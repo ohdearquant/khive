@@ -304,7 +304,7 @@ mod tests {
             ),
             kind: EntityKind::Person,
             entity_type: Some("researcher".into()),
-            name: "Ocean".into(),
+            name: "Operator".into(),
             description: None,
             properties: props,
             tags: alloc::vec![],

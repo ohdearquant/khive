@@ -2,7 +2,7 @@
 
 **Status**: accepted
 **Date**: 2026-05-23
-**Authors**: Ocean, lambda:khive
+**Authors**: khive maintainers
 **Depends on**:
 
 - ADR-014 (Curation Operations — apply step rides on existing curation primitives)
@@ -21,7 +21,7 @@ git operations from MCP — agents do not drive the KG through git. The agent
 workflow ("propose change → reviewer approves → change lands") was dropped
 without a replacement.
 
-Ocean (2026-05-23) selected option (c) **event-sourced proposals**: the
+The accepted decision selected option (c) **event-sourced proposals**: the
 proposal lifecycle is encoded purely as events on the existing log substrate
 (ADR-022). No new substrate. No new branch model. No git verbs over MCP. The
 brain already consumes events natively (ADR-032 §6); proposals slot into the
@@ -538,7 +538,7 @@ supersede, compound). Future arms add to the enum via additive semver bumps.
 | ---------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Proposal-as-Note (option a)                                            | Forces changesets into note `body`; loses schema validation; muddies the note-kind taxonomy                                                                                   |
 | PendingEdit substrate (option b)                                       | New substrate, new store, new VCS dimension — heavyweight for a workflow object                                                                                               |
-| Git-native subset (option d)                                           | Re-imports the git assumption Ocean said he wasn't sure about                                                                                                                 |
+| Git-native subset (option d)                                           | Re-imports the git assumption the decision explicitly avoided                                                                                                                 |
 | Inline apply without a separate worker step or `ProposalApplied` event | Rejected: v1 may call `ProposalApplyWorker` synchronously from `review`, but apply remains a separate worker struct and emits `ProposalApplied` for audit/failure separation. |
 | Approve = side-effect of `update(id=<proposal>, status=approved)`      | Conflates review (a typed decision) with record mutation; loses the review-history audit trail                                                                                |
 | Per-proposer namespace for proposals                                   | Cross-cuts the namespace-isolation invariant; agents can't propose changes targeting namespaces they can read                                                                 |
@@ -731,7 +731,7 @@ Lookup wire shape:
   in future ADRs
 - ADR-041 (Event Provenance Projection) — projection-table pattern this ADR
   reuses
-- Ocean directive 2026-05-23: option (c) selected — "event sourced proposal
+- Design decision 2026-05-23: option (c) selected — "event sourced proposal
   sounds fine"
 
 ## Amendment (2026-06-14): proposal_id → id wire-key rename

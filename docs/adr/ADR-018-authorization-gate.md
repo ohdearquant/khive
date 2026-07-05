@@ -2,7 +2,7 @@
 
 **Status**: accepted\
 **Date**: 2026-05-23\
-**Authors**: Ocean, lambda:khive
+**Authors**: khive maintainers
 
 ## Context
 
@@ -156,7 +156,7 @@ decision := {
     "obligations": [{"kind": "audit", "tag": sprintf("verb.%s", [input.verb])}],
 } if {
     input.actor.kind == "user"
-    input.namespace == "ocean"
+    input.namespace == "operator"
 }
 
 decision := {"decision": "deny", "reason": "anonymous callers cannot write"} if {
@@ -263,7 +263,7 @@ The wire shape is stable:
 ```json
 {
   "timestamp": "2026-05-23T01:50:00Z",
-  "actor": { "kind": "user", "id": "ocean" },
+  "actor": { "kind": "user", "id": "operator" },
   "namespace": "research",
   "verb": "create",
   "decision": "allow",

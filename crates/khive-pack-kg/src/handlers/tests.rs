@@ -568,7 +568,7 @@ fn valid_relations_unsupported_pair_returns_empty() {
 // actually accepts for that pair. This calls production code on both sides —
 // it never re-implements the rule check inline.
 //
-// Codex round-1 review of #621 flagged that a five-pair spot check missed an
+// #621 flagged that a five-pair spot check missed an
 // `EntityOfType`-scoped divergence (see
 // `valid_relations_hint_covers_formal_pack_entity_of_type_rules` below); this
 // sweeps the full closed kind space so a future divergence at any pair fails
@@ -638,7 +638,7 @@ async fn valid_relations_hint_matches_real_validator_acceptance_across_all_entit
     }
 }
 
-// Codex round-1 High finding on #621: `valid_relations_for_entity_pair` only
+// internal review round 1 High finding on #621: `valid_relations_for_entity_pair` only
 // matched `EndpointKind::EntityOfKind` pack rules, silently omitting
 // `EndpointKind::EntityOfType` rules such as khive-pack-formal's typed
 // `concept/theorem -> concept/definition` `depends_on` rule
@@ -773,7 +773,7 @@ async fn valid_relations_hint_does_not_cover_gtd_note_scoped_rules() {
     );
 }
 
-// Codex round-1 Medium finding on #621: proves the GTD boundary on the REAL
+// internal review round 1 Medium finding on #621: proves the GTD boundary on the REAL
 // `KgPack::handle_link` path with real task notes, not just rule presence in
 // `pack_edge_rules()`. A task->task relation outside GTD's declared
 // `depends_on` must fail with the substrate-mismatch error ("must be an

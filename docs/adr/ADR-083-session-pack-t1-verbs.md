@@ -2,7 +2,7 @@
 
 **Status**: accepted
 **Date**: 2026-07-02
-**Authors**: lambda:khive
+**Authors**: khive maintainers
 **GitHub**: #342
 **Amends**: [ADR-080](ADR-080-session-pack-oss-storage-mechanism.md) §3 (verb visibility, verb count,
 and parameter vocabulary) for the T1 continuity epic. Does not touch ADR-080 §6 (session mirror),
@@ -46,7 +46,7 @@ fixes a code citation (§4).
 ADR-080 §3 is accepted. Until this ADR is itself accepted, ADR-080 §3's shipped-surface record
 (three `Visibility::Subhandler` verbs, `agent_id`/`metadata`/`since` parameters, no dispatchable
 export) remains the authoritative description of what the `session` pack exposes. This ADR is the
-sign-off vehicle for changing that. If accepted, it supersedes ADR-080 §3 with the surface described
+decision vehicle for changing that. If accepted, it supersedes ADR-080 §3 with the surface described
 in §2 below, and leaves every other part of ADR-080 (§1, §2, §4, §5, §6) unchanged.
 
 No new schema is required for T1's own storage. The four verbs read and write the existing `notes`

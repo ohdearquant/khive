@@ -10,7 +10,7 @@ khive publishes a public GitHub Pages docs site (`https://ohdearquant.github.io/
 built by `.github/workflows/pages.yml` from `docs/guide/*.md` via Jekyll's
 `remote_theme: just-the-docs`. The site serves two distinct audiences from one source: humans
 browsing the HTML site, and agents fetching machine-readable summaries (`llms.txt` and raw
-markdown). Ocean's bar for the site: match the OpenAI docs standard — easy to navigate, clean,
+markdown). The bar for the site: match the OpenAI docs standard — easy to navigate, clean,
 uncluttered — and keep agent-facing content hosted as md/txt, not HTML.
 
 Two problems surfaced on the live site and were fixed in PR #582 (following the site's initial
@@ -164,7 +164,7 @@ already requires for IA, color, and agent-surface changes.
    emerging, simple convention that agents already know to probe for; it needs no negotiation
    logic and no additional hosting. Rejected.
 3. **Keep the theme default purple accent.** Zero-effort, but it reads as unstyled theme
-   boilerplate rather than a site khive deliberately designed, and does not meet Ocean's
+   boilerplate rather than a site khive deliberately designed, and does not meet the
    "clean, uncluttered, considered" bar. Rejected.
 
 ## Consequences

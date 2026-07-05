@@ -2,7 +2,7 @@
 
 **Status**: proposed
 **Date**: 2026-06-27
-**Authors**: Ocean, lambda:khive
+**Authors**: khive maintainers
 **Depends on**:
 
 - ADR-016 (Request DSL — wire envelope shape, `$prev` chain semantics)
@@ -120,7 +120,7 @@ would change what a parser sees. They are therefore scoped to `auto`/`table` (§
 has opted into a view. (3) A table renderer truncates long cells and collapses newlines — token-lean
 and legible for an agent _reading_ output, lossy for one _parsing_ it.
 
-A fleet that wants the aggressive savings everywhere sets `default_output_format = "auto"` in its
+A deployment that wants the aggressive savings everywhere sets `default_output_format = "auto"` in its
 `khive.toml` (or `KHIVE_OUTPUT_FORMAT=auto`), trading shape-stability for the −62%/−55% reduction.
 The product/cloud default stays `json` so that callers who parse responses are never surprised.
 
@@ -235,7 +235,7 @@ nested objects, must use `format=json` or pass an expand parameter.
 The following reductions are applied in `format=auto` and `format=table` only — they are a _view_
 transform, not a serialization. `format=json` (the default, on every surface) and
 `PresentationMode::Verbose` always emit the canonical shape without reduction, so the machine
-contract is shape-stable. A fleet that wants these reductions on every call opts in with
+contract is shape-stable. A deployment that wants these reductions on every call opts in with
 `default_output_format = "auto"`.
 
 **7.1. `full_id` suppression**
@@ -386,13 +386,13 @@ retained as an extension point for cases where the generic rules produce a poor 
 
 ## Alternatives Considered
 
-| Alternative                                                | Why rejected                                                                                                                                                                                                                                                                                                                                                                                                                  |
-| ---------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Single global YAML default                                 | Costs 11–17% more tokens than compact JSON for record arrays (§5). YAML beats neither the `json` default nor the `auto`/`table` views on token cost, so it was deferred rather than shipped as a variant.                                                                                                                                                                                                                     |
-| Field-compaction only, no format axis                      | ADR-045's Agent-mode compaction handles per-field trimming but leaves pretty-print whitespace and repeated key names intact. Those two factors remain the dominant cost on heavy verbs and require a separate format axis to address.                                                                                                                                                                                         |
-| Per-verb hardcoded renderers                               | Forces every pack author into a rendering concern, couples renderer tests to handler tests, and requires new verbs to declare renderers. Shape dispatch at the seam requires no per-pack work and is testable independently of pack logic. Per-verb renderers are retained as an extension point.                                                                                                                             |
-| Using `format=auto` (shape-aware table) as the MCP default | A table is a lossy view (cells truncate at ~120 chars, newlines collapse) and the redundancy-drop reshapes `properties`, so an `auto` default would silently change the parse contract for any agent or script reading MCP output. Compact `json` is lossless and shape-stable; `auto`/`table` are opt-in for callers reading rather than parsing, and a fleet can still adopt `auto` everywhere via `default_output_format`. |
-| Using `format=table` as the MCP default                    | Forcing markdown-table rendering before validating that all verb shapes are table-renderable risks rendering errors on complex or single-record shapes. `format=auto` with a compact-JSON fallback is the safer of the two view formats.                                                                                                                                                                                      |
+| Alternative                                                | Why rejected                                                                                                                                                                                                                                                                                                                                                                                                                       |
+| ---------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Single global YAML default                                 | Costs 11–17% more tokens than compact JSON for record arrays (§5). YAML beats neither the `json` default nor the `auto`/`table` views on token cost, so it was deferred rather than shipped as a variant.                                                                                                                                                                                                                          |
+| Field-compaction only, no format axis                      | ADR-045's Agent-mode compaction handles per-field trimming but leaves pretty-print whitespace and repeated key names intact. Those two factors remain the dominant cost on heavy verbs and require a separate format axis to address.                                                                                                                                                                                              |
+| Per-verb hardcoded renderers                               | Forces every pack author into a rendering concern, couples renderer tests to handler tests, and requires new verbs to declare renderers. Shape dispatch at the seam requires no per-pack work and is testable independently of pack logic. Per-verb renderers are retained as an extension point.                                                                                                                                  |
+| Using `format=auto` (shape-aware table) as the MCP default | A table is a lossy view (cells truncate at ~120 chars, newlines collapse) and the redundancy-drop reshapes `properties`, so an `auto` default would silently change the parse contract for any agent or script reading MCP output. Compact `json` is lossless and shape-stable; `auto`/`table` are opt-in for callers reading rather than parsing, and a deployment can still adopt `auto` everywhere via `default_output_format`. |
+| Using `format=table` as the MCP default                    | Forcing markdown-table rendering before validating that all verb shapes are table-renderable risks rendering errors on complex or single-record shapes. `format=auto` with a compact-JSON fallback is the safer of the two view formats.                                                                                                                                                                                           |
 
 ## Consequences
 
@@ -403,7 +403,7 @@ retained as an extension point for cases where the generic rules produce a poor 
   1,006) from removing pretty-print whitespace alone, with **zero shape change and zero caller
   migration**. The session-start triple `[gtd.next, gtd.tasks, comm.inbox]` falls from on the order
   of 4,000 tokens to roughly 3,000 on the default path.
-- **Opting into `auto`** (per-request, or fleet-wide via `default_output_format = "auto"`) adds the
+- **Opting into `auto`** (per-request, or deployment-wide via `default_output_format = "auto"`) adds the
   redundancy-drop and markdown-table view for approximately 55–62% off the pretty-print baseline:
   `gtd.tasks(10)` falls to 774 tokens (−62%) and `list(entity, 10)` to 932 (−55%), taking the
   session-start triple to roughly 2,000 tokens. For `gtd.tasks` the `properties` dedup is the
@@ -510,7 +510,7 @@ before shape detection. The pass is skipped entirely when `format=json` or
 - ADR-045 (Verb Response Presentation Modes) — `PresentationMode`; `include_full_id` override;
   §3.5 error envelope invariant; Chain `$prev` invariant; partially superseded on `full_id` default
   behavior by §7.1 of this ADR
-- Measurement workspace: `.khive/workspaces/20260627/output-verbosity/05-table-flavor-measurement.md`
+- Measurement artifact: local output-verbosity table-flavor measurement notes.
   (grounded cl100k_base integer token counts, agent path, 2026-06-27), with `SYNTHESIS.md` and
   `04-measurement.md` as supporting context
-- Ocean directive 2026-06-27 — output verbosity reduction, format axis as the design vehicle
+- Design request 2026-06-27 — output verbosity reduction, format axis as the design vehicle

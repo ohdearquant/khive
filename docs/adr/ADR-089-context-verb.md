@@ -24,7 +24,7 @@ The building blocks exist and are warm-path:
 
 No existing verb composes them. `traverse` takes explicit roots without semantic anchor
 selection; `knowledge.compose` ranks knowledge sections, not KG neighborhoods. The
-per-turn hook consumer (the fleet's prefetch integration) and khivedb end users both need
+per-turn hook consumer (the existing prefetch integration) and khivedb end users both need
 the composed form, so this is product surface, not an internal convenience.
 
 ## Decision

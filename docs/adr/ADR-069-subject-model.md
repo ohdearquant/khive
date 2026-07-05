@@ -2,7 +2,7 @@
 
 **Status**: Proposed\
 **Date**: 2026-06-23\
-**Authors**: Ocean, lambda:khive\
+**Authors**: khive maintainers
 **Depends on**: ADR-001 (Entity Kind Taxonomy), ADR-002 (Edge Ontology), ADR-013 (Note Kind
 Taxonomy), ADR-017 (Pack Standard -- extends `EndpointKind` with `EntityOfType` variant)
 
@@ -581,11 +581,11 @@ carries no such guarantee.
   as subtype registration, `VerbRegistry::all_edge_rules()` aggregation
 - `crates/khive-runtime/src/operations.rs` lines 215-292: `base_entity_rule_allows` --
   implemented base endpoint contract; confirms `concept->concept DependsOn` absent
-- `.khive/workspaces/20260621/proof-gate/mathlib/phase2_select.py` lines 58-61: taxonomy
+- Local proof-gate `mathlib/phase2_select.py` lines 58-61: taxonomy
   derivation from module path; lines 24: `TOOLING_DISCIPLINES` drop
-- `.khive/workspaces/20260621/proof-gate/mathlib/build_taxonomy_layout.py` steps 2-6:
+- Local proof-gate `mathlib/build_taxonomy_layout.py` steps 2-6:
   Layout pipeline and silhouette annotation
-- `.khive/workspaces/20260621/proof-gate/mathlib/gen_edge_ops.py`: records the `enables`
+- Local proof-gate `mathlib/gen_edge_ops.py`: records the `enables`
   workaround and its reason ("depends_on is NOT c->c in base, only under draft ADR-065")
-- `.khive/workspaces/20260621/proof-gate/mathlib/PHASE2-SELECTION.md`: verified selection
+- Local proof-gate `mathlib/PHASE2-SELECTION.md`: verified selection
   counts (316,040 raw; 62,038 final selected; T=3 threshold)

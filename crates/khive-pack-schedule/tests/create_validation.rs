@@ -695,8 +695,7 @@ async fn schedule_schedule_accepts_create_with_kind() {
     assert_eq!(result["status"], "pending");
 }
 
-/// Round-2 regression (codex REJECT, "create replay validation still misses
-/// KG kind reconciliation failures"): `create(kind="concept",
+/// Round-2 regression: `create(kind="concept",
 /// entity_kind="person", name="x")` is accepted by `schedule.schedule` before
 /// this fix, yet the real `create` handler
 /// (`khive-pack-kg/src/handlers/create.rs` via

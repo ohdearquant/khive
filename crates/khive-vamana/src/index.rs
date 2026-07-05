@@ -4052,13 +4052,13 @@ mod tests {
 
     /// RobustPrune alpha-predicate regression (ADR-052 §2 — R2 Finding 2).
     ///
-    /// Codex repro: when node AND multiple candidates all collapse to the same u8 code,
+    /// Regression reproduction: when node AND multiple candidates all collapse to the same u8 code,
     /// d2_node_candidate from the SQ8 pool is 0. The strict-≤ check then reads
     /// `alpha² * dist(selected, candidate) <= 0`, which is false for any non-zero
     /// inter-selected distance — so the candidate is NOT pruned even though exact f32
     /// WOULD prune it. This test verifies the fix: use exact f32 as the predicate RHS.
     ///
-    /// Fixture (exact codex repro): vectors=[0.0, 0.001, 0.0018, 1.0], DIM=1, node=0,
+    /// Fixture (exact reproduction): vectors=[0.0, 0.001, 0.0018, 1.0], DIM=1, node=0,
     /// candidates=[1,2], alpha=1.2.
     ///   - All of v0..v2 collapse to code 0 (gs=1/255, 0.001*255=0.255→0, 0.0018*255=0.459→0).
     ///   - f32 prune: selects v1, PRUNES v2 (alpha²*d(v1,v2)=0.000000922 ≤ d(v0,v2)=3.24e-6).

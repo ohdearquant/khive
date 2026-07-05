@@ -650,7 +650,7 @@ mod tests {
         );
     }
 
-    // ── entity_posterior_order strict coverage (PR #535 codex round-1) ────────
+    // ── entity_posterior_order strict coverage (PR #535 internal review round 1) ────────
 
     /// Build a fresh version-1 `BalancedRecallSnapshot` with `n` entity
     /// posteriors and a fully-covering order, for mutation in the tests below.
@@ -765,7 +765,7 @@ mod tests {
 
     #[test]
     fn validate_brain_state_snapshot_with_capacity_rejects_version_zero_with_partial_order() {
-        // PR #535 codex round-2 finding 2: a version-0 snapshot with a
+        // PR #535 internal review round 2 finding 2: a version-0 snapshot with a
         // non-empty (here: partial) order is NOT the legacy empty-order
         // compatibility case. `serde(default)` lets `entity_posteriors_version`
         // silently resolve to 0 on an omitted field, so this must be rejected

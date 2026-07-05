@@ -2,7 +2,7 @@
 
 **Status**: accepted (amended 2026-06-07, 2026-06-10, 2026-06-10b)
 **Date**: 2026-05-25
-**Authors**: Ocean, lambda:khive
+**Authors**: khive maintainers
 
 ## Amendment (2026-06-10b): exclude_status precedence fix; auto-compose member filter; atom status taxonomy clarification
 

@@ -2,7 +2,7 @@
 
 **Status**: accepted
 **Date**: 2026-05-23
-**Authors**: Ocean, lambda:khive
+**Authors**: khive maintainers
 
 ## Context
 
@@ -172,7 +172,7 @@ boosting reads. It is configured the same way namespace is — via `--brain-prof
 
 ```toml
 [runtime]
-namespace = "lambda:khive"
+namespace = "local"
 brain_profile = "project-recall-v1"
 ```
 

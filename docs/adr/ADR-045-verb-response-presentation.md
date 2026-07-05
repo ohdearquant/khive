@@ -2,7 +2,7 @@
 
 **Status**: accepted
 **Date**: 2026-05-23
-**Authors**: Ocean, lambda:khive
+**Authors**: khive maintainers
 **Extended by**: ADR-078 (Output Format and Shape-Aware Rendering), which introduces an orthogonal
 `format` axis (`json` / `auto` / `table`) and revises Agent-mode redundancy rules. ADR-078
 §7.1 partially supersedes the P-C1 implementation behavior that kept `full_id` present in all
@@ -28,7 +28,7 @@ Agents are token-budgeted; humans want pretty output for inspection; tooling
 different shapes of the same data. v1 forces handlers to pick one — and they
 picked the full shape, so agents pay the verbose cost on every call.
 
-Ocean's directive (2026-05-23):
+Design request (2026-05-23):
 
 > verb should include a handler for verbose output, aka if not verbose output,
 > we will normalize the data into agent friendly manner, like short datetime
@@ -326,7 +326,7 @@ it's metadata, not logic.
         "title": "Draft ADR-045",
         "status": "next",
         "priority": "p1",
-        "assignee": "lambda:khive",
+        "assignee": "agent:docs",
         "created_at": "2026-05-23T16:00:00.000000Z",
         "updated_at": "2026-05-23T16:18:15.234567Z",
         "completed_at": null,
@@ -334,7 +334,7 @@ it's metadata, not logic.
         "tags": [],
         "dependencies": [],
         "result": null,
-        "namespace": "lambda:khive"
+        "namespace": "agent:docs"
       },
       {/* ... */}
     ],
@@ -358,12 +358,12 @@ it's metadata, not logic.
         "title": "Draft ADR-045",
         "status": "next",
         "priority": "p1",
-        "assignee": "lambda:khive",
+        "assignee": "agent:docs",
         "created_at": "2026-05-23T16:00",
         "updated_at": "3m ago",
         "completed_at": null,
         "due_at": null,
-        "namespace": "lambda:khive"
+        "namespace": "agent:docs"
       },
       {/* ... */}
     ],
@@ -570,4 +570,4 @@ migrate to Agent-mode shapes or set `presentation=verbose` per call (or
   (this ADR's output-side counterpart)
 - ADR-017 (Pack Standard) — verb declaration, handler return shape
 - ADR-016 (Request DSL) — single-tool `request` envelope shape
-- Ocean directive 2026-05-23 — "verb should include a handler for verbose output…"
+- Design request 2026-05-23 — "verb should include a handler for verbose output…"

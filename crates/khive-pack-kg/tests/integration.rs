@@ -2862,7 +2862,7 @@ async fn bulk_link_verbose_controls_edges_key() {
     );
 }
 
-// ---- ADR-014 curation event payload regression tests (codex round-2) ----
+// ---- ADR-014 curation event payload regression tests (internal review round 2) ----
 
 /// Update an entity → list entity_updated events → assert payload has id, namespace,
 /// changed_fields per ADR-014.
@@ -3061,7 +3061,7 @@ async fn curation_delete_entity_hard_event_payload_has_adr014_fields() {
     );
 }
 
-// ---- ADR-022 provenance filter regression tests (codex round-2) ----
+// ---- ADR-022 provenance filter regression tests (internal review round 2) ----
 
 /// list(kind="event", observed=[uuid]) must pass the filter down to storage and
 /// return only events whose observed list contains that UUID.
@@ -3783,7 +3783,7 @@ async fn traverse_invalid_direction_is_rejected() {
     );
 }
 
-// ── verbs() dispatch-level tests (codex review Medium: H5 not covered) ────────
+// ── verbs() dispatch-level tests (internal review Medium: H5 not covered) ────────
 //
 // A fake pack with one public verb and one subhandler so we can verify that
 // `verbs()` excludes subhandlers and that category/pack filters work correctly.
@@ -4019,7 +4019,7 @@ async fn verbs_dispatch_pack_filter_fake_excludes_subhandler() {
     );
 }
 
-// M2 / codex H1 regression: three parallel singleton link() calls for the same
+// M2 / H1 regression: three parallel singleton link() calls for the same
 // (source, target, relation) triple must all return the same edge ID and the
 // database must contain exactly one edge row for that triple.
 //
@@ -4093,7 +4093,7 @@ async fn parallel_link_same_triple_returns_identical_ids() {
     );
 }
 
-// R4 / codex H1 round-4 regression: singleton link() must go through runtime.link()
+// R4 / H1 regression: singleton link() must go through runtime.link()
 // upsert even when the triple already exists, so caller-supplied weight and metadata
 // are persisted (ADR-009 §edge-upsert contract).
 //
@@ -4310,7 +4310,7 @@ async fn merge_rewire_symmetric_relation_canonicalization() {
     );
 }
 
-// ---- H1 codex round-3: update_edge canonicalizes symmetric relations ----
+// ---- H1 internal review round 3: update_edge canonicalizes symmetric relations ----
 
 /// H1-a: updating an edge from a non-symmetric relation to `competes_with`
 /// must store the row with `source_uuid < target_uuid` (canonical form).
@@ -8292,7 +8292,7 @@ async fn context_entity_ids_anchor_carries_full_entity_record() {
 
 #[tokio::test]
 async fn context_entity_ids_random_nonexistent_uuid_is_rejected() {
-    // codex round 1, High-2: a syntactically valid but nonexistent UUID must
+    // internal review round 1, High-2: a syntactically valid but nonexistent UUID must
     // error, not silently vanish from the response.
     let pack = pack();
     let random_id = uuid::Uuid::new_v4().to_string();
@@ -8840,7 +8840,7 @@ async fn context_query_and_entity_ids_combine_explicit_ids_first_then_search_fil
 
 #[tokio::test]
 async fn context_query_fill_reaches_limit_after_top_hit_duplicates_explicit_anchor() {
-    // codex round 1, Medium-1: if the query's top hit is also an explicit anchor,
+    // internal review round 1, Medium-1: if the query's top hit is also an explicit anchor,
     // the query leg must still fill up to `limit` DISTINCT non-explicit anchors
     // rather than silently returning fewer once the duplicate collapses.
     let pack = pack();
@@ -9044,7 +9044,7 @@ async fn context_fanout_caps_neighbors_per_node_per_hop() {
 
 #[tokio::test]
 async fn context_direction_outgoing_fanout_keeps_highest_weight_not_node_id_order() {
-    // Codex round 2, High: khive-runtime's neighbors_with_query re-sorts hits by
+    // internal review round 2, High: khive-runtime's neighbors_with_query re-sorts hits by
     // (node_id, edge_id) for dedup and, before this fix, never restored the
     // weight-descending order the storage layer established. That meant
     // context(direction="outgoing") returned neighbors in arbitrary node_id

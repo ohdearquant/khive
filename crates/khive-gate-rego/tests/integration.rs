@@ -73,7 +73,7 @@ fn namespace_scoped_policy_emits_audit_obligation() {
     let gate = RegoGate::from_policy_str(&source).expect("compiles");
 
     let mut req = GateRequest::new(
-        ActorRef::new("user", "ocean"),
+        ActorRef::new("user", "operator"),
         Namespace::local(),
         "search",
         json!({}),

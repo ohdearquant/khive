@@ -619,7 +619,7 @@ mod tests {
     use tempfile::TempDir;
 
     // A schema check must be read-only: it must not create a missing database,
-    // and it must not migrate (mutate) an existing one. Regression for the codex
+    // and it must not migrate (mutate) an existing one. Regression for the
     // finding that `db check` ran migrations via the read-only runtime path.
     #[tokio::test]
     async fn db_check_does_not_create_missing_file() {
@@ -778,7 +778,7 @@ mod tests {
         );
     }
 
-    /// Codex round 1 (#613) finding: the two sibling tests above never configure
+    /// internal review round 1 (#613) finding: the two sibling tests above never configure
     /// a non-default output format, so `output_format` parity was vacuous —
     /// both paths landing on the built-in `Json` default would pass even if one
     /// path silently dropped `apply_env_output_format(khive_cfg.runtime.default_output_format)`
@@ -799,7 +799,7 @@ mod tests {
         // original value (or leaves it removed) on drop — including on panic, so
         // a failing assertion or an unexpected constructor error never leaks the
         // cleared env var to later #[serial] tests. Mirrors `EmailEnvGuard` in
-        // `khive-mcp/src/serve.rs` (round 2 of the #603 codex review, PR #613:
+        // `khive-mcp/src/serve.rs` (round 2 of the #603 internal review, PR #613:
         // the prior manual save/clear/restore only ran on the success path).
         struct OutputFormatEnvGuard {
             prev: Option<String>,

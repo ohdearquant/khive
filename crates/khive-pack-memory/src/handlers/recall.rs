@@ -617,7 +617,7 @@ impl MemoryPack {
                 let served_at_us = chrono::Utc::now().timestamp_micros();
                 // Tracked, not a bare tokio::spawn, so daemon shutdown's drain()
                 // waits for this append instead of a SIGTERM aborting it
-                // mid-flight with no ledger row and no log (codex PR #583
+                // mid-flight with no ledger row and no log (internal review PR #583
                 // round-1 Medium). The response path still only pays for the
                 // enqueue (an atomic increment) — never the SQL write itself.
                 khive_runtime::track_background_task(async move {
@@ -721,7 +721,7 @@ mod tests {
     /// `$`, so this query no longer reaches the runtime-level fail-open `Err` arm
     /// added in PR #389 — it exercises the *sanitizer*, not the fail-open net.
     /// See `recall_with_residual_fts5_char_degrades_and_vector_leg_survives` below
-    /// for a test that forces the `Err` arm itself (PR #389 codex round-1 Medium).
+    /// for a test that forces the `Err` arm itself (PR #389 internal review round 1 Medium).
     #[tokio::test]
     async fn recall_with_dollar_sign_query_does_not_error() {
         let rt = KhiveRuntime::memory().expect("in-memory runtime");
@@ -827,7 +827,7 @@ mod tests {
         }
     }
 
-    /// PR #389 codex round-1 Medium regression: unlike `$`, `@` is NOT stripped
+    /// PR #389 internal review round 1 Medium regression: unlike `$`, `@` is NOT stripped
     /// by `sanitize_fts5_query` (by design — the sanitizer stays minimal per
     /// #388 scope; the fail-open net is the systematic answer for residual
     /// punctuation). SQLite FTS5's bareword parser still rejects `@`
@@ -835,7 +835,7 @@ mod tests {
     /// `collect_recall_text_hits` (khive-pack-memory/handlers/common.rs) and must
     /// degrade to vector-only results rather than aborting the recall.
     ///
-    /// Ties Medium to the codex round-1 High-2 finding: with a real (non-null)
+    /// Ties Medium to the internal review round 1 High-2 finding: with a real (non-null)
     /// embedder registered, this proves the vector leg still returns the
     /// correct note while the FTS leg is degraded — i.e. degradation loses only
     /// the FTS signal, not the overall recall. (This test does NOT assert an

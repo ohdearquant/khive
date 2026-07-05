@@ -2,7 +2,7 @@
 
 **Status**: accepted\
 **Date**: 2026-05-23\
-**Authors**: Ocean, lambda:khive
+**Authors**: khive maintainers
 
 ## Context
 
@@ -191,12 +191,12 @@ remains in git history unless a force-push rewrite is performed.
 
 Data classes that may appear in NDJSON snapshots:
 
-| Data class        | Example                          | Sensitivity                                   |
-| ----------------- | -------------------------------- | --------------------------------------------- |
-| Entity names      | "Sinkhorn Distances", "Ocean Li" | Low–Medium (Person entities carry real names) |
-| Entity properties | JSON key-value metadata          | Variable (may contain internal notes)         |
-| Edge properties   | `dependency_kind`, `weight`      | Low                                           |
-| Edge topology     | Which entities are linked        | Medium (reveals research structure)           |
+| Data class        | Example                              | Sensitivity                                   |
+| ----------------- | ------------------------------------ | --------------------------------------------- |
+| Entity names      | "Sinkhorn Distances", "Ada Lovelace" | Low–Medium (Person entities carry real names) |
+| Entity properties | JSON key-value metadata              | Variable (may contain internal notes)         |
+| Edge properties   | `dependency_kind`, `weight`          | Low                                           |
+| Edge topology     | Which entities are linked            | Medium (reveals research structure)           |
 
 For multi-user deployments:
 

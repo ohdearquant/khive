@@ -375,7 +375,7 @@ async fn on_proposal_withdrawn_cas_returns_false_on_second_call() {
     );
 }
 
-// H1 / Codex-R3 regression: two sequential `withdrawn_and_emit` calls on the same
+// H1 / internal-review R3 regression: two sequential `withdrawn_and_emit` calls on the same
 // open proposal must produce exactly ONE ProposalWithdrawn event in the events
 // table, and the second call must return cas_hit=false.
 #[tokio::test]
@@ -468,7 +468,7 @@ async fn withdrawn_and_emit_second_call_no_duplicate_event() {
     drop(rows); // silence unused-variable lint
 }
 
-// Codex round-4 regression: same-microsecond `updated_at` collision.
+// internal review round 4 regression: same-microsecond `updated_at` collision.
 #[tokio::test]
 async fn same_microsecond_timestamp_no_duplicate_event_changes_guard() {
     let (rt, tok) = setup();
@@ -610,7 +610,7 @@ async fn same_microsecond_timestamp_no_duplicate_event_changes_guard() {
         .unwrap_or(0);
     assert_eq!(
         count, 1,
-        "codex-R4: exactly ONE ProposalWithdrawn event must exist even with identical \
+        "R4: exactly ONE ProposalWithdrawn event must exist even with identical \
          `updated_at` timestamps; got {count}. \
          A value of 2 means the guard is checking timestamp equality (round-3 bug), \
          not connection-local changes()."

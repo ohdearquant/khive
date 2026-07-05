@@ -41,7 +41,7 @@ pub(crate) struct MethodResult {
 /// `parse_header` only ever produces `Some` from a non-empty first token, so
 /// `Some` is always non-empty -- this is a type-level invariant, not just a
 /// convention: an "empty configured id" can never be *represented* as a
-/// matchable authserv_id, let alone accidentally match one (Leo, SPEC-GATE,
+/// matchable authserv_id, let alone accidentally match one (example actor, design review,
 /// 2026-07-03: "guards decay; types don't").
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(crate) struct AuthResults {
@@ -376,7 +376,7 @@ mod tests {
 
     #[test]
     fn parse_header_reason_quoted_semicolon_does_not_forge_dmarc_pass() {
-        // codex #496 repro: a `;` inside a quoted reason= pvalue must never be
+        // review #496 repro: a `;` inside a quoted reason= pvalue must never be
         // treated as a top-level segment boundary, so this must NOT produce a
         // dmarc method result at all -- the real result here is spf=fail.
         let parsed = parse_header(
@@ -444,7 +444,7 @@ mod tests {
 
     #[test]
     fn parse_header_dkim_non_numeric_version_suffix_is_ignored_not_trusted_as_v1() {
-        // codex round-2 evidence: a non-numeric "version" must never be silently
+        // internal review round 2 evidence: a non-numeric "version" must never be silently
         // treated as the supported version 1 -- the whole resinfo must be ignored.
         let parsed = parse_header("mx.example.com; dkim/evil=pass header.d=example.com").unwrap();
         assert!(
@@ -538,7 +538,7 @@ mod tests {
 
     /// The plain (non-ARC) `Authentication-Results` header value Exchange
     /// Online stamps on its internal hop, taken verbatim from the real fixture
-    /// `/Users/lion/projects/.khive/workspaces/20260703/email-restore/ocean_0110_raw_headers.txt`
+    /// `/Users/lion/projects/local workspace artifact`
     /// (unfolded), minus the leading `Authentication-Results: ` field name.
     const EXO_FIXTURE_HEADER_VALUE: &str = "spf=pass (sender IP is 2607:f8b0:4864:20::1129) smtp.mailfrom=gmail.com; dkim=pass (signature was verified) header.d=gmail.com;dmarc=pass action=none header.from=gmail.com;compauth=pass reason=100";
 
@@ -627,7 +627,7 @@ mod tests {
 
     #[test]
     fn select_trusted_authserv_id_mode_empty_configured_id_never_matches_no_id_header() {
-        // Leo's exact point (SPEC-GATE 2026-07-03), independent of the
+        // the exact review point (design review 2026-07-03), independent of the
         // config-layer require_nonempty_env guard: construct
         // TrustAnchor::AuthservId(String::new()) directly, bypassing
         // from_env entirely, against a header that parses to

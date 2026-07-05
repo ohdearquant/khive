@@ -201,7 +201,7 @@ request(ops="memory.recall(query=\"FlashAttention benchmark results\", limit=5)"
 When handing off work to another agent:
 
 ```
-request(ops="memory.remember(content=\"HANDOFF: Attention benchmark suite is ready at benchmarks/attention/. Next step: run on H100 cluster. Contact: lambda:platform for GPU allocation.\", salience=0.8, memory_type=\"episodic\")")
+request(ops="memory.remember(content=\"HANDOFF: Attention benchmark suite is ready at benchmarks/attention/. Next step: run on H100 cluster. Contact: agent:platform for GPU allocation.\", salience=0.8, memory_type=\"episodic\")")
 ```
 
 ## See also

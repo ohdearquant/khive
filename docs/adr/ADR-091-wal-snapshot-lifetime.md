@@ -8,7 +8,7 @@
 ## Context
 
 Live incident, 2026-07-04 (#580): `~/.khive/khive.db` was 3.7GB; `khive.db-wal` had grown
-to 15.5GB (15,512,941,272 bytes); `-shm` was 30MB. The fleet was running roughly three
+to 15.5GB (15,512,941,272 bytes); `-shm` was 30MB. The deployment was running roughly three
 concurrent implementer agents plus a warm daemon. Writes started failing with
 `sqlite: invalid data: timed out after 5s waiting for sqlite writer connection` on
 `comm.send` and other write ops. `PRAGMA wal_checkpoint(PASSIVE)` returned `0|3768965|44`:
@@ -31,9 +31,9 @@ contended at diagnosis time; the writer was simply slow underneath a bloated WAL
 timeouts during separate bursts. Root cause is squarely "something pinned the checkpoint
 boundary," not writer contention.
 
-### Round-1 review correction (this section replaces the original draft's Plank 1 basis)
+### Internal review correction (this section replaces the original draft's Plank 1 basis)
 
-Codex round-1 review of this ADR rejected the original mechanism on two Blockers, both
+An internal review of this ADR rejected the original mechanism on two Blockers, both
 confirmed correct against the code:
 
 1. **An idle, returned autocommit connection does not pin a WAL snapshot.** The
@@ -223,7 +223,7 @@ Plank 1 bounds every mechanism proven to allow caller-controlled transaction dur
 mechanism, plus the in-memory/test pooled-reader path the original draft targeted,
 narrowed to the surface it actually covers. Plank 2 (TRUNCATE escalation) carries over
 from the original draft largely unchanged, with an explicit flap/backoff statement added
-per Leo's request.
+by design review.
 
 **Migrate-vs-instrument decision for (2b):** this ADR does **not** propose migrating the
 raw-`SqlWriter` call sites (`fold_gate.rs`, `persist.rs`, `sql_bridge.rs`'s own writer
@@ -300,7 +300,7 @@ transaction regardless of which mechanism created it:
   edge-triggered pattern as `crossing_warn`, `checkpoint.rs:224-228`) once it exceeds
   `KHIVE_TX_WARN_SECS` (default **30s**; provisional, see Plank 0), including the entry's
   `label` if supplied.
-- **Cooperative stale-operation guard, not a lifetime bound (reworded per codex round-2:
+- **Cooperative stale-operation guard, not a lifetime bound (reworded after internal review:
   the original "hard cap" language overclaimed).** Once a registry entry's
   `opened_at.elapsed()` exceeds `KHIVE_TX_MAX_AGE_SECS` (default **120s**; provisional, see
   Plank 0):
@@ -374,7 +374,7 @@ Unchanged from the original draft in mechanism: the periodic task keeps PASSIVE-
   specified: past the high-water mark, no more often than the min interval, attempt
   `PRAGMA wal_checkpoint(TRUNCATE)` via `try_writer_nowait` with a temporarily shortened
   busy timeout restored immediately after, win or lose.
-- **Explicit flap/backoff behavior (Leo's addition):** if `try_writer_nowait()` itself
+- **Explicit flap/backoff behavior:** if `try_writer_nowait()` itself
   fails (the writer mutex is held by a concurrent write) at the moment a TRUNCATE attempt
   is due, the attempt is skipped for that tick exactly like an ordinary PASSIVE skip; the
   task does not retry within the same tick or spin-wait. `last_truncate_attempt` is
@@ -398,7 +398,7 @@ Unchanged from the original draft in mechanism: the periodic task keeps PASSIVE-
   in the shared transaction registry (both `begin_tx` and raw `SqlWriter` transactions)
   when an attempt fails to make progress.
 
-### 2026-07-04 amendment: severity ladder + `wal_pages` units (spec-gate ruling, lambda:leo)
+### 2026-07-04 amendment: severity ladder + `wal_pages` units
 
 **Severity ladder (this corrects Plank 0's crossing-severity wording above).** Plank 0's
 description of the `warn_pages` crossing (`escalating to tracing::warn! once wal_pages
@@ -411,7 +411,7 @@ The ladder is:
 - **INFO**: `wal_pages` crosses `warn_pages` (a single tick observation).
 - **WARN**: `wal_pages` fails to drain back below `warn_pages` across **N = 3** consecutive
   checkpoint cycles (each cycle is one `run_checkpoint_task` tick, default 500ms via
-  `KHIVE_CHECKPOINT_INTERVAL_MS`). N is owned by lambda:khive and tunable. **This tier is
+  `KHIVE_CHECKPOINT_INTERVAL_MS`). N is owned by maintainers and tunable. **This tier is
   not yet implemented.** It is distinct from the shipped `note_truncate_outcome` escalation
   (`checkpoint.rs:508-530`), which counts consecutive TRUNCATE _attempts_, not checkpoint
   cycles, and only ever runs once `wal_pages` has already crossed the much higher

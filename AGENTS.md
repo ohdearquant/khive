@@ -314,7 +314,7 @@ the redundancy-drop even under `auto`/`table`, so agents still get their full ou
 3. `[runtime] default_output_format` in `khive.toml`
 4. Builtin `json`
 
-A fleet that wants the lean view everywhere sets `[runtime] default_output_format = "auto"` once;
+A deployment that wants the lean view everywhere sets `[runtime] default_output_format = "auto"` once;
 product/cloud surfaces leave the default `json`. Unknown values (e.g. `yaml`) warn and fall back to
 the next tier. `kkernel exec` honors all four tiers, including the TOML tier on its in-process path.
 

@@ -2,7 +2,7 @@
 
 **Status**: Proposed
 **Date**: 2026-07-04
-**Authors**: lambda:khive (advisor-hardened design)
+**Authors**: khive maintainers
 **Depends on**: ADR-016 (request DSL, single-tool contract), ADR-017 (pack standard),
 ADR-023 (pack verb surface, visibility, and composition), ADR-083 (session pack T1 verbs),
 ADR-084 (verb-surface
@@ -13,7 +13,7 @@ checks). Out of scope: brain and knowledge pack-private storage, closed taxonomi
 
 ## Context
 
-Ocean's directive (2026-07-03) asked for two things: (a) consolidate specialized-pack
+The design request asked for two things: (a) consolidate specialized-pack
 CRUD-shaped verbs (the example given was `session.resume`) into the kg pack's
 dispatch-by-kind pattern (`search(kind="session", ...)`), and (b) centralize EDGE_RULES
 validation so endpoint rules are "bundled and compiled together, instead of per verb
@@ -29,7 +29,7 @@ declared additions per ADR-017). The recon in VERB_SURFACE_INVENTORY.md (cited t
 plus #621) found no remaining duplicate rule site. So the EDGE_RULES half of the directive
 is done. Restating it would produce an ADR that ratifies work already merged.
 
-Second, the still-per-verb validation layer that Ocean's centralization intent actually
+Second, the still-per-verb validation layer that the centralization goal actually
 lands on is not edge endpoints. It is KindHook-shaped field validation: the status-enum
 checks in gtd, the memory_type enum in memory, the RFC-3339 datetime checks in schedule,
 each living inside its own pack handler with no composed-registry equivalent. That is the
@@ -77,7 +77,7 @@ resolve-depends_on-before-write orphan guard. Its status normalization helpers a
 with the hook (comment "Shared with hook.rs" at handlers.rs:372). So `gtd.assign`-the-verb
 and `create(kind="task")`+TaskHook are two write paths that produce the same kind of record
 from partly shared helpers. That is a genuine duplicate-path, and it is the one place in the
-current surface where Ocean's "compiled together instead of per-verb" instinct is correct at
+current surface where the "compiled together instead of per-verb" direction is correct at
 the code level, independent of any wire change.
 
 The gtd state machine must survive any change. `atomic_gtd_transition` (handlers.rs:444) is a
@@ -89,13 +89,13 @@ none should.
 
 ## Decision
 
-The honest answer to Ocean is: half of this is done, a quarter should not be done, and here
+The design answer is: half of this is done, a quarter should not be done, and here
 is the quarter worth doing.
 
 - The EDGE_RULES half (part b as literally stated) is shipped (#621). This ADR records that
   and does not reopen it.
 - The verb-retirement quarter (fold named pack verbs into dispatch-by-kind and remove them
-  from the surface) should not be done. It breaks a decision Ocean's fleet accepted 48 hours
+  from the surface) should not be done. It breaks a decision accepted 48 hours
   earlier (ADR-083), it degrades agent discoverability, and it buys a deduplication benefit
   that the existing KindHook seam already delivers without touching the wire.
 - The quarter worth doing is internal, not wire-facing: (1) make dispatch-by-kind plus
@@ -130,7 +130,7 @@ Argument against retirement (why it loses): three independent reasons.
    and that continuity requires "the verbs to be callable from the agent-facing MCP request
    surface." Folding `session.resume` back into `search(kind="session")` is the exact inverse
    of that decision, proposed 48 hours after it was accepted, and the packet names the session
-   pack as load-bearing for the commercial session-continuity pillar. Reopening a signed-off,
+   pack as load-bearing for the commercial session-continuity pillar. Reopening an accepted,
    commercially-tied decision within two days needs a stronger reason than surface tidiness,
    and there is none.
 
@@ -165,7 +165,7 @@ public entry point; its handler routes through the same create-plus-KindHook pat
 
 Argument for (a) hard removal: it is the only mechanism that actually shrinks the surface, so
 if surface size were the goal it would be the honest choice. It loses because F1 already
-rejected shrinking the surface: hard removal is a breaking wire change against the fleet, the
+rejected shrinking the surface: hard removal is a breaking wire change against existing callers, the
 marketplace plugin users, and ADR-083, for a goal this ADR does not adopt.
 
 Argument for (b) alias-and-deprecate (pack verbs become thin aliases over kg handlers, count
@@ -244,7 +244,7 @@ Decision: because nothing is retired, there is no wire-facing migration. The ver
 move). No deprecation window is needed because no breaking change is made.
 
 Argument for a deprecation window (the case for treating this as a migration): if we were
-retiring verbs, pre-1.0 status and a known consumer set (the fleet plus marketplace plugin
+retiring verbs, pre-1.0 status and a known consumer set (operators plus marketplace plugin
 users) would still argue for a clean break over a deprecation window, since the consumer set is
 small and reachable and a permanent alias surface is the F2-rejected outcome. But this decision
 retires nothing, so the question is moot for the wire.
@@ -287,7 +287,7 @@ Positive consequences:
   chance new packs add crud-dup verbs that later invite exactly this consolidation question.
 - ADR-083's session decision, the commercial continuity pillar, and the named discoverability
   surface are all preserved.
-- No breaking change ships to the fleet or plugin users.
+- No breaking change ships to operators or plugin users.
 
 Negative consequences and costs:
 

@@ -113,7 +113,7 @@ pub struct EngineConfig {
 /// ```toml
 /// [actor]
 /// id = "lambda:leo"                          # attribution identity (required)
-/// display_name = "Leo global orchestrator"   # human label (optional)
+/// display_name = "example actor"   # human label (optional)
 /// visible_namespaces = ["lambda:khive", "local"]  # widens default read scope (ADR-007 Rev 4 Rule 3b)
 /// ```
 ///
@@ -849,17 +849,14 @@ fusion_weight = 0.3
             r#"
 [actor]
 id = "lambda:khive"
-display_name = "Ocean's khive lambda"
+display_name = "example actor"
 "#,
         );
         let cfg = KhiveConfig::load(Some(&path))
             .expect("load should succeed")
             .expect("file should be found");
         assert_eq!(cfg.actor.id.as_deref(), Some("lambda:khive"));
-        assert_eq!(
-            cfg.actor.display_name.as_deref(),
-            Some("Ocean's khive lambda")
-        );
+        assert_eq!(cfg.actor.display_name.as_deref(), Some("example actor"));
         assert!(cfg.engines.is_empty());
     }
 

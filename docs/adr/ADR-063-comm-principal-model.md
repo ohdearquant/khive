@@ -2,7 +2,7 @@
 
 **Status**: Proposed
 **Date**: 2026-06-19
-**Authors**: lambda:khive, alpha:architect
+**Authors**: khive maintainers
 **Depends on**: ADR-007 Rev 7 (namespace carve-out for principal-scoped backends) |
 ADR-028 (Pack-Scoped Backends) | ADR-040 (Communication and Schedule Packs) |
 ADR-057 (Comm Actor-Addressed Delivery) | ADR-053 (ActorStore / SessionStore — pending)
@@ -51,7 +51,7 @@ the proxy collapses and per-actor filtering cannot activate.
 
 ### The remote backend requirement
 
-Ocean has identified cross-machine lambda-to-lambda communication as a roadmap item: lambdas
+Cross-machine lambda-to-lambda communication is a roadmap item: lambdas
 running in separate sandboxes or on separate machines need to exchange messages. This requires
 a transport with a fundamentally different trust model.
 
@@ -345,9 +345,9 @@ per-lambda namespace partitions). The correct fix for cross-machine is Step 3 (r
 Reopen the ADR-007 Rev 3 "all packs no-carry" ruling specifically for the comm pack, allowing
 comm to use the actor namespace as the storage namespace for message rows.
 
-Rejected. ADR-007 Rev 3 was a deliberate ruling by Ocean after a gemini REFUTE review that
+Rejected. ADR-007 Rev 3 was an accepted design decision after internal review that
 found per-pack actor routing to be a contradiction of Rule 0. Reopening it for one pack would
-require re-arguing the same ground and would leave the ruling unstable. The Rule 8 carve-out
+require re-arguing the same ground and would leave the decision unstable. The Rule 8 carve-out
 is the correct mechanism: it permits a different backend, not a different namespace routing
 rule for the shared substrate.
 
@@ -370,7 +370,7 @@ treated as a permanent state.
 The credential format (token type, rotation policy, revocation mechanism) for the remote
 broker is unspecified. This is intentional: the credential is part of the transport layer,
 which will be addressed in a dedicated transport ADR before Step 3 implementation begins.
-The question for Ocean's ruling is whether the credential should be a symmetric pre-shared
+The open question is whether the credential should be a symmetric pre-shared
 key per lambda pair, a public-key credential per lambda, or a centrally-issued token (e.g.,
 from a khive-cloud authority). Decision needed before any Step 3 implementation PR is opened.
 
@@ -392,7 +392,7 @@ the physical layout is not.
 
 ### OQ-3: Legacy message visibility under Step 2 — RESOLVED as shipped (commit `091231cd`, PR #213)
 
-This was originally posed as an open question for Ocean's ruling (same question as ADR-057
+This was originally posed as an open question for maintainer decision (same question as ADR-057
 Q3): whether legacy messages without a `to_actor` field should be backfilled with
 `to_actor="local"` or declared out-of-scope for actor-scoped inboxes. It was resolved by
 implementation rather than by a separate backfill decision. The shipped `EqOrMissing` filter
@@ -401,7 +401,7 @@ actor label matches the filter value, including the anonymous `"local"` caller. 
 migration was performed or is required: legacy messages remain visible under the
 `EqOrMissing` semantics as originally implemented in ADR-057, and PR #213's unconditional
 filter (see "Current State" above) extends the same semantics to the anonymous path. This
-question is closed; no further Ocean decision is pending on it.
+question is closed; no further decision is pending on it.
 
 ---
 

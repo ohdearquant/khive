@@ -2,7 +2,7 @@
 
 **Status**: accepted\
 **Date**: 2026-05-23\
-**Authors**: Ocean, lambda:khive
+**Authors**: khive maintainers
 
 > **Amended ([ADR-055](ADR-055-epistemic-edge-relations.md))**: ADR-055 added 2
 > epistemic relations (`supports`, `refutes`), expanding the closed set from 15 to 17.

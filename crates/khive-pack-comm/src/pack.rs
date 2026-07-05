@@ -197,7 +197,7 @@ mod help_tests {
 
     #[test]
     fn all_comm_handlers_have_non_empty_params() {
-        // comm.health is a legitimate no-args verb (khive #606 spec-gate: "read-only,
+        // comm.health is a legitimate no-args verb (khive #606 design review: "read-only,
         // NO args") -- same shape as kg's `stats()`. Every other comm verb takes at
         // least one param, so the invariant still holds for the rest.
         const NO_ARGS_VERBS: &[&str] = &["comm.health"];

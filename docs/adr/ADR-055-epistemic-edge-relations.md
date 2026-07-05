@@ -2,7 +2,7 @@
 
 **Status**: accepted\
 **Date**: 2026-06-14\
-**Authors**: Ocean, lambda:khive\
+**Authors**: khive maintainers
 **Amends**: [ADR-002](ADR-002-edge-ontology.md) — expands the closed edge set from 15 → 17
 relations and adds a 9th category (Epistemic / Evidential).
 
@@ -32,12 +32,12 @@ The existing relations approximate this badly and lose information:
 | `annotates`     | A note **comments on** a target. It is polarity-blind: it cannot distinguish "this finding supports the claim" from "this finding refutes it", and it does not connect two entities. |
 
 `annotates` is the closest, and it is what the research-pack design
-(`.khive/workspaces/.../research-pack-design/DESIGN.md`) currently leans on for findings. But
+(local research-pack design notes) currently leans on for findings. But
 `annotates` answers "is there commentary here?", not "is this evidence **for** or **against**,
 and how strongly?". The polarity and the strength are exactly the signal a confidence model
 needs, and `annotates` discards both.
 
-Ocean has decided to add the minimal pair of relations that carry this signal. This ADR
+The accepted decision to add the minimal pair of relations that carry this signal. This ADR
 formalizes that decision and specifies the contract.
 
 ## Decision
@@ -200,8 +200,8 @@ speculative growth — it is staged delivery with a named next consumer.
 
 ## Sub-decisions — review record
 
-The core decision — _add `supports`/`refutes` as the minimal epistemic pair_ — is Ocean's
-explicit call and is **not** open for relitigation. The following are **lambda:khive's design
+The core decision — _add `supports`/`refutes` as the minimal epistemic pair_ — is accepted
+and is **not** open for relitigation. The following are **maintainer design
 choices** in service of that decision. The adversarial review verdict and resolution are recorded
 for each.
 
@@ -311,4 +311,4 @@ the existing fallthrough). Endpoint validation in `khive-runtime` routes `suppor
 into the same-substrate branch alongside `supersedes`, and the base entity allowlist gains the
 four `* → concept` rows. No DSL parser, SQL compiler, or merge-layer change is required — those
 layers treat relations as opaque strings validated downstream. Full ordered breakdown:
-`.khive/workspaces/20260614/supports-refutes/IMPL_PLAN.md`.
+the local supports/refutes implementation plan.

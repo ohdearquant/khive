@@ -2,7 +2,7 @@
 
 **Status**: accepted\
 **Date**: 2026-05-23\
-**Authors**: Ocean, lambda:khive
+**Authors**: khive maintainers
 
 ## Context
 
@@ -78,7 +78,7 @@ The `properties` JSON column carries every GTD field:
 {
   "status": "next",
   "priority": "p1",
-  "assignee": "ocean",
+  "assignee": "operator",
   "due": "2026-06-01T10:00:00Z",
   "start": null,
   "end": null,
@@ -334,7 +334,7 @@ Every successful op returns a stable task envelope:
   "title":      "Implement retrieval",
   "status":     "next",
   "priority":   "p1",
-  "assignee":   "ocean",
+  "assignee": "operator",
   "due":        "2026-06-01T10:00:00Z",
   "namespace":  "local",
   "created_at": "2026-05-23T01:55:00Z",

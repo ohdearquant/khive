@@ -2603,8 +2603,7 @@ async fn list_proposals_without_status_returns_all_rows() -> anyhow::Result<()> 
 //
 // These tests exercise the 4-tier resolution order without a live server, using
 // the same config-loading primitives that main.rs calls.  Each test covers one
-// isolated conflict tier to lock in the regression cases identified in codex
-// round-2 review finding [Medium] "Required Precedence Matrix Is Not Tested".
+// isolated conflict tier to lock in the precedence-matrix regression cases.
 
 /// Tier 4 (hard default): no CLI actor, no env, no config file → "local".
 #[test]

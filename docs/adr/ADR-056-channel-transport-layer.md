@@ -5,7 +5,7 @@
 [§Amendment 2026-07-02](#amendment-2026-07-02----inbound-authentication-hardening),
 [§Amendment 2026-07-03](#amendment-2026-07-03----exchange-online-no-authserv-id-boundary))\
 **Date**: 2026-06-14 (amended 2026-07-02, 2026-07-03)\
-**Authors**: Ocean, lambda:khive\
+**Authors**: khive maintainers
 **Depends on**: ADR-017 (Pack Standard), ADR-018 (Authorization Gate), ADR-040 (Communication
 and Schedule Packs), ADR-053 (ActorStore / SessionStore -- extends ADR-018's actor model)\
 **Related issues**: #112 (khive-channel umbrella), #113 (Telegram adapter), #114 (email adapter),
@@ -134,7 +134,7 @@ are amended.
 
 ### Finding
 
-The trusted receiving boundary for the production ingest mailbox (`leo@khive.ai`, Microsoft
+The trusted receiving boundary for the production ingest mailbox (Microsoft
 Exchange Online) emits **no `authserv-id`** on the plain `Authentication-Results` header it
 stamps. This is a known Microsoft deviation from RFC 8601 §2.2, which requires the header to begin
 with an `authserv-id` token. The observed header from a real delivered message begins directly
@@ -230,7 +230,7 @@ revision.
 
 ## Context
 
-The autonomous build loop blocks regularly on the maintainer. HC-7 merge approvals and ADR
+The autonomous build loop blocks regularly on the maintainer. Merge approvals and ADR
 decisions require a human judgment before work continues. The only current path to unblock is the
 maintainer opening a new session.
 

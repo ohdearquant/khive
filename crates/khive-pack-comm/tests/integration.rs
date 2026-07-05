@@ -2706,7 +2706,7 @@ async fn t5_recipient_inbox_sees_message() {
     );
 }
 
-// T5b — ADR-057: comm.reply always writes same-namespace (Fix 1, codex Critical #2).
+// T5b — ADR-057: comm.reply always writes same-namespace (Fix 1, internal review Critical #2).
 //
 // Reply on a configured-actor setup proves the fail-closed reply path: after the fix,
 // handle_reply ALWAYS passes caller_ns as both `from` and `to` to dual_write_message
@@ -3036,7 +3036,7 @@ async fn t8_sender_token_cannot_mutate_recipient_inbound_note() {
 // T9 — actor-addressed reply (ADR-057) with ADR-007 Rev 2 all-local model.
 //
 // ADR-007: all writes go to "local". ADR-057: actor labels distinguish routing.
-// Leo (registry_shared) sends to khive (both copies in "local"). Then replies to
+// example actor (registry_shared) sends to khive (both copies in "local"). Then replies to
 // the inbound copy, verifying reply inherits the canonical thread_id.
 #[tokio::test]
 async fn t9_reply_cross_ns_delivers_when_allowed() {
@@ -3046,7 +3046,7 @@ async fn t9_reply_cross_ns_delivers_when_allowed() {
     let (registry_shared, rt_shared) =
         build_crossns_registry(Arc::clone(&backend), "lambda:shared", vec![]);
 
-    // "Leo" (operating as lambda:shared) sends to "khive".
+    // "example actor" (operating as lambda:shared) sends to "khive".
     let send_result = registry_shared
         .dispatch(
             "comm.send",
@@ -4368,12 +4368,12 @@ async fn reply_sets_in_reply_to_for_inbound_originated_parent() {
 
     let parent_id = plant_message_note(
         &rt,
-        "hello from ocean",
+        "hello from sender",
         serde_json::json!({
             "direction": "inbound",
-            "from": "email:ocean@example.com",
+            "from": "email:sender@example.com",
             "to": "email:mailbox@example.com",
-            "from_actor": "email:ocean@example.com",
+            "from_actor": "email:sender@example.com",
             "to_actor": "lambda:khive",
             // IMAP dedup key -- must NOT be mistaken for a Message-ID.
             "external_id": "imap:host:1:42",
@@ -4410,7 +4410,7 @@ async fn reply_sets_in_reply_to_for_outbound_minted_parent() {
             "from": "local",
             "to": "local",
             "from_actor": "lambda:khive",
-            "to_actor": "email:ocean@example.com",
+            "to_actor": "email:sender@example.com",
             "external_id": "<outbound-msg-001@khive.ai>",
             "thread_id": uuid::Uuid::new_v4().as_hyphenated().to_string(),
             "sent_at": chrono::Utc::now().to_rfc3339(),
@@ -4469,7 +4469,7 @@ async fn ingest_persists_wire_message_id_distinct_from_external_id() {
         &registry,
         &rt,
         serde_json::json!({
-            "from": "email:ocean@example.com",
+            "from": "email:sender@example.com",
             "to": "email:mailbox@example.com",
             "content": "hello",
             "external_id": "imap:host:1:99",
@@ -4526,7 +4526,7 @@ async fn ingest_persists_wire_references_distinct_from_external_id() {
         &registry,
         &rt,
         serde_json::json!({
-            "from": "email:ocean@example.com",
+            "from": "email:sender@example.com",
             "to": "email:mailbox@example.com",
             "content": "hello",
             "external_id": "imap:host:1:101",
@@ -4576,7 +4576,7 @@ async fn ingest_omits_wire_references_when_absent() {
 
 // --- issue #403 finding 1: References must carry the full ancestor chain ---
 //
-// The codex round-1 review flagged that References was set from the single
+// The round-1 review flagged that References was set from the single
 // `in_reply_to` value, dropping any ancestors before the immediate parent.
 // These tests assert the exact serialized References/In-Reply-To values
 // (not just presence) for each required case.
@@ -4590,12 +4590,12 @@ async fn reply_extends_existing_references_chain_of_two_or_more() {
 
     let parent_id = plant_message_note(
         &rt,
-        "hello from ocean",
+        "hello from sender",
         serde_json::json!({
             "direction": "inbound",
-            "from": "email:ocean@example.com",
+            "from": "email:sender@example.com",
             "to": "email:mailbox@example.com",
-            "from_actor": "email:ocean@example.com",
+            "from_actor": "email:sender@example.com",
             "to_actor": "lambda:khive",
             "external_id": "imap:host:1:43",
             "wire_message_id": "parent123@example.com",
@@ -4630,12 +4630,12 @@ async fn reply_references_falls_back_to_parent_message_id_when_no_chain() {
 
     let parent_id = plant_message_note(
         &rt,
-        "hello from ocean",
+        "hello from sender",
         serde_json::json!({
             "direction": "inbound",
-            "from": "email:ocean@example.com",
+            "from": "email:sender@example.com",
             "to": "email:mailbox@example.com",
-            "from_actor": "email:ocean@example.com",
+            "from_actor": "email:sender@example.com",
             "to_actor": "lambda:khive",
             "external_id": "imap:host:1:44",
             "wire_message_id": "parent456@example.com",
@@ -4675,7 +4675,7 @@ async fn reply_extends_references_chain_for_outbound_parent() {
             "from": "local",
             "to": "local",
             "from_actor": "lambda:khive",
-            "to_actor": "email:ocean@example.com",
+            "to_actor": "email:sender@example.com",
             "external_id": "<outbound-msg-002@khive.ai>",
             // Realistic stored shape: an outbound row's own `references_chain` is
             // ancestors-only (exactly what `build_references_header` computes for
@@ -4714,12 +4714,12 @@ async fn reply_skips_malformed_token_in_parent_references_chain() {
 
     let parent_id = plant_message_note(
         &rt,
-        "hello from ocean",
+        "hello from sender",
         serde_json::json!({
             "direction": "inbound",
-            "from": "email:ocean@example.com",
+            "from": "email:sender@example.com",
             "to": "email:mailbox@example.com",
-            "from_actor": "email:ocean@example.com",
+            "from_actor": "email:sender@example.com",
             "to_actor": "lambda:khive",
             "external_id": "imap:host:1:45",
             "wire_message_id": "parent789@example.com",
@@ -4759,7 +4759,7 @@ async fn reply_dedups_tainted_parent_references_chain_containing_parent_id() {
             "from": "local",
             "to": "local",
             "from_actor": "lambda:khive",
-            "to_actor": "email:ocean@example.com",
+            "to_actor": "email:sender@example.com",
             "external_id": "<dup-msg@khive.ai>",
             "references_chain": "<root1@example.com> <dup-msg@khive.ai> <root2@example.com>",
             "thread_id": uuid::Uuid::new_v4().as_hyphenated().to_string(),
@@ -5197,7 +5197,7 @@ async fn thread_includes_root_message_without_thread_id_property() {
 
 // --- comm.heartbeat / comm.health (khive #606) ---
 
-/// Spec-gate amendment 1 (blocking): a fresh install with no persisted daemon
+/// design review amendment 1 (blocking): a fresh install with no persisted daemon
 /// heartbeat state must report `role: "client"` with an empty channel list —
 /// never fabricate channel entries the comm pack has no evidence for.
 #[tokio::test]
@@ -5237,7 +5237,7 @@ async fn health_rejects_stray_args() {
     );
 }
 
-/// Core cross-process-read contract (spec-gate amendment 1): once the daemon
+/// Core cross-process-read contract (design review amendment 1): once the daemon
 /// persists a successful heartbeat, `comm.health()` returns it annotated
 /// `role: "daemon"`, `source: "daemon-heartbeat"` — this is true even though
 /// the *reading* call is a plain in-process dispatch here, mirroring a
@@ -5252,7 +5252,7 @@ async fn heartbeat_success_is_visible_via_health() {
             serde_json::json!({
                 "namespace": "local",
                 "channel_kind": "email",
-                "channel_slug": "leo@khive.ai",
+                "channel_slug": "recipient@example.com",
                 "outcome": "success",
             }),
         )
@@ -5270,7 +5270,7 @@ async fn heartbeat_success_is_visible_via_health() {
     assert_eq!(channels.len(), 1);
     let ch = &channels[0];
     assert_eq!(ch["channel_kind"].as_str(), Some("email"));
-    assert_eq!(ch["channel_slug"].as_str(), Some("leo@khive.ai"));
+    assert_eq!(ch["channel_slug"].as_str(), Some("recipient@example.com"));
     assert!(ch["last_success_at"].as_str().is_some());
     assert!(ch["last_poll_attempt_at"].as_str().is_some());
     assert!(ch["last_failure_at"].is_null());
@@ -5278,7 +5278,7 @@ async fn heartbeat_success_is_visible_via_health() {
     assert_eq!(ch["consecutive_failures"].as_u64(), Some(0));
 }
 
-/// Spec-gate amendment 3: `last_error` is RETAINED after a subsequent success
+/// design review amendment 3: `last_error` is RETAINED after a subsequent success
 /// (callers compare `last_error.at` vs `last_success_at`), and
 /// `consecutive_failures` resets to 0 on success.
 #[tokio::test]
@@ -5291,7 +5291,7 @@ async fn heartbeat_retains_last_error_after_success_but_resets_consecutive_failu
             serde_json::json!({
                 "namespace": "local",
                 "channel_kind": "email",
-                "channel_slug": "leo@khive.ai",
+                "channel_slug": "recipient@example.com",
                 "outcome": "failure",
                 "error_class": "auth",
                 "error_message": "XOAUTH2 handshake failed",
@@ -5305,7 +5305,7 @@ async fn heartbeat_retains_last_error_after_success_but_resets_consecutive_failu
             serde_json::json!({
                 "namespace": "local",
                 "channel_kind": "email",
-                "channel_slug": "leo@khive.ai",
+                "channel_slug": "recipient@example.com",
                 "outcome": "failure",
                 "error_class": "auth",
                 "error_message": "XOAUTH2 handshake failed",
@@ -5328,7 +5328,7 @@ async fn heartbeat_retains_last_error_after_success_but_resets_consecutive_failu
             serde_json::json!({
                 "namespace": "local",
                 "channel_kind": "email",
-                "channel_slug": "leo@khive.ai",
+                "channel_slug": "recipient@example.com",
                 "outcome": "success",
             }),
         )
@@ -5348,7 +5348,7 @@ async fn heartbeat_retains_last_error_after_success_but_resets_consecutive_failu
     assert_eq!(
         ch["last_error"]["class"].as_str(),
         Some("auth"),
-        "last_error must be RETAINED after a subsequent success (spec-gate amendment 3)"
+        "last_error must be RETAINED after a subsequent success (design review amendment 3)"
     );
     assert!(
         ch["last_success_at"].as_str().is_some(),
@@ -5356,7 +5356,7 @@ async fn heartbeat_retains_last_error_after_success_but_resets_consecutive_failu
     );
 }
 
-/// Spec-gate amendment 2: rows are keyed by channel slug + kind, never kind
+/// design review amendment 2: rows are keyed by channel slug + kind, never kind
 /// alone — two accounts of the same kind must not collapse into one row.
 #[tokio::test]
 async fn heartbeat_keys_by_slug_not_kind_alone() {
@@ -5368,7 +5368,7 @@ async fn heartbeat_keys_by_slug_not_kind_alone() {
             serde_json::json!({
                 "namespace": "local",
                 "channel_kind": "email",
-                "channel_slug": "leo@khive.ai",
+                "channel_slug": "recipient@example.com",
                 "outcome": "success",
             }),
         )
@@ -5403,7 +5403,7 @@ async fn heartbeat_keys_by_slug_not_kind_alone() {
         .iter()
         .map(|c| c["channel_slug"].as_str().unwrap())
         .collect();
-    assert!(slugs.contains("leo@khive.ai"));
+    assert!(slugs.contains("recipient@example.com"));
     assert!(slugs.contains("ops@khive.ai"));
 }
 
@@ -5420,7 +5420,7 @@ async fn heartbeat_repeated_calls_update_same_row() {
                 serde_json::json!({
                     "namespace": "local",
                     "channel_kind": "email",
-                    "channel_slug": "leo@khive.ai",
+                    "channel_slug": "recipient@example.com",
                     "outcome": "success",
                 }),
             )
@@ -5449,7 +5449,7 @@ async fn heartbeat_requires_error_class_on_failure() {
             serde_json::json!({
                 "namespace": "local",
                 "channel_kind": "email",
-                "channel_slug": "leo@khive.ai",
+                "channel_slug": "recipient@example.com",
                 "outcome": "failure",
             }),
         )
@@ -5471,7 +5471,7 @@ async fn heartbeat_rejects_invalid_outcome() {
             serde_json::json!({
                 "namespace": "local",
                 "channel_kind": "email",
-                "channel_slug": "leo@khive.ai",
+                "channel_slug": "recipient@example.com",
                 "outcome": "maybe",
             }),
         )
@@ -5495,7 +5495,7 @@ async fn health_channel_entry_never_carries_a_healthy_bool() {
             serde_json::json!({
                 "namespace": "local",
                 "channel_kind": "email",
-                "channel_slug": "leo@khive.ai",
+                "channel_slug": "recipient@example.com",
                 "outcome": "failure",
                 "error_class": "auth",
                 "error_message": "handshake failed",

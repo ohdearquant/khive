@@ -2,7 +2,7 @@
 
 **Status**: Proposed\
 **Date**: 2026-07-03\
-**Authors**: Ocean, lambda:khive\
+**Authors**: khive maintainers
 **Depends on**: ADR-001 (Entity Kind Taxonomy — `document` is a base kind; `entity_type`
 subtype registration), ADR-002 (Edge Ontology — `annotates`, `supersedes`), ADR-013 (Note
 Kind Taxonomy), ADR-017 (Pack Standard — `EntityTypeRegistry`, `KindHook`), ADR-021 (Memory
@@ -13,7 +13,7 @@ Pack — `EntityTypeRegistry` Modify precedent, `KindHook` validation precedent)
 
 ## Context
 
-Ocean's request: documents and files (specs, research notes, meeting artifacts, reports)
+Design request: documents and files (specs, research notes, meeting artifacts, reports)
 should be "on record and kept" — first-class, graph-queryable, versioned — rather than
 opaque files agents happen to read from disk. The `document` entity kind has existed since
 ADR-001 as one of the 8 base `EntityKind` variants, but nothing in the codebase specifies

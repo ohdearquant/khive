@@ -118,7 +118,7 @@ each merge produces one revertable commit on `main`. Delete-branch-on-merge is e
 A lightweight workflow (`automerge.yml`) enables native auto-merge (`gh pr merge --auto
 --squash`) on every PR when it becomes ready for review (the `ready_for_review` event; draft
 PRs cannot carry auto-merge). This workflow uses a fine-grained token minted from a GitHub App
-(khive-leo[bot]) via a SHA-pinned token-minter action and runs on `pull_request_target` so it
+(a GitHub App bot) via a SHA-pinned token-minter action and runs on `pull_request_target` so it
 has no access to the PR head's code. Its sole action is `gh pr merge --auto --squash`.
 
 The bot proposer is an optional convenience layer, not a trust boundary. Its function is to

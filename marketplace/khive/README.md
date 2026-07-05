@@ -18,32 +18,32 @@ server env (or pass `--actor`) before you start. See
 
 ## Pattern skills (one per pack)
 
-Each skill teaches the *reusable pattern* for its pack, not a how-to for every verb. Per-verb
+Each skill teaches the _reusable pattern_ for its pack, not a how-to for every verb. Per-verb
 parameter detail is always one call away at runtime: `request(ops="<verb>(help=true)")`.
 
-| Skill       | Pack      | The pattern it teaches                                                       |
-| ----------- | --------- | --------------------------------------------------------------------------- |
-| `kg`        | kg        | Search before you create; model as typed entities + edges; explore; propose |
+| Skill       | Pack      | The pattern it teaches                                                                     |
+| ----------- | --------- | ------------------------------------------------------------------------------------------ |
+| `kg`        | kg        | Search before you create; model as typed entities + edges; explore; propose                |
 | `gtd`       | gtd       | Capture with an assignee, process the inbox, advance the lifecycle, complete with evidence |
-| `memory`    | memory    | Store-before-recall with honest salience; recall before acting              |
-| `brain`     | brain     | Tune adaptive recall with profiles, feedback signals, and bindings          |
-| `comm`      | comm      | Be attributable, address by actor with a subject, triage, reply to thread   |
-| `schedule`  | schedule  | `remind` for prompts vs `schedule` for deferred verb dispatch; agenda; cancel |
-| `knowledge` | knowledge | Search (`rerank=true`) then suggest then compose; learn + cite to grow the corpus |
+| `memory`    | memory    | Store-before-recall with honest salience; recall before acting                             |
+| `brain`     | brain     | Tune adaptive recall with profiles, feedback signals, and bindings                         |
+| `comm`      | comm      | Be attributable, address by actor with a subject, triage, reply to thread                  |
+| `schedule`  | schedule  | `remind` for prompts vs `schedule` for deferred verb dispatch; agenda; cancel              |
+| `knowledge` | knowledge | Search (`rerank=true`) then suggest then compose; learn + cite to grow the corpus          |
 
 ## kg stewardship agents
 
 Bulk graph work — ingestion, gap analysis, hygiene — is owned by dedicated agents rather than
 hand-rolled. Four pair with a workflow skill (their operating contract); two run standalone.
 
-| Agent         | Paired skill | Role                                                              |
-| ------------- | ------------ | ---------------------------------------------------------------- |
+| Agent         | Paired skill | Role                                                                          |
+| ------------- | ------------ | ----------------------------------------------------------------------------- |
 | `digester`    | `digest`     | Turn source material (ADRs, papers, docs, code) into entities + edges + notes |
-| `gap-analyst` | `gap`        | Survey the graph's structural gaps; read-only frontier ranking   |
-| `expander`    | `expand`     | Grow the graph to close one strategic gap, with hard create caps |
-| `polisher`    | `polish`     | Fix orphans, under-linked nodes, duplicates, wrong-direction edges |
-| `librarian`   | —            | Swarm health monitor; watches the agent task queue, files taxonomy questions |
-| `researcher`  | —            | Context-aware investigation grounded in the persistent graph     |
+| `gap-analyst` | `gap`        | Survey the graph's structural gaps; read-only frontier ranking                |
+| `expander`    | `expand`     | Grow the graph to close one strategic gap, with hard create caps              |
+| `polisher`    | `polish`     | Fix orphans, under-linked nodes, duplicates, wrong-direction edges            |
+| `librarian`   | —            | Swarm health monitor; watches the agent task queue, files taxonomy questions  |
+| `researcher`  | —            | Context-aware investigation grounded in the persistent graph                  |
 
 Once installed, invoke them as `khive:digester`, `khive:polisher`, and so on.
 

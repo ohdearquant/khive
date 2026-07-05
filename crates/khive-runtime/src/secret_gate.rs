@@ -61,7 +61,7 @@
 //!   decomposes into two or more such runs and every run is letters-then-digits
 //!   or pure digits, at most 24 chars long, with a low case-transition density.
 //!   This covers content like `fable-ops/ADR-DRAFT-adr079.md` or
-//!   `.khive/workspaces/20260701/adr079/PACKET.md`, which is otherwise
+//!   `local workspace artifact`, which is otherwise
 //!   indistinguishable from a high-entropy secret once glued into one
 //!   whitespace token.  Random base64/base62 secrets do not decompose this
 //!   way: their case and digit placement is effectively uniform rather than
@@ -71,11 +71,11 @@
 //!   **This exemption applies ONLY outside an explicit credential trigger
 //!   context (round-4 decision).** Two narrower attempts to keep some form of
 //!   this exemption alive inside `near_trigger` context were tried and both
-//!   defeated: a trailing file-extension check (`.md`/`.rs`; codex round-2
+//!   defeated: a trailing file-extension check (`.md`/`.rs`; internal review round 2
 //!   Critical — appending an extension to any random credential re-enabled
 //!   the exemption), and a dual-signal check requiring both a run-shape count
 //!   and an average per-run letters-only Shannon entropy below a threshold
-//!   (codex round-3 Critical — an attacker who splits a credential into short
+//!   (internal review round 3 Critical — an attacker who splits a credential into short
 //!   runs, or pads it with extra short/digit-bearing runs, drives the
 //!   reported entropy for every run toward `log2(run_len)`, which ordinary
 //!   short English path segments already sit at or near; e.g. a 9-char
@@ -715,7 +715,7 @@ fn check_entropy_heuristic(text: &str, from: usize) -> Option<(&str, &'static st
         // computation, since a legitimate path can exceed ENTROPY_THRESHOLD
         // on Shannon entropy alone.
         //
-        // Round-4 decision (codex round-3 Critical): this exemption applies
+        // Round-4 decision (internal review round 3 Critical): this exemption applies
         // ONLY outside an explicit credential trigger context. Two prior
         // attempts to narrow it for `near_trigger` instead of dropping it
         // — a trailing file-extension check (round 1→2 bypass) and a
@@ -2371,7 +2371,7 @@ mod tests {
 
     #[test]
     fn github_app_token_families_are_masked() {
-        // codex #368 round-2 [Critical]: ghu_ (user-to-server), ghs_
+        // review #368 round-2 [Critical]: ghu_ (user-to-server), ghs_
         // (server-to-server), and ghr_ (refresh) GitHub App tokens are real
         // credential families that previously bypassed the prefix detector and
         // leaked through the mirror. They are context-free — no trigger word
@@ -2401,7 +2401,7 @@ mod tests {
 
     #[test]
     fn mask_secrets_redacts_entropy_token_whose_trigger_is_left_of_earlier_secret() {
-        // codex #368 round-2 [Critical]: the entropy detector only fires near a
+        // review #368 round-2 [Critical]: the entropy detector only fires near a
         // trigger word. When the trigger (`api_key`) sits to the LEFT of an
         // earlier known-prefix secret (`ghp_…`), a masker that rescans only the
         // suffix after each redaction loses that context and leaks the later
@@ -2465,7 +2465,7 @@ mod tests {
     fn blocks_workspace_path_near_key_word_accepted_fp_round4() {
         // Was `allows_workspace_path_near_key_word` pre round-4. Full-token
         // entropy 4.7938 > 4.5 — now an accepted FP.
-        let content = "key: see .khive/workspaces/20260701/adr079-slices234/PACKET.md";
+        let content = "key: see internal/workspaces/20260701/adr079-slices234/PACKET.md";
         assert!(
             check(content).is_err(),
             "accepted FP post round-4: workspace path near 'key' is now blocked; \
@@ -2479,7 +2479,7 @@ mod tests {
         // Was `allows_short_run_path_near_auth_word` pre round-4. Full-token
         // entropy 4.5955 > 4.5 — now an accepted FP.
         let content =
-            "auth work saved at .khive/workspaces/20260701/cloud-rebuild/R1-repo-audit.md";
+            "auth work saved at internal/workspaces/20260701/cloud-rebuild/R1-repo-audit.md";
         assert!(
             check(content).is_err(),
             "accepted FP post round-4: path with a short 'R1' run near 'auth' is \
@@ -2490,7 +2490,8 @@ mod tests {
 
     #[test]
     fn allows_branch_and_review_filename_near_key_word() {
-        let content = "branch feat-session-codex-mirror pushed, see codex_review_pr335_round2.md for the key findings";
+        let content =
+            "branch feat-session-mirror pushed, see review_pr335_round2.md for the key findings";
         assert!(
             check(content).is_ok(),
             "branch name and review filename near 'key' must not be blocked; fired: {:?}",
@@ -2554,9 +2555,9 @@ mod tests {
     fn structured_identifier_true_for_repro_paths() {
         let paths = [
             "fable-ops/ADR-DRAFT-adr079-slices234.md",
-            ".khive/workspaces/20260701/adr079-slices234/PACKET.md",
-            ".khive/workspaces/20260701/cloud-rebuild/R1-repo-audit.md",
-            "codex_review_pr335_round2.md",
+            "internal/workspaces/20260701/adr079-slices234/PACKET.md",
+            "internal/workspaces/20260701/cloud-rebuild/R1-repo-audit.md",
+            "review_pr335_round2.md",
             "docs/adr/ADR-055-epistemic-edge-relations.md",
             "crates/khive-pack-session/src/mirror/ingest.rs",
             "check_entropy_heuristic_impl",
@@ -2595,7 +2596,7 @@ mod tests {
     }
 
     // ── Round-4 decision: drop the structured-identifier exemption entirely
-    //    in trigger context (codex round-3 Critical) ─────────────────────────
+    //    in trigger context (internal review round 3 Critical) ─────────────────────────
     //
     // Two narrower fixes were tried in trigger context and both defeated:
     //   round 1: required a trailing file-extension run       -> bypassed by
@@ -2617,8 +2618,8 @@ mod tests {
     // `accepted_false_positive_*` below).
 
     #[test]
-    fn blocks_codex_repro_secret_access_key_bypass() {
-        // The exact bypass string from the codex round-1 Critical finding.
+    fn blocks_separator_secret_access_key_bypass() {
+        // The exact bypass string from the round-1 Critical finding.
         let content = "secret_access_key abcdefghij/klmnopqrst/uvwxyzabcd/efghijk";
         assert!(
             check(content).is_err(),
@@ -2663,7 +2664,7 @@ mod tests {
     }
 
     #[test]
-    fn blocks_codex_round2_extension_suffix_bypass_secret_access_key() {
+    fn blocks_extension_suffix_bypass_secret_access_key() {
         // The round-1 bypass string with `.md` appended — this is what
         // slipped through the round-1 extension-based exemption.
         let content = "secret_access_key abcdefghij/klmnopqrst/uvwxyzabcd/efghijk.md";
@@ -2675,7 +2676,7 @@ mod tests {
     }
 
     #[test]
-    fn blocks_codex_round2_extension_suffix_bypass_token_assignment() {
+    fn blocks_extension_suffix_bypass_token_assignment() {
         let content = "token=zxkqwmvbpl/trfhysjgnc/dweiaoutkz-mnbvcxzlk.rs";
         assert!(
             check(content).is_err(),
@@ -2716,7 +2717,7 @@ mod tests {
 
     #[test]
     fn blocks_round3_padding_run_bypass_attempts() {
-        // Codex round-3 Critical repro: a low-entropy padding run (`aaaa`)
+        // internal review round 3 Critical repro: a low-entropy padding run (`aaaa`)
         // inserted before short/digit-shaped runs used to drag the round-2
         // AVERAGE per-run letters-only entropy below its threshold while
         // `has_low_entropy_run_signal` was satisfied by the trailing
@@ -2741,7 +2742,7 @@ mod tests {
     #[test]
     fn blocks_run_splitting_bypass_attempts() {
         // A further adversarial construction found while stress-testing the
-        // round-3 fix (not itself a codex finding, but proves the general
+        // round-3 fix, proving the general
         // unsoundness): splitting a credential into short (4-6 char) runs
         // drives EVERY run's own letters-only entropy toward log2(run_len),
         // which ordinary short English path words already sit at or near —
@@ -2770,7 +2771,7 @@ mod tests {
         // (4.5) — the exemption was never load-bearing for these regardless
         // of which version of it existed.
         let paths = [
-            "codex_review_pr335_round2.md",
+            "review_pr335_round2.md",
             "docs/adr/ADR-055-epistemic-edge-relations.md",
             "crates/khive-pack-session/src/mirror/ingest.rs",
             "check_entropy_heuristic_impl",
@@ -2808,7 +2809,7 @@ mod tests {
     #[test]
     fn accepted_false_positive_workspace_packet_path_near_trigger() {
         // Same tradeoff as above: full-token entropy 4.7938 > 4.5.
-        let content = "api_key handling in .khive/workspaces/20260701/adr079-slices234/PACKET.md";
+        let content = "api_key handling in internal/workspaces/20260701/adr079-slices234/PACKET.md";
         assert!(
             check(content).is_err(),
             "accepted FP: PACKET.md workspace path near 'api_key' is now blocked \
@@ -2821,7 +2822,7 @@ mod tests {
     fn accepted_false_positive_r1_repo_audit_path_near_trigger() {
         // Same tradeoff as above: full-token entropy 4.5955 > 4.5.
         let content =
-            "api_key handling in .khive/workspaces/20260701/cloud-rebuild/R1-repo-audit.md";
+            "api_key handling in internal/workspaces/20260701/cloud-rebuild/R1-repo-audit.md";
         assert!(
             check(content).is_err(),
             "accepted FP: R1-repo-audit path near 'api_key' is now blocked post \
@@ -3095,7 +3096,7 @@ mod tests {
 
     #[test]
     fn allows_benign_url_with_scheme_and_path_separators() {
-        // Adversarial self-check (codex round-8 guidance): any-suffix
+        // Adversarial self-check (internal review round 8 guidance): any-suffix
         // semantics must not newly block ordinary URLs, whose `://` and
         // `/` characters produce several suffix candidates but none of
         // them are UUID- or content-hash-shaped. Placed near a real

@@ -2,7 +2,7 @@
 
 **Status**: accepted
 **Date**: 2026-05-23
-**Authors**: Ocean, lambda:khive
+**Authors**: khive maintainers
 
 ## Context
 
@@ -30,7 +30,7 @@ composition ([ADR-024](ADR-024-fold-cognitive-primitives.md)). This means it can
 from precision-weighting (ADR-024 §Bayesian extensions), epistemic selector weight, or the
 `ComposePipeline` structure. The Hoare triple for recall is undocumented.
 
-Ocean's directive: expose a set of configurable handlers so recall behavior can be tuned and
+Design request: expose a set of configurable handlers so recall behavior can be tuned and
 calibrated empirically without recompilation.
 
 ## Decision

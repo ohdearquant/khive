@@ -296,7 +296,7 @@ async fn channel_poll_loop(
 
     let mut last_poll = Utc::now();
     // One backoff state per (kind, slug) — i.e. per credential (#606 round-1
-    // codex review, High finding). Keying by kind alone would throttle a
+    // internal review, High finding). Keying by kind alone would throttle a
     // second same-kind credential (e.g. a second mailbox) whenever the first
     // one's connection fails, even though the two are independent
     // credentials with independent connectivity.
@@ -384,7 +384,7 @@ enum HeartbeatOutcome {
 }
 
 /// Map a [`khive_channel::ChannelError`] to the `comm.heartbeat` `error_class`
-/// open string enum (#606 spec-gate amendment 4: `auth | transport | config`
+/// open string enum (#606 design review amendment 4: `auth | transport | config`
 /// in v1, callers must tolerate unknown classes). `Auth`/`Transport` are the
 /// connectivity classes `is_backoff_eligible` already distinguishes;
 /// `Config`/`UnauthorizedSender`/`InvalidEnvelope` are static/attribution
@@ -406,7 +406,7 @@ fn channel_error_class(err: &khive_channel::ChannelError) -> &'static str {
 /// interrupt the poll loop — the heartbeat row is an observability surface,
 /// not a correctness dependency for message delivery.
 ///
-/// Takes NO `namespace` parameter (round-2, spec-gate Blocker fix, Leo
+/// Takes NO `namespace` parameter (round-2, design review Blocker fix, example actor
 /// 2026-07-04): heartbeat rows are an operational surface, not message data,
 /// so they are ALWAYS dispatched against
 /// `khive_pack_comm::CHANNEL_HEALTH_NAMESPACE` — the same constant
@@ -452,7 +452,7 @@ async fn record_channel_heartbeat(
 /// Log a backoff-eligible poll failure at the level ADR-091's `crossing_warn`
 /// discipline calls for: `warn!` only on an escalation edge
 /// (`tick.should_warn`, i.e. the computed step just changed), `debug!` on a
-/// repeat at the same step. Codex round-1 finding (2026-07-04): the poll loop
+/// repeat at the same step. internal review round 1 finding (2026-07-04): the poll loop
 /// previously emitted a generic `warn!` on every eligible retry in addition
 /// to the escalation-edge warn, so sustained pressure spammed warn-level logs
 /// once per retry instead of once per escalation. Extracted to a standalone
@@ -1640,7 +1640,7 @@ brain_profile = "unrelated"
         );
     }
 
-    /// Regression for BLOCKER-1 (PR #52 codex review): project-toml brain_profile
+    /// Regression for BLOCKER-1 (PR #52 internal review): project-toml brain_profile
     /// MUST win over KHIVE_BRAIN_PROFILE env var.
     ///
     /// Merged ADR-035 §Precedence: CLI > project toml > global toml > env > default.
@@ -1994,7 +1994,7 @@ brain_profile = "project-profile"
         );
     }
 
-    /// Regression for ADR-073 codex r1: a pack assigned to a secondary backend must
+    /// Regression for ADR-073: a pack assigned to a secondary backend must
     /// have `core_backend` wired at boot so that `rt.core().backend_id()` returns "main".
     ///
     /// Before the fix, `build_server_multi_backend` called `KhiveRuntime::from_backend`
@@ -2196,7 +2196,7 @@ brain_profile = "project-profile"
         }
     }
 
-    /// Regression for B-BLOCKER-1 (HC-7 critic): the multi-backend boot path
+    /// Regression for B-BLOCKER-1 (design review critic): the multi-backend boot path
     /// MUST thread the configured actor identity (issue #75) into the registry,
     /// exactly as the single-backend path does. If `with_actor_id` is dropped,
     /// dispatch mints `ActorRef::anonymous()` and `comm.inbox` reverts to
@@ -3050,7 +3050,7 @@ brain_profile = "project-profile"
         }
     }
 
-    // --- log_eligible_poll_failure: edge-triggered warn (codex round-1 finding 2) ---
+    // --- log_eligible_poll_failure: edge-triggered warn (internal review round 1 finding 2) ---
 
     #[cfg(feature = "channel-email")]
     mod eligible_poll_failure_log_tests {
@@ -3175,7 +3175,7 @@ brain_profile = "project-profile"
             // Simulate one escalation edge followed by several repeats at the
             // same (capped) step, as the poll loop would emit them across
             // consecutive ticks -- exactly the "riding the cap" scenario
-            // codex round-1 flagged as spamming a WARN per retry.
+            // internal review round 1 flagged as spamming a WARN per retry.
             let buffer = Arc::new(Mutex::new(Vec::new()));
             let subscriber = CaptureSubscriber {
                 events: Arc::clone(&buffer),
@@ -3457,7 +3457,7 @@ brain_profile = "project-profile"
             record_channel_heartbeat(
                 &registry,
                 "email",
-                "leo@khive.ai",
+                "recipient@example.com",
                 HeartbeatOutcome::Success,
             )
             .await;
@@ -3476,7 +3476,7 @@ brain_profile = "project-profile"
             record_channel_heartbeat(
                 &registry,
                 "email",
-                "leo@khive.ai",
+                "recipient@example.com",
                 HeartbeatOutcome::Success,
             )
             .await;
@@ -3488,10 +3488,13 @@ brain_profile = "project-profile"
             let channels = health["channels"].as_array().expect("channels array");
             assert_eq!(channels.len(), 1);
             assert_eq!(channels[0]["channel_kind"].as_str(), Some("email"));
-            assert_eq!(channels[0]["channel_slug"].as_str(), Some("leo@khive.ai"));
+            assert_eq!(
+                channels[0]["channel_slug"].as_str(),
+                Some("recipient@example.com")
+            );
         }
 
-        /// #606 round-1 codex review, Blocker finding: a daemon polling under a
+        /// #606 round-1 internal review, Blocker finding: a daemon polling under a
         /// non-local `KHIVE_EMAIL_INGEST_NAMESPACE` must not cause a client-role
         /// no-arg `comm.health()` to report empty state. `record_channel_heartbeat`
         /// takes no `namespace` parameter — the write is unconditionally pinned to
@@ -3514,7 +3517,7 @@ brain_profile = "project-profile"
             let ingest_params = serde_json::json!({
                 "namespace": configured_ingest_namespace,
                 "from": "email:sender@example.com",
-                "to": "email:leo@khive.ai",
+                "to": "email:recipient@example.com",
                 "content": "hello",
                 "channel_kind": "email",
                 "external_id": "test-msg-1",
@@ -3528,7 +3531,7 @@ brain_profile = "project-profile"
             record_channel_heartbeat(
                 &registry,
                 "email",
-                "leo@khive.ai",
+                "recipient@example.com",
                 HeartbeatOutcome::Success,
             )
             .await;
@@ -3549,11 +3552,14 @@ brain_profile = "project-profile"
                  regardless of the configured message-ingest namespace"
             );
             assert_eq!(channels[0]["channel_kind"].as_str(), Some("email"));
-            assert_eq!(channels[0]["channel_slug"].as_str(), Some("leo@khive.ai"));
+            assert_eq!(
+                channels[0]["channel_slug"].as_str(),
+                Some("recipient@example.com")
+            );
         }
     }
 
-    // --- ChannelRegistry composite-key production path (round-1 codex review, High finding) ---
+    // --- ChannelRegistry composite-key production path (round-1 internal review, High finding) ---
 
     #[cfg(feature = "channel-email")]
     mod composite_key_registry_tests {
@@ -3593,8 +3599,7 @@ brain_profile = "project-profile"
             }
         }
 
-        /// #606 round-1 codex review, High finding: this is the regression codex
-        /// specifically asked for — a PRODUCTION `ChannelRegistry` populated
+        /// #606 regression guard: a PRODUCTION `ChannelRegistry` populated
         /// through the real `register()` path (not a pack-level dispatch
         /// bypassing registration) with two same-kind, different-slug adapters.
         /// Both must be registered (not collapsed) and both must be pollable by

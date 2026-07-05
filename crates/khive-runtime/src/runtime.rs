@@ -675,7 +675,7 @@ impl KhiveRuntime {
     /// Includes both built-in lattice models and any custom embedders
     /// registered by packs via [`register_embedder`](Self::register_embedder).
     /// Useful for operations that must touch every model's storage (e.g.,
-    /// scoped vector deletion on note delete — codex High 2 (PR #407)).
+    /// scoped vector deletion on note delete — internal review High 2 (PR #407)).
     /// The default model is included.
     pub fn registered_embedding_model_names(&self) -> Vec<String> {
         self.embedder_registry

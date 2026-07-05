@@ -1172,7 +1172,7 @@ async fn f1_rrf_k_60_constant_produces_finite_scores() {
     );
 }
 
-// ── codex #527: status stays consistent with finalized through the UPDATE path ──
+// ── review #527: status stays consistent with finalized through the UPDATE path ──
 
 #[tokio::test]
 async fn upsert_finalizing_existing_atom_promotes_draft_to_reviewed() {
@@ -1931,7 +1931,7 @@ async fn search_default_rerank_decompose_guard_avoids_fts_no_such_column() {
 
 // ── embed_batch failure / count-mismatch counted as `failed` ─────────────────
 //
-// Regression for codex round-2 HIGH finding: embed_batch Err and count-mismatch
+// Regression for internal review round 2 HIGH finding: embed_batch Err and count-mismatch
 // were both mapped to `skipped` (exit 0); they must map to `failed` (exit non-0
 // without --best-effort).  The knowledge index handler cannot call embed_batch
 // without a non-empty default_embedder_name, so these tests use a fake provider
@@ -2156,7 +2156,7 @@ mod embed_failure_tests {
         );
     }
 
-    // ── Section embed failure regression (codex round-1 HIGH) ────────────────
+    // ── Section embed failure regression (internal review round 1 HIGH) ────────────────
     //
     // Mirrors the atom failure tests above but exercises the SECTION path via
     // `reindex_knowledge(sections:true, atoms:false)`. Blank-text sections are

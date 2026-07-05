@@ -2,7 +2,7 @@
 
 **Status**: Accepted/Ratified (2026-06-19)
 **Date**: 2026-06-19
-**Authors**: lambda:khive, alpha:architect
+**Authors**: khive maintainers
 **Amends**: ADR-007-namespace.md (adds Rule 8 on top of Rev 6; all prior rules Rev 0–7 retained, Rule 8 is additive)
 **Supersedes (partial)**: None — additive amendment only
 **ADR chain**: ADR-018 (Gate trait, single dispatch site) | ADR-014 (curation, merge semantics)
@@ -45,7 +45,7 @@ skipped. Issue #75 has since shipped (commit `f1061d27`): `RuntimeConfig` now ca
 unconditional. Full detail in ADR-063 "Current State."
 
 A second, larger issue is cross-machine delivery. Lambda-to-lambda coordination across
-machines or sandboxes — the roadmap item Ocean identified — requires a transport that is
+machines or sandboxes — a roadmap item — requires a transport that is
 inherently multi-principal: each lambda authenticates independently, sends messages to peers
 by principal, and reads only its own inbox. This is a different trust model from the shared
 local substrate where all actors read the same pool. A remote message broker enforces
@@ -134,12 +134,12 @@ specified in ADR-063.
 
 ## Alternatives Considered
 
-| Alternative                                                            | Disposition                                                                                                                                                            |
-| ---------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Amend ADR-007 Rules 0-7 globally to allow per-pack namespace carry     | Rejected. This would re-open the Rev 3 debate and potentially undo the "all packs no-carry" ruling. Rule 8 is a carve-out for a specific backend type, not a reversal. |
-| Define the comm isolation contract in ADR-007 directly                 | Rejected. ADR-007 is a cross-cutting substrate contract. Per-pack backend contracts belong in their own ADRs (ADR-028 pattern).                                        |
-| Treat the remote broker as a pure platform crate with no ADR           | Rejected. A transport that enforces per-principal scope is an architectural decision; it requires an ADR per the project standard.                                     |
-| Apply Option A (local filter as security model) for both OSS and cloud | Rejected for cloud. See ADR-063 §Alternatives for the full argument; the short form is: a shared store filter is bypassable by any client with store access.           |
+| Alternative                                                            | Disposition                                                                                                                                                              |
+| ---------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Amend ADR-007 Rules 0-7 globally to allow per-pack namespace carry     | Rejected. This would re-open the Rev 3 debate and potentially undo the "all packs no-carry" decision. Rule 8 is a carve-out for a specific backend type, not a reversal. |
+| Define the comm isolation contract in ADR-007 directly                 | Rejected. ADR-007 is a cross-cutting substrate contract. Per-pack backend contracts belong in their own ADRs (ADR-028 pattern).                                          |
+| Treat the remote broker as a pure platform crate with no ADR           | Rejected. A transport that enforces per-principal scope is an architectural decision; it requires an ADR per the project standard.                                       |
+| Apply Option A (local filter as security model) for both OSS and cloud | Rejected for cloud. See ADR-063 §Alternatives for the full argument; the short form is: a shared store filter is bypassable by any client with store access.             |
 
 ---
 
@@ -184,7 +184,7 @@ specified in ADR-063.
 
 **Status**: Accepted/Ratified (2026-06-19)
 **Date**: 2026-06-19
-**Authors**: lambda:khive, alpha:architect
+**Authors**: khive maintainers
 **Amends**: ADR-007-namespace.md (replaces v1 base text, both 2026-05 amendments, Rev 2, Rev 3 read-scope clause; Rev 6 amends the Rev 4 Rule 0 write-default for episodic memory)
 **Supersedes (partial)**: ADR-050 §"Decision"; ADR-059 §"Decision" and §"Visibility tiers"
 **Superseded-by-none**: ADR-053 (ActorStore, SessionStore, actor threading) survives in full
@@ -250,8 +250,7 @@ AllowAllGate as the default gate. The 2026-05-27 Namespace-by-Layer amendment sp
 two routing groups. ADR-050 proposed removing the KG-pack token rebinding introduced by that
 split. ADR-059 drafted a three-tier visibility model.
 
-Ocean's ruling (CLAUDE.md "Authorization — the gate is a seam, by design" and "Namespace and
-authorization") resolves the divergence: namespace is attribution, not isolation. Storage is
+The accepted design resolves the divergence: namespace is attribution, not isolation. Storage is
 dumb. The Gate is the one enforcement seam.
 
 PR-A1 (commit 2607e263, merged 2026-06-16) shipped the by-ID half: all ensure_namespace /
@@ -276,7 +275,7 @@ Gate implementations plug into.
 khive's default deployment is a single shared brain: one SQLite file, one namespace
 ("local"), all lambdas and agents reading and writing together.
 
-Actor identity (lambda:khive, lambda:leo, agent:*, user:ocean) is attribution only: stamped on
+Actor identity (lambda:khive, lambda:leo, agent:*, user:operator) is attribution only: stamped on
 write records and gate-request context, available for logging, filtering, and operator policy
 input. It never silently becomes the storage namespace and never gates by-ID access.
 
@@ -288,8 +287,8 @@ ADR-053; until that lands, `[actor] id` is inert at the storage layer. This is t
 distinction Rule 0 turns on: a caller may target a named namespace per request, but the actor a
 deployment is configured as must not route storage on its own.
 
-Source: CLAUDE.md "The local system is a single shared brain: one namespace (`local`), and
-every lambda / agent / subagent reads and writes it."
+Source: project guidance: the local system is a single shared brain, with one namespace
+(`local`) and every lambda / agent / subagent reading and writing it.
 
 **Rev 6 amendment to Rule 0 (episodic memory writes stamp the actor id by default).** Rule 0
 continues to hold for every write path EXCEPT one: an episodic memory write
@@ -369,13 +368,13 @@ update_entity, update_note, update_edge, delete_edge.
 
 CHANGE FROM ADR-007 v1: The 2026-05-27 Namespace-by-Layer amendment routed memory, gtd, comm,
 brain, and schedule multi-record ops by actor namespace ("WHERE namespace = <actor_namespace>"),
-while routing KG and knowledge to "local". Gemini REFUTE Finding 2 correctly identified this
+while routing KG and knowledge to "local". internal review finding 2 correctly identified this
 as a contradiction of Rule 0: framing per-pack actor routing as "explicit pack policy"
-re-introduces the exact actor-as-namespace isolation coupling Ocean ordered removed. Finding 1
+re-introduces the exact actor-as-namespace isolation coupling the accepted design removed. Finding 1
 added that memory is live-audited as bulk "local" and that cross-lambda learning via
 memory.recall over one pool depends on the shared store.
 
-Ocean ruling (2026-06-17, Rev 3): ALL packs are NO-CARRY. There is no per-pack namespace
+Accepted Rev 3 decision (2026-06-17): ALL packs are NO-CARRY. There is no per-pack namespace
 carry, now or planned. This closes the two questions that Rev 2 left deferred to Rev 3:
 
 - Comm is NO-CARRY (reverses the Rev-2 "leans yes"). Messages are inherently actor-addressed,
@@ -421,8 +420,8 @@ partitions:
   carry is NO.
 - KG / knowledge: shared "local" store. Namespace carry was NO (confirmed in Rev 2; unchanged).
 
-This dissolves the Rule 0 vs Rule 3 contradiction present in the prior amendment (gemini
-Finding 2) and resolves the memory-pack scoping incoherence (gemini Finding 1). The Rev-2
+This dissolves the Rule 0 vs Rule 3 contradiction present in the prior amendment (internal review
+finding 2) and resolves the memory-pack scoping incoherence (internal review finding 1). The Rev-2
 deferred carry questions for comm and memory are now closed: both are NO-CARRY.
 
 Status: implemented. VerbRegistry::dispatch mints the storage token with primary = the explicit
@@ -515,10 +514,10 @@ per-edge namespace-join appears in any query, in any deployment. The graph is
 shared structure; no actor "owns" an edge via namespace.
 
 Edge namespace is NOT derived from the endpoints. The B1 storage-schema fact from the ADR-059
-gemini mirror (edge carries its own namespace column, not derived from endpoints) is retained
+internal review (edge carries its own namespace column, not derived from endpoints) is retained
 as a storage-schema description, not as an isolation mechanism.
 
-Source: ADR-059 §"Context" — gemini REFUTE correction 1 confirmed scheme B1 (edge carries its
+Source: ADR-059 §"Context" — internal review correction 1 confirmed scheme B1 (edge carries its
 own namespace column). That storage fact is accurate. What ADR-059's decision built on top of
 it (the three-column visibility filter) is withdrawn.
 
@@ -554,14 +553,14 @@ storage invariants all deployments preserve. "Namespace never becomes the storag
 is absolute. "Namespace may be a gate's policy key" is consistent with it: a policy input
 is not a storage boundary.
 
-Source: CLAUDE.md "The `Gate` is a replaceable trait. The runtime holds an `Arc<dyn Gate>` and
-consults it on every verb dispatch — one authorization boundary."
+Source: project guidance: the `Gate` is a replaceable trait, and the runtime consults it on
+every verb dispatch as the single authorization boundary.
 
 ### Rule 5 — Merge semantics: same-namespace guard survives as substrate check, not isolation
 
 CHANGE FROM ADR-007 v1: The v1 base text and Namespace-by-Layer amendment defended the
 merge_entity same-namespace guard on the grounds that it prevents merging a "local KG entity
-with an actor-scoped operational note." Gemini Finding 4 correctly refuted this: entities and
+with an actor-scoped operational note." Internal review finding 4 correctly refuted this: entities and
 notes are different substrates merged by different verbs (merge_entity vs merge_note), so the
 cross-substrate scenario is structurally impossible regardless of namespace values. In an
 all-"local" world the guard is circular ("local" == "local") and is dead code with respect to
@@ -573,7 +572,7 @@ anything in the current deployment. It is dead-but-harmless and may be cleaned u
 PR. It must not be defended as isolation.
 
 Source: curation.rs line 2908-2910 ("a merge-semantic constraint, not tenant isolation"),
-gemini Finding 4.
+internal review finding 4.
 
 ### Rule 6 — Namespace type: open string with validated factory
 
@@ -607,15 +606,15 @@ policy input. It does not route storage.
 
 ## Supersession Map
 
-| Document                                          | Status                      | Superseded clauses                                                                                                                                                                                                                            | Surviving clauses                                                                                                                                                                                        |
-| ------------------------------------------------- | --------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| ADR-007 v1 base text (this file, prior revision)  | Superseded (Rev 3 replaces) | NamespaceToken as by-ID guard; NamespaceView; Read-by-ID namespace check; Timing oracle mitigation; NamespaceGrants / AuthContext / PrincipalId                                                                                               | Namespace::parse structural validation; "No Default"; Namespace vs backend independent axes; Hierarchy helper naming utility                                                                             |
-| ADR-007 2026-05-25 amendment                      | Superseded (Rev 3 replaces) | Two-model framing (collapsed: the default is one model; operator-supplied Gate adds isolation)                                                                                                                                                | AllowAllGate as default gate; [actor] id as attribution config; 4-tier config search path; display_name advisory-only                                                                                    |
-| ADR-007 2026-05-27 amendment (Namespace-by-Layer) | Superseded (Rev 3 replaces) | KG-pack namespace override via token.with_namespace(); per-pack actor namespace routing for memory/gtd/comm — this ADR replaces routing with view-layer tag filters                                                                           | None; the routing intent is now stated correctly in Rule 3                                                                                                                                               |
-| ADR-007 Rev 2 (2026-06-16)                        | Superseded (Rev 3 replaces) | Status: Proposed; Rev-3-deferred comm carry question ("leans yes"); Rev-3-deferred memory carry question ("undecided")                                                                                                                        | All substantive rules 0-7 (retained and sharpened); gemini REFUTE findings; PR-A1 shipped status                                                                                                         |
-| ADR-050                                           | Partially superseded        | Decision: removal of KG-pack override (this ADR absorbs and confirms)                                                                                                                                                                         | Context: documents the override as a historical bug; Rationale "Why not token rebinding"                                                                                                                 |
-| ADR-053                                           | Survives in full            | No conflict                                                                                                                                                                                                                                   | All: ActorStore, SessionStore, DispatchRequest, actor threading. Attribution threading is orthogonal to namespace isolation.                                                                             |
-| ADR-059 (withdrawn)                               | Withdrawn before acceptance | Decision: visibility tiers (shared + private + proposal-only); three-column edge-visibility filter; subagents submit proposals; legacy "local" maps to private namespace. The three-column filter (Rule 3a) is rejected and remains rejected. | Gemini-mirror B1 storage-schema fact: edge carries its own namespace column, not derived from endpoints. Retained as a storage fact in Rule 3a; the isolation mechanism built on top of it is withdrawn. |
+| Document                                          | Status                      | Superseded clauses                                                                                                                                                                                                                            | Surviving clauses                                                                                                                                                                                          |
+| ------------------------------------------------- | --------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| ADR-007 v1 base text (this file, prior revision)  | Superseded (Rev 3 replaces) | NamespaceToken as by-ID guard; NamespaceView; Read-by-ID namespace check; Timing oracle mitigation; NamespaceGrants / AuthContext / PrincipalId                                                                                               | Namespace::parse structural validation; "No Default"; Namespace vs backend independent axes; Hierarchy helper naming utility                                                                               |
+| ADR-007 2026-05-25 amendment                      | Superseded (Rev 3 replaces) | Two-model framing (collapsed: the default is one model; operator-supplied Gate adds isolation)                                                                                                                                                | AllowAllGate as default gate; [actor] id as attribution config; 4-tier config search path; display_name advisory-only                                                                                      |
+| ADR-007 2026-05-27 amendment (Namespace-by-Layer) | Superseded (Rev 3 replaces) | KG-pack namespace override via token.with_namespace(); per-pack actor namespace routing for memory/gtd/comm — this ADR replaces routing with view-layer tag filters                                                                           | None; the routing intent is now stated correctly in Rule 3                                                                                                                                                 |
+| ADR-007 Rev 2 (2026-06-16)                        | Superseded (Rev 3 replaces) | Status: Proposed; Rev-3-deferred comm carry question ("leans yes"); Rev-3-deferred memory carry question ("undecided")                                                                                                                        | All substantive rules 0-7 (retained and sharpened); internal review findings; PR-A1 shipped status                                                                                                         |
+| ADR-050                                           | Partially superseded        | Decision: removal of KG-pack override (this ADR absorbs and confirms)                                                                                                                                                                         | Context: documents the override as a historical bug; Rationale "Why not token rebinding"                                                                                                                   |
+| ADR-053                                           | Survives in full            | No conflict                                                                                                                                                                                                                                   | All: ActorStore, SessionStore, DispatchRequest, actor threading. Attribution threading is orthogonal to namespace isolation.                                                                               |
+| ADR-059 (withdrawn)                               | Withdrawn before acceptance | Decision: visibility tiers (shared + private + proposal-only); three-column edge-visibility filter; subagents submit proposals; legacy "local" maps to private namespace. The three-column filter (Rule 3a) is rejected and remains rejected. | Internal-review B1 storage-schema fact: edge carries its own namespace column, not derived from endpoints. Retained as a storage fact in Rule 3a; the isolation mechanism built on top of it is withdrawn. |
 
 Note on ADR-058: PR #143 proposes a new ADR-058 for the brain posterior read-path. That
 number is orthogonal to the namespace work. The supersession map above does not reference
@@ -626,14 +625,14 @@ collision.
 
 ## Alternatives Considered
 
-| Alternative                                                  | Pros                                                           | Cons                                                                                                                 | Disposition                                                                                                                                                                                   |
-| ------------------------------------------------------------ | -------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Keep ADR-007 v1 NamespaceToken as by-ID guard                | Type-safe isolation proof                                      | Incompatible with dumb-storage contract; removed by PR-A1                                                            | Rejected, SHIPPED removal                                                                                                                                                                     |
-| Per-pack actor namespace routing (Namespace-by-Layer Rule 3) | Preserves operational separation for gtd/comm                  | Contradicts Rule 0; breaks cross-lambda memory.recall; live audit shows memory is already "local"                    | Rejected in full. Blanket form rejected in Rev 2; narrow comm-only carry and memory carry both closed as NO-CARRY by Ocean ruling 2026-06-17 (Rev 3). No per-pack carry exists or is planned. |
-| ADR-059 three-tier visibility model                          | Supports cooperative multi-lambda with fine-grained boundaries | Extra complexity; per-edge namespace-join query; "local" becomes ambiguous; conflicts with "one shared brain" ruling | Withdrawn before acceptance (ADR-007 Rev 2). Withdrawn status reaffirmed by Rev 3.                                                                                                            |
-| ADR-059 three-column edge visibility filter                  | Prevents edge-induced namespace leaks                          | Complexity; joins across three namespace columns on every edge query; incompatible with "edges are shared structure" | Rejected (Rule 3a). Edge namespace is attribution-only, stamped "local" by default. No per-edge namespace-join at any tier.                                                                   |
-| New ADR number (ADR-060) instead of amending ADR-007         | Clean slate                                                    | Leaves conflicting ADR-007 as active on main                                                                         | Rejected; amend in place                                                                                                                                                                      |
-| Namespace as pure write-stamp, no SQL filter anywhere        | Simplest storage                                               | Removes legitimate tag-based view filtering for gtd assignee, comm addressing                                        | Rejected; view-layer filtering is correct, namespace-routing is not                                                                                                                           |
+| Alternative                                                  | Pros                                                           | Cons                                                                                                                 | Disposition                                                                                                                                                                                 |
+| ------------------------------------------------------------ | -------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Keep ADR-007 v1 NamespaceToken as by-ID guard                | Type-safe isolation proof                                      | Incompatible with dumb-storage contract; removed by PR-A1                                                            | Rejected, SHIPPED removal                                                                                                                                                                   |
+| Per-pack actor namespace routing (Namespace-by-Layer Rule 3) | Preserves operational separation for gtd/comm                  | Contradicts Rule 0; breaks cross-lambda memory.recall; live audit shows memory is already "local"                    | Rejected in full. Blanket form rejected in Rev 2; narrow comm-only carry and memory carry both closed as NO-CARRY by the 2026-06-17 Rev 3 decision. No per-pack carry exists or is planned. |
+| ADR-059 three-tier visibility model                          | Supports cooperative multi-lambda with fine-grained boundaries | Extra complexity; per-edge namespace-join query; "local" becomes ambiguous; conflicts with "one shared brain" ruling | Withdrawn before acceptance (ADR-007 Rev 2). Withdrawn status reaffirmed by Rev 3.                                                                                                          |
+| ADR-059 three-column edge visibility filter                  | Prevents edge-induced namespace leaks                          | Complexity; joins across three namespace columns on every edge query; incompatible with "edges are shared structure" | Rejected (Rule 3a). Edge namespace is attribution-only, stamped "local" by default. No per-edge namespace-join at any tier.                                                                 |
+| New ADR number (ADR-060) instead of amending ADR-007         | Clean slate                                                    | Leaves conflicting ADR-007 as active on main                                                                         | Rejected; amend in place                                                                                                                                                                    |
+| Namespace as pure write-stamp, no SQL filter anywhere        | Simplest storage                                               | Removes legitimate tag-based view filtering for gtd assignee, comm addressing                                        | Rejected; view-layer filtering is correct, namespace-routing is not                                                                                                                         |
 
 ---
 
@@ -727,12 +726,12 @@ Negative:
 
 ## References
 
-- CLAUDE.md "Authorization — the gate is a seam, by design" — Ocean's ratified design.
-- CLAUDE.md "Namespace and authorization" — coding standards.
+- Project guidance on authorization — ratified design.
+- Project guidance on namespace and authorization — coding standards.
 - v0 archive: khive-old/docs/_archive/adr_v0/ADR-007-namespace-as-open-string.md — original
   dumb-storage rules 1-4.
 - Commit 2607e263 — PR-A1 implementation, by-ID contract SHIPPED.
-- gemini_refute_adr007.md (resume 44078a77) — REFUTE findings 1-6, authoritative corrections.
+- Internal review artifact — findings 1-6 and authoritative corrections.
 - ADR-014 — curation operations, merge semantics.
 - ADR-018 — Gate trait, single dispatch site, AllowAllGate.
 - ADR-002 — edge cascade, no dangling refs.

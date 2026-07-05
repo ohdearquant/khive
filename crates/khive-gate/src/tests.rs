@@ -147,7 +147,7 @@ fn obligation_custom_round_trips_bool() {
 
 fn sample_req_with_session() -> GateRequest {
     GateRequest::new(
-        ActorRef::new("user", "ocean"),
+        ActorRef::new("user", "operator"),
         Namespace::local(),
         "create",
         json!({"kind": "concept"}),
@@ -171,7 +171,7 @@ fn audit_event_roundtrips_through_serde_stable_shape() {
 
     // All required fields present with correct values.
     assert_eq!(json["actor"]["kind"], "user");
-    assert_eq!(json["actor"]["id"], "ocean");
+    assert_eq!(json["actor"]["id"], "operator");
     assert_eq!(json["namespace"], "local");
     assert_eq!(json["verb"], "create");
     assert_eq!(json["decision"], "allow");

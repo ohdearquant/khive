@@ -3,7 +3,7 @@
 **Status**: Accepted
 **Date**: 2026-06-25
 **Ratified**: 2026-06-28
-**Authors**: Ocean, lambda:khive
+**Authors**: khive maintainers
 **Depends on**:
 
 - [ADR-005](ADR-005-storage-capability-traits.md) — Storage Capability Traits

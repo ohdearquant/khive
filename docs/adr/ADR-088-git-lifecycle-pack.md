@@ -2,7 +2,7 @@
 
 **Status**: Proposed\
 **Date**: 2026-07-03\
-**Authors**: Ocean, lambda:khive\
+**Authors**: khive maintainers
 **Depends on**: ADR-001 (Entity Kind Taxonomy — `project` as the repo anchor), ADR-002
 (Edge Ontology — `annotates`), ADR-013 (Note Kind Taxonomy — pack-declared note kinds),
 ADR-017 (Pack Standard — `NOTE_KINDS`, `NoteKindSpec`, `KindHook`), ADR-085 (Code Pack —
@@ -13,7 +13,7 @@ reuses)
 
 ## Context
 
-Ocean's direct correction (relayed via lambda:leo, superseding an earlier
+A design review correction superseded an earlier
 properties-only framing this workstream had proposed): commits and issues should be
 first-class, pack-registered **note kinds** — not entity subtypes, not bare properties on
 another record — carrying canonical edge relations to code-pack `finding` notes and to
@@ -33,7 +33,7 @@ A7 correctly anticipated that commit/PR provenance would eventually need first-c
 representation once a real consumer needed commit-graph traversal — and correctly rejected
 entity-per-commit as bloat at the D6.1 granularity fence. It also **guessed a specific
 shape** for that eventual v2 amendment: `artifact` entity subtypes linked via
-`introduced_by`/`derived_from`. Ocean's actual resolution takes a different shape: note
+`introduced_by`/`derived_from`. The adopted resolution takes a different shape: note
 kinds, linked via `annotates`. This ADR is that v2 amendment, and it explains, not just
 asserts, why the note-kind shape is the better fit than the artifact-entity shape A7
 guessed at.
@@ -76,20 +76,19 @@ New pack crate `khive-pack-git`, `REQUIRES = ["kg"]`, following `khive-pack-form
 
 5. **Population: background git-ingester, same operational pattern as ADR-087.**
    Cursor-based (per-repo, per-kind: last-ingested commit SHA per branch; last-synced
-   issue `updated_at` per repo), reading local `.git` history and, for issues, whatever
-   GitHub API access the fleet already uses (`gh` / the GitHub App per the standing
-   `project_leo_github_app` context) — not a live poll of the GitHub API on a tight
+   issue `updated_at` per repo), reading local `.git` history and, for issues, available
+   GitHub API access (`gh`, an installed GitHub App, or direct REST) — not a live poll of the GitHub API on a tight
    interval, and not a new API client. Unconditional `secret_gate::mask_secrets` on commit
    messages and issue bodies before write (external, less-trusted content, same posture as
    ADR-087's file mirroring). No new agent-facing verbs — `create`/`update`/`get`/`search`
    already suffice for anything an agent needs to do with a `commit`/`issue` note once it
    exists.
 
-6. **Explicit non-goals**, matching Ocean's own framing and ADR-010's established
+6. **Explicit non-goals**, matching the design framing and ADR-010's established
    principle:
    - **Not a GitHub API mirror or replacement.** ADR-010: "khive does not build a GitHub
      replacement... add semantic enrichment instead." This pack structures git/GitHub
-     lifecycle events the fleet already cares about; it does not attempt to reproduce
+     lifecycle events khive tracks; it does not attempt to reproduce
      GitHub's UI, review threads, or CI state.
    - **Not first-class git entities.** Commits/issues are notes, per Decision §1 — deliberately
      lighter-weight than entities, matching their high-cardinality, event-like nature.
@@ -133,8 +132,8 @@ ADR-085 D4's `finding` properties contract already includes `refs` (`github_issu
 resolution-tracking need — "this finding was fixed by commit abc123" without requiring the
 commit to be a graph citizen. This ADR does not remove or change that. `finding.refs.commit`
 remains valid for the case where a single finding needs to point at a SHA and nothing more.
-The new `commit`/`issue` note kinds are for the different, additional case Ocean has now
-supplied a real consumer for: when the commit or issue itself needs identity, and needs to
+The new `commit`/`issue` note kinds are for the different, additional case now needed:
+when the commit or issue itself needs identity, and needs to
 be a target other records can `annotates` or be `annotates`-ed by. Both can point at the
 same SHA without conflict — a `finding.refs.commit` string and a `commit` note's `sha`
 property are simply two independent references to the same real-world commit; nothing
@@ -159,8 +158,8 @@ needs to walk lineage today (resolve via a follow-up `get`/`search` by SHA). If 
 consumer needs graph-native commit-history traversal, that is its own future amendment —
 the same "defer until needed" discipline A7 itself used.
 
-**A3: `finding.refs.*` alone, no new note kinds — reject Ocean's correction and keep
-ADR-085's v1 scope as final.** Rejected. This is precisely the resolution Ocean's direct
+**A3: `finding.refs.*` alone, no new note kinds — reject the updated design and keep
+ADR-085's v1 scope as final.** Rejected. This is precisely the resolution the design
 correction superseded; `refs` properties do not give a commit/issue independent identity,
 annotatability, or traversal, which is the explicit ask.
 
@@ -170,7 +169,7 @@ rejected — see Open Questions.
 
 ## Consequences
 
-- Commit/issue history relevant to the fleet's own work (fixes, tracked audit findings)
+- Commit/issue history relevant to maintainer work (fixes, tracked audit findings)
   becomes queryable and linkable, closing the exact gap A7 flagged as a future amendment
   trigger.
 - The audit pipeline's existing `finding.refs.*` properties are unaffected — no migration,
@@ -190,8 +189,8 @@ rejected — see Open Questions.
 2. **Per-repo cursor granularity** — commit ingestion cursors naturally key off branch tip
    SHAs; issue ingestion cursors key off `updated_at`. Exact schema for the shared cursor
    table is an implementation detail, not fixed here.
-3. **GitHub API access path for issues** — whether the ingester uses `gh` CLI, the
-   `khive-leo[bot]` GitHub App, or direct REST calls is an implementation choice deferred
+3. **GitHub API access path for issues** — whether the ingester uses `gh` CLI, an
+   installed GitHub App, or direct REST calls is an implementation choice deferred
    to whoever builds the ingester; this ADR only requires that it not become a live,
    tight-interval GitHub API poller (rate-limit and "GitHub replacement" concerns both
    argue for batch/cursor-based sync, matching ADR-087's own poll cadence discipline).

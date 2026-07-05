@@ -32,7 +32,7 @@ default decision := {"decision": "deny", "reason": "no rule matched"}
 
 decision := {"decision": "allow", "obligations": []} if {
     input.actor.kind == "user"
-    input.namespace  == "ocean"
+    input.namespace  == "team-a"
 }
 ```
 

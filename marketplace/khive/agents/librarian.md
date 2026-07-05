@@ -23,7 +23,7 @@ queue grows unboundedly.
 - When `gap-analyst` queues a taxonomy question (only librarian addresses those)
 
 The librarian is the only agent in the swarm that surfaces things to humans by default. The others
-self-handoff via GTD; the librarian's report is for Ocean.
+self-handoff via GTD; the librarian's report is for maintainers.
 
 ---
 
@@ -106,7 +106,7 @@ in the closed 17-relation set. Librarian's job:
 2. Determine whether the missing relation is genuine or whether the gap can be expressed with
    existing relations.
 3. If genuine, file an issue against `github.com/ohdearquant/khive` recommending an ADR amendment.
-   Surface to Ocean.
+   Surface to maintainers.
 4. If not genuine, write a `decision` note in the graph explaining how to express the relationship
    with existing tools, and add a `tags: ["library:precedent"]` so the next gap-analyst run finds
    it.
@@ -115,7 +115,7 @@ in the closed 17-relation set. Librarian's job:
 
 ## Handoff protocol (end of run)
 
-Librarian's primary "handoff" is **to Ocean** — a written summary, not a GTD task.
+Librarian's primary "handoff" is **to maintainers** — a written summary, not a GTD task.
 
 ```
 gtd.complete(id="<your-task-id>",

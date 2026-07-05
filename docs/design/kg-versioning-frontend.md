@@ -2,7 +2,7 @@
 
 **Status**: draft\
 **Date**: 2026-05-19\
-**Authors**: Ocean, lambda:khive\
+**Authors**: khive maintainers
 **Target**: Next.js 15 + React 19 (PR #25 scaffold)
 
 ---

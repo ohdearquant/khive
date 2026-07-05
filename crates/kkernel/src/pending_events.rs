@@ -1403,8 +1403,8 @@ mod tests {
         );
     }
 
-    /// Round-2 regression (codex REJECT, "finalize must be bound to the
-    /// owning claim"): reproduces the exact stale-claimant-resumes
+    /// Round-2 regression: finalize must be bound to the owning claim. This
+    /// reproduces the exact stale-claimant-resumes
     /// interleaving. Drain A claims and (simulated) crashes/stalls past the
     /// stale timeout with its own `firing_at` token recorded. A reclaim pass
     /// then runs, and drain B re-claims the row, minting a fresh `firing_at`

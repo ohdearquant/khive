@@ -2,7 +2,7 @@
 
 **Status**: Proposed\
 **Date**: 2026-06-25\
-**Authors**: Ocean, lambda:khive\
+**Authors**: khive maintainers
 **Measurement evidence**: lattice dogfood loop, delta #1 (2026-06-25)\
 **Depends on**: [ADR-021](ADR-021-memory-pack.md) (Memory Pack), [ADR-033](ADR-033-recall-pipeline.md) (Recall Pipeline), [ADR-042](ADR-042-local-rerank-via-lattice-inference.md) (Composable Rerank Pipeline), [ADR-002](ADR-002-edge-ontology.md) (Closed Edge Ontology)\
 **GitHub**: #139 (Personalized PageRank), #80 (retrieval coverage metric)
@@ -96,14 +96,14 @@ The lattice loop logs the boolean pair plus rank for each delta into the `khive-
 
 | Delta   | Discovery sweep      | Actionable prior                                              | recall-lift                                                  | rank-lift                            | Outcome                     |
 | ------- | -------------------- | ------------------------------------------------------------- | ------------------------------------------------------------ | ------------------------------------ | --------------------------- |
-| delta-1 | `flash.rs` codex     | old, salience 0.72, flat rank #2 at raw 0.475                 | +1/2 (sibling cluster surfaced only via graph)               | +1 (graph promotes rank #2 to #1)    | graph fusion wins           |
+| delta-1 | `flash.rs` prior     | old, salience 0.72, flat rank #2 at raw 0.475                 | +1/2 (sibling cluster surfaced only via graph)               | +1 (graph promotes rank #2 to #1)    | graph fusion wins           |
 | delta-2 | `standard.rs` kernel | fresh session lessons, salience 0.85, decay 0.0, flat rank #1 | low, about +0.25 (entity leg adds marginal taxonomy framing) | about 0 (flat #1 already actionable) | flat plus salience suffices |
 
 The lift is conditional on the corpus. Graph proximity adds the most when the actionable prior is old, low-salience, or poorly ranked by raw cosine, which is exactly when flat retrieval under-ranks it. When the actionable priors are recent high-salience captures, the existing `salience` and `temporal` features already rank them first and graph proximity adds little. delta-2 is the control row that establishes this boundary, and it is logged precisely because flat recall won it.
 
 ### 4. Default-on gate
 
-Graph fusion becomes a default recall feature only after measured recall-parity evidence at scale. The delta-1 and delta-2 split above shows the default question is not binary: graph proximity earns default-on for corpora where stale, low-salience priors still carry actionable weight, and adds little where recent high-salience captures dominate. A scale measurement therefore reports the distribution of lift across corpus age and salience, not a single average. Until that threshold is established, the feature ships opt-in: `graph_proximity` is not present in the default `RecallConfig.reranker_weights` (which defaults to `HashMap::new()`). Callers who want graph-aware recall add the key explicitly or configure it in pack settings. The parity evidence and Ocean sign-off are both required to flip the default.
+Graph fusion becomes a default recall feature only after measured recall-parity evidence at scale. The delta-1 and delta-2 split above shows the default question is not binary: graph proximity earns default-on for corpora where stale, low-salience priors still carry actionable weight, and adds little where recent high-salience captures dominate. A scale measurement therefore reports the distribution of lift across corpus age and salience, not a single average. Until that threshold is established, the feature ships opt-in: `graph_proximity` is not present in the default `RecallConfig.reranker_weights` (which defaults to `HashMap::new()`). Callers who want graph-aware recall add the key explicitly or configure it in pack settings. The parity evidence and maintainer approval are both required to flip the default.
 
 ---
 
@@ -121,7 +121,7 @@ Graph fusion becomes a default recall feature only after measured recall-parity 
 
 ## Open Questions
 
-Acceptance is pending the lattice parity measurements and Ocean sign-off. These questions shape implementation details and are not resolved by this ADR.
+Acceptance is pending the lattice parity measurements and maintainer approval. These questions shape implementation details and are not resolved by this ADR.
 
 1. **Fusion weights.** What ratio of `graph_proximity` to `relevance` performs best across the dogfood corpus? The measurement protocol accumulates this signal; the shipped default config (if any) should come from measured evidence.
 2. **Hop budget.** Is a 2-hop expansion the right default? Wider expansion improves recall at the cost of proximity score dilution for distant nodes.

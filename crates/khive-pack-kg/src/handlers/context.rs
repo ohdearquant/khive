@@ -272,7 +272,7 @@ impl KgPack {
         // or an edge UUID would otherwise resolve here and then silently vanish
         // from the response in Stage 4's lenient "missing entity" fallback. Fail
         // loudly instead: one batch existence check naming every offending id
-        // (codex round 1, High-2).
+        // (internal review round 1, High-2).
         if !explicit_ids.is_empty() {
             let mut dedup_explicit = explicit_ids.clone();
             dedup_explicit.sort_unstable();
@@ -323,8 +323,8 @@ impl KgPack {
             // collapse into `entity_ids` duplicates don't under-fill the query
             // leg: ADR-089 §1 promises search "fills up to `limit` additional
             // anchors" after explicit ids, which requires looking past the first
-            // `limit` hits when some of them overlap explicit anchors (codex
-            // round 1, Medium-1). Bounded by a documented cap so a pathological
+            // `limit` hits when some of them overlap explicit anchors. Bounded
+            // by a documented cap so a pathological
             // overlap can't turn into an unbounded search.
             const QUERY_FILL_WINDOW_MULTIPLIER: u32 = 4;
             let fetch_n = limit
@@ -481,7 +481,7 @@ impl KgPack {
         // ---- Stage 4: assembly with budget enforcement ----
         let t4 = if prof { Some(Instant::now()) } else { None };
         // Explicit `entity_ids` anchors are already verified to exist in Stage 1
-        // (codex round 1, High-2), so this only guards the residual race of an
+        // (internal review round 1, High-2), so this only guards the residual race of an
         // anchor deleted concurrently between resolution and this fetch, or a
         // neighbor entity that vanished the same way. Neighbors get the same
         // lenient "missing node reads as absent" convention `neighbors_with_query`

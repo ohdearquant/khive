@@ -1364,7 +1364,7 @@ mod braincore_aud_001_capacity {
         assert!(result.is_ok(), "in-capacity snapshot must load cleanly");
     }
 
-    /// PR #535 codex round-2 finding 2: a persisted snapshot with `{A, B}`
+    /// PR #535 internal review round 2 finding 2: a persisted snapshot with `{A, B}`
     /// entity_posteriors, `entity_posterior_order = [A]`, and an EXPLICIT
     /// `entity_posteriors_version = 0` must be rejected at the
     /// `load_latest_snapshot` boundary rather than silently normalized by

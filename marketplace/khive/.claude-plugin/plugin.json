@@ -9,5 +9,14 @@
   "homepage": "https://github.com/ohdearquant/khive",
   "repository": "https://github.com/ohdearquant/khive",
   "license": "Apache-2.0",
-  "keywords": ["knowledge-graph", "gtd", "memory", "messaging", "scheduling", "agents", "mcp", "knowledge-management"]
+  "keywords": [
+    "knowledge-graph",
+    "gtd",
+    "memory",
+    "messaging",
+    "scheduling",
+    "agents",
+    "mcp",
+    "knowledge-management"
+  ]
 }

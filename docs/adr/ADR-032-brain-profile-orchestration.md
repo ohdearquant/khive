@@ -2,7 +2,7 @@
 
 **Status**: accepted\
 **Date**: 2026-05-23\
-**Authors**: Ocean, lambda:khive\
+**Authors**: khive maintainers
 **Depends on**:
 
 - ADR-006 (Deterministic Scoring)
@@ -996,7 +996,7 @@ A typical "train and serve per subagent per project" sequence:
      → live update loop begins
 4. brain.bind(profile_id=candidate,
               actor="implementer-α",
-              namespace="lambda:khive",
+              namespace="agent:docs",
               consumer_kind="recall")
      → next call by that actor in that namespace uses this profile
 5. (Optional) brain.unbind(...)

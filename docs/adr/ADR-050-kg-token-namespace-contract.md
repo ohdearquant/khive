@@ -98,7 +98,7 @@ The existing behavior continues to force all KG entity/edge writes into
 ### Add `with_shared_graph_namespace(false)` toggle
 
 A boolean field on `KgPack` would disable the override when set to false. Isolated-namespace
-deployments would call `.with_shared_graph_namespace(false)`. Explicitly rejected by Ocean:
+deployments would call `.with_shared_graph_namespace(false)`. Explicitly rejected:
 
 - Creates two contracts for the same pack; pack behavior becomes construction-time-dependent.
 - Leaks routing policy into pack instantiation.
@@ -138,7 +138,7 @@ This change is acceptable under ADR-007 by:
 - `In_pari_materia`: ADR-007's own namespace-resolution amendment (`ADR-007:389`) already
   states explicit namespace values are used unconditionally. The pack override was an
   internal contradiction with that text.
-- `Last_in_time`: Ocean's current intent (2026-06 decision) and ADR-028/029 make isolation a
+- `Last_in_time`: the current 2026-06 decision and ADR-028/029 make isolation a
   deployment routing and privilege concern, not a pack rewrite concern. The newer contract
   governs the conflict.
 - `Constitutional`: removing the override reduces pack coupling from 7 to 6 approximate
@@ -234,7 +234,7 @@ the caller token under ADR-050."
 - `In_pari_materia`: ADR-007 sections read together; explicit-namespace rule (`ADR-007:389`)
   and the Namespace-by-Layer Rule (`ADR-007:445–498`) were internally inconsistent; the
   explicit-namespace rule is the more principled text.
-- `Last_in_time`: Ocean's 2026-06 direction supersedes the 2026-05-27 Namespace-by-Layer Rule
+- `Last_in_time`: the 2026-06 direction supersedes the 2026-05-27 Namespace-by-Layer Rule
   for KG pack rebinding.
 - `Constitutional`: narrowing interpretation — removal reduces pack coupling below kappa 0.3
   threshold rather than widening it.

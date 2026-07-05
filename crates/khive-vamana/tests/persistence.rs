@@ -889,7 +889,7 @@ fn v2_parse_lifecycle_huge_fs_count_returns_invalid_format_not_panic() {
     assert_eq!(rebuilt.num_vectors(), n);
 }
 
-// ---- Fix 5 / codex R5: checked_add for offset + ts_bytes / offset + fs_bytes ----
+// ---- Fix 5 / R5: checked_add for offset + ts_bytes / offset + fs_bytes ----
 //
 // These two tests target the ADDITION overflow, not the multiplication.
 // ts_words = usize::MAX/8 passes checked_mul (ts_bytes = usize::MAX-7), but

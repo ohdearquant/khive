@@ -962,7 +962,7 @@ mod tests {
         );
     }
 
-    /// update.help must document `relation` for edges (codex High).
+    /// update.help must document `relation` for edges (internal review High).
     #[test]
     fn update_params_documents_relation_for_edges() {
         let h = find_handler("update");
@@ -977,7 +977,7 @@ mod tests {
         );
     }
 
-    /// update.help must document `weight` for edges (codex High).
+    /// update.help must document `weight` for edges (internal review High).
     #[test]
     fn update_params_documents_weight_for_edges() {
         let h = find_handler("update");
