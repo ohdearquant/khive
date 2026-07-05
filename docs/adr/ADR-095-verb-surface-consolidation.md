@@ -4,7 +4,8 @@
 **Date**: 2026-07-04
 **Authors**: lambda:khive (advisor-hardened design)
 **Depends on**: ADR-016 (request DSL, single-tool contract), ADR-017 (pack standard),
-ADR-023 (declarative pack format), ADR-083 (session pack T1 verbs), ADR-084 (verb-surface
+ADR-023 (pack verb surface, visibility, and composition), ADR-083 (session pack T1 verbs),
+ADR-084 (verb-surface
 consistency contract)
 **Scope**: the 74-verb MCP surface across the 8 default packs; the KindHook create-time
 extension seam; per-verb field validation (status enums, memory_type enums, datetime
@@ -22,7 +23,7 @@ Two facts reframe the directive before any design begins.
 
 First, part (b) is already shipped. PR #621 (merged 2026-07-04) left exactly one composed
 edge-rule set. Endpoint acceptance flows through a single validator,
-`validate_edge_relation_endpoints` (crates/khive-runtime/src/operations.rs:1097-1284), which
+`validate_edge_relation_endpoints` (crates/khive-runtime/src/operations.rs:1130-1317), which
 consults the runtime-composed rules (base entity-endpoint rules plus each loaded pack's
 declared additions per ADR-017). The recon in VERB_SURFACE_INVENTORY.md (cited to c8c16f49
 plus #621) found no remaining duplicate rule site. So the EDGE_RULES half of the directive
@@ -181,10 +182,14 @@ refactor with zero wire change, zero count change, and it centralizes the task f
 that is currently forked between handlers.rs and hook.rs into one site. It is the
 FindExisting answer (PI_AEP): the mechanism is not built, it is adopted.
 
-Hard constraint honored: `gtd.assign`'s resolve-depends_on-before-write orphan guard and the
-`atomic_gtd_transition` state machine (handlers.rs:444) are lifecycle logic that lives outside
-create. Internal-path unification touches only the create path. The transition path is not
-folded and its atomic guard is untouched.
+Hard constraint honored: the resolve-depends_on-before-write orphan guard is already hosted
+in `TaskHook::prepare_create` (hook.rs:103), which pre-validates every depends_on target
+through the same `resolve_primary` path `gtd.assign` uses, before the storage write.
+Unification therefore removes `handle_assign`'s duplicate copy of the guard and leaves
+`prepare_create` as the single create-time validation site; the guard is not moved, weakened,
+or carved out as a second site. The `atomic_gtd_transition` state machine (handlers.rs:444)
+is lifecycle logic outside create; the transition path is not folded and its atomic guard is
+untouched.
 
 Alternatives considered for F2 are the three fork options themselves; (a) and (b) are rejected
 above.
@@ -269,7 +274,8 @@ no-op):
 - tests/smoke_test.py:209 (`assert verbs_result["total"] == 74`): unchanged.
 - AGENTS.md verb catalog: unchanged.
 - The `request` tool description enumeration: unchanged.
-- ADR-023 (declarative pack format) and AGENTS.md amendment lane: engaged only for the
+- ADR-023 (pack verb surface, visibility, and composition) and AGENTS.md amendment lane:
+  engaged only for the
   governance rule wording (F1/F3 codification of dispatch-by-kind plus KindHook as the
   mandatory pattern for future packs), which is a documentation amendment, not a surface change.
 
@@ -310,19 +316,25 @@ Negative consequences and costs:
 
 The wire is unchanged, so the "migration" is an internal refactor plus one new test.
 
-1. Internal-path unification (F2): change `handle_assign` (handlers.rs:497) so that after its
-   pre-write orphan guard and salience derivation, the task-note creation routes through the
-   same create-plus-KindHook path that `create(kind="task")` uses, so `TaskHook::prepare_create`
-   (hook.rs:26) is the single field-normalization site and `after_create` (hook.rs:207) is the
-   single depends_on-edge site. The orphan guard stays where it is (it must run before the
-   write, which prepare_create supports). The transition path (handlers.rs:444) is not touched.
+1. Internal-path unification (F2): change `handle_assign` (handlers.rs:497) so the task-note
+   creation routes through the same create-plus-KindHook path that `create(kind="task")` uses,
+   so `TaskHook::prepare_create` (hook.rs:26) is the single field-normalization and pre-write
+   depends_on-validation site (it already hosts the orphan guard, hook.rs:103;
+   `handle_assign`'s duplicate copy is removed) and `after_create` (hook.rs:207) is the single
+   depends_on-edge site. The `context_entity_id` parameter must translate to the shared path
+   with identical semantics: full-UUID validation resolving to a KG entity (handlers.rs:264),
+   persistence into `properties.context_entity_id` (handlers.rs:620), and the `annotates`
+   edge currently passed to `create_note` (handlers.rs:630). The transition path
+   (handlers.rs:444) is not touched.
 2. Governance amendment (F1/F3): amend ADR-023 (and AGENTS.md) to state that (i) new packs
    express CRUD-shaped operations through kg dispatch-by-kind rather than bespoke verbs unless
    they carry genuine non-CRUD domain logic, and (ii) per-kind create-time field validation
    lives in `KindHook::prepare_create`, not in a parallel handler.
 3. New test: an equivalence test asserting that `gtd.assign(...)` and the corresponding
-   `create(kind="task", ...)` produce records with identical normalized fields and identical
-   depends_on edges, so the two paths cannot silently diverge again.
+   `create(kind="task", ...)` produce records with identical normalized fields, identical
+   depends_on edges, and identical `context_entity_id` handling (rejection of non-UUID input,
+   `properties.context_entity_id`, and the `annotates` edge), so the two paths cannot
+   silently diverge again.
 4. Unchanged guards: the smoke tripwire (smoke_test.py:209 == 74) must still pass untouched,
    which is the positive proof that this ADR is a wire no-op.
 
