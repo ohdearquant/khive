@@ -1,13 +1,13 @@
 # API Reference
 
-khive exposes exactly one MCP tool, `request`. Everything else — 73 verbs across 8
+khive exposes exactly one MCP tool, `request`. Everything else — 74 verbs across 8
 production packs — is dispatched through that single tool via a small request DSL.
 This page documents the DSL grammar, the response envelope, and every verb's full
 parameter contract, so an agent can call khive correctly without reading Rust source.
 
 This page is verified against the live registry (`request(ops="verbs()")`, run
-2026-07-03) and the pack source (`crates/khive-pack-*/src/*.rs` `HandlerDef`/`ParamDef`
-struct literals). Verb count: **73**, matching both the live registry `total` field and
+2026-07-04) and the pack source (`crates/khive-pack-*/src/*.rs` `HandlerDef`/`ParamDef`
+struct literals). Verb count: **74**, matching both the live registry `total` field and
 the sum of the 8 pack counts below. If your server reports a different total, your
 `KHIVE_PACKS` configuration loads a different pack set than the default — run
 `request(ops="verbs()")` against your own server to get the authoritative list.
@@ -25,13 +25,13 @@ An always-machine-readable copy of this page is at
 | `gtd`       | 5     | `KHIVE_PACKS=kg,gtd`       | Yes                 |
 | `memory`    | 5     | `KHIVE_PACKS=kg,memory`    | Yes                 |
 | `brain`     | 14    | `KHIVE_PACKS=kg,brain`     | Yes                 |
-| `comm`      | 5     | `KHIVE_PACKS=kg,comm`      | Yes                 |
+| `comm`      | 6     | `KHIVE_PACKS=kg,comm`      | Yes                 |
 | `schedule`  | 4     | `KHIVE_PACKS=kg,schedule`  | Yes                 |
 | `knowledge` | 19    | `KHIVE_PACKS=kg,knowledge` | Yes                 |
 | `session`   | 4     | `KHIVE_PACKS=kg,session`   | Yes                 |
 
 The default binary (no `KHIVE_PACKS`/`--pack` override) loads all 8 packs: 17 + 5 + 5 +
-14 + 5 + 4 + 19 + 4 = **73 verbs**.
+14 + 6 + 4 + 19 + 4 = **74 verbs**.
 
 Verb names in the `kg` pack are bare (`create`, `search`, `link`, …). Every other pack
 namespaces its verbs with a `pack.` prefix (`gtd.assign`, `memory.recall`,
@@ -836,7 +836,7 @@ request(ops="brain.register_adapter(adapter_id=\"lora-v3\", content_hash=\"<sha2
 
 ---
 
-## `comm` pack — 5 verbs
+## `comm` pack — 6 verbs
 
 Actor-to-actor messaging with threading. Optional; load with `KHIVE_PACKS=kg,comm`.
 
@@ -904,6 +904,22 @@ Retrieve all messages in a conversation thread, ordered chronologically.
 
 ```
 request(ops="comm.thread(id=\"<thread-root-id>\")")
+```
+
+### `comm.health` — Assertive
+
+Read-only per-channel health snapshot. Returns the daemon-persisted heartbeat row for
+every known channel: timestamps and consecutive-failure counts only, never a computed
+healthy bool. Health judgment belongs to the caller. Rows are read from the pinned
+operational namespace (`local`) unconditionally, regardless of the caller's dispatch
+namespace. An empty `channels` array cannot distinguish "no daemon running" from
+"channels configured but never polled". See the
+[communication guide](communication.md) for the full response contract.
+
+No parameters.
+
+```
+request(ops="comm.health()")
 ```
 
 ---
