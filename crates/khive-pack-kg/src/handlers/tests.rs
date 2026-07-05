@@ -524,7 +524,7 @@ fn valid_relations_concept_to_concept_includes_extends() {
     use khive_runtime::KhiveRuntime;
 
     let rt = KhiveRuntime::memory().expect("in-memory runtime");
-    let rels = valid_relations_for_entity_pair(&rt, "concept", "concept");
+    let rels = valid_relations_for_entity_pair(&rt, "concept", None, "concept", None);
     assert!(
         rels.contains(&"extends"),
         "#486: concept->concept must include extends; got: {rels:?}"
@@ -550,7 +550,7 @@ fn valid_relations_unsupported_pair_returns_empty() {
     use khive_runtime::KhiveRuntime;
 
     let rt = KhiveRuntime::memory().expect("in-memory runtime");
-    let rels = valid_relations_for_entity_pair(&rt, "person", "dataset");
+    let rels = valid_relations_for_entity_pair(&rt, "person", None, "dataset", None);
     assert!(
         rels.is_empty(),
         "#486: person->dataset has no base-contract relations; got: {rels:?}"
@@ -561,14 +561,21 @@ fn valid_relations_unsupported_pair_returns_empty() {
 // separate hand-authored table (the person->project gap, issue #60, was
 // exactly this divergence class) ----
 
-// Generative cross-check: for a given (source_kind, target_kind) pair, the hint
-// set returned by `valid_relations_for_entity_pair` must equal the set of
-// relations the REAL production validator (`KgPack::handle_link`, which
-// bottoms out in `KhiveRuntime::link` -> `validate_edge_relation_endpoints`)
+// Generative cross-check: for EVERY (source_kind, target_kind) entity pair in
+// the 9x9 closed entity-kind taxonomy, the hint set returned by
+// `valid_relations_for_entity_pair` must equal the set of relations the REAL
+// production validator (`KhiveRuntime::link` -> `validate_edge_relation_endpoints`)
 // actually accepts for that pair. This calls production code on both sides —
 // it never re-implements the rule check inline.
+//
+// Codex round-1 review of #621 flagged that a five-pair spot check missed an
+// `EntityOfType`-scoped divergence (see
+// `valid_relations_hint_covers_formal_pack_entity_of_type_rules` below); this
+// sweeps the full closed kind space so a future divergence at any pair fails
+// loudly rather than only at hand-picked pairs.
 #[tokio::test]
-async fn valid_relations_hint_matches_real_validator_acceptance() {
+async fn valid_relations_hint_matches_real_validator_acceptance_across_all_entity_kind_pairs() {
+    use crate::vocab::EntityKind as KgEntityKind;
     use crate::KgPack;
     use khive_runtime::{KhiveRuntime, Namespace, VerbRegistryBuilder};
     use khive_storage::EdgeRelation;
@@ -616,31 +623,117 @@ async fn valid_relations_hint_matches_real_validator_acceptance() {
     let registry = builder.build().expect("kg registry builds");
     rt.install_edge_rules(registry.all_edge_rules());
 
-    for (src_kind, tgt_kind) in [
-        ("concept", "concept"),
-        ("project", "org"),
-        // issue #60 regression: person->project must be covered by the hint
-        // path exactly as the validator accepts it (KG_EDGE_RULES part_of +
-        // instance_of).
-        ("person", "project"),
-        ("person", "org"),
-        ("org", "org"),
-    ] {
-        let expected = accepted_relations_for(&rt, src_kind, tgt_kind).await;
-        let hinted = super::valid_relations_for_entity_pair(&rt, src_kind, tgt_kind);
-        assert_eq!(
-            hinted, expected,
-            "#543: hint set for {src_kind}->{tgt_kind} must equal the real \
-             validator's acceptance set; hinted={hinted:?} expected={expected:?}"
-        );
+    for src in KgEntityKind::ALL {
+        for tgt in KgEntityKind::ALL {
+            let (src_kind, tgt_kind) = (src.name(), tgt.name());
+            let expected = accepted_relations_for(&rt, src_kind, tgt_kind).await;
+            let hinted =
+                super::valid_relations_for_entity_pair(&rt, src_kind, None, tgt_kind, None);
+            assert_eq!(
+                hinted, expected,
+                "#543: hint set for {src_kind}->{tgt_kind} must equal the real \
+                 validator's acceptance set; hinted={hinted:?} expected={expected:?}"
+            );
+        }
     }
+}
+
+// Codex round-1 High finding on #621: `valid_relations_for_entity_pair` only
+// matched `EndpointKind::EntityOfKind` pack rules, silently omitting
+// `EndpointKind::EntityOfType` rules such as khive-pack-formal's typed
+// `concept/theorem -> concept/definition` `depends_on` rule
+// (`crates/khive-pack-formal/src/vocab.rs:29-38`) — exactly the #543
+// divergence class this PR fixes. This test proves the fix: with `kg,formal`
+// installed, the hint for the typed pair includes `depends_on`, and a
+// generative cross-check against the real validator confirms the hint set is
+// exactly the validator's acceptance set for that typed pair.
+#[tokio::test]
+async fn valid_relations_hint_covers_formal_pack_entity_of_type_rules() {
+    use crate::KgPack;
+    use khive_pack_formal::FormalPack;
+    use khive_runtime::{KhiveRuntime, Namespace, VerbRegistryBuilder};
+    use khive_storage::EdgeRelation;
+
+    let rt = KhiveRuntime::memory().expect("in-memory runtime");
+    let mut builder = VerbRegistryBuilder::new();
+    builder.register(KgPack::new(rt.clone()));
+    builder.register(FormalPack::new(rt.clone()));
+    let registry = builder.build().expect("kg+formal registry builds");
+    rt.install_edge_rules(registry.all_edge_rules());
+
+    let hinted = super::valid_relations_for_entity_pair(
+        &rt,
+        "concept",
+        Some("theorem"),
+        "concept",
+        Some("definition"),
+    );
+    assert!(
+        hinted.contains(&"depends_on"),
+        "#621 round-2: hint for concept/theorem->concept/definition must \
+         include depends_on from khive-pack-formal's EntityOfType rule; \
+         got: {hinted:?}"
+    );
+
+    // Generative cross-check on the same typed pair: create real typed
+    // entities, call the real validator across all relations, and assert the
+    // hint equals the actual acceptance set — not just a presence check.
+    let token = rt.authorize(Namespace::local()).unwrap();
+    let mut expected = Vec::new();
+    for relation in EdgeRelation::ALL {
+        if relation == EdgeRelation::Annotates {
+            continue;
+        }
+        let src = rt
+            .create_entity(
+                &token,
+                "concept",
+                Some("theorem"),
+                "src",
+                None,
+                None,
+                vec![],
+            )
+            .await
+            .expect("create typed source entity");
+        let tgt = rt
+            .create_entity(
+                &token,
+                "concept",
+                Some("definition"),
+                "tgt",
+                None,
+                None,
+                vec![],
+            )
+            .await
+            .expect("create typed target entity");
+        if rt
+            .link(&token, src.id, tgt.id, relation, 1.0, None)
+            .await
+            .is_ok()
+        {
+            expected.push(relation.as_str());
+        }
+    }
+    expected.sort_unstable();
+    expected.dedup();
+
+    assert_eq!(
+        hinted, expected,
+        "#621 round-2: hint set for typed concept/theorem->concept/definition \
+         must equal the real validator's acceptance set; hinted={hinted:?} \
+         expected={expected:?}"
+    );
 }
 
 // GTD's task->task depends_on rule is NoteOfKind-scoped, not an entity-pair
 // rule, so it structurally cannot appear in (and is correctly absent from)
 // this entity-pair hint path — a task/task mismatch produces a different
 // validation error ("must be an entity for relation ...") that never reaches
-// `enrich_allowlist_error` in the first place.
+// `enrich_allowlist_error` in the first place. This pure-function check
+// complements `gtd_task_mismatch_bypasses_enriched_hint_on_real_link_path`
+// below, which proves the same boundary on the real `handle_link` path.
 #[tokio::test]
 async fn valid_relations_hint_does_not_cover_gtd_note_scoped_rules() {
     use crate::KgPack;
@@ -656,15 +749,16 @@ async fn valid_relations_hint_does_not_cover_gtd_note_scoped_rules() {
 
     // No entity kind is named "task" (it's a note kind) so no (src_kind,
     // tgt_kind) entity pair can ever surface GTD's depends_on rule here.
-    let hinted = super::valid_relations_for_entity_pair(&rt, "project", "project");
+    let hinted = super::valid_relations_for_entity_pair(&rt, "project", None, "project", None);
     assert!(
         !hinted.is_empty(),
         "sanity: project->project must still have base-rule hints"
     );
     // The composed pack_edge_rules() DOES include GTD's rule at runtime, but
     // it is NoteOfKind("task") on both ends, so it can never satisfy the
-    // EntityOfKind match this hint function requires — confirmed by checking
-    // no entity-kind pair yields "depends_on" from a NoteOfKind source.
+    // entity-substrate match this hint function requires — confirmed by
+    // checking no entity-kind pair yields "depends_on" from a NoteOfKind
+    // source.
     assert!(
         rt.pack_edge_rules().iter().any(|r| matches!(
             (r.relation, r.source, r.target),
@@ -676,6 +770,74 @@ async fn valid_relations_hint_does_not_cover_gtd_note_scoped_rules() {
         )),
         "GTD's task->task depends_on rule must be present in the composed \
          runtime rule set (proves it's reachable, not just absent by omission)"
+    );
+}
+
+// Codex round-1 Medium finding on #621: proves the GTD boundary on the REAL
+// `KgPack::handle_link` path with real task notes, not just rule presence in
+// `pack_edge_rules()`. A task->task relation outside GTD's declared
+// `depends_on` must fail with the substrate-mismatch error ("must be an
+// entity for relation ...") and must NOT carry the enriched
+// "Valid relations:" hint -- proving `enrich_allowlist_error` is never
+// reached for a note/note mismatch. The GTD-declared relation
+// (`depends_on`) between the same two notes must still succeed.
+#[tokio::test]
+async fn gtd_task_mismatch_bypasses_enriched_hint_on_real_link_path() {
+    use crate::KgPack;
+    use khive_pack_gtd::GtdPack;
+    use khive_runtime::{KhiveRuntime, Namespace, VerbRegistryBuilder};
+
+    let rt = KhiveRuntime::memory().expect("in-memory runtime");
+    let mut builder = VerbRegistryBuilder::new();
+    builder.register(KgPack::new(rt.clone()));
+    builder.register(GtdPack::new(rt.clone()));
+    let registry = builder.build().expect("kg+gtd registry builds");
+    rt.install_edge_rules(registry.all_edge_rules());
+
+    let token = rt.authorize(Namespace::local()).unwrap();
+    let src = rt
+        .create_note(&token, "task", None, "task A", None, None, vec![])
+        .await
+        .expect("create task note A");
+    let tgt = rt
+        .create_note(&token, "task", None, "task B", None, None, vec![])
+        .await
+        .expect("create task note B");
+
+    let pack = KgPack::new(rt.clone());
+
+    // "extends" is a valid relation string but not GTD's task->task rule
+    // (only depends_on is declared NoteOfKind for task->task).
+    let params = serde_json::json!({
+        "source_id": src.id.to_string(),
+        "target_id": tgt.id.to_string(),
+        "relation": "extends",
+    });
+    let result = pack.handle_link(&token, params).await;
+    assert!(result.is_err(), "task->task extends must be rejected");
+    let err_msg = format!("{}", result.unwrap_err());
+    assert!(
+        err_msg.contains("must be an entity"),
+        "expected the substrate-mismatch error (only annotates crosses \
+         substrates), got: {err_msg}"
+    );
+    assert!(
+        !err_msg.contains("Valid relations:"),
+        "a note/note mismatch must NOT be enriched with the entity-pair hint \
+         -- enrich_allowlist_error is only reachable for entity/entity \
+         mismatches; got: {err_msg}"
+    );
+
+    // Sanity: the actual GTD-declared relation succeeds on the same two notes
+    // via the real link path.
+    let params_ok = serde_json::json!({
+        "source_id": src.id.to_string(),
+        "target_id": tgt.id.to_string(),
+        "relation": "depends_on",
+    });
+    assert!(
+        pack.handle_link(&token, params_ok).await.is_ok(),
+        "task->task depends_on must be accepted by the real link path"
     );
 }
 

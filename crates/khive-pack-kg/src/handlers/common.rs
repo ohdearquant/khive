@@ -412,26 +412,33 @@ pub(crate) fn validate_weight(weight: Option<f64>) -> Result<f64, RuntimeError> 
     Ok(w)
 }
 
-/// Relations valid for a `(src_kind, tgt_kind)` entity pair, derived from the
-/// SAME sources `validate_edge_relation_endpoints` consults when accepting or
-/// rejecting a link (issue #543): the base entity endpoint allowlist
+/// Relations valid for a `(src_kind, src_entity_type, tgt_kind,
+/// tgt_entity_type)` entity pair, derived from the SAME sources
+/// `validate_edge_relation_endpoints` consults when accepting or rejecting a
+/// link (issue #543): the base entity endpoint allowlist
 /// (`khive_runtime::operations::base_entity_endpoint_rules`) plus the
-/// runtime's live composed pack `EDGE_RULES` (`KhiveRuntime::pack_edge_rules`,
-/// the same call `pack_rule_allows` makes). There is no separate hand-authored
-/// table here — a hint can no longer diverge from what the validator itself
-/// accepts.
+/// runtime's live composed pack `EDGE_RULES`, matched through
+/// `khive_runtime::operations::accepted_pack_relations_for_entities` — the
+/// same `endpoint_matches` semantics `pack_rule_allows` applies internally
+/// (`EntityOfKind`, `EntityOfType`, `NoteOfKind`). There is no separate
+/// hand-authored table and no local re-filter of endpoint kinds here: a hint
+/// can no longer diverge from what the validator itself accepts, including
+/// pack rules scoped to a granular `entity_type` (e.g. `khive-pack-formal`'s
+/// typed `theorem -> definition` `depends_on` rule).
 ///
-/// Only `EndpointKind::EntityOfKind` pack rules are considered: this function
-/// is only ever reached (via `enrich_allowlist_error`) after both endpoints
-/// have already been resolved as entities, so note-scoped pack rules (e.g.
-/// GTD's `task` -> `task` `depends_on`, declared as `NoteOfKind`) cannot match
-/// here regardless — that path produces a different validation error entirely
-/// ("must be an entity for relation ..."), not the base-allowlist error this
-/// function enriches.
+/// Note-scoped pack rules (e.g. GTD's `task` -> `task` `depends_on`,
+/// declared as `NoteOfKind`) cannot match here regardless of the shared
+/// matcher, because this function is only ever reached (via
+/// `enrich_allowlist_error`) after both endpoints have already been resolved
+/// as entities — a note/note mismatch produces a different validation error
+/// entirely ("must be an entity for relation ..."), not the base-allowlist
+/// error this function enriches.
 pub(crate) fn valid_relations_for_entity_pair(
     runtime: &KhiveRuntime,
     src_kind: &str,
+    src_entity_type: Option<&str>,
     tgt_kind: &str,
+    tgt_entity_type: Option<&str>,
 ) -> Vec<&'static str> {
     let mut relations: Vec<&'static str> = khive_runtime::operations::base_entity_endpoint_rules()
         .iter()
@@ -439,14 +446,15 @@ pub(crate) fn valid_relations_for_entity_pair(
         .map(|(_src, rel, _tgt)| rel.as_str())
         .collect();
 
-    for rule in runtime.pack_edge_rules() {
-        let src_matches =
-            matches!(rule.source, khive_types::EndpointKind::EntityOfKind(k) if k == src_kind);
-        let tgt_matches =
-            matches!(rule.target, khive_types::EndpointKind::EntityOfKind(k) if k == tgt_kind);
-        if src_matches && tgt_matches {
-            relations.push(rule.relation.as_str());
-        }
+    let pack_rules = runtime.pack_edge_rules();
+    for rel in khive_runtime::operations::accepted_pack_relations_for_entities(
+        &pack_rules,
+        src_kind,
+        src_entity_type,
+        tgt_kind,
+        tgt_entity_type,
+    ) {
+        relations.push(rel.as_str());
     }
 
     relations.sort_unstable();
@@ -462,15 +470,21 @@ pub(crate) async fn enrich_allowlist_error(
     target_id: Uuid,
     relation: EdgeRelation,
 ) -> String {
-    let src_kind = match runtime.get_entity(token, source_id).await {
-        Ok(e) => e.kind,
+    let (src_kind, src_entity_type) = match runtime.get_entity(token, source_id).await {
+        Ok(e) => (e.kind, e.entity_type),
         Err(_) => return original.to_string(),
     };
-    let tgt_kind = match runtime.get_entity(token, target_id).await {
-        Ok(e) => e.kind,
+    let (tgt_kind, tgt_entity_type) = match runtime.get_entity(token, target_id).await {
+        Ok(e) => (e.kind, e.entity_type),
         Err(_) => return original.to_string(),
     };
-    let valid = valid_relations_for_entity_pair(runtime, &src_kind, &tgt_kind);
+    let valid = valid_relations_for_entity_pair(
+        runtime,
+        &src_kind,
+        src_entity_type.as_deref(),
+        &tgt_kind,
+        tgt_entity_type.as_deref(),
+    );
     let mut msg = if valid.is_empty() {
         format!(
             "Invalid relation {:?} for {src_kind}\u{2192}{tgt_kind}. \
