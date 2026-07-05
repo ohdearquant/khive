@@ -279,10 +279,12 @@ fn daemon_log_should_rotate(current_size: u64, cap: u64) -> bool {
 /// rotate the existing file to `<name>.1` (replacing any prior backup) if it
 /// is at or over `cap` bytes, then open (or create) it for append.
 ///
-/// Returns `None` on any failure — directory creation, rotation, or open —
-/// so the caller can fall back to `Stdio::null()`. Logging is best-effort;
-/// daemon spawn correctness is not, and the daemon is on the hot path for
-/// every MCP request.
+/// Returns `None` on directory-creation or open failure so the caller can
+/// fall back to `Stdio::null()`. A rotation (`rename`) failure is deliberately
+/// swallowed and degrades to appending to the existing over-cap file — keeping
+/// the daemon's stderr flowing to a slightly-too-large log beats losing it.
+/// Logging is best-effort; daemon spawn correctness is not, and the daemon is
+/// on the hot path for every MCP request.
 fn prepare_daemon_log_file_with_cap(log_path: &std::path::Path, cap: u64) -> Option<std::fs::File> {
     let dir = log_path.parent()?;
     std::fs::create_dir_all(dir).ok()?;
