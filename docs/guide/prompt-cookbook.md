@@ -113,8 +113,8 @@ the query and merges results.
 request(ops="neighbors(node_id=\"<uuid>\", direction=\"both\")")
 ```
 
-Use when: you want to see everything connected to a node. Always pass
-`direction="both"` unless you specifically need only outgoing or incoming edges.
+Use when: you want to see everything connected to a node. The default
+direction is `both`; pass `out` or `in` only when you need one side.
 
 ### Filtered neighbors
 
