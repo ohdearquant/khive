@@ -33,6 +33,12 @@ cargo clippy --manifest-path "$SCRIPT_DIR/../crates/khive-merge/Cargo.toml" --li
 echo "=== Clippy ==="
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 
+echo "=== Doc Build (-D warnings) ==="
+# Mirrors the "Doc build" CI job (.github/workflows/ci.yml): intra-doc link
+# breakage and other rustdoc lints are a distinct gate that check/clippy/test
+# do not cover.
+RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
+
 echo "=== Tests ==="
 cargo test --workspace
 
