@@ -149,25 +149,25 @@ available to operator-only introspection.
 The native kg pack (`khive-pack-kg`) owns the **substrate verbs** and exposes them as
 bare verb names (17 verbs total):
 
-| Verb        | Speech act  | Description                                                                                                                                                                            |
-| ----------- | ----------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `create`    | commissive  | Create an entity or note                                                                                                                                                               |
-| `get`       | assertive   | Fetch any record by UUID                                                                                                                                                               |
-| `list`      | assertive   | Structured browse with pagination                                                                                                                                                      |
-| `update`    | declaration | Patch entity or edge fields                                                                                                                                                            |
-| `delete`    | declaration | Soft or hard delete a record                                                                                                                                                           |
-| `search`    | assertive   | Hybrid FTS + vector search                                                                                                                                                             |
-| `link`      | commissive  | Create a typed directed edge                                                                                                                                                           |
-| `neighbors` | assertive   | Immediate graph neighbors; optional `include_entity_type` param enriches each hit with its entity subtype                                                                              |
-| `traverse`  | assertive   | Multi-hop BFS traversal; optional `include_properties` param enriches each path node with entity properties                                                                            |
-| `query`     | assertive   | GQL/SPARQL pattern matching                                                                                                                                                            |
-| `merge`     | declaration | Deduplicate two entities                                                                                                                                                               |
-| `propose`   | commissive  | Create a proposal for KG mutation; emits `ProposalCreated`.                                                                                                                            |
-| `review`    | declaration | Record an approve/reject decision on an open proposal; emits `ProposalReviewed`.                                                                                                       |
-| `withdraw`  | commissive  | Rescind an open proposal (proposer-only); emits `ProposalWithdrawn`.                                                                                                                   |
-| `stats`     | assertive   | Aggregate counts and health metrics for the namespace graph.                                                                                                                           |
-| `verbs`     | assertive   | Enumerate all MCP-callable verbs; supports `category` and `pack` filters.                                                                                                              |
-| `context`   | assertive   | Entity-anchored graph context in one call: resolves anchors (by ID or hybrid search), expands 1-2 hops with per-node fanout caps, and packs the result within a char budget (ADR-089). |
+| Verb        | Speech act  | Description                                                                                                                                                                                                                                                                                                                                                                                     |
+| ----------- | ----------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `create`    | commissive  | Create an entity or note. Bulk shape: pass `items` (array of entity specs, `kind` + `name` required per item, capped at 1000) instead of a top-level `kind`; `atomic` (default `true`) controls all-or-nothing vs. best-effort per-item semantics, and `verbose` includes the created entity objects in the response. Bulk-created entities skip vector embedding until a subsequent `reindex`. |
+| `get`       | assertive   | Fetch any record by UUID                                                                                                                                                                                                                                                                                                                                                                        |
+| `list`      | assertive   | Structured browse with pagination                                                                                                                                                                                                                                                                                                                                                               |
+| `update`    | declaration | Patch entity or edge fields                                                                                                                                                                                                                                                                                                                                                                     |
+| `delete`    | declaration | Soft or hard delete a record                                                                                                                                                                                                                                                                                                                                                                    |
+| `search`    | assertive   | Hybrid FTS + vector search                                                                                                                                                                                                                                                                                                                                                                      |
+| `link`      | commissive  | Create a typed directed edge                                                                                                                                                                                                                                                                                                                                                                    |
+| `neighbors` | assertive   | Immediate graph neighbors; optional `include_entity_type` param enriches each hit with its entity subtype                                                                                                                                                                                                                                                                                       |
+| `traverse`  | assertive   | Multi-hop BFS traversal; optional `include_properties` param enriches each path node with entity properties                                                                                                                                                                                                                                                                                     |
+| `query`     | assertive   | GQL/SPARQL pattern matching                                                                                                                                                                                                                                                                                                                                                                     |
+| `merge`     | declaration | Deduplicate two entities                                                                                                                                                                                                                                                                                                                                                                        |
+| `propose`   | commissive  | Create a proposal for KG mutation; emits `ProposalCreated`.                                                                                                                                                                                                                                                                                                                                     |
+| `review`    | declaration | Record an approve/reject decision on an open proposal; emits `ProposalReviewed`.                                                                                                                                                                                                                                                                                                                |
+| `withdraw`  | commissive  | Rescind an open proposal (proposer-only); emits `ProposalWithdrawn`.                                                                                                                                                                                                                                                                                                                            |
+| `stats`     | assertive   | Aggregate counts and health metrics for the namespace graph.                                                                                                                                                                                                                                                                                                                                    |
+| `verbs`     | assertive   | Enumerate all MCP-callable verbs; supports `category` and `pack` filters.                                                                                                                                                                                                                                                                                                                       |
+| `context`   | assertive   | Entity-anchored graph context in one call: resolves anchors (by ID or hybrid search), expands 1-2 hops with per-node fanout caps, and packs the result within a char budget (ADR-089).                                                                                                                                                                                                          |
 
 `verbs` was added in Wave 4 (ue-help-introspection H5) to provide a machine-readable discovery
 endpoint. It is a pure read operation with no side effects. It excludes internal subhandlers
@@ -556,6 +556,32 @@ working crate. Reference impl: `crates/khive-pack-kg/`.
 | Future `verbs_disabled` config policy                          | Deferred; requires parser, validation, and capability tests |
 | Pack template-generated crate compiles + passes smoke test     | Yes                                                         |
 
+## Amendment: dispatch-by-kind + KindHook as the mandatory pattern for future packs (2026-07-05)
+
+Per ADR-095 (F1/F3, verb-surface consolidation and field-validation governance), this
+ADR is amended with two governance rules, documentation-only, with no change to the
+current verb surface or verb count:
+
+1. New packs express CRUD-shaped operations (create/read/update/delete over an entity
+   or note kind) through the kg pack's dispatch-by-kind verbs (`create`, `search`,
+   `list`, `get`, `update`, `delete`) rather than introducing bespoke pack-prefixed
+   verbs for the same operation, unless the operation carries genuine non-CRUD domain
+   logic (a state machine, an atomic multi-step guard, or side effects beyond storing
+   a record) that dispatch-by-kind cannot express. Existing named verbs accepted for
+   exactly this reason (for example the session pack's `session.resume`, per
+   ADR-083) are unaffected; this rule governs new packs and new verbs going forward.
+2. Per-kind create-time field validation (enum checks, format checks, cross-field
+   guards) lives in that kind's `KindHook::prepare_create` implementation
+   ([ADR-017](ADR-017-pack-standard.md) §KindHook), not in a parallel handler that
+   duplicates the same checks outside the hook seam. This converges validation onto
+   one site per kind and removes the divergence risk of the same rule being
+   implemented twice.
+
+This amendment does not retire, rename, or alias any verb. See ADR-095 for the full
+argument, the rejected alternatives (wire-facing verb retirement, a composed
+field-validation registry analogous to `EDGE_RULES`), and the accompanying internal
+refactor that unifies `gtd.assign` onto the shared create-plus-`TaskHook` path.
+
 ## References
 
 - [ADR-001](ADR-001-entity-kind-taxonomy.md) — closed `EntityKind` taxonomy that packs
@@ -574,6 +600,7 @@ working crate. Reference impl: `crates/khive-pack-kg/`.
 - [ADR-028](ADR-028-pack-scoped-backends.md) — `khive.toml` operator config
 - [ADR-046](ADR-046-event-sourced-proposals.md) — Event-Sourced Proposals — source ADR for `propose`, `review`, and `withdraw` verbs
 - [ADR-089](ADR-089-context-verb.md) — source ADR for the `context` verb (entity-anchored graph context)
+- [ADR-095](ADR-095-verb-surface-consolidation.md) — verb-surface consolidation and field-validation governance; source of the dispatch-by-kind + KindHook amendment above
 
 ## Supersedes
 
