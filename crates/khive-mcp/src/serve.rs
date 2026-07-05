@@ -1358,14 +1358,7 @@ pub struct RuntimeConfigInputs<'a> {
 /// default/env model set while the MCP server serves recall from the
 /// config-file `[[engines]]` set.
 pub fn resolve_runtime_config(inputs: RuntimeConfigInputs<'_>) -> anyhow::Result<RuntimeConfig> {
-    let db_path = match inputs.db {
-        Some(":memory:") => None,
-        Some(path) => Some(PathBuf::from(path)),
-        None => {
-            let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-            Some(PathBuf::from(format!("{home}/.khive/khive.db")))
-        }
-    };
+    let db_path = khive_runtime::resolve_db_anchor(inputs.db);
 
     let packs = inputs
         .packs

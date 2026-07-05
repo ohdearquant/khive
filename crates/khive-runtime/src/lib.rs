@@ -74,8 +74,8 @@ pub use presentation::{
 pub use registry::{ObjectiveRegistry, RegisteredObjective};
 pub use retrieval::{SearchHit, SearchSource};
 pub use runtime::{
-    parse_pack_list, runtime_config_from_khive_config, BackendId, EntityTypeValidatorFn,
-    KhiveRuntime, NamespaceToken, RuntimeConfig,
+    parse_pack_list, resolve_db_anchor, runtime_config_from_khive_config, BackendId,
+    EntityTypeValidatorFn, KhiveRuntime, NamespaceToken, RuntimeConfig,
 };
 pub use secret_gate::SecretMatch;
 pub use validation::{

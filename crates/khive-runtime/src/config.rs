@@ -333,6 +333,28 @@ impl Default for RuntimeConfig {
     }
 }
 
+/// Resolve the `--db`/`KHIVE_DB` value into the db path used to ANCHOR tier-3
+/// project-local `.khive/config.toml` discovery (`KhiveConfig::load_with_home_fallback`'s
+/// `db_path` parameter), mirroring the precedence `kkernel mcp` and the MCP server use to
+/// open the database itself: `:memory:` has no file to anchor on (`None`); an explicit path
+/// anchors on that path; an unset value anchors on the default `$HOME/.khive/khive.db`.
+///
+/// This is distinct from a plain override resolver that answers "does the caller want to
+/// override `RuntimeConfig::default().db_path`?" (2-arm, `None` meaning "keep the default").
+/// `resolve_db_anchor` always resolves to a concrete anchor value (3-arm) — it materializes
+/// the same default `RuntimeConfig::default()` would apply, rather than asking whether to
+/// override it.
+pub fn resolve_db_anchor(db: Option<&str>) -> Option<std::path::PathBuf> {
+    match db {
+        Some(":memory:") => None,
+        Some(path) => Some(std::path::PathBuf::from(path)),
+        None => {
+            let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+            Some(std::path::PathBuf::from(format!("{home}/.khive/khive.db")))
+        }
+    }
+}
+
 // ---- Embedding model helpers ----
 
 /// Sanitize an embedding model name into a valid SQL table suffix.
@@ -548,5 +570,30 @@ pub(crate) fn parse_embedding_model_alias(name: &str) -> Option<EmbeddingModel> 
     match normalized.as_str() {
         "paraphrase" => Some(EmbeddingModel::ParaphraseMultilingualMiniLmL12V2),
         _ => normalized.parse().ok(),
+    }
+}
+
+#[cfg(test)]
+mod resolve_db_anchor_tests {
+    use super::resolve_db_anchor;
+
+    #[test]
+    fn memory_sentinel_maps_to_none() {
+        assert_eq!(resolve_db_anchor(Some(":memory:")), None);
+    }
+
+    #[test]
+    fn explicit_path_maps_to_some() {
+        assert_eq!(
+            resolve_db_anchor(Some("/tmp/khive-anchor-test.db")),
+            Some(std::path::PathBuf::from("/tmp/khive-anchor-test.db"))
+        );
+    }
+
+    #[test]
+    fn absent_maps_to_home_default() {
+        let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+        let expected = std::path::PathBuf::from(format!("{home}/.khive/khive.db"));
+        assert_eq!(resolve_db_anchor(None), Some(expected));
     }
 }

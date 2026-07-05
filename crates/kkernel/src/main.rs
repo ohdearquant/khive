@@ -242,14 +242,7 @@ async fn main() -> Result<()> {
             // uses. Anchoring only the explicit case and leaving the default case on
             // the process cwd would let this branch select a different topology than
             // the config the server actually resolves further down this path.
-            let db_path_hint: Option<std::path::PathBuf> = match a.db.as_deref() {
-                Some(":memory:") => None,
-                Some(p) => Some(std::path::PathBuf::from(p)),
-                None => {
-                    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-                    Some(std::path::PathBuf::from(format!("{home}/.khive/khive.db")))
-                }
-            };
+            let db_path_hint = khive_runtime::resolve_db_anchor(a.db.as_deref());
             let khive_cfg =
                 KhiveConfig::load_with_home_fallback(a.config.as_deref(), db_path_hint.as_deref())
                     .unwrap_or_default()
