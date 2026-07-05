@@ -237,6 +237,75 @@ fn map_response(
     }
 }
 
+/// Cap on `khived.log` size (bytes) before a spawn rotates it to `khived.log.1`.
+///
+/// Rotation only happens at spawn time (never mid-session): the daemon is
+/// respawned often enough (rebuilds, reconnects, stale-daemon recovery) that
+/// this alone bounds disk use, without pulling in `tracing-appender` or
+/// touching `init_tracing`'s writer.
+const DAEMON_LOG_MAX_BYTES: u64 = 16 * 1024 * 1024;
+
+/// Resolve `<home>/.khive/logs/khived.log` given an explicit `HOME` value.
+///
+/// Takes the HOME value as a parameter (rather than reading the environment
+/// directly) so the resolution logic is unit-testable without mutating
+/// process-global state. Mirrors the `Path::new(&home).join(...)` idiom used
+/// for `~/.khive/.env` resolution in `kkernel`'s `load_khive_dotenv`.
+fn daemon_log_path_from_home(home: Option<&std::ffi::OsStr>) -> Option<std::path::PathBuf> {
+    let home = home?;
+    Some(
+        std::path::Path::new(home)
+            .join(".khive")
+            .join("logs")
+            .join("khived.log"),
+    )
+}
+
+/// Resolve the daemon log path from the real process environment. Returns
+/// `None` when `HOME` is unset — the caller falls back to discarding the
+/// daemon's stderr rather than failing the spawn.
+fn daemon_log_path() -> Option<std::path::PathBuf> {
+    daemon_log_path_from_home(std::env::var_os("HOME").as_deref())
+}
+
+/// Decide whether the log at `current_size` bytes must rotate before this
+/// spawn, given a `cap` in bytes. Pulled out as a pure function so the
+/// spawn-time rotation policy is unit-testable independent of the filesystem.
+fn daemon_log_should_rotate(current_size: u64, cap: u64) -> bool {
+    current_size >= cap
+}
+
+/// Prepare `log_path` for the daemon's stderr: create its parent directory,
+/// rotate the existing file to `<name>.1` (replacing any prior backup) if it
+/// is at or over `cap` bytes, then open (or create) it for append.
+///
+/// Returns `None` on any failure — directory creation, rotation, or open —
+/// so the caller can fall back to `Stdio::null()`. Logging is best-effort;
+/// daemon spawn correctness is not, and the daemon is on the hot path for
+/// every MCP request.
+fn prepare_daemon_log_file_with_cap(log_path: &std::path::Path, cap: u64) -> Option<std::fs::File> {
+    let dir = log_path.parent()?;
+    std::fs::create_dir_all(dir).ok()?;
+    if let Ok(meta) = std::fs::metadata(log_path) {
+        if daemon_log_should_rotate(meta.len(), cap) {
+            let backup = dir.join("khived.log.1");
+            // `rename` replaces an existing destination atomically on Unix —
+            // exactly the "replace any prior .1" behavior we want.
+            let _ = std::fs::rename(log_path, &backup);
+        }
+    }
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_path)
+        .ok()
+}
+
+/// [`prepare_daemon_log_file_with_cap`] using the standing [`DAEMON_LOG_MAX_BYTES`] cap.
+fn prepare_daemon_log_file(log_path: &std::path::Path) -> Option<std::fs::File> {
+    prepare_daemon_log_file_with_cap(log_path, DAEMON_LOG_MAX_BYTES)
+}
+
 fn spawn_daemon() -> std::io::Result<()> {
     #[cfg(test)]
     SPAWN_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -248,8 +317,20 @@ fn spawn_daemon() -> std::io::Result<()> {
     cmd.arg("mcp")
         .arg("--daemon")
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
+        .stdout(Stdio::null());
+    // The daemon's tracing (including WAL/checkpoint telemetry) goes to
+    // stderr honoring KHIVE_LOG (init_tracing in kkernel's main.rs) — wiring
+    // it to /dev/null silently discards all of it. Route it to a log file
+    // instead; fall back to null on any resolution/creation failure so a
+    // logging problem never breaks the daemon spawn itself.
+    match daemon_log_path().and_then(|path| prepare_daemon_log_file(&path)) {
+        Some(file) => {
+            cmd.stderr(file);
+        }
+        None => {
+            cmd.stderr(Stdio::null());
+        }
+    }
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
@@ -2331,5 +2412,128 @@ mod tests {
         );
 
         clear_daemon_env();
+    }
+
+    // ── daemon stderr log-file helpers (no process spawned) ───────────────────
+
+    #[test]
+    fn daemon_log_path_from_home_none_when_home_unset() {
+        assert!(daemon_log_path_from_home(None).is_none());
+    }
+
+    #[test]
+    fn daemon_log_path_from_home_joins_dot_khive_logs() {
+        let home = std::ffi::OsStr::new("/home/example");
+        let path = daemon_log_path_from_home(Some(home)).expect("home present");
+        assert_eq!(
+            path,
+            std::path::PathBuf::from("/home/example/.khive/logs/khived.log")
+        );
+    }
+
+    #[test]
+    fn daemon_log_should_rotate_under_cap_is_false() {
+        assert!(!daemon_log_should_rotate(100, 1000));
+    }
+
+    #[test]
+    fn daemon_log_should_rotate_at_cap_is_true() {
+        assert!(daemon_log_should_rotate(1000, 1000));
+    }
+
+    #[test]
+    fn daemon_log_should_rotate_over_cap_is_true() {
+        assert!(daemon_log_should_rotate(1001, 1000));
+    }
+
+    #[test]
+    fn prepare_daemon_log_file_creates_dir_and_file_on_first_use() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log_path = dir.path().join(".khive").join("logs").join("khived.log");
+
+        let file = prepare_daemon_log_file_with_cap(&log_path, DAEMON_LOG_MAX_BYTES);
+
+        assert!(file.is_some(), "must create dir + file on first use");
+        assert!(log_path.exists());
+    }
+
+    #[test]
+    fn prepare_daemon_log_file_leaves_existing_when_under_cap() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log_dir = dir.path().join("logs");
+        std::fs::create_dir_all(&log_dir).expect("create log dir");
+        let log_path = log_dir.join("khived.log");
+        std::fs::write(&log_path, b"existing content\n").expect("seed existing log");
+
+        let file = prepare_daemon_log_file_with_cap(&log_path, 1_000_000);
+
+        assert!(file.is_some());
+        assert!(
+            !log_dir.join("khived.log.1").exists(),
+            "under-cap log must not be rotated"
+        );
+        let content = std::fs::read_to_string(&log_path).expect("read log");
+        assert_eq!(
+            content, "existing content\n",
+            "append-open must preserve existing content"
+        );
+    }
+
+    #[test]
+    fn prepare_daemon_log_file_rotates_when_over_cap() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log_dir = dir.path().join("logs");
+        std::fs::create_dir_all(&log_dir).expect("create log dir");
+        let log_path = log_dir.join("khived.log");
+        std::fs::write(&log_path, vec![7u8; 20]).expect("seed oversized log");
+
+        let file = prepare_daemon_log_file_with_cap(&log_path, 10);
+
+        assert!(file.is_some());
+        let backup = log_dir.join("khived.log.1");
+        assert!(backup.exists(), "oversized log must rotate to .log.1");
+        assert_eq!(
+            std::fs::metadata(&backup).expect("backup metadata").len(),
+            20,
+            "backup must retain the original oversized content"
+        );
+        assert_eq!(
+            std::fs::metadata(&log_path).expect("log metadata").len(),
+            0,
+            "post-rotation log must start fresh"
+        );
+    }
+
+    #[test]
+    fn prepare_daemon_log_file_rotation_replaces_prior_backup() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log_dir = dir.path().join("logs");
+        std::fs::create_dir_all(&log_dir).expect("create log dir");
+        let log_path = log_dir.join("khived.log");
+        let backup = log_dir.join("khived.log.1");
+        std::fs::write(&backup, b"stale backup").expect("seed stale backup");
+        std::fs::write(&log_path, vec![9u8; 20]).expect("seed oversized log");
+
+        let file = prepare_daemon_log_file_with_cap(&log_path, 10);
+
+        assert!(file.is_some());
+        let backup_content = std::fs::read(&backup).expect("read backup");
+        assert_eq!(
+            backup_content,
+            vec![9u8; 20],
+            "rotation must replace the prior .log.1, not merge with it"
+        );
+    }
+
+    #[test]
+    fn prepare_daemon_log_file_returns_none_when_dir_creation_fails() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // Put a regular FILE where the log directory needs to be, so
+        // create_dir_all cannot create a directory at that path.
+        let blocker = dir.path().join("logs");
+        std::fs::write(&blocker, b"not a directory").expect("seed blocker file");
+        let log_path = blocker.join("khived.log");
+
+        assert!(prepare_daemon_log_file_with_cap(&log_path, DAEMON_LOG_MAX_BYTES).is_none());
     }
 }
