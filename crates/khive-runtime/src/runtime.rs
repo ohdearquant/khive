@@ -622,7 +622,14 @@ impl KhiveRuntime {
     }
 
     /// Snapshot of currently-installed pack edge rules.
-    pub(crate) fn pack_edge_rules(&self) -> Vec<EdgeEndpointRule> {
+    ///
+    /// This is the SAME composed rule set `validate_edge_relation_endpoints`
+    /// consults via `pack_rule_allows` when accepting/rejecting an edge (issue
+    /// #543). Public so pack-layer error-hint code (e.g.
+    /// `khive-pack-kg`'s `valid_relations_for_entity_pair`) can derive hints
+    /// from the exact source the validator uses, rather than maintaining a
+    /// separate hand-authored table that can drift out of sync (issue #60).
+    pub fn pack_edge_rules(&self) -> Vec<EdgeEndpointRule> {
         self.edge_rules
             .read()
             .map(|g| g.clone())

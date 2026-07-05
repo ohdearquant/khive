@@ -412,79 +412,51 @@ pub(crate) fn validate_weight(weight: Option<f64>) -> Result<f64, RuntimeError> 
     Ok(w)
 }
 
-pub(crate) fn valid_relations_for_entity_pair(src_kind: &str, tgt_kind: &str) -> Vec<&'static str> {
-    const RULES: &[(&str, &str, &str)] = &[
-        ("concept", "contains", "concept"),
-        ("project", "contains", "project"),
-        ("project", "contains", "artifact"),
-        ("org", "contains", "project"),
-        ("org", "contains", "service"),
-        ("concept", "part_of", "concept"),
-        ("project", "part_of", "project"),
-        ("project", "part_of", "org"),
-        ("*", "instance_of", "concept"),
-        ("service", "instance_of", "project"),
-        ("concept", "extends", "concept"),
-        ("concept", "variant_of", "concept"),
-        ("artifact", "variant_of", "artifact"),
-        ("concept", "introduced_by", "document"),
-        ("concept", "introduced_by", "person"),
-        ("artifact", "introduced_by", "document"),
-        ("artifact", "derived_from", "dataset"),
-        ("artifact", "derived_from", "document"),
-        ("artifact", "derived_from", "project"),
-        ("artifact", "derived_from", "artifact"),
-        ("document", "precedes", "document"),
-        ("dataset", "precedes", "dataset"),
-        ("artifact", "precedes", "artifact"),
-        ("service", "precedes", "service"),
-        ("project", "precedes", "project"),
-        ("project", "depends_on", "project"),
-        ("service", "depends_on", "project"),
-        ("service", "depends_on", "service"),
-        ("service", "depends_on", "artifact"),
-        ("service", "depends_on", "dataset"),
-        ("artifact", "depends_on", "project"),
-        ("artifact", "depends_on", "service"),
-        ("concept", "enables", "concept"),
-        ("service", "enables", "concept"),
-        ("dataset", "enables", "concept"),
-        ("project", "implements", "concept"),
-        ("service", "implements", "concept"),
-        ("concept", "competes_with", "concept"),
-        ("project", "competes_with", "project"),
-        ("service", "competes_with", "service"),
-        ("concept", "composed_with", "concept"),
-        ("project", "composed_with", "project"),
-        ("concept", "supersedes", "concept"),
-        ("document", "supersedes", "document"),
-        ("artifact", "supersedes", "artifact"),
-        ("service", "supersedes", "service"),
-        ("dataset", "supersedes", "dataset"),
-        // Epistemic (ADR-055)
-        ("concept", "supports", "concept"),
-        ("document", "supports", "concept"),
-        ("dataset", "supports", "concept"),
-        ("artifact", "supports", "concept"),
-        ("concept", "refutes", "concept"),
-        ("document", "refutes", "concept"),
-        ("dataset", "refutes", "concept"),
-        ("artifact", "refutes", "concept"),
-        ("person", "part_of", "org"),
-        ("person", "instance_of", "org"),
-        ("person", "part_of", "project"),
-        ("person", "instance_of", "project"),
-        ("org", "depends_on", "org"),
-        ("org", "enables", "org"),
-        ("org", "contains", "org"),
-        ("org", "part_of", "org"),
-        ("org", "precedes", "org"),
-    ];
-    let mut relations: Vec<&'static str> = RULES
+/// Relations valid for a `(src_kind, src_entity_type, tgt_kind,
+/// tgt_entity_type)` entity pair, derived from the SAME sources
+/// `validate_edge_relation_endpoints` consults when accepting or rejecting a
+/// link (issue #543): the base entity endpoint allowlist
+/// (`khive_runtime::operations::base_entity_endpoint_rules`) plus the
+/// runtime's live composed pack `EDGE_RULES`, matched through
+/// `khive_runtime::operations::accepted_pack_relations_for_entities` — the
+/// same `endpoint_matches` semantics `pack_rule_allows` applies internally
+/// (`EntityOfKind`, `EntityOfType`, `NoteOfKind`). There is no separate
+/// hand-authored table and no local re-filter of endpoint kinds here: a hint
+/// can no longer diverge from what the validator itself accepts, including
+/// pack rules scoped to a granular `entity_type` (e.g. `khive-pack-formal`'s
+/// typed `theorem -> definition` `depends_on` rule).
+///
+/// Note-scoped pack rules (e.g. GTD's `task` -> `task` `depends_on`,
+/// declared as `NoteOfKind`) cannot match here regardless of the shared
+/// matcher, because this function is only ever reached (via
+/// `enrich_allowlist_error`) after both endpoints have already been resolved
+/// as entities — a note/note mismatch produces a different validation error
+/// entirely ("must be an entity for relation ..."), not the base-allowlist
+/// error this function enriches.
+pub(crate) fn valid_relations_for_entity_pair(
+    runtime: &KhiveRuntime,
+    src_kind: &str,
+    src_entity_type: Option<&str>,
+    tgt_kind: &str,
+    tgt_entity_type: Option<&str>,
+) -> Vec<&'static str> {
+    let mut relations: Vec<&'static str> = khive_runtime::operations::base_entity_endpoint_rules()
         .iter()
         .filter(|(src, _rel, tgt)| (*src == "*" || *src == src_kind) && *tgt == tgt_kind)
-        .map(|(_src, rel, _tgt)| *rel)
+        .map(|(_src, rel, _tgt)| rel.as_str())
         .collect();
+
+    let pack_rules = runtime.pack_edge_rules();
+    for rel in khive_runtime::operations::accepted_pack_relations_for_entities(
+        &pack_rules,
+        src_kind,
+        src_entity_type,
+        tgt_kind,
+        tgt_entity_type,
+    ) {
+        relations.push(rel.as_str());
+    }
+
     relations.sort_unstable();
     relations.dedup();
     relations
@@ -498,15 +470,21 @@ pub(crate) async fn enrich_allowlist_error(
     target_id: Uuid,
     relation: EdgeRelation,
 ) -> String {
-    let src_kind = match runtime.get_entity(token, source_id).await {
-        Ok(e) => e.kind,
+    let (src_kind, src_entity_type) = match runtime.get_entity(token, source_id).await {
+        Ok(e) => (e.kind, e.entity_type),
         Err(_) => return original.to_string(),
     };
-    let tgt_kind = match runtime.get_entity(token, target_id).await {
-        Ok(e) => e.kind,
+    let (tgt_kind, tgt_entity_type) = match runtime.get_entity(token, target_id).await {
+        Ok(e) => (e.kind, e.entity_type),
         Err(_) => return original.to_string(),
     };
-    let valid = valid_relations_for_entity_pair(&src_kind, &tgt_kind);
+    let valid = valid_relations_for_entity_pair(
+        runtime,
+        &src_kind,
+        src_entity_type.as_deref(),
+        &tgt_kind,
+        tgt_entity_type.as_deref(),
+    );
     let mut msg = if valid.is_empty() {
         format!(
             "Invalid relation {:?} for {src_kind}\u{2192}{tgt_kind}. \

@@ -275,6 +275,39 @@ fn endpoint_matches(
     }
 }
 
+/// Relations that a composed pack `EDGE_RULES` set accepts for a given
+/// `(entity_kind, entity_type)` endpoint pair, using the EXACT SAME
+/// `endpoint_matches` semantics `pack_rule_allows` applies internally
+/// (`EntityOfKind`, `EntityOfType`, `NoteOfKind`) — never a re-filtered copy.
+///
+/// Both endpoints are treated as entities (substrate `"entity"`), matching
+/// the only case pack-layer error-hint code needs (issue #543): a rejected
+/// `link` between two already-resolved entities. `entity_type` is the
+/// pack-owned granular subtype (e.g. `"theorem"`); pass `None` for
+/// untyped entities. Exposed so `khive-pack-kg`'s hint derivation cannot
+/// silently diverge from the validator by only matching `EntityOfKind` and
+/// missing pack rules declared via `EntityOfType` (e.g. `khive-pack-formal`'s
+/// typed `theorem -> definition` `depends_on` rules).
+pub fn accepted_pack_relations_for_entities(
+    rules: &[EdgeEndpointRule],
+    src_kind: &str,
+    src_entity_type: Option<&str>,
+    tgt_kind: &str,
+    tgt_entity_type: Option<&str>,
+) -> Vec<EdgeRelation> {
+    let mut relations: Vec<EdgeRelation> = rules
+        .iter()
+        .filter(|r| {
+            endpoint_matches(&r.source, "entity", src_kind, src_entity_type)
+                && endpoint_matches(&r.target, "entity", tgt_kind, tgt_entity_type)
+        })
+        .map(|r| r.relation)
+        .collect();
+    relations.sort_by_key(|r| r.as_str());
+    relations.dedup();
+    relations
+}
+
 /// `true` if any pack-declared edge endpoint rule allows the
 /// `(source, relation, target)` triple. Pack rules are additive only.
 fn pack_rule_allows(
