@@ -1,10 +1,12 @@
 # ADR-056: Channel Transport Layer -- `khive-channel` and External Messaging Adapters
 
 **Status**: Accepted (amended 2026-07-02 -- inbound authentication hardening; amended 2026-07-03
--- Exchange Online no-authserv-id boundary; see
+-- Exchange Online no-authserv-id boundary; amended 2026-07-05 -- Telegram adapter
+implementation and two-way chat; see
 [§Amendment 2026-07-02](#amendment-2026-07-02----inbound-authentication-hardening),
-[§Amendment 2026-07-03](#amendment-2026-07-03----exchange-online-no-authserv-id-boundary))\
-**Date**: 2026-06-14 (amended 2026-07-02, 2026-07-03)\
+[§Amendment 2026-07-03](#amendment-2026-07-03----exchange-online-no-authserv-id-boundary),
+[§Amendment 2026-07-05](#amendment-2026-07-05----telegram-adapter-implementation-and-two-way-chat))\
+**Date**: 2026-06-14 (amended 2026-07-02, 2026-07-03, 2026-07-05)\
 **Authors**: khive maintainers
 **Depends on**: ADR-017 (Pack Standard), ADR-018 (Authorization Gate), ADR-040 (Communication
 and Schedule Packs), ADR-053 (ActorStore / SessionStore -- extends ADR-018's actor model)\
@@ -227,6 +229,147 @@ to `parse_header` (recognize the no-`authserv-id` header form), `select_trusted`
 the auth-leg alignment check, and the config trust-anchor parse; the connector, dedup, quarantine
 disposition, and dispatch-gate invariants are untouched. Implementation follows this accepted
 revision.
+
+## Amendment 2026-07-05 -- Telegram adapter implementation and two-way chat
+
+### Motivation
+
+The maintainer wants a real-time **chat** channel (greetings, nudges, reminders)
+that is separate from email. Email remains the decision and tracking thread;
+chat is the lightweight side channel. Concretely, `comm.send(to="telegram:maintainer")`
+must deliver a message to the maintainer's Telegram, and the maintainer's replies
+must arrive as inbound `comm` messages that wake the inbox monitor -- the same
+two-way shape email already has.
+
+### The outbound path is live, not deferred (un-stales §5c/§5d)
+
+ADR-056 §5c/§5d mark the outbound path and reply routing DEFERRED. That labeling
+is stale relative to the shipped code: the email adapter made outbound delivery
+live via a per-channel **outbox loop**. `spawn_email_channel_loops`
+(`khive-mcp/src/serve.rs`) spawns two tasks under the daemon role -- an inbound
+`channel_poll_loop` and a `channel_outbox_loop` that drains outbound `message`
+notes destined for the channel and calls the channel's `Channel::send`. Outbound
+therefore already works for a live adapter; §5c/§5d describe an earlier plan, not
+the current mechanism.
+
+This amendment records that current mechanism as the normative outbound design and
+applies it to Telegram: a `channel-telegram`-feature-gated
+`spawn_telegram_channel_loops`, mirroring `spawn_email_channel_loops`, spawns a
+Telegram poll loop and a Telegram outbox loop holding an `Arc<TelegramChannel>`.
+No change to the comm pack, the `comm.ingest` verb, the dispatch gate, the dedup
+index, or the envelope: Telegram reuses all of them exactly as email does.
+
+### The `khive-channel-telegram` crate
+
+A new sibling crate `crates/khive-channel-telegram` (named throughout ADR-056 §1)
+implements the `Channel` trait for the Telegram Bot API:
+
+- `kind()` -> `"telegram"`.
+- `send(envelope)` -> HTTP `POST https://api.telegram.org/bot<TOKEN>/sendMessage`
+  with `{chat_id, text}`. Reuses the workspace `reqwest` client (v0.12,
+  rustls-tls + json) -- the same client the email adapter's OAuth path uses. No
+  Telegram SDK: the Bot API is plain HTTPS + JSON.
+- `poll(since)` -> `getUpdates` long-poll with an in-memory `offset` watermark
+  (ADR-056 §7: long-poll is the default; the embedded/mini deployment has no
+  routable public URL, so no webhook). Each update becomes a `ChannelEnvelope`.
+  Offset persistence is covered in its own section below.
+- Inbound authentication by numeric `chat.id` (ADR-056 §8, unchanged; the
+  2026-07-02 email hardening explicitly exempts Telegram's transport-authenticated
+  `chat.id`). An update whose `chat.id` != the configured maintainer chat id
+  returns `ChannelError::UnauthorizedSender` and is dropped with no note (ADR-056
+  §8 Telegram drop behavior, unchanged -- no quarantine, that is email-only).
+- `external_id` = `tg:{chat_id}:{update_id}` (ADR-056 §3), the primary dedup key
+  through the existing `idx_comm_message_external_id` unique index (§10/§11).
+
+### Poll offset and restart durability
+
+The `offset` watermark is held **in memory** in the Telegram poll loop, mirroring
+the email poll loop's in-memory `last_poll` timestamp (`channel_poll_loop` in
+`khive-mcp/src/serve.rs`). It is NOT persisted -- not to a khive content store and
+not to a new transport-state table. Restart durability does not depend on a stored
+cursor: (1) Telegram's `getUpdates` confirms and drops updates below a
+previously-acknowledged offset server-side, and (2) any update re-delivered in the
+still-unconfirmed window is idempotently rejected by the existing `external_id`
+unique index (`tg:{chat_id}:{update_id}`). This is the same durability model the
+email adapter already relies on: its IMAP cursor is likewise not persisted; the
+dedup index is the durable guard. FindExisting -- no new schema, no new table.
+
+ADR-028's pack-scoped-backend cursor-persistence pattern is available but is
+deliberately not used for the poll cursor here, exactly as the email adapter
+does not use it -- the in-memory watermark plus the durable dedup index is
+sufficient, and consistency with the shipped adapter wins.
+
+### Outbound addressing (the one new decision)
+
+Outbound recipients use the channel-prefixed form `telegram:<slug>` (ADR-056 OQ-1
+Option A, matching `email:<addr>`). The Telegram outbox loop recognizes the
+`telegram:` prefix, strips it, and resolves `<slug>` to a numeric `chat_id`:
+
+- v1 is single-maintainer. The only routable slug is the maintainer slug
+  (default `maintainer`, overridable by `KHIVE_TELEGRAM_MAINTAINER_SLUG`), which
+  resolves to `KHIVE_TELEGRAM_MAINTAINER_CHAT_ID`. An outbound note addressed to
+  any other `telegram:` slug is unroutable and is logged and dropped (never sent
+  to the maintainer chat by default) -- no silent misdelivery.
+- The `chat_id` is env configuration only. It is never written to the KG, a note
+  property, or any content verb (ADR-056 §9).
+
+Inbound envelopes carry `from = "telegram:<maintainer-slug>"` (channel-prefixed,
+OQ-1 Option A) so an agent can reply with `comm.reply`, which the outbox loop
+routes back out through `telegram:<slug>`.
+
+Operational precondition (Telegram-specific): a bot cannot initiate a direct
+message. The maintainer must send `/start` to the bot once; the first `getUpdates`
+response then surfaces the `chat.id`, which the operator reads and sets as
+`KHIVE_TELEGRAM_MAINTAINER_CHAT_ID`. Until the chat id is configured, the adapter
+authenticates nothing and drops all inbound (fail-closed). The bot token itself is
+created by the maintainer in BotFather and placed into the deploy node's
+keychain/env by the maintainer's own hand -- it is never handled in plaintext by an
+agent and never stored in any khive store.
+
+### Configuration (env-only, mirroring §14)
+
+| Variable                            | Required | Default      | Description                                                                                               |
+| ----------------------------------- | -------- | ------------ | --------------------------------------------------------------------------------------------------------- |
+| `KHIVE_TELEGRAM_BOT_TOKEN`          | yes      | --           | Bot API token (BotFather). Never logged (masked `{first6}...[N chars]`), never stored in any khive store. |
+| `KHIVE_TELEGRAM_MAINTAINER_CHAT_ID` | yes      | --           | The single authorized inbound sender AND the outbound recipient for the maintainer slug. Numeric.         |
+| `KHIVE_TELEGRAM_MAINTAINER_SLUG`    | no       | `maintainer` | The slug in `telegram:<slug>` that maps to the maintainer chat id.                                        |
+| `KHIVE_TELEGRAM_INGEST_NAMESPACE`   | no       | `local`      | Target namespace for ingested inbound messages (passed as `namespace` to `comm.ingest`).                  |
+
+When any required variable is absent, `TelegramChannelConfig::from_env()` returns
+`ChannelError::Config`; the server logs a warning and skips the Telegram adapter
+without crashing (mirrors the email adapter, §14).
+
+**Inbound target namespace (deploy-config, not a code decision).** For the
+two-way-chat deployment, `KHIVE_TELEGRAM_INGEST_NAMESPACE` is set to the target
+agent's namespace so the maintainer's replies land in that agent's `comm.inbox`
+and wake its monitor. This is the namespace-alignment requirement of ADR-056 §5a
+applied to Telegram.
+
+### Feature gating
+
+`khive-mcp/Cargo.toml` gains `channel-telegram = ["khive-channel",
+"khive-channel-telegram"]` with `khive-channel-telegram` an optional dependency,
+mirroring `channel-email`. Default build excludes it (no Telegram dependency
+compiled). `channel-email` and `channel-telegram` can be enabled together; the
+`ChannelRegistry` already keys by `(kind, slug)` (#606), so both adapters coexist.
+
+### Consequences
+
+- `comm.inbox`/`read`/`reply`/`thread` unchanged for agents; two-way Telegram chat
+  works through the existing verbs with no API change.
+- The comm pack, `comm.ingest`, the dispatch gate, the dedup index, and the
+  envelope are untouched -- Telegram reuses them exactly as email does.
+- A new `khive-channel-telegram` crate at the platform layer; a
+  `channel-telegram`-gated `spawn_telegram_channel_loops` in `khive-mcp`.
+- No credentials in any note, entity, or KG store; bot token env/keychain only.
+- The §5c/§5d "DEFERRED" labels are superseded by the live outbox-loop mechanism
+  documented here (they described an earlier plan).
+
+### Out of scope (v1)
+
+- Multi-recipient / group chats, inline keyboards, media (text only for v1).
+- Webhook inbound (long-poll only until a public-URL deployment exists -- ADR-056 §7).
+- A general `telegram:<slug>` address book beyond the single maintainer slug.
 
 ## Context
 
