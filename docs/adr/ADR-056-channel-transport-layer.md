@@ -579,22 +579,22 @@ namespace checked at inbox time, the note is written but never appears. Therefor
 
 1. `comm.ingest` MUST declare `"namespace"` as a named `ParamDef` in its `HandlerDef`. This
    makes dispatch forward it to the handler rather than strip it.
-2. The ingest loop MUST always pass `"namespace": "<target_agent_namespace>"` (e.g.,
-   `"lambda:khive"`) explicitly in every `comm.ingest` dispatch call.
+2. The ingest loop MUST always pass `"namespace": "<target_agent_namespace>"` explicitly
+   in every `comm.ingest` dispatch call.
 
 Params:
 
-| Param          | Type   | Required | Description                                                                                                                                  |
-| -------------- | ------ | -------- | -------------------------------------------------------------------------------------------------------------------------------------------- |
-| `namespace`    | string | yes      | Target agent namespace (e.g., `"lambda:khive"`). Declared as `ParamDef` so dispatch forwards rather than strips it. Must match `comm.inbox`. |
-| `from`         | string | yes      | Sender address. Preserved as channel-prefixed form (see open question §OQ-1).                                                                |
-| `to`           | string | yes      | Recipient logical address.                                                                                                                   |
-| `content`      | string | yes      | Message body.                                                                                                                                |
-| `subject`      | string | no       | Optional subject line.                                                                                                                       |
-| `thread_id`    | string | no       | 36-char UUID; supplied after thread resolution (§5b).                                                                                        |
-| `channel_kind` | string | no       | `"telegram"`, `"email"`. Stored in `properties.channel_kind`.                                                                                |
-| `external_id`  | string | no       | Transport id. Stored in `properties.external_id`; primary dedup key.                                                                         |
-| `sent_at`      | string | no       | RFC 3339; defaults to now.                                                                                                                   |
+| Param          | Type   | Required | Description                                                                                                                                                                     |
+| -------------- | ------ | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `namespace`    | string | yes      | Target agent namespace (the namespace whose `comm.inbox` the message must land in). Declared as `ParamDef` so dispatch forwards rather than strips it. Must match `comm.inbox`. |
+| `from`         | string | yes      | Sender address. Preserved as channel-prefixed form (see open question §OQ-1).                                                                                                   |
+| `to`           | string | yes      | Recipient logical address.                                                                                                                                                      |
+| `content`      | string | yes      | Message body.                                                                                                                                                                   |
+| `subject`      | string | no       | Optional subject line.                                                                                                                                                          |
+| `thread_id`    | string | no       | 36-char UUID; supplied after thread resolution (§5b).                                                                                                                           |
+| `channel_kind` | string | no       | `"telegram"`, `"email"`. Stored in `properties.channel_kind`.                                                                                                                   |
+| `external_id`  | string | no       | Transport id. Stored in `properties.external_id`; primary dedup key.                                                                                                            |
+| `sent_at`      | string | no       | RFC 3339; defaults to now.                                                                                                                                                      |
 
 The handler writes exactly one `message` note with `direction=inbound` into the namespace from
 the `namespace` param. Deduplication is atomic: the handler calls `try_create_note`, which uses
