@@ -7,7 +7,7 @@ description: Work the knowledge graph as typed entities and edges — search bef
 The kg pack is the shared, cross-project knowledge graph: typed entities (9 kinds), a closed set
 of edge relations (17), and notes. Sixteen verbs — `create`, `get`, `list`, `search`, `update`,
 `delete`, `merge`, `link`, `neighbors`, `traverse`, `query`, `stats`, `propose`, `review`,
-`withdraw`, `verbs` — but the thing worth learning is the *graph discipline*, not the verb list.
+`withdraw`, `verbs` — but the thing worth learning is the _graph discipline_, not the verb list.
 Per-verb param detail is one call away: `request(ops="create(help=true)")`.
 
 **Namespace (ADR-007).** kg ops always use the shared `local` namespace, even when the server
@@ -40,13 +40,13 @@ facts like year or language are **properties**, not edges.
 
 Then wire it in with `link` — direction matters:
 
-| Relation        | FROM → TO             | Reads as                              |
-| --------------- | --------------------- | ------------------------------------- |
-| `instance_of`   | specific → general    | GQA instance_of grouped-attention     |
-| `extends`       | child → parent        | QLoRA extends LoRA                    |
-| `introduced_by` | concept → paper       | LoRA introduced_by Hu-2021            |
-| `implements`    | code → concept        | lattice-inference implements GQA      |
-| `depends_on`    | consumer → dependency | quantization depends_on calibration   |
+| Relation        | FROM → TO             | Reads as                            |
+| --------------- | --------------------- | ----------------------------------- |
+| `instance_of`   | specific → general    | GQA instance_of grouped-attention   |
+| `extends`       | child → parent        | QLoRA extends LoRA                  |
+| `introduced_by` | concept → paper       | LoRA introduced_by Hu-2021          |
+| `implements`    | code → concept        | lattice-inference implements GQA    |
+| `depends_on`    | consumer → dependency | quantization depends_on calibration |
 
 Reach minimum density before you stop: concepts ≥ 4 edges, projects ≥ 3, documents ≥ 2. If the
 relation you want is not one of the 17, it is probably a property.

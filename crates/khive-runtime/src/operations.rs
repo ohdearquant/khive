@@ -1738,7 +1738,7 @@ impl KhiveRuntime {
         // `dedup_by_key` adjacent-comparable and otherwise discards it. This
         // is the ADR-089 amended neighbor-ordering contract and must hold at
         // every call site of this op (context and neighbors verb alike),
-        // for every direction (ADR-089 context-verb review, codex round 2, High).
+        // for every direction (ADR-089 context-verb review, internal review round 2, High).
         hits.sort_by(|a, b| {
             b.weight
                 .partial_cmp(&a.weight)
@@ -2211,7 +2211,7 @@ impl KhiveRuntime {
             }
         }
 
-        // Codex round 2 Medium (PR #407): resolve embedding_model BEFORE any
+        // internal review round 2 Medium (PR #407): resolve embedding_model BEFORE any
         // note/FTS/vector write so unknown-model errors are atomic at the
         // runtime layer, not just at one pack handler. Direct Rust callers
         // (other packs, integration tests) get the same guarantee.
@@ -2251,7 +2251,7 @@ impl KhiveRuntime {
         } else {
             // Fan out to ALL registered models — includes both lattice models
             // from RuntimeConfig and any custom providers added via
-            // register_embedder() (codex High #1, PR #444).
+            // register_embedder() (internal review High #1, PR #444).
             // Gate on the registry, not config().embedding_model, so that
             // custom-only runtimes (no lattice model in config) also fan out.
             let names = self.registered_embedding_model_names();
@@ -2408,7 +2408,7 @@ impl KhiveRuntime {
                     Ok(Ok(vec)) => vectors.push(vec),
                 }
             }
-            // TODO(P2): parallelize vector inserts (codex review #444)
+            // TODO(P2): parallelize vector inserts (internal review #444)
             let mut inserted_models: Vec<String> = Vec::with_capacity(embed_model_names.len());
             for (model_name, vector) in embed_model_names.iter().zip(vectors.into_iter()) {
                 let insert_result = match self.vectors_for_model(token, model_name) {
@@ -2703,7 +2703,7 @@ impl KhiveRuntime {
         // soft-delete/kind filtering happen *after* this, and the final
         // `hits.truncate(limit)` is the only result-limiting cut. Truncating to
         // `candidates` here would drop a high-salience note ranked just outside
-        // the raw RRF cutoff before salience ever applied (codex #526).
+        // the raw RRF cutoff before salience ever applied (review #526).
         let fuse_k = text_hits.len() + vector_hits.len();
         let fused = crate::fusion::rrf_fuse_k(text_hits, vector_hits, RRF_K, fuse_k)?;
 
@@ -2957,7 +2957,7 @@ impl KhiveRuntime {
     /// By-ID contract (ADR-007): UUID v4 is globally unique — by-ID substrate
     /// inference must return the record regardless of caller namespace.  Used by
     /// the public `update` and `delete` verb handlers when no explicit `kind` is
-    /// supplied (PR-A1 / codex r2).
+    /// supplied (PR-A1).
     ///
     /// Does NOT consult the visible set or the primary-namespace check.  The
     /// token is still required to route to the correct backend pool but its
@@ -3168,7 +3168,7 @@ impl KhiveRuntime {
             self.text_for_notes(&record_tok)?
                 .delete_document(&record_ns, id)
                 .await?;
-            // Codex High 2 (PR #407): scoped delete — iterate over EVERY
+            // internal review High 2 (PR #407): scoped delete — iterate over EVERY
             // registered embedding model's vector store so non-default vectors
             // don't orphan when the note is deleted.
             for model_name in self.registered_embedding_model_names() {
@@ -3575,14 +3575,14 @@ impl KhiveRuntime {
         patch: crate::curation::EdgePatch,
     ) -> RuntimeResult<Edge> {
         // Fetch the edge by UUID — ID-only, no namespace check (PR-A1).
-        // get_edge already uses the record's stored namespace internally (codex r1 fix).
+        // get_edge already uses the record's stored namespace internally.
         let graph_for_fetch = self.graph(token)?;
         let mut edge = graph_for_fetch
             .get_edge(LinkId::from(edge_id))
             .await?
             .ok_or_else(|| crate::RuntimeError::NotFound(format!("edge {edge_id}")))?;
 
-        // PR-A1 (codex r2): after fetching, all mutations and validation must use the
+        // PR-A1: after fetching, all mutations and validation must use the
         // RECORD's namespace, not the caller's.  Derive record_tok from the stored edge
         // namespace so that endpoint validation, raw-SQL predicates, and graph routing
         // all address the correct backend partition.
@@ -4242,7 +4242,7 @@ mod tests {
         KhiveRuntime::memory().unwrap()
     }
 
-    // ── Fix-1 regression (codex High #1, PR #444) ────────────────────────────
+    // ── Fix-1 regression (internal review High #1, PR #444) ────────────────────────────
     // A runtime with no `config.embedding_model` but a custom registered
     // embedder must fan out create_note through that embedder and store a
     // vector so recall can find the note.
@@ -8483,7 +8483,7 @@ mod tests {
 
     // ---- PR #82 round-2 regression: edge-ID hard-delete path ----
     //
-    // Bug class (codex R2): delete_edge drove the primary-edge guard through get_edge()
+    // Bug class: delete_edge drove the primary-edge guard through get_edge()
     // (live-only) and the cascade through neighbors() (live-only). Two reachable holes:
     // (a) soft-deleted primary edge cannot be hard-purged via its own ID;
     // (b) an already-soft-deleted annotates edge targeting a base edge survives that
@@ -9006,7 +9006,7 @@ mod tests {
         // Create under "lambda:leo".
         let leo_tok = NamespaceToken::for_namespace(Namespace::parse("lambda:leo").unwrap());
         let entity = rt
-            .create_entity(&leo_tok, "concept", None, "Leo-Entity", None, None, vec![])
+            .create_entity(&leo_tok, "concept", None, "Peer-Entity", None, None, vec![])
             .await
             .unwrap();
         assert_eq!(entity.namespace, "lambda:leo");
@@ -9031,7 +9031,7 @@ mod tests {
                 &leo_tok,
                 "concept",
                 None,
-                "Leo-Entity-Update",
+                "Peer-Entity-Update",
                 None,
                 None,
                 vec![],
@@ -9042,7 +9042,7 @@ mod tests {
         // Update from "local" token — must not error with NotFound.
         let local_tok = NamespaceToken::local();
         let patch = crate::curation::EntityPatch {
-            name: Some("Leo-Entity-Updated".to_string()),
+            name: Some("Peer-Entity-Updated".to_string()),
             ..Default::default()
         };
         let result = rt.update_entity(&local_tok, entity.id, patch).await;
@@ -9051,7 +9051,7 @@ mod tests {
             "update_entity from local token must succeed on lambda:leo entity; got {:?}",
             result
         );
-        assert_eq!(result.unwrap().name, "Leo-Entity-Updated");
+        assert_eq!(result.unwrap().name, "Peer-Entity-Updated");
     }
 
     #[tokio::test]
@@ -9063,7 +9063,7 @@ mod tests {
                 &leo_tok,
                 "concept",
                 None,
-                "Leo-Entity-Delete",
+                "Peer-Entity-Delete",
                 None,
                 None,
                 vec![],
@@ -9331,7 +9331,7 @@ mod tests {
     #[test]
     fn endpoint_of_type_requires_base_kind_match() {
         // Regression: an entity with entity_type="theorem" but base kind != "concept"
-        // must NOT match a formal concept rule. This was the exact bypass codex named:
+        // must NOT match a formal concept rule. This was the exact bypass:
         // before the fix, EntityOfType("theorem") ignored the base kind entirely.
         let wrong_base_kind = "project"; // not "concept"
         let et = Some("theorem");

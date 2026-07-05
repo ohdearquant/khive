@@ -1033,13 +1033,13 @@ mod tests {
         );
     }
 
-    /// PR #389 codex round-1 High-1 regression: `search(kind="note", ...)` must
+    /// PR #389 internal review round 1 High-1 regression: `search(kind="note", ...)` must
     /// not hard-fail on a residual FTS5 metacharacter.
     ///
     /// `sanitize_fts5_query` (khive-db) strips known-unsafe characters like `$`,
     /// but by design stays minimal — it does not strip every character SQLite
-    /// FTS5's bareword parser rejects. `@` is one of 17 residual characters codex
-    /// round 1 found still crash the parser. Before this fix, `search_notes`
+    /// FTS5's bareword parser rejects. `@` is one residual character that still
+    /// crashes the parser. Before this fix, `search_notes`
     /// (khive-runtime/operations.rs) propagated that FTS error with `.await?`,
     /// so `search(kind="note")` aborted instead of degrading to vector-only
     /// results — unlike the entity branch and `memory.recall`, which already

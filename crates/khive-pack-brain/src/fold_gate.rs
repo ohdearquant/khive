@@ -184,7 +184,7 @@ pub async fn apply_fold_gate(
         Ok(outcome) => match exec_stmt(writer.as_mut(), "COMMIT", vec![], "commit").await {
             Ok(()) => Ok(outcome),
             Err(e) => {
-                // Finding 3 (codex round 1): a failed COMMIT must not skip the
+                // Finding 3 (internal review round 1): a failed COMMIT must not skip the
                 // rollback. The connection is dropped either way on a
                 // file-backed pool, but an explicit ROLLBACK avoids leaving a
                 // held write lock if the connection is pooled/reused
@@ -215,7 +215,7 @@ pub enum FeedbackGateMode {
     Nominal(f64),
     /// ADR-081 §4 fail-safe: the serve ledger row has no resolvable
     /// accounting profile. Always folds at zero weight and never writes
-    /// `brain_implicit_mass` — but (Finding 2, codex round 2) still
+    /// `brain_implicit_mass` — but (Finding 2, internal review round 2) still
     /// participates in the `(scorer_run_id, serve_ledger_id)` dedup claim,
     /// atomically with the event append, so two concurrent forced-zero
     /// submissions for the same pair cannot both append an audit event.
@@ -251,7 +251,7 @@ pub enum GateAndAppendOutcome {
     Applied(Box<GateAndAppendResult>),
 }
 
-/// ADR-081 §2/§6 (Finding 1 + Finding 2, codex round 2 review of PR #497):
+/// ADR-081 §2/§6 (Finding 1 + Finding 2 for PR #497):
 /// claim the `(scorer_run_id, serve_ledger_id)` dedup key (if supplied), run
 /// the bounded-mass fold gate (or skip it for `ForcedZero`), and append the
 /// resulting `brain.feedback` event — as ONE atomic, all-or-nothing unit on
@@ -472,7 +472,7 @@ async fn fold_within_tx(
     let mass_before = decayed_mass(old_mass, now_us - last_event_at);
     let (effective_weight, mass_after) = gate_decision(mass_before, weight, IMPLICIT_MASS_CAP);
 
-    // Finding 2 (codex round 1): never move `last_event_at` backwards. A
+    // Finding 2 (internal review round 1): never move `last_event_at` backwards. A
     // negative `delta_us` above (clock skew) already keeps `mass_before`
     // undecayed and the event clamps/folds conservatively, but persisting
     // `now_us` verbatim would still drag the accumulator's clock back to the
@@ -742,7 +742,7 @@ mod tests {
         (rt, dir)
     }
 
-    /// Proves the Finding-1 fix (codex round 1): concurrent duplicate scorer
+    /// Proves the Finding-1 fix (internal review round 1): concurrent duplicate scorer
     /// submissions — identical `(scorer_run_id, serve_ledger_id)` — fold
     /// exactly once, regardless of scheduling order.
     ///
@@ -868,7 +868,7 @@ mod tests {
         );
     }
 
-    /// Proves the Finding-2 fix (codex round 1): a negative-clock-skew event
+    /// Proves the Finding-2 fix (internal review round 1): a negative-clock-skew event
     /// must never drag the accumulator's `last_event_at` backwards, or a
     /// later, correctly-ordered event would decay mass that should still be
     /// at full weight and pass the clamp early.
@@ -1003,7 +1003,7 @@ mod tests {
         assert!((outcome2.mass_after - IMPLICIT_MASS_CAP).abs() < 1e-9);
     }
 
-    /// Proves the Finding-1 fix (codex round 2 review of PR #497): if the
+    /// Proves the Finding-1 fix for PR #497: if the
     /// feedback event append fails AFTER a successful dedup claim, the whole
     /// atomic unit — claim and (skipped-on-clamp-aside) mass write included
     /// — rolls back, so a retry sees no claim and proceeds normally.
@@ -1014,8 +1014,8 @@ mod tests {
     /// constraint violation on the INSERT, not a mock. `append_event_on_writer`'s
     /// INSERT has no `OR IGNORE`, so the conflict surfaces as an `Err` from
     /// `SqlWriter::execute`, propagating out of `apply_fold_gate_and_append_event`
-    /// before `COMMIT` — exercising exactly the rollback path codex flagged
-    /// as untested (before this fix, the claim+fold committed in their own
+    /// before `COMMIT` — exercising the previously untested rollback path
+    /// (before this fix, the claim+fold committed in their own
     /// transaction before the event append ran in a separate one, so this
     /// scenario could not roll back the claim at all).
     #[tokio::test]
@@ -1264,7 +1264,7 @@ mod tests {
         );
     }
 
-    /// Proves the Finding-2 fix (codex round 2 review of PR #497): the
+    /// Proves the Finding-2 fix for PR #497: the
     /// ADR-081 §4 forced-zero fail-safe (`FeedbackGateMode::ForcedZero`) now
     /// claims the dedup key atomically, on the SAME held transaction as the
     /// (skipped) mass fold and the event append — so N concurrent identical

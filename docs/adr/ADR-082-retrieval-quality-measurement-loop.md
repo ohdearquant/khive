@@ -2,7 +2,7 @@
 
 **Status**: proposed
 **Date**: 2026-07-02
-**Authors**: Ocean, lambda:khive
+**Authors**: khive maintainers
 **Depends on**: [ADR-015](ADR-015-schema-migrations.md) (Schema Migrations), [ADR-023](ADR-023-declarative-pack-format.md) (Pack Verb Surface, Visibility, and Composition — `Visibility::Subhandler`), [ADR-047](ADR-047-knowledge-pack.md) (Knowledge Pack)
 **GitHub**: #80
 **Note**: this number was previously used by a retired v0-series draft ("Engine
@@ -33,7 +33,7 @@ The real gap issue #80 surfaces is structural, not nominal: **no labeled query s
 evaluation run, and no persisted retrieval-quality signal exist anywhere in the system.**
 Retrieval quality has never been measured against ground truth. The one measurement that
 exists is qualitative and off-system: a 2026-06-10 12-probe study
-(`.khive/workspaces/20260610/knowledge-utilization/usage_patterns.md`, local and
+(local knowledge-utilization usage-pattern notes and
 gitignored) found a 50% useful-rate on real project questions, with reproducible gaps in
 specific domains (SQLite WAL internals, speculative decoding, Metal/MSL, admissions ML).
 That finding is not recorded anywhere the system itself can read, aggregate, or track
@@ -58,11 +58,11 @@ conventions here do not fit that use case).
 
 ### Scoping and rulings
 
-`.khive/workspaces/20260626/issue80-scoping/SCOPING.md` (alpha:architect, 2026-06-26)
-scoped this issue into four design forks and two Ocean-gated escalations: (1) verb
+local issue-80 scoping notes (2026-06-26)
+scoped this issue into four design forks and two maintainer-gated escalations: (1) verb
 contract and visibility for the eval runner, (2) labeled query-set location and data
 policy, (3) how `eval_coverage` gets computed and persisted, (4) feedback-grown set
-expansion. This ADR formalizes lambda:leo's 2026-07-02 rulings on the two escalations
+expansion. This ADR formalizes the 2026-07-02 decisions on the two escalations
 (D1, D2 below) and fixes the normative shape of slice-1. It does not reopen the forks;
 it records the decisions and specifies what ships.
 
@@ -369,7 +369,7 @@ produces the zero/null sentinel values described above.
 ## References
 
 - GitHub #80 — retrieval quality measurement loop
-- `.khive/workspaces/20260626/issue80-scoping/SCOPING.md` — design forks and escalations this ADR resolves
+- Local issue-80 scoping notes — design forks and escalations this ADR resolves
 - [ADR-015](ADR-015-schema-migrations.md) — schema migration mechanism; append-only `VersionedMigration` convention used by §"Schema"
 - [ADR-023](ADR-023-declarative-pack-format.md) — `Visibility::{Verb, Subhandler}`; kkernel `exec` CLI verb-DSL; the mechanism D2 relies on
 - [ADR-047](ADR-047-knowledge-pack.md) — Knowledge Pack; `knowledge.stats`, `knowledge.search`, and the 19-verb baseline this ADR extends

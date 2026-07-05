@@ -6,14 +6,13 @@ This ADR introduced a three-tier visibility model (shared / private / proposal-o
 associated per-namespace write enforcement. ADR-007 Rev 2 establishes that namespace is
 attribution-only and that all packs store in the single shared "local" namespace; actor
 identity is a view-layer tag filter, never a namespace partition. The write-tier model
-re-introduced the actor-as-namespace coupling that Ocean's "one shared brain" ruling ordered
-removed, making the core mechanism of this ADR incompatible with the ratified design.
+re-introduced the actor-as-namespace coupling that the "one shared brain" decision removed, making the core mechanism of this ADR incompatible with the ratified design.
 The subagent propose-only tier, which is operationally separable, may be proposed as a future
 ADR scoped to the propose/review verb lifecycle (ADR-046) rather than to namespace scoping.
 The ADR number 059 is burned — this file is preserved as a record of the withdrawn design.
 
 **Date**: 2026-06-15
-**Authors**: lambda:khive, Ocean
+**Authors**: khive maintainers
 **Withdrawn**: 2026-06-16 (superseded by ADR-007 Rev 2)
 **Depends on**:
 
@@ -31,7 +30,7 @@ The ADR number 059 is burned — this file is preserved as a record of the withd
 
 ## Context
 
-Three lambda orchestrators (lambda:leo, lambda:khive, lambda:lionagi) and an arbitrary number
+Three lambda orchestrators (lambda:beta, lambda:alpha, lambda:gamma) and an arbitrary number
 of ephemeral subagents share one SQLite knowledge graph via the khive MCP server. All sessions
 currently run as namespace `"local"` -- the fall-back when no `[actor] id` is configured. This
 is a deliberate stop-gap: a prior attempt to give each lambda a distinct namespace identifier
@@ -39,7 +38,7 @@ in `khive.toml` broke all cross-read access because `ensure_namespace` enforces 
 primary-namespace equality on write-guarded paths and the data corpus (approximately 12,380
 notes, 2,744 entities) lives entirely in `"local"`.
 
-Ocean's design intent (2026-06-15):
+Design intent (2026-06-15):
 
 - All lambdas may read and write to a **shared** cooperative KG namespace.
 - All lambdas may also maintain a **private** namespace for their own working state.
@@ -50,7 +49,7 @@ Ocean's design intent (2026-06-15):
   stored in the creator's namespace and the visibility filter must check all three namespace
   columns (edge, source endpoint, target endpoint) to avoid leaks.
 
-A gemini REFUTE-mirror review (2026-06-14) produced three binding corrections incorporated
+An internal review (2026-06-14) produced three binding corrections incorporated
 here:
 
 1. Edge namespace is stored on the edge (scheme B1), not derived from endpoint namespaces.
@@ -60,7 +59,7 @@ here:
 2. A link whose creator cannot reach both endpoints is rejected at link time. The error code
    is `NotFound`, not `Forbidden`. `Forbidden` is a UUID-existence oracle and violates the
    fail-closed rule.
-3. The legacy `"local"` namespace must map to a private `lambda:khive` namespace plus a fresh
+3. The legacy `"local"` namespace must map to a private `lambda:alpha` namespace plus a fresh
    empty shared namespace -- not become the shared namespace. Making `"local"` the shared
    namespace would expose operator working memory (tasks, episodic memories, session notes) to
    every cooperating agent, which is a privacy leak and pollutes a clean demo environment.
@@ -104,10 +103,10 @@ sponsoring lambda's token with a visibility set appropriate to its task.
 Two actor kinds are recognized for namespace write-tier enforcement. They map directly to the
 `ActorRef.kind` field already defined in `khive-gate/src/actor.rs`.
 
-| Kind     | `ActorRef.kind` value | Who                                          |
-| -------- | --------------------- | -------------------------------------------- |
-| Lambda   | `"lambda"`            | Standing orchestrators (leo, khive, lionagi) |
-| Subagent | `"subagent"`          | Ephemeral task-runners spawned by a lambda   |
+| Kind     | `ActorRef.kind` value | Who                                         |
+| -------- | --------------------- | ------------------------------------------- |
+| Lambda   | `"lambda"`            | Standing orchestrators (alpha, beta, gamma) |
+| Subagent | `"subagent"`          | Ephemeral task-runners spawned by a lambda  |
 
 The `"anonymous"` kind (the current default) is treated as a lambda for backward
 compatibility: unauthenticated local sessions retain full write access. A future ADR may
@@ -134,7 +133,7 @@ Two new fields are added to `ActorConfig` in `khive-runtime/src/engine_config.rs
 
 ```toml
 [actor]
-id           = "lambda:khive"        # primary write namespace (existing)
+id           = "lambda:alpha"        # primary write namespace (existing)
 kind         = "lambda"              # NEW: "lambda" | "subagent" | "anonymous"
 visible_namespaces  = ["shared"]     # existing: readable beyond primary
 writable_namespaces = ["shared"]     # NEW: namespaces this actor may write to
@@ -286,7 +285,7 @@ accept `namespaces: &[&str]` (or an equivalent `IN`-clause parameter). This is a
 breaking change to the trait contract and requires updates to all `GraphStore`
 implementations.
 
-This change is a cost callout (gemini mirror finding, 2026-06-14) and is tracked in a
+This change is a cost callout (internal review finding, 2026-06-14) and is tracked in a
 separate implementation ticket. The ADR specifies the required end state; the migration path
 is implementation-owned.
 
@@ -309,10 +308,10 @@ The relabel policy:
 
 | Record kind                                                                | Relabel target               | Rationale                                          |
 | -------------------------------------------------------------------------- | ---------------------------- | -------------------------------------------------- |
-| `memory` notes (episodic / semantic)                                       | `lambda:khive` (private)     | Operator working memory; not for subagents to read |
-| `task` notes                                                               | `lambda:khive` (private)     | lambda:khive task queue                            |
-| `message` notes                                                            | `lambda:khive` (private)     | Comm pack messages are actor-addressed internally  |
-| `scheduled_event` notes                                                    | `lambda:khive` (private)     | Schedule pack intent is per-actor                  |
+| `memory` notes (episodic / semantic)                                       | `lambda:alpha` (private)     | Operator working memory; not for subagents to read |
+| `task` notes                                                               | `lambda:alpha` (private)     | lambda:alpha task queue                            |
+| `message` notes                                                            | `lambda:alpha` (private)     | Comm pack messages are actor-addressed internally  |
+| `scheduled_event` notes                                                    | `lambda:alpha` (private)     | Schedule pack intent is per-actor                  |
 | All other note kinds (observation, insight, question, decision, reference) | OPEN FORK F1                 | See Forks                                          |
 | All entities (concept, document, project, etc.)                            | OPEN FORK F1                 | See Forks                                          |
 | All edges                                                                  | Follow source entity relabel | Edge namespace = creator's namespace               |
@@ -323,7 +322,7 @@ populate it intentionally over time by creating records with their primary names
 
 The `"local"` identifier is not retired. Any existing config or process that passes
 `namespace="local"` will target a now-private-but-renamed namespace. Once all active sessions
-are reconfigured to use `lambda:khive` or `shared`, `"local"` becomes an orphan and can be
+are reconfigured to use `lambda:alpha` or `shared`, `"local"` becomes an orphan and can be
 aliased in config.
 
 **Data preservation invariant**: no record UUID changes. No edge is deleted. The migration is
@@ -340,20 +339,20 @@ the UPDATE statements.
 After this ADR, a typical `khive.toml` for each actor:
 
 ```toml
-# kkernel serving as lambda:khive
+# kkernel serving as lambda:alpha
 [actor]
-id                  = "lambda:khive"
+id                  = "lambda:alpha"
 kind                = "lambda"
 visible_namespaces  = ["shared"]
 writable_namespaces = ["shared"]
 ```
 
 ```toml
-# kkernel serving as lambda:leo
+# kkernel serving as lambda:beta
 [actor]
-id                  = "lambda:leo"
+id                  = "lambda:beta"
 kind                = "lambda"
-visible_namespaces  = ["shared", "lambda:khive"]   # can read khive's private ns
+visible_namespaces  = ["shared", "lambda:alpha"]   # can read alpha's private ns
 writable_namespaces = ["shared"]                   # writes to shared only
 ```
 
@@ -374,7 +373,7 @@ lambdas share `"local"`, and propose-only for subagents is enforced by a config 
 than namespace separation.
 
 Rejected because: (a) there is no write isolation between lambdas -- a misbehaving lambda
-can overwrite another's private notes; (b) Ocean's explicit requirement is per-lambda
+can overwrite another's private notes; (b) the design requirement is per-lambda
 private namespaces for working state; (c) without namespace separation, cross-namespace link
 semantics have no surface to operate on.
 
@@ -396,7 +395,7 @@ runtime and additive for a misconfigured one.
 
 All existing data becomes shared immediately. No migration required.
 
-Rejected by the gemini mirror (2026-06-14): lambda:khive's working memory (tasks, episodic
+Rejected by internal review (2026-06-14): lambda:alpha's working memory (tasks, episodic
 notes, session state) is not appropriate shared content. Dumping it into the shared namespace
 pollutes the cooperative KG and exposes operator context to every cooperating agent.
 
@@ -446,10 +445,10 @@ Isolation in multi-actor deployments uses per-actor database files
 
 ---
 
-## Open Questions (Forks for Ocean)
+## Open Questions
 
-See `.khive/workspaces/20260615/namespace-write-tiers/FORKS.md` for the full fork list with
-decision guidance. The questions that require Ocean's judgment before code lands are:
+See the local namespace-write-tiers fork list for the full set of options and decision
+guidance. The questions that require maintainer judgment before code lands are:
 
 - **F1**: Which existing `"local"` note kinds and entities map to shared vs private?
 - **F2**: How is the shared namespace identifier chosen and where is it declared?

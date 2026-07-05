@@ -3,7 +3,7 @@
 **Status**: Accepted\
 **Date**: 2026-06-25\
 **PR**: #252\
-**Authors**: Ocean, lambda:khive\
+**Authors**: khive maintainers
 **Depends on**: [ADR-017](ADR-017-pack-standard.md) (Pack Standard), [ADR-028](ADR-028-pack-scoped-backends.md) (Pack-Scoped Backends), [ADR-029](ADR-029-substrate-coordinator.md) (Substrate Coordinator)\
 **Extends**: ADR-028 §"Per-pack runtime instances"\
 **Sequencing note**: ADR-071 (Backend-Pluggable Runtime, proposed) introduces `BackendHandle` as the future seam. See §"Relationship to ADR-071" for the forward-compatibility constraint.

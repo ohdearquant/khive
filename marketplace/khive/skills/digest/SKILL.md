@@ -52,7 +52,7 @@ create(kind="entity", entity_kind="<kind>", name="<short canonical name>",
 | `org`      | Labs, companies, institutions                                |
 | `artifact` | Generated files, model artifacts, build outputs              |
 | `service`  | Long-running services, APIs, deployed systems                |
-| `resource` | Knowledge atoms, domains, skills, tools                       |
+| `resource` | Knowledge atoms, domains, skills, tools                      |
 
 **Naming**: short canonical name people actually say. `LoRA` not
 `Low-Rank Adaptation of Large Language Models`. Full titles go in `properties`.

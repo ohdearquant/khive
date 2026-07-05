@@ -3,7 +3,7 @@
 //!
 //! The 2026-07-04 inbound-email outage (#602) was amplified by the poll
 //! loop's flat ~5s retry cadence with no per-credential concurrency cap:
-//! nine concurrent pollers on `leo@khive.ai` exhausted Exchange Online's
+//! nine concurrent pollers on `recipient@example.com` exhausted Exchange Online's
 //! per-mailbox connection slots, and the flat retry hammer kept the slots
 //! saturated for ~19h. `#602`/`#610` fixed the multi-process spawn that
 //! caused the concurrency; the types here make the channel degrade
@@ -104,8 +104,8 @@ impl ImapBackoff {
     /// step, and returns a [`BackoffTick`] carrying the jittered delay to
     /// sleep plus whether this is a new escalation edge worth a `warn!` log.
     ///
-    /// The jittered `delay` is clamped to `max` (codex round-1 finding
-    /// 2026-07-04): jitter is additive noise on top of `step`, but `step`
+    /// The jittered `delay` is clamped to `max` (regression guard): jitter is additive
+    /// noise on top of `step`, but `step`
     /// itself can already equal `max` once escalation saturates, so an
     /// unclamped `step + jitter` would let a "~10min cap" reach 750s at the
     /// default 25% jitter window. Clamping here keeps `delay <= max` as a
@@ -243,7 +243,7 @@ mod tests {
             let tick = b.record_failure();
             assert!(tick.step <= max);
             assert!(tick.delay >= tick.step.min(max));
-            // Codex round-1 finding: the post-jitter delay must never exceed
+            // internal review round 1 finding: the post-jitter delay must never exceed
             // `max`, even once `step` itself has saturated at `max` (an
             // unclamped 25% jitter window on a capped 600s step would reach
             // 750s otherwise).
@@ -259,7 +259,7 @@ mod tests {
     fn default_config_jittered_delay_never_exceeds_default_max() {
         // Explicitly drive the DEFAULT_BASE/DEFAULT_MAX config to the cap and
         // assert both the unjittered step and the jittered delay respect
-        // DEFAULT_MAX -- the exact scenario codex flagged (750s > 600s cap).
+        // DEFAULT_MAX -- the exact cap regression scenario (750s > 600s cap).
         let mut b = ImapBackoff::default();
         for _ in 0..20 {
             let tick = b.record_failure();

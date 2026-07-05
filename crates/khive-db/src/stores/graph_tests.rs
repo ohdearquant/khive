@@ -148,7 +148,7 @@ async fn test_neighbors_outbound() {
     assert!(!neighbor_ids.contains(&d));
 }
 
-/// Regression guard (ADR-089 context-verb review, codex round 1, High-1): a
+/// Regression guard (ADR-089 context-verb review, internal review round 1, High-1): a
 /// `limit` narrower than the neighbor set must keep the highest-weight edges,
 /// not an arbitrary SQLite row-order subset. Before the fix, `neighbors()`
 /// applied `LIMIT` with no `ORDER BY`, so a low-weight neighbor could win over
@@ -1362,7 +1362,7 @@ async fn batch_neighbors_both_chunk_boundary() {
     );
 }
 
-// ---- per-root limit regression (codex-mandated) ----
+// ---- per-root limit regression ----
 
 /// Regression guard for the per-root `limit` regression introduced when N
 /// roots were batched into a single CTE with one global SQL LIMIT.

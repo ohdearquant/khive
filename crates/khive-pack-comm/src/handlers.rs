@@ -888,7 +888,7 @@ pub(crate) async fn handle_ingest(
 /// into a single row.
 ///
 /// The three components are hashed as a JSON array of strings, NOT joined
-/// with a `:` delimiter (round-1 codex review, Medium finding). Namespaces
+/// with a `:` delimiter (round-1 internal review, Medium finding). Namespaces
 /// may themselves contain `:` (hierarchical namespace strings are explicitly
 /// allowed), so a delimiter-joined `format!("...:{a}:{b}:{c}")` is not an
 /// injective encoding: `(namespace="a:b", channel_kind="c", channel_slug="d")`
@@ -915,7 +915,7 @@ fn heartbeat_note_id(namespace: &str, channel_kind: &str, channel_slug: &str) ->
 /// Read-modify-write against the existing row (if any) so that:
 /// - `created_at` is preserved across updates (first-seen time), not reset
 ///   every tick.
-/// - `last_error` is RETAINED across a subsequent success (spec-gate
+/// - `last_error` is RETAINED across a subsequent success (design review
 ///   amendment 3): callers compare `last_error.at` against
 ///   `last_success_at`/`last_failure_at` to tell a resolved issue from a live
 ///   one, so a success must never clear it.
@@ -963,7 +963,7 @@ pub(crate) async fn handle_heartbeat(
         ));
     }
 
-    // #606 spec-gate Blocker fix (Leo 2026-07-04): heartbeat rows are an
+    // #606 design review Blocker fix (review fix): heartbeat rows are an
     // OPERATIONAL surface, not message data. Persist to
     // `crate::CHANNEL_HEALTH_NAMESPACE` ALWAYS — never `token.namespace()` —
     // so a poll loop configured with a non-local `KHIVE_EMAIL_INGEST_NAMESPACE`
@@ -996,7 +996,7 @@ pub(crate) async fn handle_heartbeat(
         "success" => {
             props["last_success_at"] = json!(at);
             props["consecutive_failures"] = json!(0);
-            // last_error is intentionally left untouched — spec-gate amendment 3.
+            // last_error is intentionally left untouched — design review amendment 3.
         }
         "failure" => {
             props["last_failure_at"] = json!(at);
@@ -1074,12 +1074,12 @@ fn channel_health_to_json(note: &Note) -> Value {
 ///
 /// Reads the daemon-persisted `channel_health` rows from
 /// `crate::CHANNEL_HEALTH_NAMESPACE` UNCONDITIONALLY — never
-/// `token.namespace()` (spec-gate Blocker fix, Leo 2026-07-04). Heartbeat
+/// `token.namespace()` (design review Blocker fix, example actor 2026-07-04). Heartbeat
 /// rows are an operational surface, not message data, so a client-role
 /// no-arg call must see them regardless of what namespace the caller's own
 /// messages happen to be ingested under (e.g. `KHIVE_EMAIL_INGEST_NAMESPACE`
 /// set to something other than `"local"`). Cross-process read is the point
-/// of this verb (spec-gate amendment 1): a client-role process (stdio MCP
+/// of this verb (design review amendment 1): a client-role process (stdio MCP
 /// without `--daemon`) has no in-memory poll-loop state of its own, so it
 /// must read what the daemon already wrote. `role` answers "who owns the
 /// loops", not "whose memory answered": any persisted row means some daemon
@@ -1092,7 +1092,7 @@ fn channel_health_to_json(note: &Note) -> Value {
 /// `khive-mcp`/`khive-channel-email`), so an empty result is the only
 /// fact-based response available at this layer.
 ///
-/// Never returns a computed `healthy: bool` (spec-gate amendment: "report
+/// Never returns a computed `healthy: bool` (design review amendment: "report
 /// timestamps only") — staleness/alerting judgment belongs to the caller.
 pub(crate) async fn handle_health(
     runtime: &KhiveRuntime,
@@ -1311,7 +1311,7 @@ mod tests {
     };
     use serde_json::json;
 
-    // #606 round-1 codex review, Medium finding: a delimiter-joined
+    // #606 round-1 internal review, Medium finding: a delimiter-joined
     // `format!("...:{a}:{b}:{c}")` id encoding is not injective once
     // components may themselves contain `:` — these two distinct triples
     // both produced `"khive:channel_health:a:b:c:d"` under the pre-fix
@@ -1332,8 +1332,8 @@ mod tests {
     #[test]
     fn heartbeat_note_id_is_deterministic() {
         assert_eq!(
-            heartbeat_note_id("local", "email", "leo@khive.ai"),
-            heartbeat_note_id("local", "email", "leo@khive.ai"),
+            heartbeat_note_id("local", "email", "recipient@example.com"),
+            heartbeat_note_id("local", "email", "recipient@example.com"),
         );
     }
 

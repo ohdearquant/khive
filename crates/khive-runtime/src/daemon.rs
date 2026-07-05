@@ -297,7 +297,7 @@ pub trait DaemonDispatch: Clone + Send + Sync + 'static {
 // never waits on a cross-pack dispatch or a SQL write. Left untracked, that
 // work is invisible to `drain()`: a SIGTERM landing between the response
 // returning and the spawned task completing can abort it mid-flight with no
-// log and no row (codex PR #583 round-1 Medium). `track_background_task`
+// log and no row (internal review PR #583 round-1 Medium). `track_background_task`
 // gives such spawns a process-wide presence that `drain()` waits on, exactly
 // like the `active` counter does for in-flight connections — the caller still
 // only pays for the spawn + counter increment, never the task's own work.
@@ -311,7 +311,7 @@ fn background_tasks() -> &'static Arc<std::sync::atomic::AtomicUsize> {
 /// Decrements the shared background-task counter from `Drop`, so the count
 /// comes back down whether the tracked future returns normally, panics, or
 /// is cancelled — a plain post-`await` `fetch_sub` only covers the return
-/// path and leaks the count forever on a panic (codex PR #583 round-2
+/// path and leaks the count forever on a panic (internal review PR #583 round-2
 /// Medium), since unwinding skips every statement after the panic point.
 struct BackgroundTaskGuard {
     counter: Arc<std::sync::atomic::AtomicUsize>,
@@ -748,14 +748,14 @@ mod tests {
         std::env::remove_var(key);
     }
 
-    // codex PR #583 round-1 Medium: `drain()` must wait for tracked background
+    // internal review PR #583 round-1 Medium: `drain()` must wait for tracked background
     // tasks (e.g. memory.recall's serve-ledger append), not just in-flight
     // connections, or a SIGTERM lands mid-flight with no log and no row.
     //
     // `#[serial(background_tasks)]`: this test reads/asserts on the
     // process-wide `BACKGROUND_TASKS` static shared with the two counter
     // tests below. Under default parallel execution one test's increment
-    // leaks into another's snapshot-then-assert window (codex PR #583
+    // leaks into another's snapshot-then-assert window (internal review PR #583
     // round-3 Medium, reproduced: both counter tests failed together,
     // passed with `--test-threads=1`). Serializing just this named group
     // isolates them from each other without forcing the whole test binary
@@ -826,7 +826,7 @@ mod tests {
     #[tokio::test]
     #[serial(background_tasks)]
     async fn track_background_task_count_returns_to_baseline_after_panic() {
-        // codex PR #583 round-2 Medium: a panic inside the tracked future must
+        // internal review PR #583 round-2 Medium: a panic inside the tracked future must
         // still decrement the counter (via BackgroundTaskGuard's Drop), not
         // leak it forever. `track_background_task` discards the spawned
         // task's `JoinHandle` (it is fire-and-forget by design — the caller

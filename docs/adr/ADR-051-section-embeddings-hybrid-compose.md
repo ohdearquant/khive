@@ -185,5 +185,5 @@ feature flag.
 
 - PR #17 — brain-core extraction (ADR-017 compliance)
 - PR #18 — hybrid section scoring in compose
-- PR #19 — progress bars, domain backfill, auto-compose, token budget, codex fixes
+- PR #19 — progress bars, domain backfill, auto-compose, token budget, review fixes
 - [ADR-021](ADR-021-memory-pack.md), [ADR-048](ADR-048-knowledge-section-profiles.md)

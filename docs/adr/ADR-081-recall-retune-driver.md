@@ -2,7 +2,7 @@
 
 **Status**: Proposed\
 **Date**: 2026-07-02\
-**Authors**: lambda:khive, lambda:leo (scorer design and evidence)\
+**Authors**: khive maintainers
 **Measurement evidence**: hook scorer v0 dry run over 19 serve ledgers, 7 sessions (2026-07-02)\
 **Depends on**: [ADR-021](ADR-021-memory-pack.md) (Memory Pack), [ADR-033](ADR-033-recall-pipeline.md) (Recall Pipeline), [ADR-032](ADR-032-brain-profile-orchestration.md) (Brain Profile Orchestration), [ADR-035](ADR-035-cli-config-and-auto-embed.md) (Feedback Profile Resolution Order), [ADR-055](ADR-055-epistemic-edge-relations.md) (Epistemic Relations)\
 **Amends**: the brain feedback weight table (`FeedbackEventKind::update_weight()`, khive-brain-core, issue #268) and the `brain.feedback` / `brain.auto_feedback` parameter surface (additive optional scorer-provenance fields, section 6)\

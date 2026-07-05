@@ -2,7 +2,7 @@
 
 **Status**: proposed
 **Date**: 2026-06-28
-**Authors**: Ocean, lambda:khive
+**Authors**: khive maintainers
 
 ## Context
 

@@ -2,7 +2,7 @@
 
 **Status**: Accepted\
 **Date**: 2026-06-15\
-**Authors**: Ocean, lambda:khive\
+**Authors**: khive maintainers
 **Depends on**: ADR-007 (Namespace), ADR-017 (Pack Standard), ADR-040 (Communication and
 Schedule Packs)\
 **Related issues**: #57 (actor-addressed delivery -- primary), #13 (cross-namespace policy
@@ -358,12 +358,12 @@ blocking comm on it leaves agent-to-agent messaging broken without benefit.
 
 ## Open Questions
 
-The following questions could not be fully resolved from source and require Ocean's judgment
+The following questions could not be fully resolved from source and require maintainer judgment
 before implementation begins.
 
 **Q1. Actor label validation strictness.** This ADR proposes that `to` actor labels be
 validated for non-empty, no control characters, and max 255 bytes, but not via
-`Namespace::parse`. If Ocean prefers that actor labels be required to be valid namespace
+`Namespace::parse`. If maintainers prefer that actor labels be required to be valid namespace
 strings, the send handler can call `Namespace::parse(to)` and return an error for
 non-conforming values. The tradeoff: strict validation improves type safety but rejects labels
 that future transport adapters (ADR-056) may need to express (e.g., email addresses or channel
@@ -371,7 +371,7 @@ identifiers as actor labels in `comm.send`). Decision needed before implementati
 
 **Q2. Index creation placement.** The new `idx_comm_message_to_actor` index is proposed to be
 added via `COMM_SCHEMA_PLAN_STMTS` (run idempotently at pack startup via `CREATE INDEX IF NOT
-EXISTS`). Ocean should confirm this approach is acceptable, or specify that the index belongs
+EXISTS`). Maintainers should confirm this approach is acceptable, or specify that the index belongs
 in a numbered `VersionedMigration` (ADR-015) to keep startup behavior predictable.
 
 **Q3. Legacy message visibility.** Messages written before this ADR have no `to_actor` field.
@@ -379,4 +379,4 @@ Under the proposed fallback, these messages are visible only to callers whose ac
 `"local"`. Callers with a configured actor label (e.g., `lambda:leo`) will not see them.
 Whether existing party-line messages should be backfilled with `to_actor = "local"` (to
 remain visible in single-actor inboxes) or declared out-of-scope for actor-scoped inboxes is
-a product decision Ocean must settle before the migration story is finalized.
+a product decision maintainers must settle before the migration story is finalized.

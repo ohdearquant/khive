@@ -2,7 +2,7 @@
 
 **Status**: proposed
 **Date**: 2026-07-02
-**Authors**: lambda:khive
+**Authors**: khive maintainers
 **Amends**: [ADR-023](ADR-023-declarative-pack-format.md) §3 (kg verb table -- adds the
 `schema` verb, 16 → 17). The table edit itself rides with the PR that ships the verb, so
 ADR-023 keeps describing the live surface at every commit. `AGENTS.md` taxonomy sections
@@ -23,7 +23,7 @@ contract. The base endpoint allowlist lives in
 by each loaded pack's `EDGE_RULES` (ADR-017). No runtime surface exposes this merged
 contract. Agents learn it from documentation snapshots that provably rot:
 
-- **Measured casualty**: a fleet skill in production taught 11 relations and 4 entity
+- **Measured casualty**: a production skill taught 11 relations and 4 entity
   kinds against the real 17 and 9. Agents consuming that skill gave wrong answers to
   endpoint-legality questions until the drift was caught by hand.
 - **Endpoint-legality questions** ("can a `resource` be the source of an `annotates`
@@ -34,7 +34,7 @@ contract. Agents learn it from documentation snapshots that provably rot:
 ### Phantom capability gaps: the strongest evidence
 
 Three friction items on the motivating list turned out, under verification, to be
-capabilities that already ship. The fleet believed the surface could not do things it does:
+capabilities that already ship. Callers believed the surface could not do things it does:
 
 1. **Multi-line strings in the function-call DSL.** Believed impossible; escapes were
    specified in ADR-016 from the start ("String escapes follow JSON: `\\`, `\"`, `\n`,
@@ -64,7 +64,7 @@ Independent of drift, the verb surface has accumulated real inconsistencies as p
 added, each individually small, collectively a memorization tax:
 
 - **Param-name divergence**: `query` vs `q`, `at` (not `due`), `id` (not `thread_id`),
-  `ids` (not `slugs`) -- correct names are fleet folklore, not a stated convention.
+  `ids` (not `slugs`) -- correct names are operational folklore, not a stated convention.
 - **ID-resolution divergence**: most `id`-typed params accept a short unique prefix;
   `brain.feedback` requires a full UUID; `knowledge.get` accepts slug or full UUID but
   not a prefix.
@@ -119,7 +119,7 @@ parameter is a breaking change to a public surface; existing non-conforming para
 migrated only through an explicit deprecation path -- accept both names for a stated
 window, warn on the deprecated one, remove in a versioned release. No silent renames.
 Whether any existing param is worth that migration cost is decided case by case at
-sign-off, not by this contract.
+explicit approval, not by this contract.
 
 **Rule 5 -- substrate-symmetric field names.** Where a concept is identical across
 substrates, the parameter name is identical: `tags` means tags for entities and notes

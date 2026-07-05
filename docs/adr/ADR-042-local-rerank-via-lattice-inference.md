@@ -2,7 +2,7 @@
 
 **Status**: accepted
 **Date**: 2026-05-23
-**Authors**: Ocean, lambda:khive
+**Authors**: khive maintainers
 **Depends on**:
 
 - ADR-011 (Embedding and Inference Architecture)

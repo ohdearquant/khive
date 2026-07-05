@@ -2,7 +2,7 @@
 
 **Status**: accepted (supersedes the original ADR-023 "Declarative Pack Format")
 **Date**: 2026-05-23
-**Authors**: Ocean, lambda:khive
+**Authors**: khive maintainers
 
 ## Context
 
@@ -486,7 +486,7 @@ Three reasons:
 
 | Alternative                                                   | Why rejected                                                                                                                                                                                             |
 | ------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| YAML pack manifests (original ADR-023 v0)                     | Bifurcates the pack ecosystem into code-packs and data-packs. Half-feature: real packs want vocabulary + verbs. Increases maintenance load. Per Ocean (2026-05-23): "declarative packs need to be Rust." |
+| YAML pack manifests (original ADR-023 v0)                     | Bifurcates the pack ecosystem into code-packs and data-packs. Half-feature: real packs want vocabulary + verbs. Increases maintenance load. The accepted decision keeps packs in Rust.                   |
 | Pack verb override (last-loaded-wins or explicit declaration) | Breaks agent predictability. Verb semantics become deployment-dependent. KindHook is the safe extension point.                                                                                           |
 | Pack middleware / wrap interception                           | Composes badly (order-dependent chains); auth and audit belong at the runtime gate (ADR-018), not the pack layer.                                                                                        |
 | Four-tier visibility (Public/Advanced/Debug/Internal)         | Conflates MCP exposure with documentation gating. Skills already handle docs; two tiers (on/off the MCP wire) are sufficient.                                                                            |
@@ -578,5 +578,5 @@ working crate. Reference impl: `crates/khive-pack-kg/`.
 ## Supersedes
 
 The v0 ADR-023 ("Declarative Pack Format") — YAML-manifest model is rescinded per
-Ocean (2026-05-23). Packs are Rust crates; vocabulary and verbs are declared together
+Accepted decision (2026-05-23). Packs are Rust crates; vocabulary and verbs are declared together
 in the pack trait.

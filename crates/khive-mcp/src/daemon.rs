@@ -1213,7 +1213,7 @@ mod tests {
     // The agent-facing `request` tool must stamp `from_wire=true` on its daemon
     // forward-frame. Without this, a daemon-backed MCP request would dispatch
     // with `from_wire=false` and silently reopen the agent subhandler bypass
-    // (codex #369 Medium). Pinned at the frame-builder seam so the daemon
+    // (review #369 Medium). Pinned at the frame-builder seam so the daemon
     // round-trip test above (which proves the daemon HONORS the bit) is paired
     // with proof that the tool SETS it.
     #[test]

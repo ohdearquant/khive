@@ -176,7 +176,7 @@ const QUERIES: &[&str] = &[
     "Rust cargo clippy workspace",
     "FTS text search trigram BM25",
     "memory decay salience temporal",
-    "ocean lambda leo session",
+    "operator actor peer session",
     "desktop app frontend wiring",
     "brain profile Bayesian posterior",
     "knowledge graph entity edge relation",

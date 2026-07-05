@@ -13,7 +13,7 @@ Per-verb param detail is one call away: `request(ops="gtd.assign(help=true)")`.
 ### 1. Capture: always set assignee at creation
 
 ```
-request(ops="gtd.assign(title=\"write release notes\", priority=\"p1\", assignee=\"lambda:khive\")")
+request(ops="gtd.assign(title=\"write release notes\", priority=\"p1\", assignee=\"agent:docs\")")
 ```
 
 Multiple agents write into the same namespace. Without `assignee`, a task is invisible to
@@ -22,15 +22,15 @@ Default status is `inbox`, default priority is `p2`. Batch captures with the par
 
 ```
 request(ops="[
-  gtd.assign(title=\"reply to Mitchell\", priority=\"p1\", assignee=\"lambda:khive\"),
-  gtd.assign(title=\"file taxes\", priority=\"p0\", due=\"2026-04-15\", assignee=\"lambda:khive\")
+  gtd.assign(title=\"reply to maintainer\", priority=\"p1\", assignee=\"agent:docs\"),
+  gtd.assign(title=\"file quarterly report\", priority=\"p0\", due=\"2026-04-15\", assignee=\"agent:docs\")
 ]")
 ```
 
 ### 2. Process: clear the inbox before looking at next
 
 ```
-request(ops="gtd.tasks(status=\"inbox\", assignee=\"lambda:khive\", limit=25)")
+request(ops="gtd.tasks(status=\"inbox\", assignee=\"agent:docs\", limit=25)")
 ```
 
 For each inbox item, decide: `next` (committed, actionable), `active` (starting now),
@@ -53,7 +53,7 @@ still in `inbox` / `waiting` / `someday`, use `gtd.transition` (`status="cancell
 ### 3. Surface actionable work
 
 ```
-request(ops="gtd.next(assignee=\"lambda:khive\", limit=20)")
+request(ops="gtd.next(assignee=\"agent:docs\", limit=20)")
 ```
 
 `gtd.next` returns only `next` and `active` tasks, sorted by priority then recency. If it is
@@ -62,8 +62,8 @@ filtering:
 
 ```
 request(ops="[
-  gtd.tasks(status=\"active\", assignee=\"lambda:khive\"),
-  gtd.tasks(status=\"waiting\", assignee=\"lambda:khive\")
+  gtd.tasks(status=\"active\", assignee=\"agent:docs\"),
+  gtd.tasks(status=\"waiting\", assignee=\"agent:docs\")
 ]")
 ```
 

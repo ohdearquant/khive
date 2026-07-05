@@ -9,7 +9,7 @@ pub(crate) mod vocab;
 pub use pack::CommPack;
 
 /// The namespace `comm.heartbeat` always writes to and `comm.health` always
-/// reads from (khive #606 spec-gate Blocker fix, Leo 2026-07-04).
+/// reads from (khive #606 design review Blocker fix, example actor 2026-07-04).
 ///
 /// Channel heartbeat rows are an OPERATIONAL surface, not message data: they
 /// must not follow `KHIVE_EMAIL_INGEST_NAMESPACE` (or any other caller-chosen

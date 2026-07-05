@@ -900,7 +900,7 @@ mod tests {
 
     // ── GsSq8Codec tests ────────────────────────────────────────────────────
 
-    /// Codex counterexample (2026-06-12): ranges [0,1] and [0,1e6].
+    /// Regression counterexample (2026-06-12): ranges [0,1] and [0,1e6].
     ///
     /// Without global-scale, the per-dim fast path reversed near/far ordering by >6 OOM.
     /// With GsSq8Codec the global scale is dominated by the wide dim; the narrow dim

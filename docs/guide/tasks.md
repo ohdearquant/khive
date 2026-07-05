@@ -76,7 +76,7 @@ via graph traversal.
 ### Task with assignee
 
 ```
-request(ops="gtd.assign(title=\"Write attention tests\", assignee=\"lambda:platform\")")
+request(ops="gtd.assign(title=\"Write attention tests\", assignee=\"agent:platform\")")
 ```
 
 ### Task with tags
@@ -108,7 +108,7 @@ Returns tasks with `status` in `[next, active]`, sorted by priority (p0 first).
 
 ```
 request(ops="gtd.tasks(status=\"active\")")
-request(ops="gtd.tasks(status=\"waiting\", assignee=\"lambda:khive\")")
+request(ops="gtd.tasks(status=\"waiting\", assignee=\"agent:docs\")")
 ```
 
 ### Transition a task
@@ -181,7 +181,7 @@ request(ops="gtd.transition(id=\"<task_id>\", status=\"next\", note=\"promoted a
 When picking up a new area of work, filter by assignee or tags:
 
 ```
-request(ops="gtd.tasks(assignee=\"lambda:khive\", status=\"next\")")
+request(ops="gtd.tasks(assignee=\"agent:docs\", status=\"next\")")
 ```
 
 ### Batch status update

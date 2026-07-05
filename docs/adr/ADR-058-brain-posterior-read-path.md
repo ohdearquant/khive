@@ -2,7 +2,7 @@
 
 **Status**: Proposed\
 **Date**: 2026-06-15 (updated 2026-06-23)\
-**Authors**: lambda:khive (architect draft); updated by alpha:architect\
+**Authors**: khive maintainers
 **Depends on**:
 
 - [ADR-021](ADR-021-memory-pack.md) (Memory Pack — recall scoring is a research surface, weights are starting values)
@@ -37,8 +37,8 @@ never consumes the resolved profile's posteriors.
 
 ### Verified current state (source-cited, double-confirmed)
 
-These findings were independently confirmed by an architect TBV pass and a gemini
-adversarial-mirror REFUTE-stance review. Both returned CONFIRMED on all findings below.
+These findings were independently confirmed by an architecture pass and an internal
+adversarial review. Both returned CONFIRMED on all findings below.
 
 Two posterior-consumption mechanisms are present in code; both are dead at ranking time.
 
@@ -139,7 +139,7 @@ Note: the knowledge pack also routes feedback through `brain.resolve(consumer_ki
 the write path (`crates/khive-pack-knowledge/src/handlers.rs:362-403`) but likewise does not read
 posteriors to rank `compose` output. The read path is dead for both consumers; this ADR scopes the
 memory-pack recall path, which is the canonical case. The knowledge pack's equivalent gap is
-flagged as an open question for Ocean (see Open Questions, Q4).
+flagged as an open question for maintainers (see Open Questions, Q4).
 
 ---
 
@@ -783,9 +783,9 @@ with no dispatch).
 path tier-2 discipline. System-default fallbacks (`matched_binding=false`) use pack defaults.
 See §Binding semantics above for rationale.
 
-### Q4 — Open (Ocean): knowledge pack read-path scope
+### Q4 — Open: knowledge pack read-path scope
 
-**The gemini mirror flagged this independently.** The `knowledge.compose` verb also lacks read-path
+**Internal review flagged this independently.** The `knowledge.compose` verb also lacks read-path
 wiring: it routes feedback through `brain.resolve(consumer_kind="recall")`
 (`crates/khive-pack-knowledge/src/handlers.rs:362-403`) — **note: as of the 2026-07-03 amendment
 above, this is a known gap, not a correct baseline; it should resolve against

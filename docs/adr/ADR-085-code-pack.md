@@ -2,7 +2,7 @@
 
 **Status**: Proposed\
 **Date**: 2026-07-03\
-**Authors**: Ocean, lambda:khive (advisor-drafted)\
+**Authors**: khive maintainers
 **Depends on**: ADR-001 (Entity Kind Taxonomy — `entity_type` subtype registration), ADR-002
 (Edge Ontology — closed 17 relations, base endpoint contract), ADR-013 (Note Kind Taxonomy —
 pack-declared note kinds), ADR-017 (Pack Standard — `EDGE_RULES`, `EntityOfType`,
@@ -15,7 +15,7 @@ introspection), issue #373 (verbs vs services — explicitly out of scope, see D
 
 khive's research graph compounds: an agent reads a paper once, records concepts and edges, and
 every later session queries the graph instead of re-reading the paper. Source code — the
-corpus this fleet works in daily — has no equivalent. Every session re-derives the same
+corpus maintainers work in daily — has no equivalent. Every session re-derives the same
 structural facts (what contains what, what depends on what, what implements which idea) by
 re-reading files. The recurring defect-audit pipeline (`.khive/scripts/audit_crate.py`)
 produces structured findings that live only as flat GitHub issues and local
@@ -258,7 +258,7 @@ Following `khive-pack-formal`'s shipped shape (`crates/khive-pack-formal/src/pac
 
 The pack roster names domains and capability surfaces that khive already owns; the closest
 analogue to "code" is `formal` — a domain vocabulary pack. Code passes the ADR-069 Subject
-test on all three ingredients, and the fleet's two concrete, recurring pains (comprehension
+test on all three ingredients, and the two concrete, recurring pains (comprehension
 re-work; audit findings invisible to queries) are both graph-vocabulary problems. An
 execution capability would collide head-on with the unresolved #373 interface taxonomy and
 carry a sandboxing risk class nothing in the one-line ask implies. Vocabulary now is useful
@@ -396,10 +396,10 @@ carry cross-language semantics.
   as gtd's `task` does today; until then `kind_status` lives in properties with
   hook-defaulted initial state.
 
-## Open Questions (for Ocean / lambda:leo)
+## Open Questions
 
 1. Is the audit-finding lane (D4) in scope for v1, or should this ADR ship code-ontology-only
-   (D1-D3, D5, D6) and defer `finding` to a follow-up amendment? Advisor recommendation:
+   (D1-D3, D5, D6) and defer `finding` to a follow-up amendment? Recommendation:
    include it — it rides shared CRUD at near-zero marginal mechanism cost and immediately
    makes the existing `audit_crate.py` harvest step's output graph-queryable.
 2. Default-pack-set promotion timing (D5's opt-in-at-v1 posture) — confirm gated on one
@@ -410,7 +410,7 @@ carry cross-language semantics.
 
 ## Implementation
 
-This ADR authorizes design, not code; implementation follows SPEC-GATE sign-off.
+This ADR authorizes design, not code; implementation follows design review approval.
 
 1. `crates/khive-pack-kg/src/entity_type_registry.rs` — add the four `EntityTypeDef`
    entries (D2 tokens + aliases) to `BUILTIN_DEFS` under a `// ── Code ──` section.
@@ -453,5 +453,4 @@ This ADR authorizes design, not code; implementation follows SPEC-GATE sign-off.
 - `crates/khive-pack-kg/src/entity_type_registry.rs` — token governance; the
   `struct`/`class` alias hazard (line 109)
 - `crates/khive-pack-formal/src/{vocab.rs,pack.rs}` — the reference implementation shape
-- `.khive/scripts/audit_crate.py` + `.khive/audits/**/findings.json` — the audit lane's
-  existing record shape mapped by D4
+- Existing audit harvest script and findings JSON — the audit lane's record shape mapped by D4

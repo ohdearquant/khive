@@ -1334,7 +1334,7 @@ mod tests {
     /// metacharacters like `$` (e.g. the DSL doc query `$prev.id`). After this test was
     /// first written, `sanitize_fts5_query` (khive-db) already strips `$`, so this alone
     /// takes the `Ok` path and does not exercise the runtime-level fail-open `Err` arm
-    /// (PR #389 codex round-1 Medium finding) — it stays as a sanitizer-path regression;
+    /// (PR #389 internal review round 1 Medium finding) — it stays as a sanitizer-path regression;
     /// see `hybrid_search_with_residual_fts5_char_degrades_to_vector_only` below for the
     /// fail-open-branch regression.
     #[tokio::test]
@@ -1364,7 +1364,7 @@ mod tests {
         );
     }
 
-    /// PR #389 codex round-1 Medium regression: unlike `$`, `@` is NOT stripped by
+    /// PR #389 internal review round 1 Medium regression: unlike `$`, `@` is NOT stripped by
     /// `sanitize_fts5_query` (by design — the sanitizer stays minimal per #388 scope;
     /// the fail-open net is the systematic answer for residual punctuation). SQLite
     /// FTS5's bareword parser still rejects `@` unconditionally, so this query reaches

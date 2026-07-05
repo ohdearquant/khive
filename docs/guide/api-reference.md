@@ -478,7 +478,7 @@ Create a GTD task (note with `kind=task`).
 | `tags`              | array\<string\> | no       | Tag list.                                                                                                                                                            |
 
 ```
-request(ops="gtd.assign(title=\"Ship API reference\", priority=\"p1\", assignee=\"lambda:khive\")")
+request(ops="gtd.assign(title=\"Ship API reference\", priority=\"p1\", assignee=\"agent:docs\")")
 ```
 
 ### `gtd.next` — Assertive
@@ -491,7 +491,7 @@ List actionable tasks (status `next` or `active`) by priority.
 | `assignee` | string  | no       | Filter to this assignee. |
 
 ```
-request(ops="gtd.next(assignee=\"lambda:khive\", limit=10)")
+request(ops="gtd.next(assignee=\"agent:docs\", limit=10)")
 ```
 
 ### `gtd.complete` — Declaration
@@ -521,7 +521,7 @@ List tasks filtered by status, assignee, priority.
 | `offset`   | integer | no       | Default 0.                                                                                         |
 
 ```
-request(ops="gtd.tasks(status=\"active\", assignee=\"lambda:khive\")")
+request(ops="gtd.tasks(status=\"active\", assignee=\"agent:docs\")")
 ```
 
 ### `gtd.transition` — Declaration
@@ -671,7 +671,7 @@ Show which profile would serve a caller context.
 | `namespace`     | string | no       | Default `*` (wildcard match).                                |
 
 ```
-request(ops="brain.resolve(consumer_kind=\"recall\", actor=\"lambda:khive\")")
+request(ops="brain.resolve(consumer_kind=\"recall\", actor=\"agent:docs\")")
 ```
 
 ### `brain.activate` — Commissive
@@ -954,7 +954,7 @@ Schedule a future verb dispatch.
 | `repeat` | string | no       | Same recurrence grammar as `schedule.remind`.                       |
 
 ```
-request(ops="schedule.schedule(action=\"gtd.next(assignee=\\\"lambda:khive\\\")\", at=\"2026-07-05T09:00:00Z\")")
+request(ops="schedule.schedule(action=\"gtd.next(assignee=\\\"agent:docs\\\")\", at=\"2026-07-05T09:00:00Z\")")
 ```
 
 ### `schedule.agenda` — Assertive

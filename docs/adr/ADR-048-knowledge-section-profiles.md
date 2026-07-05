@@ -2,7 +2,7 @@
 
 **Status**: accepted
 **Date**: 2026-05-27
-**Authors**: Ocean, lambda:khive
+**Authors**: khive maintainers
 
 ## Current Implementation Status
 
@@ -294,8 +294,8 @@ The current MCP protocol does not carry per-request caller identity. Two candida
 A `UserPromptSubmit` hook could detect the lambda from cwd and write an actor file:
 
 ```bash
-# Hook detects: cwd=/Users/lion/projects/khive/khive → lambda:khive
-echo "lambda:khive" > /tmp/claude_hooks/actor_context
+# Hook detects: cwd=/workspace/project-a → lambda:project-a
+echo "lambda:project-a" > /tmp/claude_hooks/actor_context
 ```
 
 The MCP server would read this file on each `request` dispatch and use it as the actor
@@ -309,7 +309,7 @@ A future MCP protocol extension could carry caller context in the request envelo
 ```json
 {
   "tool": "request",
-  "args": { "ops": "...", "_context": { "actor": "lambda:khive", "session": "abc123" } }
+  "args": { "ops": "...", "_context": { "actor": "lambda:project-a", "session": "abc123" } }
 }
 ```
 
@@ -436,16 +436,16 @@ Fires at the start of every Claude Code turn. Responsibilities:
 # 1. Detect lambda from cwd
 CWD="$PWD"
 case "$CWD" in
-  */khive/khive*)  ACTOR="lambda:khive" ;;
-  */lionagi*)      ACTOR="lambda:lionagi" ;;
-  */lattice*)      ACTOR="lambda:lattice" ;;
+  */project-a*)  ACTOR="lambda:project-a" ;;
+  */project-b*)      ACTOR="lambda:project-b" ;;
+  */project-c*)      ACTOR="lambda:project-c" ;;
   *)               ACTOR="local" ;;
 esac
 
 # 2. Detect role from agent context (if spawned as subagent)
 AGENT_TYPE="${CLAUDE_AGENT_TYPE:-}" # Claude Code exposes this for subagents
 if [ -n "$AGENT_TYPE" ]; then
-  ACTOR="${ACTOR}:${AGENT_TYPE}"  # e.g. "lambda:khive:implementer"
+  ACTOR="${ACTOR}:${AGENT_TYPE}"  # e.g. "lambda:project-a:implementer"
 fi
 
 # 3. Write actor context for MCP server to read
@@ -644,8 +644,8 @@ three dimensions of specificity:
 
 ```
 # Dimension 1: Project-level (which codebase)
-brain.bind(actor="lambda:khive",   namespace="*", consumer_kind="knowledge_compose", profile_id="khive-knowledge-v1")
-brain.bind(actor="lambda:lionagi", namespace="*", consumer_kind="knowledge_compose", profile_id="lionagi-knowledge-v1")
+brain.bind(actor="lambda:project-a",   namespace="*", consumer_kind="knowledge_compose", profile_id="khive-knowledge-v1")
+brain.bind(actor="lambda:project-b", namespace="*", consumer_kind="knowledge_compose", profile_id="lionagi-knowledge-v1")
 
 # Dimension 2: Role-level (what kind of work)
 brain.bind(actor="implementer",    namespace="*", consumer_kind="knowledge_compose", profile_id="impl-knowledge-v1")
@@ -653,8 +653,8 @@ brain.bind(actor="theorist",       namespace="*", consumer_kind="knowledge_compo
 brain.bind(actor="researcher",     namespace="*", consumer_kind="knowledge_compose", profile_id="research-knowledge-v1")
 
 # Dimension 3: Compound (project + role, most specific)
-brain.bind(actor="lambda:khive:implementer", namespace="*", consumer_kind="knowledge_compose", profile_id="khive-impl-v1")
-brain.bind(actor="lambda:lionagi:theorist",  namespace="*", consumer_kind="knowledge_compose", profile_id="lionagi-theory-v1")
+brain.bind(actor="lambda:project-a:implementer", namespace="*", consumer_kind="knowledge_compose", profile_id="khive-impl-v1")
+brain.bind(actor="lambda:project-b:theorist",  namespace="*", consumer_kind="knowledge_compose", profile_id="lionagi-theory-v1")
 
 # Global fallback
 brain.bind(actor="*", namespace="*", consumer_kind="knowledge_compose", profile_id="balanced-knowledge-v1")
@@ -662,16 +662,16 @@ brain.bind(actor="*", namespace="*", consumer_kind="knowledge_compose", profile_
 
 Resolution is longest-match-wins (most specific actor > less specific > wildcard):
 
-| Session context              | Hook sets actor to         | Resolves to                                |
-| ---------------------------- | -------------------------- | ------------------------------------------ |
-| khive implementer subagent   | `lambda:khive:implementer` | `khive-impl-v1` (exact compound match)     |
-| khive session, no role       | `lambda:khive`             | `khive-knowledge-v1` (project match)       |
-| lionagi theorist subagent    | `lambda:lionagi:theorist`  | `lionagi-theory-v1` (exact compound match) |
-| unknown project, implementer | `local:implementer`        | `impl-knowledge-v1` (role match)           |
-| completely generic           | `local`                    | `balanced-knowledge-v1` (wildcard)         |
+| Session context                | Hook sets actor to             | Resolves to                                |
+| ------------------------------ | ------------------------------ | ------------------------------------------ |
+| project A implementer subagent | `lambda:project-a:implementer` | `khive-impl-v1` (exact compound match)     |
+| project A session, no role     | `lambda:project-a`             | `khive-knowledge-v1` (project match)       |
+| project B theorist subagent    | `lambda:project-b:theorist`    | `lionagi-theory-v1` (exact compound match) |
+| unknown project, implementer   | `local:implementer`            | `impl-knowledge-v1` (role match)           |
+| completely generic             | `local`                        | `balanced-knowledge-v1` (wildcard)         |
 
-Each profile learns independently. The khive implementer's posteriors reflect what
-khive implementation work needs. The lionagi theorist's posteriors reflect what
+Each profile learns independently. The project A implementer's posteriors reflect what
+khive implementation work needs. The project B theorist's posteriors reflect what
 formal verification work needs. They share the same corpus but get different views.
 
 ### 5. Profile lifecycle and cross-learning
@@ -1166,7 +1166,7 @@ the authoritative shipped tables are `brain_profile_snapshots` and `brain_event_
 
 ## Amendment: Research-Informed Design Corrections (2026-05-27)
 
-**Authors**: Ocean, lambda:khive
+**Authors**: khive maintainers
 **Source**: 10 targeted ChatGPT research consultations (Q1-Q10), digested into KG as 17
 entities + 72 edges + 9 notes.
 

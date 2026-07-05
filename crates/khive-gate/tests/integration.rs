@@ -19,7 +19,7 @@ fn sample_request() -> GateRequest {
 
 fn sample_req_with_session() -> GateRequest {
     GateRequest::new(
-        ActorRef::new("user", "ocean"),
+        ActorRef::new("user", "operator"),
         Namespace::local(),
         "create",
         json!({"kind": "concept"}),
@@ -163,7 +163,7 @@ fn audit_event_roundtrips_through_serde_stable_shape() {
     let json = serde_json::to_value(&ev).unwrap();
 
     assert_eq!(json["actor"]["kind"], "user");
-    assert_eq!(json["actor"]["id"], "ocean");
+    assert_eq!(json["actor"]["id"], "operator");
     assert_eq!(json["namespace"], "local");
     assert_eq!(json["verb"], "create");
     assert_eq!(json["decision"], "allow");
@@ -350,11 +350,11 @@ fn rate_limit_try_rejects_zero_max() {
 
 #[test]
 fn valid_actor_ref_roundtrips() {
-    let a = ActorRef::new("user", "ocean");
+    let a = ActorRef::new("user", "operator");
     let json = serde_json::to_string(&a).unwrap();
     let back: ActorRef = serde_json::from_str(&json).unwrap();
     assert_eq!(back.kind, "user");
-    assert_eq!(back.id, "ocean");
+    assert_eq!(back.id, "operator");
 }
 
 #[test]

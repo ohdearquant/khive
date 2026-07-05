@@ -1029,7 +1029,7 @@ impl BrainPack {
         // PR-A1: by-ID ops are namespace-agnostic; authorization is the Gate's,
         // not a post-fetch namespace check). Rule 3b recall fans out actor-stamped
         // memories from other namespaces by design, so a primary-only check would
-        // reject the flywheel's own recalled targets. NotFound only for a
+        // reject the feedback loop's own recalled targets. NotFound only for a
         // genuinely absent UUID.
         use khive_runtime::Resolved;
         match self
@@ -1121,7 +1121,7 @@ impl BrainPack {
 
         // ADR-081 §2/§6: when both scorer fields are present, the dedup claim
         // is made atomically inside the SAME `BEGIN IMMEDIATE` transaction as
-        // the fold gate's mass check-and-write AND (Finding 1, codex round 2)
+        // the fold gate's mass check-and-write AND (Finding 1, internal review round 2)
         // the durable feedback event append (fold_gate.rs) — the `resolve`
         // check above is a non-atomic fast path only (it still handles the
         // common sequential case and the NotFound / forced-zero-weight
@@ -1165,7 +1165,7 @@ impl BrainPack {
             let nominal_weight = FeedbackEventKind::from_signal_str(signal)
                 .expect("is_gated_implicit implies from_signal_str is Some")
                 .update_weight();
-            // Finding 2 (codex round 2): the forced-zero fail-safe path now
+            // Finding 2 (internal review round 2): the forced-zero fail-safe path now
             // runs through the SAME atomic claim+append unit as the nominal
             // path below — only the mass fold write itself is skipped — so
             // it participates in the dedup claim instead of bypassing it.

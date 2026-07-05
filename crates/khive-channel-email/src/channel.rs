@@ -943,7 +943,7 @@ mod tests {
 
     #[tokio::test]
     async fn quoted_reason_semicolon_forging_dmarc_pass_does_not_bypass_gate() {
-        // Regression for codex #496 Finding 1, driven through the REAL byte-parsing
+        // Regression for review #496 Finding 1, driven through the REAL byte-parsing
         // path (parse_raw_bytes), not a hand-built AuthResults: a quoted reason=
         // pvalue containing "; dmarc=pass; " must never be split into a separate
         // dmarc method -- the gate must see the genuine spf=fail result and
@@ -1013,7 +1013,7 @@ mod tests {
     #[tokio::test]
     async fn exo_no_authserv_id_fixture_end_to_end_is_attributed() {
         // Real Exchange Online header shape (verbatim values from the live
-        // fixture `ocean_0110_raw_headers.txt`): an ARC-Authentication-Results
+        // fixture `raw_headers.txt`): an ARC-Authentication-Results
         // header (must be ignored -- collecting/trusting ARC is the rejected
         // Shape B, out of scope) precedes the plain Authentication-Results
         // header EXO stamps on its own internal hop, which carries no
@@ -1021,20 +1021,20 @@ mod tests {
         // cleanly through the real byte-parsing path.
         let raw = b"ARC-Authentication-Results: i=2; mx.microsoft.com 1; spf=pass smtp.mailfrom=gmail.com; dmarc=pass header.from=gmail.com; dkim=pass header.d=gmail.com\r\n\
                     Authentication-Results: spf=pass (sender IP is 2607:f8b0:4864:20::1129) smtp.mailfrom=gmail.com; dkim=pass (signature was verified) header.d=gmail.com;dmarc=pass action=none header.from=gmail.com;compauth=pass reason=100\r\n\
-                    From: Ocean Li <quantocean.li@gmail.com>\r\n\
-                    To: Leo Li <leo@khive.ai>\r\n\
+                    From: Example Sender <sender@example.com>\r\n\
+                    To: Example Recipient <recipient@example.com>\r\n\
                     Subject: Khive email subject disappears into body\r\n\
                     \r\n\
                     body text";
         let email = parse_raw_bytes(1, raw, "imap.example.com", 1).unwrap();
 
-        let mut config = make_config("quantocean.li@gmail.com");
+        let mut config = make_config("sender@example.com");
         config.trust_anchor = TrustAnchor::TopmostNoAuthservId;
         let ch = build_channel_from(config, vec![email]);
         let envs = ch.poll(Utc::now()).await.unwrap();
         assert_eq!(envs.len(), 1);
         assert_eq!(
-            envs[0].from, "email:quantocean.li@gmail.com",
+            envs[0].from, "email:sender@example.com",
             "the real EXO no-authserv-id header must attribute cleanly in TopmostNoAuthservId mode"
         );
     }
@@ -1048,13 +1048,13 @@ mod tests {
         // one, or an attacker's forged header floated to the top) --
         // quarantine rather than trust it.
         let raw = b"Authentication-Results: mx.microsoft.com; dmarc=pass header.from=gmail.com\r\n\
-                    From: Ocean Li <quantocean.li@gmail.com>\r\n\
-                    To: Leo Li <leo@khive.ai>\r\n\
+                    From: Example Sender <sender@example.com>\r\n\
+                    To: Example Recipient <recipient@example.com>\r\n\
                     Subject: forged topmost carries an id\r\n\
                     \r\n\
                     body";
         let email = parse_raw_bytes(1, raw, "imap.example.com", 1).unwrap();
-        let mut config = make_config("quantocean.li@gmail.com");
+        let mut config = make_config("sender@example.com");
         config.trust_anchor = TrustAnchor::TopmostNoAuthservId;
         let ch = build_channel_from(config, vec![email]);
         let envs = ch.poll(Utc::now()).await.unwrap();

@@ -2,7 +2,7 @@
 
 **Status**: Proposed\
 **Date**: 2026-06-23\
-**Authors**: Ocean, lambda:khive\
+**Authors**: khive maintainers
 **Depends on**: ADR-007 (Namespace as Attribution), ADR-018 (Authorization Gate), ADR-049
 (khived daemon), ADR-057 (Comm Actor-Addressed Delivery)\
 **Amends (effective now)**: ADR-007 Rule 4 (TenantGate clause); ADR-018
@@ -431,20 +431,20 @@ launch, not per-request. Idle actors with no active process incur no RAM cost.
 The Postgres migration path activates when the following condition is met in production metrics:
 
 ```
-active_warm_processes * p95_rss_per_warm_vamana_index > fleet_ram_budget * 0.70
+active_warm_processes * p95_rss_per_warm_vamana_index > deployment_ram_budget * 0.70
 ```
 
 where:
 
 - `active_warm_processes`: count of actor processes with a loaded Vamana index, measured from
-  process-level RSS metrics in the fleet monitoring system.
+  process-level RSS metrics in the deployment monitoring system.
 - `p95_rss_per_warm_vamana_index`: the 95th-percentile per-process RSS increment attributable
   to a warm Vamana index, measured by comparing RSS of idle-process and index-loaded-process
   samples over a rolling 7-day window.
-- `fleet_ram_budget`: total available fleet RAM as reported by the infrastructure provider.
+- `deployment_ram_budget`: total available deployment RAM as reported by the infrastructure provider.
 - `0.70`: safety factor (30% headroom). Adjust only via an ADR amendment.
 
-Decision owner: lambda:khive. Review artifact: a filed ADR amendment with the measured metric
+Decision owner: maintainers. Review artifact: a filed ADR amendment with the measured metric
 values, a 7-day trend chart, and a proposed migration timeline. No Postgres migration may begin
 without that artifact.
 

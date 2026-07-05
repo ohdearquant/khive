@@ -6,7 +6,7 @@ description: Store and retrieve durable agent memory — remember decisions, pre
 
 khive memory is how context survives across sessions. The surface is three verbs —
 `memory.remember`, `memory.recall`, and `memory.feedback` — but the thing worth
-learning is the *salience discipline and store-before-recall cycle*, not the verbs.
+learning is the _salience discipline and store-before-recall cycle_, not the verbs.
 Per-verb param detail is one call away: `request(ops="memory.remember(help=true)")`.
 
 ## The pattern
@@ -30,12 +30,12 @@ When uncertain, use `episodic` — it preserves the context of when the memory w
 
 Salience controls ranking at recall time. Default it DOWN.
 
-| Salience | For |
-|----------|-----|
-| 0.9+ | Ocean directives, life-changing facts (rare) |
-| 0.65-0.85 | Stable design decisions, high-value patterns |
-| 0.5-0.7 | Session outcomes, useful observations |
-| 0.3-0.5 | Routine episodic notes (default range) |
+| Salience  | For                                               |
+| --------- | ------------------------------------------------- |
+| 0.9+      | Maintainer directives, life-changing facts (rare) |
+| 0.65-0.85 | Stable design decisions, high-value patterns      |
+| 0.5-0.7   | Session outcomes, useful observations             |
+| 0.3-0.5   | Routine episodic notes (default range)            |
 
 Most mid-session insights belong at 0.5, not 0.8. Inflated salience fills the top
 of every recall result with noise and defeats the ranking.

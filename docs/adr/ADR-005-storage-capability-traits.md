@@ -2,7 +2,7 @@
 
 **Status**: accepted\
 **Date**: 2026-05-22\
-**Authors**: Ocean, lambda:khive
+**Authors**: khive maintainers
 
 ## Context
 

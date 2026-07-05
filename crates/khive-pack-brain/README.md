@@ -35,7 +35,7 @@ verbs through the MCP `request` DSL, not called directly as a Rust API:
 
 ```text
 request(ops="brain.create_profile(name=\"my-profile-v1\", consumer_kind=\"recall\")")
-request(ops="brain.resolve(consumer_kind=\"recall\", actor=\"lambda:khive\")")
+request(ops="brain.resolve(consumer_kind=\"recall\", actor=\"agent:docs\")")
 request(ops="brain.feedback(target_id=\"<uuid>\", signal=\"useful\")")
 ```
 

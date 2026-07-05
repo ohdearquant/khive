@@ -857,11 +857,11 @@ mod tests {
     fn proposal_payloads_are_typed() {
         let payload = EventPayload::ProposalReviewed(ProposalReviewedPayload {
             proposal_id: Id128::from_u128(42),
-            reviewer: "ocean".into(),
+            reviewer: "operator".into(),
             decision: ProposalDecision::Approve,
             comment: None,
         });
-        let event = EventBuilder::new("review", SubstrateKind::Entity, "ocean")
+        let event = EventBuilder::new("review", SubstrateKind::Entity, "operator")
             .kind(EventKind::ProposalReviewed)
             .payload(payload)
             .build(header());

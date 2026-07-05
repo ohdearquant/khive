@@ -2,7 +2,7 @@
 
 **Status**: accepted\
 **Date**: 2026-05-22\
-**Authors**: Ocean, lambda:khive\
+**Authors**: khive maintainers
 **Amended by**: [ADR-076](ADR-076-relation-calculability-and-system-role.md) — `part_of` is a
 distinct relation, not the "inverse of `contains`"; the two coincide in some domains and diverge
 in others, and neither is derived from the other.

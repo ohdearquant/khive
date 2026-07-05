@@ -2,7 +2,7 @@
 
 **Status**: accepted\
 **Date**: 2026-05-23\
-**Authors**: Ocean, lambda:khive
+**Authors**: khive maintainers
 
 > Relationship to ADR-030: ADR-012 is the legacy-but-live high-level retrieval
 > composition record. It governs runtime and pack-level orchestration of storage

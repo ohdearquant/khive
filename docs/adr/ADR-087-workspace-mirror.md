@@ -2,7 +2,7 @@
 
 **Status**: Proposed\
 **Date**: 2026-07-03\
-**Authors**: Ocean, lambda:khive\
+**Authors**: khive maintainers
 **Depends on**: ADR-086 (Document/File Modeling — the `document`-entity shape this mirror
 populates), ADR-080 (Session Pack — OSS Storage Mechanism, §6 session mirror — the
 operational pattern this ADR reuses), ADR-002 (Edge Ontology — `supersedes`), ADR-017
@@ -12,8 +12,8 @@ is excluded from this mirror's scope), ADR-021 (Memory Pack)
 
 ## Context
 
-Ocean's request, verbatim intent: fold the `.khive/` filesystem convention (workspaces,
-notes, summaries, handoffs, reports, `codex_reviews/`) into khive itself, "on record and
+The design request: fold the `.khive/` filesystem convention (workspaces,
+notes, summaries, handoffs, reports, review artifacts) into khive itself, "on record and
 kept," explicitly drawing the analogy to `khive-pack-session`'s session mirror
 architecture. `.khive/` today is the root CLAUDE.md's documented Workspace Convention — a
 directory tree of markdown artifacts that exist only as files, invisible to
@@ -31,11 +31,11 @@ continue, exactly as the session mirror already does).
 **The critical divergence this ADR must state explicitly.** The session mirror's actual
 shipped implementation writes into pack-`khive-pack-session`-private auxiliary tables,
 entirely outside the graph substrate (entities/notes/edges) — appropriate for session
-transcripts, which are recall-only raw material, not meant to be graph nodes. Ocean's ask
+transcripts, which are recall-only raw material, not meant to be graph nodes. The requirement
 for `.khive/` is different in kind: the content must be "on record" in the sense of
 graph-queryable (`search`, `neighbors`, `traverse`), linkable, and versioned via
 `supersedes` — not merely recallable. Copying the session mirror's storage target verbatim
-would satisfy the operational-pattern analogy Ocean drew but miss the actual requirement.
+would satisfy the operational-pattern analogy but miss the actual requirement.
 This ADR reuses the OPERATIONAL PATTERN and deliberately changes the STORAGE TARGET.
 
 ## Decision
@@ -73,7 +73,7 @@ maps cleanly, e.g. `notes/handoffs/*` → `entity_type="handoff"`).
 3. **Retention follows ADR-086 exactly.** A file's content changing between polls produces
    a NEW `document` entity version + a `supersedes` edge to the prior version (matched by
    `properties.source_uri`, the stable identity key across versions) — never an
-   in-place content overwrite. This is Ocean's confirmed resolution: kept means
+   in-place content overwrite. This is the confirmed resolution: kept means
    version-history-via-supersedes, not a single mutable row.
 
 4. **Scope: explicit include/exclude, not "everything under `.khive/`."** Config-driven
@@ -115,7 +115,7 @@ write target changes.
 
 Session transcripts are recall-only by design (ADR-080's own scope statement: the
 mirror stores raw material for `session.recall`, not curated graph content). `.khive/`
-notes, handoffs, and reports are exactly the kind of content Ocean's directive says
+notes, handoffs, and reports are exactly the kind of content the design request says
 should be linkable and traversable — decisions annotate documents, documents get
 superseded, agents `neighbors()` out from a report to the project it concerns. None of
 that is possible if the content sits in a pack-private table the graph substrate doesn't
@@ -124,7 +124,7 @@ see. The requirement, not just the analogy, decides the storage target.
 ## Alternatives Considered
 
 **A1: Copy the session mirror's auxiliary-table storage verbatim ("similar architecture"
-taken literally).** Rejected. Satisfies the literal analogy Ocean drew but not the
+taken literally).** Rejected. Satisfies the literal analogy but not the
 "on record, kept, queryable" requirement — the whole point of folding `.khive/` in.
 
 **A2: A new dedicated pack crate for the mirror.** Rejected. The mirror is a service that
@@ -154,7 +154,7 @@ config, defaulting to the high-value subpaths, avoids both.
 1. Exact default include/exclude glob list — proposed above as a starting point, but
    should be validated against real `.khive/` directory contents before the mirror ships,
    not fixed permanently in this ADR text.
-2. Should `codex_reviews/` mirroring be gated behind a separate opt-in flag, given it's
+2. Should review-artifact mirroring be gated behind a separate opt-in flag, given it is
    explicitly local-only/gitignored content, distinct in sensitivity from notes/reports?
    Recommend: mirror it (it's local-graph-only too, not re-exported anywhere), but keep it
    toggleable via the same include/exclude config.

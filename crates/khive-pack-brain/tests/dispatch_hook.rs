@@ -330,7 +330,7 @@ async fn cold_hook_signal_applies_on_top_of_persisted_snapshot() {
 /// owns authorization, not a post-fetch namespace comparison. Rule 3b recall
 /// fans out actor-stamped memories from other namespaces by design (a lambda's
 /// episodic memories carry its actor namespace), so a primary-only check
-/// rejected the flywheel's own recalled targets — exactly the fleet-wide
+/// rejected the feedback loop's own recalled targets — exactly shared
 /// feedback-discipline breakage this fixes.
 ///
 /// This reverses the earlier "Finding 3" primary-only behavior, which cited

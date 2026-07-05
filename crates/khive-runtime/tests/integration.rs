@@ -700,7 +700,7 @@ async fn synthetic_edge_observed_as_selected_returns_memory_note() {
 }
 
 // =============================================================================
-// update_edge conflict handling regression tests (codex round-3 H1)
+// update_edge conflict handling regression tests (internal review round 3 H1)
 // =============================================================================
 
 /// Regression for Bug 1: when update_edge absorbs a conflict (the requested edge

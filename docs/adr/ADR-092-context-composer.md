@@ -18,7 +18,7 @@ No verb assembles across substrates. Today the per-turn prefetch hook does this 
 MCP round-trips (recall + search + per-anchor neighbors), caller-side budget math, and no place for
 the runtime to learn how much budget each substrate deserves per consumer.
 
-Three shapes were considered (Ocean ratified the third):
+Three shapes were considered, and the third was selected:
 
 - **A — pack-blind substrate retrieval + traversal** (one hybrid search across all kinds + annotates
   expansion). Rejected: discards each pack's ranker (memory decay/salience/posteriors, knowledge

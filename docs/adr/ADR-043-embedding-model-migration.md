@@ -2,7 +2,7 @@
 
 **Status**: accepted
 **Date**: 2026-05-23
-**Authors**: Ocean, lambda:khive
+**Authors**: khive maintainers
 **Depends on**:
 
 - ADR-011 (Embedding and Inference Architecture)
@@ -28,7 +28,7 @@ subsystem, layered on top of what lattice already provides.
 
 ### What lattice already provides
 
-Per `/Users/lion/projects/khive/lattice/crates/{embed,transport}/`:
+Per the lattice repository's embed and transport crates:
 
 - **`lattice_embed::EmbeddingKey { model, revision, dims, metric, dtype, norm }`** with
   `canonical_bytes()`. Vectors under different keys are not exchangeable; lattice's

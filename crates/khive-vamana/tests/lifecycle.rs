@@ -1075,7 +1075,7 @@ fn oq2_consolidate_beats_no_consolidate_on_memory() {
     );
 }
 
-// ---- Regression tests (codex round-2 required) ----
+// ---- Regression tests (internal review round 2 required) ----
 
 /// T-R1: insert a distinctive vector, self-query k=1, assert the assigned ordinal is found.
 /// The previous suite only queried ORIGINAL vectors (lifecycle.rs:538). This closes that gap.
@@ -1103,7 +1103,7 @@ fn insert_then_self_query() {
     );
 }
 
-/// T-R2: exact codex repro (round-2 Critical).
+/// T-R2: exact regression reproduction.
 /// Graph: vectors [0.0, 0.1], dim=1, max_degree=1, search_list_size=1.
 /// After insert([-0.2]):
 ///   (a) self-query for [-0.2] must return the inserted ordinal.

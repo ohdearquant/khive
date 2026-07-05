@@ -3,7 +3,7 @@
 **Status**: accepted
 **Date**: 2026-06-28
 **Amended**: 2026-07-02 — shipped-surface record (§3), session mirror (§6), scope revision (Context)
-**Authors**: Ocean, lambda:khive
+**Authors**: khive maintainers
 
 ## Context
 

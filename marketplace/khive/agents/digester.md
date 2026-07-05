@@ -67,7 +67,7 @@ Before processing any source:
    concept), they are intentionally separate — do not merge.
 
    **Lesson (2026-06-09)**: 6 lionagi classes were double-ingested across two batch waves
-   ("source" 5/21 and "module" 5/27) and required manual merges by Leo.
+   ("source" 5/21 and "module" 5/27) and required manual merges by a maintainer.
 
 6. **Note salience honestly.** 0.85+ for cross-cutting insights, 0.5-0.75 for normal observations,
    <0.5 for context that doesn't matter long-term. Inflated salience poisons future recall.

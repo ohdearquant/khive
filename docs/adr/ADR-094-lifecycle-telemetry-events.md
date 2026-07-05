@@ -24,7 +24,7 @@ consecutive occurrences," and both currently have no ordered log to query.
 
 ### Three existing telemetry mechanisms, none built for this
 
-Recon (`.khive/workspaces/20260704/telemetry-recon/TELEMETRY_SURFACE.md`,
+Recon (local telemetry surface notes,
 `SINGLETON_AUDIT.md`, audited at `origin/main` `c8c16f49`, re-verified byte-identical in
 this worktree) found three mechanisms already in production:
 
@@ -375,7 +375,7 @@ id) DESC`; if fewer than 3 rows exist (e.g. shortly after daemon start), do not 
 taxonomy, the emission contract, and the drain-row addition that makes the query
 non-vacuous); #617 implements the actual query, the `tracing::warn!` downgrade/promotion
 described in the ADR-091 amendment, and any additional hysteresis #617's own design wants on
-top of this minimum.** N stays owned and tunable by lambda:khive per the amendment's text,
+top of this minimum.** N stays owned and tunable by maintainers per the amendment's text,
 unaffected by this ADR.
 
 ### 5. Retention/volume: edge-triggered for every variant except `ChannelPollStarted`
@@ -536,7 +536,7 @@ event, closing the singleton audit's top-ranked finding (`SINGLETON_AUDIT.md` §
 
   This drain-site choice (moving off `run_checkpoint_task` and onto `VerbRegistry::dispatch`)
   is a design delta from this ADR's prior revision and is called out here explicitly for
-  Leo's confirmation, on the strength of the one-directional-dependency rationale above.
+  maintainer confirmation, on the strength of the one-directional-dependency rationale above.
 
 (b) **`tx_registry.rs` (ADR-091 Plank 0)** stays out of scope for this ADR, per the audit's
 own framing (`SINGLETON_AUDIT.md` §4 item 2): it is a per-process, in-memory, observe-only

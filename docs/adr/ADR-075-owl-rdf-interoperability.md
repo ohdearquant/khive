@@ -2,7 +2,7 @@
 
 **Status**: Draft\
 **Date**: 2026-06-26\
-**Authors**: Ocean, lambda:khive\
+**Authors**: khive maintainers
 **Depends on**: ADR-002 (Edge Ontology), ADR-008 (Query Layer Separation -- SPARQL subset),
 ADR-069 (Subject Model), ADR-072 (Subject OntologySpec as Runtime Data)
 

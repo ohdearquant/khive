@@ -927,7 +927,7 @@ async fn test_357_feedback_no_double_count() {
 
 // #295: brain.reset must restore domain-informed priors, not Beta(1,1).
 //
-// Strengthened per codex P12 Medium: this test now exercises the full
+// Strengthened per internal review P12 Medium: this test now exercises the full
 // production path — handle_reset → reset_posteriors → sync helper — and
 // verifies that ALL three profile record fields (total_events,
 // exploration_epoch, state_snapshot) reflect the restored priors.
@@ -1150,7 +1150,7 @@ async fn brain_reset_accepts_empty_params() {
 // #355 (regression — real dispatch path): temporal posterior must update
 // when a recall hits via the on_dispatch hook carrying real hit/latency.
 //
-// This test exercises the production wiring added in the P12 codex fix:
+// This test exercises the production wiring added in the P12 fix:
 // the runtime now embeds duration_us + target_id in the hook event for
 // "recall" verbs.  Simulates that by constructing the hook event the way
 // the runtime now would, then verifies temporal.alpha() increments.
@@ -2867,7 +2867,7 @@ mod help_tests {
         );
     }
 
-    // ── Regression: schema-aware namespace strip (codex round-2 H1) ──────────
+    // ── Regression: schema-aware namespace strip (internal review round 2 H1) ──────────
     //
     // brain.bind / brain.resolve / brain.unbind / brain.bindings declare
     // `namespace` as a *business* parameter in their HandlerDef.params.  The
@@ -2893,7 +2893,7 @@ mod help_tests {
     }
 
     /// brain.bind via VerbRegistry must store the caller-supplied namespace,
-    /// not default to "*".  Regression for the blanket-strip bug (codex H1).
+    /// not default to "*".  Regression for the blanket-strip bug.
     #[tokio::test]
     async fn r2_h1_bind_via_registry_preserves_namespace() {
         use serde_json::json;
@@ -2942,7 +2942,7 @@ mod help_tests {
     }
 
     /// brain.resolve via VerbRegistry must use the caller-supplied namespace to
-    /// match the binding stored by brain.bind.  Regression for codex H1.
+    /// match the binding stored by brain.bind.  Regression for the binding match bug.
     #[tokio::test]
     async fn r2_h1_resolve_via_registry_uses_namespace() {
         use serde_json::json;
@@ -2982,7 +2982,7 @@ mod help_tests {
     }
 
     /// brain.unbind via VerbRegistry must use the caller-supplied namespace to
-    /// remove only the matching binding.  Regression for codex H1.
+    /// remove only the matching binding.  Regression for the binding removal bug.
     #[tokio::test]
     async fn r2_h1_unbind_via_registry_uses_namespace() {
         use serde_json::json;
@@ -4900,7 +4900,7 @@ mod adr081_retune_driver_tests {
         assert!(!second, "exact-key duplicate must report written=false");
     }
 
-    /// codex PR #583 round-1 Low: a `UNIQUE` violation on the `id TEXT PRIMARY
+    /// internal review PR #583 round-1 Low: a `UNIQUE` violation on the `id TEXT PRIMARY
     /// KEY` column (same `id`, different natural key) must NOT be reported as
     /// a tolerated natural-key duplicate — the row that actually exists does
     /// not match `(namespace, target_id, query_class, served_at)`, so the

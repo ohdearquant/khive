@@ -691,7 +691,7 @@ impl GraphStore for SqlGraphStore {
                     // ascending, applied INSIDE the window's ORDER BY — otherwise a
                     // per-origin cap can silently drop high-weight neighbors in favor
                     // of arbitrary SQLite row order (mirrors neighbors(), ADR-089
-                    // context-verb review codex round-1 High-1; issue #589).
+                    // context-verb review internal review round 1 High-1; issue #589).
                     let full_sql = if let Some(lim) = query_clone.limit {
                         all_params.push(Box::new(lim as i64));
                         format!(
@@ -929,7 +929,7 @@ impl GraphStore for SqlGraphStore {
             // Deterministic weight-descending order, tie-broken by node_id ascending,
             // applied BEFORE `LIMIT` — otherwise a `limit`/`fanout` cap can silently
             // drop high-weight neighbors in favor of arbitrary SQLite row order
-            // (ADR-089 context-verb review, codex round 1, High-1).
+            // (ADR-089 context-verb review, internal review round 1, High-1).
             let full_sql = format!(
                 "SELECT node_id, edge_id, relation, weight FROM ({}){} \
                  ORDER BY weight DESC, node_id ASC{}",

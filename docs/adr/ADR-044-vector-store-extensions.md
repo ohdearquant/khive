@@ -2,7 +2,7 @@
 
 **Status**: accepted
 **Date**: 2026-05-23
-**Authors**: Ocean, lambda:khive
+**Authors**: khive maintainers
 **Depends on**:
 
 - [ADR-005](ADR-005-storage-capability-traits.md) — Storage Capability Traits (base `VectorStore`)

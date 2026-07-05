@@ -2,7 +2,7 @@
 
 **Status**: Proposed\
 **Date**: 2026-06-26\
-**Authors**: Ocean, lambda:khive\
+**Authors**: khive maintainers
 **Extends**: ADR-069 (Subject Model -- component specification and D1)\
 **Depends on**: ADR-001 (Entity Kind Taxonomy), ADR-002 (Edge Ontology), ADR-017 (Pack
 Standard -- `EDGE_RULES`, `ENTITY_KINDS`, `all_edge_rules()`), ADR-055 (Epistemic Edge

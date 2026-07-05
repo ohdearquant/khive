@@ -829,7 +829,7 @@ impl VerbRegistry {
             }
         }
         // Only list Verb-visibility handlers so internal subhandlers are not
-        // advertised in the unknown-verb error (ue-help-introspection C1 / codex High).
+        // advertised in the unknown-verb error (ue-help-introspection C1 / internal review High).
         let available: Vec<&str> = self
             .packs
             .iter()
@@ -1052,7 +1052,7 @@ impl VerbRegistry {
 
                     // For recall verbs: extract the first result's id as
                     // target_id so the brain temporal posterior can observe
-                    // real hit/miss and latency (fix for codex P12 Major).
+                    // real hit/miss and latency (fix for internal review P12 Major).
                     if verb == "memory.recall" {
                         let first_note_id = ok_val
                             .as_array()
@@ -1079,7 +1079,7 @@ impl VerbRegistry {
             }
         }
         // Only list Verb-visibility handlers so internal subhandlers are not
-        // advertised in the unknown-verb error (ue-help-introspection C1 / codex High).
+        // advertised in the unknown-verb error (ue-help-introspection C1 / internal review High).
         let available: Vec<&str> = self
             .packs
             .iter()
@@ -2169,7 +2169,7 @@ mod tests {
     }
 
     // Captures the namespace each call sees so we can assert what the gate
-    // actually receives — codex round-1 caught us hard-wiring `default_ns()`.
+    // actually receives — internal review round 1 caught us hard-wiring `default_ns()`.
     #[derive(Default, Debug)]
     struct NamespaceCapturingGate {
         seen: std::sync::Mutex<Vec<String>>,
@@ -3021,7 +3021,7 @@ mod tests {
 
     // ---- EventStore audit envelope round-trip ----
     //
-    // Codex review finding (Major #1): EventStore was persisting a summary
+    // internal review finding (Major #1): EventStore was persisting a summary
     // Event without the full AuditEvent fields (deny_reason, gate_impl,
     // obligations). This test verifies the complete envelope survives
     // append_event → query_events.
@@ -3158,7 +3158,7 @@ mod tests {
         }
     }
 
-    // ---- SQL-backed audit envelope round-trip (codex r2) ----
+    // ---- SQL-backed audit envelope round-trip ----
     //
     // The two tests above use MemoryEventStore (no serialization). This test
     // wires the production SqlEventStore via KhiveRuntime::memory() to verify
@@ -3255,7 +3255,7 @@ mod tests {
 
     // ---- SQL-backed audit envelope: non-empty obligations survive round-trip ----
     //
-    // Codex r3 identified a blind spot: the deny-path SQL test above only
+    // Blind spot: the deny-path SQL test above only
     // asserts obligations == [], which passes even if the SQL path drops the
     // field entirely (AuditEvent.obligations has #[serde(default)]).
     //
@@ -4313,11 +4313,11 @@ mod help_tests {
         );
     }
 
-    // ── codex High: unknown-verb error must not leak subhandler names ─────────
+    // ── internal review High: unknown-verb error must not leak subhandler names ─────────
 
     /// `describe_verb` on an unknown verb must list only Verb-visibility names
     /// in the "available" list — never subhandler names like `recall.embed`
-    /// (codex High — ue-help-introspection C1 / unknown-verb path).
+    /// (internal review High — ue-help-introspection C1 / unknown-verb path).
     #[tokio::test]
     async fn help_true_unknown_verb_available_list_excludes_subhandlers() {
         let reg = build_help_registry(Arc::new(AtomicUsize::new(0)));

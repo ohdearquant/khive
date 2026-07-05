@@ -2,7 +2,7 @@
 
 **Status**: accepted
 **Date**: 2026-05-23
-**Authors**: Ocean, lambda:khive
+**Authors**: khive maintainers
 **Amended**: 2026-06-19, added §10 (`memory_type` to namespace routing) recording the
 [ADR-007](ADR-007-namespace.md) Rev 6 carve-out: episodic memory writes stamp the caller's actor
 id by default, semantic memory writes stamp the shared pool, and an explicit `namespace=`
@@ -46,10 +46,10 @@ stored under this kind, distinguished by a `memory_type` attribute on the note:
 | ------------- | ---------------------------- | ------------ | ----------------- |
 | `memory_type` | `"episodic"` \| `"semantic"` | `"episodic"` | `note.properties` |
 
-| memory_type | Shape                       | Examples                                                 |
-| ----------- | --------------------------- | -------------------------------------------------------- |
-| `episodic`  | Time-anchored, event-shaped | "On 2026-05-19 Ocean said prefer `uv run` over `python`" |
-| `semantic`  | Abstracted, fact-shaped     | "Ocean prefers `uv run` over `python`"                   |
+| memory_type | Shape                       | Examples                                                        |
+| ----------- | --------------------------- | --------------------------------------------------------------- |
+| `episodic`  | Time-anchored, event-shaped | "On 2026-05-19 a maintainer said prefer `uv run` over `python`" |
+| `semantic`  | Abstracted, fact-shaped     | "Maintainers prefer `uv run` over `python`"                     |
 
 The distinction is **advisory, not enforced**. Nothing structurally validates that
 episodic memories carry timestamps. Agents choose `memory_type` based on whether the
@@ -89,7 +89,7 @@ The `remember` verb accepts an optional `source_id` argument. When present, the 
 creates the memory note and links it to the source via `annotates` in the same invocation.
 When absent, no edge is created and the memory's provenance is unattributed.
 
-For the common case "Ocean said X" the source is a `person` entity. For "agent X
+For the common case "a maintainer said X" the source is a `person` entity. For "agent X
 produced this" the source is whichever entity represents the agent. For "this came from
 paper Y" the source is the `document` entity. All three resolve through the same
 `annotates` edge with no special-casing — provenance is queryable via

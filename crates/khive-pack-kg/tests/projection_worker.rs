@@ -560,7 +560,7 @@ async fn same_microsecond_timestamp_no_duplicate_event_changes_guard() {
         .unwrap_or(0);
     assert_eq!(
         count, 1,
-        "codex-R4: exactly ONE ProposalWithdrawn event must exist; got {count}."
+        "R4: exactly ONE ProposalWithdrawn event must exist; got {count}."
     );
 }
 

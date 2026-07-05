@@ -6,7 +6,7 @@ description: Coordinate with other agents and lambdas over khive comm — be att
 
 khive comm is how agents and lambdas message each other. The surface is four verbs —
 `comm.send`, `comm.inbox`, `comm.reply`, `comm.thread` (plus `comm.read` to clear a message) —
-but the thing worth learning is the *coordination pattern*, not the verbs. Per-verb param
+but the thing worth learning is the _coordination pattern_, not the verbs. Per-verb param
 detail is one call away: `request(ops="comm.send(help=true)")`.
 
 ## The pattern
@@ -20,7 +20,7 @@ Two things break when you are `"local"`:
 
 - **Recipients can't tell who sent it** — every unattributed sender looks identical, and the
   reader has to guess from the content.
-- **Your inbox becomes a party line** — `comm.inbox` as `"local"` returns *every* local
+- **Your inbox becomes a party line** — `comm.inbox` as `"local"` returns _every_ local
   message, not just yours, because there is no actor to scope on.
 
 So set `KHIVE_ACTOR=lambda:<you>` in the MCP server env. The server logs a startup warning when

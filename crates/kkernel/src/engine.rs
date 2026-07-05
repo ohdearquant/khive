@@ -272,7 +272,7 @@ mod tests {
 
     // Engine tests must be hermetic: with `db: None` the command resolves to the
     // operator's real `~/.khive/khive.db` and runs migration writes against
-    // it. Always point tests at a throwaway temp DB (codex #531). Keep the
+    // it. Always point tests at a throwaway temp DB (review #531). Keep the
     // returned TempDir alive for the test's duration.
     fn temp_db() -> (TempDir, Option<std::path::PathBuf>) {
         let tmp = TempDir::new().expect("temp dir");

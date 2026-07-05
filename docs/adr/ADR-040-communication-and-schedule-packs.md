@@ -2,7 +2,7 @@
 
 **Status**: accepted\
 **Date**: 2026-05-23\
-**Authors**: Ocean, lambda:khive
+**Authors**: khive maintainers
 
 ## Context
 
@@ -76,7 +76,7 @@ The `properties` JSON column carries message-specific metadata:
 
 ```json
 {
-  "from": "agent:ocean",
+  "from": "agent:ops",
   "to": "agent:khive",
   "direction": "inbound",
   "subject": "retrieval port status",
@@ -372,7 +372,7 @@ auto-transitions a task to active at the scheduled time. No coupling at the pack
 the interaction is at the `action` payload level.
 
 **Schedule + Comm**: a scheduled message is a `scheduled_event` with
-`action="comm.send(to='agent:ocean', content='weekly status update')"`. At trigger time the
+`action="comm.send(to='agent:ops', content='weekly status update')"`. At trigger time the
 execution environment dispatches the `comm.send` verb. No coupling at the pack level.
 
 **Comm + KG**: messages attach to KG entities via `link(message_id, entity_id, annotates)`.

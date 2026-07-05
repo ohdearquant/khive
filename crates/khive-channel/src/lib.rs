@@ -223,8 +223,8 @@ pub trait Channel: Send + Sync + 'static {
 /// The MCP server holds an `Arc<ChannelRegistry>` and polls all registered
 /// channels in a background loop, ingesting results via `comm.ingest`.
 ///
-/// Keyed by the composite `(kind, slug)` identity (khive #606 round-1 codex
-/// review, High finding), NOT `kind` alone: two accounts of the same `kind`
+/// Keyed by the composite `(kind, slug)` identity (khive #606), NOT `kind`
+/// alone: two accounts of the same `kind`
 /// (e.g. two mailboxes, both `kind() == "email"`) must coexist as distinct
 /// registered adapters, or they collapse before the heartbeat writer ever
 /// gets a chance to persist separate `channel_health` rows for them.
@@ -422,7 +422,7 @@ mod tests {
 
     #[test]
     fn registry_does_not_collapse_same_kind_distinct_slug() {
-        // #606 round-1 codex review, High finding: two accounts sharing
+        // #606 round-1 internal review, High finding: two accounts sharing
         // `kind()` but with distinct `slug()` values (e.g. two mailboxes)
         // must coexist as two registered adapters, not collapse into one.
         let mut reg = ChannelRegistry::new();
