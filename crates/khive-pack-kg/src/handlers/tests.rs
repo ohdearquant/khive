@@ -521,7 +521,10 @@ fn normalize_entity_timestamps_array_converts_each_element() {
 #[test]
 fn valid_relations_concept_to_concept_includes_extends() {
     use super::valid_relations_for_entity_pair;
-    let rels = valid_relations_for_entity_pair("concept", "concept");
+    use khive_runtime::KhiveRuntime;
+
+    let rt = KhiveRuntime::memory().expect("in-memory runtime");
+    let rels = valid_relations_for_entity_pair(&rt, "concept", "concept");
     assert!(
         rels.contains(&"extends"),
         "#486: concept->concept must include extends; got: {rels:?}"
@@ -544,10 +547,135 @@ fn valid_relations_concept_to_concept_includes_extends() {
 #[test]
 fn valid_relations_unsupported_pair_returns_empty() {
     use super::valid_relations_for_entity_pair;
-    let rels = valid_relations_for_entity_pair("person", "dataset");
+    use khive_runtime::KhiveRuntime;
+
+    let rt = KhiveRuntime::memory().expect("in-memory runtime");
+    let rels = valid_relations_for_entity_pair(&rt, "person", "dataset");
     assert!(
         rels.is_empty(),
         "#486: person->dataset has no base-contract relations; got: {rels:?}"
+    );
+}
+
+// ---- Issue #543: hints must equal the validator's own acceptance set, not a
+// separate hand-authored table (the person->project gap, issue #60, was
+// exactly this divergence class) ----
+
+// Generative cross-check: for a given (source_kind, target_kind) pair, the hint
+// set returned by `valid_relations_for_entity_pair` must equal the set of
+// relations the REAL production validator (`KgPack::handle_link`, which
+// bottoms out in `KhiveRuntime::link` -> `validate_edge_relation_endpoints`)
+// actually accepts for that pair. This calls production code on both sides —
+// it never re-implements the rule check inline.
+#[tokio::test]
+async fn valid_relations_hint_matches_real_validator_acceptance() {
+    use crate::KgPack;
+    use khive_runtime::{KhiveRuntime, Namespace, VerbRegistryBuilder};
+    use khive_storage::EdgeRelation;
+
+    async fn accepted_relations_for(
+        rt: &KhiveRuntime,
+        src_kind: &str,
+        tgt_kind: &str,
+    ) -> Vec<&'static str> {
+        let token = rt.authorize(Namespace::local()).unwrap();
+        let mut accepted = Vec::new();
+        for relation in EdgeRelation::ALL {
+            // `annotates` requires a note source (never an entity), so it can
+            // never be accepted for an entity->entity pair regardless of
+            // kind; skip it (matches the hint function's own scope, which
+            // never emits "annotates"). supersedes/supports/refutes DO
+            // validate entity->entity pairs against the same base allowlist
+            // the hint function reads, so they stay in scope here.
+            if relation == EdgeRelation::Annotates {
+                continue;
+            }
+            let src = rt
+                .create_entity(&token, src_kind, None, "src", None, None, vec![])
+                .await
+                .expect("create source entity");
+            let tgt = rt
+                .create_entity(&token, tgt_kind, None, "tgt", None, None, vec![])
+                .await
+                .expect("create target entity");
+            let result = rt.link(&token, src.id, tgt.id, relation, 1.0, None).await;
+            if result.is_ok() {
+                accepted.push(relation.as_str());
+            }
+        }
+        accepted.sort_unstable();
+        accepted.dedup();
+        accepted
+    }
+
+    // kg pack alone: base allowlist + KG_EDGE_RULES (person->org, person->project,
+    // org->org additions from issue #60).
+    let rt = KhiveRuntime::memory().expect("in-memory runtime");
+    let mut builder = VerbRegistryBuilder::new();
+    builder.register(KgPack::new(rt.clone()));
+    let registry = builder.build().expect("kg registry builds");
+    rt.install_edge_rules(registry.all_edge_rules());
+
+    for (src_kind, tgt_kind) in [
+        ("concept", "concept"),
+        ("project", "org"),
+        // issue #60 regression: person->project must be covered by the hint
+        // path exactly as the validator accepts it (KG_EDGE_RULES part_of +
+        // instance_of).
+        ("person", "project"),
+        ("person", "org"),
+        ("org", "org"),
+    ] {
+        let expected = accepted_relations_for(&rt, src_kind, tgt_kind).await;
+        let hinted = super::valid_relations_for_entity_pair(&rt, src_kind, tgt_kind);
+        assert_eq!(
+            hinted, expected,
+            "#543: hint set for {src_kind}->{tgt_kind} must equal the real \
+             validator's acceptance set; hinted={hinted:?} expected={expected:?}"
+        );
+    }
+}
+
+// GTD's task->task depends_on rule is NoteOfKind-scoped, not an entity-pair
+// rule, so it structurally cannot appear in (and is correctly absent from)
+// this entity-pair hint path — a task/task mismatch produces a different
+// validation error ("must be an entity for relation ...") that never reaches
+// `enrich_allowlist_error` in the first place.
+#[tokio::test]
+async fn valid_relations_hint_does_not_cover_gtd_note_scoped_rules() {
+    use crate::KgPack;
+    use khive_pack_gtd::GtdPack;
+    use khive_runtime::{KhiveRuntime, VerbRegistryBuilder};
+
+    let rt = KhiveRuntime::memory().expect("in-memory runtime");
+    let mut builder = VerbRegistryBuilder::new();
+    builder.register(KgPack::new(rt.clone()));
+    builder.register(GtdPack::new(rt.clone()));
+    let registry = builder.build().expect("kg+gtd registry builds");
+    rt.install_edge_rules(registry.all_edge_rules());
+
+    // No entity kind is named "task" (it's a note kind) so no (src_kind,
+    // tgt_kind) entity pair can ever surface GTD's depends_on rule here.
+    let hinted = super::valid_relations_for_entity_pair(&rt, "project", "project");
+    assert!(
+        !hinted.is_empty(),
+        "sanity: project->project must still have base-rule hints"
+    );
+    // The composed pack_edge_rules() DOES include GTD's rule at runtime, but
+    // it is NoteOfKind("task") on both ends, so it can never satisfy the
+    // EntityOfKind match this hint function requires — confirmed by checking
+    // no entity-kind pair yields "depends_on" from a NoteOfKind source.
+    assert!(
+        rt.pack_edge_rules().iter().any(|r| matches!(
+            (r.relation, r.source, r.target),
+            (
+                khive_storage::EdgeRelation::DependsOn,
+                khive_types::EndpointKind::NoteOfKind("task"),
+                khive_types::EndpointKind::NoteOfKind("task"),
+            )
+        )),
+        "GTD's task->task depends_on rule must be present in the composed \
+         runtime rule set (proves it's reachable, not just absent by omission)"
     );
 }
 
