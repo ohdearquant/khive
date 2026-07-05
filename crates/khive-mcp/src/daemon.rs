@@ -102,8 +102,6 @@ impl FallbackReason {
     }
 }
 
-/// `khive_daemon_fallback_total{reason="<all>"}` — sum across all reasons.
-static FALLBACK_TOTAL: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 /// `khive_daemon_fallback_total{reason="config_mismatch"}`
 static FALLBACK_CONFIG_MISMATCH: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
@@ -125,9 +123,19 @@ static FALLBACK_PROTOCOL_MISMATCH: std::sync::atomic::AtomicUsize =
 // needing to touch `record_fallback`'s call sites. Exercised directly by the counter
 // tests below in the meantime.
 #[allow(dead_code)]
-/// Total fallback count across all reasons.
+/// `khive_daemon_fallback_total{reason="<all>"}` — total fallback count across
+/// all reasons, derived by summing the five reason counters on read rather
+/// than tracked as a separate atomic. A separate total can be observed
+/// momentarily out of sync with the sum of reasons (two independent
+/// `fetch_add`s); deriving it makes total == sum-of-reasons a structural
+/// invariant instead of a timing-dependent one.
 pub(crate) fn fallback_total() -> usize {
-    FALLBACK_TOTAL.load(std::sync::atomic::Ordering::SeqCst)
+    use std::sync::atomic::Ordering::SeqCst;
+    FALLBACK_CONFIG_MISMATCH.load(SeqCst)
+        + FALLBACK_NAMESPACE_MISMATCH.load(SeqCst)
+        + FALLBACK_NO_SOCKET.load(SeqCst)
+        + FALLBACK_PARSE_FAILURE.load(SeqCst)
+        + FALLBACK_PROTOCOL_MISMATCH.load(SeqCst)
 }
 
 #[allow(dead_code)]
@@ -139,7 +147,6 @@ pub(crate) fn fallback_count(reason: FallbackReason) -> usize {
 #[cfg(test)]
 pub(crate) fn reset_fallback_counters() {
     use std::sync::atomic::Ordering::SeqCst;
-    FALLBACK_TOTAL.store(0, SeqCst);
     FALLBACK_CONFIG_MISMATCH.store(0, SeqCst);
     FALLBACK_NAMESPACE_MISMATCH.store(0, SeqCst);
     FALLBACK_NO_SOCKET.store(0, SeqCst);
@@ -164,7 +171,6 @@ fn record_fallback(
     config_id_daemon: Option<&str>,
     namespace_client: &str,
 ) {
-    FALLBACK_TOTAL.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     reason
         .counter()
         .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
