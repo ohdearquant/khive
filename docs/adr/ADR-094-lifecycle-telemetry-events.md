@@ -514,7 +514,10 @@ event, closing the singleton audit's top-ranked finding (`SINGLETON_AUDIT.md` §
   The `AtomicBool::swap` is the fast path: a single relaxed-ish atomic read-and-clear per
   dispatch call when the ledger is empty (which is every dispatch call after at most a
   handful of early ones per process lifetime, since each config key is enqueued at most
-  once). Only when the flag was `true` does dispatch touch the `Mutex` at all.
+  once). Only when the flag was `true` does dispatch touch the `Mutex` at all. One accepted
+  provenance quirk of this drain site: the emitted row inherits the **draining** dispatch's
+  namespace and actor, which are incidental; `source = "config_ledger"` carries the real
+  provenance, and no actor "locked" the config value in any meaningful sense.
 - The exactly-once guarantee moves from "the row is written exactly once" (not achievable
   synchronously from inside a sync `OnceLock` closure) to a two-part story: the closure
   enqueues exactly once (guaranteed by `OnceLock::get_or_init`); the drain removes and emits
@@ -578,10 +581,11 @@ non-goals, not actioned.
 
 ## Failure modes
 
-- **`append_event` fails inside `channel_poll_loop` or `run_checkpoint_task`.** Best-effort:
-  `tracing::warn!` and continue (Decision 2), matching #606's precedent. The poll/checkpoint
-  loop's primary job (polling channels, checking WAL pages) is never blocked by a telemetry
-  write failure.
+- **`append_event` fails inside `channel_poll_loop`, `run_checkpoint_task`, or the
+  `ConfigLocked` drain inside `VerbRegistry::dispatch`.** Best-effort: `tracing::warn!` and
+  continue (Decision 2), matching #606's precedent. The poll/checkpoint loop's primary job
+  (polling channels, checking WAL pages) is never blocked by a telemetry write failure, and
+  a failed drain append never fails or delays the dispatch that hosted it.
 - **`registry.event_store()` / `dispatcher.event_store_for_checkpoint()` returns `None`**
   (no `EventStore` configured, e.g. a test harness that builds a bare `VerbRegistry` or a
   `DaemonDispatch` implementor that never overrides the default). Every new call site treats
