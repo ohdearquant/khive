@@ -159,6 +159,45 @@
 //! carries actionable guidance (`block_guidance`) — split or reword the
 //! flagged token — regardless of which detector direction shipped, since this
 //! part carries no soundness risk.
+//!
+//! **Round 5b (recall regression caught in PR review — underscore boundary
+//! semantics): measured against both branches, not assumed.** Round 5's
+//! `contains_bounded_word` copied its boundary rule from the pre-existing
+//! `has_standalone_token` check, which treats underscore as a word character
+//! (a continuation, not a boundary) — a rule that makes sense for `token`
+//! specifically (see `has_standalone_token`'s own doc: it deliberately keeps
+//! `tokenizer`/`next_token`/`token_count` exempt). Applied to the bare
+//! `TRIGGER_WORDS` set, that same rule was wrong: it silently dropped
+//! detection of extremely common underscore-joined credential-config
+//! compounds that the pre-round-5 substring check (i.e. `main`) caught —
+//! `SECRET_KEY=...` (Django/Flask-style config), `auth_token=...`,
+//! `session_secret_...`, `signing_key=...` — because `secret`/`key`/`auth`
+//! were never bounded by the following/preceding `_` under that rule, and
+//! none of these are in `COMPOUND_TRIGGER_WORDS`. Confirmed empirically with
+//! probes run against both `main` and this branch before fixing: `main`
+//! blocks all four shapes via plain substring; the pre-round-5b branch state
+//! let all four pass.
+//!
+//! Fixed by parameterizing the boundary rule (`contains_word`'s
+//! `underscore_is_word_char` argument) instead of unifying it:
+//! `contains_bounded_word` (bare `TRIGGER_WORDS`) now treats `_` as a
+//! BOUNDARY — only ASCII alphanumerics count as continuations — which
+//! restores detection of the compounds above while leaving the round-5 win
+//! intact (`authorized`, `authentication`, `monkey`, `keyword` are
+//! letter-joined, not underscore-joined, so they are unaffected by this
+//! change). `has_standalone_token`'s underscore-is-continuation rule for
+//! `token` is deliberately left unchanged — that exemption was a prior,
+//! separate decision and is out of scope here. Regression tests:
+//! `blocks_django_style_secret_key_assignment_round5b`,
+//! `blocks_auth_token_assignment_round5b`,
+//! `blocks_session_secret_and_signing_key_compounds_round5b`,
+//! `allows_authorized_authentication_keyword_prose_unaffected_by_round5b`.
+//!
+//! Re-measured against the same 26.6k-row production corpus replay after this
+//! fix: see the harness's own output for current numbers (`corpus_replay`,
+//! `#[ignore]`d, run via `KHIVE_REPLAY_DB=<path> cargo test ... -- --ignored
+//! --nocapture`) — this doc intentionally does not restate a point-in-time
+//! count here to avoid it drifting from the harness as the corpus changes.
 
 use crate::error::{RuntimeError, RuntimeResult};
 
@@ -873,13 +912,28 @@ fn check_entropy_heuristic(text: &str, from: usize) -> Option<(&str, &'static st
 }
 
 /// Returns `true` when `low_window` contains `needle` as a standalone word —
-/// i.e. surrounded by non-ASCII-alphanumeric, non-underscore boundaries
-/// (CJK/accented prose counts as a boundary; underscore does NOT, so it stays
-/// a continuation of the same identifier) — rather than merely as a
-/// substring. This is what lets `auth` match `auth header` / `auth:` while
-/// NOT matching the substring collision inside `authorized`, `authentication`,
-/// or a compound identifier like `next_token`/`tokenizer`/`authorized_write`.
-fn contains_bounded_word(low_window: &str, needle: &str) -> bool {
+/// bounded on both sides by a character outside the caller-supplied word-char
+/// set (or start/end of string) — rather than merely as a substring.
+///
+/// `underscore_is_word_char` selects which of two, deliberately different,
+/// boundary rules the caller needs:
+/// - `true` (used by [`has_standalone_token`] / [`has_token_assignment`] for
+///   `token`): underscore is a continuation of the same identifier, so
+///   `next_token`, `tokenizer`, and `token_count` do NOT match — a prior,
+///   deliberate decision that must not change.
+/// - `false` (used by [`contains_bounded_word`] for the bare `TRIGGER_WORDS`):
+///   underscore IS a boundary, so `secret_key=`/`auth_token=`/`signing_key=`
+///   still match on the `secret`/`auth`/`key` half of the compound — these
+///   underscore-joined credential-config compounds (Django/Flask `SECRET_KEY`,
+///   OAuth `auth_token`, JWT `signing_key`) are exactly the shape a credential
+///   trigger must not lose. Only *letter*-joined collisions (`authorized`,
+///   `authentication`, `monkey`, `keyword`) are meant to stop matching.
+///
+/// CJK/accented prose always counts as a boundary in both modes (only ASCII
+/// alphanumerics — plus underscore when `underscore_is_word_char` is `true`
+/// — are treated as word characters).
+fn contains_word(low_window: &str, needle: &str, underscore_is_word_char: bool) -> bool {
+    let is_word_char = |c: char| c.is_ascii_alphanumeric() || (underscore_is_word_char && c == '_');
     let mut start = 0;
     while let Some(rel) = low_window[start..].find(needle) {
         let abs = start + rel;
@@ -887,13 +941,13 @@ fn contains_bounded_word(low_window: &str, needle: &str) -> bool {
             || low_window[..abs]
                 .chars()
                 .next_back()
-                .is_none_or(|c| !c.is_ascii_alphanumeric() && c != '_');
+                .is_none_or(|c| !is_word_char(c));
         let after_end = abs + needle.len();
         let after_ok = after_end >= low_window.len()
             || low_window[after_end..]
                 .chars()
                 .next()
-                .is_none_or(|c| !c.is_ascii_alphanumeric() && c != '_');
+                .is_none_or(|c| !is_word_char(c));
         if before_ok && after_ok {
             return true;
         }
@@ -902,11 +956,27 @@ fn contains_bounded_word(low_window: &str, needle: &str) -> bool {
     false
 }
 
+/// Returns `true` when `low_window` contains the bare trigger word `needle`
+/// as a standalone word, with underscore treated as a BOUNDARY (see
+/// [`contains_word`]) — so `secret_key=…`/`auth_token=…`/`signing_key=…`
+/// still match (on the `secret`/`auth`/`key` half), while pure letter-joined
+/// collisions like `authorized`/`authentication`/`monkey`/`keyword` do not.
+fn contains_bounded_word(low_window: &str, needle: &str) -> bool {
+    contains_word(low_window, needle, false)
+}
+
 /// Returns `true` when `low_window` contains the word `token` as a standalone
-/// word (see [`contains_bounded_word`]) — but NOT as part of compound
-/// identifiers such as `tokenizer`, `token_count`, or `next_token`.
+/// word, with underscore treated as a WORD CHARACTER / continuation (see
+/// [`contains_word`]) — but NOT as part of compound identifiers such as
+/// `tokenizer`, `token_count`, or `next_token`. This underscore-as-
+/// continuation rule is unchanged from before round 5 and deliberately
+/// different from [`contains_bounded_word`]: `token` alone is not a
+/// credential trigger (it fires on too many benign technical terms), so it
+/// needs the narrower, underscore-inclusive standalone-word definition,
+/// whereas the bare `TRIGGER_WORDS` need underscore-joined compounds like
+/// `secret_key` to still register.
 fn has_standalone_token(low_window: &str) -> bool {
-    contains_bounded_word(low_window, "token")
+    contains_word(low_window, "token", true)
 }
 
 /// Returns `true` when `low_window` contains the assignment form `token=` or
@@ -3369,19 +3439,102 @@ mod tests {
 
     #[test]
     fn blocks_secret_access_key_bypass_compound_entry_unaffected_by_round5() {
-        // Adversarial negative: the round-1/3 bypass relies on the compound
-        // `secret_access_key`/`access_key` entries, which are deliberately
-        // NOT moved to word-boundary matching (see `COMPOUND_TRIGGER_WORDS`).
-        // Confirms round 5 does not weaken this even though the bare
-        // `secret`/`key` word-boundary checks alone would no longer match
-        // `secret_access_key` (underscore is not a boundary).
+        // Adversarial negative: the round-1/3 bypass must still be blocked
+        // post round-5b. It now fires via TWO independent paths: the
+        // compound `access_key` entry (`COMPOUND_TRIGGER_WORDS`, plain
+        // substring, always matched regardless of word-boundary rules), AND
+        // the bare `secret` entry, because round-5b treats underscore as a
+        // BOUNDARY for bare `TRIGGER_WORDS` — so `secret` in
+        // `secret_access_key` is itself a bounded word (bounded by the
+        // following `_`), not merely a substring collision. Either path
+        // alone is sufficient; this asserts the end-to-end outcome.
         let content = "secret_access_key abcdefghij/klmnopqrst/uvwxyzabcd/efghijk.md";
         assert!(
             check(content).is_err(),
-            "secret_access_key bypass shape must still be blocked via the \
-             compound entry: {content:?}, got {:?}",
+            "secret_access_key bypass shape must still be blocked: {content:?}, \
+             got {:?}",
             scan(content)
         );
+    }
+
+    // ── Round 5b (recall regression vs main): underscore is a BOUNDARY for
+    //    bare TRIGGER_WORDS, not a continuation ─────────────────────────────
+    //
+    // Round 5 (above) made bare TRIGGER_WORDS word-boundary-aware but treated
+    // underscore as a word character (continuation), matching
+    // `has_standalone_token`'s existing rule for `token`. That was wrong for
+    // the bare credential words: it silently dropped detection of extremely
+    // common underscore-joined credential-config compounds that main caught
+    // via plain substring (`SECRET_KEY=`, `auth_token=`, `signing_key=`,
+    // `session_secret_...`), because `secret`/`key`/`auth` were never bounded
+    // by `_` under that rule. Fixed by treating `_` as a boundary for the
+    // bare `TRIGGER_WORDS` check specifically (see `contains_word`'s
+    // `underscore_is_word_char` parameter), while leaving
+    // `has_standalone_token`'s `token`-specific underscore-as-continuation
+    // rule (the `tokenizer`/`next_token`/`token_count` exemption) unchanged.
+
+    #[test]
+    fn blocks_django_style_secret_key_assignment_round5b() {
+        // Regression found in PR review: on main, `SECRET_KEY=<value>` blocks
+        // via the plain-substring `secret` trigger. Round 5's word-boundary
+        // change (with underscore as a continuation) silently dropped this,
+        // since `secret` is followed by `_`, not a boundary under that rule.
+        let content = "SECRET_KEY=dGhpc2lzYXNlY3JldGtleXZhbHVlMTIzNDU2Nzg5MA=="; // gitleaks:allow
+        assert!(
+            check(content).is_err(),
+            "SECRET_KEY=<value> (Django/Flask-style config) must still be \
+             blocked: {content:?}, got {:?}",
+            scan(content)
+        );
+    }
+
+    #[test]
+    fn blocks_auth_token_assignment_round5b() {
+        let opaque = "Xk9mZ2vQpLrT8nJwYuAeHfBsDcGiONvMabcdef"; // gitleaks:allow
+        let content = format!("auth_token={opaque}");
+        assert!(
+            check(&content).is_err(),
+            "auth_token=<value> must still be blocked: {content:?}, got {:?}",
+            scan(&content)
+        );
+    }
+
+    #[test]
+    fn blocks_session_secret_and_signing_key_compounds_round5b() {
+        let opaque = "Xk9mZ2vQpLrT8nJwYuAeHfBsDcGiONvMabcdef"; // gitleaks:allow
+        let cases = [
+            format!("session_secret_{opaque}"),
+            format!("signing_key={opaque}"),
+        ];
+        for content in &cases {
+            assert!(
+                check(content).is_err(),
+                "underscore-joined credential compound must still be blocked: \
+                 {content:?}, got {:?}",
+                scan(content)
+            );
+        }
+    }
+
+    #[test]
+    fn allows_authorized_authentication_keyword_prose_unaffected_by_round5b() {
+        // The round-5 win (letter-joined substring collisions) must survive
+        // round-5b's underscore-as-boundary change, since that change only
+        // affects the underscore character, not letter-joined words.
+        let cases = [
+            "authorized_write_requires_dominance was converted from axiom to theorem, id 550e8400-e29b-41d4-a716-446655440000",
+            "authentication flow diagram lives at 550e8400-e29b-41d4-a716-446655440000",
+            "the turkey and monkey story references id 550e8400-e29b-41d4-a716-446655440000",
+            "keyword research doc: 550e8400-e29b-41d4-a716-446655440000",
+        ];
+        for content in cases {
+            assert!(
+                check(content).is_ok(),
+                "letter-joined substring collision must stay exempt after \
+                 round-5b: {content:?}, got {:?}",
+                scan(content)
+            );
+        }
     }
 
     #[test]
