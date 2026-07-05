@@ -331,8 +331,8 @@ Entity-anchored graph context in one call ([ADR-089](../adr/ADR-089-context-verb
 Resolves anchors from `query` and/or `entity_ids`, expands 1-2 hops via the same
 runtime op behind `neighbors`, and assembles a budgeted, deterministically-ordered
 response — replacing a caller-side `search | neighbors` chain with a single
-round-trip. `direction` defaults to `"both"` here, diverging deliberately from
-`neighbors`'s `"outgoing"` default. At least one of `query`/`entity_ids` is required.
+round-trip. `direction` defaults to `"both"`, matching `neighbors` and `traverse`
+(`outgoing`/`incoming` on request). At least one of `query`/`entity_ids` is required.
 One embedding inference when `query` is used; zero for a pure `entity_ids` call.
 
 | Param        | Type            | Required | Notes                                                                                 |
