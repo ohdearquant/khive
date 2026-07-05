@@ -401,7 +401,7 @@ pub(crate) fn register_configured_embedding_models(
 /// env-var-derived defaults from `RuntimeConfig::default()`.
 ///
 /// When both a config file and `KHIVE_EMBEDDING_MODEL` env var are present,
-/// the caller is responsible for emitting a warning that env vars are ignored.
+/// the caller is responsible for emitting a warning that env vars are overridden.
 /// This function purely converts `KhiveConfig` to `RuntimeConfig` fields.
 pub fn runtime_config_from_khive_config(
     khive_cfg: &crate::engine_config::KhiveConfig,
