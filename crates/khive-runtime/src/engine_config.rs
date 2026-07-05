@@ -335,7 +335,7 @@ impl KhiveConfig {
     /// 1. Explicit `path` (from `--config` / `KHIVE_CONFIG`)
     /// 2. `./khive.toml` (project-local, project root)
     /// 3. `<db-dir>/config.toml` (project-local, anchored to the resolved database's
-    ///    own directory — see [`Self::project_config_anchor_dir`])
+    ///    own directory — see `project_config_anchor_dir`)
     /// 4. `~/.khive/config.toml` (user-global)
     ///
     /// Returns the first file found, or `Ok(None)` when none exist.
@@ -369,7 +369,7 @@ impl KhiveConfig {
     ///
     /// - Tier 2: `<project_root>/khive.toml` (still cwd-anchored — unchanged)
     /// - Tier 3: `<db_dir>/config.toml`, anchored to `db_path` rather than
-    ///   `project_root` (see [`Self::project_config_anchor_dir`]); falls back to
+    ///   `project_root` (see `project_config_anchor_dir`); falls back to
     ///   `<project_root>/.khive/config.toml` when `db_path` is `None`
     /// - Tier 4: `<home_root>/.khive/config.toml` (skipped when `None`)
     pub(crate) fn load_with_roots(
