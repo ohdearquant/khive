@@ -234,20 +234,26 @@ async fn main() -> Result<()> {
 
             // Check if multi-backend is configured (ADR-028 / ADR-029 Phase 2).
             //
-            // `db_path_hint` anchors tier-3 project-local config discovery to the
-            // database's own directory rather than the process cwd; an explicit
-            // `--db`/`KHIVE_DB` here mirrors the resolution `resolve_runtime_config`
-            // performs below (the `:memory:` sentinel means no file to anchor on).
-            // The unset (default) case still falls through to the pre-existing cwd
-            // anchor for this early check only — it does not affect the actual
-            // per-request `config_id` computed further down this path.
-            let db_path_hint = match a.db.as_deref() {
-                Some(":memory:") | None => None,
-                Some(p) => Some(std::path::Path::new(p)),
+            // Resolve `db_path` with the SAME precedence as `resolve_runtime_config`
+            // below (`:memory:` -> no file to anchor on; explicit `--db`/`KHIVE_DB`
+            // -> that path; unset -> the default `$HOME/.khive/khive.db`) so this
+            // early multi-backend classification anchors tier-3 project-local config
+            // discovery to the identical directory the per-request `config_id` path
+            // uses. Anchoring only the explicit case and leaving the default case on
+            // the process cwd would let this branch select a different topology than
+            // the config the server actually resolves further down this path.
+            let db_path_hint: Option<std::path::PathBuf> = match a.db.as_deref() {
+                Some(":memory:") => None,
+                Some(p) => Some(std::path::PathBuf::from(p)),
+                None => {
+                    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+                    Some(std::path::PathBuf::from(format!("{home}/.khive/khive.db")))
+                }
             };
-            let khive_cfg = KhiveConfig::load_with_home_fallback(a.config.as_deref(), db_path_hint)
-                .unwrap_or_default()
-                .unwrap_or_default();
+            let khive_cfg =
+                KhiveConfig::load_with_home_fallback(a.config.as_deref(), db_path_hint.as_deref())
+                    .unwrap_or_default()
+                    .unwrap_or_default();
 
             if khive_cfg.backends.len() <= 1 {
                 // Single-backend: zero-change path — no coordinator.
