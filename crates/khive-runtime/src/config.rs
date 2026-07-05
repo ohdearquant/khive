@@ -263,7 +263,8 @@ pub struct RuntimeConfig {
     /// `khive.toml`. When `Some`, `authorize()` mints tokens carrying this actor
     /// label so that `comm.inbox` filters by `to_actor` instead of falling back to
     /// the party-line "local" behavior. When `None` (default), tokens carry
-    /// `ActorRef::anonymous()` and inbox shows all inbound messages.
+    /// `ActorRef::anonymous()` and inbox is scoped to party-line messages —
+    /// those addressed to `"local"` or carrying no `to_actor` stamp.
     pub actor_id: Option<String>,
 }
 
