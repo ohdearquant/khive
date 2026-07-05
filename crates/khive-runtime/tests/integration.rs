@@ -2147,9 +2147,14 @@ async fn resolve_uses_visible_set_for_note_in_extra_namespace() {
 }
 
 /// A link whose target lives in the extra-visible (but not primary) namespace
-/// must be rejected — mutation endpoints must both be in the primary namespace.
+/// must succeed — endpoint existence is a by-ID check, and by-ID ops are
+/// namespace-agnostic regardless of the caller's primary/visible-set distinction
+/// (ADR-007 Rule 2; #631). This supersedes the prior
+/// `link_refuses_target_in_visible_but_not_primary_namespace` expectation, which
+/// asserted the pre-#631 bug (endpoint existence gated on `token.namespace()`) as
+/// intentional mutation-safety behavior.
 #[tokio::test]
-async fn link_refuses_target_in_visible_but_not_primary_namespace() {
+async fn link_target_in_visible_but_not_primary_namespace_succeeds() {
     let rt = rt();
     let tok_a = rt
         .authorize(Namespace::parse("link-mut-a").unwrap())
@@ -2187,15 +2192,17 @@ async fn link_refuses_target_in_visible_but_not_primary_namespace() {
         )
         .await;
     assert!(
-        result.is_err(),
-        "link with target in visible-only namespace must be rejected by mutation endpoint validation"
+        result.is_ok(),
+        "link with target in visible-only namespace must succeed (#631), got {result:?}"
     );
 }
 
 /// An annotates note whose annotated target lives in the extra-visible (but not
-/// primary) namespace must be rejected by create_note's mutation gate.
+/// primary) namespace must succeed — same by-ID, namespace-agnostic contract as
+/// `link` (ADR-007 Rule 2; #631). This supersedes the prior
+/// `create_note_annotates_refuses_target_in_visible_only_namespace` expectation.
 #[tokio::test]
-async fn create_note_annotates_refuses_target_in_visible_only_namespace() {
+async fn create_note_annotates_target_in_visible_only_namespace_succeeds() {
     let rt = rt();
     let _tok_a = rt
         .authorize(Namespace::parse("ann-mut-a").unwrap())
@@ -2230,8 +2237,8 @@ async fn create_note_annotates_refuses_target_in_visible_only_namespace() {
         )
         .await;
     assert!(
-        result.is_err(),
-        "annotates with target in visible-only namespace must be rejected"
+        result.is_ok(),
+        "annotates with target in visible-only namespace must succeed (#631), got {result:?}"
     );
 }
 

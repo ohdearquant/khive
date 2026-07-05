@@ -1140,8 +1140,10 @@ impl KhiveRuntime {
             ));
         }
         if relation == EdgeRelation::Annotates {
-            // Source must be a note in the primary namespace.
-            match self.resolve_primary(token, source_id).await? {
+            // Source must be a note. By-ID endpoint resolution is namespace-agnostic
+            // (ADR-007 Rule 2; #631) — link consumes two by-ID endpoints, so it must
+            // resolve exactly what get() resolves, regardless of caller namespace.
+            match self.resolve_edge_endpoint(token, source_id).await? {
                 Some(Resolved::Note(_)) => {}
                 Some(_) => {
                     return Err(RuntimeError::InvalidInput(format!(
@@ -1156,14 +1158,14 @@ impl KhiveRuntime {
                         )));
                     }
                     return Err(RuntimeError::NotFound(format!(
-                        "link source {source_id} not found in namespace"
+                        "link source {source_id} not found"
                     )));
                 }
             }
-            // Target may be any substrate (entity, note, event, or edge) — primary only.
-            if !self.substrate_exists_in_primary(token, target_id).await? {
+            // Target may be any substrate (entity, note, event, or edge) — by-ID, unfiltered.
+            if !self.substrate_exists_by_id(token, target_id).await? {
                 return Err(RuntimeError::NotFound(format!(
-                    "link target {target_id} not found in namespace"
+                    "link target {target_id} not found"
                 )));
             }
         } else if matches!(
@@ -1172,8 +1174,9 @@ impl KhiveRuntime {
         ) {
             // supersedes / supports / refutes: same-substrate only (note→note or entity→entity).
             // Event and edge endpoints are invalid regardless of the other endpoint.
+            // Endpoint resolution is by-ID and namespace-agnostic (ADR-007 Rule 2; #631).
             let rel_name = relation.as_str();
-            let src = match self.resolve_primary(token, source_id).await? {
+            let src = match self.resolve_edge_endpoint(token, source_id).await? {
                 Some(r) => r,
                 None => {
                     if self.get_edge(token, source_id).await?.is_some() {
@@ -1182,11 +1185,11 @@ impl KhiveRuntime {
                         )));
                     }
                     return Err(RuntimeError::NotFound(format!(
-                        "link source {source_id} not found in namespace"
+                        "link source {source_id} not found"
                     )));
                 }
             };
-            let tgt = match self.resolve_primary(token, target_id).await? {
+            let tgt = match self.resolve_edge_endpoint(token, target_id).await? {
                 Some(r) => r,
                 None => {
                     if self.get_edge(token, target_id).await?.is_some() {
@@ -1195,7 +1198,7 @@ impl KhiveRuntime {
                         )));
                     }
                     return Err(RuntimeError::NotFound(format!(
-                        "link target {target_id} not found in namespace"
+                        "link target {target_id} not found"
                     )));
                 }
             };
@@ -1250,10 +1253,11 @@ impl KhiveRuntime {
             // restrictions (see base allowlist). Packs may extend the allowlist
             // additively via EDGE_RULES.
             //
-            // Strategy: resolve both endpoints once (primary-only), consult pack rules; on
-            // miss, fall through to the original base-rule error messages.
-            let src_res = self.resolve_primary(token, source_id).await?;
-            let tgt_res = self.resolve_primary(token, target_id).await?;
+            // Strategy: resolve both endpoints once (by-ID, unfiltered — ADR-007 Rule 2;
+            // #631), consult pack rules; on miss, fall through to the original base-rule
+            // error messages.
+            let src_res = self.resolve_edge_endpoint(token, source_id).await?;
+            let tgt_res = self.resolve_edge_endpoint(token, target_id).await?;
 
             if pack_rule_allows(
                 &self.pack_edge_rules(),
@@ -1281,7 +1285,7 @@ impl KhiveRuntime {
                         )));
                     }
                     return Err(RuntimeError::NotFound(format!(
-                        "link source {source_id} not found in namespace"
+                        "link source {source_id} not found"
                     )));
                 }
             };
@@ -1301,7 +1305,7 @@ impl KhiveRuntime {
                         )));
                     }
                     return Err(RuntimeError::NotFound(format!(
-                        "link target {target_id} not found in namespace"
+                        "link target {target_id} not found"
                     )));
                 }
             };
@@ -1338,7 +1342,7 @@ impl KhiveRuntime {
     /// endpoint from its own backend, then calls this method to enforce ADR-002
     /// kind-pairing rules without a second DB round-trip.
     ///
-    /// `src` and `tgt` are the `resolve_primary` results from each backend. The
+    /// `src` and `tgt` are the `resolve_edge_endpoint` results from each backend. The
     /// `token` supplies the pack edge rules installed on this (source) runtime;
     /// no DB access is performed.
     pub fn validate_link_endpoints_by_resolved(
@@ -1648,16 +1652,19 @@ impl KhiveRuntime {
         }
     }
 
-    /// Returns `true` if `id` resolves to a live substrate record in the PRIMARY namespace only.
+    /// Returns `true` if `id` resolves to a live substrate record, by ID, with
+    /// no namespace filter.
     ///
-    /// Used from mutation endpoint validation where visible-set membership is not
-    /// sufficient — the record must belong to the caller's write namespace.
-    pub(crate) async fn substrate_exists_in_primary(
+    /// Used from `annotates` endpoint validation (`link` and `create`'s
+    /// `annotates` targets), which consume a by-ID endpoint and so must follow
+    /// the same namespace-agnostic by-ID contract as `get()` (ADR-007 Rule 2;
+    /// #631).
+    pub(crate) async fn substrate_exists_by_id(
         &self,
         token: &NamespaceToken,
         id: Uuid,
     ) -> RuntimeResult<bool> {
-        if self.resolve_primary(token, id).await?.is_some() {
+        if self.resolve_edge_endpoint(token, id).await?.is_some() {
             return Ok(true);
         }
         match self.get_edge(token, id).await {
@@ -2184,12 +2191,11 @@ impl KhiveRuntime {
         let ns = token.namespace().as_str();
 
         // Validate all annotates targets before any write (atomicity: all-or-nothing).
-        // Targets must be in the primary namespace — visible-set membership is not
-        // sufficient for mutation endpoint validation.
+        // Endpoint resolution is by-ID and namespace-agnostic (ADR-007 Rule 2; #631).
         for &target_id in &annotates {
-            if !self.substrate_exists_in_primary(token, target_id).await? {
+            if !self.substrate_exists_by_id(token, target_id).await? {
                 return Err(RuntimeError::NotFound(format!(
-                    "create_note annotates target {target_id} not found in namespace"
+                    "create_note annotates target {target_id} not found"
                 )));
             }
         }
@@ -3044,10 +3050,34 @@ impl KhiveRuntime {
         Ok(None)
     }
 
+    /// Resolve a UUID to its substrate kind with NO namespace filter, for edge
+    /// endpoint validation.
+    ///
+    /// `link` and `create`'s `annotates` targets consume by-ID endpoints, so
+    /// their existence check must follow the same by-ID contract as `get()`
+    /// (ADR-007 Rule 2: by-ID ops are namespace-agnostic — the Gate, not
+    /// storage-layer filtering, is the authz seam). Mirrors `resolve_by_id`
+    /// (entity + note, unfiltered) and additionally resolves events,
+    /// unfiltered, so edge endpoint validation resolves exactly what `get()`
+    /// resolves regardless of the caller's namespace.
+    pub async fn resolve_edge_endpoint(
+        &self,
+        token: &NamespaceToken,
+        id: Uuid,
+    ) -> RuntimeResult<Option<Resolved>> {
+        if let Some(resolved) = self.resolve_by_id(token, id).await? {
+            return Ok(Some(resolved));
+        }
+        if let Some(event) = self.events(token)?.get_event(id).await? {
+            return Ok(Some(Resolved::Event(event)));
+        }
+        Ok(None)
+    }
+
     /// Resolve a UUID to its substrate kind using primary-namespace-only enforcement.
     ///
-    /// Unlike `resolve`, never consults the visible set. Use from mutation validation
-    /// paths (link, annotate, build_edge) where strict primary ownership is required.
+    /// Unlike `resolve`, never consults the visible set. Use from GTD dependency
+    /// validation paths where strict primary ownership is required.
     pub async fn resolve_primary(
         &self,
         token: &NamespaceToken,
@@ -5712,8 +5742,14 @@ mod tests {
         assert!(target_ids.contains(&t2.id));
     }
 
+    /// `link` endpoint existence is a by-ID check and therefore namespace-agnostic
+    /// (ADR-007 Rule 2; #631) — a target living in a different namespace than the
+    /// caller must still resolve, exactly as `get()` would. This supersedes the prior
+    /// `link_target_in_different_namespace_returns_not_found` expectation, which
+    /// asserted the pre-#631 bug (endpoint existence gated on `token.namespace()`)
+    /// as intentional fail-closed behavior.
     #[tokio::test]
-    async fn link_target_in_different_namespace_returns_not_found() {
+    async fn link_target_in_different_namespace_succeeds() {
         let rt = rt();
         let ns_a = NamespaceToken::for_namespace(Namespace::parse("ns-a").unwrap());
         let ns_b = NamespaceToken::for_namespace(Namespace::parse("ns-b").unwrap());
@@ -5726,13 +5762,13 @@ mod tests {
             .await
             .unwrap();
 
-        // Linking from ns-a: target b lives in ns-b — must be treated as not found.
+        // Linking from ns-a: target b lives in ns-b — by-ID resolution finds it anyway.
         let result = rt
             .link(&ns_a, a.id, b.id, EdgeRelation::Extends, 1.0, None)
             .await;
         assert!(
-            matches!(result, Err(RuntimeError::NotFound(_))),
-            "target in different namespace must return NotFound (fail-closed), got {result:?}"
+            result.is_ok(),
+            "target in a different namespace than the caller must resolve (#631), got {result:?}"
         );
     }
 
@@ -6465,8 +6501,16 @@ mod tests {
         }
     }
 
+    /// The canonical `remember | supersedes` chain: a `supersedes` source note living
+    /// in a different namespace than the caller must still resolve as a by-ID endpoint
+    /// (ADR-007 Rule 2; #631). This supersedes the prior
+    /// `link_supersedes_cross_namespace_source_returns_not_found` expectation, which
+    /// asserted the pre-#631 bug (endpoint existence gated on `token.namespace()`) as
+    /// intentional fail-closed behavior — the exact failure reported in #631 for
+    /// `memory.remember(...) | link(source_id=$prev.id, ..., relation="supersedes")`
+    /// from a namespace-stamped caller.
     #[tokio::test]
-    async fn link_supersedes_cross_namespace_source_returns_not_found() {
+    async fn link_supersedes_cross_namespace_source_succeeds() {
         let rt = rt();
         let ns_a = NamespaceToken::for_namespace(Namespace::parse("ns-a").unwrap());
         let ns_b = NamespaceToken::for_namespace(Namespace::parse("ns-b").unwrap());
@@ -6495,7 +6539,8 @@ mod tests {
             .await
             .unwrap();
 
-        // From ns-a perspective, note_b is in a different namespace — treated as not found.
+        // From ns-a perspective, note_b is in a different namespace — by-ID resolution
+        // finds it anyway.
         let result = rt
             .link(
                 &ns_a,
@@ -6507,8 +6552,8 @@ mod tests {
             )
             .await;
         assert!(
-            matches!(result, Err(RuntimeError::NotFound(_))),
-            "cross-namespace source with Supersedes must return NotFound (fail-closed), got {result:?}"
+            result.is_ok(),
+            "cross-namespace supersedes source must resolve (#631), got {result:?}"
         );
     }
 
