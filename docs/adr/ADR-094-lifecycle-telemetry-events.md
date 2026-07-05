@@ -144,10 +144,20 @@ health check) honest about the full set. New variants:
   `channel_error_class(&e)` (`serve.rs:394-402`) differs from the class of the last emitted
   `ChannelPollFailed` for this `(kind, slug)`. This requires one small new piece of
   in-process state, `last_error_class: HashMap<(String, String), &'static str>`, added
-  alongside the existing `backoffs` map in `channel_poll_loop`; entries are cleared on the
-  channel's next `ChannelPollSucceeded` (so a subsequent failure after a recovery is again
-  treated as "first failure"). This state is independent of `backoffs` because
-  `ChannelPollFailed` fires on every failure class, including the non-backoff-eligible
+  alongside the existing `backoffs` map in `channel_poll_loop`. The entry for a `(kind,
+  slug)` key is cleared on **every** successful poll, i.e. inside the `Ok(envelopes)` branch
+  itself (`serve.rs:316`), unconditionally and independent of whether that same tick also
+  emits `ChannelPollSucceeded`. Clearing cannot be tied to the `ChannelPollSucceeded` event,
+  because that event only fires when `ImapBackoff::attempt() > 0`, and non-backoff-eligible
+  `"config"`-class failures never populate `backoffs` in the first place: a config-class
+  failure followed by a successful poll would leave `attempt() == 0` throughout, so
+  `ChannelPollSucceeded` never fires, and if clearing depended on it, the stale `"config"`
+  entry in `last_error_class` would survive indefinitely, wrongly suppressing the next,
+  separate config-failure episode of the same class as "not a change." Clearing on the
+  `Ok(envelopes)` branch itself avoids this: it runs on every success regardless of backoff
+  eligibility, so a subsequent failure after any recovery, backoff-eligible or not, is
+  correctly treated as "first failure" again. This state is independent of `backoffs`
+  because `ChannelPollFailed` fires on every failure class, including the non-backoff-eligible
   `"config"` class, while `backoffs` only tracks backoff-eligible failures. Payload carries
   `error_class` and the error message.
 - `ChannelBackoffArmed`: fired only on a `log_eligible_poll_failure` escalation edge
@@ -245,6 +255,12 @@ The injection shape this ADR specifies:
   returning `self.pool()`) implements this new method by returning `self.registry.
   event_store()` (using the Decision 2 accessor above; `KhiveMcpServer` already holds a
   `registry: VerbRegistry` field, `crates/khive-mcp/src/server.rs:186`).
+  (The same one-directional-dependency reasoning applies to Decision 7a's `ConfigLocked`
+  drain below: the drain site must live in a crate that is both reachable from the
+  `OnceLock` producer sites and does not require `khive-db` to depend on `khive-runtime`.
+  `run_checkpoint_task` is ruled out for the same reason it needed the parameters above;
+  Decision 7a places the drain in `VerbRegistry::dispatch` instead, which already lives in
+  `khive-runtime` alongside the producers' existing dependency on that crate.)
 - The spawn site (`crates/khive-runtime/src/daemon.rs:558-561`) becomes:
 
   ```rust
@@ -446,26 +462,78 @@ event, closing the singleton audit's top-ranked finding (`SINGLETON_AUDIT.md` §
   config_ledger::record_config_locked(key: &'static str, value: impl Into<String>)`, which
   pushes `(key, value)` onto a process-wide pending-emission slot (a `std::sync::Mutex<Vec<
   (&'static str, String)>>` behind a `OnceLock`, living in `khive-runtime` since both
-  `khive-pack-memory` and `khive-pack-kg` already depend on it). Because `OnceLock::
+  `khive-pack-memory` and `khive-pack-kg` already depend on it) and sets a companion
+  `static PENDING: AtomicBool` to `true` (`Ordering::Release`). Because `OnceLock::
   get_or_init` guarantees its closure runs exactly once per key across all callers, each
   config key is enqueued **exactly once** per process lifetime, this part of the story is
   unchanged from the original "fires exactly once" intent.
-- A separate, async, store-holding context drains the slot: `run_checkpoint_task`'s tick
-  (already modified by Decision 2 to hold an `event_store`, and already running on every
-  production daemon with a file-backed pool) calls `khive_runtime::config_ledger::
-  drain_config_locks()` once per tick, a cheap `mem::take` on the pending `Vec`, and appends
-  one `ConfigLocked` event per drained entry via the same best-effort `append_event` pattern
-  as every other site in this ADR.
+- **Drain site: `VerbRegistry::dispatch`, not `run_checkpoint_task`.** `run_checkpoint_task`
+  lives in `khive-db` (`crates/khive-db/src/checkpoint.rs:253`), and Decision 2 above
+  already establishes that `khive-db` cannot depend on `khive-runtime`, where this ledger
+  lives, because the dependency chain runs one direction only
+  (`khive-storage -> khive-db -> khive-runtime`). Draining from `run_checkpoint_task` would
+  reintroduce the exact dependency-direction violation Decision 2 exists to avoid. Instead,
+  the drain runs from `VerbRegistry::dispatch` (`crates/khive-runtime/src/pack.rs:878-951`),
+  which is in the **same crate** as `config_ledger`, already holds `self.event_store`
+  (`pack.rs:922`), and is guaranteed to run at least once shortly after any producer site
+  fires: every `OnceLock` config read this ADR instruments (`common.rs:40,45`,
+  `context.rs:35`) happens inside a pack-handler function, and pack handlers only run inside
+  a `VerbRegistry::dispatch` call, so a dispatch has already happened by the time there is
+  anything in the ledger to drain, and the very next dispatch (on any verb, from any caller)
+  drains it. This is a stronger liveness guarantee than the checkpoint task offered:
+  `run_checkpoint_task` only runs when `dispatcher.pool_for_checkpoint()` is `Some` (a
+  file-backed pool), while `channel_poll_loop` never runs at all on a daemon with no
+  channels configured; `dispatch` is the one call site guaranteed to be live on any daemon
+  that could have produced a `ConfigLocked` entry in the first place.
+
+  Immediately after the existing `if let Some(store) = &self.event_store` gate in `dispatch`
+  (`pack.rs:922`), add a cheap pending-check fast path so the hot dispatch path pays
+  near-zero cost on the (overwhelmingly common) case where the ledger is empty:
+
+  ```rust
+  if let Some(store) = &self.event_store {
+      if config_ledger::PENDING.swap(false, Ordering::AcqRel) {
+          for (key, value) in config_ledger::drain_config_locks() {
+              let event = Event::new(
+                  gate_req.namespace.as_str(),
+                  "config_ledger",
+                  EventKind::ConfigLocked,
+                  SubstrateKind::Event,
+                  format!("{}:{}", gate_req.actor.kind, gate_req.actor.id),
+              )
+              .with_payload(json!({ "key": key, "value": value }));
+              if let Err(e) = store.append_event(event).await {
+                  tracing::warn!(key, "failed to append ConfigLocked event: {e}");
+              }
+          }
+      }
+      // ... existing Audit event append (pack.rs:923-950), unchanged ...
+  }
+  ```
+
+  The `AtomicBool::swap` is the fast path: a single relaxed-ish atomic read-and-clear per
+  dispatch call when the ledger is empty (which is every dispatch call after at most a
+  handful of early ones per process lifetime, since each config key is enqueued at most
+  once). Only when the flag was `true` does dispatch touch the `Mutex` at all.
 - The exactly-once guarantee moves from "the row is written exactly once" (not achievable
-  synchronously) to a two-part story: the closure enqueues exactly once (guaranteed by
-  `OnceLock`); the drain removes and emits each queued entry at most once (because
-  `mem::take` empties the slot on every drain, so nothing is left to re-emit on a later
-  tick). What is **not** guaranteed: an entry can be lost if the process crashes between
-  enqueue and the next checkpoint tick (best-effort, consistent with every other emission
-  site in this ADR), and a `ConfigLocked` row can be delayed by up to one checkpoint interval
-  (500ms default) after the config value was actually locked in. Both are acceptable given
-  this data's use (auditing what value a running daemon locked in, not a correctness
-  dependency).
+  synchronously from inside a sync `OnceLock` closure) to a two-part story: the closure
+  enqueues exactly once (guaranteed by `OnceLock::get_or_init`); the drain removes and emits
+  each queued entry at most once, because `drain_config_locks()` does a `mem::take` on the
+  pending `Vec` under the same lock that guards the flag swap, so a concurrent second
+  dispatch racing the drain either sees the flag already cleared (no-op) or drains an empty
+  `Vec` (no-op); nothing is left to re-emit on a later dispatch. What is **not** guaranteed:
+  an entry can be lost if the process crashes between enqueue and the next dispatch call
+  (best-effort, consistent with every other emission site in this ADR). Drain latency is
+  now bounded by the next `VerbRegistry::dispatch` call rather than by the checkpoint
+  interval: on a serving daemon, that is at most one poll tick (`channel_poll_loop`'s
+  `comm.heartbeat` dispatch, `HAPPY_PATH_INTERVAL = 5s`, `serve.rs:296`) if no other verb is
+  dispatched sooner, and typically far less, since any client request also dispatches.
+  Both the crash-loss and the bounded-delay properties are acceptable given this data's use
+  (auditing what value a running daemon locked in, not a correctness dependency).
+
+  This drain-site choice (moving off `run_checkpoint_task` and onto `VerbRegistry::dispatch`)
+  is a design delta from this ADR's prior revision and is called out here explicitly for
+  Leo's confirmation, on the strength of the one-directional-dependency rationale above.
 
 (b) **`tx_registry.rs` (ADR-091 Plank 0)** stays out of scope for this ADR, per the audit's
 own framing (`SINGLETON_AUDIT.md` §4 item 2): it is a per-process, in-memory, observe-only
@@ -493,8 +561,12 @@ non-goals, not actioned.
 - **No new wire-surface verb.** A read verb over lifecycle events (e.g., something like
   `comm.health-for-events`, surfacing a channel's recent transition sequence the way
   `comm.health()` surfaces its current state) is plausible future work, but this ADR does
-  not spec it. Emission (Decision 2) goes through the storage-level `EventStore` trait
-  directly, not through `registry.dispatch()`.
+  not spec it. All new emission (Decision 2) calls the storage-level `EventStore::
+  append_event` trait method directly; no call site constructs a new request through the
+  verb-dispatch DSL or adds a new entry to the `request` tool's verb catalog. Decision 7a's
+  `ConfigLocked` drain runs from inside the existing `VerbRegistry::dispatch` function body
+  (an internal implementation detail of that function, not a caller-visible verb), which is
+  a different thing from adding a new verb a caller could invoke.
 - **No #599 log-file remedy.** See Decision 6: #599 stays open.
 - **No tracing removal.** Existing `tracing::{info,warn,error,debug}!` call sites in
   `serve.rs` and `checkpoint.rs` are unchanged; they remain the human-readable channel
@@ -520,10 +592,12 @@ non-goals, not actioned.
   multiplies `ChannelPollStarted` volume linearly.** Acknowledged in Decision 5's arithmetic;
   not a correctness risk, a volume-planning input for the deferred prune decision.
 - **`ConfigLocked`'s enqueue-then-drain split (Decision 7a) can lose an entry on a crash
-  between enqueue and the first checkpoint tick, or delay it by up to one checkpoint
-  interval.** Acceptable: this is auditing data (what value a running daemon locked in), not
-  a correctness dependency, and matches the best-effort discipline of every other emission
-  site in this ADR.
+  between enqueue and the next `VerbRegistry::dispatch` call, or delay it by however long
+  the daemon goes between dispatches.** Acceptable: this is auditing data (what value a
+  running daemon locked in), not a correctness dependency, and matches the best-effort
+  discipline of every other emission site in this ADR. In practice the delay is bounded by
+  at most one poll tick on a serving daemon with the email-channel feature active (Decision
+  7a), since `channel_poll_loop` itself dispatches `comm.heartbeat` every tick.
 - **`last_error_class` (Decision 1's `ChannelPollFailed` bullet) is process-local, in-memory
   state.** A daemon restart resets it, so the first failure after a restart is always
   treated as "first failure" even if the same error class was already ongoing before the
@@ -545,10 +619,12 @@ non-goals, not actioned.
 - Two small pieces of new in-process state, both explicitly owned by this ADR (not "no new
   decision logic," as an earlier draft of this ADR claimed): (1) `last_error_class:
   HashMap<(String, String), &'static str>` in `channel_poll_loop`, bounded by the number of
-  registered channels; (2) the `khive-runtime::config_ledger` pending-emission `Vec` behind a
-  `Mutex`, bounded by the number of `OnceLock` config sites (3 today) and drained to empty on
-  every checkpoint tick. `run_checkpoint_task`'s existing `was_above_warn` bool (Decision 4)
-  is reused as-is, no new state there. Beyond these two additions, `channel_poll_loop` and
+  registered channels, cleared on every successful poll regardless of which events that
+  success emits; (2) the `khive-runtime::config_ledger` pending-emission `Vec` plus its
+  companion `AtomicBool` flag, bounded by the number of `OnceLock` config sites (3 today)
+  and drained to empty on the next `VerbRegistry::dispatch` call, not on a checkpoint tick.
+  `run_checkpoint_task`'s existing `was_above_warn` bool (Decision 4) is reused as-is, no new
+  state there. Beyond these two additions, `channel_poll_loop`, `VerbRegistry::dispatch`, and
   `run_checkpoint_task` gain a handful of best-effort `append_event` calls at existing
   decision points computed from data `channel_error_class`, `is_backoff_eligible`,
   `ImapBackoff`, and `crossing_warn` already produce today.
@@ -627,7 +703,13 @@ non-goals, not actioned.
 - A poll failure emits `ChannelPollFailed` on the first failure for a channel and again on
   any subsequent failure whose `error_class` differs from the previous emitted failure's
   class; a repeated failure at the same class emits nothing further (verifies the
-  `last_error_class` state transition, including that it is cleared on the next success).
+  `last_error_class` state transition, including that the entry is cleared on the `Ok(
+  envelopes)` branch of every intervening success, not on `ChannelPollSucceeded`
+  specifically). A dedicated case: a `"config"`-class failure, followed by a successful poll
+  (no `ChannelPollSucceeded` fires, since `"config"` failures never populate `backoffs`),
+  followed by a second `"config"`-class failure, must emit `ChannelPollFailed` on the second
+  failure too, because the intervening success cleared `last_error_class` regardless of
+  which events that success itself emitted.
 - `log_eligible_poll_failure`'s escalation edge (`tick.should_warn`) emits exactly one
   `ChannelBackoffArmed` row; a same-step repeat emits zero (mirrors the existing `debug!`-
   not-`warn!` discipline, `serve.rs:462-482`).
@@ -635,9 +717,10 @@ non-goals, not actioned.
   and does not panic or abort the poll loop.
 - `ConfigLocked` is enqueued exactly once per config key across concurrent early readers
   (race test analogous to the existing `OnceLock` staleness tests, if any exist, for
-  `common.rs:40,45` / `context.rs:35`), and is drained to exactly one persisted row the next
-  time `run_checkpoint_task` ticks; draining twice in a row emits nothing on the second
-  drain.
+  `common.rs:40,45` / `context.rs:35`), and is drained to exactly one persisted row via the
+  next `VerbRegistry::dispatch` call made after the enqueue (asserted by dispatching one
+  no-op verb and checking a `ConfigLocked` row now exists), not via a checkpoint tick;
+  dispatching a second time in a row emits nothing further for that key.
 - A `CheckpointOutcomeRecorded` sequence whose 3 most-recent rows are all `above_warn = true`
   (a genuine 3-consecutive-cycle sustained elevation) satisfies the #617 WARN query. A
   sequence of isolated single-cycle crossings (each followed by an immediate `above_warn =
