@@ -33,7 +33,7 @@ JSONL files and replays them into a `session_messages` table. The table is decla
 (`crates/khive-pack-session/src/mirror/parse.rs:121`, `:200`, `:237` produce it via
 `secret_gate::mask_secrets(trimmed)`; `:538` produces it via
 `secret_gate::mask_secrets(&raw_json)` where `raw_json` comes from
-`serde_json::to_string(node).unwrap_or_default()` at `:536`, so this call site can hand
+`serde_json::to_string(node).unwrap_or_default()` at `:537`, so this call site can hand
 `mask_secrets` an empty string on a serialization failure and store an empty `raw`). `text`
 is a derived, much shorter extraction (the human-readable message body) used for display and
 search; `raw` exists so a message can be losslessly reconstructed later, independent of what
@@ -157,7 +157,7 @@ would need to carry:
 
 - **Stored value is SQLite `TEXT`** -- legacy plaintext. Returned unchanged, byte for byte,
   including the empty string produced by the `unwrap_or_default()` failure path
-  (`crates/khive-pack-session/src/mirror/parse.rs:536`). No prefix is stripped, no
+  (`crates/khive-pack-session/src/mirror/parse.rs:537`). No prefix is stripped, no
   decompression is attempted. This is a passthrough decode, not a new format: it is exactly
   what every reader does today, made explicit as one of two branches. This passthrough
   necessarily has weaker corruption detection than the BLOB branch below -- a legacy `TEXT`
