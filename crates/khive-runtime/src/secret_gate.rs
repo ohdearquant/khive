@@ -95,6 +95,70 @@
 //!   `accepted_false_positive_adr_draft_path_near_trigger` and its siblings
 //!   for the specific repro cases this now blocks, and the call site in
 //!   `check_entropy_heuristic`.
+//!
+//! **Round 5 (issues #632 / #577 — trigger-word matching, not the exemption
+//! itself): measured, not assumed.** The round-4 accepted-FP class turned out
+//! to be systemic in practice: agents routinely cite file paths while
+//! discussing auth/secret/scanner topics, and a 26.6k-row production-corpus
+//! replay (real note content + entity descriptions) found the trigger check
+//! itself was over-broad in one specific, fixable way — `TRIGGER_WORDS` were
+//! matched as a plain substring, so `auth` fired inside `authorized` and
+//! `authentication`, `key` inside `monkey`/`keyword`, etc. This is a pure
+//! substring collision, distinct from a genuine (if topical) mention of the
+//! word, and is NOT attacker-relevant: it is a false match on prose that never
+//! mentions credentials, not a signal an adversary can weaponize by adding
+//! filler words near a real payload. Bare trigger words (`key`, `secret`,
+//! `password`, `passwd`, `credential`, `bearer`, `auth`, `apikey`) are now
+//! matched at a word boundary (`contains_bounded_word`) instead of a plain
+//! substring; the three compound entries that already embed an underscore
+//! (`api_key`, `access_key`, `private_key`) are unchanged (plain substring),
+//! since the underscore already disambiguates them and word-boundary matching
+//! would only weaken them (e.g. `secret_access_key` no longer needs the bare
+//! `secret`/`key` matches once `access_key` fires on its own).
+//!
+//! This closes exactly the substring-collision false positive
+//! (`allows_internal_area_id_uuid_near_auth_substring_round5`, formerly
+//! `accepted_false_positive_internal_area_id_uuid_near_auth_substring`) and
+//! measurably reduced the production corpus block count from 29/26593 to
+//! 18/26601 in the same replay (~38% fewer blocks; the remaining blocks
+//! include genuine credentials — real `postgresql://user:pass@host` strings —
+//! plus the round-4 accepted-FP class that this round does NOT close: a
+//! structured-identifier-shaped token sitting near a **genuinely standalone**
+//! trigger word, e.g. `auth work saved at .../R1-repo-audit.md`, where `auth`
+//! is not a substring collision but an actual topical mention.
+//!
+//! Two other candidate directions were evaluated and REJECTED for the same
+//! reason as rounds 2–3: both are attacker-defeatable by inserting filler
+//! prose, which is exactly the failure mode the round-4 decision already
+//! ruled out for shape-based signals, and it applies identically here because
+//! the caller (or an attacker) fully controls the prose between a trigger
+//! word and a payload.
+//! - **Narrowing `TRIGGER_WINDOW` to reduce topical-prose false positives.**
+//!   Measured against every existing adversarial regression test:
+//!   round-1/2/3 bypass strings place the payload immediately adjacent to the
+//!   trigger word (0–1 byte gap: `secret_access_key <value>`, `token=<value>`),
+//!   while the accepted-FP repro paths sit only ~8–20 bytes away
+//!   (`api_key handling in <path>`, `key: see <path>`). No window cutoff
+//!   separates these classes without being trivially defeated by an attacker
+//!   inserting 1–2 filler words to push their payload just past whatever
+//!   narrower cutoff is chosen — the identical "attacker controls placement"
+//!   defeat as rounds 2–3, just measured in bytes-of-window instead of
+//!   run-shape. Window narrowing was not implemented.
+//! - **Reinstating the structured-identifier exemption for "bare"/topical
+//!   trigger mentions while keeping full strength only for assignment-shaped
+//!   triggers (`key=`, `secret:`).** This was checked against the round-1/3
+//!   bypass corpus directly: `secret_access_key abcdefghij/klmnopqrst/…` is
+//!   syntactically indistinguishable from `api_key handling in <path>` (both
+//!   are `TRIGGER_WORD <space> candidate-token`, no assignment operator
+//!   present), and the bypass payload independently decomposes into
+//!   `is_structured_identifier`-shaped runs — so this direction would have
+//!   silently re-opened the round-1/3 bypasses it was supposed to leave shut.
+//!   Not implemented.
+//!
+//! The caller-visible block message (`SecretMatch`'s `Display` impl) now also
+//! carries actionable guidance (`block_guidance`) — split or reword the
+//! flagged token — regardless of which detector direction shipped, since this
+//! part carries no soundness risk.
 
 use crate::error::{RuntimeError, RuntimeResult};
 
@@ -116,9 +180,40 @@ impl std::fmt::Display for SecretMatch {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "content matches secret pattern {} at masked excerpt {}",
-            self.detector, self.masked
+            "content matches secret pattern {} at masked excerpt {}. {}",
+            self.detector,
+            self.masked,
+            block_guidance(self.detector)
         )
+    }
+}
+
+/// Actionable, caller-visible guidance for a hard block, keyed by detector
+/// name (candidate 3 from issue #577: cheap regardless of which detector
+/// change ships). If the content genuinely is a credential, remove it. If it
+/// is not — the common case for the detectors below, which key off SHAPE
+/// near a trigger word rather than a known credential prefix — the fix is to
+/// break up the flagged token so it no longer reads as one contiguous
+/// high-entropy value: put it on its own line away from words like
+/// key/secret/auth/token, or insert a space/punctuation inside a long path or
+/// identifier (e.g. `workspaces / 20260705 / topic` instead of one glued
+/// token).
+fn block_guidance(detector: &'static str) -> &'static str {
+    match detector {
+        "high-entropy-token"
+        | "uuid-near-trigger"
+        | "content-hash-near-trigger"
+        | "hex-credential-token" => {
+            "If this is a real credential, remove it before writing. If it is not \
+             (e.g. a file path, UUID, or hash that happens to sit near a word like \
+             key/secret/auth/token), reword so the token is not glued directly next \
+             to that word — e.g. move it to its own line, or insert a space or word \
+             between them."
+        }
+        _ => {
+            "If this is a real credential, remove it before writing; store secrets \
+              in an env var or secrets manager instead."
+        }
     }
 }
 
@@ -552,7 +647,18 @@ fn find_url_userinfo(text: &str) -> Option<&str> {
 
 // ─── Layer 2: entropy heuristic ─────────────────────────────────────────────
 
-/// Trigger words near which high-entropy tokens are suspicious.
+/// Trigger words checked as a bounded standalone word (see
+/// [`contains_bounded_word`]) — bare English words that can otherwise appear
+/// as a pure substring collision inside unrelated identifiers or prose:
+/// `auth` inside `authorized`/`authentication`, `key` inside
+/// `monkey`/`turkey`/`keyword`, `secret` inside `secretary`.  Round-5 decision
+/// (see the module doc): a substring collision like this poisons the trigger
+/// window on prose that never mentions credentials at all, which is a
+/// distinct failure mode from a genuine (if topical) mention of the word —
+/// see issues #577 / #632.  Matching these words at a word boundary removes
+/// the substring-collision false positives while changing nothing about
+/// detection of a genuine standalone mention: `auth` as its own word (`auth
+/// header`, `auth:`) still triggers exactly as before.
 ///
 /// The bare substring `token` is NOT in this list because it fires on benign
 /// terms like `tokenizer`, `token_count`, and `next_token`.  Instead we use
@@ -567,10 +673,17 @@ const TRIGGER_WORDS: &[&str] = &[
     "bearer",
     "auth",
     "apikey",
-    "api_key",
-    "access_key",
-    "private_key",
 ];
+
+/// Trigger words checked as a plain substring (unchanged behavior) rather than
+/// a bounded word — these already embed the underscore separator that
+/// disambiguates them from ordinary prose (`secret_access_key`, `api_key`),
+/// so word-boundary matching would only weaken detection: an attacker who
+/// glues the compound onto a longer identifier (`secret_access_key_v2`) or
+/// composes it inside another compound (`aws_secret_access_key`) must still
+/// trip the gate. Do not move an entry here unless it structurally requires
+/// an underscore to make sense as a trigger.
+const COMPOUND_TRIGGER_WORDS: &[&str] = &["api_key", "access_key", "private_key"];
 
 /// Minimum token length to apply the entropy check.
 const MIN_ENTROPY_LEN: usize = 24;
@@ -642,7 +755,12 @@ fn check_entropy_heuristic(text: &str, from: usize) -> Option<(&str, &'static st
         let window = &text[window_start..window_end];
         let low_window = window.to_ascii_lowercase();
 
-        let near_trigger = TRIGGER_WORDS.iter().any(|tw| low_window.contains(tw))
+        let near_trigger = COMPOUND_TRIGGER_WORDS
+            .iter()
+            .any(|tw| low_window.contains(tw))
+            || TRIGGER_WORDS
+                .iter()
+                .any(|tw| contains_bounded_word(&low_window, tw))
             || has_standalone_token(&low_window)
             || has_token_assignment(&low_window);
 
@@ -754,12 +872,14 @@ fn check_entropy_heuristic(text: &str, from: usize) -> Option<(&str, &'static st
     None
 }
 
-/// Returns `true` when `low_window` contains the word `token` as a standalone
-/// word — i.e. surrounded by non-ASCII-alphanumeric boundaries (CJK/accented
-/// prose counts as a boundary) — but NOT as part of compound identifiers such
-/// as `tokenizer`, `token_count`, or `next_token`.
-fn has_standalone_token(low_window: &str) -> bool {
-    let needle = "token";
+/// Returns `true` when `low_window` contains `needle` as a standalone word —
+/// i.e. surrounded by non-ASCII-alphanumeric, non-underscore boundaries
+/// (CJK/accented prose counts as a boundary; underscore does NOT, so it stays
+/// a continuation of the same identifier) — rather than merely as a
+/// substring. This is what lets `auth` match `auth header` / `auth:` while
+/// NOT matching the substring collision inside `authorized`, `authentication`,
+/// or a compound identifier like `next_token`/`tokenizer`/`authorized_write`.
+fn contains_bounded_word(low_window: &str, needle: &str) -> bool {
     let mut start = 0;
     while let Some(rel) = low_window[start..].find(needle) {
         let abs = start + rel;
@@ -780,6 +900,13 @@ fn has_standalone_token(low_window: &str) -> bool {
         start = abs + needle.len().max(1);
     }
     false
+}
+
+/// Returns `true` when `low_window` contains the word `token` as a standalone
+/// word (see [`contains_bounded_word`]) — but NOT as part of compound
+/// identifiers such as `tokenizer`, `token_count`, or `next_token`.
+fn has_standalone_token(low_window: &str) -> bool {
+    contains_bounded_word(low_window, "token")
 }
 
 /// Returns `true` when `low_window` contains the assignment form `token=` or
@@ -2889,20 +3016,23 @@ mod tests {
     }
 
     #[test]
-    fn accepted_false_positive_internal_area_id_uuid_near_auth_substring() {
-        // Measured corpus regression (1 of ~19,300 real notes/docs replayed):
-        // an internal task `area_id` UUID field that happens to sit within
-        // the trigger window of the substring "auth" inside
-        // `authorized_write_requires_dominance` elsewhere in the same note.
-        // This is a deliberate, accepted false positive — the allowlist no
-        // longer distinguishes this from a UUID-shaped credential directly
-        // labeled by a trigger word, and no additional signal separates the
-        // two without reintroducing an attacker-suppliable shape check.
+    fn allows_internal_area_id_uuid_near_auth_substring_round5() {
+        // Was `accepted_false_positive_internal_area_id_uuid_near_auth_substring`
+        // pre round-5 (measured corpus regression, 1 of ~19,300 real notes/docs
+        // replayed): an internal task `area_id` UUID field sitting within the
+        // trigger window of the SUBSTRING "auth" inside
+        // `authorized_write_requires_dominance` — not a genuine mention of the
+        // word "auth" at all, a pure substring collision with "authorized".
+        // Round-5 (see the module doc and `contains_bounded_word`) requires
+        // bare trigger words to match at a word boundary; `auth` no longer
+        // matches inside `authorized`, so this UUID has no trigger in its
+        // window and passes via the ordinary out-of-context UUID allowlist.
+        // This is the fix for issue #577's root cause, not a new tradeoff.
         let content = "area_id: cfcea31d-6f50-4fd1-ad6d-5f160de1694c\n\n## Problem\nReduce Lion microkernel axioms. Converted authorized_write_requires_dominance from axiom to theorem.";
         assert!(
-            check(content).is_err(),
-            "accepted FP: internal area_id UUID near 'authorized_write' substring \
-             is now blocked; got {:?}",
+            check(content).is_ok(),
+            "round-5 fix: internal area_id UUID near the 'authorized' substring \
+             (not a genuine 'auth' mention) must now pass; got {:?}",
             scan(content)
         );
     }
@@ -3108,5 +3238,236 @@ mod tests {
             "a benign URL near a trigger word must stay allowed; got {:?}",
             scan(content)
         );
+    }
+
+    // ── Round 5 (issues #632 / #577): trigger word-boundary matching ────────
+
+    #[test]
+    fn allows_authorized_and_authentication_prose_near_uuid() {
+        // The word-boundary fix directly: "auth" no longer matches the
+        // substring inside "authorized"/"authentication", so ordinary prose
+        // using those words does not poison the trigger window for a nearby
+        // UUID or other allowlisted shape.
+        let cases = [
+            "authorized_write_requires_dominance was converted from axiom to theorem, id 550e8400-e29b-41d4-a716-446655440000",
+            "authentication flow diagram lives at 550e8400-e29b-41d4-a716-446655440000",
+        ];
+        for content in cases {
+            assert!(
+                check(content).is_ok(),
+                "'authorized'/'authentication' substring must not trigger the \
+                 entropy heuristic: {content:?}, got {:?}",
+                scan(content)
+            );
+        }
+    }
+
+    #[test]
+    fn allows_turkey_monkey_keyword_prose_near_uuid() {
+        // Other bare-word substring collisions in TRIGGER_WORDS ("key") must
+        // likewise not fire on ordinary English words that merely contain it.
+        let cases = [
+            "the turkey and monkey story references id 550e8400-e29b-41d4-a716-446655440000",
+            "keyword research doc: 550e8400-e29b-41d4-a716-446655440000",
+        ];
+        for content in cases {
+            assert!(
+                check(content).is_ok(),
+                "'turkey'/'monkey'/'keyword' substring must not trigger the \
+                 entropy heuristic: {content:?}, got {:?}",
+                scan(content)
+            );
+        }
+    }
+
+    #[test]
+    fn blocks_standalone_auth_and_key_words_unchanged_by_round5() {
+        // Round 5 only removes SUBSTRING collisions; a genuine standalone
+        // trigger word must still dominate exactly as before.
+        let opaque = "Xk9mZ2vQpLrT8nJwYuAeHfBsDcGiONvMabcdef"; // gitleaks:allow
+        let cases = [
+            format!("auth header {opaque}"),
+            format!("the key is {opaque}"),
+            format!("secret value: {opaque}"),
+        ];
+        for content in &cases {
+            assert!(
+                check(content).is_err(),
+                "a genuine standalone trigger word must still block: {content:?}, \
+                 got {:?}",
+                scan(content)
+            );
+        }
+    }
+
+    #[test]
+    fn accepted_false_positive_workspace_artifact_path_near_standalone_secret_round5() {
+        // Repro shape from issue #632: a dot-prefixed root + date segment +
+        // hyphenated topic dir + SCREAMING_SNAKE filename, discussed in
+        // prose that genuinely (not by substring collision) mentions
+        // "secret". Round 5 does not change this: `secret` here is a real
+        // standalone word, not a substring collision, so it still dominates
+        // and the path still falls through to the entropy heuristic like any
+        // other near-trigger token. Documented as a still-accepted tradeoff,
+        // not a regression.
+        let content = "writing up the secret gate false positive repro: \
+             .workspace/20260101/fix-secret-gate-trigger-false-positive/MEASUREMENT_REPORT.md";
+        assert!(
+            check(content).is_err(),
+            "accepted FP (round 5 unchanged): workspace artifact path near a \
+             genuine standalone 'secret' mention is still blocked; got {:?}",
+            scan(content)
+        );
+    }
+
+    #[test]
+    fn accepted_false_positive_archive_doc_path_near_standalone_secret_round5() {
+        // Repro shape from issue #577 case 1: a docs/_archive-style path
+        // discussed near a genuine standalone "secret" mention.
+        let content =
+            "secret scanner archive notes: docs/_archive/ADR051-TenantEncryption-v2Notes.md";
+        assert!(
+            check(content).is_err(),
+            "accepted FP (round 5 unchanged): archive doc path near a genuine \
+             standalone 'secret' mention is still blocked; got {:?}",
+            scan(content)
+        );
+    }
+
+    #[test]
+    fn accepted_false_positive_absolute_path_near_standalone_auth_round5() {
+        // Repro shape from issue #577 case 3: an absolute path written as one
+        // unbroken token, with the surrounding message genuinely (not via
+        // substring collision) discussing "auth".
+        let content = "the auth scanner flagged this file: /home/user/projects/workspace/SessionNotes20260107/AuthGateFollowup2.md";
+        assert!(
+            check(content).is_err(),
+            "accepted FP (round 5 unchanged): absolute path near a genuine \
+             standalone 'auth' mention is still blocked; got {:?}",
+            scan(content)
+        );
+    }
+
+    #[test]
+    fn blocks_assignment_shaped_credential_disguised_as_path_near_api_key() {
+        // Adversarial negative (must NOT be newly exempted by round 5): a
+        // credential-shaped value glued via '=' directly to a trigger word,
+        // even though it is path-shaped (separator-delimited, word-shaped
+        // runs) and looks superficially like the accepted-FP repro paths
+        // above. The compound entry `api_key` is unaffected by the
+        // word-boundary change (still a plain substring match), and the
+        // structured-identifier exemption is still unconditionally dropped in
+        // trigger context (round 4), so this must still block.
+        let content = "api_key=/home/user/workspaces/2026/topic-name-example/SECRET_VALUE_HERE.md";
+        assert!(
+            check(content).is_err(),
+            "assignment-shaped credential disguised as a path must still be \
+             blocked: {content:?}, got {:?}",
+            scan(content)
+        );
+    }
+
+    #[test]
+    fn blocks_secret_access_key_bypass_compound_entry_unaffected_by_round5() {
+        // Adversarial negative: the round-1/3 bypass relies on the compound
+        // `secret_access_key`/`access_key` entries, which are deliberately
+        // NOT moved to word-boundary matching (see `COMPOUND_TRIGGER_WORDS`).
+        // Confirms round 5 does not weaken this even though the bare
+        // `secret`/`key` word-boundary checks alone would no longer match
+        // `secret_access_key` (underscore is not a boundary).
+        let content = "secret_access_key abcdefghij/klmnopqrst/uvwxyzabcd/efghijk.md";
+        assert!(
+            check(content).is_err(),
+            "secret_access_key bypass shape must still be blocked via the \
+             compound entry: {content:?}, got {:?}",
+            scan(content)
+        );
+    }
+
+    #[test]
+    fn block_message_carries_actionable_guidance() {
+        let fake = "AKIAFAKEKEY1234567890";
+        let m = scan(fake).unwrap();
+        let rendered = m.to_string();
+        assert!(
+            rendered.contains("real credential"),
+            "block message must carry actionable guidance: {rendered}"
+        );
+    }
+
+    #[test]
+    fn block_message_shape_guidance_mentions_rewording() {
+        let opaque = "Xk9mZ2vQpLrT8nJwYuAeHfBsDcGiONvMabcdef"; // gitleaks:allow
+        let content = format!("auth header {opaque}");
+        let m = scan(&content).unwrap();
+        let rendered = m.to_string();
+        assert!(
+            rendered.contains("reword") || rendered.contains("own line"),
+            "shape-based detector guidance must suggest rewording/splitting: {rendered}"
+        );
+    }
+}
+
+// ─── Corpus replay harness (manual, opt-in) ─────────────────────────────────
+//
+// Measures how many real note/entity strings the gate blocks, so a detector
+// change can be evaluated against production content rather than intuition
+// (see the module doc and issues #632 / #577). Opens the target database
+// STRICTLY read-only (`SQLITE_OPEN_READ_ONLY`) and never mutates it. Point
+// `KHIVE_REPLAY_DB` at a copy or a live KG database file path; the harness
+// never writes, locks aggressively, or deletes anything.
+//
+// Run with: `KHIVE_REPLAY_DB=/path/to/khive.db cargo test -p khive-runtime \
+//   --release -- --ignored --nocapture corpus_replay`
+#[cfg(test)]
+mod corpus_replay {
+    use super::*;
+    use rusqlite::{Connection, OpenFlags};
+
+    #[test]
+    #[ignore]
+    fn replay_against_corpus() {
+        let db_path = std::env::var("KHIVE_REPLAY_DB")
+            .expect("set KHIVE_REPLAY_DB=/path/to/khive.db to run the corpus replay (read-only)");
+        let conn = Connection::open_with_flags(
+            &db_path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .expect("open corpus DB read-only");
+
+        let mut total = 0usize;
+        let mut blocked = 0usize;
+        let mut samples: Vec<String> = Vec::new();
+
+        let mut collect = |sql: &str| {
+            let mut stmt = conn.prepare(sql).expect("prepare replay query");
+            let mut rows = stmt.query([]).expect("query replay rows");
+            while let Some(row) = rows.next().expect("read replay row") {
+                let content: Option<String> = row.get(0).unwrap_or(None);
+                let Some(content) = content else { continue };
+                if content.is_empty() {
+                    continue;
+                }
+                total += 1;
+                if let Some(m) = scan(&content) {
+                    blocked += 1;
+                    if samples.len() < 30 {
+                        samples.push(format!(
+                            "{} :: {}",
+                            m,
+                            content.chars().take(160).collect::<String>()
+                        ));
+                    }
+                }
+            }
+        };
+
+        collect("SELECT content FROM notes WHERE deleted_at IS NULL");
+        collect("SELECT description FROM entities WHERE deleted_at IS NULL");
+
+        eprintln!("corpus replay: {blocked}/{total} strings blocked");
+        for s in &samples {
+            eprintln!("  BLOCKED: {s}");
+        }
     }
 }
