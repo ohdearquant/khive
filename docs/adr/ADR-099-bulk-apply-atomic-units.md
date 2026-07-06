@@ -290,19 +290,24 @@ read verbs are rejected at parse time.**
   same reason (it creates a task note). All are treated exactly like `create` and
   `memory.remember` below — rejected at parse time as embedding-bearing until a note prepare/apply
   seam exists.
-- **`update` and `merge` caveat (verified at source).** Under the current handlers, `update`
-  triggers a reindex when name or description change, and that reindex awaits embedding
-  (`reindex_entity` in `crates/khive-runtime/src/curation.rs`); property-only updates skip
-  reindex entirely (covered by an existing regression test). `merge` already performs its
-  vector re-insert **after** its transaction, precisely because embedding is async — the
-  handler's own documentation states this. So the codebase already contains the pattern this
-  design needs: row and FTS DML commit inside the transaction; embedding reindex runs as a
-  post-commit side effect, under reindex's existing best-effort warn-and-continue contract (a
-  failed re-embed leaves a stale vector, never a failed write). Under `--atomic`, `update` and
-  `merge` follow that same split: their write plans carry the row/FTS DML; any needed reindex
-  is recorded as a post-commit side effect and computes its embedding from the **committed**
-  row content, which also means no prepare-time embedding exists to go stale. The v1 prepare
-  pass therefore still computes no embeddings, and the staleness-immunity claim in D1 holds.
+- **`update` and `merge` caveat (verified at source) — applies to BOTH substrates.** Under the
+  current handlers, an entity `update` triggers a reindex when name or description change, and a
+  **note** `update` triggers a reindex when note name or content change (`reindex_entity` /
+  `reindex_note` in `crates/khive-runtime/src/curation.rs`); both reindex paths await embedding.
+  Property-only updates on either substrate skip reindex entirely (covered by existing
+  regression tests). `merge` already performs its vector re-insert **after** its transaction,
+  precisely because embedding is async — the handler's own documentation states this. So the
+  codebase already contains the pattern this design needs: row and FTS DML commit inside the
+  transaction; embedding reindex runs as a post-commit side effect, under reindex's existing
+  best-effort warn-and-continue contract (a failed re-embed leaves a stale vector, never a
+  failed write). Under `--atomic`, `update` (entity **and** note shapes) and `merge` follow that
+  same split: their write plans carry the row/FTS DML; any needed reindex — entity or note — is
+  recorded as a post-commit side effect and computes its embedding from the **committed** row
+  content, which also means no prepare-time embedding exists to go stale. The v1 prepare pass
+  therefore still computes no embeddings, and the staleness-immunity claim in D1 holds. The
+  admissibility metadata for `update` covers the whole verb only because this split is a
+  precondition of admitting it: an implementation that runs any reindex inside the transaction
+  violates the suspend-free invariant and must fail the suspend-trap test.
 - **v1 rejected — embedding-bearing:** `create` (entity/note/document) and `memory.remember`
   compute embeddings and warm ANN as part of the write. They are excluded from `--atomic` v1
   because their prepare seam (hoisting embedding out of the transaction) is not yet built. An
@@ -519,6 +524,13 @@ Schema is unchanged; no migration file is required. Pack rules gain only additiv
   the edge the earlier op inserted. No live edge remains on the merged-away entity. This pins the
   predicate-based-plan rule — a plan that pre-enumerated edge rows at prepare time fails this
   test.
+- **Note-content update reindexes post-commit only.** An `--atomic` file containing
+  `update(kind="note", content=...)` commits with the note's row and FTS DML inside the unit and
+  its embedding reindex deferred to the post-commit pass: no embedding computation occurs inside
+  the transaction (the suspend-trap assertion covers this path), and after the run the note's
+  vector reflects the committed content. This pins the note shape of the `update` caveat — an
+  implementation whose admissibility metadata admits `update` while running `reindex_note`
+  in-transaction fails this test.
 - **Zero-row apply fails the unit.** An `--atomic` file of the form `[delete(X, hard), update(X)]`
   does **not** report success: the update's affected-row guard observes zero rows inside the
   transaction, the op fails, and the whole unit rolls back (X is restored, `atomic.committed` is
