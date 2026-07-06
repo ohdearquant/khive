@@ -123,6 +123,7 @@ For historical context, see [v0 archive](../_archive/adr_v0/README.md). v0 ADRs 
 | [ADR-095](ADR-095-verb-surface-consolidation.md)             | Verb-Surface Consolidation and Field-Validation Governance (Proposed)                                           |
 | [ADR-096](ADR-096-warm-daemon-per-request-identity.md)       | Warm Daemon Per-Request Identity — Serving Many Attribution Identities Over One Shared Backend (Accepted)       |
 | [ADR-099](ADR-099-bulk-apply-atomic-units.md)                | Cross-Op Atomicity for Bulk Apply — Prepared Write Plans over the Single-Writer Seam (Accepted)                 |
+| [ADR-100](ADR-100-store-backup-replication.md)               | Store Backup and Replication — Scheduled Differential Sync with Tiered Recovery Objectives (Proposed)           |
 
 ## Closed Taxonomies — Quick Reference
 
