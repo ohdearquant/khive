@@ -72,11 +72,27 @@ pub trait AnyWriteRequest: sealed::Sealed + Send {
     /// (possibly commit-failure-adjusted) result to the request's oneshot
     /// reply channel.
     ///
-    /// `conn` must already be inside a `BEGIN IMMEDIATE` transaction opened
-    /// by the caller (`run_writer_task`) — this method issues only
-    /// `COMMIT` / `ROLLBACK`, never `BEGIN`, so `run_writer_task` remains
-    /// the sole issuer of `BEGIN IMMEDIATE` (ADR-067 Component A).
+    /// `conn` must already be inside a successfully-opened `BEGIN IMMEDIATE`
+    /// transaction opened by the caller (`run_writer_task`) — this method
+    /// issues only `COMMIT` / `ROLLBACK`, never `BEGIN`, so `run_writer_task`
+    /// remains the sole issuer of `BEGIN IMMEDIATE` (ADR-067 Component A).
+    /// Callers must use [`Self::reply_error`] instead when the enclosing
+    /// `BEGIN IMMEDIATE` itself failed — this method must not be invoked in
+    /// that case.
     fn execute_and_reply(self: Box<Self>, conn: &Connection);
+
+    /// Replies with `err` without running this request's operation or
+    /// touching `conn`.
+    ///
+    /// Used when the enclosing `BEGIN IMMEDIATE` failed (for example,
+    /// `SQLITE_BUSY` from lock contention with an unmigrated writer path
+    /// still holding the pool's writer mutex — reachable while only
+    /// `entity.rs` is routed through this channel). Running the operation
+    /// anyway would execute its DML against `conn` in autocommit mode,
+    /// landing partial writes for a request the caller is told failed.
+    /// Skipping the operation entirely keeps "the caller got an error" and
+    /// "no rows landed" true together.
+    fn reply_error(self: Box<Self>, err: StorageError);
 }
 
 impl<R: Send + 'static> AnyWriteRequest for WriteRequest<R> {
@@ -101,6 +117,12 @@ impl<R: Send + 'static> AnyWriteRequest for WriteRequest<R> {
         // The receiver may already be gone (caller dropped its future) —
         // that is not this task's problem to report; it just moves on.
         let _ = self.reply.send(final_result);
+    }
+
+    fn reply_error(self: Box<Self>, err: StorageError) {
+        // Same "receiver may already be gone" reasoning as above — send and
+        // move on regardless of outcome.
+        let _ = self.reply.send(Err(err));
     }
 }
 
@@ -195,6 +217,16 @@ pub fn spawn(pool: &ConnectionPool, capacity: usize) -> Result<WriterTaskHandle,
 /// Drain loop: the sole caller of `BEGIN IMMEDIATE` for write traffic routed
 /// through the channel (ADR-067 Component A).
 ///
+/// A `BEGIN IMMEDIATE` failure (for example, `SQLITE_BUSY` from lock
+/// contention with an unmigrated writer path still holding the pool's writer
+/// mutex — reachable while only `entity.rs` is routed through this channel
+/// in this slice) replies the request's error via
+/// [`AnyWriteRequest::reply_error`] without ever invoking the request's
+/// operation closure via [`AnyWriteRequest::execute_and_reply`]. Slice 1 has
+/// no watchdog/retry story for a failed `BEGIN` (Component D is a later
+/// slice); the connection simply tries `BEGIN IMMEDIATE` fresh on the next
+/// request.
+///
 /// Exits when every [`WriterTaskHandle`] clone is dropped and the channel
 /// closes (`rx.recv()` returns `None`), or if the blocking closure panics.
 /// Either way, this task's `rx` is dropped when the function returns, which
@@ -209,22 +241,24 @@ async fn run_writer_task(
         let outcome = tokio::task::spawn_blocking(move || {
             let _tx_handle =
                 khive_storage::tx_registry::register(Some("writer_task_tx".to_string()));
-            if let Err(e) = conn.execute_batch("BEGIN IMMEDIATE") {
-                // Slice 1 has no watchdog/retry story for a failed BEGIN
-                // (Component D is a later slice). Proceeding without an
-                // explicit transaction still yields a correct reply: the
-                // op's own statements run in autocommit mode, and
-                // `execute_and_reply`'s subsequent `COMMIT` attempt fails
-                // with "no transaction is active", which it maps to
-                // `StorageError::Pool` and returns to the caller — a
-                // request never silently hangs or panics on this path.
-                tracing::warn!(
-                    error = %e,
-                    "writer task: BEGIN IMMEDIATE failed; request proceeds \
-                     without an explicit transaction"
-                );
+            match conn.execute_batch("BEGIN IMMEDIATE") {
+                Ok(()) => request.execute_and_reply(&conn),
+                Err(e) => {
+                    // Do NOT run the request's operation: `conn` never
+                    // entered a transaction, so executing the op's DML here
+                    // would run in autocommit mode and land partial writes
+                    // for a request the caller is about to be told failed.
+                    tracing::warn!(
+                        error = %e,
+                        "writer task: BEGIN IMMEDIATE failed; replying an \
+                         error without running the request's operation"
+                    );
+                    request.reply_error(StorageError::Pool {
+                        operation: "writer_task_begin".into(),
+                        message: e.to_string(),
+                    });
+                }
             }
-            request.execute_and_reply(&conn);
             conn
         })
         .await;
@@ -246,6 +280,8 @@ async fn run_writer_task(
 mod tests {
     use super::*;
     use crate::pool::PoolConfig;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
     use std::time::Duration;
 
     fn file_pool(path: &std::path::Path) -> ConnectionPool {
@@ -254,6 +290,78 @@ mod tests {
             ..PoolConfig::default()
         };
         ConnectionPool::new(cfg).expect("pool open")
+    }
+
+    #[tokio::test]
+    async fn begin_immediate_failure_replies_error_without_running_op() {
+        // Real lock contention, not a simulation: hold the database-level
+        // write lock from the pool's own writer connection (the unmigrated
+        // path this fix is guarding against) so the writer task's dedicated
+        // connection genuinely fails `BEGIN IMMEDIATE` with `SQLITE_BUSY`
+        // after a short `busy_timeout`.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("writer_task_begin_failure.db");
+        let cfg = PoolConfig {
+            path: Some(path.clone()),
+            busy_timeout: Duration::from_millis(150),
+            ..PoolConfig::default()
+        };
+        let pool = ConnectionPool::new(cfg).unwrap();
+        {
+            let writer = pool.try_writer().unwrap();
+            writer
+                .conn()
+                .execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")
+                .unwrap();
+        }
+
+        let handle = spawn(&pool, 8).expect("writer task should spawn on a file-backed pool");
+
+        let lock_holder = pool.try_writer().unwrap();
+        lock_holder.conn().execute_batch("BEGIN IMMEDIATE").unwrap();
+
+        let op_ran = Arc::new(AtomicBool::new(false));
+        let op_ran_clone = Arc::clone(&op_ran);
+        let result = handle
+            .send(move |conn| {
+                op_ran_clone.store(true, Ordering::SeqCst);
+                conn.execute("INSERT INTO t (id, v) VALUES (99, 'should-not-land')", [])
+                    .map_err(|e| StorageError::Pool {
+                        operation: "test_insert".into(),
+                        message: e.to_string(),
+                    })
+            })
+            .await;
+
+        assert!(
+            matches!(
+                &result,
+                Err(StorageError::Pool { operation, .. }) if operation == "writer_task_begin"
+            ),
+            "expected a writer_task_begin Pool error on BEGIN IMMEDIATE \
+             failure, got {result:?}"
+        );
+        assert!(
+            !op_ran.load(Ordering::SeqCst),
+            "the request's operation closure must never run when BEGIN \
+             IMMEDIATE fails — running it would land a partial write in \
+             autocommit mode for a request the caller is told failed"
+        );
+
+        // Release the contended lock, then verify no row landed from the
+        // failed request.
+        lock_holder.conn().execute_batch("ROLLBACK").unwrap();
+        drop(lock_holder);
+
+        let reader = pool.reader().expect("reader");
+        let count: i64 = reader
+            .conn()
+            .query_row("SELECT COUNT(*) FROM t WHERE id = 99", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            count, 0,
+            "no row must have landed from the request whose BEGIN IMMEDIATE failed"
+        );
     }
 
     #[tokio::test]
