@@ -260,6 +260,12 @@ impl khive_storage::SqlReader for SqliteReader {
 
 struct SqliteWriter {
     conn: Option<rusqlite::Connection>,
+    /// ADR-067 Component A: when the write queue is enabled, `execute_batch`
+    /// routes the whole caller-supplied statement list through the
+    /// single-writer task instead of opening its own `BEGIN IMMEDIATE` on
+    /// `conn`. `None` when the flag is off or no writer task is available
+    /// (best-effort — degrades to the standalone-connection path below).
+    writer_task: Option<crate::writer_task::WriterTaskHandle>,
 }
 
 #[async_trait]
@@ -351,6 +357,34 @@ impl khive_storage::SqlWriter for SqliteWriter {
         &mut self,
         statements: Vec<SqlStatement>,
     ) -> khive_storage::types::StorageResult<u64> {
+        // ADR-067 Component A: this call is self-contained (the full statement
+        // list is supplied up front and the whole thing commits or rolls back
+        // as one unit) — unlike `writer()`'s live incrementally-driven handle,
+        // it maps cleanly onto a single `WriteRequest`. Route it through the
+        // writer task when available; `self.conn` is left untouched so a
+        // subsequent `execute`/`execute_script` call on this same handle still
+        // works over the standalone connection (that dispatch is unmigrated —
+        // see `SqlBridge::writer()`).
+        if let Some(writer_task) = self.writer_task.clone() {
+            return writer_task
+                .send(move |conn| {
+                    let mut total: u64 = 0;
+                    for statement in &statements {
+                        let mut stmt = conn
+                            .prepare(&statement.sql)
+                            .map_err(|e| map_rusqlite_err(e, "execute_batch"))?;
+                        bind_params(&mut stmt, &statement.params)
+                            .map_err(|e| map_rusqlite_err(e, "execute_batch"))?;
+                        total += stmt
+                            .raw_execute()
+                            .map_err(|e| map_rusqlite_err(e, "execute_batch"))?
+                            as u64;
+                    }
+                    Ok(total)
+                })
+                .await;
+        }
+
         let conn = self.conn.take().ok_or_else(|| StorageError::Pool {
             operation: "execute_batch".into(),
             message: "connection already consumed".into(),
@@ -851,7 +885,14 @@ impl khive_storage::SqlAccess for SqlBridge {
                 });
             }
             let conn = open_standalone_writer(&self.pool)?;
-            Ok(Box::new(SqliteWriter { conn: Some(conn) }))
+            // Best-effort: a lookup failure (no runtime context) degrades to the
+            // standalone-connection path in `execute_batch` rather than failing
+            // handle construction (mirrors every other migrated store).
+            let writer_task = self.pool.writer_task_handle().ok().flatten();
+            Ok(Box::new(SqliteWriter {
+                conn: Some(conn),
+                writer_task,
+            }))
         } else {
             Ok(Box::new(PoolBackedWriter {
                 pool: Arc::clone(&self.pool),
@@ -1016,6 +1057,157 @@ mod tests {
                 .iter()
                 .any(|(_, label)| label.as_deref() == Some("begin_tx_registry_test")),
             "expected the labeled tx to be gone from the registry after commit"
+        );
+    }
+
+    /// ADR-067 Component A entry 10: with `KHIVE_WRITE_QUEUE=1`,
+    /// `SqliteWriter::execute_batch` (reached via `SqlBridge::writer()`)
+    /// routes the whole statement list through the WriterTask channel
+    /// instead of opening its own `BEGIN IMMEDIATE` on the standalone
+    /// connection, and the row is actually committed and readable back.
+    ///
+    /// `#[serial]`: mutates the process-global `KHIVE_WRITE_QUEUE` env var,
+    /// shared with `pool.rs`'s own env-override tests in this same test binary.
+    #[tokio::test]
+    #[serial]
+    async fn execute_batch_routes_through_writer_task_when_flag_enabled() {
+        std::env::set_var("KHIVE_WRITE_QUEUE", "1");
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("write_queue_execute_batch.db");
+        let config = PoolConfig {
+            path: Some(path.clone()),
+            ..PoolConfig::default()
+        };
+        let pool = Arc::new(ConnectionPool::new(config).unwrap());
+        {
+            let guard = pool.writer().unwrap();
+            guard
+                .conn()
+                .execute_batch(
+                    "CREATE TABLE IF NOT EXISTS write_queue_batch_test \
+                     (id INTEGER PRIMARY KEY, val TEXT NOT NULL)",
+                )
+                .unwrap();
+        }
+
+        let bridge = SqlBridge::new(Arc::clone(&pool), true);
+        std::env::remove_var("KHIVE_WRITE_QUEUE");
+
+        let mut writer = bridge.writer().await.unwrap();
+        let affected = writer
+            .execute_batch(vec![
+                SqlStatement {
+                    sql: "INSERT INTO write_queue_batch_test (id, val) VALUES (?1, ?2)".into(),
+                    params: vec![SqlValue::Integer(1), SqlValue::Text("a".into())],
+                    label: None,
+                },
+                SqlStatement {
+                    sql: "INSERT INTO write_queue_batch_test (id, val) VALUES (?1, ?2)".into(),
+                    params: vec![SqlValue::Integer(2), SqlValue::Text("b".into())],
+                    label: None,
+                },
+            ])
+            .await
+            .unwrap();
+        assert_eq!(affected, 2);
+
+        let mut reader = bridge.reader().await.unwrap();
+        let count = reader
+            .query_scalar(SqlStatement {
+                sql: "SELECT COUNT(*) FROM write_queue_batch_test".into(),
+                params: vec![],
+                label: None,
+            })
+            .await
+            .unwrap();
+        assert!(
+            matches!(count, Some(SqlValue::Integer(2))),
+            "expected 2 rows, got {count:?}"
+        );
+        assert_eq!(
+            pool.writer_task_spawn_count(),
+            1,
+            "the flag-ON path must actually spawn and use the writer task"
+        );
+    }
+
+    /// ADR-067 Component A entry 10, atomicity: a batch whose second
+    /// statement fails (duplicate primary key) must roll back the WHOLE
+    /// request — including the first statement's otherwise-successful
+    /// INSERT — because the WriterTask commits or rolls back one
+    /// `WriteRequest` as a single unit (ADR-067 Component A). Zero rows must
+    /// land, not one.
+    ///
+    /// `#[serial]`: mutates the process-global `KHIVE_WRITE_QUEUE` env var.
+    #[tokio::test]
+    #[serial]
+    async fn execute_batch_rolls_back_atomically_on_mid_sequence_failure() {
+        std::env::set_var("KHIVE_WRITE_QUEUE", "1");
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("write_queue_execute_batch_rollback.db");
+        let config = PoolConfig {
+            path: Some(path.clone()),
+            ..PoolConfig::default()
+        };
+        let pool = Arc::new(ConnectionPool::new(config).unwrap());
+        {
+            let guard = pool.writer().unwrap();
+            guard
+                .conn()
+                .execute_batch(
+                    "CREATE TABLE IF NOT EXISTS write_queue_rollback_test \
+                     (id INTEGER PRIMARY KEY, val TEXT NOT NULL)",
+                )
+                .unwrap();
+        }
+
+        let bridge = SqlBridge::new(Arc::clone(&pool), true);
+        std::env::remove_var("KHIVE_WRITE_QUEUE");
+
+        let mut writer = bridge.writer().await.unwrap();
+        let result = writer
+            .execute_batch(vec![
+                // Statement 1: succeeds on its own.
+                SqlStatement {
+                    sql: "INSERT INTO write_queue_rollback_test (id, val) VALUES (?1, ?2)".into(),
+                    params: vec![SqlValue::Integer(1), SqlValue::Text("first".into())],
+                    label: None,
+                },
+                // Statement 2: duplicate primary key — fails mid-sequence.
+                SqlStatement {
+                    sql: "INSERT INTO write_queue_rollback_test (id, val) VALUES (?1, ?2)".into(),
+                    params: vec![SqlValue::Integer(1), SqlValue::Text("duplicate".into())],
+                    label: None,
+                },
+                // Statement 3: never reached.
+                SqlStatement {
+                    sql: "INSERT INTO write_queue_rollback_test (id, val) VALUES (?1, ?2)".into(),
+                    params: vec![SqlValue::Integer(2), SqlValue::Text("third".into())],
+                    label: None,
+                },
+            ])
+            .await;
+        assert!(
+            result.is_err(),
+            "a batch with a mid-sequence PK conflict must return an error"
+        );
+
+        let mut reader = bridge.reader().await.unwrap();
+        let count = reader
+            .query_scalar(SqlStatement {
+                sql: "SELECT COUNT(*) FROM write_queue_rollback_test".into(),
+                params: vec![],
+                label: None,
+            })
+            .await
+            .unwrap();
+        assert!(
+            matches!(count, Some(SqlValue::Integer(0))),
+            "the whole request must roll back — including statement 1's \
+             otherwise-successful INSERT — not just the failing statement; \
+             got {count:?}"
         );
     }
 }

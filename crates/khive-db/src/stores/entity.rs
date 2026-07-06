@@ -50,7 +50,12 @@ impl SqlEntityStore {
     /// support) — the flag is a best-effort opt-in for slice 1, not a hard
     /// requirement.
     pub fn new(pool: Arc<ConnectionPool>, is_file_backed: bool) -> Self {
-        let writer_task = pool.writer_task_handle();
+        // Best-effort opt-in (slice 1 policy, unchanged): a missing writer
+        // task — whether the flag is off, spawn degraded (e.g. in-memory
+        // pool), or no Tokio runtime was available at this first access
+        // (ADR-067 Component A runtime-handle guard) — degrades to the
+        // legacy pool-mutex path rather than failing construction.
+        let writer_task = pool.writer_task_handle().ok().flatten();
 
         Self {
             pool,

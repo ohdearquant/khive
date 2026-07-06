@@ -22,6 +22,7 @@ use khive_types::{EventKind, EventOutcome, SubstrateKind};
 
 use crate::error::SqliteError;
 use crate::pool::ConnectionPool;
+use crate::writer_task::WriterTaskHandle;
 
 fn map_err(e: rusqlite::Error, op: &'static str) -> StorageError {
     StorageError::driver(StorageCapability::Events, op, e)
@@ -36,6 +37,7 @@ pub struct SqlEventStore {
     pool: Arc<ConnectionPool>,
     is_file_backed: bool,
     namespace: String,
+    writer_task: Option<WriterTaskHandle>,
 }
 
 impl SqlEventStore {
@@ -45,10 +47,15 @@ impl SqlEventStore {
         is_file_backed: bool,
         namespace: impl Into<String>,
     ) -> Self {
+        // Best-effort opt-in (ADR-067 Component A, mirrors entity.rs slice 1
+        // policy): a missing writer task degrades to the legacy pool-mutex /
+        // standalone-connection path rather than failing construction.
+        let writer_task = pool.writer_task_handle().ok().flatten();
         Self {
             pool,
             is_file_backed,
             namespace: namespace.into(),
+            writer_task,
         }
     }
 
@@ -280,6 +287,31 @@ fn insert_event_with_observations(
     }
 
     Ok(())
+}
+
+/// DML-only batch append loop shared by both the legacy (flag-off) and
+/// WriterTask-routed (flag-on) `append_events` paths (ADR-067 Component A).
+///
+/// Issues no `BEGIN` / `COMMIT` / `ROLLBACK` itself — the caller owns the
+/// enclosing transaction. All-or-nothing: the first failed insert returns
+/// `Err` immediately (matching the pre-existing `append_events` contract) —
+/// the caller's transaction wrapper issues the ROLLBACK.
+fn batch_append_events_dml(
+    conn: &rusqlite::Connection,
+    events: &[Event],
+    attempted: u64,
+) -> Result<BatchWriteSummary, rusqlite::Error> {
+    let mut affected = 0u64;
+    for event in events {
+        insert_event_with_observations(conn, event)?;
+        affected += 1;
+    }
+    Ok(BatchWriteSummary {
+        attempted,
+        affected,
+        failed: 0,
+        first_error: String::new(),
+    })
 }
 
 /// Insert `event` (and any derived `event_observations` rows) through the
@@ -703,6 +735,21 @@ fn schema_absent(name: &'static str) -> rusqlite::Error {
 #[async_trait]
 impl EventStore for SqlEventStore {
     async fn append_event(&self, event: Event) -> Result<(), StorageError> {
+        // ADR-067 Component A: when the write queue is enabled, route
+        // through the pool-wide WriterTask. DML-only closure — no BEGIN
+        // IMMEDIATE/COMMIT/ROLLBACK here, since the WriterTask's run loop
+        // owns the transaction.
+        if let Some(writer_task) = &self.writer_task {
+            return writer_task
+                .send(move |conn| {
+                    insert_event_with_observations(conn, &event)
+                        .map_err(|e| map_err(e, "append_event"))
+                })
+                .await;
+        }
+
+        // Flag-off (default) path: byte-for-byte unchanged from pre-ADR-067
+        // behavior — the closure owns its own BEGIN IMMEDIATE/COMMIT/ROLLBACK.
         self.with_writer("append_event", move |conn| {
             conn.execute_batch("BEGIN IMMEDIATE")?;
             let _tx_handle = khive_storage::tx_registry::register(Some("event_append".to_string()));
@@ -719,27 +766,37 @@ impl EventStore for SqlEventStore {
     async fn append_events(&self, events: Vec<Event>) -> Result<BatchWriteSummary, StorageError> {
         let attempted = events.len() as u64;
 
+        // ADR-067 Component A: when the write queue is enabled, route
+        // through the pool-wide WriterTask. DML-only closure preserving the
+        // all-or-nothing semantics (first failed insert aborts the whole
+        // batch) — the WriterTask's run loop owns the enclosing transaction
+        // and issues the ROLLBACK on `Err`.
+        if let Some(writer_task) = &self.writer_task {
+            return writer_task
+                .send(move |conn| {
+                    batch_append_events_dml(conn, &events, attempted)
+                        .map_err(|e| map_err(e, "append_events"))
+                })
+                .await;
+        }
+
+        // Flag-off (default) path: byte-for-byte unchanged from pre-ADR-067
+        // behavior — the closure owns its own BEGIN IMMEDIATE/COMMIT/ROLLBACK.
         self.with_writer("append_events", move |conn| {
             conn.execute_batch("BEGIN IMMEDIATE")?;
             let _tx_handle =
                 khive_storage::tx_registry::register(Some("event_append_batch".to_string()));
-            let mut affected = 0u64;
 
-            for event in &events {
-                if let Err(e) = insert_event_with_observations(conn, event) {
+            let summary = match batch_append_events_dml(conn, &events, attempted) {
+                Ok(summary) => summary,
+                Err(e) => {
                     let _ = conn.execute_batch("ROLLBACK");
                     return Err(e);
                 }
-                affected += 1;
-            }
+            };
 
             conn.execute_batch("COMMIT")?;
-            Ok(BatchWriteSummary {
-                attempted,
-                affected,
-                failed: 0,
-                first_error: String::new(),
-            })
+            Ok(summary)
         })
         .await
     }

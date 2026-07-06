@@ -129,7 +129,7 @@ impl<R: Send + 'static> AnyWriteRequest for WriteRequest<R> {
 /// Sender half of the write queue. Cheaply cloneable (wraps an
 /// `mpsc::Sender`) — every migrated store that shares one writer task holds
 /// a clone of this handle.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct WriterTaskHandle {
     tx: mpsc::Sender<Box<dyn AnyWriteRequest + Send>>,
 }

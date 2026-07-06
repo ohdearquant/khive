@@ -2388,3 +2388,48 @@ async fn traverse_max_depth_over_i64max_rejected() {
         "expected InvalidInput, got {result:?}"
     );
 }
+
+/// ADR-067 Component A entry 3: with `KHIVE_WRITE_QUEUE=1`, `upsert_edges`
+/// routes through the WriterTask channel instead of the pool-mutex path, and
+/// both edges are actually committed and independently readable back.
+///
+/// `#[serial]`: mutates the process-global `KHIVE_WRITE_QUEUE` env var,
+/// shared with `pool.rs`'s own env-override tests in this same test binary.
+#[tokio::test]
+#[serial]
+async fn upsert_edges_routes_through_writer_task_when_flag_enabled() {
+    std::env::set_var("KHIVE_WRITE_QUEUE", "1");
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("write_queue_graph.db");
+    let pool_cfg = PoolConfig {
+        path: Some(path.clone()),
+        ..PoolConfig::default()
+    };
+    let pool = Arc::new(ConnectionPool::new(pool_cfg).unwrap());
+    {
+        let writer = pool.writer().unwrap();
+        writer.conn().execute_batch(GRAPH_DDL).unwrap();
+    }
+
+    let store = SqlGraphStore::new_scoped(Arc::clone(&pool), true, "default");
+    std::env::remove_var("KHIVE_WRITE_QUEUE");
+
+    let e1 = make_edge(Uuid::new_v4(), Uuid::new_v4(), EdgeRelation::Extends, 0.6);
+    let e2 = make_edge(Uuid::new_v4(), Uuid::new_v4(), EdgeRelation::Extends, 0.7);
+    let id1 = e1.id;
+    let id2 = e2.id;
+
+    let summary = store.upsert_edges(vec![e1, e2]).await.unwrap();
+    assert_eq!(summary.attempted, 2);
+    assert_eq!(summary.affected, 2);
+    assert_eq!(summary.failed, 0);
+
+    assert!(store.get_edge(id1).await.unwrap().is_some());
+    assert!(store.get_edge(id2).await.unwrap().is_some());
+    assert_eq!(
+        pool.writer_task_spawn_count(),
+        1,
+        "the flag-ON path must actually spawn and use the writer task"
+    );
+}

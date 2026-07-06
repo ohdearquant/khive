@@ -111,6 +111,22 @@ fn f32_slice_as_bytes(data: &[f32]) -> &[u8] {
     unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, std::mem::size_of_val(data)) }
 }
 
+/// Snapshot the current thread's failpoint flag (test builds only; always
+/// `None` in a release build). Exists so `insert_batch` can capture the
+/// thread-local's value once, unconditionally, before choosing between the
+/// flag-on (WriterTask) and flag-off (legacy pool-mutex) write paths —
+/// both eventually move the captured `Option` into a `spawn_blocking`
+/// closure on a different thread than the one that read the thread-local.
+#[cfg(test)]
+fn current_failpoint() -> Option<std::sync::Arc<std::sync::atomic::AtomicBool>> {
+    failpoint::CURRENT.with(|c| c.borrow().clone())
+}
+
+#[cfg(not(test))]
+fn current_failpoint() -> Option<std::sync::Arc<std::sync::atomic::AtomicBool>> {
+    None
+}
+
 fn map_err(e: rusqlite::Error, op: &'static str) -> StorageError {
     StorageError::driver(StorageCapability::Vectors, op, e)
 }
@@ -162,6 +178,7 @@ pub struct SqliteVecStore {
     dimensions: usize,
     table_name: String,
     namespace: String,
+    writer_task: Option<crate::writer_task::WriterTaskHandle>,
 }
 
 impl SqliteVecStore {
@@ -178,6 +195,10 @@ impl SqliteVecStore {
     ) -> Result<Self, SqliteError> {
         validate_model_key(&model_key)?;
         let table_name = format!("vec_{}", model_key);
+        // Best-effort opt-in (ADR-067 Component A, mirrors entity.rs slice 1
+        // policy): a missing writer task degrades to the legacy pool-mutex
+        // path rather than failing construction.
+        let writer_task = pool.writer_task_handle().ok().flatten();
         Ok(Self {
             pool,
             is_file_backed,
@@ -186,6 +207,7 @@ impl SqliteVecStore {
             dimensions,
             table_name,
             namespace,
+            writer_task,
         })
     }
 
@@ -249,6 +271,122 @@ impl SqliteVecStore {
             .map_err(|e| StorageError::driver(StorageCapability::Vectors, op, e))?
         }
     }
+}
+
+/// DML-only batch insert loop shared by both the legacy (flag-off) and
+/// WriterTask-routed (flag-on) `insert_batch` paths (ADR-067 Component A).
+///
+/// Issues no OUTER `BEGIN` / `COMMIT` / `ROLLBACK` — the caller owns the
+/// enclosing transaction. The per-record named `SAVEPOINT vec_batch_record`
+/// is preserved unchanged: it gives a failed INSERT a no-worse-than-stale
+/// rollback (only that record's DELETE is undone) independent of which
+/// outer transaction wraps the loop.
+#[allow(clippy::too_many_arguments)]
+fn batch_insert_vectors_dml(
+    conn: &rusqlite::Connection,
+    table: &str,
+    dims: usize,
+    store_embedding_model: &str,
+    records: &[VectorRecord],
+    attempted: u64,
+    _failpoint_flag: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+) -> Result<BatchWriteSummary, rusqlite::Error> {
+    let del_sql = format!(
+        "DELETE FROM {} WHERE subject_id = ?1 AND namespace = ?2",
+        table
+    );
+    let ins_sql = format!(
+        "INSERT INTO {} (subject_id, namespace, kind, field, embedding_model, embedding) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        table
+    );
+
+    let mut affected = 0u64;
+    let mut failed = 0u64;
+    let mut first_error = String::new();
+
+    for record in records {
+        if record.vectors.len() != 1 {
+            if first_error.is_empty() {
+                first_error = format!("expected 1 vector per record, got {}", record.vectors.len());
+            }
+            failed += 1;
+            continue;
+        }
+        let embedding = &record.vectors[0];
+        if embedding.len() != dims {
+            if first_error.is_empty() {
+                first_error = format!(
+                    "wrong vector dimension: expected {dims}, got {}",
+                    embedding.len()
+                );
+            }
+            failed += 1;
+            continue;
+        }
+        if non_finite_index(embedding).is_some() {
+            if first_error.is_empty() {
+                first_error = "embedding contains non-finite values (NaN or Inf)".to_string();
+            }
+            failed += 1;
+            continue;
+        }
+        let blob = f32_slice_as_bytes(embedding);
+        let id_str = record.subject_id.to_string();
+        let kind_str = record.kind.to_string();
+
+        // Wrap each record's DELETE+INSERT in a savepoint so a failed INSERT
+        // rolls back only that record's DELETE, leaving the prior vector intact
+        // (no-worse-than-stale guarantee, same as single-record `insert`).
+        conn.execute_batch("SAVEPOINT vec_batch_record")?;
+        let result = (|| {
+            conn.execute(&del_sql, rusqlite::params![&id_str, &record.namespace])?;
+            // Failpoint: fires only in cfg(test) when the guard is active.
+            // DELETE has already run; if ROLLBACK TO SAVEPOINT is missing,
+            // the deleted row is lost permanently.
+            #[cfg(test)]
+            if let Some(ref fp) = _failpoint_flag {
+                if failpoint::take(fp) {
+                    return Err(rusqlite::Error::InvalidParameterName(
+                        "__test_failpoint_after_delete__".into(),
+                    ));
+                }
+            }
+            conn.execute(
+                &ins_sql,
+                rusqlite::params![
+                    &id_str,
+                    &record.namespace,
+                    &kind_str,
+                    &record.field,
+                    &store_embedding_model,
+                    blob
+                ],
+            )?;
+            Ok::<(), rusqlite::Error>(())
+        })();
+        match result {
+            Ok(()) => {
+                conn.execute_batch("RELEASE SAVEPOINT vec_batch_record")?;
+                affected += 1;
+            }
+            Err(e) => {
+                let _ = conn.execute_batch("ROLLBACK TO SAVEPOINT vec_batch_record");
+                let _ = conn.execute_batch("RELEASE SAVEPOINT vec_batch_record");
+                if first_error.is_empty() {
+                    first_error = e.to_string();
+                }
+                failed += 1;
+            }
+        }
+    }
+
+    Ok(BatchWriteSummary {
+        attempted,
+        affected,
+        failed,
+        first_error,
+    })
 }
 
 #[async_trait]
@@ -346,114 +484,55 @@ impl VectorStore for SqliteVecStore {
         let store_embedding_model = self.embedding_model.clone();
 
         // Capture the failpoint Arc (if any) from the thread-local on the
-        // calling thread before handing the closure to spawn_blocking.
-        #[cfg(test)]
-        let _failpoint_flag = failpoint::CURRENT.with(|c| c.borrow().clone());
+        // calling thread before handing the closure to spawn_blocking — both
+        // the WriterTask path and the legacy path eventually run the closure
+        // on a different thread than the one that reads the thread-local.
+        let failpoint_flag = current_failpoint();
 
+        // ADR-067 Component A: when the write queue is enabled, route
+        // through the pool-wide WriterTask. DML-only closure (the per-record
+        // `SAVEPOINT vec_batch_record` is preserved unchanged — only the
+        // OUTER BEGIN IMMEDIATE/COMMIT is removed, since the WriterTask's
+        // run loop owns the enclosing transaction).
+        if let Some(writer_task) = &self.writer_task {
+            let table2 = table.clone();
+            let store_embedding_model2 = store_embedding_model.clone();
+            return writer_task
+                .send(move |conn| {
+                    batch_insert_vectors_dml(
+                        conn,
+                        &table2,
+                        dims,
+                        &store_embedding_model2,
+                        &records,
+                        attempted,
+                        failpoint_flag,
+                    )
+                    .map_err(|e| map_err(e, "vec_insert_batch"))
+                })
+                .await;
+        }
+
+        // Flag-off (default) path: byte-for-byte unchanged from pre-ADR-067
+        // behavior — the closure owns its own BEGIN IMMEDIATE/COMMIT.
         self.with_writer("vec_insert_batch", move |conn| {
-            let del_sql = format!(
-                "DELETE FROM {} WHERE subject_id = ?1 AND namespace = ?2",
-                table
-            );
-            let ins_sql = format!(
-                "INSERT INTO {} (subject_id, namespace, kind, field, embedding_model, embedding) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                table
-            );
-
             conn.execute_batch("BEGIN IMMEDIATE")?;
             let _tx_handle =
                 khive_storage::tx_registry::register(Some("vector_insert_batch".to_string()));
-            let mut affected = 0u64;
-            let mut failed = 0u64;
-            let mut first_error = String::new();
 
-            for record in &records {
-                if record.vectors.len() != 1 {
-                    if first_error.is_empty() {
-                        first_error =
-                            format!("expected 1 vector per record, got {}", record.vectors.len());
-                    }
-                    failed += 1;
-                    continue;
-                }
-                let embedding = &record.vectors[0];
-                if embedding.len() != dims {
-                    if first_error.is_empty() {
-                        first_error = format!(
-                            "wrong vector dimension: expected {dims}, got {}",
-                            embedding.len()
-                        );
-                    }
-                    failed += 1;
-                    continue;
-                }
-                if non_finite_index(embedding).is_some() {
-                    if first_error.is_empty() {
-                        first_error =
-                            "embedding contains non-finite values (NaN or Inf)".to_string();
-                    }
-                    failed += 1;
-                    continue;
-                }
-                let blob = f32_slice_as_bytes(embedding);
-                let id_str = record.subject_id.to_string();
-                let kind_str = record.kind.to_string();
-
-                // Wrap each record's DELETE+INSERT in a savepoint so a failed INSERT
-                // rolls back only that record's DELETE, leaving the prior vector intact
-                // (no-worse-than-stale guarantee, same as single-record `insert`).
-                conn.execute_batch("SAVEPOINT vec_batch_record")?;
-                let result = (|| {
-                    conn.execute(&del_sql, rusqlite::params![&id_str, &record.namespace])?;
-                    // Failpoint: fires only in cfg(test) when the guard is active.
-                    // DELETE has already run; if ROLLBACK TO SAVEPOINT is missing,
-                    // the deleted row is lost permanently.
-                    #[cfg(test)]
-                    if let Some(ref fp) = _failpoint_flag {
-                        if failpoint::take(fp) {
-                            return Err(rusqlite::Error::InvalidParameterName(
-                                "__test_failpoint_after_delete__".into(),
-                            ));
-                        }
-                    }
-                    conn.execute(
-                        &ins_sql,
-                        rusqlite::params![
-                            &id_str,
-                            &record.namespace,
-                            &kind_str,
-                            &record.field,
-                            &store_embedding_model,
-                            blob
-                        ],
-                    )?;
-                    Ok::<(), rusqlite::Error>(())
-                })();
-                match result {
-                    Ok(()) => {
-                        conn.execute_batch("RELEASE SAVEPOINT vec_batch_record")?;
-                        affected += 1;
-                    }
-                    Err(e) => {
-                        let _ = conn.execute_batch("ROLLBACK TO SAVEPOINT vec_batch_record");
-                        let _ = conn.execute_batch("RELEASE SAVEPOINT vec_batch_record");
-                        if first_error.is_empty() {
-                            first_error = e.to_string();
-                        }
-                        failed += 1;
-                    }
-                }
-            }
+            let summary = batch_insert_vectors_dml(
+                conn,
+                &table,
+                dims,
+                &store_embedding_model,
+                &records,
+                attempted,
+                failpoint_flag,
+            )?;
 
             conn.execute_batch("COMMIT")?;
 
-            Ok(BatchWriteSummary {
-                attempted,
-                affected,
-                failed,
-                first_error,
-            })
+            Ok(summary)
         })
         .await
     }
@@ -2904,6 +2983,123 @@ mod orphan_sweep_tests {
         assert!(
             present.contains(&id),
             "vector inserted after failed sweep must be present"
+        );
+    }
+}
+
+/// ADR-067 Component A entry 7: `insert_batch` is the sole `BEGIN
+/// IMMEDIATE`-issuing site in this store (per the ADR's own write-path
+/// inventory — `insert`/`update`/`orphan_sweep` use
+/// `conn.unchecked_transaction()`, a different mechanism, and are out of
+/// scope for this slice). Needs the real `vec0` extension loaded, so it
+/// lives behind the same `feature = "vectors"` gate as its sibling
+/// `atomic_replace_tests`/`orphan_sweep_tests` modules — `cargo test
+/// --workspace` (no `--all-features`) does not compile or run it, matching
+/// the existing convention in this file.
+#[cfg(all(test, feature = "vectors"))]
+mod write_queue_tests {
+    use std::sync::Arc;
+
+    use khive_storage::types::VectorRecord;
+    use khive_storage::VectorStore;
+    use khive_types::SubstrateKind;
+    use uuid::Uuid;
+
+    use super::*;
+    use crate::pool::{ConnectionPool, PoolConfig};
+
+    fn make_file_backed_pool(path: std::path::PathBuf) -> Arc<ConnectionPool> {
+        crate::extension::ensure_extensions_loaded();
+        Arc::new(
+            ConnectionPool::new(PoolConfig {
+                path: Some(path),
+                ..PoolConfig::default()
+            })
+            .expect("file-backed pool"),
+        )
+    }
+
+    fn create_vec_table(pool: &Arc<ConnectionPool>, model_key: &str, dims: usize) {
+        let ddl = format!(
+            "CREATE VIRTUAL TABLE IF NOT EXISTS vec_{} USING vec0(\
+             subject_id TEXT PRIMARY KEY, \
+             namespace TEXT NOT NULL, \
+             kind TEXT NOT NULL, \
+             field TEXT NOT NULL, \
+             embedding_model TEXT NOT NULL, \
+             embedding float[{}] distance_metric=cosine)",
+            model_key, dims
+        );
+        pool.writer()
+            .expect("writer")
+            .conn()
+            .execute_batch(&ddl)
+            .expect("create vec table");
+    }
+
+    /// `#[serial]`: mutates the process-global `KHIVE_WRITE_QUEUE` env var,
+    /// shared with `pool.rs`'s own env-override tests in this same test binary.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn insert_batch_routes_through_writer_task_when_flag_enabled() {
+        std::env::set_var("KHIVE_WRITE_QUEUE", "1");
+
+        let model_key = "write_queue_flag_test";
+        let dims = 4usize;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("write_queue_vectors.db");
+        let pool = make_file_backed_pool(path);
+        create_vec_table(&pool, model_key, dims);
+
+        let store = SqliteVecStore::new(
+            Arc::clone(&pool),
+            true,
+            model_key.to_string(),
+            model_key.to_string(),
+            dims,
+            "ns:test".to_string(),
+        )
+        .expect("SqliteVecStore::new");
+        std::env::remove_var("KHIVE_WRITE_QUEUE");
+
+        let id1 = Uuid::new_v4();
+        let id2 = Uuid::new_v4();
+        let records = vec![
+            VectorRecord {
+                subject_id: id1,
+                kind: SubstrateKind::Entity,
+                namespace: "ns:test".to_string(),
+                field: "body".to_string(),
+                embedding_model: None,
+                vectors: vec![vec![0.1, 0.2, 0.3, 0.4]],
+                updated_at: chrono::Utc::now(),
+            },
+            VectorRecord {
+                subject_id: id2,
+                kind: SubstrateKind::Entity,
+                namespace: "ns:test".to_string(),
+                field: "body".to_string(),
+                embedding_model: None,
+                vectors: vec![vec![0.5, 0.6, 0.7, 0.8]],
+                updated_at: chrono::Utc::now(),
+            },
+        ];
+
+        let summary = store.insert_batch(records).await.unwrap();
+        assert_eq!(summary.attempted, 2);
+        assert_eq!(summary.affected, 2);
+        assert_eq!(summary.failed, 0);
+
+        let present = store
+            .batch_exists(&[id1, id2], "ns:test")
+            .await
+            .expect("batch_exists");
+        assert!(present.contains(&id1));
+        assert!(present.contains(&id2));
+        assert_eq!(
+            pool.writer_task_spawn_count(),
+            1,
+            "the flag-ON path must actually spawn and use the writer task"
         );
     }
 }

@@ -335,17 +335,41 @@ impl KhiveRuntime {
         }
 
         let pool = self.backend().pool_arc();
+        // ADR-067 Component A: when the write queue is enabled, route this
+        // multi-statement merge through the single-writer task instead of the
+        // pool's writer mutex. Best-effort lookup mirrors every other migrated
+        // store: a lookup failure (no runtime context) degrades to the legacy
+        // mutex path rather than failing the merge outright.
+        let writer_task = pool.writer_task_handle().ok().flatten();
 
-        let (summary, updated_entity) = tokio::task::spawn_blocking(move || {
-            let guard = pool.writer()?;
-            guard.transaction(|conn| {
-                merge_entity_sql(
-                    conn, ns, fts_table, vec_tables, into_id, from_id, strategy, dry_run,
-                )
+        let (summary, updated_entity) = if let Some(writer_task) = writer_task {
+            writer_task
+                .send(move |conn| {
+                    merge_entity_sql(
+                        conn, ns, fts_table, vec_tables, into_id, from_id, strategy, dry_run,
+                    )
+                    .map_err(|e| {
+                        khive_storage::StorageError::driver(
+                            khive_storage::StorageCapability::Entities,
+                            "merge_entity",
+                            e,
+                        )
+                    })
+                })
+                .await
+                .map_err(RuntimeError::Storage)?
+        } else {
+            tokio::task::spawn_blocking(move || {
+                let guard = pool.writer()?;
+                guard.transaction(|conn| {
+                    merge_entity_sql(
+                        conn, ns, fts_table, vec_tables, into_id, from_id, strategy, dry_run,
+                    )
+                })
             })
-        })
-        .await
-        .map_err(|e| RuntimeError::Internal(e.to_string()))??;
+            .await
+            .map_err(|e| RuntimeError::Internal(e.to_string()))??
+        };
 
         // If vectors are configured, reindex into_entity (requires async embedding).
         // FTS and vec-deletes for all registered models were already committed inside
@@ -657,24 +681,53 @@ impl KhiveRuntime {
         }
 
         let pool = self.backend().pool_arc();
-        let (summary, updated_note) = tokio::task::spawn_blocking(move || {
-            let guard = pool.writer()?;
-            guard.transaction(|conn| {
-                merge_note_sql(
-                    conn,
-                    ns,
-                    fts_table,
-                    vec_tables,
-                    into_id,
-                    from_id,
-                    strategy,
-                    content_strategy,
-                    dry_run,
-                )
+        // ADR-067 Component A: same writer-task routing as merge_entity above.
+        let writer_task = pool.writer_task_handle().ok().flatten();
+
+        let (summary, updated_note) = if let Some(writer_task) = writer_task {
+            writer_task
+                .send(move |conn| {
+                    merge_note_sql(
+                        conn,
+                        ns,
+                        fts_table,
+                        vec_tables,
+                        into_id,
+                        from_id,
+                        strategy,
+                        content_strategy,
+                        dry_run,
+                    )
+                    .map_err(|e| {
+                        khive_storage::StorageError::driver(
+                            khive_storage::StorageCapability::Notes,
+                            "merge_note",
+                            e,
+                        )
+                    })
+                })
+                .await
+                .map_err(RuntimeError::Storage)?
+        } else {
+            tokio::task::spawn_blocking(move || {
+                let guard = pool.writer()?;
+                guard.transaction(|conn| {
+                    merge_note_sql(
+                        conn,
+                        ns,
+                        fts_table,
+                        vec_tables,
+                        into_id,
+                        from_id,
+                        strategy,
+                        content_strategy,
+                        dry_run,
+                    )
+                })
             })
-        })
-        .await
-        .map_err(|e| RuntimeError::Internal(e.to_string()))??;
+            .await
+            .map_err(|e| RuntimeError::Internal(e.to_string()))??
+        };
 
         if !dry_run && !self.registered_embedding_model_names().is_empty() {
             self.reindex_note(token, &updated_note).await?;

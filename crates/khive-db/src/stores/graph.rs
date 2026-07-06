@@ -19,6 +19,7 @@ use khive_types::EdgeRelation;
 
 use crate::error::SqliteError;
 use crate::pool::ConnectionPool;
+use crate::writer_task::WriterTaskHandle;
 
 /// Map a rusqlite error to `StorageError` with `Graph` capability.
 fn map_err(e: rusqlite::Error, op: &'static str) -> StorageError {
@@ -37,6 +38,7 @@ pub struct SqlGraphStore {
     /// WHERE filter on `query_edges`/`neighbors`/`traverse`, never as an
     /// enforcement gate on by-ID operations).
     namespace: String,
+    writer_task: Option<WriterTaskHandle>,
 }
 
 impl SqlGraphStore {
@@ -52,10 +54,16 @@ impl SqlGraphStore {
         is_file_backed: bool,
         namespace: impl Into<String>,
     ) -> Self {
+        // Best-effort opt-in (ADR-067 Component A, mirrors entity.rs slice 1
+        // policy): a missing writer task degrades to the legacy pool-mutex /
+        // standalone-connection path rather than failing construction.
+        let writer_task = pool.writer_task_handle().ok().flatten();
+
         Self {
             pool,
             is_file_backed,
             namespace: namespace.into(),
+            writer_task,
         }
     }
 
@@ -369,6 +377,80 @@ fn canonical_edge_endpoints(
     }
 }
 
+/// DML-only batch upsert loop shared by both the legacy (flag-off) and
+/// WriterTask-routed (flag-on) `upsert_edges` paths (ADR-067 Component A).
+///
+/// Issues no `BEGIN` / `COMMIT` / `ROLLBACK` itself — the caller owns the
+/// enclosing transaction. All-or-nothing: the first row failure returns
+/// `Err` immediately (matching the pre-existing `upsert_edges` contract,
+/// unlike `upsert_entities`/`upsert_notes`'s partial-success accounting) —
+/// the caller's transaction wrapper (either the legacy `with_writer` closure
+/// or `WriteRequest::execute_and_reply`) issues the ROLLBACK.
+fn batch_upsert_edges(
+    conn: &rusqlite::Connection,
+    edges: &[Edge],
+    attempted: u64,
+) -> Result<BatchWriteSummary, rusqlite::Error> {
+    let mut affected = 0u64;
+
+    for edge in edges {
+        let id_str = Uuid::from(edge.id).to_string();
+        let (canon_src, canon_tgt) =
+            canonical_edge_endpoints(edge.relation, edge.source_id, edge.target_id);
+        let src_str = canon_src.to_string();
+        let tgt_str = canon_tgt.to_string();
+        let relation_str = edge.relation.to_string();
+        let metadata_str = edge
+            .metadata
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+        conn.execute(
+            "INSERT INTO graph_edges \
+             (namespace, id, source_id, target_id, relation, weight, \
+              created_at, updated_at, deleted_at, metadata, target_backend) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11) \
+             ON CONFLICT(namespace, id) DO UPDATE SET \
+                 source_id = excluded.source_id, \
+                 target_id = excluded.target_id, \
+                 relation = excluded.relation, \
+                 weight = excluded.weight, \
+                 updated_at = excluded.updated_at, \
+                 deleted_at = NULL, \
+                 metadata = excluded.metadata, \
+                 target_backend = excluded.target_backend \
+             ON CONFLICT(namespace, source_id, target_id, relation) DO UPDATE SET \
+                 weight = excluded.weight, \
+                 updated_at = excluded.updated_at, \
+                 deleted_at = NULL, \
+                 metadata = excluded.metadata, \
+                 target_backend = excluded.target_backend",
+            rusqlite::params![
+                edge.namespace.as_str(),
+                id_str,
+                src_str,
+                tgt_str,
+                relation_str,
+                edge.weight,
+                edge.created_at.timestamp_micros(),
+                edge.updated_at.timestamp_micros(),
+                edge.deleted_at.map(|t| t.timestamp_micros()),
+                metadata_str,
+                edge.target_backend.as_deref(),
+            ],
+        )?;
+        affected += 1;
+    }
+
+    Ok(BatchWriteSummary {
+        attempted,
+        affected,
+        failed: 0,
+        first_error: String::new(),
+    })
+}
+
 #[async_trait]
 impl GraphStore for SqlGraphStore {
     async fn upsert_edge(&self, edge: Edge) -> Result<(), StorageError> {
@@ -428,75 +510,41 @@ impl GraphStore for SqlGraphStore {
     async fn upsert_edges(&self, edges: Vec<Edge>) -> Result<BatchWriteSummary, StorageError> {
         let attempted = edges.len() as u64;
 
+        // ADR-067 Component A: when the write queue is enabled, route
+        // through the pool-wide WriterTask. DML-only closure — no BEGIN
+        // IMMEDIATE/COMMIT/ROLLBACK here, since the WriterTask's run loop
+        // owns the transaction (a bare BEGIN IMMEDIATE here would violate
+        // SQLite's nested-transaction rule).
+        if let Some(writer_task) = &self.writer_task {
+            return writer_task
+                .send(move |conn| {
+                    batch_upsert_edges(conn, &edges, attempted)
+                        .map_err(|e| map_err(e, "upsert_edges"))
+                })
+                .await;
+        }
+
+        // Flag-off (default) path: byte-for-byte unchanged from pre-ADR-067
+        // behavior — the closure owns its own BEGIN IMMEDIATE/COMMIT/ROLLBACK
+        // via the pool-mutex/standalone writer.
         self.with_writer("upsert_edges", move |conn| {
             conn.execute_batch("BEGIN IMMEDIATE")?;
             let _tx_handle =
                 khive_storage::tx_registry::register(Some("graph_upsert_edges".to_string()));
-            let mut affected = 0u64;
 
-            for edge in &edges {
-                let id_str = Uuid::from(edge.id).to_string();
-                let (canon_src, canon_tgt) =
-                    canonical_edge_endpoints(edge.relation, edge.source_id, edge.target_id);
-                let src_str = canon_src.to_string();
-                let tgt_str = canon_tgt.to_string();
-                let relation_str = edge.relation.to_string();
-                let metadata_str = edge
-                    .metadata
-                    .as_ref()
-                    .map(serde_json::to_string)
-                    .transpose()
-                    .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
-                if let Err(e) = conn.execute(
-                    "INSERT INTO graph_edges \
-                     (namespace, id, source_id, target_id, relation, weight, \
-                      created_at, updated_at, deleted_at, metadata, target_backend) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11) \
-                     ON CONFLICT(namespace, id) DO UPDATE SET \
-                         source_id = excluded.source_id, \
-                         target_id = excluded.target_id, \
-                         relation = excluded.relation, \
-                         weight = excluded.weight, \
-                         updated_at = excluded.updated_at, \
-                         deleted_at = NULL, \
-                         metadata = excluded.metadata, \
-                         target_backend = excluded.target_backend \
-                     ON CONFLICT(namespace, source_id, target_id, relation) DO UPDATE SET \
-                         weight = excluded.weight, \
-                         updated_at = excluded.updated_at, \
-                         deleted_at = NULL, \
-                         metadata = excluded.metadata, \
-                         target_backend = excluded.target_backend",
-                    rusqlite::params![
-                        edge.namespace.as_str(),
-                        id_str,
-                        src_str,
-                        tgt_str,
-                        relation_str,
-                        edge.weight,
-                        edge.created_at.timestamp_micros(),
-                        edge.updated_at.timestamp_micros(),
-                        edge.deleted_at.map(|t| t.timestamp_micros()),
-                        metadata_str,
-                        edge.target_backend.as_deref(),
-                    ],
-                ) {
+            let summary = match batch_upsert_edges(conn, &edges, attempted) {
+                Ok(summary) => summary,
+                Err(e) => {
                     let _ = conn.execute_batch("ROLLBACK");
                     return Err(e);
                 }
-                affected += 1;
-            }
+            };
 
             if let Err(e) = conn.execute_batch("COMMIT") {
                 let _ = conn.execute_batch("ROLLBACK");
                 return Err(e);
             }
-            Ok(BatchWriteSummary {
-                attempted,
-                affected,
-                failed: 0,
-                first_error: String::new(),
-            })
+            Ok(summary)
         })
         .await
     }

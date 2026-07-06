@@ -626,3 +626,173 @@ async fn multiple_stores_over_one_pool_share_a_single_writer_task() {
          per store"
     );
 }
+
+/// Full-slice single-writer guarantee (ADR-067 Component A, Fork C slice 2):
+/// with every MIGRATE-listed write path routed through the writer task, drive
+/// CONCURRENT writes across entity, note, and graph stores (entries 2/3/6 —
+/// er, 1/2/3) plus `SqlBridge`'s unmigrated `writer()` (entry 8, still routes
+/// its self-contained `execute_batch` through the task per entry 10) and
+/// `begin_tx()` (entry 9, a genuine design fork — stays on its own standalone
+/// connection) over ONE pool. Asserts exactly one writer task is ever spawned
+/// and every write actually lands, proving the migrated paths and the two
+/// design-fork paths coexist over a single DB file without contending at
+/// `BEGIN IMMEDIATE` or racing the writer task's own spawn-once guarantee.
+///
+/// `#[serial]`: mutates the process-global `KHIVE_WRITE_QUEUE` env var.
+#[tokio::test]
+#[serial]
+async fn concurrent_writes_across_all_migrated_stores_share_one_writer_task() {
+    use crate::stores::graph::SqlGraphStore;
+    use crate::stores::note::SqlNoteStore;
+    use khive_storage::note::Note;
+    use khive_storage::types::{Edge, SqlStatement, SqlTxOptions, SqlValue};
+    use khive_storage::{GraphStore as _, NoteStore as _, SqlAccess as _};
+    use khive_types::EdgeRelation;
+
+    std::env::set_var("KHIVE_WRITE_QUEUE", "1");
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("write_queue_all_paths_shared_writer.db");
+    let pool_cfg = PoolConfig {
+        path: Some(path.clone()),
+        ..PoolConfig::default()
+    };
+    let pool = Arc::new(ConnectionPool::new(pool_cfg).unwrap());
+    {
+        let writer = pool.writer().unwrap();
+        writer.conn().execute_batch(ENTITIES_DDL).unwrap();
+        crate::stores::note::ensure_notes_schema(writer.conn()).unwrap();
+        crate::stores::graph::ensure_graph_schema(writer.conn()).unwrap();
+    }
+
+    std::env::remove_var("KHIVE_WRITE_QUEUE");
+
+    let entity_store = Arc::new(SqlEntityStore::new(Arc::clone(&pool), true));
+    let note_store = Arc::new(SqlNoteStore::new(Arc::clone(&pool), true));
+    let graph_store = Arc::new(SqlGraphStore::new_scoped(
+        Arc::clone(&pool),
+        true,
+        "default",
+    ));
+    let bridge = crate::sql_bridge::SqlBridge::new(Arc::clone(&pool), true);
+
+    assert_eq!(
+        pool.writer_task_spawn_count(),
+        1,
+        "entity + note + graph stores plus SqlBridge over one pool must still \
+         share exactly one writer task"
+    );
+
+    let entity = make_entity("default", "concept", "WriterTaskConcurrency");
+    let entity_id = entity.id;
+
+    let note = Note::new("default", "observation", "concurrent writer task note");
+    let note_id = note.id;
+
+    let edge_src = Uuid::new_v4();
+    let edge_tgt = Uuid::new_v4();
+    let now = chrono::Utc::now();
+    let edge = Edge {
+        id: Uuid::new_v4().into(),
+        namespace: "default".to_string(),
+        source_id: edge_src,
+        target_id: edge_tgt,
+        relation: EdgeRelation::Extends,
+        weight: 0.9,
+        created_at: now,
+        updated_at: now,
+        deleted_at: None,
+        metadata: None,
+        target_backend: None,
+    };
+    let edge_id = edge.id;
+
+    // Entry 10 (SqliteWriter::execute_batch, migrated): a raw INSERT issued
+    // through SqlBridge's file-backed writer() handle.
+    let batch_row_id = Uuid::new_v4();
+    let batch_src = Uuid::new_v4();
+    let batch_tgt = Uuid::new_v4();
+    let now_micros = chrono::Utc::now().timestamp_micros();
+    let insert_stmt = SqlStatement {
+        sql: "INSERT INTO graph_edges (namespace, id, source_id, target_id, relation, \
+              weight, created_at, updated_at, deleted_at, metadata, target_backend) \
+              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL, NULL, NULL)"
+            .to_string(),
+        params: vec![
+            SqlValue::Text("default".to_string()),
+            SqlValue::Text(batch_row_id.to_string()),
+            SqlValue::Text(batch_src.to_string()),
+            SqlValue::Text(batch_tgt.to_string()),
+            SqlValue::Text("extends".to_string()),
+            SqlValue::Float(0.5),
+            SqlValue::Integer(now_micros),
+            SqlValue::Integer(now_micros),
+        ],
+        label: Some("test_execute_batch".to_string()),
+    };
+
+    // Entry 9 (SqlBridge::begin_tx, design fork, unmigrated): its own
+    // standalone connection, running concurrently with the writer task.
+    let tx_row_id = Uuid::new_v4();
+    let tx_src = Uuid::new_v4();
+    let tx_tgt = Uuid::new_v4();
+    let tx_insert_stmt = SqlStatement {
+        sql: "INSERT INTO graph_edges (namespace, id, source_id, target_id, relation, \
+              weight, created_at, updated_at, deleted_at, metadata, target_backend) \
+              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL, NULL, NULL)"
+            .to_string(),
+        params: vec![
+            SqlValue::Text("default".to_string()),
+            SqlValue::Text(tx_row_id.to_string()),
+            SqlValue::Text(tx_src.to_string()),
+            SqlValue::Text(tx_tgt.to_string()),
+            SqlValue::Text("extends".to_string()),
+            SqlValue::Float(0.7),
+            SqlValue::Integer(now_micros),
+            SqlValue::Integer(now_micros),
+        ],
+        label: Some("test_begin_tx".to_string()),
+    };
+
+    let entity_fut = {
+        let entity_store = Arc::clone(&entity_store);
+        async move { entity_store.upsert_entity(entity).await }
+    };
+    let note_fut = {
+        let note_store = Arc::clone(&note_store);
+        async move { note_store.upsert_note(note).await }
+    };
+    let edge_fut = {
+        let graph_store = Arc::clone(&graph_store);
+        async move { graph_store.upsert_edge(edge).await }
+    };
+    let batch_fut = async {
+        let mut writer = bridge.writer().await.unwrap();
+        writer.execute_batch(vec![insert_stmt]).await
+    };
+    let tx_fut = async {
+        let mut tx = bridge.begin_tx(SqlTxOptions::default()).await.unwrap();
+        tx.execute(tx_insert_stmt).await?;
+        tx.commit().await
+    };
+
+    let (entity_res, note_res, edge_res, batch_res, tx_res) =
+        tokio::join!(entity_fut, note_fut, edge_fut, batch_fut, tx_fut);
+
+    entity_res.unwrap();
+    note_res.unwrap();
+    edge_res.unwrap();
+    batch_res.unwrap();
+    tx_res.unwrap();
+
+    assert!(entity_store.get_entity(entity_id).await.unwrap().is_some());
+    assert!(note_store.get_note(note_id).await.unwrap().is_some());
+    assert!(graph_store.get_edge(edge_id).await.unwrap().is_some());
+
+    assert_eq!(
+        pool.writer_task_spawn_count(),
+        1,
+        "concurrent writes across every migrated path plus both design-fork \
+         paths must not trigger a second writer task spawn"
+    );
+}

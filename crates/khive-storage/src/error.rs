@@ -94,6 +94,20 @@ pub enum StorageError {
     /// sending a result.
     #[error("internal storage error: {0}")]
     Internal(String),
+
+    /// `KHIVE_WRITE_QUEUE=1` is set but the calling thread has no Tokio
+    /// runtime context, so the writer task (which spawns via `tokio::spawn`)
+    /// cannot be started (ADR-067 Component A).
+    ///
+    /// Returned instead of panicking: a caller that constructs a store from
+    /// a plain, non-async context with the flag on gets a clean, typed
+    /// failure at first write rather than a `tokio::spawn`-outside-runtime
+    /// panic. Flag-off callers never see this variant — `writer_task_handle`
+    /// only attempts to spawn when `PoolConfig::write_queue_enabled` is set.
+    #[error(
+        "KHIVE_WRITE_QUEUE=1 but no Tokio runtime context is available to spawn the writer task"
+    )]
+    WriterTaskNoRuntime,
 }
 
 impl StorageError {
@@ -125,7 +139,8 @@ impl StorageError {
             | Self::Timeout { .. }
             | Self::Transaction { .. }
             | Self::WriteQueueFull { .. }
-            | Self::Internal(..) => None,
+            | Self::Internal(..)
+            | Self::WriterTaskNoRuntime => None,
         }
     }
 

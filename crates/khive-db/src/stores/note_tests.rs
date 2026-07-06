@@ -416,3 +416,48 @@ async fn page_offset_over_i64max_rejected() {
         "query_notes_filtered: expected InvalidInput, got {filtered_result:?}"
     );
 }
+
+/// ADR-067 Component A entry 2: with `KHIVE_WRITE_QUEUE=1`, `upsert_notes`
+/// routes through the WriterTask channel instead of the pool-mutex path, and
+/// both rows are actually committed and independently readable back.
+///
+/// `#[serial]`: mutates the process-global `KHIVE_WRITE_QUEUE` env var,
+/// shared with `pool.rs`'s own env-override tests in this same test binary.
+#[tokio::test]
+#[serial_test::serial]
+async fn upsert_notes_routes_through_writer_task_when_flag_enabled() {
+    std::env::set_var("KHIVE_WRITE_QUEUE", "1");
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("write_queue_notes.db");
+    let pool_cfg = PoolConfig {
+        path: Some(path.clone()),
+        ..PoolConfig::default()
+    };
+    let pool = Arc::new(ConnectionPool::new(pool_cfg).unwrap());
+    {
+        let writer = pool.writer().unwrap();
+        writer.conn().execute_batch(NOTES_DDL).unwrap();
+    }
+
+    let store = SqlNoteStore::new(Arc::clone(&pool), true);
+    std::env::remove_var("KHIVE_WRITE_QUEUE");
+
+    let n1 = make_note("default", "observation", "first");
+    let n2 = make_note("default", "observation", "second");
+    let id1 = n1.id;
+    let id2 = n2.id;
+
+    let summary = store.upsert_notes(vec![n1, n2]).await.unwrap();
+    assert_eq!(summary.attempted, 2);
+    assert_eq!(summary.affected, 2);
+    assert_eq!(summary.failed, 0);
+
+    assert!(store.get_note(id1).await.unwrap().is_some());
+    assert!(store.get_note(id2).await.unwrap().is_some());
+    assert_eq!(
+        pool.writer_task_spawn_count(),
+        1,
+        "the flag-ON path must actually spawn and use the writer task"
+    );
+}
