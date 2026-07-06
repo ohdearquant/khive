@@ -31,7 +31,9 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use clap::Parser;
 
-use khive_mcp::serve::{apply_env_output_format, enforce_strict_actor_mode};
+use khive_mcp::serve::{
+    apply_env_output_format, enforce_strict_actor_mode, resolve_runtime_config, RuntimeConfigInputs,
+};
 #[cfg(unix)]
 use khive_mcp::server::compute_config_id;
 use khive_mcp::server::KhiveMcpServer;
@@ -65,7 +67,6 @@ fn forward_or_spawn_boxed(frame: &DaemonRequestFrame) -> ForwardFuture<'_> {
     Box::pin(khive_mcp::daemon::forward_or_spawn(frame))
 }
 
-use crate::dbpath::resolve_db_override;
 use crate::pending_events;
 
 // `khive-request` is not a direct kkernel dependency.  We use serde_json to
@@ -351,12 +352,41 @@ pub async fn run_exec(args: ExecArgs) -> Result<()> {
         (None, Some(path)) => ExecMode::OpsFile(path.clone()),
     };
 
-    let mut cfg = RuntimeConfig::default();
-    if let Some(db_path) = resolve_db_override(args.db.as_deref()) {
-        cfg.db_path = db_path;
-    }
-    cfg.default_namespace =
-        Namespace::parse(&args.namespace).map_err(|e| anyhow::anyhow!("{e}"))?;
+    // Resolve through the SAME TOML-aware path `kkernel mcp` and `kkernel reindex`
+    // use (`resolve_runtime_config`), so `kkernel exec`'s config_id and actor
+    // identity agree with the daemon's. Previously this built `cfg` from
+    // `RuntimeConfig::default()` (env-only) plus an env-only db override and
+    // never called `KhiveConfig::load_with_home_fallback` at all, so a project's
+    // tier-3 `.khive/config.toml` (`[actor] id`, `[[engines]]`) was invisible to
+    // `kkernel exec`. That drift made `compute_config_id(&cfg, None)` diverge
+    // from the daemon's TOML-resolved fingerprint, so the daemon rejected the
+    // forwarded frame as a `ConfigMismatch` and `exec` silently fell back to an
+    // in-process, TOML-blind, effectively-anonymous dispatch (issue #581).
+    let namespace = Namespace::parse(&args.namespace).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let cfg = resolve_runtime_config(RuntimeConfigInputs {
+        db: args.db.as_deref(),
+        config: None, // `kkernel exec` has no `--config` flag today
+        namespace,
+        // `--namespace` has a clap `default_value = "local"`, so it is always
+        // present — there is no way to distinguish "operator typed --namespace
+        // local" from "operator didn't pass --namespace at all". `true` is the
+        // conservative, behavior-preserving choice: it keeps exec's pre-existing
+        // semantics (the CLI/default value always becomes `default_namespace`,
+        // matching what `resolve_runtime_config`'s embed path already did
+        // unconditionally). It is also empirically inert for config_id parity:
+        // in the embed path (`no_embed: false`, exec's only mode), this flag
+        // gates only the actor_id fill-when-None guard in `resolve_runtime_config`
+        // — and `compute_config_id` never reads `actor_id` (namespace is
+        // "carried separately" per its own doc comment). See the
+        // `namespace_explicit_changes_actor_id_fill_but_not_config_id` and
+        // `exec_config_id_matches_serve_config_id_for_project_toml_actor` tests
+        // below, which construct both arms and assert this directly rather than
+        // assuming it.
+        namespace_explicit: true,
+        no_embed: false,
+        packs: None,
+        brain_profile: None,
+    })?;
 
     match mode {
         ExecMode::Inline(ops) => {
@@ -654,6 +684,178 @@ mod tests {
         };
         let rt = KhiveRuntime::new(cfg).expect("runtime on temp db");
         KhiveMcpServer::new(rt).expect("server on temp db")
+    }
+
+    // ── exec-path / serve-path config_id parity (#581) ────────────────────────
+    //
+    // `run_exec`'s cfg construction (above) and `kkernel mcp`'s `build_server`
+    // both call `resolve_runtime_config`. These tests prove the two call shapes
+    // agree on `compute_config_id` for the same database — the acceptance gate
+    // for the #581 fix — and settle the `namespace_explicit` design question
+    // empirically rather than by convention.
+
+    /// Direct regression guard for #581: a project's tier-3 `.khive/config.toml`
+    /// `[actor] id` must be visible to `kkernel exec` exactly as it is to
+    /// `kkernel mcp`, and the two paths' `config_id` must be byte-identical so
+    /// the daemon accepts exec's forwarded frame instead of rejecting it as a
+    /// `ConfigMismatch` (which silently falls back to an anonymous in-process
+    /// dispatch — the reported symptom: `comm.inbox` returning `count=0`).
+    #[test]
+    #[serial]
+    fn exec_config_id_matches_serve_config_id_for_project_toml_actor() {
+        std::env::remove_var("KHIVE_EMBEDDING_MODEL");
+        std::env::remove_var("KHIVE_ADDITIONAL_EMBEDDING_MODELS");
+        std::env::remove_var("KHIVE_ACTOR");
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let khive_dir = dir.path().join(".khive");
+        std::fs::create_dir_all(&khive_dir).expect("mkdir .khive");
+        std::fs::write(
+            khive_dir.join("config.toml"),
+            r#"
+[actor]
+id = "lambda:test-actor"
+
+[[engines]]
+name = "primary"
+model = "bge-small-en-v1.5"
+default = true
+"#,
+        )
+        .expect("write config.toml");
+
+        // A db path anchored INSIDE the same `.khive` dir — this is what makes
+        // tier-3 discovery agree between a client and a daemon serving the same
+        // database, regardless of process cwd (see `project_config_anchor_dir`).
+        let db_path = khive_dir.join("exec-parity-test.db");
+        let db_str = db_path.to_str().expect("utf8 path").to_string();
+
+        let ns = Namespace::parse("local").expect("ns");
+
+        // exec-shaped inputs: `config: None` (kkernel exec has no `--config`
+        // flag today), `namespace_explicit: true` (the choice made in `run_exec`
+        // above).
+        let exec_cfg = resolve_runtime_config(RuntimeConfigInputs {
+            db: Some(&db_str),
+            config: None,
+            namespace: ns.clone(),
+            namespace_explicit: true,
+            no_embed: false,
+            packs: None,
+            brain_profile: None,
+        })
+        .expect("resolve exec-shaped config");
+
+        // serve-shaped inputs: mirrors `build_server` when the operator starts
+        // `kkernel mcp --daemon` with no explicit --actor/--namespace flag,
+        // relying on the config file's `[actor] id` — the common daemon-startup
+        // shape (`resolve_cli_namespace` returns `explicit=false` in that case).
+        let serve_cfg = resolve_runtime_config(RuntimeConfigInputs {
+            db: Some(&db_str),
+            config: None,
+            namespace: ns,
+            namespace_explicit: false,
+            no_embed: false,
+            packs: None,
+            brain_profile: None,
+        })
+        .expect("resolve serve-shaped config");
+
+        // The TOML must actually have reached both constructions — the direct
+        // regression proxy for #581, verified without a live daemon socket.
+        assert_eq!(exec_cfg.actor_id.as_deref(), Some("lambda:test-actor"));
+        assert_eq!(serve_cfg.actor_id.as_deref(), Some("lambda:test-actor"));
+        assert!(
+            exec_cfg
+                .visible_namespaces
+                .contains(&Namespace::parse("lambda:test-actor").expect("ns")),
+            "actor.id must fold into visible_namespaces (ADR-007 Rev 4 Rule 3b)"
+        );
+        assert!(
+            exec_cfg.embedding_model.is_some(),
+            "config-file [[engines]] must resolve an embedding model, not env/default"
+        );
+        assert_eq!(
+            format!("{:?}", exec_cfg.embedding_model),
+            format!("{:?}", serve_cfg.embedding_model),
+        );
+
+        // The acceptance gate: byte-identical config_id, so the daemon accepts
+        // exec's forwarded frame instead of rejecting it as a ConfigMismatch.
+        assert_eq!(
+            compute_config_id(&exec_cfg, None),
+            compute_config_id(&serve_cfg, None),
+            "exec-path config_id must match the serve/daemon-path config_id for the same db"
+        );
+    }
+
+    /// Settles the `namespace_explicit` design question by constructing both
+    /// arms and comparing `compute_config_id` directly, per the decision
+    /// criterion: does either arm break config_id parity with the daemon?
+    ///
+    /// No `[actor] id` is present (an explicit nonexistent config path makes
+    /// this fully deterministic — no dependency on cwd or `$HOME`), and the
+    /// namespace is a non-"local" value so the actor_id fill-when-None guard in
+    /// `resolve_runtime_config` (the ONLY place `namespace_explicit` has any
+    /// effect in the embed path, i.e. `no_embed: false`, which `kkernel exec`
+    /// always uses) actually fires for one arm and not the other.
+    #[test]
+    #[serial]
+    fn namespace_explicit_changes_actor_id_fill_but_not_config_id() {
+        std::env::remove_var("KHIVE_EMBEDDING_MODEL");
+        std::env::remove_var("KHIVE_ADDITIONAL_EMBEDDING_MODELS");
+        std::env::remove_var("KHIVE_ACTOR");
+
+        let missing_config =
+            std::path::PathBuf::from("/nonexistent/khive-exec-parity-test/config.toml");
+        let ns = Namespace::parse("lambda:custom-ns").expect("ns");
+
+        let with_explicit_true = resolve_runtime_config(RuntimeConfigInputs {
+            db: Some(":memory:"),
+            config: Some(&missing_config),
+            namespace: ns.clone(),
+            namespace_explicit: true,
+            no_embed: false,
+            packs: None,
+            brain_profile: None,
+        })
+        .expect("resolve with namespace_explicit=true");
+
+        let with_explicit_false = resolve_runtime_config(RuntimeConfigInputs {
+            db: Some(":memory:"),
+            config: Some(&missing_config),
+            namespace: ns,
+            namespace_explicit: false,
+            no_embed: false,
+            packs: None,
+            brain_profile: None,
+        })
+        .expect("resolve with namespace_explicit=false");
+
+        // The fill-when-None guard DOES fire differently between the two arms...
+        assert_eq!(
+            with_explicit_true.actor_id.as_deref(),
+            Some("lambda:custom-ns"),
+            "namespace_explicit=true + non-local namespace + no config actor.id \
+             must fill actor_id from the namespace (ADR-057)"
+        );
+        assert_eq!(
+            with_explicit_false.actor_id, None,
+            "namespace_explicit=false must NOT fill actor_id"
+        );
+
+        // ...but `compute_config_id` never reads `actor_id` (namespace is
+        // "carried separately" per its own doc comment), so the two configs —
+        // which differ ONLY in actor_id — must still produce a byte-identical
+        // fingerprint. This is the empirical basis for `run_exec` picking
+        // `namespace_explicit: true`: it is the conservative, behavior-
+        // preserving choice, and it provably does not affect config_id parity
+        // with the daemon either way.
+        assert_eq!(
+            compute_config_id(&with_explicit_true, None),
+            compute_config_id(&with_explicit_false, None),
+            "namespace_explicit must not affect the daemon-forwarded config_id"
+        );
     }
 
     // ── parse_ops_file tests ───────────────────────────────────────────────────

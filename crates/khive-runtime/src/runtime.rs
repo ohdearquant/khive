@@ -857,6 +857,7 @@ impl KhiveRuntime {
 mod tests {
     use super::*;
     use khive_gate::GateRef;
+    use serial_test::serial;
 
     #[test]
     fn memory_runtime_creates_successfully() {
@@ -1209,6 +1210,112 @@ mod tests {
              writes pin to local; engine config is still applied"
         );
         assert!(result.embedding_model.is_some());
+    }
+
+    // ---- base.actor_id (env-resolved actor) preservation tests ----
+    //
+    // Regression coverage: a project config found without an `[actor] id` used
+    // to silently drop `base.actor_id` (e.g. the value `RuntimeConfig::default()`
+    // read from `KHIVE_ACTOR`) because both return arms spread an unconditional
+    // `actor_id: None` over `..base`. The fix falls back to `base.actor_id`
+    // when the TOML supplies no `[actor] id`, in both arms.
+
+    #[test]
+    #[serial]
+    fn runtime_config_from_khive_config_engines_present_preserves_env_actor_when_toml_has_none() {
+        let prior = std::env::var("KHIVE_ACTOR").ok();
+        // SAFETY: test is #[serial]; no other test in this crate reads/writes KHIVE_ACTOR.
+        unsafe {
+            std::env::set_var("KHIVE_ACTOR", "lambda:test-env-actor");
+        }
+        let base = RuntimeConfig::default();
+        assert_eq!(base.actor_id.as_deref(), Some("lambda:test-env-actor"));
+
+        let cfg = KhiveConfig {
+            engines: vec![crate::engine_config::EngineConfig {
+                name: "default".to_string(),
+                model: "all-minilm-l6-v2".to_string(),
+                default: true,
+                fusion_weight: None,
+                dims: None,
+            }],
+            actor: ActorConfig::default(), // no [actor] id
+            ..KhiveConfig::default()
+        };
+        let result = runtime_config_from_khive_config(&cfg, base);
+        assert_eq!(
+            result.actor_id.as_deref(),
+            Some("lambda:test-env-actor"),
+            "engines-present arm must preserve base.actor_id (env actor) when TOML has no [actor] id"
+        );
+
+        // SAFETY: restores prior KHIVE_ACTOR value (test cleanup).
+        unsafe {
+            match prior {
+                Some(v) => std::env::set_var("KHIVE_ACTOR", v),
+                None => std::env::remove_var("KHIVE_ACTOR"),
+            }
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn runtime_config_from_khive_config_engines_empty_preserves_env_actor_when_toml_has_none() {
+        let prior = std::env::var("KHIVE_ACTOR").ok();
+        // SAFETY: test is #[serial]; no other test in this crate reads/writes KHIVE_ACTOR.
+        unsafe {
+            std::env::set_var("KHIVE_ACTOR", "lambda:test-env-actor");
+        }
+        let base = RuntimeConfig::default();
+        assert_eq!(base.actor_id.as_deref(), Some("lambda:test-env-actor"));
+
+        let cfg = KhiveConfig {
+            engines: vec![],
+            actor: ActorConfig::default(), // no [actor] id
+            ..KhiveConfig::default()
+        };
+        let result = runtime_config_from_khive_config(&cfg, base);
+        assert_eq!(
+            result.actor_id.as_deref(),
+            Some("lambda:test-env-actor"),
+            "engines-empty early-return arm must preserve base.actor_id (env actor) when TOML has no [actor] id"
+        );
+
+        // SAFETY: restores prior KHIVE_ACTOR value (test cleanup).
+        unsafe {
+            match prior {
+                Some(v) => std::env::set_var("KHIVE_ACTOR", v),
+                None => std::env::remove_var("KHIVE_ACTOR"),
+            }
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn runtime_config_from_khive_config_toml_actor_wins_over_env_actor() {
+        let prior = std::env::var("KHIVE_ACTOR").ok();
+        // SAFETY: test is #[serial]; no other test in this crate reads/writes KHIVE_ACTOR.
+        unsafe {
+            std::env::set_var("KHIVE_ACTOR", "lambda:test-env-actor");
+        }
+        let base = RuntimeConfig::default();
+        assert_eq!(base.actor_id.as_deref(), Some("lambda:test-env-actor"));
+
+        let cfg = khive_cfg_with_actor("lambda:toml-actor");
+        let result = runtime_config_from_khive_config(&cfg, base);
+        assert_eq!(
+            result.actor_id.as_deref(),
+            Some("lambda:toml-actor"),
+            "TOML [actor] id must win over the env-resolved base.actor_id"
+        );
+
+        // SAFETY: restores prior KHIVE_ACTOR value (test cleanup).
+        unsafe {
+            match prior {
+                Some(v) => std::env::set_var("KHIVE_ACTOR", v),
+                None => std::env::remove_var("KHIVE_ACTOR"),
+            }
+        }
     }
 
     // ---- list_embedding_models tests ----

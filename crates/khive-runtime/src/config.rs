@@ -335,15 +335,24 @@ impl Default for RuntimeConfig {
 
 /// Resolve the `--db`/`KHIVE_DB` value into the db path used to ANCHOR tier-3
 /// project-local `.khive/config.toml` discovery (`KhiveConfig::load_with_home_fallback`'s
-/// `db_path` parameter), mirroring the precedence `kkernel mcp` and the MCP server use to
-/// open the database itself: `:memory:` has no file to anchor on (`None`); an explicit path
-/// anchors on that path; an unset value anchors on the default `$HOME/.khive/khive.db`.
+/// `db_path` parameter), mirroring the precedence `kkernel mcp`'s and `kkernel exec`'s
+/// two call sites use to open the database itself: `:memory:` has no file to anchor on
+/// (`None`); an explicit path anchors on that path; an unset value falls back to
+/// `$HOME/.khive/khive.db`, or the relative path `./.khive/khive.db` when `HOME` is unset —
+/// matching those two call sites' own pre-existing `unwrap_or_else(|_| ".".into())` handling.
 ///
 /// This is distinct from a plain override resolver that answers "does the caller want to
 /// override `RuntimeConfig::default().db_path`?" (2-arm, `None` meaning "keep the default").
 /// `resolve_db_anchor` always resolves to a concrete anchor value (3-arm) — it materializes
-/// the same default `RuntimeConfig::default()` would apply, rather than asking whether to
-/// override it.
+/// an anchor path unconditionally rather than asking whether to override one.
+///
+/// Note one deliberate divergence from `RuntimeConfig::default()`: when `HOME` is unset,
+/// `RuntimeConfig::default()` maps its own `db_path` to `None` (`.ok()` on the failed env
+/// lookup short-circuits the following `Option::map`), whereas this function falls back to
+/// `./.khive/khive.db` instead. A caller anchoring config-file discovery wants a concrete
+/// directory to search even without `HOME`; this function is not a stand-in for
+/// `RuntimeConfig::default()`'s own db-path default, only for the two call sites' shared
+/// anchor-derivation logic.
 pub fn resolve_db_anchor(db: Option<&str>) -> Option<std::path::PathBuf> {
     match db {
         Some(":memory:") => None,
@@ -496,10 +505,20 @@ pub fn runtime_config_from_khive_config(
         })
         .collect();
 
-    // ADR-057: store actor.id as actor_id for token minting. The validated id is
-    // already confirmed to be a valid Namespace string by KhiveConfig::validate().
-    // None when [actor] id is absent — tokens then carry ActorRef::anonymous().
-    let actor_id = khive_cfg.actor.id.clone().filter(|s| !s.trim().is_empty());
+    // ADR-057: store actor.id as actor_id for token minting. Precedence is
+    // TOML `[actor] id` > `base.actor_id` (the env/CLI-resolved value the
+    // caller already put in `base`) > anonymous. When `[actor] id` is absent
+    // or empty, fall back to `base.actor_id` instead of clobbering it with
+    // `None` — otherwise an env-resolved actor (e.g. `KHIVE_ACTOR`) is
+    // silently dropped whenever a project config is found without an
+    // `[actor]` block, in both the engines-empty and engines-present arms
+    // below.
+    let actor_id = khive_cfg
+        .actor
+        .id
+        .clone()
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| base.actor_id.clone());
 
     if khive_cfg.engines.is_empty() {
         return RuntimeConfig {
