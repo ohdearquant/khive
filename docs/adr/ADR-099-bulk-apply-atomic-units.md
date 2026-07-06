@@ -279,10 +279,17 @@ configurable op-count guard.**
 synchronous DML. The v1 admissible set is the DML-only mutations; embedding-bearing verbs and all
 read verbs are rejected at parse time.**
 
-- **v1 admissible:** `update`, `delete`, `link`, `merge`, and the task-lifecycle and message
-  mutations (`gtd.*` transitions, `comm` mutations), plus the governance verbs
+- **v1 admissible (explicit per-verb list, never a pack-level category):** `update`, `delete`,
+  `link`, `merge`, the task-lifecycle transitions (`gtd.transition`, `gtd.complete` —
+  property-only status mutations that trigger no reindex), and the governance verbs
   (`propose`/`review`/`withdraw`) — the verbs whose prepare is validation and identifier
   resolution only and whose apply is pure DML.
+- **v1 rejected — note-creating mutations.** `comm.send`, `comm.reply`, and `comm.ingest` are
+  **not** DML-only today: each creates a message note, and note creation awaits embedding before
+  its vector insert (`crates/khive-runtime/src/operations.rs`). `gtd.assign` is rejected for the
+  same reason (it creates a task note). All are treated exactly like `create` and
+  `memory.remember` below — rejected at parse time as embedding-bearing until a note prepare/apply
+  seam exists.
 - **`update` and `merge` caveat (verified at source).** Under the current handlers, `update`
   triggers a reindex when name or description change, and that reindex awaits embedding
   (`reindex_entity` in `crates/khive-runtime/src/curation.rs`); property-only updates skip
@@ -458,7 +465,7 @@ inventory correction to a design that needs review.
    passes flag-off. This near-shipped twice in one day; the warning must live in the code the next
    consumer reads, not only in this ADR.
 1. Add a per-verb `prepare`/apply seam to the v1 admissible verbs (`update`, `delete`, `link`,
-   `merge`, the task-lifecycle and message mutations, the governance verbs): `prepare` runs the
+   `merge`, `gtd.transition`, `gtd.complete`, the governance verbs): `prepare` runs the
    existing async validation/identifier work and returns a materialized write plan (the
    `SqlStatement`s plus any post-commit side effect); apply issues those statements on a provided
    writer with no transaction control of its own.
@@ -494,9 +501,9 @@ Schema is unchanged; no migration file is required. Pack rules gain only additiv
   suspension error and aborts the unit — it must fail loudly, not silently succeed or wedge. This
   is the guard that a future change admitting an embedding-bearing verb without hoisting its
   embedding is caught by a test, not discovered in production on the single-writer path.
-- **Embedding-bearing verb rejected.** An `--atomic` file containing `create` or `memory.remember`
-  is rejected before execution, naming the line and verb and stating embedding-bearing verbs are
-  not yet atomic-eligible.
+- **Embedding-bearing verb rejected.** An `--atomic` file containing `create`, `memory.remember`,
+  `gtd.assign`, `comm.send`, or `comm.reply` is rejected before execution, naming the line and
+  verb and stating embedding-bearing verbs are not yet atomic-eligible.
 - **Read verb rejected.** An `--atomic` file containing a read/recall/query verb is rejected before
   any write occurs, naming the line and verb.
 - **Op-count guard.** An `--atomic` file exceeding the configured maximum op count is rejected
@@ -506,6 +513,16 @@ Schema is unchanged; no migration file is required. Pack rules gain only additiv
   up front or the unit rolls back in-transaction (the link op's affected-row/existence guard fails
   once X is gone). After the run, the database contains neither the edge nor a partial subset of
   the file's writes.
+- **Merge rewires see earlier in-file writes.** An `--atomic` file of the form
+  `[link(from, Z), merge(into, from)]` commits with the new edge rewired to `into`: the merge
+  plan's predicated rewire statements are evaluated inside the transaction and therefore cover
+  the edge the earlier op inserted. No live edge remains on the merged-away entity. This pins the
+  predicate-based-plan rule — a plan that pre-enumerated edge rows at prepare time fails this
+  test.
+- **Zero-row apply fails the unit.** An `--atomic` file of the form `[delete(X, hard), update(X)]`
+  does **not** report success: the update's affected-row guard observes zero rows inside the
+  transaction, the op fails, and the whole unit rolls back (X is restored, `atomic.committed` is
+  false). This pins the affected-row-guard rule.
 - **Non-atomic parity.** With `--atomic` absent, bulk apply output and per-op semantics are
   byte-identical to the pre-change behavior (per-op independence preserved; a failing op does not
   abort siblings).
