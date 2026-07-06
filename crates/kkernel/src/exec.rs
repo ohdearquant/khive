@@ -476,6 +476,12 @@ async fn run_exec_inline_with_forward(
             presentation: presentation.clone(),
             presentation_per_op: None,
             namespace: cfg.default_namespace.as_str().to_string(),
+            actor_id: cfg.actor_id.clone(),
+            visible_namespaces: cfg
+                .visible_namespaces
+                .iter()
+                .map(|ns| ns.as_str().to_string())
+                .collect(),
             config_id: compute_config_id(&cfg, None),
             protocol_version: PROTOCOL_VERSION,
             probe_only: false,

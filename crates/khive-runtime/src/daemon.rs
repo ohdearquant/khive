@@ -26,6 +26,8 @@ use tokio::net::{UnixListener, UnixStream};
 
 use khive_db::{run_checkpoint_task, CheckpointConfig, ConnectionPool};
 
+use crate::pack::RequestIdentity;
+
 /// Maximum frame size accepted in either direction.
 pub const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 
@@ -40,7 +42,12 @@ pub const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 /// Version history:
 ///   1 — initial versioned framing (added `protocol_version` + `version_mismatch`);
 ///       added `probe_only` request field + probe-ack sentinel shape in response
-pub const PROTOCOL_VERSION: u32 = 2;
+///   2 — gate subhandler verbs by wire origin (`from_wire` request field)
+///   3 — added per-request identity context to the request frame (`actor_id`,
+///       `visible_namespaces`, ADR-096 Fork 1); the daemon now serves a request
+///       under the frame's identity instead of rejecting on `namespace_mismatch`
+///       (the `config_id` equality reject stays hard)
+pub const PROTOCOL_VERSION: u32 = 3;
 
 const DEFAULT_DRAIN_TIMEOUT_SECS: u64 = 10;
 
@@ -129,7 +136,29 @@ pub struct DaemonRequestFrame {
     pub ops: String,
     pub presentation: Option<String>,
     pub presentation_per_op: Option<Vec<Option<String>>>,
+    /// The client's resolved storage/gate default namespace for this request.
+    ///
+    /// Historically rejected outright when it differed from the daemon's own
+    /// construction-baked namespace (`namespace_mismatch`). As of protocol
+    /// version 3 (ADR-096 Fork 1) the daemon instead serves the request under
+    /// this namespace — the field is a per-request identity input, not a
+    /// same-process-identity assertion.
     pub namespace: String,
+    /// The client's resolved write-stamp / gate actor identity (ADR-057),
+    /// carried on the frame so the warm daemon stamps writes with the
+    /// *caller's* actor instead of the daemon's own baked `actor_id`
+    /// (ADR-096 Fork 1). `None` mints `ActorRef::anonymous()`, matching an
+    /// unconfigured actor. Pre-Fork-1 clients cannot send this field (an older
+    /// protocol version rejects at the version check before it would matter).
+    #[serde(default)]
+    pub actor_id: Option<String>,
+    /// The client's resolved extra read-visibility namespaces (ADR-007 Rev 4
+    /// Rule 3b), carried on the frame so the warm daemon widens read scope to
+    /// match the caller's own configuration rather than the daemon's baked
+    /// `visible_namespaces` (ADR-096 Fork 1). Empty means no extra visibility
+    /// beyond `namespace` itself.
+    #[serde(default)]
+    pub visible_namespaces: Vec<String>,
     /// Fingerprint of the client's resolved runtime config (packs, db target,
     /// embedders). The daemon rejects a request whose `config_id` differs from
     /// its own so a restricted client (e.g. `--pack kg`, `--db :memory:`) never
@@ -256,6 +285,15 @@ pub trait DaemonDispatch: Clone + Send + Sync + 'static {
     /// [`DaemonRequestFrame::from_wire`]: when `true`, the implementor enforces
     /// verb visibility (rejects `Visibility::Subhandler` verbs); when `false`,
     /// the request is from a trusted operator surface and subhandlers pass.
+    ///
+    /// `identity` is the per-request identity context threaded from the frame
+    /// (ADR-096 Fork 1): `Some(..)` when serving a request forwarded over the
+    /// daemon socket (built from `frame.namespace` / `frame.actor_id` /
+    /// `frame.visible_namespaces` by the connection handler), `None` for any
+    /// other dispatch path. Implementors should mint the storage/gate token from
+    /// `identity` when present and fall back to their own construction-baked
+    /// identity when absent, so pure local (non-daemon) dispatch is unchanged.
+    #[allow(clippy::too_many_arguments)]
     async fn dispatch(
         &self,
         ops: String,
@@ -264,6 +302,7 @@ pub trait DaemonDispatch: Clone + Send + Sync + 'static {
         format: Option<String>,
         format_per_op: Option<Vec<Option<String>>>,
         from_wire: bool,
+        identity: Option<RequestIdentity>,
     ) -> Result<String, String>;
 
     /// Warm every pack's in-memory state (ANN indexes, etc.).
@@ -390,17 +429,15 @@ async fn handle_conn<D: DaemonDispatch>(mut stream: UnixStream, dispatcher: D) {
             version_mismatch: true,
             daemon_protocol_version: PROTOCOL_VERSION,
         }
-    } else if frame.namespace != dispatcher.namespace() {
-        DaemonResponseFrame {
-            ok: false,
-            result: None,
-            error: None,
-            namespace_mismatch: true,
-            config_mismatch: false,
-            served_config_id,
-            version_mismatch: false,
-            daemon_protocol_version: PROTOCOL_VERSION,
-        }
+    // ADR-096 Fork 1: there is no `frame.namespace != dispatcher.namespace()`
+    // reject here. The daemon accepts and serves the request under the
+    // frame's own identity (namespace / actor / visible_namespaces, built
+    // into a `RequestIdentity` below) over its one shared warm registry,
+    // rather than rejecting a differently-attributed same-uid connection to
+    // a cold local-dispatch fallback. `config_id` — which governs
+    // packs/db/embed coherence for the shared warm engine — remains a hard
+    // reject; it is not an identity field and softening it would let a
+    // restricted client dispatch through an incompatible broader daemon.
     } else if frame.config_id != dispatcher.config_id() {
         DaemonResponseFrame {
             ok: false,
@@ -427,6 +464,20 @@ async fn handle_conn<D: DaemonDispatch>(mut stream: UnixStream, dispatcher: D) {
             daemon_protocol_version: PROTOCOL_VERSION,
         }
     } else {
+        // Build the per-request identity context from the frame (ADR-096
+        // Fork 1) so the implementor mints the storage/gate token from the
+        // CALLER's identity, not the dispatcher's own construction-baked
+        // scalars. This is always `Some` here: every frame that reaches
+        // this arm carries a `namespace` (required on the wire) plus
+        // whatever `actor_id`/`visible_namespaces` the client resolved
+        // (defaulting to `None`/`vec![]` for a pre-Fork-1 field-absent
+        // payload, which is exactly the prior anonymous/no-extra-visibility
+        // behavior).
+        let identity = RequestIdentity {
+            namespace: frame.namespace.clone(),
+            actor_id: frame.actor_id.clone(),
+            visible_namespaces: frame.visible_namespaces.clone(),
+        };
         match dispatcher
             .dispatch(
                 frame.ops,
@@ -435,6 +486,7 @@ async fn handle_conn<D: DaemonDispatch>(mut stream: UnixStream, dispatcher: D) {
                 frame.format,
                 frame.format_per_op,
                 frame.from_wire,
+                Some(identity),
             )
             .await
         {

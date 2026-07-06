@@ -431,17 +431,26 @@ impl KhiveMcpServer {
     /// Result semantics mirror the per-op envelope from the registry:
     /// `Ok(Value)` → success payload (caller wraps in `{ok:true, tool, result}`).
     /// `Err((tool, error_value))` → error payload (caller wraps in `{ok:false, tool, error}`).
+    ///
+    /// `identity` mirrors the override [`Self::dispatch_op`] applies to the
+    /// registry path (ADR-096 Fork 1): when present, its namespace is used
+    /// instead of `self.default_namespace` so a per-request identity can't
+    /// diverge between the coordinator intercept and the registry dispatch
+    /// it falls through to.
     async fn dispatch_via_coordinator(
         &self,
         tool: &str,
         args_value: &Value,
+        identity: Option<&khive_runtime::RequestIdentity>,
     ) -> Option<Result<Value, (String, Value)>> {
         let coord = self.coordinator.as_ref()?;
         if coord.is_single_backend() {
             return None;
         }
-        dispatch_via_coordinator_inner(coord.as_ref(), tool, args_value, &self.default_namespace)
-            .await
+        let default_namespace = identity
+            .map(|id| id.namespace.as_str())
+            .unwrap_or(self.default_namespace.as_str());
+        dispatch_via_coordinator_inner(coord.as_ref(), tool, args_value, default_namespace).await
     }
 
     /// Namespace this server's registry was built for.
@@ -452,6 +461,23 @@ impl KhiveMcpServer {
     /// Fingerprint of the runtime config this server's registry was built for.
     pub fn config_id(&self) -> &str {
         &self.config_id
+    }
+
+    /// This server's resolved actor identity label, if configured (ADR-057).
+    ///
+    /// Read when building the daemon request frame (ADR-096 Fork 1) to carry
+    /// this server's own identity on the wire, so a warm daemon with a
+    /// different baked identity serves the request under this caller's
+    /// actor instead of the daemon's.
+    pub fn actor_id(&self) -> Option<&str> {
+        self.registry.actor_id()
+    }
+
+    /// This server's resolved extra read-visibility namespaces (ADR-007
+    /// Rev 4 Rule 3b). See [`Self::actor_id`] for why this is exposed
+    /// (ADR-096 Fork 1).
+    pub fn visible_namespaces(&self) -> &[khive_runtime::Namespace] {
+        self.registry.visible_namespaces()
     }
 
     /// The connection pool to use for background WAL checkpointing, if any.
@@ -504,6 +530,7 @@ impl KhiveMcpServer {
         op: ParsedOp,
         prev_result: Option<&Value>,
         from_wire: bool,
+        identity: Option<&khive_runtime::RequestIdentity>,
     ) -> Result<Value, (String, Value)> {
         let ParsedOp { tool, args } = op;
 
@@ -616,12 +643,19 @@ impl KhiveMcpServer {
 
         // Multi-backend interception: route link/search through the coordinator (ADR-029 D3/D4).
         // Single-backend and non-link/search verbs fall through to the registry unchanged.
-        if let Some(coord_result) = self.dispatch_via_coordinator(&tool, &args_value).await {
+        if let Some(coord_result) = self
+            .dispatch_via_coordinator(&tool, &args_value, identity)
+            .await
+        {
             return coord_result
                 .map(|result| json!({ "ok": true, "tool": tool, "result": result }));
         }
 
-        match self.registry.dispatch(&tool, args_value).await {
+        match self
+            .registry
+            .dispatch_with_identity(&tool, args_value, identity.cloned())
+            .await
+        {
             Ok(result) => Ok(json!({ "ok": true, "tool": tool, "result": result })),
             Err(RuntimeError::Khive(k)) => {
                 let error_payload = serde_json::to_value(&k)
@@ -659,6 +693,7 @@ impl KhiveMcpServer {
         presentation: PresentationMode,
         presentation_per_op: Option<Vec<Option<PresentationMode>>>,
         from_wire: bool,
+        identity: Option<&khive_runtime::RequestIdentity>,
     ) -> Value {
         let now_unix = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -703,6 +738,10 @@ impl KhiveMcpServer {
                 // Clone coordinator and namespace for use in the per-op closures (ADR-029 D3/D4).
                 let coordinator: Option<Arc<dyn CoordinatorService>> = self.coordinator.clone();
                 let default_namespace = self.default_namespace.clone();
+                // ADR-096 Fork 1: a per-request identity overrides the default
+                // namespace for both the coordinator intercept and the registry
+                // dispatch below, so the two can't drift out of sync per op.
+                let identity_owned: Option<khive_runtime::RequestIdentity> = identity.cloned();
 
                 // Independent dispatch — run all concurrently, results in input order.
                 let futures = ops.into_iter().enumerate().map(|(i, op)| {
@@ -717,7 +756,11 @@ impl KhiveMcpServer {
 
                     let registry = self.registry.clone();
                     let coord = coordinator.clone();
-                    let ns_str = default_namespace.clone();
+                    let ns_str = identity_owned
+                        .as_ref()
+                        .map(|id| id.namespace.clone())
+                        .unwrap_or_else(|| default_namespace.clone());
+                    let op_identity = identity_owned.clone();
                     let op_mode = mode_for_op(i);
                     async move {
                         let tool = op.tool.clone();
@@ -808,7 +851,10 @@ impl KhiveMcpServer {
                             }
                         }
 
-                        match registry.dispatch(&tool, args_value).await {
+                        match registry
+                            .dispatch_with_identity(&tool, args_value, op_identity)
+                            .await
+                        {
                             Ok(result) => {
                                 let presented = present(result, effective_mode, now_unix);
                                 json!({ "ok": true, "tool": tool, "result": presented })
@@ -860,7 +906,10 @@ impl KhiveMcpServer {
                     } else {
                         op_mode
                     };
-                    match self.dispatch_op(op, prev_result.as_ref(), from_wire).await {
+                    match self
+                        .dispatch_op(op, prev_result.as_ref(), from_wire, identity)
+                        .await
+                    {
                         Ok(result_obj) => {
                             // Extract canonical result for $prev (pre-presentation).
                             prev_result = result_obj.get("result").cloned();
@@ -1233,6 +1282,16 @@ impl KhiveMcpServer {
             presentation: p.presentation.clone(),
             presentation_per_op: p.presentation_per_op.clone(),
             namespace: self.default_namespace.clone(),
+            // ADR-096 Fork 1: carry this server's OWN resolved actor/visibility
+            // identity on the frame so a warm daemon with a *different* baked
+            // identity serves the request under this caller's identity instead
+            // of rejecting it or silently stamping writes under its own actor.
+            actor_id: self.actor_id().map(str::to_string),
+            visible_namespaces: self
+                .visible_namespaces()
+                .iter()
+                .map(|ns| ns.as_str().to_string())
+                .collect(),
             config_id: self.config_id.clone(),
             protocol_version: khive_runtime::daemon::PROTOCOL_VERSION,
             probe_only: false,
@@ -1248,23 +1307,33 @@ impl KhiveMcpServer {
     /// allowed. `kkernel exec`, in-process callers, and tests use this. The
     /// agent-facing MCP wire surface goes through `dispatch_request_wire`
     /// (or sets `from_wire` on the daemon frame), which enforces verb visibility.
+    ///
+    /// Pure local dispatch: no [`khive_runtime::RequestIdentity`] override is
+    /// applied (ADR-096 Fork 1) — this server's own construction-baked
+    /// identity is used, unchanged from before per-request identity existed.
     pub async fn dispatch_request_local(&self, p: RequestParams) -> Result<String, McpError> {
-        self.dispatch_request_inner(p, false).await
+        self.dispatch_request_inner(p, false, None).await
     }
 
     /// Wire-surface dispatch: same as [`Self::dispatch_request_local`] but
     /// enforces verb visibility (`Visibility::Subhandler` verbs are rejected).
     /// Used by the stdio `request` tool's local-fallback path.
     pub(crate) async fn dispatch_request_wire(&self, p: RequestParams) -> Result<String, McpError> {
-        self.dispatch_request_inner(p, true).await
+        self.dispatch_request_inner(p, true, None).await
     }
 
     /// Shared body for both dispatch surfaces. `from_wire` decides whether the
     /// subhandler-visibility gate fires (see [`run_parsed`](Self::run_parsed)).
+    ///
+    /// `identity` is the per-request identity context threaded from a daemon
+    /// frame (ADR-096 Fork 1, see `crate::daemon`'s `DaemonDispatch` impl).
+    /// `None` for every local (non-daemon-served) call — this server's own
+    /// baked identity applies, exactly as before this parameter existed.
     pub(crate) async fn dispatch_request_inner(
         &self,
         p: RequestParams,
         from_wire: bool,
+        identity: Option<khive_runtime::RequestIdentity>,
     ) -> Result<String, McpError> {
         let save_to = p.save_to.clone();
         let parsed = parse_request(&p.ops).map_err(dsl_err_to_mcp)?;
@@ -1324,6 +1393,7 @@ impl KhiveMcpServer {
                 presentation,
                 presentation_per_op.clone(),
                 from_wire,
+                identity.as_ref(),
             )
             .await;
 

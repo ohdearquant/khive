@@ -711,6 +711,38 @@ pub struct VerbRegistry {
     dispatch_hook: Option<Arc<dyn DispatchHook>>,
 }
 
+/// Per-request identity context that overrides a [`VerbRegistry`]'s
+/// construction-baked `default_namespace` / `actor_id` / `visible_namespaces`
+/// for exactly one [`VerbRegistry::dispatch_with_identity`] call (ADR-096
+/// Fork 1 — warm-daemon per-request identity).
+///
+/// A single warm registry is built once with a baked identity, but must be
+/// able to serve requests whose caller resolved a *different* attribution
+/// identity (e.g. a different project-local `[actor]`) without a cold
+/// fallback and without mis-stamping writes under the registry's own baked
+/// actor. Supplying `Some(RequestIdentity { .. })` threads the caller's
+/// identity through token minting for that one call; the registry's fields
+/// (and every other in-flight call) are untouched. `None` is exactly
+/// [`VerbRegistry::dispatch`] — the baked scalars apply, unchanged from
+/// before this type existed.
+#[derive(Debug, Clone, Default)]
+pub struct RequestIdentity {
+    /// Storage/gate default namespace for this request (used when the verb's
+    /// own params carry no explicit `namespace` field). Overrides
+    /// `VerbRegistry::default_namespace`.
+    pub namespace: String,
+    /// Write-stamp / gate actor label for this request (ADR-057). Overrides
+    /// `VerbRegistry::actor_id`. `None` mints `ActorRef::anonymous()`, same
+    /// as an unconfigured baked `actor_id`.
+    pub actor_id: Option<String>,
+    /// Extra read-visibility namespaces for this request (ADR-007 Rev 4 Rule
+    /// 3b). Overrides `VerbRegistry::visible_namespaces`. Entries that fail
+    /// `Namespace::parse` are skipped with a `tracing::warn!` rather than
+    /// failing the whole request — a single malformed visibility entry from a
+    /// caller-supplied frame must not block dispatch.
+    pub visible_namespaces: Vec<String>,
+}
+
 /// Error returned by [`VerbRegistry::apply_schema_plans_with_map`] when two
 /// packs on the same backend declare the same auxiliary table (ADR-028 §7).
 #[derive(Debug)]
@@ -777,6 +809,29 @@ fn extract_table_names(stmt: &str) -> Vec<String> {
 }
 
 impl VerbRegistry {
+    /// This registry's construction-baked default namespace.
+    ///
+    /// Used as the fallback when a request carries no [`RequestIdentity`]
+    /// override (ADR-096 Fork 1) and by transports that need to advertise
+    /// their own resolved identity when forwarding to a warm daemon.
+    pub fn default_namespace(&self) -> &str {
+        &self.default_namespace
+    }
+
+    /// This registry's construction-baked actor identity label, if configured
+    /// (ADR-057). `None` means dispatch mints `ActorRef::anonymous()` absent a
+    /// per-request [`RequestIdentity`] override (ADR-096 Fork 1).
+    pub fn actor_id(&self) -> Option<&str> {
+        self.actor_id.as_deref()
+    }
+
+    /// This registry's construction-baked extra read-visibility namespaces
+    /// (ADR-007 Rev 4 Rule 3b), used absent a per-request [`RequestIdentity`]
+    /// override (ADR-096 Fork 1).
+    pub fn visible_namespaces(&self) -> &[Namespace] {
+        &self.visible_namespaces
+    }
+
     /// Return the help schema envelope for a verb (issue #287).
     ///
     /// Walks registered packs for the first matching `HandlerDef` and returns a
@@ -875,7 +930,33 @@ impl VerbRegistry {
     /// Routes through the gate, then invokes the matching pack handler. When
     /// `params["help"] == true`, short-circuits to `describe_verb` with no side effects.
     /// Gate errors are fail-open. Full dispatch flow documented in `docs/protocol.md`.
+    ///
+    /// Equivalent to `self.dispatch_with_identity(verb, params, None)` — uses
+    /// this registry's construction-baked `default_namespace` / `actor_id` /
+    /// `visible_namespaces`.
     pub async fn dispatch(&self, verb: &str, params: Value) -> Result<Value, RuntimeError> {
+        self.dispatch_with_identity(verb, params, None).await
+    }
+
+    /// Dispatch a verb, optionally overriding this registry's baked identity
+    /// scalars for exactly this call (ADR-096 Fork 1).
+    ///
+    /// `identity = None` behaves exactly like [`Self::dispatch`]. `identity =
+    /// Some(id)` uses `id.namespace` / `id.actor_id` / `id.visible_namespaces`
+    /// in place of `self.default_namespace` / `self.actor_id` /
+    /// `self.visible_namespaces` for this call's namespace resolution, gate
+    /// request, and token minting — the registry's own fields are never
+    /// mutated, so concurrent calls with different (or no) identity are
+    /// independent. This is what lets one warm registry correctly serve
+    /// requests from many attribution identities over the same shared
+    /// backend (same db, same warm ANN indexes) instead of rejecting or
+    /// silently dispatching under its own baked identity.
+    pub async fn dispatch_with_identity(
+        &self,
+        verb: &str,
+        params: Value,
+        identity: Option<RequestIdentity>,
+    ) -> Result<Value, RuntimeError> {
         // help=true interception (issue #287) — short-circuit before gate/pack.
         if params.get("help").and_then(Value::as_bool) == Some(true) {
             return self.describe_verb(verb);
@@ -891,11 +972,21 @@ impl VerbRegistry {
         // the multi-backend coordinator intercept via `resolve_explicit_namespace`
         // so every MCP ingress path applies the same fail-closed rule.
         let explicit_namespace = params.get("namespace").is_some_and(Value::is_string);
-        let ns = resolve_explicit_namespace(&params, &self.default_namespace)?;
+        // ADR-096 Fork 1: a supplied per-request identity overrides the baked
+        // default_namespace/actor_id/visible_namespaces for this call only.
+        let default_namespace_str: &str = identity
+            .as_ref()
+            .map(|id| id.namespace.as_str())
+            .unwrap_or(self.default_namespace.as_str());
+        let ns = resolve_explicit_namespace(&params, default_namespace_str)?;
+        let actor_id_str: Option<&str> = match identity.as_ref() {
+            Some(id) => id.actor_id.as_deref(),
+            None => self.actor_id.as_deref(),
+        };
         // ADR-057: thread the configured actor identity into the gate request so
         // the gate can distinguish human vs agent callers at the dispatch seam.
         // Mirrors the actor resolution used by the token-minting path below.
-        let gate_actor = match self.actor_id.as_deref() {
+        let gate_actor = match actor_id_str {
             Some(id) if !id.trim().is_empty() => ActorRef::new("actor", id),
             _ => ActorRef::anonymous(),
         };
@@ -987,16 +1078,18 @@ impl VerbRegistry {
         // When actor_id is configured (ADR-057), mint a token carrying that actor
         // label so that comm.inbox applies the to_actor filter for directed delivery.
         // Otherwise, use ActorRef::anonymous() and inbox falls back to party-line.
-        let configured_actor = match self.actor_id.as_deref() {
+        // ADR-096 Fork 1: `actor_id_str` already reflects the per-request identity
+        // override when supplied (resolved above, mirrored into the gate request).
+        let configured_actor = match actor_id_str {
             Some(id) if !id.trim().is_empty() => ActorRef::new("actor", id),
             _ => ActorRef::anonymous(),
         };
 
         // Rule 3b (Rev 4): on the default (no explicit `namespace=`) path, the read
-        // scope widens to `['local'] ∪ self.visible_namespaces`. `'local'` is always
-        // included (mint_with_visibility deduplicates). Writes remain pinned to
-        // `'local'`. Per-actor distinctions use view-layer tag filters
-        // (assignee, actor_id, from/to), not namespace partitions.
+        // scope widens to `['local'] ∪ visible_namespaces` (baked, or the per-request
+        // override — ADR-096 Fork 1). `'local'` is always included (mint_with_visibility
+        // deduplicates). Writes remain pinned to `'local'`. Per-actor distinctions use
+        // view-layer tag filters (assignee, actor_id, from/to), not namespace partitions.
         // `ns`/`explicit_namespace` were already validated above (RUNTIME-AUD-002 /
         // #433) — reuse them instead of re-reading `params["namespace"]` with
         // `as_str()`, which would silently drop malformed non-string values again.
@@ -1006,7 +1099,25 @@ impl VerbRegistry {
         } else {
             // Rule 3b: default path. Write namespace = local; read scope = ['local'] ∪ visible_namespaces.
             let primary = Namespace::local();
-            let mut extra_visible = self.visible_namespaces.clone();
+            let mut extra_visible: Vec<Namespace> = match identity.as_ref() {
+                Some(id) => id
+                    .visible_namespaces
+                    .iter()
+                    .filter_map(|s| match Namespace::parse(s) {
+                        Ok(parsed) => Some(parsed),
+                        Err(e) => {
+                            tracing::warn!(
+                                namespace = %s,
+                                error = %e,
+                                "dispatch_with_identity: skipping invalid visible_namespace \
+                                 entry from per-request identity"
+                            );
+                            None
+                        }
+                    })
+                    .collect(),
+                None => self.visible_namespaces.clone(),
+            };
             extra_visible.push(Namespace::local()); // 'local' always readable; mint dedups
             NamespaceToken::mint_with_visibility(primary, extra_visible, configured_actor)
         };
