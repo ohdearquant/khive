@@ -59,8 +59,50 @@ impl Query {
     }
 }
 
+/// Raw wire format for [`HybridConfig`], used by `TryFrom` validation.
+#[derive(Deserialize)]
+struct RawHybridConfig {
+    fusion_strategy: FusionStrategy,
+    top_k: usize,
+    candidate_pool_size: usize,
+    min_score: Option<DeterministicScore>,
+    vector_weight: f64,
+    keyword_weight: f64,
+    #[serde(default, with = "crate::timeout::serde_opt_duration")]
+    timeout: Option<Duration>,
+}
+
+impl TryFrom<RawHybridConfig> for HybridConfig {
+    type Error = String;
+
+    fn try_from(raw: RawHybridConfig) -> Result<Self, Self::Error> {
+        if !raw.vector_weight.is_finite() {
+            return Err(format!(
+                "vector_weight must be finite, got {}",
+                raw.vector_weight
+            ));
+        }
+        if !raw.keyword_weight.is_finite() {
+            return Err(format!(
+                "keyword_weight must be finite, got {}",
+                raw.keyword_weight
+            ));
+        }
+        Ok(HybridConfig {
+            fusion_strategy: raw.fusion_strategy,
+            top_k: raw.top_k,
+            candidate_pool_size: raw.candidate_pool_size,
+            min_score: raw.min_score,
+            vector_weight: raw.vector_weight,
+            keyword_weight: raw.keyword_weight,
+            timeout: raw.timeout,
+        })
+    }
+}
+
 /// Configuration for hybrid search.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(try_from = "RawHybridConfig")]
 pub struct HybridConfig {
     /// Fusion strategy to use (default: RRF with k=60).
     pub fusion_strategy: FusionStrategy,
@@ -265,5 +307,160 @@ mod tests {
         let config = HybridConfig::default().with_weights(1.5, -0.5);
         assert_eq!(config.vector_weight, 1.0);
         assert_eq!(config.keyword_weight, 0.0);
+    }
+
+    /// JSON has no NaN token; the parser rejects the literal before `TryFrom` is ever
+    /// reached. This documents that trivial case but is NOT the real regression guard —
+    /// see `test_try_from_rejects_nan_vector_weight` below for the genuine boundary test.
+    #[test]
+    fn test_serde_json_rejects_nan_literal_vector_weight() {
+        let json = r#"{
+            "fusion_strategy": {"rrf": {"k": 60}},
+            "top_k": 10,
+            "candidate_pool_size": 50,
+            "min_score": null,
+            "vector_weight": NaN,
+            "keyword_weight": 0.3
+        }"#;
+        let result: Result<HybridConfig, _> = serde_json::from_str(json);
+        assert!(
+            result.is_err(),
+            "JSON literal NaN must be rejected by the parser"
+        );
+    }
+
+    /// Same caveat as above: `Infinity` is not a valid JSON token either.
+    #[test]
+    fn test_serde_json_rejects_infinity_literal_vector_weight() {
+        let json = r#"{
+            "fusion_strategy": {"rrf": {"k": 60}},
+            "top_k": 10,
+            "candidate_pool_size": 50,
+            "min_score": null,
+            "vector_weight": Infinity,
+            "keyword_weight": 0.3
+        }"#;
+        let result: Result<HybridConfig, _> = serde_json::from_str(json);
+        assert!(
+            result.is_err(),
+            "JSON literal Infinity must be rejected by the parser"
+        );
+    }
+
+    /// `serde_json` refuses any JSON number literal that overflows `f64` (e.g. `1e400`)
+    /// with its own "number out of range" parse error, regardless of any custom
+    /// validation — verified empirically: this also occurs for a bare `f64` field with no
+    /// `TryFrom` involved at all. So it cannot be used to prove `TryFrom` is wired up; it's
+    /// omitted here to avoid a misleading assertion. The genuine regression guard for both
+    /// NaN and infinity is `RawHybridConfig` constructed directly below, which is exactly
+    /// the value `TryFrom<RawHybridConfig>` receives once `serde` finishes parsing the raw
+    /// wire form — see `test_try_from_rejects_*` below.
+    ///
+    /// `serde_json` also cannot encode a literal NaN value at all
+    /// (`serde_json::Number::from_f64(f64::NAN)` returns `None`), so the only way to
+    /// exercise `TryFrom<RawHybridConfig>` with an actual non-finite value is to construct
+    /// the raw struct directly. Without the fix, `RawHybridConfig`/`TryFrom` do not exist
+    /// and these tests would not compile; with the old plain-derive `Deserialize`, this
+    /// exact input would have deserialized successfully (uncaught in release, since the
+    /// only prior guard was a `debug_assert!` in the unrelated `with_weights` builder).
+    #[test]
+    fn test_try_from_rejects_nan_vector_weight() {
+        let raw = RawHybridConfig {
+            fusion_strategy: FusionStrategy::rrf(),
+            top_k: 10,
+            candidate_pool_size: 50,
+            min_score: None,
+            vector_weight: f64::NAN,
+            keyword_weight: 0.3,
+            timeout: None,
+        };
+        let result = HybridConfig::try_from(raw);
+        assert!(
+            result.is_err(),
+            "NaN vector_weight must be rejected via TryFrom"
+        );
+    }
+
+    #[test]
+    fn test_try_from_rejects_infinite_vector_weight() {
+        let raw = RawHybridConfig {
+            fusion_strategy: FusionStrategy::rrf(),
+            top_k: 10,
+            candidate_pool_size: 50,
+            min_score: None,
+            vector_weight: f64::INFINITY,
+            keyword_weight: 0.3,
+            timeout: None,
+        };
+        let result = HybridConfig::try_from(raw);
+        assert!(
+            result.is_err(),
+            "+Infinity vector_weight must be rejected via TryFrom"
+        );
+    }
+
+    #[test]
+    fn test_try_from_rejects_nan_keyword_weight() {
+        let raw = RawHybridConfig {
+            fusion_strategy: FusionStrategy::rrf(),
+            top_k: 10,
+            candidate_pool_size: 50,
+            min_score: None,
+            vector_weight: 0.7,
+            keyword_weight: f64::NAN,
+            timeout: None,
+        };
+        let result = HybridConfig::try_from(raw);
+        assert!(
+            result.is_err(),
+            "NaN keyword_weight must be rejected via TryFrom"
+        );
+    }
+
+    #[test]
+    fn test_try_from_rejects_negative_infinity_keyword_weight() {
+        let raw = RawHybridConfig {
+            fusion_strategy: FusionStrategy::rrf(),
+            top_k: 10,
+            candidate_pool_size: 50,
+            min_score: None,
+            vector_weight: 0.7,
+            keyword_weight: f64::NEG_INFINITY,
+            timeout: None,
+        };
+        let result = HybridConfig::try_from(raw);
+        assert!(
+            result.is_err(),
+            "-Infinity keyword_weight must be rejected via TryFrom"
+        );
+    }
+
+    /// Positive control: a valid finite config still deserializes correctly through the
+    /// `TryFrom` boundary — the fix must not reject legitimate input.
+    #[test]
+    fn test_serde_accepts_valid_finite_config() {
+        let json = r#"{
+            "fusion_strategy": {"rrf": {"k": 60}},
+            "top_k": 10,
+            "candidate_pool_size": 50,
+            "min_score": null,
+            "vector_weight": 0.7,
+            "keyword_weight": 0.3
+        }"#;
+        let config: HybridConfig = serde_json::from_str(json).expect("valid config");
+        assert_eq!(config.top_k, 10);
+        assert_eq!(config.candidate_pool_size, 50);
+        assert_eq!(config.vector_weight, 0.7);
+        assert_eq!(config.keyword_weight, 0.3);
+    }
+
+    #[test]
+    fn test_serde_roundtrip_preserves_default_config() {
+        let config = HybridConfig::default();
+        let json = serde_json::to_string(&config).unwrap();
+        let restored: HybridConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.vector_weight, config.vector_weight);
+        assert_eq!(restored.keyword_weight, config.keyword_weight);
+        assert_eq!(restored.top_k, config.top_k);
     }
 }
