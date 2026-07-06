@@ -121,6 +121,7 @@ For historical context, see [v0 archive](../_archive/adr_v0/README.md). v0 ADRs 
 | [ADR-093](ADR-093-sessions-raw-zstd-compression.md)          | zstd Compression for Session-Mirror Raw Storage (Proposed)                                                      |
 | [ADR-094](ADR-094-lifecycle-telemetry-events.md)             | Sequencing-Assertable Lifecycle Telemetry Events (Proposed)                                                     |
 | [ADR-095](ADR-095-verb-surface-consolidation.md)             | Verb-Surface Consolidation and Field-Validation Governance (Proposed)                                           |
+| [ADR-096](ADR-096-warm-daemon-per-request-identity.md)       | Warm Daemon Per-Request Identity — Serving Many Attribution Identities Over One Shared Backend (Accepted)       |
 
 ## Closed Taxonomies — Quick Reference
 
