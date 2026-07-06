@@ -32,7 +32,8 @@ use anyhow::{Context, Result};
 use clap::Parser;
 
 use khive_mcp::serve::{
-    apply_env_output_format, enforce_strict_actor_mode, resolve_runtime_config, RuntimeConfigInputs,
+    apply_env_output_format, build_server_multi_backend, enforce_strict_actor_mode,
+    resolve_runtime_config, RuntimeConfigInputs,
 };
 #[cfg(unix)]
 use khive_mcp::server::compute_config_id;
@@ -402,11 +403,12 @@ pub async fn run_exec(args: ExecArgs) -> Result<()> {
                 args.presentation,
                 args.output_format,
                 args.save_file,
+                args.db,
             )
             .await
         }
         ExecMode::OpsFile(path) => {
-            run_exec_ops_file(path, cfg, args.presentation, args.dry_run).await
+            run_exec_ops_file(path, cfg, args.presentation, args.dry_run, args.db).await
         }
     }
 }
@@ -422,6 +424,7 @@ async fn run_exec_inline(
     presentation: Option<String>,
     output_format: Option<String>,
     save_file: Option<String>,
+    db: Option<String>,
 ) -> Result<()> {
     #[cfg(unix)]
     return run_exec_inline_with_forward(
@@ -430,11 +433,13 @@ async fn run_exec_inline(
         presentation,
         output_format,
         save_file,
+        db,
         forward_or_spawn_boxed,
     )
     .await;
     #[cfg(not(unix))]
-    return run_exec_inline_with_forward(ops, cfg, presentation, output_format, save_file).await;
+    return run_exec_inline_with_forward(ops, cfg, presentation, output_format, save_file, db)
+        .await;
 }
 
 /// Inner implementation of `run_exec_inline`, parameterised over the daemon
@@ -456,6 +461,7 @@ async fn run_exec_inline_with_forward(
     presentation: Option<String>,
     output_format: Option<String>,
     save_file: Option<String>,
+    db: Option<String>,
     #[cfg(unix)] forward_fn: ForwardFnPtr,
 ) -> Result<()> {
     // ── strict-actor gate (before any forwarding) ─────────────────────────────
@@ -466,6 +472,26 @@ async fn run_exec_inline_with_forward(
     // in-process fallback (as was the case before this fix) allowed a strict-mode
     // client to silently forward through a pre-existing anonymous daemon and exit 0.
     enforce_strict_actor_mode(cfg.actor_id.as_deref(), &cfg.packs)?;
+
+    // Load the resolved `KhiveConfig` ONCE, up front, so both the daemon
+    // forward-frame `config_id` below and the in-process fallback's backend
+    // topology (further below) resolve from the identical TOML file the
+    // daemon's own boot path loads (`serve.rs`'s `build_server`:
+    // `KhiveConfig::load_with_home_fallback(args.config.as_deref(),
+    // config.db_path.as_deref())` — `kkernel exec` has no `--config` flag, so
+    // the first argument here is always `None`, exactly like there).
+    //
+    // Fixes the config_id topology-drift bug: the forward frame below used to
+    // always fold `None` here, while the daemon folds `Some(&khive_cfg)`
+    // (`serve.rs`, `compute_config_id(default_runtime.config(),
+    // Some(khive_cfg))`). On a config declaring a non-empty `[[backends]]`
+    // topology (e.g. a separate `sessions` backend) the two fingerprints
+    // diverged, so a correctly-configured client was rejected as a
+    // `ConfigMismatch` and silently fell back to the cold in-process path on
+    // every call.
+    let khive_cfg = KhiveConfig::load_with_home_fallback(None, cfg.db_path.as_deref())
+        .map_err(|e| anyhow::anyhow!("config error: {e}"))?
+        .unwrap_or_default();
 
     // ── daemon fast-path (Unix only) ─────────────────────────────────────────
     // The daemon path does not support --save-file (the daemon returns a string;
@@ -487,7 +513,9 @@ async fn run_exec_inline_with_forward(
                 .iter()
                 .map(|ns| ns.as_str().to_string())
                 .collect(),
-            config_id: compute_config_id(&cfg, None),
+            // Fold the SAME backends topology the daemon folds (`Some(&khive_cfg)`)
+            // instead of `None` — see the `khive_cfg` load above.
+            config_id: compute_config_id(&cfg, Some(&khive_cfg)),
             protocol_version: PROTOCOL_VERSION,
             probe_only: false,
             format: output_format.clone(),
@@ -504,28 +532,14 @@ async fn run_exec_inline_with_forward(
     }
 
     // ── in-process fallback ───────────────────────────────────────────────────
-    // Resolve the full ADR-078 §2 precedence chain before building the server,
-    // mirroring the serve path: env-var (tier-2: KHIVE_OUTPUT_FORMAT) over
-    // TOML `[runtime] default_output_format` (tier-3) over builtin json. The CLI
-    // flag is then passed as the per-request `format` field (tier-1), which
-    // overrides the server default at dispatch time. This block only runs in the
-    // in-process fallback — the common daemon-forward path returns above and the
-    // daemon applies its own serve-time TOML resolution — so the config load here
-    // is off the hot path.
-    let rt = KhiveRuntime::new(cfg).map_err(|e| anyhow::anyhow!("{e}"))?;
     // Note: enforce_strict_actor_mode was called above before the daemon fast-path;
     // it is not repeated here — the single early check covers both paths.
     //
-    // `rt.config().db_path` anchors tier-3 project-local config discovery to the
-    // database's own directory rather than the process cwd, matching the serve path.
-    let toml_default = KhiveConfig::load_with_home_fallback(None, rt.config().db_path.as_deref())
-        .ok()
-        .flatten()
-        .and_then(|c| c.runtime.default_output_format);
-    let env_fmt = apply_env_output_format(toml_default);
-    let server = KhiveMcpServer::new(rt)
-        .map_err(|e| anyhow::anyhow!("{e}"))?
-        .with_default_output_format(env_fmt);
+    // `build_local_fallback_server` resolves the ADR-078 §2 output-format
+    // precedence chain (env var over TOML `[runtime] default_output_format`
+    // over builtin json) AND honors `[[backends]]` multi-backend topology —
+    // see its doc comment.
+    let server = build_local_fallback_server(cfg, &khive_cfg, db.as_deref())?;
 
     let params = RequestParams {
         ops,
@@ -545,11 +559,55 @@ async fn run_exec_inline_with_forward(
     Ok(())
 }
 
+/// Build the server used whenever `kkernel exec` dispatches a request locally
+/// instead of through the warm daemon.
+///
+/// Two call sites hit this: the daemon-unreachable/mismatch fallback inside
+/// `run_exec_inline_with_forward`, and the `--ops-file` bulk-apply path
+/// (`run_exec_ops_file`), which deliberately never attempts the daemon fast
+/// path at all (ADR-067 Context: bulk apply bypasses the daemon for cross-op
+/// atomicity).
+///
+/// `KhiveMcpServer::new` alone only ever builds a single-backend runtime — it
+/// has no visibility into a `khive.toml` `[[backends]]` declaration. Before
+/// this fix, both of exec's local-dispatch paths always took that
+/// single-backend constructor, so a config declaring a separate backend for
+/// e.g. the `session` pack was invisible to them: the in-process fallback
+/// would silently write that pack's data into the `main` backend instead of
+/// its declared one. This function makes both paths agree with the daemon's
+/// own boot logic (`khive_mcp::serve::build_server`): when
+/// `khive_cfg.backends` is empty, build the plain single-backend server
+/// exactly as before (byte-identical `config_id`, since `compute_config_id`
+/// skips the topology fold for an empty backends list); otherwise delegate to
+/// `build_server_multi_backend`, the same constructor `kkernel mcp` uses.
+///
+/// `cli_db_override` is the raw, pre-resolution `--db`/`KHIVE_DB` value —
+/// required by `build_server_multi_backend`'s db-anchor consistency guard and
+/// its `--db :memory:` multi-backend override handling (ADR-028 §8); passing
+/// the wrong value here would either falsely reject a legitimate `--db` or
+/// silently ignore an operator's `:memory:` isolation request.
+fn build_local_fallback_server(
+    cfg: RuntimeConfig,
+    khive_cfg: &KhiveConfig,
+    cli_db_override: Option<&str>,
+) -> Result<KhiveMcpServer> {
+    if khive_cfg.backends.is_empty() {
+        let rt = KhiveRuntime::new(cfg).map_err(|e| anyhow::anyhow!("{e}"))?;
+        let env_fmt = apply_env_output_format(khive_cfg.runtime.default_output_format);
+        Ok(KhiveMcpServer::new(rt)
+            .map_err(|e| anyhow::anyhow!("{e}"))?
+            .with_default_output_format(env_fmt))
+    } else {
+        build_server_multi_backend(cfg, khive_cfg, cli_db_override)
+    }
+}
+
 async fn run_exec_ops_file(
     path: PathBuf,
     cfg: RuntimeConfig,
     presentation: Option<String>,
     dry_run: bool,
+    db: Option<String>,
 ) -> Result<()> {
     // Parse the whole file first — fail before any writes if any line is bad.
     let ops = parse_ops_file(&path)?;
@@ -578,10 +636,14 @@ async fn run_exec_ops_file(
 
     // Build the in-process runtime (daemon fast-path is intentionally skipped
     // for bulk apply — bulk throughput benefits from a single warm runtime, not
-    // the round-trip overhead of socket forwarding per chunk).
-    let rt = KhiveRuntime::new(cfg).map_err(|e| anyhow::anyhow!("{e}"))?;
-    enforce_strict_actor_mode(rt.config().actor_id.as_deref(), &rt.config().packs)?;
-    let server = KhiveMcpServer::new(rt).map_err(|e| anyhow::anyhow!("{e}"))?;
+    // the round-trip overhead of socket forwarding per chunk). Honors
+    // `[[backends]]` multi-backend topology exactly like the daemon-fallback
+    // path — see `build_local_fallback_server`.
+    enforce_strict_actor_mode(cfg.actor_id.as_deref(), &cfg.packs)?;
+    let khive_cfg = KhiveConfig::load_with_home_fallback(None, cfg.db_path.as_deref())
+        .map_err(|e| anyhow::anyhow!("config error: {e}"))?
+        .unwrap_or_default();
+    let server = build_local_fallback_server(cfg, &khive_cfg, db.as_deref())?;
 
     apply_ops_file(&server, ops, presentation).await
 }
@@ -592,6 +654,34 @@ mod tests {
     use clap::Parser;
     use serial_test::serial;
     use tempfile::NamedTempFile;
+
+    // ── HOME isolation for local-fallback tests ───────────────────────────────
+    //
+    // `build_local_fallback_server` (via `run_exec_inline_with_forward` /
+    // `run_exec_ops_file`) now loads `KhiveConfig::load_with_home_fallback`
+    // unconditionally, which falls through to `~/.khive/config.toml` (tier 4)
+    // when no project-local config is found. Any test that builds a
+    // `RuntimeConfig` directly (bypassing `resolve_runtime_config`) with
+    // `db_path: None` would otherwise pick up whatever REAL config a
+    // developer/CI machine happens to have at `$HOME/.khive/config.toml` —
+    // including a genuinely multi-backend one — and silently exercise the
+    // multi-backend arm (or open real backend files) instead of the isolated
+    // single-backend path the test assumes. Point `HOME` at an empty tempdir
+    // for the duration of any such test so `khive_cfg` resolves to
+    // `KhiveConfig::default()` deterministically, regardless of the host.
+    fn isolate_home_for_test() -> (Option<std::ffi::OsString>, tempfile::TempDir) {
+        let prev = std::env::var_os("HOME");
+        let dir = tempfile::tempdir().expect("tempdir for isolated HOME");
+        std::env::set_var("HOME", dir.path());
+        (prev, dir)
+    }
+
+    fn restore_home(prev: Option<std::ffi::OsString>) {
+        match prev {
+            Some(v) => std::env::set_var("HOME", v),
+            None => std::env::remove_var("HOME"),
+        }
+    }
 
     // ── clap / env-binding tests ───────────────────────────────────────────────
 
@@ -874,6 +964,263 @@ default = true
         );
     }
 
+    /// D1-R3: the two tests above are inert to the config_id topology-drift
+    /// bug because they always call `compute_config_id(_, None)` on BOTH
+    /// sides — omitting the backends topology can never diverge from itself.
+    /// This test constructs a genuinely multi-backend `KhiveConfig` (mirroring
+    /// the real hosted shape: a `main` backend plus a separate `sessions`
+    /// backend, with the `session` pack pinned to it) and proves both that the
+    /// pre-fix computation diverges and that the post-fix computation is
+    /// byte-identical.
+    #[test]
+    #[serial]
+    fn exec_config_id_matches_serve_config_id_for_multi_backend_topology() {
+        use khive_runtime::{BackendConfig, BackendKind, PackConfig};
+
+        std::env::remove_var("KHIVE_EMBEDDING_MODEL");
+        std::env::remove_var("KHIVE_ADDITIONAL_EMBEDDING_MODELS");
+        std::env::remove_var("KHIVE_ACTOR");
+
+        // An explicit nonexistent config path keeps this fully deterministic
+        // regardless of host state (same rationale as the sibling test above).
+        let missing_config = std::path::PathBuf::from(
+            "/nonexistent/khive-exec-parity-test/multi-backend-config.toml",
+        );
+        let ns = Namespace::parse("local").expect("ns");
+
+        let khive_cfg = KhiveConfig {
+            backends: vec![
+                BackendConfig {
+                    name: "main".to_string(),
+                    kind: BackendKind::Sqlite,
+                    path: Some(std::path::PathBuf::from("/tmp/khive-parity-main.db")),
+                    cache_mb: None,
+                    journal_mode: None,
+                    read_only: false,
+                },
+                BackendConfig {
+                    name: "sessions".to_string(),
+                    kind: BackendKind::Sqlite,
+                    path: Some(std::path::PathBuf::from("/tmp/khive-parity-sessions.db")),
+                    cache_mb: None,
+                    journal_mode: None,
+                    read_only: false,
+                },
+            ],
+            packs: {
+                let mut m = std::collections::HashMap::new();
+                m.insert(
+                    "session".to_string(),
+                    PackConfig {
+                        backend: "sessions".to_string(),
+                    },
+                );
+                m
+            },
+            ..KhiveConfig::default()
+        };
+
+        // exec-shaped inputs (namespace_explicit: true — the choice `run_exec` makes).
+        let exec_cfg = resolve_runtime_config(RuntimeConfigInputs {
+            db: Some(":memory:"),
+            config: Some(&missing_config),
+            namespace: ns.clone(),
+            namespace_explicit: true,
+            actor_explicit: false,
+            no_embed: false,
+            packs: None,
+            brain_profile: None,
+        })
+        .expect("resolve exec-shaped config");
+
+        // serve-shaped inputs (namespace_explicit: false — the daemon-startup shape).
+        let serve_cfg = resolve_runtime_config(RuntimeConfigInputs {
+            db: Some(":memory:"),
+            config: Some(&missing_config),
+            namespace: ns,
+            namespace_explicit: false,
+            actor_explicit: false,
+            no_embed: false,
+            packs: None,
+            brain_profile: None,
+        })
+        .expect("resolve serve-shaped config");
+
+        // Pre-fix proof: the OLD exec-path computation (`compute_config_id(_, None)`,
+        // exec.rs:490 before this fix) diverges from the daemon/serve-path
+        // computation (`Some(&khive_cfg)`, serve.rs:916) the instant the backends
+        // topology is non-empty. This is the exact bug: a legitimately-matching
+        // client was rejected as a `ConfigMismatch` and silently fell back to the
+        // cold in-process path on every call.
+        assert_ne!(
+            compute_config_id(&exec_cfg, None),
+            compute_config_id(&serve_cfg, Some(&khive_cfg)),
+            "pre-fix exec computation (None) must diverge from the daemon computation \
+             (Some) for a non-empty backends topology — proves this test catches the \
+             real divergence, not a tautology"
+        );
+
+        // Post-fix proof: both sides fold the SAME backends topology and produce
+        // a byte-identical fingerprint, so the daemon accepts the forwarded frame
+        // instead of rejecting it as a ConfigMismatch.
+        assert_eq!(
+            compute_config_id(&exec_cfg, Some(&khive_cfg)),
+            compute_config_id(&serve_cfg, Some(&khive_cfg)),
+            "exec-path config_id must match the daemon-path config_id for the same \
+             multi-backend topology (D1 fix acceptance gate)"
+        );
+    }
+
+    // ── build_local_fallback_server multi-backend routing (D1-R2) ────────────
+    //
+    // Before this fix, both of exec's local-dispatch call sites always built a
+    // single-backend runtime pointed at `cfg.db_path`, regardless of any
+    // `[[backends]]` declaration in `khive_cfg`. A config pinning a pack (e.g.
+    // `comm`) to a separate backend would have that pack's writes silently
+    // land in whatever single file `cfg.db_path` pointed at instead of the
+    // declared backend file. This test pins `comm` to a second, file-backed
+    // `secondary` backend and proves the write lands there — not in `main` —
+    // by re-opening each backend file independently afterward.
+
+    /// D1-R2 regression proof: `build_local_fallback_server` must delegate to
+    /// `build_server_multi_backend` (not the single-backend `KhiveMcpServer::new`)
+    /// whenever `khive_cfg.backends` is non-empty, and pack routing must actually
+    /// take effect end to end.
+    #[tokio::test]
+    #[serial]
+    async fn build_local_fallback_server_routes_through_multi_backend_when_backends_declared() {
+        use khive_runtime::{BackendConfig, BackendKind, PackConfig};
+
+        let main_db = NamedTempFile::new().expect("main db tempfile");
+        let secondary_db = NamedTempFile::new().expect("secondary db tempfile");
+        let main_path = main_db.path().to_path_buf();
+        let secondary_path = secondary_db.path().to_path_buf();
+
+        let khive_cfg = KhiveConfig {
+            backends: vec![
+                BackendConfig {
+                    name: "main".to_string(),
+                    kind: BackendKind::Sqlite,
+                    path: Some(main_path.clone()),
+                    cache_mb: None,
+                    journal_mode: None,
+                    read_only: false,
+                },
+                BackendConfig {
+                    name: "secondary".to_string(),
+                    kind: BackendKind::Sqlite,
+                    path: Some(secondary_path.clone()),
+                    cache_mb: None,
+                    journal_mode: None,
+                    read_only: false,
+                },
+            ],
+            packs: {
+                let mut m = std::collections::HashMap::new();
+                m.insert(
+                    "comm".to_string(),
+                    PackConfig {
+                        backend: "secondary".to_string(),
+                    },
+                );
+                m
+            },
+            ..KhiveConfig::default()
+        };
+
+        // `db_path` here is NOT the actual storage location when `[[backends]]`
+        // is declared — `build_server_multi_backend` opens each backend's own
+        // declared path (the tempfiles above) independently. It is only the
+        // identity/fingerprint value `assert_db_anchor_consistent` checks
+        // against `resolve_db_anchor(cli_db_override)`, exactly mirroring what
+        // a real `kkernel exec` invocation with NO explicit `--db` flag would
+        // resolve to (the realistic shape when `[[backends]]` fully governs
+        // storage) — see `base_runtime_config_for_multi_backend` in serve.rs's
+        // own multi-backend test suite for the identical pattern.
+        let cfg = RuntimeConfig {
+            db_path: khive_runtime::resolve_db_anchor(None),
+            embedding_model: None,
+            additional_embedding_models: vec![],
+            packs: vec!["kg".to_string(), "comm".to_string()],
+            actor_id: Some("actor-routing-test".to_string()),
+            ..RuntimeConfig::default()
+        };
+
+        // No explicit `--db` override — `[[backends]]` alone governs storage,
+        // matching the `cfg.db_path` shape above. An explicit override here
+        // would be rejected as ambiguous by `build_registry_for_multi_backend`
+        // (ADR-028 §8) since 2 backends are already declared.
+        let server = build_local_fallback_server(cfg, &khive_cfg, None)
+            .expect("multi-backend local fallback must build");
+
+        let send = server
+            .dispatch_request_local(RequestParams {
+                ops: r#"comm.send(to="actor-routing-test", content="routed-via-secondary")"#
+                    .to_string(),
+                presentation: None,
+                presentation_per_op: None,
+                save_to: None,
+                format: None,
+                format_per_op: None,
+            })
+            .await
+            .expect("comm.send must dispatch");
+        let send_resp: serde_json::Value = serde_json::from_str(&send).expect("valid JSON");
+        assert_eq!(
+            send_resp["results"][0]["ok"].as_bool(),
+            Some(true),
+            "comm.send must succeed through the multi-backend fallback server: {send_resp}"
+        );
+
+        // Re-open EACH backend file independently (fresh KhiveMcpServer, no
+        // shared state) and list `message` notes directly against it.
+        async fn count_messages(db_path: &std::path::Path) -> usize {
+            let cfg = RuntimeConfig {
+                db_path: Some(db_path.to_path_buf()),
+                embedding_model: None,
+                additional_embedding_models: vec![],
+                packs: vec!["kg".to_string(), "comm".to_string()],
+                ..RuntimeConfig::default()
+            };
+            let rt = KhiveRuntime::new(cfg).expect("runtime on backend file");
+            let probe = KhiveMcpServer::new(rt).expect("server on backend file");
+            let raw = probe
+                .dispatch_request_local(RequestParams {
+                    ops: r#"list(kind="message")"#.to_string(),
+                    presentation: None,
+                    presentation_per_op: None,
+                    save_to: None,
+                    format: None,
+                    format_per_op: None,
+                })
+                .await
+                .expect("list must dispatch");
+            let resp: serde_json::Value = serde_json::from_str(&raw).expect("valid JSON");
+            resp["results"][0]["result"]
+                .as_array()
+                .map(|a| a.len())
+                .unwrap_or(0)
+        }
+
+        let main_count = count_messages(&main_path).await;
+        let secondary_count = count_messages(&secondary_path).await;
+
+        assert_eq!(
+            main_count, 0,
+            "comm pack must NOT write into the `main` backend file when pinned to \
+             `secondary` (D1-R2: a silent single-backend fallback would have written \
+             it here instead)"
+        );
+        assert_eq!(
+            secondary_count, 2,
+            "comm pack write must land in its declared `secondary` backend file — \
+             `comm.send` dual-writes an outbound + inbound note copy per message \
+             (khive-pack-comm's message.rs), both via the SAME pack runtime, so a \
+             single self-send yields 2 `message` notes in whichever backend `comm` \
+             is pinned to"
+        );
+    }
+
     // ── parse_ops_file tests ───────────────────────────────────────────────────
 
     #[test]
@@ -977,7 +1324,7 @@ default = true
         };
 
         // dry_run=true → no writes.
-        run_exec_ops_file(path.clone(), cfg.clone(), None, true)
+        run_exec_ops_file(path.clone(), cfg.clone(), None, true, None)
             .await
             .unwrap();
 
@@ -1036,7 +1383,7 @@ default = true
             ..RuntimeConfig::default()
         };
 
-        let result = run_exec_inline("stats()".to_string(), cfg, None, None, None).await;
+        let result = run_exec_inline("stats()".to_string(), cfg, None, None, None, None).await;
 
         // Restore env.
         match prev_strict {
@@ -1070,6 +1417,7 @@ default = true
     async fn strict_mode_allows_exec_when_comm_and_actor_configured() {
         let prev_strict = std::env::var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR").ok();
         let prev_no_daemon = std::env::var("KHIVE_NO_DAEMON").ok();
+        let (prev_home, _home_dir) = isolate_home_for_test();
 
         std::env::set_var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR", "1");
         std::env::set_var("KHIVE_NO_DAEMON", "1"); // force in-process to avoid daemon dep
@@ -1082,7 +1430,7 @@ default = true
         };
 
         // The strict gate must pass; the actual dispatch will succeed (stats() is safe).
-        let result = run_exec_inline("stats()".to_string(), cfg, None, None, None).await;
+        let result = run_exec_inline("stats()".to_string(), cfg, None, None, None, None).await;
 
         match prev_strict {
             Some(v) => std::env::set_var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR", v),
@@ -1092,6 +1440,7 @@ default = true
             Some(v) => std::env::set_var("KHIVE_NO_DAEMON", v),
             None => std::env::remove_var("KHIVE_NO_DAEMON"),
         }
+        restore_home(prev_home);
 
         assert!(
             result.is_ok(),
@@ -1106,6 +1455,7 @@ default = true
     async fn strict_mode_off_exec_inline_passes_with_comm_no_actor() {
         let prev_strict = std::env::var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR").ok();
         let prev_no_daemon = std::env::var("KHIVE_NO_DAEMON").ok();
+        let (prev_home, _home_dir) = isolate_home_for_test();
 
         std::env::remove_var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR"); // default OFF
         std::env::set_var("KHIVE_NO_DAEMON", "1");
@@ -1117,7 +1467,7 @@ default = true
             ..RuntimeConfig::default()
         };
 
-        let result = run_exec_inline("stats()".to_string(), cfg, None, None, None).await;
+        let result = run_exec_inline("stats()".to_string(), cfg, None, None, None, None).await;
 
         match prev_strict {
             Some(v) => std::env::set_var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR", v),
@@ -1127,6 +1477,7 @@ default = true
             Some(v) => std::env::set_var("KHIVE_NO_DAEMON", v),
             None => std::env::remove_var("KHIVE_NO_DAEMON"),
         }
+        restore_home(prev_home);
 
         assert!(
             result.is_ok(),
@@ -1194,6 +1545,7 @@ default = true
             None,
             None, // output_format
             None,
+            None, // db
             spy_forward_records_call,
         )
         .await;
@@ -1230,6 +1582,7 @@ default = true
     async fn strict_mode_spy_forward_reached_when_actor_configured() {
         let prev_strict = std::env::var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR").ok();
         let prev_no_daemon = std::env::var("KHIVE_NO_DAEMON").ok();
+        let (prev_home, _home_dir) = isolate_home_for_test();
         std::env::set_var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR", "1");
         // Suppress real daemon; spy still records the call before returning None.
         std::env::set_var("KHIVE_NO_DAEMON", "1");
@@ -1248,6 +1601,7 @@ default = true
             None,
             None, // output_format
             None,
+            None, // db
             spy_forward_records_call,
         )
         .await;
@@ -1263,6 +1617,7 @@ default = true
             Some(v) => std::env::set_var("KHIVE_NO_DAEMON", v),
             None => std::env::remove_var("KHIVE_NO_DAEMON"),
         }
+        restore_home(prev_home);
 
         assert!(
             result.is_ok(),
@@ -1271,6 +1626,143 @@ default = true
         assert!(
             spy_was_called,
             "spy forward_fn must be called when gate passes (KHIVE_NO_DAEMON=1 causes in-process fallback)"
+        );
+    }
+
+    // ── D1-R3 (end-to-end): exec frame config_id vs. daemon config_id ────────
+    //
+    // `exec_config_id_matches_serve_config_id_for_multi_backend_topology` above
+    // proves `compute_config_id` folds the topology identically for exec-shaped
+    // and serve-shaped `RuntimeConfig`s — but it constructs both arms manually
+    // and never calls `run_exec_inline_with_forward` itself, so it would not
+    // notice a revert of the actual `compute_config_id(&cfg, Some(&khive_cfg))`
+    // call at the real call site above. This test closes that gap: it drives
+    // `run_exec_inline_with_forward` for real, against a project-local
+    // `.khive/config.toml` that declares a genuine multi-backend topology, and
+    // captures the DAEMON REQUEST FRAME's actual `config_id` via a spy — the
+    // exact value that would be sent over the wire to a real daemon.
+
+    #[cfg(unix)]
+    std::thread_local! {
+        static SPY_CAPTURED_CONFIG_ID: std::cell::RefCell<Option<String>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    #[cfg(unix)]
+    fn spy_capture_config_id(frame: &DaemonRequestFrame) -> super::ForwardFuture<'_> {
+        SPY_CAPTURED_CONFIG_ID.with(|c| *c.borrow_mut() = Some(frame.config_id.clone()));
+        Box::pin(async { None })
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial]
+    async fn exec_frame_config_id_matches_daemon_config_id_for_multi_backend_project_toml() {
+        std::env::remove_var("KHIVE_EMBEDDING_MODEL");
+        std::env::remove_var("KHIVE_ADDITIONAL_EMBEDDING_MODELS");
+        std::env::remove_var("KHIVE_ACTOR");
+        std::env::remove_var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR");
+        let (prev_home, home_dir) = isolate_home_for_test();
+        SPY_CAPTURED_CONFIG_ID.with(|c| *c.borrow_mut() = None);
+
+        // No explicit `--db` anywhere below — this mirrors the real multi-tenant
+        // deployment shape the bug affects: `~/.khive/config.toml` declares
+        // `[[backends]]` and `kkernel exec` relies on default discovery. An
+        // explicit `--db` would itself be rejected as ambiguous once backends
+        // are declared (ADR-028 §8, `build_registry_for_multi_backend`), so it
+        // is not a legitimate way to reach this scenario — default discovery is.
+        let khive_dir = home_dir.path().join(".khive");
+        std::fs::create_dir_all(&khive_dir).expect("mkdir .khive");
+        let main_backend_path = khive_dir.join("main-backend.db");
+        let sessions_backend_path = khive_dir.join("sessions-backend.db");
+        std::fs::write(
+            khive_dir.join("config.toml"),
+            format!(
+                r#"
+[[backends]]
+name = "main"
+kind = "sqlite"
+path = "{}"
+
+[[backends]]
+name = "sessions"
+kind = "sqlite"
+path = "{}"
+
+[packs.session]
+backend = "sessions"
+"#,
+                main_backend_path.display(),
+                sessions_backend_path.display(),
+            ),
+        )
+        .expect("write multi-backend config.toml");
+
+        // `no_embed: true` keeps this test fast and network-independent — it is
+        // scoped to the backends-topology fold, not embedding-model resolution
+        // (a separate, already-covered concern in the sibling project-toml test).
+        let cfg = resolve_runtime_config(RuntimeConfigInputs {
+            db: None,
+            config: None,
+            namespace: Namespace::parse("local").expect("ns"),
+            namespace_explicit: true,
+            actor_explicit: false,
+            no_embed: true,
+            packs: None,
+            brain_profile: None,
+        })
+        .expect("resolve exec-shaped config");
+
+        let result = run_exec_inline_with_forward(
+            "stats()".to_string(),
+            cfg,
+            None,
+            None,
+            None,
+            None, // db: no explicit --db, matching default discovery
+            spy_capture_config_id,
+        )
+        .await;
+        assert!(result.is_ok(), "exec dispatch must succeed: {result:?}");
+
+        let captured = SPY_CAPTURED_CONFIG_ID
+            .with(|c| c.borrow_mut().take())
+            .expect("spy must have captured a forwarded frame");
+
+        // Independently compute what the DAEMON would compute for the exact
+        // same on-disk config.toml + database, mirroring serve.rs's own boot
+        // path (`build_server`): resolve_runtime_config with
+        // namespace_explicit=false (the daemon-startup shape), load the same
+        // KhiveConfig, and fold it with Some(&khive_cfg) exactly like
+        // serve.rs:916 does.
+        let serve_cfg = resolve_runtime_config(RuntimeConfigInputs {
+            db: None,
+            config: None,
+            namespace: Namespace::parse("local").expect("ns"),
+            namespace_explicit: false,
+            actor_explicit: false,
+            no_embed: true,
+            packs: None,
+            brain_profile: None,
+        })
+        .expect("resolve serve-shaped config");
+        let khive_cfg = KhiveConfig::load_with_home_fallback(None, serve_cfg.db_path.as_deref())
+            .expect("load multi-backend config.toml")
+            .expect("config.toml must be found at tier 3");
+        assert!(
+            !khive_cfg.backends.is_empty(),
+            "sanity: the written config.toml must actually resolve with a non-empty \
+             backends list, or this test proves nothing"
+        );
+        let daemon_config_id = compute_config_id(&serve_cfg, Some(&khive_cfg));
+        restore_home(prev_home);
+
+        assert_eq!(
+            captured, daemon_config_id,
+            "the config_id in the ACTUAL frame run_exec_inline_with_forward sends to the \
+             daemon must be byte-identical to what the daemon computes for the same \
+             multi-backend config.toml (D1 acceptance gate, exercised end-to-end through \
+             the real call site rather than a standalone compute_config_id comparison)"
         );
     }
 
