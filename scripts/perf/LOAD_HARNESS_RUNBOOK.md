@@ -27,17 +27,22 @@ dimensions — it measures and reports. Read the JSON report yourself.
 
 ## Running
 
-Reduced local smoke (proves the plumbing runs without erroring, at 1/5 scale):
+Reduced local smoke (proves the plumbing runs without erroring, at 1/5 scale).
+Relies on the 7-pack `--packs` default: the hermetic single-file scratch DB
+omits `session`, whose lazily-applied mirror schema fails bootstrap recall on
+that config and whose background writes would confound the reduced-scale gauges.
 
 ```bash
 uv run scripts/perf/bench_load_harness.py --mode real --workers 20 --tenants 4 --ops-per-worker 20
 ```
 
 Full acceptance shape (100 connections × 20 tenant namespaces, the actual
-gate target):
+gate target). Pass `--packs` explicitly to measure the full 8-pack production
+posture — including `session` — against a real multi-pack config:
 
 ```bash
-uv run scripts/perf/bench_load_harness.py --mode real --workers 100 --tenants 20 --ops-per-worker 50
+uv run scripts/perf/bench_load_harness.py --mode real --workers 100 --tenants 20 --ops-per-worker 50 \
+  --packs kg,gtd,memory,brain,comm,schedule,knowledge,session
 ```
 
 `--workers` must be an exact multiple of `--tenants` (workers are split
