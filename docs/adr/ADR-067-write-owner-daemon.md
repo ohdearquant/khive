@@ -693,3 +693,49 @@ The following are explicitly excluded from this ADR:
 - `crates/kkernel/src/exec.rs` — `apply_ops_file` and daemon fast-path bypass (`exec.rs:214`, `408`)
 - PR #221 — Slice 1: `CheckpointConfig` and `run_checkpoint_task` (in-flight, ADR-independent; must land before Slice 2)
 - Issue #195: cross-op atomicity for `--ops-file` bulk apply
+
+## Amendment 1 (2026-07-06)
+
+Component A landed in full (PR #670). This amendment corrects the migration inventory
+against the merged implementation and records two seams the implementation added beyond
+the original text.
+
+### Seams shipped beyond the original text
+
+1. **`SqlAccess::atomic_unit`** — a transaction-enlisted closure seam. With the write
+   queue enabled, the closure runs on the writer task's own transaction for the request;
+   with it disabled, a manual `BEGIN IMMEDIATE`/`COMMIT`/`ROLLBACK` path byte-identical to
+   the prior behavior. Multi-statement write units (brain persist, fold-gate) were
+   converted onto it.
+2. **`SqlWriter::execute_script_top_level`** — a top-level maintenance seam for statements
+   SQLite forbids inside any transaction (`VACUUM`, `PRAGMA wal_checkpoint(TRUNCATE)`).
+   Requests serialize through the same writer channel and drain loop, but the transaction
+   wrap is skipped. Callers: `memory.vacuum` and the VCS sync WAL checkpoint. Both carry
+   revert-companion tests proving the plain routed path fails under the queue.
+
+Additionally, `block_on_sync` returns a typed error (rather than panicking) on a pending
+future, and the writer task survives such an error; covered by a regression test.
+
+### Corrected inventory (final state at merge)
+
+Anchors are given by function name; line numbers in the original inventory tables have
+drifted and should not be relied on.
+
+| Path                                                                                             | State at merge                                                                                                                                                                                                   | Disposition                                                                                                                                                                 |
+| ------------------------------------------------------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| All store write paths (entity, note, graph, text, event, sparse, vectors CRUD) via `with_writer` | Routed through the writer task                                                                                                                                                                                   | DONE                                                                                                                                                                        |
+| `SqlBridge::writer` / `execute` / `execute_script` / `execute_batch`                             | Routed                                                                                                                                                                                                           | DONE                                                                                                                                                                        |
+| Brain persist + fold-gate multi-statement units                                                  | Converted to `atomic_unit`                                                                                                                                                                                       | DONE                                                                                                                                                                        |
+| `memory.vacuum`, VCS `checkpoint_wal`                                                            | `execute_script_top_level`                                                                                                                                                                                       | DONE                                                                                                                                                                        |
+| Entry 9 — `begin_tx()`                                                                           | Standalone connection; **sole live production caller** is session-mirror ingest (`write_events_and_cursor` in `khive-pack-session/src/mirror/ingest.rs`); all other references are tests or explanatory comments | DEFERRED to the follow-up ADR (issue #195 companion), which converts the caller to `atomic_unit` and retires the method if no non-test caller remains                       |
+| Vector-store `orphan_sweep` (`with_writer_unmanaged`)                                            | Opens its own `BEGIN IMMEDIATE` on a pool writer connection outside the writer task; serialized against other pool-mutex callers but **not** against the writer task under the queue                             | MIGRATE — convert to `atomic_unit` (mechanical; the accepted seam covers it). Until converted, this is a known residual competing-writer path alongside `begin_tx`'s caller |
+| Periodic checkpoint task (`try_writer_nowait` + direct `execute_batch`)                          | Deliberate bypass of the channel; nowait acquisition, never holds a transaction across the checkpoint                                                                                                            | EXEMPT (by design)                                                                                                                                                          |
+| Startup migrations + pack DDL (direct pool at boot)                                              | Run before concurrent traffic exists                                                                                                                                                                             | EXEMPT (by design)                                                                                                                                                          |
+
+### Clarification to the "Issue #195 — decision" section
+
+The original text says the follow-up work "depends on Component A's `WriterTask` being the
+stable owner of write connections." Precisely: the bulk-apply path runs against an
+in-process runtime (it does not traverse the daemon), so the dependency is on the
+**`atomic_unit` seam** — whose queue-on and queue-off arms are both shipped — rather than
+on the daemon-resident task being in the loop for that path.

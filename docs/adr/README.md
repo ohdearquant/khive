@@ -122,6 +122,7 @@ For historical context, see [v0 archive](../_archive/adr_v0/README.md). v0 ADRs 
 | [ADR-094](ADR-094-lifecycle-telemetry-events.md)             | Sequencing-Assertable Lifecycle Telemetry Events (Proposed)                                                     |
 | [ADR-095](ADR-095-verb-surface-consolidation.md)             | Verb-Surface Consolidation and Field-Validation Governance (Proposed)                                           |
 | [ADR-096](ADR-096-warm-daemon-per-request-identity.md)       | Warm Daemon Per-Request Identity — Serving Many Attribution Identities Over One Shared Backend (Accepted)       |
+| [ADR-099](ADR-099-bulk-apply-atomic-units.md)                | Cross-Op Atomicity for Bulk Apply — Atomic Units over the Single-Writer Seam (Accepted)                         |
 
 ## Closed Taxonomies — Quick Reference
 
