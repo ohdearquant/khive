@@ -837,7 +837,7 @@ impl BrainPack {
         let event_payload = json!({ "profile_id": profile_id, "lifecycle": lifecycle.clone() });
 
         crate::persist::persist_brain_state_mutation(
-            &self.runtime,
+            self.runtime.sql().as_ref(),
             token,
             &self.persistence,
             &self.state,
@@ -910,7 +910,7 @@ impl BrainPack {
         // applied to a proposed state copy and only takes effect after the
         // brain event-log append + snapshot upsert commit.
         crate::persist::persist_brain_state_mutation(
-            &self.runtime,
+            self.runtime.sql().as_ref(),
             token,
             &self.persistence,
             &self.state,
@@ -1284,7 +1284,7 @@ impl BrainPack {
         // `self.state` is left completely untouched (no phantom in-memory
         // posterior update that vanishes on restart).
         crate::persist::persist_brain_state_mutation(
-            &self.runtime,
+            self.runtime.sql().as_ref(),
             token,
             &self.persistence,
             &self.state,
@@ -1618,7 +1618,7 @@ impl BrainPack {
         // change is applied to a proposed state copy and only takes effect
         // after the brain event-log append + snapshot upsert commit.
         crate::persist::persist_brain_state_mutation(
-            &self.runtime,
+            self.runtime.sql().as_ref(),
             token,
             &self.persistence,
             &self.state,
@@ -1712,7 +1712,7 @@ impl BrainPack {
         // removal is applied to a proposed state copy and only takes effect
         // after the brain event-log append + snapshot upsert commit.
         crate::persist::persist_brain_state_mutation(
-            &self.runtime,
+            self.runtime.sql().as_ref(),
             token,
             &self.persistence,
             &self.state,
@@ -1861,7 +1861,7 @@ impl BrainPack {
         // upsert commit — so a persistence failure never leaves a phantom
         // profile that vanishes on restart.
         crate::persist::persist_brain_state_mutation(
-            &self.runtime,
+            self.runtime.sql().as_ref(),
             token,
             &self.persistence,
             &self.state,

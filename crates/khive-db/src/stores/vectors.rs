@@ -3211,17 +3211,6 @@ mod write_queue_tests {
     use super::*;
     use crate::pool::{ConnectionPool, PoolConfig};
 
-    fn make_file_backed_pool(path: std::path::PathBuf) -> Arc<ConnectionPool> {
-        crate::extension::ensure_extensions_loaded();
-        Arc::new(
-            ConnectionPool::new(PoolConfig {
-                path: Some(path),
-                ..PoolConfig::default()
-            })
-            .expect("file-backed pool"),
-        )
-    }
-
     fn create_vec_table(pool: &Arc<ConnectionPool>, model_key: &str, dims: usize) {
         let ddl = format!(
             "CREATE VIRTUAL TABLE IF NOT EXISTS vec_{} USING vec0(\
@@ -3240,18 +3229,30 @@ mod write_queue_tests {
             .expect("create vec table");
     }
 
-    /// `#[serial]`: mutates the process-global `KHIVE_WRITE_QUEUE` env var,
-    /// shared with `pool.rs`'s own env-override tests in this same test binary.
+    /// Constructed via a `PoolConfig` literal (`write_queue_enabled: true`),
+    /// not the `KHIVE_WRITE_QUEUE` env var — that env var is process-global
+    /// and this crate's other tests are NOT `#[serial]` against it, so a
+    /// window where it is set here could leak into a
+    /// concurrently-scheduled test's own pool construction (ADR-067 Fork C
+    /// slice 2 round 2, LOW finding). Builds the pool inline (rather than
+    /// via `make_file_backed_pool`, which hardcodes `PoolConfig::default()`)
+    /// so `write_queue_enabled` can be set directly in the literal.
     #[tokio::test]
-    #[serial_test::serial]
     async fn insert_batch_routes_through_writer_task_when_flag_enabled() {
-        std::env::set_var("KHIVE_WRITE_QUEUE", "1");
+        crate::extension::ensure_extensions_loaded();
 
         let model_key = "write_queue_flag_test";
         let dims = 4usize;
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("write_queue_vectors.db");
-        let pool = make_file_backed_pool(path);
+        let pool = Arc::new(
+            ConnectionPool::new(PoolConfig {
+                path: Some(path),
+                write_queue_enabled: true,
+                ..PoolConfig::default()
+            })
+            .expect("file-backed pool"),
+        );
         create_vec_table(&pool, model_key, dims);
 
         let store = SqliteVecStore::new(
@@ -3263,7 +3264,6 @@ mod write_queue_tests {
             "ns:test".to_string(),
         )
         .expect("SqliteVecStore::new");
-        std::env::remove_var("KHIVE_WRITE_QUEUE");
 
         let id1 = Uuid::new_v4();
         let id2 = Uuid::new_v4();

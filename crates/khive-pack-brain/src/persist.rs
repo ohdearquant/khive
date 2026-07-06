@@ -317,42 +317,45 @@ pub struct BrainMutationEvent {
     pub payload: Value,
 }
 
-async fn exec_raw(writer: &mut dyn SqlWriter, sql: &str, label: &str) -> Result<(), RuntimeError> {
-    writer
-        .execute(SqlStatement {
-            sql: sql.to_string(),
-            params: Vec::new(),
-            label: Some(label.to_string()),
-        })
-        .await
-        .map_err(|e| sql_err(label, e))?;
-    Ok(())
-}
-
 /// Apply a `BrainState` mutation with durability as part of the success
 /// contract (issues #457/#458).
 ///
 /// `mutate` runs against a *proposed* copy of the state (never the live
 /// `state` mutex) built via a snapshot round-trip. Its result and the
 /// resulting snapshot are then persisted — brain event-log append AND
-/// snapshot upsert — inside ONE `BEGIN IMMEDIATE` transaction held on a
-/// single `SqlWriter` connection. Only after that transaction commits does
-/// the proposed state replace the live state and the tracker get marked
-/// clean.
+/// snapshot upsert — as ONE atomic unit via `SqlAccess::atomic_unit`
+/// (ADR-067 Component A, Fork C slice 2 round 2). Only after that unit
+/// commits does the proposed state replace the live state and the tracker
+/// get marked clean.
 ///
 /// This deliberately does NOT use `SqlAccess::begin_tx` — per `fold_gate.rs`'s
 /// module doc, that API requires a file-backed database and errors for
 /// in-memory pools (used throughout this crate's test suite and by
-/// `KhiveRuntime::memory()`). Issuing `BEGIN IMMEDIATE`/`COMMIT`/`ROLLBACK` as
-/// ordinary statements on a plain `SqlWriter` handle gives the same
-/// all-or-nothing guarantee on both backends.
+/// `KhiveRuntime::memory()`). It also, as of this round, does NOT issue a
+/// manual `BEGIN IMMEDIATE`/`COMMIT`/`ROLLBACK` sequence on a plain
+/// `SqlWriter` handle: under `KHIVE_WRITE_QUEUE=1` that sequence would nest
+/// inside the WriterTask's own per-request `BEGIN IMMEDIATE`, which SQLite
+/// rejects ("cannot start a transaction within a transaction" — the same
+/// class of bug `fold_gate.rs`'s `atomic_unit` conversion fixed). Handing the
+/// whole append+upsert unit to `atomic_unit` instead means the WriterTask's
+/// own transaction wrapping provides the atomicity on the flag-on path, and
+/// `run_manual_atomic_unit` (khive-db) preserves the old manual-transaction
+/// shape byte-for-byte on the flag-off/in-memory path.
 ///
-/// If `mutate` fails, or the transaction fails to begin, append, upsert, or
-/// commit, this returns `Err` and the live state is left completely
-/// untouched — there is no in-memory mutation to roll back because it was
-/// never applied to the shared state in the first place.
+/// If `mutate` fails, or the atomic unit fails to append, upsert, or commit,
+/// this returns `Err` and the live state is left completely untouched —
+/// there is no in-memory mutation to roll back because it was never applied
+/// to the shared state in the first place.
+///
+/// Takes `sql: &dyn SqlAccess` rather than `&KhiveRuntime` — the only thing
+/// this function ever needed from the runtime was its `SqlAccess` handle
+/// (`KhiveRuntime::sql()`). Narrowing the parameter lets tests exercise this
+/// function against a bare `SqlBridge`/`ConnectionPool` (write-queue-enabled
+/// via a `PoolConfig` literal, mirroring `fold_gate.rs`'s routing test)
+/// without needing a full file-backed `KhiveRuntime` and its associated
+/// `KHIVE_WRITE_QUEUE` env-var race across this crate's test binary.
 pub async fn persist_brain_state_mutation<R>(
-    runtime: &KhiveRuntime,
+    sql: &dyn SqlAccess,
     token: &NamespaceToken,
     tracker: &Mutex<PersistenceTracker>,
     state: &Mutex<BrainState>,
@@ -371,40 +374,42 @@ pub async fn persist_brain_state_mutation<R>(
     let result = mutate(&mut proposed)?;
     let snapshot = proposed.to_snapshot();
 
-    let sql = runtime.sql();
-    let mut writer = sql.writer().await.map_err(|e| sql_err("writer", e))?;
+    let namespace_for_op = namespace.clone();
+    let profile_id = event.profile_id;
+    let event_kind = event.event_kind;
+    let payload = event.payload;
+    let op: khive_storage::AtomicUnitOp = Box::new(move |writer| {
+        Box::pin(async move {
+            append_brain_event_on_writer(
+                writer,
+                &namespace_for_op,
+                &profile_id,
+                &event_kind,
+                &payload,
+                now_us,
+            )
+            .await
+            .map_err(|e| {
+                khive_storage::StorageError::driver(
+                    khive_storage::StorageCapability::Sql,
+                    "brain_persist_append_event",
+                    e,
+                )
+            })?;
+            upsert_snapshot_on_writer(writer, &namespace_for_op, &snapshot, now_us)
+                .await
+                .map_err(|e| {
+                    khive_storage::StorageError::driver(
+                        khive_storage::StorageCapability::Sql,
+                        "brain_persist_upsert_snapshot",
+                        e,
+                    )
+                })?;
+            Ok(Box::new(()) as Box<dyn std::any::Any + Send>)
+        })
+    });
 
-    exec_raw(writer.as_mut(), "BEGIN IMMEDIATE", "begin mutation tx").await?;
-    let _tx_handle =
-        khive_storage::tx_registry::register(Some("brain_persist_mutation".to_string()));
-
-    let write_result: Result<(), RuntimeError> = async {
-        append_brain_event_on_writer(
-            writer.as_mut(),
-            &namespace,
-            &event.profile_id,
-            &event.event_kind,
-            &event.payload,
-            now_us,
-        )
-        .await?;
-        upsert_snapshot_on_writer(writer.as_mut(), &namespace, &snapshot, now_us).await?;
-        Ok(())
-    }
-    .await;
-
-    match write_result {
-        Ok(()) => {
-            if let Err(e) = exec_raw(writer.as_mut(), "COMMIT", "commit mutation tx").await {
-                let _ = exec_raw(writer.as_mut(), "ROLLBACK", "rollback mutation tx").await;
-                return Err(e);
-            }
-        }
-        Err(e) => {
-            let _ = exec_raw(writer.as_mut(), "ROLLBACK", "rollback mutation tx").await;
-            return Err(e);
-        }
-    }
+    sql.atomic_unit(op).await?;
 
     {
         let mut live = state.lock().unwrap();
@@ -1482,5 +1487,145 @@ mod braincore_aud_001_capacity {
             err.contains("snapshot invariant violation"),
             "error must name the load-boundary invariant violation, got: {err}"
         );
+    }
+}
+
+// ── ADR-067 Fork C slice 2 round 2 (BLOCKER B): persist_brain_state_mutation
+// write-queue routing ──────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod persist_write_queue_routing {
+    use super::*;
+    use khive_brain_core::BrainState;
+    use khive_runtime::{KhiveRuntime, Namespace};
+
+    /// Fork C slice 2 round 2 (BLOCKER B): proves `persist_brain_state_mutation`
+    /// — after its conversion from a manual `BEGIN IMMEDIATE`/`COMMIT` sequence
+    /// to the `SqlAccess::atomic_unit` seam — is actually enqueued on the
+    /// pool's shared `WriterTaskHandle` channel when the write queue is
+    /// enabled, mirroring `fold_gate.rs`'s
+    /// `fold_gate_apply_routes_through_writer_task_when_flag_enabled` test
+    /// (same `queue_depth` + occupier-parked-on-oneshot technique; a
+    /// wall-clock/timing-based test would be indistinguishable from the
+    /// flag-off fallback, which serializes via real SQLite file locking
+    /// regardless of Rust-level routing — see that test's doc comment for the
+    /// full rationale).
+    ///
+    /// Deliberately does NOT construct a full file-backed `KhiveRuntime` (with
+    /// or without the `KHIVE_WRITE_QUEUE` env var) for the `sql` handle this
+    /// function now takes directly: `persist_brain_state_mutation`'s `sql`
+    /// parameter is a bare `&dyn SqlAccess`, so this test builds a
+    /// `ConnectionPool`/`SqlBridge` straight from a `PoolConfig` literal with
+    /// `write_queue_enabled: true` (no env var, no `#[serial]`, no risk to any
+    /// other test in this binary — the exact env-var race documented on the
+    /// fold_gate test). A `NamespaceToken` is still required by this
+    /// function's signature; `NamespaceToken`'s constructors are
+    /// crate-private to `khive-runtime`, so one is minted via
+    /// `KhiveRuntime::memory().authorize(..)` — an in-memory runtime never
+    /// spawns a writer task (`open_standalone_writer` requires a real file
+    /// path) and is completely inert with respect to `KHIVE_WRITE_QUEUE`,
+    /// so minting the token this way cannot introduce the race either.
+    #[tokio::test]
+    async fn persist_brain_state_mutation_routes_through_writer_task_when_flag_enabled() {
+        // Token minted from an in-memory runtime: never touches the write
+        // queue / env var, used only for its `NamespaceToken`.
+        let token_rt = KhiveRuntime::memory().expect("memory runtime for token minting");
+        let token = token_rt
+            .authorize(Namespace::local())
+            .expect("authorize local namespace");
+
+        // The actual storage this test exercises: a bare, file-backed,
+        // write-queue-enabled pool/bridge — no KhiveRuntime, no env var.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("persist-write-queue-routing.db");
+        let pool_cfg = khive_db::PoolConfig {
+            path: Some(db_path),
+            write_queue_enabled: true,
+            ..khive_db::PoolConfig::default()
+        };
+        let pool = std::sync::Arc::new(khive_db::ConnectionPool::new(pool_cfg).expect("pool"));
+        {
+            let mut writer = pool.writer().expect("writer");
+            khive_db::run_migrations(writer.conn_mut()).expect("migrations");
+        }
+        let sql: std::sync::Arc<dyn SqlAccess> =
+            std::sync::Arc::new(khive_db::SqlBridge::new(std::sync::Arc::clone(&pool), true));
+
+        let writer_task = pool
+            .writer_task_handle()
+            .unwrap()
+            .expect("writer task must be spawned with the flag on for a file-backed pool");
+
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel::<()>();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let occupier = {
+            let writer_task = writer_task.clone();
+            tokio::spawn(async move {
+                writer_task
+                    .send(move |_conn| {
+                        let _ = started_tx.send(());
+                        let _ = release_rx.blocking_recv();
+                        Ok::<(), khive_storage::StorageError>(())
+                    })
+                    .await
+            })
+        };
+
+        started_rx
+            .await
+            .expect("occupier must signal it has started running inside the writer task");
+        assert_eq!(
+            writer_task.queue_depth(),
+            0,
+            "channel must start empty once the occupier has been dequeued and is running"
+        );
+
+        let tracker: Mutex<PersistenceTracker> = Mutex::new(PersistenceTracker::new());
+        let state: Mutex<BrainState> = Mutex::new(BrainState::new(16));
+
+        let persist_task = tokio::spawn(async move {
+            persist_brain_state_mutation(
+                sql.as_ref(),
+                &token,
+                &tracker,
+                &state,
+                BrainMutationEvent {
+                    profile_id: "write-queue-routing-profile".to_string(),
+                    event_kind: "brain.test_mutation".to_string(),
+                    payload: serde_json::json!({"probe": true}),
+                },
+                16,
+                |_state: &mut BrainState| -> Result<(), RuntimeError> { Ok(()) },
+            )
+            .await
+        });
+
+        let mut saw_enqueued = false;
+        for _ in 0..100 {
+            if writer_task.queue_depth() >= 1 {
+                saw_enqueued = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert!(
+            saw_enqueued,
+            "persist_brain_state_mutation's atomic_unit request never appeared in the \
+             writer task's channel while the occupier held the single drain slot — \
+             atomic_unit is not routing this call through the shared writer task"
+        );
+
+        release_tx
+            .send(())
+            .expect("occupier must still be waiting on the release signal");
+        occupier
+            .await
+            .expect("occupier task must not panic")
+            .expect("occupier write must succeed");
+
+        persist_task
+            .await
+            .expect("persist_task must not panic")
+            .expect("persist_brain_state_mutation must succeed once unblocked");
     }
 }

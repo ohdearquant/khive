@@ -48,9 +48,18 @@ type WriteOp<R> = Box<dyn FnOnce(&Connection) -> Result<R, StorageError> + Send>
 /// return type `R` (e.g. `BatchWriteSummary`) is preserved end to end,
 /// while [`AnyWriteRequest`] lets the drain loop hold heterogeneous
 /// requests in one homogeneous channel.
+///
+/// `top_level` (ADR-067 Component A, Fork C slice 2 round 2): when `true`,
+/// the drain loop runs this request's operation WITHOUT wrapping it in a
+/// `BEGIN IMMEDIATE`/`COMMIT`/`ROLLBACK` — still serialized through the
+/// single writer owner (only one request drains at a time regardless of
+/// this flag), but with the transaction wrap skipped entirely. Exists for
+/// statements SQLite forbids inside any open transaction (e.g. `VACUUM`);
+/// see [`WriterTaskHandle::send_top_level`].
 pub struct WriteRequest<R: Send + 'static> {
     op: WriteOp<R>,
     reply: oneshot::Sender<Result<R, StorageError>>,
+    top_level: bool,
 }
 
 mod sealed {
@@ -81,6 +90,17 @@ pub trait AnyWriteRequest: sealed::Sealed + Send {
     /// that case.
     fn execute_and_reply(self: Box<Self>, conn: &Connection);
 
+    /// Runs this request's operation directly against `conn` — no
+    /// transaction wrap, no `COMMIT`/`ROLLBACK` — and sends the result to
+    /// the request's oneshot reply channel.
+    ///
+    /// Used only for [`Self::is_top_level`] requests: the drain loop calls
+    /// this INSTEAD of `execute_and_reply` for such requests, skipping
+    /// `BEGIN IMMEDIATE` entirely so a statement that must run outside any
+    /// transaction (e.g. `VACUUM`) can still be serialized through the
+    /// single writer owner.
+    fn execute_and_reply_top_level(self: Box<Self>, conn: &Connection);
+
     /// Replies with `err` without running this request's operation or
     /// touching `conn`.
     ///
@@ -93,6 +113,11 @@ pub trait AnyWriteRequest: sealed::Sealed + Send {
     /// Skipping the operation entirely keeps "the caller got an error" and
     /// "no rows landed" true together.
     fn reply_error(self: Box<Self>, err: StorageError);
+
+    /// `true` if the drain loop must run this request via
+    /// [`Self::execute_and_reply_top_level`] (no transaction wrap) instead
+    /// of [`Self::execute_and_reply`] (wrapped in `BEGIN IMMEDIATE`).
+    fn is_top_level(&self) -> bool;
 }
 
 impl<R: Send + 'static> AnyWriteRequest for WriteRequest<R> {
@@ -119,10 +144,21 @@ impl<R: Send + 'static> AnyWriteRequest for WriteRequest<R> {
         let _ = self.reply.send(final_result);
     }
 
+    fn execute_and_reply_top_level(self: Box<Self>, conn: &Connection) {
+        let outcome = (self.op)(conn);
+        // No COMMIT/ROLLBACK here: this request explicitly did not open a
+        // transaction, so there is nothing for this method to close.
+        let _ = self.reply.send(outcome);
+    }
+
     fn reply_error(self: Box<Self>, err: StorageError) {
         // Same "receiver may already be gone" reasoning as above — send and
         // move on regardless of outcome.
         let _ = self.reply.send(Err(err));
+    }
+
+    fn is_top_level(&self) -> bool {
+        self.top_level
     }
 }
 
@@ -154,10 +190,26 @@ impl WriterTaskHandle {
         R: Send + 'static,
         F: FnOnce(&Connection) -> Result<R, StorageError> + Send + 'static,
     {
+        self.enqueue_inner(op, false).await
+    }
+
+    /// Shared enqueue path for both transaction-wrapped ([`Self::enqueue`])
+    /// and top-level ([`Self::send_top_level`]) requests — `top_level`
+    /// controls which [`AnyWriteRequest`] method the drain loop invokes.
+    async fn enqueue_inner<R, F>(
+        &self,
+        op: F,
+        top_level: bool,
+    ) -> Result<oneshot::Receiver<Result<R, StorageError>>, StorageError>
+    where
+        R: Send + 'static,
+        F: FnOnce(&Connection) -> Result<R, StorageError> + Send + 'static,
+    {
         let (reply_tx, reply_rx) = oneshot::channel();
         let request = WriteRequest {
             op: Box::new(op),
             reply: reply_tx,
+            top_level,
         };
 
         self.tx
@@ -218,6 +270,28 @@ impl WriterTaskHandle {
             }
         };
 
+        reply_rx.await.map_err(|_| {
+            StorageError::Internal("writer task dropped before replying".to_string())
+        })?
+    }
+
+    /// Send a write operation that MUST run outside any open transaction
+    /// (e.g. `VACUUM`, which SQLite forbids inside `BEGIN`/`COMMIT`) and
+    /// await its typed reply.
+    ///
+    /// Still serialized through the same single writer owner as
+    /// [`Self::send`] — the request goes through the identical bounded
+    /// channel and drain loop, one request at a time — but the drain loop
+    /// skips the per-request `BEGIN IMMEDIATE`/`COMMIT`/`ROLLBACK` wrap
+    /// entirely for this request (ADR-067 Component A, Fork C slice 2
+    /// round 2, BLOCKER A). The single-writer guarantee is preserved; only
+    /// the transaction wrap is skipped.
+    pub async fn send_top_level<R, F>(&self, op: F) -> Result<R, StorageError>
+    where
+        R: Send + 'static,
+        F: FnOnce(&Connection) -> Result<R, StorageError> + Send + 'static,
+    {
+        let reply_rx = self.enqueue_inner(op, true).await?;
         reply_rx.await.map_err(|_| {
             StorageError::Internal("writer task dropped before replying".to_string())
         })?
@@ -294,6 +368,17 @@ async fn run_writer_task(
 ) {
     while let Some(request) = rx.recv().await {
         let outcome = tokio::task::spawn_blocking(move || {
+            if request.is_top_level() {
+                // ADR-067 Component A, Fork C slice 2 round 2 (BLOCKER A):
+                // no BEGIN IMMEDIATE for this request — some statements
+                // (e.g. VACUUM) are rejected by SQLite inside any open
+                // transaction. Still runs on this task's dedicated
+                // connection and still serialized one-request-at-a-time by
+                // this same drain loop, so the single-writer guarantee
+                // holds; only the transaction wrap is skipped.
+                request.execute_and_reply_top_level(&conn);
+                return conn;
+            }
             let _tx_handle =
                 khive_storage::tx_registry::register(Some("writer_task_tx".to_string()));
             match conn.execute_batch("BEGIN IMMEDIATE") {

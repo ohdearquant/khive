@@ -1367,18 +1367,19 @@ async fn upsert_documents_first_error_populated_on_item_failure() {
 /// routes through the WriterTask channel instead of the pool-mutex path, and
 /// both documents are actually committed and independently readable back.
 ///
-/// `#[serial]`: mutates the process-global `KHIVE_WRITE_QUEUE` env var,
-/// shared with `pool.rs`'s own env-override tests in this same test binary.
+/// Constructed via a `PoolConfig` literal (`write_queue_enabled: true`), not
+/// the `KHIVE_WRITE_QUEUE` env var — that env var is process-global and this
+/// crate's other tests are NOT `#[serial]` against it, so a window where it
+/// is set here could leak into a concurrently-scheduled test's own pool
+/// construction (ADR-067 Fork C slice 2 round 2, LOW finding).
 #[tokio::test]
-#[serial_test::serial]
 async fn upsert_documents_routes_through_writer_task_when_flag_enabled() {
-    std::env::set_var("KHIVE_WRITE_QUEUE", "1");
-
     let table_key = "write_queue_flag_test";
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("write_queue_text.db");
     let pool_cfg = PoolConfig {
         path: Some(path.clone()),
+        write_queue_enabled: true,
         ..PoolConfig::default()
     };
     let pool = Arc::new(ConnectionPool::new(pool_cfg).unwrap());
@@ -1388,7 +1389,6 @@ async fn upsert_documents_routes_through_writer_task_when_flag_enabled() {
     }
 
     let store = Fts5TextSearch::new(Arc::clone(&pool), true, table_key.to_string());
-    std::env::remove_var("KHIVE_WRITE_QUEUE");
 
     let subject1 = Uuid::new_v4();
     let subject2 = Uuid::new_v4();

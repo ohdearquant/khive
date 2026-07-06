@@ -476,6 +476,43 @@ impl khive_storage::SqlWriter for SqliteWriter {
         self.conn = Some(conn);
         result.map_err(|e| map_rusqlite_err(e, "execute_script"))
     }
+
+    async fn execute_script_top_level(
+        &mut self,
+        script: String,
+    ) -> khive_storage::types::StorageResult<()> {
+        // ADR-067 Component A (Fork C slice 2 round 2, BLOCKER A): unlike
+        // `execute_script`, this must NOT run inside the writer task's
+        // per-request `BEGIN IMMEDIATE` — statements such as VACUUM are
+        // rejected by SQLite inside any open transaction. Route through
+        // `WriterTaskHandle::send_top_level`, which still serializes this
+        // call through the single writer owner but skips the transaction
+        // wrap entirely.
+        if let Some(writer_task) = self.writer_task.clone() {
+            return writer_task
+                .send_top_level(move |conn| {
+                    conn.execute_batch(&script)
+                        .map_err(|e| map_rusqlite_err(e, "execute_script_top_level"))
+                })
+                .await;
+        }
+
+        // Flag off / no writer task: identical to `execute_script`'s own
+        // flag-off path — a bare `execute_batch` on the standalone
+        // connection, already transaction-free.
+        let conn = self.conn.take().ok_or_else(|| StorageError::Pool {
+            operation: "execute_script_top_level".into(),
+            message: "connection already consumed".into(),
+        })?;
+        let (conn, result) = tokio::task::spawn_blocking(move || {
+            let res = conn.execute_batch(&script);
+            (conn, res)
+        })
+        .await
+        .map_err(|e| StorageError::driver(StorageCapability::Sql, "execute_script_top_level", e))?;
+        self.conn = Some(conn);
+        result.map_err(|e| map_rusqlite_err(e, "execute_script_top_level"))
+    }
 }
 
 // =============================================================================
@@ -1009,11 +1046,25 @@ impl khive_storage::SqlWriter for InlineWriter {
 ///
 /// Only sound for futures that never actually suspend — every caller in
 /// this module drives an [`InlineWriter`], whose methods are pure
-/// synchronous rusqlite calls with no real `.await` point. Panics loudly
-/// (rather than silently hanging or busy-looping) if that invariant is ever
-/// violated, since that would mean a future genuinely needs a real
-/// executor.
-fn block_on_sync<F: std::future::Future>(fut: F) -> F::Output {
+/// synchronous rusqlite calls with no real `.await` point.
+///
+/// ADR-067 Component A, Fork C slice 2 round 2 (HIGH finding): this used to
+/// `unreachable!()`-panic on `Poll::Pending`, and a panicking closure
+/// running inside the writer task's `spawn_blocking` (see
+/// `SqlBridge::atomic_unit`'s flag-on branch) would surface as a
+/// `JoinError` in `run_writer_task`, which is treated as fatal — the writer
+/// task exits and every subsequent `WriterTaskHandle::send` on this pool
+/// fails for the rest of the process. A future `atomic_unit` caller whose
+/// closure ever gains a real suspend point (this file's own contract
+/// already forbids it, but the invariant is enforced by convention, not the
+/// type system) would take down the writer task for the whole daemon.
+/// Returning `Err` instead lets `Pending` flow through the SAME error path
+/// as any other `atomic_unit` op failure: `WriteRequest::execute_and_reply`
+/// treats it as an ordinary `Err`, issues `ROLLBACK` on the writer task's
+/// held transaction, replies the error to the caller, and the writer task's
+/// `spawn_blocking` closure returns normally (not via panic) — so the task
+/// keeps draining subsequent requests instead of dying with the whole pool.
+fn block_on_sync<F: std::future::Future>(fut: F) -> Result<F::Output, StorageError> {
     use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 
     fn no_op(_: *const ()) {}
@@ -1030,11 +1081,17 @@ fn block_on_sync<F: std::future::Future>(fut: F) -> F::Output {
 
     let mut fut = std::pin::pin!(fut);
     match fut.as_mut().poll(&mut cx) {
-        Poll::Ready(v) => v,
-        Poll::Pending => unreachable!(
-            "block_on_sync: future was Pending on first poll — InlineWriter's \
-             methods must be purely synchronous with no real await points"
-        ),
+        Poll::Ready(v) => Ok(v),
+        Poll::Pending => {
+            tracing::error!(
+                "block_on_sync: atomic_unit future suspended on its first poll — \
+                 the closure passed to SqlAccess::atomic_unit must be non-blocking \
+                 (synchronous InlineWriter calls only, no real .await point)"
+            );
+            Err(StorageError::Internal(
+                "atomic_unit future suspended — closure must be non-blocking".to_string(),
+            ))
+        }
     }
 }
 
@@ -1225,7 +1282,19 @@ impl khive_storage::SqlAccess for SqlBridge {
                         let mut inline = InlineWriter {
                             conn: conn as *const rusqlite::Connection,
                         };
-                        block_on_sync(op(&mut inline))
+                        // Flatten: `block_on_sync` now returns `Result<F::Output,
+                        // StorageError>` (outer = "did the future actually
+                        // resolve on first poll", inner = the op's own
+                        // `StorageResult`) instead of panicking on `Pending`
+                        // (HIGH finding, ADR-067 Fork C slice 2 round 2). Either
+                        // error flows through this closure's ordinary `Err`
+                        // return, which `WriteRequest::execute_and_reply`
+                        // already turns into a normal ROLLBACK + error reply —
+                        // no panic, so the writer task survives.
+                        match block_on_sync(op(&mut inline)) {
+                            Ok(inner) => inner,
+                            Err(e) => Err(e),
+                        }
                     })
                     .await;
             }
@@ -1500,6 +1569,111 @@ mod tests {
             "the whole request must roll back — including statement 1's \
              otherwise-successful INSERT — not just the failing statement; \
              got {count:?}"
+        );
+    }
+
+    /// ADR-067 Component A, Fork C slice 2 round 2 (HIGH finding): before
+    /// this fix, `block_on_sync` (this file) `unreachable!()`-panicked if
+    /// an `atomic_unit` closure's future was `Pending` on its first poll.
+    /// That panic ran inside the writer task's own `spawn_blocking` frame
+    /// (see `atomic_unit`'s flag-on branch), and `run_writer_task` treats
+    /// any `spawn_blocking` `JoinError` as fatal — the whole writer task
+    /// exits, taking down every subsequent write for this pool. Proves the
+    /// fix: an `atomic_unit` op built to suspend on first poll (via
+    /// `std::future::pending`, never actually resolving) now returns a
+    /// clean `Err` from `atomic_unit` — no panic — AND the writer task
+    /// survives to serve a completely unrelated, well-behaved `atomic_unit`
+    /// call immediately afterward.
+    ///
+    /// Not `#[serial]` / no env var: builds the pool directly with
+    /// `write_queue_enabled: true` in the `PoolConfig` literal, same
+    /// technique as this round's other new routing tests.
+    #[tokio::test]
+    async fn atomic_unit_pending_future_errors_without_killing_writer_task() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("atomic_unit_pending_future.db");
+        let config = PoolConfig {
+            path: Some(path.clone()),
+            write_queue_enabled: true,
+            ..PoolConfig::default()
+        };
+        let pool = Arc::new(ConnectionPool::new(config).unwrap());
+        {
+            let guard = pool.writer().unwrap();
+            guard
+                .conn()
+                .execute_batch(
+                    "CREATE TABLE IF NOT EXISTS atomic_unit_pending_test \
+                     (id INTEGER PRIMARY KEY, val TEXT NOT NULL)",
+                )
+                .unwrap();
+        }
+        assert!(
+            pool.writer_task_handle().unwrap().is_some(),
+            "writer task must be spawned with the flag on for a file-backed pool"
+        );
+
+        let bridge = SqlBridge::new(Arc::clone(&pool), true);
+
+        // A closure whose future never resolves on first poll — the exact
+        // misuse `block_on_sync` must reject instead of panicking on.
+        let pending_op: AtomicUnitOp = Box::new(|_writer| {
+            Box::pin(std::future::pending::<
+                khive_storage::types::StorageResult<Box<dyn std::any::Any + Send>>,
+            >())
+        });
+
+        let pending_result = bridge.atomic_unit(pending_op).await;
+        assert!(
+            pending_result.is_err(),
+            "a Pending-on-first-poll atomic_unit closure must return Err, \
+             not panic; got {pending_result:?}"
+        );
+
+        // If the panic had instead killed the writer task, every subsequent
+        // write on this pool (including a completely unrelated, correctly
+        // non-blocking atomic_unit call) would now fail with a channel-closed
+        // error. Prove the task is still alive and serving requests.
+        let ok_op: AtomicUnitOp = Box::new(|writer| {
+            Box::pin(async move {
+                writer
+                    .execute(SqlStatement {
+                        sql: "INSERT INTO atomic_unit_pending_test (id, val) VALUES (?1, ?2)"
+                            .into(),
+                        params: vec![SqlValue::Integer(1), SqlValue::Text("survived".into())],
+                        label: None,
+                    })
+                    .await
+                    .map_err(|e| {
+                        khive_storage::StorageError::driver(
+                            StorageCapability::Sql,
+                            "atomic_unit_pending_future_test_insert",
+                            e,
+                        )
+                    })?;
+                Ok(Box::new(()) as Box<dyn std::any::Any + Send>)
+            })
+        });
+        let ok_result = bridge.atomic_unit(ok_op).await;
+        assert!(
+            ok_result.is_ok(),
+            "writer task must survive a Pending misuse and keep serving \
+             subsequent well-behaved atomic_unit requests; got {ok_result:?}"
+        );
+
+        let mut reader = bridge.reader().await.unwrap();
+        let count = reader
+            .query_scalar(SqlStatement {
+                sql: "SELECT COUNT(*) FROM atomic_unit_pending_test".into(),
+                params: vec![],
+                label: None,
+            })
+            .await
+            .unwrap();
+        assert!(
+            matches!(count, Some(SqlValue::Integer(1))),
+            "the well-behaved atomic_unit call after the Pending misuse must \
+             have actually committed its write; got {count:?}"
         );
     }
 }

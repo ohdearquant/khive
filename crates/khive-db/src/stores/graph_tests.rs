@@ -2393,17 +2393,18 @@ async fn traverse_max_depth_over_i64max_rejected() {
 /// routes through the WriterTask channel instead of the pool-mutex path, and
 /// both edges are actually committed and independently readable back.
 ///
-/// `#[serial]`: mutates the process-global `KHIVE_WRITE_QUEUE` env var,
-/// shared with `pool.rs`'s own env-override tests in this same test binary.
+/// Constructed via a `PoolConfig` literal (`write_queue_enabled: true`), not
+/// the `KHIVE_WRITE_QUEUE` env var — that env var is process-global and this
+/// crate's other tests are NOT `#[serial]` against it, so a window where it
+/// is set here could leak into a concurrently-scheduled test's own pool
+/// construction (ADR-067 Fork C slice 2 round 2, LOW finding).
 #[tokio::test]
-#[serial]
 async fn upsert_edges_routes_through_writer_task_when_flag_enabled() {
-    std::env::set_var("KHIVE_WRITE_QUEUE", "1");
-
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("write_queue_graph.db");
     let pool_cfg = PoolConfig {
         path: Some(path.clone()),
+        write_queue_enabled: true,
         ..PoolConfig::default()
     };
     let pool = Arc::new(ConnectionPool::new(pool_cfg).unwrap());
@@ -2413,7 +2414,6 @@ async fn upsert_edges_routes_through_writer_task_when_flag_enabled() {
     }
 
     let store = SqlGraphStore::new_scoped(Arc::clone(&pool), true, "default");
-    std::env::remove_var("KHIVE_WRITE_QUEUE");
 
     let e1 = make_edge(Uuid::new_v4(), Uuid::new_v4(), EdgeRelation::Extends, 0.6);
     let e2 = make_edge(Uuid::new_v4(), Uuid::new_v4(), EdgeRelation::Extends, 0.7);
@@ -2452,16 +2452,17 @@ async fn upsert_edges_routes_through_writer_task_when_flag_enabled() {
 /// slot open (parked on a oneshot via `blocking_recv`, not a sleep/timing
 /// race).
 ///
-/// `#[serial]`: mutates the process-global `KHIVE_WRITE_QUEUE` env var.
+/// Constructed via a `PoolConfig` literal (`write_queue_enabled: true`), not
+/// the `KHIVE_WRITE_QUEUE` env var — see
+/// `upsert_edges_routes_through_writer_task_when_flag_enabled`'s doc comment
+/// for the race this avoids.
 #[tokio::test]
-#[serial]
 async fn upsert_edge_routes_through_writer_task_when_flag_enabled() {
-    std::env::set_var("KHIVE_WRITE_QUEUE", "1");
-
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("write_queue_graph_single.db");
     let pool_cfg = PoolConfig {
         path: Some(path.clone()),
+        write_queue_enabled: true,
         ..PoolConfig::default()
     };
     let pool = Arc::new(ConnectionPool::new(pool_cfg).unwrap());
@@ -2475,7 +2476,6 @@ async fn upsert_edge_routes_through_writer_task_when_flag_enabled() {
         true,
         "default",
     ));
-    std::env::remove_var("KHIVE_WRITE_QUEUE");
 
     let writer_task = pool
         .writer_task_handle()

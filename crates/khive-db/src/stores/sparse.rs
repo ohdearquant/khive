@@ -950,21 +950,23 @@ mod tests {
     /// channel instead of the pool-mutex path, and both rows are actually
     /// committed and independently searchable back.
     ///
-    /// `#[serial]`: mutates the process-global `KHIVE_WRITE_QUEUE` env var,
-    /// shared with `pool.rs`'s own env-override tests in this same test binary.
+    /// Constructed via a `PoolConfig` literal (`write_queue_enabled: true`),
+    /// not the `KHIVE_WRITE_QUEUE` env var — that env var is process-global
+    /// and this crate's other tests are NOT `#[serial]` against it, so a
+    /// window where it is set here could leak into a
+    /// concurrently-scheduled test's own pool construction (ADR-067 Fork C
+    /// slice 2 round 2, LOW finding).
     #[tokio::test]
-    #[serial_test::serial]
     async fn insert_batch_routes_through_writer_task_when_flag_enabled() {
         use chrono::Utc;
         use khive_types::SubstrateKind;
-
-        std::env::set_var("KHIVE_WRITE_QUEUE", "1");
 
         let model_key = "write_queue_flag_test";
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("write_queue_sparse.db");
         let pool_cfg = PoolConfig {
             path: Some(path.clone()),
+            write_queue_enabled: true,
             ..PoolConfig::default()
         };
         let pool = Arc::new(ConnectionPool::new(pool_cfg).expect("pool"));
@@ -980,7 +982,6 @@ mod tests {
             "ns:test".to_string(),
         )
         .expect("store");
-        std::env::remove_var("KHIVE_WRITE_QUEUE");
 
         let id1 = Uuid::new_v4();
         let id2 = Uuid::new_v4();

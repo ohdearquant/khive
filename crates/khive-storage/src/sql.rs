@@ -50,6 +50,23 @@ pub trait SqlWriter: SqlReader + Send + 'static {
     async fn execute_batch(&mut self, statements: Vec<SqlStatement>) -> StorageResult<u64>;
     /// Execute a raw SQL script (no parameters; used for migrations).
     async fn execute_script(&mut self, script: String) -> StorageResult<()>;
+
+    /// Execute a raw SQL script that MUST run outside any open transaction
+    /// (ADR-067 Component A, Fork C slice 2 round 2, BLOCKER A) — e.g.
+    /// `VACUUM`, which SQLite rejects if issued inside `BEGIN`/`COMMIT`.
+    ///
+    /// Default implementation delegates to [`Self::execute_script`]: every
+    /// writer implementation in this codebase except khive-db's
+    /// write-queue-routed `SqliteWriter` already runs `execute_script`
+    /// transaction-free (a plain connection call, or already inside a
+    /// caller-managed transaction where a top-level statement would be
+    /// invalid regardless of which method is called). `SqliteWriter`
+    /// overrides this to route around its writer task's per-request `BEGIN
+    /// IMMEDIATE` specifically for this call, while still serializing
+    /// through the single writer owner.
+    async fn execute_script_top_level(&mut self, script: String) -> StorageResult<()> {
+        self.execute_script(script).await
+    }
 }
 
 /// A SQL transaction (extends `SqlWriter`).

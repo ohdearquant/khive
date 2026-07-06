@@ -1,6 +1,5 @@
 use super::*;
 use crate::pool::PoolConfig;
-use serial_test::serial;
 use std::time::Duration;
 use tokio::sync::oneshot;
 
@@ -514,17 +513,18 @@ async fn page_offset_over_i64max_rejected() {
 /// the trip through the type-erased channel intact, and both rows are
 /// actually committed and independently readable back through the store.
 ///
-/// `#[serial]`: mutates the process-global `KHIVE_WRITE_QUEUE` env var,
-/// shared with `pool.rs`'s own env-override tests in this same test binary.
+/// Constructed via a `PoolConfig` literal (`write_queue_enabled: true`), not
+/// the `KHIVE_WRITE_QUEUE` env var — that env var is process-global and this
+/// crate's other tests are NOT `#[serial]` against it, so a window where it
+/// is set here could leak into a concurrently-scheduled test's own pool
+/// construction (ADR-067 Fork C slice 2 round 2, LOW finding).
 #[tokio::test]
-#[serial]
 async fn upsert_entities_routes_through_writer_task_when_flag_enabled() {
-    std::env::set_var("KHIVE_WRITE_QUEUE", "1");
-
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("write_queue_entities.db");
     let pool_cfg = PoolConfig {
         path: Some(path.clone()),
+        write_queue_enabled: true,
         ..PoolConfig::default()
     };
     let pool = Arc::new(ConnectionPool::new(pool_cfg).unwrap());
@@ -534,10 +534,6 @@ async fn upsert_entities_routes_through_writer_task_when_flag_enabled() {
     }
 
     let store = SqlEntityStore::new(Arc::clone(&pool), true);
-
-    // Confined to the smallest possible window around construction, which is
-    // the only place this flag is read.
-    std::env::remove_var("KHIVE_WRITE_QUEUE");
 
     let e1 = make_entity("default", "concept", "LoRA");
     let e2 = make_entity("default", "concept", "QLoRA");
@@ -592,17 +588,17 @@ async fn upsert_entities_legacy_path_unchanged_when_flag_is_off() {
 /// the writer task exactly once; every store resolves to a clone of the one
 /// pool-owned handle (`ConnectionPool::writer_task_handle`).
 ///
-/// `#[serial]`: mutates the process-global `KHIVE_WRITE_QUEUE` env var,
-/// shared with `pool.rs`'s own env-override tests in this same test binary.
+/// Constructed via a `PoolConfig` literal (`write_queue_enabled: true`), not
+/// the `KHIVE_WRITE_QUEUE` env var — see the sibling
+/// `upsert_entities_routes_through_writer_task_when_flag_enabled` test's doc
+/// comment for the race this avoids.
 #[tokio::test]
-#[serial]
 async fn multiple_stores_over_one_pool_share_a_single_writer_task() {
-    std::env::set_var("KHIVE_WRITE_QUEUE", "1");
-
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("write_queue_shared_writer.db");
     let pool_cfg = PoolConfig {
         path: Some(path.clone()),
+        write_queue_enabled: true,
         ..PoolConfig::default()
     };
     let pool = Arc::new(ConnectionPool::new(pool_cfg).unwrap());
@@ -610,8 +606,6 @@ async fn multiple_stores_over_one_pool_share_a_single_writer_task() {
         let writer = pool.writer().unwrap();
         writer.conn().execute_batch(ENTITIES_DDL).unwrap();
     }
-
-    std::env::remove_var("KHIVE_WRITE_QUEUE");
 
     // Three independent stores over the same pool, each resolving the
     // write-queue flag on construction and asking the pool for its writer
@@ -640,9 +634,11 @@ async fn multiple_stores_over_one_pool_share_a_single_writer_task() {
 /// design-fork paths coexist over a single DB file without contending at
 /// `BEGIN IMMEDIATE` or racing the writer task's own spawn-once guarantee.
 ///
-/// `#[serial]`: mutates the process-global `KHIVE_WRITE_QUEUE` env var.
+/// Constructed via a `PoolConfig` literal (`write_queue_enabled: true`), not
+/// the `KHIVE_WRITE_QUEUE` env var — see the sibling
+/// `upsert_entities_routes_through_writer_task_when_flag_enabled` test's doc
+/// comment for the race this avoids.
 #[tokio::test]
-#[serial]
 async fn concurrent_writes_across_all_migrated_stores_share_one_writer_task() {
     use crate::stores::graph::SqlGraphStore;
     use crate::stores::note::SqlNoteStore;
@@ -651,12 +647,11 @@ async fn concurrent_writes_across_all_migrated_stores_share_one_writer_task() {
     use khive_storage::{GraphStore as _, NoteStore as _, SqlAccess as _};
     use khive_types::EdgeRelation;
 
-    std::env::set_var("KHIVE_WRITE_QUEUE", "1");
-
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("write_queue_all_paths_shared_writer.db");
     let pool_cfg = PoolConfig {
         path: Some(path.clone()),
+        write_queue_enabled: true,
         ..PoolConfig::default()
     };
     let pool = Arc::new(ConnectionPool::new(pool_cfg).unwrap());
@@ -666,8 +661,6 @@ async fn concurrent_writes_across_all_migrated_stores_share_one_writer_task() {
         crate::stores::note::ensure_notes_schema(writer.conn()).unwrap();
         crate::stores::graph::ensure_graph_schema(writer.conn()).unwrap();
     }
-
-    std::env::remove_var("KHIVE_WRITE_QUEUE");
 
     let entity_store = Arc::new(SqlEntityStore::new(Arc::clone(&pool), true));
     let note_store = Arc::new(SqlNoteStore::new(Arc::clone(&pool), true));
@@ -832,15 +825,18 @@ async fn concurrent_writes_across_all_migrated_stores_share_one_writer_task() {
 /// makes the test non-vacuous (verified: reverting `with_writer` to always
 /// take the legacy branch makes this assertion fail, see khive-db PR history
 /// for Fork C slice 2).
+///
+/// Constructed via a `PoolConfig` literal (`write_queue_enabled: true`), not
+/// the `KHIVE_WRITE_QUEUE` env var — see
+/// `upsert_entities_routes_through_writer_task_when_flag_enabled`'s doc
+/// comment for the race this avoids.
 #[tokio::test]
-#[serial]
 async fn upsert_entity_routes_through_writer_task_when_flag_enabled() {
-    std::env::set_var("KHIVE_WRITE_QUEUE", "1");
-
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("write_queue_entity_single.db");
     let pool_cfg = PoolConfig {
         path: Some(path.clone()),
+        write_queue_enabled: true,
         ..PoolConfig::default()
     };
     let pool = Arc::new(ConnectionPool::new(pool_cfg).unwrap());
@@ -850,8 +846,6 @@ async fn upsert_entity_routes_through_writer_task_when_flag_enabled() {
     }
 
     let store = Arc::new(SqlEntityStore::new(Arc::clone(&pool), true));
-
-    std::env::remove_var("KHIVE_WRITE_QUEUE");
 
     let writer_task = pool
         .writer_task_handle()
