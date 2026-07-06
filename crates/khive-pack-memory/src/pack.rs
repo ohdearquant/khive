@@ -487,6 +487,7 @@ mod ann_route_tests {
     use khive_pack_kg::KgPack;
     use khive_runtime::{EmbedderProvider, Namespace, RuntimeConfig, VerbRegistryBuilder};
     use lattice_embed::{EmbedError, EmbeddingModel, EmbeddingService};
+    use serial_test::serial;
 
     // Deterministic embedding service: distinct vector per unique text via FNV hash.
     struct HashVecService {
@@ -566,7 +567,14 @@ mod ann_route_tests {
     /// task; in test execution without `tokio::time::sleep`, the task typically has
     /// not completed, so `search_loaded` returns `Ok(None)` and the counter stays 0,
     /// causing this assertion to fail.
+    // `#[serial(background_tasks)]`: both recalls below return non-empty
+    // results, which fire the serve-ledger append's
+    // `khive_runtime::track_background_task` (`handlers/recall.rs`), driving
+    // the same process-wide counter that `ann.rs`'s
+    // `ensure_ann_background_registers_a_tracked_task_not_a_bare_spawn`
+    // asserts on — untagged, cargo's default parallelism can race them.
     #[tokio::test]
+    #[serial(background_tasks)]
     async fn recall_second_call_uses_warm_ann_route() {
         let tmp = tempfile::Builder::new()
             .prefix("khive-memory-ann-route-")
