@@ -925,8 +925,13 @@ fn read_edges(path: &Path) -> Result<Vec<NdjsonEdge>> {
 
 async fn checkpoint_wal(runtime: &KhiveRuntime) -> Result<()> {
     let mut writer = runtime.backend().sql().writer().await?;
+    // Top-level statement — a checkpoint cannot complete while a transaction
+    // is open on the same connection. `execute_script` wraps its statement in
+    // the WriterTask's per-request BEGIN IMMEDIATE under KHIVE_WRITE_QUEUE=1,
+    // which would make this call silently no-op the checkpoint (the subsequent
+    // rename above would then lose data — see the comment at the call site).
     writer
-        .execute_script("PRAGMA wal_checkpoint(TRUNCATE);".to_string())
+        .execute_script_top_level("PRAGMA wal_checkpoint(TRUNCATE);".to_string())
         .await?;
     Ok(())
 }
@@ -2538,6 +2543,102 @@ mod tests {
         assert!(
             !err_str.contains("secret-repo") && !err_chain.contains("secret-repo"),
             "scp repo path must not appear in public error: {err_str} | {err_chain}"
+        );
+    }
+}
+
+// ── ADR-067 Fork C slice 2 round 3 (BLOCKER, sibling of memory.vacuum's round-2
+// BLOCKER A): `checkpoint_wal` under the write queue ───────────────────────────
+//
+// `checkpoint_wal` used to send `"PRAGMA wal_checkpoint(TRUNCATE);"` via plain
+// `execute_script`, which — once `execute_script` started routing through the
+// WriterTask (ADR-067 Component A) under `KHIVE_WRITE_QUEUE=1` — landed inside
+// the WriterTask's own per-request `BEGIN IMMEDIATE`. A checkpoint cannot
+// complete while a transaction is open on the same connection, so the
+// checkpoint would silently no-op and the subsequent `rename(tmp, target)`
+// (see the comment at the `checkpoint_wal` call site above) would drop any
+// writes still sitting in the `-wal` file. This proves the fixed
+// `execute_script_top_level` path (no BEGIN/COMMIT/ROLLBACK wrap) succeeds
+// with the write queue enabled.
+//
+// `KhiveRuntime` has no config-injection point for `PoolConfig` (production
+// construction hardcodes `PoolConfig::default()`), so — mirroring the
+// `memory.vacuum` regression test in khive-pack-memory's `prune.rs` — this
+// drives the underlying mechanism directly at the `SqlBridge` level: the same
+// `execute_script_top_level("PRAGMA wal_checkpoint(TRUNCATE);")` call that
+// `checkpoint_wal` makes, over a `PoolConfig { write_queue_enabled: true, .. }`
+// literal (no env var mutation, no cross-test race).
+#[cfg(test)]
+mod checkpoint_wal_write_queue_tests {
+    #[tokio::test]
+    async fn wal_checkpoint_truncate_succeeds_with_write_queue_enabled() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("vcs-checkpoint-write-queue.db");
+        let pool_cfg = khive_db::PoolConfig {
+            path: Some(db_path),
+            write_queue_enabled: true,
+            ..khive_db::PoolConfig::default()
+        };
+        let pool = std::sync::Arc::new(khive_db::ConnectionPool::new(pool_cfg).expect("pool"));
+        {
+            let mut writer = pool.writer().expect("writer");
+            khive_db::run_migrations(writer.conn_mut()).expect("migrations");
+        }
+        assert!(
+            pool.writer_task_handle().unwrap().is_some(),
+            "writer task must be spawned with the flag on for a file-backed pool"
+        );
+
+        let sql: std::sync::Arc<dyn khive_storage::SqlAccess> =
+            std::sync::Arc::new(khive_db::SqlBridge::new(std::sync::Arc::clone(&pool), true));
+
+        let mut writer = sql.writer().await.expect("writer handle");
+        let result = writer
+            .execute_script_top_level("PRAGMA wal_checkpoint(TRUNCATE);".to_string())
+            .await;
+
+        assert!(
+            result.is_ok(),
+            "PRAGMA wal_checkpoint(TRUNCATE) via execute_script_top_level must succeed under \
+             KHIVE_WRITE_QUEUE (no BEGIN IMMEDIATE wrap); got {result:?}"
+        );
+    }
+
+    /// Revert-and-confirm-fails companion: the OLD (broken) call shape —
+    /// plain `execute_script`, which wraps the pragma in the WriterTask's
+    /// `BEGIN IMMEDIATE` — must fail under the write queue. This proves the
+    /// test above is actually exercising the regression, not passing
+    /// vacuously.
+    #[tokio::test]
+    async fn wal_checkpoint_truncate_via_plain_execute_script_fails_with_write_queue_enabled() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("vcs-checkpoint-write-queue-regression.db");
+        let pool_cfg = khive_db::PoolConfig {
+            path: Some(db_path),
+            write_queue_enabled: true,
+            ..khive_db::PoolConfig::default()
+        };
+        let pool = std::sync::Arc::new(khive_db::ConnectionPool::new(pool_cfg).expect("pool"));
+        {
+            let mut writer = pool.writer().expect("writer");
+            khive_db::run_migrations(writer.conn_mut()).expect("migrations");
+        }
+
+        let sql: std::sync::Arc<dyn khive_storage::SqlAccess> =
+            std::sync::Arc::new(khive_db::SqlBridge::new(std::sync::Arc::clone(&pool), true));
+
+        let mut writer = sql.writer().await.expect("writer handle");
+        let result = writer
+            .execute_script("PRAGMA wal_checkpoint(TRUNCATE);".to_string())
+            .await;
+
+        assert!(
+            result.is_err(),
+            "PRAGMA wal_checkpoint(TRUNCATE) via plain execute_script must FAIL under \
+             KHIVE_WRITE_QUEUE (it wraps in BEGIN IMMEDIATE, and SQLite rejects a WAL \
+             checkpoint inside an open transaction); got {result:?} — if this now passes, \
+             the WriterTask no longer wraps execute_script in a transaction and this whole \
+             regression class needs re-auditing"
         );
     }
 }

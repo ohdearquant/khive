@@ -1426,18 +1426,13 @@ mod tests {
     /// routes the whole statement list through the WriterTask channel
     /// instead of opening its own `BEGIN IMMEDIATE` on the standalone
     /// connection, and the row is actually committed and readable back.
-    ///
-    /// `#[serial]`: mutates the process-global `KHIVE_WRITE_QUEUE` env var,
-    /// shared with `pool.rs`'s own env-override tests in this same test binary.
     #[tokio::test]
-    #[serial]
     async fn execute_batch_routes_through_writer_task_when_flag_enabled() {
-        std::env::set_var("KHIVE_WRITE_QUEUE", "1");
-
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("write_queue_execute_batch.db");
         let config = PoolConfig {
             path: Some(path.clone()),
+            write_queue_enabled: true,
             ..PoolConfig::default()
         };
         let pool = Arc::new(ConnectionPool::new(config).unwrap());
@@ -1453,7 +1448,6 @@ mod tests {
         }
 
         let bridge = SqlBridge::new(Arc::clone(&pool), true);
-        std::env::remove_var("KHIVE_WRITE_QUEUE");
 
         let mut writer = bridge.writer().await.unwrap();
         let affected = writer
@@ -1499,17 +1493,13 @@ mod tests {
     /// INSERT — because the WriterTask commits or rolls back one
     /// `WriteRequest` as a single unit (ADR-067 Component A). Zero rows must
     /// land, not one.
-    ///
-    /// `#[serial]`: mutates the process-global `KHIVE_WRITE_QUEUE` env var.
     #[tokio::test]
-    #[serial]
     async fn execute_batch_rolls_back_atomically_on_mid_sequence_failure() {
-        std::env::set_var("KHIVE_WRITE_QUEUE", "1");
-
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("write_queue_execute_batch_rollback.db");
         let config = PoolConfig {
             path: Some(path.clone()),
+            write_queue_enabled: true,
             ..PoolConfig::default()
         };
         let pool = Arc::new(ConnectionPool::new(config).unwrap());
@@ -1525,7 +1515,6 @@ mod tests {
         }
 
         let bridge = SqlBridge::new(Arc::clone(&pool), true);
-        std::env::remove_var("KHIVE_WRITE_QUEUE");
 
         let mut writer = bridge.writer().await.unwrap();
         let result = writer

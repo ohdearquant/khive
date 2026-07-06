@@ -581,18 +581,13 @@ async fn page_offset_over_i64max_rejected() {
 /// ADR-067 Component A entry 5: with `KHIVE_WRITE_QUEUE=1`, `append_events`
 /// routes through the WriterTask channel instead of the pool-mutex path, and
 /// both events are actually committed and independently readable back.
-///
-/// `#[serial]`: mutates the process-global `KHIVE_WRITE_QUEUE` env var,
-/// shared with `pool.rs`'s own env-override tests in this same test binary.
 #[tokio::test]
-#[serial_test::serial]
 async fn append_events_routes_through_writer_task_when_flag_enabled() {
-    std::env::set_var("KHIVE_WRITE_QUEUE", "1");
-
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("write_queue_events.db");
     let pool_cfg = PoolConfig {
         path: Some(path.clone()),
+        write_queue_enabled: true,
         ..PoolConfig::default()
     };
     let pool = Arc::new(ConnectionPool::new(pool_cfg).unwrap());
@@ -602,7 +597,6 @@ async fn append_events_routes_through_writer_task_when_flag_enabled() {
     }
 
     let store = SqlEventStore::new_scoped(Arc::clone(&pool), true, "default");
-    std::env::remove_var("KHIVE_WRITE_QUEUE");
 
     let e1 = make_event("default");
     let e2 = make_event("default");
