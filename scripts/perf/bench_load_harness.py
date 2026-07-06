@@ -62,7 +62,9 @@ REPO_ROOT = pathlib.Path(__file__).parent.parent.parent
 
 # ── Wire protocol constants (mirrors crates/khive-runtime/src/daemon.rs) ──────
 PROTOCOL_VERSION = 3
-DEFAULT_PACKS = bpd._DEFAULT_PACKS  # "kg,gtd,memory,brain,comm,schedule,knowledge"
+# Production-default pack posture. bpd._DEFAULT_PACKS predates the `session` pack, so pin the
+# current 8-pack default explicitly here rather than measure a stale registry surface / config_id.
+DEFAULT_PACKS = "kg,gtd,memory,brain,comm,schedule,knowledge,session"
 
 # ── Metal GPU serialization (machine-wide convention; real-embedder mode only)
 METAL_GPU_LOCK_PATH = os.environ.get("METAL_GPU_LOCK_PATH", "/tmp/lion-metal-gpu-test.lock")
@@ -466,13 +468,14 @@ def _spawn_worker_proc(binary, tenant, base_env, log_level, stderr_path):
     return proc
 
 
-def _run_worker(binary, tenant, idx, base_env, log_level, tmpdir, ops_per_worker, is_leader):
+def _run_worker(binary, tenant, idx, base_env, log_level, tmpdir, ops_per_worker, is_leader, proc_registry):
     result = WorkerResult(tenant, idx)
     stderr_path = os.path.join(tmpdir, f"worker-t{tenant}-w{idx}.stderr.log")
     result.stderr_path = stderr_path
     proc = None
     try:
         proc = _spawn_worker_proc(binary, tenant, base_env, log_level, stderr_path)
+        proc_registry[(tenant, idx)] = proc  # so a future-timeout can kill a wedged read
         bpd._handshake(proc)
 
         if is_leader:
@@ -611,6 +614,7 @@ def main() -> int:
     }
 
     bootstrap_proc = None
+    worker_procs: dict = {}
     try:
         # ── bootstrap: bring up the shared warm daemon once, verify engagement
         print("Spawning bootstrap front-end to warm the shared daemon...", flush=True)
@@ -673,6 +677,7 @@ def main() -> int:
                     tmpdir,
                     args.ops_per_worker,
                     idx == 0,
+                    worker_procs,
                 ): (tenant, idx)
                 for tenant, idx in jobs
             }
@@ -681,6 +686,14 @@ def main() -> int:
                 try:
                     worker_results.append(fut.result(timeout=args.worker_timeout))
                 except FutureTimeoutError:
+                    # Kill this worker's front-end so its wedged stdout read returns and the
+                    # thread exits — otherwise ThreadPoolExecutor.__exit__ (shutdown(wait=True))
+                    # blocks forever on the hung worker and never reaches teardown, leaking the
+                    # scratch daemon + the Metal GPU lock.
+                    wedged = worker_procs.get((tenant, idx))
+                    if wedged is not None:
+                        with contextlib.suppress(Exception):
+                            wedged.kill()
                     hung = WorkerResult(tenant, idx)
                     hung.crashed = f"worker exceeded --worker-timeout={args.worker_timeout}s (possible silent hang)"
                     worker_results.append(hung)
@@ -824,6 +837,11 @@ def main() -> int:
             except Exception:
                 bootstrap_proc.kill()
                 bootstrap_proc.wait()
+
+        for _wp in worker_procs.values():
+            with contextlib.suppress(Exception):
+                if _wp.poll() is None:
+                    _wp.kill()
 
         print(json.dumps(report, indent=2, default=str))
         if args.report:
