@@ -236,8 +236,49 @@ impl SqliteVecStore {
         Ok(conn)
     }
 
-    /// Write via pool writer to serialize through the mutex.
+    /// Route a single-row write through the pool-wide `WriterTask` when
+    /// `KHIVE_WRITE_QUEUE=1` and a handle is available; otherwise fall back
+    /// to the legacy pool-mutex path (ADR-067 Component A, Fork C slice 2).
+    ///
+    /// This is the routing point for `with_writer` callers whose closure is
+    /// DML-only (`delete`/`vec_delete`, `delete_subjects`/
+    /// `vec_delete_subjects`): on the flag-on path the closure runs inside
+    /// the WriterTask's own transaction, so a bare `BEGIN IMMEDIATE` (or an
+    /// inner `conn.unchecked_transaction()`) would violate SQLite's
+    /// nested-transaction rule. `insert`/`update` (which need their own
+    /// delete-then-insert atomicity) and `insert_batch` (the batch method)
+    /// each do their own flag check and return early on `Some`, routing a
+    /// SAVEPOINT-wrapped DML-only closure directly through the WriterTask
+    /// instead — their fallback calls into this helper only ever execute on
+    /// the flag-off path (`self.writer_task` is `None` by construction
+    /// whenever those calls are reached) — no double-routing.
+    ///
+    /// `orphan_sweep` (`Transaction::new_unchecked`, its own manual
+    /// transaction) calls [`Self::with_writer_unmanaged`] instead of this
+    /// helper — routing it through the WriterTask would nest a transaction
+    /// inside the WriterTask's own transaction.
     async fn with_writer<F, R>(&self, op: &'static str, f: F) -> Result<R, StorageError>
+    where
+        F: FnOnce(&rusqlite::Connection) -> Result<R, rusqlite::Error> + Send + 'static,
+        R: Send + 'static,
+    {
+        if let Some(writer_task) = &self.writer_task {
+            return writer_task
+                .send(move |conn| f(conn).map_err(|e| map_err(e, op)))
+                .await;
+        }
+
+        self.with_writer_unmanaged(op, f).await
+    }
+
+    /// Legacy pool-mutex write path, bypassing the WriterTask channel
+    /// unconditionally regardless of `KHIVE_WRITE_QUEUE`.
+    ///
+    /// Reserved for closures that manage their own transaction — those
+    /// cannot be sent through the WriterTask channel, which already wraps
+    /// every request in its own transaction. `orphan_sweep` is the only
+    /// caller.
+    async fn with_writer_unmanaged<F, R>(&self, op: &'static str, f: F) -> Result<R, StorageError>
     where
         F: FnOnce(&rusqlite::Connection) -> Result<R, rusqlite::Error> + Send + 'static,
         R: Send + 'static,
@@ -389,6 +430,91 @@ fn batch_insert_vectors_dml(
     })
 }
 
+/// Shared DELETE-then-INSERT DML for single-record `insert`/`update`, run
+/// inside a named `SAVEPOINT` (nestable inside the WriterTask's own
+/// transaction) instead of `conn.unchecked_transaction()` (which would
+/// attempt a nested `BEGIN` and fail once this runs inside the WriterTask's
+/// already-open transaction). A failed INSERT rolls back only this
+/// SAVEPOINT, leaving the previous vector intact (no-worse-than-stale
+/// guarantee) — the single-record analog of `batch_insert_vectors_dml`'s
+/// per-record `SAVEPOINT vec_batch_record`.
+#[allow(clippy::too_many_arguments)]
+fn vec_upsert_atomic_dml(
+    conn: &rusqlite::Connection,
+    table: &str,
+    dims: usize,
+    subject_id: Uuid,
+    kind_str: &str,
+    namespace: &str,
+    field: &str,
+    embedding_model: &str,
+    embedding: &[f32],
+    savepoint_name: &'static str,
+    _failpoint_flag: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+) -> Result<(), rusqlite::Error> {
+    if embedding.len() != dims {
+        return Err(rusqlite::Error::InvalidParameterCount(
+            embedding.len(),
+            dims,
+        ));
+    }
+
+    conn.execute_batch(&format!("SAVEPOINT {savepoint_name}"))?;
+    let result = (|| {
+        let del_sql = format!(
+            "DELETE FROM {} WHERE subject_id = ?1 AND namespace = ?2",
+            table
+        );
+        conn.execute(
+            &del_sql,
+            rusqlite::params![subject_id.to_string(), namespace],
+        )?;
+
+        // Failpoint: fires only in cfg(test) when the guard is active.
+        // DELETE has already run; if ROLLBACK TO SAVEPOINT is missing, the
+        // deleted row is lost permanently.
+        #[cfg(test)]
+        if let Some(ref fp) = _failpoint_flag {
+            if failpoint::take(fp) {
+                return Err(rusqlite::Error::InvalidParameterName(
+                    "__test_failpoint_after_delete__".into(),
+                ));
+            }
+        }
+
+        let ins_sql = format!(
+            "INSERT INTO {} (subject_id, namespace, kind, field, embedding_model, embedding) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            table
+        );
+        let blob = f32_slice_as_bytes(embedding);
+        conn.execute(
+            &ins_sql,
+            rusqlite::params![
+                subject_id.to_string(),
+                namespace,
+                kind_str,
+                field,
+                embedding_model,
+                blob
+            ],
+        )?;
+        Ok::<(), rusqlite::Error>(())
+    })();
+
+    match result {
+        Ok(()) => {
+            conn.execute_batch(&format!("RELEASE SAVEPOINT {savepoint_name}"))?;
+            Ok(())
+        }
+        Err(e) => {
+            let _ = conn.execute_batch(&format!("ROLLBACK TO SAVEPOINT {savepoint_name}"));
+            let _ = conn.execute_batch(&format!("RELEASE SAVEPOINT {savepoint_name}"));
+            Err(e)
+        }
+    }
+}
+
 #[async_trait]
 impl VectorStore for SqliteVecStore {
     async fn insert(
@@ -421,6 +547,46 @@ impl VectorStore for SqliteVecStore {
             }
         }
 
+        // Capture the failpoint Arc (if any) from the thread-local on the
+        // calling thread before handing the closure to spawn_blocking.
+        let failpoint_flag = current_failpoint();
+
+        // ADR-067 Component A (Fork C slice 2): when the write queue is
+        // enabled, route through the pool-wide WriterTask. DML-only
+        // closure — atomicity is provided by `vec_upsert_atomic_dml`'s
+        // named SAVEPOINT rather than `conn.unchecked_transaction()`,
+        // which would attempt a nested `BEGIN` and fail under the
+        // WriterTask's already-open transaction.
+        if let Some(writer_task) = &self.writer_task {
+            let table2 = table.clone();
+            let namespace2 = namespace.clone();
+            let field2 = field.clone();
+            let kind_str2 = kind_str.clone();
+            let embedding_model2 = embedding_model.clone();
+            let embedding2 = embedding.clone();
+            return writer_task
+                .send(move |conn| {
+                    vec_upsert_atomic_dml(
+                        conn,
+                        &table2,
+                        dims,
+                        subject_id,
+                        &kind_str2,
+                        &namespace2,
+                        &field2,
+                        &embedding_model2,
+                        &embedding2,
+                        "vec_insert_atomic",
+                        failpoint_flag,
+                    )
+                    .map_err(|e| map_err(e, "vec_insert"))
+                })
+                .await;
+        }
+
+        // Flag-off (default) path: byte-for-byte unchanged from
+        // pre-ADR-067 behavior — the closure owns its own transaction via
+        // `conn.unchecked_transaction()`.
         self.with_writer("vec_insert", move |conn| {
             if embedding.len() != dims {
                 return Err(rusqlite::Error::InvalidParameterCount(
@@ -572,6 +738,43 @@ impl VectorStore for SqliteVecStore {
         #[cfg(test)]
         let _failpoint_flag = failpoint::CURRENT.with(|c| c.borrow().clone());
 
+        // ADR-067 Component A (Fork C slice 2): when the write queue is
+        // enabled, route through the pool-wide WriterTask. DML-only
+        // closure — atomicity is provided by `vec_upsert_atomic_dml`'s
+        // named SAVEPOINT rather than `conn.unchecked_transaction()`,
+        // which would attempt a nested `BEGIN` and fail under the
+        // WriterTask's already-open transaction.
+        if let Some(writer_task) = &self.writer_task {
+            let table2 = table.clone();
+            let namespace2 = namespace.clone();
+            let field2 = field.clone();
+            let kind_str2 = kind_str.clone();
+            let embedding_model2 = embedding_model.clone();
+            let embedding2 = embedding.clone();
+            let failpoint_flag2 = current_failpoint();
+            return writer_task
+                .send(move |conn| {
+                    vec_upsert_atomic_dml(
+                        conn,
+                        &table2,
+                        dims,
+                        subject_id,
+                        &kind_str2,
+                        &namespace2,
+                        &field2,
+                        &embedding_model2,
+                        &embedding2,
+                        "vec_update_atomic",
+                        failpoint_flag2,
+                    )
+                    .map_err(|e| map_err(e, "vec_update"))
+                })
+                .await;
+        }
+
+        // Flag-off (default) path: byte-for-byte unchanged from
+        // pre-ADR-067 behavior — the closure owns its own transaction via
+        // `conn.unchecked_transaction()`.
         self.with_writer("vec_update", move |conn| {
             if embedding.len() != dims {
                 return Err(rusqlite::Error::InvalidParameterCount(
@@ -932,7 +1135,7 @@ impl VectorStore for SqliteVecStore {
         let max_delete = config.max_delete as i64;
         let dry_run = config.dry_run;
 
-        self.with_writer("orphan_sweep", move |conn| {
+        self.with_writer_unmanaged("orphan_sweep", move |conn| {
             // `Transaction::new_unchecked` issues `BEGIN IMMEDIATE` and RAII-manages
             // rollback via its Drop impl: it checks `conn.is_autocommit()` and issues
             // ROLLBACK when the connection still has an open transaction — covering both

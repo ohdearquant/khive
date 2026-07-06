@@ -96,7 +96,51 @@ impl Fts5TextSearch {
             .map_err(|e| map_sqlite_err(e, "open_fts_reader"))
     }
 
+    /// Route a single-row write through the pool-wide `WriterTask` when
+    /// `KHIVE_WRITE_QUEUE=1` and a handle is available; otherwise fall back
+    /// to the legacy standalone-connection / pool-mutex path (ADR-067
+    /// Component A, Fork C slice 2).
+    ///
+    /// This is the routing point for `with_writer` callers whose closure is
+    /// DML-only (`delete_document`/`fts_delete`, `rebuild`/`fts_rebuild`):
+    /// on the flag-on path the closure runs inside the WriterTask's own
+    /// transaction, so a bare `BEGIN IMMEDIATE` would violate SQLite's
+    /// nested-transaction rule. `upsert_document`/`upsert_documents` (the
+    /// single-doc and batch write methods) do their own flag check and
+    /// return early on `Some`, so their fallback calls into this helper
+    /// only ever execute on the flag-off path (`self.writer_task` is
+    /// `None` by construction whenever those calls are reached) — no
+    /// double-routing.
+    ///
+    /// `rename_namespace` (`#[allow(dead_code)]`, no production caller —
+    /// see ADR-067's `BEGIN IMMEDIATE` site inventory, EXEMPT) manages its
+    /// own manual transaction and calls [`Self::with_writer_unmanaged`]
+    /// instead of this helper — routing its closure through the WriterTask
+    /// would nest a bare `BEGIN IMMEDIATE` inside the WriterTask's own
+    /// transaction.
     async fn with_writer<F, R>(&self, op: &'static str, f: F) -> Result<R, StorageError>
+    where
+        F: FnOnce(&rusqlite::Connection) -> Result<R, rusqlite::Error> + Send + 'static,
+        R: Send + 'static,
+    {
+        if let Some(writer_task) = &self.writer_task {
+            return writer_task
+                .send(move |conn| f(conn).map_err(|e| map_err(e, op)))
+                .await;
+        }
+
+        self.with_writer_unmanaged(op, f).await
+    }
+
+    /// Legacy standalone-connection / pool-mutex write path, bypassing the
+    /// WriterTask channel unconditionally regardless of
+    /// `KHIVE_WRITE_QUEUE`.
+    ///
+    /// Reserved for closures that manage their own transaction (a bare
+    /// `BEGIN IMMEDIATE`/`COMMIT`/`ROLLBACK`) — those cannot be sent through
+    /// the WriterTask channel, which already wraps every request in its own
+    /// transaction. `rename_namespace` is the only caller.
+    async fn with_writer_unmanaged<F, R>(&self, op: &'static str, f: F) -> Result<R, StorageError>
     where
         F: FnOnce(&rusqlite::Connection) -> Result<R, rusqlite::Error> + Send + 'static,
         R: Send + 'static,
@@ -1148,7 +1192,7 @@ impl Fts5TextSearch {
         let old_ns = old_namespace.to_string();
         let new_ns = new_namespace.to_string();
 
-        self.with_writer("fts_rename_namespace", move |conn| {
+        self.with_writer_unmanaged("fts_rename_namespace", move |conn| {
             let sel_sql = format!(
                 "SELECT subject_id, kind, title, body, tags, metadata, updated_at \
                  FROM {} WHERE namespace = ?1",

@@ -1,6 +1,8 @@
 use super::*;
 use crate::pool::PoolConfig;
 use serial_test::serial;
+use std::time::Duration;
+use tokio::sync::oneshot;
 
 fn setup_pool() -> Arc<ConnectionPool> {
     let config = PoolConfig {
@@ -795,4 +797,130 @@ async fn concurrent_writes_across_all_migrated_stores_share_one_writer_task() {
         "concurrent writes across every migrated path plus both design-fork \
          paths must not trigger a second writer task spawn"
     );
+}
+
+// =============================================================================
+// Fork C slice 2: single-row `upsert_entity` (via `with_writer`) routes
+// through the WriterTask when the flag is on
+// =============================================================================
+
+/// Proves `upsert_entity` (the SINGLE-row path, going through the
+/// `with_writer` helper directly rather than the already-migrated
+/// `upsert_entities` batch path) is actually enqueued on the pool's shared
+/// `WriterTaskHandle` channel when `KHIVE_WRITE_QUEUE=1` — not inferred from
+/// wall-clock contention (real SQLite file-level locking would serialize a
+/// competing writer connection against an in-flight transaction regardless
+/// of which Rust-level path issued it, which makes elapsed-time alone a
+/// vacuous signal here), but read directly off `WriterTaskHandle::queue_depth`,
+/// the live gauge over the exact `mpsc` channel `with_writer`'s writer-task
+/// branch must call `send` on.
+///
+/// Technique: submit an occupier request directly on the SAME
+/// `WriterTaskHandle` the store resolved at construction. The occupier signals
+/// a oneshot once it is actually running inside the writer task's single
+/// drain slot, then parks on a second oneshot (`blocking_recv`, valid here
+/// because this closure runs inside the writer task's `spawn_blocking`) until
+/// the test releases it — deterministically holding that one drain slot open
+/// for as long as the test needs, no sleep/timing race. While the slot is
+/// held, call `store.upsert_entity` on a separate task and poll
+/// `queue_depth()`: a version that genuinely routes this call through
+/// `writer_task.send(..)` must show `queue_depth() >= 1` (the request sitting
+/// in the channel behind the still-running occupier) before the occupier is
+/// released; a version that left `upsert_entity`/`with_writer` on the legacy
+/// `pool.try_writer()` path never touches this channel at all, so
+/// `queue_depth()` would stay `0` for the full poll window — this is what
+/// makes the test non-vacuous (verified: reverting `with_writer` to always
+/// take the legacy branch makes this assertion fail, see khive-db PR history
+/// for Fork C slice 2).
+#[tokio::test]
+#[serial]
+async fn upsert_entity_routes_through_writer_task_when_flag_enabled() {
+    std::env::set_var("KHIVE_WRITE_QUEUE", "1");
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("write_queue_entity_single.db");
+    let pool_cfg = PoolConfig {
+        path: Some(path.clone()),
+        ..PoolConfig::default()
+    };
+    let pool = Arc::new(ConnectionPool::new(pool_cfg).unwrap());
+    {
+        let writer = pool.writer().unwrap();
+        writer.conn().execute_batch(ENTITIES_DDL).unwrap();
+    }
+
+    let store = Arc::new(SqlEntityStore::new(Arc::clone(&pool), true));
+
+    std::env::remove_var("KHIVE_WRITE_QUEUE");
+
+    let writer_task = pool
+        .writer_task_handle()
+        .unwrap()
+        .expect("writer task must be spawned with the flag on for a file-backed pool");
+
+    let (started_tx, started_rx) = oneshot::channel::<()>();
+    let (release_tx, release_rx) = oneshot::channel::<()>();
+    let occupier = {
+        let writer_task = writer_task.clone();
+        tokio::spawn(async move {
+            writer_task
+                .send(move |_conn| {
+                    let _ = started_tx.send(());
+                    let _ = release_rx.blocking_recv();
+                    Ok::<(), StorageError>(())
+                })
+                .await
+        })
+    };
+
+    started_rx
+        .await
+        .expect("occupier must signal it has started running inside the writer task");
+    assert_eq!(
+        writer_task.queue_depth(),
+        0,
+        "channel must start empty once the occupier has been dequeued and is running"
+    );
+
+    let entity = make_entity("default", "concept", "RoPE");
+    let entity_id = entity.id;
+
+    let store_task = {
+        let store = Arc::clone(&store);
+        tokio::spawn(async move { store.upsert_entity(entity).await })
+    };
+
+    let mut saw_enqueued = false;
+    for _ in 0..100 {
+        if writer_task.queue_depth() >= 1 {
+            saw_enqueued = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert!(
+        saw_enqueued,
+        "upsert_entity's write request never appeared in the writer task's \
+         channel while the occupier held the single drain slot — with_writer \
+         is not routing this single-row write through the shared writer task"
+    );
+
+    release_tx
+        .send(())
+        .expect("occupier must still be waiting on the release signal");
+    occupier
+        .await
+        .expect("occupier task must not panic")
+        .expect("occupier write must succeed");
+    store_task
+        .await
+        .expect("store task must not panic")
+        .expect("upsert_entity must succeed once unblocked");
+
+    let fetched = store.get_entity(entity_id).await.unwrap();
+    assert!(
+        fetched.is_some(),
+        "entity must be committed and readable after queuing behind the occupier"
+    );
+    assert_eq!(fetched.unwrap().name, "RoPE");
 }

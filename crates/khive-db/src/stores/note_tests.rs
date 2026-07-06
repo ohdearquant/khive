@@ -461,3 +461,112 @@ async fn upsert_notes_routes_through_writer_task_when_flag_enabled() {
         "the flag-ON path must actually spawn and use the writer task"
     );
 }
+
+/// Fork C slice 2: proves the SINGLE-row `upsert_note` (via `with_writer`,
+/// distinct from the already-migrated batch `upsert_notes` above) is actually
+/// enqueued on the pool's shared `WriterTaskHandle` channel when
+/// `KHIVE_WRITE_QUEUE=1`.
+///
+/// Deliberately NOT a wall-clock/occupier-timing test: real SQLite
+/// file-level locking would serialize a second writer connection against an
+/// occupier's open transaction regardless of which Rust-level path issued
+/// it, making elapsed time alone vacuous here (confirmed empirically while
+/// designing khive-db's entity.rs sibling test in this same PR). Instead
+/// this reads `WriterTaskHandle::queue_depth` directly — the live gauge over
+/// the exact `mpsc` channel `with_writer`'s writer-task branch must call
+/// `send` on — while an occupier deterministically holds the writer task's
+/// one drain slot open (parked on a oneshot via `blocking_recv`, valid
+/// because it runs inside the writer task's own `spawn_blocking`, not a
+/// sleep/timing race).
+///
+/// `#[serial]`: mutates the process-global `KHIVE_WRITE_QUEUE` env var.
+#[tokio::test]
+#[serial_test::serial]
+async fn upsert_note_routes_through_writer_task_when_flag_enabled() {
+    std::env::set_var("KHIVE_WRITE_QUEUE", "1");
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("write_queue_note_single.db");
+    let pool_cfg = PoolConfig {
+        path: Some(path.clone()),
+        ..PoolConfig::default()
+    };
+    let pool = Arc::new(ConnectionPool::new(pool_cfg).unwrap());
+    {
+        let writer = pool.writer().unwrap();
+        writer.conn().execute_batch(NOTES_DDL).unwrap();
+    }
+
+    let store = Arc::new(SqlNoteStore::new(Arc::clone(&pool), true));
+    std::env::remove_var("KHIVE_WRITE_QUEUE");
+
+    let writer_task = pool
+        .writer_task_handle()
+        .unwrap()
+        .expect("writer task must be spawned with the flag on for a file-backed pool");
+
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel::<()>();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+    let occupier = {
+        let writer_task = writer_task.clone();
+        tokio::spawn(async move {
+            writer_task
+                .send(move |_conn| {
+                    let _ = started_tx.send(());
+                    let _ = release_rx.blocking_recv();
+                    Ok::<(), StorageError>(())
+                })
+                .await
+        })
+    };
+
+    started_rx
+        .await
+        .expect("occupier must signal it has started running inside the writer task");
+    assert_eq!(
+        writer_task.queue_depth(),
+        0,
+        "channel must start empty once the occupier has been dequeued and is running"
+    );
+
+    let note = make_note("default", "observation", "single-row write-queue routing");
+    let note_id = note.id;
+
+    let store_task = {
+        let store = Arc::clone(&store);
+        tokio::spawn(async move { store.upsert_note(note).await })
+    };
+
+    let mut saw_enqueued = false;
+    for _ in 0..100 {
+        if writer_task.queue_depth() >= 1 {
+            saw_enqueued = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    assert!(
+        saw_enqueued,
+        "upsert_note's write request never appeared in the writer task's \
+         channel while the occupier held the single drain slot — with_writer \
+         is not routing this single-row write through the shared writer task"
+    );
+
+    release_tx
+        .send(())
+        .expect("occupier must still be waiting on the release signal");
+    occupier
+        .await
+        .expect("occupier task must not panic")
+        .expect("occupier write must succeed");
+    store_task
+        .await
+        .expect("store task must not panic")
+        .expect("upsert_note must succeed once unblocked");
+
+    let fetched = store.get_note(note_id).await.unwrap();
+    assert!(
+        fetched.is_some(),
+        "note must be committed and readable after queuing behind the occupier"
+    );
+}

@@ -2433,3 +2433,117 @@ async fn upsert_edges_routes_through_writer_task_when_flag_enabled() {
         "the flag-ON path must actually spawn and use the writer task"
     );
 }
+
+/// Fork C slice 2: proves the SINGLE-row `upsert_edge` (via `with_writer`,
+/// distinct from the already-migrated batch `upsert_edges` above) is
+/// actually enqueued on the pool's shared `WriterTaskHandle` channel when
+/// `KHIVE_WRITE_QUEUE=1`.
+///
+/// `graph.rs`'s own flag-off/no-writer-task fallback (`open_standalone_writer`)
+/// differs from entity.rs/note.rs's (`pool.try_writer()`), so a wall-clock
+/// occupier-timing test is even less trustworthy here — a real file-backed
+/// fallback connection opened per call would ALSO contend with the occupier
+/// for SQLite's own write lock and could look "queued" by pure accident of
+/// file-level locking, independent of whether `with_writer` used the shared
+/// channel at all. This test sidesteps that confound entirely by reading
+/// `WriterTaskHandle::queue_depth` directly — the live gauge over the exact
+/// `mpsc` channel `with_writer`'s writer-task branch must call `send` on —
+/// while an occupier deterministically holds the writer task's one drain
+/// slot open (parked on a oneshot via `blocking_recv`, not a sleep/timing
+/// race).
+///
+/// `#[serial]`: mutates the process-global `KHIVE_WRITE_QUEUE` env var.
+#[tokio::test]
+#[serial]
+async fn upsert_edge_routes_through_writer_task_when_flag_enabled() {
+    std::env::set_var("KHIVE_WRITE_QUEUE", "1");
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("write_queue_graph_single.db");
+    let pool_cfg = PoolConfig {
+        path: Some(path.clone()),
+        ..PoolConfig::default()
+    };
+    let pool = Arc::new(ConnectionPool::new(pool_cfg).unwrap());
+    {
+        let writer = pool.writer().unwrap();
+        writer.conn().execute_batch(GRAPH_DDL).unwrap();
+    }
+
+    let store = Arc::new(SqlGraphStore::new_scoped(
+        Arc::clone(&pool),
+        true,
+        "default",
+    ));
+    std::env::remove_var("KHIVE_WRITE_QUEUE");
+
+    let writer_task = pool
+        .writer_task_handle()
+        .unwrap()
+        .expect("writer task must be spawned with the flag on for a file-backed pool");
+
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel::<()>();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+    let occupier = {
+        let writer_task = writer_task.clone();
+        tokio::spawn(async move {
+            writer_task
+                .send(move |_conn| {
+                    let _ = started_tx.send(());
+                    let _ = release_rx.blocking_recv();
+                    Ok::<(), StorageError>(())
+                })
+                .await
+        })
+    };
+
+    started_rx
+        .await
+        .expect("occupier must signal it has started running inside the writer task");
+    assert_eq!(
+        writer_task.queue_depth(),
+        0,
+        "channel must start empty once the occupier has been dequeued and is running"
+    );
+
+    let edge = make_edge(Uuid::new_v4(), Uuid::new_v4(), EdgeRelation::Extends, 0.42);
+    let edge_id = edge.id;
+
+    let store_task = {
+        let store = Arc::clone(&store);
+        tokio::spawn(async move { store.upsert_edge(edge).await })
+    };
+
+    let mut saw_enqueued = false;
+    for _ in 0..100 {
+        if writer_task.queue_depth() >= 1 {
+            saw_enqueued = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    assert!(
+        saw_enqueued,
+        "upsert_edge's write request never appeared in the writer task's \
+         channel while the occupier held the single drain slot — with_writer \
+         is not routing this single-row write through the shared writer task"
+    );
+
+    release_tx
+        .send(())
+        .expect("occupier must still be waiting on the release signal");
+    occupier
+        .await
+        .expect("occupier task must not panic")
+        .expect("occupier write must succeed");
+    store_task
+        .await
+        .expect("store task must not panic")
+        .expect("upsert_edge must succeed once unblocked");
+
+    let fetched = store.get_edge(edge_id).await.unwrap();
+    assert!(
+        fetched.is_some(),
+        "edge must be committed and readable after queuing behind the occupier"
+    );
+}

@@ -71,11 +71,28 @@ impl SqlEventStore {
             .map_err(|e| map_sqlite_err(e, "open_event_reader"))
     }
 
+    /// Route a single-row write through the pool-wide `WriterTask` when
+    /// `KHIVE_WRITE_QUEUE=1` and a handle is available; otherwise fall back
+    /// to the legacy standalone-connection / pool-mutex path (ADR-067
+    /// Component A, Fork C slice 2).
+    ///
+    /// `append_event`/`append_events` do their own flag check and return
+    /// early on `Some`, so their fallback calls into this helper only ever
+    /// execute on the flag-off path (`self.writer_task` is `None` by
+    /// construction whenever those calls are reached) — no double-routing.
+    /// `f` must be DML-only on the flag-on path (no bare `BEGIN IMMEDIATE`)
+    /// since it runs inside the WriterTask's own transaction.
     async fn with_writer<F, R>(&self, op: &'static str, f: F) -> Result<R, StorageError>
     where
         F: FnOnce(&rusqlite::Connection) -> Result<R, rusqlite::Error> + Send + 'static,
         R: Send + 'static,
     {
+        if let Some(writer_task) = &self.writer_task {
+            return writer_task
+                .send(move |conn| f(conn).map_err(|e| map_err(e, op)))
+                .await;
+        }
+
         if self.is_file_backed {
             let conn = self.open_standalone_writer()?;
             tokio::task::spawn_blocking(move || f(&conn).map_err(|e| map_err(e, op)))

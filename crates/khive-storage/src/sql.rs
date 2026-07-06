@@ -1,8 +1,32 @@
 //! SQL access capability traits.
 
+use std::any::Any;
+use std::future::Future;
+use std::pin::Pin;
+
 use async_trait::async_trait;
 
 use crate::types::{SqlRow, SqlStatement, SqlTxOptions, SqlValue, StorageResult};
+
+/// A boxed future, borrowing from the `&mut dyn SqlWriter` an
+/// [`AtomicUnitOp`] is called with (see [`SqlAccess::atomic_unit`]).
+pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+
+/// A caller-supplied unit of work to run as ONE atomic operation via
+/// [`SqlAccess::atomic_unit`] (ADR-067 Component A, Fork C slice 2).
+///
+/// `op` receives a live `&mut dyn SqlWriter` already inside an open write
+/// transaction — it must issue DML only (no bare `BEGIN`/`COMMIT`/
+/// `ROLLBACK`; the caller-visible transaction boundary is owned entirely by
+/// `atomic_unit`, exactly like the existing `execute_batch` contract) — and
+/// returns its result type-erased via `Box<dyn Any + Send>` so this trait
+/// method stays object-safe (no method-level generics on a trait used as
+/// `dyn SqlAccess`). Callers downcast the returned box back to their own
+/// concrete outcome type.
+pub type AtomicUnitOp = Box<
+    dyn for<'w> FnOnce(&'w mut dyn SqlWriter) -> BoxFuture<'w, StorageResult<Box<dyn Any + Send>>>
+        + Send,
+>;
 
 /// Read-capable SQL connection.
 #[async_trait]
@@ -46,4 +70,18 @@ pub trait SqlAccess: Send + Sync + 'static {
     async fn writer(&self) -> StorageResult<Box<dyn SqlWriter>>;
     /// Begin a transaction with the given isolation options.
     async fn begin_tx(&self, options: SqlTxOptions) -> StorageResult<Box<dyn SqlTransaction>>;
+
+    /// Run `op` as ONE atomic unit of work (ADR-067 Component A, Fork C
+    /// slice 2).
+    ///
+    /// Where a single-writer task is active (file-backed pool,
+    /// `KHIVE_WRITE_QUEUE=1`), `op` runs inside that task's one write
+    /// transaction for this request — no separate connection is opened, so
+    /// this call cannot compete with the writer task for SQLite's write
+    /// lock. Where no writer task applies (flag off, no runtime, or an
+    /// in-memory pool), `op` runs under a manual
+    /// `BEGIN IMMEDIATE`/`COMMIT`/`ROLLBACK` on a writer handle exactly like
+    /// calling [`Self::writer`] and driving the statements by hand — the
+    /// pre-ADR-067 behavior, preserved byte-for-byte on this path.
+    async fn atomic_unit(&self, op: AtomicUnitOp) -> StorageResult<Box<dyn Any + Send>>;
 }

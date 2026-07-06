@@ -79,11 +79,31 @@ impl SqlGraphStore {
             .map_err(|e| map_sqlite_err(e, "open_graph_reader"))
     }
 
+    /// Route a single-row write through the pool-wide `WriterTask` when
+    /// `KHIVE_WRITE_QUEUE=1` and a handle is available; otherwise fall back
+    /// to the legacy standalone-connection / pool-mutex path (ADR-067
+    /// Component A, Fork C slice 2).
+    ///
+    /// This is the ONE routing point for every `with_writer` caller in this
+    /// store (`upsert_edge`, `delete_edge`, `purge_incident_edges`). `f`
+    /// must be DML-only — on the flag-on path it runs inside the
+    /// WriterTask's own transaction, so a bare `BEGIN IMMEDIATE` would
+    /// violate SQLite's nested-transaction rule. `upsert_edges` (the batch
+    /// method) does its own flag check and returns early on `Some`, so its
+    /// fallback call into this helper only ever executes on the flag-off
+    /// path (`self.writer_task` is `None` by construction whenever that
+    /// call is reached) — no double-routing.
     async fn with_writer<F, R>(&self, op: &'static str, f: F) -> Result<R, StorageError>
     where
         F: FnOnce(&rusqlite::Connection) -> Result<R, rusqlite::Error> + Send + 'static,
         R: Send + 'static,
     {
+        if let Some(writer_task) = &self.writer_task {
+            return writer_task
+                .send(move |conn| f(conn).map_err(|e| map_err(e, op)))
+                .await;
+        }
+
         if self.is_file_backed {
             let conn = self.open_standalone_writer()?;
             tokio::task::spawn_blocking(move || f(&conn).map_err(|e| map_err(e, op)))

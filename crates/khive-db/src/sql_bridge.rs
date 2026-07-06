@@ -4,13 +4,14 @@
 //! - **File-backed**: Opens standalone connections per reader/writer/tx call (high concurrency).
 //! - **Memory**: Uses pool-backed approach (acquire pool connection per-query inside `spawn_blocking`).
 
+use std::any::Any;
 use std::sync::Arc;
 
 use async_trait::async_trait;
 
 use khive_storage::error::StorageError;
 use khive_storage::types::{SqlColumn, SqlIsolation, SqlRow, SqlStatement, SqlTxOptions, SqlValue};
-use khive_storage::StorageCapability;
+use khive_storage::{AtomicUnitOp, StorageCapability};
 
 use crate::error::SqliteError;
 use crate::pool::ConnectionPool;
@@ -334,6 +335,27 @@ impl khive_storage::SqlWriter for SqliteWriter {
         &mut self,
         statement: SqlStatement,
     ) -> khive_storage::types::StorageResult<u64> {
+        // ADR-067 Component A (Fork C slice 2): a single statement is
+        // self-contained, just like `execute_batch`'s full statement list —
+        // route it through the writer task when available. `self.conn` is
+        // left untouched so a subsequent `execute`/`execute_script` call on
+        // this same handle still works over the standalone connection.
+        if let Some(writer_task) = self.writer_task.clone() {
+            return writer_task
+                .send(move |conn| {
+                    let mut stmt = conn
+                        .prepare(&statement.sql)
+                        .map_err(|e| map_rusqlite_err(e, "execute"))?;
+                    bind_params(&mut stmt, &statement.params)
+                        .map_err(|e| map_rusqlite_err(e, "execute"))?;
+                    let affected = stmt
+                        .raw_execute()
+                        .map_err(|e| map_rusqlite_err(e, "execute"))?;
+                    Ok(affected as u64)
+                })
+                .await;
+        }
+
         let conn = self.conn.take().ok_or_else(|| StorageError::Pool {
             operation: "execute".into(),
             message: "connection already consumed".into(),
@@ -423,6 +445,24 @@ impl khive_storage::SqlWriter for SqliteWriter {
     }
 
     async fn execute_script(&mut self, script: String) -> khive_storage::types::StorageResult<()> {
+        // ADR-067 Component A (Fork C slice 2): the script text is
+        // self-contained (supplied up front, runs as one unit), just like
+        // `execute_batch` — route it through the writer task when
+        // available. `self.conn` is left untouched so a subsequent
+        // `execute`/`execute_script` call on this same handle still works
+        // over the standalone connection. Callers must supply a DML-only
+        // script (no bare `BEGIN`/`COMMIT`/`ROLLBACK`) on the flag-on path,
+        // since it runs inside the writer task's own transaction — same
+        // contract as `execute_batch`'s statement list.
+        if let Some(writer_task) = self.writer_task.clone() {
+            return writer_task
+                .send(move |conn| {
+                    conn.execute_batch(&script)
+                        .map_err(|e| map_rusqlite_err(e, "execute_script"))
+                })
+                .await;
+        }
+
         let conn = self.conn.take().ok_or_else(|| StorageError::Pool {
             operation: "execute_script".into(),
             message: "connection already consumed".into(),
@@ -836,6 +876,209 @@ impl khive_storage::SqlWriter for PoolBackedWriter {
 }
 
 // =============================================================================
+// atomic_unit (ADR-067 Component A, Fork C slice 2)
+// =============================================================================
+
+/// A purely-synchronous `SqlReader`/`SqlWriter` over a borrowed connection,
+/// used ONLY to drive an [`AtomicUnitOp`] on the flag-on path, where the
+/// closure body runs inside the writer task's `spawn_blocking` (synchronous
+/// `FnOnce(&rusqlite::Connection) -> ...`) rather than a real async context.
+///
+/// Every method here does plain, non-suspending rusqlite work — there is no
+/// real `.await` point anywhere in this impl — so [`block_on_sync`] driving
+/// the resulting future to completion with a single poll is sound, not a
+/// hack: the future can never actually be `Pending`.
+///
+/// `SqlReader`/`SqlWriter` both carry a `'static` supertrait bound (they are
+/// used as `Box<dyn ...>` elsewhere in this module), so this type cannot
+/// hold a real `&'c Connection` borrow — it would tie `InlineWriter` to a
+/// non-`'static` lifetime and, independently, `&Connection` is not `Send`
+/// (`Connection` is `!Sync`), which the `#[async_trait]`-generated futures
+/// require. A raw pointer sidesteps both: `*const Connection` is `Send` and
+/// `'static` on its face, and the safety burden (the pointee outliving
+/// every dereference) is upheld by construction — see `atomic_unit`, the
+/// only call site: it builds an `InlineWriter` from `conn: &Connection`,
+/// drives `op` to completion via `block_on_sync` synchronously, and drops
+/// the `InlineWriter` before that borrow ends, all within one stack frame.
+struct InlineWriter {
+    conn: *const rusqlite::Connection,
+}
+
+// SAFETY: `InlineWriter` is never actually shared across a real thread
+// boundary — it is constructed, driven to completion synchronously via
+// `block_on_sync`, and dropped within a single call frame inside the
+// writer task's `spawn_blocking` closure (see `atomic_unit`). The `Send`
+// bound `async_trait` imposes on the futures below is a static
+// over-approximation for this restricted, single-threaded usage pattern.
+unsafe impl Send for InlineWriter {}
+
+impl InlineWriter {
+    /// SAFETY: valid for the lifetime of the enclosing synchronous scope in
+    /// `atomic_unit` (see the struct doc comment above) — the pointee is
+    /// never dereferenced after that scope ends.
+    fn conn(&self) -> &rusqlite::Connection {
+        unsafe { &*self.conn }
+    }
+}
+
+#[async_trait]
+impl khive_storage::SqlReader for InlineWriter {
+    async fn query_row(
+        &mut self,
+        statement: SqlStatement,
+    ) -> khive_storage::types::StorageResult<Option<SqlRow>> {
+        let rows = execute_query(self.conn(), &statement)
+            .map_err(|e| map_rusqlite_err(e, "inline.query_row"))?;
+        Ok(rows.into_iter().next())
+    }
+
+    async fn query_all(
+        &mut self,
+        statement: SqlStatement,
+    ) -> khive_storage::types::StorageResult<Vec<SqlRow>> {
+        execute_query(self.conn(), &statement).map_err(|e| map_rusqlite_err(e, "inline.query_all"))
+    }
+
+    async fn query_scalar(
+        &mut self,
+        statement: SqlStatement,
+    ) -> khive_storage::types::StorageResult<Option<SqlValue>> {
+        let row = khive_storage::SqlReader::query_row(self, statement).await?;
+        Ok(row.and_then(|r| r.columns.into_iter().next().map(|c| c.value)))
+    }
+
+    async fn explain(
+        &mut self,
+        statement: SqlStatement,
+    ) -> khive_storage::types::StorageResult<Vec<SqlRow>> {
+        let explain_stmt = SqlStatement {
+            sql: format!("EXPLAIN QUERY PLAN {}", statement.sql),
+            params: statement.params,
+            label: statement.label,
+        };
+        khive_storage::SqlReader::query_all(self, explain_stmt).await
+    }
+}
+
+#[async_trait]
+impl khive_storage::SqlWriter for InlineWriter {
+    async fn execute(
+        &mut self,
+        statement: SqlStatement,
+    ) -> khive_storage::types::StorageResult<u64> {
+        let mut stmt = self
+            .conn()
+            .prepare(&statement.sql)
+            .map_err(|e| map_rusqlite_err(e, "inline.execute"))?;
+        bind_params(&mut stmt, &statement.params)
+            .map_err(|e| map_rusqlite_err(e, "inline.execute"))?;
+        let affected = stmt
+            .raw_execute()
+            .map_err(|e| map_rusqlite_err(e, "inline.execute"))?;
+        Ok(affected as u64)
+    }
+
+    async fn execute_batch(
+        &mut self,
+        statements: Vec<SqlStatement>,
+    ) -> khive_storage::types::StorageResult<u64> {
+        let mut total: u64 = 0;
+        for statement in &statements {
+            let mut stmt = self
+                .conn()
+                .prepare(&statement.sql)
+                .map_err(|e| map_rusqlite_err(e, "inline.execute_batch"))?;
+            bind_params(&mut stmt, &statement.params)
+                .map_err(|e| map_rusqlite_err(e, "inline.execute_batch"))?;
+            total += stmt
+                .raw_execute()
+                .map_err(|e| map_rusqlite_err(e, "inline.execute_batch"))?
+                as u64;
+        }
+        Ok(total)
+    }
+
+    async fn execute_script(&mut self, script: String) -> khive_storage::types::StorageResult<()> {
+        self.conn()
+            .execute_batch(&script)
+            .map_err(|e| map_rusqlite_err(e, "inline.execute_script"))
+    }
+}
+
+/// Poll `fut` exactly once with a no-op waker and return its output.
+///
+/// Only sound for futures that never actually suspend — every caller in
+/// this module drives an [`InlineWriter`], whose methods are pure
+/// synchronous rusqlite calls with no real `.await` point. Panics loudly
+/// (rather than silently hanging or busy-looping) if that invariant is ever
+/// violated, since that would mean a future genuinely needs a real
+/// executor.
+fn block_on_sync<F: std::future::Future>(fut: F) -> F::Output {
+    use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+
+    fn no_op(_: *const ()) {}
+    fn clone_waker(_: *const ()) -> RawWaker {
+        RawWaker::new(std::ptr::null(), &VTABLE)
+    }
+    static VTABLE: RawWakerVTable = RawWakerVTable::new(clone_waker, no_op, no_op, no_op);
+
+    // SAFETY: every `RawWakerVTable` function is a no-op that never
+    // dereferences the data pointer, so a null data pointer is sound.
+    let raw_waker = RawWaker::new(std::ptr::null(), &VTABLE);
+    let waker = unsafe { Waker::from_raw(raw_waker) };
+    let mut cx = Context::from_waker(&waker);
+
+    let mut fut = std::pin::pin!(fut);
+    match fut.as_mut().poll(&mut cx) {
+        Poll::Ready(v) => v,
+        Poll::Pending => unreachable!(
+            "block_on_sync: future was Pending on first poll — InlineWriter's \
+             methods must be purely synchronous with no real await points"
+        ),
+    }
+}
+
+/// Run `op` under a manual `BEGIN IMMEDIATE`/`COMMIT`/`ROLLBACK` on `writer`
+/// — the pre-ADR-067 shape, used by [`SqlBridge::atomic_unit`] whenever no
+/// writer task applies (flag off, no runtime, or an in-memory pool),
+/// preserving that path byte-for-byte.
+async fn run_manual_atomic_unit(
+    writer: &mut dyn khive_storage::SqlWriter,
+    op: AtomicUnitOp,
+) -> khive_storage::types::StorageResult<Box<dyn Any + Send>> {
+    fn tx_stmt(sql: &str, label: &str) -> SqlStatement {
+        SqlStatement {
+            sql: sql.to_string(),
+            params: vec![],
+            label: Some(label.to_string()),
+        }
+    }
+    khive_storage::SqlWriter::execute(writer, tx_stmt("BEGIN IMMEDIATE", "begin")).await?;
+    let _tx_handle = khive_storage::tx_registry::register(Some("atomic_unit".to_string()));
+
+    let result = op(writer).await;
+
+    match result {
+        Ok(value) => {
+            match khive_storage::SqlWriter::execute(writer, tx_stmt("COMMIT", "commit")).await {
+                Ok(_) => Ok(value),
+                Err(e) => {
+                    let _ =
+                        khive_storage::SqlWriter::execute(writer, tx_stmt("ROLLBACK", "rollback"))
+                            .await;
+                    Err(e)
+                }
+            }
+        }
+        Err(e) => {
+            let _ =
+                khive_storage::SqlWriter::execute(writer, tx_stmt("ROLLBACK", "rollback")).await;
+            Err(e)
+        }
+    }
+}
+
+// =============================================================================
 // SqlBridge: the SqlAccess implementor
 // =============================================================================
 
@@ -955,6 +1198,55 @@ impl khive_storage::SqlAccess for SqlBridge {
             read_only: effective_read_only,
             _tx_handle: tx_handle,
         }))
+    }
+
+    async fn atomic_unit(
+        &self,
+        op: AtomicUnitOp,
+    ) -> khive_storage::types::StorageResult<Box<dyn Any + Send>> {
+        if self.is_file_backed {
+            if self.pool.config().read_only {
+                return Err(StorageError::Pool {
+                    operation: "atomic_unit".into(),
+                    message: "backend is read-only".into(),
+                });
+            }
+            // Best-effort, same guard `writer()` uses: `Ok(None)` on flag-off;
+            // `Err(WriterTaskNoRuntime)` propagates loud rather than silently
+            // falling back to a competing connection from a sync caller.
+            if let Some(writer_task) = self.pool.writer_task_handle()? {
+                // Flag-on: ONE queued WriteRequest. `run_writer_task` already
+                // has an open `BEGIN IMMEDIATE` on its dedicated connection
+                // before this closure runs and issues `COMMIT`/`ROLLBACK`
+                // after it returns — `op` must not (and, via `InlineWriter`,
+                // does not) issue its own transaction control.
+                return writer_task
+                    .send(move |conn| {
+                        let mut inline = InlineWriter {
+                            conn: conn as *const rusqlite::Connection,
+                        };
+                        block_on_sync(op(&mut inline))
+                    })
+                    .await;
+            }
+            // Flag-off (or no writer task available): manual
+            // BEGIN IMMEDIATE/COMMIT/ROLLBACK on a standalone writer —
+            // byte-for-byte the pre-ADR-067 shape.
+            let conn = open_standalone_writer(&self.pool)?;
+            let mut writer = SqliteWriter {
+                conn: Some(conn),
+                writer_task: None,
+            };
+            run_manual_atomic_unit(&mut writer, op).await
+        } else {
+            // In-memory pools are exempt (not accept-loop reachable, per the
+            // rework spec's "Out of scope") — preserve the existing
+            // pool-backed manual-transaction behavior.
+            let mut writer = PoolBackedWriter {
+                pool: Arc::clone(&self.pool),
+            };
+            run_manual_atomic_unit(&mut writer, op).await
+        }
     }
 }
 

@@ -1176,6 +1176,15 @@ impl BrainPack {
             };
 
             let namespace = token.namespace().as_str().to_string();
+            // `apply_fold_gate_and_append_event`'s `build_event` closure is
+            // now required to be `'static` (ADR-067 Component A, Fork C
+            // slice 2 — it is boxed into an `AtomicUnitOp` and may run
+            // inside the writer task's `spawn_blocking`), so it must own
+            // its captures rather than borrow `namespace`/`base_data` — a
+            // separate `namespace_for_event` clone avoids conflicting with
+            // the `&namespace` borrow passed as this call's own argument.
+            let namespace_for_event = namespace.clone();
+            let base_data_for_event = base_data.clone();
             let outcome = crate::fold_gate::apply_fold_gate_and_append_event(
                 sql.as_ref(),
                 &namespace,
@@ -1184,8 +1193,8 @@ impl BrainPack {
                 gate_mode,
                 now_us,
                 dedup_key,
-                |fold_outcome, forced_zero| {
-                    let mut data = base_data.clone();
+                move |fold_outcome, forced_zero| {
+                    let mut data = base_data_for_event;
                     let (effective_weight, mass_before, mass_after) = match fold_outcome {
                         Some(o) => (o.effective_weight, o.mass_before, o.mass_after),
                         None => (0.0, 0.0, 0.0),
@@ -1198,7 +1207,7 @@ impl BrainPack {
                     });
                     let duration_us = feedback_start.elapsed().as_micros().max(1) as i64;
                     Event::new(
-                        namespace.clone(),
+                        namespace_for_event,
                         "brain.feedback",
                         khive_types::EventKind::FeedbackExplicit,
                         khive_types::SubstrateKind::Event,
