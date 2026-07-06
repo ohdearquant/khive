@@ -10,7 +10,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 
 use khive_storage::error::StorageError;
-use khive_storage::types::{SqlColumn, SqlIsolation, SqlRow, SqlStatement, SqlTxOptions, SqlValue};
+use khive_storage::types::{SqlColumn, SqlRow, SqlStatement, SqlValue};
 use khive_storage::{AtomicUnitOp, StorageCapability};
 
 use crate::error::SqliteError;
@@ -145,44 +145,6 @@ fn open_standalone_writer(pool: &ConnectionPool) -> Result<rusqlite::Connection,
         .map_err(|e| map_rusqlite_err(e, "open_writer"))?;
     conn.pragma_update(None, "mmap_size", "1073741824")
         .map_err(|e| map_rusqlite_err(e, "open_writer"))?;
-
-    Ok(conn)
-}
-
-/// Open a standalone connection for a transaction, honoring `effective_read_only`.
-///
-/// When `effective_read_only` is set, the connection is opened with
-/// `SQLITE_OPEN_READ_ONLY` (so writes fail at the SQLite level even if the
-/// `PRAGMA query_only` toggle were ever bypassed) instead of `READ_WRITE`.
-fn open_standalone_tx_conn(
-    pool: &ConnectionPool,
-    effective_read_only: bool,
-) -> Result<rusqlite::Connection, StorageError> {
-    let config = pool.config();
-    let path = config.path.as_ref().ok_or_else(|| StorageError::Pool {
-        operation: "begin_tx".into(),
-        message: "in-memory databases do not support standalone writer; use pool-backed".into(),
-    })?;
-
-    let flags = if effective_read_only {
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
-            | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX
-            | rusqlite::OpenFlags::SQLITE_OPEN_URI
-    } else {
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
-            | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX
-            | rusqlite::OpenFlags::SQLITE_OPEN_URI
-    };
-
-    let conn = rusqlite::Connection::open_with_flags(path, flags)
-        .map_err(|e| map_rusqlite_err(e, "open_tx"))?;
-
-    conn.busy_timeout(config.busy_timeout)
-        .map_err(|e| map_rusqlite_err(e, "open_tx"))?;
-    conn.pragma_update(None, "cache_size", "-65536")
-        .map_err(|e| map_rusqlite_err(e, "open_tx"))?;
-    conn.pragma_update(None, "mmap_size", "1073741824")
-        .map_err(|e| map_rusqlite_err(e, "open_tx"))?;
 
     Ok(conn)
 }
@@ -512,189 +474,6 @@ impl khive_storage::SqlWriter for SqliteWriter {
         .map_err(|e| StorageError::driver(StorageCapability::Sql, "execute_script_top_level", e))?;
         self.conn = Some(conn);
         result.map_err(|e| map_rusqlite_err(e, "execute_script_top_level"))
-    }
-}
-
-// =============================================================================
-// File-backed: SqliteTransaction (standalone connection)
-// =============================================================================
-
-struct SqliteTransaction {
-    conn: Option<rusqlite::Connection>,
-    /// Whether `PRAGMA query_only = ON` was set on the connection.
-    /// Must be reset to OFF before COMMIT/ROLLBACK so the connection can
-    /// be returned cleanly (defensive; connection is dropped after use anyway).
-    read_only: bool,
-    /// Open-transaction registry entry (ADR-091 Plank 0); deregisters on Drop.
-    _tx_handle: khive_storage::tx_registry::TxHandle,
-}
-
-#[async_trait]
-impl khive_storage::SqlReader for SqliteTransaction {
-    async fn query_row(
-        &mut self,
-        statement: SqlStatement,
-    ) -> khive_storage::types::StorageResult<Option<SqlRow>> {
-        let conn = self.conn.take().ok_or_else(|| StorageError::Pool {
-            operation: "tx.query_row".into(),
-            message: "connection already consumed".into(),
-        })?;
-        let (conn, result) = tokio::task::spawn_blocking(move || {
-            let res = execute_query(&conn, &statement);
-            (conn, res)
-        })
-        .await
-        .map_err(|e| StorageError::driver(StorageCapability::Sql, "tx.query_row", e))?;
-        self.conn = Some(conn);
-        let rows = result.map_err(|e| map_rusqlite_err(e, "tx.query_row"))?;
-        Ok(rows.into_iter().next())
-    }
-
-    async fn query_all(
-        &mut self,
-        statement: SqlStatement,
-    ) -> khive_storage::types::StorageResult<Vec<SqlRow>> {
-        let conn = self.conn.take().ok_or_else(|| StorageError::Pool {
-            operation: "tx.query_all".into(),
-            message: "connection already consumed".into(),
-        })?;
-        let (conn, result) = tokio::task::spawn_blocking(move || {
-            let res = execute_query(&conn, &statement);
-            (conn, res)
-        })
-        .await
-        .map_err(|e| StorageError::driver(StorageCapability::Sql, "tx.query_all", e))?;
-        self.conn = Some(conn);
-        result.map_err(|e| map_rusqlite_err(e, "tx.query_all"))
-    }
-
-    async fn query_scalar(
-        &mut self,
-        statement: SqlStatement,
-    ) -> khive_storage::types::StorageResult<Option<SqlValue>> {
-        let row = khive_storage::SqlReader::query_row(self, statement).await?;
-        Ok(row.and_then(|r| r.columns.into_iter().next().map(|c| c.value)))
-    }
-
-    async fn explain(
-        &mut self,
-        statement: SqlStatement,
-    ) -> khive_storage::types::StorageResult<Vec<SqlRow>> {
-        let explain_stmt = SqlStatement {
-            sql: format!("EXPLAIN QUERY PLAN {}", statement.sql),
-            params: statement.params,
-            label: statement.label,
-        };
-        khive_storage::SqlReader::query_all(self, explain_stmt).await
-    }
-}
-
-#[async_trait]
-impl khive_storage::SqlWriter for SqliteTransaction {
-    async fn execute(
-        &mut self,
-        statement: SqlStatement,
-    ) -> khive_storage::types::StorageResult<u64> {
-        let conn = self.conn.take().ok_or_else(|| StorageError::Pool {
-            operation: "tx.execute".into(),
-            message: "connection already consumed".into(),
-        })?;
-        let (conn, result) = tokio::task::spawn_blocking(move || {
-            let res = (|| -> Result<usize, rusqlite::Error> {
-                let mut stmt = conn.prepare(&statement.sql)?;
-                bind_params(&mut stmt, &statement.params)?;
-                stmt.raw_execute()
-            })();
-            (conn, res)
-        })
-        .await
-        .map_err(|e| StorageError::driver(StorageCapability::Sql, "tx.execute", e))?;
-        self.conn = Some(conn);
-        let affected = result.map_err(|e| map_rusqlite_err(e, "tx.execute"))?;
-        Ok(affected as u64)
-    }
-
-    async fn execute_batch(
-        &mut self,
-        statements: Vec<SqlStatement>,
-    ) -> khive_storage::types::StorageResult<u64> {
-        let conn = self.conn.take().ok_or_else(|| StorageError::Pool {
-            operation: "tx.execute_batch".into(),
-            message: "connection already consumed".into(),
-        })?;
-        let (conn, result) = tokio::task::spawn_blocking(move || {
-            let mut total: u64 = 0;
-            for statement in &statements {
-                let res = (|| -> Result<usize, rusqlite::Error> {
-                    let mut stmt = conn.prepare(&statement.sql)?;
-                    bind_params(&mut stmt, &statement.params)?;
-                    stmt.raw_execute()
-                })();
-                match res {
-                    Ok(n) => total += n as u64,
-                    Err(e) => return (conn, Err(e)),
-                }
-            }
-            (conn, Ok(total))
-        })
-        .await
-        .map_err(|e| StorageError::driver(StorageCapability::Sql, "tx.execute_batch", e))?;
-        self.conn = Some(conn);
-        result.map_err(|e| map_rusqlite_err(e, "tx.execute_batch"))
-    }
-
-    async fn execute_script(&mut self, script: String) -> khive_storage::types::StorageResult<()> {
-        let conn = self.conn.take().ok_or_else(|| StorageError::Pool {
-            operation: "tx.execute_script".into(),
-            message: "connection already consumed".into(),
-        })?;
-        let (conn, result) = tokio::task::spawn_blocking(move || {
-            let res = conn.execute_batch(&script);
-            (conn, res)
-        })
-        .await
-        .map_err(|e| StorageError::driver(StorageCapability::Sql, "tx.execute_script", e))?;
-        self.conn = Some(conn);
-        result.map_err(|e| map_rusqlite_err(e, "tx.execute_script"))
-    }
-}
-
-#[async_trait]
-impl khive_storage::SqlTransaction for SqliteTransaction {
-    async fn commit(mut self: Box<Self>) -> khive_storage::types::StorageResult<()> {
-        let conn = self.conn.take().ok_or_else(|| StorageError::Transaction {
-            operation: "commit".into(),
-            message: "connection already consumed".into(),
-        })?;
-        let read_only = self.read_only;
-        tokio::task::spawn_blocking(move || {
-            // Reset query_only before COMMIT so the connection ends cleanly.
-            if read_only {
-                let _ = conn.pragma_update(None, "query_only", "OFF");
-            }
-            conn.execute_batch("COMMIT")
-                .map_err(|e| map_rusqlite_err(e, "commit"))
-        })
-        .await
-        .map_err(|e| StorageError::driver(StorageCapability::Sql, "commit", e))?
-    }
-
-    async fn rollback(mut self: Box<Self>) -> khive_storage::types::StorageResult<()> {
-        let conn = self.conn.take().ok_or_else(|| StorageError::Transaction {
-            operation: "rollback".into(),
-            message: "connection already consumed".into(),
-        })?;
-        let read_only = self.read_only;
-        tokio::task::spawn_blocking(move || {
-            // Reset query_only before ROLLBACK so the connection ends cleanly.
-            if read_only {
-                let _ = conn.pragma_update(None, "query_only", "OFF");
-            }
-            conn.execute_batch("ROLLBACK")
-                .map_err(|e| map_rusqlite_err(e, "rollback"))
-        })
-        .await
-        .map_err(|e| StorageError::driver(StorageCapability::Sql, "rollback", e))?
     }
 }
 
@@ -1200,63 +979,16 @@ impl khive_storage::SqlAccess for SqlBridge {
         }
     }
 
-    async fn begin_tx(
-        &self,
-        options: SqlTxOptions,
-    ) -> khive_storage::types::StorageResult<Box<dyn khive_storage::SqlTransaction>> {
-        // Transactions need a standalone connection so the BEGIN/COMMIT state
-        // is not shared with other operations. For in-memory DBs we still
-        // open a standalone writer since the pool writer would conflict.
-        // A read-only backend forces the transaction read-only even if the
-        // caller did not ask for it, so writes cannot bypass the backend's
-        // read-only mode via `SqlTxOptions::default()`.
-        let effective_read_only = self.pool.config().read_only || options.read_only;
-
-        let conn = if self.is_file_backed {
-            open_standalone_tx_conn(&self.pool, effective_read_only)?
-        } else {
-            return Err(StorageError::Pool {
-                operation: "begin_tx".into(),
-                message: "transactions require file-backed database (not in-memory)".into(),
-            });
-        };
-
-        // Map isolation level to SQLite BEGIN mode.
-        // SQLite WAL mode gives snapshot isolation for readers automatically;
-        // IMMEDIATE acquires the write lock early (prevents writer starvation),
-        // EXCLUSIVE prevents any concurrent readers for full serializability.
-        let begin_stmt = match options.isolation {
-            SqlIsolation::Serializable => "BEGIN EXCLUSIVE",
-            _ => {
-                if effective_read_only {
-                    // DEFERRED acquires no lock at BEGIN time, compatible with
-                    // read-only transactions (no write-intent needed).
-                    "BEGIN DEFERRED"
-                } else {
-                    // IMMEDIATE acquires the write lock early to prevent starvation.
-                    "BEGIN IMMEDIATE"
-                }
-            }
-        };
-        conn.execute_batch(begin_stmt)
-            .map_err(|e| map_rusqlite_err(e, "begin_tx"))?;
-        let tx_handle = khive_storage::tx_registry::register(options.label.clone());
-
-        // Honor read_only: block all writes via PRAGMA query_only.
-        // The connection is opened as read-write so COMMIT still works, but
-        // any INSERT/UPDATE/DELETE executed inside the transaction will error.
-        if effective_read_only {
-            conn.pragma_update(None, "query_only", "ON")
-                .map_err(|e| map_rusqlite_err(e, "begin_tx"))?;
-        }
-
-        Ok(Box::new(SqliteTransaction {
-            conn: Some(conn),
-            read_only: effective_read_only,
-            _tx_handle: tx_handle,
-        }))
-    }
-
+    /// Implements the trait's atomic-unit suspend-free invariant
+    /// (`SqlAccess::atomic_unit`'s doc comment): on the flag-on branch below,
+    /// `op` is driven through [`block_on_sync`] on an [`InlineWriter`] — a
+    /// single-poll driver that returns `Err` the instant `op`'s future is
+    /// `Pending` instead of ever actually suspending. `op` must therefore
+    /// issue only synchronous DML; see `InlineWriter`'s and
+    /// `block_on_sync`'s doc comments for the full mechanics and why this
+    /// restriction is load-bearing (a suspended poll inside the writer
+    /// task's `spawn_blocking` would otherwise block that task on external
+    /// async work while holding the single write connection).
     async fn atomic_unit(
         &self,
         op: AtomicUnitOp,
@@ -1323,103 +1055,8 @@ impl khive_storage::SqlAccess for SqlBridge {
 mod tests {
     use super::*;
     use crate::pool::PoolConfig;
-    use khive_storage::types::{SqlIsolation, SqlStatement, SqlTxOptions, SqlValue};
+    use khive_storage::types::{SqlStatement, SqlValue};
     use khive_storage::SqlAccess as _;
-    use serial_test::serial;
-
-    /// Verify that a read-only transaction rejects INSERT statements via
-    /// PRAGMA query_only.
-    #[tokio::test]
-    async fn tx_read_only_rejects_writes() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("tx_ro.db");
-        let config = PoolConfig {
-            path: Some(path.clone()),
-            ..PoolConfig::default()
-        };
-        let pool = Arc::new(ConnectionPool::new(config).unwrap());
-
-        // Create a table so there is something to INSERT into.
-        {
-            let guard = pool.writer().unwrap();
-            guard
-                .conn()
-                .execute_batch("CREATE TABLE IF NOT EXISTS ro_test (id INTEGER PRIMARY KEY)")
-                .unwrap();
-        }
-
-        let bridge = SqlBridge::new(Arc::clone(&pool), true);
-
-        let mut tx = bridge
-            .begin_tx(SqlTxOptions {
-                read_only: true,
-                isolation: SqlIsolation::Default,
-                label: None,
-            })
-            .await
-            .unwrap();
-
-        // An INSERT inside a read-only transaction must fail.
-        let result = tx
-            .execute(SqlStatement {
-                sql: "INSERT INTO ro_test (id) VALUES (?1)".into(),
-                params: vec![SqlValue::Integer(1)],
-                label: None,
-            })
-            .await;
-
-        assert!(result.is_err(), "INSERT in read-only tx must fail");
-
-        // Rollback should succeed regardless.
-        tx.rollback().await.unwrap();
-    }
-
-    /// ADR-091 Plank 0: `begin_tx` registers with the shared open-transaction
-    /// registry under its caller-supplied label, and `commit()` deregisters it.
-    ///
-    /// `#[serial(tx_registry)]`: the registry is a process-wide singleton
-    /// shared across every test in this binary; this test shares the
-    /// `tx_registry` serial group with `checkpoint.rs`'s and `pool.rs`'s
-    /// registry tests to avoid cross-test interference within one run.
-    #[tokio::test]
-    #[serial(tx_registry)]
-    async fn begin_tx_registers_and_commit_deregisters() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("tx_registry.db");
-        let config = PoolConfig {
-            path: Some(path.clone()),
-            ..PoolConfig::default()
-        };
-        let pool = Arc::new(ConnectionPool::new(config).unwrap());
-        let bridge = SqlBridge::new(Arc::clone(&pool), true);
-
-        let tx = bridge
-            .begin_tx(SqlTxOptions {
-                read_only: false,
-                isolation: SqlIsolation::Default,
-                label: Some("begin_tx_registry_test".to_string()),
-            })
-            .await
-            .unwrap();
-
-        let snapshot = khive_storage::tx_registry::snapshot();
-        assert!(
-            snapshot
-                .iter()
-                .any(|(_, label)| label.as_deref() == Some("begin_tx_registry_test")),
-            "expected the labeled tx to be visible in the registry while open"
-        );
-
-        tx.commit().await.unwrap();
-
-        let snapshot_after = khive_storage::tx_registry::snapshot();
-        assert!(
-            !snapshot_after
-                .iter()
-                .any(|(_, label)| label.as_deref() == Some("begin_tx_registry_test")),
-            "expected the labeled tx to be gone from the registry after commit"
-        );
-    }
 
     /// ADR-067 Component A entry 10: with `KHIVE_WRITE_QUEUE=1`,
     /// `SqliteWriter::execute_batch` (reached via `SqlBridge::writer()`)

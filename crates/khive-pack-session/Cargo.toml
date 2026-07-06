@@ -27,3 +27,10 @@ tokio = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
 khive-pack-kg = { version = "0.3.0", path = "../khive-pack-kg" }
 tempfile = { workspace = true }
+# Test-only: builds a bare `PoolConfig { write_queue_enabled: true, .. }` +
+# `SqlBridge` directly (no `KhiveRuntime`, no `KHIVE_WRITE_QUEUE` env var) for
+# the ADR-099 D5 single-writer / suspend-free tests, matching the
+# established pattern in khive-pack-brain's `fold_gate.rs` and `persist.rs`
+# (documented there: env-var mutation races other tests' `KhiveRuntime::new`
+# calls in the same binary; a literal `PoolConfig` sidesteps that).
+khive-db = { version = "0.3.0", path = "../khive-db" }

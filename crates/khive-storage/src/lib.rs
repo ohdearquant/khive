@@ -23,7 +23,7 @@ pub use event::{
 pub use graph::GraphStore;
 pub use note::{FilterOp, Note, NoteFilter, NoteStore, SortDir};
 pub use sparse::SparseStore;
-pub use sql::{AtomicUnitOp, BoxFuture, SqlAccess, SqlReader, SqlTransaction, SqlWriter};
+pub use sql::{AtomicUnitOp, BoxFuture, SqlAccess, SqlReader, SqlWriter};
 pub use text::TextSearch;
 pub use types::StorageResult;
 pub use vectors::VectorStore;

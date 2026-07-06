@@ -36,12 +36,12 @@
 //! retry, never a full-file read in one call (PACKSESSION-AUD-003 round 2).
 
 use std::io::{BufRead, Seek, SeekFrom};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use chrono::Utc;
 use khive_runtime::{KhiveRuntime, RuntimeError};
-use khive_storage::types::{SqlStatement, SqlTxOptions, SqlValue};
-use khive_storage::SqlTransaction;
+use khive_storage::types::{SqlStatement, SqlValue};
+use khive_storage::SqlWriter;
 
 use super::parse;
 
@@ -611,11 +611,67 @@ async fn write_events_and_cursor(
     let now_us = Utc::now().timestamp_micros();
     let sql = runtime.sql();
 
-    let mut tx = sql
-        .begin_tx(SqlTxOptions::default())
-        .await
-        .map_err(|e| RuntimeError::Internal(format!("mirror: begin_tx: {e}")))?;
+    // ADR-099 D5: this closure is verified suspension-free (it drives only
+    // `writer` with inline-built `SqlStatement`s — session/message INSERTs,
+    // the count refresh, and the cursor UPDATE — with no embedding, no ANN
+    // warming, and no other `await` on an external service), so handing it
+    // to `atomic_unit` satisfies the atomic-unit suspend-free invariant
+    // (`SqlAccess::atomic_unit`'s doc comment) identically on the
+    // single-writer and flag-off paths. This replaces the standalone
+    // `begin_tx` this function used before ADR-099: the whole sequence
+    // still commits once or rolls back as one unit, but no longer opens its
+    // own connection outside the writer task.
+    let events_owned: Vec<parse::ParsedEvent> = events.to_vec();
+    let path_owned: PathBuf = path.to_path_buf();
 
+    let op: khive_storage::AtomicUnitOp = Box::new(move |writer: &mut dyn SqlWriter| {
+        Box::pin(async move {
+            write_events_and_cursor_on_writer(
+                writer,
+                &path_owned,
+                source_value,
+                &events_owned,
+                scanned,
+                new_offset,
+                now_us,
+            )
+            .await
+            .map(|stats| Box::new(stats) as Box<dyn std::any::Any + Send>)
+            .map_err(|e| {
+                khive_storage::StorageError::driver(
+                    khive_storage::StorageCapability::Sql,
+                    "session_mirror_write_events_and_cursor",
+                    e,
+                )
+            })
+        })
+    });
+
+    let boxed = sql
+        .atomic_unit(op)
+        .await
+        .map_err(|e| RuntimeError::Internal(format!("mirror: atomic_unit: {e}")))?;
+
+    Ok(*boxed.downcast::<MirrorStats>().unwrap_or_else(|_| {
+        panic!("atomic_unit op for write_events_and_cursor must return MirrorStats")
+    }))
+}
+
+/// The synchronous-DML body of `write_events_and_cursor`, run inside one
+/// `atomic_unit` closure (see that function's doc comment for the
+/// suspension-free justification). Takes a plain `&mut dyn SqlWriter`
+/// (not `&mut dyn SqlTransaction`) because `atomic_unit` owns the
+/// transaction boundary entirely — this function must not, and does not,
+/// issue its own `BEGIN`/`COMMIT`/`ROLLBACK`.
+async fn write_events_and_cursor_on_writer(
+    writer: &mut dyn SqlWriter,
+    path: &Path,
+    source_value: &'static str,
+    events: &[parse::ParsedEvent],
+    scanned: u64,
+    new_offset: u64,
+    now_us: i64,
+) -> khive_storage::types::StorageResult<MirrorStats> {
     let mut inserted: u64 = 0;
     let mut last_session_id: Option<String> = None;
 
@@ -633,38 +689,38 @@ async fn write_events_and_cursor(
         // pass that inserts no new messages writes no session metadata at all —
         // strict replay idempotency. `last_seen_at` is advanced below, but only
         // when a genuinely new message lands.
-        tx.execute(SqlStatement {
-            sql: format!(
-                "INSERT INTO sessions \
-                  (id, provider_session_id, source, cwd, git_branch, slug, \
-                   message_count, first_seen_at, last_seen_at, namespace) \
-                  VALUES(?1, ?1, '{}', ?2, ?3, ?4, 0, ?5, ?5, 'local') \
-                  ON CONFLICT(id) DO NOTHING",
-                source_value
-            ),
-            params: vec![
-                SqlValue::Text(ev.session_id.clone()),
-                ev.cwd
-                    .as_deref()
-                    .map(|s| SqlValue::Text(s.to_string()))
-                    .unwrap_or(SqlValue::Null),
-                ev.git_branch
-                    .as_deref()
-                    .map(|s| SqlValue::Text(s.to_string()))
-                    .unwrap_or(SqlValue::Null),
-                ev.slug
-                    .as_deref()
-                    .map(|s| SqlValue::Text(s.to_string()))
-                    .unwrap_or(SqlValue::Null),
-                SqlValue::Integer(created_at),
-            ],
-            label: Some("session_mirror_create_session".into()),
-        })
-        .await
-        .map_err(|e| RuntimeError::Internal(format!("mirror: session create: {e}")))?;
+        writer
+            .execute(SqlStatement {
+                sql: format!(
+                    "INSERT INTO sessions \
+                      (id, provider_session_id, source, cwd, git_branch, slug, \
+                       message_count, first_seen_at, last_seen_at, namespace) \
+                      VALUES(?1, ?1, '{}', ?2, ?3, ?4, 0, ?5, ?5, 'local') \
+                      ON CONFLICT(id) DO NOTHING",
+                    source_value
+                ),
+                params: vec![
+                    SqlValue::Text(ev.session_id.clone()),
+                    ev.cwd
+                        .as_deref()
+                        .map(|s| SqlValue::Text(s.to_string()))
+                        .unwrap_or(SqlValue::Null),
+                    ev.git_branch
+                        .as_deref()
+                        .map(|s| SqlValue::Text(s.to_string()))
+                        .unwrap_or(SqlValue::Null),
+                    ev.slug
+                        .as_deref()
+                        .map(|s| SqlValue::Text(s.to_string()))
+                        .unwrap_or(SqlValue::Null),
+                    SqlValue::Integer(created_at),
+                ],
+                label: Some("session_mirror_create_session".into()),
+            })
+            .await?;
 
         // ── session_messages insert (idempotent) ──────────────────────────────
-        let affected = tx
+        let affected = writer
             .execute(SqlStatement {
                 sql: "INSERT OR IGNORE INTO session_messages \
                       (id, session_id, seq, parent_uuid, is_sidechain, role, \
@@ -695,8 +751,7 @@ async fn write_events_and_cursor(
                 ],
                 label: Some("session_mirror_insert_message".into()),
             })
-            .await
-            .map_err(|e| RuntimeError::Internal(format!("mirror: message insert: {e}")))?;
+            .await?;
 
         // ── advance session metadata ONLY when a new message landed ────────────
         //
@@ -705,34 +760,34 @@ async fn write_events_and_cursor(
         // backfills metadata that may have been NULL at create time. A pure
         // replay (`affected == 0`) touches nothing.
         if affected > 0 {
-            tx.execute(SqlStatement {
-                sql: "UPDATE sessions SET \
-                        last_seen_at=MAX(last_seen_at, ?2), \
-                        cwd=COALESCE(cwd, ?3), \
-                        git_branch=COALESCE(git_branch, ?4), \
-                        slug=COALESCE(slug, ?5) \
-                      WHERE id=?1"
-                    .into(),
-                params: vec![
-                    SqlValue::Text(ev.session_id.clone()),
-                    SqlValue::Integer(created_at),
-                    ev.cwd
-                        .as_deref()
-                        .map(|s| SqlValue::Text(s.to_string()))
-                        .unwrap_or(SqlValue::Null),
-                    ev.git_branch
-                        .as_deref()
-                        .map(|s| SqlValue::Text(s.to_string()))
-                        .unwrap_or(SqlValue::Null),
-                    ev.slug
-                        .as_deref()
-                        .map(|s| SqlValue::Text(s.to_string()))
-                        .unwrap_or(SqlValue::Null),
-                ],
-                label: Some("session_mirror_touch_session".into()),
-            })
-            .await
-            .map_err(|e| RuntimeError::Internal(format!("mirror: session touch: {e}")))?;
+            writer
+                .execute(SqlStatement {
+                    sql: "UPDATE sessions SET \
+                            last_seen_at=MAX(last_seen_at, ?2), \
+                            cwd=COALESCE(cwd, ?3), \
+                            git_branch=COALESCE(git_branch, ?4), \
+                            slug=COALESCE(slug, ?5) \
+                          WHERE id=?1"
+                        .into(),
+                    params: vec![
+                        SqlValue::Text(ev.session_id.clone()),
+                        SqlValue::Integer(created_at),
+                        ev.cwd
+                            .as_deref()
+                            .map(|s| SqlValue::Text(s.to_string()))
+                            .unwrap_or(SqlValue::Null),
+                        ev.git_branch
+                            .as_deref()
+                            .map(|s| SqlValue::Text(s.to_string()))
+                            .unwrap_or(SqlValue::Null),
+                        ev.slug
+                            .as_deref()
+                            .map(|s| SqlValue::Text(s.to_string()))
+                            .unwrap_or(SqlValue::Null),
+                    ],
+                    label: Some("session_mirror_touch_session".into()),
+                })
+                .await?;
         }
 
         inserted += affected;
@@ -755,33 +810,28 @@ async fn write_events_and_cursor(
         seen_sessions.sort(); // deterministic order for tests
 
         for sid in &seen_sessions {
-            tx.execute(SqlStatement {
-                sql: "UPDATE sessions SET message_count=\
-                      (SELECT COUNT(*) FROM session_messages WHERE session_id=?1) \
-                      WHERE id=?1"
-                    .into(),
-                params: vec![SqlValue::Text(sid.clone())],
-                label: Some("session_mirror_refresh_count".into()),
-            })
-            .await
-            .map_err(|e| RuntimeError::Internal(format!("mirror: count refresh: {e}")))?;
+            writer
+                .execute(SqlStatement {
+                    sql: "UPDATE sessions SET message_count=\
+                          (SELECT COUNT(*) FROM session_messages WHERE session_id=?1) \
+                          WHERE id=?1"
+                        .into(),
+                    params: vec![SqlValue::Text(sid.clone())],
+                    label: Some("session_mirror_refresh_count".into()),
+                })
+                .await?;
         }
     }
 
-    upsert_cursor_in_tx(
-        &mut *tx,
-        path,
-        last_session_id.as_deref(),
-        new_offset,
-        now_us,
-    )
-    .await?;
+    upsert_cursor_on_writer(writer, path, last_session_id.as_deref(), new_offset, now_us).await?;
 
     // ── commit ────────────────────────────────────────────────────────────────
-    tx.commit()
-        .await
-        .map_err(|e| RuntimeError::Internal(format!("mirror: commit: {e}")))?;
-
+    //
+    // No explicit COMMIT here: `atomic_unit` owns the transaction boundary
+    // entirely (see this function's doc comment) and commits once this
+    // closure returns `Ok`, or rolls back the whole unit on `Err` — the
+    // same all-or-nothing contract the old `begin_tx`/`tx.commit()` shape
+    // gave, now provided by the seam instead of a manual transaction.
     Ok(MirrorStats {
         inserted,
         scanned,
@@ -789,35 +839,39 @@ async fn write_events_and_cursor(
     })
 }
 
-/// Upsert the `session_mirror_cursor` row for `path` inside an open transaction.
-async fn upsert_cursor_in_tx(
-    tx: &mut dyn SqlTransaction,
+/// Upsert the `session_mirror_cursor` row for `path` inside the open
+/// `atomic_unit` transaction. Takes `&mut dyn SqlWriter` (see
+/// `write_events_and_cursor_on_writer`'s doc comment) — it issues only the
+/// one cursor DML statement, no transaction control of its own.
+async fn upsert_cursor_on_writer(
+    writer: &mut dyn SqlWriter,
     path: &Path,
     session_id: Option<&str>,
     new_offset: u64,
     now_us: i64,
-) -> Result<(), RuntimeError> {
+) -> khive_storage::types::StorageResult<()> {
     let path_str = path.to_string_lossy().into_owned();
-    tx.execute(SqlStatement {
-        sql: "INSERT INTO session_mirror_cursor(file_path, session_id, byte_offset, updated_at) \
+    writer
+        .execute(SqlStatement {
+            sql:
+                "INSERT INTO session_mirror_cursor(file_path, session_id, byte_offset, updated_at) \
               VALUES(?1, ?2, ?3, ?4) \
               ON CONFLICT(file_path) DO UPDATE SET \
                 session_id=excluded.session_id, \
                 byte_offset=excluded.byte_offset, \
                 updated_at=excluded.updated_at"
-            .into(),
-        params: vec![
-            SqlValue::Text(path_str),
-            session_id
-                .map(|s| SqlValue::Text(s.to_string()))
-                .unwrap_or(SqlValue::Null),
-            SqlValue::Integer(new_offset as i64),
-            SqlValue::Integer(now_us),
-        ],
-        label: Some("session_mirror_cursor_upsert".into()),
-    })
-    .await
-    .map_err(|e| RuntimeError::Internal(format!("mirror: cursor upsert: {e}")))?;
+                    .into(),
+            params: vec![
+                SqlValue::Text(path_str),
+                session_id
+                    .map(|s| SqlValue::Text(s.to_string()))
+                    .unwrap_or(SqlValue::Null),
+                SqlValue::Integer(new_offset as i64),
+                SqlValue::Integer(now_us),
+            ],
+            label: Some("session_mirror_cursor_upsert".into()),
+        })
+        .await?;
     Ok(())
 }
 
@@ -878,9 +932,11 @@ mod tests {
 
     /// Build a file-backed runtime and apply the session schema.
     ///
-    /// `begin_tx` (used by `mirror_file`) requires a file-backed SQLite database;
-    /// in-memory SQLite does not support the WAL-mode transactions that `begin_tx`
-    /// opens.  The caller must keep the returned `TempDir` alive for the test.
+    /// File-backed so tests exercise the same `atomic_unit` single-writer
+    /// path (`mirror_file` → `write_events_and_cursor` → `atomic_unit`,
+    /// ADR-099 D5) production runs against — an in-memory pool would take
+    /// `atomic_unit`'s pool-backed manual-transaction branch instead. The
+    /// caller must keep the returned `TempDir` alive for the test.
     async fn setup() -> (KhiveRuntime, TempDir) {
         let dir = TempDir::new().expect("tempdir");
         let db_path = dir.path().join("test.db");
@@ -2391,76 +2447,344 @@ mod tests {
 
     /// SS6 invariants #4 ("an ingest error never advances the cursor") and #5
     /// ("one transaction per file pass") both rest on the same underlying
-    /// contract that `write_events_and_cursor` depends on: a `begin_tx()`
-    /// transaction that hits an error before `commit()` is called must leave
-    /// no visible trace of ANY write it made in that pass — including the
-    /// cursor upsert, which runs last, right before `commit()`.
+    /// contract `write_events_and_cursor` depends on: an `atomic_unit` whose
+    /// closure returns `Err` before its final statement must leave no
+    /// visible trace of ANY write it made in that pass — including the
+    /// cursor upsert, which runs last, right before the closure returns
+    /// `Ok`.
     ///
     /// The real ingest loop can't be driven into a mid-loop DB error through
     /// crafted event data: the `sessions` insert uses `ON CONFLICT(id) DO
     /// NOTHING` and the `session_messages` insert uses `INSERT OR IGNORE`,
     /// both of which swallow constraint violations by design (that's what
-    /// makes re-ingest idempotent). So this test exercises the same
-    /// `begin_tx`/`execute`/drop-without-commit path directly — the exact
-    /// machinery `mirror_chatgpt_export_file`'s `?`-propagated errors rely
-    /// on — and forces a genuine, non-suppressed SQL error (a `prepare()`
-    /// failure on a nonexistent table) after a session write AND a cursor
-    /// advance have already succeeded within the same open transaction.
+    /// makes re-ingest idempotent). So this test drives the same
+    /// `atomic_unit`/`writer.execute`/`Err`-return path directly — the exact
+    /// machinery `write_events_and_cursor`'s `?`-propagated errors rely on
+    /// (ADR-099 D5) — and forces a genuine, non-suppressed SQL error (a
+    /// `prepare()` failure on a nonexistent table) after a session write AND
+    /// a cursor advance have already succeeded within the same open unit.
     #[tokio::test]
     async fn test_mid_transaction_db_error_leaves_no_partial_state_and_cursor_unadvanced() {
         let (rt, _dir) = setup().await;
         let sql = rt.sql();
         let path = std::path::Path::new("/synthetic/mid-tx-probe.json");
+        let path_owned = path.to_path_buf();
 
-        let mut tx = sql
-            .begin_tx(SqlTxOptions::default())
-            .await
-            .expect("begin_tx");
+        let op: khive_storage::AtomicUnitOp = Box::new(move |writer: &mut dyn SqlWriter| {
+            Box::pin(async move {
+                // First write succeeds — mirrors event 1's session row in a
+                // multi-event file pass.
+                writer
+                    .execute(SqlStatement {
+                        sql: "INSERT INTO sessions \
+                              (id, provider_session_id, source, message_count, first_seen_at, last_seen_at, namespace) \
+                              VALUES('mid-tx-session', 'mid-tx-session', 'chatgpt_export', 0, 1, 1, 'local')"
+                            .into(),
+                        params: vec![],
+                        label: None,
+                    })
+                    .await?;
 
-        // First write succeeds — mirrors event 1's session row in a
-        // multi-event file pass.
-        tx.execute(SqlStatement {
-            sql: "INSERT INTO sessions \
-                  (id, provider_session_id, source, message_count, first_seen_at, last_seen_at, namespace) \
-                  VALUES('mid-tx-session', 'mid-tx-session', 'chatgpt_export', 0, 1, 1, 'local')"
-                .into(),
-            params: vec![],
-            label: None,
-        })
-        .await
-        .expect("first write in transaction must succeed");
+                // Cursor advance succeeds too — mirrors `upsert_cursor_on_writer`
+                // running near the end of `write_events_and_cursor_on_writer`.
+                upsert_cursor_on_writer(writer, &path_owned, Some("mid-tx-session"), 999, 1)
+                    .await?;
 
-        // Cursor advance succeeds too — mirrors `upsert_cursor_in_tx` running
-        // near the end of `write_events_and_cursor`, before `commit()`.
-        upsert_cursor_in_tx(&mut *tx, path, Some("mid-tx-session"), 999, 1)
-            .await
-            .expect("cursor upsert in transaction must succeed");
+                // Third write fails with a genuine (non-suppressed) SQL error —
+                // mirrors a mid-loop DB failure on a later event in the same file.
+                writer
+                    .execute(SqlStatement {
+                        sql: "INSERT INTO no_such_table_mid_tx_probe(a) VALUES(1)".into(),
+                        params: vec![],
+                        label: None,
+                    })
+                    .await?;
 
-        // Third write fails with a genuine (non-suppressed) SQL error —
-        // mirrors a mid-loop DB failure on a later event in the same file.
-        let err = tx
-            .execute(SqlStatement {
-                sql: "INSERT INTO no_such_table_mid_tx_probe(a) VALUES(1)".into(),
-                params: vec![],
-                label: None,
+                Ok(Box::new(()) as Box<dyn std::any::Any + Send>)
             })
-            .await;
-        assert!(err.is_err(), "forced third write must fail");
+        });
 
-        // No `commit()` is ever called — `tx` is dropped here, exactly as
-        // `write_events_and_cursor` drops its `tx` when an earlier `?`
-        // returns `Err` before reaching its own `tx.commit()` call.
-        drop(tx);
+        // `atomic_unit` itself must surface the error and roll back the
+        // whole unit — no explicit `commit()`/`drop()` orchestration is the
+        // caller's job anymore; the seam owns it.
+        let result = sql.atomic_unit(op).await;
+        assert!(
+            result.is_err(),
+            "atomic_unit must propagate the forced third-write failure"
+        );
 
         assert_eq!(
             count_rows(&rt, "sessions").await,
             0,
-            "session write must not survive a later error in the same transaction"
+            "session write must not survive a later error in the same atomic unit"
         );
         assert_eq!(
             cursor_offset(&rt, &path.to_string_lossy()).await,
             None,
-            "cursor must not advance when a later write in the same transaction fails"
+            "cursor must not advance when a later write in the same atomic unit fails"
+        );
+    }
+
+    /// Build a bare, file-backed, write-queue-enabled `SqlAccess` handle —
+    /// no `KhiveRuntime`, no `KHIVE_WRITE_QUEUE` env var. Mirrors
+    /// khive-pack-brain's `fold_gate.rs`/`persist.rs` write-queue-routing
+    /// tests: `PoolConfig::default()` reads `KHIVE_WRITE_QUEUE` at
+    /// construction time, and that env var is process-global, so mutating
+    /// it here would race every other test in this binary that calls
+    /// `KhiveRuntime::new()` (that binary-wide hazard is exactly what those
+    /// two tests' doc comments document having hit). A `PoolConfig` literal
+    /// with `write_queue_enabled: true` sidesteps it entirely — no
+    /// `#[serial]`, no risk to any other test in this crate.
+    fn write_queue_pool(db_path: std::path::PathBuf) -> Arc<khive_db::ConnectionPool> {
+        let pool_cfg = khive_db::PoolConfig {
+            path: Some(db_path),
+            write_queue_enabled: true,
+            ..khive_db::PoolConfig::default()
+        };
+        let pool = Arc::new(khive_db::ConnectionPool::new(pool_cfg).expect("pool"));
+        {
+            let w_conn = pool.writer().expect("writer");
+            for stmt in &SESSION_SCHEMA_PLAN_STMTS {
+                w_conn
+                    .conn()
+                    .execute_batch(stmt)
+                    .expect("session schema stmt");
+            }
+        }
+        pool
+    }
+
+    /// ADR-099 D5 acceptance: the converted `write_events_and_cursor`
+    /// closure is suspension-free — it drives only synchronous DML through
+    /// `writer`, so it resolves on its first poll and is `block_on_sync`-safe
+    /// on the single-writer path. Exercises the real production closure
+    /// (`write_events_and_cursor_on_writer` via `atomic_unit`) over a
+    /// write-queue-enabled pool built directly (see `write_queue_pool`), so
+    /// this proves the actual shipped code — not a stand-in — never
+    /// suspends: if it ever did, `block_on_sync` would return the "future
+    /// suspended" error and this call would fail instead of returning `Ok`.
+    #[tokio::test]
+    async fn write_events_and_cursor_is_suspension_free_under_single_writer() {
+        let dir = TempDir::new().expect("tempdir");
+        let pool = write_queue_pool(dir.path().join("suspend_free.db"));
+        let sql: Arc<dyn khive_storage::SqlAccess> =
+            Arc::new(khive_db::SqlBridge::new(Arc::clone(&pool), true));
+
+        pool.writer_task_handle()
+            .unwrap()
+            .expect("writer task must be spawned with the flag on for a file-backed pool");
+
+        let events = vec![parse::parse_cc_line(
+            r#"{"uuid":"evt-1","sessionId":"suspend-free-session","type":"user","message":{"role":"user","content":"hello"},"cwd":"/tmp","timestamp":"2026-01-01T00:00:00Z"}"#,
+        )
+        .expect("line must parse")];
+
+        let path = std::path::Path::new("/synthetic/suspend-free.jsonl").to_path_buf();
+        let now_us = Utc::now().timestamp_micros();
+        let op: khive_storage::AtomicUnitOp = Box::new(move |writer: &mut dyn SqlWriter| {
+            Box::pin(async move {
+                write_events_and_cursor_on_writer(
+                    writer,
+                    &path,
+                    "claude_code",
+                    &events,
+                    1,
+                    100,
+                    now_us,
+                )
+                .await
+                .map(|stats| Box::new(stats) as Box<dyn std::any::Any + Send>)
+                .map_err(|e| {
+                    khive_storage::StorageError::driver(
+                        khive_storage::StorageCapability::Sql,
+                        "test_write_events_and_cursor",
+                        e,
+                    )
+                })
+            })
+        });
+
+        let boxed = sql
+            .atomic_unit(op)
+            .await
+            .expect("a suspension-free closure must not hit block_on_sync's Pending error");
+        let stats = *boxed
+            .downcast::<MirrorStats>()
+            .expect("op must return MirrorStats");
+
+        assert_eq!(stats.inserted, 1, "the one event must be inserted");
+
+        let mut reader = sql.reader().await.expect("reader");
+        let row = khive_storage::SqlReader::query_scalar(
+            reader.as_mut(),
+            SqlStatement {
+                sql: "SELECT COUNT(*) FROM sessions".into(),
+                params: vec![],
+                label: None,
+            },
+        )
+        .await
+        .expect("count query")
+        .expect("count row");
+        match row {
+            SqlValue::Integer(1) => {}
+            other => panic!("the session row must be committed, got COUNT(*) = {other:?}"),
+        }
+    }
+
+    /// ADR-099 D5 acceptance ("single-writer concurrency test, mandatory"):
+    /// with the write queue enabled, concurrent session-mirror ingest
+    /// (`write_events_and_cursor_on_writer` via `atomic_unit`) and normal
+    /// write traffic through `SqlBridge::writer()` must not contend at
+    /// `BEGIN IMMEDIATE` — the converted ingest path routes through the
+    /// single writer task rather than opening its own standalone
+    /// transaction (the `begin_tx` hole this ADR closes). Uses the same
+    /// queue-depth + occupier-parked-on-oneshot technique as
+    /// khive-pack-brain's `fold_gate_apply_routes_through_writer_task_when_flag_enabled`
+    /// (a wall-clock/timing probe would be indistinguishable from the
+    /// flag-off fallback, which also serializes via real SQLite file
+    /// locking): while an occupier deterministically holds the writer
+    /// task's one drain slot open, the ingest call must appear in the
+    /// channel's queue depth rather than opening a second, competing
+    /// standalone `BEGIN IMMEDIATE`.
+    #[tokio::test]
+    async fn session_ingest_routes_through_writer_task_when_flag_enabled() {
+        let dir = TempDir::new().expect("tempdir");
+        let pool = write_queue_pool(dir.path().join("concurrency.db"));
+        let sql: Arc<dyn khive_storage::SqlAccess> =
+            Arc::new(khive_db::SqlBridge::new(Arc::clone(&pool), true));
+
+        let writer_task = pool
+            .writer_task_handle()
+            .unwrap()
+            .expect("writer task must be spawned with the flag on for a file-backed pool");
+
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel::<()>();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let occupier = {
+            let writer_task = writer_task.clone();
+            tokio::spawn(async move {
+                writer_task
+                    .send(move |_conn| {
+                        let _ = started_tx.send(());
+                        let _ = release_rx.blocking_recv();
+                        Ok::<(), khive_storage::StorageError>(())
+                    })
+                    .await
+            })
+        };
+
+        started_rx
+            .await
+            .expect("occupier must signal it has started running inside the writer task");
+        assert_eq!(
+            writer_task.queue_depth(),
+            0,
+            "channel must start empty once the occupier has been dequeued and is running"
+        );
+
+        let events = vec![parse::parse_cc_line(
+            r#"{"uuid":"evt-concurrency-1","sessionId":"concurrency-session","type":"user","message":{"role":"user","content":"hello"},"cwd":"/tmp","timestamp":"2026-01-01T00:00:00Z"}"#,
+        )
+        .expect("line must parse")];
+        let path = std::path::Path::new("/synthetic/concurrency.jsonl").to_path_buf();
+        let now_us = Utc::now().timestamp_micros();
+        let op: khive_storage::AtomicUnitOp = Box::new(move |writer: &mut dyn SqlWriter| {
+            Box::pin(async move {
+                write_events_and_cursor_on_writer(
+                    writer,
+                    &path,
+                    "claude_code",
+                    &events,
+                    1,
+                    100,
+                    now_us,
+                )
+                .await
+                .map(|stats| Box::new(stats) as Box<dyn std::any::Any + Send>)
+                .map_err(|e| {
+                    khive_storage::StorageError::driver(
+                        khive_storage::StorageCapability::Sql,
+                        "test_session_ingest_concurrency",
+                        e,
+                    )
+                })
+            })
+        });
+
+        let sql_for_ingest = Arc::clone(&sql);
+        let ingest_task = tokio::spawn(async move { sql_for_ingest.atomic_unit(op).await });
+
+        let mut saw_enqueued = false;
+        for _ in 0..100 {
+            if writer_task.queue_depth() >= 1 {
+                saw_enqueued = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert!(
+            saw_enqueued,
+            "session-ingest's atomic_unit request never appeared in the writer task's \
+             channel while the occupier held the single drain slot — the converted ingest \
+             path is not routing through the shared writer task (a standalone `begin_tx` \
+             connection would never show up here at all)"
+        );
+
+        release_tx
+            .send(())
+            .expect("occupier must still be waiting on the release signal");
+        occupier
+            .await
+            .expect("occupier task must not panic")
+            .expect("occupier write must succeed");
+
+        let boxed = ingest_task
+            .await
+            .expect("ingest task must not panic")
+            .expect("ingest atomic_unit must succeed once the occupier releases the slot");
+        let stats = *boxed
+            .downcast::<MirrorStats>()
+            .expect("op must return MirrorStats");
+        assert_eq!(stats.inserted, 1, "the ingest event must be committed");
+    }
+
+    /// ADR-099 acceptance ("revert-companion test"): the OLD shape — a
+    /// closure that issues its own `BEGIN IMMEDIATE` through the writer it
+    /// was handed, instead of relying on `atomic_unit`'s own transaction —
+    /// must fail deterministically with a nested-transaction error. This
+    /// proves the suspension-free / single-transaction-owner assertions
+    /// above are non-vacuous: the pre-conversion shape (a caller managing
+    /// its own `BEGIN`/`COMMIT` inside the seam) does NOT silently pass.
+    #[tokio::test]
+    async fn old_shape_manual_begin_immediate_inside_atomic_unit_fails() {
+        let (rt, _dir) = setup().await;
+        let sql = rt.sql();
+
+        let op: khive_storage::AtomicUnitOp = Box::new(move |writer: &mut dyn SqlWriter| {
+            Box::pin(async move {
+                // `atomic_unit` already has an open transaction (or, on the
+                // flag-off path, is about to issue one) around this
+                // closure — issuing a second `BEGIN IMMEDIATE` here is
+                // exactly the old `begin_tx`-shaped mistake this ADR
+                // retires: a caller managing its own transaction control
+                // inside a seam that already owns the transaction boundary.
+                writer
+                    .execute(SqlStatement {
+                        sql: "BEGIN IMMEDIATE".into(),
+                        params: vec![],
+                        label: None,
+                    })
+                    .await?;
+                Ok(Box::new(()) as Box<dyn std::any::Any + Send>)
+            })
+        });
+
+        let result = sql.atomic_unit(op).await;
+        assert!(
+            result.is_err(),
+            "a closure that issues its own BEGIN IMMEDIATE inside atomic_unit \
+             must fail with a nested-transaction error, not silently succeed"
         );
     }
 }

@@ -627,12 +627,17 @@ async fn multiple_stores_over_one_pool_share_a_single_writer_task() {
 /// with every MIGRATE-listed write path routed through the writer task, drive
 /// CONCURRENT writes across entity, note, and graph stores (entries 2/3/6 —
 /// er, 1/2/3) plus `SqlBridge`'s unmigrated `writer()` (entry 8, still routes
-/// its self-contained `execute_batch` through the task per entry 10) and
-/// `begin_tx()` (entry 9, a genuine design fork — stays on its own standalone
-/// connection) over ONE pool. Asserts exactly one writer task is ever spawned
-/// and every write actually lands, proving the migrated paths and the two
-/// design-fork paths coexist over a single DB file without contending at
-/// `BEGIN IMMEDIATE` or racing the writer task's own spawn-once guarantee.
+/// its self-contained `execute_batch` through the task per entry 10) over ONE
+/// pool. Asserts exactly one writer task is ever spawned and every write
+/// actually lands, proving the migrated paths coexist over a single DB file
+/// without contending at `BEGIN IMMEDIATE` or racing the writer task's own
+/// spawn-once guarantee.
+///
+/// Entry 9 (`SqlBridge::begin_tx`, formerly a genuine design fork on its own
+/// standalone connection) is retired as of ADR-099 D5 — `begin_tx` and
+/// `SqlTransaction` no longer exist on `SqlAccess` (their one production
+/// caller, session-mirror ingest, converted to `atomic_unit`), so this test
+/// no longer exercises it.
 ///
 /// Constructed via a `PoolConfig` literal (`write_queue_enabled: true`), not
 /// the `KHIVE_WRITE_QUEUE` env var — see the sibling
@@ -643,7 +648,7 @@ async fn concurrent_writes_across_all_migrated_stores_share_one_writer_task() {
     use crate::stores::graph::SqlGraphStore;
     use crate::stores::note::SqlNoteStore;
     use khive_storage::note::Note;
-    use khive_storage::types::{Edge, SqlStatement, SqlTxOptions, SqlValue};
+    use khive_storage::types::{Edge, SqlStatement, SqlValue};
     use khive_storage::{GraphStore as _, NoteStore as _, SqlAccess as _};
     use khive_types::EdgeRelation;
 
@@ -726,29 +731,6 @@ async fn concurrent_writes_across_all_migrated_stores_share_one_writer_task() {
         label: Some("test_execute_batch".to_string()),
     };
 
-    // Entry 9 (SqlBridge::begin_tx, design fork, unmigrated): its own
-    // standalone connection, running concurrently with the writer task.
-    let tx_row_id = Uuid::new_v4();
-    let tx_src = Uuid::new_v4();
-    let tx_tgt = Uuid::new_v4();
-    let tx_insert_stmt = SqlStatement {
-        sql: "INSERT INTO graph_edges (namespace, id, source_id, target_id, relation, \
-              weight, created_at, updated_at, deleted_at, metadata, target_backend) \
-              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL, NULL, NULL)"
-            .to_string(),
-        params: vec![
-            SqlValue::Text("default".to_string()),
-            SqlValue::Text(tx_row_id.to_string()),
-            SqlValue::Text(tx_src.to_string()),
-            SqlValue::Text(tx_tgt.to_string()),
-            SqlValue::Text("extends".to_string()),
-            SqlValue::Float(0.7),
-            SqlValue::Integer(now_micros),
-            SqlValue::Integer(now_micros),
-        ],
-        label: Some("test_begin_tx".to_string()),
-    };
-
     let entity_fut = {
         let entity_store = Arc::clone(&entity_store);
         async move { entity_store.upsert_entity(entity).await }
@@ -765,20 +747,14 @@ async fn concurrent_writes_across_all_migrated_stores_share_one_writer_task() {
         let mut writer = bridge.writer().await.unwrap();
         writer.execute_batch(vec![insert_stmt]).await
     };
-    let tx_fut = async {
-        let mut tx = bridge.begin_tx(SqlTxOptions::default()).await.unwrap();
-        tx.execute(tx_insert_stmt).await?;
-        tx.commit().await
-    };
 
-    let (entity_res, note_res, edge_res, batch_res, tx_res) =
-        tokio::join!(entity_fut, note_fut, edge_fut, batch_fut, tx_fut);
+    let (entity_res, note_res, edge_res, batch_res) =
+        tokio::join!(entity_fut, note_fut, edge_fut, batch_fut);
 
     entity_res.unwrap();
     note_res.unwrap();
     edge_res.unwrap();
     batch_res.unwrap();
-    tx_res.unwrap();
 
     assert!(entity_store.get_entity(entity_id).await.unwrap().is_some());
     assert!(note_store.get_note(note_id).await.unwrap().is_some());
@@ -787,8 +763,8 @@ async fn concurrent_writes_across_all_migrated_stores_share_one_writer_task() {
     assert_eq!(
         pool.writer_task_spawn_count(),
         1,
-        "concurrent writes across every migrated path plus both design-fork \
-         paths must not trigger a second writer task spawn"
+        "concurrent writes across every migrated path must not trigger a \
+         second writer task spawn"
     );
 }
 

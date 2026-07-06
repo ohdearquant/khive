@@ -6,7 +6,7 @@ use std::pin::Pin;
 
 use async_trait::async_trait;
 
-use crate::types::{SqlRow, SqlStatement, SqlTxOptions, SqlValue, StorageResult};
+use crate::types::{SqlRow, SqlStatement, SqlValue, StorageResult};
 
 /// A boxed future, borrowing from the `&mut dyn SqlWriter` an
 /// [`AtomicUnitOp`] is called with (see [`SqlAccess::atomic_unit`]).
@@ -69,15 +69,6 @@ pub trait SqlWriter: SqlReader + Send + 'static {
     }
 }
 
-/// A SQL transaction (extends `SqlWriter`).
-#[async_trait]
-pub trait SqlTransaction: SqlWriter + Send + 'static {
-    /// Commit the transaction, persisting all changes.
-    async fn commit(self: Box<Self>) -> StorageResult<()>;
-    /// Roll back the transaction, discarding all changes.
-    async fn rollback(self: Box<Self>) -> StorageResult<()>;
-}
-
 /// Base SQL access capability.
 #[async_trait]
 pub trait SqlAccess: Send + Sync + 'static {
@@ -85,8 +76,6 @@ pub trait SqlAccess: Send + Sync + 'static {
     async fn reader(&self) -> StorageResult<Box<dyn SqlReader>>;
     /// Acquire a read-write connection from the pool.
     async fn writer(&self) -> StorageResult<Box<dyn SqlWriter>>;
-    /// Begin a transaction with the given isolation options.
-    async fn begin_tx(&self, options: SqlTxOptions) -> StorageResult<Box<dyn SqlTransaction>>;
 
     /// Run `op` as ONE atomic unit of work (ADR-067 Component A, Fork C
     /// slice 2).
@@ -100,5 +89,22 @@ pub trait SqlAccess: Send + Sync + 'static {
     /// `BEGIN IMMEDIATE`/`COMMIT`/`ROLLBACK` on a writer handle exactly like
     /// calling [`Self::writer`] and driving the statements by hand — the
     /// pre-ADR-067 behavior, preserved byte-for-byte on this path.
+    ///
+    /// **The atomic-unit suspend-free invariant (normative for every
+    /// caller):** `op`'s future must complete on its **first poll** — it may
+    /// issue only synchronous DML against the `&mut dyn SqlWriter` it is
+    /// handed and must never reach a real suspension point (no embedding
+    /// computation, no ANN warming, no service or channel `await`, no
+    /// network round-trip). On the single-writer path this is enforced at
+    /// runtime: the writer task drives `op` through a single-poll driver and
+    /// returns a typed error the instant the future is `Pending`, so a
+    /// violation fails loudly rather than corrupting state. On the flag-off
+    /// path (no writer task active) a suspending `op` would currently
+    /// *succeed* — that path drives `op` as an ordinary `.await` under a
+    /// manual transaction — so the invariant is a correctness contract this
+    /// trait asks every caller to uphold, not something the type system or
+    /// every code path enforces. Callers must not rely on the flag-off
+    /// path's tolerance; behavior must be identical (synchronous DML only)
+    /// regardless of whether the single-writer flag is on.
     async fn atomic_unit(&self, op: AtomicUnitOp) -> StorageResult<Box<dyn Any + Send>>;
 }
