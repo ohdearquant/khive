@@ -328,12 +328,11 @@ pub struct BrainMutationEvent {
 /// commits does the proposed state replace the live state and the tracker
 /// get marked clean.
 ///
-/// This deliberately does NOT use `SqlAccess::begin_tx` — per `fold_gate.rs`'s
-/// module doc, that API requires a file-backed database and errors for
-/// in-memory pools (used throughout this crate's test suite and by
-/// `KhiveRuntime::memory()`). It also, as of this round, does NOT issue a
-/// manual `BEGIN IMMEDIATE`/`COMMIT`/`ROLLBACK` sequence on a plain
-/// `SqlWriter` handle: under `KHIVE_WRITE_QUEUE=1` that sequence would nest
+/// This deliberately does NOT issue a manual
+/// `BEGIN IMMEDIATE`/`COMMIT`/`ROLLBACK` sequence on a plain
+/// `SqlWriter` handle (the trait's former `begin_tx`/`SqlTransaction`
+/// surface, retired entirely, is likewise not an option): under
+/// `KHIVE_WRITE_QUEUE=1` that sequence would nest
 /// inside the WriterTask's own per-request `BEGIN IMMEDIATE`, which SQLite
 /// rejects ("cannot start a transaction within a transaction" — the same
 /// class of bug `fold_gate.rs`'s `atomic_unit` conversion fixed). Handing the
