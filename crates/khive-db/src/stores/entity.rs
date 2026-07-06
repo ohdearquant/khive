@@ -36,21 +36,27 @@ pub struct SqlEntityStore {
 impl SqlEntityStore {
     /// Create a new store.
     ///
-    /// When `KHIVE_WRITE_QUEUE=1` (`PoolConfig::write_queue_enabled`),
-    /// `upsert_entities` — ADR-067 slice 1's single migrated write path —
-    /// routes through the pool-wide `WriterTask` (`ConnectionPool::writer_task_handle`)
-    /// instead of the legacy pool-mutex path (`with_writer`, unchanged and
-    /// still used by every other method on this store). The handle is a
-    /// clone of the ONE writer task owned by `pool` — constructing multiple
-    /// stores (or multiple namespaces) over the same pool never spawns more
-    /// than one writer task; see `ConnectionPool::writer_task_handle`'s doc
-    /// comment for why that matters. `None` (falling back to the legacy
-    /// path) if the flag is off, or if the writer task failed to spawn (for
+    /// When `KHIVE_WRITE_QUEUE=1` (`PoolConfig::write_queue_enabled`), every
+    /// write path on this store — the batch `upsert_entities` (its own
+    /// explicit flag check) AND every single-row write routed through the
+    /// shared `with_writer` helper (`upsert_entity`, `delete_entity`) —
+    /// routes through the pool-wide `WriterTask`
+    /// (`ConnectionPool::writer_task_handle`) instead of the legacy
+    /// pool-mutex path. The handle is a clone of the ONE writer task owned
+    /// by `pool` — constructing multiple stores (or multiple namespaces)
+    /// over the same pool never spawns more than one writer task; see
+    /// `ConnectionPool::writer_task_handle`'s doc comment for why that
+    /// matters. `None` (falling back to the legacy path for every write)
+    /// if the flag is off, or if the writer task failed to spawn (for
     /// example, an in-memory pool, which has no standalone-connection
-    /// support) — the flag is a best-effort opt-in for slice 1, not a hard
-    /// requirement.
+    /// support) — the flag is a best-effort opt-in, not a hard requirement.
     pub fn new(pool: Arc<ConnectionPool>, is_file_backed: bool) -> Self {
-        let writer_task = pool.writer_task_handle();
+        // Best-effort opt-in (slice 1 policy, unchanged): a missing writer
+        // task — whether the flag is off, spawn degraded (e.g. in-memory
+        // pool), or no Tokio runtime was available at this first access
+        // (ADR-067 Component A runtime-handle guard) — degrades to the
+        // legacy pool-mutex path rather than failing construction.
+        let writer_task = pool.writer_task_handle().ok().flatten();
 
         Self {
             pool,
@@ -84,11 +90,33 @@ impl SqlEntityStore {
         Ok(conn)
     }
 
+    /// Route a single-row write through the pool-wide `WriterTask` when
+    /// `KHIVE_WRITE_QUEUE=1` and a handle is available; otherwise fall back
+    /// to the legacy pool-mutex path.
+    ///
+    /// ADR-067 Component A (Fork C slice 2): this is the ONE routing point
+    /// for every `with_writer` caller in this store — `upsert_entity`,
+    /// `delete_entity` (soft/hard) all reach the WriterTask through this
+    /// helper rather than each duplicating the flag check. `f` must be
+    /// DML-only (a single statement, no bare `BEGIN IMMEDIATE`): on the
+    /// flag-on path it runs inside the WriterTask's own transaction, and a
+    /// nested `BEGIN IMMEDIATE` would violate SQLite's nested-transaction
+    /// rule. `upsert_entities` (the batch method) does its OWN flag check
+    /// and returns early on `Some`, so its fallback call into this helper
+    /// only ever executes on the flag-off path (`self.writer_task` is
+    /// `None` by construction whenever that call is reached) — no
+    /// double-routing.
     async fn with_writer<F, R>(&self, op: &'static str, f: F) -> Result<R, StorageError>
     where
         F: FnOnce(&rusqlite::Connection) -> Result<R, rusqlite::Error> + Send + 'static,
         R: Send + 'static,
     {
+        if let Some(writer_task) = &self.writer_task {
+            return writer_task
+                .send(move |conn| f(conn).map_err(|e| map_err(e, op)))
+                .await;
+        }
+
         let pool = Arc::clone(&self.pool);
         tokio::task::spawn_blocking(move || {
             let guard = pool.try_writer().map_err(|e| map_sqlite_err(e, op))?;

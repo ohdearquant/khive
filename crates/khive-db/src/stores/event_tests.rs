@@ -577,3 +577,42 @@ async fn page_offset_over_i64max_rejected() {
         "expected InvalidInput, got {result:?}"
     );
 }
+
+/// ADR-067 Component A entry 5: with `KHIVE_WRITE_QUEUE=1`, `append_events`
+/// routes through the WriterTask channel instead of the pool-mutex path, and
+/// both events are actually committed and independently readable back.
+#[tokio::test]
+async fn append_events_routes_through_writer_task_when_flag_enabled() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("write_queue_events.db");
+    let pool_cfg = PoolConfig {
+        path: Some(path.clone()),
+        write_queue_enabled: true,
+        ..PoolConfig::default()
+    };
+    let pool = Arc::new(ConnectionPool::new(pool_cfg).unwrap());
+    {
+        let writer = pool.writer().unwrap();
+        writer.conn().execute_batch(EVENTS_DDL).unwrap();
+    }
+
+    let store = SqlEventStore::new_scoped(Arc::clone(&pool), true, "default");
+
+    let e1 = make_event("default");
+    let e2 = make_event("default");
+    let id1 = e1.id;
+    let id2 = e2.id;
+
+    let summary = store.append_events(vec![e1, e2]).await.unwrap();
+    assert_eq!(summary.attempted, 2);
+    assert_eq!(summary.affected, 2);
+    assert_eq!(summary.failed, 0);
+
+    assert!(store.get_event(id1).await.unwrap().is_some());
+    assert!(store.get_event(id2).await.unwrap().is_some());
+    assert_eq!(
+        pool.writer_task_spawn_count(),
+        1,
+        "the flag-ON path must actually spawn and use the writer task"
+    );
+}

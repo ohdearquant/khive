@@ -13,6 +13,7 @@ use khive_storage::StorageCapability;
 
 use crate::error::SqliteError;
 use crate::pool::ConnectionPool;
+use crate::writer_task::WriterTaskHandle;
 
 fn map_err(e: rusqlite::Error, op: &'static str) -> StorageError {
     StorageError::driver(StorageCapability::Notes, op, e)
@@ -29,14 +30,22 @@ fn map_sqlite_err(e: SqliteError, op: &'static str) -> StorageError {
 pub struct SqlNoteStore {
     pool: Arc<ConnectionPool>,
     is_file_backed: bool,
+    writer_task: Option<WriterTaskHandle>,
 }
 
 impl SqlNoteStore {
     /// Create a new store.
     pub fn new(pool: Arc<ConnectionPool>, is_file_backed: bool) -> Self {
+        // Best-effort opt-in (ADR-067 Component A, mirrors entity.rs slice 1
+        // policy): a missing writer task — flag off, spawn degraded, or no
+        // Tokio runtime available at this first access — degrades to the
+        // legacy pool-mutex path rather than failing construction.
+        let writer_task = pool.writer_task_handle().ok().flatten();
+
         Self {
             pool,
             is_file_backed,
+            writer_task,
         }
     }
 
@@ -65,12 +74,30 @@ impl SqlNoteStore {
         Ok(conn)
     }
 
-    /// Write via pool writer (serializes writes through the mutex).
+    /// Route a single-row write through the pool-wide `WriterTask` when
+    /// `KHIVE_WRITE_QUEUE=1` and a handle is available; otherwise fall back
+    /// to the legacy pool-mutex path (ADR-067 Component A, Fork C slice 2).
+    ///
+    /// This is the ONE routing point for every `with_writer` caller in this
+    /// store (`upsert_note`, `try_insert_note`, `delete_note`). `f` must be
+    /// DML-only — on the flag-on path it runs inside the WriterTask's own
+    /// transaction, so a bare `BEGIN IMMEDIATE` would violate SQLite's
+    /// nested-transaction rule. `upsert_notes` (the batch method) does its
+    /// own flag check and returns early on `Some`, so its fallback call
+    /// into this helper only ever executes on the flag-off path
+    /// (`self.writer_task` is `None` by construction whenever that call is
+    /// reached) — no double-routing.
     async fn with_writer<F, R>(&self, op: &'static str, f: F) -> Result<R, StorageError>
     where
         F: FnOnce(&rusqlite::Connection) -> Result<R, rusqlite::Error> + Send + 'static,
         R: Send + 'static,
     {
+        if let Some(writer_task) = &self.writer_task {
+            return writer_task
+                .send(move |conn| f(conn).map_err(|e| map_err(e, op)))
+                .await;
+        }
+
         let pool = Arc::clone(&self.pool);
         tokio::task::spawn_blocking(move || {
             let guard = pool.try_writer().map_err(|e| map_sqlite_err(e, op))?;
@@ -155,6 +182,70 @@ fn read_note(row: &rusqlite::Row<'_>) -> Result<Note, rusqlite::Error> {
 fn parse_uuid(s: &str) -> Result<Uuid, rusqlite::Error> {
     Uuid::parse_str(s).map_err(|e| {
         rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
+    })
+}
+
+/// DML-only batch upsert loop shared by both the legacy (flag-off) and
+/// WriterTask-routed (flag-on) `upsert_notes` paths (ADR-067 Component A).
+///
+/// Issues no `BEGIN` / `COMMIT` / `ROLLBACK` itself — the caller owns the
+/// enclosing transaction. Per-row failures are captured into
+/// `BatchWriteSummary::failed`/`first_error` rather than aborting the loop,
+/// matching the existing partial-success contract.
+fn batch_upsert_notes(
+    conn: &rusqlite::Connection,
+    notes: &[Note],
+    attempted: u64,
+) -> Result<BatchWriteSummary, rusqlite::Error> {
+    let mut affected = 0u64;
+    let mut failed = 0u64;
+    let mut first_error = String::new();
+
+    for note in notes {
+        let id_str = note.id.to_string();
+        let kind_str = note.kind.to_string();
+        let status_str = note.status.clone();
+        let properties_str = note
+            .properties
+            .as_ref()
+            .map(|v| serde_json::to_string(v).unwrap_or_default());
+
+        match conn.execute(
+            "INSERT OR REPLACE INTO notes \
+             (id, namespace, kind, status, name, content, salience, decay_factor, expires_at, \
+              properties, created_at, updated_at, deleted_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+            rusqlite::params![
+                id_str,
+                &note.namespace,
+                kind_str,
+                status_str,
+                &note.name,
+                note.content,
+                note.salience,
+                note.decay_factor,
+                note.expires_at,
+                properties_str,
+                note.created_at,
+                note.updated_at,
+                note.deleted_at,
+            ],
+        ) {
+            Ok(_) => affected += 1,
+            Err(e) => {
+                if first_error.is_empty() {
+                    first_error = e.to_string();
+                }
+                failed += 1;
+            }
+        }
+    }
+
+    Ok(BatchWriteSummary {
+        attempted,
+        affected,
+        failed,
+        first_error,
     })
 }
 
@@ -429,64 +520,35 @@ impl NoteStore for SqlNoteStore {
     async fn upsert_notes(&self, notes: Vec<Note>) -> Result<BatchWriteSummary, StorageError> {
         let attempted = notes.len() as u64;
 
+        // ADR-067 Component A: when the write queue is enabled, route
+        // through the pool-wide WriterTask. DML-only closure — no BEGIN
+        // IMMEDIATE/COMMIT/ROLLBACK here, since the WriterTask's run loop
+        // owns the transaction (a bare BEGIN IMMEDIATE here would violate
+        // SQLite's nested-transaction rule).
+        if let Some(writer_task) = &self.writer_task {
+            return writer_task
+                .send(move |conn| {
+                    batch_upsert_notes(conn, &notes, attempted)
+                        .map_err(|e| map_err(e, "upsert_notes"))
+                })
+                .await;
+        }
+
+        // Flag-off (default) path: byte-for-byte unchanged from pre-ADR-067
+        // behavior — the closure owns its own BEGIN IMMEDIATE/COMMIT/ROLLBACK
+        // via the pool-mutex writer.
         self.with_writer("upsert_notes", move |conn| {
             conn.execute_batch("BEGIN IMMEDIATE")?;
             let _tx_handle =
                 khive_storage::tx_registry::register(Some("note_upsert_batch".to_string()));
-            let mut affected = 0u64;
-            let mut failed = 0u64;
-            let mut first_error = String::new();
 
-            for note in &notes {
-                let id_str = note.id.to_string();
-                let kind_str = note.kind.to_string();
-                let status_str = note.status.clone();
-                let properties_str = note
-                    .properties
-                    .as_ref()
-                    .map(|v| serde_json::to_string(v).unwrap_or_default());
-
-                match conn.execute(
-                    "INSERT OR REPLACE INTO notes \
-                     (id, namespace, kind, status, name, content, salience, decay_factor, expires_at, \
-                      properties, created_at, updated_at, deleted_at) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
-                    rusqlite::params![
-                        id_str,
-                        &note.namespace,
-                        kind_str,
-                        status_str,
-                        &note.name,
-                        note.content,
-                        note.salience,
-                        note.decay_factor,
-                        note.expires_at,
-                        properties_str,
-                        note.created_at,
-                        note.updated_at,
-                        note.deleted_at,
-                    ],
-                ) {
-                    Ok(_) => affected += 1,
-                    Err(e) => {
-                        if first_error.is_empty() {
-                            first_error = e.to_string();
-                        }
-                        failed += 1;
-                    }
-                }
-            }
+            let summary = batch_upsert_notes(conn, &notes, attempted)?;
 
             if let Err(e) = conn.execute_batch("COMMIT") {
                 let _ = conn.execute_batch("ROLLBACK");
                 return Err(e);
             }
-            Ok(BatchWriteSummary {
-                attempted,
-                affected,
-                failed,
-                first_error,
-            })
+            Ok(summary)
         })
         .await
     }

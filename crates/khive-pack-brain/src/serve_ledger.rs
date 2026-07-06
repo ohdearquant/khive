@@ -291,3 +291,129 @@ pub async fn resolve(
         accounting_profile_id: row.accounting_profile_id,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Fork C slice 2: proves `record_serve`'s single-row INSERT — issued via
+    /// `sql.writer().execute(..)` — is actually enqueued on the pool's shared
+    /// `WriterTaskHandle` channel when the write queue is enabled. This is
+    /// the BLOCKER 2 Part A fix (`SqliteWriter::execute` routes through the
+    /// writer task like `execute_batch` already did): `record_serve` itself
+    /// needed zero code changes, but this test proves the fix actually
+    /// reaches this call site rather than asserting it by inspection alone.
+    ///
+    /// Deliberately NOT a wall-clock/occupier-timing test — see the sibling
+    /// `fold_gate::tests::fold_gate_apply_routes_through_writer_task_when_flag_enabled`
+    /// doc comment for why real SQLite file-level locking makes elapsed time
+    /// alone vacuous here. Instead this reads `WriterTaskHandle::queue_depth`
+    /// directly while an occupier deterministically holds the writer task's
+    /// one drain slot open (parked on a oneshot via `blocking_recv`, not a
+    /// sleep/timing race).
+    ///
+    /// Deliberately NOT built via a full `KhiveRuntime` + the
+    /// `KHIVE_WRITE_QUEUE` env var: that env var is process-global and this
+    /// crate's other tests are not `#[serial]` against it, so a window where
+    /// it is set here could leak into a concurrently-scheduled test's own
+    /// `KhiveRuntime::new` and unexpectedly flip its pool's write-queue flag
+    /// (see `fold_gate::tests::fold_gate_apply_routes_through_writer_task_when_flag_enabled`'s
+    /// doc comment for the concrete failure this caused before both tests
+    /// were rewritten to avoid the env var). Constructing the pool directly
+    /// with `write_queue_enabled: true` in the config literal, and driving
+    /// `record_serve` over a bare `SqlBridge` instead of a full
+    /// `KhiveRuntime`, sidesteps global mutable state entirely.
+    #[tokio::test]
+    async fn record_serve_routes_through_writer_task_when_flag_enabled() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("serve-ledger-write-queue-routing.db");
+        let pool_cfg = khive_db::PoolConfig {
+            path: Some(db_path),
+            write_queue_enabled: true,
+            ..khive_db::PoolConfig::default()
+        };
+        let pool = std::sync::Arc::new(khive_db::ConnectionPool::new(pool_cfg).expect("pool"));
+        {
+            let mut writer = pool.writer().expect("writer");
+            khive_db::run_migrations(writer.conn_mut()).expect("migrations");
+        }
+        let sql: std::sync::Arc<dyn SqlAccess> =
+            std::sync::Arc::new(khive_db::SqlBridge::new(std::sync::Arc::clone(&pool), true));
+
+        let writer_task = pool
+            .writer_task_handle()
+            .unwrap()
+            .expect("writer task must be spawned with the flag on for a file-backed pool");
+
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel::<()>();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let occupier = {
+            let writer_task = writer_task.clone();
+            tokio::spawn(async move {
+                writer_task
+                    .send(move |_conn| {
+                        let _ = started_tx.send(());
+                        let _ = release_rx.blocking_recv();
+                        Ok::<(), khive_storage::StorageError>(())
+                    })
+                    .await
+            })
+        };
+
+        started_rx
+            .await
+            .expect("occupier must signal it has started running inside the writer task");
+        assert_eq!(
+            writer_task.queue_depth(),
+            0,
+            "channel must start empty once the occupier has been dequeued and is running"
+        );
+
+        let record_task = tokio::spawn(async move {
+            record_serve(
+                sql.as_ref(),
+                "write-queue-routing-row",
+                "local",
+                "recall",
+                Some("profile-a"),
+                None,
+                None,
+                "write-queue-routing-target",
+                "write-queue-routing-class",
+                "write queue routing test query",
+                1_700_000_000_000_000,
+            )
+            .await
+        });
+
+        let mut saw_enqueued = false;
+        for _ in 0..100 {
+            if writer_task.queue_depth() >= 1 {
+                saw_enqueued = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert!(
+            saw_enqueued,
+            "record_serve's write request never appeared in the writer task's \
+             channel while the occupier held the single drain slot — \
+             SqliteWriter::execute is not routing this single-row write \
+             through the shared writer task"
+        );
+
+        release_tx
+            .send(())
+            .expect("occupier must still be waiting on the release signal");
+        occupier
+            .await
+            .expect("occupier task must not panic")
+            .expect("occupier write must succeed");
+
+        let inserted = record_task
+            .await
+            .expect("record_task must not panic")
+            .expect("record_serve must succeed once unblocked");
+        assert!(inserted, "record_serve must report a fresh row insert");
+    }
+}

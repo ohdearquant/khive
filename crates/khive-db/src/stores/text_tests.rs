@@ -1362,3 +1362,59 @@ async fn upsert_documents_first_error_populated_on_item_failure() {
          but got an empty string; the error is being silently swallowed"
     );
 }
+
+/// ADR-067 Component A entry 4: with `KHIVE_WRITE_QUEUE=1`, `upsert_documents`
+/// routes through the WriterTask channel instead of the pool-mutex path, and
+/// both documents are actually committed and independently readable back.
+///
+/// Constructed via a `PoolConfig` literal (`write_queue_enabled: true`), not
+/// the `KHIVE_WRITE_QUEUE` env var — that env var is process-global and this
+/// crate's other tests are NOT `#[serial]` against it, so a window where it
+/// is set here could leak into a concurrently-scheduled test's own pool
+/// construction (ADR-067 Fork C slice 2 round 2, LOW finding).
+#[tokio::test]
+async fn upsert_documents_routes_through_writer_task_when_flag_enabled() {
+    let table_key = "write_queue_flag_test";
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("write_queue_text.db");
+    let pool_cfg = PoolConfig {
+        path: Some(path.clone()),
+        write_queue_enabled: true,
+        ..PoolConfig::default()
+    };
+    let pool = Arc::new(ConnectionPool::new(pool_cfg).unwrap());
+    {
+        let writer = pool.writer().unwrap();
+        ensure_fts5_schema(writer.conn(), table_key).unwrap();
+    }
+
+    let store = Fts5TextSearch::new(Arc::clone(&pool), true, table_key.to_string());
+
+    let subject1 = Uuid::new_v4();
+    let subject2 = Uuid::new_v4();
+    let docs = vec![
+        make_document(subject1, "Doc A", "body a"),
+        make_document(subject2, "Doc B", "body b"),
+    ];
+
+    let summary = store.upsert_documents(docs).await.unwrap();
+    assert_eq!(summary.attempted, 2);
+    assert_eq!(summary.affected, 2);
+    assert_eq!(summary.failed, 0);
+
+    assert!(store
+        .get_document("test_ns", subject1)
+        .await
+        .unwrap()
+        .is_some());
+    assert!(store
+        .get_document("test_ns", subject2)
+        .await
+        .unwrap()
+        .is_some());
+    assert_eq!(
+        pool.writer_task_spawn_count(),
+        1,
+        "the flag-ON path must actually spawn and use the writer task"
+    );
+}

@@ -162,47 +162,48 @@ pub async fn apply_fold_gate(
     now_us: i64,
     dedup_key: Option<(&str, &str)>,
 ) -> Result<GateOutcome, RuntimeError> {
-    let mut writer = sql.writer().await.map_err(|e| sql_err("writer", e))?;
+    // ADR-067 Component A (Fork C slice 2): the whole claim+check+fold unit
+    // is handed to `atomic_unit` as ONE closure instead of this function
+    // opening its own `writer()` handle and issuing `BEGIN IMMEDIATE`/
+    // `COMMIT`/`ROLLBACK` by hand. On the flag-on path `atomic_unit` runs
+    // this closure inside the writer task's single request transaction —
+    // no separate connection competes for SQLite's write lock. On the
+    // flag-off (or in-memory) path `atomic_unit` wraps it in the same
+    // manual BEGIN IMMEDIATE/COMMIT/ROLLBACK sequence this function used to
+    // issue directly, so that path is unchanged.
+    let namespace = namespace.to_string();
+    let profile_id = profile_id.to_string();
+    let target_id = target_id.to_string();
+    let dedup_key = dedup_key.map(|(a, b)| (a.to_string(), b.to_string()));
 
-    exec_stmt(writer.as_mut(), "BEGIN IMMEDIATE", vec![], "begin")
-        .await
-        .map_err(|e| sql_err("begin", e))?;
-    let _tx_handle = khive_storage::tx_registry::register(Some("fold_gate_apply".to_string()));
+    let op: khive_storage::AtomicUnitOp = Box::new(move |writer| {
+        Box::pin(async move {
+            let dedup_ref = dedup_key.as_ref().map(|(a, b)| (a.as_str(), b.as_str()));
+            apply_gate_within_tx(
+                writer,
+                &namespace,
+                &profile_id,
+                &target_id,
+                weight,
+                now_us,
+                dedup_ref,
+            )
+            .await
+            .map(|outcome| Box::new(outcome) as Box<dyn std::any::Any + Send>)
+            .map_err(|e| {
+                khive_storage::StorageError::driver(
+                    khive_storage::StorageCapability::Sql,
+                    "fold_gate_apply",
+                    e,
+                )
+            })
+        })
+    });
 
-    let result = apply_gate_within_tx(
-        writer.as_mut(),
-        namespace,
-        profile_id,
-        target_id,
-        weight,
-        now_us,
-        dedup_key,
-    )
-    .await;
-
-    match result {
-        Ok(outcome) => match exec_stmt(writer.as_mut(), "COMMIT", vec![], "commit").await {
-            Ok(()) => Ok(outcome),
-            Err(e) => {
-                // Finding 3 (internal review round 1): a failed COMMIT must not skip the
-                // rollback. The connection is dropped either way on a
-                // file-backed pool, but an explicit ROLLBACK avoids leaving a
-                // held write lock if the connection is pooled/reused
-                // (in-memory backend) — matching the error-path behavior
-                // below, so every early return rolls back, not just the
-                // fold-body error path.
-                let _ = exec_stmt(writer.as_mut(), "ROLLBACK", vec![], "rollback").await;
-                Err(sql_err("commit", e))
-            }
-        },
-        Err(e) => {
-            // Best-effort: the connection is dropped either way, but an explicit
-            // ROLLBACK avoids leaving a held write lock if the connection is
-            // pooled/reused (in-memory backend).
-            let _ = exec_stmt(writer.as_mut(), "ROLLBACK", vec![], "rollback").await;
-            Err(e)
-        }
-    }
+    let boxed = sql.atomic_unit(op).await?;
+    Ok(*boxed
+        .downcast::<GateOutcome>()
+        .expect("atomic_unit op for apply_fold_gate must return GateOutcome"))
 }
 
 /// Which gating applies to the implicit event participating in the ADR-081
@@ -287,44 +288,46 @@ pub async fn apply_fold_gate_and_append_event<F>(
     build_event: F,
 ) -> Result<GateAndAppendOutcome, RuntimeError>
 where
-    F: FnOnce(Option<&FoldGateOutcome>, bool) -> Event,
+    F: FnOnce(Option<&FoldGateOutcome>, bool) -> Event + Send + 'static,
 {
-    let mut writer = sql.writer().await.map_err(|e| sql_err("writer", e))?;
+    // ADR-067 Component A (Fork C slice 2): see `apply_fold_gate`'s doc
+    // comment — same conversion, from a manually-owned `writer()` handle
+    // with hand-issued `BEGIN IMMEDIATE`/`COMMIT`/`ROLLBACK` to ONE
+    // `atomic_unit` closure.
+    let namespace = namespace.to_string();
+    let profile_id = profile_id.to_string();
+    let target_id = target_id.to_string();
+    let dedup_key = dedup_key.map(|(a, b)| (a.to_string(), b.to_string()));
 
-    exec_stmt(writer.as_mut(), "BEGIN IMMEDIATE", vec![], "begin")
-        .await
-        .map_err(|e| sql_err("begin", e))?;
-    let _tx_handle =
-        khive_storage::tx_registry::register(Some("fold_gate_apply_event".to_string()));
+    let op: khive_storage::AtomicUnitOp = Box::new(move |writer| {
+        Box::pin(async move {
+            let dedup_ref = dedup_key.as_ref().map(|(a, b)| (a.as_str(), b.as_str()));
+            apply_gate_and_append_within_tx(
+                writer,
+                &namespace,
+                &profile_id,
+                &target_id,
+                gate_mode,
+                now_us,
+                dedup_ref,
+                build_event,
+            )
+            .await
+            .map(|outcome| Box::new(outcome) as Box<dyn std::any::Any + Send>)
+            .map_err(|e| {
+                khive_storage::StorageError::driver(
+                    khive_storage::StorageCapability::Sql,
+                    "fold_gate_apply_event",
+                    e,
+                )
+            })
+        })
+    });
 
-    let result = apply_gate_and_append_within_tx(
-        writer.as_mut(),
-        namespace,
-        profile_id,
-        target_id,
-        gate_mode,
-        now_us,
-        dedup_key,
-        build_event,
-    )
-    .await;
-
-    match result {
-        Ok(outcome) => match exec_stmt(writer.as_mut(), "COMMIT", vec![], "commit").await {
-            Ok(()) => Ok(outcome),
-            Err(e) => {
-                // Same rationale as `apply_fold_gate`: an explicit ROLLBACK
-                // on a failed COMMIT avoids leaving a held write lock on a
-                // pooled/reused connection (in-memory backend).
-                let _ = exec_stmt(writer.as_mut(), "ROLLBACK", vec![], "rollback").await;
-                Err(sql_err("commit", e))
-            }
-        },
-        Err(e) => {
-            let _ = exec_stmt(writer.as_mut(), "ROLLBACK", vec![], "rollback").await;
-            Err(e)
-        }
-    }
+    let boxed = sql.atomic_unit(op).await?;
+    Ok(*boxed.downcast::<GateAndAppendOutcome>().expect(
+        "atomic_unit op for apply_fold_gate_and_append_event must return GateAndAppendOutcome",
+    ))
 }
 
 /// Run the dedup claim (if any), the fold-or-skip, and the event append on
@@ -514,6 +517,12 @@ async fn fold_within_tx(
     })
 }
 
+// ADR-067 Component A (Fork C slice 2): `apply_fold_gate`/
+// `apply_fold_gate_and_append_event` no longer issue their own manual
+// `BEGIN IMMEDIATE`/`COMMIT`/`ROLLBACK` via this helper (that now lives in
+// `SqlBridge::atomic_unit`'s `run_manual_atomic_unit`) — this remains only
+// as a small test-seeding utility.
+#[cfg(test)]
 async fn exec_stmt(
     writer: &mut dyn SqlWriter,
     sql: &str,
@@ -740,6 +749,129 @@ mod tests {
         })
         .expect("file-backed runtime");
         (rt, dir)
+    }
+
+    /// Fork C slice 2: proves `apply_fold_gate` — via the new
+    /// `SqlAccess::atomic_unit` seam this fix introduced — is actually
+    /// enqueued on the pool's shared `WriterTaskHandle` channel when the
+    /// write queue is enabled, rather than falling back to
+    /// `run_manual_atomic_unit`'s own standalone-connection path.
+    ///
+    /// Deliberately NOT a wall-clock/occupier-timing test: `atomic_unit`'s
+    /// own flag-off/no-writer-task fallback opens a real standalone
+    /// connection to the same db file and issues its own `BEGIN IMMEDIATE`,
+    /// which would ALSO serialize behind an occupier's held transaction via
+    /// SQLite's real file-level locking — indistinguishable by elapsed time
+    /// alone from the correctly-routed case (confirmed empirically while
+    /// designing this fix's khive-db sibling tests for entity/note/graph).
+    /// Instead this reads `WriterTaskHandle::queue_depth` directly while an
+    /// occupier deterministically holds the writer task's one drain slot
+    /// open (parked on a oneshot via `blocking_recv`, not a sleep/timing
+    /// race).
+    ///
+    /// Deliberately NOT built via `file_backed_runtime` + the
+    /// `KHIVE_WRITE_QUEUE` env var: that env var is process-global, and this
+    /// crate's other tests are NOT `#[serial]` against it, so a window where
+    /// it is set here can leak into a concurrently-scheduled test's own
+    /// `KhiveRuntime::new` and unexpectedly flip its pool's write-queue flag
+    /// (observed directly: `fold_gate_rolls_back_claim_and_mass_when_event_append_fails`'s
+    /// manual seed transaction hit "cannot start a transaction within a
+    /// transaction" under `cargo test`'s default parallelism before this test
+    /// was rewritten to avoid the env var). Constructing the pool directly
+    /// with `write_queue_enabled: true` in the config literal, and driving
+    /// `apply_fold_gate` over a bare `SqlBridge` instead of a full
+    /// `KhiveRuntime`, sidesteps global mutable state entirely — no
+    /// `#[serial]` needed, and no risk to any other test in this binary.
+    #[tokio::test]
+    async fn fold_gate_apply_routes_through_writer_task_when_flag_enabled() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("fold-gate-write-queue-routing.db");
+        let pool_cfg = khive_db::PoolConfig {
+            path: Some(db_path),
+            write_queue_enabled: true,
+            ..khive_db::PoolConfig::default()
+        };
+        let pool = std::sync::Arc::new(khive_db::ConnectionPool::new(pool_cfg).expect("pool"));
+        {
+            let mut writer = pool.writer().expect("writer");
+            khive_db::run_migrations(writer.conn_mut()).expect("migrations");
+        }
+        let sql: std::sync::Arc<dyn SqlAccess> =
+            std::sync::Arc::new(khive_db::SqlBridge::new(std::sync::Arc::clone(&pool), true));
+
+        let writer_task = pool
+            .writer_task_handle()
+            .unwrap()
+            .expect("writer task must be spawned with the flag on for a file-backed pool");
+
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel::<()>();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let occupier = {
+            let writer_task = writer_task.clone();
+            tokio::spawn(async move {
+                writer_task
+                    .send(move |_conn| {
+                        let _ = started_tx.send(());
+                        let _ = release_rx.blocking_recv();
+                        Ok::<(), khive_storage::StorageError>(())
+                    })
+                    .await
+            })
+        };
+
+        started_rx
+            .await
+            .expect("occupier must signal it has started running inside the writer task");
+        assert_eq!(
+            writer_task.queue_depth(),
+            0,
+            "channel must start empty once the occupier has been dequeued and is running"
+        );
+
+        let apply_task = tokio::spawn(async move {
+            apply_fold_gate(
+                sql.as_ref(),
+                "local",
+                "write-queue-routing-profile",
+                "write-queue-routing-target",
+                0.3,
+                1_700_000_000_000_000,
+                None,
+            )
+            .await
+        });
+
+        let mut saw_enqueued = false;
+        for _ in 0..100 {
+            if writer_task.queue_depth() >= 1 {
+                saw_enqueued = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert!(
+            saw_enqueued,
+            "apply_fold_gate's atomic_unit request never appeared in the writer \
+             task's channel while the occupier held the single drain slot — \
+             atomic_unit is not routing this call through the shared writer task"
+        );
+
+        release_tx
+            .send(())
+            .expect("occupier must still be waiting on the release signal");
+        occupier
+            .await
+            .expect("occupier task must not panic")
+            .expect("occupier write must succeed");
+
+        let outcome = apply_task
+            .await
+            .expect("apply_task must not panic")
+            .expect("apply_fold_gate must succeed once unblocked");
+        assert!(
+            matches!(outcome, GateOutcome::Folded(_)),
+            "expected a fresh (non-deduped) fold to succeed"
+        );
     }
 
     /// Proves the Finding-1 fix (internal review round 1): concurrent duplicate scorer
@@ -1070,7 +1202,7 @@ mod tests {
             FeedbackGateMode::Nominal(weight),
             now_us,
             Some((scorer_run_id, serve_ledger_id)),
-            |_fold_outcome, _forced_zero| Event {
+            move |_fold_outcome, _forced_zero| Event {
                 id: colliding_id,
                 ..Event::new(
                     namespace.to_string(),
@@ -1158,7 +1290,7 @@ mod tests {
             FeedbackGateMode::Nominal(weight),
             now_us,
             Some((scorer_run_id, serve_ledger_id)),
-            |_fold_outcome, _forced_zero| {
+            move |_fold_outcome, _forced_zero| {
                 Event::new(
                     namespace.to_string(),
                     "brain.feedback",

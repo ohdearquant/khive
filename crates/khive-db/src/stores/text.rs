@@ -19,6 +19,7 @@ use khive_types::SubstrateKind;
 
 use crate::error::SqliteError;
 use crate::pool::ConnectionPool;
+use crate::writer_task::WriterTaskHandle;
 
 /// Ensure the FTS5 virtual table for `table_key` exists.
 ///
@@ -62,6 +63,7 @@ pub struct Fts5TextSearch {
     pool: Arc<ConnectionPool>,
     is_file_backed: bool,
     table_name: String,
+    writer_task: Option<WriterTaskHandle>,
 }
 
 impl Fts5TextSearch {
@@ -70,10 +72,15 @@ impl Fts5TextSearch {
     /// The FTS5 virtual table must already exist (created by `StorageBackend::text()`).
     pub(crate) fn new(pool: Arc<ConnectionPool>, is_file_backed: bool, table_key: String) -> Self {
         let table_name = format!("fts_{}", table_key);
+        // Best-effort opt-in (ADR-067 Component A, mirrors entity.rs slice 1
+        // policy): a missing writer task degrades to the legacy pool-mutex /
+        // standalone-connection path rather than failing construction.
+        let writer_task = pool.writer_task_handle().ok().flatten();
         Self {
             pool,
             is_file_backed,
             table_name,
+            writer_task,
         }
     }
 
@@ -89,7 +96,51 @@ impl Fts5TextSearch {
             .map_err(|e| map_sqlite_err(e, "open_fts_reader"))
     }
 
+    /// Route a single-row write through the pool-wide `WriterTask` when
+    /// `KHIVE_WRITE_QUEUE=1` and a handle is available; otherwise fall back
+    /// to the legacy standalone-connection / pool-mutex path (ADR-067
+    /// Component A, Fork C slice 2).
+    ///
+    /// This is the routing point for `with_writer` callers whose closure is
+    /// DML-only (`delete_document`/`fts_delete`, `rebuild`/`fts_rebuild`):
+    /// on the flag-on path the closure runs inside the WriterTask's own
+    /// transaction, so a bare `BEGIN IMMEDIATE` would violate SQLite's
+    /// nested-transaction rule. `upsert_document`/`upsert_documents` (the
+    /// single-doc and batch write methods) do their own flag check and
+    /// return early on `Some`, so their fallback calls into this helper
+    /// only ever execute on the flag-off path (`self.writer_task` is
+    /// `None` by construction whenever those calls are reached) — no
+    /// double-routing.
+    ///
+    /// `rename_namespace` (`#[allow(dead_code)]`, no production caller —
+    /// see ADR-067's `BEGIN IMMEDIATE` site inventory, EXEMPT) manages its
+    /// own manual transaction and calls [`Self::with_writer_unmanaged`]
+    /// instead of this helper — routing its closure through the WriterTask
+    /// would nest a bare `BEGIN IMMEDIATE` inside the WriterTask's own
+    /// transaction.
     async fn with_writer<F, R>(&self, op: &'static str, f: F) -> Result<R, StorageError>
+    where
+        F: FnOnce(&rusqlite::Connection) -> Result<R, rusqlite::Error> + Send + 'static,
+        R: Send + 'static,
+    {
+        if let Some(writer_task) = &self.writer_task {
+            return writer_task
+                .send(move |conn| f(conn).map_err(|e| map_err(e, op)))
+                .await;
+        }
+
+        self.with_writer_unmanaged(op, f).await
+    }
+
+    /// Legacy standalone-connection / pool-mutex write path, bypassing the
+    /// WriterTask channel unconditionally regardless of
+    /// `KHIVE_WRITE_QUEUE`.
+    ///
+    /// Reserved for closures that manage their own transaction (a bare
+    /// `BEGIN IMMEDIATE`/`COMMIT`/`ROLLBACK`) — those cannot be sent through
+    /// the WriterTask channel, which already wraps every request in its own
+    /// transaction. `rename_namespace` is the only caller.
+    async fn with_writer_unmanaged<F, R>(&self, op: &'static str, f: F) -> Result<R, StorageError>
     where
         F: FnOnce(&rusqlite::Connection) -> Result<R, rusqlite::Error> + Send + 'static,
         R: Send + 'static,
@@ -288,51 +339,158 @@ fn build_filter_clause(
     }
 }
 
+/// DML-only single-document upsert shared by both the legacy (flag-off) and
+/// WriterTask-routed (flag-on) `upsert_document` paths (ADR-067 Component A).
+///
+/// Issues no `BEGIN` / `COMMIT` / `ROLLBACK` itself — the caller owns the
+/// enclosing transaction.
+fn upsert_document_dml(
+    conn: &rusqlite::Connection,
+    table: &str,
+    document: &TextDocument,
+) -> Result<(), rusqlite::Error> {
+    let namespace = &document.namespace;
+
+    let del_sql = format!(
+        "DELETE FROM {} WHERE namespace = ?1 AND subject_id = ?2",
+        table
+    );
+    conn.execute(
+        &del_sql,
+        rusqlite::params![namespace, document.subject_id.to_string()],
+    )?;
+
+    let ins_sql = format!(
+        "INSERT INTO {} \
+         (subject_id, kind, title, body, tags, namespace, metadata, updated_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        table
+    );
+    let tags_json = tags_to_json(&document.tags);
+    let metadata_json: Option<String> = document.metadata.as_ref().map(|v| v.to_string());
+
+    conn.execute(
+        &ins_sql,
+        rusqlite::params![
+            document.subject_id.to_string(),
+            document.kind.to_string(),
+            document.title.as_deref().unwrap_or(""),
+            document.body,
+            tags_json,
+            namespace,
+            metadata_json,
+            dt_to_micros(&document.updated_at),
+        ],
+    )?;
+    Ok(())
+}
+
+/// DML-only batch upsert loop shared by both the legacy (flag-off) and
+/// WriterTask-routed (flag-on) `upsert_documents` paths (ADR-067 Component A).
+///
+/// Issues no OUTER `BEGIN` / `COMMIT` / `ROLLBACK` — the caller owns the
+/// enclosing transaction. The per-row named `SAVEPOINT fts_upsert_doc` is
+/// preserved unchanged: it is what gives this loop its partial-success
+/// semantics (one bad document does not abort the whole batch) independent
+/// of which outer transaction wraps the loop.
+fn batch_upsert_documents_dml(
+    conn: &rusqlite::Connection,
+    table: &str,
+    documents: &[TextDocument],
+    attempted: u64,
+) -> Result<BatchWriteSummary, rusqlite::Error> {
+    let del_sql = format!(
+        "DELETE FROM {} WHERE namespace = ?1 AND subject_id = ?2",
+        table
+    );
+    let ins_sql = format!(
+        "INSERT INTO {} \
+         (subject_id, kind, title, body, tags, namespace, metadata, updated_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        table
+    );
+
+    let mut affected = 0u64;
+    let mut failed = 0u64;
+    let mut first_error = String::new();
+
+    for doc in documents {
+        conn.execute_batch("SAVEPOINT fts_upsert_doc")?;
+        let id_str = doc.subject_id.to_string();
+        let namespace = &doc.namespace;
+        let result = (|| {
+            conn.execute(&del_sql, rusqlite::params![namespace, &id_str])?;
+
+            let tags_json = tags_to_json(&doc.tags);
+            let metadata_json: Option<String> = doc.metadata.as_ref().map(|v| v.to_string());
+
+            conn.execute(
+                &ins_sql,
+                rusqlite::params![
+                    &id_str,
+                    &doc.kind.to_string(),
+                    doc.title.as_deref().unwrap_or(""),
+                    &doc.body,
+                    &tags_json,
+                    namespace,
+                    &metadata_json,
+                    dt_to_micros(&doc.updated_at),
+                ],
+            )?;
+            Ok::<(), rusqlite::Error>(())
+        })();
+
+        match result {
+            Ok(()) => {
+                conn.execute_batch("RELEASE SAVEPOINT fts_upsert_doc")?;
+                affected += 1;
+            }
+            Err(e) => {
+                let _ = conn.execute_batch("ROLLBACK TO SAVEPOINT fts_upsert_doc");
+                let _ = conn.execute_batch("RELEASE SAVEPOINT fts_upsert_doc");
+                if first_error.is_empty() {
+                    first_error = e.to_string();
+                }
+                failed += 1;
+            }
+        }
+    }
+
+    Ok(BatchWriteSummary {
+        attempted,
+        affected,
+        failed,
+        first_error,
+    })
+}
+
 #[async_trait]
 impl TextSearch for Fts5TextSearch {
     async fn upsert_document(&self, document: TextDocument) -> Result<(), StorageError> {
         let table = self.table_name.clone();
-        let namespace = document.namespace.clone();
 
+        // ADR-067 Component A: when the write queue is enabled, route
+        // through the pool-wide WriterTask. DML-only closure — no BEGIN
+        // IMMEDIATE/COMMIT/ROLLBACK here, since the WriterTask's run loop
+        // owns the transaction.
+        if let Some(writer_task) = &self.writer_task {
+            let table2 = table.clone();
+            return writer_task
+                .send(move |conn| {
+                    upsert_document_dml(conn, &table2, &document)
+                        .map_err(|e| map_err(e, "fts_upsert"))
+                })
+                .await;
+        }
+
+        // Flag-off (default) path: byte-for-byte unchanged from pre-ADR-067
+        // behavior — the closure owns its own BEGIN IMMEDIATE/COMMIT/ROLLBACK.
         self.with_writer("fts_upsert", move |conn| {
             conn.execute_batch("BEGIN IMMEDIATE")?;
             let _tx_handle =
                 khive_storage::tx_registry::register(Some("text_upsert_document".to_string()));
 
-            let del_sql = format!(
-                "DELETE FROM {} WHERE namespace = ?1 AND subject_id = ?2",
-                table
-            );
-            if let Err(e) = conn.execute(
-                &del_sql,
-                rusqlite::params![&namespace, document.subject_id.to_string()],
-            ) {
-                let _ = conn.execute_batch("ROLLBACK");
-                return Err(e);
-            }
-
-            let ins_sql = format!(
-                "INSERT INTO {} \
-                 (subject_id, kind, title, body, tags, namespace, metadata, updated_at) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-                table
-            );
-            let tags_json = tags_to_json(&document.tags);
-            let metadata_json: Option<String> = document.metadata.as_ref().map(|v| v.to_string());
-
-            if let Err(e) = conn.execute(
-                &ins_sql,
-                rusqlite::params![
-                    document.subject_id.to_string(),
-                    document.kind.to_string(),
-                    document.title.as_deref().unwrap_or(""),
-                    document.body,
-                    tags_json,
-                    &namespace,
-                    metadata_json,
-                    dt_to_micros(&document.updated_at),
-                ],
-            ) {
+            if let Err(e) = upsert_document_dml(conn, &table, &document) {
                 let _ = conn.execute_batch("ROLLBACK");
                 return Err(e);
             }
@@ -350,76 +508,33 @@ impl TextSearch for Fts5TextSearch {
         let table = self.table_name.clone();
         let attempted = documents.len() as u64;
 
-        self.with_writer("fts_upsert_batch", move |conn| {
-            let del_sql = format!(
-                "DELETE FROM {} WHERE namespace = ?1 AND subject_id = ?2",
-                table
-            );
-            let ins_sql = format!(
-                "INSERT INTO {} \
-                 (subject_id, kind, title, body, tags, namespace, metadata, updated_at) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-                table
-            );
+        // ADR-067 Component A: when the write queue is enabled, route
+        // through the pool-wide WriterTask. DML-only closure (the per-row
+        // `SAVEPOINT fts_upsert_doc` is preserved unchanged — only the OUTER
+        // BEGIN IMMEDIATE/COMMIT is removed, since the WriterTask's run loop
+        // owns the enclosing transaction).
+        if let Some(writer_task) = &self.writer_task {
+            let table2 = table.clone();
+            return writer_task
+                .send(move |conn| {
+                    batch_upsert_documents_dml(conn, &table2, &documents, attempted)
+                        .map_err(|e| map_err(e, "fts_upsert_batch"))
+                })
+                .await;
+        }
 
+        // Flag-off (default) path: byte-for-byte unchanged from pre-ADR-067
+        // behavior — the closure owns its own BEGIN IMMEDIATE/COMMIT.
+        self.with_writer("fts_upsert_batch", move |conn| {
             conn.execute_batch("BEGIN IMMEDIATE")?;
             let _tx_handle =
                 khive_storage::tx_registry::register(Some("text_upsert_batch".to_string()));
-            let mut affected = 0u64;
-            let mut failed = 0u64;
-            let mut first_error = String::new();
 
-            for doc in &documents {
-                conn.execute_batch("SAVEPOINT fts_upsert_doc")?;
-                let id_str = doc.subject_id.to_string();
-                let namespace = &doc.namespace;
-                let result = (|| {
-                    conn.execute(&del_sql, rusqlite::params![namespace, &id_str])?;
-
-                    let tags_json = tags_to_json(&doc.tags);
-                    let metadata_json: Option<String> =
-                        doc.metadata.as_ref().map(|v| v.to_string());
-
-                    conn.execute(
-                        &ins_sql,
-                        rusqlite::params![
-                            &id_str,
-                            &doc.kind.to_string(),
-                            doc.title.as_deref().unwrap_or(""),
-                            &doc.body,
-                            &tags_json,
-                            namespace,
-                            &metadata_json,
-                            dt_to_micros(&doc.updated_at),
-                        ],
-                    )?;
-                    Ok::<(), rusqlite::Error>(())
-                })();
-
-                match result {
-                    Ok(()) => {
-                        conn.execute_batch("RELEASE SAVEPOINT fts_upsert_doc")?;
-                        affected += 1;
-                    }
-                    Err(e) => {
-                        let _ = conn.execute_batch("ROLLBACK TO SAVEPOINT fts_upsert_doc");
-                        let _ = conn.execute_batch("RELEASE SAVEPOINT fts_upsert_doc");
-                        if first_error.is_empty() {
-                            first_error = e.to_string();
-                        }
-                        failed += 1;
-                    }
-                }
-            }
+            let summary = batch_upsert_documents_dml(conn, &table, &documents, attempted)?;
 
             conn.execute_batch("COMMIT")?;
 
-            Ok(BatchWriteSummary {
-                attempted,
-                affected,
-                failed,
-                first_error,
-            })
+            Ok(summary)
         })
         .await
     }
@@ -1077,7 +1192,7 @@ impl Fts5TextSearch {
         let old_ns = old_namespace.to_string();
         let new_ns = new_namespace.to_string();
 
-        self.with_writer("fts_rename_namespace", move |conn| {
+        self.with_writer_unmanaged("fts_rename_namespace", move |conn| {
             let sel_sql = format!(
                 "SELECT subject_id, kind, title, body, tags, metadata, updated_at \
                  FROM {} WHERE namespace = ?1",

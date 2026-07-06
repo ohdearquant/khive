@@ -1,6 +1,7 @@
 use super::*;
 use crate::pool::PoolConfig;
-use serial_test::serial;
+use std::time::Duration;
+use tokio::sync::oneshot;
 
 fn setup_pool() -> Arc<ConnectionPool> {
     let config = PoolConfig {
@@ -512,17 +513,18 @@ async fn page_offset_over_i64max_rejected() {
 /// the trip through the type-erased channel intact, and both rows are
 /// actually committed and independently readable back through the store.
 ///
-/// `#[serial]`: mutates the process-global `KHIVE_WRITE_QUEUE` env var,
-/// shared with `pool.rs`'s own env-override tests in this same test binary.
+/// Constructed via a `PoolConfig` literal (`write_queue_enabled: true`), not
+/// the `KHIVE_WRITE_QUEUE` env var — that env var is process-global and this
+/// crate's other tests are NOT `#[serial]` against it, so a window where it
+/// is set here could leak into a concurrently-scheduled test's own pool
+/// construction (ADR-067 Fork C slice 2 round 2, LOW finding).
 #[tokio::test]
-#[serial]
 async fn upsert_entities_routes_through_writer_task_when_flag_enabled() {
-    std::env::set_var("KHIVE_WRITE_QUEUE", "1");
-
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("write_queue_entities.db");
     let pool_cfg = PoolConfig {
         path: Some(path.clone()),
+        write_queue_enabled: true,
         ..PoolConfig::default()
     };
     let pool = Arc::new(ConnectionPool::new(pool_cfg).unwrap());
@@ -532,10 +534,6 @@ async fn upsert_entities_routes_through_writer_task_when_flag_enabled() {
     }
 
     let store = SqlEntityStore::new(Arc::clone(&pool), true);
-
-    // Confined to the smallest possible window around construction, which is
-    // the only place this flag is read.
-    std::env::remove_var("KHIVE_WRITE_QUEUE");
 
     let e1 = make_entity("default", "concept", "LoRA");
     let e2 = make_entity("default", "concept", "QLoRA");
@@ -590,17 +588,17 @@ async fn upsert_entities_legacy_path_unchanged_when_flag_is_off() {
 /// the writer task exactly once; every store resolves to a clone of the one
 /// pool-owned handle (`ConnectionPool::writer_task_handle`).
 ///
-/// `#[serial]`: mutates the process-global `KHIVE_WRITE_QUEUE` env var,
-/// shared with `pool.rs`'s own env-override tests in this same test binary.
+/// Constructed via a `PoolConfig` literal (`write_queue_enabled: true`), not
+/// the `KHIVE_WRITE_QUEUE` env var — see the sibling
+/// `upsert_entities_routes_through_writer_task_when_flag_enabled` test's doc
+/// comment for the race this avoids.
 #[tokio::test]
-#[serial]
 async fn multiple_stores_over_one_pool_share_a_single_writer_task() {
-    std::env::set_var("KHIVE_WRITE_QUEUE", "1");
-
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("write_queue_shared_writer.db");
     let pool_cfg = PoolConfig {
         path: Some(path.clone()),
+        write_queue_enabled: true,
         ..PoolConfig::default()
     };
     let pool = Arc::new(ConnectionPool::new(pool_cfg).unwrap());
@@ -608,8 +606,6 @@ async fn multiple_stores_over_one_pool_share_a_single_writer_task() {
         let writer = pool.writer().unwrap();
         writer.conn().execute_batch(ENTITIES_DDL).unwrap();
     }
-
-    std::env::remove_var("KHIVE_WRITE_QUEUE");
 
     // Three independent stores over the same pool, each resolving the
     // write-queue flag on construction and asking the pool for its writer
@@ -625,4 +621,300 @@ async fn multiple_stores_over_one_pool_share_a_single_writer_task() {
          exactly once — one writer task per pool (per DB file), not one \
          per store"
     );
+}
+
+/// Full-slice single-writer guarantee (ADR-067 Component A, Fork C slice 2):
+/// with every MIGRATE-listed write path routed through the writer task, drive
+/// CONCURRENT writes across entity, note, and graph stores (entries 2/3/6 —
+/// er, 1/2/3) plus `SqlBridge`'s unmigrated `writer()` (entry 8, still routes
+/// its self-contained `execute_batch` through the task per entry 10) and
+/// `begin_tx()` (entry 9, a genuine design fork — stays on its own standalone
+/// connection) over ONE pool. Asserts exactly one writer task is ever spawned
+/// and every write actually lands, proving the migrated paths and the two
+/// design-fork paths coexist over a single DB file without contending at
+/// `BEGIN IMMEDIATE` or racing the writer task's own spawn-once guarantee.
+///
+/// Constructed via a `PoolConfig` literal (`write_queue_enabled: true`), not
+/// the `KHIVE_WRITE_QUEUE` env var — see the sibling
+/// `upsert_entities_routes_through_writer_task_when_flag_enabled` test's doc
+/// comment for the race this avoids.
+#[tokio::test]
+async fn concurrent_writes_across_all_migrated_stores_share_one_writer_task() {
+    use crate::stores::graph::SqlGraphStore;
+    use crate::stores::note::SqlNoteStore;
+    use khive_storage::note::Note;
+    use khive_storage::types::{Edge, SqlStatement, SqlTxOptions, SqlValue};
+    use khive_storage::{GraphStore as _, NoteStore as _, SqlAccess as _};
+    use khive_types::EdgeRelation;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("write_queue_all_paths_shared_writer.db");
+    let pool_cfg = PoolConfig {
+        path: Some(path.clone()),
+        write_queue_enabled: true,
+        ..PoolConfig::default()
+    };
+    let pool = Arc::new(ConnectionPool::new(pool_cfg).unwrap());
+    {
+        let writer = pool.writer().unwrap();
+        writer.conn().execute_batch(ENTITIES_DDL).unwrap();
+        crate::stores::note::ensure_notes_schema(writer.conn()).unwrap();
+        crate::stores::graph::ensure_graph_schema(writer.conn()).unwrap();
+    }
+
+    let entity_store = Arc::new(SqlEntityStore::new(Arc::clone(&pool), true));
+    let note_store = Arc::new(SqlNoteStore::new(Arc::clone(&pool), true));
+    let graph_store = Arc::new(SqlGraphStore::new_scoped(
+        Arc::clone(&pool),
+        true,
+        "default",
+    ));
+    let bridge = crate::sql_bridge::SqlBridge::new(Arc::clone(&pool), true);
+
+    assert_eq!(
+        pool.writer_task_spawn_count(),
+        1,
+        "entity + note + graph stores plus SqlBridge over one pool must still \
+         share exactly one writer task"
+    );
+
+    let entity = make_entity("default", "concept", "WriterTaskConcurrency");
+    let entity_id = entity.id;
+
+    let note = Note::new("default", "observation", "concurrent writer task note");
+    let note_id = note.id;
+
+    let edge_src = Uuid::new_v4();
+    let edge_tgt = Uuid::new_v4();
+    let now = chrono::Utc::now();
+    let edge = Edge {
+        id: Uuid::new_v4().into(),
+        namespace: "default".to_string(),
+        source_id: edge_src,
+        target_id: edge_tgt,
+        relation: EdgeRelation::Extends,
+        weight: 0.9,
+        created_at: now,
+        updated_at: now,
+        deleted_at: None,
+        metadata: None,
+        target_backend: None,
+    };
+    let edge_id = edge.id;
+
+    // Entry 10 (SqliteWriter::execute_batch, migrated): a raw INSERT issued
+    // through SqlBridge's file-backed writer() handle.
+    let batch_row_id = Uuid::new_v4();
+    let batch_src = Uuid::new_v4();
+    let batch_tgt = Uuid::new_v4();
+    let now_micros = chrono::Utc::now().timestamp_micros();
+    let insert_stmt = SqlStatement {
+        sql: "INSERT INTO graph_edges (namespace, id, source_id, target_id, relation, \
+              weight, created_at, updated_at, deleted_at, metadata, target_backend) \
+              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL, NULL, NULL)"
+            .to_string(),
+        params: vec![
+            SqlValue::Text("default".to_string()),
+            SqlValue::Text(batch_row_id.to_string()),
+            SqlValue::Text(batch_src.to_string()),
+            SqlValue::Text(batch_tgt.to_string()),
+            SqlValue::Text("extends".to_string()),
+            SqlValue::Float(0.5),
+            SqlValue::Integer(now_micros),
+            SqlValue::Integer(now_micros),
+        ],
+        label: Some("test_execute_batch".to_string()),
+    };
+
+    // Entry 9 (SqlBridge::begin_tx, design fork, unmigrated): its own
+    // standalone connection, running concurrently with the writer task.
+    let tx_row_id = Uuid::new_v4();
+    let tx_src = Uuid::new_v4();
+    let tx_tgt = Uuid::new_v4();
+    let tx_insert_stmt = SqlStatement {
+        sql: "INSERT INTO graph_edges (namespace, id, source_id, target_id, relation, \
+              weight, created_at, updated_at, deleted_at, metadata, target_backend) \
+              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL, NULL, NULL)"
+            .to_string(),
+        params: vec![
+            SqlValue::Text("default".to_string()),
+            SqlValue::Text(tx_row_id.to_string()),
+            SqlValue::Text(tx_src.to_string()),
+            SqlValue::Text(tx_tgt.to_string()),
+            SqlValue::Text("extends".to_string()),
+            SqlValue::Float(0.7),
+            SqlValue::Integer(now_micros),
+            SqlValue::Integer(now_micros),
+        ],
+        label: Some("test_begin_tx".to_string()),
+    };
+
+    let entity_fut = {
+        let entity_store = Arc::clone(&entity_store);
+        async move { entity_store.upsert_entity(entity).await }
+    };
+    let note_fut = {
+        let note_store = Arc::clone(&note_store);
+        async move { note_store.upsert_note(note).await }
+    };
+    let edge_fut = {
+        let graph_store = Arc::clone(&graph_store);
+        async move { graph_store.upsert_edge(edge).await }
+    };
+    let batch_fut = async {
+        let mut writer = bridge.writer().await.unwrap();
+        writer.execute_batch(vec![insert_stmt]).await
+    };
+    let tx_fut = async {
+        let mut tx = bridge.begin_tx(SqlTxOptions::default()).await.unwrap();
+        tx.execute(tx_insert_stmt).await?;
+        tx.commit().await
+    };
+
+    let (entity_res, note_res, edge_res, batch_res, tx_res) =
+        tokio::join!(entity_fut, note_fut, edge_fut, batch_fut, tx_fut);
+
+    entity_res.unwrap();
+    note_res.unwrap();
+    edge_res.unwrap();
+    batch_res.unwrap();
+    tx_res.unwrap();
+
+    assert!(entity_store.get_entity(entity_id).await.unwrap().is_some());
+    assert!(note_store.get_note(note_id).await.unwrap().is_some());
+    assert!(graph_store.get_edge(edge_id).await.unwrap().is_some());
+
+    assert_eq!(
+        pool.writer_task_spawn_count(),
+        1,
+        "concurrent writes across every migrated path plus both design-fork \
+         paths must not trigger a second writer task spawn"
+    );
+}
+
+// =============================================================================
+// Fork C slice 2: single-row `upsert_entity` (via `with_writer`) routes
+// through the WriterTask when the flag is on
+// =============================================================================
+
+/// Proves `upsert_entity` (the SINGLE-row path, going through the
+/// `with_writer` helper directly rather than the already-migrated
+/// `upsert_entities` batch path) is actually enqueued on the pool's shared
+/// `WriterTaskHandle` channel when `KHIVE_WRITE_QUEUE=1` — not inferred from
+/// wall-clock contention (real SQLite file-level locking would serialize a
+/// competing writer connection against an in-flight transaction regardless
+/// of which Rust-level path issued it, which makes elapsed-time alone a
+/// vacuous signal here), but read directly off `WriterTaskHandle::queue_depth`,
+/// the live gauge over the exact `mpsc` channel `with_writer`'s writer-task
+/// branch must call `send` on.
+///
+/// Technique: submit an occupier request directly on the SAME
+/// `WriterTaskHandle` the store resolved at construction. The occupier signals
+/// a oneshot once it is actually running inside the writer task's single
+/// drain slot, then parks on a second oneshot (`blocking_recv`, valid here
+/// because this closure runs inside the writer task's `spawn_blocking`) until
+/// the test releases it — deterministically holding that one drain slot open
+/// for as long as the test needs, no sleep/timing race. While the slot is
+/// held, call `store.upsert_entity` on a separate task and poll
+/// `queue_depth()`: a version that genuinely routes this call through
+/// `writer_task.send(..)` must show `queue_depth() >= 1` (the request sitting
+/// in the channel behind the still-running occupier) before the occupier is
+/// released; a version that left `upsert_entity`/`with_writer` on the legacy
+/// `pool.try_writer()` path never touches this channel at all, so
+/// `queue_depth()` would stay `0` for the full poll window — this is what
+/// makes the test non-vacuous (verified: reverting `with_writer` to always
+/// take the legacy branch makes this assertion fail, see khive-db PR history
+/// for Fork C slice 2).
+///
+/// Constructed via a `PoolConfig` literal (`write_queue_enabled: true`), not
+/// the `KHIVE_WRITE_QUEUE` env var — see
+/// `upsert_entities_routes_through_writer_task_when_flag_enabled`'s doc
+/// comment for the race this avoids.
+#[tokio::test]
+async fn upsert_entity_routes_through_writer_task_when_flag_enabled() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("write_queue_entity_single.db");
+    let pool_cfg = PoolConfig {
+        path: Some(path.clone()),
+        write_queue_enabled: true,
+        ..PoolConfig::default()
+    };
+    let pool = Arc::new(ConnectionPool::new(pool_cfg).unwrap());
+    {
+        let writer = pool.writer().unwrap();
+        writer.conn().execute_batch(ENTITIES_DDL).unwrap();
+    }
+
+    let store = Arc::new(SqlEntityStore::new(Arc::clone(&pool), true));
+
+    let writer_task = pool
+        .writer_task_handle()
+        .unwrap()
+        .expect("writer task must be spawned with the flag on for a file-backed pool");
+
+    let (started_tx, started_rx) = oneshot::channel::<()>();
+    let (release_tx, release_rx) = oneshot::channel::<()>();
+    let occupier = {
+        let writer_task = writer_task.clone();
+        tokio::spawn(async move {
+            writer_task
+                .send(move |_conn| {
+                    let _ = started_tx.send(());
+                    let _ = release_rx.blocking_recv();
+                    Ok::<(), StorageError>(())
+                })
+                .await
+        })
+    };
+
+    started_rx
+        .await
+        .expect("occupier must signal it has started running inside the writer task");
+    assert_eq!(
+        writer_task.queue_depth(),
+        0,
+        "channel must start empty once the occupier has been dequeued and is running"
+    );
+
+    let entity = make_entity("default", "concept", "RoPE");
+    let entity_id = entity.id;
+
+    let store_task = {
+        let store = Arc::clone(&store);
+        tokio::spawn(async move { store.upsert_entity(entity).await })
+    };
+
+    let mut saw_enqueued = false;
+    for _ in 0..100 {
+        if writer_task.queue_depth() >= 1 {
+            saw_enqueued = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert!(
+        saw_enqueued,
+        "upsert_entity's write request never appeared in the writer task's \
+         channel while the occupier held the single drain slot — with_writer \
+         is not routing this single-row write through the shared writer task"
+    );
+
+    release_tx
+        .send(())
+        .expect("occupier must still be waiting on the release signal");
+    occupier
+        .await
+        .expect("occupier task must not panic")
+        .expect("occupier write must succeed");
+    store_task
+        .await
+        .expect("store task must not panic")
+        .expect("upsert_entity must succeed once unblocked");
+
+    let fetched = store.get_entity(entity_id).await.unwrap();
+    assert!(
+        fetched.is_some(),
+        "entity must be committed and readable after queuing behind the occupier"
+    );
+    assert_eq!(fetched.unwrap().name, "RoPE");
 }

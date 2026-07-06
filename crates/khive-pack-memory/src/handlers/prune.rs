@@ -148,13 +148,83 @@ impl MemoryPack {
             RuntimeError::InvalidInput(format!("memory.vacuum: invalid params: {e}"))
         })?;
 
-        // VACUUM must run outside an open transaction. A plain writer connection
-        // via execute_script (which calls execute_batch internally) satisfies
-        // SQLite's requirement that VACUUM is issued at the top level.
+        // VACUUM must run outside an open transaction. Under
+        // `KHIVE_WRITE_QUEUE=1`, a plain `execute_script` call would run
+        // inside the WriterTask's per-request `BEGIN IMMEDIATE` — SQLite
+        // rejects VACUUM there (ADR-067 Component A, Fork C slice 2 round 2,
+        // BLOCKER A). `execute_script_top_level` is still serialized through
+        // the single writer owner but skips that transaction wrap, so
+        // VACUUM runs genuinely top-level on both the flag-on and flag-off
+        // paths.
         let sql = self.runtime.sql();
         let mut writer = sql.writer().await?;
-        writer.execute_script("VACUUM;".to_string()).await?;
+        writer
+            .execute_script_top_level("VACUUM;".to_string())
+            .await?;
 
         Ok(json!({ "ok": true }))
+    }
+}
+
+// ── ADR-067 Fork C slice 2 round 2 (BLOCKER A): memory.vacuum under the write
+// queue ──────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod vacuum_write_queue_tests {
+    /// Fork C slice 2 round 2 (BLOCKER A): before this fix, `handle_vacuum`
+    /// sent `"VACUUM;"` via plain `execute_script`, which — once
+    /// `execute_script`'s flag-on path was migrated to route through the
+    /// writer task (Fork C slice 2 round 1) — ran inside that task's
+    /// per-request `BEGIN IMMEDIATE`. SQLite rejects `VACUUM` inside any
+    /// open transaction ("cannot VACUUM from within a transaction"), so
+    /// `memory.vacuum` broke under `KHIVE_WRITE_QUEUE=1`. This proves the
+    /// fix: routing the SAME statement through
+    /// `SqlWriter::execute_script_top_level` (what `handle_vacuum` now
+    /// calls) succeeds with the write queue enabled.
+    ///
+    /// Deliberately does NOT build a full `KhiveRuntime` (env-var or
+    /// otherwise) to reach `handle_vacuum` through the `memory.vacuum` verb
+    /// dispatch: `MemoryPack::new` requires an owned `KhiveRuntime`, and
+    /// `KhiveRuntime`/`RuntimeConfig` have no config-injection path for
+    /// `PoolConfig::write_queue_enabled` other than the process-global
+    /// `KHIVE_WRITE_QUEUE` env var — which this crate's other tests are NOT
+    /// `#[serial]` against (the exact race documented on
+    /// `khive-pack-brain`'s `fold_gate.rs` / `persist.rs` sibling routing
+    /// tests for this same round). Exercising the identical
+    /// `sql.writer().await?.execute_script_top_level("VACUUM;")` call
+    /// `handle_vacuum` makes, over a bare write-queue-enabled
+    /// `ConnectionPool`/`SqlBridge` built from a `PoolConfig` literal,
+    /// proves the same fix with no env var and no risk to any other test in
+    /// this binary.
+    #[tokio::test]
+    async fn vacuum_top_level_succeeds_with_write_queue_enabled() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("memory-vacuum-write-queue.db");
+        let pool_cfg = khive_db::PoolConfig {
+            path: Some(db_path),
+            write_queue_enabled: true,
+            ..khive_db::PoolConfig::default()
+        };
+        let pool = std::sync::Arc::new(khive_db::ConnectionPool::new(pool_cfg).expect("pool"));
+        {
+            let mut writer = pool.writer().expect("writer");
+            khive_db::run_migrations(writer.conn_mut()).expect("migrations");
+        }
+        assert!(
+            pool.writer_task_handle().unwrap().is_some(),
+            "writer task must be spawned with the flag on for a file-backed pool"
+        );
+
+        let sql: std::sync::Arc<dyn khive_storage::SqlAccess> =
+            std::sync::Arc::new(khive_db::SqlBridge::new(std::sync::Arc::clone(&pool), true));
+
+        let mut writer = sql.writer().await.expect("writer handle");
+        let result = writer.execute_script_top_level("VACUUM;".to_string()).await;
+
+        assert!(
+            result.is_ok(),
+            "VACUUM via execute_script_top_level must succeed under \
+             KHIVE_WRITE_QUEUE (no BEGIN IMMEDIATE wrap); got {result:?}"
+        );
     }
 }

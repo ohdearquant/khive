@@ -479,7 +479,7 @@ fn build_metrics_snapshot<D: DaemonDispatch>(dispatcher: &D) -> MetricsSnapshot 
 
     let (write_queue_depth, write_queue_capacity) = dispatcher
         .pool_for_checkpoint()
-        .and_then(|pool| pool.writer_task_handle())
+        .and_then(|pool| pool.writer_task_handle().ok().flatten())
         .map(|handle| (Some(handle.queue_depth()), Some(handle.capacity())))
         .unwrap_or((None, None));
 

@@ -3678,6 +3678,107 @@ impl KhiveRuntime {
         Ok(results)
     }
 
+    /// DML-only body of the symmetric-relation conflict-resolution path in
+    /// [`Self::update_edge`] (ADR-067 Component A). Runs the conflict-check SELECT,
+    /// then either the DELETE+UPDATE (case b, a canonical row already exists) or the
+    /// in-place UPDATE (case a, no conflict). Callers own the surrounding transaction
+    /// boundary — this function issues DML only, no `BEGIN`/`COMMIT`/`ROLLBACK`.
+    ///
+    /// Returns `Ok(Some(existing_id))` when a canonical conflict was absorbed (the
+    /// requested edge was deleted, the existing canonical row refreshed), or
+    /// `Ok(None)` when the requested edge was updated in place.
+    #[allow(clippy::too_many_arguments)]
+    fn update_edge_symmetric_dml(
+        conn: &rusqlite::Connection,
+        ns: &str,
+        edge_id_str: &str,
+        canon_src_str: &str,
+        canon_tgt_str: &str,
+        relation_str: &str,
+        weight: f64,
+        metadata: Option<String>,
+        target_backend: Option<String>,
+    ) -> Result<Option<String>, SqliteError> {
+        let now_ts = chrono::Utc::now().timestamp();
+
+        // Check for a conflicting canonical row (same namespace + natural key,
+        // different id). This catches conflicts whether or not endpoints were
+        // flipped — Bug 2 fix.
+        let conflict_id: Option<String> = conn
+            .query_row(
+                "SELECT id FROM graph_edges \
+                 WHERE namespace = ?1 AND source_id = ?2 AND target_id = ?3 \
+                 AND relation = ?4 AND id != ?5",
+                rusqlite::params![
+                    &ns,
+                    &canon_src_str,
+                    &canon_tgt_str,
+                    &relation_str,
+                    &edge_id_str
+                ],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(SqliteError::Rusqlite)?;
+
+        if let Some(existing_id) = conflict_id {
+            // Case (b): canonical row already exists — delete the non-canonical
+            // edge and refresh the existing canonical row. Return the surviving
+            // id so the caller can re-fetch it (Bug 1 fix: do not return the
+            // deleted edge's id).
+            conn.execute(
+                "DELETE FROM graph_edges WHERE namespace = ?1 AND id = ?2",
+                rusqlite::params![&ns, &edge_id_str],
+            )
+            .map_err(SqliteError::Rusqlite)?;
+            let affected = conn
+                .execute(
+                    "UPDATE graph_edges SET \
+                     weight = ?1, updated_at = ?2, deleted_at = NULL, \
+                     target_backend = ?3, metadata = ?4 \
+                     WHERE namespace = ?5 AND id = ?6",
+                    rusqlite::params![weight, now_ts, target_backend, metadata, &ns, &existing_id],
+                )
+                .map_err(SqliteError::Rusqlite)?;
+            if affected == 0 {
+                return Err(SqliteError::InvalidData(format!(
+                    "update_edge: surviving canonical row {existing_id} vanished during update"
+                )));
+            }
+            Ok(Some(existing_id))
+        } else {
+            // Case (a): no conflict — update source_id/target_id in-place,
+            // preserving the original edge UUID.
+            let affected = conn
+                .execute(
+                    "UPDATE graph_edges SET \
+                     source_id = ?1, target_id = ?2, relation = ?3, \
+                     weight = ?4, updated_at = ?5, metadata = ?6 \
+                     WHERE namespace = ?7 AND id = ?8",
+                    rusqlite::params![
+                        &canon_src_str,
+                        &canon_tgt_str,
+                        &relation_str,
+                        weight,
+                        now_ts,
+                        metadata,
+                        &ns,
+                        &edge_id_str,
+                    ],
+                )
+                .map_err(SqliteError::Rusqlite)?;
+            if affected == 0 {
+                // The edge row was not found under the record's namespace.
+                // This must never happen because ns = record_ns (fetched above).
+                return Err(SqliteError::InvalidData(format!(
+                    "update_edge: zero rows affected updating edge {edge_id_str} \
+                     in namespace {ns} — row vanished between fetch and update"
+                )));
+            }
+            Ok(None)
+        }
+    }
+
     /// Patch-style edge update. Only `Some(_)` fields are applied.
     ///
     /// When `relation` is `Some(new_rel)`, validates that the edge's existing endpoints
@@ -3769,103 +3870,61 @@ impl KhiveRuntime {
             let target_backend = edge.target_backend.clone();
 
             let pool = self.backend().pool_arc();
+            // ADR-067 Component A: route through the single-writer task when the
+            // write queue is enabled; best-effort lookup degrades to the legacy
+            // pool-mutex path (mirrors merge_entity/merge_note above).
+            let writer_task = pool.writer_task_handle().ok().flatten();
 
-            // spawn_blocking returns Some(surviving_id) when a canonical conflict was
-            // absorbed (the requested edge was deleted, existing canonical row refreshed),
-            // or None when the requested edge was updated in-place.
-            let surviving_id: Option<String> = tokio::task::spawn_blocking(move || {
-                let guard = pool.writer()?;
-                guard.transaction(|conn| {
-                    let now_ts = chrono::Utc::now().timestamp();
-
-                    // Check for a conflicting canonical row (same namespace + natural key,
-                    // different id). This catches conflicts whether or not endpoints were
-                    // flipped — Bug 2 fix.
-                    let conflict_id: Option<String> = conn
-                        .query_row(
-                            "SELECT id FROM graph_edges \
-                             WHERE namespace = ?1 AND source_id = ?2 AND target_id = ?3 \
-                             AND relation = ?4 AND id != ?5",
-                            rusqlite::params![
-                                &ns,
-                                &canon_src_str,
-                                &canon_tgt_str,
-                                &relation_str,
-                                &edge_id_str,
-                            ],
-                            |row| row.get(0),
+            // Some(surviving_id) when a canonical conflict was absorbed (the requested
+            // edge was deleted, existing canonical row refreshed), or None when the
+            // requested edge was updated in-place.
+            let surviving_id: Option<String> = if let Some(writer_task) = writer_task {
+                writer_task
+                    .send(move |conn| {
+                        Self::update_edge_symmetric_dml(
+                            conn,
+                            &ns,
+                            &edge_id_str,
+                            &canon_src_str,
+                            &canon_tgt_str,
+                            &relation_str,
+                            weight,
+                            metadata,
+                            target_backend,
                         )
-                        .optional()
-                        .map_err(SqliteError::Rusqlite)?;
-
-                    if let Some(existing_id) = conflict_id {
-                        // Case (b): canonical row already exists — delete the non-canonical
-                        // edge and refresh the existing canonical row. Return the surviving
-                        // id so the caller can re-fetch it (Bug 1 fix: do not return the
-                        // deleted edge's id).
-                        conn.execute(
-                            "DELETE FROM graph_edges WHERE namespace = ?1 AND id = ?2",
-                            rusqlite::params![&ns, &edge_id_str],
+                        .map_err(|e| {
+                            khive_storage::StorageError::driver(
+                                khive_storage::StorageCapability::Graph,
+                                "update_edge",
+                                e,
+                            )
+                        })
+                    })
+                    .await
+                    .map_err(RuntimeError::Storage)?
+            } else {
+                tokio::task::spawn_blocking(move || {
+                    let guard = pool.writer()?;
+                    guard.transaction(|conn| {
+                        Self::update_edge_symmetric_dml(
+                            conn,
+                            &ns,
+                            &edge_id_str,
+                            &canon_src_str,
+                            &canon_tgt_str,
+                            &relation_str,
+                            weight,
+                            metadata,
+                            target_backend,
                         )
-                        .map_err(SqliteError::Rusqlite)?;
-                        let affected = conn
-                            .execute(
-                                "UPDATE graph_edges SET \
-                                 weight = ?1, updated_at = ?2, deleted_at = NULL, \
-                                 target_backend = ?3, metadata = ?4 \
-                                 WHERE namespace = ?5 AND id = ?6",
-                                rusqlite::params![
-                                    weight,
-                                    now_ts,
-                                    target_backend,
-                                    metadata,
-                                    &ns,
-                                    &existing_id,
-                                ],
-                            )
-                            .map_err(SqliteError::Rusqlite)?;
-                        if affected == 0 {
-                            return Err(SqliteError::InvalidData(format!(
-                                "update_edge: surviving canonical row {existing_id} vanished during update"
-                            )));
-                        }
-                        Ok(Some(existing_id))
-                    } else {
-                        // Case (a): no conflict — update source_id/target_id in-place,
-                        // preserving the original edge UUID.
-                        let affected = conn
-                            .execute(
-                                "UPDATE graph_edges SET \
-                                 source_id = ?1, target_id = ?2, relation = ?3, \
-                                 weight = ?4, updated_at = ?5, metadata = ?6 \
-                                 WHERE namespace = ?7 AND id = ?8",
-                                rusqlite::params![
-                                    &canon_src_str,
-                                    &canon_tgt_str,
-                                    &relation_str,
-                                    weight,
-                                    now_ts,
-                                    metadata,
-                                    &ns,
-                                    &edge_id_str,
-                                ],
-                            )
-                            .map_err(SqliteError::Rusqlite)?;
-                        if affected == 0 {
-                            // The edge row was not found under the record's namespace.
-                            // This must never happen because ns = record_ns (fetched above).
-                            return Err(SqliteError::InvalidData(format!(
-                                "update_edge: zero rows affected updating edge {edge_id_str} \
-                                 in namespace {ns} — row vanished between fetch and update"
-                            )));
-                        }
-                        Ok(None)
-                    }
+                    })
                 })
-            })
-            .await
-            .map_err(|e| RuntimeError::Internal(format!("update_edge: spawn_blocking join: {e}")))?
-            .map_err(RuntimeError::Sqlite)?;
+                .await
+                .map_err(|e| {
+                    RuntimeError::Internal(format!("update_edge: spawn_blocking join: {e}"))
+                })?
+                .map_err(RuntimeError::Sqlite)?
+            };
 
             if let Some(sid) = surviving_id {
                 // A conflict was absorbed: re-fetch the surviving canonical row so the

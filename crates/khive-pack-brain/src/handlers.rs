@@ -837,7 +837,7 @@ impl BrainPack {
         let event_payload = json!({ "profile_id": profile_id, "lifecycle": lifecycle.clone() });
 
         crate::persist::persist_brain_state_mutation(
-            &self.runtime,
+            self.runtime.sql().as_ref(),
             token,
             &self.persistence,
             &self.state,
@@ -910,7 +910,7 @@ impl BrainPack {
         // applied to a proposed state copy and only takes effect after the
         // brain event-log append + snapshot upsert commit.
         crate::persist::persist_brain_state_mutation(
-            &self.runtime,
+            self.runtime.sql().as_ref(),
             token,
             &self.persistence,
             &self.state,
@@ -1176,6 +1176,15 @@ impl BrainPack {
             };
 
             let namespace = token.namespace().as_str().to_string();
+            // `apply_fold_gate_and_append_event`'s `build_event` closure is
+            // now required to be `'static` (ADR-067 Component A, Fork C
+            // slice 2 — it is boxed into an `AtomicUnitOp` and may run
+            // inside the writer task's `spawn_blocking`), so it must own
+            // its captures rather than borrow `namespace`/`base_data` — a
+            // separate `namespace_for_event` clone avoids conflicting with
+            // the `&namespace` borrow passed as this call's own argument.
+            let namespace_for_event = namespace.clone();
+            let base_data_for_event = base_data.clone();
             let outcome = crate::fold_gate::apply_fold_gate_and_append_event(
                 sql.as_ref(),
                 &namespace,
@@ -1184,8 +1193,8 @@ impl BrainPack {
                 gate_mode,
                 now_us,
                 dedup_key,
-                |fold_outcome, forced_zero| {
-                    let mut data = base_data.clone();
+                move |fold_outcome, forced_zero| {
+                    let mut data = base_data_for_event;
                     let (effective_weight, mass_before, mass_after) = match fold_outcome {
                         Some(o) => (o.effective_weight, o.mass_before, o.mass_after),
                         None => (0.0, 0.0, 0.0),
@@ -1198,7 +1207,7 @@ impl BrainPack {
                     });
                     let duration_us = feedback_start.elapsed().as_micros().max(1) as i64;
                     Event::new(
-                        namespace.clone(),
+                        namespace_for_event,
                         "brain.feedback",
                         khive_types::EventKind::FeedbackExplicit,
                         khive_types::SubstrateKind::Event,
@@ -1275,7 +1284,7 @@ impl BrainPack {
         // `self.state` is left completely untouched (no phantom in-memory
         // posterior update that vanishes on restart).
         crate::persist::persist_brain_state_mutation(
-            &self.runtime,
+            self.runtime.sql().as_ref(),
             token,
             &self.persistence,
             &self.state,
@@ -1609,7 +1618,7 @@ impl BrainPack {
         // change is applied to a proposed state copy and only takes effect
         // after the brain event-log append + snapshot upsert commit.
         crate::persist::persist_brain_state_mutation(
-            &self.runtime,
+            self.runtime.sql().as_ref(),
             token,
             &self.persistence,
             &self.state,
@@ -1703,7 +1712,7 @@ impl BrainPack {
         // removal is applied to a proposed state copy and only takes effect
         // after the brain event-log append + snapshot upsert commit.
         crate::persist::persist_brain_state_mutation(
-            &self.runtime,
+            self.runtime.sql().as_ref(),
             token,
             &self.persistence,
             &self.state,
@@ -1852,7 +1861,7 @@ impl BrainPack {
         // upsert commit — so a persistence failure never leaves a phantom
         // profile that vanishes on restart.
         crate::persist::persist_brain_state_mutation(
-            &self.runtime,
+            self.runtime.sql().as_ref(),
             token,
             &self.persistence,
             &self.state,

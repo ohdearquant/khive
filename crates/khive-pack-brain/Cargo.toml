@@ -50,6 +50,7 @@ khive-pack-kg = { version = "0.3.0", path = "../khive-pack-kg" }
 khive-pack-memory = { version = "0.3.0", path = "../khive-pack-memory" }
 criterion = { workspace = true }
 tempfile = { workspace = true }
+serial_test = { workspace = true }
 
 [[bench]]
 name = "brain_pack_bench"

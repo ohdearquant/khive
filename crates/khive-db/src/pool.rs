@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 
 use crate::error::SqliteError;
 use crate::writer_task::WriterTaskHandle;
+use khive_storage::error::StorageError;
 
 const CACHE_SIZE_KIB: &str = "-65536";
 const MMAP_SIZE_BYTES: &str = "1073741824";
@@ -415,41 +416,57 @@ impl ConnectionPool {
     /// connections that contend with each other at `BEGIN IMMEDIATE`,
     /// defeating the point of Component A.
     ///
-    /// Returns `None` if the flag is off, or if the writer task failed to
-    /// spawn (for example, an in-memory pool has no standalone-connection
-    /// support) — callers fall back to the legacy pool-mutex write path in
-    /// either case. A spawn failure is logged once here (at first access),
-    /// not once per store.
+    /// Returns `Ok(None)` if the flag is off, or if the writer task failed to
+    /// spawn for a reason other than a missing runtime (for example, an
+    /// in-memory pool has no standalone-connection support) — callers fall
+    /// back to the legacy pool-mutex write path in either case. A spawn
+    /// failure is logged once here (at first access), not once per store.
     ///
-    /// Must be called from within a Tokio runtime context on first access —
-    /// the initializing call may invoke `tokio::spawn` (via
-    /// `writer_task::spawn`). Every current caller (`SqlEntityStore::new`)
-    /// is reached only from async runtime paths (see the call-site audit in
-    /// ADR-067 slice 1's PR).
-    pub fn writer_task_handle(&self) -> Option<WriterTaskHandle> {
-        self.writer_task
+    /// Returns `Err(StorageError::WriterTaskNoRuntime)` instead of panicking
+    /// when `write_queue_enabled` is set but this is the first access and no
+    /// Tokio runtime is available on the calling thread (checked via
+    /// [`tokio::runtime::Handle::try_current`]) — spawning the writer task
+    /// requires `tokio::spawn`, which panics outside a runtime. Callers that
+    /// already treat a missing writer task as best-effort (construction-time
+    /// degrade to the legacy path, matching slice 1's documented policy) can
+    /// collapse this into `None` with `.ok().flatten()`; callers that need to
+    /// fail loud on a genuine misconfiguration (write queue requested but no
+    /// runtime to run it on) can propagate the `Err` directly.
+    pub fn writer_task_handle(&self) -> Result<Option<WriterTaskHandle>, StorageError> {
+        if !self.config.write_queue_enabled {
+            return Ok(None);
+        }
+        // Fast path: already resolved (spawned, degraded, or off) by an
+        // earlier call — no need to re-check the runtime.
+        if let Some(existing) = self.writer_task.get() {
+            return Ok(existing.clone());
+        }
+        // Not yet initialized and the flag is on: spawning requires
+        // `tokio::spawn`, which panics outside a runtime context. Check
+        // first and fail loud with a typed error instead.
+        if tokio::runtime::Handle::try_current().is_err() {
+            return Err(StorageError::WriterTaskNoRuntime);
+        }
+        Ok(self
+            .writer_task
             .get_or_init(|| {
                 #[cfg(test)]
                 self.writer_task_spawn_count
                     .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
-                if self.config.write_queue_enabled {
-                    match crate::writer_task::spawn(self, self.config.write_queue_capacity) {
-                        Ok(handle) => Some(handle),
-                        Err(e) => {
-                            tracing::warn!(
-                                error = %e,
-                                "KHIVE_WRITE_QUEUE=1 but the writer task failed to spawn; \
-                                 writes fall back to the pool-mutex path"
-                            );
-                            None
-                        }
+                match crate::writer_task::spawn(self, self.config.write_queue_capacity) {
+                    Ok(handle) => Some(handle),
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            "KHIVE_WRITE_QUEUE=1 but the writer task failed to spawn; \
+                             writes fall back to the pool-mutex path"
+                        );
+                        None
                     }
-                } else {
-                    None
                 }
             })
-            .clone()
+            .clone())
     }
 
     /// Test-only: how many times the writer-task init closure actually ran.
@@ -915,6 +932,41 @@ mod tests {
                 .iter()
                 .any(|(_, label)| label.as_deref() == Some("writer_guard_tx")),
             "expected the entry to be gone after the transaction completes"
+        );
+    }
+
+    /// ADR-067 Component A runtime-handle guard: `write_queue_enabled` is set
+    /// but the calling thread has no Tokio runtime context, so spawning the
+    /// writer task (which requires `tokio::spawn`) is impossible.
+    /// `writer_task_handle` must return a clean typed error instead of
+    /// panicking.
+    ///
+    /// Deliberately a plain `#[test]` (no Tokio runtime) — mirrors
+    /// `writer_task::spawn_fails_on_in_memory_pool`'s shape: the failure must
+    /// be observable without ever entering an async context, since entering
+    /// one here would defeat the point of the test.
+    #[test]
+    fn writer_task_handle_fails_loud_without_tokio_runtime() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("writer_task_no_runtime.db");
+        let cfg = PoolConfig {
+            path: Some(path),
+            write_queue_enabled: true,
+            ..PoolConfig::default()
+        };
+        let pool = ConnectionPool::new(cfg).expect("file-backed pool should open");
+
+        let result = pool.writer_task_handle();
+
+        assert!(
+            matches!(result, Err(StorageError::WriterTaskNoRuntime)),
+            "expected Err(StorageError::WriterTaskNoRuntime) outside a Tokio \
+             runtime, got {result:?}"
+        );
+        assert_eq!(
+            pool.writer_task_spawn_count(),
+            0,
+            "the guard must reject before ever attempting tokio::spawn"
         );
     }
 }

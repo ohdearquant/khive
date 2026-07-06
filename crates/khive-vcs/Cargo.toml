@@ -26,3 +26,4 @@ tempfile = { workspace = true }
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "macros"] }
 khive-vcs-adapters = { version = "0.3.0", path = "../khive-vcs-adapters" }
+khive-db = { version = "0.3.0", path = "../khive-db" }

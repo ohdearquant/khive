@@ -17,6 +17,7 @@ use khive_types::SubstrateKind;
 
 use crate::error::SqliteError;
 use crate::pool::ConnectionPool;
+use crate::writer_task::WriterTaskHandle;
 
 fn map_err(e: rusqlite::Error, op: &'static str) -> StorageError {
     StorageError::driver(StorageCapability::Sparse, op, e)
@@ -82,6 +83,93 @@ fn f32_slice_as_bytes(data: &[f32]) -> &[u8] {
     unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, std::mem::size_of_val(data)) }
 }
 
+/// DML-only batch insert loop shared by both the legacy (flag-off) and
+/// WriterTask-routed (flag-on) `insert_sparse_batch` paths (ADR-067
+/// Component A).
+///
+/// Issues no `BEGIN` / `COMMIT` / `ROLLBACK` itself — the caller owns the
+/// enclosing transaction. Per-row failures (validation or SQL) are captured
+/// into `BatchWriteSummary::failed`/`first_error` rather than aborting the
+/// loop, matching the existing partial-success contract.
+fn batch_insert_sparse_dml(
+    conn: &rusqlite::Connection,
+    table: &str,
+    records: &[SparseRecord],
+    attempted: u64,
+) -> Result<BatchWriteSummary, rusqlite::Error> {
+    let sql = format!(
+        "INSERT INTO {table} \
+         (subject_id, namespace, kind, field, indices_json, values_blob, updated_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
+         ON CONFLICT(subject_id, namespace, field) DO UPDATE SET \
+         indices_json = excluded.indices_json, \
+         values_blob = excluded.values_blob, \
+         updated_at = excluded.updated_at"
+    );
+
+    let mut affected = 0u64;
+    let mut failed = 0u64;
+    let mut first_error = String::new();
+
+    for record in records {
+        // Validate inline — skip invalid records rather than aborting the batch.
+        if record.vector.indices.len() != record.vector.values.len()
+            || record.vector.indices.is_empty()
+            || record.vector.values.iter().any(|v| !v.is_finite())
+            || record.vector.indices.windows(2).any(|w| w[0] >= w[1])
+        {
+            if first_error.is_empty() {
+                first_error = format!("invalid sparse vector for subject {}", record.subject_id);
+            }
+            failed += 1;
+            continue;
+        }
+
+        let indices_json = match serde_json::to_string(&record.vector.indices) {
+            Ok(j) => j,
+            Err(e) => {
+                if first_error.is_empty() {
+                    first_error = e.to_string();
+                }
+                failed += 1;
+                continue;
+            }
+        };
+        let values_blob = f32_slice_as_bytes(&record.vector.values);
+        let now = record.updated_at.timestamp();
+        let id_str = record.subject_id.to_string();
+        let kind_str = record.kind.to_string();
+
+        match conn.execute(
+            &sql,
+            rusqlite::params![
+                &id_str,
+                &record.namespace,
+                &kind_str,
+                &record.field,
+                &indices_json,
+                values_blob,
+                now
+            ],
+        ) {
+            Ok(_) => affected += 1,
+            Err(e) => {
+                if first_error.is_empty() {
+                    first_error = e.to_string();
+                }
+                failed += 1;
+            }
+        }
+    }
+
+    Ok(BatchWriteSummary {
+        attempted,
+        affected,
+        failed,
+        first_error,
+    })
+}
+
 /// Create the sparse table and its index for the given model_key.
 pub(crate) fn ensure_sparse_schema(
     conn: &rusqlite::Connection,
@@ -111,6 +199,7 @@ pub struct SqliteSparseStore {
     is_file_backed: bool,
     table_name: String,
     namespace: String,
+    writer_task: Option<WriterTaskHandle>,
 }
 
 impl SqliteSparseStore {
@@ -122,19 +211,43 @@ impl SqliteSparseStore {
         namespace: String,
     ) -> Result<Self, SqliteError> {
         let table_name = format!("sparse_{}", model_key);
+        // Best-effort opt-in (ADR-067 Component A, mirrors entity.rs slice 1
+        // policy): a missing writer task degrades to the legacy pool-mutex
+        // path rather than failing construction.
+        let writer_task = pool.writer_task_handle().ok().flatten();
         Ok(Self {
             pool,
             is_file_backed,
             table_name,
             namespace,
+            writer_task,
         })
     }
 
+    /// Route a single-row write through the pool-wide `WriterTask` when
+    /// `KHIVE_WRITE_QUEUE=1` and a handle is available; otherwise fall back
+    /// to the legacy pool-mutex path (ADR-067 Component A, Fork C slice 2).
+    ///
+    /// This is the ONE routing point for every `with_writer` caller in this
+    /// store (`upsert_sparse_vector`, `delete_sparse_subject`). `f` must be
+    /// DML-only — on the flag-on path it runs inside the WriterTask's own
+    /// transaction, so a bare `BEGIN IMMEDIATE` would violate SQLite's
+    /// nested-transaction rule. `insert_sparse_batch` (the batch method)
+    /// does its own flag check and returns early on `Some`, so its
+    /// fallback call into this helper only ever executes on the flag-off
+    /// path (`self.writer_task` is `None` by construction whenever that
+    /// call is reached) — no double-routing.
     async fn with_writer<F, R>(&self, op: &'static str, f: F) -> Result<R, StorageError>
     where
         F: FnOnce(&rusqlite::Connection) -> Result<R, rusqlite::Error> + Send + 'static,
         R: Send + 'static,
     {
+        if let Some(writer_task) = &self.writer_task {
+            return writer_task
+                .send(move |conn| f(conn).map_err(|e| map_err(e, op)))
+                .await;
+        }
+
         let pool = Arc::clone(&self.pool);
         tokio::task::spawn_blocking(move || {
             let guard = pool.try_writer().map_err(|e| map_sqlite_err(e, op))?;
@@ -235,83 +348,31 @@ impl SqliteSparseStore {
         let table = self.table_name.clone();
         let attempted = records.len() as u64;
 
-        self.with_writer("sparse_insert_batch", move |conn| {
-            let sql = format!(
-                "INSERT INTO {table} \
-                 (subject_id, namespace, kind, field, indices_json, values_blob, updated_at) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
-                 ON CONFLICT(subject_id, namespace, field) DO UPDATE SET \
-                 indices_json = excluded.indices_json, \
-                 values_blob = excluded.values_blob, \
-                 updated_at = excluded.updated_at"
-            );
+        // ADR-067 Component A: when the write queue is enabled, route
+        // through the pool-wide WriterTask. DML-only closure — no BEGIN
+        // IMMEDIATE/COMMIT/ROLLBACK here, since the WriterTask's run loop
+        // owns the transaction.
+        if let Some(writer_task) = &self.writer_task {
+            let table2 = table.clone();
+            return writer_task
+                .send(move |conn| {
+                    batch_insert_sparse_dml(conn, &table2, &records, attempted)
+                        .map_err(|e| map_err(e, "sparse_insert_batch"))
+                })
+                .await;
+        }
 
+        // Flag-off (default) path: byte-for-byte unchanged from pre-ADR-067
+        // behavior — the closure owns its own BEGIN IMMEDIATE/COMMIT.
+        self.with_writer("sparse_insert_batch", move |conn| {
             conn.execute_batch("BEGIN IMMEDIATE")?;
             let _tx_handle =
                 khive_storage::tx_registry::register(Some("sparse_insert_batch".to_string()));
-            let mut affected = 0u64;
-            let mut failed = 0u64;
-            let mut first_error = String::new();
 
-            for record in &records {
-                // Validate inline — skip invalid records rather than aborting the batch.
-                if record.vector.indices.len() != record.vector.values.len()
-                    || record.vector.indices.is_empty()
-                    || record.vector.values.iter().any(|v| !v.is_finite())
-                    || record.vector.indices.windows(2).any(|w| w[0] >= w[1])
-                {
-                    if first_error.is_empty() {
-                        first_error =
-                            format!("invalid sparse vector for subject {}", record.subject_id);
-                    }
-                    failed += 1;
-                    continue;
-                }
-
-                let indices_json = match serde_json::to_string(&record.vector.indices) {
-                    Ok(j) => j,
-                    Err(e) => {
-                        if first_error.is_empty() {
-                            first_error = e.to_string();
-                        }
-                        failed += 1;
-                        continue;
-                    }
-                };
-                let values_blob = f32_slice_as_bytes(&record.vector.values);
-                let now = record.updated_at.timestamp();
-                let id_str = record.subject_id.to_string();
-                let kind_str = record.kind.to_string();
-
-                match conn.execute(
-                    &sql,
-                    rusqlite::params![
-                        &id_str,
-                        &record.namespace,
-                        &kind_str,
-                        &record.field,
-                        &indices_json,
-                        values_blob,
-                        now
-                    ],
-                ) {
-                    Ok(_) => affected += 1,
-                    Err(e) => {
-                        if first_error.is_empty() {
-                            first_error = e.to_string();
-                        }
-                        failed += 1;
-                    }
-                }
-            }
+            let summary = batch_insert_sparse_dml(conn, &table, &records, attempted)?;
 
             conn.execute_batch("COMMIT")?;
-            Ok(BatchWriteSummary {
-                attempted,
-                affected,
-                failed,
-                first_error,
-            })
+            Ok(summary)
         })
         .await
     }
@@ -882,5 +943,76 @@ mod tests {
         assert_eq!(summary.affected, 2);
         assert_eq!(summary.failed, 0);
         assert_eq!(store.count().await.unwrap(), 2);
+    }
+
+    /// ADR-067 Component A entry 6: with `KHIVE_WRITE_QUEUE=1`, `insert_batch`
+    /// (delegating to `insert_sparse_batch`) routes through the WriterTask
+    /// channel instead of the pool-mutex path, and both rows are actually
+    /// committed and independently searchable back.
+    ///
+    /// Constructed via a `PoolConfig` literal (`write_queue_enabled: true`),
+    /// not the `KHIVE_WRITE_QUEUE` env var — that env var is process-global
+    /// and this crate's other tests are NOT `#[serial]` against it, so a
+    /// window where it is set here could leak into a
+    /// concurrently-scheduled test's own pool construction (ADR-067 Fork C
+    /// slice 2 round 2, LOW finding).
+    #[tokio::test]
+    async fn insert_batch_routes_through_writer_task_when_flag_enabled() {
+        use chrono::Utc;
+        use khive_types::SubstrateKind;
+
+        let model_key = "write_queue_flag_test";
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("write_queue_sparse.db");
+        let pool_cfg = PoolConfig {
+            path: Some(path.clone()),
+            write_queue_enabled: true,
+            ..PoolConfig::default()
+        };
+        let pool = Arc::new(ConnectionPool::new(pool_cfg).expect("pool"));
+        {
+            let writer = pool.writer().expect("writer");
+            ensure_sparse_schema(writer.conn(), model_key).expect("schema");
+        }
+
+        let store = SqliteSparseStore::new(
+            Arc::clone(&pool),
+            true,
+            model_key.to_string(),
+            "ns:test".to_string(),
+        )
+        .expect("store");
+
+        let id1 = Uuid::new_v4();
+        let id2 = Uuid::new_v4();
+        let records = vec![
+            SparseRecord {
+                subject_id: id1,
+                kind: SubstrateKind::Entity,
+                namespace: "ns:test".into(),
+                field: "body".into(),
+                vector: sv(vec![0, 3], vec![0.5, 0.8]),
+                updated_at: Utc::now(),
+            },
+            SparseRecord {
+                subject_id: id2,
+                kind: SubstrateKind::Entity,
+                namespace: "ns:test".into(),
+                field: "body".into(),
+                vector: sv(vec![1], vec![1.0]),
+                updated_at: Utc::now(),
+            },
+        ];
+
+        let summary = store.insert_batch(records).await.unwrap();
+        assert_eq!(summary.attempted, 2);
+        assert_eq!(summary.affected, 2);
+        assert_eq!(summary.failed, 0);
+        assert_eq!(store.count().await.unwrap(), 2);
+        assert_eq!(
+            pool.writer_task_spawn_count(),
+            1,
+            "the flag-ON path must actually spawn and use the writer task"
+        );
     }
 }
