@@ -558,6 +558,13 @@ impl VerbRegistryBuilder {
         validate_unique_note_kinds(&ordered_packs)?;
         validate_unique_verb_names(&ordered_packs)?;
 
+        let available_verbs: Vec<&'static str> = ordered_packs
+            .iter()
+            .flat_map(|p| p.handlers().iter())
+            .filter(|h| matches!(h.visibility, Visibility::Verb))
+            .map(|h| h.name)
+            .collect();
+
         Ok(VerbRegistry {
             packs: Arc::new(ordered_packs),
             resolvers: Arc::new(self.resolvers),
@@ -567,6 +574,7 @@ impl VerbRegistryBuilder {
             actor_id: self.actor_id,
             event_store: self.event_store,
             dispatch_hook: self.dispatch_hook,
+            available_verbs: Arc::new(available_verbs),
         })
     }
 }
@@ -709,6 +717,11 @@ pub struct VerbRegistry {
     event_store: Option<Arc<dyn EventStore>>,
     /// Post-dispatch hook — `None` means no real-time observation (Issue #158).
     dispatch_hook: Option<Arc<dyn DispatchHook>>,
+    /// Names of all `Visibility::Verb` handlers across all packs, precomputed
+    /// once at `build()` time. Used only to render the unknown-verb error
+    /// message — the pack set is fixed after construction, so there is no
+    /// need to re-scan every pack's handlers on every miss.
+    available_verbs: Arc<Vec<&'static str>>,
 }
 
 /// Per-request identity context that overrides a [`VerbRegistry`]'s
@@ -883,18 +896,12 @@ impl VerbRegistry {
                 }
             }
         }
-        // Only list Verb-visibility handlers so internal subhandlers are not
-        // advertised in the unknown-verb error (ue-help-introspection C1 / internal review High).
-        let available: Vec<&str> = self
-            .packs
-            .iter()
-            .flat_map(|p| p.handlers().iter())
-            .filter(|h| matches!(h.visibility, Visibility::Verb))
-            .map(|h| h.name)
-            .collect();
+        // Verb-visibility handler names, precomputed at build() time (internal
+        // subhandlers are excluded so they are not advertised in the
+        // unknown-verb error — ue-help-introspection C1 / internal review High).
         Err(RuntimeError::InvalidInput(format!(
             "unknown verb {verb:?}; available: {}",
-            available.join(", ")
+            self.available_verbs.join(", ")
         )))
     }
 
@@ -1189,18 +1196,12 @@ impl VerbRegistry {
                 return result;
             }
         }
-        // Only list Verb-visibility handlers so internal subhandlers are not
-        // advertised in the unknown-verb error (ue-help-introspection C1 / internal review High).
-        let available: Vec<&str> = self
-            .packs
-            .iter()
-            .flat_map(|p| p.handlers().iter())
-            .filter(|h| matches!(h.visibility, Visibility::Verb))
-            .map(|h| h.name)
-            .collect();
+        // Verb-visibility handler names, precomputed at build() time (internal
+        // subhandlers are excluded so they are not advertised in the
+        // unknown-verb error — ue-help-introspection C1 / internal review High).
         Err(RuntimeError::InvalidInput(format!(
             "unknown verb {verb:?}; available: {}",
-            available.join(", ")
+            self.available_verbs.join(", ")
         )))
     }
 

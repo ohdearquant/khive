@@ -922,54 +922,52 @@ pub async fn forward_or_spawn(frame: &DaemonRequestFrame) -> Option<Result<Strin
             // spawned daemon process start.
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
-            let sock = socket_path();
+            // The connect attempt inside `try_forward_inner` doubles as the
+            // readiness check — a `NoSocket` outcome here just means "not
+            // listening yet", so keep retrying instead of probing a separate
+            // throwaway connection first.
             let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
-            while tokio::time::Instant::now() < deadline {
-                if UnixStream::connect(&sock).await.is_ok() {
-                    return match try_forward_inner(frame).await {
-                        ForwardOutcome::Response(resp) => {
-                            map_response(resp, &frame.config_id, &frame.namespace)
-                        }
-                        ForwardOutcome::ParseFailure => {
-                            tracing::warn!(
-                                "freshly spawned daemon also returned an undecodable response; \
-                                 falling back to local dispatch"
-                            );
-                            record_fallback(
-                                FallbackReason::ParseFailure,
-                                &frame.config_id,
-                                None,
-                                &frame.namespace,
-                            );
-                            None
-                        }
-                        ForwardOutcome::ProtocolMismatch => Some(Err(McpError::internal_error(
+            loop {
+                if tokio::time::Instant::now() >= deadline {
+                    record_fallback(
+                        FallbackReason::NoSocket,
+                        &frame.config_id,
+                        None,
+                        &frame.namespace,
+                    );
+                    return None;
+                }
+                match try_forward_inner(frame).await {
+                    ForwardOutcome::Response(resp) => {
+                        return map_response(resp, &frame.config_id, &frame.namespace)
+                    }
+                    ForwardOutcome::ParseFailure => {
+                        tracing::warn!(
+                            "freshly spawned daemon also returned an undecodable response; \
+                             falling back to local dispatch"
+                        );
+                        record_fallback(
+                            FallbackReason::ParseFailure,
+                            &frame.config_id,
+                            None,
+                            &frame.namespace,
+                        );
+                        return None;
+                    }
+                    ForwardOutcome::ProtocolMismatch => {
+                        return Some(Err(McpError::internal_error(
                             format!(
                                 "daemon protocol mismatch: expected version {PROTOCOL_VERSION}; \
                                      run `make local` to rebuild the daemon binary"
                             ),
                             None,
-                        ))),
-                        ForwardOutcome::NoSocket => {
-                            record_fallback(
-                                FallbackReason::NoSocket,
-                                &frame.config_id,
-                                None,
-                                &frame.namespace,
-                            );
-                            None
-                        }
-                    };
+                        )));
+                    }
+                    ForwardOutcome::NoSocket => {
+                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    }
                 }
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             }
-            record_fallback(
-                FallbackReason::NoSocket,
-                &frame.config_id,
-                None,
-                &frame.namespace,
-            );
-            return None;
         }
         ForwardOutcome::ProtocolMismatch => {
             // The response was decodable but `daemon_protocol_version` does not
@@ -1009,45 +1007,40 @@ pub async fn forward_or_spawn(frame: &DaemonRequestFrame) -> Option<Result<Strin
             }
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
-            let sock = socket_path();
+            // See the ParseFailure branch above: `try_forward_inner`'s own
+            // connect attempt is the readiness signal, so a `NoSocket` outcome
+            // here just retries rather than probing a separate connection.
             let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
             loop {
                 if tokio::time::Instant::now() >= deadline {
-                    break;
+                    return Some(Err(McpError::internal_error(
+                        format!(
+                            "daemon protocol mismatch: expected version {PROTOCOL_VERSION}; \
+                             respawned daemon did not become ready within 5s — \
+                             run `make local` to rebuild the daemon binary"
+                        ),
+                        None,
+                    )));
                 }
-                if UnixStream::connect(&sock).await.is_ok() {
-                    return match try_forward_inner(frame).await {
-                        ForwardOutcome::Response(resp) => map_response(resp, &frame.config_id, &frame.namespace),
-                        ForwardOutcome::ProtocolMismatch | ForwardOutcome::ParseFailure => {
-                            Some(Err(McpError::internal_error(
-                                format!(
-                                    "daemon protocol mismatch: expected version {PROTOCOL_VERSION}; \
-                                     respawned daemon still reports wrong version — \
-                                     run `make local` to rebuild the daemon binary"
-                                ),
-                                None,
-                            )))
-                        }
-                        ForwardOutcome::NoSocket => Some(Err(McpError::internal_error(
+                match try_forward_inner(frame).await {
+                    ForwardOutcome::Response(resp) => {
+                        return map_response(resp, &frame.config_id, &frame.namespace)
+                    }
+                    ForwardOutcome::ProtocolMismatch | ForwardOutcome::ParseFailure => {
+                        return Some(Err(McpError::internal_error(
                             format!(
                                 "daemon protocol mismatch: expected version {PROTOCOL_VERSION}; \
-                                 respawned daemon did not accept connections — \
+                                 respawned daemon still reports wrong version — \
                                  run `make local` to rebuild the daemon binary"
                             ),
                             None,
-                        ))),
-                    };
+                        )));
+                    }
+                    ForwardOutcome::NoSocket => {
+                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    }
                 }
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             }
-            return Some(Err(McpError::internal_error(
-                format!(
-                    "daemon protocol mismatch: expected version {PROTOCOL_VERSION}; \
-                     respawned daemon did not become ready within 5s — \
-                     run `make local` to rebuild the daemon binary"
-                ),
-                None,
-            )));
         }
     }
 
@@ -1062,54 +1055,48 @@ pub async fn forward_or_spawn(frame: &DaemonRequestFrame) -> Option<Result<Strin
         return None;
     }
 
-    let sock = socket_path();
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
-    while tokio::time::Instant::now() < deadline {
-        if UnixStream::connect(&sock).await.is_ok() {
-            return match try_forward_inner(frame).await {
-                ForwardOutcome::Response(resp) => {
-                    map_response(resp, &frame.config_id, &frame.namespace)
-                }
-                ForwardOutcome::ParseFailure => {
-                    tracing::warn!(
-                        "freshly spawned daemon also returned an undecodable response; \
-                         falling back to local dispatch"
-                    );
-                    record_fallback(
-                        FallbackReason::ParseFailure,
-                        &frame.config_id,
-                        None,
-                        &frame.namespace,
-                    );
-                    None
-                }
-                ForwardOutcome::ProtocolMismatch => Some(Err(McpError::internal_error(
+    loop {
+        if tokio::time::Instant::now() >= deadline {
+            record_fallback(
+                FallbackReason::NoSocket,
+                &frame.config_id,
+                None,
+                &frame.namespace,
+            );
+            return None;
+        }
+        match try_forward_inner(frame).await {
+            ForwardOutcome::Response(resp) => {
+                return map_response(resp, &frame.config_id, &frame.namespace)
+            }
+            ForwardOutcome::ParseFailure => {
+                tracing::warn!(
+                    "freshly spawned daemon also returned an undecodable response; \
+                     falling back to local dispatch"
+                );
+                record_fallback(
+                    FallbackReason::ParseFailure,
+                    &frame.config_id,
+                    None,
+                    &frame.namespace,
+                );
+                return None;
+            }
+            ForwardOutcome::ProtocolMismatch => {
+                return Some(Err(McpError::internal_error(
                     format!(
                         "daemon protocol mismatch: expected version {PROTOCOL_VERSION}; \
                          run `make local` to rebuild the daemon binary"
                     ),
                     None,
-                ))),
-                ForwardOutcome::NoSocket => {
-                    record_fallback(
-                        FallbackReason::NoSocket,
-                        &frame.config_id,
-                        None,
-                        &frame.namespace,
-                    );
-                    None
-                }
-            };
+                )));
+            }
+            ForwardOutcome::NoSocket => {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
         }
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
-    record_fallback(
-        FallbackReason::NoSocket,
-        &frame.config_id,
-        None,
-        &frame.namespace,
-    );
-    None
 }
 
 // ── tests ─────────────────────────────────────────────────────────────────────
@@ -3254,6 +3241,111 @@ mod tests {
         );
 
         clear_daemon_env();
+    }
+
+    // ── respawn readiness makes exactly one connect per attempt (regression) ──
+    //
+    // The post-respawn readiness wait used to open a throwaway `UnixStream::connect`
+    // purely to check whether the socket was accepting yet, then immediately
+    // discard it and open a SECOND connection via `try_forward_inner` for the
+    // real request. This test binds the "freshly respawned daemon" only after a
+    // short delay and counts how many connections it accepts: the readiness wait
+    // must converge on exactly one connect (the real forward itself doubling as
+    // the readiness signal), not two.
+
+    #[tokio::test]
+    #[serial]
+    async fn respawn_readiness_uses_single_connect_per_forward_attempt() {
+        clear_daemon_env();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sock = dir.path().join("khived.sock");
+        let pid_file = dir.path().join("khived.pid");
+        let lock_file = dir.path().join("khived.recovery.lock");
+
+        let config_id = "packs=[kg];db=:memory:;embed=none;extra=[];backend=main";
+
+        // Stale daemon: accepts one connection, reads the request, then drops
+        // without responding — forces the first try_forward_inner to see
+        // ParseFailure and enter the kill+respawn recovery path.
+        let stale_listener = tokio::net::UnixListener::bind(&sock).expect("bind stale socket");
+        let stale_handle = tokio::spawn(serve_crash_on_dispatch(stale_listener));
+
+        // The PID on file does not belong to a khive daemon (it's this test
+        // process), so kill_stale_daemon_inner skips SIGTERM but still unlinks
+        // the stale socket path, clearing the way for the "fresh daemon" bind below.
+        std::fs::write(&pid_file, std::process::id().to_string()).expect("write pid file");
+
+        std::env::set_var("KHIVE_SOCKET", &sock);
+        std::env::set_var("KHIVE_PID", &pid_file);
+        std::env::set_var("KHIVE_LOCK", &lock_file);
+        std::env::remove_var("KHIVE_NO_DAEMON");
+
+        // Simulates the freshly-respawned daemon binding the same socket path
+        // shortly after the stale one is killed. Counts every accepted
+        // connection — the regression this test guards against is a readiness
+        // probe pushing that count above 1.
+        let connect_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let connect_count_srv = connect_count.clone();
+        let resp = frame_ok("stats-result");
+        let fresh_sock = sock.clone();
+        let fresh_handle = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            let listener =
+                tokio::net::UnixListener::bind(&fresh_sock).expect("bind fresh daemon socket");
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                connect_count_srv.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if read_frame(&mut stream).await.is_ok() {
+                    if let Ok(payload) = serde_json::to_vec(&resp) {
+                        let _ = write_frame(&mut stream, &payload).await;
+                    }
+                    break;
+                }
+                // A bare connect-and-drop (no frame) would be exactly the
+                // throwaway readiness probe this fix removes — keep accepting
+                // so a regression shows up as connect_count > 1 rather than a hang.
+            }
+        });
+
+        let frame = DaemonRequestFrame {
+            ops: "stats()".to_string(),
+            presentation: None,
+            presentation_per_op: None,
+            namespace: "test".to_string(),
+            actor_id: None,
+            visible_namespaces: Vec::new(),
+            config_id: config_id.to_string(),
+            protocol_version: PROTOCOL_VERSION,
+            probe_only: false,
+            metrics_only: false,
+            format: None,
+            format_per_op: None,
+            from_wire: false,
+        };
+
+        let result = forward_or_spawn(&frame).await;
+
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), stale_handle).await;
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), fresh_handle).await;
+
+        match result {
+            Some(Ok(v)) => assert_eq!(v, "stats-result"),
+            other => {
+                panic!("expected Some(Ok(..)) from the freshly respawned daemon, got {other:?}")
+            }
+        }
+
+        assert_eq!(
+            connect_count.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the readiness wait must not open a throwaway connection before the real \
+             forward — exactly one connect should reach the freshly spawned daemon"
+        );
+
+        clear_daemon_env();
+        std::env::remove_var("KHIVE_LOCK");
     }
 
     // ── daemon stderr log-file helpers (no process spawned) ───────────────────
