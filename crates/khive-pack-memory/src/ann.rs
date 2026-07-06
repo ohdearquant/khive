@@ -8,6 +8,7 @@ use std::sync::Arc;
 
 use khive_runtime::{KhiveRuntime, Namespace, NamespaceToken, RuntimeError};
 use khive_storage::types::{SqlStatement, SqlValue};
+use khive_storage::StorageError;
 use khive_vamana::{CorpusFingerprint, VamanaConfig, VamanaIndex, VamanaSnapshot};
 use tokio::sync::{Mutex, RwLock};
 use uuid::Uuid;
@@ -257,6 +258,24 @@ pub(crate) async fn invalidate_namespace(rt: &KhiveRuntime, ann: &SharedAnn, _na
     invalidate_snapshots(rt).await;
 }
 
+/// True when `err` is the direct result of a `spawn_blocking` cancellation —
+/// e.g. a short-lived process (or daemon shutdown) tearing the runtime down
+/// mid-build — rather than a genuine backend/driver failure.
+///
+/// Matches the concrete `tokio::task::JoinError` boxed inside
+/// `StorageError::Driver` (the shape `with_reader`/`with_writer` produce when
+/// their `spawn_blocking(...).await` is cut short) via a typed downcast, not
+/// a message substring, so a real `vec_count`/SQL driver error is never
+/// misclassified as benign.
+fn is_benign_shutdown_cancellation(err: &RuntimeError) -> bool {
+    let RuntimeError::Storage(StorageError::Driver { source, .. }) = err else {
+        return false;
+    };
+    source
+        .downcast_ref::<tokio::task::JoinError>()
+        .is_some_and(tokio::task::JoinError::is_cancelled)
+}
+
 /// Fire-once per-model background warm. Returns `true` if a new task was started.
 pub(crate) async fn ensure_ann_background(
     rt: &KhiveRuntime,
@@ -286,11 +305,23 @@ pub(crate) async fn ensure_ann_background(
     let rt = rt.clone();
     let ann = ann.clone();
     let model = model.to_owned();
-    tokio::spawn(async move {
+    // Tracked, not a bare tokio::spawn, so daemon shutdown's drain() waits for
+    // an in-flight remember-path warm instead of a SIGTERM (or a short-lived
+    // `kkernel exec` process exiting) aborting it mid-build — same rationale
+    // as recall.rs's serve-ledger append (internal review PR #583 round-1
+    // Medium). The caller still only pays for the enqueue; the build itself
+    // runs fully off the response path, unawaited.
+    khive_runtime::track_background_task(async move {
         if let Ok(token) = rt.authorize(Namespace::local()) {
             match ensure_ann_for_model(&rt, &token, &ann, &model).await {
                 Ok(status) => {
                     tracing::debug!(?status, model = %model, "memory ANN background warm complete");
+                }
+                Err(e) if is_benign_shutdown_cancellation(&e) => {
+                    // Expected on a short-lived process: the build's
+                    // spawn_blocking was cancelled by runtime teardown, not a
+                    // backend failure — don't alarm on it.
+                    tracing::debug!(error = %e, model = %model, "memory ANN background warm cancelled at shutdown");
                 }
                 Err(e) => {
                     tracing::warn!(error = %e, model = %model, "memory ANN background build failed");
@@ -403,6 +434,15 @@ pub(crate) async fn ensure_ann_for_model(
             tracing::debug!(namespace = %ns, model = %model, "memory ANN: no note vectors to build");
             Ok(AnnEnsureStatus::EmptyCorpus)
         }
+        Err(e) if is_benign_shutdown_cancellation(&e) => {
+            // Same benign-cancellation case as ensure_ann_background's own
+            // classification below: this arm fires first (before the error
+            // propagates to the background-warm caller), so it must be
+            // downgraded here too or a cancelled background warm still logs
+            // one WARN line from this site alone.
+            tracing::debug!(error = %e, namespace = %ns, model = %model, "memory ANN build cancelled at shutdown");
+            Err(e)
+        }
         Err(e) => {
             tracing::warn!(error = %e, namespace = %ns, model = %model, "memory ANN build failed");
             Err(e)
@@ -498,10 +538,12 @@ async fn load_and_build_from_vector_store(
         Ok(s) => s,
         Err(_) => return Ok(None),
     };
-    let info = store
-        .info()
-        .await
-        .map_err(|e| RuntimeError::Internal(e.to_string()))?;
+    // Plain `?` (not `.map_err(RuntimeError::Internal(e.to_string()))`) so the
+    // typed `StorageError` — and, when a background warm's spawn_blocking is
+    // cancelled at shutdown, the `tokio::task::JoinError` boxed inside it —
+    // survives to `is_benign_shutdown_cancellation`'s downcast instead of
+    // being collapsed into an opaque string.
+    let info = store.info().await?;
     if info.dimensions == 0 {
         return Ok(None);
     }
@@ -511,10 +553,7 @@ async fn load_and_build_from_vector_store(
     let table_name = format!("vec_{model_key}");
 
     let sql = rt.sql();
-    let mut reader = sql
-        .reader()
-        .await
-        .map_err(|e| RuntimeError::Internal(e.to_string()))?;
+    let mut reader = sql.reader().await?;
 
     let rows = reader
         .query_all(SqlStatement {
@@ -529,8 +568,7 @@ async fn load_and_build_from_vector_store(
             params: vec![SqlValue::Text(model.to_owned())],
             label: Some("memory_ann_corpus_scan".into()),
         })
-        .await
-        .map_err(|e| RuntimeError::Internal(e.to_string()))?;
+        .await?;
 
     if rows.is_empty() {
         return Ok(None);
@@ -707,6 +745,7 @@ async fn invalidate_snapshots(rt: &KhiveRuntime) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
 
     #[test]
     fn ann_key_is_model_only() {
@@ -809,5 +848,124 @@ mod tests {
             ann.warming.lock().await.is_empty(),
             "all warming guards must be cleared after invalidation"
         );
+    }
+
+    // internal review PR #583 round-1 Medium (see the rationale comment on
+    // ensure_ann_background): the remember-path warm must register as a
+    // tracked background task, not a bare tokio::spawn, so daemon shutdown's
+    // drain() waits for it. The only externally observable proof of that
+    // wiring is track_background_task's own process-wide counter — mirrors
+    // crates/khive-runtime/src/daemon.rs's
+    // `track_background_task_count_returns_to_zero_after_completion`.
+    //
+    // `#[serial(background_tasks)]`: recall.rs's tests in this same crate
+    // also drive track_background_task (the serve-ledger append) against the
+    // identical process-wide counter; serializing this test under the same
+    // group name avoids racing a concurrent increment/decrement from those.
+    #[tokio::test]
+    #[serial(background_tasks)]
+    async fn ensure_ann_background_registers_a_tracked_task_not_a_bare_spawn() {
+        let rt = KhiveRuntime::memory().expect("in-memory runtime");
+        let token = rt.authorize(Namespace::local()).expect("authorize local");
+        let ann = new_shared();
+        let model = "ann-warm-tracked-test-model";
+
+        let before = khive_runtime::background_task_count();
+        let started = ensure_ann_background(&rt, &token, &ann, model).await;
+        assert!(
+            started,
+            "first call for a fresh key must start a background warm"
+        );
+        assert!(
+            khive_runtime::background_task_count() > before,
+            "track_background_task's counter must reflect the new warm \
+             immediately after enqueue (the increment is synchronous), \
+             proving ensure_ann_background is tracked rather than a bare \
+             tokio::spawn invisible to drain()"
+        );
+
+        // Let the tracked task finish so it doesn't leak into another test's
+        // counter snapshot.
+        for _ in 0..200 {
+            if khive_runtime::background_task_count() <= before {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn is_benign_shutdown_cancellation_accepts_cancelled_join_error() {
+        // A real cancelled JoinError, produced the same way tokio produces
+        // one internally when spawn_blocking's task is aborted at runtime
+        // teardown — not a synthetic stand-in.
+        let handle = tokio::spawn(std::future::pending::<()>());
+        handle.abort();
+        let join_err = handle
+            .await
+            .expect_err("aborted task must yield a JoinError");
+        assert!(
+            join_err.is_cancelled(),
+            "sanity: abort() must produce a cancelled JoinError"
+        );
+
+        let err = RuntimeError::Storage(StorageError::driver(
+            khive_storage::StorageCapability::Vectors,
+            "vec_count",
+            join_err,
+        ));
+        assert!(
+            is_benign_shutdown_cancellation(&err),
+            "a cancelled JoinError boxed inside a Driver error must classify as benign"
+        );
+    }
+
+    #[tokio::test]
+    async fn is_benign_shutdown_cancellation_rejects_panicked_join_error() {
+        // A JoinError from a genuine panic is a different failure mode than
+        // cancellation (`is_cancelled()` is false for panics) and must not be
+        // swallowed as benign.
+        let handle = tokio::spawn(async { panic!("intentional panic for classification test") });
+        let join_err = handle
+            .await
+            .expect_err("panicked task must yield a JoinError");
+        assert!(
+            join_err.is_panic(),
+            "sanity: this JoinError must be a panic, not a cancellation"
+        );
+
+        let err = RuntimeError::Storage(StorageError::driver(
+            khive_storage::StorageCapability::Vectors,
+            "vec_count",
+            join_err,
+        ));
+        assert!(
+            !is_benign_shutdown_cancellation(&err),
+            "a panicked (not cancelled) JoinError must not be classified as benign"
+        );
+    }
+
+    #[test]
+    fn is_benign_shutdown_cancellation_rejects_genuine_driver_error() {
+        // A real backend failure (not a JoinError at all) must still WARN —
+        // the predicate must not treat every Driver error as benign.
+        let io_err = std::io::Error::other("disk full");
+        let err = RuntimeError::Storage(StorageError::driver(
+            khive_storage::StorageCapability::Vectors,
+            "vec_count",
+            io_err,
+        ));
+        assert!(
+            !is_benign_shutdown_cancellation(&err),
+            "a genuine driver error must never be classified as benign shutdown cancellation"
+        );
+    }
+
+    #[test]
+    fn is_benign_shutdown_cancellation_rejects_non_storage_error() {
+        // Guards the outer match arm: a RuntimeError variant unrelated to
+        // storage must never be misclassified as a benign cancellation.
+        let err = RuntimeError::Internal("unrelated internal error".into());
+        assert!(!is_benign_shutdown_cancellation(&err));
     }
 }
