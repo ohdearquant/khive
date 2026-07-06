@@ -34,6 +34,13 @@ Safety:
     touched (guarded the same way as bench_pipeline_daemon.py).
   - All daemon/front-end processes are terminated on exit; the scratch
     directory is removed unless --keep is passed.
+
+Pack posture:
+  - The hermetic reduced smoke runs the 7-pack default; the `session` pack is
+    omitted because its lazily-applied mirror schema fails bootstrap recall on
+    a single-file scratch DB and its background writes would confound the
+    reduced-scale gauges. Pass the full production set via `--packs` for the
+    acceptance run against a real multi-pack config.
 """
 
 from __future__ import annotations
@@ -62,9 +69,16 @@ REPO_ROOT = pathlib.Path(__file__).parent.parent.parent
 
 # ── Wire protocol constants (mirrors crates/khive-runtime/src/daemon.rs) ──────
 PROTOCOL_VERSION = 3
-# Production-default pack posture. bpd._DEFAULT_PACKS predates the `session` pack, so pin the
-# current 8-pack default explicitly here rather than measure a stale registry surface / config_id.
-DEFAULT_PACKS = "kg,gtd,memory,brain,comm,schedule,knowledge,session"
+# Pack posture for the spawned scratch daemon (feeds KHIVE_PACKS). Pinned explicitly here rather
+# than reused from bpd._DEFAULT_PACKS so the config_id/registry surface is stated, not inherited.
+#
+# The hermetic reduced smoke excludes `session` (the 8th production-default pack). Its mirror
+# applies schema lazily and runs periodic warm ticks against a background backend; on a single-file
+# scratch DB that path fails bootstrap recall (`fts_notes` vtable construction), and its background
+# writes would also confound the reduced-scale WAL / write-queue gauges this harness reads. The full
+# acceptance run against a real multi-pack config opts session back in via `--packs` (see below).
+DEFAULT_PACKS = "kg,gtd,memory,brain,comm,schedule,knowledge"
+PRODUCTION_PACKS = "kg,gtd,memory,brain,comm,schedule,knowledge,session"
 
 # ── Metal GPU serialization (machine-wide convention; real-embedder mode only)
 METAL_GPU_LOCK_PATH = os.environ.get("METAL_GPU_LOCK_PATH", "/tmp/lion-metal-gpu-test.lock")
@@ -546,6 +560,16 @@ def main() -> int:
     ap.add_argument("--ops-per-worker", type=int, default=20)
     ap.add_argument("--worker-timeout", type=float, default=120.0)
     ap.add_argument("--log-level", default="warn")
+    ap.add_argument(
+        "--packs",
+        default=DEFAULT_PACKS,
+        help=(
+            "comma-separated KHIVE_PACKS for the spawned daemon (default: the 7-pack hermetic "
+            f"reduced-smoke set). Full production posture is '{PRODUCTION_PACKS}'; pass it "
+            "explicitly for the acceptance run against a real multi-pack config (the hermetic "
+            "single-file smoke omits `session` — see the module docstring)."
+        ),
+    )
     ap.add_argument("--keep", action="store_true", help="do not tear down the scratch daemon/dir on exit")
     ap.add_argument("--report", default=None, help="optional path to also write the JSON report")
     args = ap.parse_args()
@@ -591,7 +615,7 @@ def main() -> int:
     base_env["KHIVE_SOCKET"] = sock_path
     base_env["KHIVE_PID"] = pid_path_file
     base_env["KHIVE_LOCK"] = lock_path
-    base_env["KHIVE_PACKS"] = DEFAULT_PACKS
+    base_env["KHIVE_PACKS"] = args.packs
     base_env["KHIVE_DAEMON_STRICT"] = "1"
     base_env["KHIVE_WRITE_QUEUE"] = "1"
     base_env["KHIVE_CONFIG"] = scratch_config_path
