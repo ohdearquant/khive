@@ -735,6 +735,7 @@ async fn probe_daemon_identity(config_id: &str, namespace: &str, timeout_ms: u64
         config_id: config_id.to_string(),
         protocol_version: PROTOCOL_VERSION,
         probe_only: true,
+        metrics_only: false,
         format: None,
         format_per_op: None,
         from_wire: false,
@@ -1216,6 +1217,7 @@ mod tests {
             served_config_id: Some(CFG.to_string()),
             version_mismatch: false,
             daemon_protocol_version: PROTOCOL_VERSION,
+            metrics: None,
         }
     }
 
@@ -1229,6 +1231,7 @@ mod tests {
             served_config_id: Some(CFG.to_string()),
             version_mismatch: false,
             daemon_protocol_version: PROTOCOL_VERSION,
+            metrics: None,
         }
     }
 
@@ -1250,6 +1253,7 @@ mod tests {
             served_config_id: Some(CFG.to_string()),
             version_mismatch: false,
             daemon_protocol_version: PROTOCOL_VERSION,
+            metrics: None,
         };
         assert!(map_response(resp, CFG, NS).is_none());
         assert_eq!(fallback_count(FallbackReason::NamespaceMismatch), 1);
@@ -1270,6 +1274,7 @@ mod tests {
             served_config_id: Some(CFG.to_string()),
             version_mismatch: false,
             daemon_protocol_version: PROTOCOL_VERSION,
+            metrics: None,
         };
         assert!(map_response(resp, CFG, NS).is_none());
         assert_eq!(fallback_count(FallbackReason::ConfigMismatch), 1);
@@ -1292,6 +1297,7 @@ mod tests {
             served_config_id: None,
             version_mismatch: false,
             daemon_protocol_version: 0,
+            metrics: None,
         };
         assert!(map_response(resp, CFG, NS).is_none());
         // The served_config_id-echo path is bucketed under config_mismatch —
@@ -1318,6 +1324,7 @@ mod tests {
             ),
             version_mismatch: false,
             daemon_protocol_version: PROTOCOL_VERSION,
+            metrics: None,
         };
         assert!(map_response(resp, CFG, NS).is_none());
         assert_eq!(fallback_count(FallbackReason::ConfigMismatch), 1);
@@ -1343,6 +1350,7 @@ mod tests {
             served_config_id: Some(CFG.to_string()),
             version_mismatch: false,
             daemon_protocol_version: PROTOCOL_VERSION,
+            metrics: None,
         };
         match map_response(resp, CFG, NS) {
             Some(Ok(s)) => assert_eq!(s, ""),
@@ -1385,6 +1393,7 @@ mod tests {
             served_config_id: Some(CFG.to_string()),
             version_mismatch: true,
             daemon_protocol_version: PROTOCOL_VERSION,
+            metrics: None,
         };
         match map_response(resp, CFG, NS) {
             Some(Err(McpError { message, .. })) => {
@@ -1412,6 +1421,7 @@ mod tests {
             served_config_id: Some(CFG.to_string()),
             version_mismatch: true,
             daemon_protocol_version: 99,
+            metrics: None,
         };
         match map_response(resp, CFG, NS) {
             Some(Err(McpError { message, .. })) => {
@@ -1682,6 +1692,7 @@ mod tests {
             config_id: "test".to_string(),
             protocol_version: PROTOCOL_VERSION,
             probe_only: false,
+            metrics_only: false,
             format: None,
             format_per_op: None,
             from_wire: false,
@@ -1733,6 +1744,7 @@ mod tests {
             config_id: config_id.clone(),
             protocol_version: PROTOCOL_VERSION,
             probe_only: false,
+            metrics_only: false,
             format: None,
             format_per_op: None,
             from_wire: false,
@@ -1777,6 +1789,7 @@ mod tests {
             config_id: config_id.clone(),
             protocol_version: PROTOCOL_VERSION,
             probe_only: false,
+            metrics_only: false,
             format: None,
             format_per_op: None,
             from_wire: false,
@@ -1812,6 +1825,7 @@ mod tests {
             config_id: "packs=[kg];db=:memory:;embed=none;extra=[];backend=main".to_string(),
             protocol_version: PROTOCOL_VERSION,
             probe_only: false,
+            metrics_only: false,
             format: None,
             format_per_op: None,
             from_wire: false,
@@ -1835,6 +1849,7 @@ mod tests {
             config_id: config_id.clone(),
             protocol_version: 0,
             probe_only: false,
+            metrics_only: false,
             format: None,
             format_per_op: None,
             from_wire: false,
@@ -1915,6 +1930,7 @@ mod tests {
             config_id: config_id.clone(),
             protocol_version: PROTOCOL_VERSION,
             probe_only: false,
+            metrics_only: false,
             format: None,
             format_per_op: None,
             from_wire: false,
@@ -1929,6 +1945,7 @@ mod tests {
             config_id: config_id.clone(),
             protocol_version: PROTOCOL_VERSION,
             probe_only: false,
+            metrics_only: false,
             format: None,
             format_per_op: None,
             from_wire: false,
@@ -2042,6 +2059,7 @@ mod tests {
             config_id: config_id.clone(),
             protocol_version: PROTOCOL_VERSION,
             probe_only: false,
+            metrics_only: false,
             format: None,
             format_per_op: None,
             from_wire,
@@ -2145,6 +2163,7 @@ mod tests {
             // Pre-versioning daemon would never set these:
             version_mismatch: false,
             daemon_protocol_version: 0,
+            metrics: None,
         }
     }
 
@@ -2202,6 +2221,7 @@ mod tests {
             config_id: config_id.to_string(),
             protocol_version: PROTOCOL_VERSION,
             probe_only: false,
+            metrics_only: false,
             format: None,
             format_per_op: None,
             from_wire: false,
@@ -2308,6 +2328,7 @@ mod tests {
             config_id: config_id.to_string(),
             protocol_version: PROTOCOL_VERSION,
             probe_only: false,
+            metrics_only: false,
             format: None,
             format_per_op: None,
             from_wire: false,
@@ -2614,6 +2635,7 @@ mod tests {
             config_id: config_id.to_string(),
             protocol_version: PROTOCOL_VERSION,
             probe_only: false,
+            metrics_only: false,
             format: None,
             format_per_op: None,
             from_wire: false,
@@ -2833,6 +2855,7 @@ mod tests {
             config_id: config_id.to_string(),
             protocol_version: PROTOCOL_VERSION,
             probe_only: false,
+            metrics_only: false,
             format: None,
             format_per_op: None,
             from_wire: false,
@@ -2891,6 +2914,7 @@ mod tests {
             served_config_id: Some(config_id.to_string()),
             version_mismatch: false,
             daemon_protocol_version: PROTOCOL_VERSION,
+            metrics: None,
         }
     }
 
@@ -3034,6 +3058,7 @@ mod tests {
             config_id: config_id.to_string(),
             protocol_version: PROTOCOL_VERSION,
             probe_only: false,
+            metrics_only: false,
             format: None,
             format_per_op: None,
             from_wire: false,
@@ -3096,6 +3121,7 @@ mod tests {
             served_config_id: Some(config_id.to_string()),
             version_mismatch: true,
             daemon_protocol_version: 0,
+            metrics: None,
         }
     }
 
@@ -3130,6 +3156,7 @@ mod tests {
             config_id: config_id.to_string(),
             protocol_version: PROTOCOL_VERSION,
             probe_only: false,
+            metrics_only: false,
             format: None,
             format_per_op: None,
             from_wire: false,
@@ -3175,6 +3202,7 @@ mod tests {
             served_config_id: Some(config_id.to_string()),
             version_mismatch: true,
             daemon_protocol_version: PROTOCOL_VERSION + 1,
+            metrics: None,
         }
     }
 
@@ -3208,6 +3236,7 @@ mod tests {
             config_id: config_id.to_string(),
             protocol_version: PROTOCOL_VERSION,
             probe_only: false,
+            metrics_only: false,
             format: None,
             format_per_op: None,
             from_wire: false,
