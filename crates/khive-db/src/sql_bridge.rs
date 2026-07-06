@@ -985,7 +985,7 @@ impl khive_storage::SqlAccess for SqlBridge {
 
     /// Implements the trait's atomic-unit suspend-free invariant
     /// (`SqlAccess::atomic_unit`'s doc comment): on the flag-on branch below,
-    /// `op` is driven through [`block_on_sync`] on an [`InlineWriter`] — a
+    /// `op` is driven through `block_on_sync` on an `InlineWriter` — a
     /// single-poll driver that returns `Err` the instant `op`'s future is
     /// `Pending` instead of ever actually suspending. `op` must therefore
     /// issue only synchronous DML; see `InlineWriter`'s and
