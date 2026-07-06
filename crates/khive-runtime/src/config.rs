@@ -505,10 +505,20 @@ pub fn runtime_config_from_khive_config(
         })
         .collect();
 
-    // ADR-057: store actor.id as actor_id for token minting. The validated id is
-    // already confirmed to be a valid Namespace string by KhiveConfig::validate().
-    // None when [actor] id is absent — tokens then carry ActorRef::anonymous().
-    let actor_id = khive_cfg.actor.id.clone().filter(|s| !s.trim().is_empty());
+    // ADR-057: store actor.id as actor_id for token minting. Precedence is
+    // TOML `[actor] id` > `base.actor_id` (the env/CLI-resolved value the
+    // caller already put in `base`) > anonymous. When `[actor] id` is absent
+    // or empty, fall back to `base.actor_id` instead of clobbering it with
+    // `None` — otherwise an env-resolved actor (e.g. `KHIVE_ACTOR`) is
+    // silently dropped whenever a project config is found without an
+    // `[actor]` block, in both the engines-empty and engines-present arms
+    // below.
+    let actor_id = khive_cfg
+        .actor
+        .id
+        .clone()
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| base.actor_id.clone());
 
     if khive_cfg.engines.is_empty() {
         return RuntimeConfig {
