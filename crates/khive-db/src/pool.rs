@@ -620,6 +620,7 @@ mod tests {
     use serial_test::serial;
 
     #[test]
+    #[serial]
     fn pool_config_default_values_match_constants() {
         // Ensure defaults are not accidentally changed.
         let cfg = PoolConfig::default();
