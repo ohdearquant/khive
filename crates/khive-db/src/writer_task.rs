@@ -135,13 +135,21 @@ pub struct WriterTaskHandle {
 }
 
 impl WriterTaskHandle {
-    /// Send a write operation to the writer task and await its typed reply.
+    /// Enqueue a write operation and return the oneshot receiver its reply
+    /// will arrive on, once the request has actually been accepted onto the
+    /// channel.
     ///
-    /// Backpressure: this suspends on the channel's `send().await` when the
-    /// bounded queue is full (ADR-067 "Channel capacity and queue-full
-    /// policy") — there is no `try_send` escape hatch. Callers that need a
-    /// deadline should use [`Self::send_with_timeout`] instead.
-    pub async fn send<R, F>(&self, op: F) -> Result<R, StorageError>
+    /// Shared by [`Self::send`] and [`Self::send_with_timeout`] so that a
+    /// caller-supplied deadline (see `send_with_timeout`) can bound ONLY
+    /// this enqueue step — never the reply-wait that follows it. Once this
+    /// returns `Ok`, the request has been accepted by the writer task and
+    /// will run to completion; the returned receiver must be awaited without
+    /// a timeout; abandoning it here would silently drop the request's
+    /// eventual result, not cancel the request itself.
+    async fn enqueue<R, F>(
+        &self,
+        op: F,
+    ) -> Result<oneshot::Receiver<Result<R, StorageError>>, StorageError>
     where
         R: Send + 'static,
         F: FnOnce(&Connection) -> Result<R, StorageError> + Send + 'static,
@@ -157,18 +165,40 @@ impl WriterTaskHandle {
             .await
             .map_err(|_| StorageError::Internal("writer task channel closed".to_string()))?;
 
+        Ok(reply_rx)
+    }
+
+    /// Send a write operation to the writer task and await its typed reply.
+    ///
+    /// Backpressure: this suspends on the channel's `send().await` when the
+    /// bounded queue is full (ADR-067 "Channel capacity and queue-full
+    /// policy") — there is no `try_send` escape hatch. Callers that need a
+    /// deadline on that wait should use [`Self::send_with_timeout`] instead.
+    pub async fn send<R, F>(&self, op: F) -> Result<R, StorageError>
+    where
+        R: Send + 'static,
+        F: FnOnce(&Connection) -> Result<R, StorageError> + Send + 'static,
+    {
+        let reply_rx = self.enqueue(op).await?;
         reply_rx.await.map_err(|_| {
             StorageError::Internal("writer task dropped before replying".to_string())
         })?
     }
 
-    /// Like [`Self::send`], but bounds the wait on a full channel with
-    /// `timeout`.
+    /// Like [`Self::send`], but bounds the wait for the bounded channel to
+    /// free capacity with `timeout`.
     ///
-    /// ADR-067's queue-full policy has no immediate-error `try_send` path —
-    /// only a caller-side deadline wrapping the blocking `send().await`. A
-    /// full channel that does not free capacity within `timeout` returns
-    /// `StorageError::WriteQueueFull` instead of resolving.
+    /// The timeout applies ONLY to enqueueing the request (the channel
+    /// `send().await` that can suspend on a full queue) — never to waiting
+    /// for the writer task's reply once the request has been accepted.
+    /// `StorageError::WriteQueueFull` means exactly "the bounded channel was
+    /// full and this request was never accepted"; it must never be returned
+    /// for a request that was accepted and is still executing (or already
+    /// committed) by the time `timeout` elapses — that would misreport a
+    /// slow op or a lock wait as a queue-capacity failure, and could tell a
+    /// caller a write failed when it actually landed. ADR-067's queue-full
+    /// policy has no immediate-error `try_send` path — only this caller-side
+    /// deadline on the enqueue step.
     pub async fn send_with_timeout<R, F>(
         &self,
         op: F,
@@ -178,12 +208,19 @@ impl WriterTaskHandle {
         R: Send + 'static,
         F: FnOnce(&Connection) -> Result<R, StorageError> + Send + 'static,
     {
-        match tokio::time::timeout(timeout, self.send(op)).await {
-            Ok(result) => result,
-            Err(_elapsed) => Err(StorageError::WriteQueueFull {
-                timeout_ms: timeout.as_millis() as u64,
-            }),
-        }
+        let reply_rx = match tokio::time::timeout(timeout, self.enqueue(op)).await {
+            Ok(Ok(reply_rx)) => reply_rx,
+            Ok(Err(e)) => return Err(e),
+            Err(_elapsed) => {
+                return Err(StorageError::WriteQueueFull {
+                    timeout_ms: timeout.as_millis() as u64,
+                })
+            }
+        };
+
+        reply_rx.await.map_err(|_| {
+            StorageError::Internal("writer task dropped before replying".to_string())
+        })?
     }
 }
 
@@ -485,6 +522,59 @@ mod tests {
         }
 
         first.abort();
+    }
+
+    #[tokio::test]
+    async fn send_with_timeout_returns_op_result_when_op_outlives_the_timeout() {
+        // `send_with_timeout`'s timeout must bound ONLY the enqueue step —
+        // never the reply-wait. An accepted request (channel not full) must
+        // run to completion and report its REAL result even when that takes
+        // longer than `timeout`; before this fix, wrapping the whole
+        // send-plus-reply-wait in one timeout would misreport this as
+        // `WriteQueueFull` despite the write actually landing.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("writer_task_slow_op.db");
+        let pool = file_pool(&path);
+        {
+            let writer = pool.try_writer().unwrap();
+            writer
+                .conn()
+                .execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")
+                .unwrap();
+        }
+
+        let handle = spawn(&pool, 8).expect("writer task should spawn on a file-backed pool");
+
+        let result = handle
+            .send_with_timeout(
+                |conn| {
+                    // Deliberately slower than the timeout below: proves the
+                    // reply-wait itself is never bounded by `timeout`.
+                    std::thread::sleep(Duration::from_millis(150));
+                    conn.execute("INSERT INTO t (id, v) VALUES (1, 'slow')", [])
+                        .map_err(|e| StorageError::Pool {
+                            operation: "test_insert".into(),
+                            message: e.to_string(),
+                        })
+                },
+                Duration::from_millis(20),
+            )
+            .await;
+
+        let affected = result.expect(
+            "an accepted request must return its real result even when the \
+             op takes longer than the enqueue timeout, not WriteQueueFull",
+        );
+        assert_eq!(affected, 1);
+
+        // The slow op's write must have actually committed, not just been
+        // reported as successful.
+        let reader = pool.reader().expect("reader");
+        let v: String = reader
+            .conn()
+            .query_row("SELECT v FROM t WHERE id = 1", [], |row| row.get(0))
+            .expect("the slow op's write must have committed");
+        assert_eq!(v, "slow");
     }
 
     #[tokio::test]

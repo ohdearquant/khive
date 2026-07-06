@@ -4,11 +4,12 @@ use parking_lot::Mutex;
 use rusqlite::{Connection, OpenFlags};
 use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::error::SqliteError;
+use crate::writer_task::WriterTaskHandle;
 
 const CACHE_SIZE_KIB: &str = "-65536";
 const MMAP_SIZE_BYTES: &str = "1073741824";
@@ -132,6 +133,18 @@ pub struct ConnectionPool {
     readers: ArrayQueue<Connection>,
     max_readers: usize,
     config: PoolConfig,
+    /// The pool-wide ADR-067 Component A writer task, spawned lazily and at
+    /// most once per pool (per DB file) via [`Self::writer_task_handle`] —
+    /// see that method's doc comment for why this lives here rather than on
+    /// each store.
+    writer_task: OnceLock<Option<WriterTaskHandle>>,
+    /// Test-only instrumentation: counts how many times the writer-task
+    /// init closure actually ran. Must never exceed 1 per pool no matter how
+    /// many stores are constructed over it — that is the invariant
+    /// `OnceLock::get_or_init` exists to guarantee, and what
+    /// `pool.rs`'s and `entity_tests.rs`'s one-writer-per-pool tests assert.
+    #[cfg(test)]
+    writer_task_spawn_count: std::sync::atomic::AtomicUsize,
 }
 
 enum ReaderLease<'pool> {
@@ -257,6 +270,9 @@ impl ConnectionPool {
             readers,
             max_readers,
             config,
+            writer_task: OnceLock::new(),
+            #[cfg(test)]
+            writer_task_spawn_count: std::sync::atomic::AtomicUsize::new(0),
         };
 
         for _ in 0..pool.max_readers {
@@ -383,6 +399,67 @@ impl ConnectionPool {
     /// Return the pool configuration.
     pub fn config(&self) -> &PoolConfig {
         &self.config
+    }
+
+    /// Return the pool-wide ADR-067 Component A writer task, spawning it
+    /// lazily on first access if `PoolConfig::write_queue_enabled` is set.
+    ///
+    /// Exactly one writer task exists per `ConnectionPool` (per DB file) no
+    /// matter how many stores or namespaces are constructed over it: the
+    /// `OnceLock` runs its init closure at most once, so concurrent callers
+    /// either race to run it once or block on the in-flight init and then
+    /// all receive a clone of the same resulting handle. This is what makes
+    /// the write queue an actual single-writer core rather than one writer
+    /// task per store — a per-store writer task would let concurrent
+    /// migrated stores over the same pool spawn independent writer
+    /// connections that contend with each other at `BEGIN IMMEDIATE`,
+    /// defeating the point of Component A.
+    ///
+    /// Returns `None` if the flag is off, or if the writer task failed to
+    /// spawn (for example, an in-memory pool has no standalone-connection
+    /// support) — callers fall back to the legacy pool-mutex write path in
+    /// either case. A spawn failure is logged once here (at first access),
+    /// not once per store.
+    ///
+    /// Must be called from within a Tokio runtime context on first access —
+    /// the initializing call may invoke `tokio::spawn` (via
+    /// `writer_task::spawn`). Every current caller (`SqlEntityStore::new`)
+    /// is reached only from async runtime paths (see the call-site audit in
+    /// ADR-067 slice 1's PR).
+    pub fn writer_task_handle(&self) -> Option<WriterTaskHandle> {
+        self.writer_task
+            .get_or_init(|| {
+                #[cfg(test)]
+                self.writer_task_spawn_count
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+
+                if self.config.write_queue_enabled {
+                    match crate::writer_task::spawn(self, self.config.write_queue_capacity) {
+                        Ok(handle) => Some(handle),
+                        Err(e) => {
+                            tracing::warn!(
+                                error = %e,
+                                "KHIVE_WRITE_QUEUE=1 but the writer task failed to spawn; \
+                                 writes fall back to the pool-mutex path"
+                            );
+                            None
+                        }
+                    }
+                } else {
+                    None
+                }
+            })
+            .clone()
+    }
+
+    /// Test-only: how many times the writer-task init closure actually ran.
+    /// Must be at most 1 for the pool's whole lifetime, regardless of how
+    /// many times [`Self::writer_task_handle`] is called or how many stores
+    /// are constructed over this pool.
+    #[cfg(test)]
+    pub(crate) fn writer_task_spawn_count(&self) -> usize {
+        self.writer_task_spawn_count
+            .load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Compatibility method: returns the writer connection wrapped in `Arc<Mutex>`.

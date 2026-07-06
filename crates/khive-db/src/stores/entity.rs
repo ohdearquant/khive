@@ -38,29 +38,19 @@ impl SqlEntityStore {
     ///
     /// When `KHIVE_WRITE_QUEUE=1` (`PoolConfig::write_queue_enabled`),
     /// `upsert_entities` — ADR-067 slice 1's single migrated write path —
-    /// routes through a dedicated `WriterTask` spawned here instead of the
-    /// legacy pool-mutex path (`with_writer`, unchanged and still used by
-    /// every other method on this store). If the task fails to spawn (for
+    /// routes through the pool-wide `WriterTask` (`ConnectionPool::writer_task_handle`)
+    /// instead of the legacy pool-mutex path (`with_writer`, unchanged and
+    /// still used by every other method on this store). The handle is a
+    /// clone of the ONE writer task owned by `pool` — constructing multiple
+    /// stores (or multiple namespaces) over the same pool never spawns more
+    /// than one writer task; see `ConnectionPool::writer_task_handle`'s doc
+    /// comment for why that matters. `None` (falling back to the legacy
+    /// path) if the flag is off, or if the writer task failed to spawn (for
     /// example, an in-memory pool, which has no standalone-connection
-    /// support), this falls back to the legacy path rather than failing
-    /// construction — the flag is a best-effort opt-in for slice 1, not a
-    /// hard requirement.
+    /// support) — the flag is a best-effort opt-in for slice 1, not a hard
+    /// requirement.
     pub fn new(pool: Arc<ConnectionPool>, is_file_backed: bool) -> Self {
-        let writer_task = if pool.config().write_queue_enabled {
-            match crate::writer_task::spawn(&pool, pool.config().write_queue_capacity) {
-                Ok(handle) => Some(handle),
-                Err(e) => {
-                    tracing::warn!(
-                        error = %e,
-                        "KHIVE_WRITE_QUEUE=1 but the writer task failed to spawn; \
-                         entity writes fall back to the pool-mutex path"
-                    );
-                    None
-                }
-            }
-        } else {
-            None
-        };
+        let writer_task = pool.writer_task_handle();
 
         Self {
             pool,

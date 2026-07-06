@@ -580,3 +580,49 @@ async fn upsert_entities_legacy_path_unchanged_when_flag_is_off() {
     assert_eq!(summary.affected, 2);
     assert_eq!(summary.failed, 0);
 }
+
+/// ADR-067 Component A's whole point is ONE writer owning the write
+/// connection for a DB file — a per-store writer task would let concurrent
+/// stores over the same pool spawn independent writer connections that
+/// contend with each other at `BEGIN IMMEDIATE`, so the migrated path would
+/// race itself instead of eliminating write contention. Constructing
+/// several `SqlEntityStore`s over the SAME pool with the flag on must spawn
+/// the writer task exactly once; every store resolves to a clone of the one
+/// pool-owned handle (`ConnectionPool::writer_task_handle`).
+///
+/// `#[serial]`: mutates the process-global `KHIVE_WRITE_QUEUE` env var,
+/// shared with `pool.rs`'s own env-override tests in this same test binary.
+#[tokio::test]
+#[serial]
+async fn multiple_stores_over_one_pool_share_a_single_writer_task() {
+    std::env::set_var("KHIVE_WRITE_QUEUE", "1");
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("write_queue_shared_writer.db");
+    let pool_cfg = PoolConfig {
+        path: Some(path.clone()),
+        ..PoolConfig::default()
+    };
+    let pool = Arc::new(ConnectionPool::new(pool_cfg).unwrap());
+    {
+        let writer = pool.writer().unwrap();
+        writer.conn().execute_batch(ENTITIES_DDL).unwrap();
+    }
+
+    std::env::remove_var("KHIVE_WRITE_QUEUE");
+
+    // Three independent stores over the same pool, each resolving the
+    // write-queue flag on construction and asking the pool for its writer
+    // task — none of them must trigger a second spawn.
+    let _store1 = SqlEntityStore::new(Arc::clone(&pool), true);
+    let _store2 = SqlEntityStore::new(Arc::clone(&pool), true);
+    let _store3 = SqlEntityStore::new(Arc::clone(&pool), true);
+
+    assert_eq!(
+        pool.writer_task_spawn_count(),
+        1,
+        "N stores constructed over one pool must spawn the writer task \
+         exactly once — one writer task per pool (per DB file), not one \
+         per store"
+    );
+}
