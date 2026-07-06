@@ -510,6 +510,120 @@ async fn test_neighbors_both_directions_reciprocal_equal_weight_limit_is_determi
     }
 }
 
+/// Forward-regression contract for `neighbors_both_directions`'s pre-`LIMIT`
+/// tie-break order: `weight DESC, node_id ASC, CASE dir WHEN 'out' THEN 0 ELSE
+/// 1 END ASC, edge_id ASC`. Four edges tie on `(weight, node_id)` — two Out
+/// and two In, all to/from the same neighbor — with edge_ids chosen so every
+/// Out edge_id sorts below every In edge_id, and inserted in an order that
+/// does not match the expected result order. That means neither the
+/// direction rank nor the `edge_id` tie-break can be satisfied by accidental
+/// insertion-order preservation: only the explicit `ORDER BY` can produce the
+/// sequence asserted below. A future change that reverses the direction rank
+/// (`in` before `out`) or flips `edge_id ASC` to `DESC` yields a different
+/// sequence than the one asserted here for either component, so this test
+/// fails the moment either tie-break regresses.
+///
+/// The two edges sharing a direction use different relations (`Extends` /
+/// `DependsOn`) purely to satisfy the storage layer's
+/// `(namespace, source_id, target_id, relation)` uniqueness constraint — a
+/// second edge with the same relation between the same ordered pair upserts
+/// onto the first rather than creating a second row. The relation choice is
+/// not part of the ordering contract under test.
+///
+/// `#[serial(neighbor_select_count)]`: see note on `test_neighbors_outbound`.
+#[tokio::test]
+#[serial(neighbor_select_count)]
+async fn test_neighbors_both_directions_direction_then_edge_id_is_a_forward_contract() {
+    let store = setup_memory_store();
+
+    let centre = Uuid::new_v4();
+    let other = Uuid::new_v4();
+
+    let out_lo: Uuid = "00000000-0000-0000-0000-000000000001".parse().unwrap();
+    let out_hi: Uuid = "00000000-0000-0000-0000-000000000002".parse().unwrap();
+    let in_lo: Uuid = "00000000-0000-0000-0000-000000000003".parse().unwrap();
+    let in_hi: Uuid = "00000000-0000-0000-0000-000000000004".parse().unwrap();
+
+    // Inserted out of both the weight/direction tie-break order and the
+    // edge_id order, so nothing about the asserted sequence below can pass
+    // by coincidentally preserving insertion order.
+    for (id, source, target, relation) in [
+        (in_lo, other, centre, EdgeRelation::Extends),
+        (out_hi, centre, other, EdgeRelation::DependsOn),
+        (in_hi, other, centre, EdgeRelation::DependsOn),
+        (out_lo, centre, other, EdgeRelation::Extends),
+    ] {
+        let now = Utc::now();
+        store
+            .upsert_edge(Edge {
+                id: id.into(),
+                namespace: "default".to_string(),
+                source_id: source,
+                target_id: target,
+                relation,
+                weight: 0.5,
+                created_at: now,
+                updated_at: now,
+                deleted_at: None,
+                metadata: None,
+                target_backend: None,
+            })
+            .await
+            .unwrap();
+    }
+
+    let query = NeighborQuery {
+        direction: Direction::Both,
+        relations: None,
+        limit: None,
+        min_weight: None,
+    };
+
+    let unlimited = store
+        .neighbors_both_directions(centre, query)
+        .await
+        .unwrap();
+
+    let observed: Vec<(Direction, Uuid)> = unlimited
+        .iter()
+        .map(|h| (h.direction.clone(), h.hit.edge_id))
+        .collect();
+    assert_eq!(
+        observed,
+        vec![
+            (Direction::Out, out_lo),
+            (Direction::Out, out_hi),
+            (Direction::In, in_lo),
+            (Direction::In, in_hi),
+        ],
+        "tied (weight, node_id) rows must order Out-before-In, then edge_id ASC within each direction"
+    );
+
+    // The storage layer applies `LIMIT` to this pre-sorted order (the runtime
+    // caller only re-sorts after `LIMIT` has already truncated), so survivors
+    // under a narrowing limit must be a prefix of the sequence above, not an
+    // arbitrary 2-of-4 subset.
+    let limited_query = NeighborQuery {
+        direction: Direction::Both,
+        relations: None,
+        limit: Some(2),
+        min_weight: None,
+    };
+    let limited = store
+        .neighbors_both_directions(centre, limited_query)
+        .await
+        .unwrap();
+    let limited_observed: Vec<(Direction, Uuid)> = limited
+        .iter()
+        .map(|h| (h.direction.clone(), h.hit.edge_id))
+        .collect();
+    assert_eq!(
+        limited_observed,
+        vec![(Direction::Out, out_lo), (Direction::Out, out_hi)],
+        "limit=2 must keep exactly the first two rows of the deterministic order, both Out"
+    );
+}
+
 #[tokio::test]
 async fn test_traverse_depth_2() {
     let store = setup_memory_store();
