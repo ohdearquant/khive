@@ -100,6 +100,70 @@ impl FallbackReason {
             FallbackReason::ProtocolMismatch => &FALLBACK_PROTOCOL_MISMATCH,
         }
     }
+
+    /// Legitimacy tier used by the `KHIVE_DAEMON_STRICT` graduated fail-loud
+    /// policy (SPEC_DRAFT §3 D2). Only `Illegitimate` reasons are elevated by
+    /// strict mode; the other two tiers are always quiet, regardless of mode.
+    fn severity(self) -> FallbackSeverity {
+        match self {
+            // A real misconfiguration: the client and daemon should have
+            // agreed on `config_id`/namespace visibility and didn't. Never
+            // expected on a correctly-configured fleet post-D1.
+            FallbackReason::ConfigMismatch | FallbackReason::NamespaceMismatch => {
+                FallbackSeverity::Illegitimate
+            }
+            // `ParseFailure` and `ProtocolMismatch` are this module's own
+            // "stale/rolling daemon" bucket: both trigger the same
+            // kill-and-respawn recovery path (see the `ForwardOutcome::ParseFailure
+            // | ForwardOutcome::ProtocolMismatch` handling above) and both
+            // represent a transient protocol-version drift during a rolling
+            // upgrade, not a persistent misconfiguration. SPEC_DRAFT §3 D2's
+            // table names only `version_mismatch` explicitly; `ParseFailure`
+            // is folded into the same `RolloutTransient` tier because the
+            // code already treats it identically to `ProtocolMismatch`
+            // everywhere else in this file.
+            FallbackReason::ProtocolMismatch | FallbackReason::ParseFailure => {
+                FallbackSeverity::RolloutTransient
+            }
+            // No daemon reachable at all — the ADR-049-mandated fallback
+            // path (CI, `KHIVE_NO_DAEMON=1`, read-only FS, spawn failure).
+            FallbackReason::NoSocket => FallbackSeverity::NoDaemon,
+        }
+    }
+}
+
+/// Legitimacy tier for a [`FallbackReason`], keyed by the graduated fail-loud
+/// policy in SPEC_DRAFT §3 D2. See [`FallbackReason::severity`] for the
+/// per-variant mapping and its rationale.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FallbackSeverity {
+    /// A real misconfiguration. Elevated to an error-level event (plus a
+    /// dedicated violation counter) when `KHIVE_DAEMON_STRICT=1`.
+    Illegitimate,
+    /// Expected during a rolling upgrade; self-heals via kill-and-respawn.
+    /// Never elevated, in strict mode or otherwise.
+    RolloutTransient,
+    /// No daemon to forward to at all. Never elevated — this is the
+    /// ADR-049-mandated safety net, not a bug.
+    NoDaemon,
+}
+
+/// `KHIVE_DAEMON_STRICT=1` elevates `Illegitimate`-severity fallbacks
+/// (`ConfigMismatch`, `NamespaceMismatch`) from a WARN to an error-level
+/// structured event plus a dedicated violation counter (D2-R1). It never
+/// disables the fallback itself — the request still completes locally so the
+/// caller is never dropped (SPEC_DRAFT §3 D2) — it only makes an illegitimate
+/// mismatch impossible to miss.
+///
+/// No hosted-vs-local auto-detection signal exists in this codebase (there is
+/// no build-time or runtime "is this the hosted fleet image" flag anywhere in
+/// the workspace) and none is invented here: this resolves as a plain opt-in,
+/// default OFF, matching the shape of `is_strict_actor_mode`'s
+/// `KHIVE_REQUIRE_ATTRIBUTED_ACTOR`. The hosted/fleet image is expected to set
+/// `KHIVE_DAEMON_STRICT=1` explicitly in its own deployment environment; a
+/// bare local `kkernel` invocation is unaffected by default.
+fn is_daemon_strict_mode() -> bool {
+    env_truthy("KHIVE_DAEMON_STRICT")
 }
 
 /// `khive_daemon_fallback_total{reason="config_mismatch"}`
@@ -115,6 +179,14 @@ static FALLBACK_PARSE_FAILURE: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 /// `khive_daemon_fallback_total{reason="protocol_mismatch"}`
 static FALLBACK_PROTOCOL_MISMATCH: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+/// `khive_daemon_fallback_strict_violations_total` — count of `Illegitimate`
+/// fallbacks (`config_mismatch`/`namespace_mismatch`) observed while
+/// `KHIVE_DAEMON_STRICT=1` was set (D2-R1). Distinct from the five
+/// per-reason counters above: this one is scoped to exactly the elevated
+/// (error-level) events, so a load-harness (D2-R2) can hard-fail on
+/// "any nonzero" without having to know which reasons are illegitimate.
+static FALLBACK_STRICT_VIOLATIONS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
 // REASON: these accessors have no production call site yet — this slice adds the
@@ -144,6 +216,14 @@ pub(crate) fn fallback_count(reason: FallbackReason) -> usize {
     reason.counter().load(std::sync::atomic::Ordering::SeqCst)
 }
 
+#[allow(dead_code)]
+/// `khive_daemon_fallback_strict_violations_total` — see
+/// [`FALLBACK_STRICT_VIOLATIONS`]. No production call site yet, same as
+/// `fallback_total`/`fallback_count` above; exercised directly by tests.
+pub(crate) fn fallback_strict_violations() -> usize {
+    FALLBACK_STRICT_VIOLATIONS.load(std::sync::atomic::Ordering::SeqCst)
+}
+
 #[cfg(test)]
 pub(crate) fn reset_fallback_counters() {
     use std::sync::atomic::Ordering::SeqCst;
@@ -152,9 +232,10 @@ pub(crate) fn reset_fallback_counters() {
     FALLBACK_NO_SOCKET.store(0, SeqCst);
     FALLBACK_PARSE_FAILURE.store(0, SeqCst);
     FALLBACK_PROTOCOL_MISMATCH.store(0, SeqCst);
+    FALLBACK_STRICT_VIOLATIONS.store(0, SeqCst);
 }
 
-/// Emit the standardized `daemon_fallback` WARN and increment the matching
+/// Emit the standardized `daemon_fallback` event and increment the matching
 /// counters. Call exactly once per fallback event, at the point where the
 /// caller is about to dispatch locally instead of via the warm daemon.
 ///
@@ -165,6 +246,16 @@ pub(crate) fn reset_fallback_counters() {
 /// (the canonical db path) is intentionally not logged here: neither call site
 /// has it in scope without broader plumbing, and inventing a value would be
 /// worse than omitting the field.
+///
+/// Log level and counter are graduated by [`FallbackReason::severity`] and
+/// [`is_daemon_strict_mode`] (D2-R1): an `Illegitimate` reason observed while
+/// `KHIVE_DAEMON_STRICT=1` is set logs at `error!` and bumps
+/// `FALLBACK_STRICT_VIOLATIONS` in addition to its own per-reason counter;
+/// every other case (non-strict mode, or a `RolloutTransient`/`NoDaemon`
+/// reason regardless of mode) logs at `warn!`, exactly as before this change
+/// (D2-R3 — strict mode keys on `FallbackReason`, never on "did a fallback
+/// happen at all"). The fallback itself is never disabled either way — the
+/// caller always proceeds to dispatch locally after this call returns.
 fn record_fallback(
     reason: FallbackReason,
     config_id_client: &str,
@@ -174,14 +265,31 @@ fn record_fallback(
     reason
         .counter()
         .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-    tracing::warn!(
-        reason = reason.as_str(),
-        config_id_client,
-        config_id_daemon = config_id_daemon.unwrap_or("none"),
-        namespace_client,
-        pid = std::process::id(),
-        "daemon_fallback"
-    );
+
+    let strict_violation =
+        reason.severity() == FallbackSeverity::Illegitimate && is_daemon_strict_mode();
+
+    if strict_violation {
+        FALLBACK_STRICT_VIOLATIONS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        tracing::error!(
+            reason = reason.as_str(),
+            config_id_client,
+            config_id_daemon = config_id_daemon.unwrap_or("none"),
+            namespace_client,
+            pid = std::process::id(),
+            strict = true,
+            "daemon_fallback"
+        );
+    } else {
+        tracing::warn!(
+            reason = reason.as_str(),
+            config_id_client,
+            config_id_daemon = config_id_daemon.unwrap_or("none"),
+            namespace_client,
+            pid = std::process::id(),
+            "daemon_fallback"
+        );
+    }
 }
 
 // ── DaemonDispatch impl ───────────────────────────────────────────────────────
@@ -1404,6 +1512,150 @@ mod tests {
             fallback_total(),
             5,
             "total must equal the sum of all reasons"
+        );
+    }
+
+    // ── KHIVE_DAEMON_STRICT graduated fail-loud policy (D2) ───────────────────
+    //
+    // No tracing-capture harness exists in this crate (see the comment on
+    // `record_fallback_config_id_daemon_defaults_to_none_literal_when_absent`
+    // above), so these tests prove the graduated behavior via
+    // `FALLBACK_STRICT_VIOLATIONS` rather than asserting the log level
+    // directly: an `Illegitimate` reason bumps it if and only if strict mode
+    // is on; every other reason/mode combination must never bump it.
+
+    fn with_daemon_strict<T>(value: Option<&str>, f: impl FnOnce() -> T) -> T {
+        let prev = std::env::var("KHIVE_DAEMON_STRICT").ok();
+        match value {
+            Some(v) => std::env::set_var("KHIVE_DAEMON_STRICT", v),
+            None => std::env::remove_var("KHIVE_DAEMON_STRICT"),
+        }
+        let result = f();
+        match prev {
+            Some(v) => std::env::set_var("KHIVE_DAEMON_STRICT", v),
+            None => std::env::remove_var("KHIVE_DAEMON_STRICT"),
+        }
+        result
+    }
+
+    #[test]
+    #[serial]
+    fn record_fallback_config_mismatch_strict_off_never_bumps_strict_violations() {
+        with_daemon_strict(None, || {
+            reset_fallback_counters();
+            record_fallback(FallbackReason::ConfigMismatch, CFG, Some("other-cfg"), NS);
+            assert_eq!(fallback_count(FallbackReason::ConfigMismatch), 1);
+            assert_eq!(
+                fallback_strict_violations(),
+                0,
+                "strict mode is OFF (default local-dev behavior) — the illegitimate \
+                 reason must still bump its own counter, but never the strict-violations one"
+            );
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn record_fallback_config_mismatch_strict_on_bumps_strict_violations() {
+        with_daemon_strict(Some("1"), || {
+            reset_fallback_counters();
+            record_fallback(FallbackReason::ConfigMismatch, CFG, Some("other-cfg"), NS);
+            assert_eq!(fallback_count(FallbackReason::ConfigMismatch), 1);
+            assert_eq!(
+                fallback_strict_violations(),
+                1,
+                "KHIVE_DAEMON_STRICT=1 + an Illegitimate reason (config_mismatch) must \
+                 bump the strict-violations counter (D2-R1)"
+            );
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn record_fallback_namespace_mismatch_strict_on_bumps_strict_violations() {
+        with_daemon_strict(Some("1"), || {
+            reset_fallback_counters();
+            record_fallback(
+                FallbackReason::NamespaceMismatch,
+                CFG,
+                Some(CFG),
+                "other-ns",
+            );
+            assert_eq!(
+                fallback_strict_violations(),
+                1,
+                "KHIVE_DAEMON_STRICT=1 + an Illegitimate reason (namespace_mismatch) must \
+                 bump the strict-violations counter (D2-R1)"
+            );
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn record_fallback_no_socket_strict_on_never_bumps_strict_violations() {
+        with_daemon_strict(Some("1"), || {
+            reset_fallback_counters();
+            record_fallback(FallbackReason::NoSocket, CFG, None, NS);
+            assert_eq!(
+                fallback_strict_violations(),
+                0,
+                "NoSocket is the ADR-049-mandated no-daemon path — it must NEVER be \
+                 elevated, even in strict mode (D2-R3)"
+            );
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn record_fallback_protocol_mismatch_strict_on_never_bumps_strict_violations() {
+        with_daemon_strict(Some("1"), || {
+            reset_fallback_counters();
+            record_fallback(FallbackReason::ProtocolMismatch, CFG, None, NS);
+            assert_eq!(
+                fallback_strict_violations(),
+                0,
+                "ProtocolMismatch is the rollout-transient (version_mismatch) tier — \
+                 it must NEVER be elevated, even in strict mode (D2-R3)"
+            );
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn record_fallback_parse_failure_strict_on_never_bumps_strict_violations() {
+        with_daemon_strict(Some("1"), || {
+            reset_fallback_counters();
+            record_fallback(FallbackReason::ParseFailure, CFG, None, NS);
+            assert_eq!(
+                fallback_strict_violations(),
+                0,
+                "ParseFailure is folded into the rollout-transient tier alongside \
+                 ProtocolMismatch (see FallbackReason::severity) — never elevated"
+            );
+        });
+    }
+
+    #[test]
+    fn fallback_reason_severity_matches_the_d2_legitimacy_table() {
+        assert_eq!(
+            FallbackReason::ConfigMismatch.severity(),
+            FallbackSeverity::Illegitimate
+        );
+        assert_eq!(
+            FallbackReason::NamespaceMismatch.severity(),
+            FallbackSeverity::Illegitimate
+        );
+        assert_eq!(
+            FallbackReason::ProtocolMismatch.severity(),
+            FallbackSeverity::RolloutTransient
+        );
+        assert_eq!(
+            FallbackReason::ParseFailure.severity(),
+            FallbackSeverity::RolloutTransient
+        );
+        assert_eq!(
+            FallbackReason::NoSocket.severity(),
+            FallbackSeverity::NoDaemon
         );
     }
 
