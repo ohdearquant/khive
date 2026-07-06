@@ -48,8 +48,8 @@ process; one worker per tenant additionally runs a `comm.send` + `get`
 readback pair to check write attribution.
 
 The harness always runs with `KHIVE_DAEMON_STRICT=1` and
-`KHIVE_WRITE_QUEUE=1` — the run posture the P0 smoothness-lane spec fixes as
-non-negotiable. It uses a fresh scratch DB under a temp directory; the live
+`KHIVE_WRITE_QUEUE=1` — the run posture required for the load/perf acceptance
+run. It uses a fresh scratch DB under a temp directory; the live
 `~/.khive/khive.db` is never touched, and the scratch directory + daemon are
 torn down on exit unless `--keep` is passed.
 
@@ -96,7 +96,7 @@ probe will simply start seeing the new key.
   signal. Dimension 2's latency shape is the only indirect corroboration
   available today.
 - The nine-dimension thresholds (WAL ceiling, p99 targets, etc.) are not
-  encoded as pass/fail gates in this driver — per the impl spec, the first
+  encoded as pass/fail gates in this driver — by design, the first
   full-scale run calibrates them; a later pass can add explicit thresholds
   once numbers exist to calibrate against.
 

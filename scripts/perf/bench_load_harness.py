@@ -2,8 +2,8 @@
 """Concurrency load-harness driver — the acceptance-gate measurement substrate.
 
 Drives many concurrent agent connections across many tenant namespaces against
-ONE warm daemon, mixed read/write, and observes the nine gate dimensions (see
-the impl spec this was built from) across four channels:
+ONE warm daemon, mixed read/write, and observes the nine gate dimensions
+across four channels:
 
   1. worker-stderr scrape       — fallback events logged by each front-end
   2. client-measured latency    — per-op round-trip timing
@@ -384,7 +384,7 @@ def _attribution_probe(proc, tenant) -> dict:
     read it back, and check the DURABLY STORED record attributes it consistently.
 
     This does NOT assert a specific expected actor STRING. Empirically (this
-    worktree, ADR-096 Fork 2 `serve.rs` explicit-namespace fill rule,
+    worktree, ADR-096's `serve.rs` explicit-namespace fill rule,
     `resolved.actor_id = Some(ns)` whenever an explicit non-local `--namespace`
     is passed): a front-end's own `actor_id` collapses to its `--namespace`
     value, and a per-session `KHIVE_ACTOR` env var (the mechanism this
@@ -794,7 +794,7 @@ def main() -> int:
                 "expected_distinct_actors": args.tenants,
                 "note": "does NOT assert a specific actor-string convention (see docstring on "
                 "_attribution_probe for a real finding: the KHIVE_ACTOR-per-session pinning this "
-                "harness's spec recommends is superseded by ADR-096 Fork 2's explicit-namespace "
+                "harness's spec recommends is superseded by ADR-096's explicit-namespace "
                 "fill rule in this worktree, so the attributed actor equals the namespace string, "
                 "not '<namespace>_actor'). This checks write-then-read consistency and that "
                 "distinct tenants get distinct attributed identities (no cross-tenant collapse).",
