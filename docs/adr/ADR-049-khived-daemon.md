@@ -109,6 +109,9 @@ Warm becomes **non-blocking**, benefiting both modes:
 - No multi-namespace daemon. v1 serves the single default namespace its registry was built
   with; the client passes its namespace and the daemon authorizes it per request, but a
   namespace mismatch falls back to local dispatch rather than mis-serving.
+  Amended by [ADR-096](ADR-096-warm-daemon-per-request-identity.md): the daemon may serve
+  per-request attribution identities over one shared backend; see that ADR for the
+  per-request identity model and its acceptance conditions.
 
 ## Consequences
 

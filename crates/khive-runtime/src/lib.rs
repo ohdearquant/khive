@@ -64,8 +64,9 @@ pub use operations::{EntityCreateSpec, LinkSpec, NoteSearchHit, QueryResult, Res
 pub use pack::{
     resolve_explicit_namespace, DispatchHook, HandlerDef, KindHook, NoteKindSpec,
     NoteLifecycleSpec, PackByIdResolver, PackFactory, PackLoadError, PackRegistration,
-    PackRegistry, PackRuntime, PackSchemaCollisionError, PackSchemaPlan, ParamDef, SchemaPlan,
-    VerbCategory, VerbPresentationPolicy, VerbRegistry, VerbRegistryBuilder, Visibility,
+    PackRegistry, PackRuntime, PackSchemaCollisionError, PackSchemaPlan, ParamDef, RequestIdentity,
+    SchemaPlan, VerbCategory, VerbPresentationPolicy, VerbRegistry, VerbRegistryBuilder,
+    Visibility,
 };
 pub use portability::{ImportSummary, KgArchive};
 pub use presentation::{
@@ -74,8 +75,9 @@ pub use presentation::{
 pub use registry::{ObjectiveRegistry, RegisteredObjective};
 pub use retrieval::{SearchHit, SearchSource};
 pub use runtime::{
-    parse_pack_list, runtime_config_from_khive_config, BackendId, EntityTypeValidatorFn,
-    KhiveRuntime, NamespaceToken, RuntimeConfig,
+    assert_db_anchor_consistent, parse_pack_list, resolve_db_anchor, resolve_project_actor_id,
+    runtime_config_from_khive_config, BackendId, EntityTypeValidatorFn, KhiveRuntime,
+    NamespaceToken, RuntimeConfig,
 };
 pub use secret_gate::SecretMatch;
 pub use validation::{

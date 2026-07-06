@@ -233,9 +233,20 @@ async fn main() -> Result<()> {
             let transport_registry = khive_mcp::transport::TransportRegistry::with_builtins();
 
             // Check if multi-backend is configured (ADR-028 / ADR-029 Phase 2).
-            let khive_cfg = KhiveConfig::load_with_home_fallback(a.config.as_deref())
-                .unwrap_or_default()
-                .unwrap_or_default();
+            //
+            // Resolve `db_path` with the SAME precedence as `resolve_runtime_config`
+            // below (`:memory:` -> no file to anchor on; explicit `--db`/`KHIVE_DB`
+            // -> that path; unset -> the default `$HOME/.khive/khive.db`) so this
+            // early multi-backend classification anchors tier-3 project-local config
+            // discovery to the identical directory the per-request `config_id` path
+            // uses. Anchoring only the explicit case and leaving the default case on
+            // the process cwd would let this branch select a different topology than
+            // the config the server actually resolves further down this path.
+            let db_path_hint = khive_runtime::resolve_db_anchor(a.db.as_deref());
+            let khive_cfg =
+                KhiveConfig::load_with_home_fallback(a.config.as_deref(), db_path_hint.as_deref())
+                    .unwrap_or_default()
+                    .unwrap_or_default();
 
             if khive_cfg.backends.len() <= 1 {
                 // Single-backend: zero-change path — no coordinator.
@@ -256,6 +267,7 @@ async fn main() -> Result<()> {
                         config: a.config.as_deref(),
                         namespace: cli_ns,
                         namespace_explicit: cli_ns_explicit,
+                        actor_explicit: cli_ns_explicit,
                         no_embed: a.no_embed,
                         packs: if a.pack.is_empty() {
                             None
@@ -680,7 +692,12 @@ mod tests {
     fn base_multi_backend_runtime_config() -> RuntimeConfig {
         use khive_runtime::Namespace;
         RuntimeConfig {
-            db_path: None,
+            // Matches what `resolve_runtime_config` would set for a `--db`-unset
+            // invocation (the `cli_db_override: None` every call site below
+            // passes) — `build_server_multi_backend`'s db-anchor consistency
+            // guard requires `db_path` to agree with `resolve_db_anchor` for
+            // the same input.
+            db_path: khive_runtime::resolve_db_anchor(None),
             default_namespace: Namespace::parse("local").expect("valid namespace"),
             embedding_model: None,
             additional_embedding_models: vec![],
@@ -859,5 +876,47 @@ mod tests {
 
         // `_env_guard` is dropped here (or on unwind, whichever comes first),
         // restoring KHIVE_OUTPUT_FORMAT regardless of assertion outcome.
+    }
+
+    /// The kkernel `Command::Mcp` coordinator-attached multi-backend boot path
+    /// (`build_multi_backend_server_with_coordinator`, the real `kkernel mcp
+    /// --daemon` production boundary) funnels through
+    /// `khive_mcp::serve::build_registry_for_multi_backend` exactly like the
+    /// plain `build_server_multi_backend` path does — that shared choke point
+    /// is where the db-anchor consistency guard lives, so a `db_path` that
+    /// diverges from the canonical anchor for the same `--db` input must be
+    /// rejected here too, naming both paths.
+    #[test]
+    fn coordinator_boundary_rejects_diverging_db_path() {
+        let args_db = "/tmp/khive-coordinator-guard-real.db";
+        let wrong_path = std::path::PathBuf::from("/tmp/khive-coordinator-guard-wrong.db");
+
+        let base_cfg = RuntimeConfig {
+            db_path: Some(wrong_path.clone()),
+            ..base_multi_backend_runtime_config()
+        };
+        let khive_cfg = KhiveConfig::default();
+
+        let result =
+            build_multi_backend_server_with_coordinator(base_cfg, &khive_cfg, Some(args_db));
+
+        let err = match result {
+            Ok(_) => panic!(
+                "a resolved db_path diverging from the canonical anchor must be rejected \
+                 at the coordinator-attached construction boundary"
+            ),
+            Err(e) => e,
+        };
+        let msg = err.to_string();
+        let anchor =
+            khive_runtime::resolve_db_anchor(Some(args_db)).expect("explicit path always anchors");
+        assert!(
+            msg.contains(&wrong_path.display().to_string()),
+            "error must name the resolved (wrong) path: {msg}"
+        );
+        assert!(
+            msg.contains(&anchor.display().to_string()),
+            "error must name the canonical anchor path: {msg}"
+        );
     }
 }

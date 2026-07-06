@@ -57,10 +57,59 @@
 //! here — the tx_registry is only read for diagnostics (Plank 1 owns
 //! enforcement).
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::pool::{ConnectionPool, WriterGuard};
+
+// ── metrics read-surface (load/perf harness) ─────────────────────────────
+//
+// Process-wide gauges mirroring the fallback-counter pattern in
+// `khive-mcp/src/daemon.rs` (`FALLBACK_*` statics + their `pub(crate)`
+// accessors): the checkpoint task is a single fire-and-forget
+// `tokio::spawn` with no handle retained anywhere the daemon's
+// connection-accept loop can reach, so these are plain module-scoped
+// atomics rather than a struct threaded through every `checkpoint_once`/
+// `maybe_truncate`/`note_truncate_outcome` call site (and, transitively,
+// every existing test call site). Read-only surface: nothing here is ever
+// reset outside `#[cfg(test)]`, and nothing reachable over the daemon wire
+// can reset them either (see `khive_runtime::daemon::DaemonRequestFrame::
+// metrics_only`).
+
+/// Last-observed WAL page count (`query_wal_pages`'s return value on its
+/// most recent call, from either `checkpoint_once` or `maybe_truncate`).
+/// `u64::MAX` is the "never observed" sentinel — no checkpoint tick has run
+/// yet in this process — distinct from a genuine zero-page WAL.
+static LAST_WAL_PAGES: AtomicU64 = AtomicU64::new(u64::MAX);
+
+/// Count of TRUNCATE attempts (`maybe_truncate`'s pragma actually invoked,
+/// win or lose) across this process's lifetime.
+static TRUNCATE_ATTEMPTS: AtomicU64 = AtomicU64::new(0);
+
+/// Current consecutive-failure count, mirrored from the caller-owned
+/// `TruncateState::consecutive_failures` field into a process-readable
+/// gauge every time `note_truncate_outcome` runs.
+static TRUNCATE_CONSECUTIVE_FAILURES: AtomicU64 = AtomicU64::new(0);
+
+/// Last-observed WAL page count, if any checkpoint tick has run yet in this
+/// process. Read surface for the daemon-frame metrics snapshot.
+pub fn last_observed_wal_pages() -> Option<u64> {
+    match LAST_WAL_PAGES.load(Ordering::Relaxed) {
+        u64::MAX => None,
+        pages => Some(pages),
+    }
+}
+
+/// Total WAL TRUNCATE attempts made in this process's lifetime.
+pub fn truncate_attempts() -> u64 {
+    TRUNCATE_ATTEMPTS.load(Ordering::Relaxed)
+}
+
+/// Current consecutive TRUNCATE-attempt failure count.
+pub fn truncate_consecutive_failures() -> u64 {
+    TRUNCATE_CONSECUTIVE_FAILURES.load(Ordering::Relaxed)
+}
 
 /// Outcome of a single checkpoint attempt.
 ///
@@ -515,6 +564,12 @@ fn note_truncate_outcome(
     wal_pages_after: u64,
     state: &mut TruncateState,
 ) {
+    // Metrics read-surface (load/perf harness): this function runs exactly
+    // once per genuine TRUNCATE attempt (both the `Ok` and `Err` outcome
+    // arms in `maybe_truncate` call it once each), so incrementing here
+    // counts total attempts without a separate call site.
+    TRUNCATE_ATTEMPTS.fetch_add(1, Ordering::Relaxed);
+
     if wal_pages_after >= config.warn_pages {
         state.consecutive_failures = state.consecutive_failures.saturating_add(1);
         if state.consecutive_failures == 3 {
@@ -527,6 +582,8 @@ fn note_truncate_outcome(
     } else {
         state.consecutive_failures = 0;
     }
+
+    TRUNCATE_CONSECUTIVE_FAILURES.store(state.consecutive_failures as u64, Ordering::Relaxed);
 }
 
 /// Evaluate whether a threshold-crossing WARN should fire and advance the
@@ -556,9 +613,15 @@ fn crossing_warn(now_above: bool, was_above: &mut bool) -> bool {
 /// Returns 0 on any error (e.g. in-memory DB where WAL is not active, which
 /// reports `log = -1`).
 fn query_wal_pages(conn: &rusqlite::Connection) -> u64 {
-    conn.query_row("PRAGMA wal_checkpoint", [], |row| row.get::<_, i64>(1))
+    let pages = conn
+        .query_row("PRAGMA wal_checkpoint", [], |row| row.get::<_, i64>(1))
         .unwrap_or(0)
-        .max(0) as u64
+        .max(0) as u64;
+    // Metrics read-surface (load/perf harness): mirror every observation into
+    // the process-wide gauge, regardless of which caller (`checkpoint_once`
+    // or `maybe_truncate`) triggered it.
+    LAST_WAL_PAGES.store(pages, Ordering::Relaxed);
+    pages
 }
 
 #[cfg(test)]

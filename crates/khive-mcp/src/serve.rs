@@ -775,6 +775,14 @@ pub fn build_registry_for_multi_backend(
     khive_cfg: &KhiveConfig,
     cli_db_override: Option<&str>,
 ) -> anyhow::Result<MultiBackendRegistry> {
+    // Regression fence: `base_config.db_path` feeds `compute_config_id` below,
+    // so it must agree with the canonical anchor for this same `--db` input.
+    // This is the shared choke point both multi-backend boot paths funnel
+    // through — `build_server_multi_backend` in this file and `kkernel`'s
+    // `Command::Mcp` coordinator-attached branch — so the guard lives here
+    // once instead of at each caller.
+    khive_runtime::assert_db_anchor_consistent(base_config.db_path.as_deref(), cli_db_override)?;
+
     let backend_count = khive_cfg.backends.len();
     let force_memory = match cli_db_override {
         Some(":memory:") => {
@@ -1045,6 +1053,7 @@ pub fn build_server(args: &Args) -> anyhow::Result<KhiveMcpServer> {
         config: args.config.as_deref(),
         namespace: cli_namespace,
         namespace_explicit: cli_namespace_explicit,
+        actor_explicit: cli_namespace_explicit,
         no_embed: args.no_embed,
         packs: if args.pack.is_empty() {
             None
@@ -1054,12 +1063,23 @@ pub fn build_server(args: &Args) -> anyhow::Result<KhiveMcpServer> {
         brain_profile: args.brain_profile.clone(),
     })?;
 
+    // Regression fence: `config.db_path` must agree with what the canonical
+    // resolver derives from this same `--db` input, or `config_id` (computed
+    // from `config.db_path` below) would silently desynchronize this process
+    // from any daemon/peer anchored on the same database.
+    khive_runtime::assert_db_anchor_consistent(config.db_path.as_deref(), args.db.as_deref())?;
+
     // Load the KhiveConfig to check for multi-backend declarations (ADR-028).
     // When no [[backends]] are declared, fall through to the existing single-backend path
     // to preserve byte-for-byte backward compatibility.
-    let khive_cfg = KhiveConfig::load_with_home_fallback(args.config.as_deref())
-        .map_err(|e| anyhow::anyhow!("config error: {e}"))?
-        .unwrap_or_default();
+    //
+    // `config.db_path` (already resolved above) anchors tier-3 project-local config
+    // discovery to the database's own directory rather than the process cwd, so this
+    // reload agrees with the one inside `resolve_runtime_config` regardless of cwd.
+    let khive_cfg =
+        KhiveConfig::load_with_home_fallback(args.config.as_deref(), config.db_path.as_deref())
+            .map_err(|e| anyhow::anyhow!("config error: {e}"))?
+            .unwrap_or_default();
 
     if khive_cfg.backends.is_empty() {
         // Single-backend path — identical to pre-ADR-028 behavior.
@@ -1149,6 +1169,9 @@ pub fn build_server_multi_backend(
     khive_cfg: &KhiveConfig,
     cli_db_override: Option<&str>,
 ) -> anyhow::Result<KhiveMcpServer> {
+    // The db-anchor consistency guard runs inside `build_registry_for_multi_backend`
+    // (the shared choke point every multi-backend boot path funnels through),
+    // so it is not duplicated here.
     let multi = build_registry_for_multi_backend(base_config, khive_cfg, cli_db_override)?;
     Ok(build_server_from_multi_backend_registry(
         multi, khive_cfg, None,
@@ -1334,6 +1357,17 @@ pub struct RuntimeConfigInputs<'a> {
     pub namespace: khive_runtime::Namespace,
     /// Whether the namespace came from an explicit CLI flag (skips config tier).
     pub namespace_explicit: bool,
+    /// Whether the caller holds a GENUINE explicit actor/identity override —
+    /// i.e. an operator actually typed `--actor` / `--namespace` (ADR-057).
+    ///
+    /// Distinct from `namespace_explicit`: `kkernel exec` and `kkernel reindex`
+    /// set `namespace_explicit: true` unconditionally (their `--namespace` arg
+    /// has no `Option` to distinguish "typed" from "default"), but they have no
+    /// `--actor` flag and must NOT suppress the project/db actor-id tiers when
+    /// their namespace happens to resolve to `"local"`. Only `kkernel mcp`
+    /// (`build_server`, via `resolve_cli_namespace`) sets this to a value that
+    /// can suppress those tiers — everyone else passes `false`.
+    pub actor_explicit: bool,
     /// Disable embedding entirely (still resolves actor namespace from config).
     pub no_embed: bool,
     /// Packs to register. `None` falls back to `RuntimeConfig::default().packs`.
@@ -1353,14 +1387,7 @@ pub struct RuntimeConfigInputs<'a> {
 /// default/env model set while the MCP server serves recall from the
 /// config-file `[[engines]]` set.
 pub fn resolve_runtime_config(inputs: RuntimeConfigInputs<'_>) -> anyhow::Result<RuntimeConfig> {
-    let db_path = match inputs.db {
-        Some(":memory:") => None,
-        Some(path) => Some(PathBuf::from(path)),
-        None => {
-            let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-            Some(PathBuf::from(format!("{home}/.khive/khive.db")))
-        }
-    };
+    let db_path = khive_runtime::resolve_db_anchor(inputs.db);
 
     let packs = inputs
         .packs
@@ -1381,31 +1408,91 @@ pub fn resolve_runtime_config(inputs: RuntimeConfigInputs<'_>) -> anyhow::Result
         ..RuntimeConfig::default()
     };
 
+    // Captured before `base_config` (which owns `db_path`) is consumed below —
+    // threaded into the config-file resolvers so tier-3 project-local config
+    // discovery anchors to the resolved database's directory rather than the
+    // process cwd (kills config_id drift between a client and the daemon
+    // serving the same database at a different working directory).
+    let db_path_for_config = base_config.db_path.clone();
+
     let resolved = if inputs.no_embed {
         let no_embed_base = RuntimeConfig {
             embedding_model: None,
             additional_embedding_models: vec![],
             ..base_config
         };
-        resolve_actor_from_config(inputs.config, no_embed_base, inputs.namespace_explicit)?
+        resolve_actor_from_config(
+            inputs.config,
+            no_embed_base,
+            inputs.namespace_explicit,
+            db_path_for_config.as_deref(),
+        )?
     } else {
-        resolve_config(inputs.config, base_config)?
+        resolve_config(inputs.config, base_config, db_path_for_config.as_deref())?
     };
 
-    // ADR-057: the `--actor` / `--namespace` CLI flag must populate `actor_id`
-    // (token attribution), matching how the `KHIVE_ACTOR` env already does via
-    // RuntimeConfig::default(). Without this, `--actor lambda:x` alone — no env,
-    // no config-file `[actor] id` — leaves actor_id None, so the request token
-    // carries ActorRef::anonymous(): ADR-057 actor-addressed delivery degrades to
-    // the party line and the unattributed-comm startup warning fires despite an
-    // actor having been set. Fill only when still None so the env (base spread) and
-    // a config-file `[actor] id` keep precedence; the `"local"` guard leaves the
-    // default namespace anonymous (consistent with should_warn_unattributed).
+    // ADR-096 Fork 2 — per-connection `actor_id` precedence chain (highest to
+    // lowest), ratified 2026-07-05:
+    //
+    //   1. Explicit CLI `--actor` / `--namespace` flag (ADR-057), threaded via
+    //      `inputs.namespace` / `inputs.actor_explicit` (`resolve_cli_namespace`,
+    //      only `build_server` sets `actor_explicit` from a real CLI parse —
+    //      see the field doc on `RuntimeConfigInputs::actor_explicit`).
+    //      `args.actor` no longer carries a `KHIVE_ACTOR` env-arg alias (the
+    //      clap `env` binding was removed from the tier-1 field — see
+    //      `args.rs`), so this tier is CLI-flag-only; a bare shell-level
+    //      `KHIVE_ACTOR` can no longer masquerade as an explicit flag. When
+    //      genuinely explicit, tiers 2-3 below are NOT consulted at all — an
+    //      explicit `--actor local` must resolve to anonymous (`None`), not
+    //      fall through to a project/db/env actor (the Medium-severity gap
+    //      this block also closes). `kkernel exec`/`reindex` force
+    //      `namespace_explicit: true` for unrelated reasons (no `Option` on
+    //      their `--namespace` arg) but always pass `actor_explicit: false`,
+    //      so they keep falling through to tiers 2-3 exactly as before.
+    //   2. Project/cwd-anchored config `[actor].id`, resolved INDEPENDENTLY of
+    //      the database-anchored config load above (`resolve_project_actor_id`).
+    //      Commit 10d9c92c (#651) anchored tier-3 `.khive/config.toml` discovery
+    //      to the resolved database's own directory — correct for `config_id`
+    //      coherence between a client and a daemon sharing one database, but it
+    //      also relocated `[actor]` discovery away from the connecting process's
+    //      own project. This tier restores it as a SEPARATE lookup.
+    //   3. Whatever `resolved.actor_id` already carries from the
+    //      database-anchored config load / `KHIVE_ACTOR` env direct-read
+    //      (`resolve_config` / `resolve_actor_from_config` / `RuntimeConfig::
+    //      default()` above) — the pre-#651-drift fallback tier. This is the
+    //      ONLY place `KHIVE_ACTOR` env feeds `actor_id`; it never touches
+    //      `default_namespace`.
+    //   4. Anonymous (`None`).
+    //
+    // Attribution-only: none of these tiers may feed `config_id` (`actor_id` is
+    // not read by `compute_config_id`) or `default_namespace` (tier 1 already
+    // sets `default_namespace` via `inputs.namespace` — unchanged pre-existing
+    // behavior; tiers 2-4 never touch it, per ADR-007 Rev 4 Rule 0).
     let resolved = {
         let mut resolved = resolved;
         let ns = resolved.default_namespace.as_str().to_string();
-        if resolved.actor_id.is_none() && inputs.namespace_explicit && ns != "local" {
+        if inputs.namespace_explicit && ns != "local" {
+            // An explicit non-"local" namespace (CLI `--actor`/`--namespace`,
+            // or `kkernel exec`/`reindex`'s forced-explicit `--namespace`)
+            // fills `actor_id` directly from the namespace — unchanged
+            // pre-existing ADR-057 fill behavior, kept keyed on
+            // `namespace_explicit` (not `actor_explicit`) so exec/reindex
+            // keep resolving a non-local `--namespace` to that actor.
             resolved.actor_id = Some(ns);
+        } else if inputs.actor_explicit {
+            // Genuinely explicit CLI actor tier requesting anonymous
+            // (`--actor local` / `--namespace local`) is authoritative: do
+            // not fall through to project/db/env actor tiers just because
+            // "local" also looks like "unset". Gated on `actor_explicit`
+            // (not the broader `namespace_explicit`) so `kkernel exec`/
+            // `reindex` — which force `namespace_explicit: true` for
+            // unrelated reasons and have no `--actor` flag — keep falling
+            // through exactly as before.
+            resolved.actor_id = None;
+        } else {
+            let project_actor = khive_runtime::resolve_project_actor_id(inputs.config)
+                .map_err(|e| anyhow::anyhow!("config error: {e}"))?;
+            resolved.actor_id = project_actor.or(resolved.actor_id);
         }
         resolved
     };
@@ -1470,11 +1557,16 @@ pub fn apply_env_output_format(toml_default: Option<OutputFormat>) -> OutputForm
 /// Precedence for embedding engines:
 /// 1. Config file `[[engines]]`
 /// 2. Env vars `KHIVE_EMBEDDING_MODEL` + `KHIVE_ADDITIONAL_EMBEDDING_MODELS`
+///
+/// `db_path` is the already-resolved database path (or `None` for an in-memory
+/// database); it anchors tier-3 project-local config discovery to the
+/// database's own directory instead of the process cwd.
 fn resolve_config(
     config_path: Option<&std::path::Path>,
     base: RuntimeConfig,
+    db_path: Option<&std::path::Path>,
 ) -> anyhow::Result<RuntimeConfig> {
-    match KhiveConfig::load_with_home_fallback(config_path)
+    match KhiveConfig::load_with_home_fallback(config_path, db_path)
         .map_err(|e| anyhow::anyhow!("config error: {e}"))?
     {
         Some(khive_cfg) => {
@@ -1502,15 +1594,19 @@ fn resolve_config(
 }
 
 /// Resolve only the actor namespace from a config file (no-embed path).
+///
+/// `db_path` anchors tier-3 project-local config discovery to the database's
+/// own directory instead of the process cwd (see [`resolve_config`]).
 fn resolve_actor_from_config(
     config_path: Option<&std::path::Path>,
     base: RuntimeConfig,
     cli_namespace_explicit: bool,
+    db_path: Option<&std::path::Path>,
 ) -> anyhow::Result<RuntimeConfig> {
     if cli_namespace_explicit {
         return Ok(base);
     }
-    match KhiveConfig::load_with_home_fallback(config_path)
+    match KhiveConfig::load_with_home_fallback(config_path, db_path)
         .map_err(|e| anyhow::anyhow!("config error: {e}"))?
     {
         Some(khive_cfg) => {
@@ -1576,6 +1672,7 @@ default = true
             config: Some(&path),
             namespace: Namespace::parse("local").expect("ns"),
             namespace_explicit: false,
+            actor_explicit: false,
             no_embed: false,
             packs: None,
             brain_profile: None,
@@ -1624,6 +1721,7 @@ brain_profile = "unrelated"
             config: Some(&path),
             namespace: Namespace::parse("local").expect("ns"),
             namespace_explicit: false,
+            actor_explicit: false,
             no_embed: false,
             packs: None,
             brain_profile: None,
@@ -1666,6 +1764,7 @@ brain_profile = "project-profile"
             config: Some(&path),
             namespace: Namespace::parse("local").expect("ns"),
             namespace_explicit: false,
+            actor_explicit: false,
             no_embed: false,
             packs: None,
             brain_profile: None, // no explicit CLI flag
@@ -1704,6 +1803,7 @@ default = true
             config: Some(&path),
             namespace: Namespace::parse("local").expect("ns"),
             namespace_explicit: false,
+            actor_explicit: false,
             no_embed: false,
             packs: None,
             brain_profile: None,
@@ -1739,6 +1839,7 @@ brain_profile = "project-profile"
             config: Some(&path),
             namespace: Namespace::parse("local").expect("ns"),
             namespace_explicit: false,
+            actor_explicit: false,
             no_embed: false,
             packs: None,
             brain_profile: Some("cli-profile".to_string()), // explicit CLI
@@ -1763,11 +1864,20 @@ brain_profile = "project-profile"
     fn cli_actor_flag_populates_actor_id() {
         std::env::remove_var("KHIVE_ACTOR");
 
+        // ADR-096 Fork 2: an explicit nonexistent config path (rather than `None`)
+        // keeps this test hermetic against whatever the real `$HOME/.khive/config.toml`
+        // on the machine running the suite happens to contain — the project-actor
+        // tier (`resolve_project_actor_id`) now runs unconditionally and would
+        // otherwise pick up a real machine's global `[actor]`, if one is set.
+        let missing_config =
+            std::path::PathBuf::from("/nonexistent/khive-cli-actor-test/config.toml");
+
         let resolved = resolve_runtime_config(RuntimeConfigInputs {
             db: Some(":memory:"),
-            config: None,
+            config: Some(&missing_config),
             namespace: Namespace::parse("lambda:agent-x").expect("ns"),
             namespace_explicit: true,
+            actor_explicit: true,
             no_embed: true,
             packs: None,
             brain_profile: None,
@@ -1793,11 +1903,16 @@ brain_profile = "project-profile"
     fn cli_actor_flag_local_stays_anonymous() {
         std::env::remove_var("KHIVE_ACTOR");
 
+        // See the hermeticity note in `cli_actor_flag_populates_actor_id` above.
+        let missing_config =
+            std::path::PathBuf::from("/nonexistent/khive-cli-actor-local-test/config.toml");
+
         let resolved = resolve_runtime_config(RuntimeConfigInputs {
             db: Some(":memory:"),
-            config: None,
+            config: Some(&missing_config),
             namespace: Namespace::parse("local").expect("ns"),
             namespace_explicit: true,
+            actor_explicit: true,
             no_embed: true,
             packs: None,
             brain_profile: None,
@@ -1811,14 +1926,535 @@ brain_profile = "project-profile"
         );
     }
 
+    // --- ADR-096 Fork 2: project/cwd-anchored actor restore ---
+    //
+    // These tests exercise the REAL config-discovery path (`std::env::current_dir`
+    // / `HOME`), which #651 anchored to the resolved database's own directory for
+    // `config_id` purposes. Because process cwd and `HOME` are global process
+    // state, each test below temporarily redirects both via `SeatEnv` (a small
+    // RAII guard) and is marked `#[serial]` so it never races another `#[serial]`
+    // test in this file. No other test in this module reads `config: None`
+    // (everything else pins an explicit path or a nonexistent one), so these are
+    // the only tests in this binary that legitimately depend on process cwd/HOME.
+
+    /// RAII guard: temporarily redirects process cwd to `project_root` and `HOME`
+    /// to an isolated, empty tempdir (so tier 4 — `~/.khive/config.toml` — never
+    /// reaches whatever the real machine running this suite happens to have
+    /// configured globally). Restores both on drop, even on panic/unwind.
+    struct SeatEnv {
+        original_cwd: PathBuf,
+        original_home: Option<std::ffi::OsString>,
+        _isolated_home: tempfile::TempDir,
+    }
+
+    impl SeatEnv {
+        fn enter(project_root: &std::path::Path) -> Self {
+            let original_cwd = std::env::current_dir().expect("read cwd");
+            let original_home = std::env::var_os("HOME");
+            let isolated_home = tempfile::tempdir().expect("isolated HOME tempdir");
+            std::env::set_current_dir(project_root).expect("chdir into seat project root");
+            std::env::set_var("HOME", isolated_home.path());
+            Self {
+                original_cwd,
+                original_home,
+                _isolated_home: isolated_home,
+            }
+        }
+    }
+
+    impl Drop for SeatEnv {
+        fn drop(&mut self) {
+            let _ = std::env::set_current_dir(&self.original_cwd);
+            match &self.original_home {
+                Some(h) => std::env::set_var("HOME", h),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+    }
+
+    /// Unit-level proof that `resolve_project_actor_id` reads the cwd-anchored
+    /// project config — the pre-#651 tier-3 location — independently of any
+    /// database directory. This is the primitive Fork 2 restores.
+    #[test]
+    #[serial]
+    fn resolve_project_actor_id_reads_cwd_anchored_project_config() {
+        std::env::remove_var("KHIVE_ACTOR");
+
+        let seat_dir = tempfile::tempdir().expect("seat tempdir");
+        std::fs::create_dir_all(seat_dir.path().join(".khive")).expect("mkdir seat .khive");
+        std::fs::write(
+            seat_dir.path().join(".khive/config.toml"),
+            "[actor]\nid = \"lambda:seat-actor\"\n",
+        )
+        .expect("write seat config");
+
+        let _seat_env = SeatEnv::enter(seat_dir.path());
+
+        assert_eq!(
+            khive_runtime::resolve_project_actor_id(None).expect("no config error"),
+            Some("lambda:seat-actor".to_string()),
+            "resolve_project_actor_id must read the cwd-anchored .khive/config.toml \
+             regardless of any database directory"
+        );
+    }
+
+    /// ADR-096 Fork 2 pinning regression test — the exact regression class that
+    /// broke the fleet: a seat-shaped connection whose cwd carries its own
+    /// `.khive/config.toml` with an `[actor] id`, while the resolved database (and
+    /// its own db-anchored config directory) lives ELSEWHERE and carries no
+    /// `[actor]` at all — exactly how daemon-multiplexed seats run in production
+    /// (every seat's own project dir vs. one shared home database).
+    ///
+    /// Exercises the REAL discovery path end-to-end through `resolve_runtime_config`
+    /// (not a synthetic roots-based helper), so a future change to config discovery
+    /// that re-collapses this fails THIS test loudly instead of silently reducing
+    /// every seat's attribution to `"local"` / anonymous.
+    #[test]
+    #[serial]
+    fn seat_shaped_project_actor_resolves_through_full_tier_chain() {
+        std::env::remove_var("KHIVE_ACTOR");
+
+        // The seat: a project directory with its own `[actor] id`.
+        let seat_dir = tempfile::tempdir().expect("seat tempdir");
+        std::fs::create_dir_all(seat_dir.path().join(".khive")).expect("mkdir seat .khive");
+        std::fs::write(
+            seat_dir.path().join(".khive/config.toml"),
+            "[actor]\nid = \"lambda:seat-actor\"\n",
+        )
+        .expect("write seat config");
+
+        // The shared database: a DIFFERENT directory, with no config.toml at its
+        // own db-anchored location (the shared-home-database fleet case).
+        let db_dir = tempfile::tempdir().expect("db tempdir");
+        let khive_dir = db_dir.path().join(".khive");
+        std::fs::create_dir_all(&khive_dir).expect("mkdir db .khive");
+        let db_path = khive_dir.join("khive.db");
+        std::fs::write(&db_path, b"").expect("touch db file");
+        let db_str = db_path.to_str().expect("utf8 path").to_string();
+
+        let _seat_env = SeatEnv::enter(seat_dir.path());
+
+        let resolved = resolve_runtime_config(RuntimeConfigInputs {
+            db: Some(&db_str),
+            config: None,
+            namespace: Namespace::parse("local").expect("ns"),
+            namespace_explicit: false,
+            actor_explicit: false,
+            no_embed: true,
+            packs: None,
+            brain_profile: None,
+        })
+        .expect("resolve seat-shaped config");
+
+        assert_eq!(
+            resolved.actor_id.as_deref(),
+            Some("lambda:seat-actor"),
+            "a seat-shaped cwd with its own [actor] must resolve that actor through \
+             the full discovery path even when the shared db-anchored config \
+             location carries none — got {:?}",
+            resolved.actor_id
+        );
+        assert_ne!(
+            resolved.actor_id.as_deref(),
+            Some("local"),
+            "must not collapse to the literal namespace string"
+        );
+    }
+
+    /// CLI `--actor` (tier 1) must win over a discovered project-config `[actor]`
+    /// (tier 2), per the ratified full precedence chain (ADR-096 Fork 2:
+    /// CLI > project-config > KHIVE_ACTOR env > anonymous).
+    #[test]
+    #[serial]
+    fn cli_actor_flag_wins_over_project_config_actor() {
+        std::env::remove_var("KHIVE_ACTOR");
+
+        let seat_dir = tempfile::tempdir().expect("seat tempdir");
+        std::fs::create_dir_all(seat_dir.path().join(".khive")).expect("mkdir seat .khive");
+        std::fs::write(
+            seat_dir.path().join(".khive/config.toml"),
+            "[actor]\nid = \"lambda:project-actor\"\n",
+        )
+        .expect("write seat config");
+
+        let _seat_env = SeatEnv::enter(seat_dir.path());
+
+        let resolved = resolve_runtime_config(RuntimeConfigInputs {
+            db: Some(":memory:"),
+            config: None,
+            namespace: Namespace::parse("lambda:cli-actor").expect("ns"),
+            namespace_explicit: true,
+            actor_explicit: true,
+            no_embed: true,
+            packs: None,
+            brain_profile: None,
+        })
+        .expect("resolve config");
+
+        assert_eq!(
+            resolved.actor_id.as_deref(),
+            Some("lambda:cli-actor"),
+            "an explicit --actor flag must win over a discovered project-config actor"
+        );
+    }
+
+    /// Project-config `[actor] id` (tier 2) must win over `KHIVE_ACTOR` env
+    /// (tier 3) when both are present, and env must still be used as a fallback
+    /// when no project config exists — the precedence this ADR restores.
+    #[test]
+    #[serial]
+    fn project_actor_config_beats_khive_actor_env_which_falls_back_to_anonymous() {
+        std::env::remove_var("KHIVE_ACTOR");
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = write_config(
+            dir.path(),
+            r#"
+[actor]
+id = "lambda:project-actor"
+"#,
+        );
+
+        std::env::set_var("KHIVE_ACTOR", "lambda:env-actor");
+
+        let with_project_config = resolve_runtime_config(RuntimeConfigInputs {
+            db: Some(":memory:"),
+            config: Some(&path),
+            namespace: Namespace::parse("local").expect("ns"),
+            namespace_explicit: false,
+            actor_explicit: false,
+            no_embed: true,
+            packs: None,
+            brain_profile: None,
+        })
+        .expect("resolve config with project actor");
+
+        let missing_config =
+            std::path::PathBuf::from("/nonexistent/khive-project-vs-env-test/config.toml");
+        let without_project_config = resolve_runtime_config(RuntimeConfigInputs {
+            db: Some(":memory:"),
+            config: Some(&missing_config),
+            namespace: Namespace::parse("local").expect("ns"),
+            namespace_explicit: false,
+            actor_explicit: false,
+            no_embed: true,
+            packs: None,
+            brain_profile: None,
+        })
+        .expect("resolve config without project actor");
+
+        std::env::remove_var("KHIVE_ACTOR");
+
+        assert_eq!(
+            with_project_config.actor_id.as_deref(),
+            Some("lambda:project-actor"),
+            "a project-config [actor] id must win over KHIVE_ACTOR env"
+        );
+        assert_eq!(
+            without_project_config.actor_id.as_deref(),
+            Some("lambda:env-actor"),
+            "KHIVE_ACTOR env must still be used when no project config actor exists"
+        );
+    }
+
+    /// Codex PR #657 review, [High]: drives the REAL `clap` parse of `Args`
+    /// (not a hand-built `RuntimeConfigInputs`) to prove a bare shell-level
+    /// `KHIVE_ACTOR` no longer occupies the tier-1 CLI slot. Before the fix,
+    /// `args.rs` bound `--actor` to `env = "KHIVE_ACTOR"`, so this env var
+    /// alone made `resolve_cli_namespace` report `explicit = true` and
+    /// therefore beat the project-config tier — inverting the ratified
+    /// chain (CLI flag > project config > `KHIVE_ACTOR` env > anonymous).
+    #[test]
+    #[serial]
+    fn real_clap_path_khive_actor_env_no_longer_wins_over_project_config() {
+        use clap::Parser;
+        std::env::remove_var("KHIVE_ACTOR");
+
+        let seat_dir = tempfile::tempdir().expect("seat tempdir");
+        std::fs::create_dir_all(seat_dir.path().join(".khive")).expect("mkdir seat .khive");
+        std::fs::write(
+            seat_dir.path().join(".khive/config.toml"),
+            "[actor]\nid = \"lambda:project-actor\"\n",
+        )
+        .expect("write seat config");
+
+        let _seat_env = SeatEnv::enter(seat_dir.path());
+        std::env::set_var("KHIVE_ACTOR", "lambda:env-actor");
+
+        // The real arg vector `kkernel mcp` parses — no `--actor` flag, so a
+        // pre-fix `env = "KHIVE_ACTOR"` binding would populate `args.actor`.
+        let args = Args::try_parse_from(["mcp"]).expect("parse real mcp args");
+        let (namespace_explicit, namespace) =
+            resolve_cli_namespace(&args).expect("resolve cli namespace");
+
+        let resolved = resolve_runtime_config(RuntimeConfigInputs {
+            db: Some(":memory:"),
+            config: None,
+            namespace,
+            namespace_explicit,
+            actor_explicit: namespace_explicit,
+            no_embed: true,
+            packs: None,
+            brain_profile: None,
+        });
+
+        std::env::remove_var("KHIVE_ACTOR");
+        let resolved = resolved.expect("resolve config");
+
+        assert!(
+            !namespace_explicit,
+            "KHIVE_ACTOR env alone must NOT make the CLI namespace tier explicit"
+        );
+        assert_eq!(
+            resolved.actor_id.as_deref(),
+            Some("lambda:project-actor"),
+            "project-config [actor] id must win over KHIVE_ACTOR env on the real clap path"
+        );
+        assert_eq!(
+            resolved.default_namespace.as_str(),
+            "local",
+            "KHIVE_ACTOR env must never set default_namespace, only actor_id"
+        );
+    }
+
+    /// Codex PR #657 review, [High], second case: with no project config and
+    /// no `--actor` flag, `KHIVE_ACTOR` must still land as the tier-3
+    /// `actor_id` fallback (it is read directly by `RuntimeConfig::default()`,
+    /// independent of the removed clap `env` binding) — and must still leave
+    /// `default_namespace` at `"local"`.
+    #[test]
+    #[serial]
+    fn real_clap_path_khive_actor_env_falls_back_to_tier3_actor_id() {
+        use clap::Parser;
+        std::env::remove_var("KHIVE_ACTOR");
+
+        // No project config anywhere on the discovery path: an isolated,
+        // empty seat dir + isolated HOME (SeatEnv), so tier 2 and tier 4
+        // (~/.khive/config.toml) both come up empty.
+        let seat_dir = tempfile::tempdir().expect("seat tempdir");
+        let _seat_env = SeatEnv::enter(seat_dir.path());
+        std::env::set_var("KHIVE_ACTOR", "lambda:env-only-actor");
+
+        let args = Args::try_parse_from(["mcp"]).expect("parse real mcp args");
+        let (namespace_explicit, namespace) =
+            resolve_cli_namespace(&args).expect("resolve cli namespace");
+
+        let resolved = resolve_runtime_config(RuntimeConfigInputs {
+            db: Some(":memory:"),
+            config: None,
+            namespace,
+            namespace_explicit,
+            actor_explicit: namespace_explicit,
+            no_embed: true,
+            packs: None,
+            brain_profile: None,
+        });
+
+        std::env::remove_var("KHIVE_ACTOR");
+        let resolved = resolved.expect("resolve config");
+
+        assert!(
+            !namespace_explicit,
+            "KHIVE_ACTOR env alone must NOT make the CLI namespace tier explicit"
+        );
+        assert_eq!(
+            resolved.actor_id.as_deref(),
+            Some("lambda:env-only-actor"),
+            "KHIVE_ACTOR env must still land as the tier-3 actor_id fallback \
+             when no project config exists"
+        );
+        assert_eq!(
+            resolved.default_namespace.as_str(),
+            "local",
+            "KHIVE_ACTOR env must never set default_namespace, only actor_id"
+        );
+    }
+
+    /// Codex PR #657 review, [Medium]: an explicit `--actor local` (an operator
+    /// request for the anonymous identity) must suppress BOTH the project-config
+    /// and the db-anchored-config actor tiers, not just the missing-flag default.
+    /// Before the fix, `resolve_runtime_config`'s tier-3 fold used
+    /// `cli_actor.or(project_actor).or(resolved.actor_id)` unconditionally, so an
+    /// explicit `local` (which maps to `cli_actor = None`) still fell through to
+    /// whatever project or db-anchored `[actor]` happened to be discovered.
+    #[test]
+    #[serial]
+    fn explicit_actor_local_suppresses_project_and_db_actor_tiers() {
+        std::env::remove_var("KHIVE_ACTOR");
+
+        // The seat: a project directory with its own `[actor] id`.
+        let seat_dir = tempfile::tempdir().expect("seat tempdir");
+        std::fs::create_dir_all(seat_dir.path().join(".khive")).expect("mkdir seat .khive");
+        std::fs::write(
+            seat_dir.path().join(".khive/config.toml"),
+            "[actor]\nid = \"lambda:seat-actor\"\n",
+        )
+        .expect("write seat config");
+
+        // A DIFFERENT db-anchored directory that ALSO carries its own `[actor]`
+        // (the db-anchored config load in `resolve_config` applies this
+        // unconditionally, regardless of the CLI explicit flag).
+        let db_dir = tempfile::tempdir().expect("db tempdir");
+        let khive_dir = db_dir.path().join(".khive");
+        std::fs::create_dir_all(&khive_dir).expect("mkdir db .khive");
+        std::fs::write(
+            khive_dir.join("config.toml"),
+            "[actor]\nid = \"lambda:db-actor\"\n",
+        )
+        .expect("write db-anchored config");
+        let db_path = khive_dir.join("khive.db");
+        std::fs::write(&db_path, b"").expect("touch db file");
+        let db_str = db_path.to_str().expect("utf8 path").to_string();
+
+        let _seat_env = SeatEnv::enter(seat_dir.path());
+
+        let resolved = resolve_runtime_config(RuntimeConfigInputs {
+            db: Some(&db_str),
+            config: None,
+            namespace: Namespace::parse("local").expect("ns"),
+            namespace_explicit: true,
+            actor_explicit: true,
+            no_embed: false,
+            packs: None,
+            brain_profile: None,
+        })
+        .expect("resolve config");
+
+        assert_eq!(
+            resolved.actor_id, None,
+            "explicit --actor local must resolve to anonymous even when both a \
+             project-config and a db-anchored config declare an [actor] id — got {:?}",
+            resolved.actor_id
+        );
+        assert_eq!(
+            resolved.default_namespace.as_str(),
+            "local",
+            "explicit --actor local must keep default_namespace local"
+        );
+    }
+
+    /// `config_id` must stay byte-identical across two connections that share ONE
+    /// database but declare DIFFERENT `[actor]` ids via their own project/cwd
+    /// config (ADR-096 Fork 2 hard invariant — `actor_id` must never feed
+    /// `compute_config_id`, whether directly or via the `visible_namespaces`
+    /// fold-in). `default_namespace` must also stay `"local"` for both
+    /// (ADR-007 Rev 4 Rule 0), independent of the configured actor.
+    ///
+    /// Deliberately does NOT use an explicit `--config` override for the two
+    /// connections: an explicit path is tier 1 and would make the db-anchored
+    /// config load (which DOES fold its own `[actor]` into `visible_namespaces`,
+    /// unchanged pre-existing behavior) and the new project-actor tier read the
+    /// identical file, conflating "two different db-anchored configs" (a
+    /// different, pre-existing concern) with "two different project-anchored
+    /// actors on one shared db-anchored config" (what Fork 2 must keep
+    /// config_id-inert). Real seats share ONE db-anchored config; only their
+    /// project-anchored actor differs — this test mirrors that shape via `SeatEnv`.
+    #[test]
+    #[serial]
+    fn config_id_byte_identical_across_different_actor_ids() {
+        std::env::remove_var("KHIVE_ACTOR");
+        std::env::remove_var("KHIVE_EMBEDDING_MODEL");
+        std::env::remove_var("KHIVE_ADDITIONAL_EMBEDDING_MODELS");
+
+        // ONE shared database, anchored in its own directory with NO `[actor]` at
+        // that db-anchored config location — mirrors the real fleet shape, where
+        // every seat's project config differs but the shared home database's own
+        // config carries no actor.
+        let db_dir = tempfile::tempdir().expect("db tempdir");
+        let khive_dir = db_dir.path().join(".khive");
+        std::fs::create_dir_all(&khive_dir).expect("mkdir db .khive");
+        let db_path = khive_dir.join("khive.db");
+        std::fs::write(&db_path, b"").expect("touch db file");
+        let db_str = db_path.to_str().expect("utf8 path").to_string();
+
+        // Two different seat project directories, each with its OWN distinct
+        // [actor] id.
+        let seat_a = tempfile::tempdir().expect("seat a");
+        std::fs::create_dir_all(seat_a.path().join(".khive")).expect("mkdir seat a .khive");
+        std::fs::write(
+            seat_a.path().join(".khive/config.toml"),
+            "[actor]\nid = \"lambda:actor-a\"\n",
+        )
+        .expect("write seat a config");
+
+        let seat_b = tempfile::tempdir().expect("seat b");
+        std::fs::create_dir_all(seat_b.path().join(".khive")).expect("mkdir seat b .khive");
+        std::fs::write(
+            seat_b.path().join(".khive/config.toml"),
+            "[actor]\nid = \"lambda:actor-b\"\n",
+        )
+        .expect("write seat b config");
+
+        let cfg_a = {
+            let _seat_env = SeatEnv::enter(seat_a.path());
+            resolve_runtime_config(RuntimeConfigInputs {
+                db: Some(&db_str),
+                config: None,
+                namespace: Namespace::parse("local").expect("ns"),
+                namespace_explicit: false,
+                actor_explicit: false,
+                no_embed: true,
+                packs: None,
+                brain_profile: None,
+            })
+            .expect("resolve config a")
+        };
+
+        let cfg_b = {
+            let _seat_env = SeatEnv::enter(seat_b.path());
+            resolve_runtime_config(RuntimeConfigInputs {
+                db: Some(&db_str),
+                config: None,
+                namespace: Namespace::parse("local").expect("ns"),
+                namespace_explicit: false,
+                actor_explicit: false,
+                no_embed: true,
+                packs: None,
+                brain_profile: None,
+            })
+            .expect("resolve config b")
+        };
+
+        assert_eq!(cfg_a.actor_id.as_deref(), Some("lambda:actor-a"));
+        assert_eq!(cfg_b.actor_id.as_deref(), Some("lambda:actor-b"));
+        assert_ne!(
+            cfg_a.actor_id, cfg_b.actor_id,
+            "precondition: the two connections must actually declare different actors"
+        );
+
+        assert_eq!(
+            cfg_a.default_namespace.as_str(),
+            "local",
+            "default_namespace must stay local regardless of the configured actor"
+        );
+        assert_eq!(
+            cfg_b.default_namespace.as_str(),
+            "local",
+            "default_namespace must stay local regardless of the configured actor"
+        );
+
+        assert_eq!(
+            crate::server::compute_config_id(&cfg_a, None),
+            crate::server::compute_config_id(&cfg_b, None),
+            "config_id must be byte-identical across connections that differ ONLY \
+             in [actor] id — actor_id must never feed compute_config_id"
+        );
+    }
+
     // --- multi-backend boot path (ADR-028) ---
 
     /// Build a `RuntimeConfig` suitable for multi-backend tests: in-memory db,
     /// AllowAllGate, "local" namespace, no embedder, both kg and comm packs.
+    ///
+    /// `db_path` mirrors what `resolve_runtime_config` sets for a `--db`-unset
+    /// invocation (every call site below passes `cli_db_override: None` to
+    /// `build_server_multi_backend`/`build_registry_for_multi_backend`) — the
+    /// db-anchor consistency guard those functions run requires `db_path` to
+    /// agree with `resolve_db_anchor` for the same input.
     fn base_runtime_config_for_multi_backend() -> RuntimeConfig {
         use khive_runtime::{AllowAllGate, BackendId, Namespace};
         RuntimeConfig {
-            db_path: None,
+            db_path: khive_runtime::resolve_db_anchor(None),
             gate: std::sync::Arc::new(AllowAllGate),
             default_namespace: Namespace::parse("local").expect("ns"),
             embedding_model: None,
@@ -2174,7 +2810,14 @@ brain_profile = "project-profile"
             ..KhiveConfig::default()
         };
 
-        let base_cfg = base_runtime_config_for_multi_backend();
+        // `db_path` matches the concrete override passed below (the db-anchor
+        // consistency guard requires this pairing) — the ambiguity rejection
+        // this test exercises is a downstream check inside
+        // `build_registry_for_multi_backend`, distinct from anchor drift.
+        let base_cfg = RuntimeConfig {
+            db_path: khive_runtime::resolve_db_anchor(Some("/tmp/some-explicit-override.db")),
+            ..base_runtime_config_for_multi_backend()
+        };
 
         let result = build_registry_for_multi_backend(
             base_cfg,
@@ -2642,7 +3285,14 @@ brain_profile = "project-profile"
             ..KhiveConfig::default()
         };
 
-        let base_cfg = base_runtime_config_for_multi_backend();
+        // `db_path` matches the concrete override passed below (the db-anchor
+        // consistency guard requires this pairing) — the ambiguity rejection
+        // this test exercises is a downstream check inside
+        // `build_registry_for_multi_backend`, distinct from anchor drift.
+        let base_cfg = RuntimeConfig {
+            db_path: khive_runtime::resolve_db_anchor(Some("/tmp/some-explicit-override.db")),
+            ..base_runtime_config_for_multi_backend()
+        };
 
         let result = build_server_multi_backend(
             base_cfg,

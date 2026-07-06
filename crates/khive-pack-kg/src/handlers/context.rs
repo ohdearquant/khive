@@ -1,13 +1,14 @@
 //! `context` verb handler (ADR-089): entity-anchored graph context in one call.
 //!
 //! Composes `hybrid_search` (anchor selection from a query) and
-//! `neighbors_with_query` (bounded 1/2-hop expansion) — both runtime ops are
-//! reused unchanged. Two handler-local decisions fill gaps the runtime ops
-//! don't cover, documented at their call sites below:
-//!   1. `NeighborHit` carries no `direction` field (the storage-level query
-//!      does `source UNION ALL target` with no discriminator column), so
-//!      per-neighbor direction is reconstructed by issuing separate Out/In
-//!      calls when the effective direction is `Both`, then tagging results.
+//! `neighbors_with_query` / `neighbors_with_query_directed` (bounded 1/2-hop
+//! expansion) — both runtime ops are reused unchanged. Two handler-local
+//! decisions fill gaps the runtime ops don't cover, documented at their call
+//! sites below:
+//!   1. A plain `NeighborHit` carries no `direction` field, so an effective
+//!      direction of `Both` uses `neighbors_with_query_directed`, which fetches
+//!      both directions in a single storage query (`UNION ALL` with a
+//!      direction literal per arm) and returns each hit tagged `Out`/`In`.
 //!   2. Symmetric relations (`competes_with`, `composed_with`) force
 //!      `Direction::Both` inside `neighbors_with_query` regardless of the
 //!      direction requested (existing op behavior) — the handler mirrors
@@ -82,18 +83,9 @@ fn relations_all_symmetric(relations: Option<&[EdgeRelation]>) -> bool {
     }
 }
 
-fn cmp_weight_desc_id_asc(
-    a: &(Uuid, EdgeRelation, f64, &'static str),
-    b: &(Uuid, EdgeRelation, f64, &'static str),
-) -> std::cmp::Ordering {
-    b.2.partial_cmp(&a.2)
-        .unwrap_or(std::cmp::Ordering::Equal)
-        .then_with(|| a.0.cmp(&b.0))
-}
-
 /// Fetch up to `fanout` neighbors of `node_id`, each tagged with its actual
-/// direction relative to `node_id`. See module docs for why this composes
-/// two calls rather than trusting a `direction` field on `NeighborHit`.
+/// direction relative to `node_id`. See module docs for why this can't just
+/// trust a `direction` field on a plain `NeighborHit`.
 async fn fetch_directed_neighbors(
     runtime: &KhiveRuntime,
     token: &NamespaceToken,
@@ -161,42 +153,37 @@ async fn fetch_directed_neighbors(
                 .collect())
         }
         Direction::Both => {
-            let out_hits = runtime
-                .neighbors_with_query(
+            // Single UNION ALL query for both directions (ADR-089 context-verb
+            // optimization) instead of two separate direction-scoped calls —
+            // halves the storage neighbor SELECT count for this branch. The
+            // op already returns hits in global weight-descending,
+            // node_id-ascending order truncated to `fanout`, so no local
+            // re-sort/truncate is needed.
+            let hits = runtime
+                .neighbors_with_query_directed(
                     token,
                     node_id,
                     NeighborQuery {
-                        direction: Direction::Out,
-                        relations: relations_vec.clone(),
-                        limit: Some(fanout),
-                        min_weight: None,
-                    },
-                )
-                .await?;
-            let in_hits = runtime
-                .neighbors_with_query(
-                    token,
-                    node_id,
-                    NeighborQuery {
-                        direction: Direction::In,
+                        direction: Direction::Both,
                         relations: relations_vec,
                         limit: Some(fanout),
                         min_weight: None,
                     },
                 )
                 .await?;
-            let mut merged: Vec<(Uuid, EdgeRelation, f64, &'static str)> = out_hits
+            Ok(hits
                 .into_iter()
-                .map(|h| (h.node_id, h.relation, h.weight, "outgoing"))
-                .chain(
-                    in_hits
-                        .into_iter()
-                        .map(|h| (h.node_id, h.relation, h.weight, "incoming")),
-                )
-                .collect();
-            merged.sort_by(cmp_weight_desc_id_asc);
-            merged.truncate(fanout as usize);
-            Ok(merged)
+                .map(|(h, dir)| {
+                    // `neighbors_with_query_directed` only ever tags hits `Out`/`In`
+                    // (see `DirectedNeighborHit` doc comment) — `Both` never appears.
+                    let tag = if dir == Direction::Out {
+                        "outgoing"
+                    } else {
+                        "incoming"
+                    };
+                    (h.node_id, h.relation, h.weight, tag)
+                })
+                .collect())
         }
     }
 }
@@ -640,24 +627,6 @@ mod tests {
             EdgeRelation::CompetesWith,
             EdgeRelation::Extends
         ])));
-    }
-
-    #[test]
-    fn cmp_weight_desc_id_asc_orders_higher_weight_first() {
-        let hi = (Uuid::nil(), EdgeRelation::Extends, 0.9, "outgoing");
-        let lo = (Uuid::max(), EdgeRelation::Extends, 0.1, "outgoing");
-        assert_eq!(
-            cmp_weight_desc_id_asc(&hi, &lo),
-            std::cmp::Ordering::Less,
-            "higher weight must sort first"
-        );
-    }
-
-    #[test]
-    fn cmp_weight_desc_id_asc_ties_break_by_uuid_ascending() {
-        let a = (Uuid::nil(), EdgeRelation::Extends, 0.5, "outgoing");
-        let b = (Uuid::max(), EdgeRelation::Extends, 0.5, "outgoing");
-        assert_eq!(cmp_weight_desc_id_asc(&a, &b), std::cmp::Ordering::Less);
     }
 
     #[test]

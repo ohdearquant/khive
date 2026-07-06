@@ -95,7 +95,7 @@ For historical context, see [v0 archive](../_archive/adr_v0/README.md). v0 ADRs 
 | [ADR-061](ADR-061-pack-extensible-by-id-resolution.md)       | Pack-Extensible by-ID Resolution (Accepted)                                                                     |
 | [ADR-062](ADR-062-fts-ann-consolidation.md)                  | FTS and ANN Consolidation -- Unified Search Tables (Schema V4) (Accepted)                                       |
 | [ADR-066](ADR-066-autonomous-merge-pipeline.md)              | Autonomous Merge Pipeline — Gate Wall as Reviewer, Human Gate at Release (Proposed)                             |
-| [ADR-067](ADR-067-write-owner-daemon.md)                     | Write-Owner Daemon — Single-Writer Task and Write Queue (Proposed)                                              |
+| [ADR-067](ADR-067-write-owner-daemon.md)                     | Write-Owner Daemon — Single-Writer Task and Write Queue (Accepted)                                              |
 | [ADR-068](ADR-068-process-isolation-topology.md)             | Per-Process Isolation Topology (Proposed)                                                                       |
 | [ADR-069](ADR-069-subject-model.md)                          | Subject Model — Domain-Ontology Ingestion and Map Pipeline (Proposed)                                           |
 | [ADR-071](ADR-071-backend-pluggable-runtime.md)              | Backend-Pluggable Runtime — Polystore Restoration (Accepted)                                                    |
@@ -116,11 +116,12 @@ For historical context, see [v0 archive](../_archive/adr_v0/README.md). v0 ADRs 
 | [ADR-088](ADR-088-git-lifecycle-pack.md)                     | Git-Lifecycle Pack — Commit and Issue Note Kinds (Proposed)                                                     |
 | [ADR-089](ADR-089-context-verb.md)                           | Context Verb — Entity-Anchored Graph Context in One Call (Proposed)                                             |
 | [ADR-090](ADR-090-docs-site-standard.md)                     | Docs Site Standard — Navigation, Agent md/txt Surfaces, Visual Style (Proposed)                                 |
-| [ADR-091](ADR-091-wal-snapshot-lifetime.md)                  | Bounded Read-Transaction Lifetime and WAL Checkpoint Escalation (Proposed)                                      |
+| [ADR-091](ADR-091-wal-snapshot-lifetime.md)                  | Bounded Read-Transaction Lifetime and WAL Checkpoint Escalation (Accepted)                                      |
 | [ADR-092](ADR-092-context-composer.md)                       | Cross-Substrate Context Composer — ContextContributor Trait + `context.assemble` (Proposed)                     |
 | [ADR-093](ADR-093-sessions-raw-zstd-compression.md)          | zstd Compression for Session-Mirror Raw Storage (Proposed)                                                      |
 | [ADR-094](ADR-094-lifecycle-telemetry-events.md)             | Sequencing-Assertable Lifecycle Telemetry Events (Proposed)                                                     |
 | [ADR-095](ADR-095-verb-surface-consolidation.md)             | Verb-Surface Consolidation and Field-Validation Governance (Proposed)                                           |
+| [ADR-096](ADR-096-warm-daemon-per-request-identity.md)       | Warm Daemon Per-Request Identity — Serving Many Attribution Identities Over One Shared Backend (Accepted)       |
 
 ## Closed Taxonomies — Quick Reference
 

@@ -287,6 +287,18 @@ pub struct NeighborHit {
     pub entity_type: Option<String>,
 }
 
+/// A [`NeighborHit`] tagged with the direction it was found in, relative to
+/// the queried node. Returned by [`crate::GraphStore::neighbors_both_directions`],
+/// which fetches both directions in a single `UNION ALL` query instead of two
+/// separate direction-scoped calls — the tag lets a caller (e.g. the `context`
+/// verb) label each hit `outgoing`/`incoming` without paying for the second
+/// query. Only `Direction::Out` and `Direction::In` are ever populated here.
+#[derive(Clone, Debug)]
+pub struct DirectedNeighborHit {
+    pub hit: NeighborHit,
+    pub direction: Direction,
+}
+
 /// Raw deserialization target for [`TraversalOptions`].
 #[derive(Deserialize)]
 struct TraversalOptionsRaw {

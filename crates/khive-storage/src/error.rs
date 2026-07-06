@@ -79,6 +79,21 @@ pub enum StorageError {
         #[source]
         source: Box<dyn StdError + Send + Sync>,
     },
+
+    /// The bounded write-queue channel (ADR-067 Component A) did not free
+    /// capacity within the caller-supplied deadline. Returned only when a
+    /// caller wraps `WriterTaskHandle::send`'s `channel.send().await` in a
+    /// `tokio::time::timeout` — there is no immediate-error `try_send` path;
+    /// an un-timed-out send simply keeps applying backpressure.
+    #[error("write queue full: timed out after {timeout_ms}ms waiting for writer task capacity")]
+    WriteQueueFull { timeout_ms: u64 },
+
+    /// An internal write-queue plumbing failure not attributable to a
+    /// specific storage capability: the writer task's channel closed (the
+    /// task panicked or was dropped) or its oneshot reply was dropped before
+    /// sending a result.
+    #[error("internal storage error: {0}")]
+    Internal(String),
 }
 
 impl StorageError {
@@ -106,7 +121,11 @@ impl StorageError {
             | Self::Serialization { capability, .. }
             | Self::IndexMaintenance { capability, .. }
             | Self::Driver { capability, .. } => Some(*capability),
-            Self::Pool { .. } | Self::Timeout { .. } | Self::Transaction { .. } => None,
+            Self::Pool { .. }
+            | Self::Timeout { .. }
+            | Self::Transaction { .. }
+            | Self::WriteQueueFull { .. }
+            | Self::Internal(..) => None,
         }
     }
 
@@ -114,7 +133,10 @@ impl StorageError {
     pub fn is_retryable(&self) -> bool {
         matches!(
             self,
-            Self::Pool { .. } | Self::Timeout { .. } | Self::Transaction { .. }
+            Self::Pool { .. }
+                | Self::Timeout { .. }
+                | Self::Transaction { .. }
+                | Self::WriteQueueFull { .. }
         )
     }
 

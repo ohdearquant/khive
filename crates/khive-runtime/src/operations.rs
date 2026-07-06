@@ -17,9 +17,9 @@ use uuid::Uuid;
 use khive_score::DeterministicScore;
 use khive_storage::note::Note;
 use khive_storage::types::{
-    BatchWriteSummary, DeleteMode, Direction, EdgeSortField, GraphPath, LinkId, NeighborHit,
-    NeighborQuery, Page, PageRequest, SortOrder, SqlRow, SqlStatement, SqlValue, TextFilter,
-    TextQueryMode, TextSearchRequest, TraversalRequest,
+    BatchWriteSummary, DeleteMode, DirectedNeighborHit, Direction, EdgeSortField, GraphPath,
+    LinkId, NeighborHit, NeighborQuery, Page, PageRequest, SortOrder, SqlRow, SqlStatement,
+    SqlValue, TextFilter, TextQueryMode, TextSearchRequest, TraversalRequest,
 };
 use khive_storage::{Edge, EdgeRelation, Entity, EntityFilter, Event, EventFilter};
 use khive_types::{EdgeEndpointRule, EndpointKind, EventKind, SubstrateKind};
@@ -211,6 +211,20 @@ fn normalize_symmetric_direction(
         Direction::Both
     } else {
         direction
+    }
+}
+
+/// Stable tie-break rank for [`Direction`] — `Out` before `In` — used to make
+/// the both-direction sort/dedup key total over self-loop edges. A self-loop
+/// (`source_id == target_id == node_id`) produces two `UNION ALL` rows with
+/// the same `(node_id, edge_id)` but opposite directions; without direction in
+/// the key, sort-then-dedup collapses them to one and drops the direction
+/// parity a separate `Out` call plus a separate `In` call would preserve.
+fn direction_sort_rank(direction: &Direction) -> u8 {
+    match direction {
+        Direction::Out => 0,
+        Direction::In => 1,
+        Direction::Both => 2,
     }
 }
 
@@ -1758,6 +1772,79 @@ impl KhiveRuntime {
                 .then(a.node_id.cmp(&b.node_id))
         });
         Ok(hits)
+    }
+
+    /// Get both-direction neighbors, each tagged with the direction (`Out`/
+    /// `In`) it was found in, via a single storage query per visible
+    /// namespace instead of two separate direction-scoped `neighbors_with_query`
+    /// calls (ADR-089 context-verb optimization — halves the neighbor SELECT
+    /// count for `context(direction="both")` expansion). `query.direction` is
+    /// ignored — always both.
+    ///
+    /// Mirrors `neighbors_with_query`'s dedup/enrich/soft-delete-filter/order
+    /// pipeline exactly, carrying the per-hit direction tag through unchanged.
+    pub async fn neighbors_with_query_directed(
+        &self,
+        token: &NamespaceToken,
+        node_id: Uuid,
+        query: NeighborQuery,
+    ) -> RuntimeResult<Vec<(NeighborHit, Direction)>> {
+        if !self.substrate_exists_in_ns(token, node_id).await? {
+            return Ok(Vec::new());
+        }
+
+        let mut hits: Vec<DirectedNeighborHit> = Vec::new();
+        for ns in token.visible_namespaces() {
+            let temp = NamespaceToken::for_namespace(ns.clone());
+            let mut ns_hits = self
+                .graph(&temp)?
+                .neighbors_both_directions(node_id, query.clone())
+                .await?;
+            hits.append(&mut ns_hits);
+        }
+        // Direction is part of the key (not just node_id/edge_id) so a
+        // self-loop's Out row and In row — same node_id and edge_id, opposite
+        // direction — sort adjacent but distinct and both survive dedup
+        // (internal review round 2, High).
+        hits.sort_by_key(|h| {
+            (
+                h.hit.node_id,
+                h.hit.edge_id,
+                direction_sort_rank(&h.direction),
+            )
+        });
+        hits.dedup_by_key(|h| {
+            (
+                h.hit.node_id,
+                h.hit.edge_id,
+                direction_sort_rank(&h.direction),
+            )
+        });
+
+        let mut plain_hits: Vec<NeighborHit> = hits.iter().map(|h| h.hit.clone()).collect();
+        self.enrich_neighbor_hits(token, &mut plain_hits).await;
+        for (dh, enriched) in hits.iter_mut().zip(plain_hits) {
+            dh.hit = enriched;
+        }
+
+        // Filter out soft-deleted entity nodes (Fix 2).
+        let candidate_ids: Vec<Uuid> = hits.iter().map(|h| h.hit.node_id).collect();
+        let deleted = self.deleted_entity_ids(candidate_ids).await;
+        if !deleted.is_empty() {
+            hits.retain(|h| !deleted.contains(&h.hit.node_id));
+        }
+        // Same global weight-descending/node_id-ascending restore as
+        // `neighbors_with_query` (ADR-089 context-verb review, internal review
+        // round 2, High) — the (node_id, edge_id, direction) sort above exists
+        // only to make `dedup_by_key` adjacent-comparable.
+        hits.sort_by(|a, b| {
+            b.hit
+                .weight
+                .partial_cmp(&a.hit.weight)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(a.hit.node_id.cmp(&b.hit.node_id))
+        });
+        Ok(hits.into_iter().map(|h| (h.hit, h.direction)).collect())
     }
 
     /// Traverse the graph from a set of root nodes.
@@ -5187,6 +5274,71 @@ mod tests {
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].node_id, b.id);
         assert_eq!(filtered[0].relation, EdgeRelation::Extends);
+    }
+
+    /// Self-loop direction parity (internal review round 2, High):
+    /// `neighbors_with_query_directed`'s post-merge dedup must not collapse a
+    /// self-loop edge's Out row and In row into one — they share `(node_id,
+    /// edge_id)` but are opposite directions, matching what a separate `Out`
+    /// call plus a separate `In` call would return for the same edge. The
+    /// self-loop edge is inserted directly through the graph store (`link()`
+    /// rejects source_id == target_id) to exercise the merge/dedup path.
+    #[tokio::test]
+    async fn neighbors_with_query_directed_preserves_self_loop_direction_parity() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+        let centre = rt
+            .create_entity(&tok, "concept", None, "Centre", None, None, vec![])
+            .await
+            .unwrap();
+
+        let now = chrono::Utc::now();
+        rt.graph(&tok)
+            .unwrap()
+            .upsert_edge(Edge {
+                id: LinkId::from(Uuid::new_v4()),
+                namespace: "local".to_string(),
+                source_id: centre.id,
+                target_id: centre.id,
+                relation: EdgeRelation::Extends,
+                weight: 0.7,
+                created_at: now,
+                updated_at: now,
+                deleted_at: None,
+                metadata: None,
+                target_backend: None,
+            })
+            .await
+            .unwrap();
+
+        let directed = rt
+            .neighbors_with_query_directed(
+                &tok,
+                centre.id,
+                NeighborQuery {
+                    direction: Direction::Both,
+                    relations: None,
+                    limit: None,
+                    min_weight: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            directed.len(),
+            2,
+            "a self-loop edge must produce both an Out hit and an In hit, not one collapsed hit"
+        );
+        let directions: Vec<Direction> = directed.iter().map(|(_, d)| d.clone()).collect();
+        assert!(
+            directions.contains(&Direction::Out),
+            "self-loop must retain its Out-tagged hit"
+        );
+        assert!(
+            directions.contains(&Direction::In),
+            "self-loop must retain its In-tagged hit"
+        );
     }
 
     #[tokio::test]

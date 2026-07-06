@@ -333,6 +333,114 @@ impl Default for RuntimeConfig {
     }
 }
 
+/// Resolve the `--db`/`KHIVE_DB` value into the db path used to ANCHOR tier-3
+/// project-local `.khive/config.toml` discovery (`KhiveConfig::load_with_home_fallback`'s
+/// `db_path` parameter), mirroring the precedence `kkernel mcp`'s and `kkernel exec`'s
+/// two call sites use to open the database itself: `:memory:` has no file to anchor on
+/// (`None`); an explicit path anchors on that path; an unset value falls back to
+/// `$HOME/.khive/khive.db`, or the relative path `./.khive/khive.db` when `HOME` is unset —
+/// matching those two call sites' own pre-existing `unwrap_or_else(|_| ".".into())` handling.
+///
+/// This is distinct from a plain override resolver that answers "does the caller want to
+/// override `RuntimeConfig::default().db_path`?" (2-arm, `None` meaning "keep the default").
+/// `resolve_db_anchor` always resolves to a concrete anchor value (3-arm) — it materializes
+/// an anchor path unconditionally rather than asking whether to override one.
+///
+/// Note one deliberate divergence from `RuntimeConfig::default()`: when `HOME` is unset,
+/// `RuntimeConfig::default()` maps its own `db_path` to `None` (`.ok()` on the failed env
+/// lookup short-circuits the following `Option::map`), whereas this function falls back to
+/// `./.khive/khive.db` instead. A caller anchoring config-file discovery wants a concrete
+/// directory to search even without `HOME`; this function is not a stand-in for
+/// `RuntimeConfig::default()`'s own db-path default, only for the two call sites' shared
+/// anchor-derivation logic.
+pub fn resolve_db_anchor(db: Option<&str>) -> Option<std::path::PathBuf> {
+    match db {
+        Some(":memory:") => None,
+        Some(path) => Some(std::path::PathBuf::from(path)),
+        None => {
+            let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+            Some(std::path::PathBuf::from(format!("{home}/.khive/khive.db")))
+        }
+    }
+}
+
+/// Assert that a resolved `db_path` — the path a runtime is about to open, and
+/// the same value `compute_config_id` folds into a process's `config_id` — agrees
+/// with what [`resolve_db_anchor`] derives from the same explicit `--db` /
+/// `KHIVE_DB` input. Call this at each construction boundary right after the
+/// `db_path` that boundary is about to use has been resolved.
+///
+/// A construction path that recomputes `db_path` independently of
+/// `resolve_db_anchor` (instead of routing through it, directly or via
+/// `resolve_runtime_config`) would otherwise diverge only silently: its
+/// `config_id` would carry the wrong db path, so it would stop matching a
+/// daemon or peer process anchored on the same database, and would silently
+/// fall back to a disconnected, out-of-sync runtime instead of failing loud.
+/// This turns that divergence into a hard error at the point it is introduced.
+///
+/// When `resolve_db_anchor(args_db)` itself resolves to `None` (the
+/// `:memory:` sentinel), there is no canonical anchor path to compare
+/// against, so the guard is inert and returns `Ok(())` unconditionally.
+pub fn assert_db_anchor_consistent(
+    resolved_db_path: Option<&std::path::Path>,
+    args_db: Option<&str>,
+) -> anyhow::Result<()> {
+    let Some(anchor) = resolve_db_anchor(args_db) else {
+        return Ok(());
+    };
+    if resolved_db_path != Some(anchor.as_path()) {
+        anyhow::bail!(
+            "db-path resolution drift at server construction: resolved db_path {:?} \
+             does not match the canonical anchor {:?} computed by resolve_db_anchor \
+             from the same --db input; this construction path likely recomputed the \
+             db path independently instead of routing through the shared resolver, \
+             which would desynchronize config_id from other processes sharing the \
+             same database",
+            resolved_db_path,
+            anchor
+        );
+    }
+    Ok(())
+}
+
+/// Resolve the per-connection attribution actor from the project/cwd-anchored
+/// config tier, independently of the database-anchored config load that governs
+/// `config_id` (ADR-096 Fork 2).
+///
+/// Anchoring tier-3 `.khive/config.toml` discovery to the resolved database's own
+/// directory (commit 10d9c92c, #651) keeps `config_id` coherent between a
+/// short-lived client and a long-running daemon that share one database — that is
+/// correct for the fields that make up `config_id` (packs/db/embed/backend/
+/// visible/outbound). It also relocated discovery of the project-local `[actor]`
+/// block, though. When many per-project connections share one database under a
+/// single `HOME` (the daemon-multiplexed fleet case), the shared database-anchored
+/// config carries no `[actor]`, so every connection's write-stamp attribution
+/// collapses to the default identity.
+///
+/// This performs a SEPARATE, cwd-anchored lookup (`db_path: None`, matching the
+/// pre-#651 tier-3 search) and reads only `[actor].id`. It intentionally does not
+/// read or return anything else from the resolved `KhiveConfig` — `config_id`,
+/// `default_namespace`, and `visible_namespaces` remain governed exclusively by
+/// the existing database-anchored load and must not be perturbed by this tier:
+/// `actor_id` is not part of `compute_config_id` (`khive-mcp` `server.rs`), and
+/// ADR-007 Rev 4 Rule 0 already keeps `[actor].id` out of `default_namespace`.
+///
+/// `config_path` is the same explicit `--config` / `KHIVE_CONFIG` override the
+/// caller's database-anchored load receives — tier 1 short-circuits identically
+/// in both loads, so an explicit override still wins here too.
+///
+/// Returns `Ok(None)` when no project-anchored config exists, or it exists but
+/// carries no non-empty `[actor].id` — callers fall through to their own env /
+/// anonymous tiers in that case.
+pub fn resolve_project_actor_id(
+    config_path: Option<&std::path::Path>,
+) -> Result<Option<String>, crate::engine_config::ConfigError> {
+    let khive_cfg = crate::engine_config::KhiveConfig::load_with_home_fallback(config_path, None)?;
+    Ok(khive_cfg
+        .and_then(|cfg| cfg.actor.id)
+        .filter(|s| !s.trim().is_empty()))
+}
+
 // ---- Embedding model helpers ----
 
 /// Sanitize an embedding model name into a valid SQL table suffix.
@@ -474,10 +582,20 @@ pub fn runtime_config_from_khive_config(
         })
         .collect();
 
-    // ADR-057: store actor.id as actor_id for token minting. The validated id is
-    // already confirmed to be a valid Namespace string by KhiveConfig::validate().
-    // None when [actor] id is absent — tokens then carry ActorRef::anonymous().
-    let actor_id = khive_cfg.actor.id.clone().filter(|s| !s.trim().is_empty());
+    // ADR-057: store actor.id as actor_id for token minting. Precedence is
+    // TOML `[actor] id` > `base.actor_id` (the env/CLI-resolved value the
+    // caller already put in `base`) > anonymous. When `[actor] id` is absent
+    // or empty, fall back to `base.actor_id` instead of clobbering it with
+    // `None` — otherwise an env-resolved actor (e.g. `KHIVE_ACTOR`) is
+    // silently dropped whenever a project config is found without an
+    // `[actor]` block, in both the engines-empty and engines-present arms
+    // below.
+    let actor_id = khive_cfg
+        .actor
+        .id
+        .clone()
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| base.actor_id.clone());
 
     if khive_cfg.engines.is_empty() {
         return RuntimeConfig {
@@ -548,5 +666,149 @@ pub(crate) fn parse_embedding_model_alias(name: &str) -> Option<EmbeddingModel> 
     match normalized.as_str() {
         "paraphrase" => Some(EmbeddingModel::ParaphraseMultilingualMiniLmL12V2),
         _ => normalized.parse().ok(),
+    }
+}
+
+#[cfg(test)]
+mod resolve_db_anchor_tests {
+    use super::resolve_db_anchor;
+
+    #[test]
+    fn memory_sentinel_maps_to_none() {
+        assert_eq!(resolve_db_anchor(Some(":memory:")), None);
+    }
+
+    #[test]
+    fn explicit_path_maps_to_some() {
+        assert_eq!(
+            resolve_db_anchor(Some("/tmp/khive-anchor-test.db")),
+            Some(std::path::PathBuf::from("/tmp/khive-anchor-test.db"))
+        );
+    }
+
+    #[test]
+    fn absent_maps_to_home_default() {
+        let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+        let expected = std::path::PathBuf::from(format!("{home}/.khive/khive.db"));
+        assert_eq!(resolve_db_anchor(None), Some(expected));
+    }
+}
+
+#[cfg(test)]
+mod assert_db_anchor_consistent_tests {
+    use super::{assert_db_anchor_consistent, resolve_db_anchor};
+
+    #[test]
+    fn diverging_db_path_is_rejected_naming_both_paths() {
+        let args_db = "/tmp/khive-anchor-guard-real.db";
+        let anchor = resolve_db_anchor(Some(args_db)).expect("explicit path always anchors");
+        let wrong = std::path::PathBuf::from("/tmp/khive-anchor-guard-wrong.db");
+
+        let err = assert_db_anchor_consistent(Some(wrong.as_path()), Some(args_db))
+            .expect_err("a resolved db_path diverging from the anchor must be rejected");
+
+        let msg = err.to_string();
+        assert!(
+            msg.contains(&wrong.display().to_string()),
+            "error must name the resolved (wrong) path: {msg}"
+        );
+        assert!(
+            msg.contains(&anchor.display().to_string()),
+            "error must name the canonical anchor path: {msg}"
+        );
+    }
+
+    #[test]
+    fn matching_explicit_db_path_passes() {
+        let args_db = "/tmp/khive-anchor-guard-consistent.db";
+        let anchor = resolve_db_anchor(Some(args_db)).expect("explicit path always anchors");
+        assert!(assert_db_anchor_consistent(Some(anchor.as_path()), Some(args_db)).is_ok());
+    }
+
+    #[test]
+    fn memory_sentinel_anchor_is_inert() {
+        // `resolve_db_anchor(":memory:")` yields `None` — there is no canonical
+        // path to assert against, so the guard passes regardless of what
+        // `resolved_db_path` happens to carry.
+        let bogus = std::path::PathBuf::from("/tmp/should-not-matter.db");
+        assert!(assert_db_anchor_consistent(Some(bogus.as_path()), Some(":memory:")).is_ok());
+        assert!(assert_db_anchor_consistent(None, Some(":memory:")).is_ok());
+    }
+
+    #[test]
+    fn normal_boot_with_db_unset_passes_silently() {
+        // Mirrors a normal boot: `--db` unset. `resolve_db_anchor(None)` always
+        // resolves to `Some(..)` (HOME-set or HOME-unset both produce a
+        // concrete anchor — see `absent_maps_to_home_default` above and the
+        // `resolve_db_anchor` doc comment on the HOME-unset arm), so a runtime
+        // whose resolved `db_path` equals that anchor passes silently.
+        let anchor = resolve_db_anchor(None);
+        assert!(assert_db_anchor_consistent(anchor.as_deref(), None).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod resolve_project_actor_id_tests {
+    use super::resolve_project_actor_id;
+
+    fn write_toml(dir: &tempfile::TempDir, body: &str) -> std::path::PathBuf {
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, body).expect("write config.toml");
+        path
+    }
+
+    #[test]
+    fn extracts_non_empty_actor_id_from_explicit_path() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = write_toml(&dir, "[actor]\nid = \"lambda:explicit-actor\"\n");
+
+        assert_eq!(
+            resolve_project_actor_id(Some(&path)).expect("no error"),
+            Some("lambda:explicit-actor".to_string())
+        );
+    }
+
+    #[test]
+    fn returns_none_for_missing_explicit_path() {
+        let missing = std::path::PathBuf::from("/nonexistent/khive-project-actor-test/config.toml");
+        assert_eq!(
+            resolve_project_actor_id(Some(&missing)).expect("no error"),
+            None,
+            "a nonexistent explicit path must resolve to None, not an error"
+        );
+    }
+
+    #[test]
+    fn propagates_load_error_for_invalid_actor_id() {
+        // `KhiveConfig::load`'s `validate()` rejects an empty `[actor] id` at load
+        // time (`ConfigError::InvalidActorId`) before the emptiness filter in
+        // `resolve_project_actor_id` would ever see it — this asserts the error
+        // surfaces rather than being silently swallowed into `Ok(None)`.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = write_toml(&dir, "[actor]\nid = \"\"\n");
+
+        let err = resolve_project_actor_id(Some(&path)).expect_err("invalid actor.id must error");
+        assert!(
+            matches!(
+                err,
+                crate::engine_config::ConfigError::InvalidActorId { .. }
+            ),
+            "expected InvalidActorId, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn returns_none_when_config_has_no_actor_section() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = write_toml(
+            &dir,
+            "[[engines]]\nname = \"primary\"\nmodel = \"bge-small-en-v1.5\"\ndefault = true\n",
+        );
+
+        assert_eq!(
+            resolve_project_actor_id(Some(&path)).expect("no error"),
+            None,
+            "a config file with no [actor] section must resolve to None"
+        );
     }
 }

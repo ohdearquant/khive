@@ -714,6 +714,7 @@ mod tests {
     use khive_pack_kg::KgPack;
     use khive_runtime::{EmbedderProvider, KhiveRuntime, Namespace, VerbRegistryBuilder};
     use lattice_embed::{EmbedError, EmbeddingModel, EmbeddingService};
+    use serial_test::serial;
 
     use crate::MemoryPack;
 
@@ -722,7 +723,14 @@ mod tests {
     /// added in PR #389 — it exercises the *sanitizer*, not the fail-open net.
     /// See `recall_with_residual_fts5_char_degrades_and_vector_leg_survives` below
     /// for a test that forces the `Err` arm itself (PR #389 internal review round 1 Medium).
+    ///
+    /// `#[serial(background_tasks)]`: a non-empty `memory.recall` fires the
+    /// serve-ledger append via `khive_runtime::track_background_task`
+    /// (see below), which drives the same process-wide counter that
+    /// `ann.rs`'s `ensure_ann_background_registers_a_tracked_task_not_a_bare_spawn`
+    /// asserts on — untagged, cargo's default parallelism can race them.
     #[tokio::test]
+    #[serial(background_tasks)]
     async fn recall_with_dollar_sign_query_does_not_error() {
         let rt = KhiveRuntime::memory().expect("in-memory runtime");
         let ns = Namespace::parse("local").expect("local namespace");
@@ -843,7 +851,11 @@ mod tests {
     /// wire shape is a bare JSON array today, so adding such a field here would
     /// be a breaking array-to-object shape change — reported separately as
     /// blocked-on-shape, not fixed in this PR.)
+    // `#[serial(background_tasks)]`: this test's recall returns a non-empty
+    // hit, which fires the serve-ledger append's `track_background_task` —
+    // see the note on `recall_with_dollar_sign_query_does_not_error` above.
     #[tokio::test]
+    #[serial(background_tasks)]
     async fn recall_with_residual_fts5_char_degrades_and_vector_leg_survives() {
         const MODEL: &str = "recall-residual-char-test-model";
         const DIMS: usize = 32;
@@ -914,7 +926,12 @@ mod tests {
         .expect("runtime")
     }
 
+    // `#[serial(background_tasks)]`: see the note on
+    // `recall_with_dollar_sign_query_does_not_error` above — this test
+    // directly exercises the same `track_background_task`-driven ledger
+    // append it names, so it shares the process-wide counter.
     #[tokio::test]
+    #[serial(background_tasks)]
     async fn recall_stamps_served_by_profile_id_and_appends_serve_ledger_row() {
         use khive_pack_brain::BrainPack;
 
@@ -1030,7 +1047,10 @@ mod tests {
         );
     }
 
+    // `#[serial(background_tasks)]`: non-empty recall — see the note on
+    // `recall_with_dollar_sign_query_does_not_error` above.
     #[tokio::test]
+    #[serial(background_tasks)]
     async fn recall_without_brain_pack_omits_stamp_and_does_not_error() {
         let rt = KhiveRuntime::memory().expect("in-memory runtime");
         let ns = Namespace::parse("local").expect("local namespace");
@@ -1072,7 +1092,11 @@ mod tests {
         );
     }
 
+    // `#[serial(background_tasks)]`: both `timed_recall` calls below return
+    // non-empty results — see the note on
+    // `recall_with_dollar_sign_query_does_not_error` above.
     #[tokio::test]
+    #[serial(background_tasks)]
     async fn recall_profile_resolution_latency_is_bounded() {
         use khive_pack_brain::BrainPack;
         use std::time::Duration;

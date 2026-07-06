@@ -60,6 +60,238 @@ pub(crate) fn reset_counters() {
     DAEMON_DISPATCH.store(0, std::sync::atomic::Ordering::SeqCst);
 }
 
+// ── local-dispatch fallback telemetry ─────────────────────────────────────────
+//
+// Every path below that returns `None` (or is matched as a fallback outcome)
+// means the caller silently dispatches locally instead of via the warm daemon.
+// A silent fallback is the bug this instrumentation exists to surface: it must
+// always be loud (a structured WARN) and counted. These are process-global
+// production counters (not `#[cfg(test)]`-gated like the instrumentation seams
+// above) — they realize the metric `khive_daemon_fallback_total{reason}`; a
+// future metrics-export slice can read them without touching call sites.
+
+/// Reason a request fell back to local dispatch instead of the warm daemon.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FallbackReason {
+    ConfigMismatch,
+    NamespaceMismatch,
+    NoSocket,
+    ParseFailure,
+    ProtocolMismatch,
+}
+
+impl FallbackReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            FallbackReason::ConfigMismatch => "config_mismatch",
+            FallbackReason::NamespaceMismatch => "namespace_mismatch",
+            FallbackReason::NoSocket => "no_socket",
+            FallbackReason::ParseFailure => "parse_failure",
+            FallbackReason::ProtocolMismatch => "protocol_mismatch",
+        }
+    }
+
+    fn counter(self) -> &'static std::sync::atomic::AtomicUsize {
+        match self {
+            FallbackReason::ConfigMismatch => &FALLBACK_CONFIG_MISMATCH,
+            FallbackReason::NamespaceMismatch => &FALLBACK_NAMESPACE_MISMATCH,
+            FallbackReason::NoSocket => &FALLBACK_NO_SOCKET,
+            FallbackReason::ParseFailure => &FALLBACK_PARSE_FAILURE,
+            FallbackReason::ProtocolMismatch => &FALLBACK_PROTOCOL_MISMATCH,
+        }
+    }
+
+    /// Legitimacy tier used by the `KHIVE_DAEMON_STRICT` graduated fail-loud
+    /// policy (SPEC_DRAFT §3 D2). Only `Illegitimate` reasons are elevated by
+    /// strict mode; the other two tiers are always quiet, regardless of mode.
+    fn severity(self) -> FallbackSeverity {
+        match self {
+            // A real misconfiguration: the client and daemon should have
+            // agreed on `config_id`/namespace visibility and didn't. Never
+            // expected on a correctly-configured fleet post-D1.
+            FallbackReason::ConfigMismatch | FallbackReason::NamespaceMismatch => {
+                FallbackSeverity::Illegitimate
+            }
+            // `ParseFailure` and `ProtocolMismatch` are this module's own
+            // "stale/rolling daemon" bucket: both trigger the same
+            // kill-and-respawn recovery path (see the `ForwardOutcome::ParseFailure
+            // | ForwardOutcome::ProtocolMismatch` handling above) and both
+            // represent a transient protocol-version drift during a rolling
+            // upgrade, not a persistent misconfiguration. SPEC_DRAFT §3 D2's
+            // table names only `version_mismatch` explicitly; `ParseFailure`
+            // is folded into the same `RolloutTransient` tier because the
+            // code already treats it identically to `ProtocolMismatch`
+            // everywhere else in this file.
+            FallbackReason::ProtocolMismatch | FallbackReason::ParseFailure => {
+                FallbackSeverity::RolloutTransient
+            }
+            // No daemon reachable at all — the ADR-049-mandated fallback
+            // path (CI, `KHIVE_NO_DAEMON=1`, read-only FS, spawn failure).
+            FallbackReason::NoSocket => FallbackSeverity::NoDaemon,
+        }
+    }
+}
+
+/// Legitimacy tier for a [`FallbackReason`], keyed by the graduated fail-loud
+/// policy in SPEC_DRAFT §3 D2. See [`FallbackReason::severity`] for the
+/// per-variant mapping and its rationale.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FallbackSeverity {
+    /// A real misconfiguration. Elevated to an error-level event (plus a
+    /// dedicated violation counter) when `KHIVE_DAEMON_STRICT=1`.
+    Illegitimate,
+    /// Expected during a rolling upgrade; self-heals via kill-and-respawn.
+    /// Never elevated, in strict mode or otherwise.
+    RolloutTransient,
+    /// No daemon to forward to at all. Never elevated — this is the
+    /// ADR-049-mandated safety net, not a bug.
+    NoDaemon,
+}
+
+/// `KHIVE_DAEMON_STRICT=1` elevates `Illegitimate`-severity fallbacks
+/// (`ConfigMismatch`, `NamespaceMismatch`) from a WARN to an error-level
+/// structured event plus a dedicated violation counter (D2-R1). It never
+/// disables the fallback itself — the request still completes locally so the
+/// caller is never dropped (SPEC_DRAFT §3 D2) — it only makes an illegitimate
+/// mismatch impossible to miss.
+///
+/// No hosted-vs-local auto-detection signal exists in this codebase (there is
+/// no build-time or runtime "is this the hosted fleet image" flag anywhere in
+/// the workspace) and none is invented here: this resolves as a plain opt-in,
+/// default OFF, matching the shape of `is_strict_actor_mode`'s
+/// `KHIVE_REQUIRE_ATTRIBUTED_ACTOR`. The hosted/fleet image is expected to set
+/// `KHIVE_DAEMON_STRICT=1` explicitly in its own deployment environment; a
+/// bare local `kkernel` invocation is unaffected by default.
+fn is_daemon_strict_mode() -> bool {
+    env_truthy("KHIVE_DAEMON_STRICT")
+}
+
+/// `khive_daemon_fallback_total{reason="config_mismatch"}`
+static FALLBACK_CONFIG_MISMATCH: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+/// `khive_daemon_fallback_total{reason="namespace_mismatch"}`
+static FALLBACK_NAMESPACE_MISMATCH: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+/// `khive_daemon_fallback_total{reason="no_socket"}`
+static FALLBACK_NO_SOCKET: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// `khive_daemon_fallback_total{reason="parse_failure"}`
+static FALLBACK_PARSE_FAILURE: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+/// `khive_daemon_fallback_total{reason="protocol_mismatch"}`
+static FALLBACK_PROTOCOL_MISMATCH: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+/// `khive_daemon_fallback_strict_violations_total` — count of `Illegitimate`
+/// fallbacks (`config_mismatch`/`namespace_mismatch`) observed while
+/// `KHIVE_DAEMON_STRICT=1` was set (D2-R1). Distinct from the five
+/// per-reason counters above: this one is scoped to exactly the elevated
+/// (error-level) events, so a load-harness (D2-R2) can hard-fail on
+/// "any nonzero" without having to know which reasons are illegitimate.
+static FALLBACK_STRICT_VIOLATIONS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+// REASON: these accessors have no production call site yet — this slice adds the
+// counters and their read path; a future metrics-export slice wires them to a real
+// exporter (see the `khive_daemon_fallback_total{reason}` doc comments above) without
+// needing to touch `record_fallback`'s call sites. Exercised directly by the counter
+// tests below in the meantime.
+#[allow(dead_code)]
+/// `khive_daemon_fallback_total{reason="<all>"}` — total fallback count across
+/// all reasons, derived by summing the five reason counters on read rather
+/// than tracked as a separate atomic. A separate total can be observed
+/// momentarily out of sync with the sum of reasons (two independent
+/// `fetch_add`s); deriving it makes total == sum-of-reasons a structural
+/// invariant instead of a timing-dependent one.
+pub(crate) fn fallback_total() -> usize {
+    use std::sync::atomic::Ordering::SeqCst;
+    FALLBACK_CONFIG_MISMATCH.load(SeqCst)
+        + FALLBACK_NAMESPACE_MISMATCH.load(SeqCst)
+        + FALLBACK_NO_SOCKET.load(SeqCst)
+        + FALLBACK_PARSE_FAILURE.load(SeqCst)
+        + FALLBACK_PROTOCOL_MISMATCH.load(SeqCst)
+}
+
+#[allow(dead_code)]
+/// Fallback count for a single `reason`.
+pub(crate) fn fallback_count(reason: FallbackReason) -> usize {
+    reason.counter().load(std::sync::atomic::Ordering::SeqCst)
+}
+
+#[allow(dead_code)]
+/// `khive_daemon_fallback_strict_violations_total` — see
+/// [`FALLBACK_STRICT_VIOLATIONS`]. No production call site yet, same as
+/// `fallback_total`/`fallback_count` above; exercised directly by tests.
+pub(crate) fn fallback_strict_violations() -> usize {
+    FALLBACK_STRICT_VIOLATIONS.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+#[cfg(test)]
+pub(crate) fn reset_fallback_counters() {
+    use std::sync::atomic::Ordering::SeqCst;
+    FALLBACK_CONFIG_MISMATCH.store(0, SeqCst);
+    FALLBACK_NAMESPACE_MISMATCH.store(0, SeqCst);
+    FALLBACK_NO_SOCKET.store(0, SeqCst);
+    FALLBACK_PARSE_FAILURE.store(0, SeqCst);
+    FALLBACK_PROTOCOL_MISMATCH.store(0, SeqCst);
+    FALLBACK_STRICT_VIOLATIONS.store(0, SeqCst);
+}
+
+/// Emit the standardized `daemon_fallback` event and increment the matching
+/// counters. Call exactly once per fallback event, at the point where the
+/// caller is about to dispatch locally instead of via the warm daemon.
+///
+/// `config_id_daemon` is `None` when no daemon response was available to read
+/// it from (socket unreachable, undecodable response) or the daemon omitted it
+/// (legacy daemon) — logged as the literal `"none"` string rather than the
+/// field being absent, since presence-vs-absence is itself diagnostic. `db`
+/// (the canonical db path) is intentionally not logged here: neither call site
+/// has it in scope without broader plumbing, and inventing a value would be
+/// worse than omitting the field.
+///
+/// Log level and counter are graduated by [`FallbackReason::severity`] and
+/// [`is_daemon_strict_mode`] (D2-R1): an `Illegitimate` reason observed while
+/// `KHIVE_DAEMON_STRICT=1` is set logs at `error!` and bumps
+/// `FALLBACK_STRICT_VIOLATIONS` in addition to its own per-reason counter;
+/// every other case (non-strict mode, or a `RolloutTransient`/`NoDaemon`
+/// reason regardless of mode) logs at `warn!`, exactly as before this change
+/// (D2-R3 — strict mode keys on `FallbackReason`, never on "did a fallback
+/// happen at all"). The fallback itself is never disabled either way — the
+/// caller always proceeds to dispatch locally after this call returns.
+fn record_fallback(
+    reason: FallbackReason,
+    config_id_client: &str,
+    config_id_daemon: Option<&str>,
+    namespace_client: &str,
+) {
+    reason
+        .counter()
+        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+
+    let strict_violation =
+        reason.severity() == FallbackSeverity::Illegitimate && is_daemon_strict_mode();
+
+    if strict_violation {
+        FALLBACK_STRICT_VIOLATIONS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        tracing::error!(
+            reason = reason.as_str(),
+            config_id_client,
+            config_id_daemon = config_id_daemon.unwrap_or("none"),
+            namespace_client,
+            pid = std::process::id(),
+            strict = true,
+            "daemon_fallback"
+        );
+    } else {
+        tracing::warn!(
+            reason = reason.as_str(),
+            config_id_client,
+            config_id_daemon = config_id_daemon.unwrap_or("none"),
+            namespace_client,
+            pid = std::process::id(),
+            "daemon_fallback"
+        );
+    }
+}
+
 // ── DaemonDispatch impl ───────────────────────────────────────────────────────
 
 #[async_trait]
@@ -72,6 +304,7 @@ impl daemon::DaemonDispatch for crate::server::KhiveMcpServer {
         format: Option<String>,
         format_per_op: Option<Vec<Option<String>>>,
         from_wire: bool,
+        identity: Option<khive_runtime::RequestIdentity>,
     ) -> Result<String, String> {
         let params = RequestParams {
             ops,
@@ -83,7 +316,11 @@ impl daemon::DaemonDispatch for crate::server::KhiveMcpServer {
         };
         // Honor the frame's origin: a wire-origin request enforces verb
         // visibility even when served by the daemon; an operator request does not.
-        self.dispatch_request_inner(params, from_wire)
+        // `identity` (ADR-096 Fork 1) is the caller's per-request identity
+        // context, built by `handle_conn` from the frame — threaded straight
+        // through so this call serves under the CALLER's namespace/actor
+        // rather than this server's own construction-baked identity.
+        self.dispatch_request_inner(params, from_wire, identity)
             .await
             .map_err(|e| e.message.to_string())
     }
@@ -200,6 +437,7 @@ async fn try_forward_inner(frame: &DaemonRequestFrame) -> ForwardOutcome {
 fn map_response(
     resp: DaemonResponseFrame,
     expected_config_id: &str,
+    namespace_client: &str,
 ) -> Option<Result<String, McpError>> {
     // Protocol version mismatch is a hard error — do NOT fall back to local
     // dispatch, which would hide the skew. Surface the daemon's own message.
@@ -214,13 +452,34 @@ fn map_response(
         return Some(Err(McpError::internal_error(msg, None)));
     }
 
-    if resp.namespace_mismatch || resp.config_mismatch {
+    if resp.namespace_mismatch {
+        record_fallback(
+            FallbackReason::NamespaceMismatch,
+            expected_config_id,
+            resp.served_config_id.as_deref(),
+            namespace_client,
+        );
+        return None;
+    }
+    if resp.config_mismatch {
+        record_fallback(
+            FallbackReason::ConfigMismatch,
+            expected_config_id,
+            resp.served_config_id.as_deref(),
+            namespace_client,
+        );
         return None;
     }
     // Fail closed: only trust a result the daemon positively confirms it served
     // under our exact config. A legacy daemon omits `served_config_id` (→ None)
     // and a config-drifted daemon echoes a different id — both fall back local.
     if resp.served_config_id.as_deref() != Some(expected_config_id) {
+        record_fallback(
+            FallbackReason::ConfigMismatch,
+            expected_config_id,
+            resp.served_config_id.as_deref(),
+            namespace_client,
+        );
         return None;
     }
     if resp.ok {
@@ -237,6 +496,77 @@ fn map_response(
     }
 }
 
+/// Cap on `khived.log` size (bytes) before a spawn rotates it to `khived.log.1`.
+///
+/// Rotation only happens at spawn time (never mid-session): the daemon is
+/// respawned often enough (rebuilds, reconnects, stale-daemon recovery) that
+/// this alone bounds disk use, without pulling in `tracing-appender` or
+/// touching `init_tracing`'s writer.
+const DAEMON_LOG_MAX_BYTES: u64 = 16 * 1024 * 1024;
+
+/// Resolve `<home>/.khive/logs/khived.log` given an explicit `HOME` value.
+///
+/// Takes the HOME value as a parameter (rather than reading the environment
+/// directly) so the resolution logic is unit-testable without mutating
+/// process-global state. Mirrors the `Path::new(&home).join(...)` idiom used
+/// for `~/.khive/.env` resolution in `kkernel`'s `load_khive_dotenv`.
+fn daemon_log_path_from_home(home: Option<&std::ffi::OsStr>) -> Option<std::path::PathBuf> {
+    let home = home?;
+    Some(
+        std::path::Path::new(home)
+            .join(".khive")
+            .join("logs")
+            .join("khived.log"),
+    )
+}
+
+/// Resolve the daemon log path from the real process environment. Returns
+/// `None` when `HOME` is unset — the caller falls back to discarding the
+/// daemon's stderr rather than failing the spawn.
+fn daemon_log_path() -> Option<std::path::PathBuf> {
+    daemon_log_path_from_home(std::env::var_os("HOME").as_deref())
+}
+
+/// Decide whether the log at `current_size` bytes must rotate before this
+/// spawn, given a `cap` in bytes. Pulled out as a pure function so the
+/// spawn-time rotation policy is unit-testable independent of the filesystem.
+fn daemon_log_should_rotate(current_size: u64, cap: u64) -> bool {
+    current_size >= cap
+}
+
+/// Prepare `log_path` for the daemon's stderr: create its parent directory,
+/// rotate the existing file to `<name>.1` (replacing any prior backup) if it
+/// is at or over `cap` bytes, then open (or create) it for append.
+///
+/// Returns `None` on directory-creation or open failure so the caller can
+/// fall back to `Stdio::null()`. A rotation (`rename`) failure is deliberately
+/// swallowed and degrades to appending to the existing over-cap file — keeping
+/// the daemon's stderr flowing to a slightly-too-large log beats losing it.
+/// Logging is best-effort; daemon spawn correctness is not, and the daemon is
+/// on the hot path for every MCP request.
+fn prepare_daemon_log_file_with_cap(log_path: &std::path::Path, cap: u64) -> Option<std::fs::File> {
+    let dir = log_path.parent()?;
+    std::fs::create_dir_all(dir).ok()?;
+    if let Ok(meta) = std::fs::metadata(log_path) {
+        if daemon_log_should_rotate(meta.len(), cap) {
+            let backup = dir.join("khived.log.1");
+            // `rename` replaces an existing destination atomically on Unix —
+            // exactly the "replace any prior .1" behavior we want.
+            let _ = std::fs::rename(log_path, &backup);
+        }
+    }
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_path)
+        .ok()
+}
+
+/// [`prepare_daemon_log_file_with_cap`] using the standing [`DAEMON_LOG_MAX_BYTES`] cap.
+fn prepare_daemon_log_file(log_path: &std::path::Path) -> Option<std::fs::File> {
+    prepare_daemon_log_file_with_cap(log_path, DAEMON_LOG_MAX_BYTES)
+}
+
 fn spawn_daemon() -> std::io::Result<()> {
     #[cfg(test)]
     SPAWN_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -248,8 +578,20 @@ fn spawn_daemon() -> std::io::Result<()> {
     cmd.arg("mcp")
         .arg("--daemon")
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
+        .stdout(Stdio::null());
+    // The daemon's tracing (including WAL/checkpoint telemetry) goes to
+    // stderr honoring KHIVE_LOG (init_tracing in kkernel's main.rs) — wiring
+    // it to /dev/null silently discards all of it. Route it to a log file
+    // instead; fall back to null on any resolution/creation failure so a
+    // logging problem never breaks the daemon spawn itself.
+    match daemon_log_path().and_then(|path| prepare_daemon_log_file(&path)) {
+        Some(file) => {
+            cmd.stderr(file);
+        }
+        None => {
+            cmd.stderr(Stdio::null());
+        }
+    }
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
@@ -385,9 +727,15 @@ async fn probe_daemon_identity(config_id: &str, namespace: &str, timeout_ms: u64
         presentation: None,
         presentation_per_op: None,
         namespace: namespace.to_string(),
+        // A probe never reaches the identity-context / dispatch arm (it
+        // short-circuits on `probe_only` right after the protocol/config_id
+        // checks), so no per-request identity is meaningful here.
+        actor_id: None,
+        visible_namespaces: Vec::new(),
         config_id: config_id.to_string(),
         protocol_version: PROTOCOL_VERSION,
         probe_only: true,
+        metrics_only: false,
         format: None,
         format_per_op: None,
         from_wire: false,
@@ -506,7 +854,9 @@ pub async fn forward_or_spawn(frame: &DaemonRequestFrame) -> Option<Result<Strin
     }
 
     match try_forward_inner(frame).await {
-        ForwardOutcome::Response(resp) => return map_response(resp, &frame.config_id),
+        ForwardOutcome::Response(resp) => {
+            return map_response(resp, &frame.config_id, &frame.namespace)
+        }
         ForwardOutcome::NoSocket => {
             // No socket present; fall through to the first-spawn path below.
         }
@@ -522,14 +872,48 @@ pub async fn forward_or_spawn(frame: &DaemonRequestFrame) -> Option<Result<Strin
                 Err(e) => {
                     tracing::warn!(error = %e,
                         "kill_and_respawn failed during stale-daemon recovery; falling back to local dispatch");
+                    record_fallback(
+                        FallbackReason::ParseFailure,
+                        &frame.config_id,
+                        None,
+                        &frame.namespace,
+                    );
                     return None;
                 }
                 Ok(RecoveryOutcome::Skipped) => {
                     // Under-lock probe confirmed a live matching daemon; forward the
                     // real request once — this is its ONLY dispatch on this path.
                     return match try_forward_inner(frame).await {
-                        ForwardOutcome::Response(resp) => map_response(resp, &frame.config_id),
-                        _ => None,
+                        ForwardOutcome::Response(resp) => {
+                            map_response(resp, &frame.config_id, &frame.namespace)
+                        }
+                        ForwardOutcome::NoSocket => {
+                            record_fallback(
+                                FallbackReason::NoSocket,
+                                &frame.config_id,
+                                None,
+                                &frame.namespace,
+                            );
+                            None
+                        }
+                        ForwardOutcome::ParseFailure => {
+                            record_fallback(
+                                FallbackReason::ParseFailure,
+                                &frame.config_id,
+                                None,
+                                &frame.namespace,
+                            );
+                            None
+                        }
+                        ForwardOutcome::ProtocolMismatch => {
+                            record_fallback(
+                                FallbackReason::ProtocolMismatch,
+                                &frame.config_id,
+                                None,
+                                &frame.namespace,
+                            );
+                            None
+                        }
                     };
                 }
                 Ok(RecoveryOutcome::Spawned) => {}
@@ -545,14 +929,28 @@ pub async fn forward_or_spawn(frame: &DaemonRequestFrame) -> Option<Result<Strin
             let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
             loop {
                 if tokio::time::Instant::now() >= deadline {
+                    record_fallback(
+                        FallbackReason::NoSocket,
+                        &frame.config_id,
+                        None,
+                        &frame.namespace,
+                    );
                     return None;
                 }
                 match try_forward_inner(frame).await {
-                    ForwardOutcome::Response(resp) => return map_response(resp, &frame.config_id),
+                    ForwardOutcome::Response(resp) => {
+                        return map_response(resp, &frame.config_id, &frame.namespace)
+                    }
                     ForwardOutcome::ParseFailure => {
                         tracing::warn!(
                             "freshly spawned daemon also returned an undecodable response; \
                              falling back to local dispatch"
+                        );
+                        record_fallback(
+                            FallbackReason::ParseFailure,
+                            &frame.config_id,
+                            None,
+                            &frame.namespace,
                         );
                         return None;
                     }
@@ -593,7 +991,9 @@ pub async fn forward_or_spawn(frame: &DaemonRequestFrame) -> Option<Result<Strin
                     // Under-lock probe confirmed a live matching daemon; forward the
                     // real request once — this is its ONLY dispatch on this path.
                     return match try_forward_inner(frame).await {
-                        ForwardOutcome::Response(resp) => map_response(resp, &frame.config_id),
+                        ForwardOutcome::Response(resp) => {
+                            map_response(resp, &frame.config_id, &frame.namespace)
+                        }
                         _ => Some(Err(McpError::internal_error(
                             format!(
                                 "daemon protocol mismatch: expected version {PROTOCOL_VERSION}; \
@@ -623,7 +1023,9 @@ pub async fn forward_or_spawn(frame: &DaemonRequestFrame) -> Option<Result<Strin
                     )));
                 }
                 match try_forward_inner(frame).await {
-                    ForwardOutcome::Response(resp) => return map_response(resp, &frame.config_id),
+                    ForwardOutcome::Response(resp) => {
+                        return map_response(resp, &frame.config_id, &frame.namespace)
+                    }
                     ForwardOutcome::ProtocolMismatch | ForwardOutcome::ParseFailure => {
                         return Some(Err(McpError::internal_error(
                             format!(
@@ -644,20 +1046,40 @@ pub async fn forward_or_spawn(frame: &DaemonRequestFrame) -> Option<Result<Strin
 
     // NoSocket path: first-time spawn (no stale daemon to kill).
     if spawn_daemon().is_err() {
+        record_fallback(
+            FallbackReason::NoSocket,
+            &frame.config_id,
+            None,
+            &frame.namespace,
+        );
         return None;
     }
 
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
     loop {
         if tokio::time::Instant::now() >= deadline {
+            record_fallback(
+                FallbackReason::NoSocket,
+                &frame.config_id,
+                None,
+                &frame.namespace,
+            );
             return None;
         }
         match try_forward_inner(frame).await {
-            ForwardOutcome::Response(resp) => return map_response(resp, &frame.config_id),
+            ForwardOutcome::Response(resp) => {
+                return map_response(resp, &frame.config_id, &frame.namespace)
+            }
             ForwardOutcome::ParseFailure => {
                 tracing::warn!(
                     "freshly spawned daemon also returned an undecodable response; \
                      falling back to local dispatch"
+                );
+                record_fallback(
+                    FallbackReason::ParseFailure,
+                    &frame.config_id,
+                    None,
+                    &frame.namespace,
                 );
                 return None;
             }
@@ -716,6 +1138,24 @@ mod tests {
         crate::server::KhiveMcpServer::new(runtime).expect("server builds with kg+brain")
     }
 
+    /// Server whose pack set includes `comm`, whose `send` verb echoes the
+    /// dispatching actor directly in its JSON response (`"from": from_actor`,
+    /// where `from_actor = token.actor().id`). Used to verify per-request
+    /// actor stamping (ADR-096 Fork 1) without a readback/inbox round-trip.
+    fn make_comm_test_server(actor_id: Option<&str>) -> crate::server::KhiveMcpServer {
+        let config = RuntimeConfig {
+            db_path: None,
+            default_namespace: Namespace::parse("test").unwrap(),
+            embedding_model: None,
+            additional_embedding_models: vec![],
+            packs: vec!["kg".to_string(), "comm".to_string()],
+            actor_id: actor_id.map(str::to_string),
+            ..RuntimeConfig::default()
+        };
+        let runtime = KhiveRuntime::new(config).expect("in-memory runtime");
+        crate::server::KhiveMcpServer::new(runtime).expect("server builds with kg+comm")
+    }
+
     fn clear_daemon_env() {
         std::env::remove_var("KHIVE_SOCKET");
         std::env::remove_var("KHIVE_PID");
@@ -752,6 +1192,7 @@ mod tests {
     // ── map_response (pure, MCP-specific) ─────────────────────────────────────
 
     const CFG: &str = "packs=[kg];db=:memory:;embed=none;extra=[];backend=main";
+    const NS: &str = "test";
 
     fn frame_ok(result: &str) -> DaemonResponseFrame {
         DaemonResponseFrame {
@@ -763,6 +1204,7 @@ mod tests {
             served_config_id: Some(CFG.to_string()),
             version_mismatch: false,
             daemon_protocol_version: PROTOCOL_VERSION,
+            metrics: None,
         }
     }
 
@@ -776,11 +1218,19 @@ mod tests {
             served_config_id: Some(CFG.to_string()),
             version_mismatch: false,
             daemon_protocol_version: PROTOCOL_VERSION,
+            metrics: None,
         }
     }
 
+    // These four tests exercise `map_response` branches that now also increment
+    // the process-global fallback counters (via `record_fallback`) — `#[serial]`
+    // + a reset at the top keeps their counter assertions deterministic against
+    // any other test in this file that touches the same counters.
+
     #[test]
+    #[serial]
     fn map_response_namespace_mismatch_yields_none() {
+        reset_fallback_counters();
         let resp = DaemonResponseFrame {
             ok: false,
             result: None,
@@ -790,12 +1240,18 @@ mod tests {
             served_config_id: Some(CFG.to_string()),
             version_mismatch: false,
             daemon_protocol_version: PROTOCOL_VERSION,
+            metrics: None,
         };
-        assert!(map_response(resp, CFG).is_none());
+        assert!(map_response(resp, CFG, NS).is_none());
+        assert_eq!(fallback_count(FallbackReason::NamespaceMismatch), 1);
+        assert_eq!(fallback_count(FallbackReason::ConfigMismatch), 0);
+        assert_eq!(fallback_total(), 1);
     }
 
     #[test]
+    #[serial]
     fn map_response_config_mismatch_yields_none() {
+        reset_fallback_counters();
         let resp = DaemonResponseFrame {
             ok: false,
             result: None,
@@ -805,14 +1261,20 @@ mod tests {
             served_config_id: Some(CFG.to_string()),
             version_mismatch: false,
             daemon_protocol_version: PROTOCOL_VERSION,
+            metrics: None,
         };
-        assert!(map_response(resp, CFG).is_none());
+        assert!(map_response(resp, CFG, NS).is_none());
+        assert_eq!(fallback_count(FallbackReason::ConfigMismatch), 1);
+        assert_eq!(fallback_count(FallbackReason::NamespaceMismatch), 0);
+        assert_eq!(fallback_total(), 1);
     }
 
     #[test]
+    #[serial]
     fn map_response_legacy_daemon_missing_echo_yields_none() {
         // A pre-config_id daemon omits served_config_id (→ None). Even on an
         // ok=true result the client MUST fall back to local dispatch.
+        reset_fallback_counters();
         let resp = DaemonResponseFrame {
             ok: true,
             result: Some("served-by-broad-registry".to_string()),
@@ -822,14 +1284,22 @@ mod tests {
             served_config_id: None,
             version_mismatch: false,
             daemon_protocol_version: 0,
+            metrics: None,
         };
-        assert!(map_response(resp, CFG).is_none());
+        assert!(map_response(resp, CFG, NS).is_none());
+        // The served_config_id-echo path is bucketed under config_mismatch —
+        // there is no separate reason for "echo missing/drifted" in the closed
+        // 5-value reason set.
+        assert_eq!(fallback_count(FallbackReason::ConfigMismatch), 1);
+        assert_eq!(fallback_total(), 1);
     }
 
     #[test]
+    #[serial]
     fn map_response_echo_drift_yields_none() {
         // A daemon serving under a different config (echo != expected) is not
         // trusted, even without an explicit config_mismatch flag.
+        reset_fallback_counters();
         let resp = DaemonResponseFrame {
             ok: true,
             result: Some("served-by-other-config".to_string()),
@@ -841,13 +1311,16 @@ mod tests {
             ),
             version_mismatch: false,
             daemon_protocol_version: PROTOCOL_VERSION,
+            metrics: None,
         };
-        assert!(map_response(resp, CFG).is_none());
+        assert!(map_response(resp, CFG, NS).is_none());
+        assert_eq!(fallback_count(FallbackReason::ConfigMismatch), 1);
+        assert_eq!(fallback_total(), 1);
     }
 
     #[test]
     fn map_response_ok_with_result_yields_some_ok() {
-        match map_response(frame_ok("the-result"), CFG) {
+        match map_response(frame_ok("the-result"), CFG, NS) {
             Some(Ok(s)) => assert_eq!(s, "the-result"),
             other => panic!("expected Some(Ok(\"the-result\")), got {other:?}"),
         }
@@ -864,8 +1337,9 @@ mod tests {
             served_config_id: Some(CFG.to_string()),
             version_mismatch: false,
             daemon_protocol_version: PROTOCOL_VERSION,
+            metrics: None,
         };
-        match map_response(resp, CFG) {
+        match map_response(resp, CFG, NS) {
             Some(Ok(s)) => assert_eq!(s, ""),
             other => panic!("expected Some(Ok(\"\")), got {other:?}"),
         }
@@ -873,7 +1347,7 @@ mod tests {
 
     #[test]
     fn map_response_not_ok_yields_some_err_preserving_message() {
-        match map_response(frame_err(Some("boom: bad verb")), CFG) {
+        match map_response(frame_err(Some("boom: bad verb")), CFG, NS) {
             Some(Err(McpError { message, .. })) => {
                 assert!(message.contains("boom: bad verb"), "got: {message}");
             }
@@ -883,7 +1357,7 @@ mod tests {
 
     #[test]
     fn map_response_not_ok_without_message_yields_contextual_err() {
-        match map_response(frame_err(None), CFG) {
+        match map_response(frame_err(None), CFG, NS) {
             Some(Err(McpError { message, .. })) => {
                 assert!(!message.is_empty(), "fallback message must not be empty");
                 assert!(
@@ -906,8 +1380,9 @@ mod tests {
             served_config_id: Some(CFG.to_string()),
             version_mismatch: true,
             daemon_protocol_version: PROTOCOL_VERSION,
+            metrics: None,
         };
-        match map_response(resp, CFG) {
+        match map_response(resp, CFG, NS) {
             Some(Err(McpError { message, .. })) => {
                 assert!(
                     message.contains("protocol mismatch"),
@@ -933,8 +1408,9 @@ mod tests {
             served_config_id: Some(CFG.to_string()),
             version_mismatch: true,
             daemon_protocol_version: 99,
+            metrics: None,
         };
-        match map_response(resp, CFG) {
+        match map_response(resp, CFG, NS) {
             Some(Err(McpError { message, .. })) => {
                 assert!(
                     message.contains("protocol mismatch"),
@@ -949,12 +1425,244 @@ mod tests {
         }
     }
 
+    // ── daemon_fallback telemetry: counters (ADR-091 F1) ──────────────────────
+    //
+    // `no_socket` / `parse_failure` / `protocol_mismatch` are only reachable
+    // inside `forward_or_spawn` on paths that require a real daemon subprocess
+    // or multi-second connect timeouts (the existing suite deliberately avoids
+    // that cost elsewhere in this file — see `try_forward_inner_returns_parse_
+    // failure_when_daemon_closes_without_response` above, which asserts the
+    // `ForwardOutcome` discriminant directly rather than driving the full
+    // `forward_or_spawn` retry loop). `record_fallback` is the single function
+    // every one of those call sites invokes, so exercising it directly gives
+    // the same counter-correctness guarantee without the slow paths.
+
+    #[test]
+    #[serial]
+    fn record_fallback_no_socket_increments_matching_counter_and_total() {
+        reset_fallback_counters();
+        record_fallback(FallbackReason::NoSocket, CFG, None, NS);
+        assert_eq!(fallback_count(FallbackReason::NoSocket), 1);
+        assert_eq!(fallback_count(FallbackReason::ParseFailure), 0);
+        assert_eq!(fallback_count(FallbackReason::ProtocolMismatch), 0);
+        assert_eq!(fallback_count(FallbackReason::ConfigMismatch), 0);
+        assert_eq!(fallback_count(FallbackReason::NamespaceMismatch), 0);
+        assert_eq!(fallback_total(), 1);
+    }
+
+    #[test]
+    #[serial]
+    fn record_fallback_parse_failure_increments_matching_counter_and_total() {
+        reset_fallback_counters();
+        record_fallback(FallbackReason::ParseFailure, CFG, None, NS);
+        assert_eq!(fallback_count(FallbackReason::ParseFailure), 1);
+        assert_eq!(fallback_count(FallbackReason::NoSocket), 0);
+        assert_eq!(fallback_total(), 1);
+    }
+
+    #[test]
+    #[serial]
+    fn record_fallback_protocol_mismatch_increments_matching_counter_and_total() {
+        reset_fallback_counters();
+        record_fallback(FallbackReason::ProtocolMismatch, CFG, None, NS);
+        assert_eq!(fallback_count(FallbackReason::ProtocolMismatch), 1);
+        assert_eq!(fallback_count(FallbackReason::ParseFailure), 0);
+        assert_eq!(fallback_total(), 1);
+    }
+
+    #[test]
+    #[serial]
+    fn record_fallback_config_id_daemon_defaults_to_none_literal_when_absent() {
+        // The log field itself isn't asserted (no tracing-capture harness in this
+        // crate — see the crate's Cargo.toml dev-dependencies), but the counter
+        // side effect proves the call completes and increments exactly once even
+        // when `config_id_daemon` is `None` (the common case at every
+        // forward_or_spawn fallback site, since no decodable daemon response was
+        // available to read a served config id from).
+        reset_fallback_counters();
+        record_fallback(FallbackReason::NoSocket, CFG, None, NS);
+        assert_eq!(fallback_total(), 1);
+    }
+
+    #[test]
+    #[serial]
+    fn fallback_total_sums_all_reason_counters() {
+        reset_fallback_counters();
+        record_fallback(FallbackReason::ConfigMismatch, CFG, Some("other-cfg"), NS);
+        record_fallback(
+            FallbackReason::NamespaceMismatch,
+            CFG,
+            Some(CFG),
+            "other-ns",
+        );
+        record_fallback(FallbackReason::NoSocket, CFG, None, NS);
+        record_fallback(FallbackReason::ParseFailure, CFG, None, NS);
+        record_fallback(FallbackReason::ProtocolMismatch, CFG, None, NS);
+
+        let sum = fallback_count(FallbackReason::ConfigMismatch)
+            + fallback_count(FallbackReason::NamespaceMismatch)
+            + fallback_count(FallbackReason::NoSocket)
+            + fallback_count(FallbackReason::ParseFailure)
+            + fallback_count(FallbackReason::ProtocolMismatch);
+        assert_eq!(sum, 5);
+        assert_eq!(
+            fallback_total(),
+            5,
+            "total must equal the sum of all reasons"
+        );
+    }
+
+    // ── KHIVE_DAEMON_STRICT graduated fail-loud policy (D2) ───────────────────
+    //
+    // No tracing-capture harness exists in this crate (see the comment on
+    // `record_fallback_config_id_daemon_defaults_to_none_literal_when_absent`
+    // above), so these tests prove the graduated behavior via
+    // `FALLBACK_STRICT_VIOLATIONS` rather than asserting the log level
+    // directly: an `Illegitimate` reason bumps it if and only if strict mode
+    // is on; every other reason/mode combination must never bump it.
+
+    fn with_daemon_strict<T>(value: Option<&str>, f: impl FnOnce() -> T) -> T {
+        let prev = std::env::var("KHIVE_DAEMON_STRICT").ok();
+        match value {
+            Some(v) => std::env::set_var("KHIVE_DAEMON_STRICT", v),
+            None => std::env::remove_var("KHIVE_DAEMON_STRICT"),
+        }
+        let result = f();
+        match prev {
+            Some(v) => std::env::set_var("KHIVE_DAEMON_STRICT", v),
+            None => std::env::remove_var("KHIVE_DAEMON_STRICT"),
+        }
+        result
+    }
+
+    #[test]
+    #[serial]
+    fn record_fallback_config_mismatch_strict_off_never_bumps_strict_violations() {
+        with_daemon_strict(None, || {
+            reset_fallback_counters();
+            record_fallback(FallbackReason::ConfigMismatch, CFG, Some("other-cfg"), NS);
+            assert_eq!(fallback_count(FallbackReason::ConfigMismatch), 1);
+            assert_eq!(
+                fallback_strict_violations(),
+                0,
+                "strict mode is OFF (default local-dev behavior) — the illegitimate \
+                 reason must still bump its own counter, but never the strict-violations one"
+            );
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn record_fallback_config_mismatch_strict_on_bumps_strict_violations() {
+        with_daemon_strict(Some("1"), || {
+            reset_fallback_counters();
+            record_fallback(FallbackReason::ConfigMismatch, CFG, Some("other-cfg"), NS);
+            assert_eq!(fallback_count(FallbackReason::ConfigMismatch), 1);
+            assert_eq!(
+                fallback_strict_violations(),
+                1,
+                "KHIVE_DAEMON_STRICT=1 + an Illegitimate reason (config_mismatch) must \
+                 bump the strict-violations counter (D2-R1)"
+            );
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn record_fallback_namespace_mismatch_strict_on_bumps_strict_violations() {
+        with_daemon_strict(Some("1"), || {
+            reset_fallback_counters();
+            record_fallback(
+                FallbackReason::NamespaceMismatch,
+                CFG,
+                Some(CFG),
+                "other-ns",
+            );
+            assert_eq!(
+                fallback_strict_violations(),
+                1,
+                "KHIVE_DAEMON_STRICT=1 + an Illegitimate reason (namespace_mismatch) must \
+                 bump the strict-violations counter (D2-R1)"
+            );
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn record_fallback_no_socket_strict_on_never_bumps_strict_violations() {
+        with_daemon_strict(Some("1"), || {
+            reset_fallback_counters();
+            record_fallback(FallbackReason::NoSocket, CFG, None, NS);
+            assert_eq!(
+                fallback_strict_violations(),
+                0,
+                "NoSocket is the ADR-049-mandated no-daemon path — it must NEVER be \
+                 elevated, even in strict mode (D2-R3)"
+            );
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn record_fallback_protocol_mismatch_strict_on_never_bumps_strict_violations() {
+        with_daemon_strict(Some("1"), || {
+            reset_fallback_counters();
+            record_fallback(FallbackReason::ProtocolMismatch, CFG, None, NS);
+            assert_eq!(
+                fallback_strict_violations(),
+                0,
+                "ProtocolMismatch is the rollout-transient (version_mismatch) tier — \
+                 it must NEVER be elevated, even in strict mode (D2-R3)"
+            );
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn record_fallback_parse_failure_strict_on_never_bumps_strict_violations() {
+        with_daemon_strict(Some("1"), || {
+            reset_fallback_counters();
+            record_fallback(FallbackReason::ParseFailure, CFG, None, NS);
+            assert_eq!(
+                fallback_strict_violations(),
+                0,
+                "ParseFailure is folded into the rollout-transient tier alongside \
+                 ProtocolMismatch (see FallbackReason::severity) — never elevated"
+            );
+        });
+    }
+
+    #[test]
+    fn fallback_reason_severity_matches_the_d2_legitimacy_table() {
+        assert_eq!(
+            FallbackReason::ConfigMismatch.severity(),
+            FallbackSeverity::Illegitimate
+        );
+        assert_eq!(
+            FallbackReason::NamespaceMismatch.severity(),
+            FallbackSeverity::Illegitimate
+        );
+        assert_eq!(
+            FallbackReason::ProtocolMismatch.severity(),
+            FallbackSeverity::RolloutTransient
+        );
+        assert_eq!(
+            FallbackReason::ParseFailure.severity(),
+            FallbackSeverity::RolloutTransient
+        );
+        assert_eq!(
+            FallbackReason::NoSocket.severity(),
+            FallbackSeverity::NoDaemon
+        );
+    }
+
     // ── forward_or_spawn fallback (env-mutating → serial) ─────────────────────
 
     #[tokio::test]
     #[serial]
     async fn forward_or_spawn_returns_none_when_no_daemon_set() {
         clear_daemon_env();
+        reset_fallback_counters();
         let dir = tempfile::tempdir().expect("tempdir");
         let sock = dir.path().join("khived.sock");
         std::env::set_var("KHIVE_SOCKET", &sock);
@@ -966,9 +1674,12 @@ mod tests {
             presentation: None,
             presentation_per_op: None,
             namespace: "test".to_string(),
+            actor_id: None,
+            visible_namespaces: Vec::new(),
             config_id: "test".to_string(),
             protocol_version: PROTOCOL_VERSION,
             probe_only: false,
+            metrics_only: false,
             format: None,
             format_per_op: None,
             from_wire: false,
@@ -976,6 +1687,11 @@ mod tests {
         let out = forward_or_spawn(&frame).await;
         assert!(out.is_none());
         assert!(!sock.exists());
+        // KHIVE_NO_DAEMON is an explicit operator opt-out, not one of the 5
+        // silent-fallback reasons this telemetry tracks — it must NOT bump the
+        // fallback counters (that would be noisy for legitimate always-local
+        // deployments).
+        assert_eq!(fallback_total(), 0);
 
         clear_daemon_env();
     }
@@ -984,7 +1700,7 @@ mod tests {
 
     #[tokio::test]
     #[serial]
-    async fn daemon_round_trip_dispatches_and_enforces_namespace() {
+    async fn daemon_round_trip_dispatches_and_enforces_config_id() {
         clear_daemon_env();
         let dir = tempfile::tempdir().expect("tempdir");
         let sock = dir.path().join("khived.sock");
@@ -1010,9 +1726,12 @@ mod tests {
             presentation: Some("verbose".to_string()),
             presentation_per_op: None,
             namespace: "test".to_string(),
+            actor_id: None,
+            visible_namespaces: Vec::new(),
             config_id: config_id.clone(),
             protocol_version: PROTOCOL_VERSION,
             probe_only: false,
+            metrics_only: false,
             format: None,
             format_per_op: None,
             from_wire: false,
@@ -1043,33 +1762,57 @@ mod tests {
         assert_eq!(resp.result.as_deref(), Some(reference_result.as_str()));
         assert!(reference_result.contains("\"entities\""));
 
-        // (b) different namespace → namespace_mismatch (config matches)
+        // (b) ADR-096 Fork 1: a different namespace, same config_id, is no
+        // longer rejected — the daemon accepts and serves the request under
+        // the frame's OWN namespace ("other") over the same shared warm
+        // registry, instead of setting `namespace_mismatch`.
         let other = DaemonRequestFrame {
             ops: "stats()".to_string(),
             presentation: None,
             presentation_per_op: None,
             namespace: "other".to_string(),
+            actor_id: None,
+            visible_namespaces: Vec::new(),
             config_id: config_id.clone(),
             protocol_version: PROTOCOL_VERSION,
             probe_only: false,
+            metrics_only: false,
             format: None,
             format_per_op: None,
             from_wire: false,
         };
         let resp_other = exchange(&sock, &other).await;
-        assert!(resp_other.namespace_mismatch);
-        assert!(!resp_other.ok);
+        assert!(
+            resp_other.ok,
+            "a differently-namespaced frame with a matching config_id must be \
+             served, not rejected; error={:?}",
+            resp_other.error
+        );
+        assert!(
+            !resp_other.namespace_mismatch,
+            "ADR-096 Fork 1 removed the namespace_mismatch reject"
+        );
+        assert!(!resp_other.config_mismatch);
+        assert_eq!(
+            resp_other.served_config_id.as_deref(),
+            Some(config_id.as_str())
+        );
 
         // (c) same namespace but different config (e.g. a `--pack kg` client
-        // hitting the broader daemon) → config_mismatch, no dispatch.
+        // hitting the broader daemon) → config_mismatch, no dispatch. The
+        // config_id reject stays hard under ADR-096 Fork 1 — only the
+        // namespace reject was softened.
         let mismatched_config = DaemonRequestFrame {
             ops: "stats()".to_string(),
             presentation: None,
             presentation_per_op: None,
             namespace: "test".to_string(),
+            actor_id: None,
+            visible_namespaces: Vec::new(),
             config_id: "packs=[kg];db=:memory:;embed=none;extra=[];backend=main".to_string(),
             protocol_version: PROTOCOL_VERSION,
             probe_only: false,
+            metrics_only: false,
             format: None,
             format_per_op: None,
             from_wire: false,
@@ -1088,9 +1831,12 @@ mod tests {
             presentation: None,
             presentation_per_op: None,
             namespace: "test".to_string(),
+            actor_id: None,
+            visible_namespaces: Vec::new(),
             config_id: config_id.clone(),
             protocol_version: 0,
             probe_only: false,
+            metrics_only: false,
             format: None,
             format_per_op: None,
             from_wire: false,
@@ -1129,6 +1875,138 @@ mod tests {
         clear_daemon_env();
     }
 
+    // ── ADR-096 Fork 1: per-request identity over one warm registry ──────────
+    //
+    // Core capability test: two requests carrying DIFFERENT frame namespaces
+    // AND DIFFERENT frame actors, dispatched against ONE already-running warm
+    // daemon, must both be served over the shared backend — and each write
+    // must be stamped with its OWN frame's actor, never the other request's
+    // and never a daemon-baked default. `comm.send` is the vehicle: its JSON
+    // response echoes the dispatching actor directly (`"from": from_actor`),
+    // so this needs no readback/inbox round-trip.
+    #[tokio::test]
+    #[serial]
+    async fn daemon_serves_per_request_identity_over_one_warm_registry() {
+        clear_daemon_env();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sock = dir.path().join("khived.sock");
+        let pid = dir.path().join("khived.pid");
+        std::env::set_var("KHIVE_SOCKET", &sock);
+        std::env::set_var("KHIVE_PID", &pid);
+        std::env::remove_var("KHIVE_NO_DAEMON");
+
+        // No baked actor_id on the daemon-side server: every actor must come
+        // from the per-request frame, never a construction-time default.
+        let reference = make_comm_test_server(None);
+        let config_id = reference.config_id().to_string();
+        let daemon_server = reference.clone();
+
+        let handle = tokio::spawn(async move {
+            let _ = run_daemon(daemon_server).await;
+        });
+        let _ready = connect_when_ready(&sock).await;
+        drop(_ready);
+
+        let alice_frame = DaemonRequestFrame {
+            ops: "comm.send(to=\"bob\", content=\"hello from alice\")".to_string(),
+            presentation: None,
+            presentation_per_op: None,
+            namespace: "alpha".to_string(),
+            actor_id: Some("alice".to_string()),
+            visible_namespaces: Vec::new(),
+            config_id: config_id.clone(),
+            protocol_version: PROTOCOL_VERSION,
+            probe_only: false,
+            metrics_only: false,
+            format: None,
+            format_per_op: None,
+            from_wire: false,
+        };
+        let bob_frame = DaemonRequestFrame {
+            ops: "comm.send(to=\"alice\", content=\"hello from bob\")".to_string(),
+            presentation: None,
+            presentation_per_op: None,
+            namespace: "beta".to_string(),
+            actor_id: Some("bob".to_string()),
+            visible_namespaces: Vec::new(),
+            config_id: config_id.clone(),
+            protocol_version: PROTOCOL_VERSION,
+            probe_only: false,
+            metrics_only: false,
+            format: None,
+            format_per_op: None,
+            from_wire: false,
+        };
+
+        let resp_alice = exchange(&sock, &alice_frame).await;
+        assert!(
+            resp_alice.ok,
+            "alice's request must be served over the shared warm registry; error={:?}",
+            resp_alice.error
+        );
+        assert!(!resp_alice.namespace_mismatch);
+        assert!(!resp_alice.config_mismatch);
+        let body_alice: serde_json::Value =
+            serde_json::from_str(resp_alice.result.as_deref().expect("alice result body"))
+                .expect("decode alice result json");
+        assert_eq!(
+            body_alice["results"][0]["result"]["from"], "alice",
+            "write dispatched under alice's frame must stamp actor=alice, got: {body_alice}"
+        );
+
+        let resp_bob = exchange(&sock, &bob_frame).await;
+        assert!(
+            resp_bob.ok,
+            "bob's request must be served over the SAME shared warm registry; error={:?}",
+            resp_bob.error
+        );
+        assert!(!resp_bob.namespace_mismatch);
+        assert!(!resp_bob.config_mismatch);
+        let body_bob: serde_json::Value =
+            serde_json::from_str(resp_bob.result.as_deref().expect("bob result body"))
+                .expect("decode bob result json");
+        assert_eq!(
+            body_bob["results"][0]["result"]["from"], "bob",
+            "write dispatched under bob's frame must stamp actor=bob, NOT cross-\
+             contaminated with alice's actor; got: {body_bob}"
+        );
+
+        handle.abort();
+        let _ = handle.await;
+        clear_daemon_env();
+    }
+
+    // Back-compat: a caller with NO per-request identity context (pure local
+    // dispatch, never touching the daemon socket) must keep using the
+    // server's own construction-baked actor_id, unaffected by the identity-
+    // override machinery introduced for daemon-forwarded requests.
+    #[tokio::test]
+    #[serial]
+    async fn local_dispatch_without_identity_context_uses_baked_actor() {
+        clear_daemon_env();
+
+        let server = make_comm_test_server(Some("baked-actor"));
+        let result = server
+            .dispatch_request_local(RequestParams {
+                ops: "comm.send(to=\"someone\", content=\"hello\")".to_string(),
+                presentation: None,
+                presentation_per_op: None,
+                save_to: None,
+                format: None,
+                format_per_op: None,
+            })
+            .await
+            .expect("local dispatch of comm.send must succeed");
+
+        let body: serde_json::Value =
+            serde_json::from_str(&result).expect("decode local dispatch result json");
+        assert_eq!(
+            body["results"][0]["result"]["from"], "baked-actor",
+            "local dispatch (no daemon, no identity context) must use the server's \
+             own baked actor_id, got: {body}"
+        );
+    }
+
     // ── daemon-forward wire-origin gate (security regression) ────────────────
     //
     // The agent-facing MCP `request` tool sets `from_wire=true` on its daemon
@@ -1163,9 +2041,12 @@ mod tests {
             presentation: None,
             presentation_per_op: None,
             namespace: "braintest".to_string(),
+            actor_id: None,
+            visible_namespaces: Vec::new(),
             config_id: config_id.clone(),
             protocol_version: PROTOCOL_VERSION,
             probe_only: false,
+            metrics_only: false,
             format: None,
             format_per_op: None,
             from_wire,
@@ -1269,6 +2150,7 @@ mod tests {
             // Pre-versioning daemon would never set these:
             version_mismatch: false,
             daemon_protocol_version: 0,
+            metrics: None,
         }
     }
 
@@ -1321,9 +2203,12 @@ mod tests {
             presentation: None,
             presentation_per_op: None,
             namespace: "test".to_string(),
+            actor_id: None,
+            visible_namespaces: Vec::new(),
             config_id: config_id.to_string(),
             protocol_version: PROTOCOL_VERSION,
             probe_only: false,
+            metrics_only: false,
             format: None,
             format_per_op: None,
             from_wire: false,
@@ -1425,9 +2310,12 @@ mod tests {
             presentation: None,
             presentation_per_op: None,
             namespace: "test".to_string(),
+            actor_id: None,
+            visible_namespaces: Vec::new(),
             config_id: config_id.to_string(),
             protocol_version: PROTOCOL_VERSION,
             probe_only: false,
+            metrics_only: false,
             format: None,
             format_per_op: None,
             from_wire: false,
@@ -1669,6 +2557,7 @@ mod tests {
             _format: Option<String>,
             _format_per_op: Option<Vec<Option<String>>>,
             _from_wire: bool,
+            _identity: Option<khive_runtime::RequestIdentity>,
         ) -> Result<String, String> {
             // Return a string whose serialized DaemonResponseFrame JSON length
             // exceeds MAX_FRAME_BYTES.  The frame JSON overhead is ~200 bytes so
@@ -1728,9 +2617,12 @@ mod tests {
             presentation: None,
             presentation_per_op: None,
             namespace: "test".to_string(),
+            actor_id: None,
+            visible_namespaces: Vec::new(),
             config_id: config_id.to_string(),
             protocol_version: PROTOCOL_VERSION,
             probe_only: false,
+            metrics_only: false,
             format: None,
             format_per_op: None,
             from_wire: false,
@@ -1835,6 +2727,7 @@ mod tests {
             _format: Option<String>,
             _format_per_op: Option<Vec<Option<String>>>,
             _from_wire: bool,
+            _identity: Option<khive_runtime::RequestIdentity>,
         ) -> Result<String, String> {
             DAEMON_DISPATCH.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Ok("{\"ok\":true,\"counted\":true}".to_string())
@@ -1944,9 +2837,12 @@ mod tests {
             presentation: None,
             presentation_per_op: None,
             namespace: "test".to_string(),
+            actor_id: None,
+            visible_namespaces: Vec::new(),
             config_id: config_id.to_string(),
             protocol_version: PROTOCOL_VERSION,
             probe_only: false,
+            metrics_only: false,
             format: None,
             format_per_op: None,
             from_wire: false,
@@ -2005,6 +2901,7 @@ mod tests {
             served_config_id: Some(config_id.to_string()),
             version_mismatch: false,
             daemon_protocol_version: PROTOCOL_VERSION,
+            metrics: None,
         }
     }
 
@@ -2095,6 +2992,7 @@ mod tests {
             _format: Option<String>,
             _format_per_op: Option<Vec<Option<String>>>,
             _from_wire: bool,
+            _identity: Option<khive_runtime::RequestIdentity>,
         ) -> Result<String, String> {
             Err("forced dispatch error: verb returned an error for testing".to_string())
         }
@@ -2142,9 +3040,12 @@ mod tests {
             presentation: None,
             presentation_per_op: None,
             namespace: "test".to_string(),
+            actor_id: None,
+            visible_namespaces: Vec::new(),
             config_id: config_id.to_string(),
             protocol_version: PROTOCOL_VERSION,
             probe_only: false,
+            metrics_only: false,
             format: None,
             format_per_op: None,
             from_wire: false,
@@ -2207,6 +3108,7 @@ mod tests {
             served_config_id: Some(config_id.to_string()),
             version_mismatch: true,
             daemon_protocol_version: 0,
+            metrics: None,
         }
     }
 
@@ -2236,9 +3138,12 @@ mod tests {
             presentation: None,
             presentation_per_op: None,
             namespace: "test".to_string(),
+            actor_id: None,
+            visible_namespaces: Vec::new(),
             config_id: config_id.to_string(),
             protocol_version: PROTOCOL_VERSION,
             probe_only: false,
+            metrics_only: false,
             format: None,
             format_per_op: None,
             from_wire: false,
@@ -2284,6 +3189,7 @@ mod tests {
             served_config_id: Some(config_id.to_string()),
             version_mismatch: true,
             daemon_protocol_version: PROTOCOL_VERSION + 1,
+            metrics: None,
         }
     }
 
@@ -2312,9 +3218,12 @@ mod tests {
             presentation: None,
             presentation_per_op: None,
             namespace: "test".to_string(),
+            actor_id: None,
+            visible_namespaces: Vec::new(),
             config_id: config_id.to_string(),
             protocol_version: PROTOCOL_VERSION,
             probe_only: false,
+            metrics_only: false,
             format: None,
             format_per_op: None,
             from_wire: false,
@@ -2405,9 +3314,12 @@ mod tests {
             presentation: None,
             presentation_per_op: None,
             namespace: "test".to_string(),
+            actor_id: None,
+            visible_namespaces: Vec::new(),
             config_id: config_id.to_string(),
             protocol_version: PROTOCOL_VERSION,
             probe_only: false,
+            metrics_only: false,
             format: None,
             format_per_op: None,
             from_wire: false,
@@ -2434,5 +3346,128 @@ mod tests {
 
         clear_daemon_env();
         std::env::remove_var("KHIVE_LOCK");
+    }
+
+    // ── daemon stderr log-file helpers (no process spawned) ───────────────────
+
+    #[test]
+    fn daemon_log_path_from_home_none_when_home_unset() {
+        assert!(daemon_log_path_from_home(None).is_none());
+    }
+
+    #[test]
+    fn daemon_log_path_from_home_joins_dot_khive_logs() {
+        let home = std::ffi::OsStr::new("/home/example");
+        let path = daemon_log_path_from_home(Some(home)).expect("home present");
+        assert_eq!(
+            path,
+            std::path::PathBuf::from("/home/example/.khive/logs/khived.log")
+        );
+    }
+
+    #[test]
+    fn daemon_log_should_rotate_under_cap_is_false() {
+        assert!(!daemon_log_should_rotate(100, 1000));
+    }
+
+    #[test]
+    fn daemon_log_should_rotate_at_cap_is_true() {
+        assert!(daemon_log_should_rotate(1000, 1000));
+    }
+
+    #[test]
+    fn daemon_log_should_rotate_over_cap_is_true() {
+        assert!(daemon_log_should_rotate(1001, 1000));
+    }
+
+    #[test]
+    fn prepare_daemon_log_file_creates_dir_and_file_on_first_use() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log_path = dir.path().join(".khive").join("logs").join("khived.log");
+
+        let file = prepare_daemon_log_file_with_cap(&log_path, DAEMON_LOG_MAX_BYTES);
+
+        assert!(file.is_some(), "must create dir + file on first use");
+        assert!(log_path.exists());
+    }
+
+    #[test]
+    fn prepare_daemon_log_file_leaves_existing_when_under_cap() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log_dir = dir.path().join("logs");
+        std::fs::create_dir_all(&log_dir).expect("create log dir");
+        let log_path = log_dir.join("khived.log");
+        std::fs::write(&log_path, b"existing content\n").expect("seed existing log");
+
+        let file = prepare_daemon_log_file_with_cap(&log_path, 1_000_000);
+
+        assert!(file.is_some());
+        assert!(
+            !log_dir.join("khived.log.1").exists(),
+            "under-cap log must not be rotated"
+        );
+        let content = std::fs::read_to_string(&log_path).expect("read log");
+        assert_eq!(
+            content, "existing content\n",
+            "append-open must preserve existing content"
+        );
+    }
+
+    #[test]
+    fn prepare_daemon_log_file_rotates_when_over_cap() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log_dir = dir.path().join("logs");
+        std::fs::create_dir_all(&log_dir).expect("create log dir");
+        let log_path = log_dir.join("khived.log");
+        std::fs::write(&log_path, vec![7u8; 20]).expect("seed oversized log");
+
+        let file = prepare_daemon_log_file_with_cap(&log_path, 10);
+
+        assert!(file.is_some());
+        let backup = log_dir.join("khived.log.1");
+        assert!(backup.exists(), "oversized log must rotate to .log.1");
+        assert_eq!(
+            std::fs::metadata(&backup).expect("backup metadata").len(),
+            20,
+            "backup must retain the original oversized content"
+        );
+        assert_eq!(
+            std::fs::metadata(&log_path).expect("log metadata").len(),
+            0,
+            "post-rotation log must start fresh"
+        );
+    }
+
+    #[test]
+    fn prepare_daemon_log_file_rotation_replaces_prior_backup() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log_dir = dir.path().join("logs");
+        std::fs::create_dir_all(&log_dir).expect("create log dir");
+        let log_path = log_dir.join("khived.log");
+        let backup = log_dir.join("khived.log.1");
+        std::fs::write(&backup, b"stale backup").expect("seed stale backup");
+        std::fs::write(&log_path, vec![9u8; 20]).expect("seed oversized log");
+
+        let file = prepare_daemon_log_file_with_cap(&log_path, 10);
+
+        assert!(file.is_some());
+        let backup_content = std::fs::read(&backup).expect("read backup");
+        assert_eq!(
+            backup_content,
+            vec![9u8; 20],
+            "rotation must replace the prior .log.1, not merge with it"
+        );
+    }
+
+    #[test]
+    fn prepare_daemon_log_file_returns_none_when_dir_creation_fails() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // Put a regular FILE where the log directory needs to be, so
+        // create_dir_all cannot create a directory at that path.
+        let blocker = dir.path().join("logs");
+        std::fs::write(&blocker, b"not a directory").expect("seed blocker file");
+        let log_path = blocker.join("khived.log");
+
+        assert!(prepare_daemon_log_file_with_cap(&log_path, DAEMON_LOG_MAX_BYTES).is_none());
     }
 }

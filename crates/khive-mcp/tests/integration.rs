@@ -2947,11 +2947,20 @@ fn cli_args_khive_namespace_env_is_explicit() {
     assert_eq!(ns, Namespace::parse("lambda:from-env").unwrap());
 }
 
-/// KHIVE_ACTOR env var → explicit=true, wins over KHIVE_NAMESPACE.
+/// ADR-096 Fork 2 (PR #657 review, [High]): `KHIVE_ACTOR` env var must NOT
+/// occupy the CLI tier at all — it no longer marks the CLI namespace as
+/// explicit, and it no longer wins over `KHIVE_NAMESPACE`. `args.rs` used to
+/// bind `--actor` to `env = "KHIVE_ACTOR"`, which made a bare shell-level
+/// `KHIVE_ACTOR` indistinguishable from an explicit `--actor` flag and let it
+/// beat the project-config `[actor]` tier — inverting the ratified
+/// precedence (CLI flag > project config > `KHIVE_ACTOR` env > anonymous).
+/// The env binding was removed from `args.actor`; `KHIVE_ACTOR` is now read
+/// only as the tier-3 `actor_id` fallback in `RuntimeConfig::default()` /
+/// `resolve_runtime_config`, never through `resolve_cli_namespace`.
 /// `ClearEnvGuard` keeps env state isolated; `#[serial]` prevents races.
 #[test]
 #[serial_test::serial]
-fn cli_args_khive_actor_env_is_explicit_and_wins() {
+fn cli_args_khive_actor_env_no_longer_occupies_cli_tier() {
     use clap::Parser;
     use khive_mcp::args::{resolve_cli_namespace, Args};
     use khive_runtime::Namespace;
@@ -2964,12 +2973,22 @@ fn cli_args_khive_actor_env_is_explicit_and_wins() {
     std::env::remove_var("KHIVE_ACTOR");
     std::env::remove_var("KHIVE_NAMESPACE");
 
+    assert!(
+        args.actor.is_none(),
+        "KHIVE_ACTOR env must not populate args.actor — the clap env binding was removed"
+    );
+
     let (explicit, ns) = resolve_cli_namespace(&args).unwrap();
-    assert!(explicit);
+    assert!(
+        explicit,
+        "KHIVE_NAMESPACE env still marks the (unchanged, out-of-scope) legacy \
+         --namespace alias tier as explicit"
+    );
     assert_eq!(
         ns,
-        Namespace::parse("lambda:actor-env").unwrap(),
-        "KHIVE_ACTOR env must win over KHIVE_NAMESPACE"
+        Namespace::parse("lambda:ns-env").unwrap(),
+        "with KHIVE_ACTOR no longer in the CLI tier, KHIVE_NAMESPACE decides \
+         the resolved namespace instead of KHIVE_ACTOR"
     );
 }
 
