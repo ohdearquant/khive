@@ -12,7 +12,7 @@ specific backend.
 
 | Trait                                                      | Surface                                                                          |
 | ---------------------------------------------------------- | -------------------------------------------------------------------------------- |
-| `SqlAccess` / `SqlReader` / `SqlWriter` / `SqlTransaction` | pooled connections, transactions, query planning                                 |
+| `SqlAccess` / `SqlReader` / `SqlWriter`                    | pooled connections, atomic units, query planning                                 |
 | `VectorStore`                                              | dense embedding insert/search/rebuild, optional filter pushdown and batch search |
 | `TextSearch`                                               | FTS document upsert/search/stats, optional term-stats (IDF)                      |
 | `GraphStore`                                               | edge CRUD, neighbor queries, multi-hop traversal, batched neighbor/edge fetch    |

@@ -16,32 +16,29 @@
 //! Concurrency (ADR-081 §2 — normative): "the mass check and the fold execute in
 //! one SQLite transaction opened with `BEGIN IMMEDIATE`... database-level
 //! single-writer semantics serialize every check-and-fold against all concurrent
-//! writers." `apply_fold_gate` implements this literally: it acquires exactly one
-//! `SqlWriter` handle and issues `BEGIN IMMEDIATE`, the mass `SELECT`, the decision
-//! (computed in Rust from the row read on *this* connection), the `INSERT ... ON
-//! CONFLICT ... DO UPDATE`, and `COMMIT` — all on that single held connection, with
-//! `ROLLBACK` on any error. For a file-backed pool, `writer()` opens a standalone
-//! real `rusqlite::Connection`; `BEGIN IMMEDIATE` on it acquires SQLite's actual
+//! writers." `apply_fold_gate` satisfies this by handing the whole
+//! check-and-fold — the mass `SELECT`, the decision (computed in Rust from the
+//! row read inside the unit), and the `INSERT ... ON CONFLICT ... DO UPDATE` —
+//! to `SqlAccess::atomic_unit` as ONE suspension-free unit. The seam owns the
+//! transaction boundary: the unit runs under a single `BEGIN IMMEDIATE` with
+//! commit-on-Ok / rollback-on-Err, on the writer task's connection when the
+//! single-writer queue is enabled and on one held writer connection otherwise.
+//! On a file-backed pool that `BEGIN IMMEDIATE` acquires SQLite's actual
 //! file-level RESERVED lock for the duration, which SQLite enforces **across
 //! processes**, not just within one. This is the property production needs:
 //! khive-mcp routinely runs multiple concurrent daemon processes against the same
 //! database file (issue #407), so an in-process mutex alone (e.g. `dispatch_gate`
 //! in `BrainPack::dispatch`) cannot serialize the check-and-fold — only SQLite's
-//! own write lock can. `SqlAccess::begin_tx` was not used for this because it
-//! returns a distinct `SqlTransaction` type and hard-errors on non-file-backed
-//! (in-memory) pools; issuing `BEGIN IMMEDIATE`/`COMMIT`/`ROLLBACK` as ordinary
-//! statements through the existing `SqlWriter::execute` on one retained
-//! `writer()` handle gets the same held-lock guarantee on file-backed pools,
-//! while still functioning correctly (single-caller, no concurrency claim) on
-//! the in-memory pools most of this crate's tests run against — the in-memory
-//! backend serves every `writer()` call from one pool-wide shared connection
-//! (`PoolBackedWriter` re-acquires the same `parking_lot` guard per call), so a
-//! *second* concurrent `BEGIN IMMEDIATE` on it would hit SQLite's own
-//! transaction-nesting error rather than genuinely racing — which is exactly
-//! why the concurrency proof below (`fold_gate_concurrent_writers_never_exceed_cap`)
-//! uses a real file-backed `KhiveRuntime`: only the file-backed path opens an
-//! independent standalone connection per `writer()` call, the same shape
-//! production's multiple concurrent `kkernel mcp` processes have.
+//! own write lock can. (Historical note: this function originally issued
+//! `BEGIN IMMEDIATE`/`COMMIT`/`ROLLBACK` itself on a retained `writer()` handle;
+//! that shape nests inside the writer task's own transaction under the
+//! single-writer queue and was converted to `atomic_unit`. The trait's
+//! `begin_tx`/`SqlTransaction` surface it once avoided has since been retired
+//! entirely.) The concurrency proof below
+//! (`fold_gate_concurrent_writers_never_exceed_cap`) uses a real file-backed
+//! `KhiveRuntime` because only the file-backed path exhibits genuine
+//! cross-connection contention — the same shape production's multiple
+//! concurrent `kkernel mcp` processes have.
 //!
 //! SQL math functions (`pow`/`exp`/`ln`/`log`) are unavailable on this
 //! `rusqlite`/SQLite build (verified empirically: `SELECT pow(2.0, -1.0)` raises

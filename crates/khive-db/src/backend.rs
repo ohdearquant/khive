@@ -730,43 +730,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sqlite_read_only_default_transaction_rejects_writes() {
-        use khive_storage::types::SqlTxOptions;
-
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("ro_tx.db");
-
-        {
-            let writable = StorageBackend::sqlite(&path).unwrap();
-            let sql = writable.sql();
-            let mut writer = sql.writer().await.unwrap();
-            writer
-                .execute_script("CREATE TABLE ro_tx_test (id INTEGER PRIMARY KEY)".into())
-                .await
-                .unwrap();
-        }
-
-        let ro = StorageBackend::sqlite_read_only(&path).unwrap();
-        let sql = ro.sql();
-
-        // `SqlTxOptions::default()` has `read_only: false`; the read-only
-        // backend must still force the transaction to reject writes.
-        let mut tx = sql.begin_tx(SqlTxOptions::default()).await.unwrap();
-        let result = tx
-            .execute(SqlStatement {
-                sql: "INSERT INTO ro_tx_test (id) VALUES (?1)".into(),
-                params: vec![SqlValue::Integer(1)],
-                label: None,
-            })
-            .await;
-        assert!(
-            result.is_err(),
-            "INSERT inside a default tx on a read-only backend must fail"
-        );
-        tx.rollback().await.unwrap();
-    }
-
-    #[tokio::test]
     #[cfg(feature = "vectors")]
     async fn vectors_roundtrip_via_public_api() {
         let backend = StorageBackend::memory().unwrap();

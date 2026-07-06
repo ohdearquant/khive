@@ -23,7 +23,7 @@ pub use event::{
 pub use graph::GraphStore;
 pub use note::{FilterOp, Note, NoteFilter, NoteStore, SortDir};
 pub use sparse::SparseStore;
-pub use sql::{AtomicUnitOp, BoxFuture, SqlAccess, SqlReader, SqlTransaction, SqlWriter};
+pub use sql::{AtomicUnitOp, BoxFuture, SqlAccess, SqlReader, SqlWriter};
 pub use text::TextSearch;
 pub use types::StorageResult;
 pub use vectors::VectorStore;
@@ -32,11 +32,11 @@ pub use types::{
     BatchWriteSummary, DeleteMode, DirectedNeighborHit, Direction, Edge, EdgeFilter, EdgeSortField,
     GraphPath, IndexRebuildScope, LinkId, NeighborHit, NeighborQuery, OrphanSweepConfig,
     OrphanSweepResult, Page, PageRequest, PathNode, PropertyFilter, PropertyOp, SortDirection,
-    SortOrder, SparseRecord, SparseSearchHit, SparseSearchRequest, SparseVector, SqlIsolation,
-    SqlRow, SqlStatement, SqlTxOptions, SqlValue, TextDocument, TextFilter, TextGatherMode,
-    TextIndexStats, TextQueryMode, TextSearchHit, TextSearchOptions, TextSearchRequest,
-    TextTermStats, TextTermStatsRequest, TimeRange, TraversalOptions, TraversalRequest,
-    VectorIndexKind, VectorMetadataFilter, VectorRecord, VectorSearchHit, VectorSearchRequest,
+    SortOrder, SparseRecord, SparseSearchHit, SparseSearchRequest, SparseVector, SqlRow,
+    SqlStatement, SqlValue, TextDocument, TextFilter, TextGatherMode, TextIndexStats,
+    TextQueryMode, TextSearchHit, TextSearchOptions, TextSearchRequest, TextTermStats,
+    TextTermStatsRequest, TimeRange, TraversalOptions, TraversalRequest, VectorIndexKind,
+    VectorMetadataFilter, VectorRecord, VectorSearchHit, VectorSearchRequest,
     VectorStoreCapabilities, VectorStoreInfo, MAX_SPARSE_SEARCH_TOP_K,
 };
 

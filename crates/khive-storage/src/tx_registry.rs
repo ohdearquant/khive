@@ -1,10 +1,11 @@
 //! Process-wide open-transaction registry (ADR-091 Plank 0).
 //!
-//! Every caller-controllable SQL transaction span (`SqliteTransaction::begin_tx`,
-//! `WriterGuard::transaction`, and the raw `BEGIN IMMEDIATE`/`COMMIT` batch-writer
-//! spans) registers here on open and deregisters via `TxHandle`'s `Drop`. This is
-//! observe-only: no enforcement reads the registry in this plank. It exists so the
-//! checkpoint task can name which caller, if any, is holding a WAL snapshot open.
+//! Every caller-controllable SQL transaction span (`WriterGuard::transaction`,
+//! `atomic_unit`'s own registered span, and the raw `BEGIN IMMEDIATE`/`COMMIT`
+//! batch-writer spans) registers here on open and deregisters via `TxHandle`'s
+//! `Drop`. This is observe-only: no enforcement reads the registry in this
+//! plank. It exists so the checkpoint task can name which caller, if any, is
+//! holding a WAL snapshot open.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
