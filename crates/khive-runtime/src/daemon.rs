@@ -177,6 +177,17 @@ pub struct DaemonRequestFrame {
     /// Pre-probe clients omit this field (deserializes to false → normal dispatch).
     #[serde(default)]
     pub probe_only: bool,
+    /// When `true`, the daemon returns a point-in-time [`MetricsSnapshot`] of
+    /// its server-side gauges (a read-only measurement surface for the
+    /// load/perf harness) instead of dispatching any op. Handled before the
+    /// `config_id` equality reject: a gauge read is process-global and
+    /// namespace/config-agnostic, not a namespaced record operation.
+    /// READ-ONLY — this field is the only input the frame accepts for a
+    /// metrics request; there is no reset or mutation reachable over the
+    /// wire. Pre-metrics clients omit this field (deserializes to `false` →
+    /// normal dispatch, unaffected).
+    #[serde(default)]
+    pub metrics_only: bool,
     /// Output format for this request (ADR-078). Forwarded to the daemon's
     /// serialization seam. `None` means use the daemon's resolved default.
     #[serde(default)]
@@ -231,6 +242,58 @@ pub struct DaemonResponseFrame {
     /// daemons omit this field (deserializes to 0).
     #[serde(default)]
     pub daemon_protocol_version: u32,
+    /// Populated when the request set `metrics_only: true`: a point-in-time
+    /// snapshot of the daemon's server-side gauges. `None` on every other
+    /// response, and on any response from a daemon that predates this field
+    /// (client-side back-compat via `#[serde(default)]`, matching
+    /// `served_config_id`'s upgrade-window handling above).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metrics: Option<MetricsSnapshot>,
+}
+
+/// Point-in-time snapshot of the daemon's server-side gauges — the
+/// load/perf harness read-surface (measurement substrate, not a product feature).
+///
+/// Every field here is a **server-side** gauge reachable from `handle_conn`
+/// without any mutation: [`khive_storage::tx_registry`] (ADR-091 Plank 0,
+/// process-global singleton), the WAL checkpoint task's last-observed page
+/// count and TRUNCATE counters (`khive_db::checkpoint`), and the ADR-067
+/// Component A write queue depth (only when `KHIVE_WRITE_QUEUE=1`). There is
+/// no reset reachable through this type or through [`DaemonRequestFrame`] —
+/// gauges out, nothing in.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
+pub struct MetricsSnapshot {
+    /// Last-observed WAL page count from the periodic checkpoint tick.
+    /// `None` when the checkpoint task has never ticked in this process
+    /// (for example, an in-memory dispatcher with no pool, or a daemon that
+    /// just started and hasn't hit its first tick yet).
+    pub wal_pages: Option<u64>,
+    /// Total WAL TRUNCATE escalation attempts (ADR-091 Plank 2) made in this
+    /// process's lifetime, regardless of whether they succeeded in reclaiming
+    /// pages.
+    pub wal_truncate_attempts: u64,
+    /// Current consecutive-failure count for TRUNCATE attempts that failed to
+    /// bring the WAL back below `warn_pages`; resets to 0 the next time an
+    /// attempt clears it.
+    pub wal_truncate_consecutive_failures: u64,
+    /// Age, in microseconds, of the oldest currently-open transaction
+    /// registry entry (ADR-091 Plank 0). `None` when no transaction is
+    /// currently open.
+    pub oldest_pinned_tx_micros: Option<u64>,
+    /// Diagnostic label of the oldest currently-open transaction registry
+    /// entry, if any and if it was registered with one.
+    pub oldest_pinned_tx_label: Option<String>,
+    /// Number of currently open transaction registry entries.
+    pub open_tx_count: usize,
+    /// Current write-queue backlog depth (ADR-067 Component A): requests
+    /// enqueued but not yet accepted by the `WriterTask` drain loop. `None`
+    /// unless the write queue is enabled (`KHIVE_WRITE_QUEUE=1`) and a
+    /// file-backed pool is available.
+    pub write_queue_depth: Option<usize>,
+    /// The write queue's configured bounded capacity
+    /// (`PoolConfig::write_queue_capacity`), gated the same as
+    /// `write_queue_depth`.
+    pub write_queue_capacity: Option<usize>,
 }
 
 // ── framing ───────────────────────────────────────────────────────────────────
@@ -391,6 +454,47 @@ pub fn background_task_count() -> usize {
 
 // ── server ────────────────────────────────────────────────────────────────────
 
+/// Build a point-in-time [`MetricsSnapshot`] of this process's server-side
+/// gauges. Called only from `handle_conn`'s `metrics_only` arm — a
+/// process-global, read-only assembly with no side effects of its own.
+///
+/// `tx_registry` (ADR-091 Plank 0) is a process-global singleton reachable
+/// directly, with no plumbing through `dispatcher`. `wal_pages` and the
+/// TRUNCATE counters (ADR-091 Plank 2) are read from `khive_db::checkpoint`'s
+/// module-scoped atomics, updated wherever the checkpoint task already calls
+/// `query_wal_pages`/`note_truncate_outcome` — mirroring the fallback-counter
+/// pattern in `khive-mcp/src/daemon.rs` rather than threading a metrics
+/// handle through every checkpoint call site, since the checkpoint task
+/// itself is a fire-and-forget `tokio::spawn` with no handle retained
+/// anywhere this accept loop can reach. `write_queue_depth`/`_capacity`
+/// (ADR-067 Component A) come from the dispatcher's own pool, if any, and
+/// are `None` unless `KHIVE_WRITE_QUEUE=1` actually spawned a writer task.
+fn build_metrics_snapshot<D: DaemonDispatch>(dispatcher: &D) -> MetricsSnapshot {
+    let open_tx_count = khive_storage::tx_registry::snapshot().len();
+    let (oldest_pinned_tx_micros, oldest_pinned_tx_label) =
+        match khive_storage::tx_registry::oldest() {
+            Some((age, label)) => (Some(age.as_micros() as u64), label),
+            None => (None, None),
+        };
+
+    let (write_queue_depth, write_queue_capacity) = dispatcher
+        .pool_for_checkpoint()
+        .and_then(|pool| pool.writer_task_handle())
+        .map(|handle| (Some(handle.queue_depth()), Some(handle.capacity())))
+        .unwrap_or((None, None));
+
+    MetricsSnapshot {
+        wal_pages: khive_db::checkpoint::last_observed_wal_pages(),
+        wal_truncate_attempts: khive_db::checkpoint::truncate_attempts(),
+        wal_truncate_consecutive_failures: khive_db::checkpoint::truncate_consecutive_failures(),
+        oldest_pinned_tx_micros,
+        oldest_pinned_tx_label,
+        open_tx_count,
+        write_queue_depth,
+        write_queue_capacity,
+    }
+}
+
 async fn handle_conn<D: DaemonDispatch>(mut stream: UnixStream, dispatcher: D) {
     let raw = match read_frame(&mut stream).await {
         Ok(r) => r,
@@ -428,6 +532,25 @@ async fn handle_conn<D: DaemonDispatch>(mut stream: UnixStream, dispatcher: D) {
             served_config_id,
             version_mismatch: true,
             daemon_protocol_version: PROTOCOL_VERSION,
+            metrics: None,
+        }
+    } else if frame.metrics_only {
+        // Process-global gauge read: namespace/config-agnostic, so this is
+        // handled BEFORE the `config_id` equality reject below (unlike every
+        // other arm) — a metrics probe must work regardless of which
+        // client's config is asking, since it never touches the dispatcher's
+        // packs/db/embed registry. READ-ONLY: builds a snapshot and returns
+        // immediately, never reaching the ops-dispatch arm.
+        DaemonResponseFrame {
+            ok: true,
+            result: None,
+            error: None,
+            namespace_mismatch: false,
+            config_mismatch: false,
+            served_config_id,
+            version_mismatch: false,
+            daemon_protocol_version: PROTOCOL_VERSION,
+            metrics: Some(build_metrics_snapshot(&dispatcher)),
         }
     // ADR-096 Fork 1: there is no `frame.namespace != dispatcher.namespace()`
     // reject here. The daemon accepts and serves the request under the
@@ -448,6 +571,7 @@ async fn handle_conn<D: DaemonDispatch>(mut stream: UnixStream, dispatcher: D) {
             served_config_id,
             version_mismatch: false,
             daemon_protocol_version: PROTOCOL_VERSION,
+            metrics: None,
         }
     } else if frame.probe_only {
         // Probe-only request: identity checks passed; return immediately without
@@ -462,6 +586,7 @@ async fn handle_conn<D: DaemonDispatch>(mut stream: UnixStream, dispatcher: D) {
             served_config_id,
             version_mismatch: false,
             daemon_protocol_version: PROTOCOL_VERSION,
+            metrics: None,
         }
     } else {
         // Build the per-request identity context from the frame (ADR-096
@@ -499,6 +624,7 @@ async fn handle_conn<D: DaemonDispatch>(mut stream: UnixStream, dispatcher: D) {
                 served_config_id,
                 version_mismatch: false,
                 daemon_protocol_version: PROTOCOL_VERSION,
+                metrics: None,
             },
             Err(e) => DaemonResponseFrame {
                 ok: false,
@@ -509,6 +635,7 @@ async fn handle_conn<D: DaemonDispatch>(mut stream: UnixStream, dispatcher: D) {
                 served_config_id,
                 version_mismatch: false,
                 daemon_protocol_version: PROTOCOL_VERSION,
+                metrics: None,
             },
         }
     };
@@ -540,6 +667,7 @@ async fn handle_conn<D: DaemonDispatch>(mut stream: UnixStream, dispatcher: D) {
                     served_config_id: resp.served_config_id,
                     version_mismatch: false,
                     daemon_protocol_version: PROTOCOL_VERSION,
+                    metrics: None,
                 };
                 if let Ok(err_payload) = serde_json::to_vec(&err_resp) {
                     if let Err(e) = write_frame(&mut stream, &err_payload).await {
@@ -907,6 +1035,347 @@ mod tests {
             background_task_count(),
             before,
             "background task counter must return to baseline after the tracked future panics"
+        );
+    }
+
+    // ── metrics-only frame (load/perf harness read-surface) ────────────────
+
+    /// Minimal `DaemonDispatch` for the metrics tests: `dispatch` just counts
+    /// how many times it was called (so tests can assert the ops path was
+    /// never reached) and `pool_for_checkpoint` returns whatever pool the
+    /// test wired in (or `None`, matching an in-memory/poolless dispatcher).
+    #[derive(Clone)]
+    struct MockDispatch {
+        namespace: String,
+        config_id: String,
+        dispatch_calls: Arc<std::sync::atomic::AtomicUsize>,
+        pool: Option<Arc<ConnectionPool>>,
+    }
+
+    #[async_trait]
+    impl DaemonDispatch for MockDispatch {
+        async fn dispatch(
+            &self,
+            _ops: String,
+            _presentation: Option<String>,
+            _presentation_per_op: Option<Vec<Option<String>>>,
+            _format: Option<String>,
+            _format_per_op: Option<Vec<Option<String>>>,
+            _from_wire: bool,
+            _identity: Option<RequestIdentity>,
+        ) -> Result<String, String> {
+            self.dispatch_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok("{}".to_string())
+        }
+
+        async fn warm_all(&self) {}
+
+        fn namespace(&self) -> &str {
+            &self.namespace
+        }
+
+        fn config_id(&self) -> &str {
+            &self.config_id
+        }
+
+        fn pool_for_checkpoint(&self) -> Option<Arc<ConnectionPool>> {
+            self.pool.clone()
+        }
+    }
+
+    fn base_request_frame(config_id: &str) -> DaemonRequestFrame {
+        DaemonRequestFrame {
+            ops: String::new(),
+            presentation: None,
+            presentation_per_op: None,
+            namespace: "local".to_string(),
+            actor_id: None,
+            visible_namespaces: Vec::new(),
+            config_id: config_id.to_string(),
+            protocol_version: PROTOCOL_VERSION,
+            probe_only: false,
+            metrics_only: false,
+            format: None,
+            format_per_op: None,
+            from_wire: false,
+        }
+    }
+
+    /// Drive `handle_conn` over an in-process `UnixStream::pair()` (no real
+    /// socket file needed) and decode the response frame it writes back.
+    async fn round_trip(dispatcher: MockDispatch, req: &DaemonRequestFrame) -> DaemonResponseFrame {
+        let (mut client, server) = UnixStream::pair().expect("unix stream pair");
+        let payload = serde_json::to_vec(req).expect("encode request frame");
+        let handle = tokio::spawn(async move {
+            handle_conn(server, dispatcher).await;
+        });
+        write_frame(&mut client, &payload)
+            .await
+            .expect("write request frame");
+        let raw = read_frame(&mut client).await.expect("read response frame");
+        handle.await.expect("handle_conn task panicked");
+        serde_json::from_slice(&raw).expect("decode response frame")
+    }
+
+    /// Test 1: a `metrics_only: true` request
+    /// returns `metrics: Some(_)` and never reaches the ops-dispatch path; a
+    /// normal request (the default `metrics_only: false`) still dispatches
+    /// exactly as before and carries no metrics. Also proves `metrics_only`
+    /// bypasses the `config_id` equality reject (a gauge read is
+    /// process-global, not namespaced to a particular client config).
+    #[tokio::test]
+    async fn metrics_only_frame_returns_snapshot_without_dispatching() {
+        let dispatch_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let dispatcher = MockDispatch {
+            namespace: "local".to_string(),
+            config_id: "cfg-a".to_string(),
+            dispatch_calls: Arc::clone(&dispatch_calls),
+            pool: None,
+        };
+
+        let mut metrics_req = base_request_frame("cfg-a");
+        metrics_req.metrics_only = true;
+        let metrics_resp = round_trip(dispatcher.clone(), &metrics_req).await;
+
+        assert!(metrics_resp.ok, "metrics_only response must be ok=true");
+        assert!(
+            metrics_resp.metrics.is_some(),
+            "metrics_only=true must return Some(snapshot)"
+        );
+        assert_eq!(
+            dispatch_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "metrics_only must never reach the ops-dispatch path"
+        );
+
+        // metrics_only bypasses the config_id equality reject.
+        let mut mismatched_req = base_request_frame("some-other-config");
+        mismatched_req.metrics_only = true;
+        let mismatched_resp = round_trip(dispatcher.clone(), &mismatched_req).await;
+        assert!(mismatched_resp.ok);
+        assert!(mismatched_resp.metrics.is_some());
+        assert!(!mismatched_resp.config_mismatch);
+        assert_eq!(
+            dispatch_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a mismatched-config metrics_only request must still skip dispatch"
+        );
+
+        // A normal request (default metrics_only=false) is unaffected: it
+        // still dispatches and carries no metrics.
+        let normal_req = base_request_frame("cfg-a");
+        let normal_resp = round_trip(dispatcher, &normal_req).await;
+        assert!(normal_resp.ok);
+        assert!(normal_resp.metrics.is_none());
+        assert_eq!(dispatch_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    /// Test 2: `wal_pages` reflects a real
+    /// checkpoint observation after writes, deterministically forced via a
+    /// direct `checkpoint_once` call rather than waiting on the async
+    /// periodic task.
+    #[tokio::test]
+    async fn metrics_snapshot_wal_pages_reflects_recent_write() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("metrics_wal_test.db");
+        let pool = Arc::new(
+            ConnectionPool::new(khive_db::PoolConfig {
+                path: Some(path),
+                ..khive_db::PoolConfig::default()
+            })
+            .expect("pool open"),
+        );
+
+        {
+            let writer = pool.try_writer().expect("writer");
+            writer
+                .conn()
+                .execute_batch(
+                    "CREATE TABLE t (x INTEGER); \
+                     INSERT INTO t VALUES (1); \
+                     INSERT INTO t VALUES (2);",
+                )
+                .expect("seed writes");
+        }
+
+        let tick = khive_db::checkpoint_once(
+            &pool,
+            &CheckpointConfig::default(),
+            &mut khive_db::checkpoint::TruncateState::default(),
+        );
+        assert!(
+            matches!(tick, khive_db::CheckpointTick::Observed(_)),
+            "checkpoint_once on a freshly-writer-held pool must observe, not skip: {tick:?}"
+        );
+
+        let dispatcher = MockDispatch {
+            namespace: "local".to_string(),
+            config_id: "cfg-wal".to_string(),
+            dispatch_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            pool: Some(pool),
+        };
+
+        let snapshot = build_metrics_snapshot(&dispatcher);
+        assert!(
+            snapshot.wal_pages.is_some(),
+            "wal_pages must be observed after a real checkpoint tick, got {snapshot:?}"
+        );
+    }
+
+    /// Test 3: the tx-pin oracle. Uses a
+    /// before/after delta rather than asserting a global `open_tx_count==0`
+    /// baseline — `tx_registry` is a process-wide singleton shared with every
+    /// other test in this binary (including write-path tests elsewhere in
+    /// this crate that register short-lived entries), the same reason
+    /// `track_background_task_count_returns_to_zero_after_completion` above
+    /// asserts a before/after delta on `background_task_count()` rather than
+    /// an absolute value.
+    #[tokio::test]
+    #[serial(tx_registry)]
+    async fn metrics_snapshot_reflects_open_transaction_registry() {
+        let dispatcher = MockDispatch {
+            namespace: "local".to_string(),
+            config_id: "cfg-tx".to_string(),
+            dispatch_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            pool: None,
+        };
+
+        let before = build_metrics_snapshot(&dispatcher).open_tx_count;
+
+        let handle = khive_storage::tx_registry::register(Some("metrics_test_tx".to_string()));
+        let during = build_metrics_snapshot(&dispatcher);
+        assert!(
+            during.open_tx_count > before,
+            "open_tx_count must reflect the freshly registered transaction: \
+             before={before} during={}",
+            during.open_tx_count
+        );
+        assert!(
+            during.oldest_pinned_tx_micros.is_some(),
+            "oldest_pinned_tx_micros must be Some while a transaction is open"
+        );
+
+        drop(handle);
+
+        let mut after = during.open_tx_count;
+        for _ in 0..20 {
+            after = build_metrics_snapshot(&dispatcher).open_tx_count;
+            if after <= before {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            after <= before,
+            "open_tx_count must drop back down after the transaction handle is dropped: \
+             before={before} after={after}"
+        );
+    }
+
+    /// Test 4: write-queue depth is flag-gated
+    /// on `PoolConfig::write_queue_enabled` (the `KHIVE_WRITE_QUEUE=1`
+    /// setting), never on a specific depth value (racy under concurrency).
+    #[tokio::test]
+    async fn metrics_snapshot_write_queue_depth_flag_gated() {
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        let enabled_pool = Arc::new(
+            ConnectionPool::new(khive_db::PoolConfig {
+                path: Some(dir.path().join("wq_enabled.db")),
+                write_queue_enabled: true,
+                ..khive_db::PoolConfig::default()
+            })
+            .expect("pool open"),
+        );
+        let enabled_dispatcher = MockDispatch {
+            namespace: "local".to_string(),
+            config_id: "cfg-wq-on".to_string(),
+            dispatch_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            pool: Some(enabled_pool),
+        };
+        let snapshot_on = build_metrics_snapshot(&enabled_dispatcher);
+        assert!(
+            snapshot_on.write_queue_depth.is_some(),
+            "write_queue_depth must be Some when write_queue_enabled=true, got {snapshot_on:?}"
+        );
+        assert!(snapshot_on.write_queue_capacity.is_some());
+
+        let disabled_pool = Arc::new(
+            ConnectionPool::new(khive_db::PoolConfig {
+                path: Some(dir.path().join("wq_disabled.db")),
+                write_queue_enabled: false,
+                ..khive_db::PoolConfig::default()
+            })
+            .expect("pool open"),
+        );
+        let disabled_dispatcher = MockDispatch {
+            namespace: "local".to_string(),
+            config_id: "cfg-wq-off".to_string(),
+            dispatch_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            pool: Some(disabled_pool),
+        };
+        let snapshot_off = build_metrics_snapshot(&disabled_dispatcher);
+        assert!(
+            snapshot_off.write_queue_depth.is_none(),
+            "write_queue_depth must be None when write_queue_enabled=false, got {snapshot_off:?}"
+        );
+        assert!(snapshot_off.write_queue_capacity.is_none());
+
+        // No pool at all (in-memory/poolless dispatcher): also None.
+        let no_pool_dispatcher = MockDispatch {
+            namespace: "local".to_string(),
+            config_id: "cfg-no-pool".to_string(),
+            dispatch_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            pool: None,
+        };
+        let snapshot_no_pool = build_metrics_snapshot(&no_pool_dispatcher);
+        assert!(snapshot_no_pool.write_queue_depth.is_none());
+        assert!(snapshot_no_pool.write_queue_capacity.is_none());
+    }
+
+    /// Test 5: serde default back-compat in
+    /// both directions — a request JSON without `metrics_only` deserializes
+    /// with it `false`, and a response JSON without `metrics` (an old
+    /// daemon's shape) deserializes with it `None`.
+    #[test]
+    fn frame_serde_defaults_metrics_fields_when_absent() {
+        let req_json = serde_json::json!({
+            "ops": "",
+            "presentation": null,
+            "presentation_per_op": null,
+            "namespace": "local",
+            "actor_id": null,
+            "visible_namespaces": [],
+            "config_id": "cfg",
+            "protocol_version": PROTOCOL_VERSION,
+            "probe_only": false,
+            "format": null,
+            "format_per_op": null,
+            "from_wire": false
+        });
+        let frame: DaemonRequestFrame =
+            serde_json::from_value(req_json).expect("decode a metrics_only-absent request frame");
+        assert!(
+            !frame.metrics_only,
+            "metrics_only must default to false when absent from the wire payload"
+        );
+
+        let resp_json = serde_json::json!({
+            "ok": true,
+            "result": null,
+            "error": null,
+            "namespace_mismatch": false,
+            "config_mismatch": false,
+            "served_config_id": "cfg",
+            "version_mismatch": false,
+            "daemon_protocol_version": PROTOCOL_VERSION
+        });
+        let resp: DaemonResponseFrame =
+            serde_json::from_value(resp_json).expect("decode a metrics-absent response frame");
+        assert!(
+            resp.metrics.is_none(),
+            "metrics must default to None when absent from the wire payload"
         );
     }
 }

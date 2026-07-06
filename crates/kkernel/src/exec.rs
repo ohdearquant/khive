@@ -518,6 +518,7 @@ async fn run_exec_inline_with_forward(
             config_id: compute_config_id(&cfg, Some(&khive_cfg)),
             protocol_version: PROTOCOL_VERSION,
             probe_only: false,
+            metrics_only: false,
             format: output_format.clone(),
             format_per_op: None,
             // `kkernel exec` is a trusted operator surface: subhandler verbs are

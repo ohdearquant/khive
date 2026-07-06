@@ -222,6 +222,24 @@ impl WriterTaskHandle {
             StorageError::Internal("writer task dropped before replying".to_string())
         })?
     }
+
+    /// Current write-queue backlog depth: requests enqueued but not yet
+    /// accepted by the writer task's drain loop.
+    ///
+    /// Reads `mpsc::Sender::max_capacity() - capacity()`, so it is a
+    /// point-in-time snapshot racy under concurrent senders/the drain loop
+    /// draining concurrently — acceptable for a monitoring gauge (the
+    /// load/perf harness metrics read-surface), never used for any correctness
+    /// decision.
+    pub fn queue_depth(&self) -> usize {
+        self.tx.max_capacity() - self.tx.capacity()
+    }
+
+    /// The bounded channel's configured capacity
+    /// (`PoolConfig::write_queue_capacity`).
+    pub fn capacity(&self) -> usize {
+        self.tx.max_capacity()
+    }
 }
 
 /// Spawn the write-owner task (ADR-067 Component A) on the current Tokio

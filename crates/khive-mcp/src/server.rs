@@ -1295,6 +1295,7 @@ impl KhiveMcpServer {
             config_id: self.config_id.clone(),
             protocol_version: khive_runtime::daemon::PROTOCOL_VERSION,
             probe_only: false,
+            metrics_only: false,
             format: p.format.clone(),
             format_per_op: p.format_per_op.clone(),
             from_wire: true,
