@@ -364,6 +364,45 @@ pub fn resolve_db_anchor(db: Option<&str>) -> Option<std::path::PathBuf> {
     }
 }
 
+/// Assert that a resolved `db_path` — the path a runtime is about to open, and
+/// the same value `compute_config_id` folds into a process's `config_id` — agrees
+/// with what [`resolve_db_anchor`] derives from the same explicit `--db` /
+/// `KHIVE_DB` input. Call this at each construction boundary right after the
+/// `db_path` that boundary is about to use has been resolved.
+///
+/// A construction path that recomputes `db_path` independently of
+/// `resolve_db_anchor` (instead of routing through it, directly or via
+/// `resolve_runtime_config`) would otherwise diverge only silently: its
+/// `config_id` would carry the wrong db path, so it would stop matching a
+/// daemon or peer process anchored on the same database, and would silently
+/// fall back to a disconnected, out-of-sync runtime instead of failing loud.
+/// This turns that divergence into a hard error at the point it is introduced.
+///
+/// When `resolve_db_anchor(args_db)` itself resolves to `None` (the
+/// `:memory:` sentinel), there is no canonical anchor path to compare
+/// against, so the guard is inert and returns `Ok(())` unconditionally.
+pub fn assert_db_anchor_consistent(
+    resolved_db_path: Option<&std::path::Path>,
+    args_db: Option<&str>,
+) -> anyhow::Result<()> {
+    let Some(anchor) = resolve_db_anchor(args_db) else {
+        return Ok(());
+    };
+    if resolved_db_path != Some(anchor.as_path()) {
+        anyhow::bail!(
+            "db-path resolution drift at server construction: resolved db_path {:?} \
+             does not match the canonical anchor {:?} computed by resolve_db_anchor \
+             from the same --db input; this construction path likely recomputed the \
+             db path independently instead of routing through the shared resolver, \
+             which would desynchronize config_id from other processes sharing the \
+             same database",
+            resolved_db_path,
+            anchor
+        );
+    }
+    Ok(())
+}
+
 /// Resolve the per-connection attribution actor from the project/cwd-anchored
 /// config tier, independently of the database-anchored config load that governs
 /// `config_id` (ADR-096 Fork 2).
@@ -652,6 +691,59 @@ mod resolve_db_anchor_tests {
         let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
         let expected = std::path::PathBuf::from(format!("{home}/.khive/khive.db"));
         assert_eq!(resolve_db_anchor(None), Some(expected));
+    }
+}
+
+#[cfg(test)]
+mod assert_db_anchor_consistent_tests {
+    use super::{assert_db_anchor_consistent, resolve_db_anchor};
+
+    #[test]
+    fn diverging_db_path_is_rejected_naming_both_paths() {
+        let args_db = "/tmp/khive-anchor-guard-real.db";
+        let anchor = resolve_db_anchor(Some(args_db)).expect("explicit path always anchors");
+        let wrong = std::path::PathBuf::from("/tmp/khive-anchor-guard-wrong.db");
+
+        let err = assert_db_anchor_consistent(Some(wrong.as_path()), Some(args_db))
+            .expect_err("a resolved db_path diverging from the anchor must be rejected");
+
+        let msg = err.to_string();
+        assert!(
+            msg.contains(&wrong.display().to_string()),
+            "error must name the resolved (wrong) path: {msg}"
+        );
+        assert!(
+            msg.contains(&anchor.display().to_string()),
+            "error must name the canonical anchor path: {msg}"
+        );
+    }
+
+    #[test]
+    fn matching_explicit_db_path_passes() {
+        let args_db = "/tmp/khive-anchor-guard-consistent.db";
+        let anchor = resolve_db_anchor(Some(args_db)).expect("explicit path always anchors");
+        assert!(assert_db_anchor_consistent(Some(anchor.as_path()), Some(args_db)).is_ok());
+    }
+
+    #[test]
+    fn memory_sentinel_anchor_is_inert() {
+        // `resolve_db_anchor(":memory:")` yields `None` — there is no canonical
+        // path to assert against, so the guard passes regardless of what
+        // `resolved_db_path` happens to carry.
+        let bogus = std::path::PathBuf::from("/tmp/should-not-matter.db");
+        assert!(assert_db_anchor_consistent(Some(bogus.as_path()), Some(":memory:")).is_ok());
+        assert!(assert_db_anchor_consistent(None, Some(":memory:")).is_ok());
+    }
+
+    #[test]
+    fn normal_boot_with_db_unset_passes_silently() {
+        // Mirrors a normal boot: `--db` unset. `resolve_db_anchor(None)` always
+        // resolves to `Some(..)` (HOME-set or HOME-unset both produce a
+        // concrete anchor — see `absent_maps_to_home_default` above and the
+        // `resolve_db_anchor` doc comment on the HOME-unset arm), so a runtime
+        // whose resolved `db_path` equals that anchor passes silently.
+        let anchor = resolve_db_anchor(None);
+        assert!(assert_db_anchor_consistent(anchor.as_deref(), None).is_ok());
     }
 }
 

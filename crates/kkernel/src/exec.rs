@@ -389,6 +389,11 @@ pub async fn run_exec(args: ExecArgs) -> Result<()> {
         brain_profile: None,
     })?;
 
+    // Regression fence: `cfg.db_path` must agree with the canonical anchor for
+    // this same `--db`/`KHIVE_DB` input, or `compute_config_id` would silently
+    // desynchronize `kkernel exec` from the daemon it is trying to reach.
+    khive_runtime::assert_db_anchor_consistent(cfg.db_path.as_deref(), args.db.as_deref())?;
+
     match mode {
         ExecMode::Inline(ops) => {
             run_exec_inline(

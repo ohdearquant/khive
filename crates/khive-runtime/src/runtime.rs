@@ -29,8 +29,8 @@ pub type EntityTypeValidatorFn =
     Arc<dyn Fn(&str, Option<&str>) -> Result<Option<String>, RuntimeError> + Send + Sync>;
 
 pub use crate::config::{
-    parse_pack_list, resolve_db_anchor, resolve_project_actor_id, runtime_config_from_khive_config,
-    BackendId, NamespaceToken, RuntimeConfig,
+    assert_db_anchor_consistent, parse_pack_list, resolve_db_anchor, resolve_project_actor_id,
+    runtime_config_from_khive_config, BackendId, NamespaceToken, RuntimeConfig,
 };
 
 // ---- KhiveRuntime ----

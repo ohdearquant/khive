@@ -775,6 +775,14 @@ pub fn build_registry_for_multi_backend(
     khive_cfg: &KhiveConfig,
     cli_db_override: Option<&str>,
 ) -> anyhow::Result<MultiBackendRegistry> {
+    // Regression fence: `base_config.db_path` feeds `compute_config_id` below,
+    // so it must agree with the canonical anchor for this same `--db` input.
+    // This is the shared choke point both multi-backend boot paths funnel
+    // through — `build_server_multi_backend` in this file and `kkernel`'s
+    // `Command::Mcp` coordinator-attached branch — so the guard lives here
+    // once instead of at each caller.
+    khive_runtime::assert_db_anchor_consistent(base_config.db_path.as_deref(), cli_db_override)?;
+
     let backend_count = khive_cfg.backends.len();
     let force_memory = match cli_db_override {
         Some(":memory:") => {
@@ -1055,6 +1063,12 @@ pub fn build_server(args: &Args) -> anyhow::Result<KhiveMcpServer> {
         brain_profile: args.brain_profile.clone(),
     })?;
 
+    // Regression fence: `config.db_path` must agree with what the canonical
+    // resolver derives from this same `--db` input, or `config_id` (computed
+    // from `config.db_path` below) would silently desynchronize this process
+    // from any daemon/peer anchored on the same database.
+    khive_runtime::assert_db_anchor_consistent(config.db_path.as_deref(), args.db.as_deref())?;
+
     // Load the KhiveConfig to check for multi-backend declarations (ADR-028).
     // When no [[backends]] are declared, fall through to the existing single-backend path
     // to preserve byte-for-byte backward compatibility.
@@ -1155,6 +1169,9 @@ pub fn build_server_multi_backend(
     khive_cfg: &KhiveConfig,
     cli_db_override: Option<&str>,
 ) -> anyhow::Result<KhiveMcpServer> {
+    // The db-anchor consistency guard runs inside `build_registry_for_multi_backend`
+    // (the shared choke point every multi-backend boot path funnels through),
+    // so it is not duplicated here.
     let multi = build_registry_for_multi_backend(base_config, khive_cfg, cli_db_override)?;
     Ok(build_server_from_multi_backend_registry(
         multi, khive_cfg, None,
@@ -2428,10 +2445,16 @@ id = "lambda:project-actor"
 
     /// Build a `RuntimeConfig` suitable for multi-backend tests: in-memory db,
     /// AllowAllGate, "local" namespace, no embedder, both kg and comm packs.
+    ///
+    /// `db_path` mirrors what `resolve_runtime_config` sets for a `--db`-unset
+    /// invocation (every call site below passes `cli_db_override: None` to
+    /// `build_server_multi_backend`/`build_registry_for_multi_backend`) — the
+    /// db-anchor consistency guard those functions run requires `db_path` to
+    /// agree with `resolve_db_anchor` for the same input.
     fn base_runtime_config_for_multi_backend() -> RuntimeConfig {
         use khive_runtime::{AllowAllGate, BackendId, Namespace};
         RuntimeConfig {
-            db_path: None,
+            db_path: khive_runtime::resolve_db_anchor(None),
             gate: std::sync::Arc::new(AllowAllGate),
             default_namespace: Namespace::parse("local").expect("ns"),
             embedding_model: None,
@@ -2787,7 +2810,14 @@ id = "lambda:project-actor"
             ..KhiveConfig::default()
         };
 
-        let base_cfg = base_runtime_config_for_multi_backend();
+        // `db_path` matches the concrete override passed below (the db-anchor
+        // consistency guard requires this pairing) — the ambiguity rejection
+        // this test exercises is a downstream check inside
+        // `build_registry_for_multi_backend`, distinct from anchor drift.
+        let base_cfg = RuntimeConfig {
+            db_path: khive_runtime::resolve_db_anchor(Some("/tmp/some-explicit-override.db")),
+            ..base_runtime_config_for_multi_backend()
+        };
 
         let result = build_registry_for_multi_backend(
             base_cfg,
@@ -3255,7 +3285,14 @@ id = "lambda:project-actor"
             ..KhiveConfig::default()
         };
 
-        let base_cfg = base_runtime_config_for_multi_backend();
+        // `db_path` matches the concrete override passed below (the db-anchor
+        // consistency guard requires this pairing) — the ambiguity rejection
+        // this test exercises is a downstream check inside
+        // `build_registry_for_multi_backend`, distinct from anchor drift.
+        let base_cfg = RuntimeConfig {
+            db_path: khive_runtime::resolve_db_anchor(Some("/tmp/some-explicit-override.db")),
+            ..base_runtime_config_for_multi_backend()
+        };
 
         let result = build_server_multi_backend(
             base_cfg,
