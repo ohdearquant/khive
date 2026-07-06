@@ -13,6 +13,7 @@ use khive_storage::StorageCapability;
 
 use crate::error::SqliteError;
 use crate::pool::ConnectionPool;
+use crate::writer_task::WriterTaskHandle;
 
 fn map_err(e: rusqlite::Error, op: &'static str) -> StorageError {
     StorageError::driver(StorageCapability::Entities, op, e)
@@ -29,14 +30,32 @@ fn map_sqlite_err(e: SqliteError, op: &'static str) -> StorageError {
 pub struct SqlEntityStore {
     pool: Arc<ConnectionPool>,
     is_file_backed: bool,
+    writer_task: Option<WriterTaskHandle>,
 }
 
 impl SqlEntityStore {
     /// Create a new store.
+    ///
+    /// When `KHIVE_WRITE_QUEUE=1` (`PoolConfig::write_queue_enabled`),
+    /// `upsert_entities` — ADR-067 slice 1's single migrated write path —
+    /// routes through the pool-wide `WriterTask` (`ConnectionPool::writer_task_handle`)
+    /// instead of the legacy pool-mutex path (`with_writer`, unchanged and
+    /// still used by every other method on this store). The handle is a
+    /// clone of the ONE writer task owned by `pool` — constructing multiple
+    /// stores (or multiple namespaces) over the same pool never spawns more
+    /// than one writer task; see `ConnectionPool::writer_task_handle`'s doc
+    /// comment for why that matters. `None` (falling back to the legacy
+    /// path) if the flag is off, or if the writer task failed to spawn (for
+    /// example, an in-memory pool, which has no standalone-connection
+    /// support) — the flag is a best-effort opt-in for slice 1, not a hard
+    /// requirement.
     pub fn new(pool: Arc<ConnectionPool>, is_file_backed: bool) -> Self {
+        let writer_task = pool.writer_task_handle();
+
         Self {
             pool,
             is_file_backed,
+            writer_task,
         }
     }
 
@@ -168,6 +187,73 @@ fn read_entity(row: &rusqlite::Row<'_>) -> Result<Entity, rusqlite::Error> {
         deleted_at,
         merged_into,
         merge_event_id,
+    })
+}
+
+/// DML-only batch upsert loop shared by both the legacy (flag-off) and
+/// WriterTask-routed (flag-on) `upsert_entities` paths (ADR-067 slice 1).
+///
+/// Issues no `BEGIN` / `COMMIT` / `ROLLBACK` itself — the caller owns the
+/// enclosing transaction. Per-row failures are captured into
+/// `BatchWriteSummary::failed`/`first_error` rather than aborting the loop,
+/// matching the existing partial-success contract: this function's own
+/// `Result` is `Ok` unless a caller bug is present, since no branch here
+/// returns `Err`.
+fn batch_upsert_entities(
+    conn: &rusqlite::Connection,
+    entities: &[Entity],
+    attempted: u64,
+) -> Result<BatchWriteSummary, rusqlite::Error> {
+    let mut affected = 0u64;
+    let mut failed = 0u64;
+    let mut first_error = String::new();
+
+    for entity in entities {
+        let id_str = entity.id.to_string();
+        let properties_str = entity
+            .properties
+            .as_ref()
+            .map(|v| serde_json::to_string(v).unwrap_or_default());
+        let tags_str = serde_json::to_string(&entity.tags).unwrap_or_else(|_| "[]".to_string());
+
+        let merged_into_str = entity.merged_into.map(|u| u.to_string());
+        let merge_event_id_str = entity.merge_event_id.map(|u| u.to_string());
+        match conn.execute(
+            "INSERT OR REPLACE INTO entities \
+             (id, namespace, kind, entity_type, name, description, properties, tags, \
+              created_at, updated_at, deleted_at, merged_into, merge_event_id) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+            rusqlite::params![
+                id_str,
+                &entity.namespace,
+                entity.kind,
+                entity.entity_type,
+                entity.name,
+                entity.description,
+                properties_str,
+                tags_str,
+                entity.created_at,
+                entity.updated_at,
+                entity.deleted_at,
+                merged_into_str,
+                merge_event_id_str,
+            ],
+        ) {
+            Ok(_) => affected += 1,
+            Err(e) => {
+                if first_error.is_empty() {
+                    first_error = e.to_string();
+                }
+                failed += 1;
+            }
+        }
+    }
+
+    Ok(BatchWriteSummary {
+        attempted,
+        affected,
+        failed,
+        first_error,
     })
 }
 
@@ -321,66 +407,36 @@ impl EntityStore for SqlEntityStore {
     ) -> Result<BatchWriteSummary, StorageError> {
         let attempted = entities.len() as u64;
 
+        // ADR-067 slice 1: when the write queue is enabled, route through
+        // the WriterTask channel. The closure is DML-only — no BEGIN
+        // IMMEDIATE/COMMIT/ROLLBACK here, since the WriterTask's run loop
+        // owns the transaction and `WriteRequest::execute_and_reply` owns
+        // the commit/rollback decision (a bare BEGIN IMMEDIATE inside this
+        // closure would violate SQLite's nested-transaction rule).
+        if let Some(writer_task) = &self.writer_task {
+            return writer_task
+                .send(move |conn| {
+                    batch_upsert_entities(conn, &entities, attempted)
+                        .map_err(|e| map_err(e, "upsert_entities"))
+                })
+                .await;
+        }
+
+        // Flag-off (default) path: byte-for-byte unchanged from pre-ADR-067
+        // behavior — the closure owns its own BEGIN IMMEDIATE/COMMIT/ROLLBACK
+        // via the pool-mutex writer.
         self.with_writer("upsert_entities", move |conn| {
             conn.execute_batch("BEGIN IMMEDIATE")?;
             let _tx_handle =
                 khive_storage::tx_registry::register(Some("entity_upsert_batch".to_string()));
-            let mut affected = 0u64;
-            let mut failed = 0u64;
-            let mut first_error = String::new();
 
-            for entity in &entities {
-                let id_str = entity.id.to_string();
-                let properties_str = entity
-                    .properties
-                    .as_ref()
-                    .map(|v| serde_json::to_string(v).unwrap_or_default());
-                let tags_str =
-                    serde_json::to_string(&entity.tags).unwrap_or_else(|_| "[]".to_string());
-
-                let merged_into_str = entity.merged_into.map(|u| u.to_string());
-                let merge_event_id_str = entity.merge_event_id.map(|u| u.to_string());
-                match conn.execute(
-                    "INSERT OR REPLACE INTO entities \
-                     (id, namespace, kind, entity_type, name, description, properties, tags, \
-                      created_at, updated_at, deleted_at, merged_into, merge_event_id) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
-                    rusqlite::params![
-                        id_str,
-                        &entity.namespace,
-                        entity.kind,
-                        entity.entity_type,
-                        entity.name,
-                        entity.description,
-                        properties_str,
-                        tags_str,
-                        entity.created_at,
-                        entity.updated_at,
-                        entity.deleted_at,
-                        merged_into_str,
-                        merge_event_id_str,
-                    ],
-                ) {
-                    Ok(_) => affected += 1,
-                    Err(e) => {
-                        if first_error.is_empty() {
-                            first_error = e.to_string();
-                        }
-                        failed += 1;
-                    }
-                }
-            }
+            let summary = batch_upsert_entities(conn, &entities, attempted)?;
 
             if let Err(e) = conn.execute_batch("COMMIT") {
                 let _ = conn.execute_batch("ROLLBACK");
                 return Err(e);
             }
-            Ok(BatchWriteSummary {
-                attempted,
-                affected,
-                failed,
-                first_error,
-            })
+            Ok(summary)
         })
         .await
     }

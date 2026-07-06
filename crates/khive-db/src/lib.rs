@@ -19,6 +19,8 @@ pub mod pool;
 pub mod sql_bridge;
 /// Per-substrate store implementations (entity, note, graph, event, text, vectors, sparse).
 pub mod stores;
+/// Single-writer task and bounded write queue (ADR-067 Component A).
+pub mod writer_task;
 
 pub use backend::StorageBackend;
 pub use checkpoint::{checkpoint_once, run_checkpoint_task, CheckpointConfig, CheckpointTick};
@@ -29,3 +31,4 @@ pub use migrations::{
 };
 pub use pool::{ConnectionPool, PoolConfig, ReaderGuard, WriterGuard};
 pub use sql_bridge::SqlBridge;
+pub use writer_task::WriterTaskHandle;
