@@ -9126,6 +9126,124 @@ async fn context_direction_outgoing_fanout_keeps_highest_weight_not_node_id_orde
 }
 
 #[tokio::test]
+async fn context_both_direction_mixed_weights_interleave_in_global_order() {
+    // ADR-089 context-verb optimization (single UNION ALL query for
+    // direction="both" expand, replacing two separate direction-scoped
+    // calls): outgoing and incoming edge weights interleave here so the
+    // assertion proves global post-union ordering (weight DESC, node_id ASC
+    // tiebreak) rather than "all outgoing, then all incoming" branch order.
+    let pack = pack();
+    let a = pack
+        .dispatch(
+            "create",
+            json!({"kind": "entity", "name": "CtxBothA", "entity_kind": "concept"}),
+        )
+        .await
+        .expect("create A");
+    let a_id = a["id"].as_str().unwrap().to_string();
+
+    let mut out_ids = Vec::new();
+    for (i, w) in [0.9, 0.5].into_iter().enumerate() {
+        let n = pack
+            .dispatch(
+                "create",
+                json!({"kind": "entity", "name": format!("CtxBothOut{i}"), "entity_kind": "concept"}),
+            )
+            .await
+            .expect("create outgoing neighbor");
+        let n_id = n["id"].as_str().unwrap().to_string();
+        pack.dispatch(
+            "link",
+            json!({"source_id": a_id, "target_id": n_id, "relation": "extends", "weight": w}),
+        )
+        .await
+        .expect("link A->neighbor");
+        out_ids.push((n_id, w));
+    }
+
+    let mut in_ids = Vec::new();
+    for (i, w) in [0.7, 0.2].into_iter().enumerate() {
+        let n = pack
+            .dispatch(
+                "create",
+                json!({"kind": "entity", "name": format!("CtxBothIn{i}"), "entity_kind": "concept"}),
+            )
+            .await
+            .expect("create incoming neighbor");
+        let n_id = n["id"].as_str().unwrap().to_string();
+        pack.dispatch(
+            "link",
+            json!({"source_id": n_id, "target_id": a_id, "relation": "extends", "weight": w}),
+        )
+        .await
+        .expect("link neighbor->A");
+        in_ids.push((n_id, w));
+    }
+
+    // Expected global order by weight DESC: 0.9(out), 0.7(in), 0.5(out), 0.2(in).
+    let expected_order = vec![
+        (out_ids[0].0.clone(), "outgoing"),
+        (in_ids[0].0.clone(), "incoming"),
+        (out_ids[1].0.clone(), "outgoing"),
+        (in_ids[1].0.clone(), "incoming"),
+    ];
+
+    let resp = pack
+        .dispatch(
+            "context",
+            json!({"entity_ids": [a_id], "hops": 1, "direction": "both", "fanout": 10}),
+        )
+        .await
+        .expect("context must succeed");
+    let neighbors = resp["anchors"][0]["neighbors"].as_array().unwrap();
+    assert_eq!(neighbors.len(), 4, "all four neighbors must be present");
+
+    let got: Vec<(String, String)> = neighbors
+        .iter()
+        .map(|n| {
+            (
+                n["id"].as_str().unwrap().to_string(),
+                n["direction"].as_str().unwrap().to_string(),
+            )
+        })
+        .collect();
+    let expected: Vec<(String, String)> = expected_order
+        .into_iter()
+        .map(|(id, dir)| (id, dir.to_string()))
+        .collect();
+    assert_eq!(
+        got, expected,
+        "direction=\"both\" must interleave outgoing/incoming by global weight DESC order, \
+         with each hit's real direction label preserved"
+    );
+
+    // Tight fanout must keep the top-K by GLOBAL weight, not per-direction top-K.
+    let resp_capped = pack
+        .dispatch(
+            "context",
+            json!({"entity_ids": [a_id], "hops": 1, "direction": "both", "fanout": 2}),
+        )
+        .await
+        .expect("context with fanout=2 must succeed");
+    let capped = resp_capped["anchors"][0]["neighbors"].as_array().unwrap();
+    assert_eq!(
+        capped.len(),
+        2,
+        "fanout=2 must cap at 2 across both directions"
+    );
+    assert_eq!(
+        capped[0]["id"], out_ids[0].0,
+        "highest-weight (outgoing) neighbor survives"
+    );
+    assert_eq!(
+        capped[1]["id"], in_ids[0].0,
+        "second-highest-weight (incoming) neighbor survives"
+    );
+    assert_eq!(capped[0]["direction"], "outgoing");
+    assert_eq!(capped[1]["direction"], "incoming");
+}
+
+#[tokio::test]
 async fn context_budget_truncation_sets_flag_and_dropped_counts() {
     let pack = pack();
     let a = pack

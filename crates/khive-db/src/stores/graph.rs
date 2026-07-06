@@ -8,8 +8,9 @@ use uuid::Uuid;
 
 use khive_storage::error::StorageError;
 use khive_storage::types::{
-    BatchWriteSummary, DeleteMode, Edge, EdgeFilter, EdgeSortField, GraphPath, NeighborHit,
-    NeighborQuery, Page, PageRequest, PathNode, SortDirection, SortOrder, TraversalRequest,
+    BatchWriteSummary, DeleteMode, DirectedNeighborHit, Direction, Edge, EdgeFilter, EdgeSortField,
+    GraphPath, NeighborHit, NeighborQuery, Page, PageRequest, PathNode, SortDirection, SortOrder,
+    TraversalRequest,
 };
 use khive_storage::GraphStore;
 use khive_storage::LinkId;
@@ -170,6 +171,85 @@ fn parse_uuid(s: &str) -> Result<Uuid, rusqlite::Error> {
     Uuid::parse_str(s).map_err(|e| {
         rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
     })
+}
+
+/// Build the `relation IN (...)` / `weight >= ?` `WHERE`-extra clause and the
+/// `LIMIT` clause shared by `neighbors` and `neighbors_both_directions` —
+/// both filter and cap identically, differing only in which direction(s) the
+/// base `SELECT`s cover. `start_param_idx` is the next free `?N` placeholder
+/// (both callers bind `namespace` and `node_id` as `?1`/`?2` first).
+fn neighbor_extra_clause(
+    query: &NeighborQuery,
+    start_param_idx: usize,
+) -> (String, String, Vec<Box<dyn rusqlite::types::ToSql>>) {
+    let mut conditions: Vec<String> = Vec::new();
+    let mut extra_params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+    let mut param_idx = start_param_idx;
+
+    if let Some(ref rels) = query.relations {
+        if !rels.is_empty() {
+            let placeholders: Vec<String> = rels
+                .iter()
+                .map(|r| {
+                    extra_params.push(Box::new(r.to_string()));
+                    let p = format!("?{}", param_idx);
+                    param_idx += 1;
+                    p
+                })
+                .collect();
+            conditions.push(format!("relation IN ({})", placeholders.join(",")));
+        }
+    }
+
+    if let Some(min_w) = query.min_weight {
+        extra_params.push(Box::new(min_w));
+        conditions.push(format!("weight >= ?{}", param_idx));
+        param_idx += 1;
+    }
+
+    let where_extra = if conditions.is_empty() {
+        String::new()
+    } else {
+        format!(" WHERE {}", conditions.join(" AND "))
+    };
+
+    let limit_clause = if let Some(lim) = query.limit {
+        extra_params.push(Box::new(lim as i64));
+        format!(" LIMIT ?{}", param_idx)
+    } else {
+        String::new()
+    };
+
+    (where_extra, limit_clause, extra_params)
+}
+
+// Test-only counter of storage-level neighbor SELECT executions (`neighbors`
+// and `neighbors_both_directions` each issue exactly one `graph_edges`
+// query per call). Lets tests assert the query-count halving a
+// `Direction::Both` caller gets from `neighbors_both_directions` vs the old
+// pattern of two separate `neighbors` calls (ADR-089 context-verb
+// optimization). Gated out of release builds — no counter overhead on the
+// hot path in production.
+#[cfg(test)]
+static NEIGHBOR_SELECT_COUNT: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(test)]
+fn count_neighbor_select() {
+    NEIGHBOR_SELECT_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[cfg(not(test))]
+fn count_neighbor_select() {}
+
+#[cfg(test)]
+pub(crate) fn reset_neighbor_select_count() {
+    NEIGHBOR_SELECT_COUNT.store(0, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[cfg(test)]
+pub(crate) fn neighbor_select_count() -> usize {
+    NEIGHBOR_SELECT_COUNT.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 fn micros_to_datetime(micros: i64) -> DateTime<Utc> {
@@ -869,7 +949,7 @@ impl GraphStore for SqlGraphStore {
         node_id: Uuid,
         query: NeighborQuery,
     ) -> Result<Vec<NeighborHit>, StorageError> {
-        use khive_storage::types::Direction;
+        count_neighbor_select();
 
         let namespace = self.namespace.clone();
         let node_str = node_id.to_string();
@@ -888,43 +968,7 @@ impl GraphStore for SqlGraphStore {
                 Direction::Both => format!("{} UNION ALL {}", base_out, base_in),
             };
 
-            let mut conditions: Vec<String> = Vec::new();
-            let mut extra_params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
-            let mut param_idx = 3;
-
-            if let Some(ref rels) = query.relations {
-                if !rels.is_empty() {
-                    let placeholders: Vec<String> = rels
-                        .iter()
-                        .map(|r| {
-                            extra_params.push(Box::new(r.to_string()));
-                            let p = format!("?{}", param_idx);
-                            param_idx += 1;
-                            p
-                        })
-                        .collect();
-                    conditions.push(format!("relation IN ({})", placeholders.join(",")));
-                }
-            }
-
-            if let Some(min_w) = query.min_weight {
-                extra_params.push(Box::new(min_w));
-                conditions.push(format!("weight >= ?{}", param_idx));
-                param_idx += 1;
-            }
-
-            let where_extra = if conditions.is_empty() {
-                String::new()
-            } else {
-                format!(" WHERE {}", conditions.join(" AND "))
-            };
-
-            let limit_clause = if let Some(lim) = query.limit {
-                extra_params.push(Box::new(lim as i64));
-                format!(" LIMIT ?{}", param_idx)
-            } else {
-                String::new()
-            };
+            let (where_extra, limit_clause, extra_params) = neighbor_extra_clause(&query, 3);
 
             // Deterministic weight-descending order, tie-broken by node_id ascending,
             // applied BEFORE `LIMIT` — otherwise a `limit`/`fanout` cap can silently
@@ -972,6 +1016,101 @@ impl GraphStore for SqlGraphStore {
                     name: None,
                     kind: None,
                     entity_type: None,
+                });
+            }
+
+            Ok(hits)
+        })
+        .await
+    }
+
+    /// Single-query both-direction neighbor fetch (ADR-089 context-verb
+    /// optimization): projects a `'out'`/`'in'` literal from each `UNION ALL`
+    /// arm so the caller gets direction labels without a second direction-
+    /// scoped round trip. `query.direction` is ignored — always both.
+    async fn neighbors_both_directions(
+        &self,
+        node_id: Uuid,
+        query: NeighborQuery,
+    ) -> Result<Vec<DirectedNeighborHit>, StorageError> {
+        count_neighbor_select();
+
+        let namespace = self.namespace.clone();
+        let node_str = node_id.to_string();
+
+        self.with_reader("neighbors_both_directions", move |conn| {
+            let base_out = "SELECT target_id AS node_id, id AS edge_id, relation, weight, \
+                            'out' AS dir \
+                            FROM graph_edges \
+                            WHERE namespace = ?1 AND source_id = ?2 AND deleted_at IS NULL";
+            let base_in = "SELECT source_id AS node_id, id AS edge_id, relation, weight, \
+                           'in' AS dir \
+                           FROM graph_edges \
+                           WHERE namespace = ?1 AND target_id = ?2 AND deleted_at IS NULL";
+            let sql = format!("{} UNION ALL {}", base_out, base_in);
+
+            let (where_extra, limit_clause, extra_params) = neighbor_extra_clause(&query, 3);
+
+            // Same global weight-descending/node_id-ascending order as `neighbors`
+            // (ADR-089 context-verb review, internal review round 1, High-1),
+            // applied across BOTH directions before `LIMIT` truncates. A
+            // reciprocal pair (an Out edge and an In edge to/from the same
+            // neighbor at the same weight) ties on `(weight, node_id)`, so the
+            // order is extended with a direction rank (`out` before `in`) and
+            // finally `edge_id` to make the pre-`LIMIT` order fully
+            // deterministic (internal review round 2, High).
+            let full_sql = format!(
+                "SELECT node_id, edge_id, relation, weight, dir FROM ({}){} \
+                 ORDER BY weight DESC, node_id ASC, \
+                 CASE dir WHEN 'out' THEN 0 ELSE 1 END ASC, edge_id ASC{}",
+                sql, where_extra, limit_clause
+            );
+
+            let mut stmt = conn.prepare(&full_sql)?;
+
+            let mut all_params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+            all_params.push(Box::new(namespace.clone()));
+            all_params.push(Box::new(node_str.clone()));
+            all_params.extend(extra_params);
+
+            let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+                all_params.iter().map(|p| p.as_ref()).collect();
+
+            let rows = stmt.query_map(param_refs.as_slice(), |row| {
+                let nid_str: String = row.get(0)?;
+                let eid_str: String = row.get(1)?;
+                let relation_str: String = row.get(2)?;
+                let weight: f64 = row.get(3)?;
+                let dir_str: String = row.get(4)?;
+                Ok((nid_str, eid_str, relation_str, weight, dir_str))
+            })?;
+
+            let mut hits = Vec::new();
+            for row in rows {
+                let (nid_str, eid_str, relation_str, weight, dir_str) = row?;
+                let relation = relation_str.parse::<EdgeRelation>().map_err(|e| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        2,
+                        rusqlite::types::Type::Text,
+                        Box::new(e),
+                    )
+                })?;
+                let direction = if dir_str == "out" {
+                    Direction::Out
+                } else {
+                    Direction::In
+                };
+                hits.push(DirectedNeighborHit {
+                    hit: NeighborHit {
+                        node_id: parse_uuid(&nid_str)?,
+                        edge_id: parse_uuid(&eid_str)?,
+                        relation,
+                        weight,
+                        name: None,
+                        kind: None,
+                        entity_type: None,
+                    },
+                    direction,
                 });
             }
 
