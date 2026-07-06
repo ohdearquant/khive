@@ -364,6 +364,44 @@ pub fn resolve_db_anchor(db: Option<&str>) -> Option<std::path::PathBuf> {
     }
 }
 
+/// Resolve the per-connection attribution actor from the project/cwd-anchored
+/// config tier, independently of the database-anchored config load that governs
+/// `config_id` (ADR-096 Fork 2).
+///
+/// Anchoring tier-3 `.khive/config.toml` discovery to the resolved database's own
+/// directory (commit 10d9c92c, #651) keeps `config_id` coherent between a
+/// short-lived client and a long-running daemon that share one database — that is
+/// correct for the fields that make up `config_id` (packs/db/embed/backend/
+/// visible/outbound). It also relocated discovery of the project-local `[actor]`
+/// block, though. When many per-project connections share one database under a
+/// single `HOME` (the daemon-multiplexed fleet case), the shared database-anchored
+/// config carries no `[actor]`, so every connection's write-stamp attribution
+/// collapses to the default identity.
+///
+/// This performs a SEPARATE, cwd-anchored lookup (`db_path: None`, matching the
+/// pre-#651 tier-3 search) and reads only `[actor].id`. It intentionally does not
+/// read or return anything else from the resolved `KhiveConfig` — `config_id`,
+/// `default_namespace`, and `visible_namespaces` remain governed exclusively by
+/// the existing database-anchored load and must not be perturbed by this tier:
+/// `actor_id` is not part of `compute_config_id` (`khive-mcp` `server.rs`), and
+/// ADR-007 Rev 4 Rule 0 already keeps `[actor].id` out of `default_namespace`.
+///
+/// `config_path` is the same explicit `--config` / `KHIVE_CONFIG` override the
+/// caller's database-anchored load receives — tier 1 short-circuits identically
+/// in both loads, so an explicit override still wins here too.
+///
+/// Returns `Ok(None)` when no project-anchored config exists, or it exists but
+/// carries no non-empty `[actor].id` — callers fall through to their own env /
+/// anonymous tiers in that case.
+pub fn resolve_project_actor_id(
+    config_path: Option<&std::path::Path>,
+) -> Result<Option<String>, crate::engine_config::ConfigError> {
+    let khive_cfg = crate::engine_config::KhiveConfig::load_with_home_fallback(config_path, None)?;
+    Ok(khive_cfg
+        .and_then(|cfg| cfg.actor.id)
+        .filter(|s| !s.trim().is_empty()))
+}
+
 // ---- Embedding model helpers ----
 
 /// Sanitize an embedding model name into a valid SQL table suffix.
@@ -614,5 +652,71 @@ mod resolve_db_anchor_tests {
         let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
         let expected = std::path::PathBuf::from(format!("{home}/.khive/khive.db"));
         assert_eq!(resolve_db_anchor(None), Some(expected));
+    }
+}
+
+#[cfg(test)]
+mod resolve_project_actor_id_tests {
+    use super::resolve_project_actor_id;
+
+    fn write_toml(dir: &tempfile::TempDir, body: &str) -> std::path::PathBuf {
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, body).expect("write config.toml");
+        path
+    }
+
+    #[test]
+    fn extracts_non_empty_actor_id_from_explicit_path() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = write_toml(&dir, "[actor]\nid = \"lambda:explicit-actor\"\n");
+
+        assert_eq!(
+            resolve_project_actor_id(Some(&path)).expect("no error"),
+            Some("lambda:explicit-actor".to_string())
+        );
+    }
+
+    #[test]
+    fn returns_none_for_missing_explicit_path() {
+        let missing = std::path::PathBuf::from("/nonexistent/khive-project-actor-test/config.toml");
+        assert_eq!(
+            resolve_project_actor_id(Some(&missing)).expect("no error"),
+            None,
+            "a nonexistent explicit path must resolve to None, not an error"
+        );
+    }
+
+    #[test]
+    fn propagates_load_error_for_invalid_actor_id() {
+        // `KhiveConfig::load`'s `validate()` rejects an empty `[actor] id` at load
+        // time (`ConfigError::InvalidActorId`) before the emptiness filter in
+        // `resolve_project_actor_id` would ever see it — this asserts the error
+        // surfaces rather than being silently swallowed into `Ok(None)`.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = write_toml(&dir, "[actor]\nid = \"\"\n");
+
+        let err = resolve_project_actor_id(Some(&path)).expect_err("invalid actor.id must error");
+        assert!(
+            matches!(
+                err,
+                crate::engine_config::ConfigError::InvalidActorId { .. }
+            ),
+            "expected InvalidActorId, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn returns_none_when_config_has_no_actor_section() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = write_toml(
+            &dir,
+            "[[engines]]\nname = \"primary\"\nmodel = \"bge-small-en-v1.5\"\ndefault = true\n",
+        );
+
+        assert_eq!(
+            resolve_project_actor_id(Some(&path)).expect("no error"),
+            None,
+            "a config file with no [actor] section must resolve to None"
+        );
     }
 }
