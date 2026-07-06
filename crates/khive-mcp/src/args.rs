@@ -21,12 +21,21 @@ pub struct Args {
     /// this is advisory — no token enforcement is applied. Cloud deployments
     /// derive namespace from the authenticated session token instead.
     ///
-    /// Precedence (highest to lowest):
-    ///   1. --actor (this flag)
-    ///   2. --namespace / KHIVE_NAMESPACE (legacy alias)
-    ///   3. \[actor\] id in config file (--config / KHIVE_CONFIG / khive.toml / ~/.khive/config.toml)
-    ///   4. Default: "local"
-    #[arg(long, env = "KHIVE_ACTOR")]
+    /// Precedence (highest to lowest — ADR-096 Fork 2, ratified 2026-07-05):
+    ///   1. --actor (this flag) / --namespace / KHIVE_NAMESPACE (legacy alias)
+    ///   2. \[actor\] id in the cwd/project-anchored config
+    ///      (`.khive/config.toml`, resolved independently of `--db`)
+    ///   3. KHIVE_ACTOR env var (attribution-only fallback — see below)
+    ///   4. Default: "local" (anonymous)
+    ///
+    /// KHIVE_ACTOR is intentionally NOT bound as a clap `env` source on this
+    /// field: doing so would make a bare shell-level `KHIVE_ACTOR` collapse
+    /// into tier 1 and beat tier 2, which inverts the ratified precedence.
+    /// It is read directly as the tier-3 fallback in
+    /// `RuntimeConfig::default()` / `resolve_runtime_config` instead, and it
+    /// sets `actor_id` only — never `default_namespace` (identity is not
+    /// namespace, ADR-007 Rule 0).
+    #[arg(long)]
     pub actor: Option<String>,
 
     /// Default namespace for operations that do not specify one (legacy alias for --actor).

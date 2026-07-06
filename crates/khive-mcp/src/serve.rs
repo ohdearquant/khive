@@ -1045,6 +1045,7 @@ pub fn build_server(args: &Args) -> anyhow::Result<KhiveMcpServer> {
         config: args.config.as_deref(),
         namespace: cli_namespace,
         namespace_explicit: cli_namespace_explicit,
+        actor_explicit: cli_namespace_explicit,
         no_embed: args.no_embed,
         packs: if args.pack.is_empty() {
             None
@@ -1339,6 +1340,17 @@ pub struct RuntimeConfigInputs<'a> {
     pub namespace: khive_runtime::Namespace,
     /// Whether the namespace came from an explicit CLI flag (skips config tier).
     pub namespace_explicit: bool,
+    /// Whether the caller holds a GENUINE explicit actor/identity override —
+    /// i.e. an operator actually typed `--actor` / `--namespace` (ADR-057).
+    ///
+    /// Distinct from `namespace_explicit`: `kkernel exec` and `kkernel reindex`
+    /// set `namespace_explicit: true` unconditionally (their `--namespace` arg
+    /// has no `Option` to distinguish "typed" from "default"), but they have no
+    /// `--actor` flag and must NOT suppress the project/db actor-id tiers when
+    /// their namespace happens to resolve to `"local"`. Only `kkernel mcp`
+    /// (`build_server`, via `resolve_cli_namespace`) sets this to a value that
+    /// can suppress those tiers — everyone else passes `false`.
+    pub actor_explicit: bool,
     /// Disable embedding entirely (still resolves actor namespace from config).
     pub no_embed: bool,
     /// Packs to register. `None` falls back to `RuntimeConfig::default().packs`.
@@ -1405,14 +1417,21 @@ pub fn resolve_runtime_config(inputs: RuntimeConfigInputs<'_>) -> anyhow::Result
     // ADR-096 Fork 2 — per-connection `actor_id` precedence chain (highest to
     // lowest), ratified 2026-07-05:
     //
-    //   1. Explicit CLI `--actor` / `--namespace` flag (ADR-057). `args.actor`
-    //      also carries its `KHIVE_ACTOR` env-arg alias — clap binds `--actor`
-    //      and `env = "KHIVE_ACTOR"` to the SAME field, so the two are
-    //      indistinguishable at this layer; both are "the CLI tier" here.
-    //      Threaded via `inputs.namespace` / `inputs.namespace_explicit`
-    //      (`resolve_cli_namespace`). The `"local"` guard leaves the default
-    //      namespace anonymous (consistent with `should_warn_unattributed`):
-    //      an explicit `--actor local` must NOT populate `actor_id`.
+    //   1. Explicit CLI `--actor` / `--namespace` flag (ADR-057), threaded via
+    //      `inputs.namespace` / `inputs.actor_explicit` (`resolve_cli_namespace`,
+    //      only `build_server` sets `actor_explicit` from a real CLI parse —
+    //      see the field doc on `RuntimeConfigInputs::actor_explicit`).
+    //      `args.actor` no longer carries a `KHIVE_ACTOR` env-arg alias (the
+    //      clap `env` binding was removed from the tier-1 field — see
+    //      `args.rs`), so this tier is CLI-flag-only; a bare shell-level
+    //      `KHIVE_ACTOR` can no longer masquerade as an explicit flag. When
+    //      genuinely explicit, tiers 2-3 below are NOT consulted at all — an
+    //      explicit `--actor local` must resolve to anonymous (`None`), not
+    //      fall through to a project/db/env actor (the Medium-severity gap
+    //      this block also closes). `kkernel exec`/`reindex` force
+    //      `namespace_explicit: true` for unrelated reasons (no `Option` on
+    //      their `--namespace` arg) but always pass `actor_explicit: false`,
+    //      so they keep falling through to tiers 2-3 exactly as before.
     //   2. Project/cwd-anchored config `[actor].id`, resolved INDEPENDENTLY of
     //      the database-anchored config load above (`resolve_project_actor_id`).
     //      Commit 10d9c92c (#651) anchored tier-3 `.khive/config.toml` discovery
@@ -1423,7 +1442,9 @@ pub fn resolve_runtime_config(inputs: RuntimeConfigInputs<'_>) -> anyhow::Result
     //   3. Whatever `resolved.actor_id` already carries from the
     //      database-anchored config load / `KHIVE_ACTOR` env direct-read
     //      (`resolve_config` / `resolve_actor_from_config` / `RuntimeConfig::
-    //      default()` above) — the pre-#651-drift fallback tier.
+    //      default()` above) — the pre-#651-drift fallback tier. This is the
+    //      ONLY place `KHIVE_ACTOR` env feeds `actor_id`; it never touches
+    //      `default_namespace`.
     //   4. Anonymous (`None`).
     //
     // Attribution-only: none of these tiers may feed `config_id` (`actor_id` is
@@ -1433,10 +1454,29 @@ pub fn resolve_runtime_config(inputs: RuntimeConfigInputs<'_>) -> anyhow::Result
     let resolved = {
         let mut resolved = resolved;
         let ns = resolved.default_namespace.as_str().to_string();
-        let cli_actor = (inputs.namespace_explicit && ns != "local").then_some(ns);
-        let project_actor = khive_runtime::resolve_project_actor_id(inputs.config)
-            .map_err(|e| anyhow::anyhow!("config error: {e}"))?;
-        resolved.actor_id = cli_actor.or(project_actor).or(resolved.actor_id);
+        if inputs.namespace_explicit && ns != "local" {
+            // An explicit non-"local" namespace (CLI `--actor`/`--namespace`,
+            // or `kkernel exec`/`reindex`'s forced-explicit `--namespace`)
+            // fills `actor_id` directly from the namespace — unchanged
+            // pre-existing ADR-057 fill behavior, kept keyed on
+            // `namespace_explicit` (not `actor_explicit`) so exec/reindex
+            // keep resolving a non-local `--namespace` to that actor.
+            resolved.actor_id = Some(ns);
+        } else if inputs.actor_explicit {
+            // Genuinely explicit CLI actor tier requesting anonymous
+            // (`--actor local` / `--namespace local`) is authoritative: do
+            // not fall through to project/db/env actor tiers just because
+            // "local" also looks like "unset". Gated on `actor_explicit`
+            // (not the broader `namespace_explicit`) so `kkernel exec`/
+            // `reindex` — which force `namespace_explicit: true` for
+            // unrelated reasons and have no `--actor` flag — keep falling
+            // through exactly as before.
+            resolved.actor_id = None;
+        } else {
+            let project_actor = khive_runtime::resolve_project_actor_id(inputs.config)
+                .map_err(|e| anyhow::anyhow!("config error: {e}"))?;
+            resolved.actor_id = project_actor.or(resolved.actor_id);
+        }
         resolved
     };
 
@@ -1615,6 +1655,7 @@ default = true
             config: Some(&path),
             namespace: Namespace::parse("local").expect("ns"),
             namespace_explicit: false,
+            actor_explicit: false,
             no_embed: false,
             packs: None,
             brain_profile: None,
@@ -1663,6 +1704,7 @@ brain_profile = "unrelated"
             config: Some(&path),
             namespace: Namespace::parse("local").expect("ns"),
             namespace_explicit: false,
+            actor_explicit: false,
             no_embed: false,
             packs: None,
             brain_profile: None,
@@ -1705,6 +1747,7 @@ brain_profile = "project-profile"
             config: Some(&path),
             namespace: Namespace::parse("local").expect("ns"),
             namespace_explicit: false,
+            actor_explicit: false,
             no_embed: false,
             packs: None,
             brain_profile: None, // no explicit CLI flag
@@ -1743,6 +1786,7 @@ default = true
             config: Some(&path),
             namespace: Namespace::parse("local").expect("ns"),
             namespace_explicit: false,
+            actor_explicit: false,
             no_embed: false,
             packs: None,
             brain_profile: None,
@@ -1778,6 +1822,7 @@ brain_profile = "project-profile"
             config: Some(&path),
             namespace: Namespace::parse("local").expect("ns"),
             namespace_explicit: false,
+            actor_explicit: false,
             no_embed: false,
             packs: None,
             brain_profile: Some("cli-profile".to_string()), // explicit CLI
@@ -1815,6 +1860,7 @@ brain_profile = "project-profile"
             config: Some(&missing_config),
             namespace: Namespace::parse("lambda:agent-x").expect("ns"),
             namespace_explicit: true,
+            actor_explicit: true,
             no_embed: true,
             packs: None,
             brain_profile: None,
@@ -1849,6 +1895,7 @@ brain_profile = "project-profile"
             config: Some(&missing_config),
             namespace: Namespace::parse("local").expect("ns"),
             namespace_explicit: true,
+            actor_explicit: true,
             no_embed: true,
             packs: None,
             brain_profile: None,
@@ -1975,6 +2022,7 @@ brain_profile = "project-profile"
             config: None,
             namespace: Namespace::parse("local").expect("ns"),
             namespace_explicit: false,
+            actor_explicit: false,
             no_embed: true,
             packs: None,
             brain_profile: None,
@@ -2019,6 +2067,7 @@ brain_profile = "project-profile"
             config: None,
             namespace: Namespace::parse("lambda:cli-actor").expect("ns"),
             namespace_explicit: true,
+            actor_explicit: true,
             no_embed: true,
             packs: None,
             brain_profile: None,
@@ -2056,6 +2105,7 @@ id = "lambda:project-actor"
             config: Some(&path),
             namespace: Namespace::parse("local").expect("ns"),
             namespace_explicit: false,
+            actor_explicit: false,
             no_embed: true,
             packs: None,
             brain_profile: None,
@@ -2069,6 +2119,7 @@ id = "lambda:project-actor"
             config: Some(&missing_config),
             namespace: Namespace::parse("local").expect("ns"),
             namespace_explicit: false,
+            actor_explicit: false,
             no_embed: true,
             packs: None,
             brain_profile: None,
@@ -2086,6 +2137,182 @@ id = "lambda:project-actor"
             without_project_config.actor_id.as_deref(),
             Some("lambda:env-actor"),
             "KHIVE_ACTOR env must still be used when no project config actor exists"
+        );
+    }
+
+    /// Codex PR #657 review, [High]: drives the REAL `clap` parse of `Args`
+    /// (not a hand-built `RuntimeConfigInputs`) to prove a bare shell-level
+    /// `KHIVE_ACTOR` no longer occupies the tier-1 CLI slot. Before the fix,
+    /// `args.rs` bound `--actor` to `env = "KHIVE_ACTOR"`, so this env var
+    /// alone made `resolve_cli_namespace` report `explicit = true` and
+    /// therefore beat the project-config tier — inverting the ratified
+    /// chain (CLI flag > project config > `KHIVE_ACTOR` env > anonymous).
+    #[test]
+    #[serial]
+    fn real_clap_path_khive_actor_env_no_longer_wins_over_project_config() {
+        use clap::Parser;
+        std::env::remove_var("KHIVE_ACTOR");
+
+        let seat_dir = tempfile::tempdir().expect("seat tempdir");
+        std::fs::create_dir_all(seat_dir.path().join(".khive")).expect("mkdir seat .khive");
+        std::fs::write(
+            seat_dir.path().join(".khive/config.toml"),
+            "[actor]\nid = \"lambda:project-actor\"\n",
+        )
+        .expect("write seat config");
+
+        let _seat_env = SeatEnv::enter(seat_dir.path());
+        std::env::set_var("KHIVE_ACTOR", "lambda:env-actor");
+
+        // The real arg vector `kkernel mcp` parses — no `--actor` flag, so a
+        // pre-fix `env = "KHIVE_ACTOR"` binding would populate `args.actor`.
+        let args = Args::try_parse_from(["mcp"]).expect("parse real mcp args");
+        let (namespace_explicit, namespace) =
+            resolve_cli_namespace(&args).expect("resolve cli namespace");
+
+        let resolved = resolve_runtime_config(RuntimeConfigInputs {
+            db: Some(":memory:"),
+            config: None,
+            namespace,
+            namespace_explicit,
+            actor_explicit: namespace_explicit,
+            no_embed: true,
+            packs: None,
+            brain_profile: None,
+        });
+
+        std::env::remove_var("KHIVE_ACTOR");
+        let resolved = resolved.expect("resolve config");
+
+        assert!(
+            !namespace_explicit,
+            "KHIVE_ACTOR env alone must NOT make the CLI namespace tier explicit"
+        );
+        assert_eq!(
+            resolved.actor_id.as_deref(),
+            Some("lambda:project-actor"),
+            "project-config [actor] id must win over KHIVE_ACTOR env on the real clap path"
+        );
+        assert_eq!(
+            resolved.default_namespace.as_str(),
+            "local",
+            "KHIVE_ACTOR env must never set default_namespace, only actor_id"
+        );
+    }
+
+    /// Codex PR #657 review, [High], second case: with no project config and
+    /// no `--actor` flag, `KHIVE_ACTOR` must still land as the tier-3
+    /// `actor_id` fallback (it is read directly by `RuntimeConfig::default()`,
+    /// independent of the removed clap `env` binding) — and must still leave
+    /// `default_namespace` at `"local"`.
+    #[test]
+    #[serial]
+    fn real_clap_path_khive_actor_env_falls_back_to_tier3_actor_id() {
+        use clap::Parser;
+        std::env::remove_var("KHIVE_ACTOR");
+
+        // No project config anywhere on the discovery path: an isolated,
+        // empty seat dir + isolated HOME (SeatEnv), so tier 2 and tier 4
+        // (~/.khive/config.toml) both come up empty.
+        let seat_dir = tempfile::tempdir().expect("seat tempdir");
+        let _seat_env = SeatEnv::enter(seat_dir.path());
+        std::env::set_var("KHIVE_ACTOR", "lambda:env-only-actor");
+
+        let args = Args::try_parse_from(["mcp"]).expect("parse real mcp args");
+        let (namespace_explicit, namespace) =
+            resolve_cli_namespace(&args).expect("resolve cli namespace");
+
+        let resolved = resolve_runtime_config(RuntimeConfigInputs {
+            db: Some(":memory:"),
+            config: None,
+            namespace,
+            namespace_explicit,
+            actor_explicit: namespace_explicit,
+            no_embed: true,
+            packs: None,
+            brain_profile: None,
+        });
+
+        std::env::remove_var("KHIVE_ACTOR");
+        let resolved = resolved.expect("resolve config");
+
+        assert!(
+            !namespace_explicit,
+            "KHIVE_ACTOR env alone must NOT make the CLI namespace tier explicit"
+        );
+        assert_eq!(
+            resolved.actor_id.as_deref(),
+            Some("lambda:env-only-actor"),
+            "KHIVE_ACTOR env must still land as the tier-3 actor_id fallback \
+             when no project config exists"
+        );
+        assert_eq!(
+            resolved.default_namespace.as_str(),
+            "local",
+            "KHIVE_ACTOR env must never set default_namespace, only actor_id"
+        );
+    }
+
+    /// Codex PR #657 review, [Medium]: an explicit `--actor local` (an operator
+    /// request for the anonymous identity) must suppress BOTH the project-config
+    /// and the db-anchored-config actor tiers, not just the missing-flag default.
+    /// Before the fix, `resolve_runtime_config`'s tier-3 fold used
+    /// `cli_actor.or(project_actor).or(resolved.actor_id)` unconditionally, so an
+    /// explicit `local` (which maps to `cli_actor = None`) still fell through to
+    /// whatever project or db-anchored `[actor]` happened to be discovered.
+    #[test]
+    #[serial]
+    fn explicit_actor_local_suppresses_project_and_db_actor_tiers() {
+        std::env::remove_var("KHIVE_ACTOR");
+
+        // The seat: a project directory with its own `[actor] id`.
+        let seat_dir = tempfile::tempdir().expect("seat tempdir");
+        std::fs::create_dir_all(seat_dir.path().join(".khive")).expect("mkdir seat .khive");
+        std::fs::write(
+            seat_dir.path().join(".khive/config.toml"),
+            "[actor]\nid = \"lambda:seat-actor\"\n",
+        )
+        .expect("write seat config");
+
+        // A DIFFERENT db-anchored directory that ALSO carries its own `[actor]`
+        // (the db-anchored config load in `resolve_config` applies this
+        // unconditionally, regardless of the CLI explicit flag).
+        let db_dir = tempfile::tempdir().expect("db tempdir");
+        let khive_dir = db_dir.path().join(".khive");
+        std::fs::create_dir_all(&khive_dir).expect("mkdir db .khive");
+        std::fs::write(
+            khive_dir.join("config.toml"),
+            "[actor]\nid = \"lambda:db-actor\"\n",
+        )
+        .expect("write db-anchored config");
+        let db_path = khive_dir.join("khive.db");
+        std::fs::write(&db_path, b"").expect("touch db file");
+        let db_str = db_path.to_str().expect("utf8 path").to_string();
+
+        let _seat_env = SeatEnv::enter(seat_dir.path());
+
+        let resolved = resolve_runtime_config(RuntimeConfigInputs {
+            db: Some(&db_str),
+            config: None,
+            namespace: Namespace::parse("local").expect("ns"),
+            namespace_explicit: true,
+            actor_explicit: true,
+            no_embed: false,
+            packs: None,
+            brain_profile: None,
+        })
+        .expect("resolve config");
+
+        assert_eq!(
+            resolved.actor_id, None,
+            "explicit --actor local must resolve to anonymous even when both a \
+             project-config and a db-anchored config declare an [actor] id — got {:?}",
+            resolved.actor_id
+        );
+        assert_eq!(
+            resolved.default_namespace.as_str(),
+            "local",
+            "explicit --actor local must keep default_namespace local"
         );
     }
 
@@ -2148,6 +2375,7 @@ id = "lambda:project-actor"
                 config: None,
                 namespace: Namespace::parse("local").expect("ns"),
                 namespace_explicit: false,
+                actor_explicit: false,
                 no_embed: true,
                 packs: None,
                 brain_profile: None,
@@ -2162,6 +2390,7 @@ id = "lambda:project-actor"
                 config: None,
                 namespace: Namespace::parse("local").expect("ns"),
                 namespace_explicit: false,
+                actor_explicit: false,
                 no_embed: true,
                 packs: None,
                 brain_profile: None,

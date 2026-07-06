@@ -267,6 +267,7 @@ async fn main() -> Result<()> {
                         config: a.config.as_deref(),
                         namespace: cli_ns,
                         namespace_explicit: cli_ns_explicit,
+                        actor_explicit: cli_ns_explicit,
                         no_embed: a.no_embed,
                         packs: if a.pack.is_empty() {
                             None
