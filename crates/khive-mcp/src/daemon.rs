@@ -196,6 +196,7 @@ impl daemon::DaemonDispatch for crate::server::KhiveMcpServer {
         format: Option<String>,
         format_per_op: Option<Vec<Option<String>>>,
         from_wire: bool,
+        identity: Option<khive_runtime::RequestIdentity>,
     ) -> Result<String, String> {
         let params = RequestParams {
             ops,
@@ -207,7 +208,11 @@ impl daemon::DaemonDispatch for crate::server::KhiveMcpServer {
         };
         // Honor the frame's origin: a wire-origin request enforces verb
         // visibility even when served by the daemon; an operator request does not.
-        self.dispatch_request_inner(params, from_wire)
+        // `identity` (ADR-096 Fork 1) is the caller's per-request identity
+        // context, built by `handle_conn` from the frame — threaded straight
+        // through so this call serves under the CALLER's namespace/actor
+        // rather than this server's own construction-baked identity.
+        self.dispatch_request_inner(params, from_wire, identity)
             .await
             .map_err(|e| e.message.to_string())
     }
@@ -614,6 +619,11 @@ async fn probe_daemon_identity(config_id: &str, namespace: &str, timeout_ms: u64
         presentation: None,
         presentation_per_op: None,
         namespace: namespace.to_string(),
+        // A probe never reaches the identity-context / dispatch arm (it
+        // short-circuits on `probe_only` right after the protocol/config_id
+        // checks), so no per-request identity is meaningful here.
+        actor_id: None,
+        visible_namespaces: Vec::new(),
         config_id: config_id.to_string(),
         protocol_version: PROTOCOL_VERSION,
         probe_only: true,
@@ -1032,6 +1042,24 @@ mod tests {
         crate::server::KhiveMcpServer::new(runtime).expect("server builds with kg+brain")
     }
 
+    /// Server whose pack set includes `comm`, whose `send` verb echoes the
+    /// dispatching actor directly in its JSON response (`"from": from_actor`,
+    /// where `from_actor = token.actor().id`). Used to verify per-request
+    /// actor stamping (ADR-096 Fork 1) without a readback/inbox round-trip.
+    fn make_comm_test_server(actor_id: Option<&str>) -> crate::server::KhiveMcpServer {
+        let config = RuntimeConfig {
+            db_path: None,
+            default_namespace: Namespace::parse("test").unwrap(),
+            embedding_model: None,
+            additional_embedding_models: vec![],
+            packs: vec!["kg".to_string(), "comm".to_string()],
+            actor_id: actor_id.map(str::to_string),
+            ..RuntimeConfig::default()
+        };
+        let runtime = KhiveRuntime::new(config).expect("in-memory runtime");
+        crate::server::KhiveMcpServer::new(runtime).expect("server builds with kg+comm")
+    }
+
     fn clear_daemon_env() {
         std::env::remove_var("KHIVE_SOCKET");
         std::env::remove_var("KHIVE_PID");
@@ -1397,6 +1425,8 @@ mod tests {
             presentation: None,
             presentation_per_op: None,
             namespace: "test".to_string(),
+            actor_id: None,
+            visible_namespaces: Vec::new(),
             config_id: "test".to_string(),
             protocol_version: PROTOCOL_VERSION,
             probe_only: false,
@@ -1420,7 +1450,7 @@ mod tests {
 
     #[tokio::test]
     #[serial]
-    async fn daemon_round_trip_dispatches_and_enforces_namespace() {
+    async fn daemon_round_trip_dispatches_and_enforces_config_id() {
         clear_daemon_env();
         let dir = tempfile::tempdir().expect("tempdir");
         let sock = dir.path().join("khived.sock");
@@ -1446,6 +1476,8 @@ mod tests {
             presentation: Some("verbose".to_string()),
             presentation_per_op: None,
             namespace: "test".to_string(),
+            actor_id: None,
+            visible_namespaces: Vec::new(),
             config_id: config_id.clone(),
             protocol_version: PROTOCOL_VERSION,
             probe_only: false,
@@ -1479,12 +1511,17 @@ mod tests {
         assert_eq!(resp.result.as_deref(), Some(reference_result.as_str()));
         assert!(reference_result.contains("\"entities\""));
 
-        // (b) different namespace → namespace_mismatch (config matches)
+        // (b) ADR-096 Fork 1: a different namespace, same config_id, is no
+        // longer rejected — the daemon accepts and serves the request under
+        // the frame's OWN namespace ("other") over the same shared warm
+        // registry, instead of setting `namespace_mismatch`.
         let other = DaemonRequestFrame {
             ops: "stats()".to_string(),
             presentation: None,
             presentation_per_op: None,
             namespace: "other".to_string(),
+            actor_id: None,
+            visible_namespaces: Vec::new(),
             config_id: config_id.clone(),
             protocol_version: PROTOCOL_VERSION,
             probe_only: false,
@@ -1493,16 +1530,33 @@ mod tests {
             from_wire: false,
         };
         let resp_other = exchange(&sock, &other).await;
-        assert!(resp_other.namespace_mismatch);
-        assert!(!resp_other.ok);
+        assert!(
+            resp_other.ok,
+            "a differently-namespaced frame with a matching config_id must be \
+             served, not rejected; error={:?}",
+            resp_other.error
+        );
+        assert!(
+            !resp_other.namespace_mismatch,
+            "ADR-096 Fork 1 removed the namespace_mismatch reject"
+        );
+        assert!(!resp_other.config_mismatch);
+        assert_eq!(
+            resp_other.served_config_id.as_deref(),
+            Some(config_id.as_str())
+        );
 
         // (c) same namespace but different config (e.g. a `--pack kg` client
-        // hitting the broader daemon) → config_mismatch, no dispatch.
+        // hitting the broader daemon) → config_mismatch, no dispatch. The
+        // config_id reject stays hard under ADR-096 Fork 1 — only the
+        // namespace reject was softened.
         let mismatched_config = DaemonRequestFrame {
             ops: "stats()".to_string(),
             presentation: None,
             presentation_per_op: None,
             namespace: "test".to_string(),
+            actor_id: None,
+            visible_namespaces: Vec::new(),
             config_id: "packs=[kg];db=:memory:;embed=none;extra=[];backend=main".to_string(),
             protocol_version: PROTOCOL_VERSION,
             probe_only: false,
@@ -1524,6 +1578,8 @@ mod tests {
             presentation: None,
             presentation_per_op: None,
             namespace: "test".to_string(),
+            actor_id: None,
+            visible_namespaces: Vec::new(),
             config_id: config_id.clone(),
             protocol_version: 0,
             probe_only: false,
@@ -1565,6 +1621,136 @@ mod tests {
         clear_daemon_env();
     }
 
+    // ── ADR-096 Fork 1: per-request identity over one warm registry ──────────
+    //
+    // Core capability test: two requests carrying DIFFERENT frame namespaces
+    // AND DIFFERENT frame actors, dispatched against ONE already-running warm
+    // daemon, must both be served over the shared backend — and each write
+    // must be stamped with its OWN frame's actor, never the other request's
+    // and never a daemon-baked default. `comm.send` is the vehicle: its JSON
+    // response echoes the dispatching actor directly (`"from": from_actor`),
+    // so this needs no readback/inbox round-trip.
+    #[tokio::test]
+    #[serial]
+    async fn daemon_serves_per_request_identity_over_one_warm_registry() {
+        clear_daemon_env();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sock = dir.path().join("khived.sock");
+        let pid = dir.path().join("khived.pid");
+        std::env::set_var("KHIVE_SOCKET", &sock);
+        std::env::set_var("KHIVE_PID", &pid);
+        std::env::remove_var("KHIVE_NO_DAEMON");
+
+        // No baked actor_id on the daemon-side server: every actor must come
+        // from the per-request frame, never a construction-time default.
+        let reference = make_comm_test_server(None);
+        let config_id = reference.config_id().to_string();
+        let daemon_server = reference.clone();
+
+        let handle = tokio::spawn(async move {
+            let _ = run_daemon(daemon_server).await;
+        });
+        let _ready = connect_when_ready(&sock).await;
+        drop(_ready);
+
+        let alice_frame = DaemonRequestFrame {
+            ops: "comm.send(to=\"bob\", content=\"hello from alice\")".to_string(),
+            presentation: None,
+            presentation_per_op: None,
+            namespace: "alpha".to_string(),
+            actor_id: Some("alice".to_string()),
+            visible_namespaces: Vec::new(),
+            config_id: config_id.clone(),
+            protocol_version: PROTOCOL_VERSION,
+            probe_only: false,
+            format: None,
+            format_per_op: None,
+            from_wire: false,
+        };
+        let bob_frame = DaemonRequestFrame {
+            ops: "comm.send(to=\"alice\", content=\"hello from bob\")".to_string(),
+            presentation: None,
+            presentation_per_op: None,
+            namespace: "beta".to_string(),
+            actor_id: Some("bob".to_string()),
+            visible_namespaces: Vec::new(),
+            config_id: config_id.clone(),
+            protocol_version: PROTOCOL_VERSION,
+            probe_only: false,
+            format: None,
+            format_per_op: None,
+            from_wire: false,
+        };
+
+        let resp_alice = exchange(&sock, &alice_frame).await;
+        assert!(
+            resp_alice.ok,
+            "alice's request must be served over the shared warm registry; error={:?}",
+            resp_alice.error
+        );
+        assert!(!resp_alice.namespace_mismatch);
+        assert!(!resp_alice.config_mismatch);
+        let body_alice: serde_json::Value =
+            serde_json::from_str(resp_alice.result.as_deref().expect("alice result body"))
+                .expect("decode alice result json");
+        assert_eq!(
+            body_alice["results"][0]["result"]["from"], "alice",
+            "write dispatched under alice's frame must stamp actor=alice, got: {body_alice}"
+        );
+
+        let resp_bob = exchange(&sock, &bob_frame).await;
+        assert!(
+            resp_bob.ok,
+            "bob's request must be served over the SAME shared warm registry; error={:?}",
+            resp_bob.error
+        );
+        assert!(!resp_bob.namespace_mismatch);
+        assert!(!resp_bob.config_mismatch);
+        let body_bob: serde_json::Value =
+            serde_json::from_str(resp_bob.result.as_deref().expect("bob result body"))
+                .expect("decode bob result json");
+        assert_eq!(
+            body_bob["results"][0]["result"]["from"], "bob",
+            "write dispatched under bob's frame must stamp actor=bob, NOT cross-\
+             contaminated with alice's actor; got: {body_bob}"
+        );
+
+        handle.abort();
+        let _ = handle.await;
+        clear_daemon_env();
+    }
+
+    // Back-compat: a caller with NO per-request identity context (pure local
+    // dispatch, never touching the daemon socket) must keep using the
+    // server's own construction-baked actor_id, unaffected by the identity-
+    // override machinery introduced for daemon-forwarded requests.
+    #[tokio::test]
+    #[serial]
+    async fn local_dispatch_without_identity_context_uses_baked_actor() {
+        clear_daemon_env();
+
+        let server = make_comm_test_server(Some("baked-actor"));
+        let result = server
+            .dispatch_request_local(RequestParams {
+                ops: "comm.send(to=\"someone\", content=\"hello\")".to_string(),
+                presentation: None,
+                presentation_per_op: None,
+                save_to: None,
+                format: None,
+                format_per_op: None,
+            })
+            .await
+            .expect("local dispatch of comm.send must succeed");
+
+        let body: serde_json::Value =
+            serde_json::from_str(&result).expect("decode local dispatch result json");
+        assert_eq!(
+            body["results"][0]["result"]["from"], "baked-actor",
+            "local dispatch (no daemon, no identity context) must use the server's \
+             own baked actor_id, got: {body}"
+        );
+    }
+
     // ── daemon-forward wire-origin gate (security regression) ────────────────
     //
     // The agent-facing MCP `request` tool sets `from_wire=true` on its daemon
@@ -1599,6 +1785,8 @@ mod tests {
             presentation: None,
             presentation_per_op: None,
             namespace: "braintest".to_string(),
+            actor_id: None,
+            visible_namespaces: Vec::new(),
             config_id: config_id.clone(),
             protocol_version: PROTOCOL_VERSION,
             probe_only: false,
@@ -1757,6 +1945,8 @@ mod tests {
             presentation: None,
             presentation_per_op: None,
             namespace: "test".to_string(),
+            actor_id: None,
+            visible_namespaces: Vec::new(),
             config_id: config_id.to_string(),
             protocol_version: PROTOCOL_VERSION,
             probe_only: false,
@@ -1861,6 +2051,8 @@ mod tests {
             presentation: None,
             presentation_per_op: None,
             namespace: "test".to_string(),
+            actor_id: None,
+            visible_namespaces: Vec::new(),
             config_id: config_id.to_string(),
             protocol_version: PROTOCOL_VERSION,
             probe_only: false,
@@ -2105,6 +2297,7 @@ mod tests {
             _format: Option<String>,
             _format_per_op: Option<Vec<Option<String>>>,
             _from_wire: bool,
+            _identity: Option<khive_runtime::RequestIdentity>,
         ) -> Result<String, String> {
             // Return a string whose serialized DaemonResponseFrame JSON length
             // exceeds MAX_FRAME_BYTES.  The frame JSON overhead is ~200 bytes so
@@ -2164,6 +2357,8 @@ mod tests {
             presentation: None,
             presentation_per_op: None,
             namespace: "test".to_string(),
+            actor_id: None,
+            visible_namespaces: Vec::new(),
             config_id: config_id.to_string(),
             protocol_version: PROTOCOL_VERSION,
             probe_only: false,
@@ -2271,6 +2466,7 @@ mod tests {
             _format: Option<String>,
             _format_per_op: Option<Vec<Option<String>>>,
             _from_wire: bool,
+            _identity: Option<khive_runtime::RequestIdentity>,
         ) -> Result<String, String> {
             DAEMON_DISPATCH.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Ok("{\"ok\":true,\"counted\":true}".to_string())
@@ -2380,6 +2576,8 @@ mod tests {
             presentation: None,
             presentation_per_op: None,
             namespace: "test".to_string(),
+            actor_id: None,
+            visible_namespaces: Vec::new(),
             config_id: config_id.to_string(),
             protocol_version: PROTOCOL_VERSION,
             probe_only: false,
@@ -2531,6 +2729,7 @@ mod tests {
             _format: Option<String>,
             _format_per_op: Option<Vec<Option<String>>>,
             _from_wire: bool,
+            _identity: Option<khive_runtime::RequestIdentity>,
         ) -> Result<String, String> {
             Err("forced dispatch error: verb returned an error for testing".to_string())
         }
@@ -2578,6 +2777,8 @@ mod tests {
             presentation: None,
             presentation_per_op: None,
             namespace: "test".to_string(),
+            actor_id: None,
+            visible_namespaces: Vec::new(),
             config_id: config_id.to_string(),
             protocol_version: PROTOCOL_VERSION,
             probe_only: false,
@@ -2672,6 +2873,8 @@ mod tests {
             presentation: None,
             presentation_per_op: None,
             namespace: "test".to_string(),
+            actor_id: None,
+            visible_namespaces: Vec::new(),
             config_id: config_id.to_string(),
             protocol_version: PROTOCOL_VERSION,
             probe_only: false,
@@ -2748,6 +2951,8 @@ mod tests {
             presentation: None,
             presentation_per_op: None,
             namespace: "test".to_string(),
+            actor_id: None,
+            visible_namespaces: Vec::new(),
             config_id: config_id.to_string(),
             protocol_version: PROTOCOL_VERSION,
             probe_only: false,
