@@ -3251,6 +3251,7 @@ mod orphan_sweep_tests {
 #[cfg(all(test, feature = "vectors"))]
 mod write_queue_tests {
     use std::sync::Arc;
+    use std::time::Duration;
 
     use khive_storage::types::VectorRecord;
     use khive_storage::VectorStore;
@@ -3489,10 +3490,94 @@ mod write_queue_tests {
             "orphaned vector must be swept"
         );
 
+        // `writer_task_spawn_count() == 1` alone does not discriminate the
+        // fix from a regression: `SqliteVecStore::new` and the two setup
+        // `store.insert(..)` calls above already spawn and use the writer
+        // task, so that counter would read 1 even if `orphan_sweep` itself
+        // had reverted to the legacy `with_writer_unmanaged` path. Prove
+        // routing directly instead, mirroring
+        // `upsert_entity_routes_through_writer_task_when_flag_enabled`
+        // (entity_tests.rs): hold the writer task's single drain slot open
+        // with an occupier parked on a oneshot (`blocking_recv`, valid
+        // inside the writer task's `spawn_blocking`), then call
+        // `orphan_sweep` on a separate task and poll
+        // `WriterTaskHandle::queue_depth()`. A version that genuinely
+        // routes through `writer_task.send(..)` must show the request
+        // sitting in the channel (`queue_depth() >= 1`) while the occupier
+        // holds the slot; a version that fell back to
+        // `with_writer_unmanaged`'s pool-mutex path never touches this
+        // channel, so `queue_depth()` would stay `0` for the whole poll
+        // window — the failure mode this test exists to catch.
+        let writer_task = pool
+            .writer_task_handle()
+            .expect("writer task handle")
+            .expect("writer task must be spawned for a file-backed pool with the flag on");
+
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel::<()>();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let occupier = {
+            let writer_task = writer_task.clone();
+            tokio::spawn(async move {
+                writer_task
+                    .send(move |_conn| {
+                        let _ = started_tx.send(());
+                        let _ = release_rx.blocking_recv();
+                        Ok::<(), StorageError>(())
+                    })
+                    .await
+            })
+        };
+
+        started_rx
+            .await
+            .expect("occupier must signal it has started running inside the writer task");
         assert_eq!(
-            pool.writer_task_spawn_count(),
-            1,
-            "orphan_sweep's flag-ON path must actually spawn and use the writer task"
+            writer_task.queue_depth(),
+            0,
+            "channel must start empty once the occupier has been dequeued and is running"
+        );
+
+        let sweep_task = tokio::spawn(async move {
+            store
+                .orphan_sweep(&OrphanSweepConfig {
+                    subject_id_allowlist: None,
+                    namespaces: vec![],
+                    substrate_kinds: vec![],
+                    max_delete: 100,
+                    dry_run: true,
+                })
+                .await
+        });
+
+        let mut saw_enqueued = false;
+        for _ in 0..100 {
+            if writer_task.queue_depth() >= 1 {
+                saw_enqueued = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(
+            saw_enqueued,
+            "orphan_sweep's write request never appeared in the writer task's channel \
+             while the occupier held the single drain slot — orphan_sweep is not routing \
+             through the shared writer task"
+        );
+
+        release_tx
+            .send(())
+            .expect("occupier must still be waiting on the release signal");
+        occupier
+            .await
+            .expect("occupier task must not panic")
+            .expect("occupier write must succeed");
+        let post_sweep = sweep_task
+            .await
+            .expect("sweep task must not panic")
+            .expect("orphan_sweep must succeed once unblocked");
+        assert_eq!(
+            post_sweep.scanned, 1,
+            "only the surviving live vector remains after the earlier real sweep"
         );
     }
 
@@ -3547,12 +3632,16 @@ mod write_queue_tests {
             })
             .await;
 
-        assert!(
-            result.is_err(),
+        let err = result.expect_err(
             "routing the OLD orphan_sweep closure (its own BEGIN IMMEDIATE) through the \
-             WriterTask must fail with a nested-transaction error under KHIVE_WRITE_QUEUE; \
-             got {result:?} — if this now passes, re-audit whether the WriterTask still owns \
-             the sole BEGIN IMMEDIATE for this connection"
+             WriterTask must fail under KHIVE_WRITE_QUEUE — if this now succeeds, re-audit \
+             whether the WriterTask still owns the sole BEGIN IMMEDIATE for this connection",
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("cannot start a transaction within a transaction"),
+            "expected the deterministic nested-transaction failure (SQLite's own message \
+             for a second BEGIN issued inside an already-open transaction), got: {msg}"
         );
     }
 }
