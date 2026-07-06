@@ -1,7 +1,9 @@
 //! SqlAccess bridge: connects `ConnectionPool` to `khive_storage::SqlAccess`.
 //!
 //! Two modes:
-//! - **File-backed**: Opens standalone connections per reader/writer/tx call (high concurrency).
+//! - **File-backed**: Opens standalone connections per reader/writer call (high concurrency).
+//!   Cross-statement atomicity goes through `atomic_unit`, which drives a single
+//!   registered raw transaction span rather than a caller-held per-tx connection.
 //! - **Memory**: Uses pool-backed approach (acquire pool connection per-query inside `spawn_blocking`).
 
 use std::any::Any;
@@ -921,7 +923,9 @@ async fn run_manual_atomic_unit(
 /// Bridges `ConnectionPool` to `khive_storage::SqlAccess`.
 ///
 /// Dispatches based on whether the pool is file-backed or in-memory:
-/// - File-backed: standalone connections per reader/writer/tx (high concurrency).
+/// - File-backed: standalone connections per reader/writer call (high
+///   concurrency); atomic units drive a single registered raw transaction
+///   span instead of a caller-held per-tx connection.
 /// - In-memory: pool-backed connections per query (single shared connection).
 pub struct SqlBridge {
     pool: Arc<ConnectionPool>,

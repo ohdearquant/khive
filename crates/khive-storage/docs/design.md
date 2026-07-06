@@ -66,7 +66,7 @@ Key design constraints:
 | [`src/graph.rs`](../src/graph.rs)           | `GraphStore`                                                                |
 | [`src/note.rs`](../src/note.rs)             | `Note`, `NoteFilter`, `NoteStore`                                           |
 | [`src/sparse.rs`](../src/sparse.rs)         | `SparseStore`                                                               |
-| [`src/sql.rs`](../src/sql.rs)               | `SqlAccess`, `SqlReader`, `SqlWriter`, `SqlTransaction`                     |
+| [`src/sql.rs`](../src/sql.rs)               | `SqlAccess`, `SqlReader`, `SqlWriter`, `AtomicUnitOp`                       |
 | [`src/text.rs`](../src/text.rs)             | `TextSearch`                                                                |
 | [`src/types/`](../src/types/)               | Shared types split by domain (vector, text, graph, sparse, sql, pagination) |
 | [`src/vectors.rs`](../src/vectors.rs)       | `VectorStore`                                                               |

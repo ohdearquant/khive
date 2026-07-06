@@ -1,4 +1,4 @@
-//! SQL-related shared types: values, statements, rows, and transaction options.
+//! SQL-related shared types: values, statements, and rows.
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -48,33 +48,5 @@ impl SqlRow {
             .iter()
             .find(|c| c.name == name)
             .map(|c| &c.value)
-    }
-}
-
-/// Transaction isolation level hint for SQL backends that support it.
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum SqlIsolation {
-    Default,
-    ReadCommitted,
-    RepeatableRead,
-    Serializable,
-}
-
-/// Options passed to a SQL transaction begin call.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct SqlTxOptions {
-    pub read_only: bool,
-    pub isolation: SqlIsolation,
-    pub label: Option<String>,
-}
-
-impl Default for SqlTxOptions {
-    fn default() -> Self {
-        Self {
-            read_only: false,
-            isolation: SqlIsolation::Default,
-            label: None,
-        }
     }
 }

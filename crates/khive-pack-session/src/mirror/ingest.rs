@@ -717,7 +717,14 @@ async fn write_events_and_cursor_on_writer(
                 ],
                 label: Some("session_mirror_create_session".into()),
             })
-            .await?;
+            .await
+            .map_err(|e| {
+                khive_storage::StorageError::driver(
+                    khive_storage::StorageCapability::Sql,
+                    "mirror: session create",
+                    e,
+                )
+            })?;
 
         // ── session_messages insert (idempotent) ──────────────────────────────
         let affected = writer
@@ -751,7 +758,14 @@ async fn write_events_and_cursor_on_writer(
                 ],
                 label: Some("session_mirror_insert_message".into()),
             })
-            .await?;
+            .await
+            .map_err(|e| {
+                khive_storage::StorageError::driver(
+                    khive_storage::StorageCapability::Sql,
+                    "mirror: message insert",
+                    e,
+                )
+            })?;
 
         // ── advance session metadata ONLY when a new message landed ────────────
         //
@@ -787,7 +801,14 @@ async fn write_events_and_cursor_on_writer(
                     ],
                     label: Some("session_mirror_touch_session".into()),
                 })
-                .await?;
+                .await
+                .map_err(|e| {
+                    khive_storage::StorageError::driver(
+                        khive_storage::StorageCapability::Sql,
+                        "mirror: session touch",
+                        e,
+                    )
+                })?;
         }
 
         inserted += affected;
@@ -819,7 +840,14 @@ async fn write_events_and_cursor_on_writer(
                     params: vec![SqlValue::Text(sid.clone())],
                     label: Some("session_mirror_refresh_count".into()),
                 })
-                .await?;
+                .await
+                .map_err(|e| {
+                    khive_storage::StorageError::driver(
+                        khive_storage::StorageCapability::Sql,
+                        "mirror: count refresh",
+                        e,
+                    )
+                })?;
         }
     }
 
@@ -871,7 +899,14 @@ async fn upsert_cursor_on_writer(
             ],
             label: Some("session_mirror_cursor_upsert".into()),
         })
-        .await?;
+        .await
+        .map_err(|e| {
+            khive_storage::StorageError::driver(
+                khive_storage::StorageCapability::Sql,
+                "mirror: cursor upsert",
+                e,
+            )
+        })?;
     Ok(())
 }
 
@@ -2756,15 +2791,24 @@ mod tests {
     /// proves the suspension-free / single-transaction-owner assertions
     /// above are non-vacuous: the pre-conversion shape (a caller managing
     /// its own `BEGIN`/`COMMIT` inside the seam) does NOT silently pass.
+    /// Built over a write-queue-enabled pool (see `write_queue_pool`) so the
+    /// closure is deterministically driven through `block_on_sync`'s
+    /// `InlineWriter` on the real single-writer production path, not the
+    /// flag-off manual-transaction fallback.
     #[tokio::test]
     async fn old_shape_manual_begin_immediate_inside_atomic_unit_fails() {
-        let (rt, _dir) = setup().await;
-        let sql = rt.sql();
+        let dir = TempDir::new().expect("tempdir");
+        let pool = write_queue_pool(dir.path().join("old_shape_begin_immediate.db"));
+        let sql: Arc<dyn khive_storage::SqlAccess> =
+            Arc::new(khive_db::SqlBridge::new(Arc::clone(&pool), true));
+
+        pool.writer_task_handle()
+            .unwrap()
+            .expect("writer task must be spawned with the flag on for a file-backed pool");
 
         let op: khive_storage::AtomicUnitOp = Box::new(move |writer: &mut dyn SqlWriter| {
             Box::pin(async move {
-                // `atomic_unit` already has an open transaction (or, on the
-                // flag-off path, is about to issue one) around this
+                // `atomic_unit` already has an open transaction around this
                 // closure — issuing a second `BEGIN IMMEDIATE` here is
                 // exactly the old `begin_tx`-shaped mistake this ADR
                 // retires: a caller managing its own transaction control
@@ -2780,11 +2824,15 @@ mod tests {
             })
         });
 
-        let result = sql.atomic_unit(op).await;
+        let err = sql.atomic_unit(op).await.expect_err(
+            "a closure that issues its own BEGIN IMMEDIATE inside atomic_unit must fail with a \
+             nested-transaction error, not silently succeed",
+        );
+        let msg = err.to_string();
         assert!(
-            result.is_err(),
-            "a closure that issues its own BEGIN IMMEDIATE inside atomic_unit \
-             must fail with a nested-transaction error, not silently succeed"
+            msg.contains("cannot start a transaction within a transaction"),
+            "expected the deterministic nested-transaction failure (SQLite's own message for a \
+             second BEGIN issued inside an already-open transaction), got: {msg}"
         );
     }
 }
