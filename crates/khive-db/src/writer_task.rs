@@ -1,0 +1,397 @@
+//! Single-writer task and bounded write queue (ADR-067 Component A).
+//!
+//! `WriterTask` (via `spawn` and the drain loop `run_writer_task`) owns a
+//! dedicated standalone writer `rusqlite::Connection` and is the only code
+//! path that issues `BEGIN IMMEDIATE` for write traffic routed through the
+//! channel it drains. Callers reach it exclusively through a
+//! [`WriterTaskHandle`], sending a typed closure and awaiting a typed
+//! oneshot reply so each store method's natural return type (e.g.
+//! `BatchWriteSummary`, with its `attempted`/`affected`/`failed`/
+//! `first_error` fields) survives the trip through the type-erased channel
+//! unmodified — a flat `Result<u64, StorageError>` reply would conflate
+//! `affected`/`failed` into one count and drop `first_error` (ADR-067
+//! Component A, lines 176-224).
+//!
+//! Slice 1 scope: this module builds the mechanism and wires exactly one
+//! write path (`SqlEntityStore::upsert_entities`, gated behind
+//! `KHIVE_WRITE_QUEUE=1` / `PoolConfig::write_queue_enabled`) through it. It
+//! commits one request per `BEGIN IMMEDIATE` — Component B's batched-commit
+//! window and three-level SAVEPOINT hierarchy, Component C's checkpoint
+//! coordination signal, and Component D's transaction watchdog are later
+//! slices. With only one store migrated, other write paths still open their
+//! own writer connections, so this slice does not yet reduce contention or
+//! claim the ADR's single-writer guarantee — it proves the mechanism works
+//! and that the flag-off path is unchanged.
+
+use rusqlite::Connection;
+use tokio::sync::{mpsc, oneshot};
+
+use khive_storage::error::StorageError;
+
+use crate::error::SqliteError;
+use crate::pool::ConnectionPool;
+
+/// Closure signature for a write operation executed against the writer
+/// task's dedicated connection.
+///
+/// `conn` is already inside a `BEGIN IMMEDIATE` transaction opened by
+/// `run_writer_task` when this runs. The closure must issue DML (and, in
+/// later slices, named `SAVEPOINT`s) only — never a bare `BEGIN` / `COMMIT`
+/// / `ROLLBACK` — a nested bare `BEGIN IMMEDIATE` would violate SQLite's
+/// nested-transaction rule and return `SQLITE_ERROR: cannot start a
+/// transaction within a transaction` (ADR-067 lines 271-276).
+type WriteOp<R> = Box<dyn FnOnce(&Connection) -> Result<R, StorageError> + Send>;
+
+/// One write request awaiting execution by the writer task.
+///
+/// Carries a typed closure and a typed oneshot reply so that the concrete
+/// return type `R` (e.g. `BatchWriteSummary`) is preserved end to end,
+/// while [`AnyWriteRequest`] lets the drain loop hold heterogeneous
+/// requests in one homogeneous channel.
+pub struct WriteRequest<R: Send + 'static> {
+    op: WriteOp<R>,
+    reply: oneshot::Sender<Result<R, StorageError>>,
+}
+
+mod sealed {
+    /// Restricts [`super::AnyWriteRequest`] to implementations defined in
+    /// this module — only [`super::WriteRequest<R>`] implements it.
+    pub trait Sealed {}
+}
+
+impl<R: Send + 'static> sealed::Sealed for WriteRequest<R> {}
+
+/// Type-erased write request the writer task's drain loop can hold in a
+/// homogeneous channel (`mpsc::Sender<Box<dyn AnyWriteRequest + Send>>`),
+/// while each concrete [`WriteRequest<R>`] still carries its own typed
+/// reply. Sealed: only this module may implement it (ADR-067 lines
+/// 210-212).
+pub trait AnyWriteRequest: sealed::Sealed + Send {
+    /// Runs this request's operation against `conn`, commits or rolls back
+    /// the enclosing transaction based on the outcome, and sends the
+    /// (possibly commit-failure-adjusted) result to the request's oneshot
+    /// reply channel.
+    ///
+    /// `conn` must already be inside a `BEGIN IMMEDIATE` transaction opened
+    /// by the caller (`run_writer_task`) — this method issues only
+    /// `COMMIT` / `ROLLBACK`, never `BEGIN`, so `run_writer_task` remains
+    /// the sole issuer of `BEGIN IMMEDIATE` (ADR-067 Component A).
+    fn execute_and_reply(self: Box<Self>, conn: &Connection);
+}
+
+impl<R: Send + 'static> AnyWriteRequest for WriteRequest<R> {
+    fn execute_and_reply(self: Box<Self>, conn: &Connection) {
+        let outcome = (self.op)(conn);
+        let final_result = match outcome {
+            Ok(value) => match conn.execute_batch("COMMIT") {
+                Ok(()) => Ok(value),
+                Err(e) => {
+                    let _ = conn.execute_batch("ROLLBACK");
+                    Err(StorageError::Pool {
+                        operation: "writer_task_commit".into(),
+                        message: e.to_string(),
+                    })
+                }
+            },
+            Err(e) => {
+                let _ = conn.execute_batch("ROLLBACK");
+                Err(e)
+            }
+        };
+        // The receiver may already be gone (caller dropped its future) —
+        // that is not this task's problem to report; it just moves on.
+        let _ = self.reply.send(final_result);
+    }
+}
+
+/// Sender half of the write queue. Cheaply cloneable (wraps an
+/// `mpsc::Sender`) — every migrated store that shares one writer task holds
+/// a clone of this handle.
+#[derive(Clone)]
+pub struct WriterTaskHandle {
+    tx: mpsc::Sender<Box<dyn AnyWriteRequest + Send>>,
+}
+
+impl WriterTaskHandle {
+    /// Send a write operation to the writer task and await its typed reply.
+    ///
+    /// Backpressure: this suspends on the channel's `send().await` when the
+    /// bounded queue is full (ADR-067 "Channel capacity and queue-full
+    /// policy") — there is no `try_send` escape hatch. Callers that need a
+    /// deadline should use [`Self::send_with_timeout`] instead.
+    pub async fn send<R, F>(&self, op: F) -> Result<R, StorageError>
+    where
+        R: Send + 'static,
+        F: FnOnce(&Connection) -> Result<R, StorageError> + Send + 'static,
+    {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        let request = WriteRequest {
+            op: Box::new(op),
+            reply: reply_tx,
+        };
+
+        self.tx
+            .send(Box::new(request))
+            .await
+            .map_err(|_| StorageError::Internal("writer task channel closed".to_string()))?;
+
+        reply_rx.await.map_err(|_| {
+            StorageError::Internal("writer task dropped before replying".to_string())
+        })?
+    }
+
+    /// Like [`Self::send`], but bounds the wait on a full channel with
+    /// `timeout`.
+    ///
+    /// ADR-067's queue-full policy has no immediate-error `try_send` path —
+    /// only a caller-side deadline wrapping the blocking `send().await`. A
+    /// full channel that does not free capacity within `timeout` returns
+    /// `StorageError::WriteQueueFull` instead of resolving.
+    pub async fn send_with_timeout<R, F>(
+        &self,
+        op: F,
+        timeout: std::time::Duration,
+    ) -> Result<R, StorageError>
+    where
+        R: Send + 'static,
+        F: FnOnce(&Connection) -> Result<R, StorageError> + Send + 'static,
+    {
+        match tokio::time::timeout(timeout, self.send(op)).await {
+            Ok(result) => result,
+            Err(_elapsed) => Err(StorageError::WriteQueueFull {
+                timeout_ms: timeout.as_millis() as u64,
+            }),
+        }
+    }
+}
+
+/// Spawn the write-owner task (ADR-067 Component A) on the current Tokio
+/// runtime.
+///
+/// Opens a dedicated standalone writer connection
+/// ([`ConnectionPool::open_standalone_writer`]) that the task owns
+/// exclusively for its lifetime — independent of the pool's Mutex-guarded
+/// `writer()` connection, which unmigrated paths continue to use in this
+/// slice. Returns the cloneable [`WriterTaskHandle`] sender half; the task
+/// keeps running in the background until every clone of the handle is
+/// dropped and the channel closes, at which point the drain loop exits.
+///
+/// `capacity` bounds the channel (ADR-067 recommends 256;
+/// `PoolConfig::write_queue_capacity` resolves the default from
+/// `KHIVE_WRITE_QUEUE_CAPACITY`). Slice 1 commits one request per `BEGIN
+/// IMMEDIATE` — Component B's batched-commit window is a later slice.
+///
+/// Must be called from within a Tokio runtime context (this calls
+/// `tokio::spawn`). Returns an error if the pool cannot open a standalone
+/// writer connection — for example, an in-memory pool, which has no
+/// standalone-connection support (`ConnectionPool::open_standalone_writer`).
+pub fn spawn(pool: &ConnectionPool, capacity: usize) -> Result<WriterTaskHandle, SqliteError> {
+    let conn = pool.open_standalone_writer()?;
+    let (tx, rx) = mpsc::channel(capacity.max(1));
+    tokio::spawn(run_writer_task(conn, rx));
+    Ok(WriterTaskHandle { tx })
+}
+
+/// Drain loop: the sole caller of `BEGIN IMMEDIATE` for write traffic routed
+/// through the channel (ADR-067 Component A).
+///
+/// Exits when every [`WriterTaskHandle`] clone is dropped and the channel
+/// closes (`rx.recv()` returns `None`), or if the blocking closure panics.
+/// Either way, this task's `rx` is dropped when the function returns, which
+/// is what turns subsequent `WriterTaskHandle::send` calls into
+/// `StorageError::Internal` (ADR-067 failure-mode table: "Receiver drop
+/// (writer task stopped)" / "Writer task panic").
+async fn run_writer_task(
+    mut conn: Connection,
+    mut rx: mpsc::Receiver<Box<dyn AnyWriteRequest + Send>>,
+) {
+    while let Some(request) = rx.recv().await {
+        let outcome = tokio::task::spawn_blocking(move || {
+            let _tx_handle =
+                khive_storage::tx_registry::register(Some("writer_task_tx".to_string()));
+            if let Err(e) = conn.execute_batch("BEGIN IMMEDIATE") {
+                // Slice 1 has no watchdog/retry story for a failed BEGIN
+                // (Component D is a later slice). Proceeding without an
+                // explicit transaction still yields a correct reply: the
+                // op's own statements run in autocommit mode, and
+                // `execute_and_reply`'s subsequent `COMMIT` attempt fails
+                // with "no transaction is active", which it maps to
+                // `StorageError::Pool` and returns to the caller — a
+                // request never silently hangs or panics on this path.
+                tracing::warn!(
+                    error = %e,
+                    "writer task: BEGIN IMMEDIATE failed; request proceeds \
+                     without an explicit transaction"
+                );
+            }
+            request.execute_and_reply(&conn);
+            conn
+        })
+        .await;
+
+        match outcome {
+            Ok(returned_conn) => conn = returned_conn,
+            Err(join_err) => {
+                tracing::error!(
+                    error = %join_err,
+                    "writer task blocking closure panicked; writer task is exiting"
+                );
+                return;
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pool::PoolConfig;
+    use std::time::Duration;
+
+    fn file_pool(path: &std::path::Path) -> ConnectionPool {
+        let cfg = PoolConfig {
+            path: Some(path.to_path_buf()),
+            ..PoolConfig::default()
+        };
+        ConnectionPool::new(cfg).expect("pool open")
+    }
+
+    #[tokio::test]
+    async fn writer_task_executes_op_and_commits() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("writer_task_commit.db");
+        let pool = file_pool(&path);
+        {
+            let writer = pool.try_writer().unwrap();
+            writer
+                .conn()
+                .execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")
+                .unwrap();
+        }
+
+        let handle = spawn(&pool, 8).expect("writer task should spawn on a file-backed pool");
+
+        let affected = handle
+            .send(|conn| {
+                conn.execute("INSERT INTO t (id, v) VALUES (1, 'hello')", [])
+                    .map_err(|e| StorageError::Pool {
+                        operation: "test_insert".into(),
+                        message: e.to_string(),
+                    })
+            })
+            .await
+            .expect("op should succeed");
+        assert_eq!(affected, 1);
+
+        // Verify the write actually committed to the shared file — read it
+        // back via a fresh pooled reader connection, not the writer task's
+        // own connection.
+        let reader = pool.reader().expect("reader");
+        let v: String = reader
+            .conn()
+            .query_row("SELECT v FROM t WHERE id = 1", [], |row| row.get(0))
+            .expect("row must be committed and visible to a reader");
+        assert_eq!(v, "hello");
+    }
+
+    #[test]
+    fn spawn_fails_on_in_memory_pool() {
+        // In-memory pools have no standalone-connection support
+        // (`ConnectionPool::open_standalone_writer`) — `spawn` must surface
+        // that as an error rather than panicking. Deliberately a plain
+        // `#[test]` (no Tokio runtime): `spawn` fails before it ever reaches
+        // `tokio::spawn`, so no runtime is required for this path.
+        let cfg = PoolConfig {
+            path: None,
+            ..PoolConfig::default()
+        };
+        let pool = ConnectionPool::new(cfg).unwrap();
+        let result = spawn(&pool, 8);
+        assert!(
+            result.is_err(),
+            "in-memory pools must reject spawn, not panic"
+        );
+    }
+
+    #[tokio::test]
+    async fn full_channel_applies_backpressure_not_immediate_error() {
+        // Build the channel directly (bypassing `spawn`/`run_writer_task`)
+        // so nothing ever drains it — deterministic control over "the
+        // channel is full" instead of racing a real writer task's
+        // processing speed.
+        let (tx, _rx) = mpsc::channel::<Box<dyn AnyWriteRequest + Send>>(1);
+        let handle = WriterTaskHandle { tx };
+
+        // First send fills the sole channel slot. Its reply never arrives
+        // since nothing drains `_rx`, so run it in the background.
+        let first = tokio::spawn({
+            let handle = handle.clone();
+            async move {
+                let _ = handle.send(|_conn| Ok::<(), StorageError>(())).await;
+            }
+        });
+
+        // Give the first send a moment to occupy the channel slot.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        // Second send must block (backpressure), not fail immediately: a
+        // short timeout should elapse rather than resolve.
+        let second = tokio::time::timeout(
+            Duration::from_millis(100),
+            handle.send(|_conn| Ok::<(), StorageError>(())),
+        )
+        .await;
+
+        assert!(
+            second.is_err(),
+            "a full channel must apply backpressure (send suspends) rather \
+             than erroring immediately — no try_send escape hatch per ADR-067"
+        );
+
+        first.abort();
+    }
+
+    #[tokio::test]
+    async fn send_with_timeout_maps_full_channel_to_write_queue_full() {
+        let (tx, _rx) = mpsc::channel::<Box<dyn AnyWriteRequest + Send>>(1);
+        let handle = WriterTaskHandle { tx };
+
+        let first = tokio::spawn({
+            let handle = handle.clone();
+            async move {
+                let _ = handle.send(|_conn| Ok::<(), StorageError>(())).await;
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        let result = handle
+            .send_with_timeout(
+                |_conn| Ok::<(), StorageError>(()),
+                Duration::from_millis(50),
+            )
+            .await;
+
+        match result {
+            Err(StorageError::WriteQueueFull { timeout_ms }) => assert_eq!(timeout_ms, 50),
+            other => panic!("expected WriteQueueFull, got {other:?}"),
+        }
+
+        first.abort();
+    }
+
+    #[tokio::test]
+    async fn dropped_receiver_maps_send_to_internal_error() {
+        // Simulates the writer task having stopped/panicked: its `rx` is
+        // gone, so `tx.send()` must fail rather than hang.
+        let (tx, rx) = mpsc::channel::<Box<dyn AnyWriteRequest + Send>>(4);
+        drop(rx);
+
+        let handle = WriterTaskHandle { tx };
+        let result = handle.send(|_conn| Ok::<(), StorageError>(())).await;
+
+        match result {
+            Err(StorageError::Internal(_)) => {}
+            other => panic!("expected Internal error on a closed channel, got {other:?}"),
+        }
+    }
+}

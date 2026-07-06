@@ -1,5 +1,6 @@
 use super::*;
 use crate::pool::PoolConfig;
+use serial_test::serial;
 
 fn setup_pool() -> Arc<ConnectionPool> {
     let config = PoolConfig {
@@ -499,4 +500,83 @@ async fn page_offset_over_i64max_rejected() {
         matches!(result, Err(StorageError::InvalidInput { .. })),
         "expected InvalidInput, got {result:?}"
     );
+}
+
+// =============================================================================
+// ADR-067 slice 1: WriterTask-routed `upsert_entities` (KHIVE_WRITE_QUEUE=1)
+// =============================================================================
+
+/// Flag-ON mechanism: with `KHIVE_WRITE_QUEUE=1`, `upsert_entities` routes
+/// through the WriterTask channel instead of the pool-mutex path, and the
+/// `BatchWriteSummary` fields (attempted/affected/failed/first_error) survive
+/// the trip through the type-erased channel intact, and both rows are
+/// actually committed and independently readable back through the store.
+///
+/// `#[serial]`: mutates the process-global `KHIVE_WRITE_QUEUE` env var,
+/// shared with `pool.rs`'s own env-override tests in this same test binary.
+#[tokio::test]
+#[serial]
+async fn upsert_entities_routes_through_writer_task_when_flag_enabled() {
+    std::env::set_var("KHIVE_WRITE_QUEUE", "1");
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("write_queue_entities.db");
+    let pool_cfg = PoolConfig {
+        path: Some(path.clone()),
+        ..PoolConfig::default()
+    };
+    let pool = Arc::new(ConnectionPool::new(pool_cfg).unwrap());
+    {
+        let writer = pool.writer().unwrap();
+        writer.conn().execute_batch(ENTITIES_DDL).unwrap();
+    }
+
+    let store = SqlEntityStore::new(Arc::clone(&pool), true);
+
+    // Confined to the smallest possible window around construction, which is
+    // the only place this flag is read.
+    std::env::remove_var("KHIVE_WRITE_QUEUE");
+
+    let e1 = make_entity("default", "concept", "LoRA");
+    let e2 = make_entity("default", "concept", "QLoRA");
+    let id1 = e1.id;
+    let id2 = e2.id;
+
+    let summary = store.upsert_entities(vec![e1, e2]).await.unwrap();
+    assert_eq!(summary.attempted, 2);
+    assert_eq!(summary.affected, 2);
+    assert_eq!(summary.failed, 0);
+    assert!(summary.first_error.is_empty());
+
+    let fetched1 = store.get_entity(id1).await.unwrap();
+    assert!(
+        fetched1.is_some(),
+        "entity 1 must be committed and readable"
+    );
+    assert_eq!(fetched1.unwrap().name, "LoRA");
+
+    let fetched2 = store.get_entity(id2).await.unwrap();
+    assert!(
+        fetched2.is_some(),
+        "entity 2 must be committed and readable"
+    );
+    assert_eq!(fetched2.unwrap().name, "QLoRA");
+}
+
+/// Flag-OFF regression (explicit): with the flag at its default (off), the
+/// store never spawns a writer task, and `upsert_entities` still returns a
+/// correct `BatchWriteSummary` via the legacy pool-mutex path — the same
+/// shape `test_batch_upsert` above already covers, restated here to
+/// document the flag-off/flag-on pairing for ADR-067 slice 1.
+#[tokio::test]
+async fn upsert_entities_legacy_path_unchanged_when_flag_is_off() {
+    let store = setup_memory_store();
+
+    let e1 = make_entity("default", "concept", "LoRA");
+    let e2 = make_entity("default", "concept", "QLoRA");
+
+    let summary = store.upsert_entities(vec![e1, e2]).await.unwrap();
+    assert_eq!(summary.attempted, 2);
+    assert_eq!(summary.affected, 2);
+    assert_eq!(summary.failed, 0);
 }

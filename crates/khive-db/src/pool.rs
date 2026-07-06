@@ -16,6 +16,7 @@ const DEFAULT_READER_CAP: usize = 8;
 
 const DEFAULT_WAL_AUTOCHECKPOINT_PAGES: u32 = 4000;
 const DEFAULT_JOURNAL_SIZE_LIMIT_BYTES: i64 = 67_108_864; // 64 MiB
+const DEFAULT_WRITE_QUEUE_CAPACITY: usize = 256;
 
 /// Configuration for the connection pool.
 #[derive(Clone, Debug)]
@@ -55,6 +56,23 @@ pub struct PoolConfig {
     /// every connection that can execute SQL. Reader connections are already
     /// opened read-only regardless of this flag.
     pub read_only: bool,
+    /// Route migrated store write paths through the single-writer
+    /// `WriterTask` channel (ADR-067 Component A) instead of the legacy
+    /// per-call pool-mutex/standalone-connection path. Off by default.
+    ///
+    /// Slice 1 wires exactly one path (`SqlEntityStore::upsert_entities`)
+    /// behind this flag; enabling it does not yet claim ADR-067's
+    /// single-writer guarantee — other write paths still open their own
+    /// writers until later slices migrate them.
+    ///
+    /// Overridable via `KHIVE_WRITE_QUEUE` (`"1"` or `"true"`,
+    /// case-insensitive, enables it; anything else, or unset, leaves it off).
+    pub write_queue_enabled: bool,
+    /// Bounded channel capacity for the `WriterTask` write queue.
+    ///
+    /// Overridable via `KHIVE_WRITE_QUEUE_CAPACITY`. Default: 256 pending
+    /// operations (ADR-067 Component A recommended default).
+    pub write_queue_capacity: usize,
 }
 
 impl Default for PoolConfig {
@@ -87,6 +105,14 @@ impl Default for PoolConfig {
                 .and_then(|v| v.parse::<i64>().ok())
                 .unwrap_or(DEFAULT_JOURNAL_SIZE_LIMIT_BYTES),
             read_only: false,
+            write_queue_enabled: std::env::var("KHIVE_WRITE_QUEUE")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false),
+            write_queue_capacity: std::env::var("KHIVE_WRITE_QUEUE_CAPACITY")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .filter(|&n| n > 0)
+                .unwrap_or(DEFAULT_WRITE_QUEUE_CAPACITY),
         }
     }
 }
@@ -670,6 +696,50 @@ mod tests {
         let cfg = PoolConfig::default();
         std::env::remove_var("KHIVE_CHECKOUT_TIMEOUT_SECS");
         assert_eq!(cfg.checkout_timeout, Duration::from_secs(10));
+    }
+
+    #[test]
+    #[serial]
+    fn pool_config_write_queue_defaults_off() {
+        let cfg = PoolConfig::default();
+        assert!(!cfg.write_queue_enabled);
+        assert_eq!(cfg.write_queue_capacity, DEFAULT_WRITE_QUEUE_CAPACITY);
+    }
+
+    #[test]
+    #[serial]
+    fn pool_config_env_override_write_queue_enabled() {
+        std::env::set_var("KHIVE_WRITE_QUEUE", "1");
+        let cfg = PoolConfig::default();
+        std::env::remove_var("KHIVE_WRITE_QUEUE");
+        assert!(cfg.write_queue_enabled);
+    }
+
+    #[test]
+    #[serial]
+    fn pool_config_env_override_write_queue_enabled_accepts_true_case_insensitive() {
+        std::env::set_var("KHIVE_WRITE_QUEUE", "True");
+        let cfg = PoolConfig::default();
+        std::env::remove_var("KHIVE_WRITE_QUEUE");
+        assert!(cfg.write_queue_enabled);
+    }
+
+    #[test]
+    #[serial]
+    fn pool_config_env_override_write_queue_capacity() {
+        std::env::set_var("KHIVE_WRITE_QUEUE_CAPACITY", "64");
+        let cfg = PoolConfig::default();
+        std::env::remove_var("KHIVE_WRITE_QUEUE_CAPACITY");
+        assert_eq!(cfg.write_queue_capacity, 64);
+    }
+
+    #[test]
+    #[serial]
+    fn pool_config_env_invalid_write_queue_capacity_falls_back_to_default() {
+        std::env::set_var("KHIVE_WRITE_QUEUE_CAPACITY", "0");
+        let cfg = PoolConfig::default();
+        std::env::remove_var("KHIVE_WRITE_QUEUE_CAPACITY");
+        assert_eq!(cfg.write_queue_capacity, DEFAULT_WRITE_QUEUE_CAPACITY);
     }
 
     #[test]
