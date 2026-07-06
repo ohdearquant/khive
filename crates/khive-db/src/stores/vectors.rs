@@ -246,17 +246,12 @@ impl SqliteVecStore {
     /// the WriterTask's own transaction, so a bare `BEGIN IMMEDIATE` (or an
     /// inner `conn.unchecked_transaction()`) would violate SQLite's
     /// nested-transaction rule. `insert`/`update` (which need their own
-    /// delete-then-insert atomicity) and `insert_batch` (the batch method)
-    /// each do their own flag check and return early on `Some`, routing a
-    /// SAVEPOINT-wrapped DML-only closure directly through the WriterTask
-    /// instead — their fallback calls into this helper only ever execute on
-    /// the flag-off path (`self.writer_task` is `None` by construction
-    /// whenever those calls are reached) — no double-routing.
-    ///
-    /// `orphan_sweep` (`Transaction::new_unchecked`, its own manual
-    /// transaction) calls [`Self::with_writer_unmanaged`] instead of this
-    /// helper — routing it through the WriterTask would nest a transaction
-    /// inside the WriterTask's own transaction.
+    /// delete-then-insert atomicity), `insert_batch` (the batch method), and
+    /// `orphan_sweep` (ADR-067 Amendment 1) each do their own flag check and
+    /// return early on `Some`, routing a DML-only closure directly through
+    /// the WriterTask instead — their fallback calls into this helper only
+    /// ever execute on the flag-off path (`self.writer_task` is `None` by
+    /// construction whenever those calls are reached) — no double-routing.
     async fn with_writer<F, R>(&self, op: &'static str, f: F) -> Result<R, StorageError>
     where
         F: FnOnce(&rusqlite::Connection) -> Result<R, rusqlite::Error> + Send + 'static,
@@ -276,8 +271,12 @@ impl SqliteVecStore {
     ///
     /// Reserved for closures that manage their own transaction — those
     /// cannot be sent through the WriterTask channel, which already wraps
-    /// every request in its own transaction. `orphan_sweep` is the only
-    /// caller.
+    /// every request in its own transaction. `orphan_sweep`'s flag-off path
+    /// (`Transaction::new_unchecked`, its own manual `BEGIN IMMEDIATE`) is
+    /// the only caller — on the flag-on path `orphan_sweep` routes a
+    /// DML-only closure directly through the WriterTask instead, since
+    /// routing a `Transaction::new_unchecked` through the channel would nest
+    /// a transaction inside the WriterTask's own transaction.
     async fn with_writer_unmanaged<F, R>(&self, op: &'static str, f: F) -> Result<R, StorageError>
     where
         F: FnOnce(&rusqlite::Connection) -> Result<R, rusqlite::Error> + Send + 'static,
@@ -513,6 +512,107 @@ fn vec_upsert_atomic_dml(
             Err(e)
         }
     }
+}
+
+/// DML-only orphan-sweep body shared by both the legacy (flag-off) and
+/// WriterTask-routed (flag-on) `orphan_sweep` paths (ADR-067 Amendment 1).
+///
+/// Issues no `BEGIN` / `COMMIT` / `ROLLBACK` — the caller owns the enclosing
+/// transaction (either the flag-off path's `Transaction::new_unchecked`, or
+/// the WriterTask drain loop's own `BEGIN IMMEDIATE`/`COMMIT`/`ROLLBACK`
+/// wrap). `ns_json` / `kind_json` / `allow_json` are the pre-serialized JSON
+/// filter arguments (or `None` for "no filter") computed once by the caller.
+fn orphan_sweep_dml(
+    conn: &rusqlite::Connection,
+    table: &str,
+    ns_json: Option<&str>,
+    kind_json: Option<&str>,
+    allow_json: Option<&str>,
+    max_delete: i64,
+    dry_run: bool,
+) -> Result<OrphanSweepResult, rusqlite::Error> {
+    // Optional-filter clause shared across all three queries.
+    // Each ?N appears twice (IS NULL guard + json_each call); SQLite
+    // reuses the same bound value for every occurrence of the same ?N.
+    //   ?1 = namespace JSON or NULL   ?2 = kind JSON or NULL
+    //   ?3 = allowlist JSON or NULL
+    let filter_pred = "(?1 IS NULL OR namespace IN (SELECT value FROM json_each(?1))) \
+                       AND (?2 IS NULL OR kind IN (SELECT value FROM json_each(?2))) \
+                       AND (?3 IS NULL OR subject_id IN (SELECT value FROM json_each(?3)))";
+
+    // Live-subjects subquery used in the orphan anti-join.
+    //
+    // Policy-critical: `deleted_at IS NULL` means a soft-deleted substrate
+    // row is NOT considered live, so its vector is swept.
+    // To preserve vectors for soft-deleted subjects, remove the
+    // `deleted_at IS NULL` filter from both lines below (one-line change per
+    // table).  The `memories` table referenced in ADR-044 §5 does not exist;
+    // memory notes live in the `notes` table with kind = 'memory'.
+    let live_subq = "SELECT id FROM entities WHERE deleted_at IS NULL \
+                     UNION ALL \
+                     SELECT id FROM notes    WHERE deleted_at IS NULL";
+
+    let orphan_pred = format!(
+        "subject_id NOT IN ({live}) AND {f}",
+        live = live_subq,
+        f = filter_pred,
+    );
+
+    // 1. Scanned: rows matching the caller's filters (before orphan check).
+    let scan_sql = format!(
+        "SELECT COUNT(*) FROM {t} WHERE {f}",
+        t = table,
+        f = filter_pred
+    );
+    let scanned: i64 = conn.query_row(
+        &scan_sql,
+        rusqlite::params![ns_json, kind_json, allow_json],
+        |row| row.get(0),
+    )?;
+
+    // 2. Would-delete: orphaned rows among the scanned set.
+    let count_sql = format!(
+        "SELECT COUNT(*) FROM {t} WHERE {p}",
+        t = table,
+        p = orphan_pred,
+    );
+    let would_delete: i64 = conn.query_row(
+        &count_sql,
+        rusqlite::params![ns_json, kind_json, allow_json],
+        |row| row.get(0),
+    )?;
+
+    let max_delete_hit = would_delete > max_delete;
+
+    // 3. Delete — skipped in dry-run mode.
+    //
+    // `DELETE … LIMIT N` requires SQLITE_ENABLE_UPDATE_DELETE_LIMIT, which
+    // rusqlite's bundled SQLite does not enable.  Portable alternative:
+    // delete subject_ids returned by a capped SELECT subquery.  SQLite
+    // materialises the inner SELECT before running the outer DELETE, so there
+    // is no self-referential conflict.
+    let deleted: i64 = if dry_run {
+        0
+    } else {
+        let del_sql = format!(
+            "DELETE FROM {t} WHERE subject_id IN (\
+             SELECT subject_id FROM {t} WHERE {p} LIMIT ?4\
+             )",
+            t = table,
+            p = orphan_pred,
+        );
+        conn.execute(
+            &del_sql,
+            rusqlite::params![ns_json, kind_json, allow_json, max_delete],
+        )? as i64
+    };
+
+    Ok(OrphanSweepResult {
+        scanned: scanned as u64,
+        would_delete: would_delete as u64,
+        deleted: deleted as u64,
+        max_delete_hit,
+    })
 }
 
 #[async_trait]
@@ -1135,6 +1235,38 @@ impl VectorStore for SqliteVecStore {
         let max_delete = config.max_delete as i64;
         let dry_run = config.dry_run;
 
+        // ADR-067 Amendment 1: when the write queue is enabled, route through
+        // the pool-wide WriterTask. DML-only closure — `run_writer_task`'s
+        // drain loop already owns the enclosing `BEGIN IMMEDIATE`/`COMMIT`/
+        // `ROLLBACK` for this request, so the closure must not open or commit
+        // its own transaction; issuing `Transaction::new_unchecked`'s `BEGIN
+        // IMMEDIATE` here would violate SQLite's nested-transaction rule and
+        // fail with `SQLITE_ERROR: cannot start a transaction within a
+        // transaction` (ADR-067 lines 271-276).
+        if let Some(writer_task) = &self.writer_task {
+            let table2 = table.clone();
+            let ns_json2 = ns_json.clone();
+            let kind_json2 = kind_json.clone();
+            let allow_json2 = allow_json.clone();
+            return writer_task
+                .send(move |conn| {
+                    orphan_sweep_dml(
+                        conn,
+                        &table2,
+                        ns_json2.as_deref(),
+                        kind_json2.as_deref(),
+                        allow_json2.as_deref(),
+                        max_delete,
+                        dry_run,
+                    )
+                    .map_err(|e| map_err(e, "orphan_sweep"))
+                })
+                .await;
+        }
+
+        // Flag-off (default) path: byte-for-byte unchanged from pre-ADR-067
+        // behavior — the closure owns its own transaction via
+        // `Transaction::new_unchecked`.
         self.with_writer_unmanaged("orphan_sweep", move |conn| {
             // `Transaction::new_unchecked` issues `BEGIN IMMEDIATE` and RAII-manages
             // rollback via its Drop impl: it checks `conn.is_autocommit()` and issues
@@ -1145,8 +1277,8 @@ impl VectorStore for SqliteVecStore {
             // which would have skipped the Drop-ROLLBACK on a BUSY COMMIT and re-poisoned
             // the pool.  Using the native primitive avoids that class of bug entirely.
             //
-            // `with_writer` serialises all callers through the pool mutex — at most one
-            // writer closure executes on this connection at a time, so no nested
+            // `with_writer_unmanaged` serialises all callers through the pool mutex — at
+            // most one writer closure executes on this connection at a time, so no nested
             // transactions can exist when this line runs.
             //
             // ADR-091 Plank 0: registered before the transaction is opened — see the
@@ -1159,103 +1291,19 @@ impl VectorStore for SqliteVecStore {
                 rusqlite::TransactionBehavior::Immediate,
             )?;
 
-            // Optional-filter clause shared across all three queries.
-            // Each ?N appears twice (IS NULL guard + json_each call); SQLite
-            // reuses the same bound value for every occurrence of the same ?N.
-            //   ?1 = namespace JSON or NULL   ?2 = kind JSON or NULL
-            //   ?3 = allowlist JSON or NULL
-            let filter_pred = "(?1 IS NULL OR namespace IN (SELECT value FROM json_each(?1))) \
-                               AND (?2 IS NULL OR kind IN (SELECT value FROM json_each(?2))) \
-                               AND (?3 IS NULL OR subject_id IN (SELECT value FROM json_each(?3)))";
-
-            // Live-subjects subquery used in the orphan anti-join.
-            //
-            // Policy-critical: `deleted_at IS NULL` means a soft-deleted substrate
-            // row is NOT considered live, so its vector is swept.
-            // To preserve vectors for soft-deleted subjects, remove the
-            // `deleted_at IS NULL` filter from both lines below (one-line change per
-            // table).  The `memories` table referenced in ADR-044 §5 does not exist;
-            // memory notes live in the `notes` table with kind = 'memory'.
-            let live_subq = "SELECT id FROM entities WHERE deleted_at IS NULL \
-                             UNION ALL \
-                             SELECT id FROM notes    WHERE deleted_at IS NULL";
-
-            let orphan_pred = format!(
-                "subject_id NOT IN ({live}) AND {f}",
-                live = live_subq,
-                f = filter_pred,
-            );
-
-            // 1. Scanned: rows matching the caller's filters (before orphan check).
-            let scan_sql = format!(
-                "SELECT COUNT(*) FROM {t} WHERE {f}",
-                t = table,
-                f = filter_pred
-            );
-            let scanned: i64 = conn.query_row(
-                &scan_sql,
-                rusqlite::params![
-                    ns_json.as_deref(),
-                    kind_json.as_deref(),
-                    allow_json.as_deref()
-                ],
-                |row| row.get(0),
+            let result = orphan_sweep_dml(
+                conn,
+                &table,
+                ns_json.as_deref(),
+                kind_json.as_deref(),
+                allow_json.as_deref(),
+                max_delete,
+                dry_run,
             )?;
-
-            // 2. Would-delete: orphaned rows among the scanned set.
-            let count_sql = format!(
-                "SELECT COUNT(*) FROM {t} WHERE {p}",
-                t = table,
-                p = orphan_pred,
-            );
-            let would_delete: i64 = conn.query_row(
-                &count_sql,
-                rusqlite::params![
-                    ns_json.as_deref(),
-                    kind_json.as_deref(),
-                    allow_json.as_deref()
-                ],
-                |row| row.get(0),
-            )?;
-
-            let max_delete_hit = would_delete > max_delete;
-
-            // 3. Delete — skipped in dry-run mode.
-            //
-            // `DELETE … LIMIT N` requires SQLITE_ENABLE_UPDATE_DELETE_LIMIT, which
-            // rusqlite's bundled SQLite does not enable.  Portable alternative:
-            // delete subject_ids returned by a capped SELECT subquery.  SQLite
-            // materialises the inner SELECT before running the outer DELETE, so there
-            // is no self-referential conflict.
-            let deleted: i64 = if dry_run {
-                0
-            } else {
-                let del_sql = format!(
-                    "DELETE FROM {t} WHERE subject_id IN (\
-                     SELECT subject_id FROM {t} WHERE {p} LIMIT ?4\
-                     )",
-                    t = table,
-                    p = orphan_pred,
-                );
-                conn.execute(
-                    &del_sql,
-                    rusqlite::params![
-                        ns_json.as_deref(),
-                        kind_json.as_deref(),
-                        allow_json.as_deref(),
-                        max_delete
-                    ],
-                )? as i64
-            };
 
             tx.commit()?;
 
-            Ok(OrphanSweepResult {
-                scanned: scanned as u64,
-                would_delete: would_delete as u64,
-                deleted: deleted as u64,
-                max_delete_hit,
-            })
+            Ok(result)
         })
         .await
     }
@@ -3190,18 +3238,20 @@ mod orphan_sweep_tests {
     }
 }
 
-/// ADR-067 Component A entry 7: `insert_batch` is the sole `BEGIN
-/// IMMEDIATE`-issuing site in this store (per the ADR's own write-path
-/// inventory — `insert`/`update`/`orphan_sweep` use
-/// `conn.unchecked_transaction()`, a different mechanism, and are out of
-/// scope for this slice). Needs the real `vec0` extension loaded, so it
-/// lives behind the same `feature = "vectors"` gate as its sibling
+/// ADR-067 Component A entry 7 / Amendment 1: `insert_batch` and
+/// `orphan_sweep` are the `BEGIN IMMEDIATE`-issuing sites in this store that
+/// route through the pool-wide `WriterTask` when the write queue is enabled
+/// (`insert`/`update` route through `vec_upsert_atomic_dml`'s SAVEPOINT
+/// instead — see the flag-on branches in the `VectorStore` impl above).
+/// Needs the real `vec0` extension loaded, so it lives behind the same
+/// `feature = "vectors"` gate as its sibling
 /// `atomic_replace_tests`/`orphan_sweep_tests` modules — `cargo test
 /// --workspace` (no `--all-features`) does not compile or run it, matching
 /// the existing convention in this file.
 #[cfg(all(test, feature = "vectors"))]
 mod write_queue_tests {
     use std::sync::Arc;
+    use std::time::Duration;
 
     use khive_storage::types::VectorRecord;
     use khive_storage::VectorStore;
@@ -3303,6 +3353,295 @@ mod write_queue_tests {
             pool.writer_task_spawn_count(),
             1,
             "the flag-ON path must actually spawn and use the writer task"
+        );
+    }
+
+    /// Create minimal substrate tables (id + deleted_at only — enough for the
+    /// anti-join). Mirrors `orphan_sweep_tests::create_substrate_tables`;
+    /// duplicated here (rather than shared) because that helper is private to
+    /// its own sibling module — same convention as this module's own
+    /// `create_vec_table` duplicate.
+    fn create_substrate_tables(pool: &Arc<ConnectionPool>) {
+        pool.try_writer()
+            .expect("writer")
+            .conn()
+            .execute_batch(
+                "CREATE TABLE IF NOT EXISTS entities \
+                     (id TEXT PRIMARY KEY, deleted_at INTEGER); \
+                 CREATE TABLE IF NOT EXISTS notes \
+                     (id TEXT PRIMARY KEY, deleted_at INTEGER);",
+            )
+            .expect("create substrate tables");
+    }
+
+    /// Insert a substrate row into `entities`. `deleted_at = None` → live.
+    fn insert_entity(pool: &Arc<ConnectionPool>, id: Uuid, deleted_at: Option<i64>) {
+        let id_str = id.to_string();
+        pool.try_writer()
+            .expect("writer")
+            .conn()
+            .execute(
+                "INSERT INTO entities (id, deleted_at) VALUES (?1, ?2)",
+                rusqlite::params![id_str, deleted_at],
+            )
+            .expect("insert entity");
+    }
+
+    /// ADR-067 Amendment 1: `orphan_sweep`'s flag-on path must route through
+    /// the pool-wide `WriterTask` (not `with_writer_unmanaged`'s pool-mutex
+    /// path) when the write queue is enabled — mirrors
+    /// `insert_batch_routes_through_writer_task_when_flag_enabled` above.
+    #[tokio::test]
+    async fn orphan_sweep_routes_through_writer_task_when_flag_enabled() {
+        crate::extension::ensure_extensions_loaded();
+
+        let model_key = "write_queue_orphan_sweep";
+        let dims = 4usize;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("write_queue_orphan_sweep.db");
+        let pool = Arc::new(
+            ConnectionPool::new(PoolConfig {
+                path: Some(path),
+                write_queue_enabled: true,
+                ..PoolConfig::default()
+            })
+            .expect("file-backed pool"),
+        );
+        create_substrate_tables(&pool);
+        create_vec_table(&pool, model_key, dims);
+
+        let store = SqliteVecStore::new(
+            Arc::clone(&pool),
+            true,
+            model_key.to_string(),
+            model_key.to_string(),
+            dims,
+            "ns:test".to_string(),
+        )
+        .expect("SqliteVecStore::new");
+
+        let live_id = Uuid::new_v4();
+        insert_entity(&pool, live_id, None); // live subject
+        let orphan_id = Uuid::new_v4(); // no substrate row -> orphaned vector
+
+        store
+            .insert(
+                live_id,
+                SubstrateKind::Entity,
+                "ns:test",
+                "body",
+                vec![vec![0.1, 0.2, 0.3, 0.4]],
+            )
+            .await
+            .expect("insert live vector");
+        store
+            .insert(
+                orphan_id,
+                SubstrateKind::Entity,
+                "ns:test",
+                "body",
+                vec![vec![0.5, 0.6, 0.7, 0.8]],
+            )
+            .await
+            .expect("insert orphan vector");
+
+        // Dry run: reports the orphan without deleting it.
+        let dry = store
+            .orphan_sweep(&OrphanSweepConfig {
+                subject_id_allowlist: None,
+                namespaces: vec![],
+                substrate_kinds: vec![],
+                max_delete: 100,
+                dry_run: true,
+            })
+            .await
+            .expect("dry-run sweep");
+        assert_eq!(dry.scanned, 2);
+        assert_eq!(dry.would_delete, 1);
+        assert_eq!(dry.deleted, 0);
+        assert!(!dry.max_delete_hit);
+
+        // Real sweep: deletes the orphan, keeps the live vector.
+        let real = store
+            .orphan_sweep(&OrphanSweepConfig {
+                subject_id_allowlist: None,
+                namespaces: vec![],
+                substrate_kinds: vec![],
+                max_delete: 100,
+                dry_run: false,
+            })
+            .await
+            .expect("real sweep");
+        assert_eq!(real.scanned, 2);
+        assert_eq!(real.would_delete, 1);
+        assert_eq!(real.deleted, 1);
+        assert!(!real.max_delete_hit);
+
+        let present = store
+            .batch_exists(&[live_id, orphan_id], "ns:test")
+            .await
+            .expect("batch_exists");
+        assert!(
+            present.contains(&live_id),
+            "live vector must survive the sweep"
+        );
+        assert!(
+            !present.contains(&orphan_id),
+            "orphaned vector must be swept"
+        );
+
+        // `writer_task_spawn_count() == 1` alone does not discriminate the
+        // fix from a regression: `SqliteVecStore::new` and the two setup
+        // `store.insert(..)` calls above already spawn and use the writer
+        // task, so that counter would read 1 even if `orphan_sweep` itself
+        // had reverted to the legacy `with_writer_unmanaged` path. Prove
+        // routing directly instead, mirroring
+        // `upsert_entity_routes_through_writer_task_when_flag_enabled`
+        // (entity_tests.rs): hold the writer task's single drain slot open
+        // with an occupier parked on a oneshot (`blocking_recv`, valid
+        // inside the writer task's `spawn_blocking`), then call
+        // `orphan_sweep` on a separate task and poll
+        // `WriterTaskHandle::queue_depth()`. A version that genuinely
+        // routes through `writer_task.send(..)` must show the request
+        // sitting in the channel (`queue_depth() >= 1`) while the occupier
+        // holds the slot; a version that fell back to
+        // `with_writer_unmanaged`'s pool-mutex path never touches this
+        // channel, so `queue_depth()` would stay `0` for the whole poll
+        // window — the failure mode this test exists to catch.
+        let writer_task = pool
+            .writer_task_handle()
+            .expect("writer task handle")
+            .expect("writer task must be spawned for a file-backed pool with the flag on");
+
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel::<()>();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let occupier = {
+            let writer_task = writer_task.clone();
+            tokio::spawn(async move {
+                writer_task
+                    .send(move |_conn| {
+                        let _ = started_tx.send(());
+                        let _ = release_rx.blocking_recv();
+                        Ok::<(), StorageError>(())
+                    })
+                    .await
+            })
+        };
+
+        started_rx
+            .await
+            .expect("occupier must signal it has started running inside the writer task");
+        assert_eq!(
+            writer_task.queue_depth(),
+            0,
+            "channel must start empty once the occupier has been dequeued and is running"
+        );
+
+        let sweep_task = tokio::spawn(async move {
+            store
+                .orphan_sweep(&OrphanSweepConfig {
+                    subject_id_allowlist: None,
+                    namespaces: vec![],
+                    substrate_kinds: vec![],
+                    max_delete: 100,
+                    dry_run: true,
+                })
+                .await
+        });
+
+        let mut saw_enqueued = false;
+        for _ in 0..100 {
+            if writer_task.queue_depth() >= 1 {
+                saw_enqueued = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(
+            saw_enqueued,
+            "orphan_sweep's write request never appeared in the writer task's channel \
+             while the occupier held the single drain slot — orphan_sweep is not routing \
+             through the shared writer task"
+        );
+
+        release_tx
+            .send(())
+            .expect("occupier must still be waiting on the release signal");
+        occupier
+            .await
+            .expect("occupier task must not panic")
+            .expect("occupier write must succeed");
+        let post_sweep = sweep_task
+            .await
+            .expect("sweep task must not panic")
+            .expect("orphan_sweep must succeed once unblocked");
+        assert_eq!(
+            post_sweep.scanned, 1,
+            "only the surviving live vector remains after the earlier real sweep"
+        );
+    }
+
+    /// Revert-and-confirm-fails companion (mirrors the pattern in
+    /// `crates/khive-vcs/src/sync.rs::checkpoint_wal_write_queue_tests`): the
+    /// OLD `orphan_sweep` shape — a closure that opens its own
+    /// `Transaction::new_unchecked`/`BEGIN IMMEDIATE` — must fail if routed
+    /// through the WriterTask channel. `run_writer_task`'s drain loop already
+    /// wraps every request in its own `BEGIN IMMEDIATE` before invoking the
+    /// closure, so a second `BEGIN IMMEDIATE` issued from inside the closure
+    /// violates SQLite's nested-transaction rule. This proves the fix's
+    /// DML-only extraction (`orphan_sweep_dml`, no inner `BEGIN`) is
+    /// required — naively forwarding the old closure to `writer_task.send()`
+    /// would not have worked.
+    #[tokio::test]
+    async fn orphan_sweep_old_unmanaged_shape_nests_transaction_under_write_queue() {
+        crate::extension::ensure_extensions_loaded();
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("write_queue_orphan_sweep_regression.db");
+        let pool = Arc::new(
+            ConnectionPool::new(PoolConfig {
+                path: Some(path),
+                write_queue_enabled: true,
+                ..PoolConfig::default()
+            })
+            .expect("file-backed pool"),
+        );
+        create_substrate_tables(&pool);
+        create_vec_table(&pool, "write_queue_orphan_sweep_regression", 4);
+
+        let writer_task = pool
+            .writer_task_handle()
+            .expect("writer task handle")
+            .expect("writer task must spawn for a file-backed pool with the flag on");
+
+        let result: Result<(), StorageError> = writer_task
+            .send(move |conn| {
+                // The OLD orphan_sweep shape: opens its own BEGIN IMMEDIATE via
+                // `Transaction::new_unchecked`. Under the write queue this
+                // closure already runs inside the drain loop's own open
+                // transaction, so this must fail with SQLite's
+                // nested-transaction error.
+                let tx = rusqlite::Transaction::new_unchecked(
+                    conn,
+                    rusqlite::TransactionBehavior::Immediate,
+                )
+                .map_err(|e| map_err(e, "orphan_sweep_old_shape"))?;
+                tx.commit()
+                    .map_err(|e| map_err(e, "orphan_sweep_old_shape"))?;
+                Ok(())
+            })
+            .await;
+
+        let err = result.expect_err(
+            "routing the OLD orphan_sweep closure (its own BEGIN IMMEDIATE) through the \
+             WriterTask must fail under KHIVE_WRITE_QUEUE — if this now succeeds, re-audit \
+             whether the WriterTask still owns the sole BEGIN IMMEDIATE for this connection",
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("cannot start a transaction within a transaction"),
+            "expected the deterministic nested-transaction failure (SQLite's own message \
+             for a second BEGIN issued inside an already-open transaction), got: {msg}"
         );
     }
 }
