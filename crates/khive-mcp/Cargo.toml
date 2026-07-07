@@ -23,6 +23,7 @@ khive-pack-comm = { version = "0.3.0", path = "../khive-pack-comm" }
 khive-pack-schedule = { version = "0.3.0", path = "../khive-pack-schedule" }
 khive-pack-knowledge = { version = "0.3.0", path = "../khive-pack-knowledge" }
 khive-pack-session = { version = "0.3.0", path = "../khive-pack-session" }
+khive-pack-git = { version = "0.3.0", path = "../khive-pack-git" }
 uuid = { workspace = true }
 inventory = { workspace = true }
 rmcp = { workspace = true, features = ["server", "transport-io"] }

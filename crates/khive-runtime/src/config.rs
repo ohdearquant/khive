@@ -306,6 +306,7 @@ impl Default for RuntimeConfig {
                     "schedule",
                     "knowledge",
                     "session",
+                    "git",
                 ]
                 .into_iter()
                 .map(String::from)
