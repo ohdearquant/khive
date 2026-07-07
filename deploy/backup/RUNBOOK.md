@@ -168,7 +168,15 @@ operator-tuned interval. `install-backup.sh status [<tier> <store>]` and
 Per the ADR's invariant 3 ("a backup that has not been restored is not a
 backup"), run this after initial setup, after any schema-migration release,
 and on a standing cadence you define (weekly is a reasonable floor given the
-tier-3 archive cadence).
+tier-3 archive cadence). The standing cadence covers **every store registered
+in `stores.conf`**, not just the primary one — a store whose backups are
+synced but never drilled is in the exact state invariant 3 forbids. (For
+stores on a pre-consolidation migration lineage the runtime cannot boot,
+steps 5-6 are a known-partial scope — see
+[Known partial-drill scopes](#known-partial-drill-scopes).) Drills are
+deliberately operator-run rather than launchd-scheduled in v1: each run
+writes a marker to the origin, occupies the ANN rebuild path for hours, and
+produces evidence an operator should actually look at.
 
 There are two drill modes (ADR-100 amendment, 2026-07-07): the **routine**
 drill, which captures its validation manifest from the freshly-synced
