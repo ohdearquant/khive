@@ -99,10 +99,17 @@ impl KindHook for CommitHook {
 const ISSUE_STATE_REASONS: &[&str] = &["completed", "not_planned", "reopened", "duplicate"];
 
 /// `KindHook` shared by `issue` and `pull_request` — both require
-/// `properties.number` and, when present, validate `properties.state_reason`.
-/// `issue`'s `state_reason` is governed to a fixed set (ADR-088 §3); v0 does
-/// not document a fixed set for `pull_request`'s `state_reason`, so it is only
-/// checked for non-emptiness there.
+/// `properties.number` and `properties.project_id`, and, when present,
+/// validate `properties.state_reason`. `issue`'s `state_reason` is governed
+/// to a fixed set (ADR-088 §3); v0 does not document a fixed set for
+/// `pull_request`'s `state_reason`, so it is only checked for non-emptiness
+/// there.
+///
+/// GitHub issue/PR numbers are repository-scoped, not globally unique — two
+/// different `project` entities in the same namespace can each have a `#1`.
+/// `properties.project_id` is the natural-key scoping field the ingester's
+/// `find_by_number` lookup filters on, so it is required and validated as a
+/// UUID here rather than left to the caller's discipline.
 #[derive(Debug)]
 pub struct IssueLikeHook {
     /// The note kind this instance validates: `"issue"` or `"pull_request"`.
@@ -124,6 +131,19 @@ impl KindHook for IssueLikeHook {
         if !number.is_u64() && !number.is_i64() {
             return Err(RuntimeError::InvalidInput(format!(
                 "{} properties.number must be an integer",
+                self.kind
+            )));
+        }
+
+        let project_id = props
+            .get("project_id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                RuntimeError::InvalidInput(format!("{} requires properties.project_id", self.kind))
+            })?;
+        if Uuid::parse_str(project_id).is_err() {
+            return Err(RuntimeError::InvalidInput(format!(
+                "{} properties.project_id {project_id:?} must be a UUID",
                 self.kind
             )));
         }

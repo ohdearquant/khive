@@ -180,12 +180,14 @@ async fn find_commit_by_sha(
 }
 
 /// Look up an existing `issue`/`pull_request` note by its `properties.number`
-/// (natural-key idempotence, scoped by kind + project so numbers from
-/// different repos under the same project never collide).
+/// (natural-key idempotence, scoped by kind + namespace + `project_id` —
+/// GitHub issue/PR numbers are repository-scoped, so a bare `kind`+`number`
+/// filter would incorrectly collide two different repos' `#1`).
 async fn find_by_number(
     runtime: &KhiveRuntime,
     token: &NamespaceToken,
     kind: &str,
+    project_id: Uuid,
     number: u64,
 ) -> Result<Option<Uuid>> {
     let sql = runtime.sql();
@@ -193,12 +195,14 @@ async fn find_by_number(
     let row = r
         .query_row(SqlStatement {
             sql: "SELECT id FROM notes WHERE kind=?1 AND namespace=?2 \
-                  AND deleted_at IS NULL AND json_extract(properties,'$.number')=?3 LIMIT 1"
+                  AND deleted_at IS NULL AND json_extract(properties,'$.number')=?3 \
+                  AND json_extract(properties,'$.project_id')=?4 LIMIT 1"
                 .into(),
             params: vec![
                 SqlValue::Text(kind.to_string()),
                 SqlValue::Text(token.namespace().as_str().to_string()),
                 SqlValue::Integer(number as i64),
+                SqlValue::Text(project_id.to_string()),
             ],
             label: Some("git_ingest_find_by_number".into()),
         })
@@ -278,11 +282,13 @@ async fn read_cursor(
     }))
 }
 
-/// Advance the `(project_id, kind)` cursor. Called only after the
-/// corresponding batch has been fully written — a mid-batch failure leaves
-/// the cursor at its prior value so the next pass safely re-ingests the
-/// batch (natural-key dedupe makes the re-ingest a no-op for anything that
-/// already landed).
+/// Advance the `(project_id, kind)` cursor. Called once per section
+/// (commits/prs/issues) after that section's loop finishes, with a value
+/// that stops advancing at the first per-record create failure (see the
+/// `cursor_stalled` handling in each `ingest_*` loop) — so the next pass
+/// re-walks from before the failure and retries it, while records that
+/// already landed (including ones ingested later in a stalled pass) are
+/// no-ops via natural-key dedupe.
 async fn write_cursor(
     runtime: &KhiveRuntime,
     project_id: Uuid,
@@ -448,11 +454,23 @@ async fn ingest_commits(
     }
     let files_by_sha = touched_files(repo)?;
 
+    // `cursor_stalled` freezes `last_sha` at the last contiguous successfully
+    // processed commit: once a record fails to create, later records in this
+    // same pass are still attempted (so a run surfaces every failure it can,
+    // not just the first) but the cursor no longer advances past them. That
+    // guarantees a failed record is retried — and its warning re-surfaced —
+    // on every subsequent pass until it is fixed upstream, rather than being
+    // silently skipped forever because the cursor moved past it. Records that
+    // do succeed after a stall are still written (idempotent via the
+    // sha natural key), so a retried pass never double-creates them.
     let mut last_sha: Option<String> = since;
+    let mut cursor_stalled = false;
     for c in &commits {
         if find_commit_by_sha(runtime, token, &c.sha).await?.is_some() {
             report.commits_skipped_existing += 1;
-            last_sha = Some(c.sha.clone());
+            if !cursor_stalled {
+                last_sha = Some(c.sha.clone());
+            }
             continue;
         }
 
@@ -486,7 +504,7 @@ async fn ingest_commits(
             None => match squash_merge_pr_number(&c.subject) {
                 Some(n) => match number_to_pr.get(&n).copied() {
                     Some(id) => Some(id),
-                    None => find_by_number(runtime, token, "pull_request", n).await?,
+                    None => find_by_number(runtime, token, "pull_request", project_id, n).await?,
                 },
                 None => None,
             },
@@ -504,7 +522,7 @@ async fn ingest_commits(
             "parents": c.parents,
         });
 
-        registry
+        match registry
             .dispatch(
                 "create",
                 json!({
@@ -515,10 +533,20 @@ async fn ingest_commits(
                 }),
             )
             .await
-            .map_err(|e| anyhow!("create commit {}: {e}", c.sha))?;
-
-        report.commits_ingested += 1;
-        last_sha = Some(c.sha.clone());
+        {
+            Ok(_) => {
+                report.commits_ingested += 1;
+                if !cursor_stalled {
+                    last_sha = Some(c.sha.clone());
+                }
+            }
+            Err(e) => {
+                report
+                    .warnings
+                    .push(format!("create commit {}: {e}", c.sha));
+                cursor_stalled = true;
+            }
+        }
     }
 
     if let Some(sha) = last_sha {
@@ -627,7 +655,13 @@ async fn ingest_prs(
     )?;
     let prs: Vec<GhPr> = serde_json::from_str(&raw).context("parsing gh pr list --json")?;
 
+    // `cursor_stalled` mirrors `ingest_commits`: once one PR fails to create,
+    // later PRs in this pass are still attempted (so every failure surfaces
+    // in this pass's warnings), but `max_updated` no longer advances past the
+    // stall point — the next pass re-fetches from before the failure and
+    // retries it, while already-landed PRs are no-ops via the natural key.
     let mut max_updated: Option<String> = since.clone();
+    let mut cursor_stalled = false;
     for pr in prs {
         let is_new = since
             .as_deref()
@@ -635,19 +669,23 @@ async fn ingest_prs(
             .map(|(cursor, updated)| updated > cursor)
             .unwrap_or(true);
 
-        if let Some(existing) = find_by_number(runtime, token, "pull_request", pr.number).await? {
+        if let Some(existing) =
+            find_by_number(runtime, token, "pull_request", project_id, pr.number).await?
+        {
             number_to_pr.insert(pr.number, existing);
             if let Some(oid) = pr.merge_commit.as_ref().and_then(|m| m.oid.clone()) {
                 merge_sha_to_pr.insert(oid, existing);
             }
             report.prs_skipped_existing += 1;
-            if let Some(u) = &pr.updated_at {
-                if max_updated
-                    .as_deref()
-                    .map(|m| u.as_str() > m)
-                    .unwrap_or(true)
-                {
-                    max_updated = Some(u.clone());
+            if !cursor_stalled {
+                if let Some(u) = &pr.updated_at {
+                    if max_updated
+                        .as_deref()
+                        .map(|m| u.as_str() > m)
+                        .unwrap_or(true)
+                    {
+                        max_updated = Some(u.clone());
+                    }
                 }
             }
             continue;
@@ -665,11 +703,12 @@ async fn ingest_prs(
             "created_at": pr.created_at,
             "merged_at": pr.merged_at,
             "closed_at": pr.closed_at,
-            "base": pr.base_ref_name,
-            "head": pr.head_ref_name,
+            "base_ref": pr.base_ref_name,
+            "head_ref": pr.head_ref_name,
+            "project_id": project_id.to_string(),
         });
 
-        let result = registry
+        let result = match registry
             .dispatch(
                 "create",
                 json!({
@@ -680,7 +719,16 @@ async fn ingest_prs(
                 }),
             )
             .await
-            .map_err(|e| anyhow!("create pull_request #{}: {e}", pr.number))?;
+        {
+            Ok(v) => v,
+            Err(e) => {
+                report
+                    .warnings
+                    .push(format!("create pull_request #{}: {e}", pr.number));
+                cursor_stalled = true;
+                continue;
+            }
+        };
 
         if let Some(id) = result
             .get("id")
@@ -693,13 +741,15 @@ async fn ingest_prs(
             }
         }
         report.prs_ingested += 1;
-        if let Some(u) = &pr.updated_at {
-            if max_updated
-                .as_deref()
-                .map(|m| u.as_str() > m)
-                .unwrap_or(true)
-            {
-                max_updated = Some(u.clone());
+        if !cursor_stalled {
+            if let Some(u) = &pr.updated_at {
+                if max_updated
+                    .as_deref()
+                    .map(|m| u.as_str() > m)
+                    .unwrap_or(true)
+                {
+                    max_updated = Some(u.clone());
+                }
             }
         }
     }
@@ -735,7 +785,13 @@ async fn ingest_issues(
     let issues: Vec<GhIssue> =
         serde_json::from_str(&raw).context("parsing gh issue list --json")?;
 
+    // `cursor_stalled` mirrors `ingest_commits`/`ingest_prs`: a per-record
+    // create failure is aggregated as a warning and later records in this
+    // pass are still attempted, but `max_updated` freezes at the stall point
+    // so the next pass retries the failed record instead of skipping it
+    // forever; already-landed records are no-ops via the natural key.
     let mut max_updated: Option<String> = since.clone();
+    let mut cursor_stalled = false;
     for issue in issues {
         let is_new = since
             .as_deref()
@@ -743,18 +799,20 @@ async fn ingest_issues(
             .map(|(cursor, updated)| updated > cursor)
             .unwrap_or(true);
 
-        if find_by_number(runtime, token, "issue", issue.number)
+        if find_by_number(runtime, token, "issue", project_id, issue.number)
             .await?
             .is_some()
         {
             report.issues_skipped_existing += 1;
-            if let Some(u) = &issue.updated_at {
-                if max_updated
-                    .as_deref()
-                    .map(|m| u.as_str() > m)
-                    .unwrap_or(true)
-                {
-                    max_updated = Some(u.clone());
+            if !cursor_stalled {
+                if let Some(u) = &issue.updated_at {
+                    if max_updated
+                        .as_deref()
+                        .map(|m| u.as_str() > m)
+                        .unwrap_or(true)
+                    {
+                        max_updated = Some(u.clone());
+                    }
                 }
             }
             continue;
@@ -778,6 +836,7 @@ async fn ingest_issues(
             "created_at": issue.created_at,
             "closed_at": issue.closed_at,
             "labels": labels,
+            "project_id": project_id.to_string(),
         });
         // gh reports stateReason as "" for open issues and UPPERCASE enum values
         // (NOT_PLANNED) for closed ones; the kind hook governs any PRESENT value
@@ -787,7 +846,7 @@ async fn ingest_issues(
             properties["state_reason"] = json!(reason.to_ascii_lowercase());
         }
 
-        registry
+        if let Err(e) = registry
             .dispatch(
                 "create",
                 json!({
@@ -798,16 +857,24 @@ async fn ingest_issues(
                 }),
             )
             .await
-            .map_err(|e| anyhow!("create issue #{}: {e}", issue.number))?;
+        {
+            report
+                .warnings
+                .push(format!("create issue #{}: {e}", issue.number));
+            cursor_stalled = true;
+            continue;
+        }
 
         report.issues_ingested += 1;
-        if let Some(u) = &issue.updated_at {
-            if max_updated
-                .as_deref()
-                .map(|m| u.as_str() > m)
-                .unwrap_or(true)
-            {
-                max_updated = Some(u.clone());
+        if !cursor_stalled {
+            if let Some(u) = &issue.updated_at {
+                if max_updated
+                    .as_deref()
+                    .map(|m| u.as_str() > m)
+                    .unwrap_or(true)
+                {
+                    max_updated = Some(u.clone());
+                }
             }
         }
     }
