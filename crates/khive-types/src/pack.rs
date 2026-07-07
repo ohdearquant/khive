@@ -335,6 +335,89 @@ pub trait Pack {
     const VALIDATION_RULES: &'static [&'static str] = &[];
 }
 
+/// ADR-099 D3 — the v1 atomic-admissible verb set for `--atomic` bulk apply.
+///
+/// This is an EXPLICIT per-verb allowlist, never derived from [`VerbCategory`]
+/// or any other classification ("never a pack-level category", ADR-099 D3).
+/// Every verb here has a prepare/apply seam whose in-transaction phase reduces
+/// to synchronous DML — the atomic-unit suspend-free invariant
+/// (`SqlAccess::atomic_unit` in `khive-storage`). Extending this list is a
+/// design decision (ADR-099 amendment), not a code-review-only change; the
+/// `atomic_admissible_list_matches_adr` test below pins this exact set so an
+/// edit here forces the editor to touch that test and its ADR citation.
+pub const ATOMIC_ADMISSIBLE_VERBS: &[&str] = &[
+    "update",
+    "delete",
+    "link",
+    "merge",
+    "gtd.transition",
+    "gtd.complete",
+    "propose",
+    "review",
+    "withdraw",
+];
+
+/// Verbs rejected under `--atomic` because their write still computes an
+/// embedding synchronously and no prepare/apply seam hoists that embedding
+/// out of the transaction yet (ADR-099 D3, "v1 rejected — embedding-bearing").
+const ATOMIC_EMBEDDING_BEARING_VERBS: &[&str] = &[
+    "create",
+    "memory.remember",
+    "gtd.assign",
+    "comm.send",
+    "comm.reply",
+    "comm.ingest",
+];
+
+/// Read verbs rejected under `--atomic` — they produce no write plan to apply
+/// (ADR-099 D3, "v1 rejected — reads").
+const ATOMIC_READ_VERBS: &[&str] = &[
+    "search",
+    "recall",
+    "query",
+    "traverse",
+    "list",
+    "get",
+    "neighbors",
+    "context",
+    "stats",
+    "verbs",
+];
+
+/// Why a verb was rejected from an `--atomic` op list (ADR-099 D3, migration
+/// step 2). Distinguishes the two named rejection classes from a generic
+/// "not yet admitted" fallback so callers can produce an actionable message.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AtomicRejectionReason {
+    /// The verb still computes an embedding synchronously in its write path.
+    EmbeddingBearing,
+    /// The verb is a read — it has no write plan to apply.
+    Read,
+    /// Neither on the v1 admissible list nor a known rejected category (e.g.
+    /// a verb added after this list was written). Rejected by default —
+    /// admissibility is opt-in, never inferred.
+    Unlisted,
+}
+
+/// Static admissibility classification for `verb_name` under ADR-099
+/// `--atomic` bulk apply.
+///
+/// Returns `None` when the verb is admissible; `Some(reason)` names why it is
+/// rejected. Default-deny: a verb name absent from every list here is
+/// [`AtomicRejectionReason::Unlisted`], never silently admitted.
+pub fn atomic_admissibility(verb_name: &str) -> Option<AtomicRejectionReason> {
+    if ATOMIC_ADMISSIBLE_VERBS.contains(&verb_name) {
+        return None;
+    }
+    if ATOMIC_EMBEDDING_BEARING_VERBS.contains(&verb_name) {
+        return Some(AtomicRejectionReason::EmbeddingBearing);
+    }
+    if ATOMIC_READ_VERBS.contains(&verb_name) {
+        return Some(AtomicRejectionReason::Read);
+    }
+    Some(AtomicRejectionReason::Unlisted)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -444,5 +527,87 @@ mod tests {
                 "{name:?} must be Standard (not AlwaysVerbose)"
             );
         }
+    }
+
+    // ── ADR-099 D3 atomic admissibility ────────────────────────────────────
+
+    // Drift-pin: a hardcoded copy of the ADR-099 D3 v1 admissible list. If
+    // someone edits `ATOMIC_ADMISSIBLE_VERBS`, this test fails until they also
+    // update this literal — forcing a look at ADR-099 D3 ("Decision: admit
+    // only verbs that expose a prepare/apply seam...") before the set changes.
+    #[test]
+    fn atomic_admissible_list_matches_adr099_d3() {
+        let adr_099_d3_v1_admissible_set: &[&str] = &[
+            "update",
+            "delete",
+            "link",
+            "merge",
+            "gtd.transition",
+            "gtd.complete",
+            "propose",
+            "review",
+            "withdraw",
+        ];
+        assert_eq!(
+            ATOMIC_ADMISSIBLE_VERBS, adr_099_d3_v1_admissible_set,
+            "ATOMIC_ADMISSIBLE_VERBS drifted from ADR-099 D3's explicit v1 list"
+        );
+    }
+
+    #[test]
+    fn atomic_admissible_verbs_are_admitted() {
+        for verb in ATOMIC_ADMISSIBLE_VERBS {
+            assert_eq!(
+                atomic_admissibility(verb),
+                None,
+                "{verb:?} is on the v1 admissible list and must be admitted"
+            );
+        }
+    }
+
+    #[test]
+    fn atomic_embedding_bearing_verbs_rejected_named() {
+        for verb in [
+            "create",
+            "memory.remember",
+            "gtd.assign",
+            "comm.send",
+            "comm.reply",
+        ] {
+            assert_eq!(
+                atomic_admissibility(verb),
+                Some(AtomicRejectionReason::EmbeddingBearing),
+                "{verb:?} must be rejected as embedding-bearing (ADR-099 acceptance criteria)"
+            );
+        }
+    }
+
+    #[test]
+    fn atomic_read_verbs_rejected() {
+        for verb in [
+            "search",
+            "recall",
+            "query",
+            "traverse",
+            "list",
+            "get",
+            "neighbors",
+            "context",
+        ] {
+            assert_eq!(
+                atomic_admissibility(verb),
+                Some(AtomicRejectionReason::Read),
+                "{verb:?} must be rejected as a read verb"
+            );
+        }
+    }
+
+    #[test]
+    fn atomic_unknown_verb_defaults_to_unlisted_rejection() {
+        assert_eq!(
+            atomic_admissibility("some_future_verb_nobody_classified_yet"),
+            Some(AtomicRejectionReason::Unlisted),
+            "an unrecognized verb must default-deny, never silently admit"
+        );
     }
 }
