@@ -51,9 +51,12 @@ use khive_runtime::atomic_plan::{
     AffectedRowGuard, GtdCompletePlan, GtdTransitionPlan, PlanStatement, PostCommitEffect,
 };
 use khive_runtime::atomic_runner::{AtomicOpFailure, AtomicOpPlan, AtomicRunOutcome};
-use khive_runtime::{KhiveConfig, KhiveRuntime, NamespaceToken, RuntimeConfig};
+use khive_runtime::pack::{PackRegistry, VerbRegistry, VerbRegistryBuilder};
+use khive_runtime::{
+    EdgeListFilter, KhiveConfig, KhiveRuntime, NamespaceToken, Resolved, RuntimeConfig,
+};
 use khive_storage::types::SqlValue;
-use khive_storage::SqlStatement;
+use khive_storage::{EdgeRelation, SqlStatement};
 
 use crate::exec::OpsFileEntry;
 
@@ -112,19 +115,53 @@ pub(crate) async fn execute_atomic_ops_file(
         .authorize(namespace)
         .context("authorize namespace for --atomic")?;
 
+    // ADR-099 B3 fix round 5, finding 1: a `VerbRegistry` built from every
+    // discovered pack, reusing the REAL runtime just constructed above (via
+    // `.clone()` — `KhiveRuntime` derives `Clone`) rather than a second
+    // throwaway one (the pattern `kkernel::pack_introspect::build_registry`
+    // uses for introspection). This is what makes `resolve_kind_spec`
+    // reachable at this seam: `khive-runtime` cannot depend on
+    // `khive-pack-kg`/`khive-pack-gtd` (packs depend on the runtime, not
+    // vice versa), so `resolve_kind_spec`'s vocab lookup (granular
+    // entity_kind/note_kind names from every loaded pack) can only be done
+    // here, where both the runtime and the packs are visible.
+    let mut verb_registry_builder = VerbRegistryBuilder::new();
+    let pack_names: Vec<String> = PackRegistry::discovered_names()
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+    PackRegistry::register_packs(&pack_names, runtime.clone(), &mut verb_registry_builder)
+        .map_err(|n| anyhow::anyhow!("pack {n:?} declared in inventory but factory missing"))?;
+    let verb_registry = verb_registry_builder
+        .build()
+        .context("building VerbRegistry for --atomic kind resolution")?;
+
     // ── async prepare pass (reads only, no writes) ───────────────────────────
     let mut plans: Vec<AtomicOpPlan> = Vec::with_capacity(ops.len());
+    // ADR-099 B3 fix round 5, finding 4: the exact args each op's plan was
+    // built from (post id-resolution for update/delete/link — finding 3) —
+    // carried alongside the plan so the post-commit result-rendering pass
+    // can re-derive natural keys (e.g. a link's canonical edge lookup)
+    // without re-parsing the ops file.
+    let mut resolved_args_list: Vec<Value> = Vec::with_capacity(ops.len());
     for (op_index, op) in ops.iter().enumerate() {
-        let plan = prepare_one(&runtime, &token, &op.tool, &op.args)
-            .await
-            .with_context(|| format!("op {op_index} (`{}`) failed to prepare", op.tool))?;
+        let (plan, resolved_args) =
+            prepare_one(&runtime, &token, &verb_registry, &op.tool, &op.args)
+                .await
+                .with_context(|| format!("op {op_index} (`{}`) failed to prepare", op.tool))?;
         plans.push(plan);
+        resolved_args_list.push(resolved_args);
     }
 
     // ── synchronous commit pass (ADR-099 D1 phase 2, B2) ────────────────────
-    let outcome = khive_runtime::atomic_runner::run_atomic_unit(runtime.sql().as_ref(), plans)
-        .await
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    // `plans` is cloned here: `run_atomic_unit` consumes it by value, but the
+    // post-commit result-rendering pass below (finding 4) still needs each
+    // op's plan (target ids, canonical link endpoints, gtd post-commit
+    // effects) to build its `result` payload.
+    let outcome =
+        khive_runtime::atomic_runner::run_atomic_unit(runtime.sql().as_ref(), plans.clone())
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
 
     let total = ops.len();
     let envelope = match outcome {
@@ -144,11 +181,31 @@ pub(crate) async fn execute_atomic_ops_file(
             khive_runtime::atomic_prepare::apply_post_commit_effects(&runtime, &token, post_commit)
                 .await
                 .context("post-commit reindex after atomic unit commit")?;
-            let results: Vec<Value> = ops
-                .iter()
-                .enumerate()
-                .map(|(idx, op)| json!({"ok": true, "tool": op.tool, "op_index": idx}))
-                .collect();
+            // ADR-099 B3 fix round 5, finding 4: render each committed op's
+            // canonical-shaped `result` payload (ADR-099 D4 requires
+            // `results[i].result`; the pre-fix envelope carried only
+            // `{ok, tool, op_index}`). Result rendering is itself a READ —
+            // safe post-commit, same reasoning as the reindex pass above.
+            let mut results: Vec<Value> = Vec::with_capacity(ops.len());
+            for (idx, op) in ops.iter().enumerate() {
+                let result = build_op_result(
+                    &runtime,
+                    &token,
+                    &op.tool,
+                    &op.args,
+                    &resolved_args_list[idx],
+                    &plans[idx],
+                )
+                .await
+                .with_context(|| {
+                    format!(
+                        "op {idx} (`{}`) committed but result rendering failed",
+                        op.tool
+                    )
+                })?;
+                results
+                    .push(json!({"ok": true, "tool": op.tool, "op_index": idx, "result": result}));
+            }
             json!({
                 "results": results,
                 "summary": {"total": total, "succeeded": total, "failed": 0},
@@ -298,23 +355,369 @@ fn validate_atomic_args(tool: &str, args: &Value) -> anyhow::Result<()> {
     }
 }
 
+/// Returns `(plan, resolved_args)` — `resolved_args` is `args` for
+/// `gtd.transition`/`gtd.complete` (their own prepare fns resolve `id`
+/// internally via the canonical gtd resolver, finding 3) and for any tool
+/// with no id-bearing fields; for `update`/`delete`/`link` it is the
+/// id-rewritten form `resolve_kg_ids_in_args` produces, carried forward so
+/// the post-commit result-rendering pass (finding 4) can re-derive natural
+/// keys (e.g. a link's canonical edge lookup) without re-resolving ids.
 async fn prepare_one(
+    runtime: &KhiveRuntime,
+    token: &NamespaceToken,
+    registry: &VerbRegistry,
+    tool: &str,
+    args: &Value,
+) -> anyhow::Result<(AtomicOpPlan, Value)> {
+    validate_atomic_args(tool, args)?;
+    match tool {
+        "gtd.transition" => {
+            let plan = prepare_gtd_transition(runtime, token, args)
+                .await
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            Ok((plan, args.clone()))
+        }
+        "gtd.complete" => {
+            let plan = prepare_gtd_complete(runtime, token, args)
+                .await
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            Ok((plan, args.clone()))
+        }
+        "update" | "link" => {
+            let resolved = resolve_kg_ids_in_args(runtime, token, tool, args).await?;
+            let plan = khive_runtime::atomic_prepare::prepare_op(runtime, token, tool, &resolved)
+                .await
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            Ok((plan, resolved))
+        }
+        "delete" => {
+            let resolved = resolve_kg_ids_in_args(runtime, token, tool, args).await?;
+            let expected_kind = delete_expected_kind(&resolved, registry)?;
+            let plan = khive_runtime::atomic_prepare::prepare_delete(
+                runtime,
+                token,
+                &resolved,
+                expected_kind,
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+            Ok((plan, resolved))
+        }
+        _ => {
+            let plan = khive_runtime::atomic_prepare::prepare_op(runtime, token, tool, args)
+                .await
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            Ok((plan, args.clone()))
+        }
+    }
+}
+
+/// Rewrite an op's KG-substrate id fields (`id` for update/delete;
+/// `source_id`/`target_id` for link) to resolved full UUIDs before handing
+/// args to `khive_runtime::atomic_prepare`, which only accepts bare
+/// `Uuid::parse_str` (ADR-099 B3 fix round 5, finding 3 — codex r3 REJECT
+/// High). Canonical KG handlers resolve through `resolve_uuid_unfiltered`
+/// (full UUID -> 8+ hex prefix -> entity-name fallback, common.rs:270; the
+/// `_including_deleted` variant for hard delete, mirroring
+/// `handle_delete`'s `hard` branch at update.rs:268-271) — both are now
+/// `pub` specifically for this seam. Resolution is a READ, so it belongs in
+/// the async prepare phase; the suspend-free commit-phase invariant is
+/// untouched. A field that is absent or not a string is left unchanged —
+/// the downstream `prepare_*` fn's own "missing required field"/"must be a
+/// full UUID" error still fires with its existing message shape.
+async fn resolve_kg_ids_in_args(
     runtime: &KhiveRuntime,
     token: &NamespaceToken,
     tool: &str,
     args: &Value,
-) -> anyhow::Result<AtomicOpPlan> {
-    validate_atomic_args(tool, args)?;
+) -> anyhow::Result<Value> {
+    let mut out = args.clone();
+    let hard = out
+        .as_object()
+        .and_then(|o| o.get("hard"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    async fn rewrite(
+        obj: &mut serde_json::Map<String, Value>,
+        key: &str,
+        runtime: &KhiveRuntime,
+        token: &NamespaceToken,
+        including_deleted: bool,
+    ) -> anyhow::Result<()> {
+        let Some(Value::String(raw)) = obj.get(key).cloned() else {
+            return Ok(());
+        };
+        let resolved = if including_deleted {
+            khive_pack_kg::handlers::resolve_uuid_unfiltered_including_deleted(&raw, runtime, token)
+                .await
+        } else {
+            khive_pack_kg::handlers::resolve_uuid_unfiltered(&raw, runtime, token).await
+        }
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+        obj.insert(key.to_string(), json!(resolved.to_string()));
+        Ok(())
+    }
+
+    let obj = out
+        .as_object_mut()
+        .ok_or_else(|| anyhow::anyhow!("op args must be a JSON object"))?;
     match tool {
-        "gtd.transition" => prepare_gtd_transition(runtime, token, args)
-            .await
-            .map_err(|e| anyhow::anyhow!("{e}")),
-        "gtd.complete" => prepare_gtd_complete(runtime, token, args)
-            .await
-            .map_err(|e| anyhow::anyhow!("{e}")),
-        _ => khive_runtime::atomic_prepare::prepare_op(runtime, token, tool, args)
-            .await
-            .map_err(|e| anyhow::anyhow!("{e}")),
+        "update" => rewrite(obj, "id", runtime, token, false).await?,
+        "delete" => rewrite(obj, "id", runtime, token, hard).await?,
+        "link" => {
+            rewrite(obj, "source_id", runtime, token, false).await?;
+            rewrite(obj, "target_id", runtime, token, false).await?;
+        }
+        _ => {}
+    }
+    Ok(out)
+}
+
+/// Resolve a caller-supplied `delete(kind=...)` string into the
+/// [`khive_runtime::atomic_prepare::AtomicDeleteKind`] `prepare_delete`
+/// enforces, using the SAME canonical `resolve_kind_spec` the non-atomic
+/// `handle_delete` calls (ADR-099 B3 fix round 5, finding 1 — codex r3
+/// REJECT Blocker). `kind` absent -> `Ok(None)` (no check, parity with
+/// canonical's own optional discriminator). `kind` resolving to
+/// `Edge`/`Event`/`Proposal` -> a fail-loud rejection BEFORE `prepare_delete`
+/// (and therefore before any write): those substrates are not v1-admissible
+/// for atomic delete (`prepare_delete`'s own match arms only ever build a
+/// plan for `Resolved::Entity`/`Resolved::Note`).
+fn delete_expected_kind(
+    args: &Value,
+    registry: &VerbRegistry,
+) -> anyhow::Result<Option<khive_runtime::atomic_prepare::AtomicDeleteKind>> {
+    let raw = match args
+        .as_object()
+        .and_then(|o| o.get("kind"))
+        .and_then(|v| v.as_str())
+    {
+        Some(k) => k,
+        None => return Ok(None),
+    };
+    let spec = khive_pack_kg::handlers::resolve_kind_spec(raw, registry)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    match spec {
+        khive_pack_kg::handlers::KindSpec::Entity { specific } => Ok(Some(
+            khive_runtime::atomic_prepare::AtomicDeleteKind::Entity { specific },
+        )),
+        khive_pack_kg::handlers::KindSpec::Note { specific } => Ok(Some(
+            khive_runtime::atomic_prepare::AtomicDeleteKind::Note { specific },
+        )),
+        khive_pack_kg::handlers::KindSpec::Edge
+        | khive_pack_kg::handlers::KindSpec::Event
+        | khive_pack_kg::handlers::KindSpec::Proposal => Err(anyhow::anyhow!(
+            "kind {raw:?} not supported under --atomic delete; only entity/note substrates \
+             are v1-admissible"
+        )),
+    }
+}
+
+/// Extract `(from_status, to_status)` from a gtd lifecycle post-commit
+/// effect — used by [`build_op_result`] below.
+fn gtd_audit_from_to(effect: &PostCommitEffect) -> Option<(String, String)> {
+    match effect {
+        PostCommitEffect::GtdAudit {
+            from_status,
+            to_status,
+            ..
+        } => Some((from_status.clone(), to_status.clone())),
+        _ => None,
+    }
+}
+
+/// Render a committed op's canonical-shaped `result` payload (ADR-099 B3 fix
+/// round 5, finding 4 — codex r3 REJECT High: the pre-fix envelope carried
+/// only `{ok, tool, op_index}`, dropping the `results[i].result` ADR-099 D4
+/// specifies). Result rendering is a pure READ, run strictly after the
+/// commit pass — safe for the same reason the post-commit reindex pass is.
+///
+/// `original_args`: the op's args exactly as the caller supplied them
+/// (needed for delete's `id`/`kind` echo, and gtd.transition's raw
+/// `status`). `resolved_args`: the id-rewritten form `resolve_kg_ids_in_args`
+/// produced for update/delete/link (`== original_args` for gtd ops, whose
+/// own prepare fns resolve `id` internally).
+async fn build_op_result(
+    runtime: &KhiveRuntime,
+    token: &NamespaceToken,
+    tool: &str,
+    original_args: &Value,
+    resolved_args: &Value,
+    plan: &AtomicOpPlan,
+) -> anyhow::Result<Value> {
+    match (tool, plan) {
+        // Canonical shape: `normalize_entity_timestamps(to_json(&updated))`
+        // (update.rs:209-211 entity, :242-244 note) — the full updated
+        // entity/note row with ISO-8601 timestamps.
+        ("update", AtomicOpPlan::Update(p)) => match runtime
+            .resolve_by_id(token, p.target_id)
+            .await?
+        {
+            Some(Resolved::Entity(entity)) => {
+                Ok(khive_pack_kg::handlers::normalize_entity_timestamps(
+                    serde_json::to_value(&entity)?,
+                ))
+            }
+            Some(Resolved::Note(note)) => Ok(khive_pack_kg::handlers::normalize_entity_timestamps(
+                serde_json::to_value(&note)?,
+            )),
+            _ => anyhow::bail!(
+                "atomic update result: target {} not found post-commit",
+                p.target_id
+            ),
+        },
+        // Canonical shape: `{"deleted": deleted, "id": p.id, "kind": p.kind}`
+        // (update.rs:327/:356/:360) — `p.id`/`p.kind` are the CALLER's
+        // original strings (pre id-resolution), not the resolved UUID.
+        ("delete", AtomicOpPlan::Delete(_)) => {
+            let id_val = original_args
+                .as_object()
+                .and_then(|o| o.get("id"))
+                .cloned()
+                .unwrap_or(Value::Null);
+            let kind_val = original_args
+                .as_object()
+                .and_then(|o| o.get("kind"))
+                .cloned()
+                .unwrap_or(Value::Null);
+            Ok(json!({"deleted": true, "id": id_val, "kind": kind_val}))
+        }
+        // Canonical shape: `to_json(&edge)` with `source_id`/`target_id`
+        // swapped back to the CALLER's order for a symmetric relation
+        // (link.rs:183-189). The atomic INSERT is a natural-key upsert, so
+        // the prepare-time-generated edge id may not be the committed row's
+        // id on a conflict — look the edge up post-commit by
+        // `(canonical_source, canonical_target, relation)` instead of
+        // trusting it.
+        ("link", AtomicOpPlan::Link(p)) => {
+            let relation_str = resolved_args
+                .as_object()
+                .and_then(|o| o.get("relation"))
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| anyhow::anyhow!("atomic link result: missing relation"))?;
+            let relation: EdgeRelation = relation_str
+                .parse()
+                .map_err(|e| anyhow::anyhow!("atomic link result: unknown relation: {e}"))?;
+            let edges = runtime
+                .list_edges(
+                    token,
+                    EdgeListFilter {
+                        source_id: Some(p.source_id),
+                        target_id: Some(p.target_id),
+                        relations: vec![relation],
+                        ..Default::default()
+                    },
+                    1,
+                )
+                .await?;
+            let edge = edges.into_iter().next().ok_or_else(|| {
+                anyhow::anyhow!("atomic link result: committed edge not found by natural key")
+            })?;
+            let mut raw = serde_json::to_value(&edge)?;
+            if relation.is_symmetric() {
+                if let Some(obj) = raw.as_object_mut() {
+                    let orig_source = resolved_args
+                        .as_object()
+                        .and_then(|o| o.get("source_id"))
+                        .cloned()
+                        .unwrap_or(Value::Null);
+                    let orig_target = resolved_args
+                        .as_object()
+                        .and_then(|o| o.get("target_id"))
+                        .cloned()
+                        .unwrap_or(Value::Null);
+                    obj.insert("source_id".to_string(), orig_source);
+                    obj.insert("target_id".to_string(), orig_target);
+                }
+            }
+            Ok(raw)
+        }
+        // Canonical shapes: handlers.rs:1030-1037 (idempotent no-op) /
+        // :1107-1118 (transitioned). `p.statements.is_empty()` is exactly
+        // the idempotent-no-op signal `prepare_gtd_transition` encodes
+        // (current == target after `normalize_status`, GAP-6).
+        ("gtd.transition", AtomicOpPlan::GtdTransition(p)) => {
+            let note = runtime
+                .notes(token)?
+                .get_note(p.task_id)
+                .await?
+                .ok_or_else(|| {
+                    anyhow::anyhow!("atomic gtd.transition result: task not found post-commit")
+                })?;
+            let task = khive_pack_gtd::handlers::render_task(&note);
+            if p.statements.is_empty() {
+                let raw_status = original_args
+                    .as_object()
+                    .and_then(|o| o.get("status"))
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("atomic gtd.transition result: missing status")
+                    })?;
+                let target = normalize_status(raw_status);
+                Ok(json!({
+                    "transitioned": false,
+                    "id": task["id"],
+                    "full_id": task["full_id"],
+                    "from": target,
+                    "to": target,
+                    "note": "already in target status",
+                }))
+            } else {
+                let (from_status, to_status) =
+                    gtd_audit_from_to(&p.post_commit).ok_or_else(|| {
+                        anyhow::anyhow!("atomic gtd.transition result: missing audit effect")
+                    })?;
+                Ok(json!({
+                    "transitioned": true,
+                    "id": task["id"],
+                    "full_id": task["full_id"],
+                    "from": from_status,
+                    "to": to_status,
+                    "is_terminal": is_terminal(&to_status),
+                    "title": task["title"],
+                    "priority": task["priority"],
+                    "assignee": task["assignee"],
+                    "due": task["due"],
+                }))
+            }
+        }
+        // Canonical shape: handlers.rs:918-926.
+        ("gtd.complete", AtomicOpPlan::GtdComplete(p)) => {
+            let note = runtime
+                .notes(token)?
+                .get_note(p.task_id)
+                .await?
+                .ok_or_else(|| {
+                    anyhow::anyhow!("atomic gtd.complete result: task not found post-commit")
+                })?;
+            let task = khive_pack_gtd::handlers::render_task(&note);
+            let (from_status, to_status) = gtd_audit_from_to(&p.post_commit).ok_or_else(|| {
+                anyhow::anyhow!("atomic gtd.complete result: missing audit effect")
+            })?;
+            let completed_at = note
+                .properties
+                .as_ref()
+                .and_then(|props| props.get("completed_at"))
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+                .ok_or_else(|| {
+                    anyhow::anyhow!("atomic gtd.complete result: missing completed_at")
+                })?;
+            Ok(json!({
+                "completed": true,
+                "id": task["id"],
+                "full_id": task["full_id"],
+                "from": from_status,
+                "to": to_status,
+                "completed_at": completed_at,
+                "is_terminal": is_terminal(&to_status),
+            }))
+        }
+        (other, _) => anyhow::bail!(
+            "atomic result rendering: no canonical-shape renderer for {other:?} \
+             (this is a bug — every v1 --atomic-admissible verb must have one)"
+        ),
     }
 }
 
@@ -330,9 +733,21 @@ fn require_str<'a>(args: &'a Value, key: &str) -> anyhow::Result<&'a str> {
         .ok_or_else(|| anyhow::anyhow!("missing required field {key:?}"))
 }
 
-fn require_uuid(args: &Value, key: &str) -> anyhow::Result<Uuid> {
+/// Resolve a gtd task id (full UUID or 8+ hex prefix), mirroring canonical
+/// GTD lifecycle verbs' resolution (`khive_pack_gtd::handlers::resolve_uuid`,
+/// handlers.rs:270 — ADR-099 B3 fix round 5, finding 3 — codex r3 REJECT
+/// High: the pre-fix version below (`require_uuid`) only accepted a bare
+/// full UUID, rejecting the short ids `gtd.assign` itself returns).
+async fn resolve_gtd_id(
+    runtime: &KhiveRuntime,
+    token: &NamespaceToken,
+    args: &Value,
+    key: &str,
+) -> anyhow::Result<Uuid> {
     let raw = require_str(args, key)?;
-    Uuid::parse_str(raw).map_err(|_| anyhow::anyhow!("{key} must be a full UUID; got {raw:?}"))
+    khive_pack_gtd::handlers::resolve_uuid(raw, runtime, token)
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))
 }
 
 /// Load a task note by id, verifying kind="task" and non-deleted — mirrors
@@ -386,7 +801,7 @@ async fn prepare_gtd_transition(
     token: &NamespaceToken,
     args: &Value,
 ) -> anyhow::Result<AtomicOpPlan> {
-    let id = require_uuid(args, "id")?;
+    let id = resolve_gtd_id(runtime, token, args, "id").await?;
     let raw_status = require_str(args, "status")?;
 
     // GAP-3 (B3 fix round 4): parity with `handle_transition`
@@ -500,7 +915,7 @@ async fn prepare_gtd_complete(
     token: &NamespaceToken,
     args: &Value,
 ) -> anyhow::Result<AtomicOpPlan> {
-    let id = require_uuid(args, "id")?;
+    let id = resolve_gtd_id(runtime, token, args, "id").await?;
     let status_arg = args
         .as_object()
         .and_then(|o| o.get("status"))

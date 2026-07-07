@@ -261,7 +261,13 @@ fn short_id(uuid: Uuid) -> String {
     uuid.as_hyphenated().to_string().chars().take(8).collect()
 }
 
-pub(crate) async fn resolve_uuid(
+/// `pub` (widened from `pub(crate)`, ADR-099 B3 fix round 5, finding 3): the
+/// `--atomic` seam in `kkernel` reuses this exact resolver (full UUID or 8+
+/// hex prefix, namespace-scoped via `resolve_prefix`) to resolve `gtd.transition`
+/// / `gtd.complete` `id` args before atomic prepare, matching what
+/// `handle_transition`/`handle_complete` use — reproducing canonical short-id
+/// acceptance without a duplicated resolution helper.
+pub async fn resolve_uuid(
     s: &str,
     runtime: &KhiveRuntime,
     token: &NamespaceToken,
@@ -344,7 +350,13 @@ fn priority_rank(props: Option<&Value>) -> u8 {
 }
 
 /// Build the response object for any task-shaped operation.
-fn render_task(note: &khive_storage::note::Note) -> Value {
+///
+/// `pub` (widened from private, ADR-099 B3 fix round 5, finding 4): the
+/// `--atomic` seam in `kkernel` reuses this exact renderer, post-commit, to
+/// build the `result` payload for a committed `gtd.transition`/`gtd.complete`
+/// op — matching `handle_transition`/`handle_complete`'s response shape
+/// field-for-field without a duplicated renderer.
+pub fn render_task(note: &khive_storage::note::Note) -> Value {
     let props = note.properties.clone().unwrap_or(json!({}));
     let title = note
         .name

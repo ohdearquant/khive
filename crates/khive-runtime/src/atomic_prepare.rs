@@ -81,26 +81,82 @@ fn optional_str<'a>(args: &'a Value, key: &str) -> Option<&'a str> {
     obj(args).ok()?.get(key).and_then(|v| v.as_str())
 }
 
-/// Three-way patch semantics for a nullable string field (mirrors
-/// `khive-pack-kg::handlers::common::optional_string_patch`, reimplemented
-/// here rather than imported — that module is `pub(crate)` to a sibling
-/// crate with no dependency edge back to `khive-runtime`):
-/// key absent -> `None` (leave unchanged); key present and JSON `null` ->
-/// `Some(None)` (clear); key present and a string -> `Some(Some(s))` (set).
+/// Nullable-string patch semantics (ADR-099 B3 fix round 5, finding 2 —
+/// codex r3 REJECT). Mirrors the *actually reachable* behavior of
+/// `khive-pack-kg::handlers::common::optional_string_patch`/
+/// `description_patch`, reimplemented here rather than imported (that
+/// module is `pub(crate)` to a sibling crate with no dependency edge back to
+/// `khive-runtime`). Canonical's field type is `Option<Value>`
+/// (`UpdateParams.name`/`.description`); serde_json's derived
+/// `Deserialize` for `Option<T>` intercepts a literal JSON `null` at the
+/// OUTER Option boundary and maps it straight to Rust `None` — REGARDLESS
+/// of the inner type `T` — so canonical's own `Some(Value::Null) =>
+/// Ok(Some(None))` "clear" arm is unreachable through normal struct
+/// deserialization (empirically verified against the live `handle_update`:
+/// `update(name=null)` / `update(description=null)` are no-ops, not
+/// clears). This module reads raw, un-deserialized JSON, so it must
+/// replicate that collapse explicitly: key absent OR JSON `null` -> `None`
+/// (leave unchanged, no-op); key present as a string -> `Some(Some(s))`
+/// (set); any other JSON type -> a hard error (canonical's still-reachable
+/// non-null-non-string rejection).
 fn optional_string_patch(args: &Value, key: &str) -> RuntimeResult<Option<Option<String>>> {
     match obj(args)?.get(key) {
-        None => Ok(None),
-        Some(Value::Null) => Ok(Some(None)),
+        None | Some(Value::Null) => Ok(None),
         Some(Value::String(s)) => Ok(Some(Some(s.clone()))),
-        Some(_) => Err(RuntimeError::InvalidInput(format!(
-            "{key} must be a string or null"
+        Some(other) => Err(RuntimeError::InvalidInput(format!(
+            "{key} must be a string or null, got: {other}"
         ))),
     }
 }
 
+/// Strict string-or-absent-or-null patch for entity `name` (ADR-099 B3 fix
+/// round 5, finding 1 of codex r3's High finding 2 — the actual violation:
+/// `optional_str`'s `.as_str()` silently drops a non-string, non-null value
+/// like `name: 123` as absent, reporting success for an invalid update.
+/// Canonical validates entity `name` via `string_value` (common.rs:819) on
+/// `UpdateParams.name: Option<Value>` — null collapses to absent at the
+/// struct-deserialize boundary (see `optional_string_patch` doc above), so
+/// `string_value`'s reachable behavior is: absent/null -> unchanged;
+/// non-null string -> set; any other JSON type -> hard error. This mirrors
+/// exactly that, reading raw JSON instead of a deserialized struct.
+fn entity_name_patch(args: &Value) -> RuntimeResult<Option<String>> {
+    match obj(args)?.get("name") {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(s)) => Ok(Some(s.clone())),
+        Some(other) => Err(RuntimeError::InvalidInput(format!(
+            "name must be a string, got: {other}"
+        ))),
+    }
+}
+
+/// Nullable-JSON-value patch for `properties` (ADR-099 B3 fix round 5,
+/// finding 2): canonical `properties: Option<Value>` on `UpdateParams`
+/// collapses a literal JSON `null` to Rust `None` at the struct-deserialize
+/// boundary (same gotcha as `optional_string_patch` above), so
+/// `properties=null` is canonically a no-op (leave existing properties
+/// unchanged) — NOT a stored JSON `null`. This module reads raw JSON, so it
+/// must replicate that collapse: key absent OR JSON `null` -> `None` (no
+/// merge); any other JSON value -> `Some(value)` (merge), matching
+/// canonical's un-typed pass-through (no further shape validation at this
+/// layer either way).
+fn optional_properties(args: &Value, key: &str) -> RuntimeResult<Option<Value>> {
+    match obj(args)?.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(v) => Ok(Some(v.clone())),
+    }
+}
+
+/// `tags` patch (ADR-099 B3 fix round 5, finding 2): canonical
+/// `tags: Option<Vec<String>>` on `UpdateParams` collapses a literal JSON
+/// `null` to Rust `None` at the struct-deserialize boundary (same gotcha),
+/// so `tags=null` is canonically a no-op (leave existing tags unchanged) —
+/// the pre-fix version of this function instead ERRORED on null, which is
+/// the exact divergence codex flagged. A non-array, non-null value is still
+/// a hard error (mirrors the type failure `UpdateParams` deserialization
+/// would itself produce for a malformed `tags`).
 fn optional_tags(args: &Value) -> RuntimeResult<Option<Vec<String>>> {
     match obj(args)?.get("tags") {
-        None => Ok(None),
+        None | Some(Value::Null) => Ok(None),
         Some(Value::Array(items)) => {
             let mut tags = Vec::with_capacity(items.len());
             for item in items {
@@ -347,7 +403,16 @@ pub async fn prepare_op(
 ) -> RuntimeResult<AtomicOpPlan> {
     match tool {
         "update" => prepare_update(runtime, token, args).await,
-        "delete" => prepare_delete(runtime, token, args).await,
+        // `expected_kind: None` here — callers that need `delete(kind=...)`
+        // parity (ADR-099 B3 fix round 5, finding 1) must resolve the kind
+        // spec themselves (it needs a `VerbRegistry`, unreachable from this
+        // crate — see `AtomicDeleteKind`'s doc comment) and call
+        // `prepare_delete` directly with the resolved value; `kkernel`'s
+        // `--atomic` seam does exactly this and bypasses this dispatch arm
+        // for "delete". A caller reaching `prepare_op("delete", ...)`
+        // without going through that seam gets kind-unchecked behavior,
+        // same as before this fix round.
+        "delete" => prepare_delete(runtime, token, args, None).await,
         "link" => prepare_link(runtime, token, args).await,
         "merge" => prepare_merge(runtime, token, args).await,
         "propose" | "review" | "withdraw" => prepare_governance_unimplemented(tool),
@@ -468,9 +533,9 @@ async fn prepare_update(
     match runtime.resolve_by_id(token, id).await? {
         Some(Resolved::Entity(entity)) => {
             reject_inapplicable_update_fields(args, "entity")?;
-            let name = optional_str(args, "name").map(|s| s.to_string());
+            let name = entity_name_patch(args)?;
             let description = optional_string_patch(args, "description")?;
-            let properties = obj(args)?.get("properties").cloned();
+            let properties = optional_properties(args, "properties")?;
             let tags = optional_tags(args)?;
 
             if let Some(ref n) = name {
@@ -580,7 +645,7 @@ async fn prepare_update(
             reject_inapplicable_update_fields(args, "note")?;
             let name = optional_string_patch(args, "name")?;
             let content = optional_str(args, "content").map(|s| s.to_string());
-            let properties = obj(args)?.get("properties").cloned();
+            let properties = optional_properties(args, "properties")?;
             let salience = optional_f64(args, "salience")?;
             let decay_factor = optional_f64(args, "decay_factor")?;
 
@@ -692,10 +757,35 @@ async fn prepare_update(
 // delete
 // ---------------------------------------------------------------------------
 
-async fn prepare_delete(
+/// Caller-supplied delete-kind expectation, resolved via the canonical
+/// `resolve_kind_spec` at the kkernel `--atomic` seam (ADR-099 B3 fix round
+/// 5, finding 1 — codex r3 REJECT Blocker). `khive-runtime` must not depend
+/// on `khive-pack-kg` (packs depend on the runtime, not the other way
+/// around), so this is a plain substrate-level shape rather than
+/// `khive_pack_kg::handlers::KindSpec` itself: the kkernel seam does the
+/// pack-aware `resolve_kind_spec` resolution (which needs a `VerbRegistry`,
+/// unreachable from this crate) and passes down only what `prepare_delete`
+/// needs to enforce the mismatch check. `KindSpec::Edge`/`Event`/`Proposal`
+/// are rejected at the kkernel seam BEFORE `prepare_delete` is ever called
+/// — those substrates are not v1-admissible for atomic delete (this enum
+/// intentionally has no variant for them, so a rejected kind can never be
+/// constructed here).
+pub enum AtomicDeleteKind {
+    Entity { specific: Option<String> },
+    Note { specific: Option<String> },
+}
+
+/// `expected_kind`: `None` when the caller omitted `kind` (no check, parity
+/// with canonical's own optional discriminator); `Some(_)` enforces an
+/// exact-parity mismatch check against the resolved record's actual
+/// substrate/specific kind (ADR-099 B3 fix round 5, finding 1), mirroring
+/// `handle_delete`'s `entity.kind != *expected` / `note.kind != *expected`
+/// checks (update.rs:319, :348).
+pub async fn prepare_delete(
     runtime: &KhiveRuntime,
     token: &NamespaceToken,
     args: &Value,
+    expected_kind: Option<AtomicDeleteKind>,
 ) -> RuntimeResult<AtomicOpPlan> {
     let id = require_uuid(args, "id")?;
     let hard = obj(args)?
@@ -718,6 +808,20 @@ async fn prepare_delete(
 
     match resolved {
         Some(Resolved::Entity(entity)) => {
+            match &expected_kind {
+                None => {}
+                Some(AtomicDeleteKind::Entity {
+                    specific: Some(expected),
+                }) => {
+                    if &entity.kind != expected {
+                        return Err(RuntimeError::NotFound(format!("{expected} {id}")));
+                    }
+                }
+                Some(AtomicDeleteKind::Entity { specific: None }) => {}
+                Some(AtomicDeleteKind::Note { .. }) => {
+                    return Err(RuntimeError::NotFound(format!("note {id}")));
+                }
+            }
             let namespace = entity.namespace.clone();
             let mut statements = if hard {
                 // Storage parity with the non-atomic hard-delete DML
@@ -790,6 +894,20 @@ async fn prepare_delete(
             }))
         }
         Some(Resolved::Note(note)) => {
+            match &expected_kind {
+                None => {}
+                Some(AtomicDeleteKind::Note {
+                    specific: Some(expected),
+                }) => {
+                    if &note.kind != expected {
+                        return Err(RuntimeError::NotFound(format!("{expected} {id}")));
+                    }
+                }
+                Some(AtomicDeleteKind::Note { specific: None }) => {}
+                Some(AtomicDeleteKind::Entity { .. }) => {
+                    return Err(RuntimeError::NotFound(format!("entity {id}")));
+                }
+            }
             let namespace = note.namespace.clone();
             let mut statements = if hard {
                 // Storage parity with the non-atomic hard-delete DML
@@ -1422,6 +1540,7 @@ mod tests {
                 &runtime,
                 &token,
                 &json!({"id": note_id.to_string(), "hard": hard}),
+                None,
             )
             .await
             .expect("prepare delete");
@@ -1503,6 +1622,7 @@ mod tests {
                 &runtime,
                 &token,
                 &json!({"id": entity_id.to_string(), "hard": hard}),
+                None,
             )
             .await
             .expect("prepare delete");
@@ -1889,7 +2009,7 @@ mod tests {
             .expect("seed note");
 
         for (id, kind) in [(entity_id, "entity"), (note_id, "note")] {
-            let plan = prepare_delete(&runtime, &token, &json!({"id": id.to_string()}))
+            let plan = prepare_delete(&runtime, &token, &json!({"id": id.to_string()}), None)
                 .await
                 .unwrap_or_else(|e| panic!("prepare delete ({kind}) must not fail: {e}"));
             let outcome = crate::atomic_runner::run_atomic_unit(runtime.sql().as_ref(), vec![plan])
@@ -1973,7 +2093,7 @@ mod tests {
         // First: SOFT delete both (via atomic prepare) so they're tombstoned
         // going into the hard-delete attempt below.
         for id in [entity_id, note_id] {
-            let plan = prepare_delete(&runtime, &token, &json!({"id": id.to_string()}))
+            let plan = prepare_delete(&runtime, &token, &json!({"id": id.to_string()}), None)
                 .await
                 .expect("prepare soft delete");
             let outcome = crate::atomic_runner::run_atomic_unit(runtime.sql().as_ref(), vec![plan])
@@ -2011,6 +2131,7 @@ mod tests {
                 &runtime,
                 &token,
                 &json!({"id": id.to_string(), "hard": true}),
+                None,
             )
             .await
             .unwrap_or_else(|e| {
@@ -2180,7 +2301,7 @@ mod tests {
             } else {
                 json!({"id": entity_id.to_string()})
             };
-            let plan = prepare_delete(&runtime, &token, &args)
+            let plan = prepare_delete(&runtime, &token, &args, None)
                 .await
                 .unwrap_or_else(|e| panic!("prepare delete (hard={hard}): {e}"));
             let outcome = crate::atomic_runner::run_atomic_unit(runtime.sql().as_ref(), vec![plan])
@@ -2235,7 +2356,7 @@ mod tests {
             } else {
                 json!({"id": note_id.to_string()})
             };
-            let plan = prepare_delete(&runtime, &token, &args)
+            let plan = prepare_delete(&runtime, &token, &args, None)
                 .await
                 .unwrap_or_else(|e| panic!("prepare delete (hard={hard}): {e}"));
             let outcome = crate::atomic_runner::run_atomic_unit(runtime.sql().as_ref(), vec![plan])

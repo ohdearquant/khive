@@ -88,8 +88,13 @@ pub(crate) fn validate_entity_type(
 // ---- Granular `kind` discriminator ----
 
 /// Resolved shape of a `kind` discriminator string.
+///
+/// `pub` (widened from `pub(crate)`, ADR-099 B3 fix round 5, finding 1): the
+/// `--atomic` seam in `kkernel` reuses [`resolve_kind_spec`] and this type to
+/// resolve a caller-supplied `delete(kind=...)` the SAME way `handle_delete`
+/// does, rather than re-deriving kind-vocabulary resolution.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum KindSpec {
+pub enum KindSpec {
     Entity { specific: Option<String> },
     Note { specific: Option<String> },
     Edge,
@@ -110,10 +115,10 @@ impl KindSpec {
 }
 
 /// Resolve a wire-level `kind` value into a [`KindSpec`].
-pub(crate) fn resolve_kind_spec(
-    raw: &str,
-    registry: &VerbRegistry,
-) -> Result<KindSpec, RuntimeError> {
+///
+/// `pub` (widened from `pub(crate)`, ADR-099 B3 fix round 5, finding 1) —
+/// see [`KindSpec`]'s doc comment.
+pub fn resolve_kind_spec(raw: &str, registry: &VerbRegistry) -> Result<KindSpec, RuntimeError> {
     let normalized = raw.trim().to_ascii_lowercase();
 
     match normalized.as_str() {
@@ -267,7 +272,11 @@ pub(crate) async fn resolve_uuid_async(
 /// primary-namespace-only `resolve_prefix` and was invisible for any row
 /// stamped with a non-primary namespace (#391 §3). Exact copy of
 /// `resolve_uuid_async` except the prefix branch.
-pub(crate) async fn resolve_uuid_unfiltered(
+///
+/// `pub` (widened from `pub(crate)`, ADR-099 B3 fix round 5, finding 3) — so
+/// kkernel's `--atomic` seam can resolve KG ids (full UUID / 8+ hex prefix /
+/// entity-name) with the exact same semantics as the canonical handlers.
+pub async fn resolve_uuid_unfiltered(
     s: &str,
     runtime: &KhiveRuntime,
     token: &NamespaceToken,
@@ -292,7 +301,11 @@ pub(crate) async fn resolve_uuid_unfiltered(
 /// `resolve_uuid_unfiltered`, including soft-deleted rows — used by the
 /// hard-delete by-ID path (#391 §3). Exact copy of
 /// `resolve_uuid_including_deleted` except the prefix branch.
-pub(crate) async fn resolve_uuid_unfiltered_including_deleted(
+///
+/// `pub` (widened from `pub(crate)`, ADR-099 B3 fix round 5, finding 3) — for
+/// the same reason as `resolve_uuid_unfiltered` above; used by the atomic
+/// hard-delete id-resolution path.
+pub async fn resolve_uuid_unfiltered_including_deleted(
     s: &str,
     runtime: &KhiveRuntime,
     token: &NamespaceToken,
@@ -631,7 +644,10 @@ pub(crate) fn deser<T: serde::de::DeserializeOwned>(params: Value) -> Result<T, 
         .map_err(|e| RuntimeError::InvalidInput(format!("bad params: {e}")))
 }
 
-pub(crate) fn normalize_entity_timestamps(mut v: Value) -> Value {
+/// `pub` (widened from `pub(crate)`, ADR-099 B3 fix round 5, finding 4) — so
+/// kkernel's `--atomic` seam can render update/delete result payloads with
+/// the same timestamp normalization as the canonical handlers.
+pub fn normalize_entity_timestamps(mut v: Value) -> Value {
     if let Some(obj) = v.as_object_mut() {
         for field in &["created_at", "updated_at", "deleted_at", "expires_at"] {
             if let Some(val) = obj.get_mut(*field) {
