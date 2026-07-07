@@ -518,6 +518,7 @@ mod tests {
                 guard: Some(AffectedRowGuard::exactly(1)),
             }],
             post_commit: PostCommitEffect::None,
+            edge_natural_key: None,
         })
     }
 

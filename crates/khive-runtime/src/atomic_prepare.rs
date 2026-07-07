@@ -44,7 +44,8 @@ use khive_storage::{EdgeRelation, SqlStatement};
 use khive_types::{EventKind, SubstrateKind};
 
 use crate::atomic_plan::{
-    AffectedRowGuard, DeletePlan, LinkPlan, MergePlan, PlanStatement, PostCommitEffect, UpdatePlan,
+    AffectedRowGuard, DeletePlan, EdgeNaturalKey, LinkPlan, MergePlan, PlanStatement,
+    PostCommitEffect, UpdatePlan,
 };
 use crate::atomic_runner::AtomicOpPlan;
 use crate::error::{RuntimeError, RuntimeResult};
@@ -60,8 +61,7 @@ use khive_db::stores::entity::{
 use khive_db::stores::event::event_insert_statements;
 use khive_db::stores::graph::{
     edge_hard_delete_statement, edge_insert_guarded_by_endpoints_statement,
-    edge_soft_delete_statement, edge_symmetric_conflict_probe_statement,
-    edge_symmetric_delete_if_conflict_statement,
+    edge_soft_delete_statement, edge_symmetric_delete_if_conflict_statement,
     edge_symmetric_refresh_or_update_inplace_statement, edge_upsert_statement,
     purge_incident_edges_statement,
 };
@@ -640,6 +640,7 @@ pub async fn prepare_update(
                 target_id: id,
                 statements,
                 post_commit,
+                edge_natural_key: None,
             }))
         }
         Some(Resolved::Note(note)) => {
@@ -699,6 +700,7 @@ pub async fn prepare_update(
                     guard: Some(AffectedRowGuard::exactly(1)),
                 }],
                 post_commit,
+                edge_natural_key: None,
             }))
         }
         Some(_) => Err(RuntimeError::InvalidInput(format!(
@@ -757,12 +759,13 @@ pub async fn prepare_update(
 ///   [`edge_symmetric_refresh_or_update_inplace_statement`] — each carries
 ///   its own commit-time `WHERE`/`CASE WHEN` predicate that re-evaluates the
 ///   conflict condition fresh inside the transaction, so the write is
-///   correct regardless of what this prepare-time probe returns. The probe
-///   itself is kept, but demoted to computing `surviving_id` only — a pure
-///   informational value used for this plan's `target_id` (post-commit
-///   result rendering), not a write-correctness input; see the inline
-///   comment at its call site for the (vanishingly rare, informational-only)
-///   residual staleness this leaves.
+///   correct regardless of prepare-time state. ADR-099 B3 r9 (codex r8
+///   Blocker finding 1) removed the prepare-time conflict probe entirely —
+///   this function no longer reads any state to guess a surviving id; the
+///   plan instead carries `edge_natural_key` (the plain canonicalized
+///   endpoints/relation this update targets), letting a post-commit caller
+///   derive the actual surviving id from the committed row, never from a
+///   value computed before the rest of this atomic unit has even run.
 async fn prepare_update_edge(
     runtime: &KhiveRuntime,
     id: Uuid,
@@ -813,7 +816,7 @@ async fn prepare_update_edge(
     let now = chrono::Utc::now();
 
     let mut statements: Vec<PlanStatement> = Vec::new();
-    let mut surviving_id = id;
+    let mut edge_natural_key: Option<EdgeNaturalKey> = None;
 
     if edge.relation.is_symmetric() {
         // ADR-099 B3 r7 (codex r7 High finding 3): the WRITE for a symmetric
@@ -859,38 +862,16 @@ async fn prepare_update_edge(
             guard: Some(AffectedRowGuard::exactly(1)),
         });
 
-        // `surviving_id` here is advisory only, used solely for this plan's
-        // `target_id` (post-commit result rendering — a pure informational
-        // READ, not a write-correctness concern; see this function's doc
-        // comment). A best-effort probe is enough for it: if an intra-batch
-        // race (vanishingly rare — it requires a SECOND op in this SAME
-        // atomic unit to touch this exact symmetric edge's natural key
-        // between this probe and commit) makes it stale, the two statements
-        // above still write to the CORRECT row regardless of what this
-        // probe returns; only the post-commit result payload could, in that
-        // exact race, echo back the pre-collision row's content.
-        let mut reader = runtime
-            .sql()
-            .reader()
-            .await
-            .map_err(RuntimeError::Storage)?;
-        let conflict_id = reader
-            .query_scalar(edge_symmetric_conflict_probe_statement(
-                &namespace,
-                canon_src,
-                canon_tgt,
-                edge.relation,
-                id,
-            ))
-            .await
-            .map_err(RuntimeError::Storage)?
-            .and_then(|v| match v {
-                SqlValue::Text(s) => Uuid::parse_str(&s).ok(),
-                _ => None,
-            });
-        if let Some(existing_id) = conflict_id {
-            surviving_id = existing_id;
-        }
+        // No prepare-time read needed: the two statements above are
+        // self-guarding at commit time (see their doc comment). Post-commit
+        // result rendering derives the actual surviving id from THIS
+        // natural key, never from a value computed here.
+        edge_natural_key = Some(EdgeNaturalKey {
+            namespace: namespace.clone(),
+            canon_source_id: canon_src,
+            canon_target_id: canon_tgt,
+            relation: edge.relation,
+        });
     } else {
         // Non-symmetric: bit-for-bit the same builder `graph.upsert_edge`
         // calls — see doc comment above.
@@ -915,9 +896,10 @@ async fn prepare_update_edge(
     )?);
 
     Ok(AtomicOpPlan::Update(UpdatePlan {
-        target_id: surviving_id,
+        target_id: id,
         statements,
         post_commit: PostCommitEffect::None,
+        edge_natural_key,
     }))
 }
 
@@ -2690,10 +2672,25 @@ mod tests {
         )
         .await
         .expect("prepare update edge (symmetric conflict)");
-        // The plan must target the SURVIVING (canonical) row, not the
-        // requested one — mirrors `update_edge`'s `edge = self.get_edge(&record_tok, surviving_uuid)`.
+        // ADR-099 B3 r9: the plan no longer computes a prepare-time
+        // advisory surviving id (`target_id` is just the requested id) —
+        // it carries `edge_natural_key` so a post-commit caller can derive
+        // the real surviving id itself. Assert the plan carries the RIGHT
+        // natural key to look up; the actual surviving row's identity is
+        // verified against the DB after commit, below.
+        let (canon_src, canon_tgt) =
+            canonical_edge_endpoints(EdgeRelation::CompetesWith, a_id, b_id);
         match &plan {
-            AtomicOpPlan::Update(p) => assert_eq!(p.target_id, canonical_id),
+            AtomicOpPlan::Update(p) => {
+                assert_eq!(p.target_id, requested_id);
+                let key = p
+                    .edge_natural_key
+                    .as_ref()
+                    .expect("symmetric edge update must carry edge_natural_key");
+                assert_eq!(key.canon_source_id, canon_src);
+                assert_eq!(key.canon_target_id, canon_tgt);
+                assert_eq!(key.relation, EdgeRelation::CompetesWith);
+            }
             other => panic!("expected an Update plan, got {other:?}"),
         }
 
@@ -2733,6 +2730,102 @@ mod tests {
         let events =
             events_for_target(&runtime, &token, requested_id, EventKind::EdgeUpdated).await;
         assert_eq!(events.len(), 1);
+    }
+
+    /// ADR-099 B3 r9 (codex r8 Blocker finding 1): the same-unit race codex
+    /// named — `[delete(X), update(X -> competes_with)]` where an
+    /// ALREADY-EXISTING canonical row sits at the post-update natural key.
+    /// Both ops' async prepare passes run before either commits, so at
+    /// prepare time `X` still exists and both plans build. At commit time
+    /// `delete(X)` removes it FIRST; `update(X -> competes_with)`'s own
+    /// commit-time statements must then fail loud (its target no longer
+    /// exists) rather than silently absorbing into the pre-existing
+    /// canonical row it never causally touched. The whole atomic unit must
+    /// roll back — parity with canonical `update_edge`'s `NotFound` for a
+    /// missing edge, expressed here as the unit-level abort ADR-099
+    /// specifies for any op whose commit-time guard fails.
+    #[tokio::test]
+    async fn atomic_update_edge_symmetric_same_unit_delete_race_aborts_the_unit() {
+        let runtime = scratch_runtime();
+        let token = runtime
+            .authorize(Namespace::parse("local").expect("ns"))
+            .expect("authorize");
+        let entities = runtime.entities(&token).expect("entities store");
+        let a = khive_storage::Entity::new("local", "concept", "GapEdgeRaceA");
+        let b = khive_storage::Entity::new("local", "concept", "GapEdgeRaceB");
+        let (a_id, b_id) = (a.id, b.id);
+        entities.upsert_entity(a).await.expect("seed a");
+        entities.upsert_entity(b).await.expect("seed b");
+
+        // The row op 1 will try to update — deleted by op 0 in the SAME unit.
+        let requested_edge = runtime
+            .link(&token, a_id, b_id, EdgeRelation::Extends, 0.2, None)
+            .await
+            .expect("seed requested edge");
+        let requested_id = Uuid::from(requested_edge.id);
+
+        // The pre-existing canonical row the buggy `id = ?2 OR natural-key`
+        // predicate used to silently absorb into.
+        let canonical_edge = runtime
+            .link(&token, a_id, b_id, EdgeRelation::CompetesWith, 0.6, None)
+            .await
+            .expect("seed canonical edge");
+        let canonical_id = Uuid::from(canonical_edge.id);
+
+        let delete_plan = prepare_delete(
+            &runtime,
+            &token,
+            &json!({"id": requested_id.to_string(), "hard": true}),
+            None,
+        )
+        .await
+        .expect("prepare delete edge");
+        let update_plan = prepare_update(
+            &runtime,
+            &token,
+            &json!({"id": requested_id.to_string(), "relation": "competes_with", "weight": 0.9}),
+            None,
+        )
+        .await
+        .expect("prepare update edge (both prepares run before either commits)");
+
+        let outcome = crate::atomic_runner::run_atomic_unit(
+            runtime.sql().as_ref(),
+            vec![delete_plan, update_plan],
+        )
+        .await
+        .expect("the seam call itself must not error — the unit rolls back cleanly");
+        match outcome {
+            crate::atomic_runner::AtomicRunOutcome::RolledBack {
+                failed_op_index, ..
+            } => {
+                assert_eq!(
+                    failed_op_index, 1,
+                    "op 1 (the update) must be the one whose guard fails"
+                );
+            }
+            other => panic!("expected the whole unit to roll back, got {other:?}"),
+        }
+
+        // Whole-unit rollback: op 0's delete must be undone too.
+        let requested_after = runtime
+            .get_edge(&token, requested_id)
+            .await
+            .expect("get_edge");
+        assert!(
+            requested_after.is_some(),
+            "delete(X) must have rolled back along with the failed update"
+        );
+        // The pre-existing canonical row must be completely untouched.
+        let canonical_after = runtime
+            .get_edge(&token, canonical_id)
+            .await
+            .expect("get_edge")
+            .expect("canonical row must still be present");
+        assert_eq!(
+            canonical_after.weight, 0.6,
+            "the pre-existing canonical row must never have been touched by the aborted update"
+        );
     }
 
     /// ADR-099 B3 r6 (closes the round-4 codex REJECT, High): `update`

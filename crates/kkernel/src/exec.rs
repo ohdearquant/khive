@@ -2145,6 +2145,111 @@ backend = "sessions"
         );
     }
 
+    /// ADR-099 B3 r9 (codex r8 Blocker finding 1, second half): the inverse
+    /// same-unit race codex named — `[link(A, B, competes_with), update(X
+    /// extends A-B -> competes_with)]`, where the CANONICAL row the update
+    /// conflict-absorbs into is created by an EARLIER op in the SAME
+    /// atomic unit (so it does not exist at either op's prepare time). The
+    /// commit must both write correctly (X deleted, the just-linked row
+    /// carries X's patch) and RENDER the correct surviving id — not X's
+    /// prepare-time-advisory id, which this fix round removed reliance on
+    /// entirely (`build_op_result` now derives it from a post-commit
+    /// natural-key lookup).
+    #[tokio::test]
+    async fn atomic_symmetric_update_absorbs_into_same_unit_link_and_renders_correct_id() {
+        let db_file = NamedTempFile::new().expect("temp db");
+        let db_path = db_file.path().to_str().expect("utf8").to_string();
+
+        let (a_id, b_id, x_id) = {
+            let server = isolated_server(&db_path);
+            let resp = dispatch_json(
+                &server,
+                r#"[create(kind="concept", name="LinkRaceA"), create(kind="concept", name="LinkRaceB")]"#,
+            )
+            .await;
+            let a_id = resp["results"][0]["result"]["id"]
+                .as_str()
+                .expect("a id")
+                .to_string();
+            let b_id = resp["results"][1]["result"]["id"]
+                .as_str()
+                .expect("b id")
+                .to_string();
+
+            let link_resp = dispatch_json(
+                &server,
+                &format!(
+                    r#"link(source_id="{a_id}", target_id="{b_id}", relation="extends", weight=0.2)"#
+                ),
+            )
+            .await;
+            let x_id = link_resp["results"][0]["result"]["id"]
+                .as_str()
+                .expect("x id")
+                .to_string();
+            (a_id, b_id, x_id)
+        };
+
+        let ops = vec![
+            atomic_op(
+                "link",
+                serde_json::json!({
+                    "source_id": a_id,
+                    "target_id": b_id,
+                    "relation": "competes_with",
+                    "weight": 0.6,
+                }),
+            ),
+            atomic_op(
+                "update",
+                serde_json::json!({"id": x_id, "relation": "competes_with", "weight": 0.9}),
+            ),
+        ];
+
+        let khive_cfg = KhiveConfig::default();
+        let envelope = crate::atomic_apply::execute_atomic_ops_file(
+            ops,
+            atomic_cfg(&db_path),
+            &khive_cfg,
+            khive_types::pack::ATOMIC_MAX_OPS_DEFAULT,
+        )
+        .await
+        .expect("atomic run must succeed");
+
+        assert_eq!(
+            envelope["atomic"]["committed"], true,
+            "envelope: {envelope}"
+        );
+
+        let linked_id = envelope["results"][0]["result"]["id"]
+            .as_str()
+            .expect("link result id")
+            .to_string();
+        let rendered_update_id = envelope["results"][1]["result"]["id"]
+            .as_str()
+            .expect("update result id")
+            .to_string();
+        assert_ne!(
+            rendered_update_id, x_id,
+            "the update's rendered result must NOT be X's stale requested id: {envelope}"
+        );
+        assert_eq!(
+            rendered_update_id, linked_id,
+            "the update's rendered result must be the surviving (just-linked) row: {envelope}"
+        );
+        assert_eq!(
+            envelope["results"][1]["result"]["weight"], 0.9,
+            "the surviving row must carry the update's patch: {envelope}"
+        );
+
+        let server = isolated_server(&db_path);
+        let surviving_resp = dispatch_json(&server, &format!(r#"get(id="{linked_id}")"#)).await;
+        assert_eq!(
+            surviving_resp["results"][0]["result"]["weight"], 0.9,
+            "the committed row itself must carry the patch: {surviving_resp}"
+        );
+    }
+
     /// Acceptance test 2: every CLI-boundary rejection fires BEFORE any
     /// write — each sub-case asserts both the error and that the db stays
     /// empty (zero entities created).

@@ -151,12 +151,32 @@ pub enum PostCommitEffect {
     },
 }
 
+/// The natural key a committed symmetric edge update's surviving row must
+/// be looked up by (ADR-099 B3 r9, codex r8 Blocker finding 1, second
+/// half). `khive-db`'s `edge_symmetric_refresh_or_update_inplace_statement`
+/// pair never trusts a prepare-time-computed target id (see that builder's
+/// doc comment); a caller rendering this op's result derives the actual
+/// surviving id by querying `graph_edges`'s own
+/// `UNIQUE(namespace, source_id, target_id, relation)` constraint (e.g. via
+/// `KhiveRuntime::list_edges` filtered on these fields — the same mechanism
+/// the atomic `link` op's own result rendering already uses), strictly
+/// after commit.
+#[derive(Debug, Clone)]
+pub struct EdgeNaturalKey {
+    pub namespace: String,
+    pub canon_source_id: Uuid,
+    pub canon_target_id: Uuid,
+    pub relation: khive_storage::EdgeRelation,
+}
+
 /// Write plan for an `update` op (entity or note shape — ADR-099 D3's
 /// `update` caveat covers both substrates the same way: row/FTS DML in the
 /// plan, any reindex deferred to `post_commit`).
 #[derive(Debug, Clone)]
 pub struct UpdatePlan {
-    /// The id of the entity or note being updated.
+    /// The id of the entity or note being updated. For a symmetric edge
+    /// update this is the CALLER's requested id — advisory only, never the
+    /// basis for post-commit result rendering (see [`EdgeNaturalKey`]).
     pub target_id: Uuid,
     /// Row + FTS DML statements to apply inside the atomic unit, in order.
     /// The row-update statement carries the existence guard; any FTS-mirror
@@ -165,6 +185,12 @@ pub struct UpdatePlan {
     pub statements: Vec<PlanStatement>,
     /// Deferred reindex, if the update changed name/description/content.
     pub post_commit: PostCommitEffect,
+    /// `Some` only for a symmetric edge update — the natural key a caller
+    /// must use to derive the committed surviving row post-commit, rather
+    /// than trusting `target_id`. `None` for every other update shape
+    /// (entity, note, non-symmetric edge), where `target_id` alone is
+    /// already an exact, non-advisory identifier.
+    pub edge_natural_key: Option<EdgeNaturalKey>,
 }
 
 /// Write plan for a `delete` op (soft or hard).
@@ -327,6 +353,7 @@ mod tests {
                 unguarded("update-fts-mirror"),
             ],
             post_commit: PostCommitEffect::ReindexEntity { entity_id: id },
+            edge_natural_key: None,
         };
         assert_eq!(plan.target_id, id);
         assert_eq!(plan.statements[0].guard, Some(AffectedRowGuard::exactly(1)));

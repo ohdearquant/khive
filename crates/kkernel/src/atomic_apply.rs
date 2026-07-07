@@ -618,6 +618,39 @@ async fn build_op_result(
         // Canonical shape: `normalize_entity_timestamps(to_json(&updated))`
         // (update.rs:209-211 entity, :242-244 note) — the full updated
         // entity/note row with ISO-8601 timestamps.
+        // ADR-099 B3 r9 (codex r8 Blocker finding 1, second half): a
+        // symmetric edge update carries `edge_natural_key` and MUST be
+        // rendered from a fresh post-commit natural-key lookup, never from
+        // `p.target_id` — that field is prepare-time-only (the caller's
+        // requested id), and the SAME staleness that made the write path
+        // unsafe to branch on at prepare time makes it unsafe to render
+        // from too. This mirrors the `link` arm below exactly (same
+        // reasoning, same `list_edges` mechanism).
+        ("update", AtomicOpPlan::Update(p)) if p.edge_natural_key.is_some() => {
+            let key = p.edge_natural_key.as_ref().expect("checked by guard above");
+            let edges = runtime
+                .list_edges(
+                    token,
+                    EdgeListFilter {
+                        source_id: Some(key.canon_source_id),
+                        target_id: Some(key.canon_target_id),
+                        relations: vec![key.relation],
+                        ..Default::default()
+                    },
+                    1,
+                )
+                .await?;
+            let edge = edges.into_iter().next().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "atomic update result: committed symmetric edge not found by natural key \
+                     ({}, {}, {})",
+                    key.canon_source_id,
+                    key.canon_target_id,
+                    key.relation
+                )
+            })?;
+            Ok(serde_json::to_value(&edge)?)
+        }
         ("update", AtomicOpPlan::Update(p)) => match runtime
             .resolve_by_id(token, p.target_id)
             .await?
@@ -630,15 +663,15 @@ async fn build_op_result(
             Some(Resolved::Note(note)) => Ok(khive_pack_kg::handlers::normalize_entity_timestamps(
                 serde_json::to_value(&note)?,
             )),
-            // ADR-099 B3 r6: `Resolved` has no `Edge` variant, so an edge
-            // update's `p.target_id` (the SURVIVING edge id — see
-            // `prepare_update_edge`'s symmetric-conflict-absorption branch,
-            // which may differ from the caller's original `id`) falls
-            // through here. Canonical shape: `to_json(&edge)` with no
-            // `normalize_entity_timestamps` wrapper (update.rs:220 —
-            // entity/note timestamps are ISO-8601 strings needing
-            // normalization; `Edge`'s `created_at`/`updated_at` already
-            // serialize as RFC3339 via its own `Serialize` impl).
+            // ADR-099 B3 r6: `Resolved` has no `Edge` variant, so a
+            // non-symmetric edge update's `p.target_id` (unambiguous — see
+            // `prepare_update_edge`'s non-symmetric branch, which never
+            // changes the edge's own id) falls through here. Canonical
+            // shape: `to_json(&edge)` with no `normalize_entity_timestamps`
+            // wrapper (update.rs:220 — entity/note timestamps are ISO-8601
+            // strings needing normalization; `Edge`'s `created_at`/
+            // `updated_at` already serialize as RFC3339 via its own
+            // `Serialize` impl).
             None => {
                 let edge = runtime.get_edge(token, p.target_id).await?.ok_or_else(|| {
                     anyhow::anyhow!(
