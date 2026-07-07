@@ -1115,4 +1115,159 @@ mod tests {
             "error must name the canonical anchor path: {msg}"
         );
     }
+
+    // --- #674: coordinator link-target resolution parity with `get` ---
+
+    /// Regression for #674: a full-UUID `link(..., relation="annotates")` whose
+    /// target is an edge-substrate UUID must succeed on the coordinator-attached
+    /// multi-backend boot path, exactly like `get(<edge_uuid>)` does.
+    ///
+    /// Reproduces the production topology from the issue: two backends (`main`
+    /// plus `sessions`), with the `session` pack bound to `sessions` while `kg`
+    /// falls back to `main`. That pack-to-backend split is what engages the
+    /// `SubstrateCoordinator` for `kg` verbs (`build_multi_backend_server_with_coordinator`,
+    /// not the coordinator-less `khive_mcp::serve::build_server_multi_backend`) —
+    /// a single-backend or unsplit config does not reproduce the bug.
+    ///
+    /// Before the fix, the coordinator's node locator only probed entity and
+    /// note substrates, so `link(note, <edge_uuid>, annotates)` failed with
+    /// "node <uuid> not found on any backend" even though `get(<edge_uuid>)`
+    /// resolved the same UUID.
+    #[tokio::test]
+    async fn coordinator_link_annotates_resolves_edge_target_like_get() {
+        use khive_mcp::tools::request::RequestParams;
+        use khive_runtime::PackConfig;
+
+        let khive_cfg = KhiveConfig {
+            backends: vec![
+                khive_runtime::BackendConfig {
+                    name: "main".to_string(),
+                    kind: khive_runtime::BackendKind::Memory,
+                    path: None,
+                    cache_mb: None,
+                    journal_mode: None,
+                    read_only: false,
+                },
+                khive_runtime::BackendConfig {
+                    name: "sessions".to_string(),
+                    kind: khive_runtime::BackendKind::Memory,
+                    path: None,
+                    cache_mb: None,
+                    journal_mode: None,
+                    read_only: false,
+                },
+            ],
+            packs: {
+                let mut m = std::collections::HashMap::new();
+                m.insert(
+                    "session".to_string(),
+                    PackConfig {
+                        backend: "sessions".to_string(),
+                    },
+                );
+                m
+            },
+            ..KhiveConfig::default()
+        };
+
+        let base_cfg = RuntimeConfig {
+            packs: vec!["kg".to_string(), "session".to_string()],
+            ..base_multi_backend_runtime_config()
+        };
+
+        let server = build_multi_backend_server_with_coordinator(base_cfg, &khive_cfg, None)
+            .expect("coordinator-attached multi-backend boot must succeed");
+
+        let dispatch = |ops: String| {
+            let server = &server;
+            async move {
+                // "verbose" presentation: the bug is specifically about
+                // full-UUID `link` endpoints (issue #674) — the default
+                // "agent" presentation truncates ids, which would silently
+                // route around the coordinator's full-UUID-only interception.
+                let resp = server
+                    .dispatch_request_local(RequestParams {
+                        ops,
+                        presentation: Some("verbose".to_string()),
+                        presentation_per_op: None,
+                        save_to: None,
+                        format: None,
+                        format_per_op: None,
+                    })
+                    .await
+                    .expect("dispatch must not error");
+                serde_json::from_str::<serde_json::Value>(&resp).expect("valid JSON")
+            }
+        };
+
+        // Two concepts + a link between them to create an edge.
+        let a = dispatch(r#"create(kind="concept", name="edge-endpoint-a")"#.to_string()).await;
+        let a_id = a["results"][0]["result"]["id"]
+            .as_str()
+            .expect("create must return an id")
+            .to_string();
+        let b = dispatch(r#"create(kind="concept", name="edge-endpoint-b")"#.to_string()).await;
+        let b_id = b["results"][0]["result"]["id"]
+            .as_str()
+            .expect("create must return an id")
+            .to_string();
+        let edge_resp = dispatch(format!(
+            r#"link(source_id="{a_id}", target_id="{b_id}", relation="extends")"#
+        ))
+        .await;
+        assert_eq!(
+            edge_resp["results"][0]["ok"].as_bool(),
+            Some(true),
+            "seed edge creation must succeed: {edge_resp}"
+        );
+        let edge_id = edge_resp["results"][0]["result"]["id"]
+            .as_str()
+            .expect("link must return an edge id")
+            .to_string();
+
+        // A note to use as the annotates source.
+        let note_resp =
+            dispatch(r#"create(kind="observation", content="annotates source")"#.to_string()).await;
+        let note_id = note_resp["results"][0]["result"]["id"]
+            .as_str()
+            .expect("create must return an id")
+            .to_string();
+
+        // Parity check #1: `get` resolves the edge-substrate UUID.
+        let got_edge = dispatch(format!(r#"get(id="{edge_id}")"#)).await;
+        assert_eq!(
+            got_edge["results"][0]["ok"].as_bool(),
+            Some(true),
+            "get(<edge_uuid>) must succeed: {got_edge}"
+        );
+        assert_eq!(
+            got_edge["results"][0]["result"]["kind"].as_str(),
+            Some("edge"),
+            "get must resolve the UUID as an edge: {got_edge}"
+        );
+
+        // Parity check #2 (the regression): note -> edge `annotates` link
+        // through the coordinator-attached multi-backend path must succeed
+        // too, resolving the exact same UUID `get` just resolved above.
+        let annotate_resp = dispatch(format!(
+            r#"link(source_id="{note_id}", target_id="{edge_id}", relation="annotates")"#
+        ))
+        .await;
+        assert_eq!(
+            annotate_resp["results"][0]["ok"].as_bool(),
+            Some(true),
+            "note->edge annotates link must succeed, proving get/link resolution parity \
+             for an edge-substrate UUID under multi-backend pack bindings: {annotate_resp}"
+        );
+
+        // Parity assertion: the `annotates` link's written target_id is
+        // exactly the same UUID `get` resolved as kind=edge above — `get`
+        // and `link` endpoint resolution agree for an edge-substrate UUID.
+        assert_eq!(
+            annotate_resp["results"][0]["result"]["target_id"].as_str(),
+            got_edge["results"][0]["result"]["id"].as_str(),
+            "link's resolved annotates target must be the exact same edge UUID get() resolved: \
+             annotate_resp={annotate_resp} got_edge={got_edge}"
+        );
+    }
 }
