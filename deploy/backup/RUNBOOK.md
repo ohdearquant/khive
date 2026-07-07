@@ -264,6 +264,14 @@ silently treating that as "nothing to compare".
   ran with `kkernel` unavailable is **not** a complete acceptance run per
   the ADR — re-run it where `kkernel` is reachable (the actual recovery
   host is the right place) before treating the backup as drill-verified.
+- **Steps 5-6 run `kkernel` under an isolated `HOME` inside the scratch
+  dir.** This is a safety property, not just a compatibility fix: config
+  discovery finds nothing under the isolated `HOME`, so the `KHIVE_DB`
+  override is accepted even on hosts whose real config declares
+  `[[backends]]` (which otherwise refuses the override), and the drill is
+  hermetic by construction — the drill runtime provably cannot discover or
+  touch the host's real stores. Every verb it serves comes from the
+  restored copy and nothing else.
 - A failed comparison prints the manifest diff and fails loudly — that is a
   defect in the backup or restore path, not "just a delta since the
   marker", because the manifest and the marker were captured atomically at
@@ -272,8 +280,9 @@ silently treating that as "nothing to compare".
 - **Cleanup on exit**: when `validate` is run with no explicit
   `scratch-dir` argument (the normal case), it removes its own scratch dir
   on both success and failure — the restored database copy is multi-GB and
-  disposable. On failure, the small evidence (`manifest.diff` and the
-  restored copy's manifest) is copied first to
+  disposable. On failure, the small evidence (`manifest.diff`, the restored
+  copy's manifest, and the `step5-*.json` / `step6-*.json` runtime-boot
+  outputs) is copied first to
   `~/.khive/backups/drill/failed-<store>-<UTC stamp>/` before the scratch
   dir is removed, so the failure is diagnosable without keeping the full
   restored copy around. Passing an explicit `scratch-dir` argument opts out
