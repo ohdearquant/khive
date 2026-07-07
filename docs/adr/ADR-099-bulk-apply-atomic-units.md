@@ -589,3 +589,55 @@ Schema is unchanged; no migration file is required. Pack rules gain only additiv
 - ADR-016 — Request DSL and the `results`/`summary` response contract this ADR preserves and
   extends on the CLI atomic path.
 - Issue #195 — true cross-op atomicity for `exec --ops-file` bulk apply.
+
+---
+
+## Amendment 1 (2026-07-07)
+
+The B3 implementation (`--atomic` CLI surface) initially re-implemented per-verb prepare
+logic in `khive-runtime/src/atomic_prepare.rs`. Successive review rounds surfaced twenty
+behavioral-parity gaps between that re-implementation and the canonical verb handlers,
+confirming the risk this ADR's handler-logic-duplication section anticipated. The
+implementation was restructured to the seam this ADR mandates:
+
+1. **Single-sourced decide steps.** Each admissible verb's validation, identifier
+   resolution, idempotence checks, and statement generation live in one place, called by
+   both the canonical handler and the atomic path:
+   - `update` / `delete` (entity, note, and edge substrates): decide-step functions in
+     `khive-runtime`, over shared `SqlStatement` builders in `khive-db`'s stores.
+   - `link`: `merge_entry_metadata` relocated to `khive-runtime` and shared.
+   - `gtd.transition` / `gtd.complete`: `prepare_transition` / `prepare_complete` in
+     `khive-pack-gtd::handlers`, returning typed decisions applied by both paths through
+     `gtd_transition_statement`.
+   - Event appends: both paths emit through `khive-db`'s `event_insert_statements` — one
+     event implementation.
+
+2. **Seam invariant.** Prepare functions are async and read-only; the atomic unit applies
+   plans in a suspend-free synchronous closure (the `block_on_sync` contract), preserving
+   the single-writer discipline. Canonical handlers call their own prepare and apply
+   immediately in their own transaction — canonical behavior is unchanged and canonical
+   handler tests are the control group for any future change to a prepare function.
+
+3. **Commit-time conflict resolution for symmetric edge updates.** The atomic path does
+   not probe for natural-key conflicts at prepare time (a prepare-time probe is stale by
+   commit time under concurrent same-unit ops). Instead it always emits two statements:
+   a delete-if-conflict statement, then a refresh/update statement whose arms are gated
+   on SQLite `changes()` from the preceding delete. Affected-row guards make the target
+   edge's commit-time existence provable: conflict absorption requires the requested-row
+   delete to affect exactly one row; the no-conflict in-place update requires the
+   requested id to affect exactly one row. Post-commit result rendering derives the
+   surviving edge id by a fresh natural-key lookup rather than trusting any prepare-time
+   advisory value.
+
+4. **One conflict-arm generation root.** The edge natural-key conflict-arm SQL is
+   produced by a single shared builder consumed by the singleton upsert, the atomic
+   guarded insert, and the batch upsert path. An exhaustive workspace enumeration of
+   every hand-written edge-conflict SQL site was recorded in PR #683; the two
+   remaining hand-copied sites (entity-merge and note-merge curation SQL) are documented
+   residuals tracked by issue #690 rather than blockers, per the review-round
+   closure policy adopted for this slice.
+
+5. **Superseded deferrals.** The two documented divergences accepted during earlier
+   review rounds (kind-vs-substrate NotFound shape on `update`; the `link`
+   target-backend conflict arm) are obsolete: both paths now execute the same code, so
+   the divergences no longer exist and no compensating documentation is required.
