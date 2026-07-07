@@ -261,19 +261,23 @@ cmd_capture_replica() {
 
 # EXIT-trap cleanup for a scratch dir this script created itself (see
 # cmd_validate's own_scratch guard — never called against a caller-supplied
-# scratch-dir). On failure (rc != 0), the small evidence files (the manifest
-# diff and the restored copy's manifest, both plain text, never the
-# multi-GB restored database) are copied out to a dated failed-<store>-*
-# dir under KHIVE_BACKUP_ROOT/drill before the scratch dir is removed —
-# "fail loud" and "clean up" both hold. On success, the scratch dir
-# (including the restored database copy) is removed outright.
+# scratch-dir). On failure (rc != 0), ALL small evidence files (the manifest
+# diff, the restored copy's manifest, and the step 5/6 runtime-boot outputs —
+# plain text/JSON, never the multi-GB restored database) are copied out to a
+# dated failed-<store>-* dir under KHIVE_BACKUP_ROOT/drill before the scratch
+# dir is removed — "fail loud" and "clean up" both hold. The step that failed
+# is the one whose evidence matters, so the step5-*/step6-* outputs must
+# survive the scratch removal. On success, the scratch dir (including the
+# restored database copy) is removed outright.
 validate_cleanup_scratch() {
-  local rc="$1" store="$2" scratch_dir="$3" fail_dir
+  local rc="$1" store="$2" scratch_dir="$3" fail_dir f
   if [ "${rc}" -ne 0 ]; then
     fail_dir="${KHIVE_BACKUP_ROOT}/drill/failed-${store}-$(date -u +%Y%m%d-%H%M%S)"
     mkdir -p "${fail_dir}"
-    [ -f "${scratch_dir}/manifest.diff" ] && cp "${scratch_dir}/manifest.diff" "${fail_dir}/manifest.diff"
-    [ -f "${scratch_dir}/manifest-restored.txt" ] && cp "${scratch_dir}/manifest-restored.txt" "${fail_dir}/manifest-restored.txt"
+    for f in "${scratch_dir}/manifest.diff" "${scratch_dir}/manifest-restored.txt" \
+      "${scratch_dir}"/step5-*.json "${scratch_dir}"/step6-*.json; do
+      [ -f "${f}" ] && cp "${f}" "${fail_dir}/$(basename "${f}")"
+    done
     blog "validate FAILED — evidence preserved at ${fail_dir}; removing scratch dir ${scratch_dir}"
   fi
   rm -rf "${scratch_dir}"
@@ -344,11 +348,19 @@ cmd_validate() {
   blog "manifest comparison: exact match"
 
   blog "step 5: booting a runtime against the restored copy and serving live verbs"
+  # kkernel refuses the KHIVE_DB override when the host config declares
+  # [[backends]] ("cannot be combined with [[backends]]: N backend(s) are
+  # already declared in khive.toml" — an ambiguity guard, observed live).
+  # Run every kkernel invocation under an isolated HOME inside the scratch
+  # dir: config discovery finds nothing, KHIVE_DB is accepted, and the drill
+  # runtime provably cannot discover (or touch) the host's real stores.
+  local drill_home="${scratch_dir}/kkernel-home"
+  mkdir -p "${drill_home}"
   local step5_status="skipped (kkernel not on PATH)"
   if command -v kkernel >/dev/null 2>&1; then
-    if KHIVE_DB="${restored_db}" kkernel exec 'stats()' >"${scratch_dir}/step5-stats.json" 2>&1 \
-      && KHIVE_DB="${restored_db}" kkernel exec 'search(kind="entity", query="restore drill", limit=1)' >"${scratch_dir}/step5-search.json" 2>&1 \
-      && KHIVE_DB="${restored_db}" kkernel exec 'memory.recall(query="restore drill", limit=1)' >"${scratch_dir}/step5-recall.json" 2>&1; then
+    if HOME="${drill_home}" KHIVE_DB="${restored_db}" kkernel exec 'stats()' >"${scratch_dir}/step5-stats.json" 2>&1 \
+      && HOME="${drill_home}" KHIVE_DB="${restored_db}" kkernel exec 'search(kind="entity", query="restore drill", limit=1)' >"${scratch_dir}/step5-search.json" 2>&1 \
+      && HOME="${drill_home}" KHIVE_DB="${restored_db}" kkernel exec 'memory.recall(query="restore drill", limit=1)' >"${scratch_dir}/step5-recall.json" 2>&1; then
       step5_status="ok"
     else
       step5_status="FAILED"
@@ -362,8 +374,8 @@ cmd_validate() {
   blog "step 6: rebuilding the ANN index from the restored database and serving one vector query"
   local step6_status="skipped (kkernel not on PATH)"
   if command -v kkernel >/dev/null 2>&1; then
-    if KHIVE_DB="${restored_db}" kkernel reindex >"${scratch_dir}/step6-reindex.json" 2>&1 \
-      && KHIVE_DB="${restored_db}" kkernel exec 'memory.recall(query="restore drill vector query", limit=1)' >"${scratch_dir}/step6-vector.json" 2>&1; then
+    if HOME="${drill_home}" KHIVE_DB="${restored_db}" kkernel reindex >"${scratch_dir}/step6-reindex.json" 2>&1 \
+      && HOME="${drill_home}" KHIVE_DB="${restored_db}" kkernel exec 'memory.recall(query="restore drill vector query", limit=1)' >"${scratch_dir}/step6-vector.json" 2>&1; then
       step6_status="ok"
     else
       step6_status="FAILED"
