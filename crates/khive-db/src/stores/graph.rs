@@ -104,7 +104,7 @@ pub fn edge_upsert_statement(edge: &Edge) -> SqlStatement {
 
 /// The atomic `link` op's variant of [`edge_upsert_statement`] (ADR-099 B3
 /// r7, codex r7 High finding 2). Shares the SAME
-/// [`EDGE_NATURAL_KEY_CONFLICT_SET`] conflict-arm text — the two builders
+/// `EDGE_NATURAL_KEY_CONFLICT_SET` conflict-arm text — the two builders
 /// cannot diverge on write behavior — but wraps the `INSERT` in a guarded
 /// `SELECT ... WHERE EXISTS(...)` that re-probes both endpoints for
 /// existence INSIDE the transaction, at commit time, rather than trusting
