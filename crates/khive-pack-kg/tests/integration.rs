@@ -9732,3 +9732,246 @@ async fn link_depends_on_project_to_project_cross_namespace_infers_dependency_ki
         "cross-namespace depends_on must still infer dependency_kind=build (#638 round 1 finding 2); got edge: {edge:?}"
     );
 }
+
+// ── ADR-086: document entity_type governed vocabulary ───────────────────────
+//
+// entity_type ∈ {spec, note, summary, handoff, report, reference, adr,
+// transcript, other} is OPTIONAL on `document` entities, but when present
+// must be one of the governed set (EntityTypeRegistry, ADR-086 §3). These
+// tests exercise that through the real `create`/`search`/`list` dispatch
+// path, not just the registry's own unit tests.
+
+/// Every ADR-086 governed value must be accepted on `document` create.
+#[tokio::test]
+async fn document_create_accepts_each_adr086_governed_entity_type() {
+    let f = pack();
+    for entity_type in [
+        "spec",
+        "note",
+        "summary",
+        "handoff",
+        "report",
+        "reference",
+        "adr",
+        "transcript",
+        "other",
+    ] {
+        let result = f
+            .dispatch(
+                "create",
+                json!({
+                    "kind": "entity",
+                    "entity_kind": "document",
+                    "entity_type": entity_type,
+                    "name": format!("Adr086Doc-{entity_type}"),
+                    "description": "governed vocabulary body",
+                }),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("entity_type {entity_type:?} must be accepted: {e:?}"));
+        assert_eq!(
+            result.get("kind").and_then(Value::as_str),
+            Some("document"),
+            "created entity must be kind=document; got {result}"
+        );
+        assert!(
+            result.get("entity_type").and_then(Value::as_str).is_some(),
+            "created document must carry a resolved entity_type; got {result}"
+        );
+    }
+}
+
+/// An entity_type outside the ADR-086 governed set is rejected fail-closed,
+/// with the valid values listed in the error (matches other kind-validation
+/// error shapes in this pack).
+#[tokio::test]
+async fn document_create_rejects_ungoverned_entity_type_with_valid_list() {
+    let f = pack();
+    let err = f
+        .dispatch(
+            "create",
+            json!({
+                "kind": "entity",
+                "entity_kind": "document",
+                "entity_type": "screenplay",
+                "name": "Adr086RejectedDoc",
+            }),
+        )
+        .await
+        .expect_err("ungoverned document entity_type must be rejected");
+    assert!(
+        is_invalid_input(&err),
+        "expected InvalidInput, got: {err:?}"
+    );
+    let msg = invalid_input_message(&err);
+    assert!(
+        msg.contains("screenplay"),
+        "error must echo the rejected value; got: {msg}"
+    );
+    for expected in [
+        "note",
+        "summary",
+        "handoff",
+        "reference",
+        "adr",
+        "transcript",
+        "other",
+    ] {
+        assert!(
+            msg.contains(expected),
+            "error must list ADR-086 governed values, missing {expected:?}; got: {msg}"
+        );
+    }
+}
+
+/// entity_type is optional on `document` — omitting it must still succeed
+/// (ADR-086 §3: "entity may omit entity_type").
+#[tokio::test]
+async fn document_create_omitted_entity_type_accepted() {
+    let f = pack();
+    let result = f
+        .dispatch(
+            "create",
+            json!({
+                "kind": "entity",
+                "entity_kind": "document",
+                "name": "Adr086NoTypeDoc",
+                "description": "no entity_type supplied",
+            }),
+        )
+        .await
+        .expect("document create without entity_type must succeed");
+    assert_eq!(
+        result.get("kind").and_then(Value::as_str),
+        Some("document"),
+        "got {result}"
+    );
+    assert!(
+        result.get("entity_type").and_then(Value::as_str).is_none()
+            || result.get("entity_type") == Some(&Value::Null),
+        "entity_type must be absent/null when omitted at create; got {result}"
+    );
+}
+
+/// `search(kind="entity", entity_kind="document", entity_type=...)` scopes
+/// results to that governed subtype — the existing entity_type filter path
+/// (already wired for `search`, verified here rather than re-invented).
+#[tokio::test]
+async fn document_search_filters_by_adr086_entity_type() {
+    let f = pack();
+    f.dispatch(
+        "create",
+        json!({
+            "kind": "entity",
+            "entity_kind": "document",
+            "entity_type": "handoff",
+            "name": "Adr086SearchHandoff",
+            "description": "unique_marker_adr086_handoff",
+        }),
+    )
+    .await
+    .expect("create handoff document");
+    f.dispatch(
+        "create",
+        json!({
+            "kind": "entity",
+            "entity_kind": "document",
+            "entity_type": "reference",
+            "name": "Adr086SearchReference",
+            "description": "unique_marker_adr086_reference",
+        }),
+    )
+    .await
+    .expect("create reference document");
+
+    let resp = f
+        .dispatch(
+            "search",
+            json!({
+                "kind": "entity",
+                "entity_kind": "document",
+                "entity_type": "handoff",
+                "query": "Adr086Search",
+            }),
+        )
+        .await
+        .expect("filtered document search must succeed");
+    let arr = resp.as_array().expect("search must return an array");
+    assert!(
+        !arr.is_empty(),
+        "entity_type=handoff filter must return the handoff document; got empty result"
+    );
+    // Search hits do not carry an `entity_type` field (only entity_kind, id,
+    // score, snippet, title) — the filter narrows which entities are
+    // eligible to match, so assert on identity (title) instead.
+    assert!(
+        arr.iter()
+            .any(|hit| hit.get("title").and_then(Value::as_str) == Some("Adr086SearchHandoff")),
+        "entity_type=handoff filter must return the handoff document by title; got {arr:?}"
+    );
+    assert!(
+        arr.iter()
+            .all(|hit| hit.get("title").and_then(Value::as_str) != Some("Adr086SearchReference")),
+        "the reference document must not appear under an entity_type=handoff filter; got {arr:?}"
+    );
+}
+
+/// `list(kind="entity", entity_kind="document", entity_type=...)` scopes
+/// results the same way as `search` — verified against the existing
+/// `list` entity_type filter path (list.rs), not a new filter surface.
+#[tokio::test]
+async fn document_list_filters_by_adr086_entity_type() {
+    let f = pack();
+    f.dispatch(
+        "create",
+        json!({
+            "kind": "entity",
+            "entity_kind": "document",
+            "entity_type": "transcript",
+            "name": "Adr086ListTranscript",
+        }),
+    )
+    .await
+    .expect("create transcript document");
+    f.dispatch(
+        "create",
+        json!({
+            "kind": "entity",
+            "entity_kind": "document",
+            "entity_type": "summary",
+            "name": "Adr086ListSummary",
+        }),
+    )
+    .await
+    .expect("create summary document");
+
+    let listed = f
+        .dispatch(
+            "list",
+            json!({
+                "kind": "entity",
+                "entity_kind": "document",
+                "entity_type": "transcript",
+            }),
+        )
+        .await
+        .expect("filtered document list must succeed");
+    // list returns a JSON array directly (Vec<Entity> serialized) — not an
+    // object with an "items" key (see dispatch.rs's kg_oss_default_namespace
+    // test for the same documented shape).
+    let items = match listed {
+        Value::Array(arr) => arr,
+        other => panic!("list must return a JSON array; got: {other:?}"),
+    };
+    assert!(
+        !items.is_empty(),
+        "entity_type=transcript filter must return the transcript document; got {items:?}"
+    );
+    for item in &items {
+        assert_eq!(
+            item.get("entity_type").and_then(Value::as_str),
+            Some("transcript"),
+            "every listed item must carry entity_type=transcript; got {item}"
+        );
+    }
+}

@@ -86,6 +86,44 @@ static BUILTIN_DEFS: &[EntityTypeDef] = &[
         type_name: "thesis",
         aliases: &[],
     },
+    // ── Document (ADR-086 workspace-convention governed vocabulary) ───────────
+    // `spec` already resolves via the "specification" alias above; `report` is
+    // already a canonical Document subtype above — neither is re-declared here.
+    EntityTypeDef {
+        kind: EntityKind::Document,
+        type_name: "note",
+        aliases: &[],
+    },
+    EntityTypeDef {
+        kind: EntityKind::Document,
+        type_name: "summary",
+        aliases: &[],
+    },
+    EntityTypeDef {
+        kind: EntityKind::Document,
+        type_name: "handoff",
+        aliases: &[],
+    },
+    EntityTypeDef {
+        kind: EntityKind::Document,
+        type_name: "reference",
+        aliases: &[],
+    },
+    EntityTypeDef {
+        kind: EntityKind::Document,
+        type_name: "adr",
+        aliases: &[],
+    },
+    EntityTypeDef {
+        kind: EntityKind::Document,
+        type_name: "transcript",
+        aliases: &[],
+    },
+    EntityTypeDef {
+        kind: EntityKind::Document,
+        type_name: "other",
+        aliases: &[],
+    },
     // ── Concept ─────────────────────────────────────────────────────────────
     EntityTypeDef {
         kind: EntityKind::Concept,
@@ -537,6 +575,82 @@ mod tests {
             .resolve(EntityKind::Document, Some("spec"))
             .expect("spec is alias for specification");
         assert_eq!(res.entity_type.as_deref(), Some("specification"));
+    }
+
+    // ── ADR-086: document governed vocabulary ────────────────────────────────
+    // entity_type ∈ {spec, note, summary, handoff, report, reference, adr,
+    // transcript, other}. `spec` resolves via the existing "specification"
+    // alias and `report` was already a canonical Document subtype; both are
+    // covered by this loop without new registry entries.
+
+    #[test]
+    fn resolve_all_adr086_document_governed_types() {
+        let r = reg();
+        for raw in [
+            "spec",
+            "note",
+            "summary",
+            "handoff",
+            "report",
+            "reference",
+            "adr",
+            "transcript",
+            "other",
+        ] {
+            let res = r
+                .resolve(EntityKind::Document, Some(raw))
+                .unwrap_or_else(|e| panic!("{raw:?} must be a valid Document entity_type: {e}"));
+            assert!(
+                res.entity_type.is_some(),
+                "{raw:?} must resolve to a canonical entity_type"
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_adr086_new_document_types_are_canonical() {
+        let r = reg();
+        for raw in [
+            "note",
+            "summary",
+            "handoff",
+            "reference",
+            "adr",
+            "transcript",
+            "other",
+        ] {
+            let res = r
+                .resolve(EntityKind::Document, Some(raw))
+                .unwrap_or_else(|e| panic!("{raw:?} must be a valid Document entity_type: {e}"));
+            assert_eq!(
+                res.entity_type.as_deref(),
+                Some(raw),
+                "{raw:?} must be stored as its own canonical name, not aliased away"
+            );
+        }
+    }
+
+    #[test]
+    fn reject_unknown_document_entity_type_lists_adr086_values() {
+        let r = reg();
+        let err = r
+            .resolve(EntityKind::Document, Some("not_a_real_doc_type"))
+            .expect_err("unregistered document entity_type must be rejected");
+        let msg = format!("{err}");
+        for expected in [
+            "note",
+            "summary",
+            "handoff",
+            "reference",
+            "adr",
+            "transcript",
+            "other",
+        ] {
+            assert!(
+                msg.contains(expected),
+                "error must list ADR-086 valid types, missing {expected:?}; got: {msg}"
+            );
+        }
     }
 
     // ── Rejection tests ──────────────────────────────────────────────────────
