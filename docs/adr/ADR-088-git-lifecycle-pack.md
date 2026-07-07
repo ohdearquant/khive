@@ -247,9 +247,9 @@ Decision text.
    code-review pack) can reuse this table for its own cursor rows without a schema
    migration.
 
-4. **GitHub API access path (Open Question 3).** The ingester shells the `gh` CLI (already
-   the fleet-standard GitHub client) rather than an installed GitHub App or direct REST
-   calls. When `gh` is unavailable, or fails against a given repository (no linked GitHub
+4. **GitHub API access path (Open Question 3).** The ingester shells the configured GitHub
+   CLI (`gh`) rather than an installed GitHub App or direct REST calls. When `gh` is
+   unavailable, or fails against a given repository (no linked GitHub
    remote, no auth), issue and pull-request ingestion are skipped with a warning in the
    ingest report; commit ingestion — which depends only on local `.git` history — proceeds
    regardless. This is a one-shot batch pass per invocation, not a poller.
