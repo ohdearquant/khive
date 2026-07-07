@@ -117,7 +117,7 @@ jobs:
             [prompt-cookbook]="10|Prompt Cookbook|Ready-to-use verb patterns for common agent workflows."
             [tips-and-tricks]="11|Tips and Tricks|Query craft, DSL round-trips, param gotchas, and troubleshooting for the request tool."
             [proof-graph-case-study]="12|Proof Graph Case Study|Mathlib ingested as a 320K-entity, 4.4M-edge khive graph: ingestion path and traversal at scale."
-            [api-reference]="13|API Reference|Full verb catalog for all 8 production packs: params, DSL examples, response envelope."
+            [api-reference]="13|API Reference|Full verb catalog for all 9 production packs: params, DSL examples, response envelope."
           )
 
           cat > "$SRC/index.md" <<'EOF'
@@ -254,7 +254,7 @@ jobs:
             echo
             echo "> A research knowledge graph runtime for AI agents: typed entities, a closed"
             echo "> 17-relation edge ontology, hybrid FTS+vector search, and GQL/SPARQL queries,"
-            echo "> all dispatched through one MCP tool (\`request\`). 73 verbs across 8 packs."
+            echo "> all dispatched through one MCP tool (\`request\`). 74 verbs across 9 packs."
             echo
             echo "## Docs"
             echo
