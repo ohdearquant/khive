@@ -13,10 +13,38 @@ dual-write, actor-addressed delivery.
 | `comm.read`   | Mark an inbound message as read                                    |
 | `comm.reply`  | Reply to a message, preserving thread linkage                      |
 | `comm.thread` | Retrieve all messages in a conversation thread, chronologically    |
+| `comm.probe`  | Read-only poll for new inbound message metadata and a stale unread count |
 
 A sixth handler, `comm.ingest`, is `Visibility::Subhandler` — it lets an
 out-of-band channel adapter (email, Telegram, etc.) write an inbound message
 directly, deduplicated by `external_id`, but it is not callable on the MCP wire.
+
+## `comm.probe` — polling contract
+
+`comm.probe` is a strictly read-only verb built for frequent polling (e.g.
+every 30s by many monitors): it never mutates the `read` flag or writes any
+row. It runs a single indexed query (`INDEXED BY idx_comm_message_to_actor`)
+over inbound messages addressed to the given `actor`.
+
+Args:
+
+- `actor` (required) — actor label whose inbound queue is probed, e.g.
+  `"lambda:leo"`.
+- `since_us` (optional) — cursor in Unix microseconds; only messages with
+  `created_at > since_us` are returned.
+- `stale_minutes` (optional, default 20) — unread age threshold in minutes.
+
+Returns:
+
+- `cursor_us` — max `created_at` (µs) over all inbound messages for the
+  actor, or `0` if none exist.
+- `new_messages` — up to 100 newest matching rows, each `{id, created_at_us,
+  from_actor, subject?}`, ordered ascending (newest-last).
+- `stale_unread_count` — count of inbound unread messages older than
+  `stale_minutes`.
+
+The response shape is frozen: it is a public polling contract and must stay
+minimal and stable.
 
 ## Dual-write delivery
 
