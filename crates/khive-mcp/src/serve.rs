@@ -34,7 +34,25 @@ pub struct MultiBackendRegistry {
 }
 
 /// Build a server from `args`, then serve it over `--daemon` or the named transport.
+///
+/// #667: `build_server` runs migrations and applies pack schema plans (FTS DDL
+/// included) while constructing the runtime. Acquiring the boot/recovery lock
+/// *before* that call and holding it through daemon bind+pid-write (or
+/// dropping it right after construction in non-daemon mode) closes the window
+/// where a second concurrently-booting process could run schema DDL against
+/// the same database file at the same time — see
+/// [`khive_runtime::daemon::run_daemon_with_boot_guard`].
 pub async fn run(args: Args, registry: &TransportRegistry) -> anyhow::Result<()> {
+    // #667: in daemon mode, failing to acquire the boot guard must abort
+    // before `build_server` runs migrations/FTS DDL unguarded — see
+    // `acquire_daemon_boot_guard`. Non-daemon callers keep the best-effort
+    // lock (dropped right after construction below).
+    #[cfg(unix)]
+    let boot_guard = if args.daemon {
+        Some(khive_runtime::daemon::acquire_daemon_boot_guard()?)
+    } else {
+        khive_runtime::daemon::acquire_recovery_lock()
+    };
     let server = build_server(&args)?;
 
     #[cfg(feature = "channel-email")]
@@ -42,9 +60,11 @@ pub async fn run(args: Args, registry: &TransportRegistry) -> anyhow::Result<()>
 
     #[cfg(unix)]
     if args.daemon {
-        khive_runtime::daemon::run_daemon(server).await?;
+        khive_runtime::daemon::run_daemon_with_boot_guard(server, boot_guard).await?;
         return Ok(());
     }
+    #[cfg(unix)]
+    drop(boot_guard);
     #[cfg(not(unix))]
     if args.daemon {
         anyhow::bail!(
@@ -720,19 +740,27 @@ async fn channel_outbox_loop(
 /// coordinator-equipped server and then call this to drive the
 /// daemon/transport dispatch. The `Args` object is still needed for `--daemon`,
 /// `--transport`, and `--bind` flags.
+///
+/// `boot_guard` is the recovery lock the caller acquired *before* building
+/// `server` (#667) — building a multi-backend coordinator server also runs
+/// migrations and applies pack schema plans, so the same
+/// acquire-before-construct/hold-through-bind pattern used in [`run`] applies
+/// here. Pass `None` only if the caller could not acquire the lock.
 pub async fn serve_server(
     server: KhiveMcpServer,
     args: &Args,
     registry: &TransportRegistry,
+    boot_guard: Option<std::fs::File>,
 ) -> anyhow::Result<()> {
     #[cfg(feature = "channel-email")]
     spawn_email_channel_loops_if_daemon(&server, args);
 
     #[cfg(unix)]
     if args.daemon {
-        khive_runtime::daemon::run_daemon(server).await?;
+        khive_runtime::daemon::run_daemon_with_boot_guard(server, boot_guard).await?;
         return Ok(());
     }
+    drop(boot_guard);
     #[cfg(not(unix))]
     if args.daemon {
         anyhow::bail!(
@@ -2555,6 +2583,60 @@ id = "lambda:project-actor"
             first_comm_ok,
             Some(true),
             "comm.send must succeed; response: {comm_resp}"
+        );
+    }
+
+    /// #658 multi-backend regression: `build_registry_for_multi_backend` — the
+    /// production multi-backend wiring path — must also wire the brain
+    /// dispatch hook produced by `PackFactory::create_install`, observing the
+    /// same `BrainPack` instance the registry dispatches `brain.*` verbs to.
+    /// Mirrors `server::tests::brain_dispatch_hook_updates_state_visible_through_same_instance`
+    /// (single-backend path) using this file's multi-backend entry point instead.
+    #[tokio::test]
+    #[serial]
+    async fn multi_backend_brain_dispatch_hook_updates_state_visible_through_same_instance() {
+        let khive_cfg = KhiveConfig {
+            backends: vec![BackendConfig {
+                name: "main".to_string(),
+                kind: BackendKind::Memory,
+                path: None,
+                cache_mb: None,
+                journal_mode: None,
+                read_only: false,
+            }],
+            ..KhiveConfig::default()
+        };
+
+        let mut base_cfg = base_runtime_config_for_multi_backend();
+        base_cfg.packs = vec!["kg".to_string(), "brain".to_string()];
+
+        let multi = build_registry_for_multi_backend(base_cfg, &khive_cfg, None)
+            .expect("multi-backend registry build must succeed");
+
+        multi
+            .registry
+            .dispatch("brain.state", serde_json::Value::Null)
+            .await
+            .expect("brain.state loads the default namespace into the active slot");
+
+        multi
+            .registry
+            .dispatch("stats", serde_json::json!({}))
+            .await
+            .expect("kg.stats dispatch succeeds");
+
+        let state = multi
+            .registry
+            .dispatch("brain.state", serde_json::Value::Null)
+            .await
+            .expect("brain.state dispatch");
+        let total_events = state["balanced_recall"]["total_events"]
+            .as_u64()
+            .unwrap_or(0);
+        assert!(
+            total_events > 0,
+            "multi-backend dispatch hook must update the same BrainPack instance \
+             the registry dispatches brain.* verbs to; got snapshot {state:?}"
         );
     }
 

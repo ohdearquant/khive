@@ -128,6 +128,50 @@ pub fn acquire_recovery_lock() -> Option<std::fs::File> {
     Some(file)
 }
 
+/// Guard returned by [`acquire_daemon_boot_guard`], held across cold-boot
+/// schema initialization (migrations + pack schema plans / FTS DDL) through
+/// daemon bind + pid-write.
+#[cfg(unix)]
+pub type DaemonBootGuard = std::fs::File;
+
+/// Acquire the recovery/boot lock, treating failure as fatal.
+///
+/// #667: unlike [`acquire_recovery_lock`] (best-effort, `None` on failure —
+/// used by shutdown cleanup, where skipping unlink is safer than blocking
+/// forever), daemon-mode boot must hold this lock across migrations/FTS DDL
+/// through bind+pid-write. Silently continuing with no lock reopens the
+/// cold-boot FTS race this guard exists to close, so callers that are about
+/// to run daemon-mode boot (or wait for one to quiesce) must fail loudly
+/// instead of proceeding unguarded.
+#[cfg(unix)]
+pub fn acquire_daemon_boot_guard() -> anyhow::Result<DaemonBootGuard> {
+    acquire_recovery_lock()
+        .ok_or_else(|| anyhow::anyhow!("failed to acquire daemon boot/recovery lock"))
+}
+
+/// Identity of a bound Unix socket path, used to tell "the socket I bound" apart
+/// from "a same-path socket some other daemon bound after mine was removed".
+///
+/// #645: a socket path can be recreated by a different process between the time
+/// this daemon captures its identity and the time it later checks it, so `dev`
+/// and `ino` (not the path) are what must match for cleanup to be safe.
+#[cfg(unix)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct SocketIdentity {
+    dev: u64,
+    ino: u64,
+}
+
+#[cfg(unix)]
+fn socket_identity(path: &std::path::Path) -> Option<SocketIdentity> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = std::fs::metadata(path).ok()?;
+    Some(SocketIdentity {
+        dev: meta.dev(),
+        ino: meta.ino(),
+    })
+}
+
 // ── wire types ────────────────────────────────────────────────────────────────
 
 /// Request frame sent from a client to the daemon.
@@ -684,7 +728,50 @@ async fn handle_conn<D: DaemonDispatch>(mut stream: UnixStream, dispatcher: D) {
 
 /// Run the daemon: bind the socket, warm in the background, serve request
 /// frames until SIGTERM/SIGINT.
+///
+/// Fatally acquires its own startup lock. #667: this only protects
+/// cleanup→bind→pid-write; by the time this function runs, `dispatcher` (a
+/// `DaemonDispatch` built from a `KhiveMcpServer`) has *already* run
+/// migrations and applied pack schema plans while constructing itself,
+/// unguarded. Production boot must go through
+/// [`run_daemon_with_boot_guard`] instead, which extends the same lock back
+/// over that construction step. This entry point remains for callers (and
+/// tests) that build the dispatcher and start serving as one atomic step with
+/// no separate boot-guard window to protect — but it still acquires the boot
+/// guard fatally (never proceeds unguarded), so the cleanup→bind→pid-write
+/// race surface is always mutually excluded.
 pub async fn run_daemon<D: DaemonDispatch>(dispatcher: D) -> anyhow::Result<()> {
+    #[cfg(unix)]
+    let boot_guard = Some(acquire_daemon_boot_guard()?);
+    #[cfg(not(unix))]
+    let boot_guard = None;
+    run_daemon_with_boot_guard(dispatcher, boot_guard).await
+}
+
+/// Run the daemon using a startup lock acquired by the caller *before*
+/// building `dispatcher`.
+///
+/// #667: cold-boot schema initialization (migrations, pack schema plans /
+/// FTS DDL) happens while `dispatcher` is being constructed, i.e. before this
+/// function is ever called. Passing an already-held `boot_guard` in lets the
+/// caller extend that same lock backward over construction, so a second
+/// process racing to boot (e.g. two `kkernel mcp --daemon` spawns before
+/// either has bound its socket, per #645) cannot run migrations/FTS DDL
+/// concurrently against the same database file. On unix every daemon-mode
+/// caller passes `Some` — `run_daemon` and the production entry points
+/// (`serve.rs`, `kkernel`) all acquire the guard fatally via
+/// `acquire_daemon_boot_guard` before constructing `dispatcher`. `boot_guard`
+/// is only `None` on non-unix targets, where there is no advisory boot lock to
+/// hold in the first place.
+///
+/// The guard is held across cleanup → bind → pid-write, exactly as
+/// `run_daemon`'s inline lock used to be, then dropped — see the "Deadlock
+/// note" below for why the caller must not still be holding a *different*
+/// handle to the same lock file at that point.
+pub async fn run_daemon_with_boot_guard<D: DaemonDispatch>(
+    dispatcher: D,
+    boot_guard: Option<std::fs::File>,
+) -> anyhow::Result<()> {
     let sock = socket_path();
     let pid_file = pid_path();
 
@@ -705,9 +792,11 @@ pub async fn run_daemon<D: DaemonDispatch>(dispatcher: D) -> anyhow::Result<()> 
     // Deadlock note: the client holds this lock only during kill+spawn and
     // releases it before the spawned daemon process starts (the lock guard is
     // dropped when kill_and_respawn returns, before the readiness probe loop).
-    // The daemon then acquires the lock here without any client holding it.
-    #[cfg(unix)]
-    let _startup_lock = acquire_recovery_lock();
+    // The daemon holds exactly one handle to this lock for its whole boot
+    // sequence (received as `boot_guard`, extended from before `dispatcher`
+    // was constructed) — never a second, independently-acquired handle in the
+    // same process, which would self-deadlock on `flock`.
+    let _startup_lock = boot_guard;
 
     if !cleanup_stale_daemon(&sock, &pid_file).await {
         tracing::info!("a responsive khived is already running; exiting");
@@ -719,8 +808,41 @@ pub async fn run_daemon<D: DaemonDispatch>(dispatcher: D) -> anyhow::Result<()> 
     if let Err(e) = std::fs::set_permissions(&sock, std::fs::Permissions::from_mode(0o600)) {
         tracing::warn!(error = %e, path = ?sock, "failed to chmod 0600 socket");
     }
+    // #645: captured while still holding the startup lock, immediately after
+    // bind, so shutdown cleanup can later prove "this is still the same socket
+    // I bound" rather than trusting the path alone.
+    #[cfg(unix)]
+    let bound_identity = socket_identity(&sock);
 
-    write_pid_file(&pid_file)?;
+    #[cfg(unix)]
+    if let Err(e) = write_pid_file_exclusive(&pid_file) {
+        if e.kind() == std::io::ErrorKind::AlreadyExists {
+            // #645: a PID file appeared between our own `cleanup_stale_daemon`
+            // removing it and this write — only possible if the boot lock did
+            // not actually exclude a concurrent booter (e.g. `acquire_recovery_lock`
+            // failed for one side). Never touch the winner's files: drop only
+            // the socket entry we ourselves just bound (proven via identity,
+            // not path), then decide by checking whether the PID now on disk
+            // names a live, reachable daemon.
+            if bound_identity.is_some() && socket_identity(&sock) == bound_identity {
+                drop(listener);
+                let _ = std::fs::remove_file(&sock);
+            }
+            if pid_file_names_a_reachable_daemon(&pid_file, &sock).await {
+                tracing::info!(
+                    "a replacement khived already claimed the pid/socket rendezvous; exiting"
+                );
+                return Ok(());
+            }
+            anyhow::bail!(
+                "failed to claim daemon pid file at {pid_file:?}: it already exists \
+                 and does not name a reachable daemon"
+            );
+        }
+        return Err(e.into());
+    }
+    #[cfg(not(unix))]
+    write_pid_file_exclusive(&pid_file)?;
     // Release the startup lock now: the listener is bound and the PID file is
     // written.  Any concurrent client or daemon startup will observe a live
     // socket+pid and take the non-recovery path.
@@ -779,10 +901,69 @@ pub async fn run_daemon<D: DaemonDispatch>(dispatcher: D) -> anyhow::Result<()> 
 
     drain(&active).await;
 
-    let _ = std::fs::remove_file(&sock);
-    let _ = std::fs::remove_file(&pid_file);
+    // #645: a concurrent client's `kill_and_respawn` may have already decided
+    // this daemon looked stale, killed it, and spawned a replacement that
+    // bound the same socket/PID paths while this daemon was draining above.
+    // Reacquire the recovery lock (the same one that serializes startup) and
+    // only unlink if the PID file still names this process AND the socket at
+    // `sock` is still the exact one this daemon bound — otherwise a
+    // replacement daemon owns those paths now and unlinking would delete its
+    // live socket/PID out from under it.
+    #[cfg(unix)]
+    {
+        match acquire_recovery_lock() {
+            Some(_shutdown_lock) => {
+                shutdown_cleanup_if_owned(&sock, &pid_file, bound_identity);
+            }
+            None => {
+                tracing::warn!(
+                    "could not acquire recovery lock for shutdown cleanup; \
+                     skipping unlink to avoid deleting a replacement daemon's paths"
+                );
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = std::fs::remove_file(&sock);
+        let _ = std::fs::remove_file(&pid_file);
+    }
     tracing::info!("khived stopped");
     Ok(())
+}
+
+/// Remove `sock`/`pid_file` only if they still belong to this process: the PID
+/// file must name `std::process::id()` AND the socket currently at `sock` must
+/// still be the exact one identified by `bound_identity` (dev/ino, not path).
+///
+/// Returns `true` if cleanup ran, `false` if it was skipped because a
+/// replacement daemon already owns those paths (#645). The caller must hold
+/// the recovery lock across this call — the same lock daemon startup holds
+/// across cleanup+bind+pid-write — so no replacement can bind between this
+/// function's checks and its unlinks.
+#[cfg(unix)]
+fn shutdown_cleanup_if_owned(
+    sock: &std::path::Path,
+    pid_file: &std::path::Path,
+    bound_identity: Option<SocketIdentity>,
+) -> bool {
+    let pid_is_ours = std::fs::read_to_string(pid_file)
+        .ok()
+        .and_then(|s| s.trim().parse::<u32>().ok())
+        == Some(std::process::id());
+    let socket_is_ours = bound_identity.is_some() && socket_identity(sock) == bound_identity;
+    if pid_is_ours && socket_is_ours {
+        let _ = std::fs::remove_file(sock);
+        let _ = std::fs::remove_file(pid_file);
+        true
+    } else {
+        tracing::warn!(
+            socket = ?sock,
+            pid_file = ?pid_file,
+            "skipping shutdown cleanup — a replacement daemon already owns this socket/PID"
+        );
+        false
+    }
 }
 
 // ── helpers ───────────────────────────────────────────────────────────────────
@@ -823,9 +1004,19 @@ async fn cleanup_stale_daemon(sock: &std::path::Path, pid_file: &std::path::Path
     true
 }
 
-fn write_pid_file(pid_file: &std::path::Path) -> std::io::Result<()> {
+/// Create `pid_file` exclusively (`O_EXCL`) and write this process's PID.
+///
+/// #645: uses `create_new(true)` rather than `create(true).truncate(true)` so
+/// this can never silently overwrite a PID file another process created —
+/// under normal operation the boot lock already serializes cleanup → bind →
+/// pid-write across processes, but that guarantee depends on
+/// `acquire_recovery_lock` succeeding for every party. Exclusive creation is
+/// the defense that holds even if the lock itself is unavailable to one side:
+/// the loser observes `ErrorKind::AlreadyExists` instead of clobbering the
+/// winner's PID out from under it.
+fn write_pid_file_exclusive(pid_file: &std::path::Path) -> std::io::Result<()> {
     let mut opts = std::fs::OpenOptions::new();
-    opts.write(true).create(true).truncate(true);
+    opts.write(true).create_new(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
@@ -834,6 +1025,27 @@ fn write_pid_file(pid_file: &std::path::Path) -> std::io::Result<()> {
     let mut f = opts.open(pid_file)?;
     f.write_all(std::process::id().to_string().as_bytes())?;
     Ok(())
+}
+
+/// Return `true` if `pid_file` currently names a different, live process that
+/// still answers on `sock` — i.e. a daemon already owns this rendezvous and it
+/// is safe to defer to it rather than treat the `AlreadyExists` PID-file
+/// collision as a boot failure.
+#[cfg(unix)]
+async fn pid_file_names_a_reachable_daemon(
+    pid_file: &std::path::Path,
+    sock: &std::path::Path,
+) -> bool {
+    let Ok(pid_str) = std::fs::read_to_string(pid_file) else {
+        return false;
+    };
+    let Ok(pid) = pid_str.trim().parse::<u32>() else {
+        return false;
+    };
+    pid != std::process::id()
+        && is_process_running(pid)
+        && sock.exists()
+        && UnixStream::connect(sock).await.is_ok()
 }
 
 async fn drain(active: &std::sync::atomic::AtomicUsize) {
@@ -1376,6 +1588,275 @@ mod tests {
         assert!(
             resp.metrics.is_none(),
             "metrics must default to None when absent from the wire payload"
+        );
+    }
+
+    // ── #645: owner-checked shutdown cleanup ──────────────────────────────────
+    //
+    // A draining daemon must not unlink a socket/PID pair that a replacement
+    // daemon has already bound. These tests exercise `shutdown_cleanup_if_owned`
+    // directly (the pure decision the caller makes under the recovery lock)
+    // rather than driving `run_daemon`'s real SIGTERM shutdown, which would
+    // require sending a signal to the whole test process.
+
+    #[test]
+    fn shutdown_cleanup_removes_paths_it_still_owns() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sock = dir.path().join("khived.sock");
+        let pid_file = dir.path().join("khived.pid");
+
+        let _listener = std::os::unix::net::UnixListener::bind(&sock).expect("bind socket");
+        std::fs::write(&pid_file, std::process::id().to_string()).expect("write pid file");
+        let identity = socket_identity(&sock);
+        assert!(
+            identity.is_some(),
+            "must read identity of a freshly bound socket"
+        );
+
+        let cleaned = shutdown_cleanup_if_owned(&sock, &pid_file, identity);
+
+        assert!(
+            cleaned,
+            "cleanup must proceed when PID and socket still match"
+        );
+        assert!(!sock.exists(), "owned socket must be removed");
+        assert!(!pid_file.exists(), "owned pid file must be removed");
+    }
+
+    #[test]
+    fn shutdown_cleanup_skips_when_pid_file_names_a_different_process() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sock = dir.path().join("khived.sock");
+        let pid_file = dir.path().join("khived.pid");
+
+        let _listener = std::os::unix::net::UnixListener::bind(&sock).expect("bind socket");
+        let identity = socket_identity(&sock);
+        // A concurrent client's kill_and_respawn already replaced the PID file
+        // with a different (replacement daemon's) PID before this daemon's
+        // drain completed.
+        std::fs::write(&pid_file, "1").expect("write foreign pid file");
+
+        let cleaned = shutdown_cleanup_if_owned(&sock, &pid_file, identity);
+
+        assert!(
+            !cleaned,
+            "cleanup must be skipped when the PID file no longer names this process"
+        );
+        assert!(sock.exists(), "replacement daemon's socket must survive");
+        assert!(
+            pid_file.exists(),
+            "replacement daemon's pid file must survive"
+        );
+    }
+
+    #[test]
+    fn shutdown_cleanup_skips_when_socket_was_rebound_by_a_replacement() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sock = dir.path().join("khived.sock");
+        let pid_file = dir.path().join("khived.pid");
+
+        // This daemon's original bind — captured identity, then simulate the
+        // process exiting (listener dropped, socket path removed) before a
+        // replacement daemon rebinds the same path with a new inode.
+        let original_identity = {
+            let listener =
+                std::os::unix::net::UnixListener::bind(&sock).expect("bind original socket");
+            let id = socket_identity(&sock);
+            drop(listener);
+            let _ = std::fs::remove_file(&sock);
+            id
+        };
+        std::fs::write(&pid_file, std::process::id().to_string())
+            .expect("write pid file matching this process");
+
+        // Replacement daemon binds the same path — new inode, same PID file
+        // path (not yet overwritten, e.g. write still in flight) — the socket
+        // identity mismatch alone must be enough to block cleanup.
+        let _replacement_listener =
+            std::os::unix::net::UnixListener::bind(&sock).expect("bind replacement socket");
+
+        let cleaned = shutdown_cleanup_if_owned(&sock, &pid_file, original_identity);
+
+        assert!(
+            !cleaned,
+            "cleanup must be skipped when the socket at this path is a different \
+             inode than the one this daemon originally bound"
+        );
+        assert!(sock.exists(), "replacement daemon's socket must survive");
+    }
+
+    // ── #667: the recovery lock actually serializes two boot sequences ───────
+    //
+    // Production wiring (`khive_mcp::serve::run` / `serve_server`) now acquires
+    // this same lock *before* building a `KhiveMcpServer` (which runs
+    // migrations and applies pack schema plans / FTS DDL) and holds it through
+    // daemon bind+pid-write, via `run_daemon_with_boot_guard`. That closes the
+    // cold-boot race only if `acquire_recovery_lock` genuinely provides mutual
+    // exclusion across concurrent boot attempts — this test proves the
+    // primitive itself: two "boot sequences" (each holding the lock across a
+    // simulated schema-init critical section) must never run their critical
+    // sections at the same time.
+    #[test]
+    #[serial]
+    fn recovery_lock_serializes_two_concurrent_boot_sequences() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let lock_file = dir.path().join("khived.recovery.lock");
+        std::env::set_var("KHIVE_LOCK", &lock_file);
+
+        let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let overlap_detected = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        let run_one_boot =
+            |active: Arc<std::sync::atomic::AtomicUsize>,
+             overlap: Arc<std::sync::atomic::AtomicBool>| {
+                move || {
+                    let _guard = acquire_recovery_lock().expect("acquire recovery lock");
+                    // Enter the "schema-init" critical section.
+                    if active.fetch_add(1, std::sync::atomic::Ordering::SeqCst) != 0 {
+                        overlap.store(true, std::sync::atomic::Ordering::SeqCst);
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                    active.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                    // `_guard` drops here, releasing the lock.
+                }
+            };
+
+        let t1 = std::thread::spawn(run_one_boot(active.clone(), overlap_detected.clone()));
+        let t2 = std::thread::spawn(run_one_boot(active.clone(), overlap_detected.clone()));
+        t1.join().expect("boot thread 1 must not panic");
+        t2.join().expect("boot thread 2 must not panic");
+
+        assert!(
+            !overlap_detected.load(std::sync::atomic::Ordering::SeqCst),
+            "two concurrent boot sequences must never hold the schema-init \
+             critical section at the same time (#667)"
+        );
+
+        std::env::remove_var("KHIVE_LOCK");
+    }
+
+    // ── #667: acquire_daemon_boot_guard treats lock failure as fatal ─────────
+    // (unlike best-effort acquire_recovery_lock, whose `None` on failure is
+    // correct for its own best-effort callers).
+
+    #[test]
+    #[serial]
+    fn acquire_daemon_boot_guard_returns_guard_when_lock_available() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let lock_file = dir.path().join("khived.recovery.lock");
+        std::env::set_var("KHIVE_LOCK", &lock_file);
+
+        let guard = acquire_daemon_boot_guard();
+        assert!(
+            guard.is_ok(),
+            "daemon boot guard must succeed when the lock file can be opened and flocked"
+        );
+        drop(guard);
+
+        std::env::remove_var("KHIVE_LOCK");
+    }
+
+    #[test]
+    #[serial]
+    fn acquire_daemon_boot_guard_fails_loudly_when_lock_file_cannot_be_opened() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // Point KHIVE_LOCK at a directory, not a file: opening a directory
+        // with `write(true)` fails (EISDIR), so `acquire_recovery_lock`
+        // returns `None` here — the exact failure mode
+        // `acquire_daemon_boot_guard` must turn into a hard `Err` instead of
+        // silently letting daemon-mode boot proceed unguarded (#667).
+        std::env::set_var("KHIVE_LOCK", dir.path());
+
+        let result = acquire_daemon_boot_guard();
+        assert!(
+            result.is_err(),
+            "daemon boot guard must fail loudly, never silently proceed unguarded, \
+             when the underlying recovery lock cannot be acquired"
+        );
+
+        std::env::remove_var("KHIVE_LOCK");
+    }
+
+    // ── #645: write_pid_file_exclusive never truncates a winner's pid file ───
+
+    #[test]
+    fn write_pid_file_exclusive_creates_new_file_with_own_pid() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pid_file = dir.path().join("khived.pid");
+        write_pid_file_exclusive(&pid_file).expect("first writer must win");
+        let contents = std::fs::read_to_string(&pid_file).expect("read pid file");
+        assert_eq!(contents, std::process::id().to_string());
+    }
+
+    #[test]
+    fn write_pid_file_exclusive_refuses_to_overwrite_an_existing_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pid_file = dir.path().join("khived.pid");
+        std::fs::write(&pid_file, "999999").expect("seed an existing pid file");
+
+        let err = write_pid_file_exclusive(&pid_file)
+            .expect_err("must not silently overwrite an existing pid file");
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+
+        // The existing content must be completely untouched — proving this is
+        // `create_new`, not the old `create(true).truncate(true)`.
+        let contents = std::fs::read_to_string(&pid_file).expect("read pid file");
+        assert_eq!(
+            contents, "999999",
+            "an existing pid file must never be truncated by a losing writer"
+        );
+    }
+
+    // Real (not simulated) concurrency: two OS threads race to `create_new`
+    // the exact same path, synchronized with a `Barrier` so they genuinely
+    // overlap at the syscall rather than relying on a sleep-based ordering
+    // guess. This is the deterministic race oracle for the #645 convergence
+    // requirement at the atomic-creation primitive `write_pid_file_exclusive`
+    // is built on: exactly one of two simultaneous daemon starters may claim
+    // the pid file, and the loser must see `AlreadyExists`, never silently
+    // clobber the winner's content.
+    #[test]
+    fn two_concurrent_writers_converge_on_exactly_one_pid_file_owner() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pid_file = std::sync::Arc::new(dir.path().join("khived.pid"));
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+
+        let spawn_writer =
+            |pid_file: std::sync::Arc<std::path::PathBuf>,
+             barrier: std::sync::Arc<std::sync::Barrier>| {
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    write_pid_file_exclusive(&pid_file)
+                })
+            };
+
+        let t1 = spawn_writer(pid_file.clone(), barrier.clone());
+        let t2 = spawn_writer(pid_file.clone(), barrier.clone());
+        let r1 = t1.join().expect("writer 1 must not panic");
+        let r2 = t2.join().expect("writer 2 must not panic");
+
+        let results = [&r1, &r2];
+        let ok_count = results.iter().filter(|r| r.is_ok()).count();
+        let already_exists_count = results
+            .iter()
+            .filter(|r| matches!(r, Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists))
+            .count();
+        assert_eq!(
+            ok_count, 1,
+            "exactly one of two concurrent writers must win the pid file"
+        );
+        assert_eq!(
+            already_exists_count, 1,
+            "the other writer must observe AlreadyExists, never a silent overwrite"
+        );
+        assert!(pid_file.exists(), "the winner's pid file must exist");
+        let contents = std::fs::read_to_string(&*pid_file).expect("read pid file");
+        assert_eq!(
+            contents,
+            std::process::id().to_string(),
+            "the surviving pid file must contain the winner's pid — both threads \
+             share this process's pid, so an unexpected value would also prove a \
+             lost/garbled write raced through"
         );
     }
 }
