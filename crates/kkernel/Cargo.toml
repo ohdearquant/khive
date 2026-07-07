@@ -26,6 +26,7 @@ khive-pack-brain = { version = "0.3.0", path = "../khive-pack-brain" }
 khive-pack-comm = { version = "0.3.0", path = "../khive-pack-comm" }
 khive-pack-schedule = { version = "0.3.0", path = "../khive-pack-schedule" }
 khive-pack-formal = { version = "0.3.0", path = "../khive-pack-formal" }
+khive-pack-code = { version = "0.3.0", path = "../khive-pack-code" }
 khive-pack-knowledge = { version = "0.3.0", path = "../khive-pack-knowledge" }
 khive-pack-session = { version = "0.3.0", path = "../khive-pack-session" }
 khive-request = { version = "0.3.0", path = "../khive-request" }
