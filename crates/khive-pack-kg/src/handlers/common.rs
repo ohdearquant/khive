@@ -388,22 +388,6 @@ pub(crate) fn parse_direction(s: Option<&str>) -> Result<Direction, RuntimeError
     }
 }
 
-pub(crate) fn merge_entry_metadata(
-    metadata: Option<Value>,
-    dependency_kind: Option<String>,
-) -> Result<Option<Value>, RuntimeError> {
-    let Some(dk) = dependency_kind else {
-        return Ok(metadata);
-    };
-    let mut obj = metadata.unwrap_or_else(|| serde_json::json!({}));
-    let map = obj
-        .as_object_mut()
-        .ok_or_else(|| RuntimeError::InvalidInput("metadata must be a JSON object".into()))?;
-    map.entry("dependency_kind".to_string())
-        .or_insert_with(|| serde_json::json!(dk));
-    Ok(Some(obj))
-}
-
 pub(crate) fn parse_relation(s: &str) -> Result<EdgeRelation, RuntimeError> {
     s.parse::<EdgeRelation>().map_err(|_| {
         let valid = EdgeRelation::ALL

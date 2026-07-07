@@ -494,6 +494,39 @@ pub(crate) fn merge_dependency_kind(
     Some(obj)
 }
 
+/// Merge a caller-supplied top-level `dependency_kind` param into an edge's
+/// `metadata` object, filling the key only if `metadata` doesn't already
+/// carry one. This is distinct from [`merge_dependency_kind`] above (which
+/// infers a default from endpoint entity kinds when no explicit value was
+/// given at all) — this one folds in an EXPLICIT `dependency_kind` argument
+/// the caller passed alongside `metadata`.
+///
+/// `pub` (ADR-099 B3 r6 second pass): the single source both
+/// `khive-pack-kg::handlers::link::handle_link` (via `khive_runtime::
+/// merge_entry_metadata`) and `crate::atomic_prepare::prepare_link` call —
+/// previously duplicated as a hand-copied 8-line block in `atomic_prepare.rs`
+/// (pack-kg's copy lived at `handlers/common.rs`, a `pub(crate)` fn in a
+/// crate `khive-runtime` cannot depend on, so it was re-typed by hand rather
+/// than imported). Relocating the canonical copy down to `khive-runtime`
+/// lets `khive-pack-kg` depend on it instead (packs depend on
+/// `khive-runtime`, never the reverse), closing the duplication in the
+/// direction the crate graph actually allows.
+pub fn merge_entry_metadata(
+    metadata: Option<serde_json::Value>,
+    dependency_kind: Option<String>,
+) -> RuntimeResult<Option<serde_json::Value>> {
+    let Some(dk) = dependency_kind else {
+        return Ok(metadata);
+    };
+    let mut obj = metadata.unwrap_or_else(|| serde_json::json!({}));
+    let map = obj
+        .as_object_mut()
+        .ok_or_else(|| RuntimeError::InvalidInput("metadata must be a JSON object".into()))?;
+    map.entry("dependency_kind".to_string())
+        .or_insert_with(|| serde_json::json!(dk));
+    Ok(Some(obj))
+}
+
 /// Valid `dependency_kind` values for `depends_on` edges.
 const VALID_DEPENDENCY_KINDS: &[&str] = &["build", "runtime", "data", "artifact", "tooling"];
 

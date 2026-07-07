@@ -1142,23 +1142,18 @@ async fn prepare_link(
     let target_id = require_uuid(args, "target_id")?;
     let relation = parse_edge_relation(require_str(args, "relation")?)?;
     let weight = optional_f64(args, "weight")?.unwrap_or(1.0);
-    let mut metadata = obj(args)?.get("metadata").cloned();
+    let metadata = obj(args)?.get("metadata").cloned();
 
-    // Top-level `dependency_kind` param merges into `metadata` (codex REJECT
-    // High finding — link.rs handler's `merge_entry_metadata` parity): only
-    // fills the key when metadata doesn't already carry one. `link.rs` is a
-    // sibling-crate `pub(crate)` fn (no dependency edge back to
-    // khive-runtime), so this three-line merge is reimplemented here rather
-    // than imported — same pattern as `parse_merge_strategy` above.
-    if let Some(dk) = optional_str(args, "dependency_kind") {
-        let mut m = metadata.unwrap_or_else(|| serde_json::json!({}));
-        let map = m
-            .as_object_mut()
-            .ok_or_else(|| RuntimeError::InvalidInput("metadata must be a JSON object".into()))?;
-        map.entry("dependency_kind".to_string())
-            .or_insert_with(|| serde_json::json!(dk));
-        metadata = Some(m);
-    }
+    // Top-level `dependency_kind` param merges into `metadata`: only fills
+    // the key when metadata doesn't already carry one. Calls the SAME
+    // `khive_runtime::merge_entry_metadata` `khive-pack-kg`'s canonical
+    // `handle_link` calls — relocated down to this crate (ADR-099 B3 r6
+    // second pass) so both sides depend on one function instead of each
+    // maintaining their own copy.
+    let mut metadata = crate::merge_entry_metadata(
+        metadata,
+        optional_str(args, "dependency_kind").map(String::from),
+    )?;
 
     validate_edge_weight(weight)?;
     runtime
