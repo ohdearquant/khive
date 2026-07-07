@@ -20,12 +20,12 @@
 
 set -euo pipefail
 
-SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd -P)"
+BACKUP_SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd -P)"
 # shellcheck source=./lib.sh
-. "${SCRIPT_DIR}/lib.sh"
+. "${BACKUP_SCRIPT_DIR}/lib.sh"
 
-TEMPLATE="${SCRIPT_DIR}/com.khive.backup.plist.template"
-BACKUP_SH="${KHIVE_BACKUP_SCRIPT_PATH:-${SCRIPT_DIR}/khive-backup.sh}"
+TEMPLATE="${BACKUP_SCRIPT_DIR}/com.khive.backup.plist.template"
+BACKUP_SH="${KHIVE_BACKUP_SCRIPT_PATH:-${BACKUP_SCRIPT_DIR}/khive-backup.sh}"
 PLIST_BUDDY="/usr/libexec/PlistBuddy"
 LOG_DIR="${HOME}/Library/Logs/khive-backup"
 UID_NUM="$(id -u)"

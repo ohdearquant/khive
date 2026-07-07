@@ -559,6 +559,22 @@ STATUS_OUT="$("${INSTALL_SH}" status t1 fixture 2>&1)"
 assert_not_contains "status output contains no CHANGE_ME remote credential leakage" "${STATUS_OUT}" "backup-host-password"
 assert_contains "status output reports the plist path" "${STATUS_OUT}" "com.khive.backup.t1.fixture.plist"
 
+echo "=== test: installer resolves the default stores.conf when KHIVE_BACKUP_CONF is unset ==="
+# Regression: install-backup.sh sources lib.sh, whose resolve_stores_conf
+# falls back to "${BACKUP_SCRIPT_DIR}/stores.conf" when KHIVE_BACKUP_CONF is
+# not set. The installer must define BACKUP_SCRIPT_DIR (the name lib.sh reads,
+# shared with khive-backup.sh / restore-drill.sh) — a mismatched local name
+# leaves it unbound, so under `set -u` every installer command that needs the
+# registry dies before doing anything. Every other install test exports
+# KHIVE_BACKUP_CONF, so only this one exercises the default-path branch. An
+# unknown store name is used deliberately: it drives resolve_stores_conf (the
+# code that needs BACKUP_SCRIPT_DIR) to completion, then fails cleanly at
+# row lookup — no plist is written, so this test mutates nothing.
+DEFAULT_CONF_OUT="$(env -u KHIVE_BACKUP_CONF KHIVE_BACKUP_INSTALL_TEST=1 "${INSTALL_SH}" install t1 __nosuch_store__ 2>&1 || true)"
+assert_not_contains "installer does not die on an unbound script-dir variable" "${DEFAULT_CONF_OUT}" "unbound variable"
+assert_not_contains "installer resolves a real registry path, not the empty-path 'not found' error" "${DEFAULT_CONF_OUT}" "store registry not found:  "
+assert_contains "installer reaches store-row lookup against the default registry" "${DEFAULT_CONF_OUT}" "no store named '__nosuch_store__'"
+
 echo "=== test: uninstall removes the plist ==="
 "${INSTALL_SH}" uninstall t1 fixture >/tmp/khive-test-uninstall.out 2>&1 \
   || fail "uninstall should succeed: $(cat /tmp/khive-test-uninstall.out)"
