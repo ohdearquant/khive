@@ -1047,6 +1047,159 @@ mod tests {
         );
     }
 
+    // `#[serial(background_tasks)]`: see the note on
+    // `recall_with_dollar_sign_query_does_not_error` above — this test
+    // directly exercises the same `track_background_task`-driven ledger
+    // append it names, so it shares the process-wide counter.
+    //
+    // #697 (c): the serve-time stamp resolves through an actor-scoped binding,
+    // not just a namespace-scoped one. Before #697, `resolve_serving_profile`
+    // called `resolve_consumer_profile` with no actor, so a binding keyed on
+    // actor (namespace left "*") could never match here.
+    #[tokio::test]
+    #[serial(background_tasks)]
+    async fn recall_stamps_served_by_profile_id_via_actor_binding() {
+        use khive_pack_brain::BrainPack;
+
+        let tmp = tempfile::Builder::new()
+            .prefix("khive-mem-recall-actor-binding-")
+            .tempdir_in(std::env::temp_dir())
+            .expect("temp dir");
+        let db_path = tmp.path().join("khive.db");
+        std::mem::forget(tmp);
+
+        let rt = khive_runtime::KhiveRuntime::new(khive_runtime::RuntimeConfig {
+            db_path: Some(db_path),
+            embedding_model: None,
+            additional_embedding_models: vec![],
+            packs: vec!["kg".to_string(), "memory".to_string(), "brain".to_string()],
+            actor_id: Some("leo".to_string()),
+            ..khive_runtime::RuntimeConfig::default()
+        })
+        .expect("runtime");
+        let ns = Namespace::parse("local").expect("local namespace");
+        let token = rt.authorize(ns.clone()).expect("authorize local");
+        assert_eq!(
+            token.actor().id,
+            "leo",
+            "test setup: token must carry the configured actor"
+        );
+
+        let note_id = rt
+            .create_note(
+                &token,
+                "memory",
+                None,
+                "actor binding recall stamp note",
+                Some(0.7),
+                None,
+                vec![],
+            )
+            .await
+            .expect("create note");
+
+        let brain = BrainPack::new(rt.clone());
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(KgPack::new(rt.clone()));
+        builder.register(MemoryPack::new(rt.clone()));
+        builder.register(brain);
+        // `VerbRegistry` mints its own per-dispatch tokens from its own
+        // construction-baked actor id (independent of `RuntimeConfig::actor_id`,
+        // which only affects tokens minted directly via `rt.authorize`) — bake
+        // the same actor here so `registry.dispatch` calls carry it too.
+        builder.with_actor_id(Some("leo".to_string()));
+        let registry = builder.build().expect("registry");
+
+        registry
+            .dispatch(
+                "brain.create_profile",
+                serde_json::json!({
+                    "namespace": ns.as_str(),
+                    "name": "leo-actor-recall-v1",
+                    "consumer_kind": "recall",
+                }),
+            )
+            .await
+            .expect("create profile");
+        registry
+            .dispatch(
+                "brain.activate",
+                serde_json::json!({
+                    "namespace": ns.as_str(),
+                    "profile_id": "leo-actor-recall-v1",
+                }),
+            )
+            .await
+            .expect("activate profile");
+        // Bind by actor only — namespace defaults to the "*" wildcard — so a
+        // namespace-only resolution can never reach this binding.
+        registry
+            .dispatch(
+                "brain.bind",
+                serde_json::json!({
+                    "actor": "leo",
+                    "profile_id": "leo-actor-recall-v1",
+                    "consumer_kind": "recall",
+                }),
+            )
+            .await
+            .expect("bind profile to actor");
+
+        let result = registry
+            .dispatch(
+                "memory.recall",
+                serde_json::json!({
+                    "namespace": ns.as_str(),
+                    "query": "actor binding recall stamp note",
+                    "limit": 10
+                }),
+            )
+            .await
+            .expect("memory.recall");
+
+        let hits = result.as_array().expect("bare array result");
+        assert!(!hits.is_empty(), "must find the seeded note");
+        assert_eq!(
+            hits[0]["served_by_profile_id"],
+            serde_json::json!("leo-actor-recall-v1"),
+            "recall response must stamp the actor-bound profile, not the default"
+        );
+
+        // The ledger append is fired via track_background_task off the response
+        // path — poll briefly rather than assume it has landed by the time recall returns.
+        let target_id = note_id.id.to_string();
+        let mut found = false;
+        for _ in 0..100 {
+            let mut reader = rt.sql().reader().await.expect("reader");
+            let row = reader
+                .query_row(khive_storage::types::SqlStatement {
+                    sql: "SELECT served_by_profile_id FROM brain_serve_ledger \
+                          WHERE target_id = ?1"
+                        .into(),
+                    params: vec![khive_storage::types::SqlValue::Text(target_id.clone())],
+                    label: None,
+                })
+                .await
+                .expect("query row");
+            if let Some(row) = row {
+                assert!(
+                    matches!(
+                        row.get("served_by_profile_id"),
+                        Some(khive_storage::types::SqlValue::Text(s)) if s == "leo-actor-recall-v1"
+                    ),
+                    "serve ledger row must carry the actor-bound profile id"
+                );
+                found = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            found,
+            "serve ledger row for the recalled target must appear within 2s"
+        );
+    }
+
     // `#[serial(background_tasks)]`: non-empty recall — see the note on
     // `recall_with_dollar_sign_query_does_not_error` above.
     #[tokio::test]
