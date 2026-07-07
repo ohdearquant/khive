@@ -41,6 +41,7 @@ use uuid::Uuid;
 
 use khive_storage::types::SqlValue;
 use khive_storage::{EdgeRelation, SqlStatement};
+use khive_types::{EventKind, EventOutcome, SubstrateKind};
 
 use crate::atomic_plan::{
     AffectedRowGuard, DeletePlan, LinkPlan, MergePlan, PlanStatement, PostCommitEffect, UpdatePlan,
@@ -233,6 +234,102 @@ async fn push_index_purge_statements(
     Ok(())
 }
 
+/// Event-store append parity for the three canonical handlers that emit a
+/// lifecycle event AFTER their row mutation: `update_entity` -> `EntityUpdated`
+/// (curation.rs:257-273), `delete_entity` -> `EntityDeleted`
+/// (operations.rs:3543-3558), `delete_note` -> `NoteDeleted`
+/// (operations.rs:3326-3340). `update_note` and `link` append no event
+/// (parity boundary verified by the GAP-1 sweep) and must never call this.
+///
+/// Placement decision (matches canonical's error semantics, ADR-099 B3 GAP-1
+/// fix round): all three canonical sites call
+/// `event_store.append_event(event).await.map_err(...)?` — the `?` makes a
+/// failed append a hard `RuntimeError`, never swallowed/logged-and-continue.
+/// `append_event`'s body (`khive-db::stores::event::insert_event_with_
+/// observations`) is two plain, deterministic `INSERT`s (`events`, then
+/// `event_observations` for the target-row observation) computed entirely
+/// from data already on hand at prepare time — no embedding call, no other
+/// suspending/async computation, unlike the `ReindexEntity`/`ReindexNote`
+/// post-commit effects this same module defers for exactly that reason. A
+/// fatal, purely-SQL-expressible effect is the `PlanStatement`-inside-the-
+/// atomic-unit case (not `PostCommitEffect`, which this module reserves for
+/// best-effort or non-SQL work): committing the event row atomically with
+/// the mutation it describes only STRENGTHENS canonical's guarantee (the
+/// non-atomic handlers write the event in a *separate* transaction, ordered
+/// but not atomic with the row mutation).
+///
+/// Returned statements are unguarded — appended after the plan's own guarded
+/// row statement, so [`apply_plan`]'s stop-on-first-failure contract means
+/// they are only reached once that row mutation's guard has already held
+/// (mirroring canonical's `if deleted { append_event(...) }` /
+/// unconditional-after-`upsert_entity` shape).
+fn event_append_statements(
+    namespace: &str,
+    verb: &str,
+    kind: EventKind,
+    substrate: SubstrateKind,
+    target_id: Uuid,
+    payload: Value,
+    label_prefix: &str,
+) -> Vec<PlanStatement> {
+    let event_id = Uuid::new_v4();
+    let created_at = chrono::Utc::now().timestamp_micros();
+    let referent_kind = if substrate == SubstrateKind::Note {
+        "note"
+    } else {
+        "entity"
+    };
+
+    let event_stmt = PlanStatement {
+        statement: SqlStatement {
+            sql: "INSERT INTO events \
+                  (id, namespace, verb, substrate, actor, kind, outcome, payload, \
+                   payload_schema_version, profile_state_version, duration_us, target_id, \
+                   session_id, aggregate_kind, aggregate_id, created_at) \
+                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)"
+                .to_string(),
+            params: vec![
+                SqlValue::Text(event_id.to_string()),
+                SqlValue::Text(namespace.to_string()),
+                SqlValue::Text(verb.to_string()),
+                SqlValue::Text(substrate.name().to_string()),
+                SqlValue::Text(String::new()),
+                SqlValue::Text(kind.name().to_string()),
+                SqlValue::Text(EventOutcome::Success.name().to_string()),
+                SqlValue::Text(payload.to_string()),
+                SqlValue::Integer(1),
+                SqlValue::Null,
+                SqlValue::Integer(0),
+                SqlValue::Text(target_id.to_string()),
+                SqlValue::Null,
+                SqlValue::Null,
+                SqlValue::Null,
+                SqlValue::Integer(created_at),
+            ],
+            label: Some(format!("{label_prefix}-event")),
+        },
+        guard: None,
+    };
+    let observation_stmt = PlanStatement {
+        statement: SqlStatement {
+            sql: "INSERT INTO event_observations \
+                  (event_id, entity_id, referent_kind, role, position) \
+                  VALUES (?1, ?2, ?3, ?4, ?5)"
+                .to_string(),
+            params: vec![
+                SqlValue::Text(event_id.to_string()),
+                SqlValue::Text(target_id.to_string()),
+                SqlValue::Text(referent_kind.to_string()),
+                SqlValue::Text("target".to_string()),
+                SqlValue::Integer(0),
+            ],
+            label: Some(format!("{label_prefix}-event-observation")),
+        },
+        guard: None,
+    };
+    vec![event_stmt, observation_stmt]
+}
+
 // ---------------------------------------------------------------------------
 // dispatch
 // ---------------------------------------------------------------------------
@@ -394,14 +491,21 @@ async fn prepare_update(
             let mut final_properties = entity.properties.clone();
             let mut final_tags = entity.tags.clone();
             let mut text_changed = false;
+            // Mirrors curation.rs update_entity's `changed_fields` tracking
+            // (curation.rs:226-248): pushed whenever the patch key was
+            // present, independent of whether the value actually differs —
+            // feeds the `EntityUpdated` event payload below.
+            let mut changed_fields: Vec<&'static str> = Vec::new();
 
             if let Some(n) = name {
                 text_changed |= final_name != n;
                 final_name = n;
+                changed_fields.push("name");
             }
             if let Some(d) = description {
                 text_changed |= final_description != d;
                 final_description = d;
+                changed_fields.push("description");
             }
             if let Some(p) = properties {
                 let (merged, _) = merge_properties(
@@ -410,9 +514,11 @@ async fn prepare_update(
                     EntityDedupMergePolicy::PreferFrom,
                 );
                 final_properties = merged;
+                changed_fields.push("properties");
             }
             if let Some(t) = tags {
                 final_tags = t;
+                changed_fields.push("tags");
             }
 
             let updated_at = chrono::Utc::now().timestamp_micros();
@@ -443,12 +549,30 @@ async fn prepare_update(
             } else {
                 PostCommitEffect::None
             };
+            let mut statements = vec![PlanStatement {
+                statement,
+                guard: Some(AffectedRowGuard::exactly(1)),
+            }];
+            // GAP-1 (B3 fix round): curation.rs's `update_entity` appends an
+            // `EntityUpdated` event unconditionally after `upsert_entity`
+            // succeeds, regardless of `text_changed` — match that here, not
+            // just on the reindex-triggering subset of updates.
+            statements.extend(event_append_statements(
+                &entity.namespace,
+                "update",
+                EventKind::EntityUpdated,
+                SubstrateKind::Entity,
+                id,
+                serde_json::json!({
+                    "id": id,
+                    "namespace": entity.namespace,
+                    "changed_fields": changed_fields,
+                }),
+                "atomic-update-entity",
+            ));
             Ok(AtomicOpPlan::Update(UpdatePlan {
                 target_id: id,
-                statements: vec![PlanStatement {
-                    statement,
-                    guard: Some(AffectedRowGuard::exactly(1)),
-                }],
+                statements,
                 post_commit,
             }))
         }
@@ -645,6 +769,21 @@ async fn prepare_delete(
                 "atomic-delete-entity",
             )
             .await?;
+            // GAP-1 (B3 fix round): operations.rs's `delete_entity` appends
+            // an `EntityDeleted` event after a successful row delete, on
+            // BOTH soft and hard delete (`if deleted { append_event(...) }`,
+            // where `deleted` is true whenever the guarded row statement
+            // above affected a row — `apply_plan` never reaches this
+            // statement otherwise, so no `if` is needed here).
+            statements.extend(event_append_statements(
+                &namespace,
+                "delete",
+                EventKind::EntityDeleted,
+                SubstrateKind::Entity,
+                id,
+                serde_json::json!({"id": id, "namespace": namespace, "hard": hard}),
+                "atomic-delete-entity",
+            ));
             Ok(AtomicOpPlan::Delete(DeletePlan {
                 target_id: id,
                 statements,
@@ -706,6 +845,19 @@ async fn prepare_delete(
                 "atomic-delete-note",
             )
             .await?;
+            // GAP-1 (B3 fix round): operations.rs's `delete_note` appends a
+            // `NoteDeleted` event after a successful row delete, on BOTH
+            // soft and hard delete — same reasoning as the entity branch
+            // above.
+            statements.extend(event_append_statements(
+                &namespace,
+                "delete",
+                EventKind::NoteDeleted,
+                SubstrateKind::Note,
+                id,
+                serde_json::json!({"id": id, "namespace": namespace, "hard": hard}),
+                "atomic-delete-note",
+            ));
             Ok(AtomicOpPlan::Delete(DeletePlan {
                 target_id: id,
                 statements,
@@ -1922,6 +2074,298 @@ mod tests {
             vec_store.count().await.expect("count after"),
             0,
             "vector rows for both records must be purged after hard delete"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // GAP-1 (B3 fix round): event-store append parity
+    // ------------------------------------------------------------------
+
+    /// Fetch every event of `kind` targeting `target_id`, via the same
+    /// `EventStore::query_events` surface `--atomic` callers would use to
+    /// verify parity — not a raw SQL probe.
+    async fn events_for_target(
+        runtime: &KhiveRuntime,
+        token: &NamespaceToken,
+        target_id: Uuid,
+        kind: EventKind,
+    ) -> Vec<khive_storage::Event> {
+        let event_store = runtime.events(token).expect("event store");
+        let filter = khive_storage::EventFilter {
+            kinds: vec![kind],
+            ..Default::default()
+        };
+        let page = event_store
+            .query_events(filter, khive_storage::types::PageRequest::default())
+            .await
+            .expect("query_events");
+        page.items
+            .into_iter()
+            .filter(|e| e.target_id == Some(target_id))
+            .collect()
+    }
+
+    /// GAP-1: atomic `update(id=<entity>, name=...)` must append an
+    /// `EntityUpdated` event, matching `curation::update_entity`
+    /// (curation.rs:257-273) — the event is appended unconditionally after
+    /// a successful row update, not only on the reindex-triggering subset.
+    #[tokio::test]
+    async fn atomic_update_entity_appends_entity_updated_event() {
+        let runtime = scratch_runtime();
+        let token = runtime
+            .authorize(Namespace::parse("local").expect("ns"))
+            .expect("authorize");
+        let entity = khive_storage::Entity::new("local", "concept", "gap1-entity");
+        let entity_id = entity.id;
+        runtime
+            .entities(&token)
+            .expect("entities store")
+            .upsert_entity(entity)
+            .await
+            .expect("seed entity");
+
+        let plan = prepare_update(
+            &runtime,
+            &token,
+            &json!({"id": entity_id.to_string(), "name": "gap1-entity-renamed"}),
+        )
+        .await
+        .expect("prepare update");
+        let outcome = crate::atomic_runner::run_atomic_unit(runtime.sql().as_ref(), vec![plan])
+            .await
+            .expect("seam call ok");
+        assert!(matches!(
+            outcome,
+            crate::atomic_runner::AtomicRunOutcome::Committed { .. }
+        ));
+
+        let events = events_for_target(&runtime, &token, entity_id, EventKind::EntityUpdated).await;
+        assert_eq!(
+            events.len(),
+            1,
+            "expected exactly one EntityUpdated event for {entity_id}"
+        );
+        assert_eq!(events[0].namespace, "local");
+        assert_eq!(events[0].payload["id"], json!(entity_id.to_string()));
+        assert_eq!(
+            events[0].payload["changed_fields"],
+            json!(["name"]),
+            "changed_fields must name exactly the patched fields"
+        );
+    }
+
+    /// GAP-1: atomic soft AND hard delete of an entity must each append an
+    /// `EntityDeleted` event, matching `operations::delete_entity`
+    /// (operations.rs:3543-3558), which fires on both delete modes.
+    #[tokio::test]
+    async fn atomic_delete_entity_appends_entity_deleted_event_soft_and_hard() {
+        let runtime = scratch_runtime();
+        let token = runtime
+            .authorize(Namespace::parse("local").expect("ns"))
+            .expect("authorize");
+
+        for hard in [false, true] {
+            let entity =
+                khive_storage::Entity::new("local", "concept", format!("gap1-entity-hard-{hard}"));
+            let entity_id = entity.id;
+            runtime
+                .entities(&token)
+                .expect("entities store")
+                .upsert_entity(entity)
+                .await
+                .expect("seed entity");
+
+            let args = if hard {
+                json!({"id": entity_id.to_string(), "hard": true})
+            } else {
+                json!({"id": entity_id.to_string()})
+            };
+            let plan = prepare_delete(&runtime, &token, &args)
+                .await
+                .unwrap_or_else(|e| panic!("prepare delete (hard={hard}): {e}"));
+            let outcome = crate::atomic_runner::run_atomic_unit(runtime.sql().as_ref(), vec![plan])
+                .await
+                .unwrap_or_else(|e| panic!("delete commit (hard={hard}): {e}"));
+            assert!(
+                matches!(
+                    outcome,
+                    crate::atomic_runner::AtomicRunOutcome::Committed { .. }
+                ),
+                "expected a clean delete commit (hard={hard}): {outcome:?}"
+            );
+
+            let events =
+                events_for_target(&runtime, &token, entity_id, EventKind::EntityDeleted).await;
+            assert_eq!(
+                events.len(),
+                1,
+                "expected exactly one EntityDeleted event for {entity_id} (hard={hard})"
+            );
+            assert_eq!(events[0].payload["hard"], json!(hard));
+        }
+    }
+
+    /// GAP-1: atomic soft AND hard delete of a note must each append a
+    /// `NoteDeleted` event, matching `operations::delete_note`
+    /// (operations.rs:3326-3340), which fires on both delete modes.
+    #[tokio::test]
+    async fn atomic_delete_note_appends_note_deleted_event_soft_and_hard() {
+        let runtime = scratch_runtime();
+        let token = runtime
+            .authorize(Namespace::parse("local").expect("ns"))
+            .expect("authorize");
+
+        for hard in [false, true] {
+            let mut note = khive_storage::note::Note::new(
+                "local",
+                "observation",
+                format!("gap1-note-content-hard-{hard}"),
+            );
+            note.name = Some(format!("gap1-note-hard-{hard}"));
+            let note_id = note.id;
+            runtime
+                .notes(&token)
+                .expect("notes store")
+                .upsert_note(note)
+                .await
+                .expect("seed note");
+
+            let args = if hard {
+                json!({"id": note_id.to_string(), "hard": true})
+            } else {
+                json!({"id": note_id.to_string()})
+            };
+            let plan = prepare_delete(&runtime, &token, &args)
+                .await
+                .unwrap_or_else(|e| panic!("prepare delete (hard={hard}): {e}"));
+            let outcome = crate::atomic_runner::run_atomic_unit(runtime.sql().as_ref(), vec![plan])
+                .await
+                .unwrap_or_else(|e| panic!("delete commit (hard={hard}): {e}"));
+            assert!(
+                matches!(
+                    outcome,
+                    crate::atomic_runner::AtomicRunOutcome::Committed { .. }
+                ),
+                "expected a clean delete commit (hard={hard}): {outcome:?}"
+            );
+
+            let events = events_for_target(&runtime, &token, note_id, EventKind::NoteDeleted).await;
+            assert_eq!(
+                events.len(),
+                1,
+                "expected exactly one NoteDeleted event for {note_id} (hard={hard})"
+            );
+            assert_eq!(events[0].payload["hard"], json!(hard));
+        }
+    }
+
+    /// GAP-1 parity boundary: atomic `update` of a NOTE must append NO
+    /// event — canonical `update_note` never calls `append_event` (verified
+    /// by the sweep; unlike `update_entity`, which always does).
+    #[tokio::test]
+    async fn atomic_update_note_appends_no_event() {
+        let runtime = scratch_runtime();
+        let token = runtime
+            .authorize(Namespace::parse("local").expect("ns"))
+            .expect("authorize");
+        let mut note = khive_storage::note::Note::new("local", "observation", "gap1-note-noevent");
+        note.name = Some("gap1-note-noevent".to_string());
+        let note_id = note.id;
+        runtime
+            .notes(&token)
+            .expect("notes store")
+            .upsert_note(note)
+            .await
+            .expect("seed note");
+
+        let plan = prepare_update(
+            &runtime,
+            &token,
+            &json!({"id": note_id.to_string(), "content": "gap1-note-noevent, revised"}),
+        )
+        .await
+        .expect("prepare update");
+        let outcome = crate::atomic_runner::run_atomic_unit(runtime.sql().as_ref(), vec![plan])
+            .await
+            .expect("seam call ok");
+        assert!(matches!(
+            outcome,
+            crate::atomic_runner::AtomicRunOutcome::Committed { .. }
+        ));
+
+        let event_store = runtime.events(&token).expect("event store");
+        let page = event_store
+            .query_events(
+                khive_storage::EventFilter::default(),
+                khive_storage::types::PageRequest::default(),
+            )
+            .await
+            .expect("query_events");
+        assert!(
+            page.items.iter().all(|e| e.target_id != Some(note_id)),
+            "update_note must append no event; found: {:?}",
+            page.items
+                .iter()
+                .filter(|e| e.target_id == Some(note_id))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// GAP-1 parity boundary: atomic `link` must append NO event —
+    /// canonical `link` never calls `append_event` (verified by the sweep).
+    #[tokio::test]
+    async fn atomic_link_appends_no_event() {
+        let runtime = scratch_runtime();
+        let token = runtime
+            .authorize(Namespace::parse("local").expect("ns"))
+            .expect("authorize");
+        let source = khive_storage::Entity::new("local", "concept", "gap1-link-source");
+        let target = khive_storage::Entity::new("local", "concept", "gap1-link-target");
+        let (source_id, target_id) = (source.id, target.id);
+        runtime
+            .entities(&token)
+            .expect("entities store")
+            .upsert_entity(source)
+            .await
+            .expect("seed source");
+        runtime
+            .entities(&token)
+            .expect("entities store")
+            .upsert_entity(target)
+            .await
+            .expect("seed target");
+
+        let plan = prepare_link(
+            &runtime,
+            &token,
+            &json!({
+                "source_id": source_id.to_string(),
+                "target_id": target_id.to_string(),
+                "relation": "extends",
+            }),
+        )
+        .await
+        .expect("prepare link");
+        let outcome = crate::atomic_runner::run_atomic_unit(runtime.sql().as_ref(), vec![plan])
+            .await
+            .expect("seam call ok");
+        assert!(matches!(
+            outcome,
+            crate::atomic_runner::AtomicRunOutcome::Committed { .. }
+        ));
+
+        let event_store = runtime.events(&token).expect("event store");
+        let page = event_store
+            .query_events(
+                khive_storage::EventFilter::default(),
+                khive_storage::types::PageRequest::default(),
+            )
+            .await
+            .expect("query_events");
+        assert!(
+            page.items.is_empty(),
+            "link must append no event; found: {:?}",
+            page.items
         );
     }
 }
