@@ -96,7 +96,7 @@ impl KindHook for CommitHook {
 }
 
 /// The governed `state_reason` value set for `issue` (ADR-088 §3).
-const ISSUE_STATE_REASONS: &[&str] = &["completed", "not_planned"];
+const ISSUE_STATE_REASONS: &[&str] = &["completed", "not_planned", "reopened", "duplicate"];
 
 /// `KindHook` shared by `issue` and `pull_request` — both require
 /// `properties.number` and, when present, validate `properties.state_reason`.

@@ -61,7 +61,7 @@ New pack crate `khive-pack-git`, `REQUIRES = ["kg"]`, following `khive-pack-form
    `kind_status`.
 
 3. **`issue` properties**: `number`, `title`, `author`, `created_at`, `closed_at`
-   (optional), `labels` (array), `state_reason` (optional: `completed` / `not_planned`).
+   (optional), `labels` (array), `state_reason` (optional: `completed` / `not_planned` / `reopened` / `duplicate` — the GitHub `stateReason` enum, normalized to lowercase).
    `NoteKindSpec` lifecycle (declared now, enforced when the generic Phase-2 lifecycle
    layer lands — same posture as `finding`'s): `kind_status`, initial `open`, terminal
    `closed`. `pull_request` is explicitly NOT in v1 — see Open Questions.
@@ -230,7 +230,7 @@ Decision text.
    shape (`number`, `title`, `author`, `created_at`, `closed_at`, `merged_at`, `base_ref`,
    `head_ref`) plus a `KindHook` that validates `number` is present but does not enforce a
    governed `state_reason` enum for PRs — GitHub's PR schema does not document one the way
-   it does for issues (`completed` / `not_planned`), so PR `state_reason`, when present, is
+   it does for issues (`completed` / `not_planned` / `reopened` / `duplicate`), so PR `state_reason`, when present, is
    only checked for non-emptiness rather than validated against a closed set.
 
 2. **Commit-to-document `annotates` enrichment.** The ingester additionally links a

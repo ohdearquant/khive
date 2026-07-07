@@ -781,7 +781,7 @@ async fn ingest_issues(
         });
         // gh reports stateReason as "" for open issues and UPPERCASE enum values
         // (NOT_PLANNED) for closed ones; the kind hook governs any PRESENT value
-        // against lowercase {completed, not_planned}, so normalize case and encode
+        // against the lowercase GitHub stateReason enum, so normalize case and encode
         // "open / no reason" as absent.
         if let Some(reason) = issue.state_reason.as_deref().filter(|r| !r.is_empty()) {
             properties["state_reason"] = json!(reason.to_ascii_lowercase());
