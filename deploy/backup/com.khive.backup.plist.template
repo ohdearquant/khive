@@ -44,6 +44,10 @@
     <string>__KHIVE_BACKUP_ROOT__</string>
     <key>KHIVE_BACKUP_CONF</key>
     <string>__KHIVE_BACKUP_CONF__</string>
+    <key>KHIVE_BACKUP_RETENTION_LOCAL</key>
+    <string>__KHIVE_BACKUP_RETENTION_LOCAL__</string>
+    <key>KHIVE_BACKUP_RETENTION_REMOTE</key>
+    <string>__KHIVE_BACKUP_RETENTION_REMOTE__</string>
   </dict>
 </dict>
 </plist>

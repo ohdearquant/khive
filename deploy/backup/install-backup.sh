@@ -2,8 +2,8 @@
 # Idempotent installer for the ADR-100 backup LaunchAgents.
 #
 # Usage:
-#   install-backup.sh install <t1|t2|t3> <store-name> [--interval SECONDS]
-#   install-backup.sh install-all [--interval-t1 S] [--interval-t2 S] [--interval-t3 S]
+#   install-backup.sh install <t1|t2|t3> <store-name> [--interval SECONDS] [--retention-local N] [--retention-remote N]
+#   install-backup.sh install-all [--interval-t1 S] [--interval-t2 S] [--interval-t3 S] [--retention-local N] [--retention-remote N]
 #   install-backup.sh status [<t1|t2|t3> <store-name>]
 #   install-backup.sh uninstall <t1|t2|t3> <store-name>
 #
@@ -94,13 +94,27 @@ read_installed_interval() {
   "${PLIST_BUDDY}" -c "Print :StartInterval" "${dest}" 2>/dev/null || true
 }
 
+read_installed_retention_local() {
+  local dest="$1"
+  [ -f "${dest}" ] || return 0
+  "${PLIST_BUDDY}" -c "Print :EnvironmentVariables:KHIVE_BACKUP_RETENTION_LOCAL" "${dest}" 2>/dev/null || true
+}
+
+read_installed_retention_remote() {
+  local dest="$1"
+  [ -f "${dest}" ] || return 0
+  "${PLIST_BUDDY}" -c "Print :EnvironmentVariables:KHIVE_BACKUP_RETENTION_REMOTE" "${dest}" 2>/dev/null || true
+}
+
 sed_escape_replacement() {
   printf '%s' "$1" | sed -e 's/[\&|]/\\&/g'
 }
 
 render_plist() {
   local dest_tmp="$1" label="$2" tier="$3" store="$4" interval="$5" script="$6" log_dir="$7" root="$8" conf="$9"
+  local retention_local="${10}" retention_remote="${11}"
   local esc_label esc_tier esc_store esc_interval esc_script esc_logdir esc_root esc_conf
+  local esc_retention_local esc_retention_remote
   esc_label="$(sed_escape_replacement "${label}")"
   esc_tier="$(sed_escape_replacement "${tier}")"
   esc_store="$(sed_escape_replacement "${store}")"
@@ -109,6 +123,8 @@ render_plist() {
   esc_logdir="$(sed_escape_replacement "${log_dir}")"
   esc_root="$(sed_escape_replacement "${root}")"
   esc_conf="$(sed_escape_replacement "${conf}")"
+  esc_retention_local="$(sed_escape_replacement "${retention_local}")"
+  esc_retention_remote="$(sed_escape_replacement "${retention_remote}")"
   sed \
     -e "s|__KHIVE_BACKUP_LABEL__|${esc_label}|g" \
     -e "s|__KHIVE_BACKUP_TIER__|${esc_tier}|g" \
@@ -118,12 +134,14 @@ render_plist() {
     -e "s|__KHIVE_BACKUP_LOG_DIR__|${esc_logdir}|g" \
     -e "s|__KHIVE_BACKUP_ROOT__|${esc_root}|g" \
     -e "s|__KHIVE_BACKUP_CONF__|${esc_conf}|g" \
+    -e "s|__KHIVE_BACKUP_RETENTION_LOCAL__|${esc_retention_local}|g" \
+    -e "s|__KHIVE_BACKUP_RETENTION_REMOTE__|${esc_retention_remote}|g" \
     "${TEMPLATE}" >"${dest_tmp}"
 }
 
 cmd_install_one() {
-  local tier="$1" store="$2" interval_cli="${3:-}"
-  local label dest target interval tmp_plist root conf
+  local tier="$1" store="$2" interval_cli="${3:-}" retention_local_cli="${4:-}" retention_remote_cli="${5:-}"
+  local label dest target interval tmp_plist root conf retention_local retention_remote
 
   case "${tier}" in t1|t2|t3) ;; *) die "unknown tier '${tier}' (expected t1, t2, or t3)" ;; esac
   load_store_row "${store}" >/dev/null || die "no store named '${store}' in $(resolve_stores_conf)"
@@ -146,6 +164,30 @@ cmd_install_one() {
     fi
   fi
 
+  if [ -n "${retention_local_cli}" ]; then
+    retention_local="${retention_local_cli}"
+  else
+    local existing_retention_local
+    existing_retention_local="$(read_installed_retention_local "${dest}")"
+    if [ -n "${existing_retention_local}" ]; then
+      retention_local="${existing_retention_local}"
+    else
+      retention_local="${KHIVE_BACKUP_RETENTION_LOCAL}"
+    fi
+  fi
+
+  if [ -n "${retention_remote_cli}" ]; then
+    retention_remote="${retention_remote_cli}"
+  else
+    local existing_retention_remote
+    existing_retention_remote="$(read_installed_retention_remote "${dest}")"
+    if [ -n "${existing_retention_remote}" ]; then
+      retention_remote="${existing_retention_remote}"
+    else
+      retention_remote="${KHIVE_BACKUP_RETENTION_REMOTE}"
+    fi
+  fi
+
   [ -f "${TEMPLATE}" ] || die "plist template not found: ${TEMPLATE}"
   [ -x "${BACKUP_SH}" ] || die "khive-backup.sh not found or not executable: ${BACKUP_SH}"
 
@@ -155,7 +197,7 @@ cmd_install_one() {
   tmp_plist="$(mktemp "${TMPDIR:-/tmp}/${label}.XXXXXX.plist")"
   trap 'rm -f "${tmp_plist}"' RETURN
 
-  render_plist "${tmp_plist}" "${label}" "${tier}" "${store}" "${interval}" "${BACKUP_SH}" "${LOG_DIR}" "${root}" "${conf}"
+  render_plist "${tmp_plist}" "${label}" "${tier}" "${store}" "${interval}" "${BACKUP_SH}" "${LOG_DIR}" "${root}" "${conf}" "${retention_local}" "${retention_remote}"
 
   if ! plutil -lint "${tmp_plist}" >/dev/null; then
     die "rendered plist failed plutil -lint; ${dest} was NOT touched"
@@ -164,7 +206,7 @@ cmd_install_one() {
     die "a template placeholder was not substituted; ${dest} was NOT touched"
   fi
 
-  log "installing ${label} (interval=${interval}s) -> ${dest}"
+  log "installing ${label} (interval=${interval}s, retention_local=${retention_local}, retention_remote=${retention_remote}) -> ${dest}"
   mv -f "${tmp_plist}" "${dest}"
   trap - RETURN
 
@@ -174,15 +216,16 @@ cmd_install_one() {
 
 cmd_install_all() {
   local interval_t1="${1:-}" interval_t2="${2:-}" interval_t3="${3:-}"
+  local retention_local="${4:-}" retention_remote="${5:-}"
   local conf line name
   conf="$(resolve_stores_conf)"
   [ -f "${conf}" ] || die "store registry not found: ${conf}"
   while IFS= read -r line || [ -n "${line}" ]; do
     case "${line}" in ''|'#'*) continue ;; esac
     name="${line%%|*}"
-    cmd_install_one t1 "${name}" "${interval_t1}"
-    cmd_install_one t2 "${name}" "${interval_t2}"
-    cmd_install_one t3 "${name}" "${interval_t3}"
+    cmd_install_one t1 "${name}" "${interval_t1}" "${retention_local}" "${retention_remote}"
+    cmd_install_one t2 "${name}" "${interval_t2}" "${retention_local}" "${retention_remote}"
+    cmd_install_one t3 "${name}" "${interval_t3}" "${retention_local}" "${retention_remote}"
   done <"${conf}"
 }
 
@@ -232,8 +275,8 @@ main() {
   case "${1:-}" in
     install)
       shift
-      [ "$#" -ge 2 ] || die "usage: $0 install <t1|t2|t3> <store-name> [--interval SECONDS]"
-      local tier="$1" store="$2" interval=""
+      [ "$#" -ge 2 ] || die "usage: $0 install <t1|t2|t3> <store-name> [--interval SECONDS] [--retention-local N] [--retention-remote N]"
+      local tier="$1" store="$2" interval="" retention_local="" retention_remote=""
       shift 2
       while [ "$#" -gt 0 ]; do
         case "$1" in
@@ -242,23 +285,35 @@ main() {
             interval="$2"
             shift 2
             ;;
+          --retention-local)
+            [ "$#" -ge 2 ] || die "--retention-local requires a value"
+            retention_local="$2"
+            shift 2
+            ;;
+          --retention-remote)
+            [ "$#" -ge 2 ] || die "--retention-remote requires a value"
+            retention_remote="$2"
+            shift 2
+            ;;
           *) die "unknown argument: $1" ;;
         esac
       done
-      cmd_install_one "${tier}" "${store}" "${interval}"
+      cmd_install_one "${tier}" "${store}" "${interval}" "${retention_local}" "${retention_remote}"
       ;;
     install-all)
       shift
-      local it1="" it2="" it3=""
+      local it1="" it2="" it3="" retention_local="" retention_remote=""
       while [ "$#" -gt 0 ]; do
         case "$1" in
           --interval-t1) it1="$2"; shift 2 ;;
           --interval-t2) it2="$2"; shift 2 ;;
           --interval-t3) it3="$2"; shift 2 ;;
+          --retention-local) retention_local="$2"; shift 2 ;;
+          --retention-remote) retention_remote="$2"; shift 2 ;;
           *) die "unknown argument: $1" ;;
         esac
       done
-      cmd_install_all "${it1}" "${it2}" "${it3}"
+      cmd_install_all "${it1}" "${it2}" "${it3}" "${retention_local}" "${retention_remote}"
       ;;
     status)
       shift
@@ -274,7 +329,7 @@ main() {
       cmd_uninstall "$1" "$2"
       ;;
     *)
-      echo "usage: $0 install <t1|t2|t3> <store-name> [--interval S] | install-all | status [<t1|t2|t3> <store-name>] | uninstall <t1|t2|t3> <store-name>" >&2
+      echo "usage: $0 install <t1|t2|t3> <store-name> [--interval S] [--retention-local N] [--retention-remote N] | install-all | status [<t1|t2|t3> <store-name>] | uninstall <t1|t2|t3> <store-name>" >&2
       exit 1
       ;;
   esac

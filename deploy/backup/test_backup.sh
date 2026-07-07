@@ -554,6 +554,30 @@ assert_eq "rerun with no override preserves the previously-set interval" "${V1}"
 V3="$(/usr/libexec/PlistBuddy -c 'Print :StartInterval' "${PLIST_DEST}" 2>/dev/null || echo '')"
 assert_eq "rerun with a new --interval updates it" "120" "${V3}"
 
+echo "=== test: installer renders retention defaults (KHIVE_BACKUP_RETENTION_LOCAL/REMOTE) into the plist ==="
+T3_PLIST_DEST="${HOME}/Library/LaunchAgents/com.khive.backup.t3.fixture.plist"
+"${INSTALL_SH}" install t3 fixture >/tmp/khive-test-install-retention-default.out 2>&1 \
+  || fail "install t3 with no retention flags should succeed: $(cat /tmp/khive-test-install-retention-default.out)"
+assert_file_exists "t3 plist installed after install" "${T3_PLIST_DEST}"
+RL_DEFAULT="$(/usr/libexec/PlistBuddy -c 'Print :EnvironmentVariables:KHIVE_BACKUP_RETENTION_LOCAL' "${T3_PLIST_DEST}" 2>/dev/null || echo '')"
+RR_DEFAULT="$(/usr/libexec/PlistBuddy -c 'Print :EnvironmentVariables:KHIVE_BACKUP_RETENTION_REMOTE' "${T3_PLIST_DEST}" 2>/dev/null || echo '')"
+assert_eq "default render writes KHIVE_BACKUP_RETENTION_LOCAL=4" "4" "${RL_DEFAULT}"
+assert_eq "default render writes KHIVE_BACKUP_RETENTION_REMOTE=8" "8" "${RR_DEFAULT}"
+
+echo "=== test: installer --retention-remote override renders the explicit value ==="
+"${INSTALL_SH}" install t3 fixture --retention-remote 4 >/tmp/khive-test-install-retention-override.out 2>&1 \
+  || fail "install t3 --retention-remote 4 should succeed: $(cat /tmp/khive-test-install-retention-override.out)"
+RR_OVERRIDE="$(/usr/libexec/PlistBuddy -c 'Print :EnvironmentVariables:KHIVE_BACKUP_RETENTION_REMOTE' "${T3_PLIST_DEST}" 2>/dev/null || echo '')"
+assert_eq "explicit --retention-remote overrides the default" "4" "${RR_OVERRIDE}"
+
+echo "=== test: installer reinstall with no retention flag carries forward the previously-rendered value ==="
+"${INSTALL_SH}" install t3 fixture >/tmp/khive-test-install-retention-carry.out 2>&1 \
+  || fail "reinstall t3 with no retention flag should succeed: $(cat /tmp/khive-test-install-retention-carry.out)"
+RR_CARRY="$(/usr/libexec/PlistBuddy -c 'Print :EnvironmentVariables:KHIVE_BACKUP_RETENTION_REMOTE' "${T3_PLIST_DEST}" 2>/dev/null || echo '')"
+assert_eq "reinstall with no flag preserves the previously-rendered retention (not reset to default 8)" "4" "${RR_CARRY}"
+RL_CARRY="$(/usr/libexec/PlistBuddy -c 'Print :EnvironmentVariables:KHIVE_BACKUP_RETENTION_LOCAL' "${T3_PLIST_DEST}" 2>/dev/null || echo '')"
+assert_eq "reinstall with no flag preserves the untouched retention-local default" "4" "${RL_CARRY}"
+
 echo "=== test: installer status output contains no secrets ==="
 STATUS_OUT="$("${INSTALL_SH}" status t1 fixture 2>&1)"
 assert_not_contains "status output contains no CHANGE_ME remote credential leakage" "${STATUS_OUT}" "backup-host-password"
