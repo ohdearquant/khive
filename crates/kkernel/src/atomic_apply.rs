@@ -6,11 +6,20 @@
 //! B1) and the op-count guard BEFORE building any runtime or touching the
 //! database, then drives the async prepare pass (KG-substrate verbs via
 //! [`khive_runtime::atomic_prepare::prepare_op`]; `gtd.transition` /
-//! `gtd.complete` via the two `prepare_gtd_*` functions below, kept in this
-//! crate because their lifecycle vocabulary lives in `khive-pack-gtd`, which
-//! depends on `khive-runtime` — not the other way around), the synchronous
-//! commit pass ([`khive_runtime::atomic_runner::run_atomic_unit`], B2), and
-//! finally the async post-commit reindex pass
+//! `gtd.complete` via the two `prepare_gtd_*` functions below — thin
+//! `AtomicOpPlan` adapters over the shared decide steps
+//! `khive_pack_gtd::handlers::prepare_transition` / `prepare_complete`,
+//! the SAME functions the canonical, non-atomic `handle_transition` /
+//! `handle_complete` call before applying (ADR-099 B3 r6 second pass). The
+//! adapters live in this crate rather than `khive-pack-gtd` purely because
+//! `AtomicOpPlan`/`PlanStatement` are `khive-runtime` atomic-plan vocabulary
+//! this CLI orchestrator owns; the decide LOGIC itself is not duplicated —
+//! it lives once, in `khive-pack-gtd::handlers::{prepare_transition,
+//! prepare_complete}`, consumed both by canonical `handle_transition` /
+//! `handle_complete` (which apply it directly) and by the two adapters
+//! below (which turn the same decision into an `AtomicOpPlan`)), the
+//! synchronous commit pass ([`khive_runtime::atomic_runner::run_atomic_unit`],
+//! B2), and finally the async post-commit reindex pass
 //! ([`khive_runtime::atomic_prepare::apply_post_commit_effects`]).
 //!
 //! `propose` / `review` / `withdraw` are admissible per
@@ -38,15 +47,12 @@
 //! (and every other exec path) are untouched by this module.
 
 use anyhow::{Context, Result};
-use chrono::Utc;
 use serde_json::{json, Value};
+#[cfg(test)]
 use uuid::Uuid;
 
 use khive_pack_gtd::handlers::{ensure_audit_schema, write_audit_record};
-use khive_pack_gtd::schema::{
-    allowed_transitions, can_transition, is_actionable, is_terminal, is_valid_status,
-    normalize_status,
-};
+use khive_pack_gtd::schema::{is_terminal, normalize_status};
 use khive_runtime::atomic_plan::{
     AffectedRowGuard, GtdCompletePlan, GtdTransitionPlan, PlanStatement, PostCommitEffect,
 };
@@ -55,8 +61,9 @@ use khive_runtime::pack::{PackRegistry, VerbRegistry, VerbRegistryBuilder};
 use khive_runtime::{
     EdgeListFilter, KhiveConfig, KhiveRuntime, NamespaceToken, Resolved, RuntimeConfig,
 };
-use khive_storage::types::SqlValue;
-use khive_storage::{EdgeRelation, SqlStatement};
+use khive_storage::EdgeRelation;
+#[cfg(test)]
+use khive_storage::{types::SqlValue, SqlStatement};
 
 use crate::exec::OpsFileEntry;
 
@@ -756,256 +763,114 @@ fn require_str<'a>(args: &'a Value, key: &str) -> anyhow::Result<&'a str> {
         .ok_or_else(|| anyhow::anyhow!("missing required field {key:?}"))
 }
 
-/// Resolve a gtd task id (full UUID or 8+ hex prefix), mirroring canonical
-/// GTD lifecycle verbs' resolution (`khive_pack_gtd::handlers::resolve_uuid`,
-/// handlers.rs:270 — ADR-099 B3 fix round 5, finding 3 — codex r3 REJECT
-/// High: the pre-fix version below (`require_uuid`) only accepted a bare
-/// full UUID, rejecting the short ids `gtd.assign` itself returns).
-async fn resolve_gtd_id(
-    runtime: &KhiveRuntime,
-    token: &NamespaceToken,
-    args: &Value,
-    key: &str,
-) -> anyhow::Result<Uuid> {
-    let raw = require_str(args, key)?;
-    khive_pack_gtd::handlers::resolve_uuid(raw, runtime, token)
-        .await
-        .map_err(|e| anyhow::anyhow!("{e}"))
-}
-
-/// Load a task note by id, verifying kind="task" and non-deleted — mirrors
-/// `khive-pack-gtd::handlers::load_task`'s checks (reimplemented here: that
-/// function is `pub(crate)` to the gtd pack crate).
-async fn load_task(
-    runtime: &KhiveRuntime,
-    token: &NamespaceToken,
-    id: Uuid,
-) -> anyhow::Result<khive_storage::note::Note> {
-    let note = runtime
-        .notes(token)?
-        .get_note(id)
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("task not found: {id}"))?;
-    if note.namespace != token.namespace().as_str() {
-        anyhow::bail!("task not found: {id}");
-    }
-    if note.kind != "task" {
-        anyhow::bail!("expected kind=\"task\", got {:?}", note.kind);
-    }
-    if note.deleted_at.is_some() {
-        anyhow::bail!("task deleted: {id}");
-    }
-    Ok(note)
-}
-
-fn task_status(props: Option<&Value>) -> String {
-    props
-        .and_then(|p| p.get("status"))
-        .and_then(|v| v.as_str())
-        .unwrap_or("inbox")
-        .to_string()
-}
-
-/// Validate the target terminal status for `gtd.complete` (mirrors
-/// `khive-pack-gtd::handlers::complete_target_status`, private to that
-/// crate): accepts `None`/`"done"` -> `"done"`, `"cancelled"` -> itself.
-fn complete_target_status(status: Option<&str>) -> anyhow::Result<&'static str> {
-    match status {
-        None | Some("done") => Ok("done"),
-        Some("cancelled") => Ok("cancelled"),
-        Some(other) => {
-            anyhow::bail!("complete: status must be \"done\" or \"cancelled\"; got {other:?}")
-        }
-    }
-}
-
+/// Decide-step wiring for `gtd.transition` (ADR-099 B3 r6 second pass): both
+/// this function and `khive-pack-gtd`'s `handle_transition` call
+/// `khive_pack_gtd::handlers::prepare_transition` — the ONE place the
+/// normalize/validate/secret-gate/load/idempotent-check/lifecycle-guard
+/// decision logic lives. This function's only job is turning that decision
+/// into an `AtomicOpPlan`: the idempotent no-op case produces an empty
+/// statement list, and the write case turns the decided patch into a
+/// `PlanStatement` via `khive_pack_gtd::handlers::gtd_transition_statement`
+/// — the same DML builder canonical's `atomic_gtd_transition` calls.
 async fn prepare_gtd_transition(
     runtime: &KhiveRuntime,
     token: &NamespaceToken,
     args: &Value,
 ) -> anyhow::Result<AtomicOpPlan> {
-    let id = resolve_gtd_id(runtime, token, args, "id").await?;
+    let raw_id = require_str(args, "id")?;
     let raw_status = require_str(args, "status")?;
-
-    // GAP-3 (B3 fix round 4): parity with `handle_transition`
-    // (handlers.rs:980-987) — normalize aliases (finished/completed->done,
-    // in_progress->active, todo->inbox, blocked->waiting, later->someday,
-    // ...) and reject an unknown status BEFORE any DB read/write. The
-    // pre-fix atomic prepare ran `can_transition` on the raw, unnormalized
-    // string with no `is_valid_status` gate at all.
-    let target = normalize_status(raw_status);
-    if !is_valid_status(target) {
-        anyhow::bail!(
-            "invalid status {raw_status:?} — valid: inbox, next, waiting, someday, active, done, \
-             cancelled (aliases: in_progress, todo, blocked, later, finished)"
-        );
-    }
-
     let note_arg = args
         .as_object()
         .and_then(|o| o.get("note"))
         .and_then(|v| v.as_str());
 
-    // Parity with `khive-pack-gtd::handlers::handle_transition`
-    // (handlers.rs:988): secret-gate the caller-supplied transition note
-    // BEFORE any DB read/write (codex r2 High finding 3).
-    if let Some(n) = note_arg {
-        khive_runtime::secret_gate::check(n)?;
-    }
+    let decision =
+        khive_pack_gtd::handlers::prepare_transition(runtime, token, raw_id, raw_status, note_arg)
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
 
-    let note = load_task(runtime, token, id).await?;
-    let current = task_status(note.properties.as_ref());
-
-    // GAP-6 (B3 fix round 4): parity with `handle_transition`
-    // (handlers.rs:995-1005) — an idempotent transition (current == target
-    // after normalization) is checked BEFORE the terminal-state guard and
-    // performs NO write and NO audit row, exactly mirroring canonical's
-    // early return. The pre-fix atomic prepare only special-cased
-    // `current != target` inside the `can_transition` check, so a
-    // current==target call fell through to an unconditional (and
-    // unnecessary) `UPDATE`.
-    if current == target {
-        return Ok(AtomicOpPlan::GtdTransition(GtdTransitionPlan {
-            task_id: id,
-            statements: vec![],
-            post_commit: PostCommitEffect::None,
-        }));
-    }
-
-    if is_terminal(&current) {
-        anyhow::bail!("task {id} is in terminal state {current:?}; no further transitions allowed");
-    }
-    if !can_transition(&current, target) {
-        let allowed = allowed_transitions(&current);
-        anyhow::bail!(
-            "cannot transition from {current:?} to {target:?}; allowed from {current:?}: {}",
-            if allowed.is_empty() {
-                "(none)".to_string()
-            } else {
-                allowed.join(", ")
-            }
-        );
-    }
-
-    let mut props = note.properties.clone().unwrap_or_else(|| json!({}));
-    if let Some(obj) = props.as_object_mut() {
-        obj.insert("status".into(), json!(target));
-        // Parity with handlers.rs:1028 — persist the caller-supplied
-        // transition note under `properties.transition_note`.
-        if let Some(n) = note_arg {
-            obj.insert("transition_note".into(), json!(n));
+    match decision {
+        khive_pack_gtd::handlers::TransitionDecision::NoOp { note, .. } => {
+            Ok(AtomicOpPlan::GtdTransition(GtdTransitionPlan {
+                task_id: note.id,
+                statements: vec![],
+                post_commit: PostCommitEffect::None,
+            }))
         }
-        if target == "done" {
-            obj.insert("completed_at".into(), json!(Utc::now().to_rfc3339()));
+        khive_pack_gtd::handlers::TransitionDecision::Write {
+            note,
+            current,
+            target,
+            props,
+            updated_at,
+            transition_note,
+        } => {
+            let statement = khive_pack_gtd::handlers::gtd_transition_statement(
+                note.id, &current, &target, &props, updated_at,
+            )
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+            Ok(AtomicOpPlan::GtdTransition(GtdTransitionPlan {
+                task_id: note.id,
+                statements: vec![PlanStatement {
+                    statement,
+                    guard: Some(AffectedRowGuard::exactly(1)),
+                }],
+                post_commit: PostCommitEffect::GtdAudit {
+                    task_id: note.id,
+                    from_status: current,
+                    to_status: target,
+                    note: transition_note,
+                    namespace: token.namespace().as_str().to_string(),
+                },
+            }))
         }
     }
-    let updated_at = Utc::now().timestamp_micros();
-
-    let statement = SqlStatement {
-        sql: "UPDATE notes SET properties = ?1, updated_at = ?2 \
-              WHERE id = ?3 AND json_extract(properties, '$.status') = ?4 \
-              AND deleted_at IS NULL"
-            .to_string(),
-        params: vec![
-            SqlValue::Text(serde_json::to_string(&props)?),
-            SqlValue::Integer(updated_at),
-            SqlValue::Text(id.to_string()),
-            SqlValue::Text(current.clone()),
-        ],
-        label: Some("atomic-gtd-transition".to_string()),
-    };
-
-    Ok(AtomicOpPlan::GtdTransition(GtdTransitionPlan {
-        task_id: id,
-        statements: vec![PlanStatement {
-            statement,
-            guard: Some(AffectedRowGuard::exactly(1)),
-        }],
-        // GAP-5 (B3 fix round 4): mirrors handlers.rs:1062-1071's
-        // best-effort `write_audit_record` call.
-        post_commit: PostCommitEffect::GtdAudit {
-            task_id: id,
-            from_status: current,
-            to_status: target.to_string(),
-            note: note_arg.map(str::to_string),
-            namespace: token.namespace().as_str().to_string(),
-        },
-    }))
 }
 
+/// Decide-step wiring for `gtd.complete` — same pattern as
+/// [`prepare_gtd_transition`] above: `khive_pack_gtd::handlers::
+/// prepare_complete` is the single decide step both this function and
+/// `handle_complete` call.
 async fn prepare_gtd_complete(
     runtime: &KhiveRuntime,
     token: &NamespaceToken,
     args: &Value,
 ) -> anyhow::Result<AtomicOpPlan> {
-    let id = resolve_gtd_id(runtime, token, args, "id").await?;
+    let raw_id = require_str(args, "id")?;
     let status_arg = args
         .as_object()
         .and_then(|o| o.get("status"))
         .and_then(|v| v.as_str());
-    let target = complete_target_status(status_arg)?;
     let result_arg = args
         .as_object()
         .and_then(|o| o.get("result"))
         .and_then(|v| v.as_str());
 
-    // Parity with `khive-pack-gtd::handlers::handle_complete` (handlers.rs:803):
-    // secret-gate the caller-supplied result BEFORE any DB read/write
-    // (codex r2 High finding 3).
-    if let Some(result) = result_arg {
-        khive_runtime::secret_gate::check(result)?;
-    }
+    let decision =
+        khive_pack_gtd::handlers::prepare_complete(runtime, token, raw_id, status_arg, result_arg)
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
 
-    let note = load_task(runtime, token, id).await?;
-    let current = task_status(note.properties.as_ref());
-
-    if is_terminal(&current) {
-        anyhow::bail!("task {id} is in terminal state {current:?}; no further transitions allowed");
-    }
-    if !is_actionable(&current) {
-        anyhow::bail!(
-            "complete: task in {current:?}; transition to 'next' or 'active' first, \
-             or use gtd.transition(status=done) explicitly"
-        );
-    }
-
-    let mut props = note.properties.clone().unwrap_or_else(|| json!({}));
-    if let Some(obj) = props.as_object_mut() {
-        obj.insert("status".into(), json!(target));
-        obj.insert("completed_at".into(), json!(Utc::now().to_rfc3339()));
-        if let Some(result) = result_arg {
-            obj.insert("result".into(), json!(result));
-        }
-    }
-    let updated_at = Utc::now().timestamp_micros();
-
-    let statement = SqlStatement {
-        sql: "UPDATE notes SET properties = ?1, updated_at = ?2 \
-              WHERE id = ?3 AND json_extract(properties, '$.status') = ?4 \
-              AND deleted_at IS NULL"
-            .to_string(),
-        params: vec![
-            SqlValue::Text(serde_json::to_string(&props)?),
-            SqlValue::Integer(updated_at),
-            SqlValue::Text(id.to_string()),
-            SqlValue::Text(current.clone()),
-        ],
-        label: Some("atomic-gtd-complete".to_string()),
-    };
+    let statement = khive_pack_gtd::handlers::gtd_transition_statement(
+        decision.note.id,
+        &decision.current,
+        decision.target,
+        &decision.props,
+        decision.updated_at,
+    )
+    .map_err(|e| anyhow::anyhow!("{e}"))?;
 
     Ok(AtomicOpPlan::GtdComplete(GtdCompletePlan {
-        task_id: id,
+        task_id: decision.note.id,
         statements: vec![PlanStatement {
             statement,
             guard: Some(AffectedRowGuard::exactly(1)),
         }],
-        // GAP-5 (B3 fix round 4): mirrors handlers.rs:873-883's best-effort
-        // `write_audit_record` call — `complete` never persists a
-        // transition note (canonical passes `None`).
         post_commit: PostCommitEffect::GtdAudit {
-            task_id: id,
-            from_status: current,
-            to_status: target.to_string(),
+            task_id: decision.note.id,
+            from_status: decision.current,
+            to_status: decision.target.to_string(),
             note: None,
             namespace: token.namespace().as_str().to_string(),
         },

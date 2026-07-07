@@ -482,12 +482,6 @@ async fn atomic_gtd_transition(
     new_props: &serde_json::Value,
     updated_at: i64,
 ) -> Result<u64, RuntimeError> {
-    let props_str = serde_json::to_string(new_props)
-        .map_err(|e| RuntimeError::Internal(format!("serialize props: {e}")))?;
-    let id_str = note_id.as_hyphenated().to_string();
-    let target_owned = target.to_string();
-    let current_owned = expected_current.to_string();
-
     // The conditional UPDATE runs as a single SQLite statement, which is atomic
     // on its own — no explicit transaction is needed because we never split the
     // read-check from the write. The WHERE predicate goes through json_extract
@@ -498,30 +492,215 @@ async fn atomic_gtd_transition(
     // terminal state) by the time the WHERE predicate is evaluated, the predicate
     // fails and rows_affected = 0. Caller distinguishes the rows-affected-0 loser
     // path from the pre-load terminal-state error returned by `load_task`.
+    let statement =
+        gtd_transition_statement(note_id, expected_current, target, new_props, updated_at)?;
     let sql = runtime.sql();
     let mut writer = sql
         .writer()
         .await
         .map_err(|e| RuntimeError::Internal(format!("sql writer: {e}")))?;
     let affected = writer
-        .execute(SqlStatement {
-            sql: "UPDATE notes SET properties = ?1, updated_at = ?2 \
-                  WHERE id = ?3 \
-                  AND json_extract(properties, '$.status') = ?4 \
-                  AND deleted_at IS NULL"
-                .to_string(),
-            params: vec![
-                SqlValue::Text(props_str),
-                SqlValue::Integer(updated_at),
-                SqlValue::Text(id_str),
-                SqlValue::Text(current_owned),
-            ],
-            label: Some(format!("gtd_atomic_transition_{target_owned}")),
-        })
+        .execute(statement)
         .await
         .map_err(|e| RuntimeError::Internal(format!("atomic transition update: {e}")))?;
 
     Ok(affected)
+}
+
+/// The exact conditional-UPDATE DML [`atomic_gtd_transition`] issues, as a
+/// plain [`SqlStatement`] — the single source of truth shared with the
+/// ADR-099 `--atomic` `gtd.transition`/`gtd.complete` prepare functions in
+/// `kkernel` (`crate::atomic_apply`, that crate — not this one — since
+/// `kkernel` depends on both `khive-runtime` and `khive-pack-gtd`). Canonical
+/// executes it immediately via the writer above; the atomic path turns it
+/// into a `PlanStatement` for the synchronous commit pass instead.
+pub fn gtd_transition_statement(
+    note_id: Uuid,
+    expected_current: &str,
+    target: &str,
+    new_props: &serde_json::Value,
+    updated_at: i64,
+) -> Result<SqlStatement, RuntimeError> {
+    let props_str = serde_json::to_string(new_props)
+        .map_err(|e| RuntimeError::Internal(format!("serialize props: {e}")))?;
+    Ok(SqlStatement {
+        sql: "UPDATE notes SET properties = ?1, updated_at = ?2 \
+              WHERE id = ?3 \
+              AND json_extract(properties, '$.status') = ?4 \
+              AND deleted_at IS NULL"
+            .to_string(),
+        params: vec![
+            SqlValue::Text(props_str),
+            SqlValue::Integer(updated_at),
+            SqlValue::Text(note_id.as_hyphenated().to_string()),
+            SqlValue::Text(expected_current.to_string()),
+        ],
+        label: Some(format!("gtd_atomic_transition_{target}")),
+    })
+}
+
+/// Outcome of [`prepare_transition`]'s decide step: either nothing to write
+/// (the idempotent `current == target` case, canonical's early return) or a
+/// fully computed patched `properties` value ready to apply — via
+/// `atomic_gtd_transition` (canonical, immediate) or
+/// [`gtd_transition_statement`] (ADR-099 atomic, deferred to the commit
+/// pass).
+pub enum TransitionDecision {
+    NoOp {
+        note: khive_storage::note::Note,
+        current: String,
+        target: String,
+    },
+    Write {
+        note: khive_storage::note::Note,
+        current: String,
+        target: String,
+        props: Value,
+        updated_at: i64,
+        transition_note: Option<String>,
+    },
+}
+
+/// Decide step of `gtd.transition` (ADR-099 B3 r6 second pass): normalizes
+/// and validates the target status, secret-gates the caller-supplied
+/// transition note, loads the task, and either returns the idempotent no-op
+/// case or the fully computed patch — all WITHOUT writing. `GtdPack::
+/// handle_transition` and the ADR-099 `--atomic` `gtd.transition` prepare
+/// function in `kkernel` both call this ONE function; only the apply
+/// mechanism differs.
+pub async fn prepare_transition(
+    runtime: &KhiveRuntime,
+    token: &NamespaceToken,
+    raw_id: &str,
+    raw_status: &str,
+    note_arg: Option<&str>,
+) -> Result<TransitionDecision, RuntimeError> {
+    let target = normalize_status(raw_status);
+    if !is_valid_status(target) {
+        return Err(RuntimeError::InvalidInput(format!(
+            "invalid status {raw_status:?} — valid: inbox, next, waiting, someday, active, done, cancelled \
+             (aliases: in_progress, todo, blocked, later, finished)"
+        )));
+    }
+    if let Some(n) = note_arg {
+        khive_runtime::secret_gate::check(n)?;
+    }
+
+    let (note, current) = load_task(runtime, token, raw_id).await?;
+
+    if current == target {
+        return Ok(TransitionDecision::NoOp {
+            note,
+            current,
+            target: target.to_string(),
+        });
+    }
+    if is_terminal(&current) {
+        return Err(RuntimeError::InvalidInput(format!(
+            "task {} is in terminal state {current:?}; no further transitions allowed",
+            short_id(note.id)
+        )));
+    }
+    if !can_transition(&current, target) {
+        let allowed = allowed_transitions(&current);
+        let allowed_display = if allowed.is_empty() {
+            "(none)".to_string()
+        } else {
+            allowed.join(", ")
+        };
+        return Err(RuntimeError::InvalidInput(format!(
+            "cannot transition from {current:?} to {target:?}; \
+             allowed from {current:?}: {allowed_display}. Full lifecycle: {TASK_LIFECYCLE_HELP}"
+        )));
+    }
+
+    let mut props = note.properties.clone().unwrap_or_else(|| json!({}));
+    if let Some(obj) = props.as_object_mut() {
+        obj.insert("status".into(), json!(target.to_string()));
+        if let Some(n) = note_arg {
+            obj.insert("transition_note".into(), json!(n));
+        }
+        if target == "done" {
+            obj.insert("completed_at".into(), json!(Utc::now().to_rfc3339()));
+        }
+    }
+    let updated_at = Utc::now().timestamp_micros();
+
+    Ok(TransitionDecision::Write {
+        note,
+        current,
+        target: target.to_string(),
+        props,
+        updated_at,
+        transition_note: note_arg.map(str::to_string),
+    })
+}
+
+/// Outcome of [`prepare_complete`]'s decide step: the fully computed patched
+/// `properties` value ready to apply. Unlike [`TransitionDecision`], there is
+/// no idempotent no-op case — `complete()` always writes when it succeeds.
+pub struct CompleteDecision {
+    pub note: khive_storage::note::Note,
+    pub current: String,
+    pub target: &'static str,
+    pub props: Value,
+    pub updated_at: i64,
+    pub completed_at: String,
+}
+
+/// Decide step of `gtd.complete` (ADR-099 B3 r6 second pass) — same split as
+/// [`prepare_transition`] above: validates the target terminal status,
+/// secret-gates the caller-supplied result, loads the task, checks the
+/// terminal/actionable guards, and computes the patched `properties` value,
+/// all WITHOUT writing. `GtdPack::handle_complete` and the ADR-099 `--atomic`
+/// `gtd.complete` prepare function in `kkernel` both call this ONE function.
+pub async fn prepare_complete(
+    runtime: &KhiveRuntime,
+    token: &NamespaceToken,
+    raw_id: &str,
+    status_arg: Option<&str>,
+    result_arg: Option<&str>,
+) -> Result<CompleteDecision, RuntimeError> {
+    let target = complete_target_status(status_arg)?;
+
+    if let Some(result) = result_arg {
+        khive_runtime::secret_gate::check(result)?;
+    }
+
+    let (note, current) = load_task(runtime, token, raw_id).await?;
+
+    if is_terminal(&current) {
+        return Err(RuntimeError::InvalidInput(format!(
+            "task {} is in terminal state {current:?}; no further transitions allowed",
+            short_id(note.id)
+        )));
+    }
+    if !is_actionable(&current) {
+        return Err(RuntimeError::InvalidInput(format!(
+            "complete: task in {current:?}; transition to 'next' or 'active' first, \
+             or use transition(status=done) explicitly"
+        )));
+    }
+
+    let completed_at = Utc::now().to_rfc3339();
+    let mut props = note.properties.clone().unwrap_or_else(|| json!({}));
+    if let Some(obj) = props.as_object_mut() {
+        obj.insert("status".into(), json!(target));
+        obj.insert("completed_at".into(), json!(completed_at));
+        if let Some(result) = result_arg {
+            obj.insert("result".into(), json!(result));
+        }
+    }
+    let updated_at = Utc::now().timestamp_micros();
+
+    Ok(CompleteDecision {
+        note,
+        current,
+        target,
+        props,
+        updated_at,
+        completed_at,
+    })
 }
 
 // ── handlers ─────────────────────────────────────────────────────────────────
@@ -829,48 +1008,32 @@ impl GtdPack {
     ) -> Result<Value, RuntimeError> {
         let p: CompleteParams = deser(params)?;
 
-        // CC-1: validate the target terminal status before any DB work.
-        // Accepts "done" (default) or "cancelled"; rejects anything else.
-        let target = complete_target_status(p.status.as_deref())?;
-
-        // Secret gate: scan free-text result before any DB interaction.
-        if let Some(ref result) = p.result {
-            khive_runtime::secret_gate::check(result)?;
-        }
-
-        let (mut note, current) = load_task(self.runtime(), token, &p.id).await?;
-
-        if is_terminal(&current) {
-            return Err(RuntimeError::InvalidInput(format!(
-                "task {} is in terminal state {current:?}; no further transitions allowed",
-                short_id(note.id)
-            )));
-        }
-        // UE2-H1: complete() is restricted to actionable states (next, active) only.
-        // Tasks in inbox/waiting/someday must be explicitly transitioned to an
-        // actionable state first. Use transition(status=done) to bypass this check.
-        if !is_actionable(&current) {
-            return Err(RuntimeError::InvalidInput(format!(
-                "complete: task in {current:?}; transition to 'next' or 'active' first, \
-                 or use transition(status=done) explicitly"
-            )));
-        }
-
-        let completed_at = Utc::now().to_rfc3339();
-        let mut props = note.properties.take().unwrap_or(json!({}));
-        if let Some(obj) = props.as_object_mut() {
-            // CC-1: write the caller-supplied target (done or cancelled).
-            obj.insert("status".into(), json!(target));
-            obj.insert("completed_at".into(), json!(completed_at));
-            if let Some(ref result) = p.result {
-                obj.insert("result".into(), json!(result));
-            }
-        }
+        // Decide step (ADR-099 B3 r6 second pass): validates the target
+        // terminal status, secret-gates the result, loads the task, checks
+        // the terminal/actionable guards, and computes the patched
+        // `properties` value — the SAME function the ADR-099 `--atomic`
+        // `gtd.complete` prepare path in `kkernel` calls.
+        let decision = prepare_complete(
+            self.runtime(),
+            token,
+            &p.id,
+            p.status.as_deref(),
+            p.result.as_deref(),
+        )
+        .await?;
+        let CompleteDecision {
+            mut note,
+            current,
+            target,
+            props,
+            updated_at,
+            completed_at,
+        } = decision;
         note.properties = Some(props);
         // notes.status is row-visibility (always "active" for live rows);
         // GTD status lives in properties.status and W1-G's remap surfaces it
         // at data.status in the response.
-        note.updated_at = Utc::now().timestamp_micros();
+        note.updated_at = updated_at;
 
         // ue-dsl-parallel C2: atomic transition — use a conditional SQL UPDATE
         // so that a concurrent complete() on the same task loses the race
@@ -1010,98 +1173,81 @@ impl GtdPack {
         params: Value,
     ) -> Result<Value, RuntimeError> {
         let p: TransitionParams = deser(params)?;
-        let target = normalize_status(&p.status);
-        if !is_valid_status(target) {
-            return Err(RuntimeError::InvalidInput(format!(
-                "invalid status {status:?} — valid: inbox, next, waiting, someday, active, done, cancelled \
-                 (aliases: in_progress, todo, blocked, later, finished)",
-                status = p.status
-            )));
-        }
-        // Secret gate: scan the caller-supplied transition note before any write.
-        if let Some(ref n) = p.note {
-            khive_runtime::secret_gate::check(n)?;
-        }
 
-        let (mut note, current) = load_task(self.runtime(), token, &p.id).await?;
+        // Decide step (ADR-099 B3 r6 second pass): normalizes/validates the
+        // target status, secret-gates the transition note, loads the task,
+        // and either returns the idempotent no-op case or the fully computed
+        // patch — the SAME function the ADR-099 `--atomic` `gtd.transition`
+        // prepare path in `kkernel` calls.
+        let decision =
+            prepare_transition(self.runtime(), token, &p.id, &p.status, p.note.as_deref()).await?;
 
-        if current == target {
-            // Idempotent — no write, no transition.
-            return Ok(json!({
-                "transitioned": false,
-                "id": short_id(note.id),
-                "full_id": note.id.as_hyphenated().to_string(),
-                "from": current,
-                "to": target,
-                "note": "already in target status",
-            }));
-        }
-        if is_terminal(&current) {
-            return Err(RuntimeError::InvalidInput(format!(
-                "task {} is in terminal state {current:?}; no further transitions allowed",
-                short_id(note.id)
-            )));
-        }
-        if !can_transition(&current, target) {
-            let allowed = allowed_transitions(&current);
-            let allowed_display = if allowed.is_empty() {
-                "(none)".to_string()
-            } else {
-                allowed.join(", ")
-            };
-            return Err(RuntimeError::InvalidInput(format!(
-                "cannot transition from {current:?} to {target:?}; \
-                 allowed from {current:?}: {allowed_display}. Full lifecycle: {TASK_LIFECYCLE_HELP}"
-            )));
-        }
-
-        let mut props = note.properties.take().unwrap_or(json!({}));
-        if let Some(obj) = props.as_object_mut() {
-            obj.insert("status".into(), json!(target.to_string()));
-            if let Some(ref n) = p.note {
-                obj.insert("transition_note".into(), json!(n));
+        let (note, current, target) = match decision {
+            TransitionDecision::NoOp {
+                note,
+                current,
+                target,
+            } => {
+                // Idempotent — no write, no transition.
+                return Ok(json!({
+                    "transitioned": false,
+                    "id": short_id(note.id),
+                    "full_id": note.id.as_hyphenated().to_string(),
+                    "from": current,
+                    "to": target,
+                    "note": "already in target status",
+                }));
             }
-            if target == "done" {
-                obj.insert("completed_at".into(), json!(Utc::now().to_rfc3339()));
+            TransitionDecision::Write {
+                mut note,
+                current,
+                target,
+                props,
+                updated_at,
+                transition_note,
+            } => {
+                note.properties = Some(props);
+                // notes.status is row-visibility (always "active" for live
+                // rows); GTD status lives in properties.status and W1-G's
+                // remap surfaces it at data.status in the response.
+                note.updated_at = updated_at;
+
+                // ue-dsl-parallel C2: atomic transition — conditional SQL
+                // UPDATE so concurrent transitions in the same parallel
+                // batch only one wins.
+                let rows_affected = atomic_gtd_transition(
+                    self.runtime(),
+                    note.id,
+                    &current,
+                    &target,
+                    note.properties.as_ref().unwrap(),
+                    note.updated_at,
+                )
+                .await?;
+
+                if rows_affected == 0 {
+                    let (_, actual_now) = load_task(self.runtime(), token, &p.id).await?;
+                    return Err(RuntimeError::InvalidInput(format!(
+                        "task {} is in terminal state {actual_now:?}; no further transitions allowed",
+                        short_id(note.id)
+                    )));
+                }
+
+                // Write lifecycle audit record (best-effort).
+                ensure_audit_schema(self.runtime()).await;
+                write_audit_record(
+                    self.runtime(),
+                    note.id,
+                    &current,
+                    &target,
+                    transition_note.as_deref(),
+                    token.namespace().as_str(),
+                )
+                .await;
+
+                (note, current, target)
             }
-        }
-        note.properties = Some(props);
-        // notes.status is row-visibility (always "active" for live rows);
-        // GTD status lives in properties.status and W1-G's remap surfaces it
-        // at data.status in the response.
-        note.updated_at = Utc::now().timestamp_micros();
-
-        // ue-dsl-parallel C2: atomic transition — conditional SQL UPDATE so
-        // concurrent transitions in the same parallel batch only one wins.
-        let rows_affected = atomic_gtd_transition(
-            self.runtime(),
-            note.id,
-            &current,
-            target,
-            note.properties.as_ref().unwrap(),
-            note.updated_at,
-        )
-        .await?;
-
-        if rows_affected == 0 {
-            let (_, actual_now) = load_task(self.runtime(), token, &p.id).await?;
-            return Err(RuntimeError::InvalidInput(format!(
-                "task {} is in terminal state {actual_now:?}; no further transitions allowed",
-                short_id(note.id)
-            )));
-        }
-
-        // Write lifecycle audit record (best-effort).
-        ensure_audit_schema(self.runtime()).await;
-        write_audit_record(
-            self.runtime(),
-            note.id,
-            &current,
-            target,
-            p.note.as_deref(),
-            token.namespace().as_str(),
-        )
-        .await;
+        };
 
         let task = render_task(&note);
         Ok(json!({
@@ -1110,7 +1256,7 @@ impl GtdPack {
             "full_id": task["full_id"],
             "from": current,
             "to": target,
-            "is_terminal": is_terminal(target),
+            "is_terminal": is_terminal(&target),
             "title": task["title"],
             "priority": task["priority"],
             "assignee": task["assignee"],
