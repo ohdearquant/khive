@@ -1073,11 +1073,16 @@ pub fn build_server(args: &Args) -> anyhow::Result<KhiveMcpServer> {
     // When no [[backends]] are declared, fall through to the existing single-backend path
     // to preserve byte-for-byte backward compatibility.
     //
-    // `config.db_path` (already resolved above) anchors tier-3 project-local config
-    // discovery to the database's own directory rather than the process cwd, so this
-    // reload agrees with the one inside `resolve_runtime_config` regardless of cwd.
+    // Deliberately `config_discovery_db_anchor(args.db.as_deref())`, NOT
+    // `config.db_path` — `config.db_path` (already resolved above) materializes
+    // the `$HOME/.khive/khive.db` default when `--db` is unset (#689), which
+    // would re-anchor this reload's tier-3 project-local config discovery to
+    // the home directory instead of the process cwd. This keeps the reload in
+    // agreement with the discovery anchor `resolve_runtime_config` already used
+    // to produce `config` above.
+    let db_path_for_config = config_discovery_db_anchor(args.db.as_deref());
     let khive_cfg =
-        KhiveConfig::load_with_home_fallback(args.config.as_deref(), config.db_path.as_deref())
+        KhiveConfig::load_with_home_fallback(args.config.as_deref(), db_path_for_config.as_deref())
             .map_err(|e| anyhow::anyhow!("config error: {e}"))?
             .unwrap_or_default();
 
