@@ -258,6 +258,20 @@ pub enum Resolved {
     },
 }
 
+/// A by-ID edge-endpoint substrate kind, including `Edge` itself.
+///
+/// Unlike [`Resolved`], this carries no record data — it is used where only
+/// the substrate classification is needed (coordinator locate/link parity
+/// with `get`, ADR-002 rule 1: `annotates` target may be entity, note, edge,
+/// or event).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EdgeEndpointKind {
+    Entity,
+    Note,
+    Event,
+    Edge,
+}
+
 /// Map a resolved endpoint to its `(substrate, kind, entity_type)` triple, or
 /// `None` if the substrate is not a valid edge endpoint (events, edges).
 ///
@@ -1540,6 +1554,51 @@ impl KhiveRuntime {
             )));
         }
 
+        Ok(())
+    }
+
+    /// Validate an `annotates` edge relation using pre-located endpoint kinds
+    /// (ADR-029 D3, #674).
+    ///
+    /// Sibling of [`Self::validate_link_endpoints_by_resolved`] for callers that
+    /// only have an [`EdgeEndpointKind`] (entity/note/event/edge) rather than a
+    /// full [`Resolved`] record — the `SubstrateCoordinator`'s cross-backend
+    /// `locate_endpoint` resolves edge-substrate UUIDs too (matching `get`'s
+    /// by-ID resolution order per ADR-002 rule 1), but edges have no `Resolved`
+    /// variant, so `validate_link_endpoints_by_resolved` cannot express them.
+    ///
+    /// `annotates` is the only relation this covers: source must be a note,
+    /// target may be any substrate (entity, note, event, or edge).
+    pub fn validate_annotates_endpoint_kinds(
+        &self,
+        source_id: Uuid,
+        target_id: Uuid,
+        source: Option<EdgeEndpointKind>,
+        target: Option<EdgeEndpointKind>,
+    ) -> RuntimeResult<()> {
+        if source_id == target_id {
+            return Err(RuntimeError::InvalidInput(
+                "self-loop edges are not allowed: source_id and target_id must be different".into(),
+            ));
+        }
+        match source {
+            Some(EdgeEndpointKind::Note) => {}
+            Some(_) => {
+                return Err(RuntimeError::InvalidInput(format!(
+                    "annotates source {source_id} must be a note"
+                )));
+            }
+            None => {
+                return Err(RuntimeError::NotFound(format!(
+                    "link source {source_id} not found"
+                )));
+            }
+        }
+        if target.is_none() {
+            return Err(RuntimeError::NotFound(format!(
+                "link target {target_id} not found"
+            )));
+        }
         Ok(())
     }
 

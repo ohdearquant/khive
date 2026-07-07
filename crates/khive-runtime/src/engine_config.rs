@@ -62,6 +62,13 @@ pub enum ConfigError {
          remove it from the config or wait for a future release that implements it"
     )]
     UnsupportedBackendField { name: String, field: &'static str },
+
+    #[error(
+        "top-level `db = {value:?}` is not a supported config-file key; \
+         use `--db` / `KHIVE_DB` to select a single-file database, or \
+         `[[backends]].path` to declare storage backend topology"
+    )]
+    UnsupportedTopLevelDb { value: String },
 }
 
 // ---- Config structs ----
@@ -235,6 +242,14 @@ pub struct PackConfig {
 /// Unknown keys are silently ignored by serde — forward-compatible.
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct KhiveConfig {
+    /// Typed only so a top-level `db` key can be rejected loudly by
+    /// [`KhiveConfig::validate`] instead of being silently ignored as an
+    /// unknown key. Not a supported config-file storage selector: single-file
+    /// database selection is `--db`/`KHIVE_DB`, and storage topology is
+    /// `[[backends]].path`.
+    #[serde(default)]
+    pub db: Option<String>,
+
     /// Embedding engine declarations.
     #[serde(default)]
     pub engines: Vec<EngineConfig>,
@@ -458,6 +473,19 @@ impl KhiveConfig {
     /// Model name validity is checked lazily at runtime (the config loader does
     /// not import `lattice_embed` directly to keep the dep surface minimal).
     pub fn validate(&self) -> Result<(), ConfigError> {
+        // Reject a top-level `db` key loudly (#689) instead of letting serde's
+        // forward-compatible unknown-key tolerance silently swallow it: a config
+        // author who writes `db = "..."` expecting it to select the database
+        // would otherwise get silent divergence from the actual database opened
+        // via `--db`/`KHIVE_DB`.
+        if let Some(value) = self.db.as_deref() {
+            if !value.is_empty() {
+                return Err(ConfigError::UnsupportedTopLevelDb {
+                    value: value.to_string(),
+                });
+            }
+        }
+
         // Validate actor.id when present — an invalid namespace is a startup error,
         // not a silent fallback.
         if let Some(id) = self.actor.id.as_deref() {
@@ -1599,6 +1627,25 @@ journal_mode = "wal"
         assert!(
             matches!(err, ConfigError::UnsupportedBackendField { ref name, field: "journal_mode" } if name == "main"),
             "expected UnsupportedBackendField {{ name: \"main\", field: \"journal_mode\" }}, got {err:?}"
+        );
+    }
+
+    // #689: a top-level `db` key must be rejected loudly at validate() instead
+    // of being silently ignored as an unknown key (serde's forward-compatible
+    // default) — the exact incident class the tier-3 discovery fix closes.
+    #[test]
+    fn test_top_level_db_rejected_at_validate() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_toml(
+            &dir,
+            r#"
+db = "/tmp/scratch/demo.db"
+"#,
+        );
+        let err = KhiveConfig::load(Some(&path)).expect_err("top-level db must be rejected");
+        assert!(
+            matches!(err, ConfigError::UnsupportedTopLevelDb { ref value } if value == "/tmp/scratch/demo.db"),
+            "expected UnsupportedTopLevelDb {{ value: \"/tmp/scratch/demo.db\" }}, got {err:?}"
         );
     }
 }

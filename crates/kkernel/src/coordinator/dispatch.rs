@@ -7,7 +7,9 @@ use std::time::Duration;
 use tokio::task::JoinError;
 use uuid::Uuid;
 
-use khive_runtime::{BackendId, KhiveRuntime, NoteSearchHit, SearchHit};
+use khive_runtime::{
+    BackendId, EdgeEndpointKind, KhiveRuntime, NoteSearchHit, Resolved, SearchHit,
+};
 use khive_score::DeterministicScore;
 use khive_storage::EdgeRelation;
 use khive_types::namespace::Namespace;
@@ -25,6 +27,16 @@ pub struct BackendSearchResult {
     pub hits: Vec<SearchHit>,
     pub note_hits: Vec<NoteSearchHit>,
     pub error: Option<String>,
+}
+
+/// A located edge endpoint: which backend owns it, and its substrate kind.
+///
+/// `kind` lets cross-backend `annotates` validation accept edge-substrate
+/// targets (ADR-002 rule 1) without a second DB round-trip once located.
+#[derive(Clone, Debug)]
+struct LocatedEndpoint {
+    backend_id: BackendId,
+    kind: EdgeEndpointKind,
 }
 
 /// Cross-backend dispatch layer.
@@ -117,11 +129,32 @@ impl SubstrateCoordinator {
     /// is sufficient — the stored namespace is NOT compared to the caller namespace.
     /// The `namespace` parameter is used only for `runtime.authorize()` capability checks.
     ///
-    /// Checks the locator cache first; on a miss, scans all backends concurrently.
-    /// Probes both entity and note substrates.
+    /// Delegates to the private `locate_endpoint`, which resolves in the same
+    /// substrate order as `get` (entity/note/event, then edge — #674), so a
+    /// full-UUID `link` endpoint locates exactly what `get` resolves for the
+    /// same UUID.
     pub async fn locate(&self, id: Uuid, namespace: &Namespace) -> Option<BackendId> {
+        self.locate_endpoint(id, namespace)
+            .await
+            .map(|e| e.backend_id)
+    }
+
+    /// Resolve which backend owns the substrate node identified by `id`,
+    /// together with its endpoint kind (entity, note, event, or edge).
+    ///
+    /// Namespace-agnostic per ADR-007 Rev 3, same contract as [`Self::locate`].
+    /// Checks the locator cache first; on a miss, scans all backends concurrently.
+    /// Resolves in the same substrate order as `get` (ADR-002 rule 1 parity,
+    /// #674): entity/note/event via `resolve_edge_endpoint`, then edge via
+    /// `get_edge`.
+    async fn locate_endpoint(&self, id: Uuid, namespace: &Namespace) -> Option<LocatedEndpoint> {
         if let Some(backend_id) = self.locator.get(id) {
-            return Some(backend_id);
+            let runtime = self
+                .registry
+                .get(&backend_id)
+                .map(|e| Arc::clone(&e.runtime))?;
+            let kind = Self::probe_endpoint_kind(&runtime, namespace, id).await?;
+            return Some(LocatedEndpoint { backend_id, kind });
         }
 
         let entries: Vec<(BackendId, Arc<KhiveRuntime>)> = self
@@ -136,32 +169,12 @@ impl SubstrateCoordinator {
 
         if entries.len() == 1 {
             let (backend_id, runtime) = &entries[0];
-            let token = match runtime.authorize(namespace.clone()) {
-                Ok(t) => t,
-                Err(e) => {
-                    tracing::warn!(error = %e, "locate: authorization denied for namespace");
-                    return None;
-                }
-            };
-            // ADR-007 Rev 3: presence on this backend is sufficient.
-            // Do NOT filter by stored record namespace.
-            let entity_owned = match runtime.entities(&token) {
-                Ok(store) => store.get_entity(id).await.ok().flatten().is_some(),
-                Err(_) => false,
-            };
-            if entity_owned {
-                self.locator.insert(id, backend_id.clone());
-                return Some(backend_id.clone());
-            }
-            let note_owned = match runtime.notes(&token) {
-                Ok(store) => store.get_note(id).await.ok().flatten().is_some(),
-                Err(_) => false,
-            };
-            if note_owned {
-                self.locator.insert(id, backend_id.clone());
-                return Some(backend_id.clone());
-            }
-            return None;
+            let kind = Self::probe_endpoint_kind(runtime, namespace, id).await?;
+            self.locator.insert(id, backend_id.clone());
+            return Some(LocatedEndpoint {
+                backend_id: backend_id.clone(),
+                kind,
+            });
         }
 
         let ns_clone = namespace.clone();
@@ -172,40 +185,60 @@ impl SubstrateCoordinator {
             let ns = ns_clone.clone();
             let locator = Arc::clone(&locator);
             let handle = tokio::spawn(async move {
-                let token = match runtime.authorize(ns.clone()) {
-                    Ok(t) => t,
-                    Err(e) => {
-                        tracing::warn!(error = %e, "locate: authorization denied for namespace");
-                        return None;
-                    }
-                };
-                // ADR-007 Rev 3: presence on this backend is sufficient.
-                // Do NOT filter by stored record namespace.
-                if let Ok(store) = runtime.entities(&token) {
-                    if let Ok(Some(_)) = store.get_entity(id).await {
-                        locator.insert(id, backend_id.clone());
-                        return Some(backend_id);
-                    }
-                }
-                if let Ok(store) = runtime.notes(&token) {
-                    if let Ok(Some(_)) = store.get_note(id).await {
-                        locator.insert(id, backend_id.clone());
-                        return Some(backend_id);
-                    }
-                }
-                None
+                let kind = Self::probe_endpoint_kind(&runtime, &ns, id).await?;
+                locator.insert(id, backend_id.clone());
+                Some(LocatedEndpoint { backend_id, kind })
             });
             handles.push(handle);
         }
 
-        let results: Vec<Result<Option<BackendId>, JoinError>> =
+        let results: Vec<Result<Option<LocatedEndpoint>, JoinError>> =
             futures_util::future::join_all(handles).await;
         for result in results {
-            if let Ok(Some(backend_id)) = result {
-                return Some(backend_id);
+            if let Ok(Some(located)) = result {
+                return Some(located);
             }
         }
         None
+    }
+
+    /// Probe a single backend for `id`'s substrate kind, authorizing for
+    /// `namespace` first.
+    ///
+    /// ADR-007 Rev 3: presence on this backend is sufficient — the stored
+    /// record namespace is NOT compared to the caller namespace. Mirrors the
+    /// by-ID resolution order `get` uses: entity/note/event first
+    /// (`resolve_edge_endpoint`), then edge (`get_edge`).
+    async fn probe_endpoint_kind(
+        runtime: &Arc<KhiveRuntime>,
+        namespace: &Namespace,
+        id: Uuid,
+    ) -> Option<EdgeEndpointKind> {
+        let token = match runtime.authorize(namespace.clone()) {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::warn!(error = %e, "locate_endpoint: authorization denied for namespace");
+                return None;
+            }
+        };
+        match runtime.resolve_edge_endpoint(&token, id).await {
+            Ok(Some(Resolved::Entity(_))) => return Some(EdgeEndpointKind::Entity),
+            Ok(Some(Resolved::Note(_))) => return Some(EdgeEndpointKind::Note),
+            Ok(Some(Resolved::Event(_))) => return Some(EdgeEndpointKind::Event),
+            Ok(Some(Resolved::PackRecord { .. })) | Ok(None) => {}
+            Err(e) => {
+                tracing::warn!(error = %e, "locate_endpoint: resolve_edge_endpoint failed");
+                return None;
+            }
+        }
+        match runtime.get_edge(&token, id).await {
+            Ok(Some(_)) => Some(EdgeEndpointKind::Edge),
+            Ok(None) => None,
+            Err(e) => {
+                tracing::warn!(error = %e, "locate_endpoint: get_edge failed");
+                None
+            }
+        }
     }
 
     /// Prewarm the locator cache after a successful create.
@@ -241,14 +274,17 @@ impl SubstrateCoordinator {
         weight: f64,
         metadata: Option<serde_json::Value>,
     ) -> Result<khive_storage::Edge, String> {
-        let src_backend = self
-            .locate(source_id, namespace)
+        let src_located = self
+            .locate_endpoint(source_id, namespace)
             .await
             .ok_or_else(|| format!("node {source_id} not found on any backend"))?;
-        let tgt_backend = self
-            .locate(target_id, namespace)
+        let tgt_located = self
+            .locate_endpoint(target_id, namespace)
             .await
             .ok_or_else(|| format!("node {target_id} not found on any backend"))?;
+
+        let src_backend = src_located.backend_id.clone();
+        let tgt_backend = tgt_located.backend_id.clone();
 
         let src_runtime = self
             .registry
@@ -268,8 +304,22 @@ impl SubstrateCoordinator {
                 .validate_link_endpoints(&token, source_id, target_id, relation)
                 .await
                 .map_err(|e| e.to_string())?;
+        } else if relation == EdgeRelation::Annotates {
+            // Cross-backend annotates: `locate_endpoint` already resolved each
+            // endpoint's substrate kind using the same by-ID order `get` uses
+            // (ADR-002 rule 1 parity, #674), including edge-substrate targets
+            // that `resolve_primary`/`Resolved` cannot express — no extra
+            // cross-backend DB lookup is needed.
+            src_runtime
+                .validate_annotates_endpoint_kinds(
+                    source_id,
+                    target_id,
+                    Some(src_located.kind),
+                    Some(tgt_located.kind),
+                )
+                .map_err(|e| e.to_string())?;
         } else {
-            // Cross-backend: the target entity lives on a different backend so the source
+            // Cross-backend, non-annotates: the target entity lives on a different backend so the source
             // runtime cannot resolve it via its own DB. Fetch each endpoint from its
             // respective backend and validate the ADR-002 kind-pairing rules using the
             // pre-fetched records (no cross-backend DB lookup required).
