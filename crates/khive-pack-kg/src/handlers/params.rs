@@ -87,9 +87,15 @@ pub(crate) struct ListParams {
 #[serde(deny_unknown_fields)]
 pub(crate) struct StatsParams {}
 
+/// ADR-099 B3: this struct is `pub` (not `pub(crate)`) SPECIFICALLY so
+/// `kkernel`'s `--atomic` validation seam (`atomic_apply::validate_atomic_args`)
+/// can deserialize an op's args through the SAME canonical struct
+/// `handle_update` uses, reproducing `deny_unknown_fields` rejection with
+/// zero duplicated field lists. Fields stay `pub(crate)` — the atomic seam
+/// only needs the `Result<_, _>` outcome, never field access.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct UpdateParams {
+pub struct UpdateParams {
     pub(crate) id: String,
     pub(crate) kind: Option<String>,
     pub(crate) name: Option<Value>,
@@ -106,9 +112,11 @@ pub(crate) struct UpdateParams {
     pub(crate) entity_kind: Option<Value>,
 }
 
+/// ADR-099 B3: `pub` for the same reason as `UpdateParams` above — reused
+/// by the atomic seam to validate `delete` args.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct DeleteParams {
+pub struct DeleteParams {
     pub(crate) id: String,
     pub(crate) kind: Option<String>,
     pub(crate) hard: Option<bool>,
@@ -155,9 +163,13 @@ pub(crate) struct BulkLinkEntry {
     pub(crate) dependency_kind: Option<String>,
 }
 
+/// ADR-099 B3: `pub` for the same reason as `UpdateParams` above — reused
+/// by the atomic seam to validate `link` args. `BulkLinkEntry` (the type of
+/// `links` below) stays `pub(crate)`: the `links` field itself is
+/// `pub(crate)`, so it never appears in `LinkParams`'s public surface.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct LinkParams {
+pub struct LinkParams {
     pub(crate) source_id: Option<String>,
     pub(crate) target_id: Option<String>,
     pub(crate) relation: Option<String>,

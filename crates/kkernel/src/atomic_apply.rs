@@ -244,12 +244,67 @@ fn describe_failure(failure: &AtomicOpFailure) -> String {
     }
 }
 
+/// ADR-099 B3 parity fix: reject unknown/typo'd arg keys on the five v1
+/// atomic-admissible write verbs, BEFORE building any plan.
+///
+/// Canonical (non-atomic) `handle_update`/`handle_delete`/`handle_link`
+/// (`khive-pack-kg`) and `handle_transition`/`handle_complete`
+/// (`khive-pack-gtd`) all deserialize their args through a
+/// `#[serde(deny_unknown_fields)]` param struct, so a typo like
+/// `conten` (for `content`) is rejected with `bad params: unknown field
+/// 'conten'` rather than silently ignored. The pre-fix `--atomic` path had
+/// no equivalent gate: each `prepare_*` fn only read the keys it knew
+/// about via `obj(args)?.get(...)`, so a typo'd key was dropped on the
+/// floor and the op reported `ok:true` with every OTHER field reset to its
+/// current value — the caller's intended change silently lost.
+///
+/// This is Approach A (reuse, not reimplement): `kkernel` already depends
+/// on both `khive-pack-kg` and `khive-pack-gtd` directly (see
+/// `kkernel/Cargo.toml`) — no crate-graph inversion is needed to reach
+/// their param structs, which are now re-exported `pub` (widened from
+/// `pub(crate)`/private specifically for this seam; see the doc comments
+/// on `UpdateParams`/`DeleteParams`/`LinkParams`
+/// [`khive_pack_kg::handlers::params`] and
+/// `TransitionParams`/`CompleteParams` [`khive_pack_gtd::handlers`]).
+/// Deserializing an op's args through the SAME struct the canonical
+/// handler uses reproduces its `deny_unknown_fields` rejection AND its
+/// exact error message shape for free, with no duplicated key list to
+/// drift out of sync. The deserialized value is discarded — the
+/// `prepare_*` fns below still read from the raw `Value` map unchanged;
+/// this is a pure additive gate in front of them.
+///
+/// `merge`, `create`, and the read/governance verbs are out of scope here:
+/// `merge` and the embedding-bearing/read/governance verbs are already
+/// rejected earlier, at `check_atomic_admissible` (before this function is
+/// ever reached) or are not part of the v1 admissible set at all.
+fn validate_atomic_args(tool: &str, args: &Value) -> anyhow::Result<()> {
+    fn reject<T: serde::de::DeserializeOwned>(args: &Value) -> anyhow::Result<()> {
+        serde_json::from_value::<T>(args.clone())
+            .map(|_| ())
+            .map_err(|e| anyhow::anyhow!("bad params: {e}"))
+    }
+
+    match tool {
+        // kg substrate verbs — `UpdateParams` covers both update-entity and
+        // update-note (the canonical handler resolves which from `id`, not
+        // from a separate struct); same struct, so one branch covers both.
+        "update" => reject::<khive_pack_kg::handlers::UpdateParams>(args),
+        "delete" => reject::<khive_pack_kg::handlers::DeleteParams>(args),
+        "link" => reject::<khive_pack_kg::handlers::LinkParams>(args),
+        // gtd verbs.
+        "gtd.transition" => reject::<khive_pack_gtd::handlers::TransitionParams>(args),
+        "gtd.complete" => reject::<khive_pack_gtd::handlers::CompleteParams>(args),
+        _ => Ok(()),
+    }
+}
+
 async fn prepare_one(
     runtime: &KhiveRuntime,
     token: &NamespaceToken,
     tool: &str,
     args: &Value,
 ) -> anyhow::Result<AtomicOpPlan> {
+    validate_atomic_args(tool, args)?;
     match tool {
         "gtd.transition" => prepare_gtd_transition(runtime, token, args)
             .await
@@ -517,6 +572,98 @@ async fn prepare_gtd_complete(
             namespace: token.namespace().as_str().to_string(),
         },
     }))
+}
+
+/// ADR-099 B3 fix (deny_unknown_fields parity): `validate_atomic_args`
+/// unit coverage. These are syntactic-only checks (no runtime/db needed) —
+/// full end-to-end "typo doesn't mutate the row" coverage lives in
+/// `kkernel::exec::tests::atomic_update_unknown_field_is_rejected_and_does_not_mutate_row`.
+#[cfg(test)]
+mod validate_atomic_args_tests {
+    use super::validate_atomic_args;
+    use serde_json::json;
+
+    #[test]
+    fn update_rejects_unknown_field() {
+        let err = validate_atomic_args("update", &json!({"id": "x", "conten": "hello"}))
+            .expect_err("typo'd `conten` must be rejected");
+        assert!(err.to_string().contains("unknown field"), "error: {err}");
+    }
+
+    #[test]
+    fn update_accepts_well_formed_args() {
+        validate_atomic_args("update", &json!({"id": "x", "content": "hello"}))
+            .expect("well-formed update args must be accepted");
+    }
+
+    #[test]
+    fn delete_rejects_unknown_field() {
+        let err = validate_atomic_args("delete", &json!({"id": "x", "hardd": true}))
+            .expect_err("typo'd `hardd` must be rejected");
+        assert!(err.to_string().contains("unknown field"), "error: {err}");
+    }
+
+    #[test]
+    fn delete_accepts_well_formed_args() {
+        validate_atomic_args("delete", &json!({"id": "x", "hard": true}))
+            .expect("well-formed delete args must be accepted");
+    }
+
+    #[test]
+    fn link_rejects_unknown_field() {
+        let err = validate_atomic_args(
+            "link",
+            &json!({
+                "source_id": "a",
+                "target_id": "b",
+                "relation": "extends",
+                "targt_backend": "x",
+            }),
+        )
+        .expect_err("typo'd `targt_backend` must be rejected");
+        assert!(err.to_string().contains("unknown field"), "error: {err}");
+    }
+
+    #[test]
+    fn link_accepts_well_formed_args() {
+        validate_atomic_args(
+            "link",
+            &json!({"source_id": "a", "target_id": "b", "relation": "extends"}),
+        )
+        .expect("well-formed link args must be accepted");
+    }
+
+    #[test]
+    fn gtd_transition_rejects_unknown_field() {
+        let err = validate_atomic_args(
+            "gtd.transition",
+            &json!({"id": "x", "status": "next", "notee": "typo"}),
+        )
+        .expect_err("typo'd `notee` must be rejected");
+        assert!(err.to_string().contains("unknown field"), "error: {err}");
+    }
+
+    #[test]
+    fn gtd_transition_accepts_well_formed_args() {
+        validate_atomic_args(
+            "gtd.transition",
+            &json!({"id": "x", "status": "next", "note": "ok"}),
+        )
+        .expect("well-formed gtd.transition args must be accepted");
+    }
+
+    #[test]
+    fn gtd_complete_rejects_unknown_field() {
+        let err = validate_atomic_args("gtd.complete", &json!({"id": "x", "resutl": "typo"}))
+            .expect_err("typo'd `resutl` must be rejected");
+        assert!(err.to_string().contains("unknown field"), "error: {err}");
+    }
+
+    #[test]
+    fn gtd_complete_accepts_well_formed_args() {
+        validate_atomic_args("gtd.complete", &json!({"id": "x", "result": "ok"}))
+            .expect("well-formed gtd.complete args must be accepted");
+    }
 }
 
 #[cfg(test)]

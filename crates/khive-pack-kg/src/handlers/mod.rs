@@ -16,11 +16,20 @@ mod update;
 
 pub(crate) use common::{canonical_entity_kind, canonical_note_kind, parse_relation};
 
+/// ADR-099 B3: re-exported as a real `pub` path (not `pub(crate)`) so
+/// `kkernel`'s `--atomic` validation seam can reach the SAME canonical
+/// param structs `handle_update`/`handle_delete`/`handle_link` deserialize
+/// through, reproducing their `#[serde(deny_unknown_fields)]` rejection
+/// without a duplicated per-verb key list. `kkernel` already depends on
+/// this crate directly (no crate-graph inversion); see
+/// `kkernel::atomic_apply::validate_atomic_args`.
+pub use params::{DeleteParams, LinkParams, UpdateParams};
+
 #[cfg(test)]
 pub(crate) use common::{
     ensure_note_kind, normalize_entity_timestamps, normalize_entity_timestamps_array,
     resolve_kind_spec, tags_match_any, valid_relations_for_entity_pair, validate_weight,
-    walk_timestamps, KindSpec, ListParams, ProposeParams, ReviewParams, SearchParams, UpdateParams,
+    walk_timestamps, KindSpec, ListParams, ProposeParams, ReviewParams, SearchParams,
     WithdrawParams,
 };
 

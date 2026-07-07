@@ -192,9 +192,15 @@ struct NextParams {
     assignee: Option<String>,
 }
 
+/// ADR-099 B3: `pub` (not module-private) SPECIFICALLY so `kkernel`'s
+/// `--atomic` validation seam (`atomic_apply::validate_atomic_args`) can
+/// deserialize an op's args through the SAME canonical struct
+/// `handle_complete` uses, reproducing `deny_unknown_fields` rejection with
+/// zero duplicated field lists. Fields stay private — the atomic seam only
+/// needs the `Result<_, _>` outcome, never field access.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct CompleteParams {
+pub struct CompleteParams {
     id: String,
     #[serde(default)]
     result: Option<String>,
@@ -233,9 +239,11 @@ struct TasksParams {
     offset: Option<u32>,
 }
 
+/// ADR-099 B3: `pub` for the same reason as `CompleteParams` above —
+/// reused by the atomic seam to validate `gtd.transition` args.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct TransitionParams {
+pub struct TransitionParams {
     id: String,
     status: String,
     #[serde(default)]

@@ -2316,4 +2316,389 @@ backend = "sessions"
             );
         }
     }
+
+    // ── ADR-099 B3 fix: `--atomic` deny_unknown_fields parity ────────────────
+    //
+    // Canonical `update`/`delete`/`link`/`gtd.transition`/`gtd.complete`
+    // reject unknown/typo'd arg keys via `#[serde(deny_unknown_fields)]` on
+    // their param structs. Pre-fix, `--atomic` silently dropped unrecognized
+    // keys instead of rejecting the op — a typo like `conten` (for
+    // `content`) would report `ok:true` while quietly discarding the
+    // caller's intended change. These tests exercise the fix at the same
+    // `execute_atomic_ops_file` seam as the acceptance tests above, and are
+    // the end-to-end counterpart to the syntactic-only unit coverage in
+    // `atomic_apply::validate_atomic_args_tests`.
+
+    /// Sharp case called out explicitly: atomic `update(id=X,
+    /// conten="hello")` (typo of `content`) must be rejected AND must not
+    /// mutate the row — no `content` change, no `updated_at` bump. Pre-fix,
+    /// this silently discarded `conten`, reset every other field to its
+    /// current value, bumped `updated_at`, and reported `ok:true`.
+    #[tokio::test]
+    async fn atomic_update_entity_unknown_field_is_rejected_and_does_not_mutate_row() {
+        let db_file = NamedTempFile::new().expect("temp db");
+        let db_path = db_file.path().to_str().expect("utf8").to_string();
+
+        let (entity_id, updated_at_before) = {
+            let server = isolated_server(&db_path);
+            let resp = dispatch_json(
+                &server,
+                r#"create(kind="concept", name="TypoGuardX", description="original")"#,
+            )
+            .await;
+            let id = resp["results"][0]["result"]["id"]
+                .as_str()
+                .expect("id")
+                .to_string();
+            let get_resp = dispatch_json(&server, &format!(r#"get(id="{id}")"#)).await;
+            let updated_at = get_resp["results"][0]["result"]["updated_at"].clone();
+            (id, updated_at)
+        };
+
+        let ops = vec![atomic_op(
+            "update",
+            serde_json::json!({"id": entity_id, "conten": "hello"}),
+        )];
+        let khive_cfg = KhiveConfig::default();
+        let err = crate::atomic_apply::execute_atomic_ops_file(
+            ops,
+            atomic_cfg(&db_path),
+            &khive_cfg,
+            khive_types::pack::ATOMIC_MAX_OPS_DEFAULT,
+        )
+        .await
+        .expect_err("typo'd `conten` must be rejected, not silently dropped");
+        assert!(
+            format!("{err:#}").contains("unknown field"),
+            "error: {err:#}"
+        );
+
+        let server = isolated_server(&db_path);
+        let get_resp = dispatch_json(&server, &format!(r#"get(id="{entity_id}")"#)).await;
+        assert_eq!(
+            get_resp["results"][0]["result"]["description"], "original",
+            "a rejected op must not have mutated description: {get_resp}"
+        );
+        assert_eq!(
+            get_resp["results"][0]["result"]["updated_at"], updated_at_before,
+            "a rejected op must not bump updated_at (no write happened): {get_resp}"
+        );
+    }
+
+    /// update-note variant of the same parity fix: a typo'd key on a note
+    /// update must be rejected, and a well-formed note update still
+    /// succeeds (parity boundary — don't over-reject).
+    #[tokio::test]
+    async fn atomic_update_note_unknown_field_rejected_well_formed_succeeds() {
+        let db_file = NamedTempFile::new().expect("temp db");
+        let db_path = db_file.path().to_str().expect("utf8").to_string();
+
+        let note_id = {
+            let server = isolated_server(&db_path);
+            let resp = dispatch_json(
+                &server,
+                r#"create(kind="observation", content="original note")"#,
+            )
+            .await;
+            resp["results"][0]["result"]["id"]
+                .as_str()
+                .expect("id")
+                .to_string()
+        };
+
+        // (a) unknown field rejected.
+        let khive_cfg = KhiveConfig::default();
+        let ops = vec![atomic_op(
+            "update",
+            serde_json::json!({"id": note_id, "conten": "typo'd"}),
+        )];
+        let err = crate::atomic_apply::execute_atomic_ops_file(
+            ops,
+            atomic_cfg(&db_path),
+            &khive_cfg,
+            khive_types::pack::ATOMIC_MAX_OPS_DEFAULT,
+        )
+        .await
+        .expect_err("typo'd `conten` on a note update must be rejected");
+        assert!(
+            format!("{err:#}").contains("unknown field"),
+            "error: {err:#}"
+        );
+
+        // (b) well-formed update still succeeds.
+        let ops = vec![atomic_op(
+            "update",
+            serde_json::json!({"id": note_id, "content": "updated note"}),
+        )];
+        let envelope = crate::atomic_apply::execute_atomic_ops_file(
+            ops,
+            atomic_cfg(&db_path),
+            &khive_cfg,
+            khive_types::pack::ATOMIC_MAX_OPS_DEFAULT,
+        )
+        .await
+        .expect("a well-formed note update must succeed");
+        assert_eq!(
+            envelope["atomic"]["committed"], true,
+            "envelope: {envelope}"
+        );
+
+        let server = isolated_server(&db_path);
+        let get_resp = dispatch_json(&server, &format!(r#"get(id="{note_id}")"#)).await;
+        assert_eq!(
+            get_resp["results"][0]["result"]["content"], "updated note",
+            "the well-formed update must have landed: {get_resp}"
+        );
+    }
+
+    /// `delete`: a typo'd key (`hardd` for `hard`) must be rejected before
+    /// any write; a well-formed delete still succeeds.
+    #[tokio::test]
+    async fn atomic_delete_unknown_field_rejected_well_formed_succeeds() {
+        let db_file = NamedTempFile::new().expect("temp db");
+        let db_path = db_file.path().to_str().expect("utf8").to_string();
+
+        let entity_id = {
+            let server = isolated_server(&db_path);
+            let resp =
+                dispatch_json(&server, r#"create(kind="concept", name="DeleteTypoGuard")"#).await;
+            resp["results"][0]["result"]["id"]
+                .as_str()
+                .expect("id")
+                .to_string()
+        };
+
+        // (a) unknown field rejected — entity must survive.
+        let khive_cfg = KhiveConfig::default();
+        let ops = vec![atomic_op(
+            "delete",
+            serde_json::json!({"id": entity_id, "hardd": true}),
+        )];
+        let err = crate::atomic_apply::execute_atomic_ops_file(
+            ops,
+            atomic_cfg(&db_path),
+            &khive_cfg,
+            khive_types::pack::ATOMIC_MAX_OPS_DEFAULT,
+        )
+        .await
+        .expect_err("typo'd `hardd` must be rejected");
+        assert!(
+            format!("{err:#}").contains("unknown field"),
+            "error: {err:#}"
+        );
+        let server = isolated_server(&db_path);
+        let get_resp = dispatch_json(&server, &format!(r#"get(id="{entity_id}")"#)).await;
+        assert!(
+            get_resp["results"][0]["result"]["deleted_at"].is_null(),
+            "a rejected delete must not have deleted the entity: {get_resp}"
+        );
+
+        // (b) well-formed delete still succeeds.
+        let ops = vec![atomic_op("delete", serde_json::json!({"id": entity_id}))];
+        let envelope = crate::atomic_apply::execute_atomic_ops_file(
+            ops,
+            atomic_cfg(&db_path),
+            &khive_cfg,
+            khive_types::pack::ATOMIC_MAX_OPS_DEFAULT,
+        )
+        .await
+        .expect("a well-formed delete must succeed");
+        assert_eq!(
+            envelope["atomic"]["committed"], true,
+            "envelope: {envelope}"
+        );
+    }
+
+    /// `link`: a typo'd key (`relatoin` for `relation`) must be rejected
+    /// before any write; a well-formed link still succeeds. (Distinct from
+    /// the Leo-accepted `target_backend` conflict-arm deferral — out of
+    /// scope here.)
+    #[tokio::test]
+    async fn atomic_link_unknown_field_rejected_well_formed_succeeds() {
+        let db_file = NamedTempFile::new().expect("temp db");
+        let db_path = db_file.path().to_str().expect("utf8").to_string();
+
+        let (a_id, b_id) = {
+            let server = isolated_server(&db_path);
+            let resp = dispatch_json(
+                &server,
+                r#"[create(kind="concept", name="LinkTypoA"), create(kind="concept", name="LinkTypoB")]"#,
+            )
+            .await;
+            let a_id = resp["results"][0]["result"]["id"]
+                .as_str()
+                .expect("a id")
+                .to_string();
+            let b_id = resp["results"][1]["result"]["id"]
+                .as_str()
+                .expect("b id")
+                .to_string();
+            (a_id, b_id)
+        };
+
+        // (a) unknown field rejected.
+        let khive_cfg = KhiveConfig::default();
+        let ops = vec![atomic_op(
+            "link",
+            serde_json::json!({
+                "source_id": a_id,
+                "target_id": b_id,
+                "relation": "extends",
+                "relatoin": "extends",
+            }),
+        )];
+        let err = crate::atomic_apply::execute_atomic_ops_file(
+            ops,
+            atomic_cfg(&db_path),
+            &khive_cfg,
+            khive_types::pack::ATOMIC_MAX_OPS_DEFAULT,
+        )
+        .await
+        .expect_err("typo'd `relatoin` must be rejected");
+        assert!(
+            format!("{err:#}").contains("unknown field"),
+            "error: {err:#}"
+        );
+
+        // (b) well-formed link still succeeds.
+        let ops = vec![atomic_op(
+            "link",
+            serde_json::json!({"source_id": a_id, "target_id": b_id, "relation": "extends"}),
+        )];
+        let envelope = crate::atomic_apply::execute_atomic_ops_file(
+            ops,
+            atomic_cfg(&db_path),
+            &khive_cfg,
+            khive_types::pack::ATOMIC_MAX_OPS_DEFAULT,
+        )
+        .await
+        .expect("a well-formed link must succeed");
+        assert_eq!(
+            envelope["atomic"]["committed"], true,
+            "envelope: {envelope}"
+        );
+    }
+
+    /// `gtd.transition`: a typo'd key (`notee` for `note`) must be rejected
+    /// before any write (task status unchanged); a well-formed transition
+    /// still succeeds.
+    #[tokio::test]
+    async fn atomic_gtd_transition_unknown_field_rejected_well_formed_succeeds() {
+        let db_file = NamedTempFile::new().expect("temp db");
+        let db_path = db_file.path().to_str().expect("utf8").to_string();
+
+        let task_id = {
+            let server = isolated_server(&db_path);
+            let resp = dispatch_json(
+                &server,
+                r#"gtd.assign(title="TransitionTypoGuard", status="inbox")"#,
+            )
+            .await;
+            // gtd.assign's `id` field is always the short hex form
+            // (handlers.rs:372) regardless of presentation mode — use
+            // `full_id`, the real UUID, so it round-trips through the
+            // atomic prepare path's UUID parse.
+            resp["results"][0]["result"]["full_id"]
+                .as_str()
+                .expect("full_id")
+                .to_string()
+        };
+
+        // (a) unknown field rejected — status must stay "inbox".
+        let khive_cfg = KhiveConfig::default();
+        let ops = vec![atomic_op(
+            "gtd.transition",
+            serde_json::json!({"id": task_id, "status": "next", "notee": "typo"}),
+        )];
+        let err = crate::atomic_apply::execute_atomic_ops_file(
+            ops,
+            atomic_cfg(&db_path),
+            &khive_cfg,
+            khive_types::pack::ATOMIC_MAX_OPS_DEFAULT,
+        )
+        .await
+        .expect_err("typo'd `notee` must be rejected");
+        assert!(
+            format!("{err:#}").contains("unknown field"),
+            "error: {err:#}"
+        );
+
+        // (b) well-formed transition still succeeds.
+        let ops = vec![atomic_op(
+            "gtd.transition",
+            serde_json::json!({"id": task_id, "status": "next"}),
+        )];
+        let envelope = crate::atomic_apply::execute_atomic_ops_file(
+            ops,
+            atomic_cfg(&db_path),
+            &khive_cfg,
+            khive_types::pack::ATOMIC_MAX_OPS_DEFAULT,
+        )
+        .await
+        .expect("a well-formed gtd.transition must succeed");
+        assert_eq!(
+            envelope["atomic"]["committed"], true,
+            "envelope: {envelope}"
+        );
+    }
+
+    /// `gtd.complete`: a typo'd key (`resutl` for `result`) must be
+    /// rejected before any write (task status unchanged); a well-formed
+    /// complete still succeeds.
+    #[tokio::test]
+    async fn atomic_gtd_complete_unknown_field_rejected_well_formed_succeeds() {
+        let db_file = NamedTempFile::new().expect("temp db");
+        let db_path = db_file.path().to_str().expect("utf8").to_string();
+
+        let task_id = {
+            let server = isolated_server(&db_path);
+            let resp = dispatch_json(
+                &server,
+                r#"gtd.assign(title="CompleteTypoGuard", status="next")"#,
+            )
+            .await;
+            // Same `full_id` note as the transition test above.
+            resp["results"][0]["result"]["full_id"]
+                .as_str()
+                .expect("full_id")
+                .to_string()
+        };
+
+        // (a) unknown field rejected.
+        let khive_cfg = KhiveConfig::default();
+        let ops = vec![atomic_op(
+            "gtd.complete",
+            serde_json::json!({"id": task_id, "resutl": "typo"}),
+        )];
+        let err = crate::atomic_apply::execute_atomic_ops_file(
+            ops,
+            atomic_cfg(&db_path),
+            &khive_cfg,
+            khive_types::pack::ATOMIC_MAX_OPS_DEFAULT,
+        )
+        .await
+        .expect_err("typo'd `resutl` must be rejected");
+        assert!(
+            format!("{err:#}").contains("unknown field"),
+            "error: {err:#}"
+        );
+
+        // (b) well-formed complete still succeeds.
+        let ops = vec![atomic_op(
+            "gtd.complete",
+            serde_json::json!({"id": task_id, "result": "shipped"}),
+        )];
+        let envelope = crate::atomic_apply::execute_atomic_ops_file(
+            ops,
+            atomic_cfg(&db_path),
+            &khive_cfg,
+            khive_types::pack::ATOMIC_MAX_OPS_DEFAULT,
+        )
+        .await
+        .expect("a well-formed gtd.complete must succeed");
+        assert_eq!(
+            envelope["atomic"]["committed"], true,
+            "envelope: {envelope}"
+        );
+    }
 }
