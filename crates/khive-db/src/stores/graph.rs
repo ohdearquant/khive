@@ -125,6 +125,141 @@ pub fn purge_incident_edges_statement(node_id: Uuid) -> SqlStatement {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Symmetric-relation update DML (ADR-099 B3 r6 second pass) — the SQL text
+// `khive-runtime::operations::KhiveRuntime::update_edge_symmetric_dml` (the
+// synchronous raw-connection commit-time path, run inside the writer-task/
+// pool-mutex transaction) and ADR-099's atomic `prepare_update_edge` symmetric
+// branch (the async plan-time path) both bind. `upsert_edge` cannot be used
+// here: it resolves `ON CONFLICT(namespace, id)` first and cannot detect a
+// natural-key collision at (namespace, source_id, target_id, relation) with a
+// *different* id, which is exactly the case a symmetric-relation endpoint
+// canonicalization can produce.
+//
+// The two call sites bind these against different parameter-passing
+// mechanisms — `conn.execute`/`conn.query_row` with `rusqlite::params!` in the
+// synchronous path (it must run inside an existing transaction on a borrowed
+// `&rusqlite::Connection`, so it cannot go through the `SqlStatement`/
+// `SqlValue` plan-shape khive-storage abstracts elsewhere) vs. `SqlValue`
+// plan params for the async `PlanStatement` path — but the SQL TEXT itself
+// (the `EDGE_SYMMETRIC_*_SQL` constants below) is the single source of truth
+// for both, closing the class of drift that produced the ADR-099 B3 round-4
+// codex REJECT (a hand-copied SQL literal silently diverging from canonical).
+pub const EDGE_SYMMETRIC_CONFLICT_PROBE_SQL: &str = "SELECT id FROM graph_edges \
+     WHERE namespace = ?1 AND source_id = ?2 AND target_id = ?3 \
+     AND relation = ?4 AND id != ?5";
+
+pub const EDGE_SYMMETRIC_DELETE_NONCANONICAL_SQL: &str =
+    "DELETE FROM graph_edges WHERE namespace = ?1 AND id = ?2";
+
+pub const EDGE_SYMMETRIC_REFRESH_CANONICAL_SQL: &str = "UPDATE graph_edges SET \
+     weight = ?1, updated_at = ?2, deleted_at = NULL, \
+     target_backend = ?3, metadata = ?4 \
+     WHERE namespace = ?5 AND id = ?6";
+
+pub const EDGE_SYMMETRIC_UPDATE_INPLACE_SQL: &str = "UPDATE graph_edges SET \
+     source_id = ?1, target_id = ?2, relation = ?3, \
+     weight = ?4, updated_at = ?5, metadata = ?6 \
+     WHERE namespace = ?7 AND id = ?8";
+
+/// Plan-shape builder for [`EDGE_SYMMETRIC_CONFLICT_PROBE_SQL`] — the
+/// async prepare-time conflict probe.
+pub fn edge_symmetric_conflict_probe_statement(
+    namespace: &str,
+    canon_src: Uuid,
+    canon_tgt: Uuid,
+    relation: EdgeRelation,
+    exclude_id: Uuid,
+) -> SqlStatement {
+    SqlStatement {
+        sql: EDGE_SYMMETRIC_CONFLICT_PROBE_SQL.to_string(),
+        params: vec![
+            SqlValue::Text(namespace.to_string()),
+            SqlValue::Text(canon_src.to_string()),
+            SqlValue::Text(canon_tgt.to_string()),
+            SqlValue::Text(relation.to_string()),
+            SqlValue::Text(exclude_id.to_string()),
+        ],
+        label: Some("edge-symmetric-conflict-probe".to_string()),
+    }
+}
+
+/// Plan-shape builder for [`EDGE_SYMMETRIC_DELETE_NONCANONICAL_SQL`] —
+/// case (b): a canonical row already exists, delete the requested row.
+pub fn edge_symmetric_delete_noncanonical_statement(namespace: &str, id: Uuid) -> SqlStatement {
+    SqlStatement {
+        sql: EDGE_SYMMETRIC_DELETE_NONCANONICAL_SQL.to_string(),
+        params: vec![
+            SqlValue::Text(namespace.to_string()),
+            SqlValue::Text(id.to_string()),
+        ],
+        label: Some("edge-symmetric-delete-noncanonical".to_string()),
+    }
+}
+
+/// Plan-shape builder for [`EDGE_SYMMETRIC_REFRESH_CANONICAL_SQL`] —
+/// case (b) continued: refresh the surviving canonical row.
+#[allow(clippy::too_many_arguments)]
+pub fn edge_symmetric_refresh_canonical_statement(
+    namespace: &str,
+    existing_id: Uuid,
+    weight: f64,
+    updated_at_micros: i64,
+    target_backend: Option<&str>,
+    metadata: Option<&str>,
+) -> SqlStatement {
+    SqlStatement {
+        sql: EDGE_SYMMETRIC_REFRESH_CANONICAL_SQL.to_string(),
+        params: vec![
+            SqlValue::Float(weight),
+            SqlValue::Integer(updated_at_micros),
+            match target_backend {
+                Some(b) => SqlValue::Text(b.to_string()),
+                None => SqlValue::Null,
+            },
+            match metadata {
+                Some(m) => SqlValue::Text(m.to_string()),
+                None => SqlValue::Null,
+            },
+            SqlValue::Text(namespace.to_string()),
+            SqlValue::Text(existing_id.to_string()),
+        ],
+        label: Some("edge-symmetric-refresh-canonical".to_string()),
+    }
+}
+
+/// Plan-shape builder for [`EDGE_SYMMETRIC_UPDATE_INPLACE_SQL`] —
+/// case (a): no conflict, update the requested row in place.
+#[allow(clippy::too_many_arguments)]
+pub fn edge_symmetric_update_inplace_statement(
+    namespace: &str,
+    id: Uuid,
+    canon_src: Uuid,
+    canon_tgt: Uuid,
+    relation: EdgeRelation,
+    weight: f64,
+    updated_at_micros: i64,
+    metadata: Option<&str>,
+) -> SqlStatement {
+    SqlStatement {
+        sql: EDGE_SYMMETRIC_UPDATE_INPLACE_SQL.to_string(),
+        params: vec![
+            SqlValue::Text(canon_src.to_string()),
+            SqlValue::Text(canon_tgt.to_string()),
+            SqlValue::Text(relation.to_string()),
+            SqlValue::Float(weight),
+            SqlValue::Integer(updated_at_micros),
+            match metadata {
+                Some(m) => SqlValue::Text(m.to_string()),
+                None => SqlValue::Null,
+            },
+            SqlValue::Text(namespace.to_string()),
+            SqlValue::Text(id.to_string()),
+        ],
+        label: Some("edge-symmetric-update-inplace".to_string()),
+    }
+}
+
 /// A GraphStore backed by SQLite tables.
 pub struct SqlGraphStore {
     pool: Arc<ConnectionPool>,

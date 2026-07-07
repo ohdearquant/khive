@@ -59,8 +59,10 @@ use khive_db::stores::entity::{
 };
 use khive_db::stores::event::event_insert_statements;
 use khive_db::stores::graph::{
-    edge_hard_delete_statement, edge_soft_delete_statement, edge_upsert_statement,
-    purge_incident_edges_statement,
+    edge_hard_delete_statement, edge_soft_delete_statement,
+    edge_symmetric_conflict_probe_statement, edge_symmetric_delete_noncanonical_statement,
+    edge_symmetric_refresh_canonical_statement, edge_symmetric_update_inplace_statement,
+    edge_upsert_statement, purge_incident_edges_statement,
 };
 use khive_db::stores::note::{
     note_hard_delete_statement, note_soft_delete_statement, note_upsert_statement,
@@ -741,26 +743,24 @@ async fn prepare_update_edge(
     let mut surviving_id = id;
 
     if edge.relation.is_symmetric() {
-        // Conflict probe (read-only, async — see doc comment above).
+        // Conflict probe (read-only, async — see doc comment above). Same SQL
+        // text `update_edge_symmetric_dml` (operations.rs, the synchronous
+        // commit-time counterpart) runs inside its transaction — see the
+        // `EDGE_SYMMETRIC_*_SQL` doc comment in khive-db for why a single
+        // bridge type isn't used for both call sites.
         let mut reader = runtime
             .sql()
             .reader()
             .await
             .map_err(RuntimeError::Storage)?;
         let conflict_id = reader
-            .query_scalar(SqlStatement {
-                sql: "SELECT id FROM graph_edges WHERE namespace = ?1 AND source_id = ?2 \
-                      AND target_id = ?3 AND relation = ?4 AND id != ?5"
-                    .to_string(),
-                params: vec![
-                    SqlValue::Text(namespace.clone()),
-                    SqlValue::Text(canon_src.to_string()),
-                    SqlValue::Text(canon_tgt.to_string()),
-                    SqlValue::Text(edge.relation.to_string()),
-                    SqlValue::Text(id.to_string()),
-                ],
-                label: Some("atomic-update-edge-conflict-probe".to_string()),
-            })
+            .query_scalar(edge_symmetric_conflict_probe_statement(
+                &namespace,
+                canon_src,
+                canon_tgt,
+                edge.relation,
+                id,
+            ))
             .await
             .map_err(RuntimeError::Storage)?
             .and_then(|v| match v {
@@ -778,66 +778,34 @@ async fn prepare_update_edge(
             // requested (non-canonical) row, refresh the surviving row.
             surviving_id = existing_id;
             statements.push(PlanStatement {
-                statement: SqlStatement {
-                    sql: "DELETE FROM graph_edges WHERE namespace = ?1 AND id = ?2".to_string(),
-                    params: vec![
-                        SqlValue::Text(namespace.clone()),
-                        SqlValue::Text(id.to_string()),
-                    ],
-                    label: Some("atomic-update-edge-symmetric-delete-noncanonical".to_string()),
-                },
+                statement: edge_symmetric_delete_noncanonical_statement(&namespace, id),
                 guard: Some(AffectedRowGuard::exactly(1)),
             });
             statements.push(PlanStatement {
-                statement: SqlStatement {
-                    sql: "UPDATE graph_edges SET \
-                          weight = ?1, updated_at = ?2, deleted_at = NULL, \
-                          target_backend = ?3, metadata = ?4 \
-                          WHERE namespace = ?5 AND id = ?6"
-                        .to_string(),
-                    params: vec![
-                        SqlValue::Float(edge.weight),
-                        SqlValue::Integer(now.timestamp_micros()),
-                        match &edge.target_backend {
-                            Some(b) => SqlValue::Text(b.clone()),
-                            None => SqlValue::Null,
-                        },
-                        match metadata_str {
-                            Some(m) => SqlValue::Text(m),
-                            None => SqlValue::Null,
-                        },
-                        SqlValue::Text(namespace.clone()),
-                        SqlValue::Text(existing_id.to_string()),
-                    ],
-                    label: Some("atomic-update-edge-symmetric-refresh-canonical".to_string()),
-                },
+                statement: edge_symmetric_refresh_canonical_statement(
+                    &namespace,
+                    existing_id,
+                    edge.weight,
+                    now.timestamp_micros(),
+                    edge.target_backend.as_deref(),
+                    metadata_str.as_deref(),
+                ),
                 guard: Some(AffectedRowGuard::exactly(1)),
             });
         } else {
             // Case (a): no conflict — update source/target/relation/weight
             // in place, preserving the original edge id.
             statements.push(PlanStatement {
-                statement: SqlStatement {
-                    sql: "UPDATE graph_edges SET \
-                          source_id = ?1, target_id = ?2, relation = ?3, \
-                          weight = ?4, updated_at = ?5, metadata = ?6 \
-                          WHERE namespace = ?7 AND id = ?8"
-                        .to_string(),
-                    params: vec![
-                        SqlValue::Text(canon_src.to_string()),
-                        SqlValue::Text(canon_tgt.to_string()),
-                        SqlValue::Text(edge.relation.to_string()),
-                        SqlValue::Float(edge.weight),
-                        SqlValue::Integer(now.timestamp_micros()),
-                        match metadata_str {
-                            Some(m) => SqlValue::Text(m),
-                            None => SqlValue::Null,
-                        },
-                        SqlValue::Text(namespace.clone()),
-                        SqlValue::Text(id.to_string()),
-                    ],
-                    label: Some("atomic-update-edge-inplace".to_string()),
-                },
+                statement: edge_symmetric_update_inplace_statement(
+                    &namespace,
+                    id,
+                    canon_src,
+                    canon_tgt,
+                    edge.relation,
+                    edge.weight,
+                    now.timestamp_micros(),
+                    metadata_str.as_deref(),
+                ),
                 guard: Some(AffectedRowGuard::exactly(1)),
             });
         }
