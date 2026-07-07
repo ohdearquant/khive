@@ -454,3 +454,46 @@ This ADR authorizes design, not code; implementation follows design review appro
   `struct`/`class` alias hazard (line 109)
 - `crates/khive-pack-formal/src/{vocab.rs,pack.rs}` — the reference implementation shape
 - Existing audit harvest script and findings JSON — the audit lane's record shape mapped by D4
+
+---
+
+## Amendment 1 (2026-07-07) — v0 implementation record
+
+The v0 implementation (`crates/khive-pack-code`) surfaced three decisions the base
+text left open. Resolved as follows; all three are normative.
+
+### A1 — Ingest posture for free-form fields: tolerate
+
+The fail-closed validation set is exactly the governed contract above:
+`severity` and `confidence` values, evidence shape, and `failure_scenario` presence.
+Fields the base text lists as free-form (`categories`, `standard`, `evidence`,
+`source_run`, `refs`) and fields it does not govern at all (`priority`, `status`,
+`impact`, `recommendation`, `verification`) are tolerated when absent or extra:
+ingest neither rejects nor coerces them. A producer that wants stricter
+required-field guarantees must bring that as a future amendment with its own
+justification; it does not arrive as unilateral ingest hardening.
+
+### A2 — `finding.status` to `kind_status` mapping is pack-owned
+
+The pack owns the `finding` kind and its `kind_status` lifecycle, so normalization
+of producer status vocabulary is ontology, not a consumer concern. v0 behavior:
+`kind_status` defaults to `open` and the raw producer value is preserved under
+`properties.audit_status`. The governed mapping (`fixed -> resolved`,
+`false_positive -> invalid`) lands pack-side as a v0.1 change; consumers must not
+implement their own mapping.
+
+### A3 — Ingest path: internal mapper, no wire verb
+
+Shared `create` assigns UUIDv4 per call and is therefore not idempotent for
+re-ingested audit runs. v0 ships a pure internal mapper, `ingest_findings_json`
+(`findings.json` to entities/notes/edges), honoring the "no verbs" decision: no
+wire verb is added. Identity is content-derived UUIDv5 over the record's key
+fields; `observed_at` is excluded from every key tuple, so re-ingesting the same
+findings file — or the same findings observed at a different time — is a no-op.
+Whole-document validation runs before any record construction (all-or-nothing).
+
+### Colocated producer contract
+
+The `findings.json` schema and producer contract are to be committed in-repo so the
+ingest consumer and its input contract live in one place. Producer tooling itself
+is out of scope for this repository.
