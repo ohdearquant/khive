@@ -22,6 +22,19 @@
 //! faithful, non-stub atomic prepare for them is separate follow-on work.
 //! [`prepare_governance_unimplemented`] fails loudly, before any write,
 //! naming this as a known scope gap rather than silently no-opping.
+//!
+//! `merge` is likewise on the v1 admissible list but is deferred (B3 fix
+//! round, Leo refinement 2026-07-07): full-parity field folding, survivor
+//! index reindex, loser index purge, provenance, and same-kind rejection are
+//! achievable as static DML, but `curation::merge_entity_sql`'s graceful
+//! edge-conflict resolution is not (it is per-row procedural, incompatible
+//! with ADR-099 D1's static predicate/guard plan shape) — rather than ship a
+//! partially-scoped atomic merge, it is rejected at the same pre-runtime
+//! static guard as governance
+//! ([`khive_types::pack::ATOMIC_KNOWN_UNIMPLEMENTED_VERBS`]). `prepare_merge`
+//! below is therefore unreachable through `--atomic`; it remains only as the
+//! pre-fix-round direct-prepare implementation, exercised by this module's
+//! own tests, and as defense in depth.
 
 use serde_json::Value;
 use uuid::Uuid;
@@ -36,7 +49,8 @@ use crate::atomic_runner::AtomicOpPlan;
 use crate::curation::{merge_properties, EntityDedupMergePolicy};
 use crate::error::{RuntimeError, RuntimeResult};
 use crate::operations::{
-    canonical_edge_endpoints, validate_edge_metadata, validate_edge_weight, Resolved,
+    canonical_edge_endpoints, merge_dependency_kind, validate_edge_metadata, validate_edge_weight,
+    Resolved,
 };
 use crate::runtime::{KhiveRuntime, NamespaceToken};
 
@@ -117,6 +131,69 @@ fn properties_string(properties: &Option<Value>) -> Option<String> {
     properties
         .as_ref()
         .map(|v| serde_json::to_string(v).unwrap_or_default())
+}
+
+/// Every registered embedding model's vector table name, in the exact format
+/// `curation::merge_entity_sql` uses (`"vec_{sanitize_key(model_name)}"`) —
+/// reused here so atomic delete/merge purge the same tables the non-atomic
+/// paths do.
+fn vector_table_names(runtime: &KhiveRuntime) -> Vec<String> {
+    runtime
+        .registered_embedding_model_names()
+        .iter()
+        .map(|name| format!("vec_{}", crate::config::sanitize_key(name)))
+        .collect()
+}
+
+/// A guarded (`guard: None` — best-effort mirror, matching the non-atomic
+/// index-cleanup calls which don't assert a row existed) `DELETE` statement
+/// against one FTS or vector table for a single subject, scoped by namespace.
+fn purge_index_row_statement(
+    table: &str,
+    namespace: &str,
+    subject_id: Uuid,
+    label: &str,
+) -> PlanStatement {
+    PlanStatement {
+        statement: SqlStatement {
+            sql: format!("DELETE FROM {table} WHERE namespace = ?1 AND subject_id = ?2"),
+            params: vec![
+                SqlValue::Text(namespace.to_string()),
+                SqlValue::Text(subject_id.to_string()),
+            ],
+            label: Some(label.to_string()),
+        },
+        guard: None,
+    }
+}
+
+/// Append the FTS + every registered model's vector-row purge for `subject_id`
+/// (scoped to the RECORD's own namespace, matching `delete_entity`/
+/// `delete_note`'s `record_tok`/`record_ns` convention — NOT the caller
+/// token's namespace, ADR-007 rule 2 by-ID namespace-agnosticism) onto
+/// `statements`.
+fn push_index_purge_statements(
+    runtime: &KhiveRuntime,
+    statements: &mut Vec<PlanStatement>,
+    fts_table: &str,
+    namespace: &str,
+    subject_id: Uuid,
+    label_prefix: &str,
+) {
+    statements.push(purge_index_row_statement(
+        fts_table,
+        namespace,
+        subject_id,
+        &format!("{label_prefix}-purge-fts"),
+    ));
+    for vec_table in vector_table_names(runtime) {
+        statements.push(purge_index_row_statement(
+            &vec_table,
+            namespace,
+            subject_id,
+            &format!("{label_prefix}-purge-vec-{vec_table}"),
+        ));
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -378,7 +455,8 @@ async fn prepare_delete(
         .unwrap_or(false);
 
     match runtime.resolve_by_id(token, id).await? {
-        Some(Resolved::Entity(_)) => {
+        Some(Resolved::Entity(entity)) => {
+            let namespace = entity.namespace.clone();
             let mut statements = if hard {
                 vec![PlanStatement {
                     statement: SqlStatement {
@@ -412,12 +490,24 @@ async fn prepare_delete(
                     guard: None,
                 });
             }
+            // FTS + vector index purge (operations.rs delete_entity parity,
+            // codex REJECT Blocker 1): both soft AND hard delete clean
+            // indexes; only hard additionally cascades edges above.
+            push_index_purge_statements(
+                runtime,
+                &mut statements,
+                "fts_entities",
+                &namespace,
+                id,
+                "atomic-delete-entity",
+            );
             Ok(AtomicOpPlan::Delete(DeletePlan {
                 target_id: id,
                 statements,
             }))
         }
-        Some(Resolved::Note(_)) => {
+        Some(Resolved::Note(note)) => {
+            let namespace = note.namespace.clone();
             let mut statements = if hard {
                 vec![PlanStatement {
                     statement: SqlStatement {
@@ -454,6 +544,17 @@ async fn prepare_delete(
                     guard: None,
                 });
             }
+            // FTS + vector index purge (operations.rs delete_note parity,
+            // codex REJECT Blocker 1): both soft AND hard delete clean
+            // indexes; only hard additionally cascades edges above.
+            push_index_purge_statements(
+                runtime,
+                &mut statements,
+                "fts_notes",
+                &namespace,
+                id,
+                "atomic-delete-note",
+            );
             Ok(AtomicOpPlan::Delete(DeletePlan {
                 target_id: id,
                 statements,
@@ -484,15 +585,50 @@ async fn prepare_link(
     let target_id = require_uuid(args, "target_id")?;
     let relation = parse_edge_relation(require_str(args, "relation")?)?;
     let weight = optional_f64(args, "weight")?.unwrap_or(1.0);
-    let metadata = obj(args)?.get("metadata").cloned();
+    let mut metadata = obj(args)?.get("metadata").cloned();
+
+    // Top-level `dependency_kind` param merges into `metadata` (codex REJECT
+    // High finding — link.rs handler's `merge_entry_metadata` parity): only
+    // fills the key when metadata doesn't already carry one. `link.rs` is a
+    // sibling-crate `pub(crate)` fn (no dependency edge back to
+    // khive-runtime), so this three-line merge is reimplemented here rather
+    // than imported — same pattern as `parse_merge_strategy` above.
+    if let Some(dk) = optional_str(args, "dependency_kind") {
+        let mut m = metadata.unwrap_or_else(|| serde_json::json!({}));
+        let map = m
+            .as_object_mut()
+            .ok_or_else(|| RuntimeError::InvalidInput("metadata must be a JSON object".into()))?;
+        map.entry("dependency_kind".to_string())
+            .or_insert_with(|| serde_json::json!(dk));
+        metadata = Some(m);
+    }
 
     validate_edge_weight(weight)?;
-    validate_edge_metadata(relation, metadata.as_ref())?;
     runtime
         .validate_edge_relation_endpoints(token, source_id, target_id, relation)
         .await?;
 
     let (canon_source, canon_target) = canonical_edge_endpoints(relation, source_id, target_id);
+
+    // Endpoint-kind `dependency_kind` inference for `depends_on` edges
+    // (codex REJECT High finding — operations.rs `link()` parity): only
+    // applies when both endpoints resolve as entities and the key is still
+    // absent after the top-level-param merge above. Runs against the
+    // CANONICAL endpoints, exactly mirroring `KhiveRuntime::link`'s own
+    // ordering (canonicalize, then infer).
+    if relation == EdgeRelation::DependsOn {
+        metadata = match (
+            runtime.resolve_edge_endpoint(token, canon_source).await?,
+            runtime.resolve_edge_endpoint(token, canon_target).await?,
+        ) {
+            (Some(Resolved::Entity(src_e)), Some(Resolved::Entity(tgt_e))) => {
+                merge_dependency_kind(&src_e.kind, &tgt_e.kind, metadata)
+            }
+            _ => metadata,
+        };
+    }
+
+    validate_edge_metadata(relation, metadata.as_ref())?;
     let edge_id = Uuid::new_v4();
     let namespace = token.namespace().as_str().to_string();
     let now = chrono::Utc::now().timestamp_micros();
@@ -537,6 +673,17 @@ async fn prepare_link(
 // merge (entity-only, ADR-099 B3 scope decision — see final report)
 // ---------------------------------------------------------------------------
 
+// NOTE (B3 fix round, Leo refinement 2026-07-07): full atomic-merge parity
+// (field folding, survivor FTS/vector reindex, loser index purge, merge
+// provenance, same-kind rejection) was drafted and unit-tested in this round,
+// but was reverted in favor of deferring atomic `merge` entirely at the
+// pre-runtime admissibility guard (`khive_types::pack::
+// ATOMIC_KNOWN_UNIMPLEMENTED_VERBS`, alongside `propose`/`review`/`withdraw`)
+// — see the fix-round report for the full rationale. This function is
+// therefore back to its pre-fix-round shape: it still produces a plan (kept
+// for the existing direct-prepare test coverage below and as defense in
+// depth), but the CLI's `--atomic` surface never reaches it, since
+// `check_atomic_admissible` rejects `merge` before any runtime is built.
 async fn prepare_merge(
     runtime: &KhiveRuntime,
     token: &NamespaceToken,
@@ -784,5 +931,247 @@ mod tests {
             1,
             "post-commit reindex must have inserted a vector row for the stub model"
         );
+    }
+
+    /// B3 fix round (codex REJECT Blocker 1): atomic delete must purge the
+    /// note's FTS row and vector row for BOTH soft and hard delete — parity
+    /// with `KhiveRuntime::delete_note`'s index-cleanup contract.
+    #[tokio::test]
+    async fn atomic_delete_note_purges_fts_and_vector_indexes_soft_and_hard() {
+        let runtime = scratch_runtime();
+        runtime.register_embedder(StubProvider);
+        let token = runtime
+            .authorize(Namespace::parse("local").expect("ns"))
+            .expect("authorize");
+
+        for hard in [false, true] {
+            let mut note =
+                khive_storage::note::Note::new("local", "observation", "purge-target content");
+            note.name = Some(format!("purge-target-hard-{hard}"));
+            let note_id = note.id;
+            runtime
+                .notes(&token)
+                .expect("notes store")
+                .upsert_note(note.clone())
+                .await
+                .expect("seed note");
+            runtime
+                .reindex_note(&token, &note)
+                .await
+                .expect("seed index rows");
+
+            let vec_store = runtime
+                .vectors_for_model(&token, STUB_MODEL)
+                .expect("vec store");
+            assert_eq!(
+                vec_store.count().await.expect("count before"),
+                1,
+                "seeded note must have a vector row before delete (hard={hard})"
+            );
+            assert!(
+                runtime
+                    .text_for_notes(&token)
+                    .expect("text store")
+                    .get_document("local", note_id)
+                    .await
+                    .expect("get_document")
+                    .is_some(),
+                "seeded note must have an FTS row before delete (hard={hard})"
+            );
+
+            let plan = prepare_delete(
+                &runtime,
+                &token,
+                &json!({"id": note_id.to_string(), "hard": hard}),
+            )
+            .await
+            .expect("prepare delete");
+            let outcome = crate::atomic_runner::run_atomic_unit(runtime.sql().as_ref(), vec![plan])
+                .await
+                .expect("seam call ok");
+            assert!(
+                matches!(
+                    outcome,
+                    crate::atomic_runner::AtomicRunOutcome::Committed { .. }
+                ),
+                "expected commit (hard={hard}): {outcome:?}"
+            );
+
+            assert!(
+                runtime
+                    .text_for_notes(&token)
+                    .expect("text store")
+                    .get_document("local", note_id)
+                    .await
+                    .expect("get_document")
+                    .is_none(),
+                "FTS row must be purged after atomic delete (hard={hard})"
+            );
+            assert_eq!(
+                vec_store.count().await.expect("count after"),
+                0,
+                "vector row must be purged after atomic delete (hard={hard})"
+            );
+        }
+    }
+
+    /// B3 fix round (codex REJECT Blocker 1): atomic delete must purge the
+    /// entity's FTS row and vector row for BOTH soft and hard delete — parity
+    /// with `KhiveRuntime::delete_entity`'s index-cleanup contract.
+    #[tokio::test]
+    async fn atomic_delete_entity_purges_fts_and_vector_indexes_soft_and_hard() {
+        let runtime = scratch_runtime();
+        runtime.register_embedder(StubProvider);
+        let token = runtime
+            .authorize(Namespace::parse("local").expect("ns"))
+            .expect("authorize");
+
+        for hard in [false, true] {
+            let entity =
+                khive_storage::Entity::new("local", "concept", format!("purge-target-hard-{hard}"));
+            let entity_id = entity.id;
+            runtime
+                .entities(&token)
+                .expect("entities store")
+                .upsert_entity(entity.clone())
+                .await
+                .expect("seed entity");
+            runtime
+                .reindex_entity(&token, &entity)
+                .await
+                .expect("seed index rows");
+
+            let vec_store = runtime
+                .vectors_for_model(&token, STUB_MODEL)
+                .expect("vec store");
+            assert_eq!(
+                vec_store.count().await.expect("count before"),
+                1,
+                "seeded entity must have a vector row before delete (hard={hard})"
+            );
+            assert!(
+                runtime
+                    .text(&token)
+                    .expect("text store")
+                    .get_document("local", entity_id)
+                    .await
+                    .expect("get_document")
+                    .is_some(),
+                "seeded entity must have an FTS row before delete (hard={hard})"
+            );
+
+            let plan = prepare_delete(
+                &runtime,
+                &token,
+                &json!({"id": entity_id.to_string(), "hard": hard}),
+            )
+            .await
+            .expect("prepare delete");
+            let outcome = crate::atomic_runner::run_atomic_unit(runtime.sql().as_ref(), vec![plan])
+                .await
+                .expect("seam call ok");
+            assert!(
+                matches!(
+                    outcome,
+                    crate::atomic_runner::AtomicRunOutcome::Committed { .. }
+                ),
+                "expected commit (hard={hard}): {outcome:?}"
+            );
+
+            assert!(
+                runtime
+                    .text(&token)
+                    .expect("text store")
+                    .get_document("local", entity_id)
+                    .await
+                    .expect("get_document")
+                    .is_none(),
+                "FTS row must be purged after atomic delete (hard={hard})"
+            );
+            assert_eq!(
+                vec_store.count().await.expect("count after"),
+                0,
+                "vector row must be purged after atomic delete (hard={hard})"
+            );
+        }
+    }
+
+    /// B3 fix round (codex REJECT High finding): atomic link must persist an
+    /// explicit top-level `dependency_kind` param into edge metadata, and
+    /// must infer one for `depends_on` edges when absent — parity with
+    /// `link.rs`'s `merge_entry_metadata` and `operations.rs`'s
+    /// `infer_dependency_kind` table.
+    #[tokio::test]
+    async fn atomic_link_persists_explicit_dependency_kind_and_infers_when_absent() {
+        let runtime = scratch_runtime();
+        let token = runtime
+            .authorize(Namespace::parse("local").expect("ns"))
+            .expect("authorize");
+        let entities = runtime.entities(&token).expect("entities store");
+
+        fn metadata_json(plan: &AtomicOpPlan) -> String {
+            let link_plan = match plan {
+                AtomicOpPlan::Link(p) => p,
+                other => panic!("expected an AtomicOpPlan::Link, got {other:?}"),
+            };
+            match link_plan.statement.statement.params.last() {
+                Some(SqlValue::Text(s)) => s.clone(),
+                other => panic!("expected the metadata param to be SqlValue::Text, got {other:?}"),
+            }
+        }
+
+        // (a) explicit top-level `dependency_kind` param persists in metadata.
+        {
+            let svc = khive_storage::Entity::new("local", "service", "SvcA");
+            let proj = khive_storage::Entity::new("local", "project", "ProjB");
+            let (svc_id, proj_id) = (svc.id, proj.id);
+            entities.upsert_entity(svc).await.expect("seed svc");
+            entities.upsert_entity(proj).await.expect("seed proj");
+
+            let plan = prepare_link(
+                &runtime,
+                &token,
+                &json!({
+                    "source_id": svc_id.to_string(),
+                    "target_id": proj_id.to_string(),
+                    "relation": "depends_on",
+                    "dependency_kind": "artifact",
+                }),
+            )
+            .await
+            .expect("prepare link");
+            let json_str = metadata_json(&plan);
+            assert!(
+                json_str.contains(r#""dependency_kind":"artifact""#),
+                "explicit dependency_kind param must persist: {json_str}"
+            );
+        }
+
+        // (b) `depends_on` with no explicit dependency_kind infers from
+        // endpoint kinds: (service, service) -> "runtime".
+        {
+            let svc_a = khive_storage::Entity::new("local", "service", "SvcC");
+            let svc_b = khive_storage::Entity::new("local", "service", "SvcD");
+            let (a_id, b_id) = (svc_a.id, svc_b.id);
+            entities.upsert_entity(svc_a).await.expect("seed svc a");
+            entities.upsert_entity(svc_b).await.expect("seed svc b");
+
+            let plan = prepare_link(
+                &runtime,
+                &token,
+                &json!({
+                    "source_id": a_id.to_string(),
+                    "target_id": b_id.to_string(),
+                    "relation": "depends_on",
+                }),
+            )
+            .await
+            .expect("prepare link");
+            let json_str = metadata_json(&plan);
+            assert!(
+                json_str.contains(r#""dependency_kind":"runtime""#),
+                "inferred dependency_kind for (service, service) must persist: {json_str}"
+            );
+        }
     }
 }

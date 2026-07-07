@@ -369,6 +369,38 @@ const ATOMIC_EMBEDDING_BEARING_VERBS: &[&str] = &[
     "comm.ingest",
 ];
 
+/// Verbs that ADR-099 D3 lists as conceptually admissible (they remain on
+/// [`ATOMIC_ADMISSIBLE_VERBS`] — the ADR intends each to eventually gain a
+/// prepare/apply seam) but for which no *full-parity* seam exists yet in this
+/// slice, so they are rejected up front rather than admitted with a gap:
+///
+/// - `propose` / `review` / `withdraw` (ADR-046's event-sourced change-proposal
+///   lifecycle): their apply path is a changeset-interpreter over a dedicated
+///   `proposals_open` table, not a small number of guarded DML statements —
+///   no prepare implementation exists at all.
+/// - `merge`: a full-parity atomic prepare (field folding, survivor FTS/vector
+///   reindex, loser index purge, merge provenance, same-kind rejection,
+///   graceful edge-conflict resolution — see `curation::merge_entity_sql`) was
+///   drafted and unit-tested in the B3 fix round, but deferred rather than
+///   shipped: `curation.rs`'s edge-rewire conflict handling does per-row
+///   procedural branching (read, canonicalize, probe for a conflicting
+///   triple, delete-and-refresh vs. update-in-place) that cannot be expressed
+///   as ADR-099 D1's static predicate/guard plan shape, so full parity is not
+///   achievable without either accepting a documented behavioral gap or a
+///   design change to the plan model — bias-toward-defer (Leo directive,
+///   fix-round refinement) over shipping a partially-scoped atomic merge.
+///   `merge` stays admissible under the *non-atomic* verb.
+///
+/// B3 fix round (codex REJECT, Medium finding — governance verbs): this set
+/// previously passed the static pre-runtime admissibility check (since it's a
+/// subset of `ATOMIC_ADMISSIBLE_VERBS`) and only failed later, inside
+/// `atomic_prepare::prepare_op`, AFTER `KhiveRuntime::new` had already run.
+/// `atomic_admissibility` now checks this set FIRST so the CLI boundary
+/// (`khive_request::atomic::check_atomic_admissible`) rejects these verbs
+/// before any runtime is built or any write attempted — the same
+/// before-any-write guarantee every other rejection class gets.
+pub const ATOMIC_KNOWN_UNIMPLEMENTED_VERBS: &[&str] = &["propose", "review", "withdraw", "merge"];
+
 /// Read verbs rejected under `--atomic` — they produce no write plan to apply
 /// (ADR-099 D3, "v1 rejected — reads").
 const ATOMIC_READ_VERBS: &[&str] = &[
@@ -411,6 +443,13 @@ pub enum AtomicRejectionReason {
     /// a verb added after this list was written). Rejected by default —
     /// admissibility is opt-in, never inferred.
     Unlisted,
+    /// On [`ATOMIC_ADMISSIBLE_VERBS`] per ADR-099 D3 (conceptually admissible,
+    /// intended to gain a seam) but has no prepare/apply implementation in
+    /// this slice yet ([`ATOMIC_KNOWN_UNIMPLEMENTED_VERBS`]). Rejected at the
+    /// same pre-runtime static-guard stage as every other rejection reason —
+    /// never silently no-opped, never deferred until after a runtime/write
+    /// attempt.
+    KnownUnimplemented,
 }
 
 /// Static admissibility classification for `verb_name` under ADR-099
@@ -419,7 +458,16 @@ pub enum AtomicRejectionReason {
 /// Returns `None` when the verb is admissible; `Some(reason)` names why it is
 /// rejected. Default-deny: a verb name absent from every list here is
 /// [`AtomicRejectionReason::Unlisted`], never silently admitted.
+///
+/// `ATOMIC_KNOWN_UNIMPLEMENTED_VERBS` is checked BEFORE the general
+/// admissible-list membership check (B3 fix round, Medium finding): those
+/// verbs are members of `ATOMIC_ADMISSIBLE_VERBS`, so checking membership
+/// first would admit them (`None`) and defer their rejection to prepare time,
+/// after a runtime has already been constructed.
 pub fn atomic_admissibility(verb_name: &str) -> Option<AtomicRejectionReason> {
+    if ATOMIC_KNOWN_UNIMPLEMENTED_VERBS.contains(&verb_name) {
+        return Some(AtomicRejectionReason::KnownUnimplemented);
+    }
     if ATOMIC_ADMISSIBLE_VERBS.contains(&verb_name) {
         return None;
     }
@@ -571,10 +619,37 @@ mod tests {
     #[test]
     fn atomic_admissible_verbs_are_admitted() {
         for verb in ATOMIC_ADMISSIBLE_VERBS {
+            // Governance verbs are on ATOMIC_ADMISSIBLE_VERBS per ADR-099 D3
+            // (conceptually admissible) but are checked separately below:
+            // they are rejected at this same static layer for a distinct
+            // reason (KnownUnimplemented), not admitted (None).
+            if ATOMIC_KNOWN_UNIMPLEMENTED_VERBS.contains(verb) {
+                continue;
+            }
             assert_eq!(
                 atomic_admissibility(verb),
                 None,
                 "{verb:?} is on the v1 admissible list and must be admitted"
+            );
+        }
+    }
+
+    #[test]
+    fn atomic_known_unimplemented_verbs_rejected_before_runtime() {
+        // B3 fix round (codex REJECT, Medium finding): propose/review/withdraw
+        // remain on ATOMIC_ADMISSIBLE_VERBS (ADR-099 D3 intends them to gain a
+        // seam) but must be rejected at this SAME static pre-runtime guard —
+        // not admitted here and only failed later inside
+        // `atomic_prepare::prepare_op` after a runtime was already built.
+        for verb in ATOMIC_KNOWN_UNIMPLEMENTED_VERBS {
+            assert!(
+                ATOMIC_ADMISSIBLE_VERBS.contains(verb),
+                "{verb:?} must remain on ATOMIC_ADMISSIBLE_VERBS per ADR-099 D3"
+            );
+            assert_eq!(
+                atomic_admissibility(verb),
+                Some(AtomicRejectionReason::KnownUnimplemented),
+                "{verb:?} must be rejected as known-unimplemented, not admitted"
             );
         }
     }

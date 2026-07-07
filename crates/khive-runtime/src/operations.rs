@@ -452,7 +452,11 @@ pub(crate) fn canonical_edge_endpoints(
 }
 
 /// Infer the default `dependency_kind` from endpoint entity kinds.
-fn infer_dependency_kind(src_kind: &str, tgt_kind: &str) -> Option<&'static str> {
+///
+/// `pub(crate)` (widened, ADR-099 B3 fix round): `crate::atomic_prepare::prepare_link`
+/// reuses this exact inference table so `--atomic link` matches the non-atomic
+/// `link()` byte-for-byte, rather than re-deriving the table.
+pub(crate) fn infer_dependency_kind(src_kind: &str, tgt_kind: &str) -> Option<&'static str> {
     match (src_kind, tgt_kind) {
         ("project", "project") => Some("build"),
         ("service", "service") => Some("runtime"),
@@ -469,7 +473,10 @@ fn infer_dependency_kind(src_kind: &str, tgt_kind: &str) -> Option<&'static str>
 /// preserved. If the key is absent and the endpoint pair has a known default,
 /// the inferred value is added. Returns `metadata` unchanged for all other
 /// cases (no matching default, or metadata already has the key).
-fn merge_dependency_kind(
+///
+/// `pub(crate)` (widened, ADR-099 B3 fix round): reused by
+/// `crate::atomic_prepare::prepare_link` for atomic/non-atomic parity.
+pub(crate) fn merge_dependency_kind(
     src_kind: &str,
     tgt_kind: &str,
     metadata: Option<serde_json::Value>,

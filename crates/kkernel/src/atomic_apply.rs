@@ -14,9 +14,24 @@
 //! ([`khive_runtime::atomic_prepare::apply_post_commit_effects`]).
 //!
 //! `propose` / `review` / `withdraw` are admissible per
-//! [`khive_types::pack::ATOMIC_ADMISSIBLE_VERBS`] but have no prepare
-//! implementation (`khive_runtime::atomic_prepare::prepare_op` fails loudly
-//! for them, before any write — see that module's doc comment).
+//! [`khive_types::pack::ATOMIC_ADMISSIBLE_VERBS`] (ADR-099 D3 intends them to
+//! gain a seam) but have no prepare implementation yet. B3 fix round (codex
+//! REJECT, Medium finding): they are now rejected by the SAME pre-runtime
+//! `check_atomic_admissible` static guard above, as
+//! [`khive_types::pack::AtomicRejectionReason::KnownUnimplemented`] — never
+//! reaching `KhiveRuntime::new` or `prepare_one` at all. `prepare_op`'s own
+//! `prepare_governance_unimplemented` fallback (see that module's doc
+//! comment) is unreachable through this CLI path and remains only as
+//! defense-in-depth for any other caller of `prepare_op`.
+//!
+//! `merge` joined this same deferred bucket in the B3 fix round (Leo
+//! refinement, codex REJECT Blocker 2): a full-parity atomic merge prepare
+//! was drafted and unit-tested against `khive_runtime::atomic_prepare`
+//! directly, but its edge-conflict resolution cannot be expressed in
+//! ADR-099's static predicate/guard plan shape (see that crate's
+//! `atomic_prepare` module doc), so it is rejected here rather than shipped
+//! partially-scoped — `merge is not yet supported under --atomic; use the
+//! non-atomic merge verb` is the message callers see.
 //!
 //! The returned envelope is additive-only and lives entirely outside
 //! `dispatch_request_local`'s response shape: non-atomic `--ops-file` runs

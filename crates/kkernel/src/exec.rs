@@ -2243,5 +2243,77 @@ backend = "sessions"
                 "error: {err:#}"
             );
         }
+
+        // (e) governance verbs (`propose`/`review`/`withdraw`) — B3 fix round
+        // (codex REJECT, Medium finding): these are on the v1 admissible list
+        // (ADR-099 D3 intends them to gain a seam) but have no prepare/apply
+        // implementation in this slice yet. They must be rejected at this
+        // SAME pre-runtime static guard — never reaching `KhiveRuntime::new`
+        // or any write — not deferred to fail later inside `prepare_op`.
+        for verb in ["propose", "review", "withdraw"] {
+            let db_file = NamedTempFile::new().expect("temp db");
+            let db_path = db_file.path().to_str().expect("utf8").to_string();
+            let ops = vec![atomic_op(
+                verb,
+                serde_json::json!({"title": "x", "description": "y", "changeset": {}}),
+            )];
+            let err = crate::atomic_apply::execute_atomic_ops_file(
+                ops,
+                atomic_cfg(&db_path),
+                &khive_cfg,
+                khive_types::pack::ATOMIC_MAX_OPS_DEFAULT,
+            )
+            .await
+            .expect_err(&format!("{verb:?} must be rejected before any write"));
+            assert!(
+                format!("{err:#}").contains("no --atomic prepare/apply seam"),
+                "error for {verb:?}: {err:#}"
+            );
+            // No runtime/db file activity: the db stays empty (nothing else
+            // touched it, so a plain re-open with the same path must show a
+            // fresh, unwritten store).
+            let server = isolated_server(&db_path);
+            let resp = dispatch_json(&server, r#"list(kind="entity")"#).await;
+            assert_eq!(
+                resp["results"][0]["result"].as_array().unwrap().len(),
+                0,
+                "no write must have landed for {verb:?}"
+            );
+        }
+
+        // (f) `merge` — B3 fix round (Leo refinement, codex REJECT Blocker 2):
+        // deferred at this SAME pre-runtime static guard rather than shipped
+        // with partial parity. Must name the non-atomic merge verb as the
+        // supported route, and must not reach `KhiveRuntime::new`/any write.
+        {
+            let db_file = NamedTempFile::new().expect("temp db");
+            let db_path = db_file.path().to_str().expect("utf8").to_string();
+            let ops = vec![atomic_op(
+                "merge",
+                serde_json::json!({
+                    "into_id": uuid::Uuid::new_v4().to_string(),
+                    "from_id": uuid::Uuid::new_v4().to_string(),
+                }),
+            )];
+            let err = crate::atomic_apply::execute_atomic_ops_file(
+                ops,
+                atomic_cfg(&db_path),
+                &khive_cfg,
+                khive_types::pack::ATOMIC_MAX_OPS_DEFAULT,
+            )
+            .await
+            .expect_err("merge must be rejected before any write");
+            assert!(
+                format!("{err:#}").contains("use the non-atomic merge verb instead"),
+                "error: {err:#}"
+            );
+            let server = isolated_server(&db_path);
+            let resp = dispatch_json(&server, r#"list(kind="entity")"#).await;
+            assert_eq!(
+                resp["results"][0]["result"].as_array().unwrap().len(),
+                0,
+                "no write must have landed for merge"
+            );
+        }
     }
 }

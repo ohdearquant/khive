@@ -24,12 +24,24 @@ pub struct AtomicRejection {
 
 impl std::fmt::Display for AtomicRejection {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let why = match self.reason {
+        let why: std::borrow::Cow<'static, str> = match self.reason {
             AtomicRejectionReason::EmbeddingBearing => {
-                "embedding-bearing verbs are not yet atomic-eligible"
+                "embedding-bearing verbs are not yet atomic-eligible".into()
             }
-            AtomicRejectionReason::Read => "read verbs have no write plan to apply",
-            AtomicRejectionReason::Unlisted => "not on the v1 atomic-admissible verb list",
+            AtomicRejectionReason::Read => "read verbs have no write plan to apply".into(),
+            AtomicRejectionReason::Unlisted => "not on the v1 atomic-admissible verb list".into(),
+            AtomicRejectionReason::KnownUnimplemented if self.tool == "merge" => {
+                "merge is not yet supported under --atomic (admissible per ADR-099 D3, but \
+                 full-parity field-folding/index-cleanup/edge-conflict-resolution is deferred \
+                 this slice); use the non-atomic merge verb instead"
+                    .into()
+            }
+            AtomicRejectionReason::KnownUnimplemented => format!(
+                "admissible per ADR-099 D3 but has no --atomic prepare/apply seam implemented \
+                 in this slice yet; use the non-atomic {:?} verb instead",
+                self.tool
+            )
+            .into(),
         };
         write!(
             f,
@@ -79,7 +91,9 @@ mod tests {
 
     #[test]
     fn all_admissible_ops_pass_with_no_rejections() {
-        let ops = vec![op("update"), op("delete"), op("link"), op("merge")];
+        // `merge` is deferred (B3 fix round, Leo refinement) — see
+        // `known_unimplemented_verbs_rejected_before_any_write` below.
+        let ops = vec![op("update"), op("delete"), op("link")];
         assert!(check_atomic_admissible(&ops).is_empty());
     }
 
@@ -133,8 +147,62 @@ mod tests {
     #[test]
     fn all_v1_admissible_verbs_from_the_ordered_ops_file_pass() {
         // ADR-099 D3's full v1 list, exercised through the ops-file shape
-        // (tool name only — the parse-time check does not need args).
-        let ops: Vec<ParsedOp> = ATOMIC_ADMISSIBLE_VERBS.iter().map(|v| op(v)).collect();
+        // (tool name only — the parse-time check does not need args),
+        // EXCLUDING the governance verbs: those are still on
+        // ATOMIC_ADMISSIBLE_VERBS (conceptually admissible per the ADR) but
+        // are rejected at this same static layer as known-unimplemented (B3
+        // fix round, codex REJECT Medium finding) — see the dedicated test
+        // below.
+        let ops: Vec<ParsedOp> = ATOMIC_ADMISSIBLE_VERBS
+            .iter()
+            .filter(|v| !khive_types::pack::ATOMIC_KNOWN_UNIMPLEMENTED_VERBS.contains(v))
+            .map(|v| op(v))
+            .collect();
         assert!(check_atomic_admissible(&ops).is_empty());
+    }
+
+    #[test]
+    fn known_unimplemented_verbs_rejected_before_any_write() {
+        // B3 fix round (codex REJECT, Medium finding + Leo refinement on
+        // Blocker 2): propose/review/withdraw AND (deferred) merge must all
+        // be rejected at THIS pre-runtime static check — not admitted here
+        // and left to fail later inside `atomic_prepare::prepare_op` after a
+        // runtime has already been constructed.
+        let ops: Vec<ParsedOp> = khive_types::pack::ATOMIC_KNOWN_UNIMPLEMENTED_VERBS
+            .iter()
+            .map(|v| op(v))
+            .collect();
+        let rejections = check_atomic_admissible(&ops);
+        assert_eq!(rejections.len(), ops.len());
+        for rejection in &rejections {
+            assert_eq!(
+                rejection.reason,
+                AtomicRejectionReason::KnownUnimplemented,
+                "rejection: {rejection:?}"
+            );
+            let msg = rejection.to_string();
+            assert!(
+                msg.contains("use the non-atomic") && msg.contains("instead"),
+                "display must name the non-atomic verb as the supported route: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn known_unimplemented_merge_names_non_atomic_merge_as_the_supported_route() {
+        // Leo refinement (2026-07-07): merge's rejection message must be
+        // specific and actionable, naming the non-atomic merge verb (the
+        // blessed defer shape), not just the generic
+        // "no --atomic prepare/apply seam yet" phrasing governance verbs use.
+        let rejection = AtomicRejection {
+            op_index: 0,
+            tool: "merge".to_string(),
+            reason: AtomicRejectionReason::KnownUnimplemented,
+        };
+        let msg = rejection.to_string();
+        assert!(
+            msg.contains("use the non-atomic merge verb instead"),
+            "display: {msg}"
+        );
     }
 }

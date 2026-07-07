@@ -1687,14 +1687,22 @@ fn merge_note_sql(
 // Merge helpers (pure functions — easier to unit test)
 // ---------------------------------------------------------------------------
 
-fn merge_string_field(into: &str, from: &str, strategy: EntityDedupMergePolicy) -> String {
+/// `pub(crate)` (widened, ADR-099 B3 fix round): `crate::atomic_prepare::prepare_merge`
+/// reuses this exact field-fold semantics for atomic/non-atomic parity.
+pub(crate) fn merge_string_field(
+    into: &str,
+    from: &str,
+    strategy: EntityDedupMergePolicy,
+) -> String {
     match strategy {
         EntityDedupMergePolicy::PreferInto | EntityDedupMergePolicy::Union => into.to_string(),
         EntityDedupMergePolicy::PreferFrom => from.to_string(),
     }
 }
 
-fn merge_option_string_field(
+/// `pub(crate)` (widened, ADR-099 B3 fix round): reused by
+/// `crate::atomic_prepare::prepare_merge` for atomic/non-atomic parity.
+pub(crate) fn merge_option_string_field(
     into: &Option<String>,
     from: &Option<String>,
     strategy: EntityDedupMergePolicy,
@@ -1796,7 +1804,9 @@ fn merge_json(into: &Value, from: &Value, strategy: EntityDedupMergePolicy) -> (
     }
 }
 
-fn union_tags(into: &[String], from: &[String]) -> (Vec<String>, usize) {
+/// `pub(crate)` (widened, ADR-099 B3 fix round): reused by
+/// `crate::atomic_prepare::prepare_merge` for atomic/non-atomic parity.
+pub(crate) fn union_tags(into: &[String], from: &[String]) -> (Vec<String>, usize) {
     let mut seen: HashSet<&str> = into.iter().map(|s| s.as_str()).collect();
     let mut result: Vec<String> = into.to_vec();
     let mut added = 0usize;
