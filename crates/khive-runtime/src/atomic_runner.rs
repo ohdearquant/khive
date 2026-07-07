@@ -888,6 +888,159 @@ mod tests {
     // Post-commit effect collection (UpdatePlan's reindex caveat, D3)
     // ------------------------------------------------------------------
 
+    // ------------------------------------------------------------------
+    // 7. Daemon coexistence (ADR-099 B3 acceptance test 5)
+    // ------------------------------------------------------------------
+
+    /// An atomic unit must go through the SAME `WriterTaskHandle` queue as
+    /// an ordinary single-row write — not a separate connection that would
+    /// let it silently bypass single-writer serialization (ADR-067
+    /// Component A). This reuses the deterministic occupier pattern from
+    /// `khive-db::stores::graph_tests::upsert_edge_routes_through_writer_task_when_flag_enabled`
+    /// (Slice A): an occupier closure parks on a oneshot inside the writer
+    /// task's one drain slot, so both the atomic unit's `atomic_unit` call
+    /// and a concurrent ordinary `upsert_entity` call are forced to queue
+    /// behind it. `queue_depth` reaching 2 while both are pending, then
+    /// draining to 0 once the occupier releases and both complete, is the
+    /// proof that `run_atomic_unit` "discriminates" through the real queue
+    /// gauge rather than opening a competing connection.
+    #[tokio::test]
+    async fn atomic_unit_and_concurrent_normal_write_share_the_same_writer_queue() {
+        let pool = scratch_pool("daemon_coexistence");
+        seed_schema(&pool);
+        let a = Uuid::new_v4();
+        let b = Uuid::new_v4();
+        insert_entity(&pool, a, "alpha");
+
+        let writer_task = pool
+            .writer_task_handle()
+            .expect("writer task lookup")
+            .expect("writer task must be spawned with the flag on for a file-backed pool");
+
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel::<()>();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let occupier = {
+            let writer_task = writer_task.clone();
+            tokio::spawn(async move {
+                writer_task
+                    .send(move |_conn| {
+                        let _ = started_tx.send(());
+                        let _ = release_rx.blocking_recv();
+                        Ok::<(), StorageError>(())
+                    })
+                    .await
+            })
+        };
+
+        started_rx
+            .await
+            .expect("occupier must signal it has started running inside the writer task");
+        assert_eq!(
+            writer_task.queue_depth(),
+            0,
+            "channel must start empty once the occupier has been dequeued and is running"
+        );
+
+        // The atomic unit: renames `a`.
+        let bridge = SqlBridge::new(StdArc::clone(&pool), true);
+        let atomic_plans = vec![rename_plan(a, "alpha-atomic", "rename-a-atomic")];
+        let atomic_task = tokio::spawn(async move { run_atomic_unit(&bridge, atomic_plans).await });
+
+        // A concurrent ORDINARY write, routed through the SAME
+        // `WriterTaskHandle::send` the real `with_writer` path uses
+        // (khive-db's own `graph_tests` occupier test asserts this for
+        // `upsert_edge`) — NOT a second `pool.try_writer()` connection,
+        // which would open a competing SQLite handle and contend on the
+        // file lock the occupier's `BEGIN IMMEDIATE` already holds,
+        // producing a `DatabaseBusy` false failure unrelated to the queue
+        // this test is actually proving something about.
+        let normal_write_task = {
+            let writer_task = writer_task.clone();
+            let b_str = b.to_string();
+            tokio::spawn(async move {
+                writer_task
+                    .send(move |conn| {
+                        conn.execute(
+                            "INSERT INTO entities \
+                             (id, namespace, kind, name, created_at, updated_at) \
+                             VALUES (?1, 'local', 'concept', ?2, 0, 0)",
+                            rusqlite::params![b_str, "bravo"],
+                        )
+                        .map_err(|e| StorageError::Internal(e.to_string()))
+                    })
+                    .await
+            })
+        };
+
+        // Both the atomic unit's `atomic_unit` call and (best-effort) the
+        // ordinary write must appear in the SAME queue while the occupier
+        // holds the slot — this is the coexistence proof: neither one opens
+        // a side-channel connection that would let it skip the queue.
+        let mut saw_both_enqueued = false;
+        for _ in 0..200 {
+            if writer_task.queue_depth() >= 2 {
+                saw_both_enqueued = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert!(
+            saw_both_enqueued,
+            "expected BOTH the atomic unit's atomic_unit() call and the \
+             concurrent ordinary write to appear in the writer task's queue \
+             while the occupier held the single drain slot (queue_depth \
+             should have reached 2) — observed {}; run_atomic_unit is not \
+             sharing the same queue as an ordinary write",
+            writer_task.queue_depth()
+        );
+
+        release_tx.send(()).expect("release occupier");
+        occupier
+            .await
+            .expect("occupier task join")
+            .expect("occupier op ok");
+
+        let atomic_outcome = atomic_task
+            .await
+            .expect("atomic task join")
+            .expect("seam call ok");
+        assert!(
+            matches!(atomic_outcome, AtomicRunOutcome::Committed { .. }),
+            "atomic unit must commit once the occupier releases: {atomic_outcome:?}"
+        );
+        normal_write_task
+            .await
+            .expect("normal write task join")
+            .expect("normal write op ok");
+
+        assert!(
+            entity_exists(&pool, a),
+            "a must exist (renamed) after commit"
+        );
+        {
+            // Scoped: the `WriterGuard` returned by `try_writer()` holds a
+            // non-reentrant `parking_lot::Mutex` for as long as it lives.
+            // Left unscoped, it would still be held when `entity_exists`
+            // below tries to check out the same writer, deadlocking (in
+            // practice, timing out after `checkout_timeout`) against itself
+            // rather than against anything the writer task/occupier hold.
+            let writer = pool.try_writer().expect("writer");
+            let renamed: String = writer
+                .conn()
+                .query_row(
+                    "SELECT name FROM entities WHERE id = ?1",
+                    rusqlite::params![a.to_string()],
+                    |row| row.get(0),
+                )
+                .expect("query renamed entity");
+            assert_eq!(renamed, "alpha-atomic");
+        }
+        assert!(
+            entity_exists(&pool, b),
+            "the concurrent ordinary write must also have landed"
+        );
+    }
+
     #[tokio::test]
     async fn post_commit_effects_are_collected_in_op_order_and_only_for_update() {
         let pool = scratch_pool("post_commit_collection");

@@ -384,6 +384,20 @@ const ATOMIC_READ_VERBS: &[&str] = &[
     "verbs",
 ];
 
+/// Conservative default maximum op count for one `--atomic` unit (ADR-099
+/// migration step 7 / B3). The ADR does not pin an exact number — D2 defers
+/// the precise threshold to harness measurement ("a recommended default on
+/// the order of a few thousand ops ... configurable with a conservative
+/// default", Open Question 2) — so this constant is an explicit interim
+/// choice, not a value read out of the ADR text. Rationale for 2000: it is
+/// inside D2's "a few thousand" band, comfortably bounds the duration of the
+/// single cross-process `BEGIN IMMEDIATE` hold an atomic unit takes on the
+/// daemon's writer lock (ADR-099 D5 daemon-coexistence), and is cheap to
+/// override per invocation (`kkernel exec --atomic --atomic-max-ops N`)
+/// without touching this default. Revisit once the load-harness (ADR-067
+/// Component A) has real per-op-count latency data under contention.
+pub const ATOMIC_MAX_OPS_DEFAULT: usize = 2000;
+
 /// Why a verb was rejected from an `--atomic` op list (ADR-099 D3, migration
 /// step 2). Distinguishes the two named rejection classes from a generic
 /// "not yet admitted" fallback so callers can produce an actionable message.

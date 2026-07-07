@@ -509,7 +509,7 @@ pub(crate) fn validate_edge_weight(weight: f64) -> RuntimeResult<()> {
 /// Currently enforces:
 /// - `dependency_kind` is only valid on `depends_on` edges.
 /// - `dependency_kind`, when present, must be one of the five governed values.
-fn validate_edge_metadata(
+pub(crate) fn validate_edge_metadata(
     relation: EdgeRelation,
     metadata: Option<&serde_json::Value>,
 ) -> RuntimeResult<()> {
@@ -1141,7 +1141,12 @@ impl KhiveRuntime {
     ///
     /// Returns `Ok(())` when valid; otherwise `InvalidInput` or `NotFound` with
     /// the same messages as the previous inline block (byte-identical behaviour).
-    async fn validate_edge_relation_endpoints(
+    ///
+    /// `pub(crate)` (widened from private, ADR-099 B3): the atomic prepare pass
+    /// (`crate::atomic_prepare`) reuses this exact endpoint-type validation
+    /// during its async prepare step, before building a `LinkPlan` — see
+    /// ADR-099 D1's "reusing the handler's existing compute" principle.
+    pub(crate) async fn validate_edge_relation_endpoints(
         &self,
         token: &NamespaceToken,
         source_id: Uuid,

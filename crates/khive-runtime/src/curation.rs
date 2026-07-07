@@ -1726,7 +1726,11 @@ fn merge_option_string_field(
 }
 
 /// Merge two property objects. Returns (merged, count_of_fields_from_from_that_were_added).
-fn merge_properties(
+/// `pub(crate)` (widened from private, ADR-099 B3): the atomic prepare pass
+/// (`crate::atomic_prepare`) reuses this exact properties-merge semantics when
+/// building an `update` write plan's row statement, matching `update_entity`/
+/// `update_note`'s own patch behavior byte-for-byte.
+pub(crate) fn merge_properties(
     into: &Option<Value>,
     from: &Option<Value>,
     strategy: EntityDedupMergePolicy,
