@@ -452,7 +452,11 @@ pub(crate) fn canonical_edge_endpoints(
 }
 
 /// Infer the default `dependency_kind` from endpoint entity kinds.
-fn infer_dependency_kind(src_kind: &str, tgt_kind: &str) -> Option<&'static str> {
+///
+/// `pub(crate)` (widened, ADR-099 B3 fix round): `crate::atomic_prepare::prepare_link`
+/// reuses this exact inference table so `--atomic link` matches the non-atomic
+/// `link()` byte-for-byte, rather than re-deriving the table.
+pub(crate) fn infer_dependency_kind(src_kind: &str, tgt_kind: &str) -> Option<&'static str> {
     match (src_kind, tgt_kind) {
         ("project", "project") => Some("build"),
         ("service", "service") => Some("runtime"),
@@ -469,7 +473,10 @@ fn infer_dependency_kind(src_kind: &str, tgt_kind: &str) -> Option<&'static str>
 /// preserved. If the key is absent and the endpoint pair has a known default,
 /// the inferred value is added. Returns `metadata` unchanged for all other
 /// cases (no matching default, or metadata already has the key).
-fn merge_dependency_kind(
+///
+/// `pub(crate)` (widened, ADR-099 B3 fix round): reused by
+/// `crate::atomic_prepare::prepare_link` for atomic/non-atomic parity.
+pub(crate) fn merge_dependency_kind(
     src_kind: &str,
     tgt_kind: &str,
     metadata: Option<serde_json::Value>,
@@ -485,6 +492,39 @@ fn merge_dependency_kind(
         o.insert("dependency_kind".to_string(), serde_json::json!(inferred));
     }
     Some(obj)
+}
+
+/// Merge a caller-supplied top-level `dependency_kind` param into an edge's
+/// `metadata` object, filling the key only if `metadata` doesn't already
+/// carry one. This is distinct from `merge_dependency_kind` above (which
+/// infers a default from endpoint entity kinds when no explicit value was
+/// given at all) — this one folds in an EXPLICIT `dependency_kind` argument
+/// the caller passed alongside `metadata`.
+///
+/// `pub` (ADR-099 B3 r6 second pass): the single source both
+/// `khive-pack-kg::handlers::link::handle_link` (via `khive_runtime::
+/// merge_entry_metadata`) and `crate::atomic_prepare::prepare_link` call —
+/// previously duplicated as a hand-copied 8-line block in `atomic_prepare.rs`
+/// (pack-kg's copy lived at `handlers/common.rs`, a `pub(crate)` fn in a
+/// crate `khive-runtime` cannot depend on, so it was re-typed by hand rather
+/// than imported). Relocating the canonical copy down to `khive-runtime`
+/// lets `khive-pack-kg` depend on it instead (packs depend on
+/// `khive-runtime`, never the reverse), closing the duplication in the
+/// direction the crate graph actually allows.
+pub fn merge_entry_metadata(
+    metadata: Option<serde_json::Value>,
+    dependency_kind: Option<String>,
+) -> RuntimeResult<Option<serde_json::Value>> {
+    let Some(dk) = dependency_kind else {
+        return Ok(metadata);
+    };
+    let mut obj = metadata.unwrap_or_else(|| serde_json::json!({}));
+    let map = obj
+        .as_object_mut()
+        .ok_or_else(|| RuntimeError::InvalidInput("metadata must be a JSON object".into()))?;
+    map.entry("dependency_kind".to_string())
+        .or_insert_with(|| serde_json::json!(dk));
+    Ok(Some(obj))
 }
 
 /// Valid `dependency_kind` values for `depends_on` edges.
@@ -509,7 +549,7 @@ pub(crate) fn validate_edge_weight(weight: f64) -> RuntimeResult<()> {
 /// Currently enforces:
 /// - `dependency_kind` is only valid on `depends_on` edges.
 /// - `dependency_kind`, when present, must be one of the five governed values.
-fn validate_edge_metadata(
+pub(crate) fn validate_edge_metadata(
     relation: EdgeRelation,
     metadata: Option<&serde_json::Value>,
 ) -> RuntimeResult<()> {
@@ -1141,7 +1181,12 @@ impl KhiveRuntime {
     ///
     /// Returns `Ok(())` when valid; otherwise `InvalidInput` or `NotFound` with
     /// the same messages as the previous inline block (byte-identical behaviour).
-    async fn validate_edge_relation_endpoints(
+    ///
+    /// `pub(crate)` (widened from private, ADR-099 B3): the atomic prepare pass
+    /// (`crate::atomic_prepare`) reuses this exact endpoint-type validation
+    /// during its async prepare step, before building a `LinkPlan` — see
+    /// ADR-099 D1's "reusing the handler's existing compute" principle.
+    pub(crate) async fn validate_edge_relation_endpoints(
         &self,
         token: &NamespaceToken,
         source_id: Uuid,
@@ -3687,6 +3732,17 @@ impl KhiveRuntime {
     /// Returns `Ok(Some(existing_id))` when a canonical conflict was absorbed (the
     /// requested edge was deleted, the existing canonical row refreshed), or
     /// `Ok(None)` when the requested edge was updated in place.
+    ///
+    /// DML text is the single source of truth shared with ADR-099's atomic
+    /// `prepare_update_edge` symmetric branch:
+    /// [`khive_db::stores::graph::EDGE_SYMMETRIC_CONFLICT_PROBE_SQL`] /
+    /// `EDGE_SYMMETRIC_DELETE_NONCANONICAL_SQL` /
+    /// `EDGE_SYMMETRIC_REFRESH_CANONICAL_SQL` /
+    /// `EDGE_SYMMETRIC_UPDATE_INPLACE_SQL` — this function binds them against
+    /// `rusqlite::params!` (it runs inside an existing transaction on a
+    /// borrowed `&rusqlite::Connection`), the atomic path binds the same text
+    /// via `SqlValue` plan params; see the constants' doc comment in
+    /// `khive-db` for why a single bridge type isn't used for both.
     #[allow(clippy::too_many_arguments)]
     fn update_edge_symmetric_dml(
         conn: &rusqlite::Connection,
@@ -3699,16 +3755,22 @@ impl KhiveRuntime {
         metadata: Option<String>,
         target_backend: Option<String>,
     ) -> Result<Option<String>, SqliteError> {
-        let now_ts = chrono::Utc::now().timestamp();
+        // `updated_at` is stored in MICROSECONDS on `graph_edges` (every other
+        // write path — `edge_upsert_statement`, `edge_soft_delete_statement` —
+        // uses `timestamp_micros()`; the column is read back via
+        // `micros_to_datetime`). `timestamp()` (seconds) here was a
+        // pre-existing bug in this raw-SQL path, found while unifying it with
+        // the ADR-099 atomic builder (which already used `timestamp_micros()`
+        // correctly) — fixed as part of this extraction, not a behavior the
+        // atomic path needed to special-case around.
+        let now_ts = chrono::Utc::now().timestamp_micros();
 
         // Check for a conflicting canonical row (same namespace + natural key,
         // different id). This catches conflicts whether or not endpoints were
         // flipped — Bug 2 fix.
         let conflict_id: Option<String> = conn
             .query_row(
-                "SELECT id FROM graph_edges \
-                 WHERE namespace = ?1 AND source_id = ?2 AND target_id = ?3 \
-                 AND relation = ?4 AND id != ?5",
+                khive_db::stores::graph::EDGE_SYMMETRIC_CONFLICT_PROBE_SQL,
                 rusqlite::params![
                     &ns,
                     &canon_src_str,
@@ -3727,16 +3789,13 @@ impl KhiveRuntime {
             // id so the caller can re-fetch it (Bug 1 fix: do not return the
             // deleted edge's id).
             conn.execute(
-                "DELETE FROM graph_edges WHERE namespace = ?1 AND id = ?2",
+                khive_db::stores::graph::EDGE_SYMMETRIC_DELETE_NONCANONICAL_SQL,
                 rusqlite::params![&ns, &edge_id_str],
             )
             .map_err(SqliteError::Rusqlite)?;
             let affected = conn
                 .execute(
-                    "UPDATE graph_edges SET \
-                     weight = ?1, updated_at = ?2, deleted_at = NULL, \
-                     target_backend = ?3, metadata = ?4 \
-                     WHERE namespace = ?5 AND id = ?6",
+                    khive_db::stores::graph::EDGE_SYMMETRIC_REFRESH_CANONICAL_SQL,
                     rusqlite::params![weight, now_ts, target_backend, metadata, &ns, &existing_id],
                 )
                 .map_err(SqliteError::Rusqlite)?;
@@ -3751,10 +3810,7 @@ impl KhiveRuntime {
             // preserving the original edge UUID.
             let affected = conn
                 .execute(
-                    "UPDATE graph_edges SET \
-                     source_id = ?1, target_id = ?2, relation = ?3, \
-                     weight = ?4, updated_at = ?5, metadata = ?6 \
-                     WHERE namespace = ?7 AND id = ?8",
+                    khive_db::stores::graph::EDGE_SYMMETRIC_UPDATE_INPLACE_SQL,
                     rusqlite::params![
                         &canon_src_str,
                         &canon_tgt_str,
@@ -4630,6 +4686,56 @@ mod tests {
             .await
             .unwrap();
         assert!((updated.weight - 0.5).abs() < 0.001);
+    }
+
+    /// Regression test (ADR-099 B3 r6 second pass): `update_edge_symmetric_dml`
+    /// previously stored `updated_at` via `chrono::Utc::now().timestamp()`
+    /// (SECONDS) while every other `graph_edges` write path
+    /// (`edge_upsert_statement`, `edge_soft_delete_statement`) uses
+    /// `timestamp_micros()` — a genuine pre-existing bug, found while
+    /// unifying this raw-SQL path with the ADR-099 atomic builder (which
+    /// already used `timestamp_micros()` correctly) onto the shared
+    /// `EDGE_SYMMETRIC_*_SQL` text. A seconds value misread as microseconds
+    /// round-trips to a date a few minutes after the Unix epoch, not "now".
+    #[tokio::test]
+    async fn update_edge_symmetric_relation_stores_microsecond_updated_at() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+        let a = rt
+            .create_entity(&tok, "concept", None, "A", None, None, vec![])
+            .await
+            .unwrap();
+        let b = rt
+            .create_entity(&tok, "concept", None, "B", None, None, vec![])
+            .await
+            .unwrap();
+        let edge = rt
+            .link(&tok, a.id, b.id, EdgeRelation::CompetesWith, 1.0, None)
+            .await
+            .unwrap();
+        let edge_id: Uuid = edge.id.into();
+
+        let before = chrono::Utc::now();
+        let updated = rt
+            .update_edge(
+                &tok,
+                edge_id,
+                crate::curation::EdgePatch {
+                    weight: Some(0.5),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        let drift = (updated.updated_at - before).num_seconds().abs();
+        assert!(
+            drift < 60,
+            "updated_at must round-trip as a recent timestamp (micros, not \
+             seconds); got {:?}, expected within 60s of {:?}",
+            updated.updated_at,
+            before
+        );
     }
 
     #[tokio::test]

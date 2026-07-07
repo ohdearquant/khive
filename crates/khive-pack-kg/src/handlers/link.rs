@@ -2,11 +2,11 @@
 
 use serde_json::{json, Value};
 
-use khive_runtime::{LinkSpec, NamespaceToken, RuntimeError};
+use khive_runtime::{merge_entry_metadata, LinkSpec, NamespaceToken, RuntimeError};
 
 use super::common::{
-    deser, enrich_allowlist_error, format_edge_output, merge_entry_metadata, parse_relation,
-    resolve_uuid_unfiltered, to_json, validate_weight, LinkParams,
+    deser, enrich_allowlist_error, format_edge_output, parse_relation, resolve_uuid_unfiltered,
+    to_json, validate_weight, LinkParams,
 };
 use crate::KgPack;
 

@@ -195,12 +195,24 @@ impl KhiveRuntime {
     ///
     /// Returns `RuntimeError::NotFound` if the entity does not exist or belongs to a different
     /// namespace. Namespace isolation is enforced at the runtime layer.
-    pub async fn update_entity(
+    /// Decide step of `update_entity` (ADR-099 B3 r6 second pass): secret-gates
+    /// the patch, fetches the current row, and computes the resulting `Entity`
+    /// plus `text_changed` (drives reindex) and `changed_fields` (the event
+    /// payload) — WITHOUT writing anything. This is the ONE place that decides
+    /// what a patched entity looks like: `update_entity` below calls it then
+    /// applies the result via `store.upsert_entity` (unchanged execution
+    /// mechanism), and the ADR-099 `--atomic` prepare path
+    /// (`khive-runtime::atomic_prepare::prepare_update`) calls this SAME
+    /// function, turning the result into a `PlanStatement` via
+    /// `khive_db::stores::entity::entity_upsert_statement` — the identical
+    /// builder `upsert_entity` calls internally. No entity-patch decision
+    /// logic is duplicated between the two paths.
+    pub(crate) async fn prepare_update_entity(
         &self,
         token: &NamespaceToken,
         id: Uuid,
         patch: EntityPatch,
-    ) -> RuntimeResult<Entity> {
+    ) -> RuntimeResult<(Entity, bool, Vec<&'static str>)> {
         // Secret gate: scan incoming text fields, properties, and tags.
         if let Some(ref name) = patch.name {
             crate::secret_gate::check(name)?;
@@ -248,6 +260,19 @@ impl KhiveRuntime {
         }
 
         entity.updated_at = chrono::Utc::now().timestamp_micros();
+        Ok((entity, text_changed, changed_fields))
+    }
+
+    pub async fn update_entity(
+        &self,
+        token: &NamespaceToken,
+        id: Uuid,
+        patch: EntityPatch,
+    ) -> RuntimeResult<Entity> {
+        let (entity, text_changed, changed_fields) =
+            self.prepare_update_entity(token, id, patch).await?;
+
+        let store = self.entities(token)?;
         store.upsert_entity(entity.clone()).await?;
 
         if text_changed {
@@ -552,13 +577,19 @@ impl KhiveRuntime {
         Ok(())
     }
 
-    /// Patch-style note update.
-    pub async fn update_note(
+    /// Decide step of `update_note` (ADR-099 B3 r6 second pass) — same split
+    /// as `prepare_update_entity` above: secret-gates the patch, fetches the
+    /// current row, computes the resulting `Note` plus `text_changed`
+    /// (drives reindex), without writing. `update_note` and the ADR-099
+    /// `--atomic` `prepare_update` Note branch both call this ONE function;
+    /// the DML itself is `khive_db::stores::note::note_upsert_statement`,
+    /// the same builder `upsert_note` calls internally.
+    pub(crate) async fn prepare_update_note(
         &self,
         token: &NamespaceToken,
         id: Uuid,
         patch: NotePatch,
-    ) -> RuntimeResult<khive_storage::note::Note> {
+    ) -> RuntimeResult<(khive_storage::note::Note, bool)> {
         // Secret gate: scan incoming text fields and structured properties.
         if let Some(ref content) = patch.content {
             crate::secret_gate::check(content)?;
@@ -621,6 +652,19 @@ impl KhiveRuntime {
         }
 
         note.updated_at = chrono::Utc::now().timestamp_micros();
+        Ok((note, text_changed))
+    }
+
+    /// Patch-style note update.
+    pub async fn update_note(
+        &self,
+        token: &NamespaceToken,
+        id: Uuid,
+        patch: NotePatch,
+    ) -> RuntimeResult<khive_storage::note::Note> {
+        let (note, text_changed) = self.prepare_update_note(token, id, patch).await?;
+
+        let store = self.notes(token)?;
         store.upsert_note(note.clone()).await?;
 
         if text_changed {
@@ -1687,14 +1731,22 @@ fn merge_note_sql(
 // Merge helpers (pure functions — easier to unit test)
 // ---------------------------------------------------------------------------
 
-fn merge_string_field(into: &str, from: &str, strategy: EntityDedupMergePolicy) -> String {
+/// `pub(crate)` (widened, ADR-099 B3 fix round): `crate::atomic_prepare::prepare_merge`
+/// reuses this exact field-fold semantics for atomic/non-atomic parity.
+pub(crate) fn merge_string_field(
+    into: &str,
+    from: &str,
+    strategy: EntityDedupMergePolicy,
+) -> String {
     match strategy {
         EntityDedupMergePolicy::PreferInto | EntityDedupMergePolicy::Union => into.to_string(),
         EntityDedupMergePolicy::PreferFrom => from.to_string(),
     }
 }
 
-fn merge_option_string_field(
+/// `pub(crate)` (widened, ADR-099 B3 fix round): reused by
+/// `crate::atomic_prepare::prepare_merge` for atomic/non-atomic parity.
+pub(crate) fn merge_option_string_field(
     into: &Option<String>,
     from: &Option<String>,
     strategy: EntityDedupMergePolicy,
@@ -1726,7 +1778,11 @@ fn merge_option_string_field(
 }
 
 /// Merge two property objects. Returns (merged, count_of_fields_from_from_that_were_added).
-fn merge_properties(
+/// `pub(crate)` (widened from private, ADR-099 B3): the atomic prepare pass
+/// (`crate::atomic_prepare`) reuses this exact properties-merge semantics when
+/// building an `update` write plan's row statement, matching `update_entity`/
+/// `update_note`'s own patch behavior byte-for-byte.
+pub(crate) fn merge_properties(
     into: &Option<Value>,
     from: &Option<Value>,
     strategy: EntityDedupMergePolicy,
@@ -1792,7 +1848,9 @@ fn merge_json(into: &Value, from: &Value, strategy: EntityDedupMergePolicy) -> (
     }
 }
 
-fn union_tags(into: &[String], from: &[String]) -> (Vec<String>, usize) {
+/// `pub(crate)` (widened, ADR-099 B3 fix round): reused by
+/// `crate::atomic_prepare::prepare_merge` for atomic/non-atomic parity.
+pub(crate) fn union_tags(into: &[String], from: &[String]) -> (Vec<String>, usize) {
     let mut seen: HashSet<&str> = into.iter().map(|s| s.as_str()).collect();
     let mut result: Vec<String> = into.to_vec();
     let mut added = 0usize;

@@ -7,12 +7,15 @@ use uuid::Uuid;
 
 use khive_storage::entity::{Entity, EntityFilter};
 use khive_storage::error::StorageError;
-use khive_storage::types::{BatchWriteSummary, DeleteMode, Page, PageRequest};
+use khive_storage::types::{
+    BatchWriteSummary, DeleteMode, Page, PageRequest, SqlStatement, SqlValue,
+};
 use khive_storage::EntityStore;
 use khive_storage::StorageCapability;
 
 use crate::error::SqliteError;
 use crate::pool::ConnectionPool;
+use crate::sql_bridge::bind_params;
 use crate::writer_task::WriterTaskHandle;
 
 fn map_err(e: rusqlite::Error, op: &'static str) -> StorageError {
@@ -21,6 +24,92 @@ fn map_err(e: rusqlite::Error, op: &'static str) -> StorageError {
 
 fn map_sqlite_err(e: SqliteError, op: &'static str) -> StorageError {
     StorageError::driver(StorageCapability::Entities, op, e)
+}
+
+// ---------------------------------------------------------------------------
+// Pure statement builders (ADR-099 B3 r6 structural cut)
+//
+// These carry NO I/O — they turn an already-computed `Entity` (or a bare id)
+// into the exact `SqlStatement` this store executes. `upsert_entity` and
+// `delete_entity` below call them and execute the result; ADR-099's atomic
+// prepare path (`khive-runtime`) calls them too, to build the same statement
+// for its own guarded, synchronous apply. One statement generator, two
+// execution mechanisms (async trait dispatch vs. synchronous atomic unit) —
+// per ADR-099's accepted "handler-logic-duplication objection" text, the
+// bulk-apply path reuses the handler's existing statement generation instead
+// of re-deriving it.
+// ---------------------------------------------------------------------------
+
+/// The exact `INSERT OR REPLACE` this store's `upsert_entity` issues.
+pub fn entity_upsert_statement(entity: &Entity) -> SqlStatement {
+    let properties_str = entity
+        .properties
+        .as_ref()
+        .map(|v| serde_json::to_string(v).unwrap_or_default());
+    let tags_str = serde_json::to_string(&entity.tags).unwrap_or_else(|_| "[]".to_string());
+    SqlStatement {
+        sql: "INSERT OR REPLACE INTO entities \
+              (id, namespace, kind, entity_type, name, description, properties, tags, \
+               created_at, updated_at, deleted_at, merged_into, merge_event_id) \
+              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)"
+            .to_string(),
+        params: vec![
+            SqlValue::Text(entity.id.to_string()),
+            SqlValue::Text(entity.namespace.clone()),
+            SqlValue::Text(entity.kind.clone()),
+            match &entity.entity_type {
+                Some(t) => SqlValue::Text(t.clone()),
+                None => SqlValue::Null,
+            },
+            SqlValue::Text(entity.name.clone()),
+            match &entity.description {
+                Some(d) => SqlValue::Text(d.clone()),
+                None => SqlValue::Null,
+            },
+            match properties_str {
+                Some(p) => SqlValue::Text(p),
+                None => SqlValue::Null,
+            },
+            SqlValue::Text(tags_str),
+            SqlValue::Integer(entity.created_at),
+            SqlValue::Integer(entity.updated_at),
+            match entity.deleted_at {
+                Some(d) => SqlValue::Integer(d),
+                None => SqlValue::Null,
+            },
+            match entity.merged_into {
+                Some(u) => SqlValue::Text(u.to_string()),
+                None => SqlValue::Null,
+            },
+            match entity.merge_event_id {
+                Some(u) => SqlValue::Text(u.to_string()),
+                None => SqlValue::Null,
+            },
+        ],
+        label: Some("entity-upsert".to_string()),
+    }
+}
+
+/// The exact soft-delete `UPDATE` this store's `delete_entity(Soft)` issues.
+pub fn entity_soft_delete_statement(id: Uuid, deleted_at: i64) -> SqlStatement {
+    SqlStatement {
+        sql: "UPDATE entities SET deleted_at = ?1 WHERE id = ?2 AND deleted_at IS NULL".to_string(),
+        params: vec![
+            SqlValue::Integer(deleted_at),
+            SqlValue::Text(id.to_string()),
+        ],
+        label: Some("entity-delete-soft".to_string()),
+    }
+}
+
+/// The exact hard-delete `DELETE` this store's `delete_entity(Hard)` issues
+/// (no `deleted_at` predicate — purges live and already-tombstoned rows).
+pub fn entity_hard_delete_statement(id: Uuid) -> SqlStatement {
+    SqlStatement {
+        sql: "DELETE FROM entities WHERE id = ?1".to_string(),
+        params: vec![SqlValue::Text(id.to_string())],
+        label: Some("entity-delete-hard".to_string()),
+    }
 }
 
 /// An EntityStore backed by SQLite. Namespace is the caller's responsibility.
@@ -391,39 +480,11 @@ fn build_entity_where(
 #[async_trait]
 impl EntityStore for SqlEntityStore {
     async fn upsert_entity(&self, entity: Entity) -> Result<(), StorageError> {
-        let namespace = entity.namespace.clone();
-        let id_str = entity.id.to_string();
-        let properties_str = entity
-            .properties
-            .as_ref()
-            .map(|v| serde_json::to_string(v).unwrap_or_default());
-        let tags_str = serde_json::to_string(&entity.tags).unwrap_or_else(|_| "[]".to_string());
-
-        let merged_into_str = entity.merged_into.map(|u| u.to_string());
-        let merge_event_id_str = entity.merge_event_id.map(|u| u.to_string());
-
+        let statement = entity_upsert_statement(&entity);
         self.with_writer("upsert_entity", move |conn| {
-            conn.execute(
-                "INSERT OR REPLACE INTO entities \
-                 (id, namespace, kind, entity_type, name, description, properties, tags, \
-                  created_at, updated_at, deleted_at, merged_into, merge_event_id) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
-                rusqlite::params![
-                    id_str,
-                    namespace,
-                    entity.kind,
-                    entity.entity_type,
-                    entity.name,
-                    entity.description,
-                    properties_str,
-                    tags_str,
-                    entity.created_at,
-                    entity.updated_at,
-                    entity.deleted_at,
-                    merged_into_str,
-                    merge_event_id_str,
-                ],
-            )?;
+            let mut stmt = conn.prepare(&statement.sql)?;
+            bind_params(&mut stmt, &statement.params)?;
+            stmt.raw_execute()?;
             Ok(())
         })
         .await
@@ -488,28 +549,23 @@ impl EntityStore for SqlEntityStore {
     }
 
     async fn delete_entity(&self, id: Uuid, mode: DeleteMode) -> Result<bool, StorageError> {
-        let id_str = id.to_string();
-
         match mode {
             DeleteMode::Soft => {
+                let now = chrono::Utc::now().timestamp_micros();
+                let statement = entity_soft_delete_statement(id, now);
                 self.with_writer("delete_entity_soft", move |conn| {
-                    let now = chrono::Utc::now().timestamp_micros();
-                    let deleted = conn.execute(
-                        "UPDATE entities SET deleted_at = ?1 \
-                         WHERE id = ?2 AND deleted_at IS NULL",
-                        rusqlite::params![now, id_str],
-                    )?;
-                    Ok(deleted > 0)
+                    let mut stmt = conn.prepare(&statement.sql)?;
+                    bind_params(&mut stmt, &statement.params)?;
+                    Ok(stmt.raw_execute()? > 0)
                 })
                 .await
             }
             DeleteMode::Hard => {
+                let statement = entity_hard_delete_statement(id);
                 self.with_writer("delete_entity_hard", move |conn| {
-                    let deleted = conn.execute(
-                        "DELETE FROM entities WHERE id = ?1",
-                        rusqlite::params![id_str],
-                    )?;
-                    Ok(deleted > 0)
+                    let mut stmt = conn.prepare(&statement.sql)?;
+                    bind_params(&mut stmt, &statement.params)?;
+                    Ok(stmt.raw_execute()? > 0)
                 })
                 .await
             }

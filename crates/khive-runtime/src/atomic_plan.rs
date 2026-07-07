@@ -118,7 +118,8 @@ impl AffectedRowGuard {
 /// atomic unit commits (ADR-099 D1, "post-commit pass"). v1's admissible set
 /// computes no embeddings during prepare (D3's `update`/`merge` caveat), so
 /// the only post-commit effects are reindex kicks computed from the
-/// **committed** row content.
+/// **committed** row content — plus, since the B3 fix round (GAP-5), the
+/// best-effort GTD lifecycle audit row.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PostCommitEffect {
     /// No deferred side effect for this op.
@@ -129,6 +130,43 @@ pub enum PostCommitEffect {
     /// Re-embed and re-warm the given note's vector row from its committed
     /// content (ADR-099 D3 `update` caveat: note name/content change).
     ReindexNote { note_id: Uuid },
+    /// Append one `gtd_lifecycle_audit` row for a committed `gtd.transition`
+    /// or `gtd.complete` (B3 fix round GAP-5): canonical `handle_transition`/
+    /// `handle_complete` call `ensure_audit_schema` + `write_audit_record`
+    /// (`khive-pack-gtd::handlers`) as a best-effort side write — a failed
+    /// audit insert must never roll back an already-committed transition.
+    /// Carries exactly the fields `write_audit_record` needs. Applied
+    /// outside `khive-runtime` (crate-direction: `khive-pack-gtd` depends on
+    /// `khive-runtime`, not the other way around) — this crate's own
+    /// `apply_post_commit_effects` treats this variant as a no-op; the
+    /// `kkernel` caller that owns both crates applies it by calling the
+    /// canonical `ensure_audit_schema`/`write_audit_record` functions
+    /// directly.
+    GtdAudit {
+        task_id: Uuid,
+        from_status: String,
+        to_status: String,
+        note: Option<String>,
+        namespace: String,
+    },
+}
+
+/// The natural key a committed symmetric edge update's surviving row must
+/// be looked up by (ADR-099 B3 r9, codex r8 Blocker finding 1, second
+/// half). `khive-db`'s `edge_symmetric_refresh_or_update_inplace_statement`
+/// pair never trusts a prepare-time-computed target id (see that builder's
+/// doc comment); a caller rendering this op's result derives the actual
+/// surviving id by querying `graph_edges`'s own
+/// `UNIQUE(namespace, source_id, target_id, relation)` constraint (e.g. via
+/// `KhiveRuntime::list_edges` filtered on these fields — the same mechanism
+/// the atomic `link` op's own result rendering already uses), strictly
+/// after commit.
+#[derive(Debug, Clone)]
+pub struct EdgeNaturalKey {
+    pub namespace: String,
+    pub canon_source_id: Uuid,
+    pub canon_target_id: Uuid,
+    pub relation: khive_storage::EdgeRelation,
 }
 
 /// Write plan for an `update` op (entity or note shape — ADR-099 D3's
@@ -136,7 +174,9 @@ pub enum PostCommitEffect {
 /// plan, any reindex deferred to `post_commit`).
 #[derive(Debug, Clone)]
 pub struct UpdatePlan {
-    /// The id of the entity or note being updated.
+    /// The id of the entity or note being updated. For a symmetric edge
+    /// update this is the CALLER's requested id — advisory only, never the
+    /// basis for post-commit result rendering (see [`EdgeNaturalKey`]).
     pub target_id: Uuid,
     /// Row + FTS DML statements to apply inside the atomic unit, in order.
     /// The row-update statement carries the existence guard; any FTS-mirror
@@ -145,6 +185,12 @@ pub struct UpdatePlan {
     pub statements: Vec<PlanStatement>,
     /// Deferred reindex, if the update changed name/description/content.
     pub post_commit: PostCommitEffect,
+    /// `Some` only for a symmetric edge update — the natural key a caller
+    /// must use to derive the committed surviving row post-commit, rather
+    /// than trusting `target_id`. `None` for every other update shape
+    /// (entity, note, non-symmetric edge), where `target_id` alone is
+    /// already an exact, non-advisory identifier.
+    pub edge_natural_key: Option<EdgeNaturalKey>,
 }
 
 /// Write plan for a `delete` op (soft or hard).
@@ -208,8 +254,16 @@ pub struct GtdTransitionPlan {
     /// Status-column DML to apply inside the atomic unit. Property-only
     /// status mutation — triggers no reindex (ADR-099 D3). The transition
     /// statement carries the guard (prepare validated the current status
-    /// and the requested transition were legal).
+    /// and the requested transition were legal). Empty for an idempotent
+    /// no-op (`current == target` after `normalize_status`, GAP-5/GAP-6 fix
+    /// round) — canonical performs no write in that case either
+    /// (`handlers.rs:995-1005`).
     pub statements: Vec<PlanStatement>,
+    /// Deferred lifecycle audit row (GAP-5 fix round) — `PostCommitEffect::
+    /// None` for the idempotent no-op case, matching canonical's early
+    /// return before its own `ensure_audit_schema`/`write_audit_record`
+    /// call.
+    pub post_commit: PostCommitEffect,
 }
 
 /// Write plan for a `gtd.complete` op (task lifecycle terminal transition).
@@ -221,6 +275,9 @@ pub struct GtdCompletePlan {
     /// validated the task was in a completable state); the `completed_at`
     /// write targets the same already-guarded row and is unguarded.
     pub statements: Vec<PlanStatement>,
+    /// Deferred lifecycle audit row (GAP-5 fix round) — mirrors
+    /// `handle_complete`'s best-effort `write_audit_record` call.
+    pub post_commit: PostCommitEffect,
 }
 
 /// Which governance verb (`propose` / `review` / `withdraw`) a
@@ -296,6 +353,7 @@ mod tests {
                 unguarded("update-fts-mirror"),
             ],
             post_commit: PostCommitEffect::ReindexEntity { entity_id: id },
+            edge_natural_key: None,
         };
         assert_eq!(plan.target_id, id);
         assert_eq!(plan.statements[0].guard, Some(AffectedRowGuard::exactly(1)));
@@ -375,12 +433,57 @@ mod tests {
         let plan = GtdTransitionPlan {
             task_id: Uuid::new_v4(),
             statements: vec![guarded("update-status", AffectedRowGuard::exactly(1))],
+            post_commit: PostCommitEffect::None,
         };
-        // Property-only status mutation — the type carries no post-commit
-        // field at all, which is the structural guarantee (ADR-099 D3: task
-        // transitions "trigger no reindex").
+        // Property-only status mutation — the type carries no *reindex*
+        // post-commit variant it can ever construct (ADR-099 D3: task
+        // transitions "trigger no reindex"); it carries only the best-effort
+        // `GtdAudit` lifecycle-audit effect added in the B3 fix round
+        // (GAP-5), which triggers no embedding/reindex work either.
         assert_eq!(plan.statements.len(), 1);
         assert!(plan.statements[0].guard.is_some());
+        assert_eq!(plan.post_commit, PostCommitEffect::None);
+    }
+
+    #[test]
+    fn gtd_transition_plan_idempotent_noop_carries_no_statements_and_no_audit() {
+        // GAP-6 (B3 fix round 4): current == target after normalize_status
+        // is an idempotent no-op — canonical performs no write and (since it
+        // never reaches its own `write_audit_record` call) writes no audit
+        // row either.
+        let plan = GtdTransitionPlan {
+            task_id: Uuid::new_v4(),
+            statements: vec![],
+            post_commit: PostCommitEffect::None,
+        };
+        assert!(plan.statements.is_empty());
+        assert_eq!(plan.post_commit, PostCommitEffect::None);
+    }
+
+    #[test]
+    fn gtd_transition_plan_carries_gtd_audit_post_commit_effect() {
+        let task_id = Uuid::new_v4();
+        let plan = GtdTransitionPlan {
+            task_id,
+            statements: vec![guarded("update-status", AffectedRowGuard::exactly(1))],
+            post_commit: PostCommitEffect::GtdAudit {
+                task_id,
+                from_status: "inbox".to_string(),
+                to_status: "next".to_string(),
+                note: Some("handed off".to_string()),
+                namespace: "local".to_string(),
+            },
+        };
+        assert_eq!(
+            plan.post_commit,
+            PostCommitEffect::GtdAudit {
+                task_id,
+                from_status: "inbox".to_string(),
+                to_status: "next".to_string(),
+                note: Some("handed off".to_string()),
+                namespace: "local".to_string(),
+            }
+        );
     }
 
     #[test]
@@ -391,6 +494,7 @@ mod tests {
                 guarded("update-status", AffectedRowGuard::exactly(1)),
                 unguarded("update-completed-at"),
             ],
+            post_commit: PostCommitEffect::None,
         };
         assert_eq!(plan.statements.len(), 2);
         let guard = plan.statements[0].guard.expect("status write is guarded");

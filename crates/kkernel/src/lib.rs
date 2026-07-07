@@ -1,5 +1,6 @@
 //! kkernel — khive admin/management library.
 
+mod atomic_apply;
 pub mod coordinator;
 pub mod dbpath;
 pub mod engine;

@@ -173,13 +173,32 @@ pub struct ExecArgs {
     /// without writing anything.  Only valid with `--ops-file`.
     #[arg(long, requires = "ops_file")]
     pub dry_run: bool,
+
+    /// Run the whole ops-file as ONE cross-op atomic unit (ADR-099): every op
+    /// commits or the whole file rolls back, with zero partial state either
+    /// way. Only valid with `--ops-file`. Only the v1 admissible verb set
+    /// (`update`, `delete`, `link`, `merge`, `gtd.transition`, `gtd.complete`)
+    /// may appear in the file — an embedding-bearing verb (`create`, ...), a
+    /// read verb, or an unlisted verb is rejected before any write. Without
+    /// this flag, `--ops-file` behavior is unchanged (chunked, best-effort,
+    /// per-op success/failure).
+    #[arg(long, requires = "ops_file")]
+    pub atomic: bool,
+
+    /// Maximum op count admitted into one `--atomic` unit (ADR-099 D2 defers
+    /// the exact threshold to harness measurement; see
+    /// `khive_types::pack::ATOMIC_MAX_OPS_DEFAULT` for the interim default
+    /// and its rationale). Rejected before any write when exceeded. Only
+    /// meaningful with `--atomic`.
+    #[arg(long, requires = "atomic")]
+    pub atomic_max_ops: Option<usize>,
 }
 
 /// A single parsed op entry from an ops-file line.
-#[derive(Debug)]
-struct OpsFileEntry {
-    tool: String,
-    args: serde_json::Value,
+#[derive(Debug, Clone)]
+pub(crate) struct OpsFileEntry {
+    pub(crate) tool: String,
+    pub(crate) args: serde_json::Value,
 }
 
 /// Parse a JSONL ops-file.
@@ -190,7 +209,7 @@ struct OpsFileEntry {
 /// Each line must be a JSON object `{"tool":"verb","args":{...}}`.  `"args"`
 /// is optional and defaults to an empty object.  Any other top-level keys are
 /// silently ignored so the format is forward-compatible.
-fn parse_ops_file(path: &PathBuf) -> Result<Vec<OpsFileEntry>> {
+pub(crate) fn parse_ops_file(path: &PathBuf) -> Result<Vec<OpsFileEntry>> {
     let file =
         std::fs::File::open(path).with_context(|| format!("open ops-file {}", path.display()))?;
     let reader = std::io::BufReader::new(file);
@@ -408,7 +427,16 @@ pub async fn run_exec(args: ExecArgs) -> Result<()> {
             .await
         }
         ExecMode::OpsFile(path) => {
-            run_exec_ops_file(path, cfg, args.presentation, args.dry_run, args.db).await
+            run_exec_ops_file(
+                path,
+                cfg,
+                args.presentation,
+                args.dry_run,
+                args.db,
+                args.atomic,
+                args.atomic_max_ops,
+            )
+            .await
         }
     }
 }
@@ -603,12 +631,15 @@ fn build_local_fallback_server(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_exec_ops_file(
     path: PathBuf,
     cfg: RuntimeConfig,
     presentation: Option<String>,
     dry_run: bool,
     db: Option<String>,
+    atomic: bool,
+    atomic_max_ops: Option<usize>,
 ) -> Result<()> {
     // Parse the whole file first — fail before any writes if any line is bad.
     let ops = parse_ops_file(&path)?;
@@ -644,6 +675,19 @@ async fn run_exec_ops_file(
     let khive_cfg = KhiveConfig::load_with_home_fallback(None, cfg.db_path.as_deref())
         .map_err(|e| anyhow::anyhow!("config error: {e}"))?
         .unwrap_or_default();
+
+    if atomic {
+        let max_ops = atomic_max_ops.unwrap_or(khive_types::pack::ATOMIC_MAX_OPS_DEFAULT);
+        let envelope = crate::atomic_apply::execute_atomic_ops_file(ops, cfg, &khive_cfg, max_ops)
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&envelope).expect("serialize atomic envelope")
+        );
+        return Ok(());
+    }
+
     let server = build_local_fallback_server(cfg, &khive_cfg, db.as_deref())?;
 
     apply_ops_file(&server, ops, presentation).await
@@ -1446,7 +1490,7 @@ default = true
         };
 
         // dry_run=true → no writes.
-        run_exec_ops_file(path.clone(), cfg.clone(), None, true, None)
+        run_exec_ops_file(path.clone(), cfg.clone(), None, true, None, false, None)
             .await
             .unwrap();
 
@@ -1932,6 +1976,1259 @@ backend = "sessions"
         assert_eq!(
             count, 0,
             "nothing should be written when any line fails to parse"
+        );
+    }
+
+    // ── ADR-099 B3: `--atomic` CLI surface acceptance tests ───────────────────
+
+    fn atomic_op(tool: &str, args: serde_json::Value) -> OpsFileEntry {
+        OpsFileEntry {
+            tool: tool.to_string(),
+            args,
+        }
+    }
+
+    async fn dispatch_json(server: &KhiveMcpServer, ops: &str) -> serde_json::Value {
+        // Verbose presentation: the default Agent mode truncates entity ids
+        // to an 8-char short form for readability, which the atomic prepare
+        // path (and every KG verb) rejects as "not a full UUID". Tests here
+        // need the real id back out so it can feed straight into `update`/
+        // `delete`/`link` args.
+        let params = RequestParams {
+            ops: ops.to_string(),
+            presentation: Some("verbose".to_string()),
+            presentation_per_op: None,
+            save_to: None,
+            format: None,
+            format_per_op: None,
+        };
+        let raw = server.dispatch_request_local(params).await.unwrap();
+        serde_json::from_str(&raw).unwrap()
+    }
+
+    fn atomic_cfg(db_path: &str) -> RuntimeConfig {
+        RuntimeConfig {
+            db_path: Some(PathBuf::from(db_path)),
+            embedding_model: None,
+            additional_embedding_models: vec![],
+            ..Default::default()
+        }
+    }
+
+    /// Acceptance test 1a: an all-success atomic ops-file run commits every
+    /// op as one unit and the results are visible afterward.
+    #[tokio::test]
+    async fn atomic_ops_file_success_commits_all_ops() {
+        let db_file = NamedTempFile::new().expect("temp db");
+        let db_path = db_file.path().to_str().expect("utf8").to_string();
+
+        let (x_id, y_id) = {
+            let server = isolated_server(&db_path);
+            let resp = dispatch_json(
+                &server,
+                r#"[create(kind="concept", name="AtomicX"), create(kind="concept", name="AtomicY")]"#,
+            )
+            .await;
+            let x_id = resp["results"][0]["result"]["id"]
+                .as_str()
+                .expect("x id")
+                .to_string();
+            let y_id = resp["results"][1]["result"]["id"]
+                .as_str()
+                .expect("y id")
+                .to_string();
+            (x_id, y_id)
+        };
+
+        let ops = vec![
+            atomic_op(
+                "update",
+                serde_json::json!({"id": x_id, "name": "AtomicX-renamed"}),
+            ),
+            atomic_op(
+                "update",
+                serde_json::json!({"id": y_id, "name": "AtomicY-renamed"}),
+            ),
+        ];
+
+        let khive_cfg = KhiveConfig::default();
+        let envelope = crate::atomic_apply::execute_atomic_ops_file(
+            ops,
+            atomic_cfg(&db_path),
+            &khive_cfg,
+            khive_types::pack::ATOMIC_MAX_OPS_DEFAULT,
+        )
+        .await
+        .expect("atomic run must succeed");
+
+        assert_eq!(
+            envelope["atomic"]["committed"], true,
+            "envelope: {envelope}"
+        );
+
+        let server = isolated_server(&db_path);
+        let x_resp = dispatch_json(&server, &format!(r#"get(id="{x_id}")"#)).await;
+        let y_resp = dispatch_json(&server, &format!(r#"get(id="{y_id}")"#)).await;
+        assert_eq!(x_resp["results"][0]["result"]["name"], "AtomicX-renamed");
+        assert_eq!(y_resp["results"][0]["result"]["name"], "AtomicY-renamed");
+    }
+
+    /// Acceptance test 1b: a mid-unit failure rolls the WHOLE unit back —
+    /// zero partial state, including the op that "succeeded" before the
+    /// failing one.
+    ///
+    /// Shape: `x` and `y` both exist. Op 0 hard-deletes `x`. Op 1 links `y`
+    /// to `x`. At PREPARE time (before either op runs) `x` still exists, so
+    /// both plans build successfully. At COMMIT time op 0 removes `x` first,
+    /// then op 1's guarded `INSERT ... WHERE EXISTS` affects zero rows (the
+    /// dangling-edge guard, ADR-099 D1 rule 1) — the whole unit rolls back,
+    /// so `x`'s deletion is undone too.
+    #[tokio::test]
+    async fn atomic_ops_file_mid_unit_failure_rolls_back_whole_unit() {
+        let db_file = NamedTempFile::new().expect("temp db");
+        let db_path = db_file.path().to_str().expect("utf8").to_string();
+
+        let (x_id, y_id) = {
+            let server = isolated_server(&db_path);
+            let resp = dispatch_json(
+                &server,
+                r#"[create(kind="concept", name="RollbackX"), create(kind="concept", name="RollbackY")]"#,
+            )
+            .await;
+            let x_id = resp["results"][0]["result"]["id"]
+                .as_str()
+                .expect("x id")
+                .to_string();
+            let y_id = resp["results"][1]["result"]["id"]
+                .as_str()
+                .expect("y id")
+                .to_string();
+            (x_id, y_id)
+        };
+
+        let ops = vec![
+            atomic_op("delete", serde_json::json!({"id": x_id, "hard": true})),
+            atomic_op(
+                "link",
+                serde_json::json!({
+                    "source_id": y_id,
+                    "target_id": x_id,
+                    "relation": "extends",
+                }),
+            ),
+        ];
+
+        let khive_cfg = KhiveConfig::default();
+        let envelope = crate::atomic_apply::execute_atomic_ops_file(
+            ops,
+            atomic_cfg(&db_path),
+            &khive_cfg,
+            khive_types::pack::ATOMIC_MAX_OPS_DEFAULT,
+        )
+        .await
+        .expect("the seam call itself must not error — the unit rolls back cleanly");
+
+        assert_eq!(
+            envelope["atomic"]["rolled_back"], true,
+            "envelope: {envelope}"
+        );
+        assert_eq!(
+            envelope["atomic"]["failed_op_index"], 1,
+            "envelope: {envelope}"
+        );
+
+        let server = isolated_server(&db_path);
+        let x_resp = dispatch_json(&server, &format!(r#"get(id="{x_id}")"#)).await;
+        assert!(
+            x_resp["results"][0]["result"]["deleted_at"].is_null(),
+            "x must NOT be deleted — the whole unit must have rolled back: {x_resp}"
+        );
+    }
+
+    /// ADR-099 B3 r9 (codex r8 Blocker finding 1, second half): the inverse
+    /// same-unit race codex named — `[link(A, B, competes_with), update(X
+    /// extends A-B -> competes_with)]`, where the CANONICAL row the update
+    /// conflict-absorbs into is created by an EARLIER op in the SAME
+    /// atomic unit (so it does not exist at either op's prepare time). The
+    /// commit must both write correctly (X deleted, the just-linked row
+    /// carries X's patch) and RENDER the correct surviving id — not X's
+    /// prepare-time-advisory id, which this fix round removed reliance on
+    /// entirely (`build_op_result` now derives it from a post-commit
+    /// natural-key lookup).
+    #[tokio::test]
+    async fn atomic_symmetric_update_absorbs_into_same_unit_link_and_renders_correct_id() {
+        let db_file = NamedTempFile::new().expect("temp db");
+        let db_path = db_file.path().to_str().expect("utf8").to_string();
+
+        let (a_id, b_id, x_id) = {
+            let server = isolated_server(&db_path);
+            let resp = dispatch_json(
+                &server,
+                r#"[create(kind="concept", name="LinkRaceA"), create(kind="concept", name="LinkRaceB")]"#,
+            )
+            .await;
+            let a_id = resp["results"][0]["result"]["id"]
+                .as_str()
+                .expect("a id")
+                .to_string();
+            let b_id = resp["results"][1]["result"]["id"]
+                .as_str()
+                .expect("b id")
+                .to_string();
+
+            let link_resp = dispatch_json(
+                &server,
+                &format!(
+                    r#"link(source_id="{a_id}", target_id="{b_id}", relation="extends", weight=0.2)"#
+                ),
+            )
+            .await;
+            let x_id = link_resp["results"][0]["result"]["id"]
+                .as_str()
+                .expect("x id")
+                .to_string();
+            (a_id, b_id, x_id)
+        };
+
+        let ops = vec![
+            atomic_op(
+                "link",
+                serde_json::json!({
+                    "source_id": a_id,
+                    "target_id": b_id,
+                    "relation": "competes_with",
+                    "weight": 0.6,
+                }),
+            ),
+            atomic_op(
+                "update",
+                serde_json::json!({"id": x_id, "relation": "competes_with", "weight": 0.9}),
+            ),
+        ];
+
+        let khive_cfg = KhiveConfig::default();
+        let envelope = crate::atomic_apply::execute_atomic_ops_file(
+            ops,
+            atomic_cfg(&db_path),
+            &khive_cfg,
+            khive_types::pack::ATOMIC_MAX_OPS_DEFAULT,
+        )
+        .await
+        .expect("atomic run must succeed");
+
+        assert_eq!(
+            envelope["atomic"]["committed"], true,
+            "envelope: {envelope}"
+        );
+
+        let linked_id = envelope["results"][0]["result"]["id"]
+            .as_str()
+            .expect("link result id")
+            .to_string();
+        let rendered_update_id = envelope["results"][1]["result"]["id"]
+            .as_str()
+            .expect("update result id")
+            .to_string();
+        assert_ne!(
+            rendered_update_id, x_id,
+            "the update's rendered result must NOT be X's stale requested id: {envelope}"
+        );
+        assert_eq!(
+            rendered_update_id, linked_id,
+            "the update's rendered result must be the surviving (just-linked) row: {envelope}"
+        );
+        assert_eq!(
+            envelope["results"][1]["result"]["weight"], 0.9,
+            "the surviving row must carry the update's patch: {envelope}"
+        );
+
+        let server = isolated_server(&db_path);
+        let surviving_resp = dispatch_json(&server, &format!(r#"get(id="{linked_id}")"#)).await;
+        assert_eq!(
+            surviving_resp["results"][0]["result"]["weight"], 0.9,
+            "the committed row itself must carry the patch: {surviving_resp}"
+        );
+    }
+
+    /// Acceptance test 2: every CLI-boundary rejection fires BEFORE any
+    /// write — each sub-case asserts both the error and that the db stays
+    /// empty (zero entities created).
+    #[tokio::test]
+    async fn atomic_cli_boundary_rejections_happen_before_any_write() {
+        let khive_cfg = KhiveConfig::default();
+
+        // (a) embedding-bearing verb.
+        {
+            let db_file = NamedTempFile::new().expect("temp db");
+            let db_path = db_file.path().to_str().expect("utf8").to_string();
+            let ops = vec![atomic_op(
+                "create",
+                serde_json::json!({"kind": "concept", "name": "ShouldNotLand"}),
+            )];
+            let err = crate::atomic_apply::execute_atomic_ops_file(
+                ops,
+                atomic_cfg(&db_path),
+                &khive_cfg,
+                khive_types::pack::ATOMIC_MAX_OPS_DEFAULT,
+            )
+            .await
+            .expect_err("embedding-bearing verb must be rejected");
+            assert!(
+                format!("{err:#}").contains("embedding-bearing"),
+                "error: {err:#}"
+            );
+            let server = isolated_server(&db_path);
+            let resp = dispatch_json(&server, r#"list(kind="entity")"#).await;
+            assert_eq!(resp["results"][0]["result"].as_array().unwrap().len(), 0);
+        }
+
+        // (b) read verb.
+        {
+            let db_file = NamedTempFile::new().expect("temp db");
+            let db_path = db_file.path().to_str().expect("utf8").to_string();
+            let ops = vec![atomic_op("search", serde_json::json!({"query": "x"}))];
+            let err = crate::atomic_apply::execute_atomic_ops_file(
+                ops,
+                atomic_cfg(&db_path),
+                &khive_cfg,
+                khive_types::pack::ATOMIC_MAX_OPS_DEFAULT,
+            )
+            .await
+            .expect_err("read verbs must be rejected");
+            assert!(format!("{err:#}").contains("read"), "error: {err:#}");
+        }
+
+        // (c) unlisted verb.
+        {
+            let db_file = NamedTempFile::new().expect("temp db");
+            let db_path = db_file.path().to_str().expect("utf8").to_string();
+            let ops = vec![atomic_op("not_a_real_verb", serde_json::json!({}))];
+            let err = crate::atomic_apply::execute_atomic_ops_file(
+                ops,
+                atomic_cfg(&db_path),
+                &khive_cfg,
+                khive_types::pack::ATOMIC_MAX_OPS_DEFAULT,
+            )
+            .await
+            .expect_err("unlisted verbs must be rejected");
+            assert!(
+                format!("{err:#}").contains("not on the v1 atomic-admissible"),
+                "error: {err:#}"
+            );
+        }
+
+        // (d) op-count guard.
+        {
+            let db_file = NamedTempFile::new().expect("temp db");
+            let db_path = db_file.path().to_str().expect("utf8").to_string();
+            let ops = vec![
+                atomic_op(
+                    "update",
+                    serde_json::json!({"id": uuid::Uuid::new_v4().to_string()}),
+                ),
+                atomic_op(
+                    "update",
+                    serde_json::json!({"id": uuid::Uuid::new_v4().to_string()}),
+                ),
+                atomic_op(
+                    "update",
+                    serde_json::json!({"id": uuid::Uuid::new_v4().to_string()}),
+                ),
+            ];
+            let err = crate::atomic_apply::execute_atomic_ops_file(
+                ops,
+                atomic_cfg(&db_path),
+                &khive_cfg,
+                2,
+            )
+            .await
+            .expect_err("exceeding max_ops must be rejected");
+            assert!(
+                format!("{err:#}").contains("exceeds the configured maximum"),
+                "error: {err:#}"
+            );
+        }
+
+        // (e) governance verbs (`propose`/`review`/`withdraw`) — B3 fix round
+        // (codex REJECT, Medium finding): these are on the v1 admissible list
+        // (ADR-099 D3 intends them to gain a seam) but have no prepare/apply
+        // implementation in this slice yet. They must be rejected at this
+        // SAME pre-runtime static guard — never reaching `KhiveRuntime::new`
+        // or any write — not deferred to fail later inside `prepare_op`.
+        for verb in ["propose", "review", "withdraw"] {
+            let db_file = NamedTempFile::new().expect("temp db");
+            let db_path = db_file.path().to_str().expect("utf8").to_string();
+            let ops = vec![atomic_op(
+                verb,
+                serde_json::json!({"title": "x", "description": "y", "changeset": {}}),
+            )];
+            let err = crate::atomic_apply::execute_atomic_ops_file(
+                ops,
+                atomic_cfg(&db_path),
+                &khive_cfg,
+                khive_types::pack::ATOMIC_MAX_OPS_DEFAULT,
+            )
+            .await
+            .expect_err(&format!("{verb:?} must be rejected before any write"));
+            assert!(
+                format!("{err:#}").contains("no --atomic prepare/apply seam"),
+                "error for {verb:?}: {err:#}"
+            );
+            // No runtime/db file activity: the db stays empty (nothing else
+            // touched it, so a plain re-open with the same path must show a
+            // fresh, unwritten store).
+            let server = isolated_server(&db_path);
+            let resp = dispatch_json(&server, r#"list(kind="entity")"#).await;
+            assert_eq!(
+                resp["results"][0]["result"].as_array().unwrap().len(),
+                0,
+                "no write must have landed for {verb:?}"
+            );
+        }
+
+        // (f) `merge` — B3 fix round (Leo refinement, codex REJECT Blocker 2):
+        // deferred at this SAME pre-runtime static guard rather than shipped
+        // with partial parity. Must name the non-atomic merge verb as the
+        // supported route, and must not reach `KhiveRuntime::new`/any write.
+        {
+            let db_file = NamedTempFile::new().expect("temp db");
+            let db_path = db_file.path().to_str().expect("utf8").to_string();
+            let ops = vec![atomic_op(
+                "merge",
+                serde_json::json!({
+                    "into_id": uuid::Uuid::new_v4().to_string(),
+                    "from_id": uuid::Uuid::new_v4().to_string(),
+                }),
+            )];
+            let err = crate::atomic_apply::execute_atomic_ops_file(
+                ops,
+                atomic_cfg(&db_path),
+                &khive_cfg,
+                khive_types::pack::ATOMIC_MAX_OPS_DEFAULT,
+            )
+            .await
+            .expect_err("merge must be rejected before any write");
+            assert!(
+                format!("{err:#}").contains("use the non-atomic merge verb instead"),
+                "error: {err:#}"
+            );
+            let server = isolated_server(&db_path);
+            let resp = dispatch_json(&server, r#"list(kind="entity")"#).await;
+            assert_eq!(
+                resp["results"][0]["result"].as_array().unwrap().len(),
+                0,
+                "no write must have landed for merge"
+            );
+        }
+    }
+
+    // ── ADR-099 B3 fix: `--atomic` deny_unknown_fields parity ────────────────
+    //
+    // Canonical `update`/`delete`/`link`/`gtd.transition`/`gtd.complete`
+    // reject unknown/typo'd arg keys via `#[serde(deny_unknown_fields)]` on
+    // their param structs. Pre-fix, `--atomic` silently dropped unrecognized
+    // keys instead of rejecting the op — a typo like `conten` (for
+    // `content`) would report `ok:true` while quietly discarding the
+    // caller's intended change. These tests exercise the fix at the same
+    // `execute_atomic_ops_file` seam as the acceptance tests above, and are
+    // the end-to-end counterpart to the syntactic-only unit coverage in
+    // `atomic_apply::validate_atomic_args_tests`.
+
+    /// Sharp case called out explicitly: atomic `update(id=X,
+    /// conten="hello")` (typo of `content`) must be rejected AND must not
+    /// mutate the row — no `content` change, no `updated_at` bump. Pre-fix,
+    /// this silently discarded `conten`, reset every other field to its
+    /// current value, bumped `updated_at`, and reported `ok:true`.
+    #[tokio::test]
+    async fn atomic_update_entity_unknown_field_is_rejected_and_does_not_mutate_row() {
+        let db_file = NamedTempFile::new().expect("temp db");
+        let db_path = db_file.path().to_str().expect("utf8").to_string();
+
+        let (entity_id, updated_at_before) = {
+            let server = isolated_server(&db_path);
+            let resp = dispatch_json(
+                &server,
+                r#"create(kind="concept", name="TypoGuardX", description="original")"#,
+            )
+            .await;
+            let id = resp["results"][0]["result"]["id"]
+                .as_str()
+                .expect("id")
+                .to_string();
+            let get_resp = dispatch_json(&server, &format!(r#"get(id="{id}")"#)).await;
+            let updated_at = get_resp["results"][0]["result"]["updated_at"].clone();
+            (id, updated_at)
+        };
+
+        let ops = vec![atomic_op(
+            "update",
+            serde_json::json!({"id": entity_id, "conten": "hello"}),
+        )];
+        let khive_cfg = KhiveConfig::default();
+        let err = crate::atomic_apply::execute_atomic_ops_file(
+            ops,
+            atomic_cfg(&db_path),
+            &khive_cfg,
+            khive_types::pack::ATOMIC_MAX_OPS_DEFAULT,
+        )
+        .await
+        .expect_err("typo'd `conten` must be rejected, not silently dropped");
+        assert!(
+            format!("{err:#}").contains("unknown field"),
+            "error: {err:#}"
+        );
+
+        let server = isolated_server(&db_path);
+        let get_resp = dispatch_json(&server, &format!(r#"get(id="{entity_id}")"#)).await;
+        assert_eq!(
+            get_resp["results"][0]["result"]["description"], "original",
+            "a rejected op must not have mutated description: {get_resp}"
+        );
+        assert_eq!(
+            get_resp["results"][0]["result"]["updated_at"], updated_at_before,
+            "a rejected op must not bump updated_at (no write happened): {get_resp}"
+        );
+    }
+
+    /// update-note variant of the same parity fix: a typo'd key on a note
+    /// update must be rejected, and a well-formed note update still
+    /// succeeds (parity boundary — don't over-reject).
+    #[tokio::test]
+    async fn atomic_update_note_unknown_field_rejected_well_formed_succeeds() {
+        let db_file = NamedTempFile::new().expect("temp db");
+        let db_path = db_file.path().to_str().expect("utf8").to_string();
+
+        let note_id = {
+            let server = isolated_server(&db_path);
+            let resp = dispatch_json(
+                &server,
+                r#"create(kind="observation", content="original note")"#,
+            )
+            .await;
+            resp["results"][0]["result"]["id"]
+                .as_str()
+                .expect("id")
+                .to_string()
+        };
+
+        // (a) unknown field rejected.
+        let khive_cfg = KhiveConfig::default();
+        let ops = vec![atomic_op(
+            "update",
+            serde_json::json!({"id": note_id, "conten": "typo'd"}),
+        )];
+        let err = crate::atomic_apply::execute_atomic_ops_file(
+            ops,
+            atomic_cfg(&db_path),
+            &khive_cfg,
+            khive_types::pack::ATOMIC_MAX_OPS_DEFAULT,
+        )
+        .await
+        .expect_err("typo'd `conten` on a note update must be rejected");
+        assert!(
+            format!("{err:#}").contains("unknown field"),
+            "error: {err:#}"
+        );
+
+        // (b) well-formed update still succeeds.
+        let ops = vec![atomic_op(
+            "update",
+            serde_json::json!({"id": note_id, "content": "updated note"}),
+        )];
+        let envelope = crate::atomic_apply::execute_atomic_ops_file(
+            ops,
+            atomic_cfg(&db_path),
+            &khive_cfg,
+            khive_types::pack::ATOMIC_MAX_OPS_DEFAULT,
+        )
+        .await
+        .expect("a well-formed note update must succeed");
+        assert_eq!(
+            envelope["atomic"]["committed"], true,
+            "envelope: {envelope}"
+        );
+
+        let server = isolated_server(&db_path);
+        let get_resp = dispatch_json(&server, &format!(r#"get(id="{note_id}")"#)).await;
+        assert_eq!(
+            get_resp["results"][0]["result"]["content"], "updated note",
+            "the well-formed update must have landed: {get_resp}"
+        );
+    }
+
+    /// `delete`: a typo'd key (`hardd` for `hard`) must be rejected before
+    /// any write; a well-formed delete still succeeds.
+    #[tokio::test]
+    async fn atomic_delete_unknown_field_rejected_well_formed_succeeds() {
+        let db_file = NamedTempFile::new().expect("temp db");
+        let db_path = db_file.path().to_str().expect("utf8").to_string();
+
+        let entity_id = {
+            let server = isolated_server(&db_path);
+            let resp =
+                dispatch_json(&server, r#"create(kind="concept", name="DeleteTypoGuard")"#).await;
+            resp["results"][0]["result"]["id"]
+                .as_str()
+                .expect("id")
+                .to_string()
+        };
+
+        // (a) unknown field rejected — entity must survive.
+        let khive_cfg = KhiveConfig::default();
+        let ops = vec![atomic_op(
+            "delete",
+            serde_json::json!({"id": entity_id, "hardd": true}),
+        )];
+        let err = crate::atomic_apply::execute_atomic_ops_file(
+            ops,
+            atomic_cfg(&db_path),
+            &khive_cfg,
+            khive_types::pack::ATOMIC_MAX_OPS_DEFAULT,
+        )
+        .await
+        .expect_err("typo'd `hardd` must be rejected");
+        assert!(
+            format!("{err:#}").contains("unknown field"),
+            "error: {err:#}"
+        );
+        let server = isolated_server(&db_path);
+        let get_resp = dispatch_json(&server, &format!(r#"get(id="{entity_id}")"#)).await;
+        assert!(
+            get_resp["results"][0]["result"]["deleted_at"].is_null(),
+            "a rejected delete must not have deleted the entity: {get_resp}"
+        );
+
+        // (b) well-formed delete still succeeds.
+        let ops = vec![atomic_op("delete", serde_json::json!({"id": entity_id}))];
+        let envelope = crate::atomic_apply::execute_atomic_ops_file(
+            ops,
+            atomic_cfg(&db_path),
+            &khive_cfg,
+            khive_types::pack::ATOMIC_MAX_OPS_DEFAULT,
+        )
+        .await
+        .expect("a well-formed delete must succeed");
+        assert_eq!(
+            envelope["atomic"]["committed"], true,
+            "envelope: {envelope}"
+        );
+    }
+
+    /// `link`: a typo'd key (`relatoin` for `relation`) must be rejected
+    /// before any write; a well-formed link still succeeds. (Distinct from
+    /// the Leo-accepted `target_backend` conflict-arm deferral — out of
+    /// scope here.)
+    #[tokio::test]
+    async fn atomic_link_unknown_field_rejected_well_formed_succeeds() {
+        let db_file = NamedTempFile::new().expect("temp db");
+        let db_path = db_file.path().to_str().expect("utf8").to_string();
+
+        let (a_id, b_id) = {
+            let server = isolated_server(&db_path);
+            let resp = dispatch_json(
+                &server,
+                r#"[create(kind="concept", name="LinkTypoA"), create(kind="concept", name="LinkTypoB")]"#,
+            )
+            .await;
+            let a_id = resp["results"][0]["result"]["id"]
+                .as_str()
+                .expect("a id")
+                .to_string();
+            let b_id = resp["results"][1]["result"]["id"]
+                .as_str()
+                .expect("b id")
+                .to_string();
+            (a_id, b_id)
+        };
+
+        // (a) unknown field rejected.
+        let khive_cfg = KhiveConfig::default();
+        let ops = vec![atomic_op(
+            "link",
+            serde_json::json!({
+                "source_id": a_id,
+                "target_id": b_id,
+                "relation": "extends",
+                "relatoin": "extends",
+            }),
+        )];
+        let err = crate::atomic_apply::execute_atomic_ops_file(
+            ops,
+            atomic_cfg(&db_path),
+            &khive_cfg,
+            khive_types::pack::ATOMIC_MAX_OPS_DEFAULT,
+        )
+        .await
+        .expect_err("typo'd `relatoin` must be rejected");
+        assert!(
+            format!("{err:#}").contains("unknown field"),
+            "error: {err:#}"
+        );
+
+        // (b) well-formed link still succeeds.
+        let ops = vec![atomic_op(
+            "link",
+            serde_json::json!({"source_id": a_id, "target_id": b_id, "relation": "extends"}),
+        )];
+        let envelope = crate::atomic_apply::execute_atomic_ops_file(
+            ops,
+            atomic_cfg(&db_path),
+            &khive_cfg,
+            khive_types::pack::ATOMIC_MAX_OPS_DEFAULT,
+        )
+        .await
+        .expect("a well-formed link must succeed");
+        assert_eq!(
+            envelope["atomic"]["committed"], true,
+            "envelope: {envelope}"
+        );
+    }
+
+    /// `gtd.transition`: a typo'd key (`notee` for `note`) must be rejected
+    /// before any write (task status unchanged); a well-formed transition
+    /// still succeeds.
+    #[tokio::test]
+    async fn atomic_gtd_transition_unknown_field_rejected_well_formed_succeeds() {
+        let db_file = NamedTempFile::new().expect("temp db");
+        let db_path = db_file.path().to_str().expect("utf8").to_string();
+
+        let task_id = {
+            let server = isolated_server(&db_path);
+            let resp = dispatch_json(
+                &server,
+                r#"gtd.assign(title="TransitionTypoGuard", status="inbox")"#,
+            )
+            .await;
+            // gtd.assign's `id` field is always the short hex form
+            // (handlers.rs:372) regardless of presentation mode — use
+            // `full_id`, the real UUID, so it round-trips through the
+            // atomic prepare path's UUID parse.
+            resp["results"][0]["result"]["full_id"]
+                .as_str()
+                .expect("full_id")
+                .to_string()
+        };
+
+        // (a) unknown field rejected — status must stay "inbox".
+        let khive_cfg = KhiveConfig::default();
+        let ops = vec![atomic_op(
+            "gtd.transition",
+            serde_json::json!({"id": task_id, "status": "next", "notee": "typo"}),
+        )];
+        let err = crate::atomic_apply::execute_atomic_ops_file(
+            ops,
+            atomic_cfg(&db_path),
+            &khive_cfg,
+            khive_types::pack::ATOMIC_MAX_OPS_DEFAULT,
+        )
+        .await
+        .expect_err("typo'd `notee` must be rejected");
+        assert!(
+            format!("{err:#}").contains("unknown field"),
+            "error: {err:#}"
+        );
+
+        // (b) well-formed transition still succeeds.
+        let ops = vec![atomic_op(
+            "gtd.transition",
+            serde_json::json!({"id": task_id, "status": "next"}),
+        )];
+        let envelope = crate::atomic_apply::execute_atomic_ops_file(
+            ops,
+            atomic_cfg(&db_path),
+            &khive_cfg,
+            khive_types::pack::ATOMIC_MAX_OPS_DEFAULT,
+        )
+        .await
+        .expect("a well-formed gtd.transition must succeed");
+        assert_eq!(
+            envelope["atomic"]["committed"], true,
+            "envelope: {envelope}"
+        );
+    }
+
+    /// `gtd.complete`: a typo'd key (`resutl` for `result`) must be
+    /// rejected before any write (task status unchanged); a well-formed
+    /// complete still succeeds.
+    #[tokio::test]
+    async fn atomic_gtd_complete_unknown_field_rejected_well_formed_succeeds() {
+        let db_file = NamedTempFile::new().expect("temp db");
+        let db_path = db_file.path().to_str().expect("utf8").to_string();
+
+        let task_id = {
+            let server = isolated_server(&db_path);
+            let resp = dispatch_json(
+                &server,
+                r#"gtd.assign(title="CompleteTypoGuard", status="next")"#,
+            )
+            .await;
+            // Same `full_id` note as the transition test above.
+            resp["results"][0]["result"]["full_id"]
+                .as_str()
+                .expect("full_id")
+                .to_string()
+        };
+
+        // (a) unknown field rejected.
+        let khive_cfg = KhiveConfig::default();
+        let ops = vec![atomic_op(
+            "gtd.complete",
+            serde_json::json!({"id": task_id, "resutl": "typo"}),
+        )];
+        let err = crate::atomic_apply::execute_atomic_ops_file(
+            ops,
+            atomic_cfg(&db_path),
+            &khive_cfg,
+            khive_types::pack::ATOMIC_MAX_OPS_DEFAULT,
+        )
+        .await
+        .expect_err("typo'd `resutl` must be rejected");
+        assert!(
+            format!("{err:#}").contains("unknown field"),
+            "error: {err:#}"
+        );
+
+        // (b) well-formed complete still succeeds.
+        let ops = vec![atomic_op(
+            "gtd.complete",
+            serde_json::json!({"id": task_id, "result": "shipped"}),
+        )];
+        let envelope = crate::atomic_apply::execute_atomic_ops_file(
+            ops,
+            atomic_cfg(&db_path),
+            &khive_cfg,
+            khive_types::pack::ATOMIC_MAX_OPS_DEFAULT,
+        )
+        .await
+        .expect("a well-formed gtd.complete must succeed");
+        assert_eq!(
+            envelope["atomic"]["committed"], true,
+            "envelope: {envelope}"
+        );
+    }
+
+    // ── ADR-099 B3 fix round 5 (codex r3 REJECT): delete kind parity, update
+    // null/type validation, canonical id resolution, per-op result payloads ──
+
+    /// Finding 1 [Blocker]: atomic `delete(id=<entity>, kind="note")` must be
+    /// REJECTED (no row deleted) — pre-fix, atomic ignored `kind` entirely
+    /// and deleted the entity anyway (a destructive wrong-substrate action).
+    /// `delete(id=<entity>, kind="entity")` and `kind` omitted must both
+    /// still succeed.
+    #[tokio::test]
+    async fn atomic_delete_rejects_kind_mismatch_and_accepts_matching_or_omitted_kind() {
+        let db_file = NamedTempFile::new().expect("temp db");
+        let db_path = db_file.path().to_str().expect("utf8").to_string();
+        let khive_cfg = KhiveConfig::default();
+
+        let (mismatch_id, matching_id, omitted_id) = {
+            let server = isolated_server(&db_path);
+            let resp = dispatch_json(
+                &server,
+                r#"[create(kind="concept", name="KindMismatch"), create(kind="concept", name="KindMatching"), create(kind="concept", name="KindOmitted")]"#,
+            )
+            .await;
+            let id = |i: usize| {
+                resp["results"][i]["result"]["id"]
+                    .as_str()
+                    .expect("id")
+                    .to_string()
+            };
+            (id(0), id(1), id(2))
+        };
+
+        // (a) kind mismatch: entity, caller says "note" — must be rejected,
+        // entity must still be present afterward.
+        let ops = vec![atomic_op(
+            "delete",
+            serde_json::json!({"id": mismatch_id, "kind": "note"}),
+        )];
+        let err = crate::atomic_apply::execute_atomic_ops_file(
+            ops,
+            atomic_cfg(&db_path),
+            &khive_cfg,
+            khive_types::pack::ATOMIC_MAX_OPS_DEFAULT,
+        )
+        .await
+        .expect_err("delete(kind=\"note\") on an entity must be rejected");
+        assert!(
+            format!("{err:#}").contains("not found"),
+            "expected a NotFound-shaped rejection, error: {err:#}"
+        );
+        let server = isolated_server(&db_path);
+        let resp = dispatch_json(&server, &format!(r#"get(id="{mismatch_id}")"#)).await;
+        assert!(
+            resp["results"][0]["result"]["deleted_at"].is_null(),
+            "entity must NOT be deleted after a kind-mismatch rejection: {resp}"
+        );
+
+        // (b) matching kind: succeeds.
+        let ops = vec![atomic_op(
+            "delete",
+            serde_json::json!({"id": matching_id, "kind": "entity"}),
+        )];
+        let envelope = crate::atomic_apply::execute_atomic_ops_file(
+            ops,
+            atomic_cfg(&db_path),
+            &khive_cfg,
+            khive_types::pack::ATOMIC_MAX_OPS_DEFAULT,
+        )
+        .await
+        .expect("delete(kind=\"entity\") on an entity must succeed");
+        assert_eq!(
+            envelope["atomic"]["committed"], true,
+            "envelope: {envelope}"
+        );
+
+        // (c) omitted kind: succeeds.
+        let ops = vec![atomic_op("delete", serde_json::json!({"id": omitted_id}))];
+        let envelope = crate::atomic_apply::execute_atomic_ops_file(
+            ops,
+            atomic_cfg(&db_path),
+            &khive_cfg,
+            khive_types::pack::ATOMIC_MAX_OPS_DEFAULT,
+        )
+        .await
+        .expect("delete with kind omitted must succeed");
+        assert_eq!(
+            envelope["atomic"]["committed"], true,
+            "envelope: {envelope}"
+        );
+    }
+
+    /// Finding 2 [High]: atomic `update` null/type semantics must match
+    /// canonical's ACTUALLY REACHABLE behavior. Empirically verified against
+    /// the live `handle_update` (two scratch probe tests run directly
+    /// against `KgPack::handle_update`, then removed) that `name=null` and
+    /// `description=null` are canonical NO-OPS, not rejections: canonical's
+    /// field type is `Option<Value>`, and serde_json's derived
+    /// `Deserialize` for `Option<T>` intercepts a literal JSON `null` at the
+    /// OUTER Option boundary and maps it straight to Rust `None` —
+    /// regardless of the inner type — so canonical's own "reject null"/
+    /// "clear on null" arms in `string_value`/`optional_string_patch` are
+    /// unreachable through normal struct deserialization. This deliberately
+    /// does NOT implement the fix-round brief's literal expectation
+    /// ("`update(name=null)` REJECTED") — that expectation does not match
+    /// the live canonical system; see the final report for the full
+    /// evidence trail. What canonical DOES still reject is a non-null,
+    /// non-string `name` (e.g. `name: 123`) — pre-fix, atomic silently
+    /// treated that as absent too (reporting success for an invalid
+    /// update), which is the real violation this test locks down.
+    #[tokio::test]
+    async fn atomic_update_null_and_type_semantics_match_canonical_no_op_behavior() {
+        let db_file = NamedTempFile::new().expect("temp db");
+        let db_path = db_file.path().to_str().expect("utf8").to_string();
+        let khive_cfg = KhiveConfig::default();
+
+        let entity_id = {
+            let server = isolated_server(&db_path);
+            let resp = dispatch_json(
+                &server,
+                r#"create(kind="concept", name="NullSemantics", description="orig-desc", properties={"k": "v"}, tags=["a", "b"])"#,
+            )
+            .await;
+            resp["results"][0]["result"]["id"]
+                .as_str()
+                .expect("id")
+                .to_string()
+        };
+
+        // (a) name: a non-null, non-string value must be REJECTED — the
+        // actual violation codex flagged (pre-fix: silently treated as
+        // absent, reporting success).
+        let ops = vec![atomic_op(
+            "update",
+            serde_json::json!({"id": entity_id, "name": 123}),
+        )];
+        let err = crate::atomic_apply::execute_atomic_ops_file(
+            ops,
+            atomic_cfg(&db_path),
+            &khive_cfg,
+            khive_types::pack::ATOMIC_MAX_OPS_DEFAULT,
+        )
+        .await
+        .expect_err("name: 123 (non-null, non-string) must be rejected");
+        assert!(
+            format!("{err:#}").contains("name must be a string"),
+            "error: {err:#}"
+        );
+
+        // (b) name=null, description=null, properties=null, tags=null in one
+        // update: all four are canonical no-ops — the update must succeed
+        // and every field must be UNCHANGED afterward.
+        let ops = vec![atomic_op(
+            "update",
+            serde_json::json!({
+                "id": entity_id,
+                "name": null,
+                "description": null,
+                "properties": null,
+                "tags": null,
+            }),
+        )];
+        let envelope = crate::atomic_apply::execute_atomic_ops_file(
+            ops,
+            atomic_cfg(&db_path),
+            &khive_cfg,
+            khive_types::pack::ATOMIC_MAX_OPS_DEFAULT,
+        )
+        .await
+        .expect("an all-null update must be a no-op success, not a rejection");
+        assert_eq!(
+            envelope["atomic"]["committed"], true,
+            "envelope: {envelope}"
+        );
+
+        let server = isolated_server(&db_path);
+        let resp = dispatch_json(&server, &format!(r#"get(id="{entity_id}")"#)).await;
+        let row = &resp["results"][0]["result"];
+        assert_eq!(
+            row["name"], "NullSemantics",
+            "name must be unchanged: {row}"
+        );
+        assert_eq!(
+            row["description"], "orig-desc",
+            "description must be unchanged: {row}"
+        );
+        assert_eq!(
+            row["properties"]["k"], "v",
+            "properties must be unchanged: {row}"
+        );
+        assert_eq!(
+            row["tags"],
+            serde_json::json!(["a", "b"]),
+            "tags must be unchanged: {row}"
+        );
+    }
+
+    /// Finding 3 [High]: an atomic ops-file using an 8-hex-prefix id for
+    /// `update` AND `gtd.transition` must succeed identically to canonical
+    /// (which accepts full UUID or an 8+ hex prefix); a non-existent prefix
+    /// must error with canonical's error shape ("no record matches
+    /// prefix"). Pre-fix, atomic did a bare `Uuid::parse_str` and rejected
+    /// any short id outright — the same ops-file that succeeds non-atomically
+    /// (e.g. against `gtd.assign`'s own short `id` output) would fail before
+    /// prepare under `--atomic`.
+    #[tokio::test]
+    async fn atomic_update_and_gtd_transition_accept_8_hex_prefix_ids() {
+        let db_file = NamedTempFile::new().expect("temp db");
+        let db_path = db_file.path().to_str().expect("utf8").to_string();
+        let khive_cfg = KhiveConfig::default();
+
+        let (entity_full_id, task_full_id) = {
+            let server = isolated_server(&db_path);
+            let resp =
+                dispatch_json(&server, r#"create(kind="concept", name="PrefixEntity")"#).await;
+            let entity_id = resp["results"][0]["result"]["id"]
+                .as_str()
+                .expect("entity id")
+                .to_string();
+            let resp =
+                dispatch_json(&server, r#"gtd.assign(title="PrefixTask", status="next")"#).await;
+            let task_id = resp["results"][0]["result"]["full_id"]
+                .as_str()
+                .expect("task full_id")
+                .to_string();
+            (entity_id, task_id)
+        };
+        let entity_prefix = &entity_full_id[..8];
+        let task_prefix = &task_full_id[..8];
+
+        // (a) 8-hex-prefix update and gtd.transition in the SAME atomic unit
+        // both succeed.
+        let ops = vec![
+            atomic_op(
+                "update",
+                serde_json::json!({"id": entity_prefix, "name": "PrefixEntity-renamed"}),
+            ),
+            atomic_op(
+                "gtd.transition",
+                serde_json::json!({"id": task_prefix, "status": "active"}),
+            ),
+        ];
+        let envelope = crate::atomic_apply::execute_atomic_ops_file(
+            ops,
+            atomic_cfg(&db_path),
+            &khive_cfg,
+            khive_types::pack::ATOMIC_MAX_OPS_DEFAULT,
+        )
+        .await
+        .expect("8-hex-prefix ids must resolve identically to canonical");
+        assert_eq!(
+            envelope["atomic"]["committed"], true,
+            "envelope: {envelope}"
+        );
+
+        let server = isolated_server(&db_path);
+        let resp = dispatch_json(&server, &format!(r#"get(id="{entity_full_id}")"#)).await;
+        assert_eq!(
+            resp["results"][0]["result"]["name"], "PrefixEntity-renamed",
+            "prefix-addressed update must have landed: {resp}"
+        );
+
+        // (b) a non-existent 8-hex prefix errors with canonical's error
+        // shape.
+        let ops = vec![atomic_op(
+            "update",
+            serde_json::json!({"id": "deadbeef", "name": "should not resolve"}),
+        )];
+        let err = crate::atomic_apply::execute_atomic_ops_file(
+            ops,
+            atomic_cfg(&db_path),
+            &khive_cfg,
+            khive_types::pack::ATOMIC_MAX_OPS_DEFAULT,
+        )
+        .await
+        .expect_err("a non-existent prefix must be rejected");
+        assert!(
+            format!("{err:#}").contains("no record matches prefix"),
+            "error: {err:#}"
+        );
+    }
+
+    /// Finding 4 [High]: a committed atomic unit's success output must
+    /// carry a canonical-shaped `result` per op (ADR-099 D4), not just
+    /// `{ok, tool, op_index}`. Exercises all five v1-admissible verbs in one
+    /// unit and asserts the field the fix-round brief calls out for each:
+    /// updated name for `update`, the deleted marker for `delete`, edge
+    /// fields for `link`, and the transition/completion shape for the two
+    /// gtd verbs.
+    #[tokio::test]
+    async fn atomic_success_results_carry_canonical_shaped_result_per_op() {
+        let db_file = NamedTempFile::new().expect("temp db");
+        let db_path = db_file.path().to_str().expect("utf8").to_string();
+        let khive_cfg = KhiveConfig::default();
+
+        // `transition_task_id` and `complete_task_id` are DELIBERATELY two
+        // separate tasks, not one task chained through both verbs: every
+        // op's prepare pass reads state BEFORE the atomic unit applies any
+        // statement (ADR-099 D1 — prepare is async/read-only, commit is the
+        // one synchronous pass), so a `gtd.transition` and a `gtd.complete`
+        // on the SAME task in the SAME unit would race against each other's
+        // as-yet-uncommitted write, not compose sequentially.
+        let (entity_id, doomed_id, source_id, target_id, transition_task_id, complete_task_id) = {
+            let server = isolated_server(&db_path);
+            let resp = dispatch_json(
+                &server,
+                r#"[create(kind="concept", name="ResultUpdate"), create(kind="concept", name="ResultDelete"), create(kind="concept", name="ResultLinkSource"), create(kind="concept", name="ResultLinkTarget")]"#,
+            )
+            .await;
+            let id = |i: usize| {
+                resp["results"][i]["result"]["id"]
+                    .as_str()
+                    .expect("id")
+                    .to_string()
+            };
+            let resp = dispatch_json(
+                &server,
+                r#"gtd.assign(title="ResultTransitionTask", status="next")"#,
+            )
+            .await;
+            let transition_task_id = resp["results"][0]["result"]["full_id"]
+                .as_str()
+                .expect("task full_id")
+                .to_string();
+            let resp = dispatch_json(
+                &server,
+                r#"gtd.assign(title="ResultCompleteTask", status="active")"#,
+            )
+            .await;
+            let complete_task_id = resp["results"][0]["result"]["full_id"]
+                .as_str()
+                .expect("task full_id")
+                .to_string();
+            (
+                id(0),
+                id(1),
+                id(2),
+                id(3),
+                transition_task_id,
+                complete_task_id,
+            )
+        };
+
+        let ops = vec![
+            atomic_op(
+                "update",
+                serde_json::json!({"id": entity_id, "name": "ResultUpdate-renamed"}),
+            ),
+            atomic_op("delete", serde_json::json!({"id": doomed_id})),
+            atomic_op(
+                "link",
+                serde_json::json!({
+                    "source_id": source_id,
+                    "target_id": target_id,
+                    "relation": "extends",
+                }),
+            ),
+            atomic_op(
+                "gtd.transition",
+                serde_json::json!({"id": transition_task_id, "status": "active"}),
+            ),
+            atomic_op(
+                "gtd.complete",
+                serde_json::json!({"id": complete_task_id, "result": "shipped"}),
+            ),
+        ];
+        let envelope = crate::atomic_apply::execute_atomic_ops_file(
+            ops,
+            atomic_cfg(&db_path),
+            &khive_cfg,
+            khive_types::pack::ATOMIC_MAX_OPS_DEFAULT,
+        )
+        .await
+        .expect("all five v1-admissible verbs must commit as one unit");
+        assert_eq!(
+            envelope["atomic"]["committed"], true,
+            "envelope: {envelope}"
+        );
+
+        let results = envelope["results"].as_array().expect("results array");
+        assert_eq!(results.len(), 5, "envelope: {envelope}");
+
+        assert_eq!(
+            results[0]["result"]["name"], "ResultUpdate-renamed",
+            "update result must carry the updated name: {envelope}"
+        );
+
+        assert_eq!(
+            results[1]["result"]["deleted"], true,
+            "delete result: {envelope}"
+        );
+        assert_eq!(
+            results[1]["result"]["id"], doomed_id,
+            "delete result must echo the caller's id: {envelope}"
+        );
+
+        assert_eq!(
+            results[2]["result"]["relation"], "extends",
+            "link result must carry the edge's relation: {envelope}"
+        );
+        assert_eq!(
+            results[2]["result"]["source_id"], source_id,
+            "link result must carry source_id: {envelope}"
+        );
+        assert_eq!(
+            results[2]["result"]["target_id"], target_id,
+            "link result must carry target_id: {envelope}"
+        );
+
+        assert_eq!(
+            results[3]["result"]["transitioned"], true,
+            "gtd.transition result: {envelope}"
+        );
+        assert_eq!(
+            results[3]["result"]["to"], "active",
+            "gtd.transition result must carry the new status: {envelope}"
+        );
+
+        assert_eq!(
+            results[4]["result"]["completed"], true,
+            "gtd.complete result: {envelope}"
+        );
+        assert_eq!(
+            results[4]["result"]["to"], "done",
+            "gtd.complete result must carry the terminal status: {envelope}"
         );
     }
 }

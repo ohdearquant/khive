@@ -45,7 +45,12 @@ fn row_to_sql_row(row: &rusqlite::Row<'_>, col_count: usize, col_names: &[String
 }
 
 /// Bind `SqlValue` parameters to a rusqlite statement.
-fn bind_params(
+///
+/// `pub(crate)` (ADR-099 B3 r6 structural cut): reused by the pure
+/// `*_statement` builders in `stores::{entity,note,graph,text,vectors}` so
+/// that every store's async execution path and the ADR-099 `--atomic`
+/// prepare path bind params identically — one implementation, not two.
+pub(crate) fn bind_params(
     stmt: &mut rusqlite::Statement<'_>,
     params: &[SqlValue],
 ) -> Result<(), rusqlite::Error> {

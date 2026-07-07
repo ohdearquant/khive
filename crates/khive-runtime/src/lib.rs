@@ -3,6 +3,7 @@
 //! Wraps `StorageBackend` and query compilation into a single Rust API surface.
 
 pub mod atomic_plan;
+pub mod atomic_prepare;
 pub mod atomic_runner;
 pub mod config;
 pub mod curation;
@@ -69,7 +70,9 @@ pub use operations::{
     arm_fts_fail, arm_fts_fail_many, arm_fts_fail_many_partial, arm_rollback_cleanup_fail,
     arm_vector_fail, arm_vector_fail_after,
 };
-pub use operations::{EntityCreateSpec, LinkSpec, NoteSearchHit, QueryResult, Resolved};
+pub use operations::{
+    merge_entry_metadata, EntityCreateSpec, LinkSpec, NoteSearchHit, QueryResult, Resolved,
+};
 pub use pack::{
     resolve_explicit_namespace, DispatchHook, HandlerDef, KindHook, NoteKindSpec,
     NoteLifecycleSpec, PackByIdResolver, PackFactory, PackLoadError, PackRegistration,
