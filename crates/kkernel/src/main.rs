@@ -42,8 +42,21 @@ struct Args {
     #[arg(long, env = "KHIVE_LOG", default_value = "warn", global = true)]
     log: String,
 
+    /// Quick-shot: run a verb DSL expression, shorthand for `kkernel exec <OPS>`.
+    ///
+    /// `kkernel -e '<ops>'` is equivalent to `kkernel exec '<ops>'` with every
+    /// other `exec` flag at its default (db/namespace resolution, presentation,
+    /// output format, ...). For `exec`'s other flags (`--ops-file`, `--db`,
+    /// `--namespace`, `--presentation`, ...), use the full `kkernel exec`
+    /// subcommand instead. Mutually exclusive with a subcommand (clap subcommand
+    /// fields are not directly addressable via `conflicts_with`, so this is
+    /// enforced explicitly in `main()`, right after `Args::parse()`, with the
+    /// same `clap::Command::error(...).exit()` mechanism clap itself uses).
+    #[arg(short = 'e', long = "exec", value_name = "OPS")]
+    exec: Option<String>,
+
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
 }
 
 #[derive(Subcommand, Debug)]
@@ -220,7 +233,17 @@ async fn main() -> Result<()> {
     let args = Args::parse();
     init_tracing(&args.log);
 
-    match args.command {
+    // `-e/--exec` is the quick-shot equivalent of `exec <OPS>` — route it
+    // through the exact same clap parsing `exec` itself uses (`ExecArgs::parse_from`)
+    // so behavior (env bindings, defaults) is byte-identical to typing out the
+    // subcommand. `-e` and a subcommand are mutually exclusive; a `#[command(subcommand)]`
+    // field cannot be named in a plain `#[arg(conflicts_with = ...)]` (clap rejects that
+    // at startup with a debug_assert — verified empirically), so the conflict is enforced
+    // here instead, using the same `clap::Command::error(...).exit()` mechanism clap's own
+    // built-in conflict detection uses (matching exit code + message style).
+    let command = resolve_command(args.exec, args.command);
+
+    match command {
         Command::Sync(s) => cmd_sync(s).await,
         Command::Pack(p) => cmd_pack(p),
         Command::Kg(k) => kg::run_kg(k).await,
@@ -288,6 +311,63 @@ async fn main() -> Result<()> {
             }
         }
         Command::Backend(b) => cmd_backend(b),
+    }
+}
+
+/// Why `-e`/subcommand resolution failed — see [`resolve_command_result`].
+#[derive(Debug, PartialEq, Eq)]
+enum ResolveCommandError {
+    /// Neither `-e <OPS>` nor a subcommand was given.
+    Missing,
+    /// Both `-e <OPS>` and a subcommand were given.
+    Conflict,
+}
+
+/// Pure resolution of the effective `Command` from the two mutually exclusive
+/// top-level entry points: the `-e/--exec` quick-shot flag and a subcommand.
+/// Split out from [`resolve_command`] so the four cases are unit-testable
+/// without triggering `clap`'s process-exiting `.error(...).exit()` path.
+///
+/// - `-e <OPS>` alone → `Command::Exec`, parsed via `ExecArgs::parse_from(["exec",
+///   &ops])` so it is byte-identical to typing `exec <OPS>` (same defaults, same
+///   env-var bindings).
+/// - a subcommand alone → that subcommand, unchanged.
+/// - neither → `Err(ResolveCommandError::Missing)`.
+/// - both → `Err(ResolveCommandError::Conflict)`. clap's derive `conflicts_with`
+///   cannot name a `#[command(subcommand)]` field directly (it is not a plain
+///   `Arg` — confirmed via clap's own startup debug_assert), so this case is
+///   enforced here rather than declaratively on the field.
+fn resolve_command_result(
+    exec: Option<String>,
+    command: Option<Command>,
+) -> Result<Command, ResolveCommandError> {
+    match (exec, command) {
+        (Some(ops), None) => Ok(Command::Exec(exec::ExecArgs::parse_from(["exec", &ops]))),
+        (None, Some(cmd)) => Ok(cmd),
+        (None, None) => Err(ResolveCommandError::Missing),
+        (Some(_), Some(_)) => Err(ResolveCommandError::Conflict),
+    }
+}
+
+/// `main()`'s entry point into [`resolve_command_result`]: same resolution,
+/// but turns a `Missing`/`Conflict` error into a clap-style CLI error (matching
+/// exit code 2 and clap's own error-printing style) instead of returning it.
+fn resolve_command(exec: Option<String>, command: Option<Command>) -> Command {
+    use clap::{error::ErrorKind, CommandFactory};
+    match resolve_command_result(exec, command) {
+        Ok(cmd) => cmd,
+        Err(ResolveCommandError::Missing) => Args::command()
+            .error(
+                ErrorKind::MissingRequiredArgument,
+                "either provide -e/--exec <OPS> or a subcommand",
+            )
+            .exit(),
+        Err(ResolveCommandError::Conflict) => Args::command()
+            .error(
+                ErrorKind::ArgumentConflict,
+                "the argument '-e/--exec <OPS>' cannot be used with a subcommand",
+            )
+            .exit(),
     }
 }
 
@@ -672,6 +752,101 @@ mod tests {
         .expect("db check passes on a current db");
         let after = std::fs::read(&path).expect("read db after check");
         assert_eq!(before, after, "db check must not mutate the database");
+    }
+
+    // --- `-e` quick-shot shortcut for `exec` ---
+
+    #[test]
+    fn exec_shortcut_short_flag_parses_ops() {
+        let args = Args::parse_from(["kkernel", "-e", "stats()"]);
+        assert_eq!(args.exec.as_deref(), Some("stats()"));
+        assert!(args.command.is_none());
+    }
+
+    #[test]
+    fn exec_shortcut_long_flag_parses_ops() {
+        let args = Args::parse_from(["kkernel", "--exec", "stats()"]);
+        assert_eq!(args.exec.as_deref(), Some("stats()"));
+        assert!(args.command.is_none());
+    }
+
+    // `-e` and a subcommand both parse fine individually at the clap level
+    // (clap has no way to declare a `#[command(subcommand)]` field as a
+    // `conflicts_with` target — see `resolve_command_result`'s doc comment),
+    // so `kkernel -e 'x()' exec 'y()'` parses into `Args { exec: Some(..),
+    // command: Some(..) }` without a clap-level error. The conflict is instead
+    // enforced by `resolve_command_result`, exercised directly below (its
+    // process-exiting `main()` wrapper, `resolve_command`, is not unit-testable).
+    #[test]
+    fn exec_shortcut_conflicts_with_subcommand() {
+        let args = Args::parse_from(["kkernel", "-e", "stats()", "exec", "other()"]);
+        assert!(args.exec.is_some());
+        assert!(args.command.is_some());
+
+        let result = resolve_command_result(args.exec, args.command);
+        assert!(matches!(result, Err(ResolveCommandError::Conflict)));
+    }
+
+    #[test]
+    fn exec_shortcut_conflicts_with_subcommand_reverse_order() {
+        // Subcommand first, -e after — still rejected, though for a different
+        // reason than the `-e ... exec ...` order above: once `exec` starts
+        // consuming tokens, `-e` is not one of `ExecArgs`'s own flags, so this
+        // is a genuine clap-level "unexpected argument" parse error rather than
+        // reaching `resolve_command_result`'s conflict branch. Either order is
+        // still rejected, which is the acceptance-relevant behavior.
+        let bare = Args::try_parse_from(["kkernel", "pack", "list"]);
+        assert!(bare.is_ok(), "a bare subcommand alone must still parse");
+
+        let result = Args::try_parse_from(["kkernel", "exec", "other()", "-e", "stats()"]);
+        assert!(
+            result.is_err(),
+            "-e after a subcommand's own args must be rejected"
+        );
+    }
+
+    #[test]
+    fn resolve_command_result_missing_when_neither_given() {
+        let args = Args::parse_from(["kkernel"]);
+        let result = resolve_command_result(args.exec, args.command);
+        assert!(matches!(result, Err(ResolveCommandError::Missing)));
+    }
+
+    #[test]
+    fn resolve_command_result_exec_only_maps_to_exec_command() {
+        let args = Args::parse_from(["kkernel", "-e", "stats()"]);
+        let result = resolve_command_result(args.exec, args.command);
+        match result {
+            Ok(Command::Exec(e)) => assert_eq!(e.ops.as_deref(), Some("stats()")),
+            other => panic!("expected Ok(Command::Exec), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn exec_shortcut_maps_to_same_ops_as_exec_subcommand() {
+        // `-e '<ops>'` must produce the identical ExecArgs the `exec` subcommand
+        // itself would parse from `exec '<ops>'` — the resolution logic in
+        // `main()` builds this via `exec::ExecArgs::parse_from(["exec", &ops])`.
+        let via_shortcut = exec::ExecArgs::parse_from(["exec", "stats()"]);
+        let via_subcommand = match Args::parse_from(["kkernel", "exec", "stats()"]).command {
+            Some(Command::Exec(e)) => e,
+            other => panic!("expected Command::Exec, got {other:?}"),
+        };
+        assert_eq!(via_shortcut.ops, via_subcommand.ops);
+        assert_eq!(via_shortcut.db, via_subcommand.db);
+        assert_eq!(via_shortcut.namespace, via_subcommand.namespace);
+        assert_eq!(via_shortcut.presentation, via_subcommand.presentation);
+    }
+
+    #[test]
+    fn bare_invocation_without_exec_or_subcommand_is_not_a_valid_parse_state() {
+        // clap itself allows `kkernel` with neither -e nor a subcommand to parse
+        // (both are optional at the clap level); main() is what turns that into
+        // an error via `Args::command().error(...).exit()`. This test pins the
+        // parse-level shape that main() branches on.
+        let args = Args::parse_from(["kkernel"]);
+        assert!(args.exec.is_none());
+        assert!(args.command.is_none());
     }
 
     // --- #603: multi-backend boot path consolidation ---
