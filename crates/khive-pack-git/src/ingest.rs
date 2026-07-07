@@ -584,9 +584,9 @@ struct GhPr {
 }
 
 fn gh_json(repo: &Path, args: &[&str]) -> Result<String> {
+    // gh has no `-C` flag (unlike git) — repo targeting is via working directory.
     let output = Command::new("gh")
-        .arg("-C")
-        .arg(repo)
+        .current_dir(repo)
         .args(args)
         .output()
         .context("spawning gh")?;
