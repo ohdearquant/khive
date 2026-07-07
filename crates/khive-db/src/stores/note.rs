@@ -7,12 +7,15 @@ use uuid::Uuid;
 
 use khive_storage::error::StorageError;
 use khive_storage::note::{FilterOp, Note, NoteFilter, SortDir};
-use khive_storage::types::{BatchWriteSummary, DeleteMode, Page, PageRequest, SqlValue};
+use khive_storage::types::{
+    BatchWriteSummary, DeleteMode, Page, PageRequest, SqlStatement, SqlValue,
+};
 use khive_storage::NoteStore;
 use khive_storage::StorageCapability;
 
 use crate::error::SqliteError;
 use crate::pool::ConnectionPool;
+use crate::sql_bridge::bind_params;
 use crate::writer_task::WriterTaskHandle;
 
 fn map_err(e: rusqlite::Error, op: &'static str) -> StorageError {
@@ -21,6 +24,84 @@ fn map_err(e: rusqlite::Error, op: &'static str) -> StorageError {
 
 fn map_sqlite_err(e: SqliteError, op: &'static str) -> StorageError {
     StorageError::driver(StorageCapability::Notes, op, e)
+}
+
+// ---------------------------------------------------------------------------
+// Pure statement builders (ADR-099 B3 r6 structural cut) — see entity.rs's
+// sibling block for the full rationale. `upsert_note`/`delete_note` below
+// and ADR-099's atomic prepare path (`khive-runtime`) both call these.
+// ---------------------------------------------------------------------------
+
+/// The exact `INSERT OR REPLACE` this store's `upsert_note` issues.
+pub fn note_upsert_statement(note: &Note) -> SqlStatement {
+    let properties_str = note
+        .properties
+        .as_ref()
+        .map(|v| serde_json::to_string(v).unwrap_or_default());
+    SqlStatement {
+        sql: "INSERT OR REPLACE INTO notes \
+              (id, namespace, kind, status, name, content, salience, decay_factor, expires_at, \
+               properties, created_at, updated_at, deleted_at) \
+              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)"
+            .to_string(),
+        params: vec![
+            SqlValue::Text(note.id.to_string()),
+            SqlValue::Text(note.namespace.clone()),
+            SqlValue::Text(note.kind.to_string()),
+            SqlValue::Text(note.status.clone()),
+            match &note.name {
+                Some(n) => SqlValue::Text(n.clone()),
+                None => SqlValue::Null,
+            },
+            SqlValue::Text(note.content.clone()),
+            match note.salience {
+                Some(s) => SqlValue::Float(s),
+                None => SqlValue::Null,
+            },
+            match note.decay_factor {
+                Some(d) => SqlValue::Float(d),
+                None => SqlValue::Null,
+            },
+            match note.expires_at {
+                Some(e) => SqlValue::Integer(e),
+                None => SqlValue::Null,
+            },
+            match properties_str {
+                Some(p) => SqlValue::Text(p),
+                None => SqlValue::Null,
+            },
+            SqlValue::Integer(note.created_at),
+            SqlValue::Integer(note.updated_at),
+            match note.deleted_at {
+                Some(d) => SqlValue::Integer(d),
+                None => SqlValue::Null,
+            },
+        ],
+        label: Some("note-upsert".to_string()),
+    }
+}
+
+/// The exact soft-delete `UPDATE` this store's `delete_note(Soft)` issues.
+pub fn note_soft_delete_statement(id: Uuid, deleted_at: i64) -> SqlStatement {
+    SqlStatement {
+        sql: "UPDATE notes SET status = 'deleted', deleted_at = ?1 \
+              WHERE id = ?2 AND deleted_at IS NULL"
+            .to_string(),
+        params: vec![
+            SqlValue::Integer(deleted_at),
+            SqlValue::Text(id.to_string()),
+        ],
+        label: Some("note-delete-soft".to_string()),
+    }
+}
+
+/// The exact hard-delete `DELETE` this store's `delete_note(Hard)` issues.
+pub fn note_hard_delete_statement(id: Uuid) -> SqlStatement {
+    SqlStatement {
+        sql: "DELETE FROM notes WHERE id = ?1".to_string(),
+        params: vec![SqlValue::Text(id.to_string())],
+        label: Some("note-delete-hard".to_string()),
+    }
 }
 
 /// A NoteStore backed by SQLite. Namespace is the caller's responsibility.
@@ -401,37 +482,11 @@ fn build_note_filter_where(
 #[async_trait]
 impl NoteStore for SqlNoteStore {
     async fn upsert_note(&self, note: Note) -> Result<(), StorageError> {
-        let namespace = note.namespace.clone();
-        let id_str = note.id.to_string();
-        let kind_str = note.kind.to_string();
-        let status_str = note.status.clone();
-        let properties_str = note
-            .properties
-            .as_ref()
-            .map(|v| serde_json::to_string(v).unwrap_or_default());
-
+        let statement = note_upsert_statement(&note);
         self.with_writer("upsert_note", move |conn| {
-            conn.execute(
-                "INSERT OR REPLACE INTO notes \
-                 (id, namespace, kind, status, name, content, salience, decay_factor, expires_at, \
-                  properties, created_at, updated_at, deleted_at) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
-                rusqlite::params![
-                    id_str,
-                    namespace,
-                    kind_str,
-                    status_str,
-                    note.name,
-                    note.content,
-                    note.salience,
-                    note.decay_factor,
-                    note.expires_at,
-                    properties_str,
-                    note.created_at,
-                    note.updated_at,
-                    note.deleted_at,
-                ],
-            )?;
+            let mut stmt = conn.prepare(&statement.sql)?;
+            bind_params(&mut stmt, &statement.params)?;
+            stmt.raw_execute()?;
             Ok(())
         })
         .await
@@ -621,26 +676,23 @@ impl NoteStore for SqlNoteStore {
     }
 
     async fn delete_note(&self, id: Uuid, mode: DeleteMode) -> Result<bool, StorageError> {
-        let id_str = id.to_string();
-
         match mode {
             DeleteMode::Soft => {
+                let now = chrono::Utc::now().timestamp_micros();
+                let statement = note_soft_delete_statement(id, now);
                 self.with_writer("delete_note_soft", move |conn| {
-                    let now = chrono::Utc::now().timestamp_micros();
-                    let deleted = conn.execute(
-                        "UPDATE notes SET status = 'deleted', deleted_at = ?1 \
-                         WHERE id = ?2 AND deleted_at IS NULL",
-                        rusqlite::params![now, id_str],
-                    )?;
-                    Ok(deleted > 0)
+                    let mut stmt = conn.prepare(&statement.sql)?;
+                    bind_params(&mut stmt, &statement.params)?;
+                    Ok(stmt.raw_execute()? > 0)
                 })
                 .await
             }
             DeleteMode::Hard => {
+                let statement = note_hard_delete_statement(id);
                 self.with_writer("delete_note_hard", move |conn| {
-                    let deleted =
-                        conn.execute("DELETE FROM notes WHERE id = ?1", rusqlite::params![id_str])?;
-                    Ok(deleted > 0)
+                    let mut stmt = conn.prepare(&statement.sql)?;
+                    bind_params(&mut stmt, &statement.params)?;
+                    Ok(stmt.raw_execute()? > 0)
                 })
                 .await
             }

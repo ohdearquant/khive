@@ -479,11 +479,13 @@ async fn resolve_kg_ids_in_args(
 /// enforces, using the SAME canonical `resolve_kind_spec` the non-atomic
 /// `handle_delete` calls (ADR-099 B3 fix round 5, finding 1 — codex r3
 /// REJECT Blocker). `kind` absent -> `Ok(None)` (no check, parity with
-/// canonical's own optional discriminator). `kind` resolving to
-/// `Edge`/`Event`/`Proposal` -> a fail-loud rejection BEFORE `prepare_delete`
+/// canonical's own optional discriminator). `kind` resolving to `Edge` maps
+/// to `AtomicDeleteKind::Edge` (ADR-099 B3 r6 — closes the round-4 codex
+/// REJECT: `Edge` used to be rejected here even though
+/// `ATOMIC_ADMISSIBLE_VERBS` already allows `delete(kind="edge")`).
+/// `Event`/`Proposal` remain a fail-loud rejection BEFORE `prepare_delete`
 /// (and therefore before any write): those substrates are not v1-admissible
-/// for atomic delete (`prepare_delete`'s own match arms only ever build a
-/// plan for `Resolved::Entity`/`Resolved::Note`).
+/// for atomic delete at all.
 fn delete_expected_kind(
     args: &Value,
     registry: &VerbRegistry,
@@ -505,12 +507,15 @@ fn delete_expected_kind(
         khive_pack_kg::handlers::KindSpec::Note { specific } => Ok(Some(
             khive_runtime::atomic_prepare::AtomicDeleteKind::Note { specific },
         )),
-        khive_pack_kg::handlers::KindSpec::Edge
-        | khive_pack_kg::handlers::KindSpec::Event
-        | khive_pack_kg::handlers::KindSpec::Proposal => Err(anyhow::anyhow!(
-            "kind {raw:?} not supported under --atomic delete; only entity/note substrates \
-             are v1-admissible"
-        )),
+        khive_pack_kg::handlers::KindSpec::Edge => {
+            Ok(Some(khive_runtime::atomic_prepare::AtomicDeleteKind::Edge))
+        }
+        khive_pack_kg::handlers::KindSpec::Event | khive_pack_kg::handlers::KindSpec::Proposal => {
+            Err(anyhow::anyhow!(
+                "kind {raw:?} not supported under --atomic delete; only entity/note/edge \
+                 substrates are v1-admissible"
+            ))
+        }
     }
 }
 
@@ -562,6 +567,24 @@ async fn build_op_result(
             Some(Resolved::Note(note)) => Ok(khive_pack_kg::handlers::normalize_entity_timestamps(
                 serde_json::to_value(&note)?,
             )),
+            // ADR-099 B3 r6: `Resolved` has no `Edge` variant, so an edge
+            // update's `p.target_id` (the SURVIVING edge id — see
+            // `prepare_update_edge`'s symmetric-conflict-absorption branch,
+            // which may differ from the caller's original `id`) falls
+            // through here. Canonical shape: `to_json(&edge)` with no
+            // `normalize_entity_timestamps` wrapper (update.rs:220 —
+            // entity/note timestamps are ISO-8601 strings needing
+            // normalization; `Edge`'s `created_at`/`updated_at` already
+            // serialize as RFC3339 via its own `Serialize` impl).
+            None => {
+                let edge = runtime.get_edge(token, p.target_id).await?.ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "atomic update result: target {} not found post-commit",
+                        p.target_id
+                    )
+                })?;
+                Ok(serde_json::to_value(&edge)?)
+            }
             _ => anyhow::bail!(
                 "atomic update result: target {} not found post-commit",
                 p.target_id

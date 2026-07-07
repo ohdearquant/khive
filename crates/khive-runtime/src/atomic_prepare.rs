@@ -41,7 +41,7 @@ use uuid::Uuid;
 
 use khive_storage::types::SqlValue;
 use khive_storage::{EdgeRelation, SqlStatement};
-use khive_types::{EventKind, EventOutcome, SubstrateKind};
+use khive_types::{EventKind, SubstrateKind};
 
 use crate::atomic_plan::{
     AffectedRowGuard, DeletePlan, LinkPlan, MergePlan, PlanStatement, PostCommitEffect, UpdatePlan,
@@ -54,6 +54,12 @@ use crate::operations::{
     Resolved,
 };
 use crate::runtime::{KhiveRuntime, NamespaceToken};
+
+use khive_db::stores::event::event_insert_statements;
+use khive_db::stores::graph::{
+    edge_hard_delete_statement, edge_soft_delete_statement, edge_upsert_statement,
+    purge_incident_edges_statement,
+};
 
 // ---------------------------------------------------------------------------
 // arg extraction helpers
@@ -290,19 +296,31 @@ async fn push_index_purge_statements(
     Ok(())
 }
 
-/// Event-store append parity for the three canonical handlers that emit a
+/// Event-store append parity for the canonical handlers that emit a
 /// lifecycle event AFTER their row mutation: `update_entity` -> `EntityUpdated`
 /// (curation.rs:257-273), `delete_entity` -> `EntityDeleted`
 /// (operations.rs:3543-3558), `delete_note` -> `NoteDeleted`
-/// (operations.rs:3326-3340). `update_note` and `link` append no event
+/// (operations.rs:3326-3340), `update_edge` -> `EdgeUpdated`
+/// (operations.rs:3968-3983), `delete_edge` -> `EdgeDeleted`
+/// (operations.rs:4042-4056). `update_note` and `link` append no event
 /// (parity boundary verified by the GAP-1 sweep) and must never call this.
 ///
+/// ADR-099 B3 r6 (Leo condition 2, "one event implementation"): builds the
+/// `Event` exactly as each canonical site does
+/// (`khive_storage::event::Event::new(...).with_target(...).with_payload(...)`)
+/// and turns it into plain-data `SqlStatement`s via
+/// [`khive_db::stores::event::event_insert_statements`] — the SAME builder
+/// [`khive_db::stores::event::append_event_on_writer`] (the async execution
+/// path every canonical `event_store.append_event(...)` call ultimately
+/// reaches) uses. There is exactly one place that knows the
+/// `events`/`event_observations` insert shape; this function only adapts its
+/// output into unguarded [`PlanStatement`]s for the atomic-unit plan.
+///
 /// Placement decision (matches canonical's error semantics, ADR-099 B3 GAP-1
-/// fix round): all three canonical sites call
+/// fix round): all canonical sites call
 /// `event_store.append_event(event).await.map_err(...)?` — the `?` makes a
 /// failed append a hard `RuntimeError`, never swallowed/logged-and-continue.
-/// `append_event`'s body (`khive-db::stores::event::insert_event_with_
-/// observations`) is two plain, deterministic `INSERT`s (`events`, then
+/// The insert is two-to-N plain, deterministic `INSERT`s (`events`, then
 /// `event_observations` for the target-row observation) computed entirely
 /// from data already on hand at prepare time — no embedding call, no other
 /// suspending/async computation, unlike the `ReindexEntity`/`ReindexNote`
@@ -326,64 +344,19 @@ fn event_append_statements(
     substrate: SubstrateKind,
     target_id: Uuid,
     payload: Value,
-    label_prefix: &str,
-) -> Vec<PlanStatement> {
-    let event_id = Uuid::new_v4();
-    let created_at = chrono::Utc::now().timestamp_micros();
-    let referent_kind = if substrate == SubstrateKind::Note {
-        "note"
-    } else {
-        "entity"
-    };
-
-    let event_stmt = PlanStatement {
-        statement: SqlStatement {
-            sql: "INSERT INTO events \
-                  (id, namespace, verb, substrate, actor, kind, outcome, payload, \
-                   payload_schema_version, profile_state_version, duration_us, target_id, \
-                   session_id, aggregate_kind, aggregate_id, created_at) \
-                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)"
-                .to_string(),
-            params: vec![
-                SqlValue::Text(event_id.to_string()),
-                SqlValue::Text(namespace.to_string()),
-                SqlValue::Text(verb.to_string()),
-                SqlValue::Text(substrate.name().to_string()),
-                SqlValue::Text(String::new()),
-                SqlValue::Text(kind.name().to_string()),
-                SqlValue::Text(EventOutcome::Success.name().to_string()),
-                SqlValue::Text(payload.to_string()),
-                SqlValue::Integer(1),
-                SqlValue::Null,
-                SqlValue::Integer(0),
-                SqlValue::Text(target_id.to_string()),
-                SqlValue::Null,
-                SqlValue::Null,
-                SqlValue::Null,
-                SqlValue::Integer(created_at),
-            ],
-            label: Some(format!("{label_prefix}-event")),
-        },
-        guard: None,
-    };
-    let observation_stmt = PlanStatement {
-        statement: SqlStatement {
-            sql: "INSERT INTO event_observations \
-                  (event_id, entity_id, referent_kind, role, position) \
-                  VALUES (?1, ?2, ?3, ?4, ?5)"
-                .to_string(),
-            params: vec![
-                SqlValue::Text(event_id.to_string()),
-                SqlValue::Text(target_id.to_string()),
-                SqlValue::Text(referent_kind.to_string()),
-                SqlValue::Text("target".to_string()),
-                SqlValue::Integer(0),
-            ],
-            label: Some(format!("{label_prefix}-event-observation")),
-        },
-        guard: None,
-    };
-    vec![event_stmt, observation_stmt]
+) -> RuntimeResult<Vec<PlanStatement>> {
+    let event = khive_storage::event::Event::new(namespace.to_string(), verb, kind, substrate, "")
+        .with_target(target_id)
+        .with_payload(payload);
+    let statements = event_insert_statements(&event)
+        .map_err(|e| RuntimeError::Internal(format!("event_insert_statements: {e}")))?;
+    Ok(statements
+        .into_iter()
+        .map(|statement| PlanStatement {
+            statement,
+            guard: None,
+        })
+        .collect())
 }
 
 // ---------------------------------------------------------------------------
@@ -484,12 +457,38 @@ fn reject_inapplicable_update_fields(args: &Value, substrate: &str) -> RuntimeRe
             };
             (bad, "name, content, salience, decay_factor, properties")
         }
+        // ADR-099 B3 r6: closes the round-4 codex REJECT (High) — `update`
+        // admits `kind="edge"` per `ATOMIC_ADMISSIBLE_VERBS` but this
+        // validator previously had no "edge" arm at all, so an edge update
+        // carrying an entity/note-only field (e.g. `name`) silently skipped
+        // the guard instead of being rejected, mirroring
+        // `khive-pack-kg::handlers::update::reject_inapplicable_fields`'s
+        // `KindSpec::Edge` arm.
+        "edge" => {
+            let bad = if present("name") {
+                Some("name")
+            } else if present("description") {
+                Some("description")
+            } else if present("content") {
+                Some("content")
+            } else if present("tags") {
+                Some("tags")
+            } else if present("salience") {
+                Some("salience")
+            } else if present("decay_factor") {
+                Some("decay_factor")
+            } else {
+                None
+            };
+            (bad, "relation, weight, properties")
+        }
         _ => (None, ""),
     };
     if let Some(field) = bad_field {
         let substrate_label = match substrate {
             "entity" => "an entity",
             "note" => "a note",
+            "edge" => "an edge",
             other => other,
         };
         return Err(RuntimeError::InvalidInput(format!(
@@ -633,8 +632,7 @@ async fn prepare_update(
                     "namespace": entity.namespace,
                     "changed_fields": changed_fields,
                 }),
-                "atomic-update-entity",
-            ));
+            )?);
             Ok(AtomicOpPlan::Update(UpdatePlan {
                 target_id: id,
                 statements,
@@ -747,10 +745,230 @@ async fn prepare_update(
             }))
         }
         Some(_) => Err(RuntimeError::InvalidInput(format!(
-            "update target {id} must be an entity or note"
+            "update target {id} must be an entity, note, or edge"
         ))),
-        None => Err(RuntimeError::NotFound(format!("entity/note {id}"))),
+        // `Resolved` (khive-runtime::operations) has no `Edge` variant — an
+        // id that isn't an entity/note/pack-private/event record is checked
+        // against the graph store directly, mirroring
+        // `khive-pack-kg::handlers::KgPack::infer_kind_from_uuid`'s own
+        // entity/note-then-edge fallback order (ADR-099 B3 r6, closes the
+        // round-4 codex REJECT: `update` admits `kind="edge"` but this
+        // function previously had no path that could ever build a plan for
+        // one).
+        None => match runtime.get_edge(token, id).await? {
+            Some(edge) => prepare_update_edge(runtime, id, edge, args).await,
+            None => Err(RuntimeError::NotFound(format!("entity/note/edge {id}"))),
+        },
     }
+}
+
+/// Edge branch of `prepare_update` (ADR-099 B3 r6). Mirrors
+/// `khive-runtime::operations::KhiveRuntime::update_edge`'s patch semantics
+/// exactly: `relation`/`weight`/`properties` are the only applicable fields
+/// (`reject_inapplicable_update_fields`'s `"edge"` arm enforces this before
+/// any mutation), a changed `relation` is endpoint-validated first, `weight`
+/// is range-checked, and `properties` REPLACES `metadata` wholesale (no
+/// merge — `update_edge` does `edge.metadata = Some(props)`, unlike the
+/// entity/note branches' `merge_properties`).
+///
+/// DML shape:
+/// - non-symmetric relation: a single [`edge_upsert_statement`] call on the
+///   patched `Edge` — bit-for-bit the same builder `update_edge`'s own
+///   non-symmetric branch calls via `graph.upsert_edge(edge.clone())`
+///   (`khive-db::stores::graph::SqlGraphStore::upsert_edge`), so parity is
+///   exact by construction.
+/// - symmetric relation (`competes_with`, `composed_with`): `update_edge`
+///   does NOT use the upsert builder here — its comment explains why
+///   (`upsert_edge` resolves `ON CONFLICT(namespace, id)` first and cannot
+///   detect a natural-key collision with a *different* id). It instead runs
+///   a conflict PROBE then branches: no conflict -> update the row in place;
+///   conflict -> delete the requested (non-canonical) row and refresh the
+///   surviving canonical row. That probe is a plain read with no side
+///   effects, so it runs here in the async prepare phase (same treatment
+///   `resolve_kg_ids_in_args` already gives id resolution) and the two
+///   branches below reproduce `update_edge_symmetric_dml`'s exact SQL text,
+///   so the resulting plan is fully static for the synchronous commit pass.
+async fn prepare_update_edge(
+    runtime: &KhiveRuntime,
+    id: Uuid,
+    mut edge: khive_storage::types::Edge,
+    args: &Value,
+) -> RuntimeResult<AtomicOpPlan> {
+    reject_inapplicable_update_fields(args, "edge")?;
+
+    let relation_raw = optional_str(args, "relation");
+    let weight = optional_f64(args, "weight")?;
+    let properties = optional_properties(args, "properties")?;
+
+    if let Some(ref p) = properties {
+        crate::secret_gate::check_json(p)?;
+    }
+
+    let namespace = edge.namespace.clone();
+    let record_tok = NamespaceToken::for_namespace(
+        khive_types::Namespace::parse(&namespace)
+            .map_err(|e| RuntimeError::Internal(format!("edge namespace invalid: {e}")))?,
+    );
+
+    let mut changed_fields: Vec<&'static str> = Vec::new();
+    if let Some(raw) = relation_raw {
+        let relation = parse_edge_relation(raw)?;
+        runtime
+            .validate_edge_relation_endpoints(&record_tok, edge.source_id, edge.target_id, relation)
+            .await?;
+        edge.relation = relation;
+        changed_fields.push("relation");
+    }
+    if let Some(w) = weight {
+        if !w.is_finite() || !(0.0..=1.0).contains(&w) {
+            return Err(RuntimeError::InvalidInput(format!(
+                "edge weight must be a finite value in [0.0, 1.0]; got {w}"
+            )));
+        }
+        edge.weight = w;
+        changed_fields.push("weight");
+    }
+    if let Some(p) = properties {
+        edge.metadata = Some(p);
+        changed_fields.push("properties");
+    }
+
+    let (canon_src, canon_tgt) =
+        canonical_edge_endpoints(edge.relation, edge.source_id, edge.target_id);
+    let now = chrono::Utc::now();
+
+    let mut statements: Vec<PlanStatement> = Vec::new();
+    let mut surviving_id = id;
+
+    if edge.relation.is_symmetric() {
+        // Conflict probe (read-only, async — see doc comment above).
+        let mut reader = runtime
+            .sql()
+            .reader()
+            .await
+            .map_err(RuntimeError::Storage)?;
+        let conflict_id = reader
+            .query_scalar(SqlStatement {
+                sql: "SELECT id FROM graph_edges WHERE namespace = ?1 AND source_id = ?2 \
+                      AND target_id = ?3 AND relation = ?4 AND id != ?5"
+                    .to_string(),
+                params: vec![
+                    SqlValue::Text(namespace.clone()),
+                    SqlValue::Text(canon_src.to_string()),
+                    SqlValue::Text(canon_tgt.to_string()),
+                    SqlValue::Text(edge.relation.to_string()),
+                    SqlValue::Text(id.to_string()),
+                ],
+                label: Some("atomic-update-edge-conflict-probe".to_string()),
+            })
+            .await
+            .map_err(RuntimeError::Storage)?
+            .and_then(|v| match v {
+                SqlValue::Text(s) => Uuid::parse_str(&s).ok(),
+                _ => None,
+            });
+
+        let metadata_str = edge
+            .metadata
+            .as_ref()
+            .map(|v| serde_json::to_string(v).unwrap_or_default());
+
+        if let Some(existing_id) = conflict_id {
+            // Case (b), mirrors `update_edge_symmetric_dml`: delete the
+            // requested (non-canonical) row, refresh the surviving row.
+            surviving_id = existing_id;
+            statements.push(PlanStatement {
+                statement: SqlStatement {
+                    sql: "DELETE FROM graph_edges WHERE namespace = ?1 AND id = ?2".to_string(),
+                    params: vec![
+                        SqlValue::Text(namespace.clone()),
+                        SqlValue::Text(id.to_string()),
+                    ],
+                    label: Some("atomic-update-edge-symmetric-delete-noncanonical".to_string()),
+                },
+                guard: Some(AffectedRowGuard::exactly(1)),
+            });
+            statements.push(PlanStatement {
+                statement: SqlStatement {
+                    sql: "UPDATE graph_edges SET \
+                          weight = ?1, updated_at = ?2, deleted_at = NULL, \
+                          target_backend = ?3, metadata = ?4 \
+                          WHERE namespace = ?5 AND id = ?6"
+                        .to_string(),
+                    params: vec![
+                        SqlValue::Float(edge.weight),
+                        SqlValue::Integer(now.timestamp_micros()),
+                        match &edge.target_backend {
+                            Some(b) => SqlValue::Text(b.clone()),
+                            None => SqlValue::Null,
+                        },
+                        match metadata_str {
+                            Some(m) => SqlValue::Text(m),
+                            None => SqlValue::Null,
+                        },
+                        SqlValue::Text(namespace.clone()),
+                        SqlValue::Text(existing_id.to_string()),
+                    ],
+                    label: Some("atomic-update-edge-symmetric-refresh-canonical".to_string()),
+                },
+                guard: Some(AffectedRowGuard::exactly(1)),
+            });
+        } else {
+            // Case (a): no conflict — update source/target/relation/weight
+            // in place, preserving the original edge id.
+            statements.push(PlanStatement {
+                statement: SqlStatement {
+                    sql: "UPDATE graph_edges SET \
+                          source_id = ?1, target_id = ?2, relation = ?3, \
+                          weight = ?4, updated_at = ?5, metadata = ?6 \
+                          WHERE namespace = ?7 AND id = ?8"
+                        .to_string(),
+                    params: vec![
+                        SqlValue::Text(canon_src.to_string()),
+                        SqlValue::Text(canon_tgt.to_string()),
+                        SqlValue::Text(edge.relation.to_string()),
+                        SqlValue::Float(edge.weight),
+                        SqlValue::Integer(now.timestamp_micros()),
+                        match metadata_str {
+                            Some(m) => SqlValue::Text(m),
+                            None => SqlValue::Null,
+                        },
+                        SqlValue::Text(namespace.clone()),
+                        SqlValue::Text(id.to_string()),
+                    ],
+                    label: Some("atomic-update-edge-inplace".to_string()),
+                },
+                guard: Some(AffectedRowGuard::exactly(1)),
+            });
+        }
+    } else {
+        // Non-symmetric: bit-for-bit the same builder `graph.upsert_edge`
+        // calls — see doc comment above.
+        edge.updated_at = now;
+        statements.push(PlanStatement {
+            statement: edge_upsert_statement(&edge),
+            guard: Some(AffectedRowGuard::exactly(1)),
+        });
+    }
+
+    // Mirrors `update_edge`'s unconditional post-mutation `EdgeUpdated`
+    // event append (operations.rs:3968-3983), keyed on the ORIGINAL
+    // `edge_id` the caller supplied — canonical does the same (the event
+    // target is `edge_id`, not the post-absorption surviving id).
+    statements.extend(event_append_statements(
+        &namespace,
+        "update",
+        EventKind::EdgeUpdated,
+        SubstrateKind::Entity,
+        id,
+        serde_json::json!({"id": id, "namespace": namespace, "changed_fields": changed_fields}),
+    )?);
+
+    Ok(AtomicOpPlan::Update(UpdatePlan {
+        target_id: surviving_id,
+        statements,
+        post_commit: PostCommitEffect::None,
+    }))
 }
 
 // ---------------------------------------------------------------------------
@@ -765,14 +983,18 @@ async fn prepare_update(
 /// `khive_pack_kg::handlers::KindSpec` itself: the kkernel seam does the
 /// pack-aware `resolve_kind_spec` resolution (which needs a `VerbRegistry`,
 /// unreachable from this crate) and passes down only what `prepare_delete`
-/// needs to enforce the mismatch check. `KindSpec::Edge`/`Event`/`Proposal`
-/// are rejected at the kkernel seam BEFORE `prepare_delete` is ever called
-/// — those substrates are not v1-admissible for atomic delete (this enum
-/// intentionally has no variant for them, so a rejected kind can never be
-/// constructed here).
+/// needs to enforce the mismatch check.
+///
+/// `Edge` was added in ADR-099 B3 r6, closing the round-4 codex REJECT
+/// (High): `delete` admits `kind="edge"` per `ATOMIC_ADMISSIBLE_VERBS`, but
+/// this enum previously had no variant for it, so the kkernel seam rejected
+/// `delete(kind="edge", ...)` before `prepare_delete` was ever reached —
+/// admissible-but-unimplemented. `Event`/`Proposal` remain rejected at the
+/// kkernel seam (not v1-admissible for atomic delete at all).
 pub enum AtomicDeleteKind {
     Entity { specific: Option<String> },
     Note { specific: Option<String> },
+    Edge,
 }
 
 /// `expected_kind`: `None` when the caller omitted `kind` (no check, parity
@@ -820,6 +1042,9 @@ pub async fn prepare_delete(
                 Some(AtomicDeleteKind::Entity { specific: None }) => {}
                 Some(AtomicDeleteKind::Note { .. }) => {
                     return Err(RuntimeError::NotFound(format!("note {id}")));
+                }
+                Some(AtomicDeleteKind::Edge) => {
+                    return Err(RuntimeError::NotFound(format!("edge {id}")));
                 }
             }
             let namespace = entity.namespace.clone();
@@ -886,8 +1111,7 @@ pub async fn prepare_delete(
                 SubstrateKind::Entity,
                 id,
                 serde_json::json!({"id": id, "namespace": namespace, "hard": hard}),
-                "atomic-delete-entity",
-            ));
+            )?);
             Ok(AtomicOpPlan::Delete(DeletePlan {
                 target_id: id,
                 statements,
@@ -906,6 +1130,9 @@ pub async fn prepare_delete(
                 Some(AtomicDeleteKind::Note { specific: None }) => {}
                 Some(AtomicDeleteKind::Entity { .. }) => {
                     return Err(RuntimeError::NotFound(format!("entity {id}")));
+                }
+                Some(AtomicDeleteKind::Edge) => {
+                    return Err(RuntimeError::NotFound(format!("edge {id}")));
                 }
             }
             let namespace = note.namespace.clone();
@@ -974,18 +1201,90 @@ pub async fn prepare_delete(
                 SubstrateKind::Note,
                 id,
                 serde_json::json!({"id": id, "namespace": namespace, "hard": hard}),
-                "atomic-delete-note",
-            ));
+            )?);
             Ok(AtomicOpPlan::Delete(DeletePlan {
                 target_id: id,
                 statements,
             }))
         }
         Some(_) => Err(RuntimeError::InvalidInput(format!(
-            "delete target {id} must be an entity or note"
+            "delete target {id} must be an entity, note, or edge"
         ))),
-        None => Err(RuntimeError::NotFound(format!("entity/note {id}"))),
+        // `Resolved` has no `Edge` variant (same reasoning as
+        // `prepare_update`'s fallback above) — probe the graph store
+        // directly. ADR-099 B3 r6: closes the round-4 codex REJECT (High).
+        None => match &expected_kind {
+            Some(AtomicDeleteKind::Entity { .. }) => {
+                Err(RuntimeError::NotFound(format!("entity/note {id}")))
+            }
+            Some(AtomicDeleteKind::Note { .. }) => {
+                Err(RuntimeError::NotFound(format!("entity/note {id}")))
+            }
+            Some(AtomicDeleteKind::Edge) | None => {
+                let edge = if hard {
+                    runtime.get_edge_including_deleted(token, id).await?
+                } else {
+                    runtime.get_edge(token, id).await?
+                };
+                match edge {
+                    Some(edge) => prepare_delete_edge(id, edge, hard).await,
+                    None => Err(RuntimeError::NotFound(format!("entity/note/edge {id}"))),
+                }
+            }
+        },
     }
+}
+
+/// Edge branch of `prepare_delete` (ADR-099 B3 r6). Mirrors
+/// `khive-runtime::operations::KhiveRuntime::delete_edge` exactly: hard
+/// delete cascades `purge_incident_edges` (any `annotates` edge — or any
+/// other edge — pointing AT this edge as a node) BEFORE deleting the edge
+/// row itself, then a soft or hard delete statement, then an unconditional
+/// `EdgeDeleted` event (edges are never FTS/vector-indexed, so unlike the
+/// entity/note branches there is no index purge here — `delete_edge` has
+/// none either).
+async fn prepare_delete_edge(
+    id: Uuid,
+    edge: khive_storage::types::Edge,
+    hard: bool,
+) -> RuntimeResult<AtomicOpPlan> {
+    let namespace = edge.namespace.clone();
+    let mut statements: Vec<PlanStatement> = Vec::new();
+
+    if hard {
+        // Mirrors `delete_edge`'s `graph.purge_incident_edges(edge_id)` —
+        // unguarded: zero incident edges is a legitimate outcome, not a
+        // failure (same reasoning as the entity/note cascade-edges
+        // statements above).
+        statements.push(PlanStatement {
+            statement: purge_incident_edges_statement(id),
+            guard: None,
+        });
+        statements.push(PlanStatement {
+            statement: edge_hard_delete_statement(id),
+            guard: Some(AffectedRowGuard::exactly(1)),
+        });
+    } else {
+        let now = chrono::Utc::now().timestamp_micros();
+        statements.push(PlanStatement {
+            statement: edge_soft_delete_statement(id, now),
+            guard: Some(AffectedRowGuard::exactly(1)),
+        });
+    }
+
+    statements.extend(event_append_statements(
+        &namespace,
+        "delete",
+        EventKind::EdgeDeleted,
+        SubstrateKind::Entity,
+        id,
+        serde_json::json!({"id": id, "namespace": namespace, "hard": hard}),
+    )?);
+
+    Ok(AtomicOpPlan::Delete(DeletePlan {
+        target_id: id,
+        statements,
+    }))
 }
 
 // ---------------------------------------------------------------------------
@@ -2375,6 +2674,263 @@ mod tests {
                 events.len(),
                 1,
                 "expected exactly one NoteDeleted event for {note_id} (hard={hard})"
+            );
+            assert_eq!(events[0].payload["hard"], json!(hard));
+        }
+    }
+
+    /// ADR-099 B3 r6 (closes the round-4 codex REJECT, High): `update`
+    /// admits `kind="edge"` per `ATOMIC_ADMISSIBLE_VERBS`; this asserts
+    /// `prepare_update` actually builds a plan for one — a non-symmetric
+    /// relation (`extends`) exercises the `edge_upsert_statement` reuse
+    /// branch — and that the committed row + `EdgeUpdated` event match
+    /// canonical `update_edge`'s shape (weight persisted, relation
+    /// unchanged, exactly one event).
+    #[tokio::test]
+    async fn atomic_update_edge_patches_weight_and_appends_edge_updated_event() {
+        let runtime = scratch_runtime();
+        let token = runtime
+            .authorize(Namespace::parse("local").expect("ns"))
+            .expect("authorize");
+        let entities = runtime.entities(&token).expect("entities store");
+        let a = khive_storage::Entity::new("local", "concept", "GapEdgeA");
+        let b = khive_storage::Entity::new("local", "concept", "GapEdgeB");
+        let (a_id, b_id) = (a.id, b.id);
+        entities.upsert_entity(a).await.expect("seed a");
+        entities.upsert_entity(b).await.expect("seed b");
+
+        let edge = runtime
+            .link(&token, a_id, b_id, EdgeRelation::Extends, 0.4, None)
+            .await
+            .expect("seed edge");
+        let edge_id = Uuid::from(edge.id);
+
+        let plan = prepare_update(
+            &runtime,
+            &token,
+            &json!({"id": edge_id.to_string(), "weight": 0.75}),
+        )
+        .await
+        .expect("prepare update edge");
+        let outcome = crate::atomic_runner::run_atomic_unit(runtime.sql().as_ref(), vec![plan])
+            .await
+            .expect("seam call ok");
+        assert!(
+            matches!(
+                outcome,
+                crate::atomic_runner::AtomicRunOutcome::Committed { .. }
+            ),
+            "expected a clean edge update commit: {outcome:?}"
+        );
+
+        let updated = runtime
+            .get_edge(&token, edge_id)
+            .await
+            .expect("get_edge")
+            .expect("edge still present");
+        assert_eq!(updated.weight, 0.75, "weight patch must persist");
+        assert_eq!(updated.relation, EdgeRelation::Extends);
+
+        let events = events_for_target(&runtime, &token, edge_id, EventKind::EdgeUpdated).await;
+        assert_eq!(
+            events.len(),
+            1,
+            "expected exactly one EdgeUpdated event for {edge_id}"
+        );
+        assert_eq!(
+            events[0].payload["changed_fields"],
+            json!(["weight"]),
+            "changed_fields must name exactly the patched field"
+        );
+    }
+
+    /// ADR-099 B3 r6: the symmetric-relation conflict-absorption branch of
+    /// `prepare_update_edge` — mirrors `update_edge_symmetric_dml`'s case
+    /// (b): changing a non-symmetric edge's `relation` to a symmetric one
+    /// whose canonical natural key collides with an ALREADY-EXISTING
+    /// symmetric edge between the same two entities must delete the
+    /// requested (non-canonical) row and refresh the surviving canonical
+    /// row in place, rather than raising a uniqueness error.
+    #[tokio::test]
+    async fn atomic_update_edge_symmetric_conflict_absorbs_into_surviving_row() {
+        let runtime = scratch_runtime();
+        let token = runtime
+            .authorize(Namespace::parse("local").expect("ns"))
+            .expect("authorize");
+        let entities = runtime.entities(&token).expect("entities store");
+        let a = khive_storage::Entity::new("local", "concept", "GapEdgeSymA");
+        let b = khive_storage::Entity::new("local", "concept", "GapEdgeSymB");
+        let (a_id, b_id) = (a.id, b.id);
+        entities.upsert_entity(a).await.expect("seed a");
+        entities.upsert_entity(b).await.expect("seed b");
+
+        // The non-canonical edge under test: A -> B, non-symmetric relation.
+        let requested_edge = runtime
+            .link(&token, a_id, b_id, EdgeRelation::Extends, 0.2, None)
+            .await
+            .expect("seed requested edge");
+        let requested_id = Uuid::from(requested_edge.id);
+
+        // The pre-existing canonical row this update will collide with once
+        // `relation` becomes `competes_with` (symmetric).
+        let canonical_edge = runtime
+            .link(&token, a_id, b_id, EdgeRelation::CompetesWith, 0.6, None)
+            .await
+            .expect("seed canonical edge");
+        let canonical_id = Uuid::from(canonical_edge.id);
+        assert_ne!(requested_id, canonical_id);
+
+        let plan = prepare_update(
+            &runtime,
+            &token,
+            &json!({"id": requested_id.to_string(), "relation": "competes_with", "weight": 0.9}),
+        )
+        .await
+        .expect("prepare update edge (symmetric conflict)");
+        // The plan must target the SURVIVING (canonical) row, not the
+        // requested one — mirrors `update_edge`'s `edge = self.get_edge(&record_tok, surviving_uuid)`.
+        match &plan {
+            AtomicOpPlan::Update(p) => assert_eq!(p.target_id, canonical_id),
+            other => panic!("expected an Update plan, got {other:?}"),
+        }
+
+        let outcome = crate::atomic_runner::run_atomic_unit(runtime.sql().as_ref(), vec![plan])
+            .await
+            .expect("seam call ok");
+        assert!(
+            matches!(
+                outcome,
+                crate::atomic_runner::AtomicRunOutcome::Committed { .. }
+            ),
+            "expected a clean symmetric-conflict-absorption commit: {outcome:?}"
+        );
+
+        // The requested (non-canonical) row must be gone.
+        let requested_after = runtime
+            .get_edge_including_deleted(&token, requested_id)
+            .await
+            .expect("get_edge_including_deleted");
+        assert!(
+            requested_after.is_none(),
+            "the non-canonical requested row must be deleted, not just tombstoned"
+        );
+
+        // The surviving canonical row must carry the patch.
+        let surviving = runtime
+            .get_edge(&token, canonical_id)
+            .await
+            .expect("get_edge")
+            .expect("surviving canonical row must remain");
+        assert_eq!(surviving.weight, 0.9);
+        assert_eq!(surviving.relation, EdgeRelation::CompetesWith);
+
+        // Event target is the CALLER-supplied id, not the surviving id —
+        // mirrors `update_edge`'s event using `edge_id` (the caller's
+        // original argument), not the post-absorption id.
+        let events =
+            events_for_target(&runtime, &token, requested_id, EventKind::EdgeUpdated).await;
+        assert_eq!(events.len(), 1);
+    }
+
+    /// ADR-099 B3 r6 (closes the round-4 codex REJECT, High): `update`
+    /// rejects an entity/note-only field (`name`) on an edge target,
+    /// mirroring `khive-pack-kg::handlers::update::reject_inapplicable_fields`'s
+    /// `KindSpec::Edge` arm — before this fix `reject_inapplicable_update_fields`
+    /// had no `"edge"` match arm at all, so the field was silently dropped.
+    #[tokio::test]
+    async fn atomic_update_edge_rejects_entity_only_field_name() {
+        let runtime = scratch_runtime();
+        let token = runtime
+            .authorize(Namespace::parse("local").expect("ns"))
+            .expect("authorize");
+        let entities = runtime.entities(&token).expect("entities store");
+        let a = khive_storage::Entity::new("local", "concept", "GapEdgeRejectA");
+        let b = khive_storage::Entity::new("local", "concept", "GapEdgeRejectB");
+        let (a_id, b_id) = (a.id, b.id);
+        entities.upsert_entity(a).await.expect("seed a");
+        entities.upsert_entity(b).await.expect("seed b");
+        let edge = runtime
+            .link(&token, a_id, b_id, EdgeRelation::Extends, 0.5, None)
+            .await
+            .expect("seed edge");
+        let edge_id = Uuid::from(edge.id);
+
+        let err = prepare_update(
+            &runtime,
+            &token,
+            &json!({"id": edge_id.to_string(), "name": "not-a-valid-edge-field"}),
+        )
+        .await
+        .expect_err("edge update with an entity-only field must be rejected");
+        let message = err.to_string();
+        assert!(
+            message.contains("name") && message.contains("edge"),
+            "error must name the offending field and the substrate: {message}"
+        );
+    }
+
+    /// ADR-099 B3 r6 (closes the round-4 codex REJECT, High): `delete`
+    /// admits `kind="edge"` per `ATOMIC_ADMISSIBLE_VERBS`; this asserts
+    /// `prepare_delete` actually builds a plan for one on both soft and
+    /// hard delete, matching `operations::delete_edge`'s row-mode DML and
+    /// unconditional `EdgeDeleted` event.
+    #[tokio::test]
+    async fn atomic_delete_edge_soft_and_hard_appends_edge_deleted_event() {
+        let runtime = scratch_runtime();
+        let token = runtime
+            .authorize(Namespace::parse("local").expect("ns"))
+            .expect("authorize");
+
+        for hard in [false, true] {
+            let entities = runtime.entities(&token).expect("entities store");
+            let a = khive_storage::Entity::new("local", "concept", format!("GapEdgeDelA{hard}"));
+            let b = khive_storage::Entity::new("local", "concept", format!("GapEdgeDelB{hard}"));
+            let (a_id, b_id) = (a.id, b.id);
+            entities.upsert_entity(a).await.expect("seed a");
+            entities.upsert_entity(b).await.expect("seed b");
+            let edge = runtime
+                .link(&token, a_id, b_id, EdgeRelation::Extends, 0.5, None)
+                .await
+                .expect("seed edge");
+            let edge_id = Uuid::from(edge.id);
+
+            let args = if hard {
+                json!({"id": edge_id.to_string(), "hard": true})
+            } else {
+                json!({"id": edge_id.to_string()})
+            };
+            let plan = prepare_delete(&runtime, &token, &args, None)
+                .await
+                .unwrap_or_else(|e| panic!("prepare delete edge (hard={hard}): {e}"));
+            let outcome = crate::atomic_runner::run_atomic_unit(runtime.sql().as_ref(), vec![plan])
+                .await
+                .unwrap_or_else(|e| panic!("edge delete commit (hard={hard}): {e}"));
+            assert!(
+                matches!(
+                    outcome,
+                    crate::atomic_runner::AtomicRunOutcome::Committed { .. }
+                ),
+                "expected a clean edge delete commit (hard={hard}): {outcome:?}"
+            );
+
+            let after = runtime
+                .get_edge_including_deleted(&token, edge_id)
+                .await
+                .expect("get_edge_including_deleted");
+            if hard {
+                assert!(after.is_none(), "hard delete must purge the row entirely");
+            } else {
+                assert!(
+                    after.as_ref().is_some_and(|e| e.deleted_at.is_some()),
+                    "soft delete must tombstone, not purge"
+                );
+            }
+
+            let events = events_for_target(&runtime, &token, edge_id, EventKind::EdgeDeleted).await;
+            assert_eq!(
+                events.len(),
+                1,
+                "expected exactly one EdgeDeleted event for {edge_id} (hard={hard})"
             );
             assert_eq!(events[0].payload["hard"], json!(hard));
         }

@@ -9,9 +9,9 @@ use uuid::Uuid;
 use khive_score::DeterministicScore;
 use khive_storage::error::StorageError;
 use khive_storage::types::{
-    BatchWriteSummary, IndexRebuildScope, TextDocument, TextFilter, TextGatherMode, TextIndexStats,
-    TextQueryMode, TextSearchHit, TextSearchOptions, TextSearchRequest, TextTermStats,
-    TextTermStatsRequest,
+    BatchWriteSummary, IndexRebuildScope, SqlStatement, SqlValue, TextDocument, TextFilter,
+    TextGatherMode, TextIndexStats, TextQueryMode, TextSearchHit, TextSearchOptions,
+    TextSearchRequest, TextTermStats, TextTermStatsRequest,
 };
 use khive_storage::StorageCapability;
 use khive_storage::TextSearch;
@@ -19,7 +19,25 @@ use khive_types::SubstrateKind;
 
 use crate::error::SqliteError;
 use crate::pool::ConnectionPool;
+use crate::sql_bridge::bind_params;
 use crate::writer_task::WriterTaskHandle;
+
+/// The exact `DELETE` this store's `delete_document` issues, for a given
+/// FTS table (ADR-099 B3 r6 structural cut — see `entity.rs`'s sibling
+/// block). `table` must already be a trusted, sanitized table name (this
+/// mirrors `delete_document`'s own pre-existing lack of a placeholder for
+/// table names — `format!` is required since table identifiers cannot be
+/// bound as SQL parameters).
+pub fn delete_document_statement(table: &str, namespace: &str, subject_id: Uuid) -> SqlStatement {
+    SqlStatement {
+        sql: format!("DELETE FROM {table} WHERE namespace = ?1 AND subject_id = ?2"),
+        params: vec![
+            SqlValue::Text(namespace.to_string()),
+            SqlValue::Text(subject_id.to_string()),
+        ],
+        label: Some(format!("fts-delete-{table}")),
+    }
+}
 
 /// Ensure the FTS5 virtual table for `table_key` exists.
 ///
@@ -544,17 +562,12 @@ impl TextSearch for Fts5TextSearch {
         namespace: &str,
         subject_id: Uuid,
     ) -> Result<bool, StorageError> {
-        let namespace = namespace.to_string();
-        let table = self.table_name.clone();
+        let statement = delete_document_statement(&self.table_name, namespace, subject_id);
 
         self.with_writer("fts_delete", move |conn| {
-            let sql = format!(
-                "DELETE FROM {} WHERE namespace = ?1 AND subject_id = ?2",
-                table
-            );
-            let deleted =
-                conn.execute(&sql, rusqlite::params![namespace, subject_id.to_string()])?;
-            Ok(deleted > 0)
+            let mut stmt = conn.prepare(&statement.sql)?;
+            bind_params(&mut stmt, &statement.params)?;
+            Ok(stmt.raw_execute()? > 0)
         })
         .await
     }

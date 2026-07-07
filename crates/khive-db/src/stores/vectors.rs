@@ -9,8 +9,9 @@ use uuid::Uuid;
 use khive_score::DeterministicScore;
 use khive_storage::error::StorageError;
 use khive_storage::types::{
-    BatchWriteSummary, IndexRebuildScope, OrphanSweepConfig, OrphanSweepResult, VectorIndexKind,
-    VectorRecord, VectorSearchHit, VectorSearchRequest, VectorStoreCapabilities, VectorStoreInfo,
+    BatchWriteSummary, IndexRebuildScope, OrphanSweepConfig, OrphanSweepResult, SqlStatement,
+    SqlValue, VectorIndexKind, VectorRecord, VectorSearchHit, VectorSearchRequest,
+    VectorStoreCapabilities, VectorStoreInfo,
 };
 use khive_storage::StorageCapability;
 use khive_storage::StorageResult;
@@ -19,6 +20,22 @@ use khive_types::SubstrateKind;
 
 use crate::error::SqliteError;
 use crate::pool::ConnectionPool;
+use crate::sql_bridge::bind_params;
+
+/// The exact `DELETE` this store's `delete` issues, for a given vector table
+/// (ADR-099 B3 r6 structural cut — see `stores::entity`'s sibling block).
+/// `table` must already be a trusted, sanitized table name (mirrors
+/// `delete`'s own pre-existing lack of a placeholder for table names).
+pub fn delete_vector_statement(table: &str, subject_id: Uuid, namespace: &str) -> SqlStatement {
+    SqlStatement {
+        sql: format!("DELETE FROM {table} WHERE subject_id = ?1 AND namespace = ?2"),
+        params: vec![
+            SqlValue::Text(subject_id.to_string()),
+            SqlValue::Text(namespace.to_string()),
+        ],
+        label: Some(format!("vec-delete-{table}")),
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Test-only failpoint: force an error between DELETE and INSERT to exercise
@@ -937,17 +954,12 @@ impl VectorStore for SqliteVecStore {
     }
 
     async fn delete(&self, subject_id: Uuid) -> Result<bool, StorageError> {
-        let table = self.table_name.clone();
-        let namespace = self.namespace.clone();
+        let statement = delete_vector_statement(&self.table_name, subject_id, &self.namespace);
 
         self.with_writer("vec_delete", move |conn| {
-            let sql = format!(
-                "DELETE FROM {} WHERE subject_id = ?1 AND namespace = ?2",
-                table
-            );
-            let deleted =
-                conn.execute(&sql, rusqlite::params![subject_id.to_string(), &namespace])?;
-            Ok(deleted > 0)
+            let mut stmt = conn.prepare(&statement.sql)?;
+            bind_params(&mut stmt, &statement.params)?;
+            Ok(stmt.raw_execute()? > 0)
         })
         .await
     }

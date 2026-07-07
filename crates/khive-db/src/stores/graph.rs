@@ -10,7 +10,7 @@ use khive_storage::error::StorageError;
 use khive_storage::types::{
     BatchWriteSummary, DeleteMode, DirectedNeighborHit, Direction, Edge, EdgeFilter, EdgeSortField,
     GraphPath, NeighborHit, NeighborQuery, Page, PageRequest, PathNode, SortDirection, SortOrder,
-    TraversalRequest,
+    SqlStatement, SqlValue, TraversalRequest,
 };
 use khive_storage::GraphStore;
 use khive_storage::LinkId;
@@ -19,6 +19,7 @@ use khive_types::EdgeRelation;
 
 use crate::error::SqliteError;
 use crate::pool::ConnectionPool;
+use crate::sql_bridge::bind_params;
 use crate::writer_task::WriterTaskHandle;
 
 /// Map a rusqlite error to `StorageError` with `Graph` capability.
@@ -28,6 +29,100 @@ fn map_err(e: rusqlite::Error, op: &'static str) -> StorageError {
 
 fn map_sqlite_err(e: SqliteError, op: &'static str) -> StorageError {
     StorageError::driver(StorageCapability::Graph, op, e)
+}
+
+// ---------------------------------------------------------------------------
+// Pure statement builders (ADR-099 B3 r6 structural cut) — see entity.rs's
+// sibling block for the full rationale. `upsert_edge`/`delete_edge` below and
+// `purge_incident_edges` (plus ADR-099's atomic prepare path in
+// `khive-runtime`, and `khive-runtime::operations::update_edge`'s
+// non-symmetric branch) all call these.
+// ---------------------------------------------------------------------------
+
+/// The exact natural-key-upserting `INSERT ... ON CONFLICT` this store's
+/// `upsert_edge` issues. Canonicalizes symmetric-relation endpoints first,
+/// matching `upsert_edge`'s own call to `canonical_edge_endpoints`.
+pub fn edge_upsert_statement(edge: &Edge) -> SqlStatement {
+    let (source_id, target_id) =
+        canonical_edge_endpoints(edge.relation, edge.source_id, edge.target_id);
+    let metadata_str = edge
+        .metadata
+        .as_ref()
+        .map(|v| serde_json::to_string(v).unwrap_or_default());
+    SqlStatement {
+        sql: "INSERT INTO graph_edges \
+              (namespace, id, source_id, target_id, relation, weight, \
+               created_at, updated_at, deleted_at, metadata, target_backend) \
+              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11) \
+              ON CONFLICT(namespace, id) DO UPDATE SET \
+                  source_id = excluded.source_id, \
+                  target_id = excluded.target_id, \
+                  relation = excluded.relation, \
+                  weight = excluded.weight, \
+                  updated_at = excluded.updated_at, \
+                  deleted_at = NULL, \
+                  metadata = excluded.metadata, \
+                  target_backend = excluded.target_backend \
+              ON CONFLICT(namespace, source_id, target_id, relation) DO UPDATE SET \
+                  weight = excluded.weight, \
+                  updated_at = excluded.updated_at, \
+                  deleted_at = NULL, \
+                  metadata = excluded.metadata, \
+                  target_backend = excluded.target_backend"
+            .to_string(),
+        params: vec![
+            SqlValue::Text(edge.namespace.clone()),
+            SqlValue::Text(Uuid::from(edge.id).to_string()),
+            SqlValue::Text(source_id.to_string()),
+            SqlValue::Text(target_id.to_string()),
+            SqlValue::Text(edge.relation.to_string()),
+            SqlValue::Float(edge.weight),
+            SqlValue::Integer(edge.created_at.timestamp_micros()),
+            SqlValue::Integer(edge.updated_at.timestamp_micros()),
+            match edge.deleted_at {
+                Some(t) => SqlValue::Integer(t.timestamp_micros()),
+                None => SqlValue::Null,
+            },
+            match metadata_str {
+                Some(m) => SqlValue::Text(m),
+                None => SqlValue::Null,
+            },
+            match &edge.target_backend {
+                Some(b) => SqlValue::Text(b.clone()),
+                None => SqlValue::Null,
+            },
+        ],
+        label: Some("edge-upsert".to_string()),
+    }
+}
+
+/// The exact soft-delete `UPDATE` this store's `delete_edge(Soft)` issues.
+pub fn edge_soft_delete_statement(id: Uuid, now: i64) -> SqlStatement {
+    SqlStatement {
+        sql: "UPDATE graph_edges SET deleted_at = ?2, updated_at = ?2 \
+              WHERE id = ?1 AND deleted_at IS NULL"
+            .to_string(),
+        params: vec![SqlValue::Text(id.to_string()), SqlValue::Integer(now)],
+        label: Some("edge-delete-soft".to_string()),
+    }
+}
+
+/// The exact hard-delete `DELETE` this store's `delete_edge(Hard)` issues.
+pub fn edge_hard_delete_statement(id: Uuid) -> SqlStatement {
+    SqlStatement {
+        sql: "DELETE FROM graph_edges WHERE id = ?1".to_string(),
+        params: vec![SqlValue::Text(id.to_string())],
+        label: Some("edge-delete-hard".to_string()),
+    }
+}
+
+/// The exact cascade `DELETE` this store's `purge_incident_edges` issues.
+pub fn purge_incident_edges_statement(node_id: Uuid) -> SqlStatement {
+    SqlStatement {
+        sql: "DELETE FROM graph_edges WHERE source_id = ?1 OR target_id = ?1".to_string(),
+        params: vec![SqlValue::Text(node_id.to_string())],
+        label: Some("edge-purge-incident".to_string()),
+    }
 }
 
 /// A GraphStore backed by SQLite tables.
@@ -474,54 +569,11 @@ fn batch_upsert_edges(
 #[async_trait]
 impl GraphStore for SqlGraphStore {
     async fn upsert_edge(&self, edge: Edge) -> Result<(), StorageError> {
-        let namespace = edge.namespace.clone();
-        let id_str = Uuid::from(edge.id).to_string();
-        let (source_id, target_id) =
-            canonical_edge_endpoints(edge.relation, edge.source_id, edge.target_id);
-        let src_str = source_id.to_string();
-        let tgt_str = target_id.to_string();
-        let relation_str = edge.relation.to_string();
-        let metadata_str = edge
-            .metadata
-            .as_ref()
-            .map(serde_json::to_string)
-            .transpose()
-            .map_err(|e| StorageError::driver(StorageCapability::Graph, "upsert_edge", e))?;
+        let statement = edge_upsert_statement(&edge);
         self.with_writer("upsert_edge", move |conn| {
-            conn.execute(
-                "INSERT INTO graph_edges \
-                 (namespace, id, source_id, target_id, relation, weight, \
-                  created_at, updated_at, deleted_at, metadata, target_backend) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11) \
-                 ON CONFLICT(namespace, id) DO UPDATE SET \
-                     source_id = excluded.source_id, \
-                     target_id = excluded.target_id, \
-                     relation = excluded.relation, \
-                     weight = excluded.weight, \
-                     updated_at = excluded.updated_at, \
-                     deleted_at = NULL, \
-                     metadata = excluded.metadata, \
-                     target_backend = excluded.target_backend \
-                 ON CONFLICT(namespace, source_id, target_id, relation) DO UPDATE SET \
-                     weight = excluded.weight, \
-                     updated_at = excluded.updated_at, \
-                     deleted_at = NULL, \
-                     metadata = excluded.metadata, \
-                     target_backend = excluded.target_backend",
-                rusqlite::params![
-                    namespace,
-                    id_str,
-                    src_str,
-                    tgt_str,
-                    relation_str,
-                    edge.weight,
-                    edge.created_at.timestamp_micros(),
-                    edge.updated_at.timestamp_micros(),
-                    edge.deleted_at.map(|t| t.timestamp_micros()),
-                    metadata_str,
-                    edge.target_backend,
-                ],
-            )?;
+            let mut stmt = conn.prepare(&statement.sql)?;
+            bind_params(&mut stmt, &statement.params)?;
+            stmt.raw_execute()?;
             Ok(())
         })
         .await
@@ -903,21 +955,17 @@ impl GraphStore for SqlGraphStore {
     }
 
     async fn delete_edge(&self, id: LinkId, mode: DeleteMode) -> Result<bool, StorageError> {
-        let id_str = Uuid::from(id).to_string();
-
+        let id = Uuid::from(id);
+        let statement = match mode {
+            DeleteMode::Soft => {
+                edge_soft_delete_statement(id, chrono::Utc::now().timestamp_micros())
+            }
+            DeleteMode::Hard => edge_hard_delete_statement(id),
+        };
         self.with_writer("delete_edge", move |conn| {
-            let affected = match mode {
-                DeleteMode::Soft => conn.execute(
-                    "UPDATE graph_edges SET deleted_at = ?2, updated_at = ?2 \
-                     WHERE id = ?1 AND deleted_at IS NULL",
-                    rusqlite::params![id_str, chrono::Utc::now().timestamp_micros()],
-                )?,
-                DeleteMode::Hard => conn.execute(
-                    "DELETE FROM graph_edges WHERE id = ?1",
-                    rusqlite::params![id_str],
-                )?,
-            };
-            Ok(affected > 0)
+            let mut stmt = conn.prepare(&statement.sql)?;
+            bind_params(&mut stmt, &statement.params)?;
+            Ok(stmt.raw_execute()? > 0)
         })
         .await
     }
@@ -1438,16 +1486,14 @@ impl GraphStore for SqlGraphStore {
     }
 
     async fn purge_incident_edges(&self, node_id: Uuid) -> Result<u64, StorageError> {
-        let id_str = node_id.to_string();
         // No namespace filter: UUID v4 is globally unique. Hard-delete cascade must
         // remove ALL incident edges regardless of which namespace they were written in
         // (ADR-002 no-dangling-references, ADR-007 by-ID contract).
+        let statement = purge_incident_edges_statement(node_id);
         self.with_writer("purge_incident_edges", move |conn| {
-            let affected = conn.execute(
-                "DELETE FROM graph_edges WHERE source_id = ?1 OR target_id = ?1",
-                rusqlite::params![id_str],
-            )?;
-            Ok(affected as u64)
+            let mut stmt = conn.prepare(&statement.sql)?;
+            bind_params(&mut stmt, &statement.params)?;
+            Ok(stmt.raw_execute()? as u64)
         })
         .await
     }
