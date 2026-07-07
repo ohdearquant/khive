@@ -3,6 +3,7 @@
 //! Wraps `StorageBackend` and query compilation into a single Rust API surface.
 
 pub mod atomic_plan;
+pub mod atomic_runner;
 pub mod config;
 pub mod curation;
 #[cfg(unix)]
@@ -26,6 +27,9 @@ pub mod validation;
 pub use atomic_plan::{
     AffectedRowGuard, DeletePlan, GovernanceOp, GovernancePlan, GtdCompletePlan, GtdTransitionPlan,
     LinkPlan, MergePlan, PlanPredicate, PlanStatement, PostCommitEffect, UpdatePlan,
+};
+pub use atomic_runner::{
+    run_atomic_unit, AtomicOpFailure, AtomicOpPlan, AtomicRunOutcome, AtomicRunnerError,
 };
 pub use curation::{
     entity_fts_document, note_fts_document, ContentMergeStrategy, EdgeListFilter, EdgePatch,
