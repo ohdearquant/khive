@@ -38,7 +38,7 @@ This is the production entrypoint. The deno/npm distribution invokes it:
 # stdio MCP server (default transport) — what MCP clients spawn
 kkernel mcp --db ~/.khive/khive.db
 
-# pick packs explicitly (default loads all 8 production packs)
+# pick packs explicitly (default loads all 9 production packs)
 kkernel mcp --pack kg --pack gtd --pack knowledge
 
 # warm Unix-socket daemon (owns ANN indexes; stdio clients auto-spawn + forward to it)

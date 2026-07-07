@@ -15,6 +15,8 @@
 //! - `exec`    — run a verb DSL expression through the pack registry
 //! - `mcp`     — serve the MCP `request` surface (stdio / daemon / transports)
 //! - `backend` — inspect registered backends (`list`, `info <name>`)
+//! - `git-ingest` — one-shot batch ingest of commit/issue/pull_request
+//!   provenance notes from a local git repository (ADR-088)
 //!
 //! All subcommands emit JSON on stdout by default for easy piping/parsing.
 //! Pass `--human` to switch to a readable table where supported.
@@ -28,7 +30,7 @@ use clap::{Parser, Subcommand};
 use khive_runtime::{BackendId, KhiveConfig, KhiveRuntime, RuntimeConfig};
 use kkernel::{
     coordinator::{BackendRegistry, SubstrateCoordinator, SubstrateCoordinatorService},
-    engine, exec, kg, pack_introspect, reindex, sync, vector,
+    engine, exec, git_ingest, kg, pack_introspect, reindex, sync, vector,
 };
 
 #[derive(Parser, Debug)]
@@ -98,6 +100,10 @@ enum Command {
     /// Inspect registered backends.
     #[command(subcommand)]
     Backend(BackendCommand),
+
+    /// One-shot batch ingest of commit/issue/pull_request provenance notes
+    /// from a local git repository (ADR-088).
+    GitIngest(git_ingest::GitIngestArgs),
 }
 
 /// Database schema lifecycle subcommands.
@@ -311,6 +317,7 @@ async fn main() -> Result<()> {
             }
         }
         Command::Backend(b) => cmd_backend(b),
+        Command::GitIngest(a) => git_ingest::run_git_ingest(a).await,
     }
 }
 

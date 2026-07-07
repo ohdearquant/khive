@@ -7,7 +7,7 @@
 ADR-023 (pack verb surface, visibility, and composition), ADR-083 (session pack T1 verbs),
 ADR-084 (verb-surface
 consistency contract)
-**Scope**: the 74-verb MCP surface across the 8 default packs; the KindHook create-time
+**Scope**: the 74-verb MCP surface across the 9 default packs; the KindHook create-time
 extension seam; per-verb field validation (status enums, memory_type enums, datetime
 checks). Out of scope: brain and knowledge pack-private storage, closed taxonomies.
 
@@ -40,8 +40,8 @@ this repo).
 
 ### The surface as it stands
 
-The 74 user-facing verbs across 8 default packs (kg 17, gtd 5, memory 5, brain 14, comm 6,
-schedule 4, knowledge 19, session 4) are asserted as a tripwire: `tests/smoke_test.py:209`
+The 74 user-facing verbs across 9 default packs (kg 17, gtd 5, memory 5, brain 14, comm 6,
+schedule 4, knowledge 19, session 4, git 0) are asserted as a tripwire: `tests/smoke_test.py:209`
 carries `assert verbs_result["total"] == 74`, with a comment stating the assertion exists to
 catch silent drift. Any change to the count moves this assertion, the AGENTS.md catalog, and
 the `request` tool description in lockstep.

@@ -88,7 +88,7 @@ All 19 verbs are `Visibility::Verb` (exposed on the agent-facing MCP surface).
 [`khive-pack-kg`](https://crates.io/crates/khive-pack-kg) (a hard `REQUIRES`
 dependency for the underlying `concept`/`document` entity substrate) and
 [`khive-pack-brain`](https://crates.io/crates/khive-pack-brain) (feedback
-target). It is one of the eight packs loaded by default in `khive-mcp`. Governing
+target). It is one of the nine packs loaded by default in `khive-mcp`. Governing
 ADRs:
 [ADR-017 (Pack Standard)](https://github.com/ohdearquant/khive/blob/main/docs/adr/ADR-017-pack-standard.md),
 [ADR-048 (Knowledge Section Profiles)](https://github.com/ohdearquant/khive/blob/main/docs/adr/ADR-048-knowledge-section-profiles.md),
