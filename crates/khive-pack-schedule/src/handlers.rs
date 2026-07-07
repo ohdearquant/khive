@@ -621,6 +621,30 @@ const ENTITY_TYPE_DEFS_FOR_REPLAY: &[(khive_types::EntityKind, &str, &[&str])] =
     ),
     (khive_types::EntityKind::Concept, "metric", &[]),
     (khive_types::EntityKind::Concept, "objective", &["loss"]),
+    // ── Code (ADR-085) ────────────────────────────────────────────────────
+    // "struct"/"class" stay with formal-math "structure" (see above); the
+    // registry does not alias them to code subtypes and neither does this
+    // mirror.
+    (
+        khive_types::EntityKind::Concept,
+        "module",
+        &["mod", "namespace"],
+    ),
+    (
+        khive_types::EntityKind::Concept,
+        "function",
+        &["fn", "func", "method"],
+    ),
+    (
+        khive_types::EntityKind::Concept,
+        "datatype",
+        &["enum", "record", "type_alias"],
+    ),
+    (
+        khive_types::EntityKind::Concept,
+        "interface",
+        &["trait", "protocol"],
+    ),
     // ── Dataset ───────────────────────────────────────────────────────────
     (khive_types::EntityKind::Dataset, "benchmark", &[]),
     (khive_types::EntityKind::Dataset, "corpus", &[]),
