@@ -98,19 +98,6 @@ impl KindHook for FindingHook {
             }
         }
 
-        if let Some(v) = obj.get("categories") {
-            let arr = v.as_array().ok_or_else(|| {
-                RuntimeError::InvalidInput("categories must be an array of strings".into())
-            })?;
-            for item in arr {
-                if !item.is_string() {
-                    return Err(RuntimeError::InvalidInput(
-                        "categories must be an array of strings".into(),
-                    ));
-                }
-            }
-        }
-
         if let Some(v) = obj.get("evidence") {
             if !v.is_array() {
                 return Err(RuntimeError::InvalidInput(

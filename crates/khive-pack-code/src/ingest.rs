@@ -2,16 +2,24 @@
 //!
 //! `ingest_findings_json` validates the entire input before constructing any
 //! output record, so a malformed file never yields a partial batch. Record
-//! identity is content-derived (UUIDv5 over JSON tuples), so re-ingesting the
-//! same `findings.json` under the same [`CodeIngestOptions`] reproduces the
-//! same entity, note, and edge IDs.
+//! identity is a content-derived UUIDv5 hash of the validated finding record
+//! (`observed_at` excluded), so re-ingesting the same `findings.json` under
+//! the same [`CodeIngestOptions`] reproduces the same entity, note, and edge
+//! IDs, while a content change (severity, evidence, impact, ...) produces a
+//! new finding id rather than colliding with the prior record.
 //!
-//! Only `severity`, `confidence`, `priority`, and the evidence shape are
-//! governed at ingest time — they reject unknown/malformed values by design
-//! (ADR-085 D4 "fail closed; no silent coercion"). Raw audit `status` has no
-//! agreed mapping to the finding lifecycle (`kind_status`) yet, so it is
-//! preserved verbatim under `properties.audit_status` rather than validated
-//! or coerced.
+//! Only `severity` and `confidence` values, the evidence shape, and
+//! `failure_scenario` presence are governed at ingest time — they reject
+//! unknown/malformed values by design (ADR-085 D4 "fail closed; no silent
+//! coercion"). Every other field (`categories`, `standard`, `refs`,
+//! `priority`, raw audit `status`, `impact`, `recommendation`,
+//! `verification`) is tolerated per ADR-085 Amendment 1 A1: ingest neither
+//! rejects nor coerces them, it preserves whatever JSON value was provided
+//! and omits the key when the field is absent. Raw `status` is preserved
+//! verbatim under `properties.audit_status` — it has no agreed mapping to
+//! the finding lifecycle (`kind_status`) yet.
+
+use std::collections::BTreeMap;
 
 use chrono::{DateTime, Utc};
 use khive_storage::{Edge, Entity, LinkId, Note};
@@ -20,7 +28,7 @@ use serde_json::{json, Map, Value};
 use uuid::Uuid;
 
 use crate::error::CodeIngestError;
-use crate::vocab::{is_valid_confidence, is_valid_priority, is_valid_severity};
+use crate::vocab::{is_valid_confidence, is_valid_severity};
 
 /// UUIDv5 namespace for all code-pack ingest identity, derived from
 /// `Uuid::new_v5(Uuid::NAMESPACE_URL, b"https://github.com/ohdearquant/khive/adr/085/code-pack/v1")`.
@@ -51,6 +59,47 @@ pub struct CodeIngestBatch {
 fn uuid5_tuple<T: serde::Serialize>(parts: &T) -> Result<Uuid, CodeIngestError> {
     let bytes = serde_json::to_vec(parts)?;
     Ok(Uuid::new_v5(&CODE_INGEST_NAMESPACE, &bytes))
+}
+
+/// Recursively sort object keys so two JSON values that differ only in key
+/// order serialize identically. Array element order is content and is left
+/// untouched.
+fn sort_json_keys(value: &Value) -> Value {
+    match value {
+        Value::Object(map) => {
+            let sorted: BTreeMap<&str, Value> = map
+                .iter()
+                .map(|(k, v)| (k.as_str(), sort_json_keys(v)))
+                .collect();
+            let mut out = Map::with_capacity(sorted.len());
+            for (k, v) in sorted {
+                out.insert(k.to_string(), v);
+            }
+            Value::Object(out)
+        }
+        Value::Array(arr) => Value::Array(arr.iter().map(sort_json_keys).collect()),
+        other => other.clone(),
+    }
+}
+
+/// Render a tolerated (ungoverned) field for inclusion in note content text.
+/// Strings pass through verbatim; any other JSON shape renders as its
+/// canonical JSON text; absence renders as empty.
+fn value_to_display(value: Option<&Value>) -> String {
+    match value {
+        None | Some(Value::Null) => String::new(),
+        Some(Value::String(s)) => s.clone(),
+        Some(other) => other.to_string(),
+    }
+}
+
+/// A tolerated field is present when the key exists and its value is not
+/// JSON `null` — an explicit `null` is treated the same as absence.
+fn tolerated_field(obj: &Map<String, Value>, key: &str) -> Option<Value> {
+    match obj.get(key) {
+        None | Some(Value::Null) => None,
+        Some(v) => Some(v.clone()),
+    }
 }
 
 fn require_str<'a>(
@@ -143,12 +192,6 @@ fn canonicalize_evidence(
     Ok(out)
 }
 
-fn first_evidence_path(evidence: &[Value]) -> Option<String> {
-    evidence
-        .iter()
-        .find_map(|e| e.get("path").and_then(Value::as_str).map(str::to_string))
-}
-
 struct ValidatedAudit {
     date: String,
     scope: String,
@@ -194,15 +237,15 @@ struct ValidatedFinding {
     normalized_title: String,
     severity: String,
     confidence: String,
-    categories: Vec<String>,
-    standard: String,
+    categories: Option<Value>,
+    standard: Option<Value>,
     evidence: Vec<Value>,
-    impact: String,
-    recommendation: String,
-    verification: String,
+    impact: Option<Value>,
+    recommendation: Option<Value>,
+    verification: Option<Value>,
     failure_scenario: Option<String>,
-    priority: Option<String>,
-    audit_status: Option<String>,
+    priority: Option<Value>,
+    audit_status: Option<Value>,
     refs: Option<Value>,
     raw: Map<String, Value>,
 }
@@ -254,64 +297,23 @@ impl ValidatedFinding {
             });
         }
 
-        let categories = match obj.get("categories") {
-            None => Vec::new(),
-            Some(Value::Array(arr)) => {
-                let mut out = Vec::with_capacity(arr.len());
-                for item in arr {
-                    match item {
-                        Value::String(s) => out.push(s.clone()),
-                        _ => {
-                            return Err(CodeIngestError::InvalidType {
-                                path: "findings[].categories".to_string(),
-                                expected: "array of strings",
-                            });
-                        }
-                    }
-                }
-                out
-            }
-            Some(_) => {
-                return Err(CodeIngestError::InvalidType {
-                    path: "findings[].categories".to_string(),
-                    expected: "array of strings",
-                });
-            }
-        };
-
-        let standard =
-            optional_str(obj, "standard", "findings[].standard")?.unwrap_or_else(String::new);
+        // `categories`, `standard`, `refs`, `priority`, `status`, `impact`,
+        // `recommendation`, and `verification` are tolerated (ADR-085
+        // Amendment 1 A1): ingest neither rejects nor coerces their shape,
+        // it preserves whatever JSON value was provided or omits the key
+        // when absent. Only `evidence` shape and `severity`/`confidence`/
+        // `failure_scenario` presence remain fail-closed.
+        let categories = tolerated_field(obj, "categories");
+        let standard = tolerated_field(obj, "standard");
         let evidence = canonicalize_evidence(obj.get("evidence"), finding_index)?;
-        let impact = optional_str(obj, "impact", "findings[].impact")?.unwrap_or_else(String::new);
-        let recommendation = optional_str(obj, "recommendation", "findings[].recommendation")?
-            .unwrap_or_else(String::new);
-        let verification = optional_str(obj, "verification", "findings[].verification")?
-            .unwrap_or_else(String::new);
+        let impact = tolerated_field(obj, "impact");
+        let recommendation = tolerated_field(obj, "recommendation");
+        let verification = tolerated_field(obj, "verification");
         let failure_scenario =
             optional_str(obj, "failure_scenario", "findings[].failure_scenario")?;
-        let audit_status = optional_str(obj, "status", "findings[].status")?;
-
-        let priority = optional_str(obj, "priority", "findings[].priority")?;
-        if let Some(p) = &priority {
-            if !is_valid_priority(p) {
-                return Err(CodeIngestError::InvalidValue {
-                    field: "priority",
-                    value: p.clone(),
-                    valid: "P0 | P1 | P2 | P3",
-                });
-            }
-        }
-
-        let refs = match obj.get("refs") {
-            None | Some(Value::Null) => None,
-            Some(Value::Object(m)) => Some(Value::Object(m.clone())),
-            Some(_) => {
-                return Err(CodeIngestError::InvalidType {
-                    path: "findings[].refs".to_string(),
-                    expected: "object",
-                });
-            }
-        };
+        let audit_status = tolerated_field(obj, "status");
+        let priority = tolerated_field(obj, "priority");
+        let refs = tolerated_field(obj, "refs");
 
         if matches!(severity.as_str(), "medium" | "high" | "critical") {
             let has_scenario = failure_scenario
@@ -439,50 +441,80 @@ pub fn ingest_findings_json(
     let mut edges = Vec::with_capacity(validated_findings.len());
 
     for finding in &validated_findings {
-        let first_path = first_evidence_path(&finding.evidence);
-        let finding_key = (
-            "code-finding",
-            1u8,
-            options.namespace,
-            source_run.as_str(),
-            audit.scope.as_str(),
-            finding.id.as_str(),
-            finding.normalized_title.as_str(),
-            first_path.as_deref().unwrap_or(""),
-        );
-        let finding_id = uuid5_tuple(&finding_key)?;
-        let finding_external_id = serde_json::to_string(&finding_key)?;
+        // Identity is a canonical content hash of the validated finding,
+        // `observed_at` excluded: same content re-ingested at a different
+        // time reproduces the same id, and any content change (severity,
+        // evidence, impact, ...) produces a different id rather than
+        // silently overwriting the prior record under the old one.
+        let identity_value = sort_json_keys(&json!({
+            "kind": "code-finding",
+            "schema_version": 1,
+            "namespace": options.namespace,
+            "source_run": source_run,
+            "scope": audit.scope,
+            "id": finding.id,
+            "normalized_title": finding.normalized_title,
+            "severity": finding.severity,
+            "confidence": finding.confidence,
+            "categories": finding.categories,
+            "standard": finding.standard,
+            "evidence": finding.evidence,
+            "impact": finding.impact,
+            "recommendation": finding.recommendation,
+            "verification": finding.verification,
+            "failure_scenario": finding.failure_scenario,
+            "priority": finding.priority,
+            "audit_status": finding.audit_status,
+            "refs": finding.refs,
+            "raw": finding.raw,
+        }));
+        let finding_id = uuid5_tuple(&identity_value)?;
+        let finding_external_id = serde_json::to_string(&identity_value)?;
 
         let mut props = Map::new();
         props.insert("external_id".into(), json!(finding_external_id));
         props.insert("finding_id".into(), json!(finding.id));
         props.insert("severity".into(), json!(finding.severity));
         props.insert("confidence".into(), json!(finding.confidence));
-        props.insert("categories".into(), json!(finding.categories));
         props.insert("source_run".into(), json!(source_run));
-        props.insert("standard".into(), json!(finding.standard));
         props.insert("evidence".into(), Value::Array(finding.evidence.clone()));
+        if let Some(categories) = &finding.categories {
+            props.insert("categories".into(), categories.clone());
+        }
+        if let Some(standard) = &finding.standard {
+            props.insert("standard".into(), standard.clone());
+        }
         if let Some(refs) = &finding.refs {
             props.insert("refs".into(), refs.clone());
         }
         if let Some(priority) = &finding.priority {
-            props.insert("priority".into(), json!(priority));
+            props.insert("priority".into(), priority.clone());
         }
         if let Some(status) = &finding.audit_status {
-            props.insert("audit_status".into(), json!(status));
+            props.insert("audit_status".into(), status.clone());
         }
         if let Some(scenario) = &finding.failure_scenario {
             props.insert("failure_scenario".into(), json!(scenario));
         }
-        props.insert("impact".into(), json!(finding.impact));
-        props.insert("recommendation".into(), json!(finding.recommendation));
-        props.insert("verification".into(), json!(finding.verification));
+        if let Some(impact) = &finding.impact {
+            props.insert("impact".into(), impact.clone());
+        }
+        if let Some(recommendation) = &finding.recommendation {
+            props.insert("recommendation".into(), recommendation.clone());
+        }
+        if let Some(verification) = &finding.verification {
+            props.insert("verification".into(), verification.clone());
+        }
         props.insert("kind_status".into(), json!("open"));
         if !finding.raw.is_empty() {
             props.insert("raw".into(), Value::Object(finding.raw.clone()));
         }
 
-        let content = format!("{}: {}", finding.title, finding.impact);
+        let content = format!(
+            "{}: {}",
+            finding.title,
+            value_to_display(finding.impact.as_ref())
+        );
         let mut note = Note::new(options.namespace, "finding", content);
         note.id = finding_id;
         note.name = Some(finding.title.clone());

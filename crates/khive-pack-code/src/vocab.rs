@@ -6,7 +6,6 @@ use khive_types::{EdgeEndpointRule, EdgeRelation, EndpointKind};
 
 pub(crate) const VALID_SEVERITIES: &[&str] = &["critical", "high", "medium", "low", "info"];
 pub(crate) const VALID_CONFIDENCES: &[&str] = &["high", "medium", "low"];
-pub(crate) const VALID_PRIORITIES: &[&str] = &["P0", "P1", "P2", "P3"];
 pub(crate) const VALID_FINDING_STATUSES: &[&str] = &["open", "resolved", "wontfix", "invalid"];
 
 pub(crate) fn is_valid_severity(value: &str) -> bool {
@@ -15,10 +14,6 @@ pub(crate) fn is_valid_severity(value: &str) -> bool {
 
 pub(crate) fn is_valid_confidence(value: &str) -> bool {
     VALID_CONFIDENCES.contains(&value)
-}
-
-pub(crate) fn is_valid_priority(value: &str) -> bool {
-    VALID_PRIORITIES.contains(&value)
 }
 
 pub(crate) fn is_valid_finding_status(value: &str) -> bool {

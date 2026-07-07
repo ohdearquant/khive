@@ -52,7 +52,7 @@ fn sample_findings_json() -> Value {
             "date": "2026-07-07",
             "scope": "khive-pack-code",
             "repo": "khive",
-            "branch": "show/khive-sweep-0707/code-pack",
+            "branch": "feature/code-pack",
             "commit": "abc123",
             "standards_file": "audit-guidelines.md",
         },
@@ -536,13 +536,42 @@ fn ingest_findings_json_same_ids_across_different_observed_at() {
 }
 
 #[test]
+fn ingest_different_content_produces_different_finding_id() {
+    // Same external id/title/evidence path as `sample_findings_json`, but a
+    // changed content field (severity). The finding id must diverge — a
+    // content change must never collide with the prior record's id.
+    let bytes_a = valid_findings_bytes();
+    let mut doc_b = sample_findings_json();
+    doc_b["findings"][0]["severity"] = json!("critical");
+    let bytes_b = serde_json::to_vec(&doc_b).expect("serializes");
+
+    let batch_a = ingest_findings_json(&bytes_a, ingest_options(Some("fixed-run")))
+        .expect("first ingest must succeed");
+    let batch_b = ingest_findings_json(&bytes_b, ingest_options(Some("fixed-run")))
+        .expect("second ingest must succeed");
+
+    assert_ne!(
+        batch_a.notes[0].id, batch_b.notes[0].id,
+        "changing finding content (severity) must produce a different finding id"
+    );
+    assert_ne!(
+        batch_a.edges[0].id, batch_b.edges[0].id,
+        "the finding's annotate-edge id derives from the finding id and must also diverge"
+    );
+    // The unrelated project entity is scoped by repo/scope only, so it is
+    // unaffected by a finding-level content change — the old record's
+    // entity is left untouched, as the amendment requires.
+    assert_eq!(batch_a.entities[0].id, batch_b.entities[0].id);
+}
+
+#[test]
 fn ingest_rejects_missing_findings_array() {
     let malformed = json!({
         "audit": {
             "date": "2026-07-07",
             "scope": "khive-pack-code",
             "repo": "khive",
-            "branch": "show/khive-sweep-0707/code-pack",
+            "branch": "feature/code-pack",
             "commit": "abc123",
             "standards_file": "audit-guidelines.md",
         },
@@ -589,19 +618,19 @@ fn ingest_rejects_invalid_severity_before_records() {
 }
 
 #[test]
-fn ingest_rejects_invalid_priority_before_records() {
+fn ingest_tolerates_out_of_vocab_priority() {
+    // ADR-085 Amendment 1 A1: `priority` is ungoverned — ingest neither
+    // rejects nor coerces it, it preserves whatever value was provided.
     let mut doc = sample_findings_json();
     doc["findings"][0]["priority"] = json!("P9");
     let bytes = serde_json::to_vec(&doc).expect("serializes");
-    let err = ingest_findings_json(&bytes, ingest_options(Some("run")))
-        .expect_err("invalid priority must be rejected before any record is built");
-    match err {
-        CodeIngestError::InvalidValue { field, valid, .. } => {
-            assert_eq!(field, "priority");
-            assert_eq!(valid, "P0 | P1 | P2 | P3");
-        }
-        other => panic!("expected InvalidValue{{field: priority}}, got: {other:?}"),
-    }
+    let batch = ingest_findings_json(&bytes, ingest_options(Some("run")))
+        .expect("out-of-vocab priority must be tolerated, not rejected");
+    assert_eq!(
+        batch.notes[0].properties.as_ref().expect("has properties")["priority"],
+        json!("P9"),
+        "tolerated priority value must be preserved as-is"
+    );
 }
 
 #[test]
