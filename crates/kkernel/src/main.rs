@@ -257,15 +257,17 @@ async fn main() -> Result<()> {
 
             // Check if multi-backend is configured (ADR-028 / ADR-029 Phase 2).
             //
-            // Resolve `db_path` with the SAME precedence as `resolve_runtime_config`
-            // below (`:memory:` -> no file to anchor on; explicit `--db`/`KHIVE_DB`
-            // -> that path; unset -> the default `$HOME/.khive/khive.db`) so this
-            // early multi-backend classification anchors tier-3 project-local config
-            // discovery to the identical directory the per-request `config_id` path
-            // uses. Anchoring only the explicit case and leaving the default case on
-            // the process cwd would let this branch select a different topology than
-            // the config the server actually resolves further down this path.
-            let db_path_hint = khive_runtime::resolve_db_anchor(a.db.as_deref());
+            // Resolve the tier-3 discovery anchor with the SAME
+            // `config_discovery_db_anchor` semantics `resolve_runtime_config`
+            // below uses (explicit `--db`/`KHIVE_DB` -> that path; unset ->
+            // `None`, falling through to cwd-anchored discovery) so this early
+            // multi-backend classification sees the identical config file the
+            // per-request `config_id` path resolves further down (#689: using
+            // `resolve_db_anchor`'s materialized `$HOME/.khive/khive.db`
+            // default here anchored classification to the home directory
+            // instead of the project, silently skipping a project-local
+            // `.khive/config.toml`).
+            let db_path_hint = khive_mcp::serve::config_discovery_db_anchor(a.db.as_deref());
             let khive_cfg =
                 KhiveConfig::load_with_home_fallback(a.config.as_deref(), db_path_hint.as_deref())
                     .unwrap_or_default()
