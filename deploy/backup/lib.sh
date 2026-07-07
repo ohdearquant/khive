@@ -248,6 +248,31 @@ preflight_disk() {
   return 0
 }
 
+# SSH-backed equivalent of preflight_disk for a remote destination
+# directory: same origin-size-plus-margin accounting, `df -Pk` (POSIX-fixed
+# columns, unlike `df -h` whose units vary by platform) run on the remote
+# host via the same ssh invocation pattern used everywhere else in this
+# script (BatchMode, ConnectTimeout, single quoted remote command). Returns
+# 1 on any ssh failure, missing `df` output, or insufficient free space —
+# callers treat all three as "cannot proceed" and refuse before touching
+# remote staging or copying.
+preflight_disk_remote() {
+  local user_host="$1" origin="$2" dest_dir="$3" margin origin_size needed df_out avail_kb avail_bytes
+  margin="${KHIVE_BACKUP_MARGIN_BYTES}"
+  origin_size="$(get_file_size "${origin}")"
+  needed=$((origin_size + margin))
+  df_out="$("${SSH_BIN}" -o BatchMode=yes -o ConnectTimeout=10 "${user_host}" \
+    "mkdir -p '${dest_dir}' && df -Pk '${dest_dir}'" 2>/dev/null)" || return 1
+  avail_kb="$(printf '%s\n' "${df_out}" | awk 'NR==2{print $4}')"
+  [ -n "${avail_kb}" ] || return 1
+  avail_bytes=$((avail_kb * 1024))
+  if [ "${avail_bytes}" -lt "${needed}" ]; then
+    blog "remote disk preflight FAILED: ${user_host}:${dest_dir} has ${avail_bytes} bytes free, need ${needed} (origin ${origin_size} + margin ${margin})"
+    return 1
+  fi
+  return 0
+}
+
 # --- JSONL event log -------------------------------------------------------
 
 json_escape() {

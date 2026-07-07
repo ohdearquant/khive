@@ -128,7 +128,34 @@ echo \"\$*\" >> '${KKERNEL_CALLS_LOG}'
 exit 0
 "
 
-write_stub ssh 'exit 0'
+# Every ssh call is logged (raw args) so a test can assert a given remote
+# command was never sent — e.g. "the seed-staging call never ran because the
+# preflight refused first". The stub also answers the two remote probes
+# khive-backup.sh/lib.sh send over ssh: the sqlite3_rsync --version relay
+# (matched on the literal "VERSION=" token the real command embeds) and the
+# `df -Pk` free-space probe — both tunable per-test via env vars so a single
+# stub covers the matching-version/plenty-of-space default AND the
+# mismatch/insufficient-space test cases. Every other remote command (rm,
+# mkdir, mv, prune) falls through to a bare `exit 0`, same as before.
+export SSH_CALLS_LOG="${SANDBOX}/ssh-calls.log"
+: >"${SSH_CALLS_LOG}"
+write_stub ssh '
+printf "%s\n" "$*" >> "${SSH_CALLS_LOG}"
+shift 4
+host="$1"
+shift
+cmd="$1"
+if printf "%s" "$cmd" | grep -q "VERSION="; then
+  echo "VERSION=${SSH_STUB_REMOTE_VERSION:-3.53.3}"
+elif printf "%s" "$cmd" | grep -q "df -Pk"; then
+  if [ -n "${SSH_STUB_DISK_FAIL:-}" ]; then
+    printf "Filesystem 1024-blocks Used Available Capacity Mounted\n/dev/disk1 1000000 999999 1 100%% /\n"
+  else
+    printf "Filesystem 1024-blocks Used Available Capacity Mounted\n/dev/disk1 1000000000 1000 999999000 1%% /\n"
+  fi
+fi
+exit 0
+'
 write_stub scp 'exit 1'
 
 echo "=== test: version preflight refuses a floor violation ==="
@@ -216,6 +243,49 @@ else
   ok "t2 sync refuses while t2_remote is CHANGE_ME"
 fi
 assert_contains "not-configured outcome logged" "$(tail -n1 "${KHIVE_BACKUP_ROOT}/log/backup-events.jsonl")" "not-configured"
+
+echo "=== test: t2 refuses on a local/remote sqlite3_rsync version mismatch ==="
+write_conf "${T1_REPLICA}" "op@remotehost:/backups/fixture.db" "${T3_ARCHIVE}"
+: >"${SSH_CALLS_LOG}"
+if SSH_STUB_REMOTE_VERSION="3.50.1" "${KHIVE_BACKUP_SH}" t2 fixture >/tmp/khive-test-t2-vermismatch.out 2>&1; then
+  fail "t2 sync should refuse a local/remote sqlite3_rsync version mismatch"
+else
+  ok "t2 sync refuses a local/remote sqlite3_rsync version mismatch"
+fi
+assert_contains "version-preflight-failed logged for the mismatch" \
+  "$(tail -n1 "${KHIVE_BACKUP_ROOT}/log/backup-events.jsonl")" "version-preflight-failed"
+assert_contains "mismatch failure names the local version" \
+  "$(tail -n1 "${KHIVE_BACKUP_ROOT}/log/backup-events.jsonl")" "local=3.53.3"
+assert_contains "mismatch failure names the mismatched remote version" \
+  "$(tail -n1 "${KHIVE_BACKUP_ROOT}/log/backup-events.jsonl")" "remote (op@remotehost)=3.50.1"
+assert_not_contains "remote staging was never touched when the version preflight refuses" \
+  "$(cat "${SSH_CALLS_LOG}")" "staging"
+
+echo "=== test: t2 proceeds past the version preflight when local and remote versions match ==="
+: >"${SSH_CALLS_LOG}"
+if SSH_STUB_REMOTE_VERSION="3.53.3" "${KHIVE_BACKUP_SH}" t2 fixture >/tmp/khive-test-t2-vermatch.out 2>&1; then
+  ok "t2 sync proceeds past the version preflight on a matching local/remote pair"
+else
+  fail "t2 sync should proceed on a matching version pair: $(cat /tmp/khive-test-t2-vermatch.out)"
+fi
+assert_contains "success row logged for t2 on a matching version pair" \
+  "$(tail -n1 "${KHIVE_BACKUP_ROOT}/log/backup-events.jsonl")" '"tier":"t2"'
+assert_contains "remote staging WAS touched once the preflights pass" \
+  "$(cat "${SSH_CALLS_LOG}")" "staging"
+
+echo "=== test: t2 refuses when the remote disk preflight reports insufficient space ==="
+: >"${SSH_CALLS_LOG}"
+if SSH_STUB_REMOTE_VERSION="3.53.3" SSH_STUB_DISK_FAIL=1 "${KHIVE_BACKUP_SH}" t2 fixture >/tmp/khive-test-t2-diskfail.out 2>&1; then
+  fail "t2 sync should refuse when the remote disk preflight reports insufficient space"
+else
+  ok "t2 sync refuses when the remote disk preflight reports insufficient space"
+fi
+assert_contains "disk-preflight-failed logged for the remote target" \
+  "$(tail -n1 "${KHIVE_BACKUP_ROOT}/log/backup-events.jsonl")" "disk-preflight-failed"
+assert_not_contains "remote staging was never touched when the disk preflight refuses" \
+  "$(cat "${SSH_CALLS_LOG}")" "staging"
+# restore the CHANGE_ME placeholder for the remaining tests in this suite
+write_conf "${T1_REPLICA}" "CHANGE_ME@backup-host:/backups/fixture.db" "${T3_ARCHIVE}"
 
 echo "=== test: t3 staged promote + retention prune ==="
 # No sqlite3 stub here: STUB_BIN does not shadow it, so PATH resolves the
@@ -417,6 +487,52 @@ if [ -d "${EXPLICIT_SCRATCH_OK}" ]; then
 else
   fail "caller-supplied scratch-dir was removed — cleanup must be scoped to self-created scratch dirs only"
 fi
+
+echo "=== test: restore drill validate is fatal by default when kkernel is missing (steps 5-6 required) ==="
+# Fresh matching pair: earlier tests in this suite deliberately advance the
+# origin/replica past CR_MANIFEST's recorded point (the capture-replica
+# absent-marker test below adds marker-2), so re-sync and recapture here
+# rather than reusing CR_MANIFEST — this test is about the kkernel gate,
+# not manifest equality, and needs a pair that is known to match.
+"${KHIVE_BACKUP_SH}" t1 fixture >/dev/null
+KKERNEL_GATE_MANIFEST="${SANDBOX}/drill-manifest-kkernel-gate.txt"
+"${RESTORE_DRILL_SH}" capture-replica fixture marker-1 "${KKERNEL_GATE_MANIFEST}" >/dev/null
+# Temporarily remove the kkernel stub from PATH to simulate the real
+# "kkernel not installed on this recovery host" case — the sandbox's
+# STUB_BIN normally shadows a real kkernel with an always-succeeding stub.
+# A restricted PATH (STUB_BIN plus only the plain system dirs sqlite3 needs)
+# is used for these two invocations so a real kkernel binary elsewhere on
+# the developer's PATH (e.g. ~/.cargo/bin) cannot leak in and defeat the
+# "kkernel not found" simulation.
+KKERNEL_STUB_PATH="${STUB_BIN}/kkernel"
+KKERNEL_STUB_BACKUP="${SANDBOX}/kkernel-stub-backup"
+mv "${KKERNEL_STUB_PATH}" "${KKERNEL_STUB_BACKUP}"
+NO_KKERNEL_PATH="${STUB_BIN}:/usr/bin:/bin"
+NO_KKERNEL_OUT="$(mktemp "${SANDBOX}/drill-no-kkernel-stdout.XXXXXX")"
+if PATH="${NO_KKERNEL_PATH}" "${RESTORE_DRILL_SH}" validate fixture "${T1_REPLICA}" marker-1 "${KKERNEL_GATE_MANIFEST}" >"${NO_KKERNEL_OUT}" 2>&1; then
+  fail "validate should refuse (fatal) when kkernel is missing and KHIVE_BACKUP_ALLOW_PARTIAL_DRILL is unset"
+else
+  ok "validate fails loudly when kkernel is missing and no partial-drill opt-in is set"
+fi
+assert_contains "fatal-missing-kkernel error names steps 5-6" "$(cat "${NO_KKERNEL_OUT}")" "steps 5"
+assert_contains "fatal-missing-kkernel error cites the ADR acceptance requirement" "$(cat "${NO_KKERNEL_OUT}")" "ADR-100"
+assert_not_contains "fatal-missing-kkernel path never prints RESTORE DRILL PASSED" "$(cat "${NO_KKERNEL_OUT}")" "RESTORE DRILL PASSED"
+
+echo "=== test: restore drill validate completes as an explicit PARTIAL drill when the operator opts in ==="
+PARTIAL_OUT="$(mktemp "${SANDBOX}/drill-partial-stdout.XXXXXX")"
+if PATH="${NO_KKERNEL_PATH}" KHIVE_BACKUP_ALLOW_PARTIAL_DRILL=1 "${RESTORE_DRILL_SH}" validate fixture "${T1_REPLICA}" marker-1 "${KKERNEL_GATE_MANIFEST}" >"${PARTIAL_OUT}" 2>&1; then
+  ok "validate completes with KHIVE_BACKUP_ALLOW_PARTIAL_DRILL=1 despite missing kkernel"
+else
+  fail "validate should complete (exit 0) for an explicit partial drill: $(cat "${PARTIAL_OUT}")"
+fi
+assert_contains "partial drill prints the PARTIAL line" \
+  "$(cat "${PARTIAL_OUT}")" "RESTORE DRILL PARTIAL (steps 5-6 skipped: kkernel not on PATH)"
+assert_not_contains "partial drill never prints RESTORE DRILL PASSED" "$(cat "${PARTIAL_OUT}")" "RESTORE DRILL PASSED"
+assert_not_contains "partial drill never prints a bare RTO_SECONDS= success token" "$(cat "${PARTIAL_OUT}")" "RTO_SECONDS="
+assert_contains "partial drill reports RTO under a partial-qualified key instead" "$(cat "${PARTIAL_OUT}")" "RTO_SECONDS_PARTIAL="
+
+# restore the kkernel stub for any remaining tests in this suite
+mv "${KKERNEL_STUB_BACKUP}" "${KKERNEL_STUB_PATH}"
 
 echo "=== test: installer idempotent re-run preserves edited interval ==="
 export KHIVE_BACKUP_INSTALL_TEST=1

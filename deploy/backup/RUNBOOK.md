@@ -266,12 +266,25 @@ verification steps). `validate` refuses outright — before touching
 anything else — if the manifest file is missing or malformed, rather than
 silently treating that as "nothing to compare".
 
-- **Steps 5-6 (inside `validate`) require `kkernel` on PATH.** If it is
-  absent, the drill prints `skipped (kkernel not on PATH)` for those two
-  steps and still reports overall success on the rest. A drill that only
-  ran with `kkernel` unavailable is **not** a complete acceptance run per
-  the ADR — re-run it where `kkernel` is reachable (the actual recovery
-  host is the right place) before treating the backup as drill-verified.
+- **Steps 5-6 (inside `validate`) require `kkernel` on PATH, and a missing
+  `kkernel` is fatal by default.** A drill that cannot boot a runtime
+  (step 5) and rebuild the ANN index (step 6) against the restored copy is
+  not the acceptance run the ADR defines, so `validate` refuses outright
+  rather than silently downgrading those two steps to "skipped" and still
+  reporting a pass. Run `validate` where `kkernel` is reachable (the actual
+  recovery host is the right place) to get a complete result.
+  - An operator who explicitly wants a partial run anyway (for example, a
+    quick manifest/integrity check on a host that will never carry
+    `kkernel`) can opt in with `KHIVE_BACKUP_ALLOW_PARTIAL_DRILL=1`. That
+    run skips steps 5-6, prints `RESTORE DRILL PARTIAL (steps 5-6 skipped:
+    kkernel not on PATH)` instead of `RESTORE DRILL PASSED`, and reports
+    `RTO_SECONDS_PARTIAL=` instead of `RTO_SECONDS=` — both changes exist so
+    no automation can grep for the pass markers and treat a partial run as
+    complete acceptance evidence. The command still exits `0` on this path
+    (the operator asked for exactly this outcome), so the distinguishing
+    signal is the output line and the field name, not the exit code — check
+    for `RESTORE DRILL PASSED` specifically, never just a zero exit status,
+    when scripting around this command.
 - **Steps 5-6 run `kkernel` under an isolated `HOME` inside the scratch
   dir.** This is a safety property, not just a compatibility fix: config
   discovery finds nothing under the isolated `HOME`, so the `KHIVE_DB`

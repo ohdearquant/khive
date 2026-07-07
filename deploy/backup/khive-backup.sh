@@ -75,7 +75,10 @@ check_local_version() {
   if ! version_ge "${ver}" "${KHIVE_BACKUP_MIN_VERSION}"; then
     fail_and_log "version-preflight-failed" "local sqlite3_rsync ${ver} is below the required floor ${KHIVE_BACKUP_MIN_VERSION}"
   fi
-  blog "local sqlite3_rsync version ${ver} >= floor ${KHIVE_BACKUP_MIN_VERSION}"
+  # blog on stderr: callers capture this function's stdout as the version
+  # string (e.g. run_tier2's local/remote equality check), so stdout must
+  # carry only the printf'd version below.
+  blog "local sqlite3_rsync version ${ver} >= floor ${KHIVE_BACKUP_MIN_VERSION}" >&2
   printf '%s' "${ver}"
 }
 
@@ -85,7 +88,8 @@ check_remote_version() {
   if ! version_ge "${ver}" "${KHIVE_BACKUP_MIN_VERSION}"; then
     fail_and_log "version-preflight-failed" "remote sqlite3_rsync ${ver} on ${user_host} is below the required floor ${KHIVE_BACKUP_MIN_VERSION}"
   fi
-  blog "remote sqlite3_rsync version ${ver} on ${user_host} >= floor ${KHIVE_BACKUP_MIN_VERSION}"
+  # See check_local_version — blog on stderr, version string only on stdout.
+  blog "remote sqlite3_rsync version ${ver} on ${user_host} >= floor ${KHIVE_BACKUP_MIN_VERSION}" >&2
   printf '%s' "${ver}"
 }
 
@@ -126,13 +130,21 @@ run_tier1() {
 run_tier2() {
   is_placeholder "${STORE_T2_REMOTE}" && fail_and_log "not-configured" "t2_remote for store '${STORE}' is still the CHANGE_ME placeholder — edit stores.conf"
 
-  local user_host remote_path staging rc
+  local user_host remote_path staging rc dest_dir local_ver remote_ver
   user_host="${STORE_T2_REMOTE%%:*}"
   remote_path="${STORE_T2_REMOTE#*:}"
   staging="${remote_path}.staging"
 
-  check_local_version >/dev/null
-  check_remote_version "${user_host}" >/dev/null
+  local_ver="$(check_local_version)"
+  remote_ver="$(check_remote_version "${user_host}")"
+  if [ "${local_ver}" != "${remote_ver}" ]; then
+    fail_and_log "version-preflight-failed" "sqlite3_rsync version mismatch: local=${local_ver}, remote (${user_host})=${remote_ver} — ADR-100 requires equal versions on both ends"
+  fi
+  blog "local and remote sqlite3_rsync versions match (${local_ver})"
+
+  dest_dir="$(dirname -- "${remote_path}")"
+  preflight_disk_remote "${user_host}" "${STORE_ORIGIN}" "${dest_dir}" \
+    || fail_and_log "disk-preflight-failed" "insufficient free space at ${user_host}:${dest_dir}"
 
   # Seed the remote staging file from the last promoted remote replica (if
   # any) so the differential sync stays meaningful, then promote only on
@@ -222,23 +234,38 @@ run_tier3() {
     user_host="${STORE_T2_REMOTE%%:*}"
     remote_replica="${STORE_T2_REMOTE#*:}"
     remote_archive_dir="$(dirname -- "${remote_replica}")/archive/${STORE}"
-    "${SSH_BIN}" -o BatchMode=yes -o ConnectTimeout=10 "${user_host}" "mkdir -p '${remote_archive_dir}'" || true
-    if scp -o BatchMode=yes -o ConnectTimeout=10 -p "${final_path}" "${user_host}:${remote_archive_dir}/"; then
-      prune_remote_archives "${user_host}" "${remote_archive_dir}" "${KHIVE_BACKUP_RETENTION_REMOTE}"
-    else
-      # The local tier-3 archive is already promoted (correct — the off-host
-      # copy is a best-effort mirror of an already-durable local artifact),
-      # but a silently-degraded off-host copy is exactly the "local archive
-      # exists, operator believes off-host does too" gap this ADR's off-host
-      # protection exists to prevent. Record a distinct, alerted event
-      # rather than only a stdout WARNING launchd may never surface;
-      # overall exit stays 0 since the local (required) half succeeded.
-      blog "WARNING: off-host archive copy to ${user_host} failed (local archive still promoted)"
+    if ! preflight_disk_remote "${user_host}" "${final_path}" "${remote_archive_dir}"; then
+      # Same non-fatal shape as the offhost-copy-failed branch below: the
+      # local (required) archive already promoted, so a full remote target
+      # degrades the off-host mirror rather than the overall run — but it
+      # gets its own distinct outcome so the alert names the real cause
+      # (no space) instead of a generic copy failure.
+      blog "WARNING: remote disk preflight failed for off-host archive at ${user_host}:${remote_archive_dir} (local archive still promoted)"
       local dur wal_after
       dur=$(($(date +%s) - START_EPOCH))
       wal_after="$(get_file_size "${STORE_ORIGIN}-wal")"
-      log_backup_event "${STORE}" "${TIER}" "offhost-copy-failed" "${dur}" "$(get_file_size "${final_path}")" "${WAL_BEFORE}" "${wal_after}" "scp to ${user_host} failed for ${final_path}"
-      send_backup_alert "khive-backup t3/${STORE}: offhost-copy-failed — local archive promoted, off-host mirror missing for ${final_path}"
+      log_backup_event "${STORE}" "${TIER}" "disk-preflight-failed" "${dur}" "$(get_file_size "${final_path}")" "${WAL_BEFORE}" "${wal_after}" "insufficient free space at ${user_host}:${remote_archive_dir}"
+      send_backup_alert "khive-backup t3/${STORE}: disk-preflight-failed — local archive promoted, off-host mirror skipped (insufficient space at ${user_host}:${remote_archive_dir})"
+    else
+      "${SSH_BIN}" -o BatchMode=yes -o ConnectTimeout=10 "${user_host}" "mkdir -p '${remote_archive_dir}'" || true
+      if scp -o BatchMode=yes -o ConnectTimeout=10 -p "${final_path}" "${user_host}:${remote_archive_dir}/"; then
+        prune_remote_archives "${user_host}" "${remote_archive_dir}" "${KHIVE_BACKUP_RETENTION_REMOTE}"
+      else
+        # The local tier-3 archive is already promoted (correct — the
+        # off-host copy is a best-effort mirror of an already-durable local
+        # artifact), but a silently-degraded off-host copy is exactly the
+        # "local archive exists, operator believes off-host does too" gap
+        # this ADR's off-host protection exists to prevent. Record a
+        # distinct, alerted event rather than only a stdout WARNING launchd
+        # may never surface; overall exit stays 0 since the local (required)
+        # half succeeded.
+        blog "WARNING: off-host archive copy to ${user_host} failed (local archive still promoted)"
+        local dur wal_after
+        dur=$(($(date +%s) - START_EPOCH))
+        wal_after="$(get_file_size "${STORE_ORIGIN}-wal")"
+        log_backup_event "${STORE}" "${TIER}" "offhost-copy-failed" "${dur}" "$(get_file_size "${final_path}")" "${WAL_BEFORE}" "${wal_after}" "scp to ${user_host} failed for ${final_path}"
+        send_backup_alert "khive-backup t3/${STORE}: offhost-copy-failed — local archive promoted, off-host mirror missing for ${final_path}"
+      fi
     fi
   fi
 

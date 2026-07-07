@@ -70,6 +70,14 @@
 #                    scratch-dir argument was passed); an operator-supplied
 #                    scratch-dir is left for the caller to manage.
 #
+# Steps 5-6 require `kkernel` on PATH and are FATAL by default when it is
+# missing — a drill that cannot boot a runtime and rebuild the ANN index
+# against the restored copy is not the acceptance run ADR-100 defines.
+# KHIVE_BACKUP_ALLOW_PARTIAL_DRILL=1 is the explicit opt-in for a drill that
+# knowingly skips steps 5-6; that run reports "RESTORE DRILL PARTIAL" (never
+# "RESTORE DRILL PASSED") and prints RTO_SECONDS_PARTIAL instead of
+# RTO_SECONDS, so no caller can mistake a partial run for a complete one.
+#
 # Marker lookup table/column default to "notes"/"id" (the kg substrate);
 # override with KHIVE_BACKUP_MARKER_TABLE / KHIVE_BACKUP_MARKER_COLUMN if a
 # store's marker lives elsewhere.
@@ -356,8 +364,26 @@ cmd_validate() {
   # runtime provably cannot discover (or touch) the host's real stores.
   local drill_home="${scratch_dir}/kkernel-home"
   mkdir -p "${drill_home}"
-  local step5_status="skipped (kkernel not on PATH)"
-  if command -v kkernel >/dev/null 2>&1; then
+
+  # ADR-100 defines "done" as steps 1-7 passing, and steps 5-6 specifically
+  # as booting a runtime + rebuilding the ANN index against the restored
+  # copy. A missing `kkernel` used to silently downgrade those two required
+  # steps to "skipped" while the drill still reported PASSED — automation
+  # (or an operator) could then consume that exit 0 as a complete
+  # acceptance run when steps 5-6 never actually ran. Missing kkernel is
+  # therefore FATAL by default; KHIVE_BACKUP_ALLOW_PARTIAL_DRILL=1 is the
+  # explicit, named opt-in for a drill that knowingly skips them — and that
+  # path reports PARTIAL, never PASSED (see the end of this function).
+  local kkernel_present=0
+  command -v kkernel >/dev/null 2>&1 && kkernel_present=1
+  local allow_partial="${KHIVE_BACKUP_ALLOW_PARTIAL_DRILL:-0}"
+
+  if [ "${kkernel_present}" -eq 0 ] && [ "${allow_partial}" != "1" ]; then
+    bdie "kkernel not found on PATH — steps 5 (runtime boot + live verb serving) and 6 (ANN rebuild + vector query) are REQUIRED for ADR-100 acceptance (docs/adr/ADR-100-store-backup-replication.md: step 5, step 6, and 'done' = steps 1-7 passing); this run cannot report a pass without them. Set KHIVE_BACKUP_ALLOW_PARTIAL_DRILL=1 to explicitly run a partial drill that skips steps 5-6 — that result is reported as PARTIAL, never PASSED"
+  fi
+
+  local step5_status
+  if [ "${kkernel_present}" -eq 1 ]; then
     if HOME="${drill_home}" KHIVE_DB="${restored_db}" kkernel exec 'stats()' >"${scratch_dir}/step5-stats.json" 2>&1 \
       && HOME="${drill_home}" KHIVE_DB="${restored_db}" kkernel exec 'search(kind="entity", query="restore drill", limit=1)' >"${scratch_dir}/step5-search.json" 2>&1 \
       && HOME="${drill_home}" KHIVE_DB="${restored_db}" kkernel exec 'memory.recall(query="restore drill", limit=1)' >"${scratch_dir}/step5-recall.json" 2>&1; then
@@ -365,6 +391,8 @@ cmd_validate() {
     else
       step5_status="FAILED"
     fi
+  else
+    step5_status="skipped (kkernel not on PATH; KHIVE_BACKUP_ALLOW_PARTIAL_DRILL=1)"
   fi
   blog "step 5 (stats/search/recall against restored copy): ${step5_status}"
   if [ "${step5_status}" = "FAILED" ]; then
@@ -372,14 +400,16 @@ cmd_validate() {
   fi
 
   blog "step 6: rebuilding the ANN index from the restored database and serving one vector query"
-  local step6_status="skipped (kkernel not on PATH)"
-  if command -v kkernel >/dev/null 2>&1; then
+  local step6_status
+  if [ "${kkernel_present}" -eq 1 ]; then
     if HOME="${drill_home}" KHIVE_DB="${restored_db}" kkernel reindex >"${scratch_dir}/step6-reindex.json" 2>&1 \
       && HOME="${drill_home}" KHIVE_DB="${restored_db}" kkernel exec 'memory.recall(query="restore drill vector query", limit=1)' >"${scratch_dir}/step6-vector.json" 2>&1; then
       step6_status="ok"
     else
       step6_status="FAILED"
     fi
+  else
+    step6_status="skipped (kkernel not on PATH; KHIVE_BACKUP_ALLOW_PARTIAL_DRILL=1)"
   fi
   blog "step 6 (ANN rebuild + vector query): ${step6_status}"
   if [ "${step6_status}" = "FAILED" ]; then
@@ -390,13 +420,27 @@ cmd_validate() {
   drill_end="$(date +%s)"
   rto_seconds=$((drill_end - RESTORE_START))
 
-  blog "step 7: RTO (steps 2-6) = ${rto_seconds}s"
-  if [ "${own_scratch}" -eq 1 ]; then
-    blog "RESTORE DRILL PASSED for store '${store}' — scratch dir ${scratch_dir} will be removed (pass an explicit scratch-dir argument to retain it)"
+  if [ "${kkernel_present}" -eq 0 ]; then
+    # Explicit partial drill (operator opted in above). Never print the
+    # PASSED line or a bare RTO_SECONDS= token — both read as "complete
+    # acceptance run" to a caller that only checks exit status and greps
+    # for one of those strings.
+    blog "step 7: RTO measurement omitted — partial drill (steps 5-6 skipped)"
+    if [ "${own_scratch}" -eq 1 ]; then
+      blog "RESTORE DRILL PARTIAL (steps 5-6 skipped: kkernel not on PATH) for store '${store}' — scratch dir ${scratch_dir} will be removed (pass an explicit scratch-dir argument to retain it)"
+    else
+      blog "RESTORE DRILL PARTIAL (steps 5-6 skipped: kkernel not on PATH) for store '${store}' — scratch artifacts kept at ${scratch_dir} (caller-supplied scratch-dir)"
+    fi
+    printf 'RTO_SECONDS_PARTIAL=%s\n' "${rto_seconds}"
   else
-    blog "RESTORE DRILL PASSED for store '${store}' — scratch artifacts kept at ${scratch_dir} (caller-supplied scratch-dir)"
+    blog "step 7: RTO (steps 2-6) = ${rto_seconds}s"
+    if [ "${own_scratch}" -eq 1 ]; then
+      blog "RESTORE DRILL PASSED for store '${store}' — scratch dir ${scratch_dir} will be removed (pass an explicit scratch-dir argument to retain it)"
+    else
+      blog "RESTORE DRILL PASSED for store '${store}' — scratch artifacts kept at ${scratch_dir} (caller-supplied scratch-dir)"
+    fi
+    printf 'RTO_SECONDS=%s\n' "${rto_seconds}"
   fi
-  printf 'RTO_SECONDS=%s\n' "${rto_seconds}"
 }
 
 case "${1:-}" in
