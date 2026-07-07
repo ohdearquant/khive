@@ -170,34 +170,57 @@ backup"), run this after initial setup, after any schema-migration release,
 and on a standing cadence you define (weekly is a reasonable floor given the
 tier-3 archive cadence).
 
+The drill is two subcommands, matching the ADR's step 1-2 ordering exactly:
+the manifest is **captured immediately before the designated sync** and
+stored beside the sync metrics; validation later compares a restored copy
+against that **recorded file** — never against the origin as it stands at
+validate time (writes land on the origin between capture and a later
+validate run; comparing against the moving origin at that point would fail
+spuriously on unrelated writes, and a pass would not actually prove
+anything about the recorded point).
+
 1. Write a marker row through the **normal write path** (not through this
    tooling) — e.g. a note or memory entry with a fresh, unique id. Record
    that id.
-2. Run (or wait for) the sync you intend to validate.
-3. Run the drill against the resulting replica:
+2. **Capture** the manifest right before running the sync you intend to
+   validate:
 
    ```bash
-   deploy/backup/restore-drill.sh khive /path/to/tier2-replica.db <marker-id>
+   deploy/backup/restore-drill.sh capture khive <marker-id>
    ```
 
-   This executes the ADR's 7 steps: capture an origin manifest in one read
-   transaction (table row counts, `MAX(rowid)`, and a `.sha3sum` checksum
-   per table), restore the given backup to a scratch path, run
-   `PRAGMA integrity_check`, compare the restored copy's manifest to the
-   origin's **exactly** (no tolerance — the manifest was captured at the
-   marker-write instant), boot a runtime against the restored copy and
-   serve `stats()` / `search()` / `memory.recall()`, rebuild the ANN index
-   from the restored database and serve one vector query, and print the RTO
-   (wall time of the restore + verification steps).
-4. **Steps 5-6 require `kkernel` on PATH.** If it is absent, the drill
-   prints `skipped (kkernel not on PATH)` for those two steps and still
-   reports overall success on steps 1-4 and 7. A drill that only ran with
-   `kkernel` unavailable is **not** a complete acceptance run per the ADR —
-   re-run it where `kkernel` is reachable (the actual recovery host is the
-   right place) before treating the backup as drill-verified.
-5. A failed comparison prints the manifest diff and fails loudly — that is
+   This verifies the marker is present in the origin, then captures a
+   manifest in one read transaction (table row counts, `MAX(rowid)`, and a
+   `.sha3sum` checksum per table) to
+   `~/.khive/backups/drill/manifests/khive-<UTC stamp>.manifest`, printing
+   the path as `MANIFEST_PATH=...`. Pass an explicit path as a third
+   argument to control the location instead.
+3. Run (or wait for) the sync being validated.
+4. **Validate** the resulting backup against the manifest captured in step 2:
+
+   ```bash
+   deploy/backup/restore-drill.sh validate khive /path/to/tier2-replica.db <marker-id> <manifest-path>
+   ```
+
+   This restores the given backup to a scratch path, runs
+   `PRAGMA integrity_check`, compares the restored copy's manifest to the
+   **recorded** manifest file **exactly** (no tolerance), boots a runtime
+   against the restored copy and serves `stats()` / `search()` /
+   `memory.recall()`, rebuilds the ANN index from the restored database and
+   serves one vector query, and prints the RTO (wall time of the restore +
+   verification steps). `validate` refuses outright — before touching
+   anything else — if the manifest file is missing or malformed, rather
+   than silently treating that as "nothing to compare".
+5. **Steps 5-6 (inside `validate`) require `kkernel` on PATH.** If it is
+   absent, the drill prints `skipped (kkernel not on PATH)` for those two
+   steps and still reports overall success on the rest. A drill that only
+   ran with `kkernel` unavailable is **not** a complete acceptance run per
+   the ADR — re-run it where `kkernel` is reachable (the actual recovery
+   host is the right place) before treating the backup as drill-verified.
+6. A failed comparison prints the manifest diff and fails loudly — that is
    a defect in the backup or restore path, not "just a delta since the
-   marker", because the manifest and the marker were captured atomically.
+   marker", because the manifest and the marker were captured atomically
+   at the recorded point, before the sync ran.
 
 ## Migration pause rule
 

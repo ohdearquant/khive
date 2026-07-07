@@ -121,7 +121,15 @@ cp "$origin" "$replica"
 exit 0
 '
 
-write_stub kkernel 'exit 0'
+KKERNEL_CALLS_LOG="${SANDBOX}/kkernel-calls.log"
+: >"${KKERNEL_CALLS_LOG}"
+write_stub kkernel "
+echo \"\$*\" >> '${KKERNEL_CALLS_LOG}'
+exit 0
+"
+
+write_stub ssh 'exit 0'
+write_stub scp 'exit 1'
 
 echo "=== test: version preflight refuses a floor violation ==="
 (
@@ -221,26 +229,64 @@ ARCHIVE_COUNT="$(find "${T3_ARCHIVE}" -maxdepth 1 -name 'fixture-*.db' | wc -l |
 assert_eq "retention keeps exactly KHIVE_BACKUP_RETENTION_LOCAL (default 4) archives" "4" "${ARCHIVE_COUNT}"
 assert_contains "t3 success rows logged" "$(tail -n1 "${KHIVE_BACKUP_ROOT}/log/backup-events.jsonl")" '"tier":"t3"'
 
-echo "=== test: restore drill — exact-equality pass ==="
-DRILL_DB="${SANDBOX}/drill-backup.db"
-cp "${T1_REPLICA}" "${DRILL_DB}"
-DRILL_OUT="$(mktemp -d "${SANDBOX}/drill.XXXXXX")"
-if "${RESTORE_DRILL_SH}" fixture "${DRILL_DB}" marker-1 "${DRILL_OUT}" >/tmp/khive-test-drill-pass.out 2>&1; then
-  ok "restore drill passes on an exact backup copy"
+echo "=== test: t3 off-host archive copy failure logs a distinct event + alerts (local archive still promoted) ==="
+# A real (non-placeholder) t2_remote so run_tier3 attempts the off-host
+# scp copy; the scp stub above always fails, exercising the degraded path.
+write_conf "${T1_REPLICA}" "op@remotehost:/backups/fixture.db" "${T3_ARCHIVE}"
+: >"${KKERNEL_CALLS_LOG}"
+if "${KHIVE_BACKUP_SH}" t3 fixture >/tmp/khive-test-t3-offhost.out 2>&1; then
+  T3_OFFHOST_RC=0
 else
-  fail "restore drill should pass on an exact backup copy: $(cat /tmp/khive-test-drill-pass.out)"
+  T3_OFFHOST_RC=$?
 fi
-assert_contains "restore drill reports RTO_SECONDS" "$(cat /tmp/khive-test-drill-pass.out)" "RTO_SECONDS="
+assert_eq "t3 still exits 0 when only the off-host copy fails (local tier succeeded)" "0" "${T3_OFFHOST_RC}"
+LAST_TWO_EVENTS="$(tail -n2 "${KHIVE_BACKUP_ROOT}/log/backup-events.jsonl")"
+assert_contains "offhost-copy-failed event logged" "${LAST_TWO_EVENTS}" '"outcome":"offhost-copy-failed"'
+assert_contains "offhost-copy-failed event still tagged tier t3" "${LAST_TWO_EVENTS}" '"tier":"t3"'
+assert_contains "local archive still promoted (success row also logged)" "${LAST_TWO_EVENTS}" '"outcome":"success"'
+assert_contains "alert (kkernel comm.send) invoked for the off-host failure" "$(cat "${KKERNEL_CALLS_LOG}")" "offhost-copy-failed"
+# restore the CHANGE_ME placeholder for the remaining tests in this suite
+write_conf "${T1_REPLICA}" "CHANGE_ME@backup-host:/backups/fixture.db" "${T3_ARCHIVE}"
 
-echo "=== test: restore drill — deliberate mismatch fails ==="
+echo "=== test: restore drill — capture (before the designated sync) then validate exact-equality pass ==="
+# ADR order: capture the manifest from the ORIGIN first, THEN run the
+# designated sync, THEN validate the resulting backup against the RECORDED
+# manifest file — never a manifest recaptured from the origin at validate
+# time.
+DRILL_MANIFEST="${SANDBOX}/drill-manifest-pass.txt"
+if "${RESTORE_DRILL_SH}" capture fixture marker-1 "${DRILL_MANIFEST}" >/tmp/khive-test-drill-capture.out 2>&1; then
+  ok "capture succeeds and verifies the marker in the origin"
+else
+  fail "capture should succeed: $(cat /tmp/khive-test-drill-capture.out)"
+fi
+assert_file_exists "capture writes the manifest file" "${DRILL_MANIFEST}"
+assert_contains "capture prints MANIFEST_PATH" "$(cat /tmp/khive-test-drill-capture.out)" "MANIFEST_PATH=${DRILL_MANIFEST}"
+assert_contains "manifest contains a COUNT row" "$(cat "${DRILL_MANIFEST}")" "COUNT|notes|"
+
+# the designated sync, run AFTER capture (origin is unchanged since capture,
+# so the resulting replica matches the recorded manifest exactly)
+"${KHIVE_BACKUP_SH}" t1 fixture >/dev/null
+
+DRILL_OUT="$(mktemp -d "${SANDBOX}/drill.XXXXXX")"
+if "${RESTORE_DRILL_SH}" validate fixture "${T1_REPLICA}" marker-1 "${DRILL_MANIFEST}" "${DRILL_OUT}" >/tmp/khive-test-drill-pass.out 2>&1; then
+  ok "validate passes when the backup matches the recorded manifest"
+else
+  fail "validate should pass on an exact backup copy: $(cat /tmp/khive-test-drill-pass.out)"
+fi
+assert_contains "validate reports RTO_SECONDS" "$(cat /tmp/khive-test-drill-pass.out)" "RTO_SECONDS="
+
+echo "=== test: restore drill — deliberate mismatch (mutated AFTER capture+sync) fails ==="
+# Same recorded manifest as above (captured before the sync); the backup fed
+# to validate is mutated AFTER both capture and the sync ran, simulating a
+# tampered/corrupted backup file rather than a spurious "moving origin" diff.
 DRILL_BAD_DB="${SANDBOX}/drill-backup-bad.db"
 cp "${T1_REPLICA}" "${DRILL_BAD_DB}"
 sqlite3 "${DRILL_BAD_DB}" "INSERT INTO notes (id, content) VALUES ('extra-row', 'this should not be here');"
 DRILL_BAD_OUT="$(mktemp -d "${SANDBOX}/drill-bad.XXXXXX")"
-if "${RESTORE_DRILL_SH}" fixture "${DRILL_BAD_DB}" marker-1 "${DRILL_BAD_OUT}" >/tmp/khive-test-drill-fail.out 2>&1; then
-  fail "restore drill should fail on a deliberately mismatched copy"
+if "${RESTORE_DRILL_SH}" validate fixture "${DRILL_BAD_DB}" marker-1 "${DRILL_MANIFEST}" "${DRILL_BAD_OUT}" >/tmp/khive-test-drill-fail.out 2>&1; then
+  fail "validate should fail on a deliberately mismatched copy"
 else
-  ok "restore drill fails on a deliberately mismatched copy"
+  ok "validate fails on a deliberately mismatched copy"
 fi
 assert_contains "mismatch failure names the manifest diff" "$(cat /tmp/khive-test-drill-fail.out)" "manifest"
 
@@ -249,11 +295,31 @@ DRILL_NOMARKER_DB="${SANDBOX}/drill-backup-nomarker.db"
 cp "${T1_REPLICA}" "${DRILL_NOMARKER_DB}"
 sqlite3 "${DRILL_NOMARKER_DB}" "DELETE FROM notes WHERE id = 'marker-1';"
 DRILL_NM_OUT="$(mktemp -d "${SANDBOX}/drill-nm.XXXXXX")"
-if "${RESTORE_DRILL_SH}" fixture "${DRILL_NOMARKER_DB}" marker-1 "${DRILL_NM_OUT}" >/tmp/khive-test-drill-nomarker.out 2>&1; then
-  fail "restore drill should fail when the marker row is missing"
+if "${RESTORE_DRILL_SH}" validate fixture "${DRILL_NOMARKER_DB}" marker-1 "${DRILL_MANIFEST}" "${DRILL_NM_OUT}" >/tmp/khive-test-drill-nomarker.out 2>&1; then
+  fail "validate should fail when the marker row is missing"
 else
-  ok "restore drill fails when the marker row is missing from the restored copy"
+  ok "validate fails when the marker row is missing from the restored copy"
 fi
+
+echo "=== test: validate refuses a missing manifest file ==="
+DRILL_MISSING_OUT="$(mktemp -d "${SANDBOX}/drill-missing.XXXXXX")"
+if "${RESTORE_DRILL_SH}" validate fixture "${T1_REPLICA}" marker-1 "${SANDBOX}/does-not-exist.manifest" "${DRILL_MISSING_OUT}" >/tmp/khive-test-drill-missing.out 2>&1; then
+  fail "validate should refuse a missing manifest file"
+else
+  ok "validate refuses a missing manifest file"
+fi
+assert_contains "missing-manifest error names the file" "$(cat /tmp/khive-test-drill-missing.out)" "manifest file not found"
+
+echo "=== test: validate refuses a malformed manifest file ==="
+BAD_MANIFEST="${SANDBOX}/malformed.manifest"
+printf 'this is not a manifest line\n' >"${BAD_MANIFEST}"
+DRILL_MALFORMED_OUT="$(mktemp -d "${SANDBOX}/drill-malformed.XXXXXX")"
+if "${RESTORE_DRILL_SH}" validate fixture "${T1_REPLICA}" marker-1 "${BAD_MANIFEST}" "${DRILL_MALFORMED_OUT}" >/tmp/khive-test-drill-malformed.out 2>&1; then
+  fail "validate should refuse a malformed manifest file"
+else
+  ok "validate refuses a malformed manifest file"
+fi
+assert_contains "malformed-manifest error names the problem" "$(cat /tmp/khive-test-drill-malformed.out)" "malformed"
 
 echo "=== test: installer idempotent re-run preserves edited interval ==="
 export KHIVE_BACKUP_INSTALL_TEST=1

@@ -223,9 +223,23 @@ run_tier3() {
     remote_replica="${STORE_T2_REMOTE#*:}"
     remote_archive_dir="$(dirname -- "${remote_replica}")/archive/${STORE}"
     "${SSH_BIN}" -o BatchMode=yes -o ConnectTimeout=10 "${user_host}" "mkdir -p '${remote_archive_dir}'" || true
-    scp -o BatchMode=yes -o ConnectTimeout=10 -p "${final_path}" "${user_host}:${remote_archive_dir}/" \
-      || blog "WARNING: off-host archive copy to ${user_host} failed (local archive still promoted; alert below)"
-    prune_remote_archives "${user_host}" "${remote_archive_dir}" "${KHIVE_BACKUP_RETENTION_REMOTE}"
+    if scp -o BatchMode=yes -o ConnectTimeout=10 -p "${final_path}" "${user_host}:${remote_archive_dir}/"; then
+      prune_remote_archives "${user_host}" "${remote_archive_dir}" "${KHIVE_BACKUP_RETENTION_REMOTE}"
+    else
+      # The local tier-3 archive is already promoted (correct — the off-host
+      # copy is a best-effort mirror of an already-durable local artifact),
+      # but a silently-degraded off-host copy is exactly the "local archive
+      # exists, operator believes off-host does too" gap this ADR's off-host
+      # protection exists to prevent. Record a distinct, alerted event
+      # rather than only a stdout WARNING launchd may never surface;
+      # overall exit stays 0 since the local (required) half succeeded.
+      blog "WARNING: off-host archive copy to ${user_host} failed (local archive still promoted)"
+      local dur wal_after
+      dur=$(($(date +%s) - START_EPOCH))
+      wal_after="$(get_file_size "${STORE_ORIGIN}-wal")"
+      log_backup_event "${STORE}" "${TIER}" "offhost-copy-failed" "${dur}" "$(get_file_size "${final_path}")" "${WAL_BEFORE}" "${wal_after}" "scp to ${user_host} failed for ${final_path}"
+      send_backup_alert "khive-backup t3/${STORE}: offhost-copy-failed — local archive promoted, off-host mirror missing for ${final_path}"
+    fi
   fi
 
   succeed_and_log "$(get_file_size "${final_path}")"
