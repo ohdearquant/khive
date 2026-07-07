@@ -1420,6 +1420,87 @@ default = true
         });
     }
 
+    // ── deterministic lock-blocking oracle (r2 fix) ───────────────────────────
+    //
+    // The end-to-end race test below proves no corruption results when both
+    // sides respect the guard, but a mutation-testing pass showed its
+    // final-row-count oracle does NOT fail if the guard at
+    // `build_local_fallback_server`'s call site is removed entirely: with no
+    // second real lock-holder racing it, the row count comes out right either
+    // way, so the test cannot tell "guarded" from "unguarded". This test
+    // closes that gap: it holds the SAME recovery lock the guard acquires
+    // from the test thread itself, then asserts `build_local_fallback_server`
+    // cannot complete construction while that lock is held (bounded wait) —
+    // an assertion that is trivially true when the guard is unguarded (it
+    // never acquires anything, so it isn't blocked by our held lock).
+    #[cfg(unix)]
+    #[test]
+    #[serial(local_exec_boot_guard)]
+    fn build_local_fallback_server_blocks_while_recovery_lock_is_held() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let lock_file = dir.path().join("khived.recovery.lock");
+        std::env::set_var("KHIVE_LOCK", &lock_file);
+
+        let db_path = dir.path().join("guard_block_test.db3");
+
+        // A separate file descriptor to the SAME lock path — flock's
+        // blocking semantics apply per open-file-description, so this
+        // blocks a second acquirer even from another thread in this same
+        // process (the same pattern `daemon.rs`'s own
+        // `recovery_lock_serializes_two_concurrent_boot_sequences` and
+        // `cold_boot_fts_race.rs` rely on).
+        let held_guard =
+            khive_runtime::daemon::acquire_recovery_lock().expect("acquire recovery lock in test");
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            let rt_handle = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("build per-thread tokio runtime");
+            let cfg = RuntimeConfig {
+                db_path: Some(db_path),
+                embedding_model: None,
+                additional_embedding_models: vec![],
+                ..RuntimeConfig::default()
+            };
+            let khive_cfg = KhiveConfig::default();
+            // The exact call under test: every non-atomic local-exec path
+            // (daemon-unreachable fallback, --save-file, KHIVE_NO_DAEMON=1,
+            // non-atomic --ops-file) funnels through this one function.
+            let result =
+                rt_handle.block_on(async { build_local_fallback_server(cfg, &khive_cfg, None) });
+            // Sent only AFTER construction returns — the test observes
+            // whether this arrives before or after the lock is released.
+            let _ = tx.send(());
+            result
+        });
+
+        // Bounded wait: construction must NOT complete while the lock is
+        // held. If the production guard at `build_local_fallback_server`'s
+        // call site is ever removed or no-op'd, nothing blocks this thread
+        // and the signal arrives well inside this window — this is the
+        // mutation-killing assertion.
+        let completed_while_locked = rx
+            .recv_timeout(std::time::Duration::from_millis(500))
+            .is_ok();
+        assert!(
+            !completed_while_locked,
+            "build_local_fallback_server must NOT complete while the boot/recovery \
+             lock is held by another holder — if this fires, the guard at its \
+             production call site has been removed or stopped acquiring the shared lock"
+        );
+
+        drop(held_guard);
+
+        handle
+            .join()
+            .expect("construction thread must not panic")
+            .expect("construction must succeed once the lock is released");
+
+        std::env::remove_var("KHIVE_LOCK");
+    }
+
     // Named serial key (not the bare `#[serial]` default): this test only
     // touches `KHIVE_LOCK`, not the `KHIVE_REQUIRE_ATTRIBUTED_ACTOR` /
     // `KHIVE_NO_DAEMON` / `HOME` vars the default-keyed `#[serial]` tests
