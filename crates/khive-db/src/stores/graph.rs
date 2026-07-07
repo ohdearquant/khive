@@ -357,20 +357,47 @@ pub fn edge_symmetric_update_inplace_statement(
 //    (non-canonical) row IF AND ONLY IF a differently-id'd canonical row
 //    exists at the target natural key at THIS moment (guard: 0 or 1 rows).
 // 2. [`edge_symmetric_refresh_or_update_inplace_statement`]: a single
-//    `UPDATE` matching either the still-live requested row (id match, if
-//    statement 1 didn't fire) or the canonical row (natural-key match, if
-//    it did) — always exactly 1 row (guard: exactly 1). `target_backend` is
-//    updated only for the natural-key match (the absorbed-conflict case);
-//    a `CASE WHEN id = :requested_id` guards that, replicating
-//    [`EDGE_SYMMETRIC_UPDATE_INPLACE_SQL`]'s "leave `target_backend`
-//    untouched" behavior for the in-place case with the SAME statement that
-//    also replicates [`EDGE_SYMMETRIC_REFRESH_CANONICAL_SQL`]'s explicit
-//    `target_backend` set for the absorbed case.
+//    `UPDATE` that no longer trusts an `id = ?2 OR natural-key` predicate
+//    (ADR-099 B3 r9, codex r8 Blocker finding 1 — that predicate could
+//    match the WRONG row: if a different op earlier in the SAME atomic unit
+//    had already deleted the requested edge, statement 1 above no-ops (its
+//    "0 rows" result is indistinguishable at the Rust level from "no
+//    conflict existed"), yet the natural-key arm could still hit a
+//    pre-existing canonical row that this update never causally touched).
+//    The fix ties the natural-key arm to `changes()` — SQLite's per-
+//    connection scalar reporting the row count of the most recently
+//    COMPLETED statement, i.e. statement 1's own result, evaluated fresh at
+//    THIS statement's execution, not at prepare time:
+//    - `id = ?2 AND changes() = 0`: statement 1 deleted nothing, so the
+//      requested row is still live under its own id — update it in place.
+//    - `source_id = ?3 AND target_id = ?4 AND relation = ?5 AND id != ?2
+//      AND changes() = 1`: statement 1 just deleted the requested row
+//      BECAUSE a conflict existed — refresh that surviving canonical row.
+//    These two arms are mutually exclusive and, together with statement 1's
+//    own guard, jointly exhaustive: if the requested row no longer existed
+//    when statement 1 ran (the same-unit race above), statement 1 affects 0
+//    rows for a reason unrelated to conflict absorption, `id = ?2` no
+//    longer matches anything (the row is gone), and the natural-key arm's
+//    `changes() = 1` guard is false — so this statement affects ZERO rows
+//    and the plan's `AffectedRowGuard::exactly(1)` on it fails the op,
+//    aborting the whole atomic unit rather than silently mutating an
+//    unrelated row. `target_backend` is updated only in the natural-key
+//    (absorbed-conflict) arm — the same `changes() = 1` condition, via a
+//    `CASE`, replicating [`EDGE_SYMMETRIC_UPDATE_INPLACE_SQL`]'s "leave
+//    `target_backend` untouched" behavior for the in-place case with the
+//    SAME statement that also replicates
+//    [`EDGE_SYMMETRIC_REFRESH_CANONICAL_SQL`]'s explicit `target_backend`
+//    set for the absorbed case.
 //
-// No probe, no branch, no read at all is needed to APPLY this pair — only
-// to compute the atomic plan's advisory `target_id` for post-commit result
-// rendering (an informational read, not a write-correctness concern); see
-// `khive-runtime::atomic_prepare::prepare_update_edge`'s doc comment.
+// No probe, no branch, no read at all is needed to APPLY this pair. Which
+// row this plan actually touched is derived post-commit by the caller via a
+// fresh natural-key lookup (`khive-runtime::KhiveRuntime::list_edges`,
+// filtered on the canonicalized endpoints/relation — the same mechanism the
+// atomic `link` op's own result rendering already uses) — ADR-099 B3 r9
+// removed the prior prepare-time advisory `target_id` probe entirely
+// (codex r8 Blocker finding 1, second half): a value computed before the
+// SAME atomic unit's other ops have run is not a fact this plan can stand
+// behind, so result rendering no longer trusts it.
 pub fn edge_symmetric_delete_if_conflict_statement(
     namespace: &str,
     id: Uuid,
@@ -414,10 +441,14 @@ pub fn edge_symmetric_refresh_or_update_inplace_statement(
         sql: "UPDATE graph_edges SET \
               source_id = ?3, target_id = ?4, relation = ?5, \
               weight = ?6, updated_at = ?7, deleted_at = NULL, metadata = ?8, \
-              target_backend = CASE WHEN id = ?2 THEN target_backend ELSE ?9 END \
+              target_backend = CASE WHEN changes() = 1 THEN ?9 ELSE target_backend END \
               WHERE namespace = ?1 \
-                AND (id = ?2 OR (source_id = ?3 AND target_id = ?4 AND relation = ?5))"
-            .to_string(),
+                AND ( \
+                  (id = ?2 AND changes() = 0) \
+                  OR (source_id = ?3 AND target_id = ?4 AND relation = ?5 \
+                      AND id != ?2 AND changes() = 1) \
+                )"
+        .to_string(),
         params: vec![
             SqlValue::Text(namespace.to_string()),
             SqlValue::Text(id.to_string()),
@@ -815,6 +846,16 @@ fn canonical_edge_endpoints(
 /// unlike `upsert_entities`/`upsert_notes`'s partial-success accounting) —
 /// the caller's transaction wrapper (either the legacy `with_writer` closure
 /// or `WriteRequest::execute_and_reply`) issues the ROLLBACK.
+///
+/// Per-row DML comes from [`edge_upsert_statement`] — the SAME builder
+/// singleton `upsert_edge` calls (ADR-099 B3 r9, codex r8 High finding 2:
+/// this function previously hand-wrote a second, textually-independent copy
+/// of the natural-key conflict arms here, the exact drift class round 7's
+/// [`EDGE_NATURAL_KEY_CONFLICT_SET`] extraction was meant to close for good
+/// — a future change to that constant would have silently stopped reaching
+/// this batch path). `bind_params` is the same `SqlStatement` -> rusqlite
+/// binding `upsert_edge` uses; there is now exactly one literal for the
+/// edge natural-key conflict arms in the whole workspace.
 fn batch_upsert_edges(
     conn: &rusqlite::Connection,
     edges: &[Edge],
@@ -823,52 +864,10 @@ fn batch_upsert_edges(
     let mut affected = 0u64;
 
     for edge in edges {
-        let id_str = Uuid::from(edge.id).to_string();
-        let (canon_src, canon_tgt) =
-            canonical_edge_endpoints(edge.relation, edge.source_id, edge.target_id);
-        let src_str = canon_src.to_string();
-        let tgt_str = canon_tgt.to_string();
-        let relation_str = edge.relation.to_string();
-        let metadata_str = edge
-            .metadata
-            .as_ref()
-            .map(serde_json::to_string)
-            .transpose()
-            .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
-        conn.execute(
-            "INSERT INTO graph_edges \
-             (namespace, id, source_id, target_id, relation, weight, \
-              created_at, updated_at, deleted_at, metadata, target_backend) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11) \
-             ON CONFLICT(namespace, id) DO UPDATE SET \
-                 source_id = excluded.source_id, \
-                 target_id = excluded.target_id, \
-                 relation = excluded.relation, \
-                 weight = excluded.weight, \
-                 updated_at = excluded.updated_at, \
-                 deleted_at = NULL, \
-                 metadata = excluded.metadata, \
-                 target_backend = excluded.target_backend \
-             ON CONFLICT(namespace, source_id, target_id, relation) DO UPDATE SET \
-                 weight = excluded.weight, \
-                 updated_at = excluded.updated_at, \
-                 deleted_at = NULL, \
-                 metadata = excluded.metadata, \
-                 target_backend = excluded.target_backend",
-            rusqlite::params![
-                edge.namespace.as_str(),
-                id_str,
-                src_str,
-                tgt_str,
-                relation_str,
-                edge.weight,
-                edge.created_at.timestamp_micros(),
-                edge.updated_at.timestamp_micros(),
-                edge.deleted_at.map(|t| t.timestamp_micros()),
-                metadata_str,
-                edge.target_backend.as_deref(),
-            ],
-        )?;
+        let statement = edge_upsert_statement(edge);
+        let mut stmt = conn.prepare(&statement.sql)?;
+        bind_params(&mut stmt, &statement.params)?;
+        stmt.raw_execute()?;
         affected += 1;
     }
 
