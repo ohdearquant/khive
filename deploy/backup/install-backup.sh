@@ -308,8 +308,8 @@ main() {
           --interval-t1) it1="$2"; shift 2 ;;
           --interval-t2) it2="$2"; shift 2 ;;
           --interval-t3) it3="$2"; shift 2 ;;
-          --retention-local) retention_local="$2"; shift 2 ;;
-          --retention-remote) retention_remote="$2"; shift 2 ;;
+          --retention-local) [ "$#" -ge 2 ] || die "--retention-local requires a value"; retention_local="$2"; shift 2 ;;
+          --retention-remote) [ "$#" -ge 2 ] || die "--retention-remote requires a value"; retention_remote="$2"; shift 2 ;;
           *) die "unknown argument: $1" ;;
         esac
       done
