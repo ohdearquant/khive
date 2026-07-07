@@ -653,7 +653,15 @@ async fn ingest_prs(
             "number,title,author,createdAt,mergedAt,closedAt,updatedAt,baseRefName,headRefName,mergeCommit,body",
         ],
     )?;
-    let prs: Vec<GhPr> = serde_json::from_str(&raw).context("parsing gh pr list --json")?;
+    let mut prs: Vec<GhPr> = serde_json::from_str(&raw).context("parsing gh pr list --json")?;
+    // `gh pr list` makes no ordering guarantee. The frozen-cursor retry
+    // guarantee below (cursor freezes at the last contiguous success, so a
+    // failed record is retried next pass) only holds if records are walked
+    // in nondecreasing updated_at order; otherwise a newer record ahead of
+    // an older failing one in the raw list would push the cursor past the
+    // failure and it would never be retried. Sort ascending first (stable —
+    // ties keep gh's original relative order).
+    prs.sort_by(|a, b| a.updated_at.cmp(&b.updated_at));
 
     // `cursor_stalled` mirrors `ingest_commits`: once one PR fails to create,
     // later PRs in this pass are still attempted (so every failure surfaces
@@ -782,8 +790,13 @@ async fn ingest_issues(
             "number,title,author,createdAt,closedAt,updatedAt,labels,stateReason,body",
         ],
     )?;
-    let issues: Vec<GhIssue> =
+    let mut issues: Vec<GhIssue> =
         serde_json::from_str(&raw).context("parsing gh issue list --json")?;
+    // See `ingest_prs`: the frozen-cursor retry guarantee requires walking
+    // records in nondecreasing updated_at order, which `gh issue list` does
+    // not itself guarantee. Sort ascending first (stable — ties keep gh's
+    // original relative order).
+    issues.sort_by(|a, b| a.updated_at.cmp(&b.updated_at));
 
     // `cursor_stalled` mirrors `ingest_commits`/`ingest_prs`: a per-record
     // create failure is aggregated as a warning and later records in this
