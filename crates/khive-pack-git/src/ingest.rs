@@ -661,6 +661,19 @@ async fn ingest_prs(
     // an older failing one in the raw list would push the cursor past the
     // failure and it would never be retried. Sort ascending first (stable —
     // ties keep gh's original relative order).
+    //
+    // Sorting alone does not cover a TIE: if a successful record and a
+    // failing record share the exact same `updated_at`, the success still
+    // advances the cursor to that timestamp, and an exclusive `updated >
+    // cursor` retry check would then see the failed record's `updated_at ==
+    // cursor` and treat it as not-new on the next pass — stranding it
+    // forever, sort or no sort. `is_new` below is therefore inclusive
+    // (`updated >= cursor`): every record at the cursor timestamp is
+    // re-examined on every subsequent pass until the cursor moves past it.
+    // That reprocessing is bounded (only records sharing the exact cursor
+    // value) and free (the natural-key lookup below turns every
+    // already-created one into a cheap no-op), so it converges the moment
+    // the last tied record either succeeds or the cursor advances.
     prs.sort_by(|a, b| a.updated_at.cmp(&b.updated_at));
 
     // `cursor_stalled` mirrors `ingest_commits`: once one PR fails to create,
@@ -674,7 +687,7 @@ async fn ingest_prs(
         let is_new = since
             .as_deref()
             .zip(pr.updated_at.as_deref())
-            .map(|(cursor, updated)| updated > cursor)
+            .map(|(cursor, updated)| updated >= cursor)
             .unwrap_or(true);
 
         if let Some(existing) =
@@ -795,7 +808,11 @@ async fn ingest_issues(
     // See `ingest_prs`: the frozen-cursor retry guarantee requires walking
     // records in nondecreasing updated_at order, which `gh issue list` does
     // not itself guarantee. Sort ascending first (stable — ties keep gh's
-    // original relative order).
+    // original relative order). Sorting doesn't cover a TIE between a
+    // successful and a failing record sharing the same `updated_at` — see
+    // `ingest_prs`'s comment on why `is_new` below is an inclusive
+    // (`updated >= cursor`) check, and why the resulting reprocessing of
+    // every record at the cursor timestamp is bounded and converges.
     issues.sort_by(|a, b| a.updated_at.cmp(&b.updated_at));
 
     // `cursor_stalled` mirrors `ingest_commits`/`ingest_prs`: a per-record
@@ -809,7 +826,7 @@ async fn ingest_issues(
         let is_new = since
             .as_deref()
             .zip(issue.updated_at.as_deref())
-            .map(|(cursor, updated)| updated > cursor)
+            .map(|(cursor, updated)| updated >= cursor)
             .unwrap_or(true);
 
         if find_by_number(runtime, token, "issue", project_id, issue.number)
