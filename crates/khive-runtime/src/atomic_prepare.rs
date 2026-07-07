@@ -59,10 +59,11 @@ use khive_db::stores::entity::{
 };
 use khive_db::stores::event::event_insert_statements;
 use khive_db::stores::graph::{
-    edge_hard_delete_statement, edge_soft_delete_statement,
-    edge_symmetric_conflict_probe_statement, edge_symmetric_delete_noncanonical_statement,
-    edge_symmetric_refresh_canonical_statement, edge_symmetric_update_inplace_statement,
-    edge_upsert_statement, purge_incident_edges_statement,
+    edge_hard_delete_statement, edge_insert_guarded_by_endpoints_statement,
+    edge_soft_delete_statement, edge_symmetric_conflict_probe_statement,
+    edge_symmetric_delete_if_conflict_statement,
+    edge_symmetric_refresh_or_update_inplace_statement, edge_upsert_statement,
+    purge_incident_edges_statement,
 };
 use khive_db::stores::note::{
     note_hard_delete_statement, note_soft_delete_statement, note_upsert_statement,
@@ -393,7 +394,17 @@ pub async fn prepare_op(
     args: &Value,
 ) -> RuntimeResult<AtomicOpPlan> {
     match tool {
-        "update" => prepare_update(runtime, token, args).await,
+        // `expected_kind: None` here — same reasoning as the `"delete"` arm
+        // immediately below: callers that need `update(kind=...)` parity
+        // (ADR-099 B3 r7, codex r7 Blocker finding 1) must resolve the kind
+        // spec themselves (it needs a `VerbRegistry`, unreachable from this
+        // crate — see `AtomicUpdateKind`'s doc comment) and call
+        // `prepare_update` directly with the resolved value; `kkernel`'s
+        // `--atomic` seam does exactly this and bypasses this dispatch arm
+        // for "update". A caller reaching `prepare_op("update", ...)`
+        // without going through that seam gets kind-unchecked behavior,
+        // same as delete's pre-existing arm.
+        "update" => prepare_update(runtime, token, args, None).await,
         // `expected_kind: None` here — callers that need `delete(kind=...)`
         // parity (ADR-099 B3 fix round 5, finding 1) must resolve the kind
         // spec themselves (it needs a `VerbRegistry`, unreachable from this
@@ -516,10 +527,32 @@ fn reject_inapplicable_update_fields(args: &Value, substrate: &str) -> RuntimeRe
     Ok(())
 }
 
-async fn prepare_update(
+/// Caller-supplied update-kind expectation, resolved via the canonical
+/// `resolve_kind_spec` at the kkernel `--atomic` seam — the exact same
+/// pattern [`AtomicDeleteKind`] uses (ADR-099 B3 r7, codex r7 Blocker
+/// finding 1: `update(kind="document", id=<concept>)` was canonically
+/// `NotFound` but the atomic path ignored the explicit kind and mutated the
+/// resolved entity anyway). `khive-runtime` must not depend on
+/// `khive-pack-kg`, so this is a plain substrate-level shape rather than
+/// `khive_pack_kg::handlers::KindSpec` itself — the kkernel seam does the
+/// pack-aware resolution and passes down only what `prepare_update` needs
+/// to enforce the mismatch check.
+pub enum AtomicUpdateKind {
+    Entity { specific: Option<String> },
+    Note { specific: Option<String> },
+    Edge,
+}
+
+/// `expected_kind`: `None` when the caller omitted `kind` (no check, parity
+/// with canonical's own optional discriminator); `Some(_)` enforces an
+/// exact-parity mismatch check against the resolved record's actual
+/// substrate/specific kind, mirroring `handle_update`'s
+/// `entity.kind != *k` / note kind checks (update.rs:200-201, :229-234).
+pub async fn prepare_update(
     runtime: &KhiveRuntime,
     token: &NamespaceToken,
     args: &Value,
+    expected_kind: Option<AtomicUpdateKind>,
 ) -> RuntimeResult<AtomicOpPlan> {
     let id = require_uuid(args, "id")?;
 
@@ -535,20 +568,25 @@ async fn prepare_update(
         ));
     }
 
-    // NOTE (GAP-4 scope, B3 fix round 4): update.rs also rejects a caller-
-    // supplied `kind=<specific>` that contradicts the resolved substrate's
-    // ACTUAL kind (update.rs:200-201, :229-234) with a `NotFound`. That
-    // check depends on `VerbRegistry::all_entity_kinds()`/
-    // `all_note_kinds()` (every loaded pack's granular vocab) and pack-
-    // private `EntityKind`/`NoteKind` parsing — neither is reachable from
-    // `khive-runtime` without either threading the registry through this
-    // call or duplicating pack-private vocab here, and no acceptance test
-    // in this fix round exercises it. Deferred, not silently dropped: the
-    // field-applicability rejection immediately below (the MAJOR-severity
-    // half of GAP-4 — a spurious no-op reported as success) is implemented
-    // in full.
     match runtime.resolve_by_id(token, id).await? {
-        Some(Resolved::Entity(_)) => {
+        Some(Resolved::Entity(entity)) => {
+            match &expected_kind {
+                None => {}
+                Some(AtomicUpdateKind::Entity {
+                    specific: Some(expected),
+                }) => {
+                    if &entity.kind != expected {
+                        return Err(RuntimeError::NotFound(format!("entity {id}")));
+                    }
+                }
+                Some(AtomicUpdateKind::Entity { specific: None }) => {}
+                Some(AtomicUpdateKind::Note { .. }) => {
+                    return Err(RuntimeError::NotFound(format!("note {id}")));
+                }
+                Some(AtomicUpdateKind::Edge) => {
+                    return Err(RuntimeError::NotFound(format!("edge {id}")));
+                }
+            }
             // Decide step lives in curation.rs's `prepare_update_entity` —
             // the SAME function canonical `update_entity` calls. Only the
             // arg-extraction (raw JSON -> `EntityPatch`) and the plan-shape
@@ -604,7 +642,24 @@ async fn prepare_update(
                 post_commit,
             }))
         }
-        Some(Resolved::Note(_)) => {
+        Some(Resolved::Note(note)) => {
+            match &expected_kind {
+                None => {}
+                Some(AtomicUpdateKind::Note {
+                    specific: Some(expected),
+                }) => {
+                    if &note.kind != expected {
+                        return Err(RuntimeError::NotFound(format!("note {id}")));
+                    }
+                }
+                Some(AtomicUpdateKind::Note { specific: None }) => {}
+                Some(AtomicUpdateKind::Entity { .. }) => {
+                    return Err(RuntimeError::NotFound(format!("entity {id}")));
+                }
+                Some(AtomicUpdateKind::Edge) => {
+                    return Err(RuntimeError::NotFound(format!("edge {id}")));
+                }
+            }
             // Decide step lives in curation.rs's `prepare_update_note` — the
             // SAME function canonical `update_note` calls, including the
             // salience/decay_factor range validation. `optional_f64_patch`
@@ -657,9 +712,17 @@ async fn prepare_update(
         // round-4 codex REJECT: `update` admits `kind="edge"` but this
         // function previously had no path that could ever build a plan for
         // one).
-        None => match runtime.get_edge(token, id).await? {
-            Some(edge) => prepare_update_edge(runtime, id, edge, args).await,
-            None => Err(RuntimeError::NotFound(format!("entity/note/edge {id}"))),
+        None => match &expected_kind {
+            Some(AtomicUpdateKind::Entity { .. }) => {
+                Err(RuntimeError::NotFound(format!("entity/note {id}")))
+            }
+            Some(AtomicUpdateKind::Note { .. }) => {
+                Err(RuntimeError::NotFound(format!("entity/note {id}")))
+            }
+            Some(AtomicUpdateKind::Edge) | None => match runtime.get_edge(token, id).await? {
+                Some(edge) => prepare_update_edge(runtime, id, edge, args).await,
+                None => Err(RuntimeError::NotFound(format!("entity/note/edge {id}"))),
+            },
         },
     }
 }
@@ -682,14 +745,24 @@ async fn prepare_update(
 /// - symmetric relation (`competes_with`, `composed_with`): `update_edge`
 ///   does NOT use the upsert builder here — its comment explains why
 ///   (`upsert_edge` resolves `ON CONFLICT(namespace, id)` first and cannot
-///   detect a natural-key collision with a *different* id). It instead runs
-///   a conflict PROBE then branches: no conflict -> update the row in place;
-///   conflict -> delete the requested (non-canonical) row and refresh the
-///   surviving canonical row. That probe is a plain read with no side
-///   effects, so it runs here in the async prepare phase (same treatment
-///   `resolve_kg_ids_in_args` already gives id resolution) and the two
-///   branches below reproduce `update_edge_symmetric_dml`'s exact SQL text,
-///   so the resulting plan is fully static for the synchronous commit pass.
+///   detect a natural-key collision with a *different* id). Canonical
+///   (`update_edge_symmetric_dml`) runs a conflict probe and branches in
+///   Rust inside a single uninterrupted transaction, which is safe there.
+///   This atomic path (ADR-099 B3 r7, codex r7 High finding 3) does NOT
+///   branch on a prepare-time probe: the prepare/commit phase split means a
+///   different op in the SAME atomic unit could change the conflict
+///   landscape between this probe and commit, so a Rust-level branch here
+///   would be stale by construction. Instead it always emits BOTH
+///   statements from [`edge_symmetric_delete_if_conflict_statement`] and
+///   [`edge_symmetric_refresh_or_update_inplace_statement`] — each carries
+///   its own commit-time `WHERE`/`CASE WHEN` predicate that re-evaluates the
+///   conflict condition fresh inside the transaction, so the write is
+///   correct regardless of what this prepare-time probe returns. The probe
+///   itself is kept, but demoted to computing `surviving_id` only — a pure
+///   informational value used for this plan's `target_id` (post-commit
+///   result rendering), not a write-correctness input; see the inline
+///   comment at its call site for the (vanishingly rare, informational-only)
+///   residual staleness this leaves.
 async fn prepare_update_edge(
     runtime: &KhiveRuntime,
     id: Uuid,
@@ -743,11 +816,59 @@ async fn prepare_update_edge(
     let mut surviving_id = id;
 
     if edge.relation.is_symmetric() {
-        // Conflict probe (read-only, async — see doc comment above). Same SQL
-        // text `update_edge_symmetric_dml` (operations.rs, the synchronous
-        // commit-time counterpart) runs inside its transaction — see the
-        // `EDGE_SYMMETRIC_*_SQL` doc comment in khive-db for why a single
-        // bridge type isn't used for both call sites.
+        // ADR-099 B3 r7 (codex r7 High finding 3): the WRITE for a symmetric
+        // relation no longer branches on a prepare-time probe result — it
+        // ALWAYS carries both self-guarding, commit-time-predicate
+        // statements (see their doc comment in khive-db's graph.rs for the
+        // full rationale). This closes the staleness window a prepare-time
+        // probe exposed atomic to (an earlier op in the SAME atomic unit
+        // could change the conflict landscape before commit) without
+        // touching canonical's own probe-then-branch `update_edge_symmetric_dml`
+        // (which has no such exposure — single transaction, no interleaving
+        // — and stays as the control-group, tests untouched).
+        let metadata_str = edge
+            .metadata
+            .as_ref()
+            .map(|v| serde_json::to_string(v).unwrap_or_default());
+
+        statements.push(PlanStatement {
+            statement: edge_symmetric_delete_if_conflict_statement(
+                &namespace,
+                id,
+                canon_src,
+                canon_tgt,
+                edge.relation,
+            ),
+            guard: Some(AffectedRowGuard {
+                expected_min: 0,
+                expected_max: Some(1),
+            }),
+        });
+        statements.push(PlanStatement {
+            statement: edge_symmetric_refresh_or_update_inplace_statement(
+                &namespace,
+                id,
+                canon_src,
+                canon_tgt,
+                edge.relation,
+                edge.weight,
+                now.timestamp_micros(),
+                metadata_str.as_deref(),
+                edge.target_backend.as_deref(),
+            ),
+            guard: Some(AffectedRowGuard::exactly(1)),
+        });
+
+        // `surviving_id` here is advisory only, used solely for this plan's
+        // `target_id` (post-commit result rendering — a pure informational
+        // READ, not a write-correctness concern; see this function's doc
+        // comment). A best-effort probe is enough for it: if an intra-batch
+        // race (vanishingly rare — it requires a SECOND op in this SAME
+        // atomic unit to touch this exact symmetric edge's natural key
+        // between this probe and commit) makes it stale, the two statements
+        // above still write to the CORRECT row regardless of what this
+        // probe returns; only the post-commit result payload could, in that
+        // exact race, echo back the pre-collision row's content.
         let mut reader = runtime
             .sql()
             .reader()
@@ -767,47 +888,8 @@ async fn prepare_update_edge(
                 SqlValue::Text(s) => Uuid::parse_str(&s).ok(),
                 _ => None,
             });
-
-        let metadata_str = edge
-            .metadata
-            .as_ref()
-            .map(|v| serde_json::to_string(v).unwrap_or_default());
-
         if let Some(existing_id) = conflict_id {
-            // Case (b), mirrors `update_edge_symmetric_dml`: delete the
-            // requested (non-canonical) row, refresh the surviving row.
             surviving_id = existing_id;
-            statements.push(PlanStatement {
-                statement: edge_symmetric_delete_noncanonical_statement(&namespace, id),
-                guard: Some(AffectedRowGuard::exactly(1)),
-            });
-            statements.push(PlanStatement {
-                statement: edge_symmetric_refresh_canonical_statement(
-                    &namespace,
-                    existing_id,
-                    edge.weight,
-                    now.timestamp_micros(),
-                    edge.target_backend.as_deref(),
-                    metadata_str.as_deref(),
-                ),
-                guard: Some(AffectedRowGuard::exactly(1)),
-            });
-        } else {
-            // Case (a): no conflict — update source/target/relation/weight
-            // in place, preserving the original edge id.
-            statements.push(PlanStatement {
-                statement: edge_symmetric_update_inplace_statement(
-                    &namespace,
-                    id,
-                    canon_src,
-                    canon_tgt,
-                    edge.relation,
-                    edge.weight,
-                    now.timestamp_micros(),
-                    metadata_str.as_deref(),
-                ),
-                guard: Some(AffectedRowGuard::exactly(1)),
-            });
         }
     } else {
         // Non-symmetric: bit-for-bit the same builder `graph.upsert_edge`
@@ -1186,49 +1268,30 @@ async fn prepare_link(
     let now = chrono::Utc::now().timestamp_micros();
     let metadata_str = metadata.map(|m| serde_json::to_string(&m).unwrap_or_default());
 
-    // GAP-2 (B3 fix round 4): a plain `INSERT` here rejects a re-link of an
-    // already-linked (or soft-deleted) triple with a `graph_edges`
-    // `UNIQUE(namespace, source_id, target_id, relation)` violation, rolling
-    // back the whole atomic unit. Canonical `link` -> `upsert_edge`
-    // (`khive-db/src/stores/graph.rs`, natural-key `ON CONFLICT` arm) instead
-    // upserts: it updates `weight`/`updated_at`/`metadata` and resurrects
-    // `deleted_at = NULL`. The `ON CONFLICT` arm below mirrors that natural-key
-    // arm's exact `SET` list (it intentionally does NOT touch
-    // `target_backend`, which this atomic INSERT never populates in the
-    // first place — that column is left untouched on conflict rather than
-    // reset to NULL). SQLite accepts `INSERT ... SELECT ... WHERE ... ON
-    // CONFLICT ... DO UPDATE`; the guarded `exactly(1)` check below still
-    // holds for both the fresh-insert and the upsert-update outcome, and
-    // still correctly reports 0 affected rows when an endpoint is missing.
-    let statement = SqlStatement {
-        sql: "INSERT INTO graph_edges \
-              (namespace, id, source_id, target_id, relation, weight, created_at, updated_at, metadata) \
-              SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, ?8 \
-              WHERE (EXISTS (SELECT 1 FROM entities WHERE id = ?3 AND deleted_at IS NULL) \
-                     OR EXISTS (SELECT 1 FROM notes WHERE id = ?3 AND deleted_at IS NULL)) \
-                AND (EXISTS (SELECT 1 FROM entities WHERE id = ?4 AND deleted_at IS NULL) \
-                     OR EXISTS (SELECT 1 FROM notes WHERE id = ?4 AND deleted_at IS NULL)) \
-              ON CONFLICT(namespace, source_id, target_id, relation) DO UPDATE SET \
-                  weight = excluded.weight, \
-                  updated_at = excluded.updated_at, \
-                  deleted_at = NULL, \
-                  metadata = excluded.metadata"
-            .to_string(),
-        params: vec![
-            SqlValue::Text(namespace),
-            SqlValue::Text(edge_id.to_string()),
-            SqlValue::Text(canon_source.to_string()),
-            SqlValue::Text(canon_target.to_string()),
-            SqlValue::Text(relation.as_str().to_string()),
-            SqlValue::Float(weight),
-            SqlValue::Integer(now),
-            match metadata_str {
-                Some(m) => SqlValue::Text(m),
-                None => SqlValue::Null,
-            },
-        ],
-        label: Some("atomic-link-insert-edge-where-exists".to_string()),
-    };
+    // ADR-099 B3 r7 (codex r7 High finding 2): the guarded `INSERT ...
+    // SELECT ... WHERE EXISTS(...)` shape is kept (it is load-bearing —
+    // `LinkPlan`'s own doc comment records why: it re-probes both endpoints
+    // INSIDE the transaction, closing the intra-batch hazard where an
+    // earlier op in the SAME atomic unit, e.g. `delete(X, hard)`, could
+    // invalidate this op's prepare-time endpoint validation before commit).
+    // What changed: the conflict-arm SET list is no longer a second
+    // hand-assembled literal — `edge_insert_guarded_by_endpoints_statement`
+    // shares the SAME `EDGE_NATURAL_KEY_CONFLICT_SET` text
+    // `edge_upsert_statement` (canonical `link`'s builder) uses, so the two
+    // cannot silently diverge again (the prior bug: this atomic literal
+    // never set `target_backend = excluded.target_backend`, so a re-link of
+    // an edge carrying a cross-backend `target_backend` stamp behaved
+    // differently under `--atomic`).
+    let statement = edge_insert_guarded_by_endpoints_statement(
+        &namespace,
+        edge_id,
+        canon_source,
+        canon_target,
+        relation,
+        weight,
+        now,
+        metadata_str.as_deref(),
+    );
 
     Ok(AtomicOpPlan::Link(LinkPlan {
         source_id: canon_source,
@@ -1463,6 +1526,7 @@ mod tests {
             &runtime,
             &token,
             &json!({"id": entity_id.to_string(), "salience": 0.9}),
+            None,
         )
         .await
         .expect_err("salience on an entity must be rejected, not silently accepted");
@@ -1481,6 +1545,7 @@ mod tests {
                 "description": "updated description",
                 "tags": ["a", "b"],
             }),
+            None,
         )
         .await
         .expect("a valid entity field set must still be accepted");
@@ -1521,7 +1586,8 @@ mod tests {
             &runtime,
             &token,
             &json!({"id": note_id.to_string(), "description": "entities have descriptions, notes don't"}),
-        )
+                None,
+            )
         .await
         .expect_err("description on a note must be rejected, not silently accepted");
         assert!(
@@ -1534,6 +1600,7 @@ mod tests {
             &runtime,
             &token,
             &json!({"id": note_id.to_string(), "content": "gap-4 note content, revised"}),
+            None,
         )
         .await
         .expect("a valid note field must still be accepted");
@@ -1578,6 +1645,7 @@ mod tests {
             &runtime,
             &token,
             &json!({"id": note_id.to_string(), "content": "freshly-updated-content-xyz"}),
+            None,
         )
         .await
         .expect("prepare update");
@@ -2380,6 +2448,7 @@ mod tests {
             &runtime,
             &token,
             &json!({"id": entity_id.to_string(), "name": "gap1-entity-renamed"}),
+            None,
         )
         .await
         .expect("prepare update");
@@ -2541,6 +2610,7 @@ mod tests {
             &runtime,
             &token,
             &json!({"id": edge_id.to_string(), "weight": 0.75}),
+            None,
         )
         .await
         .expect("prepare update edge");
@@ -2616,6 +2686,7 @@ mod tests {
             &runtime,
             &token,
             &json!({"id": requested_id.to_string(), "relation": "competes_with", "weight": 0.9}),
+            None,
         )
         .await
         .expect("prepare update edge (symmetric conflict)");
@@ -2691,6 +2762,7 @@ mod tests {
             &runtime,
             &token,
             &json!({"id": edge_id.to_string(), "name": "not-a-valid-edge-field"}),
+            None,
         )
         .await
         .expect_err("edge update with an entity-only field must be rejected");
@@ -2791,6 +2863,7 @@ mod tests {
             &runtime,
             &token,
             &json!({"id": note_id.to_string(), "content": "gap1-note-noevent, revised"}),
+            None,
         )
         .await
         .expect("prepare update");

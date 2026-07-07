@@ -39,6 +39,19 @@ fn map_sqlite_err(e: SqliteError, op: &'static str) -> StorageError {
 // non-symmetric branch) all call these.
 // ---------------------------------------------------------------------------
 
+/// The natural-key conflict arm's `SET` list — shared, textually, between
+/// [`edge_upsert_statement`] and [`edge_insert_guarded_by_endpoints_statement`]
+/// (ADR-099 B3 r7, codex r7 High finding 2) so the two can never silently
+/// diverge again: the atomic link path previously hand-duplicated this SET
+/// list without `target_backend = excluded.target_backend`, so a re-link of
+/// an edge that had a cross-backend `target_backend` stamp behaved
+/// differently under `--atomic` than under canonical `link`.
+const EDGE_NATURAL_KEY_CONFLICT_SET: &str = "weight = excluded.weight, \
+     updated_at = excluded.updated_at, \
+     deleted_at = NULL, \
+     metadata = excluded.metadata, \
+     target_backend = excluded.target_backend";
+
 /// The exact natural-key-upserting `INSERT ... ON CONFLICT` this store's
 /// `upsert_edge` issues. Canonicalizes symmetric-relation endpoints first,
 /// matching `upsert_edge`'s own call to `canonical_edge_endpoints`.
@@ -50,7 +63,8 @@ pub fn edge_upsert_statement(edge: &Edge) -> SqlStatement {
         .as_ref()
         .map(|v| serde_json::to_string(v).unwrap_or_default());
     SqlStatement {
-        sql: "INSERT INTO graph_edges \
+        sql: format!(
+            "INSERT INTO graph_edges \
               (namespace, id, source_id, target_id, relation, weight, \
                created_at, updated_at, deleted_at, metadata, target_backend) \
               VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11) \
@@ -58,18 +72,10 @@ pub fn edge_upsert_statement(edge: &Edge) -> SqlStatement {
                   source_id = excluded.source_id, \
                   target_id = excluded.target_id, \
                   relation = excluded.relation, \
-                  weight = excluded.weight, \
-                  updated_at = excluded.updated_at, \
-                  deleted_at = NULL, \
-                  metadata = excluded.metadata, \
-                  target_backend = excluded.target_backend \
+                  {EDGE_NATURAL_KEY_CONFLICT_SET} \
               ON CONFLICT(namespace, source_id, target_id, relation) DO UPDATE SET \
-                  weight = excluded.weight, \
-                  updated_at = excluded.updated_at, \
-                  deleted_at = NULL, \
-                  metadata = excluded.metadata, \
-                  target_backend = excluded.target_backend"
-            .to_string(),
+                  {EDGE_NATURAL_KEY_CONFLICT_SET}"
+        ),
         params: vec![
             SqlValue::Text(edge.namespace.clone()),
             SqlValue::Text(Uuid::from(edge.id).to_string()),
@@ -93,6 +99,66 @@ pub fn edge_upsert_statement(edge: &Edge) -> SqlStatement {
             },
         ],
         label: Some("edge-upsert".to_string()),
+    }
+}
+
+/// The atomic `link` op's variant of [`edge_upsert_statement`] (ADR-099 B3
+/// r7, codex r7 High finding 2). Shares the SAME
+/// [`EDGE_NATURAL_KEY_CONFLICT_SET`] conflict-arm text — the two builders
+/// cannot diverge on write behavior — but wraps the `INSERT` in a guarded
+/// `SELECT ... WHERE EXISTS(...)` that re-probes both endpoints for
+/// existence INSIDE the transaction, at commit time, rather than trusting
+/// prepare-time validation alone.
+///
+/// This guard is atomic-`link`-specific, not a `edge_upsert_statement`
+/// concern: `LinkPlan`'s own doc comment (`khive-runtime::atomic_plan`)
+/// records why it must be commit-time, not prepare-time — a `link` op's
+/// async prepare pass (`validate_edge_relation_endpoints`) can run and pass
+/// BEFORE an earlier op in the SAME atomic unit (e.g. `delete(X, hard)`)
+/// removes that very endpoint; only a commit-time, in-transaction guard
+/// closes that intra-batch ordering hazard (ADR-099 acceptance criteria:
+/// `[delete(X, hard), link(A, X)]` must fail, not silently create a
+/// dangling edge). Canonical `link` has no equivalent need — it executes
+/// and commits standalone, with no other op's write interleaved between its
+/// own validation and its own write.
+#[allow(clippy::too_many_arguments)]
+pub fn edge_insert_guarded_by_endpoints_statement(
+    namespace: &str,
+    edge_id: Uuid,
+    source_id: Uuid,
+    target_id: Uuid,
+    relation: EdgeRelation,
+    weight: f64,
+    now: i64,
+    metadata: Option<&str>,
+) -> SqlStatement {
+    SqlStatement {
+        sql: format!(
+            "INSERT INTO graph_edges \
+              (namespace, id, source_id, target_id, relation, weight, \
+               created_at, updated_at, metadata) \
+              SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, ?8 \
+              WHERE (EXISTS (SELECT 1 FROM entities WHERE id = ?3 AND deleted_at IS NULL) \
+                     OR EXISTS (SELECT 1 FROM notes WHERE id = ?3 AND deleted_at IS NULL)) \
+                AND (EXISTS (SELECT 1 FROM entities WHERE id = ?4 AND deleted_at IS NULL) \
+                     OR EXISTS (SELECT 1 FROM notes WHERE id = ?4 AND deleted_at IS NULL)) \
+              ON CONFLICT(namespace, source_id, target_id, relation) DO UPDATE SET \
+                  {EDGE_NATURAL_KEY_CONFLICT_SET}"
+        ),
+        params: vec![
+            SqlValue::Text(namespace.to_string()),
+            SqlValue::Text(edge_id.to_string()),
+            SqlValue::Text(source_id.to_string()),
+            SqlValue::Text(target_id.to_string()),
+            SqlValue::Text(relation.as_str().to_string()),
+            SqlValue::Float(weight),
+            SqlValue::Integer(now),
+            match metadata {
+                Some(m) => SqlValue::Text(m.to_string()),
+                None => SqlValue::Null,
+            },
+        ],
+        label: Some("atomic-link-insert-edge-where-exists".to_string()),
     }
 }
 
@@ -257,6 +323,119 @@ pub fn edge_symmetric_update_inplace_statement(
             SqlValue::Text(id.to_string()),
         ],
         label: Some("edge-symmetric-update-inplace".to_string()),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Symmetric-relation update DML — atomic-only, commit-time self-guarding
+// variant (ADR-099 B3 r7, codex r7 High finding 3).
+//
+// The four builders above are still what canonical `update_edge_symmetric_dml`
+// binds: it probes and branches synchronously INSIDE its own writer-task
+// transaction, with no other op interleaved between its probe and its write,
+// so its branch has no staleness exposure and is left untouched (control
+// group — canonical's tests must stay green).
+//
+// The atomic path is structurally different: its conflict probe runs in the
+// async PREPARE phase, which for a multi-op `--atomic` unit completes for
+// EVERY op before the synchronous COMMIT phase begins for ANY of them. An
+// earlier op in the SAME atomic unit (e.g. a `delete` or another symmetric
+// `update` touching the same natural key) can change the conflict landscape
+// between this op's prepare-time probe and its own statements finally
+// executing at commit time — codex r7 flagged this as a real staleness
+// window, not just an SQL-text duplication concern.
+//
+// The two builders below close it: instead of a Rust-level `if let
+// Some(conflict) { ... } else { ... }` that hand-picks ONE of three
+// statements at prepare time (the "second hand-assembled branch" codex
+// flagged), the atomic plan ALWAYS carries both statements, in order, and
+// each is a self-guarding, commit-time predicate that re-evaluates conflict
+// state fresh against whatever the transaction's state actually is when it
+// runs — not what prepare's probe said:
+//
+// 1. [`edge_symmetric_delete_if_conflict_statement`]: deletes the requested
+//    (non-canonical) row IF AND ONLY IF a differently-id'd canonical row
+//    exists at the target natural key at THIS moment (guard: 0 or 1 rows).
+// 2. [`edge_symmetric_refresh_or_update_inplace_statement`]: a single
+//    `UPDATE` matching either the still-live requested row (id match, if
+//    statement 1 didn't fire) or the canonical row (natural-key match, if
+//    it did) — always exactly 1 row (guard: exactly 1). `target_backend` is
+//    updated only for the natural-key match (the absorbed-conflict case);
+//    a `CASE WHEN id = :requested_id` guards that, replicating
+//    [`EDGE_SYMMETRIC_UPDATE_INPLACE_SQL`]'s "leave `target_backend`
+//    untouched" behavior for the in-place case with the SAME statement that
+//    also replicates [`EDGE_SYMMETRIC_REFRESH_CANONICAL_SQL`]'s explicit
+//    `target_backend` set for the absorbed case.
+//
+// No probe, no branch, no read at all is needed to APPLY this pair — only
+// to compute the atomic plan's advisory `target_id` for post-commit result
+// rendering (an informational read, not a write-correctness concern); see
+// `khive-runtime::atomic_prepare::prepare_update_edge`'s doc comment.
+pub fn edge_symmetric_delete_if_conflict_statement(
+    namespace: &str,
+    id: Uuid,
+    canon_src: Uuid,
+    canon_tgt: Uuid,
+    relation: EdgeRelation,
+) -> SqlStatement {
+    SqlStatement {
+        sql: "DELETE FROM graph_edges \
+              WHERE namespace = ?1 AND id = ?2 \
+                AND EXISTS ( \
+                  SELECT 1 FROM graph_edges \
+                  WHERE namespace = ?1 AND source_id = ?3 AND target_id = ?4 \
+                    AND relation = ?5 AND id != ?2 \
+                )"
+        .to_string(),
+        params: vec![
+            SqlValue::Text(namespace.to_string()),
+            SqlValue::Text(id.to_string()),
+            SqlValue::Text(canon_src.to_string()),
+            SqlValue::Text(canon_tgt.to_string()),
+            SqlValue::Text(relation.to_string()),
+        ],
+        label: Some("edge-symmetric-delete-if-conflict".to_string()),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn edge_symmetric_refresh_or_update_inplace_statement(
+    namespace: &str,
+    id: Uuid,
+    canon_src: Uuid,
+    canon_tgt: Uuid,
+    relation: EdgeRelation,
+    weight: f64,
+    updated_at_micros: i64,
+    metadata: Option<&str>,
+    target_backend: Option<&str>,
+) -> SqlStatement {
+    SqlStatement {
+        sql: "UPDATE graph_edges SET \
+              source_id = ?3, target_id = ?4, relation = ?5, \
+              weight = ?6, updated_at = ?7, deleted_at = NULL, metadata = ?8, \
+              target_backend = CASE WHEN id = ?2 THEN target_backend ELSE ?9 END \
+              WHERE namespace = ?1 \
+                AND (id = ?2 OR (source_id = ?3 AND target_id = ?4 AND relation = ?5))"
+            .to_string(),
+        params: vec![
+            SqlValue::Text(namespace.to_string()),
+            SqlValue::Text(id.to_string()),
+            SqlValue::Text(canon_src.to_string()),
+            SqlValue::Text(canon_tgt.to_string()),
+            SqlValue::Text(relation.to_string()),
+            SqlValue::Float(weight),
+            SqlValue::Integer(updated_at_micros),
+            match metadata {
+                Some(m) => SqlValue::Text(m.to_string()),
+                None => SqlValue::Null,
+            },
+            match target_backend {
+                Some(b) => SqlValue::Text(b.to_string()),
+                None => SqlValue::Null,
+            },
+        ],
+        label: Some("edge-symmetric-refresh-or-update-inplace".to_string()),
     }
 }
 

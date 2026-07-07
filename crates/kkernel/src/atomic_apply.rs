@@ -390,7 +390,20 @@ async fn prepare_one(
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
             Ok((plan, args.clone()))
         }
-        "update" | "link" => {
+        "update" => {
+            let resolved = resolve_kg_ids_in_args(runtime, token, tool, args).await?;
+            let expected_kind = update_expected_kind(&resolved, registry)?;
+            let plan = khive_runtime::atomic_prepare::prepare_update(
+                runtime,
+                token,
+                &resolved,
+                expected_kind,
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+            Ok((plan, resolved))
+        }
+        "link" => {
             let resolved = resolve_kg_ids_in_args(runtime, token, tool, args).await?;
             let plan = khive_runtime::atomic_prepare::prepare_op(runtime, token, tool, &resolved)
                 .await
@@ -520,6 +533,49 @@ fn delete_expected_kind(
         khive_pack_kg::handlers::KindSpec::Event | khive_pack_kg::handlers::KindSpec::Proposal => {
             Err(anyhow::anyhow!(
                 "kind {raw:?} not supported under --atomic delete; only entity/note/edge \
+                 substrates are v1-admissible"
+            ))
+        }
+    }
+}
+
+/// Resolve a caller-supplied `update(kind=...)` string into the
+/// [`khive_runtime::atomic_prepare::AtomicUpdateKind`] `prepare_update`
+/// enforces, using the SAME canonical `resolve_kind_spec` the non-atomic
+/// `handle_update` calls (ADR-099 B3 r7, codex r7 Blocker finding 1). Exact
+/// mirror of [`delete_expected_kind`] above — same reasoning, same shape,
+/// differing only in which `AtomicOpPlan`-adjacent enum it targets. `kind`
+/// absent -> `Ok(None)` (no check, parity with canonical's own optional
+/// discriminator). `Event`/`Proposal` remain a fail-loud rejection BEFORE
+/// `prepare_update` (and therefore before any write): those substrates are
+/// not v1-admissible for atomic update at all.
+fn update_expected_kind(
+    args: &Value,
+    registry: &VerbRegistry,
+) -> anyhow::Result<Option<khive_runtime::atomic_prepare::AtomicUpdateKind>> {
+    let raw = match args
+        .as_object()
+        .and_then(|o| o.get("kind"))
+        .and_then(|v| v.as_str())
+    {
+        Some(k) => k,
+        None => return Ok(None),
+    };
+    let spec = khive_pack_kg::handlers::resolve_kind_spec(raw, registry)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    match spec {
+        khive_pack_kg::handlers::KindSpec::Entity { specific } => Ok(Some(
+            khive_runtime::atomic_prepare::AtomicUpdateKind::Entity { specific },
+        )),
+        khive_pack_kg::handlers::KindSpec::Note { specific } => Ok(Some(
+            khive_runtime::atomic_prepare::AtomicUpdateKind::Note { specific },
+        )),
+        khive_pack_kg::handlers::KindSpec::Edge => {
+            Ok(Some(khive_runtime::atomic_prepare::AtomicUpdateKind::Edge))
+        }
+        khive_pack_kg::handlers::KindSpec::Event | khive_pack_kg::handlers::KindSpec::Proposal => {
+            Err(anyhow::anyhow!(
+                "kind {raw:?} not supported under --atomic update; only entity/note/edge \
                  substrates are v1-admissible"
             ))
         }
