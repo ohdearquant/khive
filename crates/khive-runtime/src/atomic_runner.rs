@@ -107,9 +107,11 @@ impl AtomicOpPlan {
 
     /// The deferred post-commit effect this op's plan recorded, if any.
     ///
-    /// Only [`UpdatePlan`] carries a [`PostCommitEffect`] field in v1 (the
-    /// `update` reindex caveat, ADR-099 D3): every other admissible verb's
-    /// apply is pure DML with no deferred side effect. `merge`'s existing
+    /// [`UpdatePlan`] carries a [`PostCommitEffect`] field for the `update`
+    /// reindex caveat (ADR-099 D3). Since the B3 fix round (GAP-5),
+    /// [`GtdTransitionPlan`]/[`GtdCompletePlan`] also carry one, for the
+    /// best-effort lifecycle audit row. Every other admissible verb's apply
+    /// is pure DML with no deferred side effect. `merge`'s existing
     /// post-transaction vector re-insert (D3: "merge already performs its
     /// vector re-insert after its transaction") is the handler's own
     /// pre-existing behavior outside this plan shape — [`MergePlan`] itself
@@ -117,6 +119,12 @@ impl AtomicOpPlan {
     fn post_commit_effect(&self) -> Option<PostCommitEffect> {
         match self {
             AtomicOpPlan::Update(p) if p.post_commit != PostCommitEffect::None => {
+                Some(p.post_commit.clone())
+            }
+            AtomicOpPlan::GtdTransition(p) if p.post_commit != PostCommitEffect::None => {
+                Some(p.post_commit.clone())
+            }
+            AtomicOpPlan::GtdComplete(p) if p.post_commit != PostCommitEffect::None => {
                 Some(p.post_commit.clone())
             }
             _ => None,

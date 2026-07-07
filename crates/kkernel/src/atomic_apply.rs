@@ -42,9 +42,13 @@ use chrono::Utc;
 use serde_json::{json, Value};
 use uuid::Uuid;
 
-use khive_pack_gtd::schema::{allowed_transitions, can_transition, is_actionable, is_terminal};
+use khive_pack_gtd::handlers::{ensure_audit_schema, write_audit_record};
+use khive_pack_gtd::schema::{
+    allowed_transitions, can_transition, is_actionable, is_terminal, is_valid_status,
+    normalize_status,
+};
 use khive_runtime::atomic_plan::{
-    AffectedRowGuard, GtdCompletePlan, GtdTransitionPlan, PlanStatement,
+    AffectedRowGuard, GtdCompletePlan, GtdTransitionPlan, PlanStatement, PostCommitEffect,
 };
 use khive_runtime::atomic_runner::{AtomicOpFailure, AtomicOpPlan, AtomicRunOutcome};
 use khive_runtime::{KhiveConfig, KhiveRuntime, NamespaceToken, RuntimeConfig};
@@ -125,6 +129,18 @@ pub(crate) async fn execute_atomic_ops_file(
     let total = ops.len();
     let envelope = match outcome {
         AtomicRunOutcome::Committed { post_commit } => {
+            // GAP-5 (B3 fix round 4): `GtdAudit` effects are applied HERE,
+            // not inside `khive_runtime::atomic_prepare::apply_post_commit_effects`
+            // (crate-direction: `khive-pack-gtd` depends on `khive-runtime`,
+            // not the other way around — that function treats `GtdAudit` as
+            // a no-op, see its match arm). `kkernel` already depends on both
+            // crates, so it calls the SAME canonical `ensure_audit_schema`/
+            // `write_audit_record` functions the non-atomic `gtd.transition`/
+            // `gtd.complete` handlers call, rather than re-deriving the
+            // DDL/INSERT. Best-effort: errors are logged inside those
+            // functions and never propagated — a missing audit row must
+            // never fail an already-committed atomic unit.
+            apply_gtd_audit_post_commit_effects(&runtime, &post_commit).await;
             khive_runtime::atomic_prepare::apply_post_commit_effects(&runtime, &token, post_commit)
                 .await
                 .context("post-commit reindex after atomic unit commit")?;
@@ -174,6 +190,41 @@ pub(crate) async fn execute_atomic_ops_file(
     };
 
     Ok(envelope)
+}
+
+/// Apply every [`PostCommitEffect::GtdAudit`] in `effects` by calling the
+/// SAME `ensure_audit_schema`/`write_audit_record` functions the canonical
+/// `handle_transition`/`handle_complete` handlers call (GAP-5, B3 fix round
+/// 4). Lives in `kkernel` rather than `khive-runtime::atomic_prepare`
+/// because those two functions are owned by `khive-pack-gtd`, which
+/// depends on `khive-runtime` — not the other way around; `kkernel` is the
+/// first crate in the dependency graph that can see both. Non-`GtdAudit`
+/// effects are ignored here (they are `khive_runtime::atomic_prepare::
+/// apply_post_commit_effects`'s job, called separately). Best-effort by
+/// construction: both callee functions log-and-swallow their own errors, so
+/// this function itself cannot fail.
+async fn apply_gtd_audit_post_commit_effects(runtime: &KhiveRuntime, effects: &[PostCommitEffect]) {
+    for effect in effects {
+        if let PostCommitEffect::GtdAudit {
+            task_id,
+            from_status,
+            to_status,
+            note,
+            namespace,
+        } = effect
+        {
+            ensure_audit_schema(runtime).await;
+            write_audit_record(
+                runtime,
+                *task_id,
+                from_status,
+                to_status,
+                note.as_deref(),
+                namespace,
+            )
+            .await;
+        }
+    }
 }
 
 fn describe_failure(failure: &AtomicOpFailure) -> String {
@@ -281,7 +332,22 @@ async fn prepare_gtd_transition(
     args: &Value,
 ) -> anyhow::Result<AtomicOpPlan> {
     let id = require_uuid(args, "id")?;
-    let target = require_str(args, "status")?;
+    let raw_status = require_str(args, "status")?;
+
+    // GAP-3 (B3 fix round 4): parity with `handle_transition`
+    // (handlers.rs:980-987) — normalize aliases (finished/completed->done,
+    // in_progress->active, todo->inbox, blocked->waiting, later->someday,
+    // ...) and reject an unknown status BEFORE any DB read/write. The
+    // pre-fix atomic prepare ran `can_transition` on the raw, unnormalized
+    // string with no `is_valid_status` gate at all.
+    let target = normalize_status(raw_status);
+    if !is_valid_status(target) {
+        anyhow::bail!(
+            "invalid status {raw_status:?} — valid: inbox, next, waiting, someday, active, done, \
+             cancelled (aliases: in_progress, todo, blocked, later, finished)"
+        );
+    }
+
     let note_arg = args
         .as_object()
         .and_then(|o| o.get("note"))
@@ -297,10 +363,26 @@ async fn prepare_gtd_transition(
     let note = load_task(runtime, token, id).await?;
     let current = task_status(note.properties.as_ref());
 
+    // GAP-6 (B3 fix round 4): parity with `handle_transition`
+    // (handlers.rs:995-1005) — an idempotent transition (current == target
+    // after normalization) is checked BEFORE the terminal-state guard and
+    // performs NO write and NO audit row, exactly mirroring canonical's
+    // early return. The pre-fix atomic prepare only special-cased
+    // `current != target` inside the `can_transition` check, so a
+    // current==target call fell through to an unconditional (and
+    // unnecessary) `UPDATE`.
+    if current == target {
+        return Ok(AtomicOpPlan::GtdTransition(GtdTransitionPlan {
+            task_id: id,
+            statements: vec![],
+            post_commit: PostCommitEffect::None,
+        }));
+    }
+
     if is_terminal(&current) {
         anyhow::bail!("task {id} is in terminal state {current:?}; no further transitions allowed");
     }
-    if current != target && !can_transition(&current, target) {
+    if !can_transition(&current, target) {
         let allowed = allowed_transitions(&current);
         anyhow::bail!(
             "cannot transition from {current:?} to {target:?}; allowed from {current:?}: {}",
@@ -335,7 +417,7 @@ async fn prepare_gtd_transition(
             SqlValue::Text(serde_json::to_string(&props)?),
             SqlValue::Integer(updated_at),
             SqlValue::Text(id.to_string()),
-            SqlValue::Text(current),
+            SqlValue::Text(current.clone()),
         ],
         label: Some("atomic-gtd-transition".to_string()),
     };
@@ -346,6 +428,15 @@ async fn prepare_gtd_transition(
             statement,
             guard: Some(AffectedRowGuard::exactly(1)),
         }],
+        // GAP-5 (B3 fix round 4): mirrors handlers.rs:1062-1071's
+        // best-effort `write_audit_record` call.
+        post_commit: PostCommitEffect::GtdAudit {
+            task_id: id,
+            from_status: current,
+            to_status: target.to_string(),
+            note: note_arg.map(str::to_string),
+            namespace: token.namespace().as_str().to_string(),
+        },
     }))
 }
 
@@ -404,7 +495,7 @@ async fn prepare_gtd_complete(
             SqlValue::Text(serde_json::to_string(&props)?),
             SqlValue::Integer(updated_at),
             SqlValue::Text(id.to_string()),
-            SqlValue::Text(current),
+            SqlValue::Text(current.clone()),
         ],
         label: Some("atomic-gtd-complete".to_string()),
     };
@@ -415,6 +506,16 @@ async fn prepare_gtd_complete(
             statement,
             guard: Some(AffectedRowGuard::exactly(1)),
         }],
+        // GAP-5 (B3 fix round 4): mirrors handlers.rs:873-883's best-effort
+        // `write_audit_record` call — `complete` never persists a
+        // transition note (canonical passes `None`).
+        post_commit: PostCommitEffect::GtdAudit {
+            task_id: id,
+            from_status: current,
+            to_status: target.to_string(),
+            note: None,
+            namespace: token.namespace().as_str().to_string(),
+        },
     }))
 }
 
@@ -619,6 +720,203 @@ mod tests {
         assert_eq!(
             props.get("result").and_then(|v| v.as_str()),
             Some("shipped clean")
+        );
+    }
+
+    /// GAP-3 (B3 fix round 4): atomic `gtd.transition(status="finished")`
+    /// on an active task must SUCCEED with the alias normalized to "done"
+    /// — parity with the `normalize_status`/`is_valid_status` gate in
+    /// `handle_transition` (handlers.rs:980-987). The pre-fix atomic
+    /// prepare ran `can_transition` on the raw unnormalized string, which
+    /// rejects "finished" outright (it is not itself a lifecycle state
+    /// name).
+    #[tokio::test]
+    async fn atomic_gtd_transition_normalizes_status_alias() {
+        let runtime = scratch_runtime();
+        let token = runtime
+            .authorize(Namespace::parse("local").expect("ns"))
+            .expect("authorize");
+        let task_id = seed_task(&runtime, &token, "active").await;
+
+        let plan = prepare_gtd_transition(
+            &runtime,
+            &token,
+            &json!({"id": task_id.to_string(), "status": "finished"}),
+        )
+        .await
+        .expect("prepare transition with aliased status must succeed");
+
+        let outcome =
+            khive_runtime::atomic_runner::run_atomic_unit(runtime.sql().as_ref(), vec![plan])
+                .await
+                .expect("commit ok");
+        assert!(matches!(outcome, AtomicRunOutcome::Committed { .. }));
+
+        let note = runtime
+            .notes(&token)
+            .expect("notes store")
+            .get_note(task_id)
+            .await
+            .expect("get_note")
+            .expect("task must still exist");
+        assert_eq!(
+            task_properties(&note)
+                .get("status")
+                .and_then(|v| v.as_str()),
+            Some("done"),
+            "the \"finished\" alias must normalize to \"done\", parity with canonical"
+        );
+    }
+
+    /// GAP-6 (B3 fix round 4): an idempotent `gtd.transition` (current ==
+    /// target after `normalize_status`) must perform NO write — parity with
+    /// `handle_transition`'s early return (handlers.rs:995-1005). The
+    /// pre-fix atomic prepare only special-cased `current != target` inside
+    /// its `can_transition` guard, so a current==target call fell through
+    /// to an unconditional `UPDATE` that bumped `updated_at` for nothing.
+    #[tokio::test]
+    async fn atomic_gtd_transition_idempotent_noop_performs_no_write() {
+        let runtime = scratch_runtime();
+        let token = runtime
+            .authorize(Namespace::parse("local").expect("ns"))
+            .expect("authorize");
+        let task_id = seed_task(&runtime, &token, "next").await;
+
+        let before = runtime
+            .notes(&token)
+            .expect("notes store")
+            .get_note(task_id)
+            .await
+            .expect("get_note")
+            .expect("task must exist");
+        let updated_at_before = before.updated_at;
+
+        let plan = prepare_gtd_transition(
+            &runtime,
+            &token,
+            &json!({"id": task_id.to_string(), "status": "next"}),
+        )
+        .await
+        .expect("prepare idempotent transition must succeed (no-op, not an error)");
+
+        let outcome =
+            khive_runtime::atomic_runner::run_atomic_unit(runtime.sql().as_ref(), vec![plan])
+                .await
+                .expect("commit ok");
+        let post_commit = match outcome {
+            AtomicRunOutcome::Committed { post_commit } => post_commit,
+            other => panic!("idempotent no-op must still succeed as Committed, got {other:?}"),
+        };
+        assert!(
+            post_commit.is_empty(),
+            "an idempotent no-op transition must produce no post-commit effect (no audit row \
+             either — canonical never reaches its own write_audit_record call): {post_commit:?}"
+        );
+
+        let after = runtime
+            .notes(&token)
+            .expect("notes store")
+            .get_note(task_id)
+            .await
+            .expect("get_note")
+            .expect("task must still exist");
+        assert_eq!(
+            after.updated_at, updated_at_before,
+            "an idempotent transition must not touch updated_at — no write happened"
+        );
+    }
+
+    /// GAP-5 (B3 fix round 4): a committed atomic `gtd.transition` AND a
+    /// committed atomic `gtd.complete` must each write a
+    /// `gtd_lifecycle_audit` row — parity with `handle_transition`/
+    /// `handle_complete`'s best-effort `ensure_audit_schema` +
+    /// `write_audit_record` calls (handlers.rs:1062-1071, :873-883). The
+    /// pre-fix atomic prepare wrote no audit row at all.
+    #[tokio::test]
+    async fn atomic_gtd_transition_and_complete_write_lifecycle_audit_rows() {
+        let runtime = scratch_runtime();
+        let token = runtime
+            .authorize(Namespace::parse("local").expect("ns"))
+            .expect("authorize");
+
+        // (a) transition inbox -> next, with a transition note.
+        let transition_task = seed_task(&runtime, &token, "inbox").await;
+        let plan = prepare_gtd_transition(
+            &runtime,
+            &token,
+            &json!({"id": transition_task.to_string(), "status": "next", "note": "audit me"}),
+        )
+        .await
+        .expect("prepare transition");
+        let outcome =
+            khive_runtime::atomic_runner::run_atomic_unit(runtime.sql().as_ref(), vec![plan])
+                .await
+                .expect("commit ok");
+        let post_commit = match outcome {
+            AtomicRunOutcome::Committed { post_commit } => post_commit,
+            other => panic!("expected Committed, got {other:?}"),
+        };
+        apply_gtd_audit_post_commit_effects(&runtime, &post_commit).await;
+
+        // (b) complete next -> done.
+        let complete_task = seed_task(&runtime, &token, "next").await;
+        let plan = prepare_gtd_complete(
+            &runtime,
+            &token,
+            &json!({"id": complete_task.to_string(), "result": "shipped"}),
+        )
+        .await
+        .expect("prepare complete");
+        let outcome =
+            khive_runtime::atomic_runner::run_atomic_unit(runtime.sql().as_ref(), vec![plan])
+                .await
+                .expect("commit ok");
+        let post_commit = match outcome {
+            AtomicRunOutcome::Committed { post_commit } => post_commit,
+            other => panic!("expected Committed, got {other:?}"),
+        };
+        apply_gtd_audit_post_commit_effects(&runtime, &post_commit).await;
+
+        let mut reader = runtime.sql().reader().await.expect("reader");
+        let rows = reader
+            .query_all(SqlStatement {
+                sql: "SELECT note_id, from_state, to_state, namespace FROM gtd_lifecycle_audit \
+                      ORDER BY at ASC"
+                    .to_string(),
+                params: vec![],
+                label: Some("test-gtd-audit-rows".to_string()),
+            })
+            .await
+            .expect("query gtd_lifecycle_audit");
+        assert_eq!(
+            rows.len(),
+            2,
+            "both the transition and the complete must each write exactly one audit row: {rows:?}"
+        );
+
+        let transition_task_str = transition_task.to_string();
+        let complete_task_str = complete_task.to_string();
+
+        let transition_row_present = rows.iter().any(|r| {
+            matches!(r.get("note_id"), Some(SqlValue::Text(id)) if id == &transition_task_str)
+                && matches!(r.get("from_state"), Some(SqlValue::Text(s)) if s == "inbox")
+                && matches!(r.get("to_state"), Some(SqlValue::Text(s)) if s == "next")
+                && matches!(r.get("namespace"), Some(SqlValue::Text(ns)) if ns == "local")
+        });
+        assert!(
+            transition_row_present,
+            "expected an audit row for the transition op: {rows:?}"
+        );
+
+        let complete_row_present = rows.iter().any(|r| {
+            matches!(r.get("note_id"), Some(SqlValue::Text(id)) if id == &complete_task_str)
+                && matches!(r.get("from_state"), Some(SqlValue::Text(s)) if s == "next")
+                && matches!(r.get("to_state"), Some(SqlValue::Text(s)) if s == "done")
+                && matches!(r.get("namespace"), Some(SqlValue::Text(ns)) if ns == "local")
+        });
+        assert!(
+            complete_row_present,
+            "expected an audit row for the complete op: {rows:?}"
         );
     }
 }

@@ -40,7 +40,16 @@ use crate::GtdPack;
 /// `OnceLock`, because each `KhiveRuntime::memory()` in tests creates a fresh
 /// in-memory database that needs its own schema bootstrap.  In production the
 /// DDL is idempotent and cheap (SQLite skips `IF NOT EXISTS` tables instantly).
-async fn ensure_audit_schema(runtime: &KhiveRuntime) {
+/// `pub` (rather than the module-private visibility every other helper in
+/// this file uses): the ADR-099 `--atomic` CLI surface's `gtd.transition`/
+/// `gtd.complete` prepare functions live in `kkernel` (a crate that already
+/// depends on both `khive-runtime` and `khive-pack-gtd` — see that crate's
+/// `atomic_apply` module doc for the crate-direction rationale), and the B3
+/// fix round (GAP-5) applies this exact function as a deferred post-commit
+/// effect so atomic transitions/completes write the same best-effort
+/// lifecycle audit row the canonical handlers do, rather than re-deriving
+/// the DDL/INSERT here a second time.
+pub async fn ensure_audit_schema(runtime: &KhiveRuntime) {
     let Ok(mut w) = runtime.sql().writer().await else {
         tracing::warn!("gtd: failed to acquire SQL writer for audit schema (non-fatal)");
         return;
@@ -91,7 +100,11 @@ async fn ensure_audit_schema(runtime: &KhiveRuntime) {
 ///
 /// Best-effort: failures are logged and swallowed.  The note's successful
 /// write has already happened; a missing audit row is degraded, not a failure.
-async fn write_audit_record(
+///
+/// `pub` for the same reason as `ensure_audit_schema` above — the ADR-099
+/// `--atomic` surface's `kkernel`-side post-commit pass calls this directly
+/// (B3 fix round, GAP-5) rather than re-deriving the INSERT.
+pub async fn write_audit_record(
     runtime: &KhiveRuntime,
     note_id: Uuid,
     from: &str,

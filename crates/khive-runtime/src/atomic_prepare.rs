@@ -276,14 +276,101 @@ fn prepare_governance_unimplemented(tool: &str) -> RuntimeResult<AtomicOpPlan> {
 // update
 // ---------------------------------------------------------------------------
 
+/// Mirrors `khive-pack-kg::handlers::update::reject_inapplicable_fields`
+/// (GAP-4, B3 fix round 4): a hard `InvalidInput` when a caller passes a
+/// field that does not apply to the resolved substrate (e.g. `salience` on
+/// an entity, or `description`/`tags` on a note). That function is
+/// `pub(crate)` to a sibling crate with no dependency edge back to
+/// `khive-runtime` (`khive-pack-kg` depends on `khive-runtime`, not the
+/// other way around), so its exact field-applicability check list and error
+/// message shape are reimplemented here rather than imported — same pattern
+/// as `optional_string_patch` above. Presence is checked directly on the raw
+/// args object (this module has no `UpdateParams` struct); a JSON `null`
+/// value is treated as absent, matching `Option<T>` deserialization
+/// semantics for the fields update.rs's checklist covers.
+fn reject_inapplicable_update_fields(args: &Value, substrate: &str) -> RuntimeResult<()> {
+    let o = obj(args)?;
+    let present = |k: &str| o.get(k).is_some_and(|v| !v.is_null());
+    let (bad_field, valid): (Option<&str>, &str) = match substrate {
+        "entity" => {
+            let bad = if present("content") {
+                Some("content")
+            } else if present("salience") {
+                Some("salience")
+            } else if present("decay_factor") {
+                Some("decay_factor")
+            } else if present("relation") {
+                Some("relation")
+            } else if present("weight") {
+                Some("weight")
+            } else {
+                None
+            };
+            (bad, "name, description, tags, properties")
+        }
+        "note" => {
+            let bad = if present("description") {
+                Some("description")
+            } else if present("tags") {
+                Some("tags")
+            } else if present("relation") {
+                Some("relation")
+            } else if present("weight") {
+                Some("weight")
+            } else {
+                None
+            };
+            (bad, "name, content, salience, decay_factor, properties")
+        }
+        _ => (None, ""),
+    };
+    if let Some(field) = bad_field {
+        let substrate_label = match substrate {
+            "entity" => "an entity",
+            "note" => "a note",
+            other => other,
+        };
+        return Err(RuntimeError::InvalidInput(format!(
+            "field '{field}' is not valid for {substrate_label}; valid fields: {valid}"
+        )));
+    }
+    Ok(())
+}
+
 async fn prepare_update(
     runtime: &KhiveRuntime,
     token: &NamespaceToken,
     args: &Value,
 ) -> RuntimeResult<AtomicOpPlan> {
     let id = require_uuid(args, "id")?;
+
+    // GAP-4 (B3 fix round 4): mirrors update.rs's entity_kind immutability
+    // guard (update.rs:160-164), which the pre-fix atomic prepare never
+    // checked at all — entity_kind is a legacy top-level field, independent
+    // of the `kind` substrate discriminator handled elsewhere.
+    if obj(args)?.get("entity_kind").is_some_and(|v| !v.is_null()) {
+        return Err(RuntimeError::InvalidInput(
+            "entity_kind is immutable; to change kind, delete then re-create the entity, \
+             or use merge() if this is a deduplication correction"
+                .into(),
+        ));
+    }
+
+    // NOTE (GAP-4 scope, B3 fix round 4): update.rs also rejects a caller-
+    // supplied `kind=<specific>` that contradicts the resolved substrate's
+    // ACTUAL kind (update.rs:200-201, :229-234) with a `NotFound`. That
+    // check depends on `VerbRegistry::all_entity_kinds()`/
+    // `all_note_kinds()` (every loaded pack's granular vocab) and pack-
+    // private `EntityKind`/`NoteKind` parsing — neither is reachable from
+    // `khive-runtime` without either threading the registry through this
+    // call or duplicating pack-private vocab here, and no acceptance test
+    // in this fix round exercises it. Deferred, not silently dropped: the
+    // field-applicability rejection immediately below (the MAJOR-severity
+    // half of GAP-4 — a spurious no-op reported as success) is implemented
+    // in full.
     match runtime.resolve_by_id(token, id).await? {
         Some(Resolved::Entity(entity)) => {
+            reject_inapplicable_update_fields(args, "entity")?;
             let name = optional_str(args, "name").map(|s| s.to_string());
             let description = optional_string_patch(args, "description")?;
             let properties = obj(args)?.get("properties").cloned();
@@ -366,6 +453,7 @@ async fn prepare_update(
             }))
         }
         Some(Resolved::Note(note)) => {
+            reject_inapplicable_update_fields(args, "note")?;
             let name = optional_string_patch(args, "name")?;
             let content = optional_str(args, "content").map(|s| s.to_string());
             let properties = obj(args)?.get("properties").cloned();
@@ -697,6 +785,20 @@ async fn prepare_link(
     let now = chrono::Utc::now().timestamp_micros();
     let metadata_str = metadata.map(|m| serde_json::to_string(&m).unwrap_or_default());
 
+    // GAP-2 (B3 fix round 4): a plain `INSERT` here rejects a re-link of an
+    // already-linked (or soft-deleted) triple with a `graph_edges`
+    // `UNIQUE(namespace, source_id, target_id, relation)` violation, rolling
+    // back the whole atomic unit. Canonical `link` -> `upsert_edge`
+    // (`khive-db/src/stores/graph.rs`, natural-key `ON CONFLICT` arm) instead
+    // upserts: it updates `weight`/`updated_at`/`metadata` and resurrects
+    // `deleted_at = NULL`. The `ON CONFLICT` arm below mirrors that natural-key
+    // arm's exact `SET` list (it intentionally does NOT touch
+    // `target_backend`, which this atomic INSERT never populates in the
+    // first place — that column is left untouched on conflict rather than
+    // reset to NULL). SQLite accepts `INSERT ... SELECT ... WHERE ... ON
+    // CONFLICT ... DO UPDATE`; the guarded `exactly(1)` check below still
+    // holds for both the fresh-insert and the upsert-update outcome, and
+    // still correctly reports 0 affected rows when an endpoint is missing.
     let statement = SqlStatement {
         sql: "INSERT INTO graph_edges \
               (namespace, id, source_id, target_id, relation, weight, created_at, updated_at, metadata) \
@@ -704,7 +806,12 @@ async fn prepare_link(
               WHERE (EXISTS (SELECT 1 FROM entities WHERE id = ?3 AND deleted_at IS NULL) \
                      OR EXISTS (SELECT 1 FROM notes WHERE id = ?3 AND deleted_at IS NULL)) \
                 AND (EXISTS (SELECT 1 FROM entities WHERE id = ?4 AND deleted_at IS NULL) \
-                     OR EXISTS (SELECT 1 FROM notes WHERE id = ?4 AND deleted_at IS NULL))"
+                     OR EXISTS (SELECT 1 FROM notes WHERE id = ?4 AND deleted_at IS NULL)) \
+              ON CONFLICT(namespace, source_id, target_id, relation) DO UPDATE SET \
+                  weight = excluded.weight, \
+                  updated_at = excluded.updated_at, \
+                  deleted_at = NULL, \
+                  metadata = excluded.metadata"
             .to_string(),
         params: vec![
             SqlValue::Text(namespace),
@@ -848,6 +955,14 @@ pub async fn apply_post_commit_effects(
                     runtime.reindex_note(token, &note).await?;
                 }
             }
+            PostCommitEffect::GtdAudit { .. } => {
+                // GAP-5 (B3 fix round 4): applied by the `kkernel` caller's
+                // own post-commit pass, not here — `khive-pack-gtd` (owner
+                // of `ensure_audit_schema`/`write_audit_record`) depends on
+                // `khive-runtime`, not the other way around, so this crate
+                // cannot act on the effect itself. See `PostCommitEffect::
+                // GtdAudit`'s doc comment.
+            }
         }
     }
     Ok(())
@@ -919,6 +1034,115 @@ mod tests {
         .expect("runtime");
         std::mem::forget(dir);
         rt
+    }
+
+    /// GAP-4 (B3 fix round 4): atomic `update` must reject a field that
+    /// does not apply to the resolved substrate — parity with
+    /// `khive-pack-kg::handlers::update::reject_inapplicable_fields`
+    /// (update.rs:195). The pre-fix atomic prepare silently ignored
+    /// `salience` on an entity: it would set every entity field to its
+    /// CURRENT value, bump `updated_at`, satisfy the `exactly(1)` guard,
+    /// and commit — a spurious no-op reported as success.
+    #[tokio::test]
+    async fn atomic_update_entity_rejects_note_only_field_salience() {
+        let runtime = scratch_runtime();
+        let token = runtime
+            .authorize(Namespace::parse("local").expect("ns"))
+            .expect("authorize");
+        let entity = khive_storage::Entity::new("local", "concept", "GapFourEntity");
+        let entity_id = entity.id;
+        runtime
+            .entities(&token)
+            .expect("entities store")
+            .upsert_entity(entity)
+            .await
+            .expect("seed entity");
+
+        let err = prepare_update(
+            &runtime,
+            &token,
+            &json!({"id": entity_id.to_string(), "salience": 0.9}),
+        )
+        .await
+        .expect_err("salience on an entity must be rejected, not silently accepted");
+        assert!(
+            matches!(err, RuntimeError::InvalidInput(ref msg) if msg.contains("salience") && msg.contains("not valid for an entity")),
+            "expected an InvalidInput naming the offending field, got: {err:?}"
+        );
+
+        // A valid entity update (name/description/tags) must still work.
+        let plan = prepare_update(
+            &runtime,
+            &token,
+            &json!({
+                "id": entity_id.to_string(),
+                "name": "GapFourEntity-renamed",
+                "description": "updated description",
+                "tags": ["a", "b"],
+            }),
+        )
+        .await
+        .expect("a valid entity field set must still be accepted");
+        let outcome = crate::atomic_runner::run_atomic_unit(runtime.sql().as_ref(), vec![plan])
+            .await
+            .expect("seam call ok");
+        assert!(matches!(
+            outcome,
+            crate::atomic_runner::AtomicRunOutcome::Committed { .. }
+        ));
+        let entity = runtime
+            .get_entity(&token, entity_id)
+            .await
+            .expect("get_entity");
+        assert_eq!(entity.name, "GapFourEntity-renamed");
+    }
+
+    /// GAP-4 (B3 fix round 4): symmetric note-substrate case — `description`
+    /// and `tags` are entity-only fields; passing either for a note must be
+    /// rejected the same way update.rs rejects them.
+    #[tokio::test]
+    async fn atomic_update_note_rejects_entity_only_field_description() {
+        let runtime = scratch_runtime();
+        let token = runtime
+            .authorize(Namespace::parse("local").expect("ns"))
+            .expect("authorize");
+        let mut note = khive_storage::note::Note::new("local", "observation", "gap-4 note content");
+        note.name = Some("gap-four-note".to_string());
+        let note_id = note.id;
+        runtime
+            .notes(&token)
+            .expect("notes store")
+            .upsert_note(note)
+            .await
+            .expect("seed note");
+
+        let err = prepare_update(
+            &runtime,
+            &token,
+            &json!({"id": note_id.to_string(), "description": "entities have descriptions, notes don't"}),
+        )
+        .await
+        .expect_err("description on a note must be rejected, not silently accepted");
+        assert!(
+            matches!(err, RuntimeError::InvalidInput(ref msg) if msg.contains("description") && msg.contains("not valid for a note")),
+            "expected an InvalidInput naming the offending field, got: {err:?}"
+        );
+
+        // A valid note update (content) must still work.
+        let plan = prepare_update(
+            &runtime,
+            &token,
+            &json!({"id": note_id.to_string(), "content": "gap-4 note content, revised"}),
+        )
+        .await
+        .expect("a valid note field must still be accepted");
+        let outcome = crate::atomic_runner::run_atomic_unit(runtime.sql().as_ref(), vec![plan])
+            .await
+            .expect("seam call ok");
+        assert!(matches!(
+            outcome,
+            crate::atomic_runner::AtomicRunOutcome::Committed { .. }
+        ));
     }
 
     /// ADR-099 B3 acceptance test 3: updating a note's content inside an
@@ -1236,6 +1460,243 @@ mod tests {
                 "inferred dependency_kind for (service, service) must persist: {json_str}"
             );
         }
+    }
+
+    /// Raw natural-key probe of `graph_edges` (namespace, source_id,
+    /// target_id, relation) — returns `(weight, metadata_json, deleted_at)`
+    /// for exactly the ONE row a UNIQUE(namespace, source_id, target_id,
+    /// relation) constraint permits. `None` means no row at all.
+    async fn probe_edge_natural_key(
+        runtime: &KhiveRuntime,
+        namespace: &str,
+        source_id: Uuid,
+        target_id: Uuid,
+        relation: &str,
+    ) -> (usize, Option<f64>, Option<String>, Option<i64>) {
+        let mut reader = runtime.sql().reader().await.expect("reader");
+        let rows = reader
+            .query_all(SqlStatement {
+                sql: "SELECT weight, metadata, deleted_at FROM graph_edges \
+                      WHERE namespace = ?1 AND source_id = ?2 AND target_id = ?3 AND relation = ?4"
+                    .to_string(),
+                params: vec![
+                    SqlValue::Text(namespace.to_string()),
+                    SqlValue::Text(source_id.to_string()),
+                    SqlValue::Text(target_id.to_string()),
+                    SqlValue::Text(relation.to_string()),
+                ],
+                label: Some("test-probe-edge-natural-key".to_string()),
+            })
+            .await
+            .expect("probe edge natural key");
+        let count = rows.len();
+        let Some(row) = rows.into_iter().next() else {
+            return (count, None, None, None);
+        };
+        let weight = match row.get("weight") {
+            Some(SqlValue::Float(f)) => Some(*f),
+            Some(SqlValue::Integer(i)) => Some(*i as f64),
+            _ => None,
+        };
+        let metadata = match row.get("metadata") {
+            Some(SqlValue::Text(s)) => Some(s.clone()),
+            _ => None,
+        };
+        let deleted_at = match row.get("deleted_at") {
+            Some(SqlValue::Integer(i)) => Some(*i),
+            _ => None,
+        };
+        (count, weight, metadata, deleted_at)
+    }
+
+    /// GAP-2 (B3 fix round 4): atomic `link` must be an upsert, exactly like
+    /// canonical `link` -> `upsert_edge`'s natural-key `ON CONFLICT` arm —
+    /// re-linking an already-linked triple must SUCCEED and update
+    /// weight/metadata, not hit the `UNIQUE(namespace, source_id, target_id,
+    /// relation)` constraint and roll back the whole atomic unit.
+    #[tokio::test]
+    async fn atomic_link_of_already_linked_triple_upserts_weight_and_metadata() {
+        let runtime = scratch_runtime();
+        let token = runtime
+            .authorize(Namespace::parse("local").expect("ns"))
+            .expect("authorize");
+        let entities = runtime.entities(&token).expect("entities store");
+
+        let a = khive_storage::Entity::new("local", "concept", "GapTwoA");
+        let b = khive_storage::Entity::new("local", "concept", "GapTwoB");
+        let (a_id, b_id) = (a.id, b.id);
+        entities.upsert_entity(a).await.expect("seed a");
+        entities.upsert_entity(b).await.expect("seed b");
+
+        // (a) a fresh link still works.
+        let plan1 = prepare_link(
+            &runtime,
+            &token,
+            &json!({
+                "source_id": a_id.to_string(),
+                "target_id": b_id.to_string(),
+                "relation": "extends",
+                "weight": 0.5,
+            }),
+        )
+        .await
+        .expect("prepare first link");
+        let outcome1 = crate::atomic_runner::run_atomic_unit(runtime.sql().as_ref(), vec![plan1])
+            .await
+            .expect("seam call ok");
+        assert!(
+            matches!(
+                outcome1,
+                crate::atomic_runner::AtomicRunOutcome::Committed { .. }
+            ),
+            "fresh link must commit: {outcome1:?}"
+        );
+        let (count, weight, _metadata, deleted_at) =
+            probe_edge_natural_key(&runtime, "local", a_id, b_id, "extends").await;
+        assert_eq!(count, 1, "exactly one edge row after the fresh link");
+        assert_eq!(weight, Some(0.5));
+        assert!(deleted_at.is_none());
+
+        // (b) re-linking the SAME triple with a different weight/metadata
+        // must SUCCEED (not a constraint-violation rollback) and UPDATE the
+        // existing row in place — natural key stays unique.
+        let plan2 = prepare_link(
+            &runtime,
+            &token,
+            &json!({
+                "source_id": a_id.to_string(),
+                "target_id": b_id.to_string(),
+                "relation": "extends",
+                "weight": 0.9,
+                "metadata": {"note": "relinked"},
+            }),
+        )
+        .await
+        .expect("prepare second link");
+        let outcome2 = crate::atomic_runner::run_atomic_unit(runtime.sql().as_ref(), vec![plan2])
+            .await
+            .expect("seam call ok");
+        assert!(
+            matches!(
+                outcome2,
+                crate::atomic_runner::AtomicRunOutcome::Committed { .. }
+            ),
+            "re-link of an already-linked triple must upsert, not roll back: {outcome2:?}"
+        );
+        let (count, weight, metadata, deleted_at) =
+            probe_edge_natural_key(&runtime, "local", a_id, b_id, "extends").await;
+        assert_eq!(
+            count, 1,
+            "the natural-key UNIQUE constraint must still hold exactly one row (upsert, not a second insert)"
+        );
+        assert_eq!(weight, Some(0.9), "weight must be updated to the new value");
+        assert!(
+            metadata
+                .as_deref()
+                .is_some_and(|m| m.contains(r#""note":"relinked""#)),
+            "metadata must be updated to the new value: {metadata:?}"
+        );
+        assert!(deleted_at.is_none());
+    }
+
+    /// GAP-2 (B3 fix round 4): atomic `link` of a SOFT-DELETED triple must
+    /// resurrect it (`deleted_at = NULL`), matching `upsert_edge`'s
+    /// natural-key `ON CONFLICT ... DO UPDATE SET deleted_at = NULL`.
+    #[tokio::test]
+    async fn atomic_link_of_soft_deleted_triple_resurrects_it() {
+        let runtime = scratch_runtime();
+        let token = runtime
+            .authorize(Namespace::parse("local").expect("ns"))
+            .expect("authorize");
+        let entities = runtime.entities(&token).expect("entities store");
+
+        let a = khive_storage::Entity::new("local", "concept", "GapTwoResurrectA");
+        let b = khive_storage::Entity::new("local", "concept", "GapTwoResurrectB");
+        let (a_id, b_id) = (a.id, b.id);
+        entities.upsert_entity(a).await.expect("seed a");
+        entities.upsert_entity(b).await.expect("seed b");
+
+        let plan = prepare_link(
+            &runtime,
+            &token,
+            &json!({
+                "source_id": a_id.to_string(),
+                "target_id": b_id.to_string(),
+                "relation": "extends",
+            }),
+        )
+        .await
+        .expect("prepare link");
+        let outcome = crate::atomic_runner::run_atomic_unit(runtime.sql().as_ref(), vec![plan])
+            .await
+            .expect("seam call ok");
+        assert!(matches!(
+            outcome,
+            crate::atomic_runner::AtomicRunOutcome::Committed { .. }
+        ));
+
+        // Soft-delete the edge row directly (natural-key UPDATE — mirrors
+        // what `delete_edge(hard=false)` does to this same row).
+        {
+            let mut writer = runtime.sql().writer().await.expect("writer");
+            let affected = writer
+                .execute(SqlStatement {
+                    sql: "UPDATE graph_edges SET deleted_at = ?1 \
+                          WHERE namespace = ?2 AND source_id = ?3 AND target_id = ?4 AND relation = ?5"
+                        .to_string(),
+                    params: vec![
+                        SqlValue::Integer(chrono::Utc::now().timestamp_micros()),
+                        SqlValue::Text("local".to_string()),
+                        SqlValue::Text(a_id.to_string()),
+                        SqlValue::Text(b_id.to_string()),
+                        SqlValue::Text("extends".to_string()),
+                    ],
+                    label: Some("test-soft-delete-edge".to_string()),
+                })
+                .await
+                .expect("soft delete edge");
+            assert_eq!(affected, 1, "soft-delete must touch exactly the seeded row");
+        }
+        let (_, _, _, deleted_at) =
+            probe_edge_natural_key(&runtime, "local", a_id, b_id, "extends").await;
+        assert!(
+            deleted_at.is_some(),
+            "row must be soft-deleted before the resurrect attempt"
+        );
+
+        // Re-link the same triple: must resurrect (deleted_at -> NULL), not
+        // fail on the UNIQUE constraint of the still-present soft-deleted row.
+        let plan_relink = prepare_link(
+            &runtime,
+            &token,
+            &json!({
+                "source_id": a_id.to_string(),
+                "target_id": b_id.to_string(),
+                "relation": "extends",
+                "weight": 0.75,
+            }),
+        )
+        .await
+        .expect("prepare resurrecting link");
+        let outcome_relink =
+            crate::atomic_runner::run_atomic_unit(runtime.sql().as_ref(), vec![plan_relink])
+                .await
+                .expect("seam call ok");
+        assert!(
+            matches!(
+                outcome_relink,
+                crate::atomic_runner::AtomicRunOutcome::Committed { .. }
+            ),
+            "re-linking a soft-deleted triple must resurrect it, not roll back: {outcome_relink:?}"
+        );
+        let (count, weight, _, deleted_at) =
+            probe_edge_natural_key(&runtime, "local", a_id, b_id, "extends").await;
+        assert_eq!(count, 1);
+        assert_eq!(weight, Some(0.75));
+        assert!(
+            deleted_at.is_none(),
+            "re-link must resurrect the soft-deleted row (deleted_at -> NULL)"
+        );
     }
 
     /// B3 fix round 3 (codex r2 Blocker 1): atomic delete of an entity AND a
