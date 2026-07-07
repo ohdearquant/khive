@@ -634,3 +634,49 @@ care; alert pipelines do.
 - Open Policy Agent: https://www.openpolicyagent.org/
 - Rego policy language: https://www.openpolicyagent.org/docs/latest/policy-language/
 - `regorus` Rust engine: https://github.com/microsoft/regorus
+
+---
+
+## Amendment 1 (2026-07-07) — Canonical Verb Identity in `GateRequest`
+
+### Context
+
+`GateRequest` is constructed from the raw wire verb at the dispatch site
+(`crates/khive-runtime/src/pack.rs`), before the registry resolves which pack owns
+that verb. The wire surface accepts bare aliases for some verbs (for example, bare
+`create` for `kg.create`) alongside fully-qualified `pack.verb` forms. A policy
+authored against the canonical `pack.verb` id — for example, a rule denying
+`kg.delete` — has no defined relationship to a wire call using the bare alias,
+because nothing canonicalizes the verb before it reaches the gate. The
+canonicalization step does not exist on the pre-gate path today.
+
+Any policy layer built on top of `GateRequest.verb` inherits this gap as an
+alias-bypass vulnerability: a deny rule written against the canonical id can be
+missed by a request using the alias form.
+
+### Decision
+
+1. A single, registry-backed canonicalization function resolves a wire verb to its
+   registered `pack.verb` id. This function is shared by exactly four call sites:
+   dispatch, the gate, `verbs()`, and metering. No call site maintains its own
+   alias-resolution logic.
+2. Pack-ownership resolution moves ahead of the gate check in the dispatch path, so
+   the canonical id is available when `GateRequest` is constructed.
+3. `GateRequest.verb` carries the canonical `pack.verb` id. The original wire alias,
+   if one was used, is recorded separately as an audit-only field — it is never the
+   value policy rules match against.
+4. A wire verb that does not resolve to any registered canonical id fails **closed**:
+   the request is denied before dispatch, not passed through un-normalized to the
+   pack layer or to the gate.
+
+### Consequences
+
+- Every policy that names a canonical `pack.verb` id is enforced consistently
+  regardless of which wire form the caller used.
+- Dispatch, gate, `verbs()`, and metering cannot drift into disagreement about what
+  a given wire call resolves to, because they share one resolver.
+- Pack-ownership resolution runs on every dispatch, including calls that would have
+  been allowed under `AllowAllGate`; this is a small fixed cost of a lookup class the
+  dispatch path already pays elsewhere.
+- Policies authored against alias forms (if any) must be re-authored against
+  canonical ids: a one-time migration cost at adoption.
