@@ -321,6 +321,103 @@ else
 fi
 assert_contains "malformed-manifest error names the problem" "$(cat /tmp/khive-test-drill-malformed.out)" "malformed"
 
+echo "=== test: restore drill — capture-replica happy path (marker verified in the replica, not the origin) ==="
+# Routine drill flow: the designated sync already ran above (T1_REPLICA is
+# in sync with ORIGIN_DB, both carrying marker-1), so capture-replica can
+# verify the marker in the replica and capture straight from it.
+CR_MANIFEST="${SANDBOX}/drill-manifest-capture-replica.txt"
+if "${RESTORE_DRILL_SH}" capture-replica fixture marker-1 "${CR_MANIFEST}" >/tmp/khive-test-drill-cr-capture.out 2>&1; then
+  ok "capture-replica succeeds and verifies the marker in the replica"
+else
+  fail "capture-replica should succeed: $(cat /tmp/khive-test-drill-cr-capture.out)"
+fi
+assert_file_exists "capture-replica writes the manifest file" "${CR_MANIFEST}"
+assert_contains "capture-replica prints MANIFEST_PATH" "$(cat /tmp/khive-test-drill-cr-capture.out)" "MANIFEST_PATH=${CR_MANIFEST}"
+assert_contains "capture-replica manifest contains a COUNT row" "$(cat "${CR_MANIFEST}")" "COUNT|notes|"
+
+# Feed the replica-captured manifest straight into validate against that same
+# replica — the full routine drill flow (marker -> sync -> capture-replica ->
+# validate), deterministic end-to-end on a live store.
+CR_VALIDATE_OUT="$(mktemp -d "${SANDBOX}/drill-cr-validate.XXXXXX")"
+if "${RESTORE_DRILL_SH}" validate fixture "${T1_REPLICA}" marker-1 "${CR_MANIFEST}" "${CR_VALIDATE_OUT}" >/tmp/khive-test-drill-cr-validate.out 2>&1; then
+  ok "validate passes end-to-end against a capture-replica manifest (routine drill flow)"
+else
+  fail "validate should pass against a capture-replica manifest: $(cat /tmp/khive-test-drill-cr-validate.out)"
+fi
+
+echo "=== test: restore drill — a passing validate with no explicit scratch-dir removes its own scratch dir too ==="
+CR_SUCCESS_STDOUT="$(mktemp "${SANDBOX}/drill-cr-success-stdout.XXXXXX")"
+if "${RESTORE_DRILL_SH}" validate fixture "${T1_REPLICA}" marker-1 "${CR_MANIFEST}" >"${CR_SUCCESS_STDOUT}" 2>&1; then
+  ok "validate passes with no explicit scratch-dir argument"
+else
+  fail "validate should pass: $(cat "${CR_SUCCESS_STDOUT}")"
+fi
+CR_SUCCESS_SCRATCH_DIR="$(sed -n 's/.*scratch=\(.*\)$/\1/p' "${CR_SUCCESS_STDOUT}" | head -1)"
+if [ -z "${CR_SUCCESS_SCRATCH_DIR}" ]; then
+  fail "could not parse the auto-created scratch dir from validate's own log line"
+elif [ -d "${CR_SUCCESS_SCRATCH_DIR}" ]; then
+  fail "scratch dir should be removed after a passing validate run with no explicit scratch-dir argument"
+else
+  ok "scratch dir is removed after a passing validate run with no explicit scratch-dir argument too"
+fi
+
+echo "=== test: restore drill — capture-replica refuses when the marker has not yet reached the replica ==="
+sqlite3 "${ORIGIN_DB}" "INSERT INTO notes (id, content) VALUES ('marker-2', 'not yet synced');"
+CR_MISSING_MANIFEST="${SANDBOX}/drill-manifest-capture-replica-missing.txt"
+if "${RESTORE_DRILL_SH}" capture-replica fixture marker-2 "${CR_MISSING_MANIFEST}" >/tmp/khive-test-drill-cr-missing.out 2>&1; then
+  fail "capture-replica should refuse when the marker has not synced to the replica yet"
+else
+  ok "capture-replica refuses when the marker is absent from the replica"
+fi
+assert_contains "capture-replica absent-marker error explains the sync ordering" \
+  "$(cat /tmp/khive-test-drill-cr-missing.out)" "designated sync has not yet carried it forward"
+[ -f "${CR_MISSING_MANIFEST}" ] && fail "capture-replica must not write a manifest file when the marker check fails" \
+  || ok "capture-replica writes no manifest file when the marker check fails"
+# carry marker-2 to the replica so later store state is consistent for any
+# subsequent test in this file that reads T1_REPLICA.
+"${KHIVE_BACKUP_SH}" t1 fixture >/dev/null
+
+echo "=== test: restore drill — cleanup-on-fail removes the scratch dir but preserves diff evidence ==="
+CLEANUP_BAD_DB="${SANDBOX}/drill-cleanup-bad.db"
+cp "${T1_REPLICA}" "${CLEANUP_BAD_DB}"
+sqlite3 "${CLEANUP_BAD_DB}" "INSERT INTO notes (id, content) VALUES ('cleanup-extra-row', 'should not be here');"
+CLEANUP_STDOUT="$(mktemp "${SANDBOX}/drill-cleanup-stdout.XXXXXX")"
+# No explicit scratch-dir argument: validate creates (and, on failure, must
+# remove) its own via mktemp — this is the case cleanup-on-fail covers.
+if "${RESTORE_DRILL_SH}" validate fixture "${CLEANUP_BAD_DB}" marker-1 "${CR_MANIFEST}" >"${CLEANUP_STDOUT}" 2>&1; then
+  fail "validate should fail on the deliberately mismatched cleanup-test copy"
+else
+  ok "validate fails on the deliberately mismatched cleanup-test copy (cleanup-on-fail case)"
+fi
+CLEANUP_SCRATCH_DIR="$(sed -n 's/.*scratch=\(.*\)$/\1/p' "${CLEANUP_STDOUT}" | head -1)"
+if [ -z "${CLEANUP_SCRATCH_DIR}" ]; then
+  fail "could not parse the auto-created scratch dir from validate's own log line"
+elif [ -d "${CLEANUP_SCRATCH_DIR}" ]; then
+  fail "scratch dir should be removed after a failed validate run with no explicit scratch-dir argument"
+else
+  ok "scratch dir is removed after a failed validate run with no explicit scratch-dir argument"
+fi
+FAILED_EVIDENCE_DIR="$(find "${KHIVE_BACKUP_ROOT}/drill" -maxdepth 1 -type d -name 'failed-fixture-*' 2>/dev/null | sort | tail -1)"
+if [ -n "${FAILED_EVIDENCE_DIR}" ]; then
+  ok "a failed-<store>-<timestamp> evidence dir was created"
+else
+  fail "no failed-<store>-<timestamp> evidence dir found under ${KHIVE_BACKUP_ROOT}/drill"
+fi
+assert_file_exists "evidence dir contains the manifest diff" "${FAILED_EVIDENCE_DIR}/manifest.diff"
+assert_contains "preserved manifest diff shows the notes table mismatch" \
+  "$(cat "${FAILED_EVIDENCE_DIR}/manifest.diff" 2>/dev/null)" "notes"
+
+echo "=== test: restore drill — validate with an explicit scratch-dir is never auto-removed (success or failure) ==="
+EXPLICIT_SCRATCH_OK="$(mktemp -d "${SANDBOX}/drill-explicit-ok.XXXXXX")"
+# Outcome (pass/fail) is irrelevant to this test — only scratch-dir survival
+# is asserted, so the validate exit status is deliberately not checked.
+"${RESTORE_DRILL_SH}" validate fixture "${T1_REPLICA}" marker-1 "${CR_MANIFEST}" "${EXPLICIT_SCRATCH_OK}" >/tmp/khive-test-drill-explicit-ok.out 2>&1 || true
+if [ -d "${EXPLICIT_SCRATCH_OK}" ]; then
+  ok "caller-supplied scratch-dir survives (this script never removes a scratch-dir it did not create)"
+else
+  fail "caller-supplied scratch-dir was removed — cleanup must be scoped to self-created scratch dirs only"
+fi
+
 echo "=== test: installer idempotent re-run preserves edited interval ==="
 export KHIVE_BACKUP_INSTALL_TEST=1
 export KHIVE_BACKUP_SCRIPT_PATH="${KHIVE_BACKUP_SH}"

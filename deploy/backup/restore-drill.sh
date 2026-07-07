@@ -1,29 +1,53 @@
 #!/usr/bin/env bash
 # ADR-100 restore drill (the acceptance test / standing operational drill).
 #
-# Two subcommands, matching the ADR's step 1-2 ordering exactly: the
-# manifest is captured immediately before the DESIGNATED sync and stored
-# beside the sync metrics; validation later compares a restored copy
-# against that RECORDED file, never against the (by-then-moved-on) origin.
-# Comparing against the live origin at validate time would be exactly the
-# "comparison against the moving origin" the ADR forbids — origin writes
-# that land between capture and validate would show up as spurious
-# mismatches, and a pass would prove nothing about the recorded point.
+# Two capture modes, one validate subcommand:
 #
+#   restore-drill.sh capture-replica <store-name> <marker-id> [out-path]
 #   restore-drill.sh capture <store-name> <marker-id> [out-path]
 #   restore-drill.sh validate <store-name> <backup-path> <marker-id> <manifest-path> [scratch-dir]
 #
-# Operator sequence: write a marker row through the normal write path ->
-# `capture` (right before the sync you intend to validate) -> run that
-# sync -> `validate` against the resulting backup and the manifest capture
-# produced.
+# capture-replica (ROUTINE drill — deterministic on a live, multi-writer
+# store; amendment 2026-07-07): captures the manifest from the store's
+# freshly-synced tier-1 replica (`t1_replica` in stores.conf) instead of the
+# origin. Live evidence on a 4.1GB production store showed the origin-exact
+# ordering below is unsatisfiable there: an audit `events` table takes a row
+# from every client dispatch on a ~10s cadence, versus a ~60s capture-to-sync
+# window, so five controlled origin-capture attempts each failed with a
+# manifest diff that isolated exactly the writes landing inside that window.
+# The differ was correct every time; the contract (capture the moving
+# origin, then compare a later replica to it) was the thing racing.
 #
-# capture:
-#   <store-name>  looks up the origin path in stores.conf (KHIVE_BACKUP_CONF
-#                 to override).
+# capture-replica still requires the marker round-trip: the marker was
+# written to the ORIGIN before the sync (operator step 1, unchanged), so its
+# presence in the REPLICA is the proof the sync actually carried the origin's
+# state forward — without that check, a routine drill would only prove "the
+# replica equals itself", which is not a restore drill at all. Routine flow:
+#   write marker to origin -> run the designated sync -> capture-replica
+#   (verifies marker in the replica, captures the manifest FROM the replica)
+#   -> validate (unchanged; feeds the replica-captured manifest)
+#
+# capture (ORIGIN-EXACT — retained for maintenance-window drills only): the
+# manifest is captured immediately before the DESIGNATED sync, straight from
+# the origin, and stored beside the sync metrics; validation later compares
+# a restored copy against that RECORDED file, never against the
+# (by-then-moved-on) origin. This ordering is only valid when the origin is
+# quiescent for the capture-to-sync window (a real maintenance window, or a
+# store with no live writers) — on a live multi-writer store, in-window
+# writes will show up as spurious manifest mismatches, per the evidence
+# above. Bound to the schema-migration re-drill cadence the ADR already
+# names: run it once in the first genuine maintenance window and record the
+# result.
+#
+# capture-replica / capture:
+#   <store-name>  looks up the origin (and, for capture-replica, the t1
+#                 replica) path in stores.conf (KHIVE_BACKUP_CONF to
+#                 override).
 #   <marker-id>   the id of a marker row the OPERATOR already wrote through
-#                 the normal write path (ADR step 1). This script does not
-#                 create markers — it only verifies one is present.
+#                 the normal write path to the ORIGIN (ADR step 1). This
+#                 script does not create markers — it only verifies one is
+#                 present (in the origin for `capture`, in the replica for
+#                 `capture-replica`).
 #   [out-path]    defaults to KHIVE_BACKUP_ROOT/drill/manifests/<store>-<UTC
 #                 stamp>.manifest. Printed on success as MANIFEST_PATH=<path>.
 #
@@ -32,11 +56,19 @@
 #                    operator's choice of which backup to exercise (tier-2
 #                    replica per the ADR's recommendation, but any tier's
 #                    file works).
-#   <marker-id>      same marker id used for `capture`.
-#   <manifest-path>  the file `capture` produced. Must exist and be
-#                    well-formed; validate refuses otherwise rather than
-#                    silently treating a missing file as "no prior state".
+#   <marker-id>      same marker id used for `capture`/`capture-replica`.
+#   <manifest-path>  the file `capture`/`capture-replica` produced. Must
+#                    exist and be well-formed; validate refuses otherwise
+#                    rather than silently treating a missing file as "no
+#                    prior state".
 #   [scratch-dir]    defaults to a mktemp dir under KHIVE_BACKUP_ROOT/drill.
+#                    On validate failure, small evidence (the manifest diff
+#                    and the restored manifest) is preserved under
+#                    KHIVE_BACKUP_ROOT/drill/failed-<store>-<UTC stamp>/ and
+#                    the (multi-GB) scratch dir is removed — but only when
+#                    this script created scratch-dir itself (no explicit
+#                    scratch-dir argument was passed); an operator-supplied
+#                    scratch-dir is left for the caller to manage.
 #
 # Marker lookup table/column default to "notes"/"id" (the kg substrate);
 # override with KHIVE_BACKUP_MARKER_TABLE / KHIVE_BACKUP_MARKER_COLUMN if a
@@ -51,7 +83,14 @@ BACKUP_SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" >/dev/null 2>&1 &
 usage() {
   cat >&2 <<'EOF'
 usage:
+  restore-drill.sh capture-replica <store-name> <marker-id> [out-path]
+      routine drill: capture the manifest from the freshly-synced t1
+      replica (deterministic on a live, multi-writer store). Marker must
+      already be present in the replica (i.e. run AFTER the designated
+      sync that carried it there).
   restore-drill.sh capture <store-name> <marker-id> [out-path]
+      origin-exact drill: capture the manifest from the origin. Only valid
+      on a quiescent store (maintenance-window drills) — see file header.
   restore-drill.sh validate <store-name> <backup-path> <marker-id> <manifest-path> [scratch-dir]
 EOF
   exit 1
@@ -186,12 +225,64 @@ cmd_capture() {
   printf 'MANIFEST_PATH=%s\n' "${out_path}"
 }
 
+# --- capture-replica subcommand (routine drill; see file header) ----------
+
+cmd_capture_replica() {
+  [ "$#" -ge 2 ] || usage
+  local store="$1" marker_id="$2" out_path="${3:-}"
+  local row
+
+  row="$(load_store_row "${store}")" || bdie "no store named '${store}' in $(resolve_stores_conf)"
+  split_store_row "${row}"
+  [ -n "${STORE_T1_REPLICA}" ] || bdie "no t1_replica configured for store '${store}' in $(resolve_stores_conf)"
+  is_placeholder "${STORE_T1_REPLICA}" && bdie "t1_replica for store '${store}' is still the CHANGE_ME placeholder"
+  [ -f "${STORE_T1_REPLICA}" ] || bdie "t1 replica does not exist: ${STORE_T1_REPLICA} — run the designated sync before capture-replica"
+
+  MARKER_ID="${marker_id}"
+
+  if [ -z "${out_path}" ]; then
+    mkdir -p "${KHIVE_BACKUP_ROOT}/drill/manifests"
+    out_path="${KHIVE_BACKUP_ROOT}/drill/manifests/${store}-$(date -u +%Y%m%d-%H%M%S).manifest"
+  fi
+  mkdir -p "$(dirname -- "${out_path}")"
+
+  blog "capture-replica: verifying marker '${marker_id}' is present in replica ${STORE_T1_REPLICA}"
+  check_marker_present "${STORE_T1_REPLICA}" "readonly" \
+    || bdie "marker '${marker_id}' not found in replica ${MARKER_TABLE}.${MARKER_COLUMN} — the marker was written to the origin before the sync (ADR step 1); its absence from the replica means the designated sync has not yet carried it forward. Run the sync, then retry."
+
+  blog "capture-replica: capturing manifest from the freshly-synced replica (read-only, single transaction)"
+  capture_manifest "${STORE_T1_REPLICA}" "${out_path}" "readonly"
+
+  blog "capture-replica: manifest written to ${out_path}"
+  printf 'MANIFEST_PATH=%s\n' "${out_path}"
+}
+
 # --- validate subcommand ---------------------------------------------------
+
+# EXIT-trap cleanup for a scratch dir this script created itself (see
+# cmd_validate's own_scratch guard — never called against a caller-supplied
+# scratch-dir). On failure (rc != 0), the small evidence files (the manifest
+# diff and the restored copy's manifest, both plain text, never the
+# multi-GB restored database) are copied out to a dated failed-<store>-*
+# dir under KHIVE_BACKUP_ROOT/drill before the scratch dir is removed —
+# "fail loud" and "clean up" both hold. On success, the scratch dir
+# (including the restored database copy) is removed outright.
+validate_cleanup_scratch() {
+  local rc="$1" store="$2" scratch_dir="$3" fail_dir
+  if [ "${rc}" -ne 0 ]; then
+    fail_dir="${KHIVE_BACKUP_ROOT}/drill/failed-${store}-$(date -u +%Y%m%d-%H%M%S)"
+    mkdir -p "${fail_dir}"
+    [ -f "${scratch_dir}/manifest.diff" ] && cp "${scratch_dir}/manifest.diff" "${fail_dir}/manifest.diff"
+    [ -f "${scratch_dir}/manifest-restored.txt" ] && cp "${scratch_dir}/manifest-restored.txt" "${fail_dir}/manifest-restored.txt"
+    blog "validate FAILED — evidence preserved at ${fail_dir}; removing scratch dir ${scratch_dir}"
+  fi
+  rm -rf "${scratch_dir}"
+}
 
 cmd_validate() {
   [ "$#" -ge 4 ] || usage
   local store="$1" backup_path="$2" marker_id="$3" manifest_path="$4" scratch_dir="${5:-}"
-  local row restored_db restored_manifest
+  local row restored_db restored_manifest own_scratch=0
 
   row="$(load_store_row "${store}")" || bdie "no store named '${store}' in $(resolve_stores_conf)"
   split_store_row "${row}"
@@ -204,8 +295,17 @@ cmd_validate() {
   if [ -z "${scratch_dir}" ]; then
     mkdir -p "${KHIVE_BACKUP_ROOT}/drill"
     scratch_dir="$(mktemp -d "${KHIVE_BACKUP_ROOT}/drill/${store}.XXXXXX")"
+    own_scratch=1
   fi
   mkdir -p "${scratch_dir}"
+
+  # Only a scratch dir this script created (via its own mktemp above) is
+  # ever removed here. A caller-supplied scratch-dir is left untouched on
+  # both success and failure — cleanup of it is the caller's responsibility.
+  if [ "${own_scratch}" -eq 1 ]; then
+    # shellcheck disable=SC2064 # store/scratch_dir must expand now, not at trap-fire time
+    trap "validate_cleanup_scratch \$? '${store}' '${scratch_dir}'" EXIT
+  fi
 
   restored_db="${scratch_dir}/restored.db"
   restored_manifest="${scratch_dir}/manifest-restored.txt"
@@ -279,7 +379,11 @@ cmd_validate() {
   rto_seconds=$((drill_end - RESTORE_START))
 
   blog "step 7: RTO (steps 2-6) = ${rto_seconds}s"
-  blog "RESTORE DRILL PASSED for store '${store}' — scratch artifacts kept at ${scratch_dir}"
+  if [ "${own_scratch}" -eq 1 ]; then
+    blog "RESTORE DRILL PASSED for store '${store}' — scratch dir ${scratch_dir} will be removed (pass an explicit scratch-dir argument to retain it)"
+  else
+    blog "RESTORE DRILL PASSED for store '${store}' — scratch artifacts kept at ${scratch_dir} (caller-supplied scratch-dir)"
+  fi
   printf 'RTO_SECONDS=%s\n' "${rto_seconds}"
 }
 
@@ -287,6 +391,10 @@ case "${1:-}" in
   capture)
     shift
     cmd_capture "$@"
+    ;;
+  capture-replica)
+    shift
+    cmd_capture_replica "$@"
     ;;
   validate)
     shift

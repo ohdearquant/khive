@@ -214,6 +214,56 @@ falsifiable.
 Steps 1-7 passing on a real restored copy — not on the origin — is the definition of
 done for the implementing PR.
 
+### Amendment (2026-07-07): routine drill captures from the replica
+
+Steps 1-2 above (capture the manifest from the origin immediately before the designated
+sync, then compare a later restored copy against that recorded capture) assume the origin
+is quiescent for the capture-to-sync window. Live evidence on the motivating ~4.1GB
+production store shows that assumption does not hold there: an audit `events` table takes
+a row from every client dispatch on a roughly 10-second cadence, against a roughly
+60-second capture-to-sync window for that store's tier-1 sync. Five controlled origin-capture
+attempts were run; all five failed, and in every case the manifest diff isolated exactly
+the writes that landed inside the capture-to-sync window — the differ was correct each
+time, and the contract it was checking (capture the moving origin, then compare a
+later-synced replica against that single instant) was the thing racing. Quiescing this
+store for the window is not achievable in its current deployment: its clients fall back to
+direct dispatch when the daemon that would otherwise hold writes is stopped, so there is
+no quiescent origin state to capture against short of a real maintenance window.
+
+The routine drill is amended to capture from the freshly-synced replica instead of the
+origin:
+
+1. Write the marker row through the normal write path, to the origin, as before (step 1
+   is unchanged).
+2. Run the designated sync.
+3. Capture the validation manifest from the tier-1 replica the sync just produced, not
+   from the origin. The marker round-trip is still mandatory here and is the whole proof
+   this drill has any content: the marker was written to the origin _before_ the sync, so
+   its presence in the replica is the evidence the sync actually carried the origin's
+   state forward. Without that check, a replica-captured manifest compared to a
+   replica-restored copy proves only "the replica equals itself" — not a restore drill.
+4. Validate (unchanged semantics): restore the backup to a scratch copy, run
+   `PRAGMA integrity_check`, and compare the restored copy's manifest against the
+   recorded manifest exactly — the manifest recorded in step 3, never a manifest
+   recaptured from the moving origin at validate time.
+
+This keeps the falsifiability property the original design was protecting: the reference
+manifest is still a single point-in-time recording, never a comparison against a target
+that keeps changing. What moved is which side of the sync that recording is taken from —
+the replica, whose state is fixed the instant the sync completes, rather than the origin,
+which a live multi-writer store never holds still.
+
+Residual risk: A sync that corrupts pages would self-consistently pass the manifest
+comparison; that surface is covered by `PRAGMA integrity_check`, the marker round-trip, and
+the runtime-boot steps of the drill.
+
+The origin-exact drill (steps 1-7 as originally specified above) is retained for
+maintenance-window drills, bound to the schema-migration re-drill cadence this ADR already
+names in the operator runbook requirements: the first genuine maintenance window runs the
+origin-exact drill once, on a store held quiescent for the window, and records the result.
+It is not part of the standing operational cadence on a live store — the replica-capture
+drill is.
+
 ### Generalization and product path
 
 The mechanism is deliberately expressible as configuration: a list of

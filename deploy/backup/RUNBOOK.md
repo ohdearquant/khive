@@ -170,17 +170,63 @@ backup"), run this after initial setup, after any schema-migration release,
 and on a standing cadence you define (weekly is a reasonable floor given the
 tier-3 archive cadence).
 
-The drill is two subcommands, matching the ADR's step 1-2 ordering exactly:
-the manifest is **captured immediately before the designated sync** and
-stored beside the sync metrics; validation later compares a restored copy
-against that **recorded file** — never against the origin as it stands at
-validate time (writes land on the origin between capture and a later
-validate run; comparing against the moving origin at that point would fail
-spuriously on unrelated writes, and a pass would not actually prove
-anything about the recorded point).
+There are two drill modes (ADR-100 amendment, 2026-07-07): the **routine**
+drill, which captures its validation manifest from the freshly-synced
+replica, and the **origin-exact** drill, which captures immediately before
+the sync, straight from the origin. Use routine for the standing cadence on
+a live store; origin-exact only in a genuine maintenance window (see
+[Migration pause rule](#migration-pause-rule)).
+
+### Routine drill (replica-capture — use this on a live store)
+
+Live evidence on the motivating production store showed the origin-exact
+ordering below is not reliably satisfiable there: a client-write table takes
+a row roughly every 10 seconds, against a roughly 60-second capture-to-sync
+window, so every controlled origin-capture attempt failed on exactly the
+writes landing in that window. The routine drill sidesteps this by capturing
+from the replica, which is a fixed, closed point the instant the sync
+completes, rather than from the origin, which a live multi-writer store
+never holds still.
 
 1. Write a marker row through the **normal write path** (not through this
-   tooling) — e.g. a note or memory entry with a fresh, unique id. Record
+   tooling), to the **origin** — e.g. a note or memory entry with a fresh,
+   unique id. Record that id.
+2. Run (or wait for) the designated sync, so the marker reaches the replica:
+
+   ```bash
+   deploy/backup/khive-backup.sh t1 khive
+   ```
+
+3. **Capture** the manifest from the freshly-synced replica:
+
+   ```bash
+   deploy/backup/restore-drill.sh capture-replica khive <marker-id>
+   ```
+
+   This verifies the marker is present **in the replica** — the round-trip
+   proof that the sync actually carried the origin's state forward, without
+   which a replica-captured manifest compared against a replica-restored
+   copy would prove only "the replica equals itself" — then captures a
+   manifest in one read transaction (table row counts, `MAX(rowid)`, and a
+   `.sha3sum` checksum per table) to
+   `~/.khive/backups/drill/manifests/khive-<UTC stamp>.manifest`, printing
+   the path as `MANIFEST_PATH=...`. Pass an explicit path as a third
+   argument to control the location instead.
+4. **Validate** the resulting backup against the manifest captured in
+   step 3 (same `validate` subcommand as the origin-exact drill — see
+   below).
+
+### Origin-exact drill (maintenance-window only)
+
+Valid only when the origin is quiescent for the whole capture-to-sync
+window — a real maintenance window, or a store with no live writers. On a
+live multi-writer store this mode will fail spuriously on in-window writes;
+see the amendment above. Bind this mode to the schema-migration re-drill
+cadence in [Migration pause rule](#migration-pause-rule): the first genuine
+maintenance window runs it once and records the result; it is not the
+standing cadence.
+
+1. Write a marker row through the normal write path, to the origin. Record
    that id.
 2. **Capture** the manifest right before running the sync you intend to
    validate:
@@ -189,38 +235,62 @@ anything about the recorded point).
    deploy/backup/restore-drill.sh capture khive <marker-id>
    ```
 
-   This verifies the marker is present in the origin, then captures a
-   manifest in one read transaction (table row counts, `MAX(rowid)`, and a
-   `.sha3sum` checksum per table) to
-   `~/.khive/backups/drill/manifests/khive-<UTC stamp>.manifest`, printing
-   the path as `MANIFEST_PATH=...`. Pass an explicit path as a third
-   argument to control the location instead.
+   This verifies the marker is present in the origin, then captures the
+   manifest the same way as `capture-replica` above, but reading the origin
+   directly.
 3. Run (or wait for) the sync being validated.
-4. **Validate** the resulting backup against the manifest captured in step 2:
+4. **Validate** the resulting backup against the manifest captured in
+   step 2 (see below).
 
-   ```bash
-   deploy/backup/restore-drill.sh validate khive /path/to/tier2-replica.db <marker-id> <manifest-path>
-   ```
+### Validate (shared by both modes)
 
-   This restores the given backup to a scratch path, runs
-   `PRAGMA integrity_check`, compares the restored copy's manifest to the
-   **recorded** manifest file **exactly** (no tolerance), boots a runtime
-   against the restored copy and serves `stats()` / `search()` /
-   `memory.recall()`, rebuilds the ANN index from the restored database and
-   serves one vector query, and prints the RTO (wall time of the restore +
-   verification steps). `validate` refuses outright — before touching
-   anything else — if the manifest file is missing or malformed, rather
-   than silently treating that as "nothing to compare".
-5. **Steps 5-6 (inside `validate`) require `kkernel` on PATH.** If it is
-   absent, the drill prints `skipped (kkernel not on PATH)` for those two
-   steps and still reports overall success on the rest. A drill that only
-   ran with `kkernel` unavailable is **not** a complete acceptance run per
-   the ADR — re-run it where `kkernel` is reachable (the actual recovery
-   host is the right place) before treating the backup as drill-verified.
-6. A failed comparison prints the manifest diff and fails loudly — that is
-   a defect in the backup or restore path, not "just a delta since the
-   marker", because the manifest and the marker were captured atomically
-   at the recorded point, before the sync ran.
+```bash
+deploy/backup/restore-drill.sh validate khive /path/to/tier2-replica.db <marker-id> <manifest-path>
+```
+
+This restores the given backup to a scratch path, runs
+`PRAGMA integrity_check`, compares the restored copy's manifest to the
+**recorded** manifest file **exactly** (no tolerance), boots a runtime
+against the restored copy and serves `stats()` / `search()` /
+`memory.recall()`, rebuilds the ANN index from the restored database and
+serves one vector query, and prints the RTO (wall time of the restore +
+verification steps). `validate` refuses outright — before touching
+anything else — if the manifest file is missing or malformed, rather than
+silently treating that as "nothing to compare".
+
+- **Steps 5-6 (inside `validate`) require `kkernel` on PATH.** If it is
+  absent, the drill prints `skipped (kkernel not on PATH)` for those two
+  steps and still reports overall success on the rest. A drill that only
+  ran with `kkernel` unavailable is **not** a complete acceptance run per
+  the ADR — re-run it where `kkernel` is reachable (the actual recovery
+  host is the right place) before treating the backup as drill-verified.
+- A failed comparison prints the manifest diff and fails loudly — that is a
+  defect in the backup or restore path, not "just a delta since the
+  marker", because the manifest and the marker were captured atomically at
+  the recorded point (replica-fixed for the routine drill, pre-sync origin
+  for the origin-exact drill).
+- **Cleanup on exit**: when `validate` is run with no explicit
+  `scratch-dir` argument (the normal case), it removes its own scratch dir
+  on both success and failure — the restored database copy is multi-GB and
+  disposable. On failure, the small evidence (`manifest.diff` and the
+  restored copy's manifest) is copied first to
+  `~/.khive/backups/drill/failed-<store>-<UTC stamp>/` before the scratch
+  dir is removed, so the failure is diagnosable without keeping the full
+  restored copy around. Passing an explicit `scratch-dir` argument opts out
+  of this cleanup entirely — that directory is left for the caller to
+  manage, on both success and failure.
+
+### Known partial-drill scopes
+
+A registered store on an incompatible schema lineage — one whose migration
+history predates the current consolidated baseline — cannot run the
+runtime-boot steps of the drill (steps 5-6 above: booting a runtime and
+rebuilding the ANN index) against its restored copy. Such a store is
+covered by `PRAGMA integrity_check` and manifest equality only; the
+runtime-boot steps are out of scope for it until it is migrated to the
+current baseline or explicitly exempted. Track each such store as its own
+issue — do not fold it into a shared "some stores can't run steps 5-6"
+note, since resolution (migrate vs. exempt) is a per-store decision.
 
 ## Migration pause rule
 
