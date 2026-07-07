@@ -27,6 +27,7 @@ pub mod vector;
 #[allow(unused_imports)]
 mod _pack_links {
     use khive_pack_brain::BrainPack as _;
+    use khive_pack_code::CodePack as _;
     use khive_pack_comm::CommPack as _;
     use khive_pack_formal::FormalPack as _;
     use khive_pack_git::GitPack as _;
