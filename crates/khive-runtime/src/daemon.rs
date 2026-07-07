@@ -968,6 +968,40 @@ fn shutdown_cleanup_if_owned(
 
 // ── helpers ───────────────────────────────────────────────────────────────────
 
+/// Liveness verdict for a `kill(pid, 0)` probe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PidLiveness {
+    /// errno 0 — signal delivery succeeded, the process exists and this
+    /// caller may signal it.
+    Alive,
+    /// ESRCH (or any other non-EPERM errno) — no such process.
+    Dead,
+    /// EPERM — the process exists but this caller lacks permission to
+    /// signal it. Unknown-safe: treated as running so stale-daemon cleanup
+    /// never unlinks a live daemon's socket/PID file just because it is
+    /// owned by a different user/uid.
+    PermissionDenied,
+}
+
+impl PidLiveness {
+    fn is_running(self) -> bool {
+        !matches!(self, PidLiveness::Dead)
+    }
+}
+
+/// Maps a `kill(pid, 0)` outcome (return code + errno) to a [`PidLiveness`].
+/// Pure and side-effect-free so the errno mapping can be unit tested without
+/// a real process probe.
+fn classify_kill_result(rc: i32, errno: i32) -> PidLiveness {
+    if rc == 0 {
+        return PidLiveness::Alive;
+    }
+    match errno {
+        libc::EPERM => PidLiveness::PermissionDenied,
+        _ => PidLiveness::Dead,
+    }
+}
+
 fn is_process_running(pid: u32) -> bool {
     let Ok(pid) = i32::try_from(pid) else {
         return false;
@@ -976,7 +1010,9 @@ fn is_process_running(pid: u32) -> bool {
         return false;
     }
     // SAFETY: signal 0 is an existence/permission probe with no side effects.
-    unsafe { libc::kill(pid, 0) == 0 }
+    let rc = unsafe { libc::kill(pid, 0) };
+    let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+    classify_kill_result(rc, errno).is_running()
 }
 
 async fn cleanup_stale_daemon(sock: &std::path::Path, pid_file: &std::path::Path) -> bool {
@@ -1120,6 +1156,49 @@ mod tests {
         assert!(
             !is_process_running(u32::MAX),
             "u32::MAX should fail i32 conversion and return false"
+        );
+    }
+
+    // #645 fix: EPERM (process exists, no permission to signal it) must not
+    // be misread as "not running" during stale-daemon cleanup.
+
+    #[test]
+    fn classify_kill_result_zero_is_alive() {
+        assert_eq!(classify_kill_result(0, 0), PidLiveness::Alive);
+        assert!(classify_kill_result(0, 0).is_running());
+    }
+
+    #[test]
+    fn classify_kill_result_esrch_is_dead() {
+        assert_eq!(classify_kill_result(-1, libc::ESRCH), PidLiveness::Dead);
+        assert!(!classify_kill_result(-1, libc::ESRCH).is_running());
+    }
+
+    #[test]
+    fn classify_kill_result_eperm_is_permission_denied_and_counts_as_running() {
+        assert_eq!(
+            classify_kill_result(-1, libc::EPERM),
+            PidLiveness::PermissionDenied
+        );
+        assert!(
+            classify_kill_result(-1, libc::EPERM).is_running(),
+            "EPERM must be unknown-safe: treated as running, never as a basis \
+             for stale cleanup to unlink a live daemon's rendezvous files"
+        );
+    }
+
+    #[test]
+    fn pid_1_probe_is_running_regardless_of_permission_outcome() {
+        // PID 1 (init/launchd) always exists. An unprivileged process gets
+        // EPERM signaling it (never ESRCH); running as root would get 0
+        // instead. Either way `is_process_running` must report true — this
+        // is the live regression guard for the #645 bug (EPERM misread as
+        // dead); `classify_kill_result` above is the pure-function unit
+        // coverage for the same mapping, kept independent of process
+        // ownership so it is never flaky in CI.
+        assert!(
+            is_process_running(1),
+            "PID 1 always exists; EPERM must not read as dead"
         );
     }
 
