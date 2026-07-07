@@ -771,15 +771,20 @@ async fn ingest_issues(
             .into_iter()
             .map(|l| l.name)
             .collect();
-        let properties = json!({
+        let mut properties = json!({
             "number": issue.number,
             "title": issue.title,
             "author": issue.author.and_then(|a| a.login),
             "created_at": issue.created_at,
             "closed_at": issue.closed_at,
             "labels": labels,
-            "state_reason": issue.state_reason,
         });
+        // gh reports stateReason as "" for open issues; the kind hook governs any
+        // PRESENT value against {completed, not_planned}, so absent is the only
+        // valid encoding for "open / no reason".
+        if let Some(reason) = issue.state_reason.as_deref().filter(|r| !r.is_empty()) {
+            properties["state_reason"] = json!(reason);
+        }
 
         registry
             .dispatch(
