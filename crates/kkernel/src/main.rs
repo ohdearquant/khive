@@ -329,8 +329,10 @@ enum ResolveCommandError {
 /// without triggering `clap`'s process-exiting `.error(...).exit()` path.
 ///
 /// - `-e <OPS>` alone → `Command::Exec`, parsed via `ExecArgs::parse_from(["exec",
-///   &ops])` so it is byte-identical to typing `exec <OPS>` (same defaults, same
-///   env-var bindings).
+///   "--", &ops])` so it is byte-identical to typing `exec -- <OPS>` (same
+///   defaults, same env-var bindings). The `--` separator forces `ops` to bind
+///   as the positional OPS value even when it starts with `-` (without it,
+///   `-e '--pending-events'` would reparse as exec's `--pending-events` flag).
 /// - a subcommand alone → that subcommand, unchanged.
 /// - neither → `Err(ResolveCommandError::Missing)`.
 /// - both → `Err(ResolveCommandError::Conflict)`. clap's derive `conflicts_with`
@@ -342,7 +344,9 @@ fn resolve_command_result(
     command: Option<Command>,
 ) -> Result<Command, ResolveCommandError> {
     match (exec, command) {
-        (Some(ops), None) => Ok(Command::Exec(exec::ExecArgs::parse_from(["exec", &ops]))),
+        (Some(ops), None) => Ok(Command::Exec(exec::ExecArgs::parse_from([
+            "exec", "--", &ops,
+        ]))),
         (None, Some(cmd)) => Ok(cmd),
         (None, None) => Err(ResolveCommandError::Missing),
         (Some(_), Some(_)) => Err(ResolveCommandError::Conflict),
@@ -826,8 +830,11 @@ mod tests {
     fn exec_shortcut_maps_to_same_ops_as_exec_subcommand() {
         // `-e '<ops>'` must produce the identical ExecArgs the `exec` subcommand
         // itself would parse from `exec '<ops>'` — the resolution logic in
-        // `main()` builds this via `exec::ExecArgs::parse_from(["exec", &ops])`.
-        let via_shortcut = exec::ExecArgs::parse_from(["exec", "stats()"]);
+        // `main()` builds this via `exec::ExecArgs::parse_from(["exec", "--", &ops])`.
+        let via_shortcut = match resolve_command_result(Some("stats()".into()), None) {
+            Ok(Command::Exec(e)) => e,
+            other => panic!("expected Ok(Command::Exec), got {other:?}"),
+        };
         let via_subcommand = match Args::parse_from(["kkernel", "exec", "stats()"]).command {
             Some(Command::Exec(e)) => e,
             other => panic!("expected Command::Exec, got {other:?}"),
@@ -836,6 +843,20 @@ mod tests {
         assert_eq!(via_shortcut.db, via_subcommand.db);
         assert_eq!(via_shortcut.namespace, via_subcommand.namespace);
         assert_eq!(via_shortcut.presentation, via_subcommand.presentation);
+    }
+
+    #[test]
+    fn exec_shortcut_flag_like_ops_binds_as_ops_not_as_exec_flag() {
+        // Regression for the round-1 review finding: without the `--` separator
+        // in the synthetic argv, `-e '--pending-events'` reparsed as exec's
+        // `--pending-events` FLAG (running the pending-event drain with no ops)
+        // instead of binding as the OPS value.
+        let resolved = match resolve_command_result(Some("--pending-events".into()), None) {
+            Ok(Command::Exec(e)) => e,
+            other => panic!("expected Ok(Command::Exec), got {other:?}"),
+        };
+        assert_eq!(resolved.ops.as_deref(), Some("--pending-events"));
+        assert!(!resolved.pending_events);
     }
 
     #[test]
