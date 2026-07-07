@@ -167,19 +167,53 @@ fn purge_index_row_statement(
     }
 }
 
+/// `true` iff a table named `table` currently exists in the backing SQLite
+/// database (`sqlite_master` probe, read-only — safe in async prepare, does
+/// NOT open/create the vector store, so it cannot lazily create the table
+/// itself).
+async fn vector_table_exists(runtime: &KhiveRuntime, table: &str) -> RuntimeResult<bool> {
+    let mut reader = runtime
+        .sql()
+        .reader()
+        .await
+        .map_err(RuntimeError::Storage)?;
+    let row = reader
+        .query_scalar(SqlStatement {
+            sql: "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1".to_string(),
+            params: vec![SqlValue::Text(table.to_string())],
+            label: Some("atomic-delete-vec-table-exists".to_string()),
+        })
+        .await
+        .map_err(RuntimeError::Storage)?;
+    Ok(row.is_some())
+}
+
 /// Append the FTS + every registered model's vector-row purge for `subject_id`
 /// (scoped to the RECORD's own namespace, matching `delete_entity`/
 /// `delete_note`'s `record_tok`/`record_ns` convention — NOT the caller
 /// token's namespace, ADR-007 rule 2 by-ID namespace-agnosticism) onto
 /// `statements`.
-fn push_index_purge_statements(
+///
+/// FTS tables (`fts_entities`/`fts_notes`) always exist (created at schema
+/// migration time) so their purge is unconditional. `vec_*` tables are
+/// created LAZILY on first vector-store open (`vectors_for_model` ->
+/// `CREATE VIRTUAL TABLE IF NOT EXISTS`, khive-db backend.rs) — a default
+/// runtime registers embedding models before any vector table necessarily
+/// exists, so a raw unconditional `DELETE FROM vec_*` can hit `no such
+/// table` on a fresh DB (codex r2 Blocker 1). Only push the vec purge for
+/// tables that actually exist: absence means the record definitionally has
+/// no vector row for that model, so skipping is data-parity-correct (the
+/// non-atomic path would lazily create the table then delete zero rows —
+/// same DATA outcome, the only difference is an init side-effect this
+/// read-only prepare pass must not perform).
+async fn push_index_purge_statements(
     runtime: &KhiveRuntime,
     statements: &mut Vec<PlanStatement>,
     fts_table: &str,
     namespace: &str,
     subject_id: Uuid,
     label_prefix: &str,
-) {
+) -> RuntimeResult<()> {
     statements.push(purge_index_row_statement(
         fts_table,
         namespace,
@@ -187,13 +221,16 @@ fn push_index_purge_statements(
         &format!("{label_prefix}-purge-fts"),
     ));
     for vec_table in vector_table_names(runtime) {
-        statements.push(purge_index_row_statement(
-            &vec_table,
-            namespace,
-            subject_id,
-            &format!("{label_prefix}-purge-vec-{vec_table}"),
-        ));
+        if vector_table_exists(runtime, &vec_table).await? {
+            statements.push(purge_index_row_statement(
+                &vec_table,
+                namespace,
+                subject_id,
+                &format!("{label_prefix}-purge-vec-{vec_table}"),
+            ));
+        }
     }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -454,14 +491,30 @@ async fn prepare_delete(
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
 
-    match runtime.resolve_by_id(token, id).await? {
+    // codex r2 High finding 2: `delete(id, hard=true)` is the public purge
+    // route AFTER a prior soft delete (operations.rs hard-delete resolves
+    // INCLUDING already-tombstoned rows). Live-only `resolve_by_id` would
+    // never find an already-soft-deleted record, so hard delete must resolve
+    // through the including-deleted variant; soft delete keeps the live-only
+    // resolve (a soft delete of an already-tombstoned row is a no-op,
+    // matching non-atomic behavior).
+    let resolved = if hard {
+        runtime.resolve_by_id_including_deleted(token, id).await?
+    } else {
+        runtime.resolve_by_id(token, id).await?
+    };
+
+    match resolved {
         Some(Resolved::Entity(entity)) => {
             let namespace = entity.namespace.clone();
             let mut statements = if hard {
+                // Storage parity with the non-atomic hard-delete DML
+                // (entity.rs `DELETE FROM entities WHERE id = ?1`, no
+                // `deleted_at` predicate) — purges live AND already-tombstoned
+                // rows alike.
                 vec![PlanStatement {
                     statement: SqlStatement {
-                        sql: "DELETE FROM entities WHERE id = ?1 AND deleted_at IS NULL"
-                            .to_string(),
+                        sql: "DELETE FROM entities WHERE id = ?1".to_string(),
                         params: vec![SqlValue::Text(id.to_string())],
                         label: Some("atomic-delete-entity-hard".to_string()),
                     },
@@ -492,7 +545,9 @@ async fn prepare_delete(
             }
             // FTS + vector index purge (operations.rs delete_entity parity,
             // codex REJECT Blocker 1): both soft AND hard delete clean
-            // indexes; only hard additionally cascades edges above.
+            // indexes (hard delete of an already-tombstoned record must
+            // still purge indexes — Finding 2); only hard additionally
+            // cascades edges above.
             push_index_purge_statements(
                 runtime,
                 &mut statements,
@@ -500,7 +555,8 @@ async fn prepare_delete(
                 &namespace,
                 id,
                 "atomic-delete-entity",
-            );
+            )
+            .await?;
             Ok(AtomicOpPlan::Delete(DeletePlan {
                 target_id: id,
                 statements,
@@ -509,9 +565,13 @@ async fn prepare_delete(
         Some(Resolved::Note(note)) => {
             let namespace = note.namespace.clone();
             let mut statements = if hard {
+                // Storage parity with the non-atomic hard-delete DML
+                // (note.rs `DELETE FROM notes WHERE id = ?1`, no
+                // `deleted_at` predicate) — purges live AND already-tombstoned
+                // rows alike.
                 vec![PlanStatement {
                     statement: SqlStatement {
-                        sql: "DELETE FROM notes WHERE id = ?1 AND deleted_at IS NULL".to_string(),
+                        sql: "DELETE FROM notes WHERE id = ?1".to_string(),
                         params: vec![SqlValue::Text(id.to_string())],
                         label: Some("atomic-delete-note-hard".to_string()),
                     },
@@ -546,7 +606,9 @@ async fn prepare_delete(
             }
             // FTS + vector index purge (operations.rs delete_note parity,
             // codex REJECT Blocker 1): both soft AND hard delete clean
-            // indexes; only hard additionally cascades edges above.
+            // indexes (hard delete of an already-tombstoned record must
+            // still purge indexes — Finding 2); only hard additionally
+            // cascades edges above.
             push_index_purge_statements(
                 runtime,
                 &mut statements,
@@ -554,7 +616,8 @@ async fn prepare_delete(
                 &namespace,
                 id,
                 "atomic-delete-note",
-            );
+            )
+            .await?;
             Ok(AtomicOpPlan::Delete(DeletePlan {
                 target_id: id,
                 statements,
@@ -1173,5 +1236,231 @@ mod tests {
                 "inferred dependency_kind for (service, service) must persist: {json_str}"
             );
         }
+    }
+
+    /// B3 fix round 3 (codex r2 Blocker 1): atomic delete of an entity AND a
+    /// note must SUCCEED even when the registered embedding model's `vec_*`
+    /// table has never been lazily created (a fresh DB registers models
+    /// before any vector store is opened) — the raw purge DML must skip
+    /// tables that don't exist rather than hit `no such table` and roll
+    /// back the whole atomic unit. FTS purge still fires (those tables
+    /// always exist) and the delete itself is a clean commit.
+    #[tokio::test]
+    async fn atomic_delete_succeeds_when_vec_table_never_created() {
+        let runtime = scratch_runtime();
+        runtime.register_embedder(StubProvider);
+        let token = runtime
+            .authorize(Namespace::parse("local").expect("ns"))
+            .expect("authorize");
+
+        // Seed via raw upsert ONLY — never call reindex_entity/reindex_note
+        // or vectors_for_model, so the stub model's `vec_*` table is never
+        // lazily created (opening the vector store is what creates it).
+        let entity = khive_storage::Entity::new("local", "concept", "no-vec-table-entity");
+        let entity_id = entity.id;
+        runtime
+            .entities(&token)
+            .expect("entities store")
+            .upsert_entity(entity)
+            .await
+            .expect("seed entity");
+
+        let mut note = khive_storage::note::Note::new("local", "observation", "no-vec-table-note");
+        note.name = Some("no-vec-table-note".to_string());
+        let note_id = note.id;
+        runtime
+            .notes(&token)
+            .expect("notes store")
+            .upsert_note(note)
+            .await
+            .expect("seed note");
+
+        for (id, kind) in [(entity_id, "entity"), (note_id, "note")] {
+            let plan = prepare_delete(&runtime, &token, &json!({"id": id.to_string()}))
+                .await
+                .unwrap_or_else(|e| panic!("prepare delete ({kind}) must not fail: {e}"));
+            let outcome = crate::atomic_runner::run_atomic_unit(runtime.sql().as_ref(), vec![plan])
+                .await
+                .unwrap_or_else(|e| {
+                    panic!("atomic delete ({kind}) must not hit `no such table`: {e}")
+                });
+            assert!(
+                matches!(
+                    outcome,
+                    crate::atomic_runner::AtomicRunOutcome::Committed { .. }
+                ),
+                "expected a clean commit ({kind}): {outcome:?}"
+            );
+        }
+
+        assert!(
+            runtime
+                .get_entity_including_deleted(&token, entity_id)
+                .await
+                .expect("get entity")
+                .expect("entity row still present (soft delete)")
+                .deleted_at
+                .is_some(),
+            "entity must be soft-deleted"
+        );
+        assert!(
+            runtime
+                .get_note_including_deleted(&token, note_id)
+                .await
+                .expect("get note")
+                .expect("note row still present (soft delete)")
+                .deleted_at
+                .is_some(),
+            "note must be soft-deleted"
+        );
+    }
+
+    /// B3 fix round 3 (codex r2 High finding 2): atomic hard delete must be
+    /// able to purge a record that was ALREADY soft-deleted — parity with
+    /// `delete(id, hard=true)` being the public purge route after a prior
+    /// soft delete (the non-atomic hard path resolves including deleted
+    /// rows and its DML carries no `deleted_at` predicate).
+    #[tokio::test]
+    async fn atomic_hard_delete_purges_already_soft_deleted_entity_and_note() {
+        let runtime = scratch_runtime();
+        runtime.register_embedder(StubProvider);
+        let token = runtime
+            .authorize(Namespace::parse("local").expect("ns"))
+            .expect("authorize");
+
+        let entity =
+            khive_storage::Entity::new("local", "concept", "tombstoned-entity-hard-delete");
+        let entity_id = entity.id;
+        runtime
+            .entities(&token)
+            .expect("entities store")
+            .upsert_entity(entity.clone())
+            .await
+            .expect("seed entity");
+        runtime
+            .reindex_entity(&token, &entity)
+            .await
+            .expect("seed index rows");
+
+        let mut note =
+            khive_storage::note::Note::new("local", "observation", "tombstoned-note-hard-delete");
+        note.name = Some("tombstoned-note-hard-delete".to_string());
+        let note_id = note.id;
+        runtime
+            .notes(&token)
+            .expect("notes store")
+            .upsert_note(note.clone())
+            .await
+            .expect("seed note");
+        runtime
+            .reindex_note(&token, &note)
+            .await
+            .expect("seed index rows");
+
+        // First: SOFT delete both (via atomic prepare) so they're tombstoned
+        // going into the hard-delete attempt below.
+        for id in [entity_id, note_id] {
+            let plan = prepare_delete(&runtime, &token, &json!({"id": id.to_string()}))
+                .await
+                .expect("prepare soft delete");
+            let outcome = crate::atomic_runner::run_atomic_unit(runtime.sql().as_ref(), vec![plan])
+                .await
+                .expect("soft delete commit");
+            assert!(matches!(
+                outcome,
+                crate::atomic_runner::AtomicRunOutcome::Committed { .. }
+            ));
+        }
+        assert!(
+            runtime
+                .get_entity_including_deleted(&token, entity_id)
+                .await
+                .expect("get entity")
+                .expect("entity present")
+                .deleted_at
+                .is_some(),
+            "entity must be soft-deleted before the hard-delete attempt"
+        );
+        assert!(
+            runtime
+                .get_note_including_deleted(&token, note_id)
+                .await
+                .expect("get note")
+                .expect("note present")
+                .deleted_at
+                .is_some(),
+            "note must be soft-deleted before the hard-delete attempt"
+        );
+
+        // Now: HARD delete the already-tombstoned records.
+        for (id, kind) in [(entity_id, "entity"), (note_id, "note")] {
+            let plan = prepare_delete(
+                &runtime,
+                &token,
+                &json!({"id": id.to_string(), "hard": true}),
+            )
+            .await
+            .unwrap_or_else(|e| {
+                panic!(
+                    "prepare hard delete ({kind}) of an already-soft-deleted record \
+                         must resolve it: {e}"
+                )
+            });
+            let outcome = crate::atomic_runner::run_atomic_unit(runtime.sql().as_ref(), vec![plan])
+                .await
+                .unwrap_or_else(|e| panic!("hard delete ({kind}) commit failed: {e}"));
+            assert!(
+                matches!(
+                    outcome,
+                    crate::atomic_runner::AtomicRunOutcome::Committed { .. }
+                ),
+                "expected a clean hard-delete commit ({kind}): {outcome:?}"
+            );
+        }
+
+        assert!(
+            runtime
+                .get_entity_including_deleted(&token, entity_id)
+                .await
+                .expect("get entity")
+                .is_none(),
+            "entity row must be fully purged after hard delete"
+        );
+        assert!(
+            runtime
+                .get_note_including_deleted(&token, note_id)
+                .await
+                .expect("get note")
+                .is_none(),
+            "note row must be fully purged after hard delete"
+        );
+        assert!(
+            runtime
+                .text(&token)
+                .expect("text store")
+                .get_document("local", entity_id)
+                .await
+                .expect("get_document")
+                .is_none(),
+            "entity FTS row must be purged after hard delete"
+        );
+        assert!(
+            runtime
+                .text_for_notes(&token)
+                .expect("text store")
+                .get_document("local", note_id)
+                .await
+                .expect("get_document")
+                .is_none(),
+            "note FTS row must be purged after hard delete"
+        );
+        let vec_store = runtime
+            .vectors_for_model(&token, STUB_MODEL)
+            .expect("vec store");
+        assert_eq!(
+            vec_store.count().await.expect("count after"),
+            0,
+            "vector rows for both records must be purged after hard delete"
+        );
     }
 }

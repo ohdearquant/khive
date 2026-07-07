@@ -282,6 +282,18 @@ async fn prepare_gtd_transition(
 ) -> anyhow::Result<AtomicOpPlan> {
     let id = require_uuid(args, "id")?;
     let target = require_str(args, "status")?;
+    let note_arg = args
+        .as_object()
+        .and_then(|o| o.get("note"))
+        .and_then(|v| v.as_str());
+
+    // Parity with `khive-pack-gtd::handlers::handle_transition`
+    // (handlers.rs:988): secret-gate the caller-supplied transition note
+    // BEFORE any DB read/write (codex r2 High finding 3).
+    if let Some(n) = note_arg {
+        khive_runtime::secret_gate::check(n)?;
+    }
+
     let note = load_task(runtime, token, id).await?;
     let current = task_status(note.properties.as_ref());
 
@@ -303,6 +315,11 @@ async fn prepare_gtd_transition(
     let mut props = note.properties.clone().unwrap_or_else(|| json!({}));
     if let Some(obj) = props.as_object_mut() {
         obj.insert("status".into(), json!(target));
+        // Parity with handlers.rs:1028 — persist the caller-supplied
+        // transition note under `properties.transition_note`.
+        if let Some(n) = note_arg {
+            obj.insert("transition_note".into(), json!(n));
+        }
         if target == "done" {
             obj.insert("completed_at".into(), json!(Utc::now().to_rfc3339()));
         }
@@ -348,6 +365,13 @@ async fn prepare_gtd_complete(
         .and_then(|o| o.get("result"))
         .and_then(|v| v.as_str());
 
+    // Parity with `khive-pack-gtd::handlers::handle_complete` (handlers.rs:803):
+    // secret-gate the caller-supplied result BEFORE any DB read/write
+    // (codex r2 High finding 3).
+    if let Some(result) = result_arg {
+        khive_runtime::secret_gate::check(result)?;
+    }
+
     let note = load_task(runtime, token, id).await?;
     let current = task_status(note.properties.as_ref());
 
@@ -392,4 +416,209 @@ async fn prepare_gtd_complete(
             guard: Some(AffectedRowGuard::exactly(1)),
         }],
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use khive_types::Namespace;
+
+    fn scratch_runtime() -> KhiveRuntime {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("atomic_apply_gtd.db");
+        let rt = KhiveRuntime::new(RuntimeConfig {
+            db_path: Some(path),
+            embedding_model: None,
+            additional_embedding_models: vec![],
+            ..RuntimeConfig::default()
+        })
+        .expect("runtime");
+        std::mem::forget(dir);
+        rt
+    }
+
+    /// Seed a live GTD task note directly (bypassing `gtd.assign`'s handler,
+    /// which lives one crate over) with the flat properties shape
+    /// `load_task`/`task_status` expect: `kind = "task"`,
+    /// `properties.status`.
+    async fn seed_task(runtime: &KhiveRuntime, token: &NamespaceToken, status: &str) -> Uuid {
+        let mut note = khive_storage::note::Note::new("local", "task", "atomic-gtd-test-task");
+        note.name = Some("atomic-gtd-test-task".to_string());
+        note.properties = Some(json!({"status": status, "priority": "p2"}));
+        let id = note.id;
+        runtime
+            .notes(token)
+            .expect("notes store")
+            .upsert_note(note)
+            .await
+            .expect("seed task");
+        id
+    }
+
+    fn task_properties(note: &khive_storage::note::Note) -> &Value {
+        note.properties
+            .as_ref()
+            .expect("task must carry properties")
+    }
+
+    /// B3 fix round 3 (codex r2 High finding 3): atomic `gtd.transition`
+    /// must persist a caller-supplied `note` as `properties.transition_note`
+    /// — parity with `khive-pack-gtd::handlers::handle_transition`
+    /// (handlers.rs:1028), which the pre-fix atomic prepare silently
+    /// dropped (it never read the `note` arg at all).
+    #[tokio::test]
+    async fn atomic_gtd_transition_persists_transition_note() {
+        let runtime = scratch_runtime();
+        let token = runtime
+            .authorize(Namespace::parse("local").expect("ns"))
+            .expect("authorize");
+        let task_id = seed_task(&runtime, &token, "inbox").await;
+
+        let plan = prepare_gtd_transition(
+            &runtime,
+            &token,
+            &json!({"id": task_id.to_string(), "status": "next", "note": "handed off to reviewer"}),
+        )
+        .await
+        .expect("prepare transition");
+
+        let outcome =
+            khive_runtime::atomic_runner::run_atomic_unit(runtime.sql().as_ref(), vec![plan])
+                .await
+                .expect("commit ok");
+        assert!(matches!(outcome, AtomicRunOutcome::Committed { .. }));
+
+        let note = runtime
+            .notes(&token)
+            .expect("notes store")
+            .get_note(task_id)
+            .await
+            .expect("get_note")
+            .expect("task must still exist");
+        let props = task_properties(&note);
+        assert_eq!(props.get("status").and_then(|v| v.as_str()), Some("next"));
+        assert_eq!(
+            props.get("transition_note").and_then(|v| v.as_str()),
+            Some("handed off to reviewer"),
+            "transition_note must be persisted into properties: {props:?}"
+        );
+    }
+
+    /// B3 fix round 3 (codex r2 High finding 3): a secret in the
+    /// `gtd.transition` `note` arg must be REJECTED at prepare, before any
+    /// DB write — parity with `handle_transition`'s pre-write secret_gate
+    /// check (handlers.rs:988).
+    #[tokio::test]
+    async fn atomic_gtd_transition_rejects_secret_in_note_before_any_write() {
+        let runtime = scratch_runtime();
+        let token = runtime
+            .authorize(Namespace::parse("local").expect("ns"))
+            .expect("authorize");
+        let task_id = seed_task(&runtime, &token, "inbox").await;
+
+        let err = prepare_gtd_transition(
+            &runtime,
+            &token,
+            &json!({
+                "id": task_id.to_string(),
+                "status": "next",
+                "note": "leaked key AKIAFAKEKEY1234567890",
+            }),
+        )
+        .await
+        .expect_err("a secret in the transition note must be rejected at prepare");
+        assert!(
+            err.to_string().contains("write blocked"),
+            "expected a secret_gate rejection, got: {err}"
+        );
+
+        // No write must have happened: status is still "inbox".
+        let note = runtime
+            .notes(&token)
+            .expect("notes store")
+            .get_note(task_id)
+            .await
+            .expect("get_note")
+            .expect("task must still exist");
+        assert_eq!(
+            task_properties(&note)
+                .get("status")
+                .and_then(|v| v.as_str()),
+            Some("inbox"),
+            "rejected prepare must not have mutated the task"
+        );
+    }
+
+    /// B3 fix round 3 (codex r2 High finding 3): a secret in the
+    /// `gtd.complete` `result` arg must be REJECTED at prepare, before any
+    /// DB write — parity with `handle_complete`'s pre-write secret_gate
+    /// check (handlers.rs:803); a clean result persists normally
+    /// (handlers.rs:832 parity).
+    #[tokio::test]
+    async fn atomic_gtd_complete_rejects_secret_in_result_and_persists_clean_result() {
+        let runtime = scratch_runtime();
+        let token = runtime
+            .authorize(Namespace::parse("local").expect("ns"))
+            .expect("authorize");
+
+        // (a) secret in `result` rejected before any write.
+        let task_id = seed_task(&runtime, &token, "next").await;
+        let err = prepare_gtd_complete(
+            &runtime,
+            &token,
+            &json!({
+                "id": task_id.to_string(),
+                "result": "shipped using AKIAFAKEKEY1234567890",
+            }),
+        )
+        .await
+        .expect_err("a secret in the complete result must be rejected at prepare");
+        assert!(
+            err.to_string().contains("write blocked"),
+            "expected a secret_gate rejection, got: {err}"
+        );
+        let note = runtime
+            .notes(&token)
+            .expect("notes store")
+            .get_note(task_id)
+            .await
+            .expect("get_note")
+            .expect("task must still exist");
+        assert_eq!(
+            task_properties(&note)
+                .get("status")
+                .and_then(|v| v.as_str()),
+            Some("next"),
+            "rejected prepare must not have mutated the task"
+        );
+
+        // (b) a clean result persists.
+        let plan = prepare_gtd_complete(
+            &runtime,
+            &token,
+            &json!({"id": task_id.to_string(), "result": "shipped clean"}),
+        )
+        .await
+        .expect("prepare complete");
+        let outcome =
+            khive_runtime::atomic_runner::run_atomic_unit(runtime.sql().as_ref(), vec![plan])
+                .await
+                .expect("commit ok");
+        assert!(matches!(outcome, AtomicRunOutcome::Committed { .. }));
+
+        let note = runtime
+            .notes(&token)
+            .expect("notes store")
+            .get_note(task_id)
+            .await
+            .expect("get_note")
+            .expect("task must still exist");
+        let props = task_properties(&note);
+        assert_eq!(props.get("status").and_then(|v| v.as_str()), Some("done"));
+        assert_eq!(
+            props.get("result").and_then(|v| v.as_str()),
+            Some("shipped clean")
+        );
+    }
 }
