@@ -496,7 +496,7 @@ pub(crate) fn merge_dependency_kind(
 
 /// Merge a caller-supplied top-level `dependency_kind` param into an edge's
 /// `metadata` object, filling the key only if `metadata` doesn't already
-/// carry one. This is distinct from [`merge_dependency_kind`] above (which
+/// carry one. This is distinct from `merge_dependency_kind` above (which
 /// infers a default from endpoint entity kinds when no explicit value was
 /// given at all) — this one folds in an EXPLICIT `dependency_kind` argument
 /// the caller passed alongside `metadata`.

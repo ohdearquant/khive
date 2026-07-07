@@ -20,7 +20,7 @@
 //! apply path is a changeset-interpreter (`apply_worker`) over a dedicated
 //! `proposals_open` table, not a small number of guarded DML statements — a
 //! faithful, non-stub atomic prepare for them is separate follow-on work.
-//! [`prepare_governance_unimplemented`] fails loudly, before any write,
+//! `prepare_governance_unimplemented` fails loudly, before any write,
 //! naming this as a known scope gap rather than silently no-opping.
 //!
 //! `merge` is likewise on the v1 admissible list but is deferred (B3 fix

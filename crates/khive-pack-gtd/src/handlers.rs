@@ -507,7 +507,7 @@ async fn atomic_gtd_transition(
     Ok(affected)
 }
 
-/// The exact conditional-UPDATE DML [`atomic_gtd_transition`] issues, as a
+/// The exact conditional-UPDATE DML `atomic_gtd_transition` issues, as a
 /// plain [`SqlStatement`] — the single source of truth shared with the
 /// ADR-099 `--atomic` `gtd.transition`/`gtd.complete` prepare functions in
 /// `kkernel` (`crate::atomic_apply`, that crate — not this one — since
