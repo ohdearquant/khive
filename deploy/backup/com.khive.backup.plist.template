@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  ADR-100 backup job template. Rendered per (tier, store) pair by
+  install-backup.sh into ~/Library/LaunchAgents/com.khive.backup.<tier>.<store>.plist.
+  Never hand-edit an installed plist — a rerun of install-backup.sh
+  replaces it wholesale; edit stores.conf or pass installer flags instead.
+
+  __KHIVE_BACKUP_INTERVAL__ is a render variable on purpose: the ADR gates
+  the tier-1 15-minute cadence on measured sync cost (see RUNBOOK.md's
+  measurement-gate procedure) before this template's default is trusted
+  blindly. Widen it here (or via install-backup.sh's --interval flag) if
+  the measured cost does not clear the gate.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>__KHIVE_BACKUP_LABEL__</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>__KHIVE_BACKUP_SCRIPT__</string>
+    <string>__KHIVE_BACKUP_TIER__</string>
+    <string>__KHIVE_BACKUP_STORE__</string>
+  </array>
+
+  <key>StartInterval</key>
+  <integer>__KHIVE_BACKUP_INTERVAL__</integer>
+
+  <key>RunAtLoad</key>
+  <false/>
+
+  <key>StandardOutPath</key>
+  <string>__KHIVE_BACKUP_LOG_DIR__/__KHIVE_BACKUP_TIER__-__KHIVE_BACKUP_STORE__.out.log</string>
+
+  <key>StandardErrorPath</key>
+  <string>__KHIVE_BACKUP_LOG_DIR__/__KHIVE_BACKUP_TIER__-__KHIVE_BACKUP_STORE__.err.log</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    <key>KHIVE_BACKUP_ROOT</key>
+    <string>__KHIVE_BACKUP_ROOT__</string>
+    <key>KHIVE_BACKUP_CONF</key>
+    <string>__KHIVE_BACKUP_CONF__</string>
+  </dict>
+</dict>
+</plist>
