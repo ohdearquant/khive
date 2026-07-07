@@ -1304,6 +1304,127 @@ default = true
         );
     }
 
+    // ── ADR-099 B1 inertness (golden shape) ────────────────────────────────────
+    //
+    // B1 adds only new, unconsumed types (khive-types atomic admissibility
+    // metadata, khive-runtime atomic-plan data, khive-request's parse-time
+    // check). None of them are wired into `dispatch_request_local` or
+    // `apply_ops_file` — this test pins the non-atomic response envelope's
+    // shape so a later slice that DOES wire `--atomic` in cannot silently
+    // change today's default (non-atomic) output. The op sequence below
+    // (create → update → link → get) is the representative mix named in the
+    // task: a create, a mutation, a graph edge, and a read, run back-to-back
+    // through the same in-process dispatch path bulk apply uses.
+    #[tokio::test]
+    async fn non_atomic_dispatch_envelope_shape_is_unchanged_by_adr099_b1() {
+        let db_file = NamedTempFile::new().expect("temp db");
+        let db_path = db_file.path().to_str().expect("utf8").to_string();
+        let server = isolated_server(&db_path);
+
+        async fn dispatch(server: &KhiveMcpServer, ops: &str) -> serde_json::Value {
+            let params = RequestParams {
+                ops: ops.to_string(),
+                presentation: None,
+                presentation_per_op: None,
+                save_to: None,
+                format: None,
+                format_per_op: None,
+            };
+            let raw = server
+                .dispatch_request_local(params)
+                .await
+                .unwrap_or_else(|e| panic!("dispatch {ops:?} failed: {e}"));
+            serde_json::from_str(&raw).expect("valid JSON")
+        }
+
+        // create
+        let created = dispatch(
+            &server,
+            r#"create(kind="concept", name="ADR-099-B1-inertness")"#,
+        )
+        .await;
+        assert_golden_envelope_shape(&created, "create");
+        let entity_id = created["results"][0]["result"]["id"]
+            .as_str()
+            .expect("create must return an id")
+            .to_string();
+
+        // update
+        let updated = dispatch(
+            &server,
+            &format!(r#"update(id="{entity_id}", description="updated by inertness test")"#),
+        )
+        .await;
+        assert_golden_envelope_shape(&updated, "update");
+
+        // link (self-referential edge is rejected by endpoint validation for
+        // most relations, so create a second entity as the link target)
+        let target = dispatch(&server, r#"create(kind="concept", name="link-target")"#).await;
+        let target_id = target["results"][0]["result"]["id"]
+            .as_str()
+            .expect("create must return an id")
+            .to_string();
+        let linked = dispatch(
+            &server,
+            &format!(
+                r#"link(source_id="{entity_id}", target_id="{target_id}", relation="extends")"#
+            ),
+        )
+        .await;
+        assert_golden_envelope_shape(&linked, "link");
+
+        // get (read)
+        let got = dispatch(&server, &format!(r#"get(id="{entity_id}")"#)).await;
+        assert_golden_envelope_shape(&got, "get");
+
+        // Every op above succeeded end-to-end with zero surprises in the
+        // envelope shape — this is the inertness pin: no `atomic` key
+        // appeared anywhere, `summary` kept exactly its 4 pre-existing
+        // fields on every response, and every op's own result still nests
+        // under `results[0].result` as before.
+    }
+
+    /// Asserts a `dispatch_request_local` response matches the pre-ADR-099-B1
+    /// golden shape: exactly the top-level keys `results` and `summary` (no
+    /// additive `atomic` block — that is a future, opt-in-only slice), a
+    /// `summary` with exactly `total`/`succeeded`/`failed`/`aborted`, and a
+    /// successful single-op `results[0]` carrying `ok`/`tool`/`result`.
+    fn assert_golden_envelope_shape(resp: &serde_json::Value, expected_tool: &str) {
+        let top_level_keys: std::collections::BTreeSet<&str> = resp
+            .as_object()
+            .expect("response must be a JSON object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            top_level_keys,
+            std::collections::BTreeSet::from(["results", "summary"]),
+            "non-atomic envelope must carry exactly results+summary, no `atomic` block: {resp}"
+        );
+
+        let summary_keys: std::collections::BTreeSet<&str> = resp["summary"]
+            .as_object()
+            .expect("summary must be an object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            summary_keys,
+            std::collections::BTreeSet::from(["total", "succeeded", "failed", "aborted"]),
+            "summary shape must be unchanged: {resp}"
+        );
+        assert_eq!(resp["summary"]["total"], serde_json::json!(1));
+        assert_eq!(resp["summary"]["succeeded"], serde_json::json!(1));
+        assert_eq!(resp["summary"]["failed"], serde_json::json!(0));
+
+        assert_eq!(resp["results"][0]["ok"], serde_json::json!(true));
+        assert_eq!(resp["results"][0]["tool"], serde_json::json!(expected_tool));
+        assert!(
+            resp["results"][0].get("result").is_some(),
+            "results[0] must carry a `result` field: {resp}"
+        );
+    }
+
     #[tokio::test]
     async fn ops_file_dry_run_writes_nothing() {
         let db_file = NamedTempFile::new().expect("temp db");

@@ -11,6 +11,7 @@ categories.workspace = true
 description = "Request DSL — parses verb-dispatch strings (function-call, JSON, and future LNDL / pipe / bash-style syntaxes) into a transport-agnostic ParsedRequest AST"
 
 [dependencies]
+khive-types = { version = "0.3.0", path = "../khive-types" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 
