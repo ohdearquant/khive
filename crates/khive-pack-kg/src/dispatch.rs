@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use khive_runtime::pack::PackRuntime;
 use khive_runtime::{
-    EntityTypeValidatorFn, KhiveRuntime, NamespaceToken, RuntimeError, VerbRegistry,
+    EntityTypeValidatorFn, KhiveRuntime, NamespaceToken, RuntimeError, SchemaPlan, VerbRegistry,
 };
 use khive_types::{EdgeEndpointRule, HandlerDef};
 
@@ -52,8 +52,33 @@ impl PackRuntime for KgPack {
         &KG_EDGE_RULES
     }
 
+    /// Declares the workspace mirror's pack-owned cursor table (ADR-087).
+    /// The rest of KG's storage (entities/notes/edges) is baked into the
+    /// central `khive-db` migrations, not this declarative pack-schema
+    /// mechanism — `workspace_mirror_cursor` is the one auxiliary table this
+    /// pack owns outside that central schema, mirroring how
+    /// `khive-pack-session` declares its own `session_mirror_cursor` table.
+    fn schema_plan(&self) -> SchemaPlan {
+        SchemaPlan {
+            pack: "kg",
+            statements: &crate::mirror::WORKSPACE_MIRROR_SCHEMA_PLAN_STMTS,
+        }
+    }
+
     async fn warm(&self) {
         let _ = self.runtime.embed("khive warmup").await;
+
+        // ADR-087: background workspace mirror. Off by default
+        // (`KHIVE_MIRROR_WORKSPACE_ENABLED`, matching the session mirror's
+        // own opt-in convention) — only spawn the poller when explicitly
+        // enabled.
+        let config = crate::mirror::MirrorConfig::from_env();
+        if config.enabled {
+            let runtime = self.runtime.clone();
+            tokio::spawn(async move {
+                crate::mirror::run_mirror_service(runtime, config).await;
+            });
+        }
     }
 
     fn register_entity_type_validator(&self, _runtime: &KhiveRuntime) {

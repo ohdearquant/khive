@@ -20,6 +20,8 @@ async-trait = { workspace = true }
 chrono = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+sha2 = { workspace = true }
+tokio = { workspace = true }
 uuid = { workspace = true }
 tracing = { workspace = true }
 
@@ -27,6 +29,7 @@ tracing = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 criterion = { workspace = true }
 serde_json = { workspace = true }
+tempfile = { workspace = true }
 khive-pack-formal = { version = "0.3.0", path = "../khive-pack-formal" }
 khive-pack-gtd = { version = "0.3.0", path = "../khive-pack-gtd" }
 

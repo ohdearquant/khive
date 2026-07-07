@@ -5,6 +5,7 @@ mod dispatch;
 pub mod entity_type_registry;
 mod handler_defs;
 pub mod handlers;
+pub mod mirror;
 mod pack;
 pub mod projection_worker;
 pub mod vocab;
