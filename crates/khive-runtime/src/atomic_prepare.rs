@@ -47,7 +47,6 @@ use crate::atomic_plan::{
     AffectedRowGuard, DeletePlan, LinkPlan, MergePlan, PlanStatement, PostCommitEffect, UpdatePlan,
 };
 use crate::atomic_runner::AtomicOpPlan;
-use crate::curation::{merge_properties, EntityDedupMergePolicy};
 use crate::error::{RuntimeError, RuntimeResult};
 use crate::operations::{
     canonical_edge_endpoints, merge_dependency_kind, validate_edge_metadata, validate_edge_weight,
@@ -55,10 +54,16 @@ use crate::operations::{
 };
 use crate::runtime::{KhiveRuntime, NamespaceToken};
 
+use khive_db::stores::entity::{
+    entity_hard_delete_statement, entity_soft_delete_statement, entity_upsert_statement,
+};
 use khive_db::stores::event::event_insert_statements;
 use khive_db::stores::graph::{
     edge_hard_delete_statement, edge_soft_delete_statement, edge_upsert_statement,
     purge_incident_edges_statement,
+};
+use khive_db::stores::note::{
+    note_hard_delete_statement, note_soft_delete_statement, note_upsert_statement,
 };
 
 // ---------------------------------------------------------------------------
@@ -190,10 +195,21 @@ fn optional_f64(args: &Value, key: &str) -> RuntimeResult<Option<f64>> {
     }
 }
 
-fn properties_string(properties: &Option<Value>) -> Option<String> {
-    properties
-        .as_ref()
-        .map(|v| serde_json::to_string(v).unwrap_or_default())
+/// Tri-state patch extraction for `Option<Option<f64>>`-shaped fields
+/// (`NotePatch::salience` / `NotePatch::decay_factor`): key absent -> `None`
+/// (untouched), key present as JSON `null` -> `Some(None)` (clear), key
+/// present as a number -> `Some(Some(v))` (set). Preserves the atomic path's
+/// pre-existing `contains_key`-based clear/set/untouched semantics now that
+/// range validation itself has moved into curation.rs's `prepare_update_note`.
+fn optional_f64_patch(args: &Value, key: &str) -> RuntimeResult<Option<Option<f64>>> {
+    match obj(args)?.get(key) {
+        None => Ok(None),
+        Some(Value::Null) => Ok(Some(None)),
+        Some(v) => v
+            .as_f64()
+            .map(|f| Some(Some(f)))
+            .ok_or_else(|| RuntimeError::InvalidInput(format!("{key} must be a number"))),
+    }
 }
 
 /// Every registered embedding model's vector table name, in the exact format
@@ -530,91 +546,33 @@ async fn prepare_update(
     // half of GAP-4 — a spurious no-op reported as success) is implemented
     // in full.
     match runtime.resolve_by_id(token, id).await? {
-        Some(Resolved::Entity(entity)) => {
+        Some(Resolved::Entity(_)) => {
+            // Decide step lives in curation.rs's `prepare_update_entity` —
+            // the SAME function canonical `update_entity` calls. Only the
+            // arg-extraction (raw JSON -> `EntityPatch`) and the plan-shape
+            // wiring (domain object -> `PlanStatement` via the shared
+            // `entity_upsert_statement` builder) are atomic-path-specific.
             reject_inapplicable_update_fields(args, "entity")?;
             let name = entity_name_patch(args)?;
             let description = optional_string_patch(args, "description")?;
             let properties = optional_properties(args, "properties")?;
             let tags = optional_tags(args)?;
 
-            if let Some(ref n) = name {
-                crate::secret_gate::check(n)?;
-            }
-            if let Some(Some(ref d)) = description {
-                crate::secret_gate::check(d)?;
-            }
-            if let Some(ref p) = properties {
-                crate::secret_gate::check_json(p)?;
-            }
-            if let Some(ref t) = tags {
-                crate::secret_gate::check_tags(t)?;
-            }
-
-            let mut final_name = entity.name.clone();
-            let mut final_description = entity.description.clone();
-            let mut final_properties = entity.properties.clone();
-            let mut final_tags = entity.tags.clone();
-            let mut text_changed = false;
-            // Mirrors curation.rs update_entity's `changed_fields` tracking
-            // (curation.rs:226-248): pushed whenever the patch key was
-            // present, independent of whether the value actually differs —
-            // feeds the `EntityUpdated` event payload below.
-            let mut changed_fields: Vec<&'static str> = Vec::new();
-
-            if let Some(n) = name {
-                text_changed |= final_name != n;
-                final_name = n;
-                changed_fields.push("name");
-            }
-            if let Some(d) = description {
-                text_changed |= final_description != d;
-                final_description = d;
-                changed_fields.push("description");
-            }
-            if let Some(p) = properties {
-                let (merged, _) = merge_properties(
-                    &final_properties,
-                    &Some(p),
-                    EntityDedupMergePolicy::PreferFrom,
-                );
-                final_properties = merged;
-                changed_fields.push("properties");
-            }
-            if let Some(t) = tags {
-                final_tags = t;
-                changed_fields.push("tags");
-            }
-
-            let updated_at = chrono::Utc::now().timestamp_micros();
-            let statement = SqlStatement {
-                sql: "UPDATE entities SET name = ?1, description = ?2, properties = ?3, \
-                      tags = ?4, updated_at = ?5 WHERE id = ?6 AND deleted_at IS NULL"
-                    .to_string(),
-                params: vec![
-                    SqlValue::Text(final_name),
-                    match final_description {
-                        Some(d) => SqlValue::Text(d),
-                        None => SqlValue::Null,
+            let (entity, text_changed, changed_fields) = runtime
+                .prepare_update_entity(
+                    token,
+                    id,
+                    crate::curation::EntityPatch {
+                        name,
+                        description,
+                        properties,
+                        tags,
                     },
-                    match properties_string(&final_properties) {
-                        Some(p) => SqlValue::Text(p),
-                        None => SqlValue::Null,
-                    },
-                    SqlValue::Text(
-                        serde_json::to_string(&final_tags).unwrap_or_else(|_| "[]".into()),
-                    ),
-                    SqlValue::Integer(updated_at),
-                    SqlValue::Text(id.to_string()),
-                ],
-                label: Some("atomic-update-entity".to_string()),
-            };
-            let post_commit = if text_changed {
-                PostCommitEffect::ReindexEntity { entity_id: id }
-            } else {
-                PostCommitEffect::None
-            };
+                )
+                .await?;
+
             let mut statements = vec![PlanStatement {
-                statement,
+                statement: entity_upsert_statement(&entity),
                 guard: Some(AffectedRowGuard::exactly(1)),
             }];
             // GAP-1 (B3 fix round): curation.rs's `update_entity` appends an
@@ -633,103 +591,45 @@ async fn prepare_update(
                     "changed_fields": changed_fields,
                 }),
             )?);
+            let post_commit = if text_changed {
+                PostCommitEffect::ReindexEntity { entity_id: id }
+            } else {
+                PostCommitEffect::None
+            };
             Ok(AtomicOpPlan::Update(UpdatePlan {
                 target_id: id,
                 statements,
                 post_commit,
             }))
         }
-        Some(Resolved::Note(note)) => {
+        Some(Resolved::Note(_)) => {
+            // Decide step lives in curation.rs's `prepare_update_note` — the
+            // SAME function canonical `update_note` calls, including the
+            // salience/decay_factor range validation. `optional_f64_patch`
+            // below preserves the pre-existing atomic tri-state semantics
+            // (key absent = untouched, key null = clear, key present = set)
+            // when constructing the `NotePatch`.
             reject_inapplicable_update_fields(args, "note")?;
             let name = optional_string_patch(args, "name")?;
             let content = optional_str(args, "content").map(|s| s.to_string());
             let properties = optional_properties(args, "properties")?;
-            let salience = optional_f64(args, "salience")?;
-            let decay_factor = optional_f64(args, "decay_factor")?;
+            let salience = optional_f64_patch(args, "salience")?;
+            let decay_factor = optional_f64_patch(args, "decay_factor")?;
 
-            if let Some(ref c) = content {
-                crate::secret_gate::check(c)?;
-            }
-            if let Some(Some(ref n)) = name {
-                crate::secret_gate::check(n)?;
-            }
-            if let Some(ref p) = properties {
-                crate::secret_gate::check_json(p)?;
-            }
+            let (note, text_changed) = runtime
+                .prepare_update_note(
+                    token,
+                    id,
+                    crate::curation::NotePatch::new(
+                        name,
+                        content,
+                        salience,
+                        decay_factor,
+                        properties,
+                    ),
+                )
+                .await?;
 
-            let mut final_name = note.name.clone();
-            let mut final_content = note.content.clone();
-            let mut final_properties = note.properties.clone();
-            let mut final_salience = note.salience;
-            let mut final_decay = note.decay_factor;
-            let mut text_changed = false;
-
-            if let Some(n) = name {
-                text_changed |= final_name != n;
-                final_name = n;
-            }
-            if let Some(c) = content {
-                text_changed |= final_content != c;
-                final_content = c;
-            }
-            if let Some(p) = properties {
-                let (merged, _) = merge_properties(
-                    &final_properties,
-                    &Some(p),
-                    EntityDedupMergePolicy::PreferFrom,
-                );
-                final_properties = merged;
-            }
-            if obj(args)?.contains_key("salience") {
-                if let Some(s) = salience {
-                    if !s.is_finite() || !(0.0..=1.0).contains(&s) {
-                        return Err(RuntimeError::InvalidInput(format!(
-                            "salience must be a finite value in [0.0, 1.0]; got {s}"
-                        )));
-                    }
-                }
-                final_salience = salience;
-            }
-            if obj(args)?.contains_key("decay_factor") {
-                if let Some(d) = decay_factor {
-                    if !d.is_finite() || d < 0.0 {
-                        return Err(RuntimeError::InvalidInput(format!(
-                            "decay_factor must be a finite value >= 0.0; got {d}"
-                        )));
-                    }
-                }
-                final_decay = decay_factor;
-            }
-
-            let updated_at = chrono::Utc::now().timestamp_micros();
-            let statement = SqlStatement {
-                sql: "UPDATE notes SET name = ?1, content = ?2, properties = ?3, \
-                      salience = ?4, decay_factor = ?5, updated_at = ?6 \
-                      WHERE id = ?7 AND deleted_at IS NULL"
-                    .to_string(),
-                params: vec![
-                    match final_name {
-                        Some(n) => SqlValue::Text(n),
-                        None => SqlValue::Null,
-                    },
-                    SqlValue::Text(final_content),
-                    match properties_string(&final_properties) {
-                        Some(p) => SqlValue::Text(p),
-                        None => SqlValue::Null,
-                    },
-                    match final_salience {
-                        Some(s) => SqlValue::Float(s),
-                        None => SqlValue::Null,
-                    },
-                    match final_decay {
-                        Some(d) => SqlValue::Float(d),
-                        None => SqlValue::Null,
-                    },
-                    SqlValue::Integer(updated_at),
-                    SqlValue::Text(id.to_string()),
-                ],
-                label: Some("atomic-update-note".to_string()),
-            };
             let post_commit = if text_changed {
                 PostCommitEffect::ReindexNote { note_id: id }
             } else {
@@ -738,7 +638,7 @@ async fn prepare_update(
             Ok(AtomicOpPlan::Update(UpdatePlan {
                 target_id: id,
                 statements: vec![PlanStatement {
-                    statement,
+                    statement: note_upsert_statement(&note),
                     guard: Some(AffectedRowGuard::exactly(1)),
                 }],
                 post_commit,
@@ -1048,39 +948,27 @@ pub async fn prepare_delete(
                 }
             }
             let namespace = entity.namespace.clone();
+            // Storage parity: `entity_soft_delete_statement`/
+            // `entity_hard_delete_statement` are the SAME khive-db builders
+            // khive-db's own `SqlEntityStore::delete_entity` calls — no DML
+            // text is hand-duplicated here.
             let mut statements = if hard {
-                // Storage parity with the non-atomic hard-delete DML
-                // (entity.rs `DELETE FROM entities WHERE id = ?1`, no
-                // `deleted_at` predicate) — purges live AND already-tombstoned
-                // rows alike.
                 vec![PlanStatement {
-                    statement: SqlStatement {
-                        sql: "DELETE FROM entities WHERE id = ?1".to_string(),
-                        params: vec![SqlValue::Text(id.to_string())],
-                        label: Some("atomic-delete-entity-hard".to_string()),
-                    },
+                    statement: entity_hard_delete_statement(id),
                     guard: Some(AffectedRowGuard::exactly(1)),
                 }]
             } else {
                 let deleted_at = chrono::Utc::now().timestamp_micros();
                 vec![PlanStatement {
-                    statement: SqlStatement {
-                        sql: "UPDATE entities SET deleted_at = ?1 WHERE id = ?2 AND deleted_at IS NULL"
-                            .to_string(),
-                        params: vec![SqlValue::Integer(deleted_at), SqlValue::Text(id.to_string())],
-                        label: Some("atomic-delete-entity-soft".to_string()),
-                    },
+                    statement: entity_soft_delete_statement(id, deleted_at),
                     guard: Some(AffectedRowGuard::exactly(1)),
                 }]
             };
             if hard {
+                // Same builder canonical `delete_entity`'s hard-delete
+                // cascade calls (`graph.purge_incident_edges`).
                 statements.push(PlanStatement {
-                    statement: SqlStatement {
-                        sql: "DELETE FROM graph_edges WHERE source_id = ?1 OR target_id = ?1"
-                            .to_string(),
-                        params: vec![SqlValue::Text(id.to_string())],
-                        label: Some("atomic-delete-entity-cascade-edges".to_string()),
-                    },
+                    statement: purge_incident_edges_statement(id),
                     guard: None,
                 });
             }
@@ -1136,43 +1024,24 @@ pub async fn prepare_delete(
                 }
             }
             let namespace = note.namespace.clone();
+            // Storage parity: `note_soft_delete_statement`/
+            // `note_hard_delete_statement` are the SAME khive-db builders
+            // khive-db's own `SqlNoteStore::delete_note` calls.
             let mut statements = if hard {
-                // Storage parity with the non-atomic hard-delete DML
-                // (note.rs `DELETE FROM notes WHERE id = ?1`, no
-                // `deleted_at` predicate) — purges live AND already-tombstoned
-                // rows alike.
                 vec![PlanStatement {
-                    statement: SqlStatement {
-                        sql: "DELETE FROM notes WHERE id = ?1".to_string(),
-                        params: vec![SqlValue::Text(id.to_string())],
-                        label: Some("atomic-delete-note-hard".to_string()),
-                    },
+                    statement: note_hard_delete_statement(id),
                     guard: Some(AffectedRowGuard::exactly(1)),
                 }]
             } else {
                 let deleted_at = chrono::Utc::now().timestamp_micros();
                 vec![PlanStatement {
-                    statement: SqlStatement {
-                        sql: "UPDATE notes SET status = 'deleted', deleted_at = ?1 \
-                              WHERE id = ?2 AND deleted_at IS NULL"
-                            .to_string(),
-                        params: vec![
-                            SqlValue::Integer(deleted_at),
-                            SqlValue::Text(id.to_string()),
-                        ],
-                        label: Some("atomic-delete-note-soft".to_string()),
-                    },
+                    statement: note_soft_delete_statement(id, deleted_at),
                     guard: Some(AffectedRowGuard::exactly(1)),
                 }]
             };
             if hard {
                 statements.push(PlanStatement {
-                    statement: SqlStatement {
-                        sql: "DELETE FROM graph_edges WHERE source_id = ?1 OR target_id = ?1"
-                            .to_string(),
-                        params: vec![SqlValue::Text(id.to_string())],
-                        label: Some("atomic-delete-note-cascade-edges".to_string()),
-                    },
+                    statement: purge_incident_edges_statement(id),
                     guard: None,
                 });
             }
