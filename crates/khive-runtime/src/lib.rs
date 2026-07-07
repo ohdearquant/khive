@@ -25,7 +25,7 @@ pub mod validation;
 
 pub use atomic_plan::{
     AffectedRowGuard, DeletePlan, GovernanceOp, GovernancePlan, GtdCompletePlan, GtdTransitionPlan,
-    LinkPlan, MergePlan, PlanPredicate, PostCommitEffect, UpdatePlan,
+    LinkPlan, MergePlan, PlanPredicate, PlanStatement, PostCommitEffect, UpdatePlan,
 };
 pub use curation::{
     entity_fts_document, note_fts_document, ContentMergeStrategy, EdgeListFilter, EdgePatch,

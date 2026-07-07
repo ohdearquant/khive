@@ -18,15 +18,42 @@
 //! 1. **Predicate-based plans** — a plan whose effect covers "all rows
 //!    matching a condition" carries that condition as a statement evaluated
 //!    inside the transaction, never as a prepare-time-enumerated row list
-//!    (`predicate`).
+//!    (`PlanPredicate`).
 //! 2. **Affected-row guards** — any statement whose prepare-time validation
 //!    assumed a target row exists carries an expected-effect guard, checked
 //!    in-transaction; a mismatch fails the op and rolls back the whole unit
-//!    (`guard`).
+//!    (`PlanStatement::guard`).
+//!
+//! A guard is attached to the exact [`PlanStatement`] it validates, never to
+//! the plan as a whole: the storage layer returns affected-row counts
+//! per-statement (`SqlWriter::execute`) or as a batch total
+//! (`SqlWriter::execute_batch`), so a plan-level guard field cannot tell a
+//! future runner which statement's count it is checking without an implicit
+//! ordering convention. Each plan therefore carries `Vec<PlanStatement>`
+//! (or, for `merge`, the split `rewires`/`lifecycle` fields below) so the
+//! runner contract is: apply each statement individually, and where
+//! `guard.is_some()`, check that *statement's own* affected-row count before
+//! moving to the next.
 
 use uuid::Uuid;
 
 use khive_storage::SqlStatement;
+
+/// One statement in a plan, paired with the guard (if any) that validates
+/// it. **Runner contract:** a present `guard` is checked against the
+/// affected-row count of applying `statement` alone (`SqlWriter::execute`'s
+/// return value for this statement), not a batch total and not another
+/// statement's count. `guard: None` means prepare made no row-existence
+/// assumption about this particular statement (e.g. a cascade delete that
+/// may legitimately touch zero rows).
+#[derive(Debug, Clone)]
+pub struct PlanStatement {
+    /// The DML to apply inside the atomic unit.
+    pub statement: SqlStatement,
+    /// The expected-effect guard for `statement`, if prepare's validation
+    /// assumed a target row exists for it.
+    pub guard: Option<AffectedRowGuard>,
+}
 
 /// The predicate a prepare pass validated a plan's target against, replayed
 /// as a statement evaluated **inside** the transaction (ADR-099 D1, rule 1:
@@ -111,11 +138,11 @@ pub enum PostCommitEffect {
 pub struct UpdatePlan {
     /// The id of the entity or note being updated.
     pub target_id: Uuid,
-    /// Row + FTS DML statements to apply inside the atomic unit.
-    pub statements: Vec<SqlStatement>,
-    /// Guard on the row-update statement (prepare assumed the target row
-    /// exists).
-    pub guard: AffectedRowGuard,
+    /// Row + FTS DML statements to apply inside the atomic unit, in order.
+    /// The row-update statement carries the existence guard; any FTS-mirror
+    /// statement that follows it is unguarded (its target row's existence
+    /// was already asserted by the row-update statement's own guard).
+    pub statements: Vec<PlanStatement>,
     /// Deferred reindex, if the update changed name/description/content.
     pub post_commit: PostCommitEffect,
 }
@@ -126,45 +153,52 @@ pub struct DeletePlan {
     /// The id of the entity or note being deleted.
     pub target_id: Uuid,
     /// Row DML (and, for a hard delete, incident-edge cascade DML) to apply
-    /// inside the atomic unit.
-    pub statements: Vec<SqlStatement>,
-    /// Guard on the delete statement (prepare assumed the target row
-    /// exists).
-    pub guard: AffectedRowGuard,
+    /// inside the atomic unit, in order. The target-row delete statement
+    /// carries the existence guard; a cascade edge-delete statement (hard
+    /// delete only) is unguarded — it may legitimately affect zero rows if
+    /// the target had no incident edges.
+    pub statements: Vec<PlanStatement>,
 }
 
-/// Write plan for a `link` op (create a typed directed edge).
+/// Write plan for a `link` op (create a typed directed edge). Endpoint
+/// existence is checked **structurally**, not via an unanchored plan-level
+/// guard: `statement` is a guarded `INSERT ... SELECT ... WHERE EXISTS`
+/// shape whose `SELECT` re-probes both endpoints inside the transaction, so
+/// the runner's affected-row check on this one statement *is* the
+/// in-transaction existence probe (ADR-099 acceptance criteria's
+/// dangling-edge case — `[delete(X, hard), link(A, X)]` — is closed by this
+/// guard failing once X is gone, regardless of statement ordering
+/// convention).
 #[derive(Debug, Clone)]
 pub struct LinkPlan {
     pub source_id: Uuid,
     pub target_id: Uuid,
-    /// Edge-insert DML to apply inside the atomic unit.
-    pub statements: Vec<SqlStatement>,
-    /// Guard on the endpoint-existence check (prepare validated both
-    /// endpoints exist; ADR-099 acceptance criteria's dangling-edge case —
-    /// `[delete(X, hard), link(A, X)]` — is closed by this guard failing
-    /// in-transaction once X is gone).
-    pub guard: AffectedRowGuard,
+    /// The guarded `INSERT ... SELECT ... WHERE EXISTS(...)` statement:
+    /// its affected-row count is the endpoint-existence probe.
+    pub statement: PlanStatement,
 }
 
-/// Write plan for a `merge` op (deduplicate two entities). The edge rewire is
-/// **predicate-based** (ADR-099 D1 rule 1) — `predicate` holds the
-/// `UPDATE graph_edges SET source_id = :into WHERE source_id = :from`-shaped
-/// statement evaluated inside the transaction, so it structurally sees any
-/// earlier op's edge writes in the same file (ADR-099 acceptance criteria:
-/// "merge rewires see earlier in-file writes").
+/// Write plan for a `merge` op (deduplicate two entities). Rewires and
+/// lifecycle writes are split into separate fields precisely so a guard is
+/// never ambiguous between them: the edge rewire is **predicate-based**
+/// (ADR-099 D1 rule 1) and may touch zero or many rows depending on earlier
+/// in-file writes, so it is never guarded; the `from`/`into` entity
+/// lifecycle write assumes both rows exist, so it always is.
 #[derive(Debug, Clone)]
 pub struct MergePlan {
     pub into_id: Uuid,
     pub from_id: Uuid,
-    /// The predicated edge-rewire statement(s), plus the `from` entity's
-    /// soft-delete/tombstone DML.
-    pub statements: Vec<SqlStatement>,
-    /// The in-transaction predicate the rewire is evaluated against.
-    pub predicate: PlanPredicate,
-    /// Guard on the merge target existing (prepare assumed `into`/`from`
-    /// both exist).
-    pub guard: AffectedRowGuard,
+    /// Predicate-based edge-rewire statement(s)
+    /// (`UPDATE graph_edges SET source_id = :into WHERE source_id = :from`-
+    /// shaped), evaluated inside the transaction so they structurally see
+    /// any earlier op's edge writes in the same file (ADR-099 acceptance
+    /// criteria: "merge rewires see earlier in-file writes"). Never
+    /// guarded — a rewire touching zero rows is a legitimate outcome.
+    pub rewires: Vec<PlanPredicate>,
+    /// The `from` entity's soft-delete/tombstone DML (and any other
+    /// lifecycle write prepare assumed a target row exists for). Always
+    /// guarded — prepare validated `into`/`from` both exist.
+    pub lifecycle: Vec<PlanStatement>,
 }
 
 /// Write plan for a `gtd.transition` op (explicit task lifecycle change).
@@ -172,22 +206,21 @@ pub struct MergePlan {
 pub struct GtdTransitionPlan {
     pub task_id: Uuid,
     /// Status-column DML to apply inside the atomic unit. Property-only
-    /// status mutation — triggers no reindex (ADR-099 D3).
-    pub statements: Vec<SqlStatement>,
-    /// Guard on the transition statement (prepare validated the current
-    /// status and the requested transition were legal).
-    pub guard: AffectedRowGuard,
+    /// status mutation — triggers no reindex (ADR-099 D3). The transition
+    /// statement carries the guard (prepare validated the current status
+    /// and the requested transition were legal).
+    pub statements: Vec<PlanStatement>,
 }
 
 /// Write plan for a `gtd.complete` op (task lifecycle terminal transition).
 #[derive(Debug, Clone)]
 pub struct GtdCompletePlan {
     pub task_id: Uuid,
-    /// Status + `completed_at` DML to apply inside the atomic unit.
-    pub statements: Vec<SqlStatement>,
-    /// Guard on the completion statement (prepare validated the task was in
-    /// a completable state).
-    pub guard: AffectedRowGuard,
+    /// Status + `completed_at` DML to apply inside the atomic unit, in
+    /// order. The status-update statement carries the guard (prepare
+    /// validated the task was in a completable state); the `completed_at`
+    /// write targets the same already-guarded row and is unguarded.
+    pub statements: Vec<PlanStatement>,
 }
 
 /// Which governance verb (`propose` / `review` / `withdraw`) a
@@ -205,11 +238,10 @@ pub enum GovernanceOp {
 pub struct GovernancePlan {
     pub op: GovernanceOp,
     pub proposal_id: Uuid,
-    /// Event-log + status DML to apply inside the atomic unit.
-    pub statements: Vec<SqlStatement>,
-    /// Guard on the lifecycle-state check (prepare validated the proposal
-    /// was in a state admitting this transition).
-    pub guard: AffectedRowGuard,
+    /// Event-log + status DML to apply inside the atomic unit. The
+    /// lifecycle-state-check statement carries the guard (prepare validated
+    /// the proposal was in a state admitting this transition).
+    pub statements: Vec<PlanStatement>,
 }
 
 #[cfg(test)]
@@ -221,6 +253,20 @@ mod tests {
             sql: "UPDATE t SET x = ? WHERE id = ?".to_string(),
             params: vec![],
             label: Some(label.to_string()),
+        }
+    }
+
+    fn guarded(label: &str, guard: AffectedRowGuard) -> PlanStatement {
+        PlanStatement {
+            statement: stmt(label),
+            guard: Some(guard),
+        }
+    }
+
+    fn unguarded(label: &str) -> PlanStatement {
+        PlanStatement {
+            statement: stmt(label),
+            guard: None,
         }
     }
 
@@ -241,16 +287,19 @@ mod tests {
     }
 
     #[test]
-    fn update_plan_carries_predicate_free_guard_and_post_commit() {
+    fn update_plan_guard_is_anchored_to_the_row_statement_not_the_fts_mirror() {
         let id = Uuid::new_v4();
         let plan = UpdatePlan {
             target_id: id,
-            statements: vec![stmt("update-row")],
-            guard: AffectedRowGuard::exactly(1),
+            statements: vec![
+                guarded("update-row", AffectedRowGuard::exactly(1)),
+                unguarded("update-fts-mirror"),
+            ],
             post_commit: PostCommitEffect::ReindexEntity { entity_id: id },
         };
         assert_eq!(plan.target_id, id);
-        assert_eq!(plan.guard, AffectedRowGuard::exactly(1));
+        assert_eq!(plan.statements[0].guard, Some(AffectedRowGuard::exactly(1)));
+        assert_eq!(plan.statements[1].guard, None);
         assert_eq!(
             plan.post_commit,
             PostCommitEffect::ReindexEntity { entity_id: id }
@@ -258,39 +307,43 @@ mod tests {
     }
 
     #[test]
-    fn delete_plan_guard_requires_exactly_one_row() {
+    fn delete_plan_guard_is_anchored_to_the_target_row_not_the_cascade() {
         let plan = DeletePlan {
             target_id: Uuid::new_v4(),
-            statements: vec![stmt("delete-row")],
-            guard: AffectedRowGuard::exactly(1),
+            statements: vec![
+                guarded("delete-row", AffectedRowGuard::exactly(1)),
+                unguarded("cascade-edges"),
+            ],
         };
-        assert!(plan.guard.holds_for(1));
-        assert!(!plan.guard.holds_for(0));
+        let row_guard = plan.statements[0].guard.expect("row delete is guarded");
+        assert!(row_guard.holds_for(1));
+        assert!(!row_guard.holds_for(0));
+        assert_eq!(plan.statements[1].guard, None);
     }
 
     #[test]
-    fn link_plan_carries_both_endpoints_and_existence_guard() {
+    fn link_plan_guard_is_the_endpoint_existence_probe_itself() {
         let source = Uuid::new_v4();
         let target = Uuid::new_v4();
         let plan = LinkPlan {
             source_id: source,
             target_id: target,
-            statements: vec![stmt("insert-edge")],
-            guard: AffectedRowGuard::exactly(1),
+            statement: guarded("insert-edge-where-exists", AffectedRowGuard::exactly(1)),
         };
         assert_eq!(plan.source_id, source);
         assert_eq!(plan.target_id, target);
-        // Dangling-edge acceptance criterion: once the target row is gone,
-        // an in-transaction existence check affects 0 rows and the guard
-        // must fail, not silently pass.
-        assert!(!plan.guard.holds_for(0));
+        // Dangling-edge acceptance criterion: once an endpoint row is gone,
+        // the guarded INSERT...WHERE EXISTS affects 0 rows and the guard
+        // on *that exact statement* must fail, not silently pass.
+        let guard = plan.statement.guard.expect("link insert is guarded");
+        assert!(!guard.holds_for(0));
     }
 
     #[test]
-    fn merge_plan_predicate_is_evaluated_in_transaction_not_prepare_enumerated() {
+    fn merge_plan_rewires_are_never_guarded_lifecycle_writes_always_are() {
         let into = Uuid::new_v4();
         let from = Uuid::new_v4();
-        let predicate = PlanPredicate {
+        let rewire = PlanPredicate {
             description: "source_id = :from".to_string(),
             statement: SqlStatement {
                 sql: "UPDATE graph_edges SET source_id = ? WHERE source_id = ?".to_string(),
@@ -301,41 +354,48 @@ mod tests {
         let plan = MergePlan {
             into_id: into,
             from_id: from,
-            statements: vec![predicate.statement.clone()],
-            predicate,
-            guard: AffectedRowGuard::at_least_one(),
+            rewires: vec![rewire],
+            lifecycle: vec![guarded(
+                "tombstone-from-entity",
+                AffectedRowGuard::exactly(1),
+            )],
         };
         assert_eq!(plan.into_id, into);
         assert_eq!(plan.from_id, from);
-        assert_eq!(plan.predicate.description, "source_id = :from");
+        assert_eq!(plan.rewires[0].description, "source_id = :from");
         // A predicate-based rewire may legitimately touch zero or many rows
-        // depending on how many edges an earlier in-file op inserted; the
-        // guard only requires the merge itself to have found its targets.
-        assert!(plan.guard.holds_for(0) || plan.guard.expected_min == 1);
+        // depending on how many edges an earlier in-file op inserted — the
+        // type carries no guard field for it at all.
+        let lifecycle_guard = plan.lifecycle[0].guard.expect("lifecycle write is guarded");
+        assert!(!lifecycle_guard.holds_for(0));
     }
 
     #[test]
     fn gtd_transition_plan_triggers_no_reindex_by_construction() {
         let plan = GtdTransitionPlan {
             task_id: Uuid::new_v4(),
-            statements: vec![stmt("update-status")],
-            guard: AffectedRowGuard::exactly(1),
+            statements: vec![guarded("update-status", AffectedRowGuard::exactly(1))],
         };
         // Property-only status mutation — the type carries no post-commit
         // field at all, which is the structural guarantee (ADR-099 D3: task
         // transitions "trigger no reindex").
         assert_eq!(plan.statements.len(), 1);
+        assert!(plan.statements[0].guard.is_some());
     }
 
     #[test]
-    fn gtd_complete_plan_guard_requires_target_row() {
+    fn gtd_complete_plan_guard_is_anchored_to_the_status_write() {
         let plan = GtdCompletePlan {
             task_id: Uuid::new_v4(),
-            statements: vec![stmt("update-status"), stmt("update-completed-at")],
-            guard: AffectedRowGuard::exactly(1),
+            statements: vec![
+                guarded("update-status", AffectedRowGuard::exactly(1)),
+                unguarded("update-completed-at"),
+            ],
         };
         assert_eq!(plan.statements.len(), 2);
-        assert!(plan.guard.holds_for(1));
+        let guard = plan.statements[0].guard.expect("status write is guarded");
+        assert!(guard.holds_for(1));
+        assert_eq!(plan.statements[1].guard, None);
     }
 
     #[test]
@@ -348,10 +408,10 @@ mod tests {
             let plan = GovernancePlan {
                 op,
                 proposal_id: Uuid::new_v4(),
-                statements: vec![stmt("governance-event")],
-                guard: AffectedRowGuard::exactly(1),
+                statements: vec![guarded("governance-event", AffectedRowGuard::exactly(1))],
             };
             assert_eq!(plan.op, op);
+            assert!(plan.statements[0].guard.is_some());
         }
     }
 
