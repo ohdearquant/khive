@@ -246,6 +246,14 @@ sidecars travel with their database:
   never delete a `-wal` file directly — this is invariant 1 from the ADR
   and applies identically during manual restores an operator performs
   outside these scripts.
+- A quiescent WAL-mode database whose `-shm` sidecar is absent (common after
+  a sync visits a store no live process holds open) refuses read-only opens
+  with SQLite error 14: recovering the WAL index requires write access to
+  recreate `-shm`. Options: open the file once briefly in read-write mode
+  (any writer, e.g. `sqlite3 <db> "SELECT 1;"`), or read it without recovery
+  via `sqlite3 "file:<db>?immutable=1"` — the latter only when nothing can
+  be writing. The database file itself is intact; do not treat error 14 on
+  such a store as corruption.
 
 ## Off-host protection
 

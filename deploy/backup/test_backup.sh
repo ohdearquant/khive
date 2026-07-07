@@ -355,6 +355,20 @@ else
   ok "plist removed after uninstall"
 fi
 
+echo "=== test: manifest capture skips virtual tables but covers their shadow tables ==="
+# Production stores carry extension-backed virtual tables (vec0) that the
+# stock sqlite3 CLI cannot query. The manifest must enumerate only plain
+# tables; the virtual table's shadow tables hold the data and ARE captured.
+sqlite3 "${ORIGIN_DB}" "CREATE VIRTUAL TABLE fts_probe USING fts5(body); INSERT INTO fts_probe (body) VALUES ('virtual table row');"
+DRILL_VT_MANIFEST="${SANDBOX}/drill-manifest-vt.txt"
+if "${RESTORE_DRILL_SH}" capture fixture marker-1 "${DRILL_VT_MANIFEST}" >/tmp/khive-test-drill-vt.out 2>&1; then
+  ok "capture succeeds on an origin containing a virtual table"
+else
+  fail "capture should succeed with a virtual table present: $(cat /tmp/khive-test-drill-vt.out)"
+fi
+assert_not_contains "manifest omits the virtual table itself" "$(cat "${DRILL_VT_MANIFEST}")" "COUNT|fts_probe|"
+assert_contains "manifest covers the virtual table's shadow data table" "$(cat "${DRILL_VT_MANIFEST}")" "COUNT|fts_probe_data|"
+
 echo
 echo "[test_backup.sh] ${PASS} passed, ${FAIL} failed"
 [ "${FAIL}" -eq 0 ]

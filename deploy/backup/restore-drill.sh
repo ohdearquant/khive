@@ -69,22 +69,35 @@ MARKER_COLUMN="${KHIVE_BACKUP_MARKER_COLUMN:-id}"
 capture_manifest() {
   local db="$1" out="$2" readonly_flag="$3" tables table script raw line
 
+  # Virtual tables are excluded: the sqlite3 CLI may lack their extension
+  # module (e.g. vec0), and their content lives in plain shadow tables that
+  # ARE enumerated and checksummed here. Each row is "name|rowid" or
+  # "name|norowid" — WITHOUT ROWID tables (e.g. fts5 config shadow tables)
+  # cannot answer max(rowid); COUNT + CHECKSUM still cover them fully.
+  local table_sql="SELECT name || '|' || (CASE WHEN sql LIKE '%WITHOUT ROWID%' THEN 'norowid' ELSE 'rowid' END) FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' AND (sql IS NULL OR sql NOT LIKE 'CREATE VIRTUAL TABLE%') ORDER BY name;"
   if [ "${readonly_flag}" = "readonly" ]; then
-    tables="$("${SQLITE3_BIN}" -readonly "${db}" "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name;")"
+    tables="$("${SQLITE3_BIN}" -readonly "${db}" "${table_sql}")"
   else
-    tables="$("${SQLITE3_BIN}" "${db}" "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name;")"
+    tables="$("${SQLITE3_BIN}" "${db}" "${table_sql}")"
   fi
   [ -n "${tables}" ] || bdie "no tables found in ${db}"
 
-  script=".bail off
+  script=".bail on
 .mode list
 BEGIN DEFERRED;
 "
+  local rowid_kind
   while IFS= read -r table; do
     [ -z "${table}" ] && continue
+    rowid_kind="${table##*|}"
+    table="${table%|*}"
     script="${script}SELECT 'COUNT|${table}|' || count(*) FROM \"${table}\";
-SELECT 'MAXID|${table}|' || ifnull(max(rowid),-1) FROM \"${table}\";
-.sha3sum ${table}
+"
+    if [ "${rowid_kind}" = "rowid" ]; then
+      script="${script}SELECT 'MAXID|${table}|' || ifnull(max(rowid),-1) FROM \"${table}\";
+"
+    fi
+    script="${script}.sha3sum ${table}
 "
   done <<EOF
 ${tables}
@@ -94,10 +107,13 @@ EOF
 
   raw="${out}.raw"
   if [ "${readonly_flag}" = "readonly" ]; then
-    printf '%s' "${script}" | "${SQLITE3_BIN}" -readonly "${db}" >"${raw}" 2>/dev/null
+    printf '%s' "${script}" | "${SQLITE3_BIN}" -readonly "${db}" >"${raw}" 2>"${raw}.err" \
+      || bdie "manifest capture failed against ${db}: $(cat "${raw}.err")"
   else
-    printf '%s' "${script}" | "${SQLITE3_BIN}" "${db}" >"${raw}" 2>/dev/null
+    printf '%s' "${script}" | "${SQLITE3_BIN}" "${db}" >"${raw}" 2>"${raw}.err" \
+      || bdie "manifest capture failed against ${db}: $(cat "${raw}.err")"
   fi
+  rm -f "${raw}.err"
 
   : >"${out}"
   while IFS= read -r line; do
