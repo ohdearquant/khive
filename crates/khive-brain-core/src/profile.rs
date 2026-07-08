@@ -114,10 +114,12 @@ pub struct ProfileBinding {
 /// binding, or each pack's tier-3 (global tuning prior) would become
 /// unreachable.
 ///
-/// `actor` should be the caller's identity (e.g. `NamespaceToken::actor().id`)
-/// so actor-scoped bindings can match; pass `None` only when the call site has
-/// no caller identity to thread through (wildcard `actor="*"` bindings still
-/// match in that case).
+/// `actor` should be the caller's identity via `NamespaceToken::actor().binding_id()`
+/// so actor-scoped bindings can match; pass `None` for the anonymous caller or
+/// when the call site has no caller identity to thread through (wildcard
+/// `actor="*"` bindings still match in that case). Never pass the anonymous
+/// actor's raw `id` ("local") — it would let an anonymous caller match an
+/// explicit `actor="local"` binding that `None` never can.
 ///
 /// Shared by the memory pack (`ConsumerKind::Recall`) and the knowledge pack
 /// (`ConsumerKind::KnowledgeCompose`) — ADR-058 amendment, #542; actor-aware

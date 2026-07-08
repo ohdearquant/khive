@@ -2261,6 +2261,94 @@ async fn feedback_697_unattributed_resolves_via_actor_binding() {
     );
 }
 
+/// Systemic-fix regression: an ANONYMOUS caller must not match an explicit
+/// `actor="local"` binding. `ActorRef::anonymous()` carries `id: "local"`
+/// (`khive-gate/src/actor.rs`); before the `binding_id()` fix,
+/// `resolve_effective_feedback_profile` threaded `token.actor().id`
+/// unconditionally, so an anonymous token could match a binding a
+/// pre-actor-aware `None` never could.
+#[tokio::test]
+async fn feedback_anonymous_caller_does_not_match_explicit_actor_local_binding() {
+    // No actor_id configured — `rt.authorize` mints the anonymous actor.
+    let (pack, rt) = make_pack();
+    let registry = empty_registry();
+    let token = rt.authorize(Namespace::local()).unwrap();
+    assert!(
+        token.actor().is_anonymous(),
+        "test setup: token must carry the anonymous actor"
+    );
+
+    let target = create_test_entity(&rt, &token).await;
+
+    pack.dispatch(
+        "brain.create_profile",
+        json!({"name": "anon-local-v1", "consumer_kind": "recall"}),
+        &registry,
+        &token,
+    )
+    .await
+    .unwrap();
+    pack.dispatch(
+        "brain.activate",
+        json!({"profile_id": "anon-local-v1"}),
+        &registry,
+        &token,
+    )
+    .await
+    .unwrap();
+    // Bind explicitly to actor="local" — the exact id anonymous tokens carry.
+    pack.dispatch(
+        "brain.bind",
+        json!({"actor": "local", "profile_id": "anon-local-v1", "consumer_kind": "recall"}),
+        &registry,
+        &token,
+    )
+    .await
+    .unwrap();
+
+    // No served_by_profile_id supplied.
+    pack.dispatch(
+        "brain.feedback",
+        json!({"target_id": target, "signal": "useful"}),
+        &registry,
+        &token,
+    )
+    .await
+    .unwrap();
+
+    let bound_events = pack
+        .dispatch(
+            "brain.profile",
+            json!({"profile_id": "anon-local-v1"}),
+            &registry,
+            &token,
+        )
+        .await
+        .unwrap()["total_events"]
+        .as_u64()
+        .unwrap();
+    assert_eq!(
+        bound_events, 0,
+        "anonymous caller must NOT match the actor=\"local\" binding"
+    );
+
+    let default_events = pack
+        .dispatch(
+            "brain.profile",
+            json!({"profile_id": "balanced-recall-v1"}),
+            &registry,
+            &token,
+        )
+        .await
+        .unwrap()["total_events"]
+        .as_u64()
+        .unwrap();
+    assert_eq!(
+        default_events, 1,
+        "anonymous unattributed feedback must fall through to the default profile"
+    );
+}
+
 /// #697 (b): feedback with neither an explicit profile nor any matching
 /// binding still defaults to balanced-recall-v1 — existing behavior preserved.
 #[tokio::test]
