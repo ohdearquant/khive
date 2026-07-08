@@ -1559,6 +1559,20 @@ impl VerbRegistry {
 
 // ── Inventory-based dynamic pack loading ────────────────────────────────────
 
+/// Output of [`PackFactory::create_install`] — bundles the pack runtime with
+/// its optional by-ID resolver and dispatch hook so a factory can hand back
+/// all three built from one shared instance (see `BrainPackFactory` for why
+/// this matters: the dispatch hook must observe the same state the runtime
+/// mutates, not a second unrelated instance).
+pub struct PackInstall {
+    /// The pack runtime, registered into the builder's pack list.
+    pub runtime: Box<dyn PackRuntime>,
+    /// Optional by-ID resolver, registered when present.
+    pub resolver: Option<Box<dyn PackByIdResolver>>,
+    /// Optional post-dispatch observer, wired via `VerbRegistryBuilder::with_dispatch_hook`.
+    pub dispatch_hook: Option<Arc<dyn DispatchHook>>,
+}
+
 /// Factory for creating pack instances registered via `inventory` at link time.
 /// Each pack crate submits a `&'static dyn PackFactory` wrapped in a
 /// [`PackRegistration`]; the binary's linker collects them all into a single
@@ -1582,6 +1596,23 @@ pub trait PackFactory: Send + Sync + 'static {
 
     /// Create a new pack instance for the given runtime.
     fn create(&self, runtime: KhiveRuntime) -> Box<dyn PackRuntime>;
+
+    /// Build the full installation bundle for this pack: runtime, optional
+    /// resolver, optional dispatch hook.
+    ///
+    /// Defaults to composing `create` and `create_resolver` with no dispatch
+    /// hook, so existing factories compile unchanged. Packs whose dispatch
+    /// hook must observe the same instance as the runtime (e.g. `brain`)
+    /// override this method instead of `create`, since the default would
+    /// otherwise require two independent instances to share state.
+    fn create_install(&self, runtime: KhiveRuntime) -> PackInstall {
+        let resolver = self.create_resolver(runtime.clone());
+        PackInstall {
+            runtime: self.create(runtime),
+            resolver,
+            dispatch_hook: None,
+        }
+    }
 
     /// Optionally create a `PackByIdResolver` for this pack.
     ///
@@ -1694,9 +1725,13 @@ impl PackRegistry {
         // performs the topo-sort, so insertion order here does not matter.
         for name in names {
             let factory = factory_for(name.as_str()).unwrap(); // validated above
-            builder.register_boxed(factory.create(runtime.clone()));
-            if let Some(resolver) = factory.create_resolver(runtime.clone()) {
+            let install = factory.create_install(runtime.clone());
+            builder.register_boxed(install.runtime);
+            if let Some(resolver) = install.resolver {
                 builder.register_resolver(name.clone(), resolver);
+            }
+            if let Some(hook) = install.dispatch_hook {
+                builder.with_dispatch_hook(hook);
             }
         }
 
@@ -1749,9 +1784,13 @@ impl PackRegistry {
                 .get(name.as_str())
                 .cloned()
                 .unwrap_or_else(|| default_runtime.clone());
-            builder.register_boxed(factory.create(runtime.clone()));
-            if let Some(resolver) = factory.create_resolver(runtime) {
+            let install = factory.create_install(runtime);
+            builder.register_boxed(install.runtime);
+            if let Some(resolver) = install.resolver {
                 builder.register_resolver(name.clone(), resolver);
+            }
+            if let Some(hook) = install.dispatch_hook {
+                builder.with_dispatch_hook(hook);
             }
         }
 

@@ -16,25 +16,25 @@ use khive_storage::types::{PageRequest, SqlValue};
 
 use crate::message::{dual_write_message, note_to_message_json, resolve_id, short_id};
 use crate::params::{
-    deser, HeartbeatParams, InboxParams, IngestParams, ReadParams, ReplyParams, SendParams,
-    ThreadParams,
+    deser, HeartbeatParams, InboxParams, IngestParams, ProbeParams, ReadParams, ReplyParams,
+    SendParams, ThreadParams,
 };
 
 /// Validate an actor label: non-empty, no control characters, ≤255 bytes (ADR-057 Q1 loose).
-fn validate_actor_label(label: &str, field: &str) -> Result<(), RuntimeError> {
+fn validate_actor_label(verb: &str, label: &str, field: &str) -> Result<(), RuntimeError> {
     if label.trim().is_empty() {
         return Err(RuntimeError::InvalidInput(format!(
-            "send: `{field}` must not be empty"
+            "{verb}: `{field}` must not be empty"
         )));
     }
     if label.len() > 255 {
         return Err(RuntimeError::InvalidInput(format!(
-            "send: `{field}` must not exceed 255 bytes"
+            "{verb}: `{field}` must not exceed 255 bytes"
         )));
     }
     if label.chars().any(|c| c.is_control()) {
         return Err(RuntimeError::InvalidInput(format!(
-            "send: `{field}` must not contain control characters"
+            "{verb}: `{field}` must not contain control characters"
         )));
     }
     Ok(())
@@ -59,7 +59,7 @@ pub(crate) async fn handle_send(
     params: Value,
 ) -> Result<Value, RuntimeError> {
     let p: SendParams = deser(params)?;
-    validate_actor_label(&p.to, "to")?;
+    validate_actor_label("send", &p.to, "to")?;
     if p.content.trim().is_empty() {
         return Err(RuntimeError::InvalidInput(
             "send: `content` must not be empty".into(),
@@ -1149,6 +1149,186 @@ pub(crate) async fn handle_health(
         "as_of": as_of,
         "channels": channels,
     }))
+}
+
+/// `comm.probe` response — a stable, minimal polling contract (khive daemon
+/// hardening slice, ADR-D5). Field shape is frozen: do not add fields without
+/// updating the frozen contract in the comm pack README.
+#[derive(serde::Serialize)]
+pub(crate) struct ProbeResponse {
+    pub cursor_us: i64,
+    pub new_messages: Vec<ProbeMessage>,
+    pub stale_unread_count: i64,
+}
+
+#[derive(serde::Serialize)]
+pub(crate) struct ProbeMessage {
+    /// Full note UUID, hyphenated. `comm.read` accepts it directly.
+    pub id: String,
+    pub created_at_us: i64,
+    pub from_actor: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subject: Option<String>,
+}
+
+/// The single indexed read powering `comm.probe` (ADR-D5). `INDEXED BY
+/// idx_comm_message_to_actor` is a regression fence: if a custom bootstrap
+/// skips comm schema-plan application, this query fails loudly instead of
+/// silently degrading to a table scan.
+const PROBE_SQL: &str = "WITH \
+stats AS ( \
+    SELECT \
+        COALESCE(MAX(created_at), 0) AS cursor_us, \
+        COALESCE(SUM( \
+            CASE \
+                WHEN (json_type(properties, '$.read') IS NULL \
+                      OR json_type(properties, '$.read') != 'true') \
+                     AND created_at < ?4 \
+                THEN 1 ELSE 0 \
+            END \
+        ), 0) AS stale_unread_count \
+    FROM notes INDEXED BY idx_comm_message_to_actor \
+    WHERE namespace = ?1 \
+      AND kind = 'message' \
+      AND deleted_at IS NULL \
+      AND json_extract(properties, '$.to_actor') = ?2 \
+      AND json_extract(properties, '$.direction') = 'inbound' \
+), \
+new_rows AS ( \
+    SELECT \
+        id, \
+        created_at AS created_at_us, \
+        COALESCE(json_extract(properties, '$.from_actor'), namespace) AS from_actor, \
+        json_extract(properties, '$.subject') AS subject \
+    FROM notes INDEXED BY idx_comm_message_to_actor \
+    WHERE namespace = ?1 \
+      AND kind = 'message' \
+      AND deleted_at IS NULL \
+      AND json_extract(properties, '$.to_actor') = ?2 \
+      AND json_extract(properties, '$.direction') = 'inbound' \
+      AND (?3 IS NULL OR created_at > ?3) \
+    ORDER BY created_at DESC \
+    LIMIT 100 \
+) \
+SELECT \
+    stats.cursor_us, \
+    stats.stale_unread_count, \
+    new_rows.id, \
+    new_rows.created_at_us, \
+    new_rows.from_actor, \
+    new_rows.subject \
+FROM stats \
+LEFT JOIN ( \
+    SELECT * FROM new_rows ORDER BY created_at_us ASC \
+) AS new_rows ON TRUE \
+ORDER BY new_rows.created_at_us ASC";
+
+/// `probe` — strictly read-only poll for new inbound message metadata and a
+/// stale-unread count (ADR-D5). No read-flag mutation, no writes: this is
+/// polled every ~30s by many monitors and must stay a single cheap indexed
+/// query.
+pub(crate) async fn handle_probe(
+    runtime: &KhiveRuntime,
+    token: &NamespaceToken,
+    params: Value,
+) -> Result<Value, RuntimeError> {
+    let p: ProbeParams = deser(params)?;
+    validate_actor_label("probe", &p.actor, "actor")?;
+    if p.stale_minutes <= 0 {
+        return Err(RuntimeError::InvalidInput(
+            "probe: `stale_minutes` must be positive".into(),
+        ));
+    }
+
+    let now_us = Utc::now().timestamp_micros();
+    let stale_cutoff_us = now_us - p.stale_minutes * 60_000_000;
+
+    let response = query_probe(
+        runtime,
+        token.namespace().as_str(),
+        &p.actor,
+        p.since_us,
+        stale_cutoff_us,
+    )
+    .await?;
+
+    serde_json::to_value(response).map_err(|e| {
+        RuntimeError::InvalidInput(format!("probe: failed to serialize response: {e}"))
+    })
+}
+
+async fn query_probe(
+    runtime: &KhiveRuntime,
+    namespace: &str,
+    actor: &str,
+    since_us: Option<i64>,
+    stale_cutoff_us: i64,
+) -> Result<ProbeResponse, RuntimeError> {
+    let since_param = match since_us {
+        Some(v) => SqlValue::Integer(v),
+        None => SqlValue::Null,
+    };
+
+    let statement = khive_storage::types::SqlStatement {
+        sql: PROBE_SQL.to_string(),
+        params: vec![
+            SqlValue::Text(namespace.to_string()),
+            SqlValue::Text(actor.to_string()),
+            since_param,
+            SqlValue::Integer(stale_cutoff_us),
+        ],
+        label: Some("comm_probe".into()),
+    };
+
+    let sql = runtime.sql();
+    let mut reader = sql.reader().await.map_err(RuntimeError::Storage)?;
+    let rows = reader
+        .query_all(statement)
+        .await
+        .map_err(RuntimeError::Storage)?;
+
+    let mut cursor_us = 0i64;
+    let mut stale_unread_count = 0i64;
+    let mut new_messages = Vec::new();
+
+    for row in &rows {
+        if let Some(SqlValue::Integer(v)) = row.get("cursor_us") {
+            cursor_us = *v;
+        }
+        if let Some(SqlValue::Integer(v)) = row.get("stale_unread_count") {
+            stale_unread_count = *v;
+        }
+
+        let id = match row.get("id") {
+            Some(SqlValue::Text(s)) => s.clone(),
+            _ => continue,
+        };
+        let created_at_us = match row.get("created_at_us") {
+            Some(SqlValue::Integer(v)) => *v,
+            _ => continue,
+        };
+        let from_actor = match row.get("from_actor") {
+            Some(SqlValue::Text(s)) => s.clone(),
+            _ => continue,
+        };
+        let subject = match row.get("subject") {
+            Some(SqlValue::Text(s)) => Some(s.clone()),
+            _ => None,
+        };
+
+        new_messages.push(ProbeMessage {
+            id,
+            created_at_us,
+            from_actor,
+            subject,
+        });
+    }
+
+    Ok(ProbeResponse {
+        cursor_us,
+        new_messages,
+        stale_unread_count,
+    })
 }
 
 /// Candidate `$.external_id` values to match an inbound correlation key against.

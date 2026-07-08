@@ -129,6 +129,23 @@ pub(crate) struct HeartbeatParams {
     pub at: Option<String>,
 }
 
+/// Parameters for `comm.probe` — read-only poll for new inbound message
+/// metadata and stale unread count. Public polling contract (khive #667
+/// daemon hardening slice): shape is frozen, see the comm pack README.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ProbeParams {
+    pub actor: String,
+    #[serde(default)]
+    pub since_us: Option<i64>,
+    #[serde(default = "default_stale_minutes")]
+    pub stale_minutes: i64,
+}
+
+fn default_stale_minutes() -> i64 {
+    20
+}
+
 pub(crate) fn deser<T: serde::de::DeserializeOwned>(params: Value) -> Result<T, RuntimeError> {
     serde_json::from_value(params)
         .map_err(|e| RuntimeError::InvalidInput(format!("bad params: {e}")))

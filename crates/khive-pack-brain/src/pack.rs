@@ -133,6 +133,88 @@ impl khive_runtime::PackFactory for BrainPackFactory {
     fn create(&self, runtime: KhiveRuntime) -> Box<dyn khive_runtime::pack::PackRuntime> {
         Box::new(BrainPack::new(runtime))
     }
+
+    // Overrides the default `create`-based install so the dispatch hook
+    // observes the exact same `BrainPack` instance the runtime mutates,
+    // instead of a second, state-divergent instance.
+    fn create_install(&self, runtime: KhiveRuntime) -> khive_runtime::PackInstall {
+        let brain = std::sync::Arc::new(BrainPack::new(runtime));
+        khive_runtime::PackInstall {
+            runtime: Box::new(BrainPackRuntime(std::sync::Arc::clone(&brain))),
+            resolver: None,
+            dispatch_hook: Some(brain),
+        }
+    }
+}
+
+/// Forwards the full `PackRuntime` surface to the shared inner `BrainPack`
+/// instance so the pack registry's runtime and the registered dispatch hook
+/// (see `create_install`) observe the same state and persistence tracker.
+struct BrainPackRuntime(std::sync::Arc<BrainPack>);
+
+#[async_trait::async_trait]
+impl khive_runtime::pack::PackRuntime for BrainPackRuntime {
+    fn name(&self) -> &str {
+        self.0.name()
+    }
+
+    fn note_kinds(&self) -> &'static [&'static str] {
+        self.0.note_kinds()
+    }
+
+    fn entity_kinds(&self) -> &'static [&'static str] {
+        self.0.entity_kinds()
+    }
+
+    fn handlers(&self) -> &'static [khive_runtime::HandlerDef] {
+        self.0.handlers()
+    }
+
+    fn edge_rules(&self) -> &'static [khive_types::EdgeEndpointRule] {
+        self.0.edge_rules()
+    }
+
+    fn requires(&self) -> &'static [&'static str] {
+        self.0.requires()
+    }
+
+    fn note_kind_specs(&self) -> &'static [khive_runtime::NoteKindSpec] {
+        self.0.note_kind_specs()
+    }
+
+    fn kind_hook(&self, kind: &str) -> Option<std::sync::Arc<dyn khive_runtime::KindHook>> {
+        self.0.kind_hook(kind)
+    }
+
+    fn schema_plan(&self) -> khive_runtime::SchemaPlan {
+        self.0.schema_plan()
+    }
+
+    fn validation_rules(&self) -> &'static [khive_runtime::ValidationRule] {
+        self.0.validation_rules()
+    }
+
+    fn register_embedders(&self, runtime: &KhiveRuntime) {
+        self.0.register_embedders(runtime)
+    }
+
+    fn register_entity_type_validator(&self, runtime: &KhiveRuntime) {
+        self.0.register_entity_type_validator(runtime)
+    }
+
+    async fn warm(&self) {
+        self.0.warm().await
+    }
+
+    async fn dispatch(
+        &self,
+        verb: &str,
+        params: serde_json::Value,
+        registry: &khive_runtime::VerbRegistry,
+        token: &NamespaceToken,
+    ) -> Result<serde_json::Value, RuntimeError> {
+        self.0.dispatch(verb, params, registry, token).await
+    }
 }
 
 inventory::submit! { khive_runtime::PackRegistration(&BrainPackFactory) }

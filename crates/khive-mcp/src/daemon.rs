@@ -76,7 +76,17 @@ pub(crate) enum FallbackReason {
     ConfigMismatch,
     NamespaceMismatch,
     NoSocket,
+    // REASON: #644 made "the real frame was already written" a hard error
+    // (never a local-dispatch fallback) in `forward_or_spawn`, since retrying
+    // or falling back after a completed write risks a duplicate mutation. That
+    // removed the only production call sites for these two reasons. They stay
+    // in the closed 5-value metrics set for forward-compatibility (a future
+    // reason may reuse the same severity tier) and are exercised directly by
+    // the counter tests below, matching the existing no-production-call-site
+    // pattern already used for `fallback_total`/`fallback_count` in this file.
+    #[allow(dead_code)]
     ParseFailure,
+    #[allow(dead_code)]
     ProtocolMismatch,
 }
 
@@ -670,34 +680,86 @@ fn pid_is_khive_daemon(pid: u32) -> bool {
     }
 }
 
-/// Kill the daemon and remove its PID + socket files (caller holds the lock).
+/// Kill the daemon named by the PID file and remove its PID + socket files
+/// (caller holds the recovery lock).
+///
+/// #645: the PID observed here (`expected_pid`) is captured once, before
+/// SIGTERM, and re-checked immediately before unlinking in
+/// [`remove_daemon_paths_if_still_stale`]. The recovery lock normally
+/// serializes this whole function against a concurrent daemon boot (which
+/// holds the same lock across its own cleanup → bind → pid-write), but that
+/// guarantee depends on the daemon side successfully acquiring the lock too.
+/// Re-checking ownership right before deleting is the defense that still
+/// holds if a booting daemon ever proceeds without the lock: this call must
+/// not delete a replacement daemon's live socket/PID out from under it.
 fn kill_stale_daemon_inner() {
     #[cfg(test)]
     KILL_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
     let pid_file = pid_path();
-    if let Ok(contents) = std::fs::read_to_string(&pid_file) {
-        if let Ok(pid) = contents.trim().parse::<u32>() {
-            if pid_is_khive_daemon(pid) {
-                if let Ok(signed) = i32::try_from(pid) {
-                    if signed > 0 {
-                        // SAFETY: SIGTERM is a standard termination signal with no
-                        // side effects beyond asking the process to exit.
-                        unsafe {
-                            libc::kill(signed, libc::SIGTERM);
-                        }
+    let expected_pid = std::fs::read_to_string(&pid_file)
+        .ok()
+        .and_then(|s| s.trim().parse::<u32>().ok());
+
+    if let Some(pid) = expected_pid {
+        if pid_is_khive_daemon(pid) {
+            if let Ok(signed) = i32::try_from(pid) {
+                if signed > 0 {
+                    // SAFETY: SIGTERM is a standard termination signal with no
+                    // side effects beyond asking the process to exit.
+                    unsafe {
+                        libc::kill(signed, libc::SIGTERM);
                     }
                 }
-            } else {
-                tracing::warn!(
-                    pid,
-                    "PID in daemon file does not belong to a khive daemon — skipping SIGTERM"
-                );
             }
+        } else {
+            tracing::warn!(
+                pid,
+                "PID in daemon file does not belong to a khive daemon — skipping SIGTERM"
+            );
         }
     }
-    let _ = std::fs::remove_file(&pid_file);
-    let _ = std::fs::remove_file(socket_path());
+
+    remove_daemon_paths_if_still_stale(&pid_file, expected_pid);
+}
+
+/// Remove `pid_file`/the daemon socket only if ownership has not changed since
+/// `expected_pid` was observed: the PID file must still name `expected_pid`,
+/// and the socket path must not already have a live listener answering it.
+/// Either signal changing means a replacement daemon claimed the rendezvous
+/// between the observation and this call, and unlinking would delete its live
+/// paths instead of the truly-stale ones (#645).
+fn remove_daemon_paths_if_still_stale(pid_file: &std::path::Path, expected_pid: Option<u32>) {
+    let current_pid = std::fs::read_to_string(pid_file)
+        .ok()
+        .and_then(|s| s.trim().parse::<u32>().ok());
+    if current_pid != expected_pid {
+        tracing::warn!(
+            expected_pid = ?expected_pid,
+            current_pid = ?current_pid,
+            "pid file changed during stale-daemon cleanup — a replacement daemon \
+             already claimed it; skipping unlink to avoid deleting its live paths"
+        );
+        return;
+    }
+
+    let sock = socket_path();
+    // A plain blocking connect is enough here: any success means *something*
+    // is now listening at this path, which can only be a replacement daemon
+    // that bound after our probe found the old one dead. Combined with the
+    // PID-file recheck above, this closes the window even when the recovery
+    // lock alone did not exclude the replacement's boot.
+    if std::os::unix::net::UnixStream::connect(&sock).is_ok() {
+        tracing::warn!(
+            socket = ?sock,
+            "a live listener now answers the daemon socket — skipping unlink to \
+             avoid deleting a replacement daemon's rendezvous"
+        );
+        return;
+    }
+
+    let _ = std::fs::remove_file(pid_file);
+    let _ = std::fs::remove_file(&sock);
 }
 
 /// Outcome of the under-lock identity probe.
@@ -837,17 +899,119 @@ async fn kill_and_respawn(config_id: &str, namespace: &str) -> std::io::Result<R
     Ok(RecoveryOutcome::Spawned)
 }
 
+/// Build the hard error returned when the real request frame was fully
+/// written to the daemon socket but no trustworthy response came back.
+///
+/// #644: once `write_frame` has completed for a real (non-probe) frame, the
+/// daemon may already be dispatching or have finished dispatching it. There is
+/// no way from the client side to tell "never received" apart from "received,
+/// executed, response lost" — so this case must never be retried (against the
+/// same daemon or a freshly-spawned one) and must never silently fall back to
+/// local dispatch, either of which could execute a mutation a second time.
+fn ambiguous_forward_error() -> McpError {
+    McpError::internal_error(
+        "daemon response lost after request was sent; not retrying or locally \
+         dispatching to avoid duplicate execution",
+        None,
+    )
+}
+
+/// Bounded probe timeout used by [`wait_for_boot_quiescence_then_reprobe`],
+/// matching the 500ms bound already used by the identity probe inside
+/// [`kill_and_respawn`].
+const BOOT_FENCE_PROBE_TIMEOUT_MS: u64 = 500;
+
+/// Outcome of waiting for a concurrent cold-boot (migrations + pack schema
+/// plans / FTS DDL) to finish, then re-checking daemon liveness once quiescent.
+enum BootFenceOutcome {
+    /// Boot quiesced and a live, identity-matching daemon answered — keep
+    /// sending the real frame to it.
+    DaemonReady,
+    /// Boot quiesced and the probe definitively found no daemon — safe to
+    /// fall back to local dispatch.
+    SafeLocalFallback,
+    /// Daemon state is unknown (lock/join failure, or the post-quiescence
+    /// probe itself timed out) — must not local-dispatch.
+    HardError(McpError),
+}
+
+/// #667: the readiness-timeout branch of `forward_or_spawn`'s send loop used
+/// to return `None` (silent local fallback) purely because a freshly spawned
+/// daemon had not answered within the fixed deadline — including while that
+/// daemon was still inside its boot guard running migrations/pack schema
+/// plans (FTS DDL). A local writer/searcher racing in at exactly that moment
+/// could observe or create a partially-initialized `notes`/`fts_notes` schema.
+///
+/// This blocks on the SAME boot guard the daemon holds across cold-boot
+/// schema init (ADR-D3): acquiring it here can only succeed once no boot is
+/// in progress, so acquiring-then-immediately-dropping it is a pure
+/// quiescence wait. Only after that wait does it re-probe daemon identity —
+/// distinguishing "was still booting, now ready" from "genuinely no daemon"
+/// so the caller never has to guess which one caused the original timeout.
+async fn wait_for_boot_quiescence_then_reprobe(frame: &DaemonRequestFrame) -> BootFenceOutcome {
+    // `acquire_daemon_boot_guard` performs a blocking `flock`; run it on the
+    // blocking pool rather than the async executor.
+    let quiesced =
+        tokio::task::spawn_blocking(khive_runtime::daemon::acquire_daemon_boot_guard).await;
+    match quiesced {
+        Ok(Ok(guard)) => {
+            // The guard's only purpose here is proving quiescence; drop it
+            // immediately so it does not itself block a real boot or the
+            // re-probe below.
+            drop(guard);
+        }
+        Ok(Err(e)) => {
+            return BootFenceOutcome::HardError(McpError::internal_error(
+                format!(
+                    "failed to acquire daemon boot/recovery lock while waiting for \
+                     cold-boot quiescence: {e}"
+                ),
+                None,
+            ));
+        }
+        Err(e) => {
+            return BootFenceOutcome::HardError(McpError::internal_error(
+                format!("boot-quiescence wait task failed: {e}"),
+                None,
+            ));
+        }
+    }
+
+    match probe_daemon_identity(
+        &frame.config_id,
+        &frame.namespace,
+        BOOT_FENCE_PROBE_TIMEOUT_MS,
+    )
+    .await
+    {
+        ProbeOutcome::Alive => BootFenceOutcome::DaemonReady,
+        ProbeOutcome::Dead => BootFenceOutcome::SafeLocalFallback,
+        ProbeOutcome::Timeout => BootFenceOutcome::HardError(McpError::internal_error(
+            "daemon state uncertain after cold-boot quiescence; not falling back to \
+             local dispatch to avoid racing a possibly still-initializing index",
+            None,
+        )),
+    }
+}
+
 /// Forward a request to the daemon, auto-spawning it if absent.
 ///
-/// Returns `None` on any failure → caller falls back to local dispatch.
+/// Returns `None` only when nothing was ever written to the daemon and local
+/// dispatch is therefore safe: `KHIVE_NO_DAEMON` is set, or no daemon socket
+/// could be reached (`NoSocket`). It never returns `None` after the real frame
+/// has been written. `Some(Ok)` / `Some(Err)` both mean the request's fate is
+/// already decided at the daemon and the caller must not dispatch locally.
 ///
-/// If the daemon socket is reachable but its response cannot be decoded
-/// (stale binary speaking a different wire format), or the decoded response
-/// carries a `daemon_protocol_version` that does not match [`PROTOCOL_VERSION`]
-/// (new-client + old-daemon scenario), the stale daemon is killed and a fresh
-/// one is spawned exactly once under a single recovery lock. If the fresh daemon
-/// still reports the wrong protocol version, a hard protocol-mismatch error is
-/// returned rather than silently falling back to local dispatch.
+/// The real (possibly mutating) request frame is written to the daemon socket
+/// at most once per call. A `NoSocket` outcome never writes anything, so it is
+/// safe to establish or recover the daemon (via `kill_and_respawn`, which
+/// itself uses only `probe_only` frames) and retry the connect-and-write step
+/// until a response arrives or the readiness deadline elapses.
+///
+/// Once the real frame IS fully written — `ForwardOutcome::ParseFailure` or
+/// `ForwardOutcome::ProtocolMismatch` — this returns a hard error immediately
+/// (`ambiguous_forward_error`) instead of killing/respawning/retrying or
+/// falling back locally. See #644.
 pub async fn forward_or_spawn(frame: &DaemonRequestFrame) -> Option<Result<String, McpError>> {
     if env_truthy("KHIVE_NO_DAEMON") {
         return None;
@@ -858,206 +1022,45 @@ pub async fn forward_or_spawn(frame: &DaemonRequestFrame) -> Option<Result<Strin
             return map_response(resp, &frame.config_id, &frame.namespace)
         }
         ForwardOutcome::NoSocket => {
-            // No socket present; fall through to the first-spawn path below.
+            // Nothing was written; fall through to the spawn/recover-then-send
+            // path below.
         }
         ForwardOutcome::ParseFailure => {
-            // The socket was up but the response was garbage — stale daemon.
-            // kill_and_respawn holds the recovery lock across a bounded probe-only
-            // frame (500ms timeout, no verb dispatch) then kill + spawn. A concurrent
-            // client that already replaced the stale daemon causes the probe to return
-            // Skipped — the real request is forwarded exactly once below, never used
-            // as the probe itself.
-            tracing::info!("killing stale daemon (undecodable response) and respawning");
-            match kill_and_respawn(&frame.config_id, &frame.namespace).await {
-                Err(e) => {
-                    tracing::warn!(error = %e,
-                        "kill_and_respawn failed during stale-daemon recovery; falling back to local dispatch");
-                    record_fallback(
-                        FallbackReason::ParseFailure,
-                        &frame.config_id,
-                        None,
-                        &frame.namespace,
-                    );
-                    return None;
-                }
-                Ok(RecoveryOutcome::Skipped) => {
-                    // Under-lock probe confirmed a live matching daemon; forward the
-                    // real request once — this is its ONLY dispatch on this path.
-                    return match try_forward_inner(frame).await {
-                        ForwardOutcome::Response(resp) => {
-                            map_response(resp, &frame.config_id, &frame.namespace)
-                        }
-                        ForwardOutcome::NoSocket => {
-                            record_fallback(
-                                FallbackReason::NoSocket,
-                                &frame.config_id,
-                                None,
-                                &frame.namespace,
-                            );
-                            None
-                        }
-                        ForwardOutcome::ParseFailure => {
-                            record_fallback(
-                                FallbackReason::ParseFailure,
-                                &frame.config_id,
-                                None,
-                                &frame.namespace,
-                            );
-                            None
-                        }
-                        ForwardOutcome::ProtocolMismatch => {
-                            record_fallback(
-                                FallbackReason::ProtocolMismatch,
-                                &frame.config_id,
-                                None,
-                                &frame.namespace,
-                            );
-                            None
-                        }
-                    };
-                }
-                Ok(RecoveryOutcome::Spawned) => {}
-            }
-            // Give the kernel a moment to release the socket path and let the
-            // spawned daemon process start.
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-
-            // The connect attempt inside `try_forward_inner` doubles as the
-            // readiness check — a `NoSocket` outcome here just means "not
-            // listening yet", so keep retrying instead of probing a separate
-            // throwaway connection first.
-            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
-            loop {
-                if tokio::time::Instant::now() >= deadline {
-                    record_fallback(
-                        FallbackReason::NoSocket,
-                        &frame.config_id,
-                        None,
-                        &frame.namespace,
-                    );
-                    return None;
-                }
-                match try_forward_inner(frame).await {
-                    ForwardOutcome::Response(resp) => {
-                        return map_response(resp, &frame.config_id, &frame.namespace)
-                    }
-                    ForwardOutcome::ParseFailure => {
-                        tracing::warn!(
-                            "freshly spawned daemon also returned an undecodable response; \
-                             falling back to local dispatch"
-                        );
-                        record_fallback(
-                            FallbackReason::ParseFailure,
-                            &frame.config_id,
-                            None,
-                            &frame.namespace,
-                        );
-                        return None;
-                    }
-                    ForwardOutcome::ProtocolMismatch => {
-                        return Some(Err(McpError::internal_error(
-                            format!(
-                                "daemon protocol mismatch: expected version {PROTOCOL_VERSION}; \
-                                     run `make local` to rebuild the daemon binary"
-                            ),
-                            None,
-                        )));
-                    }
-                    ForwardOutcome::NoSocket => {
-                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                    }
-                }
-            }
+            tracing::warn!(
+                config_id = %frame.config_id,
+                namespace = %frame.namespace,
+                retry_suppressed = true,
+                "daemon connection lost after the request was fully written — \
+                 not retrying or falling back locally to avoid duplicate dispatch"
+            );
+            return Some(Err(ambiguous_forward_error()));
         }
         ForwardOutcome::ProtocolMismatch => {
-            // The response was decodable but `daemon_protocol_version` does not
-            // match PROTOCOL_VERSION (old daemon silently omits the field → 0).
-            // kill_and_respawn holds the recovery lock across kill + spawn and
-            // re-probes under the lock to avoid killing a freshly-spawned daemon.
-            tracing::info!(
-                "killing stale daemon (protocol version mismatch, old daemon) and respawning"
+            tracing::warn!(
+                config_id = %frame.config_id,
+                namespace = %frame.namespace,
+                retry_suppressed = true,
+                "daemon protocol mismatch discovered after the request was fully \
+                 written — not retrying or falling back locally to avoid duplicate dispatch"
             );
-            match kill_and_respawn(&frame.config_id, &frame.namespace).await {
-                Err(_) => {
-                    return Some(Err(McpError::internal_error(
-                        format!(
-                            "daemon protocol mismatch: expected version {PROTOCOL_VERSION}; \
-                             respawn failed — run `make local` to rebuild the daemon binary"
-                        ),
-                        None,
-                    )));
-                }
-                Ok(RecoveryOutcome::Skipped) => {
-                    // Under-lock probe confirmed a live matching daemon; forward the
-                    // real request once — this is its ONLY dispatch on this path.
-                    return match try_forward_inner(frame).await {
-                        ForwardOutcome::Response(resp) => {
-                            map_response(resp, &frame.config_id, &frame.namespace)
-                        }
-                        _ => Some(Err(McpError::internal_error(
-                            format!(
-                                "daemon protocol mismatch: expected version {PROTOCOL_VERSION}; \
-                                 run `make local` to rebuild the daemon binary"
-                            ),
-                            None,
-                        ))),
-                    };
-                }
-                Ok(RecoveryOutcome::Spawned) => {}
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-
-            // See the ParseFailure branch above: `try_forward_inner`'s own
-            // connect attempt is the readiness signal, so a `NoSocket` outcome
-            // here just retries rather than probing a separate connection.
-            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
-            loop {
-                if tokio::time::Instant::now() >= deadline {
-                    return Some(Err(McpError::internal_error(
-                        format!(
-                            "daemon protocol mismatch: expected version {PROTOCOL_VERSION}; \
-                             respawned daemon did not become ready within 5s — \
-                             run `make local` to rebuild the daemon binary"
-                        ),
-                        None,
-                    )));
-                }
-                match try_forward_inner(frame).await {
-                    ForwardOutcome::Response(resp) => {
-                        return map_response(resp, &frame.config_id, &frame.namespace)
-                    }
-                    ForwardOutcome::ProtocolMismatch | ForwardOutcome::ParseFailure => {
-                        return Some(Err(McpError::internal_error(
-                            format!(
-                                "daemon protocol mismatch: expected version {PROTOCOL_VERSION}; \
-                                 respawned daemon still reports wrong version — \
-                                 run `make local` to rebuild the daemon binary"
-                            ),
-                            None,
-                        )));
-                    }
-                    ForwardOutcome::NoSocket => {
-                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                    }
-                }
-            }
+            return Some(Err(McpError::internal_error(
+                format!(
+                    "daemon protocol mismatch: expected version {PROTOCOL_VERSION}; \
+                     run `make local` to rebuild the daemon binary"
+                ),
+                None,
+            )));
         }
     }
 
-    // NoSocket path: first-time spawn (no stale daemon to kill).
-    if spawn_daemon().is_err() {
-        record_fallback(
-            FallbackReason::NoSocket,
-            &frame.config_id,
-            None,
-            &frame.namespace,
-        );
-        return None;
-    }
-
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
-    loop {
-        if tokio::time::Instant::now() >= deadline {
+    // NoSocket: nothing has been written yet. Establish a live daemon — either
+    // this is the first-ever spawn or a stale one needs replacing — under the
+    // single recovery lock, using only `probe_only` frames for the identity
+    // check. `kill_and_respawn` is a no-op kill when there is nothing stale to
+    // remove, so first-spawn and recovery share this one path.
+    match kill_and_respawn(&frame.config_id, &frame.namespace).await {
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to spawn/recover the daemon; falling back to local dispatch");
             record_fallback(
                 FallbackReason::NoSocket,
                 &frame.config_id,
@@ -1066,22 +1069,57 @@ pub async fn forward_or_spawn(frame: &DaemonRequestFrame) -> Option<Result<Strin
             );
             return None;
         }
+        Ok(RecoveryOutcome::Skipped) => {
+            // A concurrent client already has a live matching daemon ready.
+        }
+        Ok(RecoveryOutcome::Spawned) => {
+            // Give the kernel a moment to release the socket path and let the
+            // spawned daemon process start.
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    }
+
+    // Send the real frame exactly once now that a daemon is confirmed ready
+    // (or believed ready via Skipped). The connect attempt inside
+    // `try_forward_inner` doubles as the readiness check — a `NoSocket`
+    // outcome here just means "not listening yet" (nothing written), so keep
+    // retrying; any other outcome is terminal and returned immediately.
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        if tokio::time::Instant::now() >= deadline {
+            // #667: a bare timeout here does not mean "no daemon" — it may
+            // mean "daemon is still inside cold-boot schema init". Wait for
+            // that boot (if any) to quiesce and re-probe before deciding.
+            match wait_for_boot_quiescence_then_reprobe(frame).await {
+                BootFenceOutcome::DaemonReady => {
+                    // The real frame still has not been written; fall through
+                    // and send it now that boot has quiesced.
+                }
+                BootFenceOutcome::SafeLocalFallback => {
+                    record_fallback(
+                        FallbackReason::NoSocket,
+                        &frame.config_id,
+                        None,
+                        &frame.namespace,
+                    );
+                    return None;
+                }
+                BootFenceOutcome::HardError(err) => return Some(Err(err)),
+            }
+        }
         match try_forward_inner(frame).await {
             ForwardOutcome::Response(resp) => {
                 return map_response(resp, &frame.config_id, &frame.namespace)
             }
             ForwardOutcome::ParseFailure => {
                 tracing::warn!(
-                    "freshly spawned daemon also returned an undecodable response; \
-                     falling back to local dispatch"
+                    config_id = %frame.config_id,
+                    namespace = %frame.namespace,
+                    retry_suppressed = true,
+                    "freshly-established daemon connection lost after the request \
+                     was fully written — not retrying or falling back locally"
                 );
-                record_fallback(
-                    FallbackReason::ParseFailure,
-                    &frame.config_id,
-                    None,
-                    &frame.namespace,
-                );
-                return None;
+                return Some(Err(ambiguous_forward_error()));
             }
             ForwardOutcome::ProtocolMismatch => {
                 return Some(Err(McpError::internal_error(
@@ -3243,19 +3281,23 @@ mod tests {
         clear_daemon_env();
     }
 
-    // ── respawn readiness makes exactly one connect per attempt (regression) ──
+    // ── #644: ambiguous post-write outcome never retries or falls back ───────
     //
-    // The post-respawn readiness wait used to open a throwaway `UnixStream::connect`
-    // purely to check whether the socket was accepting yet, then immediately
-    // discard it and open a SECOND connection via `try_forward_inner` for the
-    // real request. This test binds the "freshly respawned daemon" only after a
-    // short delay and counts how many connections it accepts: the readiness wait
-    // must converge on exactly one connect (the real forward itself doubling as
-    // the readiness signal), not two.
+    // Before the #644 fix, a `ParseFailure` on the first `try_forward_inner`
+    // attempt (the real frame was already fully written) triggered
+    // `kill_and_respawn` followed by resending the SAME real frame to whatever
+    // daemon answered next. If the original (stale) daemon had actually
+    // dispatched the mutation before the connection dropped, that retry would
+    // execute it a second time on the freshly-spawned daemon.
+    //
+    // This test proves the fixed contract: once the real frame is confirmed
+    // written, `forward_or_spawn` returns a hard error and never opens another
+    // connection — not even to a daemon that is fully ready and willing to
+    // serve the exact same request.
 
     #[tokio::test]
     #[serial]
-    async fn respawn_readiness_uses_single_connect_per_forward_attempt() {
+    async fn ambiguous_write_never_retries_against_freshly_spawned_daemon() {
         clear_daemon_env();
         let dir = tempfile::tempdir().expect("tempdir");
         let sock = dir.path().join("khived.sock");
@@ -3266,13 +3308,10 @@ mod tests {
 
         // Stale daemon: accepts one connection, reads the request, then drops
         // without responding — forces the first try_forward_inner to see
-        // ParseFailure and enter the kill+respawn recovery path.
+        // ParseFailure (frame written, response lost).
         let stale_listener = tokio::net::UnixListener::bind(&sock).expect("bind stale socket");
         let stale_handle = tokio::spawn(serve_crash_on_dispatch(stale_listener));
 
-        // The PID on file does not belong to a khive daemon (it's this test
-        // process), so kill_stale_daemon_inner skips SIGTERM but still unlinks
-        // the stale socket path, clearing the way for the "fresh daemon" bind below.
         std::fs::write(&pid_file, std::process::id().to_string()).expect("write pid file");
 
         std::env::set_var("KHIVE_SOCKET", &sock);
@@ -3280,10 +3319,10 @@ mod tests {
         std::env::set_var("KHIVE_LOCK", &lock_file);
         std::env::remove_var("KHIVE_NO_DAEMON");
 
-        // Simulates the freshly-respawned daemon binding the same socket path
-        // shortly after the stale one is killed. Counts every accepted
-        // connection — the regression this test guards against is a readiness
-        // probe pushing that count above 1.
+        // A fully ready "freshly respawned" daemon binds shortly after the
+        // stale one drops. If the fix regresses and forward_or_spawn retries
+        // the real frame, this listener would happily answer it — that's
+        // exactly why connect_count must stay 0.
         let connect_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let connect_count_srv = connect_count.clone();
         let resp = frame_ok("stats-result");
@@ -3292,20 +3331,13 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
             let listener =
                 tokio::net::UnixListener::bind(&fresh_sock).expect("bind fresh daemon socket");
-            loop {
-                let Ok((mut stream, _)) = listener.accept().await else {
-                    break;
-                };
+            if let Ok((mut stream, _)) = listener.accept().await {
                 connect_count_srv.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 if read_frame(&mut stream).await.is_ok() {
                     if let Ok(payload) = serde_json::to_vec(&resp) {
                         let _ = write_frame(&mut stream, &payload).await;
                     }
-                    break;
                 }
-                // A bare connect-and-drop (no frame) would be exactly the
-                // throwaway readiness probe this fix removes — keep accepting
-                // so a regression shows up as connect_count > 1 rather than a hang.
             }
         });
 
@@ -3328,22 +3360,348 @@ mod tests {
         let result = forward_or_spawn(&frame).await;
 
         let _ = tokio::time::timeout(std::time::Duration::from_secs(2), stale_handle).await;
-        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), fresh_handle).await;
+        // Give the never-contacted fresh listener a moment to prove it stays idle,
+        // then drop it so its task doesn't hang the test process.
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        fresh_handle.abort();
+        let _ = fresh_handle.await;
 
         match result {
-            Some(Ok(v)) => assert_eq!(v, "stats-result"),
+            Some(Err(McpError { message, .. })) => {
+                assert!(
+                    message.contains("not retrying") && message.contains("duplicate execution"),
+                    "ambiguous post-write outcome must return the #644 hard-error \
+                     message; got: {message}"
+                );
+            }
             other => {
-                panic!("expected Some(Ok(..)) from the freshly respawned daemon, got {other:?}")
+                panic!("expected Some(Err(..)) for an ambiguous post-write outcome, got {other:?}")
             }
         }
 
         assert_eq!(
             connect_count.load(std::sync::atomic::Ordering::SeqCst),
-            1,
-            "the readiness wait must not open a throwaway connection before the real \
-             forward — exactly one connect should reach the freshly spawned daemon"
+            0,
+            "forward_or_spawn must NOT contact any daemon (stale or freshly \
+             spawned) again once the real frame has been fully written — \
+             retrying risks a duplicate dispatch (#644)"
         );
 
+        clear_daemon_env();
+        std::env::remove_var("KHIVE_LOCK");
+    }
+
+    // ── #644: exactly-once dispatch through the full forward_or_spawn path ───
+    //
+    // End-to-end version of `recovery_path_dispatches_real_request_exactly_once`
+    // (which drives `kill_and_respawn` + `try_forward_inner` directly to avoid
+    // a two-socket setup problem). This test drives the full public entry point:
+    // a single fake daemon counts every real (non-probe) dispatch, answers
+    // `probe_only` frames with a valid identity ack, and closes the connection
+    // without responding to the real frame — simulating a crash after dispatch.
+    //
+    // Fail-if-reverted: if `forward_or_spawn` ever resends the real frame after
+    // a confirmed write (the #644 bug), this fake daemon would dispatch it
+    // again and DAEMON_DISPATCH would read 2, not 1.
+
+    #[tokio::test]
+    #[serial]
+    async fn forward_or_spawn_dispatches_real_frame_exactly_once_end_to_end() {
+        clear_daemon_env();
+        reset_counters();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sock = dir.path().join("khived.sock");
+        let pid_file = dir.path().join("khived.pid");
+        let lock_file = dir.path().join("khived.recovery.lock");
+
+        std::env::set_var("KHIVE_SOCKET", &sock);
+        std::env::set_var("KHIVE_PID", &pid_file);
+        std::env::set_var("KHIVE_LOCK", &lock_file);
+        std::env::remove_var("KHIVE_NO_DAEMON");
+
+        let config_id = "packs=[kg];db=:memory:;embed=none;extra=[];backend=main";
+
+        // `forward_or_spawn`'s first attempt writes the real (non-probe) frame
+        // directly — no probe precedes it — so this fake daemon only needs to
+        // simulate "read the real frame, dispatch it, then crash before
+        // responding" for the very first connection.
+        let listener = tokio::net::UnixListener::bind(&sock).expect("bind fake daemon socket");
+        std::fs::write(&pid_file, std::process::id().to_string()).expect("write pid file");
+        let dispatch_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let dispatch_count_srv = dispatch_count.clone();
+        let fake_handle = tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                if read_frame(&mut stream).await.is_err() {
+                    continue;
+                }
+                // Count the dispatch, then drop the connection without
+                // responding — simulating a crash after the mutation already ran.
+                dispatch_count_srv.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                drop(stream);
+            }
+        });
+
+        let frame = DaemonRequestFrame {
+            ops: "stats()".to_string(),
+            presentation: None,
+            presentation_per_op: None,
+            namespace: "test".to_string(),
+            actor_id: None,
+            visible_namespaces: Vec::new(),
+            config_id: config_id.to_string(),
+            protocol_version: PROTOCOL_VERSION,
+            probe_only: false,
+            metrics_only: false,
+            format: None,
+            format_per_op: None,
+            from_wire: false,
+        };
+
+        let result = forward_or_spawn(&frame).await;
+
+        match result {
+            Some(Err(_)) => {}
+            other => panic!(
+                "expected Some(Err(..)) — not None (silent local fallback) — for a \
+                 dispatch-then-crash response, got {other:?}"
+            ),
+        }
+        assert_eq!(
+            dispatch_count.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the real request must be dispatched EXACTLY ONCE; a value of 2 means \
+             forward_or_spawn resent the frame after the write already completed"
+        );
+
+        fake_handle.abort();
+        let _ = fake_handle.await;
+        reset_counters();
+        clear_daemon_env();
+        std::env::remove_var("KHIVE_LOCK");
+    }
+
+    // ── #644 boundary: a successful daemon round trip dispatches exactly once ──
+    //
+    // The crash-after-dispatch test above proves the `Err` boundary (a lost
+    // response must never trigger a resend). This test proves the opposite
+    // boundary on the SAME counter: when the daemon successfully answers, the
+    // real frame must still have been dispatched exactly once — not retried
+    // after a successful response, and not dispatched a second time by any
+    // fallback path once `forward_or_spawn` already returns `Some(Ok(_))`.
+    //
+    // Fail-if-reverted: if a future edit ever re-sent the real frame after a
+    // successful response (e.g. a stray retry-on-timeout wrapped around the
+    // whole attempt), this fake daemon would observe DISPATCH_COUNT == 2.
+    #[tokio::test]
+    #[serial]
+    async fn forward_or_spawn_dispatches_real_frame_exactly_once_on_success() {
+        clear_daemon_env();
+        reset_counters();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sock = dir.path().join("khived.sock");
+        let pid_file = dir.path().join("khived.pid");
+        let lock_file = dir.path().join("khived.recovery.lock");
+
+        std::env::set_var("KHIVE_SOCKET", &sock);
+        std::env::set_var("KHIVE_PID", &pid_file);
+        std::env::set_var("KHIVE_LOCK", &lock_file);
+        std::env::remove_var("KHIVE_NO_DAEMON");
+
+        let config_id = "packs=[kg];db=:memory:;embed=none;extra=[];backend=main";
+
+        let listener = tokio::net::UnixListener::bind(&sock).expect("bind fake daemon socket");
+        std::fs::write(&pid_file, std::process::id().to_string()).expect("write pid file");
+        let dispatch_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let dispatch_count_srv = dispatch_count.clone();
+        let cfg_for_srv = config_id.to_string();
+        let fake_handle = tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                if read_frame(&mut stream).await.is_err() {
+                    continue;
+                }
+                dispatch_count_srv.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let resp = DaemonResponseFrame {
+                    ok: true,
+                    result: Some("daemon-handled-stats".to_string()),
+                    error: None,
+                    namespace_mismatch: false,
+                    config_mismatch: false,
+                    served_config_id: Some(cfg_for_srv.clone()),
+                    version_mismatch: false,
+                    daemon_protocol_version: PROTOCOL_VERSION,
+                    metrics: None,
+                };
+                let payload = serde_json::to_vec(&resp).expect("serialize response frame");
+                let _ = write_frame(&mut stream, &payload).await;
+            }
+        });
+
+        let frame = DaemonRequestFrame {
+            ops: "stats()".to_string(),
+            presentation: None,
+            presentation_per_op: None,
+            namespace: "test".to_string(),
+            actor_id: None,
+            visible_namespaces: Vec::new(),
+            config_id: config_id.to_string(),
+            protocol_version: PROTOCOL_VERSION,
+            probe_only: false,
+            metrics_only: false,
+            format: None,
+            format_per_op: None,
+            from_wire: false,
+        };
+
+        let result = forward_or_spawn(&frame).await;
+
+        match result {
+            Some(Ok(ref body)) => {
+                assert_eq!(
+                    body, "daemon-handled-stats",
+                    "request() must surface the daemon's response verbatim"
+                );
+            }
+            other => {
+                panic!("expected Some(Ok(_)) for a successful daemon round trip, got {other:?}")
+            }
+        }
+        assert_eq!(
+            dispatch_count.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "a successful daemon round trip must dispatch the real request EXACTLY \
+             ONCE; a value other than 1 means forward_or_spawn retried or double-sent \
+             the frame around a successful response"
+        );
+
+        fake_handle.abort();
+        let _ = fake_handle.await;
+        reset_counters();
+        clear_daemon_env();
+        std::env::remove_var("KHIVE_LOCK");
+    }
+
+    // ── #667: readiness-timeout fallback must wait for boot quiescence ────────
+    //
+    // Before this fix, `forward_or_spawn`'s post-respawn readiness loop treated
+    // a bare deadline elapse as "no daemon" and returned `None` (silent local
+    // fallback) unconditionally — even if a concurrent process was still
+    // holding the cold-boot guard (ADR-D3) running migrations / pack schema
+    // plans (FTS DDL included). A local writer/searcher racing in at exactly
+    // that moment could observe or create a partially-initialized
+    // `notes`/`fts_notes` schema (#667).
+    //
+    // Nothing ever binds the socket in this test (no `NoSocket` outcome here
+    // ever writes a real frame, so #644's at-most-once invariant is untouched
+    // by this scenario) — `kill_and_respawn`'s own probe therefore sees
+    // `NoSocket` too, classifies the (nonexistent) daemon as `Dead`, and calls
+    // the real `spawn_daemon()` (which forks this test binary with `mcp
+    // --daemon`; the child fails to parse those as libtest args and exits
+    // almost immediately without ever binding anything — the same tolerated
+    // pattern already used by
+    // `try_forward_inner_returns_parse_failure_when_daemon_closes_without_response`
+    // in this file).
+    //
+    // `SPAWN_COUNT` (already incremented for real inside `spawn_daemon`) is
+    // used purely as a **synchronization signal**: it tells the background
+    // "child boot" thread below that `kill_and_respawn`'s own (much shorter)
+    // use of the recovery lock is in its final moments, so the boot thread's
+    // blocking `acquire_daemon_boot_guard()` call queues immediately behind
+    // it via the real `flock`, rather than racing it — the two never expect
+    // to hold the lock at the same time, and the ordering between them is
+    // never guessed at with a fixed sleep.
+    //
+    // Once the boot thread holds the guard (for `GUARD_HOLD`, deliberately
+    // longer than `forward_or_spawn`'s fixed 5s readiness deadline), the fix
+    // must block inside `wait_for_boot_quiescence_then_reprobe` until that
+    // guard is released before it is allowed to decide "genuinely no daemon"
+    // and return `None`. The elapsed-time assertion below is the
+    // fail-if-reverted oracle: reverting the fence makes `forward_or_spawn`
+    // return right at the 5s readiness deadline (measured from well before
+    // the boot thread even starts holding the guard), strictly before
+    // `GUARD_HOLD` has elapsed.
+    #[tokio::test]
+    #[serial]
+    async fn forward_or_spawn_blocks_on_boot_quiescence_before_local_fallback() {
+        clear_daemon_env();
+        reset_counters();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sock = dir.path().join("khived.sock");
+        let pid_file = dir.path().join("khived.pid");
+        let lock_file = dir.path().join("khived.recovery.lock");
+
+        std::env::set_var("KHIVE_SOCKET", &sock);
+        std::env::set_var("KHIVE_PID", &pid_file);
+        std::env::set_var("KHIVE_LOCK", &lock_file);
+        std::env::remove_var("KHIVE_NO_DAEMON");
+
+        let config_id = "packs=[kg];db=:memory:;embed=none;extra=[];backend=main";
+
+        const GUARD_HOLD: std::time::Duration = std::time::Duration::from_secs(6);
+        let boot_thread = std::thread::spawn(|| {
+            let wait_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while SPAWN_COUNT.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+                assert!(
+                    std::time::Instant::now() < wait_deadline,
+                    "kill_and_respawn never reached spawn_daemon() within 5s; \
+                     the boot-holder thread has nothing to queue behind"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            // `kill_and_respawn` is at most a few milliseconds from dropping
+            // its own lock guard at this point (spawn_daemon() is its last
+            // action before returning) — this blocks on the real `flock`
+            // until that happens, then holds it for GUARD_HOLD.
+            let guard = khive_runtime::daemon::acquire_daemon_boot_guard()
+                .expect("test boot holder must acquire the recovery lock");
+            std::thread::sleep(GUARD_HOLD);
+            drop(guard);
+        });
+
+        let frame = DaemonRequestFrame {
+            ops: "stats()".to_string(),
+            presentation: None,
+            presentation_per_op: None,
+            namespace: "test".to_string(),
+            actor_id: None,
+            visible_namespaces: Vec::new(),
+            config_id: config_id.to_string(),
+            protocol_version: PROTOCOL_VERSION,
+            probe_only: false,
+            metrics_only: false,
+            format: None,
+            format_per_op: None,
+            from_wire: false,
+        };
+
+        let started = std::time::Instant::now();
+        let result = forward_or_spawn(&frame).await;
+        let elapsed = started.elapsed();
+
+        boot_thread
+            .join()
+            .expect("boot-holder thread must not panic");
+
+        assert!(
+            result.is_none(),
+            "genuinely no daemon after boot quiescence must fall back to local \
+             dispatch (None), got {result:?}"
+        );
+        assert!(
+            elapsed >= GUARD_HOLD,
+            "forward_or_spawn must block until the cold-boot guard is released \
+             before deciding to fall back locally — returned after {elapsed:?}, \
+             faster than the {GUARD_HOLD:?} the boot guard was held, meaning it \
+             (or a reverted version of this fix) would local-dispatch while \
+             cold-boot schema init could still be in progress (#667)"
+        );
+
+        reset_counters();
         clear_daemon_env();
         std::env::remove_var("KHIVE_LOCK");
     }
@@ -3469,5 +3827,86 @@ mod tests {
         let log_path = blocker.join("khived.log");
 
         assert!(prepare_daemon_log_file_with_cap(&log_path, DAEMON_LOG_MAX_BYTES).is_none());
+    }
+
+    // ── #645: remove_daemon_paths_if_still_stale ownership recheck ───────────
+    //
+    // These mirror the existing `shutdown_cleanup_skips_when_*` tests in
+    // `khive-runtime/src/daemon.rs` (owner-checked cleanup on the daemon's own
+    // shutdown path) but exercise the CLIENT's stale-daemon cleanup instead:
+    // between observing a PID as stale and reaching the unlink, a concurrent
+    // starter that could not rely on the recovery lock alone (e.g. it failed
+    // to acquire it) may have already claimed the rendezvous. Deterministic
+    // state fabrication (not a sleep-based race) proves each skip condition.
+
+    #[test]
+    #[serial]
+    fn remove_daemon_paths_if_still_stale_removes_when_pid_unchanged() {
+        clear_daemon_env();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pid_file = dir.path().join("khived.pid");
+        let sock = dir.path().join("khived.sock");
+        std::env::set_var("KHIVE_SOCKET", &sock);
+        std::fs::write(&pid_file, "4242").expect("write pid file");
+        std::fs::write(&sock, "stale socket placeholder").expect("write stale sock placeholder");
+
+        remove_daemon_paths_if_still_stale(&pid_file, Some(4242));
+
+        assert!(!pid_file.exists(), "unchanged pid file must be removed");
+        assert!(!sock.exists(), "stale socket must be removed");
+        clear_daemon_env();
+    }
+
+    #[test]
+    #[serial]
+    fn remove_daemon_paths_if_still_stale_skips_when_pid_file_changed() {
+        clear_daemon_env();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pid_file = dir.path().join("khived.pid");
+        let sock = dir.path().join("khived.sock");
+        std::env::set_var("KHIVE_SOCKET", &sock);
+        // A replacement daemon already wrote its own (different) pid here.
+        std::fs::write(&pid_file, "5555").expect("write replacement pid file");
+        std::fs::write(&sock, "replacement socket placeholder").expect("write sock placeholder");
+
+        remove_daemon_paths_if_still_stale(&pid_file, Some(4242));
+
+        assert!(
+            pid_file.exists(),
+            "replacement daemon's pid file must survive when it no longer \
+             matches the expected (pre-SIGTERM) pid"
+        );
+        assert!(
+            sock.exists(),
+            "replacement daemon's socket must survive alongside its pid file"
+        );
+        clear_daemon_env();
+    }
+
+    #[test]
+    #[serial]
+    fn remove_daemon_paths_if_still_stale_skips_when_socket_has_a_live_listener() {
+        clear_daemon_env();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pid_file = dir.path().join("khived.pid");
+        let sock = dir.path().join("khived.sock");
+        std::env::set_var("KHIVE_SOCKET", &sock);
+        std::fs::write(&pid_file, "4242").expect("write pid file matching expected_pid");
+        // A replacement daemon already bound the socket path — even though the
+        // pid file on disk has not been overwritten yet (e.g. its bind landed
+        // just before its own pid-write).
+        let _listener = std::os::unix::net::UnixListener::bind(&sock).expect("bind live socket");
+
+        remove_daemon_paths_if_still_stale(&pid_file, Some(4242));
+
+        assert!(
+            sock.exists(),
+            "a socket with a live listener must never be unlinked"
+        );
+        assert!(
+            pid_file.exists(),
+            "pid file must be left alone alongside the live socket"
+        );
+        clear_daemon_env();
     }
 }

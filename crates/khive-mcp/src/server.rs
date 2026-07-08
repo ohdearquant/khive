@@ -1677,6 +1677,63 @@ mod tests {
         assert_eq!(names, vec!["assign", "list", "search"]);
     }
 
+    // ── #658 regression: brain dispatch hook wired into production builder ──
+
+    /// The hook (registered via `PackInstall::dispatch_hook`) and the pack
+    /// runtime the registry dispatches `brain.*` verbs to must be the same
+    /// `BrainPack` instance — otherwise the hook's posterior updates would be
+    /// invisible to `brain.state` reads. `brain.state` loads the default
+    /// namespace into the shared active slot as a side effect, so a
+    /// subsequent non-brain dispatch in the same namespace lands on
+    /// `ApplyTarget::ActiveSlot` and is immediately observable.
+    ///
+    /// Uses the `local` namespace (rather than an arbitrary one) because
+    /// ADR-007 Rule 3b always pins the implicit write token to `local`
+    /// regardless of the registry's configured default namespace; using
+    /// `local` for both keeps the dispatched event's namespace and the
+    /// token's namespace identical, so the signal lands on the active slot
+    /// instead of the cold-namespace queue.
+    #[tokio::test]
+    async fn brain_dispatch_hook_updates_state_visible_through_same_instance() {
+        let config = RuntimeConfig {
+            db_path: None,
+            default_namespace: Namespace::local(),
+            embedding_model: None,
+            additional_embedding_models: vec![],
+            packs: vec!["kg".to_string(), "brain".to_string()],
+            ..RuntimeConfig::default()
+        };
+        let runtime = KhiveRuntime::new(config).expect("in-memory runtime");
+        let server = KhiveMcpServer::with_packs(runtime, &["kg".to_string(), "brain".to_string()])
+            .expect("server builds with kg + brain");
+
+        server
+            .registry
+            .dispatch("brain.state", serde_json::Value::Null)
+            .await
+            .expect("brain.state loads the default namespace into the active slot");
+
+        server
+            .registry
+            .dispatch("stats", serde_json::json!({}))
+            .await
+            .expect("kg.stats dispatch succeeds");
+
+        let state = server
+            .registry
+            .dispatch("brain.state", serde_json::Value::Null)
+            .await
+            .expect("brain.state dispatch");
+        let total_events = state["balanced_recall"]["total_events"]
+            .as_u64()
+            .unwrap_or(0);
+        assert!(
+            total_events > 0,
+            "dispatch hook must update the same BrainPack instance the registry \
+             dispatches brain.* verbs to; got snapshot {state:?}"
+        );
+    }
+
     // ── MCP-AUD-002 regression: save_to must bypass daemon forwarding ────────
 
     fn make_daemon_save_to_test_server() -> KhiveMcpServer {
@@ -1774,5 +1831,112 @@ mod tests {
         let _ = handle.await;
         clear_daemon_env();
         std::env::remove_var("KHIVE_SAVE_TO_ROOT");
+    }
+
+    // ── #644 regression: ambiguous post-write outcome must not double-dispatch ──
+    //
+    // `request()`'s daemon-forward call site (`if let Some(res) = forward_or_spawn(...)
+    // .await { return res; }`) must return BOTH `Some(Ok(_))` and `Some(Err(_))`
+    // directly, never falling through to `dispatch_request_wire` on the `Err`
+    // arm. If a future edit narrowed that match to only short-circuit on
+    // success (e.g. `if let Some(Ok(res)) = ...`), a mutating op whose real
+    // frame was already written to a now-dead daemon would ALSO run through
+    // local dispatch — a duplicate execution of the exact case #644 exists to
+    // prevent. This forces that ambiguous outcome (a fake socket that reads
+    // the request then closes without responding, exactly as a daemon crash
+    // mid-dispatch would) and proves both that the caller sees the
+    // ambiguous-forward error verbatim AND that the mutating op never actually
+    // ran locally.
+    #[tokio::test]
+    #[serial]
+    async fn request_returns_ambiguous_forward_error_without_local_double_dispatch() {
+        clear_daemon_env();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sock = dir.path().join("khived.sock");
+        let pid = dir.path().join("khived.pid");
+        std::env::set_var("KHIVE_SOCKET", &sock);
+        std::env::set_var("KHIVE_PID", &pid);
+        std::env::remove_var("KHIVE_NO_DAEMON");
+
+        let config = RuntimeConfig {
+            db_path: None,
+            default_namespace: Namespace::parse("test").unwrap(),
+            embedding_model: None,
+            additional_embedding_models: vec![],
+            packs: vec!["kg".to_string(), "comm".to_string()],
+            ..RuntimeConfig::default()
+        };
+        let runtime = KhiveRuntime::new(config).expect("in-memory runtime");
+        let server = KhiveMcpServer::new(runtime).expect("server builds with kg + comm");
+
+        // Fake "crashed daemon": accept exactly one connection, read the
+        // request frame (the real write #644 cares about), then drop the
+        // stream without writing a response.
+        let listener =
+            tokio::net::UnixListener::bind(&sock).expect("bind fake crash-daemon socket");
+        let fake_handle = tokio::spawn(async move {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                let _ = khive_runtime::daemon::read_frame(&mut stream).await;
+            }
+        });
+
+        let baseline = server
+            .dispatch_request_local(RequestParams {
+                ops: "stats()".to_string(),
+                presentation: None,
+                presentation_per_op: None,
+                save_to: None,
+                format: None,
+                format_per_op: None,
+            })
+            .await
+            .expect("baseline stats() must succeed");
+
+        let resp = server
+            .request(Parameters(RequestParams {
+                ops: "comm.send(to=\"bob\", content=\"double-forward-probe\")".to_string(),
+                presentation: None,
+                presentation_per_op: None,
+                save_to: None,
+                format: None,
+                format_per_op: None,
+            }))
+            .await;
+
+        match resp {
+            Err(McpError { message, .. }) => {
+                assert!(
+                    message.contains(
+                        "not retrying or locally dispatching to avoid duplicate execution"
+                    ),
+                    "request() must surface forward_or_spawn's ambiguous-forward error \
+                     verbatim, not a local dispatch result; got: {message}"
+                );
+            }
+            Ok(v) => panic!(
+                "request() must return the ambiguous-forward error directly, not fall \
+                 through to local dispatch; got Ok({v})"
+            ),
+        }
+
+        let after = server
+            .dispatch_request_local(RequestParams {
+                ops: "stats()".to_string(),
+                presentation: None,
+                presentation_per_op: None,
+                save_to: None,
+                format: None,
+                format_per_op: None,
+            })
+            .await
+            .expect("post-request stats() must succeed");
+        assert_eq!(
+            after, baseline,
+            "the comm.send op must NEVER have run locally after the ambiguous \
+             forward outcome — a double-dispatch would mutate local state here"
+        );
+
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), fake_handle).await;
+        clear_daemon_env();
     }
 }

@@ -309,13 +309,31 @@ async fn main() -> Result<()> {
                     },
                 )?;
 
+                // #667: acquire the boot/recovery lock before building the
+                // coordinator server — that construction runs migrations and
+                // applies pack schema plans (FTS DDL included) — and hold it
+                // through `serve_server`'s daemon bind+pid-write, so a second
+                // concurrently-booting process cannot run schema DDL against
+                // the same database file at the same time. In daemon mode,
+                // failing to acquire the lock here must abort before that
+                // unguarded construction runs, rather than silently
+                // proceeding with `boot_guard = None`.
+                #[cfg(unix)]
+                let boot_guard = if a.daemon {
+                    Some(khive_runtime::daemon::acquire_daemon_boot_guard()?)
+                } else {
+                    khive_runtime::daemon::acquire_recovery_lock()
+                };
+                #[cfg(not(unix))]
+                let boot_guard: Option<std::fs::File> = None;
+
                 let server = build_multi_backend_server_with_coordinator(
                     base_cfg,
                     &khive_cfg,
                     a.db.as_deref(),
                 )?;
 
-                khive_mcp::serve::serve_server(server, &a, &transport_registry).await
+                khive_mcp::serve::serve_server(server, &a, &transport_registry, boot_guard).await
             }
         }
         Command::Backend(b) => cmd_backend(b),
