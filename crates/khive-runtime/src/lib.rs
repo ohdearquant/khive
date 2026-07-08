@@ -2,6 +2,7 @@
 //!
 //! Wraps `StorageBackend` and query compilation into a single Rust API surface.
 
+pub mod actor_identity;
 pub mod atomic_plan;
 pub mod atomic_prepare;
 pub mod atomic_runner;
@@ -25,6 +26,7 @@ pub mod runtime;
 pub mod secret_gate;
 pub mod validation;
 
+pub use actor_identity::{actor_is_unattributed, resolve_actor, should_warn_unattributed_actor};
 pub use atomic_plan::{
     AffectedRowGuard, DeletePlan, GovernanceOp, GovernancePlan, GtdCompletePlan, GtdTransitionPlan,
     LinkPlan, MergePlan, PlanPredicate, PlanStatement, PostCommitEffect, UpdatePlan,

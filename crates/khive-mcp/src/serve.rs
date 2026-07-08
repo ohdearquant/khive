@@ -979,9 +979,12 @@ pub fn build_registry_for_multi_backend(
 /// - the loaded pack list includes `"comm"`.
 ///
 /// Pure predicate — no I/O, no logging. Callers emit the warning.
+///
+/// Delegates to the shared actor-identity policy (#567) so this predicate,
+/// the gate's actor resolution, and storage-token minting can never disagree
+/// about what counts as "unattributed".
 pub(crate) fn should_warn_unattributed(actor_id: Option<&str>, loaded_packs: &[String]) -> bool {
-    let is_local = actor_id.map(|id| id == "local").unwrap_or(true);
-    is_local && loaded_packs.iter().any(|p| p == "comm")
+    khive_runtime::should_warn_unattributed_actor(actor_id, loaded_packs)
 }
 
 /// Return true when strict actor-attribution mode is active.

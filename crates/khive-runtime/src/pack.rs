@@ -16,7 +16,7 @@ use std::time::Instant;
 
 use crate::runtime::NamespaceToken;
 use async_trait::async_trait;
-use khive_gate::{ActorRef, AllowAllGate, AuditEvent, GateDecision, GateRef, GateRequest};
+use khive_gate::{AllowAllGate, AuditEvent, GateDecision, GateRef, GateRequest};
 use khive_storage::{Event, EventStore, EventView, SubstrateKind};
 use khive_types::{EventKind, EventOutcome, Namespace};
 use serde_json::Value;
@@ -913,10 +913,7 @@ impl VerbRegistry {
     /// Gate errors (implementation failures) are surfaced as
     /// `RuntimeError::Internal`.
     pub fn authorize_namespace(&self, ns: Namespace) -> Result<(), RuntimeError> {
-        let actor = match self.actor_id.as_deref() {
-            Some(id) if !id.trim().is_empty() => ActorRef::new("actor", id),
-            _ => ActorRef::anonymous(),
-        };
+        let actor = crate::actor_identity::resolve_actor(self.actor_id.as_deref());
         let req = GateRequest::new(actor, ns, "authorize", serde_json::Value::Null);
         match self.gate.check(&req) {
             Ok(decision) if decision.is_allow() => Ok(()),
@@ -992,12 +989,11 @@ impl VerbRegistry {
         };
         // ADR-057: thread the configured actor identity into the gate request so
         // the gate can distinguish human vs agent callers at the dispatch seam.
-        // Mirrors the actor resolution used by the token-minting path below.
-        let gate_actor = match actor_id_str {
-            Some(id) if !id.trim().is_empty() => ActorRef::new("actor", id),
-            _ => ActorRef::anonymous(),
-        };
-        let gate_req = GateRequest::new(gate_actor, ns.clone(), verb, params.clone());
+        // Resolved once via the shared actor-identity policy (#567) and reused
+        // for token minting below, so the gate's notion of "who is the caller"
+        // and the storage token's notion can never drift apart.
+        let resolved_actor = crate::actor_identity::resolve_actor(actor_id_str);
+        let gate_req = GateRequest::new(resolved_actor.clone(), ns.clone(), verb, params.clone());
 
         // Consult the gate.
         //
@@ -1086,12 +1082,10 @@ impl VerbRegistry {
         // label so that comm.inbox applies the to_actor filter for directed delivery.
         // Otherwise, use ActorRef::anonymous() and inbox falls back to party-line.
         // ADR-096 Fork 1: `actor_id_str` already reflects the per-request identity
-        // override when supplied (resolved above, mirrored into the gate request).
-        let configured_actor = match actor_id_str {
-            Some(id) if !id.trim().is_empty() => ActorRef::new("actor", id),
-            _ => ActorRef::anonymous(),
-        };
-
+        // override when supplied (resolved above into `resolved_actor`, mirrored
+        // into the gate request). Reusing the same value here (#567) guarantees
+        // the gate's actor and the storage token's actor can never diverge.
+        //
         // Rule 3b (Rev 4): on the default (no explicit `namespace=`) path, the read
         // scope widens to `['local'] ∪ visible_namespaces` (baked, or the per-request
         // override — ADR-096 Fork 1). `'local'` is always included (mint_with_visibility
@@ -1102,7 +1096,7 @@ impl VerbRegistry {
         // `as_str()`, which would silently drop malformed non-string values again.
         let token = if explicit_namespace {
             // Rule 3 explicit escape: precise single-namespace scope, read+write. NOT widened.
-            NamespaceToken::mint_with_visibility(ns.clone(), vec![], configured_actor)
+            NamespaceToken::mint_with_visibility(ns.clone(), vec![], resolved_actor)
         } else {
             // Rule 3b: default path. Write namespace = local; read scope = ['local'] ∪ visible_namespaces.
             let primary = Namespace::local();
@@ -1126,7 +1120,7 @@ impl VerbRegistry {
                 None => self.visible_namespaces.clone(),
             };
             extra_visible.push(Namespace::local()); // 'local' always readable; mint dedups
-            NamespaceToken::mint_with_visibility(primary, extra_visible, configured_actor)
+            NamespaceToken::mint_with_visibility(primary, extra_visible, resolved_actor)
         };
 
         for pack in self.packs.iter() {
@@ -2556,6 +2550,117 @@ mod tests {
             "gate request must carry anonymous actor when no actor_id is configured"
         );
         assert_eq!(req.actor.id, "local");
+    }
+
+    /// A pack that records the `ActorRef` carried by the `NamespaceToken` it
+    /// is dispatched with, so tests can compare it against the gate's actor.
+    struct TokenCapturingPack {
+        actors: Arc<std::sync::Mutex<Vec<khive_gate::ActorRef>>>,
+    }
+
+    impl Pack for TokenCapturingPack {
+        const NAME: &'static str = "alpha";
+        const NOTE_KINDS: &'static [&'static str] = &[];
+        const ENTITY_KINDS: &'static [&'static str] = &[];
+        const HANDLERS: &'static [HandlerDef] = AlphaPack::HANDLERS;
+    }
+
+    #[async_trait]
+    impl PackRuntime for TokenCapturingPack {
+        fn name(&self) -> &str {
+            Self::NAME
+        }
+        fn note_kinds(&self) -> &'static [&'static str] {
+            Self::NOTE_KINDS
+        }
+        fn entity_kinds(&self) -> &'static [&'static str] {
+            Self::ENTITY_KINDS
+        }
+        fn handlers(&self) -> &'static [HandlerDef] {
+            Self::HANDLERS
+        }
+        async fn dispatch(
+            &self,
+            verb: &str,
+            _params: Value,
+            _registry: &VerbRegistry,
+            token: &NamespaceToken,
+        ) -> Result<Value, RuntimeError> {
+            self.actors.lock().unwrap().push(token.actor().clone());
+            Ok(serde_json::json!({ "pack": "alpha", "verb": verb }))
+        }
+    }
+
+    /// #567: the gate's actor and the storage token's actor must be the exact
+    /// same resolved value — both now come from one `resolve_actor` call
+    /// (`resolved_actor`) instead of two independently hand-synchronized
+    /// `match` expressions. This is the drift `#567` warns about: before the
+    /// unification, a future edit to one copy but not the other would silently
+    /// desynchronize "who the gate thinks the caller is" from "who the
+    /// storage layer thinks the caller is".
+    ///
+    /// FAILURE MODE: reintroducing a second independent actor-resolution copy
+    /// for the token (instead of reusing the gate's resolved value) could
+    /// diverge under a future edit and this test would catch it.
+    #[tokio::test]
+    async fn gate_actor_and_token_actor_are_identical_when_actor_id_is_set() {
+        let gate = Arc::new(ActorCapturingGate::default());
+        let actors = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let pack = TokenCapturingPack {
+            actors: actors.clone(),
+        };
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(pack);
+        builder.with_gate(gate.clone());
+        builder.with_actor_id(Some("actor-alpha".to_string()));
+        let reg = builder.build().expect("registry builds");
+
+        reg.dispatch("list", Value::Null).await.unwrap();
+
+        let reqs = gate.requests.lock().unwrap();
+        let gate_actor = reqs[0].actor.clone();
+        drop(reqs);
+
+        let captured = actors.lock().unwrap();
+        let token_actor = captured[0].clone();
+
+        assert_eq!(
+            gate_actor.kind, token_actor.kind,
+            "gate request actor and storage token actor must carry the same kind"
+        );
+        assert_eq!(
+            gate_actor.id, token_actor.id,
+            "gate request actor and storage token actor must carry the same id"
+        );
+        assert_eq!(gate_actor.id, "actor-alpha");
+    }
+
+    /// Same identity check with no configured `actor_id`: both the gate and
+    /// the storage token must independently land on `ActorRef::anonymous()`.
+    #[tokio::test]
+    async fn gate_actor_and_token_actor_are_identical_when_anonymous() {
+        let gate = Arc::new(ActorCapturingGate::default());
+        let actors = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let pack = TokenCapturingPack {
+            actors: actors.clone(),
+        };
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(pack);
+        builder.with_gate(gate.clone());
+        let reg = builder.build().expect("registry builds");
+
+        reg.dispatch("list", Value::Null).await.unwrap();
+
+        let reqs = gate.requests.lock().unwrap();
+        let gate_actor = reqs[0].actor.clone();
+        drop(reqs);
+
+        let captured = actors.lock().unwrap();
+        let token_actor = captured[0].clone();
+
+        assert_eq!(gate_actor.kind, token_actor.kind);
+        assert_eq!(gate_actor.id, token_actor.id);
+        assert_eq!(gate_actor.id, "local");
     }
 
     // ---- Rego gate: fail-closed end-to-end (issue #30) ----
