@@ -920,6 +920,339 @@ fn ambiguous_forward_error() -> McpError {
     )
 }
 
+// ── bridge self-heal: re-exec in place on ProtocolMismatch (#714) ───────────
+//
+// A long-lived stdio bridge process keeps running the OLD on-disk binary
+// after `make local` rebuilds it: the daemon it spawns/forwards to is fresh,
+// but this bridge process itself never picks up the new binary until its MCP
+// client reconnects. `ProtocolMismatch` is exactly that scenario — the daemon
+// is fine, this bridge is stale — so instead of leaving the connection dead
+// forever, the bridge re-execs the freshest on-disk binary in place,
+// preserving the PID and the open stdio file descriptors so the client's
+// transport never sees EOF or a reset. See issue #714 for the evidence this
+// design is based on (a live re-exec-mid-session test against the reference
+// MCP Python SDK client): a first attempt that called `execv()` synchronously
+// inside the tool handler, before the SDK's send loop had serialized and
+// flushed the response, discarded the in-flight response and the client's
+// call timed out with nothing ever written back.
+//
+// The fix is a true happens-after edge, not a fixed delay: [`arm_pending_self_heal`]
+// records the chosen action *before* the mismatch response is even
+// constructed (`trigger_bridge_self_heal` runs synchronously inside the
+// request handler), and [`SelfHealOnFlushTransport`] — wrapped around the
+// stdio transport in `server.rs::serve_stdio` — fires that action from
+// [`fire_pending_self_heal`] only once a message has actually finished
+// flushing to the client. Because arming always happens before the mismatch
+// response is handed to the transport, and firing only ever happens after a
+// flush completes, the very next successful flush is guaranteed to be at or
+// after that response reached the client — never before, and never on a
+// clock that can expire while a slow or backpressured stdout is still
+// mid-write (a fixed-duration sleep could not make that guarantee: rmcp's
+// send pipeline enqueues the response and returns almost immediately, then
+// performs the real write+flush on a separately spawned task with no
+// duration bound).
+
+/// Pending self-heal action, armed by [`arm_pending_self_heal`] and taken by
+/// [`fire_pending_self_heal`]. `None` on a healthy bridge for its entire
+/// lifetime — the overwhelmingly common case.
+static PENDING_SELF_HEAL: std::sync::Mutex<Option<MismatchRecovery>> = std::sync::Mutex::new(None);
+
+fn arm_pending_self_heal(action: MismatchRecovery) {
+    let mut slot = PENDING_SELF_HEAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    *slot = Some(action);
+}
+
+/// Take and perform whatever self-heal action is armed, if any. Called by
+/// [`SelfHealOnFlushTransport::send`] after every message it successfully
+/// flushes to the client — the load-bearing happens-after edge documented
+/// above. A no-op when nothing is armed.
+#[cfg(unix)]
+pub(crate) fn fire_pending_self_heal() {
+    let action = PENDING_SELF_HEAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take();
+    match action {
+        Some(MismatchRecovery::ReexecScheduled) => reexec_in_place(),
+        Some(MismatchRecovery::DrainAndExit) => exit_process(),
+        None => {}
+    }
+}
+
+/// Re-exec self-heal requires `exec()` (POSIX-only) — [`schedule_reexec_on_mismatch`]'s
+/// non-unix variant arms [`MismatchRecovery::DrainAndExit`] instead of
+/// [`MismatchRecovery::ReexecScheduled`], so only the drain-and-exit arm is
+/// ever actually armed on this target.
+#[cfg(not(unix))]
+pub(crate) fn fire_pending_self_heal() {
+    let action = PENDING_SELF_HEAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take();
+    if action.is_some() {
+        exit_process();
+    }
+}
+
+/// argv marker carrying the exec-once loop-breaker generation counter.
+///
+/// Parsed here and defined on [`crate::args::Args`] as a hidden clap field of
+/// the same name — the clap field exists purely so the CLI parser accepts the
+/// flag on a resumed process instead of rejecting it as unknown; the actual
+/// read path is this raw argv scan, independent of wherever in the call stack
+/// `Args` was parsed. The counter travels with the exec by construction: it
+/// is appended to argv immediately before `exec()`, so any process running
+/// with it present is, by definition, a resumed generation.
+const RESUMED_GENERATION_ARG_PREFIX: &str = "--resumed-generation=";
+
+/// Whether this process is a resumed generation of a prior self-heal re-exec,
+/// and if so, its generation counter. `None` on a normal (cold-started)
+/// bridge — the overwhelmingly common case.
+pub(crate) fn resumed_generation() -> Option<u32> {
+    resumed_generation_from_args(std::env::args())
+}
+
+/// Pure argv-scan behind [`resumed_generation`], factored out so the parsing
+/// logic is unit-testable without depending on this process's own real argv
+/// (which never carries the marker inside `cargo test`).
+fn resumed_generation_from_args(args: impl Iterator<Item = String>) -> Option<u32> {
+    args.filter_map(|a| {
+        a.strip_prefix(RESUMED_GENERATION_ARG_PREFIX)
+            .map(str::to_owned)
+    })
+    .last()
+    .and_then(|s| s.parse::<u32>().ok())
+}
+
+/// Recovery action chosen for a `ProtocolMismatch` observed inside
+/// `forward_or_spawn`. Pure decision, factored out of [`trigger_bridge_self_heal`]
+/// so the loop-breaker guard rail (#714 §2.2: exec at most once per mismatch
+/// generation) is unit-testable without touching the process or the clock.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MismatchRecovery {
+    /// First generation (no `--resumed-generation` marker) — schedule an
+    /// in-place re-exec of the freshest on-disk binary.
+    ReexecScheduled,
+    /// Already a resumed generation and it hit `ProtocolMismatch` again — the
+    /// on-disk binary is itself stale, or a second rebuild race — take the
+    /// fallback instead of exec'ing a second time.
+    DrainAndExit,
+}
+
+fn decide_mismatch_recovery(resumed_generation: Option<u32>) -> MismatchRecovery {
+    match resumed_generation {
+        None => MismatchRecovery::ReexecScheduled,
+        Some(_) => MismatchRecovery::DrainAndExit,
+    }
+}
+
+/// Trigger the bridge's self-heal recovery for a `ProtocolMismatch` outcome.
+///
+/// Called from both `forward_or_spawn` `ProtocolMismatch` arms (the
+/// first-attempt arm and the arm inside the post-recovery retry loop — either
+/// can observe the mismatch depending on whether this was the first probe or
+/// a retry after a kill/respawn). Both arms already construct and return the
+/// hard mismatch error to the caller; this call schedules the recovery
+/// alongside that return, never in place of it.
+///
+/// Concurrency note (#714 design discussion, accepted risk, not fixed by
+/// this change): if the bridge is mid-flight on more than one outstanding
+/// client request when the mismatch fires, only the request that triggered
+/// this arm gets the ambiguous-error-then-resume treatment. Any other
+/// in-flight request loses its response the same way it would today if the
+/// process crashed — a pre-existing risk, not introduced here. Relatedly,
+/// [`fire_pending_self_heal`] fires on the next successful flush of *any*
+/// message, not specifically the mismatch response's own flush — on this
+/// bridge's dominant single-request-at-a-time usage those are the same
+/// event, but a genuinely concurrent second in-flight request could in
+/// principle flush first. That race is strictly better than the pre-fix
+/// timer (which could fire before *any* flush completed at all) and is the
+/// same class of pre-existing concurrency risk noted above, not a new one.
+fn trigger_bridge_self_heal() {
+    match decide_mismatch_recovery(resumed_generation()) {
+        MismatchRecovery::ReexecScheduled => schedule_reexec_on_mismatch(),
+        MismatchRecovery::DrainAndExit => {
+            tracing::warn!(
+                "resumed generation observed ProtocolMismatch again — loop-breaker \
+                 tripped (#714 §2.2, exec-once guard); draining and exiting instead \
+                 of re-exec'ing a second time"
+            );
+            schedule_drain_and_exit();
+        }
+    }
+}
+
+/// Arm an in-place re-exec of the freshest on-disk binary, to fire from
+/// [`fire_pending_self_heal`] once the mismatch response has actually
+/// flushed (see the module-level doc above for why that happens-after edge
+/// — not a fixed delay — is load-bearing). Never execs synchronously and
+/// never execs from this function directly. Only ever called for a
+/// first-generation process — the loop-breaker guard rail lives in
+/// [`trigger_bridge_self_heal`].
+#[cfg(unix)]
+pub(crate) fn schedule_reexec_on_mismatch() {
+    tracing::warn!(
+        client_version = PROTOCOL_VERSION,
+        "protocol mismatch: arming in-place re-exec of the freshest on-disk binary, \
+         to fire once the mismatch response has flushed to the client"
+    );
+    arm_pending_self_heal(MismatchRecovery::ReexecScheduled);
+}
+
+/// Re-exec self-heal requires `exec()` (POSIX-only); on any other target,
+/// take the same drain-and-exit fallback a loop-breaker trip would.
+#[cfg(not(unix))]
+pub(crate) fn schedule_reexec_on_mismatch() {
+    schedule_drain_and_exit();
+}
+
+/// Perform the actual re-exec: resolve the on-disk binary at *exec time* via
+/// [`std::env::current_exe`] (the same primitive `spawn_daemon` already uses
+/// for "pick up whatever `make local` just replaced" — see `spawn_daemon`
+/// above), preserve the original argv, append the `--resumed-generation=1`
+/// marker, and replace the process image via
+/// [`std::os::unix::process::CommandExt::exec`] — which, unlike `spawn`,
+/// keeps the same PID and the same open stdin/stdout/stderr file descriptors,
+/// so the client's stdio transport never sees EOF or a reset.
+///
+/// `exec` only returns on failure; on failure this logs and returns, leaving
+/// the process running under its stale binary (the hard mismatch error was
+/// already sent to the client for this request; there is nothing safe to
+/// retry from here).
+#[cfg(all(unix, not(test)))]
+fn reexec_in_place() {
+    use std::os::unix::process::CommandExt;
+
+    let exe = match std::env::current_exe() {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::error!(error = %e, "bridge self-heal re-exec failed: could not resolve current_exe");
+            return;
+        }
+    };
+    // Drop any pre-existing marker defensively (should never be present here —
+    // `trigger_bridge_self_heal` only reaches this path for a first-generation
+    // process — but argv should never accumulate duplicates if that invariant
+    // is ever violated).
+    let args: Vec<String> = std::env::args()
+        .skip(1)
+        .filter(|a| !a.starts_with(RESUMED_GENERATION_ARG_PREFIX))
+        .chain(std::iter::once(format!("{RESUMED_GENERATION_ARG_PREFIX}1")))
+        .collect();
+    let err = std::process::Command::new(exe).args(&args).exec();
+    tracing::error!(
+        error = %err,
+        "bridge self-heal re-exec failed; continuing under the stale binary"
+    );
+}
+
+/// Arm this process to stop serving and exit, to fire from
+/// [`fire_pending_self_heal`] for the same happens-after reason
+/// [`schedule_reexec_on_mismatch`] arms its exec instead of performing it
+/// directly. This is the fallback path (issue #714 §4): the MCP connection
+/// dies and the client's own process-lifecycle management must restart it —
+/// no worse than the pre-#714 hard-error-forever behavior.
+pub(crate) fn schedule_drain_and_exit() {
+    arm_pending_self_heal(MismatchRecovery::DrainAndExit);
+}
+
+#[cfg(not(test))]
+fn exit_process() {
+    std::process::exit(1);
+}
+
+#[cfg(all(test, unix))]
+pub(crate) static REEXEC_INVOKED_COUNT: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+#[cfg(test)]
+pub(crate) static DRAIN_EXIT_INVOKED_COUNT: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(all(test, unix))]
+pub(crate) fn reset_self_heal_counters() {
+    REEXEC_INVOKED_COUNT.store(0, std::sync::atomic::Ordering::SeqCst);
+    DRAIN_EXIT_INVOKED_COUNT.store(0, std::sync::atomic::Ordering::SeqCst);
+}
+
+#[cfg(all(test, not(unix)))]
+pub(crate) fn reset_self_heal_counters() {
+    DRAIN_EXIT_INVOKED_COUNT.store(0, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Test double for [`reexec_in_place`]: a real `exec()` would replace the test
+/// binary's own process image, killing the entire test run. Counts instead.
+/// Gated `unix` like the production version above — it is the only thing that
+/// calls it (`schedule_reexec_on_mismatch`'s `not(unix)` arm never reaches
+/// `reexec_in_place` at all).
+#[cfg(all(test, unix))]
+fn reexec_in_place() {
+    REEXEC_INVOKED_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Wraps a [`rmcp::transport::Transport`] so every message it successfully
+/// flushes to the client fires [`fire_pending_self_heal`] afterward.
+///
+/// This is the actual happens-after edge #714's self-heal design requires,
+/// not the fixed-duration sleep the first version of this change used.
+/// [`rmcp::transport::async_rw::AsyncRwTransport::send`] — the concrete
+/// transport `KhiveMcpServer::serve_stdio` wraps this around — resolves its
+/// returned future only once the message has been encoded and flushed to
+/// the underlying writer (`FramedWrite::send` is `futures::SinkExt::send`,
+/// i.e. `feed` + `flush`). `rmcp`'s own service loop enqueues a tool
+/// handler's response and returns almost immediately, then performs that
+/// real write+flush on a separately spawned task with no duration bound —
+/// so the handler itself has no way to await it directly. Wrapping the
+/// transport instead intercepts every flush completion regardless of which
+/// task drives it.
+pub(crate) struct SelfHealOnFlushTransport<T> {
+    inner: T,
+}
+
+impl<T> SelfHealOnFlushTransport<T> {
+    pub(crate) fn new(inner: T) -> Self {
+        Self { inner }
+    }
+}
+
+impl<T> rmcp::transport::Transport<rmcp::RoleServer> for SelfHealOnFlushTransport<T>
+where
+    T: rmcp::transport::Transport<rmcp::RoleServer>,
+{
+    type Error = T::Error;
+
+    fn send(
+        &mut self,
+        item: rmcp::service::TxJsonRpcMessage<rmcp::RoleServer>,
+    ) -> impl std::future::Future<Output = Result<(), Self::Error>> + Send + 'static {
+        let send = self.inner.send(item);
+        async move {
+            let result = send.await;
+            if result.is_ok() {
+                fire_pending_self_heal();
+            }
+            result
+        }
+    }
+
+    fn receive(
+        &mut self,
+    ) -> impl std::future::Future<Output = Option<rmcp::service::RxJsonRpcMessage<rmcp::RoleServer>>>
+           + Send {
+        self.inner.receive()
+    }
+
+    fn close(&mut self) -> impl std::future::Future<Output = Result<(), Self::Error>> + Send {
+        self.inner.close()
+    }
+}
+
+#[cfg(test)]
+fn exit_process() {
+    DRAIN_EXIT_INVOKED_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+}
+
 /// Bounded probe timeout used by [`wait_for_boot_quiescence_then_reprobe`],
 /// matching the 500ms bound already used by the identity probe inside
 /// [`kill_and_respawn`].
@@ -1047,6 +1380,10 @@ pub async fn forward_or_spawn(frame: &DaemonRequestFrame) -> Option<Result<Strin
                 "daemon protocol mismatch discovered after the request was fully \
                  written — not retrying or falling back locally to avoid duplicate dispatch"
             );
+            // #714: the daemon is fine (it just rejected us) — this bridge
+            // process itself is the stale one. Trigger self-heal alongside
+            // the hard error below, never in place of it.
+            trigger_bridge_self_heal();
             return Some(Err(McpError::internal_error(
                 format!(
                     "daemon protocol mismatch: expected version {PROTOCOL_VERSION}; \
@@ -1126,6 +1463,16 @@ pub async fn forward_or_spawn(frame: &DaemonRequestFrame) -> Option<Result<Strin
                 return Some(Err(ambiguous_forward_error()));
             }
             ForwardOutcome::ProtocolMismatch => {
+                tracing::warn!(
+                    config_id = %frame.config_id,
+                    namespace = %frame.namespace,
+                    "daemon protocol mismatch discovered on the post-recovery retry \
+                     — not retrying again or falling back locally"
+                );
+                // #714: same self-heal trigger as the first-attempt arm above —
+                // either arm can observe the mismatch depending on whether this
+                // was the first probe or a retry after a kill/respawn.
+                trigger_bridge_self_heal();
                 return Some(Err(McpError::internal_error(
                     format!(
                         "daemon protocol mismatch: expected version {PROTOCOL_VERSION}; \
@@ -4074,5 +4421,158 @@ mod tests {
             "pid file must be left alone alongside the live socket"
         );
         clear_daemon_env();
+    }
+
+    // ── bridge self-heal on ProtocolMismatch (#714) ───────────────────────────
+
+    #[test]
+    fn resumed_generation_from_args_absent_is_none() {
+        let argv = vec![
+            "kkernel".to_string(),
+            "mcp".to_string(),
+            "--daemon".to_string(),
+        ];
+        assert_eq!(resumed_generation_from_args(argv.into_iter()), None);
+    }
+
+    #[test]
+    fn resumed_generation_from_args_present_parses_value() {
+        let argv = vec![
+            "kkernel".to_string(),
+            "mcp".to_string(),
+            "--resumed-generation=1".to_string(),
+        ];
+        assert_eq!(resumed_generation_from_args(argv.into_iter()), Some(1));
+    }
+
+    #[test]
+    fn resumed_generation_from_args_malformed_value_is_none() {
+        let argv = vec![
+            "kkernel".to_string(),
+            "--resumed-generation=notanumber".to_string(),
+        ];
+        assert_eq!(resumed_generation_from_args(argv.into_iter()), None);
+    }
+
+    #[test]
+    fn resumed_generation_from_args_takes_the_last_occurrence() {
+        // Defensive: `reexec_in_place` filters any pre-existing marker before
+        // appending its own, so duplicates should never occur in practice —
+        // but if one ever did, the last one (the freshest exec's own marker)
+        // must win, not the first.
+        let argv = vec![
+            "kkernel".to_string(),
+            "--resumed-generation=1".to_string(),
+            "--resumed-generation=2".to_string(),
+        ];
+        assert_eq!(resumed_generation_from_args(argv.into_iter()), Some(2));
+    }
+
+    // Cold-start non-regression (issue #714, self-heal test plan item 4): a
+    // real `cargo test` process's own argv never carries the marker, so the
+    // production entry point must resolve to `None` — the same guarantee
+    // `KhiveMcpServer::serve_stdio` relies on to keep using the normal
+    // `.serve()` handshake for every ordinary session.
+    #[test]
+    fn resumed_generation_is_none_for_a_normal_test_process() {
+        assert_eq!(resumed_generation(), None);
+    }
+
+    // Loop-breaker guard rail (issue #714, self-heal test plan item 2): a
+    // resumed generation that observes ProtocolMismatch again must take the
+    // fallback, never a second exec. Pure decision function — no live
+    // process needed.
+    #[test]
+    fn decide_mismatch_recovery_first_generation_schedules_reexec() {
+        assert_eq!(
+            decide_mismatch_recovery(None),
+            MismatchRecovery::ReexecScheduled
+        );
+    }
+
+    #[test]
+    fn decide_mismatch_recovery_resumed_generation_drains_and_exits() {
+        assert_eq!(
+            decide_mismatch_recovery(Some(1)),
+            MismatchRecovery::DrainAndExit
+        );
+    }
+
+    // Ordering regression (issue #714, self-heal test plan item 1): arming a
+    // self-heal action must never fire it — only `fire_pending_self_heal`
+    // (the stdio transport's post-flush hook, exercised for real in
+    // `crates/kkernel/tests/mcp_bridge_reexec_protocol_mismatch.rs`) may take
+    // the armed action, and only after a flush has actually completed. This
+    // is the exact bug the original toy-server evidence reproduced (an
+    // in-flight response lost because `execv()` ran before the response
+    // bytes were flushed) — these tests pin the "arm never fires" half of
+    // that contract; the "fire only after a real flush" half is what the
+    // live integration test proves.
+
+    #[test]
+    #[serial]
+    fn schedule_reexec_on_mismatch_arms_without_firing() {
+        reset_self_heal_counters();
+        schedule_reexec_on_mismatch();
+        assert_eq!(
+            REEXEC_INVOKED_COUNT.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "arming must never exec synchronously or eagerly"
+        );
+        fire_pending_self_heal();
+        assert_eq!(
+            REEXEC_INVOKED_COUNT.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the armed action must fire exactly once it is taken"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn schedule_drain_and_exit_arms_without_firing() {
+        reset_self_heal_counters();
+        schedule_drain_and_exit();
+        assert_eq!(
+            DRAIN_EXIT_INVOKED_COUNT.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "arming must never exit synchronously or eagerly"
+        );
+        fire_pending_self_heal();
+        assert_eq!(
+            DRAIN_EXIT_INVOKED_COUNT.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the armed action must fire exactly once it is taken"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn fire_pending_self_heal_is_a_no_op_when_nothing_is_armed() {
+        reset_self_heal_counters();
+        fire_pending_self_heal();
+        assert_eq!(
+            REEXEC_INVOKED_COUNT.load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+        assert_eq!(
+            DRAIN_EXIT_INVOKED_COUNT.load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn fire_pending_self_heal_takes_the_armed_action_exactly_once() {
+        reset_self_heal_counters();
+        schedule_reexec_on_mismatch();
+        fire_pending_self_heal();
+        // A second flush completing after the action was already taken must
+        // not re-fire it — `PENDING_SELF_HEAL` is `take()`n, not just read.
+        fire_pending_self_heal();
+        assert_eq!(
+            REEXEC_INVOKED_COUNT.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "must fire exactly once even if fire_pending_self_heal is called again"
+        );
     }
 }

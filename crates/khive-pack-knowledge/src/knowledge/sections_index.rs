@@ -193,7 +193,7 @@ pub(crate) async fn embed_sections(
                         .await
                         .map_err(|e| sql_err("section index writer", e))?;
                     let now = now_us();
-                    for ((id, _), mut emb) in staged.iter().zip(embeddings.into_iter()) {
+                    for ((id, _), mut emb) in staged.iter().zip(embeddings) {
                         unit_normalize(&mut emb);
                         if let Err(e) = writer
                             .execute(SqlStatement {

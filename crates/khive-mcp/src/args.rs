@@ -106,6 +106,23 @@ pub struct Args {
     /// AFTER the config-file tier (serve.rs reads it explicitly after TOML).
     #[arg(long)]
     pub brain_profile: Option<String>,
+
+    /// Internal marker: this process is a resumed generation of a stdio
+    /// bridge that just re-exec'd itself in place after detecting a stale
+    /// daemon-protocol mismatch (issue #714). Never set by a normal client
+    /// launch — the bridge appends it to its own preserved argv immediately
+    /// before `exec()`ing the freshest on-disk binary, so the value travels
+    /// with the process image across the exec by construction.
+    ///
+    /// When present, `KhiveMcpServer::serve_stdio` skips the MCP initialize
+    /// handshake (`serve_directly`) instead of waiting for one, since the
+    /// connected peer already completed a real handshake with the prior
+    /// generation over this same, uninterrupted stdio pipe. It also gates the
+    /// re-exec loop-breaker: a resumed generation that itself observes a
+    /// protocol mismatch again takes the drain-and-exit fallback rather than
+    /// exec'ing a second time (`crate::daemon`, guard rail #714 §2.2).
+    #[arg(long, hide = true)]
+    pub resumed_generation: Option<u32>,
 }
 
 /// Resolve CLI namespace from `Args`. Returns `(explicit, namespace)`; errors on invalid namespace string.

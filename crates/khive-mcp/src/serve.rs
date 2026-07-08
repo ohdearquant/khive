@@ -43,6 +43,13 @@ pub struct MultiBackendRegistry {
 /// the same database file at the same time — see
 /// [`khive_runtime::daemon::run_daemon_with_boot_guard`].
 pub async fn run(args: Args, registry: &TransportRegistry) -> anyhow::Result<()> {
+    if let Some(generation) = args.resumed_generation {
+        tracing::warn!(
+            generation,
+            "bridge self-heal: this process is a resumed generation of an \
+             in-place re-exec triggered by a stale daemon-protocol mismatch (#714)"
+        );
+    }
     // #667: in daemon mode, failing to acquire the boot guard must abort
     // before `build_server` runs migrations/FTS DDL unguarded — see
     // `acquire_daemon_boot_guard`. Non-daemon callers keep the best-effort
@@ -897,6 +904,13 @@ pub async fn serve_server(
     registry: &TransportRegistry,
     boot_guard: Option<std::fs::File>,
 ) -> anyhow::Result<()> {
+    if let Some(generation) = args.resumed_generation {
+        tracing::warn!(
+            generation,
+            "bridge self-heal: this process is a resumed generation of an \
+             in-place re-exec triggered by a stale daemon-protocol mismatch (#714)"
+        );
+    }
     #[cfg(feature = "channel-email")]
     spawn_email_channel_loops_if_daemon(&server, args);
 

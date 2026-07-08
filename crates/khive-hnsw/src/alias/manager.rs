@@ -337,8 +337,8 @@ impl IndexAliasManager {
         if let Err(AliasError::DrainTimeout { .. }) = &drain_result {
             // The old collection is already retired from manager ownership;
             // we report this in the migration report but don't fail.
-        } else if let Err(e) = drain_result {
-            return Err(e);
+        } else {
+            drain_result?;
         }
 
         Ok(MigrationReport {

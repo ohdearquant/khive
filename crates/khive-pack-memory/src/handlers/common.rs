@@ -1032,7 +1032,7 @@ impl MemoryPack {
                     all_hits.extend(ns_hits);
                 }
                 // Merge + re-rank by score descending.
-                all_hits.sort_by(|a, b| b.score.cmp(&a.score));
+                all_hits.sort_by_key(|hit| std::cmp::Reverse(hit.score));
                 all_hits.truncate(candidate_limit as usize);
                 for (idx, hit) in all_hits.iter_mut().enumerate() {
                     hit.rank = (idx + 1) as u32;

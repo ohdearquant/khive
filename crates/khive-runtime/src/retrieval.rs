@@ -559,7 +559,7 @@ impl KhiveRuntime {
             .into_iter()
             .filter(|h| candidate_set.contains(&h.subject_id))
             .collect();
-        hits.sort_by(|a, b| b.score.cmp(&a.score));
+        hits.sort_by_key(|hit| std::cmp::Reverse(hit.score));
         hits.truncate(top_k as usize);
         Ok(hits)
     }

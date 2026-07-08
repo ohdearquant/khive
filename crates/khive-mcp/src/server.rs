@@ -257,6 +257,27 @@ pub fn builtin_pack_names() -> Vec<&'static str> {
     PackRegistry::discovered_names()
 }
 
+/// Which MCP handshake mode [`KhiveMcpServer::serve_stdio`] should use for
+/// this process instance (#714).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StdioServeMode {
+    /// Normal MCP `initialize` handshake — the overwhelmingly common case.
+    Handshake,
+    /// Skip the handshake (`serve_directly`): this process is a resumed
+    /// generation of a prior self-heal re-exec (`crate::daemon`, #714 §2.3).
+    Resumed,
+}
+
+/// Pure decision behind [`StdioServeMode`], factored out so it is
+/// unit-testable without driving real stdio I/O. `resumed_generation` is
+/// [`crate::daemon::resumed_generation`]'s return value.
+fn stdio_serve_mode_for(resumed_generation: Option<u32>) -> StdioServeMode {
+    match resumed_generation {
+        Some(_) => StdioServeMode::Resumed,
+        None => StdioServeMode::Handshake,
+    }
+}
+
 impl KhiveMcpServer {
     /// Build a server from `runtime.config().packs`. Errors if any pack is unknown or missing deps.
     // The error variant intentionally carries the runtime so callers can recover.
@@ -505,10 +526,40 @@ impl KhiveMcpServer {
     }
 
     /// Serve over stdio (blocks until the connection closes).
+    ///
+    /// #714: a resumed generation (produced by `crate::daemon`'s in-place
+    /// re-exec self-heal on a stale-protocol mismatch) skips the normal MCP
+    /// initialize handshake via `serve_directly` — by construction, its peer
+    /// already completed a real handshake with the prior generation over this
+    /// same, uninterrupted stdio pipe pair, so waiting for another one would
+    /// hang forever (the client has no reason to send a second `initialize`).
+    /// A cold start (the overwhelmingly common case) is unaffected: no
+    /// `--resumed-generation` marker means the normal `.serve()` handshake
+    /// runs exactly as before this change.
+    ///
+    /// Both branches wrap the raw stdio transport in
+    /// `crate::daemon::SelfHealOnFlushTransport` — the actual happens-after
+    /// edge that fires an armed self-heal re-exec (or drain-and-exit) only
+    /// once a message has genuinely finished flushing to the client, never
+    /// on a fixed timer that could race a slow or backpressured stdout.
     pub async fn serve_stdio(self) -> anyhow::Result<()> {
-        use rmcp::transport::stdio;
-        let service = self.serve(stdio()).await?;
-        service.waiting().await?;
+        use rmcp::transport::{async_rw::AsyncRwTransport, stdio};
+
+        let build_transport = || {
+            let (read, write) = stdio();
+            crate::daemon::SelfHealOnFlushTransport::new(AsyncRwTransport::new_server(read, write))
+        };
+
+        match stdio_serve_mode_for(crate::daemon::resumed_generation()) {
+            StdioServeMode::Resumed => {
+                let service = rmcp::service::serve_directly(self, build_transport(), None);
+                service.waiting().await?;
+            }
+            StdioServeMode::Handshake => {
+                let service = self.serve(build_transport()).await?;
+                service.waiting().await?;
+            }
+        }
         Ok(())
     }
 
@@ -1630,6 +1681,18 @@ mod tests {
 
     fn t(pack: &str, verb: &str, desc: &str) -> (String, String, String) {
         (pack.to_owned(), verb.to_owned(), desc.to_owned())
+    }
+
+    // ── serve_stdio handshake-mode decision (#714) ────────────────────────────
+
+    #[test]
+    fn stdio_serve_mode_cold_start_uses_handshake() {
+        assert_eq!(stdio_serve_mode_for(None), StdioServeMode::Handshake);
+    }
+
+    #[test]
+    fn stdio_serve_mode_resumed_generation_skips_handshake() {
+        assert_eq!(stdio_serve_mode_for(Some(1)), StdioServeMode::Resumed);
     }
 
     #[test]

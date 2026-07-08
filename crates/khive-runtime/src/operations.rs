@@ -854,7 +854,7 @@ impl KhiveRuntime {
             }
             // TODO(P2): parallelize vector inserts
             let mut inserted_models: Vec<String> = Vec::with_capacity(embed_model_names.len());
-            for (model_name, vector) in embed_model_names.iter().zip(vectors.into_iter()) {
+            for (model_name, vector) in embed_model_names.iter().zip(vectors) {
                 // Count-targetable fault injection for multi-model insert path (T-E3).
                 #[cfg(any(test, feature = "fault-injection"))]
                 let count_inject = VECTOR_FAIL_AFTER.with(|cell| match cell.get() {
@@ -2637,7 +2637,7 @@ impl KhiveRuntime {
             }
             // TODO(P2): parallelize vector inserts (internal review #444)
             let mut inserted_models: Vec<String> = Vec::with_capacity(embed_model_names.len());
-            for (model_name, vector) in embed_model_names.iter().zip(vectors.into_iter()) {
+            for (model_name, vector) in embed_model_names.iter().zip(vectors) {
                 let insert_result = match self.vectors_for_model(token, model_name) {
                     Ok(vs) => vs
                         .insert(
