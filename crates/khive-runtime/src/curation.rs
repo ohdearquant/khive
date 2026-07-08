@@ -1108,9 +1108,7 @@ fn merge_entity_sql(
                 let conflict_src = new_src.to_string();
                 let conflict_tgt = new_tgt.to_string();
                 conn.query_row(
-                    "SELECT id FROM graph_edges \
-                     WHERE namespace = ?1 AND source_id = ?2 AND target_id = ?3 \
-                     AND relation = ?4 AND id != ?5",
+                    khive_db::stores::graph::EDGE_SYMMETRIC_CONFLICT_PROBE_SQL,
                     rusqlite::params![
                         &namespace,
                         &conflict_src,
@@ -1128,14 +1126,11 @@ fn merge_entity_sql(
                 // Case (b): a live or soft-deleted row already owns this natural key.
                 // Delete the from-edge and refresh the existing row.
                 conn.execute(
-                    "DELETE FROM graph_edges WHERE namespace = ?1 AND id = ?2",
+                    khive_db::stores::graph::EDGE_SYMMETRIC_DELETE_NONCANONICAL_SQL,
                     rusqlite::params![&namespace, edge.id.to_string()],
                 )?;
                 conn.execute(
-                    "UPDATE graph_edges SET \
-                     weight = ?1, updated_at = ?2, deleted_at = NULL, \
-                     target_backend = ?3, metadata = ?4 \
-                     WHERE namespace = ?5 AND id = ?6",
+                    khive_db::stores::graph::EDGE_SYMMETRIC_REFRESH_CANONICAL_SQL,
                     rusqlite::params![
                         edge.weight,
                         now_ts,
@@ -1552,9 +1547,7 @@ fn merge_note_sql(
                 let conflict_src = new_src.to_string();
                 let conflict_tgt = new_tgt.to_string();
                 conn.query_row(
-                    "SELECT id FROM graph_edges \
-                     WHERE namespace = ?1 AND source_id = ?2 AND target_id = ?3 \
-                     AND relation = ?4 AND id != ?5",
+                    khive_db::stores::graph::EDGE_SYMMETRIC_CONFLICT_PROBE_SQL,
                     rusqlite::params![
                         &namespace,
                         &conflict_src,
@@ -1570,14 +1563,11 @@ fn merge_note_sql(
 
             let changed = if let Some(existing_id) = conflict_id {
                 conn.execute(
-                    "DELETE FROM graph_edges WHERE namespace = ?1 AND id = ?2",
+                    khive_db::stores::graph::EDGE_SYMMETRIC_DELETE_NONCANONICAL_SQL,
                     rusqlite::params![&namespace, edge.id.to_string()],
                 )?;
                 conn.execute(
-                    "UPDATE graph_edges SET \
-                     weight = ?1, updated_at = ?2, deleted_at = NULL, \
-                     target_backend = ?3, metadata = ?4 \
-                     WHERE namespace = ?5 AND id = ?6",
+                    khive_db::stores::graph::EDGE_SYMMETRIC_REFRESH_CANONICAL_SQL,
                     rusqlite::params![
                         edge.weight,
                         now_ts,
@@ -2508,6 +2498,74 @@ mod tests {
         assert!(
             from_store.get_note(from_id).await.unwrap().is_none(),
             "merged-from note should be soft-deleted"
+        );
+    }
+
+    // #690 regression: after routing merge_note's conflict-probe/delete/refresh
+    // arms through the shared khive-db EDGE_SYMMETRIC_*_SQL constants, note merge
+    // must still absorb a conflicting edge natural key exactly as before —
+    // mirrors merge_entity_survives_shared_edge_to_third_party for the note path.
+    #[tokio::test]
+    async fn merge_note_survives_shared_edge_to_third_party() {
+        use khive_storage::EdgeRelation;
+        let rt = rt();
+        let tok = NamespaceToken::local();
+
+        let into = rt
+            .create_note(&tok, "observation", None, "Into", None, None, vec![])
+            .await
+            .unwrap();
+        let from = rt
+            .create_note(&tok, "observation", None, "From", None, None, vec![])
+            .await
+            .unwrap();
+        let shared = rt
+            .create_entity(&tok, "concept", None, "Shared", None, None, vec![])
+            .await
+            .unwrap();
+
+        // Both into and from annotate the same shared entity — rewiring from's
+        // edge onto into during merge produces a duplicate (into, shared,
+        // annotates) triple, exercising the conflict-probe/delete/refresh arms.
+        rt.link(&tok, into.id, shared.id, EdgeRelation::Annotates, 1.0, None)
+            .await
+            .unwrap();
+        rt.link(&tok, from.id, shared.id, EdgeRelation::Annotates, 1.0, None)
+            .await
+            .unwrap();
+
+        let summary = rt
+            .merge_note(
+                &tok,
+                into.id,
+                from.id,
+                EntityDedupMergePolicy::PreferInto,
+                ContentMergeStrategy::Append,
+                false,
+            )
+            .await
+            .expect("merge must succeed even when both notes annotate the same entity");
+
+        assert_eq!(summary.kept_id, into.id);
+        assert_eq!(summary.removed_id, from.id);
+
+        let into_edges = rt
+            .list_edges(
+                &tok,
+                crate::EdgeListFilter {
+                    source_id: Some(into.id),
+                    target_id: Some(shared.id),
+                    relations: vec![EdgeRelation::Annotates],
+                    ..Default::default()
+                },
+                10,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            into_edges.len(),
+            1,
+            "exactly one live into→shared annotates edge must exist after merge; got: {into_edges:?}"
         );
     }
 

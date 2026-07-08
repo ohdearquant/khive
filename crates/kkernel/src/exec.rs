@@ -32,8 +32,8 @@ use anyhow::{Context, Result};
 use clap::Parser;
 
 use khive_mcp::serve::{
-    apply_env_output_format, build_server_multi_backend, enforce_strict_actor_mode,
-    resolve_runtime_config, RuntimeConfigInputs,
+    apply_env_output_format, build_server_multi_backend, config_discovery_db_anchor,
+    enforce_strict_actor_mode, resolve_runtime_config, RuntimeConfigInputs,
 };
 #[cfg(unix)]
 use khive_mcp::server::compute_config_id;
@@ -553,8 +553,13 @@ async fn run_exec_inline_with_forward(
     // topology (further below) resolve from the identical TOML file the
     // daemon's own boot path loads (`serve.rs`'s `build_server`:
     // `KhiveConfig::load_with_home_fallback(args.config.as_deref(),
-    // config.db_path.as_deref())` — `kkernel exec` has no `--config` flag, so
-    // the first argument here is always `None`, exactly like there).
+    // config_discovery_db_anchor(args.db.as_deref()).as_deref())` —
+    // `kkernel exec` has no `--config` flag, so the first argument here is
+    // always `None`, exactly like there. The second argument is the raw
+    // `--db`/`KHIVE_DB` discovery anchor (`None` unless `--db` was set) rather
+    // than `cfg.db_path` — `cfg.db_path` materializes the `$HOME/.khive`
+    // default when `--db` is unset (#689), which would incorrectly re-anchor
+    // tier-3 discovery away from the process cwd.
     //
     // Fixes the config_id topology-drift bug: the forward frame below used to
     // always fold `None` here, while the daemon folds `Some(&khive_cfg)`
@@ -564,7 +569,8 @@ async fn run_exec_inline_with_forward(
     // diverged, so a correctly-configured client was rejected as a
     // `ConfigMismatch` and silently fell back to the cold in-process path on
     // every call.
-    let khive_cfg = KhiveConfig::load_with_home_fallback(None, cfg.db_path.as_deref())
+    let db_path_for_config = config_discovery_db_anchor(db.as_deref());
+    let khive_cfg = KhiveConfig::load_with_home_fallback(None, db_path_for_config.as_deref())
         .map_err(|e| anyhow::anyhow!("config error: {e}"))?
         .unwrap_or_default();
 
@@ -723,7 +729,8 @@ async fn run_exec_ops_file(
     // `[[backends]]` multi-backend topology exactly like the daemon-fallback
     // path — see `build_local_fallback_server`.
     enforce_strict_actor_mode(cfg.actor_id.as_deref(), &cfg.packs)?;
-    let khive_cfg = KhiveConfig::load_with_home_fallback(None, cfg.db_path.as_deref())
+    let db_path_for_config = config_discovery_db_anchor(db.as_deref());
+    let khive_cfg = KhiveConfig::load_with_home_fallback(None, db_path_for_config.as_deref())
         .map_err(|e| anyhow::anyhow!("config error: {e}"))?
         .unwrap_or_default();
 

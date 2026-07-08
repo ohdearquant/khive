@@ -1101,11 +1101,16 @@ pub fn build_server(args: &Args) -> anyhow::Result<KhiveMcpServer> {
     // When no [[backends]] are declared, fall through to the existing single-backend path
     // to preserve byte-for-byte backward compatibility.
     //
-    // `config.db_path` (already resolved above) anchors tier-3 project-local config
-    // discovery to the database's own directory rather than the process cwd, so this
-    // reload agrees with the one inside `resolve_runtime_config` regardless of cwd.
+    // Deliberately `config_discovery_db_anchor(args.db.as_deref())`, NOT
+    // `config.db_path` — `config.db_path` (already resolved above) materializes
+    // the `$HOME/.khive/khive.db` default when `--db` is unset (#689), which
+    // would re-anchor this reload's tier-3 project-local config discovery to
+    // the home directory instead of the process cwd. This keeps the reload in
+    // agreement with the discovery anchor `resolve_runtime_config` already used
+    // to produce `config` above.
+    let db_path_for_config = config_discovery_db_anchor(args.db.as_deref());
     let khive_cfg =
-        KhiveConfig::load_with_home_fallback(args.config.as_deref(), config.db_path.as_deref())
+        KhiveConfig::load_with_home_fallback(args.config.as_deref(), db_path_for_config.as_deref())
             .map_err(|e| anyhow::anyhow!("config error: {e}"))?
             .unwrap_or_default();
 
@@ -1372,6 +1377,24 @@ fn expand_tilde(path: &std::path::Path) -> PathBuf {
     }
 }
 
+/// Resolve the `--db`/`KHIVE_DB` value into the anchor used for tier-3
+/// project-local `.khive/config.toml` DISCOVERY — as distinct from
+/// [`khive_runtime::resolve_db_anchor`], which always materializes a concrete
+/// anchor (defaulting to `$HOME/.khive/khive.db`) for the database that is
+/// actually about to be opened.
+///
+/// An explicit `--db`/`KHIVE_DB` still anchors discovery to that path, for the
+/// same config_id-coherence reason `resolve_db_anchor` documents. But when no
+/// db was supplied, this returns `None` instead of the materialized home
+/// default (#689): passing the home-default path into
+/// `KhiveConfig::load_with_home_fallback`'s `db_path` collapses tier 3 onto
+/// `$HOME/.khive/config.toml`, silently skipping the project-local
+/// `<cwd>/.khive/config.toml` that `project_config_anchor_dir` documents as
+/// the `db_path == None` fallback.
+pub fn config_discovery_db_anchor(db: Option<&str>) -> Option<std::path::PathBuf> {
+    db.and_then(|d| khive_runtime::resolve_db_anchor(Some(d)))
+}
+
 /// Inputs for [`resolve_runtime_config`] — the subset of serve-time arguments
 /// that determine the resolved [`RuntimeConfig`]. Callers other than
 /// `kkernel mcp` (e.g. `kkernel reindex`) supply these directly so they resolve
@@ -1436,12 +1459,15 @@ pub fn resolve_runtime_config(inputs: RuntimeConfigInputs<'_>) -> anyhow::Result
         ..RuntimeConfig::default()
     };
 
-    // Captured before `base_config` (which owns `db_path`) is consumed below —
-    // threaded into the config-file resolvers so tier-3 project-local config
+    // Threaded into the config-file resolvers so tier-3 project-local config
     // discovery anchors to the resolved database's directory rather than the
-    // process cwd (kills config_id drift between a client and the daemon
-    // serving the same database at a different working directory).
-    let db_path_for_config = base_config.db_path.clone();
+    // process cwd when an explicit `--db`/`KHIVE_DB` is given (kills config_id
+    // drift between a client and the daemon serving the same database at a
+    // different working directory). Deliberately NOT `base_config.db_path`
+    // (which materializes the `$HOME/.khive/khive.db` default when unset,
+    // #689) — an unset db must fall through to cwd-anchored discovery instead
+    // of silently searching the home directory.
+    let db_path_for_config = config_discovery_db_anchor(inputs.db);
 
     let resolved = if inputs.no_embed {
         let no_embed_base = RuntimeConfig {
@@ -1655,6 +1681,32 @@ mod tests {
     use khive_runtime::Namespace;
     use serial_test::serial;
     use std::io::Write;
+
+    // #689: `config_discovery_db_anchor` is a pure function (no env/cwd
+    // dependency), so its explicit-vs-unset contract is covered here without
+    // the env-mutation isolation the cwd/HOME-dependent tests below require.
+    #[test]
+    fn config_discovery_db_anchor_unset_is_none() {
+        assert_eq!(
+            config_discovery_db_anchor(None),
+            None,
+            "unset --db must not anchor discovery on the materialized home default"
+        );
+    }
+
+    #[test]
+    fn config_discovery_db_anchor_explicit_matches_resolve_db_anchor() {
+        assert_eq!(
+            config_discovery_db_anchor(Some("/tmp/explicit.db")),
+            khive_runtime::resolve_db_anchor(Some("/tmp/explicit.db")),
+            "an explicit --db must anchor discovery identically to resolve_db_anchor"
+        );
+    }
+
+    #[test]
+    fn config_discovery_db_anchor_memory_sentinel_is_none() {
+        assert_eq!(config_discovery_db_anchor(Some(":memory:")), None);
+    }
 
     fn write_config(dir: &std::path::Path, body: &str) -> PathBuf {
         let path = dir.join("khive.toml");
@@ -2086,6 +2138,64 @@ brain_profile = "project-profile"
             resolved.actor_id.as_deref(),
             Some("local"),
             "must not collapse to the literal namespace string"
+        );
+    }
+
+    /// #689 regression: an unset `--db`/`KHIVE_DB` must anchor tier-3
+    /// `.khive/config.toml` discovery on the process cwd, not on
+    /// `resolve_db_anchor(None)`'s materialized `$HOME/.khive/khive.db`
+    /// default. Before the fix, `db_path_for_config` was cloned straight from
+    /// `base_config.db_path`, so an unset db collapsed tier 3 onto
+    /// `$HOME/.khive/config.toml` and silently ignored a real project-local
+    /// config with no error of any kind.
+    ///
+    /// Uses `[runtime].brain_profile` — read from the db-anchored config load
+    /// (`resolve_config`/`runtime_config_from_khive_config`), unlike `[actor]`
+    /// which is resolved through a separate, always-cwd-anchored tier (see
+    /// `seat_shaped_project_actor_resolves_through_full_tier_chain` above) and
+    /// so cannot observe this bug on its own.
+    #[test]
+    #[serial]
+    fn resolve_runtime_config_unset_db_discovers_cwd_config_over_home() {
+        std::env::remove_var("KHIVE_ACTOR");
+
+        let project_dir = tempfile::tempdir().expect("project tempdir");
+        std::fs::create_dir_all(project_dir.path().join(".khive")).expect("mkdir project .khive");
+        std::fs::write(
+            project_dir.path().join(".khive/config.toml"),
+            "[runtime]\nbrain_profile = \"cwd-profile\"\n",
+        )
+        .expect("write project config");
+
+        let seat_env = SeatEnv::enter(project_dir.path());
+
+        // A conflicting $HOME/.khive/config.toml — must NOT win when --db is unset.
+        std::fs::create_dir_all(seat_env._isolated_home.path().join(".khive"))
+            .expect("mkdir home .khive");
+        std::fs::write(
+            seat_env._isolated_home.path().join(".khive/config.toml"),
+            "[runtime]\nbrain_profile = \"home-profile\"\n",
+        )
+        .expect("write home config");
+
+        let resolved = resolve_runtime_config(RuntimeConfigInputs {
+            db: None,
+            config: None,
+            namespace: Namespace::parse("local").expect("ns"),
+            namespace_explicit: false,
+            actor_explicit: false,
+            no_embed: true,
+            packs: None,
+            brain_profile: None,
+        })
+        .expect("resolve unset-db config");
+
+        assert_eq!(
+            resolved.brain_profile.as_deref(),
+            Some("cwd-profile"),
+            "unset --db must resolve tier-3 discovery against the project cwd, \
+             not $HOME/.khive/khive.db's directory — got {:?}",
+            resolved.brain_profile
         );
     }
 

@@ -170,6 +170,30 @@ static BUILTIN_DEFS: &[EntityTypeDef] = &[
         type_name: "objective",
         aliases: &["loss"],
     },
+    // ── Code (ADR-085) ──────────────────────────────────────────────────────
+    // "struct" and "class" are not registered as aliases here: formal-math
+    // "structure" already owns them (see above), and ADR-085 requires
+    // ingesters to write the canonical code tokens instead.
+    EntityTypeDef {
+        kind: EntityKind::Concept,
+        type_name: "module",
+        aliases: &["mod", "namespace"],
+    },
+    EntityTypeDef {
+        kind: EntityKind::Concept,
+        type_name: "function",
+        aliases: &["fn", "func", "method"],
+    },
+    EntityTypeDef {
+        kind: EntityKind::Concept,
+        type_name: "datatype",
+        aliases: &["enum", "record", "type_alias"],
+    },
+    EntityTypeDef {
+        kind: EntityKind::Concept,
+        type_name: "interface",
+        aliases: &["trait", "protocol"],
+    },
     // ── Dataset ──────────────────────────────────────────────────────────────
     // benchmark belongs to Dataset, not Concept (it evaluates models, it is not itself a concept).
     EntityTypeDef {
@@ -801,5 +825,58 @@ mod tests {
             .resolve(EntityKind::Document, Some("blog-post"))
             .expect("blog-post must normalise to blog_post");
         assert_eq!(res.entity_type.as_deref(), Some("blog_post"));
+    }
+
+    // ── ADR-085 code subtypes ────────────────────────────────────────────────
+
+    #[test]
+    fn entity_type_registry_accepts_code_tokens_and_aliases() {
+        let r = reg();
+        for (raw, canonical) in [
+            ("module", "module"),
+            ("mod", "module"),
+            ("namespace", "module"),
+            ("function", "function"),
+            ("fn", "function"),
+            ("func", "function"),
+            ("method", "function"),
+            ("datatype", "datatype"),
+            ("enum", "datatype"),
+            ("record", "datatype"),
+            ("type_alias", "datatype"),
+            ("interface", "interface"),
+            ("trait", "interface"),
+            ("protocol", "interface"),
+        ] {
+            let res = r
+                .resolve(EntityKind::Concept, Some(raw))
+                .unwrap_or_else(|e| panic!("{raw:?} must resolve for Concept: {e}"));
+            assert_eq!(
+                res.entity_type.as_deref(),
+                Some(canonical),
+                "{raw:?} must resolve to {canonical:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn entity_type_registry_does_not_claim_struct_or_class_for_code() {
+        let r = reg();
+        let struct_res = r
+            .resolve(EntityKind::Concept, Some("struct"))
+            .expect("struct remains a valid Concept subtype (owned by formal structure)");
+        assert_eq!(
+            struct_res.entity_type.as_deref(),
+            Some("structure"),
+            "struct must still resolve to formal-math structure, not datatype"
+        );
+        let class_res = r
+            .resolve(EntityKind::Concept, Some("class"))
+            .expect("class remains a valid Concept subtype (owned by formal structure)");
+        assert_eq!(
+            class_res.entity_type.as_deref(),
+            Some("structure"),
+            "class must still resolve to formal-math structure, not datatype"
+        );
     }
 }

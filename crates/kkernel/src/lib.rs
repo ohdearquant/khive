@@ -5,6 +5,7 @@ pub mod coordinator;
 pub mod dbpath;
 pub mod engine;
 pub mod exec;
+pub mod git_ingest;
 pub mod kg;
 pub mod pack_introspect;
 pub mod pending_events;
@@ -26,8 +27,10 @@ pub mod vector;
 #[allow(unused_imports)]
 mod _pack_links {
     use khive_pack_brain::BrainPack as _;
+    use khive_pack_code::CodePack as _;
     use khive_pack_comm::CommPack as _;
     use khive_pack_formal::FormalPack as _;
+    use khive_pack_git::GitPack as _;
     use khive_pack_gtd::GtdPack as _;
     use khive_pack_kg::KgPack as _;
     use khive_pack_knowledge::KnowledgePack as _;

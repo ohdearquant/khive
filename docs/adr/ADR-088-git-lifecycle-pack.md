@@ -61,7 +61,7 @@ New pack crate `khive-pack-git`, `REQUIRES = ["kg"]`, following `khive-pack-form
    `kind_status`.
 
 3. **`issue` properties**: `number`, `title`, `author`, `created_at`, `closed_at`
-   (optional), `labels` (array), `state_reason` (optional: `completed` / `not_planned`).
+   (optional), `labels` (array), `state_reason` (optional: `completed` / `not_planned` / `reopened` / `duplicate` — the GitHub `stateReason` enum, normalized to lowercase).
    `NoteKindSpec` lifecycle (declared now, enforced when the generic Phase-2 lifecycle
    layer lands — same posture as `finding`'s): `kind_status`, initial `open`, terminal
    `closed`. `pull_request` is explicitly NOT in v1 — see Open Questions.
@@ -215,3 +215,47 @@ rejected — see Open Questions.
 - ADR-087 — background ingestion operational pattern reused here
 - `crates/khive-types/src/note.rs` — `Note.content: String` (free body-text storage this
   ADR relies on)
+
+## Amendment (v0 implementation)
+
+The v0 implementation of `khive-pack-git` resolves the three Open Questions above and
+records two shape decisions made during the build that were not fixed in the original
+Decision text.
+
+1. **`pull_request` shipped in v0, not deferred.** Open Question 1 recommended deferral,
+   but the acceptance criterion for this pack — a provenance query that walks from a
+   `project` entity to the commits and pull requests that touch it — cannot be
+   demonstrated without a PR-linked commit in the graph. `pull_request` is therefore a
+   third `NOTE_KINDS` entry alongside `commit` and `issue`, sharing `issue`'s properties
+   shape (`number`, `title`, `author`, `created_at`, `closed_at`, `merged_at`, `base_ref`,
+   `head_ref`) plus a `KindHook` that validates `number` is present but does not enforce a
+   governed `state_reason` enum for PRs — GitHub's PR schema does not document one the way
+   it does for issues (`completed` / `not_planned` / `reopened` / `duplicate`), so PR `state_reason`, when present, is
+   only checked for non-emptiness rather than validated against a closed set.
+
+2. **Commit-to-document `annotates` enrichment.** The ingester additionally links a
+   `commit` note to a `document`-kind entity (ADR-086) when the commit's touched-file paths
+   match that document's `properties.source_uri` or filename. This is a best-effort
+   enrichment, not a hard requirement: no match means no edge and no document is
+   auto-created. This narrows, rather than widens, the pack's footprint — it reuses an
+   edge relation and entity kind already licensed elsewhere in the schema.
+
+3. **Cursor table shape (Open Question 2).** `git_mirror_cursor(project_id, kind,
+   cursor_value, updated_at)`, primary key `(project_id, kind)`. `kind` is a generic
+   discriminator (`"commits"`, `"issues"`, `"prs"`), not separate per-kind tables or
+   columns, so a future ingestion pack for another lifecycle domain (for example, a
+   code-review pack) can reuse this table for its own cursor rows without a schema
+   migration.
+
+4. **GitHub API access path (Open Question 3).** The ingester shells the configured GitHub
+   CLI (`gh`) rather than an installed GitHub App or direct REST calls. When `gh` is
+   unavailable, or fails against a given repository (no linked GitHub
+   remote, no auth), issue and pull-request ingestion are skipped with a warning in the
+   ingest report; commit ingestion — which depends only on local `.git` history — proceeds
+   regardless. This is a one-shot batch pass per invocation, not a poller.
+
+5. **Secret masking is enforced at the generic `create` verb, not re-implemented in the
+   ingester.** The KG pack's `create_note_inner` already hard-rejects content containing
+   unmasked secret patterns. The ingester calls the same masking helper the gate uses
+   before submitting commit-message and issue/PR-body content, so ingested provenance text
+   is redacted rather than rejected outright.

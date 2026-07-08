@@ -1,6 +1,6 @@
 # khive
 
-A research knowledge graph runtime — 74 verbs, 8 packs, one MCP tool.
+A research knowledge graph runtime — 74 verbs, 9 packs, one MCP tool.
 
 [![GitHub](https://img.shields.io/github/stars/ohdearquant/khive?style=flat)](https://github.com/ohdearquant/khive)
 [![crates.io](https://img.shields.io/crates/v/khive-mcp.svg)](https://crates.io/crates/khive-mcp)
@@ -19,7 +19,7 @@ Add to `.mcp.json` (project-level or `~/.claude/mcp.json` for global):
 { "mcpServers": { "khive": { "command": "khive", "args": ["mcp"] } } }
 ```
 
-All 8 packs load by default. A background daemon auto-spawns to keep the runtime warm.
+All 9 packs load by default. A background daemon auto-spawns to keep the runtime warm.
 
 ## What you get
 
@@ -33,6 +33,7 @@ All 8 packs load by default. A background daemon auto-spawns to keep the runtime
 | **schedule**  | 4     | Reminders and scheduled verb execution                |
 | **knowledge** | 19    | Atom-based KB with embedding rerank search            |
 | **session**   | 4     | Session record persistence (store/list/resume/export) |
+| **git**       | 0     | Git-lifecycle note kinds (commit/issue/pull_request) + batch ingester |
 
 ## Usage
 

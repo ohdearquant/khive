@@ -1,14 +1,14 @@
 # API Reference
 
-khive exposes exactly one MCP tool, `request`. Everything else — 74 verbs across 8
+khive exposes exactly one MCP tool, `request`. Everything else — 74 verbs across 9
 production packs — is dispatched through that single tool via a small request DSL.
 This page documents the DSL grammar, the response envelope, and every verb's full
 parameter contract, so an agent can call khive correctly without reading Rust source.
 
 This page is verified against the live registry (`request(ops="verbs()")`, run
-2026-07-04) and the pack source (`crates/khive-pack-*/src/*.rs` `HandlerDef`/`ParamDef`
+2026-07-07) and the pack source (`crates/khive-pack-*/src/*.rs` `HandlerDef`/`ParamDef`
 struct literals). Verb count: **74**, matching both the live registry `total` field and
-the sum of the 8 pack counts below. If your server reports a different total, your
+the sum of the 9 pack counts below. If your server reports a different total, your
 `KHIVE_PACKS` configuration loads a different pack set than the default — run
 `request(ops="verbs()")` against your own server to get the authoritative list.
 
@@ -29,9 +29,14 @@ An always-machine-readable copy of this page is at
 | `schedule`  | 4     | `KHIVE_PACKS=kg,schedule`  | Yes                 |
 | `knowledge` | 19    | `KHIVE_PACKS=kg,knowledge` | Yes                 |
 | `session`   | 4     | `KHIVE_PACKS=kg,session`   | Yes                 |
+| `git`       | 0     | `KHIVE_PACKS=kg,git`       | Yes                 |
 
-The default binary (no `KHIVE_PACKS`/`--pack` override) loads all 8 packs: 17 + 5 + 5 +
-14 + 6 + 4 + 19 + 4 = **74 verbs**.
+`git` contributes zero verbs — it registers the `commit` / `issue` / `pull_request` note
+kinds and a batch ingester (`crates/khive-pack-git/src/ingest.rs`), consumed outside the
+`request` DSL, not new MCP-callable verbs.
+
+The default binary (no `KHIVE_PACKS`/`--pack` override) loads all 9 packs: 17 + 5 + 5 +
+14 + 6 + 4 + 19 + 4 + 0 = **74 verbs**.
 
 Verb names in the `kg` pack are bare (`create`, `search`, `link`, …). Every other pack
 namespaces its verbs with a `pack.` prefix (`gtd.assign`, `memory.recall`,

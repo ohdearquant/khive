@@ -1045,7 +1045,8 @@ mod tests {
         // session loads by default so its background mirror warm-hook runs in
         // production; its handlers are all operator-only subhandlers (0 wire verbs).
         assert!(cfg.packs.contains(&"session".to_string()));
-        assert_eq!(cfg.packs.len(), 8);
+        assert!(cfg.packs.contains(&"git".to_string()));
+        assert_eq!(cfg.packs.len(), 9);
         if let Some(v) = prior {
             // SAFETY: single-threaded test cleanup; restores KHIVE_PACKS to its prior value.
             unsafe {

@@ -71,7 +71,8 @@ pub use operations::{
     arm_vector_fail, arm_vector_fail_after,
 };
 pub use operations::{
-    merge_entry_metadata, EntityCreateSpec, LinkSpec, NoteSearchHit, QueryResult, Resolved,
+    merge_entry_metadata, EdgeEndpointKind, EntityCreateSpec, LinkSpec, NoteSearchHit, QueryResult,
+    Resolved,
 };
 pub use pack::{
     resolve_explicit_namespace, DispatchHook, HandlerDef, KindHook, NoteKindSpec,
