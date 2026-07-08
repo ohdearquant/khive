@@ -391,6 +391,9 @@ pub const BASE_ENTITY_ENDPOINT_RULES: &[(&str, EdgeRelation, &str)] = &[
     ("concept", EdgeRelation::IntroducedBy, "document"),
     ("concept", EdgeRelation::IntroducedBy, "person"),
     ("artifact", EdgeRelation::IntroducedBy, "document"),
+    ("document", EdgeRelation::IntroducedBy, "person"),
+    ("document", EdgeRelation::IntroducedBy, "org"),
+    ("concept", EdgeRelation::IntroducedBy, "org"),
     // Provenance
     ("artifact", EdgeRelation::DerivedFrom, "dataset"),
     ("artifact", EdgeRelation::DerivedFrom, "document"),
@@ -410,6 +413,7 @@ pub const BASE_ENTITY_ENDPOINT_RULES: &[(&str, EdgeRelation, &str)] = &[
     ("service", EdgeRelation::DependsOn, "dataset"),
     ("artifact", EdgeRelation::DependsOn, "project"),
     ("artifact", EdgeRelation::DependsOn, "service"),
+    ("document", EdgeRelation::DependsOn, "document"),
     ("concept", EdgeRelation::Enables, "concept"),
     ("service", EdgeRelation::Enables, "concept"),
     ("dataset", EdgeRelation::Enables, "concept"),
@@ -10891,6 +10895,148 @@ mod tests {
             result.is_ok(),
             "theorem->definition DependsOn must be allowed by the installed pack rule; \
              the base contract has no concept->concept DependsOn row; got {result:?}"
+        );
+    }
+
+    // ── ADR-002 2026-07-08 provenance amendment ─────────────────────────────────
+    // Four new base endpoint pairs: document->person and document->org (document
+    // authorship), concept->org (concept origination by an org), and
+    // document->document (normative document dependency). Positive links for
+    // each new pair, plus a direction-matters negative guard.
+
+    #[tokio::test]
+    async fn link_document_introduced_by_person_allowed() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+
+        let doc = rt
+            .create_entity(&tok, "document", None, "Paper", None, None, vec![])
+            .await
+            .unwrap();
+        let author = rt
+            .create_entity(&tok, "person", None, "Author", None, None, vec![])
+            .await
+            .unwrap();
+
+        let result = rt
+            .link(
+                &tok,
+                doc.id,
+                author.id,
+                EdgeRelation::IntroducedBy,
+                1.0,
+                None,
+            )
+            .await;
+        assert!(
+            result.is_ok(),
+            "document->person introduced_by must be allowed by the ADR-002 \
+             provenance amendment; got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn link_document_introduced_by_org_allowed() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+
+        let doc = rt
+            .create_entity(&tok, "document", None, "Whitepaper", None, None, vec![])
+            .await
+            .unwrap();
+        let org = rt
+            .create_entity(&tok, "org", None, "Publisher", None, None, vec![])
+            .await
+            .unwrap();
+
+        let result = rt
+            .link(&tok, doc.id, org.id, EdgeRelation::IntroducedBy, 1.0, None)
+            .await;
+        assert!(
+            result.is_ok(),
+            "document->org introduced_by must be allowed by the ADR-002 \
+             provenance amendment; got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn link_concept_introduced_by_org_allowed() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+
+        let concept = rt
+            .create_entity(&tok, "concept", None, "Architecture", None, None, vec![])
+            .await
+            .unwrap();
+        let org = rt
+            .create_entity(&tok, "org", None, "Originator", None, None, vec![])
+            .await
+            .unwrap();
+
+        let result = rt
+            .link(
+                &tok,
+                concept.id,
+                org.id,
+                EdgeRelation::IntroducedBy,
+                1.0,
+                None,
+            )
+            .await;
+        assert!(
+            result.is_ok(),
+            "concept->org introduced_by must be allowed by the ADR-002 \
+             provenance amendment; got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn link_document_depends_on_document_allowed() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+
+        let doc_a = rt
+            .create_entity(&tok, "document", None, "Spec A", None, None, vec![])
+            .await
+            .unwrap();
+        let doc_b = rt
+            .create_entity(&tok, "document", None, "Spec B", None, None, vec![])
+            .await
+            .unwrap();
+
+        let result = rt
+            .link(&tok, doc_a.id, doc_b.id, EdgeRelation::DependsOn, 1.0, None)
+            .await;
+        assert!(
+            result.is_ok(),
+            "document->document depends_on must be allowed by the ADR-002 \
+             provenance amendment; got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn link_org_introduced_by_document_rejected_direction_matters() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+
+        let org = rt
+            .create_entity(&tok, "org", None, "Publisher", None, None, vec![])
+            .await
+            .unwrap();
+        let doc = rt
+            .create_entity(&tok, "document", None, "Paper", None, None, vec![])
+            .await
+            .unwrap();
+
+        // The amendment adds document->org, not org->document. Direction matters:
+        // an org is not "introduced by" a document it published.
+        let result = rt
+            .link(&tok, org.id, doc.id, EdgeRelation::IntroducedBy, 1.0, None)
+            .await;
+        assert!(
+            result.is_err(),
+            "org->document introduced_by must remain rejected; only \
+             document->org is permitted, not the reverse; got {result:?}"
         );
     }
 }

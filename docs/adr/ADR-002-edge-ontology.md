@@ -6,6 +6,11 @@
 **Amended by**: [ADR-076](ADR-076-relation-calculability-and-system-role.md) — `part_of` is a
 distinct relation, not the "inverse of `contains`"; the two coincide in some domains and diverge
 in others, and neither is derived from the other.
+**Amended 2026-07-08**: base endpoint contract gains four provenance pairs — `Document
+introduced_by Person`, `Document introduced_by Org`, `Concept introduced_by Org`, and `Document
+depends_on Document` — closing a gap where a document's own authorship and a document's
+normative dependency on another document had no representable edge. See "Base endpoint
+contract" below and "Why the 2026-07-08 provenance amendment?" in Rationale.
 
 ## Context
 
@@ -214,11 +219,21 @@ allowlist but cannot remove base rules.
 | `Concept`  | `introduced_by` | `Document` |
 | `Concept`  | `introduced_by` | `Person`   |
 | `Artifact` | `introduced_by` | `Document` |
+| `Document` | `introduced_by` | `Person`   |
+| `Document` | `introduced_by` | `Org`      |
+| `Concept`  | `introduced_by` | `Org`      |
 | `Concept`  | `supersedes`    | `Concept`  |
 | `Document` | `supersedes`    | `Document` |
 | `Artifact` | `supersedes`    | `Artifact` |
 | `Service`  | `supersedes`    | `Service`  |
 | `Dataset`  | `supersedes`    | `Dataset`  |
+
+> **Amended 2026-07-08**: added `Document introduced_by Person`, `Document introduced_by Org`,
+> and `Concept introduced_by Org`. `introduced_by` previously covered only how a _concept_ or
+> _artifact_ was first described; it had no pair for a _document's own authorship_ (who wrote
+> or published it) or for a _concept originating from an org_ rather than a paper or person
+> (e.g. an architecture originated by a company). Direction is unchanged: source is the thing
+> whose origin is being recorded, target is the origin.
 
 #### Provenance relation
 
@@ -253,9 +268,15 @@ Those are better modeled with `extends`, `variant_of`, `supersedes`, or metadata
 | `Service`  | `depends_on` | `Dataset`  |
 | `Artifact` | `depends_on` | `Project`  |
 | `Artifact` | `depends_on` | `Service`  |
+| `Document` | `depends_on` | `Document` |
 | `Concept`  | `enables`    | `Concept`  |
 | `Service`  | `enables`    | `Concept`  |
 | `Dataset`  | `enables`    | `Concept`  |
+
+> **Amended 2026-07-08**: added `Document depends_on Document` — a document's normative
+> dependency on another document (e.g. a spec that requires the terminology or scope defined
+> in a referenced RFC). Previously `depends_on` covered only project/service/artifact
+> dependency chains; document-to-document normative dependency had no representable pair.
 
 #### Implementation relation
 
@@ -446,6 +467,36 @@ The second expansion (→ 17, [ADR-055](ADR-055-epistemic-edge-relations.md)) ad
   `supports` and `refutes`. Previously approximated by `annotates`, which is polarity-blind and
   does not connect two entities. The relation choice carries polarity; the weight carries
   strength. This is the signal a confidence model consumes.
+
+### Why the 2026-07-08 provenance amendment?
+
+The base contract did not distinguish "who first described this concept" from "who authored
+this document." `introduced_by` covered concept/artifact origin but had no pair for a document
+pointing at its own author or publisher. Knowledge graphs built over real research corpora
+surface this gap immediately: a document entity for a paper, blog post, or standard needs an
+authorship edge to the person or org that wrote it, independent of any concept the document
+introduces.
+
+The amendment adds three pairs to close it:
+
+- **`Document introduced_by Person`** — a document authored by a person.
+- **`Document introduced_by Org`** — a document authored or published by an org.
+- **`Concept introduced_by Org`** — a concept originated by an org rather than a specific paper
+  or person (e.g. an architecture or protocol originated by a company). This pattern recurs
+  often enough in production knowledge graphs to warrant a first-class base pair rather than a
+  per-consumer workaround.
+
+It also adds one pair to `depends_on`:
+
+- **`Document depends_on Document`** — a document's normative dependency on another document
+  (a spec that requires terminology or scope defined in a referenced document). This is
+  distinct from `precedes` (temporal ordering, no replacement judgment) and from `supersedes`
+  (replacement) — `depends_on` here records that one document cannot be correctly read or
+  implemented without the other.
+
+None of these four pairs remove or narrow an existing rule; they are strictly additive to the
+base contract, consistent with the "packs extend, never tighten" principle this ADR already
+applies to pack-level `EDGE_RULES` ([ADR-017](ADR-017-pack-standard.md)).
 
 ### Why 9 categories?
 
