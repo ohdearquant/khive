@@ -132,11 +132,17 @@ pub(super) fn cmd_commit(args: CommitArgs) -> Result<()> {
 
     run_git_ok(&repo, &["add", "--", &rel_path])?;
 
-    let producer_batch = format!(
-        "{}@{}us",
-        changeset.envelope.producer,
-        changeset.envelope.staged_at.as_micros()
-    );
+    // ADR-101 D4: the batch trailer is envelope-first — an explicit
+    // `Envelope::batch_id` wins; the `producer@staged_atus` form is only the
+    // derived fallback for envelopes staged before batch_id existed.
+    let producer_batch = match &changeset.envelope.batch_id {
+        Some(batch_id) => batch_id.clone(),
+        None => format!(
+            "{}@{}us",
+            changeset.envelope.producer,
+            changeset.envelope.staged_at.as_micros()
+        ),
+    };
     let full_message = format!(
         "{}\n\nChange-Set-Producer: {}\nChange-Set-Producer-Batch: {}\n",
         args.message.trim_end(),
@@ -774,6 +780,31 @@ mod tests {
             .path()
             .join(".khive/kg/changesets/changeset.ndjson")
             .exists());
+    }
+
+    #[test]
+    fn cmd_commit_prefers_envelope_batch_id_over_derived_form() {
+        let repo_tmp = TempDir::new().unwrap();
+        init_repo(repo_tmp.path());
+        let stage_tmp = TempDir::new().unwrap();
+        let mut cs = sample_changeset();
+        cs.envelope = cs.envelope.with_batch_id("batch-explicit-42");
+        let changeset_path = write_changeset(stage_tmp.path(), &cs);
+        let rules_path = stage_tmp.path().join("rules.toml");
+        std::fs::write(&rules_path, "").unwrap();
+
+        let args = CommitArgs {
+            changeset: changeset_path,
+            rules: rules_path,
+            repo: repo_tmp.path().to_path_buf(),
+            message: "stage batch 2".into(),
+            format: OutputFormat::Json,
+        };
+        cmd_commit(args).expect("clean change-set must commit");
+
+        let log = run_git_ok(repo_tmp.path(), &["log", "-1", "--pretty=%B"]).unwrap();
+        assert!(log.contains("Change-Set-Producer-Batch: batch-explicit-42"));
+        assert!(!log.contains("agent:test@1000000us"));
     }
 
     #[test]
