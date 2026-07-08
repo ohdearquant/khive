@@ -38,16 +38,28 @@ thread_local! {
 
 pub(super) fn recall_profile_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var("KHIVE_RECALL_PROFILE").is_ok())
+    *ENABLED.get_or_init(|| {
+        let enabled = std::env::var("KHIVE_RECALL_PROFILE").is_ok();
+        khive_runtime::config_ledger::record_config_locked(
+            "KHIVE_RECALL_PROFILE",
+            enabled.to_string(),
+        );
+        enabled
+    })
 }
 
 pub(super) fn ann_overfetch_max_rounds() -> usize {
     static ROUNDS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *ROUNDS.get_or_init(|| {
-        std::env::var("ANN_OVERFETCH_MAX_ROUNDS")
+        let rounds = std::env::var("ANN_OVERFETCH_MAX_ROUNDS")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(3)
+            .unwrap_or(3);
+        khive_runtime::config_ledger::record_config_locked(
+            "ANN_OVERFETCH_MAX_ROUNDS",
+            rounds.to_string(),
+        );
+        rounds
     })
 }
 
