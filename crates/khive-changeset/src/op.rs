@@ -158,12 +158,49 @@ impl<'de> Deserialize<'de> for LinkOp {
 /// the patch leaves unchanged — enforced at deserialize time, the same
 /// discipline `DeleteOp` and `MergeOp` apply to their own preimages below.
 /// An `UpdateOp` whose preimage and patch disagree on which fields changed
-/// is unrepresentable.
+/// is unrepresentable — both the checked constructor and `Deserialize`
+/// enforce the same congruence validation, so there is no construction path
+/// that bypasses it.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct UpdateOp {
-    pub target_id: Id128,
-    pub patch: UpdatePatch,
-    pub preimage: UpdatePreimage,
+    target_id: Id128,
+    patch: UpdatePatch,
+    preimage: UpdatePreimage,
+}
+
+impl UpdateOp {
+    /// Construct an `UpdateOp`, enforcing the congruence invariant:
+    /// `preimage` must target the same substrate as `patch` and populate
+    /// exactly the fields `patch` touches. This is the same invariant the
+    /// `Deserialize` impl enforces on the wire, so an incongruent update
+    /// cannot be built through either entry point.
+    pub fn new(
+        target_id: Id128,
+        patch: UpdatePatch,
+        preimage: UpdatePreimage,
+    ) -> Result<Self, String> {
+        validate_update_congruence(&patch, &preimage)?;
+        Ok(UpdateOp {
+            target_id,
+            patch,
+            preimage,
+        })
+    }
+
+    /// The identifier of the record this update targets.
+    pub fn target_id(&self) -> Id128 {
+        self.target_id
+    }
+
+    /// The staged patch.
+    pub fn patch(&self) -> &UpdatePatch {
+        &self.patch
+    }
+
+    /// The field-scoped prior value the patch touches.
+    pub fn preimage(&self) -> &UpdatePreimage {
+        &self.preimage
+    }
 }
 
 #[derive(Deserialize)]
@@ -180,12 +217,7 @@ impl<'de> Deserialize<'de> for UpdateOp {
         D: Deserializer<'de>,
     {
         let raw = UpdateOpRaw::deserialize(deserializer)?;
-        validate_update_congruence(&raw.patch, &raw.preimage).map_err(serde::de::Error::custom)?;
-        Ok(UpdateOp {
-            target_id: raw.target_id,
-            patch: raw.patch,
-            preimage: raw.preimage,
-        })
+        UpdateOp::new(raw.target_id, raw.patch, raw.preimage).map_err(serde::de::Error::custom)
     }
 }
 
@@ -830,6 +862,30 @@ mod tests {
             "preimage": { "target": "note", "salience": 1.9 }
         });
         let result: Result<UpdateOp, _> = serde_json::from_value(json);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn update_op_new_rejects_incongruent_construction() {
+        // The public `UpdateOp::new` constructor is the only in-memory way to
+        // build an `UpdateOp` — this proves it enforces the same congruence
+        // invariant `Deserialize` does, so no incongruent op (patch sets
+        // `name`, preimage doesn't capture it) can ever reach `to_ndjson`.
+        let result = UpdateOp::new(
+            Id128::from_u128(1),
+            UpdatePatch::Entity(EntityPatch {
+                name: Some("new-name".to_string()),
+                description: None,
+                properties: None,
+                tags: None,
+            }),
+            UpdatePreimage::Entity(EntityPreimage {
+                name: None,
+                description: None,
+                properties: None,
+                tags: None,
+            }),
+        );
         assert!(result.is_err());
     }
 }

@@ -28,11 +28,12 @@ artifact itself — nothing about how it is validated, tiered, reviewed, or comm
   - `Link` — creates a new edge; `source`/`target` may reference another op's minted id.
   - `Update` — patches an existing entity's, note's, or edge's mutable fields. Carries a
     **required** field-scoped `preimage`: the prior value of exactly the fields the patch
-    touches (sets or explicitly clears to null), and nothing else. `UpdateOp`'s custom
-    deserialize enforces that the preimage's populated field set matches the patch's touched
-    field set exactly — a mismatched pair (a field the patch touches with no captured prior
-    value, or a captured prior value for a field the patch leaves unchanged) cannot be
-    constructed or deserialized.
+    touches (sets or explicitly clears to null), and nothing else. `UpdateOp`'s fields are
+    private; the only ways to build one are the checked `UpdateOp::new` constructor and
+    `Deserialize`, and both enforce that the preimage's populated field set matches the
+    patch's touched field set exactly — a mismatched pair (a field the patch touches with no
+    captured prior value, or a captured prior value for a field the patch leaves unchanged)
+    cannot be constructed or deserialized.
   - `Delete` — removes an entity, note, or edge. Carries the full prior record state as a
     **required** field (`preimage`); a `delete` op without one cannot be constructed or
     deserialized.
