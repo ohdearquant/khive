@@ -217,11 +217,22 @@ def test_reply_and_thread(proc):
         f"root_full_id={root_full_id!r} thread_tid={thread_tid!r}"
     )
 
-    # Messages must be in chronological order
+    # Messages must be in chronological order (oldest first). Agent mode
+    # renders created_at as relative strings ("1s ago", "0s ago"), which sort
+    # lexicographically in the WRONG direction for oldest-first output — a
+    # correctly ordered thread whose root crosses a 1-second boundary fails a
+    # sorted() comparison. Assert creation order by content instead: every
+    # copy of the root (dual-write emits outbound + inbound) must precede
+    # every copy of the reply.
     msgs = thread["messages"]
-    timestamps = [m["created_at"] for m in msgs]
-    assert timestamps == sorted(timestamps), (
-        f"thread messages must be in chronological order; got {timestamps}"
+    contents = [(m.get("content") or m.get("preview") or "") for m in msgs]
+    root_positions = [i for i, c in enumerate(contents) if "root message" in c]
+    reply_positions = [i for i, c in enumerate(contents) if "first reply" in c]
+    assert root_positions and reply_positions, (
+        f"thread must contain both root and reply; got {contents}"
+    )
+    assert max(root_positions) < min(reply_positions), (
+        f"thread messages must be in chronological order (root before reply); got {contents}"
     )
     print("  [ok] reply + thread: chronological order, correct thread_id")
 
