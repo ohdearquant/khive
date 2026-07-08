@@ -111,7 +111,8 @@ whole-state NDJSON (ADR-020 §2) — a change-set's ordering is operation order,
 canonical sort, because operation order is semantically load-bearing (a `link` can depend on an
 earlier `create` in the same file) in a way a state snapshot's row order is not. Each line
 carries enough to be applied independently of the file's byte layout: op kind, target kind,
-resolved or newly-minted identifiers, and the op's fields. The concrete field-level shape is
+resolved or newly-minted identifiers, the op's fields, and — for `delete` and `merge` — the
+captured stage-time preimage D1 requires. The concrete field-level shape is
 implementation detail of the `khive-changeset` crate (D5) and is not pinned by this ADR beyond
 the op-kind/identifier/fields shape above; it evolves as an internal format under the crate's
 own versioning, not as a wire contract this ADR freezes.
