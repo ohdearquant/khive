@@ -13,9 +13,9 @@ use crate::error::StorageError;
 pub type StorageResult<T> = Result<T, StorageError>;
 
 pub use graph::{
-    DirectedNeighborHit, Direction, Edge, EdgeFilter, EdgeSortField, GraphPath, LinkId,
-    NeighborHit, NeighborQuery, PathNode, SortDirection, SortOrder, TimeRange, TraversalOptions,
-    TraversalRequest,
+    DirectedNeighborHit, Direction, Edge, EdgeFilter, EdgeSeekPage, EdgeSortField, GraphPath,
+    LinkId, NeighborHit, NeighborQuery, PathNode, SortDirection, SortOrder, TimeRange,
+    TraversalOptions, TraversalRequest,
 };
 pub use pagination::{Page, PageRequest};
 pub use sparse::{

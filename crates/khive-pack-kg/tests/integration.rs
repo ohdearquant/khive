@@ -9732,3 +9732,157 @@ async fn link_depends_on_project_to_project_cross_namespace_infers_dependency_ki
         "cross-namespace depends_on must still infer dependency_kind=build (#638 round 1 finding 2); got edge: {edge:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// #701 / #702: edge listing pagination + per-relation stats
+// ---------------------------------------------------------------------------
+
+/// Create a `concept` entity via the `create` verb and return its UUID.
+async fn create_concept(f: &Fixture, name: &str) -> String {
+    f.dispatch("create", json!({"kind": "concept", "name": name}))
+        .await
+        .expect("create must succeed")["id"]
+        .as_str()
+        .unwrap()
+        .to_string()
+}
+
+/// #701 regression, exercised through the `list` verb: `offset` must page
+/// through the full edge set instead of returning the identical first page
+/// every time, and an out-of-range offset must return an empty array.
+#[tokio::test]
+async fn list_kind_edge_offset_pages_through_full_set() {
+    let f = pack();
+    let a = create_concept(&f, "Offset701A").await;
+    for i in 0..5 {
+        let t = create_concept(&f, &format!("Offset701T{i}")).await;
+        f.dispatch(
+            "link",
+            json!({"source_id": a, "target_id": t, "relation": "extends"}),
+        )
+        .await
+        .expect("link must succeed");
+    }
+
+    async fn list_page(f: &Fixture, a: &str, offset: u64) -> Vec<Value> {
+        f.dispatch(
+            "list",
+            json!({"kind": "edge", "source_id": a, "relations": ["extends"], "limit": 2, "offset": offset}),
+        )
+        .await
+        .expect("list(kind=edge) must succeed")
+        .as_array()
+        .expect("bare array response")
+        .clone()
+    }
+
+    let page0 = list_page(&f, &a, 0).await;
+    let page1 = list_page(&f, &a, 2).await;
+    let page2 = list_page(&f, &a, 4).await;
+    assert_eq!(page0.len(), 2);
+    assert_eq!(page1.len(), 2);
+    assert_eq!(page2.len(), 1);
+    assert_ne!(page0, page1, "page 2 must differ from page 1 (#701)");
+
+    let ids = |p: &[Value]| {
+        p.iter()
+            .map(|e| e["id"].as_str().unwrap().to_string())
+            .collect::<Vec<_>>()
+    };
+    let mut all_ids = ids(&page0);
+    all_ids.extend(ids(&page1));
+    all_ids.extend(ids(&page2));
+    all_ids.sort();
+    all_ids.dedup();
+    assert_eq!(all_ids.len(), 5, "pages must tile the full edge set");
+
+    let empty = list_page(&f, &a, 100).await;
+    assert!(
+        empty.is_empty(),
+        "offset past the end must return empty, not page 1"
+    );
+}
+
+/// #702.2: `list(kind=edge, after=<cursor>)` walks the full edge set via a
+/// keyset cursor and reports `next_after` until exhausted.
+#[tokio::test]
+async fn list_kind_edge_after_cursor_tiles_full_set() {
+    let f = pack();
+    let a = create_concept(&f, "Cursor702A").await;
+    for i in 0..5 {
+        let t = create_concept(&f, &format!("Cursor702T{i}")).await;
+        f.dispatch(
+            "link",
+            json!({"source_id": a, "target_id": t, "relation": "extends"}),
+        )
+        .await
+        .expect("link must succeed");
+    }
+
+    let mut seen = Vec::new();
+    // Empty string opts into cursor-mode pagination starting from the
+    // beginning of the set (no prior page).
+    let mut after = String::new();
+    for _ in 0..20 {
+        let args = json!({"kind": "edge", "source_id": a, "relations": ["extends"], "limit": 2, "after": after});
+        let result = f.dispatch("list", args).await.expect("list must succeed");
+        // Cursor-mode responses are an object, not a bare array (#702.2) —
+        // distinguishable at the JSON-shape level so plain offset callers
+        // are unaffected.
+        let obj = result
+            .as_object()
+            .expect("cursor-mode response is an object");
+        let edges = obj["edges"].as_array().expect("edges must be an array");
+        if edges.is_empty() {
+            break;
+        }
+        seen.extend(edges.iter().map(|e| e["id"].as_str().unwrap().to_string()));
+        match obj["next_after"].as_str() {
+            Some(next) => after = next.to_string(),
+            None => break,
+        }
+    }
+    seen.sort();
+    seen.dedup();
+    assert_eq!(seen.len(), 5, "cursor walk must tile the full edge set");
+}
+
+/// #702.3: `stats()` must break edge counts down by relation, matching the
+/// created fixtures.
+#[tokio::test]
+async fn stats_reports_edges_by_relation() {
+    let f = pack();
+    let a = create_concept(&f, "Stats702A").await;
+    let b = create_concept(&f, "Stats702B").await;
+    let c = create_concept(&f, "Stats702C").await;
+
+    f.dispatch(
+        "link",
+        json!({"source_id": a, "target_id": b, "relation": "extends"}),
+    )
+    .await
+    .expect("link A->B must succeed");
+    f.dispatch(
+        "link",
+        json!({"source_id": a, "target_id": c, "relation": "extends"}),
+    )
+    .await
+    .expect("link A->C must succeed");
+    f.dispatch(
+        "link",
+        json!({"source_id": b, "target_id": c, "relation": "enables"}),
+    )
+    .await
+    .expect("link B->C must succeed");
+
+    let result = f
+        .dispatch("stats", json!({}))
+        .await
+        .expect("stats must succeed");
+    let by_relation = result
+        .get("edges_by_relation")
+        .and_then(Value::as_object)
+        .expect("stats must include edges_by_relation");
+    assert_eq!(by_relation.get("extends").and_then(Value::as_u64), Some(2));
+    assert_eq!(by_relation.get("enables").and_then(Value::as_u64), Some(1));
+}

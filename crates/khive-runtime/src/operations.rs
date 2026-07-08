@@ -1684,6 +1684,7 @@ impl KhiveRuntime {
                     ..Default::default()
                 },
                 1,
+                0,
             )
             .await?
             .into_iter()
@@ -1742,6 +1743,7 @@ impl KhiveRuntime {
                     ..Default::default()
                 },
                 1,
+                0,
             )
             .await?
             .into_iter()
@@ -3752,16 +3754,56 @@ impl KhiveRuntime {
             .await?)
     }
 
-    /// List edges matching `filter`. `limit` is capped at 1000; defaults to 100.
+    /// Maximum rows returned by a single [`Self::list_edges`] /
+    /// [`Self::list_edges_after`] page. A lower bound the docs promise callers
+    /// can rely on; kept as a named constant so tests can exercise pagination
+    /// (page tiling, out-of-range offsets) without needing >1000 real rows.
+    pub const EDGE_LIST_MAX_LIMIT: u32 = 1000;
+
+    /// List edges matching `filter`, paging by `offset`. `limit` is capped at
+    /// [`Self::EDGE_LIST_MAX_LIMIT`]; defaults to 100.
+    ///
+    /// `offset` pages through the full matching set (#701 — previously
+    /// hard-coded to 0, so every page returned the same first rows). For
+    /// O(1)-at-depth walks over large edge populations, prefer
+    /// [`Self::list_edges_after`] instead of paging offset deep.
     pub async fn list_edges(
         &self,
         token: &NamespaceToken,
         filter: crate::curation::EdgeListFilter,
         limit: u32,
+        offset: u32,
     ) -> RuntimeResult<Vec<Edge>> {
-        let limit = limit.clamp(1, 1000);
+        let limit = limit.clamp(1, Self::EDGE_LIST_MAX_LIMIT);
+        let visible = token.visible_namespaces();
+
+        // Common case: a single visible namespace — page directly against the
+        // store so `offset`/`limit` reach SQL unmodified.
+        if let [ns] = visible {
+            let temp = NamespaceToken::for_namespace(ns.clone());
+            let page = self
+                .graph(&temp)?
+                .query_edges(
+                    filter.into(),
+                    vec![SortOrder {
+                        field: EdgeSortField::CreatedAt,
+                        direction: khive_storage::types::SortDirection::Asc,
+                    }],
+                    PageRequest {
+                        offset: offset.into(),
+                        limit,
+                    },
+                )
+                .await?;
+            return Ok(page.items);
+        }
+
+        // Multi-namespace visibility: `offset` must apply to the combined,
+        // deduplicated set rather than per-namespace pages, so fetch enough
+        // of each namespace's page to cover it, merge, then slice.
+        let fetch_limit = offset.saturating_add(limit);
         let mut results = Vec::new();
-        for ns in token.visible_namespaces() {
+        for ns in visible {
             let temp = NamespaceToken::for_namespace(ns.clone());
             let page = self
                 .graph(&temp)?
@@ -3771,15 +3813,84 @@ impl KhiveRuntime {
                         field: EdgeSortField::CreatedAt,
                         direction: khive_storage::types::SortDirection::Asc,
                     }],
-                    PageRequest { offset: 0, limit },
+                    PageRequest {
+                        offset: 0,
+                        limit: fetch_limit,
+                    },
                 )
                 .await?;
             results.extend(page.items);
         }
         results.sort_by_key(|e| Uuid::from(e.id));
         results.dedup_by_key(|e| Uuid::from(e.id));
+        let start = (offset as usize).min(results.len());
+        let end = (start + limit as usize).min(results.len());
+        Ok(results[start..end].to_vec())
+    }
+
+    /// Keyset (seek) page of edges matching `filter`, ordered by edge `id`
+    /// ascending. `after` is the last edge id from the previous page
+    /// (exclusive); omit to start from the beginning. Returns
+    /// `(items, next_after)` — `next_after` is `Some` when more rows may
+    /// remain past this page.
+    ///
+    /// Unlike [`Self::list_edges`], this is O(log n + limit) at any depth: the
+    /// underlying store issues an indexed `id > ?` range scan instead of an
+    /// `OFFSET` skip (#702.2 — the fix for the O(offset) daemon CPU cost
+    /// reported against #701's broken-offset paging loop).
+    pub async fn list_edges_after(
+        &self,
+        token: &NamespaceToken,
+        filter: crate::curation::EdgeListFilter,
+        after: Option<Uuid>,
+        limit: u32,
+    ) -> RuntimeResult<(Vec<Edge>, Option<Uuid>)> {
+        let limit = limit.clamp(1, Self::EDGE_LIST_MAX_LIMIT);
+        let visible = token.visible_namespaces();
+
+        if let [ns] = visible {
+            let temp = NamespaceToken::for_namespace(ns.clone());
+            let page = self
+                .graph(&temp)?
+                .query_edges_after(filter.into(), after, limit)
+                .await?;
+            return Ok((page.items, page.next_after));
+        }
+
+        // Multi-namespace visibility: seek each namespace from the same
+        // cursor (ids are globally unique UUIDs), merge, then take the head
+        // of the merged set as this page.
+        let mut results = Vec::new();
+        for ns in visible {
+            let temp = NamespaceToken::for_namespace(ns.clone());
+            let page = self
+                .graph(&temp)?
+                .query_edges_after(filter.clone().into(), after, limit)
+                .await?;
+            results.extend(page.items);
+        }
+        results.sort_by_key(|e| Uuid::from(e.id));
+        results.dedup_by_key(|e| Uuid::from(e.id));
         results.truncate(limit as usize);
-        Ok(results)
+        let next_after = results.last().map(|e| Uuid::from(e.id));
+        Ok((results, next_after))
+    }
+
+    /// Count edges by relation, ignoring soft-deleted rows (#702.3). Used by
+    /// `stats()` to report the true per-relation population so full-graph
+    /// audits know what they're sampling from before they walk it.
+    pub async fn count_edges_by_relation(
+        &self,
+        token: &NamespaceToken,
+    ) -> RuntimeResult<std::collections::HashMap<String, u64>> {
+        let mut totals: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+        for ns in token.visible_namespaces() {
+            let temp = NamespaceToken::for_namespace(ns.clone());
+            for (relation, count) in self.graph(&temp)?.count_edges_by_relation().await? {
+                *totals.entry(relation.to_string()).or_insert(0) += count;
+            }
+        }
+        Ok(totals)
     }
 
     /// DML-only body of the symmetric-relation conflict-resolution path in
@@ -4275,6 +4386,7 @@ impl KhiveRuntime {
                         ..Default::default()
                     },
                     1,
+                    0,
                 )
                 .await?
                 .into_iter()
@@ -5046,7 +5158,7 @@ mod tests {
             relations: vec![EdgeRelation::Extends],
             ..Default::default()
         };
-        let edges = rt.list_edges(&tok, filter, 100).await.unwrap();
+        let edges = rt.list_edges(&tok, filter, 100, 0).await.unwrap();
         assert_eq!(edges.len(), 1);
         assert_eq!(edges[0].relation, EdgeRelation::Extends);
     }
@@ -5083,10 +5195,165 @@ mod tests {
             source_id: Some(a.id),
             ..Default::default()
         };
-        let edges = rt.list_edges(&tok, filter, 100).await.unwrap();
+        let edges = rt.list_edges(&tok, filter, 100, 0).await.unwrap();
         assert_eq!(edges.len(), 1);
         let src: Uuid = edges[0].source_id;
         assert_eq!(src, a.id);
+    }
+
+    /// #701 regression: `offset` was hard-coded to 0 in `list_edges`, so every
+    /// page returned the identical first rows. Pages must now tile the full
+    /// matching set with no gaps or duplicates, and an out-of-range offset
+    /// must return empty rather than page 1.
+    #[tokio::test]
+    async fn list_edges_offset_pages_through_full_set() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+        let a = rt
+            .create_entity(&tok, "concept", None, "A", None, None, vec![])
+            .await
+            .unwrap();
+        for i in 0..5 {
+            let t = rt
+                .create_entity(&tok, "concept", None, &format!("T{i}"), None, None, vec![])
+                .await
+                .unwrap();
+            rt.link(&tok, a.id, t.id, EdgeRelation::Extends, 1.0, None)
+                .await
+                .unwrap();
+        }
+
+        let filter = EdgeListFilter {
+            source_id: Some(a.id),
+            relations: vec![EdgeRelation::Extends],
+            ..Default::default()
+        };
+
+        let page0 = rt.list_edges(&tok, filter.clone(), 2, 0).await.unwrap();
+        let page1 = rt.list_edges(&tok, filter.clone(), 2, 2).await.unwrap();
+        let page2 = rt.list_edges(&tok, filter.clone(), 2, 4).await.unwrap();
+        assert_eq!(page0.len(), 2);
+        assert_eq!(page1.len(), 2);
+        assert_eq!(page2.len(), 1);
+
+        let ids = |p: &[Edge]| p.iter().map(|e| Uuid::from(e.id)).collect::<Vec<_>>();
+        assert_ne!(ids(&page0), ids(&page1), "page 2 must differ from page 1");
+
+        let mut all_ids: Vec<Uuid> = ids(&page0)
+            .into_iter()
+            .chain(ids(&page1))
+            .chain(ids(&page2))
+            .collect();
+        all_ids.sort();
+        all_ids.dedup();
+        assert_eq!(all_ids.len(), 5, "pages must tile the full edge set");
+
+        let empty = rt.list_edges(&tok, filter.clone(), 2, 100).await.unwrap();
+        assert!(
+            empty.is_empty(),
+            "offset past the end must return empty, not page 1"
+        );
+    }
+
+    /// #702.2: `list_edges_after` seeks via `id > cursor` against the
+    /// `(namespace, id)` primary key index instead of paging through OFFSET,
+    /// so cost does not grow with how deep the walk goes.
+    #[tokio::test]
+    async fn list_edges_after_keyset_tiles_full_set() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+        let a = rt
+            .create_entity(&tok, "concept", None, "A", None, None, vec![])
+            .await
+            .unwrap();
+        for i in 0..5 {
+            let t = rt
+                .create_entity(&tok, "concept", None, &format!("K{i}"), None, None, vec![])
+                .await
+                .unwrap();
+            rt.link(&tok, a.id, t.id, EdgeRelation::Extends, 1.0, None)
+                .await
+                .unwrap();
+        }
+
+        let filter = EdgeListFilter {
+            source_id: Some(a.id),
+            relations: vec![EdgeRelation::Extends],
+            ..Default::default()
+        };
+
+        let mut seen = Vec::new();
+        let mut cursor: Option<Uuid> = None;
+        for _ in 0..20 {
+            let (page, next) = rt
+                .list_edges_after(&tok, filter.clone(), cursor, 2)
+                .await
+                .unwrap();
+            if page.is_empty() {
+                break;
+            }
+            seen.extend(page.iter().map(|e| Uuid::from(e.id)));
+            if next.is_none() {
+                break;
+            }
+            cursor = next;
+        }
+        seen.sort();
+        seen.dedup();
+        assert_eq!(seen.len(), 5, "keyset walk must tile the full edge set");
+
+        // Stability: repeating the same cursor returns the same page — no
+        // drift under a fixed snapshot. The seek is `WHERE id > ?` against
+        // the `(namespace, id)` primary key index with `ORDER BY id ASC`
+        // matching the index order, so this is an indexed range scan, not a
+        // full-table scan+sort (see `query_edges_after` in khive-db).
+        let (first_a, next_a) = rt
+            .list_edges_after(&tok, filter.clone(), None, 2)
+            .await
+            .unwrap();
+        let (first_b, next_b) = rt
+            .list_edges_after(&tok, filter.clone(), None, 2)
+            .await
+            .unwrap();
+        assert_eq!(
+            first_a.iter().map(|e| e.id.0).collect::<Vec<_>>(),
+            first_b.iter().map(|e| e.id.0).collect::<Vec<_>>(),
+        );
+        assert_eq!(next_a, next_b);
+    }
+
+    /// #702.3: `stats()` should be able to report a per-relation breakdown so
+    /// auditors know the true population per relation before sampling.
+    #[tokio::test]
+    async fn count_edges_by_relation_matches_fixtures() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+        let a = rt
+            .create_entity(&tok, "concept", None, "A", None, None, vec![])
+            .await
+            .unwrap();
+        let b = rt
+            .create_entity(&tok, "concept", None, "B", None, None, vec![])
+            .await
+            .unwrap();
+        let c = rt
+            .create_entity(&tok, "concept", None, "C", None, None, vec![])
+            .await
+            .unwrap();
+
+        rt.link(&tok, a.id, b.id, EdgeRelation::Extends, 1.0, None)
+            .await
+            .unwrap();
+        rt.link(&tok, a.id, c.id, EdgeRelation::Extends, 1.0, None)
+            .await
+            .unwrap();
+        rt.link(&tok, b.id, c.id, EdgeRelation::Enables, 1.0, None)
+            .await
+            .unwrap();
+
+        let counts = rt.count_edges_by_relation(&tok).await.unwrap();
+        assert_eq!(counts.get("extends").copied(), Some(2));
+        assert_eq!(counts.get("enables").copied(), Some(1));
     }
 
     #[tokio::test]

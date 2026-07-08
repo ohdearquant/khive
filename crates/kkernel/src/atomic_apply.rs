@@ -638,6 +638,7 @@ async fn build_op_result(
                         ..Default::default()
                     },
                     1,
+                    0,
                 )
                 .await?;
             let edge = edges.into_iter().next().ok_or_else(|| {
@@ -728,6 +729,7 @@ async fn build_op_result(
                         ..Default::default()
                     },
                     1,
+                    0,
                 )
                 .await?;
             let edge = edges.into_iter().next().ok_or_else(|| {

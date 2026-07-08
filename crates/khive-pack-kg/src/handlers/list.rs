@@ -140,8 +140,34 @@ impl KgPack {
                     max_weight: p.max_weight,
                 };
                 let limit = p.limit.unwrap_or(100);
-                let edges = self.runtime.list_edges(token, filter, limit).await?;
-                to_json(&edges)
+                if let Some(ref after_str) = p.after {
+                    // An empty string opts into cursor-mode pagination while
+                    // starting from the beginning of the set (no prior page).
+                    let after = if after_str.is_empty() {
+                        None
+                    } else {
+                        Some(uuid::Uuid::parse_str(after_str).map_err(|e| {
+                            RuntimeError::InvalidInput(format!(
+                                "after: invalid UUID {after_str:?}: {e}"
+                            ))
+                        })?)
+                    };
+                    let (edges, next_after) = self
+                        .runtime
+                        .list_edges_after(token, filter, after, limit)
+                        .await?;
+                    Ok(serde_json::json!({
+                        "edges": to_json(&edges)?,
+                        "next_after": next_after,
+                    }))
+                } else {
+                    let offset = p.offset.unwrap_or(0);
+                    let edges = self
+                        .runtime
+                        .list_edges(token, filter, limit, offset)
+                        .await?;
+                    to_json(&edges)
+                }
             }
             KindSpec::Note { specific } => {
                 let kind_filter = reconcile_specific(

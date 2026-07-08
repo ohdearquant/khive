@@ -8,9 +8,9 @@ use uuid::Uuid;
 
 use khive_storage::error::StorageError;
 use khive_storage::types::{
-    BatchWriteSummary, DeleteMode, DirectedNeighborHit, Direction, Edge, EdgeFilter, EdgeSortField,
-    GraphPath, NeighborHit, NeighborQuery, Page, PageRequest, PathNode, SortDirection, SortOrder,
-    SqlStatement, SqlValue, TraversalRequest,
+    BatchWriteSummary, DeleteMode, DirectedNeighborHit, Direction, Edge, EdgeFilter, EdgeSeekPage,
+    EdgeSortField, GraphPath, NeighborHit, NeighborQuery, Page, PageRequest, PathNode,
+    SortDirection, SortOrder, SqlStatement, SqlValue, TraversalRequest,
 };
 use khive_storage::GraphStore;
 use khive_storage::LinkId;
@@ -1369,6 +1369,84 @@ impl GraphStore for SqlGraphStore {
                 params.iter().map(|p| p.as_ref()).collect();
             let count: i64 = stmt.query_row(param_refs.as_slice(), |row| row.get(0))?;
             Ok(count as u64)
+        })
+        .await
+    }
+
+    async fn count_edges_by_relation(&self) -> Result<Vec<(EdgeRelation, u64)>, StorageError> {
+        let namespace = self.namespace.clone();
+        self.with_reader("count_edges_by_relation", move |conn| {
+            let sql = "SELECT relation, COUNT(*) FROM graph_edges \
+                       WHERE namespace = ?1 AND deleted_at IS NULL \
+                       GROUP BY relation";
+            let mut stmt = conn.prepare(sql)?;
+            let rows = stmt.query_map([&namespace], |row| {
+                let relation_str: String = row.get(0)?;
+                let count: i64 = row.get(1)?;
+                Ok((relation_str, count))
+            })?;
+            let mut out = Vec::new();
+            for row in rows {
+                let (relation_str, count) = row?;
+                let relation = relation_str.parse::<EdgeRelation>().map_err(|e| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        0,
+                        rusqlite::types::Type::Text,
+                        Box::new(e),
+                    )
+                })?;
+                out.push((relation, count as u64));
+            }
+            Ok(out)
+        })
+        .await
+    }
+
+    async fn query_edges_after(
+        &self,
+        filter: EdgeFilter,
+        after: Option<Uuid>,
+        limit: u32,
+    ) -> Result<EdgeSeekPage, StorageError> {
+        let namespace = self.namespace.clone();
+        let limit_i64 = i64::from(limit);
+        self.with_reader("query_edges_after", move |conn| {
+            let (mut where_clause, mut params) = build_edge_filter_sql(&namespace, &filter);
+            if let Some(cursor) = after {
+                params.push(Box::new(cursor.to_string()));
+                where_clause.push_str(&format!(" AND id > ?{}", params.len()));
+            }
+            params.push(Box::new(limit_i64));
+            let limit_idx = params.len();
+
+            // `where_clause` always pins `namespace = ?1`; adding `id > ?N` here
+            // keeps the predicate a range scan against the implicit unique index
+            // backing `PRIMARY KEY (namespace, id)` — equality on the leading
+            // column plus a range on the trailing one, with `ORDER BY id ASC`
+            // matching the index order, so SQLite seeks instead of scanning.
+            let data_sql = format!(
+                "SELECT namespace, id, source_id, target_id, relation, weight, \
+                        created_at, updated_at, deleted_at, metadata, target_backend \
+                 FROM graph_edges{} ORDER BY id ASC LIMIT ?{}",
+                where_clause, limit_idx,
+            );
+
+            let mut stmt = conn.prepare(&data_sql)?;
+            let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+                params.iter().map(|p| p.as_ref()).collect();
+            let rows = stmt.query_map(param_refs.as_slice(), read_edge)?;
+
+            let mut items = Vec::new();
+            for row in rows {
+                items.push(row?);
+            }
+            let next_after = if items.len() as u32 >= limit {
+                items.last().map(|e| Uuid::from(e.id))
+            } else {
+                None
+            };
+
+            Ok(EdgeSeekPage { items, next_after })
         })
         .await
     }

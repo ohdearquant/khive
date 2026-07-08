@@ -61,6 +61,10 @@ pub(crate) struct ListParams {
     pub(crate) relations: Option<Vec<String>>,
     pub(crate) min_weight: Option<f64>,
     pub(crate) max_weight: Option<f64>,
+    /// Keyset cursor for `kind="edge"`: the `id` of the last edge from the
+    /// previous page. When set, the response is `{edges, next_after}` instead
+    /// of a bare array — see the `list` verb description.
+    pub(crate) after: Option<String>,
     pub(crate) note_kind: Option<String>,
     pub(crate) thread_id: Option<String>,
     pub(crate) direction: Option<String>,

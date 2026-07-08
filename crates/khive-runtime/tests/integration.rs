@@ -876,6 +876,7 @@ async fn update_edge_canonical_orientation_conflict() {
                 ..Default::default()
             },
             100,
+            0,
         )
         .await
         .expect("list_edges must succeed");

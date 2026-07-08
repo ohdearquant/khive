@@ -157,6 +157,7 @@ async fn apply_worker_applies_add_edge_changeset() {
                 ..Default::default()
             },
             100,
+            0,
         )
         .await
         .expect("list_edges");
