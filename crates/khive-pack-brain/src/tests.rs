@@ -2141,11 +2141,22 @@ async fn r2_user_profile_feedback_routes_to_profile_state() {
 /// Build a runtime whose minted tokens carry a configured actor identity
 /// (rather than `ActorRef::anonymous()`), so actor-scoped bindings can match.
 fn make_pack_with_actor(actor_id: &str) -> (BrainPack, KhiveRuntime) {
+    // Mirror KhiveRuntime::memory() exactly (in-memory db, NO embedding model)
+    // plus a configured actor. `..RuntimeConfig::default()` is a CI trap: the
+    // Default impl resolves embedding_model to a real on-disk model, which is
+    // absent on CI runners and fails entity creation with ModelInitialization.
     let rt = KhiveRuntime::new(khive_runtime::RuntimeConfig {
         db_path: None,
+        default_namespace: Namespace::local(),
+        embedding_model: None,
+        additional_embedding_models: vec![],
+        gate: std::sync::Arc::new(khive_runtime::AllowAllGate),
         packs: vec!["kg".to_string()],
+        backend_id: khive_runtime::BackendId::main(),
+        brain_profile: None,
+        visible_namespaces: vec![],
+        allowed_outbound_namespaces: vec![],
         actor_id: Some(actor_id.to_string()),
-        ..khive_runtime::RuntimeConfig::default()
     })
     .expect("in-memory runtime with actor");
     let pack = BrainPack::new(rt.clone());
