@@ -2826,16 +2826,13 @@ impl KhiveRuntime {
 
         // FTS5 over the notes index — search all visible namespaces.
         //
-        // Fail-open on the FTS leg only, and only for FTS5 parser syntax errors
-        // (#388, #389 round 2, #389 round-2 High): sanitize_fts5_query strips
-        // known-unsafe FTS5 metacharacters, but residual punctuation the
-        // sanitizer does not strip (by design — the sanitizer stays minimal, the
-        // fail-open net is the systematic answer) can still reach the FTS5 parser
-        // and error. Degrade to vector-only fusion in that case. A genuine
-        // backend outage (pool exhaustion, connection failure, etc.) is NOT a
-        // bad query and must propagate — `is_fts5_syntax_error` is the narrow
-        // gate that tells the two apart. Errors from any other leg (vector
-        // search, note hydration) still propagate normally.
+        // FTS5 parser syntax errors (#388, #389 round 2, #389 round-2 High):
+        // sanitize_fts5_query strips known-unsafe FTS5 metacharacters, but
+        // residual punctuation the sanitizer does not strip can still reach
+        // the FTS5 parser and error. Per #569 this now fails loud instead of
+        // degrading to vector-only fusion, so callers see the bad query
+        // instead of silently losing the lexical leg. Errors from any other
+        // leg (vector search, note hydration) still propagate normally.
         //
         // Injection: check FTS_SEARCH_FAIL_NS (armed by `arm_fts_search_fail(ns)`)
         // — issue #389 round-2 High regression coverage for the propagate branch.
@@ -2874,18 +2871,11 @@ impl KhiveRuntime {
                 .await
         };
 
-        let text_hits = match text_search_result {
-            Ok(hits) => hits,
-            Err(e) if e.is_fts5_syntax_error() => {
-                tracing::warn!(
-                    error = %e,
-                    query = %query_text,
-                    "search_notes: FTS leg failed on a parser syntax error, degrading to vector-only fusion"
-                );
-                Vec::new()
-            }
-            Err(e) => return Err(e.into()),
-        };
+        let text_hits = crate::error::fts_text_leg_or_err(
+            text_search_result.map_err(RuntimeError::from),
+            "search_notes",
+            query_text,
+        )?;
 
         // Vector search filtered to notes.
         let vector_hits = if query_vector.is_some() || self.config().embedding_model.is_some() {
@@ -5298,6 +5288,46 @@ mod tests {
         assert!(
             hits.iter().any(|h| h.subject_id == note.id),
             "note should be indexed in FTS5 after create"
+        );
+    }
+
+    /// #569 regression: unlike `$`, `@` is NOT stripped by `sanitize_fts5_query`
+    /// (by design — the sanitizer stays minimal per #388 scope). SQLite FTS5's
+    /// bareword parser still rejects `@` unconditionally, so this query
+    /// reaches the runtime-level `Err` arm in `search_notes`, which must fail
+    /// loud (`RuntimeError::InvalidInput`) instead of silently degrading to
+    /// vector-only fusion. This assertion fails against the pre-#569
+    /// fail-open behavior (which returned `Ok` with an empty text leg here)
+    /// and passes once the FTS leg fails closed.
+    #[tokio::test]
+    async fn search_notes_with_residual_fts5_char_fails_loud() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+        rt.create_note(
+            &tok,
+            "observation",
+            None,
+            "use foo@bar to chain calls",
+            Some(0.5),
+            None,
+            vec![],
+        )
+        .await
+        .unwrap();
+
+        let result = rt
+            .search_notes(&tok, "foo@bar", None, 10, None, false, &[], None)
+            .await;
+
+        assert!(
+            result.is_err(),
+            "#569 search_notes must fail loud when the FTS leg errors on a residual \
+             FTS5 char ('@'), not silently degrade to vector-only fusion, got: {:?}",
+            result.ok()
+        );
+        assert!(
+            matches!(result.unwrap_err(), RuntimeError::InvalidInput(_)),
+            "residual FTS5 parser failure must surface as RuntimeError::InvalidInput"
         );
     }
 

@@ -221,6 +221,34 @@ pub enum RuntimeError {
     SecretDetected(crate::secret_gate::SecretMatch),
 }
 
+/// Resolve an FTS text-leg search result, failing loud on parser syntax
+/// errors instead of silently degrading to vector-only fusion (#569).
+///
+/// A genuine backend outage (pool exhaustion, connection failure, etc.) is
+/// NOT a bad query and is returned as-is via the fallthrough `Err(e)` arm;
+/// `is_fts5_syntax_error` is the narrow gate that tells the two apart.
+pub fn fts_text_leg_or_err<T>(
+    result: Result<Vec<T>, RuntimeError>,
+    context: &'static str,
+    query: &str,
+) -> RuntimeResult<Vec<T>> {
+    match result {
+        Ok(hits) => Ok(hits),
+        Err(RuntimeError::Storage(se)) if se.is_fts5_syntax_error() => {
+            tracing::warn!(
+                error = %se,
+                query = %query,
+                context,
+                "FTS text leg failed on a parser syntax error; failing loud (#569)"
+            );
+            Err(RuntimeError::InvalidInput(format!(
+                "{context}: FTS query could not be parsed: {se}"
+            )))
+        }
+        Err(e) => Err(e),
+    }
+}
+
 fn format_uuid_list(uuids: &[uuid::Uuid]) -> String {
     let shorts: Vec<String> = uuids
         .iter()

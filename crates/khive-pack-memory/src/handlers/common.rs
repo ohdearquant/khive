@@ -11,8 +11,8 @@ use uuid::Uuid;
 use khive_fusion::FusionStrategy;
 use khive_retrieval::{fuse_search_results, HybridConfig};
 use khive_runtime::{
-    MemoryRecallPipeline, NamespaceToken, NoteCandidate, RuntimeError, SearchHit, SearchSource,
-    VerbRegistry,
+    fts_text_leg_or_err, MemoryRecallPipeline, NamespaceToken, NoteCandidate, RuntimeError,
+    SearchHit, SearchSource, VerbRegistry,
 };
 use khive_score::DeterministicScore;
 use khive_storage::types::{
@@ -595,15 +595,12 @@ impl MemoryPack {
         let t_fts = if prof { Some(Instant::now()) } else { None };
         let searcher = self.runtime.text_for_notes(token)?;
 
-        // Fail-open on the FTS leg only, and only for FTS5 parser syntax errors
-        // (#388, #389 round-2 High): sanitize_fts5_query already strips
-        // known-unsafe FTS5 metacharacters, but if the lexical leg still errors
-        // at runtime on residual punctuation the sanitizer does not strip,
-        // degrade to an empty candidate set instead of aborting the whole
-        // memory.recall (the vector leg runs independently in
-        // collect_recall_candidates and still contributes). A genuine backend
-        // outage (pool exhaustion, connection failure, etc.) is NOT a bad
-        // query and must propagate.
+        // FTS5 parser syntax errors (#388, #389 round-2 High): sanitize_fts5_query
+        // already strips known-unsafe FTS5 metacharacters, but if the lexical
+        // leg still errors at runtime on residual punctuation the sanitizer
+        // does not strip, per #569 this now fails loud instead of degrading
+        // to an empty candidate set, so `memory.recall` surfaces the bad
+        // query instead of silently losing the lexical leg.
         //
         // Note: when `fts_gather.enabled`, `collect_text_hits` (text_gather.rs)
         // already collapses every `StorageError` into `RuntimeError::Internal`
@@ -645,22 +642,9 @@ impl MemoryPack {
                 .map_err(RuntimeError::from)
         };
 
-        let hits = match fts_result {
-            Ok(mut h) => {
-                h.sort_by_key(|h| h.rank);
-                h.truncate(candidate_limit as usize);
-                h
-            }
-            Err(RuntimeError::Storage(ref se)) if se.is_fts5_syntax_error() => {
-                tracing::warn!(
-                    error = %se,
-                    query = %query,
-                    "collect_recall_text_hits: FTS leg failed on a parser syntax error, degrading to vector-only recall"
-                );
-                Vec::new()
-            }
-            Err(e) => return Err(e),
-        };
+        let mut hits = fts_text_leg_or_err(fts_result, "collect_recall_text_hits", query)?;
+        hits.sort_by_key(|h| h.rank);
+        hits.truncate(candidate_limit as usize);
 
         if prof {
             if let Some(t) = t_fts {

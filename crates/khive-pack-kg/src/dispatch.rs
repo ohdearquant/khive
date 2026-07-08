@@ -1033,19 +1033,19 @@ mod tests {
         );
     }
 
-    /// PR #389 internal review round 1 High-1 regression: `search(kind="note", ...)` must
-    /// not hard-fail on a residual FTS5 metacharacter.
+    /// #569 regression: `search(kind="note", ...)` must fail loud on a residual
+    /// FTS5 metacharacter, exercised end to end through verb dispatch.
     ///
     /// `sanitize_fts5_query` (khive-db) strips known-unsafe characters like `$`,
     /// but by design stays minimal — it does not strip every character SQLite
     /// FTS5's bareword parser rejects. `@` is one residual character that still
-    /// crashes the parser. Before this fix, `search_notes`
-    /// (khive-runtime/operations.rs) propagated that FTS error with `.await?`,
-    /// so `search(kind="note")` aborted instead of degrading to vector-only
-    /// results — unlike the entity branch and `memory.recall`, which already
-    /// fail open. This exercises the fix end to end through verb dispatch.
+    /// crashes the parser. `search_notes` (khive-runtime/operations.rs) now
+    /// surfaces that FTS parser error as `RuntimeError::InvalidInput` instead
+    /// of silently degrading to vector-only results (#569). This assertion
+    /// fails against the pre-#569 fail-open behavior (which returned `Ok`
+    /// here) and passes once the FTS leg fails closed.
     #[tokio::test]
-    async fn handler_search_note_residual_fts5_char_does_not_error() {
+    async fn handler_search_note_residual_fts5_char_fails_loud() {
         let rt = KhiveRuntime::memory().expect("in-memory runtime");
         let tok = rt.authorize(Namespace::local()).unwrap();
 
