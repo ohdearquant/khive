@@ -8,6 +8,7 @@ pub mod graph;
 pub mod note;
 pub mod sparse;
 pub mod sql;
+pub mod telemetry;
 pub mod text;
 pub mod tx_registry;
 pub mod types;
@@ -24,6 +25,11 @@ pub use graph::GraphStore;
 pub use note::{FilterOp, Note, NoteFilter, NoteStore, SortDir};
 pub use sparse::SparseStore;
 pub use sql::{AtomicUnitOp, BoxFuture, SqlAccess, SqlReader, SqlWriter};
+pub use telemetry::{
+    ChannelBackoffArmedPayload, ChannelBackoffResetPayload, ChannelHeartbeatPersistFailedPayload,
+    ChannelPollFailedPayload, ChannelPollStartedPayload, ChannelPollSucceededPayload,
+    CheckpointOutcomeRecordedPayload, ConfigLockedPayload, LifecycleEvent,
+};
 pub use text::TextSearch;
 pub use types::StorageResult;
 pub use vectors::VectorStore;
