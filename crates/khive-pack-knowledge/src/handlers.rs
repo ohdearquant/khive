@@ -396,14 +396,11 @@ impl KnowledgePack {
         // Use "knowledge_compose" (not "recall") — the knowledge pack's compose-ranking
         // feedback has its own consumer_kind bucket (ADR-058 amendment, #542) so it no
         // longer shares posteriors with the memory pack's recall bucket.
-        //
-        // actor=None: this path does not thread the caller's actor identity through
-        // (unlike the memory pack's recall path, fixed by #697), so actor-scoped
-        // knowledge_compose bindings cannot match here yet — only namespace/wildcard
-        // bindings do. Tracked as a known gap, not fixed by #697 (out of that issue's scope).
         if let Some(ref tid) = target_id_str {
+            let actor = token.actor().id.as_str();
             if let Some(profile_id) =
-                resolve_consumer_profile(registry, None, &ns, ConsumerKind::KnowledgeCompose).await
+                resolve_consumer_profile(registry, Some(actor), &ns, ConsumerKind::KnowledgeCompose)
+                    .await
             {
                 let brain_params = json!({
                     "namespace": ns,
@@ -462,10 +459,10 @@ impl KnowledgePack {
         }
 
         // Tier 2: namespace-bound profile via brain.resolve(consumer_kind="knowledge_compose").
-        // actor=None: see the identical note in record_feedback above — this read-side
-        // resolution shares the same not-yet-actor-aware seam, tracked as a known gap.
+        let actor = token.actor().id.as_str();
         if let Some(profile_id) =
-            resolve_consumer_profile(registry, None, &ns, ConsumerKind::KnowledgeCompose).await
+            resolve_consumer_profile(registry, Some(actor), &ns, ConsumerKind::KnowledgeCompose)
+                .await
         {
             if let Some(weights) = load_profile_type_weights(registry, &profile_id).await {
                 return weights;
@@ -773,6 +770,117 @@ mod tests {
             "Tier-2 bound-profile: formalism {formalism_w:.4} must exceed og {og_w:.4}; \
              ordering reflects seed_priors (formalism β(8,1) >> og β(1,8)), \
              not default priors where og α=6,β=1.5 dominates"
+        );
+    }
+
+    /// #700: `resolve_compose_type_weights` must thread the caller's actor identity
+    /// into `resolve_consumer_profile` so an actor-scoped (namespace-wildcard)
+    /// `knowledge_compose` binding resolves at Tier 2 — not just namespace-scoped
+    /// bindings, which the sibling `..._at_tier2` test above already covers.
+    ///
+    /// Binds `compose-tuned-actor-v1` by `actor="leo"` only, leaving namespace as
+    /// the wildcard `"*"`. Before #700 (call sites passed `actor=None`), this
+    /// binding could never match — `resolve_compose_type_weights` would fall
+    /// through to Tier 3 and return the untuned default weights, where
+    /// `operational_guidance` dominates `formalism`. With the caller's actor
+    /// threaded through, Tier 2 must resolve this binding and return the
+    /// seed-tuned weights instead.
+    #[tokio::test]
+    async fn resolve_compose_type_weights_reads_bound_profile_weights_via_actor_binding_at_tier2() {
+        use khive_pack_brain::BrainPack;
+        use khive_pack_kg::KgPack;
+
+        // Mirror `KhiveRuntime::memory()` exactly, plus a configured actor.
+        // `..RuntimeConfig::default()` is a CI trap here: `Default` resolves
+        // `embedding_model` to a real on-disk model, which is absent on CI
+        // runners and fails entity creation with `ModelInitialization`.
+        let rt = KhiveRuntime::new(khive_runtime::RuntimeConfig {
+            db_path: None,
+            default_namespace: Namespace::local(),
+            embedding_model: None,
+            additional_embedding_models: vec![],
+            gate: std::sync::Arc::new(khive_runtime::AllowAllGate),
+            packs: vec!["kg".to_string()],
+            backend_id: khive_runtime::BackendId::main(),
+            brain_profile: None,
+            visible_namespaces: vec![],
+            allowed_outbound_namespaces: vec![],
+            actor_id: Some("leo".to_string()),
+        })
+        .expect("in-memory runtime with actor");
+
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(KgPack::new(rt.clone()));
+        builder.register(BrainPack::new(rt.clone()));
+        let registry = builder.build().expect("kg+brain registry builds");
+
+        let token = rt.authorize(Namespace::local()).expect("authorize local");
+        assert_eq!(
+            token.actor().id,
+            "leo",
+            "test setup: token must carry the configured actor"
+        );
+
+        // Same inverted seed_priors as the namespace-bound sibling test:
+        //   formalism:            Beta(8, 1) → mean ≈ 0.889
+        //   operational_guidance: Beta(1, 8) → mean ≈ 0.111
+        registry
+            .dispatch(
+                "brain.create_profile",
+                json!({
+                    "name": "compose-tuned-actor-v1",
+                    "consumer_kind": "knowledge_compose",
+                    "seed_priors": {
+                        "section_posteriors": {
+                            "formalism": {"alpha": 8.0, "beta": 1.0},
+                            "operational_guidance": {"alpha": 1.0, "beta": 8.0}
+                        }
+                    }
+                }),
+            )
+            .await
+            .expect("create_profile with skewed seed_priors");
+
+        registry
+            .dispatch(
+                "brain.activate",
+                json!({"profile_id": "compose-tuned-actor-v1"}),
+            )
+            .await
+            .expect("activate compose-tuned-actor-v1");
+
+        // Bind by actor only — namespace left as the "*" wildcard — so a
+        // namespace-only resolution (pre-#700 behavior) can never reach this
+        // binding; only threading the caller's actor through can.
+        registry
+            .dispatch(
+                "brain.bind",
+                json!({
+                    "actor": "leo",
+                    "profile_id": "compose-tuned-actor-v1",
+                    "consumer_kind": "knowledge_compose"
+                }),
+            )
+            .await
+            .expect("bind compose-tuned-actor-v1 for actor=leo");
+
+        // KnowledgePack with brain_profile=None → Tier 1 is skipped.
+        let pack = KnowledgePack::new(rt.clone());
+        let weights = pack.resolve_compose_type_weights(&registry, &token).await;
+
+        let formalism_w = *weights
+            .get("formalism")
+            .expect("formalism weight must be present");
+        let og_w = *weights
+            .get("operational_guidance")
+            .expect("operational_guidance weight must be present");
+
+        assert!(
+            formalism_w > og_w,
+            "Tier-2 actor-bound profile: formalism {formalism_w:.4} must exceed \
+             og {og_w:.4}; ordering reflects seed_priors (formalism β(8,1) >> \
+             og β(1,8)) resolved via the actor-scoped binding, not the default \
+             priors where og α=6,β=1.5 dominates"
         );
     }
 }
