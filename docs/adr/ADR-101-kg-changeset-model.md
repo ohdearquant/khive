@@ -119,6 +119,15 @@ cross-family gate takes the producer's model family as its input) and commit pro
 below). No op-level consumer — rule evaluator, diff renderer, applier — reads it, so the
 op-list itself stays producer-agnostic.
 
+> **Amendment (2026-07-08).** The envelope additionally carries an **optional `batch_id`**:
+> the producer-assigned batch identifier D4 expects in the commit trailer, recorded at stage
+> time when the producer supplies one. When present, the committing tool uses it verbatim as
+> the trailer value; when absent, the tool derives a deterministic fallback from envelope
+> fields it already holds (producer identity plus stage timestamp), and that derived value is
+> the trailer. The field is optional precisely because D4's identifier is opaque
+> producer-internal tracking — a producer without its own batching model should not be forced
+> to invent one, and the fallback keeps the trailer's round-trip contract intact either way.
+
 ### D2 — Serialization: NDJSON-delta
 
 A change-set serializes as **NDJSON-delta**: one JSON object per line, one line per operation,
@@ -168,6 +177,11 @@ flow), the git commit that lands it carries provenance at two levels:
 This is deliberately generic. The mechanism by which a specific producer generates that
 description or that identifier — its own scheduling, batching, or tasking model — is out of
 scope for a public architectural contract and is not named here.
+
+The identifier's source is the envelope's optional `batch_id` (D1, 2026-07-08 amendment).
+When the envelope omits it, the committing tool derives a deterministic fallback from the
+envelope's producer identity and stage timestamp; the trailer is then that derived value, and
+the round-trip contract above applies to it unchanged.
 
 ### D5 — Three UI-agnostic crates, no filesystem access, wasm32-compilable
 
