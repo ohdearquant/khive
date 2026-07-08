@@ -35,6 +35,9 @@ pub enum KgCommand {
     /// Manage the pre-commit hook for KG validation.
     #[command(subcommand)]
     Hook(HookCommand),
+
+    /// Validate and commit a staged tier-2 change-set (ADR-102 Amendment to ADR-020).
+    Commit(CommitArgs),
 }
 
 /// CLI arguments for `kkernel kg validate`.
@@ -198,6 +201,58 @@ pub struct StatusArgs {
     /// Namespace to compare.
     #[arg(long, default_value = "local")]
     pub namespace: String,
+}
+
+/// CLI arguments for `kkernel kg commit`.
+///
+/// Restores the `kg commit` primitive [ADR-020](../../../docs/adr/ADR-020-git-native-kg-implementation.md)
+/// §5 specified but never shipped, scoped per
+/// [ADR-102](../../../docs/adr/ADR-102-tiered-validate-and-merge.md)'s Amendment
+/// to ADR-020: the tier-2 commit step for an already-reviewed staged
+/// change-set, against this ADR's own local-only change-set/snapshot
+/// repository (D6) — not the project-repository-embedded `.khive/kg/` layout
+/// `validate`/`init`/`export`/`import`/`status` operate on.
+#[derive(clap::Parser, Debug)]
+pub struct CommitArgs {
+    /// Path to the staged change-set NDJSON-delta file (ADR-101 D2).
+    pub changeset: PathBuf,
+
+    /// Path to the rules file (TOML) the change-set is validated against
+    /// before it may be committed. Required — the rules file is load-bearing
+    /// configuration for this primitive, not an optional convenience.
+    #[arg(long)]
+    pub rules: PathBuf,
+
+    /// Target git repository holding staged change-sets and committed
+    /// snapshots. Must have no configured git remote (ADR-102 D6) — this
+    /// repository is local-only by binding constraint.
+    #[arg(long, default_value = ".")]
+    pub repo: PathBuf,
+
+    /// Commit message body: a human-readable description of the batch
+    /// (ADR-101 D4).
+    #[arg(short = 'm', long = "message")]
+    pub message: String,
+
+    /// Output format for the pre-commit validation report.
+    #[arg(long, default_value = "text")]
+    pub format: OutputFormat,
+}
+
+/// Result of a successful `kkernel kg commit` run.
+#[derive(Debug, Serialize)]
+pub struct CommitReport {
+    /// SHA of the git commit that landed the change-set.
+    pub commit_sha: String,
+    /// Path (relative to `repo`) of the committed change-set file.
+    pub changeset_path: String,
+    /// Number of operations in the committed change-set.
+    pub ops: usize,
+    /// `Envelope::producer` — carried as the `Change-Set-Producer` trailer.
+    pub producer: String,
+    /// Value carried as the `Change-Set-Producer-Batch` trailer (see
+    /// `kg::commit` module docs for how it is derived from the envelope).
+    pub producer_batch: String,
 }
 
 /// Subcommands for `kkernel kg hook` — install, remove, and check the pre-commit hook.

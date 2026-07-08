@@ -16,9 +16,13 @@ use super::types::{
 };
 
 /// Taxonomy sets derived from the loaded pack registry.
-struct KgTaxonomy {
-    entity_kinds: HashSet<String>,
-    note_kinds: HashSet<String>,
+///
+/// `pub(super)`: also consumed by `kg::commit` (`kkernel kg commit`, ADR-102)
+/// to reuse the same entity-kind/note-kind vocabulary this module builds for
+/// `kg validate`, rather than re-deriving it.
+pub(super) struct KgTaxonomy {
+    pub(super) entity_kinds: HashSet<String>,
+    pub(super) note_kinds: HashSet<String>,
 }
 
 /// Build the merged entity-kind and note-kind sets from all registered packs.
@@ -39,7 +43,7 @@ struct KgTaxonomy {
 /// operator must be able to run taxonomy validation against a strict-mode
 /// deployment. See `enforce_strict_actor_mode` in
 /// `crates/khive-mcp/src/serve.rs` for the authoritative boundary definition.
-fn build_taxonomy() -> Result<KgTaxonomy> {
+pub(super) fn build_taxonomy() -> Result<KgTaxonomy> {
     let config = RuntimeConfig {
         db_path: None,
         default_namespace: khive_runtime::Namespace::parse("kkernel-validate")
@@ -351,7 +355,12 @@ fn record_prefix(entity_id: Option<&str>, entity_name: Option<&str>) -> String {
     }
 }
 
-fn check_valid_entity_kinds(entities_path: &Path, valid_kinds: &HashSet<String>) -> RuleResult {
+/// `pub(super)`: reused by `kg::commit` (ADR-102) to check `create`-op entity
+/// kinds against the same pack-declared taxonomy `kg validate` enforces.
+pub(super) fn check_valid_entity_kinds(
+    entities_path: &Path,
+    valid_kinds: &HashSet<String>,
+) -> RuleResult {
     let valid_list = {
         let mut v: Vec<&str> = valid_kinds.iter().map(String::as_str).collect();
         v.sort_unstable();
@@ -400,7 +409,14 @@ fn check_valid_entity_kinds(entities_path: &Path, valid_kinds: &HashSet<String>)
     }
 }
 
-fn check_valid_note_kinds(notes_path: &Path, valid_kinds: &HashSet<String>) -> RuleResult {
+/// `pub(super)`: reused by `kg::commit` (ADR-102) to check `create`-op note
+/// kinds against the same pack-declared taxonomy `kg validate` enforces —
+/// meaningful here because `NoteCreateFields::note_kind` is a free-form
+/// string, not a closed Rust enum, so it needs a runtime check.
+pub(super) fn check_valid_note_kinds(
+    notes_path: &Path,
+    valid_kinds: &HashSet<String>,
+) -> RuleResult {
     let valid_list = {
         let mut v: Vec<&str> = valid_kinds.iter().map(String::as_str).collect();
         v.sort_unstable();
@@ -970,6 +986,40 @@ pub(super) fn configurable_rule_checks(
     notes_path: &Path,
     rules_path: &Path,
 ) -> Result<Vec<RuleResult>> {
+    configurable_rule_checks_impl(entities_path, edges_path, notes_path, rules_path, false)
+}
+
+/// Same as [`configurable_rule_checks`], but for callers evaluating rules
+/// against a *partial* view of the graph (e.g. `kg commit`'s projection of a
+/// single staged change-set, not the full dataset). The built-in
+/// `dangling-refs` evaluator's *finding* is meaningless over a partial view
+/// (every cross-change-set reference looks "dangling"), so its actual check
+/// is skipped here. Its configuration is still validated: a malformed
+/// `[dangling_refs] severity = "..."` still produces an error-severity
+/// `RuleResult` (same as the full-dataset path), and any generic `[[rules]]`
+/// entry — even one that happens to share the id `"dangling-refs"` — is
+/// still evaluated and returned. Skipping is done by *not invoking* the
+/// built-in evaluator, never by filtering results after the fact by id: a
+/// post-hoc `id == "dangling-refs"` filter would also swallow the malformed-
+/// config error result and any same-id generic rule, silently letting
+/// error-severity findings through (see ADR-102 D2; the commit-time rule
+/// pass must never suppress a real error to make a partial-view check quiet).
+pub(super) fn configurable_rule_checks_partial_view(
+    entities_path: &Path,
+    edges_path: &Path,
+    notes_path: &Path,
+    rules_path: &Path,
+) -> Result<Vec<RuleResult>> {
+    configurable_rule_checks_impl(entities_path, edges_path, notes_path, rules_path, true)
+}
+
+fn configurable_rule_checks_impl(
+    entities_path: &Path,
+    edges_path: &Path,
+    notes_path: &Path,
+    rules_path: &Path,
+    skip_dangling_refs_partial_view_finding: bool,
+) -> Result<Vec<RuleResult>> {
     let ext = rules_path
         .extension()
         .and_then(|e| e.to_str())
@@ -1084,8 +1134,10 @@ pub(super) fn configurable_rule_checks(
     if let Some(cfg) = &rules_file.dangling_refs {
         if cfg.enabled {
             if let Some(err_result) = validate_severity("dangling-refs", &cfg.severity) {
+                // Malformed config is always an error, full-dataset or
+                // partial-view alike — never skipped.
                 results.push(err_result);
-            } else {
+            } else if !skip_dangling_refs_partial_view_finding {
                 results.push(check_dangling_refs(
                     entities_path,
                     notes_path,
