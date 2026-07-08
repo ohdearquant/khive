@@ -133,6 +133,23 @@ DISCOVERABLE_PRODUCT_VERBS: frozenset[str] = KG_VERBS | GTD_VERBS | MEMORY_VERBS
 # the stated minimum (15).
 PLAY_SPEC_MINIMUM_VERB_COUNT = 15
 
+# ADR-023 coverage-gate manifest: the curated set of product verbs every
+# contract test module's VERBS_UNDER_TEST must jointly cover — dotted
+# pack.verb form for GTD/memory, bare for the core KG substrate. This is
+# narrower than DISCOVERABLE_PRODUCT_VERBS above (which also counts
+# admin/meta KG verbs like stats/propose/review/withdraw/verbs/context that
+# the coverage gate does not track), so the two are intentionally not
+# unioned or aliased to each other.
+PRODUCT_VERB_MANIFEST: frozenset[str] = frozenset({
+    # KG substrate (11) — bare names; no pack prefix
+    "create", "get", "list", "update", "delete", "merge",
+    "search", "link", "neighbors", "traverse", "query",
+    # GTD (5) — dotted pack.verb form
+    "gtd.assign", "gtd.next", "gtd.complete", "gtd.tasks", "gtd.transition",
+    # Memory (2) — dotted pack.verb form
+    "memory.remember", "memory.recall",
+})
+
 # ---------------------------------------------------------------------------
 # Golden snapshot scrub keys
 # Volatile fields to replace with "<redacted>" before saving golden files.
