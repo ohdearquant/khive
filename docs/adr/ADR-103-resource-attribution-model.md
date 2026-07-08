@@ -20,9 +20,11 @@ after the fact the question "what was the daemon doing, and on whose behalf" is
 unanswerable from any artifact that should answer it.
 
 This is not solely an internal-operations problem. The same gap exists on the commercial
-side: khive-cloud meters billable requests at the router (a two-phase reserve/finalize
-meter, `crates/operations/src/router.rs`, shipped and fail-closed on the reservation
-write). A request counter answers "how many billable requests did this tenant make," which
+side: the khive-cloud deployment (a separate product codebase, not part of this source
+tree) meters billable requests at its router with a two-phase reserve/finalize meter that
+fails closed on the reservation write. That external constraint is taken as given here,
+not verifiable from this repository. A request counter answers "how many billable
+requests did this tenant make," which
 is a different question from "how much compute did this tenant's work cost," and it is
 structurally blind to any cost that is not itself a billable request — background warm,
 shared-embedder serving on behalf of a caller, and any other work that runs off the
@@ -37,20 +39,23 @@ The daemon already writes one audit event to the `events` table on every verb di
 `EventKind::Audit` row on both `Allow` and `Deny` outcomes whenever an `EventStore` is
 configured, and both production server-construction paths wire that store unconditionally
 once authorization succeeds (`crates/khive-mcp/src/server.rs`). That row already carries
-`actor`, `verb`, `namespace`, `outcome`, `duration_us`, `session_id`, and `created_at`
-(`crates/khive-db/sql/events-ddl.sql`), and `payload` is untyped JSON. ADR-094 confirms and
+`actor`, `verb`, `namespace`, `outcome`, `session_id`, and `created_at`
+(`crates/khive-db/sql/events-ddl.sql`), and `payload` is untyped JSON. The schema also has
+a `duration_us` column, but the persisted audit row currently defaults it to 0: the
+measured dispatch duration is applied only to the opt-in dispatch-hook event, not to the
+`EventStore` row (`crates/khive-runtime/src/pack.rs`, `crates/khive-storage/src/event.rs`). ADR-094 confirms and
 builds on this same fact for a different purpose (ordered lifecycle sequencing for the
 email-channel poll loop and the WAL checkpoint task): "every verb execution produces one"
 audit row, "already wired into the daemon's default construction."
 
 Three consequences follow that reshape how this design should be read:
 
-1. **There is already one event plane, and it already records per-op, per-actor wall
-   time.** A design that reads as "add a new resource-event stream" misreads the current
-   state. Per-actor, per-op accounting does not need a new event stream; it needs three
-   fields the audit row does not yet carry: a closed `work_class` tag, `cpu_us` (the row
-   has wall `duration_us` only), and a deterministic `cost_unit`. Those are a payload
-   enrichment of a row already written, not new rows.
+1. **There is already one event plane keyed by actor and verb.** A design that reads as
+   "add a new resource-event stream" misreads the current state. Per-actor, per-op
+   accounting does not need a new event stream; it needs the audit row to populate its
+   existing `duration_us` column (today defaulted to 0 on the persisted row) and to gain
+   three payload fields it does not yet carry: a closed `work_class` tag, `cpu_us`, and a
+   deterministic `cost_unit`. Those are enrichments of a row already written, not new rows.
 2. **A new row per dispatch is a write-load hazard already characterized in this repo.**
    ADR-094 §5 works this arithmetic for a different variant and rejects unconditional
    per-tick emission on volume grounds. A literal per-op resource row would roughly double
@@ -153,8 +158,10 @@ diagnostics read. The `dims` split (embedder time vs. SQL time vs. inference tim
 behind a sampling flag: most ops do not need the split, and it is cheap to sample but
 expensive to always compute.
 
-Row identity fields already present and reused, unchanged: `actor`, `verb`, `namespace`,
-`outcome`, `duration_us` (the existing wall-clock measure), `session_id`, `created_at`.
+Row identity fields already present and reused: `actor`, `verb`, `namespace`, `outcome`,
+`session_id`, `created_at`. The existing `duration_us` column becomes the wall-clock
+measure and must be populated at this stage (the persisted audit row currently defaults
+it to 0).
 
 ### (c) Phase-span `EventKind` variants, extending ADR-094's additive mechanism
 
@@ -233,8 +240,12 @@ One mechanism, two policies, over the same `cost_unit`:
   mirroring the delivered cloud router's reserve/finalize design rather than
   fire-and-forget metering, which has previously under-counted credits when it lacked a
   synchronous pre-check.
-- **Soft (local):** over-budget allows, with an obligation that downgrades the op's
-  `work_class` to queue behind interactive work, never a refusal.
+- **Soft (local):** over-budget allows, with an obligation that lowers the op's
+  scheduling posture (a separate `qos_posture` field on the obligation, e.g.
+  `defer_behind_interactive`), never a refusal. The op's `work_class` is not mutated:
+  `work_class` records what the work _is_ (the attribution join key), while the quota
+  obligation records how it is _scheduled_; an interactive request that is over budget
+  remains attributed as interactive.
 - **Advisory-first staging:** meter, expose, and alert now; wire enforcement behind
   configuration later. This matches ADR-018's own precedent of locking an obligation's
   shape before enforcing it (`RateLimit` today) and how other staged-authority surfaces in
@@ -285,18 +296,22 @@ ADR-094 as the event-plane substrate it extends, ADR-018 as the enforcement seam
 ADR-091 as the write-load constraint this design is bound by.
 
 **Stage 1 — accounting and observability (near-term).** Extends ADR-094's `EventKind` set
-with the `PhaseStarted` / `PhaseCompleted` / `PhaseCancelled` variants; adds the `resource`
-payload enrichment to the existing audit row; adds a daemon resource self-report (cumulative
-CPU, RSS, current background-phase name) to the existing health read surface; adds a
-windowed, per-actor, per-kind read verb over the event plane that also surfaces the new
-`work_class` / `cost_unit` fields. Payload-only and additive-enum-only — no new migration,
-no new table.
+with the `PhaseStarted` / `PhaseCompleted` / `PhaseCancelled` variants; populates the
+existing audit row's `duration_us` (today defaulted to 0 on the persisted row) and adds the
+`resource` payload enrichment; adds a daemon resource self-report (cumulative CPU, RSS,
+current background-phase name) to the existing health read surface; adds a windowed,
+per-actor, per-kind read verb over the event plane that also surfaces the new `work_class`
+/ `cost_unit` fields. Payload-only and additive-enum-only — no new migration, no new table.
+In terms of the filed issues: this stage covers #723 asks 1 and 2 (phase logging, health
+self-report) and #724 Ask A (windowed event counts). #723 ask 3 (QoS for warm-path work)
+lands in Stage 2, and #724 Ask B (section co-usage aggregates) is a knowledge-pack read
+surface outside this ADR's scope, tracked on that issue independently.
 
 **Stage 2 — scheduling and QoS (sub-ADR).** The per-work-class bounded-concurrency
-semaphore and lowered thread priority for the `warm` and `maintenance` classes; the
-voluntary quiet-request verb and TTL-bounded deferral at background yield points; the
-external-lock reconciliation described in (e). Telemetry-first: class thresholds are chosen
-against Stage 1's measured data, not guessed, consistent with this repo's existing
+semaphore and lowered thread priority for the `warm` and `maintenance` classes (#723 ask
+3); the voluntary quiet-request verb and TTL-bounded deferral at background yield points;
+the external-lock reconciliation described in (e). Telemetry-first: class thresholds are
+chosen against Stage 1's measured data, not guessed, consistent with this repo's existing
 instrument-before-enforcement doctrine (ADR-091).
 
 **Stage 3 — quota at the Gate (sub-ADR).** The `QuotaGate` composition wrapping the base
