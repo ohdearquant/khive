@@ -347,13 +347,31 @@ This ADR is accepted with the following binding conditions:
 
 ---
 
+## Amendment: config_id excludes request identity (2026-07-08)
+
+ADR-096 Fork 1 makes the daemon request frame the authority for request identity. Therefore
+`config_id` is an engine-coherence key only: it covers the pack set, database target, primary and
+additional embedding models, backend topology/routing, and construction-baked outbound policy.
+
+Identity-derived fields are excluded from `config_id`: `namespace`, `actor_id`, and
+`visible_namespaces`, including the actor namespace that ADR-007 Rev 4 folds into
+`visible_namespaces` at config load. Those fields travel per request in `DaemonRequestFrame` and
+are consumed when dispatch mints the request token.
+
+`allowed_outbound_namespaces` remains in `config_id` for now because outbound policy is still
+construction-baked and is not carried in `RequestIdentity`. Excluding it before outbound policy is
+threaded per request would allow a client with stricter outbound policy to reuse a daemon built
+with a broader outbound allowlist.
+
+---
+
 ## Scope / Non-goals
 
 - **Does not implement.** This is a design contract; the code change is a separate, gated task.
 - **Does not solve #580 / WAL snapshot lifetime** (ADR-091 owns that). It only establishes
   non-interaction.
-- **Does not change** the `config_id` fingerprint definition, the entity/edge/note taxonomy, or
-  any pack vocabulary.
+- **Does not change** the entity/edge/note taxonomy or any pack vocabulary. The 2026-07-08
+  amendment above defines the `config_id` identity-field exclusion.
 - **Does not add** a socket auth/admin plane, an HTTP listener, or a snapshot-format change —
   ADR-049's other scope boundaries are unchanged. Only the "No multi-namespace daemon" clause
   (lines 108-111) and the request-frame shape are amended.

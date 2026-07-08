@@ -4054,81 +4054,55 @@ async fn test_propose_pipe_withdraw_chain() -> anyhow::Result<()> {
 }
 
 // =============================================================================
-// Finding 1: compute_config_id must include visible_namespaces so two configs
-// with different visible sets produce distinct fingerprints.
+// ADR-096 Fork 1 completion: identity-derived visibility is carried per request,
+// not in the daemon engine-coherence key.
 // =============================================================================
 
 /// Two RuntimeConfigs that are identical except for their `visible_namespaces`
-/// must produce different `compute_config_id` fingerprints.
+/// must produce the same `compute_config_id` fingerprint.
 ///
-/// `visible_namespaces` widens the default multi-record read scope to
-/// `['local'] ∪ visible_namespaces` on the OSS dispatch path (ADR-007 Rev 4
-/// Rule 3b). The fingerprint includes the visible set so configs with different
-/// read scopes are treated as distinct daemon configurations.
+/// `visible_namespaces` is a per-request identity field in the daemon frame.
+/// Keeping it out of the engine-coherence key lets seats with different folded
+/// actor visibility share one warm daemon while still dispatching under their
+/// own frame identity.
 #[test]
-fn compute_config_id_differs_when_visible_namespaces_differ() {
+fn compute_config_id_is_identical_when_only_visible_namespaces_differ() {
     use khive_mcp::server::compute_config_id;
-    use khive_runtime::{Namespace, RuntimeConfig};
 
-    let base = RuntimeConfig {
-        db_path: None,
-        default_namespace: Namespace::parse("vis-a").unwrap(),
-        embedding_model: None,
-        additional_embedding_models: vec![],
-        packs: vec!["kg".to_string()],
-        visible_namespaces: vec![],
-        ..RuntimeConfig::default()
-    };
+    let mut base = KhiveRuntime::memory()
+        .expect("memory runtime")
+        .config()
+        .clone();
+    base.default_namespace = Namespace::parse("vis-a").unwrap();
+    base.visible_namespaces = vec![];
+
     let with_visible = RuntimeConfig {
         visible_namespaces: vec![Namespace::parse("vis-b").unwrap()],
         ..base.clone()
     };
-
-    let id_no_vis = compute_config_id(&base, None);
-    let id_with_vis = compute_config_id(&with_visible, None);
-
-    assert_ne!(
-        id_no_vis, id_with_vis,
-        "compute_config_id must differ when visible_namespaces differs; \
-         same id would allow wrong-visibility daemon reuse"
-    );
-    assert!(
-        id_with_vis.contains("vis-b"),
-        "visible namespace 'vis-b' must appear in config_id string; got: {id_with_vis}"
-    );
-}
-
-/// Order of entries in visible_namespaces must not change the fingerprint
-/// (the fingerprint sorts + deduplicates before hashing).
-#[test]
-fn compute_config_id_is_stable_under_visible_namespace_reorder() {
-    use khive_mcp::server::compute_config_id;
-    use khive_runtime::{Namespace, RuntimeConfig};
-
-    let cfg_ab = RuntimeConfig {
-        db_path: None,
-        default_namespace: Namespace::parse("vis-a").unwrap(),
-        embedding_model: None,
-        additional_embedding_models: vec![],
-        packs: vec!["kg".to_string()],
-        visible_namespaces: vec![
-            Namespace::parse("vis-b").unwrap(),
-            Namespace::parse("vis-c").unwrap(),
-        ],
-        ..RuntimeConfig::default()
-    };
-    let cfg_ba = RuntimeConfig {
+    let reordered_visible = RuntimeConfig {
         visible_namespaces: vec![
             Namespace::parse("vis-c").unwrap(),
             Namespace::parse("vis-b").unwrap(),
         ],
-        ..cfg_ab.clone()
+        ..base.clone()
     };
 
     assert_eq!(
-        compute_config_id(&cfg_ab, None),
-        compute_config_id(&cfg_ba, None),
-        "compute_config_id must be stable under reordering of visible_namespaces"
+        compute_config_id(&base, None),
+        compute_config_id(&with_visible, None),
+        "compute_config_id must ignore visible_namespaces; visibility travels \
+         per request in the daemon frame"
+    );
+    assert_eq!(
+        compute_config_id(&with_visible, None),
+        compute_config_id(&reordered_visible, None),
+        "visible namespace order must also be inert because visible_namespaces \
+         are excluded from the fingerprint"
+    );
+    assert!(
+        !compute_config_id(&with_visible, None).contains("vis-b"),
+        "visible namespace 'vis-b' must not appear in config_id string"
     );
 }
 
@@ -4149,17 +4123,13 @@ fn compute_config_id_is_stable_under_visible_namespace_reorder() {
 #[test]
 fn compute_config_id_differs_when_allowed_outbound_namespaces_differ() {
     use khive_mcp::server::compute_config_id;
-    use khive_runtime::{Namespace, RuntimeConfig};
 
-    let base = RuntimeConfig {
-        db_path: None,
-        default_namespace: Namespace::parse("out-a").unwrap(),
-        embedding_model: None,
-        additional_embedding_models: vec![],
-        packs: vec!["kg".to_string()],
-        allowed_outbound_namespaces: vec![],
-        ..RuntimeConfig::default()
-    };
+    let mut base = KhiveRuntime::memory()
+        .expect("memory runtime")
+        .config()
+        .clone();
+    base.default_namespace = Namespace::parse("out-a").unwrap();
+    base.allowed_outbound_namespaces = vec![];
     let with_outbound = RuntimeConfig {
         allowed_outbound_namespaces: vec![Namespace::parse("lambda:khive").unwrap()],
         ..base.clone()
@@ -4184,20 +4154,16 @@ fn compute_config_id_differs_when_allowed_outbound_namespaces_differ() {
 #[test]
 fn compute_config_id_is_stable_under_allowed_outbound_namespace_reorder() {
     use khive_mcp::server::compute_config_id;
-    use khive_runtime::{Namespace, RuntimeConfig};
 
-    let cfg_ab = RuntimeConfig {
-        db_path: None,
-        default_namespace: Namespace::parse("out-a").unwrap(),
-        embedding_model: None,
-        additional_embedding_models: vec![],
-        packs: vec!["kg".to_string()],
-        allowed_outbound_namespaces: vec![
-            Namespace::parse("lambda:khive").unwrap(),
-            Namespace::parse("lambda:leo").unwrap(),
-        ],
-        ..RuntimeConfig::default()
-    };
+    let mut cfg_ab = KhiveRuntime::memory()
+        .expect("memory runtime")
+        .config()
+        .clone();
+    cfg_ab.default_namespace = Namespace::parse("out-a").unwrap();
+    cfg_ab.allowed_outbound_namespaces = vec![
+        Namespace::parse("lambda:khive").unwrap(),
+        Namespace::parse("lambda:leo").unwrap(),
+    ];
     let cfg_ba = RuntimeConfig {
         allowed_outbound_namespaces: vec![
             Namespace::parse("lambda:leo").unwrap(),

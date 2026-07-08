@@ -1145,17 +1145,22 @@ mod tests {
     use khive_runtime::daemon::run_daemon;
     use serial_test::serial;
 
-    use khive_runtime::{KhiveRuntime, Namespace, RuntimeConfig};
+    use khive_runtime::engine_config::ActorConfig;
+    use khive_runtime::{
+        runtime_config_from_khive_config, KhiveConfig, KhiveRuntime, Namespace, RuntimeConfig,
+    };
+
+    fn memory_runtime_config() -> RuntimeConfig {
+        KhiveRuntime::memory()
+            .expect("memory runtime")
+            .config()
+            .clone()
+    }
 
     fn make_test_server() -> crate::server::KhiveMcpServer {
-        let config = RuntimeConfig {
-            db_path: None,
-            default_namespace: Namespace::parse("test").unwrap(),
-            embedding_model: None,
-            additional_embedding_models: vec![],
-            packs: vec!["kg".to_string(), "gtd".to_string()],
-            ..RuntimeConfig::default()
-        };
+        let mut config = memory_runtime_config();
+        config.default_namespace = Namespace::parse("test").unwrap();
+        config.packs = vec!["kg".to_string(), "gtd".to_string()];
         let runtime = KhiveRuntime::new(config).expect("in-memory runtime");
         crate::server::KhiveMcpServer::new(runtime).expect("server builds with kg+gtd")
     }
@@ -1164,14 +1169,9 @@ mod tests {
     /// `Visibility::Subhandler` verbs (`brain.state`, …). Used to exercise the
     /// wire visibility gate through the daemon round-trip.
     fn make_subhandler_test_server() -> crate::server::KhiveMcpServer {
-        let config = RuntimeConfig {
-            db_path: None,
-            default_namespace: Namespace::parse("braintest").unwrap(),
-            embedding_model: None,
-            additional_embedding_models: vec![],
-            packs: vec!["kg".to_string(), "brain".to_string()],
-            ..RuntimeConfig::default()
-        };
+        let mut config = memory_runtime_config();
+        config.default_namespace = Namespace::parse("braintest").unwrap();
+        config.packs = vec!["kg".to_string(), "brain".to_string()];
         let runtime = KhiveRuntime::new(config).expect("in-memory runtime");
         crate::server::KhiveMcpServer::new(runtime).expect("server builds with kg+brain")
     }
@@ -1181,17 +1181,25 @@ mod tests {
     /// where `from_actor = token.actor().id`). Used to verify per-request
     /// actor stamping (ADR-096 Fork 1) without a readback/inbox round-trip.
     fn make_comm_test_server(actor_id: Option<&str>) -> crate::server::KhiveMcpServer {
-        let config = RuntimeConfig {
-            db_path: None,
-            default_namespace: Namespace::parse("test").unwrap(),
-            embedding_model: None,
-            additional_embedding_models: vec![],
-            packs: vec!["kg".to_string(), "comm".to_string()],
-            actor_id: actor_id.map(str::to_string),
-            ..RuntimeConfig::default()
-        };
+        let mut config = memory_runtime_config();
+        config.default_namespace = Namespace::parse("test").unwrap();
+        config.packs = vec!["kg".to_string(), "comm".to_string()];
+        config.actor_id = actor_id.map(str::to_string);
         let runtime = KhiveRuntime::new(config).expect("in-memory runtime");
         crate::server::KhiveMcpServer::new(runtime).expect("server builds with kg+comm")
+    }
+
+    fn folded_actor_memory_config(actor: &str) -> RuntimeConfig {
+        runtime_config_from_khive_config(
+            &KhiveConfig {
+                actor: ActorConfig {
+                    id: Some(actor.to_string()),
+                    ..ActorConfig::default()
+                },
+                ..KhiveConfig::default()
+            },
+            memory_runtime_config(),
+        )
     }
 
     fn clear_daemon_env() {
@@ -2007,6 +2015,160 @@ mod tests {
             body_bob["results"][0]["result"]["from"], "bob",
             "write dispatched under bob's frame must stamp actor=bob, NOT cross-\
              contaminated with alice's actor; got: {body_bob}"
+        );
+
+        handle.abort();
+        let _ = handle.await;
+        clear_daemon_env();
+    }
+
+    // ADR-096 Fork 1 completion: actor-derived visible namespaces are request
+    // identity, not daemon engine identity. Two clients with different
+    // configured actors therefore compute the same config_id, but each daemon
+    // frame must still read only through its own visible set.
+    #[tokio::test]
+    #[serial]
+    async fn daemon_config_id_ignores_actor_folded_visibility_but_frame_visibility_isolated() {
+        clear_daemon_env();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sock = dir.path().join("khived.sock");
+        let pid = dir.path().join("khived.pid");
+        std::env::set_var("KHIVE_SOCKET", &sock);
+        std::env::set_var("KHIVE_PID", &pid);
+        std::env::remove_var("KHIVE_NO_DAEMON");
+
+        let actor_a = "lambda:actor-a";
+        let actor_b = "lambda:actor-b";
+        let cfg_a = folded_actor_memory_config(actor_a);
+        let cfg_b = folded_actor_memory_config(actor_b);
+        let ns_a = Namespace::parse(actor_a).expect("actor a namespace");
+        let ns_b = Namespace::parse(actor_b).expect("actor b namespace");
+
+        assert_eq!(cfg_a.actor_id.as_deref(), Some(actor_a));
+        assert_eq!(cfg_b.actor_id.as_deref(), Some(actor_b));
+        assert!(
+            cfg_a.visible_namespaces.contains(&ns_a),
+            "actor.id must fold into client A visible_namespaces"
+        );
+        assert!(
+            cfg_b.visible_namespaces.contains(&ns_b),
+            "actor.id must fold into client B visible_namespaces"
+        );
+        assert_ne!(
+            cfg_a.visible_namespaces, cfg_b.visible_namespaces,
+            "precondition: clients must carry different folded visible sets"
+        );
+
+        let id_a = crate::server::compute_config_id(&cfg_a, None);
+        let id_b = crate::server::compute_config_id(&cfg_b, None);
+        assert_eq!(
+            id_a, id_b,
+            "actor-derived visible_namespaces must not affect daemon config_id"
+        );
+
+        let daemon_server = {
+            let runtime = KhiveRuntime::new(memory_runtime_config()).expect("in-memory runtime");
+            crate::server::KhiveMcpServer::new(runtime).expect("server builds with kg")
+        };
+        assert_eq!(
+            daemon_server.config_id(),
+            id_a,
+            "daemon and both clients must share the same engine-coherence key"
+        );
+        let handle = tokio::spawn(async move {
+            let _ = run_daemon(daemon_server).await;
+        });
+        let _ready = connect_when_ready(&sock).await;
+        drop(_ready);
+
+        let frame = |ops: &str, actor: &str, visible: &[Namespace]| DaemonRequestFrame {
+            ops: ops.to_string(),
+            presentation: Some("verbose".to_string()),
+            presentation_per_op: None,
+            namespace: "local".to_string(),
+            actor_id: Some(actor.to_string()),
+            visible_namespaces: visible.iter().map(|ns| ns.as_str().to_string()).collect(),
+            config_id: id_a.clone(),
+            protocol_version: PROTOCOL_VERSION,
+            probe_only: false,
+            metrics_only: false,
+            format: None,
+            format_per_op: None,
+            from_wire: false,
+        };
+
+        let seed_a = exchange(
+            &sock,
+            &frame(
+                r#"create(kind="concept", name="ActorAVisibleOnly", namespace="lambda:actor-a")"#,
+                actor_a,
+                &cfg_a.visible_namespaces,
+            ),
+        )
+        .await;
+        assert!(seed_a.ok, "seed A must succeed: {:?}", seed_a.error);
+        let seed_b = exchange(
+            &sock,
+            &frame(
+                r#"create(kind="concept", name="ActorBVisibleOnly", namespace="lambda:actor-b")"#,
+                actor_b,
+                &cfg_b.visible_namespaces,
+            ),
+        )
+        .await;
+        assert!(seed_b.ok, "seed B must succeed: {:?}", seed_b.error);
+
+        fn names_from_list_response(resp: &DaemonResponseFrame) -> Vec<String> {
+            assert!(resp.ok, "list response must be ok: {:?}", resp.error);
+            assert!(
+                !resp.config_mismatch,
+                "list response must not reject on config_id"
+            );
+            let body: serde_json::Value =
+                serde_json::from_str(resp.result.as_deref().expect("list result body"))
+                    .expect("decode list result json");
+            let first = &body["results"][0];
+            assert_eq!(
+                first["ok"], true,
+                "list op must succeed inside daemon result: {first}"
+            );
+            let rows = first["result"]
+                .as_array()
+                .or_else(|| first["result"]["items"].as_array())
+                .expect("list result must be an array or object with items");
+            rows.iter()
+                .filter_map(|row| row.get("name").and_then(|v| v.as_str()).map(str::to_string))
+                .collect()
+        }
+
+        let list_a = exchange(
+            &sock,
+            &frame(r#"list(kind="entity")"#, actor_a, &cfg_a.visible_namespaces),
+        )
+        .await;
+        let names_a = names_from_list_response(&list_a);
+        assert!(
+            names_a.iter().any(|name| name == "ActorAVisibleOnly"),
+            "actor A frame must see actor A namespace rows; got {names_a:?}"
+        );
+        assert!(
+            !names_a.iter().any(|name| name == "ActorBVisibleOnly"),
+            "actor A frame must not see actor B namespace rows; got {names_a:?}"
+        );
+
+        let list_b = exchange(
+            &sock,
+            &frame(r#"list(kind="entity")"#, actor_b, &cfg_b.visible_namespaces),
+        )
+        .await;
+        let names_b = names_from_list_response(&list_b);
+        assert!(
+            names_b.iter().any(|name| name == "ActorBVisibleOnly"),
+            "actor B frame must see actor B namespace rows; got {names_b:?}"
+        );
+        assert!(
+            !names_b.iter().any(|name| name == "ActorAVisibleOnly"),
+            "actor B frame must not see actor A namespace rows; got {names_b:?}"
         );
 
         handle.abort();

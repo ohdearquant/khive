@@ -16,8 +16,9 @@ lifetime.
 - **Pluggable transports** — `Transport` trait + `TransportRegistry`; ships `StdioTransport`,
   open for more (e.g. Streamable HTTP) via `TransportRegistry::register`
 - **Daemon-aware dispatch** — `compute_config_id` fingerprints a resolved `RuntimeConfig`
-  (packs, db target, embedders) so a thin client only forwards to a warm daemon
-  (ADR-049) when the fingerprints match; otherwise it falls back to local dispatch
+  (packs, db target, embedders, backend routing, outbound policy) so a thin
+  client only forwards to a warm daemon (ADR-049) when the fingerprints match;
+  otherwise it falls back to local dispatch
 - **Result sinking** — `RequestParams::save_to` writes results as JSONL and returns a
   manifest (`path`, `rows`, `per_column_null_counts`, `schema_fingerprint`, `checksum`)
   instead of inlining a large result set
