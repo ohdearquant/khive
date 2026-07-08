@@ -380,7 +380,7 @@ When you `link` nodes, use ONLY these relations:
 
 - `extends` — child builds on parent (Flash Causal extends Flash Tiled)
 - `variant_of` — A is a modified version of B (QLoRA variant_of LoRA)
-- `introduced_by` — concept first described in paper/by person
+- `introduced_by` — concept first described in paper / by person or org; document authorship
 - `supersedes` — new replaces old entirely
 
 ### Provenance

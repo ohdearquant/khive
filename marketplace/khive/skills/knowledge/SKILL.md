@@ -61,7 +61,7 @@ then link them with `cite`.
 
 ### 4. Cite the source
 
-`knowledge.cite` creates an `introduced_by` edge from a concept to the document or person
+`knowledge.cite` creates an `introduced_by` edge from a concept to the document, person, or org
 that first introduced it. Both IDs must be full UUIDs.
 
 ```
