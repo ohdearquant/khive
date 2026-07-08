@@ -181,6 +181,61 @@ jobs:
           # for everything else.
           allow-dependencies-licenses: pkg:pypi/typing-extensions
 
+  wasm-parity:
+    name: wasm-parity (khive-changeset)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: crates
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.94.1
+        with:
+          targets: wasm32-unknown-unknown,wasm32-wasip1
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates
+          cache-on-failure: true
+      # Pinned exact version (same rationale as the cargo-deny/gitleaks pins
+      # above): a wasm-parity gate's tooling must not silently drift.
+      - name: Install wasmtime (pinned)
+        run: |
+          set -o pipefail
+          curl https://wasmtime.dev/install.sh -sSf | bash -s -- --version v46.0.1
+          "$HOME/.wasmtime/bin/wasmtime" --version
+          echo "$HOME/.wasmtime/bin" >> "$GITHUB_PATH"
+      - name: wasm32-unknown-unknown compile check (ADR-101 D5)
+        run: cargo check -p khive-changeset --target wasm32-unknown-unknown
+      # ADR-101 D5 requires CI to run the SAME test suite against native and
+      # wasm32 and fail on any divergence. wasm32-unknown-unknown has no
+      # standalone test-execution story (no stdout/process without extra JS
+      # tooling this repo does not otherwise depend on), so the actual
+      # execution leg runs under wasm32-wasip1 via a wasmtime runner — real
+      # wasm32 execution, not a native-only substitute. See crate README.md.
+      - name: Native test run
+        run: |
+          set -o pipefail
+          cargo test -p khive-changeset 2>&1 | tee /tmp/native.log
+      - name: wasm32-wasip1 test run
+        env:
+          CARGO_TARGET_WASM32_WASIP1_RUNNER: "wasmtime run --wasi preview2 --"
+        run: |
+          set -o pipefail
+          cargo test -p khive-changeset --target wasm32-wasip1 2>&1 | tee /tmp/wasm.log
+      - name: Assert native/wasm32 test-suite parity
+        run: |
+          grep -E '^test .* \.\.\. (ok|FAILED)$' /tmp/native.log | sort > /tmp/native.sorted
+          grep -E '^test .* \.\.\. (ok|FAILED)$' /tmp/wasm.log | sort > /tmp/wasm.sorted
+          if [ ! -s /tmp/native.sorted ]; then
+            echo "native run produced no parsed 'test ... ok/FAILED' lines" >&2
+            exit 1
+          fi
+          if ! diff -u /tmp/native.sorted /tmp/wasm.sorted; then
+            echo "native and wasm32-wasip1 test results diverge (see diff above)" >&2
+            exit 1
+          fi
+          echo "native and wasm32-wasip1: $(wc -l < /tmp/native.sorted) tests, identical pass/fail results"
+
   coverage-ratchet:
     name: Coverage ratchet
     runs-on: ubuntu-latest
@@ -254,6 +309,7 @@ jobs:
       - doc-build
       - dependency-review
       - coverage-ratchet
+      - wasm-parity
     if: always()
     steps:
       - name: Check aggregated job results

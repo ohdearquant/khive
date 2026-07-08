@@ -1,0 +1,33 @@
+[package]
+name = "khive-changeset"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+description = "Producer-agnostic KG change-set op-list model and NDJSON-delta serialization"
+
+[dependencies]
+khive-types = { version = "0.3.0", path = "../khive-types", features = ["serde"] }
+serde = { workspace = true }
+# float_roundtrip: the default float parser is a fast approximation that does
+# not always recover the exact f64 bits a prior serialize wrote (weight/
+# salience/decay_factor values drift by an ULP on re-serialization without
+# it) — load-bearing for this crate's byte-identical round-trip guarantee.
+serde_json = { workspace = true, features = ["float_roundtrip"] }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+# Not `workspace = true`: the workspace table declares plain `proptest = "1"`
+# (implicit default-features), and Cargo does not honor a member's
+# `default-features = false` override against that form. Pinned directly
+# instead so the override takes effect. default-features off: proptest's
+# default "fork"/"timeout" features pull in rusty-fork -> wait-timeout,
+# which needs process fork/wait and does not compile for wasm32-wasip1 (the
+# wasm-parity CI test target) — this crate's D5 wasm32 obligation applies to
+# dev-dependencies too, since the test suite itself must run there. "std" is
+# proptest's core, non-platform-specific mode.
+proptest = { version = "1", default-features = false, features = ["std"] }
