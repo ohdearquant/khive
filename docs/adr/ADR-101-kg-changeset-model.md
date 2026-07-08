@@ -66,6 +66,10 @@ or its consumers.
 
 ### D1 — Canonical staged artifact: a producer-agnostic typed op-list
 
+> **Amended 2026-07-08**: `update` operations also capture a stage-time preimage, scoped to
+> exactly the fields the operation changes rather than the full prior record. The requirement
+> is stated in place below, alongside the `delete`/`merge` preimage requirement it extends.
+
 The canonical staged artifact is a **typed op-list**: an ordered sequence of operations, each
 one of `create`, `link`, `update`, `delete`, or `merge`, over the same entity/edge/note
 vocabulary and edge-endpoint contract ADR-001/ADR-002/ADR-013 already define — the same
@@ -73,8 +77,8 @@ mutation surface the live request DSL (ADR-016) exposes, so nothing expressible 
 write is inexpressible as a staged one. An op-list is producer-agnostic
 by construction — it names no producer, encodes no producer-specific shape, and carries only
 what any consumer (a rule evaluator, a diff renderer, a live-write applier) needs: the op kind,
-its target substrate, its fields, the identifier(s) involved, and — for `delete` and `merge` —
-the stage-time preimage described below.
+its target substrate, its fields, the identifier(s) involved, and — for `update`, `delete`, and
+`merge` — the stage-time preimage described below.
 
 **Stage-time stable IDs are a hard requirement, not an optimization.** Every entity or note a
 `create` op introduces is minted a UUID at the moment the op is staged, not at the moment it is
@@ -95,6 +99,18 @@ destructive operations: an inverse can only restore what was captured. An operat
 without its preimage cannot be surgically reverted, and any revert of it must fall back to the
 coarser mechanisms ADR-102 D4 names.
 
+**`update` operations capture a field-scoped preimage at stage time.** An `update` op's
+preimage records the prior value of exactly the fields its patch touches — every field the
+patch sets to a new value and every field it explicitly clears to null — and no field the
+patch leaves unchanged. This keeps preimage cost proportional to the size of the write rather
+than the size of the record: a one-field rename on an entity carrying a large `properties` map
+captures one prior value, not the whole entity. It is also what makes
+[ADR-102](ADR-102-tiered-validate-and-merge.md) D4's inversion claim for `update` — that its
+inverse "restores the prior field values captured at stage time" — true rather than
+aspirational. An `update` staged without this field-scoped preimage cannot be surgically
+inverted and falls back to the same coarser mechanisms a preimage-less `delete` or `merge`
+would.
+
 **Operations are producer-agnostic; the change-set envelope is attributed.** While no
 individual operation names a producer, the change-set as a whole carries a small **envelope
 metadata block**, captured at stage time, recording the producer's identity and its model
@@ -111,8 +127,9 @@ whole-state NDJSON (ADR-020 §2) — a change-set's ordering is operation order,
 canonical sort, because operation order is semantically load-bearing (a `link` can depend on an
 earlier `create` in the same file) in a way a state snapshot's row order is not. Each line
 carries enough to be applied independently of the file's byte layout: op kind, target kind,
-resolved or newly-minted identifiers, the op's fields, and — for `delete` and `merge` — the
-captured stage-time preimage D1 requires. The concrete field-level shape is
+resolved or newly-minted identifiers, the op's fields, and — for `update`, `delete`, and
+`merge` — the captured stage-time preimage(s) D1 requires (field-scoped to the changed fields
+for `update`, full-record for `delete` and `merge`). The concrete field-level shape is
 implementation detail of the `khive-changeset` crate (D5) and is not pinned by this ADR beyond
 the op-kind/identifier/fields shape above; it evolves as an internal format under the crate's
 own versioning, not as a wire contract this ADR freezes.
