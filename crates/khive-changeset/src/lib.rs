@@ -3,6 +3,7 @@
 mod changeset;
 mod envelope;
 mod op;
+mod strict;
 
 pub use changeset::{from_ndjson, to_ndjson, ChangeSet, ChangeSetError};
 pub use envelope::{Envelope, CURRENT_SCHEMA_VERSION};

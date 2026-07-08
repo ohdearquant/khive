@@ -3,7 +3,9 @@
 use std::collections::BTreeMap;
 
 use khive_types::{EdgeRelation, Entity, EntityKind, Id128, Link, Namespace, Note, PropertyValue};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
+
+use crate::strict::{StrictEntity, StrictLink, StrictNote};
 
 /// One staged mutation. Tagged internally by `"op"` so every NDJSON-delta
 /// line self-describes its kind without a wrapping envelope.
@@ -196,13 +198,61 @@ pub struct NotePatch {
     pub tags: Option<Vec<String>>,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+/// `weight`, when present, must be finite and in `[0.0, 1.0]` — the same
+/// invariant `LinkOp`/`khive_types::Link` enforce, so a staged edge update
+/// can never target a weight the live graph would itself reject.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(into = "EdgePatchRaw")]
 pub struct EdgePatch {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub relation: Option<EdgeRelation>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub weight: Option<f64>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EdgePatchRaw {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    relation: Option<EdgeRelation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    weight: Option<f64>,
+}
+
+impl From<EdgePatch> for EdgePatchRaw {
+    fn from(p: EdgePatch) -> Self {
+        Self {
+            relation: p.relation,
+            weight: p.weight,
+        }
+    }
+}
+
+impl TryFrom<EdgePatchRaw> for EdgePatch {
+    type Error = String;
+
+    fn try_from(raw: EdgePatchRaw) -> Result<Self, Self::Error> {
+        if let Some(w) = raw.weight {
+            if !w.is_finite() {
+                return Err(format!("EdgePatch weight must be finite, got {w}"));
+            }
+            if !(0.0..=1.0).contains(&w) {
+                return Err(format!("EdgePatch weight must be in [0.0, 1.0], got {w}"));
+            }
+        }
+        Ok(EdgePatch {
+            relation: raw.relation,
+            weight: raw.weight,
+        })
+    }
+}
+
+impl<'de> Deserialize<'de> for EdgePatch {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let raw = EdgePatchRaw::deserialize(deserializer)?;
+        EdgePatch::try_from(raw).map_err(serde::de::Error::custom)
+    }
 }
 
 /// Serde helper for `Option<Option<T>>`: distinguishes absent (unchanged)
@@ -235,20 +285,50 @@ mod opt_opt {
 
 /// Remove an existing entity, note, or edge. `preimage` captures the full
 /// prior record state at stage time — required, not optional, so a `delete`
-/// op without a captured preimage is unrepresentable.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+/// op without a captured preimage is unrepresentable. `target_id` is
+/// validated against the embedded preimage's own record id at deserialize
+/// time; a mismatched pair is a parse error, not a silently-accepted op.
+#[derive(Clone, Debug, Serialize)]
 pub struct DeleteOp {
     pub target_id: Id128,
     pub hard: bool,
     pub preimage: DeletePreimage,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DeleteOpRaw {
+    target_id: Id128,
+    hard: bool,
+    preimage: DeletePreimage,
+}
+
+impl<'de> Deserialize<'de> for DeleteOp {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let raw = DeleteOpRaw::deserialize(deserializer)?;
+        let preimage_id = raw.preimage.record_id();
+        if raw.target_id != preimage_id {
+            return Err(serde::de::Error::custom(format!(
+                "DeleteOp target_id {} does not match preimage record id {preimage_id}",
+                raw.target_id
+            )));
+        }
+        Ok(DeleteOp {
+            target_id: raw.target_id,
+            hard: raw.hard,
+            preimage: raw.preimage,
+        })
+    }
+}
+
 // `Entity` and `Note` each already serialize their own `kind` field
 // (entity kind / note kind), so the discriminant tag here is `substrate`
 // (matching `khive_types::SubstrateKind`'s vocabulary) rather than `kind`,
 // which would collide and produce a "duplicate field `kind`" parse error.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize)]
 #[serde(tag = "substrate", rename_all = "snake_case")]
 pub enum DeletePreimage {
     Entity(Box<Entity>),
@@ -256,25 +336,137 @@ pub enum DeletePreimage {
     Edge(Box<Link>),
 }
 
+impl DeletePreimage {
+    /// The identifier of the record this preimage was captured from.
+    fn record_id(&self) -> Id128 {
+        match self {
+            DeletePreimage::Entity(e) => e.header.id,
+            DeletePreimage::Note(n) => n.header.id,
+            DeletePreimage::Edge(l) => l.id,
+        }
+    }
+}
+
+/// Deserialize-only mirror of [`DeletePreimage`], substituting each
+/// substrate's strict (`deny_unknown_fields`) wire-shape mirror for the
+/// looser `khive_types` deserializer.
+#[derive(Deserialize)]
+#[serde(tag = "substrate", rename_all = "snake_case")]
+enum DeletePreimageRaw {
+    Entity(StrictEntity),
+    Note(StrictNote),
+    Edge(StrictLink),
+}
+
+impl<'de> Deserialize<'de> for DeletePreimage {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let raw = DeletePreimageRaw::deserialize(deserializer)?;
+        Ok(match raw {
+            DeletePreimageRaw::Entity(e) => DeletePreimage::Entity(Box::new(e.into())),
+            DeletePreimageRaw::Note(n) => {
+                DeletePreimage::Note(Box::new(n.try_into().map_err(serde::de::Error::custom)?))
+            }
+            DeletePreimageRaw::Edge(l) => {
+                DeletePreimage::Edge(Box::new(l.try_into().map_err(serde::de::Error::custom)?))
+            }
+        })
+    }
+}
+
 // ---- merge ------------------------------------------------------------
 
 /// Merge two entities. `preimage` captures both prior entities and the
 /// incident edges the merge will rewire — required, not optional, so a
-/// `merge` op without a captured preimage is unrepresentable.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+/// `merge` op without a captured preimage is unrepresentable. `into_id` /
+/// `from_id` are validated against `preimage.into` / `preimage.from`'s own
+/// record ids, and every incident edge is validated to actually touch one
+/// of the two merge participants, at deserialize time.
+#[derive(Clone, Debug, Serialize)]
 pub struct MergeOp {
     pub into_id: Id128,
     pub from_id: Id128,
     pub preimage: MergePreimage,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+struct MergeOpRaw {
+    into_id: Id128,
+    from_id: Id128,
+    preimage: MergePreimage,
+}
+
+impl<'de> Deserialize<'de> for MergeOp {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let raw = MergeOpRaw::deserialize(deserializer)?;
+        if raw.into_id != raw.preimage.into.header.id {
+            return Err(serde::de::Error::custom(format!(
+                "MergeOp into_id {} does not match preimage.into record id {}",
+                raw.into_id, raw.preimage.into.header.id
+            )));
+        }
+        if raw.from_id != raw.preimage.from.header.id {
+            return Err(serde::de::Error::custom(format!(
+                "MergeOp from_id {} does not match preimage.from record id {}",
+                raw.from_id, raw.preimage.from.header.id
+            )));
+        }
+        for edge in &raw.preimage.incident_edges {
+            let touches_into = edge.source == raw.into_id || edge.target == raw.into_id;
+            let touches_from = edge.source == raw.from_id || edge.target == raw.from_id;
+            if !(touches_into || touches_from) {
+                return Err(serde::de::Error::custom(format!(
+                    "MergeOp incident edge {} references neither into_id {} nor from_id {}",
+                    edge.id, raw.into_id, raw.from_id
+                )));
+            }
+        }
+        Ok(MergeOp {
+            into_id: raw.into_id,
+            from_id: raw.from_id,
+            preimage: raw.preimage,
+        })
+    }
+}
+
+#[derive(Clone, Debug, Serialize)]
 pub struct MergePreimage {
     pub into: Box<Entity>,
     pub from: Box<Entity>,
     pub incident_edges: Vec<Link>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MergePreimageRaw {
+    into: StrictEntity,
+    from: StrictEntity,
+    incident_edges: Vec<StrictLink>,
+}
+
+impl<'de> Deserialize<'de> for MergePreimage {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let raw = MergePreimageRaw::deserialize(deserializer)?;
+        let incident_edges = raw
+            .incident_edges
+            .into_iter()
+            .map(|l| l.try_into().map_err(serde::de::Error::custom))
+            .collect::<Result<Vec<Link>, D::Error>>()?;
+        Ok(MergePreimage {
+            into: Box::new(raw.into.into()),
+            from: Box::new(raw.from.into()),
+            incident_edges,
+        })
+    }
 }
 
 #[cfg(test)]

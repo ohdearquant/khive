@@ -34,7 +34,11 @@ artifact itself — nothing about how it is validated, tiered, reviewed, or comm
 `to_ndjson` / `from_ndjson` encode a change-set as one JSON object per line: the envelope as
 line 1, then one line per op in stage order. Every line-level type derives
 `#[serde(deny_unknown_fields)]`, so a misspelled or extraneous key fails the parse at that
-line rather than being silently dropped. `from_ndjson` also rejects an envelope whose
+line rather than being silently dropped. This extends to the full-record preimages a `delete`
+or `merge` op embeds: `khive_types::{Entity, Note, Link}` accept unknown fields in their own
+`Deserialize` impls, so preimages are parsed through crate-private strict mirror structs
+(`src/strict.rs`) that add `deny_unknown_fields` before converting into the real types, keeping
+the same guarantee without modifying `khive-types` itself. `from_ndjson` also rejects an envelope whose
 `schema_version` does not match [`CURRENT_SCHEMA_VERSION`] — an unrecognized version is a
 hard error, not a best-effort parse.
 

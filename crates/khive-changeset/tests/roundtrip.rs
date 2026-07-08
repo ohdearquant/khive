@@ -303,3 +303,72 @@ proptest! {
         prop_assert_eq!(decoded_ids, original_ids);
     }
 }
+
+#[test]
+fn probe_rejects_out_of_range_edge_patch_weight() {
+    let json = serde_json::json!({
+        "target_id": "00000000-0000-0000-0000-000000000001",
+        "patch": {
+            "target": "edge",
+            "weight": 1.5
+        }
+    });
+
+    let result: Result<UpdateOp, _> = serde_json::from_value(json);
+    assert!(
+        result.is_err(),
+        "edge update patches must reject weights outside [0.0, 1.0]"
+    );
+}
+
+#[test]
+fn probe_rejects_delete_preimage_with_mismatched_record_id() {
+    let envelope = Envelope::new("agent:probe", "family:test", Timestamp::from_secs(1));
+    let target_id = Id128::from_u128(1);
+    let wrong_preimage_id = Id128::from_u128(2);
+    let op = Op::Delete(DeleteOp {
+        target_id,
+        hard: false,
+        preimage: DeletePreimage::Entity(Box::new(sample_entity(
+            wrong_preimage_id,
+            EntityKind::Concept,
+        ))),
+    });
+    let cs = ChangeSet::new(envelope, vec![op]);
+    let text = khive_changeset::to_ndjson(&cs).unwrap();
+
+    let result = khive_changeset::from_ndjson(&text);
+    assert!(
+        result.is_err(),
+        "delete preimage id must match the deleted target_id"
+    );
+}
+
+#[test]
+fn probe_rejects_unknown_field_inside_delete_preimage() {
+    let json = serde_json::json!({
+        "target_id": "00000000-0000-0000-0000-000000000001",
+        "hard": false,
+        "preimage": {
+            "substrate": "entity",
+            "id": "00000000-0000-0000-0000-000000000001",
+            "namespace": "local",
+            "created_at": 1,
+            "updated_at": 1,
+            "kind": "concept",
+            "entity_type": null,
+            "name": "preimage",
+            "description": null,
+            "properties": {},
+            "tags": [],
+            "deleted_at": null,
+            "unexpected": true
+        }
+    });
+
+    let result: Result<DeleteOp, _> = serde_json::from_value(json);
+    assert!(
+        result.is_err(),
+        "unknown fields inside full-record preimages must not be silently dropped"
+    );
+}

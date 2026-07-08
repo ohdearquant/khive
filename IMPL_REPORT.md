@@ -165,3 +165,61 @@ required check.
 - No producer-specific shape leaked into the op-list — `Op`, `CreateOp`, `LinkOp`, `UpdateOp`,
   `DeleteOp`, `MergeOp` name no producer and carry only kind/substrate/fields/identifiers/
   preimage, per D1.
+
+## Fix round (codex APPROVE-WITH-FIXES, on top of `4fea8a80`)
+
+Codex review returned APPROVE-WITH-FIXES (0 Blocker, 2 High, 1 Medium) and committed three
+failing probe tests into `tests/roundtrip.rs` as the oracle for "done." All three now pass
+unmodified.
+
+1. **High-1 — `EdgePatch.weight` had no validation.** Rewrote `EdgePatch` with the same
+   raw-shim pattern `LinkOp` already used (`#[serde(into = "EdgePatchRaw")]` + manual
+   `Deserialize` that round-trips through `TryFrom<EdgePatchRaw>`), enforcing finite +
+   `[0.0, 1.0]` at deserialize time. Fixes `probe_rejects_out_of_range_edge_patch_weight`.
+2. **High-2 — destructive preimages weren't checked against their op's target IDs.** Gave
+   `DeleteOp` and `MergeOp` custom `Deserialize` impls (via `DeleteOpRaw`/`MergeOpRaw` shadow
+   structs) that compare `target_id` against `preimage.record_id()` (an internal
+   `DeletePreimage` helper matching on the `Entity`/`Note`/`Edge` variant), and `into_id`/
+   `from_id` against `preimage.into.header.id`/`preimage.from.header.id`. Also added the
+   suggested (not strictly probed) check that every `MergePreimage.incident_edges` entry
+   references at least one of `into_id`/`from_id` — `khive_types::Link` exposes `source`/
+   `target` as plain `pub Id128` fields, so this was a direct, non-awkward addition, not
+   skipped. Fixes `probe_rejects_delete_preimage_with_mismatched_record_id`.
+3. **Medium-3 — full-record preimages silently dropped unknown fields.** `DeletePreimage`
+   and `MergePreimage` embed `khive_types::{Entity, Note, Link}` directly, and those types'
+   own `Deserialize` impls do not `deny_unknown_fields` (out of scope to change — `khive-types`
+   was not touched). Added a new `src/strict.rs` module (`pub(crate)`, not re-exported) with
+   `StrictEntity`/`StrictNote`/`StrictLink` mirror structs carrying
+   `#[serde(deny_unknown_fields)]`, converted into the real types via `From`/`TryFrom` impls
+   that reuse each type's own `is_valid()` rather than re-deriving range checks. Applied to
+   **both** `DeletePreimage` (explicitly probed) and `MergePreimage` (not probed, but the same
+   bug class applies identically to `MergePreimage.into`/`.from`/`.incident_edges` — fixing
+   only the probed path would have left an inconsistent, likely-flagged-on-re-review gap).
+   Fixes `probe_rejects_unknown_field_inside_delete_preimage`.
+
+New file: `src/strict.rs` (3 unit tests: `strict_entity_rejects_unknown_field`,
+`strict_link_rejects_out_of_range_weight`, `strict_note_rejects_out_of_range_salience`).
+`lib.rs` gained `mod strict;` (crate-private — no new public API surface).
+
+### Fix-round gate results (real exit codes, from `crates/`, worktree-local `CARGO_TARGET_DIR`)
+
+| Gate | Command | RC |
+|---|---|---|
+| fmt (all) | `cargo fmt --all -- --check` | 0 (first run was 1 — new match-arm formatting; fixed via `cargo fmt --all`, re-checked clean) |
+| clippy (crate) | `cargo clippy -p khive-changeset --all-targets -- -D warnings` | 0 |
+| clippy (workspace) | `cargo clippy --workspace --all-targets -- -D warnings` | 0 |
+| test (native) | `cargo test -p khive-changeset` | 0 (31 tests: 17 unit + 14 integration, incl. all 3 probes) |
+| check (workspace) | `cargo check --workspace` | 0 |
+| check (wasm32-unknown-unknown) | `cargo check -p khive-changeset --target wasm32-unknown-unknown` | 0 |
+| doc build | `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps -p khive-changeset` | 0 |
+| test (wasm32-wasip1, wasmtime 46.0.1) | `CARGO_TARGET_WASM32_WASIP1_RUNNER="wasmtime run --wasi preview2 --" cargo test -p khive-changeset --target wasm32-wasip1` | 0 (31/31 tests, identical names/outcomes to native — full parity, incl. all 3 probes) |
+
+All three probes (`probe_rejects_out_of_range_edge_patch_weight`,
+`probe_rejects_delete_preimage_with_mismatched_record_id`,
+`probe_rejects_unknown_field_inside_delete_preimage`) pass unmodified, natively and under
+`wasm32-wasip1`/wasmtime.
+
+### Commit
+
+- `fix(changeset): validate edge weight, preimage-id consistency, and preimage unknown fields`
+  — additive, on top of `4fea8a80`, not pushed, per instructions.
