@@ -5,9 +5,9 @@
 use std::collections::BTreeMap;
 
 use khive_changeset::{
-    ChangeSet, CreateOp, CreateTarget, DeleteOp, DeletePreimage, EdgePatch, EntityCreateFields,
-    EntityPatch, Envelope, LinkOp, MergeOp, MergePreimage, NoteCreateFields, NotePatch, Op,
-    UpdateOp, UpdatePatch,
+    ChangeSet, CreateOp, CreateTarget, DeleteOp, DeletePreimage, EdgePatch, EdgePreimage,
+    EntityCreateFields, EntityPatch, EntityPreimage, Envelope, LinkOp, MergeOp, MergePreimage,
+    NoteCreateFields, NotePatch, NotePreimage, Op, UpdateOp, UpdatePatch, UpdatePreimage,
 };
 use khive_types::{
     Entity, EntityKind, Header, Id128, Link, Namespace, Note, NoteStatus, Timestamp,
@@ -162,15 +162,26 @@ proptest! {
         name in prop::option::of("[a-zA-Z0-9 ]{1,16}"),
     ) {
         let envelope = Envelope::new("agent:proptest", "family:test", Timestamp::from_secs(1));
-        let op = Op::Update(UpdateOp {
-            target_id,
-            patch: UpdatePatch::Entity(EntityPatch {
-                name,
-                description: Some(None),
-                properties: None,
-                tags: None,
-            }),
-        });
+        // preimage field presence must exactly mirror the patch's touched fields.
+        let preimage_name = name.is_some().then(|| "prior-name".to_string());
+        let op = Op::Update(
+            UpdateOp::new(
+                target_id,
+                UpdatePatch::Entity(EntityPatch {
+                    name,
+                    description: Some(None),
+                    properties: None,
+                    tags: None,
+                }),
+                UpdatePreimage::Entity(EntityPreimage {
+                    name: preimage_name,
+                    description: Some(Some("prior-description".to_string())),
+                    properties: None,
+                    tags: None,
+                }),
+            )
+            .unwrap(),
+        );
         let cs = ChangeSet::new(envelope, vec![op]);
         assert_roundtrips_byte_identical(&cs);
     }
@@ -181,16 +192,28 @@ proptest! {
         content in prop::option::of("[a-zA-Z0-9 ]{1,16}"),
     ) {
         let envelope = Envelope::new("agent:proptest", "family:test", Timestamp::from_secs(1));
-        let op = Op::Update(UpdateOp {
-            target_id,
-            patch: UpdatePatch::Note(NotePatch {
-                content,
-                salience: Some(Some(0.42)),
-                decay_factor: None,
-                properties: None,
-                tags: None,
-            }),
-        });
+        // preimage field presence must exactly mirror the patch's touched fields.
+        let preimage_content = content.is_some().then(|| "prior-content".to_string());
+        let op = Op::Update(
+            UpdateOp::new(
+                target_id,
+                UpdatePatch::Note(NotePatch {
+                    content,
+                    salience: Some(Some(0.42)),
+                    decay_factor: None,
+                    properties: None,
+                    tags: None,
+                }),
+                UpdatePreimage::Note(NotePreimage {
+                    content: preimage_content,
+                    salience: Some(Some(0.1)),
+                    decay_factor: None,
+                    properties: None,
+                    tags: None,
+                }),
+            )
+            .unwrap(),
+        );
         let cs = ChangeSet::new(envelope, vec![op]);
         assert_roundtrips_byte_identical(&cs);
     }
@@ -202,10 +225,19 @@ proptest! {
         weight in prop::option::of(weight_strategy()),
     ) {
         let envelope = Envelope::new("agent:proptest", "family:test", Timestamp::from_secs(1));
-        let op = Op::Update(UpdateOp {
-            target_id,
-            patch: UpdatePatch::Edge(EdgePatch { relation, weight }),
-        });
+        // preimage field presence must exactly mirror the patch's touched fields.
+        let preimage = EdgePreimage {
+            relation: relation.map(|_| khive_types::EdgeRelation::Extends),
+            weight: weight.map(|_| 0.5),
+        };
+        let op = Op::Update(
+            UpdateOp::new(
+                target_id,
+                UpdatePatch::Edge(EdgePatch { relation, weight }),
+                UpdatePreimage::Edge(preimage),
+            )
+            .unwrap(),
+        );
         let cs = ChangeSet::new(envelope, vec![op]);
         assert_roundtrips_byte_identical(&cs);
     }
@@ -311,13 +343,19 @@ fn probe_rejects_out_of_range_edge_patch_weight() {
         "patch": {
             "target": "edge",
             "weight": 1.5
+        },
+        "preimage": {
+            "target": "edge",
+            "weight": 0.5
         }
     });
 
     let result: Result<UpdateOp, _> = serde_json::from_value(json);
+    let err = result.expect_err("edge update patches must reject weights outside [0.0, 1.0]");
+    let message = err.to_string();
     assert!(
-        result.is_err(),
-        "edge update patches must reject weights outside [0.0, 1.0]"
+        message.contains("must be in [0.0, 1.0]"),
+        "expected the weight-bound error, got: {message}"
     );
 }
 

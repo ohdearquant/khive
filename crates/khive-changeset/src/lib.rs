@@ -8,6 +8,7 @@ mod strict;
 pub use changeset::{from_ndjson, to_ndjson, ChangeSet, ChangeSetError};
 pub use envelope::{Envelope, CURRENT_SCHEMA_VERSION};
 pub use op::{
-    CreateOp, CreateTarget, DeleteOp, DeletePreimage, EdgePatch, EntityCreateFields, EntityPatch,
-    LinkOp, MergeOp, MergePreimage, NoteCreateFields, NotePatch, Op, UpdateOp, UpdatePatch,
+    CreateOp, CreateTarget, DeleteOp, DeletePreimage, EdgePatch, EdgePreimage, EntityCreateFields,
+    EntityPatch, EntityPreimage, LinkOp, MergeOp, MergePreimage, NoteCreateFields, NotePatch,
+    NotePreimage, Op, UpdateOp, UpdatePatch, UpdatePreimage,
 };

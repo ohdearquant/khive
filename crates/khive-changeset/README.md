@@ -15,14 +15,25 @@ artifact itself — nothing about how it is validated, tiered, reviewed, or comm
   load-bearing: a `link` op may target the stage-time id an earlier `create` op in the same
   file minted, so order is preserved exactly through serialization.
 - **`Envelope`** — change-set-level metadata captured at stage time: producer identity,
-  producer model family, and a `schema_version`. No individual op reads it; it exists for a
-  cross-family review gate and commit provenance to consume downstream.
+  producer model family, a `schema_version`, and an optional `batch_id`. No individual op
+  reads it; it exists for a cross-family review gate, commit provenance, and (for `batch_id`)
+  the commit trailer to consume downstream. `batch_id` is an opaque, producer-assigned token:
+  when a producer supplies one, a commit landing the change-set uses it verbatim as the
+  provenance trailer; when absent, the committing tool derives a deterministic fallback from
+  `producer` and `staged_at` instead. Absent by default and never serialized (not even as
+  `null`) — round-tripping an envelope without one leaves it unset.
 - **`Op`** — one of five typed operations, over the same entity/edge/note vocabulary and
   edge-endpoint contract the live request DSL already uses:
   - `Create` — mints a stage-time-stable `Id128` for a new entity or note.
   - `Link` — creates a new edge; `source`/`target` may reference another op's minted id.
-  - `Update` — patches an existing entity's, note's, or edge's mutable fields. Carries no
-    preimage (see "Known gap" below).
+  - `Update` — patches an existing entity's, note's, or edge's mutable fields. Carries a
+    **required** field-scoped `preimage`: the prior value of exactly the fields the patch
+    touches (sets or explicitly clears to null), and nothing else. `UpdateOp`'s fields are
+    private; the only ways to build one are the checked `UpdateOp::new` constructor and
+    `Deserialize`, and both enforce that the preimage's populated field set matches the
+    patch's touched field set exactly — a mismatched pair (a field the patch touches with no
+    captured prior value, or a captured prior value for a field the patch leaves unchanged)
+    cannot be constructed or deserialized.
   - `Delete` — removes an entity, note, or edge. Carries the full prior record state as a
     **required** field (`preimage`); a `delete` op without one cannot be constructed or
     deserialized.
@@ -50,22 +61,6 @@ row order does not.
 The envelope is a header line rather than a sidecar file: a change-set is meant to move as
 one artifact between a producer, a reviewer, and an applier, and a header line keeps that
 artifact self-contained without a second file that could go missing or drift out of sync.
-
-## Known gap: `Update` has no preimage
-
-The op-list inversion this artifact is meant to support (a later, separate consumer) needs a
-prior-value snapshot for every reversible op. The ADR that defines this model scopes
-mandatory stage-time preimage capture to the two *destructive* operations, `delete` and
-`merge`, and says nothing about `update`. The ADR that defines op-list inversion, by contrast,
-describes an `update`'s inverse as restoring "the prior field values captured at stage time,"
-which presumes an `update` op captures priors — something the first ADR never requires.
-
-This crate follows the model-defining ADR's literal, binding text: `UpdateOp` carries no
-preimage. An `update` op therefore cannot be surgically inverted today; a future revert of one
-falls back to the coarser mechanisms available for any op without a captured preimage. This
-gap is a candidate for a future ADR amendment (adding optional stage-time prior-value capture
-to `update`), not something this crate has resolved by inventing schema the model ADR does
-not specify.
 
 ## Constraints
 

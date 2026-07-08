@@ -19,10 +19,18 @@ pub struct Envelope {
     pub producer_model_family: String,
     /// Wall-clock time the change-set was staged, supplied by the caller.
     pub staged_at: Timestamp,
+    /// Opaque producer-assigned batch identifier. When present, a commit
+    /// landing this change-set uses it verbatim as the provenance trailer;
+    /// when absent, the committing tool derives a deterministic fallback
+    /// from `producer` and `staged_at` instead. Optional because the
+    /// identifier is opaque producer-internal tracking — a producer without
+    /// its own batching model is not forced to invent one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub batch_id: Option<String>,
 }
 
 impl Envelope {
-    /// Construct an envelope stamped with [`CURRENT_SCHEMA_VERSION`].
+    /// Construct an envelope stamped with [`CURRENT_SCHEMA_VERSION`] and no `batch_id`.
     pub fn new(
         producer: impl Into<String>,
         producer_model_family: impl Into<String>,
@@ -33,7 +41,14 @@ impl Envelope {
             producer: producer.into(),
             producer_model_family: producer_model_family.into(),
             staged_at,
+            batch_id: None,
         }
+    }
+
+    /// Attach a producer-assigned batch identifier.
+    pub fn with_batch_id(mut self, batch_id: impl Into<String>) -> Self {
+        self.batch_id = Some(batch_id.into());
+        self
     }
 }
 
@@ -60,5 +75,35 @@ mod tests {
         });
         let result: Result<Envelope, _> = serde_json::from_value(json);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn batch_id_absent_by_default_and_not_serialized() {
+        let env = Envelope::new("agent:test", "family:sonnet", Timestamp::from_secs(1));
+        assert_eq!(env.batch_id, None);
+        let json = serde_json::to_string(&env).unwrap();
+        assert!(
+            !json.contains("batch_id"),
+            "absent batch_id must not appear on the wire at all (not even as null): {json}"
+        );
+    }
+
+    #[test]
+    fn batch_id_round_trips_when_present() {
+        let env = Envelope::new("agent:test", "family:sonnet", Timestamp::from_secs(1))
+            .with_batch_id("batch-123");
+        let json = serde_json::to_string(&env).unwrap();
+        let decoded: Envelope = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded, env);
+        assert_eq!(decoded.batch_id.as_deref(), Some("batch-123"));
+    }
+
+    #[test]
+    fn batch_id_round_trips_when_absent() {
+        let env = Envelope::new("agent:test", "family:sonnet", Timestamp::from_secs(1));
+        let json = serde_json::to_string(&env).unwrap();
+        let decoded: Envelope = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded, env);
+        assert_eq!(decoded.batch_id, None);
     }
 }

@@ -133,6 +133,26 @@ mod tests {
     }
 
     #[test]
+    fn envelope_batch_id_round_trips_through_ndjson() {
+        let mut cs = sample_changeset();
+        cs.envelope = cs.envelope.with_batch_id("batch-xyz");
+        let text = to_ndjson(&cs).unwrap();
+        let decoded = from_ndjson(&text).unwrap();
+        assert_eq!(decoded.envelope.batch_id.as_deref(), Some("batch-xyz"));
+        assert_eq!(decoded.envelope, cs.envelope);
+    }
+
+    #[test]
+    fn envelope_without_batch_id_round_trips_through_ndjson() {
+        let cs = sample_changeset();
+        assert_eq!(cs.envelope.batch_id, None);
+        let text = to_ndjson(&cs).unwrap();
+        let decoded = from_ndjson(&text).unwrap();
+        assert_eq!(decoded.envelope.batch_id, None);
+        assert_eq!(decoded.envelope, cs.envelope);
+    }
+
+    #[test]
     fn empty_input_errors() {
         let result = from_ndjson("");
         assert!(matches!(result, Err(ChangeSetError::Empty)));
