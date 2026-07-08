@@ -1249,11 +1249,11 @@ request(ops="knowledge.learn(name=\"GQA\", domain=\"attention\", description=\"G
 
 Link a concept to the paper or source that introduced it.
 
-| Param        | Type  | Required | Notes                                                                                   |
-| ------------ | ----- | -------- | --------------------------------------------------------------------------------------- |
-| `concept_id` | uuid  | yes      | Concept entity ID.                                                                      |
-| `source_id`  | uuid  | yes      | Source entity ID; must be `kind=document` or `kind=person` (`introduced_by` edge rule). |
-| `weight`     | float | no       | Defaults to 1.0.                                                                        |
+| Param        | Type  | Required | Notes                                                                                                                                                                                                          |
+| ------------ | ----- | -------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `concept_id` | uuid  | yes      | Concept entity ID.                                                                                                                                                                                             |
+| `source_id`  | uuid  | yes      | Source entity ID; must be `kind=document` or `kind=person`. `cite` is a narrower convenience wrapper by design — the full `introduced_by` contract also allows org sources and document authorship via `link`. |
+| `weight`     | float | no       | Defaults to 1.0.                                                                                                                                                                                               |
 
 ```
 request(ops="knowledge.cite(concept_id=\"<concept-uuid>\", source_id=\"<paper-uuid>\")")

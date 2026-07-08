@@ -492,6 +492,7 @@ pub(crate) fn infer_dependency_kind(src_kind: &str, tgt_kind: &str) -> Option<&'
         ("service", "dataset") => Some("data"),
         ("service", "artifact") => Some("artifact"),
         ("artifact", "project") | ("artifact", "service") => Some("tooling"),
+        ("document", "document") => Some("normative"),
         _ => None,
     }
 }
@@ -557,7 +558,14 @@ pub fn merge_entry_metadata(
 }
 
 /// Valid `dependency_kind` values for `depends_on` edges.
-const VALID_DEPENDENCY_KINDS: &[&str] = &["build", "runtime", "data", "artifact", "tooling"];
+const VALID_DEPENDENCY_KINDS: &[&str] = &[
+    "build",
+    "runtime",
+    "data",
+    "artifact",
+    "tooling",
+    "normative",
+];
 
 /// Validate that an edge weight is finite and within `[0.0, 1.0]`.
 ///
@@ -10931,7 +10939,7 @@ mod tests {
         assert!(
             result.is_ok(),
             "document->person introduced_by must be allowed by the ADR-002 \
-             provenance amendment; got {result:?}"
+             endpoint amendment; got {result:?}"
         );
     }
 
@@ -10955,7 +10963,7 @@ mod tests {
         assert!(
             result.is_ok(),
             "document->org introduced_by must be allowed by the ADR-002 \
-             provenance amendment; got {result:?}"
+             endpoint amendment; got {result:?}"
         );
     }
 
@@ -10986,7 +10994,7 @@ mod tests {
         assert!(
             result.is_ok(),
             "concept->org introduced_by must be allowed by the ADR-002 \
-             provenance amendment; got {result:?}"
+             endpoint amendment; got {result:?}"
         );
     }
 
@@ -11010,7 +11018,18 @@ mod tests {
         assert!(
             result.is_ok(),
             "document->document depends_on must be allowed by the ADR-002 \
-             provenance amendment; got {result:?}"
+             endpoint amendment; got {result:?}"
+        );
+        let edge = result.unwrap();
+        let dk = edge
+            .metadata
+            .as_ref()
+            .and_then(|m| m.get("dependency_kind"))
+            .and_then(|v| v.as_str());
+        assert_eq!(
+            dk,
+            Some("normative"),
+            "document->document depends_on must infer dependency_kind=normative"
         );
     }
 

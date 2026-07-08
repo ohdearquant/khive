@@ -472,7 +472,7 @@ pub(crate) static KNOWLEDGE_HANDLERS: [HandlerDef; 19] = [
                 name: "source_id",
                 param_type: "uuid",
                 required: true,
-                description: "Source entity ID; must be kind=document or kind=person (introduced_by edge rule)",
+                description: "Source entity ID; must be kind=document or kind=person (cite accepts a narrower source set than the full introduced_by contract)",
             },
             ParamDef {
                 name: "weight",

@@ -6,11 +6,12 @@
 **Amended by**: [ADR-076](ADR-076-relation-calculability-and-system-role.md) — `part_of` is a
 distinct relation, not the "inverse of `contains`"; the two coincide in some domains and diverge
 in others, and neither is derived from the other.
-**Amended 2026-07-08**: base endpoint contract gains four provenance pairs — `Document
-introduced_by Person`, `Document introduced_by Org`, `Concept introduced_by Org`, and `Document
-depends_on Document` — closing a gap where a document's own authorship and a document's
-normative dependency on another document had no representable edge. See "Base endpoint
-contract" below and "Why the 2026-07-08 provenance amendment?" in Rationale.
+**Amended 2026-07-08**: base endpoint contract gains four pairs — three provenance
+(`Document introduced_by Person`, `Document introduced_by Org`, `Concept introduced_by Org`)
+and one dependency (`Document depends_on Document`) — closing a gap where a document's own
+authorship and a document's normative dependency on another document had no representable
+edge. See "Base endpoint contract" below and "Why the 2026-07-08 endpoint amendment?" in
+Rationale.
 
 ## Context
 
@@ -47,12 +48,12 @@ classification ambiguity.
 
 ### Category 2: Derivation (intellectual lineage)
 
-| Relation        | Direction                 | When                                                       |
-| --------------- | ------------------------- | ---------------------------------------------------------- |
-| `extends`       | child → parent            | Builds on, generalizes (FlashAttention-2 → FlashAttention) |
-| `variant_of`    | variant → original        | Modified version (QLoRA → LoRA)                            |
-| `introduced_by` | concept → document/person | First described in (LoRA → Hu et al. 2021)                 |
-| `supersedes`    | new → old                 | Replaces entirely; old stops being authoritative           |
+| Relation        | Direction                              | When                                                                                       |
+| --------------- | -------------------------------------- | ------------------------------------------------------------------------------------------ |
+| `extends`       | child → parent                         | Builds on, generalizes (FlashAttention-2 → FlashAttention)                                 |
+| `variant_of`    | variant → original                     | Modified version (QLoRA → LoRA)                                                            |
+| `introduced_by` | concept/document → document/person/org | First described in (LoRA → Hu et al. 2021); document authorship (paper → author/publisher) |
+| `supersedes`    | new → old                              | Replaces entirely; old stops being authoritative                                           |
 
 ### Category 3: Provenance (material/generative source lineage)
 
@@ -387,6 +388,7 @@ distinct dependency types:
 | `data`            | Dataset/corpus dependency                      | `Service → Dataset`          |
 | `artifact`        | Generated state dependency (checkpoint, index) | `Service → Artifact`         |
 | `tooling`         | Required for generation or reproduction        | `Artifact → Project/Service` |
+| `normative`       | Referenced document required to read/implement | `Document → Document`        |
 
 `optional` is a separate boolean (default `false`), not a `dependency_kind` value.
 
@@ -468,7 +470,7 @@ The second expansion (→ 17, [ADR-055](ADR-055-epistemic-edge-relations.md)) ad
   does not connect two entities. The relation choice carries polarity; the weight carries
   strength. This is the signal a confidence model consumes.
 
-### Why the 2026-07-08 provenance amendment?
+### Why the 2026-07-08 endpoint amendment?
 
 The base contract did not distinguish "who first described this concept" from "who authored
 this document." `introduced_by` covered concept/artifact origin but had no pair for a document
@@ -485,6 +487,10 @@ The amendment adds three pairs to close it:
   or person (e.g. an architecture or protocol originated by a company). This pattern recurs
   often enough in production knowledge graphs to warrant a first-class base pair rather than a
   per-consumer workaround.
+
+Consumer verbs built over `introduced_by` may accept a narrower source set than the full base
+contract. `knowledge.cite` intentionally remains a concept-to-document/person convenience
+wrapper; edges to org sources (or document authorship edges) use `link` directly.
 
 It also adds one pair to `depends_on`:
 
