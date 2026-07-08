@@ -257,6 +257,16 @@ fn format_uuid_list(uuids: &[uuid::Uuid]) -> String {
     shorts.join(", ")
 }
 
+/// Maps the dependency-light `khive-types` entity-type resolution error onto
+/// `RuntimeError::InvalidInput` at the pack boundary (#571): `khive-types`
+/// cannot depend on `khive-runtime`, so it cannot produce `RuntimeError`
+/// directly.
+impl From<khive_types::EntityTypeError> for RuntimeError {
+    fn from(e: khive_types::EntityTypeError) -> Self {
+        Self::InvalidInput(e.to_string())
+    }
+}
+
 impl From<khive_types::KhiveError> for RuntimeError {
     fn from(e: khive_types::KhiveError) -> Self {
         Self::Khive(e)

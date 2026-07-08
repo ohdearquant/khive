@@ -70,9 +70,10 @@ impl PackRuntime for KgPack {
             let ek: khive_types::EntityKind = kind
                 .parse()
                 .map_err(|_| RuntimeError::InvalidInput(format!("unknown entity kind {kind:?}")))?;
-            crate::entity_type_registry::EntityTypeRegistry::global()
+            let resolved = crate::entity_type_registry::EntityTypeRegistry::global()
                 .resolve(ek, Some(raw))
-                .map(|r| r.entity_type)
+                .map_err(RuntimeError::from)?;
+            Ok(resolved.entity_type)
         });
         self.runtime.install_entity_type_validator(validator);
     }
@@ -1080,10 +1081,10 @@ mod tests {
             .await;
 
         assert!(
-            result.is_ok(),
-            "#389 search(kind=\"note\") must not hard-fail on a residual FTS5 char ('@'), \
-             got: {:?}",
-            result.err()
+            result.is_err(),
+            "#569 search(kind=\"note\") must fail loud on a residual FTS5 char ('@'), \
+             not silently degrade to vector-only results, got: {:?}",
+            result.ok()
         );
     }
 }
