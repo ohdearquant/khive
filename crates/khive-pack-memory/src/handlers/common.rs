@@ -139,10 +139,10 @@ pub(super) async fn resolve_serving_profile(
     let ns = token.namespace().as_str().to_string();
     // #697: thread the caller's actor identity through so actor-scoped
     // bindings match, not just namespace-scoped ones.
-    let actor = token.actor().id.as_str();
+    let actor = token.actor().binding_id();
     khive_brain_core::resolve_consumer_profile(
         registry,
-        Some(actor),
+        actor,
         &ns,
         khive_brain_core::ConsumerKind::Recall,
     )

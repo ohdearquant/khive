@@ -397,10 +397,9 @@ impl KnowledgePack {
         // feedback has its own consumer_kind bucket (ADR-058 amendment, #542) so it no
         // longer shares posteriors with the memory pack's recall bucket.
         if let Some(ref tid) = target_id_str {
-            let actor = token.actor().id.as_str();
+            let actor = token.actor().binding_id();
             if let Some(profile_id) =
-                resolve_consumer_profile(registry, Some(actor), &ns, ConsumerKind::KnowledgeCompose)
-                    .await
+                resolve_consumer_profile(registry, actor, &ns, ConsumerKind::KnowledgeCompose).await
             {
                 let brain_params = json!({
                     "namespace": ns,
@@ -459,10 +458,9 @@ impl KnowledgePack {
         }
 
         // Tier 2: namespace-bound profile via brain.resolve(consumer_kind="knowledge_compose").
-        let actor = token.actor().id.as_str();
+        let actor = token.actor().binding_id();
         if let Some(profile_id) =
-            resolve_consumer_profile(registry, Some(actor), &ns, ConsumerKind::KnowledgeCompose)
-                .await
+            resolve_consumer_profile(registry, actor, &ns, ConsumerKind::KnowledgeCompose).await
         {
             if let Some(weights) = load_profile_type_weights(registry, &profile_id).await {
                 return weights;
@@ -881,6 +879,98 @@ mod tests {
              og {og_w:.4}; ordering reflects seed_priors (formalism β(8,1) >> \
              og β(1,8)) resolved via the actor-scoped binding, not the default \
              priors where og α=6,β=1.5 dominates"
+        );
+    }
+
+    /// Systemic-fix regression: an ANONYMOUS caller must not match an explicit
+    /// `actor="local"` binding.
+    ///
+    /// `ActorRef::anonymous()` carries `id: "local"` (`khive-gate/src/actor.rs`).
+    /// Before the `binding_id()` fix, `resolve_compose_type_weights` threaded
+    /// `token.actor().id` unconditionally, so an anonymous token's `"local"`
+    /// id could match an explicit `actor="local"` binding that a pre-actor-aware
+    /// `None` could never have matched. This binds `compose-tuned-anon-v1` by
+    /// `actor="local"` and asserts an anonymous-token caller falls through to
+    /// Tier 3 default weights instead (where `operational_guidance` dominates
+    /// `formalism`), not the bound profile's inverted seed_priors.
+    #[tokio::test]
+    async fn resolve_compose_type_weights_anonymous_caller_does_not_match_explicit_actor_local_binding(
+    ) {
+        use khive_pack_brain::BrainPack;
+        use khive_pack_kg::KgPack;
+
+        // Default RuntimeConfig — no actor_id configured — mints an anonymous
+        // token (id="local") via `rt.authorize`, matching an unauthenticated caller.
+        let rt = KhiveRuntime::memory().expect("in-memory runtime");
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(KgPack::new(rt.clone()));
+        builder.register(BrainPack::new(rt.clone()));
+        let registry = builder.build().expect("kg+brain registry builds");
+
+        let token = rt.authorize(Namespace::local()).expect("authorize local");
+        assert!(
+            token.actor().is_anonymous(),
+            "test setup: token must carry the anonymous actor"
+        );
+        assert_eq!(
+            token.actor().id,
+            "local",
+            "test setup: anonymous actor id must be \"local\" to exercise the collision"
+        );
+
+        registry
+            .dispatch(
+                "brain.create_profile",
+                json!({
+                    "name": "compose-tuned-anon-v1",
+                    "consumer_kind": "knowledge_compose",
+                    "seed_priors": {
+                        "section_posteriors": {
+                            "formalism": {"alpha": 8.0, "beta": 1.0},
+                            "operational_guidance": {"alpha": 1.0, "beta": 8.0}
+                        }
+                    }
+                }),
+            )
+            .await
+            .expect("create_profile with skewed seed_priors");
+
+        registry
+            .dispatch(
+                "brain.activate",
+                json!({"profile_id": "compose-tuned-anon-v1"}),
+            )
+            .await
+            .expect("activate compose-tuned-anon-v1");
+
+        // Bind explicitly to actor="local" — the exact id anonymous tokens carry.
+        registry
+            .dispatch(
+                "brain.bind",
+                json!({
+                    "actor": "local",
+                    "profile_id": "compose-tuned-anon-v1",
+                    "consumer_kind": "knowledge_compose"
+                }),
+            )
+            .await
+            .expect("bind compose-tuned-anon-v1 for actor=local");
+
+        let pack = KnowledgePack::new(rt.clone());
+        let weights = pack.resolve_compose_type_weights(&registry, &token).await;
+
+        let formalism_w = *weights
+            .get("formalism")
+            .expect("formalism weight must be present");
+        let og_w = *weights
+            .get("operational_guidance")
+            .expect("operational_guidance weight must be present");
+
+        assert!(
+            og_w > formalism_w,
+            "anonymous caller must NOT match the actor=\"local\" binding: og {og_w:.4} \
+             must exceed formalism {formalism_w:.4} (default-prior ordering, Tier 3), \
+             not the bound profile's inverted seed_priors (formalism β(8,1) >> og β(1,8))"
         );
     }
 }

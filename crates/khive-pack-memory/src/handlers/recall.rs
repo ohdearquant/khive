@@ -1202,6 +1202,139 @@ mod tests {
 
     // `#[serial(background_tasks)]`: non-empty recall — see the note on
     // `recall_with_dollar_sign_query_does_not_error` above.
+    //
+    // Systemic-fix regression: an ANONYMOUS caller must not match an explicit
+    // `actor="local"` binding. `ActorRef::anonymous()` carries `id: "local"`
+    // (`khive-gate/src/actor.rs`); before the `binding_id()` fix,
+    // `resolve_serving_profile` threaded `token.actor().id` unconditionally,
+    // so an anonymous token could match a binding a pre-actor-aware `None`
+    // never could. This binds `anon-local-recall-v1` by `actor="local"` and
+    // asserts an anonymous-token recall omits the serve stamp (falls through
+    // exactly as before actor-threading), rather than crediting the bound profile.
+    #[tokio::test]
+    #[serial(background_tasks)]
+    async fn recall_anonymous_caller_does_not_match_explicit_actor_local_binding() {
+        use khive_pack_brain::BrainPack;
+
+        // No `actor_id` configured — `rt.authorize` mints the anonymous actor
+        // (id="local"), matching an unauthenticated caller.
+        let rt = build_full_rt_with_brain();
+        let ns = Namespace::parse("local").expect("local namespace");
+        let token = rt.authorize(ns.clone()).expect("authorize local");
+        assert!(
+            token.actor().is_anonymous(),
+            "test setup: token must carry the anonymous actor"
+        );
+
+        let note_id = rt
+            .create_note(
+                &token,
+                "memory",
+                None,
+                "anonymous actor binding fall-through note",
+                Some(0.7),
+                None,
+                vec![],
+            )
+            .await
+            .expect("create note");
+
+        let brain = BrainPack::new(rt.clone());
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(KgPack::new(rt.clone()));
+        builder.register(MemoryPack::new(rt.clone()));
+        builder.register(brain);
+        // No `with_actor_id` call — registry-minted tokens stay anonymous too.
+        let registry = builder.build().expect("registry");
+
+        registry
+            .dispatch(
+                "brain.create_profile",
+                serde_json::json!({
+                    "namespace": ns.as_str(),
+                    "name": "anon-local-recall-v1",
+                    "consumer_kind": "recall",
+                }),
+            )
+            .await
+            .expect("create profile");
+        registry
+            .dispatch(
+                "brain.activate",
+                serde_json::json!({
+                    "namespace": ns.as_str(),
+                    "profile_id": "anon-local-recall-v1",
+                }),
+            )
+            .await
+            .expect("activate profile");
+        // Bind explicitly to actor="local" — the exact id anonymous tokens carry.
+        registry
+            .dispatch(
+                "brain.bind",
+                serde_json::json!({
+                    "actor": "local",
+                    "profile_id": "anon-local-recall-v1",
+                    "consumer_kind": "recall",
+                }),
+            )
+            .await
+            .expect("bind profile to actor=local");
+
+        let result = registry
+            .dispatch(
+                "memory.recall",
+                serde_json::json!({
+                    "namespace": ns.as_str(),
+                    "query": "anonymous actor binding fall-through note",
+                    "limit": 10
+                }),
+            )
+            .await
+            .expect("memory.recall");
+
+        let hits = result.as_array().expect("bare array result");
+        assert!(!hits.is_empty(), "must find the seeded note");
+        assert!(
+            hits[0].get("served_by_profile_id").is_none(),
+            "anonymous caller must NOT match the actor=\"local\" binding: the \
+             serve stamp must be omitted (unresolved profile), not carry \
+             anon-local-recall-v1: {:?}",
+            hits[0]
+        );
+
+        // The target note's id must never appear in the ledger with the
+        // bound profile — poll briefly to catch a delayed async append.
+        let target_id = note_id.id.to_string();
+        for _ in 0..20 {
+            let mut reader = rt.sql().reader().await.expect("reader");
+            let row = reader
+                .query_row(khive_storage::types::SqlStatement {
+                    sql: "SELECT served_by_profile_id FROM brain_serve_ledger \
+                          WHERE target_id = ?1"
+                        .into(),
+                    params: vec![khive_storage::types::SqlValue::Text(target_id.clone())],
+                    label: None,
+                })
+                .await
+                .expect("query row");
+            if let Some(row) = row {
+                assert!(
+                    !matches!(
+                        row.get("served_by_profile_id"),
+                        Some(khive_storage::types::SqlValue::Text(s)) if s == "anon-local-recall-v1"
+                    ),
+                    "serve ledger row must not credit the actor=\"local\" binding \
+                     to an anonymous caller"
+                );
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }
+
+    // `#[serial(background_tasks)]`: non-empty recall — see the note on
+    // `recall_with_dollar_sign_query_does_not_error` above.
     #[tokio::test]
     #[serial(background_tasks)]
     async fn recall_without_brain_pack_omits_stamp_and_does_not_error() {

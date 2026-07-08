@@ -30,6 +30,26 @@ fn make_rt(brain_profile: Option<String>, with_brain: bool) -> KhiveRuntime {
     .expect("runtime")
 }
 
+/// Mirrors `make_rt(None, true)` but with a configured actor. Full literal
+/// (no `..RuntimeConfig::default()`) — `Default` resolves `embedding_model`
+/// to a real on-disk model, absent on CI runners.
+fn make_rt_with_actor(actor: &str) -> KhiveRuntime {
+    KhiveRuntime::new(RuntimeConfig {
+        db_path: None,
+        default_namespace: Namespace::local(),
+        embedding_model: None,
+        additional_embedding_models: vec![],
+        gate: std::sync::Arc::new(khive_runtime::AllowAllGate),
+        packs: vec!["kg".into(), "knowledge".into(), "brain".into()],
+        backend_id: khive_runtime::BackendId::main(),
+        brain_profile: None,
+        visible_namespaces: vec![],
+        allowed_outbound_namespaces: vec![],
+        actor_id: Some(actor.to_string()),
+    })
+    .expect("runtime with actor")
+}
+
 /// Create a KG concept entity for use as brain.feedback target_id.
 ///
 /// brain.feedback validates that target_id resolves to a real record in the
@@ -249,6 +269,88 @@ async fn feedback_tier2_namespace_bound_profile_credited() {
         prof["total_events"].as_u64().unwrap_or(0),
         1,
         "ns-bound-compose must receive the feedback event"
+    );
+}
+
+/// Tier-2, actor-bound: `knowledge.feedback`'s own call site must thread the
+/// caller's actor identity, not just `resolve_compose_type_weights` (the read
+/// side). Binds `actor-bound-compose` by `actor="leo"` only, leaving namespace
+/// as the wildcard `"*"` — a namespace-only resolution can never reach it.
+/// Mutation: reverting `handle_feedback`'s call site back to `actor=None`
+/// must make this test fail (fall through to tier-3, `emitted` absent/false).
+#[tokio::test]
+async fn feedback_tier2_actor_bound_profile_credited() {
+    let rt = make_rt_with_actor("leo");
+    let ns = Namespace::parse("local").expect("ns");
+
+    let mut builder = VerbRegistryBuilder::new();
+    builder.register(KgPack::new(rt.clone()));
+    builder.register(KnowledgePack::new(rt.clone()));
+    builder.register(BrainPack::new(rt.clone()));
+    // `VerbRegistry` mints its own per-dispatch tokens from its own
+    // construction-baked actor id (independent of `RuntimeConfig::actor_id`) —
+    // bake the same actor here so `registry.dispatch` calls carry it too.
+    builder.with_actor_id(Some("leo".to_string()));
+    let registry = builder.build().expect("registry");
+    rt.install_edge_rules(registry.all_edge_rules());
+
+    let atom_id = make_entity(&registry, ns.as_str()).await;
+
+    registry
+        .dispatch(
+            "brain.create_profile",
+            json!({"namespace": ns.as_str(), "name": "actor-bound-compose", "consumer_kind": "knowledge_compose"}),
+        )
+        .await
+        .expect("create actor-bound profile");
+    registry
+        .dispatch(
+            "brain.activate",
+            json!({"namespace": ns.as_str(), "profile_id": "actor-bound-compose"}),
+        )
+        .await
+        .expect("activate actor-bound profile");
+    // Bind by actor only — namespace defaults to the "*" wildcard.
+    registry
+        .dispatch(
+            "brain.bind",
+            json!({"actor": "leo", "profile_id": "actor-bound-compose", "consumer_kind": "knowledge_compose"}),
+        )
+        .await
+        .expect("bind actor-bound profile to actor=leo");
+
+    let r = registry
+        .dispatch(
+            "knowledge.feedback",
+            json!({
+                "namespace": ns.as_str(),
+                "target_id": atom_id,
+                "section_signals": {"overview": "useful"},
+            }),
+        )
+        .await
+        .expect("feedback ok");
+    assert_eq!(
+        r["emitted"], true,
+        "tier-2 actor-bound feedback must route to brain pack: {r:?}"
+    );
+    assert_eq!(
+        r.get("brain_profile").and_then(|v| v.as_str()),
+        Some("actor-bound-compose"),
+        "knowledge.feedback must credit the actor-bound profile: {r:?}"
+    );
+
+    let prof = registry
+        .dispatch(
+            "brain.profile",
+            json!({"namespace": ns.as_str(), "profile_id": "actor-bound-compose"}),
+        )
+        .await
+        .expect("brain.profile");
+    assert_eq!(
+        prof["total_events"].as_u64().unwrap_or(0),
+        1,
+        "actor-bound-compose must receive the feedback event"
     );
 }
 

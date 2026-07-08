@@ -68,4 +68,25 @@ impl ActorRef {
             id: "local".into(),
         }
     }
+
+    /// Whether this actor is the implicit anonymous caller.
+    pub fn is_anonymous(&self) -> bool {
+        self.kind == "anonymous"
+    }
+
+    /// The identity to use for actor-binding resolution: `None` for the
+    /// anonymous caller, `Some(&self.id)` otherwise.
+    ///
+    /// Invariant: anonymous identity never participates in actor-binding
+    /// resolution. `anonymous()` carries `id: "local"`, which is a valid
+    /// explicit-binding value (e.g. `actor="local"`); resolving on it
+    /// would let an unauthenticated caller match a binding that a
+    /// pre-actor-aware `None` could never match.
+    pub fn binding_id(&self) -> Option<&str> {
+        if self.is_anonymous() {
+            None
+        } else {
+            Some(self.id.as_str())
+        }
+    }
 }

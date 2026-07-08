@@ -989,11 +989,10 @@ impl BrainPack {
         if let Some(profile_id) = explicit {
             return profile_id.to_string();
         }
-        let actor = token.actor().id.as_str();
+        let actor = token.actor().binding_id();
         let namespace = token.namespace().as_str();
         let state = self.state.lock().unwrap();
-        match state.resolve_with_match(Some(actor), Some(namespace), ConsumerKind::Recall.as_str())
-        {
+        match state.resolve_with_match(actor, Some(namespace), ConsumerKind::Recall.as_str()) {
             Some((record, _matched_kind, true)) => record.id.clone(),
             _ => "balanced-recall-v1".to_string(),
         }
