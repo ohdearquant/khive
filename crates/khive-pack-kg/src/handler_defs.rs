@@ -159,7 +159,23 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 17] = [
                 name: "offset",
                 param_type: "integer",
                 required: false,
-                description: "Pagination offset (default 0).",
+                description: "Pagination offset (default 0). For kind=\"edge\" this pages the full \
+                              matching set (capped at 1000 rows per page); for a full-graph walk \
+                              prefer \"after\" instead, which is O(1) at any depth rather than \
+                              O(offset).",
+            },
+            ParamDef {
+                name: "after",
+                param_type: "uuid",
+                required: false,
+                description: "Keyset cursor for kind=\"edge\" only: the id of the last edge from the \
+                              previous page, or \"\" (empty string) to opt into cursor-mode pagination \
+                              starting from the beginning of the set. Seeks via an indexed id range \
+                              scan instead of OFFSET, so cost does not grow with depth. When set, the \
+                              response shape changes from a bare array to \
+                              {\"edges\": [...], \"next_after\": <uuid-or-null>}; next_after is \
+                              non-null while more rows remain. Mutually exclusive with offset-based \
+                              paging within a single walk.",
             },
             ParamDef {
                 name: "entity_kind",
@@ -268,7 +284,9 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 17] = [
     // Assertive: returns aggregate substrate counts (#280)
     HandlerDef {
         name: "stats",
-        description: "Return aggregate KG substrate counts (entities, edges, notes)",
+        description: "Return aggregate KG substrate counts (entities, edges, notes), plus an \
+                      edges_by_relation breakdown (relation name -> count) so full-graph audits \
+                      know the true per-relation population before sampling.",
         visibility: Visibility::Verb,
         category: VerbCategory::Assertive,
         params: &[],

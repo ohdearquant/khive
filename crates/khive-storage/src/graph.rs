@@ -1,12 +1,13 @@
 //! Graph storage capability — edge CRUD and traversal.
 
 use async_trait::async_trait;
+use khive_types::EdgeRelation;
 use uuid::Uuid;
 
 use crate::types::{
-    BatchWriteSummary, DeleteMode, DirectedNeighborHit, Direction, Edge, EdgeFilter, EdgeSortField,
-    GraphPath, LinkId, NeighborHit, NeighborQuery, Page, PageRequest, SortOrder, StorageResult,
-    TraversalRequest,
+    BatchWriteSummary, DeleteMode, DirectedNeighborHit, Direction, Edge, EdgeFilter, EdgeSeekPage,
+    EdgeSortField, GraphPath, LinkId, NeighborHit, NeighborQuery, Page, PageRequest, SortOrder,
+    StorageResult, TraversalRequest,
 };
 
 /// Directed edge CRUD and graph traversal over the knowledge graph.
@@ -32,6 +33,21 @@ pub trait GraphStore: Send + Sync + 'static {
     ) -> StorageResult<Page<Edge>>;
     /// Count edges matching the given filter.
     async fn count_edges(&self, filter: EdgeFilter) -> StorageResult<u64>;
+    /// Count edges grouped by relation, ignoring soft-deleted rows. Cheap
+    /// aggregate (`GROUP BY relation`) used to report the true per-relation
+    /// population for full-graph audits (#702.3).
+    async fn count_edges_by_relation(&self) -> StorageResult<Vec<(EdgeRelation, u64)>>;
+    /// Seek-pagination page of edges ordered by `id` ascending, using an
+    /// indexed range scan (`id > after`) against the `(namespace, id)`
+    /// primary key instead of `OFFSET`. `after` is exclusive; `None` starts
+    /// from the beginning of the set. Stable under concurrent writes and
+    /// O(log n + limit) at any depth, unlike offset paging (#702.2).
+    async fn query_edges_after(
+        &self,
+        filter: EdgeFilter,
+        after: Option<Uuid>,
+        limit: u32,
+    ) -> StorageResult<EdgeSeekPage>;
     /// Return immediate neighbors of a graph node.
     async fn neighbors(
         &self,

@@ -93,6 +93,16 @@ pub struct Edge {
     pub target_backend: Option<String>,
 }
 
+/// A page of edges returned by keyset (seek) pagination, ordered by `id`
+/// ascending — an indexed range scan against the `(namespace, id)` primary
+/// key rather than an `OFFSET` skip. `next_after` is `Some(last_id)` when
+/// more rows remain past this page.
+#[derive(Clone, Debug, Default)]
+pub struct EdgeSeekPage {
+    pub items: Vec<Edge>,
+    pub next_after: Option<Uuid>,
+}
+
 /// Edge traversal direction relative to the source node.
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]

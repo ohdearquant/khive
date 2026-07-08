@@ -152,6 +152,7 @@ async fn apply_worker_applies_add_edge_changeset() {
                 ..Default::default()
             },
             100,
+            0,
         )
         .await
         .expect("list_edges");
@@ -880,6 +881,7 @@ async fn budget_some_zero_allows_edge_only_changeset() {
                 ..Default::default()
             },
             100,
+            0,
         )
         .await
         .expect("list_edges");

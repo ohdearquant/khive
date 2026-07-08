@@ -2362,6 +2362,35 @@ async fn page_offset_over_i64max_rejected() {
     );
 }
 
+#[tokio::test]
+async fn query_edges_after_exact_multiple_final_page_has_no_next_after() {
+    let store = setup_memory_store();
+
+    let edges: Vec<Edge> = (0..4)
+        .map(|_| make_edge(Uuid::new_v4(), Uuid::new_v4(), EdgeRelation::Extends, 1.0))
+        .collect();
+    store.upsert_edges(edges).await.unwrap();
+
+    let page1 = store
+        .query_edges_after(EdgeFilter::default(), None, 2)
+        .await
+        .unwrap();
+    assert_eq!(page1.items.len(), 2);
+    let cursor = page1
+        .next_after
+        .expect("first page must report a cursor when two rows remain");
+
+    let page2 = store
+        .query_edges_after(EdgeFilter::default(), Some(cursor), 2)
+        .await
+        .unwrap();
+    assert_eq!(page2.items.len(), 2);
+    assert_eq!(
+        page2.next_after, None,
+        "an exact-size final page must not report a cursor"
+    );
+}
+
 /// STORAGE-AUD-003 / #485: TraversalOptions.max_depth > i64::MAX must return
 /// InvalidInput from the backend instead of silently narrowing to a negative
 /// i64 depth and returning an empty/wrong traversal.

@@ -21,6 +21,7 @@ impl KgPack {
             .runtime
             .count_edges(token, EdgeListFilter::default())
             .await?;
+        let edges_by_relation = self.runtime.count_edges_by_relation(token).await?;
         let notes = self
             .runtime
             .notes(token)?
@@ -30,6 +31,7 @@ impl KgPack {
         Ok(serde_json::json!({
             "entities": entities,
             "edges": edges,
+            "edges_by_relation": edges_by_relation,
             "notes": notes,
         }))
     }
