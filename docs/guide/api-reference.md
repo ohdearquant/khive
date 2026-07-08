@@ -1,13 +1,13 @@
 # API Reference
 
-khive exposes exactly one MCP tool, `request`. Everything else — 74 verbs across 9
+khive exposes exactly one MCP tool, `request`. Everything else — 75 verbs across 9
 production packs — is dispatched through that single tool via a small request DSL.
 This page documents the DSL grammar, the response envelope, and every verb's full
 parameter contract, so an agent can call khive correctly without reading Rust source.
 
 This page is verified against the live registry (`request(ops="verbs()")`, run
 2026-07-07) and the pack source (`crates/khive-pack-*/src/*.rs` `HandlerDef`/`ParamDef`
-struct literals). Verb count: **74**, matching both the live registry `total` field and
+struct literals). Verb count: **75**, matching both the live registry `total` field and
 the sum of the 9 pack counts below. If your server reports a different total, your
 `KHIVE_PACKS` configuration loads a different pack set than the default — run
 `request(ops="verbs()")` against your own server to get the authoritative list.
@@ -25,7 +25,7 @@ An always-machine-readable copy of this page is at
 | `gtd`       | 5     | `KHIVE_PACKS=kg,gtd`       | Yes                 |
 | `memory`    | 5     | `KHIVE_PACKS=kg,memory`    | Yes                 |
 | `brain`     | 14    | `KHIVE_PACKS=kg,brain`     | Yes                 |
-| `comm`      | 6     | `KHIVE_PACKS=kg,comm`      | Yes                 |
+| `comm`      | 7     | `KHIVE_PACKS=kg,comm`      | Yes                 |
 | `schedule`  | 4     | `KHIVE_PACKS=kg,schedule`  | Yes                 |
 | `knowledge` | 19    | `KHIVE_PACKS=kg,knowledge` | Yes                 |
 | `session`   | 4     | `KHIVE_PACKS=kg,session`   | Yes                 |
@@ -36,7 +36,7 @@ kinds and a batch ingester (`crates/khive-pack-git/src/ingest.rs`), consumed out
 `request` DSL, not new MCP-callable verbs.
 
 The default binary (no `KHIVE_PACKS`/`--pack` override) loads all 9 packs: 17 + 5 + 5 +
-14 + 6 + 4 + 19 + 4 + 0 = **74 verbs**.
+14 + 7 + 4 + 19 + 4 + 0 = **75 verbs**.
 
 Verb names in the `kg` pack are bare (`create`, `search`, `link`, …). Every other pack
 namespaces its verbs with a `pack.` prefix (`gtd.assign`, `memory.recall`,
@@ -841,7 +841,7 @@ request(ops="brain.register_adapter(adapter_id=\"lora-v3\", content_hash=\"<sha2
 
 ---
 
-## `comm` pack — 6 verbs
+## `comm` pack — 7 verbs
 
 Actor-to-actor messaging with threading. Optional; load with `KHIVE_PACKS=kg,comm`.
 
@@ -909,6 +909,24 @@ Retrieve all messages in a conversation thread, ordered chronologically.
 
 ```
 request(ops="comm.thread(id=\"<thread-root-id>\")")
+```
+
+### `comm.probe` — Assertive
+
+Strictly read-only poll for new inbound message metadata and a stale-unread count. No
+read-flag mutation, no writes: designed for monitors polling every ~30 seconds, served by
+a single cheap indexed query. Returns a `cursor_us` high-water mark, a `stale_unread_count`
+of inbound messages unread past the staleness window, and up to 100 new inbound rows
+(id, created_at, from_actor, subject) newer than `since_us`.
+
+| Param           | Type    | Required | Notes                                               |
+| --------------- | ------- | -------- | --------------------------------------------------- |
+| `actor`         | string  | yes      | Actor label whose inbound mail is probed.           |
+| `since_us`      | integer | no       | Microsecond-epoch cursor; only newer rows returned. |
+| `stale_minutes` | integer | no       | Staleness window for the unread count (default 20). |
+
+```
+request(ops="comm.probe(actor=\"lambda:leo\", since_us=1751932800000000)")
 ```
 
 ### `comm.health` — Assertive
