@@ -111,7 +111,7 @@ they do not introduce new ones.
 | `knowledge.fold`           | Corpus  | Assertive  | Budget-constrained knapsack selection (token budgeting)                      |
 | `knowledge.search`         | Corpus  | Assertive  | TF-IDF + embedding rerank (default when embedder configured) over the corpus |
 | `knowledge.learn`          | Concept | Commissive | Register a concept entity with domain promotion                              |
-| `knowledge.cite`           | Concept | Commissive | Link a concept to its source paper via `introduced_by`                       |
+| `knowledge.cite`           | Concept | Commissive | Link a concept to its source (document, person, or org) via `introduced_by`  |
 | `knowledge.topic`          | Concept | Assertive  | List/search concepts, optionally filtered by domain                          |
 
 ### 1a. Corpus tier schema (V19 migration)
@@ -286,7 +286,7 @@ cite(concept_id, source_id, weight?) → {id, full_id, relation, concept_id, sou
 ```
 
 - `concept_id` is the concept being introduced (graph-source in `introduced_by` terms).
-- `source_id` is the paper, document, or person that introduced it (graph-target).
+- `source_id` is the document (e.g. a paper), person, or org that introduced it (graph-target).
 - Both accept full UUID or 8-char hex prefix (via `resolve_prefix`).
 - `weight` defaults to `1.0` (definitional). Values outside `[0.0, 1.0]` are **silently
   clamped**. This is consistent with how other handlers treat weight: the substrate does

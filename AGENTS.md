@@ -171,7 +171,7 @@ or `comm.thread`.
 | `knowledge.challenge`      | Mark a section as disputed                              | Flag incorrect content                       |
 | `knowledge.adjudicate`     | Resolve a disputed section                              | Accept or reject a challenge                 |
 | `knowledge.learn`          | Register a concept entity with domain/tags              | Quick concept creation                       |
-| `knowledge.cite`           | Link concept → paper/person (introduced_by edge)        | Attribution                                  |
+| `knowledge.cite`           | Link concept → paper/person/org (introduced_by edge)    | Attribution                                  |
 | `knowledge.topic`          | List concepts by domain or free-text                    | Explore the concept graph                    |
 | `knowledge.feedback`       | Route feedback to brain for knowledge recall tuning     | Signal useful/not_useful on compose results  |
 
@@ -380,7 +380,7 @@ When you `link` nodes, use ONLY these relations:
 
 - `extends` — child builds on parent (Flash Causal extends Flash Tiled)
 - `variant_of` — A is a modified version of B (QLoRA variant_of LoRA)
-- `introduced_by` — concept first described in paper/by person
+- `introduced_by` — concept first described in paper / by person or org; document authorship
 - `supersedes` — new replaces old entirely
 
 ### Provenance

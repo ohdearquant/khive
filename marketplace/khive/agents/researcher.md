@@ -73,20 +73,23 @@ Use only these 17 relations (no others — the parser rejects unknown relations)
 - Annotation: `annotates`
 - Epistemic: `supports`, `refutes` (evidence → claim)
 
-**`introduced_by` direction**: concept → paper or concept → person. Never paper → person.
+**`introduced_by` direction**: concept → paper/person/org, or paper → author/publisher.
+Never the reverse.
 
 - Correct: `link(source_id=concept.id, target_id=paper.id, relation="introduced_by")` — concept was
   introduced by the paper
 - Correct: `link(source_id=concept.id, target_id=person.id, relation="introduced_by")` — concept was
   introduced by the person
-- Wrong: `link(source_id=paper.id, target_id=person.id, relation="introduced_by")` — authorship
-  belongs in `properties.authors`
+- Correct: `link(source_id=paper.id, target_id=person.id, relation="introduced_by")` — document
+  authorship (paper → author or publishing org)
+- Wrong: `link(source_id=person.id, target_id=paper.id, relation="introduced_by")` — the source is
+  the thing being introduced, never the author
 
 **Always use IDs from prior responses.** Never pass entity names as strings to `source_id` or
 `target_id`.
 
 **Every concept you create needs at minimum**: one `instance_of` or `extends` (parent), one
-`introduced_by` (paper or person if known), and one lateral edge if alternatives exist.
+`introduced_by` (paper, person, or org if known), and one lateral edge if alternatives exist.
 
 ### Note creation rules
 
@@ -188,7 +191,7 @@ Density: 47 edges / 11 entities = 4.3 (was 3.8 before)
 - Do not create entities without edges — orphans degrade graph quality immediately
 - Do not use ad-hoc edge relations (`uses`, `related_to`, `references`) — map to the 17 or don't
   link
-- Do not reverse `introduced_by` — direction is concept → paper/person, never paper → person
+- Do not reverse `introduced_by` — direction is concept → paper/person/org (or paper → author/publisher), never the reverse
 - Do not use entity names as strings in `source_id`/`target_id` — always use IDs from prior
   responses
 - Do not use `traverse` when `neighbors` suffices — use the cheapest retrieval that answers the
