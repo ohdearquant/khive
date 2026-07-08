@@ -330,6 +330,107 @@ impl SqliteVecStore {
     }
 }
 
+/// One vector row's identity + payload for [`replace_vector_row_dml`] (#546).
+/// `embedding` must already be validated for the target table's dimension
+/// count (or delegated to the helper's own dimension check).
+struct VectorRowRef<'a> {
+    subject_id: Uuid,
+    namespace: &'a str,
+    kind: &'a str,
+    field: &'a str,
+    embedding_model: &'a str,
+    embedding: &'a [f32],
+}
+
+/// Shared DELETE-then-INSERT replacement DML for a single vector row (#546).
+///
+/// `vec0` virtual tables do not support `INSERT OR REPLACE`, so every
+/// replacement path (single-record insert/update, batch insert, and the
+/// WriterTask-routed atomic upsert) deletes the prior row for
+/// `(subject_id, namespace)` then inserts the new one. This function issues
+/// no `BEGIN`/`COMMIT`/`SAVEPOINT` itself — the caller owns the enclosing
+/// transaction or savepoint and its rollback semantics, so this can run
+/// equally inside a plain `Connection`, an `unchecked_transaction()`, or a
+/// named `SAVEPOINT`.
+///
+/// `failpoint_flag`, when `Some` in a `cfg(test)` build, is checked between
+/// the DELETE and the INSERT so tests can force an error at that exact point
+/// and assert the caller's rollback restores the prior row (no-worse-than-
+/// stale guarantee). It is inert in release builds.
+fn replace_vector_row_dml(
+    conn: &rusqlite::Connection,
+    table: &str,
+    dims: usize,
+    row: VectorRowRef<'_>,
+    failpoint_flag: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+) -> Result<(), rusqlite::Error> {
+    if row.embedding.len() != dims {
+        return Err(rusqlite::Error::InvalidParameterCount(
+            row.embedding.len(),
+            dims,
+        ));
+    }
+
+    let del_sql = format!("DELETE FROM {table} WHERE subject_id = ?1 AND namespace = ?2");
+    conn.execute(
+        &del_sql,
+        rusqlite::params![row.subject_id.to_string(), row.namespace],
+    )?;
+
+    // Failpoint: fires only in cfg(test) when the guard is active. DELETE has
+    // already run; if the caller's rollback (transaction or SAVEPOINT) is
+    // missing, the deleted row is lost permanently.
+    #[cfg(test)]
+    if let Some(ref fp) = failpoint_flag {
+        if failpoint::take(fp) {
+            return Err(rusqlite::Error::InvalidParameterName(
+                "__test_failpoint_after_delete__".into(),
+            ));
+        }
+    }
+    #[cfg(not(test))]
+    let _ = failpoint_flag;
+
+    let ins_sql = format!(
+        "INSERT INTO {table} (subject_id, namespace, kind, field, embedding_model, embedding) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)"
+    );
+    let blob = f32_slice_as_bytes(row.embedding);
+    conn.execute(
+        &ins_sql,
+        rusqlite::params![
+            row.subject_id.to_string(),
+            row.namespace,
+            row.kind,
+            row.field,
+            row.embedding_model,
+            blob
+        ],
+    )?;
+
+    Ok(())
+}
+
+/// Delete `subject_id`'s row from every registered-model vector table, in
+/// `namespace` (#546).
+///
+/// Shared by runtime curation's entity/note merge cleanup, which must sweep
+/// the merged-away subject out of every model's `vec_{model_key}` table, not
+/// just the primary embedding model's. Callers own the enclosing transaction;
+/// this issues no `BEGIN`/`COMMIT`/`SAVEPOINT`.
+pub fn delete_subject_from_vector_tables(
+    conn: &rusqlite::Connection,
+    tables: &[String],
+    subject_id: Uuid,
+    namespace: &str,
+) -> Result<(), rusqlite::Error> {
+    for table in tables {
+        let sql = format!("DELETE FROM {table} WHERE subject_id = ?1 AND namespace = ?2");
+        conn.execute(&sql, rusqlite::params![subject_id.to_string(), namespace])?;
+    }
+    Ok(())
+}
+
 /// DML-only batch insert loop shared by both the legacy (flag-off) and
 /// WriterTask-routed (flag-on) `insert_batch` paths (ADR-067 Component A).
 ///
@@ -346,18 +447,8 @@ fn batch_insert_vectors_dml(
     store_embedding_model: &str,
     records: &[VectorRecord],
     attempted: u64,
-    _failpoint_flag: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    failpoint_flag: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 ) -> Result<BatchWriteSummary, rusqlite::Error> {
-    let del_sql = format!(
-        "DELETE FROM {} WHERE subject_id = ?1 AND namespace = ?2",
-        table
-    );
-    let ins_sql = format!(
-        "INSERT INTO {} (subject_id, namespace, kind, field, embedding_model, embedding) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-        table
-    );
-
     let mut affected = 0u64;
     let mut failed = 0u64;
     let mut first_error = String::new();
@@ -388,40 +479,26 @@ fn batch_insert_vectors_dml(
             failed += 1;
             continue;
         }
-        let blob = f32_slice_as_bytes(embedding);
-        let id_str = record.subject_id.to_string();
         let kind_str = record.kind.to_string();
 
         // Wrap each record's DELETE+INSERT in a savepoint so a failed INSERT
         // rolls back only that record's DELETE, leaving the prior vector intact
         // (no-worse-than-stale guarantee, same as single-record `insert`).
         conn.execute_batch("SAVEPOINT vec_batch_record")?;
-        let result = (|| {
-            conn.execute(&del_sql, rusqlite::params![&id_str, &record.namespace])?;
-            // Failpoint: fires only in cfg(test) when the guard is active.
-            // DELETE has already run; if ROLLBACK TO SAVEPOINT is missing,
-            // the deleted row is lost permanently.
-            #[cfg(test)]
-            if let Some(ref fp) = _failpoint_flag {
-                if failpoint::take(fp) {
-                    return Err(rusqlite::Error::InvalidParameterName(
-                        "__test_failpoint_after_delete__".into(),
-                    ));
-                }
-            }
-            conn.execute(
-                &ins_sql,
-                rusqlite::params![
-                    &id_str,
-                    &record.namespace,
-                    &kind_str,
-                    &record.field,
-                    &store_embedding_model,
-                    blob
-                ],
-            )?;
-            Ok::<(), rusqlite::Error>(())
-        })();
+        let result = replace_vector_row_dml(
+            conn,
+            table,
+            dims,
+            VectorRowRef {
+                subject_id: record.subject_id,
+                namespace: &record.namespace,
+                kind: &kind_str,
+                field: &record.field,
+                embedding_model: store_embedding_model,
+                embedding,
+            },
+            failpoint_flag.clone(),
+        );
         match result {
             Ok(()) => {
                 conn.execute_batch("RELEASE SAVEPOINT vec_batch_record")?;
@@ -466,57 +543,23 @@ fn vec_upsert_atomic_dml(
     embedding_model: &str,
     embedding: &[f32],
     savepoint_name: &'static str,
-    _failpoint_flag: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    failpoint_flag: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 ) -> Result<(), rusqlite::Error> {
-    if embedding.len() != dims {
-        return Err(rusqlite::Error::InvalidParameterCount(
-            embedding.len(),
-            dims,
-        ));
-    }
-
     conn.execute_batch(&format!("SAVEPOINT {savepoint_name}"))?;
-    let result = (|| {
-        let del_sql = format!(
-            "DELETE FROM {} WHERE subject_id = ?1 AND namespace = ?2",
-            table
-        );
-        conn.execute(
-            &del_sql,
-            rusqlite::params![subject_id.to_string(), namespace],
-        )?;
-
-        // Failpoint: fires only in cfg(test) when the guard is active.
-        // DELETE has already run; if ROLLBACK TO SAVEPOINT is missing, the
-        // deleted row is lost permanently.
-        #[cfg(test)]
-        if let Some(ref fp) = _failpoint_flag {
-            if failpoint::take(fp) {
-                return Err(rusqlite::Error::InvalidParameterName(
-                    "__test_failpoint_after_delete__".into(),
-                ));
-            }
-        }
-
-        let ins_sql = format!(
-            "INSERT INTO {} (subject_id, namespace, kind, field, embedding_model, embedding) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            table
-        );
-        let blob = f32_slice_as_bytes(embedding);
-        conn.execute(
-            &ins_sql,
-            rusqlite::params![
-                subject_id.to_string(),
-                namespace,
-                kind_str,
-                field,
-                embedding_model,
-                blob
-            ],
-        )?;
-        Ok::<(), rusqlite::Error>(())
-    })();
+    let result = replace_vector_row_dml(
+        conn,
+        table,
+        dims,
+        VectorRowRef {
+            subject_id,
+            namespace,
+            kind: kind_str,
+            field,
+            embedding_model,
+            embedding,
+        },
+        failpoint_flag,
+    );
 
     match result {
         Ok(()) => {
@@ -701,21 +744,11 @@ impl VectorStore for SqliteVecStore {
                 .await;
         }
 
-        // Flag-off (default) path: byte-for-byte unchanged from
-        // pre-ADR-067 behavior — the closure owns its own transaction via
-        // `conn.unchecked_transaction()`.
+        // Flag-off (default) path: the closure owns its own transaction via
+        // `conn.unchecked_transaction()`; the DELETE+INSERT body is the same
+        // shared helper the WriterTask/batch paths use (#546), so this path
+        // now also exercises the post-delete failpoint in tests.
         self.with_writer("vec_insert", move |conn| {
-            if embedding.len() != dims {
-                return Err(rusqlite::Error::InvalidParameterCount(
-                    embedding.len(),
-                    dims,
-                ));
-            }
-
-            // vec0 does not support INSERT OR REPLACE — delete then insert.
-            // Wrap in a transaction so a failed INSERT rolls back the DELETE,
-            // leaving the previous vector intact (no-worse-than-stale guarantee).
-            //
             // ADR-091 Plank 0: register the span before opening the transaction so
             // the handle (declared first) drops AFTER `tx` (declared second) —
             // locals drop in reverse declaration order, so `tx`'s own Drop (which
@@ -725,31 +758,19 @@ impl VectorStore for SqliteVecStore {
                 khive_storage::tx_registry::register(Some("vec_insert_tx".to_string()));
             let tx = conn.unchecked_transaction()?;
 
-            let del_sql = format!(
-                "DELETE FROM {} WHERE subject_id = ?1 AND namespace = ?2",
-                table
-            );
-            tx.execute(
-                &del_sql,
-                rusqlite::params![subject_id.to_string(), &namespace],
-            )?;
-
-            let ins_sql = format!(
-                "INSERT INTO {} (subject_id, namespace, kind, field, embedding_model, embedding) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                table
-            );
-            let blob = f32_slice_as_bytes(&embedding);
-            tx.execute(
-                &ins_sql,
-                rusqlite::params![
-                    subject_id.to_string(),
-                    &namespace,
-                    &kind_str,
-                    &field,
-                    &embedding_model,
-                    blob
-                ],
+            replace_vector_row_dml(
+                &tx,
+                &table,
+                dims,
+                VectorRowRef {
+                    subject_id,
+                    namespace: &namespace,
+                    kind: &kind_str,
+                    field: &field,
+                    embedding_model: &embedding_model,
+                    embedding: &embedding,
+                },
+                failpoint_flag,
             )?;
 
             tx.commit()
@@ -852,8 +873,7 @@ impl VectorStore for SqliteVecStore {
 
         // Capture the failpoint Arc (if any) from the thread-local on the
         // calling thread before handing the closure to spawn_blocking.
-        #[cfg(test)]
-        let _failpoint_flag = failpoint::CURRENT.with(|c| c.borrow().clone());
+        let failpoint_flag = current_failpoint();
 
         // ADR-067 Component A (Fork C slice 2): when the write queue is
         // enabled, route through the pool-wide WriterTask. DML-only
@@ -868,7 +888,6 @@ impl VectorStore for SqliteVecStore {
             let kind_str2 = kind_str.clone();
             let embedding_model2 = embedding_model.clone();
             let embedding2 = embedding.clone();
-            let failpoint_flag2 = current_failpoint();
             return writer_task
                 .send(move |conn| {
                     vec_upsert_atomic_dml(
@@ -882,70 +901,36 @@ impl VectorStore for SqliteVecStore {
                         &embedding_model2,
                         &embedding2,
                         "vec_update_atomic",
-                        failpoint_flag2,
+                        failpoint_flag,
                     )
                     .map_err(|e| map_err(e, "vec_update"))
                 })
                 .await;
         }
 
-        // Flag-off (default) path: byte-for-byte unchanged from
-        // pre-ADR-067 behavior — the closure owns its own transaction via
-        // `conn.unchecked_transaction()`.
+        // Flag-off (default) path: the closure owns its own transaction via
+        // `conn.unchecked_transaction()`; the DELETE+INSERT body is the same
+        // shared helper the WriterTask/batch paths use (#546).
         self.with_writer("vec_update", move |conn| {
-            if embedding.len() != dims {
-                return Err(rusqlite::Error::InvalidParameterCount(
-                    embedding.len(),
-                    dims,
-                ));
-            }
-
-            // DELETE then INSERT in one transaction so a failed INSERT rolls back
-            // the DELETE, leaving the previous vector intact (no-worse-than-stale).
-            //
             // ADR-091 Plank 0: registered before the transaction is opened — see
             // the matching note in `insert()` above for the drop-order rationale.
             let _tx_handle =
                 khive_storage::tx_registry::register(Some("vec_update_tx".to_string()));
             let tx = conn.unchecked_transaction()?;
 
-            let del_sql = format!(
-                "DELETE FROM {} WHERE subject_id = ?1 AND namespace = ?2",
-                table
-            );
-            tx.execute(
-                &del_sql,
-                rusqlite::params![subject_id.to_string(), &namespace],
-            )?;
-
-            // Failpoint: fires only in cfg(test) when the guard is active.
-            // DELETE has already run; if the transaction rollback is missing,
-            // the deleted row is lost permanently.
-            #[cfg(test)]
-            if let Some(ref fp) = _failpoint_flag {
-                if failpoint::take(fp) {
-                    return Err(rusqlite::Error::InvalidParameterName(
-                        "__test_failpoint_after_delete__".into(),
-                    ));
-                }
-            }
-
-            let ins_sql = format!(
-                "INSERT INTO {} (subject_id, namespace, kind, field, embedding_model, embedding) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                table
-            );
-            let blob = f32_slice_as_bytes(&embedding);
-            tx.execute(
-                &ins_sql,
-                rusqlite::params![
-                    subject_id.to_string(),
-                    &namespace,
-                    &kind_str,
-                    &field,
-                    &embedding_model,
-                    blob
-                ],
+            replace_vector_row_dml(
+                &tx,
+                &table,
+                dims,
+                VectorRowRef {
+                    subject_id,
+                    namespace: &namespace,
+                    kind: &kind_str,
+                    field: &field,
+                    embedding_model: &embedding_model,
+                    embedding: &embedding,
+                },
+                failpoint_flag,
             )?;
 
             tx.commit()
@@ -2582,6 +2567,101 @@ mod atomic_replace_tests {
         assert!(
             result.is_err(),
             "update must propagate the injected error back to the caller"
+        );
+
+        // Transaction rollback must have restored the deleted stale row.
+        let present = store
+            .batch_exists(&[id_x], ns)
+            .await
+            .expect("batch_exists after failpoint");
+        assert!(
+            present.contains(&id_x),
+            "transaction rollback must restore the stale row after DELETE + injected failure"
+        );
+
+        // Self-similarity with vec1 confirms the original bytes are intact.
+        let hits = store
+            .search(VectorSearchRequest {
+                query_vectors: vec![vec1.clone()],
+                top_k: 1,
+                namespace: Some(ns.to_string()),
+                kind: Some(SubstrateKind::Entity),
+                embedding_model: None,
+                filter: None,
+                backend_hints: None,
+            })
+            .await
+            .expect("search after failpoint");
+
+        assert_eq!(
+            hits.len(),
+            1,
+            "stale vector must be searchable after rollback"
+        );
+        assert_eq!(hits[0].subject_id, id_x);
+        let sim = hits[0].score.to_f64();
+        assert!(
+            sim > 0.999,
+            "similarity to vec1 must be ~1.0 (got {sim:.6}); \
+             a lower value means the stale embedding was not restored — transaction rollback failed"
+        );
+    }
+
+    /// #546: the flag-off single-record `insert` path previously ran its own
+    /// inline DELETE+INSERT with no failpoint hook at all, so the post-delete
+    /// rollback guarantee was never exercised on this path (only `update` and
+    /// the batch/atomic-upsert helpers were covered). Now that `insert` routes
+    /// through the shared `replace_vector_row_dml` helper, the same failpoint
+    /// must fire here too and `unchecked_transaction` must roll back the
+    /// DELETE, restoring the stale row.
+    ///
+    /// FAILURE MODE (pre-#546): this test could not even be written against
+    /// the old `insert` body — there was no failpoint hook to arm. Removing
+    /// the shared helper (or its transaction rollback) makes this fail.
+    #[tokio::test]
+    async fn insert_rollback_restores_deleted_stale_after_post_delete_insert_failure() {
+        let pool = make_vec_pool();
+        let model_key = "sentinel_ins_rb";
+        let dims = 4;
+        let ns = "ns:sentinel_ins";
+
+        create_vec_table(&pool, model_key, dims);
+
+        let store = SqliteVecStore::new(
+            Arc::clone(&pool),
+            false,
+            model_key.to_string(),
+            model_key.to_string(),
+            dims,
+            ns.to_string(),
+        )
+        .expect("SqliteVecStore::new");
+
+        let id_x = Uuid::new_v4();
+        let vec1 = vec![0.1f32, 0.2, 0.3, 0.4];
+        let vec2 = vec![0.9f32, 0.0, 0.0, 0.0];
+
+        // Insert the stale row that must survive a second, failing `insert`
+        // call for the same (subject_id, namespace) — `vec0` has no
+        // INSERT OR REPLACE, so a second `insert` is itself a replace.
+        store
+            .insert(id_x, SubstrateKind::Entity, ns, "body", vec![vec1.clone()])
+            .await
+            .expect("stale insert");
+
+        // Arm the failpoint under a RAII guard.
+        let _guard = failpoint::FailpointGuard::new();
+
+        // Same namespace, correct dims, finite — DELETE will run, then failpoint fires.
+        let result = store
+            .insert(id_x, SubstrateKind::Entity, ns, "body", vec![vec2.clone()])
+            .await;
+
+        drop(_guard);
+
+        assert!(
+            result.is_err(),
+            "insert must propagate the injected error back to the caller"
         );
 
         // Transaction rollback must have restored the deleted stale row.
