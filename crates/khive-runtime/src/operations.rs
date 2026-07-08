@@ -3831,8 +3831,8 @@ impl KhiveRuntime {
     /// Keyset (seek) page of edges matching `filter`, ordered by edge `id`
     /// ascending. `after` is the last edge id from the previous page
     /// (exclusive); omit to start from the beginning. Returns
-    /// `(items, next_after)` — `next_after` is `Some` when more rows may
-    /// remain past this page.
+    /// `(items, next_after)` — `next_after` is `Some` when more rows remain
+    /// past this page.
     ///
     /// Unlike [`Self::list_edges`], this is O(log n + limit) at any depth: the
     /// underlying store issues an indexed `id > ?` range scan instead of an
@@ -3847,6 +3847,7 @@ impl KhiveRuntime {
     ) -> RuntimeResult<(Vec<Edge>, Option<Uuid>)> {
         let limit = limit.clamp(1, Self::EDGE_LIST_MAX_LIMIT);
         let visible = token.visible_namespaces();
+        let limit_usize = limit as usize;
 
         if let [ns] = visible {
             let temp = NamespaceToken::for_namespace(ns.clone());
@@ -3860,19 +3861,27 @@ impl KhiveRuntime {
         // Multi-namespace visibility: seek each namespace from the same
         // cursor (ids are globally unique UUIDs), merge, then take the head
         // of the merged set as this page.
+        let probe_limit = limit + 1;
         let mut results = Vec::new();
         for ns in visible {
             let temp = NamespaceToken::for_namespace(ns.clone());
             let page = self
                 .graph(&temp)?
-                .query_edges_after(filter.clone().into(), after, limit)
+                .query_edges_after(filter.clone().into(), after, probe_limit)
                 .await?;
             results.extend(page.items);
         }
         results.sort_by_key(|e| Uuid::from(e.id));
         results.dedup_by_key(|e| Uuid::from(e.id));
-        results.truncate(limit as usize);
-        let next_after = results.last().map(|e| Uuid::from(e.id));
+        let has_more = results.len() > limit_usize;
+        if has_more {
+            results.truncate(limit_usize);
+        }
+        let next_after = if has_more {
+            results.last().map(|e| Uuid::from(e.id))
+        } else {
+            None
+        };
         Ok((results, next_after))
     }
 
@@ -4643,7 +4652,7 @@ mod tests {
     use crate::embedder_registry::EmbedderProvider;
     use crate::error::RuntimeError;
     use crate::runtime::{KhiveRuntime, NamespaceToken};
-    use crate::Namespace;
+    use crate::{ActorRef, Namespace};
     use async_trait::async_trait;
     use khive_storage::types::PathNode;
     use lattice_embed::{EmbedError, EmbeddingModel, EmbeddingService};
@@ -5320,6 +5329,119 @@ mod tests {
             first_b.iter().map(|e| e.id.0).collect::<Vec<_>>(),
         );
         assert_eq!(next_a, next_b);
+    }
+
+    #[tokio::test]
+    async fn list_edges_after_single_namespace_exact_final_page_has_no_next_after() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+        let a = rt
+            .create_entity(&tok, "concept", None, "SingleCursorA", None, None, vec![])
+            .await
+            .unwrap();
+        for i in 0..4 {
+            let t = rt
+                .create_entity(
+                    &tok,
+                    "concept",
+                    None,
+                    &format!("SingleCursorT{i}"),
+                    None,
+                    None,
+                    vec![],
+                )
+                .await
+                .unwrap();
+            rt.link(&tok, a.id, t.id, EdgeRelation::Extends, 1.0, None)
+                .await
+                .unwrap();
+        }
+
+        let filter = EdgeListFilter {
+            source_id: Some(a.id),
+            relations: vec![EdgeRelation::Extends],
+            ..Default::default()
+        };
+
+        let (page1, next1) = rt
+            .list_edges_after(&tok, filter.clone(), None, 2)
+            .await
+            .unwrap();
+        assert_eq!(page1.len(), 2);
+        let cursor = next1.expect("first page must report a cursor when two rows remain");
+
+        let (page2, next2) = rt
+            .list_edges_after(&tok, filter, Some(cursor), 2)
+            .await
+            .unwrap();
+        assert_eq!(page2.len(), 2);
+        assert_eq!(
+            next2, None,
+            "an exact-size final single-namespace page must not report a cursor"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_edges_after_multi_namespace_exact_final_page_has_no_next_after() {
+        let rt = rt();
+        let ns_a = Namespace::parse("cursor-ns-a").unwrap();
+        let ns_b = Namespace::parse("cursor-ns-b").unwrap();
+        let tok_a = NamespaceToken::for_namespace(ns_a.clone());
+        let tok_b = NamespaceToken::for_namespace(ns_b.clone());
+        let visible = NamespaceToken::mint_with_visibility(ns_a, vec![ns_b], ActorRef::anonymous());
+
+        for (tok, prefix) in [(&tok_a, "A"), (&tok_b, "B")] {
+            let source = rt
+                .create_entity(
+                    tok,
+                    "concept",
+                    None,
+                    &format!("MultiCursor{prefix}Source"),
+                    None,
+                    None,
+                    vec![],
+                )
+                .await
+                .unwrap();
+            for i in 0..2 {
+                let target = rt
+                    .create_entity(
+                        tok,
+                        "concept",
+                        None,
+                        &format!("MultiCursor{prefix}Target{i}"),
+                        None,
+                        None,
+                        vec![],
+                    )
+                    .await
+                    .unwrap();
+                rt.link(tok, source.id, target.id, EdgeRelation::Extends, 1.0, None)
+                    .await
+                    .unwrap();
+            }
+        }
+
+        let filter = EdgeListFilter {
+            relations: vec![EdgeRelation::Extends],
+            ..Default::default()
+        };
+        let (page1, next1) = rt
+            .list_edges_after(&visible, filter.clone(), None, 2)
+            .await
+            .unwrap();
+        assert_eq!(page1.len(), 2);
+        let cursor = next1.expect("first merged page must report a cursor when rows remain");
+
+        let (page2, next2) = rt
+            .list_edges_after(&visible, filter, Some(cursor), 2)
+            .await
+            .unwrap();
+        assert_eq!(page2.len(), 2);
+        assert_eq!(
+            next2, None,
+            "an exact-size final multi-namespace page must not report a cursor"
+        );
     }
 
     /// #702.3: `stats()` should be able to report a per-relation breakdown so

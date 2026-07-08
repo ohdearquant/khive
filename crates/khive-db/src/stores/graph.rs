@@ -1409,14 +1409,15 @@ impl GraphStore for SqlGraphStore {
         limit: u32,
     ) -> Result<EdgeSeekPage, StorageError> {
         let namespace = self.namespace.clone();
-        let limit_i64 = i64::from(limit);
+        let limit_usize = limit as usize;
+        let probe_limit_i64 = i64::from(limit) + 1;
         self.with_reader("query_edges_after", move |conn| {
             let (mut where_clause, mut params) = build_edge_filter_sql(&namespace, &filter);
             if let Some(cursor) = after {
                 params.push(Box::new(cursor.to_string()));
                 where_clause.push_str(&format!(" AND id > ?{}", params.len()));
             }
-            params.push(Box::new(limit_i64));
+            params.push(Box::new(probe_limit_i64));
             let limit_idx = params.len();
 
             // `where_clause` always pins `namespace = ?1`; adding `id > ?N` here
@@ -1440,7 +1441,11 @@ impl GraphStore for SqlGraphStore {
             for row in rows {
                 items.push(row?);
             }
-            let next_after = if items.len() as u32 >= limit {
+            let has_more = items.len() > limit_usize;
+            if has_more {
+                items.truncate(limit_usize);
+            }
+            let next_after = if has_more {
                 items.last().map(|e| Uuid::from(e.id))
             } else {
                 None
