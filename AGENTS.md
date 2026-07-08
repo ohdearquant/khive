@@ -15,7 +15,7 @@ khive gives your agent:
 9. **Brain** — Bayesian profile tuning from feedback signals
 10. **Session** — persist and resume agent-session records
 
-All 9 packs load by default. **74 public verbs** across the packs — the `git` pack
+All 9 packs load by default. **75 public verbs** across the packs — the `git` pack
 (commit/issue/pull_request provenance notes, populated by a batch ingester, not agent-facing
 verbs) contributes no new verb (regenerate via `request(ops="verbs()")` before editing this
 line).
@@ -100,24 +100,25 @@ false, id, full_id, from, to, note: "already in target status"}` — the task fi
 `memory.recall` supports `tags` and `tag_mode` ("any"|"all") for tag-based post-filtering.
 Composite scores are always in [0,1]. Typical production floor: 0.3-0.7.
 
-### Brain pack — 14 verbs (`brain.` prefix)
+### Brain pack — 15 verbs (`brain.` prefix)
 
-| Verb                     | What it does                                         | When to use                                                |
-| ------------------------ | ---------------------------------------------------- | ---------------------------------------------------------- |
-| `brain.profiles`         | List profiles (optionally filtered by lifecycle)     | See what profiles exist                                    |
-| `brain.profile`          | Full detail: metadata, snapshot, state summary       | Inspect a specific profile                                 |
-| `brain.create_profile`   | Create a new profile with optional seed priors       | Custom tuning for a new consumer                           |
-| `brain.resolve`          | Which profile serves a given consumer context?       | Before recall — check active tuning                        |
-| `brain.activate`         | Start live update loop for a profile                 | Enable feedback-driven tuning                              |
-| `brain.deactivate`       | Stop live updates, retain state                      | Pause tuning without losing progress                       |
-| `brain.archive`          | Read-only, audit-retained                            | Retire a profile permanently                               |
-| `brain.reset`            | Reset posteriors to priors (preserves event history) | Start tuning fresh                                         |
-| `brain.feedback`         | Emit explicit feedback event                         | Rate a recall result as useful/not_useful/wrong            |
-| `brain.auto_feedback`    | Emit implicit feedback for recall results            | Convenience: agents call after memory.recall               |
-| `brain.bind`             | Bind a profile to an actor + consumer                | Route a specific caller to a specific profile              |
-| `brain.unbind`           | Remove a binding                                     | Stop routing                                               |
-| `brain.bindings`         | List binding rows                                    | Audit profile routing                                      |
-| `brain.register_adapter` | Register an adapter integrity record                 | Gate adapter composition to the active base-model revision |
+| Verb                     | What it does                                                      | When to use                                                |
+| ------------------------ | ----------------------------------------------------------------- | ---------------------------------------------------------- |
+| `brain.event_counts`     | Windowed event counts by kind/actor (+ feedback by_profile split) | Flywheel metrics, feedback-coverage reporting              |
+| `brain.profiles`         | List profiles (optionally filtered by lifecycle)                  | See what profiles exist                                    |
+| `brain.profile`          | Full detail: metadata, snapshot, state summary                    | Inspect a specific profile                                 |
+| `brain.create_profile`   | Create a new profile with optional seed priors                    | Custom tuning for a new consumer                           |
+| `brain.resolve`          | Which profile serves a given consumer context?                    | Before recall — check active tuning                        |
+| `brain.activate`         | Start live update loop for a profile                              | Enable feedback-driven tuning                              |
+| `brain.deactivate`       | Stop live updates, retain state                                   | Pause tuning without losing progress                       |
+| `brain.archive`          | Read-only, audit-retained                                         | Retire a profile permanently                               |
+| `brain.reset`            | Reset posteriors to priors (preserves event history)              | Start tuning fresh                                         |
+| `brain.feedback`         | Emit explicit feedback event                                      | Rate a recall result as useful/not_useful/wrong            |
+| `brain.auto_feedback`    | Emit implicit feedback for recall results                         | Convenience: agents call after memory.recall               |
+| `brain.bind`             | Bind a profile to an actor + consumer                             | Route a specific caller to a specific profile              |
+| `brain.unbind`           | Remove a binding                                                  | Stop routing                                               |
+| `brain.bindings`         | List binding rows                                                 | Audit profile routing                                      |
+| `brain.register_adapter` | Register an adapter integrity record                              | Gate adapter composition to the active base-model revision |
 
 ### Comm pack — 6 verbs (`comm.` prefix)
 

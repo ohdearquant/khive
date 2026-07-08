@@ -5740,3 +5740,409 @@ mod durable_write_tests {
         );
     }
 }
+
+// ── brain.event_counts (ADR-103 Stage 1, #724 Ask A) ────────────────────────
+
+#[cfg(test)]
+mod event_counts_tests {
+    use super::*;
+    use khive_runtime::micros_to_iso;
+    use khive_storage::event::{Event, EventFilter};
+    use khive_storage::types::PageRequest;
+    use khive_types::{EventKind, SubstrateKind};
+    use serde_json::Value;
+
+    /// Append a synthetic event directly through the `EventStore`, bypassing
+    /// verb dispatch, so the window boundary tests control `created_at` and
+    /// payload precisely instead of relying on wall-clock timing.
+    async fn seed_event(
+        rt: &KhiveRuntime,
+        token: &NamespaceToken,
+        verb: &str,
+        kind: EventKind,
+        actor: &str,
+        created_at: i64,
+        payload: Value,
+    ) {
+        let mut event = Event::new(
+            token.namespace().as_str(),
+            verb,
+            kind,
+            SubstrateKind::Note,
+            actor,
+        );
+        event.created_at = created_at;
+        event.payload = payload;
+        rt.events(token)
+            .expect("event store")
+            .append_event(event)
+            .await
+            .expect("seed event append");
+    }
+
+    /// Sanity check that the seeding helper and window semantics agree with
+    /// the underlying `EventFilter` used by other event-store tests: appending
+    /// a handful of rows and reading them back via `query_events` with an
+    /// explicit filter must see exactly what was seeded.
+    async fn seeded_count(rt: &KhiveRuntime, token: &NamespaceToken) -> usize {
+        rt.events(token)
+            .expect("event store")
+            .query_events(
+                EventFilter::default(),
+                PageRequest {
+                    offset: 0,
+                    limit: 1000,
+                },
+            )
+            .await
+            .expect("query_events")
+            .items
+            .len()
+    }
+
+    #[tokio::test]
+    async fn window_boundaries_include_since_exclude_until() {
+        let (pack, rt) = make_pack();
+        let registry = empty_registry();
+        let token = rt.authorize(Namespace::local()).unwrap();
+
+        let since = 1_000_000_i64;
+        let until = 2_000_000_i64;
+
+        // Exactly at `since` — must be INCLUDED.
+        seed_event(
+            &rt,
+            &token,
+            "search",
+            EventKind::SearchExecuted,
+            "lambda:a",
+            since,
+            json!({}),
+        )
+        .await;
+        // Inside the window.
+        seed_event(
+            &rt,
+            &token,
+            "search",
+            EventKind::SearchExecuted,
+            "lambda:a",
+            1_500_000,
+            json!({}),
+        )
+        .await;
+        // Exactly at `until` — must be EXCLUDED (half-open window).
+        seed_event(
+            &rt,
+            &token,
+            "search",
+            EventKind::SearchExecuted,
+            "lambda:a",
+            until,
+            json!({}),
+        )
+        .await;
+        // Before `since` — must be EXCLUDED.
+        seed_event(
+            &rt,
+            &token,
+            "search",
+            EventKind::SearchExecuted,
+            "lambda:a",
+            500_000,
+            json!({}),
+        )
+        .await;
+
+        assert_eq!(seeded_count(&rt, &token).await, 4);
+
+        let result = pack
+            .dispatch(
+                "brain.event_counts",
+                json!({
+                    "since": micros_to_iso(since),
+                    "until": micros_to_iso(until),
+                }),
+                &registry,
+                &token,
+            )
+            .await
+            .expect("brain.event_counts must succeed");
+
+        assert_eq!(
+            result["total"],
+            json!(2),
+            "window must include the `since` boundary and exclude the `until` boundary: {result}"
+        );
+        assert_eq!(result["counts_by_kind"]["search_executed"], json!(2));
+    }
+
+    #[tokio::test]
+    async fn empty_window_returns_zero_counts_not_error() {
+        let (pack, rt) = make_pack();
+        let registry = empty_registry();
+        let token = rt.authorize(Namespace::local()).unwrap();
+
+        let result = pack
+            .dispatch(
+                "brain.event_counts",
+                json!({
+                    "since": "2020-01-01T00:00:00Z",
+                    "until": "2020-01-02T00:00:00Z",
+                }),
+                &registry,
+                &token,
+            )
+            .await
+            .expect("empty window must not error");
+
+        assert_eq!(result["total"], json!(0));
+        assert_eq!(result["counts_by_kind"], json!({}));
+        assert_eq!(result["counts_by_actor"], json!({}));
+        assert!(
+            result.get("by_profile").is_none(),
+            "by_profile must be omitted when no feedback events are in the window: {result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn kind_filter_scopes_counts() {
+        let (pack, rt) = make_pack();
+        let registry = empty_registry();
+        let token = rt.authorize(Namespace::local()).unwrap();
+
+        seed_event(
+            &rt,
+            &token,
+            "search",
+            EventKind::SearchExecuted,
+            "lambda:a",
+            1_000_000,
+            json!({}),
+        )
+        .await;
+        seed_event(
+            &rt,
+            &token,
+            "recall",
+            EventKind::RecallExecuted,
+            "lambda:a",
+            1_000_000,
+            json!({}),
+        )
+        .await;
+
+        let result = pack
+            .dispatch(
+                "brain.event_counts",
+                json!({
+                    "since": micros_to_iso(0),
+                    "kind": "recall_executed",
+                }),
+                &registry,
+                &token,
+            )
+            .await
+            .expect("brain.event_counts must succeed");
+
+        assert_eq!(result["total"], json!(1));
+        assert_eq!(result["counts_by_kind"]["recall_executed"], json!(1));
+        assert!(result["counts_by_kind"].get("search_executed").is_none());
+    }
+
+    #[tokio::test]
+    async fn actor_filter_scopes_counts() {
+        let (pack, rt) = make_pack();
+        let registry = empty_registry();
+        let token = rt.authorize(Namespace::local()).unwrap();
+
+        seed_event(
+            &rt,
+            &token,
+            "search",
+            EventKind::SearchExecuted,
+            "lambda:a",
+            1_000_000,
+            json!({}),
+        )
+        .await;
+        seed_event(
+            &rt,
+            &token,
+            "search",
+            EventKind::SearchExecuted,
+            "lambda:b",
+            1_000_000,
+            json!({}),
+        )
+        .await;
+
+        let result = pack
+            .dispatch(
+                "brain.event_counts",
+                json!({
+                    "since": micros_to_iso(0),
+                    "actor": "lambda:b",
+                }),
+                &registry,
+                &token,
+            )
+            .await
+            .expect("brain.event_counts must succeed");
+
+        assert_eq!(result["total"], json!(1));
+        assert_eq!(result["counts_by_actor"]["lambda:b"], json!(1));
+        assert!(result["counts_by_actor"].get("lambda:a").is_none());
+    }
+
+    #[tokio::test]
+    async fn feedback_events_split_by_served_by_profile_id() {
+        let (pack, rt) = make_pack();
+        let registry = empty_registry();
+        let token = rt.authorize(Namespace::local()).unwrap();
+
+        seed_event(
+            &rt,
+            &token,
+            "brain.feedback",
+            EventKind::FeedbackExplicit,
+            "lambda:a",
+            1_000_000,
+            json!({"served_by_profile_id": "balanced-recall-v1", "signal": "useful"}),
+        )
+        .await;
+        seed_event(
+            &rt,
+            &token,
+            "brain.feedback",
+            EventKind::FeedbackExplicit,
+            "lambda:a",
+            1_000_000,
+            json!({"served_by_profile_id": "balanced-recall-v1", "signal": "wrong"}),
+        )
+        .await;
+        // Missing served_by_profile_id — must fall into the "unspecified" bucket
+        // rather than being dropped from the split.
+        seed_event(
+            &rt,
+            &token,
+            "brain.feedback",
+            EventKind::FeedbackExplicit,
+            "lambda:a",
+            1_000_000,
+            json!({"signal": "useful"}),
+        )
+        .await;
+
+        let result = pack
+            .dispatch(
+                "brain.event_counts",
+                json!({"since": micros_to_iso(0)}),
+                &registry,
+                &token,
+            )
+            .await
+            .expect("brain.event_counts must succeed");
+
+        assert_eq!(result["total"], json!(3));
+        assert_eq!(
+            result["by_profile"]["balanced-recall-v1"],
+            json!(2),
+            "got: {result}"
+        );
+        assert_eq!(
+            result["by_profile"]["unspecified"],
+            json!(1),
+            "got: {result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_kind_lists_valid_values() {
+        let (pack, rt) = make_pack();
+        let registry = empty_registry();
+        let token = rt.authorize(Namespace::local()).unwrap();
+
+        let err = pack
+            .dispatch(
+                "brain.event_counts",
+                json!({"since": micros_to_iso(0), "kind": "not_a_real_kind"}),
+                &registry,
+                &token,
+            )
+            .await
+            .expect_err("unknown kind must be rejected");
+
+        match &err {
+            RuntimeError::InvalidInput(msg) => {
+                assert!(
+                    msg.contains("not_a_real_kind"),
+                    "error must name the rejected value: {msg}"
+                );
+                assert!(
+                    msg.contains("recall_executed") || msg.contains("Valid:"),
+                    "error must list valid EventKind values: {msg}"
+                );
+            }
+            other => panic!("expected InvalidInput, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_since_datetime_names_the_field() {
+        let (pack, rt) = make_pack();
+        let registry = empty_registry();
+        let token = rt.authorize(Namespace::local()).unwrap();
+
+        let err = pack
+            .dispatch(
+                "brain.event_counts",
+                json!({"since": "not-a-date"}),
+                &registry,
+                &token,
+            )
+            .await
+            .expect_err("malformed since must be rejected");
+
+        match &err {
+            RuntimeError::InvalidInput(msg) => {
+                assert!(
+                    msg.contains("since") && msg.contains("not-a-date"),
+                    "error must name the field and offending value: {msg}"
+                );
+            }
+            other => panic!("expected InvalidInput, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn missing_since_is_rejected() {
+        let (pack, rt) = make_pack();
+        let registry = empty_registry();
+        let token = rt.authorize(Namespace::local()).unwrap();
+
+        let err = pack
+            .dispatch("brain.event_counts", json!({}), &registry, &token)
+            .await
+            .expect_err("since is required");
+
+        assert!(matches!(err, RuntimeError::InvalidInput(_)));
+    }
+
+    #[test]
+    fn handler_is_public_verb_with_required_since() {
+        let h = crate::handlers::BRAIN_HANDLERS
+            .iter()
+            .find(|h| h.name == "brain.event_counts")
+            .expect("brain.event_counts must be registered");
+        assert_eq!(h.visibility, khive_types::Visibility::Verb);
+        assert!(
+            h.params.iter().any(|p| p.name == "since" && p.required),
+            "since must be documented as required"
+        );
+        assert!(
+            h.params.iter().any(|p| p.name == "until" && !p.required),
+            "until must be documented as optional"
+        );
+    }
+}
