@@ -62,14 +62,14 @@ local:
 	SRC_HASH=$$(md5 -q "$$SRC"); \
 	SRC_SIZE=$$(stat -f '%z' "$$SRC"); \
 	echo "==> Source:  $$SRC ($$SRC_HASH, $$SRC_SIZE bytes)"; \
-	echo "==> Killing running kkernel processes..."; \
-	pkill -f 'kkernel' 2>/dev/null || true; \
+	echo "==> Killing running kkernel daemon (bridges self-heal via re-exec on next request)..."; \
+	pkill -f 'kkernel mcp --daemon' 2>/dev/null || true; \
 	for i in 1 2 3 4 5; do \
-	  if pgrep -f 'kkernel' >/dev/null 2>&1; then sleep 1; else break; fi; \
+	  if pgrep -f 'kkernel mcp --daemon' >/dev/null 2>&1; then sleep 1; else break; fi; \
 	done; \
-	if pgrep -f 'kkernel' >/dev/null 2>&1; then \
-	  echo "==> WARNING: still running after 5s — SIGKILL"; \
-	  pkill -9 -f 'kkernel' 2>/dev/null || true; \
+	if pgrep -f 'kkernel mcp --daemon' >/dev/null 2>&1; then \
+	  echo "==> WARNING: daemon still running after 5s — SIGKILL"; \
+	  pkill -9 -f 'kkernel mcp --daemon' 2>/dev/null || true; \
 	  sleep 1; \
 	fi; \
 	echo "==> Staging + codesigning $$DEST.new..."; \
