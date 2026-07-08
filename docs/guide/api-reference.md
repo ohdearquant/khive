@@ -916,8 +916,8 @@ request(ops="comm.thread(id=\"<thread-root-id>\")")
 Strictly read-only poll for new inbound message metadata and a stale-unread count. No
 read-flag mutation, no writes: designed for monitors polling every ~30 seconds, served by
 a single cheap indexed query. Returns a `cursor_us` high-water mark, a `stale_unread_count`
-of inbound messages unread past the staleness window, and up to 100 new inbound rows
-(id, created_at, from_actor, subject) newer than `since_us`.
+of inbound messages unread past the staleness window, and a `new_messages` array of up to
+100 inbound rows `{id, created_at_us, from_actor, subject?}` newer than `since_us`.
 
 | Param           | Type    | Required | Notes                                               |
 | --------------- | ------- | -------- | --------------------------------------------------- |

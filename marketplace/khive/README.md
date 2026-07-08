@@ -50,8 +50,8 @@ Once installed, invoke them as `khive:digester`, `khive:polisher`, and so on.
 ## Requirements
 
 The `kg` pack is the base (entities, edges, notes); every other pack builds on it. The default
-server config loads all eight (`kg`, `gtd`, `memory`, `brain`, `comm`, `schedule`, `knowledge`,
-`session`) — this plugin currently ships pattern skills for the first seven; `session` has no
+server config loads all nine (`kg`, `gtd`, `memory`, `brain`, `comm`, `schedule`, `knowledge`,
+`session`, `git` — the last contributes note kinds and ingest support, no MCP-callable verbs) — this plugin currently ships pattern skills for the first seven; `session` has no
 skill yet (see the Pattern skills table above).
 See [INSTALL.md](../INSTALL.md) for setup, the actor config, and per-pack smoke tests.
 
