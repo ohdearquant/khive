@@ -203,8 +203,9 @@ fn project_changeset(changeset: &ChangeSet) -> ProjectedNdjson {
                         // `edge-endpoint-types`, via `collect_kind_map`) and
                         // `description` (generic `[[rules]] require_field`)
                         // are both consulted by `kg validate`'s rule classes,
-                        // not just `id`/`kind`/`name`/`properties`/`tags` —
-                        // see codex round-1 review H1 (khive#kg-commit-tier2).
+                        // not just `id`/`kind`/`name`/`properties`/`tags`.
+                        // Projecting a narrower record than the staged op
+                        // causes false rejections and vacuous rule passes.
                         let rec = serde_json::json!({
                             "id": id_str,
                             "kind": serde_json::to_value(fields.entity_kind)
@@ -223,8 +224,7 @@ fn project_changeset(changeset: &ChangeSet) -> ProjectedNdjson {
                         // Project every `NoteCreateFields` field the rule
                         // pass can read (generic `[[rules]]` can
                         // `require_field`/condition on any top-level field,
-                        // not just `kind`/`properties`/`tags`) — see codex
-                        // round-1 review H1.
+                        // not just `kind`/`properties`/`tags`).
                         let rec = serde_json::json!({
                             "id": id_str,
                             "kind": fields.note_kind,
@@ -299,7 +299,7 @@ fn check_no_duplicate_stage_ids(duplicate_ids: &[String]) -> RuleResult {
 /// "dangling-refs"` filter would also swallow the malformed-config error
 /// result `validate_severity` emits under that same id, and any generic
 /// `[[rules]]` entry a rules author happens to name `"dangling-refs"` — both
-/// of which must still fail the commit (codex round-1 review H2).
+/// of which must still fail the commit.
 fn run_commit_time_rules(changeset: &ChangeSet, rules_path: &Path) -> Result<Vec<RuleResult>> {
     let projected = project_changeset(changeset);
 

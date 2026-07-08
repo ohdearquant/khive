@@ -364,7 +364,7 @@ fn kg_commit_fails_loud_on_malformed_changeset() {
     );
 }
 
-// ── Codex round-1 review regressions (H1: projection fidelity) ─────────────
+// ── Projection-fidelity regressions: rules must see the full staged record ─
 
 /// H1(a): a formal typed endpoint (`concept/theorem -[depends_on]->
 /// concept/definition`) is a pack-allowed pairing
@@ -480,7 +480,7 @@ fn kg_commit_lands_changeset_with_description_satisfying_require_field_rule() {
     );
 }
 
-// ── Codex round-1 review regressions (H2: dangling-refs suppression) ───────
+// ── Rule-result suppression regressions: only the built-in partial-view ────
 
 /// H2(a): a malformed `[dangling_refs] severity = "catastrophic"` must still
 /// produce an error-severity config-validation finding and refuse the
