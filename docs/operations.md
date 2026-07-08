@@ -29,6 +29,7 @@ explicitly and describes what the code does.
 | `kg export`                          | no (writes an output file, not the DB) | Dump a namespace's entities+edges to one JSON archive                                   |
 | `kg import`                          | yes (target DB)                        | Load an archive/JSON/NDJSON file into a DB                                              |
 | `kg status`                          | no                                     | Compare DB content hash against tracked NDJSON content hash                             |
+| `kg commit`                          | yes (a separate local-only git repo)   | Validate + git-commit a staged tier-2 change-set (ADR-102 Amendment to ADR-020)         |
 | `db migrate` / `db check`            | `migrate` yes, `check` no              | Apply or report pending schema migrations                                               |
 | `engine list` / `status`             | no                                     | Inspect the `_embedding_models` table                                                   |
 | `engine migrate` / `drift-check`     | n/a                                    | **Not implemented**, always return an error (see §3)                                    |
@@ -295,12 +296,87 @@ fields = ["year", "date", "published_at", "publication_date"]
   printed pass/fail reflects pre-fix state, and it refuses to touch a file containing malformed
   JSON rather than guessing at a fix (fail-closed).
 - **Exit code**: a failing validation calls `std::process::exit(1)` directly
-  (`kg/validate.rs:147-149`); this is the one `kg` subcommand that hard-exits on failure rather
-  than only reporting it in JSON.
+  (`kg/validate.rs:147-149`); `kg commit` (below) shares this hard-exit-on-failure behavior for its
+  own pre-commit report, so between them `kg validate` and `kg commit` are the two `kg`
+  subcommands that hard-exit on a failing report rather than only reporting it in JSON.
 
 `kg init`'s generated pre-commit hook (below) runs exactly `kkernel kg validate` with no extra
 flags whenever staged files touch `entities.ndjson`/`edges.ndjson`; it is bypassed the normal git
 way (`git commit --no-verify`).
+
+### `kg commit`: the tier-2 change-set commit primitive
+
+```bash
+kkernel kg commit <changeset.ndjson> --rules <rules.toml> --repo <path> -m "<message>" [--format text|json|github]
+```
+
+Restores the `kg commit` verb ADR-020 §5 specified (`export + validate + git add + git commit`)
+but never shipped, scoped per [ADR-102](adr/ADR-102-tiered-validate-and-merge.md)'s "Amendment to
+ADR-020" to the tier-2 flow that ADR defines: landing an already-staged, already-reviewed
+[ADR-101](adr/ADR-101-kg-changeset-model.md) NDJSON-delta change-set into ADR-102's own
+**local-only** staged-change-set/snapshot repository (D6) — this is a _different_ repository from
+the project-repository-embedded `.khive/kg/` layout every other `kg` verb above operates on.
+`--repo` here is that separate repository's root, not a project checkout.
+
+**Flow**:
+
+1. Parse `<changeset.ndjson>` via `khive_changeset::from_ndjson` — a malformed file (bad JSON, an
+   unrecognized `schema_version`, an op missing a required field such as a `delete`/`merge`
+   preimage) fails loud before any validation or git operation runs.
+2. Project the change-set's `create` and `link` ops into synthetic `entities.ndjson` /
+   `notes.ndjson` / `edges.ndjson` content and run a **subset** of the same rule pass `kg
+   validate` uses against them: a local duplicate-stage-id check, `valid-entity-kinds`,
+   `valid-note-kinds`, and (if `--rules` enables them) `edge_endpoint_types`,
+   `edge_direction_conventions`, `naming_conventions`, `citation_date_lint`, and any generic
+   `[[rules]]` entries. Any `error`-severity finding refuses the commit — the report is printed
+   (respecting `--format`) and the process hard-exits `1`, exactly like `kg validate`, before any
+   git command runs.
+3. On a clean pass: refuses (fail-loud, before any git mutation) if `--repo` has **any** configured
+   git remote (`git remote` returns a non-empty list) — ADR-102 D6's local-only constraint,
+   enforced in code, not by convention. Otherwise stages the change-set file into the repo (in
+   place if it already lives under `--repo`, or copied to
+   `<repo>/.khive/kg/changesets/<file-name>` if it was staged elsewhere), `git add`s it, and
+   `git commit -F <message-file>` with `-m`'s value as the body plus two trailers: `Change-Set-Producer:
+   <envelope.producer>` and `Change-Set-Producer-Batch: <envelope.producer>@<staged_at
+   microseconds>us` (ADR-101 D4's "producer-assigned batch identifier" trailer — see the crate note
+   below for why it is derived rather than read verbatim from a dedicated field). Prints a JSON
+   `CommitReport` (`commit_sha`, `changeset_path`, `ops`, `producer`, `producer_batch`) on success.
+
+**Why `referential-integrity`/`dangling-refs` are excluded from step 2**: a change-set is a
+_partial_ view of the graph — most `link` ops target entities or notes created by an earlier,
+already-committed change-set, not by this one. Running either of those two rule classes against
+this change-set alone would flag the overwhelming majority of ordinary edges as broken, a
+false-positive storm rather than a real finding, so they are deferred to stage time (where the
+producer/reviewer has, or can obtain, full graph context) instead of re-run here.
+`edge_endpoint_types`/`edge_direction_conventions` need no such exclusion: both already skip any
+edge whose endpoint fails to resolve within the given NDJSON dataset, so restricting them to this
+change-set's own `create` ops degrades gracefully rather than false-flagging.
+
+**Why `update`/`delete`/`merge` ops are not re-projected**: they patch or remove records that
+already exist outside this change-set, so `kg commit` has no fresh kind/name/relation data to
+check for them beyond what ADR-102 D2 already routes to tier-2 review by construction (`delete`,
+`merge`, and any edge-relation/weight change are _always_ tier-2, so a reviewer has already looked
+at them before a change-set reaches this command).
+
+**Batch-identifier trailer, a documented gap**: ADR-101 D4 specifies a commit trailer carrying "a
+producer-assigned batch identifier," read from the change-set envelope. The shipped
+`khive-changeset::Envelope` (schema version 1) carries `producer`, `producer_model_family`, and
+`staged_at`, but no separate batch-identifier field. `kg commit` derives the trailer value as
+`<producer>@<staged_at_micros>us` — unique per staged change-set and round-trippable, matching
+ADR-101 D4's only stated contract for the field — rather than inventing a new envelope field on a
+crate this branch does not modify. A future `khive-changeset` schema revision adding an explicit
+batch-id field would let this trailer read it directly instead.
+
+**Topology**: no SQLite handle is opened anywhere in this command. `valid-entity-kinds`/
+`valid-note-kinds` build their pack-metadata taxonomy the same way `kg validate` does (`db_path:
+None`), and every other check reads only the synthetic NDJSON projection or the change-set file
+itself — matching ADR-102 D5's MCP-client-only / no-second-DB-handle constraint on live-graph
+access.
+
+**Local-repository leak guard**: this repository's entire purpose is committing exported KG
+NDJSON, which trips the machine-wide `check-json-data.sh` pre-commit leak guard
+(`core.hooksPath`) by default. `kg commit`'s own `git commit` invocation sets
+`KHIVE_ALLOW_DATA=1` — that hook's documented, auditable bypass — rather than `--no-verify`.
 
 ### `kg init`: repo scaffolding
 

@@ -16,9 +16,13 @@ use super::types::{
 };
 
 /// Taxonomy sets derived from the loaded pack registry.
-struct KgTaxonomy {
-    entity_kinds: HashSet<String>,
-    note_kinds: HashSet<String>,
+///
+/// `pub(super)`: also consumed by `kg::commit` (`kkernel kg commit`, ADR-102)
+/// to reuse the same entity-kind/note-kind vocabulary this module builds for
+/// `kg validate`, rather than re-deriving it.
+pub(super) struct KgTaxonomy {
+    pub(super) entity_kinds: HashSet<String>,
+    pub(super) note_kinds: HashSet<String>,
 }
 
 /// Build the merged entity-kind and note-kind sets from all registered packs.
@@ -39,7 +43,7 @@ struct KgTaxonomy {
 /// operator must be able to run taxonomy validation against a strict-mode
 /// deployment. See `enforce_strict_actor_mode` in
 /// `crates/khive-mcp/src/serve.rs` for the authoritative boundary definition.
-fn build_taxonomy() -> Result<KgTaxonomy> {
+pub(super) fn build_taxonomy() -> Result<KgTaxonomy> {
     let config = RuntimeConfig {
         db_path: None,
         default_namespace: khive_runtime::Namespace::parse("kkernel-validate")
@@ -351,7 +355,12 @@ fn record_prefix(entity_id: Option<&str>, entity_name: Option<&str>) -> String {
     }
 }
 
-fn check_valid_entity_kinds(entities_path: &Path, valid_kinds: &HashSet<String>) -> RuleResult {
+/// `pub(super)`: reused by `kg::commit` (ADR-102) to check `create`-op entity
+/// kinds against the same pack-declared taxonomy `kg validate` enforces.
+pub(super) fn check_valid_entity_kinds(
+    entities_path: &Path,
+    valid_kinds: &HashSet<String>,
+) -> RuleResult {
     let valid_list = {
         let mut v: Vec<&str> = valid_kinds.iter().map(String::as_str).collect();
         v.sort_unstable();
@@ -400,7 +409,14 @@ fn check_valid_entity_kinds(entities_path: &Path, valid_kinds: &HashSet<String>)
     }
 }
 
-fn check_valid_note_kinds(notes_path: &Path, valid_kinds: &HashSet<String>) -> RuleResult {
+/// `pub(super)`: reused by `kg::commit` (ADR-102) to check `create`-op note
+/// kinds against the same pack-declared taxonomy `kg validate` enforces —
+/// meaningful here because `NoteCreateFields::note_kind` is a free-form
+/// string, not a closed Rust enum, so it needs a runtime check.
+pub(super) fn check_valid_note_kinds(
+    notes_path: &Path,
+    valid_kinds: &HashSet<String>,
+) -> RuleResult {
     let valid_list = {
         let mut v: Vec<&str> = valid_kinds.iter().map(String::as_str).collect();
         v.sort_unstable();
