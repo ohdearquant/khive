@@ -62,7 +62,9 @@ impl fmt::Display for EventOutcome {
     }
 }
 
-/// Discriminant for the 26 typed event variants produced by the verb dispatch path.
+/// Discriminant for the 34 typed event variants produced by the verb dispatch path
+/// and by lifecycle telemetry producers (channel polling/backoff, config-lock,
+/// checkpoint outcome).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
@@ -119,11 +121,27 @@ pub enum EventKind {
     ProposalApplied,
     /// A proposal was withdrawn before it was applied.
     ProposalWithdrawn,
+    /// A channel poll cycle started for one `(kind, slug)` credential.
+    ChannelPollStarted,
+    /// A channel poll cycle returned envelopes after a prior failure.
+    ChannelPollSucceeded,
+    /// A channel poll cycle failed.
+    ChannelPollFailed,
+    /// A channel's backoff escalated to a new step after a failure.
+    ChannelBackoffArmed,
+    /// A channel's backoff reset to base after a success.
+    ChannelBackoffReset,
+    /// Persisting a channel heartbeat row failed.
+    ChannelHeartbeatPersistFailed,
+    /// A process-lifetime `OnceLock` configuration value was locked in.
+    ConfigLocked,
+    /// A WAL checkpoint tick's outcome was recorded (ADR-091 elevated/drain edge).
+    CheckpointOutcomeRecorded,
 }
 
 impl EventKind {
-    /// All 26 event kind variants in declaration order.
-    pub const ALL: [Self; 26] = [
+    /// All 34 event kind variants in declaration order.
+    pub const ALL: [Self; 34] = [
         Self::Audit,
         Self::RecallExecuted,
         Self::RerankExecuted,
@@ -150,6 +168,14 @@ impl EventKind {
         Self::ProposalReviewed,
         Self::ProposalApplied,
         Self::ProposalWithdrawn,
+        Self::ChannelPollStarted,
+        Self::ChannelPollSucceeded,
+        Self::ChannelPollFailed,
+        Self::ChannelBackoffArmed,
+        Self::ChannelBackoffReset,
+        Self::ChannelHeartbeatPersistFailed,
+        Self::ConfigLocked,
+        Self::CheckpointOutcomeRecorded,
     ];
 
     /// Return the canonical snake_case string for this event kind.
@@ -181,6 +207,14 @@ impl EventKind {
             Self::ProposalReviewed => "proposal_reviewed",
             Self::ProposalApplied => "proposal_applied",
             Self::ProposalWithdrawn => "proposal_withdrawn",
+            Self::ChannelPollStarted => "channel_poll_started",
+            Self::ChannelPollSucceeded => "channel_poll_succeeded",
+            Self::ChannelPollFailed => "channel_poll_failed",
+            Self::ChannelBackoffArmed => "channel_backoff_armed",
+            Self::ChannelBackoffReset => "channel_backoff_reset",
+            Self::ChannelHeartbeatPersistFailed => "channel_heartbeat_persist_failed",
+            Self::ConfigLocked => "config_locked",
+            Self::CheckpointOutcomeRecorded => "checkpoint_outcome_recorded",
         }
     }
 }
@@ -218,6 +252,14 @@ const EVENT_KIND_VALID: &[&str] = &[
     "proposal_reviewed",
     "proposal_applied",
     "proposal_withdrawn",
+    "channel_poll_started",
+    "channel_poll_succeeded",
+    "channel_poll_failed",
+    "channel_backoff_armed",
+    "channel_backoff_reset",
+    "channel_heartbeat_persist_failed",
+    "config_locked",
+    "checkpoint_outcome_recorded",
 ];
 
 impl core::str::FromStr for EventKind {
@@ -251,6 +293,14 @@ impl core::str::FromStr for EventKind {
             "proposal_reviewed" => Ok(Self::ProposalReviewed),
             "proposal_applied" => Ok(Self::ProposalApplied),
             "proposal_withdrawn" => Ok(Self::ProposalWithdrawn),
+            "channel_poll_started" => Ok(Self::ChannelPollStarted),
+            "channel_poll_succeeded" => Ok(Self::ChannelPollSucceeded),
+            "channel_poll_failed" => Ok(Self::ChannelPollFailed),
+            "channel_backoff_armed" => Ok(Self::ChannelBackoffArmed),
+            "channel_backoff_reset" => Ok(Self::ChannelBackoffReset),
+            "channel_heartbeat_persist_failed" => Ok(Self::ChannelHeartbeatPersistFailed),
+            "config_locked" => Ok(Self::ConfigLocked),
+            "checkpoint_outcome_recorded" => Ok(Self::CheckpointOutcomeRecorded),
             other => Err(crate::error::UnknownVariant::new(
                 "event_kind",
                 other,
