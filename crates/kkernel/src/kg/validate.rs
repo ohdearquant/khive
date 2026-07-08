@@ -723,7 +723,12 @@ fn check_referential_integrity(
 // ── Configurable rule loader ──────────────────────────────────────────────────
 
 /// A single configurable lint rule loaded from `rules.toml`.
+///
+/// `deny_unknown_fields`: a misspelled key (e.g. `severtiy`) must fail the
+/// load loudly, never silently fall back to the field's default (High-2,
+/// codex re-review 4e11ee38 — the repo standard here is fail-closed config).
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RuleConfig {
     id: String,
     #[serde(default = "default_severity")]
@@ -741,6 +746,7 @@ fn default_severity() -> String {
 
 /// Top-level structure of a `rules.toml` file.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RulesFile {
     #[serde(default)]
     rules: Vec<RuleConfig>,
@@ -780,6 +786,7 @@ fn default_severity_error() -> String {
 /// Checks that every edge's `(source kind, relation, target kind)` triple
 /// satisfies the canonical endpoint contract — see [`check_edge_endpoint_types`].
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct EdgeEndpointTypesConfig {
     #[serde(default = "default_enabled")]
     enabled: bool,
@@ -791,7 +798,14 @@ struct EdgeEndpointTypesConfig {
 /// specific relation. An edge matching the reversed pattern (target's kind in
 /// `forward_source_kinds`, source's kind in `forward_target_kinds`) but not
 /// the forward pattern is flagged as likely-inverted.
+///
+/// Post-parse validated by [`validate_direction_rule_config`]: `relation`
+/// must name a real [`EdgeRelation`], and both kind lists must be non-empty —
+/// a misspelled field name (e.g. `forward_source_kind`) must fail the whole
+/// `rules.toml` load, not silently produce an empty-list entry that
+/// [`check_edge_direction_conventions`] then skips as a no-op (High-2).
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct DirectionRuleConfig {
     relation: String,
     #[serde(default)]
@@ -802,6 +816,7 @@ struct DirectionRuleConfig {
 
 /// Config for the `edge-direction-conventions` rule class (rule 2).
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct EdgeDirectionConventionsConfig {
     #[serde(default = "default_enabled")]
     enabled: bool,
@@ -813,6 +828,7 @@ struct EdgeDirectionConventionsConfig {
 
 /// Config for the `dangling-refs` rule class (rule 3).
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct DanglingRefsConfig {
     #[serde(default = "default_enabled")]
     enabled: bool,
@@ -823,6 +839,7 @@ struct DanglingRefsConfig {
 /// Per-entity-kind override of the naming-convention defaults.
 /// `None` fields fall back to the top-level [`NamingConventionsConfig`] value.
 #[derive(Debug, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 struct NamingConventionsOverride {
     max_length: Option<usize>,
     no_leading_trailing_whitespace: Option<bool>,
@@ -835,6 +852,7 @@ fn default_max_length() -> usize {
 
 /// Config for the `naming-conventions` rule class (rule 4).
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct NamingConventionsConfig {
     #[serde(default = "default_enabled")]
     enabled: bool,
@@ -862,6 +880,7 @@ fn default_date_lint_fields() -> Vec<String> {
 
 /// Config for the `citation-date-lint` rule class (rule 5).
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct CitationDateLintConfig {
     #[serde(default = "default_enabled")]
     enabled: bool,
@@ -903,6 +922,47 @@ fn validate_severity(rule_id: &str, s: &str) -> Option<RuleResult> {
     }
 }
 
+/// Post-parse validation for `[[edge_direction_conventions.relations]]`
+/// entries (High-2): each entry's `relation` must name a real [`EdgeRelation`]
+/// and both `forward_source_kinds`/`forward_target_kinds` must be non-empty.
+///
+/// `#[serde(default)]` on both kind-list fields means TOML deserialization
+/// alone cannot distinguish "field present but misspelled" (e.g.
+/// `forward_source_kind`, missing the trailing `s`) from "field
+/// intentionally omitted" — both parse to an empty `Vec`. Without this check,
+/// [`check_edge_direction_conventions`] silently treats a malformed entry as
+/// a no-op (it explicitly `continue`s past any entry with an empty kind
+/// list), so a typo disables the check instead of failing the load. Erring
+/// on the strict side: entries with genuinely empty kind lists are also
+/// rejected here rather than allowed as an intentional "always no-op" entry,
+/// since a `rules.toml` author has no other way to say "this entry means
+/// nothing" than to omit it entirely (`relations` itself defaults to `[]`).
+fn validate_direction_rule_entries(relations: &[DirectionRuleConfig]) -> Result<()> {
+    for (idx, rule) in relations.iter().enumerate() {
+        if rule.relation.parse::<EdgeRelation>().is_err() {
+            bail!(
+                "edge_direction_conventions.relations[{idx}]: {:?} is not a valid edge relation",
+                rule.relation
+            );
+        }
+        if rule.forward_source_kinds.is_empty() {
+            bail!(
+                "edge_direction_conventions.relations[{idx}] ({:?}): \
+                 forward_source_kinds must be non-empty",
+                rule.relation
+            );
+        }
+        if rule.forward_target_kinds.is_empty() {
+            bail!(
+                "edge_direction_conventions.relations[{idx}] ({:?}): \
+                 forward_target_kinds must be non-empty",
+                rule.relation
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Load and evaluate configurable rules from a TOML rules file.
 pub(super) fn configurable_rule_checks(
     entities_path: &Path,
@@ -931,6 +991,11 @@ pub(super) fn configurable_rule_checks(
 
     let rules_file: RulesFile = toml::from_str(&content)
         .with_context(|| format!("parse rules TOML {}", rules_path.display()))?;
+
+    if let Some(cfg) = &rules_file.edge_direction_conventions {
+        validate_direction_rule_entries(&cfg.relations)
+            .with_context(|| format!("validate rules TOML {}", rules_path.display()))?;
+    }
 
     let mut results = Vec::with_capacity(rules_file.rules.len());
     for rule in &rules_file.rules {
@@ -1139,7 +1204,32 @@ struct KindInfo {
 /// Entity records win the `"entity"` substrate, note records the `"note"`
 /// substrate; a duplicate UUID across both files (already reported by
 /// `no-duplicate-uuids`) resolves to whichever file is scanned last.
-fn collect_kind_map(entities_path: &Path, notes_path: &Path) -> HashMap<String, KindInfo> {
+///
+/// Known edge IDs (from `edges.ndjson`, via [`collect_edge_ids`] — the same
+/// set `referential-integrity`/`dangling-refs` already trust) are also
+/// entered, as substrate `"edge"`, but only when the ID is not already an
+/// entity or note. This closes the edge-substrate endpoint bypass: without
+/// it, an edge ID used as an endpoint resolved to "unknown" and was skipped
+/// by [`check_edge_endpoint_types`] entirely (deferred to
+/// `dangling-refs`/`referential-integrity`, which only check *existence*,
+/// not substrate legality) — so `concept -[annotates]-> <edge_id>` or any
+/// non-`annotates` relation naming an edge endpoint passed offline even
+/// though the live `link`/`update` verbs reject both
+/// (`khive-runtime::operations::validate_edge_relation_endpoints`:
+/// `annotates` requires a note *source* but accepts any substrate as
+/// *target*; every other relation, including `supersedes`/`supports`/
+/// `refutes`, rejects an edge endpoint outright). `endpoint_matches` never
+/// matches substrate `"edge"` against any `EndpointKind` variant (it only
+/// matches `"entity"`/`"note"`), so a resolved edge endpoint still correctly
+/// fails every pack/base rule lookup for non-`annotates` relations — the
+/// dispatch in [`check_edge_endpoint_types`] only needs one explicit
+/// substrate check for the `supersedes`/`supports`/`refutes` family, added
+/// alongside this map change.
+fn collect_kind_map(
+    entities_path: &Path,
+    notes_path: &Path,
+    edges_path: &Path,
+) -> HashMap<String, KindInfo> {
     let mut map = HashMap::new();
     if let Ok(content) = std::fs::read_to_string(entities_path) {
         for line in content.lines().filter(|l| !l.trim().is_empty()) {
@@ -1181,6 +1271,13 @@ fn collect_kind_map(entities_path: &Path, notes_path: &Path) -> HashMap<String, 
                 }
             }
         }
+    }
+    for id in collect_edge_ids(edges_path) {
+        map.entry(id).or_insert(KindInfo {
+            substrate: "edge",
+            kind: "edge".to_string(),
+            entity_type: None,
+        });
     }
     map
 }
@@ -1238,7 +1335,7 @@ fn check_edge_endpoint_types(
     pack_rules: &[EdgeEndpointRule],
     cfg: &EdgeEndpointTypesConfig,
 ) -> RuleResult {
-    let kind_map = collect_kind_map(entities_path, notes_path);
+    let kind_map = collect_kind_map(entities_path, notes_path, edges_path);
     let sev = severity_static(&cfg.severity);
     let mut violations = Vec::new();
 
@@ -1266,12 +1363,20 @@ fn check_edge_endpoint_types(
             };
 
             let allowed = if relation == EdgeRelation::Annotates {
+                // Runtime parity (operations.rs:1226): source must be a note;
+                // target may be ANY substrate, including an edge.
                 src.substrate == "note"
             } else if matches!(
                 relation,
                 EdgeRelation::Supersedes | EdgeRelation::Supports | EdgeRelation::Refutes
             ) {
-                if src.substrate != tgt.substrate {
+                // Runtime parity (operations.rs:1289-1333): an edge endpoint on
+                // either side is rejected outright for this relation family
+                // (folded into the substrate-mismatch branch below, since
+                // `"edge" != "edge"` is false but `"edge"` must still never
+                // reach the entity/note arms), regardless of the other
+                // endpoint's substrate.
+                if src.substrate != tgt.substrate || src.substrate == "edge" {
                     false
                 } else if src.substrate == "entity" {
                     base_entity_rule_allows(&src.kind, relation, &tgt.kind)
@@ -1334,7 +1439,7 @@ fn check_edge_direction_conventions(
     edges_path: &Path,
     cfg: &EdgeDirectionConventionsConfig,
 ) -> RuleResult {
-    let kind_map = collect_kind_map(entities_path, notes_path);
+    let kind_map = collect_kind_map(entities_path, notes_path, edges_path);
     let sev = severity_static(&cfg.severity);
     let mut violations = Vec::new();
 
@@ -2865,6 +2970,145 @@ message = "bad"
         );
     }
 
+    #[test]
+    fn edge_endpoint_types_rejects_entity_annotates_edge_endpoint() {
+        // Regression for the edge-substrate endpoint bypass (codex re-review
+        // of 4e11ee38, High-1): a `concept -[annotates]-> <edge_id>` edge must
+        // fail — `annotates` requires a NOTE source (operations.rs:1226-1236),
+        // and an entity source is invalid regardless of what the target is.
+        let tmp = TempDir::new().unwrap();
+        let kg_dir = make_kg_dir(&tmp);
+        write_entities(
+            &kg_dir,
+            &[
+                ("aaaaaaaa-0000-0000-0000-000000000001", "concept", "A"),
+                ("bbbbbbbb-0000-0000-0000-000000000002", "concept", "B"),
+                ("cccccccc-0000-0000-0000-000000000003", "concept", "C"),
+            ],
+        );
+        std::fs::write(
+            kg_dir.join("edges.ndjson"),
+            [
+                // The referenced edge — gives us a known edge_id to target.
+                r#"{"edge_id":"edge-0000-0000-0000-000000000099","source_id":"aaaaaaaa-0000-0000-0000-000000000001","target_id":"bbbbbbbb-0000-0000-0000-000000000002","relation":"extends"}"#,
+                // concept -[annotates]-> <edge_id>: must be rejected.
+                r#"{"source_id":"cccccccc-0000-0000-0000-000000000003","target_id":"edge-0000-0000-0000-000000000099","relation":"annotates"}"#,
+            ]
+            .join("\n")
+                + "\n",
+        )
+        .unwrap();
+        let cfg = EdgeEndpointTypesConfig {
+            enabled: true,
+            severity: "error".into(),
+        };
+        let result = check_edge_endpoint_types(
+            &kg_dir.join("entities.ndjson"),
+            &kg_dir.join("notes.ndjson"),
+            &kg_dir.join("edges.ndjson"),
+            &[],
+            &cfg,
+        );
+        assert!(
+            !result.passed,
+            "entity -[annotates]-> edge must fail (annotates source must be a note)"
+        );
+        assert_eq!(result.violations.len(), 1);
+    }
+
+    #[test]
+    fn edge_endpoint_types_rejects_edge_as_endpoint_of_extends() {
+        // Regression for the edge-substrate endpoint bypass (High-1): a
+        // non-`annotates` relation naming a known edge ID as an endpoint must
+        // fail — every relation other than `annotates` requires entity
+        // endpoints (operations.rs:1355-1402); an edge endpoint is invalid
+        // regardless of pack `EDGE_RULES` (`endpoint_matches` never matches
+        // substrate `"edge"`).
+        let tmp = TempDir::new().unwrap();
+        let kg_dir = make_kg_dir(&tmp);
+        write_entities(
+            &kg_dir,
+            &[
+                ("aaaaaaaa-0000-0000-0000-000000000001", "concept", "A"),
+                ("bbbbbbbb-0000-0000-0000-000000000002", "concept", "B"),
+                ("cccccccc-0000-0000-0000-000000000003", "concept", "C"),
+            ],
+        );
+        std::fs::write(
+            kg_dir.join("edges.ndjson"),
+            [
+                r#"{"edge_id":"edge-0000-0000-0000-000000000099","source_id":"aaaaaaaa-0000-0000-0000-000000000001","target_id":"bbbbbbbb-0000-0000-0000-000000000002","relation":"extends"}"#,
+                // <edge_id> -[extends]-> concept: must be rejected.
+                r#"{"source_id":"edge-0000-0000-0000-000000000099","target_id":"cccccccc-0000-0000-0000-000000000003","relation":"extends"}"#,
+            ]
+            .join("\n")
+                + "\n",
+        )
+        .unwrap();
+        let cfg = EdgeEndpointTypesConfig {
+            enabled: true,
+            severity: "error".into(),
+        };
+        let result = check_edge_endpoint_types(
+            &kg_dir.join("entities.ndjson"),
+            &kg_dir.join("notes.ndjson"),
+            &kg_dir.join("edges.ndjson"),
+            &[],
+            &cfg,
+        );
+        assert!(
+            !result.passed,
+            "edge -[extends]-> entity must fail (extends requires entity endpoints)"
+        );
+        assert_eq!(result.violations.len(), 1);
+    }
+
+    #[test]
+    fn edge_endpoint_types_accepts_note_annotates_edge_endpoint() {
+        // Runtime parity (operations.rs:1249-1254): `annotates` target may be
+        // ANY substrate, including an edge — only the SOURCE must be a note.
+        let tmp = TempDir::new().unwrap();
+        let kg_dir = make_kg_dir(&tmp);
+        write_entities(
+            &kg_dir,
+            &[
+                ("aaaaaaaa-0000-0000-0000-000000000001", "concept", "A"),
+                ("bbbbbbbb-0000-0000-0000-000000000002", "concept", "B"),
+            ],
+        );
+        write_notes(
+            &kg_dir,
+            &[("note0001-0000-0000-0000-000000000001", "observation")],
+        );
+        std::fs::write(
+            kg_dir.join("edges.ndjson"),
+            [
+                r#"{"edge_id":"edge-0000-0000-0000-000000000099","source_id":"aaaaaaaa-0000-0000-0000-000000000001","target_id":"bbbbbbbb-0000-0000-0000-000000000002","relation":"extends"}"#,
+                // note -[annotates]-> <edge_id>: must pass.
+                r#"{"source_id":"note0001-0000-0000-0000-000000000001","target_id":"edge-0000-0000-0000-000000000099","relation":"annotates"}"#,
+            ]
+            .join("\n")
+                + "\n",
+        )
+        .unwrap();
+        let cfg = EdgeEndpointTypesConfig {
+            enabled: true,
+            severity: "error".into(),
+        };
+        let result = check_edge_endpoint_types(
+            &kg_dir.join("entities.ndjson"),
+            &kg_dir.join("notes.ndjson"),
+            &kg_dir.join("edges.ndjson"),
+            &[],
+            &cfg,
+        );
+        assert!(
+            result.passed,
+            "note -[annotates]-> edge must pass: {:?}",
+            result.violations
+        );
+    }
+
     // ── edge-direction-conventions ─────────────────────────────────────────────
 
     fn direction_cfg(severity: &str) -> EdgeDirectionConventionsConfig {
@@ -3374,5 +3618,109 @@ message = "bad"
         assert!(results[0].violations[0]
             .message
             .contains("invalid severity"));
+    }
+
+    #[test]
+    fn configurable_rule_checks_misspelled_key_fails_the_load() {
+        // Regression for High-2 (codex re-review of 4e11ee38): before
+        // `#[serde(deny_unknown_fields)]`, a typo like `severtiy` was silently
+        // ignored and the field fell back to its default — the class then ran
+        // at the DEFAULT severity instead of failing loudly. Now the whole
+        // `rules.toml` load must error.
+        let tmp = TempDir::new().unwrap();
+        let kg_dir = make_kg_dir(&tmp);
+        write_entities(
+            &kg_dir,
+            &[("aaaaaaaa-0000-0000-0000-000000000001", "concept", " Bad ")],
+        );
+        std::fs::write(kg_dir.join("edges.ndjson"), "").unwrap();
+        let rules_path = tmp.path().join("rules.toml");
+        std::fs::write(&rules_path, "[naming_conventions]\nsevertiy = \"error\"\n").unwrap();
+
+        let err = configurable_rule_checks(
+            &kg_dir.join("entities.ndjson"),
+            &kg_dir.join("edges.ndjson"),
+            &kg_dir.join("notes.ndjson"),
+            &rules_path,
+        )
+        .expect_err("a misspelled key must fail the rules.toml load, not silently default");
+        assert!(
+            format!("{err:#}").contains("severtiy") || format!("{err:#}").contains("unknown field"),
+            "error must name the bad key: {err:#}"
+        );
+    }
+
+    #[test]
+    fn configurable_rule_checks_malformed_direction_entry_fails_the_load() {
+        // Regression for High-2: `forward_source_kind` (missing the trailing
+        // `s`) is not a field `DirectionRuleConfig` recognizes. Before this
+        // fix it silently parsed as an unrelated no-op (an entry with an
+        // empty `forward_source_kinds` that `check_edge_direction_conventions`
+        // skips), producing a green validation for a config that names no
+        // real direction rule at all.
+        let tmp = TempDir::new().unwrap();
+        let kg_dir = make_kg_dir(&tmp);
+        write_entities(
+            &kg_dir,
+            &[("aaaaaaaa-0000-0000-0000-000000000001", "concept", "A")],
+        );
+        std::fs::write(kg_dir.join("edges.ndjson"), "").unwrap();
+        let rules_path = tmp.path().join("rules.toml");
+        std::fs::write(
+            &rules_path,
+            "[[edge_direction_conventions.relations]]\n\
+             relation = \"introduced_by\"\n\
+             forward_source_kind = [\"concept\"]\n\
+             forward_target_kinds = [\"document\"]\n",
+        )
+        .unwrap();
+
+        let err = configurable_rule_checks(
+            &kg_dir.join("entities.ndjson"),
+            &kg_dir.join("edges.ndjson"),
+            &kg_dir.join("notes.ndjson"),
+            &rules_path,
+        )
+        .expect_err("a misspelled direction-entry field must fail the rules.toml load");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("forward_source_kind") || msg.contains("unknown field"),
+            "error must name the bad key: {msg}"
+        );
+    }
+
+    #[test]
+    fn configurable_rule_checks_direction_entry_with_empty_kind_list_fails_the_load() {
+        // Post-parse validation (High-2): a syntactically valid but
+        // semantically empty `forward_source_kinds = []` must also fail the
+        // load loudly, not silently no-op the whole entry.
+        let tmp = TempDir::new().unwrap();
+        let kg_dir = make_kg_dir(&tmp);
+        write_entities(
+            &kg_dir,
+            &[("aaaaaaaa-0000-0000-0000-000000000001", "concept", "A")],
+        );
+        std::fs::write(kg_dir.join("edges.ndjson"), "").unwrap();
+        let rules_path = tmp.path().join("rules.toml");
+        std::fs::write(
+            &rules_path,
+            "[[edge_direction_conventions.relations]]\n\
+             relation = \"introduced_by\"\n\
+             forward_source_kinds = []\n\
+             forward_target_kinds = [\"document\"]\n",
+        )
+        .unwrap();
+
+        let err = configurable_rule_checks(
+            &kg_dir.join("entities.ndjson"),
+            &kg_dir.join("edges.ndjson"),
+            &kg_dir.join("notes.ndjson"),
+            &rules_path,
+        )
+        .expect_err("an empty forward_source_kinds entry must fail the rules.toml load");
+        assert!(
+            format!("{err:#}").contains("forward_source_kinds"),
+            "error must name the empty field: {err:#}"
+        );
     }
 }
