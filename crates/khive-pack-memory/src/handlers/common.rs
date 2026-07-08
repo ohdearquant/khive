@@ -123,8 +123,8 @@ pub(super) fn parse_fusion_strategy_str(s: &str) -> Result<FusionStrategy, Runti
 }
 
 /// Resolve the serving profile via ADR-035 tiers 1-2 only (explicit config,
-/// then namespace-bound `brain.resolve(consumer_kind="recall")`). Shared by
-/// `memory.feedback` (which falls through to its own tier-3 global-prior
+/// then actor+namespace-bound `brain.resolve(consumer_kind="recall")`). Shared
+/// by `memory.feedback` (which falls through to its own tier-3 global-prior
 /// behavior on `None`) and `memory.recall`'s ADR-081 §5 serve-time stamp
 /// (which simply omits the stamp on `None`) — extracted so the two resolution
 /// paths cannot drift apart.
@@ -137,8 +137,12 @@ pub(super) async fn resolve_serving_profile(
         return Some(profile_id.clone());
     }
     let ns = token.namespace().as_str().to_string();
+    // #697: thread the caller's actor identity through so actor-scoped
+    // bindings match, not just namespace-scoped ones.
+    let actor = token.actor().id.as_str();
     khive_brain_core::resolve_consumer_profile(
         registry,
+        Some(actor),
         &ns,
         khive_brain_core::ConsumerKind::Recall,
     )

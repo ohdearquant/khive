@@ -396,9 +396,14 @@ impl KnowledgePack {
         // Use "knowledge_compose" (not "recall") — the knowledge pack's compose-ranking
         // feedback has its own consumer_kind bucket (ADR-058 amendment, #542) so it no
         // longer shares posteriors with the memory pack's recall bucket.
+        //
+        // actor=None: this path does not thread the caller's actor identity through
+        // (unlike the memory pack's recall path, fixed by #697), so actor-scoped
+        // knowledge_compose bindings cannot match here yet — only namespace/wildcard
+        // bindings do. Tracked as a known gap, not fixed by #697 (out of that issue's scope).
         if let Some(ref tid) = target_id_str {
             if let Some(profile_id) =
-                resolve_consumer_profile(registry, &ns, ConsumerKind::KnowledgeCompose).await
+                resolve_consumer_profile(registry, None, &ns, ConsumerKind::KnowledgeCompose).await
             {
                 let brain_params = json!({
                     "namespace": ns,
@@ -457,8 +462,10 @@ impl KnowledgePack {
         }
 
         // Tier 2: namespace-bound profile via brain.resolve(consumer_kind="knowledge_compose").
+        // actor=None: see the identical note in record_feedback above — this read-side
+        // resolution shares the same not-yet-actor-aware seam, tracked as a known gap.
         if let Some(profile_id) =
-            resolve_consumer_profile(registry, &ns, ConsumerKind::KnowledgeCompose).await
+            resolve_consumer_profile(registry, None, &ns, ConsumerKind::KnowledgeCompose).await
         {
             if let Some(weights) = load_profile_type_weights(registry, &profile_id).await {
                 return weights;

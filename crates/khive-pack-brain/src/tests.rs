@@ -2136,6 +2136,262 @@ async fn r2_user_profile_feedback_routes_to_profile_state() {
     );
 }
 
+// ── #697: feedback-path tier-2 binding resolution ─────────────────────────
+
+/// Build a runtime whose minted tokens carry a configured actor identity
+/// (rather than `ActorRef::anonymous()`), so actor-scoped bindings can match.
+fn make_pack_with_actor(actor_id: &str) -> (BrainPack, KhiveRuntime) {
+    // Mirror KhiveRuntime::memory() exactly (in-memory db, NO embedding model)
+    // plus a configured actor. `..RuntimeConfig::default()` is a CI trap: the
+    // Default impl resolves embedding_model to a real on-disk model, which is
+    // absent on CI runners and fails entity creation with ModelInitialization.
+    let rt = KhiveRuntime::new(khive_runtime::RuntimeConfig {
+        db_path: None,
+        default_namespace: Namespace::local(),
+        embedding_model: None,
+        additional_embedding_models: vec![],
+        gate: std::sync::Arc::new(khive_runtime::AllowAllGate),
+        packs: vec!["kg".to_string()],
+        backend_id: khive_runtime::BackendId::main(),
+        brain_profile: None,
+        visible_namespaces: vec![],
+        allowed_outbound_namespaces: vec![],
+        actor_id: Some(actor_id.to_string()),
+    })
+    .expect("in-memory runtime with actor");
+    let pack = BrainPack::new(rt.clone());
+    (pack, rt)
+}
+
+/// #697 (a): feedback without an explicit `served_by_profile_id` but with a
+/// matching actor binding must attribute to the bound profile — not
+/// balanced-recall-v1 — and must leave the default profile's posteriors untouched.
+#[tokio::test]
+async fn feedback_697_unattributed_resolves_via_actor_binding() {
+    let (pack, rt) = make_pack_with_actor("leo");
+    let registry = empty_registry();
+    let token = rt.authorize(Namespace::local()).unwrap();
+    assert_eq!(
+        token.actor().id,
+        "leo",
+        "test setup: token must carry the configured actor"
+    );
+
+    let target = create_test_entity(&rt, &token).await;
+
+    pack.dispatch(
+        "brain.create_profile",
+        json!({"name": "leo-bound-v1", "consumer_kind": "recall"}),
+        &registry,
+        &token,
+    )
+    .await
+    .unwrap();
+    pack.dispatch(
+        "brain.activate",
+        json!({"profile_id": "leo-bound-v1"}),
+        &registry,
+        &token,
+    )
+    .await
+    .unwrap();
+    // Bind by actor only (namespace left as the "*" wildcard) — a
+    // namespace-only resolution (pre-#697) can never reach this binding.
+    pack.dispatch(
+        "brain.bind",
+        json!({"actor": "leo", "profile_id": "leo-bound-v1", "consumer_kind": "recall"}),
+        &registry,
+        &token,
+    )
+    .await
+    .unwrap();
+
+    let default_before = pack
+        .dispatch(
+            "brain.profile",
+            json!({"profile_id": "balanced-recall-v1"}),
+            &registry,
+            &token,
+        )
+        .await
+        .unwrap()["total_events"]
+        .as_u64()
+        .unwrap();
+
+    // No served_by_profile_id supplied.
+    pack.dispatch(
+        "brain.feedback",
+        json!({"target_id": target, "signal": "useful"}),
+        &registry,
+        &token,
+    )
+    .await
+    .unwrap();
+
+    let bound_after = pack
+        .dispatch(
+            "brain.profile",
+            json!({"profile_id": "leo-bound-v1"}),
+            &registry,
+            &token,
+        )
+        .await
+        .unwrap()["total_events"]
+        .as_u64()
+        .unwrap();
+    assert_eq!(
+        bound_after, 1,
+        "unattributed feedback with a matching actor binding must land on the bound profile"
+    );
+
+    let default_after = pack
+        .dispatch(
+            "brain.profile",
+            json!({"profile_id": "balanced-recall-v1"}),
+            &registry,
+            &token,
+        )
+        .await
+        .unwrap()["total_events"]
+        .as_u64()
+        .unwrap();
+    assert_eq!(
+        default_after, default_before,
+        "the default profile's posteriors must be untouched when a binding resolves the event elsewhere"
+    );
+}
+
+/// #697 (b): feedback with neither an explicit profile nor any matching
+/// binding still defaults to balanced-recall-v1 — existing behavior preserved.
+#[tokio::test]
+async fn feedback_697_unattributed_no_binding_falls_back_to_default() {
+    let (pack, rt) = make_pack();
+    let registry = empty_registry();
+    let token = rt.authorize(Namespace::local()).unwrap();
+
+    let target = create_test_entity(&rt, &token).await;
+
+    let default_before = pack
+        .dispatch(
+            "brain.profile",
+            json!({"profile_id": "balanced-recall-v1"}),
+            &registry,
+            &token,
+        )
+        .await
+        .unwrap()["total_events"]
+        .as_u64()
+        .unwrap();
+
+    pack.dispatch(
+        "brain.feedback",
+        json!({"target_id": target, "signal": "useful"}),
+        &registry,
+        &token,
+    )
+    .await
+    .unwrap();
+
+    let default_after = pack
+        .dispatch(
+            "brain.profile",
+            json!({"profile_id": "balanced-recall-v1"}),
+            &registry,
+            &token,
+        )
+        .await
+        .unwrap()["total_events"]
+        .as_u64()
+        .unwrap();
+    assert_eq!(
+        default_after,
+        default_before + 1,
+        "feedback with no binding and no explicit profile must still credit balanced-recall-v1"
+    );
+}
+
+/// #697 (d): an explicit `served_by_profile_id` always wins over a matching
+/// actor binding.
+#[tokio::test]
+async fn feedback_697_explicit_profile_overrides_actor_binding() {
+    let (pack, rt) = make_pack_with_actor("leo");
+    let registry = empty_registry();
+    let token = rt.authorize(Namespace::local()).unwrap();
+
+    let target = create_test_entity(&rt, &token).await;
+
+    pack.dispatch(
+        "brain.create_profile",
+        json!({"name": "leo-bound-v2", "consumer_kind": "recall"}),
+        &registry,
+        &token,
+    )
+    .await
+    .unwrap();
+    pack.dispatch(
+        "brain.activate",
+        json!({"profile_id": "leo-bound-v2"}),
+        &registry,
+        &token,
+    )
+    .await
+    .unwrap();
+    pack.dispatch(
+        "brain.bind",
+        json!({"actor": "leo", "profile_id": "leo-bound-v2", "consumer_kind": "recall"}),
+        &registry,
+        &token,
+    )
+    .await
+    .unwrap();
+
+    // Explicit param names balanced-recall-v1 even though "leo" has a binding.
+    pack.dispatch(
+        "brain.feedback",
+        json!({
+            "target_id": target,
+            "signal": "useful",
+            "served_by_profile_id": "balanced-recall-v1",
+        }),
+        &registry,
+        &token,
+    )
+    .await
+    .unwrap();
+
+    let bound_events = pack
+        .dispatch(
+            "brain.profile",
+            json!({"profile_id": "leo-bound-v2"}),
+            &registry,
+            &token,
+        )
+        .await
+        .unwrap()["total_events"]
+        .as_u64()
+        .unwrap();
+    assert_eq!(
+        bound_events, 0,
+        "explicit served_by_profile_id must override an actor binding, not merely supplement it"
+    );
+
+    let default_events = pack
+        .dispatch(
+            "brain.profile",
+            json!({"profile_id": "balanced-recall-v1"}),
+            &registry,
+            &token,
+        )
+        .await
+        .unwrap()["total_events"]
+        .as_u64()
+        .unwrap();
+    assert_eq!(
+        default_events, 1,
+        "explicit served_by_profile_id must be honored"
+    );
+}
+
 // H4: brain.profile accepts profile_id (canonical) and id (alias).
 #[tokio::test]
 async fn w4_h4_profile_accepts_profile_id_and_id_alias() {
