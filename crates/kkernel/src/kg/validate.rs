@@ -986,6 +986,40 @@ pub(super) fn configurable_rule_checks(
     notes_path: &Path,
     rules_path: &Path,
 ) -> Result<Vec<RuleResult>> {
+    configurable_rule_checks_impl(entities_path, edges_path, notes_path, rules_path, false)
+}
+
+/// Same as [`configurable_rule_checks`], but for callers evaluating rules
+/// against a *partial* view of the graph (e.g. `kg commit`'s projection of a
+/// single staged change-set, not the full dataset). The built-in
+/// `dangling-refs` evaluator's *finding* is meaningless over a partial view
+/// (every cross-change-set reference looks "dangling"), so its actual check
+/// is skipped here. Its configuration is still validated: a malformed
+/// `[dangling_refs] severity = "..."` still produces an error-severity
+/// `RuleResult` (same as the full-dataset path), and any generic `[[rules]]`
+/// entry — even one that happens to share the id `"dangling-refs"` — is
+/// still evaluated and returned. Skipping is done by *not invoking* the
+/// built-in evaluator, never by filtering results after the fact by id: a
+/// post-hoc `id == "dangling-refs"` filter would also swallow the malformed-
+/// config error result and any same-id generic rule, silently letting
+/// error-severity findings through (see ADR-102 D2; the commit-time rule
+/// pass must never suppress a real error to make a partial-view check quiet).
+pub(super) fn configurable_rule_checks_partial_view(
+    entities_path: &Path,
+    edges_path: &Path,
+    notes_path: &Path,
+    rules_path: &Path,
+) -> Result<Vec<RuleResult>> {
+    configurable_rule_checks_impl(entities_path, edges_path, notes_path, rules_path, true)
+}
+
+fn configurable_rule_checks_impl(
+    entities_path: &Path,
+    edges_path: &Path,
+    notes_path: &Path,
+    rules_path: &Path,
+    skip_dangling_refs_partial_view_finding: bool,
+) -> Result<Vec<RuleResult>> {
     let ext = rules_path
         .extension()
         .and_then(|e| e.to_str())
@@ -1100,8 +1134,10 @@ pub(super) fn configurable_rule_checks(
     if let Some(cfg) = &rules_file.dangling_refs {
         if cfg.enabled {
             if let Some(err_result) = validate_severity("dangling-refs", &cfg.severity) {
+                // Malformed config is always an error, full-dataset or
+                // partial-view alike — never skipped.
                 results.push(err_result);
-            } else {
+            } else if !skip_dangling_refs_partial_view_finding {
                 results.push(check_dangling_refs(
                     entities_path,
                     notes_path,

@@ -351,6 +351,16 @@ producer/reviewer has, or can obtain, full graph context) instead of re-run here
 `edge_endpoint_types`/`edge_direction_conventions` need no such exclusion: both already skip any
 edge whose endpoint fails to resolve within the given NDJSON dataset, so restricting them to this
 change-set's own `create` ops degrades gracefully rather than false-flagging.
+`referential-integrity` is always-on and unaffected (it never runs over `link` ops here — only
+`no-duplicate-uuids`/`valid-entity-kinds`/`valid-note-kinds` are always-on at commit time; see
+`run_commit_time_rules`). The `dangling-refs` exclusion is implemented by never invoking the
+built-in dangling-ref evaluator in the first place (`validate::configurable_rule_checks_partial_view`)
+— **not** by filtering the returned findings by id after the fact. A post-hoc `id ==
+"dangling-refs"` filter would also swallow a malformed `[dangling_refs] severity = "..."`
+config-validation error (which is always real, partial-view or not) and any generic `[[rules]]`
+entry a rules author happens to name `"dangling-refs"`, silently letting error-severity findings
+through. Both are checked-in regressions (`kg_commit_refuses_malformed_dangling_refs_severity`,
+`kg_commit_refuses_generic_rule_named_dangling_refs` in `kg_commit_tier2.rs`).
 
 **Why `update`/`delete`/`merge` ops are not re-projected**: they patch or remove records that
 already exist outside this change-set, so `kg commit` has no fresh kind/name/relation data to

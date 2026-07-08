@@ -198,11 +198,20 @@ fn project_changeset(changeset: &ChangeSet) -> ProjectedNdjson {
                 }
                 match &create.target {
                     CreateTarget::Entity(fields) => {
+                        // Project every `EntityCreateFields` field the rule
+                        // pass can read: `entity_type` (pack `EDGE_RULES` /
+                        // `edge-endpoint-types`, via `collect_kind_map`) and
+                        // `description` (generic `[[rules]] require_field`)
+                        // are both consulted by `kg validate`'s rule classes,
+                        // not just `id`/`kind`/`name`/`properties`/`tags` —
+                        // see codex round-1 review H1 (khive#kg-commit-tier2).
                         let rec = serde_json::json!({
                             "id": id_str,
                             "kind": serde_json::to_value(fields.entity_kind)
                                 .expect("EntityKind serializes"),
+                            "entity_type": fields.entity_type,
                             "name": fields.name,
+                            "description": fields.description,
                             "properties": serde_json::to_value(&fields.properties)
                                 .expect("properties serialize"),
                             "tags": fields.tags,
@@ -211,12 +220,20 @@ fn project_changeset(changeset: &ChangeSet) -> ProjectedNdjson {
                         entities.push('\n');
                     }
                     CreateTarget::Note(fields) => {
+                        // Project every `NoteCreateFields` field the rule
+                        // pass can read (generic `[[rules]]` can
+                        // `require_field`/condition on any top-level field,
+                        // not just `kind`/`properties`/`tags`) — see codex
+                        // round-1 review H1.
                         let rec = serde_json::json!({
                             "id": id_str,
                             "kind": fields.note_kind,
+                            "content": fields.content,
                             "properties": serde_json::to_value(&fields.properties)
                                 .expect("properties serialize"),
                             "tags": fields.tags,
+                            "salience": fields.salience,
+                            "decay_factor": fields.decay_factor,
                         });
                         notes.push_str(&serde_json::to_string(&rec).expect("json line"));
                         notes.push('\n');
@@ -274,11 +291,15 @@ fn check_no_duplicate_stage_ids(duplicate_ids: &[String]) -> RuleResult {
 
 /// Run the commit-time rule subset against `changeset`, using `rules_path`
 /// for the configurable rule classes. See the module doc comment for exactly
-/// which classes run and why `dangling-refs` is filtered out of the
-/// `configurable_rule_checks` result rather than never invoked — invoking it
-/// is a plain NDJSON read (no DB, no topology hazard); its *result* is simply
-/// not meaningful against a partial change-set view, so it is excluded from
-/// the pass/fail decision and never displayed as a real finding.
+/// which classes run and why the built-in `dangling-refs` *finding* is not
+/// meaningful against a partial change-set view. That exclusion is done by
+/// calling `validate::configurable_rule_checks_partial_view`, which never
+/// invokes the built-in dangling-ref evaluator — it is NOT a post-hoc filter
+/// over the returned `RuleResult`s by public id. A post-hoc `id ==
+/// "dangling-refs"` filter would also swallow the malformed-config error
+/// result `validate_severity` emits under that same id, and any generic
+/// `[[rules]]` entry a rules author happens to name `"dangling-refs"` — both
+/// of which must still fail the commit (codex round-1 review H2).
 fn run_commit_time_rules(changeset: &ChangeSet, rules_path: &Path) -> Result<Vec<RuleResult>> {
     let projected = project_changeset(changeset);
 
@@ -299,14 +320,14 @@ fn run_commit_time_rules(changeset: &ChangeSet, rules_path: &Path) -> Result<Vec
     ];
 
     if rules_path.exists() {
-        let configurable = validate::configurable_rule_checks(
+        let configurable = validate::configurable_rule_checks_partial_view(
             &entities_path,
             &edges_path,
             &notes_path,
             rules_path,
         )
         .context("evaluating configurable rules")?;
-        results.extend(configurable.into_iter().filter(|r| r.id != "dangling-refs"));
+        results.extend(configurable);
     }
 
     Ok(results)

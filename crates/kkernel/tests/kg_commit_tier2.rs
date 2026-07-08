@@ -98,6 +98,58 @@ fn invalid_note_kind_op(id: &str) -> String {
     .to_string()
 }
 
+/// A `create` op for a `concept` entity carrying `entity_type` (the field
+/// H1's fix now projects into `entities.ndjson`).
+fn typed_concept_create_op(id: &str, name: &str, entity_type: &str) -> String {
+    serde_json::json!({
+        "op": "create",
+        "id": id,
+        "namespace": "local",
+        "target": {
+            "kind": "entity",
+            "entity_kind": "concept",
+            "entity_type": entity_type,
+            "name": name,
+            "properties": {},
+            "tags": [],
+        },
+    })
+    .to_string()
+}
+
+/// A `create` op for a `concept` entity carrying `description` (the other
+/// field H1's fix now projects into `entities.ndjson`).
+fn described_concept_create_op(id: &str, name: &str, description: &str) -> String {
+    serde_json::json!({
+        "op": "create",
+        "id": id,
+        "namespace": "local",
+        "target": {
+            "kind": "entity",
+            "entity_kind": "concept",
+            "name": name,
+            "description": description,
+            "properties": {},
+            "tags": [],
+        },
+    })
+    .to_string()
+}
+
+fn link_op(id: &str, source: &str, target: &str, relation: &str) -> String {
+    serde_json::json!({
+        "op": "link",
+        "id": id,
+        "namespace": "local",
+        "source": source,
+        "target": target,
+        "relation": relation,
+        "weight": 1.0,
+        "properties": {},
+    })
+    .to_string()
+}
+
 #[test]
 fn kg_commit_lands_a_clean_changeset_with_provenance_trailers() {
     let repo = TempDir::new().expect("repo tmp");
@@ -309,5 +361,253 @@ fn kg_commit_fails_loud_on_malformed_changeset() {
     assert!(
         !output.status.success(),
         "malformed change-set must fail loud"
+    );
+}
+
+// ── Codex round-1 review regressions (H1: projection fidelity) ─────────────
+
+/// H1(a): a formal typed endpoint (`concept/theorem -[depends_on]->
+/// concept/definition`) is a pack-allowed pairing
+/// (`khive-pack-formal::vocab::FORMAL_EDGE_RULES`), but only if
+/// `project_changeset` actually carries `entity_type` into the projected
+/// `entities.ndjson` the `edge-endpoint-types` rule reads. Before the H1 fix
+/// both endpoints projected as plain `concept` with no `entity_type`, so the
+/// pack rule never matched and this change-set was wrongly rejected.
+#[test]
+fn kg_commit_lands_formal_typed_endpoint_with_edge_endpoint_types_enabled() {
+    let repo = TempDir::new().expect("repo tmp");
+    init_repo(repo.path());
+    let stage = TempDir::new().expect("stage tmp");
+
+    let theorem_id = "dddddddd-dddd-dddd-dddd-dddddddddddd";
+    let definition_id = "eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee";
+    let changeset = write_changeset(
+        stage.path(),
+        "batch.ndjson",
+        &[
+            typed_concept_create_op(theorem_id, "Pythagorean theorem", "theorem"),
+            typed_concept_create_op(definition_id, "Right triangle", "definition"),
+            link_op(
+                "ffffffff-ffff-ffff-ffff-ffffffffffff",
+                theorem_id,
+                definition_id,
+                "depends_on",
+            ),
+        ],
+    );
+    let rules = stage.path().join("rules.toml");
+    std::fs::write(
+        &rules,
+        "[edge_endpoint_types]\nenabled = true\nseverity = \"error\"\n",
+    )
+    .expect("write rules.toml");
+
+    let output = Command::new(kkernel_bin())
+        .args([
+            "kg",
+            "commit",
+            changeset.to_str().unwrap(),
+            "--rules",
+            rules.to_str().unwrap(),
+            "--repo",
+            repo.path().to_str().unwrap(),
+            "--format",
+            "json",
+            "-m",
+            "formal typed endpoint",
+        ])
+        .output()
+        .expect("run kkernel kg commit");
+
+    assert!(
+        output.status.success(),
+        "theorem -[depends_on]-> definition is a pack-allowed endpoint pairing \
+         and must commit; stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// H1(b): a generic `[[rules]] require_field = "description"` rule must see
+/// the `description` a create op actually carries. Before the H1 fix
+/// `project_changeset` dropped `description` entirely, so this rule always
+/// reported it missing.
+#[test]
+fn kg_commit_lands_changeset_with_description_satisfying_require_field_rule() {
+    let repo = TempDir::new().expect("repo tmp");
+    init_repo(repo.path());
+    let stage = TempDir::new().expect("stage tmp");
+
+    let changeset = write_changeset(
+        stage.path(),
+        "batch.ndjson",
+        &[described_concept_create_op(
+            "11112222-3333-4444-5555-666677778888",
+            "Gamma",
+            "a concept with a real description",
+        )],
+    );
+    let rules = stage.path().join("rules.toml");
+    std::fs::write(
+        &rules,
+        "[[rules]]\nid = \"require-description\"\nseverity = \"error\"\nkind = \"entity\"\nrequire_field = \"description\"\nmessage = \"missing description: {id}\"\n",
+    )
+    .expect("write rules.toml");
+
+    let output = Command::new(kkernel_bin())
+        .args([
+            "kg",
+            "commit",
+            changeset.to_str().unwrap(),
+            "--rules",
+            rules.to_str().unwrap(),
+            "--repo",
+            repo.path().to_str().unwrap(),
+            "--format",
+            "json",
+            "-m",
+            "described concept",
+        ])
+        .output()
+        .expect("run kkernel kg commit");
+
+    assert!(
+        output.status.success(),
+        "a create op carrying description must satisfy require_field=\"description\"; \
+         stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+// ── Codex round-1 review regressions (H2: dangling-refs suppression) ───────
+
+/// H2(a): a malformed `[dangling_refs] severity = "catastrophic"` must still
+/// produce an error-severity config-validation finding and refuse the
+/// commit, even though the built-in dangling-ref evaluator itself is never
+/// invoked at commit time. Before the H2 fix, `commit.rs` filtered every
+/// result with `id == "dangling-refs"` out of the pass/fail decision — which
+/// also silently dropped this config-error result — and the commit landed.
+#[test]
+fn kg_commit_refuses_malformed_dangling_refs_severity() {
+    let repo = TempDir::new().expect("repo tmp");
+    init_repo(repo.path());
+    let stage = TempDir::new().expect("stage tmp");
+
+    let changeset = write_changeset(
+        stage.path(),
+        "batch.ndjson",
+        &[clean_create_op(
+            "99990000-1111-2222-3333-444455556666",
+            "Delta",
+        )],
+    );
+    let rules = stage.path().join("rules.toml");
+    std::fs::write(
+        &rules,
+        "[dangling_refs]\nenabled = true\nseverity = \"catastrophic\"\n",
+    )
+    .expect("write rules.toml");
+
+    let output = Command::new(kkernel_bin())
+        .args([
+            "kg",
+            "commit",
+            changeset.to_str().unwrap(),
+            "--rules",
+            rules.to_str().unwrap(),
+            "--repo",
+            repo.path().to_str().unwrap(),
+            "--format",
+            "json",
+            "-m",
+            "should not land",
+        ])
+        .output()
+        .expect("run kkernel kg commit");
+
+    assert!(
+        !output.status.success(),
+        "malformed dangling_refs severity must be an error-severity config \
+         finding and refuse the commit; stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let log_output = Command::new("git")
+        .args(["log", "--oneline"])
+        .current_dir(repo.path())
+        .output()
+        .expect("git log");
+    let log = String::from_utf8_lossy(&log_output.stdout);
+    assert_eq!(
+        log.lines().count(),
+        1,
+        "only the init commit may exist after a refused commit: {log}"
+    );
+}
+
+/// H2(b): a generic `[[rules]]` entry that happens to be named
+/// `id = "dangling-refs"` must still be evaluated and enforced. Before the
+/// H2 fix, `commit.rs`'s post-hoc `id == "dangling-refs"` filter dropped
+/// this result regardless of where it came from, letting an error-severity
+/// `require_field` violation through.
+#[test]
+fn kg_commit_refuses_generic_rule_named_dangling_refs() {
+    let repo = TempDir::new().expect("repo tmp");
+    init_repo(repo.path());
+    let stage = TempDir::new().expect("stage tmp");
+
+    // No `description` field on this create op, so the rule below fails.
+    let changeset = write_changeset(
+        stage.path(),
+        "batch.ndjson",
+        &[clean_create_op(
+            "77778888-9999-0000-1111-222233334444",
+            "Epsilon",
+        )],
+    );
+    let rules = stage.path().join("rules.toml");
+    std::fs::write(
+        &rules,
+        "[[rules]]\nid = \"dangling-refs\"\nseverity = \"error\"\nkind = \"entity\"\nrequire_field = \"description\"\nmessage = \"missing description: {id}\"\n",
+    )
+    .expect("write rules.toml");
+
+    let output = Command::new(kkernel_bin())
+        .args([
+            "kg",
+            "commit",
+            changeset.to_str().unwrap(),
+            "--rules",
+            rules.to_str().unwrap(),
+            "--repo",
+            repo.path().to_str().unwrap(),
+            "--format",
+            "json",
+            "-m",
+            "should not land",
+        ])
+        .output()
+        .expect("run kkernel kg commit");
+
+    assert!(
+        !output.status.success(),
+        "a generic rule named \"dangling-refs\" must still be enforced; \
+         stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let log_output = Command::new("git")
+        .args(["log", "--oneline"])
+        .current_dir(repo.path())
+        .output()
+        .expect("git log");
+    let log = String::from_utf8_lossy(&log_output.stdout);
+    assert_eq!(
+        log.lines().count(),
+        1,
+        "only the init commit may exist after a refused commit: {log}"
     );
 }
