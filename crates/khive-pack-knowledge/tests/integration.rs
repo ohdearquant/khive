@@ -279,6 +279,46 @@ async fn cite_creates_introduced_by_edge() {
 }
 
 #[tokio::test]
+async fn cite_accepts_org_source() {
+    let f = pack(rt());
+
+    let concept = f
+        .dispatch(
+            "knowledge.learn",
+            json!({ "name": "Hopper Architecture", "domain": "hardware" }),
+        )
+        .await
+        .expect("learn concept");
+
+    // Base allowlist (ADR-002 2026-07-08 amendment): concept -[introduced_by]-> org.
+    let org = f
+        .dispatch(
+            "create",
+            json!({
+                "kind": "org",
+                "name": "Example Hardware Vendor",
+                "description": "Org entity originating an architecture concept — covering concepts techniques algorithms implementations applications use cases and design patterns in detail"
+            }),
+        )
+        .await
+        .expect("create org");
+
+    let concept_id = concept["full_id"].as_str().unwrap();
+    let source_id = org["id"].as_str().unwrap();
+
+    let resp = f
+        .dispatch(
+            "knowledge.cite",
+            json!({ "concept_id": concept_id, "source_id": source_id }),
+        )
+        .await
+        .expect("cite org source ok");
+
+    assert_eq!(resp["relation"], "introduced_by");
+    assert_eq!(resp["source_id"], source_id);
+}
+
+#[tokio::test]
 async fn cite_rejects_unknown_id() {
     let f = pack(rt());
     let err = f

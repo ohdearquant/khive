@@ -395,14 +395,15 @@ distinct dependency types:
 **Runtime inference defaults**: if `dependency_kind` is omitted, the runtime infers from
 endpoint kinds:
 
-| Endpoint pair        | Default `dependency_kind` |
-| -------------------- | ------------------------- |
-| `Project → Project`  | `build`                   |
-| `Service → Service`  | `runtime`                 |
-| `Service → Dataset`  | `data`                    |
-| `Service → Artifact` | `artifact`                |
-| `Artifact → Project` | `tooling`                 |
-| `Artifact → Service` | `tooling`                 |
+| Endpoint pair         | Default `dependency_kind` |
+| --------------------- | ------------------------- |
+| `Project → Project`   | `build`                   |
+| `Service → Service`   | `runtime`                 |
+| `Service → Dataset`   | `data`                    |
+| `Service → Artifact`  | `artifact`                |
+| `Artifact → Project`  | `tooling`                 |
+| `Artifact → Service`  | `tooling`                 |
+| `Document → Document` | `normative`               |
 
 Unknown `dependency_kind` values are rejected. `dependency_kind` is only valid on
 `depends_on` edges.
@@ -488,9 +489,9 @@ The amendment adds three pairs to close it:
   often enough in production knowledge graphs to warrant a first-class base pair rather than a
   per-consumer workaround.
 
-Consumer verbs built over `introduced_by` may accept a narrower source set than the full base
-contract. `knowledge.cite` intentionally remains a concept-to-document/person convenience
-wrapper; edges to org sources (or document authorship edges) use `link` directly.
+Consumer verbs built over `introduced_by` follow the base contract. `knowledge.cite`
+delegates to the same runtime link validation, so a concept may be cited to a document,
+person, or org source.
 
 It also adds one pair to `depends_on`:
 

@@ -585,7 +585,7 @@ pub(crate) fn validate_edge_weight(weight: f64) -> RuntimeResult<()> {
 ///
 /// Currently enforces:
 /// - `dependency_kind` is only valid on `depends_on` edges.
-/// - `dependency_kind`, when present, must be one of the five governed values.
+/// - `dependency_kind`, when present, must be one of the governed values.
 pub(crate) fn validate_edge_metadata(
     relation: EdgeRelation,
     metadata: Option<&serde_json::Value>,
