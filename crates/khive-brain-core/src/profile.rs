@@ -107,20 +107,31 @@ pub struct ProfileBinding {
     pub created_at: DateTime<Utc>,
 }
 
-/// Resolve the effective profile for a `(namespace, consumer_kind)` pair via
-/// the brain pack's tier-2 binding table. Returns `None` unless `brain.resolve`
-/// reports `matched_binding=true` — the system-default fallback profile it
-/// returns otherwise must not be mistaken for an explicit binding, or each
-/// pack's tier-3 (global tuning prior) would become unreachable.
+/// Resolve the effective profile for an `(actor, namespace, consumer_kind)`
+/// triple via the brain pack's tier-2 binding table. Returns `None` unless
+/// `brain.resolve` reports `matched_binding=true` — the system-default
+/// fallback profile it returns otherwise must not be mistaken for an explicit
+/// binding, or each pack's tier-3 (global tuning prior) would become
+/// unreachable.
+///
+/// `actor` should be the caller's identity via `NamespaceToken::actor().binding_id()`
+/// so actor-scoped bindings can match; pass `None` for the anonymous caller or
+/// when the call site has no caller identity to thread through (wildcard
+/// `actor="*"` bindings still match in that case). Never pass the anonymous
+/// actor's raw `id` ("local") — it would let an anonymous caller match an
+/// explicit `actor="local"` binding that `None` never can.
 ///
 /// Shared by the memory pack (`ConsumerKind::Recall`) and the knowledge pack
-/// (`ConsumerKind::KnowledgeCompose`) — ADR-058 amendment, #542.
+/// (`ConsumerKind::KnowledgeCompose`) — ADR-058 amendment, #542; actor-aware
+/// resolution added by #697.
 pub async fn resolve_consumer_profile(
     registry: &khive_runtime::VerbRegistry,
+    actor: Option<&str>,
     namespace: &str,
     consumer_kind: ConsumerKind,
 ) -> Option<String> {
     let resolve_params = serde_json::json!({
+        "actor": actor,
         "namespace": namespace,
         "consumer_kind": consumer_kind.as_str(),
     });

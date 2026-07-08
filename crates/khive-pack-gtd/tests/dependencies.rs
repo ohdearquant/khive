@@ -409,6 +409,195 @@ async fn assign_rejects_malformed_context_entity_id() {
     );
 }
 
+// ---- #625/#626: gtd.assign / create(kind="note", note_kind="task") parity ----
+//
+// Both verbs now route through `task_create::prepare_task_create` and
+// `task_create::link_depends_on_edges` (see hook.rs and handlers.rs). These
+// tests prove the unification didn't just compile — the two paths must
+// persist the same normalized properties and produce the same depends_on /
+// annotates graph edges for the same logical input.
+
+#[tokio::test]
+async fn assign_and_create_task_are_equivalent_for_dependencies_and_context() {
+    let rt = rt();
+    let pack = pack(rt);
+
+    let blocker = assign(&pack, json!({"title": "blocker"})).await;
+    let blocker_id = blocker["full_id"].as_str().unwrap().to_string();
+
+    let context = pack
+        .dispatch("create", json!({"kind": "concept", "name": "Context"}))
+        .await
+        .unwrap();
+    let context_id = context["id"].as_str().unwrap().to_string();
+
+    let assigned = pack
+        .dispatch(
+            "gtd.assign",
+            json!({
+                "title": "via assign",
+                "description": "body",
+                "status": "next",
+                "priority": "p1",
+                "depends_on": [blocker_id.clone()],
+                "context_entity_id": context_id.clone(),
+                "tags": ["shared"]
+            }),
+        )
+        .await
+        .unwrap();
+
+    let created = pack
+        .dispatch(
+            "create",
+            json!({
+                "kind": "note",
+                "note_kind": "task",
+                "title": "via create",
+                "description": "body",
+                "status": "next",
+                "priority": "p1",
+                "depends_on": [blocker_id.clone()],
+                "context_entity_id": context_id.clone(),
+                "tags": ["shared"]
+            }),
+        )
+        .await
+        .unwrap();
+
+    let assigned_id = assigned["full_id"].as_str().unwrap().to_string();
+    let created_id = created["id"].as_str().unwrap().to_string();
+
+    for task in [&assigned, &created] {
+        assert_eq!(task["properties"]["status"].as_str(), Some("next"));
+        assert_eq!(task["properties"]["priority"].as_str(), Some("p1"));
+        assert_eq!(
+            task["properties"]["depends_on"][0].as_str(),
+            Some(blocker_id.as_str())
+        );
+        assert_eq!(
+            task["properties"]["context_entity_id"].as_str(),
+            Some(context_id.as_str())
+        );
+        assert_eq!(task["properties"]["tags"], serde_json::json!(["shared"]));
+    }
+
+    for task_id in [assigned_id, created_id] {
+        let deps = pack
+            .dispatch(
+                "neighbors",
+                json!({"id": task_id, "direction": "out", "relations": ["depends_on"]}),
+            )
+            .await
+            .expect("neighbors(depends_on) must succeed");
+        assert!(
+            deps.as_array()
+                .unwrap()
+                .iter()
+                .any(|n| n.to_string().contains(blocker_id.as_str())),
+            "task {task_id} must have a depends_on edge to the blocker; got {deps:?}"
+        );
+
+        let annotations = pack
+            .dispatch(
+                "neighbors",
+                json!({"id": task_id, "direction": "out", "relations": ["annotates"]}),
+            )
+            .await
+            .expect("neighbors(annotates) must succeed");
+        assert!(
+            annotations
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|n| n.to_string().contains(context_id.as_str())),
+            "task {task_id} must have an annotates edge to the context entity; got {annotations:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn create_task_merges_explicit_annotates_with_context_entity_id() {
+    let rt = rt();
+    let pack = pack(rt);
+
+    let explicit = pack
+        .dispatch("create", json!({"kind": "concept", "name": "Explicit"}))
+        .await
+        .unwrap();
+    let explicit_id = explicit["id"].as_str().unwrap().to_string();
+
+    let context = pack
+        .dispatch("create", json!({"kind": "concept", "name": "Context"}))
+        .await
+        .unwrap();
+    let context_id = context["id"].as_str().unwrap().to_string();
+
+    let created = pack
+        .dispatch(
+            "create",
+            json!({
+                "kind": "note",
+                "note_kind": "task",
+                "title": "both annotates",
+                "annotates": [explicit_id.clone()],
+                "context_entity_id": context_id.clone(),
+            }),
+        )
+        .await
+        .unwrap();
+    let task_id = created["id"].as_str().unwrap().to_string();
+
+    let annotations = pack
+        .dispatch(
+            "neighbors",
+            json!({"id": task_id, "direction": "out", "relations": ["annotates"]}),
+        )
+        .await
+        .expect("neighbors(annotates) must succeed");
+    let annotations = annotations.as_array().unwrap();
+    assert!(
+        annotations
+            .iter()
+            .any(|n| n.to_string().contains(explicit_id.as_str())),
+        "task must keep the explicit annotates edge; got {annotations:?}"
+    );
+    assert!(
+        annotations
+            .iter()
+            .any(|n| n.to_string().contains(context_id.as_str())),
+        "task must also have the context_entity_id annotates edge; got {annotations:?}"
+    );
+}
+
+#[tokio::test]
+async fn assign_and_create_task_reject_malformed_context_entity_id() {
+    let pack = pack(rt());
+
+    let assign_err = pack
+        .dispatch(
+            "gtd.assign",
+            json!({"title": "bad", "context_entity_id": "not-a-uuid"}),
+        )
+        .await
+        .unwrap_err();
+    assert!(assign_err.to_string().contains("context_entity_id"));
+
+    let create_err = pack
+        .dispatch(
+            "create",
+            json!({
+                "kind": "note",
+                "note_kind": "task",
+                "title": "bad",
+                "context_entity_id": "not-a-uuid"
+            }),
+        )
+        .await
+        .unwrap_err();
+    assert!(create_err.to_string().contains("context_entity_id"));
+}
+
 // ---- Finding 1 regression: generic create must normalize nested properties ----
 
 #[tokio::test]

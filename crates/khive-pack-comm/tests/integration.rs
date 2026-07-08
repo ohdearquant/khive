@@ -40,12 +40,12 @@ fn comm_pack_declares_message_note_kind() {
 }
 
 #[test]
-fn comm_pack_declares_eight_handlers() {
+fn comm_pack_declares_nine_handlers() {
     assert_eq!(
         CommPack::HANDLERS.len(),
-        8,
-        "comm pack must declare 8 handlers: send, inbox, read, reply, thread, ingest, \
-         heartbeat, health"
+        9,
+        "comm pack must declare 9 handlers: send, inbox, read, reply, thread, ingest, \
+         heartbeat, health, probe"
     );
     let names: Vec<&str> = CommPack::HANDLERS.iter().map(|h| h.name).collect();
     assert!(names.contains(&"comm.send"));
@@ -63,6 +63,10 @@ fn comm_pack_declares_eight_handlers() {
     assert!(
         names.contains(&"comm.heartbeat"),
         "comm.heartbeat verb must be registered (khive #606)"
+    );
+    assert!(
+        names.contains(&"comm.probe"),
+        "comm.probe verb must be registered"
     );
     assert!(
         names.contains(&"comm.health"),

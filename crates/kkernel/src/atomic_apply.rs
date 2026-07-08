@@ -116,8 +116,15 @@ pub(crate) async fn execute_atomic_ops_file(
         );
     }
 
+    // Guard cold construction (migrations) the same way every other local
+    // `kkernel exec` path does — see `crate::exec::acquire_local_construction_guard`.
+    // Dropped right after `KhiveRuntime::new` returns rather than held for the
+    // whole atomic run: the race this closes is cold-boot schema init, not the
+    // prepare/commit passes below.
+    let boot_guard = crate::exec::acquire_local_construction_guard(&cfg)?;
     let namespace = cfg.default_namespace.clone();
     let runtime = KhiveRuntime::new(cfg).context("build in-process runtime for --atomic")?;
+    drop(boot_guard);
     let token = runtime
         .authorize(namespace)
         .context("authorize namespace for --atomic")?;

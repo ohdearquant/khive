@@ -34,7 +34,7 @@ pub(crate) static COMM_SCHEMA_PLAN_STMTS: [&str; 3] = [
         WHERE deleted_at IS NULL",
 ];
 
-pub(crate) static COMM_HANDLERS: [HandlerDef; 8] = [
+pub(crate) static COMM_HANDLERS: [HandlerDef; 9] = [
     HandlerDef {
         name: "comm.send",
         description: "Send a message, optionally threaded.",
@@ -300,5 +300,31 @@ pub(crate) static COMM_HANDLERS: [HandlerDef; 8] = [
         visibility: Visibility::Verb,
         category: khive_types::VerbCategory::Assertive,
         params: &[],
+    },
+    HandlerDef {
+        name: "comm.probe",
+        description: "Read-only poll for new inbound message metadata and stale unread count.",
+        visibility: Visibility::Verb,
+        category: khive_types::VerbCategory::Assertive,
+        params: &[
+            ParamDef {
+                name: "actor",
+                param_type: "string",
+                required: true,
+                description: "Actor label whose inbound queue is probed, e.g. \"lambda:leo\".",
+            },
+            ParamDef {
+                name: "since_us",
+                param_type: "integer",
+                required: false,
+                description: "Cursor in Unix microseconds; only messages with created_at > since_us are returned.",
+            },
+            ParamDef {
+                name: "stale_minutes",
+                param_type: "integer",
+                required: false,
+                description: "Unread age threshold in minutes. Default 20.",
+            },
+        ],
     },
 ];

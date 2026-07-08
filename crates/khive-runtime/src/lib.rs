@@ -2,6 +2,7 @@
 //!
 //! Wraps `StorageBackend` and query compilation into a single Rust API surface.
 
+pub mod actor_identity;
 pub mod atomic_plan;
 pub mod atomic_prepare;
 pub mod atomic_runner;
@@ -26,6 +27,7 @@ pub mod runtime;
 pub mod secret_gate;
 pub mod validation;
 
+pub use actor_identity::{actor_is_unattributed, resolve_actor, should_warn_unattributed_actor};
 pub use atomic_plan::{
     AffectedRowGuard, DeletePlan, GovernanceOp, GovernancePlan, GtdCompletePlan, GtdTransitionPlan,
     LinkPlan, MergePlan, PlanPredicate, PlanStatement, PostCommitEffect, UpdatePlan,
@@ -47,7 +49,7 @@ pub use embedder_registry::{EmbedderProvider, EmbedderRegistry, LatticeEmbedderP
 pub use engine_config::{
     config_from_env, BackendConfig, BackendKind, ConfigError, EngineConfig, KhiveConfig, PackConfig,
 };
-pub use error::{RuntimeError, RuntimeResult};
+pub use error::{fts_text_leg_or_err, RuntimeError, RuntimeResult};
 pub use fusion::FusionStrategy;
 pub use graph_traversal::PathNode;
 pub use khive_db::{
@@ -77,7 +79,7 @@ pub use operations::{
 };
 pub use pack::{
     resolve_explicit_namespace, DispatchHook, HandlerDef, KindHook, NoteKindSpec,
-    NoteLifecycleSpec, PackByIdResolver, PackFactory, PackLoadError, PackRegistration,
+    NoteLifecycleSpec, PackByIdResolver, PackFactory, PackInstall, PackLoadError, PackRegistration,
     PackRegistry, PackRuntime, PackSchemaCollisionError, PackSchemaPlan, ParamDef, RequestIdentity,
     SchemaPlan, VerbCategory, VerbPresentationPolicy, VerbRegistry, VerbRegistryBuilder,
     Visibility,

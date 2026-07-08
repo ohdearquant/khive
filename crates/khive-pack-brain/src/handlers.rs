@@ -21,8 +21,8 @@ use khive_brain_core::derive_deterministic_weights;
 #[cfg(feature = "lattice-router")]
 use khive_brain_core::BetaPosterior;
 use khive_brain_core::{
-    FeedbackEventKind, ProfileBinding, ProfileLifecycle, ProfileRecord, SectionPosteriorState,
-    SectionType, DEFAULT_ESS_CAP,
+    ConsumerKind, FeedbackEventKind, ProfileBinding, ProfileLifecycle, ProfileRecord,
+    SectionPosteriorState, SectionType, DEFAULT_ESS_CAP,
 };
 
 // ── Adapter revision sentinel ─────────────────────────────────────────────────
@@ -969,6 +969,35 @@ impl BrainPack {
         .await
     }
 
+    /// Resolve the effective serving profile for feedback attribution
+    /// (ADR-035 tiers 1-2, #697): explicit `served_by_profile_id` wins outright;
+    /// otherwise resolve an actor+namespace-scoped binding via the same
+    /// `resolve_with_match` table `brain.resolve` uses, before falling back to
+    /// the system default. `brain.auto_feedback` forwards into `handle_feedback`
+    /// unresolved so it inherits this without duplicating the logic.
+    ///
+    /// Consumer kind is fixed to `recall`: feedback routed directly through
+    /// `brain.feedback`/`brain.auto_feedback` (as opposed to `memory.feedback`,
+    /// which resolves its own tier and passes an explicit profile) always
+    /// originates from the recall serve loop, so it must resolve against the
+    /// same binding bucket the serve path used.
+    fn resolve_effective_feedback_profile(
+        &self,
+        token: &NamespaceToken,
+        explicit: Option<&str>,
+    ) -> String {
+        if let Some(profile_id) = explicit {
+            return profile_id.to_string();
+        }
+        let actor = token.actor().binding_id();
+        let namespace = token.namespace().as_str();
+        let state = self.state.lock().unwrap();
+        match state.resolve_with_match(actor, Some(namespace), ConsumerKind::Recall.as_str()) {
+            Some((record, _matched_kind, true)) => record.id.clone(),
+            _ => "balanced-recall-v1".to_string(),
+        }
+    }
+
     // ── brain.feedback ────────────────────────────────────────────────────
 
     pub(crate) async fn handle_feedback(
@@ -1046,12 +1075,12 @@ impl BrainPack {
             }
         }
 
-        // Compute the effective serving profile (explicit or default), then validate
-        // that it exists in the registry and is not Archived.
-        let effective_profile = p
-            .served_by_profile_id
-            .as_deref()
-            .unwrap_or("balanced-recall-v1");
+        // Compute the effective serving profile (explicit, else a matching
+        // actor+namespace binding, else the system default — #697), then
+        // validate that it exists in the registry and is not Archived.
+        let effective_profile =
+            self.resolve_effective_feedback_profile(token, p.served_by_profile_id.as_deref());
+        let effective_profile = effective_profile.as_str();
         {
             let state = self.state.lock().unwrap();
             match state.profiles.get(effective_profile) {
@@ -1267,11 +1296,7 @@ impl BrainPack {
             event
         };
 
-        let serving_profile_owned = p
-            .served_by_profile_id
-            .as_deref()
-            .unwrap_or("balanced-recall-v1")
-            .to_string();
+        let serving_profile_owned = effective_profile.to_string();
 
         let brain_signal = interpret(&event);
 

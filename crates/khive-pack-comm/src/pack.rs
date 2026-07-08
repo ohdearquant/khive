@@ -93,6 +93,7 @@ impl PackRuntime for CommPack {
             "comm.ingest" => handlers::handle_ingest(self.runtime(), token, params).await,
             "comm.heartbeat" => handlers::handle_heartbeat(self.runtime(), token, params).await,
             "comm.health" => handlers::handle_health(self.runtime(), token, params).await,
+            "comm.probe" => handlers::handle_probe(self.runtime(), token, params).await,
             _ => Err(RuntimeError::InvalidInput(format!(
                 "comm pack does not handle verb {verb:?}"
             ))),

@@ -20,11 +20,10 @@ use uuid::Uuid;
 
 use khive_runtime::{micros_to_iso, KhiveRuntime, NamespaceToken, Resolved, RuntimeError};
 use khive_storage::types::{SqlStatement, SqlValue};
-use khive_storage::EdgeRelation;
 
 use crate::schema::{
     allowed_transitions, can_transition, is_actionable, is_terminal, is_valid_priority,
-    is_valid_status, normalize_status, priority_to_salience, TASK_LIFECYCLE_HELP,
+    is_valid_status, normalize_status, TASK_LIFECYCLE_HELP,
 };
 use crate::GtdPack;
 
@@ -291,7 +290,11 @@ pub async fn resolve_uuid(
 /// Validate `context_entity_id`: must be a full UUID that resolves to a KG entity.
 /// Rejects short prefixes intentionally — prefix resolution would silently canonicalize
 /// a field meant to preserve an explicit, stable KG entity ID.
-async fn resolve_context_entity_id(
+///
+/// `pub(crate)` so `task_create::prepare_task_create` (#625/#626 unification)
+/// can share this resolver between `gtd.assign` and the generic
+/// `create(kind="note", note_kind="task")` path.
+pub(crate) async fn resolve_context_entity_id(
     raw: &str,
     runtime: &KhiveRuntime,
     token: &NamespaceToken,
@@ -712,144 +715,39 @@ impl GtdPack {
         params: Value,
     ) -> Result<Value, RuntimeError> {
         let p: AssignParams = deser(params)?;
-        if p.title.trim().is_empty() {
-            return Err(RuntimeError::InvalidInput("title must not be empty".into()));
-        }
 
-        let status_in = p.status.as_deref().unwrap_or("inbox");
-        let status = normalize_status(status_in);
-        if !is_valid_status(status) {
-            return Err(RuntimeError::InvalidInput(format!(
-                "invalid status {status_in:?} — valid: inbox, next, waiting, someday, active, done, cancelled \
-                 (aliases: in_progress, todo, blocked, later, finished)"
-            )));
-        }
-        if is_terminal(status) {
-            return Err(RuntimeError::InvalidInput(format!(
-                "cannot create task in terminal state {status:?}; \
-                 use one of: inbox, next, waiting, someday, active"
-            )));
-        }
-        if let Some(ref pri) = p.priority {
-            if !is_valid_priority(pri) {
-                return Err(RuntimeError::InvalidInput(format!(
-                    "invalid priority {pri:?} — valid: p0, p1, p2, p3"
-                )));
-            }
-        }
-
-        let salience = p
-            .priority
-            .as_deref()
-            .map(priority_to_salience)
-            .unwrap_or(0.5);
-
-        // Resolve dependency IDs up front so we can both store them in properties
-        // and create graph edges referencing the same UUIDs.
-        let mut resolved_deps: Vec<Uuid> = Vec::new();
-        if let Some(ref deps) = p.depends_on {
-            for raw in deps {
-                resolved_deps.push(resolve_uuid(raw, self.runtime(), token).await?);
-            }
-        }
-
-        // Pre-validate each dependency target before any storage write. The GTD
-        // pack edge rule only allows `depends_on` between two task notes — if a
-        // caller passes a non-task UUID, fail upfront so we don't leave an orphaned
-        // task row whose post-write `link` is rejected (after_create is
-        // non-propagating, so propagating a link failure here would diverge `assign`
-        // from `create(note_kind="task")` and violate the "no failure after
-        // successful write" rule).
-        for dep_uuid in &resolved_deps {
-            // Mutation rule: depends_on targets must be in the PRIMARY namespace.
-            // A visible-only (foreign) task is NotFound here — callers must own both
-            // sides of a dependency edge. NotFound (not Forbidden) per ADR-007:215-219.
-            match self.runtime().resolve_primary(token, *dep_uuid).await? {
-                Some(Resolved::Note(n)) if n.kind == "task" => {}
-                Some(Resolved::Note(n)) => {
-                    return Err(RuntimeError::InvalidInput(format!(
-                        "depends_on target {dep_uuid} must be a task note for relation depends_on \
-                         (got note kind {:?}); the GTD pack edge rule is task→task only",
-                        n.kind
-                    )));
-                }
-                Some(_) => {
-                    return Err(RuntimeError::InvalidInput(format!(
-                        "depends_on target {dep_uuid} must be a task note for relation depends_on \
-                         (got non-note substrate); the GTD pack edge rule is task→task only"
-                    )));
-                }
-                None => {
-                    return Err(RuntimeError::NotFound(format!(
-                        "depends_on target {dep_uuid} not found in namespace"
-                    )));
-                }
-            }
-        }
-
-        let context_entity_uuid = match p.context_entity_id.as_deref() {
-            Some(raw) => Some(resolve_context_entity_id(raw, self.runtime(), token).await?),
-            None => None,
+        // #625/#626: `gtd.assign` and the generic `create(kind="note",
+        // note_kind="task")` path (`TaskHook`, see hook.rs) share one
+        // normalization/validation routine so status/priority checks,
+        // dependency-target resolution, and context-entity handling can't
+        // drift between the two entry points again.
+        let input = crate::task_create::TaskCreateInput {
+            title: p.title,
+            description: p.description,
+            assignee: p.assignee,
+            priority: p.priority,
+            status: p.status,
+            due: p.due,
+            start: p.start,
+            end: p.end,
+            depends_on: p.depends_on,
+            context_entity_id: p.context_entity_id,
+            tags: p.tags.map(|tags| json!(tags)),
+            properties: json!({}),
         };
+        let prepared =
+            crate::task_create::prepare_task_create(self.runtime(), token, input).await?;
 
-        // Always persist priority (defaults to "p2") so listing filters can
-        // match defaulted tasks via `properties.priority`. The render layer
-        // already shows "p2" for unset priority, so making it explicit on
-        // disk keeps render / sort / filter aligned.
-        let priority = p
-            .priority
-            .as_deref()
-            .map(str::to_ascii_lowercase)
-            .unwrap_or_else(|| "p2".to_string());
-
-        let mut props = json!({
-            "status": status.to_string(),
-            "priority": priority,
-        });
-        if let Some(ref desc) = p.description {
-            props["description"] = json!(desc);
-        }
-        if let Some(ref assignee) = p.assignee {
-            props["assignee"] = json!(assignee);
-        }
-        if let Some(ref due) = p.due {
-            props["due"] = json!(parse_due(due)?);
-        }
-        if let Some(ref start) = p.start {
-            props["start"] = json!(start);
-        }
-        if let Some(ref end) = p.end {
-            props["end"] = json!(end);
-        }
-        if !resolved_deps.is_empty() {
-            let dep_strs: Vec<String> = resolved_deps
-                .iter()
-                .map(|u| u.as_hyphenated().to_string())
-                .collect();
-            props["depends_on"] = json!(dep_strs);
-        }
-        if let Some(uuid) = context_entity_uuid.as_ref() {
-            props["context_entity_id"] = json!(uuid.as_hyphenated().to_string());
-        }
-        if let Some(ref tags) = p.tags {
-            props["tags"] = json!(tags);
-        }
-
-        // Content body powers semantic search; title doubles as the searchable text
-        // when no description is supplied.
-        let content = p.description.clone().unwrap_or_else(|| p.title.clone());
-
-        let annotates: Vec<Uuid> = context_entity_uuid.iter().copied().collect();
         let note = self
             .runtime()
             .create_note(
                 token,
                 "task",
-                Some(p.title.as_str()),
-                &content,
-                Some(salience),
-                Some(props),
-                annotates,
+                Some(prepared.title.as_str()),
+                &prepared.content,
+                Some(prepared.salience),
+                Some(prepared.properties.clone()),
+                prepared.annotates.clone(),
             )
             .await?;
 
@@ -860,20 +758,14 @@ impl GtdPack {
         // mislead the caller with `ok: false` for a task that's already on disk.
         // The property captures the same dependency information for queries that
         // bypass the graph.
-        for dep_uuid in resolved_deps {
-            if let Err(e) = self
-                .runtime()
-                .link(token, note.id, dep_uuid, EdgeRelation::DependsOn, 1.0, None)
-                .await
-            {
-                tracing::warn!(
-                    from = %note.id,
-                    to = %dep_uuid,
-                    error = %e,
-                    "assign: depends_on edge failed after task write (non-fatal, best-effort)"
-                );
-            }
-        }
+        crate::task_create::link_depends_on_edges(
+            self.runtime(),
+            token,
+            note.id,
+            &prepared.properties,
+            "assign",
+        )
+        .await;
 
         Ok(render_task(&note))
     }

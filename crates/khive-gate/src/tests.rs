@@ -39,6 +39,25 @@ fn actor_ref_anonymous() {
 }
 
 #[test]
+fn anonymous_actor_binding_id_is_none() {
+    let a = ActorRef::anonymous();
+    assert!(a.is_anonymous());
+    assert_eq!(
+        a.binding_id(),
+        None,
+        "anonymous actor must never expose a binding_id, even though its \
+         raw id (\"local\") could otherwise match an explicit actor=\"local\" binding"
+    );
+}
+
+#[test]
+fn configured_actor_binding_id_is_its_id() {
+    let a = ActorRef::new("lambda", "leo");
+    assert!(!a.is_anonymous());
+    assert_eq!(a.binding_id(), Some("leo"));
+}
+
+#[test]
 fn decision_helpers() {
     assert!(GateDecision::allow().is_allow());
     assert!(!GateDecision::deny("nope").is_allow());
