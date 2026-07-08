@@ -74,7 +74,7 @@ link(source_id="<from>", target_id="<to>", relation="<relation>", weight=<0.4-1.
 | Structure      | `instance_of`   | specific → general     | X is a case of Y          |
 | Derivation     | `extends`       | child → parent         | Builds on, generalizes    |
 | Derivation     | `variant_of`    | variant → original     | Modified version          |
-| Derivation     | `introduced_by` | concept → paper/person | First described in        |
+| Derivation     | `introduced_by` | concept → paper/person/org | First described in    |
 | Derivation     | `supersedes`    | new → old              | Replaces entirely         |
 | Provenance     | `derived_from`  | derived → source       | Data/artifact lineage     |
 | Temporal       | `precedes`      | earlier → later        | Ordering over time        |

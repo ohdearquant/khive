@@ -89,8 +89,8 @@ request(ops="knowledge.topic(domain=\"fine-tuning\", limit=20)")
   If a concept already exists you get a duplicate. Search or topic-check before registering.
 - **Using `learn` for papers.** Papers are `document` entities. Use `learn` for algorithms
   and techniques, `create(kind="document")` for papers, then `cite` to connect them.
-- **Citing with note IDs.** The `source_id` in `cite` must be a `document` or `person`
-  entity. Notes are not valid targets for `introduced_by`.
+- **Citing with note IDs.** The `source_id` in `cite` must be a `document`, `person`, or
+  `org` entity. Notes are not valid targets for `introduced_by`.
 - **Omitting `domain` in `learn`.** Without a domain tag, the concept will not surface in
   `topic(domain="...")` filtered queries.
 - **Skipping `rerank=true` in search.** Raw RRF scores are around 0.016 and hard to

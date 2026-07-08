@@ -20,7 +20,7 @@ rerank, and composed into markdown briefings under a token budget.
   their member atoms
 - **Concept sugar over the KG** (`knowledge.learn`, `knowledge.cite`,
   `knowledge.topic`) — register a `concept` entity and link it to its introducing
-  `document`/`person` without hand-rolling `create`/`link` calls
+  `document`/`person`/`org` without hand-rolling `create`/`link` calls
 - **Section feedback** (`knowledge.feedback`) — per-section `useful`/`not_useful`/
   `wrong` signals update posterior weights, optionally forwarded to a configured
   brain profile (ADR-032)
