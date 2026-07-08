@@ -35,10 +35,11 @@ risk, and defines the rule engine that decides which path a given operation take
 Two relevant surfaces exist in the codebase today, and this ADR extends both rather than
 inventing beside them:
 
-- **`kkernel kg validate`** ([ADR-020](ADR-020-git-native-kg-implementation.md),
-  [ADR-034](ADR-034-kg-validation-pipelines.md)) already runs a configurable, TOML-driven rule
-  pass over KG data, with a severity model (`error` / `warning` / `info`) and five shipped,
-  individually enable/disable/configurable rule classes: **edge-endpoint-types** (validates each
+- **`kkernel kg validate`** already runs a configurable, TOML-driven rule pass over KG data
+  with a severity model (`error` / `warning` / `info`). [ADR-020](ADR-020-git-native-kg-implementation.md)
+  and [ADR-034](ADR-034-kg-validation-pipelines.md) define that validation surface; the shipped
+  implementation has since extended it with five individually
+  enable/disable/configurable rule classes: **edge-endpoint-types** (validates each
   edge's source/relation/target kinds against the canonical endpoint contract),
   **edge-direction-conventions** (flags likely-inverted directional edges against a configurable
   forward pattern per relation), **dangling-refs** (a configurable counterpart to the always-on
@@ -91,15 +92,17 @@ overridable per deployment:
 
 - **Tier-1 eligible**: `create`, a non-judgment `link` (any edge relation other than the ones
   named tier-2 below), or an `update` to a mutable entity field — **and** the rule pass reports
-  all rules green (no `error`-severity finding) for that operation.
+  no `error`-severity finding for that operation. `warning`- and `info`-severity findings do
+  not block tier-1; they are recorded on the change-set so a reviewer or later reader sees
+  them, but they do not gate the fast path.
 - **Tier-2 required**: a `link` carrying `supersedes`, `supports`, or `refutes` (ADR-002's
   derivation category and [ADR-055](ADR-055-epistemic-edge-relations.md)'s epistemic category —
   the judgment-bearing relations by construction), any `delete`, any `merge`, any change to an
   existing edge's relation or weight, or a `link`/edge-weight change where the resulting weight
   falls below `0.7` (ADR-002's own boundary between "strong" and "plausible or weaker"
-  evidential strength). Any operation the rule pass does **not** report fully green is also
-  tier-2, regardless of its kind — a rule violation always escalates, never silently degrades to
-  a warning that still ships tier-1.
+  evidential strength). Any operation carrying an `error`-severity finding is also tier-2,
+  regardless of its kind — an `error` always escalates to review; it is never downgraded to a
+  lower severity, suppressed, or shipped tier-1.
 
 Because the predicate lives in the rules file rather than in code, a deployment can widen or
 narrow the tier-1 set (for example, admitting more relation types to tier-1 once a producer has
@@ -114,6 +117,9 @@ Tier-2's independent review has one binding requirement: **the reviewer's model 
 differ from the producer's.** This is enforced as a **hard routing gate** — the tier-2 flow
 refuses to present a change-set for approval to a reviewer identity sharing the producer's model
 family, rather than relying on a convention or a reviewer's own judgment to self-recuse. The
+gate's input is the producer model family recorded in the change-set's envelope metadata
+([ADR-101](ADR-101-kg-changeset-model.md) D1) — an authoritative, stage-time-captured field,
+not an out-of-band convention an implementer has to invent. The
 rationale is the same one that motivates cross-family review in code review generally: a
 same-family reviewer is more likely to share the producer's blind spots and less likely to catch
 a systematic error class the producer itself cannot see. Making this a routing gate rather than
@@ -123,11 +129,16 @@ guidance means the property holds even when an operator forgets to configure it 
 
 **Op-list inversion is the primary revert mechanism.** Because every tier-2 change-set is a
 typed op-list ([ADR-101](ADR-101-kg-changeset-model.md) D1), each operation has a well-defined
-inverse (a `create`'s inverse is a `delete` of the same identifier; a `link`'s inverse removes
-that edge; an `update`'s inverse restores the prior field values captured at stage time), and
-reverting a landed change-set means applying its inverted op-list as a new, independently
-reviewed change-set. This keeps a revert auditable as its own change-set with its own
-provenance, exactly like any other tier-2 write.
+inverse: a `create`'s inverse is a `delete` of the same identifier; a `link`'s inverse removes
+that edge; an `update`'s inverse restores the prior field values captured at stage time; a
+`delete`'s or `merge`'s inverse is reconstructed from the stage-time preimage ADR-101 D1
+requires destructive operations to capture. Reverting a landed change-set means applying its
+inverted op-list as a new, independently reviewed change-set, which keeps a revert auditable
+with its own provenance, exactly like any other tier-2 write. **Inversion is defined only over
+operations whose preimage was captured**: an operation staged without one, or whose preimage
+has been invalidated by intervening writes to the same rows, cannot be surgically inverted and
+must fall back to a reviewed compensating change-set authored against current state, or to the
+git backstop below.
 
 **Git revert of the NDJSON commit is the backstop**, used when op-list inversion is unavailable
 or insufficient (for example, a revert requested long after intervening writes have touched the
@@ -234,8 +245,8 @@ Honest costs, stated rather than assumed away:
 - ADR-020 — Git-Native KG Implementation: the `kg commit` primitive this ADR restores (Amendment
   to ADR-020), and the shipped `kkernel kg validate` rule-pass surface this ADR's tier predicate
   extends.
-- ADR-034 — KG Validation Pipelines: the five shipped, configurable rule classes this ADR's tier
-  predicate reads findings from.
+- ADR-034 — KG Validation Pipelines: the configurable rule-pass surface whose shipped rule-class
+  extensions this ADR's tier predicate reads findings from.
 - ADR-037 — Remote Entity Resolution and Content-Hash Verification: the atomic
   staging-then-rename pattern reused for writing the snapshot-commit lane's export before it is
   committed.

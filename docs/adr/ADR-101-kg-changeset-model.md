@@ -53,7 +53,7 @@ conflating them would corrupt both:
   distinction between "this row is new" and "this row already existed," and no place to attach
   per-op provenance.
 - A change-set is an **op-list** — a sequence of discrete, individually-typed mutations
-  (`create`, `link`, `update`, `delete`) that have not yet been applied. Its unit of meaning is
+  (`create`, `link`, `update`, `delete`, `merge`) that have not yet been applied. Its unit of meaning is
   the operation, not the resulting state.
 
 `KgArchive` remains exactly what ADR-020 defines it as: the whole-graph import/export envelope.
@@ -67,11 +67,14 @@ or its consumers.
 ### D1 — Canonical staged artifact: a producer-agnostic typed op-list
 
 The canonical staged artifact is a **typed op-list**: an ordered sequence of operations, each
-one of `create`, `link`, `update`, or `delete`, over the same entity/edge/note vocabulary and
-edge-endpoint contract ADR-001/ADR-002/ADR-013 already define. An op-list is producer-agnostic
+one of `create`, `link`, `update`, `delete`, or `merge`, over the same entity/edge/note
+vocabulary and edge-endpoint contract ADR-001/ADR-002/ADR-013 already define — the same
+mutation surface the live request DSL (ADR-016) exposes, so nothing expressible as a live
+write is inexpressible as a staged one. An op-list is producer-agnostic
 by construction — it names no producer, encodes no producer-specific shape, and carries only
 what any consumer (a rule evaluator, a diff renderer, a live-write applier) needs: the op kind,
-its target substrate, its fields, and — for `create` and `link` — the identifier(s) involved.
+its target substrate, its fields, the identifier(s) involved, and — for `delete` and `merge` —
+the stage-time preimage described below.
 
 **Stage-time stable IDs are a hard requirement, not an optimization.** Every entity or note a
 `create` op introduces is minted a UUID at the moment the op is staged, not at the moment it is
@@ -83,6 +86,22 @@ makes cross-producer handoff possible: one producer can stage a `create`, and a 
 because the identifier already exists and is stable. An identifier minted at apply time would
 make that handoff impossible without an intermediate resolution step every consumer would have
 to reimplement.
+
+**Destructive operations capture their preimage at stage time.** A `delete` op records the
+full prior state of the record it removes, and a `merge` op records both prior entities and
+the incident edges the merge will rewire, as part of the staged operation itself. This is what
+makes op-list inversion ([ADR-102](ADR-102-tiered-validate-and-merge.md) D4) well-defined for
+destructive operations: an inverse can only restore what was captured. An operation staged
+without its preimage cannot be surgically reverted, and any revert of it must fall back to the
+coarser mechanisms ADR-102 D4 names.
+
+**Operations are producer-agnostic; the change-set envelope is attributed.** While no
+individual operation names a producer, the change-set as a whole carries a small **envelope
+metadata block**, captured at stage time, recording the producer's identity and its model
+family. The envelope exists for exactly two consumers: reviewer routing (ADR-102 D3's
+cross-family gate takes the producer's model family as its input) and commit provenance (D4
+below). No op-level consumer — rule evaluator, diff renderer, applier — reads it, so the
+op-list itself stays producer-agnostic.
 
 ### D2 — Serialization: NDJSON-delta
 
@@ -152,7 +171,7 @@ carrying a view:
 crate boundary — every function takes its input as an in-memory value and returns an in-memory
 value. Each crate must be **wasm32-compilable**, and CI carries a **wasm-parity check**: the
 same test suite run against the native target and the wasm32 target must produce byte-identical
-results, following the same template already proven for `lattice-embed`'s wasm build.
+results, and the CI job fails on any divergence between the two.
 
 **Rationale.** A view layer — a CLI renderer, a desktop review UI, a future web frontend — is
 replaceable and, at this stage of the project, is expected to be replaced more than once. The
@@ -169,8 +188,8 @@ makes the constraint enforced, not just documented.
 
 A change-set, once committed, is itself graph-shaped history: a sequence of typed operations,
 each with provenance, applied to a graph. [ADR-088](ADR-088-git-lifecycle-pack.md) already
-defines a git-lifecycle pack that ingests a git repository's own commit and issue history into
-the graph as `commit` and `issue` note kinds. The natural composition — not committed to by this
+defines a git-lifecycle pack that ingests a git repository's own commit, issue, and
+pull-request history into the graph as `commit`, `issue`, and `pull_request` note kinds. The natural composition — not committed to by this
 ADR, and explicitly out of scope for the implementation this ADR authorizes — is a loop in which
 the git-lifecycle pack ingests the KG's own change-set commits (the artifact this ADR defines)
 back into the same graph, making the graph's own change provenance queryable as graph: which
@@ -209,7 +228,7 @@ a commitment this ADR or its implementation makes.
 - ADR-002 — Closed Edge Ontology: the edge-relation vocabulary and endpoint contract a `link` op
   must satisfy.
 - ADR-013 — Note Kind Taxonomy: the note vocabulary an op-list's note-targeting ops draw from.
-- ADR-016 — Request DSL: the live op shape (`create`/`link`/`update`/`delete` verbs) this
+- ADR-016 — Request DSL: the live op shape (`create`/`link`/`update`/`delete`/`merge` verbs) this
   format's op kinds mirror.
 - ADR-020 — Git-Native KG Implementation: `KgArchive` as the retained whole-graph import/export
   envelope this ADR explicitly does not replace or extend.
