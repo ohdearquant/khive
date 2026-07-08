@@ -246,7 +246,7 @@ Creates a concept entity in the knowledge corpus.
 request(ops="knowledge.cite(concept_id=\"<concept_uuid>\", source_id=\"<paper_uuid>\")")
 ```
 
-Both must be full UUIDs. Source must be a document or person entity.
+Both must be full UUIDs. Source must be a document, person, or org entity.
 
 ### Import markdown as atoms
 

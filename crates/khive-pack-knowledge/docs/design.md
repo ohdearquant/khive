@@ -48,7 +48,7 @@
 ### ADR-002: Edge Ontology
 
 - `knowledge.cite` creates an `introduced_by` edge from a concept entity to a source entity
-  (document or person). The edge direction is concept → source.
+  (document, person, or org). The edge direction is concept → source.
 
 ### ADR-015: Schema Migration
 
