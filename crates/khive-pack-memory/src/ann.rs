@@ -48,6 +48,15 @@ pub(crate) struct AnnBridge {
 pub(crate) struct AnnState {
     indexes: RwLock<HashMap<AnnKey, AnnBridge>>,
     warming: Mutex<HashSet<AnnKey>>,
+    /// Review finding (issue #723 fix-round): per-model single-flight lock
+    /// owned by `ensure_ann_for_model` itself, the chokepoint every warm
+    /// path (boot warm, background fire-once warm, recall-miss warm) routes
+    /// through. Distinct from `warming` above, which is `ensure_ann_background`'s
+    /// own fire-once-and-forget guard against re-spawning a background task —
+    /// this map instead lets a second concurrent caller actually wait for the
+    /// in-flight attempt to finish, so only one caller ever emits the
+    /// `PhaseStarted`/`PhaseCompleted` pair for a given model.
+    model_locks: Mutex<HashMap<AnnKey, Arc<tokio::sync::Mutex<()>>>>,
     /// Counts how many times `search_loaded` returned a warm hit. Test-only;
     /// call `reset_warm_route_count()` between operations to isolate counts.
     #[cfg(test)]
@@ -60,9 +69,23 @@ pub(crate) fn new_shared() -> SharedAnn {
     Arc::new(AnnState {
         indexes: RwLock::new(HashMap::new()),
         warming: Mutex::new(HashSet::new()),
+        model_locks: Mutex::new(HashMap::new()),
         #[cfg(test)]
         warm_route_count: AtomicUsize::new(0),
     })
+}
+
+/// Fetch (creating if absent) the per-model warm single-flight lock.
+///
+/// The outer `model_locks` mutex is only held long enough to look up or
+/// insert the per-key `Arc<Mutex<()>>` — never across the warm attempt
+/// itself, so unrelated models never contend on this map.
+async fn model_warm_lock(ann: &SharedAnn, key: &AnnKey) -> Arc<tokio::sync::Mutex<()>> {
+    let mut locks = ann.model_locks.lock().await;
+    locks
+        .entry(key.clone())
+        .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+        .clone()
 }
 
 #[cfg(test)]
@@ -362,12 +385,25 @@ pub(crate) async fn warm_existing_memory_indexes(rt: &KhiveRuntime, ann: &Shared
 /// load and/or rebuild-from-scratch) as one `ann_warm` phase span, so an
 /// operator can attribute a cold-start or on-demand-warm CPU window after
 /// the fact from the `PhaseStarted`/`PhaseCompleted`/`PhaseCancelled` event
-/// trio. This is the single call site both `warm_existing_memory_indexes`
-/// (daemon-startup cold warm) and `ensure_ann_background` (fire-once
-/// recall/remember-triggered warm) route through, so instrumenting here
-/// covers both callers. Emission is best-effort and a no-op when this
-/// `KhiveRuntime` has no `EventStore` configured, matching ADR-094's
-/// existing lifecycle-event emission contract exactly.
+/// trio. This is the chokepoint every warm path converges on —
+/// `warm_existing_memory_indexes` (daemon-startup cold warm),
+/// `ensure_ann_background` (fire-once recall/remember-triggered background
+/// warm), and the recall-miss path in `handlers/common.rs` (synchronous
+/// on-demand warm) all call this function directly or indirectly.
+///
+/// Review finding (issue #723 fix-round): because three independent call
+/// sites can race for the same model (e.g. boot warm still running when a
+/// recall misses), single-flight ownership lives *here*, not in any one
+/// caller — `ensure_ann_background`'s own `warming` guard only dedups its
+/// own fire-once spawns, it says nothing about a concurrent direct caller.
+/// A second caller blocks on the per-model lock below and, once it acquires
+/// it, re-checks `indexes` — if the first caller already warmed the model,
+/// the second returns `AlreadyLoaded` immediately without repeating the
+/// snapshot/rebuild attempt or emitting a second phase-span pair.
+///
+/// Emission is best-effort and a no-op when this `KhiveRuntime` has no
+/// `EventStore` configured, matching ADR-094's existing lifecycle-event
+/// emission contract exactly.
 pub(crate) async fn ensure_ann_for_model(
     rt: &KhiveRuntime,
     token: &NamespaceToken,
@@ -377,8 +413,30 @@ pub(crate) async fn ensure_ann_for_model(
     if model.is_empty() {
         return Ok(AnnEnsureStatus::EmptyCorpus);
     }
+    let key = AnnKey::from_token(token, model);
+
+    // Fast path: no lock needed if already warm.
+    if ann.indexes.read().await.contains_key(&key) {
+        return Ok(AnnEnsureStatus::AlreadyLoaded);
+    }
+
+    let lock = model_warm_lock(ann, &key).await;
+    let _single_flight_guard = lock.lock().await;
+
+    // Re-check after acquiring the lock: a concurrent caller may have
+    // finished warming this model while we were waiting for the guard.
+    if ann.indexes.read().await.contains_key(&key) {
+        return Ok(AnnEnsureStatus::AlreadyLoaded);
+    }
 
     let phase_start = std::time::Instant::now();
+    // Review finding (issue #723 fix-round): `process_resource_usage()`
+    // returns cumulative process CPU since start, so a single post-warm read
+    // is unusable for per-phase attribution on a long-lived daemon (a warm
+    // that runs after the process has already burned minutes of CPU would
+    // report that whole cumulative total as the phase's cost). Snapshot at
+    // entry too and report end-minus-start below.
+    let cpu_start = khive_runtime::process_resource_usage();
     // Held for the lifetime of this call so `comm.health`'s resource
     // self-report (#723 ask 2) can see `ann_warm` in its active-phases list
     // while this warm/rebuild is in flight. Dropped (and the gauge
@@ -407,7 +465,7 @@ pub(crate) async fn ensure_ann_for_model(
     let result = ensure_ann_for_model_inner(rt, token, ann, model).await;
 
     let wall_us = phase_start.elapsed().as_micros() as i64;
-    let cpu_us = khive_runtime::process_resource_usage().map(|u| u.cpu_us);
+    let cpu_us = khive_runtime::cpu_delta_us(cpu_start, khive_runtime::process_resource_usage());
     match &result {
         Err(e) if is_benign_shutdown_cancellation(e) => {
             emit_ann_warm_phase_event(
@@ -1040,6 +1098,176 @@ mod tests {
             "exactly one PhaseCompleted row, got: {page:?}"
         );
         assert_eq!(cancelled, 0, "no PhaseCancelled row on a normal completion");
+    }
+
+    // Review finding (issue #723 fix-round): two concurrent callers warming
+    // the same model (mirroring boot warm racing a recall-miss warm) must
+    // not both run the snapshot/rebuild attempt and emit their own
+    // PhaseStarted/PhaseCompleted pair. Seeds real vector rows (via a
+    // deterministic hash-based embedder, same pattern as
+    // `pack.rs::ann_route_tests`) so the first caller's build actually
+    // populates `ann.indexes` — a prerequisite for the second caller's
+    // post-lock re-check to observe it and short-circuit.
+    //
+    // Fail-on-revert proof: reverting the per-model single-flight lock in
+    // `ensure_ann_for_model` back to "just call `ensure_ann_for_model_inner`
+    // unconditionally" makes both concurrent calls run the full
+    // snapshot/rebuild attempt and each emit their own PhaseStarted row,
+    // failing the `started == 1` assertion below.
+    #[tokio::test]
+    #[serial(background_tasks)]
+    async fn ensure_ann_for_model_concurrent_callers_emit_one_phase_pair() {
+        use async_trait::async_trait;
+        use khive_runtime::{EmbedderProvider, RuntimeConfig};
+        use lattice_embed::{EmbedError, EmbeddingModel, EmbeddingService};
+
+        struct HashVecService {
+            dims: usize,
+        }
+
+        fn fnv_to_vec(text: &str, dims: usize) -> Vec<f32> {
+            let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+            for b in text.bytes() {
+                h ^= b as u64;
+                h = h.wrapping_mul(0x0000_0001_0000_01b3);
+            }
+            let mut v = Vec::with_capacity(dims);
+            let mut s = h;
+            for _ in 0..dims {
+                s = s
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                v.push(((s >> 33) as f32) / (0x7fff_ffff_u32 as f32) - 1.0);
+            }
+            v
+        }
+
+        #[async_trait]
+        impl EmbeddingService for HashVecService {
+            async fn embed(
+                &self,
+                texts: &[String],
+                _model: EmbeddingModel,
+            ) -> Result<Vec<Vec<f32>>, EmbedError> {
+                Ok(texts.iter().map(|t| fnv_to_vec(t, self.dims)).collect())
+            }
+
+            fn supports_model(&self, _model: EmbeddingModel) -> bool {
+                true
+            }
+
+            fn name(&self) -> &'static str {
+                "hash-vec"
+            }
+        }
+
+        struct HashVecProvider {
+            model_name: String,
+            dims: usize,
+        }
+
+        #[async_trait]
+        impl EmbedderProvider for HashVecProvider {
+            fn name(&self) -> &str {
+                &self.model_name
+            }
+
+            fn dimensions(&self) -> usize {
+                self.dims
+            }
+
+            async fn build(&self) -> Result<Arc<dyn EmbeddingService>, RuntimeError> {
+                Ok(Arc::new(HashVecService { dims: self.dims }))
+            }
+        }
+
+        let tmp = tempfile::Builder::new()
+            .prefix("khive-memory-ann-single-flight-")
+            .tempdir_in(std::env::temp_dir())
+            .expect("temp db dir");
+        let db_path = tmp.path().join("khive-graph.db");
+
+        const MODEL: &str = "ann-warm-single-flight-test-model";
+        const DIMS: usize = 16;
+
+        let rt = KhiveRuntime::new(RuntimeConfig {
+            db_path: Some(db_path),
+            embedding_model: None,
+            additional_embedding_models: vec![],
+            ..RuntimeConfig::default()
+        })
+        .expect("runtime");
+        rt.register_embedder(HashVecProvider {
+            model_name: MODEL.to_owned(),
+            dims: DIMS,
+        });
+
+        let token = rt.authorize(Namespace::local()).expect("authorize local");
+        for i in 0..16u32 {
+            rt.create_note_with_decay_for_embedding_model(
+                &token,
+                "memory",
+                None,
+                &format!("ann single-flight note {i}"),
+                Some(0.7),
+                0.01,
+                None,
+                vec![],
+                None,
+            )
+            .await
+            .expect("create note");
+        }
+
+        let ann = new_shared();
+
+        // Two concurrent callers warming the same model, mirroring boot warm
+        // racing a recall-miss warm for the same key.
+        let (r1, r2) = tokio::join!(
+            ensure_ann_for_model(&rt, &token, &ann, MODEL),
+            ensure_ann_for_model(&rt, &token, &ann, MODEL)
+        );
+        r1.expect("first caller must succeed");
+        r2.expect("second caller must succeed");
+
+        assert!(
+            ann.indexes
+                .read()
+                .await
+                .contains_key(&AnnKey::from_token(&token, MODEL)),
+            "the model must end up warm regardless of which caller built it"
+        );
+
+        let store = rt.events(&token).expect("event store for local namespace");
+        let page = store
+            .query_events(
+                khive_storage::EventFilter::default(),
+                khive_storage::types::PageRequest {
+                    limit: 50,
+                    offset: 0,
+                },
+            )
+            .await
+            .expect("query_events");
+
+        let started = page
+            .items
+            .iter()
+            .filter(|e| e.kind == khive_types::EventKind::PhaseStarted)
+            .count();
+        let completed = page
+            .items
+            .iter()
+            .filter(|e| e.kind == khive_types::EventKind::PhaseCompleted)
+            .count();
+        assert_eq!(
+            started, 1,
+            "exactly one caller must emit PhaseStarted for the same model, got: {page:?}"
+        );
+        assert_eq!(
+            completed, 1,
+            "exactly one caller must emit PhaseCompleted for the same model, got: {page:?}"
+        );
     }
 
     // internal review PR #583 round-1 Medium (see the rationale comment on

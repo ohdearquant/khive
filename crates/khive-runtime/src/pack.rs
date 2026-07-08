@@ -1061,6 +1061,13 @@ impl VerbRegistry {
                 // created/resolved edge fields (schema v2) once dispatch
                 // resolves. Denied calls have no dispatch to wait for and keep
                 // the immediate v1 append below.
+                //
+                // Accepted trade-off: a crash between this Allow decision and
+                // the deferred append below (post-dispatch, further down this
+                // function) loses that dispatch's audit row entirely. This is
+                // deliberate, not an oversight — see ADR-103, "Stage 1
+                // clarification: audit-row write timing" for the rationale
+                // and the recorded upgrade path.
                 let defer_audit = !is_deny;
 
                 // Persist to EventStore immediately only for denied calls.
@@ -1233,12 +1240,20 @@ impl VerbRegistry {
                                 }
                             }
                             _ => {
-                                let storage_event = build_audit_storage_event(
-                                    &gate_req,
-                                    &audit,
-                                    EventOutcome::Success,
-                                )
-                                .with_duration_us(dispatch_us);
+                                // Review finding (issue #723 fix-round): the
+                                // persisted audit outcome must reflect the
+                                // dispatch result, not be hardcoded to
+                                // Success — otherwise a failed dispatch is
+                                // recorded as successful work and disappears
+                                // from `outcome=error` queries.
+                                let outcome = if result.is_ok() {
+                                    EventOutcome::Success
+                                } else {
+                                    EventOutcome::Error
+                                };
+                                let storage_event =
+                                    build_audit_storage_event(&gate_req, &audit, outcome)
+                                        .with_duration_us(dispatch_us);
                                 append_audit_event_best_effort(store, storage_event, verb).await;
                             }
                         }
@@ -1293,8 +1308,11 @@ impl VerbRegistry {
         // trail (matches the "no audit row is ever dropped" contract above).
         if let Some(audit) = deferred_audit.take() {
             if let Some(store) = &self.event_store {
+                // Review finding (issue #723 fix-round): dispatch is about to
+                // return `InvalidInput` below (no pack owns this verb), so
+                // the persisted outcome must be `Error`, not `Success`.
                 let storage_event =
-                    build_audit_storage_event(&gate_req, &audit, EventOutcome::Success);
+                    build_audit_storage_event(&gate_req, &audit, EventOutcome::Error);
                 append_audit_event_best_effort(store, storage_event, verb).await;
             }
         }
@@ -3454,6 +3472,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(page.items[0].duration_us, 0);
+        // Review finding (issue #723 fix-round): dispatch returns
+        // InvalidInput for an unknown verb, so the persisted outcome must be
+        // Error, not the previously-hardcoded Success.
+        assert_eq!(page.items[0].outcome, EventOutcome::Error);
     }
 
     #[tokio::test]
@@ -4235,10 +4257,18 @@ mod tests {
             ev.payload_schema_version, 1,
             "failed link keeps the v1 audit shape"
         );
+        // Review finding (issue #723 fix-round): the persisted outcome must
+        // reflect the dispatch result (Err → Error), not be hardcoded to
+        // Success from the gate's Allow decision.
         assert_eq!(
             ev.outcome,
-            EventOutcome::Success,
-            "outcome reflects the gate decision (Allow), not the dispatch result"
+            EventOutcome::Error,
+            "outcome reflects the dispatch result (Err), not the gate decision (Allow)"
+        );
+        assert!(
+            ev.duration_us >= 0,
+            "duration_us must still be populated (measured, not the Event::new \
+             default sentinel) on a failed dispatch"
         );
         assert!(
             ev.target_id.is_none(),

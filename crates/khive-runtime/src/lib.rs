@@ -91,7 +91,7 @@ pub use presentation::{
     apply_redundancy_drop, micros_to_iso, present, render_format, OutputFormat, PresentationMode,
 };
 pub use registry::{ObjectiveRegistry, RegisteredObjective};
-pub use resource::{process_resource_usage, ProcessResourceUsage};
+pub use resource::{cpu_delta_us, process_resource_usage, ProcessResourceUsage};
 pub use retrieval::{SearchHit, SearchSource};
 pub use runtime::{
     assert_db_anchor_consistent, parse_pack_list, resolve_db_anchor, resolve_project_actor_id,
