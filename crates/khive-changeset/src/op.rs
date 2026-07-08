@@ -151,13 +151,42 @@ impl<'de> Deserialize<'de> for LinkOp {
 
 // ---- update ---------------------------------------------------------------
 
-/// Patch an existing entity, note, or edge's mutable fields. Carries no
-/// preimage; see `README.md` for why and the known gap that leaves open.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+/// Patch an existing entity, note, or edge's mutable fields, carrying a
+/// stage-time preimage scoped to exactly the fields the patch touches.
+/// `preimage`'s populated fields must equal `patch`'s touched fields —
+/// every field the patch sets or explicitly clears to null, and no field
+/// the patch leaves unchanged — enforced at deserialize time, the same
+/// discipline `DeleteOp` and `MergeOp` apply to their own preimages below.
+/// An `UpdateOp` whose preimage and patch disagree on which fields changed
+/// is unrepresentable.
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct UpdateOp {
     pub target_id: Id128,
     pub patch: UpdatePatch,
+    pub preimage: UpdatePreimage,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UpdateOpRaw {
+    target_id: Id128,
+    patch: UpdatePatch,
+    preimage: UpdatePreimage,
+}
+
+impl<'de> Deserialize<'de> for UpdateOp {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let raw = UpdateOpRaw::deserialize(deserializer)?;
+        validate_update_congruence(&raw.patch, &raw.preimage).map_err(serde::de::Error::custom)?;
+        Ok(UpdateOp {
+            target_id: raw.target_id,
+            patch: raw.patch,
+            preimage: raw.preimage,
+        })
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -278,6 +307,180 @@ mod opt_opt {
     {
         let opt: Option<T> = Option::deserialize(d)?;
         Ok(Some(opt))
+    }
+}
+
+// ---- update preimage -------------------------------------------------------
+
+/// Prior value of exactly the fields an [`UpdateOp`]'s patch touches,
+/// captured at stage time. Mirrors [`EntityPatch`]'s field shape one-to-one:
+/// a populated preimage field means "the patch touches this field, and this
+/// was its value before the patch"; an absent preimage field means "the
+/// patch leaves this field unchanged." [`UpdateOp`]'s custom `Deserialize`
+/// enforces that this field set exactly equals `EntityPatch`'s touched-field
+/// set.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EntityPreimage {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none", with = "opt_opt")]
+    pub description: Option<Option<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub properties: Option<BTreeMap<String, PropertyValue>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tags: Option<Vec<String>>,
+}
+
+/// Prior value of exactly the fields an [`UpdateOp`]'s patch touches;
+/// mirrors [`NotePatch`] the same way [`EntityPreimage`] mirrors
+/// [`EntityPatch`]. A captured `salience`/`decay_factor` value, when
+/// present, must satisfy the same finite/range invariant
+/// `khive_types::Note::is_valid` enforces on a live note — a prior value
+/// outside that range could never have been real.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NotePreimage {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none", with = "opt_opt")]
+    pub salience: Option<Option<f64>>,
+    #[serde(default, skip_serializing_if = "Option::is_none", with = "opt_opt")]
+    pub decay_factor: Option<Option<f64>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub properties: Option<BTreeMap<String, PropertyValue>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tags: Option<Vec<String>>,
+}
+
+/// Prior value of exactly the fields an [`UpdateOp`]'s patch touches;
+/// mirrors [`EdgePatch`] the same way [`EntityPreimage`] mirrors
+/// [`EntityPatch`]. A captured `weight` value, when present, must satisfy
+/// the same finite/`[0.0, 1.0]` invariant `EdgePatch`/`LinkOp`/
+/// `khive_types::Link` enforce on a live edge weight.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EdgePreimage {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relation: Option<EdgeRelation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub weight: Option<f64>,
+}
+
+/// The field-scoped preimage for one [`UpdateOp`], tagged by the same
+/// `target` discriminant [`UpdatePatch`] uses so a preimage's substrate is
+/// self-describing on the wire.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "target", rename_all = "snake_case")]
+pub enum UpdatePreimage {
+    Entity(EntityPreimage),
+    Note(NotePreimage),
+    Edge(EdgePreimage),
+}
+
+/// Enforce [`UpdateOp`]'s hard requirement: `preimage` targets the same
+/// substrate as `patch`, and the set of fields `preimage` populates equals
+/// the set of fields `patch` touches (sets or explicitly clears) exactly —
+/// no field the patch leaves unchanged, no field the patch touches left
+/// uncaptured. Also re-validates the finite/range invariants a captured
+/// prior `salience`, `decay_factor`, or edge `weight` must satisfy, since an
+/// out-of-range prior value could never have been a real previously-live
+/// state.
+fn validate_update_congruence(
+    patch: &UpdatePatch,
+    preimage: &UpdatePreimage,
+) -> Result<(), String> {
+    match (patch, preimage) {
+        (UpdatePatch::Entity(p), UpdatePreimage::Entity(pre)) => {
+            check_touched("name", p.name.is_some(), pre.name.is_some())?;
+            check_touched(
+                "description",
+                p.description.is_some(),
+                pre.description.is_some(),
+            )?;
+            check_touched(
+                "properties",
+                p.properties.is_some(),
+                pre.properties.is_some(),
+            )?;
+            check_touched("tags", p.tags.is_some(), pre.tags.is_some())?;
+            Ok(())
+        }
+        (UpdatePatch::Note(p), UpdatePreimage::Note(pre)) => {
+            check_touched("content", p.content.is_some(), pre.content.is_some())?;
+            check_touched("salience", p.salience.is_some(), pre.salience.is_some())?;
+            check_touched(
+                "decay_factor",
+                p.decay_factor.is_some(),
+                pre.decay_factor.is_some(),
+            )?;
+            check_touched(
+                "properties",
+                p.properties.is_some(),
+                pre.properties.is_some(),
+            )?;
+            check_touched("tags", p.tags.is_some(), pre.tags.is_some())?;
+            if let Some(Some(s)) = pre.salience {
+                if !s.is_finite() || !(0.0..=1.0).contains(&s) {
+                    return Err(format!(
+                        "UpdateOp note preimage salience must be finite and in [0.0, 1.0], got {s}"
+                    ));
+                }
+            }
+            if let Some(Some(d)) = pre.decay_factor {
+                if !d.is_finite() || d < 0.0 {
+                    return Err(format!(
+                        "UpdateOp note preimage decay_factor must be finite and non-negative, got {d}"
+                    ));
+                }
+            }
+            Ok(())
+        }
+        (UpdatePatch::Edge(p), UpdatePreimage::Edge(pre)) => {
+            check_touched("relation", p.relation.is_some(), pre.relation.is_some())?;
+            check_touched("weight", p.weight.is_some(), pre.weight.is_some())?;
+            if let Some(w) = pre.weight {
+                if !w.is_finite() || !(0.0..=1.0).contains(&w) {
+                    return Err(format!(
+                        "UpdateOp edge preimage weight must be finite and in [0.0, 1.0], got {w}"
+                    ));
+                }
+            }
+            Ok(())
+        }
+        _ => Err(format!(
+            "UpdateOp patch target ({}) does not match preimage target ({})",
+            patch_target_name(patch),
+            preimage_target_name(preimage)
+        )),
+    }
+}
+
+fn check_touched(field: &str, patch_touched: bool, preimage_present: bool) -> Result<(), String> {
+    match (patch_touched, preimage_present) {
+        (true, false) => Err(format!(
+            "UpdateOp preimage is missing `{field}`, which the patch sets or clears"
+        )),
+        (false, true) => Err(format!(
+            "UpdateOp preimage carries `{field}`, which the patch leaves unchanged"
+        )),
+        _ => Ok(()),
+    }
+}
+
+fn patch_target_name(patch: &UpdatePatch) -> &'static str {
+    match patch {
+        UpdatePatch::Entity(_) => "entity",
+        UpdatePatch::Note(_) => "note",
+        UpdatePatch::Edge(_) => "edge",
+    }
+}
+
+fn preimage_target_name(preimage: &UpdatePreimage) -> &'static str {
+    match preimage {
+        UpdatePreimage::Entity(_) => "entity",
+        UpdatePreimage::Note(_) => "note",
+        UpdatePreimage::Edge(_) => "edge",
     }
 }
 
@@ -535,6 +738,98 @@ mod tests {
             "from_id": "00000000-0000-0000-0000-000000000002"
         });
         let result: Result<MergeOp, _> = serde_json::from_value(json);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn update_op_rejects_preimage_missing_touched_field() {
+        // patch sets `name`; preimage omits it.
+        let json = serde_json::json!({
+            "target_id": "00000000-0000-0000-0000-000000000001",
+            "patch": { "target": "entity", "name": "new-name" },
+            "preimage": { "target": "entity" }
+        });
+        let result: Result<UpdateOp, _> = serde_json::from_value(json);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn update_op_rejects_preimage_with_extra_untouched_field() {
+        // patch leaves `name` unchanged; preimage carries it anyway.
+        let json = serde_json::json!({
+            "target_id": "00000000-0000-0000-0000-000000000001",
+            "patch": { "target": "entity", "tags": ["a"] },
+            "preimage": {
+                "target": "entity",
+                "name": "stale-prior-name",
+                "tags": ["prior-a"]
+            }
+        });
+        let result: Result<UpdateOp, _> = serde_json::from_value(json);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn update_op_rejects_mismatched_target_variant() {
+        let json = serde_json::json!({
+            "target_id": "00000000-0000-0000-0000-000000000001",
+            "patch": { "target": "entity", "name": "n" },
+            "preimage": { "target": "note", "content": "prior" }
+        });
+        let result: Result<UpdateOp, _> = serde_json::from_value(json);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn update_op_explicit_null_clear_captures_prior_value() {
+        let json = serde_json::json!({
+            "target_id": "00000000-0000-0000-0000-000000000001",
+            "patch": { "target": "entity", "description": null },
+            "preimage": { "target": "entity", "description": "was-set" }
+        });
+        let op: UpdateOp = serde_json::from_value(json).unwrap();
+        match op.patch {
+            UpdatePatch::Entity(p) => assert_eq!(p.description, Some(None)),
+            other => panic!("expected entity patch, got {other:?}"),
+        }
+        match op.preimage {
+            UpdatePreimage::Entity(pre) => {
+                assert_eq!(pre.description, Some(Some("was-set".to_string())))
+            }
+            other => panic!("expected entity preimage, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn update_op_accepts_congruent_preimage() {
+        let json = serde_json::json!({
+            "target_id": "00000000-0000-0000-0000-000000000001",
+            "patch": { "target": "edge", "weight": 0.5 },
+            "preimage": { "target": "edge", "weight": 0.9 }
+        });
+        let result: Result<UpdateOp, _> = serde_json::from_value(json);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn update_op_rejects_out_of_range_preimage_weight() {
+        let json = serde_json::json!({
+            "target_id": "00000000-0000-0000-0000-000000000001",
+            "patch": { "target": "edge", "weight": 0.5 },
+            "preimage": { "target": "edge", "weight": 1.5 }
+        });
+        let result: Result<UpdateOp, _> = serde_json::from_value(json);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn update_op_rejects_out_of_range_preimage_salience() {
+        let json = serde_json::json!({
+            "target_id": "00000000-0000-0000-0000-000000000001",
+            "patch": { "target": "note", "salience": 0.2 },
+            "preimage": { "target": "note", "salience": 1.9 }
+        });
+        let result: Result<UpdateOp, _> = serde_json::from_value(json);
         assert!(result.is_err());
     }
 }
