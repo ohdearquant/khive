@@ -1012,7 +1012,7 @@ impl VerbRegistry {
         // - Ok(Allow) → proceed to pack dispatch (tracing + optional EventStore).
         // - Ok(Deny) → emit audit, persist if store configured, return PermissionDenied.
         // - Err(_) → warn via tracing, fail-open (no audit persisted).
-        let (gate_blocked, mut deferred_link_audit) = match self.gate.check(&gate_req) {
+        let (gate_blocked, mut deferred_audit) = match self.gate.check(&gate_req) {
             Ok(decision) => {
                 let is_deny = matches!(decision, GateDecision::Deny { .. });
 
@@ -1051,24 +1051,23 @@ impl VerbRegistry {
                     }
                 }
 
-                // #676: a singleton `link` call (Allow decision, no `links`
-                // bulk array) defers its audit row until pack dispatch returns
-                // the created/resolved edge, so the row can carry
-                // edge_id/relation/weight instead of the generic v1 shape.
-                // Denied calls and bulk `links` have no post-dispatch edge to
-                // enrich with, so they keep the immediate v1 append below.
-                let defer_link_audit =
-                    !is_deny && verb == "link" && gate_req.args.get("links").is_none();
+                // ADR-103 Stage 1 / #676: every Allow-outcome audit row defers
+                // its append until pack dispatch returns, so the row can carry
+                // the measured dispatch time in `duration_us` (previously the
+                // row was persisted before dispatch ran, so the persisted
+                // `duration_us` was always the `Event::new` default of 0 — see
+                // ADR-103 Stage 1). A singleton `link` call (no `links` bulk
+                // array) additionally enriches the deferred row with the
+                // created/resolved edge fields (schema v2) once dispatch
+                // resolves. Denied calls have no dispatch to wait for and keep
+                // the immediate v1 append below.
+                let defer_audit = !is_deny;
 
-                // Persist to EventStore when configured.
-                if !defer_link_audit {
+                // Persist to EventStore immediately only for denied calls.
+                if !defer_audit {
                     if let Some(store) = &self.event_store {
-                        let outcome = if is_deny {
-                            EventOutcome::Denied
-                        } else {
-                            EventOutcome::Success
-                        };
-                        let storage_event = build_audit_storage_event(&gate_req, &audit, outcome);
+                        let storage_event =
+                            build_audit_storage_event(&gate_req, &audit, EventOutcome::Denied);
                         append_audit_event_best_effort(store, storage_event, verb).await;
                     }
                 }
@@ -1082,7 +1081,7 @@ impl VerbRegistry {
                 } else {
                     None
                 };
-                let deferred = if defer_link_audit { Some(audit) } else { None };
+                let deferred = if defer_audit { Some(audit) } else { None };
                 (reason, deferred)
             }
             Err(err) => {
@@ -1181,15 +1180,21 @@ impl VerbRegistry {
                 let result = pack.dispatch(verb, params, self, &token).await;
                 let dispatch_us = dispatch_start.elapsed().as_micros() as i64;
 
-                // #676: append the deferred singleton `link` audit row now that
-                // dispatch has resolved. Success enriches the row with the
-                // created/resolved edge (schema v2); anything that cannot be
-                // enriched falls back to the v1 audit shape so no audit row is
-                // ever dropped for the deferred path.
-                if let Some(audit) = deferred_link_audit.take() {
+                // ADR-103 Stage 1 / #676: append the deferred Allow-outcome
+                // audit row now that dispatch has resolved, so `duration_us`
+                // carries the measured `dispatch_us` instead of the
+                // `Event::new` default of 0. A successful singleton `link`
+                // call enriches the row with the created/resolved edge
+                // (schema v2); anything that cannot be enriched, or is not a
+                // singleton `link` call, falls back to the generic v1 audit
+                // shape so no audit row is ever dropped for the deferred
+                // path.
+                if let Some(audit) = deferred_audit.take() {
                     if let Some(store) = &self.event_store {
+                        let is_link_singleton =
+                            verb == "link" && gate_req.args.get("links").is_none();
                         match &result {
-                            Ok(ok_val) => {
+                            Ok(ok_val) if is_link_singleton => {
                                 match link_audit_success_from_result(audit.clone(), ok_val) {
                                     Some((edge_id, payload)) => {
                                         let storage_event = Event::new(
@@ -1205,7 +1210,8 @@ impl VerbRegistry {
                                         .with_outcome(EventOutcome::Success)
                                         .with_target(edge_id)
                                         .with_payload(payload)
-                                        .with_payload_schema_version(2);
+                                        .with_payload_schema_version(2)
+                                        .with_duration_us(dispatch_us);
                                         append_audit_event_best_effort(store, storage_event, verb)
                                             .await;
                                     }
@@ -1219,18 +1225,20 @@ impl VerbRegistry {
                                             &gate_req,
                                             &audit,
                                             EventOutcome::Success,
-                                        );
+                                        )
+                                        .with_duration_us(dispatch_us);
                                         append_audit_event_best_effort(store, storage_event, verb)
                                             .await;
                                     }
                                 }
                             }
-                            Err(_) => {
+                            _ => {
                                 let storage_event = build_audit_storage_event(
                                     &gate_req,
                                     &audit,
                                     EventOutcome::Success,
-                                );
+                                )
+                                .with_duration_us(dispatch_us);
                                 append_audit_event_best_effort(store, storage_event, verb).await;
                             }
                         }
@@ -1277,6 +1285,20 @@ impl VerbRegistry {
                 return result;
             }
         }
+
+        // No pack owns this verb: the gate allowed it, but no dispatch runs.
+        // Persist the deferred audit row now (duration stays at the
+        // `Event::new` default of 0 — no dispatch occurred to measure) so an
+        // allowed-but-unknown verb is never silently dropped from the audit
+        // trail (matches the "no audit row is ever dropped" contract above).
+        if let Some(audit) = deferred_audit.take() {
+            if let Some(store) = &self.event_store {
+                let storage_event =
+                    build_audit_storage_event(&gate_req, &audit, EventOutcome::Success);
+                append_audit_event_best_effort(store, storage_event, verb).await;
+            }
+        }
+
         // Verb-visibility handler names, precomputed at build() time (internal
         // subhandlers are excluded so they are not advertised in the
         // unknown-verb error — ue-help-introspection C1 / internal review High).
@@ -2079,6 +2101,50 @@ mod tests {
             _token: &NamespaceToken,
         ) -> Result<Value, RuntimeError> {
             Ok(serde_json::json!({ "pack": "alpha", "verb": verb }))
+        }
+    }
+
+    /// A pack whose `dispatch` sleeps for a fixed, generous duration so
+    /// `duration_us` regression tests (ADR-103 Stage 1) have a reliably
+    /// nonzero, non-flaky measured dispatch time to assert against.
+    struct SleepingPack;
+
+    impl Pack for SleepingPack {
+        const NAME: &'static str = "sleeping";
+        const NOTE_KINDS: &'static [&'static str] = &[];
+        const ENTITY_KINDS: &'static [&'static str] = &[];
+        const HANDLERS: &'static [HandlerDef] = &[HandlerDef {
+            name: "slow_op",
+            description: "sleeps before returning",
+            visibility: Visibility::Verb,
+            category: VerbCategory::Assertive,
+            params: &[],
+        }];
+    }
+
+    #[async_trait]
+    impl PackRuntime for SleepingPack {
+        fn name(&self) -> &str {
+            SleepingPack::NAME
+        }
+        fn note_kinds(&self) -> &'static [&'static str] {
+            SleepingPack::NOTE_KINDS
+        }
+        fn entity_kinds(&self) -> &'static [&'static str] {
+            SleepingPack::ENTITY_KINDS
+        }
+        fn handlers(&self) -> &'static [HandlerDef] {
+            SleepingPack::HANDLERS
+        }
+        async fn dispatch(
+            &self,
+            verb: &str,
+            _params: Value,
+            _registry: &VerbRegistry,
+            _token: &NamespaceToken,
+        ) -> Result<Value, RuntimeError> {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            Ok(serde_json::json!({ "pack": "sleeping", "verb": verb }))
         }
     }
 
@@ -3321,6 +3387,76 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn audit_event_duration_us_reflects_measured_dispatch_time() {
+        // ADR-103 Stage 1: the persisted audit row's `duration_us` must carry
+        // the measured pack-dispatch time, not the `Event::new` default of 0
+        // (the bug this stage fixes — the row used to be persisted before
+        // dispatch ran at all). `SleepingPack` sleeps 20ms so the assertion
+        // has a wide, non-flaky margin over scheduling jitter.
+        let store = Arc::new(MemoryEventStore::default());
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(SleepingPack);
+        builder.with_event_store(store.clone());
+        let reg = builder.build().expect("registry builds");
+
+        reg.dispatch("slow_op", serde_json::json!({}))
+            .await
+            .unwrap();
+
+        let page = store
+            .query_events(
+                EventFilter::default(),
+                PageRequest {
+                    limit: 10,
+                    offset: 0,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(page.items.len(), 1);
+        let ev = &page.items[0];
+        assert!(
+            ev.duration_us >= 10_000,
+            "duration_us must reflect the ~20ms measured dispatch time, got {}",
+            ev.duration_us
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_unknown_verb_allowed_by_gate_still_persists_audit_row() {
+        // ADR-103 Stage 1: generalizing audit-row deferral to every
+        // Allow-outcome verb (not just singleton `link`) must not silently
+        // drop the audit row for a verb the gate allows but no pack owns.
+        // `duration_us` stays at the `Event::new` default of 0 here since no
+        // dispatch ever ran to measure.
+        let store = Arc::new(MemoryEventStore::default());
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(AlphaPack);
+        builder.with_event_store(store.clone());
+        let reg = builder.build().expect("registry builds");
+
+        let result = reg.dispatch("no_such_verb", serde_json::json!({})).await;
+        assert!(result.is_err(), "unknown verb must still return an error");
+
+        let count = store.count_events(EventFilter::default()).await.unwrap();
+        assert_eq!(
+            count, 1,
+            "an allowed-but-unknown verb must still persist one audit row"
+        );
+        let page = store
+            .query_events(
+                EventFilter::default(),
+                PageRequest {
+                    limit: 10,
+                    offset: 0,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(page.items[0].duration_us, 0);
+    }
+
+    #[tokio::test]
     async fn audit_event_persists_to_event_store_on_deny() {
         #[derive(Debug)]
         struct AlwaysDenyGate;
@@ -4188,7 +4324,9 @@ mod tests {
         let count = store.count_events(EventFilter::default()).await.unwrap();
         assert_eq!(
             count, 1,
-            "bulk `links` gets exactly one immediate v1 audit row, not deferred"
+            "bulk `links` gets exactly one v1 audit row (deferred until dispatch \
+             resolves like every other Allow-outcome row since ADR-103 Stage 1, \
+             but never v2-enriched — enrichment is singleton-`link`-only)"
         );
         let page = store
             .query_events(

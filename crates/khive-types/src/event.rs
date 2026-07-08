@@ -62,9 +62,9 @@ impl fmt::Display for EventOutcome {
     }
 }
 
-/// Discriminant for the 34 typed event variants produced by the verb dispatch path
+/// Discriminant for the 37 typed event variants produced by the verb dispatch path
 /// and by lifecycle telemetry producers (channel polling/backoff, config-lock,
-/// checkpoint outcome).
+/// checkpoint outcome, background phase spans).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
@@ -137,11 +137,17 @@ pub enum EventKind {
     ConfigLocked,
     /// A WAL checkpoint tick's outcome was recorded (ADR-091 elevated/drain edge).
     CheckpointOutcomeRecorded,
+    /// A background phase (ANN warm, index rebuild/backfill, ...) started (ADR-103 Stage 1).
+    PhaseStarted,
+    /// A background phase completed (ADR-103 Stage 1).
+    PhaseCompleted,
+    /// A background phase was cancelled before completion (ADR-103 Stage 1).
+    PhaseCancelled,
 }
 
 impl EventKind {
-    /// All 34 event kind variants in declaration order.
-    pub const ALL: [Self; 34] = [
+    /// All 37 event kind variants in declaration order.
+    pub const ALL: [Self; 37] = [
         Self::Audit,
         Self::RecallExecuted,
         Self::RerankExecuted,
@@ -176,6 +182,9 @@ impl EventKind {
         Self::ChannelHeartbeatPersistFailed,
         Self::ConfigLocked,
         Self::CheckpointOutcomeRecorded,
+        Self::PhaseStarted,
+        Self::PhaseCompleted,
+        Self::PhaseCancelled,
     ];
 
     /// Return the canonical snake_case string for this event kind.
@@ -215,6 +224,9 @@ impl EventKind {
             Self::ChannelHeartbeatPersistFailed => "channel_heartbeat_persist_failed",
             Self::ConfigLocked => "config_locked",
             Self::CheckpointOutcomeRecorded => "checkpoint_outcome_recorded",
+            Self::PhaseStarted => "phase_started",
+            Self::PhaseCompleted => "phase_completed",
+            Self::PhaseCancelled => "phase_cancelled",
         }
     }
 }
@@ -260,6 +272,9 @@ const EVENT_KIND_VALID: &[&str] = &[
     "channel_heartbeat_persist_failed",
     "config_locked",
     "checkpoint_outcome_recorded",
+    "phase_started",
+    "phase_completed",
+    "phase_cancelled",
 ];
 
 impl core::str::FromStr for EventKind {
@@ -301,6 +316,9 @@ impl core::str::FromStr for EventKind {
             "channel_heartbeat_persist_failed" => Ok(Self::ChannelHeartbeatPersistFailed),
             "config_locked" => Ok(Self::ConfigLocked),
             "checkpoint_outcome_recorded" => Ok(Self::CheckpointOutcomeRecorded),
+            "phase_started" => Ok(Self::PhaseStarted),
+            "phase_completed" => Ok(Self::PhaseCompleted),
+            "phase_cancelled" => Ok(Self::PhaseCancelled),
             other => Err(crate::error::UnknownVariant::new(
                 "event_kind",
                 other,

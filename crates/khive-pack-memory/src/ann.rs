@@ -357,6 +357,17 @@ pub(crate) async fn warm_existing_memory_indexes(rt: &KhiveRuntime, ann: &Shared
 }
 
 /// Lazy warm-load for the global index for `model`: snapshot restore or rebuild with double-fingerprint check.
+///
+/// ADR-103 Stage 1 / issue #723 ask 1: brackets the whole attempt (snapshot
+/// load and/or rebuild-from-scratch) as one `ann_warm` phase span, so an
+/// operator can attribute a cold-start or on-demand-warm CPU window after
+/// the fact from the `PhaseStarted`/`PhaseCompleted`/`PhaseCancelled` event
+/// trio. This is the single call site both `warm_existing_memory_indexes`
+/// (daemon-startup cold warm) and `ensure_ann_background` (fire-once
+/// recall/remember-triggered warm) route through, so instrumenting here
+/// covers both callers. Emission is best-effort and a no-op when this
+/// `KhiveRuntime` has no `EventStore` configured, matching ADR-094's
+/// existing lifecycle-event emission contract exactly.
 pub(crate) async fn ensure_ann_for_model(
     rt: &KhiveRuntime,
     token: &NamespaceToken,
@@ -366,6 +377,128 @@ pub(crate) async fn ensure_ann_for_model(
     if model.is_empty() {
         return Ok(AnnEnsureStatus::EmptyCorpus);
     }
+
+    let phase_start = std::time::Instant::now();
+    // Held for the lifetime of this call so `comm.health`'s resource
+    // self-report (#723 ask 2) can see `ann_warm` in its active-phases list
+    // while this warm/rebuild is in flight. Dropped (and the gauge
+    // decremented) on every exit path, including an early `?`-propagated
+    // error, since it is a plain RAII guard.
+    let _phase_guard = khive_runtime::register_active_phase("ann_warm");
+    // Best-effort, cheap COUNT(*) — `None` if the query itself fails, which
+    // is fine: `corpus_size` on the Started row is a diagnostic nicety, not
+    // load-bearing for anything downstream.
+    let corpus_size = compute_memory_fingerprint(rt, token, model)
+        .await
+        .map(|fp| fp.vector_count);
+    emit_ann_warm_phase_event(
+        rt,
+        token,
+        model,
+        khive_types::EventKind::PhaseStarted,
+        khive_storage::PhaseStartedPayload {
+            work_class: "warm".into(),
+            phase: "ann_warm".into(),
+            corpus_size,
+        },
+    )
+    .await;
+
+    let result = ensure_ann_for_model_inner(rt, token, ann, model).await;
+
+    let wall_us = phase_start.elapsed().as_micros() as i64;
+    let cpu_us = khive_runtime::process_resource_usage().map(|u| u.cpu_us);
+    match &result {
+        Err(e) if is_benign_shutdown_cancellation(e) => {
+            emit_ann_warm_phase_event(
+                rt,
+                token,
+                model,
+                khive_types::EventKind::PhaseCancelled,
+                khive_storage::PhaseCancelledPayload {
+                    work_class: "warm".into(),
+                    phase: "ann_warm".into(),
+                    wall_us,
+                    cpu_us,
+                },
+            )
+            .await;
+        }
+        _ => {
+            emit_ann_warm_phase_event(
+                rt,
+                token,
+                model,
+                khive_types::EventKind::PhaseCompleted,
+                khive_storage::PhaseCompletedPayload {
+                    work_class: "warm".into(),
+                    phase: "ann_warm".into(),
+                    wall_us,
+                    cpu_us,
+                },
+            )
+            .await;
+        }
+    }
+    result
+}
+
+/// Append one ADR-103 Stage 1 `ann_warm` phase-span event, logging and
+/// swallowing store/serialize failures — the phase-log path must never
+/// interrupt or slow down the warm/rebuild it is observing (same rule as
+/// `khive-db::checkpoint`'s lifecycle-event helper).
+async fn emit_ann_warm_phase_event<P: serde::Serialize>(
+    rt: &KhiveRuntime,
+    token: &NamespaceToken,
+    model: &str,
+    kind: khive_types::EventKind,
+    payload: P,
+) {
+    // Best-effort exactly like ADR-094's other lifecycle-event emitters: a
+    // backend that cannot resolve an `EventStore` for this token's namespace
+    // is treated as an unconfigured audit sink, not an error to propagate.
+    let Ok(store) = rt.events(token) else {
+        return;
+    };
+    let payload_value = match serde_json::to_value(&payload) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                event_kind = %kind.name(),
+                model,
+                "failed to serialize ann_warm phase event payload"
+            );
+            return;
+        }
+    };
+    let event = khive_storage::Event::new(
+        token.namespace().as_str(),
+        "memory.ann_warm",
+        kind,
+        khive_types::SubstrateKind::Event,
+        "daemon:ann_warm",
+    )
+    .with_payload(payload_value);
+    if let Err(err) = store.append_event(event).await {
+        tracing::warn!(
+            error = %err,
+            event_kind = %kind.name(),
+            model,
+            "ann_warm phase event append failed"
+        );
+    }
+}
+
+/// Original `ensure_ann_for_model` body: snapshot restore or rebuild with
+/// double-fingerprint check, split out so [`ensure_ann_for_model`] can
+/// bracket it with ADR-103 Stage 1 phase-span emission above.
+async fn ensure_ann_for_model_inner(
+    rt: &KhiveRuntime,
+    token: &NamespaceToken,
+    ann: &SharedAnn,
+    model: &str,
+) -> Result<AnnEnsureStatus, RuntimeError> {
     let ns = "global";
     let key = AnnKey::new(ns, model);
 
@@ -848,6 +981,65 @@ mod tests {
             ann.warming.lock().await.is_empty(),
             "all warming guards must be cleared after invalidation"
         );
+    }
+
+    // ADR-103 Stage 1 / issue #723 ask 1: `ensure_ann_for_model` must bracket
+    // its whole attempt with a `PhaseStarted`/`PhaseCompleted` event pair
+    // whenever an `EventStore` is configured, regardless of which path
+    // inside it runs (here: `EmptyCorpus`, since no vectors are registered
+    // for `model`). `khive_runtime::register_active_phase`'s own guard
+    // release behavior (used here to populate `comm.health`'s
+    // `active_phases`) is covered in isolation by
+    // `khive-runtime`'s own `daemon::tests` — not re-asserted here via the
+    // process-wide gauge, since that gauge is shared across this whole test
+    // binary (any concurrently running `memory.remember`/`memory.recall`
+    // test can trigger its own background `ensure_ann_background` warm) and
+    // asserting its global emptiness here would be inherently racy.
+    #[tokio::test]
+    async fn ensure_ann_for_model_emits_phase_started_and_completed_events() {
+        let rt = KhiveRuntime::memory().expect("in-memory runtime");
+        let token = rt.authorize(Namespace::local()).expect("authorize local");
+        let ann = new_shared();
+        let model = "ann-warm-phase-event-test-model";
+
+        let status = ensure_ann_for_model(&rt, &token, &ann, model)
+            .await
+            .expect("ensure_ann_for_model must succeed on an empty corpus");
+        assert!(matches!(status, AnnEnsureStatus::EmptyCorpus));
+
+        let store = rt.events(&token).expect("event store for local namespace");
+        let page = store
+            .query_events(
+                khive_storage::EventFilter::default(),
+                khive_storage::types::PageRequest {
+                    limit: 50,
+                    offset: 0,
+                },
+            )
+            .await
+            .expect("query_events");
+
+        let started = page
+            .items
+            .iter()
+            .filter(|e| e.kind == khive_types::EventKind::PhaseStarted)
+            .count();
+        let completed = page
+            .items
+            .iter()
+            .filter(|e| e.kind == khive_types::EventKind::PhaseCompleted)
+            .count();
+        let cancelled = page
+            .items
+            .iter()
+            .filter(|e| e.kind == khive_types::EventKind::PhaseCancelled)
+            .count();
+        assert_eq!(started, 1, "exactly one PhaseStarted row, got: {page:?}");
+        assert_eq!(
+            completed, 1,
+            "exactly one PhaseCompleted row, got: {page:?}"
+        );
+        assert_eq!(cancelled, 0, "no PhaseCancelled row on a normal completion");
     }
 
     // internal review PR #583 round-1 Medium (see the rationale comment on
