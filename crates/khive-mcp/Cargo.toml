@@ -14,6 +14,7 @@ description = "khive MCP server library — served via the kkernel binary"
 khive-db = { version = "0.3.0", path = "../khive-db" }
 khive-runtime = { version = "0.3.0", path = "../khive-runtime" }
 khive-storage = { version = "0.3.0", path = "../khive-storage" }
+khive-types = { version = "0.3.0", path = "../khive-types", features = ["serde"] }
 khive-request = { version = "0.3.0", path = "../khive-request" }
 khive-pack-kg = { version = "0.3.0", path = "../khive-pack-kg" }
 khive-pack-gtd = { version = "0.3.0", path = "../khive-pack-gtd" }
@@ -55,7 +56,6 @@ channel-email = ["khive-channel", "khive-channel-email"]
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
 rmcp = { workspace = true, features = ["server", "transport-io", "client"] }
-khive-types = { version = "0.3.0", path = "../khive-types" }
 async-trait = { workspace = true }
 serial_test = { workspace = true }
 khive-pack-knowledge = { version = "0.3.0", path = "../khive-pack-knowledge" }

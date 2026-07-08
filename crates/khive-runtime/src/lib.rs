@@ -6,6 +6,7 @@ pub mod atomic_plan;
 pub mod atomic_prepare;
 pub mod atomic_runner;
 pub mod config;
+pub mod config_ledger;
 pub mod curation;
 #[cfg(unix)]
 pub mod daemon;

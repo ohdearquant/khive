@@ -487,6 +487,16 @@ impl KhiveMcpServer {
         self.pool.clone()
     }
 
+    /// This server's configured audit `EventStore`, if any (ADR-094).
+    ///
+    /// Exposed so the `DaemonDispatch::event_store_for_checkpoint` impl and
+    /// the email channel poll loop can append best-effort lifecycle events
+    /// to the same sink gate-check audit rows already use, without a second
+    /// constructor argument threaded everywhere a registry is built.
+    pub fn event_store(&self) -> Option<Arc<dyn khive_storage::EventStore>> {
+        self.registry.event_store()
+    }
+
     /// The server-level default output format (ADR-078), as resolved at
     /// construction by [`crate::serve::apply_env_output_format`].
     pub fn default_output_format(&self) -> OutputFormat {

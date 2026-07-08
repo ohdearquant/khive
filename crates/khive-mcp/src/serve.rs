@@ -301,7 +301,13 @@ async fn channel_poll_loop(
     // one's connection fails, even though the two are independent
     // credentials with independent connectivity.
     let mut backoffs: HashMap<(String, String), ImapBackoff> = HashMap::new();
+    // ADR-094: tracks the error class of the most recent unresolved failure
+    // per (kind, slug), so `ChannelPollFailed` fires once per failure episode
+    // (first failure since success, or a change in error class) rather than
+    // once per retry. Cleared on every success.
+    let mut last_error_class: HashMap<(String, String), &'static str> = HashMap::new();
     let mut next_interval = HAPPY_PATH_INTERVAL;
+    let event_store = registry.event_store();
 
     loop {
         tokio::time::sleep(next_interval).await;
@@ -312,13 +318,63 @@ async fn channel_poll_loop(
 
         for (kind, slug, channel) in channels.iter() {
             let backoff_key = (kind.to_string(), slug.to_string());
+
+            append_channel_lifecycle_event(
+                event_store.as_ref(),
+                khive_types::EventKind::ChannelPollStarted,
+                khive_storage::ChannelPollStartedPayload {
+                    channel_kind: kind.to_string(),
+                    channel_slug: slug.to_string(),
+                    since_rfc3339: since.to_rfc3339(),
+                },
+            )
+            .await;
+
             match channel.poll(since).await {
                 Ok(envelopes) => {
+                    let prior_attempt =
+                        backoffs.get(&backoff_key).map(|b| b.attempt()).unwrap_or(0);
                     if let Some(backoff) = backoffs.get_mut(&backoff_key) {
                         backoff.record_success();
                     }
-                    record_channel_heartbeat(&registry, kind, slug, HeartbeatOutcome::Success)
+                    last_error_class.remove(&backoff_key);
+
+                    // Only a recovery from a prior failure/backoff episode is
+                    // an interesting lifecycle transition — an unbroken
+                    // string of healthy polls never had ChannelPollFailed
+                    // fire, so there is nothing to report recovering from.
+                    if prior_attempt > 0 {
+                        append_channel_lifecycle_event(
+                            event_store.as_ref(),
+                            khive_types::EventKind::ChannelPollSucceeded,
+                            khive_storage::ChannelPollSucceededPayload {
+                                channel_kind: kind.to_string(),
+                                channel_slug: slug.to_string(),
+                                envelope_count: envelopes.len(),
+                                previous_backoff_attempt: prior_attempt,
+                            },
+                        )
                         .await;
+                        append_channel_lifecycle_event(
+                            event_store.as_ref(),
+                            khive_types::EventKind::ChannelBackoffReset,
+                            khive_storage::ChannelBackoffResetPayload {
+                                channel_kind: kind.to_string(),
+                                channel_slug: slug.to_string(),
+                                previous_backoff_attempt: prior_attempt,
+                            },
+                        )
+                        .await;
+                    }
+
+                    record_channel_heartbeat(
+                        &registry,
+                        kind,
+                        slug,
+                        HeartbeatOutcome::Success,
+                        event_store.as_ref(),
+                    )
+                    .await;
                     for env in envelopes {
                         let params = json!({
                             "namespace": ingest_namespace,
@@ -353,13 +409,48 @@ async fn channel_poll_loop(
                             class,
                             message: e.to_string(),
                         },
+                        event_store.as_ref(),
                     )
                     .await;
+
+                    // First failure since success or since the error class
+                    // changed — a run of identical retries at the same class
+                    // does not re-fire this event.
+                    if last_error_class.get(&backoff_key) != Some(&class) {
+                        last_error_class.insert(backoff_key.clone(), class);
+                        append_channel_lifecycle_event(
+                            event_store.as_ref(),
+                            khive_types::EventKind::ChannelPollFailed,
+                            khive_storage::ChannelPollFailedPayload {
+                                channel_kind: kind.to_string(),
+                                channel_slug: slug.to_string(),
+                                error_class: class.to_string(),
+                                error_message: e.to_string(),
+                            },
+                        )
+                        .await;
+                    }
+
                     if is_backoff_eligible(&e) {
                         let backoff = backoffs.entry(backoff_key).or_default();
                         let tick = backoff.record_failure();
                         log_eligible_poll_failure(kind, &e, &tick);
                         next_interval = next_interval.max(tick.delay);
+
+                        if tick.should_warn {
+                            append_channel_lifecycle_event(
+                                event_store.as_ref(),
+                                khive_types::EventKind::ChannelBackoffArmed,
+                                khive_storage::ChannelBackoffArmedPayload {
+                                    channel_kind: kind.to_string(),
+                                    channel_slug: slug.to_string(),
+                                    attempt: tick.attempt,
+                                    step_ms: tick.step.as_millis() as u64,
+                                    delay_ms: tick.delay.as_millis() as u64,
+                                },
+                            )
+                            .await;
+                        }
                     } else {
                         // Non-eligible failures (config/gate errors, never
                         // produced by poll/connect in practice) are not
@@ -370,6 +461,49 @@ async fn channel_poll_loop(
                 }
             }
         }
+    }
+}
+
+/// Append one ADR-094 channel lifecycle event, namespaced and attributed the
+/// same way as `record_channel_heartbeat`'s persisted rows.
+///
+/// Best-effort: `store == None` is a no-op, and a serialize/append failure is
+/// logged and swallowed — no lifecycle-append error may ever interrupt or
+/// slow down channel polling.
+#[cfg(feature = "channel-email")]
+async fn append_channel_lifecycle_event<P: serde::Serialize>(
+    store: Option<&std::sync::Arc<dyn khive_storage::EventStore>>,
+    kind: khive_types::EventKind,
+    payload: P,
+) {
+    let Some(store) = store else {
+        return;
+    };
+    let payload_value = match serde_json::to_value(&payload) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                event_kind = %kind.name(),
+                "failed to serialize channel lifecycle event payload"
+            );
+            return;
+        }
+    };
+    let event = khive_storage::Event::new(
+        khive_pack_comm::CHANNEL_HEALTH_NAMESPACE,
+        "channel.poll_lifecycle",
+        kind,
+        khive_types::SubstrateKind::Event,
+        "daemon:channel_poll_loop",
+    )
+    .with_payload(payload_value);
+    if let Err(err) = store.append_event(event).await {
+        tracing::warn!(
+            error = %err,
+            event_kind = %kind.name(),
+            "channel lifecycle event append failed"
+        );
     }
 }
 
@@ -421,11 +555,12 @@ async fn record_channel_heartbeat(
     channel_kind: &str,
     channel_slug: &str,
     outcome: HeartbeatOutcome,
+    event_store: Option<&std::sync::Arc<dyn khive_storage::EventStore>>,
 ) {
     use serde_json::json;
 
     let namespace = khive_pack_comm::CHANNEL_HEALTH_NAMESPACE;
-    let params = match outcome {
+    let params = match &outcome {
         HeartbeatOutcome::Success => json!({
             "namespace": namespace,
             "channel_kind": channel_kind,
@@ -446,6 +581,16 @@ async fn record_channel_heartbeat(
             channel = channel_kind,
             "comm.heartbeat failed to persist poll outcome: {e}"
         );
+        append_channel_lifecycle_event(
+            event_store,
+            khive_types::EventKind::ChannelHeartbeatPersistFailed,
+            khive_storage::ChannelHeartbeatPersistFailedPayload {
+                channel_kind: channel_kind.to_string(),
+                channel_slug: channel_slug.to_string(),
+                error: e.to_string(),
+            },
+        )
+        .await;
     }
 }
 
@@ -4219,6 +4364,7 @@ id = "lambda:project-actor"
                 "email",
                 "recipient@example.com",
                 HeartbeatOutcome::Success,
+                None,
             )
             .await;
         }
@@ -4238,6 +4384,7 @@ id = "lambda:project-actor"
                 "email",
                 "recipient@example.com",
                 HeartbeatOutcome::Success,
+                None,
             )
             .await;
 
@@ -4293,6 +4440,7 @@ id = "lambda:project-actor"
                 "email",
                 "recipient@example.com",
                 HeartbeatOutcome::Success,
+                None,
             )
             .await;
 
@@ -4392,7 +4540,8 @@ id = "lambda:project-actor"
             // Drive exactly what the production poll loop does per tick: iterate
             // the registry and record a heartbeat for every (kind, slug, channel).
             for (kind, slug, _channel) in ch_registry.iter() {
-                record_channel_heartbeat(&registry, kind, slug, HeartbeatOutcome::Success).await;
+                record_channel_heartbeat(&registry, kind, slug, HeartbeatOutcome::Success, None)
+                    .await;
             }
 
             let health = registry
@@ -4640,6 +4789,242 @@ id = "lambda:project-actor"
             // Client role: the wrapper must take the skip branch and never
             // attempt to construct an EmailChannel at all.
             spawn_email_channel_loops_if_daemon(&server, &args);
+        }
+    }
+
+    // --- channel_poll_loop: ADR-094 lifecycle event sequencing (#623) ---
+
+    #[cfg(feature = "channel-email")]
+    mod channel_lifecycle_sequencing_tests {
+        use super::*;
+        use async_trait::async_trait;
+        use chrono::{DateTime, Utc};
+        use khive_channel::{Channel, ChannelEnvelope, ChannelError, ChannelRegistry};
+        use khive_runtime::{KhiveRuntime, VerbRegistryBuilder};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Arc, Mutex};
+
+        /// A channel whose first `poll()` fails with a backoff-eligible
+        /// transport error and whose every later `poll()` succeeds — the
+        /// minimal fixture needed to drive the loop through one full
+        /// fail-then-recover lifecycle episode.
+        struct FlakyOnceChannel {
+            call_count: AtomicUsize,
+        }
+
+        #[async_trait]
+        impl Channel for FlakyOnceChannel {
+            fn kind(&self) -> &'static str {
+                "mock"
+            }
+
+            async fn send(&self, _envelope: ChannelEnvelope) -> Result<(), ChannelError> {
+                Ok(())
+            }
+
+            async fn poll(
+                &self,
+                _since: DateTime<Utc>,
+            ) -> Result<Vec<ChannelEnvelope>, ChannelError> {
+                if self.call_count.fetch_add(1, Ordering::SeqCst) == 0 {
+                    Err(ChannelError::Transport("synthetic connect failure".into()))
+                } else {
+                    Ok(vec![])
+                }
+            }
+        }
+
+        /// In-memory `EventStore` fake that just records every appended event
+        /// in append order, so the test can inspect exactly what the poll
+        /// loop persisted without standing up a SQL backend.
+        #[derive(Default)]
+        struct FakeEventStore {
+            events: Mutex<Vec<khive_storage::Event>>,
+        }
+
+        #[async_trait]
+        impl khive_storage::EventStore for FakeEventStore {
+            async fn append_event(
+                &self,
+                event: khive_storage::Event,
+            ) -> khive_storage::StorageResult<()> {
+                self.events.lock().unwrap().push(event);
+                Ok(())
+            }
+
+            async fn append_events(
+                &self,
+                events: Vec<khive_storage::Event>,
+            ) -> khive_storage::StorageResult<khive_storage::BatchWriteSummary> {
+                let n = events.len() as u64;
+                self.events.lock().unwrap().extend(events);
+                Ok(khive_storage::BatchWriteSummary {
+                    attempted: n,
+                    affected: n,
+                    failed: 0,
+                    first_error: String::new(),
+                })
+            }
+
+            async fn get_event(
+                &self,
+                id: uuid::Uuid,
+            ) -> khive_storage::StorageResult<Option<khive_storage::Event>> {
+                Ok(self
+                    .events
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .find(|e| e.id == id)
+                    .cloned())
+            }
+
+            async fn query_events(
+                &self,
+                _filter: khive_storage::EventFilter,
+                _page: khive_storage::PageRequest,
+            ) -> khive_storage::StorageResult<khive_storage::Page<khive_storage::Event>>
+            {
+                let items = self.events.lock().unwrap().clone();
+                let total = items.len() as u64;
+                Ok(khive_storage::Page {
+                    items,
+                    total: Some(total),
+                })
+            }
+
+            async fn count_events(
+                &self,
+                _filter: khive_storage::EventFilter,
+            ) -> khive_storage::StorageResult<u64> {
+                Ok(self.events.lock().unwrap().len() as u64)
+            }
+        }
+
+        /// Drive the paused virtual clock forward in small steps, yielding
+        /// after each one, until the fake store has recorded at least
+        /// `target` events. A single big `advance` can outrun a timer the
+        /// polled task hasn't registered yet (the task only arms its next
+        /// `sleep` after cooperative scheduling lets it run back around the
+        /// loop), so this steps forward repeatedly instead of guessing one
+        /// jump that is simultaneously long enough to fire the next timer
+        /// and short enough not to skip past it unregistered.
+        async fn advance_until(store: &FakeEventStore, target: usize) {
+            for _ in 0..200 {
+                if store.events.lock().unwrap().len() >= target {
+                    return;
+                }
+                tokio::time::advance(std::time::Duration::from_millis(250)).await;
+                tokio::task::yield_now().await;
+            }
+        }
+
+        /// ADR-094 sequencing invariant (#623): a channel that fails once and
+        /// then recovers must produce exactly this six-event lifecycle
+        /// sequence, in this order — `query_events` in production orders on
+        /// `idx_events_ns_created_id`, i.e. append order, which this fake
+        /// preserves directly. Swapping any two entries (e.g. emitting
+        /// `ChannelBackoffArmed` before `ChannelPollFailed`, or letting the
+        /// second `ChannelPollStarted` land after `ChannelPollSucceeded`)
+        /// makes this assertion fail: it is an order check, not a mere
+        /// presence/count check.
+        #[tokio::test(start_paused = true)]
+        async fn channel_lifecycle_events_are_sequenced_across_a_failure_then_recovery() {
+            let mut ch_registry = ChannelRegistry::new();
+            ch_registry.register(Arc::new(FlakyOnceChannel {
+                call_count: AtomicUsize::new(0),
+            }));
+
+            let runtime = KhiveRuntime::memory().expect("in-memory runtime");
+            let mut builder = VerbRegistryBuilder::new();
+            builder.register(khive_pack_kg::KgPack::new(runtime.clone()));
+            builder.register(khive_pack_comm::CommPack::new(runtime.clone()));
+            let store = Arc::new(FakeEventStore::default());
+            builder.with_event_store(store.clone());
+            let registry = builder.build().expect("registry builds");
+
+            let task = tokio::spawn(channel_poll_loop(
+                Arc::new(ch_registry),
+                registry,
+                "test-ns".to_string(),
+                "actor:test".to_string(),
+            ));
+
+            // Iteration 1 (happy-path 5s sleep elapses, poll fails, backoff
+            // arms) then iteration 2 (backoff delay elapses, poll succeeds,
+            // backoff resets) — six lifecycle events total.
+            advance_until(&store, 6).await;
+
+            task.abort();
+
+            let events = store.events.lock().unwrap();
+            let sequence: Vec<khive_types::EventKind> = events
+                .iter()
+                .map(|e| e.kind)
+                .filter(|k| {
+                    matches!(
+                        k,
+                        khive_types::EventKind::ChannelPollStarted
+                            | khive_types::EventKind::ChannelPollSucceeded
+                            | khive_types::EventKind::ChannelPollFailed
+                            | khive_types::EventKind::ChannelBackoffArmed
+                            | khive_types::EventKind::ChannelBackoffReset
+                    )
+                })
+                .collect();
+
+            assert_eq!(
+                sequence,
+                vec![
+                    khive_types::EventKind::ChannelPollStarted,
+                    khive_types::EventKind::ChannelPollFailed,
+                    khive_types::EventKind::ChannelBackoffArmed,
+                    khive_types::EventKind::ChannelPollStarted,
+                    khive_types::EventKind::ChannelPollSucceeded,
+                    khive_types::EventKind::ChannelBackoffReset,
+                ],
+                "ADR-094 lifecycle events must be sequenced exactly as the poll \
+                 loop drives them: started -> failed -> backoff armed -> \
+                 started -> succeeded -> backoff reset. Got: {sequence:?}"
+            );
+        }
+
+        /// Edge case: with no `EventStore` configured, the loop must run the
+        /// same fail-then-recover cycle without panicking or blocking on the
+        /// (absent) lifecycle-append path.
+        #[tokio::test(start_paused = true)]
+        async fn channel_lifecycle_events_are_a_no_op_without_an_event_store() {
+            let mut ch_registry = ChannelRegistry::new();
+            ch_registry.register(Arc::new(FlakyOnceChannel {
+                call_count: AtomicUsize::new(0),
+            }));
+
+            let runtime = KhiveRuntime::memory().expect("in-memory runtime");
+            let mut builder = VerbRegistryBuilder::new();
+            builder.register(khive_pack_kg::KgPack::new(runtime.clone()));
+            builder.register(khive_pack_comm::CommPack::new(runtime.clone()));
+            let registry = builder.build().expect("registry builds");
+            assert!(
+                registry.event_store().is_none(),
+                "no event store was configured for this registry"
+            );
+
+            let task = tokio::spawn(channel_poll_loop(
+                Arc::new(ch_registry),
+                registry,
+                "test-ns".to_string(),
+                "actor:test".to_string(),
+            ));
+
+            // Step the paused clock through both iterations; with no store
+            // configured there is no event count to converge on, so this
+            // just needs to comfortably clear the failure backoff delay.
+            for _ in 0..48 {
+                tokio::time::advance(std::time::Duration::from_millis(250)).await;
+                tokio::task::yield_now().await;
+            }
+
+            task.abort();
         }
     }
 }

@@ -845,6 +845,18 @@ impl VerbRegistry {
         &self.visible_namespaces
     }
 
+    /// This registry's configured audit `EventStore`, if any (ADR-094).
+    ///
+    /// Lets background tasks that hold a `VerbRegistry` but do not go through
+    /// `dispatch` (e.g. the email channel poll loop) append best-effort
+    /// lifecycle events to the same sink gate-check audit rows use, without
+    /// threading a second `Option<Arc<dyn EventStore>>` field through every
+    /// caller. `None` means tracing-only, matching the registry's own
+    /// audit-persistence default.
+    pub fn event_store(&self) -> Option<Arc<dyn EventStore>> {
+        self.event_store.clone()
+    }
+
     /// Return the help schema envelope for a verb (issue #287).
     ///
     /// Walks registered packs for the first matching `HandlerDef` and returns a
@@ -1004,7 +1016,7 @@ impl VerbRegistry {
         // - Ok(Allow) → proceed to pack dispatch (tracing + optional EventStore).
         // - Ok(Deny) → emit audit, persist if store configured, return PermissionDenied.
         // - Err(_) → warn via tracing, fail-open (no audit persisted).
-        let gate_blocked = match self.gate.check(&gate_req) {
+        let (gate_blocked, mut deferred_link_audit) = match self.gate.check(&gate_req) {
             Ok(decision) => {
                 let is_deny = matches!(decision, GateDecision::Deny { .. });
 
@@ -1016,39 +1028,54 @@ impl VerbRegistry {
                     "gate.check"
                 );
 
-                // Persist to EventStore when configured.
+                // #623 (ADR-094): drain any process-lifetime `OnceLock` config
+                // locks queued since the last dispatch and persist them as
+                // `ConfigLocked` events, riding this same audit-persistence
+                // gate. The namespace/actor stamped on these rows are
+                // whichever dispatch happens to observe the queue non-empty
+                // first — an accepted provenance quirk (ADR-094) rather than
+                // threading an `EventStore` handle into every synchronous
+                // `OnceLock::get_or_init` call site.
                 if let Some(store) = &self.event_store {
-                    let outcome = if is_deny {
-                        EventOutcome::Denied
-                    } else {
-                        EventOutcome::Success
-                    };
-                    let audit_data = serde_json::to_value(&audit).unwrap_or_else(|e| {
-                        tracing::warn!(error = %e, "failed to serialize AuditEvent for EventStore");
-                        serde_json::Value::Null
-                    });
-                    let mut storage_event = Event::new(
-                        gate_req.namespace.as_str(),
-                        verb,
-                        EventKind::Audit,
-                        SubstrateKind::Event,
-                        format!("{}:{}", gate_req.actor.kind, gate_req.actor.id),
-                    )
-                    .with_outcome(outcome)
-                    .with_payload(audit_data);
-                    if let Some(target_id) = target_id_from_args(&gate_req.args) {
-                        storage_event = storage_event.with_target(target_id);
-                    }
-                    if let Err(store_err) = store.append_event(storage_event).await {
-                        tracing::warn!(
-                            verb,
-                            error = %store_err,
-                            "audit event store write failed (non-fatal)"
-                        );
+                    if crate::config_ledger::has_pending_config_locked() {
+                        for (key, value) in crate::config_ledger::take_config_locked() {
+                            let payload = serde_json::json!({ "key": key, "value": value });
+                            let storage_event = Event::new(
+                                gate_req.namespace.as_str(),
+                                verb,
+                                EventKind::ConfigLocked,
+                                SubstrateKind::Event,
+                                format!("{}:{}", gate_req.actor.kind, gate_req.actor.id),
+                            )
+                            .with_payload(payload);
+                            append_audit_event_best_effort(store, storage_event, verb).await;
+                        }
                     }
                 }
 
-                if is_deny {
+                // #676: a singleton `link` call (Allow decision, no `links`
+                // bulk array) defers its audit row until pack dispatch returns
+                // the created/resolved edge, so the row can carry
+                // edge_id/relation/weight instead of the generic v1 shape.
+                // Denied calls and bulk `links` have no post-dispatch edge to
+                // enrich with, so they keep the immediate v1 append below.
+                let defer_link_audit =
+                    !is_deny && verb == "link" && gate_req.args.get("links").is_none();
+
+                // Persist to EventStore when configured.
+                if !defer_link_audit {
+                    if let Some(store) = &self.event_store {
+                        let outcome = if is_deny {
+                            EventOutcome::Denied
+                        } else {
+                            EventOutcome::Success
+                        };
+                        let storage_event = build_audit_storage_event(&gate_req, &audit, outcome);
+                        append_audit_event_best_effort(store, storage_event, verb).await;
+                    }
+                }
+
+                let reason = if is_deny {
                     let reason = match decision {
                         GateDecision::Deny { reason } => reason,
                         _ => String::new(),
@@ -1056,13 +1083,15 @@ impl VerbRegistry {
                     Some(reason)
                 } else {
                     None
-                }
+                };
+                let deferred = if defer_link_audit { Some(audit) } else { None };
+                (reason, deferred)
             }
             Err(err) => {
                 // Gate infrastructure failure — fail-open.
                 // No decision was produced; no audit event is persisted.
                 tracing::warn!(verb, error = %err, "gate check failed (fail-open)");
-                None
+                (None, None)
             }
         };
 
@@ -1155,6 +1184,62 @@ impl VerbRegistry {
                 let dispatch_start = Instant::now();
                 let result = pack.dispatch(verb, params, self, &token).await;
                 let dispatch_us = dispatch_start.elapsed().as_micros() as i64;
+
+                // #676: append the deferred singleton `link` audit row now that
+                // dispatch has resolved. Success enriches the row with the
+                // created/resolved edge (schema v2); anything that cannot be
+                // enriched falls back to the v1 audit shape so no audit row is
+                // ever dropped for the deferred path.
+                if let Some(audit) = deferred_link_audit.take() {
+                    if let Some(store) = &self.event_store {
+                        match &result {
+                            Ok(ok_val) => {
+                                match link_audit_success_from_result(audit.clone(), ok_val) {
+                                    Some((edge_id, payload)) => {
+                                        let storage_event = Event::new(
+                                            gate_req.namespace.as_str(),
+                                            gate_req.verb.as_str(),
+                                            EventKind::Audit,
+                                            SubstrateKind::Event,
+                                            format!(
+                                                "{}:{}",
+                                                gate_req.actor.kind, gate_req.actor.id
+                                            ),
+                                        )
+                                        .with_outcome(EventOutcome::Success)
+                                        .with_target(edge_id)
+                                        .with_payload(payload)
+                                        .with_payload_schema_version(2);
+                                        append_audit_event_best_effort(store, storage_event, verb)
+                                            .await;
+                                    }
+                                    None => {
+                                        tracing::warn!(
+                                            verb,
+                                            "link audit v2 enrichment parse failed; \
+                                             falling back to v1 audit shape"
+                                        );
+                                        let storage_event = build_audit_storage_event(
+                                            &gate_req,
+                                            &audit,
+                                            EventOutcome::Success,
+                                        );
+                                        append_audit_event_best_effort(store, storage_event, verb)
+                                            .await;
+                                    }
+                                }
+                            }
+                            Err(_) => {
+                                let storage_event = build_audit_storage_event(
+                                    &gate_req,
+                                    &audit,
+                                    EventOutcome::Success,
+                                );
+                                append_audit_event_best_effort(store, storage_event, verb).await;
+                            }
+                        }
+                    }
+                }
 
                 // Post-dispatch hook: fires on success, opt-in (Issue #158).
                 if let (Ok(ref ok_val), Some(hook)) = (&result, &self.dispatch_hook) {
@@ -1763,6 +1848,100 @@ fn target_id_from_args(args: &serde_json::Value) -> Option<uuid::Uuid> {
     args.get("target_id")
         .and_then(serde_json::Value::as_str)
         .and_then(|s| s.parse::<uuid::Uuid>().ok())
+}
+
+/// Build a v1-shape audit storage event from a gate check outcome.
+///
+/// Shared by the immediate-append path (all verbs, denied calls, bulk
+/// `links`) and the deferred singleton-`link` fallback (#676) so both audit
+/// shapes are produced by one code path.
+fn build_audit_storage_event(
+    gate_req: &GateRequest,
+    audit: &AuditEvent,
+    outcome: EventOutcome,
+) -> Event {
+    let audit_data = serde_json::to_value(audit).unwrap_or_else(|e| {
+        tracing::warn!(error = %e, "failed to serialize AuditEvent for EventStore");
+        serde_json::Value::Null
+    });
+    let mut storage_event = Event::new(
+        gate_req.namespace.as_str(),
+        gate_req.verb.as_str(),
+        EventKind::Audit,
+        SubstrateKind::Event,
+        format!("{}:{}", gate_req.actor.kind, gate_req.actor.id),
+    )
+    .with_outcome(outcome)
+    .with_payload(audit_data);
+    if let Some(target_id) = target_id_from_args(&gate_req.args) {
+        storage_event = storage_event.with_target(target_id);
+    }
+    storage_event
+}
+
+/// Append an audit event, logging and swallowing store failures.
+///
+/// Audit persistence is best-effort everywhere in the dispatch path: a store
+/// write failure must never fail the verb call it is auditing.
+async fn append_audit_event_best_effort(store: &Arc<dyn EventStore>, event: Event, verb: &str) {
+    if let Err(store_err) = store.append_event(event).await {
+        tracing::warn!(
+            verb,
+            error = %store_err,
+            "audit event store write failed (non-fatal)"
+        );
+    }
+}
+
+/// Schema v2 audit payload for a successful singleton `link` call (#676).
+///
+/// Additive over the v1 `AuditEvent` shape: every v1 field is preserved via
+/// `#[serde(flatten)]`, and the edge identity/relation/weight the caller
+/// created or resolved are added at the top level.
+#[derive(Debug, Clone, serde::Serialize)]
+struct LinkAuditSuccessV2 {
+    #[serde(flatten)]
+    audit: AuditEvent,
+    edge_id: uuid::Uuid,
+    source_id: uuid::Uuid,
+    target_id: uuid::Uuid,
+    relation: String,
+    weight: f64,
+}
+
+/// Extract the edge fields needed to enrich a successful singleton `link`
+/// audit row from the handler's returned JSON.
+///
+/// Returns `None` (rather than a `Result`) on any missing/malformed field —
+/// the caller treats that as "cannot enrich" and falls back to the v1 audit
+/// shape instead of failing the already-succeeded `link` call.
+fn link_audit_success_from_result(
+    audit: AuditEvent,
+    result: &serde_json::Value,
+) -> Option<(uuid::Uuid, serde_json::Value)> {
+    let edge_id = result.get("id")?.as_str()?.parse::<uuid::Uuid>().ok()?;
+    let source_id = result
+        .get("source_id")?
+        .as_str()?
+        .parse::<uuid::Uuid>()
+        .ok()?;
+    let target_id = result
+        .get("target_id")?
+        .as_str()?
+        .parse::<uuid::Uuid>()
+        .ok()?;
+    let relation = result.get("relation")?.as_str()?.to_string();
+    let weight = result.get("weight")?.as_f64()?;
+    let enriched = LinkAuditSuccessV2 {
+        audit,
+        edge_id,
+        source_id,
+        target_id,
+        relation,
+        weight,
+    };
+    let payload = serde_json::to_value(&enriched).ok()?;
+    Some((edge_id, payload))
 }
 
 /// Resolve and validate a caller-supplied `namespace` argument the same way
@@ -3590,6 +3769,359 @@ mod tests {
             page.items[0].target_id,
             Some(target),
             "#282: audit event must carry target_id from dispatch params"
+        );
+    }
+
+    // ---- #676: link-verb audit enrichment ----
+
+    /// Test pack exposing a single `link` verb whose one-shot result is
+    /// configured up front — lets tests drive both the success and failure
+    /// legs of the deferred link-audit path without a real KG backend.
+    struct LinkResultPack {
+        result: std::sync::Mutex<Option<Result<Value, RuntimeError>>>,
+    }
+
+    impl LinkResultPack {
+        fn ok(value: Value) -> Self {
+            Self {
+                result: std::sync::Mutex::new(Some(Ok(value))),
+            }
+        }
+        fn err(message: &str) -> Self {
+            Self {
+                result: std::sync::Mutex::new(Some(Err(RuntimeError::InvalidInput(
+                    message.to_string(),
+                )))),
+            }
+        }
+    }
+
+    impl khive_types::Pack for LinkResultPack {
+        const NAME: &'static str = "kg";
+        const NOTE_KINDS: &'static [&'static str] = &[];
+        const ENTITY_KINDS: &'static [&'static str] = &[];
+        const HANDLERS: &'static [HandlerDef] = &[HandlerDef {
+            name: "link",
+            description: "test link handler",
+            visibility: Visibility::Verb,
+            category: VerbCategory::Commissive,
+            params: &[],
+        }];
+    }
+
+    #[async_trait]
+    impl PackRuntime for LinkResultPack {
+        fn name(&self) -> &str {
+            Self::NAME
+        }
+        fn note_kinds(&self) -> &'static [&'static str] {
+            Self::NOTE_KINDS
+        }
+        fn entity_kinds(&self) -> &'static [&'static str] {
+            Self::ENTITY_KINDS
+        }
+        fn handlers(&self) -> &'static [HandlerDef] {
+            Self::HANDLERS
+        }
+        async fn dispatch(
+            &self,
+            _verb: &str,
+            _params: Value,
+            _registry: &VerbRegistry,
+            _token: &NamespaceToken,
+        ) -> Result<Value, RuntimeError> {
+            self.result
+                .lock()
+                .unwrap()
+                .take()
+                .expect("LinkResultPack dispatch called more than once in a test")
+        }
+    }
+
+    #[tokio::test]
+    async fn link_audit_enriches_successful_singleton_with_edge_v2() {
+        let store = Arc::new(MemoryEventStore::default());
+        let edge_id = uuid::Uuid::new_v4();
+        let source_id = uuid::Uuid::new_v4();
+        let target_id = uuid::Uuid::new_v4();
+        let edge_json = serde_json::json!({
+            "id": edge_id,
+            "namespace": "local",
+            "source_id": source_id,
+            "target_id": target_id,
+            "relation": "depends_on",
+            "weight": 1.0,
+        });
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(LinkResultPack::ok(edge_json));
+        builder.with_event_store(store.clone());
+        builder.with_default_namespace("test-ns");
+        let reg = builder.build().expect("registry builds");
+
+        reg.dispatch(
+            "link",
+            serde_json::json!({
+                "source_id": source_id,
+                "target_id": target_id,
+                "relation": "depends_on",
+            }),
+        )
+        .await
+        .unwrap();
+
+        let count = store.count_events(EventFilter::default()).await.unwrap();
+        assert_eq!(
+            count, 1,
+            "exactly one deferred audit row must be persisted for a successful singleton link"
+        );
+        let page = store
+            .query_events(
+                EventFilter::default(),
+                PageRequest {
+                    limit: 10,
+                    offset: 0,
+                },
+            )
+            .await
+            .unwrap();
+        let ev = &page.items[0];
+        assert_eq!(ev.verb, "link");
+        assert_eq!(ev.outcome, EventOutcome::Success);
+        assert_eq!(
+            ev.payload_schema_version, 2,
+            "successful singleton link uses audit schema v2"
+        );
+        assert_eq!(
+            ev.target_id,
+            Some(edge_id),
+            "target_id must be the created/resolved edge id, not a raw caller arg"
+        );
+        assert_eq!(ev.payload["edge_id"], serde_json::json!(edge_id));
+        assert_eq!(ev.payload["source_id"], serde_json::json!(source_id));
+        assert_eq!(ev.payload["target_id"], serde_json::json!(target_id));
+        assert_eq!(ev.payload["relation"], "depends_on");
+        assert_eq!(ev.payload["weight"], 1.0);
+        // v1 AuditEvent fields remain present via #[serde(flatten)].
+        assert_eq!(ev.payload["verb"], "link");
+        assert_eq!(ev.payload["decision"], "allow");
+        assert!(ev.payload.get("gate_impl").is_some());
+    }
+
+    #[tokio::test]
+    async fn link_audit_falls_back_to_v1_when_dispatch_fails() {
+        let store = Arc::new(MemoryEventStore::default());
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(LinkResultPack::err("target endpoint not found"));
+        builder.with_event_store(store.clone());
+        builder.with_default_namespace("test-ns");
+        let reg = builder.build().expect("registry builds");
+
+        let err = reg
+            .dispatch(
+                "link",
+                serde_json::json!({
+                    "source_id": "note:alpha",
+                    "target_id": "note:missing",
+                    "relation": "depends_on",
+                }),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, RuntimeError::InvalidInput(ref msg) if msg.contains("not found")),
+            "the original dispatch error must be returned unchanged"
+        );
+
+        let page = store
+            .query_events(
+                EventFilter::default(),
+                PageRequest {
+                    limit: 10,
+                    offset: 0,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            page.items.len(),
+            1,
+            "a v1 fallback audit row must still be persisted on dispatch failure"
+        );
+        let ev = &page.items[0];
+        assert_eq!(
+            ev.payload_schema_version, 1,
+            "failed link keeps the v1 audit shape"
+        );
+        assert_eq!(
+            ev.outcome,
+            EventOutcome::Success,
+            "outcome reflects the gate decision (Allow), not the dispatch result"
+        );
+        assert!(
+            ev.target_id.is_none(),
+            "non-UUID caller-supplied ids do not spuriously populate target_id"
+        );
+        assert!(
+            ev.payload.get("edge_id").is_none(),
+            "v1 fallback must not carry edge enrichment fields"
+        );
+        let _: khive_gate::AuditEvent = serde_json::from_value(ev.payload.clone())
+            .expect("v1 fallback payload must deserialize as AuditEvent");
+    }
+
+    #[tokio::test]
+    async fn link_audit_falls_back_to_v1_when_result_missing_edge_fields() {
+        let store = Arc::new(MemoryEventStore::default());
+        let target_arg = uuid::Uuid::new_v4();
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(LinkResultPack::ok(serde_json::json!({"ok": true})));
+        builder.with_event_store(store.clone());
+        builder.with_default_namespace("test-ns");
+        let reg = builder.build().expect("registry builds");
+
+        reg.dispatch(
+            "link",
+            serde_json::json!({
+                "source_id": uuid::Uuid::new_v4(),
+                "target_id": target_arg,
+                "relation": "depends_on",
+            }),
+        )
+        .await
+        .unwrap();
+
+        let page = store
+            .query_events(
+                EventFilter::default(),
+                PageRequest {
+                    limit: 10,
+                    offset: 0,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(page.items.len(), 1);
+        let ev = &page.items[0];
+        assert_eq!(
+            ev.payload_schema_version, 1,
+            "an unparsable success result falls back to v1 rather than dropping the audit row"
+        );
+        assert_eq!(ev.outcome, EventOutcome::Success);
+        assert_eq!(
+            ev.target_id,
+            Some(target_arg),
+            "v1 fallback still extracts target_id from the raw dispatch args"
+        );
+        assert!(ev.payload.get("edge_id").is_none());
+    }
+
+    #[tokio::test]
+    async fn link_audit_bulk_links_get_no_enrichment() {
+        let store = Arc::new(MemoryEventStore::default());
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(LinkResultPack::ok(serde_json::json!({
+            "attempted": 2, "created": 2, "skipped": 0, "failed": 0
+        })));
+        builder.with_event_store(store.clone());
+        builder.with_default_namespace("test-ns");
+        let reg = builder.build().expect("registry builds");
+
+        reg.dispatch(
+            "link",
+            serde_json::json!({
+                "links": [
+                    {"source_id": "a", "target_id": "b", "relation": "depends_on"},
+                    {"source_id": "c", "target_id": "d", "relation": "depends_on"},
+                ],
+            }),
+        )
+        .await
+        .unwrap();
+
+        let count = store.count_events(EventFilter::default()).await.unwrap();
+        assert_eq!(
+            count, 1,
+            "bulk `links` gets exactly one immediate v1 audit row, not deferred"
+        );
+        let page = store
+            .query_events(
+                EventFilter::default(),
+                PageRequest {
+                    limit: 10,
+                    offset: 0,
+                },
+            )
+            .await
+            .unwrap();
+        let ev = &page.items[0];
+        assert_eq!(
+            ev.payload_schema_version, 1,
+            "bulk link mode is out of scope for #676's events.target_id enrichment"
+        );
+        assert!(ev.target_id.is_none());
+    }
+
+    #[test]
+    fn link_audit_success_from_result_extracts_edge_fields() {
+        let gate_req = GateRequest::new(
+            ActorRef::anonymous(),
+            Namespace::local(),
+            "link",
+            serde_json::json!({}),
+        );
+        let decision = GateDecision::Allow {
+            obligations: vec![],
+        };
+        let audit = AuditEvent::from_check(&gate_req, &decision, "AllowAllGate");
+
+        let edge_id = uuid::Uuid::new_v4();
+        let source_id = uuid::Uuid::new_v4();
+        let target_id = uuid::Uuid::new_v4();
+        let result = serde_json::json!({
+            "id": edge_id,
+            "source_id": source_id,
+            "target_id": target_id,
+            "relation": "depends_on",
+            "weight": 0.5,
+        });
+
+        let (returned_id, payload) = link_audit_success_from_result(audit, &result)
+            .expect("well-formed edge JSON must produce an enriched payload");
+        assert_eq!(returned_id, edge_id);
+        assert_eq!(payload["edge_id"], serde_json::json!(edge_id));
+        assert_eq!(payload["relation"], "depends_on");
+        assert_eq!(payload["weight"], 0.5);
+        assert_eq!(
+            payload["verb"], "link",
+            "v1 AuditEvent fields must flatten into the v2 payload"
+        );
+    }
+
+    #[test]
+    fn link_audit_success_from_result_rejects_incomplete_or_malformed_result() {
+        let gate_req = GateRequest::new(
+            ActorRef::anonymous(),
+            Namespace::local(),
+            "link",
+            serde_json::json!({}),
+        );
+        let decision = GateDecision::Allow {
+            obligations: vec![],
+        };
+        let audit = AuditEvent::from_check(&gate_req, &decision, "AllowAllGate");
+
+        assert!(
+            link_audit_success_from_result(
+                audit.clone(),
+                &serde_json::json!({"id": uuid::Uuid::new_v4()}),
+            )
+            .is_none(),
+            "missing source_id/target_id/relation/weight must not enrich"
+        );
+        assert!(
+            link_audit_success_from_result(audit, &serde_json::json!({"id": "not-a-uuid"}))
+                .is_none(),
+            "a non-UUID id must not enrich"
         );
     }
 }

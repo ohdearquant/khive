@@ -92,6 +92,21 @@ static TRUNCATE_ATTEMPTS: AtomicU64 = AtomicU64::new(0);
 /// gauge every time `note_truncate_outcome` runs.
 static TRUNCATE_CONSECUTIVE_FAILURES: AtomicU64 = AtomicU64::new(0);
 
+/// Count of checkpoint ticks skipped because the writer mutex was already
+/// held (ADR-091 checkpoint-pressure telemetry), across this process's
+/// lifetime. Never reset outside `#[cfg(test)]`.
+static CHECKPOINT_SKIPPED_TICKS: AtomicU64 = AtomicU64::new(0);
+
+/// Current run-length of consecutive skipped ticks. Reset to 0 the next time
+/// a tick is actually observed (writer free), so a sustained skip streak is
+/// visible even between two successful observations.
+static CHECKPOINT_CONSECUTIVE_SKIPS: AtomicU64 = AtomicU64::new(0);
+
+/// WAL page count as of the most recent *observed* tick, snapshotted at the
+/// moment a skip occurs. `u64::MAX` is the "no skip has recorded a snapshot
+/// yet" sentinel, mirroring `LAST_WAL_PAGES`.
+static CHECKPOINT_LAST_SKIP_WAL_PAGES: AtomicU64 = AtomicU64::new(u64::MAX);
+
 /// Last-observed WAL page count, if any checkpoint tick has run yet in this
 /// process. Read surface for the daemon-frame metrics snapshot.
 pub fn last_observed_wal_pages() -> Option<u64> {
@@ -111,6 +126,54 @@ pub fn truncate_consecutive_failures() -> u64 {
     TRUNCATE_CONSECUTIVE_FAILURES.load(Ordering::Relaxed)
 }
 
+/// Total checkpoint ticks skipped (writer busy) in this process's lifetime.
+pub fn checkpoint_skipped_ticks() -> u64 {
+    CHECKPOINT_SKIPPED_TICKS.load(Ordering::Relaxed)
+}
+
+/// Current consecutive-skip run length; 0 once the next tick is observed.
+pub fn checkpoint_consecutive_skips() -> u64 {
+    CHECKPOINT_CONSECUTIVE_SKIPS.load(Ordering::Relaxed)
+}
+
+/// WAL page count last known at the time of the most recent skip, if any
+/// skip has occurred yet in this process.
+pub fn checkpoint_last_skip_wal_pages() -> Option<u64> {
+    match CHECKPOINT_LAST_SKIP_WAL_PAGES.load(Ordering::Relaxed) {
+        u64::MAX => None,
+        pages => Some(pages),
+    }
+}
+
+/// A tick's writer checkout was skipped (mutex busy): bump the lifetime and
+/// consecutive-skip counters and snapshot the last-known WAL pressure so an
+/// operator can see how bad the WAL was heading into the skip streak.
+fn note_checkpoint_skipped() {
+    CHECKPOINT_SKIPPED_TICKS.fetch_add(1, Ordering::Relaxed);
+    CHECKPOINT_CONSECUTIVE_SKIPS.fetch_add(1, Ordering::Relaxed);
+    if let Some(pages) = last_observed_wal_pages() {
+        CHECKPOINT_LAST_SKIP_WAL_PAGES.store(pages, Ordering::Relaxed);
+    }
+}
+
+/// A tick was actually observed (writer free): close out any prior skip
+/// streak. `_wal_pages` is accepted for call-site symmetry with
+/// `note_checkpoint_skipped` and to leave room for a future observed-side
+/// gauge without changing this function's signature again.
+fn note_checkpoint_observed(_wal_pages: u64) {
+    CHECKPOINT_CONSECUTIVE_SKIPS.store(0, Ordering::Relaxed);
+}
+
+/// Reset the checkpoint-pressure atomics between tests. Process-wide gauges
+/// are otherwise shared across every test in this binary; tests that assert
+/// on them must reset first and run under a shared `#[serial(...)]` group.
+#[cfg(test)]
+pub(crate) fn reset_checkpoint_metrics_for_tests() {
+    CHECKPOINT_SKIPPED_TICKS.store(0, Ordering::Relaxed);
+    CHECKPOINT_CONSECUTIVE_SKIPS.store(0, Ordering::Relaxed);
+    CHECKPOINT_LAST_SKIP_WAL_PAGES.store(u64::MAX, Ordering::Relaxed);
+}
+
 /// Outcome of a single checkpoint attempt.
 ///
 /// `Skipped` is returned when the writer mutex is already held (the tick is a
@@ -125,6 +188,10 @@ pub enum CheckpointTick {
     /// A checkpoint was issued; the value is the observed WAL page count.
     Observed(u64),
 }
+
+/// Default number of consecutive above-`warn_pages` observed ticks required
+/// to escalate from the INFO to the WARN rung of the ADR-091 severity ladder.
+pub const DEFAULT_WARN_SUSTAINED_CYCLES: u8 = 3;
 
 /// Configuration for the WAL checkpoint background task.
 ///
@@ -143,6 +210,15 @@ pub struct CheckpointConfig {
     /// Overridable via `KHIVE_WAL_WARN_PAGES`.
     /// Default: 2000 pages (~8 MB at 4 KiB page size).
     pub warn_pages: u64,
+
+    /// Number of consecutive observed ticks with `wal_pages >= warn_pages`
+    /// required before the ADR-091 severity ladder escalates from INFO
+    /// (first crossing) to WARN (sustained pressure). Edge-triggered once
+    /// per elevation episode — see [`CheckpointSeverityState`].
+    ///
+    /// Overridable via `KHIVE_WAL_WARN_SUSTAINED_CYCLES`.
+    /// Default: 3 cycles.
+    pub warn_sustained_cycles: u8,
 
     /// WAL page count above which a high-pressure WARNING is logged.
     ///
@@ -192,6 +268,7 @@ impl Default for CheckpointConfig {
         Self {
             interval: Duration::from_millis(500),
             warn_pages: 2000,
+            warn_sustained_cycles: DEFAULT_WARN_SUSTAINED_CYCLES,
             high_water_pages: 6000,
             truncate_high_water_pages: 20_000,
             truncate_min_interval: Duration::from_secs(300),
@@ -219,6 +296,14 @@ impl CheckpointConfig {
             if let Ok(n) = v.parse::<u64>() {
                 if n > 0 {
                     cfg.warn_pages = n;
+                }
+            }
+        }
+
+        if let Ok(v) = std::env::var("KHIVE_WAL_WARN_SUSTAINED_CYCLES") {
+            if let Ok(n) = v.parse::<u8>() {
+                if n > 0 {
+                    cfg.warn_sustained_cycles = n;
                 }
             }
         }
@@ -278,6 +363,110 @@ pub struct TruncateState {
     consecutive_failures: u32,
 }
 
+/// ADR-091 graduated severity rung for sustained WAL pressure.
+///
+/// `Alarm` is never produced by [`CheckpointSeverityState::observe_wal_pages`]
+/// — it labels the existing TRUNCATE-escalation tier (`maybe_truncate`),
+/// which is gated on its own threshold/interval state, not on this ladder.
+/// It exists here so callers and tests can name all three rungs uniformly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CheckpointSeverityRung {
+    /// First observed tick crossing `warn_pages` after a below-warn tick.
+    Info,
+    /// `warn_sustained_cycles` consecutive observed ticks at/above
+    /// `warn_pages`; edge-triggered once per elevation episode.
+    Warn,
+    /// The TRUNCATE-escalation tier (`checkpoint_high_water_pages` and
+    /// above); never emitted by `observe_wal_pages`.
+    Alarm,
+}
+
+/// ADR-091 severity ladder state, carried across ticks by the caller
+/// alongside [`TruncateState`]. Pure state machine: no I/O, no logging —
+/// callers turn the returned emissions into `tracing` calls.
+#[derive(Debug, Default, Clone)]
+pub struct CheckpointSeverityState {
+    /// Whether the previous observed tick was at/above `warn_pages`. Drives
+    /// the below→above edge that fires INFO.
+    was_above_warn: bool,
+    /// Run-length of consecutive observed ticks at/above `warn_pages` in the
+    /// current elevation episode. Resets to 0 on any below-warn tick.
+    consecutive_above_warn: u8,
+    /// Whether WARN has already fired for the current elevation episode, so
+    /// sustained pressure logs WARN once per episode, not once per tick past
+    /// the threshold.
+    warn_emitted_for_episode: bool,
+}
+
+/// One severity-ladder emission produced by a single
+/// [`CheckpointSeverityState::observe_wal_pages`] call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CheckpointSeverityEmission {
+    /// Which rung this emission represents (`Info` or `Warn`; see
+    /// [`CheckpointSeverityRung::Alarm`] doc for why `Alarm` never appears
+    /// here).
+    pub rung: CheckpointSeverityRung,
+    /// The WAL page count observed on the tick that produced this emission.
+    pub wal_pages: u64,
+    /// The `warn_pages` threshold in effect for this tick.
+    pub threshold_pages: u64,
+    /// Consecutive above-warn cycle count as of this tick (1 on the INFO
+    /// edge, `warn_sustained_cycles` on the WARN edge).
+    pub consecutive_cycles: u8,
+}
+
+impl CheckpointSeverityState {
+    /// Advance the severity ladder by one observed tick and return every
+    /// rung crossed on this tick (zero, one, or two emissions: a fresh
+    /// elevation episode can produce INFO and, if `warn_sustained_cycles`
+    /// is 1, WARN on the very same tick).
+    ///
+    /// A below-warn tick resets both the consecutive-cycle counter and the
+    /// per-episode WARN latch, re-arming INFO/WARN for a later episode.
+    /// Skipped ticks must not be passed here at all — the caller only calls
+    /// this on `CheckpointTick::Observed`, matching the existing
+    /// threshold-crossing WARN's skip-leaves-state-unchanged rule.
+    pub fn observe_wal_pages(
+        &mut self,
+        wal_pages: u64,
+        config: &CheckpointConfig,
+    ) -> Vec<CheckpointSeverityEmission> {
+        let mut emissions = Vec::new();
+        let above_warn = wal_pages >= config.warn_pages;
+
+        if above_warn {
+            self.consecutive_above_warn = self.consecutive_above_warn.saturating_add(1);
+
+            if !self.was_above_warn {
+                emissions.push(CheckpointSeverityEmission {
+                    rung: CheckpointSeverityRung::Info,
+                    wal_pages,
+                    threshold_pages: config.warn_pages,
+                    consecutive_cycles: self.consecutive_above_warn,
+                });
+            }
+
+            if !self.warn_emitted_for_episode
+                && self.consecutive_above_warn >= config.warn_sustained_cycles
+            {
+                emissions.push(CheckpointSeverityEmission {
+                    rung: CheckpointSeverityRung::Warn,
+                    wal_pages,
+                    threshold_pages: config.warn_pages,
+                    consecutive_cycles: self.consecutive_above_warn,
+                });
+                self.warn_emitted_for_episode = true;
+            }
+        } else {
+            self.consecutive_above_warn = 0;
+            self.warn_emitted_for_episode = false;
+        }
+
+        self.was_above_warn = above_warn;
+        emissions
+    }
+}
+
 /// Run the WAL checkpoint background task.
 ///
 /// This is a long-running async task that should be spawned with
@@ -299,12 +488,30 @@ pub struct TruncateState {
 ///
 /// Uses `try_writer_nowait` (zero-wait try-lock) so a busy writer causes the
 /// current tick to be skipped rather than stalling write traffic.
-pub async fn run_checkpoint_task(pool: Arc<ConnectionPool>, config: CheckpointConfig) {
+///
+/// `event_store` (ADR-094): when `Some`, this task appends a best-effort
+/// `CheckpointOutcomeRecorded` lifecycle event on every tick where WAL
+/// pressure is at/above `warn_pages`, plus exactly one drain row on the tick
+/// that observes pressure fall back below `warn_pages` after an elevated
+/// episode — never on every ordinary below-warn tick. `namespace` is
+/// stamped on those rows. `None` makes event emission a pure no-op, exactly
+/// like an unconfigured audit sink elsewhere in the runtime.
+pub async fn run_checkpoint_task(
+    pool: Arc<ConnectionPool>,
+    config: CheckpointConfig,
+    event_store: Option<Arc<dyn khive_storage::EventStore>>,
+    namespace: String,
+) {
     let mut interval = tokio::time::interval(config.interval);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    let mut was_above_warn = false;
+    let mut severity_state = CheckpointSeverityState::default();
     let mut was_above_high_water = false;
     let mut truncate_state = TruncateState::default();
+    // Independent of `severity_state` (which owns the WARN-episode ladder
+    // internally): this tracks only the "was the previous observed tick
+    // elevated" edge the ADR-094 event emission needs, so the event path
+    // never has to reach into the severity state machine's private fields.
+    let mut event_was_elevated = false;
 
     loop {
         interval.tick().await;
@@ -325,6 +532,7 @@ pub async fn run_checkpoint_task(pool: Arc<ConnectionPool>, config: CheckpointCo
 
         let above_warn = wal_pages >= config.warn_pages;
         let above_high_water = wal_pages >= config.high_water_pages;
+        let above_truncate_high_water = wal_pages >= config.truncate_high_water_pages;
 
         // Per-tick debug for the oldest open entry always fires (cheap, single
         // `oldest()` lookup); the two `warn!`-level registry logs below are
@@ -332,14 +540,32 @@ pub async fn run_checkpoint_task(pool: Arc<ConnectionPool>, config: CheckpointCo
         // so sustained pressure logs once per crossing, not once per tick.
         log_tx_registry_oldest_debug(wal_pages);
 
-        let warn_crossed = crossing_warn(above_warn, &mut was_above_warn);
-        if warn_crossed {
-            log_tx_registry_oldest_warn(wal_pages);
-            tracing::warn!(
-                wal_pages,
-                warn_threshold = config.warn_pages,
-                "WAL page count approaching checkpoint threshold"
-            );
+        // ADR-091 severity ladder: INFO on the first below→above crossing,
+        // WARN once `warn_sustained_cycles` consecutive ticks stay elevated.
+        // The oldest-entry registry WARN rides the same INFO edge the old
+        // binary crossing_warn used to gate on.
+        for emission in severity_state.observe_wal_pages(wal_pages, &config) {
+            match emission.rung {
+                CheckpointSeverityRung::Info => {
+                    log_tx_registry_oldest_warn(wal_pages);
+                    tracing::info!(
+                        wal_pages = emission.wal_pages,
+                        warn_threshold = emission.threshold_pages,
+                        "WAL page count crossed warn threshold"
+                    );
+                }
+                CheckpointSeverityRung::Warn => {
+                    tracing::warn!(
+                        wal_pages = emission.wal_pages,
+                        warn_threshold = emission.threshold_pages,
+                        consecutive_cycles = emission.consecutive_cycles,
+                        "WAL page count failed to drain below warn threshold"
+                    );
+                }
+                CheckpointSeverityRung::Alarm => {
+                    // Never produced by `observe_wal_pages`; see its doc.
+                }
+            }
         }
 
         let high_water_crossed = crossing_warn(above_high_water, &mut was_above_high_water);
@@ -352,6 +578,81 @@ pub async fn run_checkpoint_task(pool: Arc<ConnectionPool>, config: CheckpointCo
                  a long-lived reader may be pinning an old snapshot that PASSIVE cannot reclaim"
             );
         }
+
+        // ADR-094: emit every elevated tick, plus exactly one drain row on
+        // the tick that observes the episode end — never on every ordinary
+        // below-warn tick.
+        if checkpoint_outcome_should_emit(above_warn, event_was_elevated) {
+            let payload = khive_storage::CheckpointOutcomeRecordedPayload {
+                wal_pages,
+                warn_pages: config.warn_pages,
+                high_water_pages: config.high_water_pages,
+                truncate_high_water_pages: config.truncate_high_water_pages,
+                above_warn,
+                above_high_water,
+                above_truncate_high_water,
+            };
+            append_checkpoint_lifecycle_event(
+                event_store.as_ref(),
+                &namespace,
+                khive_types::EventKind::CheckpointOutcomeRecorded,
+                payload,
+            )
+            .await;
+        }
+        event_was_elevated = above_warn;
+    }
+}
+
+/// Whether a `CheckpointOutcomeRecorded` event should be emitted for this
+/// tick: every elevated (`above_warn`) tick, plus exactly one drain row on
+/// the first tick that observes a return to below-warn after an elevated
+/// episode (`was_elevated`). An ordinary below-warn tick following another
+/// below-warn tick emits nothing.
+fn checkpoint_outcome_should_emit(above_warn: bool, was_elevated: bool) -> bool {
+    above_warn || was_elevated
+}
+
+/// Append one ADR-094 lifecycle event on behalf of the checkpoint task.
+///
+/// Best-effort: `event_store == None` is a no-op, and an append failure is
+/// logged and swallowed. No lifecycle-append error may ever interrupt or
+/// slow down checkpoint/TRUNCATE work — the checkpoint task's correctness
+/// does not depend on this succeeding.
+async fn append_checkpoint_lifecycle_event<P: serde::Serialize>(
+    store: Option<&Arc<dyn khive_storage::EventStore>>,
+    namespace: &str,
+    kind: khive_types::EventKind,
+    payload: P,
+) {
+    let Some(store) = store else {
+        return;
+    };
+    let payload_value = match serde_json::to_value(&payload) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                event_kind = %kind.name(),
+                "failed to serialize checkpoint lifecycle event payload"
+            );
+            return;
+        }
+    };
+    let event = khive_storage::Event::new(
+        namespace,
+        "checkpoint.lifecycle",
+        kind,
+        khive_types::SubstrateKind::Event,
+        "daemon:checkpoint_task",
+    )
+    .with_payload(payload_value);
+    if let Err(err) = store.append_event(event).await {
+        tracing::warn!(
+            error = %err,
+            event_kind = %kind.name(),
+            "checkpoint lifecycle event append failed"
+        );
     }
 }
 
@@ -432,7 +733,10 @@ pub fn checkpoint_once(
 ) -> CheckpointTick {
     let writer = match pool.try_writer_nowait() {
         Ok(w) => w,
-        Err(_) => return CheckpointTick::Skipped,
+        Err(_) => {
+            note_checkpoint_skipped();
+            return CheckpointTick::Skipped;
+        }
     };
 
     let wal_pages = query_wal_pages(writer.conn());
@@ -621,6 +925,7 @@ fn query_wal_pages(conn: &rusqlite::Connection) -> u64 {
     // the process-wide gauge, regardless of which caller (`checkpoint_once`
     // or `maybe_truncate`) triggered it.
     LAST_WAL_PAGES.store(pages, Ordering::Relaxed);
+    note_checkpoint_observed(pages);
     pages
 }
 
@@ -878,7 +1183,12 @@ mod tests {
 
         let weak = Arc::downgrade(&pool);
         let task_pool = Arc::clone(&pool);
-        let handle = tokio::spawn(run_checkpoint_task(task_pool, cfg));
+        let handle = tokio::spawn(run_checkpoint_task(
+            task_pool,
+            cfg,
+            None,
+            "local".to_string(),
+        ));
 
         // Drop our copy — only the task holds the Arc now.
         drop(pool);
@@ -1288,10 +1598,14 @@ mod tests {
     /// Busy fallback: when the writer mutex is already held, `checkpoint_once`
     /// must return `Skipped` and never touch the TRUNCATE state at all — both
     /// PASSIVE and any due TRUNCATE are skipped together (one writer checkout
-    /// per tick).
+    /// per tick). Also asserts #646 checkpoint-pressure telemetry: a skipped
+    /// tick must bump the skipped/consecutive-skip counters and snapshot the
+    /// last-known WAL pressure.
     #[test]
-    #[serial(tx_registry)]
+    #[serial(tx_registry, checkpoint_skip_metrics)]
     fn busy_writer_skips_both_passive_and_truncate() {
+        reset_checkpoint_metrics_for_tests();
+
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("truncate_busy_skip.db");
         let pool = file_pool(&path);
@@ -1305,6 +1619,20 @@ mod tests {
                 )
                 .unwrap();
         }
+
+        // An observed tick first, so the skip below has a last-known WAL
+        // pressure snapshot to carry forward.
+        let mut warmup_state = TruncateState::default();
+        let warmup_tick = checkpoint_once(&pool, &CheckpointConfig::default(), &mut warmup_state);
+        let observed_pages = match warmup_tick {
+            CheckpointTick::Observed(n) => n,
+            CheckpointTick::Skipped => panic!("warmup tick must observe, not skip"),
+        };
+        assert_eq!(
+            checkpoint_consecutive_skips(),
+            0,
+            "an observed tick must not itself count as a skip"
+        );
 
         // Hold the writer mutex for the duration of the checkpoint_once call so
         // try_writer_nowait() fails, exactly like a concurrent write in progress.
@@ -1327,6 +1655,73 @@ mod tests {
             state.last_attempt.is_none(),
             "a skipped tick (writer busy) must never stamp last_attempt, \
              even with a threshold that would otherwise arm immediately"
+        );
+
+        assert_eq!(
+            checkpoint_skipped_ticks(),
+            1,
+            "one skipped tick must bump the lifetime skipped-tick counter"
+        );
+        assert_eq!(
+            checkpoint_consecutive_skips(),
+            1,
+            "one skipped tick must bump the consecutive-skip run length"
+        );
+        assert_eq!(
+            checkpoint_last_skip_wal_pages(),
+            Some(observed_pages),
+            "the skip must snapshot the last-observed WAL pressure"
+        );
+    }
+
+    /// Observation branch: a checkpoint tick that is actually observed (writer
+    /// free) must close out a prior skip streak, resetting the
+    /// consecutive-skip counter to 0 without touching the lifetime total.
+    #[test]
+    #[serial(tx_registry, checkpoint_skip_metrics)]
+    fn observed_tick_resets_consecutive_skips_but_not_lifetime_total() {
+        reset_checkpoint_metrics_for_tests();
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("skip_then_observe.db");
+        let pool = file_pool(&path);
+
+        {
+            let writer = pool.try_writer().unwrap();
+            writer
+                .conn()
+                .execute_batch(
+                    "CREATE TABLE IF NOT EXISTS t (x INTEGER); INSERT INTO t VALUES (1);",
+                )
+                .unwrap();
+        }
+
+        // Two consecutive skipped ticks.
+        {
+            let _held = pool.try_writer().unwrap();
+            let mut state = TruncateState::default();
+            for _ in 0..2 {
+                let tick = checkpoint_once(&pool, &CheckpointConfig::default(), &mut state);
+                assert_eq!(tick, CheckpointTick::Skipped);
+            }
+        }
+        assert_eq!(checkpoint_skipped_ticks(), 2);
+        assert_eq!(checkpoint_consecutive_skips(), 2);
+
+        // Now the writer is free: an observed tick must reset the streak.
+        let mut state = TruncateState::default();
+        let tick = checkpoint_once(&pool, &CheckpointConfig::default(), &mut state);
+        assert!(matches!(tick, CheckpointTick::Observed(_)));
+
+        assert_eq!(
+            checkpoint_skipped_ticks(),
+            2,
+            "an observed tick must not change the lifetime skipped-tick total"
+        );
+        assert_eq!(
+            checkpoint_consecutive_skips(),
+            0,
+            "an observed tick must reset the consecutive-skip run length"
         );
     }
 
@@ -1379,5 +1774,394 @@ mod tests {
             state.consecutive_failures, 0,
             "an attempt that clears warn_pages must reset the consecutive-failure counter"
         );
+    }
+
+    // ADR-091 #617: graduated severity ladder state-machine tests.
+
+    fn severity_test_config() -> CheckpointConfig {
+        CheckpointConfig {
+            warn_pages: 100,
+            warn_sustained_cycles: 3,
+            ..CheckpointConfig::default()
+        }
+    }
+
+    /// INFO rung: a below→above crossing emits exactly one INFO and no WARN
+    /// (default `warn_sustained_cycles = 3`, only one above-warn tick here).
+    #[test]
+    fn severity_ladder_info_on_first_crossing_no_warn() {
+        let config = severity_test_config();
+        let mut state = CheckpointSeverityState::default();
+
+        let below = state.observe_wal_pages(10, &config);
+        assert!(below.is_empty(), "below-warn tick must emit nothing");
+
+        let above = state.observe_wal_pages(150, &config);
+        assert_eq!(
+            above,
+            vec![CheckpointSeverityEmission {
+                rung: CheckpointSeverityRung::Info,
+                wal_pages: 150,
+                threshold_pages: 100,
+                consecutive_cycles: 1,
+            }],
+            "first below->above crossing must emit exactly one INFO and no WARN"
+        );
+    }
+
+    /// WARN rung: `warn_sustained_cycles` (3) consecutive above-warn ticks
+    /// emit WARN exactly on the third tick, not before and not repeated after.
+    #[test]
+    fn severity_ladder_warn_on_third_consecutive_cycle() {
+        let config = severity_test_config();
+        let mut state = CheckpointSeverityState::default();
+
+        let tick1 = state.observe_wal_pages(150, &config);
+        assert_eq!(tick1.len(), 1);
+        assert_eq!(tick1[0].rung, CheckpointSeverityRung::Info);
+
+        let tick2 = state.observe_wal_pages(150, &config);
+        assert!(
+            tick2.is_empty(),
+            "second consecutive above-warn tick must emit nothing yet"
+        );
+
+        let tick3 = state.observe_wal_pages(150, &config);
+        assert_eq!(
+            tick3,
+            vec![CheckpointSeverityEmission {
+                rung: CheckpointSeverityRung::Warn,
+                wal_pages: 150,
+                threshold_pages: 100,
+                consecutive_cycles: 3,
+            }],
+            "WARN must fire exactly on the third consecutive above-warn tick"
+        );
+
+        let tick4 = state.observe_wal_pages(150, &config);
+        assert!(
+            tick4.is_empty(),
+            "WARN must not repeat on a fourth consecutive above-warn tick"
+        );
+    }
+
+    /// Re-arm: after a WARN episode drains below warn_pages, a fresh episode
+    /// of `warn_sustained_cycles` above-warn ticks must WARN again.
+    #[test]
+    fn severity_ladder_rearms_warn_after_drain() {
+        let config = severity_test_config();
+        let mut state = CheckpointSeverityState::default();
+
+        // First episode reaches WARN.
+        for _ in 0..3 {
+            state.observe_wal_pages(150, &config);
+        }
+        assert!(state.warn_emitted_for_episode);
+
+        // Drain below warn_pages: resets the episode.
+        let drain = state.observe_wal_pages(10, &config);
+        assert!(drain.is_empty(), "a draining tick must emit nothing");
+
+        // Second episode: INFO on first tick, no WARN until the third again.
+        let reentry = state.observe_wal_pages(150, &config);
+        assert_eq!(reentry.len(), 1);
+        assert_eq!(reentry[0].rung, CheckpointSeverityRung::Info);
+
+        let mid = state.observe_wal_pages(150, &config);
+        assert!(mid.is_empty());
+
+        let second_warn = state.observe_wal_pages(150, &config);
+        assert_eq!(
+            second_warn,
+            vec![CheckpointSeverityEmission {
+                rung: CheckpointSeverityRung::Warn,
+                wal_pages: 150,
+                threshold_pages: 100,
+                consecutive_cycles: 3,
+            }],
+            "a fresh elevation episode after a drain must WARN again"
+        );
+    }
+
+    /// False-positive guard: three isolated single-tick crossings, each
+    /// followed by a drain, must never reach WARN — only INFO fires each time.
+    #[test]
+    fn severity_ladder_isolated_crossings_never_warn() {
+        let config = severity_test_config();
+        let mut state = CheckpointSeverityState::default();
+
+        for _ in 0..3 {
+            let crossing = state.observe_wal_pages(150, &config);
+            assert_eq!(
+                crossing.len(),
+                1,
+                "each isolated crossing must emit exactly one INFO"
+            );
+            assert_eq!(crossing[0].rung, CheckpointSeverityRung::Info);
+
+            let drain = state.observe_wal_pages(10, &config);
+            assert!(drain.is_empty(), "the drain tick must emit nothing");
+        }
+
+        assert!(
+            !state.warn_emitted_for_episode,
+            "isolated single-tick crossings must never accumulate into a WARN"
+        );
+    }
+
+    /// ALARM rung: the existing TRUNCATE-attempt gate is the ADR-091 ALARM
+    /// tier. `observe_wal_pages` never produces it; this test documents and
+    /// locks in that boundary so a future change can't silently reroute
+    /// ALARM through the INFO/WARN ladder.
+    #[test]
+    fn severity_ladder_never_emits_alarm() {
+        let config = CheckpointConfig {
+            warn_pages: 100,
+            warn_sustained_cycles: 1,
+            ..CheckpointConfig::default()
+        };
+        let mut state = CheckpointSeverityState::default();
+
+        for wal_pages in [150, 200, 250, u64::MAX] {
+            let emissions = state.observe_wal_pages(wal_pages, &config);
+            assert!(
+                emissions
+                    .iter()
+                    .all(|e| e.rung != CheckpointSeverityRung::Alarm),
+                "observe_wal_pages must never emit the ALARM rung, got: {emissions:?}"
+            );
+        }
+    }
+
+    /// `KHIVE_WAL_WARN_SUSTAINED_CYCLES` overrides the default and rejects 0.
+    #[test]
+    #[serial]
+    fn checkpoint_config_warn_sustained_cycles_env_override() {
+        let default = CheckpointConfig::default();
+        assert_eq!(default.warn_sustained_cycles, DEFAULT_WARN_SUSTAINED_CYCLES);
+
+        std::env::set_var("KHIVE_WAL_WARN_SUSTAINED_CYCLES", "5");
+        let cfg = CheckpointConfig::from_env();
+        std::env::remove_var("KHIVE_WAL_WARN_SUSTAINED_CYCLES");
+        assert_eq!(cfg.warn_sustained_cycles, 5);
+
+        std::env::set_var("KHIVE_WAL_WARN_SUSTAINED_CYCLES", "0");
+        let cfg_zero = CheckpointConfig::from_env();
+        std::env::remove_var("KHIVE_WAL_WARN_SUSTAINED_CYCLES");
+        assert_eq!(
+            cfg_zero.warn_sustained_cycles, DEFAULT_WARN_SUSTAINED_CYCLES,
+            "zero must fall back to the default"
+        );
+
+        std::env::set_var("KHIVE_WAL_WARN_SUSTAINED_CYCLES", "not_a_number");
+        let cfg_invalid = CheckpointConfig::from_env();
+        std::env::remove_var("KHIVE_WAL_WARN_SUSTAINED_CYCLES");
+        assert_eq!(
+            cfg_invalid.warn_sustained_cycles,
+            DEFAULT_WARN_SUSTAINED_CYCLES
+        );
+    }
+
+    // ADR-094: `CheckpointOutcomeRecorded` lifecycle event tests.
+
+    #[derive(Default)]
+    struct FakeEventStore {
+        events: std::sync::Mutex<Vec<khive_storage::Event>>,
+    }
+
+    #[async_trait::async_trait]
+    impl khive_storage::EventStore for FakeEventStore {
+        async fn append_event(
+            &self,
+            event: khive_storage::Event,
+        ) -> khive_storage::StorageResult<()> {
+            self.events.lock().unwrap().push(event);
+            Ok(())
+        }
+
+        async fn append_events(
+            &self,
+            events: Vec<khive_storage::Event>,
+        ) -> khive_storage::StorageResult<khive_storage::BatchWriteSummary> {
+            let count = events.len() as u64;
+            self.events.lock().unwrap().extend(events);
+            Ok(khive_storage::BatchWriteSummary {
+                attempted: count,
+                affected: count,
+                failed: 0,
+                first_error: String::new(),
+            })
+        }
+
+        async fn get_event(
+            &self,
+            id: uuid::Uuid,
+        ) -> khive_storage::StorageResult<Option<khive_storage::Event>> {
+            Ok(self
+                .events
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|e| e.id == id)
+                .cloned())
+        }
+
+        async fn query_events(
+            &self,
+            _filter: khive_storage::EventFilter,
+            _page: khive_storage::PageRequest,
+        ) -> khive_storage::StorageResult<khive_storage::Page<khive_storage::Event>> {
+            unimplemented!("not exercised by the checkpoint lifecycle-event tests")
+        }
+
+        async fn count_events(
+            &self,
+            _filter: khive_storage::EventFilter,
+        ) -> khive_storage::StorageResult<u64> {
+            Ok(self.events.lock().unwrap().len() as u64)
+        }
+    }
+
+    /// Pure decision-table coverage for every input combination
+    /// `checkpoint_outcome_should_emit` can see: a first elevated tick, a
+    /// sustained elevated tick, the single drain row, and the ordinary
+    /// healthy tick that must emit nothing.
+    #[test]
+    fn checkpoint_outcome_should_emit_covers_all_transitions() {
+        assert!(
+            checkpoint_outcome_should_emit(true, false),
+            "first elevated tick must emit"
+        );
+        assert!(
+            checkpoint_outcome_should_emit(true, true),
+            "sustained elevated tick must emit"
+        );
+        assert!(
+            checkpoint_outcome_should_emit(false, true),
+            "the single drain row (elevated -> healthy) must emit"
+        );
+        assert!(
+            !checkpoint_outcome_should_emit(false, false),
+            "an ordinary below-warn tick must not emit"
+        );
+    }
+
+    #[tokio::test]
+    async fn checkpoint_task_emits_outcome_events_while_elevated_and_stops_after_drain() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("outcome_emit.db");
+        let pool = file_pool(&path);
+
+        // warn_pages: 0 means any observed WAL page count (even 0) is
+        // "elevated" for the duration this config is active.
+        let cfg = CheckpointConfig {
+            interval: Duration::from_millis(10),
+            warn_pages: 0,
+            ..CheckpointConfig::default()
+        };
+        let store = Arc::new(FakeEventStore::default());
+        let store_dyn: Arc<dyn khive_storage::EventStore> = store.clone();
+
+        let weak = Arc::downgrade(&pool);
+        let task_pool = Arc::clone(&pool);
+        let handle = tokio::spawn(run_checkpoint_task(
+            task_pool,
+            cfg,
+            Some(store_dyn),
+            "local".to_string(),
+        ));
+
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        drop(pool);
+        tokio::time::timeout(Duration::from_secs(1), handle)
+            .await
+            .expect("checkpoint task should exit within 1s")
+            .expect("checkpoint task panicked");
+        assert!(weak.upgrade().is_none());
+
+        let events = store.events.lock().unwrap();
+        assert!(
+            !events.is_empty(),
+            "an always-elevated config must append at least one CheckpointOutcomeRecorded event"
+        );
+        assert!(
+            events
+                .iter()
+                .all(|e| e.kind == khive_types::EventKind::CheckpointOutcomeRecorded),
+            "every appended event must be CheckpointOutcomeRecorded, got: {events:?}"
+        );
+        assert!(
+            events.iter().all(|e| e.namespace == "local"),
+            "events must be stamped with the namespace passed to run_checkpoint_task"
+        );
+    }
+
+    #[tokio::test]
+    async fn checkpoint_task_emits_nothing_while_healthy() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("outcome_no_emit.db");
+        let pool = file_pool(&path);
+
+        // An unreachable warn_pages threshold for this test's tiny WAL: every
+        // tick stays below warn, so no event should ever be appended.
+        let cfg = CheckpointConfig {
+            interval: Duration::from_millis(10),
+            warn_pages: u64::MAX,
+            ..CheckpointConfig::default()
+        };
+        let store = Arc::new(FakeEventStore::default());
+        let store_dyn: Arc<dyn khive_storage::EventStore> = store.clone();
+
+        let weak = Arc::downgrade(&pool);
+        let task_pool = Arc::clone(&pool);
+        let handle = tokio::spawn(run_checkpoint_task(
+            task_pool,
+            cfg,
+            Some(store_dyn),
+            "local".to_string(),
+        ));
+
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        drop(pool);
+        tokio::time::timeout(Duration::from_secs(1), handle)
+            .await
+            .expect("checkpoint task should exit within 1s")
+            .expect("checkpoint task panicked");
+        assert!(weak.upgrade().is_none());
+
+        assert!(
+            store.events.lock().unwrap().is_empty(),
+            "a config that never crosses warn_pages must never append a lifecycle event"
+        );
+    }
+
+    #[tokio::test]
+    async fn checkpoint_task_with_no_event_store_does_not_panic() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("outcome_none_store.db");
+        let pool = file_pool(&path);
+
+        let cfg = CheckpointConfig {
+            interval: Duration::from_millis(10),
+            warn_pages: 0,
+            ..CheckpointConfig::default()
+        };
+
+        let weak = Arc::downgrade(&pool);
+        let task_pool = Arc::clone(&pool);
+        let handle = tokio::spawn(run_checkpoint_task(
+            task_pool,
+            cfg,
+            None,
+            "local".to_string(),
+        ));
+
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        drop(pool);
+        tokio::time::timeout(Duration::from_secs(1), handle)
+            .await
+            .expect("checkpoint task should exit within 1s")
+            .expect("checkpoint task panicked");
+        assert!(weak.upgrade().is_none());
     }
 }

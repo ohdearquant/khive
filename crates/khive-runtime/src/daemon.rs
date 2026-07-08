@@ -276,6 +276,19 @@ pub struct MetricsSnapshot {
     /// bring the WAL back below `warn_pages`; resets to 0 the next time an
     /// attempt clears it.
     pub wal_truncate_consecutive_failures: u64,
+    /// Total checkpoint ticks skipped because the writer mutex was busy
+    /// (ADR-091 checkpoint-pressure telemetry), across this process's
+    /// lifetime. `#[serde(default)]` so an older client decoding a newer
+    /// daemon's snapshot (or vice versa) does not fail.
+    #[serde(default)]
+    pub wal_checkpoint_skipped_ticks: u64,
+    /// Current consecutive-skip run length; 0 once the next tick is observed.
+    #[serde(default)]
+    pub wal_checkpoint_consecutive_skips: u64,
+    /// WAL page count last known at the time of the most recent skip, if any
+    /// skip has occurred yet in this process.
+    #[serde(default)]
+    pub wal_checkpoint_last_skip_wal_pages: Option<u64>,
     /// Age, in microseconds, of the oldest currently-open transaction
     /// registry entry (ADR-091 Plank 0). `None` when no transaction is
     /// currently open.
@@ -390,6 +403,19 @@ pub trait DaemonDispatch: Clone + Send + Sync + 'static {
     fn pool_for_checkpoint(&self) -> Option<Arc<ConnectionPool>> {
         None
     }
+
+    /// Return the audit `EventStore` the checkpoint task should append
+    /// ADR-094 lifecycle events (`CheckpointOutcomeRecorded`) to, if any.
+    ///
+    /// Mirrors [`Self::pool_for_checkpoint`]'s default-`None` shape: an
+    /// implementor with no configured event store (or no pool at all) simply
+    /// gets a checkpoint task that never appends events — the checkpoint
+    /// task itself remains fully functional either way.
+    ///
+    /// The default implementation returns `None`.
+    fn event_store_for_checkpoint(&self) -> Option<Arc<dyn khive_storage::EventStore>> {
+        None
+    }
 }
 
 // ── tracked background tasks ─────────────────────────────────────────────────
@@ -487,6 +513,9 @@ fn build_metrics_snapshot<D: DaemonDispatch>(dispatcher: &D) -> MetricsSnapshot 
         wal_pages: khive_db::checkpoint::last_observed_wal_pages(),
         wal_truncate_attempts: khive_db::checkpoint::truncate_attempts(),
         wal_truncate_consecutive_failures: khive_db::checkpoint::truncate_consecutive_failures(),
+        wal_checkpoint_skipped_ticks: khive_db::checkpoint::checkpoint_skipped_ticks(),
+        wal_checkpoint_consecutive_skips: khive_db::checkpoint::checkpoint_consecutive_skips(),
+        wal_checkpoint_last_skip_wal_pages: khive_db::checkpoint::checkpoint_last_skip_wal_pages(),
         oldest_pinned_tx_micros,
         oldest_pinned_tx_label,
         open_tx_count,
@@ -737,7 +766,9 @@ pub async fn run_daemon<D: DaemonDispatch>(dispatcher: D) -> anyhow::Result<()> 
 
     if let Some(pool) = dispatcher.pool_for_checkpoint() {
         let cfg = CheckpointConfig::from_env();
-        tokio::spawn(run_checkpoint_task(pool, cfg));
+        let event_store = dispatcher.event_store_for_checkpoint();
+        let namespace = dispatcher.namespace().to_string();
+        tokio::spawn(run_checkpoint_task(pool, cfg, event_store, namespace));
         tracing::info!("WAL checkpoint task started");
     }
 
@@ -1220,6 +1251,13 @@ mod tests {
         assert!(
             snapshot.wal_pages.is_some(),
             "wal_pages must be observed after a real checkpoint tick, got {snapshot:?}"
+        );
+        // #646: the snapshot carries the checkpoint-pressure fields read-only
+        // (no mutation path reachable through `MetricsSnapshot`/`DaemonRequestFrame`);
+        // an observed tick (not a skip) must report a zero-length skip streak.
+        assert_eq!(
+            snapshot.wal_checkpoint_consecutive_skips, 0,
+            "an observed (non-skipped) tick must report zero consecutive skips, got {snapshot:?}"
         );
     }
 

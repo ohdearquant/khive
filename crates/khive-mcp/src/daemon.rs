@@ -340,6 +340,10 @@ impl daemon::DaemonDispatch for crate::server::KhiveMcpServer {
     fn pool_for_checkpoint(&self) -> Option<std::sync::Arc<khive_db::ConnectionPool>> {
         self.pool()
     }
+
+    fn event_store_for_checkpoint(&self) -> Option<std::sync::Arc<dyn khive_storage::EventStore>> {
+        self.event_store()
+    }
 }
 
 // ── client ────────────────────────────────────────────────────────────────────
@@ -347,7 +351,7 @@ impl daemon::DaemonDispatch for crate::server::KhiveMcpServer {
 /// Result of a single forward attempt to the daemon socket.
 enum ForwardOutcome {
     /// Successfully received and decoded a response frame.
-    Response(DaemonResponseFrame),
+    Response(Box<DaemonResponseFrame>),
     /// Socket was unreachable (connection refused / no file).
     NoSocket,
     /// Connected but the response could not be decoded — most likely a stale
@@ -420,7 +424,7 @@ async fn try_forward_inner(frame: &DaemonRequestFrame) -> ForwardOutcome {
                 );
                 return ForwardOutcome::ProtocolMismatch;
             }
-            ForwardOutcome::Response(frame)
+            ForwardOutcome::Response(Box::new(frame))
         }
         Err(e) => {
             tracing::warn!(
@@ -855,7 +859,7 @@ pub async fn forward_or_spawn(frame: &DaemonRequestFrame) -> Option<Result<Strin
 
     match try_forward_inner(frame).await {
         ForwardOutcome::Response(resp) => {
-            return map_response(resp, &frame.config_id, &frame.namespace)
+            return map_response(*resp, &frame.config_id, &frame.namespace)
         }
         ForwardOutcome::NoSocket => {
             // No socket present; fall through to the first-spawn path below.
@@ -885,7 +889,7 @@ pub async fn forward_or_spawn(frame: &DaemonRequestFrame) -> Option<Result<Strin
                     // real request once — this is its ONLY dispatch on this path.
                     return match try_forward_inner(frame).await {
                         ForwardOutcome::Response(resp) => {
-                            map_response(resp, &frame.config_id, &frame.namespace)
+                            map_response(*resp, &frame.config_id, &frame.namespace)
                         }
                         ForwardOutcome::NoSocket => {
                             record_fallback(
@@ -939,7 +943,7 @@ pub async fn forward_or_spawn(frame: &DaemonRequestFrame) -> Option<Result<Strin
                 }
                 match try_forward_inner(frame).await {
                     ForwardOutcome::Response(resp) => {
-                        return map_response(resp, &frame.config_id, &frame.namespace)
+                        return map_response(*resp, &frame.config_id, &frame.namespace)
                     }
                     ForwardOutcome::ParseFailure => {
                         tracing::warn!(
@@ -992,7 +996,7 @@ pub async fn forward_or_spawn(frame: &DaemonRequestFrame) -> Option<Result<Strin
                     // real request once — this is its ONLY dispatch on this path.
                     return match try_forward_inner(frame).await {
                         ForwardOutcome::Response(resp) => {
-                            map_response(resp, &frame.config_id, &frame.namespace)
+                            map_response(*resp, &frame.config_id, &frame.namespace)
                         }
                         _ => Some(Err(McpError::internal_error(
                             format!(
@@ -1024,7 +1028,7 @@ pub async fn forward_or_spawn(frame: &DaemonRequestFrame) -> Option<Result<Strin
                 }
                 match try_forward_inner(frame).await {
                     ForwardOutcome::Response(resp) => {
-                        return map_response(resp, &frame.config_id, &frame.namespace)
+                        return map_response(*resp, &frame.config_id, &frame.namespace)
                     }
                     ForwardOutcome::ProtocolMismatch | ForwardOutcome::ParseFailure => {
                         return Some(Err(McpError::internal_error(
@@ -1068,7 +1072,7 @@ pub async fn forward_or_spawn(frame: &DaemonRequestFrame) -> Option<Result<Strin
         }
         match try_forward_inner(frame).await {
             ForwardOutcome::Response(resp) => {
-                return map_response(resp, &frame.config_id, &frame.namespace)
+                return map_response(*resp, &frame.config_id, &frame.namespace)
             }
             ForwardOutcome::ParseFailure => {
                 tracing::warn!(
