@@ -920,6 +920,229 @@ fn ambiguous_forward_error() -> McpError {
     )
 }
 
+// ── bridge self-heal: re-exec in place on ProtocolMismatch (#714) ───────────
+//
+// A long-lived stdio bridge process keeps running the OLD on-disk binary
+// after `make local` rebuilds it: the daemon it spawns/forwards to is fresh,
+// but this bridge process itself never picks up the new binary until its MCP
+// client reconnects. `ProtocolMismatch` is exactly that scenario — the daemon
+// is fine, this bridge is stale — so instead of leaving the connection dead
+// forever, the bridge re-execs the freshest on-disk binary in place,
+// preserving the PID and the open stdio file descriptors so the client's
+// transport never sees EOF or a reset. See
+// `.khive/workspaces/20260708/issue714/DESIGN-NOTE.md` for the evidence this
+// design is based on (a live re-exec-mid-session test against the reference
+// MCP Python SDK client).
+
+/// Grace period between scheduling a re-exec (or drain-and-exit) and actually
+/// performing it. Gives the async runtime time to finish flushing the
+/// in-flight ambiguous-mismatch response onto the stdio transport before the
+/// process image is replaced or the process exits — `exec()`/`exit()` discard
+/// anything not yet written to the fd. DESIGN-NOTE.md §1.1 reproduced exactly
+/// this data loss empirically: a first attempt that called `execv()`
+/// synchronously inside the tool handler, before the SDK's send loop had
+/// serialized and flushed the response, caused the client's call to time out
+/// with nothing ever written back. 150ms is generous headroom over the 50ms
+/// `forward_or_spawn` already sleeps elsewhere in this file to "give the
+/// kernel a moment" after spawning a replacement daemon — losing that race
+/// there only delays a connect retry, while losing it here drops the
+/// response outright.
+const REEXEC_GRACE_PERIOD: std::time::Duration = std::time::Duration::from_millis(150);
+
+/// argv marker carrying the exec-once loop-breaker generation counter.
+///
+/// Parsed here and defined on [`crate::args::Args`] as a hidden clap field of
+/// the same name — the clap field exists purely so the CLI parser accepts the
+/// flag on a resumed process instead of rejecting it as unknown; the actual
+/// read path is this raw argv scan, independent of wherever in the call stack
+/// `Args` was parsed. The counter travels with the exec by construction: it
+/// is appended to argv immediately before `exec()`, so any process running
+/// with it present is, by definition, a resumed generation.
+const RESUMED_GENERATION_ARG_PREFIX: &str = "--resumed-generation=";
+
+/// Whether this process is a resumed generation of a prior self-heal re-exec,
+/// and if so, its generation counter. `None` on a normal (cold-started)
+/// bridge — the overwhelmingly common case.
+pub(crate) fn resumed_generation() -> Option<u32> {
+    resumed_generation_from_args(std::env::args())
+}
+
+/// Pure argv-scan behind [`resumed_generation`], factored out so the parsing
+/// logic is unit-testable without depending on this process's own real argv
+/// (which never carries the marker inside `cargo test`).
+fn resumed_generation_from_args(args: impl Iterator<Item = String>) -> Option<u32> {
+    args.filter_map(|a| {
+        a.strip_prefix(RESUMED_GENERATION_ARG_PREFIX)
+            .map(str::to_owned)
+    })
+    .last()
+    .and_then(|s| s.parse::<u32>().ok())
+}
+
+/// Recovery action chosen for a `ProtocolMismatch` observed inside
+/// `forward_or_spawn`. Pure decision, factored out of [`trigger_bridge_self_heal`]
+/// so the loop-breaker guard rail (#714 §2.2: exec at most once per mismatch
+/// generation) is unit-testable without touching the process or the clock.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MismatchRecovery {
+    /// First generation (no `--resumed-generation` marker) — schedule an
+    /// in-place re-exec of the freshest on-disk binary.
+    ReexecScheduled,
+    /// Already a resumed generation and it hit `ProtocolMismatch` again — the
+    /// on-disk binary is itself stale, or a second rebuild race — take the
+    /// fallback instead of exec'ing a second time.
+    DrainAndExit,
+}
+
+fn decide_mismatch_recovery(resumed_generation: Option<u32>) -> MismatchRecovery {
+    match resumed_generation {
+        None => MismatchRecovery::ReexecScheduled,
+        Some(_) => MismatchRecovery::DrainAndExit,
+    }
+}
+
+/// Trigger the bridge's self-heal recovery for a `ProtocolMismatch` outcome.
+///
+/// Called from both `forward_or_spawn` `ProtocolMismatch` arms (the
+/// first-attempt arm and the arm inside the post-recovery retry loop — either
+/// can observe the mismatch depending on whether this was the first probe or
+/// a retry after a kill/respawn). Both arms already construct and return the
+/// hard mismatch error to the caller; this call schedules the recovery
+/// alongside that return, never in place of it.
+///
+/// Concurrency note (DESIGN-NOTE.md §5 item 5, accepted risk, not fixed by
+/// this change): if the bridge is mid-flight on more than one outstanding
+/// client request when the mismatch fires, only the request that triggered
+/// this arm gets the ambiguous-error-then-resume treatment. Any other
+/// in-flight request loses its response the same way it would today if the
+/// process crashed — a pre-existing risk, not introduced here.
+fn trigger_bridge_self_heal() {
+    match decide_mismatch_recovery(resumed_generation()) {
+        MismatchRecovery::ReexecScheduled => schedule_reexec_on_mismatch(),
+        MismatchRecovery::DrainAndExit => {
+            tracing::warn!(
+                "resumed generation observed ProtocolMismatch again — loop-breaker \
+                 tripped (#714 §2.2, exec-once guard); draining and exiting instead \
+                 of re-exec'ing a second time"
+            );
+            schedule_drain_and_exit();
+        }
+    }
+}
+
+/// Schedule an in-place re-exec of the freshest on-disk binary, deferred by
+/// [`REEXEC_GRACE_PERIOD`] (see its doc for why deferral is load-bearing).
+/// Never execs synchronously. Only ever called for a first-generation process
+/// — the loop-breaker guard rail lives in [`trigger_bridge_self_heal`].
+#[cfg(unix)]
+pub(crate) fn schedule_reexec_on_mismatch() {
+    tracing::warn!(
+        client_version = PROTOCOL_VERSION,
+        "protocol mismatch: scheduling in-place re-exec of the freshest on-disk binary"
+    );
+    tokio::spawn(async move {
+        tokio::time::sleep(REEXEC_GRACE_PERIOD).await;
+        reexec_in_place();
+    });
+}
+
+/// Re-exec self-heal requires `exec()` (POSIX-only); on any other target,
+/// take the same drain-and-exit fallback a loop-breaker trip would.
+#[cfg(not(unix))]
+pub(crate) fn schedule_reexec_on_mismatch() {
+    schedule_drain_and_exit();
+}
+
+/// Perform the actual re-exec: resolve the on-disk binary at *exec time* via
+/// [`std::env::current_exe`] (the same primitive `spawn_daemon` already uses
+/// for "pick up whatever `make local` just replaced" — see `spawn_daemon`
+/// above), preserve the original argv, append the `--resumed-generation=1`
+/// marker, and replace the process image via
+/// [`std::os::unix::process::CommandExt::exec`] — which, unlike `spawn`,
+/// keeps the same PID and the same open stdin/stdout/stderr file descriptors,
+/// so the client's stdio transport never sees EOF or a reset.
+///
+/// `exec` only returns on failure; on failure this logs and returns, leaving
+/// the process running under its stale binary (the hard mismatch error was
+/// already sent to the client for this request; there is nothing safe to
+/// retry from here).
+#[cfg(all(unix, not(test)))]
+fn reexec_in_place() {
+    use std::os::unix::process::CommandExt;
+
+    let exe = match std::env::current_exe() {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::error!(error = %e, "bridge self-heal re-exec failed: could not resolve current_exe");
+            return;
+        }
+    };
+    // Drop any pre-existing marker defensively (should never be present here —
+    // `trigger_bridge_self_heal` only reaches this path for a first-generation
+    // process — but argv should never accumulate duplicates if that invariant
+    // is ever violated).
+    let args: Vec<String> = std::env::args()
+        .skip(1)
+        .filter(|a| !a.starts_with(RESUMED_GENERATION_ARG_PREFIX))
+        .chain(std::iter::once(format!("{RESUMED_GENERATION_ARG_PREFIX}1")))
+        .collect();
+    let err = std::process::Command::new(exe).args(&args).exec();
+    tracing::error!(
+        error = %err,
+        "bridge self-heal re-exec failed; continuing under the stale binary"
+    );
+}
+
+/// Schedule this process to stop serving and exit, deferred by
+/// [`REEXEC_GRACE_PERIOD`] for the same reason [`schedule_reexec_on_mismatch`]
+/// defers its exec. This is the fallback path (DESIGN-NOTE.md §4): the MCP
+/// connection dies and the client's own process-lifecycle management must
+/// restart it — no worse than today's pre-#714 hard-error-forever behavior.
+pub(crate) fn schedule_drain_and_exit() {
+    tokio::spawn(async move {
+        tokio::time::sleep(REEXEC_GRACE_PERIOD).await;
+        exit_process();
+    });
+}
+
+#[cfg(not(test))]
+fn exit_process() {
+    std::process::exit(1);
+}
+
+#[cfg(all(test, unix))]
+pub(crate) static REEXEC_INVOKED_COUNT: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+#[cfg(test)]
+pub(crate) static DRAIN_EXIT_INVOKED_COUNT: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(all(test, unix))]
+pub(crate) fn reset_self_heal_counters() {
+    REEXEC_INVOKED_COUNT.store(0, std::sync::atomic::Ordering::SeqCst);
+    DRAIN_EXIT_INVOKED_COUNT.store(0, std::sync::atomic::Ordering::SeqCst);
+}
+
+#[cfg(all(test, not(unix)))]
+pub(crate) fn reset_self_heal_counters() {
+    DRAIN_EXIT_INVOKED_COUNT.store(0, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Test double for [`reexec_in_place`]: a real `exec()` would replace the test
+/// binary's own process image, killing the entire test run. Counts instead.
+/// Gated `unix` like the production version above — it is the only thing that
+/// calls it (`schedule_reexec_on_mismatch`'s `not(unix)` arm never reaches
+/// `reexec_in_place` at all).
+#[cfg(all(test, unix))]
+fn reexec_in_place() {
+    REEXEC_INVOKED_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+}
+
+#[cfg(test)]
+fn exit_process() {
+    DRAIN_EXIT_INVOKED_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+}
+
 /// Bounded probe timeout used by [`wait_for_boot_quiescence_then_reprobe`],
 /// matching the 500ms bound already used by the identity probe inside
 /// [`kill_and_respawn`].
@@ -1047,6 +1270,10 @@ pub async fn forward_or_spawn(frame: &DaemonRequestFrame) -> Option<Result<Strin
                 "daemon protocol mismatch discovered after the request was fully \
                  written — not retrying or falling back locally to avoid duplicate dispatch"
             );
+            // #714: the daemon is fine (it just rejected us) — this bridge
+            // process itself is the stale one. Trigger self-heal alongside
+            // the hard error below, never in place of it.
+            trigger_bridge_self_heal();
             return Some(Err(McpError::internal_error(
                 format!(
                     "daemon protocol mismatch: expected version {PROTOCOL_VERSION}; \
@@ -1126,6 +1353,16 @@ pub async fn forward_or_spawn(frame: &DaemonRequestFrame) -> Option<Result<Strin
                 return Some(Err(ambiguous_forward_error()));
             }
             ForwardOutcome::ProtocolMismatch => {
+                tracing::warn!(
+                    config_id = %frame.config_id,
+                    namespace = %frame.namespace,
+                    "daemon protocol mismatch discovered on the post-recovery retry \
+                     — not retrying again or falling back locally"
+                );
+                // #714: same self-heal trigger as the first-attempt arm above —
+                // either arm can observe the mismatch depending on whether this
+                // was the first probe or a retry after a kill/respawn.
+                trigger_bridge_self_heal();
                 return Some(Err(McpError::internal_error(
                     format!(
                         "daemon protocol mismatch: expected version {PROTOCOL_VERSION}; \
@@ -4074,5 +4311,131 @@ mod tests {
             "pid file must be left alone alongside the live socket"
         );
         clear_daemon_env();
+    }
+
+    // ── bridge self-heal on ProtocolMismatch (#714) ───────────────────────────
+
+    #[test]
+    fn resumed_generation_from_args_absent_is_none() {
+        let argv = vec![
+            "kkernel".to_string(),
+            "mcp".to_string(),
+            "--daemon".to_string(),
+        ];
+        assert_eq!(resumed_generation_from_args(argv.into_iter()), None);
+    }
+
+    #[test]
+    fn resumed_generation_from_args_present_parses_value() {
+        let argv = vec![
+            "kkernel".to_string(),
+            "mcp".to_string(),
+            "--resumed-generation=1".to_string(),
+        ];
+        assert_eq!(resumed_generation_from_args(argv.into_iter()), Some(1));
+    }
+
+    #[test]
+    fn resumed_generation_from_args_malformed_value_is_none() {
+        let argv = vec![
+            "kkernel".to_string(),
+            "--resumed-generation=notanumber".to_string(),
+        ];
+        assert_eq!(resumed_generation_from_args(argv.into_iter()), None);
+    }
+
+    #[test]
+    fn resumed_generation_from_args_takes_the_last_occurrence() {
+        // Defensive: `reexec_in_place` filters any pre-existing marker before
+        // appending its own, so duplicates should never occur in practice —
+        // but if one ever did, the last one (the freshest exec's own marker)
+        // must win, not the first.
+        let argv = vec![
+            "kkernel".to_string(),
+            "--resumed-generation=1".to_string(),
+            "--resumed-generation=2".to_string(),
+        ];
+        assert_eq!(resumed_generation_from_args(argv.into_iter()), Some(2));
+    }
+
+    // Cold-start non-regression (DESIGN-NOTE.md §5 item 4): a real `cargo
+    // test` process's own argv never carries the marker, so the production
+    // entry point must resolve to `None` — the same guarantee
+    // `KhiveMcpServer::serve_stdio` relies on to keep using the normal
+    // `.serve()` handshake for every ordinary session.
+    #[test]
+    fn resumed_generation_is_none_for_a_normal_test_process() {
+        assert_eq!(resumed_generation(), None);
+    }
+
+    // Loop-breaker guard rail (DESIGN-NOTE.md §5 item 2): a resumed generation
+    // that observes ProtocolMismatch again must take the fallback, never a
+    // second exec. Pure decision function — no live process needed.
+    #[test]
+    fn decide_mismatch_recovery_first_generation_schedules_reexec() {
+        assert_eq!(
+            decide_mismatch_recovery(None),
+            MismatchRecovery::ReexecScheduled
+        );
+    }
+
+    #[test]
+    fn decide_mismatch_recovery_resumed_generation_drains_and_exits() {
+        assert_eq!(
+            decide_mismatch_recovery(Some(1)),
+            MismatchRecovery::DrainAndExit
+        );
+    }
+
+    // Ordering regression (DESIGN-NOTE.md §5 item 1): both self-heal actions
+    // must be deferred past REEXEC_GRACE_PERIOD, never fire synchronously —
+    // this is the exact bug the toy-server evidence in DESIGN-NOTE.md §1.1
+    // reproduced (an in-flight response lost because `execv()` ran before the
+    // response bytes were flushed). `start_paused` gives a deterministic
+    // virtual clock instead of a real sleep.
+
+    #[tokio::test(start_paused = true)]
+    #[serial]
+    async fn schedule_reexec_on_mismatch_defers_past_the_grace_period() {
+        reset_self_heal_counters();
+        schedule_reexec_on_mismatch();
+
+        // Let the spawned task run up to (but not past) its sleep.
+        tokio::task::yield_now().await;
+        assert_eq!(
+            REEXEC_INVOKED_COUNT.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "must not exec before the grace period elapses"
+        );
+
+        tokio::time::advance(REEXEC_GRACE_PERIOD + std::time::Duration::from_millis(1)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(
+            REEXEC_INVOKED_COUNT.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "must exec exactly once after the grace period elapses"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    #[serial]
+    async fn schedule_drain_and_exit_defers_past_the_grace_period() {
+        reset_self_heal_counters();
+        schedule_drain_and_exit();
+
+        tokio::task::yield_now().await;
+        assert_eq!(
+            DRAIN_EXIT_INVOKED_COUNT.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "must not exit before the grace period elapses"
+        );
+
+        tokio::time::advance(REEXEC_GRACE_PERIOD + std::time::Duration::from_millis(1)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(
+            DRAIN_EXIT_INVOKED_COUNT.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "must exit exactly once after the grace period elapses"
+        );
     }
 }
