@@ -17,42 +17,51 @@
 //! provenance quirk) rather than needing every `OnceLock` site to carry its
 //! own `EventStore` handle.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
-static PENDING: Mutex<Vec<(String, String)>> = Mutex::new(Vec::new());
+/// `true` once at least one pair has been enqueued and not yet drained.
+///
+/// Read via `swap(false, Ordering::AcqRel)` on the dispatch hot path so the
+/// overwhelmingly common empty-ledger case pays for a single atomic
+/// read-and-clear instead of locking `LEDGER`.
+pub(crate) static PENDING: AtomicBool = AtomicBool::new(false);
+
+static LEDGER: Mutex<Vec<(String, String)>> = Mutex::new(Vec::new());
 
 /// Enqueue a config key/value pair for later `ConfigLocked` event emission.
 ///
 /// Safe to call from a synchronous `OnceLock::get_or_init` closure — this
 /// only takes a `std::sync::Mutex`, never awaits, and never fails.
 pub fn record_config_locked(key: &'static str, value: impl Into<String>) {
-    PENDING
+    LEDGER
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .push((key.to_string(), value.into()));
+    // Set after enqueue so a dispatch that observes `true` is guaranteed to
+    // find the pair already in `LEDGER`.
+    PENDING.store(true, Ordering::Release);
 }
 
 /// Drain every queued config-locked pair for emission as `ConfigLocked` events.
 ///
 /// Crate-private: only the dispatch path that owns event-store persistence
 /// should drain this queue.
-pub(crate) fn take_config_locked() -> Vec<(String, String)> {
+pub(crate) fn drain_config_locked() -> Vec<(String, String)> {
     std::mem::take(
-        &mut *PENDING
+        &mut *LEDGER
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()),
     )
 }
 
-/// `true` if at least one config-locked pair is queued.
+/// `true` if at least one config-locked pair is queued, without draining it.
 ///
-/// Lets the dispatch path skip locking the mutex a second time on the common
-/// empty-queue path.
+/// Test-only observability into the atomic fast path; the dispatch path
+/// itself swaps `PENDING` directly rather than calling this.
+#[cfg(test)]
 pub(crate) fn has_pending_config_locked() -> bool {
-    !PENDING
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .is_empty()
+    PENDING.load(Ordering::Acquire)
 }
 
 #[cfg(test)]
@@ -60,20 +69,21 @@ mod tests {
     use super::*;
     use serial_test::serial;
 
-    // `PENDING` is a process-wide singleton; serialize these tests against
-    // each other so one test's queued pairs never leak into another's
-    // assertions.
+    // `PENDING`/`LEDGER` are process-wide singletons; serialize these tests
+    // against each other so one test's queued pairs never leak into
+    // another's assertions.
     #[test]
     #[serial(config_ledger)]
-    fn record_then_take_returns_queued_pairs_in_order() {
-        take_config_locked(); // drain any leftovers from a prior test run
+    fn record_then_drain_returns_queued_pairs_in_order() {
+        drain_config_locked(); // drain any leftovers from a prior test run
+        PENDING.store(false, Ordering::Release);
         assert!(!has_pending_config_locked());
 
         record_config_locked("recall_profile_enabled", "true");
         record_config_locked("ann_overfetch_max_rounds", "3");
 
         assert!(has_pending_config_locked());
-        let drained = take_config_locked();
+        let drained = drain_config_locked();
         assert_eq!(
             drained,
             vec![
@@ -83,16 +93,31 @@ mod tests {
         );
     }
 
+    /// Mirrors the `VerbRegistry::dispatch` fast path (ADR-094): rows drain
+    /// exactly once via the atomic swap-and-check, and a second dispatch
+    /// observes no pending work without needing to lock `LEDGER`.
     #[test]
     #[serial(config_ledger)]
-    fn take_config_locked_drains_the_queue() {
-        take_config_locked();
+    fn dispatch_fast_path_drains_exactly_once_then_reports_no_pending() {
+        drain_config_locked();
+        PENDING.store(false, Ordering::Release);
+
         record_config_locked("context_profile_enabled", "false");
-        assert!(!take_config_locked().is_empty());
-        assert!(
-            !has_pending_config_locked(),
-            "a second take must observe an empty queue"
+
+        assert!(PENDING.swap(false, Ordering::AcqRel));
+        let drained = drain_config_locked();
+        assert_eq!(
+            drained,
+            vec![("context_profile_enabled".to_string(), "false".to_string())]
         );
-        assert_eq!(take_config_locked(), Vec::new());
+
+        assert!(
+            !PENDING.swap(false, Ordering::AcqRel),
+            "a second dispatch must observe the flag already cleared"
+        );
+        assert!(
+            drain_config_locked().is_empty(),
+            "nothing should be left to re-emit on a later dispatch"
+        );
     }
 }

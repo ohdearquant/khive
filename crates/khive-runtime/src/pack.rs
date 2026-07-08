@@ -1037,8 +1037,10 @@ impl VerbRegistry {
                 // threading an `EventStore` handle into every synchronous
                 // `OnceLock::get_or_init` call site.
                 if let Some(store) = &self.event_store {
-                    if crate::config_ledger::has_pending_config_locked() {
-                        for (key, value) in crate::config_ledger::take_config_locked() {
+                    if crate::config_ledger::PENDING
+                        .swap(false, std::sync::atomic::Ordering::AcqRel)
+                    {
+                        for (key, value) in crate::config_ledger::drain_config_locked() {
                             let payload = serde_json::json!({ "key": key, "value": value });
                             let storage_event = Event::new(
                                 gate_req.namespace.as_str(),

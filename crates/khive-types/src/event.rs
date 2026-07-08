@@ -62,7 +62,9 @@ impl fmt::Display for EventOutcome {
     }
 }
 
-/// Discriminant for the 26 typed event variants produced by the verb dispatch path.
+/// Discriminant for the 34 typed event variants produced by the verb dispatch path
+/// and by lifecycle telemetry producers (channel polling/backoff, config-lock,
+/// checkpoint outcome).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
