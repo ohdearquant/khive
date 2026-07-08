@@ -197,21 +197,22 @@ def main():
         assert isinstance(verbs_result["verbs"], list), f"verbs must be a list: {verbs_result}"
         # Surface-contract tripwire: the default config (no --pack, KHIVE_PACKS
         # unset) loads 9 production packs (kg, gtd, memory, brain, comm, schedule,
-        # knowledge, session, git), so verbs() returns exactly 74 user-facing
+        # knowledge, session, git), so verbs() returns exactly 75 user-facing
         # MCP-callable verbs (count what verbs() returns, not internal dispatch
         # arms). The session pack contributes 4 agent-facing T1 verbs
         # (store/list/resume/export), promoted from internal subhandlers to
         # Visibility::Verb per ADR-083; brain.register_adapter (#354), context
         # (ADR-089, the 17th kg-substrate bare verb), and comm.health (#606,
-        # verified live 2026-07-04) are included in the count; git contributes
+        # verified live 2026-07-04), and comm.probe (#644 read-only inbound
+        # poll) are included in the count; git contributes
         # 0 verbs (note kinds + ingester only). Update this number when the
         # pack set or verb surface changes; a silent drift here is the bug
         # this assertion exists to catch.
-        assert verbs_result["total"] == 74, (
-            f"expected 74 user-facing verbs from the 9 default packs "
+        assert verbs_result["total"] == 75, (
+            f"expected 75 user-facing verbs from the 9 default packs "
             f"(session contributes 4 T1 verbs promoted to Visibility::Verb per "
             f"ADR-083; context is the 17th kg-substrate bare verb per ADR-089; "
-            f"comm.health is #606; git contributes 0), "
+            f"comm.health is #606; comm.probe is #644; git contributes 0), "
             f"got {verbs_result['total']}: {verbs_result}"
         )
         verb_names = [v["verb"] for v in verbs_result["verbs"]]
