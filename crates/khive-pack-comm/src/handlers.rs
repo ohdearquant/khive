@@ -84,7 +84,10 @@ pub(crate) async fn handle_send(
     // We surface a visible warning so operators can diagnose mis-attribution; the send
     // proceeds rather than hard-erroring to preserve backward compatibility with
     // sessions that set default_namespace but not actor_id.
-    if from_actor == "local" && to_actor != "local" {
+    //
+    // Uses the shared actor-identity policy (#567) so this warning fires under
+    // exactly the same "unattributed" definition the gate and token minter use.
+    if khive_runtime::actor_is_unattributed(token.actor()) && to_actor != "local" {
         tracing::warn!(
             to_actor = %to_actor,
             "comm.send: unattributed caller (actor.id not configured) sending to a specific \

@@ -10,11 +10,14 @@ from __future__ import annotations
 import pytest
 
 from khive_contract.client import KhiveMcpSession
+from khive_contract.fixtures import NOTE_KINDS
 
 VERBS_UNDER_TEST = {"create", "list", "get", "search", "link"}
 
-# Runtime-confirmed note kinds (5 base kinds)
-RUNTIME_NOTE_KINDS = ("observation", "insight", "decision", "question", "reference")
+# Runtime-confirmed note kinds (5 base kinds) — canonical set lives in
+# khive_contract.fixtures.NOTE_KINDS; sorted here for a deterministic
+# parametrize order.
+RUNTIME_NOTE_KINDS = tuple(sorted(NOTE_KINDS))
 
 
 @pytest.mark.adr_013

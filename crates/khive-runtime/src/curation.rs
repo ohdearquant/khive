@@ -1229,15 +1229,12 @@ fn merge_entity_sql(
         )?;
 
         // --- Delete from_id from all registered model vector tables ---
-        for vec_tbl in &vec_tables {
-            conn.execute(
-                &format!(
-                    "DELETE FROM {} WHERE subject_id = ?1 AND namespace = ?2",
-                    vec_tbl
-                ),
-                rusqlite::params![&from_str, &namespace],
-            )?;
-        }
+        khive_db::stores::vectors::delete_subject_from_vector_tables(
+            conn,
+            &vec_tables,
+            from_id,
+            &namespace,
+        )?;
 
         // --- Tombstone from entity (soft-delete with provenance) ---
         let merge_event_id = Uuid::new_v4();
@@ -1669,15 +1666,12 @@ fn merge_note_sql(
         )?;
 
         // Delete from-note from all registered model vector tables.
-        for vec_tbl in &vec_tables {
-            conn.execute(
-                &format!(
-                    "DELETE FROM {} WHERE subject_id = ?1 AND namespace = ?2",
-                    vec_tbl
-                ),
-                rusqlite::params![&from_str, &namespace],
-            )?;
-        }
+        khive_db::stores::vectors::delete_subject_from_vector_tables(
+            conn,
+            &vec_tables,
+            from_id,
+            &namespace,
+        )?;
 
         // Tombstone the from-note.
         conn.execute(

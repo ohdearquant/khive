@@ -835,28 +835,20 @@ mod tests {
         }
     }
 
-    /// PR #389 internal review round 1 Medium regression: unlike `$`, `@` is NOT stripped
-    /// by `sanitize_fts5_query` (by design — the sanitizer stays minimal per
-    /// #388 scope; the fail-open net is the systematic answer for residual
-    /// punctuation). SQLite FTS5's bareword parser still rejects `@`
-    /// unconditionally, so this query reaches the `Err` arm added to
-    /// `collect_recall_text_hits` (khive-pack-memory/handlers/common.rs) and must
-    /// degrade to vector-only results rather than aborting the recall.
-    ///
-    /// Ties Medium to the internal review round 1 High-2 finding: with a real (non-null)
-    /// embedder registered, this proves the vector leg still returns the
-    /// correct note while the FTS leg is degraded — i.e. degradation loses only
-    /// the FTS signal, not the overall recall. (This test does NOT assert an
-    /// `fts_degraded`/`partial` advisory field: `memory.recall`'s common-path
-    /// wire shape is a bare JSON array today, so adding such a field here would
-    /// be a breaking array-to-object shape change — reported separately as
-    /// blocked-on-shape, not fixed in this PR.)
-    // `#[serial(background_tasks)]`: this test's recall returns a non-empty
-    // hit, which fires the serve-ledger append's `track_background_task` —
-    // see the note on `recall_with_dollar_sign_query_does_not_error` above.
+    /// #569 regression: unlike `$`, `@` is NOT stripped by `sanitize_fts5_query`
+    /// (by design — the sanitizer stays minimal per #388 scope). SQLite FTS5's
+    /// bareword parser still rejects `@` unconditionally, so this query reaches
+    /// the `Err` arm in `collect_recall_text_hits`
+    /// (khive-pack-memory/handlers/common.rs), which must now fail loud
+    /// instead of degrading to vector-only results as it did before #569.
+    /// This assertion fails against the pre-#569 fail-open behavior (which
+    /// returned `Ok` with a non-empty result here) and passes once the FTS
+    /// leg fails closed.
+    // `#[serial(background_tasks)]`: kept to match the fixture setup used by
+    // the sibling dollar-sign test above.
     #[tokio::test]
     #[serial(background_tasks)]
-    async fn recall_with_residual_fts5_char_degrades_and_vector_leg_survives() {
+    async fn recall_with_residual_fts5_char_fails_loud() {
         const MODEL: &str = "recall-residual-char-test-model";
         const DIMS: usize = 32;
         const NOTE_TEXT: &str = "foo@bar chain call helper note";
@@ -883,8 +875,9 @@ mod tests {
         let registry = builder.build().expect("registry");
 
         // Query text matches the note content exactly so the hash-vec embedder
-        // (which has no semantic notion of similarity) produces an identical
-        // vector for query and note, guaranteeing a vector-leg hit.
+        // (which has no semantic notion of similarity) would produce an
+        // identical vector for query and note if the FTS leg degraded instead
+        // of failing loud.
         let result = registry
             .dispatch(
                 "memory.recall",
@@ -893,16 +886,13 @@ mod tests {
                     "limit": 10
                 }),
             )
-            .await
-            .expect("#389 memory.recall must not hard-fail on a residual FTS5 char ('@')");
+            .await;
 
-        let hits = result
-            .as_array()
-            .expect("memory.recall common-path result is a bare JSON array");
         assert!(
-            !hits.is_empty(),
-            "vector leg must still return the seeded note while the FTS leg is \
-             degraded by the residual FTS5 char ('@'), got empty results"
+            result.is_err(),
+            "#569 memory.recall must fail loud when the FTS leg errors on a residual \
+             FTS5 char ('@'), not silently degrade to vector-only results, got: {:?}",
+            result.ok()
         );
     }
 

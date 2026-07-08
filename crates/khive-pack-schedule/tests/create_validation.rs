@@ -1179,10 +1179,12 @@ async fn schedule_schedule_rejects_entity_type_under_resource_kind_bulk() {
 /// round-3 gap 1): iterate every real `khive_types::EntityKind` and every
 /// subtype the LIVE `khive-pack-kg::EntityTypeRegistry` actually has
 /// registered (via the dev-dependency), and assert `schedule.schedule`'s
-/// hand-mirrored `ENTITY_TYPE_DEFS_FOR_REPLAY` table (`handlers.rs`) accepts
-/// every one of them. If `BUILTIN_DEFS` ever gains a new subtype that isn't
-/// mirrored, this test starts failing in CI instead of silently reproducing
-/// a false-rejection bug like the one round 3 found.
+/// replay validation (`validate_entity_type_for_replay` in `handlers.rs`,
+/// which resolves subtypes through the shared `khive_types::EntityTypeRegistry`)
+/// accepts every one of them. If `BUILTIN_DEFS` ever gains a new subtype that
+/// the shared registry doesn't resolve, this test starts failing in CI
+/// instead of silently reproducing a false-rejection bug like the one round 3
+/// found.
 #[tokio::test]
 async fn gap1_every_real_registry_subtype_is_accepted_by_schedule() {
     use khive_pack_kg::EntityTypeRegistry;
@@ -1210,9 +1212,10 @@ async fn gap1_every_real_registry_subtype_is_accepted_by_schedule() {
                 .unwrap_or_else(|e| {
                     panic!(
                         "parity gap: the live EntityTypeRegistry accepts entity_type=\
-                         {type_name:?} for kind={:?}, but schedule.schedule's mirror \
-                         rejected it — ENTITY_TYPE_DEFS_FOR_REPLAY in handlers.rs is \
-                         missing this entry: {e}",
+                         {type_name:?} for kind={:?}, but schedule.schedule's replay \
+                         validation rejected it — validate_entity_type_for_replay in \
+                         handlers.rs is out of sync with khive_types::EntityTypeRegistry \
+                         for this entry: {e}",
                         kind.name()
                     )
                 });

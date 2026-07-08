@@ -6,7 +6,7 @@
 use std::sync::{Arc, RwLock};
 
 use khive_db::StorageBackend;
-use khive_gate::{ActorRef, AllowAllGate, GateRequest};
+use khive_gate::{AllowAllGate, GateRequest};
 use khive_storage::{EntityStore, EventStore, GraphStore, NoteStore, SqlAccess};
 use khive_types::{EdgeEndpointRule, Namespace};
 use lattice_embed::{EmbeddingModel, EmbeddingService};
@@ -421,10 +421,7 @@ impl KhiveRuntime {
     /// unconfigured, the token carries `ActorRef::anonymous()` and inbox falls
     /// back to party-line behavior.
     pub fn authorize(&self, ns: Namespace) -> RuntimeResult<NamespaceToken> {
-        let actor = match self.config.actor_id.as_deref() {
-            Some(id) if !id.trim().is_empty() => ActorRef::new("actor", id),
-            _ => ActorRef::anonymous(),
-        };
+        let actor = crate::actor_identity::resolve_actor(self.config.actor_id.as_deref());
         let req = GateRequest::new(
             actor.clone(),
             ns.clone(),
@@ -477,10 +474,7 @@ impl KhiveRuntime {
         primary: Namespace,
         extra_visible: Vec<Namespace>,
     ) -> RuntimeResult<NamespaceToken> {
-        let actor = match self.config.actor_id.as_deref() {
-            Some(id) if !id.trim().is_empty() => ActorRef::new("actor", id),
-            _ => ActorRef::anonymous(),
-        };
+        let actor = crate::actor_identity::resolve_actor(self.config.actor_id.as_deref());
         let req = GateRequest::new(
             actor.clone(),
             primary.clone(),

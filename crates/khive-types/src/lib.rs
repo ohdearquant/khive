@@ -14,6 +14,7 @@ extern crate std;
 
 pub mod edge;
 pub mod entity;
+pub mod entity_type;
 pub mod error;
 pub mod event;
 pub mod hash;
@@ -29,6 +30,7 @@ pub mod vector;
 
 pub use edge::{EdgeCategory, EdgeRelation};
 pub use entity::{Entity, EntityKind, Link, PropertyValue};
+pub use entity_type::{EntityTypeDef, EntityTypeError, EntityTypeRegistry, ResolvedEntityType};
 pub use error::{TypeError, UnknownVariant};
 pub use event::{
     AggregateRef, ApplyResult, Event, EventBuilder, EventKind, EventOutcome, EventPayload,

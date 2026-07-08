@@ -50,6 +50,7 @@ impl KgPack {
             "start",
             "end",
             "depends_on",
+            "context_entity_id",
             "items",
             "atomic",
             "verbose",

@@ -11,7 +11,7 @@ use khive_storage::types::{
 use khive_storage::EntityFilter;
 use khive_types::SubstrateKind;
 
-use crate::error::RuntimeResult;
+use crate::error::{RuntimeError, RuntimeResult};
 use crate::retrieval::{SearchHit, SearchSource};
 use crate::runtime::{KhiveRuntime, NamespaceToken};
 
@@ -148,16 +148,13 @@ impl KhiveRuntime {
         let candidates = limit.saturating_mul(CANDIDATE_MULTIPLIER).max(limit);
 
         let ns = token.namespace().as_str().to_owned();
-        // Fail-open on the FTS leg only, and only for FTS5 parser syntax errors
-        // (#388, #389 round-2 High): sanitize_fts5_query already strips
-        // known-unsafe FTS5 metacharacters, but if the lexical leg still errors
-        // at runtime on residual punctuation the sanitizer does not strip,
-        // degrade to vector-only fusion. A genuine backend outage (pool
-        // exhaustion, connection failure, etc.) is NOT a bad query and must
-        // propagate — `is_fts5_syntax_error` is the narrow gate that tells the
-        // two apart. Errors from any other leg (vector search) still
-        // propagate normally.
-        let text_hits = match self
+        // FTS5 parser syntax errors (#388, #389 round-2 High): sanitize_fts5_query
+        // already strips known-unsafe FTS5 metacharacters, but if the lexical
+        // leg still errors at runtime on residual punctuation the sanitizer
+        // does not strip, per #569 this now fails loud instead of degrading
+        // to vector-only fusion. Errors from any other leg (vector search)
+        // still propagate normally.
+        let text_search_result = self
             .text(token)?
             .search(TextSearchRequest {
                 query: query_text.to_string(),
@@ -169,19 +166,12 @@ impl KhiveRuntime {
                 top_k: candidates,
                 snippet_chars: 200,
             })
-            .await
-        {
-            Ok(hits) => hits,
-            Err(e) if e.is_fts5_syntax_error() => {
-                tracing::warn!(
-                    error = %e,
-                    query = %query_text,
-                    "hybrid_search_with_strategy: FTS leg failed on a parser syntax error, degrading to vector-only fusion"
-                );
-                Vec::new()
-            }
-            Err(e) => return Err(e.into()),
-        };
+            .await;
+        let text_hits = crate::error::fts_text_leg_or_err(
+            text_search_result.map_err(RuntimeError::from),
+            "hybrid_search_with_strategy",
+            query_text,
+        )?;
 
         let vector_hits = if query_vector.is_some() || self.config().embedding_model.is_some() {
             self.vector_search(
@@ -462,14 +452,16 @@ mod tests {
         );
     }
 
-    // 11. PR #389 internal review round 1 Medium regression: unlike `$`, `@` is NOT stripped by
-    // sanitize_fts5_query (by design — the sanitizer stays minimal per #388 scope; the
-    // fail-open net is the systematic answer for residual punctuation). SQLite FTS5's
-    // bareword parser still rejects `@` unconditionally, so this query reaches the
-    // runtime-level `Err` arm added in hybrid_search_with_strategy and must degrade to
-    // vector-only fusion rather than propagating the error.
+    // 11. #569 regression: unlike `$`, `@` is NOT stripped by sanitize_fts5_query
+    // (by design — the sanitizer stays minimal per #388 scope). SQLite FTS5's
+    // bareword parser still rejects `@` unconditionally, so this query reaches
+    // the runtime-level `Err` arm in hybrid_search_with_strategy, which must
+    // now fail loud (`RuntimeError::InvalidInput`) instead of silently
+    // degrading to vector-only fusion as it did before #569. This assertion
+    // fails against the pre-#569 fail-open behavior (which returned `Ok`
+    // here) and passes once the FTS leg fails closed.
     #[tokio::test]
-    async fn hybrid_search_with_strategy_residual_fts5_char_degrades_to_vector_only() {
+    async fn hybrid_search_with_strategy_residual_fts5_char_fails_loud() {
         let rt = KhiveRuntime::memory().unwrap();
         let tok = NamespaceToken::local();
         rt.create_entity(
@@ -489,10 +481,15 @@ mod tests {
             .await;
 
         assert!(
-            result.is_ok(),
-            "#389 hybrid_search_with_strategy must not hard-fail when the FTS leg errors \
-             on a residual FTS5 char ('@'), got: {:?}",
-            result.err()
+            result.is_err(),
+            "#569 hybrid_search_with_strategy must fail loud when the FTS leg errors \
+             on a residual FTS5 char ('@'), not silently degrade to vector-only fusion, \
+             got: {:?}",
+            result.ok()
+        );
+        assert!(
+            matches!(result.unwrap_err(), RuntimeError::InvalidInput(_)),
+            "residual FTS5 parser failure must surface as RuntimeError::InvalidInput"
         );
     }
 }
