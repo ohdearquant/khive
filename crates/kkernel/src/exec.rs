@@ -443,8 +443,9 @@ pub async fn run_exec(args: ExecArgs) -> Result<()> {
         // unconditionally). It is also empirically inert for config_id parity:
         // in the embed path (`no_embed: false`, exec's only mode), this flag
         // gates only the actor_id fill-when-None guard in `resolve_runtime_config`
-        // — and `compute_config_id` never reads `actor_id` (namespace is
-        // "carried separately" per its own doc comment). See the
+        // — and `compute_config_id` never reads identity fields (`actor_id` or
+        // `visible_namespaces`; namespace is carried separately per its own doc
+        // comment). See the
         // `namespace_explicit_changes_actor_id_fill_but_not_config_id` and
         // `exec_config_id_matches_serve_config_id_for_project_toml_actor` tests
         // below, which construct both arms and assert this directly rather than
@@ -1053,13 +1054,13 @@ default = true
             "namespace_explicit=false must NOT fill actor_id"
         );
 
-        // ...but `compute_config_id` never reads `actor_id` (namespace is
-        // "carried separately" per its own doc comment), so the two configs —
-        // which differ ONLY in actor_id — must still produce a byte-identical
-        // fingerprint. This is the empirical basis for `run_exec` picking
-        // `namespace_explicit: true`: it is the conservative, behavior-
-        // preserving choice, and it provably does not affect config_id parity
-        // with the daemon either way.
+        // ...but `compute_config_id` never reads identity fields (`actor_id` or
+        // `visible_namespaces`; namespace is carried separately per its own doc
+        // comment), so the two configs — which differ ONLY in actor_id — must
+        // still produce a byte-identical fingerprint. This is the empirical
+        // basis for `run_exec` picking `namespace_explicit: true`: it is the
+        // conservative, behavior-preserving choice, and it provably does not
+        // affect config_id parity with the daemon either way.
         assert_eq!(
             compute_config_id(&with_explicit_true, None),
             compute_config_id(&with_explicit_false, None),

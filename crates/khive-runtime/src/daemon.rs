@@ -203,10 +203,12 @@ pub struct DaemonRequestFrame {
     /// beyond `namespace` itself.
     #[serde(default)]
     pub visible_namespaces: Vec<String>,
-    /// Fingerprint of the client's resolved runtime config (packs, db target,
-    /// embedders). The daemon rejects a request whose `config_id` differs from
-    /// its own so a restricted client (e.g. `--pack kg`, `--db :memory:`) never
-    /// dispatches through the broader default daemon. See ADR-027 / ADR-049.
+    /// Fingerprint of the client's engine-coherence config: packs, db target,
+    /// embedders, backend routing, and construction-baked outbound policy.
+    /// Identity fields are carried separately in this frame. The daemon rejects
+    /// a request whose `config_id` differs from its own so a restricted client
+    /// (e.g. `--pack kg`, `--db :memory:`) never dispatches through the broader
+    /// default daemon. See ADR-027 / ADR-049 / ADR-096.
     #[serde(default)]
     pub config_id: String,
     /// IPC protocol version sent by the client. Pre-versioning clients omit

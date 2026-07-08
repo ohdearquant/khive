@@ -2622,9 +2622,9 @@ id = "lambda:project-actor"
     /// `config_id` must stay byte-identical across two connections that share ONE
     /// database but declare DIFFERENT `[actor]` ids via their own project/cwd
     /// config (ADR-096 Fork 2 hard invariant — `actor_id` must never feed
-    /// `compute_config_id`, whether directly or via the `visible_namespaces`
-    /// fold-in). `default_namespace` must also stay `"local"` for both
-    /// (ADR-007 Rev 4 Rule 0), independent of the configured actor.
+    /// `compute_config_id`, and neither may the identity-derived
+    /// `visible_namespaces` fold-in). `default_namespace` must also stay
+    /// `"local"` for both (ADR-007 Rev 4 Rule 0), independent of the configured actor.
     ///
     /// Deliberately does NOT use an explicit `--config` override for the two
     /// connections: an explicit path is tier 1 and would make the db-anchored
@@ -2723,7 +2723,7 @@ id = "lambda:project-actor"
             crate::server::compute_config_id(&cfg_a, None),
             crate::server::compute_config_id(&cfg_b, None),
             "config_id must be byte-identical across connections that differ ONLY \
-             in [actor] id — actor_id must never feed compute_config_id"
+             in [actor] id and folded visibility — identity fields must never feed compute_config_id"
         );
     }
 

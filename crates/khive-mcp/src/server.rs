@@ -33,13 +33,16 @@ use khive_storage::EdgeRelation;
 use crate::coordinator::CoordinatorService;
 use crate::tools::request::RequestParams;
 
-/// Fingerprint the dispatch-affecting parts of a resolved [`RuntimeConfig`].
+/// Fingerprint the engine-coherence parts of a resolved [`RuntimeConfig`].
 ///
-/// Two servers produce the same id iff they would dispatch identically: same
-/// pack set (order-independent), same storage target, and same embedders. The
-/// daemon compares this against each forwarded request's `config_id` and rejects
+/// Two servers produce the same id iff they can safely share one warm engine:
+/// same pack set (order-independent), same storage target, same embedders, same
+/// backend topology/routing, and same construction-baked outbound policy.
+/// Identity fields (`namespace`, `actor_id`, `visible_namespaces`) are carried
+/// per request in the daemon frame and must never enter this key. The daemon
+/// compares this against each forwarded request's `config_id` and rejects
 /// mismatches so a restricted client (e.g. `--pack kg`, `--db :memory:`) cannot
-/// execute through the broader default daemon. Namespace is carried separately.
+/// execute through the broader default daemon.
 ///
 /// When `khive_cfg` is supplied and contains a non-empty `[[backends]]`
 /// declaration, the backend topology (sorted backend list and pack→backend
@@ -70,13 +73,6 @@ pub fn compute_config_id(
         .map(|m| format!("{m:?}"))
         .collect();
     extra.sort();
-    let mut visible: Vec<String> = config
-        .visible_namespaces
-        .iter()
-        .map(|ns| ns.as_str().to_owned())
-        .collect();
-    visible.sort();
-    visible.dedup();
     let mut outbound: Vec<String> = config
         .allowed_outbound_namespaces
         .iter()
@@ -86,13 +82,12 @@ pub fn compute_config_id(
     outbound.dedup();
 
     let base = format!(
-        "packs=[{}];db={};embed={};extra=[{}];backend={:?};visible=[{}];outbound=[{}]",
+        "packs=[{}];db={};embed={};extra=[{}];backend={:?};outbound=[{}]",
         packs.join(","),
         db,
         primary,
         extra.join(","),
         config.backend_id,
-        visible.join(","),
         outbound.join(","),
     );
 

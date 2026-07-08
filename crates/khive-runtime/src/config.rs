@@ -412,7 +412,7 @@ pub fn assert_db_anchor_consistent(
 /// directory (commit 10d9c92c, #651) keeps `config_id` coherent between a
 /// short-lived client and a long-running daemon that share one database — that is
 /// correct for the fields that make up `config_id` (packs/db/embed/backend/
-/// visible/outbound). It also relocated discovery of the project-local `[actor]`
+/// outbound policy). It also relocated discovery of the project-local `[actor]`
 /// block, though. When many per-project connections share one database under a
 /// single `HOME` (the daemon-multiplexed fleet case), the shared database-anchored
 /// config carries no `[actor]`, so every connection's write-stamp attribution
@@ -421,10 +421,11 @@ pub fn assert_db_anchor_consistent(
 /// This performs a SEPARATE, cwd-anchored lookup (`db_path: None`, matching the
 /// pre-#651 tier-3 search) and reads only `[actor].id`. It intentionally does not
 /// read or return anything else from the resolved `KhiveConfig` — `config_id`,
-/// `default_namespace`, and `visible_namespaces` remain governed exclusively by
-/// the existing database-anchored load and must not be perturbed by this tier:
-/// `actor_id` is not part of `compute_config_id` (`khive-mcp` `server.rs`), and
-/// ADR-007 Rev 4 Rule 0 already keeps `[actor].id` out of `default_namespace`.
+/// `default_namespace` remain governed exclusively by the existing
+/// database-anchored load and must not be perturbed by this tier: `actor_id`
+/// and identity-derived `visible_namespaces` are not part of
+/// `compute_config_id` (`khive-mcp` `server.rs`), and ADR-007 Rev 4 Rule 0
+/// already keeps `[actor].id` out of `default_namespace`.
 ///
 /// `config_path` is the same explicit `--config` / `KHIVE_CONFIG` override the
 /// caller's database-anchored load receives — tier 1 short-circuits identically
