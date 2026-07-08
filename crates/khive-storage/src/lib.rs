@@ -28,7 +28,8 @@ pub use sql::{AtomicUnitOp, BoxFuture, SqlAccess, SqlReader, SqlWriter};
 pub use telemetry::{
     ChannelBackoffArmedPayload, ChannelBackoffResetPayload, ChannelHeartbeatPersistFailedPayload,
     ChannelPollFailedPayload, ChannelPollStartedPayload, ChannelPollSucceededPayload,
-    CheckpointOutcomeRecordedPayload, ConfigLockedPayload, LifecycleEvent,
+    CheckpointOutcomeRecordedPayload, ConfigLockedPayload, LifecycleEvent, PhaseCancelledPayload,
+    PhaseCompletedPayload, PhaseStartedPayload,
 };
 pub use text::TextSearch;
 pub use types::StorageResult;

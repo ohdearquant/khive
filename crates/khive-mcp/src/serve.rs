@@ -2926,6 +2926,7 @@ id = "lambda:project-actor"
     /// `multi_backend_boot_paths_share_identical_wiring_surface` test, which
     /// exercises the actual coordinator branch.
     #[test]
+    #[serial]
     fn kkernel_multi_backend_path_wires_pool_for_file_backed_main() {
         let dir = tempfile::tempdir().expect("temp dir");
         let main_path = dir.path().join("main.db");
@@ -2959,6 +2960,7 @@ id = "lambda:project-actor"
     /// exercises `build_server_from_multi_backend_registry` — see the note on the
     /// sibling test above.
     #[test]
+    #[serial]
     fn kkernel_multi_backend_path_leaves_pool_none_for_in_memory_main() {
         let khive_cfg = KhiveConfig {
             backends: vec![BackendConfig {
@@ -2993,6 +2995,7 @@ id = "lambda:project-actor"
     /// Both boot paths now delegate to `build_pack_runtime`, which applies the wiring in
     /// one place and prevents any future path from drifting.
     #[test]
+    #[serial]
     fn secondary_pack_runtime_core_resolves_to_main_after_build_registry() {
         use khive_runtime::PackConfig;
 
@@ -3063,6 +3066,7 @@ id = "lambda:project-actor"
     /// in-memory for this invocation, and the declared sqlite paths must never be
     /// created on disk.
     #[test]
+    #[serial]
     fn memory_override_forces_all_backends_in_memory_and_never_creates_sqlite_file() {
         use khive_runtime::PackConfig;
 
@@ -3129,6 +3133,7 @@ id = "lambda:project-actor"
     /// to?) and must fail loud, pointing at khive.toml as the place to make the
     /// change, rather than silently collapsing distinct backends onto one path.
     #[test]
+    #[serial]
     fn concrete_db_override_with_backends_declared_is_rejected() {
         use khive_runtime::PackConfig;
 
@@ -3297,6 +3302,7 @@ id = "lambda:project-actor"
     /// `"main"`. `build_server_multi_backend` must return an error whose
     /// message mentions `"main"` so operators know what to fix.
     #[test]
+    #[serial]
     fn multi_backend_missing_main_returns_error_mentioning_main() {
         let khive_cfg = KhiveConfig {
             backends: vec![BackendConfig {
@@ -3334,6 +3340,7 @@ id = "lambda:project-actor"
     /// must return an `Err` mentioning the pack, the requested backend, and the
     /// defined backends.
     #[test]
+    #[serial]
     fn multi_backend_registry_rejects_undefined_pack_backend() {
         use khive_runtime::PackConfig;
 
@@ -3391,6 +3398,7 @@ id = "lambda:project-actor"
     /// but through the `build_server_multi_backend` public builder, which has its
     /// own independent per-pack backend resolution loop.
     #[test]
+    #[serial]
     fn multi_backend_server_rejects_undefined_pack_backend() {
         use khive_runtime::PackConfig;
 
@@ -3472,6 +3480,7 @@ id = "lambda:project-actor"
     /// run migrations only once. Verified by using two names that differ only by
     /// `./` prefix while pointing at the same absolute path.
     #[test]
+    #[serial]
     fn duplicate_sqlite_paths_deduplicated_to_single_backend() {
         use khive_runtime::PackConfig;
 
@@ -3536,6 +3545,7 @@ id = "lambda:project-actor"
     /// declared backend in-memory for this invocation, and the declared sqlite
     /// paths must never be created on disk.
     #[test]
+    #[serial]
     fn memory_override_forces_all_backends_in_memory_and_never_creates_sqlite_file_via_build_server_multi_backend(
     ) {
         use khive_runtime::PackConfig;
@@ -3604,6 +3614,7 @@ id = "lambda:project-actor"
     /// path too, pointing at khive.toml as the place to make the change, rather
     /// than silently collapsing distinct backends onto one path.
     #[test]
+    #[serial]
     fn concrete_db_override_with_backends_declared_is_rejected_via_build_server_multi_backend() {
         use khive_runtime::PackConfig;
 

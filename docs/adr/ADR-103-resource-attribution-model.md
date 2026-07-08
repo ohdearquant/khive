@@ -307,6 +307,34 @@ self-report) and #724 Ask A (windowed event counts). #723 ask 3 (QoS for warm-pa
 lands in Stage 2, and #724 Ask B (section co-usage aggregates) is a knowledge-pack read
 surface outside this ADR's scope, tracked on that issue independently.
 
+### Stage 1 clarification: audit-row write timing
+
+Populating `duration_us` on the existing audit row (above) requires knowing how long dispatch
+took, which is only known after dispatch returns. The implementation therefore defers the
+Allow-outcome audit row's durable append until after `pack.dispatch` resolves, so the row can
+carry the measured `duration_us` and an outcome derived from the actual dispatch result
+(`Success` for `Ok`, `Error` for `Err`) instead of a value fixed before the result is known.
+
+The consequence: if the process crashes, panics, or is killed mid-dispatch — after the gate
+allows the call but before the deferred row is appended — that one dispatch's audit row is
+lost entirely, not merely incomplete. This widens a pre-existing narrow-case trade-off (the
+prior implementation deferred only around a single verb shape) to every Allow-outcome verb.
+
+This is accepted, not an oversight. The alternative — appending a row before dispatch runs, so
+a crash cannot drop it — means every Allow-outcome row starts life recording an outcome that
+has not actually happened yet (`Success`, before the handler has returned) and a `duration_us`
+of 0. That row is not more complete; it is a preserved misattribution that a crash prevents
+from ever being corrected. The event log is the attribution and cost-accounting plane this ADR
+specifies — it is not the crash-forensics surface; the daemon's own process log is, and it is
+unaffected by this trade-off.
+
+**Upgrade path (not built in Stage 1).** If audit completeness across a crash ever becomes a
+hard requirement (for example, a compliance obligation), the design moves to a durable
+pre-dispatch append plus a narrow finalize/update seam on the event store that sets the final
+`duration_us` and outcome once dispatch resolves — two rows' worth of state collapsed onto one
+row's identity, rather than one row written twice. That seam does not exist today; this
+paragraph records the fork so it is findable if the requirement arrives.
+
 **Stage 2 — scheduling and QoS (sub-ADR).** The per-work-class bounded-concurrency
 semaphore and lowered thread priority for the `warm` and `maintenance` classes (#723 ask
 3); the voluntary quiet-request verb and TTL-bounded deferral at background yield points;

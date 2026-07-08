@@ -5225,6 +5225,51 @@ async fn health_reports_client_role_when_no_heartbeat_state_exists() {
     );
 }
 
+/// ADR-103 Stage 1 / issue #723 ask 2: `comm.health()` must self-report this
+/// process's own resource usage — `cpu_us`/`rss_bytes` via `getrusage`, plus
+/// the (possibly empty) set of named background phases currently in flight.
+/// No computed `healthy` field, matching the rest of this verb's contract.
+#[tokio::test]
+async fn health_includes_resource_self_report() {
+    let (registry, _rt) = build_registry();
+
+    let result = registry
+        .dispatch("comm.health", serde_json::json!({}))
+        .await
+        .expect("health succeeds");
+
+    let resource = &result["resource"];
+    assert!(
+        resource.is_object(),
+        "resource must be an object, got: {resource:?}"
+    );
+    assert!(
+        resource.get("healthy").is_none(),
+        "resource must never carry a computed healthy bool"
+    );
+    // `getrusage` should succeed on every CI runner this crate builds on
+    // (unix); the field must at least be present (null only on a platform
+    // with no implementation) and non-negative when populated.
+    assert!(
+        resource.get("cpu_us").is_some(),
+        "cpu_us key must be present"
+    );
+    if let Some(cpu_us) = resource["cpu_us"].as_i64() {
+        assert!(cpu_us >= 0);
+    }
+    assert!(
+        resource.get("rss_bytes").is_some(),
+        "rss_bytes key must be present"
+    );
+    let active_phases = resource["active_phases"]
+        .as_array()
+        .expect("active_phases must be an array");
+    assert!(
+        active_phases.is_empty(),
+        "no background phase is in flight during this test"
+    );
+}
+
 /// comm.health() takes no arguments — any caller-supplied args must be rejected
 /// rather than silently ignored (spec: "read-only, NO args").
 #[tokio::test]

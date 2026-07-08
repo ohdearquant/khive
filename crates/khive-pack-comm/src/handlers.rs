@@ -1097,6 +1097,21 @@ fn channel_health_to_json(note: &Note) -> Value {
 ///
 /// Never returns a computed `healthy: bool` (design review amendment: "report
 /// timestamps only") — staleness/alerting judgment belongs to the caller.
+///
+/// `resource` (ADR-103 Stage 1, issue #723 ask 2): a process-level self-report
+/// of this process's own cumulative CPU time and RSS (via `getrusage`,
+/// `khive_runtime::process_resource_usage`) plus the names of any background
+/// phases (e.g. `ann_warm`) currently in flight in this process
+/// (`khive_runtime::active_phase_names`). "This process" is, in the common
+/// case, the daemon itself: a client-role stdio session without an in-memory
+/// poll loop of its own still forwards `dispatch` calls to the daemon over
+/// its socket, so this handler body executes inside the daemon process, not
+/// the thin client. `cpu_us`/`rss_bytes` are `null` only if the underlying
+/// `getrusage` read is unavailable on this platform; `active_phases` is
+/// always present and empty when nothing is in flight. Raw observations
+/// only, per the same "no computed healthy bool" rule as the rest of this
+/// verb — attributing severity to a given CPU/RSS number is the caller's
+/// judgment, not this verb's.
 pub(crate) async fn handle_health(
     runtime: &KhiveRuntime,
     token: &NamespaceToken,
@@ -1146,11 +1161,19 @@ pub(crate) async fn handle_health(
         ("daemon", Some("daemon-heartbeat"))
     };
 
+    let usage = khive_runtime::process_resource_usage();
+    let resource = json!({
+        "cpu_us": usage.map(|u| u.cpu_us),
+        "rss_bytes": usage.map(|u| u.rss_bytes),
+        "active_phases": khive_runtime::active_phase_names(),
+    });
+
     Ok(json!({
         "role": role,
         "source": source,
         "as_of": as_of,
         "channels": channels,
+        "resource": resource,
     }))
 }
 

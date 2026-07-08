@@ -524,6 +524,72 @@ pub fn background_task_count() -> usize {
     background_tasks().load(std::sync::atomic::Ordering::Relaxed)
 }
 
+// ── active background phase names (ADR-103 Stage 1 / issue #723 ask 2) ────────
+//
+// A lightweight, best-effort process-wide gauge of which named background
+// phases (e.g. `ann_warm`) are in flight right now, read by `comm.health`'s
+// resource self-report so a caller can see "what is the daemon doing" at a
+// glance without correlating timestamps across the event log itself. Counted
+// per name rather than boolean, since more than one occurrence of the same
+// named phase can legitimately overlap (e.g. two embedding models warming
+// concurrently) — the name only drops out of the reported set once every
+// concurrent occurrence has ended.
+static ACTIVE_PHASES: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<String, usize>>,
+> = std::sync::OnceLock::new();
+
+fn active_phases() -> &'static std::sync::Mutex<std::collections::HashMap<String, usize>> {
+    ACTIVE_PHASES.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// RAII guard for one occurrence of a named background phase. Increments the
+/// phase's count on creation (see [`register_active_phase`]); decrements on
+/// `Drop`, so the count comes back down whether the guarded work returns
+/// normally, panics, or is cancelled — the same rationale as
+/// `BackgroundTaskGuard` above.
+pub struct PhaseGuard {
+    name: String,
+}
+
+impl Drop for PhaseGuard {
+    fn drop(&mut self) {
+        let mut map = active_phases()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(count) = map.get_mut(&self.name) {
+            *count -= 1;
+            if *count == 0 {
+                map.remove(&self.name);
+            }
+        }
+    }
+}
+
+/// Register one occurrence of a named background phase as currently active.
+/// Returns a guard: drop it (or let it fall out of scope) when the phase
+/// ends. Best-effort process-wide gauge only, read by `comm.health` — never
+/// load-bearing for correctness.
+pub fn register_active_phase(name: &str) -> PhaseGuard {
+    let mut map = active_phases()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    *map.entry(name.to_string()).or_insert(0) += 1;
+    PhaseGuard {
+        name: name.to_string(),
+    }
+}
+
+/// Currently active background-phase names, sorted for deterministic output.
+/// Empty when no tracked phase is in flight.
+pub fn active_phase_names() -> Vec<String> {
+    let map = active_phases()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut names: Vec<String> = map.keys().cloned().collect();
+    names.sort();
+    names
+}
+
 // ── server ────────────────────────────────────────────────────────────────────
 
 /// Build a point-in-time [`MetricsSnapshot`] of this process's server-side
@@ -1359,6 +1425,51 @@ mod tests {
             background_task_count(),
             before,
             "background task counter must return to baseline after the tracked future panics"
+        );
+    }
+
+    // ── active background phase names (ADR-103 Stage 1 / issue #723 ask 2) ──
+
+    // `#[serial(active_phases)]`: these tests read/assert on the process-wide
+    // `ACTIVE_PHASES` static. No other test in this crate touches it today,
+    // but the group mirrors the `background_tasks` precedent above so a
+    // future addition does not silently reintroduce the same interleaving
+    // hazard (internal review PR #583 round-3 Medium) that motivated it there.
+    #[test]
+    #[serial(active_phases)]
+    fn register_active_phase_appears_and_disappears_with_the_guard() {
+        assert!(
+            !active_phase_names().contains(&"adr103_test_phase".to_string()),
+            "must start absent (leaked from a prior failed run would poison this test)"
+        );
+
+        let guard = register_active_phase("adr103_test_phase");
+        assert!(active_phase_names().contains(&"adr103_test_phase".to_string()));
+
+        drop(guard);
+        assert!(
+            !active_phase_names().contains(&"adr103_test_phase".to_string()),
+            "the phase name must drop out of the gauge once its guard is dropped"
+        );
+    }
+
+    #[test]
+    #[serial(active_phases)]
+    fn register_active_phase_counts_concurrent_occurrences_of_the_same_name() {
+        let first = register_active_phase("adr103_concurrent_phase");
+        let second = register_active_phase("adr103_concurrent_phase");
+        assert!(active_phase_names().contains(&"adr103_concurrent_phase".to_string()));
+
+        drop(first);
+        assert!(
+            active_phase_names().contains(&"adr103_concurrent_phase".to_string()),
+            "one of two concurrent occurrences ending must not remove the name early"
+        );
+
+        drop(second);
+        assert!(
+            !active_phase_names().contains(&"adr103_concurrent_phase".to_string()),
+            "the name must be removed only once every concurrent occurrence has ended"
         );
     }
 

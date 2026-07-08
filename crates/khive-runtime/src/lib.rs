@@ -22,6 +22,7 @@ pub mod pack;
 pub mod portability;
 pub mod presentation;
 pub mod registry;
+pub mod resource;
 pub mod retrieval;
 pub mod runtime;
 pub mod secret_gate;
@@ -42,8 +43,9 @@ pub use curation::{
 #[cfg(unix)]
 pub use daemon::acquire_recovery_lock;
 pub use daemon::{
-    background_task_count, pid_path, run_daemon, socket_path, track_background_task,
-    DaemonDispatch, DaemonRequestFrame, DaemonResponseFrame, PROTOCOL_VERSION,
+    active_phase_names, background_task_count, pid_path, register_active_phase, run_daemon,
+    socket_path, track_background_task, DaemonDispatch, DaemonRequestFrame, DaemonResponseFrame,
+    PhaseGuard, PROTOCOL_VERSION,
 };
 pub use embedder_registry::{EmbedderProvider, EmbedderRegistry, LatticeEmbedderProvider};
 pub use engine_config::{
@@ -89,6 +91,7 @@ pub use presentation::{
     apply_redundancy_drop, micros_to_iso, present, render_format, OutputFormat, PresentationMode,
 };
 pub use registry::{ObjectiveRegistry, RegisteredObjective};
+pub use resource::{cpu_delta_us, process_resource_usage, ProcessResourceUsage};
 pub use retrieval::{SearchHit, SearchSource};
 pub use runtime::{
     assert_db_anchor_consistent, parse_pack_list, resolve_db_anchor, resolve_project_actor_id,
