@@ -287,7 +287,13 @@ fn resolved_pair(r: Option<&Resolved>) -> Option<(&'static str, &str, Option<&st
 }
 
 /// `true` if `spec` matches the given substrate + kind + entity_type triple.
-fn endpoint_matches(
+///
+/// Pure and DB-free — exposed so offline consumers (e.g. `kkernel kg
+/// validate`, which parses `(substrate, kind, entity_type)` straight out of
+/// NDJSON with no live record to resolve) can apply the exact same
+/// `EdgeEndpointRule` matching semantics `pack_rule_allows` uses internally,
+/// instead of re-deriving a parallel matcher that could drift out of sync.
+pub fn endpoint_matches(
     spec: &EndpointKind,
     substrate: &str,
     kind: &str,
@@ -442,7 +448,12 @@ pub fn base_entity_endpoint_rules() -> &'static [(&'static str, EdgeRelation, &'
     BASE_ENTITY_ENDPOINT_RULES
 }
 
-fn base_entity_rule_allows(src_kind: &str, relation: EdgeRelation, tgt_kind: &str) -> bool {
+/// `true` if `(src_kind, relation, tgt_kind)` is in the base entity endpoint
+/// allowlist. Pure and DB-free — exposed alongside [`base_entity_endpoint_rules`]
+/// so offline consumers (e.g. `kkernel kg validate`) can apply the exact same
+/// base-table membership test the live validator uses, instead of re-deriving
+/// a parallel `.any()` predicate over a hand-copied allowlist.
+pub fn base_entity_rule_allows(src_kind: &str, relation: EdgeRelation, tgt_kind: &str) -> bool {
     BASE_ENTITY_ENDPOINT_RULES.iter().any(|(src, rel, tgt)| {
         *rel == relation && (*src == "*" || *src == src_kind) && *tgt == tgt_kind
     })

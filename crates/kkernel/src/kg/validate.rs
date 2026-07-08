@@ -1,11 +1,14 @@
 //! `kkernel kg validate` — structural and configurable rule-pass validation.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use anyhow::{bail, Context, Result};
+use chrono::Datelike;
 use khive_runtime::pack::{PackRegistry, VerbRegistryBuilder};
-use khive_runtime::{KhiveRuntime, RuntimeConfig};
+use khive_runtime::{base_entity_rule_allows, endpoint_matches, KhiveRuntime, RuntimeConfig};
+use khive_storage::EdgeRelation;
+use khive_types::EdgeEndpointRule;
 use serde::Deserialize;
 
 use super::types::{
@@ -71,6 +74,35 @@ fn build_taxonomy() -> Result<KgTaxonomy> {
     })
 }
 
+/// Build the merged pack-declared edge endpoint rule set (ADR-017 `EDGE_RULES`).
+///
+/// Same no-DB registry construction as [`build_taxonomy`] (kept as a
+/// separate function rather than folding into `KgTaxonomy` so existing
+/// taxonomy-only callers and their test fixtures are unaffected). The
+/// returned rules are `VerbRegistry::all_edge_rules()` — the exact set every
+/// pack contributes via `Pack::EDGE_RULES` — so the `edge-endpoint-types`
+/// rule class consults the same live data the `link`/`update` verbs enforce,
+/// never a hand-copied snapshot.
+fn build_pack_edge_rules() -> Result<Vec<EdgeEndpointRule>> {
+    let config = RuntimeConfig {
+        db_path: None,
+        default_namespace: khive_runtime::Namespace::parse("kkernel-validate")
+            .unwrap_or_else(|_| khive_runtime::Namespace::local()),
+        embedding_model: None,
+        ..RuntimeConfig::default()
+    };
+    let runtime = KhiveRuntime::new(config).context("building edge-rules registry")?;
+    let mut builder = VerbRegistryBuilder::new();
+    let names: Vec<String> = PackRegistry::discovered_names()
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+    PackRegistry::register_packs(&names, runtime.clone(), &mut builder)
+        .map_err(|n| anyhow::anyhow!("pack {n:?} declared in inventory but factory missing"))?;
+    let registry = builder.build().context("building VerbRegistry")?;
+    Ok(registry.all_edge_rules())
+}
+
 pub(super) fn cmd_validate(args: ValidateArgs) -> Result<()> {
     let kg_dir = args.repo.join(".khive/kg");
     if !kg_dir.exists() {
@@ -94,7 +126,8 @@ pub(super) fn cmd_validate(args: ValidateArgs) -> Result<()> {
         structural_checks(&entities_path, &edges_path, &notes_path, &taxonomy);
 
     if !args.no_rules && rules_path.exists() {
-        let configurable = configurable_rule_checks(&entities_path, &edges_path, &rules_path)?;
+        let configurable =
+            configurable_rule_checks(&entities_path, &edges_path, &notes_path, &rules_path)?;
         rule_results.extend(configurable);
     }
 
@@ -417,8 +450,6 @@ fn check_valid_note_kinds(notes_path: &Path, valid_kinds: &HashSet<String>) -> R
 }
 
 fn check_valid_edge_relations(edges_path: &Path) -> RuleResult {
-    use khive_storage::EdgeRelation;
-
     let valid_list = {
         let mut names = EdgeRelation::VALID_NAMES.to_vec();
         names.sort_unstable();
@@ -713,6 +744,132 @@ fn default_severity() -> String {
 struct RulesFile {
     #[serde(default)]
     rules: Vec<RuleConfig>,
+    /// Rule class 1: edge `(source kind, relation, target kind)` endpoint
+    /// contract, checked against the live pack/base allowlist.
+    #[serde(default)]
+    edge_endpoint_types: Option<EdgeEndpointTypesConfig>,
+    /// Rule class 2: likely-inverted directional edges.
+    #[serde(default)]
+    edge_direction_conventions: Option<EdgeDirectionConventionsConfig>,
+    /// Rule class 3: unresolvable edge/annotation endpoint references.
+    #[serde(default)]
+    dangling_refs: Option<DanglingRefsConfig>,
+    /// Rule class 4: entity name hygiene.
+    #[serde(default)]
+    naming_conventions: Option<NamingConventionsConfig>,
+    /// Rule class 5: forward-dated citation/property values.
+    #[serde(default)]
+    citation_date_lint: Option<CitationDateLintConfig>,
+}
+
+fn default_enabled() -> bool {
+    true
+}
+
+/// Default severity for schema/contract-correctness rule classes
+/// (`edge-endpoint-types`, `dangling-refs`) — same default the built-in
+/// `error`-severity structural checks use, since both classes flag data that
+/// is genuinely wrong per the ADR-002/ADR-017 contract, not merely a style
+/// preference.
+fn default_severity_error() -> String {
+    "error".to_owned()
+}
+
+/// Config for the `edge-endpoint-types` rule class (rule 1).
+///
+/// Checks that every edge's `(source kind, relation, target kind)` triple
+/// satisfies the canonical endpoint contract — see [`check_edge_endpoint_types`].
+#[derive(Debug, Deserialize)]
+struct EdgeEndpointTypesConfig {
+    #[serde(default = "default_enabled")]
+    enabled: bool,
+    #[serde(default = "default_severity_error")]
+    severity: String,
+}
+
+/// One directional-convention entry: the "forward" kind patterns for a
+/// specific relation. An edge matching the reversed pattern (target's kind in
+/// `forward_source_kinds`, source's kind in `forward_target_kinds`) but not
+/// the forward pattern is flagged as likely-inverted.
+#[derive(Debug, Deserialize)]
+struct DirectionRuleConfig {
+    relation: String,
+    #[serde(default)]
+    forward_source_kinds: Vec<String>,
+    #[serde(default)]
+    forward_target_kinds: Vec<String>,
+}
+
+/// Config for the `edge-direction-conventions` rule class (rule 2).
+#[derive(Debug, Deserialize)]
+struct EdgeDirectionConventionsConfig {
+    #[serde(default = "default_enabled")]
+    enabled: bool,
+    #[serde(default = "default_severity")]
+    severity: String,
+    #[serde(default)]
+    relations: Vec<DirectionRuleConfig>,
+}
+
+/// Config for the `dangling-refs` rule class (rule 3).
+#[derive(Debug, Deserialize)]
+struct DanglingRefsConfig {
+    #[serde(default = "default_enabled")]
+    enabled: bool,
+    #[serde(default = "default_severity_error")]
+    severity: String,
+}
+
+/// Per-entity-kind override of the naming-convention defaults.
+/// `None` fields fall back to the top-level [`NamingConventionsConfig`] value.
+#[derive(Debug, Deserialize, Default)]
+struct NamingConventionsOverride {
+    max_length: Option<usize>,
+    no_leading_trailing_whitespace: Option<bool>,
+    no_parenthetical_suffix: Option<bool>,
+}
+
+fn default_max_length() -> usize {
+    200
+}
+
+/// Config for the `naming-conventions` rule class (rule 4).
+#[derive(Debug, Deserialize)]
+struct NamingConventionsConfig {
+    #[serde(default = "default_enabled")]
+    enabled: bool,
+    #[serde(default = "default_severity")]
+    severity: String,
+    #[serde(default = "default_max_length")]
+    max_length: usize,
+    #[serde(default = "default_enabled")]
+    no_leading_trailing_whitespace: bool,
+    #[serde(default = "default_enabled")]
+    no_parenthetical_suffix: bool,
+    /// Per-entity-kind overrides, keyed by entity kind string (e.g. `"concept"`).
+    #[serde(default)]
+    kinds: std::collections::BTreeMap<String, NamingConventionsOverride>,
+}
+
+fn default_date_lint_fields() -> Vec<String> {
+    vec![
+        "year".to_owned(),
+        "date".to_owned(),
+        "published_at".to_owned(),
+        "publication_date".to_owned(),
+    ]
+}
+
+/// Config for the `citation-date-lint` rule class (rule 5).
+#[derive(Debug, Deserialize)]
+struct CitationDateLintConfig {
+    #[serde(default = "default_enabled")]
+    enabled: bool,
+    #[serde(default = "default_severity")]
+    severity: String,
+    /// Property key names checked for forward-dated values.
+    #[serde(default = "default_date_lint_fields")]
+    fields: Vec<String>,
 }
 
 fn severity_static(s: &str) -> &'static str {
@@ -750,6 +907,7 @@ fn validate_severity(rule_id: &str, s: &str) -> Option<RuleResult> {
 pub(super) fn configurable_rule_checks(
     entities_path: &Path,
     edges_path: &Path,
+    notes_path: &Path,
     rules_path: &Path,
 ) -> Result<Vec<RuleResult>> {
     let ext = rules_path
@@ -814,6 +972,83 @@ pub(super) fn configurable_rule_checks(
             passed: violations.is_empty(),
             violations,
         });
+    }
+
+    // ── Built-in configurable rule classes ─────────────────────────────────
+    //
+    // Each is opt-in: absent from `rules.toml` means it does not run at all
+    // (matching this loader's existing all-or-nothing gate — `rules.toml`
+    // itself is entirely optional, see `cmd_validate`). Present-but-disabled
+    // (`enabled = false`) also skips evaluation. This keeps every existing
+    // `rules.toml` that predates these five sections byte-identical in
+    // behavior: no new section, no new checks.
+    if let Some(cfg) = &rules_file.edge_endpoint_types {
+        if cfg.enabled {
+            if let Some(err_result) = validate_severity("edge-endpoint-types", &cfg.severity) {
+                results.push(err_result);
+            } else {
+                let pack_rules = build_pack_edge_rules()
+                    .context("building pack edge-endpoint rules for edge-endpoint-types")?;
+                results.push(check_edge_endpoint_types(
+                    entities_path,
+                    notes_path,
+                    edges_path,
+                    &pack_rules,
+                    cfg,
+                ));
+            }
+        }
+    }
+
+    if let Some(cfg) = &rules_file.edge_direction_conventions {
+        if cfg.enabled {
+            if let Some(err_result) = validate_severity("edge-direction-conventions", &cfg.severity)
+            {
+                results.push(err_result);
+            } else {
+                results.push(check_edge_direction_conventions(
+                    entities_path,
+                    notes_path,
+                    edges_path,
+                    cfg,
+                ));
+            }
+        }
+    }
+
+    if let Some(cfg) = &rules_file.dangling_refs {
+        if cfg.enabled {
+            if let Some(err_result) = validate_severity("dangling-refs", &cfg.severity) {
+                results.push(err_result);
+            } else {
+                results.push(check_dangling_refs(
+                    entities_path,
+                    notes_path,
+                    edges_path,
+                    cfg,
+                ));
+            }
+        }
+    }
+
+    if let Some(cfg) = &rules_file.naming_conventions {
+        if cfg.enabled {
+            if let Some(err_result) = validate_severity("naming-conventions", &cfg.severity) {
+                results.push(err_result);
+            } else {
+                results.push(check_naming_conventions(entities_path, cfg));
+            }
+        }
+    }
+
+    if let Some(cfg) = &rules_file.citation_date_lint {
+        if cfg.enabled {
+            if let Some(err_result) = validate_severity("citation-date-lint", &cfg.severity) {
+                results.push(err_result);
+            } else {
+                results.push(check_citation_date_lint(entities_path, notes_path, cfg));
+            }
+        }
     }
 
     Ok(results)
@@ -885,6 +1120,551 @@ fn evaluate_rule(rule: &RuleConfig, path: &Path) -> Vec<Violation> {
     }
 
     violations
+}
+
+// ── Built-in configurable rule classes ────────────────────────────────────────
+
+/// A resolved `(substrate, kind, entity_type)` triple for one record ID,
+/// gathered by scanning `entities.ndjson` / `notes.ndjson`. The offline
+/// equivalent of `KhiveRuntime::resolve_edge_endpoint`, which the DB-backed
+/// validator uses and this CLI path cannot (no DB connection).
+struct KindInfo {
+    substrate: &'static str,
+    kind: String,
+    entity_type: Option<String>,
+}
+
+/// Build the `id -> (substrate, kind, entity_type)` map used by the
+/// `edge-endpoint-types` and `edge-direction-conventions` rule classes.
+/// Entity records win the `"entity"` substrate, note records the `"note"`
+/// substrate; a duplicate UUID across both files (already reported by
+/// `no-duplicate-uuids`) resolves to whichever file is scanned last.
+fn collect_kind_map(entities_path: &Path, notes_path: &Path) -> HashMap<String, KindInfo> {
+    let mut map = HashMap::new();
+    if let Ok(content) = std::fs::read_to_string(entities_path) {
+        for line in content.lines().filter(|l| !l.trim().is_empty()) {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
+                if let (Some(id), Some(kind)) = (
+                    v.get("id").and_then(|i| i.as_str()),
+                    v.get("kind").and_then(|k| k.as_str()),
+                ) {
+                    map.insert(
+                        id.to_string(),
+                        KindInfo {
+                            substrate: "entity",
+                            kind: kind.to_string(),
+                            entity_type: v
+                                .get("entity_type")
+                                .and_then(|t| t.as_str())
+                                .map(str::to_string),
+                        },
+                    );
+                }
+            }
+        }
+    }
+    if let Ok(content) = std::fs::read_to_string(notes_path) {
+        for line in content.lines().filter(|l| !l.trim().is_empty()) {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
+                if let (Some(id), Some(kind)) = (
+                    v.get("id").and_then(|i| i.as_str()),
+                    v.get("kind").and_then(|k| k.as_str()),
+                ) {
+                    map.insert(
+                        id.to_string(),
+                        KindInfo {
+                            substrate: "note",
+                            kind: kind.to_string(),
+                            entity_type: None,
+                        },
+                    );
+                }
+            }
+        }
+    }
+    map
+}
+
+/// `true` if any pack-declared edge endpoint rule admits `(src, relation, tgt)`.
+///
+/// Thin `.any()` wrapper over the reused, canonical [`endpoint_matches`]
+/// matcher (`khive-runtime`) — the actual endpoint-pairing DATA lives in
+/// `pack_rules` (fetched live from the pack registry by
+/// [`build_pack_edge_rules`]), never re-derived here.
+fn pack_rule_allows_kinds(
+    rules: &[EdgeEndpointRule],
+    relation: EdgeRelation,
+    src: &KindInfo,
+    tgt: &KindInfo,
+) -> bool {
+    rules.iter().any(|r| {
+        r.relation == relation
+            && endpoint_matches(
+                &r.source,
+                src.substrate,
+                &src.kind,
+                src.entity_type.as_deref(),
+            )
+            && endpoint_matches(
+                &r.target,
+                tgt.substrate,
+                &tgt.kind,
+                tgt.entity_type.as_deref(),
+            )
+    })
+}
+
+/// Rule class 1: edge `(source kind, relation, target
+/// kind)` endpoint contract.
+///
+/// Mirrors `KhiveRuntime::validate_edge_relation_endpoints`'s per-relation
+/// dispatch (`annotates` crosses substrates; `supersedes`/`supports`/
+/// `refutes` require same-substrate endpoints; every other relation consults
+/// the pack/base allowlist) but works from plain `(substrate, kind,
+/// entity_type)` triples parsed out of NDJSON, since `kg validate` never
+/// opens a DB connection to resolve live records. The rule DATA —
+/// `base_entity_rule_allows`'s base table and `pack_rules`' `EdgeEndpointRule`s
+/// — is always read live from `khive-runtime` (the same source the `link`/
+/// `update` verbs enforce against); only this dispatch shape is restated for
+/// the offline path, so the allowlist itself cannot drift out of sync.
+///
+/// Edges whose endpoints don't resolve within `entities.ndjson`/`notes.ndjson`
+/// are skipped here — `dangling-refs` and the always-on `referential-integrity`
+/// structural check own that failure mode, so this rule does not double-report it.
+fn check_edge_endpoint_types(
+    entities_path: &Path,
+    notes_path: &Path,
+    edges_path: &Path,
+    pack_rules: &[EdgeEndpointRule],
+    cfg: &EdgeEndpointTypesConfig,
+) -> RuleResult {
+    let kind_map = collect_kind_map(entities_path, notes_path);
+    let sev = severity_static(&cfg.severity);
+    let mut violations = Vec::new();
+
+    if let Ok(content) = std::fs::read_to_string(edges_path) {
+        for line in content.lines().filter(|l| !l.trim().is_empty()) {
+            let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+                continue;
+            };
+            let Some(src_id) = v.get("source_id").and_then(|s| s.as_str()) else {
+                continue;
+            };
+            let Some(tgt_id) = v.get("target_id").and_then(|s| s.as_str()) else {
+                continue;
+            };
+            let Some(rel_str) = v.get("relation").and_then(|r| r.as_str()) else {
+                continue;
+            };
+            let Ok(relation) = rel_str.parse::<EdgeRelation>() else {
+                // Unknown relation: `valid-edge-relations` already reports it.
+                continue;
+            };
+            let (Some(src), Some(tgt)) = (kind_map.get(src_id), kind_map.get(tgt_id)) else {
+                // Unresolved endpoint: `referential-integrity`/`dangling-refs` own this.
+                continue;
+            };
+
+            let allowed = if relation == EdgeRelation::Annotates {
+                src.substrate == "note"
+            } else if matches!(
+                relation,
+                EdgeRelation::Supersedes | EdgeRelation::Supports | EdgeRelation::Refutes
+            ) {
+                if src.substrate != tgt.substrate {
+                    false
+                } else if src.substrate == "entity" {
+                    base_entity_rule_allows(&src.kind, relation, &tgt.kind)
+                } else {
+                    // Runtime parity: same-substrate note<->note is unrestricted
+                    // for supersedes/supports/refutes (operations.rs).
+                    true
+                }
+            } else {
+                let base_ok = src.substrate == "entity"
+                    && tgt.substrate == "entity"
+                    && base_entity_rule_allows(&src.kind, relation, &tgt.kind);
+                base_ok || pack_rule_allows_kinds(pack_rules, relation, src, tgt)
+            };
+
+            if !allowed {
+                violations.push(Violation {
+                    entity_id: Some(src_id.to_string()),
+                    entity_name: None,
+                    entity_kind: Some(src.kind.clone()),
+                    rule_id: "edge-endpoint-types".into(),
+                    severity: sev,
+                    message: format!(
+                        "[{src_id}\u{2192}{tgt_id}] ({} {}) -[{}]-> ({} {}) is not a permitted \
+                         endpoint pairing for this relation",
+                        src.substrate,
+                        src.kind,
+                        relation.as_str(),
+                        tgt.substrate,
+                        tgt.kind
+                    ),
+                    fixable: false,
+                });
+            }
+        }
+    }
+
+    RuleResult {
+        id: "edge-endpoint-types".into(),
+        severity: sev,
+        passed: violations.is_empty(),
+        violations,
+    }
+}
+
+/// Rule class 2: likely-inverted directional edges.
+///
+/// For each `[[edge_direction_conventions.relations]]` entry, an edge whose
+/// relation matches but whose `(source kind, target kind)` matches the
+/// REVERSED pattern (target's kind is one of the configured
+/// `forward_source_kinds`, source's kind is one of the configured
+/// `forward_target_kinds`) while NOT matching the forward pattern is flagged
+/// as likely-inverted. A relation with no configured entry is not checked —
+/// this rule class does not guess which relations are directional. `warn` by
+/// default, since this is a heuristic, not a hard contract violation like
+/// `edge-endpoint-types`.
+fn check_edge_direction_conventions(
+    entities_path: &Path,
+    notes_path: &Path,
+    edges_path: &Path,
+    cfg: &EdgeDirectionConventionsConfig,
+) -> RuleResult {
+    let kind_map = collect_kind_map(entities_path, notes_path);
+    let sev = severity_static(&cfg.severity);
+    let mut violations = Vec::new();
+
+    if let Ok(content) = std::fs::read_to_string(edges_path) {
+        for line in content.lines().filter(|l| !l.trim().is_empty()) {
+            let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+                continue;
+            };
+            let Some(src_id) = v.get("source_id").and_then(|s| s.as_str()) else {
+                continue;
+            };
+            let Some(tgt_id) = v.get("target_id").and_then(|s| s.as_str()) else {
+                continue;
+            };
+            let Some(rel_str) = v.get("relation").and_then(|r| r.as_str()) else {
+                continue;
+            };
+            let (Some(src), Some(tgt)) = (kind_map.get(src_id), kind_map.get(tgt_id)) else {
+                continue;
+            };
+
+            for rule in &cfg.relations {
+                if rule.relation != rel_str
+                    || rule.forward_source_kinds.is_empty()
+                    || rule.forward_target_kinds.is_empty()
+                {
+                    continue;
+                }
+                let forward = rule.forward_source_kinds.iter().any(|k| k == &src.kind)
+                    && rule.forward_target_kinds.iter().any(|k| k == &tgt.kind);
+                if forward {
+                    continue;
+                }
+                let reversed = rule.forward_source_kinds.iter().any(|k| k == &tgt.kind)
+                    && rule.forward_target_kinds.iter().any(|k| k == &src.kind);
+                if reversed {
+                    violations.push(Violation {
+                        entity_id: Some(src_id.to_string()),
+                        entity_name: None,
+                        entity_kind: Some(src.kind.clone()),
+                        rule_id: "edge-direction-conventions".into(),
+                        severity: sev,
+                        message: format!(
+                            "[{src_id}\u{2192}{tgt_id}] {rel_str} from {} to {} matches the \
+                             reversed direction convention configured for this relation; \
+                             likely inverted",
+                            src.kind, tgt.kind
+                        ),
+                        fixable: false,
+                    });
+                }
+            }
+        }
+    }
+
+    RuleResult {
+        id: "edge-direction-conventions".into(),
+        severity: sev,
+        passed: violations.is_empty(),
+        violations,
+    }
+}
+
+/// Rule class 3: unresolvable edge endpoint references —
+/// the user-configurable counterpart to the always-on `referential-integrity`
+/// structural check (fixed at `error` severity, cannot be disabled or
+/// downgraded).
+///
+/// **Scope note**: `kg validate` has no `--db` flag and never opens a live
+/// graph connection — every reference is resolved only within the validated
+/// NDJSON dataset itself (`entities.ndjson` + `notes.ndjson` + edge IDs in
+/// `edges.ndjson`, reusing the same [`collect_ids`]/[`collect_edge_ids`]
+/// helpers `referential-integrity` uses, rather than re-deriving the known-ID
+/// set). An unresolvable reference is therefore always reported as "not in
+/// dataset" — there is no live-graph mode in this build to distinguish from
+/// "checked nowhere". That limitation is stated explicitly in every
+/// violation message rather than silently passing.
+fn check_dangling_refs(
+    entities_path: &Path,
+    notes_path: &Path,
+    edges_path: &Path,
+    cfg: &DanglingRefsConfig,
+) -> RuleResult {
+    let sev = severity_static(&cfg.severity);
+    let mut violations = Vec::new();
+
+    let mut known_ids = collect_ids(entities_path);
+    known_ids.extend(collect_ids(notes_path));
+    known_ids.extend(collect_edge_ids(edges_path));
+
+    if let Ok(content) = std::fs::read_to_string(edges_path) {
+        for line in content.lines().filter(|l| !l.trim().is_empty()) {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
+                for field in &["source_id", "target_id"] {
+                    if let Some(id) = v.get(*field).and_then(|i| i.as_str()) {
+                        if !known_ids.contains(id) {
+                            violations.push(Violation {
+                                entity_id: Some(id.to_string()),
+                                entity_name: None,
+                                entity_kind: None,
+                                rule_id: "dangling-refs".into(),
+                                severity: sev,
+                                message: format!(
+                                    "edge {field} {id} not in dataset (validated offline \
+                                     within the NDJSON dataset only; no live-graph check \
+                                     available in this build)"
+                                ),
+                                fixable: false,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    RuleResult {
+        id: "dangling-refs".into(),
+        severity: sev,
+        passed: violations.is_empty(),
+        violations,
+    }
+}
+
+/// `true` if `name`'s trimmed form ends with `)` and has a matching `(`
+/// preceded by other content — the shape of a parenthetical suffix like
+/// `"Foo (2024 paper)"`. Deliberately simple (no regex dependency): this is
+/// a heuristic lint, not a parser.
+fn has_parenthetical_suffix(name: &str) -> bool {
+    let trimmed = name.trim();
+    trimmed.ends_with(')') && trimmed.rfind('(').is_some_and(|i| i > 0)
+}
+
+/// Rule class 4: entity name hygiene.
+///
+/// Checks `name` against: non-empty, no leading/trailing whitespace, no
+/// parenthetical suffix (e.g. `"Foo (2024 paper)"` — qualifiers belong in
+/// `properties`, not `name`), and a configurable max length.
+/// `[naming_conventions.kinds.<entity_kind>]` overrides any of the three
+/// predicate toggles or `max_length` for that kind only. `warn` by default.
+fn check_naming_conventions(entities_path: &Path, cfg: &NamingConventionsConfig) -> RuleResult {
+    let sev = severity_static(&cfg.severity);
+    let mut violations = Vec::new();
+
+    if let Ok(content) = std::fs::read_to_string(entities_path) {
+        for line in content.lines().filter(|l| !l.trim().is_empty()) {
+            let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+                continue;
+            };
+            let Some(name) = v.get("name").and_then(|n| n.as_str()) else {
+                continue;
+            };
+            let id = v.get("id").and_then(|i| i.as_str()).map(str::to_string);
+            let kind = v.get("kind").and_then(|k| k.as_str()).map(str::to_string);
+            let overrides = kind.as_deref().and_then(|k| cfg.kinds.get(k));
+            let max_length = overrides
+                .and_then(|o| o.max_length)
+                .unwrap_or(cfg.max_length);
+            let no_ws = overrides
+                .and_then(|o| o.no_leading_trailing_whitespace)
+                .unwrap_or(cfg.no_leading_trailing_whitespace);
+            let no_paren = overrides
+                .and_then(|o| o.no_parenthetical_suffix)
+                .unwrap_or(cfg.no_parenthetical_suffix);
+            let prefix = record_prefix(id.as_deref(), Some(name));
+
+            if name.trim().is_empty() {
+                violations.push(Violation {
+                    entity_id: id.clone(),
+                    entity_name: Some(name.to_string()),
+                    entity_kind: kind.clone(),
+                    rule_id: "naming-conventions".into(),
+                    severity: sev,
+                    message: format!("{prefix}name is empty or whitespace-only"),
+                    fixable: false,
+                });
+                continue;
+            }
+            if no_ws && name != name.trim() {
+                violations.push(Violation {
+                    entity_id: id.clone(),
+                    entity_name: Some(name.to_string()),
+                    entity_kind: kind.clone(),
+                    rule_id: "naming-conventions".into(),
+                    severity: sev,
+                    message: format!("{prefix}name has leading/trailing whitespace"),
+                    fixable: false,
+                });
+            }
+            if no_paren && has_parenthetical_suffix(name) {
+                violations.push(Violation {
+                    entity_id: id.clone(),
+                    entity_name: Some(name.to_string()),
+                    entity_kind: kind.clone(),
+                    rule_id: "naming-conventions".into(),
+                    severity: sev,
+                    message: format!(
+                        "{prefix}name carries a parenthetical suffix; use `properties` for \
+                         qualifiers instead of embedding them in `name`"
+                    ),
+                    fixable: false,
+                });
+            }
+            if name.chars().count() > max_length {
+                violations.push(Violation {
+                    entity_id: id.clone(),
+                    entity_name: Some(name.to_string()),
+                    entity_kind: kind.clone(),
+                    rule_id: "naming-conventions".into(),
+                    severity: sev,
+                    message: format!(
+                        "{prefix}name exceeds max length {max_length} ({} chars)",
+                        name.chars().count()
+                    ),
+                    fixable: false,
+                });
+            }
+        }
+    }
+
+    RuleResult {
+        id: "naming-conventions".into(),
+        severity: sev,
+        passed: violations.is_empty(),
+        violations,
+    }
+}
+
+/// `Some(description)` if `value` encodes a date/year strictly after `now`.
+/// Recognises a bare 4-digit year (JSON number or string) and RFC-3339 /
+/// `YYYY-MM-DD` date strings; any other shape is left unchecked (returns
+/// `None`, not a violation) rather than guessed at.
+fn future_date_description(
+    value: &serde_json::Value,
+    now: &chrono::DateTime<chrono::Utc>,
+) -> Option<String> {
+    let current_year = now.year();
+    match value {
+        serde_json::Value::Number(n) => {
+            let y = n.as_i64()?;
+            if (1000..=9999).contains(&y) && y > i64::from(current_year) {
+                Some(format!("year {y} is after the current year {current_year}"))
+            } else {
+                None
+            }
+        }
+        serde_json::Value::String(s) => {
+            let s = s.trim();
+            if s.len() == 4 && s.chars().all(|c| c.is_ascii_digit()) {
+                let y: i64 = s.parse().ok()?;
+                return if y > i64::from(current_year) {
+                    Some(format!("year {y} is after the current year {current_year}"))
+                } else {
+                    None
+                };
+            }
+            if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(s) {
+                let dt_utc = dt.with_timezone(&chrono::Utc);
+                return if dt_utc > *now {
+                    Some(format!("date {s} is in the future (validated at {now})"))
+                } else {
+                    None
+                };
+            }
+            if let Ok(d) = chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d") {
+                if d > now.date_naive() {
+                    return Some(format!("date {s} is in the future (validated at {now})"));
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+/// Rule class 5: forward-dated citation/property values.
+///
+/// Checks the configured `properties` field names (default: `year`, `date`,
+/// `published_at`, `publication_date`) on both entities and notes for values
+/// that encode a date after the validation-time `now`, catching forward-dated
+/// citation typos (e.g. `year = 2124`). `warn` by default.
+fn check_citation_date_lint(
+    entities_path: &Path,
+    notes_path: &Path,
+    cfg: &CitationDateLintConfig,
+) -> RuleResult {
+    let sev = severity_static(&cfg.severity);
+    let now = chrono::Utc::now();
+    let mut violations = Vec::new();
+
+    for path in [entities_path, notes_path] {
+        if let Ok(content) = std::fs::read_to_string(path) {
+            for line in content.lines().filter(|l| !l.trim().is_empty()) {
+                let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+                    continue;
+                };
+                let Some(props) = v.get("properties").and_then(|p| p.as_object()) else {
+                    continue;
+                };
+                let id = v.get("id").and_then(|i| i.as_str()).map(str::to_string);
+                let name = v.get("name").and_then(|n| n.as_str()).map(str::to_string);
+                let kind = v.get("kind").and_then(|k| k.as_str()).map(str::to_string);
+                let prefix = record_prefix(id.as_deref(), name.as_deref());
+
+                for field in &cfg.fields {
+                    let Some(value) = props.get(field) else {
+                        continue;
+                    };
+                    if let Some(desc) = future_date_description(value, &now) {
+                        violations.push(Violation {
+                            entity_id: id.clone(),
+                            entity_name: name.clone(),
+                            entity_kind: kind.clone(),
+                            rule_id: "citation-date-lint".into(),
+                            severity: sev,
+                            message: format!("{prefix}property {field:?}: {desc}"),
+                            fixable: false,
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    RuleResult {
+        id: "citation-date-lint".into(),
+        severity: sev,
+        passed: violations.is_empty(),
+        violations,
+    }
 }
 
 fn apply_fixes(repo: &std::path::Path) -> Result<()> {
@@ -1029,6 +1809,7 @@ fn print_github_format(report: &ValidationReport) {
 mod tests {
     use std::path::PathBuf;
 
+    use khive_types::EndpointKind;
     use tempfile::TempDir;
 
     use super::*;
@@ -1323,6 +2104,7 @@ mod tests {
         let results = configurable_rule_checks(
             &kg_dir.join("entities.ndjson"),
             &kg_dir.join("edges.ndjson"),
+            &kg_dir.join("notes.ndjson"),
             &rules_path,
         )
         .unwrap();
@@ -1355,6 +2137,7 @@ message = "Concept {id} missing description"
         let results = configurable_rule_checks(
             &kg_dir.join("entities.ndjson"),
             &kg_dir.join("edges.ndjson"),
+            &kg_dir.join("notes.ndjson"),
             &rules_path,
         )
         .unwrap();
@@ -1401,6 +2184,7 @@ message = "Self-loop detected on {id}"
         let results = configurable_rule_checks(
             &kg_dir.join("entities.ndjson"),
             &kg_dir.join("edges.ndjson"),
+            &kg_dir.join("notes.ndjson"),
             &rules_path,
         )
         .unwrap();
@@ -1427,6 +2211,7 @@ message = "Self-loop detected on {id}"
         let result = configurable_rule_checks(
             &kg_dir.join("entities.ndjson"),
             &kg_dir.join("edges.ndjson"),
+            &kg_dir.join("notes.ndjson"),
             &rules_path,
         );
         assert!(result.is_err(), "YAML extension must return an error");
@@ -1462,6 +2247,7 @@ message = "bad"
         let results = configurable_rule_checks(
             &kg_dir.join("entities.ndjson"),
             &kg_dir.join("edges.ndjson"),
+            &kg_dir.join("notes.ndjson"),
             &rules_path,
         )
         .unwrap();
@@ -1494,6 +2280,7 @@ message = "bad"
         let results = configurable_rule_checks(
             &kg_dir.join("entities.ndjson"),
             &kg_dir.join("edges.ndjson"),
+            &kg_dir.join("notes.ndjson"),
             &rules_path,
         )
         .unwrap();
@@ -1918,5 +2705,674 @@ message = "bad"
             .find(|r| r.id == "valid-edge-relations")
             .unwrap();
         assert!(!edge_rel_result.passed, "invalid relation must fail");
+    }
+
+    // ── edge-endpoint-types ────────────────────────────────────────────────────
+
+    #[test]
+    fn edge_endpoint_types_passes_base_allowed_pair() {
+        let tmp = TempDir::new().unwrap();
+        let kg_dir = make_kg_dir(&tmp);
+        write_entities(
+            &kg_dir,
+            &[
+                ("aaaaaaaa-0000-0000-0000-000000000001", "concept", "A"),
+                ("bbbbbbbb-0000-0000-0000-000000000002", "concept", "B"),
+            ],
+        );
+        write_edges(
+            &kg_dir,
+            &[(
+                "aaaaaaaa-0000-0000-0000-000000000001",
+                "bbbbbbbb-0000-0000-0000-000000000002",
+                "extends",
+            )],
+        );
+        let cfg = EdgeEndpointTypesConfig {
+            enabled: true,
+            severity: "error".into(),
+        };
+        let result = check_edge_endpoint_types(
+            &kg_dir.join("entities.ndjson"),
+            &kg_dir.join("notes.ndjson"),
+            &kg_dir.join("edges.ndjson"),
+            &[],
+            &cfg,
+        );
+        assert!(
+            result.passed,
+            "concept -[extends]-> concept is base-allowed: {:?}",
+            result.violations
+        );
+    }
+
+    #[test]
+    fn edge_endpoint_types_rejects_disallowed_pair() {
+        let tmp = TempDir::new().unwrap();
+        let kg_dir = make_kg_dir(&tmp);
+        write_entities(
+            &kg_dir,
+            &[
+                ("aaaaaaaa-0000-0000-0000-000000000001", "person", "A"),
+                ("bbbbbbbb-0000-0000-0000-000000000002", "person", "B"),
+            ],
+        );
+        write_edges(
+            &kg_dir,
+            &[(
+                "aaaaaaaa-0000-0000-0000-000000000001",
+                "bbbbbbbb-0000-0000-0000-000000000002",
+                "extends",
+            )],
+        );
+        let cfg = EdgeEndpointTypesConfig {
+            enabled: true,
+            severity: "error".into(),
+        };
+        let result = check_edge_endpoint_types(
+            &kg_dir.join("entities.ndjson"),
+            &kg_dir.join("notes.ndjson"),
+            &kg_dir.join("edges.ndjson"),
+            &[],
+            &cfg,
+        );
+        assert!(
+            !result.passed,
+            "person -[extends]-> person is not in the base allowlist"
+        );
+        assert_eq!(result.violations.len(), 1);
+        assert_eq!(result.severity, "error");
+    }
+
+    #[test]
+    fn edge_endpoint_types_severity_config_downgrades_to_warning() {
+        let tmp = TempDir::new().unwrap();
+        let kg_dir = make_kg_dir(&tmp);
+        write_entities(
+            &kg_dir,
+            &[
+                ("aaaaaaaa-0000-0000-0000-000000000001", "person", "A"),
+                ("bbbbbbbb-0000-0000-0000-000000000002", "person", "B"),
+            ],
+        );
+        write_edges(
+            &kg_dir,
+            &[(
+                "aaaaaaaa-0000-0000-0000-000000000001",
+                "bbbbbbbb-0000-0000-0000-000000000002",
+                "extends",
+            )],
+        );
+        let cfg = EdgeEndpointTypesConfig {
+            enabled: true,
+            severity: "warning".into(),
+        };
+        let result = check_edge_endpoint_types(
+            &kg_dir.join("entities.ndjson"),
+            &kg_dir.join("notes.ndjson"),
+            &kg_dir.join("edges.ndjson"),
+            &[],
+            &cfg,
+        );
+        assert!(!result.passed);
+        assert_eq!(result.severity, "warning");
+        assert_eq!(result.violations[0].severity, "warning");
+    }
+
+    #[test]
+    fn edge_endpoint_types_accepts_pack_extended_note_to_note_pair() {
+        // GTD-shaped pack rule: depends_on between two `task` notes. Proves
+        // `check_edge_endpoint_types` genuinely consults `pack_rules` (via the
+        // reused `endpoint_matches`), not just the base entity-only table.
+        let tmp = TempDir::new().unwrap();
+        let kg_dir = make_kg_dir(&tmp);
+        std::fs::write(kg_dir.join("entities.ndjson"), "").unwrap();
+        write_notes(
+            &kg_dir,
+            &[
+                ("task-0001-0000-0000-0000-000000000001", "task"),
+                ("task-0002-0000-0000-0000-000000000002", "task"),
+            ],
+        );
+        write_edges(
+            &kg_dir,
+            &[(
+                "task-0001-0000-0000-0000-000000000001",
+                "task-0002-0000-0000-0000-000000000002",
+                "depends_on",
+            )],
+        );
+        let pack_rules = vec![EdgeEndpointRule {
+            relation: EdgeRelation::DependsOn,
+            source: EndpointKind::NoteOfKind("task"),
+            target: EndpointKind::NoteOfKind("task"),
+        }];
+        let cfg = EdgeEndpointTypesConfig {
+            enabled: true,
+            severity: "error".into(),
+        };
+        let result = check_edge_endpoint_types(
+            &kg_dir.join("entities.ndjson"),
+            &kg_dir.join("notes.ndjson"),
+            &kg_dir.join("edges.ndjson"),
+            &pack_rules,
+            &cfg,
+        );
+        assert!(
+            result.passed,
+            "pack-extended task->task depends_on must pass: {:?}",
+            result.violations
+        );
+    }
+
+    // ── edge-direction-conventions ─────────────────────────────────────────────
+
+    fn direction_cfg(severity: &str) -> EdgeDirectionConventionsConfig {
+        EdgeDirectionConventionsConfig {
+            enabled: true,
+            severity: severity.to_owned(),
+            relations: vec![DirectionRuleConfig {
+                relation: "introduced_by".into(),
+                forward_source_kinds: vec!["concept".into(), "artifact".into()],
+                forward_target_kinds: vec!["document".into(), "person".into()],
+            }],
+        }
+    }
+
+    #[test]
+    fn edge_direction_conventions_passes_forward_direction() {
+        let tmp = TempDir::new().unwrap();
+        let kg_dir = make_kg_dir(&tmp);
+        write_entities(
+            &kg_dir,
+            &[
+                ("aaaaaaaa-0000-0000-0000-000000000001", "concept", "A"),
+                ("bbbbbbbb-0000-0000-0000-000000000002", "document", "B"),
+            ],
+        );
+        write_edges(
+            &kg_dir,
+            &[(
+                "aaaaaaaa-0000-0000-0000-000000000001",
+                "bbbbbbbb-0000-0000-0000-000000000002",
+                "introduced_by",
+            )],
+        );
+        let cfg = direction_cfg("warning");
+        let result = check_edge_direction_conventions(
+            &kg_dir.join("entities.ndjson"),
+            &kg_dir.join("notes.ndjson"),
+            &kg_dir.join("edges.ndjson"),
+            &cfg,
+        );
+        assert!(
+            result.passed,
+            "concept -[introduced_by]-> document is the forward direction: {:?}",
+            result.violations
+        );
+    }
+
+    #[test]
+    fn edge_direction_conventions_flags_reversed_direction() {
+        let tmp = TempDir::new().unwrap();
+        let kg_dir = make_kg_dir(&tmp);
+        write_entities(
+            &kg_dir,
+            &[
+                ("aaaaaaaa-0000-0000-0000-000000000001", "document", "A"),
+                ("bbbbbbbb-0000-0000-0000-000000000002", "concept", "B"),
+            ],
+        );
+        write_edges(
+            &kg_dir,
+            &[(
+                "aaaaaaaa-0000-0000-0000-000000000001",
+                "bbbbbbbb-0000-0000-0000-000000000002",
+                "introduced_by",
+            )],
+        );
+        let cfg = direction_cfg("warning");
+        let result = check_edge_direction_conventions(
+            &kg_dir.join("entities.ndjson"),
+            &kg_dir.join("notes.ndjson"),
+            &kg_dir.join("edges.ndjson"),
+            &cfg,
+        );
+        assert!(
+            !result.passed,
+            "document -[introduced_by]-> concept matches the reversed pattern"
+        );
+        assert_eq!(result.violations.len(), 1);
+        assert_eq!(result.severity, "warning");
+    }
+
+    #[test]
+    fn edge_direction_conventions_severity_config_escalates_to_error() {
+        let tmp = TempDir::new().unwrap();
+        let kg_dir = make_kg_dir(&tmp);
+        write_entities(
+            &kg_dir,
+            &[
+                ("aaaaaaaa-0000-0000-0000-000000000001", "document", "A"),
+                ("bbbbbbbb-0000-0000-0000-000000000002", "concept", "B"),
+            ],
+        );
+        write_edges(
+            &kg_dir,
+            &[(
+                "aaaaaaaa-0000-0000-0000-000000000001",
+                "bbbbbbbb-0000-0000-0000-000000000002",
+                "introduced_by",
+            )],
+        );
+        let cfg = direction_cfg("error");
+        let result = check_edge_direction_conventions(
+            &kg_dir.join("entities.ndjson"),
+            &kg_dir.join("notes.ndjson"),
+            &kg_dir.join("edges.ndjson"),
+            &cfg,
+        );
+        assert!(!result.passed);
+        assert_eq!(result.severity, "error");
+        assert_eq!(result.violations[0].severity, "error");
+    }
+
+    // ── dangling-refs ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn dangling_refs_passes_when_all_endpoints_resolve() {
+        let tmp = TempDir::new().unwrap();
+        let kg_dir = make_kg_dir(&tmp);
+        write_entities(
+            &kg_dir,
+            &[
+                ("aaaaaaaa-0000-0000-0000-000000000001", "concept", "A"),
+                ("bbbbbbbb-0000-0000-0000-000000000002", "concept", "B"),
+            ],
+        );
+        write_edges(
+            &kg_dir,
+            &[(
+                "aaaaaaaa-0000-0000-0000-000000000001",
+                "bbbbbbbb-0000-0000-0000-000000000002",
+                "extends",
+            )],
+        );
+        let cfg = DanglingRefsConfig {
+            enabled: true,
+            severity: "error".into(),
+        };
+        let result = check_dangling_refs(
+            &kg_dir.join("entities.ndjson"),
+            &kg_dir.join("notes.ndjson"),
+            &kg_dir.join("edges.ndjson"),
+            &cfg,
+        );
+        assert!(result.passed, "{:?}", result.violations);
+    }
+
+    #[test]
+    fn dangling_refs_flags_unresolved_target_and_names_it_not_in_dataset() {
+        let tmp = TempDir::new().unwrap();
+        let kg_dir = make_kg_dir(&tmp);
+        write_entities(
+            &kg_dir,
+            &[("aaaaaaaa-0000-0000-0000-000000000001", "concept", "A")],
+        );
+        write_edges(
+            &kg_dir,
+            &[(
+                "aaaaaaaa-0000-0000-0000-000000000001",
+                "bbbbbbbb-0000-0000-0000-000000000002",
+                "extends",
+            )],
+        );
+        let cfg = DanglingRefsConfig {
+            enabled: true,
+            severity: "error".into(),
+        };
+        let result = check_dangling_refs(
+            &kg_dir.join("entities.ndjson"),
+            &kg_dir.join("notes.ndjson"),
+            &kg_dir.join("edges.ndjson"),
+            &cfg,
+        );
+        assert!(!result.passed);
+        assert_eq!(result.violations.len(), 1);
+        assert!(
+            result.violations[0].message.contains("not in dataset"),
+            "message must distinguish dataset-scoped resolution: {}",
+            result.violations[0].message
+        );
+    }
+
+    #[test]
+    fn dangling_refs_severity_config_downgrades_to_info() {
+        let tmp = TempDir::new().unwrap();
+        let kg_dir = make_kg_dir(&tmp);
+        write_entities(
+            &kg_dir,
+            &[("aaaaaaaa-0000-0000-0000-000000000001", "concept", "A")],
+        );
+        write_edges(
+            &kg_dir,
+            &[(
+                "aaaaaaaa-0000-0000-0000-000000000001",
+                "bbbbbbbb-0000-0000-0000-000000000002",
+                "extends",
+            )],
+        );
+        let cfg = DanglingRefsConfig {
+            enabled: true,
+            severity: "info".into(),
+        };
+        let result = check_dangling_refs(
+            &kg_dir.join("entities.ndjson"),
+            &kg_dir.join("notes.ndjson"),
+            &kg_dir.join("edges.ndjson"),
+            &cfg,
+        );
+        assert!(!result.passed);
+        assert_eq!(result.severity, "info");
+    }
+
+    // ── naming-conventions ─────────────────────────────────────────────────────
+
+    fn naming_cfg(severity: &str) -> NamingConventionsConfig {
+        NamingConventionsConfig {
+            enabled: true,
+            severity: severity.to_owned(),
+            max_length: 20,
+            no_leading_trailing_whitespace: true,
+            no_parenthetical_suffix: true,
+            kinds: std::collections::BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    fn naming_conventions_passes_clean_name() {
+        let tmp = TempDir::new().unwrap();
+        let kg_dir = make_kg_dir(&tmp);
+        write_entities(
+            &kg_dir,
+            &[("aaaaaaaa-0000-0000-0000-000000000001", "concept", "Clean")],
+        );
+        let cfg = naming_cfg("warning");
+        let result = check_naming_conventions(&kg_dir.join("entities.ndjson"), &cfg);
+        assert!(result.passed, "{:?}", result.violations);
+    }
+
+    #[test]
+    fn naming_conventions_flags_whitespace_and_parenthetical_suffix() {
+        let tmp = TempDir::new().unwrap();
+        let kg_dir = make_kg_dir(&tmp);
+        let entities = r#"{"id":"aaaaaaaa-0000-0000-0000-000000000001","kind":"concept","name":" Foo (2024 paper) "}"#;
+        std::fs::write(kg_dir.join("entities.ndjson"), entities.to_owned() + "\n").unwrap();
+        let cfg = naming_cfg("warning");
+        let result = check_naming_conventions(&kg_dir.join("entities.ndjson"), &cfg);
+        assert!(!result.passed);
+        // Both the whitespace and parenthetical-suffix predicates fire.
+        assert_eq!(result.violations.len(), 2, "{:?}", result.violations);
+    }
+
+    #[test]
+    fn naming_conventions_flags_empty_name() {
+        let tmp = TempDir::new().unwrap();
+        let kg_dir = make_kg_dir(&tmp);
+        let entities =
+            r#"{"id":"aaaaaaaa-0000-0000-0000-000000000001","kind":"concept","name":"   "}"#;
+        std::fs::write(kg_dir.join("entities.ndjson"), entities.to_owned() + "\n").unwrap();
+        let cfg = naming_cfg("warning");
+        let result = check_naming_conventions(&kg_dir.join("entities.ndjson"), &cfg);
+        assert!(!result.passed);
+        assert_eq!(result.violations.len(), 1);
+        assert!(result.violations[0].message.contains("empty"));
+    }
+
+    #[test]
+    fn naming_conventions_max_length_kind_override() {
+        let tmp = TempDir::new().unwrap();
+        let kg_dir = make_kg_dir(&tmp);
+        // 12 chars — passes the global max_length=20 but fails a per-kind
+        // override of 5 for "concept".
+        write_entities(
+            &kg_dir,
+            &[(
+                "aaaaaaaa-0000-0000-0000-000000000001",
+                "concept",
+                "TwelveChars!",
+            )],
+        );
+        let mut cfg = naming_cfg("warning");
+        cfg.kinds.insert(
+            "concept".to_string(),
+            NamingConventionsOverride {
+                max_length: Some(5),
+                no_leading_trailing_whitespace: None,
+                no_parenthetical_suffix: None,
+            },
+        );
+        let result = check_naming_conventions(&kg_dir.join("entities.ndjson"), &cfg);
+        assert!(!result.passed, "per-kind max_length override must apply");
+        assert_eq!(result.violations.len(), 1);
+        assert!(result.violations[0].message.contains("max length 5"));
+    }
+
+    #[test]
+    fn naming_conventions_severity_config_is_error() {
+        let tmp = TempDir::new().unwrap();
+        let kg_dir = make_kg_dir(&tmp);
+        let entities =
+            r#"{"id":"aaaaaaaa-0000-0000-0000-000000000001","kind":"concept","name":" Bad "}"#;
+        std::fs::write(kg_dir.join("entities.ndjson"), entities.to_owned() + "\n").unwrap();
+        let cfg = naming_cfg("error");
+        let result = check_naming_conventions(&kg_dir.join("entities.ndjson"), &cfg);
+        assert!(!result.passed);
+        assert_eq!(result.severity, "error");
+    }
+
+    // ── citation-date-lint ─────────────────────────────────────────────────────
+
+    fn citation_cfg(severity: &str) -> CitationDateLintConfig {
+        CitationDateLintConfig {
+            enabled: true,
+            severity: severity.to_owned(),
+            fields: vec!["year".into(), "date".into()],
+        }
+    }
+
+    #[test]
+    fn citation_date_lint_passes_past_year() {
+        let tmp = TempDir::new().unwrap();
+        let kg_dir = make_kg_dir(&tmp);
+        let entities = r#"{"id":"aaaaaaaa-0000-0000-0000-000000000001","kind":"document","name":"D","properties":{"year":2020}}"#;
+        std::fs::write(kg_dir.join("entities.ndjson"), entities.to_owned() + "\n").unwrap();
+        let cfg = citation_cfg("warning");
+        let result = check_citation_date_lint(
+            &kg_dir.join("entities.ndjson"),
+            &kg_dir.join("notes.ndjson"),
+            &cfg,
+        );
+        assert!(result.passed, "{:?}", result.violations);
+    }
+
+    #[test]
+    fn citation_date_lint_flags_forward_dated_year() {
+        let tmp = TempDir::new().unwrap();
+        let kg_dir = make_kg_dir(&tmp);
+        let entities = r#"{"id":"aaaaaaaa-0000-0000-0000-000000000001","kind":"document","name":"D","properties":{"year":9999}}"#;
+        std::fs::write(kg_dir.join("entities.ndjson"), entities.to_owned() + "\n").unwrap();
+        let cfg = citation_cfg("warning");
+        let result = check_citation_date_lint(
+            &kg_dir.join("entities.ndjson"),
+            &kg_dir.join("notes.ndjson"),
+            &cfg,
+        );
+        assert!(!result.passed);
+        assert_eq!(result.violations.len(), 1);
+        assert!(result.violations[0].message.contains("9999"));
+    }
+
+    #[test]
+    fn citation_date_lint_flags_forward_dated_iso_date_on_a_note() {
+        let tmp = TempDir::new().unwrap();
+        let kg_dir = make_kg_dir(&tmp);
+        std::fs::write(kg_dir.join("entities.ndjson"), "").unwrap();
+        let notes = r#"{"id":"note-0001","kind":"observation","properties":{"date":"2999-01-01"}}"#;
+        std::fs::write(kg_dir.join("notes.ndjson"), notes.to_owned() + "\n").unwrap();
+        let cfg = citation_cfg("warning");
+        let result = check_citation_date_lint(
+            &kg_dir.join("entities.ndjson"),
+            &kg_dir.join("notes.ndjson"),
+            &cfg,
+        );
+        assert!(!result.passed, "note properties must be checked too");
+        assert_eq!(result.violations.len(), 1);
+    }
+
+    #[test]
+    fn citation_date_lint_severity_config_is_error() {
+        let tmp = TempDir::new().unwrap();
+        let kg_dir = make_kg_dir(&tmp);
+        let entities = r#"{"id":"aaaaaaaa-0000-0000-0000-000000000001","kind":"document","name":"D","properties":{"year":9999}}"#;
+        std::fs::write(kg_dir.join("entities.ndjson"), entities.to_owned() + "\n").unwrap();
+        let cfg = citation_cfg("error");
+        let result = check_citation_date_lint(
+            &kg_dir.join("entities.ndjson"),
+            &kg_dir.join("notes.ndjson"),
+            &cfg,
+        );
+        assert!(!result.passed);
+        assert_eq!(result.severity, "error");
+    }
+
+    // ── rules.toml wiring through configurable_rule_checks ────────────────────
+
+    #[test]
+    fn configurable_rule_checks_wires_up_edge_endpoint_types_from_toml() {
+        let tmp = TempDir::new().unwrap();
+        let kg_dir = make_kg_dir(&tmp);
+        write_entities(
+            &kg_dir,
+            &[
+                ("aaaaaaaa-0000-0000-0000-000000000001", "person", "A"),
+                ("bbbbbbbb-0000-0000-0000-000000000002", "person", "B"),
+            ],
+        );
+        write_edges(
+            &kg_dir,
+            &[(
+                "aaaaaaaa-0000-0000-0000-000000000001",
+                "bbbbbbbb-0000-0000-0000-000000000002",
+                "extends",
+            )],
+        );
+        let rules_path = tmp.path().join("rules.toml");
+        std::fs::write(&rules_path, "[edge_endpoint_types]\nenabled = true\n").unwrap();
+
+        let results = configurable_rule_checks(
+            &kg_dir.join("entities.ndjson"),
+            &kg_dir.join("edges.ndjson"),
+            &kg_dir.join("notes.ndjson"),
+            &rules_path,
+        )
+        .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].id, "edge-endpoint-types");
+        // Default severity for this class is "error" (see default_severity_error).
+        assert_eq!(results[0].severity, "error");
+        assert!(!results[0].passed);
+    }
+
+    #[test]
+    fn configurable_rule_checks_section_absent_means_rule_does_not_run() {
+        let tmp = TempDir::new().unwrap();
+        let kg_dir = make_kg_dir(&tmp);
+        write_entities(
+            &kg_dir,
+            &[("aaaaaaaa-0000-0000-0000-000000000001", "concept", "A")],
+        );
+        std::fs::write(kg_dir.join("edges.ndjson"), "").unwrap();
+        let rules_path = tmp.path().join("rules.toml");
+        std::fs::write(&rules_path, "rules = []\n").unwrap();
+
+        let results = configurable_rule_checks(
+            &kg_dir.join("entities.ndjson"),
+            &kg_dir.join("edges.ndjson"),
+            &kg_dir.join("notes.ndjson"),
+            &rules_path,
+        )
+        .unwrap();
+        assert!(
+            results.is_empty(),
+            "no built-in rule-class sections declared → none run: {results:?}"
+        );
+    }
+
+    #[test]
+    fn configurable_rule_checks_enabled_false_skips_the_rule() {
+        let tmp = TempDir::new().unwrap();
+        let kg_dir = make_kg_dir(&tmp);
+        write_entities(
+            &kg_dir,
+            &[
+                ("aaaaaaaa-0000-0000-0000-000000000001", "person", "A"),
+                ("bbbbbbbb-0000-0000-0000-000000000002", "person", "B"),
+            ],
+        );
+        write_edges(
+            &kg_dir,
+            &[(
+                "aaaaaaaa-0000-0000-0000-000000000001",
+                "bbbbbbbb-0000-0000-0000-000000000002",
+                "extends",
+            )],
+        );
+        let rules_path = tmp.path().join("rules.toml");
+        std::fs::write(
+            &rules_path,
+            "[edge_endpoint_types]\nenabled = false\nseverity = \"error\"\n",
+        )
+        .unwrap();
+
+        let results = configurable_rule_checks(
+            &kg_dir.join("entities.ndjson"),
+            &kg_dir.join("edges.ndjson"),
+            &kg_dir.join("notes.ndjson"),
+            &rules_path,
+        )
+        .unwrap();
+        assert!(results.is_empty(), "enabled = false must skip evaluation");
+    }
+
+    #[test]
+    fn configurable_rule_checks_invalid_builtin_severity_produces_error_result() {
+        let tmp = TempDir::new().unwrap();
+        let kg_dir = make_kg_dir(&tmp);
+        write_entities(
+            &kg_dir,
+            &[("aaaaaaaa-0000-0000-0000-000000000001", "concept", "A")],
+        );
+        std::fs::write(kg_dir.join("edges.ndjson"), "").unwrap();
+        let rules_path = tmp.path().join("rules.toml");
+        std::fs::write(
+            &rules_path,
+            "[naming_conventions]\nseverity = \"catastrophic\"\n",
+        )
+        .unwrap();
+
+        let results = configurable_rule_checks(
+            &kg_dir.join("entities.ndjson"),
+            &kg_dir.join("edges.ndjson"),
+            &kg_dir.join("notes.ndjson"),
+            &rules_path,
+        )
+        .unwrap();
+        assert_eq!(results.len(), 1);
+        assert!(!results[0].passed);
+        assert_eq!(results[0].severity, "error");
+        assert!(results[0].violations[0]
+            .message
+            .contains("invalid severity"));
     }
 }

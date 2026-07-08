@@ -218,7 +218,76 @@ exists).
 
 On top of those, an optional `rules.toml` (default `.khive/kg/rules.toml`, override with
 `--rules`, skip entirely with `--no-rules`) adds configurable `warning`/`info`/`error` rules;
-`.yaml`/`.yml` is explicitly rejected with a "rename to `.toml`" error.
+`.yaml`/`.yml` is explicitly rejected with a "rename to `.toml`" error. Two rule shapes live in
+`rules.toml`: the generic ad-hoc `[[rules]]` array (`id`/`severity`/`kind`/`condition`/
+`require_field`/`message` — a single-field-equality-and-presence check over `entity` or `edge`
+records), and five built-in, individually-configurable rule classes, each its own top-level
+section. Every one of these sections is **opt-in**: a section absent from `rules.toml` does not run at
+all (an existing `rules.toml` predating these sections is unaffected), and each section accepts
+`enabled = true|false` (default `true` once the section is present) alongside `severity =
+"error"|"warning"|"info"` (matching the same severity enum the `[[rules]]` array uses — there is
+no separate `"warn"`/`"off"` spelling; use `severity` for the warning/error/info choice and
+`enabled = false` to turn a class off entirely):
+
+- **`edge_endpoint_types`** (default severity `error`): checks every edge's `(source kind,
+  relation, target kind)` triple against the same canonical endpoint contract the `link`/`update`
+  verbs enforce — the ADR-002 base allowlist plus every loaded pack's `EDGE_RULES` (ADR-017),
+  fetched live from the pack registry on each run, never a hand-copied table. Edges whose
+  endpoints don't resolve within the dataset are skipped (that's `dangling-refs`'s job).
+- **`edge_direction_conventions`** (default severity `warning`): flags edges that match a
+  configured relation's _reversed_ kind pattern but not its forward pattern — a heuristic for
+  likely-inverted directional edges, not a hard contract check. Declare one or more
+  `[[edge_direction_conventions.relations]]` entries; a relation with no entry is never checked.
+- **`dangling_refs`** (default severity `error`): the configurable counterpart to the always-on
+  `referential-integrity` structural check above. `kg validate` has no `--db` flag and never opens
+  a live graph connection, so every reference is resolved only within the validated NDJSON dataset
+  itself; every violation message says so explicitly ("not in dataset ... no live-graph check
+  available in this build") rather than silently passing.
+- **`naming_conventions`** (default severity `warning`): entity `name` hygiene — non-empty, no
+  leading/trailing whitespace, no parenthetical suffix (e.g. `"Foo (2024 paper)"`, a qualifier
+  that belongs in `properties`), and a configurable `max_length` (default 200). Per-entity-kind
+  overrides live under `[naming_conventions.kinds.<kind>]`.
+- **`citation_date_lint`** (default severity `warning`): flags configured `properties` field
+  names (default `year`, `date`, `published_at`, `publication_date`) whose value is a year or
+  ISO-ish date after validation time — catching forward-dated citation typos (`year = 2124`).
+  Recognises a bare 4-digit year and RFC-3339 / `YYYY-MM-DD` strings; anything else is left
+  unchecked rather than guessed at.
+
+```toml
+# .khive/kg/rules.toml — built-in rule-class sections (all optional; shown here all enabled)
+
+[edge_endpoint_types]
+enabled = true
+severity = "error"
+
+[edge_direction_conventions]
+enabled = true
+severity = "warning"
+
+[[edge_direction_conventions.relations]]
+relation = "introduced_by"
+forward_source_kinds = ["concept", "artifact"]
+forward_target_kinds = ["document", "person"]
+
+[dangling_refs]
+enabled = true
+severity = "error"
+
+[naming_conventions]
+enabled = true
+severity = "warning"
+max_length = 200
+no_leading_trailing_whitespace = true
+no_parenthetical_suffix = true
+
+[naming_conventions.kinds.concept]
+max_length = 120
+
+[citation_date_lint]
+enabled = true
+severity = "warning"
+fields = ["year", "date", "published_at", "publication_date"]
+```
 
 - `--strict` makes warnings count toward failure too (`passed = errors==0 && (warnings==0 if
   strict)`).
