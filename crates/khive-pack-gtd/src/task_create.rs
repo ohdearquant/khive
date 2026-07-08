@@ -137,14 +137,40 @@ impl PreparedTaskCreate {
         root.insert("salience".into(), json!(self.salience));
         root.insert("properties".into(), self.properties.clone());
         if !self.annotates.is_empty() {
-            root.insert(
-                "annotates".into(),
-                json!(self
-                    .annotates
-                    .iter()
-                    .map(|u| u.as_hyphenated().to_string())
-                    .collect::<Vec<_>>()),
-            );
+            // Merge with any caller-supplied `annotates` rather than replacing
+            // it: the generic create path already accepts a top-level
+            // `annotates` array resolved later by the kg `create` handler
+            // (`resolve_uuid_unfiltered`, which also accepts hex prefixes and
+            // entity names — not just full UUIDs). Only entries that already
+            // parse as a full UUID can be deduped against the context-derived
+            // targets here; anything else is passed through untouched for
+            // that later resolution.
+            let mut seen = std::collections::HashSet::new();
+            let mut merged = Vec::new();
+            if let Some(existing) = root.get("annotates") {
+                let arr = existing.as_array().ok_or_else(|| {
+                    RuntimeError::InvalidInput("annotates must be an array of strings".into())
+                })?;
+                for entry in arr {
+                    let raw = entry.as_str().ok_or_else(|| {
+                        RuntimeError::InvalidInput("annotates entries must be strings".into())
+                    })?;
+                    match Uuid::parse_str(raw) {
+                        Ok(uuid) => {
+                            if seen.insert(uuid) {
+                                merged.push(uuid.as_hyphenated().to_string());
+                            }
+                        }
+                        Err(_) => merged.push(raw.to_string()),
+                    }
+                }
+            }
+            for uuid in &self.annotates {
+                if seen.insert(*uuid) {
+                    merged.push(uuid.as_hyphenated().to_string());
+                }
+            }
+            root.insert("annotates".into(), json!(merged));
         }
         Ok(())
     }

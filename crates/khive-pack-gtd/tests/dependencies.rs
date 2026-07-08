@@ -517,6 +517,60 @@ async fn assign_and_create_task_are_equivalent_for_dependencies_and_context() {
 }
 
 #[tokio::test]
+async fn create_task_merges_explicit_annotates_with_context_entity_id() {
+    let rt = rt();
+    let pack = pack(rt);
+
+    let explicit = pack
+        .dispatch("create", json!({"kind": "concept", "name": "Explicit"}))
+        .await
+        .unwrap();
+    let explicit_id = explicit["id"].as_str().unwrap().to_string();
+
+    let context = pack
+        .dispatch("create", json!({"kind": "concept", "name": "Context"}))
+        .await
+        .unwrap();
+    let context_id = context["id"].as_str().unwrap().to_string();
+
+    let created = pack
+        .dispatch(
+            "create",
+            json!({
+                "kind": "note",
+                "note_kind": "task",
+                "title": "both annotates",
+                "annotates": [explicit_id.clone()],
+                "context_entity_id": context_id.clone(),
+            }),
+        )
+        .await
+        .unwrap();
+    let task_id = created["id"].as_str().unwrap().to_string();
+
+    let annotations = pack
+        .dispatch(
+            "neighbors",
+            json!({"id": task_id, "direction": "out", "relations": ["annotates"]}),
+        )
+        .await
+        .expect("neighbors(annotates) must succeed");
+    let annotations = annotations.as_array().unwrap();
+    assert!(
+        annotations
+            .iter()
+            .any(|n| n.to_string().contains(explicit_id.as_str())),
+        "task must keep the explicit annotates edge; got {annotations:?}"
+    );
+    assert!(
+        annotations
+            .iter()
+            .any(|n| n.to_string().contains(context_id.as_str())),
+        "task must also have the context_entity_id annotates edge; got {annotations:?}"
+    );
+}
+
+#[tokio::test]
 async fn assign_and_create_task_reject_malformed_context_entity_id() {
     let pack = pack(rt());
 
