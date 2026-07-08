@@ -62,7 +62,13 @@ local:
 	SRC_HASH=$$(md5 -q "$$SRC"); \
 	SRC_SIZE=$$(stat -f '%z' "$$SRC"); \
 	echo "==> Source:  $$SRC ($$SRC_HASH, $$SRC_SIZE bytes)"; \
-	echo "==> Killing running kkernel daemon (bridges self-heal via re-exec on next request)..."; \
+	echo "==> Staging + codesigning $$DEST.new..."; \
+	cp "$$SRC" "$$DEST.new"; \
+	codesign -s - -f "$$DEST.new" 2>/dev/null || true; \
+	STAGED_HASH=$$(md5 -q "$$DEST.new"); \
+	echo "==> Atomically moving into place..."; \
+	mv "$$DEST.new" "$$DEST"; \
+	echo "==> Killing running kkernel daemon (bridges respawn the NEW binary and self-heal via re-exec)..."; \
 	pkill -f 'kkernel mcp --daemon' 2>/dev/null || true; \
 	for i in 1 2 3 4 5; do \
 	  if pgrep -f 'kkernel mcp --daemon' >/dev/null 2>&1; then sleep 1; else break; fi; \
@@ -72,12 +78,6 @@ local:
 	  pkill -9 -f 'kkernel mcp --daemon' 2>/dev/null || true; \
 	  sleep 1; \
 	fi; \
-	echo "==> Staging + codesigning $$DEST.new..."; \
-	cp "$$SRC" "$$DEST.new"; \
-	codesign -s - -f "$$DEST.new" 2>/dev/null || true; \
-	STAGED_HASH=$$(md5 -q "$$DEST.new"); \
-	echo "==> Atomically moving into place..."; \
-	mv "$$DEST.new" "$$DEST"; \
 	DEST_HASH=$$(md5 -q "$$DEST"); \
 	DEST_SIZE=$$(stat -f '%z' "$$DEST"); \
 	DEST_MTIME=$$(stat -f '%Sm' "$$DEST"); \
