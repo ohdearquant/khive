@@ -536,15 +536,27 @@ impl KhiveMcpServer {
     /// A cold start (the overwhelmingly common case) is unaffected: no
     /// `--resumed-generation` marker means the normal `.serve()` handshake
     /// runs exactly as before this change.
+    ///
+    /// Both branches wrap the raw stdio transport in
+    /// `crate::daemon::SelfHealOnFlushTransport` — the actual happens-after
+    /// edge that fires an armed self-heal re-exec (or drain-and-exit) only
+    /// once a message has genuinely finished flushing to the client, never
+    /// on a fixed timer that could race a slow or backpressured stdout.
     pub async fn serve_stdio(self) -> anyhow::Result<()> {
-        use rmcp::transport::stdio;
+        use rmcp::transport::{async_rw::AsyncRwTransport, stdio};
+
+        let build_transport = || {
+            let (read, write) = stdio();
+            crate::daemon::SelfHealOnFlushTransport::new(AsyncRwTransport::new_server(read, write))
+        };
+
         match stdio_serve_mode_for(crate::daemon::resumed_generation()) {
             StdioServeMode::Resumed => {
-                let service = rmcp::service::serve_directly(self, stdio(), None);
+                let service = rmcp::service::serve_directly(self, build_transport(), None);
                 service.waiting().await?;
             }
             StdioServeMode::Handshake => {
-                let service = self.serve(stdio()).await?;
+                let service = self.serve(build_transport()).await?;
                 service.waiting().await?;
             }
         }

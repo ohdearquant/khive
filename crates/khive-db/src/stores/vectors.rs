@@ -1420,7 +1420,7 @@ impl SqliteVecStore {
                 }
             }
 
-            all_hits.sort_by(|a, b| b.score.cmp(&a.score));
+            all_hits.sort_by_key(|hit| std::cmp::Reverse(hit.score));
             for (i, hit) in all_hits.iter_mut().enumerate() {
                 hit.rank = (i + 1) as u32;
             }

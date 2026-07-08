@@ -169,7 +169,7 @@ fn main() {
             serde_json::to_string_pretty(&json_report).unwrap()
         );
 
-        let rerank_overhead = if rf_p50 > 0 { rt_p50 / rf_p50 } else { 0 };
+        let rerank_overhead = rt_p50.checked_div(rf_p50).unwrap_or(0);
         println!("[#595] warm_rerank_overhead_factor: {rerank_overhead}x");
 
         let out_path = std::env::temp_dir().join("issue_595_latencies.json");

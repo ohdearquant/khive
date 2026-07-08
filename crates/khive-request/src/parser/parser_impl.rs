@@ -440,10 +440,8 @@ impl<'a> Parser<'a> {
                     }
                     depth_paren -= 1;
                 }
-                ',' => {
-                    if depth_paren == 0 && depth_brack == 0 && depth_brace == 0 {
-                        return Ok(i);
-                    }
+                ',' if depth_paren == 0 && depth_brack == 0 && depth_brace == 0 => {
+                    return Ok(i);
                 }
                 _ => {}
             }

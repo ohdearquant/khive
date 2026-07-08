@@ -179,7 +179,7 @@ fn benchmark_knowledge_search_warm_latency() {
 
         // Sanity: warm rerank should not be more than 10x the baseline TF-IDF.
         // If this fails, there is a per-query model reload regression.
-        let rerank_overhead = if rf_p50 > 0 { rt_p50 / rf_p50 } else { 0 };
+        let rerank_overhead = rt_p50.checked_div(rf_p50).unwrap_or(0);
         println!("[#595] warm_rerank_overhead_factor: {rerank_overhead}x");
 
         // Write JSON to temp dir if writable.
