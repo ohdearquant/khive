@@ -483,17 +483,27 @@ impl MemoryPack {
             // already fetched once per recall (see the profile-resolution
             // block above) — never a second profile-state read, and never
             // gated behind `is_verbose` like `profile_component`, because
-            // (unlike that diagnostic ratio) it actually feeds `rank_score`
+            // (unlike that diagnostic ratio) it actually feeds the score
             // below and so must run for every request, breakdown or not.
+            //
+            // Applied to `final_score` (below), not to the local
+            // `rank_score` here — `final_score` is whichever composite score
+            // actually reaches ranking (either `rank_score` on the default
+            // path, or `weighted_rerank(...)`'s output when a caller sets
+            // `reranker_weights`). Applying the multiplier to `rank_score`
+            // alone would leave it dead code on the weighted-rerank path:
+            // `weighted_rerank` recomposes its own score from raw features
+            // and never reads `rank_score`, so the entity term must be the
+            // *last* step, applied exactly once regardless of which path
+            // produced the pre-entity-term composite.
             let entity_posterior_mean: Option<f64> = profile_state
                 .as_ref()
                 .and_then(|s| s.entity_posteriors.get(&id))
                 .map(khive_brain_core::BetaPosterior::mean);
-            let rank_score = rank_score
-                * crate::scoring::entity_posterior_term(
-                    entity_posterior_mean,
-                    crate::scoring::ENTITY_POSTERIOR_WEIGHT,
-                );
+            let entity_term = crate::scoring::entity_posterior_term(
+                entity_posterior_mean,
+                crate::scoring::ENTITY_POSTERIOR_WEIGHT,
+            );
 
             let age_days_f64 =
                 ((now_micros - note.created_at).max(0) as f64) / (1_000_000.0 * 86_400.0);
@@ -509,7 +519,7 @@ impl MemoryPack {
             breakdown.entity_posterior_mean = entity_posterior_mean;
 
             let source = source_by_id.get(&id).copied().unwrap_or(SearchSource::Text);
-            let final_score = if !cfg.reranker_weights.is_empty() {
+            let pre_entity_term_score = if !cfg.reranker_weights.is_empty() {
                 let features = RerankFeatures {
                     relevance: norm_relevance as f64,
                     salience: breakdown.salience_decayed,
@@ -521,6 +531,7 @@ impl MemoryPack {
             } else {
                 rank_score
             };
+            let final_score = pre_entity_term_score * entity_term;
 
             let raw_score_opt = raw_vec_scores.get(&id).copied();
             let absolute_relevance = raw_score_opt.unwrap_or(final_score).clamp(0.0, 1.0);
@@ -2867,6 +2878,277 @@ mod tests {
         assert!(
             implied_entity_term >= crate::scoring::ENTITY_POSTERIOR_CLAMP_MIN as f64 - 1e-6,
             "entity term must never fall below the -15% clamp bound: implied={implied_entity_term}"
+        );
+    }
+
+    /// Isolation (row-B gate, internal review PR round-1 Medium): the earlier
+    /// feedback-lift and clamp tests above give one profile strictly more
+    /// feedback than another, which also perturbs that profile's *global*
+    /// salience posterior (component 1, ADR-104 §1) — `on_explicit_feedback`
+    /// updates `state.salience` on every signal regardless of `target_id`
+    /// (see `recall_feedback.rs`). So a passing feedback-lift test alone does
+    /// not prove component 2 (the entity term) did the lifting; it could be
+    /// entirely a Stage A weight-projection effect.
+    ///
+    /// This test controls for that: two profiles each receive exactly ONE
+    /// `useful` signal — identical global salience posterior state — but
+    /// aimed at *different* targets (`target_x` for profile X, `target_y`
+    /// for profile Y). Recalling `target_x`'s note under both profiles must
+    /// therefore show identical `profile_component` (component 1 is
+    /// target-independent), while `entity_posterior_mean` for `target_x` is
+    /// present only under profile X. The measured `rank_score` ratio between
+    /// the two must equal `entity_posterior_term(mean, ENTITY_POSTERIOR_WEIGHT)`
+    /// exactly — the only degree of freedom left once component 1 is held
+    /// constant — proving the multiplier is live end-to-end, not just
+    /// present in the pure function.
+    #[tokio::test]
+    #[serial(background_tasks)]
+    async fn adr104_stage_b_entity_term_isolated_via_matched_global_feedback_count() {
+        use khive_pack_brain::BrainPack;
+
+        let rt = build_full_rt_with_brain();
+        let ns = Namespace::parse("local").expect("ns");
+        let token = rt.authorize(ns.clone()).expect("token");
+
+        let target_x_id = rt
+            .create_note(
+                &token,
+                "memory",
+                None,
+                "adr104b isolation target x note",
+                Some(0.6),
+                None,
+                vec![],
+            )
+            .await
+            .expect("create note x")
+            .id;
+        let target_y_id = rt
+            .create_note(
+                &token,
+                "memory",
+                None,
+                "adr104b isolation target y note",
+                Some(0.6),
+                None,
+                vec![],
+            )
+            .await
+            .expect("create note y")
+            .id;
+
+        let brain = BrainPack::new(rt.clone());
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(KgPack::new(rt.clone()));
+        builder.register(MemoryPack::new(rt.clone()));
+        builder.register(brain);
+        let registry = builder.build().expect("registry");
+
+        for name in ["adr104b-iso-x-v1", "adr104b-iso-y-v1"] {
+            registry
+                .dispatch(
+                    "brain.create_profile",
+                    serde_json::json!({
+                        "namespace": ns.as_str(),
+                        "name": name,
+                        "consumer_kind": "recall",
+                    }),
+                )
+                .await
+                .expect("create profile");
+        }
+
+        // Exactly one signal per profile — same weight, same count — but
+        // profile X's signal targets target_x and profile Y's targets
+        // target_y. Global salience posterior state ends up identical;
+        // per-entity posterior state does not.
+        adr104_skew_salience(&registry, "adr104b-iso-x-v1", target_x_id, 1).await;
+        adr104_skew_salience(&registry, "adr104b-iso-y-v1", target_y_id, 1).await;
+
+        // Both notes share most of their vocabulary ("adr104b isolation ...
+        // note"), so an FTS query naming only `target_x_id`'s note can still
+        // surface `target_y_id`'s note as a secondary hit — locate
+        // `target_x_id` by id within the returned hits rather than assuming
+        // a single-hit result.
+        async fn recall_target_x(
+            registry: &khive_runtime::VerbRegistry,
+            ns: &Namespace,
+            profile_id: &str,
+            target_x_id: Uuid,
+        ) -> (f64, f64, Option<f64>) {
+            let result = registry
+                .dispatch(
+                    "memory.recall",
+                    serde_json::json!({
+                        "namespace": ns.as_str(),
+                        "query": "adr104b isolation target x note",
+                        "profile_id": profile_id,
+                        "include_breakdown": true,
+                        "limit": 10
+                    }),
+                )
+                .await
+                .expect("recall");
+            let hits = result.as_array().expect("bare array result");
+            let pos = adr104_position(hits, target_x_id);
+            let rank_score = hits[pos]["rank_score"].as_f64().expect("rank_score");
+            let profile_component = hits[pos]["breakdown"]["profile_component"]
+                .as_f64()
+                .expect("profile_component present");
+            let entity_posterior_mean = hits[pos]["breakdown"]["entity_posterior_mean"].as_f64();
+            (rank_score, profile_component, entity_posterior_mean)
+        }
+
+        let (score_under_x, component_under_x, ent_mean_under_x) =
+            recall_target_x(&registry, &ns, "adr104b-iso-x-v1", target_x_id).await;
+        let (score_under_y, component_under_y, ent_mean_under_y) =
+            recall_target_x(&registry, &ns, "adr104b-iso-y-v1", target_x_id).await;
+
+        assert!(
+            (component_under_x - component_under_y).abs() < 1e-9,
+            "component 1 (profile_component) must be identical under both \
+             profiles — they received the same global feedback count, just \
+             on different targets: under_x={component_under_x} under_y={component_under_y}"
+        );
+        assert!(
+            ent_mean_under_x.is_some(),
+            "profile X received feedback directly on target_x => entity_posterior_mean must be present"
+        );
+        assert!(
+            ent_mean_under_y.is_none(),
+            "profile Y's signal targeted target_y, not target_x => target_x must have no \
+             posterior under profile Y: got {ent_mean_under_y:?}"
+        );
+
+        let expected_term = crate::scoring::entity_posterior_term(
+            ent_mean_under_x,
+            crate::scoring::ENTITY_POSTERIOR_WEIGHT,
+        ) as f64;
+        let observed_ratio = score_under_x / score_under_y;
+        assert!(
+            (observed_ratio - expected_term).abs() < 1e-4,
+            "with component 1 held constant, the rank_score ratio between the \
+             two profiles must equal the entity term exactly: observed={observed_ratio} \
+             expected={expected_term} (ent_mean_under_x={ent_mean_under_x:?})"
+        );
+    }
+
+    /// Regression (row-B gate, internal review PR round-1 High): the entity
+    /// term must apply on the weighted-rerank path too, not only the
+    /// default `rank_score` path. `weighted_rerank` recomposes its score
+    /// from raw relevance/salience/temporal features and never reads
+    /// `rank_score`, so a naive "multiply `rank_score`" fix is dead code
+    /// whenever a caller sets non-empty `reranker_weights`. This drives a
+    /// single-note corpus through the reranker path before and after one
+    /// `useful` signal and asserts the score moves by exactly the entity
+    /// term, proving the multiplier is applied to whichever composite score
+    /// actually reaches ranking.
+    #[tokio::test]
+    #[serial(background_tasks)]
+    async fn adr104_stage_b_entity_term_applies_under_weighted_reranker() {
+        use khive_pack_brain::BrainPack;
+
+        let rt = build_full_rt_with_brain();
+        let ns = Namespace::parse("local").expect("ns");
+        let token = rt.authorize(ns.clone()).expect("token");
+        let note_id = rt
+            .create_note(
+                &token,
+                "memory",
+                None,
+                "adr104b reranker path probe note",
+                Some(0.6),
+                None,
+                vec![],
+            )
+            .await
+            .expect("create note")
+            .id;
+
+        let brain = BrainPack::new(rt.clone());
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(KgPack::new(rt.clone()));
+        builder.register(MemoryPack::new(rt.clone()));
+        builder.register(brain);
+        let registry = builder.build().expect("registry");
+
+        registry
+            .dispatch(
+                "brain.create_profile",
+                serde_json::json!({
+                    "namespace": ns.as_str(),
+                    "name": "adr104b-rerank-v1",
+                    "consumer_kind": "recall",
+                }),
+            )
+            .await
+            .expect("create profile");
+
+        let params = serde_json::json!({
+            "namespace": ns.as_str(),
+            "query": "adr104b reranker path probe note",
+            "profile_id": "adr104b-rerank-v1",
+            "include_breakdown": true,
+            "config": {
+                "reranker_weights": {
+                    "relevance": 0.6,
+                    "salience": 0.3,
+                    "temporal": 0.1
+                }
+            },
+            "limit": 10
+        });
+
+        let before = registry
+            .dispatch("memory.recall", params.clone())
+            .await
+            .expect("recall before feedback");
+        let before_hits = before.as_array().expect("array");
+        let score_before = before_hits[0]["rank_score"].as_f64().expect("rank_score");
+        assert!(
+            before_hits[0]["breakdown"]["entity_posterior_mean"].is_null(),
+            "no feedback yet => entity_posterior_mean must be absent"
+        );
+
+        registry
+            .dispatch(
+                "brain.feedback",
+                serde_json::json!({
+                    "target_id": note_id.to_string(),
+                    "signal": "useful",
+                    "served_by_profile_id": "adr104b-rerank-v1",
+                }),
+            )
+            .await
+            .expect("one explicit useful signal");
+
+        let after = registry
+            .dispatch("memory.recall", params)
+            .await
+            .expect("recall after feedback");
+        let after_hits = after.as_array().expect("array");
+        let score_after = after_hits[0]["rank_score"].as_f64().expect("rank_score");
+        let ent_mean_after = after_hits[0]["breakdown"]["entity_posterior_mean"]
+            .as_f64()
+            .expect("entity_posterior_mean present after feedback");
+
+        assert!(
+            score_after > score_before,
+            "the entity term must lift rank_score on the weighted-rerank path too: \
+             before={score_before} after={score_after}"
+        );
+
+        let expected_ratio = crate::scoring::entity_posterior_term(
+            Some(ent_mean_after),
+            crate::scoring::ENTITY_POSTERIOR_WEIGHT,
+        ) as f64;
+        let observed_ratio = score_after / score_before;
+        assert!(
+            (observed_ratio - expected_ratio).abs() < 1e-4,
+            "reranker-path score ratio must equal the entity term exactly \
+             (weighted_rerank's inputs are unaffected by the one signal, so \
+             the entire delta must be the Stage B multiplier): \
+             observed={observed_ratio} expected={expected_ratio}"
         );
     }
 

@@ -530,8 +530,13 @@ pub struct ScoreBreakdown {
     /// ADR-104 §3: the serving profile's per-entity Beta posterior mean for
     /// this hit's UUID. `None` when no profile served the request, or the
     /// profile holds no posterior for this UUID beyond the uninformative
-    /// prior. Reported only — Stage A does not let this affect ranking
-    /// (the per-entity multiplicative term is component 2, Stage B).
+    /// prior. As of Stage B (§2), this value is not just reported: it is
+    /// the input to the bounded per-entity term
+    /// `clamp(1 + 0.3 * (entity_posterior_mean - 0.5), 0.85, 1.15)` that
+    /// multiplies the response's `rank_score` — so a value here other than
+    /// the neutral case (`None`, or a mean of exactly 0.5) means this hit's
+    /// `rank_score` was moved by up to +/-15% relative to the same
+    /// candidate under a profile with no posterior for it.
     pub entity_posterior_mean: Option<f64>,
 }
 
