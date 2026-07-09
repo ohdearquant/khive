@@ -2041,7 +2041,7 @@ pub fn resolve_explicit_namespace(
         None => Namespace::parse(default_namespace)
             .map_err(|e| RuntimeError::InvalidInput(format!("invalid namespace: {e}"))),
         Some(Value::String(ns_str)) => Namespace::parse(ns_str)
-            .map_err(|e| RuntimeError::InvalidInput(format!("invalid namespace: {e}"))),
+            .map_err(|e| RuntimeError::InvalidInput(format!("invalid namespace {ns_str:?}: {e}"))),
         Some(other) => Err(RuntimeError::InvalidInput(format!(
             "invalid namespace: expected string when present, got {}",
             json_type_name(other),

@@ -166,12 +166,20 @@ impl MemoryPack {
         });
 
         if candidates.vector_hits_per_model.len() > 1 {
+            // Review finding (#733 fix-round 1, High): same fix as
+            // `handle_recall`'s verbose multi-model breakdown — the global
+            // per-model ANN candidate lists are pre-hydration and must be
+            // filtered through `memory_ids` (the visible-namespace
+            // post-filter already applied to `vector_candidates` above)
+            // before serialization, or this diagnostic view can leak
+            // off-namespace candidate UUIDs.
             let per_model: serde_json::Map<String, Value> = candidates
                 .vector_hits_per_model
                 .iter()
                 .map(|(model, hits)| {
                     let hits_json: Vec<Value> = hits
                         .iter()
+                        .filter(|h| memory_ids.contains(&h.subject_id))
                         .map(|h| {
                             json!({
                                 "id": h.subject_id.to_string(),

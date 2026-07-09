@@ -11,9 +11,11 @@ the serving profile so scoring weights don't drift mid-measurement.
 
 ## Recipe
 
-1. **Pick an arm namespace.** Any string that parses as a valid namespace
-   (alphanumeric segments, `.` or `::` separators, no spaces) works. Prefix it
-   so it is obviously scratch data, e.g. `bench-arm-a`.
+1. **Pick an arm namespace.** A valid namespace is one or more segments
+   separated by a single `:`, each segment matching `[a-zA-Z0-9\-_.]+` (no
+   spaces, no empty segments, no trailing `:`; `::` is rejected — it produces
+   an empty segment between the two colons). Prefix it so it is obviously
+   scratch data, e.g. `bench-arm-a`.
 
 2. **Write the arm's corpus** with an explicit namespace override:
 
@@ -45,8 +47,9 @@ the serving profile so scoring weights don't drift mid-measurement.
    `local`. An invalid namespace string is a hard per-op error, not a silent
    fallback.
 
-5. **Tear down** by deleting the arm's memories (`delete(type="memory",
-   id=..., hard=true)`) once the measurement is done, or simply let the arm
+5. **Tear down** by deleting the arm's memories (`delete(id="...",
+   hard=true)` — one call per memory id; `delete` takes `id`/`kind`/`hard`,
+   not a `type=` param) once the measurement is done, or simply let the arm
    namespace age out unread — it costs nothing beyond the storage of its own
    rows.
 
@@ -59,10 +62,15 @@ the serving profile so scoring weights don't drift mid-measurement.
   is no namespace-scoped posterior isolation. Use a freshly created,
   arm-specific profile (step 3) to avoid contaminating a shared profile's
   state. Tracked as issue #733 remainder.
-- **`knowledge.compose`.** The knowledge/lore corpus has no namespace filter
-  at all — composed knowledge is global regardless of which namespace the
-  caller's token carries. A measurement arm that includes compose calls is
-  not isolated from concurrent compose traffic elsewhere.
+- **`knowledge.compose`.** Compose does scope section loading to the caller's
+  token namespace (`WHERE namespace = ?1`) — it is not global. What it lacks
+  is _this feature_: there is no `namespace=` exact-match parameter on
+  compose analogous to the one this slice adds to `memory.recall`, and no
+  `profile_id`-style pinning either. A measurement arm cannot point compose
+  at a specific scratch namespace independent of the caller's token the way
+  it can for recall; compose calls in an arm are scoped by whatever namespace
+  the caller is already authorized for, not covered by recall's new
+  exact-match parameter.
 - **The serve ledger.** `brain.record_serve` stamps the _effective_ namespace
   used for the fetch (the arm namespace when `namespace=` was passed), so
   ledger rows are attributable to the arm — but the ledger itself is a single
