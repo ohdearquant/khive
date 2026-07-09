@@ -83,10 +83,7 @@ pub async fn run_git_ingest(args: GitIngestArgs) -> Result<()> {
         &runtime,
         &token,
         &registry,
-        IngestOptions {
-            repo: args.repo,
-            project: args.project,
-        },
+        IngestOptions::unbounded(args.repo, args.project),
     )
     .await?;
 

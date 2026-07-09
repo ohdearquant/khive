@@ -15,12 +15,14 @@ use khive_types::{EdgeEndpointRule, HandlerDef, Pack};
 use crate::hook::{CommitHook, IssueLikeHook};
 use crate::vocab::{GIT_NOTE_KIND_SPECS, GIT_SCHEMA_PLAN_STMTS};
 
-/// Git-lifecycle pack (ADR-088) — registers `commit` / `issue` / `pull_request`
-/// note kinds populated by the batch ingester in `src/ingest.rs`. Contributes
-/// no new verbs and no edge endpoint rules: provenance edges use the base
-/// `annotates` contract only.
+/// Git-lifecycle pack (ADR-088, amended by ADR-088 Amendment 1) — registers
+/// `commit` / `issue` / `pull_request` note kinds populated by the batch
+/// ingester in `src/ingest.rs`, and one agent-facing verb, `git.digest`
+/// (`src/handlers.rs`). Extends the base edge contract with `precedes`
+/// commit→commit (parent→child lineage, ADR-088 Amendment 1 ingest
+/// enrichment) — the only new endpoint rule this pack contributes;
+/// everything else uses the base `annotates` contract.
 pub struct GitPack {
-    #[allow(dead_code)]
     runtime: KhiveRuntime,
 }
 
@@ -28,7 +30,8 @@ impl Pack for GitPack {
     const NAME: &'static str = "git";
     const NOTE_KINDS: &'static [&'static str] = &["commit", "issue", "pull_request"];
     const ENTITY_KINDS: &'static [&'static str] = &[];
-    const HANDLERS: &'static [HandlerDef] = &[];
+    const HANDLERS: &'static [HandlerDef] = &crate::vocab::GIT_HANDLERS;
+    const EDGE_RULES: &'static [EdgeEndpointRule] = &crate::vocab::GIT_EDGE_RULES;
     const REQUIRES: &'static [&'static str] = &["kg"];
     const NOTE_KIND_SPECS: &'static [NoteKindSpec] = &GIT_NOTE_KIND_SPECS;
     const SCHEMA_PLAN: Option<PackSchemaPlan> = Some(PackSchemaPlan {
@@ -41,6 +44,13 @@ impl GitPack {
     /// Create a new `GitPack` bound to the given runtime.
     pub fn new(runtime: KhiveRuntime) -> Self {
         Self { runtime }
+    }
+
+    /// Accessor for `src/handlers.rs`, which lives in a sibling module and
+    /// so cannot reach the private `runtime` field directly (mirrors
+    /// `khive-pack-gtd`'s identical `GtdPack::runtime()` accessor).
+    pub(crate) fn runtime(&self) -> &KhiveRuntime {
+        &self.runtime
     }
 }
 
@@ -115,12 +125,15 @@ impl PackRuntime for GitPack {
     async fn dispatch(
         &self,
         verb: &str,
-        _params: Value,
-        _registry: &VerbRegistry,
-        _token: &NamespaceToken,
+        params: Value,
+        registry: &VerbRegistry,
+        token: &NamespaceToken,
     ) -> Result<Value, RuntimeError> {
-        Err(RuntimeError::InvalidInput(format!(
-            "git pack does not handle verb {verb:?}"
-        )))
+        match verb {
+            "git.digest" => self.handle_digest(token, registry, params).await,
+            _ => Err(RuntimeError::InvalidInput(format!(
+                "git pack does not handle verb {verb:?}"
+            ))),
+        }
     }
 }

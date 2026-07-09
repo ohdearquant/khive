@@ -21,6 +21,28 @@ use uuid::Uuid;
 use khive_runtime::{secret_gate, KhiveRuntime, NamespaceToken, VerbRegistry};
 use khive_storage::types::{SqlStatement, SqlValue};
 
+use crate::refs;
+
+/// Which record kinds a `run_ingest` pass processes. `Default` selects all
+/// three — the CLI's historical behavior and the `git.digest` verb's default
+/// (ADR-088 Amendment 1).
+#[derive(Debug, Clone, Copy)]
+pub struct IngestInclude {
+    pub commits: bool,
+    pub issues: bool,
+    pub pull_requests: bool,
+}
+
+impl Default for IngestInclude {
+    fn default() -> Self {
+        Self {
+            commits: true,
+            issues: true,
+            pull_requests: true,
+        }
+    }
+}
+
 /// Options for one ingest pass.
 #[derive(Debug, Clone)]
 pub struct IngestOptions {
@@ -28,6 +50,59 @@ pub struct IngestOptions {
     pub repo: PathBuf,
     /// The repo-anchor `project` entity — full UUID or an 8+ hex prefix.
     pub project: String,
+    /// Bounded work per call, counted across commits + issues + PRs
+    /// (ADR-088 Amendment 1). `None` means unbounded — the CLI's historical
+    /// one-shot behavior.
+    pub max_items: Option<u64>,
+    /// Which record kinds to ingest this pass.
+    pub include: IngestInclude,
+}
+
+impl IngestOptions {
+    /// Convenience constructor for callers that want the CLI's historical
+    /// unbounded, all-kinds behavior.
+    pub fn unbounded(repo: PathBuf, project: String) -> Self {
+        Self {
+            repo,
+            project,
+            max_items: None,
+            include: IngestInclude::default(),
+        }
+    }
+}
+
+/// Bounds the number of new-record creation attempts across a `run_ingest`
+/// pass (ADR-088 Amendment 1 `max_items`). Only creation attempts (success or
+/// failure) consume budget — cheap natural-key "already exists" skips do not,
+/// since they are not the work the bound exists to limit.
+struct Budget {
+    remaining: Option<u64>,
+}
+
+impl Budget {
+    fn try_consume(&mut self) -> bool {
+        match &mut self.remaining {
+            None => true,
+            Some(0) => false,
+            Some(n) => {
+                *n -= 1;
+                true
+            }
+        }
+    }
+
+    fn exhausted(&self) -> bool {
+        matches!(self.remaining, Some(0))
+    }
+}
+
+/// A newly created note this pass, retained so the post-ingestion reference-
+/// extraction sweep (`link_references`) can resolve cross-references between
+/// records created in the *same* pass regardless of ingestion order (PRs and
+/// issues are ingested before commits) without re-reading them from storage.
+struct NewRecordForRef {
+    id: Uuid,
+    text: String,
 }
 
 /// Outcome of one ingest pass. Serializable so CLI callers can emit it as JSON.
@@ -43,6 +118,29 @@ pub struct IngestReport {
     /// skipped but commits still ingested (ADR-088 §5 graceful-absence rule).
     pub gh_available: bool,
     pub warnings: Vec<String>,
+    /// `false` when `max_items` was exhausted before this pass reached the
+    /// end of every included kind's history — callers loop until `true`
+    /// (ADR-088 Amendment 1). Always `true` for an unbounded
+    /// (`max_items: None`) pass.
+    pub done: bool,
+    /// The repo-anchor `project` entity id this pass resolved (or the
+    /// verb-level caller created).
+    pub project_id: Option<String>,
+    /// `true` when the `git.digest` verb auto-created the `project` anchor
+    /// because none was found (ADR-088 Amendment 1) — never set by
+    /// `run_ingest` itself, only by the verb handler after it returns.
+    pub project_created: bool,
+    /// `annotates` edges created from a `Closes/Fixes/Resolves #N` or bare
+    /// `#N` reference in a commit message or issue/PR body to the referenced
+    /// issue/PR note (ADR-088 Amendment 1 ingest enrichment).
+    pub reference_edges_created: u64,
+    /// References that named a number this pass could not resolve to an
+    /// ingested issue/PR note within the same project — skipped, not an
+    /// error (fail-open).
+    pub reference_edges_unresolved: u64,
+    /// `precedes` edges created from a commit's `parents[]` to the commit
+    /// itself (ADR-088 Amendment 1 ingest enrichment).
+    pub parent_edges_created: u64,
 }
 
 /// Run one ingest pass: issues + PRs first (via `gh`, when available), then
@@ -56,72 +154,108 @@ pub async fn run_ingest(
     registry: &VerbRegistry,
     opts: IngestOptions,
 ) -> Result<IngestReport> {
-    let mut report = IngestReport::default();
+    let mut report = IngestReport {
+        done: true,
+        ..IngestReport::default()
+    };
 
     let project_id = resolve_id(runtime, token, &opts.project)
         .await?
         .ok_or_else(|| anyhow!("--project {:?} did not resolve to an entity", opts.project))?;
+    report.project_id = Some(project_id.to_string());
 
     let mut merge_sha_to_pr: HashMap<String, Uuid> = HashMap::new();
     let mut number_to_pr: HashMap<u64, Uuid> = HashMap::new();
+    let mut budget = Budget {
+        remaining: opts.max_items,
+    };
+    let mut new_records: Vec<NewRecordForRef> = Vec::new();
 
     // Graceful degradation covers both "gh is not on PATH" and "gh is present
     // but this repo has no usable GitHub remote" (e.g. a synthetic/local-only
     // repo) — either way, issues/PRs are skipped with a warning and commits
     // still ingest (ADR-088 §5). A hard `gh` failure must never abort the
     // whole pass.
-    if gh_available(&opts.repo) {
-        report.gh_available = true;
-        match ingest_prs(
-            runtime,
-            token,
-            registry,
-            &opts.repo,
-            project_id,
-            &mut report,
-            &mut merge_sha_to_pr,
-            &mut number_to_pr,
-        )
-        .await
-        {
-            Ok(()) => {}
-            Err(e) => report
-                .warnings
-                .push(format!("gh pr list failed, skipping pull requests: {e}")),
+    if opts.include.issues || opts.include.pull_requests {
+        if gh_available(&opts.repo) {
+            report.gh_available = true;
+            if opts.include.pull_requests && !budget.exhausted() {
+                match ingest_prs(
+                    runtime,
+                    token,
+                    registry,
+                    &opts.repo,
+                    project_id,
+                    &mut report,
+                    &mut merge_sha_to_pr,
+                    &mut number_to_pr,
+                    &mut budget,
+                    &mut new_records,
+                )
+                .await
+                {
+                    Ok(()) => {}
+                    Err(e) => report
+                        .warnings
+                        .push(format!("gh pr list failed, skipping pull requests: {e}")),
+                }
+            }
+            if opts.include.issues && !budget.exhausted() {
+                if let Err(e) = ingest_issues(
+                    runtime,
+                    token,
+                    registry,
+                    &opts.repo,
+                    project_id,
+                    &mut report,
+                    &mut budget,
+                    &mut new_records,
+                )
+                .await
+                {
+                    report
+                        .warnings
+                        .push(format!("gh issue list failed, skipping issues: {e}"));
+                }
+            }
+        } else {
+            report.gh_available = false;
+            report.warnings.push(
+                "gh CLI not found on PATH; skipped issues and pull requests — commits still ingest"
+                    .to_string(),
+            );
         }
-        if let Err(e) = ingest_issues(
-            runtime,
-            token,
-            registry,
-            &opts.repo,
-            project_id,
-            &mut report,
-        )
-        .await
-        {
-            report
-                .warnings
-                .push(format!("gh issue list failed, skipping issues: {e}"));
-        }
-    } else {
-        report.gh_available = false;
-        report.warnings.push(
-            "gh CLI not found on PATH; skipped issues and pull requests — commits still ingest"
-                .to_string(),
-        );
     }
 
-    ingest_commits(
+    if opts.include.commits && !budget.exhausted() {
+        ingest_commits(
+            runtime,
+            token,
+            registry,
+            &opts.repo,
+            project_id,
+            &merge_sha_to_pr,
+            &number_to_pr,
+            &mut report,
+            &mut budget,
+            &mut new_records,
+        )
+        .await?;
+    }
+
+    if budget.exhausted() {
+        report.done = false;
+    }
+
+    link_references(
         runtime,
         token,
         registry,
-        &opts.repo,
         project_id,
-        &merge_sha_to_pr,
-        &number_to_pr,
+        &new_records,
         &mut report,
     )
-    .await?;
+    .await;
 
     Ok(report)
 }
@@ -140,6 +274,99 @@ async fn resolve_id(
         .resolve_prefix_unfiltered(raw)
         .await
         .map_err(|e| anyhow!("{e}"))
+}
+
+/// Public wrapper for the `git.digest` verb handler, which needs to resolve
+/// (but never auto-create) an explicitly supplied `project` argument the same
+/// way `run_ingest` does.
+pub async fn resolve_project_id(runtime: &KhiveRuntime, raw: &str) -> Result<Option<Uuid>> {
+    if let Ok(u) = Uuid::parse_str(raw) {
+        return Ok(Some(u));
+    }
+    runtime
+        .resolve_prefix_unfiltered(raw)
+        .await
+        .map_err(|e| anyhow!("{e}"))
+}
+
+/// Find an existing `issue` or `pull_request` note by `properties.number`
+/// within `project_id` — GitHub numbers a repository's issues and PRs from
+/// one shared sequence, so a `#N` reference can resolve to either kind.
+async fn find_issue_or_pr_by_number(
+    runtime: &KhiveRuntime,
+    token: &NamespaceToken,
+    project_id: Uuid,
+    number: u64,
+) -> Result<Option<Uuid>> {
+    if let Some(id) = find_by_number(runtime, token, "issue", project_id, number).await? {
+        return Ok(Some(id));
+    }
+    find_by_number(runtime, token, "pull_request", project_id, number).await
+}
+
+/// Post-ingestion sweep (ADR-088 Amendment 1 ingest enrichment): extract
+/// GitHub reference-grammar mentions from every note created *this pass*
+/// (commits, issues, PRs — order-independent, since all three are already in
+/// `new_records` by the time this runs) and materialize `annotates` edges to
+/// the referenced issue/PR note, carrying `ref_kind` ("closes" | "mentions")
+/// as edge metadata. Fail-open throughout: a malformed or unresolvable
+/// reference is skipped and counted, never aborts the pass.
+async fn link_references(
+    runtime: &KhiveRuntime,
+    token: &NamespaceToken,
+    registry: &VerbRegistry,
+    project_id: Uuid,
+    new_records: &[NewRecordForRef],
+    report: &mut IngestReport,
+) {
+    for record in new_records {
+        let mentions = refs::dedupe_prefer_closes(refs::extract_references(&record.text));
+        for mention in mentions {
+            let target = match find_issue_or_pr_by_number(
+                runtime,
+                token,
+                project_id,
+                mention.number,
+            )
+            .await
+            {
+                Ok(Some(id)) => id,
+                Ok(None) => {
+                    report.reference_edges_unresolved += 1;
+                    continue;
+                }
+                Err(e) => {
+                    report
+                        .warnings
+                        .push(format!("resolving reference #{}: {e}", mention.number));
+                    continue;
+                }
+            };
+            if target == record.id {
+                // A note referencing its own number (rare, e.g. a PR body
+                // that quotes its own number) — not a real cross-reference.
+                continue;
+            }
+            match registry
+                .dispatch(
+                    "link",
+                    json!({
+                        "source_id": record.id.to_string(),
+                        "target_id": target.to_string(),
+                        "relation": "annotates",
+                        "metadata": { "ref_kind": mention.kind.as_str() },
+                    }),
+                )
+                .await
+            {
+                Ok(_) => report.reference_edges_created += 1,
+                Err(e) => report.warnings.push(format!(
+                    "linking reference #{} from {}: {e}",
+                    mention.number, record.id
+                )),
+            }
+        }
+    }
 }
 
 /// `true` when `gh` is on PATH and can run inside `repo` (a lightweight
@@ -436,6 +663,11 @@ fn squash_merge_pr_number(subject: &str) -> Option<u64> {
     close[open + 2..].parse::<u64>().ok()
 }
 
+/// Max characters for the `name` field the amendment's readable-names rider
+/// sets on newly ingested notes (issues/PRs: `"#<number> <title>"`; commits:
+/// `"<short_sha> <subject>"`).
+const NAME_MAX_CHARS: usize = 120;
+
 #[allow(clippy::too_many_arguments)]
 async fn ingest_commits(
     runtime: &KhiveRuntime,
@@ -446,6 +678,8 @@ async fn ingest_commits(
     merge_sha_to_pr: &HashMap<String, Uuid>,
     number_to_pr: &HashMap<u64, Uuid>,
     report: &mut IngestReport,
+    budget: &mut Budget,
+    new_records: &mut Vec<NewRecordForRef>,
 ) -> Result<()> {
     let since = read_cursor(runtime, project_id, "commits").await?;
     let commits = walk_commits(repo, since.as_deref())?;
@@ -465,13 +699,23 @@ async fn ingest_commits(
     // sha natural key), so a retried pass never double-creates them.
     let mut last_sha: Option<String> = since;
     let mut cursor_stalled = false;
+    // Parent SHA -> note id for commits created earlier THIS pass (walked
+    // oldest-first) — combined with `find_commit_by_sha`'s DB lookup below,
+    // this resolves parent edges regardless of which pass the parent landed
+    // in.
+    let mut local_sha_to_id: HashMap<String, Uuid> = HashMap::new();
     for c in &commits {
-        if find_commit_by_sha(runtime, token, &c.sha).await?.is_some() {
+        if let Some(existing) = find_commit_by_sha(runtime, token, &c.sha).await? {
+            local_sha_to_id.insert(c.sha.clone(), existing);
             report.commits_skipped_existing += 1;
             if !cursor_stalled {
                 last_sha = Some(c.sha.clone());
             }
             continue;
+        }
+
+        if budget.exhausted() {
+            break;
         }
 
         let raw_content = if c.body.trim().is_empty() {
@@ -522,11 +766,15 @@ async fn ingest_commits(
             "parents": c.parents,
         });
 
+        let name = refs::truncate_chars(&format!("{} {}", c.short_sha, c.subject), NAME_MAX_CHARS);
+
+        budget.try_consume();
         match registry
             .dispatch(
                 "create",
                 json!({
                     "kind": "commit",
+                    "name": name,
                     "content": content,
                     "properties": properties,
                     "annotates": annotates,
@@ -534,10 +782,54 @@ async fn ingest_commits(
             )
             .await
         {
-            Ok(_) => {
+            Ok(v) => {
                 report.commits_ingested += 1;
                 if !cursor_stalled {
                     last_sha = Some(c.sha.clone());
+                }
+                if let Some(id) = v
+                    .get("id")
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| Uuid::parse_str(s).ok())
+                {
+                    local_sha_to_id.insert(c.sha.clone(), id);
+                    new_records.push(NewRecordForRef {
+                        id,
+                        text: content.clone(),
+                    });
+                    // Parent -> child `precedes` edges (ADR-088 Amendment 1
+                    // ingest enrichment). Fail-open: an unresolved or
+                    // failing parent link is skipped/warned, never aborts
+                    // the pass.
+                    for parent_sha in &c.parents {
+                        let parent_id = match local_sha_to_id.get(parent_sha).copied() {
+                            Some(pid) => Some(pid),
+                            None => find_commit_by_sha(runtime, token, parent_sha).await?,
+                        };
+                        let Some(parent_id) = parent_id else {
+                            continue;
+                        };
+                        if parent_id == id {
+                            continue;
+                        }
+                        match registry
+                            .dispatch(
+                                "link",
+                                json!({
+                                    "source_id": parent_id.to_string(),
+                                    "target_id": id.to_string(),
+                                    "relation": "precedes",
+                                }),
+                            )
+                            .await
+                        {
+                            Ok(_) => report.parent_edges_created += 1,
+                            Err(e) => report.warnings.push(format!(
+                                "linking parent {parent_sha} -> {} precedes: {e}",
+                                c.sha
+                            )),
+                        }
+                    }
                 }
             }
             Err(e) => {
@@ -628,6 +920,117 @@ fn gh_json(repo: &Path, args: &[&str]) -> Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
+/// Per-page fetch cap for both PR and issue paging (ADR-088 Amendment 1 fix
+/// round, Issue High-1). `gh {pr,issue} list --search` is backed by GitHub's
+/// search API, which never returns more than this many results for a single
+/// query regardless of `--limit` — paging works around that ceiling by
+/// advancing an `updated:>=` floor between calls, not by requesting more
+/// than one page can hold.
+const PAGE_LIMIT: usize = 1000;
+
+/// What a paging loop should do after processing one fetched page. Pure and
+/// unit-testable independent of `gh`, the database, or async machinery — the
+/// entire "was the remote window proven exhausted" decision lives here
+/// (ADR-088 Amendment 1 fix-round High-1: a single hard-coded `--limit 1000`
+/// fetch could previously report `done: true` while a repo's remaining
+/// PRs/issues past position 1000 were never seen).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PageOutcome {
+    /// The page held fewer than `PAGE_LIMIT` items: the remote window is
+    /// proven exhausted regardless of local budget state.
+    WindowComplete,
+    /// The page was full (`PAGE_LIMIT` items) and the local budget is
+    /// exhausted: stop paging, but the window is NOT proven exhausted.
+    StopBudgetExhausted,
+    /// The page was full and the last item's `updated_at` did not advance
+    /// past the current floor (more than `PAGE_LIMIT` records share one
+    /// timestamp — an unresolvable pathological case): stop paging rather
+    /// than loop forever. The window is NOT proven exhausted.
+    StopFloorStalled,
+    /// The page was full, the budget is not exhausted, and the floor
+    /// advanced: fetch the next page starting at this floor.
+    Continue(String),
+}
+
+fn decide_page_outcome(
+    page_len: usize,
+    current_floor: Option<&str>,
+    last_updated_at: Option<&str>,
+    budget_exhausted: bool,
+) -> PageOutcome {
+    if page_len < PAGE_LIMIT {
+        return PageOutcome::WindowComplete;
+    }
+    if budget_exhausted {
+        return PageOutcome::StopBudgetExhausted;
+    }
+    match last_updated_at {
+        Some(next) if Some(next) != current_floor => PageOutcome::Continue(next.to_string()),
+        _ => PageOutcome::StopFloorStalled,
+    }
+}
+
+/// `PageOutcome::WindowComplete` is the only outcome under which `done` can
+/// stay `true` on the local-budget question alone; every other outcome means
+/// more remote records may exist past the last fetched page. Test-only
+/// helper — production code matches on `PageOutcome` directly (see
+/// `ingest_prs`/`ingest_issues`'s paging loops).
+#[cfg(test)]
+fn page_outcome_proves_window_complete(outcome: PageOutcome) -> bool {
+    matches!(outcome, PageOutcome::WindowComplete)
+}
+
+fn search_query(floor: Option<&str>) -> String {
+    match floor {
+        Some(f) => format!("sort:updated-asc updated:>={f}"),
+        None => "sort:updated-asc".to_string(),
+    }
+}
+
+const PR_FIELDS: &str = "number,title,author,createdAt,mergedAt,closedAt,updatedAt,baseRefName,headRefName,mergeCommit,body";
+const ISSUE_FIELDS: &str =
+    "number,title,author,createdAt,closedAt,updatedAt,labels,stateReason,body";
+
+fn fetch_pr_page(repo: &Path, floor: Option<&str>) -> Result<Vec<GhPr>> {
+    let search = search_query(floor);
+    let raw = gh_json(
+        repo,
+        &[
+            "pr",
+            "list",
+            "--state",
+            "all",
+            "--search",
+            search.as_str(),
+            "--limit",
+            "1000",
+            "--json",
+            PR_FIELDS,
+        ],
+    )?;
+    serde_json::from_str(&raw).context("parsing gh pr list --json")
+}
+
+fn fetch_issue_page(repo: &Path, floor: Option<&str>) -> Result<Vec<GhIssue>> {
+    let search = search_query(floor);
+    let raw = gh_json(
+        repo,
+        &[
+            "issue",
+            "list",
+            "--state",
+            "all",
+            "--search",
+            search.as_str(),
+            "--limit",
+            "1000",
+            "--json",
+            ISSUE_FIELDS,
+        ],
+    )?;
+    serde_json::from_str(&raw).context("parsing gh issue list --json")
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn ingest_prs(
     runtime: &KhiveRuntime,
@@ -638,43 +1041,10 @@ async fn ingest_prs(
     report: &mut IngestReport,
     merge_sha_to_pr: &mut HashMap<String, Uuid>,
     number_to_pr: &mut HashMap<u64, Uuid>,
+    budget: &mut Budget,
+    new_records: &mut Vec<NewRecordForRef>,
 ) -> Result<()> {
     let since = read_cursor(runtime, project_id, "prs").await?;
-    let raw = gh_json(
-        repo,
-        &[
-            "pr",
-            "list",
-            "--state",
-            "all",
-            "--limit",
-            "1000",
-            "--json",
-            "number,title,author,createdAt,mergedAt,closedAt,updatedAt,baseRefName,headRefName,mergeCommit,body",
-        ],
-    )?;
-    let mut prs: Vec<GhPr> = serde_json::from_str(&raw).context("parsing gh pr list --json")?;
-    // `gh pr list` makes no ordering guarantee. The frozen-cursor retry
-    // guarantee below (cursor freezes at the last contiguous success, so a
-    // failed record is retried next pass) only holds if records are walked
-    // in nondecreasing updated_at order; otherwise a newer record ahead of
-    // an older failing one in the raw list would push the cursor past the
-    // failure and it would never be retried. Sort ascending first (stable —
-    // ties keep gh's original relative order).
-    //
-    // Sorting alone does not cover a TIE: if a successful record and a
-    // failing record share the exact same `updated_at`, the success still
-    // advances the cursor to that timestamp, and an exclusive `updated >
-    // cursor` retry check would then see the failed record's `updated_at ==
-    // cursor` and treat it as not-new on the next pass — stranding it
-    // forever, sort or no sort. `is_new` below is therefore inclusive
-    // (`updated >= cursor`): every record at the cursor timestamp is
-    // re-examined on every subsequent pass until the cursor moves past it.
-    // That reprocessing is bounded (only records sharing the exact cursor
-    // value) and free (the natural-key lookup below turns every
-    // already-created one into a cheap no-op), so it converges the moment
-    // the last tied record either succeeds or the cursor advances.
-    prs.sort_by(|a, b| a.updated_at.cmp(&b.updated_at));
 
     // `cursor_stalled` mirrors `ingest_commits`: once one PR fails to create,
     // later PRs in this pass are still attempted (so every failure surfaces
@@ -683,21 +1053,113 @@ async fn ingest_prs(
     // retries it, while already-landed PRs are no-ops via the natural key.
     let mut max_updated: Option<String> = since.clone();
     let mut cursor_stalled = false;
-    for pr in prs {
-        let is_new = since
-            .as_deref()
-            .zip(pr.updated_at.as_deref())
-            .map(|(cursor, updated)| updated >= cursor)
-            .unwrap_or(true);
+    let mut floor = since.clone();
+    let mut window_complete = true;
 
-        if let Some(existing) =
-            find_by_number(runtime, token, "pull_request", project_id, pr.number).await?
-        {
-            number_to_pr.insert(pr.number, existing);
-            if let Some(oid) = pr.merge_commit.as_ref().and_then(|m| m.oid.clone()) {
-                merge_sha_to_pr.insert(oid, existing);
+    'paging: loop {
+        let mut page = fetch_pr_page(repo, floor.as_deref())?;
+        let page_len = page.len();
+        // Each page is already `sort:updated-asc` server-side, but `--search`
+        // makes no hard ordering guarantee across ties — re-sort defensively
+        // so the frozen-cursor invariant (records walked in nondecreasing
+        // `updated_at` order) holds regardless. `is_new` below is inclusive
+        // (`updated >= cursor`) for exactly the tie reason documented at
+        // length in the pre-pagination version of this function (a
+        // successful and a failing record sharing one `updated_at` must both
+        // be re-examined next pass until the cursor moves past that tie).
+        page.sort_by(|a, b| a.updated_at.cmp(&b.updated_at));
+        let last_updated_at = page.last().and_then(|pr| pr.updated_at.clone());
+
+        for pr in page {
+            let is_new = since
+                .as_deref()
+                .zip(pr.updated_at.as_deref())
+                .map(|(cursor, updated)| updated >= cursor)
+                .unwrap_or(true);
+
+            if let Some(existing) =
+                find_by_number(runtime, token, "pull_request", project_id, pr.number).await?
+            {
+                number_to_pr.insert(pr.number, existing);
+                if let Some(oid) = pr.merge_commit.as_ref().and_then(|m| m.oid.clone()) {
+                    merge_sha_to_pr.insert(oid, existing);
+                }
+                report.prs_skipped_existing += 1;
+                if !cursor_stalled {
+                    if let Some(u) = &pr.updated_at {
+                        if max_updated
+                            .as_deref()
+                            .map(|m| u.as_str() > m)
+                            .unwrap_or(true)
+                        {
+                            max_updated = Some(u.clone());
+                        }
+                    }
+                }
+                continue;
             }
-            report.prs_skipped_existing += 1;
+            if !is_new {
+                continue;
+            }
+            if budget.exhausted() {
+                break;
+            }
+
+            let raw_body = pr.body.unwrap_or_default();
+            let content = secret_gate::mask_secrets(&raw_body).into_owned();
+            let properties = json!({
+                "number": pr.number,
+                "title": pr.title,
+                "author": pr.author.and_then(|a| a.login),
+                "created_at": pr.created_at,
+                "merged_at": pr.merged_at,
+                "closed_at": pr.closed_at,
+                "base_ref": pr.base_ref_name,
+                "head_ref": pr.head_ref_name,
+                "project_id": project_id.to_string(),
+            });
+            let name =
+                refs::truncate_chars(&format!("#{} {}", pr.number, pr.title), NAME_MAX_CHARS);
+
+            budget.try_consume();
+            let result = match registry
+                .dispatch(
+                    "create",
+                    json!({
+                        "kind": "pull_request",
+                        "name": name,
+                        "content": content,
+                        "properties": properties,
+                        "annotates": [project_id.to_string()],
+                    }),
+                )
+                .await
+            {
+                Ok(v) => v,
+                Err(e) => {
+                    report
+                        .warnings
+                        .push(format!("create pull_request #{}: {e}", pr.number));
+                    cursor_stalled = true;
+                    continue;
+                }
+            };
+
+            if let Some(id) = result
+                .get("id")
+                .and_then(|v| v.as_str())
+                .and_then(|s| Uuid::parse_str(s).ok())
+            {
+                number_to_pr.insert(pr.number, id);
+                if let Some(oid) = pr.merge_commit.and_then(|m| m.oid) {
+                    merge_sha_to_pr.insert(oid, id);
+                }
+                new_records.push(NewRecordForRef {
+                    id,
+                    text: content.clone(),
+                });
+            }
+            report.prs_ingested += 1;
             if !cursor_stalled {
                 if let Some(u) = &pr.updated_at {
                     if max_updated
@@ -709,70 +1171,29 @@ async fn ingest_prs(
                     }
                 }
             }
-            continue;
-        }
-        if !is_new {
-            continue;
         }
 
-        let raw_body = pr.body.unwrap_or_default();
-        let content = secret_gate::mask_secrets(&raw_body).into_owned();
-        let properties = json!({
-            "number": pr.number,
-            "title": pr.title,
-            "author": pr.author.and_then(|a| a.login),
-            "created_at": pr.created_at,
-            "merged_at": pr.merged_at,
-            "closed_at": pr.closed_at,
-            "base_ref": pr.base_ref_name,
-            "head_ref": pr.head_ref_name,
-            "project_id": project_id.to_string(),
-        });
-
-        let result = match registry
-            .dispatch(
-                "create",
-                json!({
-                    "kind": "pull_request",
-                    "content": content,
-                    "properties": properties,
-                    "annotates": [project_id.to_string()],
-                }),
-            )
-            .await
-        {
-            Ok(v) => v,
-            Err(e) => {
-                report
-                    .warnings
-                    .push(format!("create pull_request #{}: {e}", pr.number));
-                cursor_stalled = true;
-                continue;
+        match decide_page_outcome(
+            page_len,
+            floor.as_deref(),
+            last_updated_at.as_deref(),
+            budget.exhausted(),
+        ) {
+            PageOutcome::WindowComplete => break 'paging,
+            PageOutcome::StopBudgetExhausted | PageOutcome::StopFloorStalled => {
+                window_complete = false;
+                break 'paging;
             }
-        };
-
-        if let Some(id) = result
-            .get("id")
-            .and_then(|v| v.as_str())
-            .and_then(|s| Uuid::parse_str(s).ok())
-        {
-            number_to_pr.insert(pr.number, id);
-            if let Some(oid) = pr.merge_commit.and_then(|m| m.oid) {
-                merge_sha_to_pr.insert(oid, id);
-            }
+            PageOutcome::Continue(next_floor) => floor = Some(next_floor),
         }
-        report.prs_ingested += 1;
-        if !cursor_stalled {
-            if let Some(u) = &pr.updated_at {
-                if max_updated
-                    .as_deref()
-                    .map(|m| u.as_str() > m)
-                    .unwrap_or(true)
-                {
-                    max_updated = Some(u.clone());
-                }
-            }
-        }
+    }
+
+    if !window_complete {
+        // The remote window may hold more PRs than this pass ever fetched
+        // (ADR-088 Amendment 1 fix-round High-1) — the local budget alone is
+        // not a complete signal; report `done = false` regardless of budget
+        // state so the caller's resume loop keeps going.
+        report.done = false;
     }
 
     if let Some(cursor) = max_updated {
@@ -781,6 +1202,7 @@ async fn ingest_prs(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn ingest_issues(
     runtime: &KhiveRuntime,
     token: &NamespaceToken,
@@ -788,32 +1210,10 @@ async fn ingest_issues(
     repo: &Path,
     project_id: Uuid,
     report: &mut IngestReport,
+    budget: &mut Budget,
+    new_records: &mut Vec<NewRecordForRef>,
 ) -> Result<()> {
     let since = read_cursor(runtime, project_id, "issues").await?;
-    let raw = gh_json(
-        repo,
-        &[
-            "issue",
-            "list",
-            "--state",
-            "all",
-            "--limit",
-            "1000",
-            "--json",
-            "number,title,author,createdAt,closedAt,updatedAt,labels,stateReason,body",
-        ],
-    )?;
-    let mut issues: Vec<GhIssue> =
-        serde_json::from_str(&raw).context("parsing gh issue list --json")?;
-    // See `ingest_prs`: the frozen-cursor retry guarantee requires walking
-    // records in nondecreasing updated_at order, which `gh issue list` does
-    // not itself guarantee. Sort ascending first (stable — ties keep gh's
-    // original relative order). Sorting doesn't cover a TIE between a
-    // successful and a failing record sharing the same `updated_at` — see
-    // `ingest_prs`'s comment on why `is_new` below is an inclusive
-    // (`updated >= cursor`) check, and why the resulting reprocessing of
-    // every record at the cursor timestamp is bounded and converges.
-    issues.sort_by(|a, b| a.updated_at.cmp(&b.updated_at));
 
     // `cursor_stalled` mirrors `ingest_commits`/`ingest_prs`: a per-record
     // create failure is aggregated as a warning and later records in this
@@ -822,18 +1222,115 @@ async fn ingest_issues(
     // forever; already-landed records are no-ops via the natural key.
     let mut max_updated: Option<String> = since.clone();
     let mut cursor_stalled = false;
-    for issue in issues {
-        let is_new = since
-            .as_deref()
-            .zip(issue.updated_at.as_deref())
-            .map(|(cursor, updated)| updated >= cursor)
-            .unwrap_or(true);
+    let mut floor = since.clone();
+    let mut window_complete = true;
 
-        if find_by_number(runtime, token, "issue", project_id, issue.number)
-            .await?
-            .is_some()
-        {
-            report.issues_skipped_existing += 1;
+    'paging: loop {
+        let mut page = fetch_issue_page(repo, floor.as_deref())?;
+        let page_len = page.len();
+        // See `ingest_prs`: the frozen-cursor retry guarantee requires
+        // walking records in nondecreasing updated_at order, which `--search
+        // sort:updated-asc` does not itself guarantee across ties — sort
+        // defensively.
+        page.sort_by(|a, b| a.updated_at.cmp(&b.updated_at));
+        let last_updated_at = page.last().and_then(|i| i.updated_at.clone());
+
+        for issue in page {
+            let is_new = since
+                .as_deref()
+                .zip(issue.updated_at.as_deref())
+                .map(|(cursor, updated)| updated >= cursor)
+                .unwrap_or(true);
+
+            if find_by_number(runtime, token, "issue", project_id, issue.number)
+                .await?
+                .is_some()
+            {
+                report.issues_skipped_existing += 1;
+                if !cursor_stalled {
+                    if let Some(u) = &issue.updated_at {
+                        if max_updated
+                            .as_deref()
+                            .map(|m| u.as_str() > m)
+                            .unwrap_or(true)
+                        {
+                            max_updated = Some(u.clone());
+                        }
+                    }
+                }
+                continue;
+            }
+            if !is_new {
+                continue;
+            }
+            if budget.exhausted() {
+                break;
+            }
+
+            let raw_body = issue.body.unwrap_or_default();
+            let content = secret_gate::mask_secrets(&raw_body).into_owned();
+            let labels: Vec<String> = issue
+                .labels
+                .unwrap_or_default()
+                .into_iter()
+                .map(|l| l.name)
+                .collect();
+            let mut properties = json!({
+                "number": issue.number,
+                "title": issue.title,
+                "author": issue.author.and_then(|a| a.login),
+                "created_at": issue.created_at,
+                "closed_at": issue.closed_at,
+                "labels": labels,
+                "project_id": project_id.to_string(),
+            });
+            // gh reports stateReason as "" for open issues and UPPERCASE enum values
+            // (NOT_PLANNED) for closed ones; the kind hook governs any PRESENT value
+            // against the lowercase GitHub stateReason enum, so normalize case and encode
+            // "open / no reason" as absent.
+            if let Some(reason) = issue.state_reason.as_deref().filter(|r| !r.is_empty()) {
+                properties["state_reason"] = json!(reason.to_ascii_lowercase());
+            }
+            let name = refs::truncate_chars(
+                &format!("#{} {}", issue.number, issue.title),
+                NAME_MAX_CHARS,
+            );
+
+            budget.try_consume();
+            let result = match registry
+                .dispatch(
+                    "create",
+                    json!({
+                        "kind": "issue",
+                        "name": name,
+                        "content": content,
+                        "properties": properties,
+                        "annotates": [project_id.to_string()],
+                    }),
+                )
+                .await
+            {
+                Ok(v) => v,
+                Err(e) => {
+                    report
+                        .warnings
+                        .push(format!("create issue #{}: {e}", issue.number));
+                    cursor_stalled = true;
+                    continue;
+                }
+            };
+            if let Some(id) = result
+                .get("id")
+                .and_then(|v| v.as_str())
+                .and_then(|s| Uuid::parse_str(s).ok())
+            {
+                new_records.push(NewRecordForRef {
+                    id,
+                    text: content.clone(),
+                });
+            }
+
+            report.issues_ingested += 1;
             if !cursor_stalled {
                 if let Some(u) = &issue.updated_at {
                     if max_updated
@@ -845,72 +1342,93 @@ async fn ingest_issues(
                     }
                 }
             }
-            continue;
-        }
-        if !is_new {
-            continue;
         }
 
-        let raw_body = issue.body.unwrap_or_default();
-        let content = secret_gate::mask_secrets(&raw_body).into_owned();
-        let labels: Vec<String> = issue
-            .labels
-            .unwrap_or_default()
-            .into_iter()
-            .map(|l| l.name)
-            .collect();
-        let mut properties = json!({
-            "number": issue.number,
-            "title": issue.title,
-            "author": issue.author.and_then(|a| a.login),
-            "created_at": issue.created_at,
-            "closed_at": issue.closed_at,
-            "labels": labels,
-            "project_id": project_id.to_string(),
-        });
-        // gh reports stateReason as "" for open issues and UPPERCASE enum values
-        // (NOT_PLANNED) for closed ones; the kind hook governs any PRESENT value
-        // against the lowercase GitHub stateReason enum, so normalize case and encode
-        // "open / no reason" as absent.
-        if let Some(reason) = issue.state_reason.as_deref().filter(|r| !r.is_empty()) {
-            properties["state_reason"] = json!(reason.to_ascii_lowercase());
-        }
-
-        if let Err(e) = registry
-            .dispatch(
-                "create",
-                json!({
-                    "kind": "issue",
-                    "content": content,
-                    "properties": properties,
-                    "annotates": [project_id.to_string()],
-                }),
-            )
-            .await
-        {
-            report
-                .warnings
-                .push(format!("create issue #{}: {e}", issue.number));
-            cursor_stalled = true;
-            continue;
-        }
-
-        report.issues_ingested += 1;
-        if !cursor_stalled {
-            if let Some(u) = &issue.updated_at {
-                if max_updated
-                    .as_deref()
-                    .map(|m| u.as_str() > m)
-                    .unwrap_or(true)
-                {
-                    max_updated = Some(u.clone());
-                }
+        match decide_page_outcome(
+            page_len,
+            floor.as_deref(),
+            last_updated_at.as_deref(),
+            budget.exhausted(),
+        ) {
+            PageOutcome::WindowComplete => break 'paging,
+            PageOutcome::StopBudgetExhausted | PageOutcome::StopFloorStalled => {
+                window_complete = false;
+                break 'paging;
             }
+            PageOutcome::Continue(next_floor) => floor = Some(next_floor),
         }
+    }
+
+    if !window_complete {
+        report.done = false;
     }
 
     if let Some(cursor) = max_updated {
         write_cursor(runtime, project_id, "issues", &cursor).await?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod paging_tests {
+    use super::*;
+
+    #[test]
+    fn search_query_omits_updated_qualifier_with_no_floor() {
+        assert_eq!(search_query(None), "sort:updated-asc");
+    }
+
+    #[test]
+    fn search_query_includes_inclusive_updated_floor() {
+        assert_eq!(
+            search_query(Some("2024-01-01T00:00:00Z")),
+            "sort:updated-asc updated:>=2024-01-01T00:00:00Z"
+        );
+    }
+
+    #[test]
+    fn short_page_proves_window_complete_regardless_of_budget() {
+        let outcome = decide_page_outcome(42, None, Some("2024-01-01T00:00:00Z"), false);
+        assert_eq!(outcome, PageOutcome::WindowComplete);
+        assert!(page_outcome_proves_window_complete(outcome));
+
+        // Even a page that runs out of budget mid-way is still a proof of
+        // completeness if the page itself was short — the loop always
+        // finishes sorting/processing the whole (short) page first.
+        let outcome = decide_page_outcome(0, None, None, true);
+        assert_eq!(outcome, PageOutcome::WindowComplete);
+    }
+
+    /// This is the exact ADR-088 Amendment 1 fix-round High-1 scenario: a
+    /// full (`PAGE_LIMIT`-sized) page came back, but the local budget was
+    /// NOT exhausted (e.g. every record in the page already existed and
+    /// consumed no budget) and paging is still forced to stop because the
+    /// floor didn't move. `done` must be false here — the remote window is
+    /// not proven exhausted just because the local budget wasn't hit.
+    #[test]
+    fn full_page_with_stalled_floor_is_not_window_complete_even_with_budget_left() {
+        let outcome = decide_page_outcome(PAGE_LIMIT, Some("X"), Some("X"), false);
+        assert_eq!(outcome, PageOutcome::StopFloorStalled);
+        assert!(!page_outcome_proves_window_complete(outcome));
+    }
+
+    #[test]
+    fn full_page_with_advancing_floor_and_budget_left_continues() {
+        let outcome = decide_page_outcome(PAGE_LIMIT, Some("A"), Some("B"), false);
+        assert_eq!(outcome, PageOutcome::Continue("B".to_string()));
+        assert!(!page_outcome_proves_window_complete(outcome));
+    }
+
+    #[test]
+    fn full_page_with_exhausted_budget_stops_without_proving_completeness() {
+        let outcome = decide_page_outcome(PAGE_LIMIT, Some("A"), Some("B"), true);
+        assert_eq!(outcome, PageOutcome::StopBudgetExhausted);
+        assert!(!page_outcome_proves_window_complete(outcome));
+    }
+
+    #[test]
+    fn full_page_with_no_updated_at_stalls_rather_than_looping_forever() {
+        let outcome = decide_page_outcome(PAGE_LIMIT, Some("A"), None, false);
+        assert_eq!(outcome, PageOutcome::StopFloorStalled);
+    }
 }
