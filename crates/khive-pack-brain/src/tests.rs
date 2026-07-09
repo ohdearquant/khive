@@ -6126,7 +6126,217 @@ mod event_counts_tests {
             .await
             .expect_err("since is required");
 
-        assert!(matches!(err, RuntimeError::InvalidInput(_)));
+        match &err {
+            RuntimeError::InvalidInput(msg) => {
+                assert!(
+                    msg.contains("since"),
+                    "error must name the missing field: {msg}"
+                );
+                assert!(
+                    msg.to_ascii_lowercase().contains("iso-8601")
+                        || msg.to_ascii_lowercase().contains("rfc-3339")
+                        || msg.to_ascii_lowercase().contains("rfc3339"),
+                    "error must name the expected format: {msg}"
+                );
+                assert!(
+                    msg.contains("2026-07-01T00:00:00Z") || msg.contains("T00:00:00Z"),
+                    "error must include an example datetime: {msg}"
+                );
+            }
+            other => panic!("expected InvalidInput, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn work_class_split_reads_phase_payload_not_resource_fallback() {
+        let (pack, rt) = make_pack();
+        let registry = empty_registry();
+        let token = rt.authorize(Namespace::local()).unwrap();
+
+        // Today's real shape: work_class lives directly on the Phase* payload
+        // (khive_storage::telemetry::PhaseStartedPayload / PhaseCompletedPayload).
+        seed_event(
+            &rt,
+            &token,
+            "ann_warm",
+            EventKind::PhaseStarted,
+            "lambda:khive",
+            1_000_000,
+            json!({"work_class": "warm", "phase": "ann_warm", "corpus_size": 553_000}),
+        )
+        .await;
+        seed_event(
+            &rt,
+            &token,
+            "ann_warm",
+            EventKind::PhaseCompleted,
+            "lambda:khive",
+            1_000_000,
+            json!({"work_class": "warm", "phase": "ann_warm", "wall_us": 41_000_000, "cpu_us": null}),
+        )
+        .await;
+        // A different work_class, distinct kind, so the split can't be faked by
+        // just echoing counts_by_kind.
+        seed_event(
+            &rt,
+            &token,
+            "ann_warm",
+            EventKind::PhaseStarted,
+            "lambda:khive",
+            1_000_000,
+            json!({"work_class": "maintenance", "phase": "index_rebuild"}),
+        )
+        .await;
+        // A non-phase event with no work_class anywhere — must not appear in the split.
+        seed_event(
+            &rt,
+            &token,
+            "search",
+            EventKind::SearchExecuted,
+            "lambda:khive",
+            1_000_000,
+            json!({}),
+        )
+        .await;
+        // Future shape: work_class nested under `resource`, no top-level `work_class`.
+        // Must be picked up via the fallback path, not just the phase path.
+        seed_event(
+            &rt,
+            &token,
+            "recall",
+            EventKind::RecallExecuted,
+            "lambda:khive",
+            1_000_000,
+            json!({"resource": {"work_class": "interactive"}}),
+        )
+        .await;
+        // Both paths present: phase path must win (checked first).
+        seed_event(
+            &rt,
+            &token,
+            "ann_warm",
+            EventKind::PhaseStarted,
+            "lambda:khive",
+            1_000_000,
+            json!({"work_class": "warm", "resource": {"work_class": "maintenance"}}),
+        )
+        .await;
+
+        let result = pack
+            .dispatch(
+                "brain.event_counts",
+                json!({"since": micros_to_iso(0)}),
+                &registry,
+                &token,
+            )
+            .await
+            .expect("brain.event_counts must succeed");
+
+        assert_eq!(result["total"], json!(6), "got: {result}");
+        assert_eq!(
+            result["counts_by_work_class"]["warm"],
+            json!(3),
+            "phase-path warm rows (2 pure + 1 dual-path, phase wins) must all count as warm: {result}"
+        );
+        assert_eq!(
+            result["counts_by_work_class"]["maintenance"],
+            json!(1),
+            "the dual-path row must count under warm (phase path), not maintenance \
+             (resource fallback) — phase path must be checked first: {result}"
+        );
+        assert_eq!(
+            result["counts_by_work_class"]["interactive"],
+            json!(1),
+            "resource.work_class fallback must be read when no top-level work_class exists: {result}"
+        );
+        // search_executed carried no work_class anywhere -> excluded from the split,
+        // not zero-filled, so the split total (5) is less than the overall total (6).
+        let split_total: u64 = result["counts_by_work_class"]
+            .as_object()
+            .expect("counts_by_work_class must be an object")
+            .values()
+            .map(|v| v.as_u64().unwrap())
+            .sum();
+        assert_eq!(
+            split_total, 5,
+            "events with neither work_class path present must be excluded, not counted: {result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn work_class_split_absent_when_no_event_carries_it() {
+        let (pack, rt) = make_pack();
+        let registry = empty_registry();
+        let token = rt.authorize(Namespace::local()).unwrap();
+
+        seed_event(
+            &rt,
+            &token,
+            "search",
+            EventKind::SearchExecuted,
+            "lambda:a",
+            1_000_000,
+            json!({}),
+        )
+        .await;
+
+        let result = pack
+            .dispatch(
+                "brain.event_counts",
+                json!({"since": micros_to_iso(0)}),
+                &registry,
+                &token,
+            )
+            .await
+            .expect("brain.event_counts must succeed");
+
+        assert!(
+            result.get("counts_by_work_class").is_none(),
+            "counts_by_work_class must be omitted, not an empty object, when no event in \
+             the window carries a work_class: {result}"
+        );
+    }
+
+    /// `cost_unit` does not exist on any event payload in the codebase today (ADR-103
+    /// Stage 0 defines it; no Stage 1 producer emits it yet). This verb must not invent
+    /// a `cost_unit` key — asserts its literal absence from the response shape so a
+    /// future producer landing the field is a deliberate response-shape change, not a
+    /// silent no-op this test would miss.
+    #[tokio::test]
+    async fn cost_unit_is_not_present_in_the_response() {
+        let (pack, rt) = make_pack();
+        let registry = empty_registry();
+        let token = rt.authorize(Namespace::local()).unwrap();
+
+        seed_event(
+            &rt,
+            &token,
+            "ann_warm",
+            EventKind::PhaseCompleted,
+            "lambda:khive",
+            1_000_000,
+            json!({"work_class": "warm", "phase": "ann_warm", "wall_us": 1, "cpu_us": null}),
+        )
+        .await;
+
+        let result = pack
+            .dispatch(
+                "brain.event_counts",
+                json!({"since": micros_to_iso(0)}),
+                &registry,
+                &token,
+            )
+            .await
+            .expect("brain.event_counts must succeed");
+
+        assert!(
+            result.get("cost_unit").is_none(),
+            "cost_unit must not appear anywhere at the top level: {result}"
+        );
+        assert!(
+            result.get("counts_by_cost_unit").is_none(),
+            "no cost_unit split must be surfaced until a producer emits the field: {result}"
+        );
     }
 
     #[test]

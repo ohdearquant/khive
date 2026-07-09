@@ -15,7 +15,7 @@ khive gives your agent:
 9. **Brain** — Bayesian profile tuning from feedback signals
 10. **Session** — persist and resume agent-session records
 
-All 9 packs load by default. **75 public verbs** across the packs — the `git` pack
+All 9 packs load by default. **76 public verbs** across the packs — the `git` pack
 (commit/issue/pull_request provenance notes, populated by a batch ingester, not agent-facing
 verbs) contributes no new verb (regenerate via `request(ops="verbs()")` before editing this
 line).
@@ -120,16 +120,17 @@ Composite scores are always in [0,1]. Typical production floor: 0.3-0.7.
 | `brain.bindings`         | List binding rows                                                 | Audit profile routing                                      |
 | `brain.register_adapter` | Register an adapter integrity record                              | Gate adapter composition to the active base-model revision |
 
-### Comm pack — 6 verbs (`comm.` prefix)
+### Comm pack — 7 verbs (`comm.` prefix)
 
-| Verb          | What it does                           | When to use                              |
-| ------------- | -------------------------------------- | ---------------------------------------- |
-| `comm.send`   | Send a message (optionally threaded)   | Inter-agent or inter-namespace messaging |
-| `comm.inbox`  | List inbound messages                  | Check what's waiting                     |
-| `comm.read`   | Mark an **inbound** message as read    | Acknowledge receipt (recipient action)   |
-| `comm.reply`  | Reply to a message (threading linkage) | Respond in-thread                        |
-| `comm.thread` | Retrieve full conversation thread      | Read the whole conversation              |
-| `comm.health` | Per-channel health snapshot (no args)  | Check daemon channel-poll state          |
+| Verb          | What it does                                                           | When to use                                   |
+| ------------- | ---------------------------------------------------------------------- | --------------------------------------------- |
+| `comm.send`   | Send a message (optionally threaded)                                   | Inter-agent or inter-namespace messaging      |
+| `comm.inbox`  | List inbound messages                                                  | Check what's waiting                          |
+| `comm.read`   | Mark an **inbound** message as read                                    | Acknowledge receipt (recipient action)        |
+| `comm.reply`  | Reply to a message (threading linkage)                                 | Respond in-thread                             |
+| `comm.thread` | Retrieve full conversation thread                                      | Read the whole conversation                   |
+| `comm.health` | Per-channel health snapshot (no args)                                  | Check daemon channel-poll state               |
+| `comm.probe`  | Read-only poll for new inbound message metadata and stale unread count | Cheap wake-up check without a full inbox scan |
 
 **Inbox shape (ADR-057).** `comm.inbox` is scannable: each entry carries top-level `from`, `to`,
 `subject`, `read`, `direction`, and a derived `preview` (whitespace-collapsed, truncated to 80

@@ -72,7 +72,11 @@ pub(crate) static BRAIN_HANDLERS: &[HandlerDef] = &[
         name: "brain.event_counts",
         description: "Windowed event counts grouped by kind and actor over the event plane \
             (ADR-103 Stage 1, #724 Ask A); feedback_explicit events additionally split by \
-            served_by_profile_id.",
+            served_by_profile_id; events carrying a work_class (today: phase_started / \
+            phase_completed / phase_cancelled payloads, checked before any future \
+            payload.resource.work_class) split by counts_by_work_class. cost_unit is not \
+            surfaced: it does not exist on any event payload yet (ADR-103 Stage 0 design-only) \
+            and will be added once a resource payload carries it.",
         visibility: khive_types::Visibility::Verb,
         category: khive_types::VerbCategory::Assertive,
         params: &[
@@ -664,7 +668,25 @@ impl BrainPack {
     // ── brain.event_counts ──────────────────────────────────────────────────
     //
     // ADR-103 Stage 1 (#724 Ask A): a windowed, per-actor, per-kind read verb
-    // over the event plane. Named `brain.event_counts` rather than the literal
+    // over the event plane, additionally surfacing `work_class`
+    // (ADR-103-resource-attribution-model.md:303) via `counts_by_work_class`.
+    // `work_class` is read from `payload.work_class` first — the shape the
+    // three Phase* events (`PhaseStarted`/`PhaseCompleted`/`PhaseCancelled`,
+    // `khive_storage::telemetry`) use today — falling back to
+    // `payload.resource.work_class` for the not-yet-emitted future shape
+    // where a generic audit row carries a `resource` sub-object (ADR-103
+    // Stage 1's "resource payload enrichment", still open). Events with
+    // neither path present are simply not counted in the split.
+    // `cost_unit` is NOT surfaced: as of this PR no event payload carries it
+    // anywhere in the codebase (ADR-103 Stage 0 defines it; Stage 1's
+    // resource-payload work has not landed a `cost_unit` field on any
+    // producer yet). Surfacing a field that no event can ever populate today
+    // would be a documentation lie dressed as a response key; once a
+    // producer emits `cost_unit` (under `payload.resource.cost_unit`, by the
+    // same convention as `work_class`), this verb should sum it the same way
+    // `counts_by_work_class` groups `work_class`.
+    //
+    // Named `brain.event_counts` rather than the literal
     // `brain.events(...)` shape sketched on the issue — that name is already
     // taken by the `Visibility::Subhandler` debug-listing verb above, which an
     // MCP-boundary test (`subhandler_verbs_are_blocked_at_mcp_boundary`)
@@ -695,13 +717,23 @@ impl BrainPack {
         struct EventCountsParams {
             actor: Option<String>,
             kind: Option<String>,
-            since: String,
+            // `Option`, not a required `String`: a bare-missing `since` must go through
+            // the same named-field-plus-example-format error as a malformed one, not
+            // serde's generic "missing field `since`" message.
+            since: Option<String>,
             until: Option<String>,
         }
         let p: EventCountsParams = serde_json::from_value(params)
             .map_err(|e| RuntimeError::InvalidInput(e.to_string()))?;
 
-        let since_us = parse_rfc3339_micros("since", &p.since)?;
+        let since_raw = p.since.as_deref().ok_or_else(|| {
+            RuntimeError::InvalidInput(
+                "missing `since`: required ISO-8601/RFC-3339 datetime; expected e.g. \
+                 \"2026-07-01T00:00:00Z\""
+                    .to_string(),
+            )
+        })?;
+        let since_us = parse_rfc3339_micros("since", since_raw)?;
         let until_us = match p.until.as_deref() {
             Some(u) => parse_rfc3339_micros("until", u)?,
             None => Utc::now().timestamp_micros(),
@@ -748,6 +780,8 @@ impl BrainPack {
             std::collections::BTreeMap::new();
         let mut by_profile: std::collections::BTreeMap<String, u64> =
             std::collections::BTreeMap::new();
+        let mut counts_by_work_class: std::collections::BTreeMap<String, u64> =
+            std::collections::BTreeMap::new();
 
         for event in &page.items {
             *counts_by_kind
@@ -762,6 +796,11 @@ impl BrainPack {
                     .unwrap_or("unspecified")
                     .to_string();
                 *by_profile.entry(profile).or_insert(0) += 1;
+            }
+            if let Some(work_class) = event_work_class(&event.payload) {
+                *counts_by_work_class
+                    .entry(work_class.to_string())
+                    .or_insert(0) += 1;
             }
         }
 
@@ -778,6 +817,9 @@ impl BrainPack {
         });
         if !by_profile.is_empty() {
             result["by_profile"] = json!(by_profile);
+        }
+        if !counts_by_work_class.is_empty() {
+            result["counts_by_work_class"] = json!(counts_by_work_class);
         }
         Ok(result)
     }
@@ -2213,6 +2255,31 @@ fn parse_rfc3339_micros(field: &'static str, value: &str) -> Result<i64, Runtime
                 "invalid `{field}`: {value:?} is not a valid ISO-8601/RFC-3339 datetime ({e}); \
                  expected e.g. \"2026-07-01T00:00:00Z\""
             ))
+        })
+}
+
+/// Extract `work_class` from an event payload for `brain.event_counts`'
+/// `counts_by_work_class` split (ADR-103 Stage 1, ADR-103-resource-attribution-model.md:303).
+///
+/// Checks two paths, phase-payload first:
+/// 1. `payload.work_class` — the shape `PhaseStarted`/`PhaseCompleted`/`PhaseCancelled`
+///    events use today (`khive_storage::telemetry::{PhaseStartedPayload, ...}`).
+/// 2. `payload.resource.work_class` — the not-yet-emitted shape a generic audit row would
+///    use once ADR-103 Stage 1's "resource payload enrichment" lands `work_class` on
+///    non-phase events too. No producer writes this today; the fallback exists so this
+///    verb does not need a second change when one starts.
+///
+/// Returns `None` (silently excluded from the split, not an error) when neither path is
+/// present — the overwhelming majority of event kinds today.
+fn event_work_class(payload: &Value) -> Option<&str> {
+    payload
+        .get("work_class")
+        .and_then(Value::as_str)
+        .or_else(|| {
+            payload
+                .get("resource")
+                .and_then(|resource| resource.get("work_class"))
+                .and_then(Value::as_str)
         })
 }
 
