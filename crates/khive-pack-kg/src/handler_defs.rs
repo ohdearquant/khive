@@ -14,7 +14,7 @@ use serde_json::Value;
 use khive_runtime::{RuntimeError, VerbRegistry};
 use khive_types::{HandlerDef, ParamDef, VerbCategory, Visibility};
 
-pub(crate) static KG_HANDLERS: [HandlerDef; 17] = [
+pub(crate) static KG_HANDLERS: [HandlerDef; 18] = [
     // Commissive: commits an entity or note to the namespace
     HandlerDef {
         name: "create",
@@ -775,6 +775,47 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 17] = [
                 param_type: "string",
                 required: false,
                 description: "Optional reason for withdrawing the proposal.",
+            },
+        ],
+    },
+    // Assertive: deterministic natural-language reference resolution
+    // (unified-verb draft ADR, Slice 1). Read-only — never mutates, never
+    // executes a plan; `ask` (a later slice) is the write-planning entrance.
+    HandlerDef {
+        name: "resolve",
+        description: "Resolve natural-language references to ids. Each ref in \
+                       `refs` is resolved through: (1) id-string passthrough \
+                       (UUID / 8+ hex prefix) via the existing by-ID path; \
+                       (2) this actor's recently-referenced ring; (3) hybrid \
+                       search over the namespace. Returns one of \
+                       Resolved{id,confidence} | Ambiguous{candidates} | \
+                       NotFound per ref — never a silent pick among close \
+                       candidates. Read-only: performs no mutation.",
+        visibility: Visibility::Verb,
+        category: VerbCategory::Assertive,
+        params: &[
+            ParamDef {
+                name: "refs",
+                param_type: "array of string",
+                required: true,
+                description: "Natural-language references to resolve (e.g. \
+                              \"the old record\", a UUID, a short hex prefix, \
+                              or an exact entity name).",
+            },
+            ParamDef {
+                name: "kind",
+                param_type: "string",
+                required: false,
+                description: "Restrict the hybrid-search fallback (stage 3) \
+                              to an entity kind (e.g. \"concept\", \"project\"). \
+                              Has no effect on the id-string or ring stages.",
+            },
+            ParamDef {
+                name: "limit",
+                param_type: "integer",
+                required: false,
+                description: "Max candidates returned per ref from the \
+                              hybrid-search fallback. Default 5, max 20.",
             },
         ],
     },

@@ -276,6 +276,14 @@ pub(crate) struct ListProposalsParams {
     pub(crate) offset: Option<u32>,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ResolveParams {
+    pub(crate) refs: Vec<String>,
+    pub(crate) kind: Option<String>,
+    pub(crate) limit: Option<u32>,
+}
+
 pub(crate) fn tri_f64<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Option<f64>>, D::Error> {
     Ok(Some(Option::deserialize(d)?))
 }
