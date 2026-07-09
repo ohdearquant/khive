@@ -284,15 +284,17 @@ impl MemoryPack {
 
         // `entity_names` feeds the `EntityMatch` ×1.3 boost in `default_adjustments`
         // (scoring.rs). It used to be purely caller-supplied and no caller ever
-        // populated it, leaving the boost dead code in practice. When the caller
-        // omits it (or passes an empty list), auto-extract candidates from the
-        // query itself — see `extract_entity_candidates` for the extraction rule
-        // and why it's grounded in how `EntityMatch` actually matches. An
-        // explicit, non-empty `entity_names` from the caller always wins; this
-        // path only fills the empty case, it never overrides caller input.
-        let entity_names: Vec<String> = match p.entity_names.as_deref() {
-            Some(names) if !names.is_empty() => names.iter().map(|s| s.to_lowercase()).collect(),
-            _ => extract_entity_candidates(query_trimmed),
+        // populated it, leaving the boost dead code in practice. Opt-out
+        // semantics: `Some(_)` — including `Some([])` — is explicit caller
+        // intent and is always honored verbatim (an empty explicit list means
+        // "no entity boost", not "auto-derive one for me"). Auto-extraction
+        // via `extract_entity_candidates` only runs on `None`, i.e. when the
+        // caller didn't send the field at all. See `extract_entity_candidates`
+        // for the extraction rule and why it's grounded in how `EntityMatch`
+        // actually matches.
+        let entity_names: Vec<String> = match &p.entity_names {
+            Some(names) => names.iter().map(|s| s.to_lowercase()).collect(),
+            None => extract_entity_candidates(query_trimmed),
         };
 
         struct ScoredNote {
@@ -1375,70 +1377,133 @@ mod tests {
 
     // ── Auto entity-name extraction (dead `entity_names` parameter fix) ────────
 
-    /// `#[serial(background_tasks)]`: non-empty recall — see the note on
-    /// `recall_with_dollar_sign_query_does_not_error` above.
+    /// Dispatches `memory.recall` against a fresh single-note corpus and
+    /// returns the sole hit's `rank_score`.
     ///
-    /// The query names a capitalized proper noun ("Zenlake") that also appears
-    /// verbatim in one of the two candidate notes' content. With no
-    /// `entity_names` supplied, `extract_entity_candidates` derives `["zenlake"]`
-    /// server-side, so `calculate_score`'s EntityMatch adjustment applies its
-    /// ×1.3 multiplier only to the note that mentions it — pushing it above an
-    /// otherwise-comparable distractor note that doesn't. This exercises the
-    /// full wiring (`handle_recall` → `extract_entity_candidates` →
-    /// `calculate_score`), not just the scoring-layer unit tests in
-    /// `scoring.rs`.
-    #[tokio::test]
-    #[serial(background_tasks)]
-    async fn recall_auto_extracted_entity_boosts_matching_memory_above_distractor() {
+    /// `entity_names`: `None` omits the request field entirely (the JSON key
+    /// is absent, so `RecallParams::entity_names` deserializes to `None` —
+    /// auto-extraction runs). `Some(&[])` sends an explicit empty JSON array
+    /// (`RecallParams::entity_names` deserializes to `Some(vec![])` —
+    /// explicit opt-out, auto-extraction must NOT run). `Some(&[..])`
+    /// non-empty sends explicit names verbatim.
+    ///
+    /// A single-note corpus + forced RRF fusion keeps retrieval-stage
+    /// relevance identical across calls (fusion/RRF normalization does not
+    /// consult `entity_names`; with one hit, `normalize_rrf_scores` collapses
+    /// to the constant `baseline_relevance + range`), so any `rank_score`
+    /// difference between calls is attributable to the EntityMatch scoring
+    /// adjustment alone — not to a query term also moving retrieval-stage
+    /// rank (the two-item-corpus percentile-normalization confound: see the
+    /// design note below).
+    async fn dispatch_single_note_recall(
+        content: &str,
+        query: &str,
+        entity_names: Option<&[&str]>,
+    ) -> f64 {
         let rt = KhiveRuntime::memory().expect("in-memory runtime");
         let ns = Namespace::parse("local").expect("local namespace");
         let token = rt.authorize(ns).expect("authorize local");
-
-        rt.create_note(
-            &token,
-            "memory",
-            None,
-            "the committee reviewed the proposal from Zenlake last week",
-            Some(0.5),
-            None,
-            vec![],
-        )
-        .await
-        .expect("create matching note");
-        rt.create_note(
-            &token,
-            "memory",
-            None,
-            "the committee reviewed the proposal last week",
-            Some(0.5),
-            None,
-            vec![],
-        )
-        .await
-        .expect("create distractor note");
+        rt.create_note(&token, "memory", None, content, Some(0.5), None, vec![])
+            .await
+            .expect("create note");
 
         let mut builder = VerbRegistryBuilder::new();
         builder.register(KgPack::new(rt.clone()));
         builder.register(MemoryPack::new(rt.clone()));
         let registry = builder.build().expect("registry");
 
+        let mut params = serde_json::json!({
+            "query": query,
+            "fusion_strategy": "rrf",
+            "limit": 10
+        });
+        if let Some(names) = entity_names {
+            params["entity_names"] = serde_json::json!(names);
+        }
+
         let result = registry
-            .dispatch(
-                "memory.recall",
-                serde_json::json!({
-                    "query": "committee proposal Zenlake",
-                    "limit": 10
-                }),
-            )
+            .dispatch("memory.recall", params)
             .await
             .expect("memory.recall");
-
         let hits = result.as_array().expect("bare array result");
-        assert_eq!(hits.len(), 2, "both candidate notes must be recalled");
-        let top_content = hits[0]["content"].as_str().unwrap_or_default();
+        assert_eq!(hits.len(), 1, "single-note corpus must yield one hit");
+        hits[0]["rank_score"].as_f64().expect("rank_score")
+    }
+
+    /// `#[serial(background_tasks)]`: non-empty recall — see the note on
+    /// `recall_with_dollar_sign_query_does_not_error` above.
+    ///
+    /// Proves the full wiring (`handle_recall` → `extract_entity_candidates`
+    /// → `calculate_score`) by comparing `rank_score` for the *same*
+    /// single-note corpus and query, varying only `entity_names`:
+    /// - `entity_names` omitted (`None`) → `extract_entity_candidates`
+    ///   derives `["zenlake"]` from the capitalized query token, which
+    ///   matches the note's content → EntityMatch fires.
+    /// - explicit empty list (`Some([])`) → opt-out, auto-extraction does
+    ///   not run → EntityMatch does not fire.
+    ///
+    /// An earlier version of this test instead compared two *different*
+    /// notes (one mentioning the entity, one not) and asserted ranking
+    /// order. Review correctly flagged that as non-vacuous-looking but
+    /// actually weak: the entity term is, by construction, also a query
+    /// term, so it already changes retrieval-stage relevance independent of
+    /// the EntityMatch adjustment — the test would still pass if
+    /// auto-extraction were deleted entirely. Comparing the *same*
+    /// single-hit corpus/query across two calls (only `entity_names`
+    /// differing) isolates the scoring-stage effect and asserts the exact
+    /// ×1.3 ratio directly, so it fails if auto-extraction stops firing.
+    #[tokio::test]
+    #[serial(background_tasks)]
+    async fn recall_auto_extraction_from_capitalized_query_fires_entity_match() {
+        const CONTENT: &str = "the committee reviewed the proposal from Zenlake last week";
+        const QUERY: &str = "committee proposal Zenlake";
+
+        let auto_score = dispatch_single_note_recall(CONTENT, QUERY, None).await;
+        let opted_out_score = dispatch_single_note_recall(CONTENT, QUERY, Some(&[])).await;
+
         assert!(
-            top_content.contains("Zenlake"),
-            "the note mentioning the auto-extracted entity name must rank first, got: {hits:#?}"
+            auto_score > opted_out_score,
+            "auto-extraction (entity_names omitted) must boost the score \
+             above the explicit-opt-out baseline: auto={auto_score} \
+             opted_out={opted_out_score}"
+        );
+        let ratio = auto_score / opted_out_score;
+        assert!(
+            (ratio - 1.3).abs() < 0.01,
+            "expected ~1.3x lift from EntityMatch firing on the \
+             auto-extracted candidate, got ratio {ratio}"
+        );
+    }
+
+    /// `#[serial(background_tasks)]`: non-empty recall — see the note on
+    /// `recall_with_dollar_sign_query_does_not_error` above.
+    ///
+    /// [High-2 regression] `entity_names: []` is explicit caller intent
+    /// ("no entity boost"), distinct from omitting the field. This uses the
+    /// exact corpus/query from the sibling test above — where omitting
+    /// `entity_names` auto-extracts `"zenlake"` and fires EntityMatch — and
+    /// proves that sending `Some([])` disables the boost instead of being
+    /// treated the same as `None` (which would silently re-enable
+    /// auto-extraction and leave callers with no way to opt out).
+    #[tokio::test]
+    #[serial(background_tasks)]
+    async fn recall_explicit_empty_entity_names_disables_boost_where_auto_extraction_would_fire() {
+        const CONTENT: &str = "the committee reviewed the proposal from Zenlake last week";
+        const QUERY: &str = "committee proposal Zenlake";
+
+        let opted_out_score = dispatch_single_note_recall(CONTENT, QUERY, Some(&[])).await;
+        // A query/content pair with no entity-boost opportunity at all
+        // (all-stopword query → `extract_entity_candidates` yields nothing
+        // even on `None`) establishes the true "no boost applied" baseline
+        // score for comparison, independent of any entity-extraction path.
+        let never_boosted_baseline =
+            dispatch_single_note_recall("is it for me too", "is it for me", None).await;
+
+        assert!(
+            (opted_out_score - never_boosted_baseline).abs() < 1e-4,
+            "explicit entity_names: [] must land on the same unboosted score \
+             as a query that never had an entity candidate to begin with: \
+             opted_out={opted_out_score} baseline={never_boosted_baseline}"
         );
     }
 
@@ -1449,64 +1514,20 @@ mod tests {
     /// query — a query built entirely out of `ENTITY_STOPWORDS` tokens, so
     /// `extract_entity_candidates` deterministically yields an *empty* list
     /// (see `extract_entity_candidates_all_stopwords_returns_empty` in
-    /// scoring.rs) regardless of which extraction rule would otherwise apply.
-    /// The only way the note (whose content contains "glorptastic") can pick
-    /// up the EntityMatch ×1.3 boost is if the handler passes the caller's
-    /// explicit, query-unrelated `entity_names` straight through instead of
-    /// (re-)deriving candidates from the query. A single-note corpus keeps
-    /// retrieval-stage relevance identical across both calls (fusion/RRF
-    /// normalization does not consult `entity_names`), so any score
-    /// difference is attributable to the scoring-stage adjustment alone —
-    /// avoiding the two-candidate rank-normalization confound (a real two-item
-    /// corpus's percentile normalization dominates any single scoring
-    /// adjustment; see the sibling test above, which instead relies on the
-    /// entity term also being a genuine shared query/content term to move
-    /// retrieval-stage rank).
+    /// scoring.rs). The only way the note (whose content contains
+    /// "glorptastic") can pick up the EntityMatch ×1.3 boost is if the
+    /// handler passes the caller's explicit, non-empty, query-unrelated
+    /// `entity_names` straight through instead of (re-)deriving candidates
+    /// from the query.
     #[tokio::test]
     #[serial(background_tasks)]
-    async fn recall_explicit_entity_names_suppresses_auto_extraction() {
+    async fn recall_explicit_nonempty_entity_names_suppresses_auto_extraction() {
         const QUERY: &str = "is it for me"; // every token is an ENTITY_STOPWORDS entry
         const CONTENT: &str = "is it for me glorptastic";
 
-        async fn dispatch_recall(entity_names: Option<&[&str]>) -> f64 {
-            let rt = KhiveRuntime::memory().expect("in-memory runtime");
-            let ns = Namespace::parse("local").expect("local namespace");
-            let token = rt.authorize(ns).expect("authorize local");
-            rt.create_note(&token, "memory", None, CONTENT, Some(0.5), None, vec![])
-                .await
-                .expect("create note");
-
-            let mut builder = VerbRegistryBuilder::new();
-            builder.register(KgPack::new(rt.clone()));
-            builder.register(MemoryPack::new(rt.clone()));
-            let registry = builder.build().expect("registry");
-
-            let mut params = serde_json::json!({
-                "query": QUERY,
-                // Force RRF fusion: with a single hit, RRF normalization
-                // (`normalize_rrf_scores`) collapses to the constant
-                // `baseline_relevance + range`, decoupling relevance from
-                // the underlying raw fused score — so both calls land on
-                // an identical pre-adjustment relevance regardless of any
-                // incidental scoring differences between runs.
-                "fusion_strategy": "rrf",
-                "limit": 10
-            });
-            if let Some(names) = entity_names {
-                params["entity_names"] = serde_json::json!(names);
-            }
-
-            let result = registry
-                .dispatch("memory.recall", params)
-                .await
-                .expect("memory.recall");
-            let hits = result.as_array().expect("bare array result");
-            assert_eq!(hits.len(), 1, "single-note corpus must yield one hit");
-            hits[0]["rank_score"].as_f64().expect("rank_score")
-        }
-
-        let auto_extracted_score = dispatch_recall(None).await;
-        let explicit_score = dispatch_recall(Some(&["glorptastic"])).await;
+        let auto_extracted_score = dispatch_single_note_recall(CONTENT, QUERY, None).await;
+        let explicit_score =
+            dispatch_single_note_recall(CONTENT, QUERY, Some(&["glorptastic"])).await;
 
         assert!(
             explicit_score > auto_extracted_score,
