@@ -9,7 +9,10 @@ ADR-017 (Pack Standard — `NOTE_KINDS`, `NoteKindSpec`, `KindHook`), ADR-085 (C
 `finding` note kind and its Alternative A7, directly reconciled below)\
 **Related**: ADR-010 (KG Versioning — "khive does not build a GitHub replacement"),
 ADR-087 (Workspace Mirror — sibling background-ingestion pattern this pack's ingester
-reuses)
+reuses)\
+**Amended by**: [Amendment 1](ADR-088-amendment-1-git-digest.md) — `git.digest` agent-facing
+verb with remote-URL support (supersedes the "no new agent-facing verbs" clause for this
+one verb; adds reference-edge extraction and note naming at ingest)
 
 ## Context
 
