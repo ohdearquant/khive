@@ -42,6 +42,14 @@ pub(crate) struct AnnBridge {
     /// Used by the recall retry gate to short-circuit when the global index
     /// contains no vectors outside the caller's visible namespace set.
     pub(crate) namespace_set: HashSet<String>,
+    /// Write-generation this build's corpus snapshot was taken at or after
+    /// (#750). Captured from `AnnState::generations` BEFORE the corpus scan
+    /// begins — see `ensure_ann_for_model_inner`. Cache installation compares
+    /// this against the currently-installed entry's generation instead of
+    /// blindly `or_insert`-ing, so a build that snapshotted a stale (older)
+    /// corpus can never clobber an already-installed fresher build, and a
+    /// build that snapshotted a fresher corpus always wins.
+    pub(crate) generation: u64,
 }
 
 /// Shared ANN state: per-`(namespace, model)` indexes with at-most-one-background-build guard.
@@ -57,6 +65,19 @@ pub(crate) struct AnnState {
     /// in-flight attempt to finish, so only one caller ever emits the
     /// `PhaseStarted`/`PhaseCompleted` pair for a given model.
     model_locks: Mutex<HashMap<AnnKey, Arc<tokio::sync::Mutex<()>>>>,
+    /// Monotonic per-model write-generation counter (#750). Bumped by
+    /// `bump_generation` whenever a write may have changed a model's corpus
+    /// (`memory.remember`'s affected-models loop, right where the old
+    /// `invalidate_namespace` clear already ran). `ensure_ann_for_model`
+    /// snapshots the current value for its model BEFORE doing anything else
+    /// — including before its own "already loaded" fast path and before the
+    /// corpus scan — and stamps it on the resulting `AnnBridge`. Cache
+    /// install then only replaces an existing entry when the candidate's
+    /// generation is >= the installed entry's, instead of the old
+    /// `entry(key).or_insert(...)`, which always kept whichever build
+    /// happened to acquire the per-model lock first even if it had
+    /// snapshotted a now-stale corpus.
+    generations: Mutex<HashMap<AnnKey, u64>>,
     /// Counts how many times `search_loaded` returned a warm hit. Test-only;
     /// call `reset_warm_route_count()` between operations to isolate counts.
     #[cfg(test)]
@@ -70,9 +91,76 @@ pub(crate) fn new_shared() -> SharedAnn {
         indexes: RwLock::new(HashMap::new()),
         warming: Mutex::new(HashSet::new()),
         model_locks: Mutex::new(HashMap::new()),
+        generations: Mutex::new(HashMap::new()),
         #[cfg(test)]
         warm_route_count: AtomicUsize::new(0),
     })
+}
+
+/// Bump `key`'s write-generation counter and return the NEW value (#750).
+/// Called by `memory.remember` for every model whose corpus the write may
+/// have affected, right alongside the existing cache invalidation.
+pub(crate) async fn bump_generation(ann: &SharedAnn, key: &AnnKey) -> u64 {
+    let mut gens = ann.generations.lock().await;
+    let slot = gens.entry(key.clone()).or_insert(0);
+    *slot += 1;
+    *slot
+}
+
+/// Read `key`'s current write-generation counter (0 if never bumped).
+async fn current_generation(ann: &SharedAnn, key: &AnnKey) -> u64 {
+    ann.generations.lock().await.get(key).copied().unwrap_or(0)
+}
+
+/// True when the currently-installed entry for `key` (if any) is fresh
+/// enough to satisfy a caller whose write-generation floor is
+/// `min_generation` — i.e. the installed build's own generation is >= what
+/// the caller needs. `Ok(None)`-style "cache miss" callers should treat
+/// `false` as "must (re)build", not merely "absent".
+async fn installed_is_fresh(ann: &SharedAnn, key: &AnnKey, min_generation: u64) -> bool {
+    ann.indexes
+        .read()
+        .await
+        .get(key)
+        .is_some_and(|b| b.generation >= min_generation)
+}
+
+/// True when the currently-cached entry for `key` (if any) reflects at
+/// least `key`'s latest recorded write generation (#750). Recall's
+/// cache-hit gate uses this instead of a bare presence check, so a stale
+/// entry left behind by a slow, superseded background build (one that lost
+/// the freshness race but still reached an empty cache slot first) is
+/// treated the same as a genuine cache miss — forcing the same
+/// `ensure_ann_for_model` fallback a true miss would take, instead of
+/// silently serving results that predate a write the caller can already
+/// see committed.
+pub(crate) async fn is_current(ann: &SharedAnn, key: &AnnKey) -> bool {
+    let target_generation = current_generation(ann, key).await;
+    installed_is_fresh(ann, key, target_generation).await
+}
+
+/// Install `candidate` into the cache for `key` UNLESS an entry is already
+/// present with a generation >= `candidate.generation` (#750). Replaces the
+/// old `entry(key).or_insert(candidate)`, which always kept whichever build
+/// happened to acquire the per-model lock and reach this call first — even
+/// one that snapshotted a now-stale corpus — and silently discarded a
+/// later, fresher build's result because `or_insert` is a no-op once the
+/// key is occupied.
+async fn install_if_fresher(ann: &SharedAnn, key: &AnnKey, candidate: AnnBridge) {
+    let mut idxs = ann.indexes.write().await;
+    match idxs.get(key) {
+        Some(existing) if existing.generation >= candidate.generation => {
+            tracing::debug!(
+                model = %key.model,
+                existing_generation = existing.generation,
+                candidate_generation = candidate.generation,
+                "memory ANN install skipped: cached entry is already >= this build's generation"
+            );
+        }
+        _ => {
+            idxs.insert(key.clone(), candidate);
+        }
+    }
 }
 
 /// Fetch (creating if absent) the per-model warm single-flight lock.
@@ -134,7 +222,19 @@ impl AnnBridge {
             index,
             id_map,
             namespace_set,
+            generation: 0,
         })
+    }
+
+    /// Stamp this build with the write-generation its corpus snapshot was
+    /// taken at or after (#750). Set unconditionally by every install path
+    /// in `ensure_ann_for_model_inner` before the compare-and-maybe-replace
+    /// install; defaults to `0` (oldest possible) so any construction path
+    /// that forgets to call this loses every generation comparison rather
+    /// than winning one it shouldn't.
+    pub(crate) fn with_generation(mut self, generation: u64) -> Self {
+        self.generation = generation;
+        self
     }
 
     pub(crate) fn search(&self, query: &[f32], k: usize) -> Result<Vec<(Uuid, f32)>, RuntimeError> {
@@ -185,6 +285,7 @@ impl AnnBridge {
             // Until then it is left empty, which causes the retry gate to be
             // conservative (assume the index may contain non-visible namespaces).
             namespace_set: HashSet::new(),
+            generation: 0,
         })
     }
 
@@ -311,8 +412,17 @@ pub(crate) async fn ensure_ann_background(
     }
     let key = AnnKey::from_token(token, model);
 
-    // Fast path: already loaded.
-    if ann.indexes.read().await.contains_key(&key) {
+    // #750: snapshot the write-generation floor BEFORE the fast path so a
+    // caller triggered by a write that just bumped the counter always sees
+    // its own write reflected here — a caller reading this after a write
+    // must never observe a lower floor than that write set.
+    let target_generation = current_generation(ann, &key).await;
+
+    // Fast path: already loaded AND fresh enough for this caller's write.
+    // A merely-present entry is not sufficient — a concurrent build that
+    // snapshotted an older corpus can still be sitting in the cache from a
+    // race that finished installing after this caller's write landed (#750).
+    if installed_is_fresh(ann, &key, target_generation).await {
         return false;
     }
 
@@ -415,8 +525,18 @@ pub(crate) async fn ensure_ann_for_model(
     }
     let key = AnnKey::from_token(token, model);
 
-    // Fast path: no lock needed if already warm.
-    if ann.indexes.read().await.contains_key(&key) {
+    // #750: capture the write-generation floor BEFORE anything else — before
+    // even the fast "already loaded" check — so a caller invoked right after
+    // a write (memory.remember bumps the counter, then calls this) always
+    // requires at least that write's generation from whatever it accepts as
+    // "fresh enough". Read-generation-first, snapshot-corpus-second is the
+    // ordering that closes the race: reversing it would let a write land
+    // between the corpus snapshot and the generation read, understating the
+    // floor and letting a build miss that write without detecting it.
+    let target_generation = current_generation(ann, &key).await;
+
+    // Fast path: no lock needed if already warm AND fresh enough.
+    if installed_is_fresh(ann, &key, target_generation).await {
         return Ok(AnnEnsureStatus::AlreadyLoaded);
     }
 
@@ -424,8 +544,9 @@ pub(crate) async fn ensure_ann_for_model(
     let _single_flight_guard = lock.lock().await;
 
     // Re-check after acquiring the lock: a concurrent caller may have
-    // finished warming this model while we were waiting for the guard.
-    if ann.indexes.read().await.contains_key(&key) {
+    // finished warming this model (with a generation >= ours) while we were
+    // waiting for the guard.
+    if installed_is_fresh(ann, &key, target_generation).await {
         return Ok(AnnEnsureStatus::AlreadyLoaded);
     }
 
@@ -462,7 +583,7 @@ pub(crate) async fn ensure_ann_for_model(
     )
     .await;
 
-    let result = ensure_ann_for_model_inner(rt, token, ann, model).await;
+    let result = ensure_ann_for_model_inner(rt, token, ann, model, target_generation).await;
 
     let wall_us = phase_start.elapsed().as_micros() as i64;
     let cpu_us = khive_runtime::cpu_delta_us(cpu_start, khive_runtime::process_resource_usage());
@@ -556,11 +677,12 @@ async fn ensure_ann_for_model_inner(
     token: &NamespaceToken,
     ann: &SharedAnn,
     model: &str,
+    target_generation: u64,
 ) -> Result<AnnEnsureStatus, RuntimeError> {
     let ns = "global";
     let key = AnnKey::new(ns, model);
 
-    if ann.indexes.read().await.contains_key(&key) {
+    if installed_is_fresh(ann, &key, target_generation).await {
         return Ok(AnnEnsureStatus::AlreadyLoaded);
     }
 
@@ -577,7 +699,8 @@ async fn ensure_ann_for_model_inner(
                             .await
                             .unwrap_or_default();
                         bridge.set_namespace_set(ns_set);
-                        ann.indexes.write().await.entry(key).or_insert(bridge);
+                        let bridge = bridge.with_generation(target_generation);
+                        install_if_fresher(ann, &key, bridge).await;
                         tracing::debug!(namespace = %ns, model = %model, "memory ANN loaded from snapshot");
                         return Ok(AnnEnsureStatus::LoadedSnapshot);
                     }
@@ -596,6 +719,16 @@ async fn ensure_ann_for_model_inner(
     }
 
     // Rebuild from vector store with double-fingerprint concurrency check.
+    // The fingerprint sandwich alone (compute before, scan, compute after)
+    // only bounds the SCAN window — it cannot see a write that lands after
+    // `fp_after` is read but before this build's `install_if_fresher` call
+    // below (e.g. during `persist_snapshot`'s I/O). The write-generation
+    // check closes that residual window: `target_generation` was captured
+    // in the caller BEFORE this whole attempt started, so a write landing
+    // after that point bumps the counter to a strictly higher value that a
+    // later, correctly-scoped rebuild will carry on its own bridge —
+    // `install_if_fresher` then refuses to let THIS (now-stale) build
+    // overwrite that later result, regardless of which one finishes first.
     let fp_before = compute_memory_fingerprint(rt, token, model).await;
     match load_and_build_from_vector_store(rt, token, model).await {
         Ok(Some(bridge)) => {
@@ -610,12 +743,13 @@ async fn ensure_ann_for_model_inner(
                 return Ok(AnnEnsureStatus::DiscardedStaleBuild);
             }
             let vector_count = bridge.id_map.len();
+            let bridge = bridge.with_generation(target_generation);
             if let Some(fingerprint) = fp_after {
                 if let Err(e) = persist_snapshot(rt, ns, model, &bridge, fingerprint).await {
                     tracing::warn!(error = %e, "failed to persist memory Vamana snapshot");
                 }
             }
-            ann.indexes.write().await.entry(key).or_insert(bridge);
+            install_if_fresher(ann, &key, bridge).await;
             tracing::debug!(namespace = %ns, model = %model, vectors = vector_count, "memory ANN index built");
             Ok(AnnEnsureStatus::Built {
                 vectors: vector_count,
@@ -1039,6 +1173,140 @@ mod tests {
             ann.warming.lock().await.is_empty(),
             "all warming guards must be cleared after invalidation"
         );
+    }
+
+    // ── #750: write-generation-checked install ──────────────────────────────
+    //
+    // The end-to-end race (a slow build snapshotting a stale corpus,
+    // finishing after a newer write's invalidate+re-warm cycle, and
+    // clobbering the cache) requires precise control over async task
+    // interleaving that no test-only pause hook currently exists for in
+    // `ensure_ann_for_model_inner` — adding one solely to force a specific
+    // schedule would test the hook, not the production code path. These
+    // tests instead pin down the exact invariant the fix depends on
+    // directly: `install_if_fresher`'s compare-and-replace semantics, and
+    // `is_current`'s stale-is-a-miss semantics. Both are unconditional,
+    // deterministic properties of the fix — no timing required to observe
+    // them — and the ns733/ns733b recall tests in `handlers/recall.rs`
+    // additionally exercise the real end-to-end `memory.remember` →
+    // `memory.recall` path stress-verified over 50 consecutive fresh-process
+    // runs each (see the #750 implementation report).
+
+    fn tiny_bridge(id: Uuid, generation: u64) -> AnnBridge {
+        AnnBridge::build(vec![1.0f32, 0.0, 0.0, 0.0], 4, vec![id], HashSet::new())
+            .expect("build tiny bridge")
+            .with_generation(generation)
+    }
+
+    /// A candidate with a STRICTLY OLDER generation than the currently
+    /// installed entry must never replace it. This is the exact shape of
+    /// the pre-#750 bug: a slow build (older generation) finishing after a
+    /// faster, newer-generation build already installed.
+    #[tokio::test]
+    async fn install_if_fresher_rejects_older_generation_candidate() {
+        let ann = new_shared();
+        let key = AnnKey::new("any-ns", "model-x");
+        let newer_id = Uuid::new_v4();
+        let older_id = Uuid::new_v4();
+
+        install_if_fresher(&ann, &key, tiny_bridge(newer_id, 5)).await;
+        install_if_fresher(&ann, &key, tiny_bridge(older_id, 2)).await;
+
+        let installed = ann.indexes.read().await;
+        let bridge = installed.get(&key).expect("an entry must be installed");
+        assert_eq!(bridge.generation, 5, "the newer generation must survive");
+        assert_eq!(
+            bridge.id_map,
+            vec![newer_id],
+            "the older-generation candidate must not have replaced it"
+        );
+    }
+
+    /// A candidate with a STRICTLY NEWER generation must replace an
+    /// existing older entry — the compare-and-replace half of the fix
+    /// (`entry(key).or_insert(...)` never replaced anything once a key was
+    /// occupied, which is the direct cause of "later, more-complete
+    /// rebuild attempts are discarded").
+    #[tokio::test]
+    async fn install_if_fresher_replaces_older_installed_entry() {
+        let ann = new_shared();
+        let key = AnnKey::new("any-ns", "model-x");
+        let older_id = Uuid::new_v4();
+        let newer_id = Uuid::new_v4();
+
+        install_if_fresher(&ann, &key, tiny_bridge(older_id, 1)).await;
+        install_if_fresher(&ann, &key, tiny_bridge(newer_id, 9)).await;
+
+        let installed = ann.indexes.read().await;
+        let bridge = installed.get(&key).expect("an entry must be installed");
+        assert_eq!(bridge.generation, 9);
+        assert_eq!(bridge.id_map, vec![newer_id]);
+    }
+
+    /// Equal generations: the existing entry is kept (no-op), matching the
+    /// `>=` comparison in `install_if_fresher` — ties do not thrash the
+    /// cache with an equivalent rebuild.
+    #[tokio::test]
+    async fn install_if_fresher_keeps_existing_entry_on_equal_generation() {
+        let ann = new_shared();
+        let key = AnnKey::new("any-ns", "model-x");
+        let first_id = Uuid::new_v4();
+        let second_id = Uuid::new_v4();
+
+        install_if_fresher(&ann, &key, tiny_bridge(first_id, 3)).await;
+        install_if_fresher(&ann, &key, tiny_bridge(second_id, 3)).await;
+
+        let installed = ann.indexes.read().await;
+        let bridge = installed.get(&key).expect("an entry must be installed");
+        assert_eq!(
+            bridge.id_map,
+            vec![first_id],
+            "on an equal generation, the first-installed entry must be kept"
+        );
+    }
+
+    /// `is_current` (the recall-path freshness gate) must treat a cached
+    /// entry whose generation is behind the model's current write-generation
+    /// counter as NOT current — the other half of the fix, since a
+    /// presence-only check would still serve a stale-but-installed entry to
+    /// a recall issued after a later write.
+    #[tokio::test]
+    async fn is_current_false_when_installed_generation_behind_counter() {
+        let ann = new_shared();
+        let key = AnnKey::new("any-ns", "model-x");
+
+        // Install a bridge stamped with generation 1 (as if built before any
+        // write bumped the counter further).
+        install_if_fresher(&ann, &key, tiny_bridge(Uuid::new_v4(), 1)).await;
+        assert!(
+            is_current(&ann, &key).await,
+            "with no bumps yet, generation-1 must be considered current (counter starts at 0)"
+        );
+
+        // A write lands and bumps the counter past the installed generation.
+        bump_generation(&ann, &key).await; // -> 1
+        bump_generation(&ann, &key).await; // -> 2
+        assert!(
+            !is_current(&ann, &key).await,
+            "installed generation (1) is now behind the write-generation counter (2)"
+        );
+
+        // Once a fresher build (generation >= 2) installs, it is current again.
+        install_if_fresher(&ann, &key, tiny_bridge(Uuid::new_v4(), 2)).await;
+        assert!(
+            is_current(&ann, &key).await,
+            "installed generation (2) now matches the write-generation counter (2)"
+        );
+    }
+
+    /// `is_current` on an absent key is false (a genuine cache miss), so
+    /// callers correctly fall through to the ensure/build path rather than
+    /// treating "no entry" as "no problem."
+    #[tokio::test]
+    async fn is_current_false_when_absent() {
+        let ann = new_shared();
+        let key = AnnKey::new("any-ns", "model-x");
+        assert!(!is_current(&ann, &key).await);
     }
 
     // ADR-103 Stage 1 / issue #723 ask 1: `ensure_ann_for_model` must bracket

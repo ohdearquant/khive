@@ -3555,142 +3555,110 @@ mod tests {
     #[tokio::test]
     #[serial(background_tasks)]
     async fn ns733_recall_ann_overfetch_retry_loop_respects_effective_namespace() {
-        // See the identical race documented on
-        // `ns733b_recall_verbose_multi_model_breakdown_excludes_off_namespace_candidates`
-        // below: `ensure_ann_background`'s fire-and-forget per-model warm
-        // (ann.rs) installs whichever queued build's scan acquires the
-        // per-model lock first, permanently, even if it raced ahead of a
-        // still-in-flight `remember` and snapshotted an incomplete corpus.
-        // 35 rapid-fire `remember` calls before the one `bench-a` target is
-        // enough to occasionally trigger it here too — a pre-existing
-        // production characteristic, not a consequence of the namespace
-        // filter under test. Retry the whole seed-and-recall flow against a
-        // fresh `KhiveRuntime` (fresh scheduling) up to a few times.
-        const MAX_ATTEMPTS: usize = 5;
-        let mut last_failure: Option<String> = None;
+        // #750: this test used to retry the whole seed-and-recall flow
+        // against a fresh `KhiveRuntime` up to 5 times, and separately poll
+        // `memory.recall` for up to 500ms per attempt, to paper over a
+        // pre-existing ANN warm-cache race: `ensure_ann_for_model` installed
+        // whichever queued build acquired the per-model lock first via
+        // `entry(key).or_insert(bridge)`, permanently, even when it had
+        // snapshotted the corpus before a still-in-flight `remember`
+        // committed. With the write-generation-checked install
+        // (`install_if_fresher` in ann.rs) and the recall-path freshness
+        // gate (`ann::is_current`, `handlers/common.rs`) replacing that
+        // blind `or_insert`, a stale build can no longer win permanently and
+        // a stale-but-present cache entry is no longer treated as a hit —
+        // so this now asserts directly, in one attempt, with no retry or
+        // poll.
+        let rt = KhiveRuntime::memory().expect("in-memory runtime");
+        rt.register_embedder(FixedVecProvider {
+            model_name: NS733_ANN_MODEL.to_string(),
+            map: ns733_ann_fixed_vectors(),
+        });
 
-        'attempt: for attempt in 1..=MAX_ATTEMPTS {
-            let rt = KhiveRuntime::memory().expect("in-memory runtime");
-            rt.register_embedder(FixedVecProvider {
-                model_name: NS733_ANN_MODEL.to_string(),
-                map: ns733_ann_fixed_vectors(),
-            });
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(KgPack::new(rt.clone()));
+        builder.register(MemoryPack::new(rt.clone()));
+        let registry = builder.build().expect("registry");
 
-            let mut builder = VerbRegistryBuilder::new();
-            builder.register(KgPack::new(rt.clone()));
-            builder.register(MemoryPack::new(rt.clone()));
-            let registry = builder.build().expect("registry");
-
-            // No `embedding_model` on remember: `create_note_inner`'s auto-detect
-            // path fans out to every *registered* model when the field is
-            // omitted (`resolve_embedding_model` only accepts lattice aliases —
-            // an explicit custom provider name here would hit `UnknownModel`,
-            // same gotcha documented on `recall_with_residual_fts5_char_fails_loud`
-            // above). `NS733_ANN_MODEL` is the only model registered on this
-            // runtime, so auto-detect resolves to exactly it.
-            for i in 0..NS733_FILLER_COUNT {
-                registry
-                    .dispatch(
-                        "memory.remember",
-                        serde_json::json!({
-                            "content": format!("ns733 ann overfetch local filler {i}"),
-                            "memory_type": "semantic",
-                            "namespace": "local",
-                        }),
-                    )
-                    .await
-                    .expect("remember filler");
-            }
-            let target_id = registry
+        // No `embedding_model` on remember: `create_note_inner`'s auto-detect
+        // path fans out to every *registered* model when the field is
+        // omitted (`resolve_embedding_model` only accepts lattice aliases —
+        // an explicit custom provider name here would hit `UnknownModel`,
+        // same gotcha documented on `recall_with_residual_fts5_char_fails_loud`
+        // above). `NS733_ANN_MODEL` is the only model registered on this
+        // runtime, so auto-detect resolves to exactly it.
+        for i in 0..NS733_FILLER_COUNT {
+            registry
                 .dispatch(
                     "memory.remember",
                     serde_json::json!({
-                        "content": NS733_TARGET_CONTENT,
+                        "content": format!("ns733 ann overfetch local filler {i}"),
                         "memory_type": "semantic",
-                        "namespace": "bench-a",
+                        "namespace": "local",
                     }),
                 )
                 .await
-                .expect("remember target")["id"]
-                .as_str()
-                .expect("id")
-                .parse::<Uuid>()
-                .expect("valid uuid");
-
-            let base_params = serde_json::json!({
-                "query": NS733_QUERY,
-                "namespace": "bench-a",
-                "fusion_strategy": "vector_only",
-                "embedding_model": NS733_ANN_MODEL,
-                "config": { "candidate_limit": 1 },
-                "limit": 1,
-            });
-
-            // Case 1: default widening — the target must be found, and only the
-            // target. Poll (bounded) for the ANN warm to settle on the full
-            // corpus before treating a mismatch as a real assertion failure.
-            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
-            let widened_hits: Vec<Value>;
-            loop {
-                let widened_result = registry
-                    .dispatch("memory.recall", base_params.clone())
-                    .await
-                    .expect("memory.recall with default widening");
-                let hits = widened_result
-                    .as_array()
-                    .cloned()
-                    .expect("bare array result");
-                let settled = hits.len() == 1
-                    && hits[0]["id"].as_str().and_then(|s| s.parse::<Uuid>().ok())
-                        == Some(target_id);
-                if settled {
-                    widened_hits = hits;
-                    break;
-                }
-                if std::time::Instant::now() >= deadline {
-                    last_failure = Some(format!(
-                        "attempt {attempt}/{MAX_ATTEMPTS}: ANN warm for the bench-a target \
-                         did not settle within 500ms; last response: {hits:?}"
-                    ));
-                    continue 'attempt;
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-            }
-            assert_eq!(
-                widened_hits.len(),
-                1,
-                "default widening must surface exactly the bench-a target, got: {widened_hits:?}"
-            );
-            assert_eq!(
-                widened_hits[0]["id"]
-                    .as_str()
-                    .and_then(|s| s.parse::<Uuid>().ok()),
-                Some(target_id),
-                "the single hit must be the bench-a target, not a local filler"
-            );
-
-            // Case 2: widening disabled (`ann_overfetch_max_rounds: 1`) — round 1's
-            // narrow window is exhausted entirely by `local` fillers ranked ahead
-            // of the target, so the namespace-scoped post-filter finds nothing.
-            let mut disabled_params = base_params;
-            disabled_params["config"]["ann_overfetch_max_rounds"] = serde_json::json!(1);
-            let disabled_result = registry
-                .dispatch("memory.recall", disabled_params)
-                .await
-                .expect("memory.recall with widening disabled");
-            let disabled_hits = disabled_result.as_array().expect("bare array result");
-            assert!(
-                disabled_hits.is_empty(),
-                "with widening disabled, round 1's over-fetch window is saturated by \
-                 closer local fillers and must not reach the bench-a target: {disabled_hits:?}"
-            );
-            return;
+                .expect("remember filler");
         }
+        let target_id = registry
+            .dispatch(
+                "memory.remember",
+                serde_json::json!({
+                    "content": NS733_TARGET_CONTENT,
+                    "memory_type": "semantic",
+                    "namespace": "bench-a",
+                }),
+            )
+            .await
+            .expect("remember target")["id"]
+            .as_str()
+            .expect("id")
+            .parse::<Uuid>()
+            .expect("valid uuid");
 
-        panic!(
-            "ns733: corpus/ANN-warm race did not settle in {MAX_ATTEMPTS} fresh attempts; \
-             last failure: {}",
-            last_failure.unwrap_or_default()
+        let base_params = serde_json::json!({
+            "query": NS733_QUERY,
+            "namespace": "bench-a",
+            "fusion_strategy": "vector_only",
+            "embedding_model": NS733_ANN_MODEL,
+            "config": { "candidate_limit": 1 },
+            "limit": 1,
+        });
+
+        // Case 1: default widening — the target must be found, and only the
+        // target.
+        let widened_result = registry
+            .dispatch("memory.recall", base_params.clone())
+            .await
+            .expect("memory.recall with default widening");
+        let widened_hits = widened_result.as_array().expect("bare array result");
+        assert_eq!(
+            widened_hits.len(),
+            1,
+            "default widening must surface exactly the bench-a target, got: {widened_hits:?}"
+        );
+        assert_eq!(
+            widened_hits[0]["id"]
+                .as_str()
+                .and_then(|s| s.parse::<Uuid>().ok()),
+            Some(target_id),
+            "the single hit must be the bench-a target, not a local filler"
+        );
+
+        // Case 2: widening disabled (`ann_overfetch_max_rounds: 1`) — round 1's
+        // narrow window is exhausted entirely by `local` fillers ranked ahead
+        // of the target, so the namespace-scoped post-filter finds nothing.
+        let mut disabled_params = base_params;
+        disabled_params["config"]["ann_overfetch_max_rounds"] = serde_json::json!(1);
+        let disabled_result = registry
+            .dispatch("memory.recall", disabled_params)
+            .await
+            .expect("memory.recall with widening disabled");
+        let disabled_hits = disabled_result.as_array().expect("bare array result");
+        assert!(
+            disabled_hits.is_empty(),
+            "with widening disabled, round 1's over-fetch window is saturated by \
+             closer local fillers and must not reach the bench-a target: {disabled_hits:?}"
         );
     }
 
@@ -3794,102 +3762,50 @@ mod tests {
     #[tokio::test]
     #[serial(background_tasks)]
     async fn ns733b_recall_verbose_multi_model_breakdown_excludes_off_namespace_candidates() {
-        // Every `memory.remember` fires `ann::invalidate_namespace` (the ANN
-        // index is global per model, so any write clears *all* loaded slots)
-        // and re-queues `ensure_ann_background`'s fire-and-forget rebuild for
-        // every registered model (ann.rs). `ensure_ann_for_model` installs a
-        // finished build with `indexes.entry(key).or_insert(bridge)` and
-        // treats an already-present key as `AlreadyLoaded` — so whichever
-        // queued build's `spawn_blocking` scan happens to acquire the
-        // per-model lock *first* wins permanently, even if it raced ahead of
-        // a still-in-flight sibling write and snapshotted an incomplete
-        // corpus (the double-fingerprint check only discards a build that
-        // observes the corpus mutate *during its own* scan, which does not
-        // catch "raced ahead of a write that hadn't started yet"). Six rapid
-        // `remember` calls across two brand-new custom models is enough to
-        // occasionally trigger this pre-existing scheduling race, and once a
-        // stale entry wins, nothing here can invalidate it again (no further
-        // writes occur) — `memory.recall` polling never self-corrects.
-        //
-        // This is a genuine pre-existing production characteristic, not a
-        // consequence of the #733 namespace filter under test (confirmed via
-        // targeted debug capture: the losing runs consistently showed a
-        // 5-filler, target-absent vector index that never changed across a
-        // bounded poll window). Rather than touch the production ANN warm
-        // path, retry the whole corpus-seed-and-recall flow against a fresh
-        // `KhiveRuntime` (fresh scheduling, fresh race) up to a few times —
-        // deterministic in the success case (which is the overwhelming
-        // majority), bounded and loud on failure otherwise.
-        const MAX_ATTEMPTS: usize = 5;
-        let mut last_failure: Option<String> = None;
+        // #750: this test used to retry the whole corpus-seed-and-recall flow
+        // against a fresh `KhiveRuntime` up to 5 times, and separately poll
+        // `memory.recall` for up to 500ms per attempt, to paper over the
+        // same pre-existing ANN warm-cache race documented in detail on
+        // `ns733_recall_ann_overfetch_retry_loop_respects_effective_namespace`
+        // above — `ensure_ann_for_model`'s old `entry(key).or_insert(bridge)`
+        // let whichever queued build acquired the per-model lock first win
+        // permanently, even one that had snapshotted the corpus before a
+        // still-in-flight sibling `remember` committed. With the
+        // write-generation-checked install (`install_if_fresher`, ann.rs)
+        // and the recall-path freshness gate (`ann::is_current`,
+        // `handlers/common.rs`), a stale build can no longer win permanently
+        // and a stale-but-present cache entry is no longer served as a hit —
+        // so this now asserts directly, in one attempt, with no retry or poll.
+        let rt = KhiveRuntime::memory().expect("in-memory runtime");
+        rt.register_embedder(FixedVecProvider {
+            model_name: NS733B_MODEL_A.to_string(),
+            map: ns733b_fixed_vectors(),
+        });
+        rt.register_embedder(FixedVecProvider {
+            model_name: NS733B_MODEL_B.to_string(),
+            map: ns733b_fixed_vectors(),
+        });
 
-        'attempt: for attempt in 1..=MAX_ATTEMPTS {
-            let rt = KhiveRuntime::memory().expect("in-memory runtime");
-            rt.register_embedder(FixedVecProvider {
-                model_name: NS733B_MODEL_A.to_string(),
-                map: ns733b_fixed_vectors(),
-            });
-            rt.register_embedder(FixedVecProvider {
-                model_name: NS733B_MODEL_B.to_string(),
-                map: ns733b_fixed_vectors(),
-            });
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(KgPack::new(rt.clone()));
+        builder.register(MemoryPack::new(rt.clone()));
+        let registry = builder.build().expect("registry");
 
-            let mut builder = VerbRegistryBuilder::new();
-            builder.register(KgPack::new(rt.clone()));
-            builder.register(MemoryPack::new(rt.clone()));
-            let registry = builder.build().expect("registry");
+        let (local_filler_ids, target_id) = ns733b_seed_two_model_corpus(&registry).await;
 
-            let (local_filler_ids, target_id) = ns733b_seed_two_model_corpus(&registry).await;
+        let recall_args = serde_json::json!({
+            "query": NS733B_QUERY,
+            "namespace": "bench-a",
+            "fusion_strategy": "vector_only",
+            "include_breakdown": true,
+            "limit": 10,
+        });
+        let result = registry
+            .dispatch("memory.recall", recall_args)
+            .await
+            .expect("memory.recall with namespace + multi-model + include_breakdown");
 
-            let recall_args = serde_json::json!({
-                "query": NS733B_QUERY,
-                "namespace": "bench-a",
-                "fusion_strategy": "vector_only",
-                "include_breakdown": true,
-                "limit": 10,
-            });
-            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
-            let settled_result: Value;
-            loop {
-                let result = registry
-                    .dispatch("memory.recall", recall_args.clone())
-                    .await
-                    .expect("memory.recall with namespace + multi-model + include_breakdown");
-                let settled = result["candidates"]["vector_candidates_per_model"]
-                    .as_array()
-                    .is_some_and(|per_model| {
-                        per_model.len() == 2
-                            && per_model.iter().any(|entry| {
-                                entry["hits"].as_array().is_some_and(|hits| {
-                                    hits.iter().any(|hit| {
-                                        hit["id"].as_str().and_then(|s| s.parse::<Uuid>().ok())
-                                            == Some(target_id)
-                                    })
-                                })
-                            })
-                    });
-                if settled {
-                    settled_result = result;
-                    break;
-                }
-                if std::time::Instant::now() >= deadline {
-                    last_failure = Some(format!(
-                        "attempt {attempt}/{MAX_ATTEMPTS}: ANN warm for the bench-a target \
-                         did not settle within 500ms; last response: {result}"
-                    ));
-                    continue 'attempt;
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-            }
-
-            return ns733b_assert_breakdown(&settled_result, &local_filler_ids, target_id);
-        }
-
-        panic!(
-            "ns733b: corpus/ANN-warm race did not settle in {MAX_ATTEMPTS} fresh attempts; \
-             last failure: {}",
-            last_failure.unwrap_or_default()
-        );
+        ns733b_assert_breakdown(&result, &local_filler_ids, target_id);
     }
 
     /// Assertion body for
@@ -3961,127 +3877,87 @@ mod tests {
     #[tokio::test]
     #[serial(background_tasks)]
     async fn ns733b_recall_candidates_multi_model_excludes_off_namespace_candidates() {
-        // Same pre-existing ANN-warm race documented in detail on
+        // #750: same pre-existing ANN warm-cache race documented in detail on
         // `ns733b_recall_verbose_multi_model_breakdown_excludes_off_namespace_candidates`
-        // above applies identically here — `handle_recall_candidates` reads
+        // above applied identically here — `handle_recall_candidates` reads
         // the same shared per-model ANN index via the same
-        // `collect_recall_candidates` path `handle_recall` uses. Same bounded
-        // fresh-runtime retry.
-        const MAX_ATTEMPTS: usize = 5;
-        let mut last_failure: Option<String> = None;
+        // `collect_recall_candidates` path `handle_recall` uses. Fixed the
+        // same way (write-generation-checked install + recall-path freshness
+        // gate); asserts directly, in one attempt, with no retry or poll.
+        let rt = KhiveRuntime::memory().expect("in-memory runtime");
+        rt.register_embedder(FixedVecProvider {
+            model_name: NS733B_MODEL_A.to_string(),
+            map: ns733b_fixed_vectors(),
+        });
+        rt.register_embedder(FixedVecProvider {
+            model_name: NS733B_MODEL_B.to_string(),
+            map: ns733b_fixed_vectors(),
+        });
 
-        'attempt: for attempt in 1..=MAX_ATTEMPTS {
-            let rt = KhiveRuntime::memory().expect("in-memory runtime");
-            rt.register_embedder(FixedVecProvider {
-                model_name: NS733B_MODEL_A.to_string(),
-                map: ns733b_fixed_vectors(),
-            });
-            rt.register_embedder(FixedVecProvider {
-                model_name: NS733B_MODEL_B.to_string(),
-                map: ns733b_fixed_vectors(),
-            });
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(KgPack::new(rt.clone()));
+        builder.register(MemoryPack::new(rt.clone()));
+        let registry = builder.build().expect("registry");
 
-            let mut builder = VerbRegistryBuilder::new();
-            builder.register(KgPack::new(rt.clone()));
-            builder.register(MemoryPack::new(rt.clone()));
-            let registry = builder.build().expect("registry");
+        let (local_filler_ids, target_id) = ns733b_seed_two_model_corpus(&registry).await;
 
-            let (local_filler_ids, target_id) = ns733b_seed_two_model_corpus(&registry).await;
+        // `memory.recall_candidates`'s `HandlerDef` declares no
+        // `namespace` `ParamDef` (`pack.rs`: `params: &[]`), so
+        // `VerbRegistry::dispatch`'s generic Rule-3 explicit-namespace
+        // escape (ADR-007 Rev 4/6) is the *only* thing scoping this call
+        // — it mints the token with `visible=["bench-a"]` before
+        // `handle_recall_candidates` ever runs, then strips the
+        // `namespace` key from params (the handler never sees it). No
+        // `fusion_strategy`/`include_breakdown` params exist on this
+        // sub-verb — it always returns the per-model breakdown whenever
+        // more than one model is registered (`sub_handlers.rs:168`).
+        let recall_candidates_args = serde_json::json!({
+            "query": NS733B_QUERY,
+            "namespace": "bench-a",
+            "limit": 10,
+        });
+        let result = registry
+            .dispatch("memory.recall_candidates", recall_candidates_args)
+            .await
+            .expect("memory.recall_candidates with namespace + multi-model");
 
-            // `memory.recall_candidates`'s `HandlerDef` declares no
-            // `namespace` `ParamDef` (`pack.rs`: `params: &[]`), so
-            // `VerbRegistry::dispatch`'s generic Rule-3 explicit-namespace
-            // escape (ADR-007 Rev 4/6) is the *only* thing scoping this call
-            // — it mints the token with `visible=["bench-a"]` before
-            // `handle_recall_candidates` ever runs, then strips the
-            // `namespace` key from params (the handler never sees it). No
-            // `fusion_strategy`/`include_breakdown` params exist on this
-            // sub-verb — it always returns the per-model breakdown whenever
-            // more than one model is registered (`sub_handlers.rs:168`).
-            let recall_candidates_args = serde_json::json!({
-                "query": NS733B_QUERY,
-                "namespace": "bench-a",
-                "limit": 10,
-            });
-            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
-            let settled_result: Value;
-            loop {
-                let result = registry
-                    .dispatch("memory.recall_candidates", recall_candidates_args.clone())
-                    .await
-                    .expect("memory.recall_candidates with namespace + multi-model");
-                let settled = result["vector_candidates_per_model"]
-                    .as_object()
-                    .is_some_and(|per_model| {
-                        per_model.len() == 2
-                            && per_model.values().any(|hits| {
-                                hits.as_array().is_some_and(|hits| {
-                                    hits.iter().any(|hit| {
-                                        hit["id"].as_str().and_then(|s| s.parse::<Uuid>().ok())
-                                            == Some(target_id)
-                                    })
-                                })
-                            })
-                    });
-                if settled {
-                    settled_result = result;
-                    break;
-                }
-                if std::time::Instant::now() >= deadline {
-                    last_failure = Some(format!(
-                        "attempt {attempt}/{MAX_ATTEMPTS}: ANN warm for the bench-a target \
-                         did not settle within 500ms; last response: {result}"
-                    ));
-                    continue 'attempt;
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        let per_model = result["vector_candidates_per_model"]
+            .as_object()
+            .expect("multi-model breakdown present (two models registered)");
+        assert_eq!(
+            per_model.len(),
+            2,
+            "both registered models must appear in the breakdown: {per_model:?}"
+        );
+
+        for (model_name, hits) in per_model {
+            let hits = hits.as_array().expect("hits array");
+            for hit in hits {
+                let id = hit["id"]
+                    .as_str()
+                    .expect("id")
+                    .parse::<Uuid>()
+                    .expect("valid uuid");
+                assert!(
+                    !local_filler_ids.contains(&id),
+                    "namespace=\"bench-a\" recall_candidates breakdown must not leak a \
+                     local filler UUID ({id}) for model {model_name:?}: {hits:?}"
+                );
             }
-
-            let per_model = settled_result["vector_candidates_per_model"]
-                .as_object()
-                .expect("multi-model breakdown present (two models registered)");
-            assert_eq!(
-                per_model.len(),
-                2,
-                "both registered models must appear in the breakdown: {per_model:?}"
-            );
-
-            for (model_name, hits) in per_model {
-                let hits = hits.as_array().expect("hits array");
-                for hit in hits {
-                    let id = hit["id"]
-                        .as_str()
-                        .expect("id")
-                        .parse::<Uuid>()
-                        .expect("valid uuid");
-                    assert!(
-                        !local_filler_ids.contains(&id),
-                        "namespace=\"bench-a\" recall_candidates breakdown must not leak a \
-                         local filler UUID ({id}) for model {model_name:?}: {hits:?}"
-                    );
-                }
-            }
-
-            // Sanity: the fix must not have filtered away everything — the
-            // bench-a target itself is entitled to appear (proves this is a
-            // real filter, not a filter-everything regression).
-            let any_model_has_target = per_model.values().any(|hits| {
-                hits.as_array().unwrap().iter().any(|hit| {
-                    hit["id"].as_str().and_then(|s| s.parse::<Uuid>().ok()) == Some(target_id)
-                })
-            });
-            assert!(
-                any_model_has_target,
-                "the bench-a target must still appear in at least one model's \
-                 recall_candidates breakdown after the namespace filter: {per_model:?}"
-            );
-            return;
         }
 
-        panic!(
-            "ns733b recall_candidates: corpus/ANN-warm race did not settle in {MAX_ATTEMPTS} \
-             fresh attempts; last failure: {}",
-            last_failure.unwrap_or_default()
+        // Sanity: the fix must not have filtered away everything — the
+        // bench-a target itself is entitled to appear (proves this is a
+        // real filter, not a filter-everything regression).
+        let any_model_has_target = per_model.values().any(|hits| {
+            hits.as_array().unwrap().iter().any(|hit| {
+                hit["id"].as_str().and_then(|s| s.parse::<Uuid>().ok()) == Some(target_id)
+            })
+        });
+        assert!(
+            any_model_has_target,
+            "the bench-a target must still appear in at least one model's \
+             recall_candidates breakdown after the namespace filter: {per_model:?}"
         );
     }
 }
