@@ -5917,6 +5917,255 @@ async fn t494_thread_after_id_cursor_returns_strictly_later_messages() {
     );
 }
 
+/// Insert a `message` note directly into the store with an explicit `created_at`,
+/// bypassing `comm.send`/`comm.reply`. Cursor/tie-break/ordering tests need exact
+/// control over timestamps (including two rows sharing the same microsecond) that
+/// racing the wall clock through the normal dispatch path cannot guarantee.
+async fn insert_thread_message(
+    rt: &KhiveRuntime,
+    ns: &str,
+    id: uuid::Uuid,
+    thread_id: uuid::Uuid,
+    created_at: i64,
+    content: &str,
+) {
+    let token = rt
+        .authorize(Namespace::parse(ns).expect("valid namespace"))
+        .expect("authorize");
+    let store = rt.notes(&token).expect("notes store");
+    store
+        .upsert_note(khive_storage::note::Note {
+            id,
+            namespace: ns.to_string(),
+            kind: "message".into(),
+            status: "active".into(),
+            name: None,
+            content: content.to_string(),
+            salience: None,
+            decay_factor: None,
+            expires_at: None,
+            properties: Some(serde_json::json!({
+                "direction": "inbound",
+                "from": "x",
+                "to": ns,
+                "read": false,
+                "thread_id": thread_id.as_hyphenated().to_string(),
+            })),
+            created_at,
+            updated_at: created_at,
+            deleted_at: None,
+        })
+        .await
+        .expect("insert message");
+}
+
+/// codex r1 (#494 re-review): two physical messages that share the exact same
+/// microsecond `created_at` (e.g. what an ADR-057 dual-write self-send can
+/// produce) must not be skipped or duplicated around an id cursor — the cursor
+/// filter and sort must compare the full `(created_at, full_id)` tuple, not
+/// timestamp alone.
+#[tokio::test]
+async fn t494_thread_after_id_cursor_ties_on_equal_created_at_no_skip_no_dup() {
+    let (registry, rt) = build_registry_for_ns("local");
+
+    let root = registry
+        .dispatch(
+            "comm.send",
+            serde_json::json!({ "to": "local", "content": "root" }),
+        )
+        .await
+        .expect("root send succeeds");
+    let root_full_id = root["full_id"].as_str().expect("root full_id").to_string();
+    let root_uuid = uuid::Uuid::parse_str(&root_full_id).unwrap();
+
+    let tied_at = chrono::Utc::now().timestamp_micros();
+    let uuid_lo = uuid::Uuid::parse_str("00000000-0000-4000-8000-000000000001").unwrap();
+    let uuid_hi = uuid::Uuid::parse_str("ffffffff-0000-4000-8000-000000000002").unwrap();
+    insert_thread_message(&rt, "local", uuid_lo, root_uuid, tied_at, "tied-lo").await;
+    insert_thread_message(&rt, "local", uuid_hi, root_uuid, tied_at, "tied-hi").await;
+
+    let after_lo = registry
+        .dispatch(
+            "comm.thread",
+            serde_json::json!({ "id": root_full_id, "after": uuid_lo.to_string() }),
+        )
+        .await
+        .expect("thread succeeds");
+    let contents_lo: Vec<&str> = after_lo["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["content"].as_str().unwrap_or(""))
+        .collect();
+    assert_eq!(
+        contents_lo,
+        vec!["tied-hi"],
+        "after=lo must return exactly the higher-uuid tied row once, not skip or \
+         duplicate it; got {contents_lo:?}"
+    );
+
+    let after_hi = registry
+        .dispatch(
+            "comm.thread",
+            serde_json::json!({ "id": root_full_id, "after": uuid_hi.to_string() }),
+        )
+        .await
+        .expect("thread succeeds");
+    let contents_hi: Vec<&str> = after_hi["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["content"].as_str().unwrap_or(""))
+        .collect();
+    assert!(
+        contents_hi.is_empty(),
+        "after=hi must return nothing — hi is the greatest key among the tied rows; \
+         got {contents_hi:?}"
+    );
+}
+
+/// codex r1 (#494 re-review): an `after` timestamp cursor must be parsed to
+/// microseconds (not compared as a raw string) so non-canonical but valid RFC
+/// 3339 forms — whole-second `Z`, or an explicit `+00:00` offset — compare
+/// correctly against khive's canonical microsecond timestamps.
+#[tokio::test]
+async fn t494_thread_after_timestamp_cursor_accepts_noncanonical_rfc3339() {
+    let (registry, rt) = build_registry_for_ns("local");
+
+    let root = registry
+        .dispatch(
+            "comm.send",
+            serde_json::json!({ "to": "local", "content": "root" }),
+        )
+        .await
+        .expect("root send succeeds");
+    let root_full_id = root["full_id"].as_str().expect("root full_id").to_string();
+    let root_uuid = uuid::Uuid::parse_str(&root_full_id).unwrap();
+
+    // Far in the future so the real-clock root note (created "now") is always
+    // strictly before the cursor and never leaks into the filtered result.
+    let ts1 = chrono::DateTime::parse_from_rfc3339("2099-01-01T00:00:00Z")
+        .unwrap()
+        .timestamp_micros();
+    let ts2 = ts1 + 1_000_000;
+    let id1 = uuid::Uuid::parse_str("11111111-0000-4000-8000-000000000001").unwrap();
+    let id2 = uuid::Uuid::parse_str("22222222-0000-4000-8000-000000000002").unwrap();
+    insert_thread_message(&rt, "local", id1, root_uuid, ts1, "at-ts1").await;
+    insert_thread_message(&rt, "local", id2, root_uuid, ts2, "at-ts2").await;
+
+    for cursor in ["2099-01-01T00:00:00Z", "2099-01-01T00:00:00+00:00"] {
+        let result = registry
+            .dispatch(
+                "comm.thread",
+                serde_json::json!({ "id": root_full_id, "after": cursor }),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("cursor {cursor:?} must parse: {e:?}"));
+        let contents: Vec<&str> = result["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["content"].as_str().unwrap_or(""))
+            .collect();
+        assert_eq!(
+            contents,
+            vec!["at-ts2"],
+            "whole-second/offset RFC3339 cursor {cursor:?} must exclude the note at \
+             exactly that instant and include only the strictly-later one; got {contents:?}"
+        );
+    }
+}
+
+/// codex r1 (#494 re-review): an `after` value that is neither a resolvable
+/// message id nor a parseable RFC 3339 timestamp must fail loudly, never be
+/// silently coerced into "no cursor" (which would return the whole thread).
+#[tokio::test]
+async fn t494_thread_after_invalid_string_is_hard_error() {
+    let (registry, _rt) = build_registry_for_ns("local");
+
+    let root = registry
+        .dispatch(
+            "comm.send",
+            serde_json::json!({ "to": "local", "content": "root" }),
+        )
+        .await
+        .expect("root send succeeds");
+    let root_full_id = root["full_id"].as_str().expect("root full_id").to_string();
+
+    let result = registry
+        .dispatch(
+            "comm.thread",
+            serde_json::json!({ "id": root_full_id, "after": "not-a-valid-cursor" }),
+        )
+        .await;
+    assert!(
+        result.is_err(),
+        "an `after` value that is neither a resolvable id nor a valid RFC 3339 \
+         timestamp must be a hard error, not silently treated as no-cursor; got {result:?}"
+    );
+    let err = result.unwrap_err().to_string();
+    assert!(
+        err.contains("neither a resolvable message id nor a valid RFC 3339 timestamp"),
+        "error must name why the cursor was rejected; got: {err}"
+    );
+}
+
+/// codex r1 (#494 re-review): `order="desc"` combined with an id `after` cursor
+/// must filter against the DESC sequence, not always `created_at >`. "After" in
+/// desc order means further along the desc traversal, i.e. strictly older.
+#[tokio::test]
+async fn t494_thread_order_desc_with_after_id_cursor_returns_strictly_older_in_desc_sequence() {
+    let (registry, rt) = build_registry_for_ns("local");
+
+    let root = registry
+        .dispatch(
+            "comm.send",
+            serde_json::json!({ "to": "local", "content": "root" }),
+        )
+        .await
+        .expect("root send succeeds");
+    let root_full_id = root["full_id"].as_str().expect("root full_id").to_string();
+    let root_uuid = uuid::Uuid::parse_str(&root_full_id).unwrap();
+
+    let base = chrono::DateTime::parse_from_rfc3339("2099-01-01T00:00:00Z")
+        .unwrap()
+        .timestamp_micros();
+    let id_a = uuid::Uuid::parse_str("aaaaaaaa-0000-4000-8000-000000000001").unwrap();
+    let id_b = uuid::Uuid::parse_str("bbbbbbbb-0000-4000-8000-000000000002").unwrap();
+    let id_c = uuid::Uuid::parse_str("cccccccc-0000-4000-8000-000000000003").unwrap();
+    insert_thread_message(&rt, "local", id_a, root_uuid, base, "msg-a").await;
+    insert_thread_message(&rt, "local", id_b, root_uuid, base + 1_000_000, "msg-b").await;
+    insert_thread_message(&rt, "local", id_c, root_uuid, base + 2_000_000, "msg-c").await;
+
+    // `comm.send(to="local", ...)` is a self-send: ADR-057 dual-write stores
+    // both an outbound and an inbound copy of "root", both real-clock (and so
+    // both strictly older than the synthetic 2099 timestamps). Full desc
+    // sequence is therefore [msg-c, msg-b, msg-a, root, root]. `after=msg-b`
+    // must return only what comes strictly after it in THAT sequence —
+    // msg-a and both root copies — never msg-c, even though msg-c is also
+    // `>` msg-b in wall-clock terms.
+    let result = registry
+        .dispatch(
+            "comm.thread",
+            serde_json::json!({ "id": root_full_id, "order": "desc", "after": id_b.to_string() }),
+        )
+        .await
+        .expect("thread succeeds");
+    let contents: Vec<&str> = result["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["content"].as_str().unwrap_or(""))
+        .collect();
+    assert_eq!(
+        contents,
+        vec!["msg-a", "root", "root"],
+        "order=desc + after=msg-b must return only rows strictly older than msg-b \
+         (further along the desc sequence), in desc order — both self-send root \
+         copies included, msg-c excluded; got {contents:?}"
+    );
+}
+
 /// Absent `order`/`after` preserves today's behavior exactly: same messages, same order,
 /// same truncation as before #494 (regression guard alongside the existing #485 test).
 #[tokio::test]

@@ -10,7 +10,7 @@ use chrono::Utc;
 use serde_json::{json, Value};
 use uuid::Uuid;
 
-use khive_runtime::{micros_to_iso, KhiveRuntime, NamespaceToken, RuntimeError};
+use khive_runtime::{KhiveRuntime, NamespaceToken, RuntimeError};
 use khive_storage::note::{FilterOp, Note, NoteFilter, PropertyFilter};
 use khive_storage::types::{PageRequest, SqlValue};
 
@@ -591,7 +591,7 @@ pub(crate) async fn handle_thread(
         ..Default::default()
     };
     const PAGE_SIZE: u32 = 200;
-    let mut messages: Vec<Value> = Vec::new();
+    let mut rows: Vec<ThreadRow> = Vec::new();
     let mut db_offset: u32 = 0;
 
     loop {
@@ -607,7 +607,11 @@ pub(crate) async fn handle_thread(
             .await?;
         let fetched = page.items.len() as u32;
         for n in &page.items {
-            messages.push(note_to_message_json(n));
+            rows.push(ThreadRow {
+                created_at: n.created_at,
+                full_id: n.id,
+                json: note_to_message_json(n),
+            });
         }
         if fetched < PAGE_SIZE {
             break;
@@ -622,19 +626,27 @@ pub(crate) async fn handle_thread(
     // already-validated root note when the query didn't already return it, so
     // `comm.thread(id=root)` never reports an empty/incomplete thread for a
     // root that exists but predates the canonical `thread_id` field.
-    let root_full_id = root_note.id.as_hyphenated().to_string();
-    let root_already_present = messages
-        .iter()
-        .any(|m| m.get("full_id").and_then(Value::as_str) == Some(root_full_id.as_str()));
+    let root_already_present = rows.iter().any(|r| r.full_id == root_note.id);
     if !root_already_present {
-        messages.push(note_to_message_json(&root_note));
+        rows.push(ThreadRow {
+            created_at: root_note.created_at,
+            full_id: root_note.id,
+            json: note_to_message_json(&root_note),
+        });
     }
 
-    // #494: `after` cursor — either a message id (short prefix or full UUID, resolved
-    // the same way `id` is) or an RFC 3339 timestamp. Resolves to an ISO created_at
-    // string so it compares directly against the `created_at` field already on each
-    // message JSON, matching the lexicographic-ISO-8601 comparison used below.
-    let after_cursor: Option<String> = match p.after.as_deref() {
+    // #494 / codex r1: `after` cursor — either a message id (short prefix or full
+    // UUID, resolved the same way `id` is) or an RFC 3339 timestamp. An id cursor
+    // resolves to the full `(created_at, full_id)` tuple of the referenced note so
+    // ties on equal microsecond timestamps are broken deterministically instead of
+    // being skipped or duplicated. A timestamp cursor is parsed to microseconds via
+    // chrono (matching the pattern in khive-pack-brain/src/handlers.rs and
+    // khive-vcs/src/sync.rs) rather than compared as a raw string, so non-canonical
+    // but valid RFC 3339 forms (whole-second `Z`, `+00:00` offsets, ...) compare
+    // correctly against khive's canonical microsecond timestamps. An `after` value
+    // that is neither a resolvable id nor a parseable RFC 3339 timestamp is a hard
+    // error — never silently coerced or treated as "no cursor".
+    let after_cursor: Option<AfterCursor> = match p.after.as_deref() {
         None => None,
         Some(raw) => {
             let looks_like_id = raw.parse::<Uuid>().is_ok()
@@ -651,37 +663,90 @@ pub(crate) async fn handle_thread(
                             "thread: `after` cursor {raw:?} does not resolve to a message"
                         ))
                     })?;
-                Some(micros_to_iso(cursor_note.created_at))
+                Some(AfterCursor::Id {
+                    created_at: cursor_note.created_at,
+                    full_id: cursor_note.id,
+                })
             } else {
-                Some(raw.to_string())
+                let micros = chrono::DateTime::parse_from_rfc3339(raw.trim())
+                    .map(|dt| dt.with_timezone(&Utc).timestamp_micros())
+                    .map_err(|e| {
+                        RuntimeError::InvalidInput(format!(
+                            "thread: `after` cursor {raw:?} is neither a resolvable message id \
+                             nor a valid RFC 3339 timestamp: {e}"
+                        ))
+                    })?;
+                Some(AfterCursor::Timestamp { micros })
             }
         }
     };
-    if let Some(cursor) = after_cursor.as_deref() {
-        messages.retain(|m| m.get("created_at").and_then(Value::as_str).unwrap_or("") > cursor);
+    if let Some(cursor) = &after_cursor {
+        rows.retain(|r| match cursor {
+            // Tuple compare, not timestamp-only: two rows sharing a microsecond
+            // `created_at` (e.g. ADR-057 dual-write self-send copies) are ordered
+            // deterministically by `full_id`, so an id cursor sitting on one of them
+            // never skips or re-includes its tie.
+            AfterCursor::Id {
+                created_at,
+                full_id,
+            } => {
+                let row_key = (r.created_at, r.full_id);
+                let cursor_key = (*created_at, *full_id);
+                match order {
+                    // "after" in desc order means further along the desc sequence,
+                    // i.e. strictly older (smaller key) than the cursor.
+                    "desc" => row_key < cursor_key,
+                    _ => row_key > cursor_key,
+                }
+            }
+            AfterCursor::Timestamp { micros } => match order {
+                "desc" => r.created_at < *micros,
+                _ => r.created_at > *micros,
+            },
+        });
     }
 
-    // Sort chronologically. ISO 8601 timestamps (e.g. "2026-05-27T10:30:00.000000Z")
-    // are lexicographically ordered, so string comparison is correct and cheaper than
-    // parsing. `order="desc"` (issue #494) reverses the comparison so truncation below
-    // keeps the newest `limit` messages instead of the oldest; default "asc" is
-    // byte-identical to prior behavior.
-    messages.sort_by(|a, b| {
-        let a_ts = a.get("created_at").and_then(Value::as_str).unwrap_or("");
-        let b_ts = b.get("created_at").and_then(Value::as_str).unwrap_or("");
+    // Total order: sort by `(created_at, full_id)` — the same tuple the cursor
+    // filter above compares against — ascending for order="asc", reversed for
+    // "desc". Sorting on timestamp alone (prior behavior) left ties among
+    // same-microsecond rows in query-return order, which is not stable across
+    // pages/backends.
+    rows.sort_by(|a, b| {
+        let a_key = (a.created_at, a.full_id);
+        let b_key = (b.created_at, b.full_id);
         match order {
-            "desc" => b_ts.cmp(a_ts),
-            _ => a_ts.cmp(b_ts),
+            "desc" => b_key.cmp(&a_key),
+            _ => a_key.cmp(&b_key),
         }
     });
-    messages.truncate(limit);
-    let count = messages.len();
+    rows.truncate(limit);
+    let count = rows.len();
+    let messages: Vec<Value> = rows.into_iter().map(|r| r.json).collect();
 
     Ok(json!({
         "thread_id": canonical_thread_id,
         "count": count,
         "messages": messages,
     }))
+}
+
+/// A thread row carries the sort/cursor key (`created_at`, `full_id`) alongside
+/// the already-rendered message JSON, so the total-order sort and cursor filter
+/// in `handle_thread` compare exact `(i64, Uuid)` tuples instead of re-parsing
+/// the ISO string embedded in the JSON.
+struct ThreadRow {
+    created_at: i64,
+    full_id: Uuid,
+    json: Value,
+}
+
+/// `after` cursor resolved to a comparable key. An id cursor carries the full
+/// `(created_at, full_id)` tuple of the referenced message for tie-breaking; a
+/// timestamp cursor carries only the parsed microsecond value (there is no
+/// specific row to break ties against).
+enum AfterCursor {
+    Id { created_at: i64, full_id: Uuid },
+    Timestamp { micros: i64 },
 }
 
 /// `ingest` — write a single inbound message note from a channel adapter.

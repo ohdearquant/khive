@@ -171,7 +171,7 @@ pub(crate) static COMM_HANDLERS: [HandlerDef; 9] = [
                 name: "after",
                 param_type: "string",
                 required: false,
-                description: "Cursor: a message id (short prefix or full UUID) or an RFC 3339 timestamp. Only messages strictly after that point in time are returned.",
+                description: "Cursor: a message id (short prefix or full UUID) or an RFC 3339 timestamp (any valid form, e.g. whole-second `Z` or `+00:00` offset). An id cursor ties-break on (created_at, full_id) so equal-timestamp messages are never skipped or duplicated. Only messages strictly after that point in the chosen `order` are returned; an unparseable value is a hard error.",
             },
         ],
     },
