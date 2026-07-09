@@ -335,6 +335,7 @@ impl KgPack {
                 for s in p.annotates.unwrap_or_default() {
                     annotates.push(resolve_uuid_unfiltered(&s, &self.runtime, token).await?);
                 }
+                let properties = super::common::merge_note_tags(p.properties, p.tags)?;
                 let note = self
                     .runtime
                     .create_note(
@@ -343,7 +344,7 @@ impl KgPack {
                         p.name.as_deref(),
                         &content,
                         p.salience,
-                        p.properties,
+                        properties,
                         annotates,
                     )
                     .await?;

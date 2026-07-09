@@ -9886,3 +9886,160 @@ async fn stats_reports_edges_by_relation() {
     assert_eq!(by_relation.get("extends").and_then(Value::as_u64), Some(2));
     assert_eq!(by_relation.get("enables").and_then(Value::as_u64), Some(1));
 }
+
+// ── #747 regression: create(kind=note, tags=[...]) must persist tags ──────
+
+/// #747: top-level `tags` on `create(kind="note", ...)` must round-trip
+/// through `properties["tags"]` (notes have no dedicated tags column — same
+/// convention already used by `memory.remember` and honored by this pack's
+/// own `search`/`list` note-tag filters). Before the fix, `tags` was
+/// whitelisted as an accepted param but never read in the note branch, so it
+/// was silently dropped.
+#[tokio::test]
+async fn create_note_persists_top_level_tags_into_properties() {
+    let f = pack();
+
+    let created = f
+        .dispatch(
+            "create",
+            json!({
+                "kind": "note",
+                "note_kind": "observation",
+                "content": "note nvk747 top-level tags must persist",
+                "tags": ["alpha", "beta"],
+            }),
+        )
+        .await
+        .expect("create note with tags must succeed");
+    let id = created.get("id").and_then(Value::as_str).expect("id");
+
+    let fetched = f
+        .dispatch("get", json!({"id": id}))
+        .await
+        .expect("get must succeed");
+    let stored_tags: Vec<&str> = fetched
+        .get("properties")
+        .and_then(|p| p.get("tags"))
+        .and_then(Value::as_array)
+        .expect("properties.tags must be present")
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    assert_eq!(
+        stored_tags,
+        vec!["alpha", "beta"],
+        "#747: note tags must persist into properties[\"tags\"]"
+    );
+}
+
+/// #747: absent/empty `tags` must leave `properties` unchanged — no spurious
+/// `properties["tags"]` key when the caller never supplied tags.
+#[tokio::test]
+async fn create_note_without_tags_leaves_properties_unchanged() {
+    let f = pack();
+
+    let created = f
+        .dispatch(
+            "create",
+            json!({
+                "kind": "note",
+                "note_kind": "observation",
+                "content": "note nvk747b no tags supplied",
+                "properties": {"domain": "test747"},
+            }),
+        )
+        .await
+        .expect("create note without tags must succeed");
+    let id = created.get("id").and_then(Value::as_str).expect("id");
+
+    let fetched = f
+        .dispatch("get", json!({"id": id}))
+        .await
+        .expect("get must succeed");
+    let props = fetched
+        .get("properties")
+        .and_then(Value::as_object)
+        .expect("properties must be present");
+    assert_eq!(props.get("domain").and_then(Value::as_str), Some("test747"));
+    assert!(
+        !props.contains_key("tags"),
+        "#747: absent tags param must not inject a properties[\"tags\"] key; got {props:?}"
+    );
+
+    // Empty tags array is equivalent to absent — must not inject the key either.
+    let created2 = f
+        .dispatch(
+            "create",
+            json!({
+                "kind": "note",
+                "note_kind": "observation",
+                "content": "note nvk747c empty tags array",
+                "tags": [],
+            }),
+        )
+        .await
+        .expect("create note with empty tags must succeed");
+    let id2 = created2.get("id").and_then(Value::as_str).expect("id");
+    let fetched2 = f
+        .dispatch("get", json!({"id": id2}))
+        .await
+        .expect("get must succeed");
+    let has_tags_key = fetched2
+        .get("properties")
+        .and_then(Value::as_object)
+        .is_some_and(|p| p.contains_key("tags"));
+    assert!(
+        !has_tags_key,
+        "#747: empty tags array must not inject a properties[\"tags\"] key"
+    );
+}
+
+/// #747: when the caller supplies BOTH a top-level `tags` param AND a
+/// conflicting `properties.tags`, the top-level `tags` param wins (documented
+/// precedence rule — the explicit, typed param overrides the nested-object
+/// value rather than silently merging or erroring).
+#[tokio::test]
+async fn create_note_top_level_tags_wins_over_properties_tags_conflict() {
+    let f = pack();
+
+    let created = f
+        .dispatch(
+            "create",
+            json!({
+                "kind": "note",
+                "note_kind": "observation",
+                "content": "note nvk747d conflicting tags sources",
+                "properties": {"tags": ["from-properties"], "domain": "test747d"},
+                "tags": ["from-top-level"],
+            }),
+        )
+        .await
+        .expect("create note with conflicting tags must succeed");
+    let id = created.get("id").and_then(Value::as_str).expect("id");
+
+    let fetched = f
+        .dispatch("get", json!({"id": id}))
+        .await
+        .expect("get must succeed");
+    let props = fetched
+        .get("properties")
+        .and_then(Value::as_object)
+        .expect("properties must be present");
+    let stored_tags: Vec<&str> = props
+        .get("tags")
+        .and_then(Value::as_array)
+        .expect("tags must be present")
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    assert_eq!(
+        stored_tags,
+        vec!["from-top-level"],
+        "#747: top-level `tags` param must win over properties.tags on conflict"
+    );
+    // The rest of `properties` (unrelated keys) must survive the merge untouched.
+    assert_eq!(
+        props.get("domain").and_then(Value::as_str),
+        Some("test747d")
+    );
+}

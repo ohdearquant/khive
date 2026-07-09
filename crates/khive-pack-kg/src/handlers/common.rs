@@ -731,6 +731,38 @@ pub(crate) fn tags_match_any(entity_tags: &[String], wanted: &[String]) -> bool 
         .any(|tag| wanted.iter().any(|w| tag.eq_ignore_ascii_case(w)))
 }
 
+/// Merge the top-level `tags` create-param into `properties["tags"]` for a
+/// note. Notes have no dedicated tags column (see search.rs's `tag_filter`
+/// handling) — `properties["tags"]` is the storage convention already used
+/// by `memory.remember` (khive-pack-memory/src/handlers/remember.rs) and by
+/// this pack's own `search`/`list` note-tag filters. Without this merge,
+/// `create(kind=note, tags=[...])` silently dropped the tags (#747).
+///
+/// Precedence: an empty/absent `tags` param leaves `properties` untouched.
+/// A non-empty `tags` param always WINS over any `properties["tags"]` the
+/// caller also supplied — the top-level, typed param is the more explicit
+/// signal, so it overwrites rather than merges with a same-named nested key.
+pub(crate) fn merge_note_tags(
+    properties: Option<Value>,
+    tags: Option<Vec<String>>,
+) -> Result<Option<Value>, RuntimeError> {
+    let tags = match tags {
+        Some(t) if !t.is_empty() => t,
+        _ => return Ok(properties),
+    };
+    let mut obj = match properties {
+        None => serde_json::Map::new(),
+        Some(Value::Object(m)) => m,
+        Some(other) => {
+            return Err(RuntimeError::InvalidInput(format!(
+                "create: note `tags` cannot be merged into non-object `properties` (got {other})"
+            )));
+        }
+    };
+    obj.insert("tags".to_string(), json!(tags));
+    Ok(Some(Value::Object(obj)))
+}
+
 // ---- Handler helpers ----
 
 pub(crate) fn parse_entity_policy(s: &str) -> Result<EntityDedupMergePolicy, RuntimeError> {
