@@ -171,10 +171,19 @@ remember to signal" bookkeeping is required for a clean exit path.
 to the existing `track_background_task` helper (`crates/khive-runtime/src/daemon.rs`)
 at spawn time, exactly as pack handlers already register fire-and-forget work today.
 This gives the tick loop the same shutdown-visibility guarantee `track_background_task`
-already provides: `drain()` (called immediately after the accept-loop/shutdown-signal
-`select!` resolves) does not return until the tick loop's future has completed, so a
-`SIGTERM` landing mid-tick cannot abort a drain pass silently the way an untracked
-`tokio::spawn` could. No additional field or accessor is added to `DaemonDispatch`
+already provides, which is bounded rather than unconditional: `drain()` (called
+immediately after the accept-loop/shutdown-signal `select!` resolves) waits for tracked
+futures up to `KHIVE_DRAIN_TIMEOUT_SECS` (default 10 seconds), then logs a warning and
+returns with any still-busy future outstanding
+(`crates/khive-runtime/src/daemon.rs`, `drain_timeout`). An idle tick always exits
+cleanly, because the watch channel resolves its `select!` immediately. A pass still
+processing a large backlog when the drain budget expires can be cut off by process
+teardown. That bounded outcome is acceptable because every drain pass is already
+crash-tolerant: each event's fire is finalized individually, and rows stranded in the
+`firing` state by an interrupted pass are recovered by `reclaim_stale_firing_events`
+on a subsequent drain. The executor relies on that recovery path; this ADR does not
+promise pass completion under shutdown, only prompt exit when idle and recoverability
+when interrupted. No additional field or accessor is added to `DaemonDispatch`
 beyond the existing `pool_for_checkpoint`, which `schedule_tick_loop` still uses to
 obtain the `Arc<ConnectionPool>` it drains against; the change from the earlier
 revision is the shutdown signal, not the pool wiring. A dispatcher whose
@@ -215,12 +224,16 @@ without either downstream crate depending on the other for them.
 references `khive-mcp` or `kkernel` types directly. The contract distinguishes two
 failure classes:
 
-- **Drain infrastructure failures**: the two steps the current implementation
-  propagates with `?` before any per-event work happens, `reclaim_stale_firing_events`
-  (`crates/kkernel/src/pending_events.rs`, the stale-firing reclaim sweep) and
-  `discover_pending_namespaces` (`crates/kkernel/src/pending_events.rs`, namespace
-  discovery). `KhiveMcpServer`'s implementation maps a failure in either step into
-  `DrainError`, and the whole call returns `Err` for that pass.
+- **Drain infrastructure failures**: every error the current implementation
+  propagates with `?` at the drain level rather than recording per event. That set is,
+  today: `reclaim_stale_firing_events` (the stale-firing reclaim sweep),
+  `discover_pending_namespaces` (namespace discovery), a `query_notes_filtered` page
+  read failing while scanning a namespace, and pagination-offset overflow while
+  advancing through pages (all in `crates/kkernel/src/pending_events.rs`).
+  `KhiveMcpServer`'s implementation maps any of these into `DrainError`, and the whole
+  call returns `Err` for that pass. The classification rule for future changes is
+  positional, not a fixed list: an error the drain orchestration propagates instead of
+  handling per event is a `DrainError`.
 - **Per-event dispatch failures**: a single event's `dispatch_action` or
   `finalize_fired_event` failing. These are not infrastructure failures: they continue
   to accumulate in the returned `DrainSummary.failed` counter exactly as they do today,
@@ -353,9 +366,13 @@ unaffected by this ADR.
    to 60000 (60 seconds) when unset, unparseable, or zero.
 5. A production-shaped shutdown regression, built against `KhiveMcpServer` (the real
    dispatcher, not a mock), demonstrates that stopping the daemon signals the watch
-   channel, the tick loop's `select!` observes the signal and exits promptly, and
-   `drain()` observes the tick loop's tracked future complete before returning; a
-   dispatcher with no checkpoint pool never spawns the tick.
+   channel, the tick loop's `select!` observes the signal while idle and exits
+   promptly, and `drain()` observes the tick loop's tracked future complete before
+   returning; a dispatcher with no checkpoint pool never spawns the tick. A companion
+   case covers the in-flight boundary: with a drain pass deliberately held busy past a
+   short `KHIVE_DRAIN_TIMEOUT_SECS`, `drain()` returns after logging the forced-shutdown
+   warning rather than hanging, and a subsequent drain recovers any row left in the
+   `firing` state via `reclaim_stale_firing_events`.
 6. `kkernel exec --pending-events` continues to work unchanged as a standalone,
    cron-invocable one-shot drain, now implemented as a thin wrapper calling
    `DaemonDispatch::drain_pending_events` on a CLI-constructed `KhiveMcpServer`.
