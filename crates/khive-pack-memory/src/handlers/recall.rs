@@ -16,8 +16,8 @@ use khive_storage::EdgeRelation;
 use crate::config::ScoreBreakdown;
 use crate::rerank::{weighted_rerank, RerankFeatures};
 use crate::scoring::{
-    calculate_score, contains_cjk, needs_multilingual, normalize_min_score,
-    normalize_rank_fusion_scores, normalize_rrf_scores, ScoreInput,
+    calculate_score, contains_cjk, extract_entity_candidates, needs_multilingual,
+    normalize_min_score, normalize_rank_fusion_scores, normalize_rrf_scores, ScoreInput,
 };
 use crate::MemoryPack;
 
@@ -282,13 +282,18 @@ impl MemoryPack {
         let now_micros = chrono::Utc::now().timestamp_micros();
         let now_millis = now_micros / 1_000;
 
-        let entity_names: Vec<String> = p
-            .entity_names
-            .as_deref()
-            .unwrap_or(&[])
-            .iter()
-            .map(|s| s.to_lowercase())
-            .collect();
+        // `entity_names` feeds the `EntityMatch` ×1.3 boost in `default_adjustments`
+        // (scoring.rs). It used to be purely caller-supplied and no caller ever
+        // populated it, leaving the boost dead code in practice. When the caller
+        // omits it (or passes an empty list), auto-extract candidates from the
+        // query itself — see `extract_entity_candidates` for the extraction rule
+        // and why it's grounded in how `EntityMatch` actually matches. An
+        // explicit, non-empty `entity_names` from the caller always wins; this
+        // path only fills the empty case, it never overrides caller input.
+        let entity_names: Vec<String> = match p.entity_names.as_deref() {
+            Some(names) if !names.is_empty() => names.iter().map(|s| s.to_lowercase()).collect(),
+            _ => extract_entity_candidates(query_trimmed),
+        };
 
         struct ScoredNote {
             id: Uuid,
@@ -1365,6 +1370,156 @@ mod tests {
         assert!(
             hits[0].get("served_by_profile_id").is_none(),
             "no brain pack registered => no profile resolvable => no stamp"
+        );
+    }
+
+    // ── Auto entity-name extraction (dead `entity_names` parameter fix) ────────
+
+    /// `#[serial(background_tasks)]`: non-empty recall — see the note on
+    /// `recall_with_dollar_sign_query_does_not_error` above.
+    ///
+    /// The query names a capitalized proper noun ("Zenlake") that also appears
+    /// verbatim in one of the two candidate notes' content. With no
+    /// `entity_names` supplied, `extract_entity_candidates` derives `["zenlake"]`
+    /// server-side, so `calculate_score`'s EntityMatch adjustment applies its
+    /// ×1.3 multiplier only to the note that mentions it — pushing it above an
+    /// otherwise-comparable distractor note that doesn't. This exercises the
+    /// full wiring (`handle_recall` → `extract_entity_candidates` →
+    /// `calculate_score`), not just the scoring-layer unit tests in
+    /// `scoring.rs`.
+    #[tokio::test]
+    #[serial(background_tasks)]
+    async fn recall_auto_extracted_entity_boosts_matching_memory_above_distractor() {
+        let rt = KhiveRuntime::memory().expect("in-memory runtime");
+        let ns = Namespace::parse("local").expect("local namespace");
+        let token = rt.authorize(ns).expect("authorize local");
+
+        rt.create_note(
+            &token,
+            "memory",
+            None,
+            "the committee reviewed the proposal from Zenlake last week",
+            Some(0.5),
+            None,
+            vec![],
+        )
+        .await
+        .expect("create matching note");
+        rt.create_note(
+            &token,
+            "memory",
+            None,
+            "the committee reviewed the proposal last week",
+            Some(0.5),
+            None,
+            vec![],
+        )
+        .await
+        .expect("create distractor note");
+
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(KgPack::new(rt.clone()));
+        builder.register(MemoryPack::new(rt.clone()));
+        let registry = builder.build().expect("registry");
+
+        let result = registry
+            .dispatch(
+                "memory.recall",
+                serde_json::json!({
+                    "query": "committee proposal Zenlake",
+                    "limit": 10
+                }),
+            )
+            .await
+            .expect("memory.recall");
+
+        let hits = result.as_array().expect("bare array result");
+        assert_eq!(hits.len(), 2, "both candidate notes must be recalled");
+        let top_content = hits[0]["content"].as_str().unwrap_or_default();
+        assert!(
+            top_content.contains("Zenlake"),
+            "the note mentioning the auto-extracted entity name must rank first, got: {hits:#?}"
+        );
+    }
+
+    /// `#[serial(background_tasks)]`: non-empty recall — see the note on
+    /// `recall_with_dollar_sign_query_does_not_error` above.
+    ///
+    /// Both calls target the exact same single-note corpus and the exact same
+    /// query — a query built entirely out of `ENTITY_STOPWORDS` tokens, so
+    /// `extract_entity_candidates` deterministically yields an *empty* list
+    /// (see `extract_entity_candidates_all_stopwords_returns_empty` in
+    /// scoring.rs) regardless of which extraction rule would otherwise apply.
+    /// The only way the note (whose content contains "glorptastic") can pick
+    /// up the EntityMatch ×1.3 boost is if the handler passes the caller's
+    /// explicit, query-unrelated `entity_names` straight through instead of
+    /// (re-)deriving candidates from the query. A single-note corpus keeps
+    /// retrieval-stage relevance identical across both calls (fusion/RRF
+    /// normalization does not consult `entity_names`), so any score
+    /// difference is attributable to the scoring-stage adjustment alone —
+    /// avoiding the two-candidate rank-normalization confound (a real two-item
+    /// corpus's percentile normalization dominates any single scoring
+    /// adjustment; see the sibling test above, which instead relies on the
+    /// entity term also being a genuine shared query/content term to move
+    /// retrieval-stage rank).
+    #[tokio::test]
+    #[serial(background_tasks)]
+    async fn recall_explicit_entity_names_suppresses_auto_extraction() {
+        const QUERY: &str = "is it for me"; // every token is an ENTITY_STOPWORDS entry
+        const CONTENT: &str = "is it for me glorptastic";
+
+        async fn dispatch_recall(entity_names: Option<&[&str]>) -> f64 {
+            let rt = KhiveRuntime::memory().expect("in-memory runtime");
+            let ns = Namespace::parse("local").expect("local namespace");
+            let token = rt.authorize(ns).expect("authorize local");
+            rt.create_note(&token, "memory", None, CONTENT, Some(0.5), None, vec![])
+                .await
+                .expect("create note");
+
+            let mut builder = VerbRegistryBuilder::new();
+            builder.register(KgPack::new(rt.clone()));
+            builder.register(MemoryPack::new(rt.clone()));
+            let registry = builder.build().expect("registry");
+
+            let mut params = serde_json::json!({
+                "query": QUERY,
+                // Force RRF fusion: with a single hit, RRF normalization
+                // (`normalize_rrf_scores`) collapses to the constant
+                // `baseline_relevance + range`, decoupling relevance from
+                // the underlying raw fused score — so both calls land on
+                // an identical pre-adjustment relevance regardless of any
+                // incidental scoring differences between runs.
+                "fusion_strategy": "rrf",
+                "limit": 10
+            });
+            if let Some(names) = entity_names {
+                params["entity_names"] = serde_json::json!(names);
+            }
+
+            let result = registry
+                .dispatch("memory.recall", params)
+                .await
+                .expect("memory.recall");
+            let hits = result.as_array().expect("bare array result");
+            assert_eq!(hits.len(), 1, "single-note corpus must yield one hit");
+            hits[0]["rank_score"].as_f64().expect("rank_score")
+        }
+
+        let auto_extracted_score = dispatch_recall(None).await;
+        let explicit_score = dispatch_recall(Some(&["glorptastic"])).await;
+
+        assert!(
+            explicit_score > auto_extracted_score,
+            "explicit entity_names must be honored (not overridden by \
+             query-derived auto-extraction, which yields empty candidates \
+             for this all-stopword query): auto={auto_extracted_score} \
+             explicit={explicit_score}"
+        );
+        let ratio = explicit_score / auto_extracted_score;
+        assert!(
+            (ratio - 1.3).abs() < 0.01,
+            "expected ~1.3x lift from the EntityMatch adjustment when the \
+             explicit entity_names path is honored, got ratio {ratio}"
         );
     }
 

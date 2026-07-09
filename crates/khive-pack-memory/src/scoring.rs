@@ -13,7 +13,7 @@
 // CJK routing, and the full test suite for the scoring pipeline. The tests require access
 // to module-private helpers; splitting would require pub(crate) promotion of private fns.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -194,6 +194,115 @@ pub fn default_adjustments() -> Vec<ScoreAdjustment> {
             operation: AdjustmentOp::Multiply { factor: 1.3 },
         },
     ]
+}
+
+// ── Auto entity-name extraction ─────────────────────────────────────────────────
+
+/// A small closed set of common English function words, used to keep
+/// auto-extracted entity candidates low-noise. Deliberately conservative
+/// (articles, prepositions, pronouns, conjunctions, common auxiliary verbs
+/// only) — content words are intentionally left out of this list, since
+/// distinguishing a proper noun from a common noun without an NER model
+/// is exactly what the capitalization / length rules below are for.
+const ENTITY_STOPWORDS: &[&str] = &[
+    "a", "an", "the", "and", "or", "but", "of", "in", "on", "at", "to", "for", "with", "by",
+    "from", "is", "are", "was", "were", "be", "been", "being", "this", "that", "these", "those",
+    "it", "its", "he", "she", "his", "her", "him", "they", "them", "their", "we", "us", "our",
+    "you", "your", "i", "my", "me", "as", "if", "so", "not", "no", "yes", "do", "does", "did",
+    "has", "have", "had", "will", "would", "can", "could", "should", "may", "might", "about",
+    "into", "than", "then", "there", "here", "what", "which", "who", "whom", "when", "where",
+    "why", "how",
+];
+
+/// Maximum number of auto-extracted entity-name candidates per query.
+/// `EntityMatch` (see `default_adjustments` above) scans every candidate
+/// linearly against each memory's content, so this bounds that cost as well
+/// as capping how many independent memories can pick up the ×1.3 boost from
+/// a single query.
+pub const MAX_AUTO_ENTITY_NAMES: usize = 8;
+
+/// Minimum token length (post-punctuation-strip) to qualify as an entity
+/// candidate under the no-capitalization fallback path.
+const MIN_LOWERCASE_ENTITY_LEN: usize = 3;
+
+/// Strip leading/trailing non-alphanumeric characters from a token (quotes,
+/// commas, trailing periods, etc.), keeping internal punctuation like
+/// apostrophes in a name intact.
+fn strip_token_punctuation(token: &str) -> &str {
+    token.trim_matches(|c: char| !c.is_alphanumeric())
+}
+
+/// Auto-extract entity-name candidates from a recall query when the caller
+/// does not supply `entity_names` explicitly.
+///
+/// Context (khive #dead-parameter defect): `entity_names` was a
+/// caller-supplied request field that fed `EntityMatch` — but no caller ever
+/// populated it, so the ×1.3 boost in `default_adjustments` never fired in
+/// practice. This function derives candidates server-side from the query
+/// text so the boost has something to match against.
+///
+/// `EntityMatch::matches` (above) does `lower(content).contains(lower(entity))`
+/// — a **free-text substring check against raw memory content**, not
+/// something anchored to actual KG entity references. Extracting every
+/// content word as a candidate under that matching rule would flood
+/// unrelated memories with the boost (any memory mentioning "college" would
+/// qualify against a candidate "college"). Two rules balance recall against
+/// that imprecision:
+///
+/// - **Capitalization signal present** (at least one query token starts with
+///   an uppercase letter): only capitalized tokens (stopwords excluded)
+///   become candidates. Capitalization is the strongest low-noise
+///   proper-noun signal available without an NER model, and well-formed
+///   human-typed queries carry it ("Alex's sibling" → `Alex`).
+/// - **No capitalization signal**: many recall callers — agents in
+///   particular — pass fully lowercase queries. Requiring capitalization
+///   there would silently disable extraction for exactly the callers this
+///   fix targets, so the fallback instead takes non-stopword tokens of
+///   length >= 3. It is coarser (it will occasionally admit a generic content
+///   word), but it only activates when the query gives no cheaper signal to
+///   work with, and remains bounded by the stopword list, the length floor,
+///   and `MAX_AUTO_ENTITY_NAMES`.
+///
+/// Returned names are lowercased (matching `EntityMatch`'s own lowercasing
+/// of both sides before the substring check), deduplicated preserving
+/// first-seen order, and capped at `MAX_AUTO_ENTITY_NAMES`.
+pub fn extract_entity_candidates(query: &str) -> Vec<String> {
+    let tokens: Vec<&str> = query.split_whitespace().collect();
+    let has_capitalized = tokens.iter().any(|t| {
+        strip_token_punctuation(t)
+            .chars()
+            .next()
+            .is_some_and(char::is_uppercase)
+    });
+
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut out: Vec<String> = Vec::new();
+
+    for raw in tokens {
+        let stripped = strip_token_punctuation(raw);
+        if stripped.is_empty() {
+            continue;
+        }
+        let lower = stripped.to_lowercase();
+        if ENTITY_STOPWORDS.contains(&lower.as_str()) {
+            continue;
+        }
+        let qualifies = if has_capitalized {
+            stripped.chars().next().is_some_and(char::is_uppercase)
+        } else {
+            stripped.chars().count() >= MIN_LOWERCASE_ENTITY_LEN
+        };
+        if !qualifies {
+            continue;
+        }
+        if seen.insert(lower.clone()) {
+            out.push(lower);
+            if out.len() >= MAX_AUTO_ENTITY_NAMES {
+                break;
+            }
+        }
+    }
+    out
 }
 
 // ── Scoring weights ───────────────────────────────────────────────────────────
@@ -731,6 +840,75 @@ mod tests {
     }
 
     #[test]
+    fn calculate_score_entity_match_from_auto_extraction_lifts_equal_relevance_candidate() {
+        // Wires `extract_entity_candidates` straight into `calculate_score` with
+        // the default adjustments (EntityMatch ×1.3 included) — everything else
+        // held identical between the two candidates — to isolate exactly what
+        // the entity boost contributes, decoupled from retrieval-stage relevance
+        // differences (which the handler-level tests in recall.rs cover instead).
+        let config = ScoringConfig::default();
+        let now_ms = 1_000_000i64;
+
+        // Capitalized-signal query so extraction yields a single isolated
+        // candidate ("gamma") rather than the whole-query fallback set — that
+        // keeps this test's two candidates differing by exactly one factor
+        // (does the content mention the named entity or not). The fallback
+        // (all-lowercase-query) extraction path, which is the shape of the
+        // reported eval row, is covered by the handler-level integration
+        // tests in `handlers/recall.rs`.
+        let query = "sibling transfer to Gamma university";
+        let entity_names = extract_entity_candidates(query);
+        assert_eq!(
+            entity_names,
+            vec!["gamma"],
+            "capitalized-signal query must extract exactly the one proper noun: {entity_names:?}"
+        );
+
+        let matching_score = calculate_score(
+            &ScoreInput {
+                salience: 0.5,
+                memory_type_str: "semantic",
+                content: "sibling transferred to gamma university this fall",
+                created_at_millis: 0,
+                decay_factor: 0.005,
+                now_millis: now_ms,
+                relevance_score: 0.5,
+                entity_names: &entity_names,
+            },
+            &config,
+        );
+        let non_matching_score = calculate_score(
+            &ScoreInput {
+                salience: 0.5,
+                memory_type_str: "semantic",
+                content: "sibling transferred to a different university this fall",
+                created_at_millis: 0,
+                decay_factor: 0.005,
+                now_millis: now_ms,
+                relevance_score: 0.5,
+                entity_names: &entity_names,
+            },
+            &config,
+        );
+
+        assert!(
+            matching_score > non_matching_score,
+            "memory matching an auto-extracted entity name must outrank an \
+             equal-relevance memory that doesn't: matching={matching_score} \
+             non_matching={non_matching_score}"
+        );
+        // The EntityMatch adjustment is a flat ×1.3 multiply applied after the
+        // base formula and the other (inactive, for this age/salience combo)
+        // adjustments — assert the lift is approximately that factor, not just
+        // "higher", so a future change to the adjustment order/weights is caught.
+        let ratio = matching_score / non_matching_score;
+        assert!(
+            (ratio - 1.3).abs() < 0.01,
+            "expected ~1.3x lift from the EntityMatch adjustment, got ratio {ratio}"
+        );
+    }
+
+    #[test]
     fn dos_caps_enforce_limits() {
         let mut config = ScoringConfig {
             max_recall_candidates: 9999,
@@ -844,5 +1022,80 @@ mod tests {
         assert!(!needs_multilingual("bonjour le monde"));
         assert!(!needs_multilingual("como estas"));
         assert!(!needs_multilingual("ich suche einen buchhalter"));
+    }
+
+    // ── extract_entity_candidates ─────────────────────────────────────────────
+
+    #[test]
+    fn extract_entity_candidates_capitalized_tokens_only_when_present() {
+        // Capitalization signal present ("Alex") → only capitalized tokens
+        // qualify; lowercase content words ("college") are excluded even
+        // though they're not stopwords.
+        let out = extract_entity_candidates("Alex sibling college Acme Beta Gamma");
+        assert_eq!(out, vec!["alex", "acme", "beta", "gamma"]);
+    }
+
+    #[test]
+    fn extract_entity_candidates_lowercase_fallback_when_no_capitalization() {
+        // No capitalized token anywhere in the query → fallback rule: every
+        // non-stopword token of length >= 3 qualifies (matches the reported
+        // eval-row shape: agent-generated queries are frequently all-lowercase).
+        let out = extract_entity_candidates("alex sibling college acme beta gamma");
+        assert_eq!(
+            out,
+            vec!["alex", "sibling", "college", "acme", "beta", "gamma"]
+        );
+    }
+
+    #[test]
+    fn extract_entity_candidates_strips_stopwords() {
+        let out = extract_entity_candidates("what is the capital of France");
+        // "what", "is", "the", "of" are stopwords; "capital" and "France" remain.
+        // "France" is capitalized so the capitalized-only rule applies.
+        assert_eq!(out, vec!["france"]);
+    }
+
+    #[test]
+    fn extract_entity_candidates_lowercase_fallback_still_strips_stopwords_and_short_tokens() {
+        let out = extract_entity_candidates("is it ok to go by car");
+        // No capitalized token → fallback rule. Stopwords (is, it, to, by) and
+        // sub-3-char tokens (ok, go) are excluded; "car" (len 3) qualifies.
+        assert_eq!(out, vec!["car"]);
+    }
+
+    #[test]
+    fn extract_entity_candidates_strips_punctuation() {
+        let out = extract_entity_candidates("Alex's sibling, Acme!");
+        assert_eq!(out, vec!["alex's", "acme"]);
+    }
+
+    #[test]
+    fn extract_entity_candidates_caps_at_max_auto_entity_names() {
+        let query = "Alpha Bravo Charlie Delta Echo Foxtrot Golf Hotel India Juliet";
+        let out = extract_entity_candidates(query);
+        assert_eq!(out.len(), MAX_AUTO_ENTITY_NAMES);
+        assert_eq!(
+            out,
+            vec!["alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel"]
+        );
+    }
+
+    #[test]
+    fn extract_entity_candidates_dedupes_case_insensitively() {
+        let out = extract_entity_candidates("Acme ACME college");
+        // capitalization signal present (Acme, ACME) → only capitalized tokens
+        // qualify; "college" is dropped; Acme and ACME collapse to one entry.
+        assert_eq!(out, vec!["acme"]);
+    }
+
+    #[test]
+    fn extract_entity_candidates_empty_query_returns_empty() {
+        assert!(extract_entity_candidates("").is_empty());
+        assert!(extract_entity_candidates("   ").is_empty());
+    }
+
+    #[test]
+    fn extract_entity_candidates_all_stopwords_returns_empty() {
+        assert!(extract_entity_candidates("is the a of").is_empty());
     }
 }
