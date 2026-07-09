@@ -21,8 +21,9 @@
 //!   [`run_pending_events`] directly. Suitable for `* * * * * kkernel exec
 //!   --pending-events` to achieve minute-granularity delivery.
 //! - **Daemon-resident tick** (ADR-106): [`schedule_tick_loop`] calls
-//!   [`run_pending_events`] on a fixed interval for the lifetime of the warm
-//!   `khived` daemon process. Spawned only by the daemon role (mirrors the
+//!   [`run_pending_events_on`] against the daemon's own resolved `KhiveRuntime`
+//!   handle on a fixed interval for the lifetime of the warm `khived` daemon
+//!   process. Spawned only by the daemon role (mirrors the
 //!   `is_daemon_role` gate `khive-mcp::serve` already uses for the email
 //!   channel loops), never by a short-lived stdio client. Running both an
 //!   external cron entry and the daemon tick at once is safe: the drain's
@@ -169,6 +170,30 @@ pub async fn run_pending_events(
 
     let rt = KhiveRuntime::new(cfg).map_err(|e| anyhow::anyhow!("{e}"))?;
     enforce_strict_actor_mode(rt.config().actor_id.as_deref(), &rt.config().packs)?;
+    run_pending_events_on(&rt, verbose).await
+}
+
+/// One-shot drain against an already-constructed [`KhiveRuntime`] (ADR-106
+/// fix-round: codex PR #782 review, High finding).
+///
+/// [`run_pending_events`] is the CLI-facing entry point (`kkernel exec
+/// --pending-events`): it resolves its own throwaway `RuntimeConfig` from raw
+/// `db`/`namespace` args, one fresh runtime per invocation, which is correct
+/// for a short-lived cron-invoked process.
+///
+/// The daemon-resident tick ([`schedule_tick_loop`]) must NOT do that: the
+/// daemon boot path (`khive-mcp::serve::build_server` /
+/// `build_registry_for_multi_backend`) already resolves `--config`,
+/// `[[backends]]`, actor identity, and `--pack` selection once at startup.
+/// Reconstructing a second, independent `RuntimeConfig::default()` inside the
+/// tick silently discards all of that: it can drain `$HOME/.khive/khive.db`
+/// instead of the configured schedule backend, trip strict-actor-mode
+/// failures the live server never has, and dispatch stored actions through a
+/// pack set the daemon never loaded. This function takes the daemon's own
+/// resolved, already-validated `&KhiveRuntime` by reference instead, so the
+/// tick's storage target, actor identity, and pack set are always identical
+/// to the server it is ticking for.
+pub async fn run_pending_events_on(rt: &KhiveRuntime, verbose: bool) -> Result<DrainSummary> {
     let server = KhiveMcpServer::new(rt.clone()).map_err(|e| anyhow::anyhow!("{e}"))?;
 
     let now = Utc::now();
@@ -182,7 +207,7 @@ pub async fn run_pending_events(
     let stale_before = now
         .timestamp_micros()
         .saturating_sub(STALE_FIRING_TIMEOUT_MICROS);
-    summary.reclaimed = reclaim_stale_firing_events(&rt, stale_before).await?;
+    summary.reclaimed = reclaim_stale_firing_events(rt, stale_before).await?;
     if verbose && summary.reclaimed > 0 {
         eprintln!(
             "[pending-events] reclaimed {} stale \"firing\" row(s) back to \"pending\"",
@@ -191,7 +216,7 @@ pub async fn run_pending_events(
     }
 
     // ── Step 1: discover all distinct namespaces with pending scheduled_event notes ──
-    let namespaces = discover_pending_namespaces(&rt, now).await?;
+    let namespaces = discover_pending_namespaces(rt, now).await?;
 
     if verbose {
         eprintln!(
@@ -231,7 +256,20 @@ pub async fn run_pending_events(
             }
         };
 
-        // Page through all pending scheduled_event notes in this namespace.
+        // Snapshot every pending scheduled_event note in this namespace BEFORE
+        // any mutation (codex PR #782 review, Medium finding #2).
+        //
+        // The previous version paged `status="pending"` with LIMIT/OFFSET
+        // *while* processing each page mutated matching rows out of that same
+        // predicate (claim -> "firing" -> "fired"/"missed"/re-armed
+        // "pending"). Once page 1's 200 rows left the "pending" set, the
+        // page-2 query at `OFFSET 200` was evaluated against a result set
+        // that had already shrunk by 200 — row 201 (and beyond) was silently
+        // skipped for the entire pass. Reading the full candidate set into
+        // memory first, before any write touches this namespace's rows, means
+        // pagination happens only over a stable, unmutated snapshot; the
+        // mutation loop below then iterates the fixed-size `Vec` directly and
+        // never re-queries by offset.
         let filter = NoteFilter {
             kind: Some("scheduled_event".to_string()),
             property_filters: vec![PropertyFilter {
@@ -244,25 +282,36 @@ pub async fn run_pending_events(
         };
 
         const PAGE_SIZE: u32 = 200;
-        let mut offset: u64 = 0;
+        let mut candidates = Vec::new();
+        {
+            let mut offset: u64 = 0;
+            loop {
+                let page = store
+                    .query_notes_filtered(
+                        ns_str,
+                        &filter,
+                        PageRequest {
+                            limit: PAGE_SIZE,
+                            offset,
+                        },
+                    )
+                    .await
+                    .with_context(|| {
+                        format!("pending-events: query_notes_filtered failed for ns={ns_str}")
+                    })?;
+                let page_len = page.items.len() as u32;
+                candidates.extend(page.items);
+                if page_len < PAGE_SIZE {
+                    break;
+                }
+                offset = offset
+                    .checked_add(u64::from(PAGE_SIZE))
+                    .ok_or_else(|| anyhow::anyhow!("pending-events: pagination offset overflow"))?;
+            }
+        }
 
-        loop {
-            let page = store
-                .query_notes_filtered(
-                    ns_str,
-                    &filter,
-                    PageRequest {
-                        limit: PAGE_SIZE,
-                        offset,
-                    },
-                )
-                .await
-                .with_context(|| {
-                    format!("pending-events: query_notes_filtered failed for ns={ns_str}")
-                })?;
-            let page_len = page.items.len() as u32;
-
-            for mut note in page.items {
+        {
+            for mut note in candidates {
                 summary.scanned += 1;
 
                 // Parse and check trigger_at.
@@ -345,7 +394,7 @@ pub async fn run_pending_events(
                 // guards the missed path: a missed event still needs
                 // exclusive ownership before it can be marked "missed" or
                 // re-armed to a future occurrence.
-                let claimed_firing_at = match claim_pending_event(&rt, ns_str, note.id).await {
+                let claimed_firing_at = match claim_pending_event(rt, ns_str, note.id).await {
                     Ok(c) => c,
                     Err(e) => {
                         if verbose {
@@ -399,7 +448,7 @@ pub async fn run_pending_events(
                     let updated_at = Utc::now().timestamp_micros();
 
                     match finalize_fired_event(
-                        &rt,
+                        rt,
                         ns_str,
                         note.id,
                         &props,
@@ -478,7 +527,7 @@ pub async fn run_pending_events(
                 // but defensively) raced in after the claim.
                 let final_props = note.properties.clone().unwrap_or_else(|| json!({}));
                 match finalize_fired_event(
-                    &rt,
+                    rt,
                     ns_str,
                     note.id,
                     &final_props,
@@ -521,13 +570,6 @@ pub async fn run_pending_events(
                     }
                 }
             }
-
-            if page_len < PAGE_SIZE {
-                break;
-            }
-            offset = offset
-                .checked_add(u64::from(PAGE_SIZE))
-                .ok_or_else(|| anyhow::anyhow!("pending-events: pagination offset overflow"))?;
         }
     }
 
@@ -954,35 +996,47 @@ pub fn tick_interval_from_env() -> std::time::Duration {
 
 /// Daemon-resident periodic drain loop (ADR-106).
 ///
-/// Runs [`run_pending_events`] on a fixed interval for as long as the daemon
-/// process lives. Only the daemon role spawns this loop (mirrors the
+/// Runs [`run_pending_events_on`] on a fixed interval for as long as the
+/// daemon process lives. Only the daemon role spawns this loop (mirrors the
 /// `is_daemon_role` gate `khive-mcp::serve` already applies to the email
 /// channel loops, #602) — a short-lived `kkernel exec`/stdio client process
 /// never calls this, so there is exactly one tick loop per live daemon.
 ///
-/// Each tick opens its own short-lived `KhiveRuntime` against `db`/
-/// `namespace` — the same construction `kkernel exec --pending-events` uses
-/// — rather than threading the daemon's own warm runtime through. This is a
-/// deliberate simplification: `khive-mcp::server::KhiveMcpServer` does not
-/// retain a single top-level `KhiveRuntime` handle (each pack holds its own),
-/// so reusing the daemon's live runtime here would need new plumbing through
-/// `DaemonDispatch`. Running the documented cron invocation in-process
-/// instead costs a connection-pool warm-up every tick but never a
-/// correctness risk: the drain's `pending -> firing` claim/finalize CAS
-/// already makes concurrent or overlapping invocations harmless by
-/// construction (see the module-level docs), exactly as it does for the
-/// still-supported external-cron redundancy.
+/// `rt` is the daemon's own resolved runtime handle for the `"schedule"` pack
+/// — for a single-backend boot, the one `KhiveRuntime` the whole daemon
+/// shares; for a multi-backend boot (ADR-028 `[[backends]]`), the specific
+/// per-pack runtime `schedule` was wired to. `khive-mcp::serve::build_server`
+/// resolves this once at daemon boot (the same `--config`/`[[backends]]`/
+/// actor-identity/`--pack` resolution the live server itself uses) and passes
+/// it through here, so every tick drains the SAME storage target under the
+/// SAME actor identity and pack set as the daemon it belongs to — never a
+/// silently-reconstructed `RuntimeConfig::default()` (codex PR #782 review,
+/// High finding: a config-backed daemon's tick could otherwise drain
+/// `$HOME/.khive/khive.db` instead of the configured backend, trip
+/// strict-actor-mode failures the live server never has, or dispatch stored
+/// actions through packs the daemon never loaded). `rt.clone()` is cheap
+/// (`KhiveRuntime` is `Arc`-wrapped internally) — every tick reuses the same
+/// warm connection pool rather than opening a fresh one.
+///
+/// Ticks on a fixed `tokio::time::interval` with
+/// [`tokio::time::MissedTickBehavior::Skip`] rather than sleeping `interval`
+/// AFTER each drain: a sleep-after-drain loop's effective cadence is
+/// `interval + drain_duration`, which drifts further behind on every pass
+/// that finds a nontrivial backlog (codex PR #782 review, Medium finding
+/// "tick cadence deviates from the accepted interval contract" — ADR-106
+/// specifies a fixed interval). The first tick fires after one full
+/// `interval` has elapsed (via `interval_at(now + interval, interval)`),
+/// matching the original sleep-based boot behavior instead of draining
+/// immediately at daemon start.
 ///
 /// A per-tick failure (e.g. a transient SQL error) is logged and does not
 /// stop the loop — the next tick simply tries again.
-pub async fn schedule_tick_loop(
-    db: Option<String>,
-    namespace: String,
-    interval: std::time::Duration,
-) {
+pub async fn schedule_tick_loop(rt: KhiveRuntime, interval: std::time::Duration) {
+    let mut ticker = tokio::time::interval_at(tokio::time::Instant::now() + interval, interval);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
-        tokio::time::sleep(interval).await;
-        match run_pending_events(db.as_deref(), &namespace, false).await {
+        ticker.tick().await;
+        match run_pending_events_on(&rt, false).await {
             Ok(summary) => {
                 if summary.fired > 0
                     || summary.advanced > 0
@@ -1954,21 +2008,35 @@ mod tests {
     /// The headline regression: 9 non-repeating events overdue well beyond
     /// the default grace window (300s) must ALL be marked `"missed"` and
     /// NONE dispatched. This is the first-boot-against-a-large-backlog
-    /// scenario the ADR-106 amendment calls out explicitly. The action DSL
-    /// is deliberately a verb (`create`) that would leave an observable
-    /// trace if dispatched, so a regression that accidentally fires the
-    /// missed path would be caught by `summary.fired`/`summary.advanced`
-    /// being non-zero, not just by inspecting note status.
+    /// scenario the ADR-106 amendment calls out explicitly. The action DSL is
+    /// deliberately a genuinely side-effecting verb (`create`, writing a
+    /// distinctively-tagged `observation` note) rather than the read-only
+    /// `stats()`, and the test asserts that note is ABSENT after the drain —
+    /// not just that `summary.fired`/`summary.advanced` read zero. A
+    /// regression that accidentally fires the missed path would otherwise be
+    /// caught only by the summary counters, which is weaker evidence than
+    /// confirming the action's own write never landed (codex PR #782 review,
+    /// Low finding: the previous fixture used `stats()`, contradicting this
+    /// comment's claim of a side-effecting action).
     #[tokio::test]
     async fn nine_overdue_events_beyond_grace_are_missed_with_zero_dispatch() {
         let (_tmp, db_path) = tmp_db();
         let rt = make_rt(&db_path).await;
 
         let past = "2000-01-01T00:00:00Z";
+        let marker = "nine-overdue-zero-dispatch-marker";
+        let action_dsl = format!("create(kind=\"observation\", content=\"{marker}\")");
         let mut ids = Vec::new();
         for _ in 0..9 {
-            let id =
-                create_scheduled_event(&rt, "local", past, Some("stats()"), None, "schedule").await;
+            let id = create_scheduled_event(
+                &rt,
+                "local",
+                past,
+                Some(action_dsl.as_str()),
+                None,
+                "schedule",
+            )
+            .await;
             ids.push(id);
         }
 
@@ -2011,6 +2079,29 @@ mod tests {
                 "note {id} must never have fired_at set (never dispatched), got {props:?}"
             );
         }
+
+        // Strongest evidence: the side-effecting action's own output record
+        // must be entirely absent — not merely "summary says zero fired".
+        let ns = Namespace::parse("local").unwrap();
+        let token = rt.authorize(ns).expect("authorize");
+        let store = rt.notes(&token).expect("notes");
+        let page = store
+            .query_notes(
+                "local",
+                Some("observation"),
+                PageRequest {
+                    limit: 50,
+                    offset: 0,
+                },
+            )
+            .await
+            .expect("query observation notes");
+        let marker_hits: Vec<_> = page.items.iter().filter(|n| n.content == marker).collect();
+        assert!(
+            marker_hits.is_empty(),
+            "the missed action must never dispatch: found {} marker note(s): {marker_hits:?}",
+            marker_hits.len()
+        );
     }
 
     /// An event overdue by less than the grace window must still fire
@@ -2115,5 +2206,112 @@ mod tests {
             "re-armed trigger_at must be the very next occurrence, not skip further \
              (no catch-up burst), got {new_trigger} (now={now})"
         );
+    }
+
+    /// A backlog larger than the drain's internal page size (200) must be
+    /// fully processed in ONE drain pass, not silently truncated at the page
+    /// boundary (codex PR #782 review, Medium finding: the previous
+    /// implementation paged `status="pending"` with `LIMIT/OFFSET` while
+    /// simultaneously mutating rows out of that predicate, so once the first
+    /// page's 200 rows left `"pending"`, the page-2 query at `OFFSET 200`
+    /// undercounted and silently skipped every row beyond the first page).
+    /// 201 rows — one more than `PAGE_SIZE` — reproduces the exact boundary
+    /// codex identified.
+    #[tokio::test]
+    async fn backlog_larger_than_page_size_is_fully_drained_in_one_pass() {
+        let (_tmp, db_path) = tmp_db();
+        let rt = make_rt(&db_path).await;
+
+        const OVERDUE_ROW_COUNT: usize = 201; // PAGE_SIZE (200) + 1
+        let past = "2000-01-01T00:00:00Z"; // far beyond the missed-event grace window
+        let mut ids = Vec::with_capacity(OVERDUE_ROW_COUNT);
+        for _ in 0..OVERDUE_ROW_COUNT {
+            let id =
+                create_scheduled_event(&rt, "local", past, Some("stats()"), None, "schedule").await;
+            ids.push(id);
+        }
+
+        let summary = run_pending_events(Some(&db_path), "local", false)
+            .await
+            .expect("drain");
+
+        assert_eq!(
+            summary.scanned, OVERDUE_ROW_COUNT as u64,
+            "every overdue row across both pages must be scanned in one pass, got \
+             summary={summary:?}"
+        );
+        assert_eq!(
+            summary.missed.len(),
+            OVERDUE_ROW_COUNT,
+            "every overdue row across both pages must be marked missed in one pass \
+             (the page-boundary row must not be skipped), got summary={summary:?}"
+        );
+        for id in &ids {
+            assert!(
+                summary.missed.contains(id),
+                "missed list must name every row, including ones beyond the first page"
+            );
+        }
+        for id in ids {
+            let props = get_note_props(&rt, id).await;
+            assert_eq!(
+                props["status"].as_str(),
+                Some("missed"),
+                "note {id} must end in status=missed (not left pending past the page \
+                 boundary), got {props:?}"
+            );
+        }
+    }
+
+    /// Two concurrent drain passes over the same store must never double-fire
+    /// a row: the `pending -> firing` CAS claim (`claim_pending_event`) makes
+    /// exactly one of the two concurrent callers win each row (codex PR #782
+    /// review, Medium finding: Amendment B claims Acceptance Criterion 2 is
+    /// met, but no regression exercised concurrent drains until now).
+    #[tokio::test]
+    async fn concurrent_drains_fire_each_row_exactly_once() {
+        let (_tmp, db_path) = tmp_db();
+        let rt = make_rt(&db_path).await;
+
+        const ROW_COUNT: usize = 20;
+        let past = due_rfc3339(); // in-grace: exercises the normal fire path, not missed
+        let mut ids = Vec::with_capacity(ROW_COUNT);
+        for _ in 0..ROW_COUNT {
+            let id = create_scheduled_event(&rt, "local", &past, Some("stats()"), None, "schedule")
+                .await;
+            ids.push(id);
+        }
+
+        let db_path_a = db_path.clone();
+        let db_path_b = db_path.clone();
+        let (summary_a, summary_b) = tokio::join!(
+            async move { run_pending_events(Some(&db_path_a), "local", false).await },
+            async move { run_pending_events(Some(&db_path_b), "local", false).await },
+        );
+        let summary_a = summary_a.expect("drain A");
+        let summary_b = summary_b.expect("drain B");
+
+        let total_dispatched =
+            summary_a.fired + summary_a.advanced + summary_b.fired + summary_b.advanced;
+        assert_eq!(
+            total_dispatched, ROW_COUNT as u64,
+            "every row must be dispatched exactly once across both concurrent drains, \
+             got a={summary_a:?} b={summary_b:?}"
+        );
+        assert_eq!(
+            summary_a.failed + summary_b.failed,
+            0,
+            "the CAS claim must make the losing drain skip cleanly (skipped_race), \
+             never fail: a={summary_a:?} b={summary_b:?}"
+        );
+
+        for id in ids {
+            let props = get_note_props(&rt, id).await;
+            assert_eq!(
+                props["status"].as_str(),
+                Some("fired"),
+                "note {id} must end fired exactly once, got {props:?}"
+            );
+        }
     }
 }

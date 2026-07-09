@@ -363,8 +363,11 @@ unaffected by this ADR.
 3. No MCP client process (a stdio `kkernel mcp` session without `--daemon`) spawns a
    schedule tick, verified the same way the existing `is_daemon_role_false_for_client_args`
    /`is_daemon_role_true_for_daemon_args` tests verify the email-channel gate.
-4. The tick interval is overridable via `KHIVE_SCHEDULE_TICK_INTERVAL_MS` and defaults
-   to 60000 (60 seconds) when unset, unparseable, or zero.
+4. The tick interval is overridable via `KHIVE_SCHEDULE_TICK_SECS` (seconds) and defaults
+   to 60 seconds when unset, unparseable, or zero. (Amended 2026-07-09, codex PR #782
+   review fix-round: the shipped implementation uses this name and unit — see Amendment
+   B — and this criterion is restated to name the accepted contract rather than the
+   originally-proposed `KHIVE_SCHEDULE_TICK_INTERVAL_MS`/milliseconds form.)
 5. A production-shaped shutdown regression, built against `KhiveMcpServer` (the real
    dispatcher, not a mock), demonstrates that stopping the daemon signals the watch
    channel, the tick loop's `select!` observes the signal while idle and exits
@@ -568,16 +571,7 @@ same PR:
 - The tick does **not** go through a `DaemonDispatch::drain_pending_events` trait
   method. `khive-runtime` gains no new trait method and no new `DrainSummary`/
   `DrainError` types; those remain owned by `khive-mcp` (as `DrainSummary` already was
-  before this ADR). Each tick instead constructs its own short-lived `KhiveRuntime`
-  against the daemon's configured `db`/`namespace`, the same construction
-  `kkernel exec --pending-events` uses, rather than sharing the live daemon's warm
-  runtime. This is the "Why the drain cannot be ticked as-is" problem the base ADR
-  identifies, deliberately left unsolved here: the cost is a connection-pool warm-up
-  every tick, not a correctness risk, because the drain's claim/finalize CAS already
-  makes redundant invocations safe by construction (Decision point 5) — the same
-  property that makes running external cron alongside the tick safe makes a per-tick
-  fresh runtime safe too, just at a higher resource cost than the shared-runtime design
-  would have.
+  before this ADR).
 - Shutdown is a bare `tokio::spawn` with no `track_background_task` registration and no
   watch-channel signal, matching how the checkpoint task and the email-channel loops are
   already spawned in the current codebase (neither uses `track_background_task` today
@@ -588,18 +582,97 @@ same PR:
 - The interval env var is `KHIVE_SCHEDULE_TICK_SECS` (seconds, default `60`), not
   `KHIVE_SCHEDULE_TICK_INTERVAL_MS` (milliseconds, default `60000`) as specified in
   Decision point 6. The resolved default cadence is identical (60 seconds); only the
-  variable name and unit differ from the original decision.
+  variable name and unit differ from the original decision — Acceptance Criterion 4
+  above is amended to name this shipped contract directly.
 
-None of this changes Acceptance Criteria 1, 2, 4, or 6, which describe externally
-observable behavior (a due row fires within one tick interval; concurrent cron and tick
-invocations race safely to exactly one fire; the interval is configurable with a 60s
-default; the CLI wrapper is unchanged) — all four hold under the shipped
-implementation. Acceptance Criteria 3, 5, and 7 describe the specific trait-based
-mechanism (the `is_daemon_role` test shape, the watch-channel shutdown regression, and
-`khive-runtime`'s dependency graph): 3 holds as stated (the gate is on `args.daemon`
-regardless of which file spawns the loop); 5 and 7 are **not** met by the shipped
-implementation, since there is no watch-channel shutdown to test and `DrainSummary`
-never moved into `khive-runtime`. Closing that gap — moving to the full
-`DaemonDispatch::drain_pending_events` trait seam with tracked, graceful shutdown and a
-shared warm runtime per tick — remains open follow-on work, tracked separately from the
-missed-event policy this amendment's primary content (Amendment A) delivers.
+### Fix-round update (2026-07-09, codex PR #782 review)
+
+The initial cut of this amendment (above) additionally claimed the tick "constructs its
+own short-lived `KhiveRuntime` against the daemon's configured `db`/`namespace`... rather
+than sharing the live daemon's warm runtime," and framed that as a resource-cost-only
+deviation. Codex's review of the PR carrying this ADR (#782) identified that claim as
+incorrect: a tick that independently re-resolves `RuntimeConfig::default()` from raw
+`--db` and an inferred namespace does not merely reconstruct the _same_ configuration at
+extra cost — it silently **discards** everything the daemon's own boot path
+(`khive-mcp::serve::build_server` / `build_registry_for_multi_backend`) resolves from
+`--config`/`[[backends]]`/actor identity/`--pack` selection. A config-backed daemon's
+tick could therefore drain `$HOME/.khive/khive.db` instead of the configured schedule
+backend, trip strict-actor-mode failures the live server never has, or dispatch stored
+actions through packs the daemon never loaded. This was filed as the review's High
+finding and fixed in the same PR, before merge:
+
+- `build_server` now returns, alongside the server, the resolved `"schedule"`-pack
+  `KhiveRuntime` handle it already constructed while building the server itself
+  (`Option<KhiveRuntime>` — `None` when the resolved pack set excludes `"schedule"`).
+  For a single-backend boot this is the one runtime the whole daemon shares; for a
+  multi-backend boot (ADR-028 `[[backends]]`) it is the specific per-pack runtime
+  `"schedule"` was wired to, read out of `MultiBackendRegistry.per_pack_runtimes`. The
+  coordinator-attached multi-backend path (`kkernel`'s `Command::Mcp` branch) resolves
+  and threads the same handle through `serve_server`.
+- `schedule_tick_loop` takes that runtime by value (`KhiveRuntime::clone()` is a cheap
+  `Arc`-wrapped clone) instead of `db: Option<String>, namespace: String`, and every tick
+  drains through it via a new `run_pending_events_on(rt: &KhiveRuntime, ...)` entry point.
+  `run_pending_events` (the CLI one-shot path, `kkernel exec --pending-events`) is
+  unchanged — it still resolves its own throwaway config per invocation, which remains
+  correct for a short-lived cron-invoked process — and now delegates to
+  `run_pending_events_on` internally.
+- This also resolves the resource-cost concern the original text raised (a fresh
+  connection-pool warm-up every tick): the tick now reuses the daemon's already-warm
+  runtime and connection pool rather than constructing a new one per pass.
+- Tick cadence was also corrected in the same fix-round (a separate, Medium-severity
+  finding in the same review): `schedule_tick_loop` now ticks on
+  `tokio::time::interval_at(now + interval, interval)` with
+  `MissedTickBehavior::Skip`, matching Decision point 6's fixed-interval specification,
+  rather than sleeping `interval` after each drain (which had produced an effective
+  cadence of `interval + drain_duration`, drifting further behind on every pass that
+  found a nontrivial backlog).
+- The drain's own pagination was independently found to skip rows once an overdue
+  backlog exceeded one page (`PAGE_SIZE = 200`): paging `status="pending"` with
+  `LIMIT/OFFSET` while the same loop mutates rows out of that predicate desynchronizes
+  the offset from the shrinking result set. Fixed by snapshotting every candidate row for
+  a namespace before any mutation begins, then processing the fixed-size snapshot with no
+  further paginated queries. A regression with 201 overdue rows (`PAGE_SIZE + 1`) covers
+  this.
+- A new concurrent-drain regression (two `run_pending_events` calls racing over the same
+  store, asserting exactly one fire per row across both) was added alongside the existing
+  CAS-race unit tests, closing the exact gap Acceptance Criterion 2 names.
+
+None of this changes Acceptance Criteria 1, 3, 4, or 6's _scope_ — but their status
+against the shipped implementation is restated here precisely, since the original
+"None of this changes Acceptance Criteria 1, 2, 4, or 6... all four hold" claim below
+(now superseded) conflated "unchanged in scope" with "met," which was not accurate for
+Criterion 6:
+
+- **Criterion 1** (a due row fires within one tick interval): **met**. Unaffected by this
+  fix-round beyond the cadence and runtime-targeting corrections above, which strengthen
+  rather than weaken it.
+- **Criterion 2** (concurrent cron + tick invocations race to exactly one fire): **met**,
+  now backed by the concurrent-drain regression added in this fix-round (previously
+  claimed met on the strength of the CAS design alone, with no regression exercising
+  concurrency — codex's Medium finding on this amendment).
+- **Criterion 3** (no stdio client spawns a tick): **met**, unchanged — the gate is on
+  `args.daemon` regardless of which file spawns the loop.
+- **Criterion 4** (interval configurable, 60s default): **met**, under the shipped
+  `KHIVE_SCHEDULE_TICK_SECS` contract the criterion text above was amended to name.
+- **Criterion 5** (production-shaped watch-channel shutdown regression): **not met**.
+  There is no watch-channel shutdown to test; a tick in flight at process shutdown is
+  still simply dropped, recovered by the next `reclaim_stale_firing_events` sweep.
+- **Criterion 6** (`kkernel exec --pending-events` implemented as a thin wrapper over
+  `DaemonDispatch::drain_pending_events`): **not met**. The CLI path calls
+  `khive_mcp::pending_events::run_pending_events` directly, not a `DaemonDispatch` trait
+  method — no such trait method exists. This criterion was incorrectly listed as met in
+  the original cut of this amendment; that was a direct contradiction of this same
+  amendment's own bullet stating "the tick does **not** go through a
+  `DaemonDispatch::drain_pending_events` trait method," caught in the codex PR #782
+  review (Medium finding).
+- **Criterion 7** (`khive-runtime` gains no new dependency after `DaemonDispatch` gains
+  `drain_pending_events`): **not met** — vacuously, since no such trait method was added.
+  `cargo tree -p khive-runtime` showing no edge to `khive-mcp`/`khive-request`/`kkernel`
+  remains true today, but for a different reason than the criterion describes (nothing
+  was added to `khive-runtime` at all, rather than something being added safely).
+
+Closing the Criterion 5/6/7 gap — moving to the full `DaemonDispatch::drain_pending_events`
+trait seam with tracked, graceful shutdown and `DrainSummary`/`DrainError` owned by
+`khive-runtime` — remains open follow-on work, tracked separately from the missed-event
+policy (Amendment A) and the runtime-targeting/cadence/pagination fixes (this fix-round)
+this ADR has delivered so far.
