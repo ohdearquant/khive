@@ -1,6 +1,6 @@
 //! Contract test: every non-kg verb must be namespaced as `<pack>.<verb>`.
 //!
-//! The kg substrate pack owns the 17 bare verb names (create, get, list, …).
+//! The kg substrate pack owns the bare verb names (create, get, list, …).
 //! Every other pack must prefix its verbs with the pack name followed by a
 //! single dot: `memory.recall`, `gtd.assign`, etc. Sub-variants use a single
 //! additional underscore-delimited segment, NOT a second dot:
@@ -140,7 +140,7 @@ fn every_non_kg_verb_is_namespaced() {
     );
 }
 
-/// Complementary check: the kg substrate pack must expose all 17 mandated bare
+/// Complementary check: the kg substrate pack must expose all mandated bare
 /// verbs and no dotted ones. This catches regressions in the kg pack itself.
 #[test]
 fn kg_pack_exposes_bare_verbs_only() {
