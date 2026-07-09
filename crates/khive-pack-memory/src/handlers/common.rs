@@ -264,6 +264,22 @@ pub(super) struct RecallParams {
     /// a silent fallback to defaults.
     #[serde(default)]
     pub(super) profile_id: Option<String>,
+    /// ADR-007 Rev 6 §"multi-record ops default to local + explicit escape"
+    /// (#733): exact-match read-namespace override. When absent, recall reads
+    /// the caller token's namespace (which defaults to `local`) — byte-identical
+    /// to pre-#733 behavior. When present, the candidate fetch (FTS + vector +
+    /// the ANN over-fetch retry loop) is scoped to exactly this namespace
+    /// instead of the token's (possibly wider) visible-namespace set. Invalid
+    /// values are rejected via the same `Namespace::parse` machinery used
+    /// elsewhere — never silently coerced.
+    ///
+    /// This is normally already pre-applied by `VerbRegistry::dispatch`'s
+    /// Rule-3 explicit-namespace escape (the token this handler receives
+    /// already carries `visible=[namespace]` in that path) — this field's
+    /// handling below is defense-in-depth for direct (non-dispatch) callers,
+    /// mirroring `RememberParams::namespace` / `handle_remember`.
+    #[serde(default)]
+    pub(super) namespace: Option<String>,
 }
 
 impl RecallParams {

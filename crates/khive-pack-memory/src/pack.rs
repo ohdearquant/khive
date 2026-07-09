@@ -253,6 +253,12 @@ static MEMORY_HANDLERS: [HandlerDef; 10] = [
                 required: false,
                 description: "Tag filter mode: \"any\" (OR, default) or \"all\" (AND). Only applies when tags is non-empty.",
             },
+            ParamDef {
+                name: "namespace",
+                param_type: "string",
+                required: false,
+                description: "Exact-match read-namespace override (ADR-007 Rev 6 escape hatch). When absent, reads the caller's default visible namespace set (unchanged default behavior). When present, scopes the candidate fetch to exactly this namespace; invalid values are rejected.",
+            },
         ],
     },
     HandlerDef {

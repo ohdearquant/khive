@@ -10,7 +10,9 @@ use uuid::Uuid;
 
 use khive_brain_core::PackTunable;
 use khive_fusion::FusionStrategy;
-use khive_runtime::{micros_to_iso, NamespaceToken, RuntimeError, SearchSource, VerbRegistry};
+use khive_runtime::{
+    micros_to_iso, Namespace, NamespaceToken, RuntimeError, SearchSource, VerbRegistry,
+};
 use khive_storage::types::{EdgeFilter, PageRequest};
 use khive_storage::EdgeRelation;
 
@@ -40,6 +42,30 @@ impl MemoryPack {
 
         let recall_start = Instant::now();
         let p: RecallParams = deser(params)?;
+
+        // #733: exact-match read-namespace escape. `VerbRegistry::dispatch`'s
+        // Rule-3 explicit-namespace escape already mints `token` with
+        // `visible=[namespace]` when the caller passed `namespace=` at the
+        // dispatch boundary, so this is normally a no-op re-derivation of the
+        // token we were already handed. It is defense-in-depth for direct
+        // (non-dispatch) callers, mirroring `handle_remember`'s identical
+        // pattern for the write-namespace override. Every subsequent use of
+        // `token` in this function (FTS/vector candidate fetch, the ANN
+        // over-fetch retry loop's visible-namespace gate, the supersedes
+        // graph read, and the serve-ledger namespace stamp) reads this
+        // shadowed binding, so the effective namespace flows uniformly
+        // through the whole pipeline.
+        let effective_token: NamespaceToken = match p.namespace.as_deref() {
+            Some(ns_str) => {
+                let ns = Namespace::parse(ns_str).map_err(|e| {
+                    RuntimeError::InvalidInput(format!("invalid namespace {ns_str:?}: {e}"))
+                })?;
+                token.with_namespace(ns)
+            }
+            None => token.clone(),
+        };
+        let token = &effective_token;
+
         let prof = super::common::recall_profile_enabled();
         let call_id = if prof {
             let id = RECALL_CALL_ID.fetch_add(1, Ordering::Relaxed);
@@ -839,7 +865,7 @@ impl MemoryPack {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
     use std::sync::Arc;
 
     use async_trait::async_trait;
@@ -3283,6 +3309,320 @@ mod tests {
              delta:                      median={:.1}us p95={:.1}us",
             median_with - median_without,
             p95_with - p95_without,
+        );
+    }
+
+    // ── #733 slice 1: optional `namespace` param on memory.recall ──────────
+
+    /// Seeds a fresh in-memory runtime with `kg` + `memory` registered, three
+    /// memories — two in `local`, one in `bench-a` — all sharing a query term
+    /// so a namespace-agnostic FTS/RRF recall would surface all three absent
+    /// any namespace filtering. Returns `(registry, local_id_1, local_id_2,
+    /// bench_id)`.
+    async fn ns733_seed_three_memories() -> (khive_runtime::VerbRegistry, Uuid, Uuid, Uuid) {
+        let rt = KhiveRuntime::memory().expect("in-memory runtime");
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(KgPack::new(rt.clone()));
+        builder.register(MemoryPack::new(rt.clone()));
+        let registry = builder.build().expect("registry");
+
+        async fn remember(
+            registry: &khive_runtime::VerbRegistry,
+            content: &str,
+            namespace: &str,
+        ) -> Uuid {
+            let result = registry
+                .dispatch(
+                    "memory.remember",
+                    serde_json::json!({
+                        "content": content,
+                        "memory_type": "semantic",
+                        "namespace": namespace,
+                    }),
+                )
+                .await
+                .expect("memory.remember");
+            result["id"]
+                .as_str()
+                .expect("id")
+                .parse::<Uuid>()
+                .expect("valid uuid")
+        }
+
+        let local_id_1 = remember(&registry, "ns733 probe term local arm one", "local").await;
+        let local_id_2 = remember(&registry, "ns733 probe term local arm two", "local").await;
+        let bench_id = remember(&registry, "ns733 probe term bench arm alpha", "bench-a").await;
+
+        (registry, local_id_1, local_id_2, bench_id)
+    }
+
+    /// Regression (spec item 1): `namespace` absent must be byte-identical to
+    /// pre-#733 behavior — recall reads the caller token's default visible
+    /// namespace set (`local` here), so a no-arg recall over a corpus with
+    /// two `local` memories and one `bench-a` memory surfaces only the two
+    /// `local` hits.
+    #[tokio::test]
+    #[serial(background_tasks)]
+    async fn ns733_recall_namespace_absent_regresses_to_local_only() {
+        let (registry, local_id_1, local_id_2, _bench_id) = ns733_seed_three_memories().await;
+
+        let result = registry
+            .dispatch(
+                "memory.recall",
+                serde_json::json!({
+                    "query": "ns733 probe term",
+                    "limit": 10
+                }),
+            )
+            .await
+            .expect("memory.recall with no namespace param");
+        let hits = result.as_array().expect("bare array result");
+        let ids: HashSet<Uuid> = hits
+            .iter()
+            .map(|h| h["id"].as_str().expect("id").parse::<Uuid>().expect("uuid"))
+            .collect();
+
+        assert_eq!(
+            ids,
+            HashSet::from([local_id_1, local_id_2]),
+            "no namespace param => must resolve to exactly the caller's default \
+             visible namespace set (local), never bench-a: {hits:?}"
+        );
+    }
+
+    /// Spec item 2: `namespace="bench-a"` returns only the bench-a memory,
+    /// not either `local` memory — the exact-match escape narrows the read
+    /// scope instead of widening it.
+    #[tokio::test]
+    #[serial(background_tasks)]
+    async fn ns733_recall_namespace_explicit_returns_only_that_namespace() {
+        let (registry, _local_id_1, _local_id_2, bench_id) = ns733_seed_three_memories().await;
+
+        let result = registry
+            .dispatch(
+                "memory.recall",
+                serde_json::json!({
+                    "query": "ns733 probe term",
+                    "namespace": "bench-a",
+                    "limit": 10
+                }),
+            )
+            .await
+            .expect("memory.recall with namespace=bench-a");
+        let hits = result.as_array().expect("bare array result");
+        let ids: HashSet<Uuid> = hits
+            .iter()
+            .map(|h| h["id"].as_str().expect("id").parse::<Uuid>().expect("uuid"))
+            .collect();
+
+        assert_eq!(
+            ids,
+            HashSet::from([bench_id]),
+            "namespace=\"bench-a\" must return exactly the bench-a memory and \
+             neither local memory: {hits:?}"
+        );
+    }
+
+    /// Spec item 3: a `namespace` that matches nothing in the corpus returns
+    /// an empty result set with `ok:true` (dispatch succeeds), not an error.
+    #[tokio::test]
+    #[serial(background_tasks)]
+    async fn ns733_recall_namespace_no_match_returns_empty_ok() {
+        let (registry, ..) = ns733_seed_three_memories().await;
+
+        let result = registry
+            .dispatch(
+                "memory.recall",
+                serde_json::json!({
+                    "query": "ns733 probe term",
+                    "namespace": "bench-nonexistent",
+                    "limit": 10
+                }),
+            )
+            .await
+            .expect("memory.recall with a namespace matching no memories must still be Ok");
+        let hits = result.as_array().expect("bare array result");
+        assert!(
+            hits.is_empty(),
+            "namespace matching no memories must yield an empty result set, got: {hits:?}"
+        );
+    }
+
+    /// Spec item 4: an invalid `namespace` string is a per-op error naming
+    /// the problem, never silent coercion to a fallback namespace. Validated
+    /// via the same `Namespace::parse` machinery used elsewhere (a space is
+    /// rejected — `NamespaceError::InvalidCharacter`).
+    #[tokio::test]
+    #[serial(background_tasks)]
+    async fn ns733_recall_invalid_namespace_is_a_per_op_error() {
+        let (registry, ..) = ns733_seed_three_memories().await;
+
+        let result = registry
+            .dispatch(
+                "memory.recall",
+                serde_json::json!({
+                    "query": "ns733 probe term",
+                    "namespace": "bad namespace",
+                    "limit": 10
+                }),
+            )
+            .await;
+
+        let err = result.expect_err(
+            "an invalid namespace string must be a per-op error, not a silent fallback",
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.to_lowercase().contains("namespace"),
+            "error message must name the problem (namespace), got: {msg}"
+        );
+    }
+
+    const NS733_ANN_MODEL: &str = "ns733-ann-namespace-model";
+    const NS733_QUERY: &str = "ns733 ann overfetch query";
+    const NS733_TARGET_CONTENT: &str = "ns733 ann overfetch bench target";
+    const NS733_FILLER_COUNT: usize = 35;
+
+    /// 8-dim vectors, first two components carry signal (ADR-104 test pattern
+    /// reused here). Query = (1, 0) — cos 1.0 against itself. All 35 `local`
+    /// filler notes share an identical vector at cos 0.9 against the query;
+    /// the single `bench-a` target sits at cos 0.5, strictly below every
+    /// filler. Cosine-ranked purely by similarity, the target is therefore
+    /// guaranteed last (rank 36 of 36) — not a probabilistic near-miss.
+    fn ns733_ann_fixed_vectors() -> HashMap<String, Vec<f32>> {
+        let mut m = HashMap::new();
+        m.insert(
+            NS733_QUERY.to_string(),
+            vec![1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        );
+        for i in 0..NS733_FILLER_COUNT {
+            m.insert(
+                format!("ns733 ann overfetch local filler {i}"),
+                vec![0.9, 0.4358899, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            );
+        }
+        m.insert(
+            NS733_TARGET_CONTENT.to_string(),
+            vec![0.5, 0.8660254, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        );
+        m
+    }
+
+    /// Spec item 5: the ANN over-fetch retry loop (`config.rs`'s
+    /// "visible-namespace candidates" widening, `ann_overfetch_max_rounds`)
+    /// must respect the effective (explicit-namespace-narrowed) visible set,
+    /// not just eventually surface *a* result.
+    ///
+    /// Setup: a single global per-model ANN index (confirmed at the source —
+    /// `AnnKey` carries no namespace field, `ann.rs`: "One index per model
+    /// covers all namespaces") holds 35 `local` filler vectors all closer to
+    /// the query than the one `bench-a` target vector, with `candidate_limit`
+    /// pinned to 1 so the initial over-fetch window (`max(limit*4,
+    /// limit+32)` = 33) is narrower than the filler count — round 1 excludes
+    /// the target outright. This proves two things in one test:
+    ///
+    /// 1. With default widening (`ann_overfetch_max_rounds` unset, env
+    ///    fallback 3): the retry loop widens past round 1, the target enters
+    ///    the fetch window, and `namespace="bench-a"`'s post-filter still
+    ///    returns *only* the target — none of the 35 `local` fillers ever
+    ///    leak into the response despite sharing the same global ANN index.
+    /// 2. With widening explicitly disabled (`ann_overfetch_max_rounds: 1`,
+    ///    per `config.rs`'s "Pass `Some(1)` to disable widening entirely"):
+    ///    the same query against the same corpus returns nothing — proving
+    ///    the round-1 result in case 1 was not a coincidence of corpus size,
+    ///    but genuinely produced by the widening loop.
+    #[tokio::test]
+    #[serial(background_tasks)]
+    async fn ns733_recall_ann_overfetch_retry_loop_respects_effective_namespace() {
+        let rt = KhiveRuntime::memory().expect("in-memory runtime");
+        rt.register_embedder(FixedVecProvider {
+            model_name: NS733_ANN_MODEL.to_string(),
+            map: ns733_ann_fixed_vectors(),
+        });
+
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(KgPack::new(rt.clone()));
+        builder.register(MemoryPack::new(rt.clone()));
+        let registry = builder.build().expect("registry");
+
+        // No `embedding_model` on remember: `create_note_inner`'s auto-detect
+        // path fans out to every *registered* model when the field is
+        // omitted (`resolve_embedding_model` only accepts lattice aliases —
+        // an explicit custom provider name here would hit `UnknownModel`,
+        // same gotcha documented on `recall_with_residual_fts5_char_fails_loud`
+        // above). `NS733_ANN_MODEL` is the only model registered on this
+        // runtime, so auto-detect resolves to exactly it.
+        for i in 0..NS733_FILLER_COUNT {
+            registry
+                .dispatch(
+                    "memory.remember",
+                    serde_json::json!({
+                        "content": format!("ns733 ann overfetch local filler {i}"),
+                        "memory_type": "semantic",
+                        "namespace": "local",
+                    }),
+                )
+                .await
+                .expect("remember filler");
+        }
+        let target_id = registry
+            .dispatch(
+                "memory.remember",
+                serde_json::json!({
+                    "content": NS733_TARGET_CONTENT,
+                    "memory_type": "semantic",
+                    "namespace": "bench-a",
+                }),
+            )
+            .await
+            .expect("remember target")["id"]
+            .as_str()
+            .expect("id")
+            .parse::<Uuid>()
+            .expect("valid uuid");
+
+        let base_params = serde_json::json!({
+            "query": NS733_QUERY,
+            "namespace": "bench-a",
+            "fusion_strategy": "vector_only",
+            "embedding_model": NS733_ANN_MODEL,
+            "config": { "candidate_limit": 1 },
+            "limit": 1,
+        });
+
+        // Case 1: default widening — the target must be found, and only the target.
+        let widened_result = registry
+            .dispatch("memory.recall", base_params.clone())
+            .await
+            .expect("memory.recall with default widening");
+        let widened_hits = widened_result.as_array().expect("bare array result");
+        assert_eq!(
+            widened_hits.len(),
+            1,
+            "default widening must surface exactly the bench-a target, got: {widened_hits:?}"
+        );
+        assert_eq!(
+            widened_hits[0]["id"]
+                .as_str()
+                .and_then(|s| s.parse::<Uuid>().ok()),
+            Some(target_id),
+            "the single hit must be the bench-a target, not a local filler"
+        );
+
+        // Case 2: widening disabled (`ann_overfetch_max_rounds: 1`) — round 1's
+        // narrow window is exhausted entirely by `local` fillers ranked ahead
+        // of the target, so the namespace-scoped post-filter finds nothing.
+        let mut disabled_params = base_params;
+        disabled_params["config"]["ann_overfetch_max_rounds"] = serde_json::json!(1);
+        let disabled_result = registry
+            .dispatch("memory.recall", disabled_params)
+            .await
+            .expect("memory.recall with widening disabled");
+        let disabled_hits = disabled_result.as_array().expect("bare array result");
+        assert!(
+            disabled_hits.is_empty(),
+            "with widening disabled, round 1's over-fetch window is saturated by \
+             closer local fillers and must not reach the bench-a target: {disabled_hits:?}"
         );
     }
 }
