@@ -3726,6 +3726,59 @@ mod tests {
         m
     }
 
+    /// Seeds `registry`'s runtime with `NS733B_FILLER_COUNT` `local` filler
+    /// memories plus one `bench-a` target memory, all sharing
+    /// `ns733b_fixed_vectors`'s vector scheme (query cos 1.0, fillers cos
+    /// 0.9, target cos 0.5). No `embedding_model` on remember: auto-detect
+    /// fans out to every registered model, matching
+    /// `ns733_seed_three_memories`'s documented gotcha above. Shared between
+    /// the `memory.recall` verbose-breakdown regression (#733 fix-round 1,
+    /// High) and the `memory.recall_candidates` regression (#733 fix-round
+    /// 2, Medium) that protects `handle_recall_candidates`'s independent
+    /// per-model serialization site (`sub_handlers.rs`). Returns
+    /// `(local_filler_ids, target_id)`.
+    async fn ns733b_seed_two_model_corpus(
+        registry: &khive_runtime::VerbRegistry,
+    ) -> (HashSet<Uuid>, Uuid) {
+        let mut local_filler_ids: HashSet<Uuid> = HashSet::new();
+        for i in 0..NS733B_FILLER_COUNT {
+            let r = registry
+                .dispatch(
+                    "memory.remember",
+                    serde_json::json!({
+                        "content": format!("ns733b breakdown local filler {i}"),
+                        "memory_type": "semantic",
+                        "namespace": "local",
+                    }),
+                )
+                .await
+                .expect("remember filler");
+            local_filler_ids.insert(
+                r["id"]
+                    .as_str()
+                    .expect("id")
+                    .parse::<Uuid>()
+                    .expect("valid uuid"),
+            );
+        }
+        let target_id = registry
+            .dispatch(
+                "memory.remember",
+                serde_json::json!({
+                    "content": NS733B_TARGET_CONTENT,
+                    "memory_type": "semantic",
+                    "namespace": "bench-a",
+                }),
+            )
+            .await
+            .expect("remember target")["id"]
+            .as_str()
+            .expect("id")
+            .parse::<Uuid>()
+            .expect("valid uuid");
+        (local_filler_ids, target_id)
+    }
+
     /// Codex review finding (#733 fix-round 1, High): with `namespace="bench-a"`,
     /// more than one registered embedding model, and `include_breakdown=true`,
     /// `memory.recall`'s verbose response embeds
@@ -3786,45 +3839,7 @@ mod tests {
             builder.register(MemoryPack::new(rt.clone()));
             let registry = builder.build().expect("registry");
 
-            // No `embedding_model` on remember: auto-detect fans out to every
-            // registered model (both A and B), matching
-            // `ns733_seed_three_memories`'s documented gotcha above.
-            let mut local_filler_ids: HashSet<Uuid> = HashSet::new();
-            for i in 0..NS733B_FILLER_COUNT {
-                let r = registry
-                    .dispatch(
-                        "memory.remember",
-                        serde_json::json!({
-                            "content": format!("ns733b breakdown local filler {i}"),
-                            "memory_type": "semantic",
-                            "namespace": "local",
-                        }),
-                    )
-                    .await
-                    .expect("remember filler");
-                local_filler_ids.insert(
-                    r["id"]
-                        .as_str()
-                        .expect("id")
-                        .parse::<Uuid>()
-                        .expect("valid uuid"),
-                );
-            }
-            let target_id = registry
-                .dispatch(
-                    "memory.remember",
-                    serde_json::json!({
-                        "content": NS733B_TARGET_CONTENT,
-                        "memory_type": "semantic",
-                        "namespace": "bench-a",
-                    }),
-                )
-                .await
-                .expect("remember target")["id"]
-                .as_str()
-                .expect("id")
-                .parse::<Uuid>()
-                .expect("valid uuid");
+            let (local_filler_ids, target_id) = ns733b_seed_two_model_corpus(&registry).await;
 
             let recall_args = serde_json::json!({
                 "query": NS733B_QUERY,
@@ -3920,6 +3935,153 @@ mod tests {
             any_model_has_target,
             "the bench-a target must still appear in at least one model's \
              breakdown after the namespace filter: {per_model:?}"
+        );
+    }
+
+    // ── #733 fix-round 2 (codex Medium): `memory.recall_candidates` must be
+    // covered by its own regression, independent of `memory.recall`'s ──────
+
+    /// Codex re-review finding (#733 fix-round 2, Medium): the fix-round-1
+    /// regression above dispatches only `memory.recall` with
+    /// `include_breakdown=true`, which is mutation-sensitive for
+    /// `handle_recall`'s filter (`recall.rs`) but *not* for
+    /// `handle_recall_candidates`'s independent filter (`sub_handlers.rs:182`,
+    /// reached via the separate `memory.recall_candidates` verb —
+    /// `pack.rs`'s dispatch table routes the two verbs to two different
+    /// handler functions with two separate `vector_hits_per_model`
+    /// serialization sites). Removing the `.filter(...)` at
+    /// `sub_handlers.rs:182` would not fail any existing test. This
+    /// dispatches `memory.recall_candidates` directly against the identical
+    /// two-model/`local`-fillers/`bench-a`-target corpus and asserts the
+    /// same no-leak + target-present properties against
+    /// `handle_recall_candidates`'s response shape, which differs from
+    /// `handle_recall`'s: `vector_candidates_per_model` here is a JSON
+    /// *object* keyed by model name (`{"model-a": [...], "model-b": [...]}`,
+    /// `sub_handlers.rs:194`), not an array of `{model, hits}` entries.
+    #[tokio::test]
+    #[serial(background_tasks)]
+    async fn ns733b_recall_candidates_multi_model_excludes_off_namespace_candidates() {
+        // Same pre-existing ANN-warm race documented in detail on
+        // `ns733b_recall_verbose_multi_model_breakdown_excludes_off_namespace_candidates`
+        // above applies identically here — `handle_recall_candidates` reads
+        // the same shared per-model ANN index via the same
+        // `collect_recall_candidates` path `handle_recall` uses. Same bounded
+        // fresh-runtime retry.
+        const MAX_ATTEMPTS: usize = 5;
+        let mut last_failure: Option<String> = None;
+
+        'attempt: for attempt in 1..=MAX_ATTEMPTS {
+            let rt = KhiveRuntime::memory().expect("in-memory runtime");
+            rt.register_embedder(FixedVecProvider {
+                model_name: NS733B_MODEL_A.to_string(),
+                map: ns733b_fixed_vectors(),
+            });
+            rt.register_embedder(FixedVecProvider {
+                model_name: NS733B_MODEL_B.to_string(),
+                map: ns733b_fixed_vectors(),
+            });
+
+            let mut builder = VerbRegistryBuilder::new();
+            builder.register(KgPack::new(rt.clone()));
+            builder.register(MemoryPack::new(rt.clone()));
+            let registry = builder.build().expect("registry");
+
+            let (local_filler_ids, target_id) = ns733b_seed_two_model_corpus(&registry).await;
+
+            // `memory.recall_candidates`'s `HandlerDef` declares no
+            // `namespace` `ParamDef` (`pack.rs`: `params: &[]`), so
+            // `VerbRegistry::dispatch`'s generic Rule-3 explicit-namespace
+            // escape (ADR-007 Rev 4/6) is the *only* thing scoping this call
+            // — it mints the token with `visible=["bench-a"]` before
+            // `handle_recall_candidates` ever runs, then strips the
+            // `namespace` key from params (the handler never sees it). No
+            // `fusion_strategy`/`include_breakdown` params exist on this
+            // sub-verb — it always returns the per-model breakdown whenever
+            // more than one model is registered (`sub_handlers.rs:168`).
+            let recall_candidates_args = serde_json::json!({
+                "query": NS733B_QUERY,
+                "namespace": "bench-a",
+                "limit": 10,
+            });
+            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+            let settled_result: Value;
+            loop {
+                let result = registry
+                    .dispatch("memory.recall_candidates", recall_candidates_args.clone())
+                    .await
+                    .expect("memory.recall_candidates with namespace + multi-model");
+                let settled = result["vector_candidates_per_model"]
+                    .as_object()
+                    .is_some_and(|per_model| {
+                        per_model.len() == 2
+                            && per_model.values().any(|hits| {
+                                hits.as_array().is_some_and(|hits| {
+                                    hits.iter().any(|hit| {
+                                        hit["id"].as_str().and_then(|s| s.parse::<Uuid>().ok())
+                                            == Some(target_id)
+                                    })
+                                })
+                            })
+                    });
+                if settled {
+                    settled_result = result;
+                    break;
+                }
+                if std::time::Instant::now() >= deadline {
+                    last_failure = Some(format!(
+                        "attempt {attempt}/{MAX_ATTEMPTS}: ANN warm for the bench-a target \
+                         did not settle within 500ms; last response: {result}"
+                    ));
+                    continue 'attempt;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+
+            let per_model = settled_result["vector_candidates_per_model"]
+                .as_object()
+                .expect("multi-model breakdown present (two models registered)");
+            assert_eq!(
+                per_model.len(),
+                2,
+                "both registered models must appear in the breakdown: {per_model:?}"
+            );
+
+            for (model_name, hits) in per_model {
+                let hits = hits.as_array().expect("hits array");
+                for hit in hits {
+                    let id = hit["id"]
+                        .as_str()
+                        .expect("id")
+                        .parse::<Uuid>()
+                        .expect("valid uuid");
+                    assert!(
+                        !local_filler_ids.contains(&id),
+                        "namespace=\"bench-a\" recall_candidates breakdown must not leak a \
+                         local filler UUID ({id}) for model {model_name:?}: {hits:?}"
+                    );
+                }
+            }
+
+            // Sanity: the fix must not have filtered away everything — the
+            // bench-a target itself is entitled to appear (proves this is a
+            // real filter, not a filter-everything regression).
+            let any_model_has_target = per_model.values().any(|hits| {
+                hits.as_array().unwrap().iter().any(|hit| {
+                    hit["id"].as_str().and_then(|s| s.parse::<Uuid>().ok()) == Some(target_id)
+                })
+            });
+            assert!(
+                any_model_has_target,
+                "the bench-a target must still appear in at least one model's \
+                 recall_candidates breakdown after the namespace filter: {per_model:?}"
+            );
+            return;
+        }
+
+        panic!(
+            "ns733b recall_candidates: corpus/ANN-warm race did not settle in {MAX_ATTEMPTS} \
+             fresh attempts; last failure: {}",
+            last_failure.unwrap_or_default()
         );
     }
 }
