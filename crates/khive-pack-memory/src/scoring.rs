@@ -742,6 +742,35 @@ pub fn calculate_score(input: &ScoreInput<'_>, config: &ScoringConfig) -> f32 {
     score.clamp(0.0, 1.0)
 }
 
+// ── ADR-104 §2 (Stage B): bounded per-entity posterior term ───────────────────
+
+/// Default weight for the per-entity posterior term. Chosen so the clamp
+/// bounds below are exactly reachable at posterior means of 0.0 and 1.0
+/// (`1 + 0.3 * (0.0 - 0.5) = 0.85`, `1 + 0.3 * (1.0 - 0.5) = 1.15`).
+pub const ENTITY_POSTERIOR_WEIGHT: f32 = 0.3;
+
+/// Lower bound of the per-entity posterior multiplier — the term can never
+/// move a score down by more than 15%.
+pub const ENTITY_POSTERIOR_CLAMP_MIN: f32 = 0.85;
+
+/// Upper bound of the per-entity posterior multiplier — the term can never
+/// move a score up by more than 15%.
+pub const ENTITY_POSTERIOR_CLAMP_MAX: f32 = 1.15;
+
+/// `clamp(1 + w_ent * (entity_posterior_mean - 0.5), 0.85, 1.15)`.
+///
+/// `None` (no posterior for this candidate beyond the uninformative prior)
+/// is neutral: exactly `1.0`, not the midpoint of the clamp band. Untouched
+/// memories must be unaffected — the neutral value has to be an identity
+/// multiplier, not a value that happens to fall inside the bounds.
+pub fn entity_posterior_term(entity_posterior_mean: Option<f64>, w_ent: f32) -> f32 {
+    match entity_posterior_mean {
+        Some(mean) => (1.0 + w_ent * (mean as f32 - 0.5))
+            .clamp(ENTITY_POSTERIOR_CLAMP_MIN, ENTITY_POSTERIOR_CLAMP_MAX),
+        None => 1.0,
+    }
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -1196,5 +1225,58 @@ mod tests {
             AdjustmentCondition::EntityMatch.matches(&ctx),
             "boundary anchoring must not break matching the actual word"
         );
+    }
+
+    // ── ADR-104 §2 (Stage B): entity_posterior_term ────────────────────────────
+
+    #[test]
+    fn entity_posterior_term_neutral_when_no_posterior() {
+        assert_eq!(entity_posterior_term(None, ENTITY_POSTERIOR_WEIGHT), 1.0);
+    }
+
+    #[test]
+    fn entity_posterior_term_neutral_at_uninformative_prior_mean() {
+        // Beta(1,1) mean = 0.5 — the uninformative prior itself, distinct
+        // from `None`, must also be an identity multiplier.
+        let term = entity_posterior_term(Some(0.5), ENTITY_POSTERIOR_WEIGHT);
+        assert!((term - 1.0).abs() < 1e-6, "got {term}");
+    }
+
+    #[test]
+    fn entity_posterior_term_reaches_low_clamp_bound_at_mean_zero() {
+        let term = entity_posterior_term(Some(0.0), ENTITY_POSTERIOR_WEIGHT);
+        assert!(
+            (term - ENTITY_POSTERIOR_CLAMP_MIN).abs() < 1e-6,
+            "w_ent=0.3 at mean=0.0 must land exactly on the 0.85 clamp bound, got {term}"
+        );
+    }
+
+    #[test]
+    fn entity_posterior_term_reaches_high_clamp_bound_at_mean_one() {
+        let term = entity_posterior_term(Some(1.0), ENTITY_POSTERIOR_WEIGHT);
+        assert!(
+            (term - ENTITY_POSTERIOR_CLAMP_MAX).abs() < 1e-6,
+            "w_ent=0.3 at mean=1.0 must land exactly on the 1.15 clamp bound, got {term}"
+        );
+    }
+
+    #[test]
+    fn entity_posterior_term_never_exceeds_clamp_bounds_for_out_of_range_input() {
+        // A Beta posterior mean is mathematically bounded to [0, 1], but the
+        // clamp must hold defensively regardless — the term is never allowed
+        // to move a score by more than +-15% no matter what value reaches it.
+        let low = entity_posterior_term(Some(-5.0), ENTITY_POSTERIOR_WEIGHT);
+        let high = entity_posterior_term(Some(5.0), ENTITY_POSTERIOR_WEIGHT);
+        assert_eq!(low, ENTITY_POSTERIOR_CLAMP_MIN);
+        assert_eq!(high, ENTITY_POSTERIOR_CLAMP_MAX);
+    }
+
+    #[test]
+    fn entity_posterior_term_moves_monotonically_with_mean() {
+        let low = entity_posterior_term(Some(0.2), ENTITY_POSTERIOR_WEIGHT);
+        let mid = entity_posterior_term(Some(0.5), ENTITY_POSTERIOR_WEIGHT);
+        let high = entity_posterior_term(Some(0.8), ENTITY_POSTERIOR_WEIGHT);
+        assert!(low < mid, "low={low} mid={mid}");
+        assert!(mid < high, "mid={mid} high={high}");
     }
 }

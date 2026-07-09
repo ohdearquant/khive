@@ -185,13 +185,13 @@ static MEMORY_HANDLERS: [HandlerDef; 10] = [
                 name: "min_score",
                 param_type: "number",
                 required: false,
-                description: "Minimum composite score to include (default 0.0). Composite scores are always in [0,1]: relevance is normalized to [0,1] per strategy (RRF rank-1 → 1.0; Weighted scores are [0,1] natively), and all three weighted contributions sum to at most 1.0. Typical production floor: 0.3–0.7.",
+                description: "Minimum rank_score to include (default 0.0). This filters `rank_score`, not `score`: `score` (absolute/raw relevance in each result) stays in [0,1] regardless of fusion strategy, but `rank_score` (the composite used for ranking and this filter) is the weighted relevance/salience/temporal composite — nominally [0,1] — further adjusted by ADR-104 posterior terms whenever a brain profile serves the request: a weight-reprojection component, and a per-entity term bounded to clamp(1 + 0.3 * (entity_posterior_mean - 0.5), 0.85, 1.15). So a served, positively-reinforced memory's rank_score can exceed 1.0 by up to 15%. Typical production floor: 0.3–0.7.",
             },
             ParamDef {
                 name: "score_floor",
                 param_type: "number",
                 required: false,
-                description: "Alias for min_score. Filter out hits below this composite score. Scores are always in [0,1] regardless of fusion strategy.",
+                description: "Alias for min_score. Filters by `rank_score`, not `score` — see min_score for the [0,1]-plus-up-to-15%-under-ADR-104 range of rank_score when a profile serves the request. `score` (absolute/raw relevance) stays in [0,1] regardless of fusion strategy or served profile.",
             },
             ParamDef {
                 name: "min_salience",
