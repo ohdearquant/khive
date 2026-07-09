@@ -114,6 +114,7 @@ For historical context, see [v0 archive](../_archive/adr_v0/README.md). v0 ADRs 
 | [ADR-086](ADR-086-doc-file-pack.md)                          | Document/File Modeling — Content on the Existing `document` Entity Kind (Proposed)                              |
 | [ADR-087](ADR-087-workspace-mirror.md)                       | Workspace Mirror — Folding `.khive/` Into the Graph Substrate (Proposed)                                        |
 | [ADR-088](ADR-088-git-lifecycle-pack.md)                     | Git-Lifecycle Pack — Commit and Issue Note Kinds (Proposed)                                                     |
+| [ADR-088 Amendment 1](ADR-088-amendment-1-git-digest.md)     | `git.digest` — Agent-Facing Digest Verb with Remote-URL Support (Accepted)                                      |
 | [ADR-089](ADR-089-context-verb.md)                           | Context Verb — Entity-Anchored Graph Context in One Call (Proposed)                                             |
 | [ADR-090](ADR-090-docs-site-standard.md)                     | Docs Site Standard — Navigation, Agent md/txt Surfaces, Visual Style (Proposed)                                 |
 | [ADR-091](ADR-091-wal-snapshot-lifetime.md)                  | Bounded Read-Transaction Lifetime and WAL Checkpoint Escalation (Accepted)                                      |
