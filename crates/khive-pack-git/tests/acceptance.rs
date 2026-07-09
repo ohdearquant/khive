@@ -219,10 +219,7 @@ async fn ingest_links_commits_to_document_and_pr_by_provenance_query() {
         &rt,
         &token,
         &registry,
-        IngestOptions {
-            repo: repo.to_path_buf(),
-            project: project_id.to_string(),
-        },
+        IngestOptions::unbounded(repo.to_path_buf(), project_id.to_string()),
     )
     .await
     .expect("ingest ok");
@@ -331,10 +328,7 @@ async fn ingest_masks_secrets_in_commit_message() {
         &rt,
         &token,
         &registry,
-        IngestOptions {
-            repo: repo.to_path_buf(),
-            project: project_id.to_string(),
-        },
+        IngestOptions::unbounded(repo.to_path_buf(), project_id.to_string()),
     )
     .await
     .expect("ingest ok");
@@ -485,10 +479,7 @@ async fn issue_and_pr_idempotency_is_scoped_per_project() {
         &rt,
         &token,
         &registry,
-        IngestOptions {
-            repo: repo_b.clone(),
-            project: project_b.to_string(),
-        },
+        IngestOptions::unbounded(repo_b.clone(), project_b.to_string()),
     )
     .await
     .expect("ingest ok (pass 1)");
@@ -543,10 +534,7 @@ async fn issue_and_pr_idempotency_is_scoped_per_project() {
         &rt,
         &token,
         &registry,
-        IngestOptions {
-            repo: repo_b.clone(),
-            project: project_b.to_string(),
-        },
+        IngestOptions::unbounded(repo_b.clone(), project_b.to_string()),
     )
     .await
     .expect("ingest ok (pass 2)");
@@ -646,10 +634,7 @@ async fn gh_boundary_contract_and_partial_ingest_failure() {
         &rt,
         &token,
         &registry,
-        IngestOptions {
-            repo: repo.clone(),
-            project: project_id.to_string(),
-        },
+        IngestOptions::unbounded(repo.clone(), project_id.to_string()),
     )
     .await
     .expect("ingest ok (pass 1)");
@@ -756,10 +741,7 @@ async fn gh_boundary_contract_and_partial_ingest_failure() {
         &rt,
         &token,
         &registry,
-        IngestOptions {
-            repo: repo.clone(),
-            project: project_id.to_string(),
-        },
+        IngestOptions::unbounded(repo.clone(), project_id.to_string()),
     )
     .await
     .expect("ingest ok (pass 2)");
@@ -862,10 +844,7 @@ async fn issue_ingest_sorts_by_updated_at_so_frozen_cursor_survives_out_of_order
         &rt,
         &token,
         &registry,
-        IngestOptions {
-            repo: repo.clone(),
-            project: project_id.to_string(),
-        },
+        IngestOptions::unbounded(repo.clone(), project_id.to_string()),
     )
     .await
     .expect("ingest ok (pass 1)");
@@ -907,10 +886,7 @@ async fn issue_ingest_sorts_by_updated_at_so_frozen_cursor_survives_out_of_order
         &rt,
         &token,
         &registry,
-        IngestOptions {
-            repo: repo.clone(),
-            project: project_id.to_string(),
-        },
+        IngestOptions::unbounded(repo.clone(), project_id.to_string()),
     )
     .await
     .expect("ingest ok (pass 2)");
@@ -1005,10 +981,7 @@ async fn pr_ingest_sorts_by_updated_at_so_frozen_cursor_survives_out_of_order_li
         &rt,
         &token,
         &registry,
-        IngestOptions {
-            repo: repo.clone(),
-            project: project_id.to_string(),
-        },
+        IngestOptions::unbounded(repo.clone(), project_id.to_string()),
     )
     .await
     .expect("ingest ok (pass 1)");
@@ -1050,10 +1023,7 @@ async fn pr_ingest_sorts_by_updated_at_so_frozen_cursor_survives_out_of_order_li
         &rt,
         &token,
         &registry,
-        IngestOptions {
-            repo: repo.clone(),
-            project: project_id.to_string(),
-        },
+        IngestOptions::unbounded(repo.clone(), project_id.to_string()),
     )
     .await
     .expect("ingest ok (pass 2)");
@@ -1154,10 +1124,7 @@ async fn issue_ingest_retries_tie_at_cursor_timestamp() {
         &rt,
         &token,
         &registry,
-        IngestOptions {
-            repo: repo.clone(),
-            project: project_id.to_string(),
-        },
+        IngestOptions::unbounded(repo.clone(), project_id.to_string()),
     )
     .await
     .expect("ingest ok (pass 1)");
@@ -1196,10 +1163,7 @@ async fn issue_ingest_retries_tie_at_cursor_timestamp() {
         &rt,
         &token,
         &registry,
-        IngestOptions {
-            repo: repo.clone(),
-            project: project_id.to_string(),
-        },
+        IngestOptions::unbounded(repo.clone(), project_id.to_string()),
     )
     .await
     .expect("ingest ok (pass 2)");
@@ -1283,10 +1247,7 @@ async fn pr_ingest_retries_tie_at_cursor_timestamp() {
         &rt,
         &token,
         &registry,
-        IngestOptions {
-            repo: repo.clone(),
-            project: project_id.to_string(),
-        },
+        IngestOptions::unbounded(repo.clone(), project_id.to_string()),
     )
     .await
     .expect("ingest ok (pass 1)");
@@ -1325,10 +1286,7 @@ async fn pr_ingest_retries_tie_at_cursor_timestamp() {
         &rt,
         &token,
         &registry,
-        IngestOptions {
-            repo: repo.clone(),
-            project: project_id.to_string(),
-        },
+        IngestOptions::unbounded(repo.clone(), project_id.to_string()),
     )
     .await
     .expect("ingest ok (pass 2)");
@@ -1367,4 +1325,210 @@ async fn pr_ingest_retries_tie_at_cursor_timestamp() {
         2,
         "exactly #5, #20 — no duplicates: {numbers:?}"
     );
+}
+
+// ── `git.digest` verb (ADR-088 Amendment 1) ─────────────────────────────────
+
+/// End-to-end over the `git.digest` verb itself (not `run_ingest` directly):
+/// no `project` argument auto-creates the repo-anchor entity (reported via
+/// `project_created`), a `Closes #N` commit message materializes an
+/// `annotates` edge (with `ref_kind: "closes"`) from the commit to a
+/// pre-existing `issue` note, a second commit's `parents[]` materializes a
+/// `precedes` edge from parent to child, and both commit and issue notes get
+/// the amendment's readable `name`.
+#[tokio::test]
+async fn digest_verb_auto_creates_project_and_enriches_references() {
+    let _guard = ENV_MUTEX.lock().await;
+    let (_rt, _token, registry) = fixture().await;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    init_repo(repo);
+    write(repo, "README.md", "hello\n");
+    commit(repo, &["README.md"], "Initial commit");
+
+    let first = registry
+        .dispatch(
+            "git.digest",
+            json!({"source": repo.to_str().unwrap(), "max_items": 10}),
+        )
+        .await
+        .expect("digest ok (pass 1)");
+
+    assert_eq!(first["done"], true, "{first}");
+    assert_eq!(first["project_created"], true, "{first}");
+    assert_eq!(first["commits_ingested"], 1, "{first}");
+    let project_id = first["project_id"]
+        .as_str()
+        .expect("project_id present")
+        .to_string();
+
+    // Second digest call for the same local path resolves the SAME project
+    // (no duplicate anchor entity).
+    let second = registry
+        .dispatch(
+            "git.digest",
+            json!({"source": repo.to_str().unwrap(), "max_items": 10}),
+        )
+        .await
+        .expect("digest ok (pass 2, no new commits)");
+    assert_eq!(second["project_created"], false, "{second}");
+    assert_eq!(second["project_id"], project_id, "{second}");
+    assert_eq!(
+        second["commits_ingested"], 0,
+        "no new commits since pass 1: {second}"
+    );
+
+    // Pre-create an issue #42 the project already tracks (as if ingested by
+    // an earlier `gh`-backed pass), then a commit whose message closes it.
+    let issue_id = create(
+        &registry,
+        json!({
+            "kind": "issue",
+            "content": "",
+            "properties": {"number": 42, "title": "Some bug", "project_id": project_id},
+            "annotates": [project_id],
+        }),
+    )
+    .await;
+
+    write(repo, "src/lib.rs", "// fix\n");
+    commit(repo, &["src/lib.rs"], "Fix the bug\n\nCloses #42");
+    let commit2_sha = head_sha(repo);
+
+    let third = registry
+        .dispatch(
+            "git.digest",
+            json!({"source": repo.to_str().unwrap(), "project": project_id, "max_items": 10}),
+        )
+        .await
+        .expect("digest ok (pass 3)");
+    assert_eq!(third["commits_ingested"], 1, "{third}");
+    assert_eq!(
+        third["reference_edges_created"], 1,
+        "the Closes #42 reference resolves: {third}"
+    );
+    assert_eq!(
+        third["parent_edges_created"], 1,
+        "the second commit's parent link to the first: {third}"
+    );
+
+    // The issue has exactly one incoming `annotates` edge, from the closing
+    // commit, carrying ref_kind=closes.
+    let issue_neighbors = registry
+        .dispatch(
+            "neighbors",
+            json!({"id": issue_id.to_string(), "direction": "incoming", "relations": ["annotates"]}),
+        )
+        .await
+        .expect("neighbors ok");
+    let hits = issue_neighbors.as_array().expect("array");
+    assert_eq!(hits.len(), 1, "{hits:?}");
+    assert_eq!(hits[0]["kind"], "commit");
+
+    // The closing commit's own record carries the readable name and its sha.
+    let commit_note = registry
+        .dispatch("list", json!({"kind": "commit", "limit": 10}))
+        .await
+        .expect("list ok");
+    let items = commit_note.as_array().expect("array");
+    let closing = items
+        .iter()
+        .find(|c| c["properties"]["sha"] == commit2_sha)
+        .expect("closing commit note present");
+    let name = closing["name"].as_str().expect("name present");
+    assert!(
+        name.contains("Fix the bug"),
+        "commit name must carry the subject: {name:?}"
+    );
+
+    // Parent -> child `precedes` edge: the first commit precedes the second.
+    let first_commit = items
+        .iter()
+        .find(|c| c["properties"]["sha"] != commit2_sha)
+        .expect("first commit note present");
+    let first_commit_id = first_commit["id"].as_str().expect("id present");
+    let precedes_neighbors = registry
+        .dispatch(
+            "neighbors",
+            json!({"id": first_commit_id, "direction": "outgoing", "relations": ["precedes"]}),
+        )
+        .await
+        .expect("neighbors ok");
+    let precedes_hits = precedes_neighbors.as_array().expect("array");
+    assert_eq!(
+        precedes_hits.len(),
+        1,
+        "the first commit precedes exactly the second: {precedes_hits:?}"
+    );
+    assert_eq!(
+        precedes_hits[0]["id"].as_str().unwrap(),
+        closing["id"].as_str().unwrap()
+    );
+}
+
+/// `max_items` bounds work per call and the response is cursor-resumable:
+/// looping `git.digest` calls until `done` eventually ingests every commit
+/// with no duplicates.
+#[tokio::test]
+async fn digest_verb_max_items_is_bounded_and_resumable() {
+    let _guard = ENV_MUTEX.lock().await;
+    let (_rt, _token, registry) = fixture().await;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    init_repo(repo);
+    for i in 0..3 {
+        write(repo, "f.txt", &format!("v{i}\n"));
+        commit(repo, &["f.txt"], &format!("commit {i}"));
+    }
+
+    let mut total_ingested = 0u64;
+    let mut project_id: Option<String> = None;
+    let mut calls = 0;
+    loop {
+        calls += 1;
+        assert!(calls <= 10, "must converge well within 10 calls");
+        let mut args =
+            json!({"source": repo.to_str().unwrap(), "max_items": 1, "include": ["commits"]});
+        if let Some(p) = &project_id {
+            args["project"] = json!(p);
+        }
+        let resp = registry
+            .dispatch("git.digest", args)
+            .await
+            .expect("digest ok");
+        project_id = Some(resp["project_id"].as_str().unwrap().to_string());
+        total_ingested += resp["commits_ingested"].as_u64().unwrap();
+        if resp["done"].as_bool().unwrap() {
+            break;
+        }
+    }
+    assert_eq!(total_ingested, 3, "all three commits eventually ingest");
+
+    let list = registry
+        .dispatch("list", json!({"kind": "commit", "limit": 10}))
+        .await
+        .expect("list ok");
+    assert_eq!(
+        list.as_array().expect("array").len(),
+        3,
+        "no duplicates across the bounded/resumed calls"
+    );
+}
+
+/// Source validation surfaces as a normal verb error (ssh:// rejected,
+/// ADR-088 Amendment 1 security posture) rather than panicking or silently
+/// no-op'ing.
+#[tokio::test]
+async fn digest_verb_rejects_ssh_source() {
+    let (_rt, _token, registry) = fixture().await;
+    let err = registry
+        .dispatch(
+            "git.digest",
+            json!({"source": "ssh://git@github.com/org/repo.git"}),
+        )
+        .await
+        .expect_err("ssh source must be rejected");
+    assert!(format!("{err}").contains("SSH"), "{err}");
 }

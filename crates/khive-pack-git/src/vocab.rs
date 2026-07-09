@@ -1,11 +1,20 @@
-//! Git pack vocabulary: note kind specs and the pack-auxiliary cursor schema.
+//! Git pack vocabulary: note kind specs, the `git.digest` handler
+//! declaration, the `precedes` commit→commit edge extension, and the
+//! pack-auxiliary cursor schema.
 //!
-//! No `HANDLERS` and no `EDGE_RULES` are declared here (unlike gtd): this pack
-//! introduces zero new verbs and relies exclusively on the base `annotates`
-//! contract (note -> any substrate) for provenance edges — no endpoint
-//! extension is needed. See `crates/khive-pack-git/src/pack.rs`.
+//! ADR-088 v0 shipped with no `HANDLERS` and no `EDGE_RULES`: zero new verbs,
+//! relying exclusively on the base `annotates` contract (note -> any
+//! substrate) for provenance edges. ADR-088 Amendment 1 adds exactly one
+//! verb (`git.digest`) and one endpoint extension (`precedes` commit→commit,
+//! for parent→child commit lineage — the base contract only allows
+//! `precedes` between five entity kinds, never between notes; this pack
+//! extends it the same additive way `khive-pack-gtd` extends `depends_on` to
+//! task→task). See `crates/khive-pack-git/src/pack.rs`.
 
 use khive_runtime::{NoteKindSpec, NoteLifecycleSpec};
+use khive_types::{
+    EdgeEndpointRule, EdgeRelation, EndpointKind, HandlerDef, ParamDef, VerbCategory, Visibility,
+};
 
 /// Lifecycle declaration shared by `issue` and `pull_request` — both track an
 /// open/closed state with the same posture as ADR-088's `finding` precedent:
@@ -54,3 +63,62 @@ pub(crate) static GIT_SCHEMA_PLAN_STMTS: [&str; 2] = [
     "CREATE INDEX IF NOT EXISTS idx_git_mirror_cursor_updated \
         ON git_mirror_cursor(updated_at DESC)",
 ];
+
+/// ADR-088 Amendment 1 ingest enrichment: parent→child commit lineage as
+/// `precedes` edges. The base endpoint contract only allows `precedes`
+/// between five entity kinds (`document`, `dataset`, `artifact`, `service`,
+/// `project` — see `khive-runtime::operations::BASE_ENTITY_ENDPOINT_RULES`);
+/// it has no note→note case at all. This is the same additive-extension
+/// mechanism `khive-pack-gtd` uses for `depends_on` task→task.
+pub(crate) static GIT_EDGE_RULES: [EdgeEndpointRule; 1] = [EdgeEndpointRule {
+    relation: EdgeRelation::Precedes,
+    source: EndpointKind::NoteOfKind("commit"),
+    target: EndpointKind::NoteOfKind("commit"),
+}];
+
+/// Illocutionary classification (Searle 1976): `git.digest` commits data to
+/// the graph (ingests notes and edges), so it is `Commissive` — the same
+/// category `create`/`link`/`remember` use.
+pub(crate) static GIT_HANDLERS: [HandlerDef; 1] = [HandlerDef {
+    name: "git.digest",
+    description: "Ingest commit/issue/pull_request provenance from a local git repo path or an \
+                   https:// URL into the graph. Bounded and cursor-resumable: call repeatedly \
+                   until the response's `done` field is true.",
+    visibility: Visibility::Verb,
+    category: VerbCategory::Commissive,
+    params: &[
+        ParamDef {
+            name: "source",
+            param_type: "string",
+            required: true,
+            description: "Absolute local path to a git repository (must contain a .git entry), \
+                           or an https:// URL. Any https host is accepted; non-github.com hosts \
+                           degrade to commits-only (gh cannot serve their issues/PRs). ssh://, \
+                           git://, http://, and scp-shorthand (user@host:path) sources are \
+                           rejected.",
+        },
+        ParamDef {
+            name: "project",
+            param_type: "string",
+            required: false,
+            description: "UUID or 8+ hex prefix of the repo-anchor project entity. When absent, \
+                           resolved by matching properties.repo_url or name, or created if none \
+                           is found (see the response's project_id and project_created).",
+        },
+        ParamDef {
+            name: "max_items",
+            param_type: "integer",
+            required: false,
+            description: "Bounded work for this call, counted across commits + issues + PRs \
+                           (default 500, clamped to 1..=2000). Cursor-resumable: call again \
+                           while the response's done field is false.",
+        },
+        ParamDef {
+            name: "include",
+            param_type: "array of string",
+            required: false,
+            description: "Which record kinds to ingest this call: any of commits | issues | \
+                           pull_requests (default: all three).",
+        },
+    ],
+}];

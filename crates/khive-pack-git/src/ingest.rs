@@ -21,6 +21,28 @@ use uuid::Uuid;
 use khive_runtime::{secret_gate, KhiveRuntime, NamespaceToken, VerbRegistry};
 use khive_storage::types::{SqlStatement, SqlValue};
 
+use crate::refs;
+
+/// Which record kinds a `run_ingest` pass processes. `Default` selects all
+/// three — the CLI's historical behavior and the `git.digest` verb's default
+/// (ADR-088 Amendment 1).
+#[derive(Debug, Clone, Copy)]
+pub struct IngestInclude {
+    pub commits: bool,
+    pub issues: bool,
+    pub pull_requests: bool,
+}
+
+impl Default for IngestInclude {
+    fn default() -> Self {
+        Self {
+            commits: true,
+            issues: true,
+            pull_requests: true,
+        }
+    }
+}
+
 /// Options for one ingest pass.
 #[derive(Debug, Clone)]
 pub struct IngestOptions {
@@ -28,6 +50,59 @@ pub struct IngestOptions {
     pub repo: PathBuf,
     /// The repo-anchor `project` entity — full UUID or an 8+ hex prefix.
     pub project: String,
+    /// Bounded work per call, counted across commits + issues + PRs
+    /// (ADR-088 Amendment 1). `None` means unbounded — the CLI's historical
+    /// one-shot behavior.
+    pub max_items: Option<u64>,
+    /// Which record kinds to ingest this pass.
+    pub include: IngestInclude,
+}
+
+impl IngestOptions {
+    /// Convenience constructor for callers that want the CLI's historical
+    /// unbounded, all-kinds behavior.
+    pub fn unbounded(repo: PathBuf, project: String) -> Self {
+        Self {
+            repo,
+            project,
+            max_items: None,
+            include: IngestInclude::default(),
+        }
+    }
+}
+
+/// Bounds the number of new-record creation attempts across a `run_ingest`
+/// pass (ADR-088 Amendment 1 `max_items`). Only creation attempts (success or
+/// failure) consume budget — cheap natural-key "already exists" skips do not,
+/// since they are not the work the bound exists to limit.
+struct Budget {
+    remaining: Option<u64>,
+}
+
+impl Budget {
+    fn try_consume(&mut self) -> bool {
+        match &mut self.remaining {
+            None => true,
+            Some(0) => false,
+            Some(n) => {
+                *n -= 1;
+                true
+            }
+        }
+    }
+
+    fn exhausted(&self) -> bool {
+        matches!(self.remaining, Some(0))
+    }
+}
+
+/// A newly created note this pass, retained so the post-ingestion reference-
+/// extraction sweep (`link_references`) can resolve cross-references between
+/// records created in the *same* pass regardless of ingestion order (PRs and
+/// issues are ingested before commits) without re-reading them from storage.
+struct NewRecordForRef {
+    id: Uuid,
+    text: String,
 }
 
 /// Outcome of one ingest pass. Serializable so CLI callers can emit it as JSON.
@@ -43,6 +118,29 @@ pub struct IngestReport {
     /// skipped but commits still ingested (ADR-088 §5 graceful-absence rule).
     pub gh_available: bool,
     pub warnings: Vec<String>,
+    /// `false` when `max_items` was exhausted before this pass reached the
+    /// end of every included kind's history — callers loop until `true`
+    /// (ADR-088 Amendment 1). Always `true` for an unbounded
+    /// (`max_items: None`) pass.
+    pub done: bool,
+    /// The repo-anchor `project` entity id this pass resolved (or the
+    /// verb-level caller created).
+    pub project_id: Option<String>,
+    /// `true` when the `git.digest` verb auto-created the `project` anchor
+    /// because none was found (ADR-088 Amendment 1) — never set by
+    /// `run_ingest` itself, only by the verb handler after it returns.
+    pub project_created: bool,
+    /// `annotates` edges created from a `Closes/Fixes/Resolves #N` or bare
+    /// `#N` reference in a commit message or issue/PR body to the referenced
+    /// issue/PR note (ADR-088 Amendment 1 ingest enrichment).
+    pub reference_edges_created: u64,
+    /// References that named a number this pass could not resolve to an
+    /// ingested issue/PR note within the same project — skipped, not an
+    /// error (fail-open).
+    pub reference_edges_unresolved: u64,
+    /// `precedes` edges created from a commit's `parents[]` to the commit
+    /// itself (ADR-088 Amendment 1 ingest enrichment).
+    pub parent_edges_created: u64,
 }
 
 /// Run one ingest pass: issues + PRs first (via `gh`, when available), then
@@ -56,72 +154,108 @@ pub async fn run_ingest(
     registry: &VerbRegistry,
     opts: IngestOptions,
 ) -> Result<IngestReport> {
-    let mut report = IngestReport::default();
+    let mut report = IngestReport {
+        done: true,
+        ..IngestReport::default()
+    };
 
     let project_id = resolve_id(runtime, token, &opts.project)
         .await?
         .ok_or_else(|| anyhow!("--project {:?} did not resolve to an entity", opts.project))?;
+    report.project_id = Some(project_id.to_string());
 
     let mut merge_sha_to_pr: HashMap<String, Uuid> = HashMap::new();
     let mut number_to_pr: HashMap<u64, Uuid> = HashMap::new();
+    let mut budget = Budget {
+        remaining: opts.max_items,
+    };
+    let mut new_records: Vec<NewRecordForRef> = Vec::new();
 
     // Graceful degradation covers both "gh is not on PATH" and "gh is present
     // but this repo has no usable GitHub remote" (e.g. a synthetic/local-only
     // repo) — either way, issues/PRs are skipped with a warning and commits
     // still ingest (ADR-088 §5). A hard `gh` failure must never abort the
     // whole pass.
-    if gh_available(&opts.repo) {
-        report.gh_available = true;
-        match ingest_prs(
-            runtime,
-            token,
-            registry,
-            &opts.repo,
-            project_id,
-            &mut report,
-            &mut merge_sha_to_pr,
-            &mut number_to_pr,
-        )
-        .await
-        {
-            Ok(()) => {}
-            Err(e) => report
-                .warnings
-                .push(format!("gh pr list failed, skipping pull requests: {e}")),
+    if opts.include.issues || opts.include.pull_requests {
+        if gh_available(&opts.repo) {
+            report.gh_available = true;
+            if opts.include.pull_requests && !budget.exhausted() {
+                match ingest_prs(
+                    runtime,
+                    token,
+                    registry,
+                    &opts.repo,
+                    project_id,
+                    &mut report,
+                    &mut merge_sha_to_pr,
+                    &mut number_to_pr,
+                    &mut budget,
+                    &mut new_records,
+                )
+                .await
+                {
+                    Ok(()) => {}
+                    Err(e) => report
+                        .warnings
+                        .push(format!("gh pr list failed, skipping pull requests: {e}")),
+                }
+            }
+            if opts.include.issues && !budget.exhausted() {
+                if let Err(e) = ingest_issues(
+                    runtime,
+                    token,
+                    registry,
+                    &opts.repo,
+                    project_id,
+                    &mut report,
+                    &mut budget,
+                    &mut new_records,
+                )
+                .await
+                {
+                    report
+                        .warnings
+                        .push(format!("gh issue list failed, skipping issues: {e}"));
+                }
+            }
+        } else {
+            report.gh_available = false;
+            report.warnings.push(
+                "gh CLI not found on PATH; skipped issues and pull requests — commits still ingest"
+                    .to_string(),
+            );
         }
-        if let Err(e) = ingest_issues(
-            runtime,
-            token,
-            registry,
-            &opts.repo,
-            project_id,
-            &mut report,
-        )
-        .await
-        {
-            report
-                .warnings
-                .push(format!("gh issue list failed, skipping issues: {e}"));
-        }
-    } else {
-        report.gh_available = false;
-        report.warnings.push(
-            "gh CLI not found on PATH; skipped issues and pull requests — commits still ingest"
-                .to_string(),
-        );
     }
 
-    ingest_commits(
+    if opts.include.commits && !budget.exhausted() {
+        ingest_commits(
+            runtime,
+            token,
+            registry,
+            &opts.repo,
+            project_id,
+            &merge_sha_to_pr,
+            &number_to_pr,
+            &mut report,
+            &mut budget,
+            &mut new_records,
+        )
+        .await?;
+    }
+
+    if budget.exhausted() {
+        report.done = false;
+    }
+
+    link_references(
         runtime,
         token,
         registry,
-        &opts.repo,
         project_id,
-        &merge_sha_to_pr,
-        &number_to_pr,
+        &new_records,
         &mut report,
     )
-    .await?;
+    .await;
 
     Ok(report)
 }
@@ -140,6 +274,99 @@ async fn resolve_id(
         .resolve_prefix_unfiltered(raw)
         .await
         .map_err(|e| anyhow!("{e}"))
+}
+
+/// Public wrapper for the `git.digest` verb handler, which needs to resolve
+/// (but never auto-create) an explicitly supplied `project` argument the same
+/// way `run_ingest` does.
+pub async fn resolve_project_id(runtime: &KhiveRuntime, raw: &str) -> Result<Option<Uuid>> {
+    if let Ok(u) = Uuid::parse_str(raw) {
+        return Ok(Some(u));
+    }
+    runtime
+        .resolve_prefix_unfiltered(raw)
+        .await
+        .map_err(|e| anyhow!("{e}"))
+}
+
+/// Find an existing `issue` or `pull_request` note by `properties.number`
+/// within `project_id` — GitHub numbers a repository's issues and PRs from
+/// one shared sequence, so a `#N` reference can resolve to either kind.
+async fn find_issue_or_pr_by_number(
+    runtime: &KhiveRuntime,
+    token: &NamespaceToken,
+    project_id: Uuid,
+    number: u64,
+) -> Result<Option<Uuid>> {
+    if let Some(id) = find_by_number(runtime, token, "issue", project_id, number).await? {
+        return Ok(Some(id));
+    }
+    find_by_number(runtime, token, "pull_request", project_id, number).await
+}
+
+/// Post-ingestion sweep (ADR-088 Amendment 1 ingest enrichment): extract
+/// GitHub reference-grammar mentions from every note created *this pass*
+/// (commits, issues, PRs — order-independent, since all three are already in
+/// `new_records` by the time this runs) and materialize `annotates` edges to
+/// the referenced issue/PR note, carrying `ref_kind` ("closes" | "mentions")
+/// as edge metadata. Fail-open throughout: a malformed or unresolvable
+/// reference is skipped and counted, never aborts the pass.
+async fn link_references(
+    runtime: &KhiveRuntime,
+    token: &NamespaceToken,
+    registry: &VerbRegistry,
+    project_id: Uuid,
+    new_records: &[NewRecordForRef],
+    report: &mut IngestReport,
+) {
+    for record in new_records {
+        let mentions = refs::dedupe_prefer_closes(refs::extract_references(&record.text));
+        for mention in mentions {
+            let target = match find_issue_or_pr_by_number(
+                runtime,
+                token,
+                project_id,
+                mention.number,
+            )
+            .await
+            {
+                Ok(Some(id)) => id,
+                Ok(None) => {
+                    report.reference_edges_unresolved += 1;
+                    continue;
+                }
+                Err(e) => {
+                    report
+                        .warnings
+                        .push(format!("resolving reference #{}: {e}", mention.number));
+                    continue;
+                }
+            };
+            if target == record.id {
+                // A note referencing its own number (rare, e.g. a PR body
+                // that quotes its own number) — not a real cross-reference.
+                continue;
+            }
+            match registry
+                .dispatch(
+                    "link",
+                    json!({
+                        "source_id": record.id.to_string(),
+                        "target_id": target.to_string(),
+                        "relation": "annotates",
+                        "metadata": { "ref_kind": mention.kind.as_str() },
+                    }),
+                )
+                .await
+            {
+                Ok(_) => report.reference_edges_created += 1,
+                Err(e) => report.warnings.push(format!(
+                    "linking reference #{} from {}: {e}",
+                    mention.number, record.id
+                )),
+            }
+        }
+    }
 }
 
 /// `true` when `gh` is on PATH and can run inside `repo` (a lightweight
@@ -436,6 +663,11 @@ fn squash_merge_pr_number(subject: &str) -> Option<u64> {
     close[open + 2..].parse::<u64>().ok()
 }
 
+/// Max characters for the `name` field the amendment's readable-names rider
+/// sets on newly ingested notes (issues/PRs: `"#<number> <title>"`; commits:
+/// `"<short_sha> <subject>"`).
+const NAME_MAX_CHARS: usize = 120;
+
 #[allow(clippy::too_many_arguments)]
 async fn ingest_commits(
     runtime: &KhiveRuntime,
@@ -446,6 +678,8 @@ async fn ingest_commits(
     merge_sha_to_pr: &HashMap<String, Uuid>,
     number_to_pr: &HashMap<u64, Uuid>,
     report: &mut IngestReport,
+    budget: &mut Budget,
+    new_records: &mut Vec<NewRecordForRef>,
 ) -> Result<()> {
     let since = read_cursor(runtime, project_id, "commits").await?;
     let commits = walk_commits(repo, since.as_deref())?;
@@ -465,13 +699,23 @@ async fn ingest_commits(
     // sha natural key), so a retried pass never double-creates them.
     let mut last_sha: Option<String> = since;
     let mut cursor_stalled = false;
+    // Parent SHA -> note id for commits created earlier THIS pass (walked
+    // oldest-first) — combined with `find_commit_by_sha`'s DB lookup below,
+    // this resolves parent edges regardless of which pass the parent landed
+    // in.
+    let mut local_sha_to_id: HashMap<String, Uuid> = HashMap::new();
     for c in &commits {
-        if find_commit_by_sha(runtime, token, &c.sha).await?.is_some() {
+        if let Some(existing) = find_commit_by_sha(runtime, token, &c.sha).await? {
+            local_sha_to_id.insert(c.sha.clone(), existing);
             report.commits_skipped_existing += 1;
             if !cursor_stalled {
                 last_sha = Some(c.sha.clone());
             }
             continue;
+        }
+
+        if budget.exhausted() {
+            break;
         }
 
         let raw_content = if c.body.trim().is_empty() {
@@ -522,11 +766,15 @@ async fn ingest_commits(
             "parents": c.parents,
         });
 
+        let name = refs::truncate_chars(&format!("{} {}", c.short_sha, c.subject), NAME_MAX_CHARS);
+
+        budget.try_consume();
         match registry
             .dispatch(
                 "create",
                 json!({
                     "kind": "commit",
+                    "name": name,
                     "content": content,
                     "properties": properties,
                     "annotates": annotates,
@@ -534,10 +782,54 @@ async fn ingest_commits(
             )
             .await
         {
-            Ok(_) => {
+            Ok(v) => {
                 report.commits_ingested += 1;
                 if !cursor_stalled {
                     last_sha = Some(c.sha.clone());
+                }
+                if let Some(id) = v
+                    .get("id")
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| Uuid::parse_str(s).ok())
+                {
+                    local_sha_to_id.insert(c.sha.clone(), id);
+                    new_records.push(NewRecordForRef {
+                        id,
+                        text: content.clone(),
+                    });
+                    // Parent -> child `precedes` edges (ADR-088 Amendment 1
+                    // ingest enrichment). Fail-open: an unresolved or
+                    // failing parent link is skipped/warned, never aborts
+                    // the pass.
+                    for parent_sha in &c.parents {
+                        let parent_id = match local_sha_to_id.get(parent_sha).copied() {
+                            Some(pid) => Some(pid),
+                            None => find_commit_by_sha(runtime, token, parent_sha).await?,
+                        };
+                        let Some(parent_id) = parent_id else {
+                            continue;
+                        };
+                        if parent_id == id {
+                            continue;
+                        }
+                        match registry
+                            .dispatch(
+                                "link",
+                                json!({
+                                    "source_id": parent_id.to_string(),
+                                    "target_id": id.to_string(),
+                                    "relation": "precedes",
+                                }),
+                            )
+                            .await
+                        {
+                            Ok(_) => report.parent_edges_created += 1,
+                            Err(e) => report.warnings.push(format!(
+                                "linking parent {parent_sha} -> {} precedes: {e}",
+                                c.sha
+                            )),
+                        }
+                    }
                 }
             }
             Err(e) => {
@@ -638,6 +930,8 @@ async fn ingest_prs(
     report: &mut IngestReport,
     merge_sha_to_pr: &mut HashMap<String, Uuid>,
     number_to_pr: &mut HashMap<u64, Uuid>,
+    budget: &mut Budget,
+    new_records: &mut Vec<NewRecordForRef>,
 ) -> Result<()> {
     let since = read_cursor(runtime, project_id, "prs").await?;
     let raw = gh_json(
@@ -714,6 +1008,9 @@ async fn ingest_prs(
         if !is_new {
             continue;
         }
+        if budget.exhausted() {
+            break;
+        }
 
         let raw_body = pr.body.unwrap_or_default();
         let content = secret_gate::mask_secrets(&raw_body).into_owned();
@@ -728,12 +1025,15 @@ async fn ingest_prs(
             "head_ref": pr.head_ref_name,
             "project_id": project_id.to_string(),
         });
+        let name = refs::truncate_chars(&format!("#{} {}", pr.number, pr.title), NAME_MAX_CHARS);
 
+        budget.try_consume();
         let result = match registry
             .dispatch(
                 "create",
                 json!({
                     "kind": "pull_request",
+                    "name": name,
                     "content": content,
                     "properties": properties,
                     "annotates": [project_id.to_string()],
@@ -760,6 +1060,10 @@ async fn ingest_prs(
             if let Some(oid) = pr.merge_commit.and_then(|m| m.oid) {
                 merge_sha_to_pr.insert(oid, id);
             }
+            new_records.push(NewRecordForRef {
+                id,
+                text: content.clone(),
+            });
         }
         report.prs_ingested += 1;
         if !cursor_stalled {
@@ -781,6 +1085,7 @@ async fn ingest_prs(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn ingest_issues(
     runtime: &KhiveRuntime,
     token: &NamespaceToken,
@@ -788,6 +1093,8 @@ async fn ingest_issues(
     repo: &Path,
     project_id: Uuid,
     report: &mut IngestReport,
+    budget: &mut Budget,
+    new_records: &mut Vec<NewRecordForRef>,
 ) -> Result<()> {
     let since = read_cursor(runtime, project_id, "issues").await?;
     let raw = gh_json(
@@ -850,6 +1157,9 @@ async fn ingest_issues(
         if !is_new {
             continue;
         }
+        if budget.exhausted() {
+            break;
+        }
 
         let raw_body = issue.body.unwrap_or_default();
         let content = secret_gate::mask_secrets(&raw_body).into_owned();
@@ -875,12 +1185,18 @@ async fn ingest_issues(
         if let Some(reason) = issue.state_reason.as_deref().filter(|r| !r.is_empty()) {
             properties["state_reason"] = json!(reason.to_ascii_lowercase());
         }
+        let name = refs::truncate_chars(
+            &format!("#{} {}", issue.number, issue.title),
+            NAME_MAX_CHARS,
+        );
 
-        if let Err(e) = registry
+        budget.try_consume();
+        let result = match registry
             .dispatch(
                 "create",
                 json!({
                     "kind": "issue",
+                    "name": name,
                     "content": content,
                     "properties": properties,
                     "annotates": [project_id.to_string()],
@@ -888,11 +1204,24 @@ async fn ingest_issues(
             )
             .await
         {
-            report
-                .warnings
-                .push(format!("create issue #{}: {e}", issue.number));
-            cursor_stalled = true;
-            continue;
+            Ok(v) => v,
+            Err(e) => {
+                report
+                    .warnings
+                    .push(format!("create issue #{}: {e}", issue.number));
+                cursor_stalled = true;
+                continue;
+            }
+        };
+        if let Some(id) = result
+            .get("id")
+            .and_then(|v| v.as_str())
+            .and_then(|s| Uuid::parse_str(s).ok())
+        {
+            new_records.push(NewRecordForRef {
+                id,
+                text: content.clone(),
+            });
         }
 
         report.issues_ingested += 1;
