@@ -66,6 +66,7 @@ fn effective_config_uses_defaults() {
         tag_mode: TagMode::Any,
         entity_names: None,
         full_content: None,
+        profile_id: None,
     };
     let cfg = p.effective_config(RecallConfig::default());
     assert!((cfg.relevance_weight - 0.70).abs() < 1e-12);
@@ -91,6 +92,7 @@ fn effective_config_legacy_overrides() {
         tag_mode: TagMode::Any,
         entity_names: None,
         full_content: None,
+        profile_id: None,
     };
     let cfg = p.effective_config(RecallConfig::default());
     assert!((cfg.min_score - 0.5).abs() < 1e-12);
@@ -118,6 +120,7 @@ fn effective_config_explicit_config_wins() {
         tag_mode: TagMode::Any,
         entity_names: None,
         full_content: None,
+        profile_id: None,
     };
     let cfg = p.effective_config(RecallConfig::default());
     assert!((cfg.relevance_weight - 0.50).abs() < 1e-12);
@@ -149,6 +152,7 @@ fn test_weighted_strategy_preserves_pack_weights() {
         tag_mode: TagMode::Any,
         entity_names: None,
         full_content: None,
+        profile_id: None,
     };
 
     let mut cfg = p.effective_config(base);
@@ -203,6 +207,7 @@ fn test_weighted_strategy_from_rrf_config_uses_vector_heavy_defaults() {
         tag_mode: TagMode::Any,
         entity_names: None,
         full_content: None,
+        profile_id: None,
     };
 
     let mut cfg = p.effective_config(base);
@@ -835,4 +840,46 @@ fn remember_type_defaults_constants_are_differentiated() {
         (DEFAULT_DECAY_SEMANTIC - 0.005).abs() < 1e-12,
         "semantic decay constant must be 0.005"
     );
+}
+
+// ── memory.recall HandlerDef ↔ RecallParams schema fidelity ─────────────
+
+/// Every parameter the `memory.recall` `HandlerDef` advertises must be
+/// accepted by `RecallParams` (which is `deny_unknown_fields`), and the
+/// ADR-104 §4 `profile_id` override must be advertised — the handler
+/// accepting a param the help schema omits ships an incomplete public
+/// contract.
+#[test]
+fn recall_handler_schema_params_are_all_accepted_by_recall_params() {
+    use khive_types::Pack;
+
+    let recall_def = <crate::MemoryPack as Pack>::HANDLERS
+        .iter()
+        .find(|h| h.name == "memory.recall")
+        .expect("memory.recall HandlerDef exists");
+
+    let advertised: Vec<&str> = recall_def.params.iter().map(|p| p.name).collect();
+    assert!(
+        advertised.contains(&"profile_id"),
+        "memory.recall HandlerDef must advertise the ADR-104 profile_id override; advertised: {advertised:?}"
+    );
+
+    let mut obj = serde_json::Map::new();
+    for p in recall_def.params {
+        let value = match (p.name, p.param_type) {
+            ("tag_mode", _) => Value::String("any".into()),
+            ("memory_type", _) => Value::String("episodic".into()),
+            (_, "string") => Value::String("x".into()),
+            (_, "number") | (_, "integer") => serde_json::json!(1),
+            (_, "boolean") => Value::Bool(true),
+            (_, "array") => Value::Array(vec![]),
+            (_, "object") => Value::Object(serde_json::Map::new()),
+            (name, ty) => panic!("unhandled param_type {ty:?} for {name:?}"),
+        };
+        obj.insert(p.name.to_string(), value);
+    }
+
+    serde_json::from_value::<RecallParams>(Value::Object(obj)).unwrap_or_else(|e| {
+        panic!("RecallParams must accept every HandlerDef-advertised param: {e}")
+    });
 }

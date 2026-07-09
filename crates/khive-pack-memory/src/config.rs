@@ -521,6 +521,18 @@ pub struct ScoreBreakdown {
     pub temporal: f64,
     /// Weighted contributions summing to the total score.
     pub weighted: WeightedContributions,
+    /// ADR-104 §3: multiplicative contribution of serve-time profile-weight
+    /// projection relative to configured-default weights for this hit —
+    /// `score_with_projected_weights / score_with_default_weights`. `1.0`
+    /// when no profile served the request (component 1 never ran) or the
+    /// default-weight score is ~0 (div-by-zero guard).
+    pub profile_component: f64,
+    /// ADR-104 §3: the serving profile's per-entity Beta posterior mean for
+    /// this hit's UUID. `None` when no profile served the request, or the
+    /// profile holds no posterior for this UUID beyond the uninformative
+    /// prior. Reported only — Stage A does not let this affect ranking
+    /// (the per-entity multiplicative term is component 2, Stage B).
+    pub entity_posterior_mean: Option<f64>,
 }
 
 impl ScoreBreakdown {
@@ -875,6 +887,8 @@ mod tests {
                 salience_contribution: 0.12,
                 temporal_contribution: 0.03,
             },
+            profile_component: 1.0,
+            entity_posterior_mean: None,
         };
         let expected = 0.35 + 0.12 + 0.03;
         let diff = (bd.total() - expected).abs();

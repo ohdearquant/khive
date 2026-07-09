@@ -8,12 +8,13 @@ use crate::recall_feedback::{on_recall_hit, on_recall_miss};
 use serde_json::{json, Value};
 use uuid::Uuid;
 
+use khive_brain_core::PackTunable;
 use khive_fusion::FusionStrategy;
 use khive_runtime::{micros_to_iso, NamespaceToken, RuntimeError, SearchSource, VerbRegistry};
 use khive_storage::types::{EdgeFilter, PageRequest};
 use khive_storage::EdgeRelation;
 
-use crate::config::ScoreBreakdown;
+use crate::config::{RecallConfig, ScoreBreakdown};
 use crate::rerank::{weighted_rerank, RerankFeatures};
 use crate::scoring::{
     calculate_score, contains_cjk, extract_entity_candidates, needs_multilingual,
@@ -120,6 +121,77 @@ impl MemoryPack {
         if prof {
             if let Some(ref t) = t_stage {
                 plog(call_id, "setup", t.elapsed().as_micros());
+            }
+            t_stage = Some(Instant::now());
+        }
+
+        // ADR-104 §1 (Stage A) + §4: resolve the serving profile *before*
+        // scoring, either via an explicit `profile_id` override (§4,
+        // short-circuits binding resolution; unknown/invalid id is a hard
+        // per-op error, not a silent fallback) or the ADR-081 binding
+        // resolution already used for the serve-time stamp. This is the
+        // same `served_by_profile_id` stamped on the response and appended
+        // to the serve ledger further down — resolved once here, reused
+        // throughout, so the two paths cannot drift apart.
+        //
+        // A resolved-but-unreadable profile state degrades to configured
+        // defaults with a WARN log (never fails the recall) — only the
+        // explicit override treats a lookup failure as caller error.
+        let mut profile_state: Option<khive_brain_core::BalancedRecallState> = None;
+        let served_by_profile_id: Option<String> = if let Some(ref pid) = p.profile_id {
+            let resp = registry
+                .dispatch("brain.profile", json!({ "profile_id": pid }))
+                .await
+                .map_err(|e| {
+                    RuntimeError::InvalidInput(format!(
+                        "profile_id {pid:?} is not a known profile: {e}"
+                    ))
+                })?;
+            profile_state = super::common::balanced_recall_state_from_profile_response(&resp);
+            Some(pid.clone())
+        } else {
+            let resolved =
+                super::common::resolve_serving_profile(&self.brain_profile, token, registry).await;
+            if let Some(ref profile_id) = resolved {
+                match registry
+                    .dispatch("brain.profile", json!({ "profile_id": profile_id }))
+                    .await
+                {
+                    Ok(resp) => {
+                        profile_state =
+                            super::common::balanced_recall_state_from_profile_response(&resp);
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            profile_id = %profile_id,
+                            error = %e,
+                            "ADR-104 §1: profile state read failed; recall scores with configured defaults"
+                        );
+                    }
+                }
+            }
+            resolved
+        };
+
+        // Serve-time projection (ADR-104 §1): derive this request's scoring
+        // weights from the served profile's posterior means via the existing
+        // `PackTunable::project_config` path, used as a pure function — never
+        // `apply_config`, never a mutation of `self.config`. `default_weights`
+        // is kept for the breakdown's `profile_component` ratio (§3).
+        let default_weights = scoring_cfg.weights.clone();
+        if let Some(ref state) = profile_state {
+            if let Ok(projected) =
+                serde_json::from_value::<RecallConfig>(self.project_config(state))
+            {
+                scoring_cfg.weights.relevance = projected.relevance_weight as f32;
+                scoring_cfg.weights.salience = projected.salience_weight as f32;
+                scoring_cfg.weights.temporal = projected.temporal_weight as f32;
+            }
+        }
+
+        if prof {
+            if let Some(ref t) = t_stage {
+                plog(call_id, "profile_resolve", t.elapsed().as_micros());
             }
             t_stage = Some(Instant::now());
         }
@@ -311,6 +383,11 @@ impl MemoryPack {
 
         let recall_pipeline = make_pipeline(&cfg);
 
+        // ADR-104 §3: breakdown fields are only reported when the caller asked
+        // for them — gate the extra default-weight score computation on that
+        // rather than paying it on every candidate.
+        let is_verbose = cfg.include_breakdown || p.include_breakdown.unwrap_or(false);
+
         let mut ranked: Vec<ScoredNote> = Vec::new();
         for hit in &fused {
             let id = hit.entity_id;
@@ -362,23 +439,52 @@ impl MemoryPack {
                 continue;
             }
 
-            let rank_score = calculate_score(
-                &ScoreInput {
-                    salience: salience as f32,
-                    memory_type_str: &note_memory_type,
-                    content: &note.content,
-                    created_at_millis: note.created_at / 1_000,
-                    decay_factor: decay_factor as f32,
-                    now_millis,
-                    relevance_score: norm_relevance,
-                    entity_names: &entity_names,
-                },
-                &scoring_cfg,
-            );
+            let score_input = ScoreInput {
+                salience: salience as f32,
+                memory_type_str: &note_memory_type,
+                content: &note.content,
+                created_at_millis: note.created_at / 1_000,
+                decay_factor: decay_factor as f32,
+                now_millis,
+                relevance_score: norm_relevance,
+                entity_names: &entity_names,
+            };
+            let rank_score = calculate_score(&score_input, &scoring_cfg);
+
+            // ADR-104 §3: `profile_component` reports the projected-weight
+            // score's ratio against what the same candidate would have
+            // scored under configured-default weights — computed only for
+            // verbose responses, since it costs a second `calculate_score`
+            // call per candidate. Neutral (1.0) when no profile served the
+            // request (component 1 never ran). `entity_posterior_mean` is
+            // read-only: it must never feed `scoring_cfg` (that's component
+            // 2, Stage B).
+            let (profile_component, entity_posterior_mean) = if is_verbose {
+                let component = match &profile_state {
+                    Some(_) => {
+                        let mut default_cfg = scoring_cfg.clone();
+                        default_cfg.weights = default_weights.clone();
+                        let default_score = calculate_score(&score_input, &default_cfg);
+                        if default_score.abs() > f32::EPSILON {
+                            (rank_score / default_score) as f64
+                        } else {
+                            1.0
+                        }
+                    }
+                    None => 1.0,
+                };
+                let ent_mean = profile_state
+                    .as_ref()
+                    .and_then(|s| s.entity_posteriors.get(&id))
+                    .map(khive_brain_core::BetaPosterior::mean);
+                (component, ent_mean)
+            } else {
+                (1.0, None)
+            };
 
             let age_days_f64 =
                 ((now_micros - note.created_at).max(0) as f64) / (1_000_000.0 * 86_400.0);
-            let (_, breakdown) = compute_score(
+            let (_, mut breakdown) = compute_score(
                 &cfg,
                 &recall_pipeline,
                 norm_relevance as f64,
@@ -386,6 +492,8 @@ impl MemoryPack {
                 decay_factor,
                 age_days_f64,
             );
+            breakdown.profile_component = profile_component;
+            breakdown.entity_posterior_mean = entity_posterior_mean;
 
             let source = source_by_id.get(&id).copied().unwrap_or(SearchSource::Text);
             let final_score = if !cfg.reranker_weights.is_empty() {
@@ -543,7 +651,6 @@ impl MemoryPack {
         }
         let budget_capped = ranked.len() < pre_budget_count;
 
-        let is_verbose = cfg.include_breakdown || p.include_breakdown.unwrap_or(false);
         let full_content = p.full_content.unwrap_or(true);
         const PREVIEW_CHARS: usize = 200;
 
@@ -578,13 +685,14 @@ impl MemoryPack {
             })
             .collect();
 
-        // ADR-081 §5 (#394): resolve the serving profile via the same tiers
-        // 1-2 memory.feedback uses (resolve_serving_profile), stamp it into
-        // each result, then fire the cross-session serve-ledger append
-        // (ADR-081 §4) asynchronously off the response path — the recall
-        // caller must not wait on a brain-pack dispatch. An unresolved
-        // profile omits the stamp rather than guessing one; the ledger row
-        // is still written with a null served_by_profile_id in that case.
+        // ADR-081 §5 (#394): stamp the serving profile resolved earlier
+        // (ADR-104 §1, above — same value, so the score projection and the
+        // response stamp can never drift apart) into each result, then fire
+        // the cross-session serve-ledger append (ADR-081 §4) asynchronously
+        // off the response path — the recall caller must not wait on a
+        // brain-pack dispatch. An unresolved profile omits the stamp rather
+        // than guessing one; the ledger row is still written with a null
+        // served_by_profile_id in that case.
         if prof {
             if let Some(ref t) = t_stage {
                 plog_n(
@@ -593,14 +701,6 @@ impl MemoryPack {
                     t.elapsed().as_micros(),
                     results.len(),
                 );
-            }
-            t_stage = Some(Instant::now());
-        }
-        let served_by_profile_id =
-            super::common::resolve_serving_profile(&self.brain_profile, token, registry).await;
-        if prof {
-            if let Some(ref t) = t_stage {
-                plog(call_id, "profile_resolve", t.elapsed().as_micros());
             }
             t_stage = Some(Instant::now());
         }
@@ -715,13 +815,16 @@ impl MemoryPack {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::sync::Arc;
 
     use async_trait::async_trait;
     use khive_pack_kg::KgPack;
     use khive_runtime::{EmbedderProvider, KhiveRuntime, Namespace, VerbRegistryBuilder};
     use lattice_embed::{EmbedError, EmbeddingModel, EmbeddingService};
+    use serde_json::Value;
     use serial_test::serial;
+    use uuid::Uuid;
 
     use crate::MemoryPack;
 
@@ -1197,6 +1300,133 @@ mod tests {
         );
     }
 
+    // ADR-104 §1 resolution-path regression: the profile that SERVES the
+    // request (projects weights, gets stamped) must be the one `brain.bind`
+    // resolves through the actor-scoped dispatch path (#699/#708) — not the
+    // `profile_id` override (component 4), which is a separate, deliberate
+    // short-circuit covered by its own test. A resolution regression here
+    // (e.g. `resolve_serving_profile` losing actor-threading, or serve-time
+    // projection reading the wrong profile's state) must fail this test
+    // rather than being masked by the override path.
+    #[tokio::test]
+    #[serial(background_tasks)]
+    async fn recall_serve_time_projection_uses_the_actor_resolved_profile() {
+        use khive_pack_brain::BrainPack;
+
+        let tmp = tempfile::Builder::new()
+            .prefix("khive-mem-recall-adr104-resolution-")
+            .tempdir_in(std::env::temp_dir())
+            .expect("temp dir");
+        let db_path = tmp.path().join("khive.db");
+        std::mem::forget(tmp);
+
+        let rt = khive_runtime::KhiveRuntime::new(khive_runtime::RuntimeConfig {
+            db_path: Some(db_path),
+            embedding_model: None,
+            additional_embedding_models: vec![],
+            packs: vec!["kg".to_string(), "memory".to_string(), "brain".to_string()],
+            actor_id: Some("leo".to_string()),
+            ..khive_runtime::RuntimeConfig::default()
+        })
+        .expect("runtime");
+        rt.register_embedder(FixedVecProvider {
+            model_name: ADR104_MODEL.to_string(),
+            map: adr104_fixed_vectors(),
+        });
+        let ns = Namespace::parse("local").expect("local namespace");
+        let token = rt.authorize(ns.clone()).expect("authorize local");
+        assert_eq!(
+            token.actor().id,
+            "leo",
+            "test setup: token must carry the configured actor"
+        );
+
+        let note_id = rt
+            .create_note(
+                &token,
+                "memory",
+                None,
+                ADR104_H_CONTENT,
+                Some(0.1),
+                None,
+                vec![],
+            )
+            .await
+            .expect("create note")
+            .id;
+
+        let brain = BrainPack::new(rt.clone());
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(KgPack::new(rt.clone()));
+        builder.register(MemoryPack::new(rt.clone()));
+        builder.register(brain);
+        builder.with_actor_id(Some("leo".to_string()));
+        let registry = builder.build().expect("registry");
+
+        registry
+            .dispatch(
+                "brain.create_profile",
+                serde_json::json!({
+                    "namespace": ns.as_str(),
+                    "name": "adr104-resolution-v1",
+                    "consumer_kind": "recall",
+                }),
+            )
+            .await
+            .expect("create profile");
+        registry
+            .dispatch(
+                "brain.bind",
+                serde_json::json!({
+                    "actor": "leo",
+                    "profile_id": "adr104-resolution-v1",
+                    "consumer_kind": "recall",
+                }),
+            )
+            .await
+            .expect("bind profile to actor");
+
+        // Skew the bound profile's salience posterior away from the default
+        // prior BEFORE issuing the recall — this is what makes
+        // `profile_component != 1.0` a genuine assertion about serve-time
+        // projection reading the actor-resolved profile's state, not merely
+        // about the stamp.
+        adr104_skew_salience(&registry, "adr104-resolution-v1", note_id, 30).await;
+
+        let result = registry
+            .dispatch(
+                "memory.recall",
+                serde_json::json!({
+                    "namespace": ns.as_str(),
+                    "query": ADR104_QUERY,
+                    "fusion_strategy": "vector_only",
+                    "embedding_model": ADR104_MODEL,
+                    "include_breakdown": true,
+                    "limit": 10
+                }),
+            )
+            .await
+            .expect("memory.recall");
+
+        let hits = result.as_array().expect("bare array result");
+        assert!(!hits.is_empty(), "must find the seeded note");
+        assert_eq!(
+            hits[0]["served_by_profile_id"],
+            serde_json::json!("adr104-resolution-v1"),
+            "recall response must stamp the actor-resolved profile, not the \
+             profile_id override path (which was not used in this test)"
+        );
+
+        let profile_component = hits[0]["breakdown"]["profile_component"]
+            .as_f64()
+            .expect("profile_component present under include_breakdown");
+        assert!(
+            (profile_component - 1.0).abs() > 1e-6,
+            "serve-time projection must have used the actor-resolved profile's \
+             skewed posterior state, not defaults: profile_component={profile_component}"
+        );
+    }
+
     // `#[serial(background_tasks)]`: non-empty recall — see the note on
     // `recall_with_dollar_sign_query_does_not_error` above.
     //
@@ -1640,6 +1870,798 @@ mod tests {
         assert!(
             with_brain < Duration::from_secs(2),
             "profile resolution must not introduce unbounded latency, got {with_brain:?}"
+        );
+    }
+
+    // ── ADR-104 Stage A: serve-time profile projection ─────────────────────
+
+    /// Deterministic embedding service returning a hand-picked fixed vector
+    /// per exact input text. Unlike `HashVecService` above (deterministic
+    /// but not analytically controllable), this lets a test pin the exact
+    /// cosine similarity between a query and a given note's content, which
+    /// the ADR-104 ranking tests need to build a small corpus with a known,
+    /// controlled relevance gap between two candidates.
+    struct FixedVecService {
+        map: HashMap<String, Vec<f32>>,
+    }
+
+    #[async_trait]
+    impl EmbeddingService for FixedVecService {
+        async fn embed(
+            &self,
+            texts: &[String],
+            _model: EmbeddingModel,
+        ) -> Result<Vec<Vec<f32>>, EmbedError> {
+            Ok(texts
+                .iter()
+                .map(|t| self.map.get(t).cloned().unwrap_or_else(|| vec![0.0; 8]))
+                .collect())
+        }
+
+        fn supports_model(&self, _model: EmbeddingModel) -> bool {
+            true
+        }
+
+        fn name(&self) -> &'static str {
+            "fixed-vec"
+        }
+    }
+
+    struct FixedVecProvider {
+        model_name: String,
+        map: HashMap<String, Vec<f32>>,
+    }
+
+    #[async_trait]
+    impl EmbedderProvider for FixedVecProvider {
+        fn name(&self) -> &str {
+            &self.model_name
+        }
+
+        fn dimensions(&self) -> usize {
+            8
+        }
+
+        async fn build(&self) -> Result<Arc<dyn EmbeddingService>, khive_runtime::RuntimeError> {
+            Ok(Arc::new(FixedVecService {
+                map: self.map.clone(),
+            }))
+        }
+    }
+
+    const ADR104_MODEL: &str = "adr104-fixed-vec-model";
+    const ADR104_QUERY: &str = "profile ranking probe query";
+    const ADR104_FILLER_LOW: &str = "filler low relevance content";
+    const ADR104_FILLER_HIGH: &str = "filler high relevance content";
+    const ADR104_H_CONTENT: &str = "candidate h content marker";
+    const ADR104_L_CONTENT: &str = "candidate l content marker";
+
+    /// 8-dim unit vectors, only the first two components carrying signal —
+    /// cosine similarity between any two of these equals the dot product of
+    /// those two components. Query = `(1, 0)`. `FILLER_LOW` is orthogonal
+    /// (cos 0.0) and `FILLER_HIGH` is identical to the query (cos 1.0); they
+    /// anchor the min/max of `normalize_rank_fusion_scores`'s percentile
+    /// band so that `H` (cos 0.717) and `L` (cos 0.5) calibrate to a known,
+    /// modest ~1.3x relevance ratio instead of the min/max extremes a
+    /// 2-point corpus would otherwise force them to.
+    fn adr104_fixed_vectors() -> HashMap<String, Vec<f32>> {
+        let mut m = HashMap::new();
+        m.insert(
+            ADR104_QUERY.to_string(),
+            vec![1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        );
+        m.insert(
+            ADR104_FILLER_LOW.to_string(),
+            vec![0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        );
+        m.insert(
+            ADR104_FILLER_HIGH.to_string(),
+            vec![1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        );
+        m.insert(
+            ADR104_H_CONTENT.to_string(),
+            vec![0.717, 0.6971, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        );
+        m.insert(
+            ADR104_L_CONTENT.to_string(),
+            vec![0.5, 0.8660254, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        );
+        m
+    }
+
+    /// Builds a runtime with kg+memory+brain registered, the deterministic
+    /// fixed-vector embedder above, and a 4-note corpus: two filler notes
+    /// anchoring the relevance percentile band, plus two candidates —
+    /// `H` (higher relevance, cos 0.717; lower salience, 0.1) and `L`
+    /// (lower relevance, cos 0.5; higher salience, 0.9). The ~1.3x
+    /// calibrated relevance edge for `H` is deliberately small enough that
+    /// pushing the salience posterior's projected weight high enough (via
+    /// repeated `brain.feedback` "useful" signals against a profile) flips
+    /// the ranking to `L` — proving the projection is load-bearing for
+    /// ordering, not just magnitude. Returns `(runtime, registry, namespace,
+    /// h_id, l_id)`.
+    async fn adr104_build_ranking_corpus() -> (
+        khive_runtime::KhiveRuntime,
+        khive_runtime::VerbRegistry,
+        Namespace,
+        Uuid,
+        Uuid,
+    ) {
+        use khive_pack_brain::BrainPack;
+
+        let rt = build_full_rt_with_brain();
+        rt.register_embedder(FixedVecProvider {
+            model_name: ADR104_MODEL.to_string(),
+            map: adr104_fixed_vectors(),
+        });
+        let ns = Namespace::parse("local").expect("local namespace");
+        let token = rt.authorize(ns.clone()).expect("authorize local");
+
+        rt.create_note(
+            &token,
+            "memory",
+            None,
+            ADR104_FILLER_LOW,
+            Some(0.5),
+            None,
+            vec![],
+        )
+        .await
+        .expect("filler low note");
+        rt.create_note(
+            &token,
+            "memory",
+            None,
+            ADR104_FILLER_HIGH,
+            Some(0.5),
+            None,
+            vec![],
+        )
+        .await
+        .expect("filler high note");
+        let h_id = rt
+            .create_note(
+                &token,
+                "memory",
+                None,
+                ADR104_H_CONTENT,
+                Some(0.1),
+                None,
+                vec![],
+            )
+            .await
+            .expect("candidate h note")
+            .id;
+        let l_id = rt
+            .create_note(
+                &token,
+                "memory",
+                None,
+                ADR104_L_CONTENT,
+                Some(0.9),
+                None,
+                vec![],
+            )
+            .await
+            .expect("candidate l note")
+            .id;
+
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(KgPack::new(rt.clone()));
+        builder.register(MemoryPack::new(rt.clone()));
+        builder.register(BrainPack::new(rt.clone()));
+        let registry = builder.build().expect("registry");
+
+        (rt, registry, ns, h_id, l_id)
+    }
+
+    /// Skews `profile_id`'s salience posterior via `n` repeated explicit
+    /// "useful" `brain.feedback` signals targeted at `target_id`
+    /// (`served_by_profile_id` bypasses binding resolution). Each signal
+    /// updates both the profile's global salience posterior (starts at
+    /// `Beta(2,8)`, mean 0.2) and `target_id`'s per-entity posterior (starts
+    /// at the uninformative `Beta(1,1)`, mean 0.5) — the same feedback event
+    /// drives both ADR-104 component 1 (via the global posterior) and the
+    /// component-3 `entity_posterior_mean` report (via the per-entity one).
+    async fn adr104_skew_salience(
+        registry: &khive_runtime::VerbRegistry,
+        profile_id: &str,
+        target_id: Uuid,
+        n: usize,
+    ) {
+        for _ in 0..n {
+            registry
+                .dispatch(
+                    "brain.feedback",
+                    serde_json::json!({
+                        "target_id": target_id.to_string(),
+                        "signal": "useful",
+                        "served_by_profile_id": profile_id,
+                    }),
+                )
+                .await
+                .expect("skew salience posterior");
+        }
+    }
+
+    /// Index of the hit whose `id` matches `id` in a `memory.recall` hits array.
+    fn adr104_position(hits: &[Value], id: Uuid) -> usize {
+        let target = id.to_string();
+        hits.iter()
+            .position(|h| h["id"].as_str() == Some(target.as_str()))
+            .unwrap_or_else(|| panic!("id {target} not present in recall hits: {hits:?}"))
+    }
+
+    /// Profile-differentiated ranking (ADR-104 §1): two profiles with
+    /// different posterior state must produce DIFFERENT orderings for the
+    /// same store+query. `H` leads `L` at configured-default weights (its
+    /// modest relevance edge dominates); pushing a profile's salience
+    /// posterior far above the default weight overturns that edge and `L`
+    /// leads instead. Deleting the serve-time projection call collapses
+    /// both cases to the same (default) ordering, failing this test.
+    #[tokio::test]
+    #[serial(background_tasks)]
+    async fn adr104_profile_differentiated_ranking_flips_order() {
+        let (_rt, registry, ns, h_id, l_id) = adr104_build_ranking_corpus().await;
+
+        registry
+            .dispatch(
+                "brain.create_profile",
+                serde_json::json!({
+                    "namespace": ns.as_str(),
+                    "name": "adr104-skew-recall-v1",
+                    "consumer_kind": "recall",
+                }),
+            )
+            .await
+            .expect("create profile");
+        adr104_skew_salience(&registry, "adr104-skew-recall-v1", h_id, 30).await;
+
+        let base_params = serde_json::json!({
+            "namespace": ns.as_str(),
+            "query": ADR104_QUERY,
+            "fusion_strategy": "vector_only",
+            "embedding_model": ADR104_MODEL,
+            "limit": 10,
+        });
+
+        let default_result = registry
+            .dispatch("memory.recall", base_params.clone())
+            .await
+            .expect("default recall");
+        let default_hits = default_result.as_array().expect("bare array result");
+
+        let mut skewed_params = base_params;
+        skewed_params["profile_id"] = serde_json::json!("adr104-skew-recall-v1");
+        let skewed_result = registry
+            .dispatch("memory.recall", skewed_params)
+            .await
+            .expect("skewed-profile recall");
+        let skewed_hits = skewed_result.as_array().expect("bare array result");
+
+        assert!(
+            adr104_position(default_hits, h_id) < adr104_position(default_hits, l_id),
+            "at configured-default weights H's relevance edge must win: {default_hits:?}"
+        );
+        assert!(
+            adr104_position(skewed_hits, l_id) < adr104_position(skewed_hits, h_id),
+            "under the salience-skewed profile L must overtake H — if this still \
+             matches the default ordering, the serve-time projection call is not \
+             wired into scoring: {skewed_hits:?}"
+        );
+    }
+
+    /// No-profile path unchanged (ADR-104 §1): a request with no resolvable
+    /// profile must score byte-identically whether or not the brain pack is
+    /// even loaded — merely having a default profile registered must not
+    /// perturb scoring absent an explicit config or a matching binding.
+    #[tokio::test]
+    #[serial(background_tasks)]
+    async fn recall_no_profile_scores_identically_with_or_without_brain_pack() {
+        use khive_pack_brain::BrainPack;
+
+        async fn score_for(with_brain: bool) -> f64 {
+            let rt = if with_brain {
+                build_full_rt_with_brain()
+            } else {
+                KhiveRuntime::memory().expect("in-memory runtime")
+            };
+            let ns = Namespace::parse("local").expect("ns");
+            let token = rt.authorize(ns.clone()).expect("token");
+            rt.create_note(
+                &token,
+                "memory",
+                None,
+                "adr104 no-profile baseline note",
+                Some(0.6),
+                None,
+                vec![],
+            )
+            .await
+            .expect("create note");
+
+            let mut builder = VerbRegistryBuilder::new();
+            builder.register(KgPack::new(rt.clone()));
+            builder.register(MemoryPack::new(rt.clone()));
+            if with_brain {
+                builder.register(BrainPack::new(rt.clone()));
+            }
+            let registry = builder.build().expect("registry");
+
+            let result = registry
+                .dispatch(
+                    "memory.recall",
+                    serde_json::json!({
+                        "namespace": ns.as_str(),
+                        "query": "adr104 no-profile baseline note",
+                        "limit": 10
+                    }),
+                )
+                .await
+                .expect("recall");
+            let hits = result.as_array().expect("bare array result");
+            assert_eq!(hits.len(), 1);
+            assert!(
+                hits[0].get("served_by_profile_id").is_none(),
+                "no bound profile => no stamp, whether or not brain is loaded"
+            );
+            hits[0]["rank_score"].as_f64().expect("rank_score")
+        }
+
+        let without_brain = score_for(false).await;
+        let with_brain = score_for(true).await;
+        assert!(
+            (without_brain - with_brain).abs() < 1e-9,
+            "ADR-104 §1: with no resolvable profile, scoring must be byte-identical \
+             to the pre-change baseline regardless of whether the brain pack is \
+             loaded: without_brain={without_brain} with_brain={with_brain}"
+        );
+    }
+
+    /// `profile_id` override (ADR-104 §4): stamps the named profile with no
+    /// binding required, participates in the serve ledger identically to a
+    /// resolved profile, and an unknown profile_id is a hard per-op error
+    /// rather than a silent fallback to defaults.
+    #[tokio::test]
+    #[serial(background_tasks)]
+    async fn recall_profile_id_override_stamps_ledger_and_rejects_unknown_profile() {
+        use khive_pack_brain::BrainPack;
+
+        let rt = build_full_rt_with_brain();
+        let ns = Namespace::parse("local").expect("ns");
+        let token = rt.authorize(ns.clone()).expect("token");
+
+        let note = rt
+            .create_note(
+                &token,
+                "memory",
+                None,
+                "adr104 profile_id override note",
+                Some(0.7),
+                None,
+                vec![],
+            )
+            .await
+            .expect("create note");
+
+        let brain = BrainPack::new(rt.clone());
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(KgPack::new(rt.clone()));
+        builder.register(MemoryPack::new(rt.clone()));
+        builder.register(brain);
+        let registry = builder.build().expect("registry");
+
+        // No binding created — the override must serve purely from the
+        // explicit `profile_id` param, bypassing binding resolution.
+        registry
+            .dispatch(
+                "brain.create_profile",
+                serde_json::json!({
+                    "namespace": ns.as_str(),
+                    "name": "adr104-override-v1",
+                    "consumer_kind": "recall",
+                }),
+            )
+            .await
+            .expect("create profile");
+
+        let result = registry
+            .dispatch(
+                "memory.recall",
+                serde_json::json!({
+                    "namespace": ns.as_str(),
+                    "query": "adr104 profile_id override note",
+                    "profile_id": "adr104-override-v1",
+                    "limit": 10
+                }),
+            )
+            .await
+            .expect("memory.recall with profile_id override");
+
+        let hits = result.as_array().expect("bare array result");
+        assert!(!hits.is_empty());
+        assert_eq!(
+            hits[0]["served_by_profile_id"],
+            serde_json::json!("adr104-override-v1"),
+            "profile_id override must stamp the named profile with no binding required"
+        );
+
+        let target_id = note.id.to_string();
+        let mut found = false;
+        for _ in 0..100 {
+            let mut reader = rt.sql().reader().await.expect("reader");
+            let row = reader
+                .query_row(khive_storage::types::SqlStatement {
+                    sql: "SELECT served_by_profile_id FROM brain_serve_ledger \
+                          WHERE target_id = ?1"
+                        .into(),
+                    params: vec![khive_storage::types::SqlValue::Text(target_id.clone())],
+                    label: None,
+                })
+                .await
+                .expect("query row");
+            if let Some(row) = row {
+                assert!(
+                    matches!(
+                        row.get("served_by_profile_id"),
+                        Some(khive_storage::types::SqlValue::Text(s)) if s == "adr104-override-v1"
+                    ),
+                    "serve ledger row must carry the profile_id override"
+                );
+                found = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            found,
+            "serve ledger row for the override must appear within 2s"
+        );
+
+        let bad_result = registry
+            .dispatch(
+                "memory.recall",
+                serde_json::json!({
+                    "namespace": ns.as_str(),
+                    "query": "adr104 profile_id override note",
+                    "profile_id": "adr104-does-not-exist",
+                    "limit": 10
+                }),
+            )
+            .await;
+        assert!(
+            bad_result.is_err(),
+            "unknown profile_id must be a per-op error, not a silent fallback to defaults"
+        );
+    }
+
+    /// Breakdown fields (ADR-104 §3): `profile_component` is neutral (1.0)
+    /// with no profile and != 1.0 once a differentiating profile serves the
+    /// request; `entity_posterior_mean` is absent for a target with no
+    /// feedback and present+correct for one with a seeded posterior — and
+    /// Stage A ranking is driven by component 1 alone: the seeded entity
+    /// posterior on `H` must not move it back above `L`.
+    #[tokio::test]
+    #[serial(background_tasks)]
+    async fn recall_breakdown_reports_profile_component_and_entity_posterior_mean() {
+        {
+            let rt = KhiveRuntime::memory().expect("in-memory runtime");
+            let ns = Namespace::parse("local").expect("ns");
+            let token = rt.authorize(ns.clone()).expect("token");
+            rt.create_note(
+                &token,
+                "memory",
+                None,
+                "adr104 breakdown no-profile note",
+                Some(0.5),
+                None,
+                vec![],
+            )
+            .await
+            .expect("create note");
+
+            let mut builder = VerbRegistryBuilder::new();
+            builder.register(KgPack::new(rt.clone()));
+            builder.register(MemoryPack::new(rt.clone()));
+            let registry = builder.build().expect("registry");
+
+            let result = registry
+                .dispatch(
+                    "memory.recall",
+                    serde_json::json!({
+                        "namespace": ns.as_str(),
+                        "query": "adr104 breakdown no-profile note",
+                        "include_breakdown": true,
+                        "limit": 10
+                    }),
+                )
+                .await
+                .expect("recall");
+            let hits = result.as_array().expect("bare array result");
+            assert_eq!(hits.len(), 1);
+            let breakdown = &hits[0]["breakdown"];
+            assert_eq!(
+                breakdown["profile_component"].as_f64(),
+                Some(1.0),
+                "no profile served the request => profile_component must be neutral 1.0"
+            );
+            assert!(
+                breakdown["entity_posterior_mean"].is_null(),
+                "no profile served the request => entity_posterior_mean must be absent"
+            );
+        }
+
+        let (_rt, registry, ns, h_id, l_id) = adr104_build_ranking_corpus().await;
+
+        registry
+            .dispatch(
+                "brain.create_profile",
+                serde_json::json!({
+                    "namespace": ns.as_str(),
+                    "name": "adr104-breakdown-skew-v1",
+                    "consumer_kind": "recall",
+                }),
+            )
+            .await
+            .expect("create profile");
+        // Seeds both the global salience posterior (drives component 1) and
+        // H's per-entity posterior (reported by component 3) in one loop.
+        adr104_skew_salience(&registry, "adr104-breakdown-skew-v1", h_id, 30).await;
+
+        let result = registry
+            .dispatch(
+                "memory.recall",
+                serde_json::json!({
+                    "namespace": ns.as_str(),
+                    "query": ADR104_QUERY,
+                    "fusion_strategy": "vector_only",
+                    "embedding_model": ADR104_MODEL,
+                    "profile_id": "adr104-breakdown-skew-v1",
+                    "include_breakdown": true,
+                    "limit": 10
+                }),
+            )
+            .await
+            .expect("recall");
+        let hits = result.as_array().expect("bare array result");
+
+        let h_pos = adr104_position(hits, h_id);
+        let l_pos = adr104_position(hits, l_id);
+        assert!(
+            l_pos < h_pos,
+            "Stage A ranking must still be driven by component 1 alone (matching \
+             the profile-differentiated ranking test) — the entity posterior term \
+             (component 2, Stage B) must not move it even though H has a seeded \
+             posterior: {hits:?}"
+        );
+
+        let h_component = hits[h_pos]["breakdown"]["profile_component"]
+            .as_f64()
+            .expect("profile_component present");
+        assert!(
+            (h_component - 1.0).abs() > 1e-6,
+            "H's score moved under projected weights (differentiating profile) => \
+             profile_component must be != 1.0, got {h_component}"
+        );
+        let h_ent_mean = hits[h_pos]["breakdown"]["entity_posterior_mean"]
+            .as_f64()
+            .expect("H has a seeded entity posterior");
+        assert!(
+            h_ent_mean > 0.9,
+            "H received 30 'useful' signals against an uninformative Beta(1,1) \
+             prior; its entity posterior mean must be high, got {h_ent_mean}"
+        );
+
+        assert!(
+            hits[l_pos]["breakdown"]["entity_posterior_mean"].is_null(),
+            "L never received feedback => entity_posterior_mean must be absent, \
+             not a guessed prior mean"
+        );
+    }
+
+    /// Determinism (ADR-104 §1): identical store/query/profile-state must
+    /// produce identical ranking and identical `rank_score` values across
+    /// repeated calls — `project_config` is used as a pure function, never
+    /// mutating shared state.
+    #[tokio::test]
+    #[serial(background_tasks)]
+    async fn recall_profile_projection_is_deterministic_across_repeated_calls() {
+        let (_rt, registry, ns, h_id, _l_id) = adr104_build_ranking_corpus().await;
+
+        registry
+            .dispatch(
+                "brain.create_profile",
+                serde_json::json!({
+                    "namespace": ns.as_str(),
+                    "name": "adr104-determinism-v1",
+                    "consumer_kind": "recall",
+                }),
+            )
+            .await
+            .expect("create profile");
+        adr104_skew_salience(&registry, "adr104-determinism-v1", h_id, 30).await;
+
+        let params = serde_json::json!({
+            "namespace": ns.as_str(),
+            "query": ADR104_QUERY,
+            "fusion_strategy": "vector_only",
+            "embedding_model": ADR104_MODEL,
+            "profile_id": "adr104-determinism-v1",
+            "limit": 10
+        });
+
+        let first = registry
+            .dispatch("memory.recall", params.clone())
+            .await
+            .expect("first recall");
+        let second = registry
+            .dispatch("memory.recall", params)
+            .await
+            .expect("second recall");
+
+        let first_hits = first.as_array().expect("bare array result");
+        let second_hits = second.as_array().expect("bare array result");
+
+        let first_order: Vec<&str> = first_hits
+            .iter()
+            .map(|h| h["id"].as_str().expect("id"))
+            .collect();
+        let second_order: Vec<&str> = second_hits
+            .iter()
+            .map(|h| h["id"].as_str().expect("id"))
+            .collect();
+        assert_eq!(
+            first_order, second_order,
+            "identical store/query/profile-state must produce identical ranking \
+             across repeated calls"
+        );
+
+        let first_scores: Vec<f64> = first_hits
+            .iter()
+            .map(|h| h["rank_score"].as_f64().expect("rank_score"))
+            .collect();
+        let second_scores: Vec<f64> = second_hits
+            .iter()
+            .map(|h| h["rank_score"].as_f64().expect("rank_score"))
+            .collect();
+        assert_eq!(
+            first_scores, second_scores,
+            "identical store/query/profile-state must produce byte-identical \
+             rank_score values"
+        );
+    }
+
+    // ── ADR-104 R2: measured per-recall overhead of the profile-state read ─
+
+    /// Median + p95 wall-clock overhead of the ADR-104 §1 profile-state read
+    /// (`brain.profile` dispatch + snapshot deserialize + `project_config`)
+    /// against an otherwise identical recall with no resolvable profile.
+    /// `#[ignore]`d — a timing measurement, not a correctness gate; run
+    /// explicitly (`cargo test -p khive-pack-memory -- --ignored
+    /// adr104_r2`) and the printed numbers are recorded verbatim in
+    /// IMPL_REPORT.md per the Stage A binding sign-off rider (R2).
+    #[tokio::test]
+    #[ignore]
+    async fn adr104_r2_measure_profile_state_read_overhead() {
+        use khive_pack_brain::BrainPack;
+
+        const ITERATIONS: usize = 150;
+
+        async fn recall_once(registry: &khive_runtime::VerbRegistry, params: &Value) {
+            registry
+                .dispatch("memory.recall", params.clone())
+                .await
+                .expect("recall");
+        }
+
+        fn percentile(mut samples: Vec<f64>, p: f64) -> f64 {
+            samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let idx = ((samples.len() - 1) as f64 * p).round() as usize;
+            samples[idx]
+        }
+
+        let rt = build_full_rt_with_brain();
+        let ns = Namespace::parse("local").expect("ns");
+        let token = rt.authorize(ns.clone()).expect("token");
+        rt.create_note(
+            &token,
+            "memory",
+            None,
+            "adr104 r2 overhead probe note",
+            Some(0.6),
+            None,
+            vec![],
+        )
+        .await
+        .expect("create note");
+
+        let brain = BrainPack::new(rt.clone());
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(KgPack::new(rt.clone()));
+        builder.register(MemoryPack::new(rt.clone()));
+        builder.register(brain);
+        let registry = builder.build().expect("registry");
+
+        registry
+            .dispatch(
+                "brain.create_profile",
+                serde_json::json!({
+                    "namespace": ns.as_str(),
+                    "name": "adr104-r2-v1",
+                    "consumer_kind": "recall",
+                }),
+            )
+            .await
+            .expect("create profile");
+        registry
+            .dispatch(
+                "brain.bind",
+                serde_json::json!({
+                    "namespace": ns.as_str(),
+                    "profile_id": "adr104-r2-v1",
+                    "consumer_kind": "recall",
+                }),
+            )
+            .await
+            .expect("bind profile");
+
+        // The "without profile" arm exercises the exact same handler path
+        // with binding resolution finding nothing: a fresh namespace with no
+        // binding, rather than an invalid profile_id (which would error,
+        // not degrade).
+        let unbound_ns = Namespace::parse("adr104-r2-unbound").expect("ns");
+        let unbound_token = rt.authorize(unbound_ns.clone()).expect("token");
+        rt.create_note(
+            &unbound_token,
+            "memory",
+            None,
+            "adr104 r2 overhead probe note",
+            Some(0.6),
+            None,
+            vec![],
+        )
+        .await
+        .expect("create note in unbound namespace");
+        let params_without_profile = serde_json::json!({
+            "namespace": unbound_ns.as_str(),
+            "query": "adr104 r2 overhead probe note",
+            "limit": 10,
+        });
+
+        let params_with_profile = serde_json::json!({
+            "namespace": ns.as_str(),
+            "query": "adr104 r2 overhead probe note",
+            "limit": 10,
+        });
+
+        // Warm up (first-call effects: ANN index build, query embedding cache).
+        recall_once(&registry, &params_without_profile).await;
+        recall_once(&registry, &params_with_profile).await;
+
+        let mut without_profile_us: Vec<f64> = Vec::with_capacity(ITERATIONS);
+        let mut with_profile_us: Vec<f64> = Vec::with_capacity(ITERATIONS);
+        for _ in 0..ITERATIONS {
+            let start = std::time::Instant::now();
+            recall_once(&registry, &params_without_profile).await;
+            without_profile_us.push(start.elapsed().as_micros() as f64);
+
+            let start = std::time::Instant::now();
+            recall_once(&registry, &params_with_profile).await;
+            with_profile_us.push(start.elapsed().as_micros() as f64);
+        }
+
+        let median_without = percentile(without_profile_us.clone(), 0.50);
+        let p95_without = percentile(without_profile_us, 0.95);
+        let median_with = percentile(with_profile_us.clone(), 0.50);
+        let p95_with = percentile(with_profile_us, 0.95);
+
+        eprintln!(
+            "[ADR-104 R2] N={ITERATIONS} iterations\n\
+             without profile-state read: median={median_without:.1}us p95={p95_without:.1}us\n\
+             with profile-state read:    median={median_with:.1}us p95={p95_with:.1}us\n\
+             delta:                      median={:.1}us p95={:.1}us",
+            median_with - median_without,
+            p95_with - p95_without,
         );
     }
 }
