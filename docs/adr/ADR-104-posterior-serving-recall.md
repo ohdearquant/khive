@@ -1,6 +1,6 @@
 # ADR-104: Profile Posteriors in the Recall Read Path
 
-**Status**: Proposed
+**Status**: Accepted (signed 2026-07-08, with riders R1 and R2 below)
 **Date**: 2026-07-08
 **Depends on**: ADR-021 (memory pack), ADR-081 (serve ledger + profile stamping), ADR-033
 (recall scoring), issue #159 (brain-tunable parameter surface)
@@ -143,6 +143,15 @@ semantics unchanged).
 Stages land as separate PRs in order; A carries the request/response shape changes, so
 B and C are additive behind already-shipped surface.
 
+Two riders bind the stage gates (sign-off conditions, 2026-07-08):
+
+- **R1 (Stage C)**: the Stage C PR must document the lowercase/CJK lookup strategy and an
+  explicit per-recall cost bound for entity anchoring — one batched indexed lookup, no
+  unbounded per-recall scans of the entity table.
+- **R2 (Stage A)**: Stage A ships a **measured** per-recall overhead number (recall with
+  vs without the profile-state read) recorded in the PR; Stage B does not land until that
+  number is in the record.
+
 ## Consequences
 
 ### Positive
@@ -171,10 +180,11 @@ B and C are additive behind already-shipped surface.
    a future curation pass merges memories), per-entity posterior state for the removed
    UUID is orphaned rather than folded into the kept record. Acceptable at current
    volumes; revisit if feedback density grows.
-2. **ESS floor for the per-entity term.** Component 2 treats any posterior beyond the
-   uninformative prior as informative. If single-signal noise proves visible in evals, a
-   minimum-evidence floor (e.g. ≥2 observations) is a one-line adjustment; the eval set
-   decides.
+2. **ESS floor for the per-entity term.** Resolved at sign-off (2026-07-08): **no ESS
+   floor at Stage B.** Component 2 treats any posterior beyond the uninformative prior as
+   informative; single-signal responsiveness is the point of the feedback-lift gate. If
+   eval noise later proves visible, a minimum-evidence floor is a one-line adjustment —
+   revisit only with eval evidence.
 3. **Bigram window for entity anchoring.** Component 5 starts with unigrams and
    adjacent-token bigrams. Longer entity names (3+ tokens) fall back to capitalized
    extraction or explicit `entity_names`; extending the window is a measured decision.
