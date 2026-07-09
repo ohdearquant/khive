@@ -168,9 +168,9 @@ request(ops="[{\"tool\":\"v1\",\"args\":{...}}, ...]")
 
 Verbs come from whichever packs are loaded via `KHIVE_PACKS` (env) or `--pack` (CLI). Default
 loads all 9 production packs: kg, gtd, memory, brain, comm, schedule, knowledge, session, git
-(75 verbs total — git contributes commit/issue/pull_request note kinds and a batch ingester,
-no new verbs; comm.probe (#644) added 2026-07-07; regenerate via
-`request(ops="verbs()")` before editing this line).
+(76 verbs total — git contributes commit/issue/pull_request note kinds and a batch ingester,
+no new verbs; comm.probe (#644) added 2026-07-07; brain.event_counts (ADR-103 Stage 1, #724
+Ask A) added 2026-07-08; regenerate via `request(ops="verbs()")` before editing this line).
 
 ### KG pack verbs (17 — ADR-017, ADR-046, ADR-089)
 

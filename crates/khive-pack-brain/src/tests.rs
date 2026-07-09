@@ -5740,3 +5740,619 @@ mod durable_write_tests {
         );
     }
 }
+
+// ── brain.event_counts (ADR-103 Stage 1, #724 Ask A) ────────────────────────
+
+#[cfg(test)]
+mod event_counts_tests {
+    use super::*;
+    use khive_runtime::micros_to_iso;
+    use khive_storage::event::{Event, EventFilter};
+    use khive_storage::types::PageRequest;
+    use khive_types::{EventKind, SubstrateKind};
+    use serde_json::Value;
+
+    /// Append a synthetic event directly through the `EventStore`, bypassing
+    /// verb dispatch, so the window boundary tests control `created_at` and
+    /// payload precisely instead of relying on wall-clock timing.
+    async fn seed_event(
+        rt: &KhiveRuntime,
+        token: &NamespaceToken,
+        verb: &str,
+        kind: EventKind,
+        actor: &str,
+        created_at: i64,
+        payload: Value,
+    ) {
+        let mut event = Event::new(
+            token.namespace().as_str(),
+            verb,
+            kind,
+            SubstrateKind::Note,
+            actor,
+        );
+        event.created_at = created_at;
+        event.payload = payload;
+        rt.events(token)
+            .expect("event store")
+            .append_event(event)
+            .await
+            .expect("seed event append");
+    }
+
+    /// Sanity check that the seeding helper and window semantics agree with
+    /// the underlying `EventFilter` used by other event-store tests: appending
+    /// a handful of rows and reading them back via `query_events` with an
+    /// explicit filter must see exactly what was seeded.
+    async fn seeded_count(rt: &KhiveRuntime, token: &NamespaceToken) -> usize {
+        rt.events(token)
+            .expect("event store")
+            .query_events(
+                EventFilter::default(),
+                PageRequest {
+                    offset: 0,
+                    limit: 1000,
+                },
+            )
+            .await
+            .expect("query_events")
+            .items
+            .len()
+    }
+
+    #[tokio::test]
+    async fn window_boundaries_include_since_exclude_until() {
+        let (pack, rt) = make_pack();
+        let registry = empty_registry();
+        let token = rt.authorize(Namespace::local()).unwrap();
+
+        let since = 1_000_000_i64;
+        let until = 2_000_000_i64;
+
+        // Exactly at `since` — must be INCLUDED.
+        seed_event(
+            &rt,
+            &token,
+            "search",
+            EventKind::SearchExecuted,
+            "lambda:a",
+            since,
+            json!({}),
+        )
+        .await;
+        // Inside the window.
+        seed_event(
+            &rt,
+            &token,
+            "search",
+            EventKind::SearchExecuted,
+            "lambda:a",
+            1_500_000,
+            json!({}),
+        )
+        .await;
+        // Exactly at `until` — must be EXCLUDED (half-open window).
+        seed_event(
+            &rt,
+            &token,
+            "search",
+            EventKind::SearchExecuted,
+            "lambda:a",
+            until,
+            json!({}),
+        )
+        .await;
+        // Before `since` — must be EXCLUDED.
+        seed_event(
+            &rt,
+            &token,
+            "search",
+            EventKind::SearchExecuted,
+            "lambda:a",
+            500_000,
+            json!({}),
+        )
+        .await;
+
+        assert_eq!(seeded_count(&rt, &token).await, 4);
+
+        let result = pack
+            .dispatch(
+                "brain.event_counts",
+                json!({
+                    "since": micros_to_iso(since),
+                    "until": micros_to_iso(until),
+                }),
+                &registry,
+                &token,
+            )
+            .await
+            .expect("brain.event_counts must succeed");
+
+        assert_eq!(
+            result["total"],
+            json!(2),
+            "window must include the `since` boundary and exclude the `until` boundary: {result}"
+        );
+        assert_eq!(result["counts_by_kind"]["search_executed"], json!(2));
+    }
+
+    #[tokio::test]
+    async fn empty_window_returns_zero_counts_not_error() {
+        let (pack, rt) = make_pack();
+        let registry = empty_registry();
+        let token = rt.authorize(Namespace::local()).unwrap();
+
+        let result = pack
+            .dispatch(
+                "brain.event_counts",
+                json!({
+                    "since": "2020-01-01T00:00:00Z",
+                    "until": "2020-01-02T00:00:00Z",
+                }),
+                &registry,
+                &token,
+            )
+            .await
+            .expect("empty window must not error");
+
+        assert_eq!(result["total"], json!(0));
+        assert_eq!(result["counts_by_kind"], json!({}));
+        assert_eq!(result["counts_by_actor"], json!({}));
+        assert!(
+            result.get("by_profile").is_none(),
+            "by_profile must be omitted when no feedback events are in the window: {result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn kind_filter_scopes_counts() {
+        let (pack, rt) = make_pack();
+        let registry = empty_registry();
+        let token = rt.authorize(Namespace::local()).unwrap();
+
+        seed_event(
+            &rt,
+            &token,
+            "search",
+            EventKind::SearchExecuted,
+            "lambda:a",
+            1_000_000,
+            json!({}),
+        )
+        .await;
+        seed_event(
+            &rt,
+            &token,
+            "recall",
+            EventKind::RecallExecuted,
+            "lambda:a",
+            1_000_000,
+            json!({}),
+        )
+        .await;
+
+        let result = pack
+            .dispatch(
+                "brain.event_counts",
+                json!({
+                    "since": micros_to_iso(0),
+                    "kind": "recall_executed",
+                }),
+                &registry,
+                &token,
+            )
+            .await
+            .expect("brain.event_counts must succeed");
+
+        assert_eq!(result["total"], json!(1));
+        assert_eq!(result["counts_by_kind"]["recall_executed"], json!(1));
+        assert!(result["counts_by_kind"].get("search_executed").is_none());
+    }
+
+    #[tokio::test]
+    async fn actor_filter_scopes_counts() {
+        let (pack, rt) = make_pack();
+        let registry = empty_registry();
+        let token = rt.authorize(Namespace::local()).unwrap();
+
+        seed_event(
+            &rt,
+            &token,
+            "search",
+            EventKind::SearchExecuted,
+            "lambda:a",
+            1_000_000,
+            json!({}),
+        )
+        .await;
+        seed_event(
+            &rt,
+            &token,
+            "search",
+            EventKind::SearchExecuted,
+            "lambda:b",
+            1_000_000,
+            json!({}),
+        )
+        .await;
+
+        let result = pack
+            .dispatch(
+                "brain.event_counts",
+                json!({
+                    "since": micros_to_iso(0),
+                    "actor": "lambda:b",
+                }),
+                &registry,
+                &token,
+            )
+            .await
+            .expect("brain.event_counts must succeed");
+
+        assert_eq!(result["total"], json!(1));
+        assert_eq!(result["counts_by_actor"]["lambda:b"], json!(1));
+        assert!(result["counts_by_actor"].get("lambda:a").is_none());
+    }
+
+    #[tokio::test]
+    async fn feedback_events_split_by_served_by_profile_id() {
+        let (pack, rt) = make_pack();
+        let registry = empty_registry();
+        let token = rt.authorize(Namespace::local()).unwrap();
+
+        seed_event(
+            &rt,
+            &token,
+            "brain.feedback",
+            EventKind::FeedbackExplicit,
+            "lambda:a",
+            1_000_000,
+            json!({"served_by_profile_id": "balanced-recall-v1", "signal": "useful"}),
+        )
+        .await;
+        seed_event(
+            &rt,
+            &token,
+            "brain.feedback",
+            EventKind::FeedbackExplicit,
+            "lambda:a",
+            1_000_000,
+            json!({"served_by_profile_id": "balanced-recall-v1", "signal": "wrong"}),
+        )
+        .await;
+        // Missing served_by_profile_id — must fall into the "unspecified" bucket
+        // rather than being dropped from the split.
+        seed_event(
+            &rt,
+            &token,
+            "brain.feedback",
+            EventKind::FeedbackExplicit,
+            "lambda:a",
+            1_000_000,
+            json!({"signal": "useful"}),
+        )
+        .await;
+
+        let result = pack
+            .dispatch(
+                "brain.event_counts",
+                json!({"since": micros_to_iso(0)}),
+                &registry,
+                &token,
+            )
+            .await
+            .expect("brain.event_counts must succeed");
+
+        assert_eq!(result["total"], json!(3));
+        assert_eq!(
+            result["by_profile"]["balanced-recall-v1"],
+            json!(2),
+            "got: {result}"
+        );
+        assert_eq!(
+            result["by_profile"]["unspecified"],
+            json!(1),
+            "got: {result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_kind_lists_valid_values() {
+        let (pack, rt) = make_pack();
+        let registry = empty_registry();
+        let token = rt.authorize(Namespace::local()).unwrap();
+
+        let err = pack
+            .dispatch(
+                "brain.event_counts",
+                json!({"since": micros_to_iso(0), "kind": "not_a_real_kind"}),
+                &registry,
+                &token,
+            )
+            .await
+            .expect_err("unknown kind must be rejected");
+
+        match &err {
+            RuntimeError::InvalidInput(msg) => {
+                assert!(
+                    msg.contains("not_a_real_kind"),
+                    "error must name the rejected value: {msg}"
+                );
+                assert!(
+                    msg.contains("recall_executed") || msg.contains("Valid:"),
+                    "error must list valid EventKind values: {msg}"
+                );
+            }
+            other => panic!("expected InvalidInput, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_since_datetime_names_the_field() {
+        let (pack, rt) = make_pack();
+        let registry = empty_registry();
+        let token = rt.authorize(Namespace::local()).unwrap();
+
+        let err = pack
+            .dispatch(
+                "brain.event_counts",
+                json!({"since": "not-a-date"}),
+                &registry,
+                &token,
+            )
+            .await
+            .expect_err("malformed since must be rejected");
+
+        match &err {
+            RuntimeError::InvalidInput(msg) => {
+                assert!(
+                    msg.contains("since") && msg.contains("not-a-date"),
+                    "error must name the field and offending value: {msg}"
+                );
+            }
+            other => panic!("expected InvalidInput, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn missing_since_is_rejected() {
+        let (pack, rt) = make_pack();
+        let registry = empty_registry();
+        let token = rt.authorize(Namespace::local()).unwrap();
+
+        let err = pack
+            .dispatch("brain.event_counts", json!({}), &registry, &token)
+            .await
+            .expect_err("since is required");
+
+        match &err {
+            RuntimeError::InvalidInput(msg) => {
+                assert!(
+                    msg.contains("since"),
+                    "error must name the missing field: {msg}"
+                );
+                assert!(
+                    msg.to_ascii_lowercase().contains("iso-8601")
+                        || msg.to_ascii_lowercase().contains("rfc-3339")
+                        || msg.to_ascii_lowercase().contains("rfc3339"),
+                    "error must name the expected format: {msg}"
+                );
+                assert!(
+                    msg.contains("2026-07-01T00:00:00Z") || msg.contains("T00:00:00Z"),
+                    "error must include an example datetime: {msg}"
+                );
+            }
+            other => panic!("expected InvalidInput, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn work_class_split_reads_phase_payload_not_resource_fallback() {
+        let (pack, rt) = make_pack();
+        let registry = empty_registry();
+        let token = rt.authorize(Namespace::local()).unwrap();
+
+        // Today's real shape: work_class lives directly on the Phase* payload
+        // (khive_storage::telemetry::PhaseStartedPayload / PhaseCompletedPayload).
+        seed_event(
+            &rt,
+            &token,
+            "ann_warm",
+            EventKind::PhaseStarted,
+            "lambda:khive",
+            1_000_000,
+            json!({"work_class": "warm", "phase": "ann_warm", "corpus_size": 553_000}),
+        )
+        .await;
+        seed_event(
+            &rt,
+            &token,
+            "ann_warm",
+            EventKind::PhaseCompleted,
+            "lambda:khive",
+            1_000_000,
+            json!({"work_class": "warm", "phase": "ann_warm", "wall_us": 41_000_000, "cpu_us": null}),
+        )
+        .await;
+        // A different work_class, distinct kind, so the split can't be faked by
+        // just echoing counts_by_kind.
+        seed_event(
+            &rt,
+            &token,
+            "ann_warm",
+            EventKind::PhaseStarted,
+            "lambda:khive",
+            1_000_000,
+            json!({"work_class": "maintenance", "phase": "index_rebuild"}),
+        )
+        .await;
+        // A non-phase event with no work_class anywhere — must not appear in the split.
+        seed_event(
+            &rt,
+            &token,
+            "search",
+            EventKind::SearchExecuted,
+            "lambda:khive",
+            1_000_000,
+            json!({}),
+        )
+        .await;
+        // Future shape: work_class nested under `resource`, no top-level `work_class`.
+        // Must be picked up via the fallback path, not just the phase path.
+        seed_event(
+            &rt,
+            &token,
+            "recall",
+            EventKind::RecallExecuted,
+            "lambda:khive",
+            1_000_000,
+            json!({"resource": {"work_class": "interactive"}}),
+        )
+        .await;
+        // Both paths present: phase path must win (checked first).
+        seed_event(
+            &rt,
+            &token,
+            "ann_warm",
+            EventKind::PhaseStarted,
+            "lambda:khive",
+            1_000_000,
+            json!({"work_class": "warm", "resource": {"work_class": "maintenance"}}),
+        )
+        .await;
+
+        let result = pack
+            .dispatch(
+                "brain.event_counts",
+                json!({"since": micros_to_iso(0)}),
+                &registry,
+                &token,
+            )
+            .await
+            .expect("brain.event_counts must succeed");
+
+        assert_eq!(result["total"], json!(6), "got: {result}");
+        assert_eq!(
+            result["counts_by_work_class"]["warm"],
+            json!(3),
+            "phase-path warm rows (2 pure + 1 dual-path, phase wins) must all count as warm: {result}"
+        );
+        assert_eq!(
+            result["counts_by_work_class"]["maintenance"],
+            json!(1),
+            "the dual-path row must count under warm (phase path), not maintenance \
+             (resource fallback) — phase path must be checked first: {result}"
+        );
+        assert_eq!(
+            result["counts_by_work_class"]["interactive"],
+            json!(1),
+            "resource.work_class fallback must be read when no top-level work_class exists: {result}"
+        );
+        // search_executed carried no work_class anywhere -> excluded from the split,
+        // not zero-filled, so the split total (5) is less than the overall total (6).
+        let split_total: u64 = result["counts_by_work_class"]
+            .as_object()
+            .expect("counts_by_work_class must be an object")
+            .values()
+            .map(|v| v.as_u64().unwrap())
+            .sum();
+        assert_eq!(
+            split_total, 5,
+            "events with neither work_class path present must be excluded, not counted: {result}"
+        );
+    }
+
+    #[tokio::test]
+    async fn work_class_split_absent_when_no_event_carries_it() {
+        let (pack, rt) = make_pack();
+        let registry = empty_registry();
+        let token = rt.authorize(Namespace::local()).unwrap();
+
+        seed_event(
+            &rt,
+            &token,
+            "search",
+            EventKind::SearchExecuted,
+            "lambda:a",
+            1_000_000,
+            json!({}),
+        )
+        .await;
+
+        let result = pack
+            .dispatch(
+                "brain.event_counts",
+                json!({"since": micros_to_iso(0)}),
+                &registry,
+                &token,
+            )
+            .await
+            .expect("brain.event_counts must succeed");
+
+        assert!(
+            result.get("counts_by_work_class").is_none(),
+            "counts_by_work_class must be omitted, not an empty object, when no event in \
+             the window carries a work_class: {result}"
+        );
+    }
+
+    /// `cost_unit` does not exist on any event payload in the codebase today (ADR-103
+    /// Stage 0 defines it; no Stage 1 producer emits it yet). This verb must not invent
+    /// a `cost_unit` key — asserts its literal absence from the response shape so a
+    /// future producer landing the field is a deliberate response-shape change, not a
+    /// silent no-op this test would miss.
+    #[tokio::test]
+    async fn cost_unit_is_not_present_in_the_response() {
+        let (pack, rt) = make_pack();
+        let registry = empty_registry();
+        let token = rt.authorize(Namespace::local()).unwrap();
+
+        seed_event(
+            &rt,
+            &token,
+            "ann_warm",
+            EventKind::PhaseCompleted,
+            "lambda:khive",
+            1_000_000,
+            json!({"work_class": "warm", "phase": "ann_warm", "wall_us": 1, "cpu_us": null}),
+        )
+        .await;
+
+        let result = pack
+            .dispatch(
+                "brain.event_counts",
+                json!({"since": micros_to_iso(0)}),
+                &registry,
+                &token,
+            )
+            .await
+            .expect("brain.event_counts must succeed");
+
+        assert!(
+            result.get("cost_unit").is_none(),
+            "cost_unit must not appear anywhere at the top level: {result}"
+        );
+        assert!(
+            result.get("counts_by_cost_unit").is_none(),
+            "no cost_unit split must be surfaced until a producer emits the field: {result}"
+        );
+    }
+
+    #[test]
+    fn handler_is_public_verb_with_required_since() {
+        let h = crate::handlers::BRAIN_HANDLERS
+            .iter()
+            .find(|h| h.name == "brain.event_counts")
+            .expect("brain.event_counts must be registered");
+        assert_eq!(h.visibility, khive_types::Visibility::Verb);
+        assert!(
+            h.params.iter().any(|p| p.name == "since" && p.required),
+            "since must be documented as required"
+        );
+        assert!(
+            h.params.iter().any(|p| p.name == "until" && !p.required),
+            "until must be documented as optional"
+        );
+    }
+}
