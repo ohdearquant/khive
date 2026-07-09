@@ -7,11 +7,25 @@
 //! touched on every successful `ensure_clone`) once the cache exceeds
 //! `digest_cache_max_repos` entries or `digest_cache_max_bytes` total size --
 //! eviction is safe because ingest cursors live in the database, not the
-//! clone (ADR-088 Amendment 1 §Remote-URL mode). A per-clone size cap
-//! (`digest_cache_clone_max_bytes`) aborts an individual clone/fetch that
-//! grows past its own budget: `git` has no reliable pre-flight size check for
-//! a partial (`--filter=blob:none`) clone, so the cap is enforced by
-//! clone-then-measure-then-clean-up-on-violation rather than a pre-check.
+//! clone (ADR-088 Amendment 1 §Remote-URL mode). Eviction only ever removes
+//! entries it can *prove* it owns (`is_owned_entry`: a 16-hex cache-key
+//! directory name containing both a `.git` dir and the `.khive-last-used`
+//! marker) -- a `KHIVE_GIT_DIGEST_SCRATCH_ROOT` override pointed at a broader
+//! or pre-existing directory must never lose unrelated operator data.
+//!
+//! A per-clone size cap (`digest_cache_clone_max_bytes`) rejects a clone/
+//! fetch that grows past its own budget *before* it ever enters the
+//! addressable cache slot: `ensure_clone` clones/fetches into a staging
+//! directory outside the cache root, measures it, and only moves it into
+//! `<root>/<cache_key>/` when it is under the cap. A too-large clone is
+//! deleted from staging and never touches `evict_lru`'s bookkeeping or the
+//! cache slot. This guarantees the cap is enforced before the clone enters
+//! the cache -- it does NOT bound the transient disk usage of the clone/
+//! fetch child process itself while it runs in staging (`git` has no
+//! reliable pre-flight or mid-transfer size check for a partial
+//! `--filter=blob:none` clone); a single oversized `git clone` can still
+//! transiently consume disk in the staging directory before this check
+//! rejects and removes it.
 //!
 //! Config is env-var driven today (`KHIVE_GIT_DIGEST_CACHE_MAX_REPOS`,
 //! `KHIVE_GIT_DIGEST_CACHE_MAX_BYTES`, `KHIVE_GIT_DIGEST_CLONE_MAX_BYTES`,
@@ -21,6 +35,8 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::SystemTime;
+
+use uuid::Uuid;
 
 use crate::source::cache_key;
 
@@ -96,27 +112,47 @@ fn clone_max_bytes() -> u64 {
 }
 
 /// Ensure a local clone of `canonical_url` exists and is up to date; returns
-/// the repo's local path. No existing clone -> `git clone --filter=blob:none`.
-/// Existing clone -> `git fetch --prune`. Enforces the per-clone size cap
-/// after the clone/fetch completes, and runs LRU eviction over the rest of
-/// the cache (this clone is exempt from its own eviction pass).
+/// the repo's local path.
+///
+/// An existing cache slot is updated in place (`git fetch --prune`) and
+/// re-measured against the per-clone cap -- a repo that grew past the cap
+/// since it was last fetched is evicted from the cache slot on the spot. A
+/// fresh clone is written into a private staging directory first
+/// (`git clone --filter=blob:none`), measured there, and only *moved* into
+/// the addressable `<root>/<cache_key>/` slot once it is under the cap --
+/// an oversized clone never enters the cache slot, never participates in
+/// `evict_lru`'s accounting, and is removed from staging immediately.
+///
+/// Runs LRU eviction over the rest of the cache after a successful
+/// clone/fetch (this clone is exempt from its own eviction pass).
 pub fn ensure_clone(canonical_url: &str) -> Result<PathBuf, CacheError> {
     let root = scratch_root();
     std::fs::create_dir_all(&root)?;
     let key = cache_key(canonical_url);
     let repo_dir = root.join(&key);
+    let cap = clone_max_bytes();
 
     if repo_dir.join(".git").exists() {
         fetch(&repo_dir)?;
+        let size = dir_size(&repo_dir)?;
+        if size > cap {
+            let _ = std::fs::remove_dir_all(&repo_dir);
+            return Err(CacheError::CloneTooLarge { bytes: size, cap });
+        }
     } else {
-        clone(canonical_url, &repo_dir)?;
-    }
-
-    let size = dir_size(&repo_dir)?;
-    let cap = clone_max_bytes();
-    if size > cap {
-        let _ = std::fs::remove_dir_all(&repo_dir);
-        return Err(CacheError::CloneTooLarge { bytes: size, cap });
+        let staging_dir = root.join(format!(".staging-{}", Uuid::new_v4()));
+        clone(canonical_url, &staging_dir)?;
+        let size = dir_size(&staging_dir).inspect_err(|_| {
+            let _ = std::fs::remove_dir_all(&staging_dir);
+        })?;
+        if size > cap {
+            let _ = std::fs::remove_dir_all(&staging_dir);
+            return Err(CacheError::CloneTooLarge { bytes: size, cap });
+        }
+        std::fs::rename(&staging_dir, &repo_dir).map_err(|e| {
+            let _ = std::fs::remove_dir_all(&staging_dir);
+            CacheError::Io(e)
+        })?;
     }
 
     touch(&repo_dir)?;
@@ -188,17 +224,40 @@ fn dir_size(path: &Path) -> Result<u64, CacheError> {
     Ok(total)
 }
 
+/// Whether `path` is a directory `ensure_clone` could plausibly have
+/// created: a 16-lowercase-hex `cache_key`-shaped directory name (never a
+/// UUID staging dir, never an arbitrary operator directory) containing both
+/// a `.git` entry and the `.khive-last-used` marker written by `touch`.
+/// Eviction (and any future scratch-root cleanup) must only ever remove
+/// entries that pass this check -- a `KHIVE_GIT_DIGEST_SCRATCH_ROOT`
+/// override pointed at a broader or pre-existing directory must never lose
+/// unrelated data sitting next to the cache slots.
+fn is_owned_entry(path: &Path) -> bool {
+    let name = match path.file_name().and_then(|n| n.to_str()) {
+        Some(n) => n,
+        None => return false,
+    };
+    if name.len() != 16
+        || !name
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+    {
+        return false;
+    }
+    path.join(".git").exists() && path.join(MARKER_FILE).exists()
+}
+
 /// Evict least-recently-used clones under `root` (by `.khive-last-used`
 /// mtime) until both the repo-count cap and the total-byte cap are
 /// satisfied. `keep` (the clone `ensure_clone` just touched) is never
-/// evicted. Only removes paths that are direct children of `root` --
-/// eviction never touches user-owned paths.
+/// evicted. Only removes paths that are direct children of `root` AND pass
+/// `is_owned_entry` -- eviction never touches user-owned or non-cache paths.
 fn evict_lru(root: &Path, keep: &Path) -> Result<(), CacheError> {
     let mut entries: Vec<(PathBuf, SystemTime, u64)> = Vec::new();
     for entry in std::fs::read_dir(root)? {
         let entry = entry?;
         let p = entry.path();
-        if !p.is_dir() || p == keep {
+        if !p.is_dir() || p == keep || !is_owned_entry(&p) {
             continue;
         }
         let mtime = std::fs::metadata(p.join(MARKER_FILE))
@@ -235,6 +294,19 @@ mod tests {
     /// touch it.
     static ENV_MUTEX: LazyLock<std::sync::Mutex<()>> = LazyLock::new(|| std::sync::Mutex::new(()));
 
+    /// Build a directory shaped exactly like a real `ensure_clone` cache
+    /// slot: a 16-lowercase-hex name (a real `cache_key` output) containing
+    /// a `.git` dir and (optionally) the `.khive-last-used` marker.
+    fn make_owned_entry(root: &Path, key: &str, with_marker: bool) -> PathBuf {
+        assert_eq!(key.len(), 16, "test cache keys must be 16 hex chars");
+        let p = root.join(key);
+        std::fs::create_dir_all(p.join(".git")).unwrap();
+        if with_marker {
+            std::fs::write(p.join(MARKER_FILE), b"").unwrap();
+        }
+        p
+    }
+
     #[test]
     fn evict_lru_removes_oldest_past_repo_cap() {
         let _guard = ENV_MUTEX.lock().unwrap();
@@ -244,14 +316,10 @@ mod tests {
         std::env::set_var("KHIVE_GIT_DIGEST_CACHE_MAX_BYTES", "1000000000");
 
         let root = dir.path();
-        let old = root.join("old-repo");
-        let new = root.join("new-repo");
-        std::fs::create_dir_all(&old).unwrap();
-        std::fs::create_dir_all(&new).unwrap();
-        std::fs::write(old.join(MARKER_FILE), b"").unwrap();
+        let old = make_owned_entry(root, "1111111111111111", true);
         // Ensure a real mtime gap.
         std::thread::sleep(std::time::Duration::from_millis(20));
-        std::fs::write(new.join(MARKER_FILE), b"").unwrap();
+        let new = make_owned_entry(root, "2222222222222222", true);
 
         evict_lru(root, &new).expect("evict");
 
@@ -272,15 +340,96 @@ mod tests {
 
         let root = dir.path().join("scratch-root");
         std::fs::create_dir_all(&root).unwrap();
-        let kept = root.join("kept");
-        std::fs::create_dir_all(&kept).unwrap();
-        std::fs::write(kept.join(MARKER_FILE), b"").unwrap();
+        let kept = make_owned_entry(&root, "3333333333333333", true);
 
         evict_lru(&root, &kept).expect("evict");
         assert!(kept.exists());
 
         std::env::remove_var("KHIVE_GIT_DIGEST_CACHE_MAX_REPOS");
         std::env::remove_var("KHIVE_GIT_DIGEST_CACHE_MAX_BYTES");
+    }
+
+    #[test]
+    fn evict_lru_never_removes_a_foreign_directory_under_root() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let dir = tempfile::tempdir().expect("tempdir");
+        // Cap of 0 repos: without ownership filtering this would previously
+        // have wiped out every child of root, including operator data.
+        std::env::set_var("KHIVE_GIT_DIGEST_CACHE_MAX_REPOS", "0");
+        std::env::set_var("KHIVE_GIT_DIGEST_CACHE_MAX_BYTES", "0");
+
+        let root = dir.path().join("scratch-root");
+        std::fs::create_dir_all(&root).unwrap();
+        let foreign = root.join("not-a-cache-entry");
+        std::fs::create_dir_all(&foreign).unwrap();
+        std::fs::write(foreign.join("important.txt"), b"do not delete me").unwrap();
+        let kept = make_owned_entry(&root, "4444444444444444", true);
+
+        evict_lru(&root, &kept).expect("evict");
+
+        assert!(
+            foreign.exists(),
+            "a directory that doesn't look like a cache slot must survive eviction"
+        );
+        assert!(
+            foreign.join("important.txt").exists(),
+            "foreign directory contents must be untouched"
+        );
+
+        std::env::remove_var("KHIVE_GIT_DIGEST_CACHE_MAX_REPOS");
+        std::env::remove_var("KHIVE_GIT_DIGEST_CACHE_MAX_BYTES");
+    }
+
+    #[test]
+    fn evict_lru_never_removes_an_owned_looking_dir_missing_the_marker() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::env::set_var("KHIVE_GIT_DIGEST_CACHE_MAX_REPOS", "0");
+        std::env::set_var("KHIVE_GIT_DIGEST_CACHE_MAX_BYTES", "0");
+
+        let root = dir.path().join("scratch-root");
+        std::fs::create_dir_all(&root).unwrap();
+        // Has a .git dir and a valid cache-key-shaped name, but no marker --
+        // e.g. a clone that failed after `clone()` but before `touch()`.
+        let no_marker = make_owned_entry(&root, "5555555555555555", false);
+        let kept = make_owned_entry(&root, "6666666666666666", true);
+
+        evict_lru(&root, &kept).expect("evict");
+
+        assert!(
+            no_marker.exists(),
+            "an owned-looking directory without the marker must survive eviction"
+        );
+
+        std::env::remove_var("KHIVE_GIT_DIGEST_CACHE_MAX_REPOS");
+        std::env::remove_var("KHIVE_GIT_DIGEST_CACHE_MAX_BYTES");
+    }
+
+    #[test]
+    fn is_owned_entry_rejects_non_cache_shapes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+
+        // Wrong length.
+        let short = root.join("abc123");
+        std::fs::create_dir_all(short.join(".git")).unwrap();
+        std::fs::write(short.join(MARKER_FILE), b"").unwrap();
+        assert!(!is_owned_entry(&short));
+
+        // Uppercase hex (cache_key is always lowercase).
+        let upper = root.join("ABCDEF0123456789");
+        std::fs::create_dir_all(upper.join(".git")).unwrap();
+        std::fs::write(upper.join(MARKER_FILE), b"").unwrap();
+        assert!(!is_owned_entry(&upper));
+
+        // Right shape but missing .git.
+        let no_git = root.join("7777777777777777");
+        std::fs::create_dir_all(&no_git).unwrap();
+        std::fs::write(no_git.join(MARKER_FILE), b"").unwrap();
+        assert!(!is_owned_entry(&no_git));
+
+        let owned = make_owned_entry(root, "8888888888888888", true);
+        assert!(is_owned_entry(&owned));
     }
 
     #[test]

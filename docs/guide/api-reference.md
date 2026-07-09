@@ -1,13 +1,13 @@
 # API Reference
 
-khive exposes exactly one MCP tool, `request`. Everything else — 75 verbs across 9
+khive exposes exactly one MCP tool, `request`. Everything else — 76 verbs across 9
 production packs — is dispatched through that single tool via a small request DSL.
 This page documents the DSL grammar, the response envelope, and every verb's full
 parameter contract, so an agent can call khive correctly without reading Rust source.
 
 This page is verified against the live registry (`request(ops="verbs()")`, run
-2026-07-07) and the pack source (`crates/khive-pack-*/src/*.rs` `HandlerDef`/`ParamDef`
-struct literals). Verb count: **75**, matching both the live registry `total` field and
+2026-07-09) and the pack source (`crates/khive-pack-*/src/*.rs` `HandlerDef`/`ParamDef`
+struct literals). Verb count: **76**, matching both the live registry `total` field and
 the sum of the 9 pack counts below. If your server reports a different total, your
 `KHIVE_PACKS` configuration loads a different pack set than the default — run
 `request(ops="verbs()")` against your own server to get the authoritative list.
@@ -29,14 +29,14 @@ An always-machine-readable copy of this page is at
 | `schedule`  | 4     | `KHIVE_PACKS=kg,schedule`  | Yes                 |
 | `knowledge` | 19    | `KHIVE_PACKS=kg,knowledge` | Yes                 |
 | `session`   | 4     | `KHIVE_PACKS=kg,session`   | Yes                 |
-| `git`       | 0     | `KHIVE_PACKS=kg,git`       | Yes                 |
+| `git`       | 1     | `KHIVE_PACKS=kg,git`       | Yes                 |
 
-`git` contributes zero verbs — it registers the `commit` / `issue` / `pull_request` note
-kinds and a batch ingester (`crates/khive-pack-git/src/ingest.rs`), consumed outside the
-`request` DSL, not new MCP-callable verbs.
+`git` also registers the `commit` / `issue` / `pull_request` note kinds and the shared
+`run_ingest` core (`crates/khive-pack-git/src/ingest.rs`) that both `git.digest` and the
+`kkernel git-ingest` CLI drive.
 
 The default binary (no `KHIVE_PACKS`/`--pack` override) loads all 9 packs: 17 + 5 + 5 +
-14 + 7 + 4 + 19 + 4 + 0 = **75 verbs**.
+14 + 7 + 4 + 19 + 4 + 1 = **76 verbs**.
 
 Verb names in the `kg` pack are bare (`create`, `search`, `link`, …). Every other pack
 namespaces its verbs with a `pack.` prefix (`gtd.assign`, `memory.recall`,
@@ -1346,6 +1346,35 @@ Serialize one stored session as json or markdown.
 
 ```
 request(ops="session.export(id=\"<session-id>\", format=\"markdown\")")
+```
+
+---
+
+## `git` pack — 1 verb
+
+Batch, cursor-based git-history ingester (ADR-088, ADR-088 Amendment 1). Optional; load
+with `KHIVE_PACKS=kg,git`. Also registers the `commit` / `issue` / `pull_request` note
+kinds, used by `git.digest` below and by the `kkernel git-ingest` CLI (both drive the
+same underlying ingest core, so ingest enrichment — readable `name`s, `Closes #N`
+reference edges, parent→child commit `precedes` edges — applies identically either way).
+
+### `git.digest` — Commissive
+
+Walk a local repository path or clone/fetch a remote `https://` URL, then ingest commits
+and (when the source is a github.com repo and the `gh` CLI is available) issues and pull
+requests as provenance notes, resolving or auto-creating the repo-anchor `project` entity.
+Bounded and cursor-resumable: call again with the same `source`/`project` while the
+response's `done` field is `false`.
+
+| Param       | Type            | Required | Notes                                                                                                                                                                                                                                     |
+| ----------- | --------------- | -------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `source`    | string          | yes      | A local filesystem path (must contain `.git`) or an `https://` URL. Any `https` host is accepted; non-github.com hosts degrade to commits-only. `ssh://`, `git://`, `http://`, and scp-shorthand (`user@host:path`) sources are rejected. |
+| `project`   | string          | no       | UUID or 8+ hex prefix of the repo-anchor `project` entity. When absent, resolved by matching `properties.repo_url` or `name`, or created if none is found (see the response's `project_id` and `project_created`).                        |
+| `max_items` | integer         | no       | Bounded work for this call, counted across commits + issues + PRs (default 500, clamped to 1..=2000). Cursor-resumable: call again while the response's `done` field is `false`.                                                          |
+| `include`   | array\<string\> | no       | Which record kinds to ingest this call: any of `commits` \| `issues` \| `pull_requests` (default: all three).                                                                                                                             |
+
+```
+request(ops="git.digest(source=\"https://github.com/org/repo\", max_items=500)")
 ```
 
 ---

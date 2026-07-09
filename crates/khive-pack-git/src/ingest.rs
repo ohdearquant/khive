@@ -920,6 +920,113 @@ fn gh_json(repo: &Path, args: &[&str]) -> Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
+/// Per-page fetch cap for both PR and issue paging (ADR-088 Amendment 1 fix
+/// round, Issue High-1). `gh {pr,issue} list --search` is backed by GitHub's
+/// search API, which never returns more than this many results for a single
+/// query regardless of `--limit` — paging works around that ceiling by
+/// advancing an `updated:>=` floor between calls, not by requesting more
+/// than one page can hold.
+const PAGE_LIMIT: usize = 1000;
+
+/// What a paging loop should do after processing one fetched page. Pure and
+/// unit-testable independent of `gh`, the database, or async machinery — the
+/// entire "was the remote window proven exhausted" decision lives here
+/// (ADR-088 Amendment 1 fix-round High-1: a single hard-coded `--limit 1000`
+/// fetch could previously report `done: true` while a repo's remaining
+/// PRs/issues past position 1000 were never seen).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PageOutcome {
+    /// The page held fewer than `PAGE_LIMIT` items: the remote window is
+    /// proven exhausted regardless of local budget state.
+    WindowComplete,
+    /// The page was full (`PAGE_LIMIT` items) and the local budget is
+    /// exhausted: stop paging, but the window is NOT proven exhausted.
+    StopBudgetExhausted,
+    /// The page was full and the last item's `updated_at` did not advance
+    /// past the current floor (more than `PAGE_LIMIT` records share one
+    /// timestamp — an unresolvable pathological case): stop paging rather
+    /// than loop forever. The window is NOT proven exhausted.
+    StopFloorStalled,
+    /// The page was full, the budget is not exhausted, and the floor
+    /// advanced: fetch the next page starting at this floor.
+    Continue(String),
+}
+
+fn decide_page_outcome(
+    page_len: usize,
+    current_floor: Option<&str>,
+    last_updated_at: Option<&str>,
+    budget_exhausted: bool,
+) -> PageOutcome {
+    if page_len < PAGE_LIMIT {
+        return PageOutcome::WindowComplete;
+    }
+    if budget_exhausted {
+        return PageOutcome::StopBudgetExhausted;
+    }
+    match last_updated_at {
+        Some(next) if Some(next) != current_floor => PageOutcome::Continue(next.to_string()),
+        _ => PageOutcome::StopFloorStalled,
+    }
+}
+
+/// `PageOutcome::WindowComplete` is the only outcome under which `done` can
+/// stay `true` on the local-budget question alone; every other outcome means
+/// more remote records may exist past the last fetched page. Test-only
+/// helper — production code matches on `PageOutcome` directly (see
+/// `ingest_prs`/`ingest_issues`'s paging loops).
+#[cfg(test)]
+fn page_outcome_proves_window_complete(outcome: PageOutcome) -> bool {
+    matches!(outcome, PageOutcome::WindowComplete)
+}
+
+fn search_query(floor: Option<&str>) -> String {
+    match floor {
+        Some(f) => format!("sort:updated-asc updated:>={f}"),
+        None => "sort:updated-asc".to_string(),
+    }
+}
+
+const PR_FIELDS: &str = "number,title,author,createdAt,mergedAt,closedAt,updatedAt,baseRefName,headRefName,mergeCommit,body";
+const ISSUE_FIELDS: &str =
+    "number,title,author,createdAt,closedAt,updatedAt,labels,stateReason,body";
+
+fn fetch_pr_page(repo: &Path, floor: Option<&str>) -> Result<Vec<GhPr>> {
+    let search = search_query(floor);
+    let raw = gh_json(
+        repo,
+        &[
+            "pr",
+            "list",
+            "--search",
+            search.as_str(),
+            "--limit",
+            "1000",
+            "--json",
+            PR_FIELDS,
+        ],
+    )?;
+    serde_json::from_str(&raw).context("parsing gh pr list --json")
+}
+
+fn fetch_issue_page(repo: &Path, floor: Option<&str>) -> Result<Vec<GhIssue>> {
+    let search = search_query(floor);
+    let raw = gh_json(
+        repo,
+        &[
+            "issue",
+            "list",
+            "--search",
+            search.as_str(),
+            "--limit",
+            "1000",
+            "--json",
+            ISSUE_FIELDS,
+        ],
+    )?;
+    serde_json::from_str(&raw).context("parsing gh issue list --json")
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn ingest_prs(
     runtime: &KhiveRuntime,
@@ -934,41 +1041,6 @@ async fn ingest_prs(
     new_records: &mut Vec<NewRecordForRef>,
 ) -> Result<()> {
     let since = read_cursor(runtime, project_id, "prs").await?;
-    let raw = gh_json(
-        repo,
-        &[
-            "pr",
-            "list",
-            "--state",
-            "all",
-            "--limit",
-            "1000",
-            "--json",
-            "number,title,author,createdAt,mergedAt,closedAt,updatedAt,baseRefName,headRefName,mergeCommit,body",
-        ],
-    )?;
-    let mut prs: Vec<GhPr> = serde_json::from_str(&raw).context("parsing gh pr list --json")?;
-    // `gh pr list` makes no ordering guarantee. The frozen-cursor retry
-    // guarantee below (cursor freezes at the last contiguous success, so a
-    // failed record is retried next pass) only holds if records are walked
-    // in nondecreasing updated_at order; otherwise a newer record ahead of
-    // an older failing one in the raw list would push the cursor past the
-    // failure and it would never be retried. Sort ascending first (stable —
-    // ties keep gh's original relative order).
-    //
-    // Sorting alone does not cover a TIE: if a successful record and a
-    // failing record share the exact same `updated_at`, the success still
-    // advances the cursor to that timestamp, and an exclusive `updated >
-    // cursor` retry check would then see the failed record's `updated_at ==
-    // cursor` and treat it as not-new on the next pass — stranding it
-    // forever, sort or no sort. `is_new` below is therefore inclusive
-    // (`updated >= cursor`): every record at the cursor timestamp is
-    // re-examined on every subsequent pass until the cursor moves past it.
-    // That reprocessing is bounded (only records sharing the exact cursor
-    // value) and free (the natural-key lookup below turns every
-    // already-created one into a cheap no-op), so it converges the moment
-    // the last tied record either succeeds or the cursor advances.
-    prs.sort_by(|a, b| a.updated_at.cmp(&b.updated_at));
 
     // `cursor_stalled` mirrors `ingest_commits`: once one PR fails to create,
     // later PRs in this pass are still attempted (so every failure surfaces
@@ -977,21 +1049,113 @@ async fn ingest_prs(
     // retries it, while already-landed PRs are no-ops via the natural key.
     let mut max_updated: Option<String> = since.clone();
     let mut cursor_stalled = false;
-    for pr in prs {
-        let is_new = since
-            .as_deref()
-            .zip(pr.updated_at.as_deref())
-            .map(|(cursor, updated)| updated >= cursor)
-            .unwrap_or(true);
+    let mut floor = since.clone();
+    let mut window_complete = true;
 
-        if let Some(existing) =
-            find_by_number(runtime, token, "pull_request", project_id, pr.number).await?
-        {
-            number_to_pr.insert(pr.number, existing);
-            if let Some(oid) = pr.merge_commit.as_ref().and_then(|m| m.oid.clone()) {
-                merge_sha_to_pr.insert(oid, existing);
+    'paging: loop {
+        let mut page = fetch_pr_page(repo, floor.as_deref())?;
+        let page_len = page.len();
+        // Each page is already `sort:updated-asc` server-side, but `--search`
+        // makes no hard ordering guarantee across ties — re-sort defensively
+        // so the frozen-cursor invariant (records walked in nondecreasing
+        // `updated_at` order) holds regardless. `is_new` below is inclusive
+        // (`updated >= cursor`) for exactly the tie reason documented at
+        // length in the pre-pagination version of this function (a
+        // successful and a failing record sharing one `updated_at` must both
+        // be re-examined next pass until the cursor moves past that tie).
+        page.sort_by(|a, b| a.updated_at.cmp(&b.updated_at));
+        let last_updated_at = page.last().and_then(|pr| pr.updated_at.clone());
+
+        for pr in page {
+            let is_new = since
+                .as_deref()
+                .zip(pr.updated_at.as_deref())
+                .map(|(cursor, updated)| updated >= cursor)
+                .unwrap_or(true);
+
+            if let Some(existing) =
+                find_by_number(runtime, token, "pull_request", project_id, pr.number).await?
+            {
+                number_to_pr.insert(pr.number, existing);
+                if let Some(oid) = pr.merge_commit.as_ref().and_then(|m| m.oid.clone()) {
+                    merge_sha_to_pr.insert(oid, existing);
+                }
+                report.prs_skipped_existing += 1;
+                if !cursor_stalled {
+                    if let Some(u) = &pr.updated_at {
+                        if max_updated
+                            .as_deref()
+                            .map(|m| u.as_str() > m)
+                            .unwrap_or(true)
+                        {
+                            max_updated = Some(u.clone());
+                        }
+                    }
+                }
+                continue;
             }
-            report.prs_skipped_existing += 1;
+            if !is_new {
+                continue;
+            }
+            if budget.exhausted() {
+                break;
+            }
+
+            let raw_body = pr.body.unwrap_or_default();
+            let content = secret_gate::mask_secrets(&raw_body).into_owned();
+            let properties = json!({
+                "number": pr.number,
+                "title": pr.title,
+                "author": pr.author.and_then(|a| a.login),
+                "created_at": pr.created_at,
+                "merged_at": pr.merged_at,
+                "closed_at": pr.closed_at,
+                "base_ref": pr.base_ref_name,
+                "head_ref": pr.head_ref_name,
+                "project_id": project_id.to_string(),
+            });
+            let name =
+                refs::truncate_chars(&format!("#{} {}", pr.number, pr.title), NAME_MAX_CHARS);
+
+            budget.try_consume();
+            let result = match registry
+                .dispatch(
+                    "create",
+                    json!({
+                        "kind": "pull_request",
+                        "name": name,
+                        "content": content,
+                        "properties": properties,
+                        "annotates": [project_id.to_string()],
+                    }),
+                )
+                .await
+            {
+                Ok(v) => v,
+                Err(e) => {
+                    report
+                        .warnings
+                        .push(format!("create pull_request #{}: {e}", pr.number));
+                    cursor_stalled = true;
+                    continue;
+                }
+            };
+
+            if let Some(id) = result
+                .get("id")
+                .and_then(|v| v.as_str())
+                .and_then(|s| Uuid::parse_str(s).ok())
+            {
+                number_to_pr.insert(pr.number, id);
+                if let Some(oid) = pr.merge_commit.and_then(|m| m.oid) {
+                    merge_sha_to_pr.insert(oid, id);
+                }
+                new_records.push(NewRecordForRef {
+                    id,
+                    text: content.clone(),
+                });
+            }
+            report.prs_ingested += 1;
             if !cursor_stalled {
                 if let Some(u) = &pr.updated_at {
                     if max_updated
@@ -1003,80 +1167,29 @@ async fn ingest_prs(
                     }
                 }
             }
-            continue;
-        }
-        if !is_new {
-            continue;
-        }
-        if budget.exhausted() {
-            break;
         }
 
-        let raw_body = pr.body.unwrap_or_default();
-        let content = secret_gate::mask_secrets(&raw_body).into_owned();
-        let properties = json!({
-            "number": pr.number,
-            "title": pr.title,
-            "author": pr.author.and_then(|a| a.login),
-            "created_at": pr.created_at,
-            "merged_at": pr.merged_at,
-            "closed_at": pr.closed_at,
-            "base_ref": pr.base_ref_name,
-            "head_ref": pr.head_ref_name,
-            "project_id": project_id.to_string(),
-        });
-        let name = refs::truncate_chars(&format!("#{} {}", pr.number, pr.title), NAME_MAX_CHARS);
-
-        budget.try_consume();
-        let result = match registry
-            .dispatch(
-                "create",
-                json!({
-                    "kind": "pull_request",
-                    "name": name,
-                    "content": content,
-                    "properties": properties,
-                    "annotates": [project_id.to_string()],
-                }),
-            )
-            .await
-        {
-            Ok(v) => v,
-            Err(e) => {
-                report
-                    .warnings
-                    .push(format!("create pull_request #{}: {e}", pr.number));
-                cursor_stalled = true;
-                continue;
+        match decide_page_outcome(
+            page_len,
+            floor.as_deref(),
+            last_updated_at.as_deref(),
+            budget.exhausted(),
+        ) {
+            PageOutcome::WindowComplete => break 'paging,
+            PageOutcome::StopBudgetExhausted | PageOutcome::StopFloorStalled => {
+                window_complete = false;
+                break 'paging;
             }
-        };
-
-        if let Some(id) = result
-            .get("id")
-            .and_then(|v| v.as_str())
-            .and_then(|s| Uuid::parse_str(s).ok())
-        {
-            number_to_pr.insert(pr.number, id);
-            if let Some(oid) = pr.merge_commit.and_then(|m| m.oid) {
-                merge_sha_to_pr.insert(oid, id);
-            }
-            new_records.push(NewRecordForRef {
-                id,
-                text: content.clone(),
-            });
+            PageOutcome::Continue(next_floor) => floor = Some(next_floor),
         }
-        report.prs_ingested += 1;
-        if !cursor_stalled {
-            if let Some(u) = &pr.updated_at {
-                if max_updated
-                    .as_deref()
-                    .map(|m| u.as_str() > m)
-                    .unwrap_or(true)
-                {
-                    max_updated = Some(u.clone());
-                }
-            }
-        }
+    }
+
+    if !window_complete {
+        // The remote window may hold more PRs than this pass ever fetched
+        // (ADR-088 Amendment 1 fix-round High-1) — the local budget alone is
+        // not a complete signal; report `done = false` regardless of budget
+        // state so the caller's resume loop keeps going.
+        report.done = false;
     }
 
     if let Some(cursor) = max_updated {
@@ -1097,30 +1210,6 @@ async fn ingest_issues(
     new_records: &mut Vec<NewRecordForRef>,
 ) -> Result<()> {
     let since = read_cursor(runtime, project_id, "issues").await?;
-    let raw = gh_json(
-        repo,
-        &[
-            "issue",
-            "list",
-            "--state",
-            "all",
-            "--limit",
-            "1000",
-            "--json",
-            "number,title,author,createdAt,closedAt,updatedAt,labels,stateReason,body",
-        ],
-    )?;
-    let mut issues: Vec<GhIssue> =
-        serde_json::from_str(&raw).context("parsing gh issue list --json")?;
-    // See `ingest_prs`: the frozen-cursor retry guarantee requires walking
-    // records in nondecreasing updated_at order, which `gh issue list` does
-    // not itself guarantee. Sort ascending first (stable — ties keep gh's
-    // original relative order). Sorting doesn't cover a TIE between a
-    // successful and a failing record sharing the same `updated_at` — see
-    // `ingest_prs`'s comment on why `is_new` below is an inclusive
-    // (`updated >= cursor`) check, and why the resulting reprocessing of
-    // every record at the cursor timestamp is bounded and converges.
-    issues.sort_by(|a, b| a.updated_at.cmp(&b.updated_at));
 
     // `cursor_stalled` mirrors `ingest_commits`/`ingest_prs`: a per-record
     // create failure is aggregated as a warning and later records in this
@@ -1129,18 +1218,115 @@ async fn ingest_issues(
     // forever; already-landed records are no-ops via the natural key.
     let mut max_updated: Option<String> = since.clone();
     let mut cursor_stalled = false;
-    for issue in issues {
-        let is_new = since
-            .as_deref()
-            .zip(issue.updated_at.as_deref())
-            .map(|(cursor, updated)| updated >= cursor)
-            .unwrap_or(true);
+    let mut floor = since.clone();
+    let mut window_complete = true;
 
-        if find_by_number(runtime, token, "issue", project_id, issue.number)
-            .await?
-            .is_some()
-        {
-            report.issues_skipped_existing += 1;
+    'paging: loop {
+        let mut page = fetch_issue_page(repo, floor.as_deref())?;
+        let page_len = page.len();
+        // See `ingest_prs`: the frozen-cursor retry guarantee requires
+        // walking records in nondecreasing updated_at order, which `--search
+        // sort:updated-asc` does not itself guarantee across ties — sort
+        // defensively.
+        page.sort_by(|a, b| a.updated_at.cmp(&b.updated_at));
+        let last_updated_at = page.last().and_then(|i| i.updated_at.clone());
+
+        for issue in page {
+            let is_new = since
+                .as_deref()
+                .zip(issue.updated_at.as_deref())
+                .map(|(cursor, updated)| updated >= cursor)
+                .unwrap_or(true);
+
+            if find_by_number(runtime, token, "issue", project_id, issue.number)
+                .await?
+                .is_some()
+            {
+                report.issues_skipped_existing += 1;
+                if !cursor_stalled {
+                    if let Some(u) = &issue.updated_at {
+                        if max_updated
+                            .as_deref()
+                            .map(|m| u.as_str() > m)
+                            .unwrap_or(true)
+                        {
+                            max_updated = Some(u.clone());
+                        }
+                    }
+                }
+                continue;
+            }
+            if !is_new {
+                continue;
+            }
+            if budget.exhausted() {
+                break;
+            }
+
+            let raw_body = issue.body.unwrap_or_default();
+            let content = secret_gate::mask_secrets(&raw_body).into_owned();
+            let labels: Vec<String> = issue
+                .labels
+                .unwrap_or_default()
+                .into_iter()
+                .map(|l| l.name)
+                .collect();
+            let mut properties = json!({
+                "number": issue.number,
+                "title": issue.title,
+                "author": issue.author.and_then(|a| a.login),
+                "created_at": issue.created_at,
+                "closed_at": issue.closed_at,
+                "labels": labels,
+                "project_id": project_id.to_string(),
+            });
+            // gh reports stateReason as "" for open issues and UPPERCASE enum values
+            // (NOT_PLANNED) for closed ones; the kind hook governs any PRESENT value
+            // against the lowercase GitHub stateReason enum, so normalize case and encode
+            // "open / no reason" as absent.
+            if let Some(reason) = issue.state_reason.as_deref().filter(|r| !r.is_empty()) {
+                properties["state_reason"] = json!(reason.to_ascii_lowercase());
+            }
+            let name = refs::truncate_chars(
+                &format!("#{} {}", issue.number, issue.title),
+                NAME_MAX_CHARS,
+            );
+
+            budget.try_consume();
+            let result = match registry
+                .dispatch(
+                    "create",
+                    json!({
+                        "kind": "issue",
+                        "name": name,
+                        "content": content,
+                        "properties": properties,
+                        "annotates": [project_id.to_string()],
+                    }),
+                )
+                .await
+            {
+                Ok(v) => v,
+                Err(e) => {
+                    report
+                        .warnings
+                        .push(format!("create issue #{}: {e}", issue.number));
+                    cursor_stalled = true;
+                    continue;
+                }
+            };
+            if let Some(id) = result
+                .get("id")
+                .and_then(|v| v.as_str())
+                .and_then(|s| Uuid::parse_str(s).ok())
+            {
+                new_records.push(NewRecordForRef {
+                    id,
+                    text: content.clone(),
+                });
+            }
+
+            report.issues_ingested += 1;
             if !cursor_stalled {
                 if let Some(u) = &issue.updated_at {
                     if max_updated
@@ -1152,94 +1338,93 @@ async fn ingest_issues(
                     }
                 }
             }
-            continue;
-        }
-        if !is_new {
-            continue;
-        }
-        if budget.exhausted() {
-            break;
         }
 
-        let raw_body = issue.body.unwrap_or_default();
-        let content = secret_gate::mask_secrets(&raw_body).into_owned();
-        let labels: Vec<String> = issue
-            .labels
-            .unwrap_or_default()
-            .into_iter()
-            .map(|l| l.name)
-            .collect();
-        let mut properties = json!({
-            "number": issue.number,
-            "title": issue.title,
-            "author": issue.author.and_then(|a| a.login),
-            "created_at": issue.created_at,
-            "closed_at": issue.closed_at,
-            "labels": labels,
-            "project_id": project_id.to_string(),
-        });
-        // gh reports stateReason as "" for open issues and UPPERCASE enum values
-        // (NOT_PLANNED) for closed ones; the kind hook governs any PRESENT value
-        // against the lowercase GitHub stateReason enum, so normalize case and encode
-        // "open / no reason" as absent.
-        if let Some(reason) = issue.state_reason.as_deref().filter(|r| !r.is_empty()) {
-            properties["state_reason"] = json!(reason.to_ascii_lowercase());
-        }
-        let name = refs::truncate_chars(
-            &format!("#{} {}", issue.number, issue.title),
-            NAME_MAX_CHARS,
-        );
-
-        budget.try_consume();
-        let result = match registry
-            .dispatch(
-                "create",
-                json!({
-                    "kind": "issue",
-                    "name": name,
-                    "content": content,
-                    "properties": properties,
-                    "annotates": [project_id.to_string()],
-                }),
-            )
-            .await
-        {
-            Ok(v) => v,
-            Err(e) => {
-                report
-                    .warnings
-                    .push(format!("create issue #{}: {e}", issue.number));
-                cursor_stalled = true;
-                continue;
+        match decide_page_outcome(
+            page_len,
+            floor.as_deref(),
+            last_updated_at.as_deref(),
+            budget.exhausted(),
+        ) {
+            PageOutcome::WindowComplete => break 'paging,
+            PageOutcome::StopBudgetExhausted | PageOutcome::StopFloorStalled => {
+                window_complete = false;
+                break 'paging;
             }
-        };
-        if let Some(id) = result
-            .get("id")
-            .and_then(|v| v.as_str())
-            .and_then(|s| Uuid::parse_str(s).ok())
-        {
-            new_records.push(NewRecordForRef {
-                id,
-                text: content.clone(),
-            });
+            PageOutcome::Continue(next_floor) => floor = Some(next_floor),
         }
+    }
 
-        report.issues_ingested += 1;
-        if !cursor_stalled {
-            if let Some(u) = &issue.updated_at {
-                if max_updated
-                    .as_deref()
-                    .map(|m| u.as_str() > m)
-                    .unwrap_or(true)
-                {
-                    max_updated = Some(u.clone());
-                }
-            }
-        }
+    if !window_complete {
+        report.done = false;
     }
 
     if let Some(cursor) = max_updated {
         write_cursor(runtime, project_id, "issues", &cursor).await?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod paging_tests {
+    use super::*;
+
+    #[test]
+    fn search_query_omits_updated_qualifier_with_no_floor() {
+        assert_eq!(search_query(None), "sort:updated-asc");
+    }
+
+    #[test]
+    fn search_query_includes_inclusive_updated_floor() {
+        assert_eq!(
+            search_query(Some("2024-01-01T00:00:00Z")),
+            "sort:updated-asc updated:>=2024-01-01T00:00:00Z"
+        );
+    }
+
+    #[test]
+    fn short_page_proves_window_complete_regardless_of_budget() {
+        let outcome = decide_page_outcome(42, None, Some("2024-01-01T00:00:00Z"), false);
+        assert_eq!(outcome, PageOutcome::WindowComplete);
+        assert!(page_outcome_proves_window_complete(outcome));
+
+        // Even a page that runs out of budget mid-way is still a proof of
+        // completeness if the page itself was short — the loop always
+        // finishes sorting/processing the whole (short) page first.
+        let outcome = decide_page_outcome(0, None, None, true);
+        assert_eq!(outcome, PageOutcome::WindowComplete);
+    }
+
+    /// This is the exact ADR-088 Amendment 1 fix-round High-1 scenario: a
+    /// full (`PAGE_LIMIT`-sized) page came back, but the local budget was
+    /// NOT exhausted (e.g. every record in the page already existed and
+    /// consumed no budget) and paging is still forced to stop because the
+    /// floor didn't move. `done` must be false here — the remote window is
+    /// not proven exhausted just because the local budget wasn't hit.
+    #[test]
+    fn full_page_with_stalled_floor_is_not_window_complete_even_with_budget_left() {
+        let outcome = decide_page_outcome(PAGE_LIMIT, Some("X"), Some("X"), false);
+        assert_eq!(outcome, PageOutcome::StopFloorStalled);
+        assert!(!page_outcome_proves_window_complete(outcome));
+    }
+
+    #[test]
+    fn full_page_with_advancing_floor_and_budget_left_continues() {
+        let outcome = decide_page_outcome(PAGE_LIMIT, Some("A"), Some("B"), false);
+        assert_eq!(outcome, PageOutcome::Continue("B".to_string()));
+        assert!(!page_outcome_proves_window_complete(outcome));
+    }
+
+    #[test]
+    fn full_page_with_exhausted_budget_stops_without_proving_completeness() {
+        let outcome = decide_page_outcome(PAGE_LIMIT, Some("A"), Some("B"), true);
+        assert_eq!(outcome, PageOutcome::StopBudgetExhausted);
+        assert!(!page_outcome_proves_window_complete(outcome));
+    }
+
+    #[test]
+    fn full_page_with_no_updated_at_stalls_rather_than_looping_forever() {
+        let outcome = decide_page_outcome(PAGE_LIMIT, Some("A"), None, false);
+        assert_eq!(outcome, PageOutcome::StopFloorStalled);
+    }
 }

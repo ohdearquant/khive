@@ -17,9 +17,9 @@ use crate::ingest::{resolve_project_id, run_ingest, IngestInclude, IngestOptions
 use crate::source::{parse_source, repo_basename, DigestSource};
 use crate::GitPack;
 
-const DEFAULT_MAX_ITEMS: u64 = 500;
-const MIN_MAX_ITEMS: u64 = 1;
-const MAX_MAX_ITEMS: u64 = 2000;
+const DEFAULT_MAX_ITEMS: i64 = 500;
+const MIN_MAX_ITEMS: i64 = 1;
+const MAX_MAX_ITEMS: i64 = 2000;
 
 impl GitPack {
     pub(crate) async fn handle_digest(
@@ -35,11 +35,19 @@ impl GitPack {
         let source =
             parse_source(source_raw).map_err(|e| RuntimeError::InvalidInput(e.to_string()))?;
 
-        let max_items = params
-            .get("max_items")
-            .and_then(Value::as_u64)
-            .unwrap_or(DEFAULT_MAX_ITEMS)
-            .clamp(MIN_MAX_ITEMS, MAX_MAX_ITEMS);
+        // Parsed as i64 (not u64) so an out-of-range negative value clamps to
+        // MIN_MAX_ITEMS instead of failing `as_u64` and silently falling
+        // through to the default -- a caller passing `-1` gets the smallest
+        // legal budget, not an unrequested 500-item pass. A non-integer
+        // value (string, float, bool, array, object) is rejected outright
+        // rather than silently defaulted.
+        let max_items = match params.get("max_items") {
+            None | Some(Value::Null) => DEFAULT_MAX_ITEMS,
+            Some(v) => v.as_i64().ok_or_else(|| {
+                RuntimeError::InvalidInput(format!("max_items must be an integer, got {v:?}"))
+            })?,
+        }
+        .clamp(MIN_MAX_ITEMS, MAX_MAX_ITEMS) as u64;
 
         let include = match params.get("include") {
             None | Some(Value::Null) => IngestInclude::default(),
