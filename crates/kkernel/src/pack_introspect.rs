@@ -219,12 +219,12 @@ mod tests {
             "kg pack must expose verbs; got {:?}",
             info.verbs
         );
-        // kg pack ships 17 verbs: 11 base + propose/review/withdraw (3) + verbs
-        // + stats (2) + context (1, ADR-089)
+        // kg pack ships 18 verbs: 11 base + propose/review/withdraw (3) + verbs
+        // + stats (2) + context (1, ADR-089) + resolve (1)
         assert_eq!(
             info.verbs.len(),
-            17,
-            "kg pack must expose 17 verbs; got {}: {:?}",
+            18,
+            "kg pack must expose 18 verbs; got {}: {:?}",
             info.verbs.len(),
             info.verbs.iter().map(|v| &v.name).collect::<Vec<_>>()
         );
