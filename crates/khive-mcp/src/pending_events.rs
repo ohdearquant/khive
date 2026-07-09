@@ -1,13 +1,34 @@
-//! `kkernel exec --pending-events` — one-shot scheduled event drain.
+//! Scheduled event drain — `kkernel exec --pending-events` (one-shot) and the
+//! daemon-resident tick (ADR-106, [`schedule_tick_loop`]).
 //!
 //! Scans all `scheduled_event` notes with `status="pending"` whose `trigger_at`
 //! is at or before now, fires their stored action through the registry in the
 //! event's own namespace, marks each as `"fired"`, and advances repeating events
-//! to their next occurrence.
+//! to their next occurrence. Events overdue by more than the configured grace
+//! window are never dispatched — see "Missed-event policy" below.
 //!
-//! This is a cron-friendly one-shot drain. It is NOT a long-running daemon.
-//! Run it from cron (e.g. `* * * * * kkernel exec --pending-events`) to achieve
-//! minute-granularity delivery.
+//! This module lives in `khive-mcp` (not `kkernel`, where it originated)
+//! because the daemon tick loop needs to call it in-process from
+//! `khive-mcp::serve`, and `khive-runtime` (where the daemon's socket/accept
+//! loop lives) cannot depend back on `khive-mcp` (`khive-mcp` already depends
+//! on `khive-runtime` — a dependency the other way would cycle). `kkernel`
+//! already depends on `khive-mcp`, so its `exec --pending-events` entry point
+//! simply calls [`run_pending_events`] here instead of a local module.
+//!
+//! ## Invocation modes
+//!
+//! - **One-shot** (`kkernel exec --pending-events`, cron-friendly): call
+//!   [`run_pending_events`] directly. Suitable for `* * * * * kkernel exec
+//!   --pending-events` to achieve minute-granularity delivery.
+//! - **Daemon-resident tick** (ADR-106): [`schedule_tick_loop`] calls
+//!   [`run_pending_events`] on a fixed interval for the lifetime of the warm
+//!   `khived` daemon process. Spawned only by the daemon role (mirrors the
+//!   `is_daemon_role` gate `khive-mcp::serve` already uses for the email
+//!   channel loops), never by a short-lived stdio client. Running both an
+//!   external cron entry and the daemon tick at once is safe: the drain's
+//!   `pending -> firing` CAS claim (`claim_pending_event`) makes concurrent or
+//!   overlapping invocations harmless by construction — at most one caller
+//!   ever wins a given row.
 //!
 //! ## Namespace isolation
 //!
@@ -28,19 +49,48 @@
 //! machine-readable next-fire semantics exist for cron form). Events with a cron
 //! `repeat` are fired and then marked `"fired"` (one-shot). See issue #14 for the
 //! tracking note.
+//!
+//! ## Missed-event policy (ADR-106 amendment)
+//!
+//! An event is "missed" when it is discovered overdue by more than
+//! `KHIVE_FIRE_GRACE_SECS` (default 300s / 5 minutes). A missed event is
+//! **never dispatched** — it is marked `status="missed"` with `missed_at`
+//! stamped (epoch µs) and `fired_at` left null. A missed *repeating* event is
+//! skipped for this occurrence and re-armed at the next occurrence strictly
+//! after now (looping past every accumulated occurrence) — it never fires a
+//! catch-up burst. This means a daemon that was offline for a long stretch
+//! (or a first boot against a store with a large stale backlog) marks the
+//! entire overdue backlog missed on its first tick and dispatches zero of
+//! them. See the ADR-106 amendment for the full rationale and the prior-art
+//! comparison.
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Duration, Months, Utc};
 use serde_json::{json, Value};
 
-use khive_mcp::serve::enforce_strict_actor_mode;
-use khive_mcp::server::KhiveMcpServer;
-use khive_mcp::tools::request::RequestParams;
+use crate::serve::enforce_strict_actor_mode;
+use crate::server::KhiveMcpServer;
+use crate::tools::request::RequestParams;
 use khive_runtime::{KhiveRuntime, Namespace, RuntimeConfig};
 use khive_storage::note::{FilterOp, NoteFilter, PropertyFilter, SortDir};
 use khive_storage::types::{PageRequest, SqlStatement, SqlValue};
 
-use crate::dbpath::resolve_db_override;
+/// Resolve the `--db`/`KHIVE_DB` value into a `db_path` override, mirroring
+/// `kkernel mcp`: an explicit `:memory:` means the ephemeral in-memory db
+/// (`None`), not a file literally named ":memory:" (which SQLite treats as a
+/// per-connection file → empty schema). `None` leaves the default in place.
+///
+/// Intentionally duplicated from `kkernel::dbpath::resolve_db_override`
+/// rather than shared: `kkernel` depends on `khive-mcp`, so the reverse
+/// dependency this module would need to reuse that copy is unavailable, and
+/// the function is an 8-line pure mapping — not worth a new shared crate.
+fn resolve_db_override(db: Option<&str>) -> Option<Option<std::path::PathBuf>> {
+    match db {
+        Some(":memory:") => Some(None),
+        Some(path) => Some(Some(std::path::PathBuf::from(path))),
+        None => None,
+    }
+}
 
 /// A `scheduled_event` row stuck in `status="firing"` for longer than this is
 /// considered abandoned by a drain process that crashed or was killed between
@@ -56,6 +106,23 @@ use crate::dbpath::resolve_db_override;
 /// still-in-flight claim is never mistaken for an abandoned one.
 const STALE_FIRING_TIMEOUT_MICROS: i64 = 5 * 60 * 1_000_000;
 
+/// Default grace window (seconds): an event discovered overdue by more than
+/// this is "missed" rather than fired late. Overridable via
+/// `KHIVE_FIRE_GRACE_SECS`. See the module-level "Missed-event policy" docs.
+const DEFAULT_FIRE_GRACE_SECS: i64 = 300;
+
+/// Resolve the missed-event grace window from `KHIVE_FIRE_GRACE_SECS`,
+/// falling back to [`DEFAULT_FIRE_GRACE_SECS`] when unset or unparseable as a
+/// non-negative integer.
+fn fire_grace_from_env() -> Duration {
+    let secs = std::env::var("KHIVE_FIRE_GRACE_SECS")
+        .ok()
+        .and_then(|s| s.parse::<i64>().ok())
+        .filter(|&s| s >= 0)
+        .unwrap_or(DEFAULT_FIRE_GRACE_SECS);
+    Duration::seconds(secs)
+}
+
 /// Summary of a single drain run.
 #[derive(Debug, Default)]
 pub struct DrainSummary {
@@ -66,6 +133,10 @@ pub struct DrainSummary {
     pub skipped_not_due: u64,
     pub skipped_race: u64,
     pub reclaimed: u64,
+    /// IDs of `scheduled_event` notes marked `"missed"` (or re-armed past a
+    /// missed occurrence) this pass — never dispatched. See the module-level
+    /// "Missed-event policy" docs.
+    pub missed: Vec<uuid::Uuid>,
 }
 
 /// One-shot drain: fire all pending, due scheduled events.
@@ -101,6 +172,7 @@ pub async fn run_pending_events(
     let server = KhiveMcpServer::new(rt.clone()).map_err(|e| anyhow::anyhow!("{e}"))?;
 
     let now = Utc::now();
+    let grace = fire_grace_from_env();
     let mut summary = DrainSummary::default();
 
     // ── Step 0: reclaim rows abandoned mid-fire by a crashed/killed drain ──
@@ -219,6 +291,15 @@ pub async fn run_pending_events(
                     continue;
                 }
 
+                // ── Missed-event grace policy (ADR-106 amendment) ─────────
+                // An event overdue by more than `grace` is never dispatched:
+                // agent-facing side effects (outbound mail, spawned actions)
+                // must not fire late en masse after a daemon outage or a
+                // first boot against a large stale backlog. See the
+                // module-level "Missed-event policy" docs.
+                let overdue = now.signed_duration_since(trigger_at);
+                let is_missed = overdue > grace;
+
                 // ── Determine what to dispatch ───────────────────────────
                 let event_type = note
                     .properties
@@ -227,7 +308,7 @@ pub async fn run_pending_events(
                     .and_then(Value::as_str)
                     .unwrap_or("remind");
 
-                let action_dsl: Option<String> = if event_type == "schedule" {
+                let action_dsl: Option<String> = if event_type == "schedule" && !is_missed {
                     note.properties
                         .as_ref()
                         .and_then(|p| p.get("payload"))
@@ -237,8 +318,20 @@ pub async fn run_pending_events(
                     // remind events: no DSL action to dispatch. We mark as fired
                     // to acknowledge the trigger. The notification channel (comm,
                     // channel transport, etc.) is out of scope for this drain.
+                    // Missed `schedule` events take this branch too: the whole
+                    // point of the missed policy is that the action is never
+                    // dispatched.
                     None
                 };
+
+                // ── Determine repeat (read before claim; only informs which
+                // finalize branch runs below, never mutates the snapshot) ──
+                let repeat = note
+                    .properties
+                    .as_ref()
+                    .and_then(|p| p.get("repeat"))
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
 
                 // ── Claim the row before dispatch (issue #462, fire side) ──
                 // `note` is a snapshot read by the page query above; a
@@ -248,7 +341,10 @@ pub async fn run_pending_events(
                 // matches status='pending') fails once we've claimed it, and
                 // (b) if cancel already won the race, our claim fails and we
                 // skip — the drain can no longer clobber a cancel that
-                // landed between the read and this point.
+                // landed between the read and this point. The same claim
+                // guards the missed path: a missed event still needs
+                // exclusive ownership before it can be marked "missed" or
+                // re-armed to a future occurrence.
                 let claimed_firing_at = match claim_pending_event(&rt, ns_str, note.id).await {
                     Ok(c) => c,
                     Err(e) => {
@@ -271,6 +367,70 @@ pub async fn run_pending_events(
                     continue;
                 };
 
+                if is_missed {
+                    // ── Missed path: never dispatch. Mark terminally
+                    // "missed", or (for a repeat) re-arm past every
+                    // accumulated occurrence to the next future one — no
+                    // catch-up bursts. ─────────────────────────────────────
+                    if verbose {
+                        eprintln!(
+                            "[pending-events] note {} overdue by {}s (grace {}s): marking \
+                             missed, not dispatching",
+                            note.id,
+                            overdue.num_seconds(),
+                            grace.num_seconds()
+                        );
+                    }
+                    let mut props = note.properties.clone().unwrap_or_else(|| json!({}));
+                    props["missed_at"] = json!(now.timestamp_micros());
+                    match advance_repeat_past_missed(&repeat, trigger_at, now) {
+                        Some(next_at) => {
+                            // Repeating event: skip this occurrence, re-arm
+                            // pending at the next future one.
+                            props["trigger_at"] = json!(next_at.to_rfc3339());
+                            props["status"] = json!("pending");
+                        }
+                        None => {
+                            // Non-repeating (or non-advancing cron): terminal
+                            // "missed". `fired_at` stays null/untouched.
+                            props["status"] = json!("missed");
+                        }
+                    }
+                    let updated_at = Utc::now().timestamp_micros();
+
+                    match finalize_fired_event(
+                        &rt,
+                        ns_str,
+                        note.id,
+                        &props,
+                        updated_at,
+                        claimed_firing_at,
+                    )
+                    .await
+                    {
+                        Ok(true) => {
+                            summary.missed.push(note.id);
+                        }
+                        Ok(false) => {
+                            if verbose {
+                                eprintln!(
+                                    "[pending-events] finalize no-op for {}: row no longer in \
+                                     \"firing\" state",
+                                    note.id
+                                );
+                            }
+                            summary.failed += 1;
+                        }
+                        Err(e) => {
+                            if verbose {
+                                eprintln!("[pending-events] finalize failed for {}: {e}", note.id);
+                            }
+                            summary.failed += 1;
+                        }
+                    }
+                    continue;
+                }
+
                 // ── Dispatch the action ──────────────────────────────────
                 if let Some(dsl) = &action_dsl {
                     let dispatch_result = dispatch_action(dsl, ns_str, &server, verbose).await;
@@ -287,14 +447,6 @@ pub async fn run_pending_events(
                         // field to distinguish clean fires from error fires.)
                     }
                 }
-
-                // ── Determine repeat ─────────────────────────────────────
-                let repeat = note
-                    .properties
-                    .as_ref()
-                    .and_then(|p| p.get("repeat"))
-                    .and_then(Value::as_str)
-                    .map(str::to_string);
 
                 let fired_at_rfc = Utc::now().to_rfc3339();
                 let mut props = note.properties.clone().unwrap_or_else(|| json!({}));
@@ -584,6 +736,36 @@ fn is_five_field_cron(expr: &str) -> bool {
     expr.split_whitespace().count() == 5
 }
 
+/// Advance a missed repeating event's `trigger_at` past every occurrence at
+/// or before `now`, landing on the first occurrence strictly after `now`
+/// (ADR-106 missed-event amendment). This is what makes a missed repeat
+/// re-arm without ever firing a catch-up burst: a daily reminder that was
+/// due 10 times while the daemon was down skips straight to tomorrow's
+/// occurrence instead of firing 10 times in a row.
+///
+/// Returns `None` when the event does not advance at all (no `repeat`, or an
+/// unsupported cron form per [`next_trigger_at`]) — the caller then marks the
+/// event terminally `"missed"` instead of re-arming it.
+///
+/// Terminates because [`next_trigger_at`]'s named-alias arms are always
+/// strictly increasing (`current + positive duration`), so each loop
+/// iteration moves `current` forward; `now` is fixed, so the loop reaches
+/// `next > now` in a bounded number of steps.
+fn advance_repeat_past_missed(
+    repeat: &Option<String>,
+    current: DateTime<Utc>,
+    now: DateTime<Utc>,
+) -> Option<DateTime<Utc>> {
+    let mut current = current;
+    loop {
+        let next = next_trigger_at(repeat, current)?;
+        if next > now {
+            return Some(next);
+        }
+        current = next;
+    }
+}
+
 /// Dispatch a DSL action string in the given namespace.
 ///
 /// The action is wrapped as a JSON-form batch with `namespace` injected into
@@ -738,6 +920,8 @@ pub fn print_summary(summary: &DrainSummary) {
         "skipped_not_due": summary.skipped_not_due,
         "skipped_race": summary.skipped_race,
         "reclaimed": summary.reclaimed,
+        "missed_count": summary.missed.len(),
+        "missed_ids": summary.missed.iter().map(uuid::Uuid::to_string).collect::<Vec<_>>(),
     });
     println!(
         "{}",
@@ -750,6 +934,79 @@ pub fn print_summary(summary: &DrainSummary) {
 // KhiveRuntime exposes `sql()` as an accessor to the SqlAccess trait object.
 // We use it here for the namespace-discovery query.
 
+/// Default interval between daemon-resident schedule ticks, in seconds.
+/// Matches the cadence the module doc already documents for the external-cron
+/// invocation (`* * * * * kkernel exec --pending-events` is minute-grain;
+/// 60s is the same order of magnitude for the in-daemon tick).
+const DEFAULT_TICK_INTERVAL_SECS: u64 = 60;
+
+/// Resolve the daemon tick interval from `KHIVE_SCHEDULE_TICK_SECS`, falling
+/// back to `DEFAULT_TICK_INTERVAL_SECS` (60s) when unset or not a positive
+/// integer.
+pub fn tick_interval_from_env() -> std::time::Duration {
+    let secs = std::env::var("KHIVE_SCHEDULE_TICK_SECS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .filter(|&s| s > 0)
+        .unwrap_or(DEFAULT_TICK_INTERVAL_SECS);
+    std::time::Duration::from_secs(secs)
+}
+
+/// Daemon-resident periodic drain loop (ADR-106).
+///
+/// Runs [`run_pending_events`] on a fixed interval for as long as the daemon
+/// process lives. Only the daemon role spawns this loop (mirrors the
+/// `is_daemon_role` gate `khive-mcp::serve` already applies to the email
+/// channel loops, #602) — a short-lived `kkernel exec`/stdio client process
+/// never calls this, so there is exactly one tick loop per live daemon.
+///
+/// Each tick opens its own short-lived `KhiveRuntime` against `db`/
+/// `namespace` — the same construction `kkernel exec --pending-events` uses
+/// — rather than threading the daemon's own warm runtime through. This is a
+/// deliberate simplification: `khive-mcp::server::KhiveMcpServer` does not
+/// retain a single top-level `KhiveRuntime` handle (each pack holds its own),
+/// so reusing the daemon's live runtime here would need new plumbing through
+/// `DaemonDispatch`. Running the documented cron invocation in-process
+/// instead costs a connection-pool warm-up every tick but never a
+/// correctness risk: the drain's `pending -> firing` claim/finalize CAS
+/// already makes concurrent or overlapping invocations harmless by
+/// construction (see the module-level docs), exactly as it does for the
+/// still-supported external-cron redundancy.
+///
+/// A per-tick failure (e.g. a transient SQL error) is logged and does not
+/// stop the loop — the next tick simply tries again.
+pub async fn schedule_tick_loop(
+    db: Option<String>,
+    namespace: String,
+    interval: std::time::Duration,
+) {
+    loop {
+        tokio::time::sleep(interval).await;
+        match run_pending_events(db.as_deref(), &namespace, false).await {
+            Ok(summary) => {
+                if summary.fired > 0
+                    || summary.advanced > 0
+                    || summary.failed > 0
+                    || !summary.missed.is_empty()
+                {
+                    tracing::info!(
+                        scanned = summary.scanned,
+                        fired = summary.fired,
+                        advanced = summary.advanced,
+                        missed = summary.missed.len(),
+                        failed = summary.failed,
+                        reclaimed = summary.reclaimed,
+                        "schedule tick: drain pass complete"
+                    );
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "schedule tick: drain pass failed");
+            }
+        }
+    }
+}
+
 // ── tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -761,6 +1018,15 @@ mod tests {
         let f = NamedTempFile::new().expect("tempfile");
         let path = f.path().to_str().expect("utf8 path").to_string();
         (f, path)
+    }
+
+    /// An RFC 3339 timestamp a few seconds in the past — due, but comfortably
+    /// inside the default 300s missed-event grace window (ADR-106 amendment),
+    /// so tests exercising the normal fire/advance path aren't swept into the
+    /// missed path by a fixed year-2000 sentinel. Tests exercising the missed
+    /// path itself use their own far-past or `now`-relative timestamps.
+    fn due_rfc3339() -> String {
+        (Utc::now() - Duration::seconds(5)).to_rfc3339()
     }
 
     async fn make_rt(db_path: &str) -> KhiveRuntime {
@@ -837,10 +1103,12 @@ mod tests {
 
         // Create a past-due schedule event. Use stats() as the action since it's
         // a valid, registered verb that has no side-effects that need a
-        // namespace argument check.
-        let past = "2000-01-01T00:00:00Z";
+        // namespace argument check. `due_rfc3339` is only a few seconds
+        // overdue — inside the missed-event grace window — so this exercises
+        // the normal fire path, not the ADR-106 missed path.
+        let past = due_rfc3339();
         let id =
-            create_scheduled_event(&rt, "local", past, Some("stats()"), None, "schedule").await;
+            create_scheduled_event(&rt, "local", &past, Some("stats()"), None, "schedule").await;
 
         let summary = run_pending_events(Some(&db_path), "local", false)
             .await
@@ -893,9 +1161,9 @@ mod tests {
         let (_tmp, db_path) = tmp_db();
         let rt = make_rt(&db_path).await;
 
-        let past = "2000-01-01T00:00:00Z";
+        let past = due_rfc3339();
         let id =
-            create_scheduled_event(&rt, "local", past, Some("stats()"), None, "schedule").await;
+            create_scheduled_event(&rt, "local", &past, Some("stats()"), None, "schedule").await;
 
         // First drain — fires the event.
         let s1 = run_pending_events(Some(&db_path), "local", false)
@@ -931,12 +1199,12 @@ mod tests {
         let (_tmp, db_path) = tmp_db();
         let rt = make_rt(&db_path).await;
 
-        // Use a past trigger_at with daily repeat.
-        let past = "2000-06-01T09:00:00Z";
+        // Use a past (but in-grace) trigger_at with daily repeat.
+        let past = due_rfc3339();
         let id = create_scheduled_event(
             &rt,
             "local",
-            past,
+            &past,
             Some("stats()"),
             Some("daily"),
             "schedule",
@@ -981,9 +1249,10 @@ mod tests {
         // in ns-a without touching the ns-b namespace counts.
         let ns_a = "ns-a";
         let ns_b = "ns-b";
-        let past = "2000-01-01T00:00:00Z";
+        let past = due_rfc3339();
 
-        let id_a = create_scheduled_event(&rt, ns_a, past, Some("stats()"), None, "schedule").await;
+        let id_a =
+            create_scheduled_event(&rt, ns_a, &past, Some("stats()"), None, "schedule").await;
 
         // Create a future event in ns-b that must not be fired.
         let _id_b = create_scheduled_event(
@@ -1025,12 +1294,13 @@ mod tests {
         let (_tmp, db_path) = tmp_db();
         let rt = make_rt(&db_path).await;
 
-        // Create a past-due event with an invalid action DSL (verb not registered).
-        let past = "2000-01-01T00:00:00Z";
+        // Create a past-due (but in-grace) event with an invalid action DSL
+        // (verb not registered).
+        let past = due_rfc3339();
         let _id_bad = create_scheduled_event(
             &rt,
             "local",
-            past,
+            &past,
             Some("stats()"), // valid — but let's add a second event with a broken action
             None,
             "schedule",
@@ -1040,7 +1310,7 @@ mod tests {
         let id_bad2 = create_scheduled_event(
             &rt,
             "local",
-            past,
+            &past,
             Some("this_verb_does_not_exist(foo=\"bar\")"),
             None,
             "schedule",
@@ -1115,11 +1385,11 @@ mod tests {
         let (_tmp, db_path) = tmp_db();
         let rt = make_rt(&db_path).await;
 
-        let past = "2000-01-01T00:00:00Z";
+        let past = due_rfc3339();
         let id = create_scheduled_event(
             &rt,
             "local",
-            past,
+            &past,
             Some("schedule.remind(content=\"ping\", at=\"2099-01-01T00:00:00Z\")"),
             None,
             "schedule",
@@ -1177,11 +1447,11 @@ mod tests {
         let (_tmp, db_path) = tmp_db();
         let rt = make_rt(&db_path).await;
 
-        let past = "2000-01-01T00:00:00Z";
+        let past = due_rfc3339();
         let _id = create_scheduled_event(
             &rt,
             "local",
-            past,
+            &past,
             Some("stats() | get(id=$prev.id)"),
             None,
             "schedule",
@@ -1318,9 +1588,9 @@ mod tests {
         let (_tmp, db_path) = tmp_db();
         let rt = make_rt(&db_path).await;
 
-        let past = "2000-01-01T00:00:00Z";
+        let past = due_rfc3339();
         let id =
-            create_scheduled_event(&rt, "local", past, Some("stats()"), None, "schedule").await;
+            create_scheduled_event(&rt, "local", &past, Some("stats()"), None, "schedule").await;
 
         // Simulate a drain claiming the row, then crashing before finalize:
         // status="firing" with a firing_at well past the stale timeout.
@@ -1647,5 +1917,203 @@ mod tests {
         let base: DateTime<Utc> = "2026-06-01T09:00:00Z".parse().unwrap();
         // 5-field cron: not supported → returns None (one-shot fire)
         assert!(next_trigger_at(&Some("0 9 * * 1".to_string()), base).is_none());
+    }
+
+    // ── ADR-106 missed-event policy ─────────────────────────────────────────
+
+    /// Deterministic unit test for `advance_repeat_past_missed`: 14 daily
+    /// occurrences accumulated while an event was undrained must be skipped
+    /// in a single advance to the first occurrence strictly after `now` —
+    /// never a multi-fire catch-up burst.
+    #[test]
+    fn advance_repeat_past_missed_skips_all_accumulated_occurrences() {
+        let now: DateTime<Utc> = "2026-06-15T09:00:00Z".parse().unwrap();
+        let original: DateTime<Utc> = "2026-06-01T09:00:00Z".parse().unwrap();
+        let next = advance_repeat_past_missed(&Some("daily".to_string()), original, now).unwrap();
+        assert!(next > now, "advanced occurrence must be strictly future");
+        assert!(
+            next <= now + Duration::days(1),
+            "must land on the very next occurrence, not skip further than one interval past now"
+        );
+        assert_eq!(
+            next,
+            original + Duration::days(15),
+            "must be exactly the first daily occurrence after now (single advance, no burst)"
+        );
+    }
+
+    /// No `repeat` (or an unsupported cron form) never advances — the caller
+    /// must fall back to marking the event terminally `"missed"`.
+    #[test]
+    fn advance_repeat_past_missed_no_repeat_returns_none() {
+        let now: DateTime<Utc> = "2026-06-15T09:00:00Z".parse().unwrap();
+        let original: DateTime<Utc> = "2026-06-01T09:00:00Z".parse().unwrap();
+        assert!(advance_repeat_past_missed(&None, original, now).is_none());
+    }
+
+    /// The headline regression: 9 non-repeating events overdue well beyond
+    /// the default grace window (300s) must ALL be marked `"missed"` and
+    /// NONE dispatched. This is the first-boot-against-a-large-backlog
+    /// scenario the ADR-106 amendment calls out explicitly. The action DSL
+    /// is deliberately a verb (`create`) that would leave an observable
+    /// trace if dispatched, so a regression that accidentally fires the
+    /// missed path would be caught by `summary.fired`/`summary.advanced`
+    /// being non-zero, not just by inspecting note status.
+    #[tokio::test]
+    async fn nine_overdue_events_beyond_grace_are_missed_with_zero_dispatch() {
+        let (_tmp, db_path) = tmp_db();
+        let rt = make_rt(&db_path).await;
+
+        let past = "2000-01-01T00:00:00Z";
+        let mut ids = Vec::new();
+        for _ in 0..9 {
+            let id =
+                create_scheduled_event(&rt, "local", past, Some("stats()"), None, "schedule").await;
+            ids.push(id);
+        }
+
+        let summary = run_pending_events(Some(&db_path), "local", false)
+            .await
+            .expect("drain");
+
+        assert_eq!(summary.scanned, 9, "all 9 overdue rows must be scanned");
+        assert_eq!(summary.fired, 0, "zero dispatches: nothing may be fired");
+        assert_eq!(
+            summary.advanced, 0,
+            "zero dispatches: nothing may be advanced"
+        );
+        assert_eq!(summary.failed, 0, "the missed path is not a failure");
+        assert_eq!(
+            summary.missed.len(),
+            9,
+            "all 9 overdue rows must be marked missed, got summary={summary:?}"
+        );
+        for id in &ids {
+            assert!(
+                summary.missed.contains(id),
+                "missed list must name every overdue id"
+            );
+        }
+
+        for id in ids {
+            let props = get_note_props(&rt, id).await;
+            assert_eq!(
+                props["status"].as_str(),
+                Some("missed"),
+                "note {id} must end in status=missed, got {props:?}"
+            );
+            assert!(
+                props["missed_at"].as_i64().is_some(),
+                "note {id} must have missed_at stamped, got {props:?}"
+            );
+            assert!(
+                props["fired_at"].is_null(),
+                "note {id} must never have fired_at set (never dispatched), got {props:?}"
+            );
+        }
+    }
+
+    /// An event overdue by less than the grace window must still fire
+    /// normally — the missed policy only applies beyond the grace threshold.
+    #[tokio::test]
+    async fn overdue_within_grace_still_fires() {
+        let (_tmp, db_path) = tmp_db();
+        let rt = make_rt(&db_path).await;
+
+        // 60s overdue is comfortably inside the 300s default grace window.
+        let trigger_at = (Utc::now() - Duration::seconds(60)).to_rfc3339();
+        let id =
+            create_scheduled_event(&rt, "local", &trigger_at, Some("stats()"), None, "schedule")
+                .await;
+
+        let summary = run_pending_events(Some(&db_path), "local", false)
+            .await
+            .expect("drain");
+
+        assert!(
+            summary.missed.is_empty(),
+            "an event within grace must never be marked missed, got summary={summary:?}"
+        );
+        assert!(
+            summary.fired >= 1 || summary.advanced >= 1,
+            "an event within grace must be dispatched normally, got summary={summary:?}"
+        );
+
+        let props = get_note_props(&rt, id).await;
+        assert_eq!(
+            props["status"].as_str(),
+            Some("fired"),
+            "non-repeating in-grace event must end fired, got {props:?}"
+        );
+        assert!(
+            props["fired_at"].as_str().is_some(),
+            "in-grace event must have fired_at set, got {props:?}"
+        );
+    }
+
+    /// End-to-end (drain-level) confirmation that a missed *repeating* event
+    /// is re-armed at a future occurrence instead of ending terminally
+    /// missed — complements the deterministic
+    /// `advance_repeat_past_missed_skips_all_accumulated_occurrences` unit
+    /// test above with the full claim/finalize wiring.
+    #[tokio::test]
+    async fn missed_repeat_is_rearmed_at_next_future_occurrence() {
+        let (_tmp, db_path) = tmp_db();
+        let rt = make_rt(&db_path).await;
+
+        // 10 days overdue with a daily repeat: 10 accumulated occurrences,
+        // all missed, must collapse into exactly one future re-arm.
+        let original_trigger: DateTime<Utc> = Utc::now() - Duration::days(10);
+        let id = create_scheduled_event(
+            &rt,
+            "local",
+            &original_trigger.to_rfc3339(),
+            Some("stats()"),
+            Some("daily"),
+            "schedule",
+        )
+        .await;
+
+        let summary = run_pending_events(Some(&db_path), "local", false)
+            .await
+            .expect("drain");
+
+        assert_eq!(summary.fired, 0, "a missed repeat must not fire");
+        assert_eq!(
+            summary.advanced, 0,
+            "a missed repeat's re-arm is counted as missed, not advanced"
+        );
+        assert_eq!(
+            summary.missed.len(),
+            1,
+            "exactly one missed occurrence recorded"
+        );
+        assert!(summary.missed.contains(&id));
+
+        let props = get_note_props(&rt, id).await;
+        assert_eq!(
+            props["status"].as_str(),
+            Some("pending"),
+            "a missed repeat must be re-armed to pending, not left terminal, got {props:?}"
+        );
+        assert!(
+            props["missed_at"].as_i64().is_some(),
+            "missed_at must be stamped even though the row is re-armed, got {props:?}"
+        );
+        let new_trigger: DateTime<Utc> = props["trigger_at"]
+            .as_str()
+            .expect("trigger_at must be set")
+            .parse()
+            .expect("parseable trigger_at");
+        let now = Utc::now();
+        assert!(
+            new_trigger > now,
+            "re-armed trigger_at must be strictly in the future, got {new_trigger} (now={now})"
+        );
+        assert!(
+            new_trigger <= now + Duration::days(1),
+            "re-armed trigger_at must be the very next occurrence, not skip further \
+             (no catch-up burst), got {new_trigger} (now={now})"
+        );
     }
 }

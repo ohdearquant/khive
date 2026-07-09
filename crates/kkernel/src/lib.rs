@@ -8,10 +8,15 @@ pub mod exec;
 pub mod git_ingest;
 pub mod kg;
 pub mod pack_introspect;
-pub mod pending_events;
 pub mod reindex;
 pub mod sync;
 pub mod vector;
+
+// `pending_events` (the scheduled-event drain) now lives in `khive-mcp`
+// (`khive_mcp::pending_events`), not here — the daemon-resident tick (ADR-106)
+// needs to call it from `khive-mcp::serve`, which cannot depend back on
+// `kkernel`. `kkernel exec --pending-events` (`exec.rs`) calls the moved
+// module directly.
 
 // Force the pack crates into the binary so their `inventory::submit!` blocks
 // run at startup. Cargo deps alone are not enough — the linker drops

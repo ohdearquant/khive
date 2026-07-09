@@ -1,7 +1,8 @@
 # ADR-106: Schedule Pack Executor — Daemon-Resident Tick for the Pending-Event Drain
 
-**Status**: Proposed
+**Status**: Accepted
 **Date**: 2026-07-09
+**Amended**: 2026-07-09 (missed-event grace policy, Amendment A; implementation note, Amendment B)
 **Depends on**: [ADR-040](ADR-040-communication-and-schedule-packs.md) (schedule pack
 verbs and `scheduled_event` note kind), [ADR-049](ADR-049-khived-daemon.md) (warm daemon
 process model), [ADR-016](ADR-016-request-dsl.md) (request DSL, replayed at fire time)
@@ -442,3 +443,163 @@ daemon-resident tick:
   the drain already has.
 - A new environment-configurable interval knob is introduced for the schedule tick,
   following the same override pattern already used for the checkpoint task's interval.
+
+## Amendment A: Missed-event grace policy (2026-07-09)
+
+The drain, as originally specified above, fires any `scheduled_event` row it finds
+`pending` with `trigger_at <= now`, regardless of how overdue it is. Decision point 7
+calls this out as a feature, not an oversight: "a daemon that was down for an hour
+simply fires everything overdue on its first tick after restart." That behavior is
+correct for a short outage. It is the wrong behavior for a long one, or for a fresh
+deployment's first tick against a database that already carries an accumulated backlog
+of undrained rows: every one of those rows would fire in a single pass, including rows
+whose action has an externally visible, agent-facing side effect (an outbound
+`comm.send`, a spawned action, and similar). Firing a large stale backlog all at once is
+a mass-notification / mass-side-effect incident waiting to happen, not a recovery.
+
+### Policy
+
+An event is **missed** when the drain discovers it `pending` and overdue by more than a
+configurable grace window, `KHIVE_FIRE_GRACE_SECS` (default `300`, five minutes).
+
+- A missed event is **never dispatched**. Its stored action is not replayed, regardless
+  of `event_type`.
+- A missed, **non-repeating** event is marked terminal: `status` transitions to
+  `"missed"`, `missed_at` is stamped (epoch microseconds, the same unit `firing_at` and
+  the drain's other internal timestamps already use), and `fired_at` is left `null` —
+  the row was never fired, so `fired_at` must not claim otherwise.
+- A missed **repeating** event is not left terminal: the drain advances its
+  `trigger_at` past every occurrence at or before `now` in one step, landing on the
+  first occurrence strictly after `now`, and re-arms the row to `status = "pending"` at
+  that new `trigger_at`. `missed_at` is still stamped, recording that at least one
+  occurrence was skipped. The event never fires a catch-up burst — a daily reminder
+  that accumulated ten missed occurrences advances directly to tomorrow's, not through
+  ten sequential fires.
+- A row overdue by less than the grace window is unaffected: it fires (or advances,
+  for a repeat) exactly as specified in the base ADR, with no behavior change.
+
+The practical consequence for a first daemon boot against a store carrying a large
+stale backlog (every row overdue well past the grace window): every such row is marked
+`"missed"` (or re-armed, for repeats) on the first tick, and zero of them are
+dispatched. This is the intended migration behavior, not a bug — it is exactly the
+scenario the policy exists to guard against.
+
+### Why skip-and-mark, not catch-up-once or fire-everything
+
+Prior art disagrees on missed-fire handling, and the disagreement tracks what kind of
+side effect a missed action typically has:
+
+- **systemd** (`Persistent=true` on a timer unit) catches up **once**: if the system was
+  off past a timer's scheduled run, the unit fires a single time on the next boot,
+  collapsing any number of missed occurrences into one. This is close to khive's
+  repeat-rearm behavior in spirit (no burst), but systemd's model still fires the
+  action — it assumes the missed unit's side effect is idempotent-ish or safe to run
+  late (a backup job, a log rotation). khive's action space is a replayed `VerbRegistry`
+  call, and nothing in the schedule pack constrains that call to be side-effect-free or
+  idempotent; a `comm.send` dispatched hours or days late is not equivalent to on-time
+  delivery, it is a surprise.
+- **Quartz** exposes per-trigger misfire instructions (`fire now`, `do nothing`, `reset
+  to next fire time`), pushing the decision to the scheduling caller on a per-schedule
+  basis. This is a real, more flexible design point khive does not adopt for v1: it
+  would require a new field on `scheduled_event` (a per-row misfire policy) and a
+  corresponding write-time API surface on `schedule.schedule`/`schedule.remind`,
+  neither of which exists today. A single global grace window is the smaller, additive
+  change; a per-row override is a natural extension if a real use case demands it,
+  tracked as follow-on work rather than blocking this ADR.
+- **Sidekiq** (the general background-job-queue precedent, not schedule-specific) fires
+  everything it finds due, in full, with no missed-fire concept at all — the job queue
+  model assumes catching up on a backlog of independent jobs is exactly the desired
+  behavior. That assumption is correct for typical queued work (each job is
+  independent, idempotent-by-convention, and "eventually processed" is the contract)
+  and wrong for khive's schedule pack, where a `scheduled_event` models a specific
+  point in time the caller cared about (a reminder due today, a briefing due at 9am),
+  not a work item that is equally valid whenever it happens to run.
+
+khive chooses **skip-and-mark** over both: never replay a stale action (ruling out
+Sidekiq's fire-everything and softening systemd's fire-once), but never lose the
+schedule either (a repeat re-arms to its next real occurrence rather than being
+abandoned, and a non-repeat's miss is visibly recorded via `status = "missed"` +
+`missed_at` rather than silently vanishing). The deciding factor is that khive's action
+space is closed but unconstrained in side-effect shape (Decision point 3 of the base
+ADR: "replay a validated khive verb DSL string," which can be a `comm.send`, a
+`create`, or any other registered verb) — the drain cannot assume any given action is
+safe to fire late, so the only universally safe choice is to never fire late at all, and
+instead make the miss observable and, for repeats, self-healing at the next real
+occurrence.
+
+### Interaction with the rest of this ADR
+
+The missed-event check runs inside the existing claim/finalize CAS
+(`claim_pending_event` / `finalize_fired_event`), not as a separate pass: a row is
+still claimed `pending -> firing` before its missed-vs-fire disposition is decided, so
+the same race protection against a concurrent `schedule.cancel` (Decision point 5's CAS
+argument) and the same redundant-external-cron safety apply identically to the missed
+path. No new claim mechanism was introduced. The `DrainSummary` type gains one new
+field, `missed: Vec<Uuid>` (the IDs marked missed or re-armed this pass), alongside the
+seven fields already specified in Decision point 2.
+
+## Amendment B: Implementation note — the wiring seam actually shipped (2026-07-09)
+
+Decision points 1-3 above specify a fairly involved target design for the tick's home
+and lifecycle: a `DaemonDispatch::drain_pending_events` trait method with `DrainSummary`
+/ `DrainError` types owned by `khive-runtime`, `schedule_tick_loop` spawned from
+`run_daemon_with_boot_guard` in `khive-runtime/src/daemon.rs`, and an explicit
+`tokio::sync::watch`-channel shutdown signal integrated with the daemon's existing
+`track_background_task` bounded-drain shutdown sequence.
+
+The implementation landing alongside this amendment takes a smaller step toward that
+target rather than the full design in one PR, to keep the missed-event policy (Amendment
+A, the change with the more immediate safety payoff) decoupled from a `DaemonDispatch`
+trait-signature change that every implementor of that trait would need to absorb in the
+same PR:
+
+- The drain's internal functions (`claim_pending_event`, `dispatch_action`,
+  `finalize_fired_event`, `reclaim_stale_firing_events`, `discover_pending_namespaces`,
+  and the `run_pending_events` orchestration) moved from `crates/kkernel` into
+  `crates/khive-mcp` (`khive_mcp::pending_events`), matching Decision point 2's target
+  home for the drain logic itself. `kkernel exec --pending-events` now calls
+  `khive_mcp::pending_events::run_pending_events` directly rather than a `kkernel`-local
+  copy — this part of Decision point 2 is delivered as specified.
+- `schedule_tick_loop` is spawned from `khive-mcp/src/serve.rs`
+  (`spawn_schedule_tick_loop_if_daemon`), gated on `args.daemon` exactly the way
+  `spawn_email_channel_loops_if_daemon` already gates the email-channel loops (Decision
+  point 4's `is_daemon_role` gating is delivered as specified; only the _file_ differs
+  from Decision point 1's `daemon.rs` target).
+- The tick does **not** go through a `DaemonDispatch::drain_pending_events` trait
+  method. `khive-runtime` gains no new trait method and no new `DrainSummary`/
+  `DrainError` types; those remain owned by `khive-mcp` (as `DrainSummary` already was
+  before this ADR). Each tick instead constructs its own short-lived `KhiveRuntime`
+  against the daemon's configured `db`/`namespace`, the same construction
+  `kkernel exec --pending-events` uses, rather than sharing the live daemon's warm
+  runtime. This is the "Why the drain cannot be ticked as-is" problem the base ADR
+  identifies, deliberately left unsolved here: the cost is a connection-pool warm-up
+  every tick, not a correctness risk, because the drain's claim/finalize CAS already
+  makes redundant invocations safe by construction (Decision point 5) — the same
+  property that makes running external cron alongside the tick safe makes a per-tick
+  fresh runtime safe too, just at a higher resource cost than the shared-runtime design
+  would have.
+- Shutdown is a bare `tokio::spawn` with no `track_background_task` registration and no
+  watch-channel signal, matching how the checkpoint task and the email-channel loops are
+  already spawned in the current codebase (neither uses `track_background_task` today
+  either). A tick in flight at process shutdown is simply dropped, not drained; the next
+  daemon start (or a redundant external cron invocation) picks up any row left
+  mid-claim via the existing `reclaim_stale_firing_events` sweep, the same recovery
+  path Acceptance Criterion 5 relies on for the target design's bounded-drain case.
+- The interval env var is `KHIVE_SCHEDULE_TICK_SECS` (seconds, default `60`), not
+  `KHIVE_SCHEDULE_TICK_INTERVAL_MS` (milliseconds, default `60000`) as specified in
+  Decision point 6. The resolved default cadence is identical (60 seconds); only the
+  variable name and unit differ from the original decision.
+
+None of this changes Acceptance Criteria 1, 2, 4, or 6, which describe externally
+observable behavior (a due row fires within one tick interval; concurrent cron and tick
+invocations race safely to exactly one fire; the interval is configurable with a 60s
+default; the CLI wrapper is unchanged) — all four hold under the shipped
+implementation. Acceptance Criteria 3, 5, and 7 describe the specific trait-based
+mechanism (the `is_daemon_role` test shape, the watch-channel shutdown regression, and
+`khive-runtime`'s dependency graph): 3 holds as stated (the gate is on `args.daemon`
+regardless of which file spawns the loop); 5 and 7 are **not** met by the shipped
+implementation, since there is no watch-channel shutdown to test and `DrainSummary`
+never moved into `khive-runtime`. Closing that gap — moving to the full
+`DaemonDispatch::drain_pending_events` trait seam with tracked, graceful shutdown and a
+shared warm runtime per tick — remains open follow-on work, tracked separately from the
+missed-event policy this amendment's primary content (Amendment A) delivers.

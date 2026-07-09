@@ -68,7 +68,10 @@ fn forward_or_spawn_boxed(frame: &DaemonRequestFrame) -> ForwardFuture<'_> {
     Box::pin(khive_mcp::daemon::forward_or_spawn(frame))
 }
 
-use crate::pending_events;
+// The scheduled-event drain now lives in `khive-mcp` (ADR-106: the
+// daemon-resident tick needs to call it from `khive-mcp::serve`, which
+// cannot depend back on `kkernel`).
+use khive_mcp::pending_events;
 
 // ── guarded local construction (cold-boot FTS race, #667/#645) ─────────────
 //

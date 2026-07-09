@@ -64,6 +64,7 @@ pub async fn run(args: Args, registry: &TransportRegistry) -> anyhow::Result<()>
 
     #[cfg(feature = "channel-email")]
     spawn_email_channel_loops_if_daemon(&server, &args);
+    spawn_schedule_tick_loop_if_daemon(&args);
 
     #[cfg(unix)]
     if args.daemon {
@@ -126,6 +127,40 @@ fn spawn_email_channel_loops_if_daemon(server: &KhiveMcpServer, args: &Args) {
         spawn_email_channel_loops(server);
     } else {
         tracing::info!("email channel loops: skipped (client role; daemon owns channel loops)");
+    }
+}
+
+/// Spawn the daemon-resident schedule-event tick loop (ADR-106) if — and
+/// only if — `args` indicates this process is the daemon. Mirrors
+/// [`spawn_email_channel_loops_if_daemon`]'s `args.daemon` role gate (#602):
+/// a short-lived `kkernel exec`/stdio client process never spawns this, only
+/// the daemon does, exactly once per live process. Unlike the email loops,
+/// this is not behind a Cargo feature — the schedule pack is always linked,
+/// so the tick loop is always available.
+///
+/// If no daemon is running, scheduled events are simply not drained by this
+/// mechanism — the documented external-cron invocation
+/// (`kkernel exec --pending-events`) still works independently and safely
+/// races the tick loop when both are present (see the module docs on
+/// [`crate::pending_events`]).
+fn spawn_schedule_tick_loop_if_daemon(args: &Args) {
+    if args.daemon {
+        let db = args.db.clone();
+        let namespace = args
+            .namespace
+            .clone()
+            .or_else(|| args.actor.clone())
+            .unwrap_or_else(|| "local".to_string());
+        let interval = crate::pending_events::tick_interval_from_env();
+        tracing::info!(
+            interval_secs = interval.as_secs(),
+            "schedule tick loop: spawning (daemon role)"
+        );
+        tokio::spawn(crate::pending_events::schedule_tick_loop(
+            db, namespace, interval,
+        ));
+    } else {
+        tracing::info!("schedule tick loop: skipped (client role; daemon owns the tick)");
     }
 }
 
@@ -913,6 +948,7 @@ pub async fn serve_server(
     }
     #[cfg(feature = "channel-email")]
     spawn_email_channel_loops_if_daemon(&server, args);
+    spawn_schedule_tick_loop_if_daemon(args);
 
     #[cfg(unix)]
     if args.daemon {
