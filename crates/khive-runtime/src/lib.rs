@@ -21,6 +21,8 @@ pub mod operations;
 pub mod pack;
 pub mod portability;
 pub mod presentation;
+pub mod reference_resolution;
+pub mod reference_ring;
 pub mod registry;
 pub mod resource;
 pub mod retrieval;
@@ -90,6 +92,8 @@ pub use portability::{ImportSummary, KgArchive};
 pub use presentation::{
     apply_redundancy_drop, micros_to_iso, present, render_format, OutputFormat, PresentationMode,
 };
+pub use reference_resolution::{resolve_reference, ReferenceCandidate, ReferenceResolution};
+pub use reference_ring::{ReferenceRing, RingEntry};
 pub use registry::{ObjectiveRegistry, RegisteredObjective};
 pub use resource::{cpu_delta_us, process_resource_usage, ProcessResourceUsage};
 pub use retrieval::{SearchHit, SearchSource};

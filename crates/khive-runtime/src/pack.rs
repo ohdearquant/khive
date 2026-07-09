@@ -591,6 +591,7 @@ impl VerbRegistryBuilder {
             event_store: self.event_store,
             dispatch_hook: self.dispatch_hook,
             available_verbs: Arc::new(available_verbs),
+            reference_ring: Arc::new(crate::reference_ring::ReferenceRing::new()),
         })
     }
 }
@@ -738,6 +739,11 @@ pub struct VerbRegistry {
     /// message — the pack set is fixed after construction, so there is no
     /// need to re-scan every pack's handlers on every miss.
     available_verbs: Arc<Vec<&'static str>>,
+    /// Recently-referenced ring (unified-verb draft ADR, Slice 1). Daemon-warm,
+    /// actor-scoped, never persisted — see `crate::reference_ring`. Shared
+    /// across every clone of this registry via the `Arc`, so admissions made
+    /// by one dispatch are visible to the next on the same warm daemon.
+    reference_ring: Arc<crate::reference_ring::ReferenceRing>,
 }
 
 /// Per-request identity context that overrides a [`VerbRegistry`]'s
@@ -1313,6 +1319,21 @@ impl VerbRegistry {
                     hook.on_dispatch(&dispatch_view).await;
                 }
 
+                // Recently-referenced ring admission (unified-verb draft ADR,
+                // Slice 1 — gate condition, 2026-07-09): only by-id touches
+                // admit an id. Runs unconditionally (not gated on
+                // `dispatch_hook`, which is opt-in) because the ring is a
+                // core dispatch-boundary capability, not an observer.
+                if let Ok(ref ok_val) = result {
+                    let admissions = crate::reference_ring::ring_admissions_for(verb, ok_val);
+                    if !admissions.is_empty() {
+                        let actor_key = format!("{}:{}", gate_req.actor.kind, gate_req.actor.id);
+                        for (id, name) in admissions {
+                            self.reference_ring.admit(ns.as_str(), &actor_key, id, name);
+                        }
+                    }
+                }
+
                 return result;
             }
         }
@@ -1349,6 +1370,14 @@ impl VerbRegistry {
     /// substrates (entity/note/edge/event) return `None` for a given UUID.
     pub fn resolvers(&self) -> &[(String, Box<dyn PackByIdResolver>)] {
         &self.resolvers
+    }
+
+    /// The daemon-warm recently-referenced ring (unified-verb draft ADR,
+    /// Slice 1). Consumed by `resolve_reference` (Layer 0 stage 2) and by the
+    /// `resolve` verb handler; admitted-to by every successful by-id
+    /// dispatch (see the admission block in `dispatch_with_identity`).
+    pub fn reference_ring(&self) -> &Arc<crate::reference_ring::ReferenceRing> {
+        &self.reference_ring
     }
 
     /// Find a kind hook among the registered packs.

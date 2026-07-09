@@ -140,6 +140,7 @@ impl PackRuntime for KgPack {
             "review" => self.handle_review(graph_token, params, registry).await,
             "withdraw" => self.handle_withdraw(graph_token, params).await,
             "stats" => self.handle_stats(graph_token, params).await,
+            "resolve" => self.handle_resolve(graph_token, params, registry).await,
             "merge" => self.handle_merge(graph_token, params, registry).await,
             // UUID-based: entities/edges use graph token, notes/events use caller token.
             "get" => self.handle_get(token, graph_token, params, registry).await,
@@ -1085,6 +1086,230 @@ mod tests {
             "#569 search(kind=\"note\") must fail loud on a residual FTS5 char ('@'), \
              not silently degrade to vector-only results, got: {:?}",
             result.ok()
+        );
+    }
+
+    // ---- `resolve` verb (unified-verb draft ADR, Slice 1) ----
+    //
+    // Ring admission happens at the `VerbRegistry::dispatch_with_identity`
+    // boundary (see `pack.rs`), not inside `KgPack::dispatch` — these tests
+    // go through `registry.dispatch(verb, params)` (not the direct
+    // `pack.dispatch(verb, params, &registry, &tok)` bypass most other tests
+    // in this module use) specifically so the admission hook fires.
+
+    /// A UUID ref resolves through the id-string passthrough stage,
+    /// regardless of whether the entity was ever touched through this
+    /// registry's ring — exercised end to end through verb dispatch.
+    #[tokio::test]
+    async fn resolve_id_string_passthrough_through_dispatch() {
+        let rt = KhiveRuntime::memory().expect("in-memory runtime");
+        let mut builder = VerbRegistryBuilder::new();
+        builder.with_default_namespace("local");
+        builder.register(KgPack::new(rt.clone()));
+        let registry = builder.build().expect("registry build");
+
+        let created = registry
+            .dispatch(
+                "create",
+                json!({"kind": "concept", "name": "ResolveIdTarget"}),
+            )
+            .await
+            .expect("create must succeed");
+        let id = created.get("id").and_then(|v| v.as_str()).unwrap();
+
+        let result = registry
+            .dispatch("resolve", json!({"refs": [id]}))
+            .await
+            .expect("resolve must succeed");
+        let results = result.get("results").and_then(|v| v.as_array()).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(
+            results[0].get("status").and_then(|v| v.as_str()),
+            Some("resolved")
+        );
+        assert_eq!(results[0].get("id").and_then(|v| v.as_str()), Some(id));
+        assert_eq!(
+            results[0].get("confidence").and_then(|v| v.as_f64()),
+            Some(1.0)
+        );
+    }
+
+    /// The dispatch-boundary ring admits `create`'s returned id under its
+    /// name; a later `resolve(refs=[name])` call by the SAME actor resolves
+    /// it via the ring stage without ever running hybrid search over a
+    /// matching name. Proves the ring, not just the id-string passthrough.
+    #[tokio::test]
+    async fn resolve_via_recently_referenced_ring_after_create() {
+        let rt = KhiveRuntime::memory().expect("in-memory runtime");
+        let mut builder = VerbRegistryBuilder::new();
+        builder.with_default_namespace("local");
+        builder.register(KgPack::new(rt.clone()));
+        let registry = builder.build().expect("registry build");
+
+        let created = registry
+            .dispatch(
+                "create",
+                json!({"kind": "concept", "name": "the old record"}),
+            )
+            .await
+            .expect("create must succeed");
+        let id = created.get("id").and_then(|v| v.as_str()).unwrap();
+
+        let result = registry
+            .dispatch("resolve", json!({"refs": ["the old record"]}))
+            .await
+            .expect("resolve must succeed");
+        let results = result.get("results").and_then(|v| v.as_array()).unwrap();
+        assert_eq!(
+            results[0].get("status").and_then(|v| v.as_str()),
+            Some("resolved"),
+            "ring admission from `create` must let `resolve` find it by name: {results:?}"
+        );
+        assert_eq!(results[0].get("id").and_then(|v| v.as_str()), Some(id));
+        assert_eq!(
+            results[0].get("confidence").and_then(|v| v.as_f64()),
+            Some(0.95),
+            "an exact ring-name match must resolve at RING_EXACT_CONFIDENCE"
+        );
+    }
+
+    /// Two entities admitted to the ring under the exact same name resolve
+    /// as `Ambiguous`, never a silent pick (F7 of the unified-verb draft ADR).
+    #[tokio::test]
+    async fn resolve_ambiguous_on_duplicate_ring_names() {
+        let rt = KhiveRuntime::memory().expect("in-memory runtime");
+        let mut builder = VerbRegistryBuilder::new();
+        builder.with_default_namespace("local");
+        builder.register(KgPack::new(rt.clone()));
+        let registry = builder.build().expect("registry build");
+
+        for _ in 0..2 {
+            registry
+                .dispatch(
+                    "create",
+                    json!({"kind": "concept", "name": "duplicate ring name"}),
+                )
+                .await
+                .expect("create must succeed");
+        }
+
+        let result = registry
+            .dispatch("resolve", json!({"refs": ["duplicate ring name"]}))
+            .await
+            .expect("resolve must succeed");
+        let results = result.get("results").and_then(|v| v.as_array()).unwrap();
+        assert_eq!(
+            results[0].get("status").and_then(|v| v.as_str()),
+            Some("ambiguous")
+        );
+        let candidates = results[0]
+            .get("candidates")
+            .and_then(|v| v.as_array())
+            .expect("ambiguous result must carry candidates");
+        assert_eq!(candidates.len(), 2);
+    }
+
+    /// A ref that matches nothing in the ring or hybrid search is `NotFound`.
+    #[tokio::test]
+    async fn resolve_not_found_when_nothing_matches() {
+        let rt = KhiveRuntime::memory().expect("in-memory runtime");
+        let mut builder = VerbRegistryBuilder::new();
+        builder.with_default_namespace("local");
+        builder.register(KgPack::new(rt.clone()));
+        let registry = builder.build().expect("registry build");
+
+        let result = registry
+            .dispatch(
+                "resolve",
+                json!({"refs": ["nothing in this empty graph matches"]}),
+            )
+            .await
+            .expect("resolve must succeed");
+        let results = result.get("results").and_then(|v| v.as_array()).unwrap();
+        assert_eq!(
+            results[0].get("status").and_then(|v| v.as_str()),
+            Some("not_found")
+        );
+    }
+
+    /// `search` result-sets never admit to the ring (gate condition,
+    /// 2026-07-09): an entity that only ever went through `search` (never
+    /// `create`/`get`/`update`/`delete`/`merge`/`link` on THIS registry) must
+    /// not resolve via the ring's high-confidence exact-match stage. It is
+    /// created directly on the runtime (bypassing dispatch, hence bypassing
+    /// admission entirely) so the only way `resolve` can find it at all is
+    /// the hybrid-search fallback (stage 3) — proven by a confidence below
+    /// the ring's fixed 0.95 exact-match / 0.7 substring-match bands.
+    #[tokio::test]
+    async fn resolve_search_result_sets_never_populate_the_ring() {
+        let rt = KhiveRuntime::memory().expect("in-memory runtime");
+        let direct_tok = rt.authorize(Namespace::local()).unwrap();
+        rt.create_entity(
+            &direct_tok,
+            "concept",
+            None,
+            "ring sparsity probe target",
+            None,
+            None,
+            vec![],
+        )
+        .await
+        .expect("direct entity create must succeed");
+
+        let mut builder = VerbRegistryBuilder::new();
+        builder.with_default_namespace("local");
+        builder.register(KgPack::new(rt.clone()));
+        let registry = builder.build().expect("registry build");
+
+        // Search alone must never populate the ring.
+        registry
+            .dispatch(
+                "search",
+                json!({"kind": "entity", "query": "ring sparsity probe target"}),
+            )
+            .await
+            .expect("search must succeed");
+
+        let result = registry
+            .dispatch("resolve", json!({"refs": ["ring sparsity probe target"]}))
+            .await
+            .expect("resolve must succeed");
+        let results = result.get("results").and_then(|v| v.as_array()).unwrap();
+        if let Some(status) = results[0].get("status").and_then(|v| v.as_str()) {
+            if status == "resolved" {
+                let confidence = results[0]
+                    .get("confidence")
+                    .and_then(|v| v.as_f64())
+                    .unwrap();
+                assert!(
+                    confidence < 0.9,
+                    "a resolved hit here must come from hybrid search, not the ring \
+                     (which would score 0.95 exact / 0.7 substring); got {confidence}"
+                );
+            }
+        }
+    }
+
+    /// `resolve` is registered as a public verb and appears in `verbs()`.
+    #[tokio::test]
+    async fn resolve_appears_in_verbs_introspection() {
+        let rt = KhiveRuntime::memory().expect("in-memory runtime");
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(KgPack::new(rt.clone()));
+        let registry = builder.build().expect("registry build");
+
+        let result = registry
+            .dispatch("verbs", json!({}))
+            .await
+            .expect("verbs must succeed");
+        let verbs = result.get("verbs").and_then(|v| v.as_array()).unwrap();
+        let names: Vec<&str> = verbs
+            .iter()
+            .filter_map(|v| v.get("verb").and_then(|n| n.as_str()))
+            .collect();
+        assert!(
+            names.contains(&"resolve"),
+            "resolve must be registered as a public verb; got {names:?}"
         );
     }
 }

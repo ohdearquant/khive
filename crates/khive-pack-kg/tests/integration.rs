@@ -80,14 +80,15 @@ fn invalid_input_message(err: &RuntimeError) -> &str {
 
 // ADR-046 (cluster-22) added propose, review, and withdraw — bringing the
 // handler count from 11 to 14, then 15 with verbs introspection, then 16
-// with stats, then 17 with context (ADR-089).
+// with stats, then 17 with context (ADR-089), then 18 with resolve
+// (unified-verb draft ADR Slice 1).
 #[test]
-fn pack_verbs_returns_seventeen() {
+fn pack_verbs_returns_eighteen() {
     let pack = pack();
     assert_eq!(
         pack.verbs().len(),
-        17,
-        "KgPack must expose exactly 17 verbs (16 previous + context)"
+        18,
+        "KgPack must expose exactly 18 verbs (17 previous + resolve)"
     );
 }
 
@@ -113,6 +114,7 @@ fn pack_verbs_names_are_correct() {
         "withdraw",
         "verbs",
         "context",
+        "resolve",
     ] {
         assert!(names.contains(expected), "verbs() missing {expected:?}");
     }

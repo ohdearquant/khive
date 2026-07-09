@@ -10,6 +10,7 @@ mod list;
 mod merge;
 mod params;
 mod proposal;
+mod resolve;
 mod search;
 mod stats;
 mod update;
