@@ -3129,7 +3129,16 @@ impl KhiveRuntime {
             format!(" AND namespace IN ({})", placeholders.join(", "))
         });
 
+        // #749: a UUID can legitimately exist in more than one scanned table
+        // (e.g. an entity id string that also happens to be an edge id — the
+        // scan is purely a text-prefix LIKE across independent tables, not a
+        // substrate-exclusive lookup). Without dedup, a single record hit
+        // twice across tables inflated `matches.len()` past 1 and produced a
+        // false `AmbiguousPrefix` naming the SAME UUID twice. `seen` tracks
+        // UUIDs already pushed so `matches` (and thus every length check,
+        // including the early-exit below) reflects DISTINCT UUIDs only.
         let mut matches: Vec<String> = Vec::new();
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
         let mut reader = self.sql().reader().await.map_err(RuntimeError::Storage)?;
 
         for (table, has_deleted_at) in tables {
@@ -3155,7 +3164,9 @@ impl KhiveRuntime {
                     for row in rows {
                         if let Some(col) = row.columns.first() {
                             if let SqlValue::Text(s) = &col.value {
-                                matches.push(s.clone());
+                                if seen.insert(s.clone()) {
+                                    matches.push(s.clone());
+                                }
                             }
                         }
                     }
@@ -6355,6 +6366,80 @@ mod tests {
             ),
             "shared 8-char prefix must return AmbiguousPrefix; got {err:?}"
         );
+    }
+
+    /// #749: a single UUID legitimately present in TWO scanned tables
+    /// (entities and notes here) must resolve cleanly to that one UUID, not
+    /// a false `AmbiguousPrefix` naming the same UUID twice. Before the fix,
+    /// `resolve_prefix_inner` pushed every table hit into `matches` with no
+    /// cross-table dedup, so `matches.len()` became 2 for a single record.
+    #[tokio::test]
+    async fn resolve_prefix_cross_table_duplicate_uuid_resolves_cleanly() {
+        use khive_storage::entity::Entity;
+
+        let rt = rt();
+        let tok = NamespaceToken::local();
+        let shared_id = Uuid::parse_str("ccddeeff-1111-4000-8000-000000000001").unwrap();
+
+        let mut entity = Entity::new("local", "concept", "Nvk749Entity");
+        entity.id = shared_id;
+        rt.entities(&tok)
+            .unwrap()
+            .upsert_entity(entity)
+            .await
+            .unwrap();
+
+        let mut note = Note::new("local", "observation", "nvk749 note with the same id");
+        note.id = shared_id;
+        rt.notes(&tok).unwrap().upsert_note(note).await.unwrap();
+
+        let resolved = rt
+            .resolve_prefix(&tok, "ccddeeff")
+            .await
+            .expect("#749: a UUID present in two tables must not be reported as ambiguous");
+        assert_eq!(
+            resolved,
+            Some(shared_id),
+            "#749: cross-table duplicate must resolve to the single shared UUID"
+        );
+    }
+
+    /// #749: the early-exit inside the per-table scan loop (`if matches.len()
+    /// > 1 { break }`) must also operate on DEDUPED state — otherwise a
+    /// cross-table duplicate could still short-circuit the scan before a
+    /// later table contributes the SAME UUID again, which would have masked
+    /// the bug rather than exercising it. This drives the duplicate through
+    /// the earliest two tables scanned (entities, notes) so the early-exit
+    /// path is the one under test, not a post-loop dedup applied too late.
+    #[tokio::test]
+    async fn resolve_prefix_early_exit_uses_deduped_match_count() {
+        use khive_storage::entity::Entity;
+
+        let rt = rt();
+        let tok = NamespaceToken::local();
+        let shared_id = Uuid::parse_str("ddeeff11-2222-4000-8000-000000000002").unwrap();
+
+        // entities and notes are the first two tables scanned inside
+        // resolve_prefix_inner — the same UUID in both must not trip the
+        // mid-scan `matches.len() > 1` break as if two distinct UUIDs had
+        // been found.
+        let mut entity = Entity::new("local", "concept", "Nvk749bEntity");
+        entity.id = shared_id;
+        rt.entities(&tok)
+            .unwrap()
+            .upsert_entity(entity)
+            .await
+            .unwrap();
+
+        let mut note = Note::new("local", "observation", "nvk749b note with the same id");
+        note.id = shared_id;
+        rt.notes(&tok).unwrap().upsert_note(note).await.unwrap();
+
+        let resolved = rt
+            .resolve_prefix(&tok, "ddeeff11")
+            .await
+            .expect("#749: deduped early-exit must not falsely report ambiguity");
+        assert_eq!(resolved, Some(shared_id));
     }
 
     // ---- Event resolution tests (issue #30) ----
