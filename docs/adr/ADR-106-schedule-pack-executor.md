@@ -12,8 +12,13 @@ The `khive-pack-schedule` crate stores scheduling intent only. Its own module
 documentation is explicit about the boundary: "Trigger evaluation is NOT performed by
 the pack — the pack only stores intent." The pack exposes four verbs
 (`schedule.remind`, `schedule.schedule`, `schedule.agenda`, `schedule.cancel`), all of
-which read or write a `scheduled_event` note. Nothing in the pack itself ever
-transitions a `scheduled_event` past `"pending"`.
+which read or write a `scheduled_event` note. The pack does not evaluate `trigger_at`,
+claim rows for firing, dispatch payloads, or transition a due row to `firing` or
+`fired`; that is the drain's job, described next. `schedule.cancel` is the one
+exception to "stores intent only": it does transition a row it owns, from `pending` to
+`cancelled` (`crates/khive-pack-schedule/src/handlers.rs`, `cancel_pending_event`), via
+a conditional CAS update guarded by `status = 'pending'` so a concurrent fire can never
+be clobbered by a stale cancel.
 
 A separate, already-shipped component performs the actual firing: `kkernel exec
 --pending-events` (`crates/kkernel/src/pending_events.rs`, entry point
@@ -118,16 +123,79 @@ The schedule tick is a new background task, `schedule_tick_loop`, spawned from
 existing warm-up and checkpoint-task spawns, using the same unconditional
 daemon-boot block (this code path runs exactly once per live daemon process, never per
 MCP client). It follows the checkpoint task's loop shape: a `tokio::time::interval`
-tick, `MissedTickBehavior::Skip`, and a `strong_count`-based shutdown check consistent
-with the existing task rather than introducing a second shutdown-signaling mechanism.
+tick and `MissedTickBehavior::Skip`.
 
-### 2. In-process refactor of the drain, not a subprocess shell-out
+Neither the warm-up spawn nor the checkpoint-task spawn retains a `JoinHandle`
+(`run_daemon_with_boot_guard` fires both with a bare `tokio::spawn` and drops the
+handle), and neither is aborted at any teardown point: `drain()` (the function that
+runs between the accept-loop/shutdown-signal `select!` and socket/PID cleanup) only
+awaits tasks registered through `track_background_task` (per-connection handlers), not
+these two boot-time spawns. Shutdown for `run_checkpoint_task` is therefore
+self-detected: it checks `Arc::strong_count(&pool) <= 1` on every tick and exits its
+loop once it is the sole remaining holder of the `Arc<ConnectionPool>` the daemon
+passed it (`crates/khive-db/src/checkpoint.rs`).
 
-Two options were available for how the tick invokes the drain: (a) refactor
-`run_pending_events` (and the functions it calls: `discover_pending_namespaces`,
-`claim_pending_event`, `dispatch_action`, `finalize_fired_event`,
-`reclaim_stale_firing_events`) to operate against a runtime/server handle supplied by
-the caller instead of one it constructs itself, or (b) leave the drain's CLI-only
+`schedule_tick_loop` follows the same self-terminating shape, counting the identical
+underlying pool rather than introducing a second owner: it receives its own clone of
+the `Arc<ConnectionPool>` obtained from `dispatcher.pool_for_checkpoint()`. Because two
+independent tasks now each hold one long-lived clone of that `Arc`, the floor once every
+other holder (the daemon's own dispatcher instance, every per-connection dispatcher
+clone) has dropped is two, not one. `run_checkpoint_task`'s existing `<= 1` threshold is
+unchanged for its own clone; `schedule_tick_loop` reads the count against the same
+floor-plus-one shape a second self-terminating consumer requires, exiting once it
+observes only itself and (at most) the checkpoint task's own clone still outstanding.
+This is implementation detail for whoever lands the tick loop, not a new public API: no
+additional field or accessor is added to `DaemonDispatch` beyond the existing
+`pool_for_checkpoint`. A dispatcher whose `pool_for_checkpoint` returns `None` (an
+in-memory or test dispatcher with no persistent schedule store to drain) does not get a
+`schedule_tick_loop` spawned at all, mirroring the existing
+`if let Some(pool) = ...` guard around the checkpoint-task spawn; the daemon logs one
+warn-level line at boot noting the tick was skipped for that reason.
+
+### 2. Executor seam: a new `DaemonDispatch` trait method, drain moved to `khive-mcp`
+
+`run_daemon_with_boot_guard` only ever calls through the generic `D: DaemonDispatch`
+bound (`crates/khive-runtime/src/daemon.rs`); it has no dependency on `khive-mcp` or
+`kkernel` and this ADR does not add one. The seam is therefore a new method on
+`DaemonDispatch` itself, alongside the existing `pool_for_checkpoint` /
+`event_store_for_checkpoint` hooks:
+
+```rust
+async fn drain_pending_events(&self) -> DrainSummary;
+```
+
+returning a per-pass summary (scanned/fired/advanced/failed/reclaimed counts, the same
+shape `run_pending_events` already returns today). `schedule_tick_loop` calls this
+method through the trait; it never references `khive-mcp` or `kkernel` types directly.
+
+`KhiveMcpServer` (`crates/khive-mcp`) implements the method. The drain's internal
+functions (`discover_pending_namespaces`, `claim_pending_event`, `dispatch_action`,
+`finalize_fired_event`, `reclaim_stale_firing_events`, and the `run_pending_events`
+orchestration that calls them) move from `crates/kkernel/src/pending_events.rs` into
+`khive-mcp`, adjacent to `dispatch_request_local` (`crates/khive-mcp/src/server.rs`),
+which `dispatch_action` already requires to replay a stored op through the live
+registry. `kkernel exec --pending-events` becomes a thin CLI wrapper: it constructs its
+`RuntimeConfig` / `KhiveRuntime` / `KhiveMcpServer` exactly as it does today (a
+CLI-owned, one-shot construction, unchanged), then calls
+`server.drain_pending_events()`, the same method the daemon tick calls on its own
+long-lived server. CLI behavior and output are unchanged; only the drain logic's home
+crate moves.
+
+Dependency direction is unaffected by this move: `khive-runtime` gains only the new
+trait method signature on `DaemonDispatch`, no new crate dependency (it depends on
+`khive-db` and `khive-storage` today, not on `khive-mcp` or `khive-request`).
+`khive-mcp` already depends on `khive-runtime` and `khive-request`
+(`crates/khive-mcp/Cargo.toml`), so implementing the trait and hosting the drain
+functions there introduces no new edge. `kkernel` already depends on both
+`khive-runtime` and `khive-mcp` (`crates/kkernel/Cargo.toml`), so its thin wrapper
+continues to compile unchanged. No cycle is introduced in either direction.
+
+### 3. In-process refactor of the drain, not a subprocess shell-out
+
+Two options were available for how the tick invokes the drain: (a) move the drain
+functions into `khive-mcp` behind the `drain_pending_events` trait method described in
+Decision point 2, so both the daemon tick and the CLI call the same in-process
+implementation against a live `KhiveMcpServer`, or (b) leave the drain's CLI-only
 signature untouched and have the tick task shell out to `kkernel exec
 --pending-events` as a subprocess on each interval.
 
@@ -139,10 +207,11 @@ functions currently assume they own their `KhiveRuntime`/`KhiveMcpServer`) but s
 the daemon's live registry and connection pool, matching the same reuse ADR-049 already
 established for every other daemon-resident operation. The drain's CLI entry point
 (`kkernel exec --pending-events`) keeps its current signature and behavior; the refactor
-is additive (a new code path shares the underlying claim/dispatch/finalize logic), not a
-breaking change to the CLI.
+is additive (a new code path, the daemon tick, shares the underlying
+claim/dispatch/finalize logic through the moved implementation), not a breaking change
+to the CLI.
 
-### 3. `is_daemon_role` gating
+### 4. `is_daemon_role` gating
 
 `schedule_tick_loop` is spawned only from the daemon boot path
 (`run_daemon_with_boot_guard`), which by construction runs once per live `khived`
@@ -153,29 +222,37 @@ Code session (or per agent) must never independently start a recurring backgroun
 against the shared database, or every live client re-runs the same periodic work
 concurrently.
 
-### 4. External cron stays supported, and redundant invocation is safe by construction
+### 5. External cron stays supported, and redundant invocation is safe by construction
 
 `kkernel exec --pending-events` is not removed or deprecated by this ADR. An operator
 who has cron invoking it continues to work correctly with the daemon tick running at
 the same time: the drain's claim step is a `pending → firing` conditional `UPDATE ...
 WHERE status = 'pending'`. Two concurrent callers, the daemon tick and an external cron
 invocation, racing the same row resolve cleanly: exactly one claims it, the other's
-conditional update affects zero rows and it moves on. This is the same CAS property
-that already lets the drain's own reclaim sweep and a fresh claim race safely, and is
-covered by the existing regression suite (`fire_claim_wins_race_against_concurrent_cancel`
-and the stale-claimant tests). No additional locking or coordination between the tick
-and external cron is required or added.
+conditional update affects zero rows and it moves on. The underlying CAS mechanism is
+exercised by the existing regression suite (`fire_claim_wins_race_against_concurrent_cancel`
+and the stale-claimant tests), which cover fire-claim-versus-cancel and stale-finalize-
+after-reclaim respectively; neither exercises two concurrent drain callers racing the
+same row, which is why Acceptance Criterion 2 requires a new test for that specific
+case. No additional locking or coordination between the tick and external cron is
+required or added.
 
-### 5. Interval: configurable, default 60 seconds
+### 6. Interval: configurable, default 60 seconds
 
-The tick interval is read from configuration with an environment override, defaulting
-to 60 seconds, matching the cadence the drain's own module documentation already
-recommends for cron-based invocation (`* * * * * kkernel exec --pending-events`). A
-60-second default keeps scheduled-event latency in the same ballpark operators would
-get from a standard cron minute-tick, without requiring cron to be configured at all in
-a daemon-fronted deployment.
+The tick interval is read from a single environment variable,
+`KHIVE_SCHEDULE_TICK_INTERVAL_MS`, mirroring `KHIVE_CHECKPOINT_INTERVAL_MS`
+(`crates/khive-db/src/checkpoint.rs`) in shape: milliseconds, env-only for v1 (no
+`khive.toml` key), default 60000 (60 seconds) when unset. An unparseable or zero value
+falls back to the default, with a warn-level log naming the rejected value: a stricter
+failure mode than the checkpoint precedent, which falls back silently. This ADR chooses
+to log because a misconfigured schedule interval is user-facing latency,
+not an internal tuning knob. The 60-second default matches the cadence the drain's own
+module documentation already recommends for cron-based invocation
+(`* * * * * kkernel exec --pending-events`), keeping scheduled-event latency in the
+same ballpark operators would get from a standard cron minute-tick, without requiring
+cron to be configured at all in a daemon-fronted deployment.
 
-### 6. Repeat-advance semantics are unchanged
+### 7. Repeat-advance semantics are unchanged
 
 This ADR does not alter how the drain advances `trigger_at` for repeating events. Named
 aliases (`daily` / `weekly` / `monthly`) continue to be computed from the row's own
@@ -193,17 +270,23 @@ unaffected by this ADR.
    advanced `trigger_at` for a repeating event), and `fired_at` is set.
 2. A concurrent external `kkernel exec --pending-events` invocation racing the daemon
    tick against the same row results in exactly one fire, never zero and never two,
-   verified by a new concurrent-tick regression test alongside the existing CAS race
-   tests in `pending_events.rs`.
+   verified by a new concurrent-drain regression test alongside the existing CAS race
+   tests co-located with the moved drain logic in `khive-mcp`.
 3. No MCP client process (a stdio `kkernel mcp` session without `--daemon`) spawns a
    schedule tick, verified the same way the existing `is_daemon_role_false_for_client_args`
    /`is_daemon_role_true_for_daemon_args` tests verify the email-channel gate.
-4. The tick interval is overridable via environment configuration and defaults to 60
-   seconds when unset.
-5. Stopping the daemon stops the tick loop cleanly, following the same shutdown
-   detection the checkpoint task already uses.
+4. The tick interval is overridable via `KHIVE_SCHEDULE_TICK_INTERVAL_MS` and defaults
+   to 60000 (60 seconds) when unset, unparseable, or zero.
+5. Stopping the daemon stops the tick loop, converging on the same
+   `Arc::strong_count`-based self-termination the checkpoint task already uses against
+   `dispatcher.pool_for_checkpoint()`; a dispatcher with no checkpoint pool never spawns
+   the tick.
 6. `kkernel exec --pending-events` continues to work unchanged as a standalone,
-   cron-invocable one-shot drain.
+   cron-invocable one-shot drain, now implemented as a thin wrapper calling
+   `DaemonDispatch::drain_pending_events` on a CLI-constructed `KhiveMcpServer`.
+7. `khive-runtime` compiles with no new crate dependency after the `DaemonDispatch`
+   trait gains `drain_pending_events`; `cargo tree -p khive-runtime` shows no edge to
+   `khive-mcp`, `khive-request`, or `kkernel`.
 
 ## Alternatives Considered
 
@@ -218,7 +301,7 @@ unaffected by this ADR.
    mechanism: it requires every operator to separately provision a cron entry (or
    equivalent scheduler) outside khive itself, which is an easy step to miss and leaves
    scheduled events silently stuck with no in-product signal. External cron remains
-   supported as a redundant fallback (Decision point 4), not the sole mechanism.
+   supported as a redundant fallback (Decision point 5), not the sole mechanism.
 3. **Gate the tick behind `serve.rs`'s `spawn_email_channel_loops_if_daemon` call site
    instead of `daemon.rs`.** Both entry points converge on `run_daemon_with_boot_guard`
    for `--daemon` mode, so either location is defensible. `daemon.rs` was chosen because
