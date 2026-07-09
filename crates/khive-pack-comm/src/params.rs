@@ -71,9 +71,12 @@ pub(crate) struct ThreadParams {
     #[serde(default)]
     pub order: Option<String>,
     /// Cursor: a message id (short prefix or full UUID) or an RFC 3339
-    /// timestamp. When present, only messages strictly after that point in
-    /// time are returned, enabling incremental polling without re-fetching
-    /// history.
+    /// timestamp. Id cursors compare on the total order `(created_at,
+    /// full_id)` so equal-timestamp messages are never skipped or duplicated;
+    /// timestamp cursors are parsed (any valid RFC 3339 form) rather than
+    /// string-compared. "After" is relative to the chosen `order` (for
+    /// `desc`, strictly older in the descending sequence). An unparseable or
+    /// unresolvable cursor is an error, never silently ignored.
     #[serde(default)]
     pub after: Option<String>,
 }
