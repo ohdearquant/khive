@@ -1,6 +1,6 @@
 # ADR-085: Code Pack — Source-Code Ontology and Audit-Finding Vocabulary
 
-**Status**: Proposed\
+**Status**: Accepted\
 **Date**: 2026-07-03\
 **Authors**: khive maintainers
 **Depends on**: ADR-001 (Entity Kind Taxonomy — `entity_type` subtype registration), ADR-002
@@ -497,3 +497,138 @@ Whole-document validation runs before any record construction (all-or-nothing).
 The `findings.json` schema and producer contract are to be committed in-repo so the
 ingest consumer and its input contract live in one place. Producer tooling itself
 is out of scope for this repository.
+
+## Amendment 2 (2026-07-09): code.ingest verb + acceptance
+
+The base text left the Scanner/Extractor pipeline over the D2-D3 vocabulary as
+"separate ADR-069-layer work" and explicitly out of scope. That pipeline now has a
+design. This amendment specifies it as a single new verb, `code.ingest`, and closes
+the ADR to Accepted.
+
+### B1: One new verb, `code.ingest(path, db?, languages?)`
+
+The pack gains exactly one verb, following the precedent set by the git pack's
+single `git.digest` verb for a comparable bulk-intake surface. Signature:
+`code.ingest(path, db?, languages?=auto)`.
+
+- `path` is a folder, not necessarily a repository root. Monorepo subtree ingest
+  (a single crate, a single package directory) is first-class, not a special case
+  of whole-repo ingest.
+- `languages` defaults to automatic detection from manifest files
+  (`Cargo.toml`, `pyproject.toml`, `package.json`, Lean project files) and file
+  extensions under `path`; callers may pass an explicit language list to skip
+  detection or restrict scope.
+- `db` targets the destination database (see B7); it defaults to a workspace map
+  database, not the shared production graph.
+
+### B2: Pipeline shape
+
+The pipeline follows the Scanner/Extractor split from ADR-069: one Scanner per
+source language performs syntax-level parsing only, and a single Extractor,
+shared across all languages, maps Scanner output into this ADR's D2 subtypes and
+D3 edge rules. The Extractor is ontology-driven and source-blind: it has no
+per-language branching, only per-Scanner-output-shape adapters feeding one
+mapping table.
+
+Scanners are syntax-only in v1: no type-checking and no compilation. A
+declaration's doc comment is transcribed verbatim into its `description`
+property when present (ADR-069 D5, "transcribe, do not invent"); nothing is
+synthesized. Scanner sequencing, in delivery order: Rust (`syn`), Python
+(`rustpython-parser`), TypeScript (`oxc`), then Lean. The Lean scanner performs
+statement-text structural parsing; `structure`-level `extends` relationships
+require environment metadata that a syntax-only parse does not have, so that
+edge kind is an explicit boundary deferred past v1, consistent with this ADR's
+D3 finding that some relations need more than AST structure to resolve.
+
+### B3: Tiers
+
+Ingest proceeds in three tiers of increasing cost and completeness, each usable
+independently of the ones after it:
+
+- **L1 (manifest edges).** Pure manifest parsing (`Cargo.toml`, `pyproject.toml`,
+  `package.json`) yields `project depends_on project` edges with
+  `dependency_kind`, using the base endpoint contract's already-legal triple.
+  Requires no Scanner and covers every language with a package manifest.
+- **L1.5 (import-scan edges).** A regex-based import scan produces
+  module-to-module and project-to-project `depends_on` edges. This is the
+  coverage floor for a language that has no Scanner yet, and doubles as the
+  signal for which language to build a Scanner for next.
+- **L2 (symbol tier).** The full Scanner/Extractor pipeline (B2) over the D2
+  subtypes and D3 edge rules, at declaration granularity.
+
+### B4: Identity and idempotency
+
+Symbol identity is `uuid5` over `(source_project, module_path, name, kind)`,
+where `kind` is one of the four canonical D2 tokens (never an alias). A
+secondary `content_hash` property (a hash of the declaration body) detects
+changed-versus-unchanged content independently of identity. Because identity is
+derived from these fields rather than assigned per call, re-ingesting the same
+path is idempotent: the same declarations produce the same entity and edge
+identities, and repeated ingests do not accumulate duplicate rows. Ingesters
+write the canonical D2 tokens only; the alias-capture hazard documented in D2
+applies identically here.
+
+### B5: Staleness
+
+Ingest performs no automatic deletion. An entity absent from the most recent
+sweep of its source path receives a `properties.last_seen_at` stamp; whether a
+query surfaces it is a view-layer filtering decision, not a data-layer one
+(khive's data-versus-view principle: showing only current state is always a
+query concern, never a reason to delete, mutate, or transfer stored data).
+
+### B6: Cross-repo resolution
+
+An import specifier that names a project not yet ingested (a dependency on a
+crate or package that has not itself been scanned) does not fail the ingest.
+The specifier is recorded on the source entity as an unresolved reference, and
+within-source-project edges land normally. Resolution runs as a re-resolve pass:
+after any repository is ingested, previously recorded unresolved specifiers
+across the target database are replayed against the now-known symbol keys. This
+is the v1 mechanism; a deferred-edge queue that replays only the pending
+references relevant to a specific just-ingested project is a documented, more
+scalable v2 alternative once the number of interlinked repositories grows large
+enough that repeated full-database replay becomes costly.
+
+Once materialized, a cross-repository edge is an ordinary edge: repository
+provenance is carried as a `properties.source` value on the entity, not as a
+namespace distinction, so cross-repository and within-repository edges share
+the same relation semantics and query surface.
+
+### B7: Target database posture
+
+This amendment restates and does not relax the D6.1 granularity fence.
+Exhaustive, whole-repository symbol and call graphs are large by construction
+(comparable in scale to other Subject-scale ingests this codebase already
+supports) and target dedicated map databases via the existing direct-build
+path, not the shared production graph. Promoting a curated slice, such as the
+symbols and modules an agent's work has actually referenced, into the shared
+production database remains a separate, explicit, human-directed act. Ingest
+itself never performs that promotion automatically. `code.ingest`'s `db`
+parameter defaults to a workspace map database for this reason; pointing it at
+the production database is an explicit caller choice, not a default path.
+
+### B8: Acceptance
+
+An implementation of this amendment is acceptance-tested against two
+properties, both expressible as ordinary queries against the shared query
+surface (`neighbors` / `traverse` / `query`) with no additional tooling:
+
+1. **Codeflow parity**, per ingested repository:
+   - blast radius: a reverse, depth-bounded `depends_on` traversal from a named
+     symbol returns its callers;
+   - circular dependencies: a depth-bounded, self-returning `depends_on`
+     pattern at module level is detectable;
+   - dead symbols: the set of functions, datatypes, and interfaces with zero
+     incoming `depends_on` edges is listable (scoped to callers present in the
+     ingested set).
+2. **Cross-repository order independence**: ingesting two related repositories
+   in either order converges to the identical final edge set once both ingests
+   and any pending re-resolve pass have completed.
+
+### Explicitly deferred (unchanged from the base text's posture)
+
+Rename detection, the deferred-edge queue (B6's v2 alternative), Lean
+`structure`-level `extends` resolution, additional D2 subtypes beyond the four
+shipped, commit/PR entities, and any type-checked or semantic (as opposed to
+syntactic) extraction remain out of scope for this amendment, consistent with
+D6 and the base text's Alternatives Considered.
