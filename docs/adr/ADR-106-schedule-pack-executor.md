@@ -83,7 +83,12 @@ if let Some(pool) = dispatcher.pool_for_checkpoint() {
 a schedule tick than the one-shot warm-up: it is a genuine interval loop
 (`tokio::time::interval`, `MissedTickBehavior::Skip`) that runs for the daemon's
 lifetime and detects shutdown by checking `Arc::strong_count(&pool) <= 1` on each tick
-rather than a separate cancellation channel.
+rather than a separate cancellation channel. That check does not, however, reflect the
+task's full production ownership graph: `run_daemon_with_boot_guard` also passes
+`run_checkpoint_task` an `event_store` (`crates/khive-runtime/src/daemon.rs:957`), and
+the production `SqlEventStore` retains its own separate clone of the same
+`Arc<ConnectionPool>` in its `pool` field (`crates/khive-db/src/stores/event.rs:37`), a
+clone the `<= 1` check never accounts for.
 
 A second existing pattern establishes the role gate a periodic background loop needs.
 `crates/khive-mcp/src/serve.rs` gates the email-channel poll/outbox loops behind
@@ -135,24 +140,55 @@ self-detected: it checks `Arc::strong_count(&pool) <= 1` on every tick and exits
 loop once it is the sole remaining holder of the `Arc<ConnectionPool>` the daemon
 passed it (`crates/khive-db/src/checkpoint.rs`).
 
-`schedule_tick_loop` follows the same self-terminating shape, counting the identical
-underlying pool rather than introducing a second owner: it receives its own clone of
-the `Arc<ConnectionPool>` obtained from `dispatcher.pool_for_checkpoint()`. Because two
-independent tasks now each hold one long-lived clone of that `Arc`, the floor once every
-other holder (the daemon's own dispatcher instance, every per-connection dispatcher
-clone) has dropped is two, not one. `run_checkpoint_task`'s existing `<= 1` threshold is
-unchanged for its own clone; `schedule_tick_loop` reads the count against the same
-floor-plus-one shape a second self-terminating consumer requires, exiting once it
-observes only itself and (at most) the checkpoint task's own clone still outstanding.
-This is implementation detail for whoever lands the tick loop, not a new public API: no
-additional field or accessor is added to `DaemonDispatch` beyond the existing
-`pool_for_checkpoint`. A dispatcher whose `pool_for_checkpoint` returns `None` (an
-in-memory or test dispatcher with no persistent schedule store to drain) does not get a
-`schedule_tick_loop` spawned at all, mirroring the existing
-`if let Some(pool) = ...` guard around the checkpoint-task spawn; the daemon logs one
-warn-level line at boot noting the tick was skipped for that reason.
+`schedule_tick_loop` does not use a strong-count floor. As the Context section above
+notes, `run_checkpoint_task`'s own `<= 1` check already undercounts its production
+ownership graph (it never accounts for the pool clone parked inside the `event_store`
+it also holds), so copying that mechanism onto a second self-terminating consumer would
+add a second undercounted check on top of one that does not correctly terminate for the
+task it was modeled on. Decision point 1a describes the shutdown mechanism this ADR
+uses instead. Fixing `run_checkpoint_task`'s own undercount is separate follow-on work,
+out of scope here.
 
-### 2. Executor seam: a new `DaemonDispatch` trait method, drain moved to `khive-mcp`
+### 1a. Shutdown: explicit cancellation, not strong-count self-termination
+
+`schedule_tick_loop` is signalled to stop rather than inferring shutdown from a
+reference count. `run_daemon_with_boot_guard` creates a `tokio::sync::watch::channel`
+before spawning the warm-up, checkpoint, and tick tasks, and holds the sender for the
+remainder of the function's scope. `schedule_tick_loop` is given a clone of the
+receiver and `tokio::select!`s between the `tokio::time::interval` tick and a change on
+the watch channel, exiting its loop as soon as the channel reports a change (an
+explicit shutdown signal) or a closed sender (the daemon function returning without
+signalling, e.g. an early error path). The daemon's shutdown sequence, which already
+runs `sigterm`/`sigint` detection into a single `shutdown` future ahead of `drain()`
+(`crates/khive-runtime/src/daemon.rs`, the `run_daemon_with_boot_guard` accept-loop
+`select!`), sends on the watch channel as its first step once that future resolves, and
+then proceeds to `drain()` as it does today. Because the sender lives in
+`run_daemon_with_boot_guard`'s own scope, both an explicit send and the ordinary drop
+at function return are sufficient to signal every receiver, so no separate "did we
+remember to signal" bookkeeping is required for a clean exit path.
+
+`schedule_tick_loop` itself, not a separately tracked `JoinHandle`, is the future passed
+to the existing `track_background_task` helper (`crates/khive-runtime/src/daemon.rs`)
+at spawn time, exactly as pack handlers already register fire-and-forget work today.
+This gives the tick loop the same shutdown-visibility guarantee `track_background_task`
+already provides: `drain()` (called immediately after the accept-loop/shutdown-signal
+`select!` resolves) does not return until the tick loop's future has completed, so a
+`SIGTERM` landing mid-tick cannot abort a drain pass silently the way an untracked
+`tokio::spawn` could. No additional field or accessor is added to `DaemonDispatch`
+beyond the existing `pool_for_checkpoint`, which `schedule_tick_loop` still uses to
+obtain the `Arc<ConnectionPool>` it drains against; the change from the earlier
+revision is the shutdown signal, not the pool wiring. A dispatcher whose
+`pool_for_checkpoint` returns `None` (an in-memory or test dispatcher with no
+persistent schedule store to drain) does not get a `schedule_tick_loop` spawned at all,
+mirroring the existing `if let Some(pool) = ...` guard around the checkpoint-task spawn;
+the daemon logs one warn-level line at boot noting the tick was skipped for that reason.
+
+This ADR does not redesign the existing checkpoint task's shutdown; `run_checkpoint_task`
+keeps its current `Arc::strong_count` check unchanged, and the undercount described
+above is noted here only as further motivation for why the new executor is not built
+the same way, not as a change this ADR makes to the checkpoint task itself.
+
+### 2. Executor seam: a fallible trait method, `DrainSummary`/`DrainError` in `khive-runtime`
 
 `run_daemon_with_boot_guard` only ever calls through the generic `D: DaemonDispatch`
 bound (`crates/khive-runtime/src/daemon.rs`); it has no dependency on `khive-mcp` or
@@ -161,12 +197,34 @@ bound (`crates/khive-runtime/src/daemon.rs`); it has no dependency on `khive-mcp
 `event_store_for_checkpoint` hooks:
 
 ```rust
-async fn drain_pending_events(&self) -> DrainSummary;
+async fn drain_pending_events(&self) -> Result<DrainSummary, DrainError>;
 ```
 
-returning a per-pass summary (scanned/fired/advanced/failed/reclaimed counts, the same
-shape `run_pending_events` already returns today). `schedule_tick_loop` calls this
-method through the trait; it never references `khive-mcp` or `kkernel` types directly.
+`DrainSummary` moves from `crates/kkernel/src/pending_events.rs` into
+`khive-runtime/src/daemon.rs`, defined alongside `DaemonDispatch` itself, carrying all
+seven fields the existing type already has today
+(`crates/kkernel/src/pending_events.rs`): `scanned`, `fired`, `advanced`, `failed`,
+`skipped_not_due`, `skipped_race`, and `reclaimed`. `DrainError` is a new, equally
+runtime-owned error type defined in the same module; a newtype over `String` is
+sufficient for v1 (no variant structure is required yet, so this ADR does not introduce
+one). Moving both types into `khive-runtime` lets the trait name its own return type
+without `khive-runtime` depending on `khive-mcp` or `kkernel` for either type, and
+without either downstream crate depending on the other for them.
+
+`schedule_tick_loop` calls `drain_pending_events` through the trait; it never
+references `khive-mcp` or `kkernel` types directly. The contract distinguishes two
+failure classes:
+
+- **Drain infrastructure failures**: the two steps the current implementation
+  propagates with `?` before any per-event work happens, `reclaim_stale_firing_events`
+  (`crates/kkernel/src/pending_events.rs`, the stale-firing reclaim sweep) and
+  `discover_pending_namespaces` (`crates/kkernel/src/pending_events.rs`, namespace
+  discovery). `KhiveMcpServer`'s implementation maps a failure in either step into
+  `DrainError`, and the whole call returns `Err` for that pass.
+- **Per-event dispatch failures**: a single event's `dispatch_action` or
+  `finalize_fired_event` failing. These are not infrastructure failures: they continue
+  to accumulate in the returned `DrainSummary.failed` counter exactly as they do today,
+  and do not turn the call into an `Err`.
 
 `KhiveMcpServer` (`crates/khive-mcp`) implements the method. The drain's internal
 functions (`discover_pending_namespaces`, `claim_pending_event`, `dispatch_action`,
@@ -178,17 +236,33 @@ registry. `kkernel exec --pending-events` becomes a thin CLI wrapper: it constru
 `RuntimeConfig` / `KhiveRuntime` / `KhiveMcpServer` exactly as it does today (a
 CLI-owned, one-shot construction, unchanged), then calls
 `server.drain_pending_events()`, the same method the daemon tick calls on its own
-long-lived server. CLI behavior and output are unchanged; only the drain logic's home
-crate moves.
+long-lived server, and continues to propagate a returned `DrainError` with `.await?`
+before printing the summary (`crates/kkernel/src/exec.rs`), exactly its current
+`.await?` behavior against `Result<DrainSummary>` today: a one-shot CLI invocation that
+hits a drain infrastructure failure still exits non-zero and prints nothing. CLI
+behavior and output are unchanged; only the drain logic's home crate and the fallible
+type's home crate move.
+
+The daemon tick's handling of `Err(DrainError)` is new behavior this ADR adds:
+`schedule_tick_loop` logs the error at `warn` level, naming the rejected drain pass,
+and continues to its next tick rather than exiting the loop or propagating the error
+further. A transient drain infrastructure failure (for example, one bad SQL
+round-trip during namespace discovery) must not kill the tick loop for the daemon's
+whole remaining lifetime; that is a behavior the one-shot CLI wrapper does not share,
+since a CLI invocation is a fresh process per drain and has no "next tick" to continue
+to.
 
 Dependency direction is unaffected by this move: `khive-runtime` gains only the new
-trait method signature on `DaemonDispatch`, no new crate dependency (it depends on
-`khive-db` and `khive-storage` today, not on `khive-mcp` or `khive-request`).
-`khive-mcp` already depends on `khive-runtime` and `khive-request`
-(`crates/khive-mcp/Cargo.toml`), so implementing the trait and hosting the drain
-functions there introduces no new edge. `kkernel` already depends on both
+trait method signature on `DaemonDispatch` plus the two new types (`DrainSummary`,
+`DrainError`) it now owns, no new crate dependency (it depends on `khive-db` and
+`khive-storage` today, not on `khive-mcp` or `khive-request`). `khive-mcp` already
+depends on `khive-runtime` and `khive-request` (`crates/khive-mcp/Cargo.toml`), so
+implementing the trait, hosting the drain functions, and constructing `DrainSummary` /
+`DrainError` there introduces no new edge. `kkernel` already depends on both
 `khive-runtime` and `khive-mcp` (`crates/kkernel/Cargo.toml`), so its thin wrapper
-continues to compile unchanged. No cycle is introduced in either direction.
+continues to compile unchanged, now matching on a `khive-runtime`-owned `Result` type
+instead of the `kkernel`-owned one it matched on before. No cycle is introduced in
+either direction.
 
 ### 3. In-process refactor of the drain, not a subprocess shell-out
 
@@ -277,10 +351,11 @@ unaffected by this ADR.
    /`is_daemon_role_true_for_daemon_args` tests verify the email-channel gate.
 4. The tick interval is overridable via `KHIVE_SCHEDULE_TICK_INTERVAL_MS` and defaults
    to 60000 (60 seconds) when unset, unparseable, or zero.
-5. Stopping the daemon stops the tick loop, converging on the same
-   `Arc::strong_count`-based self-termination the checkpoint task already uses against
-   `dispatcher.pool_for_checkpoint()`; a dispatcher with no checkpoint pool never spawns
-   the tick.
+5. A production-shaped shutdown regression, built against `KhiveMcpServer` (the real
+   dispatcher, not a mock), demonstrates that stopping the daemon signals the watch
+   channel, the tick loop's `select!` observes the signal and exits promptly, and
+   `drain()` observes the tick loop's tracked future complete before returning; a
+   dispatcher with no checkpoint pool never spawns the tick.
 6. `kkernel exec --pending-events` continues to work unchanged as a standalone,
    cron-invocable one-shot drain, now implemented as a thin wrapper calling
    `DaemonDispatch::drain_pending_events` on a CLI-constructed `KhiveMcpServer`.
