@@ -5956,3 +5956,188 @@ async fn t494_thread_without_new_params_unchanged() {
         .collect();
     assert_eq!(contents, vec!["root", "root", "reply-1", "reply-1"]);
 }
+
+// ── #495: comm.send / comm.reply metadata (tags) passthrough ────────────────
+
+/// `comm.send(tags=[...])` persists the tags into `properties["tags"]` on the
+/// inbound copy, round-tripped via `comm.inbox`.
+#[tokio::test]
+async fn t495_send_tags_roundtrip_via_inbox() {
+    let backend = shared_backend();
+    let (registry_a, _rt_a) = build_actor_registry(backend.clone(), "lambda:a");
+    let (registry_b, _rt_b) = build_actor_registry(backend, "lambda:b");
+
+    registry_a
+        .dispatch(
+            "comm.send",
+            serde_json::json!({
+                "to": "lambda:b",
+                "content": "tagged message",
+                "tags": ["run:abc123", "traffic:agent"],
+            }),
+        )
+        .await
+        .expect("tagged send succeeds");
+
+    let inbox = registry_b
+        .dispatch(
+            "comm.inbox",
+            serde_json::json!({ "status": "all", "limit": 10 }),
+        )
+        .await
+        .expect("inbox succeeds");
+    let messages = inbox["messages"].as_array().expect("messages array");
+    assert_eq!(messages.len(), 1);
+    let tags = messages[0]["properties"]["tags"]
+        .as_array()
+        .expect("tags array present on inbound copy");
+    let tag_strs: Vec<&str> = tags.iter().map(|t| t.as_str().unwrap_or("")).collect();
+    assert_eq!(tag_strs, vec!["run:abc123", "traffic:agent"]);
+}
+
+/// `comm.send(tags=[...])` also persists on the outbound copy, round-tripped
+/// via `comm.read` after resolving the sender's own outbound note.
+#[tokio::test]
+async fn t495_send_tags_present_on_outbound_copy() {
+    let backend = shared_backend();
+    let (registry_a, rt_a) = build_actor_registry(backend, "lambda:a");
+
+    let send_result = registry_a
+        .dispatch(
+            "comm.send",
+            serde_json::json!({
+                "to": "lambda:a",
+                "content": "self-tagged",
+                "tags": ["job:42"],
+            }),
+        )
+        .await
+        .expect("tagged self-send succeeds");
+    let outbound_full_id = send_result["full_id"].as_str().expect("full_id");
+    let outbound_uuid: uuid::Uuid = outbound_full_id.parse().expect("valid uuid");
+
+    let tok = rt_a.authorize(Namespace::parse("local").unwrap()).unwrap();
+    let store = rt_a.notes(&tok).expect("notes store");
+    let note = store
+        .get_note(outbound_uuid)
+        .await
+        .expect("get_note succeeds")
+        .expect("outbound note exists");
+    let tags = note.properties.as_ref().and_then(|p| p.get("tags"));
+    assert_eq!(
+        tags,
+        Some(&serde_json::json!(["job:42"])),
+        "outbound copy must also carry tags"
+    );
+}
+
+/// `comm.reply(tags=[...])` persists tags on the reply's inbound copy.
+#[tokio::test]
+async fn t495_reply_tags_roundtrip_via_inbox() {
+    let backend = shared_backend();
+    let (registry_a, _rt_a) = build_actor_registry(backend.clone(), "lambda:a");
+    let (registry_b, _rt_b) = build_actor_registry(backend, "lambda:b");
+
+    registry_a
+        .dispatch(
+            "comm.send",
+            serde_json::json!({ "to": "lambda:b", "content": "hello" }),
+        )
+        .await
+        .expect("send succeeds");
+
+    let inbox_b = registry_b
+        .dispatch(
+            "comm.inbox",
+            serde_json::json!({ "status": "all", "limit": 10 }),
+        )
+        .await
+        .expect("B inbox succeeds");
+    let b_inbound_id = inbox_b["messages"][0]["full_id"]
+        .as_str()
+        .expect("B inbound full_id");
+
+    registry_b
+        .dispatch(
+            "comm.reply",
+            serde_json::json!({
+                "id": b_inbound_id,
+                "content": "reply with tags",
+                "tags": ["job:reply-1"],
+            }),
+        )
+        .await
+        .expect("tagged reply succeeds");
+
+    let inbox_a = registry_a
+        .dispatch(
+            "comm.inbox",
+            serde_json::json!({ "status": "all", "limit": 10 }),
+        )
+        .await
+        .expect("A inbox succeeds");
+    let a_messages = inbox_a["messages"].as_array().expect("messages array");
+    let reply_msg = a_messages
+        .iter()
+        .find(|m| m["content"] == "reply with tags")
+        .expect("A's inbox contains the tagged reply");
+    let tags = reply_msg["properties"]["tags"]
+        .as_array()
+        .expect("tags array present on reply's inbound copy");
+    let tag_strs: Vec<&str> = tags.iter().map(|t| t.as_str().unwrap_or("")).collect();
+    assert_eq!(tag_strs, vec!["job:reply-1"]);
+}
+
+/// Absent `tags` preserves today's behavior exactly: no `properties["tags"]` key at all.
+#[tokio::test]
+async fn t495_send_without_tags_omits_tags_property() {
+    let backend = shared_backend();
+    let (registry_a, _rt_a) = build_actor_registry(backend.clone(), "lambda:a");
+    let (registry_b, _rt_b) = build_actor_registry(backend, "lambda:b");
+
+    registry_a
+        .dispatch(
+            "comm.send",
+            serde_json::json!({ "to": "lambda:b", "content": "no tags here" }),
+        )
+        .await
+        .expect("send succeeds");
+
+    let inbox = registry_b
+        .dispatch(
+            "comm.inbox",
+            serde_json::json!({ "status": "all", "limit": 10 }),
+        )
+        .await
+        .expect("inbox succeeds");
+    let messages = inbox["messages"].as_array().expect("messages array");
+    assert_eq!(messages.len(), 1);
+    assert!(
+        messages[0]["properties"].get("tags").is_none(),
+        "absent tags must not add a properties.tags key; got {:?}",
+        messages[0]["properties"]
+    );
+}
+
+/// `comm.send` with an unknown top-level field (typo) is still rejected —
+/// `tags` addition must not have loosened `deny_unknown_fields`.
+#[tokio::test]
+async fn t495_send_rejects_unknown_field_alongside_tags() {
+    let (registry, _rt) = build_registry_for_ns("local");
+
+    let result = registry
+        .dispatch(
+            "comm.send",
+            serde_json::json!({
+                "to": "local",
+                "content": "hi",
+                "tags": ["a"],
+                "bogus_field": "typo",
+            }),
+        )
+        .await;
+    assert!(
+        result.is_err(),
+        "unknown field alongside tags must still be rejected; got {result:?}"
+    );
+}

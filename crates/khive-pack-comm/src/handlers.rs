@@ -115,6 +115,7 @@ pub(crate) async fn handle_send(
         Some(&to_actor),
         None,
         None,
+        p.tags.as_deref(),
     )
     .await?;
 
@@ -474,6 +475,7 @@ pub(crate) async fn handle_reply(
         Some(&reply_to_actor),
         in_reply_to_message_id.as_deref(),
         references_chain.as_deref(),
+        p.tags.as_deref(),
     )
     .await?;
 

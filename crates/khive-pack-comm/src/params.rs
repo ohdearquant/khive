@@ -15,6 +15,11 @@ pub(crate) struct SendParams {
     pub subject: Option<String>,
     #[serde(default)]
     pub thread_id: Option<String>,
+    /// Structured provenance tags (e.g. run id, job id, traffic class), persisted
+    /// verbatim to `properties["tags"]` on both the outbound and inbound copies.
+    /// Mirrors the shipped `memory.remember` `tags` precedent (issue #495).
+    #[serde(default)]
+    pub tags: Option<Vec<String>>,
 }
 
 #[derive(Deserialize)]
@@ -44,6 +49,10 @@ pub(crate) struct ReadParams {
 pub(crate) struct ReplyParams {
     pub id: String,
     pub content: String,
+    /// Structured provenance tags, persisted verbatim to `properties["tags"]` on
+    /// both the outbound and inbound copies of the reply (issue #495).
+    #[serde(default)]
+    pub tags: Option<Vec<String>>,
 }
 
 #[derive(Deserialize)]

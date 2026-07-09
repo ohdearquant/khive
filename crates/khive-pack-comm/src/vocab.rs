@@ -65,6 +65,12 @@ pub(crate) static COMM_HANDLERS: [HandlerDef; 9] = [
                 required: false,
                 description: "Optional UUID to group messages into a thread.",
             },
+            ParamDef {
+                name: "tags",
+                param_type: "array of string",
+                required: false,
+                description: "Structured provenance tags (e.g. run id, job id, traffic class), persisted verbatim to `properties[\"tags\"]` on both the outbound and inbound copies.",
+            },
         ],
     },
     HandlerDef {
@@ -128,6 +134,12 @@ pub(crate) static COMM_HANDLERS: [HandlerDef; 9] = [
                 param_type: "string",
                 required: true,
                 description: "Reply body. Must not be empty.",
+            },
+            ParamDef {
+                name: "tags",
+                param_type: "array of string",
+                required: false,
+                description: "Structured provenance tags, persisted verbatim to `properties[\"tags\"]` on both the outbound and inbound copies of the reply.",
             },
         ],
     },
