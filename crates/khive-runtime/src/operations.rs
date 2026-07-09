@@ -2020,26 +2020,50 @@ impl KhiveRuntime {
         Ok(paths)
     }
 
-    /// Batch-query for soft-deleted entity UUIDs in `ids`.
+    /// Batch-query for soft-deleted UUIDs in `ids`, across BOTH the entities
+    /// and notes tables.
     ///
-    /// Returns the subset of `ids` that have `deleted_at IS NOT NULL` in the
-    /// entities table. Takes `Vec<Uuid>` (not an iterator) so the async
-    /// state machine holds only owned data — no iterator borrow across yields.
+    /// Neighbor/traverse candidates can be note-kind nodes (e.g. reached via
+    /// `annotates` edges) as well as entities; the original Fix-2 screen only
+    /// consulted `entities`, so soft-deleted note targets leaked through and
+    /// hydrated as blank/missing hits (#748). This is a view-layer read-only
+    /// screen — it does not touch edges or mutate any data.
+    ///
+    /// Returns the subset of `ids` that have `deleted_at IS NOT NULL` in
+    /// either table. Takes `Vec<Uuid>` (not an iterator) so the async state
+    /// machine holds only owned data — no iterator borrow across yields.
     async fn deleted_entity_ids(&self, ids: Vec<Uuid>) -> std::collections::HashSet<Uuid> {
         if ids.is_empty() {
             return std::collections::HashSet::new();
         }
         let id_strs: Vec<String> = ids.iter().map(|u| u.to_string()).collect();
-        let placeholders = id_strs
-            .iter()
-            .enumerate()
-            .map(|(i, _)| format!("?{}", i + 1))
+        let n = id_strs.len();
+        // Each UNION half gets its OWN numbered-placeholder block (?1..?n for
+        // entities, ?(n+1)..?(2n) for notes) — numbered SQLite params bind by
+        // index, so reusing the same numbers across halves would silently
+        // collapse to a single shared block instead of binding the full list
+        // twice (see khive-db/src/stores/graph.rs batch_neighbors: "each half
+        // is a fully independent positional-parameter block").
+        let entities_placeholders = (0..n)
+            .map(|i| format!("?{}", i + 1))
+            .collect::<Vec<_>>()
+            .join(",");
+        let notes_placeholders = (0..n)
+            .map(|i| format!("?{}", n + i + 1))
             .collect::<Vec<_>>()
             .join(",");
         let sql_str = format!(
-            "SELECT id FROM entities WHERE id IN ({placeholders}) AND deleted_at IS NOT NULL"
+            "SELECT id FROM entities WHERE id IN ({entities_placeholders}) AND deleted_at IS NOT NULL \
+             UNION \
+             SELECT id FROM notes WHERE id IN ({notes_placeholders}) AND deleted_at IS NOT NULL"
         );
-        let params: Vec<SqlValue> = id_strs.into_iter().map(SqlValue::Text).collect();
+        // Same id list bound twice — once per UNION arm's independent placeholder block.
+        let params: Vec<SqlValue> = id_strs
+            .iter()
+            .chain(id_strs.iter())
+            .cloned()
+            .map(SqlValue::Text)
+            .collect();
         let stmt = SqlStatement {
             sql: sql_str,
             params,
@@ -7847,10 +7871,24 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(before.len(), 1);
+        let edge_id = before[0].edge_id;
 
         // Soft delete must NOT cascade edges (data-vs-view principle).
         let deleted = rt.delete_note(&tok, note_target.id, false).await.unwrap();
         assert!(deleted, "soft delete must return true");
+
+        // The edge itself must survive the soft delete — checked at the
+        // storage/edge layer directly (`get_edge`), not through `neighbors()`.
+        // `neighbors()` is a VIEW query and, per #748, now correctly screens
+        // out soft-deleted note targets — so it no longer surfaces this edge
+        // once note_target is soft-deleted, even though the edge row itself
+        // is untouched (data-vs-view principle: the edge is data, what
+        // `neighbors()` shows is a view decision).
+        let edge_after = rt.get_edge(&tok, edge_id).await.unwrap();
+        assert!(
+            edge_after.is_some(),
+            "soft delete must NOT cascade edges; get_edge returned None"
+        );
 
         let after = rt
             .neighbors(
@@ -7864,8 +7902,8 @@ mod tests {
             .unwrap();
         assert_eq!(
             after.len(),
-            1,
-            "soft delete must NOT cascade edges; got {after:?}"
+            0,
+            "#748: neighbors() must screen out the soft-deleted note target; got {after:?}"
         );
     }
 

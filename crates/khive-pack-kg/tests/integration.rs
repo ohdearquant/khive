@@ -3447,6 +3447,172 @@ async fn traverse_excludes_soft_deleted_entity() {
     );
 }
 
+// ---- #748: neighbors() must also screen soft-deleted NOTE targets ----
+
+/// #748: a soft-deleted note reached via an `annotates` edge must not appear
+/// in `neighbors()`. The original Fix-2 screen (`deleted_entity_ids`) only
+/// queried the `entities` table, so a soft-deleted note-kind neighbor leaked
+/// through. View-layer only — no edges are touched, no data is mutated.
+#[tokio::test]
+async fn neighbors_excludes_soft_deleted_note() {
+    let pack = pack();
+
+    let entity = pack
+        .dispatch(
+            "create",
+            json!({"kind": "entity", "name": "Nvk748Target", "entity_kind": "concept"}),
+        )
+        .await
+        .expect("create entity must succeed");
+    let entity_id = entity
+        .get("id")
+        .and_then(Value::as_str)
+        .unwrap()
+        .to_string();
+
+    // Annotating note: creates a note --annotates--> entity edge.
+    let note = pack
+        .dispatch(
+            "create",
+            json!({
+                "kind": "note",
+                "content": "nvk748 note that will be soft-deleted",
+                "annotates": [entity_id.clone()],
+            }),
+        )
+        .await
+        .expect("create annotating note must succeed");
+    let note_id = note.get("id").and_then(Value::as_str).unwrap().to_string();
+
+    // A second, non-deleted annotating note — must remain visible after the
+    // first note is soft-deleted (regression: the fix must not over-filter).
+    let live_note = pack
+        .dispatch(
+            "create",
+            json!({
+                "kind": "note",
+                "content": "nvk748 note that stays alive",
+                "annotates": [entity_id.clone()],
+            }),
+        )
+        .await
+        .expect("create second annotating note must succeed");
+    let live_note_id = live_note
+        .get("id")
+        .and_then(Value::as_str)
+        .unwrap()
+        .to_string();
+
+    // Before delete: both notes are visible as incoming neighbors of the entity.
+    let before = pack
+        .dispatch(
+            "neighbors",
+            json!({"node_id": entity_id, "direction": "in"}),
+        )
+        .await
+        .expect("neighbors (pre-delete) must succeed");
+    let before_ids: Vec<&str> = before
+        .as_array()
+        .expect("neighbors must be array")
+        .iter()
+        .filter_map(|v| v.get("id").and_then(Value::as_str))
+        .collect();
+    assert!(
+        before_ids.iter().any(|&id| id == note_id),
+        "#748 setup: note must appear as a neighbor before delete; ids={before_ids:?}"
+    );
+    assert!(
+        before_ids.iter().any(|&id| id == live_note_id),
+        "#748 setup: live_note must appear as a neighbor before delete; ids={before_ids:?}"
+    );
+
+    // Soft-delete the first note.
+    pack.dispatch("delete", json!({"id": note_id, "kind": "note"}))
+        .await
+        .expect("delete note must succeed");
+
+    let after = pack
+        .dispatch(
+            "neighbors",
+            json!({"node_id": entity_id, "direction": "in"}),
+        )
+        .await
+        .expect("neighbors (post-delete) must succeed");
+    let after_ids: Vec<&str> = after
+        .as_array()
+        .expect("neighbors must be array")
+        .iter()
+        .filter_map(|v| v.get("id").and_then(Value::as_str))
+        .collect();
+    assert!(
+        !after_ids.iter().any(|&id| id == note_id),
+        "#748: soft-deleted note must not appear in neighbors(); ids={after_ids:?}"
+    );
+    assert!(
+        after_ids.iter().any(|&id| id == live_note_id),
+        "#748: non-deleted note must still appear in neighbors(); ids={after_ids:?}"
+    );
+}
+
+/// #748 regression guard: the pre-existing entity-only soft-delete screen
+/// (Fix 2) must keep working after extending `deleted_entity_ids` to also
+/// cover notes.
+#[tokio::test]
+async fn neighbors_still_excludes_soft_deleted_entity_after_note_fix() {
+    let pack = pack();
+
+    let alive = pack
+        .dispatch(
+            "create",
+            json!({"kind": "entity", "name": "Nvk748AliveEntity", "entity_kind": "concept"}),
+        )
+        .await
+        .expect("create alive must succeed");
+    let alive_id = alive.get("id").and_then(Value::as_str).unwrap().to_string();
+
+    let deleted = pack
+        .dispatch(
+            "create",
+            json!({"kind": "entity", "name": "Nvk748DeletedEntity", "entity_kind": "concept"}),
+        )
+        .await
+        .expect("create deleted must succeed");
+    let deleted_id = deleted
+        .get("id")
+        .and_then(Value::as_str)
+        .unwrap()
+        .to_string();
+
+    pack.dispatch(
+        "link",
+        json!({"source_id": alive_id, "target_id": deleted_id, "relation": "contains"}),
+    )
+    .await
+    .expect("link must succeed");
+
+    pack.dispatch("delete", json!({"id": deleted_id, "kind": "entity"}))
+        .await
+        .expect("delete must succeed");
+
+    let neighbors = pack
+        .dispatch(
+            "neighbors",
+            json!({"node_id": alive_id, "direction": "out"}),
+        )
+        .await
+        .expect("neighbors must succeed");
+    let ids: Vec<&str> = neighbors
+        .as_array()
+        .expect("neighbors must be array")
+        .iter()
+        .filter_map(|v| v.get("id").and_then(Value::as_str))
+        .collect();
+    assert!(
+        !ids.iter().any(|&id| id == deleted_id),
+        "#748 regression: soft-deleted entity must still be excluded; ids={ids:?}"
+    );
+}
+
 // ---- K-C1: link response preserves caller source/target for symmetric relations ----
 
 /// K-C1 regression: for `competes_with` (symmetric), the runtime canonicalises
