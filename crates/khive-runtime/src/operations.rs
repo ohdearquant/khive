@@ -3479,6 +3479,13 @@ impl KhiveRuntime {
             event_store.append_event(event).await.map_err(|e| {
                 RuntimeError::Internal(format!("delete_note: event store write failed: {e}"))
             })?;
+            // #750 fix-round 1: a soft OR hard delete removes the note's
+            // vectors/FTS document above — any pack-owned vector-derived
+            // cache (e.g. khive-pack-memory's warm ANN index) needs to know
+            // the corpus changed, reached via this generic hook so
+            // khive-runtime never takes a dependency on khive-pack-memory.
+            // No-op when no pack has installed a hook.
+            self.fire_note_mutation_hook(&note.kind, id).await;
         }
         Ok(deleted)
     }

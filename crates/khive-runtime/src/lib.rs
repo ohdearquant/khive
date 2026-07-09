@@ -96,7 +96,7 @@ pub use retrieval::{SearchHit, SearchSource};
 pub use runtime::{
     assert_db_anchor_consistent, parse_pack_list, resolve_db_anchor, resolve_project_actor_id,
     runtime_config_from_khive_config, BackendId, EntityTypeValidatorFn, KhiveRuntime,
-    NamespaceToken, RuntimeConfig,
+    NamespaceToken, NoteMutationHookFn, RuntimeConfig,
 };
 pub use secret_gate::SecretMatch;
 pub use validation::{

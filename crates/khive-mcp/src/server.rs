@@ -336,6 +336,11 @@ impl KhiveMcpServer {
         // entity-type validation is active at the runtime layer for all write
         // paths, including direct `create_many` callers that bypass the handler.
         registry.call_register_entity_type_validators(&runtime);
+        // #750 fix-round 1: install pack-owned note-mutation hooks (currently
+        // only khive-pack-memory's warm-ANN-cache invalidation) so KG's
+        // update/delete verbs notify caching packs even though there is no
+        // crate-level dependency between them.
+        registry.call_register_note_mutation_hooks(&runtime);
         // Apply pack-auxiliary schema plans at startup so pack tables are
         // present before any handler runs. Errors are logged but not propagated
         // so a single pack's schema failure cannot abort startup.

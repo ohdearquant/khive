@@ -203,6 +203,22 @@ pub trait PackRuntime: Send + Sync {
     /// is the correct behaviour for bare runtimes without packs.
     fn register_entity_type_validator(&self, _runtime: &KhiveRuntime) {}
 
+    /// Install a pack-owned note-mutation hook on the runtime (#750 fix-round 1).
+    ///
+    /// Called by the transport during pack initialisation, after the registry
+    /// is built and before the first verb dispatch — same timing as
+    /// `register_entity_type_validator`. Packs that cache derived state keyed
+    /// by note content (e.g. `khive-pack-memory`'s warm ANN index) should
+    /// override this to install a hook via `KhiveRuntime::install_note_mutation_hook`,
+    /// so `update_note`/`delete_note` notify them even when the mutation
+    /// arrived through a different pack's verb that has no dependency on the
+    /// reacting pack (e.g. KG's `update`/`delete` on a `kind="memory"` note).
+    ///
+    /// The default no-op leaves the runtime hook absent (skip-when-None),
+    /// which is the correct behaviour for packs that don't cache note-derived
+    /// state and for bare runtimes without packs.
+    fn register_note_mutation_hook(&self, _runtime: &KhiveRuntime) {}
+
     /// Warm up any in-memory state from persisted snapshots (optional).
     ///
     /// Called by the transport after all packs are registered but before
@@ -1531,6 +1547,23 @@ impl VerbRegistry {
     pub fn call_register_entity_type_validators(&self, runtime: &KhiveRuntime) {
         for pack in self.packs.iter() {
             pack.register_entity_type_validator(runtime);
+        }
+    }
+
+    /// Invoke `PackRuntime::register_note_mutation_hook` on every registered pack
+    /// (#750 fix-round 1).
+    ///
+    /// Called by the transport during startup, after the registry is built and
+    /// before the first verb dispatch, so that note-mutation notifications at
+    /// the runtime layer are active for all write paths — including KG's
+    /// `update`/`delete` verbs reaching a `kind="memory"` note, which have no
+    /// crate-level dependency on `khive-pack-memory`.
+    ///
+    /// Packs whose `register_note_mutation_hook` is the default no-op pay no
+    /// overhead.
+    pub fn call_register_note_mutation_hooks(&self, runtime: &KhiveRuntime) {
+        for pack in self.packs.iter() {
+            pack.register_note_mutation_hook(runtime);
         }
     }
 

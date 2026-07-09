@@ -669,6 +669,13 @@ impl KhiveRuntime {
 
         if text_changed {
             self.reindex_note(token, &note).await?;
+            // #750 fix-round 1: text_changed means the note's embedding was
+            // just reindexed, which any pack-owned vector-derived cache
+            // (e.g. khive-pack-memory's warm ANN index) needs to know about —
+            // reached via this generic hook so khive-runtime/khive-pack-kg
+            // never take a dependency on khive-pack-memory. No-op when no
+            // pack has installed a hook.
+            self.fire_note_mutation_hook(&note.kind, note.id).await;
         }
 
         Ok(note)

@@ -6,6 +6,7 @@ use serde_json::{json, Value};
 use khive_runtime::{NamespaceToken, RuntimeError};
 use khive_storage::types::{DeleteMode, SqlStatement, SqlValue};
 
+use crate::ann;
 use crate::MemoryPack;
 
 // ── Params ────────────────────────────────────────────────────────────────────
@@ -132,6 +133,24 @@ impl MemoryPack {
         for id in to_delete {
             if note_store.delete_note(id, DeleteMode::Soft).await? {
                 pruned += 1;
+            }
+        }
+
+        // #750 fix-round 1: `note_store.delete_note` above is the raw
+        // `NoteStore` capability — it bypasses `KhiveRuntime::delete_note`'s
+        // orchestration entirely (no FTS/vector cleanup, no note-mutation
+        // hook fire), so it does NOT go through the generic hook wired into
+        // `update_note`/`delete_note` for KG's delete path. Prune is inside
+        // the same crate as `ann`, so it invalidates/bumps directly, mirroring
+        // `memory.remember`'s own write-path pattern in `remember.rs`. The
+        // resulting cache miss forces a rebuild whose corpus scan already
+        // filters `deleted_at IS NULL` (`ann.rs`), so the just-pruned rows
+        // are correctly excluded from the rebuilt index.
+        if pruned > 0 {
+            ann::invalidate_namespace(&self.runtime, &self.ann, &namespace).await;
+            for model in self.runtime.registered_embedding_model_names() {
+                let key = ann::AnnKey::new(namespace.as_str(), model.as_str());
+                ann::bump_generation(&self.ann, &key).await;
             }
         }
 
