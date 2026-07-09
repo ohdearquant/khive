@@ -75,6 +75,11 @@ pub struct ProfileRecord {
     pub created_at: DateTime<Utc>,
     pub state_snapshot: Option<serde_json::Value>,
     pub total_events: u64,
+    /// Count of `brain.reset` invocations against this profile. Despite the
+    /// name, no exploration schedule exists — nothing else increments it, and
+    /// it stays 0 for profiles that have never been reset. Renaming to
+    /// `reset_epoch` is a versioned output-shape change deferred to the
+    /// posterior-serving lane (ADR-104 follow-up).
     pub exploration_epoch: u64,
 }
 

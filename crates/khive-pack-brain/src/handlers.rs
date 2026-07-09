@@ -146,7 +146,7 @@ pub(crate) static BRAIN_HANDLERS: &[HandlerDef] = &[
                 name: "actor",
                 param_type: "string",
                 required: false,
-                description: "Caller actor identifier. Defaults to \"*\" wildcard match.",
+                description: "Caller actor identifier. Defaults to the caller's dispatch identity; anonymous callers match only wildcard bindings. Pass explicitly to query another identity.",
             },
             khive_types::ParamDef {
                 name: "namespace",
@@ -159,7 +159,7 @@ pub(crate) static BRAIN_HANDLERS: &[HandlerDef] = &[
     // ── Commissive (write state) verbs ────────────────────────────────────
     HandlerDef {
         name: "brain.activate",
-        description: "Move a profile to Active (start live update loop)",
+        description: "Move a profile to Active (lifecycle transition; serving reads profile state per-request)",
         visibility: khive_types::Visibility::Verb,
         category: khive_types::VerbCategory::Commissive,
         params: &[khive_types::ParamDef {
@@ -195,7 +195,7 @@ pub(crate) static BRAIN_HANDLERS: &[HandlerDef] = &[
     },
     HandlerDef {
         name: "brain.reset",
-        description: "Reset posteriors to priors (preserves event history)",
+        description: "Reset posteriors to priors (preserves event history; increments exploration_epoch, which counts resets and nothing else)",
         visibility: khive_types::Visibility::Verb,
         category: khive_types::VerbCategory::Declaration,
         params: &[khive_types::ParamDef {
@@ -942,7 +942,11 @@ impl BrainPack {
 
     // ── brain.resolve ─────────────────────────────────────────────────────
 
-    pub(crate) async fn handle_resolve(&self, params: Value) -> Result<Value, RuntimeError> {
+    pub(crate) async fn handle_resolve(
+        &self,
+        token: &NamespaceToken,
+        params: Value,
+    ) -> Result<Value, RuntimeError> {
         #[derive(Deserialize)]
         #[serde(deny_unknown_fields)]
         struct ResolveParams {
@@ -953,12 +957,21 @@ impl BrainPack {
         let p: ResolveParams = serde_json::from_value(params)
             .map_err(|e| RuntimeError::InvalidInput(e.to_string()))?;
 
+        // #741: an omitted `actor` defaults to the caller's dispatch identity so
+        // this introspection verb reports what the serve path (#708) actually
+        // does. Anonymous callers stay `None` and match only wildcard bindings;
+        // an explicit `actor` param wins so evaluation tooling can query other
+        // identities.
+        let actor = match p.actor.as_deref() {
+            Some(a) => Some(a),
+            None => token.actor().binding_id(),
+        };
+
         let state = self.state.lock().unwrap();
         // Return requested_consumer_kind + matched_consumer_kind + matched_binding so
         // callers can distinguish a real binding match from a system-default fallback.
         // ADR-035 tier-2 requires matched_binding=true; a false value means tier-3 fires.
-        match state.resolve_with_match(p.actor.as_deref(), p.namespace.as_deref(), &p.consumer_kind)
-        {
+        match state.resolve_with_match(actor, p.namespace.as_deref(), &p.consumer_kind) {
             Some((record, matched_kind, matched_binding)) => Ok(json!({
                 "resolved_profile_id": record.id,
                 "lifecycle": record.lifecycle,
@@ -2492,7 +2505,7 @@ impl khive_runtime::pack::PackRuntime for BrainPack {
             "brain.event_counts" => self.handle_event_counts(token, params).await,
             "brain.profiles" => self.handle_profiles(params).await,
             "brain.profile" => self.handle_profile(params).await,
-            "brain.resolve" => self.handle_resolve(params).await,
+            "brain.resolve" => self.handle_resolve(token, params).await,
             "brain.bindings" => self.handle_bindings(params).await,
             // Commissive
             "brain.activate" => self.handle_activate(token, params).await,
