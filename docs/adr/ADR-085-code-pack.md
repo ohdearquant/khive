@@ -571,12 +571,19 @@ applies identically here.
 Canonicalization of the two identity inputs is fixed, not left to per-caller
 convention:
 
-- `source_project` is the package name declared by the nearest governing
-  manifest at or above the ingested path (`Cargo.toml` `[package].name`,
+- `source_project` resolves per source file, not per ingested path: each
+  file's `source_project` is the package name declared by the nearest
+  governing manifest at or above that file (`Cargo.toml` `[package].name`,
   `pyproject.toml` `[project].name`, `package.json` `name`, the Lean project
-  name for a Lean project file). When no such manifest is found above the
-  ingested path, `source_project` falls back to the basename of the ingested
-  folder.
+  name for a Lean project file). A virtual or workspace-only manifest that
+  declares no package name, such as a `Cargo.toml` with `[workspace]` but no
+  `[package]`, or a `pyproject.toml` with no `[project]` table, is not
+  governing and is skipped upward in favor of the next manifest above it. The
+  basename fallback applies only when no governing manifest exists anywhere
+  above a file, in which case that file's `source_project` falls back to the
+  basename of the ingested folder. Consequently, ingesting a multi-package
+  repository root naturally yields multiple per-package `source_project`
+  values in one ingest run; there is no reject rule for multi-package roots.
 - `module_path` is the language's own canonical module path, relative to the
   `source_project` root determined above: a Rust crate-relative `::` path, a
   Python dotted module path, a TypeScript path relative to the package root
@@ -590,12 +597,15 @@ convention:
 Ingest performs no automatic deletion. Every entity present in a sweep has its
 `properties.last_seen_at` stamped to that sweep's time, recording when it was
 last observed. An entity absent from a sweep is left untouched: its
-`last_seen_at` keeps the value from its last observed sweep. Staleness
-filtering compares an entity's `last_seen_at` against the latest sweep time for
-its source; whether a query surfaces an entity below that threshold is a
-view-layer filtering decision, not a data-layer one (khive's data-versus-view
-principle: showing only current state is always a query concern, never a
-reason to delete, mutate, or transfer stored data).
+`last_seen_at` keeps the value from its last observed sweep. Sweep
+timestamps are recorded per `(source_project, language)` pair. Staleness
+filtering compares an entity's `last_seen_at` against the latest sweep time
+of its own `(source_project, language)` pair, never against sweeps of other
+projects or languages ingested into the same namespace; whether a query
+surfaces an entity below that threshold is a view-layer filtering decision,
+not a data-layer one (khive's data-versus-view principle: showing only
+current state is always a query concern, never a reason to delete, mutate,
+or transfer stored data).
 
 ### B6: Cross-repo resolution
 
