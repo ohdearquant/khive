@@ -558,8 +558,16 @@ independently of the ones after it:
 
 ### B4: Identity and idempotency
 
-Symbol identity is `uuid5` over `(source_project, module_path, name, kind)`,
-where `kind` is one of the four canonical D2 tokens (never an alias). A
+Symbol identity is `uuid5` over
+`(source_project, language, module_path, name, kind)`, where `language` is the
+detected source language of the declaring file and `kind` is one of the four
+canonical D2 tokens (never an alias). `language` is part of the identity tuple
+because module paths are language-native rather than globally disjoint: a
+polyglot or manifestless project can hold same-named declarations in two
+languages whose native module paths coincide (single-segment paths
+especially), and without the language component those declarations would
+collapse to one entity, leaving B5 unable to attribute that entity to a
+single `(source_project, language)` sweep clock. A
 secondary `content_hash` property (a hash of the declaration body) detects
 changed-versus-unchanged content independently of identity. Because identity is
 derived from these fields rather than assigned per call, re-ingesting the same
@@ -662,6 +670,12 @@ fixture states otherwise.
 2. **Cross-project order independence**: ingesting two related
    `source_project`s in either order converges to the identical final edge set
    once both ingests and their synchronous re-resolve passes have completed.
+3. **Cross-language identity disjointness**: a fixture containing same-named
+   declarations of the same `kind` in two languages, placed so their
+   language-native module paths coincide, produces two distinct entities, and
+   a subsequent single-language sweep advances only that language's
+   `(source_project, language)` sweep clock, leaving the other language's
+   entity and staleness threshold untouched.
 
 ### Explicitly deferred (unchanged from the base text's posture)
 
