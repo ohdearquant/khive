@@ -456,11 +456,12 @@ impl MemoryPack {
             // scored under configured-default weights — computed only for
             // verbose responses, since it costs a second `calculate_score`
             // call per candidate. Neutral (1.0) when no profile served the
-            // request (component 1 never ran). `entity_posterior_mean` is
-            // read-only: it must never feed `scoring_cfg` (that's component
-            // 2, Stage B).
-            let (profile_component, entity_posterior_mean) = if is_verbose {
-                let component = match &profile_state {
+            // request (component 1 never ran). It is computed against the
+            // pre-entity-term `rank_score` so it stays a pure read on
+            // component 1 (weight projection) — component 2 (the entity
+            // term, applied below) is orthogonal to the weight ratio.
+            let profile_component = if is_verbose {
+                match &profile_state {
                     Some(_) => {
                         let mut default_cfg = scoring_cfg.clone();
                         default_cfg.weights = default_weights.clone();
@@ -472,15 +473,27 @@ impl MemoryPack {
                         }
                     }
                     None => 1.0,
-                };
-                let ent_mean = profile_state
-                    .as_ref()
-                    .and_then(|s| s.entity_posteriors.get(&id))
-                    .map(khive_brain_core::BetaPosterior::mean);
-                (component, ent_mean)
+                }
             } else {
-                (1.0, None)
+                1.0
             };
+
+            // ADR-104 §2 (Stage B): bounded per-entity posterior term. This
+            // is a single `HashMap::get` against the profile state Stage A
+            // already fetched once per recall (see the profile-resolution
+            // block above) — never a second profile-state read, and never
+            // gated behind `is_verbose` like `profile_component`, because
+            // (unlike that diagnostic ratio) it actually feeds `rank_score`
+            // below and so must run for every request, breakdown or not.
+            let entity_posterior_mean: Option<f64> = profile_state
+                .as_ref()
+                .and_then(|s| s.entity_posteriors.get(&id))
+                .map(khive_brain_core::BetaPosterior::mean);
+            let rank_score = rank_score
+                * crate::scoring::entity_posterior_term(
+                    entity_posterior_mean,
+                    crate::scoring::ENTITY_POSTERIOR_WEIGHT,
+                );
 
             let age_days_f64 =
                 ((now_micros - note.created_at).max(0) as f64) / (1_000_000.0 * 86_400.0);
@@ -2338,9 +2351,15 @@ mod tests {
     /// Breakdown fields (ADR-104 §3): `profile_component` is neutral (1.0)
     /// with no profile and != 1.0 once a differentiating profile serves the
     /// request; `entity_posterior_mean` is absent for a target with no
-    /// feedback and present+correct for one with a seeded posterior — and
-    /// Stage A ranking is driven by component 1 alone: the seeded entity
-    /// posterior on `H` must not move it back above `L`.
+    /// feedback and present+correct for one with a seeded posterior. With
+    /// Stage B (§2) live, the entity term on `H` is also in effect here —
+    /// bounded to at most +15% — but the salience-projection margin that
+    /// puts `L` ahead (component 1, driven by 30 signals against the global
+    /// salience posterior) is wide enough that the entity term alone does
+    /// not overturn it. Component 2's isolated, order-flipping effect is
+    /// covered by the feedback-lift and neutrality tests below (ADR-104
+    /// Stage B gate), which hold the corpus fixed and vary only the entity
+    /// posterior.
     #[tokio::test]
     #[serial(background_tasks)]
     async fn recall_breakdown_reports_profile_component_and_entity_posterior_mean() {
@@ -2429,10 +2448,10 @@ mod tests {
         let l_pos = adr104_position(hits, l_id);
         assert!(
             l_pos < h_pos,
-            "Stage A ranking must still be driven by component 1 alone (matching \
-             the profile-differentiated ranking test) — the entity posterior term \
-             (component 2, Stage B) must not move it even though H has a seeded \
-             posterior: {hits:?}"
+            "the component-1 salience-projection margin (matching the \
+             profile-differentiated ranking test) is wide enough that H's \
+             bounded (<=+15%) component-2 entity term does not overturn it: \
+             {hits:?}"
         );
 
         let h_component = hits[h_pos]["breakdown"]["profile_component"]
@@ -2528,6 +2547,326 @@ mod tests {
             first_scores, second_scores,
             "identical store/query/profile-state must produce byte-identical \
              rank_score values"
+        );
+    }
+
+    // ── ADR-104 Stage B: bounded per-entity posterior term (row-B gate) ────
+
+    /// Neutrality (row-B gate): a candidate with no per-entity posterior must
+    /// score identically whether or not a profile serves the request, as
+    /// long as that profile's *global* weights also equal defaults (a fresh
+    /// profile with untouched Beta priors projects to exactly
+    /// `RecallConfig::default()` — see `tunable.rs`'s
+    /// `project_config_with_default_priors_matches_expected_defaults`). This
+    /// isolates component 2 (the entity term) from component 1 (weight
+    /// projection): with no posterior for this UUID, component 2 must be
+    /// the identity multiplier, so profile-served and default-served scores
+    /// coincide exactly.
+    #[tokio::test]
+    #[serial(background_tasks)]
+    async fn adr104_stage_b_no_posterior_candidate_scores_identically_with_fresh_profile() {
+        use khive_pack_brain::BrainPack;
+
+        let rt = build_full_rt_with_brain();
+        let ns = Namespace::parse("local").expect("ns");
+        let token = rt.authorize(ns.clone()).expect("token");
+        rt.create_note(
+            &token,
+            "memory",
+            None,
+            "adr104b neutrality probe note",
+            Some(0.6),
+            None,
+            vec![],
+        )
+        .await
+        .expect("create note");
+
+        let brain = BrainPack::new(rt.clone());
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(KgPack::new(rt.clone()));
+        builder.register(MemoryPack::new(rt.clone()));
+        builder.register(brain);
+        let registry = builder.build().expect("registry");
+
+        registry
+            .dispatch(
+                "brain.create_profile",
+                serde_json::json!({
+                    "namespace": ns.as_str(),
+                    "name": "adr104b-neutral-v1",
+                    "consumer_kind": "recall",
+                }),
+            )
+            .await
+            .expect("create profile");
+
+        let with_profile = registry
+            .dispatch(
+                "memory.recall",
+                serde_json::json!({
+                    "namespace": ns.as_str(),
+                    "query": "adr104b neutrality probe note",
+                    "profile_id": "adr104b-neutral-v1",
+                    "include_breakdown": true,
+                    "limit": 10
+                }),
+            )
+            .await
+            .expect("recall with fresh profile");
+        let without_profile = registry
+            .dispatch(
+                "memory.recall",
+                serde_json::json!({
+                    "namespace": ns.as_str(),
+                    "query": "adr104b neutrality probe note",
+                    "limit": 10
+                }),
+            )
+            .await
+            .expect("recall with defaults");
+
+        let with_hits = with_profile.as_array().expect("bare array result");
+        let without_hits = without_profile.as_array().expect("bare array result");
+        assert_eq!(with_hits.len(), 1);
+        assert_eq!(without_hits.len(), 1);
+
+        assert!(
+            with_hits[0]["breakdown"]["entity_posterior_mean"].is_null(),
+            "fresh profile holds no posterior for this UUID => entity_posterior_mean absent"
+        );
+
+        let score_with = with_hits[0]["rank_score"].as_f64().expect("rank_score");
+        let score_without = without_hits[0]["rank_score"].as_f64().expect("rank_score");
+        assert!(
+            (score_with - score_without).abs() < 1e-9,
+            "no-posterior candidate must score identically served vs unserved: \
+             with_profile={score_with} without_profile={score_without}"
+        );
+    }
+
+    /// Feedback-lift (row-B gate, the ADR's headline test): one explicit
+    /// `useful` signal on a recalled memory changes that memory's rank_score
+    /// on the next equivalent query — under the profile the signal targeted
+    /// — and does NOT change it under a different profile or under defaults.
+    /// Both non-targeted arms start numerically identical to the pre-signal
+    /// baseline (a fresh profile projects to default weights, per the
+    /// neutrality test above), so any post-signal divergence is attributable
+    /// to the signal.
+    #[tokio::test]
+    #[serial(background_tasks)]
+    async fn adr104_stage_b_one_signal_lifts_rank_only_under_the_served_profile() {
+        use khive_pack_brain::BrainPack;
+
+        let rt = build_full_rt_with_brain();
+        let ns = Namespace::parse("local").expect("ns");
+        let token = rt.authorize(ns.clone()).expect("token");
+        let note_id = rt
+            .create_note(
+                &token,
+                "memory",
+                None,
+                "adr104b feedback lift probe note",
+                Some(0.6),
+                None,
+                vec![],
+            )
+            .await
+            .expect("create note")
+            .id;
+
+        let brain = BrainPack::new(rt.clone());
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(KgPack::new(rt.clone()));
+        builder.register(MemoryPack::new(rt.clone()));
+        builder.register(brain);
+        let registry = builder.build().expect("registry");
+
+        for name in ["adr104b-lift-a-v1", "adr104b-lift-b-v1"] {
+            registry
+                .dispatch(
+                    "brain.create_profile",
+                    serde_json::json!({
+                        "namespace": ns.as_str(),
+                        "name": name,
+                        "consumer_kind": "recall",
+                    }),
+                )
+                .await
+                .expect("create profile");
+        }
+
+        async fn recall_score(
+            registry: &khive_runtime::VerbRegistry,
+            ns: &Namespace,
+            profile_id: Option<&str>,
+        ) -> f64 {
+            let mut params = serde_json::json!({
+                "namespace": ns.as_str(),
+                "query": "adr104b feedback lift probe note",
+                "limit": 10
+            });
+            if let Some(pid) = profile_id {
+                params["profile_id"] = serde_json::json!(pid);
+            }
+            let result = registry
+                .dispatch("memory.recall", params)
+                .await
+                .expect("recall");
+            let hits = result.as_array().expect("bare array result");
+            assert_eq!(hits.len(), 1);
+            hits[0]["rank_score"].as_f64().expect("rank_score")
+        }
+
+        let a_before = recall_score(&registry, &ns, Some("adr104b-lift-a-v1")).await;
+        let b_before = recall_score(&registry, &ns, Some("adr104b-lift-b-v1")).await;
+        let default_before = recall_score(&registry, &ns, None).await;
+        assert!(
+            (a_before - default_before).abs() < 1e-9 && (b_before - default_before).abs() < 1e-9,
+            "both fresh profiles must start identical to defaults: a={a_before} \
+             b={b_before} default={default_before}"
+        );
+
+        registry
+            .dispatch(
+                "brain.feedback",
+                serde_json::json!({
+                    "target_id": note_id.to_string(),
+                    "signal": "useful",
+                    "served_by_profile_id": "adr104b-lift-a-v1",
+                }),
+            )
+            .await
+            .expect("one explicit useful signal under profile A");
+
+        let a_after = recall_score(&registry, &ns, Some("adr104b-lift-a-v1")).await;
+        let b_after = recall_score(&registry, &ns, Some("adr104b-lift-b-v1")).await;
+        let default_after = recall_score(&registry, &ns, None).await;
+
+        assert!(
+            a_after > a_before,
+            "one useful signal under profile A must lift the score under \
+             profile A: before={a_before} after={a_after}"
+        );
+        assert!(
+            (b_after - b_before).abs() < 1e-9,
+            "profile B never received the signal => its score must be \
+             unchanged: before={b_before} after={b_after}"
+        );
+        assert!(
+            (default_after - default_before).abs() < 1e-9,
+            "defaults (no profile) must be unchanged by feedback given under \
+             an explicit profile: before={default_before} after={default_after}"
+        );
+    }
+
+    /// Clamp (row-B gate) at the pipeline level: driving a profile's
+    /// per-entity posterior to its practical ceiling (repeated `useful`
+    /// signals push the Beta posterior mean arbitrarily close to 1.0, never
+    /// reaching it exactly) must never lift `rank_score` by more than the
+    /// documented +15% bound relative to the same candidate's score under a
+    /// fresh, untouched profile. The exact-boundary case
+    /// (`entity_posterior_term`'s clamp at mean=0.0/1.0 precisely) is
+    /// covered at the unit level in `scoring.rs`; this test proves the bound
+    /// holds end-to-end through the handler, not just in the pure function.
+    #[tokio::test]
+    #[serial(background_tasks)]
+    async fn adr104_stage_b_saturated_posterior_never_exceeds_clamp_bound_end_to_end() {
+        use khive_pack_brain::BrainPack;
+
+        let rt = build_full_rt_with_brain();
+        let ns = Namespace::parse("local").expect("ns");
+        let token = rt.authorize(ns.clone()).expect("token");
+        let note_id = rt
+            .create_note(
+                &token,
+                "memory",
+                None,
+                "adr104b clamp probe note",
+                Some(0.6),
+                None,
+                vec![],
+            )
+            .await
+            .expect("create note")
+            .id;
+
+        let brain = BrainPack::new(rt.clone());
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(KgPack::new(rt.clone()));
+        builder.register(MemoryPack::new(rt.clone()));
+        builder.register(brain);
+        let registry = builder.build().expect("registry");
+
+        registry
+            .dispatch(
+                "brain.create_profile",
+                serde_json::json!({
+                    "namespace": ns.as_str(),
+                    "name": "adr104b-clamp-v1",
+                    "consumer_kind": "recall",
+                }),
+            )
+            .await
+            .expect("create profile");
+
+        let baseline = registry
+            .dispatch(
+                "memory.recall",
+                serde_json::json!({
+                    "namespace": ns.as_str(),
+                    "query": "adr104b clamp probe note",
+                    "limit": 10
+                }),
+            )
+            .await
+            .expect("baseline recall");
+        let baseline_score = baseline.as_array().expect("array")[0]["rank_score"]
+            .as_f64()
+            .expect("rank_score");
+
+        adr104_skew_salience(&registry, "adr104b-clamp-v1", note_id, 200).await;
+
+        let saturated = registry
+            .dispatch(
+                "memory.recall",
+                serde_json::json!({
+                    "namespace": ns.as_str(),
+                    "query": "adr104b clamp probe note",
+                    "profile_id": "adr104b-clamp-v1",
+                    "include_breakdown": true,
+                    "limit": 10
+                }),
+            )
+            .await
+            .expect("saturated-profile recall");
+        let hits = saturated.as_array().expect("array");
+        let saturated_score = hits[0]["rank_score"].as_f64().expect("rank_score");
+        let ent_mean = hits[0]["breakdown"]["entity_posterior_mean"]
+            .as_f64()
+            .expect("entity_posterior_mean present after 200 signals");
+        assert!(
+            ent_mean > 0.95,
+            "expected a near-saturated mean, got {ent_mean}"
+        );
+
+        // 200 "useful" signals also drive the global salience posterior
+        // (component 1) far from its prior, so `saturated_score` reflects
+        // both components, not component 2 alone. Bound the *entity term's*
+        // contribution directly instead of the composite ratio: divide out
+        // the component-1 (profile_component) ratio the response already
+        // reports, leaving only component 2's multiplier for the assertion.
+        let profile_component = hits[0]["breakdown"]["profile_component"]
+            .as_f64()
+            .expect("profile_component present");
+        let implied_entity_term = (saturated_score / baseline_score) / profile_component;
+        assert!(
+            implied_entity_term <= crate::scoring::ENTITY_POSTERIOR_CLAMP_MAX as f64 + 1e-6,
+            "entity term must never exceed the +15% clamp bound: implied={implied_entity_term}"
+        );
+        assert!(
+            implied_entity_term >= crate::scoring::ENTITY_POSTERIOR_CLAMP_MIN as f64 - 1e-6,
+            "entity term must never fall below the -15% clamp bound: implied={implied_entity_term}"
         );
     }
 
