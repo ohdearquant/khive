@@ -230,6 +230,12 @@ static MEMORY_HANDLERS: [HandlerDef; 10] = [
                 description: "Entity names to boost in scoring. Memories mentioning these entities receive a 1.3× score multiplier.",
             },
             ParamDef {
+                name: "profile_id",
+                param_type: "string",
+                required: false,
+                description: "Serving-profile override (ADR-104 §4): short-circuits binding resolution so the named profile's state serves this request; stamped and ledgered like a resolved profile. Unknown ids error.",
+            },
+            ParamDef {
                 name: "full_content",
                 param_type: "boolean",
                 required: false,

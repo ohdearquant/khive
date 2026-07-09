@@ -841,3 +841,45 @@ fn remember_type_defaults_constants_are_differentiated() {
         "semantic decay constant must be 0.005"
     );
 }
+
+// ── memory.recall HandlerDef ↔ RecallParams schema fidelity ─────────────
+
+/// Every parameter the `memory.recall` `HandlerDef` advertises must be
+/// accepted by `RecallParams` (which is `deny_unknown_fields`), and the
+/// ADR-104 §4 `profile_id` override must be advertised — the handler
+/// accepting a param the help schema omits ships an incomplete public
+/// contract.
+#[test]
+fn recall_handler_schema_params_are_all_accepted_by_recall_params() {
+    use khive_types::Pack;
+
+    let recall_def = <crate::MemoryPack as Pack>::HANDLERS
+        .iter()
+        .find(|h| h.name == "memory.recall")
+        .expect("memory.recall HandlerDef exists");
+
+    let advertised: Vec<&str> = recall_def.params.iter().map(|p| p.name).collect();
+    assert!(
+        advertised.contains(&"profile_id"),
+        "memory.recall HandlerDef must advertise the ADR-104 profile_id override; advertised: {advertised:?}"
+    );
+
+    let mut obj = serde_json::Map::new();
+    for p in recall_def.params {
+        let value = match (p.name, p.param_type) {
+            ("tag_mode", _) => Value::String("any".into()),
+            ("memory_type", _) => Value::String("episodic".into()),
+            (_, "string") => Value::String("x".into()),
+            (_, "number") | (_, "integer") => serde_json::json!(1),
+            (_, "boolean") => Value::Bool(true),
+            (_, "array") => Value::Array(vec![]),
+            (_, "object") => Value::Object(serde_json::Map::new()),
+            (name, ty) => panic!("unhandled param_type {ty:?} for {name:?}"),
+        };
+        obj.insert(p.name.to_string(), value);
+    }
+
+    serde_json::from_value::<RecallParams>(Value::Object(obj)).unwrap_or_else(|e| {
+        panic!("RecallParams must accept every HandlerDef-advertised param: {e}")
+    });
+}
