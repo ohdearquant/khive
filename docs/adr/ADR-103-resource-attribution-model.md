@@ -361,6 +361,31 @@ of the previous.
    design and is not resolved here: a measurement spike to confirm or refute per-actor
    embedder-CPU capture is needed before `cost_unit` weights are finalized, ahead of Stage 1
    shipping any billing-facing use of the number.
+
+   **Resolved 2026-07-08 — NOT-CAPTURED.** The measurement spike returned a verdict against
+   per-actor embedder-CPU attribution, for reasons sharper than the mechanism feared above:
+
+   - The embedder does not escape to another thread. `lattice-embed`'s `encode_batch` runs
+     synchronously inline on the OS thread polling the dispatching task (`spawn_blocking`
+     is used only for one-time model loading, not per-call inference), so the feared
+     dispatch-thread/embedder-thread split does not exist.
+   - The codebase has no per-thread CPU measurement at all. The only CPU capture is
+     process-wide `getrusage(RUSAGE_SELF)` (`khive-runtime/src/resource.rs`), wired into
+     the ANN warm-task phase spans and the `comm.health` resource snapshot; the
+     per-dispatch audit row's `duration_us` is wall-clock only.
+   - Measured: process-wide `getrusage` over-attributes by a factor matching concurrent
+     worker occupancy (a reproducible ~2x on a 2-worker runtime, variance under 0.15%
+     across 30 samples). Extended to per-dispatch rows it would charge each actor for
+     other actors' concurrent CPU — actively contaminated, not merely incomplete.
+   - Measured: under contention, half of async tasks migrated OS threads across a single
+     `.await` point, so any `CLOCK_THREAD_CPUTIME_ID` bracket wider than the single
+     non-yielding embed call is unsound without a same-thread guard, which does not exist
+     in the codebase today.
+
+   Consequence: `cost_unit` weights are finalized as deterministic op-class weights (the
+   fallback this section anticipated). Measured `cpu_us` is not a calibration source for
+   embedding-bearing ops and, where surfaced, is documented as process-wide rather than
+   per-actor.
 2. **Events-table retention and prune.** This design adds a small, bounded increment to an
    existing, already-unaddressed growth pattern. It does not resolve the retention question
    recorded as open in prior ADRs (ADR-032, ADR-041, ADR-094) and does not attempt to; it is
