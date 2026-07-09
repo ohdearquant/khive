@@ -5729,3 +5729,230 @@ async fn t493_inbox_without_sender_filter_returns_all_senders() {
         "no sender filter must return both senders' messages unchanged; got {messages:?}"
     );
 }
+
+// ── #494: comm.thread tail pagination (order + after cursor) ────────────────
+//
+// NOTE: `comm.send`/`comm.reply` targeting the caller's own namespace ("local")
+// write BOTH an outbound and an inbound copy of every logical message into that
+// same namespace (dual_write_message, ADR-057) — so each `content` string below
+// appears TWICE in an unfiltered thread(), consecutively (outbound then inbound),
+// since the inbound copy is always written a moment after the outbound copy in
+// the same call. Tests account for this pairing explicitly rather than assuming
+// one physical note per logical send (matches the existing #485/H3 tests' use of
+// tolerant `>=` counts for the same reason).
+
+/// Default order ("asc") truncates from the tail — this is the pre-existing
+/// (buggy, per #494) behavior that must stay byte-identical: a thread longer
+/// than `limit` returns the HEAD (oldest messages), not the newest.
+#[tokio::test]
+async fn t494_thread_default_order_truncates_head_unchanged() {
+    let (registry, _rt) = build_registry_for_ns("local");
+
+    let root = registry
+        .dispatch(
+            "comm.send",
+            serde_json::json!({ "to": "local", "content": "root" }),
+        )
+        .await
+        .expect("root send succeeds");
+    let root_full_id = root["full_id"].as_str().expect("root full_id").to_string();
+
+    for i in 1..=4 {
+        registry
+            .dispatch(
+                "comm.reply",
+                serde_json::json!({ "id": root_full_id, "content": format!("reply-{i}") }),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("reply-{i} succeeds: {e:?}"));
+    }
+
+    // 5 logical messages (root + 4 replies) = 10 physical notes (outbound+inbound
+    // pairs). limit=2 with no order= must return the OLDEST 2 physical notes —
+    // both copies of "root" — matching pre-#494 truncate-from-head behavior.
+    let result = registry
+        .dispatch(
+            "comm.thread",
+            serde_json::json!({ "id": root_full_id, "limit": 2 }),
+        )
+        .await
+        .expect("thread succeeds");
+    let msgs = result["messages"].as_array().expect("messages array");
+    assert_eq!(msgs.len(), 2, "limit=2 must return exactly 2 messages");
+    let contents: Vec<&str> = msgs
+        .iter()
+        .map(|m| m["content"].as_str().unwrap_or(""))
+        .collect();
+    assert_eq!(
+        contents,
+        vec!["root", "root"],
+        "default order must truncate from the tail (keep the head), unchanged from before #494"
+    );
+}
+
+/// `order="desc"` returns the newest `limit` messages instead of the oldest — the
+/// #494 fix: long threads can now reach their tail.
+#[tokio::test]
+async fn t494_thread_order_desc_returns_newest_messages() {
+    let (registry, _rt) = build_registry_for_ns("local");
+
+    let root = registry
+        .dispatch(
+            "comm.send",
+            serde_json::json!({ "to": "local", "content": "root" }),
+        )
+        .await
+        .expect("root send succeeds");
+    let root_full_id = root["full_id"].as_str().expect("root full_id").to_string();
+
+    for i in 1..=4 {
+        registry
+            .dispatch(
+                "comm.reply",
+                serde_json::json!({ "id": root_full_id, "content": format!("reply-{i}") }),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("reply-{i} succeeds: {e:?}"));
+    }
+
+    let result = registry
+        .dispatch(
+            "comm.thread",
+            serde_json::json!({ "id": root_full_id, "limit": 2, "order": "desc" }),
+        )
+        .await
+        .expect("thread succeeds");
+    let msgs = result["messages"].as_array().expect("messages array");
+    assert_eq!(msgs.len(), 2, "limit=2 must return exactly 2 messages");
+    let contents: Vec<&str> = msgs
+        .iter()
+        .map(|m| m["content"].as_str().unwrap_or(""))
+        .collect();
+    assert_eq!(
+        contents,
+        vec!["reply-4", "reply-4"],
+        "order=desc + limit=2 must return the newest 2 physical notes — both copies \
+         of the last reply — not the oldest (#494 fix: the tail is now reachable)"
+    );
+}
+
+/// An invalid `order` value is rejected, naming the valid set (ADR-084 Rule 2).
+#[tokio::test]
+async fn t494_thread_invalid_order_rejected() {
+    let (registry, _rt) = build_registry_for_ns("local");
+
+    let root = registry
+        .dispatch(
+            "comm.send",
+            serde_json::json!({ "to": "local", "content": "root" }),
+        )
+        .await
+        .expect("root send succeeds");
+    let root_full_id = root["full_id"].as_str().expect("root full_id").to_string();
+
+    let result = registry
+        .dispatch(
+            "comm.thread",
+            serde_json::json!({ "id": root_full_id, "order": "banana" }),
+        )
+        .await;
+    assert!(
+        result.is_err(),
+        "order=banana must be rejected; got {result:?}"
+    );
+    let err = result.unwrap_err().to_string();
+    assert!(
+        err.contains("asc") && err.contains("desc"),
+        "error must name the valid order values; got: {err}"
+    );
+}
+
+/// `after` accepts a message id cursor and returns only messages strictly after it
+/// (enables incremental polling without re-fetching history). The cursor resolves
+/// to the OUTBOUND copy's `full_id` (what `comm.reply` returns); its own inbound
+/// copy — created a moment later in the same dual-write call — is strictly after
+/// it and so is included.
+#[tokio::test]
+async fn t494_thread_after_id_cursor_returns_strictly_later_messages() {
+    let (registry, _rt) = build_registry_for_ns("local");
+
+    let root = registry
+        .dispatch(
+            "comm.send",
+            serde_json::json!({ "to": "local", "content": "root" }),
+        )
+        .await
+        .expect("root send succeeds");
+    let root_full_id = root["full_id"].as_str().expect("root full_id").to_string();
+
+    let reply1 = registry
+        .dispatch(
+            "comm.reply",
+            serde_json::json!({ "id": root_full_id, "content": "reply-1" }),
+        )
+        .await
+        .expect("reply-1 succeeds");
+    let reply1_full_id = reply1["full_id"]
+        .as_str()
+        .expect("reply1 full_id")
+        .to_string();
+
+    let result = registry
+        .dispatch(
+            "comm.thread",
+            serde_json::json!({ "id": root_full_id, "after": reply1_full_id }),
+        )
+        .await
+        .expect("thread succeeds");
+    let msgs = result["messages"].as_array().expect("messages array");
+    let contents: Vec<&str> = msgs
+        .iter()
+        .map(|m| m["content"].as_str().unwrap_or(""))
+        .collect();
+    assert_eq!(
+        contents,
+        vec!["reply-1"],
+        "after=reply-1's outbound id must return only its own inbound copy \
+         (strictly later), excluding root and reply-1's own outbound copy; got {contents:?}"
+    );
+}
+
+/// Absent `order`/`after` preserves today's behavior exactly: same messages, same order,
+/// same truncation as before #494 (regression guard alongside the existing #485 test).
+#[tokio::test]
+async fn t494_thread_without_new_params_unchanged() {
+    let (registry, _rt) = build_registry_for_ns("local");
+
+    let root = registry
+        .dispatch(
+            "comm.send",
+            serde_json::json!({ "to": "local", "content": "root" }),
+        )
+        .await
+        .expect("root send succeeds");
+    let root_full_id = root["full_id"].as_str().expect("root full_id").to_string();
+
+    registry
+        .dispatch(
+            "comm.reply",
+            serde_json::json!({ "id": root_full_id, "content": "reply-1" }),
+        )
+        .await
+        .expect("reply-1 succeeds");
+
+    let result = registry
+        .dispatch("comm.thread", serde_json::json!({ "id": root_full_id }))
+        .await
+        .expect("thread succeeds");
+    let msgs = result["messages"].as_array().expect("messages array");
+    assert_eq!(
+        msgs.len(),
+        4,
+        "root (outbound+inbound) + reply-1 (outbound+inbound) = 4 physical notes"
+    );
+    let contents: Vec<&str> = msgs
+        .iter()
+        .map(|m| m["content"].as_str().unwrap_or(""))
+        .collect();
+    assert_eq!(contents, vec!["root", "root", "reply-1", "reply-1"]);
+}

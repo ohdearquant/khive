@@ -10,7 +10,7 @@ use chrono::Utc;
 use serde_json::{json, Value};
 use uuid::Uuid;
 
-use khive_runtime::{KhiveRuntime, NamespaceToken, RuntimeError};
+use khive_runtime::{micros_to_iso, KhiveRuntime, NamespaceToken, RuntimeError};
 use khive_storage::note::{FilterOp, Note, NoteFilter, PropertyFilter};
 use khive_storage::types::{PageRequest, SqlValue};
 
@@ -513,6 +513,16 @@ pub(crate) async fn handle_thread(
     let p: ThreadParams = deser(params)?;
     let limit = p.limit.unwrap_or(100).clamp(1, 500) as usize;
 
+    // #494: order — "asc" (default, unchanged) | "desc". Closed set.
+    let order = match p.order.as_deref().unwrap_or("asc") {
+        o @ ("asc" | "desc") => o,
+        other => {
+            return Err(RuntimeError::InvalidInput(format!(
+                "thread: invalid order {other:?}; expected one of: asc, desc"
+            )));
+        }
+    };
+
     // Resolve and validate the passed ID.
     let passed_uuid = resolve_id(runtime, token, &p.id, "thread").await?;
 
@@ -618,13 +628,49 @@ pub(crate) async fn handle_thread(
         messages.push(note_to_message_json(&root_note));
     }
 
-    // Sort chronologically ascending (earliest first).
-    // ISO 8601 timestamps (e.g. "2026-05-27T10:30:00.000000Z") are lexicographically
-    // ordered, so string comparison is correct and cheaper than parsing.
+    // #494: `after` cursor — either a message id (short prefix or full UUID, resolved
+    // the same way `id` is) or an RFC 3339 timestamp. Resolves to an ISO created_at
+    // string so it compares directly against the `created_at` field already on each
+    // message JSON, matching the lexicographic-ISO-8601 comparison used below.
+    let after_cursor: Option<String> = match p.after.as_deref() {
+        None => None,
+        Some(raw) => {
+            let looks_like_id = raw.parse::<Uuid>().is_ok()
+                || (raw.len() >= 8 && raw.chars().all(|c| c.is_ascii_hexdigit()));
+            if looks_like_id {
+                let cursor_uuid = resolve_id(runtime, token, raw, "thread").await?;
+                let cursor_store = runtime.notes(token)?;
+                let cursor_note = cursor_store
+                    .get_note(cursor_uuid)
+                    .await
+                    .map_err(|e| RuntimeError::Internal(format!("thread: get_note (after): {e}")))?
+                    .ok_or_else(|| {
+                        RuntimeError::InvalidInput(format!(
+                            "thread: `after` cursor {raw:?} does not resolve to a message"
+                        ))
+                    })?;
+                Some(micros_to_iso(cursor_note.created_at))
+            } else {
+                Some(raw.to_string())
+            }
+        }
+    };
+    if let Some(cursor) = after_cursor.as_deref() {
+        messages.retain(|m| m.get("created_at").and_then(Value::as_str).unwrap_or("") > cursor);
+    }
+
+    // Sort chronologically. ISO 8601 timestamps (e.g. "2026-05-27T10:30:00.000000Z")
+    // are lexicographically ordered, so string comparison is correct and cheaper than
+    // parsing. `order="desc"` (issue #494) reverses the comparison so truncation below
+    // keeps the newest `limit` messages instead of the oldest; default "asc" is
+    // byte-identical to prior behavior.
     messages.sort_by(|a, b| {
         let a_ts = a.get("created_at").and_then(Value::as_str).unwrap_or("");
         let b_ts = b.get("created_at").and_then(Value::as_str).unwrap_or("");
-        a_ts.cmp(b_ts)
+        match order {
+            "desc" => b_ts.cmp(a_ts),
+            _ => a_ts.cmp(b_ts),
+        }
     });
     messages.truncate(limit);
     let count = messages.len();

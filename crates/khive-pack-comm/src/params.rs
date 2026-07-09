@@ -55,6 +55,18 @@ pub(crate) struct ThreadParams {
     pub id: String,
     #[serde(default)]
     pub limit: Option<u32>,
+    /// Ordering of the returned messages: `"asc"` (default, chronological) |
+    /// `"desc"` (newest first). Truncation to `limit` applies after ordering,
+    /// so `order="desc"` returns the newest `limit` messages instead of the
+    /// oldest (issue #494 — long threads previously lost the tail).
+    #[serde(default)]
+    pub order: Option<String>,
+    /// Cursor: a message id (short prefix or full UUID) or an RFC 3339
+    /// timestamp. When present, only messages strictly after that point in
+    /// time are returned, enabling incremental polling without re-fetching
+    /// history.
+    #[serde(default)]
+    pub after: Option<String>,
 }
 
 /// Parameters for `comm.ingest` — ingests a single inbound message from a channel adapter.
