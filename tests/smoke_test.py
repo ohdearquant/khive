@@ -197,7 +197,7 @@ def main():
         assert isinstance(verbs_result["verbs"], list), f"verbs must be a list: {verbs_result}"
         # Surface-contract tripwire: the default config (no --pack, KHIVE_PACKS
         # unset) loads 9 production packs (kg, gtd, memory, brain, comm, schedule,
-        # knowledge, session, git), so verbs() returns exactly 76 user-facing
+        # knowledge, session, git), so verbs() returns exactly 77 user-facing
         # MCP-callable verbs (count what verbs() returns, not internal dispatch
         # arms). The session pack contributes 4 agent-facing T1 verbs
         # (store/list/resume/export), promoted from internal subhandlers to
@@ -206,15 +206,15 @@ def main():
         # verified live 2026-07-04), comm.probe (#644 read-only inbound
         # poll), and brain.event_counts (#724, ADR-103 Stage 1 windowed event
         # read) are included in the count; git contributes
-        # 0 verbs (note kinds + ingester only). Update this number when the
+        # git.digest (ADR-088 Amendment 1). Update this number when the
         # pack set or verb surface changes; a silent drift here is the bug
         # this assertion exists to catch.
-        assert verbs_result["total"] == 76, (
-            f"expected 76 user-facing verbs from the 9 default packs "
+        assert verbs_result["total"] == 77, (
+            f"expected 77 user-facing verbs from the 9 default packs "
             f"(session contributes 4 T1 verbs promoted to Visibility::Verb per "
             f"ADR-083; context is the 17th kg-substrate bare verb per ADR-089; "
             f"comm.health is #606; comm.probe is #644; brain.event_counts is "
-            f"#724/ADR-103; git contributes 0), "
+            f"#724/ADR-103; git contributes git.digest), "
             f"got {verbs_result['total']}: {verbs_result}"
         )
         verb_names = [v["verb"] for v in verbs_result["verbs"]]

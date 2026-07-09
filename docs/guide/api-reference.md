@@ -1,6 +1,6 @@
 # API Reference
 
-khive exposes exactly one MCP tool, `request`. Everything else — 76 verbs across 9
+khive exposes exactly one MCP tool, `request`. Everything else — 77 verbs across 9
 production packs — is dispatched through that single tool via a small request DSL.
 This page documents the DSL grammar, the response envelope, and every verb's full
 parameter contract, so an agent can call khive correctly without reading Rust source.
@@ -24,7 +24,7 @@ An always-machine-readable copy of this page is at
 | `kg`        | 17    | `KHIVE_PACKS=kg` (default) | No — base substrate |
 | `gtd`       | 5     | `KHIVE_PACKS=kg,gtd`       | Yes                 |
 | `memory`    | 5     | `KHIVE_PACKS=kg,memory`    | Yes                 |
-| `brain`     | 14    | `KHIVE_PACKS=kg,brain`     | Yes                 |
+| `brain`     | 15    | `KHIVE_PACKS=kg,brain`     | Yes                 |
 | `comm`      | 7     | `KHIVE_PACKS=kg,comm`      | Yes                 |
 | `schedule`  | 4     | `KHIVE_PACKS=kg,schedule`  | Yes                 |
 | `knowledge` | 19    | `KHIVE_PACKS=kg,knowledge` | Yes                 |
@@ -36,7 +36,7 @@ An always-machine-readable copy of this page is at
 `kkernel git-ingest` CLI drive.
 
 The default binary (no `KHIVE_PACKS`/`--pack` override) loads all 9 packs: 17 + 5 + 5 +
-14 + 7 + 4 + 19 + 4 + 1 = **76 verbs**.
+15 + 7 + 4 + 19 + 4 + 1 = **77 verbs**.
 
 Verb names in the `kg` pack are bare (`create`, `search`, `link`, …). Every other pack
 namespaces its verbs with a `pack.` prefix (`gtd.assign`, `memory.recall`,
