@@ -665,6 +665,24 @@ async fn gh_boundary_contract_and_partial_ingest_failure() {
         !args_log.contains("-C"),
         "gh must never receive an unsupported -C flag: {args_log}"
     );
+    // ADR-088 Amendment 1 fix-round r2 High-1: the paging rewrite (--search
+    // "sort:updated-asc ...") must not silently drop --state all -- gh
+    // defaults to open-only listing, which would make closed issues and
+    // closed/merged PRs vanish from every ingest.
+    let pr_and_issue_invocations: Vec<&str> = args_log
+        .lines()
+        .filter(|l| l.starts_with("pr ") || l.starts_with("issue "))
+        .collect();
+    assert!(
+        !pr_and_issue_invocations.is_empty(),
+        "expected at least one gh pr/issue list invocation: {args_log}"
+    );
+    for line in &pr_and_issue_invocations {
+        assert!(
+            line.contains("--state all"),
+            "every gh pr/issue list invocation must request --state all: {line:?}"
+        );
+    }
     let cwd_log = std::fs::read_to_string(log_dir.join("cwd.log")).expect("read cwd.log");
     let cwd_lines: Vec<&str> = cwd_log.lines().filter(|l| !l.is_empty()).collect();
     assert!(

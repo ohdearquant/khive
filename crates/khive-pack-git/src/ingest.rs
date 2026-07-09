@@ -998,6 +998,8 @@ fn fetch_pr_page(repo: &Path, floor: Option<&str>) -> Result<Vec<GhPr>> {
         &[
             "pr",
             "list",
+            "--state",
+            "all",
             "--search",
             search.as_str(),
             "--limit",
@@ -1016,6 +1018,8 @@ fn fetch_issue_page(repo: &Path, floor: Option<&str>) -> Result<Vec<GhIssue>> {
         &[
             "issue",
             "list",
+            "--state",
+            "all",
             "--search",
             search.as_str(),
             "--limit",

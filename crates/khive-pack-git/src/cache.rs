@@ -141,7 +141,15 @@ pub fn ensure_clone(canonical_url: &str) -> Result<PathBuf, CacheError> {
         }
     } else {
         let staging_dir = root.join(format!(".staging-{}", Uuid::new_v4()));
-        clone(canonical_url, &staging_dir)?;
+        clone(canonical_url, &staging_dir).inspect_err(|_| {
+            // `git clone` can create and partially populate the destination
+            // before failing (network drop, auth failure, bad ref) -- clean
+            // it up so a run of failures doesn't leave `.staging-*` litter
+            // under the scratch root. `evict_lru` deliberately never touches
+            // non-owned names (`is_owned_entry`), so nothing else would ever
+            // reclaim this on its own.
+            let _ = std::fs::remove_dir_all(&staging_dir);
+        })?;
         let size = dir_size(&staging_dir).inspect_err(|_| {
             let _ = std::fs::remove_dir_all(&staging_dir);
         })?;
@@ -305,6 +313,39 @@ mod tests {
             std::fs::write(p.join(MARKER_FILE), b"").unwrap();
         }
         p
+    }
+
+    /// ADR-088 Amendment 1 fix-round r2 Medium-1: a `git clone` failure (bad
+    /// source, no network needed -- a nonexistent local path fails
+    /// immediately) must not leave a `.staging-<uuid>` directory behind.
+    /// `evict_lru` deliberately never touches non-owned names, so a leaked
+    /// staging dir would otherwise accumulate forever across repeated
+    /// failures.
+    #[test]
+    fn ensure_clone_cleans_up_staging_dir_on_clone_failure() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::env::set_var("KHIVE_GIT_DIGEST_SCRATCH_ROOT", dir.path());
+
+        let bogus_source = dir.path().join("does-not-exist-as-a-repo");
+        let result = ensure_clone(bogus_source.to_str().expect("utf8 path"));
+        assert!(
+            result.is_err(),
+            "cloning a nonexistent local path must fail: {result:?}"
+        );
+
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .expect("read scratch root")
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with(".staging-"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "a failed clone must not leave .staging-* directories behind: {leftovers:?}"
+        );
+
+        std::env::remove_var("KHIVE_GIT_DIGEST_SCRATCH_ROOT");
     }
 
     #[test]
