@@ -115,6 +115,7 @@ pub(crate) async fn handle_send(
         Some(&to_actor),
         None,
         None,
+        p.tags.as_deref(),
     )
     .await?;
 
@@ -145,6 +146,13 @@ pub(crate) async fn handle_inbox(
         return Ok(json!({ "messages": [], "count": 0 }));
     }
     let limit = raw_limit.clamp(1, 200) as usize;
+
+    // #493: from_actor / from_prefix sender filter — mutually exclusive.
+    if p.from_actor.is_some() && p.from_prefix.is_some() {
+        return Err(RuntimeError::InvalidInput(
+            "inbox: `from_actor` and `from_prefix` are mutually exclusive".into(),
+        ));
+    }
 
     let status = match p.status.as_deref().unwrap_or("unread") {
         s @ ("unread" | "read" | "all") => s,
@@ -201,18 +209,66 @@ pub(crate) async fn handle_inbox(
         order_by: None, // preserves existing created_at DESC ordering
         ..Default::default()
     };
-    let page = runtime
-        .notes(token)?
-        .query_notes_filtered(
-            token.namespace().as_str(),
-            &filter,
-            PageRequest {
-                limit: limit as u32,
-                offset: 0,
-            },
-        )
-        .await?;
-    let messages: Vec<Value> = page.items.iter().map(note_to_message_json).collect();
+    let store = runtime.notes(token)?;
+
+    // #493: when a sender filter is supplied, apply it in Rust after the standard
+    // direction/status/to_actor filters (which stay pushed into SQL for index usage) —
+    // `FilterOp` has no prefix-match operator, so from_prefix cannot be pushed down.
+    // Pages beyond the first are scanned (same unbounded-page-loop shape `handle_thread`
+    // uses) until `limit` matches are collected or the store is exhausted.
+    let messages: Vec<Value> = if p.from_actor.is_some() || p.from_prefix.is_some() {
+        const PAGE_SIZE: u32 = 200;
+        let mut collected: Vec<Value> = Vec::new();
+        let mut db_offset: u32 = 0;
+        loop {
+            let page = store
+                .query_notes_filtered(
+                    token.namespace().as_str(),
+                    &filter,
+                    PageRequest {
+                        limit: PAGE_SIZE,
+                        offset: db_offset.into(),
+                    },
+                )
+                .await?;
+            let fetched = page.items.len() as u32;
+            for n in &page.items {
+                let sender = n
+                    .properties
+                    .as_ref()
+                    .and_then(|props| props.get("from_actor"))
+                    .and_then(Value::as_str);
+                let matches = match (p.from_actor.as_deref(), p.from_prefix.as_deref()) {
+                    (Some(exact), None) => sender == Some(exact),
+                    (None, Some(prefix)) => sender.map(|s| s.starts_with(prefix)).unwrap_or(false),
+                    _ => unreachable!("mutual exclusion already validated above"),
+                };
+                if matches {
+                    collected.push(note_to_message_json(n));
+                    if collected.len() >= limit {
+                        break;
+                    }
+                }
+            }
+            if collected.len() >= limit || fetched < PAGE_SIZE {
+                break;
+            }
+            db_offset += PAGE_SIZE;
+        }
+        collected
+    } else {
+        let page = store
+            .query_notes_filtered(
+                token.namespace().as_str(),
+                &filter,
+                PageRequest {
+                    limit: limit as u32,
+                    offset: 0,
+                },
+            )
+            .await?;
+        page.items.iter().map(note_to_message_json).collect()
+    };
     let count = messages.len();
     Ok(json!({ "messages": messages, "count": count }))
 }
@@ -419,6 +475,7 @@ pub(crate) async fn handle_reply(
         Some(&reply_to_actor),
         in_reply_to_message_id.as_deref(),
         references_chain.as_deref(),
+        p.tags.as_deref(),
     )
     .await?;
 
@@ -457,6 +514,16 @@ pub(crate) async fn handle_thread(
 ) -> Result<Value, RuntimeError> {
     let p: ThreadParams = deser(params)?;
     let limit = p.limit.unwrap_or(100).clamp(1, 500) as usize;
+
+    // #494: order — "asc" (default, unchanged) | "desc". Closed set.
+    let order = match p.order.as_deref().unwrap_or("asc") {
+        o @ ("asc" | "desc") => o,
+        other => {
+            return Err(RuntimeError::InvalidInput(format!(
+                "thread: invalid order {other:?}; expected one of: asc, desc"
+            )));
+        }
+    };
 
     // Resolve and validate the passed ID.
     let passed_uuid = resolve_id(runtime, token, &p.id, "thread").await?;
@@ -524,7 +591,7 @@ pub(crate) async fn handle_thread(
         ..Default::default()
     };
     const PAGE_SIZE: u32 = 200;
-    let mut messages: Vec<Value> = Vec::new();
+    let mut rows: Vec<ThreadRow> = Vec::new();
     let mut db_offset: u32 = 0;
 
     loop {
@@ -540,7 +607,11 @@ pub(crate) async fn handle_thread(
             .await?;
         let fetched = page.items.len() as u32;
         for n in &page.items {
-            messages.push(note_to_message_json(n));
+            rows.push(ThreadRow {
+                created_at: n.created_at,
+                full_id: n.id,
+                json: note_to_message_json(n),
+            });
         }
         if fetched < PAGE_SIZE {
             break;
@@ -555,30 +626,127 @@ pub(crate) async fn handle_thread(
     // already-validated root note when the query didn't already return it, so
     // `comm.thread(id=root)` never reports an empty/incomplete thread for a
     // root that exists but predates the canonical `thread_id` field.
-    let root_full_id = root_note.id.as_hyphenated().to_string();
-    let root_already_present = messages
-        .iter()
-        .any(|m| m.get("full_id").and_then(Value::as_str) == Some(root_full_id.as_str()));
+    let root_already_present = rows.iter().any(|r| r.full_id == root_note.id);
     if !root_already_present {
-        messages.push(note_to_message_json(&root_note));
+        rows.push(ThreadRow {
+            created_at: root_note.created_at,
+            full_id: root_note.id,
+            json: note_to_message_json(&root_note),
+        });
     }
 
-    // Sort chronologically ascending (earliest first).
-    // ISO 8601 timestamps (e.g. "2026-05-27T10:30:00.000000Z") are lexicographically
-    // ordered, so string comparison is correct and cheaper than parsing.
-    messages.sort_by(|a, b| {
-        let a_ts = a.get("created_at").and_then(Value::as_str).unwrap_or("");
-        let b_ts = b.get("created_at").and_then(Value::as_str).unwrap_or("");
-        a_ts.cmp(b_ts)
+    // #494 / codex r1: `after` cursor — either a message id (short prefix or full
+    // UUID, resolved the same way `id` is) or an RFC 3339 timestamp. An id cursor
+    // resolves to the full `(created_at, full_id)` tuple of the referenced note so
+    // ties on equal microsecond timestamps are broken deterministically instead of
+    // being skipped or duplicated. A timestamp cursor is parsed to microseconds via
+    // chrono (matching the pattern in khive-pack-brain/src/handlers.rs and
+    // khive-vcs/src/sync.rs) rather than compared as a raw string, so non-canonical
+    // but valid RFC 3339 forms (whole-second `Z`, `+00:00` offsets, ...) compare
+    // correctly against khive's canonical microsecond timestamps. An `after` value
+    // that is neither a resolvable id nor a parseable RFC 3339 timestamp is a hard
+    // error — never silently coerced or treated as "no cursor".
+    let after_cursor: Option<AfterCursor> = match p.after.as_deref() {
+        None => None,
+        Some(raw) => {
+            let looks_like_id = raw.parse::<Uuid>().is_ok()
+                || (raw.len() >= 8 && raw.chars().all(|c| c.is_ascii_hexdigit()));
+            if looks_like_id {
+                let cursor_uuid = resolve_id(runtime, token, raw, "thread").await?;
+                let cursor_store = runtime.notes(token)?;
+                let cursor_note = cursor_store
+                    .get_note(cursor_uuid)
+                    .await
+                    .map_err(|e| RuntimeError::Internal(format!("thread: get_note (after): {e}")))?
+                    .ok_or_else(|| {
+                        RuntimeError::InvalidInput(format!(
+                            "thread: `after` cursor {raw:?} does not resolve to a message"
+                        ))
+                    })?;
+                Some(AfterCursor::Id {
+                    created_at: cursor_note.created_at,
+                    full_id: cursor_note.id,
+                })
+            } else {
+                let micros = chrono::DateTime::parse_from_rfc3339(raw.trim())
+                    .map(|dt| dt.with_timezone(&Utc).timestamp_micros())
+                    .map_err(|e| {
+                        RuntimeError::InvalidInput(format!(
+                            "thread: `after` cursor {raw:?} is neither a resolvable message id \
+                             nor a valid RFC 3339 timestamp: {e}"
+                        ))
+                    })?;
+                Some(AfterCursor::Timestamp { micros })
+            }
+        }
+    };
+    if let Some(cursor) = &after_cursor {
+        rows.retain(|r| match cursor {
+            // Tuple compare, not timestamp-only: two rows sharing a microsecond
+            // `created_at` (e.g. ADR-057 dual-write self-send copies) are ordered
+            // deterministically by `full_id`, so an id cursor sitting on one of them
+            // never skips or re-includes its tie.
+            AfterCursor::Id {
+                created_at,
+                full_id,
+            } => {
+                let row_key = (r.created_at, r.full_id);
+                let cursor_key = (*created_at, *full_id);
+                match order {
+                    // "after" in desc order means further along the desc sequence,
+                    // i.e. strictly older (smaller key) than the cursor.
+                    "desc" => row_key < cursor_key,
+                    _ => row_key > cursor_key,
+                }
+            }
+            AfterCursor::Timestamp { micros } => match order {
+                "desc" => r.created_at < *micros,
+                _ => r.created_at > *micros,
+            },
+        });
+    }
+
+    // Total order: sort by `(created_at, full_id)` — the same tuple the cursor
+    // filter above compares against — ascending for order="asc", reversed for
+    // "desc". Sorting on timestamp alone (prior behavior) left ties among
+    // same-microsecond rows in query-return order, which is not stable across
+    // pages/backends.
+    rows.sort_by(|a, b| {
+        let a_key = (a.created_at, a.full_id);
+        let b_key = (b.created_at, b.full_id);
+        match order {
+            "desc" => b_key.cmp(&a_key),
+            _ => a_key.cmp(&b_key),
+        }
     });
-    messages.truncate(limit);
-    let count = messages.len();
+    rows.truncate(limit);
+    let count = rows.len();
+    let messages: Vec<Value> = rows.into_iter().map(|r| r.json).collect();
 
     Ok(json!({
         "thread_id": canonical_thread_id,
         "count": count,
         "messages": messages,
     }))
+}
+
+/// A thread row carries the sort/cursor key (`created_at`, `full_id`) alongside
+/// the already-rendered message JSON, so the total-order sort and cursor filter
+/// in `handle_thread` compare exact `(i64, Uuid)` tuples instead of re-parsing
+/// the ISO string embedded in the JSON.
+struct ThreadRow {
+    created_at: i64,
+    full_id: Uuid,
+    json: Value,
+}
+
+/// `after` cursor resolved to a comparable key. An id cursor carries the full
+/// `(created_at, full_id)` tuple of the referenced message for tie-breaking; a
+/// timestamp cursor carries only the parsed microsecond value (there is no
+/// specific row to break ties against).
+enum AfterCursor {
+    Id { created_at: i64, full_id: Uuid },
+    Timestamp { micros: i64 },
 }
 
 /// `ingest` — write a single inbound message note from a channel adapter.

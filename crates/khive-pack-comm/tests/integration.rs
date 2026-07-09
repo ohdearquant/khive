@@ -5565,3 +5565,828 @@ async fn health_channel_entry_never_carries_a_healthy_bool() {
         "channel entry must never carry a computed healthy bool: {ch:?}"
     );
 }
+
+// ── #493: comm.inbox from_actor / from_prefix sender filter ─────────────────
+
+/// A single actor namespace receives messages from two distinct senders;
+/// `from_actor` (exact match) selects only the messages from the named sender.
+#[tokio::test]
+async fn t493_inbox_from_actor_filters_to_exact_sender() {
+    let backend = shared_backend();
+    let (registry_a, _rt_a) = build_actor_registry(backend.clone(), "lambda:a");
+    let (registry_b, _rt_b) = build_actor_registry(backend.clone(), "lambda:b");
+    let (registry_c, _rt_c) = build_actor_registry(backend.clone(), "lambda:c");
+
+    registry_a
+        .dispatch(
+            "comm.send",
+            serde_json::json!({ "to": "lambda:c", "content": "hi from A" }),
+        )
+        .await
+        .expect("A send succeeds");
+    registry_b
+        .dispatch(
+            "comm.send",
+            serde_json::json!({ "to": "lambda:c", "content": "hi from B" }),
+        )
+        .await
+        .expect("B send succeeds");
+
+    let filtered = registry_c
+        .dispatch(
+            "comm.inbox",
+            serde_json::json!({ "status": "all", "limit": 50, "from_actor": "lambda:a" }),
+        )
+        .await
+        .expect("filtered inbox succeeds");
+    let messages = filtered["messages"].as_array().expect("messages array");
+    assert_eq!(
+        messages.len(),
+        1,
+        "from_actor=lambda:a must return exactly 1 message; got {messages:?}"
+    );
+    assert_eq!(
+        messages[0]["properties"]["from_actor"].as_str(),
+        Some("lambda:a")
+    );
+}
+
+/// `from_prefix` selects all senders whose actor label starts with the given prefix,
+/// e.g. `"agent:khive:"` selects every spawned agent under that namespace.
+#[tokio::test]
+async fn t493_inbox_from_prefix_filters_to_matching_senders() {
+    let backend = shared_backend();
+    let (registry_a1, _rt_a1) = build_actor_registry(backend.clone(), "agent:khive:role-1");
+    let (registry_a2, _rt_a2) = build_actor_registry(backend.clone(), "agent:khive:role-2");
+    let (registry_other, _rt_other) = build_actor_registry(backend.clone(), "lambda:other");
+    let (registry_c, _rt_c) = build_actor_registry(backend.clone(), "lambda:c");
+
+    registry_a1
+        .dispatch(
+            "comm.send",
+            serde_json::json!({ "to": "lambda:c", "content": "status from role-1" }),
+        )
+        .await
+        .expect("a1 send succeeds");
+    registry_a2
+        .dispatch(
+            "comm.send",
+            serde_json::json!({ "to": "lambda:c", "content": "status from role-2" }),
+        )
+        .await
+        .expect("a2 send succeeds");
+    registry_other
+        .dispatch(
+            "comm.send",
+            serde_json::json!({ "to": "lambda:c", "content": "unrelated message" }),
+        )
+        .await
+        .expect("other send succeeds");
+
+    let filtered = registry_c
+        .dispatch(
+            "comm.inbox",
+            serde_json::json!({ "status": "all", "limit": 50, "from_prefix": "agent:khive:" }),
+        )
+        .await
+        .expect("filtered inbox succeeds");
+    let messages = filtered["messages"].as_array().expect("messages array");
+    assert_eq!(
+        messages.len(),
+        2,
+        "from_prefix=agent:khive: must return the 2 agent messages, excluding lambda:other; got {messages:?}"
+    );
+    for m in messages {
+        let from_actor = m["properties"]["from_actor"].as_str().unwrap_or("");
+        assert!(
+            from_actor.starts_with("agent:khive:"),
+            "every returned message must have a from_actor matching the prefix; got {from_actor:?}"
+        );
+    }
+}
+
+/// Supplying both `from_actor` and `from_prefix` is a per-op error naming the conflict.
+#[tokio::test]
+async fn t493_inbox_from_actor_and_from_prefix_mutually_exclusive() {
+    let backend = shared_backend();
+    let (registry, _rt) = build_actor_registry(backend, "lambda:c");
+
+    let result = registry
+        .dispatch(
+            "comm.inbox",
+            serde_json::json!({
+                "from_actor": "lambda:a",
+                "from_prefix": "agent:khive:",
+            }),
+        )
+        .await;
+    assert!(
+        result.is_err(),
+        "from_actor + from_prefix together must be rejected; got {result:?}"
+    );
+    let err = result.unwrap_err().to_string();
+    assert!(
+        err.contains("mutually exclusive"),
+        "error must name the conflict; got: {err}"
+    );
+}
+
+/// Absent from_actor/from_prefix preserves today's behavior exactly: no sender filter
+/// is applied and both senders' messages are returned.
+#[tokio::test]
+async fn t493_inbox_without_sender_filter_returns_all_senders() {
+    let backend = shared_backend();
+    let (registry_a, _rt_a) = build_actor_registry(backend.clone(), "lambda:a");
+    let (registry_b, _rt_b) = build_actor_registry(backend.clone(), "lambda:b");
+    let (registry_c, _rt_c) = build_actor_registry(backend.clone(), "lambda:c");
+
+    registry_a
+        .dispatch(
+            "comm.send",
+            serde_json::json!({ "to": "lambda:c", "content": "hi from A" }),
+        )
+        .await
+        .expect("A send succeeds");
+    registry_b
+        .dispatch(
+            "comm.send",
+            serde_json::json!({ "to": "lambda:c", "content": "hi from B" }),
+        )
+        .await
+        .expect("B send succeeds");
+
+    let unfiltered = registry_c
+        .dispatch(
+            "comm.inbox",
+            serde_json::json!({ "status": "all", "limit": 50 }),
+        )
+        .await
+        .expect("unfiltered inbox succeeds");
+    let messages = unfiltered["messages"].as_array().expect("messages array");
+    assert_eq!(
+        messages.len(),
+        2,
+        "no sender filter must return both senders' messages unchanged; got {messages:?}"
+    );
+}
+
+// ── #494: comm.thread tail pagination (order + after cursor) ────────────────
+//
+// NOTE: `comm.send`/`comm.reply` targeting the caller's own namespace ("local")
+// write BOTH an outbound and an inbound copy of every logical message into that
+// same namespace (dual_write_message, ADR-057) — so each `content` string below
+// appears TWICE in an unfiltered thread(), consecutively (outbound then inbound),
+// since the inbound copy is always written a moment after the outbound copy in
+// the same call. Tests account for this pairing explicitly rather than assuming
+// one physical note per logical send (matches the existing #485/H3 tests' use of
+// tolerant `>=` counts for the same reason).
+
+/// Default order ("asc") truncates from the tail — this is the pre-existing
+/// (buggy, per #494) behavior that must stay byte-identical: a thread longer
+/// than `limit` returns the HEAD (oldest messages), not the newest.
+#[tokio::test]
+async fn t494_thread_default_order_truncates_head_unchanged() {
+    let (registry, _rt) = build_registry_for_ns("local");
+
+    let root = registry
+        .dispatch(
+            "comm.send",
+            serde_json::json!({ "to": "local", "content": "root" }),
+        )
+        .await
+        .expect("root send succeeds");
+    let root_full_id = root["full_id"].as_str().expect("root full_id").to_string();
+
+    for i in 1..=4 {
+        registry
+            .dispatch(
+                "comm.reply",
+                serde_json::json!({ "id": root_full_id, "content": format!("reply-{i}") }),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("reply-{i} succeeds: {e:?}"));
+    }
+
+    // 5 logical messages (root + 4 replies) = 10 physical notes (outbound+inbound
+    // pairs). limit=2 with no order= must return the OLDEST 2 physical notes —
+    // both copies of "root" — matching pre-#494 truncate-from-head behavior.
+    let result = registry
+        .dispatch(
+            "comm.thread",
+            serde_json::json!({ "id": root_full_id, "limit": 2 }),
+        )
+        .await
+        .expect("thread succeeds");
+    let msgs = result["messages"].as_array().expect("messages array");
+    assert_eq!(msgs.len(), 2, "limit=2 must return exactly 2 messages");
+    let contents: Vec<&str> = msgs
+        .iter()
+        .map(|m| m["content"].as_str().unwrap_or(""))
+        .collect();
+    assert_eq!(
+        contents,
+        vec!["root", "root"],
+        "default order must truncate from the tail (keep the head), unchanged from before #494"
+    );
+}
+
+/// `order="desc"` returns the newest `limit` messages instead of the oldest — the
+/// #494 fix: long threads can now reach their tail.
+#[tokio::test]
+async fn t494_thread_order_desc_returns_newest_messages() {
+    let (registry, _rt) = build_registry_for_ns("local");
+
+    let root = registry
+        .dispatch(
+            "comm.send",
+            serde_json::json!({ "to": "local", "content": "root" }),
+        )
+        .await
+        .expect("root send succeeds");
+    let root_full_id = root["full_id"].as_str().expect("root full_id").to_string();
+
+    for i in 1..=4 {
+        registry
+            .dispatch(
+                "comm.reply",
+                serde_json::json!({ "id": root_full_id, "content": format!("reply-{i}") }),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("reply-{i} succeeds: {e:?}"));
+    }
+
+    let result = registry
+        .dispatch(
+            "comm.thread",
+            serde_json::json!({ "id": root_full_id, "limit": 2, "order": "desc" }),
+        )
+        .await
+        .expect("thread succeeds");
+    let msgs = result["messages"].as_array().expect("messages array");
+    assert_eq!(msgs.len(), 2, "limit=2 must return exactly 2 messages");
+    let contents: Vec<&str> = msgs
+        .iter()
+        .map(|m| m["content"].as_str().unwrap_or(""))
+        .collect();
+    assert_eq!(
+        contents,
+        vec!["reply-4", "reply-4"],
+        "order=desc + limit=2 must return the newest 2 physical notes — both copies \
+         of the last reply — not the oldest (#494 fix: the tail is now reachable)"
+    );
+}
+
+/// An invalid `order` value is rejected, naming the valid set (ADR-084 Rule 2).
+#[tokio::test]
+async fn t494_thread_invalid_order_rejected() {
+    let (registry, _rt) = build_registry_for_ns("local");
+
+    let root = registry
+        .dispatch(
+            "comm.send",
+            serde_json::json!({ "to": "local", "content": "root" }),
+        )
+        .await
+        .expect("root send succeeds");
+    let root_full_id = root["full_id"].as_str().expect("root full_id").to_string();
+
+    let result = registry
+        .dispatch(
+            "comm.thread",
+            serde_json::json!({ "id": root_full_id, "order": "banana" }),
+        )
+        .await;
+    assert!(
+        result.is_err(),
+        "order=banana must be rejected; got {result:?}"
+    );
+    let err = result.unwrap_err().to_string();
+    assert!(
+        err.contains("asc") && err.contains("desc"),
+        "error must name the valid order values; got: {err}"
+    );
+}
+
+/// `after` accepts a message id cursor and returns only messages strictly after it
+/// (enables incremental polling without re-fetching history). The cursor resolves
+/// to the OUTBOUND copy's `full_id` (what `comm.reply` returns); its own inbound
+/// copy — created a moment later in the same dual-write call — is strictly after
+/// it and so is included.
+#[tokio::test]
+async fn t494_thread_after_id_cursor_returns_strictly_later_messages() {
+    let (registry, _rt) = build_registry_for_ns("local");
+
+    let root = registry
+        .dispatch(
+            "comm.send",
+            serde_json::json!({ "to": "local", "content": "root" }),
+        )
+        .await
+        .expect("root send succeeds");
+    let root_full_id = root["full_id"].as_str().expect("root full_id").to_string();
+
+    let reply1 = registry
+        .dispatch(
+            "comm.reply",
+            serde_json::json!({ "id": root_full_id, "content": "reply-1" }),
+        )
+        .await
+        .expect("reply-1 succeeds");
+    let reply1_full_id = reply1["full_id"]
+        .as_str()
+        .expect("reply1 full_id")
+        .to_string();
+
+    let result = registry
+        .dispatch(
+            "comm.thread",
+            serde_json::json!({ "id": root_full_id, "after": reply1_full_id }),
+        )
+        .await
+        .expect("thread succeeds");
+    let msgs = result["messages"].as_array().expect("messages array");
+    let contents: Vec<&str> = msgs
+        .iter()
+        .map(|m| m["content"].as_str().unwrap_or(""))
+        .collect();
+    assert_eq!(
+        contents,
+        vec!["reply-1"],
+        "after=reply-1's outbound id must return only its own inbound copy \
+         (strictly later), excluding root and reply-1's own outbound copy; got {contents:?}"
+    );
+}
+
+/// Insert a `message` note directly into the store with an explicit `created_at`,
+/// bypassing `comm.send`/`comm.reply`. Cursor/tie-break/ordering tests need exact
+/// control over timestamps (including two rows sharing the same microsecond) that
+/// racing the wall clock through the normal dispatch path cannot guarantee.
+async fn insert_thread_message(
+    rt: &KhiveRuntime,
+    ns: &str,
+    id: uuid::Uuid,
+    thread_id: uuid::Uuid,
+    created_at: i64,
+    content: &str,
+) {
+    let token = rt
+        .authorize(Namespace::parse(ns).expect("valid namespace"))
+        .expect("authorize");
+    let store = rt.notes(&token).expect("notes store");
+    store
+        .upsert_note(khive_storage::note::Note {
+            id,
+            namespace: ns.to_string(),
+            kind: "message".into(),
+            status: "active".into(),
+            name: None,
+            content: content.to_string(),
+            salience: None,
+            decay_factor: None,
+            expires_at: None,
+            properties: Some(serde_json::json!({
+                "direction": "inbound",
+                "from": "x",
+                "to": ns,
+                "read": false,
+                "thread_id": thread_id.as_hyphenated().to_string(),
+            })),
+            created_at,
+            updated_at: created_at,
+            deleted_at: None,
+        })
+        .await
+        .expect("insert message");
+}
+
+/// codex r1 (#494 re-review): two physical messages that share the exact same
+/// microsecond `created_at` (e.g. what an ADR-057 dual-write self-send can
+/// produce) must not be skipped or duplicated around an id cursor — the cursor
+/// filter and sort must compare the full `(created_at, full_id)` tuple, not
+/// timestamp alone.
+#[tokio::test]
+async fn t494_thread_after_id_cursor_ties_on_equal_created_at_no_skip_no_dup() {
+    let (registry, rt) = build_registry_for_ns("local");
+
+    let root = registry
+        .dispatch(
+            "comm.send",
+            serde_json::json!({ "to": "local", "content": "root" }),
+        )
+        .await
+        .expect("root send succeeds");
+    let root_full_id = root["full_id"].as_str().expect("root full_id").to_string();
+    let root_uuid = uuid::Uuid::parse_str(&root_full_id).unwrap();
+
+    let tied_at = chrono::Utc::now().timestamp_micros();
+    let uuid_lo = uuid::Uuid::parse_str("00000000-0000-4000-8000-000000000001").unwrap();
+    let uuid_hi = uuid::Uuid::parse_str("ffffffff-0000-4000-8000-000000000002").unwrap();
+    insert_thread_message(&rt, "local", uuid_lo, root_uuid, tied_at, "tied-lo").await;
+    insert_thread_message(&rt, "local", uuid_hi, root_uuid, tied_at, "tied-hi").await;
+
+    let after_lo = registry
+        .dispatch(
+            "comm.thread",
+            serde_json::json!({ "id": root_full_id, "after": uuid_lo.to_string() }),
+        )
+        .await
+        .expect("thread succeeds");
+    let contents_lo: Vec<&str> = after_lo["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["content"].as_str().unwrap_or(""))
+        .collect();
+    assert_eq!(
+        contents_lo,
+        vec!["tied-hi"],
+        "after=lo must return exactly the higher-uuid tied row once, not skip or \
+         duplicate it; got {contents_lo:?}"
+    );
+
+    let after_hi = registry
+        .dispatch(
+            "comm.thread",
+            serde_json::json!({ "id": root_full_id, "after": uuid_hi.to_string() }),
+        )
+        .await
+        .expect("thread succeeds");
+    let contents_hi: Vec<&str> = after_hi["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["content"].as_str().unwrap_or(""))
+        .collect();
+    assert!(
+        contents_hi.is_empty(),
+        "after=hi must return nothing — hi is the greatest key among the tied rows; \
+         got {contents_hi:?}"
+    );
+}
+
+/// codex r1 (#494 re-review): an `after` timestamp cursor must be parsed to
+/// microseconds (not compared as a raw string) so non-canonical but valid RFC
+/// 3339 forms — whole-second `Z`, or an explicit `+00:00` offset — compare
+/// correctly against khive's canonical microsecond timestamps.
+#[tokio::test]
+async fn t494_thread_after_timestamp_cursor_accepts_noncanonical_rfc3339() {
+    let (registry, rt) = build_registry_for_ns("local");
+
+    let root = registry
+        .dispatch(
+            "comm.send",
+            serde_json::json!({ "to": "local", "content": "root" }),
+        )
+        .await
+        .expect("root send succeeds");
+    let root_full_id = root["full_id"].as_str().expect("root full_id").to_string();
+    let root_uuid = uuid::Uuid::parse_str(&root_full_id).unwrap();
+
+    // Far in the future so the real-clock root note (created "now") is always
+    // strictly before the cursor and never leaks into the filtered result.
+    let ts1 = chrono::DateTime::parse_from_rfc3339("2099-01-01T00:00:00Z")
+        .unwrap()
+        .timestamp_micros();
+    let ts2 = ts1 + 1_000_000;
+    let id1 = uuid::Uuid::parse_str("11111111-0000-4000-8000-000000000001").unwrap();
+    let id2 = uuid::Uuid::parse_str("22222222-0000-4000-8000-000000000002").unwrap();
+    insert_thread_message(&rt, "local", id1, root_uuid, ts1, "at-ts1").await;
+    insert_thread_message(&rt, "local", id2, root_uuid, ts2, "at-ts2").await;
+
+    for cursor in ["2099-01-01T00:00:00Z", "2099-01-01T00:00:00+00:00"] {
+        let result = registry
+            .dispatch(
+                "comm.thread",
+                serde_json::json!({ "id": root_full_id, "after": cursor }),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("cursor {cursor:?} must parse: {e:?}"));
+        let contents: Vec<&str> = result["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["content"].as_str().unwrap_or(""))
+            .collect();
+        assert_eq!(
+            contents,
+            vec!["at-ts2"],
+            "whole-second/offset RFC3339 cursor {cursor:?} must exclude the note at \
+             exactly that instant and include only the strictly-later one; got {contents:?}"
+        );
+    }
+}
+
+/// codex r1 (#494 re-review): an `after` value that is neither a resolvable
+/// message id nor a parseable RFC 3339 timestamp must fail loudly, never be
+/// silently coerced into "no cursor" (which would return the whole thread).
+#[tokio::test]
+async fn t494_thread_after_invalid_string_is_hard_error() {
+    let (registry, _rt) = build_registry_for_ns("local");
+
+    let root = registry
+        .dispatch(
+            "comm.send",
+            serde_json::json!({ "to": "local", "content": "root" }),
+        )
+        .await
+        .expect("root send succeeds");
+    let root_full_id = root["full_id"].as_str().expect("root full_id").to_string();
+
+    let result = registry
+        .dispatch(
+            "comm.thread",
+            serde_json::json!({ "id": root_full_id, "after": "not-a-valid-cursor" }),
+        )
+        .await;
+    assert!(
+        result.is_err(),
+        "an `after` value that is neither a resolvable id nor a valid RFC 3339 \
+         timestamp must be a hard error, not silently treated as no-cursor; got {result:?}"
+    );
+    let err = result.unwrap_err().to_string();
+    assert!(
+        err.contains("neither a resolvable message id nor a valid RFC 3339 timestamp"),
+        "error must name why the cursor was rejected; got: {err}"
+    );
+}
+
+/// codex r1 (#494 re-review): `order="desc"` combined with an id `after` cursor
+/// must filter against the DESC sequence, not always `created_at >`. "After" in
+/// desc order means further along the desc traversal, i.e. strictly older.
+#[tokio::test]
+async fn t494_thread_order_desc_with_after_id_cursor_returns_strictly_older_in_desc_sequence() {
+    let (registry, rt) = build_registry_for_ns("local");
+
+    let root = registry
+        .dispatch(
+            "comm.send",
+            serde_json::json!({ "to": "local", "content": "root" }),
+        )
+        .await
+        .expect("root send succeeds");
+    let root_full_id = root["full_id"].as_str().expect("root full_id").to_string();
+    let root_uuid = uuid::Uuid::parse_str(&root_full_id).unwrap();
+
+    let base = chrono::DateTime::parse_from_rfc3339("2099-01-01T00:00:00Z")
+        .unwrap()
+        .timestamp_micros();
+    let id_a = uuid::Uuid::parse_str("aaaaaaaa-0000-4000-8000-000000000001").unwrap();
+    let id_b = uuid::Uuid::parse_str("bbbbbbbb-0000-4000-8000-000000000002").unwrap();
+    let id_c = uuid::Uuid::parse_str("cccccccc-0000-4000-8000-000000000003").unwrap();
+    insert_thread_message(&rt, "local", id_a, root_uuid, base, "msg-a").await;
+    insert_thread_message(&rt, "local", id_b, root_uuid, base + 1_000_000, "msg-b").await;
+    insert_thread_message(&rt, "local", id_c, root_uuid, base + 2_000_000, "msg-c").await;
+
+    // `comm.send(to="local", ...)` is a self-send: ADR-057 dual-write stores
+    // both an outbound and an inbound copy of "root", both real-clock (and so
+    // both strictly older than the synthetic 2099 timestamps). Full desc
+    // sequence is therefore [msg-c, msg-b, msg-a, root, root]. `after=msg-b`
+    // must return only what comes strictly after it in THAT sequence —
+    // msg-a and both root copies — never msg-c, even though msg-c is also
+    // `>` msg-b in wall-clock terms.
+    let result = registry
+        .dispatch(
+            "comm.thread",
+            serde_json::json!({ "id": root_full_id, "order": "desc", "after": id_b.to_string() }),
+        )
+        .await
+        .expect("thread succeeds");
+    let contents: Vec<&str> = result["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["content"].as_str().unwrap_or(""))
+        .collect();
+    assert_eq!(
+        contents,
+        vec!["msg-a", "root", "root"],
+        "order=desc + after=msg-b must return only rows strictly older than msg-b \
+         (further along the desc sequence), in desc order — both self-send root \
+         copies included, msg-c excluded; got {contents:?}"
+    );
+}
+
+/// Absent `order`/`after` preserves today's behavior exactly: same messages, same order,
+/// same truncation as before #494 (regression guard alongside the existing #485 test).
+#[tokio::test]
+async fn t494_thread_without_new_params_unchanged() {
+    let (registry, _rt) = build_registry_for_ns("local");
+
+    let root = registry
+        .dispatch(
+            "comm.send",
+            serde_json::json!({ "to": "local", "content": "root" }),
+        )
+        .await
+        .expect("root send succeeds");
+    let root_full_id = root["full_id"].as_str().expect("root full_id").to_string();
+
+    registry
+        .dispatch(
+            "comm.reply",
+            serde_json::json!({ "id": root_full_id, "content": "reply-1" }),
+        )
+        .await
+        .expect("reply-1 succeeds");
+
+    let result = registry
+        .dispatch("comm.thread", serde_json::json!({ "id": root_full_id }))
+        .await
+        .expect("thread succeeds");
+    let msgs = result["messages"].as_array().expect("messages array");
+    assert_eq!(
+        msgs.len(),
+        4,
+        "root (outbound+inbound) + reply-1 (outbound+inbound) = 4 physical notes"
+    );
+    let contents: Vec<&str> = msgs
+        .iter()
+        .map(|m| m["content"].as_str().unwrap_or(""))
+        .collect();
+    assert_eq!(contents, vec!["root", "root", "reply-1", "reply-1"]);
+}
+
+// ── #495: comm.send / comm.reply metadata (tags) passthrough ────────────────
+
+/// `comm.send(tags=[...])` persists the tags into `properties["tags"]` on the
+/// inbound copy, round-tripped via `comm.inbox`.
+#[tokio::test]
+async fn t495_send_tags_roundtrip_via_inbox() {
+    let backend = shared_backend();
+    let (registry_a, _rt_a) = build_actor_registry(backend.clone(), "lambda:a");
+    let (registry_b, _rt_b) = build_actor_registry(backend, "lambda:b");
+
+    registry_a
+        .dispatch(
+            "comm.send",
+            serde_json::json!({
+                "to": "lambda:b",
+                "content": "tagged message",
+                "tags": ["run:abc123", "traffic:agent"],
+            }),
+        )
+        .await
+        .expect("tagged send succeeds");
+
+    let inbox = registry_b
+        .dispatch(
+            "comm.inbox",
+            serde_json::json!({ "status": "all", "limit": 10 }),
+        )
+        .await
+        .expect("inbox succeeds");
+    let messages = inbox["messages"].as_array().expect("messages array");
+    assert_eq!(messages.len(), 1);
+    let tags = messages[0]["properties"]["tags"]
+        .as_array()
+        .expect("tags array present on inbound copy");
+    let tag_strs: Vec<&str> = tags.iter().map(|t| t.as_str().unwrap_or("")).collect();
+    assert_eq!(tag_strs, vec!["run:abc123", "traffic:agent"]);
+}
+
+/// `comm.send(tags=[...])` also persists on the outbound copy, round-tripped
+/// via `comm.read` after resolving the sender's own outbound note.
+#[tokio::test]
+async fn t495_send_tags_present_on_outbound_copy() {
+    let backend = shared_backend();
+    let (registry_a, rt_a) = build_actor_registry(backend, "lambda:a");
+
+    let send_result = registry_a
+        .dispatch(
+            "comm.send",
+            serde_json::json!({
+                "to": "lambda:a",
+                "content": "self-tagged",
+                "tags": ["job:42"],
+            }),
+        )
+        .await
+        .expect("tagged self-send succeeds");
+    let outbound_full_id = send_result["full_id"].as_str().expect("full_id");
+    let outbound_uuid: uuid::Uuid = outbound_full_id.parse().expect("valid uuid");
+
+    let tok = rt_a.authorize(Namespace::parse("local").unwrap()).unwrap();
+    let store = rt_a.notes(&tok).expect("notes store");
+    let note = store
+        .get_note(outbound_uuid)
+        .await
+        .expect("get_note succeeds")
+        .expect("outbound note exists");
+    let tags = note.properties.as_ref().and_then(|p| p.get("tags"));
+    assert_eq!(
+        tags,
+        Some(&serde_json::json!(["job:42"])),
+        "outbound copy must also carry tags"
+    );
+}
+
+/// `comm.reply(tags=[...])` persists tags on the reply's inbound copy.
+#[tokio::test]
+async fn t495_reply_tags_roundtrip_via_inbox() {
+    let backend = shared_backend();
+    let (registry_a, _rt_a) = build_actor_registry(backend.clone(), "lambda:a");
+    let (registry_b, _rt_b) = build_actor_registry(backend, "lambda:b");
+
+    registry_a
+        .dispatch(
+            "comm.send",
+            serde_json::json!({ "to": "lambda:b", "content": "hello" }),
+        )
+        .await
+        .expect("send succeeds");
+
+    let inbox_b = registry_b
+        .dispatch(
+            "comm.inbox",
+            serde_json::json!({ "status": "all", "limit": 10 }),
+        )
+        .await
+        .expect("B inbox succeeds");
+    let b_inbound_id = inbox_b["messages"][0]["full_id"]
+        .as_str()
+        .expect("B inbound full_id");
+
+    registry_b
+        .dispatch(
+            "comm.reply",
+            serde_json::json!({
+                "id": b_inbound_id,
+                "content": "reply with tags",
+                "tags": ["job:reply-1"],
+            }),
+        )
+        .await
+        .expect("tagged reply succeeds");
+
+    let inbox_a = registry_a
+        .dispatch(
+            "comm.inbox",
+            serde_json::json!({ "status": "all", "limit": 10 }),
+        )
+        .await
+        .expect("A inbox succeeds");
+    let a_messages = inbox_a["messages"].as_array().expect("messages array");
+    let reply_msg = a_messages
+        .iter()
+        .find(|m| m["content"] == "reply with tags")
+        .expect("A's inbox contains the tagged reply");
+    let tags = reply_msg["properties"]["tags"]
+        .as_array()
+        .expect("tags array present on reply's inbound copy");
+    let tag_strs: Vec<&str> = tags.iter().map(|t| t.as_str().unwrap_or("")).collect();
+    assert_eq!(tag_strs, vec!["job:reply-1"]);
+}
+
+/// Absent `tags` preserves today's behavior exactly: no `properties["tags"]` key at all.
+#[tokio::test]
+async fn t495_send_without_tags_omits_tags_property() {
+    let backend = shared_backend();
+    let (registry_a, _rt_a) = build_actor_registry(backend.clone(), "lambda:a");
+    let (registry_b, _rt_b) = build_actor_registry(backend, "lambda:b");
+
+    registry_a
+        .dispatch(
+            "comm.send",
+            serde_json::json!({ "to": "lambda:b", "content": "no tags here" }),
+        )
+        .await
+        .expect("send succeeds");
+
+    let inbox = registry_b
+        .dispatch(
+            "comm.inbox",
+            serde_json::json!({ "status": "all", "limit": 10 }),
+        )
+        .await
+        .expect("inbox succeeds");
+    let messages = inbox["messages"].as_array().expect("messages array");
+    assert_eq!(messages.len(), 1);
+    assert!(
+        messages[0]["properties"].get("tags").is_none(),
+        "absent tags must not add a properties.tags key; got {:?}",
+        messages[0]["properties"]
+    );
+}
+
+/// `comm.send` with an unknown top-level field (typo) is still rejected —
+/// `tags` addition must not have loosened `deny_unknown_fields`.
+#[tokio::test]
+async fn t495_send_rejects_unknown_field_alongside_tags() {
+    let (registry, _rt) = build_registry_for_ns("local");
+
+    let result = registry
+        .dispatch(
+            "comm.send",
+            serde_json::json!({
+                "to": "local",
+                "content": "hi",
+                "tags": ["a"],
+                "bogus_field": "typo",
+            }),
+        )
+        .await;
+    assert!(
+        result.is_err(),
+        "unknown field alongside tags must still be rejected; got {result:?}"
+    );
+}

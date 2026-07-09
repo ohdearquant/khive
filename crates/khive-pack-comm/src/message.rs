@@ -171,6 +171,7 @@ pub(crate) async fn dual_write_message(
     to_actor: Option<&str>,
     in_reply_to_message_id: Option<&str>,
     references_chain: Option<&str>,
+    tags: Option<&[String]>,
 ) -> Result<Note, RuntimeError> {
     let recipient_ns_str = to.trim();
     if from != recipient_ns_str {
@@ -230,6 +231,11 @@ pub(crate) async fn dual_write_message(
     }
     if let Some(refs) = references_chain {
         outbound_props["references_chain"] = json!(refs);
+    }
+    if let Some(t) = tags {
+        if !t.is_empty() {
+            outbound_props["tags"] = json!(t);
+        }
     }
 
     let outbound_note = runtime
@@ -321,6 +327,11 @@ pub(crate) async fn dual_write_message(
         if let Some(refs) = references_chain {
             inbound_props["references_chain"] = json!(refs);
         }
+        if let Some(t) = tags {
+            if !t.is_empty() {
+                inbound_props["tags"] = json!(t);
+            }
+        }
 
         let inbound_result = runtime
             .create_note(
@@ -408,6 +419,7 @@ mod tests {
             "F1 regression content",
             None,
             "2026-07-03T00:00:00Z",
+            None,
             None,
             None,
             None,

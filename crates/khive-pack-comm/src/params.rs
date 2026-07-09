@@ -15,6 +15,11 @@ pub(crate) struct SendParams {
     pub subject: Option<String>,
     #[serde(default)]
     pub thread_id: Option<String>,
+    /// Structured provenance tags (e.g. run id, job id, traffic class), persisted
+    /// verbatim to `properties["tags"]` on both the outbound and inbound copies.
+    /// Mirrors the shipped `memory.remember` `tags` precedent (issue #495).
+    #[serde(default)]
+    pub tags: Option<Vec<String>>,
 }
 
 #[derive(Deserialize)]
@@ -24,6 +29,13 @@ pub(crate) struct InboxParams {
     pub limit: Option<u32>,
     #[serde(default)]
     pub status: Option<String>,
+    /// Exact match on `properties.from_actor`. Mutually exclusive with `from_prefix`.
+    #[serde(default)]
+    pub from_actor: Option<String>,
+    /// Prefix match on `properties.from_actor` (e.g. `"agent:khive:"` selects all
+    /// agents under one namespace). Mutually exclusive with `from_actor`.
+    #[serde(default)]
+    pub from_prefix: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -37,6 +49,10 @@ pub(crate) struct ReadParams {
 pub(crate) struct ReplyParams {
     pub id: String,
     pub content: String,
+    /// Structured provenance tags, persisted verbatim to `properties["tags"]` on
+    /// both the outbound and inbound copies of the reply (issue #495).
+    #[serde(default)]
+    pub tags: Option<Vec<String>>,
 }
 
 #[derive(Deserialize)]
@@ -48,6 +64,21 @@ pub(crate) struct ThreadParams {
     pub id: String,
     #[serde(default)]
     pub limit: Option<u32>,
+    /// Ordering of the returned messages: `"asc"` (default, chronological) |
+    /// `"desc"` (newest first). Truncation to `limit` applies after ordering,
+    /// so `order="desc"` returns the newest `limit` messages instead of the
+    /// oldest (issue #494 — long threads previously lost the tail).
+    #[serde(default)]
+    pub order: Option<String>,
+    /// Cursor: a message id (short prefix or full UUID) or an RFC 3339
+    /// timestamp. Id cursors compare on the total order `(created_at,
+    /// full_id)` so equal-timestamp messages are never skipped or duplicated;
+    /// timestamp cursors are parsed (any valid RFC 3339 form) rather than
+    /// string-compared. "After" is relative to the chosen `order` (for
+    /// `desc`, strictly older in the descending sequence). An unparseable or
+    /// unresolvable cursor is an error, never silently ignored.
+    #[serde(default)]
+    pub after: Option<String>,
 }
 
 /// Parameters for `comm.ingest` — ingests a single inbound message from a channel adapter.
