@@ -652,8 +652,8 @@ from and never performed by `code.ingest`.
 
 ### B8: Acceptance
 
-An implementation of this amendment is acceptance-tested against two
-properties, both expressible as ordinary queries against the shared query
+An implementation of this amendment is acceptance-tested against three
+properties, all expressible as ordinary queries against the shared query
 surface (`neighbors` / `traverse` / `query`) with no additional tooling. The
 acceptance fixture supplies the traversal bound (`max_depth`) and the expected
 result for that bound; `max_depth=3` is the reference value used unless a
