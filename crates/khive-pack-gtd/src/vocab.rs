@@ -161,7 +161,7 @@ pub(crate) static GTD_HANDLERS: [HandlerDef; 5] = [
                 name: "limit",
                 param_type: "integer",
                 required: false,
-                description: "Maximum tasks to return (default 10).",
+                description: "Maximum tasks to return (default 10, silently clamped to 200 — issue #744: a `limit` above 200 is capped without a separate signal in the response).",
             },
             ParamDef {
                 name: "assignee",
@@ -229,7 +229,7 @@ pub(crate) static GTD_HANDLERS: [HandlerDef; 5] = [
                 name: "limit",
                 param_type: "integer",
                 required: false,
-                description: "Maximum results (default 20).",
+                description: "Maximum results (default 20, silently clamped to 200 — issue #744: a `limit` above 200 is capped without a separate signal in the response).",
             },
             ParamDef {
                 name: "offset",

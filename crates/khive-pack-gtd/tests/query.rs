@@ -235,3 +235,130 @@ async fn next_ordering_is_deterministic_on_equal_priority_and_timestamp() {
         "gtd.next must return identical ordering on repeated calls with the same task set"
     );
 }
+
+// ── #744: gtd.tasks / gtd.next silent 200-row clamp ──────────────────────────
+
+/// Under-limit: `limit` below the 200 cap is unaffected — no change from before #744.
+#[tokio::test]
+async fn next_limit_under_cap_returns_requested_count_unaffected() {
+    let pack = pack(rt());
+    for i in 0..5 {
+        assign(
+            &pack,
+            json!({"title": format!("task-{i}"), "status": "next"}),
+        )
+        .await;
+    }
+
+    let resp = pack
+        .dispatch("gtd.next", json!({"limit": 10}))
+        .await
+        .unwrap();
+    let arr = resp.as_array().unwrap();
+    assert_eq!(
+        arr.len(),
+        5,
+        "limit=10 with only 5 actionable tasks must return all 5, unaffected by the cap"
+    );
+}
+
+/// Over-limit: `gtd.next(limit=500)` is silently clamped to 200 (issue #744 — the cap
+/// itself is intentional and unchanged; #744 is about the *silence*, addressed here by
+/// documenting the cap on the `limit` ParamDef rather than a response-shape change,
+/// since the response is a bare JSON array consumed via `.as_array()` throughout the
+/// codebase and a sibling `truncated` field would require a breaking wrap-in-object
+/// change).
+#[tokio::test]
+async fn next_limit_over_cap_clamps_to_200() {
+    let pack = pack(rt());
+    for i in 0..205 {
+        assign(
+            &pack,
+            json!({"title": format!("task-{i}"), "status": "next"}),
+        )
+        .await;
+    }
+
+    let resp = pack
+        .dispatch("gtd.next", json!({"limit": 500}))
+        .await
+        .unwrap();
+    let arr = resp.as_array().unwrap();
+    assert_eq!(
+        arr.len(),
+        200,
+        "limit=500 over 205 actionable tasks must clamp to exactly 200"
+    );
+}
+
+/// Under-limit: `gtd.tasks(limit=...)` below the cap is unaffected.
+#[tokio::test]
+async fn tasks_limit_under_cap_returns_requested_count_unaffected() {
+    let pack = pack(rt());
+    for i in 0..5 {
+        assign(
+            &pack,
+            json!({"title": format!("task-{i}"), "status": "next"}),
+        )
+        .await;
+    }
+
+    let resp = pack
+        .dispatch("gtd.tasks", json!({"limit": 10}))
+        .await
+        .unwrap();
+    let arr = resp.as_array().unwrap();
+    assert_eq!(arr.len(), 5, "limit=10 with only 5 tasks must return all 5");
+}
+
+/// Over-limit: `gtd.tasks(limit=500)` is silently clamped to 200, mirroring `gtd.next`.
+#[tokio::test]
+async fn tasks_limit_over_cap_clamps_to_200() {
+    let pack = pack(rt());
+    for i in 0..205 {
+        assign(
+            &pack,
+            json!({"title": format!("task-{i}"), "status": "next"}),
+        )
+        .await;
+    }
+
+    let resp = pack
+        .dispatch("gtd.tasks", json!({"limit": 500}))
+        .await
+        .unwrap();
+    let arr = resp.as_array().unwrap();
+    assert_eq!(
+        arr.len(),
+        200,
+        "limit=500 over 205 tasks must clamp to exactly 200"
+    );
+}
+
+/// The 200 cap is documented on both verbs' `limit` ParamDef (issue #744 fallback
+/// ask 1), so `help=true`/verb introspection surfaces it even though the response
+/// itself carries no truncation signal.
+#[tokio::test]
+async fn next_and_tasks_limit_param_documents_the_200_cap() {
+    use khive_pack_gtd::GtdPack;
+    use khive_runtime::pack::HandlerDef;
+    use khive_types::Pack;
+
+    let handlers: &[HandlerDef] = GtdPack::HANDLERS;
+    for verb in ["gtd.next", "gtd.tasks"] {
+        let h = handlers
+            .iter()
+            .find(|h| h.name == verb)
+            .unwrap_or_else(|| panic!("{verb} must be declared"));
+        let limit = h
+            .params
+            .iter()
+            .find(|p| p.name == "limit")
+            .unwrap_or_else(|| panic!("{verb} must declare a limit param"));
+        assert!(
+            limit.description.contains("200"),
+            "{verb}.limit description must document the 200 cap; got: {:?}",
+            limit.description
+        );
+    }
+}

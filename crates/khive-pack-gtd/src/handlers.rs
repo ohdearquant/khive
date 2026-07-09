@@ -776,6 +776,12 @@ impl GtdPack {
         params: Value,
     ) -> Result<Value, RuntimeError> {
         let p: NextParams = deser(params)?;
+        // #744: this clamp is silent by design here — the response shape is a bare
+        // JSON array (`Value::Array`), consumed directly via `.as_array()` by every
+        // caller in this crate and beyond (kkernel, li surfaces). Adding a sibling
+        // `truncated` field would require wrapping the response in an object, which
+        // is a breaking shape change, not an additive one. The cap is documented on
+        // the `limit` ParamDef instead (issue #744 fallback ask 1).
         let limit = p.limit.unwrap_or(10).clamp(1, 200);
 
         // Pull a broad window of recent tasks, filter in-memory by GTD status.
@@ -987,6 +993,9 @@ impl GtdPack {
         params: Value,
     ) -> Result<Value, RuntimeError> {
         let p: TasksParams = deser(params)?;
+        // #744: silent clamp, documented rather than signaled — see the identical
+        // note in `handle_next` above (bare-array response shape rules out an
+        // additive `truncated` field).
         let limit = p.limit.unwrap_or(50).clamp(1, 200);
         let offset = p.offset.unwrap_or(0) as usize;
 
