@@ -85,6 +85,18 @@ pub(crate) static COMM_HANDLERS: [HandlerDef; 9] = [
                 required: false,
                 description: "Filter by read status: \"unread\" (default) | \"read\" | \"all\".",
             },
+            ParamDef {
+                name: "from_actor",
+                param_type: "string",
+                required: false,
+                description: "Exact match on the sender's actor label (`properties.from_actor`). Mutually exclusive with `from_prefix`.",
+            },
+            ParamDef {
+                name: "from_prefix",
+                param_type: "string",
+                required: false,
+                description: "Prefix match on the sender's actor label (e.g. `\"agent:khive:\"` selects all agents under one namespace). Mutually exclusive with `from_actor`.",
+            },
         ],
     },
     HandlerDef {

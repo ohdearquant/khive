@@ -5565,3 +5565,167 @@ async fn health_channel_entry_never_carries_a_healthy_bool() {
         "channel entry must never carry a computed healthy bool: {ch:?}"
     );
 }
+
+// ── #493: comm.inbox from_actor / from_prefix sender filter ─────────────────
+
+/// A single actor namespace receives messages from two distinct senders;
+/// `from_actor` (exact match) selects only the messages from the named sender.
+#[tokio::test]
+async fn t493_inbox_from_actor_filters_to_exact_sender() {
+    let backend = shared_backend();
+    let (registry_a, _rt_a) = build_actor_registry(backend.clone(), "lambda:a");
+    let (registry_b, _rt_b) = build_actor_registry(backend.clone(), "lambda:b");
+    let (registry_c, _rt_c) = build_actor_registry(backend.clone(), "lambda:c");
+
+    registry_a
+        .dispatch(
+            "comm.send",
+            serde_json::json!({ "to": "lambda:c", "content": "hi from A" }),
+        )
+        .await
+        .expect("A send succeeds");
+    registry_b
+        .dispatch(
+            "comm.send",
+            serde_json::json!({ "to": "lambda:c", "content": "hi from B" }),
+        )
+        .await
+        .expect("B send succeeds");
+
+    let filtered = registry_c
+        .dispatch(
+            "comm.inbox",
+            serde_json::json!({ "status": "all", "limit": 50, "from_actor": "lambda:a" }),
+        )
+        .await
+        .expect("filtered inbox succeeds");
+    let messages = filtered["messages"].as_array().expect("messages array");
+    assert_eq!(
+        messages.len(),
+        1,
+        "from_actor=lambda:a must return exactly 1 message; got {messages:?}"
+    );
+    assert_eq!(
+        messages[0]["properties"]["from_actor"].as_str(),
+        Some("lambda:a")
+    );
+}
+
+/// `from_prefix` selects all senders whose actor label starts with the given prefix,
+/// e.g. `"agent:khive:"` selects every spawned agent under that namespace.
+#[tokio::test]
+async fn t493_inbox_from_prefix_filters_to_matching_senders() {
+    let backend = shared_backend();
+    let (registry_a1, _rt_a1) = build_actor_registry(backend.clone(), "agent:khive:role-1");
+    let (registry_a2, _rt_a2) = build_actor_registry(backend.clone(), "agent:khive:role-2");
+    let (registry_other, _rt_other) = build_actor_registry(backend.clone(), "lambda:other");
+    let (registry_c, _rt_c) = build_actor_registry(backend.clone(), "lambda:c");
+
+    registry_a1
+        .dispatch(
+            "comm.send",
+            serde_json::json!({ "to": "lambda:c", "content": "status from role-1" }),
+        )
+        .await
+        .expect("a1 send succeeds");
+    registry_a2
+        .dispatch(
+            "comm.send",
+            serde_json::json!({ "to": "lambda:c", "content": "status from role-2" }),
+        )
+        .await
+        .expect("a2 send succeeds");
+    registry_other
+        .dispatch(
+            "comm.send",
+            serde_json::json!({ "to": "lambda:c", "content": "unrelated message" }),
+        )
+        .await
+        .expect("other send succeeds");
+
+    let filtered = registry_c
+        .dispatch(
+            "comm.inbox",
+            serde_json::json!({ "status": "all", "limit": 50, "from_prefix": "agent:khive:" }),
+        )
+        .await
+        .expect("filtered inbox succeeds");
+    let messages = filtered["messages"].as_array().expect("messages array");
+    assert_eq!(
+        messages.len(),
+        2,
+        "from_prefix=agent:khive: must return the 2 agent messages, excluding lambda:other; got {messages:?}"
+    );
+    for m in messages {
+        let from_actor = m["properties"]["from_actor"].as_str().unwrap_or("");
+        assert!(
+            from_actor.starts_with("agent:khive:"),
+            "every returned message must have a from_actor matching the prefix; got {from_actor:?}"
+        );
+    }
+}
+
+/// Supplying both `from_actor` and `from_prefix` is a per-op error naming the conflict.
+#[tokio::test]
+async fn t493_inbox_from_actor_and_from_prefix_mutually_exclusive() {
+    let backend = shared_backend();
+    let (registry, _rt) = build_actor_registry(backend, "lambda:c");
+
+    let result = registry
+        .dispatch(
+            "comm.inbox",
+            serde_json::json!({
+                "from_actor": "lambda:a",
+                "from_prefix": "agent:khive:",
+            }),
+        )
+        .await;
+    assert!(
+        result.is_err(),
+        "from_actor + from_prefix together must be rejected; got {result:?}"
+    );
+    let err = result.unwrap_err().to_string();
+    assert!(
+        err.contains("mutually exclusive"),
+        "error must name the conflict; got: {err}"
+    );
+}
+
+/// Absent from_actor/from_prefix preserves today's behavior exactly: no sender filter
+/// is applied and both senders' messages are returned.
+#[tokio::test]
+async fn t493_inbox_without_sender_filter_returns_all_senders() {
+    let backend = shared_backend();
+    let (registry_a, _rt_a) = build_actor_registry(backend.clone(), "lambda:a");
+    let (registry_b, _rt_b) = build_actor_registry(backend.clone(), "lambda:b");
+    let (registry_c, _rt_c) = build_actor_registry(backend.clone(), "lambda:c");
+
+    registry_a
+        .dispatch(
+            "comm.send",
+            serde_json::json!({ "to": "lambda:c", "content": "hi from A" }),
+        )
+        .await
+        .expect("A send succeeds");
+    registry_b
+        .dispatch(
+            "comm.send",
+            serde_json::json!({ "to": "lambda:c", "content": "hi from B" }),
+        )
+        .await
+        .expect("B send succeeds");
+
+    let unfiltered = registry_c
+        .dispatch(
+            "comm.inbox",
+            serde_json::json!({ "status": "all", "limit": 50 }),
+        )
+        .await
+        .expect("unfiltered inbox succeeds");
+    let messages = unfiltered["messages"].as_array().expect("messages array");
+    assert_eq!(
+        messages.len(),
+        2,
+        "no sender filter must return both senders' messages unchanged; got {messages:?}"
+    );
+}

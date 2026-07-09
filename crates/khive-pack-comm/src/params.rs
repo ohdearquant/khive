@@ -24,6 +24,13 @@ pub(crate) struct InboxParams {
     pub limit: Option<u32>,
     #[serde(default)]
     pub status: Option<String>,
+    /// Exact match on `properties.from_actor`. Mutually exclusive with `from_prefix`.
+    #[serde(default)]
+    pub from_actor: Option<String>,
+    /// Prefix match on `properties.from_actor` (e.g. `"agent:khive:"` selects all
+    /// agents under one namespace). Mutually exclusive with `from_actor`.
+    #[serde(default)]
+    pub from_prefix: Option<String>,
 }
 
 #[derive(Deserialize)]

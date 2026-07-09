@@ -146,6 +146,13 @@ pub(crate) async fn handle_inbox(
     }
     let limit = raw_limit.clamp(1, 200) as usize;
 
+    // #493: from_actor / from_prefix sender filter — mutually exclusive.
+    if p.from_actor.is_some() && p.from_prefix.is_some() {
+        return Err(RuntimeError::InvalidInput(
+            "inbox: `from_actor` and `from_prefix` are mutually exclusive".into(),
+        ));
+    }
+
     let status = match p.status.as_deref().unwrap_or("unread") {
         s @ ("unread" | "read" | "all") => s,
         other => {
@@ -201,18 +208,66 @@ pub(crate) async fn handle_inbox(
         order_by: None, // preserves existing created_at DESC ordering
         ..Default::default()
     };
-    let page = runtime
-        .notes(token)?
-        .query_notes_filtered(
-            token.namespace().as_str(),
-            &filter,
-            PageRequest {
-                limit: limit as u32,
-                offset: 0,
-            },
-        )
-        .await?;
-    let messages: Vec<Value> = page.items.iter().map(note_to_message_json).collect();
+    let store = runtime.notes(token)?;
+
+    // #493: when a sender filter is supplied, apply it in Rust after the standard
+    // direction/status/to_actor filters (which stay pushed into SQL for index usage) —
+    // `FilterOp` has no prefix-match operator, so from_prefix cannot be pushed down.
+    // Pages beyond the first are scanned (same unbounded-page-loop shape `handle_thread`
+    // uses) until `limit` matches are collected or the store is exhausted.
+    let messages: Vec<Value> = if p.from_actor.is_some() || p.from_prefix.is_some() {
+        const PAGE_SIZE: u32 = 200;
+        let mut collected: Vec<Value> = Vec::new();
+        let mut db_offset: u32 = 0;
+        loop {
+            let page = store
+                .query_notes_filtered(
+                    token.namespace().as_str(),
+                    &filter,
+                    PageRequest {
+                        limit: PAGE_SIZE,
+                        offset: db_offset.into(),
+                    },
+                )
+                .await?;
+            let fetched = page.items.len() as u32;
+            for n in &page.items {
+                let sender = n
+                    .properties
+                    .as_ref()
+                    .and_then(|props| props.get("from_actor"))
+                    .and_then(Value::as_str);
+                let matches = match (p.from_actor.as_deref(), p.from_prefix.as_deref()) {
+                    (Some(exact), None) => sender == Some(exact),
+                    (None, Some(prefix)) => sender.map(|s| s.starts_with(prefix)).unwrap_or(false),
+                    _ => unreachable!("mutual exclusion already validated above"),
+                };
+                if matches {
+                    collected.push(note_to_message_json(n));
+                    if collected.len() >= limit {
+                        break;
+                    }
+                }
+            }
+            if collected.len() >= limit || fetched < PAGE_SIZE {
+                break;
+            }
+            db_offset += PAGE_SIZE;
+        }
+        collected
+    } else {
+        let page = store
+            .query_notes_filtered(
+                token.namespace().as_str(),
+                &filter,
+                PageRequest {
+                    limit: limit as u32,
+                    offset: 0,
+                },
+            )
+            .await?;
+        page.items.iter().map(note_to_message_json).collect()
+    };
     let count = messages.len();
     Ok(json!({ "messages": messages, "count": count }))
 }
