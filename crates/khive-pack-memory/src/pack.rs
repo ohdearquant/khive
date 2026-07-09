@@ -896,6 +896,95 @@ mod note_mutation_hook_tests {
         );
     }
 
+    /// #750 fix-round 2 (codex r2 High 1): `merge_note`'s non-dry-run
+    /// success path reindexes the surviving note (a corpus change exactly
+    /// like `update_note`'s `text_changed` branch) but never fired the
+    /// note-mutation hook. Same white-box shape as the three fr1 tests
+    /// above.
+    ///
+    /// Both notes are seeded and the cache is warmed only ONCE, AFTER both
+    /// exist — NOT via `fr1_seed_and_warm` for the first note followed by a
+    /// second `memory.remember` for the second, because `memory.remember`'s
+    /// own handler already calls `ann::bump_generation` on every create
+    /// (`handlers/remember.rs`). Warming before the second note existed
+    /// would make the merge assertion pass trivially off that unrelated
+    /// bump — this exact non-discriminating-test trap is what caught out
+    /// an earlier draft of this test (confirmed by a disable/re-enable
+    /// run: the earlier draft still passed with the merge fix's hook-fire
+    /// call commented out). See the fix-round-2 report for the full
+    /// before/after evidence.
+    #[tokio::test]
+    #[serial(background_tasks)]
+    async fn fr2_kg_merge_invalidates_warm_ann_without_subsequent_remember() {
+        let rt = KhiveRuntime::memory().expect("in-memory runtime");
+        let (registry, ann) = fr1_build_registry(&rt);
+
+        rt.register_embedder(Fr1FixedVecProvider {
+            model_name: FR1_MODEL.to_string(),
+            vector: [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        });
+
+        let into_id = registry
+            .dispatch(
+                "memory.remember",
+                json!({"content": "fr2 merge into content", "salience": 0.7}),
+            )
+            .await
+            .expect("seed into-note")["id"]
+            .as_str()
+            .expect("id")
+            .parse::<Uuid>()
+            .expect("valid uuid");
+        let from_id = registry
+            .dispatch(
+                "memory.remember",
+                json!({"content": "fr2 merge from content", "salience": 0.7}),
+            )
+            .await
+            .expect("seed from-note")["id"]
+            .as_str()
+            .expect("id")
+            .parse::<Uuid>()
+            .expect("valid uuid");
+
+        // ONE warm-up recall, after BOTH notes exist.
+        registry
+            .dispatch(
+                "memory.recall",
+                json!({
+                    "query": "fr2 merge into content",
+                    "namespace": "local",
+                    "fusion_strategy": "vector_only",
+                    "embedding_model": FR1_MODEL,
+                }),
+            )
+            .await
+            .expect("warm recall");
+        assert!(
+            ann::is_current(&ann, &fr1_key()).await,
+            "sanity: warm-up recall must leave the ANN cache current before \
+             the merge under test"
+        );
+
+        registry
+            .dispatch(
+                "merge",
+                json!({
+                    "into_id": into_id.to_string(),
+                    "from_id": from_id.to_string(),
+                    "kind": "memory",
+                }),
+            )
+            .await
+            .expect("kg merge on memory-kind notes");
+
+        assert!(
+            !ann::is_current(&ann, &fr1_key()).await,
+            "a KG `merge` of two memory-kind notes must invalidate the warm \
+             ANN generation (#750 fix-round 2, codex r2 High 1)"
+        );
+    }
+
     struct Fr1FixedVecProvider {
         model_name: String,
         vector: [f32; 8],

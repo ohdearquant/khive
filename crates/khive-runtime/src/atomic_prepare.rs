@@ -1035,6 +1035,7 @@ pub async fn prepare_delete(
             Ok(AtomicOpPlan::Delete(DeletePlan {
                 target_id: id,
                 statements,
+                post_commit: PostCommitEffect::None,
             }))
         }
         Some(Resolved::Note(note)) => {
@@ -1106,6 +1107,15 @@ pub async fn prepare_delete(
             Ok(AtomicOpPlan::Delete(DeletePlan {
                 target_id: id,
                 statements,
+                // #750 fix-round 2 (codex r2 High 2): a committed atomic
+                // note delete must fire the same pack-installed
+                // note-mutation hook `operations.rs::delete_note` fires,
+                // so a warm ANN cache sees the deletion even when the
+                // mutation went through the atomic-plan path instead.
+                post_commit: PostCommitEffect::NoteDeleted {
+                    note_id: id,
+                    kind: note.kind.clone(),
+                },
             }))
         }
         Some(_) => Err(RuntimeError::InvalidInput(format!(
@@ -1185,6 +1195,7 @@ async fn prepare_delete_edge(
     Ok(AtomicOpPlan::Delete(DeletePlan {
         target_id: id,
         statements,
+        post_commit: PostCommitEffect::None,
     }))
 }
 
@@ -1399,7 +1410,30 @@ pub async fn apply_post_commit_effects(
             PostCommitEffect::ReindexNote { note_id } => {
                 if let Some(note) = runtime.notes(token)?.get_note(note_id).await? {
                     runtime.reindex_note(token, &note).await?;
+                    // #750 fix-round 2 (codex r2 High 2): this handler
+                    // called `reindex_note` directly, bypassing
+                    // `update_note()` entirely — the note-mutation hook
+                    // `update_note` fires after its own reindex (see
+                    // `curation.rs`) was never reached for an atomic
+                    // update. Fire it here so any in-process consumer
+                    // (e.g. khive-pack-memory's warm ANN cache) sees a
+                    // bumped generation after a committed atomic note
+                    // update, matching the non-atomic path.
+                    runtime.fire_note_mutation_hook(&note.kind, note.id).await;
                 }
+            }
+            PostCommitEffect::NoteDeleted { note_id, kind } => {
+                // #750 fix-round 2 (codex r2 High 2): `DeletePlan` had no
+                // `post_commit` slot at all prior to this round, so an
+                // atomic note delete never reached
+                // `fire_note_mutation_hook` — unlike `operations.rs`'s
+                // `delete_note`, which fires it directly (with the
+                // already-known kind, no refetch) after a successful row
+                // delete. The note row is gone (hard delete) or tombstoned
+                // (soft delete) by the time this post-commit pass runs, so
+                // this mirrors `delete_note`'s direct-fire shape rather
+                // than `ReindexNote`'s refetch-then-fire shape.
+                runtime.fire_note_mutation_hook(&kind, note_id).await;
             }
             PostCommitEffect::GtdAudit { .. } => {
                 // GAP-5 (B3 fix round 4): applied by the `kkernel` caller's
@@ -1668,6 +1702,121 @@ mod tests {
             vec_store.count().await.expect("count after"),
             1,
             "post-commit reindex must have inserted a vector row for the stub model"
+        );
+    }
+
+    /// #750 fix-round 2 (codex r2 High 2, in-process portion): the
+    /// atomic-plan path never fired the pack-installed note-mutation hook
+    /// for either an atomic note UPDATE (`PostCommitEffect::ReindexNote`'s
+    /// handler called `reindex_note` directly, bypassing `update_note()`,
+    /// which is where the hook fires on the non-atomic path) or an atomic
+    /// note DELETE (`DeletePlan` carried no `post_commit` slot at all
+    /// before this round, so nothing could fire there regardless). Both
+    /// are fixed in this round: `ReindexNote`'s handler now fires the hook
+    /// after its own reindex, and `DeletePlan` now carries a
+    /// `PostCommitEffect::NoteDeleted` that `apply_post_commit_effects`
+    /// dispatches directly (mirroring `operations.rs::delete_note`'s
+    /// direct-fire, no-refetch shape — the row may already be gone by the
+    /// time this runs, for a hard delete). A minimal counting hook proves
+    /// both fire; no `khive-pack-memory` dependency is needed at this
+    /// layer, since the hook itself is generic.
+    #[tokio::test]
+    async fn atomic_note_update_and_delete_post_commit_fire_the_note_mutation_hook() {
+        let runtime = scratch_runtime();
+        let token = runtime
+            .authorize(Namespace::parse("local").expect("ns"))
+            .expect("authorize");
+
+        let fired: std::sync::Arc<std::sync::Mutex<Vec<(String, uuid::Uuid)>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let fired_for_hook = fired.clone();
+        runtime.install_note_mutation_hook(std::sync::Arc::new(
+            move |kind: String, id: uuid::Uuid| {
+                let fired = fired_for_hook.clone();
+                Box::pin(async move {
+                    fired.lock().expect("lock").push((kind, id));
+                })
+            },
+        ));
+
+        // Update path.
+        let mut note = khive_storage::note::Note::new("local", "observation", "hook-update-target");
+        note.name = Some("hook-update-target".to_string());
+        let update_note_id = note.id;
+        runtime
+            .notes(&token)
+            .expect("notes store")
+            .upsert_note(note)
+            .await
+            .expect("seed update-target note");
+
+        let plan = prepare_update(
+            &runtime,
+            &token,
+            &json!({"id": update_note_id.to_string(), "content": "hook-update-target, revised"}),
+            None,
+        )
+        .await
+        .expect("prepare update");
+        let outcome = crate::atomic_runner::run_atomic_unit(runtime.sql().as_ref(), vec![plan])
+            .await
+            .expect("seam call ok");
+        let post_commit = match outcome {
+            crate::atomic_runner::AtomicRunOutcome::Committed { post_commit } => post_commit,
+            other => panic!("expected Committed, got {other:?}"),
+        };
+        apply_post_commit_effects(&runtime, &token, post_commit)
+            .await
+            .expect("apply post-commit effects (update)");
+
+        // Delete path (soft delete — the row still exists, but the fix
+        // fires directly from the captured kind rather than refetching).
+        let mut del_note =
+            khive_storage::note::Note::new("local", "observation", "hook-delete-target");
+        del_note.name = Some("hook-delete-target".to_string());
+        let delete_note_id = del_note.id;
+        runtime
+            .notes(&token)
+            .expect("notes store")
+            .upsert_note(del_note)
+            .await
+            .expect("seed delete-target note");
+
+        let plan = prepare_delete(
+            &runtime,
+            &token,
+            &json!({"id": delete_note_id.to_string(), "hard": false}),
+            None,
+        )
+        .await
+        .expect("prepare delete");
+        let outcome = crate::atomic_runner::run_atomic_unit(runtime.sql().as_ref(), vec![plan])
+            .await
+            .expect("seam call ok");
+        let post_commit = match outcome {
+            crate::atomic_runner::AtomicRunOutcome::Committed { post_commit } => post_commit,
+            other => panic!("expected Committed, got {other:?}"),
+        };
+        assert_eq!(
+            post_commit,
+            vec![PostCommitEffect::NoteDeleted {
+                note_id: delete_note_id,
+                kind: "observation".to_string(),
+            }],
+            "a committed note delete must schedule exactly one NoteDeleted post-commit effect"
+        );
+        apply_post_commit_effects(&runtime, &token, post_commit)
+            .await
+            .expect("apply post-commit effects (delete)");
+
+        let seen = fired.lock().expect("lock").clone();
+        assert!(
+            seen.contains(&("observation".to_string(), update_note_id)),
+            "the note-mutation hook must fire for the atomic UPDATE path: {seen:?}"
+        );
+        assert!(
+            seen.contains(&("observation".to_string(), delete_note_id)),
+            "the note-mutation hook must fire for the atomic DELETE path: {seen:?}"
         );
     }
 

@@ -782,6 +782,16 @@ impl KhiveRuntime {
 
         if !dry_run && !self.registered_embedding_model_names().is_empty() {
             self.reindex_note(token, &updated_note).await?;
+            // #750 fix-round 2 (codex r2 High 1): a merge changes the same
+            // ANN corpus as update_note's text_changed branch — the
+            // surviving note gets a new vector via reindex_note above, and
+            // the source note is tombstoned by merge_note_sql. Fire the
+            // same hook update_note fires after its own reindex (see
+            // ~line 670 above) so a pack-owned vector cache (e.g.
+            // khive-pack-memory's warm ANN index) is notified regardless of
+            // which public write path reached the corpus change.
+            self.fire_note_mutation_hook(&updated_note.kind, updated_note.id)
+                .await;
         }
         Ok(summary)
     }

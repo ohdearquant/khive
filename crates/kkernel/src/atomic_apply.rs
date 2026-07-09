@@ -149,6 +149,19 @@ pub(crate) async fn execute_atomic_ops_file(
     let verb_registry = verb_registry_builder
         .build()
         .context("building VerbRegistry for --atomic kind resolution")?;
+    // #750 fix-round 2 (codex r2 High 2): every other entry point that
+    // builds a `VerbRegistry` from a freshly constructed `KhiveRuntime`
+    // (`khive-mcp`'s `serve.rs`/`server.rs`) calls this so a pack-installed
+    // note-mutation hook (e.g. khive-pack-memory's warm ANN invalidation)
+    // is actually wired into the runtime handle used for the rest of this
+    // process's lifetime. `--atomic` built its own registry without this
+    // call, so `fire_note_mutation_hook` was a guaranteed no-op for the
+    // whole `--atomic` process regardless of whether a call site invoked
+    // it. This closes the in-process half of the gap; the note-mutation
+    // hook's effect (a bumped `AnnState` generation) is itself process-
+    // local, so it still cannot reach a separately-running daemon's warm
+    // cache — see the cross-process analysis in the fix-round-2 report.
+    verb_registry.call_register_note_mutation_hooks(&runtime);
 
     // ── async prepare pass (reads only, no writes) ───────────────────────────
     let mut plans: Vec<AtomicOpPlan> = Vec::with_capacity(ops.len());
