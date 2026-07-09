@@ -13,7 +13,7 @@
 // CJK routing, and the full test suite for the scoring pipeline. The tests require access
 // to module-private helpers; splitting would require pub(crate) promotion of private fns.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -78,6 +78,47 @@ pub struct CandidateContext<'a> {
     pub entity_names: &'a [String],
 }
 
+/// Returns `true` when `needle` occurs in `haystack` at a **word (character)
+/// boundary** — the character immediately before the match (if any) and the
+/// character immediately after the match (if any) are both non-alphanumeric
+/// (or the match sits at the start/end of `haystack`).
+///
+/// Plain substring `contains` matches inside unrelated words: a candidate
+/// `"beta"` matches `"alphabet"` and `"betamax"`; `"car"` matches
+/// `"scarcity"`. Anchoring to boundaries closes that class of false positive
+/// while still matching multi-word phrases on their own boundaries — a
+/// caller-supplied explicit name like `"knowledge graph"` still matches
+/// `"...the knowledge graph shows..."` because the space characters on
+/// either side of the phrase are themselves non-alphanumeric, satisfying the
+/// boundary check without any special-casing for internal spaces.
+///
+/// Both `haystack` and `needle` are expected pre-lowercased by the caller
+/// (matching `EntityMatch`'s existing lowercase-both-sides contract).
+fn contains_at_word_boundary(haystack: &str, needle: &str) -> bool {
+    if needle.is_empty() {
+        return false;
+    }
+    let haystack_chars: Vec<char> = haystack.chars().collect();
+    let needle_chars: Vec<char> = needle.chars().collect();
+    let n = needle_chars.len();
+    if n == 0 || haystack_chars.len() < n {
+        return false;
+    }
+    for start in 0..=(haystack_chars.len() - n) {
+        if haystack_chars[start..start + n] != needle_chars[..] {
+            continue;
+        }
+        let before_ok = start == 0 || !haystack_chars[start - 1].is_alphanumeric();
+        let after_idx = start + n;
+        let after_ok =
+            after_idx >= haystack_chars.len() || !haystack_chars[after_idx].is_alphanumeric();
+        if before_ok && after_ok {
+            return true;
+        }
+    }
+    false
+}
+
 impl AdjustmentCondition {
     /// Return `true` when this condition applies to the given candidate context.
     pub fn matches(&self, ctx: &CandidateContext<'_>) -> bool {
@@ -114,14 +155,18 @@ impl AdjustmentCondition {
                     return false;
                 }
                 let lower = ctx.content.to_lowercase();
-                ctx.entity_names.iter().any(|e| lower.contains(e.as_str()))
+                ctx.entity_names
+                    .iter()
+                    .any(|e| contains_at_word_boundary(&lower, e))
             }
             Self::EntityMiss => {
                 if ctx.entity_names.is_empty() {
                     return false;
                 }
                 let lower = ctx.content.to_lowercase();
-                !ctx.entity_names.iter().any(|e| lower.contains(e.as_str()))
+                !ctx.entity_names
+                    .iter()
+                    .any(|e| contains_at_word_boundary(&lower, e))
             }
             Self::All { conditions } => conditions.iter().all(|c| c.matches(ctx)),
         }
@@ -194,6 +239,99 @@ pub fn default_adjustments() -> Vec<ScoreAdjustment> {
             operation: AdjustmentOp::Multiply { factor: 1.3 },
         },
     ]
+}
+
+// ── Auto entity-name extraction ─────────────────────────────────────────────────
+
+/// A small closed set of common English function words, used to keep
+/// auto-extracted entity candidates low-noise. Deliberately conservative
+/// (articles, prepositions, pronouns, conjunctions, common auxiliary verbs
+/// only) — content words are intentionally left out of this list, since
+/// distinguishing a proper noun from a common noun without an NER model
+/// is exactly what the capitalization / length rules below are for.
+const ENTITY_STOPWORDS: &[&str] = &[
+    "a", "an", "the", "and", "or", "but", "of", "in", "on", "at", "to", "for", "with", "by",
+    "from", "is", "are", "was", "were", "be", "been", "being", "this", "that", "these", "those",
+    "it", "its", "he", "she", "his", "her", "him", "they", "them", "their", "we", "us", "our",
+    "you", "your", "i", "my", "me", "as", "if", "so", "not", "no", "yes", "do", "does", "did",
+    "has", "have", "had", "will", "would", "can", "could", "should", "may", "might", "about",
+    "into", "than", "then", "there", "here", "what", "which", "who", "whom", "when", "where",
+    "why", "how",
+];
+
+/// Maximum number of auto-extracted entity-name candidates per query.
+/// `EntityMatch` (see `default_adjustments` above) applies its multiplier to
+/// *any* candidate memory that contains *any* one of the extracted names —
+/// this constant does not limit how many memories can receive the boost
+/// (one generic name can still match many memories). It only bounds the
+/// extracted-name list length and, transitively, the number of
+/// `contains_at_word_boundary` scans `EntityMatch` performs per note.
+pub const MAX_AUTO_ENTITY_NAMES: usize = 8;
+
+/// Strip leading/trailing non-alphanumeric characters from a token (quotes,
+/// commas, trailing periods, etc.), keeping internal punctuation like
+/// apostrophes in a name intact.
+fn strip_token_punctuation(token: &str) -> &str {
+    token.trim_matches(|c: char| !c.is_alphanumeric())
+}
+
+/// Auto-extract entity-name candidates from a recall query when the caller
+/// does not supply `entity_names` explicitly.
+///
+/// Context (khive #dead-parameter defect): `entity_names` was a
+/// caller-supplied request field that fed `EntityMatch` — but no caller ever
+/// populated it, so the ×1.3 boost in `default_adjustments` never fired in
+/// practice. This function derives candidates server-side from the query
+/// text so the boost has something to match against.
+///
+/// **Capitalized tokens only.** A query token qualifies iff, after stripping
+/// surrounding punctuation, it is not a stopword and starts with an
+/// uppercase letter. Capitalization is the only signal used here because it
+/// is the sole low-noise proper-noun indicator available without an NER
+/// model or a lookup against known entity records — `EntityMatch::matches`
+/// (above) does a free-text boundary-anchored match against raw memory
+/// content, not something anchored to actual KG entity references, so
+/// admitting ordinary lowercase content words as candidates degenerates the
+/// boost into a second, redundant lexical-overlap signal on top of
+/// retrieval-stage relevance (confirmed by review: realistic score inputs
+/// clamp at the `[0, 1]` ceiling and flatten top-rank ordering when generic
+/// query words are treated as entity candidates).
+///
+/// **Queries with no capitalization extract nothing.** Many recall callers —
+/// agents in particular — pass fully lowercase queries, and this function
+/// deliberately returns an empty list for them rather than guessing at
+/// content words. Covering that case precisely requires anchoring candidates
+/// against known entity records (e.g. resolving query tokens against the KG)
+/// rather than lexical heuristics over the query string; that is out of
+/// scope here.
+///
+/// Returned names are lowercased (matching `EntityMatch`'s own lowercasing
+/// of both sides before the boundary-anchored match), deduplicated
+/// preserving first-seen order, and capped at `MAX_AUTO_ENTITY_NAMES`.
+pub fn extract_entity_candidates(query: &str) -> Vec<String> {
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut out: Vec<String> = Vec::new();
+
+    for raw in query.split_whitespace() {
+        let stripped = strip_token_punctuation(raw);
+        if stripped.is_empty() {
+            continue;
+        }
+        if !stripped.chars().next().is_some_and(char::is_uppercase) {
+            continue;
+        }
+        let lower = stripped.to_lowercase();
+        if ENTITY_STOPWORDS.contains(&lower.as_str()) {
+            continue;
+        }
+        if seen.insert(lower.clone()) {
+            out.push(lower);
+            if out.len() >= MAX_AUTO_ENTITY_NAMES {
+                break;
+            }
+        }
+    }
+    out
 }
 
 // ── Scoring weights ───────────────────────────────────────────────────────────
@@ -731,6 +869,72 @@ mod tests {
     }
 
     #[test]
+    fn calculate_score_entity_match_from_auto_extraction_lifts_equal_relevance_candidate() {
+        // Wires `extract_entity_candidates` straight into `calculate_score` with
+        // the default adjustments (EntityMatch ×1.3 included) — everything else
+        // held identical between the two candidates — to isolate exactly what
+        // the entity boost contributes, decoupled from retrieval-stage relevance
+        // differences (which the handler-level tests in recall.rs cover instead).
+        let config = ScoringConfig::default();
+        let now_ms = 1_000_000i64;
+
+        // Capitalized-signal query so extraction yields a single isolated
+        // candidate ("gamma") — that keeps this test's two candidates
+        // differing by exactly one factor (does the content mention the
+        // named entity or not).
+        let query = "sibling transfer to Gamma university";
+        let entity_names = extract_entity_candidates(query);
+        assert_eq!(
+            entity_names,
+            vec!["gamma"],
+            "capitalized-signal query must extract exactly the one proper noun: {entity_names:?}"
+        );
+
+        let matching_score = calculate_score(
+            &ScoreInput {
+                salience: 0.5,
+                memory_type_str: "semantic",
+                content: "sibling transferred to gamma university this fall",
+                created_at_millis: 0,
+                decay_factor: 0.005,
+                now_millis: now_ms,
+                relevance_score: 0.5,
+                entity_names: &entity_names,
+            },
+            &config,
+        );
+        let non_matching_score = calculate_score(
+            &ScoreInput {
+                salience: 0.5,
+                memory_type_str: "semantic",
+                content: "sibling transferred to a different university this fall",
+                created_at_millis: 0,
+                decay_factor: 0.005,
+                now_millis: now_ms,
+                relevance_score: 0.5,
+                entity_names: &entity_names,
+            },
+            &config,
+        );
+
+        assert!(
+            matching_score > non_matching_score,
+            "memory matching an auto-extracted entity name must outrank an \
+             equal-relevance memory that doesn't: matching={matching_score} \
+             non_matching={non_matching_score}"
+        );
+        // The EntityMatch adjustment is a flat ×1.3 multiply applied after the
+        // base formula and the other (inactive, for this age/salience combo)
+        // adjustments — assert the lift is approximately that factor, not just
+        // "higher", so a future change to the adjustment order/weights is caught.
+        let ratio = matching_score / non_matching_score;
+        assert!(
+            (ratio - 1.3).abs() < 0.01,
+            "expected ~1.3x lift from the EntityMatch adjustment, got ratio {ratio}"
+        );
+    }
+
+    #[test]
     fn dos_caps_enforce_limits() {
         let mut config = ScoringConfig {
             max_recall_candidates: 9999,
@@ -844,5 +1048,153 @@ mod tests {
         assert!(!needs_multilingual("bonjour le monde"));
         assert!(!needs_multilingual("como estas"));
         assert!(!needs_multilingual("ich suche einen buchhalter"));
+    }
+
+    // ── extract_entity_candidates ─────────────────────────────────────────────
+
+    #[test]
+    fn extract_entity_candidates_capitalized_tokens_only() {
+        // Only capitalized tokens qualify; lowercase content words
+        // ("sibling", "college") are excluded even though they're not
+        // stopwords.
+        let out = extract_entity_candidates("Alex sibling college Acme Beta Gamma");
+        assert_eq!(out, vec!["alex", "acme", "beta", "gamma"]);
+    }
+
+    #[test]
+    fn extract_entity_candidates_all_lowercase_query_extracts_nothing() {
+        // DESIGN RULING: the lowercase fallback was removed after review —
+        // it degenerated EntityMatch into a second lexical-overlap reward on
+        // top of retrieval-stage relevance. An all-lowercase query (however
+        // topical) must extract zero candidates.
+        let out = extract_entity_candidates("alex sibling college acme beta gamma");
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn extract_entity_candidates_strips_stopwords() {
+        let out = extract_entity_candidates("what is the capital of France");
+        // "what", "is", "the", "of" are stopwords; "capital" is lowercase (excluded);
+        // "France" is capitalized and not a stopword, so it remains.
+        assert_eq!(out, vec!["france"]);
+    }
+
+    #[test]
+    fn extract_entity_candidates_strips_punctuation() {
+        let out = extract_entity_candidates("Alex's sibling, Acme!");
+        assert_eq!(out, vec!["alex's", "acme"]);
+    }
+
+    #[test]
+    fn extract_entity_candidates_caps_at_max_auto_entity_names() {
+        let query = "Alpha Bravo Charlie Delta Echo Foxtrot Golf Hotel India Juliet";
+        let out = extract_entity_candidates(query);
+        assert_eq!(out.len(), MAX_AUTO_ENTITY_NAMES);
+        assert_eq!(
+            out,
+            vec!["alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel"]
+        );
+    }
+
+    #[test]
+    fn extract_entity_candidates_dedupes_case_insensitively() {
+        let out = extract_entity_candidates("Acme ACME college");
+        // capitalization signal present (Acme, ACME) → only capitalized tokens
+        // qualify; "college" is dropped; Acme and ACME collapse to one entry.
+        assert_eq!(out, vec!["acme"]);
+    }
+
+    #[test]
+    fn extract_entity_candidates_empty_query_returns_empty() {
+        assert!(extract_entity_candidates("").is_empty());
+        assert!(extract_entity_candidates("   ").is_empty());
+    }
+
+    #[test]
+    fn extract_entity_candidates_all_stopwords_returns_empty() {
+        assert!(extract_entity_candidates("is the a of").is_empty());
+    }
+
+    // ── EntityMatch word-boundary matching ──────────────────────────────────────
+
+    fn entity_match_ctx<'a>(content: &'a str, entity_names: &'a [String]) -> CandidateContext<'a> {
+        CandidateContext {
+            memory_type: "episodic",
+            age_days: 0.0,
+            salience: 0.5,
+            content,
+            entity_names,
+        }
+    }
+
+    #[test]
+    fn contains_at_word_boundary_rejects_substring_inside_another_word() {
+        assert!(!contains_at_word_boundary("alphabet soup", "beta"));
+        assert!(!contains_at_word_boundary("buy a betamax player", "beta"));
+        assert!(!contains_at_word_boundary(
+            "water scarcity is rising",
+            "car"
+        ));
+    }
+
+    #[test]
+    fn contains_at_word_boundary_accepts_the_word_itself() {
+        assert!(contains_at_word_boundary("beta release notes", "beta"));
+        assert!(contains_at_word_boundary("drove the car home", "car"));
+        // start/end of string edges (no adjacent char to fail the boundary check).
+        assert!(contains_at_word_boundary("beta", "beta"));
+        assert!(contains_at_word_boundary("notes beta", "beta"));
+    }
+
+    #[test]
+    fn contains_at_word_boundary_accepts_multi_word_phrase() {
+        // Internal spaces in a multi-word candidate are themselves
+        // non-alphanumeric, so the phrase's own boundaries (not each word's)
+        // are what the check anchors on.
+        assert!(contains_at_word_boundary(
+            "the knowledge graph shows this",
+            "knowledge graph"
+        ));
+        assert!(!contains_at_word_boundary(
+            "prior knowledge, graphical view",
+            "knowledge graph"
+        ));
+    }
+
+    #[test]
+    fn entity_match_condition_rejects_substring_false_positives() {
+        let entity_names = vec!["beta".to_string()];
+        let ctx = entity_match_ctx("alphabet soup for dinner", &entity_names);
+        assert!(
+            !AdjustmentCondition::EntityMatch.matches(&ctx),
+            "\"beta\" must not match inside \"alphabet\""
+        );
+
+        let entity_names = vec!["car".to_string()];
+        let ctx = entity_match_ctx("water scarcity is rising", &entity_names);
+        assert!(
+            !AdjustmentCondition::EntityMatch.matches(&ctx),
+            "\"car\" must not match inside \"scarcity\""
+        );
+    }
+
+    #[test]
+    fn entity_match_condition_matches_multi_word_explicit_name() {
+        let entity_names = vec!["knowledge graph".to_string()];
+        let ctx = entity_match_ctx("notes on the knowledge graph design", &entity_names);
+        assert!(
+            AdjustmentCondition::EntityMatch.matches(&ctx),
+            "explicit multi-word entity name must still match on its own boundaries"
+        );
+    }
+
+    #[test]
+    fn entity_match_condition_still_matches_real_word_occurrence() {
+        let entity_names = vec!["beta".to_string()];
+        let ctx = entity_match_ctx("the beta release ships tomorrow", &entity_names);
+        assert!(
+            AdjustmentCondition::EntityMatch.matches(&ctx),
+            "boundary anchoring must not break matching the actual word"
+        );
     }
 }
