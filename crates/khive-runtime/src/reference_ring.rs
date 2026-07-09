@@ -188,21 +188,27 @@ impl ReferenceRing {
     /// Snapshot the live (non-stale) entries for `(namespace, actor)`,
     /// most-recently-touched first. Returns an empty vec for an unknown or
     /// empty key — never an error, since a ring miss is always a legitimate
-    /// state (fresh session, restarted daemon, cross-actor query). Also
-    /// prunes the queried key from the outer map if eviction leaves it
-    /// empty, instead of leaving a dangling empty `VecDeque` entry behind.
+    /// state (fresh session, restarted daemon, cross-actor query).
+    ///
+    /// Also runs `prune_outer_map` over the WHOLE outer map, not just the
+    /// queried key (review r2 finding, 2026-07-09): a daemon that only ever
+    /// reads (never admits) would otherwise never prune any OTHER actor's
+    /// stale key — `admit` was the sole `prune_outer_map` call site, so a
+    /// read-only period left every unqueried stale key sitting in the map
+    /// forever. Snapshotting now sweeps the whole map on every read, same as
+    /// every write.
     pub fn snapshot(&self, namespace: &str, actor: &str) -> Vec<RingEntry> {
         let now = Instant::now();
         let mut state = self.lock_state();
         let key = Self::key(namespace, actor);
-        let Some(ring) = state.rings.get_mut(&key) else {
-            return Vec::new();
+        let snap: Vec<RingEntry> = match state.rings.get_mut(&key) {
+            Some(ring) => {
+                Self::evict_stale(ring, self.ttl, now);
+                ring.iter().rev().cloned().collect()
+            }
+            None => Vec::new(),
         };
-        Self::evict_stale(ring, self.ttl, now);
-        let snap: Vec<RingEntry> = ring.iter().rev().cloned().collect();
-        if ring.is_empty() {
-            state.rings.remove(&key);
-        }
+        Self::prune_outer_map(&mut state.rings, self.ttl, self.max_outer_keys, now, &key);
         snap
     }
 }
@@ -508,6 +514,32 @@ mod tests {
                 .rings
                 .contains_key(&("local".to_string(), "actor:a".to_string())),
             "a key whose ring emptied via TTL eviction must not linger in the outer map"
+        );
+    }
+
+    /// Regression (review r2 finding, 2026-07-09): `snapshot` must sweep the
+    /// WHOLE outer map, not just the queried key — otherwise a read-only
+    /// daemon (one that only ever calls `snapshot`, never `admit`) never
+    /// prunes any OTHER actor's stale key at all. Two actors age out; only
+    /// `actor:queried` is snapshotted, but `actor:other`'s stale key must be
+    /// removed too.
+    #[test]
+    fn snapshot_prunes_other_stale_keys_it_did_not_query() {
+        let ring = ReferenceRing::with_bounds(64, Duration::from_millis(20));
+        ring.admit("local", "actor:queried", Uuid::new_v4(), None);
+        ring.admit("local", "actor:other", Uuid::new_v4(), None);
+        std::thread::sleep(Duration::from_millis(40));
+
+        // Only `actor:queried` is ever snapshotted directly.
+        assert!(ring.snapshot("local", "actor:queried").is_empty());
+
+        let state = ring.state.lock().unwrap();
+        assert!(
+            !state
+                .rings
+                .contains_key(&("local".to_string(), "actor:other".to_string())),
+            "snapshotting one actor must also prune OTHER actors' fully-stale keys, \
+             not just the one queried"
         );
     }
 
