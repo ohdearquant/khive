@@ -127,6 +127,7 @@ For historical context, see [v0 archive](../_archive/adr_v0/README.md). v0 ADRs 
 | [ADR-100](ADR-100-store-backup-replication.md)               | Store Backup and Replication — Scheduled Differential Sync with Tiered Recovery Objectives (Proposed)           |
 | [ADR-101](ADR-101-kg-changeset-model.md)                     | KG Change-Set Model — Producer-Agnostic Op-List with Stage-Time Stable IDs (Proposed)                           |
 | [ADR-102](ADR-102-tiered-validate-and-merge.md)              | Tiered Validate-and-Merge — Rule-Gated Fast Path and Reviewed Change-Set Path (Proposed)                        |
+| [ADR-106](ADR-106-schedule-pack-executor.md)                 | Schedule Pack Executor — Daemon-Resident Tick for the Pending-Event Drain (Proposed)                            |
 
 ## Closed Taxonomies — Quick Reference
 
