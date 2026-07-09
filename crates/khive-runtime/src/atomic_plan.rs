@@ -149,6 +149,16 @@ pub enum PostCommitEffect {
         note: Option<String>,
         namespace: String,
     },
+    /// A committed note delete (soft or hard) — fire the pack-installed
+    /// note-mutation hook with the deleted note's kind (#750 fix-round 2,
+    /// codex r2 High 2: `DeletePlan` previously carried no `post_commit`
+    /// slot at all, so an atomic note delete never reached
+    /// `KhiveRuntime::fire_note_mutation_hook`, unlike `operations.rs`'s
+    /// `delete_note`, which fires it directly after a successful row
+    /// delete). Entity deletes have no equivalent — the hook system is
+    /// note-only (`khive-pack-memory`'s warm ANN cache is the only
+    /// installed consumer today).
+    NoteDeleted { note_id: Uuid, kind: String },
 }
 
 /// The natural key a committed symmetric edge update's surviving row must
@@ -204,6 +214,10 @@ pub struct DeletePlan {
     /// delete only) is unguarded — it may legitimately affect zero rows if
     /// the target had no incident edges.
     pub statements: Vec<PlanStatement>,
+    /// Deferred note-mutation-hook fire, for a note delete (#750 fix-round
+    /// 2). `PostCommitEffect::None` for entity and edge deletes — the hook
+    /// system is note-only.
+    pub post_commit: PostCommitEffect,
 }
 
 /// Write plan for a `link` op (create a typed directed edge). Endpoint
@@ -368,6 +382,7 @@ mod tests {
     fn delete_plan_guard_is_anchored_to_the_target_row_not_the_cascade() {
         let plan = DeletePlan {
             target_id: Uuid::new_v4(),
+            post_commit: PostCommitEffect::None,
             statements: vec![
                 guarded("delete-row", AffectedRowGuard::exactly(1)),
                 unguarded("cascade-edges"),

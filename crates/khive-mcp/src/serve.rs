@@ -1133,6 +1133,11 @@ pub fn build_registry_for_multi_backend(
     }
     registry.call_register_embedders(&default_runtime);
     registry.call_register_entity_type_validators(&default_runtime);
+    // #750 fix-round 1: install pack-owned note-mutation hooks (currently
+    // only khive-pack-memory's warm-ANN-cache invalidation) so KG's
+    // update/delete verbs notify caching packs even though there is no
+    // crate-level dependency between them.
+    registry.call_register_note_mutation_hooks(&default_runtime);
 
     let backend_for_pack: HashMap<&str, &StorageBackend> = per_pack_runtimes_local
         .iter()

@@ -392,6 +392,40 @@ impl PackRuntime for MemoryPack {
         fts_population_guard(&self.runtime).await;
     }
 
+    /// #750 fix-round 1: install a note-mutation hook on the runtime THIS
+    /// pack owns (`self.runtime`, not the `_runtime` param — mirrors
+    /// `KgPack::register_entity_type_validator`'s multi-backend rationale:
+    /// in a multi-backend deployment each pack is constructed with its own
+    /// per-pack runtime, and `self.runtime` is always that one).
+    ///
+    /// KG's `update`/`delete` verbs reach `KhiveRuntime::update_note`/
+    /// `delete_note` with no dependency on `khive-pack-memory` at all. When
+    /// those touch a `kind="memory"` note (content update, soft delete, or
+    /// hard delete), this hook invalidates the warm ANN cache and bumps the
+    /// affected models' write-generation counter — the same two calls
+    /// `memory.remember` already makes on its own write path (`ann::invalidate_namespace`
+    /// + `ann::bump_generation`) — so `ann::is_current()` correctly treats
+    /// the stale-but-still-installed index as a miss on the next recall.
+    fn register_note_mutation_hook(&self, _runtime: &KhiveRuntime) {
+        let runtime = self.runtime.clone();
+        let ann = self.ann.clone();
+        let hook: khive_runtime::NoteMutationHookFn = std::sync::Arc::new(move |kind, _id| {
+            let runtime = runtime.clone();
+            let ann = ann.clone();
+            Box::pin(async move {
+                if kind != "memory" {
+                    return;
+                }
+                crate::ann::invalidate_namespace(&runtime, &ann, "local").await;
+                for model in runtime.registered_embedding_model_names() {
+                    let key = crate::ann::AnnKey::new("local", model.as_str());
+                    crate::ann::bump_generation(&ann, &key).await;
+                }
+            })
+        });
+        self.runtime.install_note_mutation_hook(hook);
+    }
+
     async fn dispatch(
         &self,
         verb: &str,
@@ -670,5 +704,335 @@ mod ann_route_tests {
             ann.warm_route_count() > 0,
             "second recall must route through warm ANN, not exact sqlite-vec fallback"
         );
+    }
+}
+
+/// #750 fix-round 1 regressions: `memory.prune`, KG `update`, and KG `delete`
+/// all mutate the same memory-note corpus the warm ANN cache is built from,
+/// but only `memory.remember` bumped `AnnState::generations` before this
+/// round. Each test here warms the cache (proving `is_current()` is `true`
+/// for the registered model), performs the mutation WITHOUT any intervening
+/// `memory.remember`, and asserts `is_current()` is `false` afterward — the
+/// exact mechanism `handlers/common.rs`'s recall-path cache-hit gate checks
+/// before trusting an installed index.
+///
+/// This is a white-box, crate-internal assertion (`ann::is_current`/
+/// `ann::AnnKey` are `pub(crate)`) rather than a black-box recall-result
+/// check. Confirmed via a throwaway experiment (temporarily disabling the
+/// note-mutation hook call sites in `curation.rs`/`operations.rs`/
+/// `prune.rs`): for the delete path specifically, "the deleted note is
+/// absent from recall results" passes EVEN WITH THE BUG REINTRODUCED,
+/// because recall's post-search hydration filters soft-deleted notes
+/// regardless of ANN cache freshness — it is not a discriminating
+/// assertion. `is_current` is. The same experiment confirmed all three
+/// tests below fail (as expected) with the fix removed, and pass with it
+/// restored.
+#[cfg(test)]
+mod note_mutation_hook_tests {
+    use super::*;
+    use crate::ann;
+    use khive_pack_kg::KgPack;
+    use khive_runtime::VerbRegistryBuilder;
+    use serde_json::json;
+    use serial_test::serial;
+    use uuid::Uuid;
+
+    const FR1_MODEL: &str = "fr1-mutation-hook-model";
+
+    /// Build a kg+memory registry AND wire the note-mutation hook.
+    /// Production boot does this via `khive-mcp`'s `serve.rs`/`server.rs`
+    /// calling `VerbRegistry::call_register_note_mutation_hooks`; a
+    /// hand-built test registry must call it explicitly, same as this
+    /// codebase's existing `call_register_entity_type_validators` test
+    /// pattern. Also returns the `MemoryPack`'s `SharedAnn` handle (cloned
+    /// before the pack is moved into the builder) so tests can assert
+    /// `ann::is_current` directly.
+    fn fr1_build_registry(rt: &KhiveRuntime) -> (khive_runtime::VerbRegistry, SharedAnn) {
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(KgPack::new(rt.clone()));
+        let memory_pack = MemoryPack::new(rt.clone());
+        let ann = memory_pack.ann_for_test();
+        builder.register(memory_pack);
+        let registry = builder.build().expect("registry builds");
+        registry.call_register_note_mutation_hooks(rt);
+        (registry, ann)
+    }
+
+    fn fr1_key() -> ann::AnnKey {
+        ann::AnnKey::new("local", FR1_MODEL)
+    }
+
+    /// Seed one memory note, then run a `memory.recall` to synchronously
+    /// warm the ANN cache — the cache-miss fallback in `handlers/common.rs`
+    /// calls `ensure_ann_for_model` and awaits it before returning, so a
+    /// single recall is enough to guarantee the index is installed. Returns
+    /// the seeded note's id and asserts the cache is current before the
+    /// caller's mutation under test.
+    async fn fr1_seed_and_warm(
+        rt: &KhiveRuntime,
+        registry: &khive_runtime::VerbRegistry,
+        ann: &SharedAnn,
+        content: &str,
+        salience: f64,
+    ) -> Uuid {
+        rt.register_embedder(Fr1FixedVecProvider {
+            model_name: FR1_MODEL.to_string(),
+            vector: [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        });
+        let id = registry
+            .dispatch(
+                "memory.remember",
+                json!({"content": content, "salience": salience}),
+            )
+            .await
+            .expect("seed remember")["id"]
+            .as_str()
+            .expect("id")
+            .parse::<Uuid>()
+            .expect("valid uuid");
+
+        registry
+            .dispatch(
+                "memory.recall",
+                json!({
+                    "query": content,
+                    "namespace": "local",
+                    "fusion_strategy": "vector_only",
+                    "embedding_model": FR1_MODEL,
+                }),
+            )
+            .await
+            .expect("warm recall");
+
+        assert!(
+            ann::is_current(ann, &fr1_key()).await,
+            "sanity: warm-up recall must leave the ANN cache current before \
+             the mutation under test"
+        );
+        id
+    }
+
+    #[tokio::test]
+    #[serial(background_tasks)]
+    async fn fr1_prune_invalidates_warm_ann_without_subsequent_remember() {
+        let rt = KhiveRuntime::memory().expect("in-memory runtime");
+        let (registry, ann) = fr1_build_registry(&rt);
+
+        fr1_seed_and_warm(&rt, &registry, &ann, "fr1 prune target content", 0.9).await;
+
+        // `min_salience: 1.0` is strictly above the seeded note's 0.9
+        // salience, so it is the one candidate. No `memory.remember` call
+        // follows.
+        let pruned = registry
+            .dispatch(
+                "memory.prune",
+                json!({ "min_salience": 1.0, "namespace": "local" }),
+            )
+            .await
+            .expect("prune");
+        assert_eq!(
+            pruned["pruned"], 1,
+            "the seeded note must be the one candidate pruned: {pruned:?}"
+        );
+
+        assert!(
+            !ann::is_current(&ann, &fr1_key()).await,
+            "memory.prune deleting a candidate must invalidate the warm ANN \
+             generation for affected models (#750 fix-round 1)"
+        );
+    }
+
+    #[tokio::test]
+    #[serial(background_tasks)]
+    async fn fr1_kg_update_reindex_invalidates_warm_ann_without_subsequent_remember() {
+        let rt = KhiveRuntime::memory().expect("in-memory runtime");
+        let (registry, ann) = fr1_build_registry(&rt);
+
+        let id = fr1_seed_and_warm(&rt, &registry, &ann, "fr1 update target content", 0.7).await;
+
+        // KG's generic `update` verb — NOT `memory.remember` — changes the
+        // note's content. Same call shape `khive-pack-kg/src/handlers/
+        // update.rs` dispatches through `KhiveRuntime::update_note`; no
+        // `kind` param needed, the UUID resolves the substrate.
+        registry
+            .dispatch(
+                "update",
+                json!({ "id": id.to_string(), "content": "entirely different rewritten content" }),
+            )
+            .await
+            .expect("kg update on memory-kind note");
+
+        assert!(
+            !ann::is_current(&ann, &fr1_key()).await,
+            "a KG `update` that changes a memory-kind note's content must \
+             invalidate the warm ANN generation (#750 fix-round 1)"
+        );
+    }
+
+    #[tokio::test]
+    #[serial(background_tasks)]
+    async fn fr1_kg_delete_invalidates_warm_ann_without_subsequent_remember() {
+        let rt = KhiveRuntime::memory().expect("in-memory runtime");
+        let (registry, ann) = fr1_build_registry(&rt);
+
+        let id = fr1_seed_and_warm(&rt, &registry, &ann, "fr1 delete target content", 0.7).await;
+
+        // KG's generic `delete` verb (soft delete by default) — NOT any
+        // memory-pack verb.
+        let deleted = registry
+            .dispatch("delete", json!({ "id": id.to_string() }))
+            .await
+            .expect("kg delete on memory-kind note");
+        assert_eq!(
+            deleted["deleted"].as_bool(),
+            Some(true),
+            "delete must report success: {deleted:?}"
+        );
+
+        assert!(
+            !ann::is_current(&ann, &fr1_key()).await,
+            "a KG `delete` on a memory-kind note must invalidate the warm \
+             ANN generation (#750 fix-round 1)"
+        );
+    }
+
+    /// #750 fix-round 2 (codex r2 High 1): `merge_note`'s non-dry-run
+    /// success path reindexes the surviving note (a corpus change exactly
+    /// like `update_note`'s `text_changed` branch) but never fired the
+    /// note-mutation hook. Same white-box shape as the three fr1 tests
+    /// above.
+    ///
+    /// Both notes are seeded and the cache is warmed only ONCE, AFTER both
+    /// exist — NOT via `fr1_seed_and_warm` for the first note followed by a
+    /// second `memory.remember` for the second, because `memory.remember`'s
+    /// own handler already calls `ann::bump_generation` on every create
+    /// (`handlers/remember.rs`). Warming before the second note existed
+    /// would make the merge assertion pass trivially off that unrelated
+    /// bump — this exact non-discriminating-test trap is what caught out
+    /// an earlier draft of this test (confirmed by a disable/re-enable
+    /// run: the earlier draft still passed with the merge fix's hook-fire
+    /// call commented out). See the fix-round-2 report for the full
+    /// before/after evidence.
+    #[tokio::test]
+    #[serial(background_tasks)]
+    async fn fr2_kg_merge_invalidates_warm_ann_without_subsequent_remember() {
+        let rt = KhiveRuntime::memory().expect("in-memory runtime");
+        let (registry, ann) = fr1_build_registry(&rt);
+
+        rt.register_embedder(Fr1FixedVecProvider {
+            model_name: FR1_MODEL.to_string(),
+            vector: [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        });
+
+        let into_id = registry
+            .dispatch(
+                "memory.remember",
+                json!({"content": "fr2 merge into content", "salience": 0.7}),
+            )
+            .await
+            .expect("seed into-note")["id"]
+            .as_str()
+            .expect("id")
+            .parse::<Uuid>()
+            .expect("valid uuid");
+        let from_id = registry
+            .dispatch(
+                "memory.remember",
+                json!({"content": "fr2 merge from content", "salience": 0.7}),
+            )
+            .await
+            .expect("seed from-note")["id"]
+            .as_str()
+            .expect("id")
+            .parse::<Uuid>()
+            .expect("valid uuid");
+
+        // ONE warm-up recall, after BOTH notes exist.
+        registry
+            .dispatch(
+                "memory.recall",
+                json!({
+                    "query": "fr2 merge into content",
+                    "namespace": "local",
+                    "fusion_strategy": "vector_only",
+                    "embedding_model": FR1_MODEL,
+                }),
+            )
+            .await
+            .expect("warm recall");
+        assert!(
+            ann::is_current(&ann, &fr1_key()).await,
+            "sanity: warm-up recall must leave the ANN cache current before \
+             the merge under test"
+        );
+
+        registry
+            .dispatch(
+                "merge",
+                json!({
+                    "into_id": into_id.to_string(),
+                    "from_id": from_id.to_string(),
+                    "kind": "memory",
+                }),
+            )
+            .await
+            .expect("kg merge on memory-kind notes");
+
+        assert!(
+            !ann::is_current(&ann, &fr1_key()).await,
+            "a KG `merge` of two memory-kind notes must invalidate the warm \
+             ANN generation (#750 fix-round 2, codex r2 High 1)"
+        );
+    }
+
+    struct Fr1FixedVecProvider {
+        model_name: String,
+        vector: [f32; 8],
+    }
+
+    #[async_trait::async_trait]
+    impl khive_runtime::EmbedderProvider for Fr1FixedVecProvider {
+        fn name(&self) -> &str {
+            &self.model_name
+        }
+
+        fn dimensions(&self) -> usize {
+            8
+        }
+
+        async fn build(
+            &self,
+        ) -> Result<std::sync::Arc<dyn lattice_embed::EmbeddingService>, RuntimeError> {
+            Ok(std::sync::Arc::new(Fr1FixedVecService {
+                vector: self.vector,
+            }))
+        }
+    }
+
+    struct Fr1FixedVecService {
+        vector: [f32; 8],
+    }
+
+    #[async_trait::async_trait]
+    impl lattice_embed::EmbeddingService for Fr1FixedVecService {
+        async fn embed(
+            &self,
+            texts: &[String],
+            _model: lattice_embed::EmbeddingModel,
+        ) -> Result<Vec<Vec<f32>>, lattice_embed::EmbedError> {
+            // Every text maps to the SAME fixed vector — deterministic
+            // cosine=1.0 between any query and any seeded content under this
+            // provider, so ANN warming/hit behavior is fully controlled by
+            // this test module, not by real embedding semantics.
+            Ok(texts.iter().map(|_| self.vector.to_vec()).collect())
+        }
+
+        fn supports_model(&self, _model: lattice_embed::EmbeddingModel) -> bool {
+            true
+        }
+
+        fn name(&self) -> &'static str {
+            "fr1-fixed-vec"
+        }
     }
 }

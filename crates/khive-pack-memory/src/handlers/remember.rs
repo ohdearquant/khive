@@ -143,6 +143,16 @@ impl MemoryPack {
                 None => self.runtime.registered_embedding_model_names(),
             };
             for model in affected_models {
+                // #750: bump this model's write-generation counter BEFORE
+                // triggering the background warm, so `ensure_ann_background`'s
+                // (and, downstream, `ensure_ann_for_model`'s) write-generation
+                // floor for this call always reflects the note just written —
+                // any build that started capturing its own floor before this
+                // point is provably looking at a stale corpus and will lose
+                // the install race to whichever rebuild captures at or after
+                // this bump.
+                let key = ann::AnnKey::from_token(write_token, &model);
+                ann::bump_generation(&self.ann, &key).await;
                 ann::ensure_ann_background(&self.runtime, write_token, &self.ann, &model).await;
             }
         }

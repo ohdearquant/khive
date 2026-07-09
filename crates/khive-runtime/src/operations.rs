@@ -2020,26 +2020,50 @@ impl KhiveRuntime {
         Ok(paths)
     }
 
-    /// Batch-query for soft-deleted entity UUIDs in `ids`.
+    /// Batch-query for soft-deleted UUIDs in `ids`, across BOTH the entities
+    /// and notes tables.
     ///
-    /// Returns the subset of `ids` that have `deleted_at IS NOT NULL` in the
-    /// entities table. Takes `Vec<Uuid>` (not an iterator) so the async
-    /// state machine holds only owned data — no iterator borrow across yields.
+    /// Neighbor/traverse candidates can be note-kind nodes (e.g. reached via
+    /// `annotates` edges) as well as entities; the original Fix-2 screen only
+    /// consulted `entities`, so soft-deleted note targets leaked through and
+    /// hydrated as blank/missing hits (#748). This is a view-layer read-only
+    /// screen — it does not touch edges or mutate any data.
+    ///
+    /// Returns the subset of `ids` that have `deleted_at IS NOT NULL` in
+    /// either table. Takes `Vec<Uuid>` (not an iterator) so the async state
+    /// machine holds only owned data — no iterator borrow across yields.
     async fn deleted_entity_ids(&self, ids: Vec<Uuid>) -> std::collections::HashSet<Uuid> {
         if ids.is_empty() {
             return std::collections::HashSet::new();
         }
         let id_strs: Vec<String> = ids.iter().map(|u| u.to_string()).collect();
-        let placeholders = id_strs
-            .iter()
-            .enumerate()
-            .map(|(i, _)| format!("?{}", i + 1))
+        let n = id_strs.len();
+        // Each UNION half gets its OWN numbered-placeholder block (?1..?n for
+        // entities, ?(n+1)..?(2n) for notes) — numbered SQLite params bind by
+        // index, so reusing the same numbers across halves would silently
+        // collapse to a single shared block instead of binding the full list
+        // twice (see khive-db/src/stores/graph.rs batch_neighbors: "each half
+        // is a fully independent positional-parameter block").
+        let entities_placeholders = (0..n)
+            .map(|i| format!("?{}", i + 1))
+            .collect::<Vec<_>>()
+            .join(",");
+        let notes_placeholders = (0..n)
+            .map(|i| format!("?{}", n + i + 1))
             .collect::<Vec<_>>()
             .join(",");
         let sql_str = format!(
-            "SELECT id FROM entities WHERE id IN ({placeholders}) AND deleted_at IS NOT NULL"
+            "SELECT id FROM entities WHERE id IN ({entities_placeholders}) AND deleted_at IS NOT NULL \
+             UNION \
+             SELECT id FROM notes WHERE id IN ({notes_placeholders}) AND deleted_at IS NOT NULL"
         );
-        let params: Vec<SqlValue> = id_strs.into_iter().map(SqlValue::Text).collect();
+        // Same id list bound twice — once per UNION arm's independent placeholder block.
+        let params: Vec<SqlValue> = id_strs
+            .iter()
+            .chain(id_strs.iter())
+            .cloned()
+            .map(SqlValue::Text)
+            .collect();
         let stmt = SqlStatement {
             sql: sql_str,
             params,
@@ -3105,7 +3129,16 @@ impl KhiveRuntime {
             format!(" AND namespace IN ({})", placeholders.join(", "))
         });
 
+        // #749: a UUID can legitimately exist in more than one scanned table
+        // (e.g. an entity id string that also happens to be an edge id — the
+        // scan is purely a text-prefix LIKE across independent tables, not a
+        // substrate-exclusive lookup). Without dedup, a single record hit
+        // twice across tables inflated `matches.len()` past 1 and produced a
+        // false `AmbiguousPrefix` naming the SAME UUID twice. `seen` tracks
+        // UUIDs already pushed so `matches` (and thus every length check,
+        // including the early-exit below) reflects DISTINCT UUIDs only.
         let mut matches: Vec<String> = Vec::new();
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
         let mut reader = self.sql().reader().await.map_err(RuntimeError::Storage)?;
 
         for (table, has_deleted_at) in tables {
@@ -3131,7 +3164,9 @@ impl KhiveRuntime {
                     for row in rows {
                         if let Some(col) = row.columns.first() {
                             if let SqlValue::Text(s) = &col.value {
-                                matches.push(s.clone());
+                                if seen.insert(s.clone()) {
+                                    matches.push(s.clone());
+                                }
                             }
                         }
                     }
@@ -3444,6 +3479,13 @@ impl KhiveRuntime {
             event_store.append_event(event).await.map_err(|e| {
                 RuntimeError::Internal(format!("delete_note: event store write failed: {e}"))
             })?;
+            // #750 fix-round 1: a soft OR hard delete removes the note's
+            // vectors/FTS document above — any pack-owned vector-derived
+            // cache (e.g. khive-pack-memory's warm ANN index) needs to know
+            // the corpus changed, reached via this generic hook so
+            // khive-runtime never takes a dependency on khive-pack-memory.
+            // No-op when no pack has installed a hook.
+            self.fire_note_mutation_hook(&note.kind, id).await;
         }
         Ok(deleted)
     }
@@ -6333,6 +6375,80 @@ mod tests {
         );
     }
 
+    /// #749: a single UUID legitimately present in TWO scanned tables
+    /// (entities and notes here) must resolve cleanly to that one UUID, not
+    /// a false `AmbiguousPrefix` naming the same UUID twice. Before the fix,
+    /// `resolve_prefix_inner` pushed every table hit into `matches` with no
+    /// cross-table dedup, so `matches.len()` became 2 for a single record.
+    #[tokio::test]
+    async fn resolve_prefix_cross_table_duplicate_uuid_resolves_cleanly() {
+        use khive_storage::entity::Entity;
+
+        let rt = rt();
+        let tok = NamespaceToken::local();
+        let shared_id = Uuid::parse_str("ccddeeff-1111-4000-8000-000000000001").unwrap();
+
+        let mut entity = Entity::new("local", "concept", "Nvk749Entity");
+        entity.id = shared_id;
+        rt.entities(&tok)
+            .unwrap()
+            .upsert_entity(entity)
+            .await
+            .unwrap();
+
+        let mut note = Note::new("local", "observation", "nvk749 note with the same id");
+        note.id = shared_id;
+        rt.notes(&tok).unwrap().upsert_note(note).await.unwrap();
+
+        let resolved = rt
+            .resolve_prefix(&tok, "ccddeeff")
+            .await
+            .expect("#749: a UUID present in two tables must not be reported as ambiguous");
+        assert_eq!(
+            resolved,
+            Some(shared_id),
+            "#749: cross-table duplicate must resolve to the single shared UUID"
+        );
+    }
+
+    /// #749: the early-exit inside the per-table scan loop (`if matches.len()
+    /// > 1 { break }`) must also operate on DEDUPED state — otherwise a
+    /// cross-table duplicate could still short-circuit the scan before a
+    /// later table contributes the SAME UUID again, which would have masked
+    /// the bug rather than exercising it. This drives the duplicate through
+    /// the earliest two tables scanned (entities, notes) so the early-exit
+    /// path is the one under test, not a post-loop dedup applied too late.
+    #[tokio::test]
+    async fn resolve_prefix_early_exit_uses_deduped_match_count() {
+        use khive_storage::entity::Entity;
+
+        let rt = rt();
+        let tok = NamespaceToken::local();
+        let shared_id = Uuid::parse_str("ddeeff11-2222-4000-8000-000000000002").unwrap();
+
+        // entities and notes are the first two tables scanned inside
+        // resolve_prefix_inner — the same UUID in both must not trip the
+        // mid-scan `matches.len() > 1` break as if two distinct UUIDs had
+        // been found.
+        let mut entity = Entity::new("local", "concept", "Nvk749bEntity");
+        entity.id = shared_id;
+        rt.entities(&tok)
+            .unwrap()
+            .upsert_entity(entity)
+            .await
+            .unwrap();
+
+        let mut note = Note::new("local", "observation", "nvk749b note with the same id");
+        note.id = shared_id;
+        rt.notes(&tok).unwrap().upsert_note(note).await.unwrap();
+
+        let resolved = rt
+            .resolve_prefix(&tok, "ddeeff11")
+            .await
+            .expect("#749: deduped early-exit must not falsely report ambiguity");
+        assert_eq!(resolved, Some(shared_id));
+    }
+
     // ---- Event resolution tests (issue #30) ----
     //
     // resolve_prefix and handle_get already include events; these tests are
@@ -7847,10 +7963,24 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(before.len(), 1);
+        let edge_id = before[0].edge_id;
 
         // Soft delete must NOT cascade edges (data-vs-view principle).
         let deleted = rt.delete_note(&tok, note_target.id, false).await.unwrap();
         assert!(deleted, "soft delete must return true");
+
+        // The edge itself must survive the soft delete — checked at the
+        // storage/edge layer directly (`get_edge`), not through `neighbors()`.
+        // `neighbors()` is a VIEW query and, per #748, now correctly screens
+        // out soft-deleted note targets — so it no longer surfaces this edge
+        // once note_target is soft-deleted, even though the edge row itself
+        // is untouched (data-vs-view principle: the edge is data, what
+        // `neighbors()` shows is a view decision).
+        let edge_after = rt.get_edge(&tok, edge_id).await.unwrap();
+        assert!(
+            edge_after.is_some(),
+            "soft delete must NOT cascade edges; get_edge returned None"
+        );
 
         let after = rt
             .neighbors(
@@ -7864,8 +7994,8 @@ mod tests {
             .unwrap();
         assert_eq!(
             after.len(),
-            1,
-            "soft delete must NOT cascade edges; got {after:?}"
+            0,
+            "#748: neighbors() must screen out the soft-deleted note target; got {after:?}"
         );
     }
 

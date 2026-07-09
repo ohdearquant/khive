@@ -938,36 +938,45 @@ impl MemoryPack {
                 // retry — up to ANN_OVERFETCH_MAX_ROUNDS total rounds, or until the
                 // index is exhausted (returned hits < requested k). Single-namespace
                 // stores fill on round 1 at zero extra cost.
-                let initial_raw_hits: Option<Vec<(Uuid, f32)>> =
-                    match ann::search_loaded(&self.ann, &key, &vec, ann_fetch_limit).await {
-                        Ok(Some(hits)) => Some(hits),
-                        Ok(None) => {
-                            let status = ann::ensure_ann_for_model(
-                                &self.runtime,
-                                token,
-                                &self.ann,
-                                &model_name,
-                            )
-                            .await?;
-                            tracing::debug!(
-                                ?status,
-                                model = %model_name,
-                                namespace = %ns,
-                                "memory ANN ensured on recall miss"
-                            );
-                            ann::search_loaded(&self.ann, &key, &vec, ann_fetch_limit).await?
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                error = %e,
-                                namespace = %ns,
-                                model = %model_name,
-                                "memory ANN search failed; falling back to exact sqlite-vec"
-                            );
-                            ann::clear_key(&self.ann, &key).await;
-                            None
-                        }
-                    };
+                // #750: a merely-present cache entry is not sufficient — a slow
+                // background build that snapshotted the corpus before the most
+                // recent write can still be sitting in the cache (it lost the
+                // install race for freshness but was still the first to reach
+                // an empty slot). `is_current` treats "present but stale
+                // relative to this model's write-generation counter" the same
+                // as a genuine cache miss, so a just-written memory is never
+                // silently served from a snapshot that predates it.
+                let cache_fresh = ann::is_current(&self.ann, &key).await;
+                let search_result = if cache_fresh {
+                    ann::search_loaded(&self.ann, &key, &vec, ann_fetch_limit).await
+                } else {
+                    Ok(None)
+                };
+                let initial_raw_hits: Option<Vec<(Uuid, f32)>> = match search_result {
+                    Ok(Some(hits)) => Some(hits),
+                    Ok(None) => {
+                        let status =
+                            ann::ensure_ann_for_model(&self.runtime, token, &self.ann, &model_name)
+                                .await?;
+                        tracing::debug!(
+                            ?status,
+                            model = %model_name,
+                            namespace = %ns,
+                            "memory ANN ensured on recall miss"
+                        );
+                        ann::search_loaded(&self.ann, &key, &vec, ann_fetch_limit).await?
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            namespace = %ns,
+                            model = %model_name,
+                            "memory ANN search failed; falling back to exact sqlite-vec"
+                        );
+                        ann::clear_key(&self.ann, &key).await;
+                        None
+                    }
+                };
 
                 if let Some(first_raw) = initial_raw_hits {
                     // Bounded retry: widen fetch window if visible-namespace survivors

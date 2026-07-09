@@ -28,6 +28,24 @@ use crate::error::{RuntimeError, RuntimeResult};
 pub type EntityTypeValidatorFn =
     Arc<dyn Fn(&str, Option<&str>) -> Result<Option<String>, RuntimeError> + Send + Sync>;
 
+/// Callback type for a pack-installed note-mutation hook (#750 fix-round 1).
+///
+/// Invoked by `update_note` (when the note's text/embedding actually
+/// changed) and `delete_note` (soft or hard) with `(note_kind, note_id)`,
+/// AFTER the mutation has been durably applied. Returns a boxed future so
+/// the hook can await async cache-invalidation work (e.g.
+/// `khive-pack-memory`'s ANN warm-cache generation bump) without the
+/// `KhiveRuntime`/`khive-runtime` crate depending on any pack crate — the
+/// dependency points the other way (packs depend on `khive-runtime`, not
+/// vice versa), so this is the same "runtime exposes an extension point,
+/// pack installs into it" shape as `EntityTypeValidatorFn` /
+/// `install_edge_rules`, just async.
+pub type NoteMutationHookFn = Arc<
+    dyn Fn(String, uuid::Uuid) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
+        + Send
+        + Sync,
+>;
+
 pub use crate::config::{
     assert_db_anchor_consistent, parse_pack_list, resolve_db_anchor, resolve_project_actor_id,
     runtime_config_from_khive_config, BackendId, NamespaceToken, RuntimeConfig,
@@ -75,6 +93,18 @@ pub struct KhiveRuntime {
     /// without packs), entity-type validation is skipped — the pack handler layer
     /// is the primary enforcement point, same as for `valid_entity_kinds`.
     entity_type_validator: Arc<RwLock<Option<EntityTypeValidatorFn>>>,
+    /// Pack-installed note-mutation hook (#750 fix-round 1).
+    ///
+    /// When `Some`, `update_note` (on text change) and `delete_note` (soft
+    /// or hard) call this after the mutation is durably applied, so a pack
+    /// that caches derived state keyed by note content (e.g. `khive-pack-memory`'s
+    /// warm ANN index) can invalidate/advance its own generation counter even
+    /// when the mutation arrived through a different pack's verb (e.g. KG's
+    /// `update`/`delete` on a `kind="memory"` note) that has no dependency on
+    /// the reacting pack. `None` when no pack installs one (bare runtime, or
+    /// no pack cares about note-mutation notifications) — the call becomes a
+    /// no-op check of an `Option`.
+    note_mutation_hook: Arc<RwLock<Option<NoteMutationHookFn>>>,
 }
 
 impl KhiveRuntime {
@@ -115,6 +145,7 @@ impl KhiveRuntime {
             valid_entity_kinds: Arc::new(RwLock::new(Vec::new())),
             valid_note_kinds: Arc::new(RwLock::new(Vec::new())),
             entity_type_validator: Arc::new(RwLock::new(None)),
+            note_mutation_hook: Arc::new(RwLock::new(None)),
         })
     }
 
@@ -143,6 +174,7 @@ impl KhiveRuntime {
             valid_entity_kinds: Arc::new(RwLock::new(Vec::new())),
             valid_note_kinds: Arc::new(RwLock::new(Vec::new())),
             entity_type_validator: Arc::new(RwLock::new(None)),
+            note_mutation_hook: Arc::new(RwLock::new(None)),
         })
     }
 
@@ -170,6 +202,7 @@ impl KhiveRuntime {
             valid_entity_kinds: Arc::new(RwLock::new(Vec::new())),
             valid_note_kinds: Arc::new(RwLock::new(Vec::new())),
             entity_type_validator: Arc::new(RwLock::new(None)),
+            note_mutation_hook: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -200,7 +233,7 @@ impl KhiveRuntime {
     /// this returns a new `KhiveRuntime` backed by the main
     /// `Arc<StorageBackend>` and sharing all registry state (`embedder_registry`,
     /// `edge_rules`, `valid_entity_kinds`, `valid_note_kinds`,
-    /// `entity_type_validator`) with `self`.
+    /// `entity_type_validator`, `note_mutation_hook`) with `self`.
     /// No database I/O occurs; no embedding models are reloaded.
     ///
     /// Use `core()` for notes and entities that must reside in the shared graph
@@ -226,6 +259,7 @@ impl KhiveRuntime {
                     valid_entity_kinds: self.valid_entity_kinds.clone(),
                     valid_note_kinds: self.valid_note_kinds.clone(),
                     entity_type_validator: self.entity_type_validator.clone(),
+                    note_mutation_hook: self.note_mutation_hook.clone(),
                 }
             }
         }
@@ -613,6 +647,38 @@ impl KhiveRuntime {
         match guard.as_ref() {
             None => Ok(entity_type.map(str::to_string)),
             Some(validate) => validate(kind, entity_type),
+        }
+    }
+
+    /// Install a pack-owned note-mutation hook (#750 fix-round 1).
+    ///
+    /// Overwrites any previously-installed hook, same single-slot semantics
+    /// as [`install_entity_type_validator`](Self::install_entity_type_validator).
+    /// In practice only one pack (`khive-pack-memory`) installs one today;
+    /// if a second pack ever needs this, the slot should be widened to a
+    /// `Vec` at that point rather than silently overwritten.
+    pub fn install_note_mutation_hook(&self, f: NoteMutationHookFn) {
+        if let Ok(mut guard) = self.note_mutation_hook.write() {
+            *guard = Some(f);
+        }
+    }
+
+    /// Invoke the pack-installed note-mutation hook, if any.
+    ///
+    /// `kind` is the note's `kind` string (e.g. `"memory"`); `id` is the
+    /// note's UUID. No-op when no hook is installed (bare runtime, or no
+    /// pack cares). Errors inside the hook are the hook's own concern to
+    /// handle/log — this call site cannot propagate a failure without
+    /// changing `update_note`/`delete_note`'s already-committed success
+    /// return value.
+    pub(crate) async fn fire_note_mutation_hook(&self, kind: &str, id: uuid::Uuid) {
+        let hook = self
+            .note_mutation_hook
+            .read()
+            .ok()
+            .and_then(|guard| guard.clone());
+        if let Some(hook) = hook {
+            hook(kind.to_string(), id).await;
         }
     }
 
