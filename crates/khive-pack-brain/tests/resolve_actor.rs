@@ -120,14 +120,16 @@ async fn explicit_actor_param_overrides_dispatch_identity() {
     );
 }
 
-/// The anonymous caller never matches an explicit binding (#708 invariant):
-/// with no configured actor and no `actor` param, resolution falls through to
-/// a non-binding fallback.
+/// The anonymous caller never matches an explicit binding (#708 invariant).
+/// The binding deliberately uses `actor="local"` — the anonymous `ActorRef`
+/// carries raw id `"local"`, so this test fails if `handle_resolve` ever
+/// regresses from `binding_id()` (anonymous → `None`) to the raw actor id,
+/// which would let an unauthenticated caller match an explicit `local` row.
 #[tokio::test]
 async fn anonymous_caller_does_not_match_explicit_binding() {
     let rt = runtime_with_actor(None);
     let brain = Arc::new(BrainPack::new(rt.clone()));
-    bind_seat_profile(&brain, &rt, "lambda:test-seat").await;
+    bind_seat_profile(&brain, &rt, "local").await;
 
     let registry = VerbRegistryBuilder::new().build().expect("registry");
     let token = rt.authorize(Namespace::local()).expect("token");
