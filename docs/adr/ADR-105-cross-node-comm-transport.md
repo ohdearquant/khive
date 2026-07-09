@@ -1,6 +1,6 @@
 # ADR-105: Cross-node comm transport (node channel adapter + hub ingress)
 
-- Status: Proposed
+- Status: Accepted (signed 2026-07-08, with riders R1 and R2 below)
 - Date: 2026-07-08
 - Depends on: [ADR-056](ADR-056-channel-transport-layer.md) (channel transport
   abstraction), [ADR-057](ADR-057-comm-actor-addressed-delivery.md) (actor-addressed
@@ -138,6 +138,19 @@ A hub-and-mail-spoke deployment moves messages to a node nobody reads — it val
 plumbing while delivering nothing. The primary spoke runs the same adapter in the same
 portless posture; including it is one more config and one more bearer. v0 is the
 three-node star, verified by the end-to-end flow above.
+
+## Sign-off riders (binding)
+
+- **R1 — executable success criterion.** The end-to-end success criterion in Context is
+  delivered as an executable smoke script in the implementation lane, not prose. The
+  script must include a deliberate re-push of an already-delivered envelope and assert
+  exactly-once landing (external-id dedup observed, zero duplicate inbox rows).
+- **R2 — auth-before-parse stays testable.** The hub ingress must have a test proving
+  that a request with a bad bearer and a malformed body is rejected with zero parse
+  attempts of the body.
+- The transitive-trust residual risk (Consequences below) is acknowledged for v0 at
+  sign-off; its revisit trigger converts to a tracked issue when the first
+  implementation PR opens.
 
 ## Consequences
 
