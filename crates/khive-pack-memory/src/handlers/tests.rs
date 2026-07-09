@@ -66,6 +66,7 @@ fn effective_config_uses_defaults() {
         tag_mode: TagMode::Any,
         entity_names: None,
         full_content: None,
+        profile_id: None,
     };
     let cfg = p.effective_config(RecallConfig::default());
     assert!((cfg.relevance_weight - 0.70).abs() < 1e-12);
@@ -91,6 +92,7 @@ fn effective_config_legacy_overrides() {
         tag_mode: TagMode::Any,
         entity_names: None,
         full_content: None,
+        profile_id: None,
     };
     let cfg = p.effective_config(RecallConfig::default());
     assert!((cfg.min_score - 0.5).abs() < 1e-12);
@@ -118,6 +120,7 @@ fn effective_config_explicit_config_wins() {
         tag_mode: TagMode::Any,
         entity_names: None,
         full_content: None,
+        profile_id: None,
     };
     let cfg = p.effective_config(RecallConfig::default());
     assert!((cfg.relevance_weight - 0.50).abs() < 1e-12);
@@ -149,6 +152,7 @@ fn test_weighted_strategy_preserves_pack_weights() {
         tag_mode: TagMode::Any,
         entity_names: None,
         full_content: None,
+        profile_id: None,
     };
 
     let mut cfg = p.effective_config(base);
@@ -203,6 +207,7 @@ fn test_weighted_strategy_from_rrf_config_uses_vector_heavy_defaults() {
         tag_mode: TagMode::Any,
         entity_names: None,
         full_content: None,
+        profile_id: None,
     };
 
     let mut cfg = p.effective_config(base);

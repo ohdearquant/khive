@@ -161,6 +161,34 @@ pub(super) async fn resolve_serving_profile(
     .await
 }
 
+/// Entity-posterior cache capacity used when reconstructing a served
+/// profile's `BalancedRecallState` from its `brain.profile` snapshot
+/// (ADR-104 §1). Matches the capacity `MemoryPack::recall_state` uses for
+/// its own in-process posterior state (`pack.rs`); the brain pack's
+/// snapshot carries its own LRU eviction order (`entity_posterior_order`),
+/// so this only bounds how many entries `from_snapshot` restores.
+pub(super) const PROFILE_STATE_ENTITY_CAPACITY: usize = 10_000;
+
+/// Reconstruct a served profile's live `BalancedRecallState` from a
+/// `brain.profile` response's `state_snapshot` field (ADR-104 §1).
+///
+/// Returns `None` when the snapshot is absent or malformed — callers
+/// degrade to configured defaults in that case, never fail the recall.
+pub(super) fn balanced_recall_state_from_profile_response(
+    resp: &Value,
+) -> Option<khive_brain_core::BalancedRecallState> {
+    let snap_val = resp.get("state_snapshot")?;
+    if snap_val.is_null() {
+        return None;
+    }
+    let snapshot: khive_brain_core::BalancedRecallSnapshot =
+        serde_json::from_value(snap_val.clone()).ok()?;
+    Some(khive_brain_core::BalancedRecallState::from_snapshot(
+        snapshot,
+        PROFILE_STATE_ENTITY_CAPACITY,
+    ))
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct RememberParams {
@@ -229,6 +257,13 @@ pub(super) struct RecallParams {
     pub(super) entity_names: Option<Vec<String>>,
     #[serde(default)]
     pub(super) full_content: Option<bool>,
+    /// ADR-104 §4: explicit serving-profile override. When set, short-circuits
+    /// ADR-081 binding resolution — the named profile's `BalancedRecallState`
+    /// serves this request and is stamped as `served_by_profile_id`, exactly
+    /// like a resolved profile. An unknown profile_id is a per-op error, not
+    /// a silent fallback to defaults.
+    #[serde(default)]
+    pub(super) profile_id: Option<String>,
 }
 
 impl RecallParams {
@@ -315,6 +350,10 @@ pub(super) fn compute_score(
             salience_contribution: i_contrib,
             temporal_contribution: t_contrib,
         },
+        // ADR-104 §3: set to neutral/absent here; `handle_recall` overwrites
+        // both when a profile served the request (component 1 ran).
+        profile_component: 1.0,
+        entity_posterior_mean: None,
     };
     (total, breakdown)
 }
