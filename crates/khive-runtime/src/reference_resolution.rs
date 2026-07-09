@@ -8,7 +8,10 @@
 //!    8+ hex-char prefix resolves through the existing by-ID path
 //!    (`KhiveRuntime::resolve_by_id` / `resolve_prefix_unfiltered`) instead of
 //!    being treated as free text — it must not error just because it arrived
-//!    through `resolve_reference` rather than `get`.
+//!    through `resolve_reference` rather than `get`. Scoped to entity ids
+//!    only, identically for the full-UUID and prefix forms (matching the
+//!    ring's entity-only contract); a note/edge/event id-string is
+//!    `NotFound` here, not an error — a caller resolving those uses `get`.
 //! 2. **Recently-referenced ring.** An exact (case-insensitive) or substring
 //!    match against this actor's ring (`reference_ring::ReferenceRing`).
 //! 3. **Hybrid-search fallback.** `KhiveRuntime::hybrid_search` over the
@@ -23,6 +26,7 @@ use std::str::FromStr;
 use uuid::Uuid;
 
 use crate::error::{RuntimeError, RuntimeResult};
+use crate::operations::Resolved;
 use crate::reference_ring::ReferenceRing;
 use crate::runtime::{KhiveRuntime, NamespaceToken};
 
@@ -48,18 +52,35 @@ pub enum ReferenceResolution {
 const RING_EXACT_CONFIDENCE: f64 = 0.95;
 /// Ring-match confidence for a substring match (either direction).
 const RING_SUBSTRING_CONFIDENCE: f64 = 0.7;
-/// A single ring/search candidate auto-resolves only at or above this bar;
-/// below it, the sole candidate is still surfaced, just as `Ambiguous` (never
-/// silently accepted, never silently dropped — see F7).
-const AUTO_RESOLVE_CONFIDENCE: f64 = 0.7;
-/// Hybrid-search fallback: the top hit auto-resolves only when it leads the
-/// runner-up by at least this ratio — RRF scores are not on a fixed 0..1
-/// confidence scale, so a fixed absolute bar can't express "decisively best"
-/// the way it can for the ring. Below the margin, every hit above the score
-/// floor is surfaced as a candidate instead.
+/// A single ring candidate auto-resolves only at or above this bar; below
+/// it, the sole candidate is still surfaced, just as `Ambiguous` (never
+/// silently accepted, never silently dropped — see F7). Ring-stage only:
+/// ring scores are fixed constants on this same 0..1 scale
+/// (`RING_EXACT_CONFIDENCE` / `RING_SUBSTRING_CONFIDENCE`), so comparing them
+/// against a fixed bar is meaningful. The search stage below uses its own,
+/// deliberately separate rule — see `SEARCH_RESOLVED_CONFIDENCE`.
+const RING_AUTO_RESOLVE_CONFIDENCE: f64 = 0.7;
+/// Hybrid-search fallback: the top hit auto-resolves over a runner-up only
+/// when it leads by at least this ratio — RRF scores are not on a fixed
+/// 0..1 confidence scale, so a fixed absolute bar can't express "decisively
+/// best" the way it can for the ring. Below the margin, every hit above the
+/// score floor is surfaced as a candidate instead.
 const SEARCH_MARGIN_RATIO: f64 = 2.0;
 /// Hybrid-search hits below this score never enter the candidate set at all.
 const SEARCH_SCORE_FLOOR: f64 = 0.0;
+/// Confidence reported on a search-stage `Resolved` outcome. NOT the raw RRF
+/// score — RRF is `sum 1/(k + rank)` (`khive-fusion::rrf`), so a rank-1
+/// single-source hit scores ~1/61 (~0.0164) and a strong two-source hit
+/// ~2/61 (~0.0328): comparing that against a 0..1 "confidence" bar the way
+/// the ring stage does would make the search fallback functionally never
+/// resolve (the bug this constant fixes). Instead, a lone hybrid-search
+/// candidate (nothing to be ambiguous against) or a decisive-margin winner
+/// (see `SEARCH_MARGIN_RATIO`) resolves at this fixed, documented
+/// search-stage confidence — deliberately below both ring bands, so callers
+/// can distinguish "the ring recognized this" from "search picked this out"
+/// by confidence alone. The raw RRF value is never discarded: it is exactly
+/// what `ReferenceCandidate.score` carries in `Ambiguous` listings.
+const SEARCH_RESOLVED_CONFIDENCE: f64 = 0.6;
 
 /// Resolve one natural-language reference for `token`'s actor.
 ///
@@ -86,33 +107,62 @@ pub async fn resolve_reference(
     // by-ID path, never reimplemented. A ref shaped like an id but absent
     // from storage is NotFound, not a fall-through to ring/search: the
     // caller named a specific id, so a miss there is the true answer.
+    //
+    // Scope: entity ids only, both branches identically (review finding,
+    // 2026-07-09 fix round). `resolve_by_id` alone (entity + note) and
+    // `resolve_prefix_unfiltered` alone (entity + note + event + edge) used
+    // to disagree — a graph edge's full UUID returned `NotFound` while its
+    // short prefix resolved. The ring is entity-only by the same S1 contract
+    // (`reference_ring::substrate_admits_as_entity`), so id-string
+    // passthrough is narrowed to match: an edge or event id-string is
+    // `NotFound` here regardless of whether it arrived full or as a prefix.
+    // A caller that needs to resolve a non-entity id already has `get`.
     if let Ok(uuid) = Uuid::from_str(trimmed) {
         return match runtime.resolve_by_id(token, uuid).await? {
-            Some(_) => Ok(ReferenceResolution::Resolved {
+            Some(Resolved::Entity(_)) => Ok(ReferenceResolution::Resolved {
                 id: uuid,
                 confidence: 1.0,
             }),
-            None => Ok(ReferenceResolution::NotFound),
+            Some(_) | None => Ok(ReferenceResolution::NotFound),
         };
     }
     if is_hex_prefix(trimmed) {
         return match runtime.resolve_prefix_unfiltered(trimmed).await {
-            Ok(Some(uuid)) => Ok(ReferenceResolution::Resolved {
-                id: uuid,
-                confidence: 1.0,
-            }),
+            Ok(Some(uuid)) => match runtime.resolve_by_id(token, uuid).await? {
+                Some(Resolved::Entity(_)) => Ok(ReferenceResolution::Resolved {
+                    id: uuid,
+                    confidence: 1.0,
+                }),
+                Some(_) | None => Ok(ReferenceResolution::NotFound),
+            },
             Ok(None) => Ok(ReferenceResolution::NotFound),
             Err(RuntimeError::AmbiguousPrefix { matches, .. }) => {
-                Ok(ReferenceResolution::Ambiguous {
-                    candidates: matches
-                        .into_iter()
-                        .map(|id| ReferenceCandidate {
-                            id,
-                            name: None,
-                            score: 1.0,
-                        })
-                        .collect(),
-                })
+                let mut entity_matches = Vec::with_capacity(matches.len());
+                for id in matches {
+                    if matches!(
+                        runtime.resolve_by_id(token, id).await?,
+                        Some(Resolved::Entity(_))
+                    ) {
+                        entity_matches.push(id);
+                    }
+                }
+                match entity_matches.len() {
+                    0 => Ok(ReferenceResolution::NotFound),
+                    1 => Ok(ReferenceResolution::Resolved {
+                        id: entity_matches[0],
+                        confidence: 1.0,
+                    }),
+                    _ => Ok(ReferenceResolution::Ambiguous {
+                        candidates: entity_matches
+                            .into_iter()
+                            .map(|id| ReferenceCandidate {
+                                id,
+                                name: None,
+                                score: 1.0,
+                            })
+                            .collect(),
+                    }),
+                }
             }
             Err(e) => Err(e),
         };
@@ -184,26 +234,22 @@ pub async fn resolve_reference(
 
     match candidates.len() {
         0 => Ok(ReferenceResolution::NotFound),
-        1 => {
-            let top = &candidates[0];
-            if top.score >= AUTO_RESOLVE_CONFIDENCE {
-                Ok(ReferenceResolution::Resolved {
-                    id: top.id,
-                    confidence: top.score,
-                })
-            } else {
-                Ok(ReferenceResolution::Ambiguous { candidates })
-            }
-        }
+        // A lone hit is presence-decisive: there is no competing candidate to
+        // be ambiguous against, regardless of its raw RRF magnitude (see
+        // `SEARCH_RESOLVED_CONFIDENCE`).
+        1 => Ok(ReferenceResolution::Resolved {
+            id: candidates[0].id,
+            confidence: SEARCH_RESOLVED_CONFIDENCE,
+        }),
         _ => {
             let top_score = candidates[0].score;
             let second_score = candidates[1].score;
             let decisive =
                 second_score <= f64::EPSILON || top_score / second_score >= SEARCH_MARGIN_RATIO;
-            if decisive && top_score > SEARCH_SCORE_FLOOR {
+            if decisive {
                 Ok(ReferenceResolution::Resolved {
                     id: candidates[0].id,
-                    confidence: top_score,
+                    confidence: SEARCH_RESOLVED_CONFIDENCE,
                 })
             } else {
                 Ok(ReferenceResolution::Ambiguous { candidates })
@@ -222,7 +268,7 @@ fn resolve_from_candidates(candidates: Vec<ReferenceCandidate>) -> Option<Refere
         0 => None,
         1 => {
             let top = &candidates[0];
-            Some(if top.score >= AUTO_RESOLVE_CONFIDENCE {
+            Some(if top.score >= RING_AUTO_RESOLVE_CONFIDENCE {
                 ReferenceResolution::Resolved {
                     id: top.id,
                     confidence: top.score,

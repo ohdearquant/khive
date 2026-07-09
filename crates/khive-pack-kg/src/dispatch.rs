@@ -1290,6 +1290,109 @@ mod tests {
         }
     }
 
+    /// Regression for the namespace-key mismatch (review finding, 2026-07-09
+    /// fix round): ring admission used the gate-resolved `ns` (which is the
+    /// configured `default_namespace`, e.g. `"lambda:leo"`, on the default
+    /// dispatch path) while `resolve_reference`'s ring lookup used
+    /// `token.namespace()` (always `"local"` on that same path, per ADR-007
+    /// Rule 0/3b). With a non-local `default_namespace`, a `create` followed
+    /// by a same-actor `resolve` on the same registry must still hit the
+    /// ring — proving admission and lookup are keyed identically.
+    #[tokio::test]
+    async fn resolve_via_ring_survives_non_local_default_namespace() {
+        let rt = KhiveRuntime::memory().expect("in-memory runtime");
+        let mut builder = VerbRegistryBuilder::new();
+        builder.with_default_namespace("lambda:leo");
+        builder.register(KgPack::new(rt.clone()));
+        let registry = builder.build().expect("registry build");
+
+        let created = registry
+            .dispatch(
+                "create",
+                json!({"kind": "concept", "name": "namespace key parity target"}),
+            )
+            .await
+            .expect("create must succeed");
+        let id = created.get("id").and_then(|v| v.as_str()).unwrap();
+
+        let result = registry
+            .dispatch("resolve", json!({"refs": ["namespace key parity target"]}))
+            .await
+            .expect("resolve must succeed");
+        let results = result.get("results").and_then(|v| v.as_array()).unwrap();
+        assert_eq!(
+            results[0].get("status").and_then(|v| v.as_str()),
+            Some("resolved"),
+            "ring admission and lookup must key on the same namespace even when \
+             default_namespace is non-local: {results:?}"
+        );
+        assert_eq!(results[0].get("id").and_then(|v| v.as_str()), Some(id));
+        assert_eq!(
+            results[0].get("confidence").and_then(|v| v.as_f64()),
+            Some(0.95),
+            "must resolve via the ring's exact-match stage, not fall through to search"
+        );
+    }
+
+    /// Id-string passthrough is entity-scoped, identically for full UUIDs
+    /// and short prefixes (review finding, 2026-07-09 fix round): a note's
+    /// id-string is `NotFound` through `resolve`, even though `get` on the
+    /// same id would succeed.
+    #[tokio::test]
+    async fn resolve_id_string_passthrough_is_entity_only() {
+        let rt = KhiveRuntime::memory().expect("in-memory runtime");
+        let mut builder = VerbRegistryBuilder::new();
+        builder.with_default_namespace("local");
+        builder.register(KgPack::new(rt.clone()));
+        let registry = builder.build().expect("registry build");
+
+        let created = registry
+            .dispatch(
+                "create",
+                json!({"kind": "note", "note_kind": "observation", "content": "a note body"}),
+            )
+            .await
+            .expect("create must succeed");
+        let id = created.get("id").and_then(|v| v.as_str()).unwrap();
+
+        // `get` on the note id succeeds — sanity-checking the id is real.
+        registry
+            .dispatch("get", json!({"id": id}))
+            .await
+            .expect("get on the note id must succeed");
+
+        let full_uuid_result = registry
+            .dispatch("resolve", json!({"refs": [id]}))
+            .await
+            .expect("resolve must succeed");
+        let full_uuid_results = full_uuid_result
+            .get("results")
+            .and_then(|v| v.as_array())
+            .unwrap();
+        assert_eq!(
+            full_uuid_results[0].get("status").and_then(|v| v.as_str()),
+            Some("not_found"),
+            "a note's full-UUID ref must not resolve through the entity-only \
+             id-string passthrough: {full_uuid_results:?}"
+        );
+
+        let prefix = &id[..8];
+        let prefix_result = registry
+            .dispatch("resolve", json!({"refs": [prefix]}))
+            .await
+            .expect("resolve must succeed");
+        let prefix_results = prefix_result
+            .get("results")
+            .and_then(|v| v.as_array())
+            .unwrap();
+        assert_eq!(
+            prefix_results[0].get("status").and_then(|v| v.as_str()),
+            Some("not_found"),
+            "a note's short-prefix ref must behave identically to its full UUID: \
+             {prefix_results:?}"
+        );
+    }
+
     /// `resolve` is registered as a public verb and appears in `verbs()`.
     #[tokio::test]
     async fn resolve_appears_in_verbs_introspection() {

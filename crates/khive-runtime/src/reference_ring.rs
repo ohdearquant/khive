@@ -23,6 +23,14 @@ pub const DEFAULT_RING_CAPACITY: usize = 64;
 /// Default eviction age.
 pub const DEFAULT_RING_TTL: Duration = Duration::from_secs(30 * 60);
 
+/// Maximum distinct `(namespace, actor)` keys held at once. The per-key ring
+/// is capacity/TTL-bounded (above), but the outer map itself has no such
+/// bound by default — a daemon serving many transient actor ids needs an
+/// eviction rule for the map too, or it grows without limit. LRU by
+/// most-recent touch, sized generously above the 64-entry inner bound since
+/// this is the actor-fanout axis, not the per-actor recency axis.
+pub const DEFAULT_MAX_OUTER_KEYS: usize = 4096;
+
 /// One admitted id: the id itself, a best-effort display name (drawn from the
 /// dispatch result JSON — never a fresh fetch, to keep admission cheap on the
 /// Tier-1 latency budget), and the instant it was touched.
@@ -49,6 +57,7 @@ pub struct ReferenceRing {
     state: Mutex<RingState>,
     capacity: usize,
     ttl: Duration,
+    max_outer_keys: usize,
 }
 
 impl Default for ReferenceRing {
@@ -63,15 +72,45 @@ impl ReferenceRing {
     }
 
     pub fn with_bounds(capacity: usize, ttl: Duration) -> Self {
+        Self::with_bounds_and_outer_limit(capacity, ttl, DEFAULT_MAX_OUTER_KEYS)
+    }
+
+    pub fn with_bounds_and_outer_limit(
+        capacity: usize,
+        ttl: Duration,
+        max_outer_keys: usize,
+    ) -> Self {
         Self {
             state: Mutex::new(RingState::default()),
             capacity,
             ttl,
+            max_outer_keys,
         }
     }
 
     fn key(namespace: &str, actor: &str) -> RingKey {
         (namespace.to_owned(), actor.to_owned())
+    }
+
+    /// Lock the shared state, recovering from mutex poisoning instead of
+    /// panicking. Admission/lookup here is best-effort daemon-warm cache
+    /// maintenance riding on the back of an already-successful dispatch — a
+    /// panic in some unrelated ring-holding call must never turn a
+    /// successful op's return into a panic for every future caller. On
+    /// poison, log once at warn and take the inner (possibly
+    /// mid-mutation-but-structurally-valid, since std collections don't
+    /// leave torn state on panic) state and carry on.
+    fn lock_state(&self) -> std::sync::MutexGuard<'_, RingState> {
+        match self.state.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                tracing::warn!(
+                    "reference ring mutex poisoned by a prior panic; recovering inner state \
+                     (ring admission/lookup is best-effort and must never fail a dispatch)"
+                );
+                poisoned.into_inner()
+            }
+        }
     }
 
     /// Evict entries older than `ttl` from the front of `ring` (front = oldest,
@@ -86,59 +125,146 @@ impl ReferenceRing {
         }
     }
 
+    /// Drop outer-map keys whose ring is empty or fully aged out, then, if
+    /// still over `max_outer_keys`, evict the globally least-recently-touched
+    /// surviving keys (by each key's newest entry) until back within budget.
+    /// `exempt` (the key that triggered this admission) is never evicted by
+    /// the budget pass — admitting an id must never immediately evict the
+    /// ring it was just admitted to.
+    fn prune_outer_map(
+        rings: &mut HashMap<RingKey, VecDeque<RingEntry>>,
+        ttl: Duration,
+        max_outer_keys: usize,
+        now: Instant,
+        exempt: &RingKey,
+    ) {
+        rings.retain(|_, ring| {
+            Self::evict_stale(ring, ttl, now);
+            !ring.is_empty()
+        });
+        if rings.len() <= max_outer_keys {
+            return;
+        }
+        let mut by_recency: Vec<(RingKey, Instant)> = rings
+            .iter()
+            .filter(|(k, _)| *k != exempt)
+            .filter_map(|(k, ring)| ring.back().map(|e| (k.clone(), e.touched_at)))
+            .collect();
+        by_recency.sort_by_key(|(_, touched_at)| *touched_at);
+        let overflow = rings.len().saturating_sub(max_outer_keys);
+        for (key, _) in by_recency.into_iter().take(overflow) {
+            rings.remove(&key);
+        }
+    }
+
     /// Admit `id` into the `(namespace, actor)` ring, touching it to "now".
     ///
     /// Re-admitting an id already present moves it to the back (most-recent)
     /// instead of duplicating the entry. Eviction is size-or-age: stale
     /// entries are dropped first, then the oldest surviving entry is dropped
-    /// if the ring is still over capacity.
+    /// if the ring is still over capacity. The outer `(namespace, actor)` map
+    /// is pruned on every admission (see `prune_outer_map`) so a daemon
+    /// serving many transient actor ids never grows it without bound.
     pub fn admit(&self, namespace: &str, actor: &str, id: Uuid, name: Option<String>) {
         let now = Instant::now();
-        let mut state = self.state.lock().expect("reference ring mutex poisoned");
-        let ring = state.rings.entry(Self::key(namespace, actor)).or_default();
-        Self::evict_stale(ring, self.ttl, now);
-        ring.retain(|e| e.id != id);
-        ring.push_back(RingEntry {
-            id,
-            name,
-            touched_at: now,
-        });
-        while ring.len() > self.capacity {
-            ring.pop_front();
+        let mut state = self.lock_state();
+        let key = Self::key(namespace, actor);
+        {
+            let ring = state.rings.entry(key.clone()).or_default();
+            Self::evict_stale(ring, self.ttl, now);
+            ring.retain(|e| e.id != id);
+            ring.push_back(RingEntry {
+                id,
+                name,
+                touched_at: now,
+            });
+            while ring.len() > self.capacity {
+                ring.pop_front();
+            }
         }
+        Self::prune_outer_map(&mut state.rings, self.ttl, self.max_outer_keys, now, &key);
     }
 
     /// Snapshot the live (non-stale) entries for `(namespace, actor)`,
     /// most-recently-touched first. Returns an empty vec for an unknown or
     /// empty key — never an error, since a ring miss is always a legitimate
-    /// state (fresh session, restarted daemon, cross-actor query).
+    /// state (fresh session, restarted daemon, cross-actor query). Also
+    /// prunes the queried key from the outer map if eviction leaves it
+    /// empty, instead of leaving a dangling empty `VecDeque` entry behind.
     pub fn snapshot(&self, namespace: &str, actor: &str) -> Vec<RingEntry> {
         let now = Instant::now();
-        let mut state = self.state.lock().expect("reference ring mutex poisoned");
-        let Some(ring) = state.rings.get_mut(&Self::key(namespace, actor)) else {
+        let mut state = self.lock_state();
+        let key = Self::key(namespace, actor);
+        let Some(ring) = state.rings.get_mut(&key) else {
             return Vec::new();
         };
         Self::evict_stale(ring, self.ttl, now);
-        ring.iter().rev().cloned().collect()
+        let snap: Vec<RingEntry> = ring.iter().rev().cloned().collect();
+        if ring.is_empty() {
+            state.rings.remove(&key);
+        }
+        snap
     }
 }
 
-/// Best-effort display name extracted from a dispatch result: prefer `name`
-/// (entities), fall back to a `content` snippet (notes), else `None`.
+/// Display name extracted from a dispatch result's `name` field. S1's ring
+/// contract is entity ids only (see `substrate_admits_as_entity`), so there
+/// is no note-content fallback here — a note is never admitted in the first
+/// place, and using its `content` as a ring name would let free text stand
+/// in for an entity's actual name.
 fn display_name(result: &Value) -> Option<String> {
-    if let Some(name) = result.get("name").and_then(Value::as_str) {
-        let trimmed = name.trim();
-        if !trimmed.is_empty() {
-            return Some(trimmed.to_string());
-        }
+    let name = result.get("name").and_then(Value::as_str)?;
+    let trimmed = name.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
+}
+
+/// The nine closed entity kinds (ADR-001 base 8 + ADR-048 `resource`).
+/// Duplicated here (rather than depending on khive-pack-kg's vocab, which
+/// would invert the crate dependency direction) because this check only
+/// needs the closed set's membership, not the pack's full vocabulary.
+const ENTITY_KINDS: [&str; 9] = [
+    "concept", "document", "dataset", "project", "person", "org", "artifact", "service", "resource",
+];
+
+fn is_entity_kind_value(v: &str) -> bool {
+    v == "entity" || ENTITY_KINDS.contains(&v)
+}
+
+/// Whether a `create`/`get`/`update`/`delete` result JSON denotes an entity
+/// (S1's ring contract: entity ids only, plus `link` endpoints — see module
+/// docs). No extra storage read: the discriminator is read off the shape
+/// khive-pack-kg's handlers already return.
+///
+/// - `edge`/`event` results carry an explicit top-level `"kind": "edge"` /
+///   `"kind": "event"` (injected by `flatten_get_result`) — never entities.
+/// - `create`/`get`/`update` on an entity or note return the raw storage
+///   record: entities always serialize an `entity_type` key (even as
+///   `null`), notes always serialize a `content` key — the two shapes never
+///   overlap, so key presence alone is a reliable substrate discriminator.
+/// - `delete` returns a synthetic `{deleted, id, kind}` summary carrying
+///   neither field; its `kind` is the caller-supplied request param verbatim
+///   (may be the generic `"entity"`/`"note"` keyword, a specific closed
+///   entity kind, a specific note kind, or absent/`null` when the caller let
+///   `delete` infer it). Absent or ambiguous `kind` never admits — a delete
+///   admission is a nice-to-have, not required for correctness, and S1's
+///   "never mutates, never guesses" bias makes skipping always the safe
+///   choice.
+fn substrate_admits_as_entity(obj: &serde_json::Map<String, Value>) -> bool {
+    if matches!(
+        obj.get("kind").and_then(Value::as_str),
+        Some("edge") | Some("event")
+    ) {
+        return false;
     }
-    if let Some(content) = result.get("content").and_then(Value::as_str) {
-        let trimmed = content.trim();
-        if !trimmed.is_empty() {
-            return Some(trimmed.chars().take(60).collect());
-        }
+    if obj.contains_key("content") {
+        return false;
     }
-    None
+    if obj.contains_key("entity_type") {
+        return true;
+    }
+    obj.get("kind")
+        .and_then(Value::as_str)
+        .is_some_and(is_entity_kind_value)
 }
 
 /// Compute the `(id, name)` pairs a successful `verb` dispatch admits to the
@@ -165,10 +291,18 @@ pub(crate) fn ring_admissions_for(verb: &str, result: &Value) -> Vec<(Uuid, Opti
             .and_then(|s| Uuid::parse_str(s).ok())
     };
     match verb {
-        "create" | "get" | "update" | "delete" => match parse_id("id") {
-            Some(id) => vec![(id, display_name(result))],
-            None => Vec::new(),
-        },
+        "create" | "get" | "update" | "delete" => {
+            if !substrate_admits_as_entity(obj) {
+                return Vec::new();
+            }
+            match parse_id("id") {
+                Some(id) => vec![(id, display_name(result))],
+                None => Vec::new(),
+            }
+        }
+        // merge is entity-only by construction (v0.1 scope, ADR-046) — no
+        // substrate check needed; `MergeSummary` carries no `kind` field to
+        // check even if one were wanted.
         "merge" => match parse_id("kept_id") {
             Some(id) => vec![(id, None)],
             None => Vec::new(),
@@ -212,9 +346,61 @@ mod tests {
     #[test]
     fn ring_admissions_for_get_extracts_id_and_name() {
         let id = Uuid::new_v4();
-        let result = json!({"id": id.to_string(), "name": "Concept"});
+        // Real entity get/create/update responses always carry `entity_type`
+        // (even as `null`) — that key's presence is the entity-substrate
+        // discriminator `substrate_admits_as_entity` checks for.
+        let result = json!({"id": id.to_string(), "name": "Concept", "entity_type": null});
         let admissions = ring_admissions_for("get", &result);
         assert_eq!(admissions, vec![(id, Some("Concept".to_string()))]);
+    }
+
+    #[test]
+    fn ring_admissions_for_note_result_is_empty() {
+        let id = Uuid::new_v4();
+        // Real note get/create/update responses carry `content`, never
+        // `entity_type` — S1's ring contract is entity ids only.
+        let result = json!({"id": id.to_string(), "name": "a note", "content": "body text"});
+        assert!(ring_admissions_for("create", &result).is_empty());
+        assert!(ring_admissions_for("get", &result).is_empty());
+        assert!(ring_admissions_for("update", &result).is_empty());
+        assert!(ring_admissions_for("delete", &result).is_empty());
+    }
+
+    #[test]
+    fn ring_admissions_for_edge_and_event_kind_is_empty() {
+        let id = Uuid::new_v4();
+        let edge_result = json!({"id": id.to_string(), "kind": "edge"});
+        assert!(ring_admissions_for("get", &edge_result).is_empty());
+        let event_result = json!({"id": id.to_string(), "kind": "event"});
+        assert!(ring_admissions_for("get", &event_result).is_empty());
+    }
+
+    #[test]
+    fn ring_admissions_for_delete_uses_echoed_kind_param() {
+        let id = Uuid::new_v4();
+        // delete's synthetic summary has neither `content` nor `entity_type`;
+        // it falls back to the caller-echoed `kind` param.
+        let entity_delete = json!({"deleted": true, "id": id.to_string(), "kind": "concept"});
+        assert_eq!(
+            ring_admissions_for("delete", &entity_delete),
+            vec![(id, None)]
+        );
+        let generic_entity_delete =
+            json!({"deleted": true, "id": id.to_string(), "kind": "entity"});
+        assert_eq!(
+            ring_admissions_for("delete", &generic_entity_delete),
+            vec![(id, None)]
+        );
+        let note_delete = json!({"deleted": true, "id": id.to_string(), "kind": "observation"});
+        assert!(ring_admissions_for("delete", &note_delete).is_empty());
+        let unspecified_delete = json!({"deleted": true, "id": id.to_string(), "kind": null});
+        assert!(ring_admissions_for("delete", &unspecified_delete).is_empty());
+    }
+
+    #[test]
+    fn display_name_never_falls_back_to_content() {
+        let result = json!({"id": Uuid::new_v4().to_string(), "content": "some note body"});
+        assert_eq!(display_name(&result), None);
     }
 
     #[test]
@@ -307,5 +493,84 @@ mod tests {
         assert_eq!(snap.len(), 2, "re-admission must not duplicate the entry");
         assert_eq!(snap[0].id, a, "re-admitted id must be most-recent");
         assert_eq!(snap[0].name.as_deref(), Some("A-renamed"));
+    }
+
+    #[test]
+    fn snapshot_prunes_a_key_that_ages_out_entirely() {
+        let ring = ReferenceRing::with_bounds(64, Duration::from_millis(20));
+        ring.admit("local", "actor:a", Uuid::new_v4(), None);
+        std::thread::sleep(Duration::from_millis(40));
+        // The read itself must observe (and clean up) the now-fully-stale key.
+        assert!(ring.snapshot("local", "actor:a").is_empty());
+        let state = ring.state.lock().unwrap();
+        assert!(
+            !state
+                .rings
+                .contains_key(&("local".to_string(), "actor:a".to_string())),
+            "a key whose ring emptied via TTL eviction must not linger in the outer map"
+        );
+    }
+
+    #[test]
+    fn outer_map_evicts_least_recently_touched_keys_over_budget() {
+        let ring = ReferenceRing::with_bounds_and_outer_limit(64, DEFAULT_RING_TTL, 3);
+        // Admit four distinct actors in order; the outer-key budget is 3, so
+        // the least-recently-touched one (actor:0) must be evicted once the
+        // fourth actor is admitted.
+        for i in 0..4 {
+            ring.admit(
+                "local",
+                &format!("actor:{i}"),
+                Uuid::new_v4(),
+                Some(format!("actor {i}")),
+            );
+        }
+        assert!(
+            ring.snapshot("local", "actor:0").is_empty(),
+            "the least-recently-touched key must be evicted once the outer-key budget is exceeded"
+        );
+        for i in 1..4 {
+            assert!(
+                !ring.snapshot("local", &format!("actor:{i}")).is_empty(),
+                "actor:{i} must survive the budget eviction"
+            );
+        }
+    }
+
+    #[test]
+    fn outer_map_budget_eviction_never_evicts_the_key_just_admitted() {
+        let ring = ReferenceRing::with_bounds_and_outer_limit(64, DEFAULT_RING_TTL, 1);
+        ring.admit("local", "actor:a", Uuid::new_v4(), None);
+        // Admitting actor:b pushes the outer map to 2 keys against a budget
+        // of 1; the key that triggered this admission (actor:b) must survive
+        // even though it is, by construction, also the most-recently-touched.
+        ring.admit("local", "actor:b", Uuid::new_v4(), None);
+        assert!(!ring.snapshot("local", "actor:b").is_empty());
+    }
+
+    /// A prior panic while holding the ring's mutex must never turn a
+    /// later, unrelated `admit`/`snapshot` call into a panic too — admission
+    /// is best-effort cache maintenance riding on an already-successful
+    /// dispatch (finding 4, 2026-07-09 fix round).
+    #[test]
+    fn admit_and_snapshot_recover_from_poisoned_mutex() {
+        let ring = std::sync::Arc::new(ReferenceRing::new());
+        let poison_ring = ring.clone();
+        let _ = std::thread::spawn(move || {
+            let _guard = poison_ring.state.lock().unwrap();
+            panic!("deliberately poisoning the reference ring mutex for the recovery test");
+        })
+        .join();
+
+        // Both calls must complete normally (not panic) despite the poison.
+        ring.admit(
+            "local",
+            "actor:a",
+            Uuid::new_v4(),
+            Some("post-poison".into()),
+        );
+        let snap = ring.snapshot("local", "actor:a");
+        assert_eq!(snap.len(), 1);
+        assert_eq!(snap[0].name.as_deref(), Some("post-poison"));
     }
 }

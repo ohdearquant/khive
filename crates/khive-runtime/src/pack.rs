@@ -1324,12 +1324,28 @@ impl VerbRegistry {
                 // admit an id. Runs unconditionally (not gated on
                 // `dispatch_hook`, which is opt-in) because the ring is a
                 // core dispatch-boundary capability, not an observer.
+                //
+                // Keyed on `token.namespace()`, NOT `ns` (review finding,
+                // 2026-07-09 fix round): `ns` is the gate-resolved namespace,
+                // which on the default (non-explicit) dispatch path can be a
+                // non-local `default_namespace` (e.g. "lambda:leo") while the
+                // storage token that actually created/touched the record is
+                // pinned to `local` per ADR-007 Rule 0/3b. The ring must be
+                // keyed on the namespace the record actually lives in — the
+                // same namespace `resolve_reference`'s ring lookup uses —
+                // or admission and lookup silently diverge on any non-local
+                // `default_namespace` config.
                 if let Ok(ref ok_val) = result {
                     let admissions = crate::reference_ring::ring_admissions_for(verb, ok_val);
                     if !admissions.is_empty() {
                         let actor_key = format!("{}:{}", gate_req.actor.kind, gate_req.actor.id);
                         for (id, name) in admissions {
-                            self.reference_ring.admit(ns.as_str(), &actor_key, id, name);
+                            self.reference_ring.admit(
+                                token.namespace().as_str(),
+                                &actor_key,
+                                id,
+                                name,
+                            );
                         }
                     }
                 }
