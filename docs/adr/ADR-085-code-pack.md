@@ -568,62 +568,90 @@ identities, and repeated ingests do not accumulate duplicate rows. Ingesters
 write the canonical D2 tokens only; the alias-capture hazard documented in D2
 applies identically here.
 
+Canonicalization of the two identity inputs is fixed, not left to per-caller
+convention:
+
+- `source_project` is the package name declared by the nearest governing
+  manifest at or above the ingested path (`Cargo.toml` `[package].name`,
+  `pyproject.toml` `[project].name`, `package.json` `name`, the Lean project
+  name for a Lean project file). When no such manifest is found above the
+  ingested path, `source_project` falls back to the basename of the ingested
+  folder.
+- `module_path` is the language's own canonical module path, relative to the
+  `source_project` root determined above: a Rust crate-relative `::` path, a
+  Python dotted module path, a TypeScript path relative to the package root
+  with the file extension stripped, and a Lean namespace path.
+- The `uuid5` namespace seed is a fixed, pack-level constant, following the
+  same pattern already used by the pack's existing findings-ingest identity
+  namespace.
+
 ### B5: Staleness
 
-Ingest performs no automatic deletion. An entity absent from the most recent
-sweep of its source path receives a `properties.last_seen_at` stamp; whether a
-query surfaces it is a view-layer filtering decision, not a data-layer one
-(khive's data-versus-view principle: showing only current state is always a
-query concern, never a reason to delete, mutate, or transfer stored data).
+Ingest performs no automatic deletion. Every entity present in a sweep has its
+`properties.last_seen_at` stamped to that sweep's time, recording when it was
+last observed. An entity absent from a sweep is left untouched: its
+`last_seen_at` keeps the value from its last observed sweep. Staleness
+filtering compares an entity's `last_seen_at` against the latest sweep time for
+its source; whether a query surfaces an entity below that threshold is a
+view-layer filtering decision, not a data-layer one (khive's data-versus-view
+principle: showing only current state is always a query concern, never a
+reason to delete, mutate, or transfer stored data).
 
 ### B6: Cross-repo resolution
 
 An import specifier that names a project not yet ingested (a dependency on a
 crate or package that has not itself been scanned) does not fail the ingest.
 The specifier is recorded on the source entity as an unresolved reference, and
-within-source-project edges land normally. Resolution runs as a re-resolve pass:
-after any repository is ingested, previously recorded unresolved specifiers
-across the target database are replayed against the now-known symbol keys. This
-is the v1 mechanism; a deferred-edge queue that replays only the pending
-references relevant to a specific just-ingested project is a documented, more
-scalable v2 alternative once the number of interlinked repositories grows large
-enough that repeated full-database replay becomes costly.
+within-`source_project` edges land normally. Resolution runs as a re-resolve
+pass: after any `source_project` is ingested, previously recorded unresolved
+specifiers across the target database are replayed against the now-known
+symbol keys. In v1 this pass runs synchronously as part of the same
+`code.ingest` call and completes before a successful return; there is no
+pending-resolution state exposed to callers in v1. A deferred-edge queue that
+replays only the pending references relevant to a specific just-ingested
+`source_project` is a documented, more scalable v2 alternative once the number
+of interlinked projects grows large enough that repeated full-database replay
+becomes costly.
 
-Once materialized, a cross-repository edge is an ordinary edge: repository
-provenance is carried as a `properties.source` value on the entity, not as a
-namespace distinction, so cross-repository and within-repository edges share
-the same relation semantics and query surface.
+Once materialized, a cross-project edge is an ordinary edge: source provenance
+is carried as a `properties.source` value on the entity, not as a namespace
+distinction, so cross-project and within-project edges share the same relation
+semantics and query surface.
 
 ### B7: Target database posture
 
 This amendment restates and does not relax the D6.1 granularity fence.
-Exhaustive, whole-repository symbol and call graphs are large by construction
-(comparable in scale to other Subject-scale ingests this codebase already
-supports) and target dedicated map databases via the existing direct-build
-path, not the shared production graph. Promoting a curated slice, such as the
+`code.ingest`'s `db` parameter selects among dedicated map databases only; the
+verb rejects the shared production database as a target for an exhaustive L2
+ingest. Exhaustive, whole-project symbol and call graphs are large by
+construction (comparable in scale to other Subject-scale ingests this codebase
+already supports) and target dedicated map databases via the existing
+direct-build path, never the shared production graph, with no override
+available on the ingest verb itself. Promoting a curated slice, such as the
 symbols and modules an agent's work has actually referenced, into the shared
-production database remains a separate, explicit, human-directed act. Ingest
-itself never performs that promotion automatically. `code.ingest`'s `db`
-parameter defaults to a workspace map database for this reason; pointing it at
-the production database is an explicit caller choice, not a default path.
+production database is a separate, explicit curation or import path, distinct
+from and never performed by `code.ingest`.
 
 ### B8: Acceptance
 
 An implementation of this amendment is acceptance-tested against two
 properties, both expressible as ordinary queries against the shared query
-surface (`neighbors` / `traverse` / `query`) with no additional tooling:
+surface (`neighbors` / `traverse` / `query`) with no additional tooling. The
+acceptance fixture supplies the traversal bound (`max_depth`) and the expected
+result for that bound; `max_depth=3` is the reference value used unless a
+fixture states otherwise.
 
-1. **Codeflow parity**, per ingested repository:
-   - blast radius: a reverse, depth-bounded `depends_on` traversal from a named
-     symbol returns its callers;
-   - circular dependencies: a depth-bounded, self-returning `depends_on`
-     pattern at module level is detectable;
+1. **Codeflow parity**, per ingested `source_project`:
+   - blast radius: a reverse `depends_on` traversal from a named symbol,
+     bounded by the fixture's `max_depth`, returns its callers;
+   - circular dependencies: a self-returning `depends_on` pattern at module
+     level, bounded by the fixture's `max_depth`, is detectable;
    - dead symbols: the set of functions, datatypes, and interfaces with zero
      incoming `depends_on` edges is listable (scoped to callers present in the
      ingested set).
-2. **Cross-repository order independence**: ingesting two related repositories
-   in either order converges to the identical final edge set once both ingests
-   and any pending re-resolve pass have completed.
+2. **Cross-project order independence**: ingesting two related
+   `source_project`s in either order converges to the identical final edge set
+   once both ingests and their synchronous re-resolve passes have completed.
 
 ### Explicitly deferred (unchanged from the base text's posture)
 
