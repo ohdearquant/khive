@@ -19,6 +19,57 @@ fn setup_memory_store() -> SqlGraphStore {
     SqlGraphStore::new_scoped(pool, false, "default")
 }
 
+/// Like [`setup_memory_store`] but also seeds minimal `entities`/`notes`
+/// tables (id + deleted_at only) so the `#769` guarded-write tests can
+/// exercise the real `WHERE EXISTS(entities...) OR EXISTS(notes...)` probes
+/// `edge_insert_guarded_by_endpoints_statement` and `edge_endpoints_exist`
+/// issue against those tables.
+fn setup_memory_store_with_substrates() -> (Arc<ConnectionPool>, SqlGraphStore) {
+    let config = PoolConfig {
+        path: None,
+        ..PoolConfig::default()
+    };
+    let pool = Arc::new(ConnectionPool::new(config).unwrap());
+
+    {
+        let writer = pool.writer().unwrap();
+        writer.conn().execute_batch(GRAPH_DDL).unwrap();
+        writer
+            .conn()
+            .execute_batch(
+                "CREATE TABLE entities (id TEXT PRIMARY KEY, deleted_at INTEGER);
+                 CREATE TABLE notes (id TEXT PRIMARY KEY, deleted_at INTEGER);
+                 CREATE TABLE events (id TEXT PRIMARY KEY);",
+            )
+            .unwrap();
+    }
+
+    let store = SqlGraphStore::new_scoped(Arc::clone(&pool), false, "default");
+    (pool, store)
+}
+
+fn insert_live_entity(pool: &ConnectionPool, id: Uuid) {
+    let writer = pool.writer().unwrap();
+    writer
+        .conn()
+        .execute(
+            "INSERT INTO entities (id, deleted_at) VALUES (?1, NULL)",
+            rusqlite::params![id.to_string()],
+        )
+        .unwrap();
+}
+
+fn hard_delete_entity(pool: &ConnectionPool, id: Uuid) {
+    let writer = pool.writer().unwrap();
+    writer
+        .conn()
+        .execute(
+            "DELETE FROM entities WHERE id = ?1",
+            rusqlite::params![id.to_string()],
+        )
+        .unwrap();
+}
+
 fn make_edge(source: Uuid, target: Uuid, relation: EdgeRelation, weight: f64) -> Edge {
     let now = Utc::now();
     Edge {
@@ -2575,4 +2626,148 @@ async fn upsert_edge_routes_through_writer_task_when_flag_enabled() {
         fetched.is_some(),
         "edge must be committed and readable after queuing behind the occupier"
     );
+}
+
+// ---------------------------------------------------------------------------
+// #769 — commit-time endpoint guard for canonical `link`/`link_many`
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn upsert_edge_guarded_succeeds_when_both_endpoints_exist() {
+    let (pool, store) = setup_memory_store_with_substrates();
+    let source = Uuid::new_v4();
+    let target = Uuid::new_v4();
+    insert_live_entity(&pool, source);
+    insert_live_entity(&pool, target);
+
+    let edge = make_edge(source, target, EdgeRelation::Extends, 1.0);
+    let edge_id = edge.id;
+    let written = store.upsert_edge_guarded(edge).await.unwrap();
+
+    assert!(
+        written,
+        "guarded write must succeed when both endpoints exist"
+    );
+    assert!(store.get_edge(edge_id).await.unwrap().is_some());
+}
+
+/// Reproduces #769's failure scenario at the layer where the bug actually
+/// lived: an endpoint that existed when a caller validated it (mirrored here
+/// by `insert_live_entity`) is hard-deleted before the edge write reaches
+/// storage (mirrored by `hard_delete_entity`) — the exact window a
+/// concurrent MCP request could land in between `KhiveRuntime::link`'s async
+/// `validate_edge_relation_endpoints` read and its write. Before #769's fix,
+/// `SqlGraphStore::upsert_edge` had no such check and would have inserted
+/// this edge unconditionally, leaving it permanently dangling.
+#[tokio::test]
+async fn upsert_edge_guarded_returns_false_when_target_hard_deleted_before_write() {
+    let (pool, store) = setup_memory_store_with_substrates();
+    let source = Uuid::new_v4();
+    let target = Uuid::new_v4();
+    insert_live_entity(&pool, source);
+    insert_live_entity(&pool, target);
+
+    // Simulates a concurrent hard-delete landing between prepare-time
+    // validation and this write.
+    hard_delete_entity(&pool, target);
+
+    let edge = make_edge(source, target, EdgeRelation::Extends, 1.0);
+    let edge_id = edge.id;
+    let written = store.upsert_edge_guarded(edge).await.unwrap();
+
+    assert!(
+        !written,
+        "guarded write must refuse an edge whose target vanished before commit"
+    );
+    assert!(
+        store.get_edge(edge_id).await.unwrap().is_none(),
+        "no dangling edge may be persisted"
+    );
+}
+
+#[tokio::test]
+async fn upsert_edge_guarded_returns_false_when_source_hard_deleted_before_write() {
+    let (pool, store) = setup_memory_store_with_substrates();
+    let source = Uuid::new_v4();
+    let target = Uuid::new_v4();
+    insert_live_entity(&pool, source);
+    insert_live_entity(&pool, target);
+
+    hard_delete_entity(&pool, source);
+
+    let edge = make_edge(source, target, EdgeRelation::Extends, 1.0);
+    let edge_id = edge.id;
+    let written = store.upsert_edge_guarded(edge).await.unwrap();
+
+    assert!(
+        !written,
+        "guarded write must refuse an edge whose source vanished before commit"
+    );
+    assert!(store.get_edge(edge_id).await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn upsert_edges_guarded_succeeds_when_all_endpoints_exist() {
+    let (pool, store) = setup_memory_store_with_substrates();
+    let a = Uuid::new_v4();
+    let b = Uuid::new_v4();
+    let c = Uuid::new_v4();
+    insert_live_entity(&pool, a);
+    insert_live_entity(&pool, b);
+    insert_live_entity(&pool, c);
+
+    let edges = vec![
+        make_edge(a, b, EdgeRelation::Extends, 1.0),
+        make_edge(b, c, EdgeRelation::Extends, 1.0),
+    ];
+    let ids: Vec<_> = edges.iter().map(|e| e.id).collect();
+
+    let summary = store.upsert_edges_guarded(edges).await.unwrap();
+    assert_eq!(summary.attempted, 2);
+    assert_eq!(summary.affected, 2);
+
+    for id in ids {
+        assert!(store.get_edge(id).await.unwrap().is_some());
+    }
+}
+
+/// Batch form of #769's regression: one edge in the batch targets an
+/// endpoint that vanished before commit. The whole batch must be rejected —
+/// no edge from it, including the ones whose endpoints were still live,
+/// may be persisted (all-or-nothing, matching `create_many`'s existing
+/// validation-failure contract).
+#[tokio::test]
+async fn upsert_edges_guarded_writes_nothing_when_one_endpoint_vanishes() {
+    let (pool, store) = setup_memory_store_with_substrates();
+    let a = Uuid::new_v4();
+    let b = Uuid::new_v4();
+    let c = Uuid::new_v4();
+    insert_live_entity(&pool, a);
+    insert_live_entity(&pool, b);
+    insert_live_entity(&pool, c);
+
+    // b's endpoint vanishes before the batch write — mirrors a concurrent
+    // hard-delete landing between per-spec validation and `link_many`'s
+    // single batched write.
+    hard_delete_entity(&pool, b);
+
+    let edges = vec![
+        make_edge(a, b, EdgeRelation::Extends, 1.0), // dangling endpoint
+        make_edge(a, c, EdgeRelation::Extends, 1.0), // both endpoints live
+    ];
+    let ids: Vec<_> = edges.iter().map(|e| e.id).collect();
+
+    let summary = store.upsert_edges_guarded(edges).await.unwrap();
+    assert_eq!(summary.attempted, 2);
+    assert_eq!(
+        summary.affected, 0,
+        "no edge from the batch may be persisted when any endpoint is missing"
+    );
+
+    for id in ids {
+        assert!(
+            store.get_edge(id).await.unwrap().is_none(),
+            "batch must be all-or-nothing: {id:?} must not be persisted"
+        );
+    }
 }

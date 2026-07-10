@@ -52,6 +52,25 @@ const EDGE_NATURAL_KEY_CONFLICT_SET: &str = "weight = excluded.weight, \
      metadata = excluded.metadata, \
      target_backend = excluded.target_backend";
 
+/// A `WHERE`-clause fragment asserting the id bound to `id_param` (an SQL
+/// placeholder like `?3`) resolves to a live edge endpoint — an
+/// undeleted entity or note, an event (append-only, no `deleted_at`), or an
+/// undeleted edge (the `annotates` relation's target may be any substrate,
+/// including another edge; ADR-002/ADR-055). Shared by
+/// [`edge_insert_guarded_by_endpoints_statement`] and
+/// [`edge_endpoints_exist`] (#769) so the two "does this endpoint still
+/// exist" probes — the guarded single-row insert and the guarded batch
+/// pre-check — can never drift on which substrates count as valid
+/// endpoints.
+fn endpoint_exists_clause(id_param: &str) -> String {
+    format!(
+        "EXISTS (SELECT 1 FROM entities WHERE id = {id_param} AND deleted_at IS NULL) \
+         OR EXISTS (SELECT 1 FROM notes WHERE id = {id_param} AND deleted_at IS NULL) \
+         OR EXISTS (SELECT 1 FROM events WHERE id = {id_param}) \
+         OR EXISTS (SELECT 1 FROM graph_edges WHERE id = {id_param} AND deleted_at IS NULL)"
+    )
+}
+
 /// The exact natural-key-upserting `INSERT ... ON CONFLICT` this store's
 /// `upsert_edge` issues. Canonicalizes symmetric-relation endpoints first,
 /// matching `upsert_edge`'s own call to `canonical_edge_endpoints`.
@@ -132,16 +151,15 @@ pub fn edge_insert_guarded_by_endpoints_statement(
     now: i64,
     metadata: Option<&str>,
 ) -> SqlStatement {
+    let src_exists = endpoint_exists_clause("?3");
+    let tgt_exists = endpoint_exists_clause("?4");
     SqlStatement {
         sql: format!(
             "INSERT INTO graph_edges \
               (namespace, id, source_id, target_id, relation, weight, \
                created_at, updated_at, metadata) \
               SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, ?8 \
-              WHERE (EXISTS (SELECT 1 FROM entities WHERE id = ?3 AND deleted_at IS NULL) \
-                     OR EXISTS (SELECT 1 FROM notes WHERE id = ?3 AND deleted_at IS NULL)) \
-                AND (EXISTS (SELECT 1 FROM entities WHERE id = ?4 AND deleted_at IS NULL) \
-                     OR EXISTS (SELECT 1 FROM notes WHERE id = ?4 AND deleted_at IS NULL)) \
+              WHERE ({src_exists}) AND ({tgt_exists}) \
               ON CONFLICT(namespace, source_id, target_id, relation) DO UPDATE SET \
                   {EDGE_NATURAL_KEY_CONFLICT_SET}"
         ),
@@ -892,13 +910,11 @@ fn edge_endpoints_exist(
     source_id: Uuid,
     target_id: Uuid,
 ) -> Result<bool, rusqlite::Error> {
+    let src_exists = endpoint_exists_clause("?1");
+    let tgt_exists = endpoint_exists_clause("?2");
+    let sql = format!("SELECT ({src_exists}) AND ({tgt_exists})");
     conn.query_row(
-        "SELECT \
-            (EXISTS (SELECT 1 FROM entities WHERE id = ?1 AND deleted_at IS NULL) \
-             OR EXISTS (SELECT 1 FROM notes WHERE id = ?1 AND deleted_at IS NULL)) \
-         AND \
-            (EXISTS (SELECT 1 FROM entities WHERE id = ?2 AND deleted_at IS NULL) \
-             OR EXISTS (SELECT 1 FROM notes WHERE id = ?2 AND deleted_at IS NULL))",
+        &sql,
         rusqlite::params![source_id.to_string(), target_id.to_string()],
         |row| row.get::<_, bool>(0),
     )

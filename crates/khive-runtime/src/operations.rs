@@ -6988,6 +6988,154 @@ mod tests {
         assert_eq!(edge.relation, EdgeRelation::Extends);
     }
 
+    // ---- #769: commit-time endpoint guard vs concurrent hard-delete ----
+
+    /// Deterministic form of the regression, exercised directly at the
+    /// write step `link` performs after prepare-time validation: build the
+    /// exact `Edge` `link` would build, delete the target the way a
+    /// concurrent racer would, and confirm the guarded write refuses it.
+    #[tokio::test]
+    async fn link_write_time_guard_blocks_dangling_edge_after_target_vanishes() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+        let a = rt
+            .create_entity(&tok, "concept", None, "A", None, None, vec![])
+            .await
+            .unwrap();
+        let x = rt
+            .create_entity(&tok, "concept", None, "X", None, None, vec![])
+            .await
+            .unwrap();
+
+        rt.validate_edge_relation_endpoints(&tok, a.id, x.id, EdgeRelation::Extends)
+            .await
+            .expect("prepare-time validation must pass while X is live");
+
+        assert!(rt.delete_entity(&tok, x.id, true).await.unwrap());
+
+        let now = chrono::Utc::now();
+        let edge = Edge {
+            id: LinkId::from(Uuid::new_v4()),
+            namespace: tok.namespace().as_str().to_string(),
+            source_id: a.id,
+            target_id: x.id,
+            relation: EdgeRelation::Extends,
+            weight: 1.0,
+            created_at: now,
+            updated_at: now,
+            deleted_at: None,
+            metadata: None,
+            target_backend: None,
+        };
+        let written = rt
+            .graph(&tok)
+            .unwrap()
+            .upsert_edge_guarded(edge)
+            .await
+            .unwrap();
+        assert!(
+            !written,
+            "guarded write must refuse an edge whose target vanished before commit"
+        );
+
+        let edges = rt
+            .list_edges(
+                &tok,
+                crate::curation::EdgeListFilter {
+                    source_id: Some(a.id),
+                    target_id: Some(x.id),
+                    relations: vec![EdgeRelation::Extends],
+                    ..Default::default()
+                },
+                10,
+                0,
+            )
+            .await
+            .unwrap();
+        assert!(
+            edges.is_empty(),
+            "no dangling edge may be persisted after the guarded write refused it"
+        );
+    }
+
+    #[tokio::test]
+    async fn link_many_writes_nothing_when_one_target_vanishes_before_write() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+        let a = rt
+            .create_entity(&tok, "concept", None, "A", None, None, vec![])
+            .await
+            .unwrap();
+        let b = rt
+            .create_entity(&tok, "concept", None, "B", None, None, vec![])
+            .await
+            .unwrap();
+        let x = rt
+            .create_entity(&tok, "concept", None, "X", None, None, vec![])
+            .await
+            .unwrap();
+
+        let specs = vec![
+            LinkSpec {
+                namespace: None,
+                source_id: a.id,
+                target_id: x.id,
+                relation: EdgeRelation::Extends,
+                weight: 1.0,
+                metadata: None,
+            },
+            LinkSpec {
+                namespace: None,
+                source_id: a.id,
+                target_id: b.id,
+                relation: EdgeRelation::Extends,
+                weight: 1.0,
+                metadata: None,
+            },
+        ];
+
+        // Both specs validate fine at build_edge time (X and B both live).
+        let mut edges = Vec::with_capacity(specs.len());
+        for spec in &specs {
+            edges.push(rt.build_edge(&tok, spec).await.unwrap());
+        }
+
+        // X vanishes before the batched write — mirrors a concurrent
+        // hard-delete landing between per-spec validation and link_many's
+        // single guarded batch write.
+        assert!(rt.delete_entity(&tok, x.id, true).await.unwrap());
+
+        let summary = rt
+            .graph(&tok)
+            .unwrap()
+            .upsert_edges_guarded(edges)
+            .await
+            .unwrap();
+        assert_eq!(
+            summary.affected, 0,
+            "no edge from the batch may be persisted when any endpoint vanished"
+        );
+
+        let edges = rt
+            .list_edges(
+                &tok,
+                crate::curation::EdgeListFilter {
+                    source_id: Some(a.id),
+                    relations: vec![EdgeRelation::Extends],
+                    ..Default::default()
+                },
+                10,
+                0,
+            )
+            .await
+            .unwrap();
+        assert!(
+            edges.is_empty(),
+            "link_many's guarded batch must be all-or-nothing: the live A-B edge \
+             must not have been persisted alongside the doomed A-X edge"
+        );
+    }
+
     #[tokio::test]
     async fn create_note_annotates_phantom_returns_not_found() {
         let rt = rt();
