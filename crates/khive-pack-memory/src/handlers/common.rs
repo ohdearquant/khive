@@ -964,6 +964,16 @@ impl MemoryPack {
                 // monopolizes a tokio worker: the CPU-bound graph build
                 // inside it now runs via `tokio::task::spawn_blocking`
                 // (`ann.rs::load_and_build_from_vector_store`).
+                //
+                // #812 review REQUEST CHANGES HIGH: `is_current` alone only
+                // sees THIS process's write-generation counter, which
+                // `kkernel reindex` (a separate OS process) never touches —
+                // an already-warm daemon would otherwise trust its cached
+                // entry forever after a cross-process reindex. The amortized
+                // durable-epoch check below observes a signal written to the
+                // shared SQLite file instead, debounced so it doesn't add a
+                // DB round-trip to every recall.
+                ann::maybe_check_durable_epoch(&self.runtime, &self.ann, &key).await;
                 let cache_fresh = ann::is_current(&self.ann, &key).await;
                 let search_result =
                     ann::search_loaded(&self.ann, &key, &vec, ann_fetch_limit).await;

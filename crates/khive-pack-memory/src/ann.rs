@@ -51,6 +51,14 @@ pub(crate) struct AnnBridge {
     /// corpus can never clobber an already-installed fresher build, and a
     /// build that snapshotted a fresher corpus always wins.
     pub(crate) generation: u64,
+    /// Durable corpus epoch (`memory_ann_epoch` table) observed at build/load
+    /// time (#812 review REQUEST CHANGES HIGH). Distinct from `generation`,
+    /// which lives only in this process's memory and resets to 0 on restart
+    /// — `epoch_baseline` is compared against a value written to the shared
+    /// SQLite file, so it is the only signal a warm daemon has for an
+    /// out-of-process corpus mutation (`kkernel reindex`) that never goes
+    /// through this daemon's `bump_generation` call at all.
+    pub(crate) epoch_baseline: u64,
 }
 
 /// Shared ANN state: per-`(namespace, model)` indexes with at-most-one-background-build guard.
@@ -85,10 +93,24 @@ pub(crate) struct AnnState {
     /// happened to acquire the per-model lock first even if it had
     /// snapshotted a now-stale corpus.
     generations: Mutex<HashMap<AnnKey, u64>>,
+    /// Debounce state for `maybe_check_durable_epoch` (#812 review REQUEST
+    /// CHANGES HIGH): last time this process actually paid for a
+    /// `memory_ann_epoch` SELECT for a given key, so the warm-hit recall
+    /// path amortizes the cross-process freshness check instead of adding a
+    /// DB round-trip to every single recall.
+    last_epoch_check: std::sync::Mutex<HashMap<AnnKey, std::time::Instant>>,
     /// Counts how many times `search_loaded` returned a warm hit. Test-only;
     /// call `reset_warm_route_count()` between operations to isolate counts.
     #[cfg(test)]
     pub(crate) warm_route_count: AtomicUsize,
+    /// Test-only synchronization point: notified right before each rebuild
+    /// attempt inside `ensure_ann_background`'s tracked task commits to the
+    /// generation floor it captured (#812 review REQUEST CHANGES MEDIUM-2).
+    /// Scoped per-`AnnState` (not a process-global static) so one test's
+    /// notifications can never be consumed by a different test's waiter —
+    /// each test gets its own via `new_shared()`.
+    #[cfg(test)]
+    pub(crate) attempt_floor_notify: tokio::sync::Notify,
 }
 
 pub(crate) type SharedAnn = Arc<AnnState>;
@@ -99,8 +121,11 @@ pub(crate) fn new_shared() -> SharedAnn {
         warming: std::sync::Mutex::new(HashSet::new()),
         model_locks: Mutex::new(HashMap::new()),
         generations: Mutex::new(HashMap::new()),
+        last_epoch_check: std::sync::Mutex::new(HashMap::new()),
         #[cfg(test)]
         warm_route_count: AtomicUsize::new(0),
+        #[cfg(test)]
+        attempt_floor_notify: tokio::sync::Notify::new(),
     })
 }
 
@@ -155,6 +180,134 @@ async fn installed_is_fresh(ann: &SharedAnn, key: &AnnKey, min_generation: u64) 
 pub(crate) async fn is_current(ann: &SharedAnn, key: &AnnKey) -> bool {
     let target_generation = current_generation(ann, key).await;
     installed_is_fresh(ann, key, target_generation).await
+}
+
+/// How often `maybe_check_durable_epoch` is willing to pay for a
+/// `memory_ann_epoch` SELECT for the same key (#812 review REQUEST CHANGES
+/// HIGH). A warm-hit recall calls this on every request; without debouncing
+/// that would add a synchronous DB round-trip to the hot path this whole PR
+/// exists to keep off. Zero in tests so a single direct call always performs
+/// the check deterministically instead of racing a wall-clock interval.
+#[cfg(not(test))]
+const DURABLE_EPOCH_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+#[cfg(test)]
+const DURABLE_EPOCH_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(0);
+
+/// Amortized cross-process freshness check (#812 review REQUEST CHANGES
+/// HIGH): compares the durable `memory_ann_epoch` row against the
+/// currently-installed entry's `epoch_baseline` for `key`, and — if the
+/// durable epoch has moved on — bumps `key`'s in-memory write-generation so
+/// the existing generation machinery (`is_current`, `ensure_ann_background`'s
+/// single-flight rebuild) takes over exactly as it would for an in-process
+/// write.
+///
+/// This exists because `kkernel reindex` runs as a separate OS process: it
+/// mutates the vector table and deletes the persisted snapshot row directly,
+/// never touching this daemon's in-memory `generations` map, so an
+/// already-warm daemon's `common.rs` recall path (`ann::is_current`) had no
+/// way to ever notice — the daemon would serve pre-reindex vectors
+/// indefinitely. `bump_memory_ann_epoch` (called from `kkernel::reindex`
+/// after it invalidates the snapshot) is the durable side of this signal.
+pub(crate) async fn maybe_check_durable_epoch(rt: &KhiveRuntime, ann: &SharedAnn, key: &AnnKey) {
+    {
+        let mut last = ann
+            .last_epoch_check
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let now = std::time::Instant::now();
+        let due = last
+            .get(key)
+            .is_none_or(|t| now.duration_since(*t) >= DURABLE_EPOCH_CHECK_INTERVAL);
+        if !due {
+            return;
+        }
+        last.insert(key.clone(), now);
+    }
+
+    let installed_baseline = ann.indexes.read().await.get(key).map(|b| b.epoch_baseline);
+    let Some(baseline) = installed_baseline else {
+        // Nothing installed yet — a genuine cache miss already routes through
+        // the normal build path, which reads the durable epoch itself.
+        return;
+    };
+    let durable = durable_epoch(rt).await;
+    if durable > baseline {
+        tracing::debug!(
+            model = %key.model,
+            baseline,
+            durable,
+            "memory ANN durable epoch advanced; marking cached entry stale"
+        );
+        bump_generation(ann, key).await;
+    }
+}
+
+/// Ensure the `memory_ann_epoch` table exists. Best-effort: called before
+/// every read/write of the durable epoch, mirroring `ensure_snapshot_schema`.
+async fn ensure_epoch_schema(rt: &KhiveRuntime) -> Result<(), RuntimeError> {
+    let sql = rt.sql();
+    let mut w = sql
+        .writer()
+        .await
+        .map_err(|e| RuntimeError::Internal(e.to_string()))?;
+    w.execute_script(
+        "CREATE TABLE IF NOT EXISTS memory_ann_epoch (\
+             id INTEGER PRIMARY KEY CHECK (id = 1), \
+             epoch INTEGER NOT NULL DEFAULT 0\
+         );"
+        .into(),
+    )
+    .await
+    .map_err(|e| RuntimeError::Internal(e.to_string()))
+}
+
+/// Read the durable corpus epoch (0 if the table doesn't exist yet or the
+/// row is absent — the same "nothing has ever bumped this" baseline every
+/// `AnnBridge` implicitly starts from via `epoch_baseline: 0`).
+pub(crate) async fn durable_epoch(rt: &KhiveRuntime) -> u64 {
+    let sql = rt.sql();
+    let Ok(mut reader) = sql.reader().await else {
+        return 0;
+    };
+    let Ok(rows) = reader
+        .query_all(SqlStatement {
+            sql: "SELECT epoch FROM memory_ann_epoch WHERE id = 1".into(),
+            params: vec![],
+            label: Some("memory_ann_durable_epoch_read".into()),
+        })
+        .await
+    else {
+        return 0;
+    };
+    match rows.first().and_then(|r| r.get("epoch")) {
+        Some(SqlValue::Integer(n)) if *n >= 0 => *n as u64,
+        _ => 0,
+    }
+}
+
+/// Bump the durable corpus epoch by one and return the new value. Called by
+/// `kkernel reindex` (via `khive_pack_memory::bump_memory_ann_epoch`) after
+/// it invalidates the persisted snapshot, so an already-warm daemon sharing
+/// the same database file has a durable signal to observe (#812 review
+/// REQUEST CHANGES HIGH).
+pub(crate) async fn bump_durable_epoch(rt: &KhiveRuntime) -> Result<u64, RuntimeError> {
+    ensure_epoch_schema(rt).await?;
+    let sql = rt.sql();
+    let mut w = sql
+        .writer()
+        .await
+        .map_err(|e| RuntimeError::Internal(e.to_string()))?;
+    w.execute(SqlStatement {
+        sql: "INSERT INTO memory_ann_epoch (id, epoch) VALUES (1, 1) \
+              ON CONFLICT(id) DO UPDATE SET epoch = epoch + 1"
+            .into(),
+        params: vec![],
+        label: Some("memory_ann_durable_epoch_bump".into()),
+    })
+    .await
+    .map_err(|e| RuntimeError::Internal(e.to_string()))?;
+    drop(w);
+    Ok(durable_epoch(rt).await)
 }
 
 /// Install `candidate` into the cache for `key` UNLESS an entry is already
@@ -241,6 +394,7 @@ impl AnnBridge {
             id_map,
             namespace_set,
             generation: 0,
+            epoch_baseline: 0,
         })
     }
 
@@ -252,6 +406,14 @@ impl AnnBridge {
     /// than winning one it shouldn't.
     pub(crate) fn with_generation(mut self, generation: u64) -> Self {
         self.generation = generation;
+        self
+    }
+
+    /// Stamp this build with the durable corpus epoch observed at build/load
+    /// time (#812 review REQUEST CHANGES HIGH). See `epoch_baseline`'s doc
+    /// comment for why this is tracked separately from `generation`.
+    pub(crate) fn with_epoch_baseline(mut self, epoch: u64) -> Self {
+        self.epoch_baseline = epoch;
         self
     }
 
@@ -304,6 +466,7 @@ impl AnnBridge {
             // conservative (assume the index may contain non-visible namespaces).
             namespace_set: HashSet::new(),
             generation: 0,
+            epoch_baseline: 0,
         })
     }
 
@@ -471,18 +634,53 @@ pub(crate) async fn ensure_ann_background(
         return false;
     }
 
-    // Single-flight guard.
-    {
-        let mut warming = lock_warming(ann);
-        if warming.contains(&key) {
-            return false;
-        }
-        warming.insert(key.clone());
+    if !try_take_warming_guard(ann, &key) {
+        return false;
     }
 
-    let rt = rt.clone();
-    let ann = ann.clone();
-    let model = model.to_owned();
+    // Tracked, not a bare tokio::spawn, so daemon shutdown's drain() waits for
+    // an in-flight remember-path warm instead of a SIGTERM (or a short-lived
+    // `kkernel exec` process exiting) aborting it mid-build — same rationale
+    // as recall.rs's serve-ledger append (internal review PR #583 round-1
+    // Medium). The caller still only pays for the enqueue; the build itself
+    // runs fully off the response path, unawaited.
+    spawn_rebuild_task(rt.clone(), ann.clone(), model.to_owned(), key);
+    true
+}
+
+/// Synchronously take the single-flight `warming` guard for `key`. Split out
+/// of `ensure_ann_background` so the post-release re-enqueue path in
+/// `spawn_rebuild_task` (#812 review REQUEST CHANGES MEDIUM-1) can take the
+/// guard itself and call `spawn_rebuild_task` directly instead of calling
+/// back into `ensure_ann_background` — which would make the tracked task's
+/// own future type recursively reference itself and fail to prove `Send`.
+fn try_take_warming_guard(ann: &SharedAnn, key: &AnnKey) -> bool {
+    let mut warming = lock_warming(ann);
+    if warming.contains(key) {
+        return false;
+    }
+    warming.insert(key.clone());
+    true
+}
+
+/// Spawn the tracked background-rebuild loop for `key`. The caller MUST have
+/// already taken the `warming` single-flight guard for `key` (via
+/// `try_take_warming_guard`) before calling this — it is not re-checked
+/// here.
+///
+/// Deliberately a plain (non-`async`) function, not folded back into
+/// `ensure_ann_background`: the loop below re-enqueues itself by calling
+/// this function again after releasing its guard (#812 review REQUEST
+/// CHANGES MEDIUM-1/MEDIUM-2). Calling an `async fn` that (transitively)
+/// awaits itself makes rustc unable to prove the resulting future is `Send`
+/// — the compiler reported exactly that when the re-enqueue call was
+/// `ensure_ann_background(...).await` from inside this same tracked task.
+/// Because `spawn_rebuild_task` is synchronous, the "recursive" call at the
+/// bottom of the loop is a plain function call that hands a brand-new,
+/// independent future to `track_background_task` — it never becomes part of
+/// this future's own state machine, so there is no self-referential type for
+/// Send-inference to choke on.
+fn spawn_rebuild_task(rt: KhiveRuntime, ann: SharedAnn, model: String, key: AnnKey) {
     // Tied to the tracked task's own scope so it releases on every exit path
     // (success, error, or panic) rather than only the "nothing got loaded"
     // arm — see `WarmingGuard`'s doc comment (#812 review HIGH-1).
@@ -490,14 +688,7 @@ pub(crate) async fn ensure_ann_background(
         ann: ann.clone(),
         key: key.clone(),
     };
-    // Tracked, not a bare tokio::spawn, so daemon shutdown's drain() waits for
-    // an in-flight remember-path warm instead of a SIGTERM (or a short-lived
-    // `kkernel exec` process exiting) aborting it mid-build — same rationale
-    // as recall.rs's serve-ledger append (internal review PR #583 round-1
-    // Medium). The caller still only pays for the enqueue; the build itself
-    // runs fully off the response path, unawaited.
     khive_runtime::track_background_task(async move {
-        let _warming_guard = warming_guard;
         // #812 review MEDIUM (reconfirm): a write landing while this task's
         // own build is in flight bumps the generation counter, but that
         // write's own `ensure_ann_background` call finds `warming` already
@@ -511,11 +702,24 @@ pub(crate) async fn ensure_ann_background(
         // the floor THIS attempt started from — if a write raced in during
         // the build, immediately re-enqueue another attempt against this
         // same task rather than waiting on an external caller.
+        //
+        // #812 review REQUEST CHANGES MEDIUM-2: bounded, not unconditional —
+        // continuous writes during every rebuild would otherwise spin this
+        // task (and the `warming` guard it holds) forever. `ATTEMPT_BOUND`
+        // caps consecutive rebuild attempts within a single tracked task;
+        // once exhausted the remainder is left for the post-release
+        // recheck below (or a later recall/write) to pick up, documented in
+        // ADR-107.
+        const ATTEMPT_BOUND: u32 = 3;
+        let mut attempt_floor = current_generation(&ann, &key).await;
+        let mut attempts: u32 = 0;
         loop {
             let Ok(token) = rt.authorize(Namespace::local()) else {
                 break;
             };
-            let attempt_floor = current_generation(&ann, &key).await;
+            attempts += 1;
+            #[cfg(test)]
+            ann.attempt_floor_notify.notify_one();
             match ensure_ann_for_model(&rt, &token, &ann, &model).await {
                 Ok(status) => {
                     tracing::debug!(?status, model = %model, "memory ANN background warm complete");
@@ -532,16 +736,44 @@ pub(crate) async fn ensure_ann_background(
                     break;
                 }
             }
-            if current_generation(&ann, &key).await <= attempt_floor {
+            let now_generation = current_generation(&ann, &key).await;
+            if now_generation <= attempt_floor {
                 // Nothing raced in while we built — either the corpus is
                 // fully caught up, or (e.g. an empty corpus with no further
                 // writes) there is nothing new to catch up to. Either way,
                 // looping again would spin without making progress.
                 break;
             }
+            if attempts >= ATTEMPT_BOUND {
+                tracing::debug!(
+                    model = %model,
+                    attempts,
+                    "memory ANN background warm hit its rebuild-attempt bound; \
+                     deferring the remainder to the next recall or write"
+                );
+                break;
+            }
+            attempt_floor = now_generation;
+        }
+        // #812 review REQUEST CHANGES MEDIUM-1: release the guard BEFORE this
+        // final freshness recheck, not after. The old code held the guard
+        // for the rest of the async block's scope, so it only dropped once
+        // this task returned — a write landing in the gap between the
+        // loop's last `current_generation` read above and that implicit
+        // drop would find `warming` still occupied by THIS task at
+        // `ensure_ann_background`'s single-flight check, silently no-op, and
+        // be stranded once the guard finally disappeared with nobody left to
+        // notice. Dropping explicitly here, then re-checking, closes that
+        // window: if the recheck finds the generation moved on, `warming` is
+        // already free, so taking it again below starts a genuinely new task
+        // instead of rejecting itself.
+        drop(warming_guard);
+        if current_generation(&ann, &key).await > attempt_floor
+            && try_take_warming_guard(&ann, &key)
+        {
+            spawn_rebuild_task(rt, ann, model, key);
         }
     });
-    true
 }
 
 /// Warm the global per-model ANN indexes at startup — skips already-loaded keys.
@@ -760,6 +992,14 @@ async fn ensure_ann_for_model_inner(
         return Ok(AnnEnsureStatus::AlreadyLoaded);
     }
 
+    // Captured once per attempt, same rationale as `target_generation`
+    // above: whatever gets installed by this attempt (snapshot-load or
+    // rebuild) is stamped with the durable epoch observed here, so a LATER
+    // `maybe_check_durable_epoch` call only flags this entry stale once a
+    // reindex bumps the epoch again after this point (#812 review REQUEST
+    // CHANGES HIGH).
+    let target_epoch = durable_epoch(rt).await;
+
     // Try snapshot warm-load. Both the shallow `CorpusFingerprint` (vector
     // count + dimensions) AND the durable `CorpusContentHash` (a blake3 hash
     // of the exact ordered subject-id + embedding-byte rows a build consumes)
@@ -795,7 +1035,9 @@ async fn ensure_ann_for_model_inner(
                         .await
                         .unwrap_or_default();
                     bridge.set_namespace_set(ns_set);
-                    let bridge = bridge.with_generation(target_generation);
+                    let bridge = bridge
+                        .with_generation(target_generation)
+                        .with_epoch_baseline(target_epoch);
                     install_if_fresher(ann, &key, bridge).await;
                     tracing::debug!(namespace = %ns, model = %model, "memory ANN loaded from snapshot");
                     return Ok(AnnEnsureStatus::LoadedSnapshot);
@@ -840,7 +1082,9 @@ async fn ensure_ann_for_model_inner(
                 return Ok(AnnEnsureStatus::DiscardedStaleBuild);
             }
             let vector_count = bridge.id_map.len();
-            let bridge = bridge.with_generation(target_generation);
+            let bridge = bridge
+                .with_generation(target_generation)
+                .with_epoch_baseline(target_epoch);
             if let Some(fingerprint) = fp_after {
                 // `content_hash` was computed from the exact rows this
                 // build's own scan read (#812 review re-confirm HIGH-B) —
@@ -2264,21 +2508,169 @@ mod tests {
         );
     }
 
+    // ── #812 review REQUEST CHANGES HIGH: durable epoch vs. warm daemon ─────
+
+    /// Reviewer-requested regression test (#812 review REQUEST CHANGES
+    /// HIGH): `kkernel reindex` runs as a SEPARATE process from a khive
+    /// daemon that already warmed its ANN index — the two share a database
+    /// file but nothing in-memory. Deleting the persisted snapshot row (as
+    /// `invalidate_active_memory_vamana_snapshot` does) is invisible to the
+    /// warm daemon's `common.rs` recall path, which only ever consults its
+    /// own in-memory generation counter. This models exactly that scenario
+    /// with two independent `KhiveRuntime`/`AnnState` pairs sharing one
+    /// SQLite file, and asserts the amortized durable-epoch check
+    /// (`maybe_check_durable_epoch`) is what closes the gap.
+    ///
+    /// Fail-on-revert: without `bump_memory_ann_epoch`/`maybe_check_durable_epoch`,
+    /// `is_current` on `ann1` stays `true` forever after `rt2`'s reindex, and
+    /// the final `ensure_ann_for_model` call returns `AlreadyLoaded` instead
+    /// of `Built`.
+    #[tokio::test]
+    async fn maybe_check_durable_epoch_detects_reindex_from_a_separate_warm_daemon() {
+        const MODEL: &str = "ann-warm-durable-epoch-test-model";
+        const DIMS: usize = 8;
+
+        let tmp = tempfile::Builder::new()
+            .prefix("khive-memory-ann-durable-epoch-")
+            .tempdir_in(std::env::temp_dir())
+            .expect("temp db dir");
+        let db_path = tmp.path().join("khive-graph.db");
+        std::mem::forget(tmp);
+
+        // "Daemon": first runtime, warms the ANN index and stays resident —
+        // exactly like a long-lived `kkernel mcp --daemon` process.
+        let rt1 = KhiveRuntime::new(khive_runtime::RuntimeConfig {
+            db_path: Some(db_path.clone()),
+            embedding_model: None,
+            additional_embedding_models: vec![],
+            ..khive_runtime::RuntimeConfig::default()
+        })
+        .expect("runtime 1");
+        rt1.register_embedder(HashVecProvider {
+            model_name: MODEL.to_owned(),
+            dims: DIMS,
+        });
+        let token1 = rt1.authorize(Namespace::local()).expect("authorize local");
+
+        let mut note_ids = Vec::new();
+        for i in 0..4u32 {
+            let note = rt1
+                .create_note_with_decay_for_embedding_model(
+                    &token1,
+                    "memory",
+                    None,
+                    &format!("durable epoch note {i}"),
+                    Some(0.7),
+                    0.01,
+                    None,
+                    vec![],
+                    None,
+                )
+                .await
+                .expect("create note");
+            note_ids.push(note.id);
+        }
+
+        let ann1 = new_shared();
+        let key = AnnKey::from_token(&token1, MODEL);
+        let status = ensure_ann_for_model(&rt1, &token1, &ann1, MODEL)
+            .await
+            .expect("first warm");
+        assert!(
+            matches!(status, AnnEnsureStatus::Built { vectors: 4 }),
+            "expected initial build, got: {status:?}"
+        );
+
+        // "Reindexer": a SEPARATE runtime pointed at the same DB file, like
+        // `kkernel reindex` invoked while the daemon above stays warm.
+        let rt2 = KhiveRuntime::new(khive_runtime::RuntimeConfig {
+            db_path: Some(db_path),
+            embedding_model: None,
+            additional_embedding_models: vec![],
+            ..khive_runtime::RuntimeConfig::default()
+        })
+        .expect("runtime 2");
+        rt2.register_embedder(HashVecProvider {
+            model_name: MODEL.to_owned(),
+            dims: DIMS,
+        });
+
+        // Vector-only re-embed, bypassing the notes table entirely — same
+        // shape as `reindex.rs`'s `embed_and_store_batch`.
+        {
+            let table_name = format!("vec_{}", sanitize_model_key(MODEL));
+            let replacement: Vec<f32> = (0..DIMS).map(|i| (i as f32 + 100.0) / 7.0).collect();
+            let bytes: Vec<u8> = replacement.iter().flat_map(|f| f.to_le_bytes()).collect();
+            let sql = rt2.sql();
+            let mut w = sql.writer().await.expect("writer");
+            w.execute(SqlStatement {
+                sql: format!(
+                    "UPDATE {table_name} SET embedding = ?1 \
+                     WHERE subject_id = ?2 AND embedding_model = ?3"
+                ),
+                params: vec![
+                    SqlValue::Blob(bytes),
+                    SqlValue::Text(note_ids[0].to_string()),
+                    SqlValue::Text(MODEL.to_string()),
+                ],
+                label: Some("test_durable_epoch_vector_reindex".into()),
+            })
+            .await
+            .expect("overwrite embedding");
+        }
+        // The reindexer deletes the persisted snapshot AND bumps the durable
+        // epoch, exactly like `invalidate_active_memory_vamana_snapshot` +
+        // `khive_pack_memory::bump_memory_ann_epoch` in `kkernel::reindex`.
+        bump_durable_epoch(&rt2).await.expect("bump durable epoch");
+
+        // Sanity: before the epoch check runs, the daemon's cache still
+        // (wrongly) considers itself fresh — its in-memory generation was
+        // never touched by `rt2`'s write.
+        assert!(
+            is_current(&ann1, &key).await,
+            "sanity: the daemon's cache must still consider itself fresh before \
+             the durable-epoch check runs"
+        );
+        maybe_check_durable_epoch(&rt1, &ann1, &key).await;
+        assert!(
+            !is_current(&ann1, &key).await,
+            "the amortized durable-epoch check must detect a cross-process \
+             reindex and mark the warm daemon's cached entry stale (#812 \
+             review REQUEST CHANGES HIGH)"
+        );
+
+        let status = ensure_ann_for_model(&rt1, &token1, &ann1, MODEL)
+            .await
+            .expect("rebuild after epoch mismatch");
+        assert!(
+            matches!(status, AnnEnsureStatus::Built { vectors: 4 }),
+            "the warm daemon must rebuild once its durable-epoch check detects \
+             the out-of-process reindex, got: {status:?}"
+        );
+    }
+
     // ── #812 review re-confirm MEDIUM: high-water re-enqueue on drop ────────
 
-    /// Reviewer-requested regression test (#812 review re-confirm MEDIUM): a
-    /// write landing while a background warm is already in flight must
-    /// eventually converge WITHOUT any later `memory.recall` or
-    /// `memory.remember` re-triggering the warm — the in-flight task's own
-    /// loop must notice the generation moved past what it built for and
-    /// re-enqueue itself.
+    /// Reviewer-requested regression test (#812 review re-confirm MEDIUM,
+    /// hardened per #812 review REQUEST CHANGES MEDIUM-2): a write landing
+    /// while a background warm is already in flight must eventually
+    /// converge WITHOUT any later `memory.recall` or `memory.remember`
+    /// re-triggering the warm — the in-flight task's own loop must notice
+    /// the generation moved past what it built for and re-enqueue itself.
+    ///
+    /// Uses `attempt_floor_notify` as an explicit barrier instead of relying
+    /// on a 300-note build being slow enough to still be in flight when
+    /// `bump_generation` runs — the reviewer flagged that timing-based
+    /// version as not provably exercising the re-enqueue path at all. The
+    /// barrier guarantees the write lands strictly after the task has
+    /// committed to its first attempt's generation floor, which is exactly
+    /// the window the re-enqueue loop exists to cover.
     ///
     /// Fail-on-revert: reverting `ensure_ann_background`'s tracked task back
     /// to a single `ensure_ann_for_model` attempt (no loop) makes this test
-    /// flaky-to-failing: whenever the `bump_generation` call below lands
-    /// after the task has already captured its build floor, nothing is left
-    /// to notice the index fell behind, and `is_current` never becomes true
-    /// within the poll budget.
+    /// fail deterministically: nothing is left to notice the index fell
+    /// behind after the barrier releases, and `is_current` never becomes
+    /// true within the poll budget.
     #[tokio::test]
     #[serial(background_tasks)]
     async fn ensure_ann_background_converges_on_write_during_warm_with_no_further_recalls() {
@@ -2287,10 +2679,7 @@ mod tests {
         let rt = test_runtime_with_hash_embedder(MODEL, DIMS);
 
         let token = rt.authorize(Namespace::local()).expect("authorize local");
-        // A few hundred notes so the graph build takes long enough (spawn_blocking
-        // I/O + Vamana construction) to reliably still be in flight when the
-        // `bump_generation` call right below executes.
-        for i in 0..300u32 {
+        for i in 0..8u32 {
             rt.create_note_with_decay_for_embedding_model(
                 &token,
                 "memory",
@@ -2309,10 +2698,15 @@ mod tests {
         let ann = new_shared();
         let key = AnnKey::from_token(&token, MODEL);
 
+        let notified = ann.attempt_floor_notify.notified();
         assert!(
             ensure_ann_background(&rt, &token, &ann, MODEL).await,
             "first call for a fresh key must start a background warm"
         );
+        // Wait for the tracked task to actually commit to its first
+        // attempt's generation floor before bumping — this is the barrier
+        // that replaces the old "300 notes should be slow enough" gamble.
+        notified.await;
         // Simulate a write racing in while the warm above is still building —
         // bump the generation exactly like `memory.remember` does, but
         // deliberately do NOT call `ensure_ann_background` again: the whole

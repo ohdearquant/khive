@@ -880,6 +880,21 @@ async fn invalidate_active_memory_vamana_snapshot(rt: &KhiveRuntime) {
             }
         }
     }
+    drop(writer);
+
+    // #812 review REQUEST CHANGES HIGH: the DELETE above only touches the
+    // persisted snapshot row. A khive daemon that warmed its in-memory ANN
+    // index before this reindex ran shares no process, and therefore no
+    // in-memory write-generation state, with this `kkernel reindex`
+    // invocation — its `common.rs` recall path would keep trusting that
+    // cached index forever with no way to observe this mutation at all.
+    // Bumping the durable epoch here gives that daemon's amortized freshness
+    // check (`khive_pack_memory::ann::maybe_check_durable_epoch`, sampled
+    // from the recall path) a signal written to the shared database file
+    // instead of one confined to this process.
+    if let Err(e) = khive_pack_memory::bump_memory_ann_epoch(rt).await {
+        tracing::warn!(error = %e, "failed to bump durable memory ANN epoch after reindex");
+    }
 }
 
 /// Return the set of distinct namespaces present in base `entities` and `notes`
