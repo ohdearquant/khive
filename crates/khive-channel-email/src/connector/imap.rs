@@ -5,6 +5,7 @@
 //! at construction time from environment variables.
 
 use std::collections::HashMap;
+use std::num::NonZeroU32;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -26,16 +27,41 @@ type ImapSession = async_imap::Session<
     async_native_tls::TlsStream<tokio_util::compat::Compat<tokio::net::TcpStream>>,
 >;
 
+/// Durable IMAP poll progress: the mailbox's `UIDVALIDITY` epoch plus the
+/// greatest UID durably handled within that epoch (issue #449).
+///
+/// `NonZeroU32` mirrors the wire invariant: IMAP's own `UIDVALIDITY` and
+/// `UID` values are never zero (see [`validate_uid_validity`] and
+/// [`select_uid_page`]'s zero-UID rejection).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ImapProgress {
+    pub(crate) uid_validity: Option<NonZeroU32>,
+    pub(crate) last_seen_uid: Option<NonZeroU32>,
+}
+
+/// One page of IMAP fetch results plus the progress the caller should adopt
+/// once the page is durably handled.
+pub(crate) struct ImapFetchPage {
+    pub(crate) emails: Vec<RawEmail>,
+    pub(crate) next_progress: ImapProgress,
+}
+
 /// Internal trait for IMAP fetch operations.
 ///
 /// Allows unit tests to substitute a mock without a live IMAP server.
 #[async_trait]
 pub(crate) trait ImapConnector: Send + Sync + 'static {
-    async fn fetch_since(
+    /// Fetch a sorted, deduplicated, progress-bound page of messages.
+    ///
+    /// `progress` is the caller's last-known `(UIDVALIDITY, high-water)`
+    /// pair; the connector never advances past an incompletely-handled page
+    /// (see [`process_selected_page`]).
+    async fn fetch_page(
         &self,
         since: DateTime<Utc>,
         limit: usize,
-    ) -> Result<Vec<RawEmail>, ChannelError>;
+        progress: ImapProgress,
+    ) -> Result<ImapFetchPage, ChannelError>;
 }
 
 /// IMAP authentication configuration (basic or OAuth2 XOAUTH2).
@@ -192,11 +218,12 @@ impl LiveImap {
 #[async_trait]
 impl ImapConnector for LiveImap {
     #[instrument(skip(self), fields(imap_host = %self.host))]
-    async fn fetch_since(
+    async fn fetch_page(
         &self,
         since: DateTime<Utc>,
         limit: usize,
-    ) -> Result<Vec<RawEmail>, ChannelError> {
+        progress: ImapProgress,
+    ) -> Result<ImapFetchPage, ChannelError> {
         // Single-flight (#605): hold this credential's one permit for the
         // full connect-through-logout lifecycle below, so a second concurrent
         // call (e.g. a future caller widening the poll loop's concurrency)
@@ -211,33 +238,46 @@ impl ImapConnector for LiveImap {
             .select("INBOX")
             .await
             .map_err(|e| ChannelError::Transport(format!("IMAP SELECT INBOX failed: {e}")))?;
-        let uid_validity = mailbox.uid_validity;
+        let uid_validity = validate_uid_validity(mailbox.uid_validity)?;
 
-        // Search for messages since the given date.
-        let since_str = since.format("%d-%b-%Y").to_string();
-        let uid_set = session
-            .uid_search(format!("SINCE {since_str}"))
-            .await
-            .map_err(|e| ChannelError::Transport(format!("IMAP UID SEARCH SINCE failed: {e}")))?;
-
-        let mut uid_list: Vec<u32> = uid_set.into_iter().collect();
-        uid_list.truncate(limit);
-
-        if uid_list.is_empty() {
+        let Some(query) = uid_search_query(since, uid_validity, progress) else {
+            // Current epoch's high-water is already at u32::MAX: nothing more
+            // to search, and the epoch/high-water are unchanged.
             let _ = session.logout().await;
-            return Ok(vec![]);
+            return Ok(ImapFetchPage {
+                emails: vec![],
+                next_progress: progress,
+            });
+        };
+
+        let uid_set = session
+            .uid_search(query)
+            .await
+            .map_err(|e| ChannelError::Transport(format!("IMAP UID SEARCH failed: {e}")))?;
+
+        let selected =
+            select_uid_page(uid_set.into_iter().collect(), limit, uid_validity, progress)?;
+
+        if selected.is_empty() {
+            let _ = session.logout().await;
+            let next = next_progress(uid_validity, progress, &selected);
+            return Ok(ImapFetchPage {
+                emails: vec![],
+                next_progress: next,
+            });
         }
 
-        let uid_str = uid_list
+        let uid_str = selected
             .iter()
-            .map(|u| u.to_string())
+            .map(|u| u.get().to_string())
             .collect::<Vec<_>>()
             .join(",");
 
         // Collect the fetch stream into owned bytes before releasing the session borrow.
-        // Each entry carries the raw UID as returned by the server (Option<u32>); zero
-        // and absent UIDs are validated inside process_mailbox_fetch.
-        let fetched_raw: Vec<(Option<u32>, Vec<u8>)> = {
+        // Every fetch entry is kept, including a `None` body: filtering bodyless
+        // entries here would hide an incomplete selected page from
+        // `process_selected_page`, which must see (and reject) that gap.
+        let fetched_raw: Vec<(Option<u32>, Option<Vec<u8>>)> = {
             let mut stream = session
                 .uid_fetch(&uid_str, "RFC822")
                 .await
@@ -249,64 +289,172 @@ impl ImapConnector for LiveImap {
                 .await
                 .map_err(|e| ChannelError::Transport(format!("IMAP fetch stream error: {e}")))?
             {
-                if let Some(body) = msg.body() {
-                    collected.push((msg.uid, body.to_vec()));
-                }
+                collected.push((msg.uid, msg.body().map(|b| b.to_vec())));
             }
             collected
         };
 
         let _ = session.logout().await;
 
-        process_mailbox_fetch(uid_validity, fetched_raw, &self.host)
+        let emails = process_selected_page(uid_validity, &selected, fetched_raw, &self.host)?;
+        let next = next_progress(uid_validity, progress, &selected);
+        Ok(ImapFetchPage {
+            emails,
+            next_progress: next,
+        })
     }
 }
 
-/// Validate UIDVALIDITY + per-message UIDs and build the `RawEmail` list.
+/// Reject a missing or zero `UIDVALIDITY` before any search/fetch is issued.
 ///
-/// `uid_validity` must be `Some(non-zero)`.  When it is `None` or `Some(0)` the
-/// whole batch is rejected as a transport error: UIDVALIDITY is required to form
-/// the stable `imap:{host}:{uidvalidity}:{uid}` dedup key, and without it we
-/// cannot safely identify or deduplicate messages.
+/// UIDVALIDITY is required to form the stable `imap:{host}:{uidvalidity}:{uid}`
+/// dedup key and to bind durable high-water progress to the correct epoch;
+/// without it we cannot safely identify, deduplicate, or page messages.
+fn validate_uid_validity(uid_validity: Option<u32>) -> Result<NonZeroU32, ChannelError> {
+    uid_validity.and_then(NonZeroU32::new).ok_or_else(|| {
+        ChannelError::Transport(
+            "IMAP SELECT did not return a valid UIDVALIDITY; \
+             cannot safely deduplicate messages — poll aborted"
+                .to_string(),
+        )
+    })
+}
+
+/// Build the `UID SEARCH` criteria string for the current epoch and progress.
 ///
-/// Per-message UIDs that are `None` or `0` are skipped with a `warn!` log rather
-/// than failing the batch: one missing UID is a server quirk, not a reason to
-/// discard all other messages in the poll.
+/// Returns `None` when the current epoch matches stored progress and the
+/// high-water is already `u32::MAX` (the epoch is exhausted; no search is
+/// issued). Otherwise: same epoch with a known high-water searches strictly
+/// above it (`UID {h+1}:*`); a new/changed epoch, or a same epoch with no
+/// high-water yet, searches by date (`SINCE <since>`), ignoring any high-water
+/// from a different epoch.
+fn uid_search_query(
+    since: DateTime<Utc>,
+    current_uid_validity: NonZeroU32,
+    progress: ImapProgress,
+) -> Option<String> {
+    if progress.uid_validity == Some(current_uid_validity) {
+        match progress.last_seen_uid {
+            Some(h) if h.get() == u32::MAX => None,
+            Some(h) => Some(format!("UID {}:*", h.get().saturating_add(1))),
+            None => Some(format!("SINCE {}", since.format("%d-%b-%Y"))),
+        }
+    } else {
+        Some(format!("SINCE {}", since.format("%d-%b-%Y")))
+    }
+}
+
+/// Normalize a raw `UID SEARCH` result into a bounded, deterministic page.
 ///
-/// This function is extracted from `LiveImap::fetch_since` so the validation
-/// logic can be exercised without a live IMAP server.
-pub(crate) fn process_mailbox_fetch(
-    uid_validity: Option<u32>,
-    fetched_raw: Vec<(Option<u32>, Vec<u8>)>,
+/// Order: reject any zero UID (protocol-invalid); sort ascending; deduplicate;
+/// when the epoch matches stored progress, retain only UIDs strictly above the
+/// high-water as a defensive re-check; then truncate to `limit`.
+fn select_uid_page(
+    mut uids: Vec<u32>,
+    limit: usize,
+    current_uid_validity: NonZeroU32,
+    progress: ImapProgress,
+) -> Result<Vec<NonZeroU32>, ChannelError> {
+    if uids.contains(&0) {
+        return Err(ChannelError::Transport(
+            "IMAP UID SEARCH returned a zero UID, which is protocol-invalid".to_string(),
+        ));
+    }
+    uids.sort_unstable();
+    uids.dedup();
+
+    if progress.uid_validity == Some(current_uid_validity) {
+        if let Some(high_water) = progress.last_seen_uid {
+            uids.retain(|&u| u > high_water.get());
+        }
+    }
+
+    uids.truncate(limit);
+
+    Ok(uids
+        .into_iter()
+        .map(|u| NonZeroU32::new(u).expect("zero UIDs already rejected above"))
+        .collect())
+}
+
+/// Compute the checkpoint candidate after selecting (not yet validating) a page.
+///
+/// A non-empty selection advances to `(current epoch, max selected UID)`. An
+/// empty selection under an unchanged epoch leaves `prior` untouched (nothing
+/// to commit — avoids a write every poll). An empty selection under a new or
+/// changed epoch still replaces the obsolete epoch, with `high_water: None`,
+/// so a stale epoch's high-water is never silently reused.
+fn next_progress(
+    current_uid_validity: NonZeroU32,
+    prior: ImapProgress,
+    selected: &[NonZeroU32],
+) -> ImapProgress {
+    match selected.iter().map(|u| u.get()).max() {
+        Some(max) => ImapProgress {
+            uid_validity: Some(current_uid_validity),
+            last_seen_uid: NonZeroU32::new(max),
+        },
+        None if prior.uid_validity == Some(current_uid_validity) => prior,
+        None => ImapProgress {
+            uid_validity: Some(current_uid_validity),
+            last_seen_uid: None,
+        },
+    }
+}
+
+/// Validate a fully-fetched selected page and build the `RawEmail` list, in
+/// `selected_uids` order.
+///
+/// Every UID in `selected_uids` must appear exactly once in `fetched_raw` with
+/// a non-`None` body that parses successfully; any gap, duplicate, missing
+/// body, or parse failure fails the whole page (no partial advancement — the
+/// poll coordinator must not commit a candidate high-water for an incompletely
+/// materialized page). A fetch response for a UID outside `selected_uids` is
+/// unrequested (e.g. a stray server response) and is ignored with a `warn!`;
+/// it can never affect page validity or the candidate high-water.
+pub(crate) fn process_selected_page(
+    uid_validity: NonZeroU32,
+    selected_uids: &[NonZeroU32],
+    fetched_raw: Vec<(Option<u32>, Option<Vec<u8>>)>,
     host: &str,
 ) -> Result<Vec<RawEmail>, ChannelError> {
-    let uidvalidity = match uid_validity {
-        Some(v) if v != 0 => v,
-        _ => {
-            return Err(ChannelError::Transport(
-                "IMAP SELECT did not return a valid UIDVALIDITY; \
-                 cannot safely deduplicate messages — poll aborted"
-                    .to_string(),
-            ));
-        }
-    };
-
-    let mut result = Vec::new();
-    for (uid_opt, raw_bytes) in fetched_raw {
-        let uid = match uid_opt {
-            Some(u) if u != 0 => u,
-            _ => {
-                tracing::warn!(
-                    host = %host,
-                    uidvalidity = %uidvalidity,
-                    "skipping message with missing or zero UID; cannot form a stable dedup key"
-                );
-                continue;
-            }
+    let mut by_uid: HashMap<u32, Vec<u8>> = HashMap::new();
+    for (uid_opt, body_opt) in fetched_raw {
+        let Some(uid) = uid_opt.filter(|&u| u != 0) else {
+            continue;
         };
-        if let Some(email) = parse_raw_bytes(uid, &raw_bytes, host, uidvalidity) {
-            result.push(email);
+        if !selected_uids.iter().any(|s| s.get() == uid) {
+            tracing::warn!(host = %host, uid, "ignoring unrequested IMAP fetch response");
+            continue;
         }
+        let Some(body) = body_opt else {
+            return Err(ChannelError::Transport(format!(
+                "IMAP UID FETCH returned no RFC822 body for selected UID {uid}; \
+                 page rejected, not partially advanced"
+            )));
+        };
+        if by_uid.insert(uid, body).is_some() {
+            return Err(ChannelError::Transport(format!(
+                "IMAP UID FETCH returned duplicate responses for selected UID {uid}"
+            )));
+        }
+    }
+
+    let mut result = Vec::with_capacity(selected_uids.len());
+    for &uid in selected_uids {
+        let uid = uid.get();
+        let raw = by_uid.remove(&uid).ok_or_else(|| {
+            ChannelError::Transport(format!(
+                "IMAP UID FETCH did not return a response for selected UID {uid}; \
+                 page rejected, not partially advanced"
+            ))
+        })?;
+        let email = parse_raw_bytes(uid, &raw, host, uid_validity.get()).ok_or_else(|| {
+            ChannelError::Transport(format!(
+                "failed to parse RFC822 bytes for selected UID {uid}"
+            ))
+        })?;
+        result.push(email);
     }
     Ok(result)
 }
@@ -439,6 +587,12 @@ pub(crate) fn parse_raw_bytes(
 /// IMAP fetcher wrapping an `ImapConnector`.
 pub struct ImapFetcher {
     pub(crate) inner: Arc<dyn ImapConnector>,
+    /// In-memory compatibility cursor for [`Self::fetch_since`] callers (e.g.
+    /// direct library use outside the daemon poll loop, and this crate's own
+    /// tests). Progress-based within one process, but never persisted — the
+    /// daemon's durable checkpoint path goes through [`Self::fetch_page`]
+    /// with an explicit [`ImapProgress`] loaded from storage instead.
+    legacy_progress: tokio::sync::Mutex<ImapProgress>,
 }
 
 impl ImapFetcher {
@@ -446,6 +600,7 @@ impl ImapFetcher {
     pub fn new(host: impl Into<String>, port: u16, username: &str, password: &str) -> Self {
         Self {
             inner: Arc::new(LiveImap::new(host, port, username, password)),
+            legacy_progress: tokio::sync::Mutex::new(ImapProgress::default()),
         }
     }
 
@@ -458,6 +613,7 @@ impl ImapFetcher {
     ) -> Self {
         Self {
             inner: Arc::new(LiveImap::new_oauth(host, port, mailbox, token_provider)),
+            legacy_progress: tokio::sync::Mutex::new(ImapProgress::default()),
         }
     }
 
@@ -466,16 +622,39 @@ impl ImapFetcher {
     pub(crate) fn with_connector(connector: impl ImapConnector) -> Self {
         Self {
             inner: Arc::new(connector),
+            legacy_progress: tokio::sync::Mutex::new(ImapProgress::default()),
         }
     }
 
     /// Fetch messages received since `since`, up to `limit` items.
+    ///
+    /// Maintains an in-memory `(UIDVALIDITY, high-water)` cursor across calls
+    /// on this `ImapFetcher` instance, advancing it only when the underlying
+    /// fetch succeeds. This makes repeated standalone calls progress-based
+    /// within one process without requiring a durable checkpoint; the daemon
+    /// poll loop uses [`Self::fetch_page`] with an explicit stored checkpoint
+    /// instead.
     pub async fn fetch_since(
         &self,
         since: DateTime<Utc>,
         limit: usize,
     ) -> Result<Vec<RawEmail>, ChannelError> {
-        self.inner.fetch_since(since, limit).await
+        let mut progress = self.legacy_progress.lock().await;
+        let page = self.inner.fetch_page(since, limit, *progress).await?;
+        *progress = page.next_progress;
+        Ok(page.emails)
+    }
+
+    /// Fetch one explicit-progress page (crate-internal: used by
+    /// `EmailChannel::poll_page` with a durable checkpoint loaded from
+    /// storage, bypassing the in-memory `legacy_progress` cursor entirely).
+    pub(crate) async fn fetch_page(
+        &self,
+        since: DateTime<Utc>,
+        limit: usize,
+        progress: ImapProgress,
+    ) -> Result<ImapFetchPage, ChannelError> {
+        self.inner.fetch_page(since, limit, progress).await
     }
 }
 
@@ -495,12 +674,16 @@ mod tests {
 
     #[async_trait]
     impl ImapConnector for MockImap {
-        async fn fetch_since(
+        async fn fetch_page(
             &self,
             _since: DateTime<Utc>,
             _limit: usize,
-        ) -> Result<Vec<RawEmail>, ChannelError> {
-            Ok(self.emails.clone())
+            _progress: ImapProgress,
+        ) -> Result<ImapFetchPage, ChannelError> {
+            Ok(ImapFetchPage {
+                emails: self.emails.clone(),
+                next_progress: ImapProgress::default(),
+            })
         }
     }
 
@@ -721,80 +904,343 @@ mod tests {
         assert_eq!(email.correlation(), Some("some-uuid"));
     }
 
-    // --- process_mailbox_fetch guard tests ---
+    // --- UID progress/paging pure-helper tests (issue #449) ---
 
     fn minimal_rfc822(from: &str, subject: &str) -> Vec<u8> {
         format!("From: {from}\r\nTo: me@example.com\r\nSubject: {subject}\r\n\r\nbody").into_bytes()
     }
 
     #[test]
-    fn process_mailbox_fetch_missing_uidvalidity_returns_error() {
-        let raw = minimal_rfc822("a@example.com", "test");
-        let result = process_mailbox_fetch(None, vec![(Some(1), raw)], "imap.example.com");
+    fn validate_uid_validity_rejects_missing_and_zero() {
+        assert!(validate_uid_validity(None).is_err());
+        assert!(validate_uid_validity(Some(0)).is_err());
+        assert!(validate_uid_validity(Some(1)).is_ok());
+    }
+
+    #[test]
+    fn uid_page_progress_drains_75_uids_in_50_then_25() {
+        // Reversed with duplicates, mirroring async-imap's unordered HashSet result.
+        let mut uids: Vec<u32> = (1..=75).rev().collect();
+        uids.extend(1..=10);
+        let validity = NonZeroU32::new(99).unwrap();
+        let progress = ImapProgress::default();
+
+        let page1 = select_uid_page(uids.clone(), 50, validity, progress).unwrap();
+        assert_eq!(
+            page1.iter().map(|u| u.get()).collect::<Vec<_>>(),
+            (1u32..=50).collect::<Vec<_>>(),
+            "first page must be exactly 1..=50"
+        );
+
+        let progress2 = next_progress(validity, progress, &page1);
+        assert_eq!(progress2.last_seen_uid, NonZeroU32::new(50));
+
+        let page2 = select_uid_page(uids.clone(), 50, validity, progress2).unwrap();
+        assert_eq!(
+            page2.iter().map(|u| u.get()).collect::<Vec<_>>(),
+            (51u32..=75).collect::<Vec<_>>(),
+            "second page must be exactly 51..=75, no overlap with the first"
+        );
+
+        let progress3 = next_progress(validity, progress2, &page2);
+        let page3 = select_uid_page(uids, 50, validity, progress3).unwrap();
+        assert!(
+            page3.is_empty(),
+            "third page must be empty; the backlog is fully drained"
+        );
+    }
+
+    #[test]
+    fn uid_page_is_independent_of_input_order_and_deduplicates_before_limit() {
+        let validity = NonZeroU32::new(1).unwrap();
+        let progress = ImapProgress::default();
+        let ascending: Vec<u32> = (1..=10).collect();
+        let mut shuffled = ascending.clone();
+        shuffled.reverse();
+        let mut with_dupes = shuffled.clone();
+        with_dupes.extend(shuffled.clone());
+
+        let a = select_uid_page(ascending, 10, validity, progress).unwrap();
+        let b = select_uid_page(shuffled, 10, validity, progress).unwrap();
+        let c = select_uid_page(with_dupes, 10, validity, progress).unwrap();
+        assert_eq!(a, b, "page selection must not depend on input order");
+        assert_eq!(a, c, "duplicate UIDs must not consume extra page slots");
+    }
+
+    #[test]
+    fn uid_page_rejects_zero_uid() {
+        let validity = NonZeroU32::new(1).unwrap();
+        let result = select_uid_page(vec![0, 1, 2], 10, validity, ImapProgress::default());
         assert!(
             result.is_err(),
-            "missing UIDVALIDITY must return a transport error"
+            "a protocol-invalid zero UID must reject the whole selection"
         );
-        let msg = result.unwrap_err().to_string();
+    }
+
+    #[test]
+    fn same_uidvalidity_query_starts_strictly_above_high_water() {
+        let validity = NonZeroU32::new(99).unwrap();
+        let progress = ImapProgress {
+            uid_validity: Some(validity),
+            last_seen_uid: NonZeroU32::new(50),
+        };
+        assert_eq!(
+            uid_search_query(Utc::now(), validity, progress).as_deref(),
+            Some("UID 51:*")
+        );
+    }
+
+    #[test]
+    fn uidvalidity_change_uses_since_and_ignores_old_high_water() {
+        let old_validity = NonZeroU32::new(99).unwrap();
+        let new_validity = NonZeroU32::new(100).unwrap();
+        let progress = ImapProgress {
+            uid_validity: Some(old_validity),
+            last_seen_uid: NonZeroU32::new(50),
+        };
+        let since = DateTime::parse_from_rfc3339("2026-07-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        assert_eq!(
+            uid_search_query(since, new_validity, progress).as_deref(),
+            Some("SINCE 01-Jul-2026")
+        );
+
+        // The new epoch's selection must not filter by the old epoch's high-water.
+        let selected = select_uid_page(vec![3, 1, 2], 50, new_validity, progress).unwrap();
+        assert_eq!(
+            selected.iter().map(|u| u.get()).collect::<Vec<_>>(),
+            vec![1, 2, 3],
+            "new epoch selection must retain low UIDs the old epoch's high-water would have excluded"
+        );
+    }
+
+    #[test]
+    fn max_uid_high_water_issues_no_search_for_same_epoch() {
+        let validity = NonZeroU32::new(99).unwrap();
+        let progress = ImapProgress {
+            uid_validity: Some(validity),
+            last_seen_uid: NonZeroU32::new(u32::MAX),
+        };
+        assert_eq!(
+            uid_search_query(Utc::now(), validity, progress),
+            None,
+            "an exhausted epoch (high-water at u32::MAX) must not repeat the search"
+        );
+    }
+
+    #[test]
+    fn next_progress_changed_epoch_empty_selection_resets_high_water_to_none() {
+        let old_validity = NonZeroU32::new(99).unwrap();
+        let new_validity = NonZeroU32::new(100).unwrap();
+        let prior = ImapProgress {
+            uid_validity: Some(old_validity),
+            last_seen_uid: NonZeroU32::new(50),
+        };
+        let next = next_progress(new_validity, prior, &[]);
+        assert_eq!(
+            next,
+            ImapProgress {
+                uid_validity: Some(new_validity),
+                last_seen_uid: None,
+            },
+            "a UIDVALIDITY change with an empty selection must still adopt the new \
+             epoch and reset high-water, not silently keep the old epoch's value"
+        );
+    }
+
+    #[test]
+    fn next_progress_same_epoch_empty_selection_keeps_prior_unchanged() {
+        let validity = NonZeroU32::new(99).unwrap();
+        let prior = ImapProgress {
+            uid_validity: Some(validity),
+            last_seen_uid: NonZeroU32::new(50),
+        };
+        let next = next_progress(validity, prior, &[]);
+        assert_eq!(
+            next, prior,
+            "an empty page under an unchanged epoch must leave the checkpoint \
+             byte-identical, avoiding a wasted commit every poll"
+        );
+    }
+
+    #[test]
+    fn select_uid_page_dedup_happens_before_truncate_so_limit_is_not_wasted_on_duplicates() {
+        let validity = NonZeroU32::new(1).unwrap();
+        let mut uids = vec![1u32; 200];
+        uids.extend(2..=40); // 39 more distinct UIDs -> 40 distinct total.
+        let selected = select_uid_page(uids, 50, validity, ImapProgress::default()).unwrap();
+        assert_eq!(
+            selected.iter().map(|u| u.get()).collect::<Vec<_>>(),
+            (1u32..=40).collect::<Vec<_>>(),
+            "200 duplicate copies of UID 1 must not consume page slots that belong \
+             to the 39 genuinely distinct UIDs"
+        );
+    }
+
+    #[test]
+    fn select_uid_page_repeated_overlapping_search_result_yields_only_new_uids() {
+        let validity = NonZeroU32::new(1).unwrap();
+        let progress = ImapProgress {
+            uid_validity: Some(validity),
+            last_seen_uid: NonZeroU32::new(10),
+        };
+        // A broad re-search (e.g. after a retry) that re-includes already-consumed
+        // UIDs 1..=10 alongside genuinely new UIDs 11..=15.
+        let uids: Vec<u32> = (1..=15).collect();
+        let selected = select_uid_page(uids, 50, validity, progress).unwrap();
+        assert_eq!(
+            selected.iter().map(|u| u.get()).collect::<Vec<_>>(),
+            (11u32..=15).collect::<Vec<_>>(),
+            "a re-searched page that overlaps already-consumed UIDs must yield only \
+             the strictly-new tail"
+        );
+    }
+
+    #[test]
+    fn select_uid_page_out_of_order_uids_with_gaps_selected_in_sorted_order() {
+        let validity = NonZeroU32::new(1).unwrap();
+        let uids = vec![97, 3, 500, 12, 3, 8, 250];
+        let selected = select_uid_page(uids, 50, validity, ImapProgress::default()).unwrap();
+        assert_eq!(
+            selected.iter().map(|u| u.get()).collect::<Vec<_>>(),
+            vec![3, 8, 12, 97, 250, 500],
+            "sparse, unordered, duplicated UIDs must sort and dedupe correctly, not \
+             just over a contiguous range"
+        );
+    }
+
+    #[test]
+    fn strict_page_orders_fetch_responses_by_selected_uid() {
+        let validity = NonZeroU32::new(1).unwrap();
+        let selected = vec![
+            NonZeroU32::new(1).unwrap(),
+            NonZeroU32::new(2).unwrap(),
+            NonZeroU32::new(3).unwrap(),
+        ];
+        // Fetch stream returns entries in reverse order.
+        let fetched = vec![
+            (Some(3), Some(minimal_rfc822("c@example.com", "three"))),
+            (Some(2), Some(minimal_rfc822("b@example.com", "two"))),
+            (Some(1), Some(minimal_rfc822("a@example.com", "one"))),
+        ];
+        let emails =
+            process_selected_page(validity, &selected, fetched, "imap.example.com").unwrap();
+        assert_eq!(
+            emails.iter().map(|e| e.uid).collect::<Vec<_>>(),
+            vec![1, 2, 3],
+            "output must follow selected_uids order, not fetch response order"
+        );
+    }
+
+    #[test]
+    fn strict_page_missing_body_or_selected_uid_returns_error() {
+        let validity = NonZeroU32::new(1).unwrap();
+        let selected = vec![NonZeroU32::new(1).unwrap(), NonZeroU32::new(2).unwrap()];
+
+        // UID 2 is present in the response but carries no RFC822 body.
+        let missing_body = vec![
+            (Some(1), Some(minimal_rfc822("a@example.com", "one"))),
+            (Some(2), None),
+        ];
         assert!(
-            msg.contains("UIDVALIDITY"),
-            "error message should mention UIDVALIDITY; got: {msg}"
+            process_selected_page(validity, &selected, missing_body, "h").is_err(),
+            "a selected UID with no body must fail the whole page, not silently omit it"
         );
-    }
 
-    #[test]
-    fn process_mailbox_fetch_zero_uidvalidity_returns_error() {
-        let raw = minimal_rfc822("a@example.com", "test");
-        let result = process_mailbox_fetch(Some(0), vec![(Some(1), raw)], "imap.example.com");
+        // UID 2 never appears in the fetch response at all.
+        let missing_uid = vec![(Some(1), Some(minimal_rfc822("a@example.com", "one")))];
         assert!(
-            result.is_err(),
-            "zero UIDVALIDITY must return a transport error"
+            process_selected_page(validity, &selected, missing_uid, "h").is_err(),
+            "a selected UID absent from the fetch response must fail the whole page"
         );
     }
 
     #[test]
-    fn process_mailbox_fetch_missing_uid_skips_message() {
-        let raw = minimal_rfc822("a@example.com", "test");
-        let result =
-            process_mailbox_fetch(Some(999), vec![(None, raw)], "imap.example.com").unwrap();
+    fn strict_page_parse_failure_returns_error() {
+        let validity = NonZeroU32::new(1).unwrap();
+        let selected = vec![NonZeroU32::new(1).unwrap()];
+        // Empty body — mail_parser returns None ("if no headers are found
+        // None is returned").
+        let fetched = vec![(Some(1), Some(Vec::new()))];
         assert!(
-            result.is_empty(),
-            "a message with missing UID must be skipped (not an error)"
+            process_selected_page(validity, &selected, fetched, "h").is_err(),
+            "malformed selected RFC822 bytes must fail the page, not silently advance"
         );
     }
 
     #[test]
-    fn process_mailbox_fetch_zero_uid_skips_message() {
-        let raw = minimal_rfc822("a@example.com", "test");
-        let result =
-            process_mailbox_fetch(Some(999), vec![(Some(0), raw)], "imap.example.com").unwrap();
+    fn strict_page_ignores_unrequested_fetch_response() {
+        let validity = NonZeroU32::new(1).unwrap();
+        let selected = vec![NonZeroU32::new(1).unwrap()];
+        let fetched = vec![
+            (Some(1), Some(minimal_rfc822("a@example.com", "one"))),
+            // UID 99 was never selected; a stray response for it must be ignored,
+            // not treated as part of the page.
+            (Some(99), Some(minimal_rfc822("stray@example.com", "stray"))),
+        ];
+        let emails = process_selected_page(validity, &selected, fetched, "h").unwrap();
+        assert_eq!(emails.len(), 1);
+        assert_eq!(emails[0].uid, 1);
+    }
+
+    #[tokio::test]
+    async fn mock_imap_backlog_drains_across_fetch_since_calls() {
+        // Simulates async-imap search always returning the full 75-message
+        // backlog (as it would every 5s until the SINCE window advances) --
+        // ImapFetcher's legacy_progress cursor must still drain it as
+        // 50, then 25, then 0 across repeated standalone calls.
+        struct BacklogMockImap {
+            validity: NonZeroU32,
+            all_uids: Vec<u32>,
+        }
+
+        #[async_trait]
+        impl ImapConnector for BacklogMockImap {
+            async fn fetch_page(
+                &self,
+                _since: DateTime<Utc>,
+                limit: usize,
+                progress: ImapProgress,
+            ) -> Result<ImapFetchPage, ChannelError> {
+                let selected =
+                    select_uid_page(self.all_uids.clone(), limit, self.validity, progress)?;
+                let fetched: Vec<(Option<u32>, Option<Vec<u8>>)> = selected
+                    .iter()
+                    .map(|u| {
+                        (
+                            Some(u.get()),
+                            Some(minimal_rfc822("sender@example.com", "backlog")),
+                        )
+                    })
+                    .collect();
+                let emails =
+                    process_selected_page(self.validity, &selected, fetched, "mail.example.com")?;
+                let next = next_progress(self.validity, progress, &selected);
+                Ok(ImapFetchPage {
+                    emails,
+                    next_progress: next,
+                })
+            }
+        }
+
+        let mut all_uids: Vec<u32> = (1..=75).rev().collect();
+        all_uids.extend(1..=5); // duplicates, mirroring HashSet noise
+
+        let fetcher = ImapFetcher::with_connector(BacklogMockImap {
+            validity: NonZeroU32::new(42).unwrap(),
+            all_uids,
+        });
+
+        let page1 = fetcher.fetch_since(Utc::now(), 50).await.unwrap();
+        assert_eq!(page1.len(), 50);
+        let page2 = fetcher.fetch_since(Utc::now(), 50).await.unwrap();
+        assert_eq!(page2.len(), 25);
+        let page3 = fetcher.fetch_since(Utc::now(), 50).await.unwrap();
         assert!(
-            result.is_empty(),
-            "a message with zero UID must be skipped (not an error)"
+            page3.is_empty(),
+            "backlog must be fully drained after two pages"
         );
-    }
-
-    #[test]
-    fn process_mailbox_fetch_valid_inputs_produce_email() {
-        let raw = minimal_rfc822("alice@example.com", "hello");
-        let result =
-            process_mailbox_fetch(Some(1234), vec![(Some(7), raw)], "mail.example.com").unwrap();
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0].imap_external_id, "imap:mail.example.com:1234:7");
-    }
-
-    #[test]
-    fn process_mailbox_fetch_skips_invalid_uid_continues_valid() {
-        let raw_bad = minimal_rfc822("bad@example.com", "bad");
-        let raw_good = minimal_rfc822("good@example.com", "good");
-        let result = process_mailbox_fetch(
-            Some(555),
-            vec![(Some(0), raw_bad), (Some(3), raw_good)],
-            "imap.example.com",
-        )
-        .unwrap();
-        assert_eq!(result.len(), 1, "only the valid message should be returned");
-        assert_eq!(result[0].imap_external_id, "imap:imap.example.com:555:3");
     }
 
     #[test]

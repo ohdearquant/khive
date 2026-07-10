@@ -6,7 +6,7 @@
 
 use std::collections::HashSet;
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use serde_json::{json, Value};
 use uuid::Uuid;
 
@@ -16,8 +16,8 @@ use khive_storage::types::{PageRequest, SqlValue};
 
 use crate::message::{dual_write_message, note_to_message_json, resolve_id, short_id};
 use crate::params::{
-    deser, HeartbeatParams, InboxParams, IngestParams, ProbeParams, ReadParams, ReplyParams,
-    SendParams, ThreadParams,
+    deser, CursorCommitParams, CursorGetParams, HeartbeatParams, InboxParams, IngestParams,
+    ProbeParams, ReadParams, ReplyParams, SendParams, ThreadParams,
 };
 
 /// Validate an actor label: non-empty, no control characters, ≤255 bytes (ADR-057 Q1 loose).
@@ -1523,6 +1523,181 @@ async fn query_probe(
         new_messages,
         stale_unread_count,
     })
+}
+
+/// `cursor_get` — read the persisted channel poll checkpoint for
+/// `(channel_kind, channel_slug)` (issue #449). Subhandler — only the
+/// daemon's channel poll loop calls this. Returns JSON `null` when no row
+/// exists yet (first-run compatibility mode).
+///
+/// Runs the pack-owned `comm_channel_cursor` schema statement before the
+/// query so an in-memory/test runtime that never applied the boot-time
+/// schema plan still works (matches the repository's lazy pack-schema
+/// bootstrap convention).
+pub(crate) async fn handle_cursor_get(
+    runtime: &KhiveRuntime,
+    params: Value,
+) -> Result<Value, RuntimeError> {
+    let p: CursorGetParams = deser(params)?;
+    if p.channel_kind.trim().is_empty() {
+        return Err(RuntimeError::InvalidInput(
+            "cursor_get: `channel_kind` must not be empty".into(),
+        ));
+    }
+    if p.channel_slug.trim().is_empty() {
+        return Err(RuntimeError::InvalidInput(
+            "cursor_get: `channel_slug` must not be empty".into(),
+        ));
+    }
+
+    let sql = runtime.sql();
+    let mut w = sql.writer().await.map_err(RuntimeError::Storage)?;
+    w.execute_script(crate::vocab::COMM_CHANNEL_CURSOR_SCHEMA_STMT.to_string())
+        .await
+        .map_err(RuntimeError::Storage)?;
+
+    let row = w
+        .query_row(khive_storage::types::SqlStatement {
+            sql: "SELECT source, generation, high_water, updated_at FROM comm_channel_cursor \
+                  WHERE channel_kind = ?1 AND channel_slug = ?2"
+                .into(),
+            params: vec![
+                SqlValue::Text(p.channel_kind.clone()),
+                SqlValue::Text(p.channel_slug.clone()),
+            ],
+            label: Some("comm_cursor_get".into()),
+        })
+        .await
+        .map_err(RuntimeError::Storage)?;
+
+    let Some(row) = row else {
+        return Ok(Value::Null);
+    };
+
+    let source = match row.get("source") {
+        Some(SqlValue::Text(s)) => s.clone(),
+        _ => {
+            return Err(RuntimeError::Internal(
+                "cursor_get: malformed `source` column".into(),
+            ));
+        }
+    };
+    let generation = match row.get("generation") {
+        Some(SqlValue::Integer(i)) if *i > 0 => *i as u64,
+        _ => {
+            return Err(RuntimeError::Internal(
+                "cursor_get: malformed `generation` column".into(),
+            ));
+        }
+    };
+    let high_water = match row.get("high_water") {
+        Some(SqlValue::Integer(i)) if *i > 0 => Some(*i as u64),
+        None | Some(SqlValue::Null) => None,
+        _ => {
+            return Err(RuntimeError::Internal(
+                "cursor_get: malformed `high_water` column".into(),
+            ));
+        }
+    };
+    let updated_at_us = match row.get("updated_at") {
+        Some(SqlValue::Integer(i)) => *i,
+        _ => {
+            return Err(RuntimeError::Internal(
+                "cursor_get: malformed `updated_at` column".into(),
+            ));
+        }
+    };
+    let committed_at = DateTime::<Utc>::from_timestamp_micros(updated_at_us).ok_or_else(|| {
+        RuntimeError::Internal("cursor_get: invalid `updated_at` timestamp".into())
+    })?;
+
+    Ok(json!({
+        "source": source,
+        "generation": generation,
+        "high_water": high_water,
+        "committed_at": committed_at.to_rfc3339(),
+    }))
+}
+
+/// `cursor_commit` — persist a channel poll checkpoint for `(channel_kind,
+/// channel_slug)` (issue #449), replacing any prior row for that identity.
+/// Subhandler — only the daemon's channel poll loop calls this, and only
+/// after every envelope in the page has returned `Ok` from `comm.ingest`.
+pub(crate) async fn handle_cursor_commit(
+    runtime: &KhiveRuntime,
+    params: Value,
+) -> Result<Value, RuntimeError> {
+    let p: CursorCommitParams = deser(params)?;
+    if p.channel_kind.trim().is_empty() {
+        return Err(RuntimeError::InvalidInput(
+            "cursor_commit: `channel_kind` must not be empty".into(),
+        ));
+    }
+    if p.channel_slug.trim().is_empty() {
+        return Err(RuntimeError::InvalidInput(
+            "cursor_commit: `channel_slug` must not be empty".into(),
+        ));
+    }
+    if p.source.trim().is_empty() {
+        return Err(RuntimeError::InvalidInput(
+            "cursor_commit: `source` must not be empty".into(),
+        ));
+    }
+    if p.generation == 0 || p.generation > i64::MAX as u64 {
+        return Err(RuntimeError::InvalidInput(
+            "cursor_commit: `generation` must be in 1..=i64::MAX".into(),
+        ));
+    }
+    if let Some(h) = p.high_water {
+        if h == 0 || h > i64::MAX as u64 {
+            return Err(RuntimeError::InvalidInput(
+                "cursor_commit: `high_water` must be in 1..=i64::MAX when present".into(),
+            ));
+        }
+    }
+
+    let now_us = Utc::now().timestamp_micros();
+
+    let sql = runtime.sql();
+    let mut w = sql.writer().await.map_err(RuntimeError::Storage)?;
+    w.execute_script(crate::vocab::COMM_CHANNEL_CURSOR_SCHEMA_STMT.to_string())
+        .await
+        .map_err(RuntimeError::Storage)?;
+
+    w.execute(khive_storage::types::SqlStatement {
+        sql: "INSERT INTO comm_channel_cursor(channel_kind, channel_slug, source, generation, high_water, updated_at) \
+              VALUES(?1, ?2, ?3, ?4, ?5, ?6) \
+              ON CONFLICT(channel_kind, channel_slug) DO UPDATE SET \
+                source=excluded.source, \
+                generation=excluded.generation, \
+                high_water=excluded.high_water, \
+                updated_at=excluded.updated_at"
+            .into(),
+        params: vec![
+            SqlValue::Text(p.channel_kind.clone()),
+            SqlValue::Text(p.channel_slug.clone()),
+            SqlValue::Text(p.source.clone()),
+            SqlValue::Integer(p.generation as i64),
+            match p.high_water {
+                Some(h) => SqlValue::Integer(h as i64),
+                None => SqlValue::Null,
+            },
+            SqlValue::Integer(now_us),
+        ],
+        label: Some("comm_cursor_commit".into()),
+    })
+    .await
+    .map_err(RuntimeError::Storage)?;
+
+    let committed_at = DateTime::<Utc>::from_timestamp_micros(now_us)
+        .expect("Utc::now().timestamp_micros() always round-trips");
+
+    Ok(json!({
+        "source": p.source,
+        "generation": p.generation,
+        "high_water": p.high_water,
+        "committed_at": committed_at.to_rfc3339(),
+    }))
 }
 
 /// Candidate `$.external_id` values to match an inbound correlation key against.
