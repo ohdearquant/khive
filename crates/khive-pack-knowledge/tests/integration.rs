@@ -1919,6 +1919,178 @@ async fn compose_returns_markdown_for_domain() {
     );
 }
 
+/// PR #816 Major finding 2: `knowledge.compose` accepts compact hex prefixes
+/// for domains but must normalize them (`hex_prefix_to_uuid_pattern`) before
+/// binding the `LIKE` pattern — a >8-char compact prefix could not match the
+/// hyphenated `id` column before the fix.
+#[tokio::test]
+async fn compose_resolves_domain_by_compact_hex_prefix_over_8_chars() {
+    let f = pack(rt());
+
+    f.dispatch(
+        "knowledge.upsert_atoms",
+        json!({
+            "atoms": [
+                { "slug": "atom-a", "name": "Atom A", "content": "content of atom a dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity" }
+            ]
+        }),
+    )
+    .await
+    .expect("upsert atom");
+
+    f.dispatch(
+        "knowledge.upsert_domains",
+        json!({
+            "domains": [
+                {
+                    "slug": "test-domain",
+                    "name": "Test Domain", "description": "dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity",
+                    "members": ["atom-a"]
+                }
+            ]
+        }),
+    )
+    .await
+    .expect("upsert domain");
+
+    let domain_resp = f
+        .dispatch("knowledge.get", json!({ "id": "test-domain" }))
+        .await
+        .expect("get domain");
+    let domain_id = domain_resp["id"].as_str().expect("domain id").to_string();
+    let compact = domain_id.replace('-', "");
+    let prefix = &compact[..16];
+
+    let resp = f
+        .dispatch(
+            "knowledge.compose",
+            json!({
+                "domain_ids": [prefix],
+                "query": "content"
+            }),
+        )
+        .await
+        .expect("compose from compact domain prefix must resolve");
+
+    let atoms = resp["data"]["atoms"].as_array().expect("atoms");
+    assert!(
+        !atoms.is_empty(),
+        "compose from compact domain prefix should include member atoms"
+    );
+}
+
+/// PR #816 Major finding 2: same normalization requirement for atom ids.
+#[tokio::test]
+async fn compose_resolves_atom_by_compact_hex_prefix_over_8_chars() {
+    let f = pack(rt());
+
+    f.dispatch(
+        "knowledge.upsert_atoms",
+        json!({
+            "atoms": [
+                {
+                    "slug": "rag-overview",
+                    "name": "RAG Overview",
+                    "content": "Retrieval-augmented generation combines retrieval with generation. dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity"
+                }
+            ]
+        }),
+    )
+    .await
+    .expect("upsert atom");
+
+    let atom_resp = f
+        .dispatch("knowledge.get", json!({ "id": "rag-overview" }))
+        .await
+        .expect("get atom");
+    let atom_id = atom_resp["id"].as_str().expect("atom id").to_string();
+    let compact = atom_id.replace('-', "");
+    let prefix = &compact[..16];
+
+    let resp = f
+        .dispatch(
+            "knowledge.compose",
+            json!({
+                "atom_ids": [prefix],
+                "query": "retrieval augmented generation"
+            }),
+        )
+        .await
+        .expect("compose from compact atom prefix must resolve");
+
+    let atoms = resp["data"]["atoms"].as_array().expect("atoms");
+    assert_eq!(atoms.len(), 1, "expected exactly 1 atom");
+    assert_eq!(
+        atoms[0]["slug"].as_str(),
+        Some("rag-overview"),
+        "compact atom prefix must resolve to the correct atom"
+    );
+}
+
+/// PR #816 Major finding 2 (precedence): an all-hex slug must still win over
+/// prefix interpretation. Atom B's slug is deliberately set to the same
+/// hex string as the first 16 chars of atom A's compact id — a value that
+/// is *also* a syntactically valid compact prefix. Because `compose` tries
+/// an exact slug match before falling back to prefix scanning, this must
+/// resolve atom B (by slug), never atom A (by prefix collision).
+#[tokio::test]
+async fn compose_atom_all_hex_slug_wins_over_prefix_interpretation() {
+    let f = pack(rt());
+
+    f.dispatch(
+        "knowledge.upsert_atoms",
+        json!({
+            "atoms": [
+                { "slug": "atom-x", "name": "Atom X", "content": "atom x content dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity" }
+            ]
+        }),
+    )
+    .await
+    .expect("upsert atom x");
+
+    let atom_x_resp = f
+        .dispatch("knowledge.get", json!({ "id": "atom-x" }))
+        .await
+        .expect("get atom x");
+    let atom_x_id = atom_x_resp["id"].as_str().expect("atom x id").to_string();
+    let hex_slug = atom_x_id.replace('-', "")[..16].to_string();
+
+    f.dispatch(
+        "knowledge.upsert_atoms",
+        json!({
+            "atoms": [
+                { "slug": hex_slug.clone(), "name": "Atom Y", "content": "atom y content dense sparse retrieval corpus benchmark search latency gradient descent transformer attention vector index nearest neighbor ranking fusion pipeline embedding rerank cosine similarity" }
+            ]
+        }),
+    )
+    .await
+    .expect("upsert atom y with all-hex slug");
+
+    let resp = f
+        .dispatch(
+            "knowledge.compose",
+            json!({
+                "atom_ids": [hex_slug.clone()],
+                "query": "atom content"
+            }),
+        )
+        .await
+        .expect("compose by all-hex slug must resolve");
+
+    let atoms = resp["data"]["atoms"].as_array().expect("atoms");
+    assert_eq!(atoms.len(), 1, "expected exactly 1 atom");
+    assert_eq!(
+        atoms[0]["slug"].as_str(),
+        Some(hex_slug.as_str()),
+        "all-hex slug must resolve to the atom with that slug, not a prefix collision"
+    );
+    assert_eq!(
+        atoms[0]["name"].as_str(),
+        Some("Atom Y"),
+        "must resolve atom Y by slug, never atom X by prefix interpretation"
+    );
+}
+
 #[tokio::test]
 async fn compose_rejects_missing_ids() {
     let f = pack(rt());

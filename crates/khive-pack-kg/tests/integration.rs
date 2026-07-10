@@ -7291,6 +7291,84 @@ async fn get_proposal_by_compact_hex_prefix_over_8_chars() {
     );
 }
 
+/// PR #816 Major finding 1: `review(id=<compact-hex-prefix>)` must resolve
+/// via `resolve_proposal_uuid` (proposal.rs), independent of `get`'s own
+/// `proposals_open` scan. Before the fix, `resolve_proposal_uuid` built the
+/// `LIKE` pattern from the raw compact prefix instead of normalizing it with
+/// `hex_prefix_to_uuid_pattern`, so any prefix longer than 8 chars
+/// structurally could not match the hyphenated `proposal_id` column.
+#[tokio::test]
+async fn review_proposal_by_compact_hex_prefix_over_8_chars() {
+    let f = pack_with_events();
+
+    let propose_result = f
+        .dispatch(
+            "propose",
+            json!({
+                "title": "CompactPrefixReviewTest",
+                "description": "review must resolve a >8-char compact prefix",
+                "changeset": changeset_add_entity(),
+            }),
+        )
+        .await
+        .expect("propose must succeed");
+    let pid = propose_result["id"]
+        .as_str()
+        .expect("propose must return id")
+        .to_string();
+
+    let compact = pid.replace('-', "");
+    let prefix = &compact[..16];
+
+    let review_result = f
+        .dispatch("review", json!({ "id": prefix, "decision": "approve" }))
+        .await
+        .expect("review must resolve the proposal via compact prefix");
+
+    assert_eq!(
+        review_result.get("id").and_then(|v| v.as_str()),
+        Some(pid.as_str()),
+        "review(id=<compact prefix>) must resolve to the proposal; got {review_result}"
+    );
+}
+
+/// PR #816 Major finding 1: `withdraw(id=<compact-hex-prefix>)` must resolve
+/// via `resolve_proposal_uuid` (proposal.rs) the same way `review` does.
+#[tokio::test]
+async fn withdraw_proposal_by_compact_hex_prefix_over_8_chars() {
+    let f = pack_with_events();
+
+    let propose_result = f
+        .dispatch(
+            "propose",
+            json!({
+                "title": "CompactPrefixWithdrawTest",
+                "description": "withdraw must resolve a >8-char compact prefix",
+                "changeset": changeset_add_entity(),
+            }),
+        )
+        .await
+        .expect("propose must succeed");
+    let pid = propose_result["id"]
+        .as_str()
+        .expect("propose must return id")
+        .to_string();
+
+    let compact = pid.replace('-', "");
+    let prefix = &compact[..16];
+
+    let withdraw_result = f
+        .dispatch("withdraw", json!({ "id": prefix }))
+        .await
+        .expect("withdraw must resolve the proposal via compact prefix");
+
+    assert_eq!(
+        withdraw_result.get("id").and_then(|v| v.as_str()),
+        Some(pid.as_str()),
+        "withdraw(id=<compact prefix>) must resolve to the proposal; got {withdraw_result}"
+    );
+}
+
 /// review(id=..., proposal_id=...) must be rejected by #[serde(deny_unknown_fields)].
 ///
 /// ReviewParams declares `id` (required) with deny_unknown_fields — `proposal_id` is

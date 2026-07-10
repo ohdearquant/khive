@@ -1509,3 +1509,63 @@ mod truncation_tests {
         );
     }
 }
+
+/// PR #816 Minor finding 4: `resolve_id`/`resolve_project_id` call the
+/// public `resolve_prefix_unfiltered` resolver without their own all-hex
+/// gate, so a `%`-bearing (or otherwise non-hex) `project` argument reached
+/// the bound `LIKE` pattern unfiltered. The runtime resolver boundary
+/// (`resolve_prefix_inner`) now rejects non-hex/non-hyphen input itself, so
+/// these callers inherit the fix without needing their own gate.
+#[cfg(test)]
+mod compact_prefix_resolver_tests {
+    use super::*;
+    use khive_runtime::Namespace;
+
+    #[tokio::test]
+    async fn resolve_project_id_rejects_like_wildcard_input() {
+        let rt = KhiveRuntime::memory().unwrap();
+        let token = rt.authorize(Namespace::local()).unwrap();
+        let project = rt
+            .create_entity(
+                &token,
+                "project",
+                None,
+                "WildcardIngestTest",
+                None,
+                None,
+                vec![],
+            )
+            .await
+            .unwrap();
+        let compact = project.id.simple().to_string();
+        let wildcard_input = format!("{}%", &compact[..8]);
+
+        let resolved = resolve_project_id(&rt, &wildcard_input).await.unwrap();
+        assert_eq!(
+            resolved, None,
+            "a %-bearing project argument must not resolve via a wildcard LIKE scan"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_id_resolves_compact_prefix_over_8_chars() {
+        let rt = KhiveRuntime::memory().unwrap();
+        let token = rt.authorize(Namespace::local()).unwrap();
+        let project = rt
+            .create_entity(
+                &token,
+                "project",
+                None,
+                "CompactIngestTest",
+                None,
+                None,
+                vec![],
+            )
+            .await
+            .unwrap();
+        let compact = project.id.simple().to_string();
+
+        let resolved = resolve_id(&rt, &token, &compact[..16]).await.unwrap();
+        assert_eq!(resolved, Some(project.id));
+    }
+}
