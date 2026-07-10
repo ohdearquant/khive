@@ -357,8 +357,25 @@ async fn channel_poll_loop(
             )
             .await;
 
-            match channel.poll(since).await {
-                Ok(envelopes) => {
+            // Durable checkpoint path (issue #449): cursor_get -> poll_page ->
+            // every comm.ingest -> cursor_commit, committing only when the
+            // whole page durably ingested. A cursor_get failure means we
+            // cannot trust what progress to poll from, so this channel is
+            // skipped for the cycle rather than risk polling from an empty
+            // checkpoint and silently discarding durable state.
+            let checkpoint = match load_channel_cursor(&registry, kind, slug).await {
+                Ok(cp) => cp,
+                Err(e) => {
+                    tracing::warn!(
+                        channel = kind,
+                        "comm.cursor_get failed; skipping this channel's poll this cycle: {e}"
+                    );
+                    continue;
+                }
+            };
+
+            match channel.poll_page(since, checkpoint.as_ref()).await {
+                Ok(page) => {
                     let prior_attempt =
                         backoffs.get(&backoff_key).map(|b| b.attempt()).unwrap_or(0);
                     if let Some(backoff) = backoffs.get_mut(&backoff_key) {
@@ -377,7 +394,7 @@ async fn channel_poll_loop(
                             khive_storage::ChannelPollSucceededPayload {
                                 channel_kind: kind.to_string(),
                                 channel_slug: slug.to_string(),
-                                envelope_count: envelopes.len(),
+                                envelope_count: page.envelopes.len(),
                                 previous_backoff_attempt: prior_attempt,
                             },
                         )
@@ -402,7 +419,16 @@ async fn channel_poll_loop(
                         event_store.as_ref(),
                     )
                     .await;
-                    for env in envelopes {
+
+                    // Every envelope in the page must durably ingest before
+                    // the cursor is allowed to advance past it (issue #449
+                    // Blocker fix): a partial-page ingest failure must leave
+                    // the checkpoint untouched so the next poll re-selects
+                    // the whole page -- comm.ingest's `INSERT OR IGNORE`
+                    // dedup then skips re-storing the messages that already
+                    // succeeded, and only the failed one is retried.
+                    let mut page_fully_ingested = true;
+                    for env in page.envelopes {
                         let params = json!({
                             "namespace": ingest_namespace,
                             "from": env.from,
@@ -423,7 +449,28 @@ async fn channel_poll_loop(
                                 channel = kind,
                                 "comm.ingest failed for inbound message: {e}"
                             );
+                            page_fully_ingested = false;
                         }
+                    }
+
+                    if page_fully_ingested {
+                        if let Some(next_checkpoint) = page.next_checkpoint {
+                            if let Err(e) =
+                                commit_channel_cursor(&registry, kind, slug, &next_checkpoint).await
+                            {
+                                tracing::warn!(
+                                    channel = kind,
+                                    "comm.cursor_commit failed; progress not durably \
+                                     advanced, next poll will retry: {e}"
+                                );
+                            }
+                        }
+                    } else {
+                        tracing::warn!(
+                            channel = kind,
+                            "not committing IMAP cursor: at least one message in this page \
+                             failed comm.ingest; the whole page will be retried next poll"
+                        );
                     }
                 }
                 Err(e) => {
@@ -619,6 +666,70 @@ async fn record_channel_heartbeat(
         )
         .await;
     }
+}
+
+/// Load the durable poll checkpoint for `(channel_kind, channel_slug)` via
+/// `comm.cursor_get` (issue #449). Returns `Ok(None)` on first-run
+/// (`comm.cursor_get` returns JSON `null`). A dispatch failure or a
+/// malformed response is returned as `Err` so the caller skips this
+/// channel's poll for the cycle rather than risk polling with empty
+/// progress and silently discarding durable state.
+#[cfg(feature = "channel-email")]
+async fn load_channel_cursor(
+    registry: &khive_runtime::VerbRegistry,
+    channel_kind: &str,
+    channel_slug: &str,
+) -> Result<Option<khive_channel::StoredChannelCheckpoint>, khive_runtime::RuntimeError> {
+    use serde_json::json;
+
+    let value = registry
+        .dispatch(
+            "comm.cursor_get",
+            json!({
+                "channel_kind": channel_kind,
+                "channel_slug": channel_slug,
+            }),
+        )
+        .await?;
+    if value.is_null() {
+        return Ok(None);
+    }
+    serde_json::from_value(value).map(Some).map_err(|e| {
+        khive_runtime::RuntimeError::Internal(format!(
+            "comm.cursor_get returned a malformed checkpoint: {e}"
+        ))
+    })
+}
+
+/// Persist the durable poll checkpoint for `(channel_kind, channel_slug)`
+/// via `comm.cursor_commit` (issue #449).
+///
+/// Callers MUST only call this after every envelope in the page has
+/// returned `Ok` from `comm.ingest` -- see `channel_poll_loop`. Committing
+/// on a partial page would advance the cursor past a message that was never
+/// durably ingested, permanently skipping it.
+#[cfg(feature = "channel-email")]
+async fn commit_channel_cursor(
+    registry: &khive_runtime::VerbRegistry,
+    channel_kind: &str,
+    channel_slug: &str,
+    checkpoint: &khive_channel::ChannelCheckpoint,
+) -> Result<(), khive_runtime::RuntimeError> {
+    use serde_json::json;
+
+    registry
+        .dispatch(
+            "comm.cursor_commit",
+            json!({
+                "channel_kind": channel_kind,
+                "channel_slug": channel_slug,
+                "source": checkpoint.source,
+                "generation": checkpoint.generation,
+                "high_water": checkpoint.high_water,
+            }),
+        )
+        .await?;
+    Ok(())
 }
 
 /// Log a backoff-eligible poll failure at the level ADR-091's `crossing_warn`
@@ -5025,12 +5136,21 @@ id = "lambda:project-actor"
         /// jump that is simultaneously long enough to fire the next timer
         /// and short enough not to skip past it unregistered.
         async fn advance_until(store: &FakeEventStore, target: usize) {
-            for _ in 0..200 {
+            // khive #449: the poll loop now also dispatches comm.cursor_get /
+            // comm.cursor_commit each iteration, and the first cursor_get
+            // bootstraps the comm_channel_cursor schema -- under this test's
+            // paused clock that bootstrap needs several more cooperative
+            // sleep/wake round-trips to settle than a bare heartbeat write
+            // did, so the iteration budget is higher than a single
+            // fail-then-recover episode would otherwise need.
+            for _ in 0..2000 {
                 if store.events.lock().unwrap().len() >= target {
                     return;
                 }
                 tokio::time::advance(std::time::Duration::from_millis(250)).await;
-                tokio::task::yield_now().await;
+                for _ in 0..10 {
+                    tokio::task::yield_now().await;
+                }
             }
         }
 
@@ -5140,6 +5260,216 @@ id = "lambda:project-actor"
             }
 
             task.abort();
+        }
+    }
+
+    /// Regression tests for issue #449's daemon wiring (Blocker fix): the
+    /// poll loop must drive `cursor_get` -> `poll_page` -> every
+    /// `comm.ingest` -> `cursor_commit`, committing the cursor only when
+    /// every envelope in the page durably ingested.
+    #[cfg(feature = "channel-email")]
+    mod cursor_commit_gating_tests {
+        use super::*;
+        use async_trait::async_trait;
+        use chrono::{DateTime, Utc};
+        use khive_channel::{
+            Channel, ChannelCheckpoint, ChannelEnvelope, ChannelError, ChannelPollPage,
+            ChannelRegistry, StoredChannelCheckpoint,
+        };
+        use khive_runtime::{KhiveRuntime, VerbRegistryBuilder};
+        use serde_json::json;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Arc, Mutex};
+
+        const SOURCE: &str = "imap+tls:h:993:m:INBOX";
+
+        /// First `poll_page` call returns one message that ingests cleanly
+        /// and one that permanently fails `comm.ingest` validation (empty
+        /// content) -- simulating a partial-page ingest failure. Every
+        /// subsequent call returns only the message that already succeeded,
+        /// mirroring the daemon's next-poll re-delivery of the whole
+        /// unresolved page. Each call's observed checkpoint is recorded
+        /// (rather than asserted inline, since a panic inside a
+        /// `tokio::spawn`ed task is otherwise silently swallowed by
+        /// `task.abort()`) so the test body can assert on it after the loop
+        /// task is done.
+        struct PartialFailureChannel {
+            call_count: AtomicUsize,
+            observed_checkpoints: Arc<Mutex<Vec<Option<StoredChannelCheckpoint>>>>,
+        }
+
+        #[async_trait]
+        impl Channel for PartialFailureChannel {
+            fn kind(&self) -> &'static str {
+                "mock"
+            }
+
+            async fn send(&self, _envelope: ChannelEnvelope) -> Result<(), ChannelError> {
+                Ok(())
+            }
+
+            async fn poll(
+                &self,
+                _since: DateTime<Utc>,
+            ) -> Result<Vec<ChannelEnvelope>, ChannelError> {
+                panic!("the daemon poll loop must call poll_page, not poll");
+            }
+
+            async fn poll_page(
+                &self,
+                _since: DateTime<Utc>,
+                checkpoint: Option<&StoredChannelCheckpoint>,
+            ) -> Result<ChannelPollPage, ChannelError> {
+                let call = self.call_count.fetch_add(1, Ordering::SeqCst);
+                self.observed_checkpoints
+                    .lock()
+                    .unwrap()
+                    .push(checkpoint.cloned());
+                let good = ChannelEnvelope::new(
+                    "email:sender@example.com",
+                    "email:me@example.com",
+                    "good body",
+                )
+                .with_external_id("imap:h:1:1");
+
+                if call == 0 {
+                    let bad = ChannelEnvelope::new(
+                        "email:sender@example.com",
+                        "email:me@example.com",
+                        "",
+                    );
+                    Ok(ChannelPollPage {
+                        envelopes: vec![good, bad],
+                        next_checkpoint: Some(ChannelCheckpoint {
+                            source: SOURCE.to_string(),
+                            generation: 1,
+                            high_water: Some(2),
+                        }),
+                    })
+                } else {
+                    Ok(ChannelPollPage {
+                        envelopes: vec![good],
+                        next_checkpoint: Some(ChannelCheckpoint {
+                            source: SOURCE.to_string(),
+                            generation: 1,
+                            high_water: Some(1),
+                        }),
+                    })
+                }
+            }
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn partial_ingest_failure_does_not_advance_cursor_and_dedup_prevents_double_store() {
+            let observed_checkpoints = Arc::new(Mutex::new(Vec::new()));
+            let mut ch_registry = ChannelRegistry::new();
+            ch_registry.register(Arc::new(PartialFailureChannel {
+                call_count: AtomicUsize::new(0),
+                observed_checkpoints: observed_checkpoints.clone(),
+            }));
+
+            let runtime = KhiveRuntime::memory().expect("in-memory runtime");
+            let mut builder = VerbRegistryBuilder::new();
+            builder.register(khive_pack_kg::KgPack::new(runtime.clone()));
+            builder.register(khive_pack_comm::CommPack::new(runtime.clone()));
+            let registry = builder.build().expect("registry builds");
+
+            let task = tokio::spawn(channel_poll_loop(
+                Arc::new(ch_registry),
+                registry.clone(),
+                "test-ns".to_string(),
+                "actor:test".to_string(),
+            ));
+
+            // Two happy-path 5s ticks: the first drives the partial-failure
+            // page, the second drives the retry the fix must produce.
+            for _ in 0..20 {
+                tokio::time::advance(std::time::Duration::from_secs(5)).await;
+                for _ in 0..20 {
+                    tokio::task::yield_now().await;
+                }
+            }
+            task.abort();
+
+            let calls = observed_checkpoints.lock().unwrap().clone();
+            assert!(
+                calls.len() >= 2,
+                "the loop must have retried at least once: {calls:?}"
+            );
+            assert!(
+                calls[0].is_none(),
+                "the first poll must see no persisted checkpoint"
+            );
+            assert!(
+                calls[1].is_none(),
+                "the cursor must NOT have advanced past the partially-failed page \
+                 -- the retry must still see no committed checkpoint: {calls:?}"
+            );
+
+            let inbox = registry
+                .dispatch(
+                    "list",
+                    json!({"namespace": "test-ns", "kind": "message", "limit": 50}),
+                )
+                .await
+                .expect("list must succeed");
+            let notes = inbox.as_array().expect("list returns an array").clone();
+            let matching: Vec<_> = notes
+                .iter()
+                .filter(|n| {
+                    n.get("properties")
+                        .and_then(|p| p.get("external_id"))
+                        .and_then(|v| v.as_str())
+                        == Some("imap:h:1:1")
+                })
+                .collect();
+            assert_eq!(
+                matching.len(),
+                1,
+                "the message that succeeded on the failed page must not be \
+                 double-stored once the retry re-delivers the whole page: {notes:?}"
+            );
+        }
+
+        /// Restart-across-a-checkpoint round-trip (issue #449 part b): once a
+        /// page fully ingests and the cursor commits, a fresh call to
+        /// `comm.cursor_get` (simulating a daemon restart reading the
+        /// persisted row) must return the exact checkpoint that was
+        /// committed -- proving the durable path round-trips independent of
+        /// any in-process state.
+        #[tokio::test]
+        async fn committed_cursor_round_trips_across_a_fresh_cursor_get() {
+            let runtime = KhiveRuntime::memory().expect("in-memory runtime");
+            let mut builder = VerbRegistryBuilder::new();
+            builder.register(khive_pack_kg::KgPack::new(runtime.clone()));
+            builder.register(khive_pack_comm::CommPack::new(runtime.clone()));
+            let registry = builder.build().expect("registry builds");
+
+            // Simulates a poll that crosses an IMAP UIDVALIDITY/date-window
+            // boundary: commit once, then read it back as a brand-new
+            // process (a new `comm.cursor_get` call, no shared in-memory
+            // cursor) would on restart.
+            commit_channel_cursor(
+                &registry,
+                "mock",
+                "mailbox-a",
+                &ChannelCheckpoint {
+                    source: SOURCE.to_string(),
+                    generation: 7,
+                    high_water: Some(123),
+                },
+            )
+            .await
+            .expect("cursor_commit must succeed");
+
+            let restored = load_channel_cursor(&registry, "mock", "mailbox-a")
+                .await
+                .expect("cursor_get must succeed")
+                .expect("a committed checkpoint must round-trip, not read back as absent");
+
+            assert_eq!(restored.checkpoint.source, SOURCE);
+            assert_eq!(restored.checkpoint.generation, 7);
+            assert_eq!(restored.checkpoint.high_water, Some(123));
         }
     }
 }
