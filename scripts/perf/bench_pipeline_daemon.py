@@ -513,6 +513,17 @@ def _wait_for_ann_convergence(
     (fusion_strategy="vector_only"), so "converged" here means the ANN
     background rebuild has actually installed over the full post-ingest
     corpus — not a blind sleep guessing at a duration.
+
+    `probe_query`/`expected_topic` MUST come from the LAST-ingested batch, not
+    an arbitrary bench query. The daemon's background rebuild is a full-corpus
+    rebuild, not incremental: any installed generation captures everything
+    written up to when that build started reading, so a build snapshotted
+    mid-ingest can already satisfy a probe against EARLY-ingested content
+    (e.g. the first topic) while still missing the last few batches. Probing
+    with early content therefore converges the moment the FIRST background
+    build lands, not when the corpus is actually complete — the caller must
+    pass content whose presence can only be explained by a build that
+    happened at or after the final write.
     """
     deadline = time.time() + deadline_s
     t_start = time.time()
@@ -680,6 +691,8 @@ def main():
 
         corpus = generate_corpus()
         _ingest(proc, corpus)
+        last_batch_probe = corpus[-1]
+        last_batch_topic, _ = TOPICS[-1]
 
         # Assert recall is non-empty before measuring
         _, warmup_hits = _query_once(proc, QUERIES[0][0])
@@ -707,7 +720,12 @@ def main():
         # so the measurement loop below never samples the convergence race
         # (see ANN_SETTLE_* tunables and ADR-107 sec 1).
         print("\n[SETTLE] Waiting for ANN vector leg to converge post-ingest...", flush=True)
-        _wait_for_ann_convergence(proc, QUERIES[0][0], QUERIES[0][1])
+        # Probe with the LAST-ingested note's own content, not a bench query
+        # against the first topic: the rebuild is a full-corpus rebuild, so an
+        # early-content probe is satisfied by any installed generation from
+        # the start of ingest onward and converges before the corpus is
+        # actually complete (see _wait_for_ann_convergence docstring).
+        _wait_for_ann_convergence(proc, last_batch_probe, last_batch_topic)
 
         # Additional warm-up rounds (discard timings)
         for q, _ in QUERIES:
