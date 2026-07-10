@@ -110,22 +110,43 @@ fn bump_generation(ann: &SharedAnn, namespace: &str) -> u64 {
 }
 
 /// Read `namespace`'s current write-generation counter (0 if never bumped).
-fn current_generation(ann: &SharedAnn, namespace: &str) -> u64 {
+pub(crate) fn current_generation(ann: &SharedAnn, namespace: &str) -> u64 {
     generations_guard(&ann.generations)
         .get(namespace)
         .copied()
         .unwrap_or(0)
 }
 
-/// Install `candidate` into the cache for `key` unless an entry is already
-/// present with a generation >= `candidate.generation` (issue #770). Replaces
-/// the old `entry(key).or_insert(candidate)`, which always kept whichever
-/// build happened to reach this call first — even one that scanned a corpus
-/// version predating a `clear_namespace` invalidation that ran while it was
-/// still building — and silently discarded a later, fresher build's result
-/// because `or_insert` is a no-op once the key is occupied.
-async fn install_if_fresher(ann: &SharedAnn, key: &AnnKey, candidate: AnnBridge) {
+/// Install `candidate` into the cache for `key` unless it is stale (PR #815
+/// review, HIGH — the #770 scenario through the empty-slot door). Two
+/// independent fences, both evaluated while holding the write lock:
+///
+/// 1. `candidate.generation` must be >= the namespace's CURRENT generation.
+///    Comparing only against an existing entry (the old behavior) has
+///    nothing to compare against once `clear_namespace` has emptied the
+///    slot — a pre-invalidation candidate would install unconditionally
+///    even though it scanned a corpus version the namespace has since
+///    invalidated. `clear_namespace` bumps the generation counter inside
+///    this same write-lock scope, so a candidate's read of the current
+///    generation here can never observe a pre-bump value for a slot that
+///    has already been (or is about to be) evicted.
+/// 2. `candidate.generation` must be >= any already-installed entry's
+///    generation, so a slower-but-staler build can never clobber a faster
+///    build that already scanned a newer corpus.
+pub(crate) async fn install_if_fresher(ann: &SharedAnn, key: &AnnKey, candidate: AnnBridge) {
     let mut idxs = ann.indexes.write().await;
+
+    let ns_generation = current_generation(ann, &key.namespace);
+    if candidate.generation < ns_generation {
+        tracing::debug!(
+            key = ?key,
+            candidate_generation = candidate.generation,
+            namespace_generation = ns_generation,
+            "knowledge ANN install skipped: candidate predates namespace's current generation"
+        );
+        return;
+    }
+
     match idxs.get(key) {
         Some(existing) if existing.generation >= candidate.generation => {
             tracing::debug!(
@@ -151,6 +172,10 @@ fn warming_guard(
 
 /// Insert `bridge` under `key` only if the slot is empty. Returns `true` when
 /// the bridge was inserted, `false` if the key was already present.
+///
+/// Test-only: unlike `install_if_fresher`, this performs no generation
+/// fencing at all, so production install sites must never use it.
+#[cfg(test)]
 pub(crate) async fn insert_ann_if_absent(ann: &SharedAnn, key: AnnKey, bridge: AnnBridge) -> bool {
     use std::collections::hash_map::Entry;
     let mut guard = ann.indexes.write().await;
@@ -167,15 +192,18 @@ pub(crate) async fn insert_ann_if_absent(ann: &SharedAnn, key: AnnKey, bridge: A
 ///
 /// Called after any corpus mutation so the next search triggers a fresh load.
 pub(crate) async fn clear_namespace(ann: &SharedAnn, namespace: &str) {
-    ann.indexes
-        .write()
-        .await
-        .retain(|k, _| k.namespace != namespace);
+    {
+        // Evict and bump the generation counter inside the SAME write-lock
+        // scope (PR #815 review, HIGH). `install_if_fresher` takes this same
+        // lock before reading the namespace's current generation, so there
+        // is no window between "slot emptied" and "generation bumped" where
+        // a concurrent install could read a stale (pre-bump) generation and
+        // self-approve into the just-emptied slot.
+        let mut idxs = ann.indexes.write().await;
+        idxs.retain(|k, _| k.namespace != namespace);
+        bump_generation(ann, namespace);
+    }
     warming_guard(&ann.warming).retain(|k| k.namespace != namespace);
-    // Fence any build already in flight for this namespace (issue #770): a
-    // build that captured its generation before this bump can never install
-    // over a fresher one, even though the slot above was already emptied.
-    bump_generation(ann, namespace);
 }
 
 /// Search the already-loaded index for `key`. Returns `None` on cache miss.
@@ -978,9 +1006,29 @@ pub(crate) async fn ensure_ann_for_model(
     // reflected as a higher generation than anything this build can install.
     let target_generation = current_generation(ann, &ns);
 
-    // 1. Fast path: already loaded.
-    if ann.indexes.read().await.contains_key(&key) {
-        return;
+    // 1. Fast path: already loaded AND at least as fresh as this namespace's
+    // current generation (PR #815 review, HIGH). A present entry with a
+    // stale generation is not a hit — mere presence let a pre-invalidation
+    // build served from an emptied-then-refilled slot serve indefinitely.
+    // Falling through here re-enters the same rebuild path a genuine cache
+    // miss would take.
+    if let Some(loaded_generation) = ann
+        .indexes
+        .read()
+        .await
+        .get(&key)
+        .map(|bridge| bridge.generation)
+    {
+        if loaded_generation >= target_generation {
+            return;
+        }
+        tracing::debug!(
+            namespace = %ns,
+            model = %model,
+            loaded_generation,
+            target_generation,
+            "knowledge ANN fast path skipped: cached entry generation stale; rebuilding"
+        );
     }
 
     // 2. v2 segment path.
@@ -1399,6 +1447,57 @@ mod tests {
             hits.first().map(|(id, _)| *id),
             Some(build_b_id),
             "build A's late, stale install must not clobber build B's fresher result"
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_build_rejected_installing_into_still_empty_post_invalidation_slot() {
+        // Deterministic reproduction of the #770 scenario through the EMPTY-SLOT
+        // door (PR #815 review, HIGH): unlike the test above (where a fresh build
+        // B installs first, so the stale build has an incumbent to lose against),
+        // this exercises the case where NOTHING has installed yet when the stale
+        // build arrives. Build A captures its generation floor, an invalidating
+        // write (`clear_namespace`) bumps the namespace's generation while the
+        // slot is still empty, and only then does A's late, stale install attempt
+        // land — straight into that still-empty slot. The old `install_if_fresher`
+        // compared a candidate only against an *existing* entry, so an empty slot
+        // meant nothing to compare against and the stale build installed
+        // unconditionally. The fix compares against the namespace's CURRENT
+        // generation instead, so this must be rejected even with no incumbent.
+        let ann = new_shared();
+        let key = AnnKey::new("local", "test-model");
+
+        // Build A starts: capture the generation floor before doing any work.
+        let build_a_generation = current_generation(&ann, "local");
+        assert_eq!(build_a_generation, 0);
+
+        // An invalidating write lands while A is still scanning. The slot was
+        // never populated, so this is a no-op on the map, but it must still
+        // bump the namespace's generation.
+        clear_namespace(&ann, "local").await;
+        assert_eq!(current_generation(&ann, "local"), 1);
+        assert!(
+            !ann.indexes.read().await.contains_key(&key),
+            "precondition: slot must still be empty after clear_namespace"
+        );
+
+        // Build A's slow scan finally finishes and attempts to install its
+        // stale (pre-invalidation) result into the still-empty slot.
+        let build_a_bridge = AnnBridge::build(vec![1.0, 0.0, 0.0, 0.0], 4, vec![Uuid::new_v4()])
+            .expect("build stale bridge")
+            .with_generation(build_a_generation);
+        install_if_fresher(&ann, &key, build_a_bridge).await;
+
+        assert!(
+            !ann.indexes.read().await.contains_key(&key),
+            "stale pre-invalidation build must not install into the emptied slot, \
+             even with no incumbent to compare against"
+        );
+        assert!(
+            search_loaded(&ann, &key, &[1.0, 0.0, 0.0, 0.0], 1)
+                .await
+                .is_none(),
+            "the fast path must not serve a stale index that was correctly rejected at install"
         );
     }
 
@@ -2000,6 +2099,55 @@ mod tests {
         assert_eq!(
             persisted_after.vector_count, 5,
             "re-persisted segment must reflect the 5-row corpus (4 initial + 1 mutation)"
+        );
+    }
+
+    /// `ensure_ann_for_model`'s fast path must treat a present-but-generation-stale
+    /// cached entry as a miss, not a hit (PR #815 review, HIGH). In production
+    /// `install_if_fresher`'s own fencing prevents a stale entry from ever
+    /// installing, so this test bumps the namespace generation directly
+    /// (bypassing `clear_namespace`'s eviction) to construct the "present but
+    /// stale" state as an independent, defense-in-depth check on the fast path
+    /// itself — mere presence must never again be trusted as freshness.
+    #[tokio::test]
+    async fn ensure_ann_fast_path_ignores_generation_stale_cached_entry() {
+        let dir = TempDir::new().expect("tempdir");
+        let rt = file_rt_with_embedder(dir.path().join("test.db"));
+        let token = rt.authorize(Namespace::local()).expect("authorize");
+        seed_warm_corpus(&rt, &token, 4).await;
+
+        let ann = new_shared();
+        ensure_ann_for_model(&rt, &token, &ann, WARM_TEST_MODEL).await;
+        let key = AnnKey::new("local", WARM_TEST_MODEL);
+        assert!(
+            ann.indexes.read().await.contains_key(&key),
+            "setup: first call must build and install the index at generation 0"
+        );
+
+        // Bump the namespace's generation directly, leaving the generation-0
+        // entry present — the state install_if_fresher's fencing prevents in
+        // production, exercised here purely to isolate the fast-path check.
+        bump_generation(&ann, "local");
+        assert_eq!(current_generation(&ann, "local"), 1);
+
+        ensure_ann_for_model(&rt, &token, &ann, WARM_TEST_MODEL).await;
+
+        // If the in-memory fast path had (incorrectly) treated mere presence
+        // as a hit, it would return immediately and the cached entry's
+        // generation would still read 0. Falling through re-stamps it with
+        // the namespace's current generation (1) via the v2/rebuild paths —
+        // proof the stale entry was NOT served as a hit.
+        assert_eq!(
+            ann.indexes
+                .read()
+                .await
+                .get(&key)
+                .expect("entry present")
+                .generation,
+            1,
+            "a present-but-generation-stale entry must not short-circuit via the fast \
+             path; the reloaded/rebuilt entry must be re-stamped with the namespace's \
+             new current generation"
         );
     }
 

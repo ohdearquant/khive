@@ -207,11 +207,18 @@ impl KnowledgeHandlers {
                 cb(total as u64, total as u64);
             }
             let model_name = runtime.default_embedder_name();
+            // Capture the namespace's write-generation floor before scanning the
+            // corpus, mirroring `ensure_ann_for_model`'s `target_generation` capture
+            // (PR #815 review, HIGH) — `install_if_fresher` then fences this direct
+            // rebuild insertion with the same generation check the warm path uses,
+            // instead of the old presence-only `insert_ann_if_absent`.
+            let build_generation = vamana::current_generation(ann, &ns);
             // Build from the shared corpus scan (ORDER BY subject_id) so the persisted
             // v2 content_hash matches the warm-path live_content_hash. Building from
             // atom-iteration order persists a hash the warm path always reads as stale.
             match vamana::load_and_build_from_vector_store(runtime, token, model_name).await {
                 Ok(Some(bridge)) => {
+                    let bridge = bridge.with_generation(build_generation);
                     let n = bridge.num_vectors();
                     ann_count = Some(n);
                     if let Err(e) = vamana::persist_ann_v2(runtime, &ns, model_name, &bridge) {
@@ -219,7 +226,7 @@ impl KnowledgeHandlers {
                         ann_failed = true;
                     }
                     let key = vamana::AnnKey::new(&ns, model_name);
-                    vamana::insert_ann_if_absent(ann, key, bridge).await;
+                    vamana::install_if_fresher(ann, &key, bridge).await;
                     eprintln!("  Vamana ANN built ({n} vectors)");
                 }
                 Ok(None) => {}
