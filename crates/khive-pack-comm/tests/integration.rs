@@ -43,9 +43,9 @@ fn comm_pack_declares_message_note_kind() {
 fn comm_pack_declares_nine_handlers() {
     assert_eq!(
         CommPack::HANDLERS.len(),
-        9,
-        "comm pack must declare 9 handlers: send, inbox, read, reply, thread, ingest, \
-         heartbeat, health, probe"
+        11,
+        "comm pack must declare 11 handlers: send, inbox, read, reply, thread, ingest, \
+         heartbeat, health, probe, cursor_get, cursor_commit (khive #449)"
     );
     let names: Vec<&str> = CommPack::HANDLERS.iter().map(|h| h.name).collect();
     assert!(names.contains(&"comm.send"));
@@ -67,6 +67,14 @@ fn comm_pack_declares_nine_handlers() {
     assert!(
         names.contains(&"comm.probe"),
         "comm.probe verb must be registered"
+    );
+    assert!(
+        names.contains(&"comm.cursor_get"),
+        "comm.cursor_get verb must be registered (khive #449)"
+    );
+    assert!(
+        names.contains(&"comm.cursor_commit"),
+        "comm.cursor_commit verb must be registered (khive #449)"
     );
     assert!(
         names.contains(&"comm.health"),
@@ -6389,4 +6397,276 @@ async fn t495_send_rejects_unknown_field_alongside_tags() {
         result.is_err(),
         "unknown field alongside tags must still be rejected; got {result:?}"
     );
+}
+
+// --- channel poll checkpoint persistence tests (khive #449) ---
+
+#[tokio::test]
+async fn cursor_get_returns_none_for_new_mailbox() {
+    let (registry, _rt) = build_registry();
+
+    let result = registry
+        .dispatch(
+            "comm.cursor_get",
+            serde_json::json!({ "channel_kind": "email", "channel_slug": "acct-1" }),
+        )
+        .await
+        .expect("cursor_get succeeds for a mailbox with no prior checkpoint");
+    assert!(
+        result.is_null(),
+        "an unseeded (channel_kind, channel_slug) must read back null; got {result}"
+    );
+}
+
+#[tokio::test]
+async fn cursor_commit_round_trips_generation_high_water_and_time() {
+    let (registry, _rt) = build_registry();
+
+    let committed = registry
+        .dispatch(
+            "comm.cursor_commit",
+            serde_json::json!({
+                "channel_kind": "email",
+                "channel_slug": "acct-1",
+                "source": "imap+tls:mail.example.com:993:inbox@example.com:INBOX",
+                "generation": 17,
+                "high_water": 42,
+            }),
+        )
+        .await
+        .expect("cursor_commit succeeds");
+    assert_eq!(committed["generation"], 17);
+    assert_eq!(committed["high_water"], 42);
+    assert!(
+        committed["committed_at"].as_str().is_some(),
+        "cursor_commit must return an RFC3339 committed_at; got {committed}"
+    );
+
+    let fetched = registry
+        .dispatch(
+            "comm.cursor_get",
+            serde_json::json!({ "channel_kind": "email", "channel_slug": "acct-1" }),
+        )
+        .await
+        .expect("cursor_get succeeds");
+    assert_eq!(
+        fetched["source"],
+        "imap+tls:mail.example.com:993:inbox@example.com:INBOX"
+    );
+    assert_eq!(fetched["generation"], 17);
+    assert_eq!(fetched["high_water"], 42);
+    assert!(
+        fetched["committed_at"].as_str().is_some(),
+        "cursor_get must round-trip an RFC3339 committed_at; got {fetched}"
+    );
+}
+
+#[tokio::test]
+async fn cursor_rows_are_isolated_by_kind_and_slug() {
+    let (registry, _rt) = build_registry();
+
+    registry
+        .dispatch(
+            "comm.cursor_commit",
+            serde_json::json!({
+                "channel_kind": "email",
+                "channel_slug": "acct-1",
+                "source": "imap+tls:host-a:993:a@example.com:INBOX",
+                "generation": 1,
+                "high_water": 5,
+            }),
+        )
+        .await
+        .expect("commit for acct-1 succeeds");
+    registry
+        .dispatch(
+            "comm.cursor_commit",
+            serde_json::json!({
+                "channel_kind": "email",
+                "channel_slug": "acct-2",
+                "source": "imap+tls:host-b:993:b@example.com:INBOX",
+                "generation": 9,
+                "high_water": 99,
+            }),
+        )
+        .await
+        .expect("commit for acct-2 succeeds");
+
+    let acct_1 = registry
+        .dispatch(
+            "comm.cursor_get",
+            serde_json::json!({ "channel_kind": "email", "channel_slug": "acct-1" }),
+        )
+        .await
+        .expect("cursor_get acct-1 succeeds");
+    let acct_2 = registry
+        .dispatch(
+            "comm.cursor_get",
+            serde_json::json!({ "channel_kind": "email", "channel_slug": "acct-2" }),
+        )
+        .await
+        .expect("cursor_get acct-2 succeeds");
+
+    assert_eq!(
+        acct_1["high_water"], 5,
+        "acct-1's row must not see acct-2's write"
+    );
+    assert_eq!(
+        acct_2["high_water"], 99,
+        "acct-2's row must not see acct-1's write"
+    );
+}
+
+#[tokio::test]
+async fn cursor_uidvalidity_reset_can_replace_high_water_with_null() {
+    let (registry, _rt) = build_registry();
+
+    registry
+        .dispatch(
+            "comm.cursor_commit",
+            serde_json::json!({
+                "channel_kind": "email",
+                "channel_slug": "acct-1",
+                "source": "imap+tls:host:993:a@example.com:INBOX",
+                "generation": 1,
+                "high_water": 50,
+            }),
+        )
+        .await
+        .expect("initial commit succeeds");
+
+    // A UIDVALIDITY change resets the epoch; the new generation carries no
+    // high_water yet because nothing has been fetched in the new epoch.
+    registry
+        .dispatch(
+            "comm.cursor_commit",
+            serde_json::json!({
+                "channel_kind": "email",
+                "channel_slug": "acct-1",
+                "source": "imap+tls:host:993:a@example.com:INBOX",
+                "generation": 2,
+            }),
+        )
+        .await
+        .expect("reset commit succeeds");
+
+    let fetched = registry
+        .dispatch(
+            "comm.cursor_get",
+            serde_json::json!({ "channel_kind": "email", "channel_slug": "acct-1" }),
+        )
+        .await
+        .expect("cursor_get succeeds");
+    assert_eq!(fetched["generation"], 2);
+    assert!(
+        fetched["high_water"].is_null(),
+        "an UIDVALIDITY-reset commit must be able to replace a prior high_water with null; got {fetched}"
+    );
+}
+
+#[tokio::test]
+async fn cursor_commit_rejects_empty_identity_zero_or_i64_overflow() {
+    let (registry, _rt) = build_registry();
+
+    let empty_kind = registry
+        .dispatch(
+            "comm.cursor_commit",
+            serde_json::json!({
+                "channel_kind": "",
+                "channel_slug": "acct-1",
+                "source": "imap+tls:host:993:a@example.com:INBOX",
+                "generation": 1,
+            }),
+        )
+        .await;
+    assert!(empty_kind.is_err(), "empty channel_kind must be rejected");
+
+    let empty_source = registry
+        .dispatch(
+            "comm.cursor_commit",
+            serde_json::json!({
+                "channel_kind": "email",
+                "channel_slug": "acct-1",
+                "source": "",
+                "generation": 1,
+            }),
+        )
+        .await;
+    assert!(empty_source.is_err(), "empty source must be rejected");
+
+    let zero_generation = registry
+        .dispatch(
+            "comm.cursor_commit",
+            serde_json::json!({
+                "channel_kind": "email",
+                "channel_slug": "acct-1",
+                "source": "imap+tls:host:993:a@example.com:INBOX",
+                "generation": 0,
+            }),
+        )
+        .await;
+    assert!(zero_generation.is_err(), "generation=0 must be rejected");
+
+    let zero_high_water = registry
+        .dispatch(
+            "comm.cursor_commit",
+            serde_json::json!({
+                "channel_kind": "email",
+                "channel_slug": "acct-1",
+                "source": "imap+tls:host:993:a@example.com:INBOX",
+                "generation": 1,
+                "high_water": 0,
+            }),
+        )
+        .await;
+    assert!(zero_high_water.is_err(), "high_water=0 must be rejected");
+
+    let overflowing_generation = registry
+        .dispatch(
+            "comm.cursor_commit",
+            serde_json::json!({
+                "channel_kind": "email",
+                "channel_slug": "acct-1",
+                "source": "imap+tls:host:993:a@example.com:INBOX",
+                "generation": u64::MAX,
+            }),
+        )
+        .await;
+    assert!(
+        overflowing_generation.is_err(),
+        "generation beyond i64::MAX must be rejected, not silently truncated"
+    );
+}
+
+#[tokio::test]
+async fn cursor_schema_lazy_bootstraps_fresh_memory_runtime() {
+    // A fresh in-memory runtime never runs the boot-time schema plan the way
+    // a real daemon startup does; cursor_get/cursor_commit must still work by
+    // lazily applying the idempotent CREATE TABLE IF NOT EXISTS statement
+    // themselves, exactly like the rest of the pack's lazy-bootstrap tests.
+    let (registry, _rt) = build_registry();
+
+    let before = registry
+        .dispatch(
+            "comm.cursor_get",
+            serde_json::json!({ "channel_kind": "email", "channel_slug": "fresh" }),
+        )
+        .await
+        .expect("cursor_get on a never-written table must not error, just return null");
+    assert!(before.is_null());
+
+    let committed = registry
+        .dispatch(
+            "comm.cursor_commit",
+            serde_json::json!({
+                "channel_kind": "email",
+                "channel_slug": "fresh",
+                "source": "imap+tls:host:993:a@example.com:INBOX",
+                "generation": 1,
+                "high_water": 1,
+            }),
+        )
+        .await
+        .expect("cursor_commit on a never-written table must lazily create the schema and succeed");
+    assert_eq!(committed["generation"], 1);
 }

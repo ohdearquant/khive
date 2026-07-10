@@ -147,6 +147,55 @@ impl ChannelEnvelope {
     }
 }
 
+/// Durable poll progress for a single `(kind, slug)` channel.
+///
+/// Transport-neutral: IMAP maps `generation` to `UIDVALIDITY` and
+/// `high_water` to the greatest durably handled UID, but the type itself
+/// carries no IMAP-specific meaning so other transports can reuse it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChannelCheckpoint {
+    /// Stable, non-secret identity of the remote source/configuration.
+    pub source: String,
+    /// Remote identity epoch. IMAP maps this to UIDVALIDITY.
+    pub generation: u64,
+    /// Greatest durably handled remote sequence value. IMAP maps this to UID.
+    pub high_water: Option<u64>,
+}
+
+/// A [`ChannelCheckpoint`] as persisted, with the time it was committed.
+///
+/// `committed_at` is used as the recovery `SINCE` floor after an epoch reset,
+/// so a daemon that was down across a UIDVALIDITY change still bounds its
+/// re-scan instead of falling back to the caller's `since` alone.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StoredChannelCheckpoint {
+    #[serde(flatten)]
+    pub checkpoint: ChannelCheckpoint,
+    /// Database commit time, used as the recovery SINCE floor after an epoch reset.
+    pub committed_at: DateTime<Utc>,
+}
+
+/// The result of one [`Channel::poll_page`] call: envelopes ready for
+/// `comm.ingest`, plus the checkpoint the poll coordinator should persist
+/// after every envelope has been durably ingested.
+#[derive(Debug, Clone)]
+pub struct ChannelPollPage {
+    pub envelopes: Vec<ChannelEnvelope>,
+    /// `Some` only when durable progress must be inserted or changed.
+    pub next_checkpoint: Option<ChannelCheckpoint>,
+}
+
+impl ChannelPollPage {
+    /// Wrap a plain envelope list with no checkpoint — the default
+    /// [`Channel::poll_page`] behavior for adapters that only implement `poll`.
+    pub fn stateless(envelopes: Vec<ChannelEnvelope>) -> Self {
+        Self {
+            envelopes,
+            next_checkpoint: None,
+        }
+    }
+}
+
 /// Errors produced by channel operations.
 #[derive(Debug, thiserror::Error)]
 pub enum ChannelError {
@@ -216,6 +265,23 @@ pub trait Channel: Send + Sync + 'static {
     /// deduplicate themselves.  Adapters should apply a best-effort server-side
     /// filter on `since` to avoid fetching large backlogs.
     async fn poll(&self, since: DateTime<Utc>) -> Result<Vec<ChannelEnvelope>, ChannelError>;
+
+    /// Poll for new inbound messages, checkpoint-aware.
+    ///
+    /// The default implementation wraps [`Channel::poll`] with a stateless
+    /// [`ChannelPollPage`] (`next_checkpoint: None`), so every existing
+    /// adapter remains source-compatible without change. Adapters that can
+    /// bind progress to a durable per-source high-water mark (e.g. IMAP's
+    /// UIDVALIDITY/UID) should override this instead of relying on `since`
+    /// alone.
+    async fn poll_page(
+        &self,
+        since: DateTime<Utc>,
+        checkpoint: Option<&StoredChannelCheckpoint>,
+    ) -> Result<ChannelPollPage, ChannelError> {
+        let _ = checkpoint;
+        Ok(ChannelPollPage::stateless(self.poll(since).await?))
+    }
 }
 
 /// Registry of named channel adapters.
@@ -479,6 +545,29 @@ mod tests {
         assert!(
             ch.is_configured(),
             "default is_configured() must return true"
+        );
+    }
+
+    #[tokio::test]
+    async fn default_poll_page_wraps_legacy_poll_without_checkpoint() {
+        // #449: an adapter that implements only `poll` (the pre-checkpoint
+        // shape) must still work through `poll_page`, returning the same
+        // envelopes with no checkpoint to persist.
+        let inbound =
+            vec![
+                ChannelEnvelope::new("email:sender@example.com", "email:me@example.com", "body")
+                    .with_external_id("<id1@example.com>"),
+            ];
+        let ch = MockChannel::new(inbound.clone());
+        let page = ch.poll_page(Utc::now(), None).await.expect("poll_page ok");
+        assert_eq!(page.envelopes.len(), 1);
+        assert_eq!(
+            page.envelopes[0].external_id.as_deref(),
+            Some("<id1@example.com>")
+        );
+        assert!(
+            page.next_checkpoint.is_none(),
+            "default poll_page must never produce a checkpoint"
         );
     }
 

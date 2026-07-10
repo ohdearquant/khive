@@ -9,12 +9,19 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::LazyLock;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, LazyLock, Mutex};
 
+use async_trait::async_trait;
 use khive_pack_git::ingest::{run_ingest, IngestOptions};
 use khive_pack_git::GitPack;
 use khive_pack_kg::KgPack;
-use khive_runtime::{KhiveRuntime, Namespace, NamespaceToken, VerbRegistry, VerbRegistryBuilder};
+use khive_runtime::{
+    AllowAllGate, BackendId, EmbedderProvider, KhiveRuntime, Namespace, NamespaceToken,
+    RuntimeConfig, RuntimeResult, VerbRegistry, VerbRegistryBuilder,
+};
+use khive_storage::types::{SqlStatement, SqlValue};
+use lattice_embed::{EmbedError, EmbeddingModel, EmbeddingService};
 use serde_json::{json, Value};
 use uuid::Uuid;
 
@@ -159,6 +166,66 @@ fn head_sha(repo: &Path) -> String {
         .output()
         .expect("rev-parse");
     String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+/// Sentinel body substring that triggers [`FailOnceEmbeddingService`].
+const CURSOR_FAIL_SENTINEL: &str = "cursor-fail-sentinel";
+
+/// #763 masks credential-shaped PR title/body instead of dropping the record
+/// (design: `architect-2/approved_design.md` §3), so the pre-#763 cursor-stall
+/// fixture — a leaked-credential-shaped PR title — now lands successfully
+/// instead of failing. This test-only embedder is the design's mandated
+/// replacement: it fails exactly once for any text containing
+/// [`CURSOR_FAIL_SENTINEL`], then succeeds for every later call (including a
+/// retry of the same content), giving cursor-stall tests a deterministic,
+/// secret-detection-independent create failure.
+struct FailOnceEmbeddingService {
+    failed_once: AtomicBool,
+}
+
+#[async_trait]
+impl EmbeddingService for FailOnceEmbeddingService {
+    async fn embed(
+        &self,
+        texts: &[String],
+        _model: EmbeddingModel,
+    ) -> Result<Vec<Vec<f32>>, EmbedError> {
+        if texts.iter().any(|t| t.contains(CURSOR_FAIL_SENTINEL))
+            && !self.failed_once.swap(true, Ordering::SeqCst)
+        {
+            return Err(EmbedError::Internal(
+                "injected cursor-stall test failure".to_string(),
+            ));
+        }
+        Ok(texts.iter().map(|_| vec![0.0_f32; 4]).collect())
+    }
+
+    fn supports_model(&self, _model: EmbeddingModel) -> bool {
+        true
+    }
+
+    fn name(&self) -> &'static str {
+        "fail-once-test-embedder"
+    }
+}
+
+struct FailOnceEmbedderProvider;
+
+#[async_trait]
+impl EmbedderProvider for FailOnceEmbedderProvider {
+    fn name(&self) -> &str {
+        "fail-once-test-embedder"
+    }
+
+    fn dimensions(&self) -> usize {
+        4
+    }
+
+    async fn build(&self) -> RuntimeResult<Arc<dyn EmbeddingService>> {
+        Ok(Arc::new(FailOnceEmbeddingService {
+            failed_once: AtomicBool::new(false),
+        }))
+    }
 }
 
 /// Full end-to-end: a fixture repo with three commits (two touching a
@@ -349,6 +416,613 @@ async fn ingest_masks_secrets_in_commit_message() {
         stored_content.contains("***MASKED***") || stored_content.contains("MASKED"),
         "masked marker must be present: {stored_content:?}"
     );
+}
+
+/// Issue #763 exact acceptance repro: a PR body containing a bare 64-char hex
+/// hash near the standalone word "token" must ingest with only the flagged
+/// span masked — the containing PR note (and its surrounding prose) must be
+/// retained, not dropped.
+#[tokio::test]
+async fn ingest_masks_pr_body_hash_near_token_without_dropping_note() {
+    let _guard = ENV_MUTEX.lock().await;
+    let (rt, token, registry) = fixture().await;
+
+    let project_id = create(
+        &registry,
+        json!({"kind": "project", "name": "pr-hash-near-token-repo"}),
+    )
+    .await;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo: PathBuf = dir.path().join("repo");
+    std::fs::create_dir_all(&repo).expect("mk repo dir");
+    init_repo(&repo);
+    write(&repo, "README.md", "hello\n");
+    commit(&repo, &["README.md"], "Initial commit");
+
+    let bin_dir = dir.path().join("bin");
+    std::fs::create_dir_all(&bin_dir).expect("mk bin dir");
+    let log_dir = dir.path().join("log");
+    std::fs::create_dir_all(&log_dir).expect("mk log dir");
+
+    let hex64 = "deadbeef".repeat(8);
+    assert_eq!(hex64.len(), 64, "fixture hash must be exactly 64 hex chars");
+    let pr_json = json!([{
+        "number": 42,
+        "title": "Document the rotation process",
+        "author": {"login": "octocat"},
+        "createdAt": "2026-01-01T00:00:00Z",
+        "mergedAt": null,
+        "closedAt": null,
+        "updatedAt": "2026-01-01T00:00:00Z",
+        "baseRefName": "main",
+        "headRefName": "docs/rotation",
+        "mergeCommit": null,
+        "body": format!("Rotated the deploy token. Old hash was {hex64} before rotation.")
+    }])
+    .to_string();
+
+    write_fake_gh(&bin_dir, &log_dir, &pr_json, "[]");
+    let _path_guard = PathGuard::install(&bin_dir);
+
+    let report = run_ingest(
+        &rt,
+        &token,
+        &registry,
+        IngestOptions::unbounded(repo.clone(), project_id.to_string()),
+    )
+    .await
+    .expect("ingest ok");
+
+    assert_eq!(
+        report.prs_ingested, 1,
+        "the PR must not be dropped: {report:?}"
+    );
+    assert!(
+        report.warnings.iter().all(|w| !w.contains("pull_request")),
+        "no silent-drop warning may be reported: {:?}",
+        report.warnings
+    );
+
+    let prs_list = registry
+        .dispatch("list", json!({"kind": "pull_request", "limit": 10}))
+        .await
+        .expect("list prs ok");
+    let items = prs_list.as_array().expect("array");
+    assert_eq!(items.len(), 1);
+    let content = items[0]["content"].as_str().expect("content is string");
+    assert!(
+        !content.contains(&hex64),
+        "raw 64-hex hash must not survive into stored content: {content:?}"
+    );
+    let expected = "Rotated the deploy token. Old hash was ***MASKED*** before rotation.";
+    assert_eq!(
+        content, expected,
+        "only the flagged hash span is replaced, surrounding prose is retained exactly: {content:?}"
+    );
+    let report_debug = format!("{report:?}");
+    assert!(
+        !report_debug.contains(&hex64),
+        "the report itself must not carry the raw detected hash: {report_debug}"
+    );
+}
+
+/// A credential-shaped PR title (not just body) must also be masked in place
+/// rather than causing the whole PR note to be rejected by the runtime's
+/// recursive `properties` secret scan.
+#[tokio::test]
+async fn ingest_masks_credential_shaped_pr_title_without_dropping_note() {
+    let _guard = ENV_MUTEX.lock().await;
+    let (rt, token, registry) = fixture().await;
+
+    let project_id = create(
+        &registry,
+        json!({"kind": "project", "name": "pr-title-credential-repo"}),
+    )
+    .await;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo: PathBuf = dir.path().join("repo");
+    std::fs::create_dir_all(&repo).expect("mk repo dir");
+    init_repo(&repo);
+    write(&repo, "README.md", "hello\n");
+    commit(&repo, &["README.md"], "Initial commit");
+
+    let bin_dir = dir.path().join("bin");
+    std::fs::create_dir_all(&bin_dir).expect("mk bin dir");
+    let log_dir = dir.path().join("log");
+    std::fs::create_dir_all(&log_dir).expect("mk log dir");
+
+    let fake_token = "ghp_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+    let pr_json = json!([{
+        "number": 7,
+        "title": format!("Rotate leaked {fake_token} immediately"),
+        "author": {"login": "octocat"},
+        "createdAt": "2026-01-01T00:00:00Z",
+        "mergedAt": null,
+        "closedAt": null,
+        "updatedAt": "2026-01-01T00:00:00Z",
+        "baseRefName": "main",
+        "headRefName": "fix/rotate",
+        "mergeCommit": null,
+        "body": ""
+    }])
+    .to_string();
+
+    write_fake_gh(&bin_dir, &log_dir, &pr_json, "[]");
+    let _path_guard = PathGuard::install(&bin_dir);
+
+    let report = run_ingest(
+        &rt,
+        &token,
+        &registry,
+        IngestOptions::unbounded(repo.clone(), project_id.to_string()),
+    )
+    .await
+    .expect("ingest ok");
+
+    assert_eq!(
+        report.prs_ingested, 1,
+        "the PR must not be dropped: {report:?}"
+    );
+    assert!(
+        report.warnings.iter().all(|w| !w.contains("pull_request")),
+        "no silent-drop warning may be reported: {:?}",
+        report.warnings
+    );
+
+    let prs_list = registry
+        .dispatch("list", json!({"kind": "pull_request", "limit": 10}))
+        .await
+        .expect("list prs ok");
+    let items = prs_list.as_array().expect("array");
+    assert_eq!(items.len(), 1);
+    let item = &items[0];
+    let stored_name = item["name"].as_str().expect("name is string");
+    let stored_title = item["properties"]["title"]
+        .as_str()
+        .expect("properties.title is string");
+    assert!(
+        !stored_name.contains(fake_token) && !stored_title.contains(fake_token),
+        "raw credential must not survive into name or properties.title: \
+         name={stored_name:?}, title={stored_title:?}"
+    );
+    assert!(
+        stored_name.contains("***MASKED***") && stored_title.contains("***MASKED***"),
+        "masked marker must be present in both name and properties.title: \
+         name={stored_name:?}, title={stored_title:?}"
+    );
+    let stored_content = item["content"].as_str().expect("content is string");
+    assert_eq!(
+        stored_content, "",
+        "an empty body must remain empty, not acquire a masking placeholder: {stored_content:?}"
+    );
+}
+
+/// Multiple credential spans across both the title and the body of the same
+/// PR must all be masked, and exactly one PR note must be written.
+#[tokio::test]
+async fn ingest_masks_multiple_credential_spans_in_pr_title_and_body() {
+    let _guard = ENV_MUTEX.lock().await;
+    let (rt, token, registry) = fixture().await;
+
+    let project_id = create(
+        &registry,
+        json!({"kind": "project", "name": "pr-multi-span-repo"}),
+    )
+    .await;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo: PathBuf = dir.path().join("repo");
+    std::fs::create_dir_all(&repo).expect("mk repo dir");
+    init_repo(&repo);
+    write(&repo, "README.md", "hello\n");
+    commit(&repo, &["README.md"], "Initial commit");
+
+    let bin_dir = dir.path().join("bin");
+    std::fs::create_dir_all(&bin_dir).expect("mk bin dir");
+    let log_dir = dir.path().join("log");
+    std::fs::create_dir_all(&log_dir).expect("mk log dir");
+
+    let title_token = "ghp_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+    let body_token = "ghp_BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB";
+    let pr_json = json!([{
+        "number": 13,
+        "title": format!("Purge {title_token} from history"),
+        "author": {"login": "octocat"},
+        "createdAt": "2026-01-01T00:00:00Z",
+        "mergedAt": null,
+        "closedAt": null,
+        "updatedAt": "2026-01-01T00:00:00Z",
+        "baseRefName": "main",
+        "headRefName": "fix/purge",
+        "mergeCommit": null,
+        "body": format!("Also found {body_token} committed earlier, and again {body_token} in a second commit.")
+    }])
+    .to_string();
+
+    write_fake_gh(&bin_dir, &log_dir, &pr_json, "[]");
+    let _path_guard = PathGuard::install(&bin_dir);
+
+    let report = run_ingest(
+        &rt,
+        &token,
+        &registry,
+        IngestOptions::unbounded(repo.clone(), project_id.to_string()),
+    )
+    .await
+    .expect("ingest ok");
+
+    assert_eq!(
+        report.prs_ingested, 1,
+        "exactly one PR note written: {report:?}"
+    );
+
+    let prs_list = registry
+        .dispatch("list", json!({"kind": "pull_request", "limit": 10}))
+        .await
+        .expect("list prs ok");
+    let items = prs_list.as_array().expect("array");
+    assert_eq!(items.len(), 1, "no duplicate PR notes: {items:?}");
+    let item = &items[0];
+    let stored_name = item["name"].as_str().expect("name is string");
+    let stored_title = item["properties"]["title"]
+        .as_str()
+        .expect("properties.title is string");
+    let stored_content = item["content"].as_str().expect("content is string");
+    assert!(
+        !stored_name.contains(title_token)
+            && !stored_title.contains(title_token)
+            && !stored_content.contains(body_token),
+        "no raw credential span may survive in any surface: \
+         name={stored_name:?}, title={stored_title:?}, content={stored_content:?}"
+    );
+    assert_eq!(
+        stored_content.matches("***MASKED***").count(),
+        2,
+        "both body occurrences of the credential must be masked independently: {stored_content:?}"
+    );
+    assert!(
+        stored_title.contains("***MASKED***"),
+        "title span must be masked: {stored_title:?}"
+    );
+}
+
+/// Review #763 required regression: a clean (non-credential) PR title and a
+/// null body must pass through `ingest_prs` byte-for-byte unchanged — a bare
+/// 64-hex string with no trigger word nearby is allowlisted by
+/// `mask_secrets`, so nothing in this fixture should ever be replaced.
+/// Guards against a future over-aggressive masking regression that the
+/// detector-positive tests above cannot catch, since they never exercise
+/// clean input.
+#[tokio::test]
+async fn ingest_leaves_clean_pr_title_and_null_body_unmasked() {
+    let _guard = ENV_MUTEX.lock().await;
+    let (rt, token, registry) = fixture().await;
+
+    let project_id = create(
+        &registry,
+        json!({"kind": "project", "name": "pr-clean-title-repo"}),
+    )
+    .await;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo: PathBuf = dir.path().join("repo");
+    std::fs::create_dir_all(&repo).expect("mk repo dir");
+    init_repo(&repo);
+    write(&repo, "README.md", "hello\n");
+    commit(&repo, &["README.md"], "Initial commit");
+
+    let bin_dir = dir.path().join("bin");
+    std::fs::create_dir_all(&bin_dir).expect("mk bin dir");
+    let log_dir = dir.path().join("log");
+    std::fs::create_dir_all(&log_dir).expect("mk log dir");
+
+    // A bare 64-hex string (git-SHA/checksum shape) with no trigger word
+    // anywhere in the title is allowlisted by `mask_secrets` (`!near_trigger
+    // && is_pure_hex`) — this title must survive unchanged.
+    let hex64 = "deadbeef".repeat(8);
+    let title = format!("Document the {hex64} commit reference");
+    let pr_json = json!([{
+        "number": 9,
+        "title": title,
+        "author": {"login": "octocat"},
+        "createdAt": "2026-01-01T00:00:00Z",
+        "mergedAt": null,
+        "closedAt": null,
+        "updatedAt": "2026-01-01T00:00:00Z",
+        "baseRefName": "main",
+        "headRefName": "docs/reference",
+        "mergeCommit": null,
+        "body": null
+    }])
+    .to_string();
+
+    write_fake_gh(&bin_dir, &log_dir, &pr_json, "[]");
+    let _path_guard = PathGuard::install(&bin_dir);
+
+    let report = run_ingest(
+        &rt,
+        &token,
+        &registry,
+        IngestOptions::unbounded(repo.clone(), project_id.to_string()),
+    )
+    .await
+    .expect("ingest ok");
+
+    assert_eq!(report.prs_ingested, 1, "the PR must land: {report:?}");
+    assert_eq!(
+        report.prs_skipped_existing, 0,
+        "a first-seen PR is never counted as skipped-existing: {report:?}"
+    );
+
+    let prs_list = registry
+        .dispatch("list", json!({"kind": "pull_request", "limit": 10}))
+        .await
+        .expect("list prs ok");
+    let items = prs_list.as_array().expect("array");
+    assert_eq!(items.len(), 1);
+    let item = &items[0];
+    let stored_name = item["name"].as_str().expect("name is string");
+    let stored_title = item["properties"]["title"]
+        .as_str()
+        .expect("properties.title is string");
+    let stored_content = item["content"].as_str().expect("content is string");
+
+    assert_eq!(
+        stored_title, title,
+        "a clean title must be stored byte-for-byte unchanged"
+    );
+    assert_eq!(
+        stored_name,
+        format!("#9 {title}"),
+        "the name must be the unmodified `#<number> <title>` form"
+    );
+    assert_eq!(
+        stored_content, "",
+        "a null body must serialize as an empty, unmasked content string"
+    );
+    assert!(
+        !stored_title.contains("***MASKED***") && !stored_name.contains("***MASKED***"),
+        "no masking marker may appear on clean input: title={stored_title:?}, name={stored_name:?}"
+    );
+
+    let project_neighbors = registry
+        .dispatch(
+            "neighbors",
+            json!({"id": project_id.to_string(), "direction": "incoming", "relations": ["annotates"]}),
+        )
+        .await
+        .expect("neighbors ok");
+    let pr_neighbor_count = project_neighbors
+        .as_array()
+        .expect("array")
+        .iter()
+        .filter(|h| h["kind"] == "pull_request")
+        .count();
+    assert_eq!(
+        pr_neighbor_count, 1,
+        "the PR's project annotation edge must still materialize for clean input: {project_neighbors:?}"
+    );
+}
+
+/// Diagnostic #763 order-of-operations invariant: masking must run BEFORE
+/// `NAME_MAX_CHARS` truncation, not after. The raw (unmasked) title is
+/// constructed long enough that the `#<number> <title>` name exceeds the
+/// 120-char budget partway through the credential token, but the masked
+/// title (marker shrinks the token from 38 to 12 chars) comfortably fits —
+/// a trailing marker placed after the token only survives in the stored
+/// name if masking ran first.
+#[tokio::test]
+async fn ingest_masks_pr_title_before_truncating_name_to_max_chars() {
+    let _guard = ENV_MUTEX.lock().await;
+    let (rt, token, registry) = fixture().await;
+
+    let project_id = create(
+        &registry,
+        json!({"kind": "project", "name": "pr-mask-before-truncate-repo"}),
+    )
+    .await;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo: PathBuf = dir.path().join("repo");
+    std::fs::create_dir_all(&repo).expect("mk repo dir");
+    init_repo(&repo);
+    write(&repo, "README.md", "hello\n");
+    commit(&repo, &["README.md"], "Initial commit");
+
+    let bin_dir = dir.path().join("bin");
+    std::fs::create_dir_all(&bin_dir).expect("mk bin dir");
+    let log_dir = dir.path().join("log");
+    std::fs::create_dir_all(&log_dir).expect("mk log dir");
+
+    let filler = "x".repeat(80);
+    let fake_token = "ghp_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+    // The token must be its own whitespace-delimited unit (a leading space
+    // separates it from `filler`) so the vendor-prefix detector sees a token
+    // that actually starts with `ghp_`, not a merged `filler+token` blob.
+    let title = format!("{filler} {fake_token} TAIL_SURVIVED_MARKER");
+    // Sanity-check the fixture math this test depends on: the raw name (with
+    // the full token) must exceed NAME_MAX_CHARS (120) before the tail
+    // marker even starts, while the masked name comfortably fits under it.
+    let raw_name_len = format!("#1 {title}").len();
+    assert!(
+        raw_name_len > 120,
+        "fixture must exceed NAME_MAX_CHARS pre-mask: {raw_name_len}"
+    );
+
+    let pr_json = json!([{
+        "number": 1,
+        "title": title,
+        "author": {"login": "octocat"},
+        "createdAt": "2026-01-01T00:00:00Z",
+        "mergedAt": null,
+        "closedAt": null,
+        "updatedAt": "2026-01-01T00:00:00Z",
+        "baseRefName": "main",
+        "headRefName": "fix/order",
+        "mergeCommit": null,
+        "body": ""
+    }])
+    .to_string();
+
+    write_fake_gh(&bin_dir, &log_dir, &pr_json, "[]");
+    let _path_guard = PathGuard::install(&bin_dir);
+
+    let report = run_ingest(
+        &rt,
+        &token,
+        &registry,
+        IngestOptions::unbounded(repo.clone(), project_id.to_string()),
+    )
+    .await
+    .expect("ingest ok");
+
+    assert_eq!(
+        report.prs_ingested, 1,
+        "the PR must not be dropped: {report:?}"
+    );
+
+    let prs_list = registry
+        .dispatch("list", json!({"kind": "pull_request", "limit": 10}))
+        .await
+        .expect("list prs ok");
+    let items = prs_list.as_array().expect("array");
+    assert_eq!(items.len(), 1);
+    let item = &items[0];
+    let stored_name = item["name"].as_str().expect("name is string");
+    let stored_title = item["properties"]["title"]
+        .as_str()
+        .expect("properties.title is string");
+
+    assert!(
+        stored_name.chars().count() <= 120,
+        "the stored name must respect NAME_MAX_CHARS: {stored_name:?}"
+    );
+    assert!(
+        !stored_name.contains(fake_token) && !stored_title.contains(fake_token),
+        "raw credential must not survive: name={stored_name:?}, title={stored_title:?}"
+    );
+    assert!(
+        stored_name.contains("***MASKED***"),
+        "masked marker must be present in the truncated name: {stored_name:?}"
+    );
+    assert!(
+        stored_name.contains("TAIL_SURVIVED_MARKER"),
+        "masking must run before truncation so the trailing marker, which would be \
+         cut away if the raw (unmasked) name were truncated first, survives: {stored_name:?}"
+    );
+}
+
+/// Diagnostic #763 interaction check: a masked credential span and a
+/// `Fixes #N` cross-reference in the same PR body must not interfere with
+/// each other — masking must not corrupt the reference token, and the
+/// post-ingest reference-extraction sweep (which runs over the
+/// already-masked stored text) must still resolve the reference.
+#[tokio::test]
+async fn ingest_masks_pr_body_credential_without_breaking_fixes_reference() {
+    let _guard = ENV_MUTEX.lock().await;
+    let (rt, token, registry) = fixture().await;
+
+    let project_id = create(
+        &registry,
+        json!({"kind": "project", "name": "pr-mask-and-reference-repo"}),
+    )
+    .await;
+    let issue_id = create(
+        &registry,
+        json!({
+            "kind": "issue",
+            "content": "",
+            "properties": {"number": 42, "title": "Some bug", "project_id": project_id.to_string()},
+            "annotates": [project_id.to_string()],
+        }),
+    )
+    .await;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo: PathBuf = dir.path().join("repo");
+    std::fs::create_dir_all(&repo).expect("mk repo dir");
+    init_repo(&repo);
+    write(&repo, "README.md", "hello\n");
+    commit(&repo, &["README.md"], "Initial commit");
+
+    let bin_dir = dir.path().join("bin");
+    std::fs::create_dir_all(&bin_dir).expect("mk bin dir");
+    let log_dir = dir.path().join("log");
+    std::fs::create_dir_all(&log_dir).expect("mk log dir");
+
+    let fake_token = "ghp_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+    let pr_json = json!([{
+        "number": 7,
+        "title": "Rotate the leaked credential",
+        "author": {"login": "octocat"},
+        "createdAt": "2026-01-01T00:00:00Z",
+        "mergedAt": null,
+        "closedAt": null,
+        "updatedAt": "2026-01-01T00:00:00Z",
+        "baseRefName": "main",
+        "headRefName": "fix/rotate",
+        "mergeCommit": null,
+        "body": format!("Rotated {fake_token} out of the config. Fixes #42.")
+    }])
+    .to_string();
+
+    write_fake_gh(&bin_dir, &log_dir, &pr_json, "[]");
+    let _path_guard = PathGuard::install(&bin_dir);
+
+    let report = run_ingest(
+        &rt,
+        &token,
+        &registry,
+        IngestOptions::unbounded(repo.clone(), project_id.to_string()),
+    )
+    .await
+    .expect("ingest ok");
+
+    assert_eq!(
+        report.prs_ingested, 1,
+        "the PR must not be dropped: {report:?}"
+    );
+    assert_eq!(
+        report.reference_edges_created, 1,
+        "the Fixes #42 reference must resolve even though the body was masked: {report:?}"
+    );
+
+    let prs_list = registry
+        .dispatch("list", json!({"kind": "pull_request", "limit": 10}))
+        .await
+        .expect("list prs ok");
+    let items = prs_list.as_array().expect("array");
+    assert_eq!(items.len(), 1);
+    let content = items[0]["content"].as_str().expect("content is string");
+    assert!(
+        !content.contains(fake_token),
+        "raw credential must not survive: {content:?}"
+    );
+    assert!(
+        content.contains("***MASKED***"),
+        "masked marker must be present: {content:?}"
+    );
+    assert!(
+        content.contains("Fixes #42"),
+        "the reference text itself must be retained in stored content: {content:?}"
+    );
+
+    let issue_neighbors = registry
+        .dispatch(
+            "neighbors",
+            json!({"id": issue_id.to_string(), "direction": "incoming", "relations": ["annotates"]}),
+        )
+        .await
+        .expect("neighbors ok");
+    let hits = issue_neighbors.as_array().expect("array");
+    assert_eq!(
+        hits.len(),
+        1,
+        "exactly one PR annotates the referenced issue: {hits:?}"
+    );
+    assert_eq!(hits[0]["kind"], "pull_request");
 }
 
 // ── KindHook validation unit tests ──────────────────────────────────────────
@@ -948,16 +1622,19 @@ async fn issue_ingest_sorts_by_updated_at_so_frozen_cursor_survives_out_of_order
 /// PR mirror of `issue_ingest_sorts_by_updated_at_so_frozen_cursor_survives_out_of_order_listing`.
 /// `pull_request` has no `stateReason` field in `gh pr list --json` (verified
 /// against the live `gh` CLI's field list — only `issue`s carry one), so this
-/// fixture forces the per-record failure a different, equally real way: a
-/// leaked-credential-shaped PR title. `create_note_inner` scans `properties`
-/// (which carries `title`) through `secret_gate::check_json` independently
-/// of `ingest.rs`'s own `mask_secrets` pass over the PR body — a credential
-/// pasted into a title is masked nowhere upstream, so the create is rejected
-/// outright rather than silently landing unmasked.
+/// fixture forces the per-record failure a different, equally real way. Prior
+/// to #763 this used a leaked-credential-shaped PR title, but #763 now masks
+/// credential-shaped title/body in place instead of dropping the record, so
+/// that mechanism would land #20 instead of failing it. Per #763's approved
+/// design (`architect-2/approved_design.md` §3, "Required tests"), the
+/// replacement is a deterministic, secret-detection-independent failure: a
+/// test-only embedder ([`FailOnceEmbeddingService`]) that fails exactly once
+/// for a PR body containing [`CURSOR_FAIL_SENTINEL`].
 #[tokio::test]
 async fn pr_ingest_sorts_by_updated_at_so_frozen_cursor_survives_out_of_order_listing() {
     let _guard = ENV_MUTEX.lock().await;
     let (rt, token, registry) = fixture().await;
+    rt.register_embedder(FailOnceEmbedderProvider);
 
     let project_id = create(
         &registry,
@@ -977,22 +1654,14 @@ async fn pr_ingest_sorts_by_updated_at_so_frozen_cursor_survives_out_of_order_li
     let log_dir = dir.path().join("log");
     std::fs::create_dir_all(&log_dir).expect("mk log dir");
 
-    let leaked_token = "ghp_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
-    let bad_pr_json = |title_20: &str| {
-        json!([
-            {"number": 10, "title": "pr10-newest-good", "author": {"login": "a"}, "createdAt": "2026-01-01T00:00:00Z", "mergedAt": null, "closedAt": null, "updatedAt": "2026-01-03T00:00:00Z", "baseRefName": "main", "headRefName": "f10", "mergeCommit": null, "body": ""},
-            {"number": 20, "title": title_20, "author": {"login": "a"}, "createdAt": "2026-01-01T00:00:00Z", "mergedAt": null, "closedAt": null, "updatedAt": "2026-01-01T00:00:00Z", "baseRefName": "main", "headRefName": "f20", "mergeCommit": null, "body": ""},
-            {"number": 5, "title": "pr5-oldest-good", "author": {"login": "a"}, "createdAt": "2026-01-01T00:00:00Z", "mergedAt": null, "closedAt": null, "updatedAt": "2025-12-01T00:00:00Z", "baseRefName": "main", "headRefName": "f5", "mergeCommit": null, "body": ""}
-        ])
-        .to_string()
-    };
+    let bad_pr_json = json!([
+        {"number": 10, "title": "pr10-newest-good", "author": {"login": "a"}, "createdAt": "2026-01-01T00:00:00Z", "mergedAt": null, "closedAt": null, "updatedAt": "2026-01-03T00:00:00Z", "baseRefName": "main", "headRefName": "f10", "mergeCommit": null, "body": ""},
+        {"number": 20, "title": "pr20-older-bad", "author": {"login": "a"}, "createdAt": "2026-01-01T00:00:00Z", "mergedAt": null, "closedAt": null, "updatedAt": "2026-01-01T00:00:00Z", "baseRefName": "main", "headRefName": "f20", "mergeCommit": null, "body": CURSOR_FAIL_SENTINEL},
+        {"number": 5, "title": "pr5-oldest-good", "author": {"login": "a"}, "createdAt": "2026-01-01T00:00:00Z", "mergedAt": null, "closedAt": null, "updatedAt": "2025-12-01T00:00:00Z", "baseRefName": "main", "headRefName": "f5", "mergeCommit": null, "body": ""}
+    ])
+    .to_string();
 
-    write_fake_gh(
-        &bin_dir,
-        &log_dir,
-        &bad_pr_json(&format!("pr20-older-bad {leaked_token}")),
-        "[]",
-    );
+    write_fake_gh(&bin_dir, &log_dir, &bad_pr_json, "[]");
     let _path_guard = PathGuard::install(&bin_dir);
 
     let report = run_ingest(
@@ -1006,7 +1675,7 @@ async fn pr_ingest_sorts_by_updated_at_so_frozen_cursor_survives_out_of_order_li
 
     assert_eq!(
         report.prs_ingested, 2,
-        "#5 and #10 both land, #20 (leaked credential in title) warns-and-skips: {report:?}"
+        "#5 and #10 both land, #20 (injected embedder failure) warns-and-skips: {report:?}"
     );
     assert_eq!(
         report
@@ -1029,14 +1698,9 @@ async fn pr_ingest_sorts_by_updated_at_so_frozen_cursor_survives_out_of_order_li
          just because #10 appeared earlier in gh's raw (unsorted) output: {cursor_after_pass1:?}"
     );
 
-    // Upstream correction: #20's title no longer carries a credential — pass
-    // 2 must retry and land it without duplicating #5 or #10.
-    std::fs::write(
-        log_dir.join("pr_response.json"),
-        bad_pr_json("pr20-older-fixed"),
-    )
-    .expect("rewrite pr fixture with corrected title");
-
+    // The embedder's one-shot fuse is already spent — pass 2 retries #20 with
+    // the SAME fixture (no upstream correction needed) and must land it
+    // without duplicating #5 or #10.
     let report2 = run_ingest(
         &rt,
         &token,
@@ -1048,7 +1712,7 @@ async fn pr_ingest_sorts_by_updated_at_so_frozen_cursor_survives_out_of_order_li
 
     assert_eq!(
         report2.prs_ingested, 1,
-        "only #20 (now corrected) is newly created on pass 2: {report2:?}"
+        "only #20 (embedder fuse now spent) is newly created on pass 2: {report2:?}"
     );
     assert_eq!(
         report2.prs_skipped_existing, 2,
@@ -1059,7 +1723,7 @@ async fn pr_ingest_sorts_by_updated_at_so_frozen_cursor_survives_out_of_order_li
             .warnings
             .iter()
             .all(|w| !w.contains("pull_request #20")),
-        "#20 must not warn once its title no longer carries a credential: {:?}",
+        "#20 must not warn once the embedder fuse is spent: {:?}",
         report2.warnings
     );
 
@@ -1221,13 +1885,15 @@ async fn issue_ingest_retries_tie_at_cursor_timestamp() {
 
 /// PR mirror of `issue_ingest_retries_tie_at_cursor_timestamp` — see that
 /// test and `ingest_prs`'s sort-rationale comment for the tie hazard. Uses
-/// the leaked-credential-in-title failure mechanism (see
-/// `pr_ingest_sorts_by_updated_at_so_frozen_cursor_survives_out_of_order_listing`)
-/// since `pull_request` has no `stateReason` field.
+/// the fail-once-embedder failure mechanism (see
+/// `pr_ingest_sorts_by_updated_at_so_frozen_cursor_survives_out_of_order_listing`
+/// for why the pre-#763 leaked-credential-in-title mechanism no longer
+/// forces a create failure) since `pull_request` has no `stateReason` field.
 #[tokio::test]
 async fn pr_ingest_retries_tie_at_cursor_timestamp() {
     let _guard = ENV_MUTEX.lock().await;
     let (rt, token, registry) = fixture().await;
+    rt.register_embedder(FailOnceEmbedderProvider);
 
     let project_id = create(&registry, json!({"kind": "project", "name": "pr-tie-repo"})).await;
 
@@ -1244,21 +1910,13 @@ async fn pr_ingest_retries_tie_at_cursor_timestamp() {
     std::fs::create_dir_all(&log_dir).expect("mk log dir");
 
     const TIE_AT: &str = "2026-02-01T00:00:00Z";
-    let leaked_token = "ghp_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
-    let pr_json = |title_20: &str| {
-        json!([
-            {"number": 5, "title": "pr5-good", "author": {"login": "a"}, "createdAt": "2026-01-01T00:00:00Z", "mergedAt": null, "closedAt": null, "updatedAt": TIE_AT, "baseRefName": "main", "headRefName": "f5", "mergeCommit": null, "body": ""},
-            {"number": 20, "title": title_20, "author": {"login": "a"}, "createdAt": "2026-01-01T00:00:00Z", "mergedAt": null, "closedAt": null, "updatedAt": TIE_AT, "baseRefName": "main", "headRefName": "f20", "mergeCommit": null, "body": ""}
-        ])
-        .to_string()
-    };
+    let pr_json = json!([
+        {"number": 5, "title": "pr5-good", "author": {"login": "a"}, "createdAt": "2026-01-01T00:00:00Z", "mergedAt": null, "closedAt": null, "updatedAt": TIE_AT, "baseRefName": "main", "headRefName": "f5", "mergeCommit": null, "body": ""},
+        {"number": 20, "title": "pr20-bad-tied", "author": {"login": "a"}, "createdAt": "2026-01-01T00:00:00Z", "mergedAt": null, "closedAt": null, "updatedAt": TIE_AT, "baseRefName": "main", "headRefName": "f20", "mergeCommit": null, "body": CURSOR_FAIL_SENTINEL}
+    ])
+    .to_string();
 
-    write_fake_gh(
-        &bin_dir,
-        &log_dir,
-        &pr_json(&format!("pr20-bad-tied {leaked_token}")),
-        "[]",
-    );
+    write_fake_gh(&bin_dir, &log_dir, &pr_json, "[]");
     let _path_guard = PathGuard::install(&bin_dir);
 
     let report = run_ingest(
@@ -1272,7 +1930,7 @@ async fn pr_ingest_retries_tie_at_cursor_timestamp() {
 
     assert_eq!(
         report.prs_ingested, 1,
-        "#5 lands, #20 (tied timestamp, leaked credential in title) warns-and-skips: {report:?}"
+        "#5 lands, #20 (tied timestamp, injected embedder failure) warns-and-skips: {report:?}"
     );
     assert_eq!(
         report
@@ -1295,11 +1953,8 @@ async fn pr_ingest_retries_tie_at_cursor_timestamp() {
          #20 on: {cursor_after_pass1:?}"
     );
 
-    // Upstream correction: #20's title no longer carries a credential — pass
-    // 2 must retry the tied record and land it without duplicating #5.
-    std::fs::write(log_dir.join("pr_response.json"), pr_json("pr20-fixed"))
-        .expect("rewrite pr fixture with corrected title");
-
+    // The embedder's one-shot fuse is already spent — pass 2 retries the tied
+    // record with the SAME fixture and must land it without duplicating #5.
     let report2 = run_ingest(
         &rt,
         &token,
@@ -1311,7 +1966,7 @@ async fn pr_ingest_retries_tie_at_cursor_timestamp() {
 
     assert_eq!(
         report2.prs_ingested, 1,
-        "only #20 (now corrected) is newly created on pass 2, proving the \
+        "only #20 (embedder fuse now spent) is newly created on pass 2, proving the \
          tied timestamp did not strand it: {report2:?}"
     );
     assert_eq!(
@@ -1324,7 +1979,7 @@ async fn pr_ingest_retries_tie_at_cursor_timestamp() {
             .warnings
             .iter()
             .all(|w| !w.contains("pull_request #20")),
-        "#20 must not warn once its title no longer carries a credential: {:?}",
+        "#20 must not warn once the embedder fuse is spent: {:?}",
         report2.warnings
     );
 
@@ -1656,4 +2311,743 @@ async fn digest_verb_rejects_non_integer_max_items() {
         format!("{err}").contains("max_items"),
         "error must name the offending field: {err}"
     );
+}
+
+// ── #764: over-cap commit payload truncation ────────────────────────────────
+
+/// Test-only [`EmbeddingService`] that records every text it is asked to
+/// embed (so a test can assert exactly what reached the "provider") and
+/// returns a deterministic constant vector, never failing.
+struct CapturingEmbedService {
+    captured: Arc<Mutex<Vec<String>>>,
+    dims: usize,
+}
+
+#[async_trait]
+impl EmbeddingService for CapturingEmbedService {
+    async fn embed(
+        &self,
+        texts: &[String],
+        _model: EmbeddingModel,
+    ) -> std::result::Result<Vec<Vec<f32>>, EmbedError> {
+        self.captured
+            .lock()
+            .expect("captured mutex")
+            .extend(texts.iter().cloned());
+        Ok(texts.iter().map(|_| vec![1.0_f32; self.dims]).collect())
+    }
+
+    fn supports_model(&self, _model: EmbeddingModel) -> bool {
+        true
+    }
+
+    fn name(&self) -> &'static str {
+        "capturing-test-embedder"
+    }
+}
+
+struct CapturingEmbedProvider {
+    captured: Arc<Mutex<Vec<String>>>,
+    dims: usize,
+}
+
+#[async_trait]
+impl EmbedderProvider for CapturingEmbedProvider {
+    fn name(&self) -> &str {
+        "capturing-test-embedder"
+    }
+
+    fn dimensions(&self) -> usize {
+        self.dims
+    }
+
+    async fn build(&self) -> RuntimeResult<Arc<dyn EmbeddingService>> {
+        Ok(Arc::new(CapturingEmbedService {
+            captured: Arc::clone(&self.captured),
+            dims: self.dims,
+        }))
+    }
+}
+
+/// A commit message over the 32,768-byte embedding cap must still create the
+/// complete note (full content stored/FTS-indexed), must send only a capped,
+/// UTF-8-safe head prefix to the embedder, and must report the truncation.
+#[tokio::test]
+async fn ingest_truncates_over_cap_commit_embedding_and_reports_it() {
+    let _guard = ENV_MUTEX.lock().await;
+    let (rt, token, registry) = fixture().await;
+
+    // The project anchor entity is created (and, via `create_entity`, embedded)
+    // BEFORE the capturing embedder is registered, so only the commit note's
+    // embed call below is captured.
+    let project_id = create(
+        &registry,
+        json!({"kind": "project", "name": "big-commit-repo"}),
+    )
+    .await;
+
+    let captured: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    rt.register_embedder(CapturingEmbedProvider {
+        captured: Arc::clone(&captured),
+        dims: 8,
+    });
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    init_repo(repo);
+    write(repo, "README.md", "hello\n");
+
+    // 51,648 ASCII chars (matches the issue's first-consumer report), with a
+    // unique term at the very start (head, must be embedded/searchable) and
+    // a unique term at the very end (tail, must be stored/FTS-searchable but
+    // is beyond the embedding cap).
+    let filler = "x".repeat(51_648 - "head-term-unique ".len() - " tail-term-unique".len());
+    let message = format!("head-term-unique {filler} tail-term-unique");
+    assert!(message.len() > 32_768, "fixture must exceed the cap");
+    commit(repo, &["README.md"], &message);
+
+    let report = run_ingest(
+        &rt,
+        &token,
+        &registry,
+        IngestOptions::unbounded(repo.to_path_buf(), project_id.to_string()),
+    )
+    .await
+    .expect("ingest ok");
+    assert_eq!(report.commits_ingested, 1);
+    assert_eq!(
+        report.commit_embeddings_truncated, 1,
+        "over-cap commit must be reported as truncated"
+    );
+
+    // Full content remains stored (including the tail sentinel beyond the cap).
+    let list = registry
+        .dispatch("list", json!({"kind": "commit", "limit": 10}))
+        .await
+        .expect("list ok");
+    let items = list.as_array().expect("array");
+    assert_eq!(items.len(), 1);
+    let stored_content = items[0]["content"].as_str().expect("content is string");
+    assert!(stored_content.contains("head-term-unique"));
+    assert!(
+        stored_content.contains("tail-term-unique"),
+        "full commit message, including the tail beyond the cap, must be stored"
+    );
+
+    // Exactly one embed call was made, with a capped, head-only prefix.
+    let seen = captured.lock().expect("captured mutex").clone();
+    assert_eq!(seen.len(), 1, "exactly one embed call: {seen:?}");
+    let embedded_text = &seen[0];
+    assert!(
+        embedded_text.len() <= 32_768,
+        "embedder input must be at or under the cap: {} bytes",
+        embedded_text.len()
+    );
+    assert!(
+        embedded_text.contains("head-term-unique"),
+        "embedder input must retain the head term"
+    );
+    assert!(
+        !embedded_text.contains("tail-term-unique"),
+        "embedder input must not reach past the cap into the tail"
+    );
+    assert!(
+        stored_content.starts_with(embedded_text.as_str()),
+        "embedder input must be a proper prefix of the stored content"
+    );
+
+    // A vector was actually inserted for this note (not skipped).
+    let vectors = rt
+        .vectors_for_model(&token, "capturing-test-embedder")
+        .expect("vector store for capturing embedder");
+    assert_eq!(
+        vectors.count().await.expect("vector count"),
+        1,
+        "the capped head must have produced exactly one vector row"
+    );
+
+    // The head term is retrievable through the `search` verb (the design's
+    // "vector evidence/search finds the head" requirement, satisfied here via
+    // its search form in addition to the direct embedder-capture evidence
+    // above), and the tail term — beyond the embedding cap but still part of
+    // the fully stored/FTS-indexed content — remains independently
+    // searchable too.
+    // FTS5's bareword query grammar treats a run of whitespace-separated
+    // terms as an implicit (adjacency-required) phrase, so the query text
+    // uses spaces rather than the fixture's hyphenated compound — both tokenize
+    // identically against the indexed content (hyphens are FTS5 word
+    // separators too), but only the space form parses as the intended
+    // three-token phrase rather than one hyphenated bareword.
+    let head_hits = registry
+        .dispatch(
+            "search",
+            json!({"kind": "commit", "query": "head term unique"}),
+        )
+        .await
+        .expect("search ok");
+    let head_hits = head_hits.as_array().expect("array");
+    assert!(
+        head_hits.iter().any(|h| h["id"] == items[0]["id"]),
+        "the head term must resolve the truncated commit note via search: {head_hits:?}"
+    );
+
+    let tail_hits = registry
+        .dispatch(
+            "search",
+            json!({"kind": "commit", "query": "tail term unique"}),
+        )
+        .await
+        .expect("search ok");
+    let tail_hits = tail_hits.as_array().expect("array");
+    assert!(
+        tail_hits.iter().any(|h| h["id"] == items[0]["id"]),
+        "the tail term, beyond the embedding cap, must still resolve via FTS on the \
+         complete stored content: {tail_hits:?}"
+    );
+
+    // A duplicate digest pass that re-walks the same over-cap commit (its
+    // natural-key sha already has a note) must count it as a skip, and must
+    // NOT re-increment the truncation counter — that counter only ever moves
+    // on the successful-CREATE arm, which a skip never reaches. Re-walking
+    // requires clearing the persisted cursor directly (the `{sha}..HEAD`
+    // range `walk_commits` uses is exclusive of an already-advanced cursor,
+    // so an ordinary duplicate `run_ingest` call would simply see zero
+    // commits and never exercise the skip path at all).
+    let sql = rt.sql();
+    let mut w = sql.writer().await.expect("sql writer");
+    w.execute(SqlStatement {
+        sql: "DELETE FROM git_mirror_cursor WHERE project_id=?1 AND kind='commits'".into(),
+        params: vec![SqlValue::Text(project_id.to_string())],
+        label: Some("test_reset_commits_cursor".into()),
+    })
+    .await
+    .expect("reset cursor");
+    drop(w);
+
+    let second_report = run_ingest(
+        &rt,
+        &token,
+        &registry,
+        IngestOptions::unbounded(repo.to_path_buf(), project_id.to_string()),
+    )
+    .await
+    .expect("second ingest ok");
+    assert_eq!(
+        second_report.commits_ingested, 0,
+        "no new commits on the re-walked pass"
+    );
+    assert_eq!(
+        second_report.commits_skipped_existing, 1,
+        "the already-ingested over-cap commit must be a natural-key skip"
+    );
+    assert_eq!(
+        second_report.commit_embeddings_truncated, 0,
+        "a re-walked pass must not re-report truncation for an existing commit"
+    );
+}
+
+struct FailingEmbedService;
+
+#[async_trait]
+impl EmbeddingService for FailingEmbedService {
+    async fn embed(
+        &self,
+        _texts: &[String],
+        _model: EmbeddingModel,
+    ) -> std::result::Result<Vec<Vec<f32>>, EmbedError> {
+        Err(EmbedError::InferenceFailed(
+            "simulated inference failure (issue #764 regression)".into(),
+        ))
+    }
+
+    fn supports_model(&self, _model: EmbeddingModel) -> bool {
+        true
+    }
+
+    fn name(&self) -> &'static str {
+        "failing-test-embedder"
+    }
+}
+
+struct FailingEmbedProvider;
+
+#[async_trait]
+impl EmbedderProvider for FailingEmbedProvider {
+    fn name(&self) -> &str {
+        "failing-test-embedder"
+    }
+
+    fn dimensions(&self) -> usize {
+        8
+    }
+
+    async fn build(&self) -> RuntimeResult<Arc<dyn EmbeddingService>> {
+        Ok(Arc::new(FailingEmbedService))
+    }
+}
+
+/// An over-cap commit whose vector embedding genuinely fails (a real
+/// `EmbedError::InferenceFailed` from the registered embedder -- the existing
+/// test-embedder seam, not a production fault-injection flag) must not leave
+/// a partial record behind: `create_note_inner`'s existing compensation
+/// removes the note row and its FTS document, the pass reports the failure
+/// as a create-commit warning, and neither `commits_ingested` nor
+/// `commit_embeddings_truncated` moves for that commit, since both only ever
+/// advance on the successful-create arm (review round-2 [Medium]-1
+/// remediation).
+#[tokio::test]
+async fn ingest_over_cap_commit_with_failing_embedder_creates_nothing_and_warns() {
+    let _guard = ENV_MUTEX.lock().await;
+    let (rt, token, registry) = fixture().await;
+
+    let project_id = create(
+        &registry,
+        json!({"kind": "project", "name": "failing-embed-repo"}),
+    )
+    .await;
+
+    rt.register_embedder(FailingEmbedProvider);
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    init_repo(repo);
+    write(repo, "README.md", "hello\n");
+
+    let filler = "x".repeat(51_648 - "head-term-unique ".len() - " tail-term-unique".len());
+    let message = format!("head-term-unique {filler} tail-term-unique");
+    assert!(message.len() > 32_768, "fixture must exceed the cap");
+    commit(repo, &["README.md"], &message);
+
+    let report = run_ingest(
+        &rt,
+        &token,
+        &registry,
+        IngestOptions::unbounded(repo.to_path_buf(), project_id.to_string()),
+    )
+    .await
+    .expect("ingest ok -- a per-commit create failure is a warning, not a hard pass error");
+
+    assert_eq!(
+        report.commits_ingested, 0,
+        "the failed create must not be counted as ingested"
+    );
+    assert_eq!(
+        report.commit_embeddings_truncated, 0,
+        "truncation is only reported on the successful-create arm, which a failed \
+         embed never reaches"
+    );
+    assert!(
+        report.warnings.iter().any(|w| w.contains("create commit")
+            && w.contains("embedding inference failed")
+            && w.contains("simulated inference failure")),
+        "the embed failure must surface as an explicit create-commit warning: {:?}",
+        report.warnings
+    );
+
+    // No note row survives the compensated create.
+    let list = registry
+        .dispatch("list", json!({"kind": "commit", "limit": 10}))
+        .await
+        .expect("list ok");
+    assert_eq!(
+        list.as_array().expect("array").len(),
+        0,
+        "a compensated create must leave no commit note row behind"
+    );
+
+    // No FTS hit either -- the head term never resolves anything, since the
+    // FTS document was compensated away along with the note row.
+    let head_hits = registry
+        .dispatch(
+            "search",
+            json!({"kind": "commit", "query": "head term unique"}),
+        )
+        .await
+        .expect("search ok");
+    assert_eq!(
+        head_hits.as_array().expect("array").len(),
+        0,
+        "no FTS document must survive the compensated create"
+    );
+}
+
+/// Semantic-only retrieval (review round-2 [Medium]-1): an explicit
+/// deterministic query vector matching a real registered embedder's
+/// constant output, paired with query text that is lexically absent from
+/// the commit message, can only resolve the note through the vector leg --
+/// the FTS leg cannot contribute a hit. This proves the stored vector
+/// genuinely retrieves the created commit note by ID/kind through the
+/// public `KhiveRuntime::search_notes` surface, not merely that a vector
+/// row of some count exists or that FTS happens to also work.
+///
+/// `search_notes`'s vector leg always searches the store keyed by the
+/// runtime's *configured default* embedding model
+/// (`config().embedding_model`), so unlike the sibling truncation test's
+/// custom-named `CapturingEmbedProvider` (whose vectors live in a
+/// per-provider store `search_notes` cannot reach), this test registers its
+/// deterministic fixture embedder under a real `EmbeddingModel` variant's
+/// canonical name -- `EmbedderRegistry::register` is last-writer-wins, so
+/// this replaces the default `LatticeEmbedderProvider` khive-runtime
+/// auto-registers for a configured model.
+#[tokio::test]
+async fn ingest_over_cap_commit_embedding_is_semantically_retrievable() {
+    const MODEL: EmbeddingModel = EmbeddingModel::BgeSmallEnV15;
+    let dims = MODEL.dimensions();
+
+    struct FixtureEmbedService {
+        dims: usize,
+    }
+
+    #[async_trait]
+    impl EmbeddingService for FixtureEmbedService {
+        async fn embed(
+            &self,
+            texts: &[String],
+            _model: EmbeddingModel,
+        ) -> std::result::Result<Vec<Vec<f32>>, EmbedError> {
+            Ok(texts.iter().map(|_| vec![1.0_f32; self.dims]).collect())
+        }
+
+        fn supports_model(&self, _model: EmbeddingModel) -> bool {
+            true
+        }
+
+        fn name(&self) -> &'static str {
+            "fixture-semantic-embedder"
+        }
+    }
+
+    struct FixtureEmbedProvider {
+        dims: usize,
+    }
+
+    #[async_trait]
+    impl EmbedderProvider for FixtureEmbedProvider {
+        fn name(&self) -> &str {
+            "bge-small-en-v1.5"
+        }
+
+        fn dimensions(&self) -> usize {
+            self.dims
+        }
+
+        async fn build(&self) -> RuntimeResult<Arc<dyn EmbeddingService>> {
+            Ok(Arc::new(FixtureEmbedService { dims: self.dims }))
+        }
+    }
+
+    let _guard = ENV_MUTEX.lock().await;
+    let rt = KhiveRuntime::new(RuntimeConfig {
+        db_path: None,
+        default_namespace: Namespace::local(),
+        embedding_model: Some(MODEL),
+        additional_embedding_models: vec![],
+        gate: Arc::new(AllowAllGate),
+        packs: vec!["kg".to_string()],
+        backend_id: BackendId::main(),
+        brain_profile: None,
+        visible_namespaces: vec![],
+        allowed_outbound_namespaces: vec![],
+        actor_id: None,
+    })
+    .expect("runtime with a configured default model");
+    rt.register_embedder(FixtureEmbedProvider { dims });
+
+    let mut builder = VerbRegistryBuilder::new();
+    builder.register(KgPack::new(rt.clone()));
+    builder.register(GitPack::new(rt.clone()));
+    let registry = builder.build().expect("registry builds");
+    rt.install_edge_rules(registry.all_edge_rules());
+    registry.apply_schema_plans(rt.backend());
+    let token = rt.authorize(Namespace::local()).expect("authorize local");
+
+    let project_id = create(
+        &registry,
+        json!({"kind": "project", "name": "semantic-retrieval-repo"}),
+    )
+    .await;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    init_repo(repo);
+    write(repo, "README.md", "hello\n");
+
+    let filler = "x".repeat(51_648 - "head-term-unique ".len() - " tail-term-unique".len());
+    let message = format!("head-term-unique {filler} tail-term-unique");
+    assert!(message.len() > 32_768, "fixture must exceed the cap");
+    commit(repo, &["README.md"], &message);
+
+    let report = run_ingest(
+        &rt,
+        &token,
+        &registry,
+        IngestOptions::unbounded(repo.to_path_buf(), project_id.to_string()),
+    )
+    .await
+    .expect("ingest ok");
+    assert_eq!(report.commits_ingested, 1);
+    assert_eq!(report.commit_embeddings_truncated, 1);
+
+    let list = registry
+        .dispatch("list", json!({"kind": "commit", "limit": 10}))
+        .await
+        .expect("list ok");
+    let items = list.as_array().expect("array");
+    assert_eq!(items.len(), 1);
+    let commit_note_id =
+        Uuid::parse_str(items[0]["id"].as_str().expect("commit id")).expect("commit id is uuid");
+
+    let semantic_hits = rt
+        .search_notes(
+            &token,
+            "lexically-absent-query-term-zzz",
+            Some(vec![1.0_f32; dims]),
+            10,
+            Some("commit"),
+            false,
+            &[],
+            None,
+        )
+        .await
+        .expect("semantic search ok");
+    assert!(
+        semantic_hits.iter().any(|h| h.note_id == commit_note_id),
+        "an explicit deterministic query vector matching the embedded head must \
+         retrieve the commit note by ID even though the query text is lexically \
+         absent from its content: {semantic_hits:?}"
+    );
+}
+
+/// Under-cap commit content must not be truncated: the embedder sees the
+/// full text and the report's truncation counter stays at zero. See
+/// [`ingest_does_not_truncate_exact_cap_commit_embedding`] for the
+/// exact-cap-boundary sibling of this test.
+#[tokio::test]
+async fn ingest_does_not_truncate_under_cap_commit_embedding() {
+    let _guard = ENV_MUTEX.lock().await;
+    let (rt, token, registry) = fixture().await;
+
+    // Create the project anchor entity BEFORE registering the capturing
+    // embedder, so only the commit note's embed call is captured below.
+    let project_id = create(
+        &registry,
+        json!({"kind": "project", "name": "small-commit-repo"}),
+    )
+    .await;
+
+    let captured: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    rt.register_embedder(CapturingEmbedProvider {
+        captured: Arc::clone(&captured),
+        dims: 8,
+    });
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    init_repo(repo);
+    write(repo, "README.md", "hello\n");
+    commit(repo, &["README.md"], "A short, unremarkable commit message");
+
+    let report = run_ingest(
+        &rt,
+        &token,
+        &registry,
+        IngestOptions::unbounded(repo.to_path_buf(), project_id.to_string()),
+    )
+    .await
+    .expect("ingest ok");
+    assert_eq!(report.commits_ingested, 1);
+    assert_eq!(
+        report.commit_embeddings_truncated, 0,
+        "an under-cap commit must not be reported as truncated"
+    );
+
+    let seen = captured.lock().expect("captured mutex").clone();
+    assert_eq!(seen.len(), 1);
+    assert!(
+        seen[0].contains("A short, unremarkable commit message"),
+        "the embedder must receive the full message unchanged: {:?}",
+        seen[0]
+    );
+}
+
+/// A commit message whose masked content lands EXACTLY on the 32,768-byte
+/// cap (not one byte over) must not be truncated either: the design draws
+/// the line at "at or below the cap", and `truncated_embedding_head`'s own
+/// exact-cap unit test only proves the pure helper's behavior, not this
+/// full `run_ingest` pipeline's counter and embedder-input wiring.
+#[tokio::test]
+async fn ingest_does_not_truncate_exact_cap_commit_embedding() {
+    let _guard = ENV_MUTEX.lock().await;
+    let (rt, token, registry) = fixture().await;
+
+    let project_id = create(
+        &registry,
+        json!({"kind": "project", "name": "exact-cap-commit-repo"}),
+    )
+    .await;
+
+    let captured: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    rt.register_embedder(CapturingEmbedProvider {
+        captured: Arc::clone(&captured),
+        dims: 8,
+    });
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    init_repo(repo);
+    write(repo, "README.md", "hello\n");
+
+    // A single-line, body-less subject of exactly 32,768 ASCII bytes: `git`'s
+    // `%s`/`%b` split leaves `body` empty, so `raw_content == subject` and
+    // `content.len()` (post-mask, a no-op here) is exactly the cap.
+    let message = "x".repeat(32_768);
+    assert_eq!(
+        message.len(),
+        32_768,
+        "fixture must land exactly on the cap"
+    );
+    commit(repo, &["README.md"], &message);
+
+    let report = run_ingest(
+        &rt,
+        &token,
+        &registry,
+        IngestOptions::unbounded(repo.to_path_buf(), project_id.to_string()),
+    )
+    .await
+    .expect("ingest ok");
+    assert_eq!(report.commits_ingested, 1);
+    assert_eq!(
+        report.commit_embeddings_truncated, 0,
+        "an exact-cap commit must not be reported as truncated"
+    );
+
+    let seen = captured.lock().expect("captured mutex").clone();
+    assert_eq!(seen.len(), 1);
+    assert_eq!(
+        seen[0].len(),
+        32_768,
+        "the embedder must receive the full, untruncated exact-cap message"
+    );
+}
+
+/// With no embedder registered at all (the acceptance fixture's default),
+/// an over-cap commit must still store the full note and report the
+/// truncation — the counter reflects the capped candidate input regardless
+/// of whether any embedder is configured to consume it.
+#[tokio::test]
+async fn ingest_reports_truncation_even_with_no_embedder_configured() {
+    let _guard = ENV_MUTEX.lock().await;
+    let (rt, token, registry) = fixture().await;
+
+    let project_id = create(
+        &registry,
+        json!({"kind": "project", "name": "no-embedder-repo"}),
+    )
+    .await;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    init_repo(repo);
+    write(repo, "README.md", "hello\n");
+    let message = format!("head-of-message {}", "y".repeat(40_000));
+    commit(repo, &["README.md"], &message);
+
+    let report = run_ingest(
+        &rt,
+        &token,
+        &registry,
+        IngestOptions::unbounded(repo.to_path_buf(), project_id.to_string()),
+    )
+    .await
+    .expect("ingest ok");
+    assert_eq!(report.commits_ingested, 1);
+    assert_eq!(report.commit_embeddings_truncated, 1);
+
+    let list = registry
+        .dispatch("list", json!({"kind": "commit", "limit": 10}))
+        .await
+        .expect("list ok");
+    let stored_content = list[0]["content"].as_str().expect("content is string");
+    assert!(stored_content.contains(&message));
+}
+
+/// A `Closes #N` reference placed in the tail of an over-cap commit message —
+/// past the 32,768-byte embedding cap — must still resolve to a
+/// `reference_edges_created` annotates edge. `link_references` reads
+/// `NewRecordForRef.text`, which is the complete masked content (not the
+/// capped embedding head), so a beyond-cap reference must be exactly as
+/// resolvable as one in the head.
+#[tokio::test]
+async fn ingest_resolves_over_cap_commit_reference_beyond_the_embedding_cap() {
+    let _guard = ENV_MUTEX.lock().await;
+    let (_rt, _token, registry) = fixture().await;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    init_repo(repo);
+    write(repo, "README.md", "hello\n");
+    commit(repo, &["README.md"], "Initial commit");
+
+    let first = registry
+        .dispatch(
+            "git.digest",
+            json!({"source": repo.to_str().unwrap(), "max_items": 10}),
+        )
+        .await
+        .expect("digest ok (pass 1)");
+    let project_id = first["project_id"]
+        .as_str()
+        .expect("project_id present")
+        .to_string();
+
+    let issue_id = create(
+        &registry,
+        json!({
+            "kind": "issue",
+            "content": "",
+            "properties": {"number": 4242, "title": "Tail-referenced bug", "project_id": project_id},
+            "annotates": [project_id],
+        }),
+    )
+    .await;
+
+    // The `Closes #4242` reference sits well past the 32,768-byte cap: the
+    // filler alone already exceeds the cap before the reference paragraph.
+    let filler = "z".repeat(40_000);
+    let message = format!("Fix the tail bug\n\n{filler}\n\nCloses #4242");
+    assert!(
+        message.rfind("Closes #4242").unwrap() > 32_768,
+        "fixture must place the reference beyond the embedding cap"
+    );
+    write(repo, "src/lib.rs", "// fix\n");
+    commit(repo, &["src/lib.rs"], &message);
+
+    let second = registry
+        .dispatch(
+            "git.digest",
+            json!({"source": repo.to_str().unwrap(), "project": project_id, "max_items": 10}),
+        )
+        .await
+        .expect("digest ok (pass 2)");
+    assert_eq!(second["commits_ingested"], 1, "{second}");
+    assert_eq!(
+        second["commit_embeddings_truncated"], 1,
+        "the referencing commit is itself over-cap: {second}"
+    );
+    assert_eq!(
+        second["reference_edges_created"], 1,
+        "the beyond-cap Closes #4242 reference must still resolve: {second}"
+    );
+
+    let issue_neighbors = registry
+        .dispatch(
+            "neighbors",
+            json!({"id": issue_id.to_string(), "direction": "incoming", "relations": ["annotates"]}),
+        )
+        .await
+        .expect("neighbors ok");
+    let hits = issue_neighbors.as_array().expect("array");
+    assert_eq!(hits.len(), 1, "{hits:?}");
+    assert_eq!(hits[0]["kind"], "commit");
 }

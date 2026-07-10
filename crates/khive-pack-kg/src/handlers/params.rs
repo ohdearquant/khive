@@ -38,6 +38,10 @@ pub(crate) struct CreateParams {
     pub(crate) tags: Option<Vec<String>>,
     pub(crate) skip_dedup_check: Option<bool>,
     pub(crate) edges: Option<Vec<EdgeSpec>>,
+    /// Singleton-note-only vector-embedding input override (issue #764). When
+    /// present, `content` is still stored/FTS-indexed in full; only the text
+    /// sent to the embedder is replaced with this value.
+    pub(crate) embedding_content: Option<String>,
 }
 
 #[derive(Deserialize)]

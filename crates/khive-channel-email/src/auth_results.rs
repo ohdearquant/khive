@@ -185,6 +185,100 @@ fn split_top_level_segments(raw: &str) -> Vec<String> {
     segments
 }
 
+/// Split one top-level `resinfo` segment (already produced by
+/// [`split_top_level_segments`], so comments are already stripped and only
+/// quoted semicolons can remain) into whitespace-delimited tokens, tracking
+/// RFC 5322 quoted-string state (with `\` escapes) so quoted whitespace is
+/// never treated as a token boundary.
+///
+/// This is the second of two delimiter layers: the segment scanner above
+/// finds `;` boundaries; this one finds whitespace boundaries within a
+/// segment. Both share the same quoted-pair semantics (`\` plus the
+/// following character is one atomic unit, regardless of what that character
+/// is), but this layer never sees `(...)` comments -- those were already
+/// discarded by the segment scanner. A token is returned verbatim, including
+/// any retained quote and backslash characters; it is never unquoted.
+///
+/// Malformed input (an unmatched `"`, or a `\` as the final character while
+/// quoted) is handled conservatively: the remainder of the segment is
+/// retained as one atomic token through EOF rather than resuming whitespace
+/// splitting, so a malformed quoted tail can never be reinterpreted as
+/// additional tokens -- see `split_top_level_ws_keeps_malformed_quoted_tail_atomic`.
+fn split_top_level_ws(segment: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut in_quotes = false;
+    let mut chars = segment.chars();
+
+    while let Some(c) = chars.next() {
+        if in_quotes {
+            current.push(c);
+            match c {
+                '\\' => {
+                    if let Some(next) = chars.next() {
+                        current.push(next);
+                    }
+                }
+                '"' => in_quotes = false,
+                _ => {}
+            }
+            continue;
+        }
+
+        match c {
+            '"' => {
+                in_quotes = true;
+                current.push(c);
+            }
+            c if c.is_whitespace() => {
+                if !current.is_empty() {
+                    tokens.push(std::mem::take(&mut current));
+                }
+            }
+            _ => current.push(c),
+        }
+    }
+
+    if !current.is_empty() {
+        tokens.push(current);
+    }
+
+    tokens
+}
+
+/// Returns true if `target` occurs anywhere in `token` *outside* of a
+/// quoted-string span, using the same quoted-pair (`\`) escaping semantics
+/// as [`split_top_level_ws`]. A plain `str::contains` would treat a `=`
+/// inside a quoted value (e.g. a quoted `authserv-id` like `"id=foo"`, which
+/// RFC 8601 §2.2 permits as a valid `value`) the same as an unquoted `=`,
+/// even though the tokenizer that produced `token` already knows the
+/// difference -- this keeps the classification consistent with that state.
+fn contains_unquoted(token: &str, target: char) -> bool {
+    let mut in_quotes = false;
+    let mut chars = token.chars();
+
+    while let Some(c) = chars.next() {
+        if in_quotes {
+            match c {
+                '\\' => {
+                    chars.next();
+                }
+                '"' => in_quotes = false,
+                _ => {}
+            }
+            continue;
+        }
+
+        match c {
+            '"' => in_quotes = true,
+            c if c == target => return true,
+            _ => {}
+        }
+    }
+
+    false
+}
+
 /// Parse one raw `Authentication-Results` header value.
 ///
 /// Detects two shapes for the first `resinfo`-or-authserv-id segment:
@@ -210,15 +304,22 @@ fn split_top_level_segments(raw: &str) -> Vec<String> {
 pub(crate) fn parse_header(raw: &str) -> Option<AuthResults> {
     let mut all_segments = split_top_level_segments(raw).into_iter();
     let first_segment = all_segments.next()?;
-    let first_token = first_segment.split_whitespace().next()?;
+    let first_token = split_top_level_ws(&first_segment).into_iter().next()?;
 
-    // A valid RFC 8601 authserv-id can never contain `=`; a resinfo always
-    // begins `method[/version]=result`. An unquoted `=` in the first
-    // whitespace token is therefore unambiguous evidence that this boundary
-    // emits no authserv-id at all, regardless of whether an optional
-    // method-version suffix (`method/version=result`) is also present --
-    // the `=` survives that suffix either way.
-    let is_no_authserv_id_form = first_token.contains('=');
+    // A valid RFC 8601 authserv-id can never contain an *unquoted* `=`; a
+    // resinfo always begins `method[/version]=result`, also unquoted. An
+    // unquoted `=` in the first whitespace token is therefore unambiguous
+    // evidence that this boundary emits no authserv-id at all, regardless of
+    // whether an optional method-version suffix (`method/version=result`) is
+    // also present -- the `=` survives that suffix either way. This must use
+    // the same quote-state machine as `split_top_level_ws` (via
+    // `contains_unquoted`), not a raw `str::contains`: RFC 8601 §2.2 permits
+    // a quoted-string `authserv-id` value, and a `=` sealed inside that
+    // quoting is not a resinfo delimiter -- treating it as one would let a
+    // quoted authserv-id be misclassified as the no-authserv-id form, which
+    // `TrustAnchor::TopmostNoAuthservId` treats as a strictly weaker,
+    // position-only trust signal than a real authserv-id match.
+    let is_no_authserv_id_form = contains_unquoted(&first_token, '=');
 
     let (authserv_id, method_segments): (Option<String>, Box<dyn Iterator<Item = String>>) =
         if is_no_authserv_id_form {
@@ -227,7 +328,7 @@ pub(crate) fn parse_header(raw: &str) -> Option<AuthResults> {
                 Box::new(std::iter::once(first_segment).chain(all_segments)),
             )
         } else {
-            (Some(first_token.to_string()), Box::new(all_segments))
+            (Some(first_token), Box::new(all_segments))
         };
 
     let mut out = AuthResults {
@@ -241,7 +342,7 @@ pub(crate) fn parse_header(raw: &str) -> Option<AuthResults> {
         if segment.is_empty() || segment.eq_ignore_ascii_case("none") {
             continue;
         }
-        let mut tokens = segment.split_whitespace();
+        let mut tokens = split_top_level_ws(segment).into_iter();
         let Some(methodspec) = tokens.next() else {
             continue;
         };
@@ -653,5 +754,318 @@ mod tests {
         // No authserv-id (first token contains '=') AND no recognized
         // dmarc/spf/dkim method anywhere -- genuine zero signal, must be None.
         assert!(parse_header("evil=x").is_none());
+    }
+
+    // --- #501: quote/backslash-aware whitespace tokenization ---
+
+    #[test]
+    fn split_top_level_ws_preserves_unquoted_whitespace_behavior() {
+        let tokens = split_top_level_ws(
+            " \tspf=pass  smtp.mailfrom=alice@example.com\u{00a0}header.from=example.com \n",
+        );
+        assert_eq!(
+            tokens,
+            vec![
+                "spf=pass",
+                "smtp.mailfrom=alice@example.com",
+                "header.from=example.com"
+            ]
+        );
+    }
+
+    #[test]
+    fn split_top_level_ws_preserves_empty_quoted_value_and_drops_empty_fields() {
+        let tokens = split_top_level_ws(r#"  spf=pass   reason=""  smtp.mailfrom=evil.com  "#);
+        assert_eq!(
+            tokens,
+            vec!["spf=pass", r#"reason="""#, "smtp.mailfrom=evil.com"]
+        );
+    }
+
+    #[test]
+    fn split_top_level_ws_keeps_quoted_whitespace_atomic() {
+        let tokens = split_top_level_ws(r#"spf=pass smtp.mailfrom="a b c"@evil.com extra=1"#);
+        assert_eq!(tokens.len(), 3);
+        assert_eq!(tokens[1], r#"smtp.mailfrom="a b c"@evil.com"#);
+    }
+
+    #[test]
+    fn split_top_level_ws_escaped_quote_keeps_quote_open() {
+        let tokens = split_top_level_ws(
+            r#"spf=pass reason="said \"still quoted smtp.mailfrom=khive.ai" smtp.mailfrom=evil.com"#,
+        );
+        assert_eq!(tokens.len(), 3);
+        assert!(tokens[1].contains("smtp.mailfrom=khive.ai"));
+        assert_eq!(tokens[2], "smtp.mailfrom=evil.com");
+    }
+
+    #[test]
+    fn split_top_level_ws_escaped_backslash_allows_later_quote_to_close() {
+        let tokens = split_top_level_ws(r#"spf=pass reason="path \\" smtp.mailfrom=evil.com"#);
+        assert_eq!(tokens.len(), 3);
+        assert_eq!(tokens[1].matches('\\').count(), 2);
+        assert_eq!(tokens[2], "smtp.mailfrom=evil.com");
+    }
+
+    #[test]
+    fn split_top_level_ws_keeps_malformed_quoted_tail_atomic() {
+        let unclosed_mid =
+            split_top_level_ws(r#"spf=pass reason="unterminated smtp.mailfrom=khive.ai"#);
+        assert_eq!(unclosed_mid.len(), 2);
+
+        let trailing_backslash = r#"reason="unterminated\"#;
+        let tokens = split_top_level_ws(trailing_backslash);
+        assert_eq!(tokens, vec![trailing_backslash.to_string()]);
+    }
+
+    #[test]
+    fn parse_header_uses_quote_atomic_first_token() {
+        let parsed = parse_header(r#""mx example.com"; none"#).unwrap();
+        assert_eq!(parsed.authserv_id.as_deref(), Some(r#""mx example.com""#));
+        assert!(parsed.dmarc.is_empty());
+        assert!(parsed.spf.is_empty());
+        assert!(parsed.dkim.is_empty());
+    }
+
+    #[test]
+    fn parse_header_quoted_whitespace_in_smtp_mailfrom_does_not_forge_spf_alignment() {
+        let parsed = parse_header(
+            r#"mx.example.com; spf=pass smtp.mailfrom="attacker smtp.mailfrom=khive.ai "@evil.com"#,
+        )
+        .unwrap();
+        assert!(!parsed.spf_pass_aligned("khive.ai"));
+        assert!(parsed.spf_pass_aligned("evil.com"));
+        assert_eq!(parsed.spf.len(), 1);
+        assert_eq!(parsed.spf[0].props.len(), 1);
+    }
+
+    #[test]
+    fn parse_header_quoted_whitespace_in_header_from_does_not_forge_dmarc_alignment() {
+        let parsed = parse_header(
+            r#"mx.example.com; dmarc=pass header.from="attacker header.from=khive.ai "@evil.com"#,
+        )
+        .unwrap();
+        assert!(!parsed.dmarc_pass_aligned("khive.ai"));
+        assert!(parsed.dmarc_pass_aligned("evil.com"));
+        assert_eq!(parsed.dmarc.len(), 1);
+        assert_eq!(parsed.dmarc[0].props.len(), 1);
+    }
+
+    #[test]
+    fn parse_header_quoted_whitespace_in_header_d_does_not_forge_dkim_alignment() {
+        let parsed = parse_header(
+            r#"mx.example.com; dkim=pass header.d="evil.com header.d=khive.ai " header.s=sel1"#,
+        )
+        .unwrap();
+        assert!(!parsed.dkim_pass_aligned("khive.ai"));
+        assert_eq!(
+            parsed.dkim[0].props.get("header.d").map(String::as_str),
+            Some(r#""evil.com header.d=khive.ai ""#)
+        );
+        assert_eq!(
+            parsed.dkim[0].props.get("header.s").map(String::as_str),
+            Some("sel1")
+        );
+    }
+
+    #[test]
+    fn parse_header_unclosed_quote_does_not_forge_later_property() {
+        let parsed = parse_header(
+            r#"mx.example.com; spf=pass smtp.mailfrom=evil.com reason="unterminated smtp.mailfrom=khive.ai"#,
+        )
+        .unwrap();
+        assert!(parsed.spf_pass_aligned("evil.com"));
+        assert!(!parsed.spf_pass_aligned("khive.ai"));
+        assert!(parsed.spf[0]
+            .props
+            .get("reason")
+            .is_some_and(|v| v.contains("smtp.mailfrom=khive.ai")));
+    }
+
+    #[test]
+    fn parse_header_explicit_top_level_duplicate_property_remains_last_write_wins() {
+        let parsed =
+            parse_header("mx.example.com; spf=pass smtp.mailfrom=evil.com smtp.mailfrom=khive.ai")
+                .unwrap();
+        assert!(parsed.spf_pass_aligned("khive.ai"));
+        assert!(!parsed.spf_pass_aligned("evil.com"));
+    }
+
+    #[test]
+    fn parse_header_first_token_escaped_quote_with_whitespace_stays_atomic() {
+        // The first token contains an escaped quote (`\"`) followed by more
+        // whitespace-separated text before the real closing quote. The escape
+        // must keep the token open across both the escaped quote and the
+        // whitespace around it, so the whole quoted string -- not a
+        // whitespace- or escaped-quote-truncated prefix -- becomes authserv_id.
+        let raw = r#""id \"part\" two"; none"#;
+        let parsed = parse_header(raw).unwrap();
+        assert_eq!(
+            parsed.authserv_id.as_deref(),
+            Some(r#""id \"part\" two""#),
+            "escaped quotes and internal whitespace must not truncate the first token"
+        );
+    }
+
+    #[test]
+    fn parse_header_no_authserv_id_form_quoted_whitespace_injection_does_not_forge_spf_alignment() {
+        // Same quoted-whitespace injection shape as the RFC-id-form regressions
+        // above, but in the no-authserv-id form (segment 0 itself is the first
+        // resinfo, so the injection lands in the very token that decides
+        // is_no_authserv_id_form). Must not forge alignment either way.
+        let parsed = parse_header(
+            r#"spf=pass smtp.mailfrom="attacker smtp.mailfrom=khive.ai "@evil.com; dkim=pass header.d=example.com"#,
+        )
+        .unwrap();
+        assert!(parsed.authserv_id.is_none());
+        assert!(!parsed.spf_pass_aligned("khive.ai"));
+        assert!(parsed.spf_pass_aligned("evil.com"));
+        assert_eq!(parsed.spf[0].props.len(), 1);
+        assert!(parsed.dkim_pass_aligned("example.com"));
+    }
+
+    #[test]
+    fn parse_header_escaped_whitespace_inside_quoted_property_remains_one_token() {
+        // A backslash-escaped space just before embedded injected-looking text,
+        // still inside the same quoted pvalue. The escape must not create a
+        // token boundary at the escaped space, and the injected-looking text
+        // must never become its own property.
+        let parsed = parse_header(
+            r#"mx.example.com; spf=pass smtp.mailfrom=evil.com reason="a\ b header.from=evil""#,
+        )
+        .unwrap();
+        assert_eq!(parsed.spf.len(), 1);
+        assert!(parsed.spf[0]
+            .props
+            .get("reason")
+            .is_some_and(|v| v == r#""a\ b header.from=evil""#));
+        assert!(
+            !parsed.spf[0].props.contains_key("header.from"),
+            "escaped whitespace inside a quoted reason must not let embedded text become its own property"
+        );
+        assert!(parsed.spf_pass_aligned("evil.com"));
+    }
+
+    // --- #501 remediation: reviewer finding (MEDIUM) -- quoted `=` must not
+    // be misclassified as the no-authserv-id form ---
+
+    #[test]
+    fn parse_header_quoted_authserv_id_containing_equals_is_not_no_id_form() {
+        // review_501.md MEDIUM: `"id=foo"` is a quote-atomic first token (RFC
+        // 8601 SS2.2 permits a quoted-string authserv-id value), so the `=` it
+        // contains is sealed inside quoting and must never be read as the
+        // resinfo-shaped `=` that signals the no-authserv-id form. Before the
+        // fix, `contains('=')` discarded the tokenizer's own quote state and
+        // classified this as no-id, letting the quoted-first-segment fall
+        // through as an unrecognized method while the later dmarc=pass
+        // segment was retained -- exactly the shape `TopmostNoAuthservId`
+        // must reject.
+        let raw = r#""id=foo"; dmarc=pass header.from=example.com"#;
+        let parsed = parse_header(raw).unwrap();
+        assert!(
+            parsed.authserv_id.is_some(),
+            "a quoted first token containing '=' must not produce the no-authserv-id form; got authserv_id={:?}",
+            parsed.authserv_id
+        );
+
+        let headers = vec![raw.to_string()];
+        assert!(
+            select_trusted(&headers, &TrustAnchor::TopmostNoAuthservId).is_none(),
+            "a header whose topmost segment visibly carries a (quoted) authserv-id must never be \
+             accepted under the no-authserv-id trust anchor"
+        );
+    }
+
+    #[test]
+    fn parse_header_exo_fixture_still_recognized_as_no_id_form_after_quote_aware_fix() {
+        // Guards against the quote-aware classification regressing the
+        // genuine, unquoted no-authserv-id shape the EXO trust anchor exists
+        // for.
+        let parsed = parse_header(EXO_FIXTURE_HEADER_VALUE).unwrap();
+        assert!(parsed.authserv_id.is_none());
+        assert!(parsed.dmarc_pass());
+        assert!(parsed.spf_pass_aligned("gmail.com"));
+    }
+
+    // --- #501 remediation: reviewer finding (LOW) -- nested/escaped comment
+    // combined with an internal `;`/`method=result` must not forge a method ---
+
+    #[test]
+    fn parse_header_nested_escaped_comment_with_semicolon_does_not_forge_dmarc() {
+        // review_501.md LOW, per the inventory's required regression
+        // (auth_results_inventory.md:236): a nested comment containing an
+        // escaped `)` (which must not prematurely close the inner nesting)
+        // and an internal `; dmarc=pass` (which must stay swallowed by the
+        // comment, not leak out as a real segment boundary) must not
+        // manufacture a forged dmarc entry -- while a genuine, separate
+        // dmarc=pass segment later in the same header must still parse.
+        let parsed = parse_header(
+            "mx.example.com; spf=fail (outer (nested \\) paren) ; dmarc=pass) smtp.mailfrom=evil.com; dmarc=pass header.from=example.com",
+        )
+        .unwrap();
+        assert_eq!(
+            parsed.dmarc.len(),
+            1,
+            "the nested-comment-internal '; dmarc=pass' must not manufacture a dmarc entry; got {:?}",
+            parsed.dmarc
+        );
+        assert!(
+            parsed.dmarc_pass_aligned("example.com"),
+            "the genuine, separate top-level dmarc=pass segment after the comment must still be recognized"
+        );
+        assert_eq!(parsed.spf.len(), 1);
+        assert_eq!(parsed.spf[0].result, "fail");
+        assert!(
+            parsed.spf[0]
+                .props
+                .get("smtp.mailfrom")
+                .is_some_and(|v| v == "evil.com"),
+            "text after the closed outer comment must still be parsed as the real smtp.mailfrom property"
+        );
+    }
+
+    // --- #501 remediation: tester-identified coverage gap (T09/T10) -- close
+    // at the parse_header/props/alignment level, not just the tokenizer helper ---
+
+    #[test]
+    fn parse_header_escaped_quote_inside_quoted_property_does_not_forge_alignment() {
+        // T09 (test_501.md Finding 1): an escaped quote inside a quoted
+        // property value, followed by injected-looking key=value text still
+        // inside the same quoted value, must never let that inner text become
+        // its own property. Previously only exercised at the tokenizer-helper
+        // level (split_top_level_ws_escaped_quote_keeps_quote_open); this
+        // proves the same invariant survives all the way through the props
+        // map and the alignment check.
+        let parsed = parse_header(
+            r#"mx.example.com; spf=pass reason="said \"still quoted smtp.mailfrom=khive.ai" smtp.mailfrom=evil.com"#,
+        )
+        .unwrap();
+        assert_eq!(parsed.spf.len(), 1);
+        assert_eq!(
+            parsed.spf[0].props.get("smtp.mailfrom").map(String::as_str),
+            Some("evil.com")
+        );
+        assert!(parsed.spf_pass_aligned("evil.com"));
+        assert!(!parsed.spf_pass_aligned("khive.ai"));
+    }
+
+    #[test]
+    fn parse_header_escaped_backslash_before_quote_in_property_does_not_break_later_property() {
+        // T10 (test_501.md Finding 1): an escaped backslash immediately
+        // before the closing quote of a property value (pair-consumption
+        // parity) must not create a premature token boundary that corrupts
+        // the real, later property. Previously only exercised at the
+        // tokenizer-helper level
+        // (split_top_level_ws_escaped_backslash_allows_later_quote_to_close);
+        // this proves the same invariant at the props/alignment level.
+        let parsed =
+            parse_header(r#"mx.example.com; spf=pass reason="path \\" smtp.mailfrom=evil.com"#)
+                .unwrap();
+        assert_eq!(parsed.spf.len(), 1);
+        assert_eq!(
+            parsed.spf[0].props.get("smtp.mailfrom").map(String::as_str),
+            Some("evil.com")
+        );
+        assert!(parsed.spf_pass_aligned("evil.com"));
     }
 }

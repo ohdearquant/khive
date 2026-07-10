@@ -1395,3 +1395,109 @@ async fn update_entity_with_note_field_salience_returns_error() {
         "entity name must be unchanged after rejected update"
     );
 }
+
+// ── #764: create's embedding_content wiring ─────────────────────────────────
+
+/// A note create with a proper-prefix `embedding_content` must succeed and
+/// store the full `content`; the override is a runtime-layer concern
+/// (covered by `khive-runtime`'s own unit tests) — this proves the handler
+/// forwards the field rather than dropping or misrouting it.
+#[tokio::test]
+async fn create_note_forwards_embedding_content_and_stores_full_content() {
+    use crate::KgPack;
+    use khive_runtime::{KhiveRuntime, Namespace, VerbRegistryBuilder};
+
+    let rt = KhiveRuntime::memory().expect("in-memory runtime");
+    let mut builder = VerbRegistryBuilder::new();
+    builder.register(KgPack::new(rt.clone()));
+    let registry = builder.build().expect("registry build");
+    let _token = rt.authorize(Namespace::local()).expect("authorize local");
+
+    let full = "head sentinel plus a long tail sentinel beyond any cap";
+    let head = &full[.."head sentinel".len()];
+
+    let resp = registry
+        .dispatch(
+            "create",
+            json!({
+                "kind": "observation",
+                "content": full,
+                "embedding_content": head,
+            }),
+        )
+        .await
+        .expect("proper-prefix embedding_content must be accepted");
+    assert_eq!(
+        resp["content"], full,
+        "stored content must be the full text"
+    );
+}
+
+/// `embedding_content` is only meaningful for a singleton `kind=note` create;
+/// supplying it alongside an entity kind must be rejected before any write.
+#[tokio::test]
+async fn create_entity_rejects_embedding_content() {
+    use crate::KgPack;
+    use khive_runtime::{KhiveRuntime, Namespace, VerbRegistryBuilder};
+
+    let rt = KhiveRuntime::memory().expect("in-memory runtime");
+    let mut builder = VerbRegistryBuilder::new();
+    builder.register(KgPack::new(rt.clone()));
+    let registry = builder.build().expect("registry build");
+    let _token = rt.authorize(Namespace::local()).expect("authorize local");
+
+    let err = registry
+        .dispatch(
+            "create",
+            json!({
+                "kind": "project",
+                "name": "should-not-be-created",
+                "embedding_content": "irrelevant",
+            }),
+        )
+        .await
+        .expect_err("embedding_content on an entity create must be rejected");
+    assert!(
+        format!("{err}").contains("embedding_content"),
+        "error must name the offending field: {err}"
+    );
+
+    let list = registry
+        .dispatch("list", json!({"kind": "project", "limit": 10}))
+        .await
+        .expect("list ok");
+    assert_eq!(
+        list.as_array().expect("array").len(),
+        0,
+        "rejected create must leave no entity behind"
+    );
+}
+
+/// `embedding_content` is not supported for bulk `items` create — supplying
+/// it at the top level alongside `items` must be rejected before any write.
+#[tokio::test]
+async fn create_bulk_items_rejects_top_level_embedding_content() {
+    use crate::KgPack;
+    use khive_runtime::{KhiveRuntime, Namespace, VerbRegistryBuilder};
+
+    let rt = KhiveRuntime::memory().expect("in-memory runtime");
+    let mut builder = VerbRegistryBuilder::new();
+    builder.register(KgPack::new(rt.clone()));
+    let registry = builder.build().expect("registry build");
+    let _token = rt.authorize(Namespace::local()).expect("authorize local");
+
+    let err = registry
+        .dispatch(
+            "create",
+            json!({
+                "items": [{"kind": "concept", "name": "should-not-be-created"}],
+                "embedding_content": "irrelevant",
+            }),
+        )
+        .await
+        .expect_err("embedding_content alongside bulk items must be rejected");
+    assert!(
+        format!("{err}").contains("embedding_content"),
+        "error must name the offending field: {err}"
+    );
+}
