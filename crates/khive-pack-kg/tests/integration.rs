@@ -7251,6 +7251,46 @@ async fn get_proposal_wire_key_is_id_not_proposal_id() {
     );
 }
 
+/// #773: `get(id=<compact-hex-prefix>)` on an open proposal must resolve via
+/// `proposals_open`'s own `LIKE` scan (get.rs:181), independent of the
+/// `resolve_prefix_inner` fan-in point. Before the fix, any compact prefix
+/// longer than 8 chars structurally could not match the hyphenated
+/// `proposal_id` column.
+#[tokio::test]
+async fn get_proposal_by_compact_hex_prefix_over_8_chars() {
+    let f = pack_with_events();
+
+    let propose_result = f
+        .dispatch(
+            "propose",
+            json!({
+                "title": "CompactPrefixProposalTest",
+                "description": "get must resolve a >8-char compact prefix",
+                "changeset": changeset_add_entity(),
+            }),
+        )
+        .await
+        .expect("propose must succeed");
+    let pid = propose_result["id"]
+        .as_str()
+        .expect("propose must return id")
+        .to_string();
+
+    let compact = pid.replace('-', "");
+    let prefix = &compact[..16];
+
+    let get_result = f
+        .dispatch("get", json!({ "id": prefix }))
+        .await
+        .expect("get must resolve the proposal via compact prefix");
+
+    assert_eq!(
+        get_result.get("id").and_then(|v| v.as_str()),
+        Some(pid.as_str()),
+        "get(id=<compact prefix>) must resolve to the proposal; got {get_result}"
+    );
+}
+
 /// review(id=..., proposal_id=...) must be rejected by #[serde(deny_unknown_fields)].
 ///
 /// ReviewParams declares `id` (required) with deny_unknown_fields — `proposal_id` is

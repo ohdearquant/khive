@@ -180,6 +180,28 @@ pub struct NoteSearchHit {
     pub snippet: Option<String>,
 }
 
+/// Re-insert hyphens at canonical UUID positions (8-4-4-4-12) into a
+/// hyphen-free hex prefix, so a `LIKE '<pattern>%'` scan against the
+/// hyphenated `id` column matches correctly (#773). Prefixes that already
+/// contain a hyphen are passed through unchanged. No-op for len <= 8
+/// (already correct). Truncates at 32 hex chars (a full UUID); longer input
+/// is the caller's problem (still hex-only per the existing acceptance
+/// gate).
+pub fn hex_prefix_to_uuid_pattern(prefix: &str) -> String {
+    if prefix.contains('-') {
+        return prefix.to_string();
+    }
+    const BOUNDARIES: [usize; 4] = [8, 13, 18, 23]; // post-hyphen-insertion offsets
+    let mut out = String::with_capacity(36);
+    for c in prefix.chars().take(32) {
+        if BOUNDARIES.contains(&out.len()) {
+            out.push('-');
+        }
+        out.push(c);
+    }
+    out
+}
+
 fn text_preview(text: &str, max_chars: usize) -> Option<String> {
     let trimmed = text.trim();
     if trimmed.is_empty() {
@@ -3176,7 +3198,7 @@ impl KhiveRuntime {
     ) -> RuntimeResult<Option<Uuid>> {
         use khive_storage::types::{SqlStatement, SqlValue};
 
-        let pattern = format!("{}%", prefix);
+        let pattern = format!("{}%", hex_prefix_to_uuid_pattern(prefix));
 
         let tables = [
             ("entities", true),
@@ -6442,6 +6464,149 @@ mod tests {
 
         let resolved = rt.resolve_prefix(&tok, prefix).await.unwrap();
         assert_eq!(resolved, Some(entity.id));
+    }
+
+    #[test]
+    fn hex_prefix_to_uuid_pattern_inserts_hyphens_at_canonical_boundaries() {
+        let full = "aabbccdd112240008000000000000ab1";
+        let cases: &[(usize, &str)] = &[
+            (1, "a"),
+            (7, "aabbccd"),
+            (8, "aabbccdd"),
+            (9, "aabbccdd-1"),
+            (12, "aabbccdd-1122"),
+            (13, "aabbccdd-1122-4"),
+            (16, "aabbccdd-1122-4000"),
+            (18, "aabbccdd-1122-4000-80"),
+            (20, "aabbccdd-1122-4000-8000"),
+            (23, "aabbccdd-1122-4000-8000-000"),
+            (24, "aabbccdd-1122-4000-8000-0000"),
+            (28, "aabbccdd-1122-4000-8000-00000000"),
+            (31, "aabbccdd-1122-4000-8000-000000000ab"),
+        ];
+        for (len, expected) in cases {
+            let input = &full[..*len];
+            assert_eq!(
+                hex_prefix_to_uuid_pattern(input),
+                *expected,
+                "len={len} input={input:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn hex_prefix_to_uuid_pattern_full_32_char_matches_canonical_uuid() {
+        let compact = "aabbccdd112240008000000000000ab1";
+        // 32 hex chars only (truncate any extras beyond a full UUID).
+        let compact32 = &compact[..32];
+        assert_eq!(
+            hex_prefix_to_uuid_pattern(compact32),
+            "aabbccdd-1122-4000-8000-000000000ab1"
+        );
+    }
+
+    #[test]
+    fn hex_prefix_to_uuid_pattern_passes_through_hyphenated_input() {
+        let hyphenated = "aabbccdd-1122-4000-8000-000000000ab1";
+        assert_eq!(hex_prefix_to_uuid_pattern(hyphenated), hyphenated);
+
+        let partial = "aabbccdd-11";
+        assert_eq!(hex_prefix_to_uuid_pattern(partial), partial);
+    }
+
+    #[tokio::test]
+    async fn resolve_prefix_compact_9_to_31_char_matches() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+        let entity = rt
+            .create_entity(
+                &tok,
+                "concept",
+                None,
+                "CompactPrefixTest",
+                None,
+                None,
+                vec![],
+            )
+            .await
+            .unwrap();
+        let compact = entity.id.simple().to_string();
+
+        for len in [9, 12, 16, 20, 24, 28, 31] {
+            let prefix = &compact[..len];
+            let resolved = rt.resolve_prefix(&tok, prefix).await.unwrap();
+            assert_eq!(
+                resolved,
+                Some(entity.id),
+                "compact prefix of len {len} should resolve"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn resolve_prefix_compact_full_32_char_matches() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+        let entity = rt
+            .create_entity(&tok, "concept", None, "Full32Test", None, None, vec![])
+            .await
+            .unwrap();
+        let compact = entity.id.simple().to_string();
+        assert_eq!(compact.len(), 32);
+
+        let resolved = rt.resolve_prefix(&tok, &compact).await.unwrap();
+        assert_eq!(resolved, Some(entity.id));
+    }
+
+    #[tokio::test]
+    async fn resolve_prefix_boundary_at_hyphen_positions() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+        let entity = rt
+            .create_entity(&tok, "concept", None, "BoundaryTest", None, None, vec![])
+            .await
+            .unwrap();
+        let compact = entity.id.simple().to_string();
+
+        for len in [8, 12, 16, 20, 24] {
+            let prefix = &compact[..len];
+            let resolved = rt.resolve_prefix(&tok, prefix).await.unwrap();
+            assert_eq!(
+                resolved,
+                Some(entity.id),
+                "boundary prefix of len {len} should resolve"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn resolve_prefix_ambiguous_still_detected_after_normalization() {
+        use khive_storage::entity::Entity;
+
+        let rt = rt();
+        let tok = NamespaceToken::local();
+        let id_a = Uuid::parse_str("aabbccdd-1111-4000-8000-000000000001").unwrap();
+        let id_b = Uuid::parse_str("aabbccdd-1111-4000-8000-000000000002").unwrap();
+
+        let mut entity_a = Entity::new("local", "concept", "AmbigCompactA");
+        entity_a.id = id_a;
+        let mut entity_b = Entity::new("local", "concept", "AmbigCompactB");
+        entity_b.id = id_b;
+
+        let store = rt.entities(&tok).unwrap();
+        store.upsert_entity(entity_a).await.unwrap();
+        store.upsert_entity(entity_b).await.unwrap();
+
+        // Shared 20-char compact prefix (past the first hyphen boundary).
+        let shared_compact = &id_a.simple().to_string()[..20];
+        let err = rt.resolve_prefix(&tok, shared_compact).await.unwrap_err();
+        assert!(
+            matches!(
+                err,
+                RuntimeError::AmbiguousPrefix { ref matches, .. } if matches.len() == 2
+            ),
+            "shared compact prefix must still return AmbiguousPrefix; got {err:?}"
+        );
     }
 
     #[tokio::test]

@@ -5,7 +5,9 @@ use std::str::FromStr;
 use serde_json::Value;
 use uuid::Uuid;
 
-use khive_runtime::{NamespaceToken, Resolved, RuntimeError, VerbRegistry};
+use khive_runtime::{
+    hex_prefix_to_uuid_pattern, NamespaceToken, Resolved, RuntimeError, VerbRegistry,
+};
 use khive_storage::event::Event;
 use khive_storage::types::{SqlRow, SqlStatement, SqlValue};
 use khive_types::EventKind;
@@ -179,7 +181,7 @@ impl KgPack {
                 vec![SqlValue::Text(raw_id.to_string()), SqlValue::Text(ns)],
             )
         } else if raw_id.len() >= 8 && raw_id.chars().all(|c| c.is_ascii_hexdigit()) {
-            let pattern = format!("{}%", raw_id);
+            let pattern = format!("{}%", hex_prefix_to_uuid_pattern(raw_id));
             (
                 "SELECT proposal_id FROM proposals_open \
                  WHERE proposal_id LIKE ?1 AND namespace = ?2 LIMIT 2"
