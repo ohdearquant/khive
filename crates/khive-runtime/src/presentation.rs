@@ -648,6 +648,9 @@ fn parse_tz_offset_secs(tail: &str) -> Option<i64> {
         ),
         _ => return None,
     };
+    if hh > 23 || mm > 59 {
+        return None;
+    }
     Some(sign * (hh * 3600 + mm * 60))
 }
 
@@ -1234,6 +1237,24 @@ mod tests {
         assert_eq!(parse_iso8601_unix("2026-07-09T15:55:00X"), None);
         assert_eq!(parse_iso8601_unix("2026-07-09T15:55:00+04"), None);
         assert_eq!(parse_iso8601_unix("2026-07-09T15:55:00."), None);
+    }
+
+    #[test]
+    fn parse_iso8601_unix_out_of_range_offset_returns_none() {
+        // Hour out of range (>23), colon and compact forms.
+        assert_eq!(parse_iso8601_unix("2026-07-09T15:55:00+24:00"), None);
+        assert_eq!(parse_iso8601_unix("2026-07-09T15:55:00+2400"), None);
+        // Minute out of range (>59), colon and compact forms.
+        assert_eq!(parse_iso8601_unix("2026-07-09T15:55:00+01:60"), None);
+        assert_eq!(parse_iso8601_unix("2026-07-09T15:55:00+0160"), None);
+    }
+
+    #[test]
+    fn parse_iso8601_unix_max_valid_offset_boundary_is_accepted() {
+        // +23:59 / -23:59 are the largest valid offsets and must still parse.
+        assert!(parse_iso8601_unix("2026-07-09T15:55:00+23:59").is_some());
+        assert!(parse_iso8601_unix("2026-07-09T15:55:00-23:59").is_some());
+        assert!(parse_iso8601_unix("2026-07-09T15:55:00+2359").is_some());
     }
 
     #[test]
