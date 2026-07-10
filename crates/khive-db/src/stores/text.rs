@@ -280,6 +280,232 @@ fn sanitize_fts5_query(query: &str) -> String {
         .join(" ")
 }
 
+/// Legacy (pre-#397) sanitization: hyphen and dot are stripped outright
+/// instead of being space-split, so `khive-pack-memory` normalizes to the
+/// single merged bareword `khivepackmemory` rather than three terms.
+///
+/// Used only to build the merged-form OR-alternative in
+/// [`sanitize_fts5_token_group`] — never as the sole sanitized query. Content
+/// indexed before #397, or under a tokenizer whose own token-splitting rules
+/// collapse punctuation differently than the current space-split pass,  may
+/// still carry this merged token; kept as a fallback match term so those
+/// documents stay reachable.
+fn sanitize_fts5_query_legacy_merged(query: &str) -> String {
+    let spaced: String = query
+        .chars()
+        .map(|c| {
+            if matches!(c, '(' | ')' | ',' | ':') {
+                ' '
+            } else {
+                c
+            }
+        })
+        .collect();
+
+    let sanitized: String = spaced
+        .chars()
+        .filter(|c| {
+            !matches!(
+                c,
+                '*' | '"' | '\'' | '+' | '-' | '^' | '.' | '~' | '!' | '$' | '\0'
+            ) && !c.is_control()
+        })
+        .collect();
+
+    sanitized
+        .split_whitespace()
+        .filter(|t| {
+            !matches!(
+                t.to_ascii_uppercase().as_str(),
+                "AND" | "OR" | "NOT" | "NEAR"
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Strip a raw token down to what is safe inside a double-quoted FTS5 phrase:
+/// the closing delimiter (`"`), the trailing-`*` prefix-query trigger, and
+/// control characters. Everything else — including `-`, `.`, `:`, `$`, `'`,
+/// digits — passes through literally, since FTS5 phrase text is matched
+/// against the column's own tokenization of that literal text (word-exact
+/// under `unicode61`, substring-exact under `trigram`), not re-sanitized.
+///
+/// Returns `None` if nothing survives the filter.
+fn sanitize_fts5_phrase_literal(token: &str) -> Option<String> {
+    let literal: String = token
+        .chars()
+        .filter(|c| !matches!(c, '"' | '*' | '\0') && !c.is_control())
+        .collect();
+    if literal.is_empty() {
+        None
+    } else {
+        Some(literal)
+    }
+}
+
+/// Below this length, FTS5's built-in `trigram` tokenizer (the production
+/// default — `backend.rs::StorageBackend::text()`) produces zero tokens for
+/// a bareword MATCH term. Verified against a live `tokenize='trigram'`
+/// table: a term this short silently drops out of its AND clause instead of
+/// constraining the match, e.g. `2026 07 10` matches any row containing
+/// `2026` regardless of month/day. `sanitize_fts5_token_group` treats any
+/// split segment at or below this length as trigram-unsafe.
+const FTS5_TRIGRAM_MIN_SAFE_LEN: usize = 3;
+
+/// Sanitize a single whitespace-isolated raw token into an FTS5
+/// match-expression fragment.
+///
+/// #397 split punctuated identifiers (`khive-pack-memory` -> three terms
+/// `khive pack memory`, ANDed together) so they are searchable as distinct
+/// words. That is correct against content indexed with word-splitting
+/// tokenizers (`unicode61`, and multi-word `trigram` content where each
+/// word is long enough to trigram on its own), but two more cases need
+/// covering when punctuation actually causes a split:
+///
+/// - a query for content that only ever matched the pre-#397 merged
+///   bareword (`khivepackmemory`) would silently stop matching — kept
+///   reachable via the legacy-merged alternative.
+/// - under the production `trigram` tokenizer, a split segment shorter
+///   than [`FTS5_TRIGRAM_MIN_SAFE_LEN`] (e.g. the `07`/`10` in a
+///   `2026-07-10` date) tokenizes to zero trigrams and silently drops out
+///   of its AND clause, broadening the match to anything sharing the
+///   longer segment (any `2026`, not just that date). Neither the plain
+///   split AND-group nor the merged form avoids this — both were checked
+///   empirically against a live `tokenize='trigram'` table and both either
+///   broaden or simply fail to match. The fix that does work is a literal
+///   phrase-quoted alternative: FTS5 matches it by exact substring under
+///   `trigram` (confirmed: quoting `"2026-07-10"` discriminates the exact
+///   day) and by exact adjacent sub-tokens under word tokenizers. So when
+///   any split segment is trigram-unsafe, the split AND-group is dropped
+///   entirely rather than paired with the merged/phrase alternatives — an
+///   OR would still admit its broadened matches. Retrieval stays correct
+///   (still matches the right content, still discriminates) at the cost of
+///   requiring adjacency for that token, which is the trade-off intended
+///   by the finding this fixes (khive #397 Finding 2): correctness over a
+///   marginally more lenient match.
+///
+/// All emitted readings are additive OR-alternatives otherwise — the result
+/// is never a narrower match than any single (safe) form alone.
+///
+/// Returns `None` if the token sanitizes to nothing.
+fn sanitize_fts5_token_group(token: &str) -> Option<String> {
+    let split = sanitize_fts5_query(token);
+    let split_terms: Vec<&str> = split.split_whitespace().collect();
+    if split_terms.is_empty() {
+        return None;
+    }
+    if split_terms.len() == 1 {
+        return Some(split_terms[0].to_string());
+    }
+
+    let has_trigram_unsafe_segment = split_terms
+        .iter()
+        .any(|t| t.chars().count() < FTS5_TRIGRAM_MIN_SAFE_LEN);
+
+    let mut alternatives = Vec::new();
+    if !has_trigram_unsafe_segment {
+        alternatives.push(format!("({})", split_terms.join(" ")));
+    }
+
+    let merged = sanitize_fts5_query_legacy_merged(token);
+    if !merged.is_empty() && merged != split_terms.join("") {
+        alternatives.push(merged);
+    }
+
+    if let Some(phrase) = sanitize_fts5_phrase_literal(token) {
+        alternatives.push(format!("\"{}\"", phrase));
+    }
+
+    match alternatives.len() {
+        0 => Some(format!("({})", split_terms.join(" "))),
+        1 => alternatives.into_iter().next(),
+        _ => Some(format!("({})", alternatives.join(" OR "))),
+    }
+}
+
+/// Join Plain-mode per-token groups into one MATCH expression.
+///
+/// FTS5's implicit-AND adjacency rule (a bare space between two terms)
+/// applies only between two *plain* terms — verified against a live table:
+/// `GQA KV cache` (all bare) matches, but `GQA AND KV AND cache` does not,
+/// because FTS5's explicit `AND` treats a trigram-unsafe short bareword
+/// (`KV`, 2 chars, zero trigrams) as an unsatisfiable operand, while
+/// implicit adjacency instead lets it drop out harmlessly. So: use a bare
+/// space between two plain (unparenthesized) groups to preserve that
+/// existing leniency, and fall back to explicit `AND` only where at least
+/// one side is a parenthesized OR-group (`sanitize_fts5_token_group`'s
+/// output for punctuated tokens) — adjacency there without the operator is
+/// a MATCH-expression syntax error (`(a OR b) c` fails; `(a OR b) AND c`
+/// does not).
+fn join_plain_groups(groups: &[String]) -> String {
+    let mut expr = String::new();
+    for (i, group) in groups.iter().enumerate() {
+        if i > 0 {
+            let prev_compound = groups[i - 1].starts_with('(');
+            let this_compound = group.starts_with('(');
+            expr.push_str(if prev_compound || this_compound {
+                " AND "
+            } else {
+                " "
+            });
+        }
+        expr.push_str(group);
+    }
+    expr
+}
+
+/// Build the FTS5 MATCH expression for a query string under a given mode.
+///
+/// Centralizes the AnyTerm/Plain/Phrase branching previously duplicated
+/// across `search()`, `search_unranked()`, and `search_rank_within_cap()`.
+///
+/// AnyTerm and Plain both process the query token-by-token (split on
+/// whitespace) through [`sanitize_fts5_token_group`], so a punctuated
+/// identifier anywhere in the query gets its split/merged OR-alternative;
+/// AnyTerm joins the per-token groups with `OR`; Plain joins them via
+/// [`join_plain_groups`] (implicit-AND space where safe, explicit `AND`
+/// where a group is parenthesized). Phrase mode keeps the single-string
+/// literal behavior — a double-quoted FTS5 phrase cannot contain
+/// `OR`/parenthesized groups.
+///
+/// Returns `None` when the sanitized query is empty (caller short-circuits
+/// to an empty result set rather than sending an invalid MATCH expression).
+fn build_match_expr(query: &str, mode: TextQueryMode) -> Option<String> {
+    match mode {
+        TextQueryMode::AnyTerm => {
+            let groups: Vec<String> = query
+                .split_whitespace()
+                .filter_map(sanitize_fts5_token_group)
+                .collect();
+            if groups.is_empty() {
+                None
+            } else {
+                Some(groups.join(" OR "))
+            }
+        }
+        TextQueryMode::Plain => {
+            let groups: Vec<String> = query
+                .split_whitespace()
+                .filter_map(sanitize_fts5_token_group)
+                .collect();
+            if groups.is_empty() {
+                None
+            } else {
+                Some(join_plain_groups(&groups))
+            }
+        }
+        TextQueryMode::Phrase => {
+            let sanitized = sanitize_fts5_query(query);
+            if sanitized.is_empty() {
+                None
+            } else {
+                Some(format!("\"{}\"", sanitized))
+            }
+        }
+    }
+}
+
 /// Build a WHERE clause fragment and params for a `TextFilter`.
 ///
 /// Returns `(clause, params)` where clause is empty if no filters are active.
@@ -636,32 +862,9 @@ impl TextSearch for Fts5TextSearch {
         let table = self.table_name.clone();
 
         self.with_reader("fts_search", move |conn| {
-            let match_expr = match request.mode {
-                TextQueryMode::AnyTerm => {
-                    // Sanitize each token independently so the OR joiner isn't
-                    // stripped by sanitize_fts5_query's keyword filter.
-                    let parts: Vec<String> = request
-                        .query
-                        .split_whitespace()
-                        .map(sanitize_fts5_query)
-                        .filter(|t| !t.is_empty())
-                        .collect();
-                    if parts.is_empty() {
-                        return Ok(Vec::new());
-                    }
-                    parts.join(" OR ")
-                }
-                _ => {
-                    let sanitized = sanitize_fts5_query(&request.query);
-                    if sanitized.is_empty() {
-                        return Ok(Vec::new());
-                    }
-                    match request.mode {
-                        TextQueryMode::Phrase => format!("\"{}\"", sanitized),
-                        TextQueryMode::Plain => sanitized,
-                        TextQueryMode::AnyTerm => unreachable!(),
-                    }
-                }
+            let match_expr = match build_match_expr(&request.query, request.mode) {
+                Some(expr) => expr,
+                None => return Ok(Vec::new()),
             };
 
             // Snippet column index 3 = body in the FTS5 schema.
@@ -948,20 +1151,6 @@ impl Fts5TextSearch {
         ((n - f + 0.5) / (f + 0.5) + 1.0).ln()
     }
 
-    /// Build the OR match expression from a query string (shared logic).
-    fn build_any_term_expr(query: &str) -> Option<String> {
-        let parts: Vec<String> = query
-            .split_whitespace()
-            .map(sanitize_fts5_query)
-            .filter(|t| !t.is_empty())
-            .collect();
-        if parts.is_empty() {
-            None
-        } else {
-            Some(parts.join(" OR "))
-        }
-    }
-
     /// Gather candidates without BM25 ranking; return with uniform score 1.0.
     async fn search_unranked(
         &self,
@@ -970,22 +1159,9 @@ impl Fts5TextSearch {
         let table = self.table_name.clone();
 
         self.with_reader("fts_search_unranked", move |conn| {
-            let match_expr = match request.mode {
-                TextQueryMode::AnyTerm => match Self::build_any_term_expr(&request.query) {
-                    Some(e) => e,
-                    None => return Ok(Vec::new()),
-                },
-                _ => {
-                    let sanitized = sanitize_fts5_query(&request.query);
-                    if sanitized.is_empty() {
-                        return Ok(Vec::new());
-                    }
-                    match request.mode {
-                        TextQueryMode::Phrase => format!("\"{}\"", sanitized),
-                        TextQueryMode::Plain => sanitized,
-                        TextQueryMode::AnyTerm => unreachable!(),
-                    }
-                }
+            let match_expr = match build_match_expr(&request.query, request.mode) {
+                Some(expr) => expr,
+                None => return Ok(Vec::new()),
             };
 
             let (filter_clause, filter_params) = if let Some(ref filter) = request.filter {
@@ -1052,22 +1228,9 @@ impl Fts5TextSearch {
         let table = self.table_name.clone();
 
         self.with_reader("fts_search_rank_within_cap", move |conn| {
-            let match_expr = match request.mode {
-                TextQueryMode::AnyTerm => match Self::build_any_term_expr(&request.query) {
-                    Some(e) => e,
-                    None => return Ok(Vec::new()),
-                },
-                _ => {
-                    let sanitized = sanitize_fts5_query(&request.query);
-                    if sanitized.is_empty() {
-                        return Ok(Vec::new());
-                    }
-                    match request.mode {
-                        TextQueryMode::Phrase => format!("\"{}\"", sanitized),
-                        TextQueryMode::Plain => sanitized,
-                        TextQueryMode::AnyTerm => unreachable!(),
-                    }
-                }
+            let match_expr = match build_match_expr(&request.query, request.mode) {
+                Some(expr) => expr,
+                None => return Ok(Vec::new()),
             };
 
             let (filter_clause, filter_params) = if let Some(ref filter) = request.filter {
