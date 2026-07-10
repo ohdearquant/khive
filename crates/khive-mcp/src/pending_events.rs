@@ -288,7 +288,7 @@ pub async fn run_pending_events_on(
             let (sql, params): (String, Vec<SqlValue>) = match &cursor {
                 //
                 // The due-ness predicate compares via SQLite's `datetime()`,
-                // not a raw string `<=` (Ocean review, High finding): stored
+                // not a raw string `<=` (PR #782 review round 3, High finding): stored
                 // `trigger_at` values are NOT normalized to UTC —
                 // `khive-pack-schedule`'s `handle_remind`/`handle_schedule`
                 // deliberately round-trip the caller's original string
@@ -1047,7 +1047,7 @@ async fn discover_pending_namespaces(rt: &KhiveRuntime, now: DateTime<Utc>) -> R
     // candidate scan below, not the final due-ness decision — but a
     // namespace excluded HERE never reaches that scan at all, so it must be
     // held to the same correctness bar as the candidate-page queries
-    // (`datetime(...)` normalization, Ocean review High finding): comparing
+    // (`datetime(...)` normalization, PR #782 review round 3 High finding): comparing
     // `trigger_at` against `now` as raw TEXT is only chronologically correct
     // when every stored string happens to share `now`'s UTC offset.
     // `khive-pack-schedule` round-trips the caller's original `trigger_at`
@@ -1407,7 +1407,7 @@ mod tests {
     }
 
     /// A due event whose `trigger_at` carries a POSITIVE offset must still
-    /// fire (Ocean review, High finding).
+    /// fire (PR #782 review round 3, High finding).
     ///
     /// `khive-pack-schedule` round-trips the caller's original `trigger_at`
     /// string verbatim, offset included (H5) — it is never normalized to
@@ -1471,7 +1471,7 @@ mod tests {
     /// `datetime(...)` normalization correctly excludes it from the
     /// candidate page; even if it were fetched, the retained Rust-side
     /// `trigger_at > now` re-check is the belt-and-suspenders backstop that
-    /// already made this direction benign before the SQL fix (Ocean review:
+    /// already made this direction benign before the SQL fix (PR #782 review round 3:
     /// "Negative-offset strings produce false POSITIVES, which the retained
     /// Rust re-check filters — benign").
     #[tokio::test]
