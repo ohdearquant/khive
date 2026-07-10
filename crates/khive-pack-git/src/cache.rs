@@ -181,7 +181,12 @@ pub fn ensure_clone(canonical_url: &str) -> Result<PathBuf, CacheError> {
 /// trusting the existing (possibly promisor-incomplete) object store,
 /// repairing a partial/pruned clone in place. Only ever operates on an
 /// existing slot -- callers repair a slot only after a prior `ensure_clone`
-/// already produced one.
+/// already produced one. Re-checks `is_owned_entry` immediately before
+/// fetching (review round-3 [High]-1, issue #765 follow-up PR #788): the
+/// gap between `ensure_clone`'s own ownership check and this repair running
+/// -- project resolution and GitHub ingestion happen in between -- is wide
+/// enough for the slot to go markerless or be replaced, so this function
+/// cannot rely on the caller having checked recently.
 pub(crate) fn refetch_clone(canonical_url: &str) -> Result<PathBuf, CacheError> {
     let root = scratch_root();
     let key = cache_key(canonical_url);
@@ -191,6 +196,22 @@ pub(crate) fn refetch_clone(canonical_url: &str) -> Result<PathBuf, CacheError> 
             "refetch requested for {canonical_url:?} but no cache slot exists at {}",
             repo_dir.display()
         )));
+    }
+    // Re-check ownership immediately before mutating the slot (review
+    // round-3 [High]-1, issue #765 follow-up PR #788): the caller's own
+    // ownership check (`ensure_clone`, much earlier in `handle_digest`)
+    // happens before project resolution and potentially lengthy GitHub
+    // ingestion, so the slot can go markerless -- or be replaced by a
+    // foreign directory colliding with the cache key -- in that interval.
+    // Without this re-check, `fetch_refetch` below would mutate whatever
+    // sits at `repo_dir` and `touch` would mark it owned, making it eligible
+    // for later deletion. There is no same-key serialization for cache
+    // mutation in this crate today (a concurrent `ensure_clone`/`reclone`
+    // racing this same slot is not otherwise excluded) -- this re-check
+    // narrows the adoption bug but does not close a true concurrent-writer
+    // race.
+    if !is_owned_entry(&repo_dir) {
+        return Err(CacheError::UnsafeToReplace(repo_dir));
     }
 
     fetch_refetch(&repo_dir)?;
@@ -748,7 +769,14 @@ mod tests {
     /// a slot that has lost its `.khive-last-used` marker (simulating a
     /// directory the guard cannot prove it owns) survives over-cap cleanup,
     /// and the caller sees the ownership failure (`UnsafeToReplace`) that
-    /// actually occurred, not a laundered `CloneTooLarge`.
+    /// actually occurred, not a laundered `CloneTooLarge`. Since review
+    /// round-3 [High]-1 added a pre-fetch ownership re-check, this markerless
+    /// slot is now refused before `fetch_refetch` even runs (see
+    /// `refetch_clone_refuses_a_markerless_slot_under_the_cap` below) rather
+    /// than at the over-cap cleanup step this test originally targeted --
+    /// the assertions still hold (`UnsafeToReplace`, slot survives), so this
+    /// remains a valid regression guard for the cleanup path once a slot
+    /// somehow reaches it un-owned.
     #[test]
     fn refetch_clone_over_cap_cleanup_never_deletes_an_unproven_slot() {
         let _guard = ENV_MUTEX.blocking_lock();
@@ -778,6 +806,51 @@ mod tests {
         );
 
         std::env::remove_var("KHIVE_GIT_DIGEST_CLONE_MAX_BYTES");
+        std::env::remove_var("KHIVE_GIT_DIGEST_SCRATCH_ROOT");
+    }
+
+    /// Review round-3 [High]-1 remediation (issue #765 follow-up PR #788):
+    /// `refetch_clone` must refuse a markerless slot *before* ever calling
+    /// `fetch_refetch`, not only on the over-cap cleanup branch the previous
+    /// test exercises. Under the default (non-cap-exceeded) cap, a
+    /// pre-fetch ownership check is the only thing standing between a
+    /// markerless slot and a real fetch: the origin is given fresh history
+    /// so a fetch that ran despite the missing marker would be directly
+    /// observable via a moved `HEAD`.
+    #[test]
+    fn refetch_clone_refuses_a_markerless_slot_under_the_cap() {
+        let _guard = ENV_MUTEX.blocking_lock();
+        let scratch = tempfile::tempdir().expect("tempdir");
+        std::env::set_var("KHIVE_GIT_DIGEST_SCRATCH_ROOT", scratch.path());
+
+        let origin_dir = tempfile::tempdir().expect("tempdir");
+        init_origin_with_one_commit(origin_dir.path());
+        let canonical = origin_dir.path().to_str().unwrap();
+
+        let slot = ensure_clone(canonical).expect("initial ensure_clone");
+        let sentinel_sha = head_sha(&slot);
+        std::fs::remove_file(slot.join(MARKER_FILE)).expect("remove marker");
+
+        // The origin moves on -- if the ownership guard failed to fire and
+        // a real fetch ran, the slot's HEAD would follow.
+        add_commit(origin_dir.path(), "b.txt", "world", "second");
+
+        let err = refetch_clone(canonical)
+            .expect_err("a markerless slot must be refused before any fetch runs");
+        assert!(
+            matches!(err, CacheError::UnsafeToReplace(_)),
+            "expected UnsafeToReplace, got {err:?}"
+        );
+        assert_eq!(
+            head_sha(&slot),
+            sentinel_sha,
+            "no fetch must have run against the markerless slot"
+        );
+        assert!(
+            !slot.join(MARKER_FILE).exists(),
+            "a refused refetch must never (re)write the ownership marker"
+        );
+
         std::env::remove_var("KHIVE_GIT_DIGEST_SCRATCH_ROOT");
     }
 

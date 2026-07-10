@@ -966,3 +966,164 @@ async fn public_verb_refuses_a_symlink_at_the_cache_key_path() {
 
     std::env::remove_var("KHIVE_GIT_DIGEST_SCRATCH_ROOT");
 }
+
+/// Removes the `.git/objects/pack/*` set whose `git verify-pack -v` listing
+/// contains an object of `kind` (e.g. `"commit"`, `"tree"`) -- used to strip
+/// a real partial clone of a specific object class the way pruning or a
+/// dropped promisor push would.
+fn remove_pack_containing_kind(repo: &Path, kind: &str) {
+    let pack_dir = repo.join(".git/objects/pack");
+    let entries = std::fs::read_dir(&pack_dir).expect("read pack dir");
+    for entry in entries.filter_map(|e| e.ok()) {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("pack") {
+            continue;
+        }
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(["verify-pack", "-v"])
+            .arg(&path)
+            .output()
+            .expect("verify-pack");
+        let listing = String::from_utf8_lossy(&out.stdout);
+        let contains_kind = listing
+            .lines()
+            .any(|l| l.split_whitespace().nth(1) == Some(kind));
+        if contains_kind {
+            let base = path.with_extension("");
+            for ext in ["pack", "idx", "promisor", "rev"] {
+                let _ = std::fs::remove_file(base.with_extension(ext));
+            }
+        }
+    }
+}
+
+fn loose_object_path(repo: &Path, sha: &str) -> std::path::PathBuf {
+    repo.join(".git/objects").join(&sha[..2]).join(&sha[2..])
+}
+
+/// Review round-2 [Medium] finding (issue #765 follow-up, PR #788): every
+/// test above proves `RemoteCommitRecovery`'s retry orchestration against a
+/// PATH-shim that scripts a plausible-looking diagnostic string -- none of
+/// them prove `git fetch --refetch` actually restores a missing object in a
+/// genuinely corrupt promisor cache. This test builds a real
+/// `git clone --filter=blob:none` partial clone against a real local
+/// `file://` origin (via the production `cache::ensure_clone`, with
+/// `uploadpack.allowfilter`/`uploadpack.allowanysha1inwant` enabled on the
+/// origin so the filter actually negotiates), writes a real commit-graph so
+/// the corruption is visible to a plain `git log` rather than silently
+/// repaired by git's own on-demand promisor lazy-fetch, then deletes the
+/// pack containing commit objects from the clone AND removes the same
+/// object from the origin -- a genuine, end-to-end missing object, not a
+/// fabricated error string. `git log --name-only` (the exact command
+/// `touched_files` runs) is confirmed to fail for real against this state.
+///
+/// The object is then restored to the origin and `cache::refetch_clone` --
+/// the exact repair primitive `RemoteCommitRecovery::repair` calls for issue
+/// #765 -- is invoked directly against the corrupted slot, and `git log
+/// --name-only` is confirmed to succeed afterward: `git fetch --refetch`
+/// genuinely restored the missing object.
+///
+/// This deliberately does not drive the corruption through the public
+/// `git.digest` verb end-to-end. Doing so requires the real git diagnostic
+/// to satisfy `GitLogError::is_missing_promisor_object`'s narrow `"promisor"`
+/// keyword match (deliberately narrow by design -- see that function's own
+/// doc comment, and `does_not_classify_bad_object_without_promisor` in
+/// `ingest.rs`). In this environment (git 2.49, a `file://` local origin) no
+/// tooling-achievable corruption of this kind produces a genuine,
+/// non-shimmed diagnostic containing that literal word: when the origin
+/// stays reachable throughout, git's own on-demand promisor lazy-fetch
+/// silently repairs the missing object before any error ever surfaces
+/// (confirmed while building this fixture); when the origin is made
+/// unreachable instead, the failure is a transport-level message ("bad
+/// object HEAD" / "does not appear to be a git repository") that never
+/// mentions "promisor" either. The real diagnostic this fixture *does*
+/// produce -- "is in the commit graph file but not in the object database"
+/// -- satisfies the classifier's object-missing wording but not its
+/// "promisor" wording, so routing it through `git.digest` would exercise the
+/// unclassified-failure path already covered by
+/// `persistent_corruption_is_bounded_and_never_reports_false_success` above,
+/// not first-call recovery. Calling `cache::refetch_clone` directly is the
+/// closest faithful proof available that the underlying repair primitive
+/// genuinely repairs genuinely corrupt promisor state, without fabricating
+/// an assertion about a diagnostic string this tooling cannot produce for
+/// real.
+#[tokio::test]
+async fn refetch_clone_restores_a_genuinely_missing_promisor_object() {
+    let _env = env_guard().await;
+    let scratch = tempfile::tempdir().expect("scratch root");
+    std::env::set_var("KHIVE_GIT_DIGEST_SCRATCH_ROOT", scratch.path());
+
+    let origin = tempfile::tempdir().expect("origin dir");
+    let origin_path = origin.path();
+    git(origin_path, &["init", "-q", "-b", "main"]);
+    git(origin_path, &["config", "user.email", "test@example.com"]);
+    git(origin_path, &["config", "user.name", "Test User"]);
+    git(origin_path, &["config", "uploadpack.allowfilter", "true"]);
+    git(
+        origin_path,
+        &["config", "uploadpack.allowanysha1inwant", "true"],
+    );
+    std::fs::write(origin_path.join("a.txt"), b"hello").unwrap();
+    git(origin_path, &["add", "a.txt"]);
+    git(origin_path, &["commit", "-q", "-m", "initial"]);
+    let first_sha = head_sha(origin_path);
+    std::fs::write(origin_path.join("b.txt"), b"world").unwrap();
+    git(origin_path, &["add", "b.txt"]);
+    git(origin_path, &["commit", "-q", "-m", "second"]);
+
+    let canonical = format!("file://{}", origin_path.display());
+    let repo_path = cache::ensure_clone(&canonical).expect("real partial clone");
+
+    git(&repo_path, &["commit-graph", "write", "--reachable"]);
+    remove_pack_containing_kind(&repo_path, "commit");
+
+    let origin_obj = loose_object_path(origin_path, &first_sha);
+    let saved = tempfile::NamedTempFile::new().expect("tempfile for saved object");
+    std::fs::copy(&origin_obj, saved.path()).expect("save origin object");
+    std::fs::remove_file(&origin_obj).expect("remove origin object (genuine end-to-end gap)");
+
+    let precondition = Command::new("git")
+        .arg("-C")
+        .arg(&repo_path)
+        .arg("log")
+        .arg("--name-only")
+        .arg("--pretty=format:RS%H")
+        .output()
+        .expect("git log --name-only precondition check");
+    assert!(
+        !precondition.status.success(),
+        "git log --name-only must genuinely fail against the corrupted object database"
+    );
+    let precondition_stderr = String::from_utf8_lossy(&precondition.stderr).to_ascii_lowercase();
+    assert!(
+        precondition_stderr.contains("not in the object database")
+            || precondition_stderr.contains("bad object"),
+        "expected a real corrupt-object diagnostic, got: {precondition_stderr}"
+    );
+
+    // `git fetch --refetch` can only repair a slot from a genuinely intact
+    // remote -- restore the object to the origin before repairing.
+    std::fs::copy(saved.path(), &origin_obj).expect("restore origin object");
+
+    let repaired =
+        cache::refetch_clone(&canonical).expect("refetch_clone must repair the corrupted slot");
+    assert_eq!(repaired, repo_path, "refetch repairs the same cache slot");
+
+    let post_repair = Command::new("git")
+        .arg("-C")
+        .arg(&repaired)
+        .arg("log")
+        .arg("--name-only")
+        .arg("--pretty=format:RS%H")
+        .output()
+        .expect("git log --name-only after refetch");
+    assert!(
+        post_repair.status.success(),
+        "git fetch --refetch must have genuinely restored the missing object: {}",
+        String::from_utf8_lossy(&post_repair.stderr)
+    );
+
+    std::env::remove_var("KHIVE_GIT_DIGEST_SCRATCH_ROOT");
+}
