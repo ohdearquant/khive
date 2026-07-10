@@ -87,6 +87,23 @@ pub struct CompiledQuery {
     pub params: Vec<QueryValue>,
     pub return_vars: Vec<ReturnItem>,
     pub warnings: Vec<String>,
+    /// Present when the server-side `max_limit` cap is the binding
+    /// constraint on this query (no explicit `LIMIT`, or an explicit
+    /// `LIMIT` above the cap). The emitted SQL fetches `max_limit + 1`
+    /// rows (a sentinel row) so the execution site can detect whether the
+    /// true match count exceeded the cap and warn accordingly, instead of
+    /// inferring truncation from the requested `LIMIT` alone (issue #777).
+    pub truncation_check: Option<TruncationCheck>,
+}
+
+/// See [`CompiledQuery::truncation_check`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TruncationCheck {
+    /// The server-side row cap; the execution site truncates to this many
+    /// rows after stripping the sentinel.
+    pub max_limit: usize,
+    /// The caller's explicit `LIMIT`, if any, for warning-message purposes.
+    pub requested_limit: Option<usize>,
 }
 
 /// Runtime options injected by the caller to scope and cap query execution.
@@ -106,6 +123,34 @@ impl Default for CompileOptions {
     }
 }
 
+/// Compute the SQL `LIMIT` to emit and whether the execution site must
+/// perform a cap-sentinel check (issue #777).
+///
+/// When the caller's own `LIMIT` is at or below `max_limit`, the cap never
+/// binds: we fetch exactly what was requested and no truncation is
+/// possible. When there is no explicit `LIMIT`, or the explicit `LIMIT`
+/// exceeds `max_limit`, the cap is the binding constraint — we fetch one
+/// extra row (`max_limit + 1`) so the caller can tell, from the actual
+/// result set, whether there were more matches than the cap allows. This
+/// replaces inferring truncation from the requested `LIMIT` alone, which is
+/// both a false positive (`LIMIT 1000` matching only 20 rows) and a false
+/// negative (no `LIMIT`, 501+ rows actually match).
+fn effective_limit(
+    requested_limit: Option<usize>,
+    max_limit: usize,
+) -> (usize, Option<TruncationCheck>) {
+    match requested_limit {
+        Some(limit) if limit <= max_limit => (limit, None),
+        requested => (
+            max_limit.saturating_add(1),
+            Some(TruncationCheck {
+                max_limit,
+                requested_limit: requested,
+            }),
+        ),
+    }
+}
+
 /// Compile a `GqlQuery` AST to a parameterized SQL string and bound parameters.
 pub fn compile(query: &GqlQuery, opts: &CompileOptions) -> Result<CompiledQuery, QueryError> {
     if query.pattern.elements.is_empty() {
@@ -121,7 +166,7 @@ pub fn compile(query: &GqlQuery, opts: &CompileOptions) -> Result<CompiledQuery,
     } else {
         compile_fixed_length(&query, opts)?
     };
-    compiled.warnings = warnings;
+    compiled.warnings.extend(warnings);
 
     // Defense-in-depth: assert the emitted SQL is SELECT-only.
     // The parsers already reject write-shaped input; this guard ensures a future
@@ -559,7 +604,7 @@ fn compile_fixed_length(
         }
     }
 
-    let limit = query.limit.unwrap_or(opts.max_limit).min(opts.max_limit);
+    let (limit, truncation_check) = effective_limit(query.limit, opts.max_limit);
     let limit_i64 = i64::try_from(limit)
         .map_err(|_| QueryError::InvalidInput("limit exceeds i64::MAX".into()))?;
     params.push(QueryValue::Integer(limit_i64));
@@ -578,6 +623,7 @@ fn compile_fixed_length(
         params,
         return_vars: query.return_items.clone(),
         warnings: Vec::new(),
+        truncation_check,
     })
 }
 
@@ -1136,7 +1182,7 @@ fn compile_variable_length(
         end_conditions.push(format!("t.depth >= ?{}", params.len()));
     }
 
-    let limit = query.limit.unwrap_or(opts.max_limit).min(opts.max_limit);
+    let (limit, truncation_check) = effective_limit(query.limit, opts.max_limit);
     let limit_i64 = i64::try_from(limit)
         .map_err(|_| QueryError::InvalidInput("limit exceeds i64::MAX".into()))?;
     params.push(QueryValue::Integer(limit_i64));
@@ -1310,6 +1356,7 @@ fn compile_variable_length(
         params,
         return_vars: query.return_items.clone(),
         warnings: Vec::new(),
+        truncation_check,
     })
 }
 
@@ -1518,13 +1565,99 @@ mod tests {
 
     #[test]
     fn limit_capped_by_max_limit() {
-        // Query requests 1000, max_limit is 500 — result should be 500
+        // Query requests 1000, max_limit is 500 — the compiler now emits a
+        // sentinel LIMIT of 501 so the execution site can detect and warn on
+        // real truncation (issue #777); the returned rows are still capped
+        // at 500 once the sentinel is stripped at the execution site.
         let q = gql::parse("MATCH (a:concept)-[e]->(b) RETURN a LIMIT 1000").unwrap();
         let compiled = compile(&q, &opts()).unwrap();
         let limit_param = compiled.params.last().unwrap();
         assert!(
-            matches!(limit_param, QueryValue::Integer(500)),
-            "expected Integer(500), got {limit_param:?}"
+            matches!(limit_param, QueryValue::Integer(501)),
+            "expected Integer(501), got {limit_param:?}"
+        );
+    }
+
+    #[test]
+    fn limit_over_cap_requests_sentinel_row() {
+        // LIMIT 1000 against the default max_limit=500 — the cap is binding,
+        // so the compiler must fetch a max_limit+1 sentinel row rather than
+        // inferring truncation from the requested LIMIT alone (issue #777).
+        let q = gql::parse("MATCH (a:concept)-[e]->(b) RETURN a LIMIT 1000").unwrap();
+        let compiled = compile(&q, &opts()).unwrap();
+        assert_eq!(
+            compiled.truncation_check,
+            Some(TruncationCheck {
+                max_limit: 500,
+                requested_limit: Some(1000),
+            })
+        );
+        let limit_param = compiled.params.last().unwrap();
+        assert!(
+            matches!(limit_param, QueryValue::Integer(501)),
+            "expected sentinel LIMIT 501, got {limit_param:?}"
+        );
+    }
+
+    #[test]
+    fn limit_exactly_at_cap_no_sentinel() {
+        // LIMIT 500 == max_limit exactly — the cap never binds, fetch exactly
+        // what was requested and no sentinel check is needed.
+        let q = gql::parse("MATCH (a:concept)-[e]->(b) RETURN a LIMIT 500").unwrap();
+        let compiled = compile(&q, &opts()).unwrap();
+        assert_eq!(compiled.truncation_check, None);
+        let limit_param = compiled.params.last().unwrap();
+        assert!(matches!(limit_param, QueryValue::Integer(500)));
+    }
+
+    #[test]
+    fn limit_below_cap_no_sentinel() {
+        // Explicit LIMIT 100, well under the 500 cap — not truncated, no sentinel.
+        let q = gql::parse("MATCH (a:concept)-[e]->(b) RETURN a LIMIT 100").unwrap();
+        let compiled = compile(&q, &opts()).unwrap();
+        assert_eq!(compiled.truncation_check, None);
+        let limit_param = compiled.params.last().unwrap();
+        assert!(matches!(limit_param, QueryValue::Integer(100)));
+    }
+
+    #[test]
+    fn no_explicit_limit_requests_sentinel_row() {
+        // No LIMIT clause at all — the cap is the only bound, and the true
+        // match count is unknown at compile time, so the compiler must fetch
+        // a sentinel row to let the execution site detect real truncation
+        // (this is issue #777's original silent-truncation case).
+        let q = gql::parse("MATCH (a:concept)-[e]->(b) RETURN a").unwrap();
+        let compiled = compile(&q, &opts()).unwrap();
+        assert_eq!(
+            compiled.truncation_check,
+            Some(TruncationCheck {
+                max_limit: 500,
+                requested_limit: None,
+            })
+        );
+        let limit_param = compiled.params.last().unwrap();
+        assert!(
+            matches!(limit_param, QueryValue::Integer(501)),
+            "expected sentinel LIMIT 501, got {limit_param:?}"
+        );
+    }
+
+    #[test]
+    fn variable_length_limit_over_cap_requests_sentinel_row() {
+        // Same sentinel-row coverage for the variable-length/traversal compile path.
+        let q = gql::parse("MATCH (a)-[:extends*1..3]->(b) RETURN b LIMIT 5000").unwrap();
+        let compiled = compile(&q, &opts()).unwrap();
+        assert_eq!(
+            compiled.truncation_check,
+            Some(TruncationCheck {
+                max_limit: 500,
+                requested_limit: Some(5000),
+            })
+        );
+        let limit_param = compiled.params.last().unwrap();
+        assert!(
+            matches!(limit_param, QueryValue::Integer(501)),
+            "expected sentinel LIMIT 501, got {limit_param:?}"
         );
     }
 
@@ -2121,7 +2254,9 @@ mod tests {
         }
     }
 
-    /// max_limit=0 with no query limit: query limit defaults to 0, no crash.
+    /// max_limit=0 with no query limit: the cap is binding (0 rows allowed),
+    /// so the compiler fetches a single sentinel row (max_limit+1 = 1) to
+    /// detect whether any row exists at all, no crash.
     #[test]
     fn max_limit_zero_compiles() {
         let q = gql::parse("MATCH (a)-[:extends]->(b) RETURN a").unwrap();
@@ -2130,10 +2265,17 @@ mod tests {
             max_limit: 0,
         };
         let compiled = compile(&q, &opts).unwrap();
+        assert_eq!(
+            compiled.truncation_check,
+            Some(TruncationCheck {
+                max_limit: 0,
+                requested_limit: None,
+            })
+        );
         let limit_param = compiled.params.last().unwrap();
         assert!(
-            matches!(limit_param, QueryValue::Integer(0)),
-            "max_limit=0 should produce LIMIT 0; got {limit_param:?}"
+            matches!(limit_param, QueryValue::Integer(1)),
+            "max_limit=0 should produce sentinel LIMIT 1; got {limit_param:?}"
         );
     }
 
