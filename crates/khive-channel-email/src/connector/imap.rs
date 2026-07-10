@@ -41,9 +41,50 @@ pub(crate) struct ImapProgress {
 
 /// One page of IMAP fetch results plus the progress the caller should adopt
 /// once the page is durably handled.
+///
+/// `emails` carries exactly one [`SelectedMessage`] per selected UID (khive
+/// #449 High fix): every selected UID gets a durable terminal disposition
+/// before `next_progress` is allowed to advance past it, so a single
+/// permanently malformed message can never starve later UIDs.
 pub(crate) struct ImapFetchPage {
-    pub(crate) emails: Vec<RawEmail>,
+    pub(crate) emails: Vec<SelectedMessage>,
     pub(crate) next_progress: ImapProgress,
+}
+
+/// Why a selected UID could not be parsed into a [`RawEmail`] (khive #449
+/// High fix). Distinguishes the two permanent-failure shapes so the
+/// downstream quarantine record carries an accurate reason.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MalformedReason {
+    /// The `UID FETCH` response carried no RFC822 body for this UID.
+    MissingBody,
+    /// An RFC822 body was present but `mail_parser` could not parse it.
+    ParseFailure,
+}
+
+impl std::fmt::Display for MalformedReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            MalformedReason::MissingBody => "missing-body",
+            MalformedReason::ParseFailure => "parse-failure",
+        })
+    }
+}
+
+/// The terminal disposition of one selected UID: either a successfully
+/// parsed message, or a durable quarantine marker for a UID that could not
+/// be parsed (khive #449 High fix). Every selected UID produces exactly one
+/// of these -- never silently dropped, never left without a disposition.
+pub(crate) enum SelectedMessage {
+    Email(Box<RawEmail>),
+    Malformed {
+        uid: u32,
+        /// Stable `imap:{host}:{uidvalidity}:{uid}` dedup key, precomputed
+        /// here since a malformed message has no parsed headers to derive
+        /// it from.
+        imap_external_id: String,
+        reason: MalformedReason,
+    },
 }
 
 /// Internal trait for IMAP fetch operations.
@@ -402,23 +443,29 @@ fn next_progress(
     }
 }
 
-/// Validate a fully-fetched selected page and build the `RawEmail` list, in
-/// `selected_uids` order.
+/// Validate a fully-fetched selected page and build the [`SelectedMessage`]
+/// list, in `selected_uids` order -- exactly one entry per selected UID.
 ///
-/// Every UID in `selected_uids` must appear exactly once in `fetched_raw` with
-/// a non-`None` body that parses successfully; any gap, duplicate, missing
-/// body, or parse failure fails the whole page (no partial advancement — the
-/// poll coordinator must not commit a candidate high-water for an incompletely
-/// materialized page). A fetch response for a UID outside `selected_uids` is
-/// unrequested (e.g. a stray server response) and is ignored with a `warn!`;
-/// it can never affect page validity or the candidate high-water.
+/// Every UID in `selected_uids` must appear exactly once in `fetched_raw`;
+/// a gap (UID absent from the fetch response entirely) or a duplicate
+/// response for the same UID still fails the whole page (no partial
+/// advancement — these are protocol anomalies, not permanent per-message
+/// failures, and a genuinely expunged message will not be re-selected next
+/// poll). A missing RFC822 body or an unparseable body, by contrast, is a
+/// permanent per-UID failure (khive #449 High fix): rather than failing the
+/// whole page and re-selecting the same poison UID forever, that UID gets a
+/// durable [`SelectedMessage::Malformed`] disposition so the caller can
+/// quarantine it and advance past it. A fetch response for a UID outside
+/// `selected_uids` is unrequested (e.g. a stray server response) and is
+/// ignored with a `warn!`; it can never affect page validity or the
+/// candidate high-water.
 pub(crate) fn process_selected_page(
     uid_validity: NonZeroU32,
     selected_uids: &[NonZeroU32],
     fetched_raw: Vec<(Option<u32>, Option<Vec<u8>>)>,
     host: &str,
-) -> Result<Vec<RawEmail>, ChannelError> {
-    let mut by_uid: HashMap<u32, Vec<u8>> = HashMap::new();
+) -> Result<Vec<SelectedMessage>, ChannelError> {
+    let mut by_uid: HashMap<u32, Option<Vec<u8>>> = HashMap::new();
     for (uid_opt, body_opt) in fetched_raw {
         let Some(uid) = uid_opt.filter(|&u| u != 0) else {
             continue;
@@ -427,13 +474,7 @@ pub(crate) fn process_selected_page(
             tracing::warn!(host = %host, uid, "ignoring unrequested IMAP fetch response");
             continue;
         }
-        let Some(body) = body_opt else {
-            return Err(ChannelError::Transport(format!(
-                "IMAP UID FETCH returned no RFC822 body for selected UID {uid}; \
-                 page rejected, not partially advanced"
-            )));
-        };
-        if by_uid.insert(uid, body).is_some() {
+        if by_uid.insert(uid, body_opt).is_some() {
             return Err(ChannelError::Transport(format!(
                 "IMAP UID FETCH returned duplicate responses for selected UID {uid}"
             )));
@@ -443,18 +484,43 @@ pub(crate) fn process_selected_page(
     let mut result = Vec::with_capacity(selected_uids.len());
     for &uid in selected_uids {
         let uid = uid.get();
-        let raw = by_uid.remove(&uid).ok_or_else(|| {
+        let imap_external_id = format!("imap:{host}:{}:{uid}", uid_validity.get());
+        let entry = by_uid.remove(&uid).ok_or_else(|| {
             ChannelError::Transport(format!(
                 "IMAP UID FETCH did not return a response for selected UID {uid}; \
                  page rejected, not partially advanced"
             ))
         })?;
-        let email = parse_raw_bytes(uid, &raw, host, uid_validity.get()).ok_or_else(|| {
-            ChannelError::Transport(format!(
-                "failed to parse RFC822 bytes for selected UID {uid}"
-            ))
-        })?;
-        result.push(email);
+        let message = match entry {
+            None => {
+                tracing::warn!(
+                    host = %host,
+                    uid,
+                    "IMAP UID FETCH returned no RFC822 body for selected UID; quarantining"
+                );
+                SelectedMessage::Malformed {
+                    uid,
+                    imap_external_id,
+                    reason: MalformedReason::MissingBody,
+                }
+            }
+            Some(raw) => match parse_raw_bytes(uid, &raw, host, uid_validity.get()) {
+                Some(email) => SelectedMessage::Email(Box::new(email)),
+                None => {
+                    tracing::warn!(
+                        host = %host,
+                        uid,
+                        "failed to parse RFC822 bytes for selected UID; quarantining"
+                    );
+                    SelectedMessage::Malformed {
+                        uid,
+                        imap_external_id,
+                        reason: MalformedReason::ParseFailure,
+                    }
+                }
+            },
+        };
+        result.push(message);
     }
     Ok(result)
 }
@@ -634,11 +700,11 @@ impl ImapFetcher {
     /// within one process without requiring a durable checkpoint; the daemon
     /// poll loop uses [`Self::fetch_page`] with an explicit stored checkpoint
     /// instead.
-    pub async fn fetch_since(
+    pub(crate) async fn fetch_since(
         &self,
         since: DateTime<Utc>,
         limit: usize,
-    ) -> Result<Vec<RawEmail>, ChannelError> {
+    ) -> Result<Vec<SelectedMessage>, ChannelError> {
         let mut progress = self.legacy_progress.lock().await;
         let page = self.inner.fetch_page(since, limit, *progress).await?;
         *progress = page.next_progress;
@@ -681,7 +747,12 @@ mod tests {
             _progress: ImapProgress,
         ) -> Result<ImapFetchPage, ChannelError> {
             Ok(ImapFetchPage {
-                emails: self.emails.clone(),
+                emails: self
+                    .emails
+                    .clone()
+                    .into_iter()
+                    .map(|e| SelectedMessage::Email(Box::new(e)))
+                    .collect(),
                 next_progress: ImapProgress::default(),
             })
         }
@@ -713,8 +784,11 @@ mod tests {
         let fetcher = ImapFetcher::with_connector(MockImap::with_emails(emails));
         let result = fetcher.fetch_since(Utc::now(), 50).await.unwrap();
         assert_eq!(result.len(), 1);
-        assert_eq!(result[0].imap_external_id, "imap:mail.example.com:12345:1");
-        assert_eq!(result[0].from_addrs, vec!["alice@example.com"]);
+        let SelectedMessage::Email(email) = &result[0] else {
+            panic!("expected a parsed email, got a malformed disposition");
+        };
+        assert_eq!(email.imap_external_id, "imap:mail.example.com:12345:1");
+        assert_eq!(email.from_addrs, vec!["alice@example.com"]);
     }
 
     #[tokio::test]
@@ -1126,29 +1200,59 @@ mod tests {
         ];
         let emails =
             process_selected_page(validity, &selected, fetched, "imap.example.com").unwrap();
+        let uids: Vec<u32> = emails
+            .iter()
+            .map(|m| match m {
+                SelectedMessage::Email(e) => e.uid,
+                SelectedMessage::Malformed { uid, .. } => *uid,
+            })
+            .collect();
         assert_eq!(
-            emails.iter().map(|e| e.uid).collect::<Vec<_>>(),
+            uids,
             vec![1, 2, 3],
             "output must follow selected_uids order, not fetch response order"
         );
     }
 
     #[test]
-    fn strict_page_missing_body_or_selected_uid_returns_error() {
+    fn strict_page_missing_body_quarantines_without_failing_page() {
+        // UID 2 is present in the response but carries no RFC822 body -- must
+        // get a durable Malformed disposition, not fail the whole page
+        // (khive #449 High fix: a permanently bodyless message must not
+        // starve every later UID).
         let validity = NonZeroU32::new(1).unwrap();
         let selected = vec![NonZeroU32::new(1).unwrap(), NonZeroU32::new(2).unwrap()];
-
-        // UID 2 is present in the response but carries no RFC822 body.
         let missing_body = vec![
             (Some(1), Some(minimal_rfc822("a@example.com", "one"))),
             (Some(2), None),
         ];
+        let result = process_selected_page(validity, &selected, missing_body, "h").unwrap();
+        assert_eq!(result.len(), 2, "both selected UIDs must get a disposition");
         assert!(
-            process_selected_page(validity, &selected, missing_body, "h").is_err(),
-            "a selected UID with no body must fail the whole page, not silently omit it"
+            matches!(&result[0], SelectedMessage::Email(e) if e.uid == 1),
+            "UID 1 must parse normally"
         );
+        assert!(
+            matches!(
+                &result[1],
+                SelectedMessage::Malformed {
+                    uid: 2,
+                    reason: MalformedReason::MissingBody,
+                    ..
+                }
+            ),
+            "UID 2 must be quarantined as missing-body, not dropped or erroring"
+        );
+    }
 
-        // UID 2 never appears in the fetch response at all.
+    #[test]
+    fn strict_page_absent_uid_still_errors() {
+        // UID 2 never appears in the fetch response at all -- a genuine
+        // protocol gap (distinct from a malformed body), so the whole page
+        // still fails; a self-healing retry is safe because an expunged
+        // message will not be re-selected next poll.
+        let validity = NonZeroU32::new(1).unwrap();
+        let selected = vec![NonZeroU32::new(1).unwrap(), NonZeroU32::new(2).unwrap()];
         let missing_uid = vec![(Some(1), Some(minimal_rfc822("a@example.com", "one")))];
         assert!(
             process_selected_page(validity, &selected, missing_uid, "h").is_err(),
@@ -1157,15 +1261,25 @@ mod tests {
     }
 
     #[test]
-    fn strict_page_parse_failure_returns_error() {
+    fn strict_page_parse_failure_quarantines_without_failing_page() {
         let validity = NonZeroU32::new(1).unwrap();
         let selected = vec![NonZeroU32::new(1).unwrap()];
         // Empty body — mail_parser returns None ("if no headers are found
         // None is returned").
         let fetched = vec![(Some(1), Some(Vec::new()))];
+        let result = process_selected_page(validity, &selected, fetched, "h").unwrap();
+        assert_eq!(result.len(), 1);
         assert!(
-            process_selected_page(validity, &selected, fetched, "h").is_err(),
-            "malformed selected RFC822 bytes must fail the page, not silently advance"
+            matches!(
+                &result[0],
+                SelectedMessage::Malformed {
+                    uid: 1,
+                    reason: MalformedReason::ParseFailure,
+                    ..
+                }
+            ),
+            "malformed selected RFC822 bytes must quarantine, not fail the whole page \
+             or silently advance without a record"
         );
     }
 
@@ -1181,7 +1295,7 @@ mod tests {
         ];
         let emails = process_selected_page(validity, &selected, fetched, "h").unwrap();
         assert_eq!(emails.len(), 1);
-        assert_eq!(emails[0].uid, 1);
+        assert!(matches!(&emails[0], SelectedMessage::Email(e) if e.uid == 1));
     }
 
     #[tokio::test]
@@ -1240,6 +1354,58 @@ mod tests {
         assert!(
             page3.is_empty(),
             "backlog must be fully drained after two pages"
+        );
+    }
+
+    #[test]
+    fn one_poison_uid_does_not_starve_51_later_valid_uids_and_cursor_passes_it() {
+        // khive #449 High regression: a single permanently malformed UID
+        // (here, UID 1: an empty body mail_parser cannot parse) followed by
+        // 50 valid messages. All 50 valid ones must parse; the poison UID
+        // must get a durable quarantine disposition (not silently dropped,
+        // not failing the page); and the candidate high-water must advance
+        // past the poison UID along with everything else, so the next poll
+        // never re-selects it.
+        let validity = NonZeroU32::new(1).unwrap();
+        let selected: Vec<NonZeroU32> = (1u32..=51).map(|u| NonZeroU32::new(u).unwrap()).collect();
+
+        let mut fetched: Vec<(Option<u32>, Option<Vec<u8>>)> = vec![(Some(1), Some(Vec::new()))];
+        fetched.extend(
+            (2u32..=51).map(|u| (Some(u), Some(minimal_rfc822("sender@example.com", "valid")))),
+        );
+
+        let result = process_selected_page(validity, &selected, fetched, "h").unwrap();
+        assert_eq!(result.len(), 51, "every selected UID gets a disposition");
+
+        assert!(
+            matches!(
+                &result[0],
+                SelectedMessage::Malformed {
+                    uid: 1,
+                    reason: MalformedReason::ParseFailure,
+                    ..
+                }
+            ),
+            "the poison UID must carry a quarantine record, not be dropped"
+        );
+        let valid_uids: Vec<u32> = result[1..]
+            .iter()
+            .map(|m| match m {
+                SelectedMessage::Email(e) => e.uid,
+                SelectedMessage::Malformed { uid, .. } => *uid,
+            })
+            .collect();
+        assert_eq!(
+            valid_uids,
+            (2u32..=51).collect::<Vec<_>>(),
+            "all 50 valid messages after the poison UID must still ingest"
+        );
+
+        let next = next_progress(validity, ImapProgress::default(), &selected);
+        assert_eq!(
+            next.last_seen_uid,
+            NonZeroU32::new(51),
+            "the checkpoint candidate must advance past the poison UID, not stall on it"
         );
     }
 

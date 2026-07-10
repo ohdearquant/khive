@@ -13,7 +13,7 @@ use tracing::{debug, warn};
 
 use crate::auth_results;
 use crate::config::{EmailAuth, EmailChannelConfig};
-use crate::connector::imap::{ImapFetcher, ImapProgress};
+use crate::connector::imap::{ImapFetcher, ImapProgress, MalformedReason, SelectedMessage};
 use crate::connector::smtp::SmtpSender;
 use crate::connector::{MailAddress, RawEmail};
 use crate::oauth::TokenProvider;
@@ -39,6 +39,12 @@ enum QuarantineReason {
     Unaligned,
     /// Domain authentication passed, but the sender is not on the maintainer allowlist.
     OffAllowlist,
+    /// The `UID FETCH` response carried no RFC822 body for this UID (khive
+    /// #449 High fix: a durable terminal disposition, never a silent drop).
+    MissingBody,
+    /// An RFC822 body was present but could not be parsed (khive #449 High
+    /// fix: a durable terminal disposition, never a silent drop).
+    ParseFailure,
 }
 
 impl std::fmt::Display for QuarantineReason {
@@ -48,7 +54,18 @@ impl std::fmt::Display for QuarantineReason {
             QuarantineReason::DmarcFail => "dmarc-fail",
             QuarantineReason::Unaligned => "unaligned",
             QuarantineReason::OffAllowlist => "off-allowlist",
+            QuarantineReason::MissingBody => "missing-body",
+            QuarantineReason::ParseFailure => "parse-failure",
         })
+    }
+}
+
+impl From<MalformedReason> for QuarantineReason {
+    fn from(reason: MalformedReason) -> Self {
+        match reason {
+            MalformedReason::MissingBody => QuarantineReason::MissingBody,
+            MalformedReason::ParseFailure => QuarantineReason::ParseFailure,
+        }
     }
 }
 
@@ -267,6 +284,31 @@ impl EmailChannel {
         env
     }
 
+    /// Build the envelope recorded for a selected UID that could not be
+    /// durably parsed into a message (khive #449 High fix: a missing RFC822
+    /// body or an unparseable one). Unlike [`Self::quarantine_envelope`],
+    /// this is never gated by `quarantine_store` -- a data-integrity failure
+    /// must always leave a queryable record, never a silent drop, since
+    /// dropping it here is the only way this UID's disposition could be lost
+    /// before the cursor advances past it.
+    fn malformed_quarantine_envelope(
+        &self,
+        uid: u32,
+        imap_external_id: &str,
+        reason: QuarantineReason,
+    ) -> ChannelEnvelope {
+        let to = format!("email:{}", self.maintainer_address());
+        let body =
+            format!("(khive: IMAP message UID {uid} could not be parsed and was quarantined)");
+        let mut env = ChannelEnvelope::new("email:quarantine", to, body);
+        env = env.with_external_id(imap_external_id);
+        env.metadata
+            .insert("quarantined".to_string(), "true".to_string());
+        env.metadata
+            .insert("quarantine_reason".to_string(), reason.to_string());
+        env
+    }
+
     /// This channel's stable, non-secret checkpoint identity.
     ///
     /// Compared verbatim (never parsed) against a stored checkpoint's
@@ -348,24 +390,51 @@ impl EmailChannel {
     /// Run the gate/quarantine disposition loop over a fetched batch,
     /// producing the envelopes ready for `comm.ingest`. Extracted from `poll`
     /// so `poll_page` shares the exact same per-message logic.
-    fn disposition(&self, raw: Vec<RawEmail>) -> Vec<ChannelEnvelope> {
+    ///
+    /// Every [`SelectedMessage`] produces exactly one disposition here (khive
+    /// #449 High fix): a parsed email is gated as before, and a
+    /// [`SelectedMessage::Malformed`] entry always becomes a quarantine
+    /// envelope, regardless of `quarantine_store` -- see
+    /// [`Self::malformed_quarantine_envelope`].
+    fn disposition(&self, raw: Vec<SelectedMessage>) -> Vec<ChannelEnvelope> {
         let mut envelopes = Vec::new();
-        for email in raw {
-            let uid = email.uid;
-            match self.gate(&email) {
-                Ok(()) => envelopes.push(self.to_envelope(email)),
-                Err(reason) => {
-                    if self.config.quarantine_store {
-                        envelopes.push(self.quarantine_envelope(&email, reason));
-                    } else {
-                        // Address-free: only the IMAP UID and the quarantine reason
-                        // are logged, never the (possibly forged) From address.
-                        warn!(
-                            uid,
-                            reason = %reason,
-                            "quarantine-store disabled: dropping unattributed message"
-                        );
+        for message in raw {
+            match message {
+                SelectedMessage::Email(email) => {
+                    let uid = email.uid;
+                    match self.gate(&email) {
+                        Ok(()) => envelopes.push(self.to_envelope(*email)),
+                        Err(reason) => {
+                            if self.config.quarantine_store {
+                                envelopes.push(self.quarantine_envelope(&email, reason));
+                            } else {
+                                // Address-free: only the IMAP UID and the quarantine reason
+                                // are logged, never the (possibly forged) From address.
+                                warn!(
+                                    uid,
+                                    reason = %reason,
+                                    "quarantine-store disabled: dropping unattributed message"
+                                );
+                            }
+                        }
                     }
+                }
+                SelectedMessage::Malformed {
+                    uid,
+                    imap_external_id,
+                    reason,
+                } => {
+                    let reason: QuarantineReason = reason.into();
+                    warn!(
+                        uid,
+                        reason = %reason,
+                        "quarantining permanently unparseable IMAP message"
+                    );
+                    envelopes.push(self.malformed_quarantine_envelope(
+                        uid,
+                        &imap_external_id,
+                        reason,
+                    ));
                 }
             }
         }
@@ -571,7 +640,12 @@ mod tests {
             _progress: crate::connector::imap::ImapProgress,
         ) -> Result<ImapFetchPage, ChannelError> {
             Ok(ImapFetchPage {
-                emails: self.emails.clone(),
+                emails: self
+                    .emails
+                    .clone()
+                    .into_iter()
+                    .map(|e| SelectedMessage::Email(Box::new(e)))
+                    .collect(),
                 next_progress: crate::connector::imap::ImapProgress::default(),
             })
         }
@@ -1503,7 +1577,10 @@ mod tests {
             progress: ImapProgress,
         ) -> Result<ImapFetchPage, ChannelError> {
             let selected = self.select(limit, progress);
-            let emails: Vec<RawEmail> = selected.iter().map(|&u| self.email_for(u)).collect();
+            let emails: Vec<SelectedMessage> = selected
+                .iter()
+                .map(|&u| SelectedMessage::Email(Box::new(self.email_for(u))))
+                .collect();
             let next_progress = match selected.iter().map(|u| u.get()).max() {
                 Some(max) => ImapProgress {
                     uid_validity: Some(self.validity),
@@ -1663,7 +1740,7 @@ mod tests {
                 _progress: ImapProgress,
             ) -> Result<ImapFetchPage, ChannelError> {
                 Ok(ImapFetchPage {
-                    emails: vec![self.email.clone()],
+                    emails: vec![SelectedMessage::Email(Box::new(self.email.clone()))],
                     next_progress: ImapProgress {
                         uid_validity: NonZeroU32::new(3),
                         last_seen_uid: NonZeroU32::new(self.email.uid),
