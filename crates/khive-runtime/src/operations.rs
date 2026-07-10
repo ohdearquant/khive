@@ -1715,7 +1715,15 @@ impl KhiveRuntime {
             metadata,
             target_backend: None,
         };
-        self.graph(token)?.upsert_edge(edge).await?;
+        // #769: `upsert_edge_guarded` re-checks both endpoints exist as part
+        // of the same write, not the separate `validate_edge_relation_endpoints`
+        // read above — a concurrent hard-delete landing between that read and
+        // this write can no longer create a durably dangling edge.
+        if !self.graph(token)?.upsert_edge_guarded(edge).await? {
+            return Err(RuntimeError::NotFound(format!(
+                "link source {source_id} or target {target_id} no longer exists at write time"
+            )));
+        }
 
         // H1 fix: read back the persisted row by natural key so the returned
         // edge ID is always the one stored in the database, not the locally
@@ -4557,7 +4565,21 @@ impl KhiveRuntime {
         for spec in &specs {
             edges.push(self.build_edge(token, spec).await?);
         }
-        self.graph(token)?.upsert_edges(edges.clone()).await?;
+        // #769: `upsert_edges_guarded` re-checks every edge's endpoints as
+        // part of the same write, not the separate per-spec `build_edge`
+        // validation reads above. A concurrent hard-delete of any endpoint
+        // landing between those reads and this write aborts the whole batch
+        // (all-or-nothing, no partial write) instead of persisting a
+        // dangling edge.
+        let summary = self
+            .graph(token)?
+            .upsert_edges_guarded(edges.clone())
+            .await?;
+        if summary.affected != edges.len() as u64 {
+            return Err(RuntimeError::NotFound(
+                "link_many: one or more edge endpoints no longer exist at write time".to_string(),
+            ));
+        }
 
         // H1-bulk fix: read back each persisted edge by natural key so callers
         // always receive the stored row ID, not the pre-upsert generated UUID.

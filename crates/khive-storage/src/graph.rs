@@ -17,6 +17,19 @@ pub trait GraphStore: Send + Sync + 'static {
     async fn upsert_edge(&self, edge: Edge) -> StorageResult<()>;
     /// Insert or update a batch of edges.
     async fn upsert_edges(&self, edges: Vec<Edge>) -> StorageResult<BatchWriteSummary>;
+    /// Insert or update a single edge, re-checking that both endpoints still
+    /// exist (and are not soft-deleted) as part of the same write, not a
+    /// separate prior read. Closes the TOCTOU window between an async
+    /// prepare-time existence check and a later, unconditional write: a
+    /// concurrent hard-delete of an endpoint that lands between the two can
+    /// otherwise leave a durably dangling edge (#769). Returns `false`
+    /// (nothing written) when either endpoint is gone at write time, `true`
+    /// when the edge was inserted or updated.
+    async fn upsert_edge_guarded(&self, edge: Edge) -> StorageResult<bool>;
+    /// Batch form of [`GraphStore::upsert_edge_guarded`]. All-or-nothing:
+    /// if any edge's endpoints are missing at write time, no edge from the
+    /// batch is persisted and `BatchWriteSummary::affected` is `0`.
+    async fn upsert_edges_guarded(&self, edges: Vec<Edge>) -> StorageResult<BatchWriteSummary>;
     /// Fetch an edge by link ID, returning `None` if absent. Filters soft-deleted rows.
     async fn get_edge(&self, id: LinkId) -> StorageResult<Option<Edge>>;
     /// Fetch an edge by link ID including soft-deleted rows. Used by the runtime hard-delete path
