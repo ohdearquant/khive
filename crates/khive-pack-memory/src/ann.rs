@@ -111,6 +111,20 @@ pub(crate) struct AnnState {
     /// each test gets its own via `new_shared()`.
     #[cfg(test)]
     pub(crate) attempt_floor_notify: tokio::sync::Notify,
+    /// Test-only reverse barrier (#812 review REQUEST CHANGES MEDIUM — the
+    /// `Notify` test still lacked an ordering guarantee): when
+    /// `attempt_floor_barrier` is armed, the tracked task's first attempt
+    /// WAITS on this after emitting `attempt_floor_notify`, so a test can
+    /// deterministically bump the generation before the task's build is
+    /// allowed to proceed, instead of racing the build's own completion.
+    #[cfg(test)]
+    pub(crate) attempt_floor_release: tokio::sync::Notify,
+    /// Test-only: arms the two-way handshake above. Defaults to `false` so
+    /// every other test driving `ensure_ann_background`/`spawn_rebuild_task`
+    /// (which never call `attempt_floor_release.notify_one()`) is unaffected
+    /// — only a test that explicitly sets this waits on the release signal.
+    #[cfg(test)]
+    pub(crate) attempt_floor_barrier: std::sync::atomic::AtomicBool,
 }
 
 pub(crate) type SharedAnn = Arc<AnnState>;
@@ -126,6 +140,10 @@ pub(crate) fn new_shared() -> SharedAnn {
         warm_route_count: AtomicUsize::new(0),
         #[cfg(test)]
         attempt_floor_notify: tokio::sync::Notify::new(),
+        #[cfg(test)]
+        attempt_floor_release: tokio::sync::Notify::new(),
+        #[cfg(test)]
+        attempt_floor_barrier: std::sync::atomic::AtomicBool::new(false),
     })
 }
 
@@ -193,6 +211,22 @@ const DURABLE_EPOCH_CHECK_INTERVAL: std::time::Duration = std::time::Duration::f
 #[cfg(test)]
 const DURABLE_EPOCH_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(0);
 
+/// Minimum delay before a CHAINED rebuild task's first attempt — i.e. a task
+/// spawned by `spawn_rebuild_task`'s own post-release re-enqueue, not the
+/// original caller-triggered spawn (#812 review REQUEST CHANGES MEDIUM: "the
+/// three-attempt cap still permits an unbounded task chain"). Without this,
+/// a corpus that receives a new write on every rebuild attempt chains a
+/// fresh `ATTEMPT_BOUND`-attempt task immediately after the previous one
+/// exits, forever, spending unbounded aggregate CPU under continuous
+/// writes. Sleeping here — between chained spawns, not inside a single
+/// task's attempt loop — lets writes that land during the delay coalesce
+/// into the next chained task's single generation read instead of each one
+/// re-triggering its own chain link.
+#[cfg(not(test))]
+const REBUILD_CHAIN_DEBOUNCE: std::time::Duration = std::time::Duration::from_secs(1);
+#[cfg(test)]
+const REBUILD_CHAIN_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(5);
+
 /// Amortized cross-process freshness check (#812 review REQUEST CHANGES
 /// HIGH): compares the durable `memory_ann_epoch` row against the
 /// currently-installed entry's `epoch_baseline` for `key`, and — if the
@@ -242,23 +276,33 @@ pub(crate) async fn maybe_check_durable_epoch(rt: &KhiveRuntime, ann: &SharedAnn
     }
 }
 
-/// Ensure the `memory_ann_epoch` table exists. Best-effort: called before
-/// every read/write of the durable epoch, mirroring `ensure_snapshot_schema`.
-async fn ensure_epoch_schema(rt: &KhiveRuntime) -> Result<(), RuntimeError> {
+/// DDL for the durable memory-ANN corpus epoch table (#812 review REQUEST
+/// CHANGES MEDIUM — pack schema contract). Declared here so
+/// `MemoryPack::SCHEMA_PLAN` (`pack.rs`) can own it like every other
+/// pack-auxiliary table in this codebase (ADR-028), instead of the table
+/// being created ad hoc, inline, on the epoch bump/read path.
+pub(crate) const MEMORY_SCHEMA_PLAN_STMTS: [&str; 1] =
+    ["CREATE TABLE IF NOT EXISTS memory_ann_epoch (\
+     id INTEGER PRIMARY KEY CHECK (id = 1), \
+     epoch INTEGER NOT NULL DEFAULT 0\
+ )"];
+
+/// Ensure the `memory_ann_epoch` table exists (idempotent). NOT called from
+/// the epoch bump/read hot path anymore (#812 review REQUEST CHANGES
+/// MEDIUM) — a daemon boot applies `MemoryPack::SCHEMA_PLAN` up front
+/// (`server.rs`/`serve.rs`), and `kkernel reindex` (which runs directly
+/// against a raw `KhiveRuntime`, never booting a pack registry) calls this
+/// explicitly, once, via `khive_pack_memory::ensure_ann_epoch_schema` before
+/// its first durable-epoch bump.
+pub(crate) async fn ensure_epoch_schema(rt: &KhiveRuntime) -> Result<(), RuntimeError> {
     let sql = rt.sql();
     let mut w = sql
         .writer()
         .await
         .map_err(|e| RuntimeError::Internal(e.to_string()))?;
-    w.execute_script(
-        "CREATE TABLE IF NOT EXISTS memory_ann_epoch (\
-             id INTEGER PRIMARY KEY CHECK (id = 1), \
-             epoch INTEGER NOT NULL DEFAULT 0\
-         );"
-        .into(),
-    )
-    .await
-    .map_err(|e| RuntimeError::Internal(e.to_string()))
+    w.execute_script(MEMORY_SCHEMA_PLAN_STMTS[0].to_string())
+        .await
+        .map_err(|e| RuntimeError::Internal(e.to_string()))
 }
 
 /// Read the durable corpus epoch (0 if the table doesn't exist yet or the
@@ -291,7 +335,6 @@ pub(crate) async fn durable_epoch(rt: &KhiveRuntime) -> u64 {
 /// the same database file has a durable signal to observe (#812 review
 /// REQUEST CHANGES HIGH).
 pub(crate) async fn bump_durable_epoch(rt: &KhiveRuntime) -> Result<u64, RuntimeError> {
-    ensure_epoch_schema(rt).await?;
     let sql = rt.sql();
     let mut w = sql
         .writer()
@@ -681,6 +724,25 @@ fn try_take_warming_guard(ann: &SharedAnn, key: &AnnKey) -> bool {
 /// this future's own state machine, so there is no self-referential type for
 /// Send-inference to choke on.
 fn spawn_rebuild_task(rt: KhiveRuntime, ann: SharedAnn, model: String, key: AnnKey) {
+    spawn_rebuild_task_inner(rt, ann, model, key, false);
+}
+
+/// `chained`: `true` only for the post-release re-enqueue call at the bottom
+/// of this function's own tracked task — i.e. this spawn exists because a
+/// PRIOR task in the same chain just exhausted its `ATTEMPT_BOUND` with more
+/// work still pending. `false` for every caller-triggered spawn
+/// (`ensure_ann_background`'s first call for a key). Only a chained spawn
+/// pays `REBUILD_CHAIN_DEBOUNCE` before its first attempt (#812 review
+/// REQUEST CHANGES MEDIUM) — the original caller-triggered spawn must still
+/// start immediately, matching every existing warm-latency expectation and
+/// test in this file.
+fn spawn_rebuild_task_inner(
+    rt: KhiveRuntime,
+    ann: SharedAnn,
+    model: String,
+    key: AnnKey,
+    chained: bool,
+) {
     // Tied to the tracked task's own scope so it releases on every exit path
     // (success, error, or panic) rather than only the "nothing got loaded"
     // arm — see `WarmingGuard`'s doc comment (#812 review HIGH-1).
@@ -689,6 +751,9 @@ fn spawn_rebuild_task(rt: KhiveRuntime, ann: SharedAnn, model: String, key: AnnK
         key: key.clone(),
     };
     khive_runtime::track_background_task(async move {
+        if chained {
+            tokio::time::sleep(REBUILD_CHAIN_DEBOUNCE).await;
+        }
         // #812 review MEDIUM (reconfirm): a write landing while this task's
         // own build is in flight bumps the generation counter, but that
         // write's own `ensure_ann_background` call finds `warming` already
@@ -710,6 +775,18 @@ fn spawn_rebuild_task(rt: KhiveRuntime, ann: SharedAnn, model: String, key: AnnK
         // once exhausted the remainder is left for the post-release
         // recheck below (or a later recall/write) to pick up, documented in
         // ADR-107.
+        //
+        // Shutdown bound (#812 review REQUEST CHANGES MEDIUM): this loop has
+        // no dedicated cancellation signal of its own — `AnnState` carries
+        // none, and this task is registered via `khive_runtime::track_background_task`,
+        // whose only shutdown coordination is `daemon::drain()`'s bounded wait
+        // (`KHIVE_DRAIN_TIMEOUT_SECS`, default in `daemon.rs`) followed by an
+        // unconditional process exit once that deadline passes. A chain that
+        // is still respawning at shutdown is therefore bounded by drain's
+        // timeout, not by anything in this file; `REBUILD_CHAIN_DEBOUNCE`
+        // keeps each link short enough that drain's timeout is the effective
+        // ceiling on how many chain links can still be mid-flight when the
+        // process is torn down.
         const ATTEMPT_BOUND: u32 = 3;
         let mut attempt_floor = current_generation(&ann, &key).await;
         let mut attempts: u32 = 0;
@@ -719,7 +796,23 @@ fn spawn_rebuild_task(rt: KhiveRuntime, ann: SharedAnn, model: String, key: AnnK
             };
             attempts += 1;
             #[cfg(test)]
-            ann.attempt_floor_notify.notify_one();
+            {
+                ann.attempt_floor_notify.notify_one();
+                // Two-way barrier (#812 review REQUEST CHANGES MEDIUM: the
+                // old test only synchronized one direction — "floor
+                // captured" — then let the build race ahead unconditionally,
+                // so nothing actually forced the test's `bump_generation` to
+                // land before this attempt's build ran. Only armed tests
+                // wait here; every other test in this file never sets
+                // `attempt_floor_barrier` and proceeds exactly as before.
+                if attempts == 1
+                    && ann
+                        .attempt_floor_barrier
+                        .load(std::sync::atomic::Ordering::SeqCst)
+                {
+                    ann.attempt_floor_release.notified().await;
+                }
+            }
             match ensure_ann_for_model(&rt, &token, &ann, &model).await {
                 Ok(status) => {
                     tracing::debug!(?status, model = %model, "memory ANN background warm complete");
@@ -771,7 +864,10 @@ fn spawn_rebuild_task(rt: KhiveRuntime, ann: SharedAnn, model: String, key: AnnK
         if current_generation(&ann, &key).await > attempt_floor
             && try_take_warming_guard(&ann, &key)
         {
-            spawn_rebuild_task(rt, ann, model, key);
+            // `chained: true` — this re-enqueue is throttled by
+            // `REBUILD_CHAIN_DEBOUNCE` (#812 review REQUEST CHANGES MEDIUM),
+            // not an immediate back-to-back respawn.
+            spawn_rebuild_task_inner(rt, ann, model, key, true);
         }
     });
 }
@@ -2621,6 +2717,15 @@ mod tests {
         // The reindexer deletes the persisted snapshot AND bumps the durable
         // epoch, exactly like `invalidate_active_memory_vamana_snapshot` +
         // `khive_pack_memory::bump_memory_ann_epoch` in `kkernel::reindex`.
+        // `kkernel reindex` runs directly against a raw `KhiveRuntime` with
+        // no pack registry boot (so `MemoryPack::SCHEMA_PLAN` is never
+        // applied) — it calls `ensure_epoch_schema` explicitly once before
+        // its first bump (see `begin_reindex_epoch` in `reindex.rs`); mirror
+        // that here now that `bump_durable_epoch` no longer creates the
+        // table itself (#812 review REQUEST CHANGES MEDIUM).
+        ensure_epoch_schema(&rt2)
+            .await
+            .expect("ensure epoch schema");
         bump_durable_epoch(&rt2).await.expect("bump durable epoch");
 
         // Sanity: before the epoch check runs, the daemon's cache still
@@ -2698,6 +2803,15 @@ mod tests {
         let ann = new_shared();
         let key = AnnKey::from_token(&token, MODEL);
 
+        // Arm the two-way barrier (#812 review REQUEST CHANGES MEDIUM — the
+        // one-way `Notify` above only proved the task had captured its
+        // floor, not that its build couldn't race ahead and read the
+        // generation before this test's `bump_generation` below landed).
+        // The task's first attempt now WAITS on `attempt_floor_release`
+        // after emitting `attempt_floor_notify`, so the ordering here is
+        // deterministic rather than a race against build speed.
+        ann.attempt_floor_barrier
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         let notified = ann.attempt_floor_notify.notified();
         assert!(
             ensure_ann_background(&rt, &token, &ann, MODEL).await,
@@ -2712,6 +2826,14 @@ mod tests {
         // deliberately do NOT call `ensure_ann_background` again: the whole
         // point is that no second caller ever arrives to notice or retrigger.
         bump_generation(&ann, &key).await;
+        // Disarm BEFORE releasing so later attempts (attempt 2, 3, ...) in
+        // this same task's loop don't also block waiting for a release this
+        // test never sends again. `Notify::notify_one` synchronizes with
+        // the waiter's wakeup, so the task observes `barrier == false` by
+        // the time it re-checks on its next attempt.
+        ann.attempt_floor_barrier
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        ann.attempt_floor_release.notify_one();
 
         for _ in 0..500 {
             if is_current(&ann, &key).await {

@@ -221,6 +221,14 @@ struct ReindexReport {
     entities_fts_failed: u64,
     /// Note FTS upserts that failed during the backfill pass.
     notes_fts_failed: u64,
+    /// True when the completion ("settled") durable memory-ANN epoch bump
+    /// failed after entity/note mutations were already committed (#812
+    /// review REQUEST CHANGES HIGH — crash safety). The start-of-pass bump
+    /// (`begin_reindex_epoch`) aborts the whole run before any mutation on
+    /// failure, so there is nothing left to "abort" here — but a swallowed
+    /// failure at this point is exactly the bug this fix closes, so it now
+    /// surfaces as a fail-closed exit instead of a silent warning.
+    epoch_bump_failed: bool,
 }
 
 impl ReindexReport {
@@ -233,6 +241,7 @@ impl ReindexReport {
             || self.knowledge_pass_errored
             || self.knowledge_ann_failed
             || self.knowledge_sections_failed > 0
+            || self.epoch_bump_failed
     }
 }
 
@@ -515,8 +524,14 @@ pub async fn run_reindex(args: ReindexArgs) -> Result<()> {
     let mut entities_fts_failed: u64 = 0;
     let mut notes_fts_failed: u64 = 0;
 
+    let mut epoch_bump_failed = false;
+
     // ── entities + notes (graph substrate) ────────────────────────────────────
     if do_graph {
+        begin_reindex_epoch(&rt)
+            .await
+            .context("aborting reindex before any vector mutation")?;
+
         let entity_total = rt.count_entities(&token, None).await.unwrap_or(0);
         let entity_bar = ProgressBar::new("entities");
         entity_bar.update(0, entity_total);
@@ -644,7 +659,11 @@ pub async fn run_reindex(args: ReindexArgs) -> Result<()> {
         // `khive-pack-memory::ann` is the primary defense against a daemon
         // trusting it afterward, but deleting it here forces a rebuild on the
         // very next warm regardless, without depending on that check alone.
-        invalidate_active_memory_vamana_snapshot(&rt).await;
+        //
+        // This also performs the completion ("settled") durable epoch bump
+        // (#812 review REQUEST CHANGES HIGH) — see its own doc comment for
+        // why a failure here is reported rather than warned-and-ignored.
+        epoch_bump_failed = !invalidate_active_memory_vamana_snapshot(&rt).await;
 
         // Drop per-namespace FTS partition tables that survived the V4 migration
         // (tables created by the runtime before the migration ran, or on databases
@@ -740,6 +759,7 @@ pub async fn run_reindex(args: ReindexArgs) -> Result<()> {
         errors_skipped,
         entities_fts_failed,
         notes_fts_failed,
+        epoch_bump_failed,
     };
 
     print_report(&report, args.human);
@@ -839,62 +859,112 @@ async fn purge_stale_memory_vamana_snapshots(rt: &KhiveRuntime) {
     }
 }
 
+/// Durably mark the reindex-in-progress epoch, before ANY vector mutation in
+/// this pass (#812 review REQUEST CHANGES HIGH — crash safety). The previous
+/// design bumped the durable epoch only as a best-effort step AFTER every
+/// vector mutation had already committed (see
+/// `invalidate_active_memory_vamana_snapshot`'s completion bump below); a
+/// crash between the last commit and that bump, or a silently swallowed
+/// bump error, left an already-warm daemon with no durable signal at all and
+/// serving pre-reindex vectors indefinitely.
+///
+/// Bumping first instead closes that gap: a daemon that observes this epoch
+/// mid-reindex (via `khive_pack_memory::ann::maybe_check_durable_epoch`,
+/// sampled from the recall path) rebuilds conservatively against whatever
+/// partial corpus is on disk at that moment — never worse than the old
+/// behavior of trusting a stale index forever — and the completion bump at
+/// the end of this pass forces one more rebuild once the corpus reaches its
+/// final, fully re-embedded state. Together these two durable bumps form an
+/// in-progress/completed epoch protocol: any observer landing anywhere
+/// between them still converges.
+///
+/// `kkernel reindex` runs directly against a raw `KhiveRuntime`, without a
+/// pack registry boot to apply `MemoryPack::SCHEMA_PLAN`, so this also
+/// ensures the `memory_ann_epoch` table exists before its first bump.
+///
+/// Fail-closed: an error here — schema creation OR the epoch write itself —
+/// aborts the whole reindex before any mutation runs, via `?` on this
+/// function's `Result`. Never warn-and-continue: a swallowed failure here is
+/// exactly the bug ADR-107 §4 was written to close.
+async fn begin_reindex_epoch(rt: &KhiveRuntime) -> Result<()> {
+    khive_pack_memory::ensure_ann_epoch_schema(rt)
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))
+        .context("failed to ensure memory_ann_epoch schema before reindex")?;
+    khive_pack_memory::bump_memory_ann_epoch(rt)
+        .await
+        .map_err(|e| anyhow::anyhow!("{e}"))
+        .context("failed to durably mark reindex-in-progress epoch")?;
+    Ok(())
+}
+
 /// Delete the ACTIVE global memory Vamana snapshot row (`global::memory_vamana::*`),
 /// distinct from `purge_stale_memory_vamana_snapshots`'s legacy-row cleanup above
 /// (#812 review re-confirm HIGH-A defense in depth). Reindex rewrites note
 /// embeddings directly, bypassing `memory.remember`, so it never bumps the memory
 /// pack's in-memory write-generation counter — that daemon-side signal simply
-/// cannot see this change. Best-effort: a missing table or SQL failure is logged
-/// and ignored, matching this file's other snapshot-maintenance helpers.
-async fn invalidate_active_memory_vamana_snapshot(rt: &KhiveRuntime) {
+/// cannot see this change. The DELETE itself stays best-effort (a missing table
+/// or SQL failure is logged and ignored, matching this file's other
+/// snapshot-maintenance helpers) — it is a defense-in-depth optimization, not
+/// the correctness mechanism.
+///
+/// Returns `false` when the completion ("settled") durable epoch bump below
+/// fails — see `begin_reindex_epoch`'s doc comment for the two-phase
+/// protocol this half completes. Unlike `begin_reindex_epoch`, mutations have
+/// already committed by this point, so there is nothing left to abort; the
+/// caller instead folds this into `ReindexReport::epoch_bump_failed`, which
+/// drives a fail-closed non-zero exit instead of the old warn-and-continue.
+async fn invalidate_active_memory_vamana_snapshot(rt: &KhiveRuntime) -> bool {
     use khive_storage::types::{SqlStatement, SqlValue};
     let sql = rt.sql();
-    let Ok(mut writer) = sql.writer().await else {
-        return;
-    };
-    // `retrieval_snapshots.namespace` holds the FULL composite key produced by
-    // `ann::snapshot_key` (`"global::memory_vamana::{model}"`), not a bare
-    // namespace — matching on `namespace = 'global'` would never match any row.
-    match writer
-        .execute(SqlStatement {
-            sql: "DELETE FROM retrieval_snapshots \
-                  WHERE index_type = 'memory_vamana' AND namespace LIKE ?1"
-                .into(),
-            params: vec![SqlValue::Text("global::memory_vamana::%".into())],
-            label: Some("invalidate_active_memory_vamana_snapshot".into()),
-        })
-        .await
-    {
-        Ok(deleted) => {
-            if deleted > 0 {
-                tracing::info!(
-                    deleted,
-                    "invalidated active global memory Vamana snapshot after reindex"
-                );
+    if let Ok(mut writer) = sql.writer().await {
+        // `retrieval_snapshots.namespace` holds the FULL composite key produced
+        // by `ann::snapshot_key` (`"global::memory_vamana::{model}"`), not a
+        // bare namespace — matching on `namespace = 'global'` would never
+        // match any row.
+        match writer
+            .execute(SqlStatement {
+                sql: "DELETE FROM retrieval_snapshots \
+                      WHERE index_type = 'memory_vamana' AND namespace LIKE ?1"
+                    .into(),
+                params: vec![SqlValue::Text("global::memory_vamana::%".into())],
+                label: Some("invalidate_active_memory_vamana_snapshot".into()),
+            })
+            .await
+        {
+            Ok(deleted) => {
+                if deleted > 0 {
+                    tracing::info!(
+                        deleted,
+                        "invalidated active global memory Vamana snapshot after reindex"
+                    );
+                }
             }
-        }
-        Err(e) => {
-            let msg = e.to_string();
-            if !msg.contains("no such table") {
-                tracing::warn!(error = %e, "failed to invalidate active memory Vamana snapshot");
+            Err(e) => {
+                let msg = e.to_string();
+                if !msg.contains("no such table") {
+                    tracing::warn!(error = %e, "failed to invalidate active memory Vamana snapshot");
+                }
             }
         }
     }
-    drop(writer);
 
-    // #812 review REQUEST CHANGES HIGH: the DELETE above only touches the
-    // persisted snapshot row. A khive daemon that warmed its in-memory ANN
-    // index before this reindex ran shares no process, and therefore no
-    // in-memory write-generation state, with this `kkernel reindex`
-    // invocation — its `common.rs` recall path would keep trusting that
-    // cached index forever with no way to observe this mutation at all.
-    // Bumping the durable epoch here gives that daemon's amortized freshness
-    // check (`khive_pack_memory::ann::maybe_check_durable_epoch`, sampled
-    // from the recall path) a signal written to the shared database file
-    // instead of one confined to this process.
+    // #812 review REQUEST CHANGES HIGH: the completion half of the
+    // in-progress/completed epoch protocol described on `begin_reindex_epoch`.
+    // A khive daemon that warmed its in-memory ANN index before this reindex
+    // ran shares no process, and therefore no in-memory write-generation
+    // state, with this `kkernel reindex` invocation — its `common.rs` recall
+    // path would keep trusting that cached index forever with no way to
+    // observe this mutation at all. Bumping the durable epoch here gives that
+    // daemon's amortized freshness check
+    // (`khive_pack_memory::ann::maybe_check_durable_epoch`, sampled from the
+    // recall path) a signal written to the shared database file instead of
+    // one confined to this process.
     if let Err(e) = khive_pack_memory::bump_memory_ann_epoch(rt).await {
         tracing::warn!(error = %e, "failed to bump durable memory ANN epoch after reindex");
+        return false;
     }
+    true
 }
 
 /// Return the set of distinct namespaces present in base `entities` and `notes`
@@ -1401,6 +1471,7 @@ mod tests {
             errors_skipped: errors,
             entities_fts_failed: 0,
             notes_fts_failed: 0,
+            epoch_bump_failed: false,
         }
     }
 
@@ -1437,6 +1508,7 @@ mod tests {
             errors_skipped: 0,
             entities_fts_failed: 0,
             notes_fts_failed: 0,
+            epoch_bump_failed: false,
         };
         assert!(
             report.has_failures(),
@@ -1468,6 +1540,7 @@ mod tests {
             errors_skipped: 0,
             entities_fts_failed: 0,
             notes_fts_failed: 0,
+            epoch_bump_failed: false,
         };
         assert!(
             report.has_failures(),
@@ -1838,6 +1911,7 @@ mod tests {
             errors_skipped: 0,
             entities_fts_failed: 0,
             notes_fts_failed: 1,
+            epoch_bump_failed: false,
         };
         assert!(
             report.has_failures(),
@@ -2420,6 +2494,7 @@ mod tests {
             errors_skipped: 0,
             entities_fts_failed: 1,
             notes_fts_failed: 0,
+            epoch_bump_failed: false,
         };
         assert!(
             report.has_failures(),

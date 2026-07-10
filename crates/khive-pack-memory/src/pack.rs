@@ -6,12 +6,14 @@ use async_trait::async_trait;
 use serde_json::Value;
 
 use khive_runtime::pack::PackRuntime;
-use khive_runtime::{KhiveRuntime, NamespaceToken, RuntimeError, VerbRegistry};
+use khive_runtime::{
+    KhiveRuntime, NamespaceToken, PackSchemaPlan, RuntimeError, SchemaPlan, VerbRegistry,
+};
 use khive_types::{HandlerDef, Pack, ParamDef, VerbCategory, Visibility};
 
 use khive_brain_core::BalancedRecallState;
 
-use crate::ann::{new_shared, SharedAnn};
+use crate::ann::{new_shared, SharedAnn, MEMORY_SCHEMA_PLAN_STMTS};
 use crate::config::RecallConfig;
 use crate::query_cache::QueryEmbeddingCache;
 
@@ -72,6 +74,14 @@ impl Pack for MemoryPack {
     const ENTITY_KINDS: &'static [&'static str] = &[];
     const HANDLERS: &'static [HandlerDef] = &MEMORY_HANDLERS;
     const REQUIRES: &'static [&'static str] = &["kg"];
+    /// `memory_ann_epoch` (#812 review REQUEST CHANGES MEDIUM — pack schema
+    /// contract): declared here instead of created inline on the epoch
+    /// bump/read path, matching every other pack-auxiliary table in this
+    /// codebase (ADR-028). Applied at boot by `server.rs`/`serve.rs`.
+    const SCHEMA_PLAN: Option<PackSchemaPlan> = Some(PackSchemaPlan {
+        pack: "memory",
+        statements: &MEMORY_SCHEMA_PLAN_STMTS,
+    });
 }
 
 // Illocutionary classification (Searle 1976):
@@ -385,6 +395,13 @@ impl PackRuntime for MemoryPack {
 
     fn requires(&self) -> &'static [&'static str] {
         <MemoryPack as Pack>::REQUIRES
+    }
+
+    fn schema_plan(&self) -> SchemaPlan {
+        SchemaPlan {
+            pack: "memory",
+            statements: &MEMORY_SCHEMA_PLAN_STMTS,
+        }
     }
 
     async fn warm(&self) {

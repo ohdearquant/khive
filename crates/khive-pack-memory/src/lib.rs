@@ -28,3 +28,17 @@ pub async fn bump_memory_ann_epoch(
 ) -> Result<u64, khive_runtime::RuntimeError> {
     ann::bump_durable_epoch(rt).await
 }
+
+/// Ensure the `memory_ann_epoch` table exists on `rt` (idempotent, #812
+/// review REQUEST CHANGES MEDIUM — pack schema contract). Declared via
+/// `MemoryPack::SCHEMA_PLAN` for daemon boot (`server.rs`/`serve.rs` apply
+/// every loaded pack's schema plan up front), but `kkernel reindex` runs
+/// directly against a raw `KhiveRuntime` without ever booting a pack
+/// registry — it calls this explicitly, once, before its first
+/// `bump_memory_ann_epoch`, so a reindex against a brand-new database (no
+/// daemon ever started) doesn't fail before this table exists.
+pub async fn ensure_ann_epoch_schema(
+    rt: &khive_runtime::KhiveRuntime,
+) -> Result<(), khive_runtime::RuntimeError> {
+    ann::ensure_epoch_schema(rt).await
+}
