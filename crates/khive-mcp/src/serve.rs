@@ -5167,26 +5167,66 @@ id = "lambda:project-actor"
             }
         }
 
+        /// The ADR-094 lifecycle-event subsequence the sequencing test
+        /// asserts on. The shared `FakeEventStore` also receives every
+        /// dispatch's audit event and each `comm.heartbeat` write, so raw
+        /// `store.events.len()` is not a proxy for "how many lifecycle
+        /// events landed" -- it inflates far faster than the six events
+        /// this test actually cares about, which is why convergence must
+        /// be checked against this filtered view, not the raw count.
+        fn lifecycle_sequence(store: &FakeEventStore) -> Vec<khive_types::EventKind> {
+            store
+                .events
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|e| e.kind)
+                .filter(|k| {
+                    matches!(
+                        k,
+                        khive_types::EventKind::ChannelPollStarted
+                            | khive_types::EventKind::ChannelPollSucceeded
+                            | khive_types::EventKind::ChannelPollFailed
+                            | khive_types::EventKind::ChannelBackoffArmed
+                            | khive_types::EventKind::ChannelBackoffReset
+                    )
+                })
+                .collect()
+        }
+
         /// Drive the paused virtual clock forward in small steps, yielding
         /// after each one, until the fake store has recorded at least
-        /// `target` events. A single big `advance` can outrun a timer the
-        /// polled task hasn't registered yet (the task only arms its next
-        /// `sleep` after cooperative scheduling lets it run back around the
-        /// loop), so this steps forward repeatedly instead of guessing one
-        /// jump that is simultaneously long enough to fire the next timer
-        /// and short enough not to skip past it unregistered.
+        /// `target` lifecycle events (see [`lifecycle_sequence`]). A single
+        /// big `advance` can outrun a timer the polled task hasn't
+        /// registered yet (the task only arms its next `sleep` after
+        /// cooperative scheduling lets it run back around the loop), so
+        /// this steps forward repeatedly instead of guessing one jump that
+        /// is simultaneously long enough to fire the next timer and short
+        /// enough not to skip past it unregistered.
+        ///
+        /// The loop's own `comm.*` dispatches land on `spawn_blocking`
+        /// (`khive-db`'s writer runs on tokio's real OS-thread blocking
+        /// pool), so how many `advance`/`yield_now` rounds this needs to
+        /// converge depends on real thread-pool scheduling latency, not on
+        /// virtual time -- a fixed iteration count is really a proxy for
+        /// real wall-clock patience, and a bigger fixed count doesn't buy
+        /// more of it if the loop itself runs each round near-instantly in
+        /// real time. Bounding on an actual wall-clock deadline instead
+        /// gives the blocking pool as much real time as it needs under
+        /// load, while still failing fast (with a clear message) if the
+        /// condition is genuinely never met.
         async fn advance_until(store: &FakeEventStore, target: usize) {
-            // khive #449: the poll loop now also dispatches comm.cursor_get /
-            // comm.cursor_commit each iteration, and the first cursor_get
-            // bootstraps the comm_channel_cursor schema -- under this test's
-            // paused clock that bootstrap needs several more cooperative
-            // sleep/wake round-trips to settle than a bare heartbeat write
-            // did, so the iteration budget is higher than a single
-            // fail-then-recover episode would otherwise need.
-            for _ in 0..2000 {
-                if store.events.lock().unwrap().len() >= target {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+            loop {
+                if lifecycle_sequence(store).len() >= target {
                     return;
                 }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "lifecycle event sequence did not reach {target} events within 60s of \
+                     wall-clock time; got {:?}",
+                    lifecycle_sequence(store)
+                );
                 tokio::time::advance(std::time::Duration::from_millis(250)).await;
                 for _ in 0..10 {
                     tokio::task::yield_now().await;
@@ -5232,21 +5272,7 @@ id = "lambda:project-actor"
 
             task.abort();
 
-            let events = store.events.lock().unwrap();
-            let sequence: Vec<khive_types::EventKind> = events
-                .iter()
-                .map(|e| e.kind)
-                .filter(|k| {
-                    matches!(
-                        k,
-                        khive_types::EventKind::ChannelPollStarted
-                            | khive_types::EventKind::ChannelPollSucceeded
-                            | khive_types::EventKind::ChannelPollFailed
-                            | khive_types::EventKind::ChannelBackoffArmed
-                            | khive_types::EventKind::ChannelBackoffReset
-                    )
-                })
-                .collect();
+            let sequence = lifecycle_sequence(&store);
 
             assert_eq!(
                 sequence,
@@ -5422,8 +5448,25 @@ id = "lambda:project-actor"
             ));
 
             // Two happy-path 5s ticks: the first drives the partial-failure
-            // page, the second drives the retry the fix must produce.
-            for _ in 0..20 {
+            // page, the second drives the retry the fix must produce. Poll
+            // for the retry directly (rather than blindly running a fixed
+            // number of ticks) and bound the wait by a real wall-clock
+            // deadline, not a virtual-time/iteration budget -- the loop's
+            // `comm.*` dispatches land on `spawn_blocking`'s real OS-thread
+            // pool, so how many advance/yield rounds this needs depends on
+            // real thread-pool scheduling latency, which a fixed count
+            // cannot account for under load.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+            loop {
+                if observed_checkpoints.lock().unwrap().len() >= 2 {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the loop must have retried at least once within 60s of wall-clock \
+                     time: {:?}",
+                    observed_checkpoints.lock().unwrap()
+                );
                 tokio::time::advance(std::time::Duration::from_secs(5)).await;
                 for _ in 0..20 {
                     tokio::task::yield_now().await;
@@ -5468,6 +5511,107 @@ id = "lambda:project-actor"
                 1,
                 "the message that succeeded on the failed page must not be \
                  double-stored once the retry re-delivers the whole page: {notes:?}"
+            );
+        }
+
+        /// A channel whose every `poll_page` call returns an empty page with
+        /// a `next_checkpoint` that `comm.cursor_commit` itself rejects
+        /// (`generation: 0` is outside its documented `1..=i64::MAX` range).
+        /// Exercises the daemon's `commit_channel_cursor`-`Err` branch
+        /// (issue #449 Blocker fix): every other test in this module drives
+        /// a `cursor_get` failure or a `comm.ingest` failure, never a
+        /// rejected commit itself, so that branch was otherwise dead from
+        /// this suite's perspective.
+        struct CommitRejectedChannel {
+            call_count: AtomicUsize,
+        }
+
+        #[async_trait]
+        impl Channel for CommitRejectedChannel {
+            fn kind(&self) -> &'static str {
+                "mock_commit_rejected"
+            }
+
+            async fn send(&self, _envelope: ChannelEnvelope) -> Result<(), ChannelError> {
+                Ok(())
+            }
+
+            async fn poll(
+                &self,
+                _since: DateTime<Utc>,
+            ) -> Result<Vec<ChannelEnvelope>, ChannelError> {
+                panic!("the daemon poll loop must call poll_page, not poll");
+            }
+
+            async fn poll_page(
+                &self,
+                _since: DateTime<Utc>,
+                _checkpoint: Option<&StoredChannelCheckpoint>,
+            ) -> Result<ChannelPollPage, ChannelError> {
+                self.call_count.fetch_add(1, Ordering::SeqCst);
+                Ok(ChannelPollPage {
+                    envelopes: vec![],
+                    next_checkpoint: Some(ChannelCheckpoint {
+                        source: SOURCE.to_string(),
+                        generation: 0,
+                        high_water: Some(1),
+                    }),
+                })
+            }
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn rejected_cursor_commit_leaves_no_committed_checkpoint() {
+            let channel = Arc::new(CommitRejectedChannel {
+                call_count: AtomicUsize::new(0),
+            });
+            let mut ch_registry = ChannelRegistry::new();
+            ch_registry.register(channel.clone());
+
+            let runtime = KhiveRuntime::memory().expect("in-memory runtime");
+            let mut builder = VerbRegistryBuilder::new();
+            builder.register(khive_pack_kg::KgPack::new(runtime.clone()));
+            builder.register(khive_pack_comm::CommPack::new(runtime.clone()));
+            let registry = builder.build().expect("registry builds");
+
+            let task = tokio::spawn(channel_poll_loop(
+                Arc::new(ch_registry),
+                registry.clone(),
+                "test-ns".to_string(),
+                "actor:test".to_string(),
+            ));
+
+            // Wait for at least two poll_page calls (deterministic condition
+            // on the channel's own call counter, not a fixed tick budget):
+            // the second call proves the loop went all the way around after
+            // the first call's rejected commit, giving that commit's async
+            // dispatch chain every chance to finish before asserting on its
+            // durable effect. Bounded on real wall-clock time, not virtual
+            // time, since the underlying `comm.*` dispatches land on
+            // `spawn_blocking`'s real OS-thread pool.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+            loop {
+                if channel.call_count.load(Ordering::SeqCst) >= 2 {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "poll_page was not called at least twice within 60s of wall-clock time"
+                );
+                tokio::time::advance(std::time::Duration::from_millis(250)).await;
+                for _ in 0..10 {
+                    tokio::task::yield_now().await;
+                }
+            }
+            task.abort();
+
+            let restored =
+                load_channel_cursor(&registry, "mock_commit_rejected", "mock_commit_rejected")
+                    .await
+                    .expect("cursor_get must succeed");
+            assert!(
+                restored.is_none(),
+                "a rejected cursor_commit must not leave a committed checkpoint: {restored:?}"
             );
         }
 
