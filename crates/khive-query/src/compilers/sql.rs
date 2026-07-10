@@ -106,6 +106,23 @@ impl Default for CompileOptions {
     }
 }
 
+/// Build a truncation warning when the caller's requested limit (or the
+/// implicit default of `max_limit` when no `LIMIT` clause is present)
+/// exceeds the server-side safety cap (issue #777). Returns `None` when the
+/// effective limit is at or below the cap — a query that never asked for
+/// more than `max_limit` rows was not truncated by the clamp.
+fn truncation_warning(requested_limit: Option<usize>, max_limit: usize) -> Option<String> {
+    let effective = requested_limit.unwrap_or(max_limit);
+    if effective > max_limit {
+        Some(format!(
+            "result set capped at {max_limit} rows; requested limit {effective} exceeds the \
+             cap — use LIMIT/OFFSET to page through the remaining results"
+        ))
+    } else {
+        None
+    }
+}
+
 /// Compile a `GqlQuery` AST to a parameterized SQL string and bound parameters.
 pub fn compile(query: &GqlQuery, opts: &CompileOptions) -> Result<CompiledQuery, QueryError> {
     if query.pattern.elements.is_empty() {
@@ -121,7 +138,10 @@ pub fn compile(query: &GqlQuery, opts: &CompileOptions) -> Result<CompiledQuery,
     } else {
         compile_fixed_length(&query, opts)?
     };
-    compiled.warnings = warnings;
+    // compile_fixed_length/compile_variable_length may already have pushed a
+    // truncation warning (clamp sites) onto `compiled.warnings` — extend,
+    // don't overwrite, so both sources of warnings survive.
+    compiled.warnings.extend(warnings);
 
     // Defense-in-depth: assert the emitted SQL is SELECT-only.
     // The parsers already reject write-shaped input; this guard ensures a future
@@ -559,6 +579,7 @@ fn compile_fixed_length(
         }
     }
 
+    let limit_warning = truncation_warning(query.limit, opts.max_limit);
     let limit = query.limit.unwrap_or(opts.max_limit).min(opts.max_limit);
     let limit_i64 = i64::try_from(limit)
         .map_err(|_| QueryError::InvalidInput("limit exceeds i64::MAX".into()))?;
@@ -577,7 +598,7 @@ fn compile_fixed_length(
         sql,
         params,
         return_vars: query.return_items.clone(),
-        warnings: Vec::new(),
+        warnings: limit_warning.into_iter().collect(),
     })
 }
 
@@ -1136,6 +1157,7 @@ fn compile_variable_length(
         end_conditions.push(format!("t.depth >= ?{}", params.len()));
     }
 
+    let limit_warning = truncation_warning(query.limit, opts.max_limit);
     let limit = query.limit.unwrap_or(opts.max_limit).min(opts.max_limit);
     let limit_i64 = i64::try_from(limit)
         .map_err(|_| QueryError::InvalidInput("limit exceeds i64::MAX".into()))?;
@@ -1309,7 +1331,7 @@ fn compile_variable_length(
         sql,
         params,
         return_vars: query.return_items.clone(),
-        warnings: Vec::new(),
+        warnings: limit_warning.into_iter().collect(),
     })
 }
 
@@ -1526,6 +1548,77 @@ mod tests {
             matches!(limit_param, QueryValue::Integer(500)),
             "expected Integer(500), got {limit_param:?}"
         );
+    }
+
+    #[test]
+    fn limit_over_cap_emits_truncation_warning() {
+        // LIMIT 1000 against the default max_limit=500 — the clamp applies AND
+        // the caller must be told the result set was truncated (issue #777).
+        let q = gql::parse("MATCH (a:concept)-[e]->(b) RETURN a LIMIT 1000").unwrap();
+        let compiled = compile(&q, &opts()).unwrap();
+        assert_eq!(
+            compiled.warnings.len(),
+            1,
+            "warnings: {:?}",
+            compiled.warnings
+        );
+        let warning = &compiled.warnings[0];
+        assert!(warning.contains("500"), "warning: {warning}");
+        assert!(warning.contains("1000"), "warning: {warning}");
+    }
+
+    #[test]
+    fn limit_exactly_at_cap_emits_no_truncation_warning() {
+        // LIMIT 500 == max_limit exactly — nothing was dropped, no warning.
+        let q = gql::parse("MATCH (a:concept)-[e]->(b) RETURN a LIMIT 500").unwrap();
+        let compiled = compile(&q, &opts()).unwrap();
+        assert!(
+            compiled.warnings.is_empty(),
+            "warnings: {:?}",
+            compiled.warnings
+        );
+    }
+
+    #[test]
+    fn limit_below_cap_emits_no_truncation_warning() {
+        // Explicit LIMIT 100, well under the 500 cap — not truncated.
+        let q = gql::parse("MATCH (a:concept)-[e]->(b) RETURN a LIMIT 100").unwrap();
+        let compiled = compile(&q, &opts()).unwrap();
+        assert!(
+            compiled.warnings.is_empty(),
+            "warnings: {:?}",
+            compiled.warnings
+        );
+    }
+
+    #[test]
+    fn no_explicit_limit_defaults_to_cap_with_no_warning() {
+        // No LIMIT clause at all defaults to max_limit exactly — the compiler
+        // cannot know the true match count, so it does not warn (compile-time
+        // signal only; see issue #777 design note).
+        let q = gql::parse("MATCH (a:concept)-[e]->(b) RETURN a").unwrap();
+        let compiled = compile(&q, &opts()).unwrap();
+        assert!(
+            compiled.warnings.is_empty(),
+            "warnings: {:?}",
+            compiled.warnings
+        );
+    }
+
+    #[test]
+    fn variable_length_limit_over_cap_emits_truncation_warning() {
+        // Same clamp-site coverage for the variable-length/traversal compile path.
+        let q = gql::parse("MATCH (a)-[:extends*1..3]->(b) RETURN b LIMIT 5000").unwrap();
+        let compiled = compile(&q, &opts()).unwrap();
+        assert_eq!(
+            compiled.warnings.len(),
+            1,
+            "warnings: {:?}",
+            compiled.warnings
+        );
+        let warning = &compiled.warnings[0];
+        assert!(warning.contains("500"), "warning: {warning}");
+        assert!(warning.contains("5000"), "warning: {warning}");
     }
 
     #[test]
