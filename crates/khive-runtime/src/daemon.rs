@@ -1885,23 +1885,28 @@ mod tests {
         let sock = dir.path().join("khived.sock");
         let pid_file = dir.path().join("khived.pid");
 
-        // This daemon's original bind — captured identity, then simulate the
-        // process exiting (listener dropped, socket path removed) before a
-        // replacement daemon rebinds the same path with a new inode.
-        let original_identity = {
-            let listener =
-                std::os::unix::net::UnixListener::bind(&sock).expect("bind original socket");
-            let id = socket_identity(&sock);
-            drop(listener);
-            let _ = std::fs::remove_file(&sock);
-            id
-        };
+        // A synthetic "this daemon's original bind" identity, distinct from
+        // any (dev, ino) a real bind could produce. A prior version of this
+        // test derived `original_identity` from a real bind/drop/rebind cycle
+        // at the same path, trusting the OS to hand the replacement a fresh
+        // inode — but some filesystems (observed on ext4-backed /tmp under
+        // cargo-llvm-cov's slower instrumented linux builds) can recycle the
+        // just-freed inode for the very next create in an otherwise-empty
+        // directory, occasionally making "original" and "replacement" collide
+        // and flipping this negative test's `cleaned` result to `true`. Only
+        // the *mismatch* between `bound_identity` and the real replacement
+        // socket's identity is under test here, so pinning it synthetically
+        // removes that OS-dependent source of flakiness without changing what
+        // the test proves.
+        let original_identity = Some(SocketIdentity {
+            dev: u64::MAX,
+            ino: u64::MAX,
+        });
         std::fs::write(&pid_file, std::process::id().to_string())
             .expect("write pid file matching this process");
 
-        // Replacement daemon binds the same path — new inode, same PID file
-        // path (not yet overwritten, e.g. write still in flight) — the socket
-        // identity mismatch alone must be enough to block cleanup.
+        // Replacement daemon binds the path for real — the socket identity
+        // mismatch alone must be enough to block cleanup.
         let _replacement_listener =
             std::os::unix::net::UnixListener::bind(&sock).expect("bind replacement socket");
 
