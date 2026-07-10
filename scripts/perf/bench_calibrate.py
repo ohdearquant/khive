@@ -46,6 +46,7 @@ import json
 import os
 import pathlib
 import re
+import signal
 import statistics
 import subprocess
 import sys
@@ -78,6 +79,57 @@ def _git_dirty() -> bool:
     return bool(out.stdout.strip())
 
 
+def _revalidate_same_sha(expected_sha: str, allow_dirty: bool, when: str) -> str | None:
+    """Recheck HEAD sha + worktree cleanliness. Returns an error message, or None if clean."""
+    sha = _git_sha()
+    if sha != expected_sha:
+        return (
+            f"HEAD sha changed {when} (expected {expected_sha}, now {sha}) - "
+            "same-SHA calibration invalidated."
+        )
+    if not allow_dirty and _git_dirty():
+        return f"git worktree became dirty {when} - same-SHA calibration invalidated."
+    return None
+
+
+class ChildFailure(RuntimeError):
+    """Raised when a suite subprocess exits nonzero. Fails the whole calibration closed."""
+
+    def __init__(self, run_dir: pathlib.Path, returncode: int):
+        self.run_dir = run_dir
+        self.returncode = returncode
+        super().__init__(
+            f"child process exited {returncode} (run dir: {run_dir}) - aborting before "
+            "metric extraction; no profile written."
+        )
+
+
+class SchemaError(RuntimeError):
+    """Raised when a suite's stdout/report does not match the required metric schema."""
+
+
+def _kill_process_tree(proc: subprocess.Popen) -> None:
+    """Terminate the whole process group launched for `proc` (start_new_session=True).
+
+    subprocess timeouts only kill the direct child; suites spawn a kkernel/daemon
+    descendant that would otherwise survive the timeout and keep holding the DB/socket.
+    """
+    try:
+        pgid = os.getpgid(proc.pid)
+    except ProcessLookupError:
+        return
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        try:
+            os.killpg(pgid, sig)
+        except ProcessLookupError:
+            return
+        try:
+            proc.wait(timeout=5)
+            return
+        except subprocess.TimeoutExpired:
+            continue
+
+
 # ── suite: pipeline ───────────────────────────────────────────────────────────
 
 _PIPELINE_MEAN_PAK_RE = re.compile(r"Mean Precision@K=([\d.]+)\s+floor=[\d.]+")
@@ -91,6 +143,16 @@ _PIPELINE_QUERY_RE = re.compile(
 )
 _PIPELINE_GATE_RE = re.compile(r"^Gate: (PASS|FAIL)$", re.MULTILINE)
 
+# QUERIES in bench_pipeline_daemon.py is a fixed 15-row list; each row yields 5
+# per-query metrics (p_at_k, vec_p_at_k, kw_p_at_k, top_k_hits, p50_us) plus 7
+# summary/gate metrics (mean p@k x3, p50/p95/n_latencies, gate_pass) = 82 total.
+_PIPELINE_EXPECTED_QUERY_ROWS = 15
+_PIPELINE_METRICS_PER_QUERY = 5
+_PIPELINE_SUMMARY_METRIC_COUNT = 7
+_PIPELINE_EXPECTED_METRIC_COUNT = (
+    _PIPELINE_EXPECTED_QUERY_ROWS * _PIPELINE_METRICS_PER_QUERY + _PIPELINE_SUMMARY_METRIC_COUNT
+)
+
 
 def _pipeline_build_cmd(run_dir: pathlib.Path, extra_args: list[str]) -> list[str]:
     return [sys.executable, str(PIPELINE_SCRIPT), *extra_args]
@@ -100,31 +162,55 @@ def _pipeline_extract(run_dir: pathlib.Path, proc: subprocess.CompletedProcess) 
     stdout = proc.stdout
     metrics: dict[str, float] = {}
 
-    m = _PIPELINE_MEAN_PAK_RE.search(stdout)
-    if m:
-        metrics["mean_precision_at_k"] = float(m.group(1))
-    m = _PIPELINE_MEAN_VEC_RE.search(stdout)
-    if m:
-        metrics["mean_precision_vector_only"] = float(m.group(1))
-    m = _PIPELINE_MEAN_KW_RE.search(stdout)
-    if m:
-        metrics["mean_precision_keyword_only"] = float(m.group(1))
-    m = _PIPELINE_LATENCY_RE.search(stdout)
-    if m:
-        metrics["p50_us"] = float(m.group(1))
-        metrics["p95_us"] = float(m.group(2))
-        metrics["n_latencies"] = float(m.group(3))
-    m = _PIPELINE_GATE_RE.search(stdout)
-    if m:
-        metrics["gate_pass"] = 1.0 if m.group(1) == "PASS" else 0.0
+    def _require(m: re.Match | None, desc: str) -> re.Match:
+        if m is None:
+            raise SchemaError(
+                f"pipeline stdout missing expected {desc}; see {run_dir}/stdout.log"
+            )
+        return m
 
-    for qm in _PIPELINE_QUERY_RE.finditer(stdout):
+    m = _require(_PIPELINE_MEAN_PAK_RE.search(stdout), "mean Precision@K summary line")
+    metrics["mean_precision_at_k"] = float(m.group(1))
+    m = _require(_PIPELINE_MEAN_VEC_RE.search(stdout), "mean VectorOnly P@K summary line")
+    metrics["mean_precision_vector_only"] = float(m.group(1))
+    m = _require(_PIPELINE_MEAN_KW_RE.search(stdout), "mean KeywordOnly P@K summary line")
+    metrics["mean_precision_keyword_only"] = float(m.group(1))
+    m = _require(_PIPELINE_LATENCY_RE.search(stdout), "p50/p95/n_latencies summary line")
+    metrics["p50_us"] = float(m.group(1))
+    metrics["p95_us"] = float(m.group(2))
+    metrics["n_latencies"] = float(m.group(3))
+    m = _require(_PIPELINE_GATE_RE.search(stdout), "'Gate: PASS/FAIL' line")
+    metrics["gate_pass"] = 1.0 if m.group(1) == "PASS" else 0.0
+
+    query_rows = list(_PIPELINE_QUERY_RE.finditer(stdout))
+    if len(query_rows) != _PIPELINE_EXPECTED_QUERY_ROWS:
+        raise SchemaError(
+            f"expected {_PIPELINE_EXPECTED_QUERY_ROWS} per-query rows in pipeline stdout, "
+            f"found {len(query_rows)}; see {run_dir}/stdout.log"
+        )
+
+    seen_topics: set[str] = set()
+    for qm in query_rows:
         topic = qm.group(1).strip().replace(" ", "_")
+        if topic in seen_topics:
+            raise SchemaError(
+                f"duplicate per-query row for topic {topic!r} in pipeline stdout; "
+                f"see {run_dir}/stdout.log"
+            )
+        seen_topics.add(topic)
         metrics[f"query.{topic}.p_at_k"] = float(qm.group(2))
         metrics[f"query.{topic}.vec_p_at_k"] = float(qm.group(3))
         metrics[f"query.{topic}.kw_p_at_k"] = float(qm.group(4))
         metrics[f"query.{topic}.top_k_hits"] = float(qm.group(5))
         metrics[f"query.{topic}.p50_us"] = float(qm.group(6))
+
+    if len(metrics) != _PIPELINE_EXPECTED_METRIC_COUNT:
+        raise SchemaError(
+            f"expected exactly {_PIPELINE_EXPECTED_METRIC_COUNT} pipeline metrics "
+            f"({_PIPELINE_EXPECTED_QUERY_ROWS} query rows x {_PIPELINE_METRICS_PER_QUERY} + "
+            f"{_PIPELINE_SUMMARY_METRIC_COUNT} summary), got {len(metrics)}; "
+            f"see {run_dir}/stdout.log"
+        )
 
     return metrics
 
@@ -158,7 +244,18 @@ def _load_extract(run_dir: pathlib.Path, proc: subprocess.CompletedProcess) -> d
     else:
         # Fallback: the script also prints the same JSON report as its last
         # stdout write when --report could not be written for some reason.
-        report = json.loads(proc.stdout.strip().splitlines()[-1])
+        try:
+            report = json.loads(proc.stdout.strip().splitlines()[-1])
+        except (IndexError, json.JSONDecodeError) as exc:
+            raise SchemaError(
+                f"no {_LOAD_REPORT_FILENAME} written and stdout does not end in a JSON "
+                f"report; see {run_dir}/stdout.log"
+            ) from exc
+
+    if "dimensions" not in report:
+        raise SchemaError(
+            f"load report missing required 'dimensions' key; see {report_path}"
+        )
 
     metrics: dict[str, float] = {}
     _flatten_numeric("", report.get("dimensions", {}), metrics)
@@ -167,6 +264,11 @@ def _load_extract(run_dir: pathlib.Path, proc: subprocess.CompletedProcess) -> d
     for k, v in report.get("op_error_counts", {}).items():
         metrics[f"op_error_counts.{k}"] = float(v)
     metrics["smoke_pass"] = 1.0 if report.get("smoke_result") == "PASS" else 0.0
+
+    if not metrics:
+        raise SchemaError(
+            f"no numeric metrics extracted from load report; see {report_path}"
+        )
     return metrics
 
 
@@ -190,8 +292,10 @@ SUITES = {
         # Cheap local defaults: bench-embedder (no GPU lock), small
         # worker/tenant fan-out. Override entirely via --suite-arg (each
         # --suite-arg token is appended after these, so pass the full
-        # desired flag set, e.g. --suite-arg --workers --suite-arg 40, to
-        # widen the run).
+        # desired flag set, e.g. --suite-arg=--workers --suite-arg=40, to
+        # widen the run). Use the `=` form for dash-prefixed values -
+        # argparse's append action cannot tell a space-separated
+        # `--suite-arg --workers` from a new top-level flag.
         "default_args": [
             "--mode", "bench",
             "--workers", "8",
@@ -212,30 +316,52 @@ def _run_once(suite_name: str, run_dir: pathlib.Path, extra_args: list[str]) -> 
     suite = SUITES[suite_name]
     argv = suite["build_cmd"](run_dir, extra_args)
 
+    # run_dir is created fresh (exist_ok=False) by the caller for every
+    # invocation - home_dir must be too, so no run can read state (including
+    # a stale load_report.json) left behind by a prior run.
     home_dir = run_dir / "home"
-    home_dir.mkdir(parents=True, exist_ok=True)
+    home_dir.mkdir(parents=True, exist_ok=False)
     env = {**os.environ}
     env["HOME"] = str(home_dir)
 
     t0 = time.time()
-    proc = subprocess.run(
+    # start_new_session=True puts the child in its own process group so a
+    # timeout can kill the whole tree (kkernel/daemon descendants included),
+    # not just the direct child subprocess.run would otherwise leave orphaned.
+    proc = subprocess.Popen(
         argv,
         cwd=str(REPO_ROOT),
         env=env,
-        capture_output=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
         text=True,
-        timeout=suite["timeout_s"],
+        start_new_session=True,
     )
+    try:
+        stdout, stderr = proc.communicate(timeout=suite["timeout_s"])
+    except subprocess.TimeoutExpired:
+        _kill_process_tree(proc)
+        stdout, stderr = proc.communicate()
+        wall_s = time.time() - t0
+        (run_dir / "stdout.log").write_text(stdout or "")
+        (run_dir / "stderr.log").write_text(stderr or "")
+        (run_dir / "argv.txt").write_text(" ".join(argv) + "\n")
+        raise
     wall_s = time.time() - t0
 
-    (run_dir / "stdout.log").write_text(proc.stdout)
-    (run_dir / "stderr.log").write_text(proc.stderr)
+    (run_dir / "stdout.log").write_text(stdout)
+    (run_dir / "stderr.log").write_text(stderr)
     (run_dir / "argv.txt").write_text(" ".join(argv) + "\n")
 
-    metrics = suite["extract"](run_dir, proc)
+    # FAIL CLOSED: a nonzero child exit aborts before any metric extraction.
+    # No profile may be written from a run whose child process failed.
+    if proc.returncode != 0:
+        raise ChildFailure(run_dir, proc.returncode)
+
+    cp = subprocess.CompletedProcess(argv, proc.returncode, stdout, stderr)
+    metrics = suite["extract"](run_dir, cp)
     metrics["_wall_s"] = wall_s
-    metrics["_exit_code"] = float(proc.returncode)
-    return proc, metrics, wall_s
+    return cp, metrics, wall_s
 
 
 def _advisory_floor(vals: list[float], mean: float, std: float) -> float:
@@ -248,13 +374,19 @@ def _advisory_floor(vals: list[float], mean: float, std: float) -> float:
     return max(floor, 0.0)
 
 
+_CV_NEAR_ZERO_EPS = 1e-9
+
+
 def _build_profile(samples: dict[str, list[float]]) -> dict[str, dict]:
     profile = {}
     for name, vals in samples.items():
         n = len(vals)
         mean = statistics.fmean(vals)
-        std = statistics.pstdev(vals) if n > 1 else 0.0
-        cv = (std / mean) if mean else None
+        # Sample std (n-1 denominator, statistics.stdev) - a population std
+        # (statistics.pstdev) understates spread for the small same-SHA
+        # sample sizes (--runs) this harness is built around.
+        std = statistics.stdev(vals) if n > 1 else 0.0
+        cv = (std / mean) if abs(mean) > _CV_NEAR_ZERO_EPS else None
         profile[name] = {
             "n": n,
             "samples": vals,
@@ -315,7 +447,11 @@ def main() -> int:
         "--suite-arg",
         action="append",
         default=[],
-        help="extra argv token appended to the suite's default args (repeatable, e.g. --suite-arg --workers --suite-arg 40)",
+        help=(
+            "extra argv token appended to the suite's default args (repeatable). "
+            "For dash-prefixed values use the '=' form so argparse doesn't mistake "
+            "the value for a new flag, e.g. --suite-arg=--workers --suite-arg=40"
+        ),
     )
     ap.add_argument(
         "--allow-dirty",
@@ -343,24 +479,76 @@ def main() -> int:
 
     out_dir = pathlib.Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
-    runs_dir = out_dir / "runs" / f"{args.suite}_{short_sha}"
-    runs_dir.mkdir(parents=True, exist_ok=True)
+
+    # Fresh isolation per invocation: the run dir carries a nanosecond
+    # timestamp + pid suffix so two invocations at the same SHA never share
+    # (and can never silently read) each other's run artifacts. FAIL rather
+    # than reuse if this exact dir is somehow already there.
+    invocation_tag = f"{time.time_ns()}_{os.getpid()}"
+    runs_dir = out_dir / "runs" / f"{args.suite}_{short_sha}_{invocation_tag}"
+    if runs_dir.exists():
+        print(f"FATAL: run directory {runs_dir} already exists; refusing to reuse it.", file=sys.stderr)
+        return 2
+    runs_dir.mkdir(parents=True, exist_ok=False)
 
     suite = SUITES[args.suite]
     extra_args = [*suite["default_args"], *args.suite_arg]
 
     samples: dict[str, list[float]] = {}
     exit_codes = []
+    first_key_set: set[str] | None = None
     print(f"[calibrate] suite={args.suite} runs={args.runs} sha={short_sha}", flush=True)
     for i in range(args.runs):
+        err = _revalidate_same_sha(sha, args.allow_dirty, f"before run {i + 1}")
+        if err:
+            print(f"FATAL: {err} No profile written.", file=sys.stderr)
+            return 2
+
         run_dir = runs_dir / f"run{i + 1}"
-        run_dir.mkdir(parents=True, exist_ok=True)
+        if run_dir.exists():
+            print(f"FATAL: run directory {run_dir} already exists; refusing to reuse it.", file=sys.stderr)
+            return 2
+        run_dir.mkdir(parents=True, exist_ok=False)
+
         print(f"[calibrate] run {i + 1}/{args.runs}...", flush=True)
         try:
             proc, metrics, wall_s = _run_once(args.suite, run_dir, extra_args)
         except subprocess.TimeoutExpired:
-            print(f"[calibrate] run {i + 1} TIMED OUT after {suite['timeout_s']}s; aborting.", file=sys.stderr)
+            print(
+                f"[calibrate] run {i + 1} TIMED OUT after {suite['timeout_s']}s "
+                "(process group killed); aborting. No profile written.",
+                file=sys.stderr,
+            )
             return 1
+        except ChildFailure as exc:
+            print(f"[calibrate] FATAL on run {i + 1}: {exc}", file=sys.stderr)
+            return 1
+        except SchemaError as exc:
+            print(
+                f"[calibrate] FATAL: schema/cardinality check failed on run {i + 1}: {exc}\n"
+                "No profile written.",
+                file=sys.stderr,
+            )
+            return 1
+
+        key_set = set(metrics)
+        if first_key_set is None:
+            first_key_set = key_set
+        elif key_set != first_key_set:
+            added = sorted(key_set - first_key_set)
+            removed = sorted(first_key_set - key_set)
+            print(
+                f"[calibrate] FATAL: metric key-set drift on run {i + 1} vs run 1 "
+                f"(added={added} removed={removed}); aborting. No profile written.",
+                file=sys.stderr,
+            )
+            return 1
+
+        err = _revalidate_same_sha(sha, args.allow_dirty, f"after run {i + 1}")
+        if err:
+            print(f"FATAL: {err} No profile written.", file=sys.stderr)
+            return 2
+
         exit_codes.append(proc.returncode)
         for k, v in metrics.items():
             samples.setdefault(k, []).append(v)
