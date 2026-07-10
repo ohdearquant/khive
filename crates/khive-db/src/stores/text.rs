@@ -365,7 +365,15 @@ const FTS5_TRIGRAM_MIN_SAFE_LEN: usize = 3;
 ///
 /// - a query for content that only ever matched the pre-#397 merged
 ///   bareword (`khivepackmemory`) would silently stop matching — kept
-///   reachable via the legacy-merged alternative.
+///   reachable via the legacy-merged alternative. The merged form is
+///   dropped only when it is a literal duplicate of an alternative already
+///   emitted into the expression (the split AND-group's own space-joined
+///   content, or the quoted literal phrase) — not merely when it equals the
+///   *concatenation* of the split terms, which for an ordinary punctuated
+///   identifier (`khive-pack-memory`) is always true and would suppress the
+///   legacy alternative unconditionally, leaving rows stored under the
+///   pre-#397 merged token (`khivepackmemory`) unreachable under
+///   `unicode61`.
 /// - under the production `trigram` tokenizer, a split segment shorter
 ///   than [`FTS5_TRIGRAM_MIN_SAFE_LEN`] (e.g. the `07`/`10` in a
 ///   `2026-07-10` date) tokenizes to zero trigrams and silently drops out
@@ -424,11 +432,22 @@ fn sanitize_fts5_token_group(token: &str) -> Option<String> {
         && merged_terms
             .iter()
             .any(|t| t.chars().count() < FTS5_TRIGRAM_MIN_SAFE_LEN);
-    if !merged.is_empty() && merged != split_terms.join("") && !merged_has_unsafe_segment {
+    // Compare against the split AND-group's own space-joined content — the
+    // form it actually contributes to the expression — not the bare
+    // concatenation of its terms. For an ordinary punctuated identifier the
+    // concatenation always matches the merged bareword (both simply drop the
+    // separators), which suppressed this alternative unconditionally and cut
+    // off legacy-indexed content; a real duplicate only exists when the
+    // merge itself produced the same space-separated content the split group
+    // already emits (e.g. an operator token whose merge stays multi-term).
+    let phrase = sanitize_fts5_phrase_literal(token);
+    let duplicates_split = merged == split_terms.join(" ");
+    let duplicates_phrase = phrase.as_deref() == Some(merged.as_str());
+    if !merged.is_empty() && !duplicates_split && !duplicates_phrase && !merged_has_unsafe_segment {
         alternatives.push(merged);
     }
 
-    if let Some(phrase) = sanitize_fts5_phrase_literal(token) {
+    if let Some(phrase) = phrase {
         alternatives.push(format!("\"{}\"", phrase));
     }
 

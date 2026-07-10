@@ -638,6 +638,106 @@ async fn test_search_with_hyphenated_and_dotted_queries_matches_literal_tokens()
     }
 }
 
+/// Round-2 codex re-review regression: `sanitize_fts5_token_group` must keep
+/// the legacy-merged bareword alternative reachable for ordinary punctuated
+/// identifiers under `unicode61`. The merged form (`khivepackmemory`,
+/// `previd`) is content indexed before #397's split-terms change, or content
+/// whose own tokenizer collapsed punctuation the same way; a query for the
+/// punctuated spelling must still find it. Assert exact hit-id sets (not
+/// just "contains") so a fix that accidentally broadens the match — e.g. by
+/// dropping the trigram-safety gate on multi-term merges — is caught too.
+#[tokio::test]
+async fn test_search_matches_legacy_merged_and_punctuated_forms_exact_ids() {
+    let store = setup_memory_store("legacy_merged_punctuated");
+
+    let legacy_merged_id = Uuid::new_v4();
+    store
+        .upsert_document(make_document(
+            legacy_merged_id,
+            "doc",
+            "khivepackmemory legacy note",
+        ))
+        .await
+        .unwrap();
+
+    let punctuated_id = Uuid::new_v4();
+    store
+        .upsert_document(make_document(
+            punctuated_id,
+            "doc",
+            "khive-pack-memory crate",
+        ))
+        .await
+        .unwrap();
+
+    let legacy_prev_id = Uuid::new_v4();
+    store
+        .upsert_document(make_document(
+            legacy_prev_id,
+            "DSL docs",
+            "chain results with previd token",
+        ))
+        .await
+        .unwrap();
+
+    let punctuated_prev_id = Uuid::new_v4();
+    store
+        .upsert_document(make_document(
+            punctuated_prev_id,
+            "DSL docs",
+            "chain results with the $prev.id token",
+        ))
+        .await
+        .unwrap();
+
+    let unrelated_id = Uuid::new_v4();
+    store
+        .upsert_document(make_document(
+            unrelated_id,
+            "doc",
+            "completely unrelated content about gardening",
+        ))
+        .await
+        .unwrap();
+
+    for mode in [TextQueryMode::Plain, TextQueryMode::AnyTerm] {
+        for (query, expected_ids, label) in [
+            (
+                "khive-pack-memory",
+                vec![legacy_merged_id, punctuated_id],
+                "punctuated identifier reaches both legacy-merged and split forms",
+            ),
+            (
+                "$prev.id",
+                vec![legacy_prev_id, punctuated_prev_id],
+                "dollar+dot query reaches both legacy-merged and split forms",
+            ),
+        ] {
+            let hits = store
+                .search(TextSearchRequest {
+                    query: query.to_string(),
+                    mode: mode.clone(),
+                    filter: Some(ns_filter("test_ns")),
+                    top_k: 10,
+                    snippet_chars: 0,
+                })
+                .await
+                .unwrap();
+            let hit_ids: std::collections::HashSet<_> =
+                hits.iter().map(|hit| hit.subject_id).collect();
+            let expected: std::collections::HashSet<_> = expected_ids.into_iter().collect();
+            assert_eq!(
+                hit_ids, expected,
+                "unicode61 {mode:?} query {query:?} ({label}) must match exactly {expected:?}; got {hit_ids:?}"
+            );
+            assert!(
+                !hit_ids.contains(&unrelated_id),
+                "unicode61 {mode:?} query {query:?} ({label}) must not match unrelated doc {unrelated_id}; got {hit_ids:?}"
+            );
+        }
+    }
+}
+
 /// #397 Finding 2 regression: production defaults to the FTS5 `trigram`
 /// tokenizer (`backend.rs`'s `StorageBackend::text()`), and generic search
 /// (`operations.rs::search_notes`) queries it in `Plain` mode — neither of
