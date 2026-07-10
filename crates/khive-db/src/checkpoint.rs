@@ -1128,7 +1128,13 @@ mod tests {
         Arc::new(ConnectionPool::new(cfg).expect("pool open"))
     }
 
+    // `checkpoint_once` -> `query_wal_pages` writes the process-wide
+    // `LAST_WAL_PAGES` gauge and resets `CHECKPOINT_CONSECUTIVE_SKIPS`
+    // (see the reset-discipline comment on `reset_checkpoint_metrics_for_tests`
+    // above) — this must join the `checkpoint_skip_metrics` group so it can
+    // never interleave with a test asserting on those same gauges.
     #[test]
+    #[serial(checkpoint_skip_metrics)]
     fn checkpoint_once_succeeds_on_file_backed_pool() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("wal_test.db");
@@ -1155,6 +1161,7 @@ mod tests {
     }
 
     #[test]
+    #[serial(checkpoint_skip_metrics)]
     fn checkpoint_once_is_noop_on_in_memory_pool() {
         // In-memory databases do not use WAL; checkpoint_once must not panic.
         let cfg = PoolConfig {
@@ -1170,6 +1177,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial(checkpoint_skip_metrics)]
     async fn checkpoint_task_exits_when_pool_dropped() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("wal_task_drop.db");
@@ -1277,6 +1285,7 @@ mod tests {
     /// busy_timeout to 2000ms keeps the PASSIVE path well below 500ms while a
     /// TRUNCATE regression blocks for ~2000ms — a 4x safety margin on both sides.
     #[test]
+    #[serial(checkpoint_skip_metrics)]
     fn checkpoint_high_water_does_not_block_behind_reader() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("high_water_test.db");
@@ -2047,6 +2056,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial(checkpoint_skip_metrics)]
     async fn checkpoint_task_emits_outcome_events_while_elevated_and_stops_after_drain() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("outcome_emit.db");
@@ -2097,6 +2107,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial(checkpoint_skip_metrics)]
     async fn checkpoint_task_emits_nothing_while_healthy() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("outcome_no_emit.db");
@@ -2136,6 +2147,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial(checkpoint_skip_metrics)]
     async fn checkpoint_task_with_no_event_store_does_not_panic() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("outcome_none_store.db");
