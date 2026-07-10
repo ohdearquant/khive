@@ -102,27 +102,99 @@ async fn probe_cursor_advances_and_filters_since_us() {
 
     let t1 = 1_000_000_i64;
     let t2 = 2_000_000_i64;
-    let id2 = plant_inbound_message(&rt, actor, "lambda:khive", t2, None, false).await;
     plant_inbound_message(&rt, actor, "lambda:khive", t1, None, false).await;
 
-    let result = registry
-        .dispatch("comm.probe", json!({ "actor": actor, "since_us": t1 }))
+    // `cursor_us` is an opaque token round-tripped from a prior probe
+    // response (#780) -- not a raw timestamp a caller computes itself.
+    let first = registry
+        .dispatch("comm.probe", json!({ "actor": actor }))
+        .await
+        .expect("probe succeeds");
+    let cursor_1 = first["cursor_us"]
+        .as_i64()
+        .expect("cursor_us is an integer");
+    assert_eq!(first["new_messages"].as_array().unwrap().len(), 1);
+
+    let id2 = plant_inbound_message(&rt, actor, "lambda:khive", t2, None, false).await;
+
+    let second = registry
+        .dispatch(
+            "comm.probe",
+            json!({ "actor": actor, "since_us": cursor_1 }),
+        )
         .await
         .expect("probe succeeds");
 
-    assert_eq!(
-        result["cursor_us"],
-        json!(t2),
-        "cursor is the max created_at"
+    assert!(
+        second["cursor_us"].as_i64().unwrap() > cursor_1,
+        "cursor advances past the previous token"
     );
-    let messages = result["new_messages"].as_array().expect("array");
+    let messages = second["new_messages"].as_array().expect("array");
     assert_eq!(
         messages.len(),
         1,
-        "only the message strictly newer than since_us is returned: {messages:?}"
+        "only the message planted after cursor_1 is returned: {messages:?}"
     );
     assert_eq!(messages[0]["id"], json!(id2.to_string()));
     assert_eq!(messages[0]["created_at_us"], json!(t2));
+}
+
+/// Regression for #780: the probe cursor must be keyed on commit order
+/// (SQLite `rowid`), not the application-clock `created_at` stamped before a
+/// write acquires the writer critical section. Two concurrent writers can
+/// commit out of stamp order; a `created_at`-keyed cursor then permanently
+/// hides whichever row committed second but stamped an earlier clock read.
+#[tokio::test]
+async fn probe_survives_out_of_order_commit_vs_created_at() {
+    let (registry, rt) = build_registry();
+    let actor = "lambda:leo";
+
+    let t_high = 5_000_000_i64;
+    let t_low = 1_000_000_i64;
+
+    // "Winner" of the writer-lock race: commits FIRST, but its clock read
+    // (taken before the race) is LATER.
+    let id_winner = plant_inbound_message(&rt, actor, "lambda:khive", t_high, None, false).await;
+
+    let first = registry
+        .dispatch("comm.probe", json!({ "actor": actor }))
+        .await
+        .expect("probe succeeds");
+    let cursor_1 = first["cursor_us"]
+        .as_i64()
+        .expect("cursor_us is an integer");
+    let first_messages = first["new_messages"].as_array().expect("array");
+    assert!(
+        first_messages
+            .iter()
+            .any(|m| m["id"] == json!(id_winner.to_string())),
+        "first probe must see the winner message: {first_messages:?}"
+    );
+
+    // "Loser": commits SECOND, but its clock read (taken before it lost the
+    // writer-lock race) is EARLIER than the winner's.
+    let id_loser = plant_inbound_message(&rt, actor, "lambda:khive", t_low, None, false).await;
+
+    let second = registry
+        .dispatch(
+            "comm.probe",
+            json!({ "actor": actor, "since_us": cursor_1 }),
+        )
+        .await
+        .expect("probe succeeds");
+    let second_messages = second["new_messages"].as_array().expect("array");
+
+    // Under the OLD created_at-keyed cursor, t_low <= cursor_1 (t_high) would
+    // exclude the loser forever. Under the FIXED rowid-keyed cursor, the
+    // loser's rowid is still greater than cursor_1's, regardless of its
+    // created_at value.
+    assert_eq!(
+        second_messages.len(),
+        1,
+        "the loser message must be visible to the next probe, not permanently \
+         skipped: {second_messages:?}"
+    );
+    assert_eq!(second_messages[0]["id"], json!(id_loser.to_string()));
 }
 
 #[tokio::test]
@@ -369,7 +441,11 @@ async fn probe_ignores_messages_addressed_to_other_actors() {
         1,
         "a probe for one actor must not see another actor's inbound messages: {messages:?}"
     );
-    assert_eq!(result["cursor_us"], json!(1_000_000));
+    assert!(
+        result["cursor_us"].as_i64().unwrap() > 0,
+        "cursor must advance for the actor's own message, independent of the other \
+         actor's row: {result}"
+    );
 }
 
 #[tokio::test]
@@ -495,5 +571,44 @@ async fn probe_query_plan_uses_the_to_actor_index() {
     assert!(
         plan_text.contains("idx_comm_message_to_actor"),
         "query plan must use idx_comm_message_to_actor: {plan_text}"
+    );
+}
+
+/// Regression for #780's paired hazard: `comm.read` must patch a message's
+/// `properties` via a real `UPDATE`, not `upsert_note`'s `INSERT OR REPLACE`
+/// (a SQLite DELETE+INSERT on a primary-key conflict, which reassigns the
+/// row's implicit `rowid`). If `comm.read` churned `rowid`, marking an
+/// already-probed message as read could bump its `rowid` past the current
+/// cursor, resurrecting it as "new" on the next poll.
+#[tokio::test]
+async fn probe_read_does_not_resurrect_message_via_rowid_churn() {
+    let (registry, rt) = build_registry();
+    let actor = "lambda:leo";
+
+    let id = plant_inbound_message(&rt, actor, "lambda:khive", 1_000_000, None, false).await;
+
+    // Probe past it: the cursor now covers this message's rowid.
+    let first = registry
+        .dispatch("comm.probe", json!({ "actor": actor }))
+        .await
+        .expect("probe succeeds");
+    let cursor = first["cursor_us"]
+        .as_i64()
+        .expect("cursor_us is an integer");
+    assert_eq!(first["new_messages"].as_array().unwrap().len(), 1);
+
+    registry
+        .dispatch("comm.read", json!({ "id": id.to_string() }))
+        .await
+        .expect("comm.read succeeds");
+
+    let second = registry
+        .dispatch("comm.probe", json!({ "actor": actor, "since_us": cursor }))
+        .await
+        .expect("probe succeeds");
+    let second_messages = second["new_messages"].as_array().expect("array");
+    assert!(
+        second_messages.is_empty(),
+        "marking a message read must not resurrect it as new: {second_messages:?}"
     );
 }

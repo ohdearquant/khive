@@ -81,6 +81,35 @@ pub fn note_upsert_statement(note: &Note) -> SqlStatement {
     }
 }
 
+/// The exact `properties`/`updated_at` `UPDATE` this store's
+/// `update_note_properties` issues. A real `UPDATE` never triggers SQLite's
+/// `INSERT OR REPLACE` delete+insert, so the row's `rowid` stays stable
+/// across the call (#780: `comm.read` relies on this to avoid churning the
+/// `rowid`-backed `comm.probe` cursor).
+pub fn note_update_properties_statement(
+    id: Uuid,
+    properties: &Option<serde_json::Value>,
+    updated_at: i64,
+) -> SqlStatement {
+    let properties_str = properties
+        .as_ref()
+        .map(|v| serde_json::to_string(v).unwrap_or_default());
+    SqlStatement {
+        sql: "UPDATE notes SET properties = ?1, updated_at = ?2 \
+              WHERE id = ?3 AND deleted_at IS NULL"
+            .to_string(),
+        params: vec![
+            match properties_str {
+                Some(p) => SqlValue::Text(p),
+                None => SqlValue::Null,
+            },
+            SqlValue::Integer(updated_at),
+            SqlValue::Text(id.to_string()),
+        ],
+        label: Some("note-update-properties".to_string()),
+    }
+}
+
 /// The exact soft-delete `UPDATE` this store's `delete_note(Soft)` issues.
 pub fn note_soft_delete_statement(id: Uuid, deleted_at: i64) -> SqlStatement {
     SqlStatement {
@@ -488,6 +517,21 @@ impl NoteStore for SqlNoteStore {
             bind_params(&mut stmt, &statement.params)?;
             stmt.raw_execute()?;
             Ok(())
+        })
+        .await
+    }
+
+    async fn update_note_properties(
+        &self,
+        id: Uuid,
+        properties: Option<serde_json::Value>,
+        updated_at: i64,
+    ) -> Result<bool, StorageError> {
+        let statement = note_update_properties_statement(id, &properties, updated_at);
+        self.with_writer("update_note_properties", move |conn| {
+            let mut stmt = conn.prepare(&statement.sql)?;
+            bind_params(&mut stmt, &statement.params)?;
+            Ok(stmt.raw_execute()? > 0)
         })
         .await
     }

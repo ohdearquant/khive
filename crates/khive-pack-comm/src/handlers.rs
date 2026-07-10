@@ -283,7 +283,7 @@ pub(crate) async fn handle_read(
     let id = resolve_id(runtime, token, &p.id, "read").await?;
 
     let store = runtime.notes(token)?;
-    let mut note = store
+    let note = store
         .get_note(id)
         .await
         .map_err(|e| RuntimeError::Internal(format!("read: get_note: {e}")))?
@@ -316,16 +316,19 @@ pub(crate) async fn handle_read(
         )));
     }
 
-    // Merge `read: true` into properties.
+    // Merge `read: true` into properties and patch in place via a real
+    // `UPDATE` (not `upsert_note`'s `INSERT OR REPLACE`): the latter
+    // silently reassigns the row's `rowid` on a primary-key conflict, which
+    // would let a mark-as-read bump a message's `rowid` past the current
+    // `comm.probe` cursor and resurrect it as "new" on the next poll (#780).
     let mut props = note.properties.clone().unwrap_or_else(|| json!({}));
     props["read"] = json!(true);
-    note.properties = Some(props.clone());
-    note.updated_at = Utc::now().timestamp_micros();
+    let updated_at = Utc::now().timestamp_micros();
 
     store
-        .upsert_note(note)
+        .update_note_properties(id, Some(props.clone()), updated_at)
         .await
-        .map_err(|e| RuntimeError::Internal(format!("read: upsert_note: {e}")))?;
+        .map_err(|e| RuntimeError::Internal(format!("read: update_note_properties: {e}")))?;
 
     Ok(
         json!({ "id": short_id(id), "full_id": id.as_hyphenated().to_string(), "read": true, "properties": props }),
@@ -1369,10 +1372,24 @@ pub(crate) struct ProbeMessage {
 /// idx_comm_message_to_actor` is a regression fence: if a custom bootstrap
 /// skips comm schema-plan application, this query fails loudly instead of
 /// silently degrading to a table scan.
+///
+/// `cursor_us`/`since_us` are keyed on SQLite `rowid`, not `created_at`
+/// (#780): `created_at` is an application-clock read taken before a note's
+/// write acquires the writer critical section, so two concurrent writers can
+/// commit out of stamp order, so a `created_at`-keyed cursor can then advance
+/// past a row that committed *after* it, permanently hiding that row from
+/// every later probe. `rowid` is assigned by SQLite exactly once, inside the
+/// one active writer transaction, so it is monotonic with commit order by
+/// construction. The wire field names keep the `_us` suffix (frozen contract,
+/// ADR-D5) but the value is an opaque monotonic token, not a microsecond
+/// timestamp; do not revert this to `created_at`. `created_at_us` on each
+/// `new_messages` entry is unaffected: it stays a real display timestamp,
+/// still ordered ascending by `created_at` for readability, and carries no
+/// cursor guarantee of its own.
 const PROBE_SQL: &str = "WITH \
 stats AS ( \
     SELECT \
-        COALESCE(MAX(created_at), 0) AS cursor_us, \
+        COALESCE(MAX(rowid), 0) AS cursor_us, \
         COALESCE(SUM( \
             CASE \
                 WHEN (json_type(properties, '$.read') IS NULL \
@@ -1400,7 +1417,7 @@ new_rows AS ( \
       AND deleted_at IS NULL \
       AND json_extract(properties, '$.to_actor') = ?2 \
       AND json_extract(properties, '$.direction') = 'inbound' \
-      AND (?3 IS NULL OR created_at > ?3) \
+      AND (?3 IS NULL OR rowid > ?3) \
     ORDER BY created_at DESC \
     LIMIT 100 \
 ) \
