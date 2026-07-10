@@ -469,9 +469,11 @@ fn escape_like(input: &str) -> String {
 /// matches `path` (ADR-086 keying convention). Returns `None` when no match —
 /// v0 never creates documents on the ingester's behalf (skip the edge).
 ///
-/// An exact `source_uri`/`name` match always wins over the suffix-`LIKE`
-/// fallback: the two are queried separately so a wildcard-broadened
-/// candidate can never shadow an exact one under an unordered `LIMIT 1`.
+/// Exact and suffix-`LIKE` candidates are selected in a single query/snapshot
+/// so a document inserted between an exact-match read and a fallback read
+/// can never be missed by the exact branch, and a wildcard-broadened match
+/// can never shadow an exact one: the `ORDER BY` ranks exact matches first,
+/// with `id` as a deterministic tiebreaker.
 async fn find_document_for_path(
     runtime: &KhiveRuntime,
     token: &NamespaceToken,
@@ -483,43 +485,30 @@ async fn find_document_for_path(
         .unwrap_or(path);
     let sql = runtime.sql();
     let namespace = token.namespace().as_str().to_string();
+    let like_pattern = format!("%{}", escape_like(path));
 
     let mut r = sql.reader().await.map_err(|e| anyhow!("{e}"))?;
-    let exact_row = r
+    let row = r
         .query_row(SqlStatement {
             sql: "SELECT id FROM entities WHERE kind='document' AND namespace=?1 \
                   AND deleted_at IS NULL \
-                  AND (json_extract(properties,'$.source_uri')=?2 OR name=?3) \
+                  AND (json_extract(properties,'$.source_uri')=?2 OR name=?3 \
+                       OR json_extract(properties,'$.source_uri') LIKE ?4 ESCAPE '\\') \
+                  ORDER BY CASE WHEN json_extract(properties,'$.source_uri')=?2 OR name=?3 \
+                                THEN 0 ELSE 1 END, id \
                   LIMIT 1"
                 .into(),
             params: vec![
-                SqlValue::Text(namespace.clone()),
+                SqlValue::Text(namespace),
                 SqlValue::Text(path.to_string()),
                 SqlValue::Text(file_name.to_string()),
+                SqlValue::Text(like_pattern),
             ],
-            label: Some("git_ingest_find_document_for_path_exact".into()),
+            label: Some("git_ingest_find_document_for_path".into()),
         })
         .await
         .map_err(|e| anyhow!("{e}"))?;
-    if let Some(id) = exact_row.and_then(|r| row_uuid(&r)) {
-        return Ok(Some(id));
-    }
-
-    let like_pattern = format!("%{}", escape_like(path));
-    let mut r = sql.reader().await.map_err(|e| anyhow!("{e}"))?;
-    let like_row = r
-        .query_row(SqlStatement {
-            sql: "SELECT id FROM entities WHERE kind='document' AND namespace=?1 \
-                  AND deleted_at IS NULL \
-                  AND json_extract(properties,'$.source_uri') LIKE ?2 ESCAPE '\\' \
-                  LIMIT 1"
-                .into(),
-            params: vec![SqlValue::Text(namespace), SqlValue::Text(like_pattern)],
-            label: Some("git_ingest_find_document_for_path_like".into()),
-        })
-        .await
-        .map_err(|e| anyhow!("{e}"))?;
-    Ok(like_row.and_then(|r| row_uuid(&r)))
+    Ok(row.and_then(|r| row_uuid(&r)))
 }
 
 /// Read the last-ingested cursor value for `(project_id, kind)`, if any.
@@ -1668,6 +1657,31 @@ mod find_document_for_path_tests {
             resolved,
             Some(exact_id),
             "an exact source_uri match must always win over a suffix-LIKE candidate"
+        );
+    }
+
+    /// PR #816 r5 Major finding: running the exact-match read and the
+    /// LIKE-fallback read as two separate awaited queries left a TOCTOU gap
+    /// where a document inserted between them could still lose to the
+    /// unordered fallback `LIMIT 1`. Resolution must now happen in one
+    /// query/snapshot: both candidates are visible to the same `SELECT`, and
+    /// the `ORDER BY` — not read ordering — decides the exact match wins.
+    #[tokio::test]
+    async fn single_query_snapshot_prefers_exact_over_broadened() {
+        let rt = KhiveRuntime::memory().unwrap();
+        let token = rt.authorize(Namespace::local()).unwrap();
+
+        let path = "crates/khive-pack-git/src/toctou.rs";
+        let broadened_suffix_path = "other/crates/khive-pack-git/src/toctou.rs";
+        let exact_id = create_document(&rt, &token, path).await;
+        create_document(&rt, &token, broadened_suffix_path).await;
+
+        let resolved = find_document_for_path(&rt, &token, path).await.unwrap();
+        assert_eq!(
+            resolved,
+            Some(exact_id),
+            "a single query covering both exact and broadened candidates \
+             must still rank the exact match first, regardless of insertion order"
         );
     }
 }
