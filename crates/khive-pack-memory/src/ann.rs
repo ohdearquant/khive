@@ -498,7 +498,24 @@ pub(crate) async fn ensure_ann_background(
     // runs fully off the response path, unawaited.
     khive_runtime::track_background_task(async move {
         let _warming_guard = warming_guard;
-        if let Ok(token) = rt.authorize(Namespace::local()) {
+        // #812 review MEDIUM (reconfirm): a write landing while this task's
+        // own build is in flight bumps the generation counter, but that
+        // write's own `ensure_ann_background` call finds `warming` already
+        // occupied by this task and silently no-ops (the fire-once guard
+        // above) — nobody else is queued to pick that write up. The old
+        // single-attempt body relied entirely on some LATER `memory.recall`
+        // noticing `is_current` is false and re-firing this function; with
+        // no further recalls the index stayed stale forever, breaking
+        // ADR-107's per-write rebuild bound. Loop here instead: after each
+        // attempt, re-check whether the write-generation counter moved past
+        // the floor THIS attempt started from — if a write raced in during
+        // the build, immediately re-enqueue another attempt against this
+        // same task rather than waiting on an external caller.
+        loop {
+            let Ok(token) = rt.authorize(Namespace::local()) else {
+                break;
+            };
+            let attempt_floor = current_generation(&ann, &key).await;
             match ensure_ann_for_model(&rt, &token, &ann, &model).await {
                 Ok(status) => {
                     tracing::debug!(?status, model = %model, "memory ANN background warm complete");
@@ -508,10 +525,19 @@ pub(crate) async fn ensure_ann_background(
                     // spawn_blocking was cancelled by runtime teardown, not a
                     // backend failure — don't alarm on it.
                     tracing::debug!(error = %e, model = %model, "memory ANN background warm cancelled at shutdown");
+                    break;
                 }
                 Err(e) => {
                     tracing::warn!(error = %e, model = %model, "memory ANN background build failed");
+                    break;
                 }
+            }
+            if current_generation(&ann, &key).await <= attempt_floor {
+                // Nothing raced in while we built — either the corpus is
+                // fully caught up, or (e.g. an empty corpus with no further
+                // writes) there is nothing new to catch up to. Either way,
+                // looping again would spin without making progress.
+                break;
             }
         }
     });
@@ -735,21 +761,32 @@ async fn ensure_ann_for_model_inner(
     }
 
     // Try snapshot warm-load. Both the shallow `CorpusFingerprint` (vector
-    // count + dimensions) AND the durable `CorpusContentSignal` (count + max
-    // `updated_at`) must match the live corpus (#812 review HIGH-2):
+    // count + dimensions) AND the durable `CorpusContentHash` (a blake3 hash
+    // of the exact ordered subject-id + embedding-byte rows a build consumes)
+    // must match the live corpus (#812 review re-confirm HIGH-A/HIGH-B):
     // write-generations reset to 0 on restart, so on a cold process the
     // fingerprint alone is the only signal deciding Hot vs. Stale — and a
-    // delete-one/add-one or a content re-embed preserves vector count and
-    // dimensions exactly while changing what the corpus actually contains.
-    // The content signal catches that: a new or edited note always carries
-    // a fresher `updated_at` than every prior row, so the signal changes
-    // even when the fingerprint doesn't.
+    // delete-one/add-one, a content re-embed, OR a vector-only re-embed
+    // (`kkernel reindex`, which overwrites embeddings without touching
+    // `notes.updated_at`) all preserve vector count and dimensions exactly
+    // while changing what the corpus actually contains. Hashing the raw
+    // embedding bytes themselves (not a proxy like `updated_at`) catches all
+    // three, and computing it here from a fresh scan of the SAME rows a
+    // rebuild would read — rather than a separate cheap aggregate query
+    // sampled at a different instant — closes the race where a
+    // same-cardinality write lands between "what the graph was built from"
+    // and "what the signal was sampled from".
     if let Some(persisted) = try_load_snapshot(rt, ns, model).await {
         let current_fp = compute_memory_fingerprint(rt, token, model).await;
-        let current_signal = compute_corpus_content_signal(rt, token, model).await;
         let fp_matches = current_fp.is_some_and(|fp| persisted.snapshot.fingerprint == fp);
-        let signal_matches = current_signal.is_some_and(|sig| persisted.content_signal == sig);
-        if fp_matches && signal_matches {
+        // Only pay for the full corpus-hash scan when the cheap fingerprint
+        // already agrees — a fingerprint mismatch alone is enough to know a
+        // rebuild is needed.
+        let hash_matches = fp_matches
+            && compute_corpus_content_hash(rt, token, model)
+                .await
+                .is_some_and(|hash| persisted.content_hash == hash);
+        if fp_matches && hash_matches {
             match AnnBridge::from_snapshot(persisted.snapshot) {
                 Ok(mut bridge) => {
                     // Populate namespace set from a cheap DISTINCT query so the
@@ -772,8 +809,8 @@ async fn ensure_ann_for_model_inner(
                 namespace = %ns,
                 model = %model,
                 fp_matches,
-                signal_matches,
-                "stale memory Vamana snapshot (fingerprint or content-signal mismatch); rebuilding"
+                hash_matches,
+                "stale memory Vamana snapshot (fingerprint or content-hash mismatch); rebuilding"
             );
         }
     }
@@ -791,7 +828,7 @@ async fn ensure_ann_for_model_inner(
     // overwrite that later result, regardless of which one finishes first.
     let fp_before = compute_memory_fingerprint(rt, token, model).await;
     match load_and_build_from_vector_store(rt, token, model).await {
-        Ok(Some(bridge)) => {
+        Ok(Some((bridge, content_hash))) => {
             let fp_after = compute_memory_fingerprint(rt, token, model).await;
             // If fingerprint changed during the scan, the corpus raced; discard.
             if fp_before != fp_after {
@@ -805,19 +842,15 @@ async fn ensure_ann_for_model_inner(
             let vector_count = bridge.id_map.len();
             let bridge = bridge.with_generation(target_generation);
             if let Some(fingerprint) = fp_after {
-                // Best-effort: if the content signal can't be computed right
-                // now, skip persisting rather than write a snapshot with no
-                // durable staleness check at all (a missing signal would
-                // otherwise need a placeholder that either always matches —
-                // defeating the fix — or never matches — forcing every future
-                // warm to rebuild).
-                if let Some(content_signal) = compute_corpus_content_signal(rt, token, model).await
+                // `content_hash` was computed from the exact rows this
+                // build's own scan read (#812 review re-confirm HIGH-B) —
+                // no separate sampling read, so there is no window between
+                // "what the graph was built from" and "what got persisted
+                // as the freshness signal" for a race to land in.
+                if let Err(e) =
+                    persist_snapshot(rt, ns, model, &bridge, fingerprint, content_hash).await
                 {
-                    if let Err(e) =
-                        persist_snapshot(rt, ns, model, &bridge, fingerprint, content_signal).await
-                    {
-                        tracing::warn!(error = %e, "failed to persist memory Vamana snapshot");
-                    }
+                    tracing::warn!(error = %e, "failed to persist memory Vamana snapshot");
                 }
             }
             install_if_fresher(ann, &key, bridge).await;
@@ -923,13 +956,14 @@ async fn compute_memory_fingerprint(
     })
 }
 
-/// Scan all non-deleted `note.content` vectors across all namespaces for `model` and build an
-/// `AnnBridge`. Returns `Ok(None)` when the corpus is empty or inaccessible.
+/// Scan all non-deleted `note.content` vectors across all namespaces for `model`, build an
+/// `AnnBridge`, and hash the exact rows the build consumed (#812 review
+/// re-confirm HIGH-B). Returns `Ok(None)` when the corpus is empty or inaccessible.
 async fn load_and_build_from_vector_store(
     rt: &KhiveRuntime,
     token: &NamespaceToken,
     model: &str,
-) -> Result<Option<AnnBridge>, RuntimeError> {
+) -> Result<Option<(AnnBridge, CorpusContentHash)>, RuntimeError> {
     let store = match rt.vectors_for_model(token, model) {
         Ok(s) => s,
         Err(_) => return Ok(None),
@@ -973,6 +1007,15 @@ async fn load_and_build_from_vector_store(
     let mut id_map: Vec<Uuid> = Vec::with_capacity(rows.len());
     let mut flat: Vec<f32> = Vec::with_capacity(rows.len() * dims);
     let mut namespace_set: HashSet<String> = HashSet::new();
+    // Hashed row-by-row, in the SAME loop that feeds `flat`/`id_map` below —
+    // not a separate query run before or after this scan — so the persisted
+    // signal can never describe a different corpus snapshot than the graph
+    // that gets built from it (#812 review re-confirm HIGH-B). Hashes the
+    // raw, un-normalized embedding bytes (not `notes.updated_at`), so a
+    // vector-only re-embed that never touches the notes table — exactly
+    // what `kkernel reindex` does — still changes the hash (#812 review
+    // re-confirm HIGH-A).
+    let mut hasher = blake3::Hasher::new();
 
     for row in &rows {
         let id_str = match row.get("subject_id") {
@@ -997,6 +1040,8 @@ async fn load_and_build_from_vector_store(
         if let Some(SqlValue::Text(ns)) = row.get("namespace") {
             namespace_set.insert(ns.clone());
         }
+        hasher.update(uuid.as_bytes());
+        hasher.update(bytes);
         id_map.push(uuid);
         flat.extend_from_slice(&vec);
     }
@@ -1004,6 +1049,8 @@ async fn load_and_build_from_vector_store(
     if id_map.is_empty() {
         return Ok(None);
     }
+
+    let content_hash = CorpusContentHash(*hasher.finalize().as_bytes());
 
     // #791: `AnnBridge::build` (via `VamanaIndex::build`) is a plain
     // synchronous, CPU-bound full graph construction — training the SQ8
@@ -1023,12 +1070,13 @@ async fn load_and_build_from_vector_store(
                     e,
                 ))
             })??;
-    Ok(Some(built))
+    Ok(Some((built, content_hash)))
 }
 
 // ── persistence ───────────────────────────────────────────────────────────────
 
-/// Durable content signal for a model's live corpus (#812 review HIGH-2).
+/// Durable content signal for a model's live corpus (#812 review re-confirm
+/// HIGH-A/HIGH-B).
 ///
 /// `CorpusFingerprint` (vector count + dimensions) is preserved by a
 /// delete-one/add-one or a content re-embed, and write-generations
@@ -1036,17 +1084,16 @@ async fn load_and_build_from_vector_store(
 /// so on a cold process the fingerprint is the only signal deciding whether
 /// a persisted snapshot is still current, and a same-cardinality corpus
 /// change would be classified Hot forever with no rebuild ever triggered.
-/// `max_updated_at` closes that gap: a newly added or edited note always
-/// carries a fresher `updated_at` than every prior row in the corpus, so
-/// this signal changes on exactly the patterns the fingerprint misses.
+/// A blake3 hash of the ordered `(subject_id, embedding)` rows closes that
+/// gap completely: any change to which rows exist, their ordering, or their
+/// embedding bytes changes the hash — including a vector-only re-embed
+/// (`kkernel reindex`) that never touches `notes.updated_at` at all, which a
+/// timestamp-based signal cannot see (#812 review re-confirm HIGH-A).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-struct CorpusContentSignal {
-    count: u64,
-    max_updated_at: i64,
-}
+struct CorpusContentHash([u8; 32]);
 
 /// On-disk wrapper persisted into `retrieval_snapshots.snapshot` in place of
-/// a bare `VamanaSnapshot`, so the durable content signal travels with the
+/// a bare `VamanaSnapshot`, so the durable content hash travels with the
 /// snapshot it was computed against. A pre-existing bare-`VamanaSnapshot`
 /// blob (persisted before this field existed) fails to deserialize as this
 /// wrapper and is treated as corrupt by `try_load_snapshot`'s existing
@@ -1055,49 +1102,74 @@ struct CorpusContentSignal {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct PersistedMemorySnapshot {
     snapshot: VamanaSnapshot,
-    content_signal: CorpusContentSignal,
+    content_hash: CorpusContentHash,
 }
 
-/// Compute `model`'s durable content signal (#812 review HIGH-2): the
-/// live-note vector count plus the maximum `updated_at` across those rows.
-/// Cheap — a single aggregate query, no embedding blobs read — unlike a full
-/// content hash, which would require the same corpus scan a rebuild does.
-async fn compute_corpus_content_signal(
+/// Recompute `model`'s durable content hash directly from the store (#812
+/// review re-confirm HIGH-A/HIGH-B), for restart validation ONLY — the build
+/// path computes its own hash from the exact rows it scans in
+/// `load_and_build_from_vector_store`, in the same read, rather than calling
+/// this. Deliberately NOT a cheap aggregate: it re-reads every live
+/// `note.content` embedding blob for `model`, in the same row order
+/// (`ORDER BY v.subject_id`) the build itself uses, so a match here means
+/// "the persisted snapshot was built from exactly this corpus" rather than
+/// merely "the row count and a timestamp line up".
+async fn compute_corpus_content_hash(
     rt: &KhiveRuntime,
     token: &NamespaceToken,
     model: &str,
-) -> Option<CorpusContentSignal> {
-    let _ = rt.vectors_for_model(token, model).ok()?;
+) -> Option<CorpusContentHash> {
+    let store = rt.vectors_for_model(token, model).ok()?;
+    let info = store.info().await.ok()?;
+    if info.dimensions == 0 {
+        return None;
+    }
+    let dims = info.dimensions;
     let table_name = format!("vec_{}", sanitize_model_key(model));
     let sql = rt.sql();
     let mut reader = sql.reader().await.ok()?;
     let rows = reader
         .query_all(SqlStatement {
             sql: format!(
-                "SELECT COUNT(*) AS n, MAX(n.updated_at) AS max_updated FROM {table_name} v \
+                "SELECT v.subject_id, v.embedding FROM {table_name} v \
                  JOIN notes n ON n.id = v.subject_id \
                  WHERE v.embedding_model = ?1 \
                    AND v.kind = 'note' AND v.field = 'note.content' \
-                   AND n.deleted_at IS NULL"
+                   AND n.deleted_at IS NULL \
+                 ORDER BY v.subject_id"
             ),
             params: vec![SqlValue::Text(model.to_owned())],
-            label: Some("memory_ann_content_signal".into()),
+            label: Some("memory_ann_content_hash".into()),
         })
         .await
         .ok()?;
-    let row = rows.first()?;
-    let count = match row.get("n")? {
-        SqlValue::Integer(n) if *n >= 0 => *n as u64,
-        _ => return None,
-    };
-    let max_updated_at = match row.get("max_updated") {
-        Some(SqlValue::Integer(v)) => *v,
-        _ => 0,
-    };
-    Some(CorpusContentSignal {
-        count,
-        max_updated_at,
-    })
+
+    let mut hasher = blake3::Hasher::new();
+    let mut any_row = false;
+    for row in &rows {
+        let id_str = match row.get("subject_id") {
+            Some(SqlValue::Text(s)) => s.as_str(),
+            _ => continue,
+        };
+        let uuid = match Uuid::parse_str(id_str) {
+            Ok(id) => id,
+            Err(_) => continue,
+        };
+        let bytes = match row.get("embedding") {
+            Some(SqlValue::Blob(b)) => b.as_slice(),
+            _ => continue,
+        };
+        if bytes.len() != dims * 4 {
+            continue;
+        }
+        hasher.update(uuid.as_bytes());
+        hasher.update(bytes);
+        any_row = true;
+    }
+    if !any_row {
+        return None;
+    }
+    Some(CorpusContentHash(*hasher.finalize().as_bytes()))
 }
 
 async fn ensure_snapshot_schema(rt: &KhiveRuntime) -> Result<(), RuntimeError> {
@@ -1130,7 +1202,7 @@ async fn persist_snapshot(
     model: &str,
     bridge: &AnnBridge,
     fingerprint: CorpusFingerprint,
-    content_signal: CorpusContentSignal,
+    content_hash: CorpusContentHash,
 ) -> Result<(), RuntimeError> {
     if let Err(e) = ensure_snapshot_schema(rt).await {
         tracing::warn!(error = %e, "failed to create retrieval_snapshots schema");
@@ -1141,7 +1213,7 @@ async fn persist_snapshot(
         .map_err(|e| RuntimeError::Internal(format!("to_snapshot: {e}")))?;
     let persisted = PersistedMemorySnapshot {
         snapshot,
-        content_signal,
+        content_hash,
     };
     let blob = serde_json::to_vec(&persisted)
         .map_err(|e| RuntimeError::Internal(format!("snapshot serialize: {e}")))?;
@@ -1301,10 +1373,7 @@ mod tests {
                     vector_count: 1,
                     dimensions: 4,
                 },
-                CorpusContentSignal {
-                    count: 1,
-                    max_updated_at: 0,
-                },
+                CorpusContentHash([0u8; 32]),
             )
             .await
             .expect("persist snapshot");
@@ -2015,20 +2084,21 @@ mod tests {
         );
     }
 
-    // ── #812 review HIGH-2: restart validation needs a durable content signal ─
+    // ── #812 review re-confirm HIGH-A/HIGH-B: content-hash restart validation ─
 
-    /// Reviewer-requested regression test (#812 review HIGH-2): a
-    /// delete-one/add-one that preserves vector count and dimensions must
-    /// still be detected as stale by a fresh `AnnState` (simulating a
-    /// process restart, where write-generations reset to 0) so the model is
-    /// rebuilt instead of silently serving the outdated snapshot forever.
+    /// Reviewer-requested regression test (#812 review HIGH-2, still valid
+    /// under the content-hash redesign): a delete-one/add-one that preserves
+    /// vector count and dimensions must still be detected as stale by a
+    /// fresh `AnnState` (simulating a process restart, where write-generations
+    /// reset to 0) so the model is rebuilt instead of silently serving the
+    /// outdated snapshot forever.
     ///
     /// Fail-on-revert: reverting `ensure_ann_for_model_inner` to compare only
     /// `CorpusFingerprint` (vector count + dimensions) makes the second warm
     /// below take the Hot/`LoadedSnapshot` path instead of `Built`, because
     /// the corpus still has 4 vectors at the same dimensionality.
     #[tokio::test]
-    async fn ensure_ann_for_model_restart_content_signal_mismatch_triggers_rebuild() {
+    async fn ensure_ann_for_model_restart_content_hash_mismatch_triggers_rebuild() {
         const MODEL: &str = "ann-warm-restart-signal-test-model";
         const DIMS: usize = 8;
         let rt = test_runtime_with_hash_embedder(MODEL, DIMS);
@@ -2100,6 +2170,166 @@ mod tests {
             "a same-cardinality corpus content change must be detected as \
              stale and force a rebuild rather than silently loading the \
              outdated snapshot forever (#812 review HIGH-2), got: {status:?}"
+        );
+    }
+
+    /// Reviewer-requested regression test (#812 review re-confirm HIGH-A): a
+    /// vector-only re-embed — same note IDs, same count, same dimensions,
+    /// same `notes.updated_at` (never touched) but different embedding
+    /// bytes, exactly what `kkernel reindex` produces — must still be
+    /// detected as stale by restart validation.
+    ///
+    /// Fail-on-revert: reverting `compute_corpus_content_hash` (or the
+    /// build-side hash it's paired against) back to the old
+    /// `CorpusContentSignal` (count + `MAX(notes.updated_at)`) makes the
+    /// second warm below wrongly take the Hot/`LoadedSnapshot` path, because
+    /// neither the count nor `updated_at` changed — only the embedding bytes
+    /// did.
+    #[tokio::test]
+    async fn ensure_ann_for_model_restart_detects_vector_only_reindex() {
+        const MODEL: &str = "ann-warm-restart-vector-only-reindex-model";
+        const DIMS: usize = 8;
+        let rt = test_runtime_with_hash_embedder(MODEL, DIMS);
+
+        let token = rt.authorize(Namespace::local()).expect("authorize local");
+        let mut note_ids = Vec::new();
+        for i in 0..4u32 {
+            let note = rt
+                .create_note_with_decay_for_embedding_model(
+                    &token,
+                    "memory",
+                    None,
+                    &format!("vector-only reindex note {i}"),
+                    Some(0.7),
+                    0.01,
+                    None,
+                    vec![],
+                    None,
+                )
+                .await
+                .expect("create note");
+            note_ids.push(note.id);
+        }
+
+        let ann1 = new_shared();
+        let status = ensure_ann_for_model(&rt, &token, &ann1, MODEL)
+            .await
+            .expect("first warm");
+        assert!(
+            matches!(status, AnnEnsureStatus::Built { vectors: 4 }),
+            "expected a fresh build over 4 vectors, got: {status:?}"
+        );
+
+        // Simulate `kkernel reindex`: overwrite the embedding blob for one
+        // note directly in the vector table, bypassing
+        // `create_note_with_decay_for_embedding_model` entirely so
+        // `notes.updated_at` is never touched — same as reindex.rs's
+        // `embed_and_store_batch` path, which writes vectors without
+        // touching the notes table at all.
+        {
+            let table_name = format!("vec_{}", sanitize_model_key(MODEL));
+            let replacement: Vec<f32> = (0..DIMS).map(|i| (i as f32 + 100.0) / 7.0).collect();
+            let bytes: Vec<u8> = replacement.iter().flat_map(|f| f.to_le_bytes()).collect();
+            let sql = rt.sql();
+            let mut w = sql.writer().await.expect("writer");
+            w.execute(SqlStatement {
+                sql: format!(
+                    "UPDATE {table_name} SET embedding = ?1 \
+                     WHERE subject_id = ?2 AND embedding_model = ?3"
+                ),
+                params: vec![
+                    SqlValue::Blob(bytes),
+                    SqlValue::Text(note_ids[0].to_string()),
+                    SqlValue::Text(MODEL.to_string()),
+                ],
+                label: Some("test_vector_only_reindex".into()),
+            })
+            .await
+            .expect("overwrite embedding");
+        }
+
+        // "Restart": a fresh `AnnState`, generations reset to 0 — matches a
+        // real restart exactly, and also matches `kkernel reindex` running
+        // as a separate process from the daemon, which shares no in-memory
+        // generation state with it at all.
+        let ann2 = new_shared();
+        let status = ensure_ann_for_model(&rt, &token, &ann2, MODEL)
+            .await
+            .expect("post-reindex warm");
+        assert!(
+            matches!(status, AnnEnsureStatus::Built { vectors: 4 }),
+            "a vector-only re-embed that never touches notes.updated_at must \
+             still be detected as stale and force a rebuild (#812 review \
+             re-confirm HIGH-A), got: {status:?}"
+        );
+    }
+
+    // ── #812 review re-confirm MEDIUM: high-water re-enqueue on drop ────────
+
+    /// Reviewer-requested regression test (#812 review re-confirm MEDIUM): a
+    /// write landing while a background warm is already in flight must
+    /// eventually converge WITHOUT any later `memory.recall` or
+    /// `memory.remember` re-triggering the warm — the in-flight task's own
+    /// loop must notice the generation moved past what it built for and
+    /// re-enqueue itself.
+    ///
+    /// Fail-on-revert: reverting `ensure_ann_background`'s tracked task back
+    /// to a single `ensure_ann_for_model` attempt (no loop) makes this test
+    /// flaky-to-failing: whenever the `bump_generation` call below lands
+    /// after the task has already captured its build floor, nothing is left
+    /// to notice the index fell behind, and `is_current` never becomes true
+    /// within the poll budget.
+    #[tokio::test]
+    #[serial(background_tasks)]
+    async fn ensure_ann_background_converges_on_write_during_warm_with_no_further_recalls() {
+        const MODEL: &str = "ann-warm-medium-reenqueue-test-model";
+        const DIMS: usize = 8;
+        let rt = test_runtime_with_hash_embedder(MODEL, DIMS);
+
+        let token = rt.authorize(Namespace::local()).expect("authorize local");
+        // A few hundred notes so the graph build takes long enough (spawn_blocking
+        // I/O + Vamana construction) to reliably still be in flight when the
+        // `bump_generation` call right below executes.
+        for i in 0..300u32 {
+            rt.create_note_with_decay_for_embedding_model(
+                &token,
+                "memory",
+                None,
+                &format!("medium re-enqueue note {i}"),
+                Some(0.7),
+                0.01,
+                None,
+                vec![],
+                None,
+            )
+            .await
+            .expect("create note");
+        }
+
+        let ann = new_shared();
+        let key = AnnKey::from_token(&token, MODEL);
+
+        assert!(
+            ensure_ann_background(&rt, &token, &ann, MODEL).await,
+            "first call for a fresh key must start a background warm"
+        );
+        // Simulate a write racing in while the warm above is still building —
+        // bump the generation exactly like `memory.remember` does, but
+        // deliberately do NOT call `ensure_ann_background` again: the whole
+        // point is that no second caller ever arrives to notice or retrigger.
+        bump_generation(&ann, &key).await;
+
+        for _ in 0..500 {
+            if is_current(&ann, &key).await {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            is_current(&ann, &key).await,
+            "a write racing in during an in-flight warm must eventually be \
+             picked up and converge on its own, with zero further recalls or \
+             writes to retrigger it (#812 review re-confirm MEDIUM)"
         );
     }
 }

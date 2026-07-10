@@ -636,6 +636,16 @@ pub async fn run_reindex(args: ReindexArgs) -> Result<()> {
         // `global::memory_vamana::*`; old per-ns rows are orphaned and waste space.
         purge_stale_memory_vamana_snapshots(&rt).await;
 
+        // Invalidate the ACTIVE global memory Vamana snapshot too (#812 review
+        // re-confirm HIGH-A defense in depth). Its key (`global::memory_vamana::*`)
+        // never matched `invalidate_vamana_snapshots`'s `{namespace}::vamana::%`
+        // pattern above, so the note re-embed this pass just did left that
+        // snapshot installed and untouched — the content-hash restart check in
+        // `khive-pack-memory::ann` is the primary defense against a daemon
+        // trusting it afterward, but deleting it here forces a rebuild on the
+        // very next warm regardless, without depending on that check alone.
+        invalidate_active_memory_vamana_snapshot(&rt).await;
+
         // Drop per-namespace FTS partition tables that survived the V4 migration
         // (tables created by the runtime before the migration ran, or on databases
         // that were migrated but not swept). The sweep is guarded: it only runs
@@ -824,6 +834,49 @@ async fn purge_stale_memory_vamana_snapshots(rt: &KhiveRuntime) {
             let msg = e.to_string();
             if !msg.contains("no such table") {
                 tracing::warn!(error = %e, "failed to purge stale memory Vamana snapshots");
+            }
+        }
+    }
+}
+
+/// Delete the ACTIVE global memory Vamana snapshot row (`global::memory_vamana::*`),
+/// distinct from `purge_stale_memory_vamana_snapshots`'s legacy-row cleanup above
+/// (#812 review re-confirm HIGH-A defense in depth). Reindex rewrites note
+/// embeddings directly, bypassing `memory.remember`, so it never bumps the memory
+/// pack's in-memory write-generation counter — that daemon-side signal simply
+/// cannot see this change. Best-effort: a missing table or SQL failure is logged
+/// and ignored, matching this file's other snapshot-maintenance helpers.
+async fn invalidate_active_memory_vamana_snapshot(rt: &KhiveRuntime) {
+    use khive_storage::types::{SqlStatement, SqlValue};
+    let sql = rt.sql();
+    let Ok(mut writer) = sql.writer().await else {
+        return;
+    };
+    // `retrieval_snapshots.namespace` holds the FULL composite key produced by
+    // `ann::snapshot_key` (`"global::memory_vamana::{model}"`), not a bare
+    // namespace — matching on `namespace = 'global'` would never match any row.
+    match writer
+        .execute(SqlStatement {
+            sql: "DELETE FROM retrieval_snapshots \
+                  WHERE index_type = 'memory_vamana' AND namespace LIKE ?1"
+                .into(),
+            params: vec![SqlValue::Text("global::memory_vamana::%".into())],
+            label: Some("invalidate_active_memory_vamana_snapshot".into()),
+        })
+        .await
+    {
+        Ok(deleted) => {
+            if deleted > 0 {
+                tracing::info!(
+                    deleted,
+                    "invalidated active global memory Vamana snapshot after reindex"
+                );
+            }
+        }
+        Err(e) => {
+            let msg = e.to_string();
+            if !msg.contains("no such table") {
+                tracing::warn!(error = %e, "failed to invalidate active memory Vamana snapshot");
             }
         }
     }
@@ -1171,6 +1224,86 @@ mod tests {
         assert!(
             !remaining.contains(&"local::vamana::model-b".to_string()),
             "local vamana model-b must be deleted: {remaining:?}"
+        );
+    }
+
+    /// Reviewer-requested regression test (#812 review re-confirm HIGH-A
+    /// defense in depth): the active global memory Vamana snapshot row must
+    /// be deleted by `invalidate_active_memory_vamana_snapshot`, since
+    /// `invalidate_vamana_snapshots`'s `{namespace}::vamana::%` pattern never
+    /// matches the memory pack's distinct `global::memory_vamana::*` key.
+    #[tokio::test]
+    async fn test_reindex_invalidates_active_memory_vamana_snapshot() {
+        let rt = KhiveRuntime::memory().expect("in-memory runtime");
+        let sql = rt.sql();
+
+        let mut w = sql.writer().await.expect("writer");
+        w.execute_script(
+            "CREATE TABLE IF NOT EXISTS retrieval_snapshots (\
+             namespace TEXT NOT NULL, \
+             index_type TEXT NOT NULL, \
+             snapshot BLOB NOT NULL, \
+             created_at INTEGER NOT NULL, \
+             PRIMARY KEY (namespace, index_type));"
+                .into(),
+        )
+        .await
+        .expect("create table");
+
+        for (ns, idx_type) in &[
+            ("global::memory_vamana::model-a", "memory_vamana"),
+            ("local::vamana::model-a", "vamana"),
+            ("local::memory_vamana::model-a", "memory_vamana"),
+        ] {
+            w.execute(SqlStatement {
+                sql: "INSERT INTO retrieval_snapshots \
+                      (namespace, index_type, snapshot, created_at) \
+                      VALUES (?1, ?2, ?3, 0)"
+                    .into(),
+                params: vec![
+                    SqlValue::Text(ns.to_string()),
+                    SqlValue::Text(idx_type.to_string()),
+                    SqlValue::Blob(b"{}".to_vec()),
+                ],
+                label: None,
+            })
+            .await
+            .expect("insert row");
+        }
+        drop(w);
+
+        invalidate_active_memory_vamana_snapshot(&rt).await;
+
+        let mut r = sql.reader().await.expect("reader");
+        let rows = r
+            .query_all(SqlStatement {
+                sql: "SELECT namespace FROM retrieval_snapshots ORDER BY namespace".into(),
+                params: vec![],
+                label: None,
+            })
+            .await
+            .expect("query");
+
+        let remaining: Vec<String> = rows
+            .iter()
+            .filter_map(|row| match row.get("namespace") {
+                Some(SqlValue::Text(s)) => Some(s.clone()),
+                _ => None,
+            })
+            .collect();
+
+        assert!(
+            !remaining.contains(&"global::memory_vamana::model-a".to_string()),
+            "the active global memory Vamana snapshot must be deleted: {remaining:?}"
+        );
+        assert!(
+            remaining.contains(&"local::vamana::model-a".to_string()),
+            "unrelated knowledge Vamana rows must survive: {remaining:?}"
+        );
+        assert!(
+            remaining.contains(&"local::memory_vamana::model-a".to_string()),
+            "legacy per-namespace memory Vamana rows are purge_stale_memory_vamana_snapshots's \
+             job, not this function's: {remaining:?}"
         );
     }
 
