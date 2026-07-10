@@ -15,7 +15,7 @@ khive gives your agent:
 9. **Brain** — Bayesian profile tuning from feedback signals
 10. **Session** — persist and resume agent-session records
 
-All 9 packs load by default. **77 public verbs** across the packs — the `git` pack
+All 9 packs load by default. **78 public verbs** across the packs — the `git` pack
 contributes the `git.digest` verb plus the commit/issue/pull_request provenance note kinds
 and a batch ingester (regenerate via `request(ops="verbs()")` before editing this line).
 
@@ -30,27 +30,28 @@ or JSON form ([ADR-016](docs/adr/ADR-016-request-dsl.md),
 [ADR-027](docs/adr/ADR-027-dynamic-pack-loading.md)). Verb semantics and namespace contract are
 defined in [ADR-023](docs/adr/ADR-023-declarative-pack-format.md).
 
-### KG pack — 17 verbs (bare names, no prefix)
+### KG pack — 18 verbs (bare names, no prefix)
 
-| Verb        | What it does                                                                           | When to use                                                             |
-| ----------- | -------------------------------------------------------------------------------------- | ----------------------------------------------------------------------- |
-| `create`    | Add an entity or note                                                                  | New concept, paper, observation, decision worth tracking                |
-| `get`       | Fetch any record by UUID (auto-detects type)                                           | When you have a UUID and need the full record                           |
-| `search`    | Text + semantic search over entities or notes                                          | Finding things by content similarity                                    |
-| `list`      | Structured filtering (by kind, tags, etc.)                                             | Browsing a category or namespace                                        |
-| `stats`     | Entity/edge/note/event counts                                                          | Dashboard, health check                                                 |
-| `update`    | Patch properties, tags, or content (by UUID)                                           | Correcting or enriching an existing record                              |
-| `delete`    | Soft-delete (or hard-delete) a record (by UUID)                                        | Removing stale or incorrect data                                        |
-| `merge`     | Deduplicate two entities into one                                                      | "LoRA" and "Low-Rank Adaptation" are the same concept                   |
-| `link`      | Connect two nodes with a typed relation                                                | When relationships emerge from research                                 |
-| `neighbors` | Immediate neighbors of a node                                                          | "What connects to this entity?"                                         |
-| `traverse`  | Multi-hop graph walk with depth/relation filters                                       | Structural context — lineages, paths, clusters                          |
-| `query`     | GQL/SPARQL query string → SQL                                                          | Complex pattern matching over the graph                                 |
-| `propose`   | Create an event-sourced change proposal                                                | Staging changes for review before apply                                 |
-| `review`    | Approve or reject a proposal                                                           | Gating changes through a review workflow                                |
-| `withdraw`  | Cancel an open proposal                                                                | Abandoning a staged change                                              |
-| `verbs`     | List all registered verbs on this server                                               | Discovery — see what's available                                        |
-| `context`   | Entity-anchored graph context in one call (anchors + 1-2 hop expansion, budget-packed) | Feeding an agent "everything relevant near X" in one call — see ADR-089 |
+| Verb        | What it does                                                                                     | When to use                                                             |
+| ----------- | ------------------------------------------------------------------------------------------------ | ----------------------------------------------------------------------- |
+| `create`    | Add an entity or note                                                                            | New concept, paper, observation, decision worth tracking                |
+| `get`       | Fetch any record by UUID (auto-detects type)                                                     | When you have a UUID and need the full record                           |
+| `search`    | Text + semantic search over entities or notes                                                    | Finding things by content similarity                                    |
+| `list`      | Structured filtering (by kind, tags, etc.)                                                       | Browsing a category or namespace                                        |
+| `stats`     | Entity/edge/note/event counts                                                                    | Dashboard, health check                                                 |
+| `update`    | Patch properties, tags, or content (by UUID)                                                     | Correcting or enriching an existing record                              |
+| `delete`    | Soft-delete (or hard-delete) a record (by UUID)                                                  | Removing stale or incorrect data                                        |
+| `merge`     | Deduplicate two entities into one                                                                | "LoRA" and "Low-Rank Adaptation" are the same concept                   |
+| `link`      | Connect two nodes with a typed relation                                                          | When relationships emerge from research                                 |
+| `neighbors` | Immediate neighbors of a node                                                                    | "What connects to this entity?"                                         |
+| `traverse`  | Multi-hop graph walk with depth/relation filters                                                 | Structural context — lineages, paths, clusters                          |
+| `query`     | GQL/SPARQL query string → SQL                                                                    | Complex pattern matching over the graph                                 |
+| `propose`   | Create an event-sourced change proposal                                                          | Staging changes for review before apply                                 |
+| `review`    | Approve or reject a proposal                                                                     | Gating changes through a review workflow                                |
+| `withdraw`  | Cancel an open proposal                                                                          | Abandoning a staged change                                              |
+| `resolve`   | Resolve natural-language references to ids (id passthrough, recent-ring, hybrid search fallback) | Turning a fuzzy reference ("the old record") into an id before acting   |
+| `verbs`     | List all registered verbs on this server                                                         | Discovery — see what's available                                        |
+| `context`   | Entity-anchored graph context in one call (anchors + 1-2 hop expansion, budget-packed)           | Feeding an agent "everything relevant near X" in one call — see ADR-089 |
 
 `get`, `update`, `delete` are by-ID — they auto-detect whether the record is an entity, note, or
 edge. The `id` parameter is resolved in three steps: (1) a full UUID (36-char dashed or 32-char
@@ -441,6 +442,7 @@ These are the KG pack verbs. Other packs are documented in their verb tables abo
 | `propose`   | **kind** (entity\|note\|edge), fields for the proposed change. Returns `{id, status, proposer, title}`. Chain as `propose(...) \| review(id=$prev.id, …)`, **not** `$prev.proposal_id`. Nested objects (e.g. `changeset`) are expressible in the function-call DSL using quoted JSON-style keys (`changeset={"kind":"update_entity",...}`); unquoted JS-style keys are rejected. The full JSON batch form also works.                                                                                                                                                                                                                                                                                                                                                                                                                                                                     | `{"kind":"entity","entity_kind":"concept","name":"X"}`       |
 | `review`    | **id** (proposal UUID), **decision** (approve\|reject\|comment\|request_changes); comment. Returns `{decision, id, reviewer, status}` (status = new proposal status)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      | `{"id":"<uuid>","decision":"approve"}`                       |
 | `withdraw`  | **id** (proposal UUID). Returns `{by, id, status}` with `status: "withdrawn"`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             | `{"id":"<uuid>"}`                                            |
+| `resolve`   | **refs** (array of natural-language references — UUID, 8+ hex prefix, exact name, or free text); kind (restricts the hybrid-search fallback stage to an entity kind), limit (max candidates per ref from the hybrid-search fallback, default 5, max 20). Read-only. Returns one of `Resolved{id,confidence}` \| `Ambiguous{candidates}` \| `NotFound` per ref                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             | `{"refs":["the old record","<uuid>"]}`                       |
 | `context`   | query and/or **entity_ids** (at least one required); hops (0-2, default 1), budget (256-65536 chars, default 4096), relations, direction (out\|in\|both, default both), limit (1-20, default 5), fanout (1-50, default 10). Returns `{anchors: [{...entity, neighbors: [{...edge fields, hop, via}]}], truncated, dropped: {anchors, neighbors}}`. Query anchors run one hybrid search; entity_ids anchors resolve in full, never clamped by `limit`. See ADR-089.                                                                                                                                                                                                                                                                                                                                                                                                                        | `{"entity_ids":["<uuid>"],"hops":1,"budget":4096}`           |
 
 ### When to use which retrieval verb
