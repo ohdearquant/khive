@@ -226,12 +226,14 @@ fn micros_to_dt(micros: i64) -> DateTime<Utc> {
 /// Two-pass approach:
 /// 1. **Replace** grouping/separator chars with spaces so adjacent tokens are
 ///    not merged. This prevents `NEAR(smile,5)` from becoming `NEARsmile5`.
-///    Chars replaced with space: `(`, `)`, `,`
+///    It also keeps punctuated identifiers searchable: `khive-pack-memory`
+///    becomes `khive pack memory`, not `khivepackmemory`.
+///    Chars replaced with space: `(`, `)`, `,`, `:`, `-`, `.`
 /// 2. **Remove** remaining FTS5 operator characters (H1: `~`, `!` added;
 ///    issue #388: `$` added — FTS5's MATCH-expression parser treats a bareword
 ///    starting with, containing, or consisting solely of `$` as a syntax
 ///    error regardless of tokenizer, e.g. the DSL-doc query `$prev.id`):
-///    `*`, `"`, `+`, `-`, `:`, `^`, `.`, `~`, `!`, `$`, `\0`, control characters
+///    `*`, `"`, `'`, `+`, `^`, `~`, `!`, `$`, `\0`, control characters
 ///
 /// After character processing, split on whitespace and remove FTS5 keyword
 /// tokens: AND, OR, NOT, NEAR.
@@ -239,12 +241,12 @@ fn micros_to_dt(micros: i64) -> DateTime<Utc> {
 /// For Phrase mode, the caller wraps the result in double quotes.
 fn sanitize_fts5_query(query: &str) -> String {
     // Pass 1: replace grouping/separator chars with spaces to isolate tokens.
-    // Colon is included here (not in Pass 2) so that "tenant:isolation" becomes
-    // "tenant isolation" rather than "tenantisolation".
+    // Colon, hyphen, and dot are included here (not in Pass 2) so punctuated
+    // identifiers become separate terms rather than merged tokens.
     let spaced: String = query
         .chars()
         .map(|c| {
-            if matches!(c, '(' | ')' | ',' | ':') {
+            if matches!(c, '(' | ')' | ',' | ':' | '-' | '.') {
                 ' '
             } else {
                 c
@@ -261,10 +263,7 @@ fn sanitize_fts5_query(query: &str) -> String {
     let sanitized: String = spaced
         .chars()
         .filter(|c| {
-            !matches!(
-                c,
-                '*' | '"' | '\'' | '+' | '-' | '^' | '.' | '~' | '!' | '$' | '\0'
-            ) && !c.is_control()
+            !matches!(c, '*' | '"' | '\'' | '+' | '^' | '~' | '!' | '$' | '\0') && !c.is_control()
         })
         .collect();
 

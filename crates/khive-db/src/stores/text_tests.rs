@@ -399,9 +399,18 @@ async fn test_sanitize_fts5_query() {
     // M-C4: decimal numbers must not produce "syntax error near '.'"
     assert_eq!(
         sanitize_fts5_query("salience 0.9 vs 0.3"),
-        "salience 09 vs 03"
+        "salience 0 9 vs 0 3"
     );
-    assert_eq!(sanitize_fts5_query("version 1.2.3"), "version 123");
+    assert_eq!(sanitize_fts5_query("version 1.2.3"), "version 1 2 3");
+    // #397: hyphenated and dotted identifiers must space-split, not concatenate.
+    assert_eq!(
+        sanitize_fts5_query("khive-pack-memory"),
+        "khive pack memory"
+    );
+    assert_eq!(
+        sanitize_fts5_query("khive.pack.memory"),
+        "khive pack memory"
+    );
     // H1: tilde and comma must be stripped to prevent FTS5 syntax errors
     assert_eq!(sanitize_fts5_query("~hello"), "hello");
     assert_eq!(sanitize_fts5_query("\"+_~!\""), "_");
@@ -441,7 +450,7 @@ async fn test_sanitize_fts5_query() {
     assert_eq!(sanitize_fts5_query("AND OR NOT"), "");
     // #388: dollar sign is an unconditional FTS5 MATCH-parser syntax error
     // ("syntax error near \"$\"") regardless of position in the token or query.
-    assert_eq!(sanitize_fts5_query("$prev.id"), "previd");
+    assert_eq!(sanitize_fts5_query("$prev.id"), "prev id");
     assert_eq!(sanitize_fts5_query("$prev"), "prev");
     assert_eq!(sanitize_fts5_query("foo$bar"), "foobar");
     assert_eq!(sanitize_fts5_query("$"), "");
@@ -513,7 +522,7 @@ async fn test_search_with_decimal_query_does_not_crash() {
         .upsert_document(make_document(
             Uuid::new_v4(),
             "salience thresholds",
-            "salience 09 vs 03 comparison",
+            "salience 0 9 vs 0 3 comparison",
         ))
         .await
         .unwrap();
@@ -549,6 +558,46 @@ async fn test_search_with_decimal_query_does_not_crash() {
         "version-string query must succeed, got error: {:?}",
         result2.err()
     );
+}
+
+/// #397 regression: punctuated identifier queries must not be concatenated into
+/// tokens that cannot occur in the indexed text.
+#[tokio::test]
+async fn test_search_with_hyphenated_and_dotted_queries_matches_literal_tokens() {
+    let store = setup_memory_store("punctuated_query_match");
+
+    let hyphen_id = Uuid::new_v4();
+    store
+        .upsert_document(make_document(hyphen_id, "doc", "LEGACY-FLAT-NOTE"))
+        .await
+        .unwrap();
+
+    let dotted_id = Uuid::new_v4();
+    store
+        .upsert_document(make_document(dotted_id, "doc", "khive.pack.memory"))
+        .await
+        .unwrap();
+
+    for (query, expected_id) in [
+        ("LEGACY-FLAT-NOTE", hyphen_id),
+        ("khive.pack.memory", dotted_id),
+    ] {
+        let hits = store
+            .search(TextSearchRequest {
+                query: query.to_string(),
+                mode: TextQueryMode::AnyTerm,
+                filter: Some(ns_filter("test_ns")),
+                top_k: 10,
+                snippet_chars: 64,
+            })
+            .await
+            .unwrap();
+        let hit_ids: Vec<_> = hits.iter().map(|hit| hit.subject_id).collect();
+        assert!(
+            hit_ids.contains(&expected_id),
+            "#397 query {query:?} must match {expected_id}; got {hit_ids:?}"
+        );
+    }
 }
 
 /// #570: all FTS5 operator classes must not crash the generic text search surface.
@@ -614,7 +663,7 @@ async fn test_search_with_dollar_sign_does_not_crash() {
         .upsert_document(make_document(
             Uuid::new_v4(),
             "DSL docs",
-            "chain results with the previd token",
+            "chain results with the prev id token",
         ))
         .await
         .unwrap();
@@ -633,8 +682,7 @@ async fn test_search_with_dollar_sign_does_not_crash() {
         "#388 dollar-sign query must not crash FTS5, got: {:?}",
         result.err()
     );
-    // sanitize_fts5_query("$prev.id") == "previd" (both '$' and '.' stripped, no
-    // space inserted) — it still matches a document containing that literal token,
+    // sanitize_fts5_query("$prev.id") == "prev id" ('$' stripped, '.' space-split),
     // confirming legitimate text search stays intact after sanitization.
     assert_eq!(result.unwrap().len(), 1);
 }
