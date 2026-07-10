@@ -67,22 +67,45 @@ own build is still in flight bumps the counter, but that write's own
 `ensure_ann_background` call finds the guard already held and no-ops (the fire-once
 single-flight guard exists precisely to prevent a second redundant task) — nobody else
 is left to notice the counter moved. The tracked background task therefore loops:
-before releasing its guard, it re-reads the write-generation counter and compares it
-against the floor its own just-finished attempt captured. If a write raced in during
-that attempt, it immediately re-enqueues another attempt against itself — repeating
-until the installed generation catches up (or the corpus never had anything to build,
-in which case the first attempt's fixed point is itself the terminal state). This is
-what guarantees §1's bound holds without depending on a later recall or write to
-retrigger it.
+after each attempt, it re-reads the write-generation counter and compares it against
+the floor that attempt captured. If a write raced in, it immediately runs another
+attempt against itself — repeating until either the installed generation catches up
+(the corpus is caught up, or, e.g. an empty corpus with no further writes, there is
+nothing new to catch up to) or a bounded cap of 3 consecutive attempts within one task
+is reached.
+
+The cap exists because an unbounded loop under continuous writes — a new write landing
+during every single rebuild — would otherwise hold the guard and spin the task forever.
+3 was chosen as small enough to bound one task's worst-case extra latency to a handful
+of rebuild cycles, while still absorbing the common case (one or two writes racing
+during a single in-flight build) without falling back to a later caller. Once the cap
+is hit, the loop exits and the remainder is left for the post-release recheck below, or
+a later recall/write, to pick up — see the note on this in Consequences.
+
+Guard release and the re-enqueue decision are ordered deliberately: the guard is
+dropped _before_ the final freshness recheck runs, not after. Checking first and
+dropping second would leave a window — between the loop's last generation read and the
+guard's release — where a write landing in that gap finds `warming` still occupied by
+the exiting task, no-ops against it, and has nobody left to notice once the guard
+disappears moments later. Dropping first means that same race instead finds the guard
+already free by the time it goes looking, so the recheck that follows takes a fresh
+guard and starts a genuinely new task rather than being silently dropped.
 
 ### 3. Cold behavior
 
-The first `memory.recall` or `memory.remember` for a model with no cache entry and no
-loadable snapshot pays for a one-time synchronous `ensure_ann_for_model` call, whose
-CPU-bound graph construction runs via `spawn_blocking` so it does not monopolize the
-async runtime for other concurrent work. This is a genuine cold miss, not the #791 hang:
-it happens once per model per process lifetime (until the process restarts), not on
-every write.
+A cold `memory.recall` — no cache entry and no loadable snapshot for the model — pays
+for a one-time synchronous `ensure_ann_for_model` call, whose CPU-bound graph
+construction runs via `spawn_blocking` so it does not monopolize the async runtime for
+other concurrent work. This is a genuine cold miss, not the #791 hang: it happens once
+per model per process lifetime (until the process restarts), not on every write.
+
+`memory.remember` never pays this synchronous cost, cold or warm. It only ever bumps
+the write-generation counter and calls `ensure_ann_background` (§2), which enqueues the
+build and returns immediately; the graph construction itself always runs off the
+write's response path. A write to a model with no cache entry yet does not force that
+model's first build — it schedules it, the same as any other write. The first
+synchronous build for a model is paid by whichever caller first issues a cold
+`memory.recall` against it, not by `memory.remember`.
 
 ### 4. Restart validation
 
@@ -108,13 +131,7 @@ signal (e.g. `MAX(notes.updated_at)`) left open:
   overwrites embeddings directly without touching the `notes` table at all, so a
   same-model, same-dimension re-embed through that path changes no timestamp a
   timestamp-based signal could observe. Hashing the embedding bytes themselves catches
-  it unconditionally, regardless of which write path produced the change. As defense
-  in depth, `kkernel reindex` also directly deletes the active
-  `global::memory_vamana::*` snapshot row after re-embedding, forcing a rebuild on the
-  next warm even before this hash check would otherwise catch it — the daemon and
-  `kkernel reindex` run as separate processes sharing no in-memory generation state, so
-  this direct invalidation is the only signal available to a daemon that stays running
-  across a reindex.
+  it unconditionally, regardless of which write path produced the change.
 - **A separately-sampled signal races the build it is meant to describe.** A signal
   computed by its own query after the graph build finishes can observe a
   same-cardinality write that landed in the gap between the build's scan and the
@@ -132,6 +149,30 @@ needed and skips the hash scan entirely. A mismatch in either the fingerprint or
 content hash is treated as stale: the snapshot is discarded and the model falls
 through to a full rebuild from the vector store, the same path a genuinely absent
 snapshot takes.
+
+The content-hash check above only runs when a process restarts and re-warms from a
+persisted snapshot. It does nothing for a daemon that stays running across a
+`kkernel reindex` invocation: `kkernel reindex` also directly deletes the active
+`global::memory_vamana::*` snapshot row after re-embedding, but that deletion mutates
+only the persisted row — it is invisible to an already-warm daemon, which never
+re-reads the snapshot table for a model it already has installed. The daemon and
+`kkernel reindex` run as separate processes sharing no in-memory generation state, so
+neither the write-generation counter nor the deletion itself is a signal such a daemon
+can ever observe on its own. Left uncorrected, a daemon that warmed before a reindex
+serves pre-reindex vectors indefinitely, for as long as the process stays up.
+
+This is closed by a durable corpus epoch: a single-row `memory_ann_epoch` table that
+`kkernel reindex` increments (`khive_pack_memory::bump_memory_ann_epoch`) immediately
+after invalidating the snapshot. Every `AnnBridge` records the epoch value it observed
+at build/load time (`epoch_baseline`). The recall warm-hit path
+(`ann::maybe_check_durable_epoch`) compares the installed entry's `epoch_baseline`
+against the current durable epoch and, on a mismatch, folds it into the same
+write-generation machinery §2 describes (`ann::bump_generation`) so the existing
+single-flight rebuild takes over unchanged. This check is debounced per model (a fixed
+interval between DB reads, not on every single recall) so it adds no DB round-trip to
+the common warm-hit case; the daemon's own in-memory generation counter remains the
+only signal it consults for every write it did not miss, and it uses the durable epoch
+only to catch the ones it did.
 
 ### 5. Deletion filtering
 
@@ -160,9 +201,16 @@ leaking through.
   §4's memory-pack-specific hash with ADR-079's own content-hash mechanism; that
   migration is out of scope for this ADR.
 - A write that lands after the self-driving re-enqueue loop (§2) has already fully
-  exited still needs a normal write-path call to `ensure_ann_background` to be picked
-  up — the loop only protects writes that race in while its own task is still running,
-  not writes arriving after it has converged and returned.
+  exited — whether by converging or by hitting its 3-attempt cap — still needs a normal
+  write-path call to `ensure_ann_background` to be picked up. Under sustained
+  continuous writes to the same model, this means catch-up can span more than one
+  independently-triggered background task rather than a single unbroken loop; each
+  individual task's own worst-case extra latency stays bounded regardless.
+- A daemon that stays warm across a `kkernel reindex` run only detects the resulting
+  staleness on its next amortized durable-epoch check (§4), not immediately — the check
+  is debounced, so there can be a bounded window (one check interval) after a reindex
+  completes during which a recall still serves the pre-reindex index. This is separate
+  from, and in addition to, the per-write bound in §1.
 
 ## Status
 
