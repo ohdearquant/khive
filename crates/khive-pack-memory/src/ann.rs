@@ -10,6 +10,7 @@ use khive_runtime::{KhiveRuntime, Namespace, NamespaceToken, RuntimeError};
 use khive_storage::types::{SqlStatement, SqlValue};
 use khive_storage::StorageError;
 use khive_vamana::{CorpusFingerprint, VamanaConfig, VamanaIndex, VamanaSnapshot};
+use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, RwLock};
 use uuid::Uuid;
 
@@ -55,7 +56,13 @@ pub(crate) struct AnnBridge {
 /// Shared ANN state: per-`(namespace, model)` indexes with at-most-one-background-build guard.
 pub(crate) struct AnnState {
     indexes: RwLock<HashMap<AnnKey, AnnBridge>>,
-    warming: Mutex<HashSet<AnnKey>>,
+    /// Plain `std::sync::Mutex`, not `tokio::sync::Mutex`: every critical
+    /// section here is a synchronous check-and-mutate with no `.await`
+    /// inside it, which lets `WarmingGuard::drop` (below) release the guard
+    /// synchronously on every exit path of the background task it's tied to
+    /// — success, error, or panic (#812 review HIGH-1) — instead of needing
+    /// to spawn a second task just to await a `tokio::sync::Mutex`.
+    warming: std::sync::Mutex<HashSet<AnnKey>>,
     /// Review finding (issue #723 fix-round): per-model single-flight lock
     /// owned by `ensure_ann_for_model` itself, the chokepoint every warm
     /// path (boot warm, background fire-once warm, recall-miss warm) routes
@@ -89,7 +96,7 @@ pub(crate) type SharedAnn = Arc<AnnState>;
 pub(crate) fn new_shared() -> SharedAnn {
     Arc::new(AnnState {
         indexes: RwLock::new(HashMap::new()),
-        warming: Mutex::new(HashSet::new()),
+        warming: std::sync::Mutex::new(HashSet::new()),
         model_locks: Mutex::new(HashMap::new()),
         generations: Mutex::new(HashMap::new()),
         #[cfg(test)]
@@ -382,7 +389,42 @@ pub(crate) async fn index_namespace_set(ann: &SharedAnn, key: &AnnKey) -> Option
 /// entry itself just proved unusable, not merely stale.
 pub(crate) async fn clear_key(ann: &SharedAnn, key: &AnnKey) {
     ann.indexes.write().await.remove(key);
-    ann.warming.lock().await.remove(key);
+    lock_warming(ann).remove(key);
+}
+
+/// Lock `ann.warming`, recovering from poisoning instead of propagating it.
+///
+/// A poisoned lock here would mean an earlier holder panicked while the
+/// guard was held — but every critical section on this mutex is a plain
+/// synchronous set operation, so a panic mid-section can only have come from
+/// the allocator itself. Refusing to recover would leave every future warm
+/// attempt permanently unable to take the guard at all, which is strictly
+/// worse than the bug this fixes.
+fn lock_warming(ann: &SharedAnn) -> std::sync::MutexGuard<'_, HashSet<AnnKey>> {
+    ann.warming
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// RAII release of the fire-once `warming` guard (#812 review HIGH-1).
+///
+/// The guard used to be removed only on the "nothing got loaded" failure
+/// path inside `ensure_ann_background`'s tracked task — so a single
+/// successful warm left the key in `warming` forever, and every later
+/// write's rebuild attempt (`memory.remember`) plus recall's rescheduling
+/// (`handlers/common.rs`) silently no-op'd against the stale guard, serving
+/// the stale index indefinitely. Tying release to `Drop` instead covers
+/// every exit path of the tracked task uniformly — normal return, an early
+/// `Err`, and an unwinding panic all run the same destructor.
+struct WarmingGuard {
+    ann: SharedAnn,
+    key: AnnKey,
+}
+
+impl Drop for WarmingGuard {
+    fn drop(&mut self) {
+        lock_warming(&self.ann).remove(&self.key);
+    }
 }
 
 /// True when `err` is the direct result of a `spawn_blocking` cancellation —
@@ -431,7 +473,7 @@ pub(crate) async fn ensure_ann_background(
 
     // Single-flight guard.
     {
-        let mut warming = ann.warming.lock().await;
+        let mut warming = lock_warming(ann);
         if warming.contains(&key) {
             return false;
         }
@@ -441,6 +483,13 @@ pub(crate) async fn ensure_ann_background(
     let rt = rt.clone();
     let ann = ann.clone();
     let model = model.to_owned();
+    // Tied to the tracked task's own scope so it releases on every exit path
+    // (success, error, or panic) rather than only the "nothing got loaded"
+    // arm — see `WarmingGuard`'s doc comment (#812 review HIGH-1).
+    let warming_guard = WarmingGuard {
+        ann: ann.clone(),
+        key: key.clone(),
+    };
     // Tracked, not a bare tokio::spawn, so daemon shutdown's drain() waits for
     // an in-flight remember-path warm instead of a SIGTERM (or a short-lived
     // `kkernel exec` process exiting) aborting it mid-build — same rationale
@@ -448,6 +497,7 @@ pub(crate) async fn ensure_ann_background(
     // Medium). The caller still only pays for the enqueue; the build itself
     // runs fully off the response path, unawaited.
     khive_runtime::track_background_task(async move {
+        let _warming_guard = warming_guard;
         if let Ok(token) = rt.authorize(Namespace::local()) {
             match ensure_ann_for_model(&rt, &token, &ann, &model).await {
                 Ok(status) => {
@@ -463,11 +513,6 @@ pub(crate) async fn ensure_ann_background(
                     tracing::warn!(error = %e, model = %model, "memory ANN background build failed");
                 }
             }
-        }
-        // If loading/building failed, remove the guard so a later recall retries.
-        let loaded = ann.indexes.read().await.contains_key(&key);
-        if !loaded {
-            ann.warming.lock().await.remove(&key);
         }
     });
     true
@@ -689,35 +734,47 @@ async fn ensure_ann_for_model_inner(
         return Ok(AnnEnsureStatus::AlreadyLoaded);
     }
 
-    // Try snapshot warm-load.
-    if let Some(snapshot) = try_load_snapshot(rt, ns, model).await {
+    // Try snapshot warm-load. Both the shallow `CorpusFingerprint` (vector
+    // count + dimensions) AND the durable `CorpusContentSignal` (count + max
+    // `updated_at`) must match the live corpus (#812 review HIGH-2):
+    // write-generations reset to 0 on restart, so on a cold process the
+    // fingerprint alone is the only signal deciding Hot vs. Stale — and a
+    // delete-one/add-one or a content re-embed preserves vector count and
+    // dimensions exactly while changing what the corpus actually contains.
+    // The content signal catches that: a new or edited note always carries
+    // a fresher `updated_at` than every prior row, so the signal changes
+    // even when the fingerprint doesn't.
+    if let Some(persisted) = try_load_snapshot(rt, ns, model).await {
         let current_fp = compute_memory_fingerprint(rt, token, model).await;
-        if let Some(fp) = current_fp {
-            if snapshot.fingerprint == fp {
-                match AnnBridge::from_snapshot(snapshot) {
-                    Ok(mut bridge) => {
-                        // Populate namespace set from a cheap DISTINCT query so the
-                        // retry gate in recall can short-circuit when appropriate.
-                        let ns_set = query_distinct_namespaces(rt, token, model)
-                            .await
-                            .unwrap_or_default();
-                        bridge.set_namespace_set(ns_set);
-                        let bridge = bridge.with_generation(target_generation);
-                        install_if_fresher(ann, &key, bridge).await;
-                        tracing::debug!(namespace = %ns, model = %model, "memory ANN loaded from snapshot");
-                        return Ok(AnnEnsureStatus::LoadedSnapshot);
-                    }
-                    Err(e) => {
-                        tracing::warn!(error = %e, "corrupt memory Vamana snapshot; rebuilding");
-                    }
+        let current_signal = compute_corpus_content_signal(rt, token, model).await;
+        let fp_matches = current_fp.is_some_and(|fp| persisted.snapshot.fingerprint == fp);
+        let signal_matches = current_signal.is_some_and(|sig| persisted.content_signal == sig);
+        if fp_matches && signal_matches {
+            match AnnBridge::from_snapshot(persisted.snapshot) {
+                Ok(mut bridge) => {
+                    // Populate namespace set from a cheap DISTINCT query so the
+                    // retry gate in recall can short-circuit when appropriate.
+                    let ns_set = query_distinct_namespaces(rt, token, model)
+                        .await
+                        .unwrap_or_default();
+                    bridge.set_namespace_set(ns_set);
+                    let bridge = bridge.with_generation(target_generation);
+                    install_if_fresher(ann, &key, bridge).await;
+                    tracing::debug!(namespace = %ns, model = %model, "memory ANN loaded from snapshot");
+                    return Ok(AnnEnsureStatus::LoadedSnapshot);
                 }
-            } else {
-                tracing::info!(
-                    namespace = %ns,
-                    model = %model,
-                    "stale memory Vamana snapshot (fingerprint mismatch); rebuilding"
-                );
+                Err(e) => {
+                    tracing::warn!(error = %e, "corrupt memory Vamana snapshot; rebuilding");
+                }
             }
+        } else {
+            tracing::info!(
+                namespace = %ns,
+                model = %model,
+                fp_matches,
+                signal_matches,
+                "stale memory Vamana snapshot (fingerprint or content-signal mismatch); rebuilding"
+            );
         }
     }
 
@@ -748,8 +805,19 @@ async fn ensure_ann_for_model_inner(
             let vector_count = bridge.id_map.len();
             let bridge = bridge.with_generation(target_generation);
             if let Some(fingerprint) = fp_after {
-                if let Err(e) = persist_snapshot(rt, ns, model, &bridge, fingerprint).await {
-                    tracing::warn!(error = %e, "failed to persist memory Vamana snapshot");
+                // Best-effort: if the content signal can't be computed right
+                // now, skip persisting rather than write a snapshot with no
+                // durable staleness check at all (a missing signal would
+                // otherwise need a placeholder that either always matches —
+                // defeating the fix — or never matches — forcing every future
+                // warm to rebuild).
+                if let Some(content_signal) = compute_corpus_content_signal(rt, token, model).await
+                {
+                    if let Err(e) =
+                        persist_snapshot(rt, ns, model, &bridge, fingerprint, content_signal).await
+                    {
+                        tracing::warn!(error = %e, "failed to persist memory Vamana snapshot");
+                    }
                 }
             }
             install_if_fresher(ann, &key, bridge).await;
@@ -960,6 +1028,78 @@ async fn load_and_build_from_vector_store(
 
 // ── persistence ───────────────────────────────────────────────────────────────
 
+/// Durable content signal for a model's live corpus (#812 review HIGH-2).
+///
+/// `CorpusFingerprint` (vector count + dimensions) is preserved by a
+/// delete-one/add-one or a content re-embed, and write-generations
+/// (`AnnState::generations`) are in-memory-only and reset to 0 on restart —
+/// so on a cold process the fingerprint is the only signal deciding whether
+/// a persisted snapshot is still current, and a same-cardinality corpus
+/// change would be classified Hot forever with no rebuild ever triggered.
+/// `max_updated_at` closes that gap: a newly added or edited note always
+/// carries a fresher `updated_at` than every prior row in the corpus, so
+/// this signal changes on exactly the patterns the fingerprint misses.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct CorpusContentSignal {
+    count: u64,
+    max_updated_at: i64,
+}
+
+/// On-disk wrapper persisted into `retrieval_snapshots.snapshot` in place of
+/// a bare `VamanaSnapshot`, so the durable content signal travels with the
+/// snapshot it was computed against. A pre-existing bare-`VamanaSnapshot`
+/// blob (persisted before this field existed) fails to deserialize as this
+/// wrapper and is treated as corrupt by `try_load_snapshot`'s existing
+/// corrupt-blob handling — self-healing, since the next warm attempt
+/// rebuilds and re-persists in the new format.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct PersistedMemorySnapshot {
+    snapshot: VamanaSnapshot,
+    content_signal: CorpusContentSignal,
+}
+
+/// Compute `model`'s durable content signal (#812 review HIGH-2): the
+/// live-note vector count plus the maximum `updated_at` across those rows.
+/// Cheap — a single aggregate query, no embedding blobs read — unlike a full
+/// content hash, which would require the same corpus scan a rebuild does.
+async fn compute_corpus_content_signal(
+    rt: &KhiveRuntime,
+    token: &NamespaceToken,
+    model: &str,
+) -> Option<CorpusContentSignal> {
+    let _ = rt.vectors_for_model(token, model).ok()?;
+    let table_name = format!("vec_{}", sanitize_model_key(model));
+    let sql = rt.sql();
+    let mut reader = sql.reader().await.ok()?;
+    let rows = reader
+        .query_all(SqlStatement {
+            sql: format!(
+                "SELECT COUNT(*) AS n, MAX(n.updated_at) AS max_updated FROM {table_name} v \
+                 JOIN notes n ON n.id = v.subject_id \
+                 WHERE v.embedding_model = ?1 \
+                   AND v.kind = 'note' AND v.field = 'note.content' \
+                   AND n.deleted_at IS NULL"
+            ),
+            params: vec![SqlValue::Text(model.to_owned())],
+            label: Some("memory_ann_content_signal".into()),
+        })
+        .await
+        .ok()?;
+    let row = rows.first()?;
+    let count = match row.get("n")? {
+        SqlValue::Integer(n) if *n >= 0 => *n as u64,
+        _ => return None,
+    };
+    let max_updated_at = match row.get("max_updated") {
+        Some(SqlValue::Integer(v)) => *v,
+        _ => 0,
+    };
+    Some(CorpusContentSignal {
+        count,
+        max_updated_at,
+    })
+}
+
 async fn ensure_snapshot_schema(rt: &KhiveRuntime) -> Result<(), RuntimeError> {
     let sql = rt.sql();
     let mut w = sql
@@ -990,6 +1130,7 @@ async fn persist_snapshot(
     model: &str,
     bridge: &AnnBridge,
     fingerprint: CorpusFingerprint,
+    content_signal: CorpusContentSignal,
 ) -> Result<(), RuntimeError> {
     if let Err(e) = ensure_snapshot_schema(rt).await {
         tracing::warn!(error = %e, "failed to create retrieval_snapshots schema");
@@ -998,7 +1139,11 @@ async fn persist_snapshot(
     let snapshot = bridge
         .to_snapshot(namespace, model, fingerprint)
         .map_err(|e| RuntimeError::Internal(format!("to_snapshot: {e}")))?;
-    let blob = serde_json::to_vec(&snapshot)
+    let persisted = PersistedMemorySnapshot {
+        snapshot,
+        content_signal,
+    };
+    let blob = serde_json::to_vec(&persisted)
         .map_err(|e| RuntimeError::Internal(format!("snapshot serialize: {e}")))?;
     let key = snapshot_key(namespace, model);
     let sql = rt.sql();
@@ -1027,7 +1172,7 @@ async fn try_load_snapshot(
     rt: &KhiveRuntime,
     namespace: &str,
     model: &str,
-) -> Option<VamanaSnapshot> {
+) -> Option<PersistedMemorySnapshot> {
     let key = snapshot_key(namespace, model);
     let sql = rt.sql();
     let mut reader = sql.reader().await.ok()?;
@@ -1049,7 +1194,7 @@ async fn try_load_snapshot(
         SqlValue::Blob(b) => b.clone(),
         _ => return None,
     };
-    match serde_json::from_slice::<VamanaSnapshot>(&blob) {
+    match serde_json::from_slice::<PersistedMemorySnapshot>(&blob) {
         Ok(s) => Some(s),
         Err(e) => {
             tracing::warn!(error = %e, "corrupt memory Vamana snapshot blob");
@@ -1155,6 +1300,10 @@ mod tests {
                 CorpusFingerprint {
                     vector_count: 1,
                     dimensions: 4,
+                },
+                CorpusContentSignal {
+                    count: 1,
+                    max_updated_at: 0,
                 },
             )
             .await
@@ -1689,5 +1838,268 @@ mod tests {
         // storage must never be misclassified as a benign cancellation.
         let err = RuntimeError::Internal("unrelated internal error".into());
         assert!(!is_benign_shutdown_cancellation(&err));
+    }
+
+    // ── #812 review HIGH-1: warming guard must release on every exit ────────
+
+    struct HashVecService {
+        dims: usize,
+    }
+
+    fn fnv_to_vec(text: &str, dims: usize) -> Vec<f32> {
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        for b in text.bytes() {
+            h ^= b as u64;
+            h = h.wrapping_mul(0x0000_0001_0000_01b3);
+        }
+        let mut v = Vec::with_capacity(dims);
+        let mut s = h;
+        for _ in 0..dims {
+            s = s
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            v.push(((s >> 33) as f32) / (0x7fff_ffff_u32 as f32) - 1.0);
+        }
+        v
+    }
+
+    #[async_trait::async_trait]
+    impl lattice_embed::EmbeddingService for HashVecService {
+        async fn embed(
+            &self,
+            texts: &[String],
+            _model: lattice_embed::EmbeddingModel,
+        ) -> Result<Vec<Vec<f32>>, lattice_embed::EmbedError> {
+            Ok(texts.iter().map(|t| fnv_to_vec(t, self.dims)).collect())
+        }
+
+        fn supports_model(&self, _model: lattice_embed::EmbeddingModel) -> bool {
+            true
+        }
+
+        fn name(&self) -> &'static str {
+            "hash-vec"
+        }
+    }
+
+    struct HashVecProvider {
+        model_name: String,
+        dims: usize,
+    }
+
+    #[async_trait::async_trait]
+    impl khive_runtime::EmbedderProvider for HashVecProvider {
+        fn name(&self) -> &str {
+            &self.model_name
+        }
+
+        fn dimensions(&self) -> usize {
+            self.dims
+        }
+
+        async fn build(&self) -> Result<Arc<dyn lattice_embed::EmbeddingService>, RuntimeError> {
+            Ok(Arc::new(HashVecService { dims: self.dims }))
+        }
+    }
+
+    fn test_runtime_with_hash_embedder(model: &str, dims: usize) -> KhiveRuntime {
+        let tmp = tempfile::Builder::new()
+            .prefix("khive-memory-ann-review-fix-")
+            .tempdir_in(std::env::temp_dir())
+            .expect("temp db dir");
+        // Leaked deliberately: the runtime borrows this path only long enough
+        // to open the SQLite file, and each test process only ever creates a
+        // handful of these — matching this file's other embedder-backed
+        // tests, which do the same via a per-test `tempfile::Builder` kept
+        // alive by dropping it at the end of the enclosing scope. Since we
+        // return only the runtime (not the tempdir guard) to keep the test
+        // helper simple, leak the guard so the directory outlives the test.
+        let db_path = tmp.path().join("khive-graph.db");
+        std::mem::forget(tmp);
+        let rt = KhiveRuntime::new(khive_runtime::RuntimeConfig {
+            db_path: Some(db_path),
+            embedding_model: None,
+            additional_embedding_models: vec![],
+            ..khive_runtime::RuntimeConfig::default()
+        })
+        .expect("runtime");
+        rt.register_embedder(HashVecProvider {
+            model_name: model.to_owned(),
+            dims,
+        });
+        rt
+    }
+
+    /// Reviewer-requested regression test (#812 review HIGH-1): warm
+    /// succeeds, a write bumps the generation, the rebuild it triggers
+    /// completes, a second write lands, and the model eventually reaches a
+    /// fresh result — proving the `warming` guard from the FIRST warm does
+    /// not permanently block every later rebuild attempt.
+    ///
+    /// Fail-on-revert: reverting `ensure_ann_background`'s cleanup back to
+    /// "only remove the guard when nothing got loaded" leaves `warming`
+    /// containing `key` after the first successful warm below, failing the
+    /// first assertion; the second `ensure_ann_background` call would then
+    /// also return `false` (guard still set) instead of `true`.
+    #[tokio::test]
+    #[serial(background_tasks)]
+    async fn ensure_ann_background_releases_warming_guard_after_success_and_allows_later_rebuild() {
+        const MODEL: &str = "ann-warm-guard-release-test-model";
+        const DIMS: usize = 8;
+        let rt = test_runtime_with_hash_embedder(MODEL, DIMS);
+
+        let token = rt.authorize(Namespace::local()).expect("authorize local");
+        for i in 0..4u32 {
+            rt.create_note_with_decay_for_embedding_model(
+                &token,
+                "memory",
+                None,
+                &format!("warming guard note {i}"),
+                Some(0.7),
+                0.01,
+                None,
+                vec![],
+                None,
+            )
+            .await
+            .expect("create note");
+        }
+
+        let ann = new_shared();
+        let key = AnnKey::from_token(&token, MODEL);
+
+        assert!(
+            ensure_ann_background(&rt, &token, &ann, MODEL).await,
+            "first call for a fresh key must start a background warm"
+        );
+        // Wait for the tracked task to fully exit (guard dropped), not merely
+        // for the index to appear — the task still does async phase-event
+        // bookkeeping after `install_if_fresher` and before returning, so
+        // polling on index presence alone races the guard's release.
+        for _ in 0..300 {
+            if !ann.warming.lock().unwrap().contains(&key) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            !ann.warming.lock().unwrap().contains(&key),
+            "the warming guard must be released once the first background warm \
+             finishes, not left set forever after a success (#812 review HIGH-1)"
+        );
+        assert!(
+            ann.indexes.read().await.contains_key(&key),
+            "the first background warm must install an index"
+        );
+
+        // A second write lands: bump the generation exactly like
+        // `memory.remember` does, then request another background warm.
+        bump_generation(&ann, &key).await;
+        assert!(
+            ensure_ann_background(&rt, &token, &ann, MODEL).await,
+            "a write landing after a completed warm must be able to schedule a \
+             new background rebuild — if the guard were still set from the \
+             first warm this would wrongly return false, and every later \
+             recall would keep serving the now-stale index forever"
+        );
+
+        for _ in 0..300 {
+            if is_current(&ann, &key).await {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            is_current(&ann, &key).await,
+            "the second background warm must eventually install a fresh entry"
+        );
+    }
+
+    // ── #812 review HIGH-2: restart validation needs a durable content signal ─
+
+    /// Reviewer-requested regression test (#812 review HIGH-2): a
+    /// delete-one/add-one that preserves vector count and dimensions must
+    /// still be detected as stale by a fresh `AnnState` (simulating a
+    /// process restart, where write-generations reset to 0) so the model is
+    /// rebuilt instead of silently serving the outdated snapshot forever.
+    ///
+    /// Fail-on-revert: reverting `ensure_ann_for_model_inner` to compare only
+    /// `CorpusFingerprint` (vector count + dimensions) makes the second warm
+    /// below take the Hot/`LoadedSnapshot` path instead of `Built`, because
+    /// the corpus still has 4 vectors at the same dimensionality.
+    #[tokio::test]
+    async fn ensure_ann_for_model_restart_content_signal_mismatch_triggers_rebuild() {
+        const MODEL: &str = "ann-warm-restart-signal-test-model";
+        const DIMS: usize = 8;
+        let rt = test_runtime_with_hash_embedder(MODEL, DIMS);
+
+        let token = rt.authorize(Namespace::local()).expect("authorize local");
+        let mut note_ids = Vec::new();
+        for i in 0..4u32 {
+            let note = rt
+                .create_note_with_decay_for_embedding_model(
+                    &token,
+                    "memory",
+                    None,
+                    &format!("restart signal note {i}"),
+                    Some(0.7),
+                    0.01,
+                    None,
+                    vec![],
+                    None,
+                )
+                .await
+                .expect("create note");
+            note_ids.push(note.id);
+        }
+
+        // First "process": warm and persist a snapshot over the initial
+        // 4-note corpus.
+        let ann1 = new_shared();
+        let status = ensure_ann_for_model(&rt, &token, &ann1, MODEL)
+            .await
+            .expect("first warm");
+        assert!(
+            matches!(status, AnnEnsureStatus::Built { vectors: 4 }),
+            "expected a fresh build over 4 vectors, got: {status:?}"
+        );
+
+        // Delete one note and add a fresh one: vector count and dimensions
+        // both come back unchanged (still 4, still DIMS), but the corpus
+        // content has moved on.
+        assert!(
+            rt.delete_note(&token, note_ids[0], false)
+                .await
+                .expect("soft delete"),
+            "soft delete must succeed"
+        );
+        rt.create_note_with_decay_for_embedding_model(
+            &token,
+            "memory",
+            None,
+            "restart signal note REPLACEMENT",
+            Some(0.7),
+            0.01,
+            None,
+            vec![],
+            None,
+        )
+        .await
+        .expect("create replacement note");
+
+        // "Restart": a fresh `AnnState` with generations reset to 0, exactly
+        // like a process restart — write-generation tracking (#750) cannot
+        // see this corpus change at all, so only restart validation against
+        // the persisted snapshot can catch it.
+        let ann2 = new_shared();
+        let status = ensure_ann_for_model(&rt, &token, &ann2, MODEL)
+            .await
+            .expect("post-restart warm");
+        assert!(
+            matches!(status, AnnEnsureStatus::Built { vectors: 4 }),
+            "a same-cardinality corpus content change must be detected as \
+             stale and force a rebuild rather than silently loading the \
+             outdated snapshot forever (#812 review HIGH-2), got: {status:?}"
+        );
     }
 }
