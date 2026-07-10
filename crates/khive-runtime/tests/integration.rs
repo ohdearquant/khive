@@ -345,6 +345,174 @@ async fn query_via_gql() {
 }
 
 // =============================================================================
+// GQL query truncation warning (issue #777)
+//
+// The compiler cannot infer truncation from the requested LIMIT alone — it
+// must observe whether a real (max_limit + 1)-th match exists. These tests
+// exercise the full compile -> execute -> strip-sentinel -> warn pipeline
+// against real result sets straddling the default 500-row cap.
+// =============================================================================
+
+/// Seed `n` concept entities into a fresh namespace and return the token.
+async fn seed_concepts(rt: &KhiveRuntime, ns: &str, n: usize) -> khive_runtime::NamespaceToken {
+    let tok = rt.authorize(Namespace::parse(ns).unwrap()).unwrap();
+    for i in 0..n {
+        rt.create_entity(
+            &tok,
+            "concept",
+            None,
+            &format!("seed-{i}"),
+            None,
+            None,
+            vec![],
+        )
+        .await
+        .unwrap();
+    }
+    tok
+}
+
+#[tokio::test]
+async fn no_explicit_limit_under_and_at_cap_emits_no_warning() {
+    let rt = rt();
+
+    // 499 matches, no explicit LIMIT: below the cap, all rows returned, no warning.
+    let tok_499 = seed_concepts(&rt, "trunc-499", 499).await;
+    let result_499 = rt
+        .query_with_metadata(
+            &tok_499,
+            "MATCH (a:concept) RETURN a",
+            khive_query::CompileOptions::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(result_499.rows.len(), 499);
+    assert!(
+        result_499.warnings.is_empty(),
+        "499 matches under the cap must not warn: {:?}",
+        result_499.warnings
+    );
+
+    // Exactly 500 matches, no explicit LIMIT: right at the cap, no truncation, no warning.
+    let tok_500 = seed_concepts(&rt, "trunc-500", 500).await;
+    let result_500 = rt
+        .query_with_metadata(
+            &tok_500,
+            "MATCH (a:concept) RETURN a",
+            khive_query::CompileOptions::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(result_500.rows.len(), 500);
+    assert!(
+        result_500.warnings.is_empty(),
+        "exactly 500 matches must not warn (nothing was dropped): {:?}",
+        result_500.warnings
+    );
+}
+
+#[tokio::test]
+async fn no_explicit_limit_over_cap_warns_and_strips_sentinel() {
+    let rt = rt();
+
+    // 501 matches, no explicit LIMIT — this is issue #777's original silent-
+    // truncation case: the cap is the only bound, and the compiler cannot know
+    // ahead of time that a 501st row exists.
+    let tok = seed_concepts(&rt, "trunc-501", 501).await;
+    let result = rt
+        .query_with_metadata(
+            &tok,
+            "MATCH (a:concept) RETURN a",
+            khive_query::CompileOptions::default(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        result.rows.len(),
+        500,
+        "sentinel row must be stripped; exactly max_limit rows must be returned"
+    );
+    assert_eq!(result.warnings.len(), 1, "warnings: {:?}", result.warnings);
+    assert!(result.warnings[0].contains("500"), "{}", result.warnings[0]);
+
+    // The sentinel row must not leak into the returned set: every row must be
+    // a distinct seeded entity.
+    let names: std::collections::HashSet<_> = result
+        .rows
+        .iter()
+        .filter_map(|r| match r.get("a_name") {
+            Some(khive_storage::types::SqlValue::Text(s)) => Some(s.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(names.len(), 500, "sentinel row must not leak into results");
+}
+
+#[tokio::test]
+async fn explicit_limit_variants_against_501_matches() {
+    let rt = rt();
+    let tok = seed_concepts(&rt, "trunc-501-limits", 501).await;
+
+    // LIMIT above the cap: the cap still binds, warning fires, sentinel stripped.
+    let above_cap = rt
+        .query_with_metadata(
+            &tok,
+            "MATCH (a:concept) RETURN a LIMIT 600",
+            khive_query::CompileOptions::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(above_cap.rows.len(), 500);
+    assert_eq!(
+        above_cap.warnings.len(),
+        1,
+        "LIMIT above cap with 501 real matches must warn: {:?}",
+        above_cap.warnings
+    );
+    assert!(above_cap.warnings[0].contains("600"));
+    assert!(above_cap.warnings[0].contains("500"));
+
+    // LIMIT exactly at the cap: the cap never binds (requested <= max_limit),
+    // so no sentinel is fetched and no warning fires, even though 501 rows
+    // actually match — the caller asked for exactly 500 and got exactly 500.
+    let at_cap = rt
+        .query_with_metadata(
+            &tok,
+            "MATCH (a:concept) RETURN a LIMIT 500",
+            khive_query::CompileOptions::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(at_cap.rows.len(), 500);
+    assert!(
+        at_cap.warnings.is_empty(),
+        "LIMIT == cap must not warn: {:?}",
+        at_cap.warnings
+    );
+
+    // LIMIT below the cap: this is the reviewer's false-positive regression
+    // case (LIMIT above the requested value but under real matches would have
+    // wrongly warned under the old requested-limit-only inference). Here the
+    // requested LIMIT is under the cap, so it must never warn regardless of
+    // how many rows actually match.
+    let below_cap = rt
+        .query_with_metadata(
+            &tok,
+            "MATCH (a:concept) RETURN a LIMIT 100",
+            khive_query::CompileOptions::default(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(below_cap.rows.len(), 100);
+    assert!(
+        below_cap.warnings.is_empty(),
+        "LIMIT below cap must not warn: {:?}",
+        below_cap.warnings
+    );
+}
+
+// =============================================================================
 // Namespace isolation
 // =============================================================================
 

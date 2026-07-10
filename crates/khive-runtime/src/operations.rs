@@ -3608,7 +3608,8 @@ impl KhiveRuntime {
             .map(|ns| ns.as_str().to_string())
             .collect();
         let compiled = khive_query::compile(&ast, &opts)?;
-        let warnings = compiled.warnings;
+        let mut warnings = compiled.warnings;
+        let truncation_check = compiled.truncation_check;
 
         // Convert QueryValue params (query-layer type) to SqlValue (storage-layer type)
         // at the query–storage boundary.
@@ -3630,7 +3631,31 @@ impl KhiveRuntime {
             params,
             label: None,
         };
-        let rows = reader.query_all(stmt).await?;
+        let mut rows = reader.query_all(stmt).await?;
+
+        // When the server-side cap was the binding constraint, the compiled
+        // SQL asked for one extra (sentinel) row. Its presence in the actual
+        // result set — not the requested LIMIT — is the truncation signal
+        // (issue #777): a `LIMIT 1000` that only matches 20 rows must not
+        // warn, and a query with no `LIMIT` that matches 501+ rows must.
+        if let Some(check) = truncation_check {
+            if rows.len() > check.max_limit {
+                rows.truncate(check.max_limit);
+                warnings.push(match check.requested_limit {
+                    Some(requested) => format!(
+                        "result set capped at {} rows; requested limit {requested} exceeds the \
+                         cap — use LIMIT/OFFSET to page through the remaining results",
+                        check.max_limit
+                    ),
+                    None => format!(
+                        "result set capped at {} rows; more than {} rows matched with no LIMIT \
+                         clause — use LIMIT/OFFSET to page through the remaining results",
+                        check.max_limit, check.max_limit
+                    ),
+                });
+            }
+        }
+
         Ok(QueryResult { rows, warnings })
     }
 
