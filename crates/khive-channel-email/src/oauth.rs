@@ -4,12 +4,17 @@
 //! set. The token endpoint is Microsoft's app-only flow:
 //! `POST https://login.microsoftonline.com/{tenant_id}/oauth2/v2.0/token`.
 
-use std::time::{Duration, Instant};
+use std::{
+    future::Future,
+    time::{Duration, Instant},
+};
 
 #[cfg(test)]
 use base64::Engine as _;
 use khive_channel::ChannelError;
 use tokio::sync::Mutex;
+
+const TOKEN_REFRESH_TIMEOUT: Duration = Duration::from_secs(15);
 
 // ──────────────────────────── OAuth error-body sanitization (Finding 1)
 
@@ -140,19 +145,53 @@ impl TokenProvider {
 
     /// Return a valid access token, fetching a new one when the cached token
     /// has less than 60 seconds of life remaining.
+    ///
+    /// The cache-miss/expired-token refresh is bounded by
+    /// [`TOKEN_REFRESH_TIMEOUT`] while the cache lock is held; a timeout
+    /// releases the lock so a subsequent call can retry.
     pub async fn get_token(&self) -> Result<String, ChannelError> {
+        self.get_token_with_fetcher(|| {
+            fetch_token(&self.tenant_id, &self.client_id, &self.client_secret)
+        })
+        .await
+    }
+
+    async fn get_token_with_fetcher<F, Fut>(&self, fetch: F) -> Result<String, ChannelError>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = Result<TokenResponse, ChannelError>>,
+    {
         let mut guard = self.cached.lock().await;
-        if let Some(ref cached) = *guard {
+
+        if let Some(cached) = guard.as_ref() {
             if cached.expires_at > Instant::now() {
-                return Ok(cached.access_token.clone());
+                let access_token = cached.access_token.clone();
+                drop(guard);
+                return Ok(access_token);
             }
         }
-        let resp = fetch_token(&self.tenant_id, &self.client_id, &self.client_secret).await?;
+
+        let resp = match tokio::time::timeout(TOKEN_REFRESH_TIMEOUT, fetch()).await {
+            Ok(Ok(resp)) => resp,
+            Ok(Err(err)) => {
+                drop(guard);
+                return Err(err);
+            }
+            Err(_) => {
+                drop(guard);
+                return Err(ChannelError::Auth(format!(
+                    "OAuth2 token refresh timed out ({TOKEN_REFRESH_TIMEOUT:?})"
+                )));
+            }
+        };
+
         let expires_at = Instant::now() + Duration::from_secs(resp.expires_in.saturating_sub(60));
         *guard = Some(CachedToken {
             access_token: resp.access_token.clone(),
             expires_at,
         });
+        drop(guard);
+
         Ok(resp.access_token)
     }
 }
@@ -256,6 +295,11 @@ async fn fetch_token(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+
     use async_imap::Authenticator as _;
 
     use super::*;
@@ -439,5 +483,309 @@ mod tests {
             token_type: Some("Bearer".to_string()),
         };
         assert!(validate_token_response(&resp).is_ok());
+    }
+
+    // ── Issue #477: bounded refresh under the shared cache lock ─────────────
+
+    /// A stalled cache-miss refresh must time out after [`TOKEN_REFRESH_TIMEOUT`],
+    /// release the cache mutex, and let an already-queued caller acquire it and
+    /// complete its own independently bounded refresh.
+    #[tokio::test(start_paused = true)]
+    async fn timed_out_refresh_releases_lock_and_waiting_retry_succeeds() {
+        let provider = Arc::new(TokenProvider::new(
+            "tenant".to_string(),
+            "client".to_string(),
+            "secret".to_string(),
+        ));
+        let (stalled_started_tx, stalled_started_rx) = tokio::sync::oneshot::channel();
+
+        let stalled = {
+            let provider = Arc::clone(&provider);
+            tokio::spawn(async move {
+                provider
+                    .get_token_with_fetcher(move || {
+                        stalled_started_tx
+                            .send(())
+                            .expect("stalled fetch start receiver must remain live");
+                        std::future::pending::<Result<TokenResponse, ChannelError>>()
+                    })
+                    .await
+            })
+        };
+
+        stalled_started_rx
+            .await
+            .expect("stalled refresh must acquire the lock and begin");
+        assert!(
+            provider.cached.try_lock().is_err(),
+            "stalled refresh must still own the cache mutex"
+        );
+
+        let retry_fetch_calls = Arc::new(AtomicUsize::new(0));
+        let (retry_started_tx, retry_started_rx) = tokio::sync::oneshot::channel();
+        let retry = {
+            let provider = Arc::clone(&provider);
+            let retry_fetch_calls = Arc::clone(&retry_fetch_calls);
+            tokio::spawn(async move {
+                retry_started_tx
+                    .send(())
+                    .expect("retry start receiver must remain live");
+                provider
+                    .get_token_with_fetcher(move || {
+                        retry_fetch_calls.fetch_add(1, Ordering::SeqCst);
+                        std::future::ready(Ok(TokenResponse {
+                            access_token: "retry_token".to_string(), // gitleaks:allow
+                            expires_in: 3600,
+                            token_type: Some("Bearer".to_string()),
+                        }))
+                    })
+                    .await
+            })
+        };
+
+        retry_started_rx
+            .await
+            .expect("retry caller must begin before the refresh deadline");
+        assert_eq!(
+            retry_fetch_calls.load(Ordering::SeqCst),
+            0,
+            "retry fetch must not start while the stalled owner holds the mutex"
+        );
+
+        tokio::time::advance(TOKEN_REFRESH_TIMEOUT - Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+        assert!(
+            !stalled.is_finished(),
+            "refresh must remain pending before deadline"
+        );
+        assert_eq!(retry_fetch_calls.load(Ordering::SeqCst), 0);
+
+        tokio::time::advance(Duration::from_secs(1)).await;
+        let err = stalled
+            .await
+            .expect("stalled refresh task must not panic")
+            .expect_err("stalled refresh must time out");
+        match err {
+            ChannelError::Auth(message) => {
+                assert_eq!(message, "OAuth2 token refresh timed out (15s)");
+            }
+            other => panic!("expected ChannelError::Auth, got {other:?}"),
+        }
+
+        let token = tokio::time::timeout(Duration::from_secs(1), retry)
+            .await
+            .expect("queued retry must acquire the released cache mutex")
+            .expect("retry task must not panic")
+            .expect("retry refresh must succeed");
+        assert_eq!(token, "retry_token");
+        assert_eq!(retry_fetch_calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// Two concurrent cache-miss callers must perform exactly one refresh; the
+    /// second caller rechecks the populated cache after acquiring the lock and
+    /// never invokes its own fetch closure.
+    #[tokio::test(start_paused = true)]
+    async fn concurrent_cache_miss_performs_one_refresh_and_shares_result() {
+        let provider = Arc::new(TokenProvider::new(
+            "tenant".to_string(),
+            "client".to_string(),
+            "secret".to_string(),
+        ));
+        let (fetch_started_tx, fetch_started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+
+        let first = {
+            let provider = Arc::clone(&provider);
+            tokio::spawn(async move {
+                provider
+                    .get_token_with_fetcher(move || async move {
+                        fetch_started_tx
+                            .send(())
+                            .expect("first fetch start receiver must remain live");
+                        release_rx
+                            .await
+                            .expect("first fetch release sender must remain live");
+                        Ok(TokenResponse {
+                            access_token: "shared_token".to_string(), // gitleaks:allow
+                            expires_in: 3600,
+                            token_type: Some("Bearer".to_string()),
+                        })
+                    })
+                    .await
+            })
+        };
+
+        fetch_started_rx
+            .await
+            .expect("first refresh must acquire the lock and begin");
+        assert!(
+            provider.cached.try_lock().is_err(),
+            "first refresh must still own the cache mutex"
+        );
+
+        let second_fetch_calls = Arc::new(AtomicUsize::new(0));
+        let (second_started_tx, second_started_rx) = tokio::sync::oneshot::channel();
+        let second = {
+            let provider = Arc::clone(&provider);
+            let second_fetch_calls = Arc::clone(&second_fetch_calls);
+            tokio::spawn(async move {
+                second_started_tx
+                    .send(())
+                    .expect("second caller start receiver must remain live");
+                provider
+                    .get_token_with_fetcher(move || {
+                        second_fetch_calls.fetch_add(1, Ordering::SeqCst);
+                        std::future::ready(Ok(TokenResponse {
+                            access_token: "duplicate_token".to_string(), // gitleaks:allow
+                            expires_in: 3600,
+                            token_type: Some("Bearer".to_string()),
+                        }))
+                    })
+                    .await
+            })
+        };
+
+        second_started_rx
+            .await
+            .expect("second caller must begin while first refresh owns the lock");
+        assert_eq!(
+            second_fetch_calls.load(Ordering::SeqCst),
+            0,
+            "second fetch must wait behind the first refresh"
+        );
+
+        release_tx
+            .send(())
+            .expect("first refresh task must remain live");
+
+        let first_token = tokio::time::timeout(Duration::from_secs(1), first)
+            .await
+            .expect("first refresh must finish after release")
+            .expect("first refresh task must not panic")
+            .expect("first refresh must succeed");
+        let second_token = tokio::time::timeout(Duration::from_secs(1), second)
+            .await
+            .expect("second caller must acquire the released cache mutex")
+            .expect("second caller task must not panic")
+            .expect("second caller must return the cached token");
+
+        assert_eq!(first_token, "shared_token");
+        assert_eq!(second_token, "shared_token");
+        assert_eq!(second_fetch_calls.load(Ordering::SeqCst), 0);
+    }
+
+    fn success_resp(token: &str) -> TokenResponse {
+        TokenResponse {
+            access_token: token.to_string(),
+            expires_in: 3600,
+            token_type: Some("Bearer".to_string()),
+        }
+    }
+
+    /// After one successful refresh populates the cache, a second call must
+    /// return the cached token WITHOUT invoking its fetch closure at all.
+    #[tokio::test(start_paused = true)]
+    async fn cache_hit_no_contention_never_invokes_fetcher() {
+        let provider = TokenProvider::new("t".into(), "c".into(), "s".into());
+
+        let token = provider
+            .get_token_with_fetcher(|| async { Ok(success_resp("hit_token")) })
+            .await
+            .expect("first refresh must succeed");
+        assert_eq!(token, "hit_token");
+
+        let second = provider
+            .get_token_with_fetcher(|| async {
+                panic!("cache-hit path must not invoke the fetcher");
+                #[allow(unreachable_code)]
+                Ok(success_resp("unused"))
+            })
+            .await
+            .expect("cache hit must succeed without fetching");
+        assert_eq!(second, "hit_token");
+    }
+
+    /// A fast (non-timeout) fetch failure must propagate the original error
+    /// unchanged and release the lock immediately — not be reinterpreted as a
+    /// timeout, and not leave the mutex held for the next caller.
+    #[tokio::test(start_paused = true)]
+    async fn refresh_failure_propagates_and_releases_lock_immediately() {
+        let provider = Arc::new(TokenProvider::new("t".into(), "c".into(), "s".into()));
+
+        let err = provider
+            .get_token_with_fetcher(|| async {
+                Err(ChannelError::Auth("invalid_client".to_string()))
+            })
+            .await
+            .expect_err("fast failure must propagate");
+        match err {
+            ChannelError::Auth(msg) => assert_eq!(msg, "invalid_client"),
+            other => panic!("expected ChannelError::Auth, got {other:?}"),
+        }
+
+        assert!(
+            provider.cached.try_lock().is_ok(),
+            "lock must be released synchronously after a fast fetch error"
+        );
+        let token = provider
+            .get_token_with_fetcher(|| async { Ok(success_resp("after_failure")) })
+            .await
+            .expect("subsequent call must succeed");
+        assert_eq!(token, "after_failure");
+    }
+
+    /// Proves the guard is released when the CALLER cancels/aborts the
+    /// in-flight future — distinct from the internal `tokio::time::timeout`
+    /// elapsing. No virtual time is advanced here: release must happen
+    /// strictly from cancellation, not from [`TOKEN_REFRESH_TIMEOUT`] elapsing.
+    #[tokio::test(start_paused = true)]
+    async fn caller_cancellation_releases_lock_before_internal_timeout() {
+        let provider = Arc::new(TokenProvider::new("t".into(), "c".into(), "s".into()));
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+
+        let handle = {
+            let provider = Arc::clone(&provider);
+            tokio::spawn(async move {
+                provider
+                    .get_token_with_fetcher(move || {
+                        started_tx.send(()).expect("receiver must be live");
+                        std::future::pending::<Result<TokenResponse, ChannelError>>()
+                    })
+                    .await
+            })
+        };
+
+        started_rx
+            .await
+            .expect("task must start and acquire the lock");
+        assert!(
+            provider.cached.try_lock().is_err(),
+            "in-flight refresh must hold the cache mutex"
+        );
+
+        // Cancel the CALLER well before TOKEN_REFRESH_TIMEOUT elapses. If the
+        // lock were only released by the internal `tokio::time::timeout`
+        // future, this abort alone would never free it.
+        handle.abort();
+        let join_result = handle.await;
+        assert!(
+            join_result.as_ref().is_err() && join_result.unwrap_err().is_cancelled(),
+            "task must report as cancelled, not as having completed the pending fetch"
+        );
+
+        // Let the runtime run the aborted future's Drop glue.
+        tokio::task::yield_now().await;
+
+        assert!(
+            provider.cached.try_lock().is_ok(),
+            "cache mutex guard must be dropped when the caller's future is cancelled, \
+             not only when the internal timeout elapses"
+        );
+
+        let token = provider
+            .get_token_with_fetcher(|| async { Ok(success_resp("post_cancel")) })
+            .await
+            .expect("a fresh caller must be able to acquire and refresh after cancellation");
+        assert_eq!(token, "post_cancel");
     }
 }
