@@ -5,17 +5,24 @@ use std::collections::BTreeMap;
 use serde_json::{Map, Value};
 
 use crate::types::{
-    ArgValue, DslError, ExecutionMode, ParsedOp, ParsedRequest, MAX_OPS, RESERVED_ENVELOPE_ARGS,
+    ArgValue, DslError, ExecutionMode, ParsedOp, ParsedRequest, MAX_OPS, MAX_OPS_INPUT_LEN,
+    RESERVED_ENVELOPE_ARGS,
 };
 
 use super::parser_impl::Parser;
-use super::scan::{find_prev_ref_pos, json_value_contains_prev_ref};
+use super::scan::{check_json_nesting_depth, find_prev_ref_pos, json_value_contains_prev_ref};
 
 /// Parse a request input string into a single op or a batch.
 pub fn parse_request(input: &str) -> Result<ParsedRequest, DslError> {
     let trimmed = input.trim();
     if trimmed.is_empty() {
         return Err(DslError::Empty);
+    }
+    if trimmed.len() > MAX_OPS_INPUT_LEN {
+        return Err(DslError::InputTooLarge {
+            len: trimmed.len(),
+            max: MAX_OPS_INPUT_LEN,
+        });
     }
 
     let first = trimmed.as_bytes()[0];
@@ -96,6 +103,11 @@ fn parse_chain_tail(mut p: Parser<'_>, first_op: ParsedOp) -> Result<ParsedReque
 }
 
 fn parse_json_form(input: &str) -> Result<ParsedRequest, DslError> {
+    // `serde_json`'s untyped `Value` deserializer has no exposed depth knob,
+    // so bound nesting with a cheap pre-pass scan before handing the input to
+    // it, otherwise a deeply-nested JSON-form payload recurses the native
+    // parser unbounded (CWE-674).
+    check_json_nesting_depth(input)?;
     let v: Value = serde_json::from_str(input).map_err(|e| DslError::InvalidJson {
         error: e.to_string(),
     })?;

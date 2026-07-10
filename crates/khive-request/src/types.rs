@@ -6,6 +6,24 @@ use serde_json::Value;
 /// Hard cap on operations per request.
 pub const MAX_OPS: usize = 100;
 
+/// Hard cap on the byte length of a raw `ops` input string, checked before any
+/// parsing begins. A cheap O(1) first line of defense against pathological
+/// input; does not by itself bound container-nesting depth (see
+/// [`NESTING_DEPTH_LIMIT`]), since a compact payload can still pack tens of
+/// thousands of nesting levels into a few KiB.
+pub const MAX_OPS_INPUT_LEN: usize = 256 * 1024;
+
+/// Hard cap on container-nesting depth (`[`/`{`) tracked through the DSL
+/// parser, the JSON-form pre-pass scan, and (by construction, since
+/// `ArgValue::Array` and `ArgValue::Object` are only ever built inside the
+/// depth-guarded parser functions) any `$prev` reference nested inside
+/// array/object literals.
+///
+/// 64 gives generous headroom over real khive `ops` payloads (observed at 2-4
+/// levels of nesting) while remaining far too shallow for a native recursive
+/// descent to threaten the thread stack (CWE-674).
+pub const NESTING_DEPTH_LIMIT: usize = 64;
+
 /// Names reserved at the request-envelope level; rejected if they appear inside verb args.
 pub const RESERVED_ENVELOPE_ARGS: &[&str] = &["presentation", "presentation_per_op"];
 
@@ -107,6 +125,20 @@ pub enum DslError {
         count: usize,
         max: usize,
     },
+    /// Raw `ops` input exceeds [`MAX_OPS_INPUT_LEN`], rejected before any parsing begins.
+    InputTooLarge {
+        len: usize,
+        max: usize,
+    },
+    /// Container nesting (`[`/`{`) exceeds [`NESTING_DEPTH_LIMIT`]. Covers the
+    /// function-call array/object parser, the JSON-form pre-pass scan, and any
+    /// `$prev` reference nested inside array/object literals (bounded at the
+    /// same construction sites).
+    NestingTooDeep {
+        pos: usize,
+        depth: usize,
+        max: usize,
+    },
     UnexpectedChar {
         pos: usize,
         found: char,
@@ -187,6 +219,15 @@ impl fmt::Display for DslError {
             DslError::Empty => write!(f, "request is empty"),
             DslError::TooManyOps { count, max } => {
                 write!(f, "batch has {count} ops; max is {max}")
+            }
+            DslError::InputTooLarge { len, max } => {
+                write!(f, "ops input is {len} bytes; max is {max} bytes")
+            }
+            DslError::NestingTooDeep { pos, depth, max } => {
+                write!(
+                    f,
+                    "at position {pos}: container nesting depth {depth} exceeds max {max}"
+                )
             }
             DslError::UnexpectedChar {
                 pos,
