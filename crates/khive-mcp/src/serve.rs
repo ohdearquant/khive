@@ -1289,8 +1289,8 @@ pub(crate) fn is_strict_actor_mode() -> bool {
 /// - `build_server` and `build_server_multi_backend` in this file (the `kkernel mcp` paths)
 /// - `build_registry_for_multi_backend` in this file (the ADR-029 coordinator path)
 /// - `kkernel exec` (`crates/kkernel/src/exec.rs`) — dispatches arbitrary ops
-/// - `kkernel pending_events` (`crates/kkernel/src/pending_events.rs`) — drains
-///   and dispatches scheduled events
+/// - `khive_mcp::pending_events::run_pending_events` — drains and dispatches
+///   scheduled events
 ///
 /// **Pure-introspection registry construction is intentionally EXEMPT** because it
 /// never dispatches verbs or reads comm/tenant data, so it carries no

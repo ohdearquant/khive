@@ -215,7 +215,7 @@ pub async fn run_pending_events(
 ///
 /// [`run_pending_events`] is the CLI-facing entry point (`kkernel exec
 /// --pending-events`); it now resolves both `rt` and `server` via
-/// `khive-mcp::serve::build_server`, the same multi-backend-aware
+/// `khive-mcp::serve::build_server_with_explicit_namespace`, the same multi-backend-aware
 /// construction the daemon boot path uses, one fresh pair per invocation —
 /// correct for a short-lived cron-invoked process.
 ///
