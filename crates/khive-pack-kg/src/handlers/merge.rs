@@ -43,7 +43,7 @@ impl KgPack {
                     )));
                 }
                 self.runtime
-                    .merge_entity(token, into_id, from_id, policy, dry_run)
+                    .merge_entity(token, into_id, from_id, policy, content_strategy, dry_run)
                     .await?
             }
             KindSpec::Note { specific } => {

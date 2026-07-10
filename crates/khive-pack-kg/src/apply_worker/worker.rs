@@ -3,7 +3,7 @@
 use uuid::Uuid;
 
 use khive_runtime::{
-    curation::{EntityDedupMergePolicy, EntityPatch},
+    curation::{ContentMergeStrategy, EntityDedupMergePolicy, EntityPatch},
     KhiveRuntime, NamespaceToken, RuntimeError, VerbRegistry,
 };
 use khive_storage::types::PageRequest;
@@ -363,6 +363,7 @@ impl ProposalApplyWorker {
                 into_id,
                 from_id,
                 EntityDedupMergePolicy::PreferInto,
+                ContentMergeStrategy::Append,
                 false,
             )
             .await?;

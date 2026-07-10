@@ -3005,6 +3005,66 @@ async fn curation_merge_entity_event_payload_has_adr014_fields() {
         payload.get("edges_rewired").is_some(),
         "entity_merged payload must contain 'edges_rewired'; got {payload}"
     );
+    assert!(
+        payload.get("content_strategy").is_some(),
+        "entity_merged payload must contain 'content_strategy' (codex PR #814 Medium finding); got {payload}"
+    );
+}
+
+/// Handler-wiring test for the codex PR #814 High finding: `content_strategy`
+/// passed on the wire through `merge(kind="entity", ...)` must reach
+/// `KhiveRuntime::merge_entity` and be honored independently of the default
+/// entity `strategy` (`prefer_into`).
+#[tokio::test]
+async fn merge_handler_wires_explicit_prefer_from_content_strategy() {
+    let p = pack();
+
+    let into = p
+        .dispatch(
+            "create",
+            json!({"kind": "concept", "name": "Into", "description": "desc A"}),
+        )
+        .await
+        .expect("create into must succeed");
+    let into_id = into
+        .get("id")
+        .and_then(Value::as_str)
+        .expect("create must return id")
+        .to_string();
+
+    let from = p
+        .dispatch(
+            "create",
+            json!({"kind": "concept", "name": "From", "description": "desc B"}),
+        )
+        .await
+        .expect("create from must succeed");
+    let from_id = from
+        .get("id")
+        .and_then(Value::as_str)
+        .expect("create must return id")
+        .to_string();
+
+    // strategy is left at its default (prefer_into); only content_strategy is
+    // set explicitly. If the handler/runtime wiring collapses content_strategy
+    // onto the entity policy, the into-description ("desc A") survives instead.
+    p.dispatch(
+        "merge",
+        json!({"into_id": &into_id, "from_id": &from_id, "content_strategy": "prefer_from"}),
+    )
+    .await
+    .expect("merge must succeed");
+
+    let merged = p
+        .dispatch("get", json!({"id": &into_id}))
+        .await
+        .expect("get must succeed");
+    assert_eq!(
+        merged.get("description").and_then(Value::as_str),
+        Some("desc B"),
+        "content_strategy=prefer_from on the wire must win over the default \
+         prefer_into entity policy; got {merged}"
+    );
 }
 
 /// Delete an entity with hard=true → list entity_deleted events → assert payload has

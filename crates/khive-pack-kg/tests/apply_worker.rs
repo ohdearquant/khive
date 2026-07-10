@@ -196,6 +196,113 @@ async fn apply_worker_applies_add_edge_changeset() {
     assert_eq!(row.status, "applied");
 }
 
+/// ADR-046 apply-worker path test for the codex PR #814 Medium finding: the
+/// five new content_strategy tests only exercised the runtime directly, not
+/// a proposal-driven merge. `apply_merge_entities` hard-codes
+/// `EntityDedupMergePolicy::PreferInto` + `ContentMergeStrategy::Append`
+/// (the safe, lossless default for proposal-driven merges) — verify that
+/// path actually rewires edges and tombstones the source.
+#[tokio::test]
+async fn apply_worker_applies_merge_entities_changeset() {
+    let (rt, tok) = setup();
+    ensure_schema(&rt).await;
+
+    let into = rt
+        .create_entity(&tok, "concept", None, "Into", Some("desc A"), None, vec![])
+        .await
+        .expect("create into");
+    let from = rt
+        .create_entity(&tok, "concept", None, "From", Some("desc B"), None, vec![])
+        .await
+        .expect("create from");
+    let other = rt
+        .create_entity(&tok, "concept", None, "Other", None, None, vec![])
+        .await
+        .expect("create other");
+    rt.link(
+        &tok,
+        other.id,
+        from.id,
+        khive_types::EdgeRelation::Extends,
+        1.0,
+        None,
+    )
+    .await
+    .expect("link other -> from");
+
+    let proposal_id = Uuid::new_v4();
+    let changeset = ProposalChangeset::MergeEntities {
+        into: Id128::from_u128(into.id.as_u128()),
+        from: Id128::from_u128(from.id.as_u128()),
+    };
+
+    seed_proposal_created_event(&rt, &tok, proposal_id, changeset).await;
+    insert_projection_row(&rt, &tok, proposal_id, "approved").await;
+
+    let registry = build_registry(&rt);
+    let worker = ProposalApplyWorker::new(rt.clone());
+    worker
+        .maybe_apply(&tok, proposal_id, &registry, None)
+        .await
+        .expect("maybe_apply must succeed");
+
+    let event_store = rt.events(&tok).expect("event store");
+    let applied_events = event_store
+        .query_events(
+            EventFilter {
+                kinds: vec![EventKind::ProposalApplied],
+                payload_proposal_id: Some(proposal_id),
+                ..Default::default()
+            },
+            PageRequest {
+                offset: 0,
+                limit: 10,
+            },
+        )
+        .await
+        .expect("query events");
+    assert_eq!(
+        applied_events.items.len(),
+        1,
+        "exactly one ProposalApplied event must be emitted"
+    );
+
+    let merged = rt
+        .get_entity(&tok, into.id)
+        .await
+        .expect("into entity must still exist");
+    assert_eq!(
+        merged.description.as_deref(),
+        Some("desc A\n\n---\n\ndesc B"),
+        "apply_merge_entities must merge content with the Append default"
+    );
+
+    let source = rt
+        .get_entity(&tok, from.id)
+        .await
+        .expect_err("from entity must be tombstoned (soft-deleted) after merge");
+    assert!(
+        matches!(source, khive_runtime::RuntimeError::NotFound(_)),
+        "expected NotFound for the tombstoned source entity, got: {source:?}"
+    );
+
+    let other_neighbors = rt
+        .neighbors(
+            &tok,
+            other.id,
+            khive_storage::types::Direction::Out,
+            None,
+            None,
+        )
+        .await
+        .expect("neighbors must succeed");
+    assert_eq!(other_neighbors.len(), 1);
+    assert_eq!(
+        other_neighbors[0].node_id, into.id,
+        "the edge from `other` must have been rewired onto the surviving `into` entity"
+    );
+}
+
 #[tokio::test]
 async fn apply_worker_skips_non_approved_proposals() {
     let (rt, tok) = setup();
