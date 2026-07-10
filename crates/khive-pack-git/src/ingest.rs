@@ -451,9 +451,27 @@ fn row_uuid(row: &khive_storage::types::SqlRow) -> Option<Uuid> {
     }
 }
 
+/// Escape SQLite `LIKE` wildcard characters (`%`, `_`) and the escape
+/// character itself (`\`) so a caller-supplied path is matched literally
+/// under `LIKE ... ESCAPE '\'` rather than as a pattern.
+fn escape_like(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    for c in input.chars() {
+        if matches!(c, '\\' | '%' | '_') {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}
+
 /// Find an existing `document` entity whose `properties.source_uri` or `name`
 /// matches `path` (ADR-086 keying convention). Returns `None` when no match —
 /// v0 never creates documents on the ingester's behalf (skip the edge).
+///
+/// An exact `source_uri`/`name` match always wins over the suffix-`LIKE`
+/// fallback: the two are queried separately so a wildcard-broadened
+/// candidate can never shadow an exact one under an unordered `LIMIT 1`.
 async fn find_document_for_path(
     runtime: &KhiveRuntime,
     token: &NamespaceToken,
@@ -463,29 +481,45 @@ async fn find_document_for_path(
         .file_name()
         .and_then(|f| f.to_str())
         .unwrap_or(path);
-    let like_pattern = format!("%{path}");
     let sql = runtime.sql();
+    let namespace = token.namespace().as_str().to_string();
+
     let mut r = sql.reader().await.map_err(|e| anyhow!("{e}"))?;
-    let row = r
+    let exact_row = r
         .query_row(SqlStatement {
             sql: "SELECT id FROM entities WHERE kind='document' AND namespace=?1 \
                   AND deleted_at IS NULL \
-                  AND (json_extract(properties,'$.source_uri')=?2 \
-                       OR json_extract(properties,'$.source_uri') LIKE ?3 \
-                       OR name=?4) \
+                  AND (json_extract(properties,'$.source_uri')=?2 OR name=?3) \
                   LIMIT 1"
                 .into(),
             params: vec![
-                SqlValue::Text(token.namespace().as_str().to_string()),
+                SqlValue::Text(namespace.clone()),
                 SqlValue::Text(path.to_string()),
-                SqlValue::Text(like_pattern),
                 SqlValue::Text(file_name.to_string()),
             ],
-            label: Some("git_ingest_find_document_for_path".into()),
+            label: Some("git_ingest_find_document_for_path_exact".into()),
         })
         .await
         .map_err(|e| anyhow!("{e}"))?;
-    Ok(row.and_then(|r| row_uuid(&r)))
+    if let Some(id) = exact_row.and_then(|r| row_uuid(&r)) {
+        return Ok(Some(id));
+    }
+
+    let like_pattern = format!("%{}", escape_like(path));
+    let mut r = sql.reader().await.map_err(|e| anyhow!("{e}"))?;
+    let like_row = r
+        .query_row(SqlStatement {
+            sql: "SELECT id FROM entities WHERE kind='document' AND namespace=?1 \
+                  AND deleted_at IS NULL \
+                  AND json_extract(properties,'$.source_uri') LIKE ?2 ESCAPE '\\' \
+                  LIMIT 1"
+                .into(),
+            params: vec![SqlValue::Text(namespace), SqlValue::Text(like_pattern)],
+            label: Some("git_ingest_find_document_for_path_like".into()),
+        })
+        .await
+        .map_err(|e| anyhow!("{e}"))?;
+    Ok(like_row.and_then(|r| row_uuid(&r)))
 }
 
 /// Read the last-ingested cursor value for `(project_id, kind)`, if any.
@@ -1567,5 +1601,73 @@ mod compact_prefix_resolver_tests {
 
         let resolved = resolve_id(&rt, &token, &compact[..16]).await.unwrap();
         assert_eq!(resolved, Some(project.id));
+    }
+}
+
+/// PR #816 r3 Major finding: `find_document_for_path` bound an unescaped
+/// path into a `LIKE` pattern (`%`/`_` in a filename became pattern
+/// wildcards) and picked whichever candidate the unordered `LIMIT 1` scan
+/// happened to return first, even when an exact match existed.
+#[cfg(test)]
+mod find_document_for_path_tests {
+    use super::*;
+    use khive_runtime::Namespace;
+
+    async fn create_document(rt: &KhiveRuntime, token: &NamespaceToken, source_uri: &str) -> Uuid {
+        rt.create_entity(
+            token,
+            "document",
+            None,
+            source_uri,
+            None,
+            Some(json!({ "source_uri": source_uri })),
+            vec![],
+        )
+        .await
+        .unwrap()
+        .id
+    }
+
+    #[tokio::test]
+    async fn path_with_like_wildcards_resolves_only_itself() {
+        let rt = KhiveRuntime::memory().unwrap();
+        let token = rt.authorize(Namespace::local()).unwrap();
+
+        // Neither document's `source_uri` matches `path` exactly, so
+        // resolution must fall through to the suffix-`LIKE` scan. Under the
+        // pre-fix unescaped pattern, `%` matches zero-or-more chars and `_`
+        // matches exactly one char, so this decoy (`100` + "" + "Q" +
+        // `done.rs`) would incorrectly satisfy `LIKE '%src/100%_done.rs'`.
+        // With `%`/`_` escaped, the pattern requires the literal substring
+        // `100%_done.rs` and the decoy no longer matches.
+        let path = "src/100%_done.rs";
+        let decoy_source_uri = "prefix/src/100Qdone.rs";
+        create_document(&rt, &token, decoy_source_uri).await;
+
+        let resolved = find_document_for_path(&rt, &token, path).await.unwrap();
+        assert_eq!(
+            resolved, None,
+            "a % or _ in the path must be matched literally, not as a LIKE wildcard"
+        );
+    }
+
+    #[tokio::test]
+    async fn exact_match_wins_over_wildcard_broadened_candidate() {
+        let rt = KhiveRuntime::memory().unwrap();
+        let token = rt.authorize(Namespace::local()).unwrap();
+
+        let path = "crates/khive-pack-git/src/ingest.rs";
+        let broadened_suffix_path = "other/crates/khive-pack-git/src/ingest.rs";
+        // Created first so an unordered `LIMIT 1` scan without exact-match
+        // priority would be free to return it instead of the exact match.
+        create_document(&rt, &token, broadened_suffix_path).await;
+        let exact_id = create_document(&rt, &token, path).await;
+
+        let resolved = find_document_for_path(&rt, &token, path).await.unwrap();
+        assert_eq!(
+            resolved,
+            Some(exact_id),
+            "an exact source_uri match must always win over a suffix-LIKE candidate"
+        );
     }
 }
