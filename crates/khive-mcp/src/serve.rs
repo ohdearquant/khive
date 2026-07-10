@@ -64,7 +64,7 @@ pub async fn run(args: Args, registry: &TransportRegistry) -> anyhow::Result<()>
 
     #[cfg(feature = "channel-email")]
     spawn_email_channel_loops_if_daemon(&server, &args);
-    spawn_schedule_tick_loop_if_daemon(&args, schedule_rt);
+    spawn_schedule_tick_loop_if_daemon(&args, &server, schedule_rt);
 
     #[cfg(unix)]
     if args.daemon {
@@ -150,12 +150,30 @@ fn spawn_email_channel_loops_if_daemon(server: &KhiveMcpServer, args: &Args) {
 /// this isn't the daemon role, or the resolved pack set does not include
 /// `"schedule"` (nothing to drain) — either way the tick loop is skipped.
 ///
+/// `server` is the daemon's own live, fully-wired `KhiveMcpServer` — the
+/// SAME one [`build_server`] returned alongside `schedule_rt` and that this
+/// process is about to serve. It is cloned (cheap — `Arc`-wrapped
+/// internally) and handed to the tick loop for action-dispatch only (round 2
+/// of codex PR #782 review's High finding, a continuation of the
+/// `schedule_rt`-only fix above): `schedule_rt` alone is correct for
+/// *scanning* `scheduled_event` rows (they live on the schedule pack's own
+/// backend), but building a throwaway `KhiveMcpServer` from `schedule_rt`
+/// alone for *dispatch* would register every pack against the schedule
+/// backend, so a replayed action belonging to another pack (e.g.
+/// `comm.send`) would route to the wrong backend in a multi-backend
+/// deployment. Passing the daemon's real `server` keeps replay routing
+/// identical to a live request.
+///
 /// If no daemon is running, scheduled events are simply not drained by this
 /// mechanism — the documented external-cron invocation
 /// (`kkernel exec --pending-events`) still works independently and safely
 /// races the tick loop when both are present (see the module docs on
 /// [`crate::pending_events`]).
-fn spawn_schedule_tick_loop_if_daemon(args: &Args, schedule_rt: Option<KhiveRuntime>) {
+fn spawn_schedule_tick_loop_if_daemon(
+    args: &Args,
+    server: &KhiveMcpServer,
+    schedule_rt: Option<KhiveRuntime>,
+) {
     if !args.daemon {
         tracing::info!("schedule tick loop: skipped (client role; daemon owns the tick)");
         return;
@@ -172,7 +190,11 @@ fn spawn_schedule_tick_loop_if_daemon(args: &Args, schedule_rt: Option<KhiveRunt
         interval_secs = interval.as_secs(),
         "schedule tick loop: spawning (daemon role)"
     );
-    tokio::spawn(crate::pending_events::schedule_tick_loop(rt, interval));
+    tokio::spawn(crate::pending_events::schedule_tick_loop(
+        rt,
+        server.clone(),
+        interval,
+    ));
 }
 
 /// Spawn the email channel polling + outbox loops if the `channel-email`
@@ -967,7 +989,7 @@ pub async fn serve_server(
     }
     #[cfg(feature = "channel-email")]
     spawn_email_channel_loops_if_daemon(&server, args);
-    spawn_schedule_tick_loop_if_daemon(args, schedule_rt);
+    spawn_schedule_tick_loop_if_daemon(args, &server, schedule_rt);
 
     #[cfg(unix)]
     if args.daemon {
@@ -4763,6 +4785,149 @@ backend = "schedule-backend"
             0,
             "the marker must be ABSENT from \"main\" — the tick's runtime must not have \
              silently written into the main backend instead of the declared schedule backend"
+        );
+    }
+
+    /// Multi-backend ACTION-DISPATCH routing (codex PR #782 review round 2,
+    /// High finding): `schedule` defaults to "main" (no `[packs.schedule]`
+    /// entry declared), while `kg` — the pack whose `create` verb the stored
+    /// action below replays — is routed to a SEPARATE declared backend. A due
+    /// scheduled event whose action writes through `kg` must land its side
+    /// effect in `kg`'s OWN declared backend, never "main".
+    ///
+    /// This is the regression the round-1 fix-round was missing: round 1
+    /// fixed SCANNING (`scheduled_event` rows now correctly read from
+    /// `schedule`'s own backend, proven by
+    /// `build_server_schedule_tick_uses_the_declared_multi_backend_not_main`
+    /// above) but not DISPATCH — the drain replayed every stored action
+    /// through a throwaway `KhiveMcpServer::new(schedule_rt.clone())`, which
+    /// registers EVERY pack against the schedule backend alone. This test
+    /// drives the drain through `run_pending_events_on(&rt, &server, ..)`
+    /// with the daemon's REAL, fully-wired `server` (as
+    /// `spawn_schedule_tick_loop_if_daemon` now passes it) and asserts the
+    /// replayed action's own write shows up only in `kg`'s declared backend.
+    #[tokio::test]
+    #[serial]
+    async fn build_server_schedule_tick_dispatches_actions_through_the_declared_multi_backend_not_schedule(
+    ) {
+        let seat_dir = tempfile::tempdir().expect("seat tempdir");
+        let _seat_env = SeatEnv::enter(seat_dir.path());
+        std::env::remove_var("KHIVE_DB");
+        std::env::remove_var("KHIVE_ACTOR");
+        std::env::remove_var("KHIVE_PACKS");
+        std::env::remove_var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR");
+
+        let main_db = seat_dir.path().join("main.db");
+        let kg_db = seat_dir.path().join("kg-backend.db");
+        let config_path = write_config(
+            seat_dir.path(),
+            &format!(
+                r#"
+[[backends]]
+name = "main"
+kind = "sqlite"
+path = "{main}"
+
+[[backends]]
+name = "kg-backend"
+kind = "sqlite"
+path = "{kg}"
+
+[packs.kg]
+backend = "kg-backend"
+"#,
+                main = main_db.display(),
+                kg = kg_db.display(),
+            ),
+        );
+
+        use clap::Parser;
+        let args = Args::parse_from(["mcp", "--config", config_path.to_str().expect("utf8 path")]);
+
+        let (server, schedule_rt) = build_server(&args).expect("build_server must succeed");
+        // No `[packs.schedule]` entry above, so it defaults to "main".
+        let rt = schedule_rt.expect("schedule pack is loaded by default");
+
+        let marker = "adr106-multi-backend-dispatch-marker";
+        let action_dsl = format!("create(kind=\"observation\", content=\"{marker}\")");
+        let past = (chrono::Utc::now() - chrono::Duration::seconds(5)).to_rfc3339();
+        let repeat: Option<&str> = None;
+        let fired_at: Option<&str> = None;
+        let cancelled_at: Option<&str> = None;
+        let props = serde_json::json!({
+            "trigger_at": past,
+            "repeat": repeat,
+            "status": "pending",
+            "event_type": "schedule",
+            "payload": action_dsl,
+            "fired_at": fired_at,
+            "cancelled_at": cancelled_at,
+        });
+        let ns = Namespace::parse("local").expect("ns");
+        let token = rt.authorize(ns).expect("authorize schedule runtime");
+        rt.create_note(
+            &token,
+            "scheduled_event",
+            None,
+            &action_dsl,
+            None,
+            Some(props),
+            vec![],
+        )
+        .await
+        .expect("create scheduled_event through the schedule runtime");
+
+        let summary = crate::pending_events::run_pending_events_on(&rt, &server, false)
+            .await
+            .expect("drain");
+        assert_eq!(
+            summary.fired + summary.advanced,
+            1,
+            "the due event must be dispatched, got summary={summary:?}"
+        );
+        assert_eq!(summary.failed, 0, "dispatch must not fail: {summary:?}");
+
+        let count_marker_notes = |path: std::path::PathBuf| async move {
+            let cfg = RuntimeConfig {
+                db_path: Some(path),
+                default_namespace: Namespace::parse("local").unwrap(),
+                embedding_model: None,
+                additional_embedding_models: vec![],
+                ..RuntimeConfig::default()
+            };
+            let probe_rt = KhiveRuntime::new(cfg).expect("reopen backend file");
+            let ns = Namespace::parse("local").unwrap();
+            let token = probe_rt.authorize(ns).expect("authorize probe");
+            let store = probe_rt.notes(&token).expect("notes store");
+            let page = store
+                .query_notes(
+                    "local",
+                    Some("observation"),
+                    khive_storage::types::PageRequest {
+                        limit: 10,
+                        offset: 0,
+                    },
+                )
+                .await
+                .expect("query observation notes");
+            page.items
+                .into_iter()
+                .filter(|n| n.content == marker)
+                .count()
+        };
+
+        assert_eq!(
+            count_marker_notes(kg_db.clone()).await,
+            1,
+            "the replayed create(kind=\"observation\") action must land in the kg pack's OWN \
+             declared backend (\"kg-backend\"), not the schedule backend"
+        );
+        assert_eq!(
+            count_marker_notes(main_db.clone()).await,
+            0,
+            "the marker must be ABSENT from \"main\" (the schedule backend) — dispatching \
+             through a throwaway single-runtime server built from the schedule runtime alone \
+             would have written it here instead"
         );
     }
 

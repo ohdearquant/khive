@@ -632,10 +632,13 @@ finding and fixed in the same PR, before merge:
   the offset from the shrinking result set. Fixed by snapshotting every candidate row for
   a namespace before any mutation begins, then processing the fixed-size snapshot with no
   further paginated queries. A regression with 201 overdue rows (`PAGE_SIZE + 1`) covers
-  this.
+  this. **Superseded in round 2 below** — the full-namespace snapshot this round
+  introduced turned out to have its own unbounded-memory failure mode.
 - A new concurrent-drain regression (two `run_pending_events` calls racing over the same
   store, asserting exactly one fire per row across both) was added alongside the existing
-  CAS-race unit tests, closing the exact gap Acceptance Criterion 2 names.
+  CAS-race unit tests, closing the exact gap Acceptance Criterion 2 names. **Strengthened
+  in round 2 below** — this version dispatched a read-only `stats()` action, which cannot
+  distinguish a clean single fire from a double-dispatch-one-finalize race.
 
 None of this changes Acceptance Criteria 1, 3, 4, or 6's _scope_ — but their status
 against the shipped implementation is restated here precisely, since the original
@@ -649,7 +652,8 @@ Criterion 6:
 - **Criterion 2** (concurrent cron + tick invocations race to exactly one fire): **met**,
   now backed by the concurrent-drain regression added in this fix-round (previously
   claimed met on the strength of the CAS design alone, with no regression exercising
-  concurrency — codex's Medium finding on this amendment).
+  concurrency — codex's Medium finding on this amendment), and strengthened in round 2
+  below to assert on the action's own side effect, not just the CAS-tracked counters.
 - **Criterion 3** (no stdio client spawns a tick): **met**, unchanged — the gate is on
   `args.daemon` regardless of which file spawns the loop.
 - **Criterion 4** (interval configurable, 60s default): **met**, under the shipped
@@ -670,6 +674,70 @@ Criterion 6:
   `cargo tree -p khive-runtime` showing no edge to `khive-mcp`/`khive-request`/`kkernel`
   remains true today, but for a different reason than the criterion describes (nothing
   was added to `khive-runtime` at all, rather than something being added safely).
+
+### Fix-round 2 update (2026-07-09, codex PR #782 review round 2)
+
+Codex's round-2 pass on this PR verified the round-1 fixes above were all present and
+gates green, but found the High runtime-policy fix (`build_server` threading the
+resolved `"schedule"`-pack runtime through to the tick) was still **incomplete** for
+multi-backend deployments, plus two narrower regression/resource issues:
+
+- **Dispatch still used the wrong runtime for multi-backend actions.** Round 1 fixed
+  _scanning_ — `run_pending_events_on` now reads `scheduled_event` rows from the
+  daemon's own resolved `"schedule"`-pack runtime, correct for multi-backend boots
+  where `schedule` is wired to its own declared backend. But the same function then
+  built its action-dispatch server from that runtime alone
+  (`KhiveMcpServer::new(rt.clone())`), which registers **every** pack against the
+  schedule backend. A replayed action belonging to another pack — `comm.send`, or any
+  `kg` verb — therefore dispatched into the schedule backend instead of that pack's
+  own configured one in a multi-backend deployment: scanning was correct, dispatch was
+  not. Fixed by threading the daemon's actual, already-multi-backend-wired
+  `KhiveMcpServer` through to the tick as a second parameter, alongside the schedule
+  runtime: `schedule_tick_loop(rt, server, interval)` and
+  `run_pending_events_on(rt, server, verbose)` now take both — `rt` for the
+  scan/claim/finalize SQL (schedule's own backend), `server` (cloned — cheap,
+  `Arc`-wrapped internally) for `dispatch_action` only (the daemon's live, fully-wired
+  registry). `spawn_schedule_tick_loop_if_daemon` clones the same `server` it is about
+  to hand to the transport/daemon bind, so replayed-action routing is identical to a
+  live request against this daemon. `run_pending_events` (the CLI one-shot path) now
+  also resolves both through `khive-mcp::serve::build_server` rather than a throwaway
+  `RuntimeConfig::default()` — a further honesty fix, since the CLI path previously
+  never consulted `khive.toml` at all (`[[backends]]`, `[actor] id`) despite
+  `kkernel mcp --daemon` and `kkernel exec`'s own ordinary-ops path both doing so. A new
+  regression (`build_server_schedule_tick_dispatches_actions_through_the_declared_multi_backend_not_schedule`)
+  declares `schedule` on `"main"` and `kg` on a separate backend, schedules a due event
+  whose action is `create(kind="observation", ...)` (a `kg` verb), drains via
+  `run_pending_events_on(&rt, &server, false)`, and asserts the resulting note lands
+  only in `kg`'s declared backend file, never `main`.
+- **The round-1 pagination fix introduced its own unbounded-memory failure mode.**
+  Snapshotting every `status="pending"` row for a namespace before mutation (round 1's
+  fix, above) correctly closed the offset-skip bug, but the snapshot filter checked
+  only `status`, not `trigger_at` — a namespace with one due event sitting in a large
+  FUTURE schedule pulled the entire future backlog into memory on every tick. Fixed by
+  replacing the `NoteFilter`/`query_notes_filtered` snapshot with a raw SQL statement
+  that (a) pushes `trigger_at <= now` into the `WHERE` clause directly, so future events
+  are never fetched at all, and (b) pages via a `(created_at, id)` keyset cursor instead
+  of `LIMIT/OFFSET` — both columns are immutable (this drain never rewrites either), so
+  a row's claim/dispatch/finalize mutation between pages can never shift a later page's
+  boundary (the original round-1 bug class), and at most `PAGE_SIZE` rows are held in
+  memory at once, never the whole namespace. The existing 201-row backlog regression
+  continues to cover the keyset-pagination-under-mutation property.
+- **The concurrent-drain regression's `stats()` action was too weak to catch its own
+  target bug.** A read-only action makes the CAS-tracked `status`/summary counters the
+  only signal, which cannot distinguish "claimed once, dispatched once" from "claimed
+  once, dispatched TWICE, only one finalize succeeded." Fixed by giving each of the 20
+  rows a row-distinct `create(kind="observation", content="concurrent-drain-marker-{i}")`
+  action and asserting, after both drains, that exactly one marker note exists per row —
+  the double-dispatch-one-finalize regression this test exists to catch would show up as
+  a marker count of 2 for the row that raced, which the counter-only version could not
+  detect.
+- The PR description was updated to match this shipped state (shared resolved runtime
+  for scan, the daemon's real live server for dispatch, Criteria 5-7 unmet) rather than
+  the pre-fix-round "fresh per-tick runtime" / "Criterion 6 met" text it still carried.
+
+None of this changes the Criteria 1-7 status table above — the High finding this round
+closed was scoped entirely to dispatch routing, which Criterion 2 (fire-exactly-once)
+already covers; no new criterion becomes met or unmet as a result.
 
 Closing the Criterion 5/6/7 gap — moving to the full `DaemonDispatch::drain_pending_events`
 trait seam with tracked, graceful shutdown and `DrainSummary`/`DrainError` owned by
