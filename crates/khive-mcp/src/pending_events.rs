@@ -286,12 +286,44 @@ pub async fn run_pending_events_on(
         let mut cursor: Option<(i64, String)> = None;
         loop {
             let (sql, params): (String, Vec<SqlValue>) = match &cursor {
+                //
+                // The due-ness predicate compares via SQLite's `datetime()`,
+                // not a raw string `<=` (Ocean review, High finding): stored
+                // `trigger_at` values are NOT normalized to UTC —
+                // `khive-pack-schedule`'s `handle_remind`/`handle_schedule`
+                // deliberately round-trip the caller's original string
+                // (offset included, H5), and `validate_at` accepts any RFC
+                // 3339 offset. A raw lexicographic `<=` against a UTC
+                // `now`-string therefore mis-ranks any non-UTC-offset
+                // `trigger_at`: e.g. `"2026-07-10T02:00:00+04:00"`
+                // (chronologically `2026-07-09T22:00:00Z`, overdue) sorts
+                // AFTER a UTC `now` string like
+                // `"2026-07-10T00:47:00.123+00:00"` as raw text, so it would
+                // never be fetched — never fire, never get marked missed,
+                // forever. `datetime(...)` normalizes both sides to UTC
+                // before comparing, so the predicate is chronological
+                // regardless of the stored string's offset. Storage itself
+                // is unchanged — only this fetch-bound comparison is
+                // normalized; the original string still round-trips
+                // faithfully (H5).
+                //
+                // `datetime()` returns NULL for a value it cannot parse, and
+                // NULL <= anything is NULL (never true) — the OR clause below
+                // keeps an unparseable `trigger_at` row in the candidate set
+                // instead of silently dropping it, so the existing Rust-side
+                // unparseable-`trigger_at` branch (which logs and advances
+                // the cursor past it) still sees it. `validate_at` rejects
+                // unparseable `trigger_at` at write time, so this only
+                // matters for a hand-written or pre-validation row.
                 None => (
                     "SELECT id, properties, created_at FROM notes \
                      WHERE namespace = ?1 AND kind = 'scheduled_event' \
                        AND deleted_at IS NULL \
                        AND json_extract(properties, '$.status') = 'pending' \
-                       AND json_extract(properties, '$.trigger_at') <= ?2 \
+                       AND ( \
+                         datetime(json_extract(properties, '$.trigger_at')) <= datetime(?2) \
+                         OR datetime(json_extract(properties, '$.trigger_at')) IS NULL \
+                       ) \
                      ORDER BY created_at ASC, id ASC LIMIT ?3"
                         .to_string(),
                     vec![
@@ -305,7 +337,10 @@ pub async fn run_pending_events_on(
                      WHERE namespace = ?1 AND kind = 'scheduled_event' \
                        AND deleted_at IS NULL \
                        AND json_extract(properties, '$.status') = 'pending' \
-                       AND json_extract(properties, '$.trigger_at') <= ?2 \
+                       AND ( \
+                         datetime(json_extract(properties, '$.trigger_at')) <= datetime(?2) \
+                         OR datetime(json_extract(properties, '$.trigger_at')) IS NULL \
+                       ) \
                        AND (created_at > ?3 OR (created_at = ?3 AND id > ?4)) \
                      ORDER BY created_at ASC, id ASC LIMIT ?5"
                         .to_string(),
@@ -1008,9 +1043,21 @@ async fn discover_pending_namespaces(rt: &KhiveRuntime, now: DateTime<Utc>) -> R
 
     // Select distinct namespaces with at least one potentially-due event.
     // We do a broad filter on `status` here; the Rust layer applies the
-    // parsed-timestamp check. Using `<=` string comparison on trigger_at works
-    // for UTC-normalised timestamps but is a best-effort pre-filter for the
-    // SQL layer only.
+    // parsed-timestamp check. This is a pre-filter gate for the per-namespace
+    // candidate scan below, not the final due-ness decision — but a
+    // namespace excluded HERE never reaches that scan at all, so it must be
+    // held to the same correctness bar as the candidate-page queries
+    // (`datetime(...)` normalization, Ocean review High finding): comparing
+    // `trigger_at` against `now` as raw TEXT is only chronologically correct
+    // when every stored string happens to share `now`'s UTC offset.
+    // `khive-pack-schedule` round-trips the caller's original `trigger_at`
+    // string verbatim (offset included, H5), so a non-UTC-offset value can
+    // sort on the wrong side of a raw-text comparison and silently exclude
+    // its entire namespace from every future pass — not just skip one row.
+    // `datetime(...)` normalizes both sides to UTC before comparing; the `OR
+    // ... IS NULL` clause keeps a namespace with an unparseable `trigger_at`
+    // visible rather than silently dropped, matching the candidate-page
+    // queries' same NULL-safety rider.
     let now_rfc = now.to_rfc3339();
     let rows = reader
         .query_all(SqlStatement {
@@ -1019,8 +1066,11 @@ async fn discover_pending_namespaces(rt: &KhiveRuntime, now: DateTime<Utc>) -> R
                   WHERE kind = 'scheduled_event' \
                     AND deleted_at IS NULL \
                     AND json_extract(properties, '$.status') = 'pending' \
-                    AND json_extract(properties, '$.trigger_at') <= ?1"
-                .into(),
+                    AND ( \
+                      datetime(json_extract(properties, '$.trigger_at')) <= datetime(?1) \
+                      OR datetime(json_extract(properties, '$.trigger_at')) IS NULL \
+                    )"
+            .into(),
             params: vec![SqlValue::Text(now_rfc)],
             label: Some("pending_events_namespaces".into()),
         })
@@ -1176,6 +1226,7 @@ pub async fn schedule_tick_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::FixedOffset;
     use khive_runtime::RuntimeConfig;
     use khive_storage::types::PageRequest;
     use tempfile::NamedTempFile;
@@ -1193,6 +1244,17 @@ mod tests {
     /// path itself use their own far-past or `now`-relative timestamps.
     fn due_rfc3339() -> String {
         (Utc::now() - Duration::seconds(5)).to_rfc3339()
+    }
+
+    /// A UTC "now" RFC 3339 string, formatted the same way the candidate-page
+    /// query's bind parameter is (`now.to_rfc3339()` on a `DateTime<Utc>`).
+    /// Used only by the offset-sorting regressions below to assert their own
+    /// test fixtures actually exercise the raw-text lexicographic-ordering
+    /// bug class they're named for, independent of the real query's own
+    /// `now` capture (a few milliseconds of drift between the two calls is
+    /// irrelevant next to the multi-hour offset margins those tests use).
+    fn now_rfc3339_for_ordering_check() -> String {
+        Utc::now().to_rfc3339()
     }
 
     async fn make_rt(db_path: &str) -> KhiveRuntime {
@@ -1335,6 +1397,114 @@ mod tests {
         // invariant is that fired=0, advanced=0.
         assert_eq!(summary.fired, 0, "future event must not be fired");
         assert_eq!(summary.advanced, 0, "future event must not be advanced");
+
+        let props = get_note_props(&rt, id).await;
+        assert_eq!(
+            props["status"].as_str(),
+            Some("pending"),
+            "future event must remain pending"
+        );
+    }
+
+    /// A due event whose `trigger_at` carries a POSITIVE offset must still
+    /// fire (Ocean review, High finding).
+    ///
+    /// `khive-pack-schedule` round-trips the caller's original `trigger_at`
+    /// string verbatim, offset included (H5) — it is never normalized to
+    /// UTC in storage. The candidate-page SQL predicate used to compare
+    /// `trigger_at` against `now` as raw TEXT (`<=`), which is only
+    /// chronologically correct when every stored string happens to share the
+    /// same offset as the bind parameter. This event is chronologically due
+    /// (10s ago, well inside the default grace window) but stored at a
+    /// `+04:00` wall-clock offset, whose string sorts LEXICOGRAPHICALLY
+    /// AFTER a UTC `now` string (a later-looking hour digit) even though it
+    /// is chronologically earlier — under the pre-fix raw-text predicate
+    /// this row would never be fetched by the candidate query at all, so it
+    /// would never fire, never even reach the Rust-side missed check: it
+    /// would sit `pending` forever. The fix wraps both sides of the SQL
+    /// predicate in `datetime(...)`, which normalizes to UTC before
+    /// comparing, making the fetch chronologically correct regardless of the
+    /// stored string's offset.
+    #[tokio::test]
+    async fn due_event_with_positive_offset_trigger_at_fires() {
+        let (_tmp, db_path) = tmp_db();
+        let rt = make_rt(&db_path).await;
+
+        // Chronologically 10s overdue (well inside the default 300s grace
+        // window), but formatted at +04:00 wall time so the RFC 3339 string
+        // sorts AFTER a UTC `now` string as raw text.
+        let trigger_instant = Utc::now() - Duration::seconds(10);
+        let plus_four = FixedOffset::east_opt(4 * 3600).expect("valid offset");
+        let trigger_at = trigger_instant.with_timezone(&plus_four).to_rfc3339();
+        assert!(
+            trigger_at.as_str() > now_rfc3339_for_ordering_check().as_str(),
+            "test setup: {trigger_at:?} must sort AFTER a UTC now-string as raw text \
+             for this to exercise the lexicographic-ordering bug"
+        );
+
+        let id =
+            create_scheduled_event(&rt, "local", &trigger_at, Some("stats()"), None, "schedule")
+                .await;
+
+        let summary = drain_for_test(&db_path).await.expect("drain");
+
+        assert!(
+            summary.fired >= 1 || summary.advanced >= 1,
+            "a due event stored with a positive offset must still fire, got {summary:?}"
+        );
+
+        let props = get_note_props(&rt, id).await;
+        let status = props["status"].as_str().unwrap_or("");
+        assert!(
+            status == "fired" || status == "pending",
+            "status must be fired or pending (repeat), got {status:?}"
+        );
+    }
+
+    /// A FUTURE event whose `trigger_at` carries a NEGATIVE offset — whose
+    /// RFC 3339 string sorts BEFORE a UTC `now` string as raw text, a false
+    /// POSITIVE under the pre-fix raw-text predicate — must NOT fire.
+    ///
+    /// This exercises the other direction of the same lexicographic-ordering
+    /// bug class: a negative-offset string can make a genuinely FUTURE event
+    /// look due to a raw-text `<=` comparison. The SQL predicate's
+    /// `datetime(...)` normalization correctly excludes it from the
+    /// candidate page; even if it were fetched, the retained Rust-side
+    /// `trigger_at > now` re-check is the belt-and-suspenders backstop that
+    /// already made this direction benign before the SQL fix (Ocean review:
+    /// "Negative-offset strings produce false POSITIVES, which the retained
+    /// Rust re-check filters — benign").
+    #[tokio::test]
+    async fn future_event_with_negative_offset_trigger_at_is_not_fired() {
+        let (_tmp, db_path) = tmp_db();
+        let rt = make_rt(&db_path).await;
+
+        // Chronologically 2h in the future, but formatted at -08:00 wall
+        // time so the RFC 3339 string sorts BEFORE a UTC `now` string as raw
+        // text (a false positive under naive lexicographic comparison).
+        let trigger_instant = Utc::now() + Duration::hours(2);
+        let minus_eight = FixedOffset::west_opt(8 * 3600).expect("valid offset");
+        let trigger_at = trigger_instant.with_timezone(&minus_eight).to_rfc3339();
+        assert!(
+            trigger_at.as_str() < now_rfc3339_for_ordering_check().as_str(),
+            "test setup: {trigger_at:?} must sort BEFORE a UTC now-string as raw text \
+             for this to exercise the false-positive path"
+        );
+
+        let id =
+            create_scheduled_event(&rt, "local", &trigger_at, Some("stats()"), None, "schedule")
+                .await;
+
+        let summary = drain_for_test(&db_path).await.expect("drain");
+
+        assert_eq!(
+            summary.fired, 0,
+            "a chronologically future event must not be fired, got {summary:?}"
+        );
+        assert_eq!(
+            summary.advanced, 0,
+            "a chronologically future event must not be advanced, got {summary:?}"
+        );
 
         let props = get_note_props(&rt, id).await;
         assert_eq!(

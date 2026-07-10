@@ -734,6 +734,17 @@ multi-backend deployments, plus two narrower regression/resource issues:
 - The PR description was updated to match this shipped state (shared resolved runtime
   for scan, the daemon's real live server for dispatch, Criteria 5-7 unmet) rather than
   the pre-fix-round "fresh per-tick runtime" / "Criterion 6 met" text it still carried.
+- **Fix-round 3 addendum (2026-07-09):** the round-2 keyset page queries and
+  `discover_pending_namespaces` compared `trigger_at` as raw RFC3339 text, which sorts
+  lexicographically rather than chronologically for values carrying a non-UTC offset
+  (`handlers.rs` deliberately round-trips the caller's original offset, so this was
+  reachable in production, not just theoretically). Fixed by wrapping both sides of the
+  due-ness predicate in SQLite's `datetime(...)` (plus an `OR ... IS NULL` clause so
+  unparseable `trigger_at` values stay visible to the existing Rust-side skip/log path
+  instead of being silently excluded) in all three affected queries: both keyset page
+  branches and `discover_pending_namespaces`. The comparison is now chronological via
+  SQLite `datetime()`; storage still round-trips the caller's original string — H5
+  unchanged.
 
 None of this changes the Criteria 1-7 status table above — the High finding this round
 closed was scoped entirely to dispatch routing, which Criterion 2 (fire-exactly-once)
