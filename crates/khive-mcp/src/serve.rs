@@ -5447,24 +5447,41 @@ id = "lambda:project-actor"
                 "actor:test".to_string(),
             ));
 
-            // Two happy-path 5s ticks: the first drives the partial-failure
-            // page, the second drives the retry the fix must produce. Poll
-            // for the retry directly (rather than blindly running a fixed
-            // number of ticks) and bound the wait by a real wall-clock
-            // deadline, not a virtual-time/iteration budget -- the loop's
-            // `comm.*` dispatches land on `spawn_blocking`'s real OS-thread
-            // pool, so how many advance/yield rounds this needs depends on
-            // real thread-pool scheduling latency, which a fixed count
-            // cannot account for under load.
+            // Three happy-path 5s ticks: the first drives the partial-failure
+            // page, the second drives the retry the fix must produce, and the
+            // third observes the checkpoint the retry committed -- proving
+            // the retry's `comm.ingest` (and its dedup) actually completed and
+            // was durably persisted, not merely that a second `poll_page` call
+            // was made while the retry was still in flight. Poll for that
+            // directly (rather than blindly running a fixed number of ticks)
+            // and bound the wait by a real wall-clock deadline, not a
+            // virtual-time/iteration budget -- the loop's `comm.*` dispatches
+            // land on `spawn_blocking`'s real OS-thread pool, so how many
+            // advance/yield rounds this needs depends on real thread-pool
+            // scheduling latency, which a fixed count cannot account for
+            // under load.
+            let expected_committed_checkpoint = ChannelCheckpoint {
+                source: SOURCE.to_string(),
+                generation: 1,
+                high_water: Some(1),
+            };
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
             loop {
-                if observed_checkpoints.lock().unwrap().len() >= 2 {
+                if observed_checkpoints
+                    .lock()
+                    .unwrap()
+                    .get(2)
+                    .is_some_and(|c| {
+                        c.as_ref().map(|stored| &stored.checkpoint)
+                            == Some(&expected_committed_checkpoint)
+                    })
+                {
                     break;
                 }
                 assert!(
                     std::time::Instant::now() < deadline,
-                    "the loop must have retried at least once within 60s of wall-clock \
-                     time: {:?}",
+                    "the retry must have committed its checkpoint (observable on the \
+                     third poll_page call) within 60s of wall-clock time: {:?}",
                     observed_checkpoints.lock().unwrap()
                 );
                 tokio::time::advance(std::time::Duration::from_secs(5)).await;
@@ -5476,8 +5493,9 @@ id = "lambda:project-actor"
 
             let calls = observed_checkpoints.lock().unwrap().clone();
             assert!(
-                calls.len() >= 2,
-                "the loop must have retried at least once: {calls:?}"
+                calls.len() >= 3,
+                "the loop must have retried and then re-polled with the retry's \
+                 committed checkpoint: {calls:?}"
             );
             assert!(
                 calls[0].is_none(),
@@ -5487,6 +5505,13 @@ id = "lambda:project-actor"
                 calls[1].is_none(),
                 "the cursor must NOT have advanced past the partially-failed page \
                  -- the retry must still see no committed checkpoint: {calls:?}"
+            );
+            assert_eq!(
+                calls[2].as_ref().map(|stored| &stored.checkpoint),
+                Some(&expected_committed_checkpoint),
+                "the third poll must observe the checkpoint the retry committed, \
+                 proving the retry's comm.ingest (and its dedup) actually completed: \
+                 {calls:?}"
             );
 
             let inbox = registry
