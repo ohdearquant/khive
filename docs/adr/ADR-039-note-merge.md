@@ -61,9 +61,10 @@ struct MergeParams {
 ```
 
 `kind` absent or `"entity"` (or any entity-substrate granular kind) routes to the
-existing `merge_entity` path unchanged. `kind = "note"` (or any note-substrate
-granular kind such as `"observation"`, `"insight"`, `"task"`) routes to the new
-`merge_note` path defined below.
+`merge_entity` path. `kind = "note"` (or any note-substrate granular kind such as
+`"observation"`, `"insight"`, `"task"`) routes to the new `merge_note` path defined
+below. **Amendment (#778/#814):** `merge_entity`'s signature and description-merge
+behavior were _not_ left unchanged — see below.
 
 `substrate` is not a field on `MergeParams` — it is the internal resolved value
 after the registry maps `kind` to its storage family.
@@ -71,6 +72,14 @@ after the registry maps `kind` to its storage family.
 ### Content strategy
 
 Note content requires its own merge policy because entities have no content field.
+`ContentMergeStrategy` is defined once here and reused, unchanged, by entity merge
+(ADR-014 amendment, #778/#814) to govern the entity `description` field — entities
+have no `content` field, but `description` plays the same "freeform text body"
+role and needed the same three-way choice. `merge_entity` gained a `content_strategy`
+parameter (previously description selection silently followed the entity `policy`
+field, which could not express "prefer_from content but prefer_into everything
+else"). Both merge paths share the type; the behavior tables below apply verbatim
+to entity `description` with `content` read as `description`.
 
 | Value              | Behaviour                                                                                                                                                       |
 | ------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------- |

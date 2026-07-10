@@ -178,9 +178,36 @@ The two `MergeStrategy` names previously used (curation merge and snapshot merge
 now live in different namespaces with explicit names. No naming overload between
 substrate dedup and graph versioning.
 
+### `content_strategy`: description merge is independent of `policy` (amendment, #778/#814)
+
+`policy` (`EntityDedupMergePolicy`) governs `name`, `properties`, and `tags`.
+Description merge is governed by its own parameter, `content_strategy`
+(`ContentMergeStrategy`, defined in ADR-039 for note merge and shared here):
+
+```rust
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ContentMergeStrategy {
+    /// Default. Concatenates `into`'s and `from`'s descriptions with a
+    /// `\n\n---\n\n` separator. Lossless — the only default that never
+    /// discards content.
+    #[default]
+    Append,
+    /// Keeps `into`'s description unchanged; `from`'s description is discarded.
+    PreferInto,
+    /// Replaces `into`'s description with `from`'s description.
+    PreferFrom,
+}
+```
+
+`content_strategy` is selected directly — it is **not** derived from `policy`.
+An explicit `content_strategy=prefer_from` takes effect even when `policy`
+stays at its default `prefer_into`, and vice versa: the two parameters are
+independently settable, matching the note-merge design in ADR-039.
+
 ### `merge_entity` semantics
 
-`merge_entity(namespace, into_id, from_id, policy)`:
+`merge_entity(namespace, into_id, from_id, policy, content_strategy, dry_run)`:
 
 ```text
 1. Resolve namespace via NamespaceToken (ADR-007).
@@ -193,10 +220,10 @@ substrate dedup and graph versioning.
    b. If rewire produces a self-loop: drop the edge.
    c. Otherwise: upsert with DO UPDATE semantics (ADR-009) on the unique triple
       (namespace, source, target, relation).
-7. Merge entity fields per policy:
-   - name:        per policy
-   - description: per policy
-   - properties:  per policy (deep-merge for Union; key-add for PreferInto;
+7. Merge entity fields:
+   - name:        per `policy`
+   - description: per `content_strategy` (independent of `policy` — see above)
+   - properties:  per `policy` (deep-merge for Union; key-add for PreferInto;
                   full-override for PreferFrom)
    - tags:        always unioned
    - entity_type: per policy (validated via EntityTypeRegistry)
@@ -206,8 +233,13 @@ substrate dedup and graph versioning.
    The entity row is NOT hard-deleted; it carries merged_into provenance.
 10. Commit transaction.
 11. Emit MergeEvent for audit trail (entity_merged event with into_id, from_id,
-    edges_rewired count, policy).
+    edges_rewired count, policy, content_strategy). Skipped when `dry_run` is true.
 ```
+
+`dry_run=true` short-circuits all writes in step 6 (edge rewire), step 8 (upsert +
+reindex), step 9 (tombstone), and step 11 (event emission) — it is a read-only
+preview. `edges_rewired` in the returned summary is still accurate: it counts the
+edges that _would_ be rewired, computed without writing.
 
 Returns:
 
@@ -218,6 +250,8 @@ pub struct MergeSummary {
     pub edges_rewired: usize,
     pub properties_merged: usize,
     pub tags_unioned: usize,
+    pub content_appended: bool,
+    pub dry_run: bool,
 }
 ```
 
