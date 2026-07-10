@@ -59,6 +59,20 @@ VECTOR_FLOOR = 0.70
 KEYWORD_FLOOR = 0.70
 N_REPS = 5  # repetitions per query for latency measurement
 
+# ANN convergence settle step. After a 600-note ingest burst, the memory pack's
+# background ANN rebuild (write-generation-checked install, ADR-107 sec 1) has
+# not necessarily installed by the time the first post-ingest recall lands —
+# that is the documented eventual-consistency contract this pipeline ships
+# (stale-but-installed served immediately, hot-swapped on background completion).
+# This benchmark is a read-after-write consumer of that contract: it must poll
+# for real convergence, not sample mid-rebuild and misread the race as a
+# structural vector-leg failure. Bounded generous deadline; fails loudly (not
+# silently) if convergence never happens, since that would indicate an actual
+# rebuild-latency regression rather than expected warm-up.
+ANN_SETTLE_DEADLINE_S = 30.0
+ANN_SETTLE_STABLE_N = 3
+ANN_SETTLE_POLL_S = 0.25
+
 # Default production pack set (must match RuntimeConfig::default().packs in
 # crates/khive-runtime/src/config.rs so config_id agrees between front-end
 # and daemon child).
@@ -482,6 +496,56 @@ def _query_once(proc, query_text, fusion_strategy=None):
     contents = [r["content"] for r in arr if isinstance(r, dict) and "content" in r]
     return elapsed_us, contents
 
+def _wait_for_ann_convergence(
+    proc,
+    probe_query,
+    expected_topic,
+    deadline_s=ANN_SETTLE_DEADLINE_S,
+    stable_needed=ANN_SETTLE_STABLE_N,
+    poll_interval_s=ANN_SETTLE_POLL_S,
+):
+    """Poll the vector-only leg with `probe_query` until it reports the
+    ingested corpus (P@K >= VECTOR_FLOOR) for `stable_needed` consecutive
+    polls, or raise loudly if `deadline_s` elapses first.
+
+    This is the deterministic settle step between ingest and the query phase:
+    it samples the SAME structural signal the gate later asserts on
+    (fusion_strategy="vector_only"), so "converged" here means the ANN
+    background rebuild has actually installed over the full post-ingest
+    corpus — not a blind sleep guessing at a duration.
+    """
+    deadline = time.time() + deadline_s
+    t_start = time.time()
+    consecutive_ok = 0
+    attempts = 0
+    last_p = None
+    while time.time() < deadline:
+        attempts += 1
+        _, contents = _query_once(proc, probe_query, fusion_strategy="vector_only")
+        last_p = precision_at_k(contents, expected_topic)
+        if last_p >= VECTOR_FLOOR:
+            consecutive_ok += 1
+            if consecutive_ok >= stable_needed:
+                print(
+                    f"[SETTLE] ANN vector leg converged after {attempts} probe(s), "
+                    f"{time.time() - t_start:.2f}s",
+                    flush=True,
+                )
+                return
+        else:
+            consecutive_ok = 0
+        time.sleep(poll_interval_s)
+    raise RuntimeError(
+        f"ANN vector-leg did not converge within {deadline_s}s of ingest "
+        f"({attempts} probe(s), last vector-only P@K={last_p!r} for probe "
+        f"query {probe_query!r}). The background rebuild triggered by ingest "
+        "never installed a corpus-covering index. This exceeds the expected "
+        "warm-up window for this corpus size and looks like a genuine "
+        "convergence-latency regression in the ANN rebuild path, not benign "
+        "eventual-consistency staleness — investigate before re-running."
+    )
+
+
 # ── Daemon teardown helper ────────────────────────────────────────────────────
 
 def _teardown_daemon(pid_path, tmpdir):
@@ -637,6 +701,13 @@ def main():
         while not pathlib.Path(sock_path).exists() and time.time() < deadline:
             time.sleep(0.1)
         assert_daemon_engaged(sock_path, pid_path_file, bench_db, label="main")
+
+        # Deterministic settle: block until the ANN background rebuild
+        # triggered by ingest has actually installed a corpus-covering index,
+        # so the measurement loop below never samples the convergence race
+        # (see ANN_SETTLE_* tunables and ADR-107 sec 1).
+        print("\n[SETTLE] Waiting for ANN vector leg to converge post-ingest...", flush=True)
+        _wait_for_ann_convergence(proc, QUERIES[0][0], QUERIES[0][1])
 
         # Additional warm-up rounds (discard timings)
         for q, _ in QUERIES:
