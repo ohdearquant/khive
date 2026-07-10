@@ -161,18 +161,55 @@ neither the write-generation counter nor the deletion itself is a signal such a 
 can ever observe on its own. Left uncorrected, a daemon that warmed before a reindex
 serves pre-reindex vectors indefinitely, for as long as the process stays up.
 
-This is closed by a durable corpus epoch: a single-row `memory_ann_epoch` table that
-`kkernel reindex` increments (`khive_pack_memory::bump_memory_ann_epoch`) immediately
-after invalidating the snapshot. Every `AnnBridge` records the epoch value it observed
-at build/load time (`epoch_baseline`). The recall warm-hit path
-(`ann::maybe_check_durable_epoch`) compares the installed entry's `epoch_baseline`
-against the current durable epoch and, on a mismatch, folds it into the same
-write-generation machinery §2 describes (`ann::bump_generation`) so the existing
-single-flight rebuild takes over unchanged. This check is debounced per model (a fixed
-interval between DB reads, not on every single recall) so it adds no DB round-trip to
-the common warm-hit case; the daemon's own in-memory generation counter remains the
-only signal it consults for every write it did not miss, and it uses the durable epoch
-only to catch the ones it did.
+This is closed by a durable corpus epoch: a single-row `memory_ann_epoch` table, declared
+through `MemoryPack::SCHEMA_PLAN` (the same pack-auxiliary-table contract every other
+pack-owned table in this codebase follows) rather than created ad hoc on the epoch
+read/write path. Every `AnnBridge` records the epoch value it observed at build/load
+time (`epoch_baseline`). The recall warm-hit path (`ann::maybe_check_durable_epoch`)
+compares the installed entry's `epoch_baseline` against the current durable epoch and,
+on a mismatch, folds it into the same write-generation machinery §2 describes
+(`ann::bump_generation`) so the existing single-flight rebuild takes over unchanged.
+This check is debounced per model — a fixed 5-second interval between DB reads in
+production (`0` in tests, so a single direct call is deterministic), not on every
+single recall — so it adds no DB round-trip to the common warm-hit case; the daemon's
+own in-memory generation counter remains the only signal it consults for every write
+it did not miss, and it uses the durable epoch only to catch the ones it did. The
+5-second interval is a fixed implementation default, not itself durable state; a
+deployment that needs a different bound changes the constant, not a config value.
+
+**Crash-safety protocol.** The epoch is bumped twice per `kkernel reindex` run,
+forming an in-progress/completed pair rather than a single best-effort write at the
+end:
+
+1. **Begin (in-progress marker).** Before ANY vector mutation in the pass —
+   entities or notes — `kkernel reindex` durably bumps the epoch
+   (`begin_reindex_epoch` in `reindex.rs`, calling
+   `khive_pack_memory::ensure_ann_epoch_schema` then `bump_memory_ann_epoch`). If
+   either the schema-ensure or the bump itself fails, the whole reindex aborts
+   before any mutation runs — fail-closed, not warn-and-continue. A daemon that
+   observes this bumped epoch mid-reindex (via the debounced check above) rebuilds
+   conservatively against whatever partial corpus is on disk at that moment; that
+   is never worse than the pre-fix behavior of trusting a stale index indefinitely.
+2. **Completion (settled marker).** After all entity/note mutations for the pass
+   have committed, `kkernel reindex` invalidates the persisted
+   `global::memory_vamana::*` snapshot row and bumps the epoch a second time
+   (`invalidate_active_memory_vamana_snapshot`). This forces one more rebuild once
+   the corpus has reached its final, fully re-embedded state, so a daemon that
+   rebuilt against the mid-reindex partial corpus in step 1 does not keep serving
+   that partial build forever.
+
+Coupling every individual committed vector-mutation batch with its own epoch advance
+(one bump per batch, in the same transaction as that batch's commit) was considered
+and rejected as unnecessary: the two-phase begin/completion pair already guarantees
+any observer landing anywhere between the first mutation and the pass's end
+eventually converges, without paying a durable write per batch. A crash between the
+begin bump and the completion bump still leaves the begin bump durably recorded, so
+a daemon that missed the completion bump (because the process crashed before
+reaching it) still rebuilds off the in-progress signal rather than never rebuilding
+at all — the previous design's exact failure mode. The completion bump's own
+failure is no longer silently swallowed either: `kkernel reindex` folds it into its
+report's failure set, so the process exits non-zero (unless `--best-effort`) instead
+of completing looking clean while the durable signal never fired.
 
 ### 5. Deletion filtering
 
@@ -201,16 +238,26 @@ leaking through.
   §4's memory-pack-specific hash with ADR-079's own content-hash mechanism; that
   migration is out of scope for this ADR.
 - A write that lands after the self-driving re-enqueue loop (§2) has already fully
-  exited — whether by converging or by hitting its 3-attempt cap — still needs a normal
-  write-path call to `ensure_ann_background` to be picked up. Under sustained
-  continuous writes to the same model, this means catch-up can span more than one
-  independently-triggered background task rather than a single unbroken loop; each
-  individual task's own worst-case extra latency stays bounded regardless.
+  exited — whether by converging or by hitting its 3-attempt cap — does not need a
+  normal write-path call to `ensure_ann_background` to be picked up: if the
+  generation moved past what the exiting task built for, it re-enqueues a CHAINED
+  task itself (still bounded to `ATTEMPT_BOUND` attempts) rather than waiting for an
+  external caller. Under sustained continuous writes, this can chain multiple linked
+  tasks back-to-back; each chained task's first attempt is preceded by a fixed
+  debounce delay (`REBUILD_CHAIN_DEBOUNCE`, 1 second in production) before its own
+  `ATTEMPT_BOUND`-attempt loop starts, so writes landing during that delay coalesce
+  into the next chained task's single generation read instead of each triggering its
+  own chain link. This bounds aggregate rebuild work under continuous writes to one
+  rebuild per debounce interval, not one rebuild per write. A chain still respawning
+  at process shutdown is bounded by the daemon's own drain timeout
+  (`KHIVE_DRAIN_TIMEOUT_SECS`), not by anything in this mechanism — there is no
+  separate cancellation signal for this loop.
 - A daemon that stays warm across a `kkernel reindex` run only detects the resulting
   staleness on its next amortized durable-epoch check (§4), not immediately — the check
-  is debounced, so there can be a bounded window (one check interval) after a reindex
-  completes during which a recall still serves the pre-reindex index. This is separate
-  from, and in addition to, the per-write bound in §1.
+  is debounced to a fixed 5-second interval in production, so there can be a bounded
+  window of up to that interval after a reindex completes during which a recall still
+  serves the pre-reindex index. This is separate from, and in addition to, the
+  per-write bound in §1.
 
 ## Status
 
