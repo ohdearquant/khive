@@ -5,9 +5,9 @@
 //   Commissive -- commits caller to a persistent change
 //   Declaration -- changes institutional status by fiat
 //
-// Verbs 12-14 (propose, review, withdraw) implement the event-sourced proposal
-// lifecycle. Verb 15 (verbs) serves verb discovery. Verb 16 (stats) provides
-// namespace statistics.
+// propose, review, and withdraw implement the event-sourced proposal
+// lifecycle. verbs serves verb discovery. stats provides namespace
+// statistics.
 
 use serde_json::Value;
 
