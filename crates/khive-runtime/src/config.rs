@@ -202,8 +202,14 @@ pub struct RuntimeConfig {
     pub db_path: Option<std::path::PathBuf>,
     /// Namespace used when no explicit namespace is provided.
     pub default_namespace: Namespace,
-    /// Local embedding model. `None` disables embedding and hybrid vector search;
-    /// `hybrid_search` then falls back to text-only.
+    /// Local embedding model. `None` alone does not disable embedding: setting
+    /// only this field to `None` while `additional_embedding_models` is
+    /// non-empty still registers those models. Both `embedding_model` and
+    /// `additional_embedding_models` must be empty to disable built-in
+    /// embedding model registration, at which point `hybrid_search` falls back
+    /// to text-only. Use [`RuntimeConfig::no_embeddings`] to clear both fields
+    /// together — it is the canonical constructor for this. Custom embedder
+    /// providers registered later by packs are not affected by this field.
     ///
     /// Deprecated: embedding engines move to a per-pack `EmbedderRegistry`.
     /// This field persists for backward compatibility until the embedder registry
