@@ -1768,6 +1768,101 @@ mod tests {
         );
     }
 
+    /// khive #449 High follow-up (Medium-2): the connector-level
+    /// `one_poison_uid_does_not_starve_51_later_valid_uids_and_cursor_passes_it`
+    /// test in `imap.rs` only proves `process_selected_page` assigns the
+    /// poison UID a `SelectedMessage::Malformed` disposition -- it never
+    /// proves that disposition survives into the actual `ChannelEnvelope`
+    /// `EmailChannel::poll_page` hands to `comm.ingest`. Drives a
+    /// `SelectedMessage::Malformed` entry (as the IMAP connector would
+    /// return it for an unparseable UID) through `poll_page`'s public
+    /// pipeline and asserts the resulting envelope carries the stable
+    /// `imap:{host}:{uidvalidity}:{uid}` external ID plus durable quarantine
+    /// metadata -- exactly what the daemon's ingest/query layer needs to
+    /// prove a durable quarantine record, not just an intermediate value.
+    #[tokio::test]
+    async fn poll_page_malformed_uid_produces_a_stable_external_id_and_quarantine_metadata() {
+        let since = Utc::now();
+        let config = make_config("maintainer@example.com");
+        let smtp = SmtpSender::with_connector(RecordingSmtp {
+            calls: Arc::new(Mutex::new(Vec::new())),
+        });
+
+        struct PoisonUidImap {
+            good: RawEmail,
+        }
+        #[async_trait]
+        impl ImapConnector for PoisonUidImap {
+            async fn fetch_page(
+                &self,
+                _since: DateTime<Utc>,
+                _limit: usize,
+                _progress: ImapProgress,
+            ) -> Result<ImapFetchPage, ChannelError> {
+                Ok(ImapFetchPage {
+                    emails: vec![
+                        SelectedMessage::Malformed {
+                            uid: 1,
+                            imap_external_id: "imap:imap.example.com:4:1".to_string(),
+                            reason: MalformedReason::MissingBody,
+                        },
+                        SelectedMessage::Email(Box::new(self.good.clone())),
+                    ],
+                    next_progress: ImapProgress {
+                        uid_validity: NonZeroU32::new(4),
+                        last_seen_uid: NonZeroU32::new(2),
+                    },
+                })
+            }
+        }
+
+        let mut good = make_email("sender@example.com", "imap:imap.example.com:4:2");
+        good.uid = 2;
+        let imap = ImapFetcher::with_connector(PoisonUidImap { good });
+        let ch = EmailChannel::with_connectors(config, smtp, imap);
+
+        let page = ch.poll_page(since, None).await.unwrap();
+        assert_eq!(
+            page.envelopes.len(),
+            2,
+            "the poison UID must still produce a durable quarantine envelope \
+             alongside the valid message, not a dropped/short page"
+        );
+
+        let quarantined = page
+            .envelopes
+            .iter()
+            .find(|e| e.external_id.as_deref() == Some("imap:imap.example.com:4:1"))
+            .expect(
+                "the malformed UID's stable external_id must be present on the \
+                 envelope actually handed to comm.ingest",
+            );
+        assert_eq!(
+            quarantined.from, "email:quarantine",
+            "a malformed UID must be attributed to the fixed quarantine marker"
+        );
+        assert_eq!(
+            quarantined.metadata.get("quarantined").map(String::as_str),
+            Some("true"),
+            "the envelope must carry durable quarantine metadata for comm.ingest \
+             to persist"
+        );
+        assert_eq!(
+            quarantined
+                .metadata
+                .get("quarantine_reason")
+                .map(String::as_str),
+            Some("missing-body"),
+            "the quarantine reason must be preserved onto the persisted envelope"
+        );
+
+        assert_eq!(
+            page.next_checkpoint.unwrap().high_water,
+            Some(2),
+            "the checkpoint candidate must advance past the poison UID"
+        );
+    }
+
     #[tokio::test]
     async fn poll_drains_75_same_day_backlog_across_repeated_calls_via_production_entrypoint() {
         // Drives the actual production entrypoint (`EmailChannel::poll`, the

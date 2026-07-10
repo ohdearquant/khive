@@ -313,7 +313,7 @@ async fn channel_poll_loop(
     ingest_namespace: String,
     default_inbound_actor: String,
 ) {
-    use chrono::Utc;
+    use chrono::{DateTime, Utc};
     use khive_channel_email::{is_backoff_eligible, ImapBackoff};
     use serde_json::json;
     use std::collections::HashMap;
@@ -321,7 +321,19 @@ async fn channel_poll_loop(
 
     const HAPPY_PATH_INTERVAL: Duration = Duration::from_secs(5);
 
-    let mut last_poll = Utc::now();
+    // Per-channel bootstrap "since" floor (issue #449 High follow-up). This
+    // only feeds the date-based SINCE search used while a channel has no
+    // committed UID high-water yet (first-ever poll, or a UIDVALIDITY
+    // reset); once a checkpoint has a high-water, polling is UID-ranged and
+    // this floor is unused for that channel. Each entry only advances to the
+    // poll tick's timestamp once that channel's full cycle -- cursor_get,
+    // poll_page, every comm.ingest, and cursor_commit -- succeeds this tick.
+    // Advancing it unconditionally (as a shared `last_poll` timestamp used
+    // to) would drop the earlier floor on any bootstrap-cycle failure, and
+    // if that failure spans a calendar-day boundary the next checkpoint-less
+    // poll's SINCE clause would use the newer date, permanently skipping the
+    // previous day's uncommitted mail.
+    let mut bootstrap_since: HashMap<(String, String), DateTime<Utc>> = HashMap::new();
     // One backoff state per (kind, slug) — i.e. per credential (#606 round-1
     // internal review, High finding). Keying by kind alone would throttle a
     // second same-kind credential (e.g. a second mailbox) whenever the first
@@ -340,11 +352,15 @@ async fn channel_poll_loop(
         tokio::time::sleep(next_interval).await;
         next_interval = HAPPY_PATH_INTERVAL;
 
-        let since = last_poll;
-        last_poll = Utc::now();
+        let now = Utc::now();
 
         for (kind, slug, channel) in channels.iter() {
             let backoff_key = (kind.to_string(), slug.to_string());
+            let since = *bootstrap_since.entry(backoff_key.clone()).or_insert(now);
+            // Set once this channel's cycle durably completes (a fresh
+            // commit, or nothing new to commit); gates whether `since`
+            // advances past this tick's `now` for next time.
+            let mut bootstrap_floor_advances = false;
 
             append_channel_lifecycle_event(
                 event_store.as_ref(),
@@ -454,16 +470,24 @@ async fn channel_poll_loop(
                     }
 
                     if page_fully_ingested {
-                        if let Some(next_checkpoint) = page.next_checkpoint {
-                            if let Err(e) =
-                                commit_channel_cursor(&registry, kind, slug, &next_checkpoint).await
-                            {
-                                tracing::warn!(
-                                    channel = kind,
-                                    "comm.cursor_commit failed; progress not durably \
-                                     advanced, next poll will retry: {e}"
-                                );
+                        match page.next_checkpoint {
+                            Some(next_checkpoint) => {
+                                match commit_channel_cursor(&registry, kind, slug, &next_checkpoint)
+                                    .await
+                                {
+                                    Ok(()) => bootstrap_floor_advances = true,
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            channel = kind,
+                                            "comm.cursor_commit failed; progress not durably \
+                                             advanced, next poll will retry: {e}"
+                                        );
+                                    }
+                                }
                             }
+                            // Nothing new to commit this tick is not a
+                            // failure -- safe to advance the bootstrap floor.
+                            None => bootstrap_floor_advances = true,
                         }
                     } else {
                         tracing::warn!(
@@ -533,6 +557,10 @@ async fn channel_poll_loop(
                         tracing::warn!(channel = kind, "channel poll failed: {e}");
                     }
                 }
+            }
+
+            if bootstrap_floor_advances {
+                bootstrap_since.insert((kind.to_string(), slug.to_string()), now);
             }
         }
     }
@@ -5431,6 +5459,158 @@ id = "lambda:project-actor"
             );
         }
 
+        /// A channel whose one and only `poll_page` call returns a single
+        /// quarantine-shaped envelope -- exactly the field shape
+        /// `EmailChannel::disposition` produces for a permanently
+        /// unparseable UID (see
+        /// `khive-channel-email`'s
+        /// `poll_page_malformed_uid_produces_a_stable_external_id_and_quarantine_metadata`) --
+        /// so this test can drive it through the daemon's real
+        /// `comm.ingest` call and query the durably persisted note.
+        struct QuarantineOnceChannel {
+            envelope: Mutex<Option<ChannelEnvelope>>,
+        }
+
+        #[async_trait]
+        impl Channel for QuarantineOnceChannel {
+            fn kind(&self) -> &'static str {
+                "mock_quarantine"
+            }
+
+            async fn send(&self, _envelope: ChannelEnvelope) -> Result<(), ChannelError> {
+                Ok(())
+            }
+
+            async fn poll(
+                &self,
+                _since: DateTime<Utc>,
+            ) -> Result<Vec<ChannelEnvelope>, ChannelError> {
+                panic!("the daemon poll loop must call poll_page, not poll");
+            }
+
+            async fn poll_page(
+                &self,
+                _since: DateTime<Utc>,
+                _checkpoint: Option<&StoredChannelCheckpoint>,
+            ) -> Result<ChannelPollPage, ChannelError> {
+                let Some(envelope) = self.envelope.lock().unwrap().take() else {
+                    return Ok(ChannelPollPage {
+                        envelopes: vec![],
+                        next_checkpoint: None,
+                    });
+                };
+                Ok(ChannelPollPage {
+                    envelopes: vec![envelope],
+                    next_checkpoint: Some(ChannelCheckpoint {
+                        source: SOURCE.to_string(),
+                        generation: 9,
+                        high_water: Some(1),
+                    }),
+                })
+            }
+        }
+
+        /// khive #449 High follow-up (Medium-2): the connector- and
+        /// channel-level poison-UID tests prove a malformed message becomes
+        /// a quarantine-shaped `ChannelEnvelope`, but neither proves the
+        /// daemon actually turns that into a durable, queryable record.
+        /// Drives a quarantine envelope through the real `channel_poll_loop`
+        /// -> `comm.ingest` path and queries the stored note back out,
+        /// asserting its stable external ID and quarantine metadata
+        /// persisted exactly -- and that the cursor committed, since a
+        /// quarantine envelope must durably ingest like any other message.
+        #[tokio::test(start_paused = true)]
+        async fn malformed_message_durably_quarantines_with_stable_external_id_and_metadata() {
+            let mut envelope = ChannelEnvelope::new(
+                "email:quarantine",
+                "email:maintainer@example.com",
+                "(khive: IMAP message UID 1 could not be parsed and was quarantined)",
+            )
+            .with_external_id("imap:h:9:1");
+            envelope
+                .metadata
+                .insert("quarantined".to_string(), "true".to_string());
+            envelope
+                .metadata
+                .insert("quarantine_reason".to_string(), "missing-body".to_string());
+
+            let mut ch_registry = ChannelRegistry::new();
+            ch_registry.register(Arc::new(QuarantineOnceChannel {
+                envelope: Mutex::new(Some(envelope)),
+            }));
+
+            let runtime = KhiveRuntime::memory().expect("in-memory runtime");
+            let mut builder = VerbRegistryBuilder::new();
+            builder.register(khive_pack_kg::KgPack::new(runtime.clone()));
+            builder.register(khive_pack_comm::CommPack::new(runtime.clone()));
+            let registry = builder.build().expect("registry builds");
+
+            let task = tokio::spawn(channel_poll_loop(
+                Arc::new(ch_registry),
+                registry.clone(),
+                "test-ns".to_string(),
+                "actor:test".to_string(),
+            ));
+
+            for _ in 0..2000 {
+                let restored = load_channel_cursor(&registry, "mock_quarantine", "mock_quarantine")
+                    .await
+                    .expect("cursor_get must succeed");
+                if restored.is_some() {
+                    break;
+                }
+                tokio::time::advance(std::time::Duration::from_millis(250)).await;
+                for _ in 0..10 {
+                    tokio::task::yield_now().await;
+                }
+            }
+            task.abort();
+
+            let restored = load_channel_cursor(&registry, "mock_quarantine", "mock_quarantine")
+                .await
+                .expect("cursor_get must succeed")
+                .expect(
+                    "the cursor must have committed -- a quarantine envelope must ingest \
+                     durably like any other message",
+                );
+            assert_eq!(restored.checkpoint.high_water, Some(1));
+
+            let inbox = registry
+                .dispatch(
+                    "list",
+                    json!({"namespace": "test-ns", "kind": "message", "limit": 50}),
+                )
+                .await
+                .expect("list must succeed");
+            let notes = inbox.as_array().expect("list returns an array").clone();
+            let quarantined = notes
+                .iter()
+                .find(|n| {
+                    n.get("properties")
+                        .and_then(|p| p.get("external_id"))
+                        .and_then(|v| v.as_str())
+                        == Some("imap:h:9:1")
+                })
+                .expect(
+                    "the quarantined message must be durably queryable by its stable \
+                         external_id, not just held as an intermediate value",
+                );
+
+            let props = quarantined
+                .get("properties")
+                .expect("stored note must carry properties");
+            assert_eq!(
+                props.get("quarantined").and_then(|v| v.as_str()),
+                Some("true"),
+                "durable quarantine metadata must survive comm.ingest: {props:?}"
+            );
+            assert_eq!(
+                props.get("quarantine_reason").and_then(|v| v.as_str()),
+                Some("missing-body"),
+                "the quarantine reason must survive comm.ingest: {props:?}"
+            );
+        }
+
         /// Restart-across-a-checkpoint round-trip (issue #449 part b): once a
         /// page fully ingests and the cursor commits, a fresh call to
         /// `comm.cursor_get` (simulating a daemon restart reading the
@@ -5470,6 +5650,348 @@ id = "lambda:project-actor"
             assert_eq!(restored.checkpoint.source, SOURCE);
             assert_eq!(restored.checkpoint.generation, 7);
             assert_eq!(restored.checkpoint.high_water, Some(123));
+        }
+    }
+
+    /// Regression tests for issue #449's High follow-up: a channel's
+    /// bootstrap `since` floor (the date used in the IMAP `SINCE` clause
+    /// while no UID high-water is committed yet) must only advance once
+    /// `cursor_get`, `poll_page`, every `comm.ingest`, and `cursor_commit`
+    /// have all succeeded for that channel's cycle. A cursor_get failure or
+    /// an ingest failure that blocks the first commit must leave the floor
+    /// exactly where it was, so a later successful cycle still searches from
+    /// the original floor rather than a newer date -- otherwise, if the
+    /// failing cycles spanned a calendar-day boundary, mail from the earlier
+    /// day would be permanently skipped.
+    #[cfg(feature = "channel-email")]
+    mod bootstrap_since_floor_tests {
+        use super::*;
+        use async_trait::async_trait;
+        use chrono::{DateTime, Utc};
+        use khive_channel::{
+            Channel, ChannelEnvelope, ChannelError, ChannelPollPage, ChannelRegistry,
+            StoredChannelCheckpoint,
+        };
+        use khive_runtime::{KhiveRuntime, VerbRegistryBuilder};
+        use khive_storage::types::{SqlStatement, SqlValue};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Arc, Mutex};
+
+        /// A channel that just records the `since` it is called with on
+        /// every `poll_page` call and always reports a clean, empty page --
+        /// harmless to call repeatedly, so the test can drive many ticks and
+        /// inspect only the recorded `since` history.
+        struct RecordingChannel {
+            kind: &'static str,
+            since_calls: Arc<Mutex<Vec<DateTime<Utc>>>>,
+        }
+
+        #[async_trait]
+        impl Channel for RecordingChannel {
+            fn kind(&self) -> &'static str {
+                self.kind
+            }
+
+            async fn send(&self, _envelope: ChannelEnvelope) -> Result<(), ChannelError> {
+                Ok(())
+            }
+
+            async fn poll(
+                &self,
+                _since: DateTime<Utc>,
+            ) -> Result<Vec<ChannelEnvelope>, ChannelError> {
+                panic!("the daemon poll loop must call poll_page, not poll");
+            }
+
+            async fn poll_page(
+                &self,
+                since: DateTime<Utc>,
+                _checkpoint: Option<&StoredChannelCheckpoint>,
+            ) -> Result<ChannelPollPage, ChannelError> {
+                self.since_calls.lock().unwrap().push(since);
+                Ok(ChannelPollPage {
+                    envelopes: vec![],
+                    next_checkpoint: None,
+                })
+            }
+        }
+
+        /// A channel whose first `poll_page` call returns one envelope that
+        /// permanently fails `comm.ingest` validation (empty `content`),
+        /// blocking that cycle's first-ever commit; every later call returns
+        /// no envelopes so the cycle cleanly completes. Also records `since`
+        /// on every call.
+        struct IngestFailsOnceChannel {
+            call_count: AtomicUsize,
+            since_calls: Arc<Mutex<Vec<DateTime<Utc>>>>,
+        }
+
+        #[async_trait]
+        impl Channel for IngestFailsOnceChannel {
+            fn kind(&self) -> &'static str {
+                "mock_ingest_fails_once"
+            }
+
+            async fn send(&self, _envelope: ChannelEnvelope) -> Result<(), ChannelError> {
+                Ok(())
+            }
+
+            async fn poll(
+                &self,
+                _since: DateTime<Utc>,
+            ) -> Result<Vec<ChannelEnvelope>, ChannelError> {
+                panic!("the daemon poll loop must call poll_page, not poll");
+            }
+
+            async fn poll_page(
+                &self,
+                since: DateTime<Utc>,
+                _checkpoint: Option<&StoredChannelCheckpoint>,
+            ) -> Result<ChannelPollPage, ChannelError> {
+                self.since_calls.lock().unwrap().push(since);
+                if self.call_count.fetch_add(1, Ordering::SeqCst) == 0 {
+                    let bad = ChannelEnvelope::new(
+                        "email:sender@example.com",
+                        "email:me@example.com",
+                        "",
+                    );
+                    Ok(ChannelPollPage {
+                        envelopes: vec![bad],
+                        next_checkpoint: None,
+                    })
+                } else {
+                    Ok(ChannelPollPage {
+                        envelopes: vec![],
+                        next_checkpoint: None,
+                    })
+                }
+            }
+        }
+
+        /// Drive the paused virtual clock forward in small steps, yielding
+        /// after each one, until `calls` has recorded at least `target`
+        /// entries (mirrors `cursor_commit_gating_tests`' convergence
+        /// pattern: the loop's `comm.*` dispatches need several cooperative
+        /// sleep/wake round-trips under a paused clock to settle, so a
+        /// single large `advance` can outrun a timer the task has not
+        /// re-armed yet).
+        async fn advance_until_calls(calls: &Mutex<Vec<DateTime<Utc>>>, target: usize) {
+            for _ in 0..2000 {
+                if calls.lock().unwrap().len() >= target {
+                    return;
+                }
+                tokio::time::advance(std::time::Duration::from_millis(250)).await;
+                for _ in 0..10 {
+                    tokio::task::yield_now().await;
+                }
+            }
+        }
+
+        /// Cross-date regression (issue #449 High, failure shape 1): a
+        /// `comm.cursor_get` failure on a channel's first cycle must not
+        /// lose that channel's bootstrap floor. This corrupts the durable
+        /// cursor row for `mock_broken_cursor_get` directly (an unparseable
+        /// `generation` column) so its very first `cursor_get` fails and the
+        /// channel is skipped for that tick, then repairs the row before the
+        /// next tick. A `mock_control` channel with no corruption is polled
+        /// on every tick as a same-run reference for what the *first* tick's
+        /// floor actually was -- if the fix works, the broken channel's
+        /// first successful `poll_page` call (after recovery) sees the exact
+        /// same `since` as the control channel's very first call, proving
+        /// the floor survived the cursor_get failure instead of jumping
+        /// forward to a later tick's timestamp (which, across a calendar-day
+        /// boundary, would silently drop the previous day's mail from the
+        /// IMAP `SINCE` search).
+        #[tokio::test(start_paused = true)]
+        async fn cursor_get_failure_preserves_the_bootstrap_floor() {
+            const BROKEN_KIND: &str = "mock_broken_cursor_get";
+
+            let runtime = KhiveRuntime::memory().expect("in-memory runtime");
+            let mut builder = VerbRegistryBuilder::new();
+            builder.register(khive_pack_kg::KgPack::new(runtime.clone()));
+            builder.register(khive_pack_comm::CommPack::new(runtime.clone()));
+            let registry = builder.build().expect("registry builds");
+
+            // Seed a valid row (also bootstraps the pack-owned schema), then
+            // corrupt `generation` in place so cursor_get's column-type match
+            // falls through to its "malformed" error arm.
+            commit_channel_cursor(
+                &registry,
+                BROKEN_KIND,
+                BROKEN_KIND,
+                &khive_channel::ChannelCheckpoint {
+                    source: "seed".to_string(),
+                    generation: 1,
+                    high_water: Some(1),
+                },
+            )
+            .await
+            .expect("seed cursor_commit must succeed");
+
+            let sql = runtime.sql();
+            {
+                let mut w = sql.writer().await.expect("writer");
+                w.execute(SqlStatement {
+                    sql: "UPDATE comm_channel_cursor SET generation = 1.5 \
+                          WHERE channel_kind = ?1 AND channel_slug = ?2"
+                        .into(),
+                    params: vec![
+                        SqlValue::Text(BROKEN_KIND.to_string()),
+                        SqlValue::Text(BROKEN_KIND.to_string()),
+                    ],
+                    label: Some("test_corrupt_generation".into()),
+                })
+                .await
+                .expect("corrupting update must succeed");
+            }
+
+            let control_calls = Arc::new(Mutex::new(Vec::new()));
+            let broken_calls = Arc::new(Mutex::new(Vec::new()));
+
+            let mut ch_registry = ChannelRegistry::new();
+            ch_registry.register(Arc::new(RecordingChannel {
+                kind: "mock_control",
+                since_calls: control_calls.clone(),
+            }));
+            ch_registry.register(Arc::new(RecordingChannel {
+                kind: BROKEN_KIND,
+                since_calls: broken_calls.clone(),
+            }));
+
+            let task = tokio::spawn(channel_poll_loop(
+                Arc::new(ch_registry),
+                registry.clone(),
+                "test-ns".to_string(),
+                "actor:test".to_string(),
+            ));
+
+            // Tick 1: control succeeds (records the tick's floor); the
+            // broken channel's cursor_get fails on the corrupted row, so it
+            // is skipped and records nothing.
+            advance_until_calls(&control_calls, 1).await;
+            assert_eq!(
+                control_calls.lock().unwrap().len(),
+                1,
+                "control channel must be polled on the first tick"
+            );
+            assert_eq!(
+                broken_calls.lock().unwrap().len(),
+                0,
+                "the broken channel must be skipped while cursor_get fails"
+            );
+
+            // Repair the row so cursor_get succeeds from the next tick on.
+            {
+                let mut w = sql.writer().await.expect("writer");
+                w.execute(SqlStatement {
+                    sql: "UPDATE comm_channel_cursor SET generation = 1 \
+                          WHERE channel_kind = ?1 AND channel_slug = ?2"
+                        .into(),
+                    params: vec![
+                        SqlValue::Text(BROKEN_KIND.to_string()),
+                        SqlValue::Text(BROKEN_KIND.to_string()),
+                    ],
+                    label: Some("test_repair_generation".into()),
+                })
+                .await
+                .expect("repairing update must succeed");
+            }
+
+            // Tick 2: cursor_get now succeeds and the broken channel is
+            // finally polled for the first time.
+            advance_until_calls(&broken_calls, 1).await;
+            task.abort();
+
+            let control_first = control_calls.lock().unwrap()[0];
+            let broken_first = *broken_calls
+                .lock()
+                .unwrap()
+                .first()
+                .expect("the broken channel must have been polled after recovery");
+
+            assert_eq!(
+                broken_first, control_first,
+                "the broken channel's first poll_page call must see the SAME \
+                 bootstrap floor as the control channel's very first call \
+                 ({control_first:?}), not a later tick's timestamp \
+                 ({broken_first:?}) -- the cursor_get failure must not have \
+                 lost the earlier floor"
+            );
+        }
+
+        /// Cross-date regression (issue #449 High, failure shape 2): an
+        /// ingest failure that blocks a channel's first-ever `cursor_commit`
+        /// must not lose that channel's bootstrap floor either. Uses the
+        /// same same-run control-channel comparison as the cursor_get test
+        /// above.
+        #[tokio::test(start_paused = true)]
+        async fn quarantine_ingest_failure_blocking_first_commit_preserves_the_bootstrap_floor() {
+            let runtime = KhiveRuntime::memory().expect("in-memory runtime");
+            let mut builder = VerbRegistryBuilder::new();
+            builder.register(khive_pack_kg::KgPack::new(runtime.clone()));
+            builder.register(khive_pack_comm::CommPack::new(runtime.clone()));
+            let registry = builder.build().expect("registry builds");
+
+            let control_calls = Arc::new(Mutex::new(Vec::new()));
+            let failing_calls = Arc::new(Mutex::new(Vec::new()));
+
+            let mut ch_registry = ChannelRegistry::new();
+            ch_registry.register(Arc::new(RecordingChannel {
+                kind: "mock_control",
+                since_calls: control_calls.clone(),
+            }));
+            ch_registry.register(Arc::new(IngestFailsOnceChannel {
+                call_count: AtomicUsize::new(0),
+                since_calls: failing_calls.clone(),
+            }));
+
+            let task = tokio::spawn(channel_poll_loop(
+                Arc::new(ch_registry),
+                registry.clone(),
+                "test-ns".to_string(),
+                "actor:test".to_string(),
+            ));
+
+            // Tick 1: control succeeds; the ingest-failing channel is polled
+            // (records `since`) but its one envelope fails comm.ingest, so
+            // no checkpoint is committed for it this tick.
+            advance_until_calls(&control_calls, 1).await;
+            advance_until_calls(&failing_calls, 1).await;
+            assert_eq!(control_calls.lock().unwrap().len(), 1);
+            assert_eq!(
+                failing_calls.lock().unwrap().len(),
+                1,
+                "poll_page is still called even though ingest will fail"
+            );
+
+            // Tick 2: the channel is polled again (its envelope now ingests
+            // cleanly with no bad message), and its cycle finally succeeds.
+            advance_until_calls(&failing_calls, 2).await;
+            task.abort();
+
+            let control_first = control_calls.lock().unwrap()[0];
+            let failing_calls = failing_calls.lock().unwrap();
+            assert_eq!(
+                failing_calls.len(),
+                2,
+                "the channel must have been polled again on the second tick"
+            );
+
+            assert_eq!(
+                failing_calls[0], control_first,
+                "the first poll_page call's `since` must match the control \
+                 channel's first-tick floor"
+            );
+            assert_eq!(
+                failing_calls[1], control_first,
+                "the SECOND poll_page call's `since` must still match the \
+                 same original floor ({control_first:?}), not a fresh \
+                 timestamp from the tick where the ingest failure blocked \
+                 the first commit ({:?}) -- otherwise a failure spanning a \
+                 calendar-day boundary would permanently skip the earlier \
+                 day's uncommitted mail",
+                failing_calls[1]
+            );
         }
     }
 }

@@ -42,12 +42,16 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace
 echo "=== Tests ==="
 cargo test --workspace
 
-echo "=== Channel Lifecycle Tests (channel-email feature) ==="
-# `--workspace` alone never compiles or runs the ADR-094 channel lifecycle
-# sequencing test: it lives behind `#[cfg(feature = "channel-email")]` in
-# khive-mcp, and the all-features clippy pass above only type-checks it.
-# Run it explicitly so a broken lifecycle sequence fails CI.
-cargo test -p khive-mcp --features channel-email channel_lifecycle
+echo "=== Channel-Email Feature Tests (channel-email feature) ==="
+# `--workspace` alone never runs any of the several `#[cfg(feature =
+# "channel-email")]` test modules in khive-mcp (ADR-094 channel lifecycle
+# sequencing, issue #449 cursor_commit gating, bootstrap-floor regressions,
+# etc.) -- the all-features clippy pass above only type-checks them. A prior
+# name filter here (`channel_lifecycle`) ran only one of those modules and
+# silently skipped the rest, including the daemon's durable-cursor
+# regression tests. Run the whole crate under the feature, unfiltered, so
+# every one of those modules fails CI on a regression.
+cargo test -p khive-mcp --features channel-email
 
 echo "=== No-Default-Features Check ==="
 cargo check --workspace --no-default-features
