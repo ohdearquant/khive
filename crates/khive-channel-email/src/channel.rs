@@ -972,6 +972,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn quoted_whitespace_smtp_mailfrom_injection_does_not_bypass_gate() {
+        // Regression for the #501 property-tokenizer hardening, driven through
+        // the REAL byte-parsing path (parse_raw_bytes): a quoted
+        // smtp.mailfrom= pvalue containing embedded whitespace and an
+        // attacker-controlled inner "smtp.mailfrom=example.com" must never be
+        // shattered into a separate, alignment-winning property token. The
+        // real envelope domain (evil.com) must be what the gate sees, so this
+        // must quarantine as unaligned, never attribute to the maintainer.
+        let raw = b"Authentication-Results: mx.example.com; spf=pass smtp.mailfrom=\"attacker smtp.mailfrom=example.com \"@evil.com\r\n\
+                    From: maintainer@example.com\r\n\
+                    To: me@example.com\r\n\
+                    Subject: quoted whitespace property injection\r\n\
+                    \r\n\
+                    body";
+        let email = parse_raw_bytes(1, raw, "imap.example.com", 1).unwrap();
+        let ch = build_channel("maintainer@example.com", vec![email]);
+        let envs = ch.poll(Utc::now()).await.unwrap();
+        assert_eq!(envs.len(), 1);
+        assert_eq!(
+            envs[0].from, "email:quarantine",
+            "a forged smtp.mailfrom hidden inside a quoted pvalue's embedded whitespace must never attribute mail"
+        );
+        assert_eq!(
+            envs[0]
+                .metadata
+                .get("quarantine_reason")
+                .map(String::as_str),
+            Some("unaligned")
+        );
+    }
+
+    #[tokio::test]
     async fn spf_pass_unaligned_envelope_from_quarantines_unaligned() {
         let raw = b"Authentication-Results: mx.example.com; spf=pass smtp.mailfrom=alice@attacker.net\r\n\
                     From: maintainer@example.com\r\n\
