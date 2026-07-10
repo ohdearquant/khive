@@ -1760,31 +1760,30 @@ pub fn resolve_runtime_config(inputs: RuntimeConfigInputs<'_>) -> anyhow::Result
     // we exclude brain_profile from the default spread and set it to None (CLI-only).
     let cli_brain_profile = inputs.brain_profile.filter(|s| !s.trim().is_empty());
 
-    let base_config = RuntimeConfig {
-        db_path,
-        default_namespace: inputs.namespace,
-        packs,
-        // Explicit CLI flag only at this tier — env and config-file tiers are applied
-        // below in resolve_config / resolve_actor_from_config and apply_env_brain_profile.
-        brain_profile: cli_brain_profile,
-        ..RuntimeConfig::default()
-    };
-
     // Threaded into the config-file resolvers so tier-3 project-local config
     // discovery anchors to the resolved database's directory rather than the
     // process cwd when an explicit `--db`/`KHIVE_DB` is given (kills config_id
     // drift between a client and the daemon serving the same database at a
-    // different working directory). Deliberately NOT `base_config.db_path`
-    // (which materializes the `$HOME/.khive/khive.db` default when unset,
-    // #689) — an unset db must fall through to cwd-anchored discovery instead
-    // of silently searching the home directory.
+    // different working directory). Deliberately NOT the base config's own
+    // `db_path` (which materializes the `$HOME/.khive/khive.db` default when
+    // unset, #689) — an unset db must fall through to cwd-anchored discovery
+    // instead of silently searching the home directory.
     let db_path_for_config = config_discovery_db_anchor(inputs.db);
 
     let resolved = if inputs.no_embed {
+        // `RuntimeConfig::no_embeddings()` is the canonical "zero embedders"
+        // constructor (issue #396) — it clears `embedding_model` and
+        // `additional_embedding_models` together, unlike a manual two-field
+        // override which can leave `additional_embedding_models` populated
+        // from `KHIVE_ADDITIONAL_EMBEDDING_MODELS`.
         let no_embed_base = RuntimeConfig {
-            embedding_model: None,
-            additional_embedding_models: vec![],
-            ..base_config
+            db_path,
+            default_namespace: inputs.namespace,
+            packs,
+            // Explicit CLI flag only at this tier — env and config-file tiers are applied
+            // below in resolve_actor_from_config and apply_env_brain_profile.
+            brain_profile: cli_brain_profile,
+            ..RuntimeConfig::no_embeddings()
         };
         resolve_actor_from_config(
             inputs.config,
@@ -1793,6 +1792,15 @@ pub fn resolve_runtime_config(inputs: RuntimeConfigInputs<'_>) -> anyhow::Result
             db_path_for_config.as_deref(),
         )?
     } else {
+        let base_config = RuntimeConfig {
+            db_path,
+            default_namespace: inputs.namespace,
+            packs,
+            // Explicit CLI flag only at this tier — env and config-file tiers are applied
+            // below in resolve_config and apply_env_brain_profile.
+            brain_profile: cli_brain_profile,
+            ..RuntimeConfig::default()
+        };
         resolve_config(inputs.config, base_config, db_path_for_config.as_deref())?
     };
 

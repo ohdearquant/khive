@@ -4952,6 +4952,60 @@ mod tests {
         );
     }
 
+    // ── Issue #396 regression ────────────────────────────────────────────────
+    // `RuntimeConfig::no_embeddings()` must register zero embedders, so
+    // `create_note` never attempts to lazily build a lattice embedding model —
+    // this is what lets `memory.remember` succeed on a machine with no local
+    // model files present (the exact failure mode reported in #396).
+
+    #[tokio::test]
+    async fn no_embeddings_config_registers_zero_embedders() {
+        let config = crate::config::RuntimeConfig {
+            db_path: None,
+            packs: vec!["kg".to_string()],
+            ..crate::config::RuntimeConfig::no_embeddings()
+        };
+        let rt = KhiveRuntime::new(config).expect("runtime construction must succeed");
+
+        assert!(rt.config().embedding_model.is_none());
+        assert!(
+            rt.registered_embedding_model_names().is_empty(),
+            "no_embeddings() runtime must register zero embedders"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_embeddings_runtime_create_note_succeeds_without_model_fanout() {
+        let config = crate::config::RuntimeConfig {
+            db_path: None,
+            packs: vec!["kg".to_string()],
+            ..crate::config::RuntimeConfig::no_embeddings()
+        };
+        let rt = KhiveRuntime::new(config).expect("runtime construction must succeed");
+        let tok = NamespaceToken::local();
+
+        // With zero registered embedders, create_note's embed fan-out list is
+        // empty and no lattice model build is ever attempted -- the write must
+        // succeed (degrading to FTS-only) exactly as #396 requires.
+        let note = rt
+            .create_note(
+                &tok,
+                "memory",
+                None,
+                "issue-396 regression: model-less remember must succeed",
+                Some(0.7),
+                None,
+                vec![],
+            )
+            .await
+            .expect("create_note must succeed with zero registered embedders");
+
+        assert_eq!(
+            note.content,
+            "issue-396 regression: model-less remember must succeed"
+        );
+    }
+
     #[tokio::test]
     async fn update_edge_changes_weight() {
         let rt = rt();
