@@ -30,4 +30,5 @@ blake3 = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
 khive-pack-kg = { version = "0.3.0", path = "../khive-pack-kg" }
 tempfile = { workspace = true }
+khive-runtime = { version = "0.3.0", path = "../khive-runtime", features = ["fault-injection"] }
 lattice-embed = { workspace = true }

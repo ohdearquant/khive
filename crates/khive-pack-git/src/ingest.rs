@@ -153,11 +153,38 @@ pub struct IngestReport {
 /// commit's `annotates` list can reference an already-created merging-PR
 /// note (the generic `create` verb validates `annotates` targets exist
 /// before it writes — see `khive-runtime::operations::create_note_inner`).
+///
+/// Delegates to `run_ingest_with_commit_recovery` with a recovery callback
+/// that never repairs anything — the CLI and any local-path caller has no
+/// disposable remote cache to repair (issue #765 self-heal is remote-URL
+/// mode only, ADR-088 Amendment 1), so a classified commit-snapshot failure
+/// here surfaces as an ordinary error, exactly as before this pass gained
+/// recovery support.
 pub async fn run_ingest(
     runtime: &KhiveRuntime,
     token: &NamespaceToken,
     registry: &VerbRegistry,
     opts: IngestOptions,
+) -> Result<IngestReport> {
+    run_ingest_with_commit_recovery(runtime, token, registry, opts, |_repo, _err| Ok(None)).await
+}
+
+/// Same one-shot ingest pass as `run_ingest`, but a classified missing-
+/// promisor-object failure while loading the commit-history snapshot
+/// (`GitLogError::is_missing_promisor_object`) is retried through `recover`
+/// instead of aborting the whole pass (issue #765). Issues and PRs still run
+/// exactly once regardless of whether recovery is later needed or invoked —
+/// only commit-snapshot acquisition (`walk_commits` + `touched_files`) is
+/// retried, inside this same invocation's `Budget`, `IngestReport`, PR/merge
+/// maps, and reference candidates (`new_records`); a repair never resets or
+/// replays any of them, and there is no second `run_ingest` pass hiding
+/// behind this one.
+pub(crate) async fn run_ingest_with_commit_recovery(
+    runtime: &KhiveRuntime,
+    token: &NamespaceToken,
+    registry: &VerbRegistry,
+    opts: IngestOptions,
+    mut recover: impl FnMut(&Path, &GitLogError) -> Result<Option<RecoveredRepo>> + Send,
 ) -> Result<IngestReport> {
     let mut report = IngestReport {
         done: true,
@@ -244,6 +271,7 @@ pub async fn run_ingest(
             &mut report,
             &mut budget,
             &mut new_records,
+            &mut recover,
         )
         .await?;
     }
@@ -565,6 +593,53 @@ struct RawCommit {
     body: String,
 }
 
+/// Which `git log` pass a classified failure came from (issue #765): the
+/// two passes fail independently (`walk_commits`'s plain metadata pass can
+/// succeed via cached commit data while `touched_files`'s `--name-only` pass
+/// needs a tree that the promisor cache dropped, or vice versa), so recovery
+/// needs to know which one to retry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GitLogPhase {
+    Metadata,
+    TouchedFiles,
+}
+
+/// A non-zero-exit `git log` failure, carrying its phase and raw stderr so
+/// `is_missing_promisor_object` can classify it without losing the
+/// underlying diagnostic (surfaced verbatim in the final error when
+/// recovery is unavailable or exhausted).
+#[derive(Debug)]
+pub(crate) struct GitLogError {
+    phase: GitLogPhase,
+    stderr: String,
+}
+
+impl std::fmt::Display for GitLogError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let cmd = match self.phase {
+            GitLogPhase::Metadata => "git log",
+            GitLogPhase::TouchedFiles => "git log --name-only",
+        };
+        write!(f, "{cmd} failed: {}", self.stderr)
+    }
+}
+
+impl std::error::Error for GitLogError {}
+
+impl GitLogError {
+    /// `true` for exactly the class of failure issue #765 authorizes
+    /// self-healing for: a missing-object diagnostic that names a promisor
+    /// remote. Deliberately narrow (ASCII-case-insensitive `promisor` plus
+    /// either `not in the object database` or `missing object`) so ordinary
+    /// auth/network/`bad object`/spawn/local-source failures are never
+    /// treated as corrupt-cache and never trigger a destructive repair.
+    pub(crate) fn is_missing_promisor_object(&self) -> bool {
+        let lower = self.stderr.to_ascii_lowercase();
+        lower.contains("promisor")
+            && (lower.contains("not in the object database") || lower.contains("missing object"))
+    }
+}
+
 /// Walk local git history via `git log` with a stable, machine-parseable
 /// format (v0 choice per ADR-088 §5 — `git2`/`gix` are not workspace
 /// dependencies today, so shelling out avoids a new heavy dependency).
@@ -589,10 +664,10 @@ fn walk_commits(repo: &Path, since_sha: Option<&str>) -> Result<Vec<RawCommit>> 
         .output()
         .context("spawning git log")?;
     if !output.status.success() {
-        return Err(anyhow!(
-            "git log failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        ));
+        return Err(anyhow::Error::new(GitLogError {
+            phase: GitLogPhase::Metadata,
+            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        }));
     }
     let text = String::from_utf8_lossy(&output.stdout);
     let mut commits = Vec::new();
@@ -630,7 +705,7 @@ fn walk_commits(repo: &Path, since_sha: Option<&str>) -> Result<Vec<RawCommit>> 
     Ok(commits)
 }
 
-/// `sha -> [touched paths]` for every commit in `repo`'s history, via a
+/// `sha -> \[touched paths\]` for every commit in `repo`'s history, via a
 /// separate `--name-only` pass (kept apart from `walk_commits`'s custom
 /// `--pretty=format` — interleaving file-name lines with the metadata format
 /// has no clean, unambiguous delimiter).
@@ -644,10 +719,10 @@ fn touched_files(repo: &Path) -> Result<HashMap<String, Vec<String>>> {
         .output()
         .context("spawning git log --name-only")?;
     if !output.status.success() {
-        return Err(anyhow!(
-            "git log --name-only failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        ));
+        return Err(anyhow::Error::new(GitLogError {
+            phase: GitLogPhase::TouchedFiles,
+            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        }));
     }
     let text = String::from_utf8_lossy(&output.stdout);
     let mut map: HashMap<String, Vec<String>> = HashMap::new();
@@ -658,6 +733,104 @@ fn touched_files(repo: &Path) -> Result<HashMap<String, Vec<String>>> {
         map.insert(sha.trim().to_string(), files);
     }
     Ok(map)
+}
+
+/// The two `git log` passes a commit-ingest phase needs, loaded together so
+/// a classified failure in either one can be retried as a single unit
+/// (issue #765).
+struct CommitSnapshot {
+    commits: Vec<RawCommit>,
+    files_by_sha: HashMap<String, Vec<String>>,
+}
+
+/// Load one commit-history snapshot. Mirrors `ingest_commits`'s original
+/// inline sequencing: `touched_files` (a second, unscoped `git log
+/// --name-only` pass over the whole history) is skipped entirely when
+/// `walk_commits` found no new commits, since there is nothing new to
+/// annotate with touched paths.
+fn load_commit_snapshot(repo: &Path, since_sha: Option<&str>) -> Result<CommitSnapshot> {
+    let commits = walk_commits(repo, since_sha)?;
+    if commits.is_empty() {
+        return Ok(CommitSnapshot {
+            commits,
+            files_by_sha: HashMap::new(),
+        });
+    }
+    let files_by_sha = touched_files(repo)?;
+    Ok(CommitSnapshot {
+        commits,
+        files_by_sha,
+    })
+}
+
+/// Which repair `RemoteCommitRecovery` (`handlers.rs`) performed, so
+/// `recover_commit_snapshot` can report exactly one truthful success warning
+/// once the commit phase completes (issue #765).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CacheRepairStrategy {
+    Refetch,
+    Reclone,
+}
+
+/// The repo path and strategy a `recover` callback used to repair a
+/// classified `GitLogError` -- `recover_commit_snapshot` retries the
+/// snapshot load against `repo` (the same cache slot for both strategies in
+/// `cache.rs`, but callers are not required to keep it identical).
+pub(crate) struct RecoveredRepo {
+    pub(crate) repo: PathBuf,
+    pub(crate) strategy: CacheRepairStrategy,
+}
+
+fn cache_repair_warning(strategy: CacheRepairStrategy) -> String {
+    match strategy {
+        CacheRepairStrategy::Refetch => {
+            "repaired corrupt remote git cache by refetching missing promisor objects".to_string()
+        }
+        CacheRepairStrategy::Reclone => {
+            "repaired corrupt remote git cache by replacing the owned clone".to_string()
+        }
+    }
+}
+
+/// Load a commit-history snapshot, retrying through `recover` when the
+/// failure is a classified missing-promisor-object error (issue #765).
+///
+/// Bounded entirely by `recover`'s own return value: `Ok(Some(_))` retries
+/// the snapshot load against the recovered repo path, `Ok(None)` surfaces
+/// the original classified error (no more repair available), and any other
+/// error (including an unclassified `GitLogError` or a non-`GitLogError`
+/// failure) is returned immediately without ever calling `recover`. A later
+/// repair attempt's strategy replaces the pending warning rather than
+/// accumulating one per attempt, so exactly one success warning is ever
+/// returned -- describing the *last* repair that was needed, not every one
+/// tried.
+fn recover_commit_snapshot(
+    repo: &Path,
+    since_sha: Option<&str>,
+    mut recover: impl FnMut(&Path, &GitLogError) -> Result<Option<RecoveredRepo>>,
+) -> Result<(CommitSnapshot, Option<String>)> {
+    let mut repo_path = repo.to_path_buf();
+    let mut recovery_warning: Option<String> = None;
+    loop {
+        match load_commit_snapshot(&repo_path, since_sha) {
+            Ok(snapshot) => return Ok((snapshot, recovery_warning)),
+            Err(e) => {
+                let classified = e
+                    .downcast_ref::<GitLogError>()
+                    .filter(|g| g.is_missing_promisor_object());
+                let Some(git_log_err) = classified else {
+                    return Err(e);
+                };
+                match recover(&repo_path, git_log_err)? {
+                    Some(recovered) => {
+                        repo_path = recovered.repo;
+                        recovery_warning = Some(cache_repair_warning(recovered.strategy));
+                    }
+                    None => return Err(e),
+                }
+            }
+        }
+    }
 }
 
 /// Squash-merge subject suffix `"... (#123)"` -> `123`.
@@ -706,13 +879,20 @@ async fn ingest_commits(
     report: &mut IngestReport,
     budget: &mut Budget,
     new_records: &mut Vec<NewRecordForRef>,
+    recover: &mut (dyn FnMut(&Path, &GitLogError) -> Result<Option<RecoveredRepo>> + Send),
 ) -> Result<()> {
     let since = read_cursor(runtime, project_id, "commits").await?;
-    let commits = walk_commits(repo, since.as_deref())?;
+    let (snapshot, recovery_warning) = recover_commit_snapshot(repo, since.as_deref(), recover)?;
+    let CommitSnapshot {
+        commits,
+        files_by_sha,
+    } = snapshot;
     if commits.is_empty() {
+        if let Some(warning) = recovery_warning {
+            report.warnings.push(warning);
+        }
         return Ok(());
     }
-    let files_by_sha = touched_files(repo)?;
 
     // `cursor_stalled` freezes `last_sha` at the last contiguous successfully
     // processed commit: once a record fails to create, later records in this
@@ -872,6 +1052,9 @@ async fn ingest_commits(
 
     if let Some(sha) = last_sha {
         write_cursor(runtime, project_id, "commits", &sha).await?;
+    }
+    if let Some(warning) = recovery_warning {
+        report.warnings.push(warning);
     }
     Ok(())
 }
@@ -1460,6 +1643,135 @@ mod paging_tests {
     fn full_page_with_no_updated_at_stalls_rather_than_looping_forever() {
         let outcome = decide_page_outcome(PAGE_LIMIT, Some("A"), None, false);
         assert_eq!(outcome, PageOutcome::StopFloorStalled);
+    }
+}
+
+/// Issue #765: `GitLogError` classification and the `recover_commit_snapshot`
+/// retry loop. Pure/synchronous (no runtime, no database) -- these fields
+/// are private to this module, so this lives here rather than in the
+/// sibling `recovery_tests` module (which drives the DB-backed acceptance
+/// scenarios through the `pub(crate)` surface instead).
+#[cfg(test)]
+mod recovery_classifier_tests {
+    use super::*;
+
+    fn err(phase: GitLogPhase, stderr: &str) -> GitLogError {
+        GitLogError {
+            phase,
+            stderr: stderr.to_string(),
+        }
+    }
+
+    const REAL_WORLD_MESSAGE: &str = "fatal: deadbeefdeadbeefdeadbeefdeadbeefdeadbeef is in \
+         the commit graph file, but not in the object database\nfatal: unable to parse commit: \
+         deadbeefdeadbeefdeadbeefdeadbeefdeadbeef\nfatal: could not fetch from promisor remote";
+
+    #[test]
+    fn classifies_real_world_missing_promisor_object_message_on_either_phase() {
+        assert!(err(GitLogPhase::TouchedFiles, REAL_WORLD_MESSAGE).is_missing_promisor_object());
+        assert!(err(GitLogPhase::Metadata, REAL_WORLD_MESSAGE).is_missing_promisor_object());
+    }
+
+    #[test]
+    fn classifies_missing_object_wording_case_insensitively() {
+        assert!(err(
+            GitLogPhase::TouchedFiles,
+            "FATAL: MISSING OBJECT abc123; PROMISOR remote unavailable"
+        )
+        .is_missing_promisor_object());
+    }
+
+    #[test]
+    fn does_not_classify_bad_object_without_promisor() {
+        assert!(!err(GitLogPhase::Metadata, "fatal: bad object HEAD").is_missing_promisor_object());
+    }
+
+    #[test]
+    fn does_not_classify_auth_or_network_failures() {
+        assert!(!err(
+            GitLogPhase::Metadata,
+            "fatal: Authentication failed for 'https://example.com/org/repo.git/'"
+        )
+        .is_missing_promisor_object());
+        assert!(!err(
+            GitLogPhase::TouchedFiles,
+            "fatal: unable to access 'https://example.com/org/repo.git/': Could not resolve host"
+        )
+        .is_missing_promisor_object());
+    }
+
+    #[test]
+    fn does_not_classify_promisor_mention_without_missing_object_wording() {
+        // "promisor" alone (e.g. a config-dump or unrelated log line) must
+        // not be treated as proof of corruption -- both keyword classes are
+        // required.
+        assert!(!err(
+            GitLogPhase::Metadata,
+            "fatal: promisor remote configured but unreachable"
+        )
+        .is_missing_promisor_object());
+    }
+
+    /// A healthy repo: the snapshot loads on the first try, no `recover`
+    /// call, no warning.
+    #[test]
+    fn recover_commit_snapshot_returns_no_warning_when_healthy() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        init_repo_with_commit(dir.path());
+        let mut recover_calls = 0;
+        let (snapshot, warning) = recover_commit_snapshot(dir.path(), None, |_repo, _err| {
+            recover_calls += 1;
+            Ok(None)
+        })
+        .expect("healthy repo loads");
+        assert_eq!(snapshot.commits.len(), 1);
+        assert_eq!(warning, None);
+        assert_eq!(recover_calls, 0);
+    }
+
+    /// An unclassified `git log` failure (nonexistent repo path -- a spawn-
+    /// level/`bad object`-shaped failure, not a promisor one) must never
+    /// reach `recover` at all, and must propagate as-is.
+    #[test]
+    fn recover_commit_snapshot_never_calls_recover_for_unclassified_failures() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // Not a git repo at all -- `git log` fails with a plain spawn/repo
+        // error, not a classified promisor one.
+        let mut recover_calls = 0;
+        let result = recover_commit_snapshot(dir.path(), None, |_repo, _err| {
+            recover_calls += 1;
+            Ok(Some(RecoveredRepo {
+                repo: dir.path().to_path_buf(),
+                strategy: CacheRepairStrategy::Refetch,
+            }))
+        });
+        assert!(result.is_err(), "a non-repo path must fail to load");
+        assert_eq!(
+            recover_calls, 0,
+            "an unclassified failure must never invoke recover"
+        );
+    }
+
+    fn init_repo_with_commit(repo: &Path) {
+        let run = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(repo)
+                .args(args)
+                .output()
+                .expect("spawn git");
+            assert!(
+                out.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        run(&["init", "-q", "-b", "main"]);
+        run(&["config", "user.email", "test@example.com"]);
+        run(&["config", "user.name", "Test User"]);
+        std::fs::write(repo.join("a.txt"), b"hello").unwrap();
+        run(&["add", "a.txt"]);
+        run(&["commit", "-q", "-m", "initial"]);
     }
 }
 

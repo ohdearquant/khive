@@ -22,6 +22,8 @@ pub mod handlers;
 pub mod hook;
 pub mod ingest;
 mod pack;
+#[cfg(test)]
+mod recovery_tests;
 pub mod refs;
 pub mod source;
 pub(crate) mod vocab;

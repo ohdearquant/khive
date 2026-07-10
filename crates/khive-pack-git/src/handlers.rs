@@ -5,6 +5,8 @@
 //! the repo-anchor `project` entity, then drives the shared
 //! `ingest::run_ingest` core with a bounded, cursor-resumable pass.
 
+use std::path::Path;
+
 use anyhow::anyhow;
 use serde_json::{json, Value};
 use uuid::Uuid;
@@ -12,10 +14,91 @@ use uuid::Uuid;
 use khive_runtime::{KhiveRuntime, NamespaceToken, RuntimeError, VerbRegistry};
 use khive_storage::types::{SqlStatement, SqlValue};
 
-use crate::cache;
-use crate::ingest::{resolve_project_id, run_ingest, IngestInclude, IngestOptions};
+use crate::cache::{self, CacheError};
+use crate::ingest::{
+    resolve_project_id, run_ingest, run_ingest_with_commit_recovery, CacheRepairStrategy,
+    GitLogError, IngestInclude, IngestOptions, RecoveredRepo,
+};
 use crate::source::{parse_source, repo_basename, DigestSource};
 use crate::GitPack;
+
+/// Issue #765 remote-only repair policy: at most one `git fetch --refetch`,
+/// then at most one owned-cache reclone, bounded by `stage` so a persistent
+/// or recurring classified failure surfaces as a terminal error rather than
+/// looping. Local-path sources never construct this — they call public
+/// `run_ingest` directly, which never repairs anything (ADR-088 Amendment 1:
+/// the disposable scratch cache is remote-URL-mode-only).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RemoteRecoveryStage {
+    Initial,
+    Refetched,
+    Recloned,
+}
+
+pub(crate) struct RemoteCommitRecovery {
+    canonical_url: String,
+    stage: RemoteRecoveryStage,
+}
+
+impl RemoteCommitRecovery {
+    pub(crate) fn new(canonical_url: impl Into<String>) -> Self {
+        Self {
+            canonical_url: canonical_url.into(),
+            stage: RemoteRecoveryStage::Initial,
+        }
+    }
+
+    /// Advance the bounded repair state machine by one step in response to a
+    /// classified `GitLogError` (the caller has already verified
+    /// `is_missing_promisor_object()`). Ignores `_repo` — both repair
+    /// primitives operate on the cache slot for `canonical_url`, which is
+    /// the same path `_repo` already names (`crate::cache`'s slot layout is
+    /// keyed by URL, not passed through).
+    pub(crate) fn repair(
+        &mut self,
+        _repo: &Path,
+        _error: &GitLogError,
+    ) -> anyhow::Result<Option<RecoveredRepo>> {
+        match self.stage {
+            RemoteRecoveryStage::Initial => match cache::refetch_clone(&self.canonical_url) {
+                Ok(repo) => {
+                    self.stage = RemoteRecoveryStage::Refetched;
+                    Ok(Some(RecoveredRepo {
+                        repo,
+                        strategy: CacheRepairStrategy::Refetch,
+                    }))
+                }
+                // The refetch command itself failed at the git level (e.g.
+                // the remote still cannot supply the missing objects) --
+                // fall through to the one guarded reclone immediately rather
+                // than surfacing the refetch failure. An I/O, size-cap, or
+                // ownership-guard failure is terminal: it is not a signal
+                // that a fresh clone would fare any differently, and is
+                // never worth risking a second destructive operation for.
+                Err(CacheError::Git(_)) => {
+                    self.stage = RemoteRecoveryStage::Refetched;
+                    self.reclone()
+                }
+                Err(e) => Err(anyhow!("cache repair (refetch) failed: {e}")),
+            },
+            RemoteRecoveryStage::Refetched => self.reclone(),
+            RemoteRecoveryStage::Recloned => Ok(None),
+        }
+    }
+
+    fn reclone(&mut self) -> anyhow::Result<Option<RecoveredRepo>> {
+        match cache::reclone(&self.canonical_url) {
+            Ok(repo) => {
+                self.stage = RemoteRecoveryStage::Recloned;
+                Ok(Some(RecoveredRepo {
+                    repo,
+                    strategy: CacheRepairStrategy::Reclone,
+                }))
+            }
+            Err(e) => Err(anyhow!("cache repair (reclone) failed: {e}")),
+        }
+    }
+}
 
 const DEFAULT_MAX_ITEMS: i64 = 500;
 const MIN_MAX_ITEMS: i64 = 1;
@@ -98,18 +181,26 @@ impl GitPack {
             pull_requests: include.pull_requests && gh_capable,
         };
 
-        let mut report = run_ingest(
-            self.runtime(),
-            token,
-            registry,
-            IngestOptions {
-                repo: repo_path,
-                project: project_id.to_string(),
-                max_items: Some(max_items),
-                include: effective_include,
-            },
-        )
-        .await
+        let opts = IngestOptions {
+            repo: repo_path,
+            project: project_id.to_string(),
+            max_items: Some(max_items),
+            include: effective_include,
+        };
+
+        // Only a remote-URL source has a disposable cache to repair (ADR-088
+        // Amendment 1) -- a local path is the caller's own working copy and
+        // is never a candidate for self-heal (issue #765).
+        let mut report = match &source {
+            DigestSource::Local(_) => run_ingest(self.runtime(), token, registry, opts).await,
+            DigestSource::Remote { canonical, .. } => {
+                let mut recovery = RemoteCommitRecovery::new(canonical.clone());
+                run_ingest_with_commit_recovery(self.runtime(), token, registry, opts, {
+                    move |repo, err| recovery.repair(repo, err)
+                })
+                .await
+            }
+        }
         .map_err(|e| RuntimeError::InvalidInput(e.to_string()))?;
 
         report.warnings.extend(warnings);
