@@ -180,6 +180,31 @@ pub struct NoteSearchHit {
     pub snippet: Option<String>,
 }
 
+/// Re-insert hyphens at canonical UUID positions (8-4-4-4-12) into a
+/// hyphen-free hex prefix, so a `LIKE '<pattern>%'` scan against the
+/// hyphenated `id` column matches correctly (#773). Prefixes that already
+/// contain a hyphen are passed through unchanged. No-op for len <= 8
+/// (already correct). Input longer than 32 hex chars is NOT truncated: the
+/// extra hex chars are appended past the canonical 12-char final segment
+/// with no further hyphen, so the resulting `LIKE` pattern requires literal
+/// characters beyond position 36 that no real (36-char) UUID string can
+/// ever have — the scan naturally fails closed instead of silently
+/// resolving `<valid-32-hex><extra-hex>` to the valid UUID.
+pub fn hex_prefix_to_uuid_pattern(prefix: &str) -> String {
+    if prefix.contains('-') {
+        return prefix.to_string();
+    }
+    const BOUNDARIES: [usize; 4] = [8, 13, 18, 23]; // post-hyphen-insertion offsets
+    let mut out = String::with_capacity(36);
+    for c in prefix.chars() {
+        if BOUNDARIES.contains(&out.len()) {
+            out.push('-');
+        }
+        out.push(c);
+    }
+    out
+}
+
 fn text_preview(text: &str, max_chars: usize) -> Option<String> {
     let trimmed = text.trim();
     if trimmed.is_empty() {
@@ -3176,7 +3201,19 @@ impl KhiveRuntime {
     ) -> RuntimeResult<Option<Uuid>> {
         use khive_storage::types::{SqlStatement, SqlValue};
 
-        let pattern = format!("{}%", prefix);
+        // Resolver-boundary gate (#816 Minor): every caller is expected to
+        // pre-validate hex-only input, but this is the single choke point
+        // every `resolve_prefix*` variant funnels through, so re-validate
+        // here too. A prefix containing anything other than hex digits and
+        // canonical hyphen separators (`%`, `_`, or other LIKE-wildcard /
+        // injection-shaped input) never matches a real id and is rejected
+        // before it can reach the LIKE pattern, instead of relying on bound
+        // params alone to neutralize wildcard semantics.
+        if !prefix.chars().all(|c| c.is_ascii_hexdigit() || c == '-') {
+            return Ok(None);
+        }
+
+        let pattern = format!("{}%", hex_prefix_to_uuid_pattern(prefix));
 
         let tables = [
             ("entities", true),
@@ -6467,6 +6504,216 @@ mod tests {
 
         let resolved = rt.resolve_prefix(&tok, prefix).await.unwrap();
         assert_eq!(resolved, Some(entity.id));
+    }
+
+    #[test]
+    fn hex_prefix_to_uuid_pattern_inserts_hyphens_at_canonical_boundaries() {
+        let full = "aabbccdd112240008000000000000ab1";
+        let cases: &[(usize, &str)] = &[
+            (1, "a"),
+            (7, "aabbccd"),
+            (8, "aabbccdd"),
+            (9, "aabbccdd-1"),
+            (12, "aabbccdd-1122"),
+            (13, "aabbccdd-1122-4"),
+            (16, "aabbccdd-1122-4000"),
+            (18, "aabbccdd-1122-4000-80"),
+            (20, "aabbccdd-1122-4000-8000"),
+            (23, "aabbccdd-1122-4000-8000-000"),
+            (24, "aabbccdd-1122-4000-8000-0000"),
+            (28, "aabbccdd-1122-4000-8000-00000000"),
+            (31, "aabbccdd-1122-4000-8000-000000000ab"),
+        ];
+        for (len, expected) in cases {
+            let input = &full[..*len];
+            assert_eq!(
+                hex_prefix_to_uuid_pattern(input),
+                *expected,
+                "len={len} input={input:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn hex_prefix_to_uuid_pattern_full_32_char_matches_canonical_uuid() {
+        let compact = "aabbccdd112240008000000000000ab1";
+        let compact32 = &compact[..32];
+        assert_eq!(
+            hex_prefix_to_uuid_pattern(compact32),
+            "aabbccdd-1122-4000-8000-000000000ab1"
+        );
+    }
+
+    /// PR #816 Minor finding 3: input longer than 32 hex chars is NOT
+    /// truncated — the extra chars land past the canonical 12-char final
+    /// segment with no further hyphen, so the pattern can never match a real
+    /// (36-char) stored `id`, instead of silently truncating down to a
+    /// pattern that matches the valid 32-char UUID.
+    #[test]
+    fn hex_prefix_to_uuid_pattern_overlong_input_is_not_truncated() {
+        let compact32 = "aabbccdd112240008000000000000ab1";
+        let overlong = format!("{compact32}extrahex");
+        let pattern = hex_prefix_to_uuid_pattern(&overlong);
+        assert_eq!(
+            pattern, "aabbccdd-1122-4000-8000-000000000ab1extrahex",
+            "overlong input must keep its extra chars, not truncate to the valid UUID"
+        );
+        assert_ne!(
+            pattern, "aabbccdd-1122-4000-8000-000000000ab1",
+            "overlong pattern must not collapse to the canonical 36-char UUID form"
+        );
+    }
+
+    #[test]
+    fn hex_prefix_to_uuid_pattern_passes_through_hyphenated_input() {
+        let hyphenated = "aabbccdd-1122-4000-8000-000000000ab1";
+        assert_eq!(hex_prefix_to_uuid_pattern(hyphenated), hyphenated);
+
+        let partial = "aabbccdd-11";
+        assert_eq!(hex_prefix_to_uuid_pattern(partial), partial);
+    }
+
+    #[tokio::test]
+    async fn resolve_prefix_compact_9_to_31_char_matches() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+        let entity = rt
+            .create_entity(
+                &tok,
+                "concept",
+                None,
+                "CompactPrefixTest",
+                None,
+                None,
+                vec![],
+            )
+            .await
+            .unwrap();
+        let compact = entity.id.simple().to_string();
+
+        for len in [9, 12, 16, 20, 24, 28, 31] {
+            let prefix = &compact[..len];
+            let resolved = rt.resolve_prefix(&tok, prefix).await.unwrap();
+            assert_eq!(
+                resolved,
+                Some(entity.id),
+                "compact prefix of len {len} should resolve"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn resolve_prefix_compact_full_32_char_matches() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+        let entity = rt
+            .create_entity(&tok, "concept", None, "Full32Test", None, None, vec![])
+            .await
+            .unwrap();
+        let compact = entity.id.simple().to_string();
+        assert_eq!(compact.len(), 32);
+
+        let resolved = rt.resolve_prefix(&tok, &compact).await.unwrap();
+        assert_eq!(resolved, Some(entity.id));
+    }
+
+    /// PR #816 Minor finding 3 (integration level): a valid 32-char compact
+    /// id with extra trailing hex chars appended must fail to resolve, not
+    /// silently resolve to the valid entity via truncation.
+    #[tokio::test]
+    async fn resolve_prefix_rejects_overlong_all_hex_input() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+        let entity = rt
+            .create_entity(&tok, "concept", None, "OverlongTest", None, None, vec![])
+            .await
+            .unwrap();
+        let compact = entity.id.simple().to_string();
+        assert_eq!(compact.len(), 32);
+
+        let overlong = format!("{compact}ab");
+        let resolved = rt.resolve_prefix(&tok, &overlong).await.unwrap();
+        assert_eq!(
+            resolved, None,
+            "a 32-char id plus extra hex chars must not resolve to the valid entity"
+        );
+    }
+
+    /// PR #816 Minor finding 4: the `resolve_prefix*` boundary rejects
+    /// non-hex/non-hyphen input (e.g. LIKE wildcards `%`/`_`) instead of
+    /// letting it reach the bound `LIKE` pattern unfiltered — covers callers
+    /// (like khive-pack-git/src/ingest.rs) that resolve raw input without
+    /// their own all-hex gate.
+    #[tokio::test]
+    async fn resolve_prefix_rejects_like_wildcard_input() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+        let entity = rt
+            .create_entity(&tok, "concept", None, "WildcardTest", None, None, vec![])
+            .await
+            .unwrap();
+        let compact = entity.id.simple().to_string();
+        // A caller that forgot to hex-gate might pass a `%`-bearing string
+        // straight through, hoping to broaden a scan; the resolver boundary
+        // must reject it instead of running it as a wildcard LIKE.
+        let wildcard_prefix = format!("{}%", &compact[..8]);
+
+        let resolved = rt.resolve_prefix(&tok, &wildcard_prefix).await.unwrap();
+        assert_eq!(
+            resolved, None,
+            "prefix containing a LIKE wildcard must be rejected, not resolved"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_prefix_boundary_at_hyphen_positions() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+        let entity = rt
+            .create_entity(&tok, "concept", None, "BoundaryTest", None, None, vec![])
+            .await
+            .unwrap();
+        let compact = entity.id.simple().to_string();
+
+        for len in [8, 12, 16, 20, 24] {
+            let prefix = &compact[..len];
+            let resolved = rt.resolve_prefix(&tok, prefix).await.unwrap();
+            assert_eq!(
+                resolved,
+                Some(entity.id),
+                "boundary prefix of len {len} should resolve"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn resolve_prefix_ambiguous_still_detected_after_normalization() {
+        use khive_storage::entity::Entity;
+
+        let rt = rt();
+        let tok = NamespaceToken::local();
+        let id_a = Uuid::parse_str("aabbccdd-1111-4000-8000-000000000001").unwrap();
+        let id_b = Uuid::parse_str("aabbccdd-1111-4000-8000-000000000002").unwrap();
+
+        let mut entity_a = Entity::new("local", "concept", "AmbigCompactA");
+        entity_a.id = id_a;
+        let mut entity_b = Entity::new("local", "concept", "AmbigCompactB");
+        entity_b.id = id_b;
+
+        let store = rt.entities(&tok).unwrap();
+        store.upsert_entity(entity_a).await.unwrap();
+        store.upsert_entity(entity_b).await.unwrap();
+
+        // Shared 20-char compact prefix (past the first hyphen boundary).
+        let shared_compact = &id_a.simple().to_string()[..20];
+        let err = rt.resolve_prefix(&tok, shared_compact).await.unwrap_err();
+        assert!(
+            matches!(
+                err,
+                RuntimeError::AmbiguousPrefix { ref matches, .. } if matches.len() == 2
+            ),
+            "shared compact prefix must still return AmbiguousPrefix; got {err:?}"
+        );
     }
 
     #[tokio::test]

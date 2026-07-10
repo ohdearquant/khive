@@ -78,8 +78,9 @@ pub use operations::{
     arm_vector_fail, arm_vector_fail_after,
 };
 pub use operations::{
-    base_entity_endpoint_rules, base_entity_rule_allows, endpoint_matches, merge_entry_metadata,
-    EdgeEndpointKind, EntityCreateSpec, LinkSpec, NoteSearchHit, QueryResult, Resolved,
+    base_entity_endpoint_rules, base_entity_rule_allows, endpoint_matches,
+    hex_prefix_to_uuid_pattern, merge_entry_metadata, EdgeEndpointKind, EntityCreateSpec, LinkSpec,
+    NoteSearchHit, QueryResult, Resolved,
 };
 pub use pack::{
     resolve_explicit_namespace, DispatchHook, HandlerDef, KindHook, NoteKindSpec,

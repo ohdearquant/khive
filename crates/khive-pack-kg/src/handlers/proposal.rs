@@ -5,7 +5,7 @@ use std::str::FromStr;
 use serde_json::Value;
 use uuid::Uuid;
 
-use khive_runtime::{NamespaceToken, RuntimeError, VerbRegistry};
+use khive_runtime::{hex_prefix_to_uuid_pattern, NamespaceToken, RuntimeError, VerbRegistry};
 use khive_storage::types::{SqlStatement, SqlValue};
 use khive_storage::SubstrateKind;
 use khive_types::{
@@ -32,7 +32,7 @@ impl KgPack {
         }
         if raw.len() >= 8 && raw.chars().all(|c| c.is_ascii_hexdigit()) {
             let ns = token.namespace().as_str().to_owned();
-            let pattern = format!("{}%", raw);
+            let pattern = format!("{}%", hex_prefix_to_uuid_pattern(raw));
             let sql = self.runtime.sql();
             let mut reader = sql.reader().await.map_err(RuntimeError::Storage)?;
             let rows = reader

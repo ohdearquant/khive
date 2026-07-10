@@ -8,7 +8,7 @@ use std::collections::{HashMap, HashSet};
 use serde_json::{json, Value};
 use uuid::Uuid;
 
-use khive_runtime::{KhiveRuntime, NamespaceToken, RuntimeError};
+use khive_runtime::{hex_prefix_to_uuid_pattern, KhiveRuntime, NamespaceToken, RuntimeError};
 use khive_score::DeterministicScore;
 use khive_storage::types::{SqlStatement, SqlValue};
 
@@ -706,11 +706,12 @@ async fn load_domain_by_id_or_slug(
                 && id.len() <= 36
                 && id.chars().all(|c| c.is_ascii_hexdigit() || c == '-');
             if is_hex {
+                let pattern = format!("{}%", hex_prefix_to_uuid_pattern(&id));
                 let rows = reader
                     .query_all(SqlStatement {
                         sql: "SELECT * FROM knowledge_domains WHERE id LIKE ?1 AND namespace = ?2 AND deleted_at IS NULL LIMIT 2".into(),
                         params: vec![
-                            SqlValue::Text(format!("{id}%")),
+                            SqlValue::Text(pattern),
                             SqlValue::Text(ns.to_owned()),
                         ],
                         label: None,
@@ -768,11 +769,12 @@ async fn load_atom_by_id_or_slug(
                 && id.len() <= 36
                 && id.chars().all(|c| c.is_ascii_hexdigit() || c == '-');
             if is_hex {
+                let pattern = format!("{}%", hex_prefix_to_uuid_pattern(&id));
                 let rows = reader
                     .query_all(SqlStatement {
                         sql: "SELECT * FROM knowledge_atoms WHERE id LIKE ?1 AND namespace = ?2 AND deleted_at IS NULL LIMIT 2".into(),
                         params: vec![
-                            SqlValue::Text(format!("{id}%")),
+                            SqlValue::Text(pattern),
                             SqlValue::Text(ns.to_owned()),
                         ],
                         label: None,

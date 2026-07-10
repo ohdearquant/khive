@@ -479,9 +479,29 @@ fn row_uuid(row: &khive_storage::types::SqlRow) -> Option<Uuid> {
     }
 }
 
+/// Escape SQLite `LIKE` wildcard characters (`%`, `_`) and the escape
+/// character itself (`\`) so a caller-supplied path is matched literally
+/// under `LIKE ... ESCAPE '\'` rather than as a pattern.
+fn escape_like(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    for c in input.chars() {
+        if matches!(c, '\\' | '%' | '_') {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}
+
 /// Find an existing `document` entity whose `properties.source_uri` or `name`
 /// matches `path` (ADR-086 keying convention). Returns `None` when no match —
 /// v0 never creates documents on the ingester's behalf (skip the edge).
+///
+/// Exact and suffix-`LIKE` candidates are selected in a single query/snapshot
+/// so a document inserted between an exact-match read and a fallback read
+/// can never be missed by the exact branch, and a wildcard-broadened match
+/// can never shadow an exact one: the `ORDER BY` ranks exact matches first,
+/// with `id` as a deterministic tiebreaker.
 async fn find_document_for_path(
     runtime: &KhiveRuntime,
     token: &NamespaceToken,
@@ -491,23 +511,26 @@ async fn find_document_for_path(
         .file_name()
         .and_then(|f| f.to_str())
         .unwrap_or(path);
-    let like_pattern = format!("%{path}");
     let sql = runtime.sql();
+    let namespace = token.namespace().as_str().to_string();
+    let like_pattern = format!("%{}", escape_like(path));
+
     let mut r = sql.reader().await.map_err(|e| anyhow!("{e}"))?;
     let row = r
         .query_row(SqlStatement {
             sql: "SELECT id FROM entities WHERE kind='document' AND namespace=?1 \
                   AND deleted_at IS NULL \
-                  AND (json_extract(properties,'$.source_uri')=?2 \
-                       OR json_extract(properties,'$.source_uri') LIKE ?3 \
-                       OR name=?4) \
+                  AND (json_extract(properties,'$.source_uri')=?2 OR name=?3 \
+                       OR json_extract(properties,'$.source_uri') LIKE ?4 ESCAPE '\\') \
+                  ORDER BY CASE WHEN json_extract(properties,'$.source_uri')=?2 OR name=?3 \
+                                THEN 0 ELSE 1 END, id \
                   LIMIT 1"
                 .into(),
             params: vec![
-                SqlValue::Text(token.namespace().as_str().to_string()),
+                SqlValue::Text(namespace),
                 SqlValue::Text(path.to_string()),
-                SqlValue::Text(like_pattern),
                 SqlValue::Text(file_name.to_string()),
+                SqlValue::Text(like_pattern),
             ],
             label: Some("git_ingest_find_document_for_path".into()),
         })
@@ -1818,6 +1841,159 @@ mod truncation_tests {
         assert!(
             !head.contains("tail-sentinel"),
             "head must not include text past the cap"
+        );
+    }
+}
+
+/// PR #816 Minor finding 4: `resolve_id`/`resolve_project_id` call the
+/// public `resolve_prefix_unfiltered` resolver without their own all-hex
+/// gate, so a `%`-bearing (or otherwise non-hex) `project` argument reached
+/// the bound `LIKE` pattern unfiltered. The runtime resolver boundary
+/// (`resolve_prefix_inner`) now rejects non-hex/non-hyphen input itself, so
+/// these callers inherit the fix without needing their own gate.
+#[cfg(test)]
+mod compact_prefix_resolver_tests {
+    use super::*;
+    use khive_runtime::Namespace;
+
+    #[tokio::test]
+    async fn resolve_project_id_rejects_like_wildcard_input() {
+        let rt = KhiveRuntime::memory().unwrap();
+        let token = rt.authorize(Namespace::local()).unwrap();
+        let project = rt
+            .create_entity(
+                &token,
+                "project",
+                None,
+                "WildcardIngestTest",
+                None,
+                None,
+                vec![],
+            )
+            .await
+            .unwrap();
+        let compact = project.id.simple().to_string();
+        let wildcard_input = format!("{}%", &compact[..8]);
+
+        let resolved = resolve_project_id(&rt, &wildcard_input).await.unwrap();
+        assert_eq!(
+            resolved, None,
+            "a %-bearing project argument must not resolve via a wildcard LIKE scan"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_id_resolves_compact_prefix_over_8_chars() {
+        let rt = KhiveRuntime::memory().unwrap();
+        let token = rt.authorize(Namespace::local()).unwrap();
+        let project = rt
+            .create_entity(
+                &token,
+                "project",
+                None,
+                "CompactIngestTest",
+                None,
+                None,
+                vec![],
+            )
+            .await
+            .unwrap();
+        let compact = project.id.simple().to_string();
+
+        let resolved = resolve_id(&rt, &token, &compact[..16]).await.unwrap();
+        assert_eq!(resolved, Some(project.id));
+    }
+}
+
+/// PR #816 r3 Major finding: `find_document_for_path` bound an unescaped
+/// path into a `LIKE` pattern (`%`/`_` in a filename became pattern
+/// wildcards) and picked whichever candidate the unordered `LIMIT 1` scan
+/// happened to return first, even when an exact match existed.
+#[cfg(test)]
+mod find_document_for_path_tests {
+    use super::*;
+    use khive_runtime::Namespace;
+
+    async fn create_document(rt: &KhiveRuntime, token: &NamespaceToken, source_uri: &str) -> Uuid {
+        rt.create_entity(
+            token,
+            "document",
+            None,
+            source_uri,
+            None,
+            Some(json!({ "source_uri": source_uri })),
+            vec![],
+        )
+        .await
+        .unwrap()
+        .id
+    }
+
+    #[tokio::test]
+    async fn path_with_like_wildcards_resolves_only_itself() {
+        let rt = KhiveRuntime::memory().unwrap();
+        let token = rt.authorize(Namespace::local()).unwrap();
+
+        // Neither document's `source_uri` matches `path` exactly, so
+        // resolution must fall through to the suffix-`LIKE` scan. Under the
+        // pre-fix unescaped pattern, `%` matches zero-or-more chars and `_`
+        // matches exactly one char, so this decoy (`100` + "" + "Q" +
+        // `done.rs`) would incorrectly satisfy `LIKE '%src/100%_done.rs'`.
+        // With `%`/`_` escaped, the pattern requires the literal substring
+        // `100%_done.rs` and the decoy no longer matches.
+        let path = "src/100%_done.rs";
+        let decoy_source_uri = "prefix/src/100Qdone.rs";
+        create_document(&rt, &token, decoy_source_uri).await;
+
+        let resolved = find_document_for_path(&rt, &token, path).await.unwrap();
+        assert_eq!(
+            resolved, None,
+            "a % or _ in the path must be matched literally, not as a LIKE wildcard"
+        );
+    }
+
+    #[tokio::test]
+    async fn exact_match_wins_over_wildcard_broadened_candidate() {
+        let rt = KhiveRuntime::memory().unwrap();
+        let token = rt.authorize(Namespace::local()).unwrap();
+
+        let path = "crates/khive-pack-git/src/ingest.rs";
+        let broadened_suffix_path = "other/crates/khive-pack-git/src/ingest.rs";
+        // Created first so an unordered `LIMIT 1` scan without exact-match
+        // priority would be free to return it instead of the exact match.
+        create_document(&rt, &token, broadened_suffix_path).await;
+        let exact_id = create_document(&rt, &token, path).await;
+
+        let resolved = find_document_for_path(&rt, &token, path).await.unwrap();
+        assert_eq!(
+            resolved,
+            Some(exact_id),
+            "an exact source_uri match must always win over a suffix-LIKE candidate"
+        );
+    }
+
+    /// PR #816 r5 Major finding: running the exact-match read and the
+    /// LIKE-fallback read as two separate awaited queries left a TOCTOU gap
+    /// where a document inserted between them could still lose to the
+    /// unordered fallback `LIMIT 1`. Resolution must now happen in one
+    /// query/snapshot: both candidates are visible to the same `SELECT`, and
+    /// the `ORDER BY` — not read ordering — decides the exact match wins.
+    #[tokio::test]
+    async fn single_query_snapshot_prefers_exact_over_broadened() {
+        let rt = KhiveRuntime::memory().unwrap();
+        let token = rt.authorize(Namespace::local()).unwrap();
+
+        let path = "crates/khive-pack-git/src/toctou.rs";
+        let broadened_suffix_path = "other/crates/khive-pack-git/src/toctou.rs";
+        let exact_id = create_document(&rt, &token, path).await;
+        create_document(&rt, &token, broadened_suffix_path).await;
+
+        let resolved = find_document_for_path(&rt, &token, path).await.unwrap();
+        assert_eq!(
+            resolved,
+            Some(exact_id),
+            "a single query covering both exact and broadened candidates \
+             must still rank the exact match first, regardless of insertion order"
         );
     }
 }
