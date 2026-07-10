@@ -591,7 +591,7 @@ fn head_sha_reads_the_real_current_commit() {
     assert!(sha.chars().all(|c| c.is_ascii_hexdigit()));
 }
 
-/// Review round-1 [Medium]-3 remediation: the approved design's mandatory
+/// Review round-1 \[Medium\]-3 remediation: the approved design's mandatory
 /// `max_items = 4` partial-side-effect fixture (`architect-2/approved_design.md`
 /// §5), driven through the real public `git.digest` verb
 /// (`registry.dispatch`, an HTTPS remote source, and a fake `gh`) rather than
@@ -859,7 +859,7 @@ async fn public_verb_partial_side_effects_survive_commit_snapshot_recovery() {
     std::env::remove_var("KHIVE_TEST_GIT_FAIL_NAME_ONLY_UNTIL");
 }
 
-/// Review round-2 [High]-1 remediation (issue #765): the public `git.digest`
+/// Review round-2 \[High\]-1 remediation (issue #765): the public `git.digest`
 /// verb must refuse a markerless, cache-key-shaped real Git directory
 /// sitting at the scratch-cache slot path rather than fetching into it or
 /// making it eligible for later deletion by the recovery path -- driven
@@ -1003,7 +1003,7 @@ fn loose_object_path(repo: &Path, sha: &str) -> std::path::PathBuf {
     repo.join(".git/objects").join(&sha[..2]).join(&sha[2..])
 }
 
-/// Review round-2 [Medium] finding (issue #765 follow-up, PR #788): every
+/// Review round-2 \[Medium\] finding (issue #765 follow-up, PR #788): every
 /// test above proves `RemoteCommitRecovery`'s retry orchestration against a
 /// PATH-shim that scripts a plausible-looking diagnostic string -- none of
 /// them prove `git fetch --refetch` actually restores a missing object in a

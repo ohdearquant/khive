@@ -6,7 +6,9 @@
 use std::sync::{Arc, RwLock};
 
 use khive_db::StorageBackend;
-use khive_gate::{AllowAllGate, GateRequest};
+#[cfg(test)]
+use khive_gate::AllowAllGate;
+use khive_gate::GateRequest;
 use khive_storage::{EntityStore, EventStore, GraphStore, NoteStore, SqlAccess};
 use khive_types::{EdgeEndpointRule, Namespace};
 use lattice_embed::{EmbeddingModel, EmbeddingService};
@@ -269,16 +271,10 @@ impl KhiveRuntime {
     pub fn memory() -> RuntimeResult<Self> {
         Self::new(RuntimeConfig {
             db_path: None,
-            default_namespace: Namespace::local(),
-            embedding_model: None,
-            additional_embedding_models: vec![],
-            gate: Arc::new(AllowAllGate),
             packs: vec!["kg".to_string()],
-            backend_id: BackendId::main(),
             brain_profile: None,
-            visible_namespaces: vec![],
-            allowed_outbound_namespaces: vec![],
             actor_id: None,
+            ..RuntimeConfig::no_embeddings()
         })
     }
 

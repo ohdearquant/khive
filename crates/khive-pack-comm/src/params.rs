@@ -177,6 +177,30 @@ fn default_stale_minutes() -> i64 {
     20
 }
 
+/// Parameters for `comm.cursor_get` — reads the persisted channel poll
+/// checkpoint for `(channel_kind, channel_slug)`, or `null` if none exists.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct CursorGetParams {
+    pub channel_kind: String,
+    pub channel_slug: String,
+}
+
+/// Parameters for `comm.cursor_commit` — persists a channel poll checkpoint
+/// for `(channel_kind, channel_slug)`, replacing any prior row for that
+/// identity. Only the daemon's channel poll loop calls this, after every
+/// envelope in the page has been durably accepted by `comm.ingest`.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct CursorCommitParams {
+    pub channel_kind: String,
+    pub channel_slug: String,
+    pub source: String,
+    pub generation: u64,
+    #[serde(default)]
+    pub high_water: Option<u64>,
+}
+
 pub(crate) fn deser<T: serde::de::DeserializeOwned>(params: Value) -> Result<T, RuntimeError> {
     serde_json::from_value(params)
         .map_err(|e| RuntimeError::InvalidInput(format!("bad params: {e}")))

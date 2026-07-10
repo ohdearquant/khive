@@ -202,8 +202,14 @@ pub struct RuntimeConfig {
     pub db_path: Option<std::path::PathBuf>,
     /// Namespace used when no explicit namespace is provided.
     pub default_namespace: Namespace,
-    /// Local embedding model. `None` disables embedding and hybrid vector search;
-    /// `hybrid_search` then falls back to text-only.
+    /// Local embedding model. `None` alone does not disable embedding: setting
+    /// only this field to `None` while `additional_embedding_models` is
+    /// non-empty still registers those models. Both `embedding_model` and
+    /// `additional_embedding_models` must be empty to disable built-in
+    /// embedding model registration, at which point `hybrid_search` falls back
+    /// to text-only. Use [`RuntimeConfig::no_embeddings`] to clear both fields
+    /// together — it is the canonical constructor for this. Custom embedder
+    /// providers registered later by packs are not affected by this field.
     ///
     /// Deprecated: embedding engines move to a per-pack `EmbedderRegistry`.
     /// This field persists for backward compatibility until the embedder registry
@@ -330,6 +336,38 @@ impl Default for RuntimeConfig {
             visible_namespaces: vec![],
             allowed_outbound_namespaces: vec![],
             actor_id,
+        }
+    }
+}
+
+impl RuntimeConfig {
+    /// Build a `RuntimeConfig` with embedding disabled entirely (issue #396).
+    ///
+    /// `embedding_model` and `additional_embedding_models` are computed
+    /// *independently* inside [`Default::default`] (see above): the former from
+    /// `KHIVE_EMBEDDING_MODEL`, the latter from `KHIVE_ADDITIONAL_EMBEDDING_MODELS`
+    /// (falling back to seeding `ParaphraseMultilingualMiniLmL12V2` when that var
+    /// is unset). Writing `RuntimeConfig { embedding_model: None,
+    /// ..RuntimeConfig::default() }` therefore does *not* produce a model-less
+    /// runtime: `additional_embedding_models` still carries the env-driven
+    /// fallback seed, `configured_embedding_models` still reports it, and the
+    /// note-write path fans out embedding to every *registered* model regardless
+    /// of `embedding_model` — so the first `memory.remember` on a machine without
+    /// local model files hard-fails instead of degrading to FTS-only.
+    ///
+    /// This constructor clears both fields together and is the one ergonomic,
+    /// correct spelling for "no embed runtime". Model-less machines (CI runners,
+    /// fresh installs without local model files) should use it instead of the
+    /// two-field struct-update form above.
+    ///
+    /// Deliberately ignores `KHIVE_ADDITIONAL_EMBEDDING_MODELS`: a caller
+    /// reaching for `no_embeddings()` wants zero embedders unconditionally, not
+    /// "zero unless the environment happens to disagree".
+    pub fn no_embeddings() -> Self {
+        Self {
+            embedding_model: None,
+            additional_embedding_models: Vec::new(),
+            ..Self::default()
         }
     }
 }
@@ -811,6 +849,65 @@ mod resolve_project_actor_id_tests {
             resolve_project_actor_id(Some(&path)).expect("no error"),
             None,
             "a config file with no [actor] section must resolve to None"
+        );
+    }
+}
+
+#[cfg(test)]
+mod no_embeddings_tests {
+    use super::*;
+    use serial_test::serial;
+
+    #[test]
+    fn no_embeddings_clears_both_fields() {
+        let config = RuntimeConfig::no_embeddings();
+        assert_eq!(config.embedding_model, None);
+        assert!(config.additional_embedding_models.is_empty());
+        assert!(
+            configured_embedding_models(&config).is_empty(),
+            "no_embeddings() must yield zero configured embedders"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn no_embeddings_ignores_additional_env_override() {
+        // no_embeddings() is an unconditional opt-out: even if the caller's
+        // environment sets KHIVE_ADDITIONAL_EMBEDDING_MODELS, the resulting
+        // config must still report zero embedders.
+        std::env::set_var("KHIVE_ADDITIONAL_EMBEDDING_MODELS", "paraphrase");
+        let config = RuntimeConfig::no_embeddings();
+        std::env::remove_var("KHIVE_ADDITIONAL_EMBEDDING_MODELS");
+
+        assert!(config.additional_embedding_models.is_empty());
+        assert!(configured_embedding_models(&config).is_empty());
+    }
+
+    #[test]
+    #[serial]
+    fn default_still_seeds_additional_models_when_env_unset() {
+        // Regression guard for issue #396's root cause: `Default` must keep
+        // computing `embedding_model` and `additional_embedding_models`
+        // independently. `no_embeddings()` is a new opt-out constructor, not a
+        // change to `Default`'s existing (env-driven) seeding behavior.
+        std::env::remove_var("KHIVE_ADDITIONAL_EMBEDDING_MODELS");
+        let config = RuntimeConfig::default();
+
+        assert_eq!(
+            config.additional_embedding_models,
+            vec![EmbeddingModel::ParaphraseMultilingualMiniLmL12V2]
+        );
+
+        // The bug shape from #396: overriding only `embedding_model` via
+        // struct-update syntax does not clear `additional_embedding_models`.
+        let buggy_form = RuntimeConfig {
+            embedding_model: None,
+            ..RuntimeConfig::default()
+        };
+        assert!(
+            !buggy_form.additional_embedding_models.is_empty(),
+            "Default's independent-field seeding must remain unchanged; \
+             no_embeddings() is the fix, not a change to Default"
         );
     }
 }

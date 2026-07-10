@@ -1,18 +1,30 @@
 //! `EmailChannel` — implements the `Channel` trait for email transport.
 
+use std::num::NonZeroU32;
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use khive_channel::{Channel, ChannelEnvelope, ChannelError};
+use khive_channel::{
+    Channel, ChannelCheckpoint, ChannelEnvelope, ChannelError, ChannelPollPage,
+    StoredChannelCheckpoint,
+};
 use tracing::{debug, warn};
 
 use crate::auth_results;
 use crate::config::{EmailAuth, EmailChannelConfig};
-use crate::connector::imap::ImapFetcher;
+use crate::connector::imap::{ImapFetcher, ImapProgress, MalformedReason, SelectedMessage};
 use crate::connector::smtp::SmtpSender;
 use crate::connector::{MailAddress, RawEmail};
 use crate::oauth::TokenProvider;
+
+/// Literal IMAP folder this connector selects. Not the configured mailbox
+/// address (which identifies the account/credential, not the folder).
+const IMAP_FOLDER: &str = "INBOX";
+
+/// Page size for both the legacy `poll` path and the checkpointed
+/// `poll_page` path.
+const IMAP_PAGE_LIMIT: usize = 50;
 
 /// Reason a message failed the attribution gate (ADR-056 Amendment
 /// 2026-07-02) and was quarantined instead of attributed to the maintainer.
@@ -27,6 +39,12 @@ enum QuarantineReason {
     Unaligned,
     /// Domain authentication passed, but the sender is not on the maintainer allowlist.
     OffAllowlist,
+    /// The `UID FETCH` response carried no RFC822 body for this UID (khive
+    /// #449 High fix: a durable terminal disposition, never a silent drop).
+    MissingBody,
+    /// An RFC822 body was present but could not be parsed (khive #449 High
+    /// fix: a durable terminal disposition, never a silent drop).
+    ParseFailure,
 }
 
 impl std::fmt::Display for QuarantineReason {
@@ -36,7 +54,18 @@ impl std::fmt::Display for QuarantineReason {
             QuarantineReason::DmarcFail => "dmarc-fail",
             QuarantineReason::Unaligned => "unaligned",
             QuarantineReason::OffAllowlist => "off-allowlist",
+            QuarantineReason::MissingBody => "missing-body",
+            QuarantineReason::ParseFailure => "parse-failure",
         })
+    }
+}
+
+impl From<MalformedReason> for QuarantineReason {
+    fn from(reason: MalformedReason) -> Self {
+        match reason {
+            MalformedReason::MissingBody => QuarantineReason::MissingBody,
+            MalformedReason::ParseFailure => QuarantineReason::ParseFailure,
+        }
     }
 }
 
@@ -255,6 +284,163 @@ impl EmailChannel {
         env
     }
 
+    /// Build the envelope recorded for a selected UID that could not be
+    /// durably parsed into a message (khive #449 High fix: a missing RFC822
+    /// body or an unparseable one). Unlike [`Self::quarantine_envelope`],
+    /// this is never gated by `quarantine_store` -- a data-integrity failure
+    /// must always leave a queryable record, never a silent drop, since
+    /// dropping it here is the only way this UID's disposition could be lost
+    /// before the cursor advances past it.
+    fn malformed_quarantine_envelope(
+        &self,
+        uid: u32,
+        imap_external_id: &str,
+        reason: QuarantineReason,
+    ) -> ChannelEnvelope {
+        let to = format!("email:{}", self.maintainer_address());
+        let body =
+            format!("(khive: IMAP message UID {uid} could not be parsed and was quarantined)");
+        let mut env = ChannelEnvelope::new("email:quarantine", to, body);
+        env = env.with_external_id(imap_external_id);
+        env.metadata
+            .insert("quarantined".to_string(), "true".to_string());
+        env.metadata
+            .insert("quarantine_reason".to_string(), reason.to_string());
+        env
+    }
+
+    /// This channel's stable, non-secret checkpoint identity.
+    ///
+    /// Compared verbatim (never parsed) against a stored checkpoint's
+    /// `source` to detect a host/port/mailbox/folder configuration change —
+    /// in which case the stored generation/high-water must not be applied to
+    /// the current (different) source.
+    fn checkpoint_source(&self) -> String {
+        format!(
+            "imap+tls:{}:{}:{}:{}",
+            self.config.imap_host.to_lowercase(),
+            self.config.imap_port,
+            self.config.mailbox,
+            IMAP_FOLDER
+        )
+    }
+
+    /// Decode a stored checkpoint into the connector-level [`ImapProgress`],
+    /// plus the `committed_at` recovery floor (only when the source matches).
+    ///
+    /// A source mismatch or absent checkpoint yields default (empty)
+    /// progress and no recovery floor — a different account's high-water or
+    /// timestamp must never apply to this one. A persisted value that does
+    /// not fit a nonzero `u32` fails closed with `ChannelError::Config`
+    /// rather than silently resetting.
+    fn decode_progress(
+        &self,
+        checkpoint: Option<&StoredChannelCheckpoint>,
+    ) -> Result<(ImapProgress, Option<DateTime<Utc>>), ChannelError> {
+        let Some(stored) = checkpoint else {
+            return Ok((ImapProgress::default(), None));
+        };
+        if stored.checkpoint.source != self.checkpoint_source() {
+            return Ok((ImapProgress::default(), None));
+        }
+
+        let uid_validity = u32::try_from(stored.checkpoint.generation)
+            .ok()
+            .and_then(NonZeroU32::new)
+            .ok_or_else(|| {
+                ChannelError::Config(format!(
+                    "persisted IMAP checkpoint generation {} is not a valid nonzero u32",
+                    stored.checkpoint.generation
+                ))
+            })?;
+        let last_seen_uid =
+            match stored.checkpoint.high_water {
+                None => None,
+                Some(h) => Some(u32::try_from(h).ok().and_then(NonZeroU32::new).ok_or_else(
+                    || {
+                        ChannelError::Config(format!(
+                            "persisted IMAP checkpoint high_water {h} is not a valid nonzero u32"
+                        ))
+                    },
+                )?),
+            };
+
+        Ok((
+            ImapProgress {
+                uid_validity: Some(uid_validity),
+                last_seen_uid,
+            },
+            Some(stored.committed_at),
+        ))
+    }
+
+    /// Encode connector-level progress into the transport-neutral checkpoint
+    /// the poll coordinator persists.
+    fn encode_checkpoint(&self, progress: ImapProgress) -> ChannelCheckpoint {
+        ChannelCheckpoint {
+            source: self.checkpoint_source(),
+            generation: progress
+                .uid_validity
+                .map(|v| u64::from(v.get()))
+                .unwrap_or(0),
+            high_water: progress.last_seen_uid.map(|v| u64::from(v.get())),
+        }
+    }
+
+    /// Run the gate/quarantine disposition loop over a fetched batch,
+    /// producing the envelopes ready for `comm.ingest`. Extracted from `poll`
+    /// so `poll_page` shares the exact same per-message logic.
+    ///
+    /// Every [`SelectedMessage`] produces exactly one disposition here (khive
+    /// #449 High fix): a parsed email is gated as before, and a
+    /// [`SelectedMessage::Malformed`] entry always becomes a quarantine
+    /// envelope, regardless of `quarantine_store` -- see
+    /// [`Self::malformed_quarantine_envelope`].
+    fn disposition(&self, raw: Vec<SelectedMessage>) -> Vec<ChannelEnvelope> {
+        let mut envelopes = Vec::new();
+        for message in raw {
+            match message {
+                SelectedMessage::Email(email) => {
+                    let uid = email.uid;
+                    match self.gate(&email) {
+                        Ok(()) => envelopes.push(self.to_envelope(*email)),
+                        Err(reason) => {
+                            if self.config.quarantine_store {
+                                envelopes.push(self.quarantine_envelope(&email, reason));
+                            } else {
+                                // Address-free: only the IMAP UID and the quarantine reason
+                                // are logged, never the (possibly forged) From address.
+                                warn!(
+                                    uid,
+                                    reason = %reason,
+                                    "quarantine-store disabled: dropping unattributed message"
+                                );
+                            }
+                        }
+                    }
+                }
+                SelectedMessage::Malformed {
+                    uid,
+                    imap_external_id,
+                    reason,
+                } => {
+                    let reason: QuarantineReason = reason.into();
+                    warn!(
+                        uid,
+                        reason = %reason,
+                        "quarantining permanently unparseable IMAP message"
+                    );
+                    envelopes.push(self.malformed_quarantine_envelope(
+                        uid,
+                        &imap_external_id,
+                        reason,
+                    ));
+                }
+            }
+        }
+        envelopes
+    }
+
     /// Convert a `RawEmail` that has already passed `gate` into a `ChannelEnvelope`.
     fn to_envelope(&self, email: RawEmail) -> ChannelEnvelope {
         // Safe: gate() verified exactly one From entry before this is called.
@@ -333,28 +519,41 @@ impl Channel for EmailChannel {
     }
 
     async fn poll(&self, since: DateTime<Utc>) -> Result<Vec<ChannelEnvelope>, ChannelError> {
-        let raw = self.imap.fetch_since(since, 50).await?;
-        let mut envelopes = Vec::new();
-        for email in raw {
-            let uid = email.uid;
-            match self.gate(&email) {
-                Ok(()) => envelopes.push(self.to_envelope(email)),
-                Err(reason) => {
-                    if self.config.quarantine_store {
-                        envelopes.push(self.quarantine_envelope(&email, reason));
-                    } else {
-                        // Address-free: only the IMAP UID and the quarantine reason
-                        // are logged, never the (possibly forged) From address.
-                        warn!(
-                            uid,
-                            reason = %reason,
-                            "quarantine-store disabled: dropping unattributed message"
-                        );
-                    }
-                }
-            }
-        }
-        Ok(envelopes)
+        let raw = self.imap.fetch_since(since, IMAP_PAGE_LIMIT).await?;
+        Ok(self.disposition(raw))
+    }
+
+    /// Checkpointed poll (issue #449): resolves the durable IMAP
+    /// UIDVALIDITY/high-water progress from `checkpoint`, fetches strictly
+    /// above it (or bootstraps by date on no/mismatched/reset progress), and
+    /// returns a checkpoint candidate for the poll coordinator to persist
+    /// only after every envelope is durably ingested.
+    async fn poll_page(
+        &self,
+        since: DateTime<Utc>,
+        checkpoint: Option<&StoredChannelCheckpoint>,
+    ) -> Result<ChannelPollPage, ChannelError> {
+        let (progress, committed_at) = self.decode_progress(checkpoint)?;
+        let recovery_since = match committed_at {
+            Some(committed_at) => since.min(committed_at),
+            None => since,
+        };
+
+        let page = self
+            .imap
+            .fetch_page(recovery_since, IMAP_PAGE_LIMIT, progress)
+            .await?;
+        let envelopes = self.disposition(page.emails);
+        let next_checkpoint = if page.next_progress == progress {
+            None
+        } else {
+            Some(self.encode_checkpoint(page.next_progress))
+        };
+
+        Ok(ChannelPollPage {
+            envelopes,
+            next_checkpoint,
+        })
     }
 }
 
@@ -368,7 +567,9 @@ fn strip_kind_prefix<'a>(addr: &'a str, kind: &str) -> &'a str {
 mod tests {
     use super::*;
     use crate::config::{EmailAuth, TrustAnchor};
-    use crate::connector::imap::{parse_raw_bytes, ImapConnector, ImapFetcher};
+    use crate::connector::imap::{
+        parse_raw_bytes, ImapConnector, ImapFetchPage, ImapFetcher, ImapProgress,
+    };
     use crate::connector::smtp::{SmtpConnector, SmtpSender};
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
@@ -432,12 +633,21 @@ mod tests {
 
     #[async_trait]
     impl ImapConnector for FixedImap {
-        async fn fetch_since(
+        async fn fetch_page(
             &self,
             _since: DateTime<Utc>,
             _limit: usize,
-        ) -> Result<Vec<RawEmail>, ChannelError> {
-            Ok(self.emails.clone())
+            _progress: crate::connector::imap::ImapProgress,
+        ) -> Result<ImapFetchPage, ChannelError> {
+            Ok(ImapFetchPage {
+                emails: self
+                    .emails
+                    .clone()
+                    .into_iter()
+                    .map(|e| SelectedMessage::Email(Box::new(e)))
+                    .collect(),
+                next_progress: crate::connector::imap::ImapProgress::default(),
+            })
         }
     }
 
@@ -972,6 +1182,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn quoted_whitespace_smtp_mailfrom_injection_does_not_bypass_gate() {
+        // Regression for the #501 property-tokenizer hardening, driven through
+        // the REAL byte-parsing path (parse_raw_bytes): a quoted
+        // smtp.mailfrom= pvalue containing embedded whitespace and an
+        // attacker-controlled inner "smtp.mailfrom=example.com" must never be
+        // shattered into a separate, alignment-winning property token. The
+        // real envelope domain (evil.com) must be what the gate sees, so this
+        // must quarantine as unaligned, never attribute to the maintainer.
+        let raw = b"Authentication-Results: mx.example.com; spf=pass smtp.mailfrom=\"attacker smtp.mailfrom=example.com \"@evil.com\r\n\
+                    From: maintainer@example.com\r\n\
+                    To: me@example.com\r\n\
+                    Subject: quoted whitespace property injection\r\n\
+                    \r\n\
+                    body";
+        let email = parse_raw_bytes(1, raw, "imap.example.com", 1).unwrap();
+        let ch = build_channel("maintainer@example.com", vec![email]);
+        let envs = ch.poll(Utc::now()).await.unwrap();
+        assert_eq!(envs.len(), 1);
+        assert_eq!(
+            envs[0].from, "email:quarantine",
+            "a forged smtp.mailfrom hidden inside a quoted pvalue's embedded whitespace must never attribute mail"
+        );
+        assert_eq!(
+            envs[0]
+                .metadata
+                .get("quarantine_reason")
+                .map(String::as_str),
+            Some("unaligned")
+        );
+    }
+
+    #[tokio::test]
     async fn spf_pass_unaligned_envelope_from_quarantines_unaligned() {
         let raw = b"Authentication-Results: mx.example.com; spf=pass smtp.mailfrom=alice@attacker.net\r\n\
                     From: maintainer@example.com\r\n\
@@ -1232,6 +1474,76 @@ mod tests {
         );
     }
 
+    // --- checkpoint decode (issue #449) ---
+
+    #[test]
+    fn source_mismatch_drops_stored_progress() {
+        let ch = build_channel_from(make_config("maintainer@example.com"), vec![]);
+        let stored = StoredChannelCheckpoint {
+            checkpoint: ChannelCheckpoint {
+                source: "imap+tls:other.example.com:993:other@example.com:INBOX".to_string(),
+                generation: 42,
+                high_water: Some(10),
+            },
+            committed_at: Utc::now(),
+        };
+        let (progress, committed_at) = ch.decode_progress(Some(&stored)).unwrap();
+        assert_eq!(
+            progress,
+            ImapProgress::default(),
+            "a source mismatch (different host/port/mailbox) must drop stored progress"
+        );
+        assert!(
+            committed_at.is_none(),
+            "a source mismatch must not surface the other source's recovery floor either"
+        );
+    }
+
+    #[test]
+    fn invalid_persisted_imap_width_or_zero_fails_closed() {
+        let ch = build_channel_from(make_config("maintainer@example.com"), vec![]);
+        let source = ch.checkpoint_source();
+
+        let overflowing_generation = StoredChannelCheckpoint {
+            checkpoint: ChannelCheckpoint {
+                source: source.clone(),
+                generation: u64::from(u32::MAX) + 1,
+                high_water: None,
+            },
+            committed_at: Utc::now(),
+        };
+        assert!(
+            ch.decode_progress(Some(&overflowing_generation)).is_err(),
+            "a generation wider than u32 must fail closed, not truncate"
+        );
+
+        let zero_generation = StoredChannelCheckpoint {
+            checkpoint: ChannelCheckpoint {
+                source: source.clone(),
+                generation: 0,
+                high_water: None,
+            },
+            committed_at: Utc::now(),
+        };
+        assert!(
+            ch.decode_progress(Some(&zero_generation)).is_err(),
+            "a zero generation must fail closed, not silently reset to empty progress"
+        );
+
+        let overflowing_high_water = StoredChannelCheckpoint {
+            checkpoint: ChannelCheckpoint {
+                source,
+                generation: 1,
+                high_water: Some(u64::from(u32::MAX) + 1),
+            },
+            committed_at: Utc::now(),
+        };
+        assert!(
+            ch.decode_progress(Some(&overflowing_high_water)).is_err(),
+            "a high_water wider than u32 must fail closed"
+        );
+    }
+
     #[test]
     fn strip_kind_prefix_removes_prefix() {
         assert_eq!(
@@ -1241,6 +1553,385 @@ mod tests {
         assert_eq!(
             strip_kind_prefix("user@example.com", "email"),
             "user@example.com"
+        );
+    }
+
+    // --- poll_page / poll integration (issue #449) ---
+    //
+    // `select_uid_page`/`next_progress` are module-private to `connector::imap`
+    // and covered directly by that module's own tests. The mock below
+    // replicates the same sort/dedup/high-water-filter/truncate contract
+    // inline so these tests can drive the actual `EmailChannel::poll_page`/
+    // `poll` orchestration (disposition, checkpoint encode/decode, source
+    // binding), not just the connector-level helpers in isolation.
+
+    struct KeysetMockImap {
+        validity: NonZeroU32,
+        all_uids: Vec<u32>,
+    }
+
+    impl KeysetMockImap {
+        fn select(&self, limit: usize, progress: ImapProgress) -> Vec<NonZeroU32> {
+            let mut uids = self.all_uids.clone();
+            uids.sort_unstable();
+            uids.dedup();
+            if progress.uid_validity == Some(self.validity) {
+                if let Some(high_water) = progress.last_seen_uid {
+                    uids.retain(|&u| u > high_water.get());
+                }
+            }
+            uids.truncate(limit);
+            uids.into_iter()
+                .map(|u| NonZeroU32::new(u).unwrap())
+                .collect()
+        }
+
+        fn email_for(&self, uid: NonZeroU32) -> RawEmail {
+            let mut email = make_email(
+                "sender@example.com",
+                &format!(
+                    "imap:mail.example.com:{}:{}",
+                    self.validity.get(),
+                    uid.get()
+                ),
+            );
+            email.uid = uid.get();
+            email
+        }
+    }
+
+    #[async_trait]
+    impl ImapConnector for KeysetMockImap {
+        async fn fetch_page(
+            &self,
+            _since: DateTime<Utc>,
+            limit: usize,
+            progress: ImapProgress,
+        ) -> Result<ImapFetchPage, ChannelError> {
+            let selected = self.select(limit, progress);
+            let emails: Vec<SelectedMessage> = selected
+                .iter()
+                .map(|&u| SelectedMessage::Email(Box::new(self.email_for(u))))
+                .collect();
+            let next_progress = match selected.iter().map(|u| u.get()).max() {
+                Some(max) => ImapProgress {
+                    uid_validity: Some(self.validity),
+                    last_seen_uid: NonZeroU32::new(max),
+                },
+                None if progress.uid_validity == Some(self.validity) => progress,
+                None => ImapProgress {
+                    uid_validity: Some(self.validity),
+                    last_seen_uid: None,
+                },
+            };
+            Ok(ImapFetchPage {
+                emails,
+                next_progress,
+            })
+        }
+    }
+
+    fn build_keyset_channel(mailbox: &str, validity: u32, all_uids: Vec<u32>) -> EmailChannel {
+        let mut config = make_config("maintainer@example.com");
+        config.mailbox = mailbox.to_string();
+        config.username = mailbox.to_string();
+        let smtp = SmtpSender::with_connector(RecordingSmtp {
+            calls: Arc::new(Mutex::new(Vec::new())),
+        });
+        let imap = ImapFetcher::with_connector(KeysetMockImap {
+            validity: NonZeroU32::new(validity).unwrap(),
+            all_uids,
+        });
+        EmailChannel::with_connectors(config, smtp, imap)
+    }
+
+    #[tokio::test]
+    async fn poll_page_resumes_from_persisted_checkpoint_across_restart() {
+        let since = Utc::now();
+
+        // First "process": drains the initial backlog 1..=5 and produces a
+        // checkpoint candidate.
+        let first = build_keyset_channel("a@example.com", 7, vec![1, 2, 3, 4, 5]);
+        let page1 = first.poll_page(since, None).await.unwrap();
+        assert_eq!(page1.envelopes.len(), 5);
+        let checkpoint = page1
+            .next_checkpoint
+            .expect("non-empty page must checkpoint");
+        let stored = StoredChannelCheckpoint {
+            checkpoint,
+            committed_at: Utc::now(),
+        };
+
+        // A brand-new `EmailChannel` instance (simulating a process restart:
+        // no shared in-memory state) sees the same 1..=5 backlog plus one
+        // newly-arrived UID 6.
+        let restarted = build_keyset_channel("a@example.com", 7, vec![1, 2, 3, 4, 5, 6]);
+        let page2 = restarted.poll_page(since, Some(&stored)).await.unwrap();
+        assert_eq!(
+            page2.envelopes.len(),
+            1,
+            "a fresh instance given the persisted checkpoint must fetch zero \
+             already-seen messages"
+        );
+        assert_eq!(
+            page2.envelopes[0].external_id.as_deref(),
+            Some("imap:mail.example.com:7:6"),
+            "the fresh instance must correctly pick up the newly-arrived UID"
+        );
+        assert_eq!(
+            page2.next_checkpoint.unwrap().high_water,
+            Some(6),
+            "checkpoint must advance to the newly-arrived UID"
+        );
+    }
+
+    #[tokio::test]
+    async fn poll_page_two_mailboxes_have_independent_cursors() {
+        let since = Utc::now();
+        let mailbox_a_checkpoint = StoredChannelCheckpoint {
+            checkpoint: ChannelCheckpoint {
+                source: "imap+tls:imap.example.com:993:a@example.com:INBOX".to_string(),
+                generation: 99,
+                high_water: Some(50),
+            },
+            committed_at: Utc::now(),
+        };
+
+        // Mailbox B has its own small, low-numbered backlog untouched by A's
+        // checkpoint.
+        let mailbox_b = build_keyset_channel("b@example.com", 5, vec![1, 2, 3]);
+        let page = mailbox_b
+            .poll_page(since, Some(&mailbox_a_checkpoint))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            page.envelopes.len(),
+            3,
+            "mailbox A's checkpoint must be rejected by B's source check, leaving \
+             B's own backlog untouched"
+        );
+        assert_eq!(page.next_checkpoint.unwrap().generation, 5);
+    }
+
+    #[tokio::test]
+    async fn poll_page_retried_call_with_uncommitted_checkpoint_is_idempotent() {
+        let since = Utc::now();
+        let ch = build_keyset_channel("a@example.com", 9, vec![1, 2, 3]);
+
+        let first = ch.poll_page(since, None).await.unwrap();
+        // Simulate a retry after a crash between fetch and cursor commit: the
+        // coordinator calls poll_page again with the same (uncommitted) `None`.
+        let retry = ch.poll_page(since, None).await.unwrap();
+
+        let ids = |p: &ChannelPollPage| {
+            p.envelopes
+                .iter()
+                .map(|e| e.external_id.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            ids(&first),
+            ids(&retry),
+            "retrying with the same uncommitted checkpoint must return \
+             byte-identical envelopes"
+        );
+        assert_eq!(
+            first.next_checkpoint.unwrap(),
+            retry.next_checkpoint.unwrap(),
+            "retrying with the same uncommitted checkpoint must return an \
+             identical checkpoint candidate"
+        );
+    }
+
+    #[tokio::test]
+    async fn poll_page_quarantine_disabled_drop_still_advances_checkpoint() {
+        let since = Utc::now();
+        let mut config = make_config("maintainer@example.com");
+        config.quarantine_store = false;
+        let smtp = SmtpSender::with_connector(RecordingSmtp {
+            calls: Arc::new(Mutex::new(Vec::new())),
+        });
+
+        // A message with no Authentication-Results header fails the gate
+        // (AuthAbsent) and, with quarantine_store disabled, is dropped rather
+        // than emitted as an envelope.
+        let mut gate_failing = make_email("forged@example.com", "imap:mail.example.com:3:1");
+        gate_failing.authentication_results.clear();
+        gate_failing.uid = 1;
+
+        struct SingleGateFailingImap {
+            email: RawEmail,
+        }
+        #[async_trait]
+        impl ImapConnector for SingleGateFailingImap {
+            async fn fetch_page(
+                &self,
+                _since: DateTime<Utc>,
+                _limit: usize,
+                _progress: ImapProgress,
+            ) -> Result<ImapFetchPage, ChannelError> {
+                Ok(ImapFetchPage {
+                    emails: vec![SelectedMessage::Email(Box::new(self.email.clone()))],
+                    next_progress: ImapProgress {
+                        uid_validity: NonZeroU32::new(3),
+                        last_seen_uid: NonZeroU32::new(self.email.uid),
+                    },
+                })
+            }
+        }
+        let imap = ImapFetcher::with_connector(SingleGateFailingImap {
+            email: gate_failing,
+        });
+        let ch = EmailChannel::with_connectors(config, smtp, imap);
+
+        let page = ch.poll_page(since, None).await.unwrap();
+        assert!(
+            page.envelopes.is_empty(),
+            "a gate-failing message with quarantine_store disabled must be dropped, \
+             not emitted"
+        );
+        assert_eq!(
+            page.next_checkpoint.unwrap().high_water,
+            Some(1),
+            "the checkpoint must still advance past the dropped message's UID -- \
+             checkpoint advancement is bound to the selected UID page, not to \
+             which envelopes disposition actually emits"
+        );
+    }
+
+    /// khive #449 High follow-up (Medium-2): the connector-level
+    /// `one_poison_uid_does_not_starve_51_later_valid_uids_and_cursor_passes_it`
+    /// test in `imap.rs` only proves `process_selected_page` assigns the
+    /// poison UID a `SelectedMessage::Malformed` disposition -- it never
+    /// proves that disposition survives into the actual `ChannelEnvelope`
+    /// `EmailChannel::poll_page` hands to `comm.ingest`. Drives a
+    /// `SelectedMessage::Malformed` entry (as the IMAP connector would
+    /// return it for an unparseable UID) through `poll_page`'s public
+    /// pipeline and asserts the resulting envelope carries the stable
+    /// `imap:{host}:{uidvalidity}:{uid}` external ID plus durable quarantine
+    /// metadata -- exactly what the daemon's ingest/query layer needs to
+    /// prove a durable quarantine record, not just an intermediate value.
+    #[tokio::test]
+    async fn poll_page_malformed_uid_produces_a_stable_external_id_and_quarantine_metadata() {
+        let since = Utc::now();
+        let config = make_config("maintainer@example.com");
+        let smtp = SmtpSender::with_connector(RecordingSmtp {
+            calls: Arc::new(Mutex::new(Vec::new())),
+        });
+
+        struct PoisonUidImap {
+            good: RawEmail,
+        }
+        #[async_trait]
+        impl ImapConnector for PoisonUidImap {
+            async fn fetch_page(
+                &self,
+                _since: DateTime<Utc>,
+                _limit: usize,
+                _progress: ImapProgress,
+            ) -> Result<ImapFetchPage, ChannelError> {
+                Ok(ImapFetchPage {
+                    emails: vec![
+                        SelectedMessage::Malformed {
+                            uid: 1,
+                            imap_external_id: "imap:imap.example.com:4:1".to_string(),
+                            reason: MalformedReason::MissingBody,
+                        },
+                        SelectedMessage::Email(Box::new(self.good.clone())),
+                    ],
+                    next_progress: ImapProgress {
+                        uid_validity: NonZeroU32::new(4),
+                        last_seen_uid: NonZeroU32::new(2),
+                    },
+                })
+            }
+        }
+
+        let mut good = make_email("sender@example.com", "imap:imap.example.com:4:2");
+        good.uid = 2;
+        let imap = ImapFetcher::with_connector(PoisonUidImap { good });
+        let ch = EmailChannel::with_connectors(config, smtp, imap);
+
+        let page = ch.poll_page(since, None).await.unwrap();
+        assert_eq!(
+            page.envelopes.len(),
+            2,
+            "the poison UID must still produce a durable quarantine envelope \
+             alongside the valid message, not a dropped/short page"
+        );
+
+        let quarantined = page
+            .envelopes
+            .iter()
+            .find(|e| e.external_id.as_deref() == Some("imap:imap.example.com:4:1"))
+            .expect(
+                "the malformed UID's stable external_id must be present on the \
+                 envelope actually handed to comm.ingest",
+            );
+        assert_eq!(
+            quarantined.from, "email:quarantine",
+            "a malformed UID must be attributed to the fixed quarantine marker"
+        );
+        assert_eq!(
+            quarantined.metadata.get("quarantined").map(String::as_str),
+            Some("true"),
+            "the envelope must carry durable quarantine metadata for comm.ingest \
+             to persist"
+        );
+        assert_eq!(
+            quarantined
+                .metadata
+                .get("quarantine_reason")
+                .map(String::as_str),
+            Some("missing-body"),
+            "the quarantine reason must be preserved onto the persisted envelope"
+        );
+
+        assert_eq!(
+            page.next_checkpoint.unwrap().high_water,
+            Some(2),
+            "the checkpoint candidate must advance past the poison UID"
+        );
+    }
+
+    #[tokio::test]
+    async fn poll_drains_75_same_day_backlog_across_repeated_calls_via_production_entrypoint() {
+        // Drives the actual production entrypoint (`EmailChannel::poll`, the
+        // literal call `serve.rs` makes) with the issue's own numbers: 75
+        // same-day UIDs, page limit 50, shuffled input mirroring HashSet
+        // iteration-order noise.
+        let mut all_uids: Vec<u32> = (1..=75).rev().collect();
+        all_uids.extend(1..=10); // duplicates
+        let ch = build_keyset_channel("a@example.com", 42, all_uids);
+
+        let since = Utc::now();
+        let page1 = ch.poll(since).await.unwrap();
+        assert_eq!(page1.len(), 50, "first poll must return exactly 50");
+        let page2 = ch.poll(since).await.unwrap();
+        assert_eq!(
+            page2.len(),
+            25,
+            "second poll must return the remaining 25, not a repeat of the first 50"
+        );
+        let page3 = ch.poll(since).await.unwrap();
+        assert!(
+            page3.is_empty(),
+            "third poll must be empty; backlog fully drained"
+        );
+
+        let mut all_ids: Vec<String> = page1
+            .iter()
+            .chain(page2.iter())
+            .map(|e| e.external_id.clone().unwrap())
+            .collect();
+        all_ids.sort();
+        all_ids.dedup();
+        assert_eq!(
+            all_ids.len(),
+            75,
+            "all 75 external IDs must be distinct across both calls -- none skipped, \
+             none repeated"
         );
     }
 }

@@ -17,7 +17,7 @@ use khive_types::{HandlerDef, ParamDef, Visibility};
 /// The `idx_comm_message_external_id` UNIQUE index is NOT listed here; it is
 /// created by the V5 schema migration (`005-unique-comm-external-id.sql`), which
 /// is the sole durable authority for that index.
-pub(crate) static COMM_SCHEMA_PLAN_STMTS: [&str; 3] = [
+pub(crate) static COMM_SCHEMA_PLAN_STMTS: [&str; 4] = [
     "CREATE INDEX IF NOT EXISTS idx_comm_message_direction \
         ON notes(namespace, kind, json_extract(properties, '$.direction'), \
         json_extract(properties, '$.read'), created_at DESC) \
@@ -32,9 +32,33 @@ pub(crate) static COMM_SCHEMA_PLAN_STMTS: [&str; 3] = [
         json_extract(properties, '$.read'), \
         created_at DESC) \
         WHERE deleted_at IS NULL",
+    COMM_CHANNEL_CURSOR_SCHEMA_STMT,
 ];
 
-pub(crate) static COMM_HANDLERS: [HandlerDef; 9] = [
+/// Pack-owned auxiliary cursor table for durable channel poll progress
+/// (issue #449): one row per `(channel_kind, channel_slug)`, holding the
+/// transport-neutral checkpoint fields from `khive_channel::ChannelCheckpoint`.
+/// For IMAP, `generation` is `UIDVALIDITY` and `high_water` is the greatest
+/// durably handled UID. `source` detects a host/port/mailbox/folder change
+/// under the same registry identity, so a stale checkpoint is never applied
+/// to a different configuration.
+///
+/// Idempotent (`CREATE TABLE IF NOT EXISTS`), applied at boot via
+/// `schema_plan` and shared verbatim with `handle_cursor_get`/
+/// `handle_cursor_commit`'s lazy bootstrap for in-memory/test runtimes that
+/// never run the boot-time schema plan.
+pub(crate) const COMM_CHANNEL_CURSOR_SCHEMA_STMT: &str =
+    "CREATE TABLE IF NOT EXISTS comm_channel_cursor (\
+    channel_kind TEXT NOT NULL CHECK (length(trim(channel_kind)) > 0),\
+    channel_slug TEXT NOT NULL CHECK (length(trim(channel_slug)) > 0),\
+    source TEXT NOT NULL CHECK (length(trim(source)) > 0),\
+    generation INTEGER NOT NULL CHECK (generation > 0),\
+    high_water INTEGER CHECK (high_water IS NULL OR high_water > 0),\
+    updated_at INTEGER NOT NULL,\
+    PRIMARY KEY (channel_kind, channel_slug)\
+)";
+
+pub(crate) static COMM_HANDLERS: [HandlerDef; 11] = [
     HandlerDef {
         name: "comm.send",
         description: "Send a message, optionally threaded.",
@@ -360,6 +384,73 @@ pub(crate) static COMM_HANDLERS: [HandlerDef; 9] = [
                 param_type: "integer",
                 required: false,
                 description: "Unread age threshold in minutes. Default 20.",
+            },
+        ],
+    },
+    HandlerDef {
+        name: "comm.cursor_get",
+        description: "Read the persisted channel poll checkpoint for (channel_kind, channel_slug), \
+                       or null if none exists. Subhandler — not callable on the MCP wire; only the \
+                       daemon's channel poll loop (khive #449) calls this.",
+        visibility: Visibility::Subhandler,
+        category: khive_types::VerbCategory::Assertive,
+        params: &[
+            ParamDef {
+                name: "channel_kind",
+                param_type: "string",
+                required: true,
+                description: "Channel kind identifier (e.g. `email`).",
+            },
+            ParamDef {
+                name: "channel_slug",
+                param_type: "string",
+                required: true,
+                description: "Stable per-credential identifier distinguishing accounts of the same kind.",
+            },
+        ],
+    },
+    HandlerDef {
+        name: "comm.cursor_commit",
+        description: "Persist a channel poll checkpoint for (channel_kind, channel_slug), replacing \
+                       any prior row for that identity. Subhandler — not callable on the MCP wire; \
+                       only the daemon's channel poll loop calls this, and only after every envelope \
+                       in the page has been durably accepted by comm.ingest (khive #449).",
+        visibility: Visibility::Subhandler,
+        category: khive_types::VerbCategory::Declaration,
+        params: &[
+            ParamDef {
+                name: "channel_kind",
+                param_type: "string",
+                required: true,
+                description: "Channel kind identifier (e.g. `email`).",
+            },
+            ParamDef {
+                name: "channel_slug",
+                param_type: "string",
+                required: true,
+                description: "Stable per-credential identifier distinguishing accounts of the same kind.",
+            },
+            ParamDef {
+                name: "source",
+                param_type: "string",
+                required: true,
+                description: "Stable, non-secret identity of the remote source/configuration (e.g. \
+                               `imap+tls:{host}:{port}:{mailbox}:INBOX`). A mismatch against the \
+                               stored row's source is how the caller detects a configuration change.",
+            },
+            ParamDef {
+                name: "generation",
+                param_type: "integer",
+                required: true,
+                description: "Remote identity epoch (e.g. IMAP UIDVALIDITY). Must be a positive integer.",
+            },
+            ParamDef {
+                name: "high_water",
+                param_type: "integer",
+                required: false,
+                description: "Greatest durably handled remote sequence value (e.g. IMAP UID). Omit \
+                               or null to reset progress within the generation (e.g. right after a \
+                               UIDVALIDITY change with no messages selected yet).",
             },
         ],
     },

@@ -2247,7 +2247,44 @@ impl KhiveRuntime {
         annotates: Vec<Uuid>,
     ) -> RuntimeResult<Note> {
         self.create_note_inner(
-            token, kind, name, content, salience, None, properties, annotates, None,
+            token, kind, name, content, None, salience, None, properties, annotates, None,
+        )
+        .await
+    }
+
+    /// Like [`Self::create_note`], but lets the caller supply a smaller text
+    /// to send to the vector embedder while the note's stored/FTS-indexed
+    /// `content` remains the full text (issue #764).
+    ///
+    /// `embedding_content`, when `Some`, must be non-empty and a proper
+    /// prefix of `content` — anything else is rejected with `InvalidInput`
+    /// before any write. `None` behaves exactly like [`Self::create_note`].
+    /// Use this when `content` may exceed an embedder's input cap (e.g. a
+    /// very long commit message) and only a capped head prefix should be
+    /// embedded, while the full text is still stored and searchable via FTS.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_note_with_embedding_content(
+        &self,
+        token: &NamespaceToken,
+        kind: &str,
+        name: Option<&str>,
+        content: &str,
+        embedding_content: Option<&str>,
+        salience: Option<f64>,
+        properties: Option<serde_json::Value>,
+        annotates: Vec<Uuid>,
+    ) -> RuntimeResult<Note> {
+        self.create_note_inner(
+            token,
+            kind,
+            name,
+            content,
+            embedding_content,
+            salience,
+            None,
+            properties,
+            annotates,
+            None,
         )
         .await
     }
@@ -2303,6 +2340,7 @@ impl KhiveRuntime {
             kind,
             name,
             content,
+            None,
             salience,
             Some(decay_factor),
             properties,
@@ -2418,6 +2456,7 @@ impl KhiveRuntime {
         kind: &str,
         name: Option<&str>,
         content: &str,
+        embedding_content: Option<&str>,
         salience: Option<f64>,
         decay_factor: Option<f64>,
         properties: Option<serde_json::Value>,
@@ -2432,6 +2471,24 @@ impl KhiveRuntime {
         }
         if let Some(ref p) = properties {
             crate::secret_gate::check_json(p)?;
+        }
+        // `embedding_content` is a caller-supplied alternate vector-embedding
+        // input (issue #764) — it must be a non-empty proper prefix of
+        // `content` (never a superset, an unrelated string, or the full
+        // text) and passes the same secret gate as any other stored/embedded
+        // text. Rejected before any write, same as the checks above.
+        if let Some(ec) = embedding_content {
+            if ec.is_empty() {
+                return Err(RuntimeError::InvalidInput(
+                    "embedding_content must not be empty".into(),
+                ));
+            }
+            if ec.len() >= content.len() || !content.starts_with(ec) {
+                return Err(RuntimeError::InvalidInput(
+                    "embedding_content must be a proper prefix of content".into(),
+                ));
+            }
+            crate::secret_gate::check(ec)?;
         }
         let ns = token.namespace().as_str();
 
@@ -2559,12 +2616,16 @@ impl KhiveRuntime {
         //   - explicit embedding_model → single model (existing behaviour)
         //   - None + any models registered → ALL registered models in parallel
         //   - None + no models configured → skip (text-only)
+        // The effective text sent to every embedder: the caller-supplied
+        // capped override when present, otherwise the full stored content.
+        // FTS indexing above always used the full `note.content` — this cap
+        // affects only the vector-embedding input (issue #764).
+        let embed_text: &str = embedding_content.unwrap_or(content);
+
         if embed_model_names.len() == 1 {
             // Single-model path: preserves original sequential behaviour.
             let model_name = &embed_model_names[0];
-            let vec_result = self
-                .embed_document_with_model(model_name, &note.content)
-                .await;
+            let vec_result = self.embed_document_with_model(model_name, embed_text).await;
 
             // Injection: check VECTOR_FAIL_NS (armed by `arm_vector_fail(ns)`).
             // Fires only when the armed namespace matches this note's namespace,
@@ -2620,7 +2681,7 @@ impl KhiveRuntime {
             // Multi-model path: embed with each model in parallel via spawned tasks,
             // then insert one VectorRecord per model.
             let rt_clone = self.clone();
-            let content_owned = note.content.clone();
+            let content_owned = embed_text.to_string();
             let mut handles = Vec::with_capacity(embed_model_names.len());
             for model_name in &embed_model_names {
                 let rt = rt_clone.clone();
@@ -3608,7 +3669,8 @@ impl KhiveRuntime {
             .map(|ns| ns.as_str().to_string())
             .collect();
         let compiled = khive_query::compile(&ast, &opts)?;
-        let warnings = compiled.warnings;
+        let mut warnings = compiled.warnings;
+        let truncation_check = compiled.truncation_check;
 
         // Convert QueryValue params (query-layer type) to SqlValue (storage-layer type)
         // at the query–storage boundary.
@@ -3630,7 +3692,31 @@ impl KhiveRuntime {
             params,
             label: None,
         };
-        let rows = reader.query_all(stmt).await?;
+        let mut rows = reader.query_all(stmt).await?;
+
+        // When the server-side cap was the binding constraint, the compiled
+        // SQL asked for one extra (sentinel) row. Its presence in the actual
+        // result set — not the requested LIMIT — is the truncation signal
+        // (issue #777): a `LIMIT 1000` that only matches 20 rows must not
+        // warn, and a query with no `LIMIT` that matches 501+ rows must.
+        if let Some(check) = truncation_check {
+            if rows.len() > check.max_limit {
+                rows.truncate(check.max_limit);
+                warnings.push(match check.requested_limit {
+                    Some(requested) => format!(
+                        "result set capped at {} rows; requested limit {requested} exceeds the \
+                         cap — use LIMIT/OFFSET to page through the remaining results",
+                        check.max_limit
+                    ),
+                    None => format!(
+                        "result set capped at {} rows; more than {} rows matched with no LIMIT \
+                         clause — use LIMIT/OFFSET to page through the remaining results",
+                        check.max_limit, check.max_limit
+                    ),
+                });
+            }
+        }
+
         Ok(QueryResult { rows, warnings })
     }
 
@@ -4888,6 +4974,60 @@ mod tests {
         assert!(
             matches!(result.unwrap_err(), RuntimeError::UnknownModel(ref n) if n == "nonexistent-model"),
             "unregistered model name must return UnknownModel"
+        );
+    }
+
+    // ── Issue #396 regression ────────────────────────────────────────────────
+    // `RuntimeConfig::no_embeddings()` must register zero embedders, so
+    // `create_note` never attempts to lazily build a lattice embedding model —
+    // this is what lets `memory.remember` succeed on a machine with no local
+    // model files present (the exact failure mode reported in #396).
+
+    #[tokio::test]
+    async fn no_embeddings_config_registers_zero_embedders() {
+        let config = crate::config::RuntimeConfig {
+            db_path: None,
+            packs: vec!["kg".to_string()],
+            ..crate::config::RuntimeConfig::no_embeddings()
+        };
+        let rt = KhiveRuntime::new(config).expect("runtime construction must succeed");
+
+        assert!(rt.config().embedding_model.is_none());
+        assert!(
+            rt.registered_embedding_model_names().is_empty(),
+            "no_embeddings() runtime must register zero embedders"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_embeddings_runtime_create_note_succeeds_without_model_fanout() {
+        let config = crate::config::RuntimeConfig {
+            db_path: None,
+            packs: vec!["kg".to_string()],
+            ..crate::config::RuntimeConfig::no_embeddings()
+        };
+        let rt = KhiveRuntime::new(config).expect("runtime construction must succeed");
+        let tok = NamespaceToken::local();
+
+        // With zero registered embedders, create_note's embed fan-out list is
+        // empty and no lattice model build is ever attempted -- the write must
+        // succeed (degrading to FTS-only) exactly as #396 requires.
+        let note = rt
+            .create_note(
+                &tok,
+                "memory",
+                None,
+                "issue-396 regression: model-less remember must succeed",
+                Some(0.7),
+                None,
+                vec![],
+            )
+            .await
+            .expect("create_note must succeed with zero registered embedders");
+
+        assert_eq!(
+            note.content,
+            "issue-396 regression: model-less remember must succeed"
         );
     }
 
@@ -8269,6 +8409,104 @@ mod tests {
         );
     }
 
+    // #764: the `embedding_content` override must not bypass the same
+    // FTS/vector compensation the plain `create_note` path already has —
+    // both use `create_note_inner` underneath, but these tests exercise it
+    // through `create_note_with_embedding_content` with a real Some(head)
+    // override to prove the override path shares the identical rollback.
+    #[tokio::test]
+    async fn create_note_with_embedding_content_fts_failure_rolls_back_note_row() {
+        let rt = rt();
+        let ns = Namespace::parse("fault-fts-rollback-embedding-content").unwrap();
+        let tok = NamespaceToken::for_namespace(ns.clone());
+
+        arm_fts_fail(ns.as_str());
+
+        let full = "fts-fail rollback target with an embedding-content override";
+        let head = &full[.."fts-fail rollback target".len()];
+        let result = rt
+            .create_note_with_embedding_content(
+                &tok,
+                "observation",
+                None,
+                full,
+                Some(head),
+                None,
+                None,
+                vec![],
+            )
+            .await;
+
+        assert!(
+            result.is_err(),
+            "create_note_with_embedding_content must propagate the injected FTS failure"
+        );
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("injected FTS failure"),
+            "error must carry injection message; got: {err_msg}"
+        );
+
+        // Compensation must have removed the note row; a failed create must
+        // never leave a stranded row behind just because it carried an
+        // embedding_content override.
+        let notes = rt.list_notes(&tok, None, 1000, 0).await.unwrap();
+        assert!(
+            notes.is_empty(),
+            "compensation must remove the note row after FTS failure; got {notes:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_note_with_embedding_content_vector_failure_rolls_back_note_row_and_fts() {
+        const MODEL: &str = "test-vec-inject-embedding-content";
+        const DIMS: usize = 4;
+
+        let rt = KhiveRuntime::memory().unwrap();
+        let (provider, _counter) = ConstVecProvider::new(MODEL, DIMS);
+        rt.register_embedder(provider);
+
+        let ns = Namespace::parse("fault-vec-rollback-embedding-content").unwrap();
+        let tok = NamespaceToken::for_namespace(ns.clone());
+
+        arm_vector_fail(ns.as_str());
+
+        let full = "vec-fail rollback target with an embedding-content override";
+        let head = &full[.."vec-fail rollback target".len()];
+        let result = rt
+            .create_note_with_embedding_content(
+                &tok,
+                "observation",
+                None,
+                full,
+                Some(head),
+                None,
+                None,
+                vec![],
+            )
+            .await;
+
+        assert!(
+            result.is_err(),
+            "create_note_with_embedding_content must propagate the injected vector failure"
+        );
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("injected vector failure"),
+            "error must carry injection message; got: {err_msg}"
+        );
+
+        // Compensation must have removed the note row: the ingest-layer
+        // truncation counter only increments in the successful-create arm,
+        // so a failed create — with or without an embedding_content override
+        // — can never cause a spurious truncation count on the caller side.
+        let notes = rt.list_notes(&tok, None, 1000, 0).await.unwrap();
+        assert!(
+            notes.is_empty(),
+            "compensation must remove note row after vector failure; got {notes:?}"
+        );
+    }
+
     // ---- #232 soft-delete index cleanup tests ----
 
     #[tokio::test]
@@ -11187,5 +11425,295 @@ mod tests {
             "org->document introduced_by must remain rejected; only \
              document->org is permitted, not the reverse; got {result:?}"
         );
+    }
+
+    // ── #764: create_note_with_embedding_content ────────────────────────────
+
+    /// Like `ConstVecService`/`ConstVecProvider` above, but records every text
+    /// it is asked to embed so a test can assert exactly what reached the
+    /// "provider" — used to verify the effective embed text is the capped
+    /// override, not the full note content.
+    struct CapturingVecService {
+        dims: usize,
+        captured: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    #[async_trait]
+    impl EmbeddingService for CapturingVecService {
+        async fn embed(
+            &self,
+            texts: &[String],
+            _model: EmbeddingModel,
+        ) -> std::result::Result<Vec<Vec<f32>>, EmbedError> {
+            self.captured.lock().unwrap().extend(texts.iter().cloned());
+            Ok(texts.iter().map(|_| vec![1.0_f32; self.dims]).collect())
+        }
+
+        fn supports_model(&self, _model: EmbeddingModel) -> bool {
+            true
+        }
+
+        fn name(&self) -> &'static str {
+            "capturing-vec"
+        }
+    }
+
+    struct CapturingVecProvider {
+        provider_name: String,
+        dims: usize,
+        captured: Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    #[async_trait]
+    impl EmbedderProvider for CapturingVecProvider {
+        fn name(&self) -> &str {
+            &self.provider_name
+        }
+
+        fn dimensions(&self) -> usize {
+            self.dims
+        }
+
+        async fn build(&self) -> crate::error::RuntimeResult<Arc<dyn EmbeddingService>> {
+            Ok(Arc::new(CapturingVecService {
+                dims: self.dims,
+                captured: Arc::clone(&self.captured),
+            }))
+        }
+    }
+
+    #[tokio::test]
+    async fn create_note_with_embedding_content_none_matches_create_note() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+        let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
+        rt.register_embedder(CapturingVecProvider {
+            provider_name: "capturing-vec".into(),
+            dims: 4,
+            captured: Arc::clone(&captured),
+        });
+
+        let note = rt
+            .create_note_with_embedding_content(
+                &tok,
+                "observation",
+                None,
+                "full content, no override",
+                None,
+                None,
+                None,
+                vec![],
+            )
+            .await
+            .expect("create with None override must behave like create_note");
+        assert_eq!(note.content, "full content, no override");
+        let seen = captured.lock().unwrap().clone();
+        assert_eq!(
+            seen,
+            vec!["full content, no override".to_string()],
+            "with no override the embedder must see the full content"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_note_with_embedding_content_embeds_capped_override_and_stores_full_content() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+        let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
+        rt.register_embedder(CapturingVecProvider {
+            provider_name: "capturing-vec".into(),
+            dims: 4,
+            captured: Arc::clone(&captured),
+        });
+
+        let full = "head-term and then a very long tail-term that exceeds any cap";
+        let head = &full[.."head-term and then a very long".len()];
+
+        let note = rt
+            .create_note_with_embedding_content(
+                &tok,
+                "observation",
+                None,
+                full,
+                Some(head),
+                None,
+                None,
+                vec![],
+            )
+            .await
+            .expect("proper-prefix override must be accepted");
+        assert_eq!(note.content, full, "stored content must be the full text");
+
+        let seen = captured.lock().unwrap().clone();
+        assert_eq!(
+            seen,
+            vec![head.to_string()],
+            "embedder must see only the capped override"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_note_with_embedding_content_fans_out_identical_override_to_multiple_models() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+        let captured_a = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured_b = Arc::new(std::sync::Mutex::new(Vec::new()));
+        rt.register_embedder(CapturingVecProvider {
+            provider_name: "capturing-vec-a".into(),
+            dims: 4,
+            captured: Arc::clone(&captured_a),
+        });
+        rt.register_embedder(CapturingVecProvider {
+            provider_name: "capturing-vec-b".into(),
+            dims: 4,
+            captured: Arc::clone(&captured_b),
+        });
+
+        let full = "head-only-embedded plus a long discarded tail";
+        let head = &full[.."head-only-embedded".len()];
+
+        rt.create_note_with_embedding_content(
+            &tok,
+            "observation",
+            None,
+            full,
+            Some(head),
+            None,
+            None,
+            vec![],
+        )
+        .await
+        .expect("create ok");
+
+        assert_eq!(
+            captured_a.lock().unwrap().clone(),
+            vec![head.to_string()],
+            "model A must receive the identical capped override"
+        );
+        assert_eq!(
+            captured_b.lock().unwrap().clone(),
+            vec![head.to_string()],
+            "model B must receive the identical capped override"
+        );
+
+        // Both models actually persisted a vector row for the note (not just
+        // an embed call that was discarded before insertion).
+        let vs_a = rt
+            .vectors_for_model(&tok, "capturing-vec-a")
+            .expect("vector store for model A");
+        assert_eq!(
+            vs_a.count().await.expect("vector count A"),
+            1,
+            "model A must have exactly one vector row for the note"
+        );
+        let vs_b = rt
+            .vectors_for_model(&tok, "capturing-vec-b")
+            .expect("vector store for model B");
+        assert_eq!(
+            vs_b.count().await.expect("vector count B"),
+            1,
+            "model B must have exactly one vector row for the note"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_note_with_embedding_content_rejects_empty_override() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+
+        let err = rt
+            .create_note_with_embedding_content(
+                &tok,
+                "observation",
+                None,
+                "some content",
+                Some(""),
+                None,
+                None,
+                vec![],
+            )
+            .await
+            .expect_err("empty override must be rejected");
+        assert!(matches!(err, RuntimeError::InvalidInput(_)));
+    }
+
+    #[tokio::test]
+    async fn create_note_with_embedding_content_rejects_non_prefix_override() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+
+        let err = rt
+            .create_note_with_embedding_content(
+                &tok,
+                "observation",
+                None,
+                "the actual content",
+                Some("an unrelated string"),
+                None,
+                None,
+                vec![],
+            )
+            .await
+            .expect_err("non-prefix override must be rejected");
+        assert!(matches!(err, RuntimeError::InvalidInput(ref m) if m.contains("prefix")));
+    }
+
+    #[tokio::test]
+    async fn create_note_with_embedding_content_rejects_equal_length_override() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+
+        // Same length and same text as `content` is not a *proper* prefix.
+        let err = rt
+            .create_note_with_embedding_content(
+                &tok,
+                "observation",
+                None,
+                "identical text",
+                Some("identical text"),
+                None,
+                None,
+                vec![],
+            )
+            .await
+            .expect_err("an equal-length override must be rejected as not a proper prefix");
+        assert!(matches!(err, RuntimeError::InvalidInput(ref m) if m.contains("prefix")));
+    }
+
+    #[tokio::test]
+    async fn create_note_with_embedding_content_rejects_secret_bearing_override() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+
+        let token_span = "ghp_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+        let content = format!("{token_span} plus extra trailing content beyond the override");
+        let embedding_content = format!("{token_span} plus extra");
+
+        let err = rt
+            .create_note_with_embedding_content(
+                &tok,
+                "observation",
+                None,
+                &content,
+                Some(&embedding_content),
+                None,
+                None,
+                vec![],
+            )
+            .await
+            .expect_err("a credential-shaped override must fail the secret gate");
+        assert!(
+            matches!(err, RuntimeError::SecretDetected(_)),
+            "expected SecretDetected, got {err:?}"
+        );
+
+        // Fail-closed: no note survives the rejected create.
+        let count = rt
+            .notes(&tok)
+            .unwrap()
+            .count_notes(tok.namespace().as_str(), None)
+            .await
+            .unwrap();
+        assert_eq!(count, 0, "a rejected create must leave no note behind");
     }
 }

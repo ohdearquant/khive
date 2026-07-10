@@ -16,6 +16,44 @@ fn setup_memory_store(table_key: &str) -> Fts5TextSearch {
     Fts5TextSearch::new(pool, false, table_key.to_string())
 }
 
+/// #397 Finding 2 regression fixture: the FTS5 `trigram` tokenizer, matching
+/// `StorageBackend::text()`'s production default (`backend.rs`) byte-for-byte
+/// (`tokenize = 'trigram'`), rather than the bare `ensure_fts5_schema` helper
+/// above, which omits `tokenize=` and so falls back to SQLite's own default
+/// (`unicode61`). Production generic search (`operations.rs`, Plain mode) and
+/// AnyTerm search both run against trigram-tokenized tables; a regression
+/// covered only under the test helper's `unicode61` default would miss
+/// trigram-specific behavior entirely.
+fn setup_trigram_store(table_key: &str) -> Fts5TextSearch {
+    let config = PoolConfig {
+        path: None,
+        ..PoolConfig::default()
+    };
+    let pool = Arc::new(ConnectionPool::new(config).unwrap());
+
+    {
+        let writer = pool.writer().unwrap();
+        let table_name = format!("fts_{}", table_key);
+        let ddl = format!(
+            "CREATE VIRTUAL TABLE IF NOT EXISTS {} USING fts5(\
+             subject_id UNINDEXED, \
+             kind UNINDEXED, \
+             title, \
+             body, \
+             tags UNINDEXED, \
+             namespace UNINDEXED, \
+             metadata UNINDEXED, \
+             updated_at UNINDEXED, \
+             tokenize = 'trigram'\
+             )",
+            table_name
+        );
+        writer.conn().execute_batch(&ddl).unwrap();
+    }
+
+    Fts5TextSearch::new(pool, false, table_key.to_string())
+}
+
 fn make_document(subject_id: Uuid, title: &str, body: &str) -> TextDocument {
     TextDocument {
         subject_id,
@@ -399,9 +437,18 @@ async fn test_sanitize_fts5_query() {
     // M-C4: decimal numbers must not produce "syntax error near '.'"
     assert_eq!(
         sanitize_fts5_query("salience 0.9 vs 0.3"),
-        "salience 09 vs 03"
+        "salience 0 9 vs 0 3"
     );
-    assert_eq!(sanitize_fts5_query("version 1.2.3"), "version 123");
+    assert_eq!(sanitize_fts5_query("version 1.2.3"), "version 1 2 3");
+    // #397: hyphenated and dotted identifiers must space-split, not concatenate.
+    assert_eq!(
+        sanitize_fts5_query("khive-pack-memory"),
+        "khive pack memory"
+    );
+    assert_eq!(
+        sanitize_fts5_query("khive.pack.memory"),
+        "khive pack memory"
+    );
     // H1: tilde and comma must be stripped to prevent FTS5 syntax errors
     assert_eq!(sanitize_fts5_query("~hello"), "hello");
     assert_eq!(sanitize_fts5_query("\"+_~!\""), "_");
@@ -441,7 +488,7 @@ async fn test_sanitize_fts5_query() {
     assert_eq!(sanitize_fts5_query("AND OR NOT"), "");
     // #388: dollar sign is an unconditional FTS5 MATCH-parser syntax error
     // ("syntax error near \"$\"") regardless of position in the token or query.
-    assert_eq!(sanitize_fts5_query("$prev.id"), "previd");
+    assert_eq!(sanitize_fts5_query("$prev.id"), "prev id");
     assert_eq!(sanitize_fts5_query("$prev"), "prev");
     assert_eq!(sanitize_fts5_query("foo$bar"), "foobar");
     assert_eq!(sanitize_fts5_query("$"), "");
@@ -513,7 +560,7 @@ async fn test_search_with_decimal_query_does_not_crash() {
         .upsert_document(make_document(
             Uuid::new_v4(),
             "salience thresholds",
-            "salience 09 vs 03 comparison",
+            "salience 0 9 vs 0 3 comparison",
         ))
         .await
         .unwrap();
@@ -549,6 +596,358 @@ async fn test_search_with_decimal_query_does_not_crash() {
         "version-string query must succeed, got error: {:?}",
         result2.err()
     );
+}
+
+/// #397 regression: punctuated identifier queries must not be concatenated into
+/// tokens that cannot occur in the indexed text.
+#[tokio::test]
+async fn test_search_with_hyphenated_and_dotted_queries_matches_literal_tokens() {
+    let store = setup_memory_store("punctuated_query_match");
+
+    let hyphen_id = Uuid::new_v4();
+    store
+        .upsert_document(make_document(hyphen_id, "doc", "LEGACY-FLAT-NOTE"))
+        .await
+        .unwrap();
+
+    let dotted_id = Uuid::new_v4();
+    store
+        .upsert_document(make_document(dotted_id, "doc", "khive.pack.memory"))
+        .await
+        .unwrap();
+
+    for (query, expected_id) in [
+        ("LEGACY-FLAT-NOTE", hyphen_id),
+        ("khive.pack.memory", dotted_id),
+    ] {
+        let hits = store
+            .search(TextSearchRequest {
+                query: query.to_string(),
+                mode: TextQueryMode::AnyTerm,
+                filter: Some(ns_filter("test_ns")),
+                top_k: 10,
+                snippet_chars: 64,
+            })
+            .await
+            .unwrap();
+        let hit_ids: Vec<_> = hits.iter().map(|hit| hit.subject_id).collect();
+        assert!(
+            hit_ids.contains(&expected_id),
+            "#397 query {query:?} must match {expected_id}; got {hit_ids:?}"
+        );
+    }
+}
+
+/// Round-2 codex re-review regression: `sanitize_fts5_token_group` must keep
+/// the legacy-merged bareword alternative reachable for ordinary punctuated
+/// identifiers under `unicode61`. The merged form (`khivepackmemory`,
+/// `previd`) is content indexed before #397's split-terms change, or content
+/// whose own tokenizer collapsed punctuation the same way; a query for the
+/// punctuated spelling must still find it. Assert exact hit-id sets (not
+/// just "contains") so a fix that accidentally broadens the match — e.g. by
+/// dropping the trigram-safety gate on multi-term merges — is caught too.
+#[tokio::test]
+async fn test_search_matches_legacy_merged_and_punctuated_forms_exact_ids() {
+    let store = setup_memory_store("legacy_merged_punctuated");
+
+    let legacy_merged_id = Uuid::new_v4();
+    store
+        .upsert_document(make_document(
+            legacy_merged_id,
+            "doc",
+            "khivepackmemory legacy note",
+        ))
+        .await
+        .unwrap();
+
+    let punctuated_id = Uuid::new_v4();
+    store
+        .upsert_document(make_document(
+            punctuated_id,
+            "doc",
+            "khive-pack-memory crate",
+        ))
+        .await
+        .unwrap();
+
+    let legacy_prev_id = Uuid::new_v4();
+    store
+        .upsert_document(make_document(
+            legacy_prev_id,
+            "DSL docs",
+            "chain results with previd token",
+        ))
+        .await
+        .unwrap();
+
+    let punctuated_prev_id = Uuid::new_v4();
+    store
+        .upsert_document(make_document(
+            punctuated_prev_id,
+            "DSL docs",
+            "chain results with the $prev.id token",
+        ))
+        .await
+        .unwrap();
+
+    let unrelated_id = Uuid::new_v4();
+    store
+        .upsert_document(make_document(
+            unrelated_id,
+            "doc",
+            "completely unrelated content about gardening",
+        ))
+        .await
+        .unwrap();
+
+    for mode in [TextQueryMode::Plain, TextQueryMode::AnyTerm] {
+        for (query, expected_ids, label) in [
+            (
+                "khive-pack-memory",
+                vec![legacy_merged_id, punctuated_id],
+                "punctuated identifier reaches both legacy-merged and split forms",
+            ),
+            (
+                "$prev.id",
+                vec![legacy_prev_id, punctuated_prev_id],
+                "dollar+dot query reaches both legacy-merged and split forms",
+            ),
+        ] {
+            let hits = store
+                .search(TextSearchRequest {
+                    query: query.to_string(),
+                    mode: mode.clone(),
+                    filter: Some(ns_filter("test_ns")),
+                    top_k: 10,
+                    snippet_chars: 0,
+                })
+                .await
+                .unwrap();
+            let hit_ids: std::collections::HashSet<_> =
+                hits.iter().map(|hit| hit.subject_id).collect();
+            let expected: std::collections::HashSet<_> = expected_ids.into_iter().collect();
+            assert_eq!(
+                hit_ids, expected,
+                "unicode61 {mode:?} query {query:?} ({label}) must match exactly {expected:?}; got {hit_ids:?}"
+            );
+            assert!(
+                !hit_ids.contains(&unrelated_id),
+                "unicode61 {mode:?} query {query:?} ({label}) must not match unrelated doc {unrelated_id}; got {hit_ids:?}"
+            );
+        }
+    }
+}
+
+/// #397 Finding 2 regression: production defaults to the FTS5 `trigram`
+/// tokenizer (`backend.rs`'s `StorageBackend::text()`), and generic search
+/// (`operations.rs::search_notes`) queries it in `Plain` mode — neither of
+/// which the prior `unicode61`/`AnyTerm`-only coverage exercised. Assert
+/// exact hit-id sets (not just "contains") for punctuated identifiers,
+/// decimals, versions, and legacy-normalized forms, under a real trigram
+/// table, in both `Plain` and `AnyTerm` mode.
+#[tokio::test]
+async fn test_search_trigram_punctuated_and_decimal_queries_matches_exact_ids() {
+    let store = setup_trigram_store("trigram_punctuated");
+
+    let hyphen_id = Uuid::new_v4();
+    store
+        .upsert_document(make_document(hyphen_id, "doc", "khive-pack-memory crate"))
+        .await
+        .unwrap();
+
+    let dotted_id = Uuid::new_v4();
+    store
+        .upsert_document(make_document(
+            dotted_id,
+            "doc",
+            "the khive.pack.memory module",
+        ))
+        .await
+        .unwrap();
+
+    let decimal_id = Uuid::new_v4();
+    store
+        .upsert_document(make_document(
+            decimal_id,
+            "doc",
+            "salience 0.9 vs 0.3 comparison",
+        ))
+        .await
+        .unwrap();
+
+    let version_id = Uuid::new_v4();
+    store
+        .upsert_document(make_document(version_id, "doc", "released version 1.2.3"))
+        .await
+        .unwrap();
+
+    // A literal punctuated identifier short enough (`id` = 2 chars) that its
+    // split segments are trigram-unsafe (below FTS5_TRIGRAM_MIN_SAFE_LEN):
+    // only reachable via the exact-substring phrase alternative under
+    // `trigram`, since the doc body embeds the raw "$prev.id" token verbatim
+    // rather than as separately tokenizable words.
+    let legacy_id = Uuid::new_v4();
+    store
+        .upsert_document(make_document(
+            legacy_id,
+            "DSL docs",
+            "chain results with the $prev.id token",
+        ))
+        .await
+        .unwrap();
+
+    let unrelated_id = Uuid::new_v4();
+    store
+        .upsert_document(make_document(
+            unrelated_id,
+            "doc",
+            "completely unrelated content about gardening",
+        ))
+        .await
+        .unwrap();
+
+    for mode in [TextQueryMode::Plain, TextQueryMode::AnyTerm] {
+        for (query, expected_id, label) in [
+            ("khive-pack-memory", hyphen_id, "hyphenated identifier"),
+            ("khive.pack.memory", dotted_id, "dotted identifier"),
+            ("0.9", decimal_id, "decimal"),
+            ("1.2.3", version_id, "version string"),
+            ("$prev.id", legacy_id, "legacy dollar+dot query"),
+        ] {
+            let hits = store
+                .search(TextSearchRequest {
+                    query: query.to_string(),
+                    mode: mode.clone(),
+                    filter: Some(ns_filter("test_ns")),
+                    top_k: 10,
+                    snippet_chars: 0,
+                })
+                .await
+                .unwrap();
+            let hit_ids: std::collections::HashSet<_> =
+                hits.iter().map(|hit| hit.subject_id).collect();
+            assert!(
+                hit_ids.contains(&expected_id),
+                "trigram {mode:?} query {query:?} ({label}) must match {expected_id}; got {hit_ids:?}"
+            );
+            assert!(
+                !hit_ids.contains(&unrelated_id),
+                "trigram {mode:?} query {query:?} ({label}) must not match unrelated doc {unrelated_id}; got {hit_ids:?}"
+            );
+        }
+    }
+}
+
+/// #397 Finding 2 concrete broadening regression: a hyphenated date query
+/// under the trigram tokenizer must not collapse to matching every document
+/// that merely shares the year. `sanitize_fts5_token_group`'s split reading
+/// keeps the year term ("2026", 4 chars) fully discriminating under trigram;
+/// this test pins that neither the split nor the merged OR-alternative
+/// widens the match to a different day in the same year.
+#[tokio::test]
+async fn test_search_trigram_date_query_does_not_broaden_to_same_year() {
+    let store = setup_trigram_store("trigram_date");
+
+    let target_id = Uuid::new_v4();
+    store
+        .upsert_document(make_document(
+            target_id,
+            "doc",
+            "changelog entry dated 2026-07-10",
+        ))
+        .await
+        .unwrap();
+
+    let other_day_id = Uuid::new_v4();
+    store
+        .upsert_document(make_document(
+            other_day_id,
+            "doc",
+            "changelog entry dated 2026-03-15",
+        ))
+        .await
+        .unwrap();
+
+    for mode in [TextQueryMode::Plain, TextQueryMode::AnyTerm] {
+        let hits = store
+            .search(TextSearchRequest {
+                query: "2026-07-10".to_string(),
+                mode: mode.clone(),
+                filter: Some(ns_filter("test_ns")),
+                top_k: 10,
+                snippet_chars: 0,
+            })
+            .await
+            .unwrap();
+        let hit_ids: std::collections::HashSet<_> = hits.iter().map(|hit| hit.subject_id).collect();
+        assert!(
+            hit_ids.contains(&target_id),
+            "trigram {mode:?} date query must match its own date {target_id}; got {hit_ids:?}"
+        );
+        assert!(
+            !hit_ids.contains(&other_day_id),
+            "trigram {mode:?} date query for 2026-07-10 must not broaden to 2026-03-15 \
+             ({other_day_id}); got {hit_ids:?}"
+        );
+    }
+}
+
+/// #397 Finding 2 round-3 regression: a punctuated operand of an FTS5
+/// operator expression (`NEAR(alpha-beta,5)`, `NOT(alpha-beta,5)`) makes the
+/// legacy-merged OR-alternative in `sanitize_fts5_token_group` collapse to
+/// multiple space-separated terms (`"alphabeta 5"`) instead of one bareword,
+/// because the operand's comma spaces the trailing short segment off from
+/// the merged word. Pushed unguarded into the OR-group, that fragment's
+/// trigram-unsafe `5` term silently drops out under FTS5's implicit-AND
+/// adjacency (see `join_plain_groups`'s doc comment), broadening the match
+/// to any row containing the bare `alphabeta` merge. Pin under the
+/// production trigram tokenizer that an unrelated row containing only the
+/// merged bareword does not match.
+#[tokio::test]
+async fn test_search_trigram_operator_short_operand_does_not_broaden() {
+    let store = setup_trigram_store("trigram_operator_short_operand");
+
+    let unrelated_id = Uuid::new_v4();
+    store
+        .upsert_document(make_document(
+            unrelated_id,
+            "doc",
+            "an alphabeta widget completely unrelated to any proximity or negation query",
+        ))
+        .await
+        .unwrap();
+
+    for (query, label) in [
+        (
+            "NEAR(alpha-beta,5)",
+            "NEAR operator with a short numeric operand",
+        ),
+        (
+            "NOT(alpha-beta,5)",
+            "NOT operator with a short numeric operand",
+        ),
+    ] {
+        for mode in [TextQueryMode::Plain, TextQueryMode::AnyTerm] {
+            let hits = store
+                .search(TextSearchRequest {
+                    query: query.to_string(),
+                    mode: mode.clone(),
+                    filter: Some(ns_filter("test_ns")),
+                    top_k: 10,
+                    snippet_chars: 0,
+                })
+                .await
+                .unwrap();
+            let hit_ids: std::collections::HashSet<_> =
+                hits.iter().map(|hit| hit.subject_id).collect();
+            assert!(
+                !hit_ids.contains(&unrelated_id),
+                "trigram {mode:?} query {query:?} ({label}) must not broaden to match \
+                 {unrelated_id} via the trigram-unsafe multi-term merged alternative; \
+                 got {hit_ids:?}"
+            );
+        }
+    }
 }
 
 /// #570: all FTS5 operator classes must not crash the generic text search surface.
@@ -614,7 +1013,7 @@ async fn test_search_with_dollar_sign_does_not_crash() {
         .upsert_document(make_document(
             Uuid::new_v4(),
             "DSL docs",
-            "chain results with the previd token",
+            "chain results with the prev id token",
         ))
         .await
         .unwrap();
@@ -633,8 +1032,7 @@ async fn test_search_with_dollar_sign_does_not_crash() {
         "#388 dollar-sign query must not crash FTS5, got: {:?}",
         result.err()
     );
-    // sanitize_fts5_query("$prev.id") == "previd" (both '$' and '.' stripped, no
-    // space inserted) — it still matches a document containing that literal token,
+    // sanitize_fts5_query("$prev.id") == "prev id" ('$' stripped, '.' space-split),
     // confirming legitimate text search stays intact after sanitization.
     assert_eq!(result.unwrap().len(), 1);
 }

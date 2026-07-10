@@ -2,16 +2,18 @@
 
 **Status**: Accepted (amended 2026-07-02 -- inbound authentication hardening; amended 2026-07-03
 -- Exchange Online no-authserv-id boundary; amended 2026-07-05 -- Telegram adapter
-implementation and two-way chat; see
+implementation and two-way chat; amended 2026-07-09 -- durable IMAP UID cursor; see
 [§Amendment 2026-07-02](#amendment-2026-07-02----inbound-authentication-hardening),
 [§Amendment 2026-07-03](#amendment-2026-07-03----exchange-online-no-authserv-id-boundary),
-[§Amendment 2026-07-05](#amendment-2026-07-05----telegram-adapter-implementation-and-two-way-chat))\
-**Date**: 2026-06-14 (amended 2026-07-02, 2026-07-03, 2026-07-05)\
+[§Amendment 2026-07-05](#amendment-2026-07-05----telegram-adapter-implementation-and-two-way-chat),
+[§Amendment 2026-07-09](#amendment-2026-07-09----durable-imap-uid-cursor))\
+**Date**: 2026-06-14 (amended 2026-07-02, 2026-07-03, 2026-07-05, 2026-07-09)\
 **Authors**: khive maintainers
 **Depends on**: ADR-017 (Pack Standard), ADR-018 (Authorization Gate), ADR-040 (Communication
 and Schedule Packs), ADR-053 (ActorStore / SessionStore -- extends ADR-018's actor model)\
 **Related issues**: #112 (khive-channel umbrella), #113 (Telegram adapter), #114 (email adapter),
-#448 (inbound header spoofing -- resolved by this amendment)
+#448 (inbound header spoofing -- resolved by this amendment), #449 (IMAP UID progress -- resolved
+by the 2026-07-09 amendment)
 
 ## Amendment 2026-07-02 -- Inbound authentication hardening
 
@@ -370,6 +372,85 @@ compiled). `channel-email` and `channel-telegram` can be enabled together; the
 - Multi-recipient / group chats, inline keyboards, media (text only for v1).
 - Webhook inbound (long-poll only until a public-URL deployment exists -- ADR-056 §7).
 - A general `telegram:<slug>` address book beyond the single maintainer slug.
+
+## Amendment 2026-07-09 -- Durable IMAP UID cursor
+
+### Motivation
+
+Issue #449 (`khive-channel-email: IMAP polling can repeatedly fetch the same UID subset and
+miss later messages`, P1/high): a mailbox with more messages in one `SINCE` day-window than the
+50-item fetch limit could have its overflow permanently starved. `LiveImap::fetch_since` searched
+`SINCE <date>`, collected the result into a `Vec` straight from `async-imap`'s `HashSet<Uid>`, and
+truncated to the limit before any progress state existed. With 75 same-day UIDs and a 50-item
+limit, the same arbitrary 50 could be returned forever while UIDs 51-75 were never fetched, and
+once the date window advanced past that day, those UIDs would never match `SINCE` again.
+
+This directly supersedes this ADR's earlier restart-durability claim (Amendment 2026-07-05,
+"Poll offset and restart durability"): _"the email adapter's IMAP cursor is likewise not
+persisted... no new schema, no new table."_ Issue #449 explicitly requires persisted per-mailbox
+`UIDVALIDITY`/high-water progress, because -- unlike Telegram's `getUpdates`, which
+server-side-drops already-acknowledged updates -- IMAP `SINCE` truncation could permanently skip
+messages the dedup index never saw in the first place; the durable dedup index cannot recover
+mail that pagination never fetched. `Last_in_time` governs: this amendment's persistence
+requirement controls where it conflicts with the earlier claim.
+
+### What changed
+
+`crates/khive-channel-email/src/connector/imap.rs` and `channel.rs` replace unordered
+day-level truncation with a `(UIDVALIDITY, last_seen_uid)` progress model (`ImapProgress`):
+UID search results are rejected if they contain a protocol-invalid zero UID, sorted ascending,
+deduplicated, filtered to strictly above the high-water when the epoch is unchanged, then
+truncated to the page limit. A UIDVALIDITY change discards the old high-water. `khive-channel`
+gains transport-neutral `ChannelCheckpoint`/`StoredChannelCheckpoint`/`ChannelPollPage` types and
+a default `Channel::poll_page` method (existing `Channel::poll` and all other implementers are
+unchanged and source-compatible). `khive-pack-comm` gains a pack-owned auxiliary table,
+`comm_channel_cursor` (keyed by `(channel_kind, channel_slug)`, storing `source`, `generation`,
+`high_water`, `updated_at`), plus internal (non-MCP-callable) `comm.cursor_get`/`comm.cursor_commit`
+subhandlers. This table and its handlers are new, pack-owned operational bookkeeping -- not a
+core `khive-db` migration -- consistent with ADR-028's pack-scoped-backend cursor pattern, and
+they directly retract the "no new schema, no new table" claim above for the email adapter only;
+Telegram's offset remains in-memory as originally documented.
+
+### The durable checkpoint path is wired into the daemon
+
+1. **`ImapFetcher::fetch_since`** (unchanged public signature, still used by `EmailChannel::poll`,
+   the non-checkpointed entrypoint) holds an in-memory `legacy_progress` mutex that applies the
+   same sort/dedup/high-water/truncate discipline across repeated calls on one process. This
+   closes the issue's literal reported failure -- the same 50-of-75 UIDs repeated forever -- for
+   any caller that only uses `poll`. It is **not persisted**; on its own, a process restart resets
+   it to an empty progress and the connector bootstraps by `SINCE` again.
+2. **`EmailChannel::poll_page`** (a new override of the `Channel` trait's default) plus
+   `comm.cursor_get`/`comm.cursor_commit`: a fully implemented and unit/integration-tested durable
+   checkpoint path, keyed by a stable `imap+tls:{host}:{port}:{mailbox}:INBOX` source string so
+   one account's high-water can never suppress another's. **`khive-mcp/src/serve.rs`'s
+   `channel_poll_loop` now calls `cursor_get` -> `poll_page` -> every `comm.ingest` -> `cursor_commit`
+   for each configured channel, committing the cursor only after every envelope in the page has
+   durably ingested.** A partial-page `comm.ingest` failure leaves the checkpoint untouched, so the
+   next poll re-selects the whole page; `comm.ingest`'s `INSERT OR IGNORE` dedup then skips
+   re-storing the messages that already succeeded and only the failed one is effectively retried.
+   A `cursor_get` failure skips that channel's poll for the cycle rather than risk polling from an
+   empty checkpoint and silently discarding durable state.
+3. **Poison-UID durability** (issue #449 High): a selected UID whose `UID FETCH` response carries
+   no RFC822 body, or whose body fails to parse, no longer fails the whole page. It gets a durable
+   terminal disposition -- a quarantine envelope carrying the stable `imap:{host}:{uidvalidity}:{uid}`
+   dedup key and a `missing-body`/`parse-failure` reason, always stored regardless of the
+   `quarantine_store` config flag -- so the cursor can advance past it instead of re-selecting the
+   same poison UID on every subsequent poll.
+
+### Consequences
+
+- The issue's literal 75-message/50-limit backlog-drain scenario is fixed and covered by tests
+  exercising the real `EmailChannel::poll` entrypoint, not only the pure helpers.
+- Full restart durability (a daemon crash or redeploy resuming exactly above the last durably
+  ingested UID) is delivered end-to-end: `channel_poll_loop` drives `cursor_get`/`poll_page`/
+  `cursor_commit` on every cycle, and the commit-only-after-full-page-ingest ordering is covered by
+  poll-loop regression tests for partial-ingest-failure non-advancement and cross-restart
+  round-tripping.
+- `comm_channel_cursor` and its subhandlers are pack-owned operational bookkeeping, not a new
+  MCP-callable verb and not a core schema migration; they are exercised in production only via the
+  daemon poll loop's internal dispatch calls.
+- Telegram's in-memory offset watermark and its restart-durability rationale (Amendment
+  2026-07-05) are unchanged by this amendment.
 
 ## Context
 

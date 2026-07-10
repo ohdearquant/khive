@@ -141,6 +141,11 @@ pub struct IngestReport {
     /// `precedes` edges created from a commit's `parents[]` to the commit
     /// itself (ADR-088 Amendment 1 ingest enrichment).
     pub parent_edges_created: u64,
+    /// Commits whose masked content exceeded `MAX_COMMIT_EMBED_BYTES`: the
+    /// full commit note was stored and FTS-indexed unchanged, but the vector
+    /// embedding input was truncated to a UTF-8-safe head prefix at the cap
+    /// (issue #764). Only incremented for successfully created commits.
+    pub commit_embeddings_truncated: u64,
 }
 
 /// Run one ingest pass: issues + PRs first (via `gh`, when available), then
@@ -700,7 +705,7 @@ fn walk_commits(repo: &Path, since_sha: Option<&str>) -> Result<Vec<RawCommit>> 
     Ok(commits)
 }
 
-/// `sha -> [touched paths]` for every commit in `repo`'s history, via a
+/// `sha -> \[touched paths\]` for every commit in `repo`'s history, via a
 /// separate `--name-only` pass (kept apart from `walk_commits`'s custom
 /// `--pretty=format` — interleaving file-name lines with the metadata format
 /// has no clean, unambiguous delimiter).
@@ -841,6 +846,27 @@ fn squash_merge_pr_number(subject: &str) -> Option<u64> {
 /// `"<short_sha> <subject>"`).
 const NAME_MAX_CHARS: usize = 120;
 
+/// Cap for the text a commit note sends to the vector embedder (issue #764).
+/// Matches the repository's existing `MAX_EMBED_BYTES` precedent
+/// (`khive-pack-knowledge`, `kkernel::reindex`, ADR-048) — bytes, not chars,
+/// UTF-8-boundary-safe. The full, untruncated commit content is always
+/// stored and FTS-indexed; only the candidate vector input is capped.
+const MAX_COMMIT_EMBED_BYTES: usize = 32_768;
+
+/// Returns a UTF-8-valid, proper head prefix of `content` when it exceeds
+/// `MAX_COMMIT_EMBED_BYTES`, or `None` when `content` is at or under the cap
+/// (nothing to truncate — the full text is a valid embedding input as-is).
+fn truncated_embedding_head(content: &str) -> Option<&str> {
+    if content.len() <= MAX_COMMIT_EMBED_BYTES {
+        return None;
+    }
+    let mut end = MAX_COMMIT_EMBED_BYTES;
+    while !content.is_char_boundary(end) {
+        end -= 1;
+    }
+    Some(&content[..end])
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn ingest_commits(
     runtime: &KhiveRuntime,
@@ -947,23 +973,26 @@ async fn ingest_commits(
         });
 
         let name = refs::truncate_chars(&format!("{} {}", c.short_sha, c.subject), NAME_MAX_CHARS);
+        let embedding_head = truncated_embedding_head(&content);
+
+        let mut create_request = json!({
+            "kind": "commit",
+            "name": name,
+            "content": content,
+            "properties": properties,
+            "annotates": annotates,
+        });
+        if let Some(head) = embedding_head {
+            create_request["embedding_content"] = json!(head);
+        }
 
         budget.try_consume();
-        match registry
-            .dispatch(
-                "create",
-                json!({
-                    "kind": "commit",
-                    "name": name,
-                    "content": content,
-                    "properties": properties,
-                    "annotates": annotates,
-                }),
-            )
-            .await
-        {
+        match registry.dispatch("create", create_request).await {
             Ok(v) => {
                 report.commits_ingested += 1;
+                if embedding_head.is_some() {
+                    report.commit_embeddings_truncated += 1;
+                }
                 if !cursor_stalled {
                     last_sha = Some(c.sha.clone());
                 }
@@ -1290,9 +1319,10 @@ async fn ingest_prs(
 
             let raw_body = pr.body.unwrap_or_default();
             let content = secret_gate::mask_secrets(&raw_body).into_owned();
+            let safe_title = secret_gate::mask_secrets(&pr.title).into_owned();
             let properties = json!({
                 "number": pr.number,
-                "title": pr.title,
+                "title": safe_title,
                 "author": pr.author.and_then(|a| a.login),
                 "created_at": pr.created_at,
                 "merged_at": pr.merged_at,
@@ -1302,7 +1332,7 @@ async fn ingest_prs(
                 "project_id": project_id.to_string(),
             });
             let name =
-                refs::truncate_chars(&format!("#{} {}", pr.number, pr.title), NAME_MAX_CHARS);
+                refs::truncate_chars(&format!("#{} {}", pr.number, safe_title), NAME_MAX_CHARS);
 
             budget.try_consume();
             let result = match registry
@@ -1742,5 +1772,52 @@ mod recovery_classifier_tests {
         std::fs::write(repo.join("a.txt"), b"hello").unwrap();
         run(&["add", "a.txt"]);
         run(&["commit", "-q", "-m", "initial"]);
+    }
+}
+
+#[cfg(test)]
+mod truncation_tests {
+    use super::*;
+
+    #[test]
+    fn under_cap_content_is_not_truncated() {
+        let content = "a".repeat(MAX_COMMIT_EMBED_BYTES - 1);
+        assert_eq!(truncated_embedding_head(&content), None);
+    }
+
+    #[test]
+    fn exactly_at_cap_content_is_not_truncated() {
+        let content = "a".repeat(MAX_COMMIT_EMBED_BYTES);
+        assert_eq!(truncated_embedding_head(&content), None);
+    }
+
+    #[test]
+    fn over_cap_content_is_truncated_to_exactly_the_cap() {
+        let content = "a".repeat(MAX_COMMIT_EMBED_BYTES + 1);
+        let head = truncated_embedding_head(&content).expect("over cap must truncate");
+        assert_eq!(head.len(), MAX_COMMIT_EMBED_BYTES);
+        assert!(content.starts_with(head));
+    }
+
+    /// A multibyte scalar (3-byte '€') straddling the byte cap must roll the
+    /// boundary back to the nearest valid char boundary rather than panicking
+    /// or splitting the scalar.
+    #[test]
+    fn multibyte_scalar_straddling_cap_rolls_back_to_char_boundary() {
+        // Fill up to one byte short of the cap with ASCII, then place a
+        // 3-byte character exactly across the boundary.
+        let mut content = "a".repeat(MAX_COMMIT_EMBED_BYTES - 1);
+        content.push('€'); // 3 bytes: straddles byte 32_768..32_771
+        content.push_str("tail-sentinel");
+
+        let head = truncated_embedding_head(&content).expect("over cap must truncate");
+        assert!(head.len() <= MAX_COMMIT_EMBED_BYTES);
+        assert!(content.is_char_boundary(head.len()));
+        assert!(std::str::from_utf8(head.as_bytes()).is_ok());
+        assert!(content.starts_with(head));
+        assert!(
+            !head.contains("tail-sentinel"),
+            "head must not include text past the cap"
+        );
     }
 }

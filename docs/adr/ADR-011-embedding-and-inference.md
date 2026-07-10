@@ -88,9 +88,13 @@ pub struct RuntimeConfig {
 }
 ```
 
-`None` disables embedding. Vector and hybrid search return `Unconfigured("embedding_model")`.
-Text-only search and graph traversal still work. This is the "KG without semantic search"
-deployment.
+Setting `embedding_model` to `None` alone does not disable embedding: `additional_embedding_models`
+is populated independently and those models are still registered. Both `embedding_model` and
+`additional_embedding_models` must be empty to disable built-in embedding model registration —
+use `RuntimeConfig::no_embeddings()`, the canonical constructor for this. With both cleared,
+direct vector search returns `Unconfigured("embedding_model")`, hybrid search skips the vector
+leg and falls back to text-only results, and text-only search / graph traversal still work. This is the "KG without semantic search" deployment. Custom embedder
+providers registered later by packs are not affected by this setting.
 
 Model overrides at the call site are not currently supported — the runtime is configured
 with one active model. Multi-model serving (different models for different namespaces or
