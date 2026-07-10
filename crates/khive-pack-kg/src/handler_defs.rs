@@ -64,6 +64,16 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 18] = [
                 description: "Free-text description (entities).",
             },
             ParamDef {
+                name: "embedding_content",
+                param_type: "string",
+                required: false,
+                description: "Singleton kind=note only. A non-empty proper prefix of \
+                              `content` to send to the vector embedder instead of the \
+                              full text — use when `content` exceeds an embedder's \
+                              input cap. Stored and FTS-indexed content are always the \
+                              full `content`; this only replaces the vector input.",
+            },
+            ParamDef {
                 name: "tags",
                 param_type: "array of string",
                 required: false,

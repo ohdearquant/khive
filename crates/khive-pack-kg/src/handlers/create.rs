@@ -40,6 +40,7 @@ impl KgPack {
             "properties",
             "salience",
             "annotates",
+            "embedding_content",
             "skip_dedup_check",
             "edges",
             "title",
@@ -89,6 +90,11 @@ impl KgPack {
                 None
             };
             if let Some(entries) = maybe_items {
+                if params.get("embedding_content").is_some() {
+                    return Err(RuntimeError::InvalidInput(
+                        "embedding_content is only valid for a singleton kind=note create, not bulk `items`".into(),
+                    ));
+                }
                 let attempted = entries.len();
                 if attempted > 1000 {
                     return Err(RuntimeError::InvalidInput(
@@ -300,6 +306,11 @@ impl KgPack {
 
         let (mut response, new_id) = match p.kind.as_str() {
             "entity" => {
+                if p.embedding_content.is_some() {
+                    return Err(RuntimeError::InvalidInput(
+                        "embedding_content is only valid for kind=note".into(),
+                    ));
+                }
                 let canonical = sub_kind.clone().expect("entity_kind canonicalized above");
                 let name = p.name.ok_or_else(|| {
                     RuntimeError::InvalidInput("kind=entity requires 'name'".into())
@@ -338,11 +349,12 @@ impl KgPack {
                 let properties = super::common::merge_note_tags(p.properties, p.tags)?;
                 let note = self
                     .runtime
-                    .create_note(
+                    .create_note_with_embedding_content(
                         token,
                         &canonical,
                         p.name.as_deref(),
                         &content,
+                        p.embedding_content.as_deref(),
                         p.salience,
                         properties,
                         annotates,
