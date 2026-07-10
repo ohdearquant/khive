@@ -245,6 +245,19 @@ pub enum FilterOp {
     /// Equivalent to `json_type IS NULL OR json_type != value`.
     /// Used for unread filter: matches any `$.read` that is NOT the JSON boolean true.
     JsonTypeNeMissing,
+    /// Matches rows where `json_extract(properties, path)` equals any value in
+    /// the set. A row with a missing/NULL property does not match — use
+    /// `NotInOrMissing` with the complementary set when "absent" should count
+    /// as included. `PropertyFilter.value` is unused for this op; the set
+    /// lives in the variant itself.
+    In(Vec<SqlValue>),
+    /// Matches rows where the property is missing/NULL OR its value is not in
+    /// the set. Used for "exclude a small closed set of terminal values, but
+    /// treat a still-unset property as included" (e.g. GTD default task
+    /// listing excludes `done`/`cancelled` while a task with no `status` yet
+    /// still counts as `inbox`, i.e. included). `PropertyFilter.value` is
+    /// unused for this op; the set lives in the variant itself.
+    NotInOrMissing(Vec<SqlValue>),
 }
 
 /// A single `json_extract(properties, '$.field') op value` predicate.

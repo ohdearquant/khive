@@ -2270,3 +2270,226 @@ async fn complete_blocks_secret_in_result() {
         "gtd.complete with secret in result must be rejected; got: {result:?}"
     );
 }
+
+// ── Issue #772: fixed-window pre-fetch-then-filter regression tests ─────────
+
+/// `gtd.next` must surface an actionable task even when 500+ newer,
+/// non-actionable task notes exist. Before the fix, `handle_next` pre-fetched
+/// only the newest 500 task notes (unfiltered) via `list_notes` and applied
+/// the actionable-status filter afterward in Rust — an older `next`/`active`
+/// task falling outside that fixed window was silently invisible regardless
+/// of priority.
+#[tokio::test]
+async fn next_finds_actionable_task_older_than_fixed_window() {
+    use khive_storage::note::Note;
+
+    let runtime = rt();
+    let token = runtime
+        .authorize(khive_runtime::Namespace::local())
+        .unwrap();
+    let note_store = runtime.notes(&token).expect("note store");
+
+    // An old, actionable p0 task — created long before any filler task.
+    let old_ts = chrono::Utc::now().timestamp_micros() - 1_000_000_000_000; // ~11 days ago
+    let old_task = Note {
+        id: uuid::Uuid::new_v4(),
+        namespace: "local".to_string(),
+        kind: "task".to_string(),
+        status: "active".to_string(),
+        name: Some("ancient-p0".to_string()),
+        content: "ancient p0 task".to_string(),
+        salience: None,
+        decay_factor: None,
+        expires_at: None,
+        properties: Some(json!({"status": "next", "priority": "p0"})),
+        created_at: old_ts,
+        updated_at: old_ts,
+        deleted_at: None,
+    };
+    note_store
+        .upsert_note(old_task)
+        .await
+        .expect("insert old task");
+
+    // Pad with 501 newer, non-actionable (inbox) task notes — more than the
+    // legacy fixed 500-row window, none of which are actionable themselves.
+    let now = chrono::Utc::now().timestamp_micros();
+    let fillers: Vec<Note> = (0..501_u32)
+        .map(|i| Note {
+            id: uuid::Uuid::new_v4(),
+            namespace: "local".to_string(),
+            kind: "task".to_string(),
+            status: "active".to_string(),
+            name: Some(format!("filler-{i}")),
+            content: format!("filler task {i}"),
+            salience: None,
+            decay_factor: None,
+            expires_at: None,
+            properties: Some(json!({"status": "inbox"})),
+            created_at: now + i64::from(i),
+            updated_at: now + i64::from(i),
+            deleted_at: None,
+        })
+        .collect();
+    note_store
+        .upsert_notes(fillers)
+        .await
+        .expect("insert fillers");
+
+    let pack = pack(runtime);
+    let result = pack.dispatch("gtd.next", json!({})).await.unwrap();
+    let arr = result.as_array().unwrap();
+    assert!(
+        arr.iter()
+            .any(|t| t["title"].as_str() == Some("ancient-p0")),
+        "gtd.next must surface an actionable p0 task older than 500 newer \
+         non-actionable tasks (issue #772); result: {result:?}"
+    );
+    assert_eq!(
+        arr[0]["title"], "ancient-p0",
+        "the ancient p0 task must sort first by priority"
+    );
+}
+
+/// `gtd.tasks(status="done")` must surface a done task even when 500+ newer,
+/// non-done task notes exist. Before the fix, `handle_tasks` pre-fetched
+/// `offset + limit + 500` task notes (unfiltered, always from offset 0) via
+/// `list_notes` and applied the status filter afterward in Rust — an older
+/// `done` task falling outside that window was silently invisible.
+#[tokio::test]
+async fn tasks_finds_done_task_older_than_fixed_window() {
+    use khive_storage::note::Note;
+
+    let runtime = rt();
+    let token = runtime
+        .authorize(khive_runtime::Namespace::local())
+        .unwrap();
+    let note_store = runtime.notes(&token).expect("note store");
+
+    let old_ts = chrono::Utc::now().timestamp_micros() - 1_000_000_000_000;
+    let old_task = Note {
+        id: uuid::Uuid::new_v4(),
+        namespace: "local".to_string(),
+        kind: "task".to_string(),
+        status: "active".to_string(),
+        name: Some("ancient-done".to_string()),
+        content: "ancient done task".to_string(),
+        salience: None,
+        decay_factor: None,
+        expires_at: None,
+        properties: Some(json!({"status": "done"})),
+        created_at: old_ts,
+        updated_at: old_ts,
+        deleted_at: None,
+    };
+    note_store
+        .upsert_note(old_task)
+        .await
+        .expect("insert old done task");
+
+    // The legacy default window was offset(0) + limit(50) + 500 = 550; 600
+    // newer non-done fillers exceed that so the always-offset-0 fetch never
+    // reached the ancient done task.
+    let now = chrono::Utc::now().timestamp_micros();
+    let fillers: Vec<Note> = (0..600_u32)
+        .map(|i| Note {
+            id: uuid::Uuid::new_v4(),
+            namespace: "local".to_string(),
+            kind: "task".to_string(),
+            status: "active".to_string(),
+            name: Some(format!("filler-{i}")),
+            content: format!("filler task {i}"),
+            salience: None,
+            decay_factor: None,
+            expires_at: None,
+            properties: Some(json!({"status": "inbox"})),
+            created_at: now + i64::from(i),
+            updated_at: now + i64::from(i),
+            deleted_at: None,
+        })
+        .collect();
+    note_store
+        .upsert_notes(fillers)
+        .await
+        .expect("insert fillers");
+
+    let pack = pack(runtime);
+    let result = pack
+        .dispatch("gtd.tasks", json!({"status": "done"}))
+        .await
+        .unwrap();
+    let arr = result.as_array().unwrap();
+    assert!(
+        arr.iter()
+            .any(|t| t["title"].as_str() == Some("ancient-done")),
+        "gtd.tasks(status=\"done\") must surface a done task older than the \
+         legacy fixed pre-fetch window (issue #772); result: {result:?}"
+    );
+}
+
+/// `gtd.tasks` pages must not overlap: real SQL-level `LIMIT`/`OFFSET`
+/// pagination (this fix) must keep behaving correctly for the common case
+/// where every row already matches the filter, guarding against a regression
+/// back to any offset-0-refetch pattern.
+#[tokio::test]
+async fn tasks_pagination_returns_disjoint_pages() {
+    use khive_storage::note::Note;
+    use std::collections::HashSet;
+
+    let runtime = rt();
+    let token = runtime
+        .authorize(khive_runtime::Namespace::local())
+        .unwrap();
+    let note_store = runtime.notes(&token).expect("note store");
+
+    let now = chrono::Utc::now().timestamp_micros();
+    let tasks: Vec<Note> = (0..60_u32)
+        .map(|i| Note {
+            id: uuid::Uuid::new_v4(),
+            namespace: "local".to_string(),
+            kind: "task".to_string(),
+            status: "active".to_string(),
+            name: Some(format!("task-{i}")),
+            content: format!("task {i}"),
+            salience: None,
+            decay_factor: None,
+            expires_at: None,
+            properties: Some(json!({"status": "next"})),
+            created_at: now + i64::from(i),
+            updated_at: now + i64::from(i),
+            deleted_at: None,
+        })
+        .collect();
+    note_store.upsert_notes(tasks).await.expect("insert tasks");
+
+    let pack = pack(runtime);
+    let page1 = pack
+        .dispatch("gtd.tasks", json!({"limit": 20, "offset": 0}))
+        .await
+        .unwrap();
+    let page2 = pack
+        .dispatch("gtd.tasks", json!({"limit": 20, "offset": 20}))
+        .await
+        .unwrap();
+
+    let ids1: HashSet<&str> = page1
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["full_id"].as_str().unwrap())
+        .collect();
+    let ids2: HashSet<&str> = page2
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["full_id"].as_str().unwrap())
+        .collect();
+
+    assert_eq!(ids1.len(), 20);
+    assert_eq!(ids2.len(), 20);
+    assert!(
+        ids1.is_disjoint(&ids2),
+        "pages at different offsets must not overlap (issue #772 offset-0 \
+         refetch bug); page1={ids1:?} page2={ids2:?}"
+    );
+}

@@ -428,7 +428,7 @@ fn build_note_filter_where(
     }
 
     for pf in &filter.property_filters {
-        match pf.op {
+        match &pf.op {
             FilterOp::EqOrMissing => {
                 let expr = json_extract_expr(&pf.json_path);
                 params.push(sql_value_param(&pf.value)?);
@@ -448,6 +448,36 @@ fn build_note_filter_where(
                 let n = params.len();
                 conditions.push(format!("({type_expr} IS NULL OR {type_expr} != ?{n})"));
             }
+            FilterOp::In(values) => {
+                let expr = json_extract_expr(&pf.json_path);
+                if values.is_empty() {
+                    // An empty set can never match any row.
+                    conditions.push("0".to_string());
+                    continue;
+                }
+                let mut placeholders = Vec::with_capacity(values.len());
+                for v in values {
+                    params.push(sql_value_param(v)?);
+                    placeholders.push(format!("?{}", params.len()));
+                }
+                conditions.push(format!("{expr} IN ({})", placeholders.join(", ")));
+            }
+            FilterOp::NotInOrMissing(values) => {
+                let expr = json_extract_expr(&pf.json_path);
+                if values.is_empty() {
+                    // Nothing to exclude — every row (including missing) matches.
+                    continue;
+                }
+                let mut placeholders = Vec::with_capacity(values.len());
+                for v in values {
+                    params.push(sql_value_param(v)?);
+                    placeholders.push(format!("?{}", params.len()));
+                }
+                conditions.push(format!(
+                    "({expr} IS NULL OR {expr} NOT IN ({}))",
+                    placeholders.join(", ")
+                ));
+            }
             _ => {
                 let expr = json_extract_expr(&pf.json_path);
                 let op = match pf.op {
@@ -457,7 +487,11 @@ fn build_note_filter_where(
                     FilterOp::Lte => "<=",
                     FilterOp::Gt => ">",
                     FilterOp::Gte => ">=",
-                    FilterOp::EqOrMissing | FilterOp::JsonTypeEq | FilterOp::JsonTypeNeMissing => {
+                    FilterOp::EqOrMissing
+                    | FilterOp::JsonTypeEq
+                    | FilterOp::JsonTypeNeMissing
+                    | FilterOp::In(_)
+                    | FilterOp::NotInOrMissing(_) => {
                         unreachable!()
                     }
                 };
