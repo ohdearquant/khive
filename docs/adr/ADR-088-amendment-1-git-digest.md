@@ -47,7 +47,9 @@ git.digest(source, project?, max_items?, include?)
 - `include` (optional, array of `commits|issues|pull_requests`, default all three).
 
 Return shape: the existing `IngestReport` (counts, skips, warnings, `gh_available`)
-extended with `done: bool`, `project_id`, and `project_created: bool`.
+extended with `done: bool`, `project_id`, `project_created: bool`, and
+`commit_embeddings_truncated: u64` (count of commits whose vector-embedding input was
+capped this pass; see "Commit embedding truncation" below).
 
 ### Remote-URL mode
 
@@ -125,6 +127,20 @@ Data-fidelity checks from the same evidence run were verified clean: `closed_at`
 that cluster at one instant reflect real GitHub bulk-close events (confirmed against
 `gh issue view`), and `author` is the genuine GitHub login (commit author names come from
 git identity, a different identity system — both correct).
+
+## Commit embedding truncation (issue #764, 2026-07-10)
+
+Commit note content (subject plus body, after secret masking) has no upper bound, but
+vector embedders do. When a commit's content exceeds 32,768 bytes, the ingester computes a
+UTF-8-boundary-safe head prefix at that cap and passes it as the `create` verb's
+`embedding_content` parameter. Only the vector-embedding input is capped this way: the
+full, untruncated commit content is always stored and FTS-indexed unchanged. Each commit
+whose embedding input was truncated increments `commit_embeddings_truncated` in the
+returned `IngestReport`; the field is `0` for a pass with no over-cap commits.
+
+This reuses the pack-kg `create` verb's existing `embedding_content` parameter (a
+non-empty proper prefix of `content`, subject to the same secret-gate check as any other
+stored text) rather than adding pack-git-local truncation logic.
 
 ## Consequences
 

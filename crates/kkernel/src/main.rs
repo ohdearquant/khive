@@ -327,13 +327,20 @@ async fn main() -> Result<()> {
                 #[cfg(not(unix))]
                 let boot_guard: Option<std::fs::File> = None;
 
-                let server = build_multi_backend_server_with_coordinator(
+                let (server, schedule_rt) = build_multi_backend_server_with_coordinator(
                     base_cfg,
                     &khive_cfg,
                     a.db.as_deref(),
                 )?;
 
-                khive_mcp::serve::serve_server(server, &a, &transport_registry, boot_guard).await
+                khive_mcp::serve::serve_server(
+                    server,
+                    &a,
+                    &transport_registry,
+                    boot_guard,
+                    schedule_rt,
+                )
+                .await
             }
         }
         Command::Backend(b) => cmd_backend(b),
@@ -415,13 +422,27 @@ fn resolve_command(exec: Option<String>, command: Option<Command>) -> Command {
 /// Extraction also makes this branch directly comparable, in a test, against
 /// `khive_mcp::serve::build_server_multi_backend` (the sibling boot path) —
 /// see `multi_backend_boot_paths_share_identical_wiring_surface` below.
+///
+/// Also returns the resolved `"schedule"`-pack runtime (ADR-106), read out of
+/// the same `multi.per_pack_runtimes` map used to build the coordinator's
+/// `BackendRegistry` below — `None` when the resolved pack set does not
+/// include `"schedule"`. The caller threads this through
+/// `khive_mcp::serve::serve_server` so the daemon-resident tick loop
+/// (`spawn_schedule_tick_loop_if_daemon`) drains the exact backend this
+/// coordinator-attached boot resolved, never a re-derived config (codex PR
+/// #782 review, High finding).
 fn build_multi_backend_server_with_coordinator(
     base_cfg: RuntimeConfig,
     khive_cfg: &KhiveConfig,
     cli_db_override: Option<&str>,
-) -> Result<khive_mcp::server::KhiveMcpServer> {
+) -> Result<(khive_mcp::server::KhiveMcpServer, Option<KhiveRuntime>)> {
     let multi =
         khive_mcp::serve::build_registry_for_multi_backend(base_cfg, khive_cfg, cli_db_override)?;
+
+    let schedule_rt = multi
+        .per_pack_runtimes
+        .get("schedule")
+        .map(|rt| (**rt).clone());
 
     // Build BackendRegistry: one entry per unique backend (deduplicated
     // by backend_name so packs sharing a backend share one runtime).
@@ -447,11 +468,12 @@ fn build_multi_backend_server_with_coordinator(
     let coord =
         SubstrateCoordinatorService::new(SubstrateCoordinator::new(backend_reg), note_kinds);
 
-    Ok(khive_mcp::serve::build_server_from_multi_backend_registry(
+    let server = khive_mcp::serve::build_server_from_multi_backend_registry(
         multi,
         khive_cfg,
         Some(Arc::new(coord) as Arc<dyn khive_mcp::coordinator::CoordinatorService>),
-    ))
+    );
+    Ok((server, schedule_rt))
 }
 
 async fn cmd_db(cmd: DbCommand) -> Result<()> {
@@ -963,7 +985,7 @@ mod tests {
         )
         .expect("plain multi-backend boot must succeed");
 
-        let coordinator_server = build_multi_backend_server_with_coordinator(
+        let (coordinator_server, _schedule_rt) = build_multi_backend_server_with_coordinator(
             base_multi_backend_runtime_config(),
             &khive_cfg,
             None,
@@ -997,7 +1019,7 @@ mod tests {
         )
         .expect("plain multi-backend boot must succeed");
 
-        let coordinator_server = build_multi_backend_server_with_coordinator(
+        let (coordinator_server, _schedule_rt) = build_multi_backend_server_with_coordinator(
             base_multi_backend_runtime_config(),
             &khive_cfg,
             None,
@@ -1074,7 +1096,7 @@ mod tests {
         )
         .expect("plain multi-backend boot must succeed");
 
-        let coordinator_server = build_multi_backend_server_with_coordinator(
+        let (coordinator_server, _schedule_rt) = build_multi_backend_server_with_coordinator(
             base_multi_backend_runtime_config(),
             &khive_cfg,
             None,
@@ -1202,8 +1224,9 @@ mod tests {
             ..base_multi_backend_runtime_config()
         };
 
-        let server = build_multi_backend_server_with_coordinator(base_cfg, &khive_cfg, None)
-            .expect("coordinator-attached multi-backend boot must succeed");
+        let (server, _schedule_rt) =
+            build_multi_backend_server_with_coordinator(base_cfg, &khive_cfg, None)
+                .expect("coordinator-attached multi-backend boot must succeed");
 
         let dispatch = |ops: String| {
             let server = &server;
