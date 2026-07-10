@@ -408,8 +408,23 @@ fn sanitize_fts5_token_group(token: &str) -> Option<String> {
         alternatives.push(format!("({})", split_terms.join(" ")));
     }
 
+    // An operator-bearing token (e.g. `NEAR(alpha-beta,5)`) can make the
+    // legacy merge itself collapse to multiple space-separated terms rather
+    // than one bareword: pass 1 of `sanitize_fts5_query_legacy_merged` spaces
+    // out `(`, `)`, and `,` while pass 2 removes `-`/`.` outright, so
+    // `NEAR(alpha-beta,5)` merges to `"alphabeta 5"`, not one word. Pushed
+    // unguarded, that multi-term fragment carries the same trigram-unsafe
+    // `5` the split-group check above exists to exclude, and under FTS5's
+    // implicit-AND adjacency it silently drops, broadening the OR-alternative
+    // to any row containing `alphabeta`. Apply the same trigram-safety gate
+    // here whenever the merge is multi-term.
     let merged = sanitize_fts5_query_legacy_merged(token);
-    if !merged.is_empty() && merged != split_terms.join("") {
+    let merged_terms: Vec<&str> = merged.split_whitespace().collect();
+    let merged_has_unsafe_segment = merged_terms.len() > 1
+        && merged_terms
+            .iter()
+            .any(|t| t.chars().count() < FTS5_TRIGRAM_MIN_SAFE_LEN);
+    if !merged.is_empty() && merged != split_terms.join("") && !merged_has_unsafe_segment {
         alternatives.push(merged);
     }
 
