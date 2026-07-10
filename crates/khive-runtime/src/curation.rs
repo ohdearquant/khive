@@ -318,6 +318,7 @@ impl KhiveRuntime {
         into_id: Uuid,
         from_id: Uuid,
         strategy: EntityDedupMergePolicy,
+        content_strategy: ContentMergeStrategy,
         dry_run: bool,
     ) -> RuntimeResult<MergeSummary> {
         if into_id == from_id {
@@ -371,7 +372,15 @@ impl KhiveRuntime {
             writer_task
                 .send(move |conn| {
                     merge_entity_sql(
-                        conn, ns, fts_table, vec_tables, into_id, from_id, strategy, dry_run,
+                        conn,
+                        ns,
+                        fts_table,
+                        vec_tables,
+                        into_id,
+                        from_id,
+                        strategy,
+                        content_strategy,
+                        dry_run,
                     )
                     .map_err(|e| {
                         khive_storage::StorageError::driver(
@@ -388,7 +397,15 @@ impl KhiveRuntime {
                 let guard = pool.writer()?;
                 guard.transaction(|conn| {
                     merge_entity_sql(
-                        conn, ns, fts_table, vec_tables, into_id, from_id, strategy, dry_run,
+                        conn,
+                        ns,
+                        fts_table,
+                        vec_tables,
+                        into_id,
+                        from_id,
+                        strategy,
+                        content_strategy,
+                        dry_run,
                     )
                 })
             })
@@ -995,6 +1012,7 @@ fn merge_entity_sql(
     into_id: Uuid,
     from_id: Uuid,
     strategy: EntityDedupMergePolicy,
+    content_strategy: ContentMergeStrategy,
     dry_run: bool,
 ) -> Result<(MergeSummary, Entity), SqliteError> {
     let into_entity = read_merge_entity(conn, into_id, &namespace)?;
@@ -1067,8 +1085,23 @@ fn merge_entity_sql(
     let (merged_props, properties_merged) =
         merge_properties(&into_entity.properties, &from_entity.properties, strategy);
     let merged_name = merge_string_field(&into_entity.name, &from_entity.name, strategy);
-    let merged_description =
-        merge_option_string_field(&into_entity.description, &from_entity.description, strategy);
+    let (merged_description, content_appended) = match content_strategy {
+        ContentMergeStrategy::Append => {
+            let into_desc = into_entity.description.as_deref().unwrap_or("");
+            let from_desc = from_entity.description.as_deref().unwrap_or("");
+            if from_desc.is_empty() {
+                (into_entity.description.clone(), false)
+            } else if into_desc.is_empty() {
+                (from_entity.description.clone(), true)
+            } else {
+                (Some(format!("{}\n\n---\n\n{}", into_desc, from_desc)), true)
+            }
+        }
+        ContentMergeStrategy::PreferInto | ContentMergeStrategy::PreferFrom => (
+            merge_option_string_field(&into_entity.description, &from_entity.description, strategy),
+            false,
+        ),
+    };
     let (merged_tags, tags_unioned) = union_tags(&into_entity.tags, &from_entity.tags);
 
     let now = chrono::Utc::now().timestamp_micros();
@@ -1292,7 +1325,7 @@ fn merge_entity_sql(
             edges_rewired,
             properties_merged,
             tags_unioned,
-            content_appended: false,
+            content_appended,
             dry_run,
         },
         updated_entity,
@@ -2118,7 +2151,14 @@ mod tests {
             .unwrap();
 
         let summary = rt
-            .merge_entity(&tok, d.id, b.id, EntityDedupMergePolicy::PreferInto, false)
+            .merge_entity(
+                &tok,
+                d.id,
+                b.id,
+                EntityDedupMergePolicy::PreferInto,
+                ContentMergeStrategy::Append,
+                false,
+            )
             .await
             .unwrap();
 
@@ -2151,7 +2191,14 @@ mod tests {
             .await
             .unwrap();
         let err = rt
-            .merge_entity(&tok, a.id, a.id, EntityDedupMergePolicy::PreferInto, false)
+            .merge_entity(
+                &tok,
+                a.id,
+                a.id,
+                EntityDedupMergePolicy::PreferInto,
+                ContentMergeStrategy::Append,
+                false,
+            )
             .await
             .unwrap_err();
         assert!(
@@ -2194,6 +2241,7 @@ mod tests {
             into.id,
             from.id,
             EntityDedupMergePolicy::PreferInto,
+            ContentMergeStrategy::Append,
             false,
         )
         .await
@@ -2240,6 +2288,7 @@ mod tests {
             into.id,
             from.id,
             EntityDedupMergePolicy::PreferFrom,
+            ContentMergeStrategy::Append,
             false,
         )
         .await
@@ -2281,9 +2330,16 @@ mod tests {
             .await
             .unwrap();
 
-        rt.merge_entity(&tok, into.id, from.id, EntityDedupMergePolicy::Union, false)
-            .await
-            .unwrap();
+        rt.merge_entity(
+            &tok,
+            into.id,
+            from.id,
+            EntityDedupMergePolicy::Union,
+            ContentMergeStrategy::Append,
+            false,
+        )
+        .await
+        .unwrap();
 
         let kept = rt.get_entity(&tok, into.id).await.unwrap();
         let props = kept.properties.unwrap();
@@ -2326,6 +2382,7 @@ mod tests {
             into.id,
             from.id,
             EntityDedupMergePolicy::PreferInto,
+            ContentMergeStrategy::Append,
             false,
         )
         .await
@@ -2356,7 +2413,14 @@ mod tests {
             .unwrap();
 
         let summary = rt
-            .merge_entity(&tok, a.id, b.id, EntityDedupMergePolicy::PreferInto, false)
+            .merge_entity(
+                &tok,
+                a.id,
+                b.id,
+                EntityDedupMergePolicy::PreferInto,
+                ContentMergeStrategy::Append,
+                false,
+            )
             .await
             .unwrap();
 
@@ -2370,6 +2434,182 @@ mod tests {
             .await
             .unwrap();
         assert!(a_out.is_empty(), "no self-loop should remain");
+    }
+
+    // ---- #778: content_strategy for entity merge ----
+
+    #[tokio::test]
+    async fn merge_entity_append_strategy_concatenates_descriptions() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+        let into = rt
+            .create_entity(&tok, "concept", None, "Into", Some("desc A"), None, vec![])
+            .await
+            .unwrap();
+        let from = rt
+            .create_entity(&tok, "concept", None, "From", Some("desc B"), None, vec![])
+            .await
+            .unwrap();
+
+        let summary = rt
+            .merge_entity(
+                &tok,
+                into.id,
+                from.id,
+                EntityDedupMergePolicy::PreferInto,
+                ContentMergeStrategy::Append,
+                false,
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            summary.content_appended,
+            "append strategy with two non-empty descriptions must report content_appended=true"
+        );
+        let kept = rt.get_entity(&tok, into.id).await.unwrap();
+        assert_eq!(kept.description.as_deref(), Some("desc A\n\n---\n\ndesc B"));
+    }
+
+    #[tokio::test]
+    async fn merge_entity_append_strategy_from_empty_is_noop() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+        let into = rt
+            .create_entity(&tok, "concept", None, "Into", Some("desc A"), None, vec![])
+            .await
+            .unwrap();
+        let from = rt
+            .create_entity(&tok, "concept", None, "From", None, None, vec![])
+            .await
+            .unwrap();
+
+        let summary = rt
+            .merge_entity(
+                &tok,
+                into.id,
+                from.id,
+                EntityDedupMergePolicy::PreferInto,
+                ContentMergeStrategy::Append,
+                false,
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            !summary.content_appended,
+            "from's empty description means nothing was appended"
+        );
+        let kept = rt.get_entity(&tok, into.id).await.unwrap();
+        assert_eq!(kept.description.as_deref(), Some("desc A"));
+    }
+
+    #[tokio::test]
+    async fn merge_entity_append_strategy_into_empty_takes_from() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+        let into = rt
+            .create_entity(&tok, "concept", None, "Into", None, None, vec![])
+            .await
+            .unwrap();
+        let from = rt
+            .create_entity(&tok, "concept", None, "From", Some("desc B"), None, vec![])
+            .await
+            .unwrap();
+
+        let summary = rt
+            .merge_entity(
+                &tok,
+                into.id,
+                from.id,
+                EntityDedupMergePolicy::PreferInto,
+                ContentMergeStrategy::Append,
+                false,
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            summary.content_appended,
+            "taking from's description into an empty into is real content preservation"
+        );
+        let kept = rt.get_entity(&tok, into.id).await.unwrap();
+        assert_eq!(kept.description.as_deref(), Some("desc B"));
+    }
+
+    #[tokio::test]
+    async fn merge_entity_prefer_into_strategy_still_discards_explicitly() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+        let into = rt
+            .create_entity(&tok, "concept", None, "Into", Some("desc A"), None, vec![])
+            .await
+            .unwrap();
+        let from = rt
+            .create_entity(&tok, "concept", None, "From", Some("desc B"), None, vec![])
+            .await
+            .unwrap();
+
+        let summary = rt
+            .merge_entity(
+                &tok,
+                into.id,
+                from.id,
+                EntityDedupMergePolicy::PreferInto,
+                ContentMergeStrategy::PreferInto,
+                false,
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            !summary.content_appended,
+            "explicit PreferInto opt-out must not report an append"
+        );
+        let kept = rt.get_entity(&tok, into.id).await.unwrap();
+        assert_eq!(
+            kept.description.as_deref(),
+            Some("desc A"),
+            "explicit PreferInto opt-out keeps the old discard behavior"
+        );
+    }
+
+    #[tokio::test]
+    async fn merge_entity_dry_run_previews_append() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+        let into = rt
+            .create_entity(&tok, "concept", None, "Into", Some("desc A"), None, vec![])
+            .await
+            .unwrap();
+        let from = rt
+            .create_entity(&tok, "concept", None, "From", Some("desc B"), None, vec![])
+            .await
+            .unwrap();
+
+        let summary = rt
+            .merge_entity(
+                &tok,
+                into.id,
+                from.id,
+                EntityDedupMergePolicy::PreferInto,
+                ContentMergeStrategy::Append,
+                true,
+            )
+            .await
+            .unwrap();
+
+        assert!(summary.dry_run);
+        assert!(
+            summary.content_appended,
+            "dry-run must preview the append outcome without writing"
+        );
+        let kept = rt.get_entity(&tok, into.id).await.unwrap();
+        assert_eq!(
+            kept.description.as_deref(),
+            Some("desc A"),
+            "dry_run=true must not mutate the into entity's description"
+        );
     }
 
     // ---- merge helper unit tests ----
@@ -2419,6 +2659,7 @@ mod tests {
             into.id,
             from_id,
             EntityDedupMergePolicy::PreferInto,
+            ContentMergeStrategy::Append,
             false,
         )
         .await
@@ -2846,6 +3087,7 @@ mod tests {
                 a.id,
                 b.id,
                 crate::EntityDedupMergePolicy::PreferInto,
+                ContentMergeStrategy::Append,
                 false,
             )
             .await
@@ -2915,6 +3157,7 @@ mod tests {
                 concept.id,
                 project.id,
                 crate::EntityDedupMergePolicy::PreferInto,
+                ContentMergeStrategy::Append,
                 false,
             )
             .await
@@ -2958,6 +3201,7 @@ mod tests {
                 c1.id,
                 c2.id,
                 crate::EntityDedupMergePolicy::PreferInto,
+                ContentMergeStrategy::Append,
                 false,
             )
             .await
@@ -3100,6 +3344,7 @@ mod tests {
                 foreign_b.id,
                 from_a.id,
                 EntityDedupMergePolicy::PreferInto,
+                ContentMergeStrategy::Append,
                 false,
             )
             .await;
@@ -3115,6 +3360,7 @@ mod tests {
                 into_a.id,
                 foreign_b.id,
                 EntityDedupMergePolicy::PreferInto,
+                ContentMergeStrategy::Append,
                 false,
             )
             .await;
@@ -3397,6 +3643,7 @@ mod tests {
             into_e.id,
             from_e.id,
             EntityDedupMergePolicy::PreferInto,
+            ContentMergeStrategy::Append,
             false,
         )
         .await
@@ -3623,6 +3870,7 @@ mod tests {
                 into_e.id,
                 from_e.id,
                 EntityDedupMergePolicy::PreferInto,
+                ContentMergeStrategy::Append,
                 false,
             )
             .await
