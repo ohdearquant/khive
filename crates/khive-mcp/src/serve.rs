@@ -347,6 +347,16 @@ async fn channel_poll_loop(
     let mut last_error_class: HashMap<(String, String), &'static str> = HashMap::new();
     let mut next_interval = HAPPY_PATH_INTERVAL;
     let event_store = registry.event_store();
+    // Captured before the loop's first sleep (issue #449 High follow-up,
+    // codex re-review). A channel's very first bootstrap floor must reflect
+    // when the daemon actually started, not whenever its first tick happens
+    // to fire: `tokio::time::sleep` below runs before any polling, so
+    // computing `now` after it (as the loop used to) can land on the far
+    // side of a calendar-day boundary the daemon started before. Every
+    // vacant `bootstrap_since` entry -- on tick 1 or any later tick a
+    // channel is first seen on -- uses this single startup timestamp
+    // instead of that tick's own `now`.
+    let startup_since = Utc::now();
 
     loop {
         tokio::time::sleep(next_interval).await;
@@ -356,7 +366,9 @@ async fn channel_poll_loop(
 
         for (kind, slug, channel) in channels.iter() {
             let backoff_key = (kind.to_string(), slug.to_string());
-            let since = *bootstrap_since.entry(backoff_key.clone()).or_insert(now);
+            let since = *bootstrap_since
+                .entry(backoff_key.clone())
+                .or_insert(startup_since);
             // Set once this channel's cycle durably completes (a fresh
             // commit, or nothing new to commit); gates whether `since`
             // advances past this tick's `now` for next time.
@@ -5991,6 +6003,67 @@ id = "lambda:project-actor"
                  calendar-day boundary would permanently skip the earlier \
                  day's uncommitted mail",
                 failing_calls[1]
+            );
+        }
+
+        /// First-tick regression (issue #449 High, codex re-review): the
+        /// very first bootstrap floor a channel ever sees must be seeded
+        /// from when the daemon started, not from whenever the loop's
+        /// first sleep happens to finish. Runs on a live (unpaused) clock
+        /// on purpose -- `tokio::time::pause` only fast-forwards the
+        /// virtual timer, not `Utc::now()`, so it cannot observe a
+        /// regression where `since` is captured after the sleep instead of
+        /// before the loop is entered. If the loop ever goes back to
+        /// computing that floor post-sleep, a daemon started just before
+        /// UTC midnight whose first tick lands just after it would seed
+        /// the new day and permanently skip the previous day's mail.
+        #[tokio::test]
+        async fn first_tick_uses_startup_time_not_post_sleep_time() {
+            let runtime = KhiveRuntime::memory().expect("in-memory runtime");
+            let mut builder = VerbRegistryBuilder::new();
+            builder.register(khive_pack_kg::KgPack::new(runtime.clone()));
+            builder.register(khive_pack_comm::CommPack::new(runtime.clone()));
+            let registry = builder.build().expect("registry builds");
+
+            let calls = Arc::new(Mutex::new(Vec::new()));
+            let mut ch_registry = ChannelRegistry::new();
+            ch_registry.register(Arc::new(RecordingChannel {
+                kind: "mock_startup_clock",
+                since_calls: calls.clone(),
+            }));
+
+            let startup = Utc::now();
+            let task = tokio::spawn(channel_poll_loop(
+                Arc::new(ch_registry),
+                registry.clone(),
+                "test-ns".to_string(),
+                "actor:test".to_string(),
+            ));
+
+            // Real-time wait for the loop's first (~5s) tick to fire.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+            loop {
+                if !calls.lock().unwrap().is_empty() {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() <= deadline,
+                    "first poll_page call did not arrive within 15s"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+            task.abort();
+
+            let first_since = calls.lock().unwrap()[0];
+            let drift_ms = (first_since - startup).num_milliseconds().abs();
+            assert!(
+                drift_ms < 2_000,
+                "the first poll_page call's `since` ({first_since:?}) must \
+                 reflect the daemon's startup time ({startup:?}), not a \
+                 timestamp captured after the loop's first ~5s sleep -- a \
+                 {drift_ms}ms drift means the floor is still seeded \
+                 post-sleep, which would drop a full day of mail if that \
+                 sleep happened to cross a calendar-day boundary"
             );
         }
     }
