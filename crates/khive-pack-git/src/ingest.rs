@@ -1136,9 +1136,10 @@ async fn ingest_prs(
 
             let raw_body = pr.body.unwrap_or_default();
             let content = secret_gate::mask_secrets(&raw_body).into_owned();
+            let safe_title = secret_gate::mask_secrets(&pr.title).into_owned();
             let properties = json!({
                 "number": pr.number,
-                "title": pr.title,
+                "title": safe_title,
                 "author": pr.author.and_then(|a| a.login),
                 "created_at": pr.created_at,
                 "merged_at": pr.merged_at,
@@ -1148,7 +1149,7 @@ async fn ingest_prs(
                 "project_id": project_id.to_string(),
             });
             let name =
-                refs::truncate_chars(&format!("#{} {}", pr.number, pr.title), NAME_MAX_CHARS);
+                refs::truncate_chars(&format!("#{} {}", pr.number, safe_title), NAME_MAX_CHARS);
 
             budget.try_consume();
             let result = match registry
