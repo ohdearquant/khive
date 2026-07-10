@@ -60,10 +60,11 @@ pub async fn run(args: Args, registry: &TransportRegistry) -> anyhow::Result<()>
     } else {
         khive_runtime::daemon::acquire_recovery_lock()
     };
-    let server = build_server(&args)?;
+    let (server, schedule_rt) = build_server(&args)?;
 
     #[cfg(feature = "channel-email")]
     spawn_email_channel_loops_if_daemon(&server, &args);
+    spawn_schedule_tick_loop_if_daemon(&args, &server, schedule_rt);
 
     #[cfg(unix)]
     if args.daemon {
@@ -127,6 +128,73 @@ fn spawn_email_channel_loops_if_daemon(server: &KhiveMcpServer, args: &Args) {
     } else {
         tracing::info!("email channel loops: skipped (client role; daemon owns channel loops)");
     }
+}
+
+/// Spawn the daemon-resident schedule-event tick loop (ADR-106) if — and
+/// only if — `args` indicates this process is the daemon. Mirrors
+/// [`spawn_email_channel_loops_if_daemon`]'s `args.daemon` role gate (#602):
+/// a short-lived `kkernel exec`/stdio client process never spawns this, only
+/// the daemon does, exactly once per live process. Unlike the email loops,
+/// this is not behind a Cargo feature — the schedule pack is always linked,
+/// so the tick loop is always available.
+///
+/// `schedule_rt` is the daemon's own resolved `"schedule"`-pack runtime
+/// handle, as returned by [`build_server`] (or threaded through
+/// [`serve_server`] by `kkernel`'s coordinator-attached multi-backend boot
+/// path). Passing the ALREADY-RESOLVED runtime, rather than deriving a fresh
+/// `RuntimeConfig` from raw `args.db`/an inferred namespace inside the tick,
+/// is the fix for codex PR #782 review's High finding: the daemon resolves
+/// `--config`/`[[backends]]`/actor identity/`--pack` selection once at boot,
+/// and a second independent resolution inside the tick could silently target
+/// a different database, actor identity, or pack set. `None` means either
+/// this isn't the daemon role, or the resolved pack set does not include
+/// `"schedule"` (nothing to drain) — either way the tick loop is skipped.
+///
+/// `server` is the daemon's own live, fully-wired `KhiveMcpServer` — the
+/// SAME one [`build_server`] returned alongside `schedule_rt` and that this
+/// process is about to serve. It is cloned (cheap — `Arc`-wrapped
+/// internally) and handed to the tick loop for action-dispatch only (round 2
+/// of codex PR #782 review's High finding, a continuation of the
+/// `schedule_rt`-only fix above): `schedule_rt` alone is correct for
+/// *scanning* `scheduled_event` rows (they live on the schedule pack's own
+/// backend), but building a throwaway `KhiveMcpServer` from `schedule_rt`
+/// alone for *dispatch* would register every pack against the schedule
+/// backend, so a replayed action belonging to another pack (e.g.
+/// `comm.send`) would route to the wrong backend in a multi-backend
+/// deployment. Passing the daemon's real `server` keeps replay routing
+/// identical to a live request.
+///
+/// If no daemon is running, scheduled events are simply not drained by this
+/// mechanism — the documented external-cron invocation
+/// (`kkernel exec --pending-events`) still works independently and safely
+/// races the tick loop when both are present (see the module docs on
+/// [`crate::pending_events`]).
+fn spawn_schedule_tick_loop_if_daemon(
+    args: &Args,
+    server: &KhiveMcpServer,
+    schedule_rt: Option<KhiveRuntime>,
+) {
+    if !args.daemon {
+        tracing::info!("schedule tick loop: skipped (client role; daemon owns the tick)");
+        return;
+    }
+    let Some(rt) = schedule_rt else {
+        tracing::info!(
+            "schedule tick loop: skipped (\"schedule\" pack is not in this daemon's \
+             resolved pack set)"
+        );
+        return;
+    };
+    let interval = crate::pending_events::tick_interval_from_env();
+    tracing::info!(
+        interval_secs = interval.as_secs(),
+        "schedule tick loop: spawning (daemon role)"
+    );
+    tokio::spawn(crate::pending_events::schedule_tick_loop(
+        rt,
+        server.clone(),
+        interval,
+    ));
 }
 
 /// Spawn the email channel polling + outbox loops if the `channel-email`
@@ -898,11 +966,19 @@ async fn channel_outbox_loop(
 /// migrations and applies pack schema plans, so the same
 /// acquire-before-construct/hold-through-bind pattern used in [`run`] applies
 /// here. Pass `None` only if the caller could not acquire the lock.
+///
+/// `schedule_rt` is the caller's resolved `"schedule"`-pack runtime handle
+/// (ADR-106) — see `spawn_schedule_tick_loop_if_daemon`. `kkernel`'s
+/// coordinator-attached multi-backend boot path resolves this from the same
+/// `MultiBackendRegistry.per_pack_runtimes` map it uses to build `server`
+/// itself, so the tick drains the identical backend/actor/pack configuration
+/// the live server serves.
 pub async fn serve_server(
     server: KhiveMcpServer,
     args: &Args,
     registry: &TransportRegistry,
     boot_guard: Option<std::fs::File>,
+    schedule_rt: Option<KhiveRuntime>,
 ) -> anyhow::Result<()> {
     if let Some(generation) = args.resumed_generation {
         tracing::warn!(
@@ -913,6 +989,7 @@ pub async fn serve_server(
     }
     #[cfg(feature = "channel-email")]
     spawn_email_channel_loops_if_daemon(&server, args);
+    spawn_schedule_tick_loop_if_daemon(args, &server, schedule_rt);
 
     #[cfg(unix)]
     if args.daemon {
@@ -1212,8 +1289,8 @@ pub(crate) fn is_strict_actor_mode() -> bool {
 /// - `build_server` and `build_server_multi_backend` in this file (the `kkernel mcp` paths)
 /// - `build_registry_for_multi_backend` in this file (the ADR-029 coordinator path)
 /// - `kkernel exec` (`crates/kkernel/src/exec.rs`) — dispatches arbitrary ops
-/// - `kkernel pending_events` (`crates/kkernel/src/pending_events.rs`) — drains
-///   and dispatches scheduled events
+/// - `khive_mcp::pending_events::run_pending_events` — drains and dispatches
+///   scheduled events
 ///
 /// **Pure-introspection registry construction is intentionally EXEMPT** because it
 /// never dispatches verbs or reads comm/tenant data, so it carries no
@@ -1239,16 +1316,70 @@ pub fn enforce_strict_actor_mode(
 }
 
 /// Build a fully-configured server from parsed args (without serving).
-pub fn build_server(args: &Args) -> anyhow::Result<KhiveMcpServer> {
+///
+/// Returns, alongside the server, the resolved [`KhiveRuntime`] handle the
+/// `"schedule"` pack is bound to — `None` when the resolved pack set does not
+/// include `"schedule"` — for `spawn_schedule_tick_loop_if_daemon` to drain
+/// against (ADR-106). This is the SAME runtime the server itself dispatches
+/// through: a single-backend boot shares one `KhiveRuntime` across every
+/// pack, and a multi-backend boot (ADR-028 `[[backends]]`) returns the
+/// specific per-pack runtime `"schedule"` was wired to. Threading this
+/// through — rather than having the tick loop re-resolve its own
+/// `RuntimeConfig` from raw `--db`/namespace args — is the fix for codex PR
+/// #782 review's High finding: a second, independently-resolved config could
+/// silently target a different database, actor identity, or pack set than
+/// the daemon it claims to serve.
+///
+/// Thin wrapper over [`build_server_with_explicit_namespace`]: derives the
+/// `(namespace, namespace_explicit)` pair from a real CLI parse via
+/// [`resolve_cli_namespace`], and — because this is the genuine `--actor`
+/// / `--namespace` CLI flag path — also treats that explicitness as a real
+/// actor override (`actor_explicit` mirrors `namespace_explicit` here; see
+/// `RuntimeConfigInputs::actor_explicit`'s field doc for why only this call
+/// site is allowed to do that).
+pub fn build_server(args: &Args) -> anyhow::Result<(KhiveMcpServer, Option<KhiveRuntime>)> {
     let (cli_namespace_explicit, cli_namespace) =
         resolve_cli_namespace(args).map_err(|e| anyhow::anyhow!("{e}"))?;
+    build_server_with_explicit_namespace(
+        args,
+        cli_namespace,
+        cli_namespace_explicit,
+        cli_namespace_explicit,
+    )
+}
 
+/// Build a fully-configured server from parsed args plus an independently
+/// resolved `(namespace, namespace_explicit, actor_explicit)` triple.
+///
+/// Extracted from [`build_server`] (PR #782 review round 4, High finding) so
+/// that non-interactive-CLI callers — e.g. the `--pending-events` one-shot
+/// drain wrapper in `pending_events.rs` — can supply a namespace default
+/// without it being misread as a genuine `--actor` override. `build_server`
+/// derives its namespace from a real CLI parse (`resolve_cli_namespace`),
+/// where "a namespace value is present" and "the operator explicitly
+/// overrode the actor identity" are the same fact by construction — there is
+/// no way to type `--namespace foo` without meaning it. A caller that
+/// synthesizes an `Args` value programmatically (no real flag parse behind
+/// it) does not get to make that same inference: passing a default
+/// namespace through `namespace_explicit: true` while asserting the actor
+/// identity was never touched (`actor_explicit: false`) is exactly the
+/// `kkernel exec` / `kkernel reindex` shape (see their own
+/// `resolve_runtime_config` call sites and the field doc on
+/// `RuntimeConfigInputs::actor_explicit`), and this function is the seam
+/// that lets any caller opt into that same, narrower semantic instead of
+/// `build_server`'s CLI-only one.
+pub fn build_server_with_explicit_namespace(
+    args: &Args,
+    namespace: khive_runtime::Namespace,
+    namespace_explicit: bool,
+    actor_explicit: bool,
+) -> anyhow::Result<(KhiveMcpServer, Option<KhiveRuntime>)> {
     let config = resolve_runtime_config(RuntimeConfigInputs {
         db: args.db.as_deref(),
         config: args.config.as_deref(),
-        namespace: cli_namespace,
-        namespace_explicit: cli_namespace_explicit,
-        actor_explicit: cli_namespace_explicit,
+        namespace,
+        namespace_explicit,
+        actor_explicit,
         no_embed: args.no_embed,
         packs: if args.pack.is_empty() {
             None
@@ -1304,14 +1435,27 @@ pub fn build_server(args: &Args) -> anyhow::Result<KhiveMcpServer> {
                  Set KHIVE_ACTOR or --actor to this lambda's id."
             );
         }
+        let schedule_rt = runtime
+            .config()
+            .packs
+            .iter()
+            .any(|p| p == "schedule")
+            .then(|| runtime.clone());
         let fmt = apply_env_output_format(khive_cfg.runtime.default_output_format);
-        return KhiveMcpServer::new(runtime)
+        let server = KhiveMcpServer::new(runtime)
             .map(|s| s.with_default_output_format(fmt))
-            .map_err(|e| anyhow::anyhow!("{e}"));
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        return Ok((server, schedule_rt));
     }
 
     // Multi-backend path (ADR-028).
-    build_server_multi_backend(config, &khive_cfg, args.db.as_deref())
+    let multi = build_registry_for_multi_backend(config, &khive_cfg, args.db.as_deref())?;
+    let schedule_rt = multi
+        .per_pack_runtimes
+        .get("schedule")
+        .map(|rt| (**rt).clone());
+    let server = build_server_from_multi_backend_registry(multi, &khive_cfg, None);
+    Ok((server, schedule_rt))
 }
 
 /// Canonicalize a SQLite backend path for deduplication (ADR-028 §8).
@@ -4417,6 +4561,414 @@ id = "lambda:project-actor"
             result.is_ok(),
             "enforce_strict_actor_mode must return Ok when comm pack is not loaded \
              (no party-line risk even without actor)"
+        );
+    }
+
+    // --- build_server's returned schedule-tick runtime (ADR-106 fix-round,
+    // codex PR #782 review, High finding) ---
+    //
+    // Before this fix-round, the daemon-resident tick (`schedule_tick_loop`)
+    // reconstructed its OWN `RuntimeConfig::default()` from raw `args.db` and
+    // an inferred namespace, discarding everything `build_server` resolves
+    // from `--config`/`[[backends]]`/`--actor`/`--pack`. These regressions
+    // exercise `build_server` itself (the exact function `run()` calls) and
+    // assert the runtime it hands back for the tick to drain against carries
+    // the SAME resolved db path, actor identity, and pack set the live
+    // server itself was built with — not a silently different one.
+    //
+    // All use `SeatEnv` (defined above, ADR-096 Fork 2 section) to isolate
+    // cwd/HOME so no ambient developer-machine `~/.khive/config.toml` or
+    // project `.khive/config.toml` can leak into the resolution, and clear
+    // every `KHIVE_*` env var these tests care about so a shell-level export
+    // in the test-runner's environment cannot silently change the resolved
+    // config out from under the assertion.
+
+    #[test]
+    #[serial]
+    fn build_server_schedule_tick_uses_the_configured_backend_not_the_home_default() {
+        let seat_dir = tempfile::tempdir().expect("seat tempdir");
+        let _seat_env = SeatEnv::enter(seat_dir.path());
+        std::env::remove_var("KHIVE_DB");
+        std::env::remove_var("KHIVE_ACTOR");
+        std::env::remove_var("KHIVE_PACKS");
+        std::env::remove_var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR");
+
+        let configured_db = seat_dir.path().join("configured-schedule-backend.db");
+
+        use clap::Parser;
+        let args = Args::parse_from(["mcp", "--db", configured_db.to_str().expect("utf8 path")]);
+
+        let (_server, schedule_rt) = build_server(&args).expect("build_server must succeed");
+        let rt = schedule_rt
+            .expect("the default pack set includes \"schedule\" — a runtime must be returned");
+
+        assert_eq!(
+            rt.config().db_path.as_deref(),
+            Some(configured_db.as_path()),
+            "the tick's runtime must target the exact --db this daemon was configured with, \
+             not RuntimeConfig::default()'s $HOME/.khive/khive.db fallback"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn build_server_schedule_tick_uses_the_configured_actor_identity() {
+        let seat_dir = tempfile::tempdir().expect("seat tempdir");
+        let _seat_env = SeatEnv::enter(seat_dir.path());
+        std::env::remove_var("KHIVE_DB");
+        std::env::remove_var("KHIVE_ACTOR");
+        std::env::remove_var("KHIVE_PACKS");
+        std::env::remove_var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR");
+
+        use clap::Parser;
+        let args = Args::parse_from([
+            "mcp",
+            "--db",
+            ":memory:",
+            "--actor",
+            "lambda:adr106-tick-actor",
+        ]);
+
+        let (_server, schedule_rt) = build_server(&args).expect("build_server must succeed");
+        let rt = schedule_rt.expect("schedule pack is loaded by default");
+
+        assert_eq!(
+            rt.config().actor_id.as_deref(),
+            Some("lambda:adr106-tick-actor"),
+            "the tick's runtime must carry the daemon's own resolved --actor identity, \
+             not RuntimeConfig::default()'s unattributed actor_id=None"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn build_server_schedule_tick_is_none_when_schedule_pack_is_not_in_the_restricted_pack_set() {
+        let seat_dir = tempfile::tempdir().expect("seat tempdir");
+        let _seat_env = SeatEnv::enter(seat_dir.path());
+        std::env::remove_var("KHIVE_DB");
+        std::env::remove_var("KHIVE_ACTOR");
+        std::env::remove_var("KHIVE_PACKS");
+        std::env::remove_var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR");
+
+        use clap::Parser;
+        // Restrict to a pack set that deliberately excludes "schedule".
+        let args = Args::parse_from(["mcp", "--db", ":memory:", "--pack", "kg"]);
+
+        let (_server, schedule_rt) = build_server(&args).expect("build_server must succeed");
+        assert!(
+            schedule_rt.is_none(),
+            "when the operator restricts --pack to exclude \"schedule\", the tick must have \
+             nothing to drain against — never silently falling back to a runtime that can \
+             dispatch through a pack the daemon was not configured to load"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn build_server_schedule_tick_runtime_satisfies_strict_actor_mode_like_the_live_server() {
+        // Regression for the exact "strict actor mode can make every tick
+        // fail" scenario codex's High finding named: before this fix, the
+        // tick's separately-reconstructed `RuntimeConfig::default()` carried
+        // NO actor regardless of what `--actor` the daemon itself was given,
+        // so a strict-mode daemon's tick would trip `enforce_strict_actor_mode`
+        // on every single pass even though the live server's own actor was
+        // configured correctly. `build_server` must both (a) succeed under
+        // strict mode when an actor IS configured, and (b) hand back a
+        // schedule-tick runtime carrying that SAME actor — proving the tick
+        // no longer performs its own, separately-failing resolution.
+        let seat_dir = tempfile::tempdir().expect("seat tempdir");
+        let _seat_env = SeatEnv::enter(seat_dir.path());
+        std::env::remove_var("KHIVE_DB");
+        std::env::remove_var("KHIVE_ACTOR");
+        std::env::remove_var("KHIVE_PACKS");
+        let prev_strict = std::env::var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR").ok();
+        std::env::set_var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR", "1");
+
+        use clap::Parser;
+        let args = Args::parse_from([
+            "mcp",
+            "--db",
+            ":memory:",
+            "--actor",
+            "lambda:strict-mode-tenant",
+            "--pack",
+            "kg",
+            "--pack",
+            "comm",
+            "--pack",
+            "schedule",
+        ]);
+
+        let result = build_server(&args);
+
+        match prev_strict {
+            Some(v) => std::env::set_var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR", v),
+            None => std::env::remove_var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR"),
+        }
+
+        let (_server, schedule_rt) = result.expect(
+            "build_server must succeed under strict mode when --actor is properly configured",
+        );
+        let rt = schedule_rt.expect("\"schedule\" pack was explicitly requested");
+        assert_eq!(
+            rt.config().actor_id.as_deref(),
+            Some("lambda:strict-mode-tenant"),
+            "the tick's runtime must carry the same actor identity that satisfied strict \
+             mode at daemon boot, not a separately-resolved, unattributed default"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn build_server_schedule_tick_uses_the_declared_multi_backend_not_main() {
+        // Multi-backend (ADR-028 [[backends]]) config-backed targeting: the
+        // "schedule" pack is explicitly routed to its OWN backend, distinct
+        // from "main". `build_server`'s returned schedule-tick runtime must
+        // WRITE INTO that declared backend's file, not main's — proving the
+        // High-finding fix threads the correct per-pack runtime through for
+        // multi-backend boots too, not only the single-backend common case.
+        // (`RuntimeConfig.db_path` is not itself a reliable signal here —
+        // per-pack multi-backend runtimes only override `backend_id`, not
+        // `db_path` — so this test verifies the actual bound storage file by
+        // writing a marker row and re-opening both declared backend files
+        // independently.)
+        let seat_dir = tempfile::tempdir().expect("seat tempdir");
+        let _seat_env = SeatEnv::enter(seat_dir.path());
+        std::env::remove_var("KHIVE_DB");
+        std::env::remove_var("KHIVE_ACTOR");
+        std::env::remove_var("KHIVE_PACKS");
+        std::env::remove_var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR");
+
+        let main_db = seat_dir.path().join("main.db");
+        let schedule_db = seat_dir.path().join("schedule-backend.db");
+        let config_path = write_config(
+            seat_dir.path(),
+            &format!(
+                r#"
+[[backends]]
+name = "main"
+kind = "sqlite"
+path = "{main}"
+
+[[backends]]
+name = "schedule-backend"
+kind = "sqlite"
+path = "{schedule}"
+
+[packs.schedule]
+backend = "schedule-backend"
+"#,
+                main = main_db.display(),
+                schedule = schedule_db.display(),
+            ),
+        );
+
+        use clap::Parser;
+        let args = Args::parse_from(["mcp", "--config", config_path.to_str().expect("utf8 path")]);
+
+        let (_server, schedule_rt) = build_server(&args).expect("build_server must succeed");
+        let rt = schedule_rt.expect("schedule pack is loaded by default and declared here");
+
+        let marker_content = "adr106-multi-backend-schedule-marker";
+        let ns = Namespace::parse("local").expect("ns");
+        let token = rt.authorize(ns).expect("authorize schedule runtime");
+        let store = rt.notes(&token).expect("notes store");
+        store
+            .upsert_note(khive_storage::note::Note::new(
+                "local",
+                "observation",
+                marker_content,
+            ))
+            .await
+            .expect("write marker note through the tick's runtime");
+
+        // Re-open each declared backend file independently (the original
+        // `_server`/`rt` are dropped-in-scope-still-alive but this is a
+        // sequential, not concurrent, re-open) and confirm the marker landed
+        // in "schedule-backend.db" only.
+        let count_marker_notes = |path: std::path::PathBuf| async move {
+            let cfg = RuntimeConfig {
+                db_path: Some(path),
+                default_namespace: Namespace::parse("local").unwrap(),
+                embedding_model: None,
+                additional_embedding_models: vec![],
+                ..RuntimeConfig::default()
+            };
+            let probe_rt = KhiveRuntime::new(cfg).expect("reopen backend file");
+            let ns = Namespace::parse("local").unwrap();
+            let token = probe_rt.authorize(ns).expect("authorize probe");
+            let store = probe_rt.notes(&token).expect("notes store");
+            let page = store
+                .query_notes(
+                    "local",
+                    Some("observation"),
+                    khive_storage::types::PageRequest {
+                        limit: 10,
+                        offset: 0,
+                    },
+                )
+                .await
+                .expect("query observation notes");
+            page.items
+                .into_iter()
+                .filter(|n| n.content == marker_content)
+                .count()
+        };
+
+        assert_eq!(
+            count_marker_notes(schedule_db.clone()).await,
+            1,
+            "the marker written through the tick's runtime must be present in the declared \
+             \"schedule-backend\" backend file"
+        );
+        assert_eq!(
+            count_marker_notes(main_db.clone()).await,
+            0,
+            "the marker must be ABSENT from \"main\" — the tick's runtime must not have \
+             silently written into the main backend instead of the declared schedule backend"
+        );
+    }
+
+    /// Multi-backend ACTION-DISPATCH routing (codex PR #782 review round 2,
+    /// High finding): `schedule` defaults to "main" (no `[packs.schedule]`
+    /// entry declared), while `kg` — the pack whose `create` verb the stored
+    /// action below replays — is routed to a SEPARATE declared backend. A due
+    /// scheduled event whose action writes through `kg` must land its side
+    /// effect in `kg`'s OWN declared backend, never "main".
+    ///
+    /// This is the regression the round-1 fix-round was missing: round 1
+    /// fixed SCANNING (`scheduled_event` rows now correctly read from
+    /// `schedule`'s own backend, proven by
+    /// `build_server_schedule_tick_uses_the_declared_multi_backend_not_main`
+    /// above) but not DISPATCH — the drain replayed every stored action
+    /// through a throwaway `KhiveMcpServer::new(schedule_rt.clone())`, which
+    /// registers EVERY pack against the schedule backend alone. This test
+    /// drives the drain through `run_pending_events_on(&rt, &server, ..)`
+    /// with the daemon's REAL, fully-wired `server` (as
+    /// `spawn_schedule_tick_loop_if_daemon` now passes it) and asserts the
+    /// replayed action's own write shows up only in `kg`'s declared backend.
+    #[tokio::test]
+    #[serial]
+    async fn build_server_schedule_tick_dispatches_actions_through_the_declared_multi_backend_not_schedule(
+    ) {
+        let seat_dir = tempfile::tempdir().expect("seat tempdir");
+        let _seat_env = SeatEnv::enter(seat_dir.path());
+        std::env::remove_var("KHIVE_DB");
+        std::env::remove_var("KHIVE_ACTOR");
+        std::env::remove_var("KHIVE_PACKS");
+        std::env::remove_var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR");
+
+        let main_db = seat_dir.path().join("main.db");
+        let kg_db = seat_dir.path().join("kg-backend.db");
+        let config_path = write_config(
+            seat_dir.path(),
+            &format!(
+                r#"
+[[backends]]
+name = "main"
+kind = "sqlite"
+path = "{main}"
+
+[[backends]]
+name = "kg-backend"
+kind = "sqlite"
+path = "{kg}"
+
+[packs.kg]
+backend = "kg-backend"
+"#,
+                main = main_db.display(),
+                kg = kg_db.display(),
+            ),
+        );
+
+        use clap::Parser;
+        let args = Args::parse_from(["mcp", "--config", config_path.to_str().expect("utf8 path")]);
+
+        let (server, schedule_rt) = build_server(&args).expect("build_server must succeed");
+        // No `[packs.schedule]` entry above, so it defaults to "main".
+        let rt = schedule_rt.expect("schedule pack is loaded by default");
+
+        let marker = "adr106-multi-backend-dispatch-marker";
+        let action_dsl = format!("create(kind=\"observation\", content=\"{marker}\")");
+        let past = (chrono::Utc::now() - chrono::Duration::seconds(5)).to_rfc3339();
+        let repeat: Option<&str> = None;
+        let fired_at: Option<&str> = None;
+        let cancelled_at: Option<&str> = None;
+        let props = serde_json::json!({
+            "trigger_at": past,
+            "repeat": repeat,
+            "status": "pending",
+            "event_type": "schedule",
+            "payload": action_dsl,
+            "fired_at": fired_at,
+            "cancelled_at": cancelled_at,
+        });
+        let ns = Namespace::parse("local").expect("ns");
+        let token = rt.authorize(ns).expect("authorize schedule runtime");
+        rt.create_note(
+            &token,
+            "scheduled_event",
+            None,
+            &action_dsl,
+            None,
+            Some(props),
+            vec![],
+        )
+        .await
+        .expect("create scheduled_event through the schedule runtime");
+
+        let summary = crate::pending_events::run_pending_events_on(&rt, &server, false)
+            .await
+            .expect("drain");
+        assert_eq!(
+            summary.fired + summary.advanced,
+            1,
+            "the due event must be dispatched, got summary={summary:?}"
+        );
+        assert_eq!(summary.failed, 0, "dispatch must not fail: {summary:?}");
+
+        let count_marker_notes = |path: std::path::PathBuf| async move {
+            let cfg = RuntimeConfig {
+                db_path: Some(path),
+                default_namespace: Namespace::parse("local").unwrap(),
+                embedding_model: None,
+                additional_embedding_models: vec![],
+                ..RuntimeConfig::default()
+            };
+            let probe_rt = KhiveRuntime::new(cfg).expect("reopen backend file");
+            let ns = Namespace::parse("local").unwrap();
+            let token = probe_rt.authorize(ns).expect("authorize probe");
+            let store = probe_rt.notes(&token).expect("notes store");
+            let page = store
+                .query_notes(
+                    "local",
+                    Some("observation"),
+                    khive_storage::types::PageRequest {
+                        limit: 10,
+                        offset: 0,
+                    },
+                )
+                .await
+                .expect("query observation notes");
+            page.items
+                .into_iter()
+                .filter(|n| n.content == marker)
+                .count()
+        };
+
+        assert_eq!(
+            count_marker_notes(kg_db.clone()).await,
+            1,
+            "the replayed create(kind=\"observation\") action must land in the kg pack's OWN \
+             declared backend (\"kg-backend\"), not the schedule backend"
+        );
+        assert_eq!(
+            count_marker_notes(main_db.clone()).await,
+            0,
+            "the marker must be ABSENT from \"main\" (the schedule backend) — dispatching \
+             through a throwaway single-runtime server built from the schedule runtime alone \
+             would have written it here instead"
         );
     }
 
