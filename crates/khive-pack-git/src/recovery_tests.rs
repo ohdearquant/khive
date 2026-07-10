@@ -606,7 +606,7 @@ fn head_sha_reads_the_real_current_commit() {
 #[tokio::test]
 async fn public_verb_partial_side_effects_survive_commit_snapshot_recovery() {
     use async_trait::async_trait;
-    use khive_runtime::{arm_vector_fail, EmbedderProvider};
+    use khive_runtime::{arm_vector_fail_after, EmbedderProvider};
     use lattice_embed::{EmbedError, EmbeddingModel, EmbeddingService};
 
     const FIXTURE_MODEL: &str = "mandatory-765-const-vec";
@@ -669,9 +669,9 @@ async fn public_verb_partial_side_effects_survive_commit_snapshot_recovery() {
     write_fake_git_redirecting_clone(bin_dir.path(), log_dir.path(), fake_url, origin.path());
 
     // PR #3 has an earlier `updatedAt` than PR #2, so `ingest_prs`'s
-    // `sort:updated-asc` paging processes it FIRST -- letting one process-
-    // global one-shot `arm_vector_fail` injection land on exactly this PR's
-    // create, not PR #2's, without needing per-call count-targeting.
+    // `sort:updated-asc` paging processes it FIRST -- letting the
+    // thread-local one-shot `arm_vector_fail_after(0)` injection land on
+    // exactly this PR's create, not PR #2's.
     let pr_json = json!([
         {
             "number": 3, "title": "chore: sentinel", "author": {"login": "bot"},
@@ -708,15 +708,30 @@ async fn public_verb_partial_side_effects_survive_commit_snapshot_recovery() {
     )
     .await;
 
-    // Fires on the next note create in the `local` namespace (the namespace
-    // every `registry.dispatch` call is pinned to) -- that is PR #3's,
-    // processed first per the `updatedAt` ordering above -- then disarms.
-    arm_vector_fail("local");
+    // `arm_vector_fail(ns)` is a process-wide one-shot flag matched by
+    // namespace string alone -- every other test in this crate built through
+    // `fixture()` also writes into the shared default `local` namespace, so
+    // arming it here raced against any concurrently running test's own note
+    // create winning the one-shot flag first (or this call's own PR #3
+    // create losing it to one of theirs), occasionally leaving `git.digest`
+    // to hit the injected failure on a note path its recovery logic does not
+    // expect, or not to hit it at all. `arm_vector_fail_after(0)` is
+    // thread-local (see its doc comment) and fires on the very next vector
+    // insert on THIS thread regardless of namespace, so it cannot be won or
+    // disarmed by another test's concurrent note create -- it fires
+    // deterministically on PR #3's create, the first vector-embedding note
+    // create in this pipeline, processed first per the `updatedAt` ordering
+    // above.
+    arm_vector_fail_after(0);
 
     let resp = registry
         .dispatch(
             "git.digest",
-            json!({"source": fake_url, "project": project_id.to_string(), "max_items": 4}),
+            json!({
+                "source": fake_url,
+                "project": project_id.to_string(),
+                "max_items": 4,
+            }),
         )
         .await
         .expect("the public verb call must self-heal, not error");
