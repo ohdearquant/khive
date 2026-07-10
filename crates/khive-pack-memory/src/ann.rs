@@ -98,8 +98,19 @@ pub(crate) fn new_shared() -> SharedAnn {
 }
 
 /// Bump `key`'s write-generation counter and return the NEW value (#750).
-/// Called by `memory.remember` for every model whose corpus the write may
-/// have affected, right alongside the existing cache invalidation.
+/// Called by every memory write path (`memory.remember`, `memory.prune`,
+/// and the KG-side note-mutation hook in `pack.rs`) for every model the
+/// write may have affected.
+///
+/// #791: this is now the ONLY invalidation signal a write emits — it no
+/// longer clears the in-memory index or deletes the persisted snapshot.
+/// The stale-but-installed entry stays put and keeps serving reads
+/// (`ann::search_loaded` doesn't consult freshness at all;
+/// `handlers/common.rs`'s recall path serves it and fires the
+/// already-existing `ensure_ann_background` warm rather than blocking the
+/// request on a synchronous rebuild). `install_if_fresher` guarantees the
+/// stale entry is replaced, never merged or corrupted, once a build that
+/// snapshotted at or after this generation installs.
 pub(crate) async fn bump_generation(ann: &SharedAnn, key: &AnnKey) -> u64 {
     let mut gens = ann.generations.lock().await;
     let slot = gens.entry(key.clone()).or_insert(0);
@@ -364,22 +375,14 @@ pub(crate) async fn index_namespace_set(ann: &SharedAnn, key: &AnnKey) -> Option
 }
 
 /// Remove a single in-memory ANN slot and its warming guard entry.
+///
+/// Only used on a genuine ANN search failure (`handlers/common.rs`) — a
+/// write no longer calls anything like this (#791; see `bump_generation`'s
+/// doc comment). Evicting the slot there is correct because the cached
+/// entry itself just proved unusable, not merely stale.
 pub(crate) async fn clear_key(ann: &SharedAnn, key: &AnnKey) {
     ann.indexes.write().await.remove(key);
     ann.warming.lock().await.remove(key);
-}
-
-/// Remove all in-memory ANN slots and warming-guard entries.
-/// Because the index is global per model, any namespace write invalidates all slots.
-pub(crate) async fn clear_namespace(ann: &SharedAnn, _namespace: &str) {
-    ann.indexes.write().await.clear();
-    ann.warming.lock().await.clear();
-}
-
-/// Clear in-memory cache and delete persisted snapshots.
-pub(crate) async fn invalidate_namespace(rt: &KhiveRuntime, ann: &SharedAnn, _namespace: &str) {
-    clear_namespace(ann, _namespace).await;
-    invalidate_snapshots(rt).await;
 }
 
 /// True when `err` is the direct result of a `spawn_blocking` cancellation —
@@ -934,7 +937,25 @@ async fn load_and_build_from_vector_store(
         return Ok(None);
     }
 
-    AnnBridge::build(flat, dims, id_map, namespace_set).map(Some)
+    // #791: `AnnBridge::build` (via `VamanaIndex::build`) is a plain
+    // synchronous, CPU-bound full graph construction — training the SQ8
+    // quantization codec and building the Vamana graph over the whole
+    // corpus scanned above. Run it on the blocking thread pool so it never
+    // monopolizes the tokio worker driving this future (and every other
+    // task scheduled on it) for the full build duration, whether this call
+    // is reached from a background warm or, on a genuine cold-start miss,
+    // directly on a recall's own request path.
+    let built =
+        tokio::task::spawn_blocking(move || AnnBridge::build(flat, dims, id_map, namespace_set))
+            .await
+            .map_err(|e| {
+                RuntimeError::Storage(StorageError::driver(
+                    khive_storage::StorageCapability::Vectors,
+                    "memory_ann_build",
+                    e,
+                ))
+            })??;
+    Ok(Some(built))
 }
 
 // ── persistence ───────────────────────────────────────────────────────────────
@@ -1037,34 +1058,6 @@ async fn try_load_snapshot(
     }
 }
 
-/// Delete the global memory Vamana snapshot rows from `retrieval_snapshots`.
-/// Best-effort — missing table is silently ignored.
-async fn invalidate_snapshots(rt: &KhiveRuntime) {
-    let pattern = "global::memory_vamana::%".to_string();
-    let sql = rt.sql();
-    let mut w = match sql.writer().await {
-        Ok(w) => w,
-        Err(e) => {
-            tracing::warn!(error = %e, "failed to open writer for memory ANN snapshot invalidation");
-            return;
-        }
-    };
-    match w
-        .execute(SqlStatement {
-            sql: "DELETE FROM retrieval_snapshots WHERE namespace LIKE ?1".into(),
-            params: vec![SqlValue::Text(pattern)],
-            label: Some("invalidate_memory_vamana_snapshot".into()),
-        })
-        .await
-    {
-        Ok(_) => {}
-        Err(e) if e.to_string().contains("no such table") => {}
-        Err(e) => {
-            tracing::warn!(error = %e, "failed to invalidate memory Vamana snapshots");
-        }
-    }
-}
-
 // ── tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -1130,48 +1123,89 @@ mod tests {
         );
     }
 
+    // ── #791: writes no longer destroy the fast fallback ────────────────────
+    //
+    // `memory.remember`/`memory.prune`/the KG note-mutation hook used to call
+    // `ann::invalidate_namespace`, which cleared every in-memory index slot
+    // AND deleted the persisted snapshot row synchronously on the write's own
+    // path. A `memory.recall` landing after that clear and before the
+    // (correctly backgrounded) rebuild finished had nothing left to serve
+    // except a full synchronous corpus rebuild inline on its own request
+    // path — issue #791's hang. The fix: a write now only bumps the model's
+    // write-generation counter (`bump_generation`, #750 machinery); the
+    // previous index and snapshot stay installed and keep serving reads
+    // until a fresher build replaces them via `install_if_fresher`.
+
     #[tokio::test]
-    async fn invalidate_namespace_clears_global_index() {
-        // After FTS+ANN consolidation, AnnKey is model-only (namespace is ignored).
-        // invalidate_namespace clears the single global index for all models.
+    async fn bump_generation_does_not_evict_installed_index_or_snapshot() {
         let rt = KhiveRuntime::memory().expect("in-memory runtime");
         let ann = new_shared();
-        let model_a = "model-a";
-        let model_b = "model-b";
+        let key = AnnKey::new("global", "model-x");
+        let id = Uuid::new_v4();
 
-        let id_a = Uuid::new_v4();
-        let id_b = Uuid::new_v4();
-
-        let bridge_a = AnnBridge::build(vec![1.0f32, 0.0, 0.0, 0.0], 4, vec![id_a], HashSet::new())
-            .expect("build a");
-        let bridge_b = AnnBridge::build(vec![0.0f32, 1.0, 0.0, 0.0], 4, vec![id_b], HashSet::new())
-            .expect("build b");
-
-        // Keys are model-only; namespace arg is ignored.
-        let key_a = AnnKey::new("any-ns", model_a);
-        let key_b = AnnKey::new("any-ns", model_b);
-
+        install_if_fresher(&ann, &key, tiny_bridge(id, 1)).await;
         {
-            let mut idxs = ann.indexes.write().await;
-            idxs.insert(key_a.clone(), bridge_a);
-            idxs.insert(key_b.clone(), bridge_b);
-        }
-        {
-            let mut warming = ann.warming.lock().await;
-            warming.insert(key_a.clone());
-            warming.insert(key_b.clone());
+            let idxs = ann.indexes.read().await;
+            let bridge = idxs.get(&key).expect("installed above");
+            persist_snapshot(
+                &rt,
+                "global",
+                "model-x",
+                bridge,
+                CorpusFingerprint {
+                    vector_count: 1,
+                    dimensions: 4,
+                },
+            )
+            .await
+            .expect("persist snapshot");
         }
 
-        // invalidate_namespace evicts ALL in-memory indexes (global index serves all namespaces).
-        invalidate_namespace(&rt, &ann, "any-ns").await;
+        // A write lands: it bumps the generation but must not clear anything.
+        bump_generation(&ann, &key).await;
 
         assert!(
-            ann.indexes.read().await.is_empty(),
-            "all indexes must be cleared after invalidation"
+            ann.indexes.read().await.contains_key(&key),
+            "a write must not evict the previously-installed in-memory index"
         );
         assert!(
-            ann.warming.lock().await.is_empty(),
-            "all warming guards must be cleared after invalidation"
+            try_load_snapshot(&rt, "global", "model-x").await.is_some(),
+            "a write must not delete the previously-persisted snapshot before \
+             a fresher build has durably replaced it"
+        );
+    }
+
+    /// The primitive both `handlers/common.rs`'s recall-path stale-serve and
+    /// the write paths' no-longer-clearing behavior depend on: `search_loaded`
+    /// answers from whatever is installed regardless of `is_current`, so a
+    /// cache entry that has fallen behind the write-generation counter is
+    /// still served — not treated as a miss that forces a synchronous
+    /// rebuild on the caller's own request path. Fail-on-revert: restoring
+    /// the old `if cache_fresh { search_loaded(...) } else { Ok(None) }` gate
+    /// in `common.rs` would make an equivalent check on this same primitive
+    /// return `None` here.
+    #[tokio::test]
+    async fn search_loaded_serves_stale_installed_entry_without_rebuild() {
+        let ann = new_shared();
+        let key = AnnKey::new("global", "model-x");
+        let id = Uuid::new_v4();
+
+        install_if_fresher(&ann, &key, tiny_bridge(id, 1)).await;
+        bump_generation(&ann, &key).await; // counter -> 1
+        bump_generation(&ann, &key).await; // counter -> 2, ahead of installed gen 1
+
+        assert!(
+            !is_current(&ann, &key).await,
+            "sanity: the installed entry must now be behind the write-generation counter"
+        );
+
+        let hits = search_loaded(&ann, &key, &[1.0, 0.0, 0.0, 0.0], 1)
+            .await
+            .expect("search_loaded must not error on a stale-but-installed entry");
+        assert!(
+            hits.is_some(),
+            "a stale-but-installed entry must still be served by search_loaded, \
+             not treated the same as a genuine cache miss"
         );
     }
 

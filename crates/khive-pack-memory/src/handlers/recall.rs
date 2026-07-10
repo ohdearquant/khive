@@ -3327,6 +3327,48 @@ mod tests {
 
     // ── #733 slice 1: optional `namespace` param on memory.recall ──────────
 
+    /// #791: `memory.recall`'s ANN cache-hit path now serves a
+    /// present-but-stale entry immediately rather than blocking the request
+    /// on a synchronous full-corpus rebuild (`ann::search_loaded`'s call
+    /// site in `handlers/common.rs` no longer gates on `ann::is_current`).
+    /// A `memory.remember` immediately followed by a `memory.recall` for the
+    /// same model is therefore only eventually, not immediately, consistent:
+    /// the background warm the write fires (`ann::ensure_ann_background`)
+    /// has to install before the just-written note is reflected. Tests that
+    /// seed notes and then assert on recall results poll a bounded number of
+    /// times instead of asserting on a single dispatch, matching the
+    /// documented indexing-latency contract ("a stale ANN serving window is
+    /// acceptable"). `ready` decides when the response is settled enough to
+    /// assert against; on exhaustion this returns the last response so the
+    /// caller's own assertions produce the real diagnostic.
+    async fn recall_until(
+        registry: &khive_runtime::VerbRegistry,
+        verb: &str,
+        args: Value,
+        mut ready: impl FnMut(&Value) -> bool,
+    ) -> Value {
+        let mut result = registry
+            .dispatch(verb, args.clone())
+            .await
+            .unwrap_or_else(|e| panic!("{verb}: {e}"));
+        // 300 * 25ms = ~7.5s ceiling — generous relative to the small
+        // in-memory corpora these tests seed, to stay reliable under
+        // parallel test-suite CPU contention (background warms share the
+        // process-wide blocking pool with every other concurrently running
+        // test), while still resolving in low milliseconds in the common case.
+        for _ in 0..300 {
+            if ready(&result) {
+                return result;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            result = registry
+                .dispatch(verb, args.clone())
+                .await
+                .unwrap_or_else(|e| panic!("{verb}: {e}"));
+        }
+        result
+    }
+
     /// Seeds a fresh in-memory runtime with `kg` + `memory` registered, three
     /// memories — two in `local`, one in `bench-a` — all sharing a query term
     /// so a namespace-agnostic FTS/RRF recall would surface all three absent
@@ -3562,13 +3604,18 @@ mod tests {
         // whichever queued build acquired the per-model lock first via
         // `entry(key).or_insert(bridge)`, permanently, even when it had
         // snapshotted the corpus before a still-in-flight `remember`
-        // committed. With the write-generation-checked install
-        // (`install_if_fresher` in ann.rs) and the recall-path freshness
-        // gate (`ann::is_current`, `handlers/common.rs`) replacing that
-        // blind `or_insert`, a stale build can no longer win permanently and
-        // a stale-but-present cache entry is no longer treated as a hit —
-        // so this now asserts directly, in one attempt, with no retry or
-        // poll.
+        // committed. The write-generation-checked install
+        // (`install_if_fresher` in ann.rs) fixed that permanent-win bug.
+        //
+        // #791: `handlers/common.rs`'s recall path now serves a
+        // stale-but-present cache entry immediately instead of treating it
+        // as a miss, to stop a recall from paying for a synchronous
+        // full-corpus rebuild on its own request path. That reintroduces a
+        // *bounded, eventually-resolving* staleness window here: the very
+        // next recall right after `remember`ing the target can observe a
+        // cache that predates it. `recall_until` polls for the settled
+        // (post-background-warm) response instead of asserting on a single
+        // dispatch.
         let rt = KhiveRuntime::memory().expect("in-memory runtime");
         rt.register_embedder(FixedVecProvider {
             model_name: NS733_ANN_MODEL.to_string(),
@@ -3626,11 +3673,16 @@ mod tests {
         });
 
         // Case 1: default widening — the target must be found, and only the
-        // target.
-        let widened_result = registry
-            .dispatch("memory.recall", base_params.clone())
-            .await
-            .expect("memory.recall with default widening");
+        // target. Poll (#791) until the background warm settles the target
+        // into the ANN cache.
+        let widened_result = recall_until(&registry, "memory.recall", base_params.clone(), |r| {
+            r.as_array().is_some_and(|hits| {
+                hits.len() == 1
+                    && hits[0]["id"].as_str().and_then(|s| s.parse::<Uuid>().ok())
+                        == Some(target_id)
+            })
+        })
+        .await;
         let widened_hits = widened_result.as_array().expect("bare array result");
         assert_eq!(
             widened_hits.len(),
@@ -3770,12 +3822,15 @@ mod tests {
         // above — `ensure_ann_for_model`'s old `entry(key).or_insert(bridge)`
         // let whichever queued build acquired the per-model lock first win
         // permanently, even one that had snapshotted the corpus before a
-        // still-in-flight sibling `remember` committed. With the
+        // still-in-flight sibling `remember` committed. The
         // write-generation-checked install (`install_if_fresher`, ann.rs)
-        // and the recall-path freshness gate (`ann::is_current`,
-        // `handlers/common.rs`), a stale build can no longer win permanently
-        // and a stale-but-present cache entry is no longer served as a hit —
-        // so this now asserts directly, in one attempt, with no retry or poll.
+        // fixed that permanent-win bug.
+        //
+        // #791: `handlers/common.rs`'s recall path now serves a
+        // stale-but-present cache entry immediately (see the rationale on
+        // `ns733_recall_ann_overfetch_retry_loop_respects_effective_namespace`
+        // above), so `recall_until` polls for the settled response instead
+        // of asserting on a single dispatch.
         let rt = KhiveRuntime::memory().expect("in-memory runtime");
         rt.register_embedder(FixedVecProvider {
             model_name: NS733B_MODEL_A.to_string(),
@@ -3800,10 +3855,21 @@ mod tests {
             "include_breakdown": true,
             "limit": 10,
         });
-        let result = registry
-            .dispatch("memory.recall", recall_args)
-            .await
-            .expect("memory.recall with namespace + multi-model + include_breakdown");
+        let result = recall_until(&registry, "memory.recall", recall_args, |r| {
+            r["candidates"]["vector_candidates_per_model"]
+                .as_array()
+                .is_some_and(|per_model| {
+                    per_model.iter().any(|entry| {
+                        entry["hits"].as_array().is_some_and(|hits| {
+                            hits.iter().any(|hit| {
+                                hit["id"].as_str().and_then(|s| s.parse::<Uuid>().ok())
+                                    == Some(target_id)
+                            })
+                        })
+                    })
+                })
+        })
+        .await;
 
         ns733b_assert_breakdown(&result, &local_filler_ids, target_id);
     }
@@ -3882,8 +3948,11 @@ mod tests {
         // above applied identically here — `handle_recall_candidates` reads
         // the same shared per-model ANN index via the same
         // `collect_recall_candidates` path `handle_recall` uses. Fixed the
-        // same way (write-generation-checked install + recall-path freshness
-        // gate); asserts directly, in one attempt, with no retry or poll.
+        // same way (write-generation-checked install).
+        //
+        // #791: same stale-serve behavior change as the sibling test above
+        // — polls for the settled response via `recall_until` rather than
+        // asserting on a single dispatch.
         let rt = KhiveRuntime::memory().expect("in-memory runtime");
         rt.register_embedder(FixedVecProvider {
             model_name: NS733B_MODEL_A.to_string(),
@@ -3916,10 +3985,26 @@ mod tests {
             "namespace": "bench-a",
             "limit": 10,
         });
-        let result = registry
-            .dispatch("memory.recall_candidates", recall_candidates_args)
-            .await
-            .expect("memory.recall_candidates with namespace + multi-model");
+        let result = recall_until(
+            &registry,
+            "memory.recall_candidates",
+            recall_candidates_args,
+            |r| {
+                r["vector_candidates_per_model"]
+                    .as_object()
+                    .is_some_and(|per_model| {
+                        per_model.values().any(|hits| {
+                            hits.as_array().is_some_and(|hits| {
+                                hits.iter().any(|hit| {
+                                    hit["id"].as_str().and_then(|s| s.parse::<Uuid>().ok())
+                                        == Some(target_id)
+                                })
+                            })
+                        })
+                    })
+            },
+        )
+        .await;
 
         let per_model = result["vector_candidates_per_model"]
             .as_object()

@@ -401,11 +401,13 @@ impl PackRuntime for MemoryPack {
     /// KG's `update`/`delete` verbs reach `KhiveRuntime::update_note`/
     /// `delete_note` with no dependency on `khive-pack-memory` at all. When
     /// those touch a `kind="memory"` note (content update, soft delete, or
-    /// hard delete), this hook invalidates the warm ANN cache and bumps the
-    /// affected models' write-generation counter — the same two calls
-    /// `memory.remember` already makes on its own write path (`ann::invalidate_namespace`
-    /// + `ann::bump_generation`) — so `ann::is_current()` correctly treats
-    /// the stale-but-still-installed index as a miss on the next recall.
+    /// hard delete), this hook bumps the affected models' write-generation
+    /// counter (#750) and fires the same background warm `memory.remember`
+    /// fires on its own write path (#791) — so `ann::is_current()` correctly
+    /// treats the stale-but-still-installed index as behind, `search_loaded`
+    /// keeps serving it in the meantime, and the background warm eventually
+    /// installs a fresh one. This hook no longer clears the cache or deletes
+    /// the persisted snapshot (see `remember.rs`'s #791 rationale).
     fn register_note_mutation_hook(&self, _runtime: &KhiveRuntime) {
         let runtime = self.runtime.clone();
         let ann = self.ann.clone();
@@ -416,10 +418,13 @@ impl PackRuntime for MemoryPack {
                 if kind != "memory" {
                     return;
                 }
-                crate::ann::invalidate_namespace(&runtime, &ann, "local").await;
+                let Ok(token) = runtime.authorize(khive_runtime::Namespace::local()) else {
+                    return;
+                };
                 for model in runtime.registered_embedding_model_names() {
                     let key = crate::ann::AnnKey::new("local", model.as_str());
                     crate::ann::bump_generation(&ann, &key).await;
+                    crate::ann::ensure_ann_background(&runtime, &token, &ann, &model).await;
                 }
             })
         });

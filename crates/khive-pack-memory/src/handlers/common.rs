@@ -938,20 +938,38 @@ impl MemoryPack {
                 // retry — up to ANN_OVERFETCH_MAX_ROUNDS total rounds, or until the
                 // index is exhausted (returned hits < requested k). Single-namespace
                 // stores fill on round 1 at zero extra cost.
-                // #750: a merely-present cache entry is not sufficient — a slow
-                // background build that snapshotted the corpus before the most
-                // recent write can still be sitting in the cache (it lost the
-                // install race for freshness but was still the first to reach
-                // an empty slot). `is_current` treats "present but stale
-                // relative to this model's write-generation counter" the same
-                // as a genuine cache miss, so a just-written memory is never
-                // silently served from a snapshot that predates it.
+                // #750: `is_current` treats "present but stale relative to
+                // this model's write-generation counter" as behind, so a
+                // background build that snapshotted the corpus before the
+                // most recent write is never mistaken for a fully fresh one.
+                //
+                // #791: being behind is no longer treated the same as a
+                // genuine cache miss. It used to route straight into
+                // `ensure_ann_for_model`, which — on a cache that a
+                // concurrent `memory.remember` had just cleared and whose
+                // snapshot it had just deleted — meant a full synchronous
+                // corpus rebuild inline on THIS recall's own request path
+                // (the #791 hang: single-flighted, so every other concurrent
+                // recall for the same model waited out the same rebuild).
+                // Writes no longer clear the cache at all (`ann::bump_generation`'s
+                // doc comment), so the previous, still-installed entry is
+                // always tried first via `search_loaded` regardless of
+                // freshness. A stale-but-present hit is served immediately;
+                // the already-existing background warm is (re-)fired so a
+                // later recall benefits from the fresher build once
+                // `install_if_fresher` installs it. Only a genuine miss —
+                // nothing installed for this model at all, e.g. before the
+                // very first warm has ever completed — still pays for an
+                // inline `ensure_ann_for_model`, and even that no longer
+                // monopolizes a tokio worker: the CPU-bound graph build
+                // inside it now runs via `tokio::task::spawn_blocking`
+                // (`ann.rs::load_and_build_from_vector_store`).
                 let cache_fresh = ann::is_current(&self.ann, &key).await;
-                let search_result = if cache_fresh {
-                    ann::search_loaded(&self.ann, &key, &vec, ann_fetch_limit).await
-                } else {
-                    Ok(None)
-                };
+                let search_result =
+                    ann::search_loaded(&self.ann, &key, &vec, ann_fetch_limit).await;
+                if !cache_fresh && matches!(search_result, Ok(Some(_))) {
+                    ann::ensure_ann_background(&self.runtime, token, &self.ann, &model_name).await;
+                }
                 let initial_raw_hits: Option<Vec<(Uuid, f32)>> = match search_result {
                     Ok(Some(hits)) => Some(hits),
                     Ok(None) => {

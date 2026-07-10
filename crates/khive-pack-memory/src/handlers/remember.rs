@@ -136,8 +136,18 @@ impl MemoryPack {
             .await?;
 
         {
-            let ns = write_token.namespace().as_str().to_owned();
-            ann::invalidate_namespace(&self.runtime, &self.ann, &ns).await;
+            // #791: do NOT clear the in-memory ANN cache or delete the
+            // persisted snapshot here. That used to destroy the only fast
+            // fallback a concurrent `memory.recall` had — a recall landing
+            // before the background warm below finished was forced into a
+            // synchronous full-corpus rebuild inline on its own request
+            // path. Bumping the write-generation counter is the only
+            // invalidation signal needed: the recall-path freshness gate
+            // (`ann::is_current`, `handlers/common.rs`) already treats a
+            // present-but-behind-counter entry as stale, serves it anyway,
+            // and fires this same background warm so a later recall
+            // benefits from the fresher build once `install_if_fresher`
+            // installs it.
             let affected_models: Vec<String> = match p.embedding_model.as_deref() {
                 Some(model) => vec![model.to_owned()],
                 None => self.runtime.registered_embedding_model_names(),
