@@ -581,8 +581,9 @@ fn compact_timestamp(s: &str, now: i64) -> String {
 /// Attempt to parse an ISO-8601 datetime string to Unix seconds.
 ///
 /// Only handles the subset produced by khive handlers:
-/// `YYYY-MM-DDTHH:MM:SS[.frac][Z]`. Returns `None` for anything we can't parse
-/// (graceful degradation — the timestamp is still compacted by truncation).
+/// `YYYY-MM-DDTHH:MM:SS[.frac][Z|±HH:MM|±HHMM]`. Returns `None` for anything
+/// we can't parse (graceful degradation — the timestamp is still compacted
+/// by truncation).
 fn parse_iso8601_unix(s: &str) -> Option<i64> {
     // Minimum parseable: "YYYY-MM-DDTHH:MM:SS"
     if s.len() < 19 {
@@ -596,10 +597,61 @@ fn parse_iso8601_unix(s: &str) -> Option<i64> {
     let minute: i64 = parse_digits(&b[14..16])?;
     let second: i64 = parse_digits(&b[17..19])?;
 
-    // Simple Gregorian → Unix seconds (no timezone offsets other than 'Z').
-    // Close enough for relative-time comparisons; not for calendar correctness.
+    // Simple Gregorian → local-wall-clock Unix seconds, then adjust for any
+    // trailing timezone offset (see `parse_tz_offset_secs`) to get the
+    // actual UTC instant.
     let days_since_epoch = days_from_civil(year, month, day);
-    Some(days_since_epoch * 86400 + hour * 3600 + minute * 60 + second)
+    let local = days_since_epoch * 86400 + hour * 3600 + minute * 60 + second;
+    let offset_secs = parse_tz_offset_secs(&s[19..])?;
+    Some(local - offset_secs)
+}
+
+/// Parse the tail of an ISO-8601 timestamp (everything from byte index 19
+/// onward, i.e. after the whole-seconds field) into a UTC offset in seconds.
+///
+/// Handles, in order: optional fractional seconds (`.nnn`, skipped — this
+/// parser only has whole-second precision), then one of:
+/// - empty string or `"Z"` → offset 0
+/// - `±HH:MM` or the compact `±HHMM` form → `sign * (hh*3600 + mm*60)`
+///
+/// Returns `None` for anything else (malformed tail).
+fn parse_tz_offset_secs(tail: &str) -> Option<i64> {
+    let mut rest = tail;
+    if let Some(after_dot) = rest.strip_prefix('.') {
+        let frac_len = after_dot.bytes().take_while(u8::is_ascii_digit).count();
+        if frac_len == 0 {
+            return None;
+        }
+        rest = &after_dot[frac_len..];
+    }
+
+    if rest.is_empty() || rest == "Z" {
+        return Some(0);
+    }
+
+    let sign: i64 = match rest.as_bytes().first()? {
+        b'+' => 1,
+        b'-' => -1,
+        _ => return None,
+    };
+    let digits = &rest[1..];
+    let (hh, mm) = match digits.len() {
+        // "HH:MM"
+        5 if digits.as_bytes()[2] == b':' => (
+            parse_digits(&digits.as_bytes()[0..2])?,
+            parse_digits(&digits.as_bytes()[3..5])?,
+        ),
+        // "HHMM"
+        4 => (
+            parse_digits(&digits.as_bytes()[0..2])?,
+            parse_digits(&digits.as_bytes()[2..4])?,
+        ),
+        _ => return None,
+    };
+    if hh > 23 || mm > 59 {
+        return None;
+    }
+    Some(sign * (hh * 3600 + mm * 60))
 }
 
 fn parse_digits(b: &[u8]) -> Option<i64> {
@@ -1115,5 +1167,116 @@ mod tests {
             std::str::from_utf8(rendered.as_bytes()).is_ok(),
             "rendered output must be valid UTF-8"
         );
+    }
+
+    // --- parse_iso8601_unix / relative-time offset handling (#754) ---
+
+    #[test]
+    fn parse_iso8601_unix_negative_offset_matches_equivalent_utc() {
+        // "-04:00" is 4 hours behind UTC, so 11:55 local == 15:55Z.
+        assert_eq!(
+            parse_iso8601_unix("2026-07-09T11:55:00-04:00"),
+            parse_iso8601_unix("2026-07-09T15:55:00Z")
+        );
+    }
+
+    #[test]
+    fn parse_iso8601_unix_positive_offset_matches_equivalent_utc() {
+        // "+04:00" is 4 hours ahead of UTC, so 20:15 local == 16:15Z.
+        assert_eq!(
+            parse_iso8601_unix("2026-05-23T20:15:00+04:00"),
+            parse_iso8601_unix("2026-05-23T16:15:00Z")
+        );
+    }
+
+    #[test]
+    fn parse_iso8601_unix_zero_offset_matches_z() {
+        assert_eq!(
+            parse_iso8601_unix("2026-07-09T15:55:00+00:00"),
+            parse_iso8601_unix("2026-07-09T15:55:00Z")
+        );
+    }
+
+    #[test]
+    fn parse_iso8601_unix_compact_offset_form_matches_colon_form() {
+        assert_eq!(
+            parse_iso8601_unix("2026-07-09T11:55:00-0400"),
+            parse_iso8601_unix("2026-07-09T11:55:00-04:00")
+        );
+    }
+
+    #[test]
+    fn parse_iso8601_unix_fractional_seconds_with_offset() {
+        // Fractional seconds are dropped (whole-second precision only) but
+        // must not prevent the trailing offset from being applied.
+        assert_eq!(
+            parse_iso8601_unix("2026-07-09T11:55:00.123-04:00"),
+            parse_iso8601_unix("2026-07-09T15:55:00Z")
+        );
+    }
+
+    #[test]
+    fn parse_iso8601_unix_fractional_seconds_with_z() {
+        assert_eq!(
+            parse_iso8601_unix("2026-07-09T15:55:00.999Z"),
+            parse_iso8601_unix("2026-07-09T15:55:00Z")
+        );
+    }
+
+    #[test]
+    fn parse_iso8601_unix_bare_form_unchanged() {
+        // No trailing Z/offset at all: existing "no offset" behavior preserved.
+        assert_eq!(
+            parse_iso8601_unix("2026-07-09T15:55:00"),
+            parse_iso8601_unix("2026-07-09T15:55:00Z")
+        );
+    }
+
+    #[test]
+    fn parse_iso8601_unix_malformed_tail_returns_none() {
+        assert_eq!(parse_iso8601_unix("2026-07-09T15:55:00X"), None);
+        assert_eq!(parse_iso8601_unix("2026-07-09T15:55:00+04"), None);
+        assert_eq!(parse_iso8601_unix("2026-07-09T15:55:00."), None);
+    }
+
+    #[test]
+    fn parse_iso8601_unix_out_of_range_offset_returns_none() {
+        // Hour out of range (>23), colon and compact forms.
+        assert_eq!(parse_iso8601_unix("2026-07-09T15:55:00+24:00"), None);
+        assert_eq!(parse_iso8601_unix("2026-07-09T15:55:00+2400"), None);
+        // Minute out of range (>59), colon and compact forms.
+        assert_eq!(parse_iso8601_unix("2026-07-09T15:55:00+01:60"), None);
+        assert_eq!(parse_iso8601_unix("2026-07-09T15:55:00+0160"), None);
+    }
+
+    #[test]
+    fn parse_iso8601_unix_max_valid_offset_boundary_is_accepted() {
+        // +23:59 / -23:59 are the largest valid offsets and must still parse.
+        assert!(parse_iso8601_unix("2026-07-09T15:55:00+23:59").is_some());
+        assert!(parse_iso8601_unix("2026-07-09T15:55:00-23:59").is_some());
+        assert!(parse_iso8601_unix("2026-07-09T15:55:00+2359").is_some());
+    }
+
+    #[test]
+    fn compact_timestamp_offset_bearing_future_time_not_shown_as_ago() {
+        // Regression for #754: a wall-clock-identical-to-NOW timestamp that
+        // carries a "-02:00" offset is actually 2h in the future relative to
+        // NOW (2025-05-23T16:08:00Z). The old offset-naive parser treated
+        // the wall-clock digits as UTC and reported "0s ago"; the fixed
+        // parser must not.
+        let out = compact_timestamp("2025-05-23T16:08:00-02:00", NOW);
+        assert_ne!(out, "0s ago");
+        assert_eq!(out, "2025-05-23T16:08");
+    }
+
+    #[test]
+    fn compact_timestamp_offset_bearing_past_time_renders_relative() {
+        // "20:05+04:00" == "16:05Z", which is 3 minutes before NOW
+        // (2025-05-23T16:08:00Z). Correct offset handling must produce
+        // "3m ago"; the old offset-naive parser would compare wall-clock
+        // 20:05 against NOW directly, landing outside the 24h window and
+        // falling back to truncated absolute form instead.
+        let out = compact_timestamp("2025-05-23T20:05:00+04:00", NOW);
+        assert_eq!(out, "3m ago");
     }
 }
