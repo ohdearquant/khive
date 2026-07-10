@@ -33,17 +33,23 @@ it is a standalone contract for what PR #812 actually implemented.
 ### 1. Stale bound
 
 A `memory.recall` may serve results computed from an ANN index that is behind the
-caller's own most recent write to the same model by at most **one background rebuild
-latency** — the wall-clock time of the single rebuild that write's write-generation bump
-triggers. There is no bound on how far behind a _third party's_ concurrent writes the
-served index may be beyond the same one-rebuild window; the bound is per-write, not
-wall-clock.
+caller's own most recent write to the same model by at most **the wall-clock time of
+the background rebuild(s) that write's write-generation bump caused to run** — not a
+fixed count of rebuilds. In the common case that is a single rebuild latency. If the
+write instead races in while a rebuild triggered by an earlier write is already in
+flight, `ensure_ann_background`'s own task detects on exit that the installed
+generation is still behind the counter and immediately re-enqueues another attempt
+against itself (§2) — no second write or recall is needed to notice or retrigger it.
+The bound is therefore always "however many rebuild latencies it takes that one
+self-driving task to catch up", with no dependency on further external activity. There
+is no bound on how far behind a _third party's_ concurrent writes the served index may
+be beyond that window; the bound is per-write, not wall-clock.
 
 Recall never blocks on this staleness. A stale-but-installed entry is served
 immediately (`ann::search_loaded` does not consult freshness); the caller does not wait
 for the triggered rebuild.
 
-### 2. Rebuild trigger: write-generation bump
+### 2. Rebuild trigger: write-generation bump, high-water re-enqueue
 
 Every memory write path that may change a model's corpus (`memory.remember`,
 `memory.prune`, and the KG-side note-mutation hook) bumps that model's write-generation
@@ -54,11 +60,20 @@ started before a write can never clobber a later, fresher one, regardless of whi
 finishes first.
 
 The write-generation guard that fires a background rebuild (`ensure_ann_background`)
-must release on every exit of the task it guards — success, error, or panic — not only
-on the "nothing loaded" failure path. A guard left set after a successful warm silently
-rejects every subsequent write's rebuild request, serving the same index forever with
-no further attempt to catch up. This is enforced by an RAII release tied to the
-background task's own scope.
+releases on every exit of the task it guards — success, error, or panic — not only on
+the "nothing loaded" failure path, via an RAII release tied to the background task's
+own scope. Release alone is not sufficient, though: a write landing while that task's
+own build is still in flight bumps the counter, but that write's own
+`ensure_ann_background` call finds the guard already held and no-ops (the fire-once
+single-flight guard exists precisely to prevent a second redundant task) — nobody else
+is left to notice the counter moved. The tracked background task therefore loops:
+before releasing its guard, it re-reads the write-generation counter and compares it
+against the floor its own just-finished attempt captured. If a write raced in during
+that attempt, it immediately re-enqueues another attempt against itself — repeating
+until the installed generation catches up (or the corpus never had anything to build,
+in which case the first attempt's fixed point is itself the terminal state). This is
+what guarantees §1's bound holds without depending on a later recall or write to
+retrigger it.
 
 ### 3. Cold behavior
 
@@ -74,19 +89,49 @@ every write.
 Write-generations live only in `AnnState`, an in-memory structure that resets to a
 fresh, empty state on every process restart. A persisted snapshot's `CorpusFingerprint`
 (vector count + dimensions) is therefore not sufficient on its own to decide whether a
-restored snapshot is current: a delete-one/add-one or a content re-embed preserves both
-count and dimensions exactly, so a fingerprint-only check would classify a stale
-snapshot as current forever, with no write-generation bump ever able to detect the
-mismatch (the counter starts at 0 on both sides).
+restored snapshot is current: a delete-one/add-one, a content re-embed, or a
+vector-only re-embed all preserve both count and dimensions exactly, so a
+fingerprint-only check would classify a stale snapshot as current forever, with no
+write-generation bump ever able to detect the mismatch (the counter starts at 0 on
+both sides).
 
-Restart validation therefore additionally persists a durable `CorpusContentSignal`
-(live-note count plus the corpus's maximum `updated_at`) alongside the snapshot and
-recomputes it fresh against the live corpus on every warm attempt, restart or not. A
-new or edited note always carries a strictly fresher `updated_at` than every prior row,
-so this signal changes on exactly the corpus mutations a bare fingerprint misses. A
-mismatch in either the fingerprint or the content signal is treated as stale: the
-snapshot is discarded and the model falls through to a full rebuild from the vector
-store, the same path a genuinely absent snapshot takes.
+Restart validation therefore additionally persists a durable `CorpusContentHash`
+alongside the snapshot: a blake3 hash of every live `note.content` row's
+`(subject_id, embedding)` bytes, in the same deterministic order
+(`ORDER BY v.subject_id`) the graph build itself scans in. The hash is computed once,
+during the build's own corpus-scanning read — not from a separate query sampled before
+or after it — so the persisted signal can never describe a different corpus snapshot
+than the graph it is paired with. This closes two distinct gaps a timestamp-based
+signal (e.g. `MAX(notes.updated_at)`) left open:
+
+- **Vector-only re-embedding is invisible to `notes.updated_at`.** `kkernel reindex`
+  overwrites embeddings directly without touching the `notes` table at all, so a
+  same-model, same-dimension re-embed through that path changes no timestamp a
+  timestamp-based signal could observe. Hashing the embedding bytes themselves catches
+  it unconditionally, regardless of which write path produced the change. As defense
+  in depth, `kkernel reindex` also directly deletes the active
+  `global::memory_vamana::*` snapshot row after re-embedding, forcing a rebuild on the
+  next warm even before this hash check would otherwise catch it — the daemon and
+  `kkernel reindex` run as separate processes sharing no in-memory generation state, so
+  this direct invalidation is the only signal available to a daemon that stays running
+  across a reindex.
+- **A separately-sampled signal races the build it is meant to describe.** A signal
+  computed by its own query after the graph build finishes can observe a
+  same-cardinality write that landed in the gap between the build's scan and the
+  signal's own read, pairing a stale graph with a signal that looks fresh. Because the
+  hash is computed from literally the same rows the build consumed, in the same read,
+  no such gap exists to race in.
+
+Restart validation recomputes the hash fresh against the live corpus by re-scanning
+every live `note.content` embedding row for the model, in the same row order, and
+compares it byte-for-byte against the persisted value — not a cheap aggregate query,
+deliberately, since only an exact re-scan can detect every mutation a build-time hash
+would have detected. This scan is paid for only when the cheap `CorpusFingerprint`
+check already agrees; a fingerprint mismatch alone is sufficient to know a rebuild is
+needed and skips the hash scan entirely. A mismatch in either the fingerprint or the
+content hash is treated as stale: the snapshot is discarded and the model falls
+through to a full rebuild from the vector store, the same path a genuinely absent
+snapshot takes.
 
 ### 5. Deletion filtering
 
@@ -111,10 +156,15 @@ leaking through.
   documented) are not served by this contract and must poll `memory.recall` or wait
   for the rebuild to observably complete via `memory.feedback`/index inspection; this
   ADR does not add a synchronous variant.
-- Future work extending ADR-079's v2 segment format and content-hash restart check to
-  the memory pack would supersede §4 here; that migration is out of scope for this ADR.
+- Future work extending ADR-079's v2 segment format to the memory pack would supersede
+  §4's memory-pack-specific hash with ADR-079's own content-hash mechanism; that
+  migration is out of scope for this ADR.
+- A write that lands after the self-driving re-enqueue loop (§2) has already fully
+  exited still needs a normal write-path call to `ensure_ann_background` to be picked
+  up — the loop only protects writes that race in while its own task is still running,
+  not writes arriving after it has converged and returned.
 
 ## Status
 
-Proposed. Implemented by PR #812 (issue #791) as of commit `2f9d037e` on
+Proposed. Implemented by PR #812 (issue #791), most recently on
 `fix/791-recall-ann-rebuild-blocking`.
