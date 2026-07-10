@@ -420,31 +420,35 @@ impl KhiveRuntime {
             self.reindex_entity(token, &updated_entity).await?;
         }
 
-        let event_store = self.events(token)?;
-        // Mirror the wire-level strategy spelling from MergeParams so consumers
-        // can round-trip the policy string back into a request.
-        let policy_str = match strategy {
-            EntityDedupMergePolicy::PreferInto => "prefer_into",
-            EntityDedupMergePolicy::PreferFrom => "prefer_from",
-            EntityDedupMergePolicy::Union => "union",
-        };
-        let event = khive_storage::event::Event::new(
-            updated_entity.namespace.clone(),
-            "merge",
-            EventKind::EntityMerged,
-            SubstrateKind::Entity,
-            "",
-        )
-        .with_target(summary.kept_id)
-        .with_payload(serde_json::json!({
-            "into_id": summary.kept_id,
-            "from_id": summary.removed_id,
-            "policy": policy_str,
-            "edges_rewired": summary.edges_rewired,
-        }));
-        event_store.append_event(event).await.map_err(|e| {
-            RuntimeError::Internal(format!("merge_entity: event store write failed: {e}"))
-        })?;
+        // Dry-run is a read-only preview: it must not append a merge event.
+        if !dry_run {
+            let event_store = self.events(token)?;
+            // Mirror the wire-level strategy spelling from MergeParams so consumers
+            // can round-trip the policy string back into a request.
+            let policy_str = match strategy {
+                EntityDedupMergePolicy::PreferInto => "prefer_into",
+                EntityDedupMergePolicy::PreferFrom => "prefer_from",
+                EntityDedupMergePolicy::Union => "union",
+            };
+            let event = khive_storage::event::Event::new(
+                updated_entity.namespace.clone(),
+                "merge",
+                EventKind::EntityMerged,
+                SubstrateKind::Entity,
+                "",
+            )
+            .with_target(summary.kept_id)
+            .with_payload(serde_json::json!({
+                "into_id": summary.kept_id,
+                "from_id": summary.removed_id,
+                "policy": policy_str,
+                "content_strategy": format!("{:?}", content_strategy),
+                "edges_rewired": summary.edges_rewired,
+            }));
+            event_store.append_event(event).await.map_err(|e| {
+                RuntimeError::Internal(format!("merge_entity: event store write failed: {e}"))
+            })?;
+        }
 
         Ok(summary)
     }
@@ -1097,10 +1101,11 @@ fn merge_entity_sql(
                 (Some(format!("{}\n\n---\n\n{}", into_desc, from_desc)), true)
             }
         }
-        ContentMergeStrategy::PreferInto | ContentMergeStrategy::PreferFrom => (
-            merge_option_string_field(&into_entity.description, &from_entity.description, strategy),
-            false,
-        ),
+        // Description selection follows `content_strategy` directly — it is a
+        // deliberate, independently-settable choice, not derived from the
+        // entity-field `strategy` (properties/name/tags merge policy).
+        ContentMergeStrategy::PreferInto => (into_entity.description.clone(), false),
+        ContentMergeStrategy::PreferFrom => (from_entity.description.clone(), false),
     };
     let (merged_tags, tags_unioned) = union_tags(&into_entity.tags, &from_entity.tags);
 
@@ -1112,105 +1117,116 @@ fn merge_entity_sql(
     let tags_json = serde_json::to_string(&merged_tags).unwrap_or_else(|_| "[]".to_string());
 
     // --- Rewire edges ---
+    // Writes are gated on `!dry_run` below, but the loop itself always runs so a
+    // dry-run response reports a predictive `edges_rewired` count (the number of
+    // incident edges that would be rewired) instead of always reporting zero.
     let mut edges_rewired = 0usize;
-    if !dry_run {
-        for edge in all_edges {
-            let raw_src = if edge.source_id == from_id {
-                into_id
-            } else {
-                edge.source_id
-            };
-            let raw_tgt = if edge.target_id == from_id {
-                into_id
-            } else {
-                edge.target_id
-            };
-            // Symmetric relations must be stored with source_uuid < target_uuid.
-            // Apply canonicalization so the conflict check and UPDATE both use the canonical form.
-            let (new_src, new_tgt) = match edge.relation.parse::<EdgeRelation>() {
-                Ok(rel) => canonical_edge_endpoints(rel, raw_src, raw_tgt),
-                Err(_) => (raw_src, raw_tgt),
-            };
+    for edge in all_edges {
+        let raw_src = if edge.source_id == from_id {
+            into_id
+        } else {
+            edge.source_id
+        };
+        let raw_tgt = if edge.target_id == from_id {
+            into_id
+        } else {
+            edge.target_id
+        };
+        // Symmetric relations must be stored with source_uuid < target_uuid.
+        // Apply canonicalization so the conflict check and UPDATE both use the canonical form.
+        let (new_src, new_tgt) = match edge.relation.parse::<EdgeRelation>() {
+            Ok(rel) => canonical_edge_endpoints(rel, raw_src, raw_tgt),
+            Err(_) => (raw_src, raw_tgt),
+        };
 
-            if new_src == new_tgt {
+        if new_src == new_tgt {
+            if !dry_run {
                 conn.execute(
                     "DELETE FROM graph_edges WHERE namespace = ?1 AND id = ?2",
                     rusqlite::params![&namespace, edge.id.to_string()],
                 )?;
-                continue;
             }
-
-            let now_ts = chrono::Utc::now().timestamp();
-            // H3 fix: preserve the original edge ID by updating
-            // source_id/target_id in-place when no conflict exists.
-            //
-            // Two-step approach to handle all cases while keeping the original ID:
-            //   (a) No conflict (new triple): UPDATE source_id/target_id in-place.
-            //       The edge retains its original UUID — callers can still get() it
-            //       by the ID they received from link().
-            //   (b) Conflict: into_id already has an edge with this (source,target,
-            //       relation). Delete the from-edge (it is superseded) and UPDATE
-            //       the existing into-edge to refresh weight/metadata/deleted_at.
-            //       The surviving edge is the into-entity's original edge (correct).
-            //
-            // Check for a conflict: does into_id already have this natural key?
-            let conflict_id: Option<String> = {
-                let conflict_src = new_src.to_string();
-                let conflict_tgt = new_tgt.to_string();
-                conn.query_row(
-                    khive_db::stores::graph::EDGE_SYMMETRIC_CONFLICT_PROBE_SQL,
-                    rusqlite::params![
-                        &namespace,
-                        &conflict_src,
-                        &conflict_tgt,
-                        &edge.relation,
-                        edge.id.to_string(),
-                    ],
-                    |row| row.get(0),
-                )
-                .optional()
-                .map_err(SqliteError::Rusqlite)?
-            };
-
-            let changed = if let Some(existing_id) = conflict_id {
-                // Case (b): a live or soft-deleted row already owns this natural key.
-                // Delete the from-edge and refresh the existing row.
-                conn.execute(
-                    khive_db::stores::graph::EDGE_SYMMETRIC_DELETE_NONCANONICAL_SQL,
-                    rusqlite::params![&namespace, edge.id.to_string()],
-                )?;
-                conn.execute(
-                    khive_db::stores::graph::EDGE_SYMMETRIC_REFRESH_CANONICAL_SQL,
-                    rusqlite::params![
-                        edge.weight,
-                        now_ts,
-                        edge.target_backend,
-                        edge.metadata,
-                        &namespace,
-                        &existing_id,
-                    ],
-                )?
-            } else {
-                // Case (a): no conflict — update source_id/target_id in-place,
-                // preserving the original edge ID for callers.
-                conn.execute(
-                    "UPDATE graph_edges SET \
-                     source_id = ?1, target_id = ?2, updated_at = ?3 \
-                     WHERE namespace = ?4 AND id = ?5",
-                    rusqlite::params![
-                        new_src.to_string(),
-                        new_tgt.to_string(),
-                        now_ts,
-                        &namespace,
-                        edge.id.to_string(),
-                    ],
-                )?
-            };
-            if changed > 0 {
-                edges_rewired += 1;
-            }
+            continue;
         }
 
+        if dry_run {
+            // Predictive count only — no write in a dry-run.
+            edges_rewired += 1;
+            continue;
+        }
+
+        let now_ts = chrono::Utc::now().timestamp();
+        // H3 fix: preserve the original edge ID by updating
+        // source_id/target_id in-place when no conflict exists.
+        //
+        // Two-step approach to handle all cases while keeping the original ID:
+        //   (a) No conflict (new triple): UPDATE source_id/target_id in-place.
+        //       The edge retains its original UUID — callers can still get() it
+        //       by the ID they received from link().
+        //   (b) Conflict: into_id already has an edge with this (source,target,
+        //       relation). Delete the from-edge (it is superseded) and UPDATE
+        //       the existing into-edge to refresh weight/metadata/deleted_at.
+        //       The surviving edge is the into-entity's original edge (correct).
+        //
+        // Check for a conflict: does into_id already have this natural key?
+        let conflict_id: Option<String> = {
+            let conflict_src = new_src.to_string();
+            let conflict_tgt = new_tgt.to_string();
+            conn.query_row(
+                khive_db::stores::graph::EDGE_SYMMETRIC_CONFLICT_PROBE_SQL,
+                rusqlite::params![
+                    &namespace,
+                    &conflict_src,
+                    &conflict_tgt,
+                    &edge.relation,
+                    edge.id.to_string(),
+                ],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(SqliteError::Rusqlite)?
+        };
+
+        let changed = if let Some(existing_id) = conflict_id {
+            // Case (b): a live or soft-deleted row already owns this natural key.
+            // Delete the from-edge and refresh the existing row.
+            conn.execute(
+                khive_db::stores::graph::EDGE_SYMMETRIC_DELETE_NONCANONICAL_SQL,
+                rusqlite::params![&namespace, edge.id.to_string()],
+            )?;
+            conn.execute(
+                khive_db::stores::graph::EDGE_SYMMETRIC_REFRESH_CANONICAL_SQL,
+                rusqlite::params![
+                    edge.weight,
+                    now_ts,
+                    edge.target_backend,
+                    edge.metadata,
+                    &namespace,
+                    &existing_id,
+                ],
+            )?
+        } else {
+            // Case (a): no conflict — update source_id/target_id in-place,
+            // preserving the original edge ID for callers.
+            conn.execute(
+                "UPDATE graph_edges SET \
+                     source_id = ?1, target_id = ?2, updated_at = ?3 \
+                     WHERE namespace = ?4 AND id = ?5",
+                rusqlite::params![
+                    new_src.to_string(),
+                    new_tgt.to_string(),
+                    now_ts,
+                    &namespace,
+                    edge.id.to_string(),
+                ],
+            )?
+        };
+        if changed > 0 {
+            edges_rewired += 1;
+        }
+    }
+
+    if !dry_run {
         // --- Upsert merged entity ---
         conn.execute(
             "INSERT OR REPLACE INTO entities \
@@ -1775,39 +1791,6 @@ pub(crate) fn merge_string_field(
     match strategy {
         EntityDedupMergePolicy::PreferInto | EntityDedupMergePolicy::Union => into.to_string(),
         EntityDedupMergePolicy::PreferFrom => from.to_string(),
-    }
-}
-
-/// `pub(crate)` (widened, ADR-099 B3 fix round): reused by
-/// `crate::atomic_prepare::prepare_merge` for atomic/non-atomic parity.
-pub(crate) fn merge_option_string_field(
-    into: &Option<String>,
-    from: &Option<String>,
-    strategy: EntityDedupMergePolicy,
-) -> Option<String> {
-    match strategy {
-        EntityDedupMergePolicy::PreferInto => {
-            if into.is_some() {
-                into.clone()
-            } else {
-                from.clone()
-            }
-        }
-        EntityDedupMergePolicy::PreferFrom => {
-            if from.is_some() {
-                from.clone()
-            } else {
-                into.clone()
-            }
-        }
-        EntityDedupMergePolicy::Union => {
-            // Keep into's description; if empty, append from's.
-            match (into, from) {
-                (Some(a), _) if !a.is_empty() => Some(a.clone()),
-                (_, Some(b)) => Some(b.clone()),
-                _ => None,
-            }
-        }
     }
 }
 
@@ -2574,6 +2557,47 @@ mod tests {
         );
     }
 
+    /// Regression test for the codex PR #814 High finding: `content_strategy`
+    /// must be followed directly, independent of the entity-field `strategy`.
+    /// With the default entity policy `prefer_into`, an explicit
+    /// `content_strategy=prefer_from` must still keep the from-description.
+    #[tokio::test]
+    async fn merge_entity_prefer_from_content_strategy_wins_over_default_entity_policy() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+        let into = rt
+            .create_entity(&tok, "concept", None, "Into", Some("desc A"), None, vec![])
+            .await
+            .unwrap();
+        let from = rt
+            .create_entity(&tok, "concept", None, "From", Some("desc B"), None, vec![])
+            .await
+            .unwrap();
+
+        let summary = rt
+            .merge_entity(
+                &tok,
+                into.id,
+                from.id,
+                EntityDedupMergePolicy::PreferInto,
+                ContentMergeStrategy::PreferFrom,
+                false,
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            !summary.content_appended,
+            "explicit PreferFrom is not an append"
+        );
+        let kept = rt.get_entity(&tok, into.id).await.unwrap();
+        assert_eq!(
+            kept.description.as_deref(),
+            Some("desc B"),
+            "content_strategy=prefer_from must win over the default prefer_into entity policy"
+        );
+    }
+
     #[tokio::test]
     async fn merge_entity_dry_run_previews_append() {
         let rt = rt();
@@ -2609,6 +2633,83 @@ mod tests {
             kept.description.as_deref(),
             Some("desc A"),
             "dry_run=true must not mutate the into entity's description"
+        );
+    }
+
+    /// Codex PR #814 Medium finding: dry-run must be a read-only, accurate preview —
+    /// it must predict `edges_rewired` without writing, and must not append an
+    /// `EntityMerged` event.
+    #[tokio::test]
+    async fn merge_entity_dry_run_predicts_edges_rewired_without_writing() {
+        use khive_storage::EdgeRelation;
+
+        let rt = rt();
+        let tok = NamespaceToken::local();
+        let a = rt
+            .create_entity(&tok, "concept", None, "A", None, None, vec![])
+            .await
+            .unwrap();
+        let into = rt
+            .create_entity(&tok, "concept", None, "Into", None, None, vec![])
+            .await
+            .unwrap();
+        let from = rt
+            .create_entity(&tok, "concept", None, "From", None, None, vec![])
+            .await
+            .unwrap();
+
+        rt.link(&tok, a.id, from.id, EdgeRelation::Extends, 1.0, None)
+            .await
+            .unwrap();
+
+        let summary = rt
+            .merge_entity(
+                &tok,
+                into.id,
+                from.id,
+                EntityDedupMergePolicy::PreferInto,
+                ContentMergeStrategy::Append,
+                true,
+            )
+            .await
+            .unwrap();
+
+        assert!(summary.dry_run);
+        assert_eq!(
+            summary.edges_rewired, 1,
+            "dry-run must predict the edge that would be rewired, not report zero"
+        );
+
+        // The edge must not actually have been rewired.
+        let a_neighbors = rt
+            .neighbors(&tok, a.id, Direction::Out, None, None)
+            .await
+            .unwrap();
+        assert_eq!(a_neighbors.len(), 1);
+        assert_eq!(
+            a_neighbors[0].node_id, from.id,
+            "dry_run=true must not rewire any edges"
+        );
+
+        // No EntityMerged event should have been appended.
+        let events = rt
+            .events(&tok)
+            .unwrap()
+            .query_events(
+                khive_storage::EventFilter {
+                    kinds: vec![EventKind::EntityMerged],
+                    ..Default::default()
+                },
+                khive_storage::types::PageRequest {
+                    offset: 0,
+                    limit: 10,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(
+            events.items.is_empty(),
+            "dry_run=true must not append an EntityMerged event"
         );
     }
 
