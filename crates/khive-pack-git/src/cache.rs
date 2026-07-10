@@ -50,7 +50,16 @@ const MARKER_FILE: &str = ".khive-last-used";
 pub enum CacheError {
     Io(std::io::Error),
     Git(String),
-    CloneTooLarge { bytes: u64, cap: u64 },
+    CloneTooLarge {
+        bytes: u64,
+        cap: u64,
+    },
+    /// A repair operation (refetch/reclone) would have to touch a path that
+    /// does not prove itself an owned cache slot (`is_owned_entry`) or is
+    /// not a direct child of the scratch root — refused rather than risking
+    /// deletion of unrelated operator data under an overridden
+    /// `KHIVE_GIT_DIGEST_SCRATCH_ROOT`.
+    UnsafeToReplace(PathBuf),
 }
 
 impl std::fmt::Display for CacheError {
@@ -63,6 +72,11 @@ impl std::fmt::Display for CacheError {
                 "clone exceeds the per-clone size cap ({bytes} bytes > {cap} bytes); \
                  the clone was removed. Raise KHIVE_GIT_DIGEST_CLONE_MAX_BYTES if this \
                  repository's history is legitimately this large."
+            ),
+            CacheError::UnsafeToReplace(path) => write!(
+                f,
+                "refusing to replace {} -- it does not prove itself an owned cache slot",
+                path.display()
             ),
         }
     }
@@ -114,14 +128,25 @@ fn clone_max_bytes() -> u64 {
 /// Ensure a local clone of `canonical_url` exists and is up to date; returns
 /// the repo's local path.
 ///
-/// An existing cache slot is updated in place (`git fetch --prune`) and
-/// re-measured against the per-clone cap -- a repo that grew past the cap
-/// since it was last fetched is evicted from the cache slot on the spot. A
-/// fresh clone is written into a private staging directory first
-/// (`git clone --filter=blob:none`), measured there, and only *moved* into
-/// the addressable `<root>/<cache_key>/` slot once it is under the cap --
-/// an oversized clone never enters the cache slot, never participates in
-/// `evict_lru`'s accounting, and is removed from staging immediately.
+/// An existing path at the cache-key slot is only ever treated as a fetchable
+/// cache slot when it already passes `is_owned_entry` -- a `.git` directory
+/// sitting at that path without the `.khive-last-used` marker (a foreign
+/// directory that happens to collide with the cache key, or a directory a
+/// crashed prior run left in a pre-`touch` state) is refused with
+/// `CacheError::UnsafeToReplace` rather than fetched into or adopted (issue
+/// #765 review round-2 [High]-1). A fresh clone is written into a private
+/// staging directory first (`git clone --filter=blob:none`), measured there,
+/// marked with `.khive-last-used` there, and only *moved* into the
+/// addressable `<root>/<cache_key>/` slot once it is under the cap and
+/// already carries its ownership marker -- an oversized clone never enters
+/// the cache slot, never participates in `evict_lru`'s accounting, and is
+/// removed from staging immediately; a process interruption between the
+/// clone and the rename can never leave a live, markerless slot behind.
+///
+/// A repo that grew past the per-clone cap since it was last fetched is
+/// evicted from the cache slot on the spot, through the same ownership-
+/// guarded `remove_owned_entry` every other repair path uses, propagating
+/// any cleanup/ownership failure instead of discarding it.
 ///
 /// Runs LRU eviction over the rest of the cache after a successful
 /// clone/fetch (this clone is exempt from its own eviction pass).
@@ -133,39 +158,161 @@ pub fn ensure_clone(canonical_url: &str) -> Result<PathBuf, CacheError> {
     let cap = clone_max_bytes();
 
     if repo_dir.join(".git").exists() {
+        if !is_owned_entry(&repo_dir) {
+            return Err(CacheError::UnsafeToReplace(repo_dir));
+        }
         fetch(&repo_dir)?;
         let size = dir_size(&repo_dir)?;
         if size > cap {
-            let _ = std::fs::remove_dir_all(&repo_dir);
+            remove_owned_entry(&root, &repo_dir)?;
             return Err(CacheError::CloneTooLarge { bytes: size, cap });
         }
+        touch(&repo_dir)?;
     } else {
-        let staging_dir = root.join(format!(".staging-{}", Uuid::new_v4()));
-        clone(canonical_url, &staging_dir).inspect_err(|_| {
-            // `git clone` can create and partially populate the destination
-            // before failing (network drop, auth failure, bad ref) -- clean
-            // it up so a run of failures doesn't leave `.staging-*` litter
-            // under the scratch root. `evict_lru` deliberately never touches
-            // non-owned names (`is_owned_entry`), so nothing else would ever
-            // reclaim this on its own.
-            let _ = std::fs::remove_dir_all(&staging_dir);
-        })?;
-        let size = dir_size(&staging_dir).inspect_err(|_| {
-            let _ = std::fs::remove_dir_all(&staging_dir);
-        })?;
-        if size > cap {
-            let _ = std::fs::remove_dir_all(&staging_dir);
-            return Err(CacheError::CloneTooLarge { bytes: size, cap });
-        }
-        std::fs::rename(&staging_dir, &repo_dir).map_err(|e| {
-            let _ = std::fs::remove_dir_all(&staging_dir);
-            CacheError::Io(e)
-        })?;
+        install_fresh_clone(canonical_url, &root, &repo_dir, cap)?;
+    }
+
+    evict_lru(&root, &repo_dir)?;
+    Ok(repo_dir)
+}
+
+/// Re-fetch a corrupt-but-present cache slot with `git fetch --refetch`
+/// (issue #765): downloads a complete fresh filtered packfile rather than
+/// trusting the existing (possibly promisor-incomplete) object store,
+/// repairing a partial/pruned clone in place. Only ever operates on an
+/// existing slot -- callers repair a slot only after a prior `ensure_clone`
+/// already produced one.
+pub(crate) fn refetch_clone(canonical_url: &str) -> Result<PathBuf, CacheError> {
+    let root = scratch_root();
+    let key = cache_key(canonical_url);
+    let repo_dir = root.join(&key);
+    if !repo_dir.join(".git").exists() {
+        return Err(CacheError::Git(format!(
+            "refetch requested for {canonical_url:?} but no cache slot exists at {}",
+            repo_dir.display()
+        )));
+    }
+
+    fetch_refetch(&repo_dir)?;
+
+    let cap = clone_max_bytes();
+    let size = dir_size(&repo_dir)?;
+    if size > cap {
+        // Route through the same ownership-guarded removal `reclone` uses
+        // (issue #765 remediation, review round-1 [High]-1) rather than a raw
+        // `remove_dir_all` -- a repair primitive must never delete a path
+        // that doesn't prove itself an owned cache slot, even on the cap-
+        // exceeded cleanup path. Propagate a cleanup/ownership failure
+        // instead of discarding it (review round-2 [High]-1): a refused or
+        // failed removal must surface as its own error, not be silently
+        // swallowed behind `CloneTooLarge`.
+        remove_owned_entry(&root, &repo_dir)?;
+        return Err(CacheError::CloneTooLarge { bytes: size, cap });
     }
 
     touch(&repo_dir)?;
     evict_lru(&root, &repo_dir)?;
     Ok(repo_dir)
+}
+
+/// Evict an owned cache slot (if present) and install a fresh clone in its
+/// place (issue #765's fallback when a refetch cannot repair the slot).
+/// Refuses via `CacheError::UnsafeToReplace` when the existing path does not
+/// prove itself an owned cache slot -- the same ownership guard `evict_lru`
+/// uses, so a `KHIVE_GIT_DIGEST_SCRATCH_ROOT` override pointed at a broader
+/// or pre-existing directory can never lose unrelated operator data here
+/// either.
+pub(crate) fn reclone(canonical_url: &str) -> Result<PathBuf, CacheError> {
+    let root = scratch_root();
+    std::fs::create_dir_all(&root)?;
+    let key = cache_key(canonical_url);
+    let repo_dir = root.join(&key);
+    let cap = clone_max_bytes();
+
+    remove_owned_entry(&root, &repo_dir)?;
+    install_fresh_clone(canonical_url, &root, &repo_dir, cap)?;
+
+    evict_lru(&root, &repo_dir)?;
+    Ok(repo_dir)
+}
+
+/// Shared staging-clone-then-move path for both a first-time `ensure_clone`
+/// and a `reclone` repair: clones into a private staging directory outside
+/// the cache root, measures it against the per-clone cap, writes the
+/// `.khive-last-used` ownership marker into the staging directory itself,
+/// and only then moves it into the addressable `<root>/<cache_key>/` slot --
+/// an oversized clone never enters the cache slot, and because the marker is
+/// written before the atomic rename, a process interruption between clone
+/// and rename can never leave a live, markerless slot at the cache-key path
+/// (issue #765 review round-2 [High]-1).
+fn install_fresh_clone(
+    canonical_url: &str,
+    root: &Path,
+    repo_dir: &Path,
+    cap: u64,
+) -> Result<(), CacheError> {
+    let staging_dir = root.join(format!(".staging-{}", Uuid::new_v4()));
+    clone(canonical_url, &staging_dir).inspect_err(|_| {
+        // `git clone` can create and partially populate the destination
+        // before failing (network drop, auth failure, bad ref) -- clean
+        // it up so a run of failures doesn't leave `.staging-*` litter
+        // under the scratch root. `evict_lru` deliberately never touches
+        // non-owned names (`is_owned_entry`), so nothing else would ever
+        // reclaim this on its own.
+        let _ = std::fs::remove_dir_all(&staging_dir);
+    })?;
+    let size = dir_size(&staging_dir).inspect_err(|_| {
+        let _ = std::fs::remove_dir_all(&staging_dir);
+    })?;
+    if size > cap {
+        let _ = std::fs::remove_dir_all(&staging_dir);
+        return Err(CacheError::CloneTooLarge { bytes: size, cap });
+    }
+    touch(&staging_dir).inspect_err(|_| {
+        let _ = std::fs::remove_dir_all(&staging_dir);
+    })?;
+    std::fs::rename(&staging_dir, repo_dir).map_err(|e| {
+        let _ = std::fs::remove_dir_all(&staging_dir);
+        CacheError::Io(e)
+    })?;
+    Ok(())
+}
+
+/// Remove `repo_dir` only when it is a direct child of `root` AND passes
+/// `is_owned_entry` -- refuses (`CacheError::UnsafeToReplace`) rather than
+/// deleting anything else, including a not-yet-existing or foreign-shaped
+/// path. A slot that does not currently exist is not an error: there is
+/// simply nothing to remove before installing a fresh clone.
+fn remove_owned_entry(root: &Path, repo_dir: &Path) -> Result<(), CacheError> {
+    if !repo_dir.exists() {
+        return Ok(());
+    }
+    if repo_dir.parent() != Some(root) || !is_owned_entry(repo_dir) {
+        return Err(CacheError::UnsafeToReplace(repo_dir.to_path_buf()));
+    }
+    remove_dir_all_retrying(repo_dir).map_err(CacheError::Io)?;
+    Ok(())
+}
+
+/// `std::fs::remove_dir_all` on a large git working tree can transiently
+/// fail with "directory not empty" when something else briefly touches the
+/// tree mid-removal (e.g. a filesystem indexer) -- retry a few times before
+/// giving up, rather than letting a one-off transient race abort a repair
+/// that would otherwise succeed.
+fn remove_dir_all_retrying(path: &Path) -> std::io::Result<()> {
+    let mut last_err = None;
+    for attempt in 0..5 {
+        match std::fs::remove_dir_all(path) {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                last_err = Some(e);
+                if attempt < 4 {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                }
+            }
+        }
+    }
+    Err(last_err.expect("loop always sets last_err before exiting"))
 }
 
 fn clone(url: &str, dest: &Path) -> Result<(), CacheError> {
@@ -207,6 +354,31 @@ fn fetch(repo: &Path) -> Result<(), CacheError> {
     Ok(())
 }
 
+/// Issue #765 repair primitive: `git fetch --refetch origin` obtains a
+/// complete fresh filtered packfile instead of incrementally trusting the
+/// existing (possibly promisor-incomplete) object store -- the documented
+/// fix for a partial clone that has dropped objects it should still have.
+fn fetch_refetch(repo: &Path) -> Result<(), CacheError> {
+    let status = Command::new("git")
+        .arg("-c")
+        .arg("core.hooksPath=/dev/null")
+        .arg("-C")
+        .arg(repo)
+        .arg("fetch")
+        .arg("--refetch")
+        .arg("origin")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .status()
+        .map_err(|e| CacheError::Git(format!("spawning git fetch --refetch: {e}")))?;
+    if !status.success() {
+        return Err(CacheError::Git(format!(
+            "git fetch --refetch in {} failed (exit {status})",
+            repo.display()
+        )));
+    }
+    Ok(())
+}
+
 fn touch(repo_dir: &Path) -> Result<(), CacheError> {
     std::fs::write(repo_dir.join(MARKER_FILE), b"")?;
     Ok(())
@@ -234,12 +406,15 @@ fn dir_size(path: &Path) -> Result<u64, CacheError> {
 
 /// Whether `path` is a directory `ensure_clone` could plausibly have
 /// created: a 16-lowercase-hex `cache_key`-shaped directory name (never a
-/// UUID staging dir, never an arbitrary operator directory) containing both
-/// a `.git` entry and the `.khive-last-used` marker written by `touch`.
-/// Eviction (and any future scratch-root cleanup) must only ever remove
-/// entries that pass this check -- a `KHIVE_GIT_DIGEST_SCRATCH_ROOT`
-/// override pointed at a broader or pre-existing directory must never lose
-/// unrelated data sitting next to the cache slots.
+/// UUID staging dir, never an arbitrary operator directory), itself a real
+/// directory rather than a symlink (a symlink placed at the cache-key path
+/// pointing at an unrelated owned-looking or foreign directory must never be
+/// treated as an owned slot), containing both a `.git` entry and the
+/// `.khive-last-used` marker written by `touch`. Eviction (and any future
+/// scratch-root cleanup) must only ever remove entries that pass this check
+/// -- a `KHIVE_GIT_DIGEST_SCRATCH_ROOT` override pointed at a broader or
+/// pre-existing directory must never lose unrelated data sitting next to the
+/// cache slots.
 fn is_owned_entry(path: &Path) -> bool {
     let name = match path.file_name().and_then(|n| n.to_str()) {
         Some(n) => n,
@@ -251,6 +426,10 @@ fn is_owned_entry(path: &Path) -> bool {
             .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
     {
         return false;
+    }
+    match std::fs::symlink_metadata(path) {
+        Ok(md) if md.is_dir() => {}
+        _ => return false,
     }
     path.join(".git").exists() && path.join(MARKER_FILE).exists()
 }
@@ -293,14 +472,20 @@ fn evict_lru(root: &Path, keep: &Path) -> Result<(), CacheError> {
     Ok(())
 }
 
+/// `scratch_root()` reads process-global env vars; serialize any in-crate
+/// test (in this module or elsewhere, e.g. `recovery_tests.rs`) that touches
+/// it, so the whole `cargo test` binary's parallel test threads never race
+/// on `KHIVE_GIT_DIGEST_SCRATCH_ROOT`/cache-cap env vars/`PATH`. A
+/// `tokio::sync::Mutex` rather than `std::sync::Mutex` so async tests can
+/// hold the guard across `.await` points (`blocking_lock()` for this
+/// module's plain sync `#[test]`s).
+#[cfg(test)]
+pub(crate) static ENV_MUTEX: std::sync::LazyLock<tokio::sync::Mutex<()>> =
+    std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::LazyLock;
-
-    /// `scratch_root()` reads process-global env vars; serialize tests that
-    /// touch it.
-    static ENV_MUTEX: LazyLock<std::sync::Mutex<()>> = LazyLock::new(|| std::sync::Mutex::new(()));
 
     /// Build a directory shaped exactly like a real `ensure_clone` cache
     /// slot: a 16-lowercase-hex name (a real `cache_key` output) containing
@@ -323,7 +508,7 @@ mod tests {
     /// failures.
     #[test]
     fn ensure_clone_cleans_up_staging_dir_on_clone_failure() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = ENV_MUTEX.blocking_lock();
         let dir = tempfile::tempdir().expect("tempdir");
         std::env::set_var("KHIVE_GIT_DIGEST_SCRATCH_ROOT", dir.path());
 
@@ -350,7 +535,7 @@ mod tests {
 
     #[test]
     fn evict_lru_removes_oldest_past_repo_cap() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = ENV_MUTEX.blocking_lock();
         let dir = tempfile::tempdir().expect("tempdir");
         std::env::set_var("KHIVE_GIT_DIGEST_SCRATCH_ROOT", dir.path());
         std::env::set_var("KHIVE_GIT_DIGEST_CACHE_MAX_REPOS", "1");
@@ -374,7 +559,7 @@ mod tests {
 
     #[test]
     fn evict_lru_only_touches_children_of_root() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = ENV_MUTEX.blocking_lock();
         let dir = tempfile::tempdir().expect("tempdir");
         std::env::set_var("KHIVE_GIT_DIGEST_CACHE_MAX_REPOS", "5");
         std::env::set_var("KHIVE_GIT_DIGEST_CACHE_MAX_BYTES", "1000000000");
@@ -392,7 +577,7 @@ mod tests {
 
     #[test]
     fn evict_lru_never_removes_a_foreign_directory_under_root() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = ENV_MUTEX.blocking_lock();
         let dir = tempfile::tempdir().expect("tempdir");
         // Cap of 0 repos: without ownership filtering this would previously
         // have wiped out every child of root, including operator data.
@@ -423,7 +608,7 @@ mod tests {
 
     #[test]
     fn evict_lru_never_removes_an_owned_looking_dir_missing_the_marker() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = ENV_MUTEX.blocking_lock();
         let dir = tempfile::tempdir().expect("tempdir");
         std::env::set_var("KHIVE_GIT_DIGEST_CACHE_MAX_REPOS", "0");
         std::env::set_var("KHIVE_GIT_DIGEST_CACHE_MAX_BYTES", "0");
@@ -480,5 +665,317 @@ mod tests {
         std::fs::create_dir_all(dir.path().join("sub")).unwrap();
         std::fs::write(dir.path().join("sub/b.txt"), b"1234567890").unwrap();
         assert_eq!(dir_size(dir.path()).unwrap(), 15);
+    }
+
+    // ── issue #765: refetch/reclone repair primitives ──────────────────────
+
+    fn git(repo: &Path, args: &[&str]) {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(args)
+            .output()
+            .expect("spawn git");
+        assert!(
+            out.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    /// A real local repo usable as an `ensure_clone`/`refetch_clone`/`reclone`
+    /// `canonical_url` (git accepts a plain filesystem path as a clone/fetch
+    /// source, same as the existing `ensure_clone_cleans_up_staging_dir_*`
+    /// test does for a failure case).
+    fn init_origin_with_one_commit(repo: &Path) {
+        git(repo, &["init", "-q", "-b", "main"]);
+        git(repo, &["config", "user.email", "test@example.com"]);
+        git(repo, &["config", "user.name", "Test User"]);
+        std::fs::write(repo.join("a.txt"), b"hello").unwrap();
+        git(repo, &["add", "a.txt"]);
+        git(repo, &["commit", "-q", "-m", "initial"]);
+    }
+
+    fn add_commit(repo: &Path, rel: &str, contents: &str, message: &str) {
+        std::fs::write(repo.join(rel), contents).unwrap();
+        git(repo, &["add", rel]);
+        git(repo, &["commit", "-q", "-m", message]);
+    }
+
+    fn head_sha(repo: &Path) -> String {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .expect("rev-parse");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    /// The primary #765 acceptance path: a slot already exists (via
+    /// `ensure_clone`); `refetch_clone` must pull history the slot doesn't
+    /// have yet (standing in for genuinely corrupt/incomplete objects, which
+    /// `git fetch --refetch` repairs the same way -- by re-obtaining a
+    /// complete fresh packfile from the remote).
+    #[test]
+    fn refetch_clone_updates_an_existing_slot_to_the_remote_tip() {
+        let _guard = ENV_MUTEX.blocking_lock();
+        let scratch = tempfile::tempdir().expect("tempdir");
+        std::env::set_var("KHIVE_GIT_DIGEST_SCRATCH_ROOT", scratch.path());
+
+        let origin_dir = tempfile::tempdir().expect("tempdir");
+        init_origin_with_one_commit(origin_dir.path());
+        let canonical = origin_dir.path().to_str().unwrap();
+
+        let first = ensure_clone(canonical).expect("initial ensure_clone");
+        let before = head_sha(&first);
+
+        add_commit(origin_dir.path(), "b.txt", "world", "second");
+        let expected_tip = head_sha(origin_dir.path());
+        assert_ne!(before, expected_tip, "origin must have moved on");
+
+        let repaired = refetch_clone(canonical).expect("refetch_clone");
+        assert_eq!(repaired, first, "refetch repairs the same cache slot path");
+        git(&repaired, &["show", &format!("{expected_tip}:b.txt")]);
+
+        std::env::remove_var("KHIVE_GIT_DIGEST_SCRATCH_ROOT");
+    }
+
+    /// Review round-1 [High]-1 remediation (issue #765), tightened by review
+    /// round-2 [High]-1: `refetch_clone`'s over-cap cleanup must go through
+    /// the same ownership guard `reclone` uses, not a raw `remove_dir_all`,
+    /// AND must propagate that guard's failure rather than discarding it --
+    /// a slot that has lost its `.khive-last-used` marker (simulating a
+    /// directory the guard cannot prove it owns) survives over-cap cleanup,
+    /// and the caller sees the ownership failure (`UnsafeToReplace`) that
+    /// actually occurred, not a laundered `CloneTooLarge`.
+    #[test]
+    fn refetch_clone_over_cap_cleanup_never_deletes_an_unproven_slot() {
+        let _guard = ENV_MUTEX.blocking_lock();
+        let scratch = tempfile::tempdir().expect("tempdir");
+        std::env::set_var("KHIVE_GIT_DIGEST_SCRATCH_ROOT", scratch.path());
+
+        let origin_dir = tempfile::tempdir().expect("tempdir");
+        init_origin_with_one_commit(origin_dir.path());
+        let canonical = origin_dir.path().to_str().unwrap();
+
+        let slot = ensure_clone(canonical).expect("initial ensure_clone");
+        // Simulate a slot the ownership guard cannot prove it owns (e.g. a
+        // crash between a prior clone/fetch and `touch`, or a foreign
+        // directory occupying this exact cache-key path) by removing the
+        // marker `touch` would normally have written.
+        std::fs::remove_file(slot.join(".khive-last-used")).expect("remove marker");
+
+        std::env::set_var("KHIVE_GIT_DIGEST_CLONE_MAX_BYTES", "1");
+        let err = refetch_clone(canonical).expect_err("refetch must report the ownership error");
+        assert!(
+            matches!(err, CacheError::UnsafeToReplace(_)),
+            "expected UnsafeToReplace (the cleanup's ownership failure, propagated), got {err:?}"
+        );
+        assert!(
+            slot.exists(),
+            "a slot the ownership guard cannot prove it owns must survive over-cap cleanup"
+        );
+
+        std::env::remove_var("KHIVE_GIT_DIGEST_CLONE_MAX_BYTES");
+        std::env::remove_var("KHIVE_GIT_DIGEST_SCRATCH_ROOT");
+    }
+
+    #[test]
+    fn refetch_clone_errors_when_no_slot_exists() {
+        let _guard = ENV_MUTEX.blocking_lock();
+        let scratch = tempfile::tempdir().expect("tempdir");
+        std::env::set_var("KHIVE_GIT_DIGEST_SCRATCH_ROOT", scratch.path());
+
+        let err = refetch_clone("https://example.invalid/never-cloned/repo")
+            .expect_err("no slot exists yet");
+        assert!(
+            matches!(err, CacheError::Git(_)),
+            "expected CacheError::Git, got {err:?}"
+        );
+
+        std::env::remove_var("KHIVE_GIT_DIGEST_SCRATCH_ROOT");
+    }
+
+    /// #765's fallback path: a refetch that cannot repair the slot (here,
+    /// simulated by pointing the existing slot's `origin` remote at a
+    /// nonexistent path so `git fetch --refetch` itself fails) is followed by
+    /// `reclone`, which ignores the broken clone entirely and clones fresh
+    /// from the still-good `canonical_url`.
+    #[test]
+    fn reclone_replaces_a_slot_whose_refetch_cannot_succeed() {
+        let _guard = ENV_MUTEX.blocking_lock();
+        let scratch = tempfile::tempdir().expect("tempdir");
+        std::env::set_var("KHIVE_GIT_DIGEST_SCRATCH_ROOT", scratch.path());
+
+        let origin_dir = tempfile::tempdir().expect("tempdir");
+        init_origin_with_one_commit(origin_dir.path());
+        let canonical = origin_dir.path().to_str().unwrap();
+
+        let slot = ensure_clone(canonical).expect("initial ensure_clone");
+        // Break the slot's own remote so `fetch --refetch origin` fails --
+        // standing in for a corrupt slot that cannot self-repair via refetch.
+        git(
+            &slot,
+            &[
+                "remote",
+                "set-url",
+                "origin",
+                "/nonexistent/path/does-not-exist",
+            ],
+        );
+        assert!(matches!(refetch_clone(canonical), Err(CacheError::Git(_))));
+
+        let recloned = reclone(canonical).expect("reclone");
+        assert_eq!(recloned, slot, "reclone reinstalls at the same slot path");
+        assert_eq!(head_sha(&recloned), head_sha(origin_dir.path()));
+        // The fresh clone's own remote points back at the canonical URL, not
+        // the broken one the corrupt slot had.
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(&recloned)
+            .args(["remote", "get-url", "origin"])
+            .output()
+            .expect("remote get-url");
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout).trim(),
+            canonical,
+            "reclone must re-point origin at canonical_url, not the broken remote"
+        );
+
+        std::env::remove_var("KHIVE_GIT_DIGEST_SCRATCH_ROOT");
+    }
+
+    /// Ownership guard (ADR-088 Amendment 1 / PR #761): `reclone` must never
+    /// delete a directory that doesn't prove itself an owned cache slot, even
+    /// though its path is exactly where the cache key says the slot should
+    /// be -- a `KHIVE_GIT_DIGEST_SCRATCH_ROOT` override pointed at a broader
+    /// directory must never lose unrelated operator data to a repair.
+    #[test]
+    fn reclone_refuses_to_replace_a_foreign_looking_directory() {
+        let _guard = ENV_MUTEX.blocking_lock();
+        let scratch = tempfile::tempdir().expect("tempdir");
+        std::env::set_var("KHIVE_GIT_DIGEST_SCRATCH_ROOT", scratch.path());
+
+        let origin_dir = tempfile::tempdir().expect("tempdir");
+        init_origin_with_one_commit(origin_dir.path());
+        let canonical = origin_dir.path().to_str().unwrap();
+        let key = cache_key(canonical);
+        let foreign = scratch.path().join(&key);
+        std::fs::create_dir_all(&foreign).unwrap();
+        std::fs::write(foreign.join("important.txt"), b"do not delete me").unwrap();
+
+        let err = reclone(canonical).expect_err("foreign directory must be refused");
+        assert!(
+            matches!(err, CacheError::UnsafeToReplace(_)),
+            "expected UnsafeToReplace, got {err:?}"
+        );
+        assert!(
+            foreign.join("important.txt").exists(),
+            "foreign directory contents must survive a refused reclone"
+        );
+
+        std::env::remove_var("KHIVE_GIT_DIGEST_SCRATCH_ROOT");
+    }
+
+    /// When no slot exists at all yet, `reclone` has nothing to remove and
+    /// simply installs a fresh clone -- the same fallback a first-ever
+    /// `ensure_clone` would have taken.
+    #[test]
+    fn reclone_installs_fresh_when_no_slot_exists_yet() {
+        let _guard = ENV_MUTEX.blocking_lock();
+        let scratch = tempfile::tempdir().expect("tempdir");
+        std::env::set_var("KHIVE_GIT_DIGEST_SCRATCH_ROOT", scratch.path());
+
+        let origin_dir = tempfile::tempdir().expect("tempdir");
+        init_origin_with_one_commit(origin_dir.path());
+        let canonical = origin_dir.path().to_str().unwrap();
+
+        let recloned = reclone(canonical).expect("reclone with no prior slot");
+        assert_eq!(head_sha(&recloned), head_sha(origin_dir.path()));
+
+        std::env::remove_var("KHIVE_GIT_DIGEST_SCRATCH_ROOT");
+    }
+
+    /// Review round-2 [High]-1 remediation (issue #765): `ensure_clone` must
+    /// never adopt, fetch into, or touch a directory sitting at the
+    /// cache-key path that does not already prove itself owned via
+    /// `is_owned_entry`. Here the directory is a genuine Git repository (so
+    /// the pre-fix `repo_dir.join(".git").exists()` check alone would have
+    /// accepted it) but is missing the `.khive-last-used` marker -- standing
+    /// in for an operator's own repository that happens to land on the same
+    /// cache-key path under an overridden `KHIVE_GIT_DIGEST_SCRATCH_ROOT`.
+    /// The call must refuse with `UnsafeToReplace` and the sentinel operator
+    /// data inside must survive completely untouched.
+    #[test]
+    fn ensure_clone_refuses_a_markerless_git_directory_at_the_cache_key_path() {
+        let _guard = ENV_MUTEX.blocking_lock();
+        let scratch = tempfile::tempdir().expect("tempdir");
+        std::env::set_var("KHIVE_GIT_DIGEST_SCRATCH_ROOT", scratch.path());
+
+        let canonical = "https://example.invalid/lookalike/repo";
+        let key = cache_key(canonical);
+        let lookalike = scratch.path().join(&key);
+        std::fs::create_dir_all(&lookalike).unwrap();
+        init_origin_with_one_commit(&lookalike);
+        std::fs::write(lookalike.join("sentinel.txt"), b"do not delete me").unwrap();
+        let sentinel_sha = head_sha(&lookalike);
+
+        let err = ensure_clone(canonical).expect_err("markerless lookalike must be refused");
+        assert!(
+            matches!(err, CacheError::UnsafeToReplace(_)),
+            "expected UnsafeToReplace, got {err:?}"
+        );
+
+        assert!(
+            lookalike.join("sentinel.txt").exists(),
+            "sentinel operator data must survive a refused ensure_clone"
+        );
+        assert_eq!(
+            head_sha(&lookalike),
+            sentinel_sha,
+            "the lookalike repository's own history must be untouched (no fetch ran)"
+        );
+        assert!(
+            !lookalike.join(MARKER_FILE).exists(),
+            "a refused ensure_clone must never write the ownership marker either"
+        );
+
+        std::env::remove_var("KHIVE_GIT_DIGEST_SCRATCH_ROOT");
+    }
+
+    /// Same guard, symlink variant: a symlink placed at the cache-key path
+    /// pointing at an unrelated owned-looking directory must not be treated
+    /// as an owned slot either -- `is_owned_entry` requires the cache-key
+    /// path itself to be a real directory, not a symlink to one.
+    #[cfg(unix)]
+    #[test]
+    fn ensure_clone_refuses_a_symlink_at_the_cache_key_path() {
+        let _guard = ENV_MUTEX.blocking_lock();
+        let scratch = tempfile::tempdir().expect("tempdir");
+        std::env::set_var("KHIVE_GIT_DIGEST_SCRATCH_ROOT", scratch.path());
+
+        let canonical = "https://example.invalid/symlink-lookalike/repo";
+        let key = cache_key(canonical);
+        let link_path = scratch.path().join(&key);
+
+        let target = tempfile::tempdir().expect("symlink target");
+        make_owned_entry(target.path(), "9999999999999999", true);
+        let real_owned = target.path().join("9999999999999999");
+        std::fs::write(real_owned.join("sentinel.txt"), b"do not delete me").unwrap();
+
+        std::os::unix::fs::symlink(&real_owned, &link_path).expect("create symlink");
+
+        let err = ensure_clone(canonical).expect_err("symlink lookalike must be refused");
+        assert!(
+            matches!(err, CacheError::UnsafeToReplace(_)),
+            "expected UnsafeToReplace, got {err:?}"
+        );
+        assert!(
+            real_owned.join("sentinel.txt").exists(),
+            "the symlink target's sentinel data must survive a refused ensure_clone"
+        );
+
+        std::env::remove_var("KHIVE_GIT_DIGEST_SCRATCH_ROOT");
     }
 }
