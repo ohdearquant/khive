@@ -108,26 +108,30 @@ class SchemaError(RuntimeError):
     """Raised when a suite's stdout/report does not match the required metric schema."""
 
 
-def _kill_process_tree(proc: subprocess.Popen) -> None:
-    """Terminate the whole process group launched for `proc` (start_new_session=True).
+def _kill_process_tree(pgid: int, proc: subprocess.Popen) -> None:
+    """Terminate the whole process group `pgid` launched for `proc` (start_new_session=True).
 
     subprocess timeouts only kill the direct child; suites spawn a kkernel/daemon
     descendant that would otherwise survive the timeout and keep holding the DB/socket.
+    `pgid` must be captured by the caller right after Popen (while the direct child is
+    still guaranteed alive) - deriving it from `proc.pid` here would race: once the
+    direct child has exited (even just to zombie state), os.getpgid(proc.pid) can raise
+    ProcessLookupError and skip the kill entirely, letting a SIGTERM-resistant
+    descendant survive. SIGKILL is always sent to the saved pgid after the grace
+    period, even if the direct child already exited from SIGTERM.
     """
     try:
-        pgid = os.getpgid(proc.pid)
+        os.killpg(pgid, signal.SIGTERM)
     except ProcessLookupError:
         return
-    for sig in (signal.SIGTERM, signal.SIGKILL):
-        try:
-            os.killpg(pgid, sig)
-        except ProcessLookupError:
-            return
-        try:
-            proc.wait(timeout=5)
-            return
-        except subprocess.TimeoutExpired:
-            continue
+    try:
+        proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        pass
+    try:
+        os.killpg(pgid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
 
 
 # ── suite: pipeline ───────────────────────────────────────────────────────────
@@ -263,12 +267,18 @@ def _load_extract(run_dir: pathlib.Path, proc: subprocess.CompletedProcess) -> d
         metrics[f"op_counts.{k}"] = float(v)
     for k, v in report.get("op_error_counts", {}).items():
         metrics[f"op_error_counts.{k}"] = float(v)
-    metrics["smoke_pass"] = 1.0 if report.get("smoke_result") == "PASS" else 0.0
 
+    # Validate the extractor actually pulled real suite metrics BEFORE
+    # merging in bookkeeping keys (smoke_pass) - otherwise an empty
+    # dimensions/op_counts/op_error_counts tree still yields a non-empty
+    # dict and the no-metrics guard downstream never fires.
     if not metrics:
         raise SchemaError(
-            f"no numeric metrics extracted from load report; see {report_path}"
+            f"no numeric metrics extracted from load report dimensions/op_counts/"
+            f"op_error_counts; see {report_path}"
         )
+
+    metrics["smoke_pass"] = 1.0 if report.get("smoke_result") == "PASS" else 0.0
     return metrics
 
 
@@ -337,11 +347,21 @@ def _run_once(suite_name: str, run_dir: pathlib.Path, extra_args: list[str]) -> 
         text=True,
         start_new_session=True,
     )
+    # Captured immediately - the direct child is guaranteed alive right
+    # after Popen returns, so this cannot race a fast-exiting child the way
+    # a lazy os.getpgid(proc.pid) inside the timeout handler would.
+    pgid = os.getpgid(proc.pid)
     try:
         stdout, stderr = proc.communicate(timeout=suite["timeout_s"])
     except subprocess.TimeoutExpired:
-        _kill_process_tree(proc)
-        stdout, stderr = proc.communicate()
+        _kill_process_tree(pgid, proc)
+        # Bounded: _kill_process_tree already SIGKILLed the whole process
+        # group, so the pipes should close promptly; never block forever on
+        # a descendant that somehow still holds a write end open.
+        try:
+            stdout, stderr = proc.communicate(timeout=10)
+        except subprocess.TimeoutExpired:
+            stdout, stderr = "", ""
         wall_s = time.time() - t0
         (run_dir / "stdout.log").write_text(stdout or "")
         (run_dir / "stderr.log").write_text(stderr or "")
@@ -360,6 +380,13 @@ def _run_once(suite_name: str, run_dir: pathlib.Path, extra_args: list[str]) -> 
 
     cp = subprocess.CompletedProcess(argv, proc.returncode, stdout, stderr)
     metrics = suite["extract"](run_dir, cp)
+    # The extractor itself must have returned real suite metrics - raise
+    # loudly here, before merging in the _wall_s bookkeeping key, so a
+    # bookkeeping-only profile can never slip past the no-metrics guard.
+    if not metrics:
+        raise SchemaError(
+            f"suite '{suite_name}' extractor returned no metrics; see {run_dir}/stdout.log"
+        )
     metrics["_wall_s"] = wall_s
     return cp, metrics, wall_s
 
