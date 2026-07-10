@@ -36,6 +36,7 @@ headroom and must NOT be tightened toward the observed mean.
 """
 
 import csv
+import itertools
 import json
 import os
 import pathlib
@@ -58,6 +59,20 @@ RECALL_FLOOR = 0.70
 VECTOR_FLOOR = 0.70
 KEYWORD_FLOOR = 0.70
 N_REPS = 5  # repetitions per query for latency measurement
+
+# ANN convergence settle step. After a 600-note ingest burst, the memory pack's
+# background ANN rebuild (write-generation-checked install, ADR-107 sec 1) has
+# not necessarily installed by the time the first post-ingest recall lands —
+# that is the documented eventual-consistency contract this pipeline ships
+# (stale-but-installed served immediately, hot-swapped on background completion).
+# This benchmark is a read-after-write consumer of that contract: it must poll
+# for real convergence, not sample mid-rebuild and misread the race as a
+# structural vector-leg failure. Bounded generous deadline; fails loudly (not
+# silently) if convergence never happens, since that would indicate an actual
+# rebuild-latency regression rather than expected warm-up.
+ANN_SETTLE_DEADLINE_S = 30.0
+ANN_SETTLE_STABLE_N = 3
+ANN_SETTLE_POLL_S = 0.25
 
 # Default production pack set (must match RuntimeConfig::default().packs in
 # crates/khive-runtime/src/config.rs so config_id agrees between front-end
@@ -112,6 +127,21 @@ def generate_corpus():
             prefix = "core" if i % 3 == 0 else ("detail" if i % 3 == 1 else "context")
             notes.append(f"{prefix} {w0}: {topic} with {w1} and {w2} — note {i}")
     return notes
+
+# ── Settle sentinel ───────────────────────────────────────────────────────────
+
+_SENTINEL_SEQ = itertools.count()
+
+
+def _make_sentinel_content():
+    """Return a run-unique content string that cannot collide with corpus text.
+
+    Built from os.getpid() plus a per-run counter so it is distinct even across
+    concurrent bench invocations on the same host. It shares no words with any
+    TOPICS entry, so it can never satisfy a topic-containment check and never
+    counts toward (or against) any query's Precision@K.
+    """
+    return f"__khive_bench_settle_sentinel_pid{os.getpid()}_seq{next(_SENTINEL_SEQ)}__"
 
 # ── MCP stdio driver (mirrors smoke_test.py pattern) ─────────────────────────
 
@@ -482,6 +512,68 @@ def _query_once(proc, query_text, fusion_strategy=None):
     contents = [r["content"] for r in arr if isinstance(r, dict) and "content" in r]
     return elapsed_us, contents
 
+def _wait_for_ann_convergence(
+    proc,
+    sentinel_content,
+    deadline_s=ANN_SETTLE_DEADLINE_S,
+    stable_needed=ANN_SETTLE_STABLE_N,
+    poll_interval_s=ANN_SETTLE_POLL_S,
+):
+    """Poll the vector-only leg, querying with `sentinel_content` itself, until
+    the EXACT sentinel note is present in the results for `stable_needed`
+    consecutive polls, or raise loudly if `deadline_s` elapses first.
+
+    This is the deterministic settle step between ingest and the query phase:
+    it samples the SAME structural signal the gate later asserts on
+    (fusion_strategy="vector_only"), so "converged" here means the ANN
+    background rebuild has actually installed over the full post-ingest
+    corpus — not a blind sleep guessing at a duration.
+
+    `sentinel_content` MUST be the content of a note written with its own
+    SEQUENTIAL memory.remember call issued strictly after every batch ingest
+    op has returned — never a note drawn from a batch. Batch ingest ops run
+    in parallel with no inter-op ordering (ADR-016), so the "last" element of
+    a batch has no guarantee of being the last note actually committed; and
+    the daemon's background rebuild is a full-corpus rebuild, not incremental,
+    so a build snapshotted mid-ingest can already satisfy a topic-level probe
+    against EARLY-ingested content while still missing the last few batches.
+    Requiring the exact sentinel — written after all batch ingestion
+    completed and unique enough that only a post-sentinel-write build could
+    surface it — is the only way to prove the installed index actually
+    covers the complete corpus.
+    """
+    deadline = time.time() + deadline_s
+    t_start = time.time()
+    consecutive_ok = 0
+    attempts = 0
+    last_hit = False
+    while time.time() < deadline:
+        attempts += 1
+        _, contents = _query_once(proc, sentinel_content, fusion_strategy="vector_only")
+        last_hit = any(sentinel_content in c for c in contents)
+        if last_hit:
+            consecutive_ok += 1
+            if consecutive_ok >= stable_needed:
+                print(
+                    f"[SETTLE] ANN vector leg converged after {attempts} probe(s), "
+                    f"{time.time() - t_start:.2f}s",
+                    flush=True,
+                )
+                return
+        else:
+            consecutive_ok = 0
+        time.sleep(poll_interval_s)
+    raise RuntimeError(
+        f"ANN vector-leg did not converge within {deadline_s}s of ingest "
+        f"({attempts} probe(s), sentinel note {sentinel_content!r} not found "
+        "in vector-only results). The background rebuild triggered by ingest "
+        "never installed a corpus-covering index. This exceeds the expected "
+        "warm-up window for this corpus size and looks like a genuine "
+        "convergence-latency regression in the ANN rebuild path, not benign "
+        "eventual-consistency staleness — investigate before re-running."
+    )
+
+
 # ── Daemon teardown helper ────────────────────────────────────────────────────
 
 def _teardown_daemon(pid_path, tmpdir):
@@ -617,6 +709,21 @@ def main():
         corpus = generate_corpus()
         _ingest(proc, corpus)
 
+        # Sequential settle sentinel: a single memory.remember call, issued only
+        # after every batch ingest op above has returned, so its commit cannot
+        # precede any corpus note (see _wait_for_ann_convergence docstring).
+        sentinel_content = _make_sentinel_content()
+        sentinel_body = _call_request(proc, json.dumps([
+            {"tool": "memory.remember", "args": {
+                "content": sentinel_content,
+                "memory_type": "semantic",
+                "salience": 0.7,
+                "decay_factor": 0.0,
+            }}
+        ]))
+        if sentinel_body is None or sentinel_body.get("summary", {}).get("failed", 0):
+            raise RuntimeError(f"Sentinel note write failed: {sentinel_body}")
+
         # Assert recall is non-empty before measuring
         _, warmup_hits = _query_once(proc, QUERIES[0][0])
         if not warmup_hits:
@@ -637,6 +744,17 @@ def main():
         while not pathlib.Path(sock_path).exists() and time.time() < deadline:
             time.sleep(0.1)
         assert_daemon_engaged(sock_path, pid_path_file, bench_db, label="main")
+
+        # Deterministic settle: block until the ANN background rebuild
+        # triggered by ingest has actually installed a corpus-covering index,
+        # so the measurement loop below never samples the convergence race
+        # (see ANN_SETTLE_* tunables and ADR-107 sec 1).
+        print("\n[SETTLE] Waiting for ANN vector leg to converge post-ingest...", flush=True)
+        # Probe with the sequential sentinel note's own unique content, not a
+        # bench query against a topic: only a build that ran at or after the
+        # sentinel write can surface it, so its presence proves the corpus is
+        # actually complete (see _wait_for_ann_convergence docstring).
+        _wait_for_ann_convergence(proc, sentinel_content)
 
         # Additional warm-up rounds (discard timings)
         for q, _ in QUERIES:

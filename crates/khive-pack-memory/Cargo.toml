@@ -18,6 +18,7 @@ khive-retrieval = { version = "0.3.0", path = "../khive-retrieval" }
 khive-score = { version = "0.3.0", path = "../khive-score" }
 khive-brain-core = { version = "0.3.0", path = "../khive-brain-core" }
 khive-vamana = { version = "0.3.0", path = "../khive-vamana" }
+blake3 = { workspace = true }
 inventory = { workspace = true }
 khive-storage = { version = "0.3.0", path = "../khive-storage" }
 async-trait = { workspace = true }

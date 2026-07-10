@@ -141,16 +141,20 @@ impl MemoryPack {
         // orchestration entirely (no FTS/vector cleanup, no note-mutation
         // hook fire), so it does NOT go through the generic hook wired into
         // `update_note`/`delete_note` for KG's delete path. Prune is inside
-        // the same crate as `ann`, so it invalidates/bumps directly, mirroring
-        // `memory.remember`'s own write-path pattern in `remember.rs`. The
-        // resulting cache miss forces a rebuild whose corpus scan already
-        // filters `deleted_at IS NULL` (`ann.rs`), so the just-pruned rows
-        // are correctly excluded from the rebuilt index.
+        // the same crate as `ann`, so it bumps generation directly, mirroring
+        // `memory.remember`'s own write-path pattern in `remember.rs`.
+        //
+        // #791: no longer clears the in-memory cache or deletes the
+        // persisted snapshot (see `remember.rs`'s rationale) — bumping
+        // generation is the only invalidation signal needed, and the
+        // background warm fired here re-scans the corpus (already filtering
+        // `deleted_at IS NULL`, `ann.rs`), correctly excluding the just-pruned
+        // rows once it installs.
         if pruned > 0 {
-            ann::invalidate_namespace(&self.runtime, &self.ann, &namespace).await;
             for model in self.runtime.registered_embedding_model_names() {
                 let key = ann::AnnKey::new(namespace.as_str(), model.as_str());
                 ann::bump_generation(&self.ann, &key).await;
+                ann::ensure_ann_background(&self.runtime, token, &self.ann, &model).await;
             }
         }
 

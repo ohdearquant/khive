@@ -6,12 +6,14 @@ use async_trait::async_trait;
 use serde_json::Value;
 
 use khive_runtime::pack::PackRuntime;
-use khive_runtime::{KhiveRuntime, NamespaceToken, RuntimeError, VerbRegistry};
+use khive_runtime::{
+    KhiveRuntime, NamespaceToken, PackSchemaPlan, RuntimeError, SchemaPlan, VerbRegistry,
+};
 use khive_types::{HandlerDef, Pack, ParamDef, VerbCategory, Visibility};
 
 use khive_brain_core::BalancedRecallState;
 
-use crate::ann::{new_shared, SharedAnn};
+use crate::ann::{new_shared, SharedAnn, MEMORY_SCHEMA_PLAN_STMTS};
 use crate::config::RecallConfig;
 use crate::query_cache::QueryEmbeddingCache;
 
@@ -72,6 +74,14 @@ impl Pack for MemoryPack {
     const ENTITY_KINDS: &'static [&'static str] = &[];
     const HANDLERS: &'static [HandlerDef] = &MEMORY_HANDLERS;
     const REQUIRES: &'static [&'static str] = &["kg"];
+    /// `memory_ann_epoch` (#812 review REQUEST CHANGES MEDIUM — pack schema
+    /// contract): declared here instead of created inline on the epoch
+    /// bump/read path, matching every other pack-auxiliary table in this
+    /// codebase (ADR-028). Applied at boot by `server.rs`/`serve.rs`.
+    const SCHEMA_PLAN: Option<PackSchemaPlan> = Some(PackSchemaPlan {
+        pack: "memory",
+        statements: &MEMORY_SCHEMA_PLAN_STMTS,
+    });
 }
 
 // Illocutionary classification (Searle 1976):
@@ -387,6 +397,13 @@ impl PackRuntime for MemoryPack {
         <MemoryPack as Pack>::REQUIRES
     }
 
+    fn schema_plan(&self) -> SchemaPlan {
+        SchemaPlan {
+            pack: "memory",
+            statements: &MEMORY_SCHEMA_PLAN_STMTS,
+        }
+    }
+
     async fn warm(&self) {
         crate::ann::warm_existing_memory_indexes(&self.runtime, &self.ann).await;
         fts_population_guard(&self.runtime).await;
@@ -401,11 +418,13 @@ impl PackRuntime for MemoryPack {
     /// KG's `update`/`delete` verbs reach `KhiveRuntime::update_note`/
     /// `delete_note` with no dependency on `khive-pack-memory` at all. When
     /// those touch a `kind="memory"` note (content update, soft delete, or
-    /// hard delete), this hook invalidates the warm ANN cache and bumps the
-    /// affected models' write-generation counter — the same two calls
-    /// `memory.remember` already makes on its own write path (`ann::invalidate_namespace`
-    /// + `ann::bump_generation`) — so `ann::is_current()` correctly treats
-    /// the stale-but-still-installed index as a miss on the next recall.
+    /// hard delete), this hook bumps the affected models' write-generation
+    /// counter (#750) and fires the same background warm `memory.remember`
+    /// fires on its own write path (#791) — so `ann::is_current()` correctly
+    /// treats the stale-but-still-installed index as behind, `search_loaded`
+    /// keeps serving it in the meantime, and the background warm eventually
+    /// installs a fresh one. This hook no longer clears the cache or deletes
+    /// the persisted snapshot (see `remember.rs`'s #791 rationale).
     fn register_note_mutation_hook(&self, _runtime: &KhiveRuntime) {
         let runtime = self.runtime.clone();
         let ann = self.ann.clone();
@@ -416,10 +435,13 @@ impl PackRuntime for MemoryPack {
                 if kind != "memory" {
                     return;
                 }
-                crate::ann::invalidate_namespace(&runtime, &ann, "local").await;
+                let Ok(token) = runtime.authorize(khive_runtime::Namespace::local()) else {
+                    return;
+                };
                 for model in runtime.registered_embedding_model_names() {
                     let key = crate::ann::AnnKey::new("local", model.as_str());
                     crate::ann::bump_generation(&ann, &key).await;
+                    crate::ann::ensure_ann_background(&runtime, &token, &ann, &model).await;
                 }
             })
         });
