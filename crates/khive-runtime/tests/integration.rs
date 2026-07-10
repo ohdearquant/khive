@@ -512,6 +512,33 @@ async fn explicit_limit_variants_against_501_matches() {
     );
 }
 
+#[tokio::test]
+async fn explicit_limit_over_cap_with_few_real_matches_emits_no_warning() {
+    let rt = rt();
+
+    // Only 20 real matches, but the explicit LIMIT (600) exceeds the cap
+    // (500). This is the false-positive regression case: the old
+    // warn-whenever-LIMIT-exceeds-cap inference would have fired here even
+    // though nothing was actually truncated. All 20 rows must come back and
+    // no warning must fire.
+    let tok = seed_concepts(&rt, "trunc-20-limit-over-cap", 20).await;
+    let result = rt
+        .query_with_metadata(
+            &tok,
+            "MATCH (a:concept) RETURN a LIMIT 600",
+            khive_query::CompileOptions::default(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(result.rows.len(), 20);
+    assert!(
+        result.warnings.is_empty(),
+        "LIMIT above cap with fewer real matches than the cap must not warn: {:?}",
+        result.warnings
+    );
+}
+
 // =============================================================================
 // Namespace isolation
 // =============================================================================
