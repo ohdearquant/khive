@@ -140,27 +140,56 @@ pub async fn run_pending_events(
     verbose: bool,
 ) -> Result<DrainSummary> {
     // Resolve through the SAME multi-backend-aware construction the daemon
-    // boot path uses (`khive-mcp::serve::build_server`), rather than a
-    // throwaway `RuntimeConfig::default()` (codex PR #782 review round 2,
-    // High finding continuation): `RuntimeConfig::default()` is env-only —
-    // it never consulted `khive.toml` (`[[backends]]`, `[actor] id`,
-    // `[packs.*].backend`) at all, so a project with a declared multi-backend
-    // config or a tier-3 config-file actor identity was silently invisible
-    // to this one-shot CLI path even though `kkernel mcp --daemon` (and, for
-    // ordinary ops, `kkernel exec`'s own `resolve_runtime_config` call) both
-    // resolve it. `build_server` also returns the fully-wired
-    // `KhiveMcpServer` for the resolved pack set (single- or multi-backend),
-    // so replayed actions route through the correct per-pack backend exactly
-    // like the daemon tick now does — not a single runtime standing in for
-    // every pack (the same High finding this fix-round closes for the
-    // daemon-resident tick). `kkernel exec` has no `--config` flag today
-    // (see `kkernel::exec::run_exec`'s own `resolve_runtime_config` call),
-    // so this mirrors that: `config: None` still triggers `khive.toml`'s
-    // standard cwd/home search order inside `build_server`.
+    // boot path uses (`khive-mcp::serve::build_server_with_explicit_namespace`),
+    // rather than a throwaway `RuntimeConfig::default()` (codex PR #782
+    // review round 2, High finding continuation): `RuntimeConfig::default()`
+    // is env-only — it never consulted `khive.toml` (`[[backends]]`,
+    // `[actor] id`, `[packs.*].backend`) at all, so a project with a
+    // declared multi-backend config or a tier-3 config-file actor identity
+    // was silently invisible to this one-shot CLI path even though
+    // `kkernel mcp --daemon` (and, for ordinary ops, `kkernel exec`'s own
+    // `resolve_runtime_config` call) both resolve it. The wrapper also
+    // returns the fully-wired `KhiveMcpServer` for the resolved pack set
+    // (single- or multi-backend), so replayed actions route through the
+    // correct per-pack backend exactly like the daemon tick now does — not a
+    // single runtime standing in for every pack (the same High finding this
+    // fix-round closes for the daemon-resident tick). `kkernel exec` has no
+    // `--config` flag today (see `kkernel::exec::run_exec`'s own
+    // `resolve_runtime_config` call), so this mirrors that: `config: None`
+    // still triggers `khive.toml`'s standard cwd/home search order inside
+    // `resolve_runtime_config`.
+    //
+    // This does NOT call `crate::serve::build_server` directly (PR #782
+    // review round 4, High finding): `build_server` derives BOTH
+    // `namespace_explicit` and `actor_explicit` from `resolve_cli_namespace`,
+    // which treats "a namespace value is present" and "the operator typed
+    // `--actor`/`--namespace`" as the same fact — true for a real CLI parse,
+    // where there is no other way a namespace value could appear. This
+    // wrapper's `namespace` argument is not a CLI flag the operator typed;
+    // it is a plain default this function was called with (`"local"` unless
+    // the caller passed something else), and `resolve_runtime_config`
+    // (`serve.rs`) treats a genuine explicit actor override as authoritative
+    // — it clears any configured `[actor] id` for the resolved-to-"local"
+    // case rather than falling through to it. Routing this default namespace
+    // through `build_server` therefore silently discarded a project's
+    // configured `[actor] id`, contradicting Amendment B's claim that this
+    // CLI path honors it, and — under strict actor mode with the comm pack —
+    // could make server construction itself fail despite a valid config.
+    // `build_server_with_explicit_namespace` is the seam that lets this
+    // caller assert the narrower, correct semantic instead: the namespace
+    // *is* a real default (`namespace_explicit: true`, so it still becomes
+    // `default_namespace` and fills `actor_id` when non-"local"), but it is
+    // NOT an actor override (`actor_explicit: false`), so a `"local"`
+    // resolution keeps falling through to the project/db/env actor tiers —
+    // exactly the shape `kkernel exec`/`kkernel reindex` already use via
+    // their own direct `resolve_runtime_config` calls (see
+    // `RuntimeConfigInputs::actor_explicit`'s field doc).
+    let ns = Namespace::parse(namespace)
+        .map_err(|e| anyhow::anyhow!("pending-events: invalid namespace {namespace:?}: {e}"))?;
     let args = crate::args::Args {
         db: db.map(str::to_string),
         actor: None,
-        namespace: Some(namespace.to_string()),
+        namespace: None,
         no_embed: false,
         pack: Vec::new(),
         config: None,
@@ -170,8 +199,9 @@ pub async fn run_pending_events(
         brain_profile: None,
         resumed_generation: None,
     };
-    let (server, schedule_rt) = crate::serve::build_server(&args)
-        .map_err(|e| anyhow::anyhow!("pending-events: build server: {e}"))?;
+    let (server, schedule_rt) =
+        crate::serve::build_server_with_explicit_namespace(&args, ns, true, false)
+            .map_err(|e| anyhow::anyhow!("pending-events: build server: {e}"))?;
     let rt = schedule_rt.ok_or_else(|| {
         anyhow::anyhow!(
             "pending-events: resolved pack set does not include \"schedule\"; nothing to drain"
@@ -1023,15 +1053,19 @@ async fn dispatch_action(
 /// `scheduled_event` note (i.e. `status="pending"` AND `trigger_at <= now`).
 ///
 /// Uses a direct SQL query for efficiency — avoids fetching all pending notes
-/// across all namespaces up front. The `trigger_at` comparison is a string
-/// comparison, which is correct for UTC RFC 3339 timestamps (lexicographic
-/// order matches chronological order for `Z` / `+00:00` forms).
-///
-/// RFC 3339 timestamps with non-zero offsets are NOT reliably comparable as
-/// strings — the schedule pack normalises all `trigger_at` values to whatever
-/// the caller supplies. In practice, `validate_at` in `handlers.rs` accepts
-/// any RFC 3339 string that `chrono` parses (including offset forms). We
-/// therefore fetch by namespace and re-check in Rust with parsed `DateTime<Utc>`.
+/// across all namespaces up front. The `trigger_at` comparison is done via
+/// SQLite's `datetime(...)`, not a raw string comparison (PR #782 review
+/// round 3, High finding): `khive-pack-schedule` round-trips the caller's
+/// original `trigger_at` string verbatim, offset included (H5), and
+/// `validate_at` in `handlers.rs` accepts any RFC 3339 offset — a raw-text
+/// `<=` only matches chronological order when every stored string happens to
+/// share `now`'s UTC offset, which is not guaranteed. `datetime(...)`
+/// normalizes both sides to UTC before comparing, making the comparison
+/// chronological regardless of offset; storage still round-trips the
+/// caller's original string unchanged (H5 unaffected). The Rust layer
+/// downstream still re-parses and re-checks each candidate row with
+/// `DateTime<Utc>` as the final authority — this SQL predicate is a fetch
+/// bound, not the last word.
 async fn discover_pending_namespaces(rt: &KhiveRuntime, now: DateTime<Utc>) -> Result<Vec<String>> {
     use khive_storage::types::{SqlStatement, SqlValue};
 
@@ -2648,5 +2682,195 @@ mod tests {
                 hits.len()
             );
         }
+    }
+
+    // ── PR #782 review round 4, High finding: `run_pending_events`'s wrapper
+    //    seam must not misread a default namespace as an explicit actor
+    //    override ──────────────────────────────────────────────────────────
+    //
+    // These tests exercise the REAL config-discovery path (process cwd /
+    // `HOME`), exactly like `serve.rs`'s own ADR-096 Fork 2 regressions —
+    // that module's `SeatEnv`/`write_config` helpers are private to its own
+    // `#[cfg(test)]` module, so this module carries its own copies rather
+    // than exporting test-only scaffolding across a crate boundary that
+    // doesn't otherwise exist between these two files.
+
+    /// RAII guard: temporarily redirects process cwd to `project_root` and
+    /// `HOME` to an isolated, empty tempdir (so tier 4 — `~/.khive/config.toml`
+    /// — never reaches whatever the real machine running this suite happens
+    /// to have configured globally). Restores both on drop, even on
+    /// panic/unwind. Mirrors `serve.rs`'s own `SeatEnv`.
+    struct SeatEnv {
+        original_cwd: std::path::PathBuf,
+        original_home: Option<std::ffi::OsString>,
+        _isolated_home: tempfile::TempDir,
+    }
+
+    impl SeatEnv {
+        fn enter(project_root: &std::path::Path) -> Self {
+            let original_cwd = std::env::current_dir().expect("read cwd");
+            let original_home = std::env::var_os("HOME");
+            let isolated_home = tempfile::tempdir().expect("isolated HOME tempdir");
+            std::env::set_current_dir(project_root).expect("chdir into seat project root");
+            std::env::set_var("HOME", isolated_home.path());
+            Self {
+                original_cwd,
+                original_home,
+                _isolated_home: isolated_home,
+            }
+        }
+    }
+
+    impl Drop for SeatEnv {
+        fn drop(&mut self) {
+            let _ = std::env::set_current_dir(&self.original_cwd);
+            match &self.original_home {
+                Some(h) => std::env::set_var("HOME", h),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+    }
+
+    /// Write a project-local `.khive/config.toml` declaring `[actor] id`.
+    fn write_project_actor_config(project_root: &std::path::Path, actor_id: &str) {
+        std::fs::create_dir_all(project_root.join(".khive")).expect("mkdir .khive");
+        std::fs::write(
+            project_root.join(".khive/config.toml"),
+            format!("[actor]\nid = \"{actor_id}\"\n"),
+        )
+        .expect("write project actor config");
+    }
+
+    /// The wrapper seam (`build_server_with_explicit_namespace`, called by
+    /// `run_pending_events` with `namespace_explicit: true, actor_explicit:
+    /// false`) must let a `"local"`-resolved default namespace fall through
+    /// to the project-configured actor — never clear it the way a genuine
+    /// `--actor`/`--namespace` CLI override would (`build_server`'s own,
+    /// correctly-narrower semantic). Regression for PR #782 review round 4's
+    /// High finding: before this fix, `run_pending_events` called
+    /// `build_server` directly with a synthesized `namespace: Some("local")`,
+    /// which `resolve_cli_namespace` reported as `explicit = true` and
+    /// `build_server` then fed into BOTH `namespace_explicit` AND
+    /// `actor_explicit`, tripping the "genuinely explicit actor tier
+    /// requesting anonymous" branch in `resolve_runtime_config` and silently
+    /// discarding the configured `[actor] id`.
+    #[test]
+    #[serial_test::serial]
+    fn wrapper_seam_falls_through_to_project_actor_instead_of_clearing_it() {
+        std::env::remove_var("KHIVE_ACTOR");
+        std::env::remove_var("KHIVE_DB");
+        std::env::remove_var("KHIVE_PACKS");
+        std::env::remove_var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR");
+
+        let seat_dir = tempfile::tempdir().expect("seat tempdir");
+        write_project_actor_config(seat_dir.path(), "lambda:pending-events-tenant");
+        let _seat_env = SeatEnv::enter(seat_dir.path());
+
+        let args = crate::args::Args {
+            db: Some(":memory:".to_string()),
+            actor: None,
+            namespace: None,
+            no_embed: false,
+            pack: Vec::new(),
+            config: None,
+            daemon: false,
+            transport: None,
+            bind: None,
+            brain_profile: None,
+            resumed_generation: None,
+        };
+        let ns = Namespace::parse("local").expect("local namespace");
+
+        // The seam `run_pending_events` actually calls: namespace is a real
+        // default (`namespace_explicit: true`) but NOT an actor override
+        // (`actor_explicit: false`).
+        let (_server, schedule_rt) =
+            crate::serve::build_server_with_explicit_namespace(&args, ns, true, false)
+                .expect("build_server_with_explicit_namespace must succeed");
+        let rt = schedule_rt.expect("\"schedule\" pack is in the default pack set");
+        assert_eq!(
+            rt.config().actor_id.as_deref(),
+            Some("lambda:pending-events-tenant"),
+            "a default namespace resolving to \"local\" must fall through to the \
+             project-configured [actor] id, not clear it as if it were an explicit \
+             --actor/--namespace override"
+        );
+    }
+
+    /// Positive control for the failure mode the fix above closes: routing
+    /// the same inputs through `build_server` (the genuine CLI-flag seam,
+    /// unchanged by this fix-round) DOES clear the actor, because there a
+    /// present namespace value really does mean "the operator typed
+    /// --namespace". This documents why `run_pending_events` must not reuse
+    /// that entry point for a synthesized, non-CLI-parsed namespace default.
+    #[test]
+    #[serial_test::serial]
+    fn build_server_cli_seam_clears_actor_for_explicit_local_namespace() {
+        std::env::remove_var("KHIVE_ACTOR");
+        std::env::remove_var("KHIVE_DB");
+        std::env::remove_var("KHIVE_PACKS");
+        std::env::remove_var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR");
+
+        let seat_dir = tempfile::tempdir().expect("seat tempdir");
+        write_project_actor_config(seat_dir.path(), "lambda:pending-events-tenant");
+        let _seat_env = SeatEnv::enter(seat_dir.path());
+
+        let args = crate::args::Args {
+            db: Some(":memory:".to_string()),
+            actor: None,
+            namespace: Some("local".to_string()),
+            no_embed: false,
+            pack: Vec::new(),
+            config: None,
+            daemon: false,
+            transport: None,
+            bind: None,
+            brain_profile: None,
+            resumed_generation: None,
+        };
+
+        let (_server, schedule_rt) =
+            crate::serve::build_server(&args).expect("build_server must succeed");
+        let rt = schedule_rt.expect("\"schedule\" pack is in the default pack set");
+        assert_eq!(
+            rt.config().actor_id,
+            None,
+            "build_server's genuine CLI-flag seam must still treat a present --namespace \
+             value as an explicit actor override and clear the actor for \"local\" — this \
+             is correct CLI behavior, unaffected by the wrapper-seam fix"
+        );
+    }
+
+    /// `run_pending_events` (the actual `kkernel exec --pending-events`
+    /// entry point, not the lower-level `drain_for_test` helper) must
+    /// succeed under strict actor mode when a project `[actor] id` is
+    /// configured — proving the wrapper's server construction no longer
+    /// spuriously trips `enforce_strict_actor_mode` the way routing through
+    /// `build_server`'s actor-clearing path would have.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn wrapper_succeeds_under_strict_actor_mode_with_configured_project_actor() {
+        std::env::remove_var("KHIVE_ACTOR");
+        std::env::remove_var("KHIVE_DB");
+        std::env::remove_var("KHIVE_PACKS");
+        let prev_strict = std::env::var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR").ok();
+        std::env::set_var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR", "1");
+
+        let seat_dir = tempfile::tempdir().expect("seat tempdir");
+        write_project_actor_config(seat_dir.path(), "lambda:pending-events-tenant");
+        let _seat_env = SeatEnv::enter(seat_dir.path());
+
+        let result = run_pending_events(Some(":memory:"), "local", false).await;
+
+        match prev_strict {
+            Some(v) => std::env::set_var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR", v),
+            None => std::env::remove_var("KHIVE_REQUIRE_ATTRIBUTED_ACTOR"),
+        }
+
+        result.expect(
+            "run_pending_events must succeed under strict actor mode when a project \
+             [actor] id is configured — the same config a live `kkernel mcp --daemon` \
+             boot in this project would resolve",
+        );
     }
 }

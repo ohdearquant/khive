@@ -570,8 +570,10 @@ same PR:
   from Decision point 1's `daemon.rs` target).
 - The tick does **not** go through a `DaemonDispatch::drain_pending_events` trait
   method. `khive-runtime` gains no new trait method and no new `DrainSummary`/
-  `DrainError` types; those remain owned by `khive-mcp` (as `DrainSummary` already was
-  before this ADR).
+  `DrainError` types; `DrainSummary` is owned by `khive-mcp` — it moved there from
+  `crates/kkernel` as part of the same relocation described above, not something
+  `khive-mcp` already owned before this ADR — and no separate `DrainError` type exists
+  at all (per-event failures accumulate in `DrainSummary.failed` instead).
 - Shutdown is a bare `tokio::spawn` with no `track_background_task` registration and no
   watch-channel signal, matching how the checkpoint task and the email-channel loops are
   already spawned in the current codebase (neither uses `track_background_task` today
@@ -745,6 +747,24 @@ multi-backend deployments, plus two narrower regression/resource issues:
   branches and `discover_pending_namespaces`. The comparison is now chronological via
   SQLite `datetime()`; storage still round-trips the caller's original string — H5
   unchanged.
+- **Fix-round 4 addendum (2026-07-09):** the one-shot CLI path (`run_pending_events`)
+  synthesized an `Args` value with `namespace: Some("local")` and called `build_server`
+  directly — the same entry point real `--actor`/`--namespace` CLI flags go through.
+  `build_server` derives both `namespace_explicit` and `actor_explicit` from a single
+  `resolve_cli_namespace` check, which is correct for a genuine CLI parse (there is no
+  way to type `--namespace` without meaning an explicit actor override) but wrong for a
+  synthesized default: it made a default-resolved `"local"` namespace clear any
+  project-configured `[actor] id` exactly as if the operator had typed `--actor local`,
+  contradicting this section's own claim that the CLI path honors `[actor] id`, and
+  could fail server construction outright under strict actor mode despite a valid
+  config. Fixed by extracting `build_server`'s body (after CLI-namespace resolution)
+  into a new `build_server_with_explicit_namespace(args, namespace, namespace_explicit,
+  actor_explicit)` seam; `build_server` itself is unchanged (still derives both flags
+  from `resolve_cli_namespace`), while `run_pending_events` now calls the new seam
+  directly with `namespace_explicit: true, actor_explicit: false` — the same shape
+  `kkernel exec`/`kkernel reindex` already use via their own `resolve_runtime_config`
+  calls, so a `"local"`-resolved default namespace falls through to the project/db/env
+  actor tiers instead of being treated as an explicit override.
 
 None of this changes the Criteria 1-7 status table above — the High finding this round
 closed was scoped entirely to dispatch routing, which Criterion 2 (fire-exactly-once)

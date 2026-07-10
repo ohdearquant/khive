@@ -1329,16 +1329,57 @@ pub fn enforce_strict_actor_mode(
 /// #782 review's High finding: a second, independently-resolved config could
 /// silently target a different database, actor identity, or pack set than
 /// the daemon it claims to serve.
+///
+/// Thin wrapper over [`build_server_with_explicit_namespace`]: derives the
+/// `(namespace, namespace_explicit)` pair from a real CLI parse via
+/// [`resolve_cli_namespace`], and — because this is the genuine `--actor`
+/// / `--namespace` CLI flag path — also treats that explicitness as a real
+/// actor override (`actor_explicit` mirrors `namespace_explicit` here; see
+/// `RuntimeConfigInputs::actor_explicit`'s field doc for why only this call
+/// site is allowed to do that).
 pub fn build_server(args: &Args) -> anyhow::Result<(KhiveMcpServer, Option<KhiveRuntime>)> {
     let (cli_namespace_explicit, cli_namespace) =
         resolve_cli_namespace(args).map_err(|e| anyhow::anyhow!("{e}"))?;
+    build_server_with_explicit_namespace(
+        args,
+        cli_namespace,
+        cli_namespace_explicit,
+        cli_namespace_explicit,
+    )
+}
 
+/// Build a fully-configured server from parsed args plus an independently
+/// resolved `(namespace, namespace_explicit, actor_explicit)` triple.
+///
+/// Extracted from [`build_server`] (PR #782 review round 4, High finding) so
+/// that non-interactive-CLI callers — e.g. the `--pending-events` one-shot
+/// drain wrapper in `pending_events.rs` — can supply a namespace default
+/// without it being misread as a genuine `--actor` override. `build_server`
+/// derives its namespace from a real CLI parse (`resolve_cli_namespace`),
+/// where "a namespace value is present" and "the operator explicitly
+/// overrode the actor identity" are the same fact by construction — there is
+/// no way to type `--namespace foo` without meaning it. A caller that
+/// synthesizes an `Args` value programmatically (no real flag parse behind
+/// it) does not get to make that same inference: passing a default
+/// namespace through `namespace_explicit: true` while asserting the actor
+/// identity was never touched (`actor_explicit: false`) is exactly the
+/// `kkernel exec` / `kkernel reindex` shape (see their own
+/// `resolve_runtime_config` call sites and the field doc on
+/// `RuntimeConfigInputs::actor_explicit`), and this function is the seam
+/// that lets any caller opt into that same, narrower semantic instead of
+/// `build_server`'s CLI-only one.
+pub fn build_server_with_explicit_namespace(
+    args: &Args,
+    namespace: khive_runtime::Namespace,
+    namespace_explicit: bool,
+    actor_explicit: bool,
+) -> anyhow::Result<(KhiveMcpServer, Option<KhiveRuntime>)> {
     let config = resolve_runtime_config(RuntimeConfigInputs {
         db: args.db.as_deref(),
         config: args.config.as_deref(),
-        namespace: cli_namespace,
-        namespace_explicit: cli_namespace_explicit,
-        actor_explicit: cli_namespace_explicit,
+        namespace,
+        namespace_explicit,
+        actor_explicit,
         no_embed: args.no_embed,
         packs: if args.pack.is_empty() {
             None
