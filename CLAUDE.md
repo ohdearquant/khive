@@ -55,7 +55,7 @@ behavior isn't written there, it is an unspecified design decision → escalate,
 └──────────────────────────────────────────────────────────────┘
                             ↕ VerbRegistry dispatch
 ┌──────────────────────────────────────────────────────────────┐
-│  khive-pack-kg     — KG vocabulary + 17 verb handlers (ADR-017)     │
+│  khive-pack-kg     — KG vocabulary + 18 verb handlers (ADR-017)     │
 │  khive-pack-gtd    — GTD lifecycle, 5 verbs (ADR-019, optional)     │
 │  khive-pack-memory — memory/recall verbs + feedback + decay (ADR-021, optional)│
 │  khive-vcs         — KG versioning: snapshots/branches (ADR-010)    │
@@ -99,7 +99,7 @@ not shipped.
 | `crates/khive-query`       | GQL + SPARQL parsers, AST validation, SQL compiler                                                                                                                                                                                               |
 | `crates/khive-runtime`     | Service API + VerbRegistry + PackRuntime trait                                                                                                                                                                                                   |
 | `crates/khive-request`     | Request DSL parser (function-call + JSON; pipe/LNDL planned)                                                                                                                                                                                     |
-| `crates/khive-pack-kg`     | KG pack: vocabulary, 17 verb handlers, kind validation                                                                                                                                                                                           |
+| `crates/khive-pack-kg`     | KG pack: vocabulary, 18 verb handlers, kind validation                                                                                                                                                                                           |
 | `crates/khive-pack-gtd`    | GTD pack: 5 verbs over notes (assign / next / complete / tasks / transition)                                                                                                                                                                     |
 | `crates/khive-pack-memory` | Memory pack: `remember`/`recall`/`feedback` verbs, decay-weighted recall ([ADR-021](docs/adr/ADR-021-memory-pack.md))                                                                                                                            |
 | `crates/khive-pack-formal` | Formal-methods pack: typed edge endpoint rules for six formal-math concept subtypes (theorem, definition, structure, instance, axiom, goal); pure ontology, no verbs ([ADR-069](docs/adr/ADR-069-subject-model.md)); not in the default pack set |
@@ -168,36 +168,37 @@ request(ops="[{\"tool\":\"v1\",\"args\":{...}}, ...]")
 
 Verbs come from whichever packs are loaded via `KHIVE_PACKS` (env) or `--pack` (CLI). Default
 loads all 9 production packs: kg, gtd, memory, brain, comm, schedule, knowledge, session, git
-(77 verbs total — git contributes commit/issue/pull_request note kinds, a batch ingester,
+(78 verbs total — git contributes commit/issue/pull_request note kinds, a batch ingester,
 and the git.digest verb (ADR-088 Amendment 1); comm.probe (#644) added 2026-07-07; brain.event_counts (ADR-103 Stage 1, #724
-Ask A) added 2026-07-08; regenerate via `request(ops="verbs()")` before editing this line).
+Ask A) added 2026-07-08; kg.resolve added 2026-07-09; regenerate via `request(ops="verbs()")` before editing this line).
 
-### KG pack verbs (17 — ADR-017, ADR-046, ADR-089)
+### KG pack verbs (18 — ADR-017, ADR-046, ADR-089)
 
 `create`, `list`, and `search` take a `kind` discriminant. It accepts either the substrate-level
 name (`entity`, `note`, `edge`) **or** a pack-registered granular kind (`concept`, `document`,
 `task`, `observation`, …). The registry resolves which substrate the granular form lives in.
 Mixing a granular `kind` with a contradicting `entity_kind`/`note_kind` sub-filter is rejected.
 
-| Verb        | Args                                                                                         | What it does                                                                                   |
-| ----------- | -------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------- |
-| `create`    | `kind=<substrate\|granular>` + fields                                                        | Create an entity or note                                                                       |
-| `get`       | `id` (UUID)                                                                                  | Fetch any record — auto-detects entity/note/edge                                               |
-| `list`      | `kind=<substrate\|granular>\|edge` + filters                                                 | Structured browse with pagination                                                              |
-| `stats`     | —                                                                                            | Return aggregate KG substrate counts (entities, edges, notes)                                  |
-| `update`    | `id` + patch fields                                                                          | Patch entity (name/desc/props/tags) or edge (relation/weight)                                  |
-| `delete`    | `id`, `hard?`                                                                                | Soft-delete (default) or hard-delete with edge cascade                                         |
-| `merge`     | `into_id`, `from_id`                                                                         | Deduplicate two entities (v0.1: entity-only)                                                   |
-| `search`    | `kind=<substrate\|granular>`, `query`                                                        | Hybrid FTS5 + vector search with RRF fusion                                                    |
-| `link`      | `source_id`, `target_id`, `relation`                                                         | Create a typed directed edge                                                                   |
-| `neighbors` | `node_id`, `direction?`, `relations?`, `include_entity_type?`                                | Immediate graph neighbors; `include_entity_type=true` adds entity subtype to each hit          |
-| `traverse`  | `roots`, `max_depth?`, `relations?`, `include_properties?`                                   | Multi-hop BFS with filters; `include_properties=true` adds entity properties to each path node |
-| `query`     | GQL or SPARQL string                                                                         | Pattern matching compiled to SQL                                                               |
-| `propose`   | `title`, `description`, `changeset`                                                          | Create an event-sourced change proposal (ADR-046)                                              |
-| `review`    | `id`, `decision`, `comment?`                                                                 | Approve, reject, or comment on a proposal                                                      |
-| `withdraw`  | `id`, `rationale?`                                                                           | Rescind an open proposal (proposer-only)                                                       |
-| `verbs`     | `category?`, `pack?`                                                                         | List all MCP-callable verbs registered on this server                                          |
-| `context`   | `query?`, `entity_ids?`, `hops?`, `budget?`, `relations?`, `direction?`, `limit?`, `fanout?` | Entity-anchored graph context in one call (ADR-089)                                            |
+| Verb        | Args                                                                                         | What it does                                                                                     |
+| ----------- | -------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------ |
+| `create`    | `kind=<substrate\|granular>` + fields                                                        | Create an entity or note                                                                         |
+| `get`       | `id` (UUID)                                                                                  | Fetch any record — auto-detects entity/note/edge                                                 |
+| `list`      | `kind=<substrate\|granular>\|edge` + filters                                                 | Structured browse with pagination                                                                |
+| `stats`     | —                                                                                            | Return aggregate KG substrate counts (entities, edges, notes)                                    |
+| `update`    | `id` + patch fields                                                                          | Patch entity (name/desc/props/tags) or edge (relation/weight)                                    |
+| `delete`    | `id`, `hard?`                                                                                | Soft-delete (default) or hard-delete with edge cascade                                           |
+| `merge`     | `into_id`, `from_id`                                                                         | Deduplicate two entities (v0.1: entity-only)                                                     |
+| `search`    | `kind=<substrate\|granular>`, `query`                                                        | Hybrid FTS5 + vector search with RRF fusion                                                      |
+| `link`      | `source_id`, `target_id`, `relation`                                                         | Create a typed directed edge                                                                     |
+| `neighbors` | `node_id`, `direction?`, `relations?`, `include_entity_type?`                                | Immediate graph neighbors; `include_entity_type=true` adds entity subtype to each hit            |
+| `traverse`  | `roots`, `max_depth?`, `relations?`, `include_properties?`                                   | Multi-hop BFS with filters; `include_properties=true` adds entity properties to each path node   |
+| `query`     | GQL or SPARQL string                                                                         | Pattern matching compiled to SQL                                                                 |
+| `propose`   | `title`, `description`, `changeset`                                                          | Create an event-sourced change proposal (ADR-046)                                                |
+| `review`    | `id`, `decision`, `comment?`                                                                 | Approve, reject, or comment on a proposal                                                        |
+| `withdraw`  | `id`, `rationale?`                                                                           | Rescind an open proposal (proposer-only)                                                         |
+| `resolve`   | `refs`, `kind?`, `limit?`                                                                    | Resolve natural-language references to ids (id passthrough, recent-ring, hybrid-search fallback) |
+| `verbs`     | `category?`, `pack?`                                                                         | List all MCP-callable verbs registered on this server                                            |
+| `context`   | `query?`, `entity_ids?`, `hops?`, `budget?`, `relations?`, `direction?`, `limit?`, `fanout?` | Entity-anchored graph context in one call (ADR-089)                                              |
 
 ### GTD pack verbs (5 — ADR-019, optional)
 

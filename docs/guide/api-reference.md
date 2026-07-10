@@ -1,13 +1,13 @@
 # API Reference
 
-khive exposes exactly one MCP tool, `request`. Everything else — 77 verbs across 9
+khive exposes exactly one MCP tool, `request`. Everything else — 78 verbs across 9
 production packs — is dispatched through that single tool via a small request DSL.
 This page documents the DSL grammar, the response envelope, and every verb's full
 parameter contract, so an agent can call khive correctly without reading Rust source.
 
 This page is verified against the live registry (`request(ops="verbs()")`, run
-2026-07-09) and the pack source (`crates/khive-pack-*/src/*.rs` `HandlerDef`/`ParamDef`
-struct literals). Verb count: **76**, matching both the live registry `total` field and
+2026-07-10) and the pack source (`crates/khive-pack-*/src/*.rs` `HandlerDef`/`ParamDef`
+struct literals). Verb count: **78**, matching both the live registry `total` field and
 the sum of the 9 pack counts below. If your server reports a different total, your
 `KHIVE_PACKS` configuration loads a different pack set than the default — run
 `request(ops="verbs()")` against your own server to get the authoritative list.
@@ -21,7 +21,7 @@ An always-machine-readable copy of this page is at
 
 | Pack        | Verbs | Load with                  | Optional?           |
 | ----------- | ----- | -------------------------- | ------------------- |
-| `kg`        | 17    | `KHIVE_PACKS=kg` (default) | No — base substrate |
+| `kg`        | 18    | `KHIVE_PACKS=kg` (default) | No — base substrate |
 | `gtd`       | 5     | `KHIVE_PACKS=kg,gtd`       | Yes                 |
 | `memory`    | 5     | `KHIVE_PACKS=kg,memory`    | Yes                 |
 | `brain`     | 15    | `KHIVE_PACKS=kg,brain`     | Yes                 |
@@ -35,8 +35,8 @@ An always-machine-readable copy of this page is at
 `run_ingest` core (`crates/khive-pack-git/src/ingest.rs`) that both `git.digest` and the
 `kkernel git-ingest` CLI drive.
 
-The default binary (no `KHIVE_PACKS`/`--pack` override) loads all 9 packs: 17 + 5 + 5 +
-15 + 7 + 4 + 19 + 4 + 1 = **77 verbs**.
+The default binary (no `KHIVE_PACKS`/`--pack` override) loads all 9 packs: 18 + 5 + 5 +
+15 + 7 + 4 + 19 + 4 + 1 = **78 verbs**.
 
 Verb names in the `kg` pack are bare (`create`, `search`, `link`, …). Every other pack
 namespaces its verbs with a `pack.` prefix (`gtd.assign`, `memory.recall`,
@@ -134,7 +134,7 @@ parallel batches, since parallel failures do not cascade.
 
 ---
 
-## `kg` pack — 17 verbs
+## `kg` pack — 18 verbs
 
 Base substrate verbs, bare names (no `kg.` prefix). Category is the illocutionary act
 (Searle 1976): Assertive = retrieves state, Commissive = commits a persistent change,
@@ -446,15 +446,33 @@ Withdraw an open proposal (proposer-only).
 request(ops="withdraw(id=\"<proposal-id>\")")
 ```
 
+### `resolve` — Assertive
+
+Resolve natural-language references to ids. Each ref in `refs` is resolved through:
+(1) id-string passthrough (UUID or 8+ hex prefix) via the existing by-ID path; (2) this
+actor's recently-referenced ring; (3) hybrid search over the namespace. Returns one of
+`Resolved{id,confidence}` | `Ambiguous{candidates}` | `NotFound` per ref — never a
+silent pick among close candidates. Read-only: performs no mutation.
+
+| Param   | Type            | Required | Notes                                                                                                        |
+| ------- | --------------- | -------- | ------------------------------------------------------------------------------------------------------------ |
+| `refs`  | array\<string\> | yes      | Natural-language references to resolve (UUID, hex prefix, exact entity name, or free text).                  |
+| `kind`  | string          | no       | Restricts the hybrid-search fallback (stage 3) to an entity kind. No effect on the id-string or ring stages. |
+| `limit` | integer         | no       | Max candidates returned per ref from the hybrid-search fallback. Default 5, max 20.                          |
+
+```
+request(ops="resolve(refs=[\"the old record\", \"<uuid>\"])")
+```
+
 ### `verbs` — Assertive
 
 List all MCP-callable verbs registered on this server. Internal subhandlers are
 excluded.
 
-| Param      | Type   | Required | Notes                                                                                             |
-| ---------- | ------ | -------- | ------------------------------------------------------------------------------------------------- |
-| `category` | string | no       | Filter: `Assertive`\|`Commissive`\|`Declaration`\|`Directive`.                                    |
-| `pack`     | string | no       | Filter by pack name (`kg`, `gtd`, `memory`, `brain`, `comm`, `schedule`, `knowledge`, `session`). |
+| Param      | Type   | Required | Notes                                                                                                    |
+| ---------- | ------ | -------- | -------------------------------------------------------------------------------------------------------- |
+| `category` | string | no       | Filter: `Assertive`\|`Commissive`\|`Declaration`\|`Directive`.                                           |
+| `pack`     | string | no       | Filter by pack name (`kg`, `gtd`, `memory`, `brain`, `comm`, `schedule`, `knowledge`, `session`, `git`). |
 
 ```
 request(ops="verbs()")
@@ -635,11 +653,31 @@ request(ops="memory.vacuum()")
 
 ---
 
-## `brain` pack — 14 verbs
+## `brain` pack — 15 verbs
 
 Recall-tuning profiles: Beta-posterior scoring, profile lifecycle, and the actor/
 namespace/consumer-kind resolution table that picks which profile serves a given
 caller. Optional; load with `KHIVE_PACKS=kg,brain`.
+
+### `brain.event_counts` — Assertive
+
+Windowed event counts grouped by kind and actor over the event plane (ADR-103 Stage 1,
+#724 Ask A). `feedback_explicit` events are additionally split by `served_by_profile_id`.
+Events carrying a `work_class` (today: `phase_started`/`phase_completed`/`phase_cancelled`
+payloads) split by `counts_by_work_class`. `cost_unit` is not surfaced: it does not exist
+on any event payload yet (ADR-103 Stage 0 is design-only) and will be added once a
+resource payload carries it.
+
+| Param   | Type   | Required | Notes                                                                  |
+| ------- | ------ | -------- | ---------------------------------------------------------------------- |
+| `since` | string | yes      | Window start, ISO-8601/RFC-3339 datetime. Inclusive.                   |
+| `until` | string | no       | Window end, ISO-8601/RFC-3339 datetime. Exclusive. Defaults to now.    |
+| `actor` | string | no       | Filter to a single actor. Omit for all actors.                         |
+| `kind`  | string | no       | Filter to a single EventKind (e.g. `"recall_executed"`). Omit for all. |
+
+```
+request(ops="brain.event_counts(since=\"2026-07-01T00:00:00Z\")")
+```
 
 ### `brain.profiles` — Assertive
 
