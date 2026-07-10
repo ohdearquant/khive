@@ -33,6 +33,11 @@ use uuid::Uuid;
 pub(crate) struct AnnBridge {
     index: VamanaIndex,
     id_map: Vec<Uuid>,
+    /// Namespace write-generation this build's corpus scan started at or after
+    /// (issue #770). Stamped just before install; `install_if_fresher` uses it
+    /// to reject a late-arriving build whose scan predates a `clear_namespace`
+    /// invalidation that landed while it was still running.
+    generation: u64,
 }
 
 /// Cache key for a per-{namespace, model} ANN index slot.
@@ -58,6 +63,20 @@ pub(crate) struct AnnState {
     /// Keys currently being warmed (or already warmed). `std::sync::Mutex`
     /// so the fire-and-check guard in `ensure_ann_background` stays sync.
     warming: std::sync::Mutex<HashSet<AnnKey>>,
+    /// Per-namespace write-generation counter (issue #770). Bumped by
+    /// `clear_namespace` whenever a corpus mutation invalidates a namespace's
+    /// ANN slots. `ensure_ann_for_model` captures the current value for its
+    /// namespace before doing anything else — including before its own
+    /// "already loaded" fast path and before the corpus scan — and stamps it
+    /// on the resulting `AnnBridge`. `install_if_fresher` then only replaces
+    /// an already-installed entry when the candidate's generation is >= the
+    /// installed entry's, instead of the old `entry(key).or_insert(...)`,
+    /// which always kept whichever build reached the install site first even
+    /// if it had scanned a corpus version predating a later invalidation.
+    /// Keyed by namespace (not the full `AnnKey`) because `clear_namespace`
+    /// only knows the namespace being invalidated, not which models have (or
+    /// will have) a build in flight for it.
+    generations: std::sync::Mutex<HashMap<String, u64>>,
 }
 
 pub(crate) type SharedAnn = Arc<AnnState>;
@@ -66,7 +85,81 @@ pub(crate) fn new_shared() -> SharedAnn {
     Arc::new(AnnState {
         indexes: RwLock::new(HashMap::new()),
         warming: std::sync::Mutex::new(HashSet::new()),
+        generations: std::sync::Mutex::new(HashMap::new()),
     })
+}
+
+// Recover a poisoned generations Mutex rather than aborting: the guarded
+// HashMap<String, u64> stays logically valid through a poison (worst case a
+// stale reader misses one bump, which only widens — never narrows — the set
+// of builds treated as possibly-stale).
+fn generations_guard(
+    m: &std::sync::Mutex<HashMap<String, u64>>,
+) -> std::sync::MutexGuard<'_, HashMap<String, u64>> {
+    m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Bump `namespace`'s write-generation counter and return the new value
+/// (issue #770). Called from `clear_namespace`, the single chokepoint every
+/// corpus-mutating write already routes through.
+fn bump_generation(ann: &SharedAnn, namespace: &str) -> u64 {
+    let mut gens = generations_guard(&ann.generations);
+    let slot = gens.entry(namespace.to_owned()).or_insert(0);
+    *slot += 1;
+    *slot
+}
+
+/// Read `namespace`'s current write-generation counter (0 if never bumped).
+pub(crate) fn current_generation(ann: &SharedAnn, namespace: &str) -> u64 {
+    generations_guard(&ann.generations)
+        .get(namespace)
+        .copied()
+        .unwrap_or(0)
+}
+
+/// Install `candidate` into the cache for `key` unless it is stale (PR #815
+/// review, HIGH — the #770 scenario through the empty-slot door). Two
+/// independent fences, both evaluated while holding the write lock:
+///
+/// 1. `candidate.generation` must be >= the namespace's CURRENT generation.
+///    Comparing only against an existing entry (the old behavior) has
+///    nothing to compare against once `clear_namespace` has emptied the
+///    slot — a pre-invalidation candidate would install unconditionally
+///    even though it scanned a corpus version the namespace has since
+///    invalidated. `clear_namespace` bumps the generation counter inside
+///    this same write-lock scope, so a candidate's read of the current
+///    generation here can never observe a pre-bump value for a slot that
+///    has already been (or is about to be) evicted.
+/// 2. `candidate.generation` must be >= any already-installed entry's
+///    generation, so a slower-but-staler build can never clobber a faster
+///    build that already scanned a newer corpus.
+pub(crate) async fn install_if_fresher(ann: &SharedAnn, key: &AnnKey, candidate: AnnBridge) {
+    let mut idxs = ann.indexes.write().await;
+
+    let ns_generation = current_generation(ann, &key.namespace);
+    if candidate.generation < ns_generation {
+        tracing::debug!(
+            key = ?key,
+            candidate_generation = candidate.generation,
+            namespace_generation = ns_generation,
+            "knowledge ANN install skipped: candidate predates namespace's current generation"
+        );
+        return;
+    }
+
+    match idxs.get(key) {
+        Some(existing) if existing.generation >= candidate.generation => {
+            tracing::debug!(
+                key = ?key,
+                existing_generation = existing.generation,
+                candidate_generation = candidate.generation,
+                "knowledge ANN install skipped: cached entry already >= this build's generation"
+            );
+        }
+        _ => {
+            idxs.insert(key.clone(), candidate);
+        }
+    }
 }
 
 // Recover a poisoned warming Mutex rather than aborting: the guarded HashSet<AnnKey>
@@ -79,6 +172,10 @@ fn warming_guard(
 
 /// Insert `bridge` under `key` only if the slot is empty. Returns `true` when
 /// the bridge was inserted, `false` if the key was already present.
+///
+/// Test-only: unlike `install_if_fresher`, this performs no generation
+/// fencing at all, so production install sites must never use it.
+#[cfg(test)]
 pub(crate) async fn insert_ann_if_absent(ann: &SharedAnn, key: AnnKey, bridge: AnnBridge) -> bool {
     use std::collections::hash_map::Entry;
     let mut guard = ann.indexes.write().await;
@@ -95,10 +192,17 @@ pub(crate) async fn insert_ann_if_absent(ann: &SharedAnn, key: AnnKey, bridge: A
 ///
 /// Called after any corpus mutation so the next search triggers a fresh load.
 pub(crate) async fn clear_namespace(ann: &SharedAnn, namespace: &str) {
-    ann.indexes
-        .write()
-        .await
-        .retain(|k, _| k.namespace != namespace);
+    {
+        // Evict and bump the generation counter inside the SAME write-lock
+        // scope (PR #815 review, HIGH). `install_if_fresher` takes this same
+        // lock before reading the namespace's current generation, so there
+        // is no window between "slot emptied" and "generation bumped" where
+        // a concurrent install could read a stale (pre-bump) generation and
+        // self-approve into the just-emptied slot.
+        let mut idxs = ann.indexes.write().await;
+        idxs.retain(|k, _| k.namespace != namespace);
+        bump_generation(ann, namespace);
+    }
     warming_guard(&ann.warming).retain(|k| k.namespace != namespace);
 }
 
@@ -213,7 +317,19 @@ impl AnnBridge {
         }
         let cfg = VamanaConfig::with_dimensions(dim);
         let index = VamanaIndex::build(&vectors, cfg).map_err(|e| format!("{e}"))?;
-        Ok(Self { index, id_map })
+        Ok(Self {
+            index,
+            id_map,
+            generation: 0,
+        })
+    }
+
+    /// Stamp this bridge with the namespace write-generation its corpus scan
+    /// started at or after (issue #770). Called just before install; see
+    /// `install_if_fresher`.
+    pub(crate) fn with_generation(mut self, generation: u64) -> Self {
+        self.generation = generation;
+        self
     }
 
     pub fn search(&self, query: &[f32], k: usize) -> Vec<(Uuid, f32)> {
@@ -249,7 +365,11 @@ impl AnnBridge {
             .collect::<Result<_, _>>()?;
         let index =
             VamanaIndex::from_snapshot(&snapshot).map_err(|e| format!("snapshot restore: {e}"))?;
-        Ok(Self { index, id_map })
+        Ok(Self {
+            index,
+            id_map,
+            generation: 0,
+        })
     }
 
     /// Save this bridge to `dir` atomically.
@@ -338,7 +458,11 @@ impl AnnBridge {
             ));
         }
 
-        Ok(Self { index, id_map })
+        Ok(Self {
+            index,
+            id_map,
+            generation: 0,
+        })
     }
 }
 
@@ -876,9 +1000,35 @@ pub(crate) async fn ensure_ann_for_model(
     let ns = token.namespace().as_str().to_owned();
     let key = AnnKey::new(&ns, model);
 
-    // 1. Fast path: already loaded.
-    if ann.indexes.read().await.contains_key(&key) {
-        return;
+    // Capture the namespace's write-generation BEFORE anything else (issue
+    // #770) — including before the fast path below and before the corpus
+    // scan — so a write that lands after this point is guaranteed to be
+    // reflected as a higher generation than anything this build can install.
+    let target_generation = current_generation(ann, &ns);
+
+    // 1. Fast path: already loaded AND at least as fresh as this namespace's
+    // current generation (PR #815 review, HIGH). A present entry with a
+    // stale generation is not a hit — mere presence let a pre-invalidation
+    // build served from an emptied-then-refilled slot serve indefinitely.
+    // Falling through here re-enters the same rebuild path a genuine cache
+    // miss would take.
+    if let Some(loaded_generation) = ann
+        .indexes
+        .read()
+        .await
+        .get(&key)
+        .map(|bridge| bridge.generation)
+    {
+        if loaded_generation >= target_generation {
+            return;
+        }
+        tracing::debug!(
+            namespace = %ns,
+            model = %model,
+            loaded_generation,
+            target_generation,
+            "knowledge ANN fast path skipped: cached entry generation stale; rebuilding"
+        );
     }
 
     // 2. v2 segment path.
@@ -897,7 +1047,12 @@ pub(crate) async fn ensure_ann_for_model(
                         if live_hash == persisted.content_hash {
                             match AnnBridge::load(&seg_dir) {
                                 Ok(bridge) => {
-                                    ann.indexes.write().await.entry(key).or_insert(bridge);
+                                    install_if_fresher(
+                                        ann,
+                                        &key,
+                                        bridge.with_generation(target_generation),
+                                    )
+                                    .await;
                                     return;
                                 }
                                 Err(e) => {
@@ -944,7 +1099,8 @@ pub(crate) async fn ensure_ann_for_model(
             if snapshot.fingerprint == fp {
                 match AnnBridge::from_vamana_snapshot(snapshot) {
                     Ok(bridge) => {
-                        ann.indexes.write().await.entry(key).or_insert(bridge);
+                        install_if_fresher(ann, &key, bridge.with_generation(target_generation))
+                            .await;
                         return;
                     }
                     Err(e) => {
@@ -967,7 +1123,7 @@ pub(crate) async fn ensure_ann_for_model(
             if let Err(e) = persist_ann_v2(rt, &ns, model, &bridge) {
                 tracing::error!(error = %e, "failed to persist v2 Vamana segment after rebuild");
             }
-            ann.indexes.write().await.entry(key).or_insert(bridge);
+            install_if_fresher(ann, &key, bridge.with_generation(target_generation)).await;
         }
         Ok(None) => {}
         Err(e) => {
@@ -1114,6 +1270,234 @@ mod tests {
         assert_eq!(
             hits_b[0].0, id_b,
             "namespace B query must not return namespace A neighbour"
+        );
+    }
+
+    // ── generation-checked install (issue #770) ──────────────────────────────
+
+    #[tokio::test]
+    async fn install_if_fresher_rejects_late_stale_build() {
+        let ann = new_shared();
+        let key = AnnKey::new("local", "test-model");
+
+        let fresh = AnnBridge::build(vec![1.0, 0.0, 0.0, 0.0], 4, vec![Uuid::new_v4()])
+            .expect("build fresh bridge")
+            .with_generation(2);
+        let stale = AnnBridge::build(vec![0.0, 1.0, 0.0, 0.0], 4, vec![Uuid::new_v4()])
+            .expect("build stale bridge")
+            .with_generation(1);
+
+        // Fresh install first, then a late-arriving stale build must not clobber it.
+        install_if_fresher(&ann, &key, fresh).await;
+        install_if_fresher(&ann, &key, stale).await;
+
+        let installed_generation = ann
+            .indexes
+            .read()
+            .await
+            .get(&key)
+            .expect("entry present")
+            .generation;
+        assert_eq!(
+            installed_generation, 2,
+            "stale build (generation 1) must not replace fresher installed entry (generation 2)"
+        );
+    }
+
+    #[tokio::test]
+    async fn install_if_fresher_accepts_forward_progress() {
+        let ann = new_shared();
+        let key = AnnKey::new("local", "test-model");
+
+        let old = AnnBridge::build(vec![1.0, 0.0, 0.0, 0.0], 4, vec![Uuid::new_v4()])
+            .expect("build old bridge")
+            .with_generation(1);
+        let newer = AnnBridge::build(vec![0.0, 1.0, 0.0, 0.0], 4, vec![Uuid::new_v4()])
+            .expect("build newer bridge")
+            .with_generation(2);
+
+        // Normal forward progress: old installs first, newer build replaces it.
+        install_if_fresher(&ann, &key, old).await;
+        install_if_fresher(&ann, &key, newer).await;
+
+        let installed_generation = ann
+            .indexes
+            .read()
+            .await
+            .get(&key)
+            .expect("entry present")
+            .generation;
+        assert_eq!(
+            installed_generation, 2,
+            "newer build must replace an older installed entry"
+        );
+    }
+
+    #[tokio::test]
+    async fn install_if_fresher_ties_keep_incumbent() {
+        let ann = new_shared();
+        let key = AnnKey::new("local", "test-model");
+
+        let first = AnnBridge::build(vec![1.0, 0.0, 0.0, 0.0], 4, vec![Uuid::new_v4()])
+            .expect("build first bridge")
+            .with_generation(1);
+        let second_id = Uuid::new_v4();
+        let second = AnnBridge::build(vec![0.0, 1.0, 0.0, 0.0], 4, vec![second_id])
+            .expect("build second bridge")
+            .with_generation(1);
+
+        install_if_fresher(&ann, &key, first).await;
+        install_if_fresher(&ann, &key, second).await;
+
+        let hits = search_loaded(&ann, &key, &[0.0, 1.0, 0.0, 0.0], 1)
+            .await
+            .expect("entry present");
+        assert_ne!(
+            hits.first().map(|(id, _)| *id),
+            Some(second_id),
+            "equal-generation candidate must not replace the incumbent"
+        );
+    }
+
+    #[tokio::test]
+    async fn install_if_fresher_installs_into_empty_slot() {
+        let ann = new_shared();
+        let key = AnnKey::new("local", "test-model");
+        let bridge = AnnBridge::build(vec![1.0, 0.0, 0.0, 0.0], 4, vec![Uuid::new_v4()])
+            .expect("build bridge")
+            .with_generation(0);
+
+        install_if_fresher(&ann, &key, bridge).await;
+
+        assert!(
+            ann.indexes.read().await.contains_key(&key),
+            "first successful build must always install into an empty slot"
+        );
+    }
+
+    #[tokio::test]
+    async fn clear_namespace_bumps_generation_scoped_to_namespace() {
+        let ann = new_shared();
+
+        assert_eq!(current_generation(&ann, "ns:a"), 0);
+        assert_eq!(current_generation(&ann, "ns:b"), 0);
+
+        clear_namespace(&ann, "ns:a").await;
+
+        assert_eq!(
+            current_generation(&ann, "ns:a"),
+            1,
+            "clear_namespace must bump the invalidated namespace's generation"
+        );
+        assert_eq!(
+            current_generation(&ann, "ns:b"),
+            0,
+            "clear_namespace must not affect a different namespace's generation"
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_build_installs_before_invalidation_race_is_rejected_after() {
+        // Simulates the #770 race deterministically: build A (slow, e.g. the
+        // full corpus rebuild fallthrough) starts scanning and captures its
+        // generation floor. An invalidating write lands mid-build, clearing
+        // the slot and bumping the namespace generation. The empty slot lets
+        // a second, concurrent build B (e.g. `ensure_ann_background` retried
+        // by the next search, since `clear_namespace` also freed the warming
+        // guard) start, scan the now-current corpus, and install first. Only
+        // afterward does build A's slow scan finish and attempt to install
+        // its stale result — it must lose to B rather than clobbering it, the
+        // exact bug this issue reports (`entry().or_insert()` would have let
+        // A's late install win regardless of arrival order).
+        let ann = new_shared();
+        let key = AnnKey::new("local", "test-model");
+
+        // Build A starts: capture the generation floor before doing any work.
+        let build_a_generation = current_generation(&ann, "local");
+        assert_eq!(build_a_generation, 0);
+
+        // A concurrent write invalidates the namespace while A is still scanning.
+        clear_namespace(&ann, "local").await;
+        assert_eq!(current_generation(&ann, "local"), 1);
+
+        // Build B starts after the invalidation (slot is empty, warming guard
+        // was cleared too), scans the current corpus, and installs first.
+        let build_b_generation = current_generation(&ann, "local");
+        let build_b_id = Uuid::new_v4();
+        let build_b_bridge = AnnBridge::build(vec![0.0, 1.0, 0.0, 0.0], 4, vec![build_b_id])
+            .expect("build fresh bridge")
+            .with_generation(build_b_generation);
+        install_if_fresher(&ann, &key, build_b_bridge).await;
+        assert!(
+            ann.indexes.read().await.contains_key(&key),
+            "build B (post-invalidation generation) must install"
+        );
+
+        // Build A's slow scan finally finishes and attempts to install its
+        // stale (pre-invalidation) result.
+        let build_a_bridge = AnnBridge::build(vec![1.0, 0.0, 0.0, 0.0], 4, vec![Uuid::new_v4()])
+            .expect("build stale bridge")
+            .with_generation(build_a_generation);
+        install_if_fresher(&ann, &key, build_a_bridge).await;
+
+        let hits = search_loaded(&ann, &key, &[0.0, 1.0, 0.0, 0.0], 1)
+            .await
+            .expect("entry present");
+        assert_eq!(
+            hits.first().map(|(id, _)| *id),
+            Some(build_b_id),
+            "build A's late, stale install must not clobber build B's fresher result"
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_build_rejected_installing_into_still_empty_post_invalidation_slot() {
+        // Deterministic reproduction of the #770 scenario through the EMPTY-SLOT
+        // door (PR #815 review, HIGH): unlike the test above (where a fresh build
+        // B installs first, so the stale build has an incumbent to lose against),
+        // this exercises the case where NOTHING has installed yet when the stale
+        // build arrives. Build A captures its generation floor, an invalidating
+        // write (`clear_namespace`) bumps the namespace's generation while the
+        // slot is still empty, and only then does A's late, stale install attempt
+        // land — straight into that still-empty slot. The old `install_if_fresher`
+        // compared a candidate only against an *existing* entry, so an empty slot
+        // meant nothing to compare against and the stale build installed
+        // unconditionally. The fix compares against the namespace's CURRENT
+        // generation instead, so this must be rejected even with no incumbent.
+        let ann = new_shared();
+        let key = AnnKey::new("local", "test-model");
+
+        // Build A starts: capture the generation floor before doing any work.
+        let build_a_generation = current_generation(&ann, "local");
+        assert_eq!(build_a_generation, 0);
+
+        // An invalidating write lands while A is still scanning. The slot was
+        // never populated, so this is a no-op on the map, but it must still
+        // bump the namespace's generation.
+        clear_namespace(&ann, "local").await;
+        assert_eq!(current_generation(&ann, "local"), 1);
+        assert!(
+            !ann.indexes.read().await.contains_key(&key),
+            "precondition: slot must still be empty after clear_namespace"
+        );
+
+        // Build A's slow scan finally finishes and attempts to install its
+        // stale (pre-invalidation) result into the still-empty slot.
+        let build_a_bridge = AnnBridge::build(vec![1.0, 0.0, 0.0, 0.0], 4, vec![Uuid::new_v4()])
+            .expect("build stale bridge")
+            .with_generation(build_a_generation);
+        install_if_fresher(&ann, &key, build_a_bridge).await;
+
+        assert!(
+            !ann.indexes.read().await.contains_key(&key),
+            "stale pre-invalidation build must not install into the emptied slot, \
+             even with no incumbent to compare against"
+        );
+        assert!(
+            search_loaded(&ann, &key, &[1.0, 0.0, 0.0, 0.0], 1)
+                .await
+                .is_none(),
+            "the fast path must not serve a stale index that was correctly rejected at install"
         );
     }
 
@@ -1715,6 +2099,55 @@ mod tests {
         assert_eq!(
             persisted_after.vector_count, 5,
             "re-persisted segment must reflect the 5-row corpus (4 initial + 1 mutation)"
+        );
+    }
+
+    /// `ensure_ann_for_model`'s fast path must treat a present-but-generation-stale
+    /// cached entry as a miss, not a hit (PR #815 review, HIGH). In production
+    /// `install_if_fresher`'s own fencing prevents a stale entry from ever
+    /// installing, so this test bumps the namespace generation directly
+    /// (bypassing `clear_namespace`'s eviction) to construct the "present but
+    /// stale" state as an independent, defense-in-depth check on the fast path
+    /// itself — mere presence must never again be trusted as freshness.
+    #[tokio::test]
+    async fn ensure_ann_fast_path_ignores_generation_stale_cached_entry() {
+        let dir = TempDir::new().expect("tempdir");
+        let rt = file_rt_with_embedder(dir.path().join("test.db"));
+        let token = rt.authorize(Namespace::local()).expect("authorize");
+        seed_warm_corpus(&rt, &token, 4).await;
+
+        let ann = new_shared();
+        ensure_ann_for_model(&rt, &token, &ann, WARM_TEST_MODEL).await;
+        let key = AnnKey::new("local", WARM_TEST_MODEL);
+        assert!(
+            ann.indexes.read().await.contains_key(&key),
+            "setup: first call must build and install the index at generation 0"
+        );
+
+        // Bump the namespace's generation directly, leaving the generation-0
+        // entry present — the state install_if_fresher's fencing prevents in
+        // production, exercised here purely to isolate the fast-path check.
+        bump_generation(&ann, "local");
+        assert_eq!(current_generation(&ann, "local"), 1);
+
+        ensure_ann_for_model(&rt, &token, &ann, WARM_TEST_MODEL).await;
+
+        // If the in-memory fast path had (incorrectly) treated mere presence
+        // as a hit, it would return immediately and the cached entry's
+        // generation would still read 0. Falling through re-stamps it with
+        // the namespace's current generation (1) via the v2/rebuild paths —
+        // proof the stale entry was NOT served as a hit.
+        assert_eq!(
+            ann.indexes
+                .read()
+                .await
+                .get(&key)
+                .expect("entry present")
+                .generation,
+            1,
+            "a present-but-generation-stale entry must not short-circuit via the fast \
+             path; the reloaded/rebuilt entry must be re-stamped with the namespace's \
+             new current generation"
         );
     }
 
