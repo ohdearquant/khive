@@ -20,6 +20,7 @@ import struct
 import sys
 import tempfile
 import threading
+import time
 import unittest
 
 sys.path.insert(0, os.path.dirname(__file__))
@@ -197,11 +198,13 @@ class _MockDaemonServer:
     simulate a hang for timeout tests).
     """
 
-    def __init__(self, responder, delay_s: float = 0.0):
+    def __init__(self, responder, delay_s: float = 0.0, drip_chunk_delay_s: float = 0.0, drip_chunk_size: int = 20):
         self._tmp = tempfile.TemporaryDirectory()
         self.sock_path = os.path.join(self._tmp.name, "khived.sock")
         self._responder = responder
         self._delay_s = delay_s
+        self._drip_chunk_delay_s = drip_chunk_delay_s
+        self._drip_chunk_size = drip_chunk_size
         self._server = socketlib.socket(socketlib.AF_UNIX, socketlib.SOCK_STREAM)
         self._server.bind(self.sock_path)
         self._server.listen(16)
@@ -227,13 +230,23 @@ class _MockDaemonServer:
             raw = mbc.recv_exact(conn, length)
             frame = json.loads(raw)
             if self._delay_s:
-                import time as _time
-                _time.sleep(self._delay_s)
+                time.sleep(self._delay_s)
             resp = self._responder(frame)
             if resp is None:
                 return
             payload = json.dumps(resp).encode()
-            conn.sendall(struct.pack(">I", len(payload)) + payload)
+            wire = struct.pack(">I", len(payload)) + payload
+            if self._drip_chunk_delay_s:
+                # Trickle the response out in small pieces, sleeping between
+                # each one. Each individual `recv()` on the client sees a
+                # short delay well inside a naive per-call timeout, but the
+                # cumulative transfer time can exceed a whole-request
+                # deadline.
+                for i in range(0, len(wire), self._drip_chunk_size):
+                    conn.sendall(wire[i:i + self._drip_chunk_size])
+                    time.sleep(self._drip_chunk_delay_s)
+            else:
+                conn.sendall(wire)
         except Exception:
             pass
         finally:
@@ -360,6 +373,76 @@ class ConcurrentFrameFloorTests(unittest.TestCase):
             self.assertEqual(out["timed_out"], 0)
             self.assertEqual(sum(out["errors_by_code"].values()), 4)
 
+    def test_measure_concurrent_frames_rejects_config_mismatch_as_error_not_success(self):
+        # The daemon deliberately returns ok:false, config_mismatch:true
+        # WITHOUT dispatching when configs differ. A stale/mismatched
+        # daemon must never contribute a fast-rejection latency sample.
+        server = _MockDaemonServer(
+            lambda frame: _base_response(frame, ok=False, config_mismatch=True, served_config_id="other-cfg")
+        )
+        try:
+            frame = mbc.base_daemon_frame("stats()", "cfg-under-test", probe_only=False)
+            out = mbc.measure_concurrent_frames(server.sock_path, frame, attempts=5, concurrency=2, deadline_ms=2000)
+            self.assertEqual(out["successes"], 0)
+            self.assertEqual(out["timed_out"], 0)
+            self.assertEqual(out["errors_by_code"], {"config_mismatch": 5})
+            self.assertIsNone(out["p50_us"])
+            self.assertIsNone(out["max_us"])
+        finally:
+            server.close()
+
+    def test_measure_concurrent_frames_rejects_version_mismatch(self):
+        server = _MockDaemonServer(
+            lambda frame: _base_response(frame, ok=False, version_mismatch=True)
+        )
+        try:
+            frame = mbc.base_daemon_frame("stats()", "cfg-under-test", probe_only=False)
+            out = mbc.measure_concurrent_frames(server.sock_path, frame, attempts=3, concurrency=1, deadline_ms=2000)
+            self.assertEqual(out["successes"], 0)
+            self.assertEqual(out["errors_by_code"], {"version_mismatch": 3})
+        finally:
+            server.close()
+
+    def test_measure_concurrent_frames_rejects_not_ok_without_mismatch_flags(self):
+        server = _MockDaemonServer(lambda frame: _base_response(frame, ok=False))
+        try:
+            frame = mbc.base_daemon_frame("stats()", "cfg-under-test", probe_only=False)
+            out = mbc.measure_concurrent_frames(server.sock_path, frame, attempts=3, concurrency=1, deadline_ms=2000)
+            self.assertEqual(out["successes"], 0)
+            self.assertEqual(out["errors_by_code"], {"not_ok": 3})
+        finally:
+            server.close()
+
+    def test_measure_concurrent_frames_rejects_served_config_id_mismatch(self):
+        # ok:true but served_config_id disagrees with the requested config_id:
+        # a plausible-but-wrong response that must not be counted either.
+        server = _MockDaemonServer(
+            lambda frame: _base_response(frame, ok=True, served_config_id="not-the-requested-cfg")
+        )
+        try:
+            frame = mbc.base_daemon_frame("stats()", "cfg-under-test", probe_only=False)
+            out = mbc.measure_concurrent_frames(server.sock_path, frame, attempts=3, concurrency=1, deadline_ms=2000)
+            self.assertEqual(out["successes"], 0)
+            self.assertEqual(out["errors_by_code"], {"served_config_mismatch": 3})
+        finally:
+            server.close()
+
+    def test_measure_concurrent_frames_metrics_only_frame_bypasses_config_validation(self):
+        # metrics_only frames are answered before the daemon's config_id
+        # check (namespace/config-agnostic gauge read), so served_config_id
+        # there is not a dispatch-identity guarantee and must not be
+        # validated against the requested config_id.
+        server = _MockDaemonServer(
+            lambda frame: _base_response(frame, ok=True, served_config_id="unrelated-cfg", metrics={"wal_pages": 1})
+        )
+        try:
+            frame = mbc.base_daemon_frame("", "cfg-under-test", probe_only=False, metrics_only=True)
+            out = mbc.measure_concurrent_frames(server.sock_path, frame, attempts=3, concurrency=1, deadline_ms=2000)
+            self.assertEqual(out["successes"], 3)
+            self.assertEqual(out["errors_by_code"], {})
+        finally:
+            server.close()
+
     def test_measure_probe_only_floor_and_stats_dispatch_floor_build_expected_ops(self):
         seen_ops = []
 
@@ -380,6 +463,40 @@ class ConcurrentFrameFloorTests(unittest.TestCase):
         self.assertEqual(len(stats_ops), 3)
         self.assertTrue(all(op[0] == "stats()" for op in stats_ops))
         self.assertTrue(all(op[2] is False for op in stats_ops))
+
+
+# ── Whole-request deadline (not per-recv-call) ────────────────────────────────
+
+class WholeRequestDeadlineTests(unittest.TestCase):
+    def test_raw_daemon_roundtrip_censors_drip_fed_response_past_total_deadline(self):
+        # The response trickles out a few bytes at a time, 0.05s apart. Each
+        # individual `recv()` finishes well inside a naive fixed per-call
+        # timeout, but the full transfer takes far longer than the
+        # whole-request deadline passed to `raw_daemon_roundtrip`. Before the
+        # fix, `socket.settimeout` was set once up front, so every partial
+        # read got its own fresh timeout window and this would return
+        # successfully instead of censoring as a timeout.
+        server = _MockDaemonServer(lambda frame: _base_response(frame), drip_chunk_delay_s=0.05, drip_chunk_size=20)
+        try:
+            with self.assertRaises(socketlib.timeout):
+                mbc.raw_daemon_roundtrip(
+                    server.sock_path,
+                    mbc.base_daemon_frame("stats()", "cfg-under-test", probe_only=False),
+                    timeout_s=0.2,
+                )
+        finally:
+            server.close()
+
+    def test_measure_concurrent_frames_marks_drip_fed_response_as_timed_out(self):
+        server = _MockDaemonServer(lambda frame: _base_response(frame), drip_chunk_delay_s=0.05, drip_chunk_size=20)
+        try:
+            frame = mbc.base_daemon_frame("stats()", "cfg-under-test", probe_only=False)
+            out = mbc.measure_concurrent_frames(server.sock_path, frame, attempts=2, concurrency=2, deadline_ms=200)
+            self.assertEqual(out["successes"], 0)
+            self.assertEqual(out["timed_out"], 2)
+            self.assertIsNone(out["p50_us"])
+        finally:
+            server.close()
 
 
 if __name__ == "__main__":

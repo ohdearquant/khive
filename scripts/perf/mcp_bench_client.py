@@ -207,7 +207,7 @@ def lsof_has_bench_db(pid, bench_db):
         bench_db_real = str(pathlib.Path(bench_db).resolve())
         return bench_db_real in out
     except FileNotFoundError:
-        print("[SKIP] lsof not available — skipping open-file sub-check", flush=True)
+        print("[SKIP] lsof not available, skipping open-file sub-check", flush=True)
         return None  # None means skipped, not False
     except Exception:
         return False
@@ -285,7 +285,7 @@ def assert_no_daemon_spawned(sock_path, label="nodaemon"):
     if pathlib.Path(sock_path).exists():
         print(
             f"[DAEMON-CHECK-{label}] FAIL: bench socket {sock_path!r} exists when "
-            "KHIVE_NO_DAEMON=1 was set — something spawned a daemon unexpectedly.",
+            "KHIVE_NO_DAEMON=1 was set: something spawned a daemon unexpectedly.",
             file=sys.stderr,
             flush=True,
         )
@@ -339,9 +339,24 @@ def pct(sorted_list, p):
 #     connections do not have that limitation).
 
 
-def recv_exact(sock: socketlib.socket, n: int) -> bytes:
+def recv_exact(sock: socketlib.socket, n: int, deadline: float | None = None) -> bytes:
+    """Read exactly `n` bytes from `sock`.
+
+    If `deadline` (a `time.monotonic()` timestamp) is given, each individual
+    `recv()` call is bounded by the REMAINING budget rather than a fixed
+    per-call timeout. `socket.settimeout` governs one blocking call at a
+    time, so a socket that drip-feeds a response in small pieces would
+    otherwise get a fresh full timeout window on every partial read and
+    could hold the caller open arbitrarily long past the caller's actual
+    deadline.
+    """
     buf = b""
     while len(buf) < n:
+        if deadline is not None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise socketlib.timeout("whole-request deadline exceeded while assembling frame")
+            sock.settimeout(remaining)
         chunk = sock.recv(n - len(buf))
         if not chunk:
             raise RuntimeError("daemon socket closed mid-frame")
@@ -352,17 +367,32 @@ def recv_exact(sock: socketlib.socket, n: int) -> bytes:
 def raw_daemon_roundtrip(sock_path: str, frame: dict, timeout_s: float = 5.0) -> dict:
     """Send one length-prefixed JSON frame directly over the daemon's Unix
     socket and return the decoded response frame. Raises `socket.timeout` if
-    no complete response arrives within `timeout_s`.
+    the complete round trip (connect, send, and every partial recv needed to
+    assemble the frame) does not finish within `timeout_s` of this call's
+    start. The budget is a single absolute deadline for the whole request,
+    not a per-socket-operation timeout: `recv_exact` is handed the
+    remaining time on every call so a slow, drip-feeding peer cannot reset
+    the clock on each partial read.
     """
+    deadline = time.monotonic() + timeout_s
     s = socketlib.socket(socketlib.AF_UNIX, socketlib.SOCK_STREAM)
-    s.settimeout(timeout_s)
     try:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise socketlib.timeout("whole-request deadline exceeded before connect")
+        s.settimeout(remaining)
         s.connect(sock_path)
+
         payload = json.dumps(frame).encode()
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise socketlib.timeout("whole-request deadline exceeded before send")
+        s.settimeout(remaining)
         s.sendall(struct.pack(">I", len(payload)) + payload)
-        len_buf = recv_exact(s, 4)
+
+        len_buf = recv_exact(s, 4, deadline=deadline)
         (length,) = struct.unpack(">I", len_buf)
-        raw = recv_exact(s, length)
+        raw = recv_exact(s, length, deadline=deadline)
         return json.loads(raw)
     finally:
         s.close()
@@ -459,6 +489,33 @@ def probe_metrics_snapshot(sock_path: str) -> dict:
 
 # ── F10 concurrent frame floor: deadline-aware, timeout-censored ────────────
 
+def _classify_bad_response(resp: dict, frame: dict) -> str | None:
+    """Return an `errors_by_code` label if `resp` must be rejected as a
+    sample, or `None` if it is a genuine successful dispatch.
+
+    Per the Coverage definition (item 3), a daemon fallback or config
+    mismatch is a failed scenario, never an interchangeable latency sample:
+    the daemon deliberately returns `ok: false, config_mismatch: true`
+    WITHOUT dispatching when the frame's `config_id` disagrees with its own
+    (`crates/khive-runtime/src/daemon.rs` around 799-810), so a stale or
+    mismatched daemon would otherwise produce a plausible-but-wrong
+    fast-rejection latency. `metrics_only` frames are exempt: the daemon
+    answers them before the config_id check (namespace/config-agnostic gauge
+    read), so `served_config_id` there is not a dispatch-identity guarantee.
+    """
+    if frame.get("metrics_only"):
+        return None
+    if resp.get("config_mismatch"):
+        return "config_mismatch"
+    if resp.get("version_mismatch"):
+        return "version_mismatch"
+    if not resp.get("ok"):
+        return "not_ok"
+    if resp.get("served_config_id") != frame.get("config_id"):
+        return "served_config_mismatch"
+    return None
+
+
 def measure_concurrent_frames(
     sock_path: str,
     frame: dict,
@@ -476,10 +533,21 @@ def measure_concurrent_frames(
     right-censored: it is counted under `timed_out` and its elapsed time is
     NEVER inserted into the latency population, per the Methodology
     contract's settle/censoring rule (a deadline never substitutes into a
-    percentile). Any other exception is counted under `errors_by_code`,
-    keyed by the exception's class name. The raw frame protocol has no
-    server-assigned stable error code, so the Python exception type is the
-    best available attribution at this layer.
+    percentile).
+
+    A response that completes but fails `_classify_bad_response` (not
+    `ok`, a `config_mismatch`/`version_mismatch` flag, or a
+    `served_config_id` that disagrees with the frame's requested
+    `config_id`) is likewise excluded from the latency population and
+    counted under `errors_by_code` by its distinct code
+    (`config_mismatch`, `version_mismatch`, `not_ok`,
+    `served_config_mismatch`), per the Coverage definition's rule that a
+    daemon fallback or config mismatch is a failed scenario, not an
+    interchangeable sample. Any transport exception is counted under
+    `errors_by_code` too, keyed by the exception's class name: the raw
+    frame protocol has no server-assigned stable error code for transport
+    failures, so the Python exception type is the best available
+    attribution at that layer.
 
     This is the F10 diagnostic frame-floor measurement: it bypasses the
     stdio MCP front-end's `tools/call` JSON-RPC decode entirely, so per the
@@ -501,7 +569,10 @@ def measure_concurrent_frames(
     def _one(_i):
         t0 = time.perf_counter_ns()
         try:
-            raw_daemon_roundtrip(sock_path, frame, timeout_s=deadline_s)
+            resp = raw_daemon_roundtrip(sock_path, frame, timeout_s=deadline_s)
+            bad_code = _classify_bad_response(resp, frame)
+            if bad_code is not None:
+                return ("error", bad_code)
             return ("ok", (time.perf_counter_ns() - t0) // 1000)
         except socketlib.timeout:
             return ("timeout", None)
