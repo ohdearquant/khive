@@ -215,6 +215,41 @@ def _freshness_window_days(runner_class: str) -> int:
     return FRESHNESS_DAYS_HOSTED if runner_class in HOSTED_RUNNER_CLASSES else FRESHNESS_DAYS_SELF_HOSTED
 
 
+def _cohort_mismatches(scenario: dict, record: dict) -> list[str]:
+    """Compare the manifest scenario's cohort-defining fields against the
+    record's actual measured cohort. A record whose surface/fixture_hash
+    match but whose runner tier, embedder, settle posture, scale, or
+    concurrency/attempts differ measured a different population than the
+    scenario declares - it cannot stand in for the required scenario, even
+    though it is otherwise schema-valid and fresh."""
+    mismatches: list[str] = []
+    runtime = record.get("runtime", {})
+    settle = record.get("settle", {})
+    workload = record.get("workload", {})
+
+    if runtime.get("runner_class") != scenario["runner_class"]:
+        mismatches.append(
+            f"runtime.runner_class mismatch: manifest {scenario['runner_class']!r} vs record {runtime.get('runner_class')!r}"
+        )
+    if runtime.get("embedder") != scenario["embedder"]:
+        mismatches.append(f"runtime.embedder mismatch: manifest {scenario['embedder']!r} vs record {runtime.get('embedder')!r}")
+    if settle.get("state") != scenario["state"]:
+        mismatches.append(f"settle.state mismatch: manifest {scenario['state']!r} vs record {settle.get('state')!r}")
+    if settle.get("method") != scenario["settle"]:
+        mismatches.append(f"settle.method mismatch: manifest {scenario['settle']!r} vs record {settle.get('method')!r}")
+    if workload.get("scale") != scenario["scale"]:
+        mismatches.append(f"workload.scale mismatch: manifest {scenario['scale']!r} vs record {workload.get('scale')!r}")
+    if workload.get("concurrency") != scenario["concurrency"]:
+        mismatches.append(
+            f"workload.concurrency mismatch: manifest {scenario['concurrency']!r} vs record {workload.get('concurrency')!r}"
+        )
+    if workload.get("attempts") != scenario["attempts"]:
+        mismatches.append(
+            f"workload.attempts mismatch: manifest {scenario['attempts']!r} vs record {workload.get('attempts')!r}"
+        )
+    return mismatches
+
+
 def scenario_status(scenario: dict, records: list[dict], now: datetime.datetime) -> tuple[str, str]:
     """Return (status, reason) for one manifest scenario. `status` is one of
     STATUSES. `reason` is a short human-readable explanation."""
@@ -236,6 +271,10 @@ def scenario_status(scenario: dict, records: list[dict], now: datetime.datetime)
     record_fixture_hash = latest.get("workload", {}).get("fixture_hash")
     if record_fixture_hash != scenario["fixture_hash"]:
         return "confounded", f"fixture_hash mismatch: manifest {scenario['fixture_hash']!r} vs record {record_fixture_hash!r}"
+
+    cohort_mismatches = _cohort_mismatches(scenario, latest)
+    if cohort_mismatches:
+        return "confounded", "; ".join(cohort_mismatches)
 
     try:
         record_time = _parse_timestamp(latest["timestamp"])

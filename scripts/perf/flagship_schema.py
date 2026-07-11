@@ -1,18 +1,21 @@
 #!/usr/bin/env python3
-"""Flagship E2E result schema v1 (stdlib-only).
+"""Flagship E2E result schema v3 (stdlib-only).
 
 Implements the Distribution contract and the Ledger record contract from
 `.khive/workspaces/20260711/bench-overhaul/DESIGN.md` ("Typed interfaces")
-as plain-dict validators, mirroring `schemas/flagship-result-v1.json` (the
+as plain-dict validators, mirroring `schemas/flagship-result-v3.json` (the
 checked JSON Schema copy of the same contract, kept for external tooling
 and IDE validation). This module is the one `scripts/perf/coverage_validator.py`
 actually imports - no `jsonschema` dependency, matching the stdlib-only
 convention of `bench_track.py` and `bench_calibrate.py`.
 
-This is a standalone schema for the flagship-e2e result document. Its own
-version track (`SCHEMA_VERSION = 1`, this module) is independent of
-`bench_track.py`'s ledger `schema_version` integer (currently 2; DESIGN.md
-plans a v3 there when PR 2 wires flagship-e2e records into that ledger).
+`SCHEMA_VERSION = 3` here because the Ledger record contract fixes
+`FlagshipRecord.schema_version` at 3 - the same schema_version track that
+`bench_track.py`'s ledger will carry for flagship-e2e records once PR 2
+wires this runner's output into that ledger. `bench_track.py` itself
+remains at its own `SCHEMA_VERSION = 2` for its existing (non-flagship)
+suites until then; the two are the same version track, not independent
+ones, once flagship-e2e records land there.
 
 No runner in this repository emits documents against this schema yet - PR 1
 is contracts and a coverage validator only, per the phased plan. PR 2+
@@ -21,7 +24,9 @@ implement the scenario runner that will produce real records.
 
 from __future__ import annotations
 
-SCHEMA_VERSION = 1
+import re
+
+SCHEMA_VERSION = 3
 SUITE_NAME = "flagship-e2e"
 
 FEATURES = ("F1", "F2", "F3", "F4", "F5", "F6", "F7", "F8", "F9", "F10")
@@ -34,9 +39,77 @@ RECORD_STATUSES = ("ok", "error", "confounded", "insufficient_samples")
 ESTIMATOR = "nearest_rank_v1"
 DISTRIBUTION_UNIT = "us"
 
+SHA256_REF_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
+
+# These two tuples mirror the JSON Schema exactly: for the record top level
+# and for `distribution`, the schema's `properties` set equals its
+# `required` set and `additionalProperties` is `false` - so "required" and
+# "allowed" are the same tuple and any key outside it is a schema violation.
+RECORD_FIELDS = (
+    "schema_version",
+    "suite",
+    "scenario_id",
+    "feature",
+    "operation",
+    "arm",
+    "sha",
+    "branch",
+    "run_id",
+    "run_attempt",
+    "timestamp",
+    "status",
+    "metrics",
+    "distributions",
+    "workload",
+    "runtime",
+    "host",
+    "settle",
+    "calibration",
+    "artifact",
+)
+DISTRIBUTION_FIELDS = (
+    "estimator",
+    "unit",
+    "attempts",
+    "successes",
+    "timed_out",
+    "errors_by_code",
+    "histogram_edges_us",
+    "histogram_counts",
+    "p50_us",
+    "p95_us",
+    "p99_us",
+    "max_us",
+    "conditional_on_success",
+)
+WORKLOAD_REQUIRED_FIELDS = (
+    "manifest_version",
+    "manifest_hash",
+    "scenario_id",
+    "fixture",
+    "fixture_hash",
+    "scale",
+    "concurrency",
+    "attempts",
+)
+ARTIFACT_FIELDS = ("name", "sha256")
+
 
 def _err(path: str, message: str) -> str:
     return f"{path}: {message}"
+
+
+def _is_nonneg_int(value: object) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+
+def _check_closed_object(obj: dict, allowed: tuple, path: str, errors: list[str]) -> None:
+    missing = [f for f in allowed if f not in obj]
+    if missing:
+        errors.append(_err(path, f"missing required field(s): {', '.join(missing)}"))
+    extra = sorted(set(obj) - set(allowed))
+    if extra:
+        errors.append(_err(path, f"unexpected field(s) not allowed: {', '.join(extra)}"))
 
 
 def validate_distribution(dist: dict, path: str = "distribution") -> list[str]:
@@ -46,6 +119,8 @@ def validate_distribution(dist: dict, path: str = "distribution") -> list[str]:
     errors: list[str] = []
     if not isinstance(dist, dict):
         return [_err(path, f"expected object, got {type(dist).__name__}")]
+
+    _check_closed_object(dist, DISTRIBUTION_FIELDS, path, errors)
 
     if dist.get("estimator") != ESTIMATOR:
         errors.append(_err(path, f"estimator must be {ESTIMATOR!r}, got {dist.get('estimator')!r}"))
@@ -58,8 +133,18 @@ def validate_distribution(dist: dict, path: str = "distribution") -> list[str]:
     successes = dist.get("successes")
     timed_out = dist.get("timed_out")
     for name, value in (("attempts", attempts), ("successes", successes), ("timed_out", timed_out)):
-        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+        if not _is_nonneg_int(value):
             errors.append(_err(path, f"{name} must be a non-negative integer, got {value!r}"))
+
+    errors_by_code = dist.get("errors_by_code")
+    if not isinstance(errors_by_code, dict):
+        errors.append(_err(path, "errors_by_code must be an object"))
+    else:
+        for code, count in errors_by_code.items():
+            if not isinstance(code, str):
+                errors.append(_err(path, f"errors_by_code key must be a string, got {code!r}"))
+            if not _is_nonneg_int(count):
+                errors.append(_err(path, f"errors_by_code[{code!r}] must be a non-negative integer, got {count!r}"))
 
     if isinstance(attempts, int) and isinstance(successes, int) and isinstance(timed_out, int):
         errors_total = sum(dist.get("errors_by_code", {}).values()) if isinstance(dist.get("errors_by_code"), dict) else 0
@@ -76,10 +161,24 @@ def validate_distribution(dist: dict, path: str = "distribution") -> list[str]:
     counts = dist.get("histogram_counts")
     if not isinstance(edges, list) or not isinstance(counts, list):
         errors.append(_err(path, "histogram_edges_us and histogram_counts must be arrays"))
-    elif len(edges) != len(counts):
-        errors.append(
-            _err(path, f"histogram_edges_us ({len(edges)}) and histogram_counts ({len(counts)}) must be the same length")
-        )
+    else:
+        if len(edges) != len(counts):
+            errors.append(
+                _err(
+                    path, f"histogram_edges_us ({len(edges)}) and histogram_counts ({len(counts)}) must be the same length"
+                )
+            )
+        for idx, edge in enumerate(edges):
+            if not _is_nonneg_int(edge):
+                errors.append(_err(path, f"histogram_edges_us[{idx}] must be a non-negative integer, got {edge!r}"))
+        for idx, count in enumerate(counts):
+            if not _is_nonneg_int(count):
+                errors.append(_err(path, f"histogram_counts[{idx}] must be a non-negative integer, got {count!r}"))
+
+    for name in ("p50_us", "p95_us", "p99_us", "max_us"):
+        value = dist.get(name)
+        if value is not None and not _is_nonneg_int(value):
+            errors.append(_err(path, f"{name} must be null or a non-negative integer, got {value!r}"))
 
     percentiles = [dist.get("p50_us"), dist.get("p95_us"), dist.get("p99_us")]
     numeric_percentiles = [p for p in percentiles if p is not None]
@@ -101,6 +200,8 @@ def validate_record(record: dict) -> list[str]:
     errors: list[str] = []
     if not isinstance(record, dict):
         return ["record: expected object"]
+
+    _check_closed_object(record, RECORD_FIELDS, "record", errors)
 
     if record.get("schema_version") != SCHEMA_VERSION:
         errors.append(_err("schema_version", f"must be {SCHEMA_VERSION}, got {record.get('schema_version')!r}"))
@@ -151,9 +252,28 @@ def validate_record(record: dict) -> list[str]:
     if not isinstance(workload, dict):
         errors.append(_err("workload", "must be an object"))
     else:
-        for field in ("scenario_id", "fixture", "fixture_hash", "scale", "concurrency", "attempts"):
+        for field in WORKLOAD_REQUIRED_FIELDS:
             if field not in workload:
                 errors.append(_err(f"workload.{field}", "is required"))
+        if "manifest_version" in workload and not isinstance(workload["manifest_version"], str):
+            errors.append(_err("workload.manifest_version", "must be a string"))
+        for hash_field in ("manifest_hash", "fixture_hash"):
+            if hash_field in workload and not SHA256_REF_RE.match(str(workload[hash_field])):
+                errors.append(
+                    _err(f"workload.{hash_field}", f"must match 'sha256:<64 lowercase hex>', got {workload[hash_field]!r}")
+                )
+        if "fixture" in workload and not isinstance(workload["fixture"], str):
+            errors.append(_err("workload.fixture", "must be a string"))
+        if "scenario_id" in workload and not isinstance(workload["scenario_id"], str):
+            errors.append(_err("workload.scenario_id", "must be a string"))
+        if "scale" in workload and not isinstance(workload["scale"], dict):
+            errors.append(_err("workload.scale", "must be an object"))
+        concurrency = workload.get("concurrency")
+        if "concurrency" in workload and (not isinstance(concurrency, int) or isinstance(concurrency, bool) or concurrency < 1):
+            errors.append(_err("workload.concurrency", f"must be an integer >= 1, got {concurrency!r}"))
+        attempts_w = workload.get("attempts")
+        if "attempts" in workload and (not isinstance(attempts_w, int) or isinstance(attempts_w, bool) or attempts_w < 1):
+            errors.append(_err("workload.attempts", f"must be an integer >= 1, got {attempts_w!r}"))
 
     runtime = record.get("runtime")
     if not isinstance(runtime, dict):
@@ -167,6 +287,27 @@ def validate_record(record: dict) -> list[str]:
             errors.append(
                 _err("runtime.runner_class", f"must be one of {RUNNER_CLASSES}, got {runtime.get('runner_class')!r}")
             )
+        if "daemon_fallback_count" not in runtime:
+            errors.append(_err("runtime.daemon_fallback_count", "is required"))
+        elif not _is_nonneg_int(runtime["daemon_fallback_count"]):
+            errors.append(
+                _err(
+                    "runtime.daemon_fallback_count",
+                    f"must be a non-negative integer, got {runtime['daemon_fallback_count']!r}",
+                )
+            )
+
+    host = record.get("host")
+    if not isinstance(host, dict):
+        errors.append(_err("host", "must be an object"))
+    else:
+        for field in ("os", "arch"):
+            if not isinstance(host.get(field), str) or not host.get(field):
+                errors.append(_err(f"host.{field}", "must be a non-empty string"))
+        if "cpu_count" not in host:
+            errors.append(_err("host.cpu_count", "is required"))
+        elif host["cpu_count"] is not None and (isinstance(host["cpu_count"], bool) or not isinstance(host["cpu_count"], int)):
+            errors.append(_err("host.cpu_count", f"must be null or an integer, got {host['cpu_count']!r}"))
 
     settle = record.get("settle")
     if not isinstance(settle, dict):
@@ -178,11 +319,23 @@ def validate_record(record: dict) -> list[str]:
             errors.append(_err("settle.state", f"must be one of {STATES}, got {settle.get('state')!r}"))
 
     calibration = record.get("calibration")
-    if calibration is not None and not isinstance(calibration, dict):
-        errors.append(_err("calibration", "must be null or an object"))
+    if calibration is not None:
+        if not isinstance(calibration, dict):
+            errors.append(_err("calibration", "must be null or an object"))
+        else:
+            for field in ("artifact_sha", "baseline_id", "tolerance_factor", "same_sha_run_count"):
+                if field not in calibration:
+                    errors.append(_err(f"calibration.{field}", "is required when calibration is not null"))
+            same_sha_run_count = calibration.get("same_sha_run_count")
+            if "same_sha_run_count" in calibration and (
+                not isinstance(same_sha_run_count, int) or isinstance(same_sha_run_count, bool) or same_sha_run_count < 10
+            ):
+                errors.append(_err("calibration.same_sha_run_count", f"must be an integer >= 10, got {same_sha_run_count!r}"))
 
     artifact = record.get("artifact")
-    if not isinstance(artifact, dict) or "name" not in artifact or "sha256" not in artifact:
-        errors.append(_err("artifact", "must be an object with name and sha256"))
+    if not isinstance(artifact, dict):
+        errors.append(_err("artifact", "must be an object"))
+    else:
+        _check_closed_object(artifact, ARTIFACT_FIELDS, "artifact", errors)
 
     return errors

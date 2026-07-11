@@ -45,7 +45,7 @@ def _base_scenario(**overrides) -> dict:
 
 def _base_record(**overrides) -> dict:
     record = {
-        "schema_version": 1,
+        "schema_version": 3,
         "suite": "flagship-e2e",
         "scenario_id": "f1.recall.warm.real",
         "feature": "F1",
@@ -60,6 +60,8 @@ def _base_record(**overrides) -> dict:
         "metrics": {"p50_us": 1200.0},
         "distributions": {},
         "workload": {
+            "manifest_version": "1",
+            "manifest_hash": "sha256:" + "d" * 64,
             "scenario_id": "f1.recall.warm.real",
             "fixture": "memory_12k_sentinel_settled",
             "fixture_hash": "sha256:" + "a" * 64,
@@ -156,10 +158,34 @@ class ManifestTests(unittest.TestCase):
             _, errors = coverage_validator.load_manifest(path)
             self.assertTrue(any("does not match" in e for e in errors), errors)
 
+    def test_f3_context_full_18_point_grid_is_present(self):
+        """F3's {anchor} x {hops} x {budget} grid is 2 x 3 x 3 = 18 points
+        (DESIGN.md "Required target scenarios" for F3). The manifest may put
+        a reduced subset on the hosted runner tier, but the full 18-point
+        denominator must exist - no grid point may be silently dropped."""
+        data, _ = coverage_validator.load_manifest(MANIFEST_PATH)
+        f3_ids = {sc["scenario_id"] for sc in data["scenario"] if sc["feature"] == "F3"}
+        expected = {
+            f"f3.context.{anchor}.hop{hop}.budget{budget}.real"
+            for anchor in ("query", "entity_ids")
+            for hop in (0, 1, 2)
+            for budget in ("1k", "4k", "16k")
+        }
+        self.assertEqual(f3_ids, expected)
+        self.assertEqual(len(expected), 18)
+
 
 class SchemaValidationTests(unittest.TestCase):
     def test_valid_record_has_no_errors(self):
         errors = flagship_schema.validate_record(_base_record())
+        self.assertEqual(errors, [])
+
+    def test_schema_version_1_is_rejected(self):
+        errors = flagship_schema.validate_record(_base_record(schema_version=1))
+        self.assertTrue(any(e.startswith("schema_version:") for e in errors), errors)
+
+    def test_schema_version_3_is_accepted(self):
+        errors = flagship_schema.validate_record(_base_record(schema_version=3))
         self.assertEqual(errors, [])
 
     def test_missing_required_field_is_flagged(self):
@@ -167,6 +193,50 @@ class SchemaValidationTests(unittest.TestCase):
         del record["workload"]
         errors = flagship_schema.validate_record(record)
         self.assertTrue(any(e.startswith("workload:") for e in errors), errors)
+
+    def test_missing_daemon_fallback_count_is_flagged(self):
+        record = _base_record()
+        del record["runtime"]["daemon_fallback_count"]
+        errors = flagship_schema.validate_record(record)
+        self.assertTrue(any("daemon_fallback_count" in e for e in errors), errors)
+
+    def test_negative_daemon_fallback_count_is_flagged(self):
+        record = _base_record()
+        record["runtime"]["daemon_fallback_count"] = -1
+        errors = flagship_schema.validate_record(record)
+        self.assertTrue(any("daemon_fallback_count" in e for e in errors), errors)
+
+    def test_missing_workload_manifest_metadata_is_flagged(self):
+        record = _base_record()
+        del record["workload"]["manifest_version"]
+        del record["workload"]["manifest_hash"]
+        errors = flagship_schema.validate_record(record)
+        self.assertTrue(any("workload.manifest_version" in e for e in errors), errors)
+        self.assertTrue(any("workload.manifest_hash" in e for e in errors), errors)
+
+    def test_distribution_missing_errors_by_code_is_flagged(self):
+        dist = {
+            "estimator": "nearest_rank_v1",
+            "unit": "us",
+            "attempts": 1000,
+            "successes": 1000,
+            "timed_out": 0,
+            "histogram_edges_us": [0, 1000],
+            "histogram_counts": [500, 500],
+            "p50_us": 900,
+            "p95_us": 950,
+            "p99_us": 990,
+            "max_us": 1000,
+            "conditional_on_success": True,
+        }
+        errors = flagship_schema.validate_distribution(dist)
+        self.assertTrue(any("errors_by_code" in e for e in errors), errors)
+
+    def test_record_rejects_unexpected_top_level_field(self):
+        record = _base_record()
+        record["unexpected_field"] = "surprise"
+        errors = flagship_schema.validate_record(record)
+        self.assertTrue(any("unexpected field(s)" in e for e in errors), errors)
 
     def test_missing_operation_or_arm_is_flagged(self):
         for field in ("operation", "arm"):
@@ -259,7 +329,7 @@ class CoverageStatusTests(unittest.TestCase):
         self.assertEqual(status, "measured")
 
     def test_hosted_scenario_stale_after_7_days(self):
-        scenario = _base_scenario(runner_class="hosted_hash")
+        scenario = _base_scenario(runner_class="hosted_hash", embedder="bench_hash")
         record = _base_record(
             runtime={
                 "surface": "mcp_daemon",
@@ -273,7 +343,7 @@ class CoverageStatusTests(unittest.TestCase):
         self.assertEqual(status, "stale")
 
     def test_hosted_scenario_measured_within_7_days(self):
-        scenario = _base_scenario(runner_class="hosted_hash")
+        scenario = _base_scenario(runner_class="hosted_hash", embedder="bench_hash")
         record = _base_record(
             runtime={
                 "surface": "mcp_daemon",
@@ -317,6 +387,75 @@ class CoverageStatusTests(unittest.TestCase):
         record = _base_record()  # scenario_id defaults to f1.recall.warm.real
         status, _ = coverage_validator.scenario_status(scenario, [record], self.NOW)
         self.assertEqual(status, "missing")
+
+    def test_hash_embedder_record_against_production_scenario_is_confounded(self):
+        scenario = _base_scenario(embedder="production")
+        record = _base_record(
+            timestamp="2026-07-10T00:00:00+00:00",
+            runtime={
+                "surface": "mcp_daemon",
+                "embedder": "bench_hash",
+                "runner_class": "self_hosted_real_embedder",
+                "daemon_fallback_count": 0,
+            },
+        )
+        status, reason = coverage_validator.scenario_status(scenario, [record], self.NOW)
+        self.assertEqual(status, "confounded")
+        self.assertIn("embedder", reason)
+
+    def test_attempts_1_record_against_1000_attempt_scenario_is_confounded(self):
+        scenario = _base_scenario(attempts=1000)
+        record = _base_record(
+            timestamp="2026-07-10T00:00:00+00:00",
+            workload={
+                "manifest_version": "1",
+                "manifest_hash": "sha256:" + "d" * 64,
+                "scenario_id": "f1.recall.warm.real",
+                "fixture": "memory_12k_sentinel_settled",
+                "fixture_hash": "sha256:" + "a" * 64,
+                "scale": {"memories": 12000},
+                "concurrency": 1,
+                "attempts": 1,
+            },
+        )
+        status, reason = coverage_validator.scenario_status(scenario, [record], self.NOW)
+        self.assertEqual(status, "confounded")
+        self.assertIn("attempts", reason)
+
+    def test_runner_class_mismatch_is_confounded(self):
+        scenario = _base_scenario(runner_class="hosted_hash")
+        record = _base_record(timestamp="2026-07-10T00:00:00+00:00")  # record stays self_hosted_real_embedder
+        status, reason = coverage_validator.scenario_status(scenario, [record], self.NOW)
+        self.assertEqual(status, "confounded")
+        self.assertIn("runner_class", reason)
+
+    def test_settle_state_mismatch_is_confounded(self):
+        scenario = _base_scenario(state="cold")
+        record = _base_record(timestamp="2026-07-10T00:00:00+00:00")  # record settle.state stays "warm"
+        status, reason = coverage_validator.scenario_status(scenario, [record], self.NOW)
+        self.assertEqual(status, "confounded")
+        self.assertIn("settle.state", reason)
+
+    def test_settle_method_mismatch_is_confounded(self):
+        scenario = _base_scenario(settle="explicit_lifecycle_predicate")
+        record = _base_record(timestamp="2026-07-10T00:00:00+00:00")  # record settle.method stays "sequential_sentinel"
+        status, reason = coverage_validator.scenario_status(scenario, [record], self.NOW)
+        self.assertEqual(status, "confounded")
+        self.assertIn("settle.method", reason)
+
+    def test_scale_mismatch_is_confounded(self):
+        scenario = _base_scenario(scale={"memories": 50000})
+        record = _base_record(timestamp="2026-07-10T00:00:00+00:00")  # record workload.scale stays {"memories": 12000}
+        status, reason = coverage_validator.scenario_status(scenario, [record], self.NOW)
+        self.assertEqual(status, "confounded")
+        self.assertIn("scale", reason)
+
+    def test_concurrency_mismatch_is_confounded(self):
+        scenario = _base_scenario(concurrency=128)
+        record = _base_record(timestamp="2026-07-10T00:00:00+00:00")  # record workload.concurrency stays 1
+        status, reason = coverage_validator.scenario_status(scenario, [record], self.NOW)
+        self.assertEqual(status, "confounded")
+        self.assertIn("concurrency", reason)
 
     def test_latest_record_wins_when_multiple_exist(self):
         scenario = _base_scenario()

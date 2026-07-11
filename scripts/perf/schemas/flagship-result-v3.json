@@ -1,8 +1,8 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://khive.dev/schemas/flagship-result-v1.json",
+  "$id": "https://khive.dev/schemas/flagship-result-v3.json",
   "title": "FlagshipRecord",
-  "description": "Checked result contract for the flagship E2E benchmark manifest (bench-overhaul PR 1). Implements the Distribution contract and the Ledger record contract from .khive/workspaces/20260711/bench-overhaul/DESIGN.md ('Typed interfaces'). This is a standalone schema for the flagship-e2e result document; its own version track (v1, this file) is independent of scripts/perf/bench_track.py's ledger `schema_version` integer (currently 2, planned to become 3 when PR 2 wires flagship-e2e records into that ledger). No runner emits documents against this schema yet - PR 2+ implement the scenario runner.",
+  "description": "Checked result contract for the flagship E2E benchmark manifest (bench-overhaul PR 1). Implements the Distribution contract and the Ledger record contract from .khive/workspaces/20260711/bench-overhaul/DESIGN.md ('Typed interfaces'), which fixes FlagshipRecord.schema_version at 3 - the same schema_version track scripts/perf/bench_track.py's ledger will carry for flagship-e2e records once PR 2 wires this runner's output into that ledger. bench_track.py itself remains at its own SCHEMA_VERSION = 2 for its existing (non-flagship) suites until then. No runner emits documents against this schema yet - PR 2+ implement the scenario runner.",
   "type": "object",
   "required": [
     "schema_version",
@@ -29,7 +29,7 @@
   "additionalProperties": false,
   "properties": {
     "schema_version": {
-      "const": 1
+      "const": 3
     },
     "suite": {
       "const": "flagship-e2e"

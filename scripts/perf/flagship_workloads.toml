@@ -13,16 +13,6 @@
 # plus a perf-data records directory and reports per-scenario status.
 #
 # scenario_id convention: f<N>.<verb>.<arm>.<embedder> (N = F1..F10).
-#
-# Scoping note (F3/F5 grids): DESIGN.md calls for a full
-# {anchor} x {hops} x {budget} cross product for F3 context and a full
-# {gql,sparql} x {arm} cross product for F5 query. F5 is encoded in full
-# (10 scenarios). F3's 2x3x3=18-point grid is reduced, per DESIGN.md's own
-# 'reduced hosted matrix, full scheduled scale curve' allowance, to a
-# 10-point representative set: every hop value (0,1,2) and every budget
-# value (1k,4k,16k) appears at least once per anchor ("query", "entity_ids").
-# The remaining grid points are deferred to PR 4 (F2-F5 read surface),
-# where the fixed graph shapes are actually built, not silently dropped.
 
 [oq_rulings]
 # OQ1 (admin-ingest surface conflict): APPROVED CLI-boundary exception
@@ -462,6 +452,150 @@ operation = "context"
 fixture = "kg_context_fixed_graph"
 fixture_hash = "sha256:6453dfff6c00282a8e1f86b561534a46a6e8aea8e61d8247e61f9a5362cd5583"
 scale = { entities = 20000, edges = 80000, hops = 2, budget_bytes = 16384 }
+embedder = "production"
+state = "warm"
+settle = "sequential_sentinel"
+attempts = 1000
+concurrency = 1
+required_percentiles = ["p50", "p95", "p99"]
+request_deadline_ms = 30000
+request_deadline_provenance = "harness measurement-censoring safety cap, not a product SLO (OQ2 ruling); the MCP client's own request-timeout default is 300000 ms (300s), recorded here for reference only, see [oq_rulings] above"
+runner_class = "self_hosted_real_embedder"
+
+[[scenario]]
+scenario_id = "f3.context.query.hop0.budget1k.real"
+feature = "F3"
+surface = "mcp_daemon"
+operation = "context"
+fixture = "kg_context_fixed_graph"
+fixture_hash = "sha256:6453dfff6c00282a8e1f86b561534a46a6e8aea8e61d8247e61f9a5362cd5583"
+scale = { entities = 20000, edges = 80000, hops = 0, budget_bytes = 1024 }
+embedder = "production"
+state = "warm"
+settle = "sequential_sentinel"
+attempts = 1000
+concurrency = 1
+required_percentiles = ["p50", "p95", "p99"]
+request_deadline_ms = 30000
+request_deadline_provenance = "harness measurement-censoring safety cap, not a product SLO (OQ2 ruling); the MCP client's own request-timeout default is 300000 ms (300s), recorded here for reference only, see [oq_rulings] above"
+runner_class = "self_hosted_real_embedder"
+
+[[scenario]]
+scenario_id = "f3.context.query.hop0.budget16k.real"
+feature = "F3"
+surface = "mcp_daemon"
+operation = "context"
+fixture = "kg_context_fixed_graph"
+fixture_hash = "sha256:6453dfff6c00282a8e1f86b561534a46a6e8aea8e61d8247e61f9a5362cd5583"
+scale = { entities = 20000, edges = 80000, hops = 0, budget_bytes = 16384 }
+embedder = "production"
+state = "warm"
+settle = "sequential_sentinel"
+attempts = 1000
+concurrency = 1
+required_percentiles = ["p50", "p95", "p99"]
+request_deadline_ms = 30000
+request_deadline_provenance = "harness measurement-censoring safety cap, not a product SLO (OQ2 ruling); the MCP client's own request-timeout default is 300000 ms (300s), recorded here for reference only, see [oq_rulings] above"
+runner_class = "self_hosted_real_embedder"
+
+[[scenario]]
+scenario_id = "f3.context.query.hop1.budget1k.real"
+feature = "F3"
+surface = "mcp_daemon"
+operation = "context"
+fixture = "kg_context_fixed_graph"
+fixture_hash = "sha256:6453dfff6c00282a8e1f86b561534a46a6e8aea8e61d8247e61f9a5362cd5583"
+scale = { entities = 20000, edges = 80000, hops = 1, budget_bytes = 1024 }
+embedder = "production"
+state = "warm"
+settle = "sequential_sentinel"
+attempts = 1000
+concurrency = 1
+required_percentiles = ["p50", "p95", "p99"]
+request_deadline_ms = 30000
+request_deadline_provenance = "harness measurement-censoring safety cap, not a product SLO (OQ2 ruling); the MCP client's own request-timeout default is 300000 ms (300s), recorded here for reference only, see [oq_rulings] above"
+runner_class = "self_hosted_real_embedder"
+
+[[scenario]]
+scenario_id = "f3.context.query.hop1.budget16k.real"
+feature = "F3"
+surface = "mcp_daemon"
+operation = "context"
+fixture = "kg_context_fixed_graph"
+fixture_hash = "sha256:6453dfff6c00282a8e1f86b561534a46a6e8aea8e61d8247e61f9a5362cd5583"
+scale = { entities = 20000, edges = 80000, hops = 1, budget_bytes = 16384 }
+embedder = "production"
+state = "warm"
+settle = "sequential_sentinel"
+attempts = 1000
+concurrency = 1
+required_percentiles = ["p50", "p95", "p99"]
+request_deadline_ms = 30000
+request_deadline_provenance = "harness measurement-censoring safety cap, not a product SLO (OQ2 ruling); the MCP client's own request-timeout default is 300000 ms (300s), recorded here for reference only, see [oq_rulings] above"
+runner_class = "self_hosted_real_embedder"
+
+[[scenario]]
+scenario_id = "f3.context.entity_ids.hop0.budget1k.real"
+feature = "F3"
+surface = "mcp_daemon"
+operation = "context"
+fixture = "kg_context_fixed_graph"
+fixture_hash = "sha256:6453dfff6c00282a8e1f86b561534a46a6e8aea8e61d8247e61f9a5362cd5583"
+scale = { entities = 20000, edges = 80000, hops = 0, budget_bytes = 1024 }
+embedder = "production"
+state = "warm"
+settle = "sequential_sentinel"
+attempts = 1000
+concurrency = 1
+required_percentiles = ["p50", "p95", "p99"]
+request_deadline_ms = 30000
+request_deadline_provenance = "harness measurement-censoring safety cap, not a product SLO (OQ2 ruling); the MCP client's own request-timeout default is 300000 ms (300s), recorded here for reference only, see [oq_rulings] above"
+runner_class = "self_hosted_real_embedder"
+
+[[scenario]]
+scenario_id = "f3.context.entity_ids.hop0.budget16k.real"
+feature = "F3"
+surface = "mcp_daemon"
+operation = "context"
+fixture = "kg_context_fixed_graph"
+fixture_hash = "sha256:6453dfff6c00282a8e1f86b561534a46a6e8aea8e61d8247e61f9a5362cd5583"
+scale = { entities = 20000, edges = 80000, hops = 0, budget_bytes = 16384 }
+embedder = "production"
+state = "warm"
+settle = "sequential_sentinel"
+attempts = 1000
+concurrency = 1
+required_percentiles = ["p50", "p95", "p99"]
+request_deadline_ms = 30000
+request_deadline_provenance = "harness measurement-censoring safety cap, not a product SLO (OQ2 ruling); the MCP client's own request-timeout default is 300000 ms (300s), recorded here for reference only, see [oq_rulings] above"
+runner_class = "self_hosted_real_embedder"
+
+[[scenario]]
+scenario_id = "f3.context.entity_ids.hop1.budget1k.real"
+feature = "F3"
+surface = "mcp_daemon"
+operation = "context"
+fixture = "kg_context_fixed_graph"
+fixture_hash = "sha256:6453dfff6c00282a8e1f86b561534a46a6e8aea8e61d8247e61f9a5362cd5583"
+scale = { entities = 20000, edges = 80000, hops = 1, budget_bytes = 1024 }
+embedder = "production"
+state = "warm"
+settle = "sequential_sentinel"
+attempts = 1000
+concurrency = 1
+required_percentiles = ["p50", "p95", "p99"]
+request_deadline_ms = 30000
+request_deadline_provenance = "harness measurement-censoring safety cap, not a product SLO (OQ2 ruling); the MCP client's own request-timeout default is 300000 ms (300s), recorded here for reference only, see [oq_rulings] above"
+runner_class = "self_hosted_real_embedder"
+
+[[scenario]]
+scenario_id = "f3.context.entity_ids.hop1.budget16k.real"
+feature = "F3"
+surface = "mcp_daemon"
+operation = "context"
+fixture = "kg_context_fixed_graph"
+fixture_hash = "sha256:6453dfff6c00282a8e1f86b561534a46a6e8aea8e61d8247e61f9a5362cd5583"
+scale = { entities = 20000, edges = 80000, hops = 1, budget_bytes = 16384 }
 embedder = "production"
 state = "warm"
 settle = "sequential_sentinel"
