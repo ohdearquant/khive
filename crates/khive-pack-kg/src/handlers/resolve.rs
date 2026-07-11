@@ -12,7 +12,7 @@ use serde_json::{json, Value};
 
 use khive_runtime::{NamespaceToken, ReferenceResolution, RuntimeError, VerbRegistry};
 
-use super::common::deser;
+use super::common::{deser, resolve_kind_spec, KindSpec};
 use super::params::ResolveParams;
 use crate::KgPack;
 
@@ -35,6 +35,26 @@ impl KgPack {
         let limit = p.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
         let ring = registry.reference_ring();
 
+        // `resolve`'s pipeline (id-string passthrough, ring, exact-name
+        // storage lookup, hybrid search) is entity-only, so `kind` here
+        // follows the same substrate-or-granular discriminant as
+        // `create`/`list`/`search` (see `resolve_kind_spec`): the bare
+        // substrate label `"entity"` means "no kind filter", not a literal
+        // `entities.kind` value. Forwarding the raw string as-is would filter
+        // every real match out (#849) — `entities.kind` only ever holds a
+        // granular value like `"concept"`, never `"entity"`.
+        let entity_kind = match &p.kind {
+            Some(raw) => match resolve_kind_spec(raw, registry)? {
+                KindSpec::Entity { specific } => specific,
+                _ => {
+                    return Err(RuntimeError::InvalidInput(format!(
+                        "resolve only supports entity kinds; kind={raw:?} is not an entity kind"
+                    )))
+                }
+            },
+            None => None,
+        };
+
         let mut results = Vec::with_capacity(p.refs.len());
         for nl_ref in &p.refs {
             let resolution = khive_runtime::resolve_reference(
@@ -43,7 +63,7 @@ impl KgPack {
                 token,
                 nl_ref,
                 limit,
-                p.kind.as_deref(),
+                entity_kind.as_deref(),
             )
             .await?;
             results.push(render_resolution(nl_ref, resolution));

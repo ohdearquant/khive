@@ -87,6 +87,15 @@ pub struct EntityFilter {
     /// Filter by exact `entity_type` value. Multiple values are ORed.
     pub entity_types: Vec<String>,
     pub name_prefix: Option<String>,
+    /// Deterministic, case-sensitive equality on `entities.name` (binary
+    /// comparison — SQLite's default collation for `=` on a `TEXT` column
+    /// without an explicit `COLLATE NOCASE`). Distinct from `name_prefix`:
+    /// that stage's `LIKE` is inherently prefix-shaped and, with SQLite's
+    /// default `NOCASE`-free `LIKE` on ASCII, still ranks a page by
+    /// `created_at DESC` — a match that is exact but not the newest can be
+    /// paged out. `name_exact` skips paging risk entirely by filtering to
+    /// only rows that equal `name` at the SQL layer.
+    pub name_exact: Option<String>,
     pub tags_any: Vec<String>,
     /// When non-empty, restricts results to any of these namespaces using
     /// `namespace IN (...)`. Takes precedence over the `namespace` string
