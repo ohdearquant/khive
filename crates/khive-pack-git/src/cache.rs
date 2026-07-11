@@ -345,23 +345,28 @@ fn remove_dir_all_retrying(path: &Path) -> std::io::Result<()> {
 }
 
 /// `-c maintenance.auto=false` on every clone/fetch into a cache slot, as
-/// defensive hardening: since git 2.30, `fetch`/`clone` unconditionally
-/// check `maintenance.auto` (default true) after they finish and, if set,
-/// launch `git maintenance run --auto --detach` as a detached background
-/// child. The child spawn is trace2-proven in both directions
-/// (`GIT_TRACE2_EVENT` on a live `git fetch --refetch`: with default config
-/// the child forks; with `maintenance.auto=false` it does not). When one of
-/// its auto-maintenance tasks fires, that child mutates the slot's `.git`
-/// tree (commit-graph writes, pack maintenance, lock files) concurrently
-/// with any `dir_size`/`evict_lru` walk of the same slot. Whether such a
-/// task actually fired in issue #842's historical macOS ENOENT failures is
-/// not proven -- in small repos the child typically finds no task to run
-/// and exits quickly -- so the load-bearing fix for that flake family is
-/// the descendant-vanish tolerance in `dir_size`; this flag removes the one
-/// background mutator git itself forks into our cache slots. `gc.auto=0`
-/// alone does **not** suppress the child (trace2-verified); it is kept
-/// alongside because it disables `git gc --auto`'s separate
-/// opportunistic-gc check, harmless to also turn off here.
+/// defensive hardening. `git fetch` runs auto-maintenance after it
+/// finishes when `maintenance.auto` (default true) is set, and since git
+/// 2.47 that maintenance runs as a *detached background child*
+/// (`git maintenance run --auto --detach`) that can outlive the foreground
+/// command; on 2.46 and earlier it ran synchronously. The spawn is
+/// trace2-proven in both directions on the `fetch --refetch` path
+/// (`GIT_TRACE2_EVENT`, git 2.49: with default config the child forks; with
+/// `maintenance.auto=false` it does not). The same trace showed `clone`
+/// spawning no maintenance child; the flag is applied to the clone builder
+/// too purely as harmless defensive configuration, with no trace evidence
+/// claimed for that path. When one of the detached child's tasks fires it
+/// mutates the slot's `.git` tree (commit-graph writes, pack maintenance,
+/// lock files) concurrently with any `dir_size`/`evict_lru` walk of the
+/// same slot. Whether such a task actually fired in issue #842's historical
+/// macOS ENOENT failures is not proven -- in small repos the child
+/// typically finds no task to run and exits quickly -- so the load-bearing
+/// fix for that flake family is the descendant-vanish tolerance in
+/// `dir_size`; this flag removes the one background mutator git itself can
+/// fork into our cache slots. `gc.auto=0` alone does **not** suppress the
+/// child (trace2-verified); it is kept alongside because it disables
+/// `git gc --auto`'s separate opportunistic-gc check, harmless to also turn
+/// off here.
 ///
 /// This does not mean a cache slot is naturally garbage-collected some other
 /// way instead: no cache-slot repo is ever gc'd or maintenance'd by us.
