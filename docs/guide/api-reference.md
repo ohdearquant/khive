@@ -41,8 +41,8 @@ accepted but unimplemented (ADR-085), and `findings.json` ingest runs through th
 `kkernel code-ingest` admin CLI path, not the MCP verb surface — so it contributes 0
 verbs to the total below.
 
-The default binary (no `KHIVE_PACKS`/`--pack` override) loads all 10 packs: 18 + 5 + 5 +
-15 + 7 + 4 + 19 + 4 + 1 + 0 = **78 verbs**.
+The default binary (no `KHIVE_PACKS`/`--pack` override) loads all 11 packs: 18 + 5 + 5 +
+15 + 7 + 4 + 19 + 4 + 1 + 0 + 0 = **78 verbs**.
 
 Verb names in the `kg` pack are bare (`create`, `search`, `link`, …). Every other pack
 namespaces its verbs with a `pack.` prefix (`gtd.assign`, `memory.recall`,
