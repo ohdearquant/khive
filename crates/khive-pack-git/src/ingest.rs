@@ -1138,6 +1138,42 @@ struct GhPr {
     body: Option<String>,
 }
 
+/// Every externally controlled issue string (title, body, label names,
+/// author login) funnels through this constructor before it can reach
+/// `properties`/`content`/the note name. There is no way to read a raw
+/// field back out of this struct -- the only fields it exposes are already
+/// masked -- so a call site cannot forget to mask one without a compile
+/// error, and a future new external string only needs to be added here
+/// once to be covered everywhere it's used.
+struct MaskedIssueFields {
+    title: String,
+    body: String,
+    author_login: Option<String>,
+    labels: Vec<String>,
+}
+
+impl MaskedIssueFields {
+    fn new(
+        title: &str,
+        body: Option<String>,
+        author: Option<GhAuthor>,
+        labels: Option<Vec<GhLabel>>,
+    ) -> Self {
+        Self {
+            title: secret_gate::mask_secrets(title).into_owned(),
+            body: secret_gate::mask_secrets(&body.unwrap_or_default()).into_owned(),
+            author_login: author
+                .and_then(|a| a.login)
+                .map(|login| secret_gate::mask_secrets(&login).into_owned()),
+            labels: labels
+                .unwrap_or_default()
+                .into_iter()
+                .map(|l| secret_gate::mask_secrets(&l.name).into_owned())
+                .collect(),
+        }
+    }
+}
+
 fn gh_json(repo: &Path, args: &[&str]) -> Result<String> {
     // gh has no `-C` flag (unlike git) — repo targeting is via working directory.
     let output = Command::new("gh")
@@ -1503,22 +1539,17 @@ async fn ingest_issues(
                 break;
             }
 
-            let raw_body = issue.body.unwrap_or_default();
-            let content = secret_gate::mask_secrets(&raw_body).into_owned();
-            let safe_title = secret_gate::mask_secrets(&issue.title).into_owned();
-            let labels: Vec<String> = issue
-                .labels
-                .unwrap_or_default()
-                .into_iter()
-                .map(|l| l.name)
-                .collect();
+            let masked =
+                MaskedIssueFields::new(&issue.title, issue.body, issue.author, issue.labels);
+            let content = masked.body;
+            let safe_title = masked.title;
             let mut properties = json!({
                 "number": issue.number,
                 "title": safe_title,
-                "author": issue.author.and_then(|a| a.login),
+                "author": masked.author_login,
                 "created_at": issue.created_at,
                 "closed_at": issue.closed_at,
-                "labels": labels,
+                "labels": masked.labels,
                 "project_id": project_id.to_string(),
             });
             // gh reports stateReason as "" for open issues and UPPERCASE enum values

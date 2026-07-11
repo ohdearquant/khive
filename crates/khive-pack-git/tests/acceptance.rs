@@ -754,6 +754,173 @@ async fn ingest_leaves_clean_issue_title_unmasked() {
     );
 }
 
+/// PR #835 round-1 codex finding: the runtime secret gate recursively scans
+/// every string in `properties` (not just `title`), so a credential-shaped
+/// label name previously tripped the gate on `create()` even after the
+/// title was masked, silently dropping the whole issue note.
+#[tokio::test]
+async fn ingest_masks_credential_shaped_issue_label_without_dropping_note() {
+    let _guard = ENV_MUTEX.lock().await;
+    let (rt, token, registry) = fixture().await;
+
+    let project_id = create(
+        &registry,
+        json!({"kind": "project", "name": "issue-label-credential-repo"}),
+    )
+    .await;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo: PathBuf = dir.path().join("repo");
+    std::fs::create_dir_all(&repo).expect("mk repo dir");
+    init_repo(&repo);
+    write(&repo, "README.md", "hello\n");
+    commit(&repo, &["README.md"], "Initial commit");
+
+    let bin_dir = dir.path().join("bin");
+    std::fs::create_dir_all(&bin_dir).expect("mk bin dir");
+    let log_dir = dir.path().join("log");
+    std::fs::create_dir_all(&log_dir).expect("mk log dir");
+
+    let fake_token = "ghp_BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB";
+    let issue_json = json!([{
+        "number": 13,
+        "title": "Rotate the leaked deploy key",
+        "author": {"login": "octocat"},
+        "createdAt": "2026-01-01T00:00:00Z",
+        "closedAt": null,
+        "updatedAt": "2026-01-01T00:00:00Z",
+        "labels": [{"name": fake_token}],
+        "stateReason": "",
+        "body": ""
+    }])
+    .to_string();
+
+    write_fake_gh(&bin_dir, &log_dir, "[]", &issue_json);
+    let _path_guard = PathGuard::install(&bin_dir);
+
+    let report = run_ingest(
+        &rt,
+        &token,
+        &registry,
+        IngestOptions::unbounded(repo.clone(), project_id.to_string()),
+    )
+    .await
+    .expect("ingest ok");
+
+    assert_eq!(
+        report.issues_ingested, 1,
+        "the issue must not be dropped: {report:?}"
+    );
+    assert!(
+        report.warnings.iter().all(|w| !w.contains("issue #13")),
+        "no silent-drop warning may be reported: {:?}",
+        report.warnings
+    );
+
+    let issues_list = registry
+        .dispatch("list", json!({"kind": "issue", "limit": 10}))
+        .await
+        .expect("list issues ok");
+    let items = issues_list.as_array().expect("array");
+    assert_eq!(items.len(), 1);
+    let item = &items[0];
+    let stored_labels = item["properties"]["labels"]
+        .as_array()
+        .expect("properties.labels is array");
+    assert_eq!(stored_labels.len(), 1);
+    let stored_label = stored_labels[0].as_str().expect("label is string");
+    assert!(
+        !stored_label.contains(fake_token),
+        "raw credential must not survive into properties.labels: {stored_label:?}"
+    );
+    assert!(
+        stored_label.contains("***MASKED***"),
+        "masked marker must be present in properties.labels: {stored_label:?}"
+    );
+}
+
+/// Same finding as above, for the author login field: a credential-shaped
+/// login previously tripped the recursive secret gate on `properties` and
+/// silently dropped the issue note.
+#[tokio::test]
+async fn ingest_masks_credential_shaped_issue_author_login_without_dropping_note() {
+    let _guard = ENV_MUTEX.lock().await;
+    let (rt, token, registry) = fixture().await;
+
+    let project_id = create(
+        &registry,
+        json!({"kind": "project", "name": "issue-login-credential-repo"}),
+    )
+    .await;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo: PathBuf = dir.path().join("repo");
+    std::fs::create_dir_all(&repo).expect("mk repo dir");
+    init_repo(&repo);
+    write(&repo, "README.md", "hello\n");
+    commit(&repo, &["README.md"], "Initial commit");
+
+    let bin_dir = dir.path().join("bin");
+    std::fs::create_dir_all(&bin_dir).expect("mk bin dir");
+    let log_dir = dir.path().join("log");
+    std::fs::create_dir_all(&log_dir).expect("mk log dir");
+
+    let fake_token = "ghp_CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC";
+    let issue_json = json!([{
+        "number": 14,
+        "title": "Investigate flaky CI runner",
+        "author": {"login": fake_token},
+        "createdAt": "2026-01-01T00:00:00Z",
+        "closedAt": null,
+        "updatedAt": "2026-01-01T00:00:00Z",
+        "labels": [],
+        "stateReason": "",
+        "body": ""
+    }])
+    .to_string();
+
+    write_fake_gh(&bin_dir, &log_dir, "[]", &issue_json);
+    let _path_guard = PathGuard::install(&bin_dir);
+
+    let report = run_ingest(
+        &rt,
+        &token,
+        &registry,
+        IngestOptions::unbounded(repo.clone(), project_id.to_string()),
+    )
+    .await
+    .expect("ingest ok");
+
+    assert_eq!(
+        report.issues_ingested, 1,
+        "the issue must not be dropped: {report:?}"
+    );
+    assert!(
+        report.warnings.iter().all(|w| !w.contains("issue #14")),
+        "no silent-drop warning may be reported: {:?}",
+        report.warnings
+    );
+
+    let issues_list = registry
+        .dispatch("list", json!({"kind": "issue", "limit": 10}))
+        .await
+        .expect("list issues ok");
+    let items = issues_list.as_array().expect("array");
+    assert_eq!(items.len(), 1);
+    let item = &items[0];
+    let stored_author = item["properties"]["author"]
+        .as_str()
+        .expect("properties.author is string");
+    assert!(
+        !stored_author.contains(fake_token),
+        "raw credential must not survive into properties.author: {stored_author:?}"
+    );
+    assert!(
+        stored_author.contains("***MASKED***"),
+        "masked marker must be present in properties.author: {stored_author:?}"
+    );
+}
+
 /// Multiple credential spans across both the title and the body of the same
 /// PR must all be masked, and exactly one PR note must be written.
 #[tokio::test]
