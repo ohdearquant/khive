@@ -43,7 +43,7 @@ config:
 
 ```bash
 uv run scripts/perf/bench_load_harness.py --mode real --workers 100 --tenants 20 --ops-per-worker 50 \
-  --packs kg,gtd,memory,brain,comm,schedule,knowledge,session,git,code
+  --packs kg,gtd,memory,brain,comm,schedule,knowledge,session,git,code,workspace
 ```
 
 `--workers` must be an exact multiple of `--tenants` (workers are split
