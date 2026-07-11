@@ -172,6 +172,146 @@ pub fn u8_l2sq_u32(a: &[u8], b: &[u8]) -> u32 {
     }
 }
 
+// ─── Validation errors (QUANT-AUD-002) ─────────────────────────────────────────
+
+/// Errors returned by the `try_*` codec constructors and encoders.
+///
+/// Public train/encode input is caller-controlled (corpus data, external
+/// vectors); shape mismatches here must be a typed error rather than a panic
+/// or a silently truncated/malformed encoded vector.
+#[derive(Debug, Clone, PartialEq)]
+pub enum QuantError {
+    /// The training corpus contained zero rows.
+    EmptyCorpus,
+    /// `dims` was zero (flat API) or the first row was empty (row API).
+    ZeroDims,
+    /// A flat vector's length was not a multiple of `dims`.
+    FlatLengthNotDivisible { len: usize, dims: usize },
+    /// A training row's length did not match the dims established by row 0.
+    RaggedRow {
+        row: usize,
+        expected: usize,
+        got: usize,
+    },
+    /// A vector passed to `encode`/`encode_flat_par` did not match the
+    /// codec's trained dims.
+    EncodeLengthMismatch { expected: usize, got: usize },
+}
+
+impl std::fmt::Display for QuantError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::EmptyCorpus => write!(f, "cannot train on empty corpus"),
+            Self::ZeroDims => write!(f, "dims must be > 0"),
+            Self::FlatLengthNotDivisible { len, dims } => write!(
+                f,
+                "flat vector length {len} is not a multiple of dims {dims}"
+            ),
+            Self::RaggedRow { row, expected, got } => write!(
+                f,
+                "row {row} has length {got}, expected {expected} (dims fixed by row 0)"
+            ),
+            Self::EncodeLengthMismatch { expected, got } => write!(
+                f,
+                "vector length {got} does not match codec dims {expected}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for QuantError {}
+
+/// Compute per-dimension min/max over row-major flat vectors, validating
+/// `dims > 0`, a non-empty corpus, and that `vectors.len()` is a multiple of
+/// `dims`. Non-finite values are skipped (same convention as before); a
+/// dimension with no finite observation defaults to `[0, 1)`.
+fn flat_min_max(vectors: &[f32], dims: usize) -> Result<(Vec<f32>, Vec<f32>), QuantError> {
+    if dims == 0 {
+        return Err(QuantError::ZeroDims);
+    }
+    if vectors.is_empty() {
+        return Err(QuantError::EmptyCorpus);
+    }
+    if !vectors.len().is_multiple_of(dims) {
+        return Err(QuantError::FlatLengthNotDivisible {
+            len: vectors.len(),
+            dims,
+        });
+    }
+
+    let n = vectors.len() / dims;
+    let mut min = vec![f32::INFINITY; dims];
+    let mut max = vec![f32::NEG_INFINITY; dims];
+
+    for row in 0..n {
+        let v = &vectors[row * dims..(row + 1) * dims];
+        for (d, &x) in v.iter().enumerate() {
+            if x.is_finite() {
+                if x < min[d] {
+                    min[d] = x;
+                }
+                if x > max[d] {
+                    max[d] = x;
+                }
+            }
+        }
+    }
+    finalize_min_max(&mut min, &mut max);
+    Ok((min, max))
+}
+
+/// Compute per-dimension min/max over a slice of row vectors, validating a
+/// non-empty corpus, `dims > 0` (row 0's length), and that every row has the
+/// same length as row 0 (rectangular corpus). See [`flat_min_max`] for the
+/// finite-value and empty-dimension handling.
+fn row_min_max(vectors: &[Vec<f32>]) -> Result<(usize, Vec<f32>, Vec<f32>), QuantError> {
+    if vectors.is_empty() {
+        return Err(QuantError::EmptyCorpus);
+    }
+    let dims = vectors[0].len();
+    if dims == 0 {
+        return Err(QuantError::ZeroDims);
+    }
+
+    let mut min = vec![f32::INFINITY; dims];
+    let mut max = vec![f32::NEG_INFINITY; dims];
+
+    for (row, v) in vectors.iter().enumerate() {
+        if v.len() != dims {
+            return Err(QuantError::RaggedRow {
+                row,
+                expected: dims,
+                got: v.len(),
+            });
+        }
+        for (d, &x) in v.iter().enumerate() {
+            if x.is_finite() {
+                if x < min[d] {
+                    min[d] = x;
+                }
+                if x > max[d] {
+                    max[d] = x;
+                }
+            }
+        }
+    }
+    finalize_min_max(&mut min, &mut max);
+    Ok((dims, min, max))
+}
+
+/// Default a dimension with no finite observation to `min=0, max=1`; widen a
+/// degenerate `max <= min` to a unit range so `scale`/`gs` never divide by zero.
+fn finalize_min_max(min: &mut [f32], max: &mut [f32]) {
+    for d in 0..min.len() {
+        if !min[d].is_finite() {
+            min[d] = 0.0;
+        }
+        if !max[d].is_finite() || max[d] <= min[d] {
+            max[d] = min[d] + 1.0;
+        }
+    }
+}
+
 // ─── Sq8Codec (per-dim scale — dot product / cosine) ──────────────────────────
 
 /// Per-dimension affine SQ8 codec for dot product and cosine distance.
@@ -230,84 +370,64 @@ impl Sq8Codec {
     }
 
     /// Train a codec from row-major flat vectors.
+    ///
+    /// Panics on invalid input. See [`Self::try_train_flat`] for a fallible
+    /// variant that returns [`QuantError`] instead.
     pub fn train_flat(vectors: &[f32], dims: usize) -> Self {
-        assert!(dims > 0, "dims must be > 0");
-        assert!(!vectors.is_empty(), "cannot train on empty corpus");
-        assert_eq!(
-            vectors.len() % dims,
-            0,
-            "vectors length must be a multiple of dims"
-        );
+        Self::try_train_flat(vectors, dims).unwrap_or_else(|e| panic!("{e}"))
+    }
 
-        let n = vectors.len() / dims;
-        let mut min = vec![f32::INFINITY; dims];
-        let mut max = vec![f32::NEG_INFINITY; dims];
-
-        for row in 0..n {
-            let v = &vectors[row * dims..(row + 1) * dims];
-            for (d, &x) in v.iter().enumerate() {
-                if x.is_finite() {
-                    if x < min[d] {
-                        min[d] = x;
-                    }
-                    if x > max[d] {
-                        max[d] = x;
-                    }
-                }
-            }
-        }
-
-        for d in 0..dims {
-            if !min[d].is_finite() {
-                min[d] = 0.0;
-            }
-            if !max[d].is_finite() || max[d] <= min[d] {
-                max[d] = min[d] + 1.0;
-            }
-        }
-
-        Self::build_from_min_max(min, max)
+    /// Fallible variant of [`Self::train_flat`]. Validates `dims > 0`, a
+    /// non-empty corpus, and that `vectors.len()` is a multiple of `dims`.
+    pub fn try_train_flat(vectors: &[f32], dims: usize) -> Result<Self, QuantError> {
+        let (min, max) = flat_min_max(vectors, dims)?;
+        Ok(Self::build_from_min_max(min, max))
     }
 
     /// Train from a slice of row vectors (each a `Vec<f32>`).
+    ///
+    /// Panics on invalid input. See [`Self::try_train`] for a fallible
+    /// variant that returns [`QuantError`] instead.
     pub fn train(vectors: &[Vec<f32>]) -> Self {
-        assert!(!vectors.is_empty(), "cannot train on empty corpus");
-        let dims = vectors[0].len();
-        assert!(dims > 0, "dims must be > 0");
+        Self::try_train(vectors).unwrap_or_else(|e| panic!("{e}"))
+    }
 
-        let mut min = vec![f32::INFINITY; dims];
-        let mut max = vec![f32::NEG_INFINITY; dims];
-
-        for v in vectors {
-            for (d, &x) in v.iter().enumerate() {
-                if x.is_finite() {
-                    if x < min[d] {
-                        min[d] = x;
-                    }
-                    if x > max[d] {
-                        max[d] = x;
-                    }
-                }
-            }
-        }
-
-        for d in 0..dims {
-            if !min[d].is_finite() {
-                min[d] = 0.0;
-            }
-            if !max[d].is_finite() || max[d] <= min[d] {
-                max[d] = min[d] + 1.0;
-            }
-        }
-
-        Self::build_from_min_max(min, max)
+    /// Fallible variant of [`Self::train`]. Validates a non-empty corpus,
+    /// `dims > 0` (row 0's length), and that every row is the same length
+    /// (rectangular corpus); a ragged row returns [`QuantError::RaggedRow`]
+    /// instead of panicking on out-of-bounds indexing.
+    pub fn try_train(vectors: &[Vec<f32>]) -> Result<Self, QuantError> {
+        let (_dims, min, max) = row_min_max(vectors)?;
+        Ok(Self::build_from_min_max(min, max))
     }
 
     /// Encode a single vector into SQ8 codes + correction metadata.
+    ///
+    /// Panics if `v.len()` does not match the codec's trained dims. See
+    /// [`Self::try_encode`] for a fallible variant that returns
+    /// [`QuantError`] instead.
     pub fn encode(&self, v: &[f32]) -> EncodedVector {
-        let dims = self.min.len();
-        debug_assert_eq!(v.len(), dims, "vector length must match codec dims");
+        self.try_encode(v).unwrap_or_else(|e| panic!("{e}"))
+    }
 
+    /// Fallible variant of [`Self::encode`]. Validates `v.len()` against the
+    /// codec's trained dims before encoding, replacing the prior
+    /// debug-only length assertion (which was compiled out in release
+    /// builds and could silently produce a truncated/malformed code vector).
+    pub fn try_encode(&self, v: &[f32]) -> Result<EncodedVector, QuantError> {
+        let dims = self.min.len();
+        if v.len() != dims {
+            return Err(QuantError::EncodeLengthMismatch {
+                expected: dims,
+                got: v.len(),
+            });
+        }
+        Ok(self.encode_unchecked(v))
+    }
+
+    /// Encode a vector already validated to have `v.len() == self.min.len()`.
+    fn encode_unchecked(&self, v: &[f32]) -> EncodedVector {
+        let dims = self.min.len();
         let mut codes = Vec::with_capacity(dims);
         let mut soc_sum = 0.0f32;
         let mut residual_dot_bias = 0.0f32;
@@ -332,17 +452,75 @@ impl Sq8Codec {
     }
 
     /// Encode a batch of flat-row vectors in parallel.
+    ///
+    /// Panics on invalid input. See [`Self::try_encode_flat_par`] for a
+    /// fallible variant that returns [`QuantError`] instead.
     pub fn encode_flat_par(&self, vectors: &[f32], dims: usize) -> Vec<EncodedVector> {
+        self.try_encode_flat_par(vectors, dims)
+            .unwrap_or_else(|e| panic!("{e}"))
+    }
+
+    /// Fallible variant of [`Self::encode_flat_par`]. Validates `dims > 0`,
+    /// divisibility, and that `dims` matches the codec's trained dims before
+    /// dividing `vectors.len() / dims`, replacing the prior unchecked
+    /// division (panics on `dims == 0`) and silent truncation (a non-multiple
+    /// `vectors.len()` previously dropped the trailing partial row).
+    pub fn try_encode_flat_par(
+        &self,
+        vectors: &[f32],
+        dims: usize,
+    ) -> Result<Vec<EncodedVector>, QuantError> {
+        if dims == 0 {
+            return Err(QuantError::ZeroDims);
+        }
+        if !vectors.len().is_multiple_of(dims) {
+            return Err(QuantError::FlatLengthNotDivisible {
+                len: vectors.len(),
+                dims,
+            });
+        }
+        if dims != self.min.len() {
+            return Err(QuantError::EncodeLengthMismatch {
+                expected: self.min.len(),
+                got: dims,
+            });
+        }
         let n = vectors.len() / dims;
-        (0..n)
+        Ok((0..n)
             .into_par_iter()
-            .map(|i| self.encode(&vectors[i * dims..(i + 1) * dims]))
-            .collect()
+            .map(|i| self.encode_unchecked(&vectors[i * dims..(i + 1) * dims]))
+            .collect())
     }
 
     /// Encode a batch of row vectors in parallel.
+    ///
+    /// Panics if any row's length does not match the codec's trained dims.
+    /// See [`Self::try_encode_par`] for a fallible variant that returns
+    /// [`QuantError`] instead.
     pub fn encode_par(&self, vectors: &[Vec<f32>]) -> Vec<EncodedVector> {
-        vectors.par_iter().map(|v| self.encode(v)).collect()
+        self.try_encode_par(vectors)
+            .unwrap_or_else(|e| panic!("{e}"))
+    }
+
+    /// Fallible variant of [`Self::encode_par`]. Validates every row's
+    /// length against the codec's trained dims before dispatching to the
+    /// thread pool, replacing the prior `self.encode` call per row, which
+    /// unwrapped [`Self::try_encode`] and panicked mid-batch on a
+    /// length-mismatched row.
+    pub fn try_encode_par(&self, vectors: &[Vec<f32>]) -> Result<Vec<EncodedVector>, QuantError> {
+        let dims = self.min.len();
+        for v in vectors {
+            if v.len() != dims {
+                return Err(QuantError::EncodeLengthMismatch {
+                    expected: dims,
+                    got: v.len(),
+                });
+            }
+        }
+        Ok(vectors
+            .par_iter()
+            .map(|v| self.encode_unchecked(v))
+            .collect())
     }
 
     /// Approximate dot product between two encoded vectors (same codec).
@@ -455,43 +633,8 @@ pub struct GsEncodedVector {
 }
 
 impl GsSq8Codec {
-    /// Train from row-major flat vectors.
-    pub fn train_flat(vectors: &[f32], dims: usize) -> Self {
-        assert!(dims > 0, "dims must be > 0");
-        assert!(!vectors.is_empty(), "cannot train on empty corpus");
-        assert_eq!(
-            vectors.len() % dims,
-            0,
-            "vectors length must be a multiple of dims"
-        );
-
-        let n = vectors.len() / dims;
-        let mut min = vec![f32::INFINITY; dims];
-        let mut max = vec![f32::NEG_INFINITY; dims];
-
-        for row in 0..n {
-            let v = &vectors[row * dims..(row + 1) * dims];
-            for (d, &x) in v.iter().enumerate() {
-                if x.is_finite() {
-                    if x < min[d] {
-                        min[d] = x;
-                    }
-                    if x > max[d] {
-                        max[d] = x;
-                    }
-                }
-            }
-        }
-
-        for d in 0..dims {
-            if !min[d].is_finite() {
-                min[d] = 0.0;
-            }
-            if !max[d].is_finite() || max[d] <= min[d] {
-                max[d] = min[d] + 1.0;
-            }
-        }
-
+    fn build_from_min_max(min: Vec<f32>, max: Vec<f32>) -> Self {
+        let dims = min.len();
         let ranges: Vec<f32> = (0..dims).map(|d| max[d] - min[d]).collect();
         let max_range = ranges.iter().cloned().fold(0.0f32, f32::max);
         let gs = if max_range > 1e-12 {
@@ -517,74 +660,70 @@ impl GsSq8Codec {
             gs_sq: gs * gs,
             anisotropy_ratio,
         }
+    }
+
+    /// Train from row-major flat vectors.
+    ///
+    /// Panics on invalid input. See [`Self::try_train_flat`] for a fallible
+    /// variant that returns [`QuantError`] instead.
+    pub fn train_flat(vectors: &[f32], dims: usize) -> Self {
+        Self::try_train_flat(vectors, dims).unwrap_or_else(|e| panic!("{e}"))
+    }
+
+    /// Fallible variant of [`Self::train_flat`]. Validates `dims > 0`, a
+    /// non-empty corpus, and that `vectors.len()` is a multiple of `dims`.
+    pub fn try_train_flat(vectors: &[f32], dims: usize) -> Result<Self, QuantError> {
+        let (min, max) = flat_min_max(vectors, dims)?;
+        Ok(Self::build_from_min_max(min, max))
     }
 
     /// Train from a slice of row vectors.
+    ///
+    /// Panics on invalid input. See [`Self::try_train`] for a fallible
+    /// variant that returns [`QuantError`] instead.
     pub fn train(vectors: &[Vec<f32>]) -> Self {
-        assert!(!vectors.is_empty(), "cannot train on empty corpus");
-        let dims = vectors[0].len();
-        assert!(dims > 0, "dims must be > 0");
+        Self::try_train(vectors).unwrap_or_else(|e| panic!("{e}"))
+    }
 
-        let mut min = vec![f32::INFINITY; dims];
-        let mut max = vec![f32::NEG_INFINITY; dims];
-
-        for v in vectors {
-            for (d, &x) in v.iter().enumerate() {
-                if x.is_finite() {
-                    if x < min[d] {
-                        min[d] = x;
-                    }
-                    if x > max[d] {
-                        max[d] = x;
-                    }
-                }
-            }
-        }
-
-        for d in 0..dims {
-            if !min[d].is_finite() {
-                min[d] = 0.0;
-            }
-            if !max[d].is_finite() || max[d] <= min[d] {
-                max[d] = min[d] + 1.0;
-            }
-        }
-
-        let ranges: Vec<f32> = (0..dims).map(|d| max[d] - min[d]).collect();
-        let max_range = ranges.iter().cloned().fold(0.0f32, f32::max);
-        let gs = if max_range > 1e-12 {
-            max_range / 255.0
-        } else {
-            1.0 / 255.0
-        };
-
-        let min_range_nonzero = ranges
-            .iter()
-            .cloned()
-            .filter(|&r| r > 1e-12)
-            .fold(f32::INFINITY, f32::min);
-        let anisotropy_ratio = if min_range_nonzero.is_finite() && min_range_nonzero > 0.0 {
-            max_range / min_range_nonzero
-        } else {
-            1.0
-        };
-
-        Self {
-            min,
-            gs,
-            gs_sq: gs * gs,
-            anisotropy_ratio,
-        }
+    /// Fallible variant of [`Self::train`]. Validates a non-empty corpus,
+    /// `dims > 0` (row 0's length), and that every row is the same length
+    /// (rectangular corpus); a ragged row returns [`QuantError::RaggedRow`]
+    /// instead of panicking on out-of-bounds indexing.
+    pub fn try_train(vectors: &[Vec<f32>]) -> Result<Self, QuantError> {
+        let (_dims, min, max) = row_min_max(vectors)?;
+        Ok(Self::build_from_min_max(min, max))
     }
 
     /// Encode a single vector.
+    ///
+    /// Panics if `v.len()` does not match the codec's trained dims. See
+    /// [`Self::try_encode`] for a fallible variant that returns
+    /// [`QuantError`] instead.
     #[inline]
     pub fn encode(&self, v: &[f32]) -> GsEncodedVector {
-        debug_assert_eq!(
-            v.len(),
-            self.min.len(),
-            "vector length must match codec dims"
-        );
+        self.try_encode(v).unwrap_or_else(|e| panic!("{e}"))
+    }
+
+    /// Fallible variant of [`Self::encode`]. Validates `v.len()` against the
+    /// codec's trained dims before encoding, replacing the prior
+    /// debug-only length assertion (which was compiled out in release
+    /// builds and could silently produce a malformed code vector, e.g. an
+    /// empty `v` yields an empty code vector that `is_in_distribution`
+    /// vacuously accepts and `l2_sq` scores as 0.0).
+    pub fn try_encode(&self, v: &[f32]) -> Result<GsEncodedVector, QuantError> {
+        let dims = self.min.len();
+        if v.len() != dims {
+            return Err(QuantError::EncodeLengthMismatch {
+                expected: dims,
+                got: v.len(),
+            });
+        }
+        Ok(self.encode_unchecked(v))
+    }
+
+    /// Encode a vector already validated to have `v.len() == self.min.len()`.
+    #[inline]
+    fn encode_unchecked(&self, v: &[f32]) -> GsEncodedVector {
         let inv_gs = if self.gs > 1e-12 { 1.0 / self.gs } else { 0.0 };
         let codes = v
             .iter()
@@ -595,12 +734,43 @@ impl GsSq8Codec {
     }
 
     /// Encode a batch of flat-row vectors in parallel.
+    ///
+    /// Panics on invalid input. See [`Self::try_encode_flat_par`] for a
+    /// fallible variant that returns [`QuantError`] instead.
     pub fn encode_flat_par(&self, vectors: &[f32], dims: usize) -> Vec<GsEncodedVector> {
+        self.try_encode_flat_par(vectors, dims)
+            .unwrap_or_else(|e| panic!("{e}"))
+    }
+
+    /// Fallible variant of [`Self::encode_flat_par`]. Validates `dims > 0`,
+    /// divisibility, and that `dims` matches the codec's trained dims before
+    /// dividing `vectors.len() / dims`, replacing the prior unchecked
+    /// division (panics on `dims == 0`) and silent truncation.
+    pub fn try_encode_flat_par(
+        &self,
+        vectors: &[f32],
+        dims: usize,
+    ) -> Result<Vec<GsEncodedVector>, QuantError> {
+        if dims == 0 {
+            return Err(QuantError::ZeroDims);
+        }
+        if !vectors.len().is_multiple_of(dims) {
+            return Err(QuantError::FlatLengthNotDivisible {
+                len: vectors.len(),
+                dims,
+            });
+        }
+        if dims != self.min.len() {
+            return Err(QuantError::EncodeLengthMismatch {
+                expected: self.min.len(),
+                got: dims,
+            });
+        }
         let n = vectors.len() / dims;
-        (0..n)
+        Ok((0..n)
             .into_par_iter()
-            .map(|i| self.encode(&vectors[i * dims..(i + 1) * dims]))
-            .collect()
+            .map(|i| self.encode_unchecked(&vectors[i * dims..(i + 1) * dims]))
+            .collect())
     }
 
     /// Approximate squared L2 distance.
@@ -662,6 +832,181 @@ mod tests {
 
     fn l2_sq_f32(a: &[f32], b: &[f32]) -> f32 {
         a.iter().zip(b).map(|(x, y)| (x - y) * (x - y)).sum()
+    }
+
+    // ── QUANT-AUD-002: validation regression tests ──────────────────────────
+
+    #[test]
+    fn sq8_try_train_ragged_rows_returns_error_not_panic() {
+        let vecs = vec![vec![0.0], vec![1.0, 2.0]];
+        let err = Sq8Codec::try_train(&vecs).expect_err("ragged rows must be rejected");
+        assert_eq!(
+            err,
+            QuantError::RaggedRow {
+                row: 1,
+                expected: 1,
+                got: 2
+            }
+        );
+    }
+
+    #[test]
+    fn gs_try_train_ragged_rows_returns_error_not_panic() {
+        let vecs = vec![vec![0.0], vec![1.0, 2.0]];
+        let err = GsSq8Codec::try_train(&vecs).expect_err("ragged rows must be rejected");
+        assert_eq!(
+            err,
+            QuantError::RaggedRow {
+                row: 1,
+                expected: 1,
+                got: 2
+            }
+        );
+    }
+
+    #[test]
+    fn sq8_try_train_empty_corpus_returns_error() {
+        let vecs: Vec<Vec<f32>> = vec![];
+        assert_eq!(
+            Sq8Codec::try_train(&vecs).unwrap_err(),
+            QuantError::EmptyCorpus
+        );
+    }
+
+    #[test]
+    fn sq8_try_train_flat_zero_dims_returns_error() {
+        assert_eq!(
+            Sq8Codec::try_train_flat(&[1.0, 2.0], 0).unwrap_err(),
+            QuantError::ZeroDims
+        );
+    }
+
+    #[test]
+    fn gs_try_train_flat_zero_dims_returns_error() {
+        assert_eq!(
+            GsSq8Codec::try_train_flat(&[1.0, 2.0], 0).unwrap_err(),
+            QuantError::ZeroDims
+        );
+    }
+
+    #[test]
+    fn sq8_try_train_flat_remainder_returns_error() {
+        // 5 elements is not a multiple of dims=2.
+        let err = Sq8Codec::try_train_flat(&[1.0, 2.0, 3.0, 4.0, 5.0], 2).unwrap_err();
+        assert_eq!(err, QuantError::FlatLengthNotDivisible { len: 5, dims: 2 });
+    }
+
+    #[test]
+    fn gs_try_train_flat_remainder_returns_error() {
+        let err = GsSq8Codec::try_train_flat(&[1.0, 2.0, 3.0, 4.0, 5.0], 2).unwrap_err();
+        assert_eq!(err, QuantError::FlatLengthNotDivisible { len: 5, dims: 2 });
+    }
+
+    #[test]
+    fn sq8_try_encode_shorter_input_returns_error_not_malformed_vector() {
+        let codec = Sq8Codec::train(&rand_vecs(10, 4, 1));
+        let err = codec.try_encode(&[0.0, 1.0]).unwrap_err();
+        assert_eq!(
+            err,
+            QuantError::EncodeLengthMismatch {
+                expected: 4,
+                got: 2
+            }
+        );
+    }
+
+    #[test]
+    fn sq8_try_encode_longer_input_returns_error() {
+        let codec = Sq8Codec::train(&rand_vecs(10, 4, 1));
+        let err = codec.try_encode(&[0.0, 1.0, 2.0, 3.0, 4.0]).unwrap_err();
+        assert_eq!(
+            err,
+            QuantError::EncodeLengthMismatch {
+                expected: 4,
+                got: 5
+            }
+        );
+    }
+
+    #[test]
+    fn gs_try_encode_empty_input_returns_error_not_malformed_vector() {
+        // QUANT-AUD-002: previously encode(&[]) on a trained (dims=1) codec
+        // silently returned an EMPTY code vector in release builds (the
+        // length check was debug_assert-only), which is_in_distribution
+        // vacuously accepted and l2_sq scored as 0.0. Must now be a typed
+        // error, never a malformed zero-length code vector.
+        let codec = GsSq8Codec::train_flat(&[1.0, 2.0, 3.0, 4.0], 1);
+        let err = codec.try_encode(&[]).unwrap_err();
+        assert_eq!(
+            err,
+            QuantError::EncodeLengthMismatch {
+                expected: 1,
+                got: 0
+            }
+        );
+    }
+
+    #[test]
+    fn sq8_try_encode_flat_par_zero_dims_returns_error() {
+        let codec = Sq8Codec::train(&rand_vecs(10, 4, 1));
+        assert_eq!(
+            codec.try_encode_flat_par(&[1.0, 2.0], 0).unwrap_err(),
+            QuantError::ZeroDims
+        );
+    }
+
+    #[test]
+    fn gs_try_encode_flat_par_zero_dims_returns_error() {
+        let codec = GsSq8Codec::train(&rand_vecs(10, 4, 1));
+        assert_eq!(
+            codec.try_encode_flat_par(&[1.0, 2.0], 0).unwrap_err(),
+            QuantError::ZeroDims
+        );
+    }
+
+    #[test]
+    fn sq8_try_encode_flat_par_remainder_returns_error() {
+        let codec = Sq8Codec::train(&rand_vecs(10, 4, 1));
+        let flat: Vec<f32> = (0..9).map(|i| i as f32).collect(); // 9 not a multiple of 4
+        assert_eq!(
+            codec.try_encode_flat_par(&flat, 4).unwrap_err(),
+            QuantError::FlatLengthNotDivisible { len: 9, dims: 4 }
+        );
+    }
+
+    #[test]
+    fn sq8_try_encode_flat_par_dims_mismatch_returns_error() {
+        let codec = Sq8Codec::train(&rand_vecs(10, 4, 1));
+        let flat: Vec<f32> = (0..6).map(|i| i as f32).collect();
+        let err = codec.try_encode_flat_par(&flat, 3).unwrap_err();
+        assert_eq!(
+            err,
+            QuantError::EncodeLengthMismatch {
+                expected: 4,
+                got: 3
+            }
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "row 1 has length 2, expected 1")]
+    fn sq8_train_still_panics_with_typed_message_on_ragged_rows() {
+        // The panicking convenience wrapper is preserved for existing callers,
+        // but must now surface the typed QuantError message rather than
+        // panicking from a raw out-of-bounds index.
+        let _ = Sq8Codec::train(&[vec![0.0], vec![1.0, 2.0]]);
+    }
+
+    #[test]
+    fn sq8_try_train_and_encode_roundtrip_matches_panicking_api() {
+        let vecs = rand_vecs(20, 8, 7);
+        let a = Sq8Codec::train(&vecs);
+        let b = Sq8Codec::try_train(&vecs).expect("valid corpus must train");
+        assert_eq!(a.min, b.min);
+        assert_eq!(a.scale, b.scale);
+        let ea = a.encode(&vecs[0]);
+        let eb = b.try_encode(&vecs[0]).expect("valid vector must encode");
+        assert_eq!(ea.codes, eb.codes);
     }
 
     // ── Sq8Codec tests ──────────────────────────────────────────────────────
@@ -850,6 +1195,45 @@ mod tests {
             assert_eq!(s.codes, p.codes);
             assert!((s.soc_sum - p.soc_sum).abs() < 1e-5);
         }
+    }
+
+    #[test]
+    fn sq8_try_encode_par_short_row_returns_error_not_panic() {
+        let codec = Sq8Codec::train(&rand_vecs(10, 4, 1));
+        let mut rows = rand_vecs(5, 4, 2);
+        rows[3] = vec![0.0, 1.0];
+        let err = codec.try_encode_par(&rows).unwrap_err();
+        assert_eq!(
+            err,
+            QuantError::EncodeLengthMismatch {
+                expected: 4,
+                got: 2
+            }
+        );
+    }
+
+    #[test]
+    fn sq8_try_encode_par_long_row_returns_error_not_panic() {
+        let codec = Sq8Codec::train(&rand_vecs(10, 4, 1));
+        let mut rows = rand_vecs(5, 4, 2);
+        rows[3] = vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0];
+        let err = codec.try_encode_par(&rows).unwrap_err();
+        assert_eq!(
+            err,
+            QuantError::EncodeLengthMismatch {
+                expected: 4,
+                got: 6
+            }
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "vector length 2 does not match codec dims 4")]
+    fn sq8_encode_par_still_panics_with_typed_message_on_short_row() {
+        let codec = Sq8Codec::train(&rand_vecs(10, 4, 1));
+        let mut rows = rand_vecs(5, 4, 2);
+        rows[3] = vec![0.0, 1.0];
+        let _ = codec.encode_par(&rows);
     }
 
     #[test]
