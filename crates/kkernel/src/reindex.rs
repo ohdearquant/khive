@@ -788,10 +788,25 @@ fn finish(report: &ReindexReport, best_effort: bool) -> Result<()> {
     result
 }
 
+/// Escape SQLite `LIKE` wildcard characters (`%`, `_`) and the escape
+/// character itself (`\`) so a caller-supplied namespace is matched literally
+/// under `LIKE ... ESCAPE '\'` rather than as a pattern (#819: an
+/// underscore-bearing namespace like `a_b` must not also match `aXb`).
+fn escape_like(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    for c in input.chars() {
+        if matches!(c, '\\' | '%' | '_') {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}
+
 async fn invalidate_vamana_snapshots(rt: &KhiveRuntime, namespace: &str) -> anyhow::Result<()> {
     use khive_storage::types::{SqlStatement, SqlValue};
 
-    let pattern = format!("{namespace}::vamana::%");
+    let pattern = format!("{}::vamana::%", escape_like(namespace));
     let sql = rt.sql();
     let mut writer = sql
         .writer()
@@ -800,7 +815,7 @@ async fn invalidate_vamana_snapshots(rt: &KhiveRuntime, namespace: &str) -> anyh
 
     match writer
         .execute(SqlStatement {
-            sql: "DELETE FROM retrieval_snapshots WHERE namespace LIKE ?1".into(),
+            sql: "DELETE FROM retrieval_snapshots WHERE namespace LIKE ?1 ESCAPE '\\'".into(),
             params: vec![SqlValue::Text(pattern)],
             label: Some("invalidate_vamana_snapshots".into()),
         })
@@ -1309,6 +1324,78 @@ mod tests {
         assert!(
             !remaining.contains(&"local::vamana::model-b".to_string()),
             "local vamana model-b must be deleted: {remaining:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_reindex_invalidate_does_not_cross_underscore_namespace() {
+        let rt = KhiveRuntime::memory().expect("in-memory runtime");
+        let sql = rt.sql();
+
+        let mut w = sql.writer().await.expect("writer");
+        w.execute_script(
+            "CREATE TABLE IF NOT EXISTS retrieval_snapshots (\
+             namespace TEXT NOT NULL, \
+             index_type TEXT NOT NULL, \
+             snapshot BLOB NOT NULL, \
+             created_at INTEGER NOT NULL, \
+             PRIMARY KEY (namespace, index_type));"
+                .into(),
+        )
+        .await
+        .expect("create table");
+
+        // "a_b" and "aXb" are distinct namespaces (the `_` in "a_b" is a
+        // literal underscore, not a wildcard). Before #819's fix, invalidating
+        // "a_b" also deleted "aXb"'s row because `_` is a single-character
+        // LIKE wildcard.
+        for ns in &["a_b::vamana::model-a", "aXb::vamana::model-a"] {
+            w.execute(SqlStatement {
+                sql: "INSERT INTO retrieval_snapshots \
+                      (namespace, index_type, snapshot, created_at) \
+                      VALUES (?1, ?2, ?3, 0)"
+                    .into(),
+                params: vec![
+                    SqlValue::Text(ns.to_string()),
+                    SqlValue::Text("vamana".to_string()),
+                    SqlValue::Blob(b"{}".to_vec()),
+                ],
+                label: None,
+            })
+            .await
+            .expect("insert row");
+        }
+        drop(w);
+
+        invalidate_vamana_snapshots(&rt, "a_b")
+            .await
+            .expect("invalidate");
+
+        let mut r = sql.reader().await.expect("reader");
+        let rows = r
+            .query_all(SqlStatement {
+                sql: "SELECT namespace FROM retrieval_snapshots ORDER BY namespace".into(),
+                params: vec![],
+                label: None,
+            })
+            .await
+            .expect("query");
+
+        let remaining: Vec<String> = rows
+            .iter()
+            .filter_map(|row| match row.get("namespace") {
+                Some(SqlValue::Text(s)) => Some(s.clone()),
+                _ => None,
+            })
+            .collect();
+
+        assert!(
+            remaining.contains(&"aXb::vamana::model-a".to_string()),
+            "unrelated namespace 'aXb' must survive invalidating 'a_b': {remaining:?}"
+        );
+        assert!(
+            !remaining.contains(&"a_b::vamana::model-a".to_string()),
+            "'a_b' own snapshot must still be deleted: {remaining:?}"
         );
     }
 
