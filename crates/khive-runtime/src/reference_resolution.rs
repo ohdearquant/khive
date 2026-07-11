@@ -324,10 +324,17 @@ async fn exact_name_match(
     entity_kind: Option<&str>,
 ) -> RuntimeResult<Option<ReferenceResolution>> {
     let filter = EntityFilter {
-        name_prefix: Some(name.to_string()),
+        name_exact: Some(name.to_string()),
         kinds: entity_kind.map(|k| vec![k.to_string()]).unwrap_or_default(),
         ..EntityFilter::default()
     };
+    // A storage-level `name = ?` predicate (not `name_prefix` + in-memory
+    // filter) so a namespace with many newer case variants of `name` can
+    // never page the exact target out from under a `created_at DESC` sort
+    // (#849, #852) — every row this query returns already equals `name`.
+    // The page is small (10, not 1): a single hit still needs `Resolved`,
+    // but multiple hits must surface every candidate for `Ambiguous`, the
+    // same way the ring and search stages report their candidate sets.
     let page = runtime
         .entities(token)?
         .query_entities(
@@ -335,7 +342,7 @@ async fn exact_name_match(
             filter,
             PageRequest {
                 offset: 0,
-                limit: 100,
+                limit: 10,
             },
         )
         .await
@@ -344,7 +351,6 @@ async fn exact_name_match(
     let exact: Vec<ReferenceCandidate> = page
         .items
         .into_iter()
-        .filter(|e| e.name == name)
         .map(|e| ReferenceCandidate {
             id: e.id,
             name: Some(e.name),
@@ -518,5 +524,59 @@ mod tests {
             .await
             .expect("resolve_reference");
         assert_eq!(resolution, ReferenceResolution::NotFound);
+    }
+
+    // Regression for #849/#852: the stage-3 exact-name lookup used to filter
+    // `name_prefix` (`LIKE 'RoLoRA%'`) in memory, and `query_entities` ranks
+    // a `name_prefix` page by `CASE WHEN LOWER(name) = prefix THEN 0 ELSE 1
+    // END, created_at DESC`. Case-insensitive variants of the target name
+    // tie for priority 0 with the true exact match, so 100+ *newer*
+    // lowercase variants can fill the `LIMIT 100` page and page the older,
+    // case-exact target out entirely — the stage then falls through to
+    // hybrid search instead of resolving deterministically. The fix issues a
+    // storage-level `name = ?` (binary) predicate instead, so decoys that
+    // merely match case-insensitively never enter the result set at all.
+    #[tokio::test]
+    async fn exact_name_stage_survives_many_newer_case_variant_decoys() {
+        let rt = KhiveRuntime::memory().expect("in-memory runtime");
+        let token = actor_token("resolver-test");
+        let ring = ReferenceRing::new();
+
+        let target = rt
+            .create_entity(&token, "concept", None, "RoLoRA", None, None, vec![])
+            .await
+            .expect("create target entity");
+
+        // Case variants of the same name, not suffixed variants: SQLite's
+        // `LIKE` is case-insensitive for ASCII, so a `rolora`-named decoy
+        // still matches the `LIKE 'RoLoRA%'` pattern the buggy `name_prefix`
+        // stage used, and the exact-match-ranking `CASE WHEN LOWER(name) =
+        // ...` ties every one of these decoys with the true target at
+        // priority 0 — leaving `created_at DESC` as the only tiebreak.
+        let decoy_cases = ["rolora", "ROLORA", "RoLoRa", "roLORA"];
+        for i in 0..120 {
+            rt.create_entity(
+                &token,
+                "concept",
+                None,
+                decoy_cases[i % decoy_cases.len()],
+                None,
+                None,
+                vec![],
+            )
+            .await
+            .expect("create decoy entity");
+        }
+
+        let resolution = resolve_reference(&rt, &ring, &token, "RoLoRA", 5, None)
+            .await
+            .expect("resolve_reference");
+        assert_eq!(
+            resolution,
+            ReferenceResolution::Resolved {
+                id: target.id,
+                confidence: EXACT_NAME_CONFIDENCE,
+            }
+        );
     }
 }
