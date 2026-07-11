@@ -24,16 +24,18 @@ requires a separate calibration pass (`bench_calibrate.py`, `K>=10` same-SHA
 runs) plus a `>=2`-week zero-alarm observation window - not a one-off PR
 decision.
 
-### Record shape (`schema_version: 1`)
+### Record shape (`schema_version: 2`)
 
 One JSON object per line, appended to `bench-data/<suite>.jsonl`:
 
 ```json
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "suite": "components",
   "sha": "<full commit sha>",
   "branch": "main",
+  "run_id": "<$GITHUB_RUN_ID, or 'local' outside CI>",
+  "run_attempt": "<$GITHUB_RUN_ATTEMPT, or '1' outside CI>",
   "timestamp": "<commit's own commit-date, ISO8601>",
   "metrics": { "khive-score/score_ops.mean_ns": 42.3, "...": "..." },
   "host": { "os": "Linux", "arch": "x86_64", "python": "3.12.1", "cpu_count": 4, "runner": "..." }
@@ -46,6 +48,16 @@ workflow re-run) carries an identical, reproducible timestamp rather than
 drifting with runner scheduling. It falls back to wall-clock only when git
 cannot resolve the sha (a synthetic sha, or a shallow checkout missing the
 commit).
+
+`run_id`/`run_attempt` identify the workflow run a record belongs to
+(`--run-id`/`--run-attempt`, defaulting to `$GITHUB_RUN_ID`/
+`$GITHUB_RUN_ATTEMPT`, then `"local"`/`"1"` outside CI). `_aggregate_shards`
+keys on `(sha, run_id, run_attempt)`, not sha alone, so a rerun of the same
+commit is a distinct logical run in the trend - a pass-then-fail rerun of
+one sha never blends one run's metrics with the other run's gate/host/error
+provenance. A metric name written twice within the SAME run is a collision,
+not an error: the later shard's value wins and the name is surfaced in the
+rendered trend's `metric_collisions`.
 
 ### Commands
 

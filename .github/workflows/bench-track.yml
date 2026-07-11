@@ -138,18 +138,32 @@ jobs:
           timeout 600 cargo bench "${pkg_args[@]}" -- --quick || true
 
       - name: Record trend ledger entry
+        id: record
+        # Captures bench_track.py's own exit code into $GITHUB_OUTPUT instead
+        # of letting a nonzero exit fail this step outright (round-3 finding:
+        # the step used to fail here, before the publish step ran, so an
+        # error record it had already written to local disk never reached
+        # perf-data - `if: success()` on publish silently skipped it). `set
+        # +e` plus an explicit `exit 0` keep this step green so publish/
+        # summary/upload below always run; the captured code is enforced by
+        # the final "Fail job" step after publish has had its chance.
         run: |
-          set -euo pipefail
+          set +e
           python3 scripts/perf/bench_track.py record \
             --suite components \
             --source criterion \
             --criterion-dir crates/target/criterion \
             --sha "$GITHUB_SHA" \
             --branch "$GITHUB_REF_NAME" \
+            --run-id "$GITHUB_RUN_ID" \
+            --run-attempt "$GITHUB_RUN_ATTEMPT" \
             --data-dir bench-data \
             --summary-out /tmp/components-trend.md
+          echo "exit_code=$?" >> "$GITHUB_OUTPUT"
+          exit 0
 
       - name: Publish ledger to perf-data branch
+        if: ${{ !cancelled() }}
         run: bash scripts/perf/publish_ledger.sh bench-data/components.jsonl
 
       - name: Write step summary
@@ -164,6 +178,14 @@ jobs:
           path: crates/target/criterion
           retention-days: 90
           if-no-files-found: ignore
+
+      - name: Fail job if trend ledger record errored
+        if: ${{ !cancelled() && steps.record.outputs.exit_code != '0' }}
+        env:
+          RECORD_EXIT_CODE: ${{ steps.record.outputs.exit_code }}
+        run: |
+          echo "bench_track.py record exited ${RECORD_EXIT_CODE} for suite=components shard=${{ matrix.shard }}; its status=error record was still published above (see 'Publish ledger to perf-data branch')." >&2
+          exit "${RECORD_EXIT_CODE}"
 
   # ─────────────────────────────────────────────────────────────────────────
   # e2e benches: the pipeline daemon suite (bench_calibrate's `pipeline`
@@ -203,17 +225,26 @@ jobs:
           cp crates/target/release/kkernel crates/target/release/kkernel-bench
 
       - name: Record pipeline suite (single informational run)
+        id: record_pipeline
         env:
           KKERNEL_BENCH_BINARY: crates/target/release/kkernel-bench
+        # Captures bench_track.py's own exit code instead of failing the
+        # step outright (round-3 finding: this step failing before publish
+        # ran meant an already-written error record never reached
+        # perf-data). See the "Fail job" step at the end of this job.
         run: |
-          set -euo pipefail
+          set +e
           python3 scripts/perf/bench_track.py record \
             --suite pipeline \
             --source calibrate \
             --sha "$GITHUB_SHA" \
             --branch "$GITHUB_REF_NAME" \
+            --run-id "$GITHUB_RUN_ID" \
+            --run-attempt "$GITHUB_RUN_ATTEMPT" \
             --data-dir bench-data \
             --summary-out /tmp/pipeline-trend.md
+          echo "exit_code=$?" >> "$GITHUB_OUTPUT"
+          exit 0
 
       - name: Run hermetic bench-1m synthetic gate (informational, --runs 1)
         id: bench_1m
@@ -234,19 +265,25 @@ jobs:
           echo "exit_code=$?" >> "$GITHUB_OUTPUT"
 
       - name: Record bench-1m suite (single informational run)
+        id: record_bench_1m
         run: |
-          set -euo pipefail
+          set +e
           python3 scripts/perf/bench_track.py record \
             --suite bench-1m \
             --source json \
             --json-file target/bench-out/SIFT-CI-synthetic.json \
             --sha "$GITHUB_SHA" \
             --branch "$GITHUB_REF_NAME" \
+            --run-id "$GITHUB_RUN_ID" \
+            --run-attempt "$GITHUB_RUN_ATTEMPT" \
             --data-dir bench-data \
             --gate-exit-code "${{ steps.bench_1m.outputs.exit_code }}" \
             --summary-out /tmp/bench-1m-trend.md
+          echo "exit_code=$?" >> "$GITHUB_OUTPUT"
+          exit 0
 
       - name: Publish ledgers to perf-data branch
+        if: ${{ !cancelled() }}
         run: bash scripts/perf/publish_ledger.sh bench-data/pipeline.jsonl bench-data/bench-1m.jsonl
 
       - name: Write step summary
@@ -266,3 +303,15 @@ jobs:
             perf/ci-synthetic-ledger.csv
           retention-days: 90
           if-no-files-found: ignore
+
+      - name: Fail job if trend ledger record errored
+        if: ${{ !cancelled() && (steps.record_pipeline.outputs.exit_code != '0' || steps.record_bench_1m.outputs.exit_code != '0') }}
+        env:
+          PIPELINE_EXIT_CODE: ${{ steps.record_pipeline.outputs.exit_code }}
+          BENCH_1M_RECORD_EXIT_CODE: ${{ steps.record_bench_1m.outputs.exit_code }}
+        run: |
+          echo "bench_track.py record failed: pipeline exit=${PIPELINE_EXIT_CODE} bench-1m exit=${BENCH_1M_RECORD_EXIT_CODE}; status=error record(s) were still published above (see 'Publish ledgers to perf-data branch')." >&2
+          if [ "${PIPELINE_EXIT_CODE}" != "0" ]; then
+            exit "${PIPELINE_EXIT_CODE}"
+          fi
+          exit "${BENCH_1M_RECORD_EXIT_CODE}"

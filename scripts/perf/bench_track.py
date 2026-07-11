@@ -20,9 +20,16 @@ Three metric sources, one record shape:
               (target/criterion/**/{new,base}/estimates.json) and extract
               mean/median/std_dev point estimates (nanoseconds) per bench id.
 
-Record shape (schema_version 1):
-  {schema_version, suite, sha, branch, timestamp, metrics, host,
-   status, error, gate_exit_code, gate_status}
+Record shape (schema_version 2):
+  {schema_version, suite, sha, branch, run_id, run_attempt, timestamp,
+   metrics, host, status, error, gate_exit_code, gate_status}
+
+`run_id`/`run_attempt` (schema_version 2, round-3 finding) come from
+`$GITHUB_RUN_ID`/`$GITHUB_RUN_ATTEMPT` and default to "local"/"1" outside
+CI. Aggregation keys on (sha, run_id, run_attempt), not sha alone - a
+rerun of the same commit (same sha, new run_id) is a distinct logical run
+in the ledger, so a pass-then-fail rerun cannot blend one run's metrics
+with the other run's gate/error/host provenance.
 
 `timestamp` is the commit's own commit-date (`git show -s --format=%cI`), not
 wall-clock `time.time()` - two CI runs at the same SHA (e.g. a re-run) then
@@ -39,10 +46,19 @@ suite's own advisory verdict alongside its metrics.
 
 The `components` suite is sharded 4 ways across matrix jobs
 (.github/workflows/bench-track.yml); each shard appends its own partial
-record for the same sha. `_aggregate_shards` merges same-sha records before
-windowing/rendering so the trend summary treats one workflow run (one sha)
-as one logical row with the full union of every shard's metrics, not one
-row per shard.
+record for the same sha. `_aggregate_shards` merges records sharing the
+same (sha, run_id, run_attempt) - not sha alone - before windowing/
+rendering, so the trend summary treats one workflow run as one logical row
+with the full union of every shard's metrics. Keying on sha alone would
+silently merge two DIFFERENT workflow runs at the same sha (e.g. a
+pass-then-fail rerun): host/timestamp/error/gate provenance from the two
+runs would mix into one row. `run_id`/`run_attempt` come from
+`$GITHUB_RUN_ID`/`$GITHUB_RUN_ATTEMPT` (workflow-passed via `--run-id`/
+`--run-attempt`, defaulting to "local"/"1" outside CI) and are recorded on
+every record. A metric name written by two shards of the SAME run is a
+collision, not an error: the later shard's value wins (ledger append
+order) and the name is listed in the merged record's `metric_collisions`
+so it stays visible in the rendered trend instead of silently vanishing.
 """
 
 from __future__ import annotations
@@ -58,7 +74,7 @@ import sys
 sys.path.insert(0, str(pathlib.Path(__file__).parent))
 import bench_calibrate as calibrate  # noqa: E402  (path insert must precede this)
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 REPO_ROOT = calibrate.REPO_ROOT
 DATA_DIR = REPO_ROOT / "bench-data"
 
@@ -175,7 +191,11 @@ def _run_once_no_gate(
         text=True,
         start_new_session=True,
     )
-    pgid = os.getpgid(proc.pid)
+    # start_new_session=True makes this child a session leader, whose pgid
+    # is its own pid by definition - no os.getpgid(proc.pid) lookup needed,
+    # and none of the ProcessLookupError race a lookup risks if the child
+    # has already exited by the time we ask.
+    pgid = proc.pid
     try:
         stdout, stderr = proc.communicate(timeout=suite["timeout_s"])
     except subprocess.TimeoutExpired:
@@ -291,6 +311,8 @@ def build_record(
     sha: str,
     branch: str,
     gate_exit_code: int | None = None,
+    run_id: str = "local",
+    run_attempt: str = "1",
 ) -> dict:
     gate_status = None
     if gate_exit_code is not None:
@@ -300,6 +322,8 @@ def build_record(
         "suite": suite,
         "sha": sha,
         "branch": branch,
+        "run_id": run_id,
+        "run_attempt": run_attempt,
         "timestamp": _commit_timestamp(sha),
         "metrics": metrics,
         "host": host_fingerprint(),
@@ -310,7 +334,14 @@ def build_record(
     }
 
 
-def build_error_record(suite: str, sha: str, branch: str, error: str) -> dict:
+def build_error_record(
+    suite: str,
+    sha: str,
+    branch: str,
+    error: str,
+    run_id: str = "local",
+    run_attempt: str = "1",
+) -> dict:
     """A build/extraction failure still gets a ledger row - `status: "error"`,
     empty metrics, and the failure message - instead of raising before
     `append_record` ever runs and leaving the ledger silently missing that
@@ -321,6 +352,8 @@ def build_error_record(suite: str, sha: str, branch: str, error: str) -> dict:
         "suite": suite,
         "sha": sha,
         "branch": branch,
+        "run_id": run_id,
+        "run_attempt": run_attempt,
         "timestamp": _commit_timestamp(sha),
         "metrics": {},
         "host": host_fingerprint(),
@@ -359,34 +392,56 @@ def read_records(suite: str, data_dir: pathlib.Path = DATA_DIR) -> list[dict]:
 
 
 def _aggregate_shards(records: list[dict]) -> list[dict]:
-    """Merge same-sha records into one logical run per commit.
+    """Merge records sharing the same (sha, run_id, run_attempt) into one
+    logical run.
 
     The `components` suite is sharded 4 ways (bench-track.yml matrix); each
     shard job appends its own partial record for the same sha independently.
     Without this, the raw ledger holds up to 4 rows per commit and a naive
     "last record" read only sees whichever shard happened to append last -
     both undercounting distinct commits as separate "runs" and dropping
-    every other shard's metrics from the rendered trend. Records are merged
-    in ledger (append) order, keyed by sha, preserving first-seen order so
-    the result stays chronological; a later shard's metrics are unioned in,
-    and an "error" status from any shard is never masked by a later
-    "ok" shard.
+    every other shard's metrics from the rendered trend.
+
+    Keying on sha ALONE (round-3 finding) is wrong: a rerun of the same
+    commit - same sha, new `run_id` - would then merge into the FIRST run's
+    row, so a pass-then-fail rerun could leave a merged record whose
+    metrics came from the failing rerun but whose `gate_status` stayed
+    "pass" from the first run, with host/timestamp/error mixed across two
+    unrelated attempts. Keying on (sha, run_id, run_attempt) keeps every
+    workflow run - including reruns of the same sha - as its own logical
+    row; only shards from the SAME run merge.
+
+    Records are merged in ledger (append) order, preserving first-seen key
+    order so the result stays chronological; a later shard's metrics are
+    unioned in, and an "error" status from any shard is never masked by a
+    later "ok" shard. If two shards of the SAME run report the same metric
+    name (should not happen for distinct crate shards, but is not assumed
+    impossible), the later shard's value wins - ledger append order - and
+    the name is recorded in `metric_collisions` so it stays visible in the
+    rendered trend instead of silently disappearing.
     """
-    order: list[str] = []
-    merged: dict[str, dict] = {}
+    order: list[tuple] = []
+    merged: dict[tuple, dict] = {}
     for rec in records:
-        sha = rec["sha"]
-        if sha not in merged:
-            order.append(sha)
+        key = (rec["sha"], rec.get("run_id", "local"), rec.get("run_attempt", "1"))
+        if key not in merged:
+            order.append(key)
             agg = dict(rec)
             agg["metrics"] = dict(rec.get("metrics", {}))
-            merged[sha] = agg
+            agg["metric_collisions"] = []
+            merged[key] = agg
         else:
-            merged[sha]["metrics"].update(rec.get("metrics", {}))
-            if rec.get("status") == "error" and merged[sha].get("status") != "error":
-                merged[sha]["status"] = "error"
-                merged[sha]["error"] = rec.get("error")
-    return [merged[sha] for sha in order]
+            agg = merged[key]
+            incoming = rec.get("metrics", {})
+            collisions = [name for name in incoming if name in agg["metrics"]]
+            for name in collisions:
+                if name not in agg["metric_collisions"]:
+                    agg["metric_collisions"].append(name)
+            agg["metrics"].update(incoming)
+            if rec.get("status") == "error" and agg.get("status") != "error":
+                agg["status"] = "error"
+                agg["error"] = rec.get("error")
+    return [merged[key] for key in order]
 
 
 def _arrow(prev: float, curr: float) -> str:
@@ -408,11 +463,19 @@ def render_trend_markdown(suite: str, limit: int = 10, data_dir: pathlib.Path = 
     window = all_records[-limit:]
     latest = window[-1]
     lines.append(f"- runs in window: {len(window)} (of {len(all_records)} total)")
-    lines.append(f"- latest sha: `{latest['sha'][:8]}` ({latest['branch']}) at {latest['timestamp']}")
+    lines.append(
+        f"- latest sha: `{latest['sha'][:8]}` ({latest['branch']}) at {latest['timestamp']} "
+        f"[run {latest.get('run_id', 'local')}/attempt {latest.get('run_attempt', '1')}]"
+    )
     if latest.get("status") == "error":
         lines.append(f"- LATEST RUN FAILED (build/extraction error): {latest.get('error')}")
     elif latest.get("gate_status") is not None:
         lines.append(f"- latest gate outcome: {latest['gate_status']} (exit {latest.get('gate_exit_code')})")
+    if latest.get("metric_collisions"):
+        lines.append(
+            "- metric name collisions within this run (last-write-wins, later shard kept): "
+            + ", ".join(latest["metric_collisions"])
+        )
     lines.append("")
     lines.append(
         "Informational only - no thresholds, per the bench-program spec's promotion ladder. "
@@ -444,6 +507,14 @@ def _cmd_record(args: argparse.Namespace) -> int:
     sha = args.sha or _git_sha()
     branch = args.branch or _current_branch()
     data_dir = pathlib.Path(args.data_dir) if args.data_dir else DATA_DIR
+    # `run_id`/`run_attempt` identify the workflow run/rerun a shard's record
+    # belongs to (round-3 finding: aggregating on sha alone mixes reruns of
+    # the same commit into one row). --run-id/--run-attempt let the workflow
+    # pass $GITHUB_RUN_ID/$GITHUB_RUN_ATTEMPT explicitly; falling back to
+    # those same env vars covers a caller that forgets the flags but still
+    # runs under Actions, and "local"/"1" covers local/test invocations.
+    run_id = getattr(args, "run_id", None) or os.environ.get("GITHUB_RUN_ID") or "local"
+    run_attempt = getattr(args, "run_attempt", None) or os.environ.get("GITHUB_RUN_ATTEMPT") or "1"
 
     try:
         if args.source == "calibrate":
@@ -458,14 +529,24 @@ def _cmd_record(args: argparse.Namespace) -> int:
             metrics = collect_criterion_metrics(criterion_dir)
         else:  # pragma: no cover - argparse choices already constrain this
             raise SystemExit(f"unknown source {args.source!r}")
-    except (SystemExit, calibrate.SchemaError, calibrate.ChildFailure, OSError, json.JSONDecodeError) as exc:
+    except (
+        SystemExit,
+        calibrate.SchemaError,
+        calibrate.ChildFailure,
+        OSError,
+        json.JSONDecodeError,
+        subprocess.TimeoutExpired,
+    ) as exc:
         # A build/extraction failure (no output produced, malformed JSON, a
-        # crashed child) must still leave a ledger row - otherwise this
-        # commit's data point is silently missing rather than visibly
-        # marked as failed. Write the error record FIRST, then surface the
-        # failure so the workflow step still goes red.
+        # crashed child, or a suite that ran past its timeout - round-3
+        # finding: TimeoutExpired was not caught here, so a timed-out suite
+        # raised past this function instead of leaving a ledger row) must
+        # still leave a ledger row - otherwise this commit's data point is
+        # silently missing rather than visibly marked as failed. Write the
+        # error record FIRST, then surface the failure so the workflow step
+        # still goes red.
         message = str(exc.code) if isinstance(exc, SystemExit) else str(exc)
-        error_record = build_error_record(args.suite, sha, branch, message)
+        error_record = build_error_record(args.suite, sha, branch, message, run_id=run_id, run_attempt=run_attempt)
         path = append_record(error_record, data_dir)
         print(
             f"[bench_track] build/extraction FAILED for suite={args.suite} sha={sha[:8]} "
@@ -475,7 +556,9 @@ def _cmd_record(args: argparse.Namespace) -> int:
         print(f"[bench_track] error: {message}", file=sys.stderr)
         return 1
 
-    record = build_record(args.suite, metrics, sha, branch, gate_exit_code=args.gate_exit_code)
+    record = build_record(
+        args.suite, metrics, sha, branch, gate_exit_code=args.gate_exit_code, run_id=run_id, run_attempt=run_attempt
+    )
     path = append_record(record, data_dir)
     print(f"[bench_track] appended {len(metrics)} metrics for suite={args.suite} sha={sha[:8]} -> {path}")
 
@@ -529,6 +612,14 @@ def main(argv: list[str] | None = None) -> int:
     )
     rec.add_argument("--sha", help="commit sha to record (default: current HEAD)")
     rec.add_argument("--branch", help="branch name to record (default: $GITHUB_REF_NAME or current branch)")
+    rec.add_argument(
+        "--run-id",
+        help="workflow run id this record belongs to (default: $GITHUB_RUN_ID or 'local')",
+    )
+    rec.add_argument(
+        "--run-attempt",
+        help="workflow run attempt this record belongs to (default: $GITHUB_RUN_ATTEMPT or '1')",
+    )
     rec.add_argument("--data-dir", help="ledger directory (default: bench-data/)")
     rec.add_argument("--limit", type=int, default=10, help="runs to include in the rendered trend (default: 10)")
     rec.add_argument("--summary-out", help="write the rendered trend markdown to this path")

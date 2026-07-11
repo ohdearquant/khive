@@ -315,6 +315,152 @@ class ShardAggregationTests(unittest.TestCase):
         self.assertIn("khive-hnsw/hnsw_build.mean_ns", aggregated[0]["metrics"])
 
 
+class TimeoutRecordTests(unittest.TestCase):
+    """Round-3 finding: `_run_once_no_gate` re-raises `subprocess.TimeoutExpired`
+    on a suite that runs past its timeout, but `_cmd_record`'s except tuple
+    did not catch it - a timed-out suite raised straight past `_cmd_record`
+    instead of leaving a status=error ledger row. Registers a synthetic
+    bench_calibrate suite whose child sleeps well past a 1s timeout.
+    """
+
+    SUITE_NAME = "_test_timeout_suite"
+
+    def setUp(self):
+        def build_cmd(run_dir, extra_args):
+            return [sys.executable, "-c", "import time; time.sleep(30)"]
+
+        def extract(run_dir, proc):
+            return {"unused": 0.0}
+
+        bench_calibrate.SUITES[self.SUITE_NAME] = {
+            "build_cmd": build_cmd,
+            "extract": extract,
+            "default_args": [],
+            "timeout_s": 1,
+        }
+        self.addCleanup(bench_calibrate.SUITES.pop, self.SUITE_NAME, None)
+
+    def test_timeout_writes_error_record_instead_of_raising(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = pathlib.Path(tmp)
+            args = argparse.Namespace(
+                suite=self.SUITE_NAME,
+                source="calibrate",
+                json_file=None,
+                json_prefix="",
+                criterion_dir=None,
+                extra_arg=[],
+                run_dir=str(data_dir / "run"),
+                gate_exit_code=None,
+                run_id=None,
+                run_attempt=None,
+                sha="f" * 40,
+                branch="main",
+                data_dir=str(data_dir),
+                limit=10,
+                summary_out=None,
+            )
+            rc = bench_track._cmd_record(args)
+            self.assertEqual(rc, 1)
+
+            records = bench_track.read_records(self.SUITE_NAME, data_dir=data_dir)
+            self.assertEqual(len(records), 1)
+            self.assertEqual(records[0]["status"], "error")
+            self.assertIn("timed out", records[0]["error"].lower())
+
+
+class RunIdAggregationTests(unittest.TestCase):
+    """Round-3 finding: keying `_aggregate_shards` on sha alone lets a rerun
+    of the same commit (same sha, new run_id) merge into the FIRST run's
+    row - a pass-then-fail rerun then produces one logical run whose
+    metrics came from the failing rerun but whose gate_status stayed
+    "pass" from the first run. Keying on (sha, run_id, run_attempt) keeps
+    every workflow run - including reruns of the same sha - as its own row.
+    """
+
+    def test_same_sha_different_run_id_stays_separate(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = pathlib.Path(tmp)
+            sha = "a" * 40
+            rec1 = bench_track.build_record("components", {"m": 1.0}, sha, "main", run_id="100", run_attempt="1")
+            rec2 = bench_track.build_record("components", {"m": 2.0}, sha, "main", run_id="200", run_attempt="1")
+            bench_track.append_record(rec1, data_dir=data_dir)
+            bench_track.append_record(rec2, data_dir=data_dir)
+            aggregated = bench_track._aggregate_shards(bench_track.read_records("components", data_dir=data_dir))
+            self.assertEqual(len(aggregated), 2)
+            self.assertEqual({r["metrics"]["m"] for r in aggregated}, {1.0, 2.0})
+
+    def test_same_sha_same_run_id_different_attempt_stays_separate(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = pathlib.Path(tmp)
+            sha = "b" * 40
+            rec1 = bench_track.build_record("components", {"m": 1.0}, sha, "main", run_id="100", run_attempt="1")
+            rec2 = bench_track.build_record("components", {"m": 2.0}, sha, "main", run_id="100", run_attempt="2")
+            bench_track.append_record(rec1, data_dir=data_dir)
+            bench_track.append_record(rec2, data_dir=data_dir)
+            aggregated = bench_track._aggregate_shards(bench_track.read_records("components", data_dir=data_dir))
+            self.assertEqual(len(aggregated), 2)
+
+    def test_same_sha_same_run_id_same_attempt_still_merges_like_shards(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = pathlib.Path(tmp)
+            sha = "c" * 40
+            rec1 = bench_track.build_record("components", {"a": 1.0}, sha, "main", run_id="100", run_attempt="1")
+            rec2 = bench_track.build_record("components", {"b": 2.0}, sha, "main", run_id="100", run_attempt="1")
+            bench_track.append_record(rec1, data_dir=data_dir)
+            bench_track.append_record(rec2, data_dir=data_dir)
+            aggregated = bench_track._aggregate_shards(bench_track.read_records("components", data_dir=data_dir))
+            self.assertEqual(len(aggregated), 1)
+            self.assertEqual(aggregated[0]["metrics"], {"a": 1.0, "b": 2.0})
+
+    def test_duplicate_metric_name_within_run_last_write_wins_and_flagged(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = pathlib.Path(tmp)
+            sha = "d" * 40
+            rec1 = bench_track.build_record("components", {"dup": 1.0}, sha, "main", run_id="100", run_attempt="1")
+            rec2 = bench_track.build_record("components", {"dup": 2.0}, sha, "main", run_id="100", run_attempt="1")
+            bench_track.append_record(rec1, data_dir=data_dir)
+            bench_track.append_record(rec2, data_dir=data_dir)
+            aggregated = bench_track._aggregate_shards(bench_track.read_records("components", data_dir=data_dir))
+            self.assertEqual(len(aggregated), 1)
+            self.assertEqual(aggregated[0]["metrics"]["dup"], 2.0)
+            self.assertIn("dup", aggregated[0]["metric_collisions"])
+
+    def test_rerun_same_sha_different_run_id_does_not_mix_gate_status(self):
+        """Reproduces the exact round-3 scenario: pass-then-fail rerun of
+        the same sha must not blend into one row with mismatched gate
+        provenance."""
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = pathlib.Path(tmp)
+            sha = "e" * 40
+            passing = bench_track.build_record(
+                "bench-1m", {"recall_at_10": 0.95}, sha, "main", gate_exit_code=0, run_id="1", run_attempt="1"
+            )
+            failing = bench_track.build_record(
+                "bench-1m", {"recall_at_10": 0.10}, sha, "main", gate_exit_code=1, run_id="2", run_attempt="1"
+            )
+            bench_track.append_record(passing, data_dir=data_dir)
+            bench_track.append_record(failing, data_dir=data_dir)
+            aggregated = bench_track._aggregate_shards(bench_track.read_records("bench-1m", data_dir=data_dir))
+            self.assertEqual(len(aggregated), 2)
+            by_run = {r["run_id"]: r for r in aggregated}
+            self.assertEqual(by_run["1"]["gate_status"], "pass")
+            self.assertEqual(by_run["1"]["metrics"]["recall_at_10"], 0.95)
+            self.assertEqual(by_run["2"]["gate_status"], "fail")
+            self.assertEqual(by_run["2"]["metrics"]["recall_at_10"], 0.10)
+
+    def test_missing_run_id_defaults_do_not_break_legacy_records(self):
+        # Bare dict records without run_id/run_attempt keys (e.g. records
+        # written before schema_version 2) must still aggregate by sha.
+        records = [
+            {"sha": "f" * 40, "metrics": {"x": 1.0}},
+            {"sha": "f" * 40, "metrics": {"y": 2.0}},
+        ]
+        aggregated = bench_track._aggregate_shards(records)
+        self.assertEqual(len(aggregated), 1)
+        self.assertEqual(aggregated[0]["metrics"], {"x": 1.0, "y": 2.0})
+
+
 class CalibrateNoGateTests(unittest.TestCase):
     """collect_calibrate_metrics must record metrics from a run whose
     internal threshold FAILED (nonzero child exit) - it is a tracker, not a
