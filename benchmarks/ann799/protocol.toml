@@ -1,0 +1,128 @@
+# ANN-799 matched-condition benchmark protocol.
+#
+# Fixed construction settings, dataset split, seeds, and statistical
+# thresholds for the khive-vamana vs. external-ANN comparison defined in
+# docs/design/adr-799-baseline-plan.md (khive-work). This file is the single
+# source of truth consumed by runner.py and report.py; do not duplicate these
+# numbers elsewhere.
+#
+# Platform ruling (supersedes the plan's Linux-x86_64 platform section):
+# the target host for this harness is an Apple M-series macOS ARM machine.
+# See docs/benchmarks/ann799-matched-ann.md for the claim-scope statement.
+
+[dataset]
+name = "SIFT-1M"
+base_file = "sift_base.fvecs"
+query_file = "sift_query.fvecs"
+groundtruth_file = "sift_groundtruth.ivecs"
+expected_base_count = 1_000_000
+expected_query_count = 10_000
+expected_dim = 128
+expected_groundtruth_k = 100
+metric = "l2"
+
+# Query 0..1999 (2000 queries) = calibration split, immutable.
+# Query 2000..9999 (8000 queries) = evaluation split, immutable.
+[dataset.split]
+calibration_start = 0
+calibration_end = 2000
+evaluation_start = 2000
+evaluation_end = 10000
+
+[recall]
+k_values = [1, 10, 100]
+calibration_k = 10
+calibration_target = 0.9500
+eval_band_low = 0.9500
+eval_band_high = 0.9600
+eval_bootstrap_lower_bound = 0.9450
+
+[search_width]
+# Binary-search bounds shared by every graph/IVF adapter's calibration sweep.
+min_value = 10
+max_value = 1024
+
+[execution]
+threads = 1
+warm_blocks = 10
+build_repeats = 3
+# Written once before the timed window starts; each block permutes the
+# 8000-query evaluation split with this seed plus the block index.
+block_order_seed = 799
+build_cv_warning_pct = 20.0
+warm_p50_cv_warning_pct = 20.0
+
+[statistics]
+bootstrap_resamples = 10_000
+bootstrap_seed = 799
+bootstrap_ci = 0.95
+permutation_resamples = 10_000
+permutation_seed = 799
+permutation_alpha = 0.05
+min_abs_cohens_dz = 0.5
+
+[quiescence]
+loadavg1_max = 0.25
+pinned_core_idle_min_pct = 90.0
+device_util_max_pct = 5.0
+pre_window_seconds = 600
+
+[systems.khive-vamana]
+library = "khive-vamana"
+index_kind = "vamana"
+search_param_name = "beam"
+max_degree = 64
+search_list_size = 128
+alpha = 1.0
+build_batch = 1024
+required = true
+
+[systems.faiss-flat]
+library = "faiss-cpu"
+library_version = "1.14.3"
+index_kind = "IndexFlatL2"
+search_param_name = "none"
+required = true
+role = "exact_control"
+
+[systems.faiss-hnswflat]
+library = "faiss-cpu"
+library_version = "1.14.3"
+index_kind = "IndexHNSWFlat"
+search_param_name = "efSearch"
+m = 32
+ef_construction = 200
+required = true
+
+[systems.faiss-ivfflat]
+library = "faiss-cpu"
+library_version = "1.14.3"
+index_kind = "IndexIVFFlat"
+search_param_name = "nprobe"
+nlist = 4096
+train_sample = 100_000
+search_width_min = 1
+search_width_max = 4096
+required = true
+
+[systems.hnswlib]
+library = "hnswlib"
+library_version = "0.8.0"
+index_kind = "HNSW"
+search_param_name = "ef"
+m = 32
+ef_construction = 200
+seed = 100
+required = true
+
+[systems.diskann-memory]
+library = "diskann-cpp-legacy"
+library_version = "0.6.1"
+source_commit = "78256bbab4685e1774e78d331e081a153be26823"
+index_kind = "vamana-memory"
+search_param_name = "L_search"
+max_degree = 64
+search_list_size = 128
+alpha = 1.0
+required = false
+note = "optional-attempt: macOS ARM build is best-effort; excluded if it does not build in the timebox"

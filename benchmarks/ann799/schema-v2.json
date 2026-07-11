@@ -1,0 +1,136 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://khive.ai/schemas/ann799/schema-v2.json",
+  "title": "ANN-799 matched-condition benchmark result contract",
+  "description": "Raw per-query samples (one JSONL line per record) and per-system summary records produced by benchmarks/ann799/runner.py, consumed by report.py and scripts/perf/ann799_ingest.py. Extends the perf/ledger.csv column set defined in docs/design/adr-799-baseline-plan.md (khive-work).",
+  "definitions": {
+    "raw_sample_record": {
+      "type": "object",
+      "description": "One line of a block-NN.jsonl file: one timed query.",
+      "required": ["query_index", "latency_ns"],
+      "additionalProperties": false,
+      "properties": {
+        "query_index": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Index into the 8000-query evaluation split (0-based)."
+        },
+        "latency_ns": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Wall-clock nanoseconds from immediately before search_one to immediately after it returns."
+        }
+      }
+    },
+    "calibration_point": {
+      "type": "array",
+      "description": "[search_width, recall_at_10] pair tested during calibration.",
+      "items": [
+        { "type": "integer", "minimum": 1 },
+        { "type": "number", "minimum": 0, "maximum": 1 }
+      ],
+      "minItems": 2,
+      "maxItems": 2
+    },
+    "summary_record": {
+      "type": "object",
+      "description": "Per-system summary written as <system>.summary.json by runner.py.",
+      "required": [
+        "schema_version",
+        "run_id",
+        "system",
+        "library",
+        "library_version",
+        "index_kind",
+        "search_param_name",
+        "metric",
+        "threads",
+        "cache_state",
+        "query_count",
+        "recall_at_10",
+        "index_bytes",
+        "peak_build_rss_bytes",
+        "peak_query_rss_bytes",
+        "cpu_affinity",
+        "build_ms",
+        "pass"
+      ],
+      "additionalProperties": true,
+      "properties": {
+        "schema_version": { "const": 2 },
+        "run_id": { "type": "string", "minLength": 1 },
+        "system": { "type": "string", "minLength": 1 },
+        "library": { "type": "string", "minLength": 1 },
+        "library_version": { "type": ["string", "null"] },
+        "source_commit": { "type": ["string", "null"] },
+        "index_kind": { "type": "string", "minLength": 1 },
+        "build_params": { "type": "object" },
+        "search_param_name": {
+          "type": "string",
+          "enum": ["beam", "L_search", "efSearch", "ef", "nprobe", "none"]
+        },
+        "search_param_value": { "type": ["integer", "null"], "minimum": 1 },
+        "metric": { "type": "string", "enum": ["l2"] },
+        "threads": { "type": "integer", "const": 1 },
+        "cache_state": { "type": "string", "enum": ["warm", "cold"] },
+        "run_id_notes": { "type": "string" },
+        "query_count": { "type": "integer", "minimum": 0 },
+        "recall_at_1": { "type": "number", "minimum": 0, "maximum": 1 },
+        "recall_at_10": { "type": "number", "minimum": 0, "maximum": 1 },
+        "recall_at_100": { "type": "number", "minimum": 0, "maximum": 1 },
+        "index_bytes": { "type": "integer", "minimum": 0 },
+        "peak_build_rss_bytes": { "type": "integer", "minimum": 0 },
+        "peak_query_rss_bytes": { "type": "integer", "minimum": 0 },
+        "cpu_affinity": {
+          "description": "Pinned core id(s), or null when the platform has no enforceable pinning primitive (macOS).",
+          "type": ["array", "null"],
+          "items": { "type": "integer" }
+        },
+        "build_ms": {
+          "type": "array",
+          "items": { "type": "number", "minimum": 0 },
+          "minItems": 1
+        },
+        "build_ms_median": { "type": "number", "minimum": 0 },
+        "build_ms_cv_pct": { "type": "number", "minimum": 0 },
+        "block_p50_us": { "type": "array", "items": { "type": "number" } },
+        "block_p95_us": { "type": "array", "items": { "type": "number" } },
+        "block_p99_us": { "type": "array", "items": { "type": "number" } },
+        "block_files": { "type": "array", "items": { "type": "string" } },
+        "warm_p50_cv_pct": { "type": "number", "minimum": 0 },
+        "calibration": {
+          "type": "object",
+          "properties": {
+            "selected_width": { "type": ["integer", "null"] },
+            "selected_recall": { "type": "number" },
+            "tested": {
+              "type": "array",
+              "items": { "$ref": "#/definitions/calibration_point" }
+            },
+            "monotonic": { "type": "boolean" }
+          }
+        },
+        "pass": { "type": "boolean" },
+        "notes": { "type": "string" }
+      }
+    },
+    "ledger_row": {
+      "type": "object",
+      "description": "perf/ann799-ledger.csv column contract: strict superset of perf/ledger.csv.",
+      "required": [
+        "date", "sha", "target", "n", "system", "library", "library_version",
+        "source_commit", "index_kind", "search_param_name", "search_param_value",
+        "metric", "threads", "cache_state", "run_id", "recall_at_1",
+        "recall_at_10", "recall_at_100", "p50_us", "p95_us", "p99_us",
+        "build_ms", "index_bytes", "peak_build_rss_bytes",
+        "peak_query_rss_bytes", "cpu_affinity", "speedup", "brute_us",
+        "pass", "loadavg", "notes"
+      ]
+    }
+  },
+  "type": "object",
+  "oneOf": [
+    { "$ref": "#/definitions/raw_sample_record" },
+    { "$ref": "#/definitions/summary_record" }
+  ]
+}

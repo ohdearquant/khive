@@ -1,0 +1,25 @@
+# Pinned Python dependencies for the ANN-799 harness on Apple-silicon macOS.
+#
+# These versions match protocol.toml's [systems.*] library_version fields.
+# faiss-cpu publishes macOS arm64 wheels from 1.8.0 onward; hnswlib publishes
+# arm64 wheels from 0.7.0 onward. Both are confirmed installable on Apple
+# silicon without a local build toolchain.
+#
+# Hashes are intentionally NOT filled in here: this file is authored off the
+# target host, and `--require-hashes` needs hashes for the exact wheel built
+# for the runner's Python version and macOS/arm64 platform tag. Before the
+# real run, on the target host, regenerate this file with hashes pinned:
+#
+#   uv venv "$ANN799_ROOT/venv"
+#   . "$ANN799_ROOT/venv/bin/activate"
+#   uv pip install faiss-cpu==1.14.3 hnswlib==0.8.0 "numpy>=1.26,<2.3"
+#   uv pip freeze | uv pip compile - --generate-hashes -o requirements-macos-arm64.txt
+#
+# then commit the hash-pinned file to the run's manifest directory (not back
+# onto this tracked template) and pass it to `pip install --require-hashes`.
+# ann799_preflight.sh fails closed if the venv was installed from a file
+# without hashes.
+
+numpy>=1.26,<2.3
+faiss-cpu==1.14.3
+hnswlib==0.8.0

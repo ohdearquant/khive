@@ -63,9 +63,9 @@ ehthumbs.db
 *.sqlite3
 
 # khive KG layout:
-#   .khive/kg/       — committed (NDJSON + schema.yaml)
-#   .khive/config.toml — committed (project config)
-#   .khive/state/    — gitignored (working.db, derived from NDJSON)
+#   .khive/kg/       -- committed (NDJSON + schema.yaml)
+#   .khive/config.toml -- committed (project config)
+#   .khive/state/    -- gitignored (working.db, derived from NDJSON)
 .khive/state/
 
 # Test artifacts
@@ -98,10 +98,10 @@ pyproject.toml
 
 *results.json
 
-# Pipeline ledger — written locally and uploaded as CI artifact; not committed.
+# Pipeline ledger -- written locally and uploaded as CI artifact; not committed.
 perf/pipeline-ledger.csv
 
-# Synthetic ANN regression gate ledger — written by --ci-synthetic, uploaded as CI artifact; not committed.
+# Synthetic ANN regression gate ledger -- written by --ci-synthetic, uploaded as CI artifact; not committed.
 perf/ci-synthetic-ledger.csv
 
 # Raw bench-run JSON files banked by bench_1m.sh / vec_bench --bank-run.
@@ -119,3 +119,12 @@ scripts/perf/calibration/
 # main or a feature branch.
 bench-data/
 .perf-data-worktree/
+
+# ANN-799 raw run artifacts (manifests, JSONL samples, logs, checksums) and
+# any downloaded SIFT source data. Uploaded as a release/CI artifact instead
+# of being committed; see docs/benchmarks/ann799-matched-ann.md.
+perf/ann799-runs/
+target/ann799/
+**/sift1m/
+*.fvecs
+*.ivecs
