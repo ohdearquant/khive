@@ -982,6 +982,14 @@ mod note_mutation_hook_tests {
             )
             .await
             .expect("warm recall");
+        // ANN warming is asynchronous (`ann::ensure_ann_background`'s doc
+        // comment): both the seeding `memory.remember` calls above and this
+        // warm-up recall itself can fire a fire-and-forget background
+        // rebuild rather than complete it inline (#844). Wait for the
+        // single-flight `warming` guard for this key to clear before
+        // trusting `is_current` — the guard is only released once every
+        // in-flight rebuild for this key has actually finished.
+        ann::wait_until_warm_idle(&ann, &fr1_key()).await;
         assert!(
             ann::is_current(&ann, &fr1_key()).await,
             "sanity: warm-up recall must leave the ANN cache current before \
