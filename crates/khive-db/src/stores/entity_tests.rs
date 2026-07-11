@@ -184,6 +184,100 @@ async fn test_query_by_name_prefix() {
 }
 
 #[tokio::test]
+async fn test_query_by_name_prefix_escapes_underscore_wildcard() {
+    let store = setup_memory_store_ns("ns1");
+
+    // The real entity's name contains a literal underscore.
+    store
+        .upsert_entity(make_entity("ns1", "concept", "a_b"))
+        .await
+        .unwrap();
+
+    // 150 decoys that would match the *unescaped* LIKE pattern "a_b%"
+    // (`_` as a wildcard matches any single character) but must not match
+    // once the wildcard is escaped. Created after "a_b" so a page ordered
+    // by created_at DESC with LIMIT 100 would push "a_b" out unless exact
+    // matches are also ranked first.
+    for i in 0..150 {
+        store
+            .upsert_entity(make_entity("ns1", "concept", &format!("aXb-{i:03}")))
+            .await
+            .unwrap();
+    }
+
+    let result = store
+        .query_entities(
+            "ns1",
+            EntityFilter {
+                name_prefix: Some("a_b".to_string()),
+                ..Default::default()
+            },
+            PageRequest {
+                offset: 0,
+                limit: 100,
+            },
+        )
+        .await
+        .unwrap();
+
+    let names: Vec<&str> = result.items.iter().map(|e| e.name.as_str()).collect();
+    assert!(
+        names.contains(&"a_b"),
+        "exact match 'a_b' must survive escaping and page ordering despite 150 wildcard-matching decoys; got {names:?}"
+    );
+    assert!(
+        !names.iter().any(|n| n.starts_with("aXb")),
+        "escaped '_' must not match decoy names like 'aXb-000'; got {names:?}"
+    );
+}
+
+#[tokio::test]
+async fn test_query_by_name_prefix_escapes_percent_wildcard() {
+    let store = setup_memory_store_ns("ns1");
+
+    // The real entity's name contains a literal percent sign.
+    store
+        .upsert_entity(make_entity("ns1", "concept", "50%off"))
+        .await
+        .unwrap();
+
+    // 150 decoys that would match the *unescaped* LIKE pattern "50%off%"
+    // (`%` as a wildcard matches any sequence, including across "-") but
+    // must not match once the wildcard is escaped.
+    for i in 0..150 {
+        store
+            .upsert_entity(make_entity("ns1", "concept", &format!("50-off-{i:03}")))
+            .await
+            .unwrap();
+    }
+
+    let result = store
+        .query_entities(
+            "ns1",
+            EntityFilter {
+                name_prefix: Some("50%off".to_string()),
+                ..Default::default()
+            },
+            PageRequest {
+                offset: 0,
+                limit: 100,
+            },
+        )
+        .await
+        .unwrap();
+
+    let names: Vec<&str> = result.items.iter().map(|e| e.name.as_str()).collect();
+    assert!(
+        names.contains(&"50%off"),
+        "exact match '50%off' must survive escaping and page ordering despite 150 wildcard-matching decoys; got {names:?}"
+    );
+    assert!(
+        !names.iter().any(|n| n.starts_with("50-off-")),
+        "escaped '%' must not match decoy names like '50-off-000'; got {names:?}"
+    );
+}
+
+#[tokio::test]
 async fn test_count_entities() {
     let store = setup_memory_store_ns("ns1");
 

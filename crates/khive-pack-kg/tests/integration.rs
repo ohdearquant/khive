@@ -2023,6 +2023,98 @@ async fn link_by_name_exact_match_succeeds() {
 }
 
 #[tokio::test]
+async fn link_by_name_with_underscore_resolves_exactly() {
+    let pack = pack();
+
+    // Entity name contains a literal underscore, a SQLite LIKE
+    // single-character wildcard (#818).
+    pack.dispatch(
+        "create",
+        json!({"kind": "entity", "name": "a_b", "entity_kind": "concept"}),
+    )
+    .await
+    .expect("create 'a_b' must succeed");
+
+    // A decoy whose name only the *unescaped* wildcard form of "a_b" would
+    // match (`_` matching any single character).
+    pack.dispatch(
+        "create",
+        json!({"kind": "entity", "name": "aXb", "entity_kind": "concept"}),
+    )
+    .await
+    .expect("create 'aXb' must succeed");
+
+    pack.dispatch(
+        "create",
+        json!({"kind": "entity", "name": "TargetEntity", "entity_kind": "concept"}),
+    )
+    .await
+    .expect("create TargetEntity must succeed");
+
+    // Resolving "a_b" by name must find the exact entity, not be rejected as
+    // ambiguous with "aXb" and not silently resolve to the decoy.
+    let result = pack
+        .dispatch(
+            "link",
+            json!({
+                "source_id": "a_b",
+                "target_id": "TargetEntity",
+                "relation": "extends"
+            }),
+        )
+        .await;
+    assert!(
+        result.is_ok(),
+        "link by exact name 'a_b' must succeed despite an unescaped-wildcard-matching decoy; got: {result:?}"
+    );
+}
+
+#[tokio::test]
+async fn link_by_name_with_percent_resolves_exactly() {
+    let pack = pack();
+
+    // Entity name contains a literal percent sign, a SQLite LIKE
+    // any-sequence wildcard (#818).
+    pack.dispatch(
+        "create",
+        json!({"kind": "entity", "name": "50%off", "entity_kind": "concept"}),
+    )
+    .await
+    .expect("create '50%off' must succeed");
+
+    // A decoy whose name only the *unescaped* wildcard form of "50%off"
+    // would match (`%` matching any sequence, including across "-").
+    pack.dispatch(
+        "create",
+        json!({"kind": "entity", "name": "50-off-promo", "entity_kind": "concept"}),
+    )
+    .await
+    .expect("create '50-off-promo' must succeed");
+
+    pack.dispatch(
+        "create",
+        json!({"kind": "entity", "name": "TargetEntity", "entity_kind": "concept"}),
+    )
+    .await
+    .expect("create TargetEntity must succeed");
+
+    let result = pack
+        .dispatch(
+            "link",
+            json!({
+                "source_id": "50%off",
+                "target_id": "TargetEntity",
+                "relation": "extends"
+            }),
+        )
+        .await;
+    assert!(
+        result.is_ok(),
+        "link by exact name '50%off' must succeed despite an unescaped-wildcard-matching decoy; got: {result:?}"
+    );
+}
+
+#[tokio::test]
 async fn list_event_kind_returns_array() {
     let pack = pack_with_events();
     // Create an entity first so there are audit events to find.
