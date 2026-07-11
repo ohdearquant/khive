@@ -986,18 +986,32 @@ async fn confirm_genuinely_dead(config_id: &str, namespace: &str) -> ProbeOutcom
     // rounds; only give up (return `LockContended`) once every round agreed
     // nobody could confirm, exactly mirroring how `Dead` only becomes trusted
     // once every round agreed the daemon was absent.
-    let mut last_unresolved = ProbeOutcome::Dead;
+    //
+    // #838 round-2 Finding 1: `LockContended` is STICKY across rounds — once
+    // any round can't confirm quiescence, the aggregate must never collapse
+    // back to `Dead` just because a LATER round happened to observe it. The
+    // old code tracked only the last round's outcome, so a
+    // LockContended-then-Dead sequence overwrote the earlier contention and
+    // returned `Dead`, permitting kill+spawn on a call that never actually
+    // established quiescence across every round. `Dead` is only trustworthy
+    // when EVERY round agrees; a single contended round makes the whole call
+    // `LockContended` regardless of what any other round returned.
+    let mut saw_contention = false;
     for round in 0..DEAD_CONFIRM_ROUNDS {
         match quiesce_then_probe_identity(config_id, namespace, BOOT_FENCE_PROBE_TIMEOUT_MS).await {
-            ProbeOutcome::Dead => last_unresolved = ProbeOutcome::Dead,
-            ProbeOutcome::LockContended => last_unresolved = ProbeOutcome::LockContended,
+            ProbeOutcome::Dead => {}
+            ProbeOutcome::LockContended => saw_contention = true,
             other => return other,
         }
         if round + 1 < DEAD_CONFIRM_ROUNDS {
             tokio::time::sleep(std::time::Duration::from_millis(DEAD_CONFIRM_POLL_MS)).await;
         }
     }
-    last_unresolved
+    if saw_contention {
+        ProbeOutcome::LockContended
+    } else {
+        ProbeOutcome::Dead
+    }
 }
 
 /// Deadline for acquiring the recoverer-only lock
@@ -3797,6 +3811,102 @@ mod tests {
 
         serve_handle.abort();
         let _ = serve_handle.await;
+        reset_counters();
+        clear_daemon_env();
+        std::env::remove_var("KHIVE_LOCK");
+    }
+
+    // ── #838 round-2 Finding 1: an earlier LockContended round must not be
+    // erased by a later Dead round ──────────────────────────────────────────
+    //
+    // `confirm_genuinely_dead` only trusts `Dead` once EVERY round agrees the
+    // daemon is absent. Before this fix, the aggregation tracked only the
+    // LAST round's outcome: a LockContended round followed by a later Dead
+    // round overwrote the earlier contention and the whole call returned
+    // `Dead`, which `kill_and_respawn` trusts enough to kill+spawn — even
+    // though quiescence was never actually established across every round.
+    //
+    // This test drives that exact sequence directly: a background thread
+    // holds the real boot/recovery lock for longer than a single round's
+    // bounded wait (`BOOT_QUIESCENCE_LOCK_TIMEOUT_MS` = 500ms), guaranteeing
+    // round 1 cannot acquire it and returns `LockContended`, then releases
+    // the lock before `confirm_genuinely_dead` returns — so the remaining
+    // rounds observe the (genuinely absent) daemon and return `Dead`.
+    //
+    // Fail-if-reverted: with the old last-round-wins aggregation, this
+    // LockContended-then-Dead sequence resolves to `ProbeOutcome::Dead`, and
+    // the assertion below fails.
+    #[tokio::test]
+    #[serial]
+    async fn confirm_genuinely_dead_is_sticky_uncertain_after_earlier_contention() {
+        clear_daemon_env();
+        reset_counters();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sock = dir.path().join("khived.sock");
+        let pid_file = dir.path().join("khived.pid");
+        let lock_file = dir.path().join("khived.recovery.lock");
+
+        std::env::set_var("KHIVE_SOCKET", &sock);
+        std::env::set_var("KHIVE_PID", &pid_file);
+        std::env::set_var("KHIVE_LOCK", &lock_file);
+        std::env::remove_var("KHIVE_NO_DAEMON");
+
+        // Genuinely no daemon at all: no socket, no pid file. Once the lock
+        // is free, every round's identity probe observes Dead.
+        let config_id = "packs=[kg];db=:memory:;embed=none;extra=[];backend=main".to_string();
+
+        // Hold the real boot/recovery lock from before `confirm_genuinely_dead`
+        // starts, for strictly longer than one round's bounded wait, so round
+        // 1 is deterministically unable to acquire it (LockContended) — not a
+        // probabilistic race, since the hold spans the round's entire
+        // deadline window.
+        let guard = khive_runtime::daemon::acquire_daemon_boot_guard()
+            .expect("test lock holder must acquire the recovery lock");
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let boot_thread = std::thread::spawn(move || {
+            let _ = release_rx.recv();
+            drop(guard);
+        });
+
+        let confirm_config_id = config_id.clone();
+        let confirm_handle =
+            tokio::spawn(async move { confirm_genuinely_dead(&confirm_config_id, "test").await });
+
+        // Round 1's bounded wait is 500ms; sleeping past it while still
+        // holding the lock guarantees round 1 observed LockContended before
+        // release. `confirm_handle` runs concurrently on the runtime during
+        // this sleep (unlike a merely-pinned, never-polled future), so round
+        // 1 genuinely contends against the held lock here.
+        tokio::time::sleep(std::time::Duration::from_millis(650)).await;
+        release_tx
+            .send(())
+            .expect("boot-holder thread still awaiting release");
+        boot_thread
+            .join()
+            .expect("boot-holder thread must not panic");
+
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(5), confirm_handle)
+            .await
+            .expect("confirm_genuinely_dead must resolve once the lock is released")
+            .expect("confirm_genuinely_dead task must not panic");
+
+        assert!(
+            matches!(outcome, ProbeOutcome::LockContended),
+            "an earlier LockContended round must make the whole call \
+             LockContended (sticky), never overwritten by a later round's \
+             Dead reading; got {outcome:?}"
+        );
+        assert_eq!(
+            KILL_COUNT.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "confirm_genuinely_dead must never kill on its own"
+        );
+        assert_eq!(
+            SPAWN_COUNT.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "confirm_genuinely_dead must never spawn on its own"
+        );
+
         reset_counters();
         clear_daemon_env();
         std::env::remove_var("KHIVE_LOCK");
