@@ -10,6 +10,9 @@ keywords.workspace = true
 categories.workspace = true
 description = "Knowledge verb pack — lore corpus (atoms/domains), TF-IDF retrieval, concept registration"
 
+[lib]
+bench = false
+
 [dependencies]
 khive-types = { version = "0.3.0", path = "../khive-types", features = ["serde"] }
 khive-brain-core = { version = "0.3.0", path = "../khive-brain-core" }

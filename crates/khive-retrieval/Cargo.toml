@@ -10,6 +10,9 @@ keywords.workspace = true
 categories.workspace = true
 description = "Hybrid retrieval composer (HNSW + BM25 + fusion + graph + cross-encoder) with deterministic scoring"
 
+[lib]
+bench = false
+
 [dependencies]
 khive-hnsw    = { version = "0.3.0", path = "../khive-hnsw" }
 khive-bm25    = { version = "0.3.0", path = "../khive-bm25" }

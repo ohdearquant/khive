@@ -10,6 +10,9 @@ keywords.workspace = true
 categories.workspace = true
 description = "GQL and SPARQL parsers with SQL compiler for knowledge graph queries."
 
+[lib]
+bench = false
+
 [dependencies]
 khive-types = { version = "0.3.0", path = "../khive-types" }
 thiserror = { workspace = true }

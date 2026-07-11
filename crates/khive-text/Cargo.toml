@@ -10,6 +10,9 @@ keywords.workspace = true
 categories.workspace = true
 description = "Text analysis primitives for khive: tokenization, normalization, filtering"
 
+[lib]
+bench = false
+
 [dependencies]
 unicode-segmentation = { workspace = true, optional = true }
 rust-stemmers = { workspace = true, optional = true }
