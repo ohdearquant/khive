@@ -25,3 +25,16 @@ CREATE TABLE IF NOT EXISTS notes_seq (
 );
 
 CREATE INDEX IF NOT EXISTS idx_notes_seq_note_id ON notes_seq(note_id);
+
+-- Backfill: every note that already existed on a pre-V7 (V6 and earlier)
+-- database has no `notes_seq` row yet. `comm.probe`'s query INNER JOINs
+-- `notes` to `notes_seq`, so without this backfill every pre-existing
+-- inbound message would silently vanish from `new_messages`, `cursor_us`,
+-- and `stale_unread_count` the moment a populated database is upgraded to
+-- V7 -- the exact bug this migration exists to fix, reintroduced at the
+-- boundary. Ordered by `(created_at, id)` so the backfilled sequence
+-- preserves the same visible ordering `comm.probe` already presents to
+-- callers. This migration runs exactly once per database (tracked by
+-- `_schema_migrations`), so the full-table scan here is a one-time cost.
+INSERT OR IGNORE INTO notes_seq (note_id)
+SELECT id FROM notes ORDER BY created_at ASC, id ASC;

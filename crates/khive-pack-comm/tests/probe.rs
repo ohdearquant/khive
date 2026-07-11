@@ -8,8 +8,13 @@
 //! `build_registry()` fixture intentionally does not apply schema plans, and
 //! changing it would be a behavior change for unrelated tests in that file.
 
+use std::sync::Arc;
+
 use khive_pack_comm::CommPack;
-use khive_runtime::{KhiveRuntime, Namespace, VerbRegistry, VerbRegistryBuilder};
+use khive_runtime::{
+    AllowAllGate, BackendId, KhiveRuntime, Namespace, RuntimeConfig, VerbRegistry,
+    VerbRegistryBuilder,
+};
 use khive_storage::note::Note;
 use khive_storage::types::DeleteMode;
 use serde_json::json;
@@ -806,5 +811,180 @@ async fn probe_resets_implausible_pre_upgrade_timestamp_cursor_to_baseline() {
         1,
         "an implausible pre-upgrade timestamp cursor must reset to baseline, not \
          permanently suppress messages: {messages:?}"
+    );
+}
+
+/// Regression for #827 Finding 3: `notes_seq` has no fixed ceiling on how
+/// high a legitimate sequence value can grow. A `since_us` far above the
+/// old fixed `1_000_000_000_000` cutoff, but still at or below the actual
+/// `notes_seq` high-water mark, must round-trip normally -- not be reset to
+/// baseline. This directly exercises `comm.probe`'s opaque round-trip
+/// contract (`vocab.rs`): whatever `cursor_us` a probe hands back must work
+/// as `since_us` on the next call, at any magnitude.
+#[tokio::test]
+async fn probe_round_trips_a_legitimately_high_sequence_cursor() {
+    let (registry, rt) = build_registry();
+    let actor = "lambda:leo";
+
+    // Plant enough messages to push notes_seq comfortably past the old fixed
+    // 1_000_000_000_000 cutoff would have been irrelevant at this count, so
+    // instead directly advance the `notes_seq` AUTOINCREMENT high-water mark
+    // past that bound, then plant one real message after it.
+    // The comm pack's notes DDL bootstrap (`notes-ddl.sql`) already registers
+    // a `notes_seq` row in `sqlite_sequence` (at `seq = 0`) as a side effect
+    // of its own idempotent backfill `INSERT ... SELECT`, even before any
+    // real note is ever inserted -- so this advances that existing row via
+    // `UPDATE` rather than inserting a second, conflicting one (SQLite's
+    // AUTOINCREMENT bookkeeping does not enforce uniqueness on `name` at the
+    // SQL layer, so a duplicate row would silently be ignored by the
+    // engine's internal lookup).
+    let sql = rt.sql();
+    {
+        let mut writer = sql.writer().await.expect("writer");
+        writer
+            .execute_script(
+                "UPDATE sqlite_sequence SET seq = 2000000000000 WHERE name = 'notes_seq';"
+                    .to_string(),
+            )
+            .await
+            .expect("advance notes_seq high-water mark");
+    }
+
+    let t1 = 1_000_000_i64;
+    plant_inbound_message(&rt, actor, "lambda:khive", t1, None, false).await;
+
+    let first = registry
+        .dispatch("comm.probe", json!({ "actor": actor }))
+        .await
+        .expect("probe succeeds");
+    let cursor_1 = first["cursor_us"]
+        .as_i64()
+        .expect("cursor_us is an integer");
+    assert!(
+        cursor_1 > 1_000_000_000_000,
+        "the planted message's sequence value must exceed the old fixed cutoff: {cursor_1}"
+    );
+    assert_eq!(first["new_messages"].as_array().unwrap().len(), 1);
+
+    let t2 = 2_000_000_i64;
+    let id2 = plant_inbound_message(&rt, actor, "lambda:khive", t2, None, false).await;
+
+    let second = registry
+        .dispatch(
+            "comm.probe",
+            json!({ "actor": actor, "since_us": cursor_1 }),
+        )
+        .await
+        .expect("probe succeeds");
+    let messages = second["new_messages"].as_array().expect("array");
+    assert_eq!(
+        messages.len(),
+        1,
+        "a legitimately high sequence cursor must round-trip, not be reset to \
+         baseline and replay the first message: {messages:?}"
+    );
+    assert_eq!(messages[0]["id"], json!(id2.to_string()));
+}
+
+/// Regression for #827 Finding 1: `V7` (`sql/007-notes-seq.sql`) must
+/// backfill `notes_seq` for every note that already existed on a populated
+/// V6 database, not just notes inserted after the upgrade. Without the
+/// backfill, `comm.probe`'s `INNER JOIN notes_seq` would silently drop every
+/// pre-existing inbound message from `new_messages`, `cursor_us`, and
+/// `stale_unread_count` forever.
+#[tokio::test]
+async fn probe_backfills_pre_existing_messages_across_v6_to_v7_upgrade() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("v6_upgrade.db");
+    let actor = "lambda:leo";
+    let pre_existing_id = Uuid::new_v4();
+
+    // Build a V6-state database directly: apply only migrations up to V6,
+    // then insert a pre-existing inbound message the old way -- `notes_seq`
+    // does not exist yet at V6, so this note has no sequence row.
+    {
+        let backend = khive_db::StorageBackend::sqlite(&path).expect("open v6 backend");
+        let writer = backend.pool().try_writer().expect("writer");
+        let conn = writer.conn();
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS _schema_migrations ( \
+                 version INTEGER PRIMARY KEY, name TEXT NOT NULL, applied_at INTEGER NOT NULL);",
+        )
+        .expect("create migration tracking table");
+
+        let now = chrono::Utc::now().timestamp_micros();
+        for migration in khive_db::migrations::MIGRATIONS
+            .iter()
+            .filter(|m| m.version <= 6)
+        {
+            conn.execute_batch(migration.up)
+                .unwrap_or_else(|e| panic!("apply V{}: {e}", migration.version));
+            conn.execute(
+                "INSERT INTO _schema_migrations (version, name, applied_at) VALUES (?1, ?2, ?3)",
+                rusqlite::params![migration.version, migration.name, now],
+            )
+            .unwrap_or_else(|e| panic!("record V{}: {e}", migration.version));
+        }
+
+        conn.execute(
+            "INSERT INTO notes \
+             (id, namespace, kind, status, name, content, salience, decay_factor, expires_at, \
+              properties, created_at, updated_at, deleted_at) \
+             VALUES (?1, 'local', 'message', 'active', NULL, 'pre-existing v6 message', \
+                     NULL, NULL, NULL, ?2, ?3, ?3, NULL)",
+            rusqlite::params![
+                pre_existing_id.to_string(),
+                json!({
+                    "direction": "inbound",
+                    "to_actor": actor,
+                    "from_actor": "lambda:khive",
+                    "read": false,
+                })
+                .to_string(),
+                1_000_000_i64,
+            ],
+        )
+        .expect("insert pre-existing v6 message");
+    }
+
+    // Reopen through the normal runtime boot path -- this runs
+    // `run_migrations` to latest, including V7's backfill.
+    let config = RuntimeConfig {
+        db_path: Some(path.clone()),
+        default_namespace: Namespace::local(),
+        embedding_model: None,
+        additional_embedding_models: vec![],
+        gate: Arc::new(AllowAllGate),
+        packs: vec!["kg".to_string(), "comm".to_string()],
+        backend_id: BackendId::main(),
+        brain_profile: None,
+        visible_namespaces: vec![],
+        allowed_outbound_namespaces: vec![],
+        actor_id: None,
+    };
+    let runtime = KhiveRuntime::new(config).expect("runtime reopens and migrates to latest");
+
+    let mut builder = VerbRegistryBuilder::new();
+    builder.register(khive_pack_kg::KgPack::new(runtime.clone()));
+    builder.register(CommPack::new(runtime.clone()));
+    let registry = builder.build().expect("registry builds");
+    registry.apply_schema_plans(runtime.backend());
+
+    let result = registry
+        .dispatch("comm.probe", json!({ "actor": actor }))
+        .await
+        .expect("probe succeeds after v6->v7 upgrade");
+
+    let messages = result["new_messages"].as_array().expect("array");
+    assert_eq!(
+        messages.len(),
+        1,
+        "the pre-existing V6 message must be backfilled into notes_seq and appear \
+         in the first probe after upgrading to V7: {messages:?}"
+    );
+    assert_eq!(messages[0]["id"], json!(pre_existing_id.to_string()));
+    assert!(
+        result["cursor_us"].as_i64().unwrap() > 0,
+        "cursor_us must reflect the backfilled pre-existing message: {result}"
     );
 }

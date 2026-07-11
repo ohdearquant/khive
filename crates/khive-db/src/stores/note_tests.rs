@@ -386,6 +386,87 @@ async fn test_try_insert_note_pk_collision_returns_error_not_dedup() {
     );
 }
 
+// ── #827 Finding 2: single-note insert + notes_seq assignment atomicity ────
+
+/// Regression for #827 Finding 2: on the default flag-off (pool-mutex) path,
+/// `upsert_note` used to issue its INSERT into `notes` and `assign_note_seq`
+/// as two separate autocommit statements, so a crash or interleaving
+/// between them could strand a note with no `notes_seq` row -- permanently
+/// invisible to `comm.probe`'s `INNER JOIN notes_seq`. A `BEFORE INSERT`
+/// trigger on `notes_seq` injects a failure for one specific note id,
+/// simulating exactly that crash point (the `notes` INSERT has already run
+/// by the time this fires); the note row must not survive either, proving
+/// both statements now land in one transaction.
+#[tokio::test]
+async fn test_upsert_note_insert_and_seq_assignment_are_atomic() {
+    let store = setup_memory_store();
+
+    let fail_id = uuid::Uuid::parse_str("00000000-0000-0000-0000-0000000000aa").unwrap();
+    {
+        let writer = store.pool.try_writer().unwrap();
+        writer
+            .conn()
+            .execute_batch(&format!(
+                "CREATE TRIGGER inject_seq_failure_upsert BEFORE INSERT ON notes_seq \
+                 WHEN NEW.note_id = '{fail_id}' \
+                 BEGIN SELECT RAISE(ABORT, 'injected failure for #827 atomicity test'); END;"
+            ))
+            .unwrap();
+    }
+
+    let mut note = make_note("ns1", "message", "atomic test upsert_note");
+    note.id = fail_id;
+
+    let result = store.upsert_note(note).await;
+    assert!(
+        result.is_err(),
+        "the injected notes_seq trigger failure must surface as an error"
+    );
+
+    let fetched = store.get_note(fail_id).await.unwrap();
+    assert!(
+        fetched.is_none(),
+        "the note insert must roll back together with the failed sequence \
+         assignment, not strand the note without a notes_seq row: {fetched:?}"
+    );
+}
+
+/// Same regression as `test_upsert_note_insert_and_seq_assignment_are_atomic`
+/// for `try_insert_note`'s flag-off path.
+#[tokio::test]
+async fn test_try_insert_note_insert_and_seq_assignment_are_atomic() {
+    let store = setup_memory_store();
+
+    let fail_id = uuid::Uuid::parse_str("00000000-0000-0000-0000-0000000000bb").unwrap();
+    {
+        let writer = store.pool.try_writer().unwrap();
+        writer
+            .conn()
+            .execute_batch(&format!(
+                "CREATE TRIGGER inject_seq_failure_try_insert BEFORE INSERT ON notes_seq \
+                 WHEN NEW.note_id = '{fail_id}' \
+                 BEGIN SELECT RAISE(ABORT, 'injected failure for #827 atomicity test'); END;"
+            ))
+            .unwrap();
+    }
+
+    let mut note = make_note("ns1", "message", "atomic test try_insert_note");
+    note.id = fail_id;
+
+    let result = store.try_insert_note(note).await;
+    assert!(
+        result.is_err(),
+        "the injected notes_seq trigger failure must surface as an error"
+    );
+
+    let fetched = store.get_note(fail_id).await.unwrap();
+    assert!(
+        fetched.is_none(),
+        "the note insert must roll back together with the failed sequence \
+         assignment, not strand the note without a notes_seq row: {fetched:?}"
+    );
+}
+
 /// STORAGE-AUD-003 / #485: PageRequest.offset > i64::MAX must return
 /// InvalidInput for both list paths instead of silently narrowing to a
 /// negative i64 offset.

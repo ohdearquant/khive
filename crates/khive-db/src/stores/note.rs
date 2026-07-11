@@ -188,15 +188,18 @@ impl SqlNoteStore {
     /// `KHIVE_WRITE_QUEUE=1` and a handle is available; otherwise fall back
     /// to the legacy pool-mutex path (ADR-067 Component A, Fork C slice 2).
     ///
-    /// This is the ONE routing point for every `with_writer` caller in this
-    /// store (`upsert_note`, `try_insert_note`, `delete_note`). `f` must be
+    /// This is the routing point for single-statement `with_writer` callers
+    /// in this store (`update_note_properties`, `delete_note`). `f` must be
     /// DML-only — on the flag-on path it runs inside the WriterTask's own
     /// transaction, so a bare `BEGIN IMMEDIATE` would violate SQLite's
     /// nested-transaction rule. `upsert_notes` (the batch method) does its
     /// own flag check and returns early on `Some`, so its fallback call
     /// into this helper only ever executes on the flag-off path
     /// (`self.writer_task` is `None` by construction whenever that call is
-    /// reached) — no double-routing.
+    /// reached) — no double-routing. Callers whose `f` issues more than one
+    /// DML statement that must land atomically together (`upsert_note`,
+    /// `try_insert_note`) use [`Self::with_writer_tx`] instead — see its doc
+    /// comment (khive #827 Finding 2).
     async fn with_writer<F, R>(&self, op: &'static str, f: F) -> Result<R, StorageError>
     where
         F: FnOnce(&rusqlite::Connection) -> Result<R, rusqlite::Error> + Send + 'static,
@@ -212,6 +215,54 @@ impl SqlNoteStore {
         tokio::task::spawn_blocking(move || {
             let guard = pool.try_writer().map_err(|e| map_sqlite_err(e, op))?;
             f(guard.conn()).map_err(|e| map_err(e, op))
+        })
+        .await
+        .map_err(|e| StorageError::driver(StorageCapability::Notes, op, e))?
+    }
+
+    /// Like [`Self::with_writer`], but for callers whose closure issues more
+    /// than one DML statement that must land atomically together (khive
+    /// #827 Finding 2): a single-note insert immediately followed by
+    /// `assign_note_seq`. On the flag-on path the WriterTask already wraps
+    /// every request in its own `BEGIN IMMEDIATE`/`COMMIT`/`ROLLBACK`, so `f`
+    /// is sent unwrapped, same as `with_writer`. On the flag-off (pool-mutex)
+    /// path, `with_writer` runs `f` in SQLite's default autocommit mode --
+    /// each statement inside `f` is its own implicit transaction -- so a
+    /// crash or interleaving between the insert and the sequence assignment
+    /// can strand a note that `comm.probe`'s `INNER JOIN notes_seq` will
+    /// never see again. This wraps that path in one explicit transaction,
+    /// matching `upsert_notes`' own flag-off branch.
+    async fn with_writer_tx<F, R>(&self, op: &'static str, f: F) -> Result<R, StorageError>
+    where
+        F: FnOnce(&rusqlite::Connection) -> Result<R, rusqlite::Error> + Send + 'static,
+        R: Send + 'static,
+    {
+        if let Some(writer_task) = &self.writer_task {
+            return writer_task
+                .send(move |conn| f(conn).map_err(|e| map_err(e, op)))
+                .await;
+        }
+
+        let pool = Arc::clone(&self.pool);
+        tokio::task::spawn_blocking(move || {
+            let guard = pool.try_writer().map_err(|e| map_sqlite_err(e, op))?;
+            let conn = guard.conn();
+            conn.execute_batch("BEGIN IMMEDIATE")
+                .map_err(|e| map_err(e, op))?;
+
+            match f(conn) {
+                Ok(value) => match conn.execute_batch("COMMIT") {
+                    Ok(()) => Ok(value),
+                    Err(e) => {
+                        let _ = conn.execute_batch("ROLLBACK");
+                        Err(map_err(e, op))
+                    }
+                },
+                Err(e) => {
+                    let _ = conn.execute_batch("ROLLBACK");
+                    Err(map_err(e, op))
+                }
+            }
         })
         .await
         .map_err(|e| StorageError::driver(StorageCapability::Notes, op, e))?
@@ -530,7 +581,7 @@ impl NoteStore for SqlNoteStore {
     async fn upsert_note(&self, note: Note) -> Result<(), StorageError> {
         let id_str = note.id.to_string();
         let statement = note_upsert_statement(&note);
-        self.with_writer("upsert_note", move |conn| {
+        self.with_writer_tx("upsert_note", move |conn| {
             let mut stmt = conn.prepare(&statement.sql)?;
             bind_params(&mut stmt, &statement.params)?;
             stmt.raw_execute()?;
@@ -574,7 +625,7 @@ impl NoteStore for SqlNoteStore {
             .filter(|s| !s.is_empty())
             .map(|s| s.to_string());
 
-        self.with_writer("try_insert_note", move |conn| {
+        self.with_writer_tx("try_insert_note", move |conn| {
             let rows = conn.execute(
                 "INSERT OR IGNORE INTO notes \
                  (id, namespace, kind, status, name, content, salience, decay_factor, expires_at, \

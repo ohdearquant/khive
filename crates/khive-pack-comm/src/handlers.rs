@@ -1481,16 +1481,35 @@ pub(crate) async fn handle_probe(
     })
 }
 
-/// Above this bound, a caller-supplied `since_us` is treated as a
-/// pre-upgrade persisted-timestamp cursor rather than a `notes_seq` value
-/// (#827): `notes_seq` starts at 1 and grows by exactly one per note ever
-/// inserted, so no real deployment comes anywhere near this bound, while any
-/// real Unix-microsecond timestamp from after 1970-01-12 already exceeds it
-/// by three orders of magnitude. A cursor above the bound is reset to
-/// baseline (treated as absent) instead of being compared against
-/// `notes_seq.seq`, where its enormous magnitude would silently suppress
-/// every message forever.
-const PROBE_CURSOR_PLAUSIBLE_MAX: i64 = 1_000_000_000_000;
+/// A caller-supplied `since_us` above `notes_seq`'s durable high-water mark
+/// (`sqlite_sequence.seq` for the `notes_seq` table) cannot be a genuine
+/// cursor -- `notes_seq` starts at 1 and grows by exactly one per note ever
+/// inserted, so no value this store ever handed out can exceed the highest
+/// value it has ever assigned. Such a `since_us` is a pre-upgrade
+/// persisted-timestamp cursor (#827): a real Unix-microsecond timestamp from
+/// after 1970-01-12 already exceeds any realistic note count by orders of
+/// magnitude. Comparing against the actual high-water mark, instead of a
+/// fixed ceiling, keeps this correct forever as `notes_seq` grows -- a fixed
+/// ceiling would eventually reset a legitimate high sequence value to
+/// baseline, contradicting `comm.probe`'s opaque round-trip contract
+/// (`vocab.rs`).
+async fn notes_seq_high_water_mark(
+    reader: &mut Box<dyn khive_storage::sql::SqlReader>,
+) -> Result<i64, RuntimeError> {
+    let row = reader
+        .query_row(khive_storage::types::SqlStatement {
+            sql: "SELECT seq FROM sqlite_sequence WHERE name = 'notes_seq'".into(),
+            params: vec![],
+            label: Some("comm_probe_notes_seq_hwm".into()),
+        })
+        .await
+        .map_err(RuntimeError::Storage)?;
+
+    match row.and_then(|r| r.get("seq").cloned()) {
+        Some(SqlValue::Integer(v)) => Ok(v),
+        _ => Ok(0),
+    }
+}
 
 async fn query_probe(
     runtime: &KhiveRuntime,
@@ -1499,12 +1518,18 @@ async fn query_probe(
     since_us: Option<i64>,
     stale_cutoff_us: i64,
 ) -> Result<ProbeResponse, RuntimeError> {
+    let sql = runtime.sql();
+    let mut reader = sql.reader().await.map_err(RuntimeError::Storage)?;
+
+    let high_water_mark = notes_seq_high_water_mark(&mut reader).await?;
+
     let effective_since = match since_us {
-        Some(v) if v > PROBE_CURSOR_PLAUSIBLE_MAX => {
+        Some(v) if v > high_water_mark => {
             tracing::warn!(
                 actor,
                 since_us = v,
-                "comm.probe: since_us exceeds the plausible notes_seq range; treating it as a \
+                high_water_mark,
+                "comm.probe: since_us exceeds the notes_seq high-water mark; treating it as a \
                  stale pre-upgrade timestamp cursor and resetting to baseline"
             );
             None
@@ -1528,8 +1553,6 @@ async fn query_probe(
         label: Some("comm_probe".into()),
     };
 
-    let sql = runtime.sql();
-    let mut reader = sql.reader().await.map_err(RuntimeError::Storage)?;
     let rows = reader
         .query_all(statement)
         .await

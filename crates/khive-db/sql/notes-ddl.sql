@@ -32,3 +32,18 @@ CREATE TABLE IF NOT EXISTS notes_seq (
 );
 
 CREATE INDEX IF NOT EXISTS idx_notes_seq_note_id ON notes_seq(note_id);
+
+-- Backfill, mirroring `sql/007-notes-seq.sql` (khive #827) -- see that file
+-- for the full rationale. This DDL runs on every `notes_for_namespace` call
+-- (not just once, like the versioned migration), including for callers that
+-- build a store directly and never call `run_migrations`. Without this, a
+-- populated database opened only through this lazy path would keep every
+-- pre-existing note permanently invisible to `comm.probe`. The `WHERE NOT
+-- EXISTS` guard keeps this a one-time cost per database: once any row is
+-- present in `notes_seq` -- either from this backfill or from the first
+-- real insert going through `assign_note_seq` -- every later call skips the
+-- full-table scan.
+INSERT OR IGNORE INTO notes_seq (note_id)
+SELECT id FROM notes
+WHERE NOT EXISTS (SELECT 1 FROM notes_seq)
+ORDER BY created_at ASC, id ASC;
