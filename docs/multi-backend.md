@@ -127,8 +127,8 @@ path   = "~/.khive/records.db"
 [packs.records]           # hypothetical operator-supplied records pack
 backend = "records"
 
-# All built-in packs (kg, memory, brain, gtd, knowledge, schedule, comm)
-# are left unlisted and therefore default to "main".
+# All built-in packs (kg, memory, brain, gtd, knowledge, schedule, comm,
+# session, git, code) are left unlisted and therefore default to "main".
 ```
 
 Fields on `[[backends]]`:
@@ -170,8 +170,8 @@ name = "records"
 kind = "sqlite"
 path = "/var/lib/your-app/records.db"
 
-# Built-in packs (kg, memory, brain, gtd, knowledge, schedule, comm)
-# are NOT listed here; they fall back to "main" automatically.
+# Built-in packs (kg, memory, brain, gtd, knowledge, schedule, comm,
+# session, git, code) are NOT listed here; they fall back to "main" automatically.
 
 [packs.records]
 backend = "records"
