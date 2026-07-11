@@ -21,3 +21,4 @@ regorus = { workspace = true }
 
 [dev-dependencies]
 khive-types = { version = "0.3.0", path = "../khive-types", features = ["serde"] }
+tracing-subscriber = { workspace = true }
