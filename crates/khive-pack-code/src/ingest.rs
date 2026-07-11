@@ -102,6 +102,18 @@ fn tolerated_field(obj: &Map<String, Value>, key: &str) -> Option<Value> {
     }
 }
 
+/// Amendment 1 A2 governed mapping: `fixed -> resolved`, `false_positive ->
+/// invalid`, everything else (including absent/non-string status) stays
+/// `open`. The raw producer value is preserved verbatim under
+/// `properties.audit_status` regardless of how it maps here.
+fn map_producer_status_to_kind_status(audit_status: Option<&Value>) -> &'static str {
+    match audit_status.and_then(Value::as_str) {
+        Some("fixed") => "resolved",
+        Some("false_positive") => "invalid",
+        _ => "open",
+    }
+}
+
 fn require_str<'a>(
     obj: &'a Map<String, Value>,
     key: &'static str,
@@ -505,7 +517,12 @@ pub fn ingest_findings_json(
         if let Some(verification) = &finding.verification {
             props.insert("verification".into(), verification.clone());
         }
-        props.insert("kind_status".into(), json!("open"));
+        props.insert(
+            "kind_status".into(),
+            json!(map_producer_status_to_kind_status(
+                finding.audit_status.as_ref()
+            )),
+        );
         if !finding.raw.is_empty() {
             props.insert("raw".into(), Value::Object(finding.raw.clone()));
         }

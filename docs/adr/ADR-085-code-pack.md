@@ -500,6 +500,16 @@ is out of scope for this repository.
 
 ## Amendment 2 (2026-07-09): code.ingest verb + acceptance
 
+**Status (as of Amendment 3, 2026-07-11): accepted but deferred, not yet
+implemented.** The `code.ingest` verb this amendment specifies has no
+handler in `crates/khive-pack-code` today; the shipped pack contributes zero
+MCP verbs. Amendment 3 below documents the current (zero-verb) production
+surface and adds no verb of its own — it covers an unrelated admin CLI path
+for `findings.json`, not this amendment's Scanner/Extractor design. The
+design and acceptance recorded in this section remain the plan for when
+`code.ingest` is implemented; nothing here is being withdrawn or
+superseded, only marked not-yet-built.
+
 The base text left the Scanner/Extractor pipeline over the D2-D3 vocabulary as
 "separate ADR-069-layer work" and explicitly out of scope. That pipeline now has a
 design. This amendment specifies it as a single new verb, `code.ingest`, and closes

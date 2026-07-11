@@ -1,6 +1,6 @@
 # API Reference
 
-khive exposes exactly one MCP tool, `request`. Everything else — 78 verbs across 9
+khive exposes exactly one MCP tool, `request`. Everything else — 78 verbs across 10
 production packs — is dispatched through that single tool via a small request DSL.
 This page documents the DSL grammar, the response envelope, and every verb's full
 parameter contract, so an agent can call khive correctly without reading Rust source.
@@ -8,7 +8,7 @@ parameter contract, so an agent can call khive correctly without reading Rust so
 This page is verified against the live registry (`request(ops="verbs()")`, run
 2026-07-10) and the pack source (`crates/khive-pack-*/src/*.rs` `HandlerDef`/`ParamDef`
 struct literals). Verb count: **78**, matching both the live registry `total` field and
-the sum of the 9 pack counts below. If your server reports a different total, your
+the sum of the 10 pack counts below. If your server reports a different total, your
 `KHIVE_PACKS` configuration loads a different pack set than the default — run
 `request(ops="verbs()")` against your own server to get the authoritative list.
 
@@ -30,13 +30,19 @@ An always-machine-readable copy of this page is at
 | `knowledge` | 19    | `KHIVE_PACKS=kg,knowledge` | Yes                 |
 | `session`   | 4     | `KHIVE_PACKS=kg,session`   | Yes                 |
 | `git`       | 1     | `KHIVE_PACKS=kg,git`       | Yes                 |
+| `code`      | 0     | `KHIVE_PACKS=kg,code`      | Yes                 |
 
 `git` also registers the `commit` / `issue` / `pull_request` note kinds and the shared
 `run_ingest` core (`crates/khive-pack-git/src/ingest.rs`) that both `git.digest` and the
 `kkernel git-ingest` CLI drive.
 
-The default binary (no `KHIVE_PACKS`/`--pack` override) loads all 9 packs: 18 + 5 + 5 +
-15 + 7 + 4 + 19 + 4 + 1 = **78 verbs**.
+`code` registers the `finding` note kind and edge rules only; its `code.ingest` verb is
+accepted but unimplemented (ADR-085), and `findings.json` ingest runs through the
+`kkernel code-ingest` admin CLI path, not the MCP verb surface — so it contributes 0
+verbs to the total below.
+
+The default binary (no `KHIVE_PACKS`/`--pack` override) loads all 10 packs: 18 + 5 + 5 +
+15 + 7 + 4 + 19 + 4 + 1 + 0 = **78 verbs**.
 
 Verb names in the `kg` pack are bare (`create`, `search`, `link`, …). Every other pack
 namespaces its verbs with a `pack.` prefix (`gtd.assign`, `memory.recall`,

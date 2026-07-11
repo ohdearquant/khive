@@ -1,0 +1,345 @@
+//! Black-box CLI tests for `kkernel code-ingest` (khive#848 F7).
+//!
+//! Drives the actual compiled `kkernel` binary (`CARGO_BIN_EXE_kkernel`)
+//! rather than calling `code_ingest_batch` in-tree: the helper-level unit
+//! tests in `crates/kkernel/src/code_ingest.rs` cover the mapping logic, but
+//! only a real subprocess exercises clap argument parsing, `main`'s
+//! subcommand dispatch, the process exit code, and — most importantly — the
+//! filesystem side effects (or lack thereof) of `--dry-run` and a rejected
+//! document, which is exactly what round 1 of the PR #848 review found
+//! missing.
+
+use std::path::Path;
+use std::process::Command;
+
+use khive_db::StorageBackend;
+use khive_storage::{SqlStatement, SqlValue};
+
+fn kkernel_bin() -> &'static str {
+    env!("CARGO_BIN_EXE_kkernel")
+}
+
+/// Query substrate row counts directly over the sqlite file rather than
+/// through `kkernel exec`: `exec`'s config resolution rejects an explicit
+/// `--db` when the ambient `$HOME/.khive/config.toml` declares `[[backends]]`
+/// (a real constraint on developer machines with a multi-backend khive
+/// setup), which is orthogonal to what this test verifies. Reading the file
+/// straight is also a more direct proof of "reached storage" than routing
+/// through another CLI surface's own config layer.
+async fn substrate_counts(db: &Path) -> (u64, u64, u64) {
+    let backend = StorageBackend::sqlite_read_only(db).expect("open scratch db read-only");
+    let sql = backend.sql();
+    let mut reader = sql.reader().await.expect("reader");
+
+    async fn count(reader: &mut dyn khive_storage::SqlReader, table: &str) -> u64 {
+        match reader
+            .query_scalar(SqlStatement {
+                sql: format!("SELECT COUNT(*) FROM {table} WHERE deleted_at IS NULL"),
+                params: vec![],
+                label: None,
+            })
+            .await
+            .expect("count query")
+        {
+            Some(SqlValue::Integer(n)) => n as u64,
+            other => panic!("unexpected count() result: {other:?}"),
+        }
+    }
+
+    let entities = count(reader.as_mut(), "entities").await;
+    let notes = count(reader.as_mut(), "notes").await;
+    let edges = count(reader.as_mut(), "graph_edges").await;
+    (entities, notes, edges)
+}
+
+/// Fetch the single `finding` note's `properties.source_run` value from the
+/// given namespace, directly over sqlite (see `substrate_counts` for why).
+async fn finding_source_run(db: &Path, namespace: &str) -> String {
+    let backend = StorageBackend::sqlite_read_only(db).expect("open scratch db read-only");
+    let sql = backend.sql();
+    let mut reader = sql.reader().await.expect("reader");
+    let row = reader
+        .query_row(SqlStatement {
+            sql: "SELECT properties FROM notes WHERE namespace = ?1 AND kind = 'finding' \
+                  AND deleted_at IS NULL"
+                .to_string(),
+            params: vec![SqlValue::Text(namespace.to_string())],
+            label: None,
+        })
+        .await
+        .expect("query finding note")
+        .expect("expected exactly one finding note in the given namespace");
+    let properties = match row.get("properties") {
+        Some(SqlValue::Text(s)) => s.clone(),
+        other => panic!("unexpected properties column: {other:?}"),
+    };
+    let parsed: serde_json::Value =
+        serde_json::from_str(&properties).expect("properties must be valid JSON");
+    parsed["source_run"]
+        .as_str()
+        .expect("finding note must carry a source_run property")
+        .to_string()
+}
+
+fn write_valid_findings(dir: &Path) -> std::path::PathBuf {
+    let path = dir.join("findings.json");
+    std::fs::write(
+        &path,
+        r#"{
+            "audit": {
+                "date": "2026-07-11",
+                "scope": "khive-pack-code",
+                "repo": "ohdearquant/khive",
+                "branch": "feat/adr085-code-ingest-admin",
+                "commit": "abc1234",
+                "standards_file": "docs/standards.md"
+            },
+            "findings": [
+                {
+                    "id": "F-CLI-001",
+                    "title": "Example finding for a black-box CLI test",
+                    "severity": "medium",
+                    "confidence": "high",
+                    "failure_scenario": "Reproduced by running kkernel code-ingest twice.",
+                    "evidence": "code_ingest_cli.rs test",
+                    "impact": "none, this is a test fixture"
+                }
+            ]
+        }"#,
+    )
+    .expect("write findings.json fixture");
+    path
+}
+
+fn write_invalid_findings(dir: &Path) -> std::path::PathBuf {
+    let path = dir.join("bad.json");
+    std::fs::write(
+        &path,
+        r#"{
+            "audit": {
+                "date": "2026-07-11",
+                "scope": "x",
+                "repo": "r",
+                "branch": "b",
+                "commit": "c",
+                "standards_file": "s"
+            },
+            "findings": [
+                {"id": "F-CLI-002", "title": "bad", "severity": "high", "confidence": "low"}
+            ]
+        }"#,
+    )
+    .expect("write invalid findings.json fixture");
+    path
+}
+
+fn code_ingest(args: &[&str]) -> std::process::Output {
+    Command::new(kkernel_bin())
+        .arg("code-ingest")
+        .args(args)
+        .env("KHIVE_NO_DAEMON", "1")
+        .output()
+        .expect("run kkernel code-ingest")
+}
+
+/// (a) A fresh `--dry-run` against a nonexistent `--db` path must exit 0 and
+/// leave that path nonexistent — no file, no directory, nothing.
+#[test]
+fn dry_run_against_nonexistent_db_leaves_it_nonexistent_and_exits_zero() {
+    let tmp = tempfile::TempDir::new().expect("temp dir");
+    let findings = write_valid_findings(tmp.path());
+    let db = tmp.path().join("does-not-exist").join("scratch.db");
+    assert!(!db.exists());
+
+    let output = code_ingest(&[
+        findings.to_str().unwrap(),
+        "--db",
+        db.to_str().unwrap(),
+        "--dry-run",
+    ]);
+
+    assert!(
+        output.status.success(),
+        "a valid document under --dry-run must exit 0; stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !db.exists(),
+        "--dry-run against a nonexistent db path must not create it or its parent"
+    );
+
+    let report: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("stdout must be valid JSON");
+    assert_eq!(report["dry_run"], serde_json::json!(true));
+    assert_eq!(report["entities_created"], serde_json::json!(1));
+    assert_eq!(report["notes_created"], serde_json::json!(1));
+    assert_eq!(report["edges_created"], serde_json::json!(1));
+}
+
+/// (b) An invalid document against a nonexistent `--db` path must exit 1 and
+/// leave that path nonexistent.
+#[test]
+fn invalid_document_against_nonexistent_db_leaves_it_nonexistent_and_exits_nonzero() {
+    let tmp = tempfile::TempDir::new().expect("temp dir");
+    let findings = write_invalid_findings(tmp.path());
+    let db = tmp.path().join("scratch.db");
+    assert!(!db.exists());
+
+    let output = code_ingest(&[findings.to_str().unwrap(), "--db", db.to_str().unwrap()]);
+
+    assert!(
+        !output.status.success(),
+        "an invalid document must exit nonzero; stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !db.exists(),
+        "rejecting an invalid document must leave the db path untouched"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("failed validation") || stderr.contains("failure_scenario"),
+        "stderr must explain the validation failure: {stderr}"
+    );
+}
+
+/// (c) An invalid document against an EXISTING db must exit 1 and leave the
+/// db byte-identical — no migrations, no partial writes, nothing.
+#[test]
+fn invalid_document_against_existing_db_leaves_it_byte_identical() {
+    let tmp = tempfile::TempDir::new().expect("temp dir");
+    let valid = write_valid_findings(tmp.path());
+    let db = tmp.path().join("scratch.db");
+
+    let seed = code_ingest(&[valid.to_str().unwrap(), "--db", db.to_str().unwrap()]);
+    assert!(
+        seed.status.success(),
+        "seeding the db with a valid ingest must succeed; stderr={}",
+        String::from_utf8_lossy(&seed.stderr)
+    );
+    assert!(db.exists(), "seed ingest must create the db file");
+    let bytes_before = std::fs::read(&db).expect("read db bytes before invalid ingest");
+
+    let invalid = write_invalid_findings(tmp.path());
+    let output = code_ingest(&[invalid.to_str().unwrap(), "--db", db.to_str().unwrap()]);
+    assert!(
+        !output.status.success(),
+        "an invalid document against an existing db must exit nonzero"
+    );
+
+    let bytes_after = std::fs::read(&db).expect("read db bytes after invalid ingest");
+    assert_eq!(
+        bytes_before, bytes_after,
+        "rejecting an invalid document must not change a single byte of an existing db"
+    );
+}
+
+/// (d) A normal (non-dry-run) ingest creates the expected entity/note/edge
+/// rows, and re-running the same sweep is a content-derived-id no-op.
+#[tokio::test]
+async fn normal_ingest_creates_expected_entity_note_edge_rows() {
+    let tmp = tempfile::TempDir::new().expect("temp dir");
+    let findings = write_valid_findings(tmp.path());
+    let db = tmp.path().join("scratch.db");
+
+    let output = code_ingest(&[
+        findings.to_str().unwrap(),
+        "--db",
+        db.to_str().unwrap(),
+        "--source-run",
+        "cli-test-run",
+    ]);
+    assert!(
+        output.status.success(),
+        "normal ingest must succeed; stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("stdout must be valid JSON");
+    assert_eq!(report["dry_run"], serde_json::json!(false));
+    assert_eq!(report["entities_created"], serde_json::json!(1));
+    assert_eq!(report["notes_created"], serde_json::json!(1));
+    assert_eq!(report["edges_created"], serde_json::json!(1));
+
+    let stats = substrate_counts(&db).await;
+    assert_eq!(
+        stats,
+        (1, 1, 1),
+        "expected (entities, notes, edges) = (1, 1, 1): {stats:?}"
+    );
+
+    // Re-ingesting the identical sweep must be a no-op (content-derived
+    // UUIDv5 identity), never a duplicate write.
+    let rerun = code_ingest(&[
+        findings.to_str().unwrap(),
+        "--db",
+        db.to_str().unwrap(),
+        "--source-run",
+        "cli-test-run",
+    ]);
+    assert!(rerun.status.success());
+    let rerun_report: serde_json::Value =
+        serde_json::from_slice(&rerun.stdout).expect("stdout must be valid JSON");
+    assert_eq!(rerun_report["entities_created"], serde_json::json!(0));
+    assert_eq!(rerun_report["notes_created"], serde_json::json!(0));
+    assert_eq!(rerun_report["edges_created"], serde_json::json!(0));
+    assert_eq!(
+        rerun_report["entities_skipped_existing"],
+        serde_json::json!(1)
+    );
+    assert_eq!(rerun_report["notes_skipped_existing"], serde_json::json!(1));
+    assert_eq!(rerun_report["edges_skipped_existing"], serde_json::json!(1));
+
+    let stats_after_rerun = substrate_counts(&db).await;
+    assert_eq!(
+        stats_after_rerun, stats,
+        "a re-ingest no-op must not change substrate counts"
+    );
+}
+
+/// (e) `--db`, `--namespace`, and `--source-run` all reach storage: the
+/// database is created at the given path, records land in the given
+/// namespace, and the note's `source_run` property carries the given value.
+#[tokio::test]
+async fn db_namespace_and_source_run_reach_storage() {
+    let tmp = tempfile::TempDir::new().expect("temp dir");
+    let findings = write_valid_findings(tmp.path());
+    let db = tmp.path().join("nested").join("scratch.db");
+
+    let output = code_ingest(&[
+        findings.to_str().unwrap(),
+        "--db",
+        db.to_str().unwrap(),
+        "--namespace",
+        "cli-test-ns",
+        "--source-run",
+        "explicit-source-run-marker",
+    ]);
+    assert!(
+        output.status.success(),
+        "ingest must succeed; stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        db.exists(),
+        "--db must be honored, including parent dir creation"
+    );
+
+    let (entities, notes, edges) = substrate_counts(&db).await;
+    assert_eq!(
+        (entities, notes, edges),
+        (1, 1, 1),
+        "the record must be reachable in the database --db pointed at"
+    );
+
+    let source_run = finding_source_run(&db, "cli-test-ns").await;
+    assert_eq!(
+        source_run, "explicit-source-run-marker",
+        "--source-run must reach the persisted note's properties.source_run, under the \
+         explicit --namespace"
+    );
+}

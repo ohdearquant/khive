@@ -77,9 +77,9 @@ Over MCP, the same call is issued as a DSL string:
 request(ops="create(kind=\"entity\", entity_kind=\"concept\", name=\"RoPE\")")
 ```
 
-`khive-mcp` loads a default set of nine packs — `kg`, `gtd`, `memory`, `brain`,
-`comm`, `schedule`, `knowledge`, `session`, `git` — with `kg` always present;
-`KHIVE_PACKS` / `--pack` select a subset.
+`khive-mcp` loads a default set of ten packs — `kg`, `gtd`, `memory`, `brain`,
+`comm`, `schedule`, `knowledge`, `session`, `git`, `code` — with `kg` always
+present; `KHIVE_PACKS` / `--pack` select a subset.
 
 ## Where this sits
 
@@ -87,7 +87,8 @@ request(ops="create(kind=\"entity\", entity_kind=\"concept\", name=\"RoPE\")")
 `khive-query`, and `khive-storage`, and is registered into the pack runtime that
 `khive-mcp` serves. Every other pack in this workspace declares
 `REQUIRES = ["kg"]` — `gtd`, `memory`, `brain`, `comm`, `schedule`, `knowledge`,
-`session`, plus `formal` and `template` — so each depends on `kg` being loaded.
+`session`, `git`, `code`, plus `formal` and `template` — so each depends on
+`kg` being loaded.
 Governing ADRs:
 [ADR-001](https://github.com/ohdearquant/khive/blob/main/docs/adr/ADR-001-entity-kind-taxonomy.md) (entity kinds),
 [ADR-002](https://github.com/ohdearquant/khive/blob/main/docs/adr/ADR-002-edge-ontology.md) (edge relations),

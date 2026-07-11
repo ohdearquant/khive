@@ -9,17 +9,18 @@
 //! `--dry-run` runs the same validation and existence checks but performs
 //! no writes.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use chrono::Utc;
 use clap::Parser;
 use serde::Serialize;
 
+use khive_db::StorageBackend;
 use khive_mcp::serve::{resolve_runtime_config, RuntimeConfigInputs};
-use khive_pack_code::{ingest_findings_json, CodeIngestOptions};
-use khive_runtime::{entity_fts_document, note_fts_document, KhiveRuntime, Namespace};
-use khive_storage::SubstrateKind;
+use khive_pack_code::{ingest_findings_json, CodeIngestBatch, CodeIngestOptions};
+use khive_runtime::{entity_fts_document, note_fts_document, secret_gate, KhiveRuntime, Namespace};
+use khive_storage::{SqlStatement, SqlValue, SubstrateKind};
 
 /// Arguments for `kkernel code-ingest`.
 #[derive(Parser, Debug)]
@@ -94,6 +95,14 @@ pub async fn run_code_ingest(args: CodeIngestArgs) -> Result<()> {
 
 /// Core of `run_code_ingest`, split out so tests can assert on the returned
 /// [`CodeIngestReport`] directly instead of parsing stdout.
+///
+/// Order matters here: the document is read, parsed, and fully validated
+/// (`ingest_findings_json`), then secret-gate-preflighted, entirely BEFORE
+/// any `KhiveRuntime`/database construction. This is what makes `--dry-run`
+/// (and a rejected invalid document) leave the filesystem untouched: no
+/// runtime, no migrations, no embedding-model registration happen until
+/// after validation has already succeeded and a real (non-dry-run) write is
+/// about to occur.
 async fn code_ingest_batch(args: CodeIngestArgs) -> Result<CodeIngestReport> {
     let bytes = std::fs::read(&args.findings)
         .with_context(|| format!("failed to read {}", args.findings.display()))?;
@@ -110,6 +119,47 @@ async fn code_ingest_batch(args: CodeIngestArgs) -> Result<CodeIngestReport> {
         brain_profile: None,
     })?;
 
+    // The write path below persists `finding` notes directly through
+    // EntityStore/NoteStore/GraphStore rather than through pack dispatch (see
+    // `preflight_secret_gate` below), so it must independently confirm the
+    // `code` pack is actually part of this run's configured pack set —
+    // otherwise a misconfigured `KHIVE_PACKS`/`--pack` could accept
+    // `finding` records into a graph that never declared the kind.
+    if !cfg.packs.iter().any(|p| p == "code") {
+        anyhow::bail!(
+            "the `code` pack is not in the configured pack set {:?}; `finding` notes require it \
+             to be loaded (set KHIVE_PACKS to include `code`, or drop --pack overrides)",
+            cfg.packs
+        );
+    }
+
+    // Whole-document validation before any runtime/database construction
+    // (fail-closed): a malformed findings.json returns Err here and the
+    // process exits nonzero with zero filesystem effect.
+    let batch = ingest_findings_json(
+        &bytes,
+        CodeIngestOptions {
+            namespace: cfg.default_namespace.as_str(),
+            observed_at: Utc::now(),
+            source_run: args.source_run.as_deref(),
+        },
+    )
+    .with_context(|| format!("{} failed validation", args.findings.display()))?;
+
+    // Preflight every entity/note content and nested property value through
+    // the same secret gate the shared `create` verb path applies
+    // (`crate::secret_gate::check`/`check_json`). This path writes directly
+    // through the storage traits rather than `registry.dispatch("create",
+    // ...)` — explicit-id creation (required for the content-derived UUIDv5
+    // identity that makes re-ingest idempotent) has no dispatch-level
+    // equivalent today — so the gate has to run here instead of being
+    // inherited for free from the shared create handler.
+    preflight_secret_gate(&batch)?;
+
+    if args.dry_run {
+        return dry_run_report(cfg.db_path.as_deref(), &batch).await;
+    }
+
     let runtime = KhiveRuntime::new(cfg).map_err(|e| anyhow::anyhow!("{e}"))?;
     let resolved_ns = runtime.config().default_namespace.clone();
     let token = runtime
@@ -117,21 +167,8 @@ async fn code_ingest_batch(args: CodeIngestArgs) -> Result<CodeIngestReport> {
         .map_err(|e| anyhow::anyhow!("{e}"))
         .context("failed to authorize namespace")?;
 
-    // Whole-document validation before any write (fail-closed): a malformed
-    // findings.json returns Err here and the process exits nonzero without
-    // touching storage.
-    let batch = ingest_findings_json(
-        &bytes,
-        CodeIngestOptions {
-            namespace: token.namespace().as_str(),
-            observed_at: Utc::now(),
-            source_run: args.source_run.as_deref(),
-        },
-    )
-    .with_context(|| format!("{} failed validation", args.findings.display()))?;
-
     let mut report = CodeIngestReport {
-        dry_run: args.dry_run,
+        dry_run: false,
         ..CodeIngestReport::default()
     };
 
@@ -148,9 +185,6 @@ async fn code_ingest_batch(args: CodeIngestArgs) -> Result<CodeIngestReport> {
             continue;
         }
         report.entities_created += 1;
-        if args.dry_run {
-            continue;
-        }
         entities
             .upsert_entity(entity.clone())
             .await
@@ -179,7 +213,12 @@ async fn code_ingest_batch(args: CodeIngestArgs) -> Result<CodeIngestReport> {
                                 entity.id,
                                 SubstrateKind::Entity,
                                 token.namespace().as_str(),
-                                "entity.name",
+                                // Canonical field label for the entity body
+                                // vector (khive-runtime/src/operations.rs,
+                                // curation.rs) — must match so vector
+                                // provenance metadata agrees with every
+                                // other write path.
+                                "entity.body",
                                 vec![vector],
                             )
                             .await
@@ -214,9 +253,6 @@ async fn code_ingest_batch(args: CodeIngestArgs) -> Result<CodeIngestReport> {
             continue;
         }
         report.notes_created += 1;
-        if args.dry_run {
-            continue;
-        }
         notes
             .upsert_note(note.clone())
             .await
@@ -278,9 +314,6 @@ async fn code_ingest_batch(args: CodeIngestArgs) -> Result<CodeIngestReport> {
             continue;
         }
         report.edges_created += 1;
-        if args.dry_run {
-            continue;
-        }
         graph
             .upsert_edge(edge.clone())
             .await
@@ -290,8 +323,124 @@ async fn code_ingest_batch(args: CodeIngestArgs) -> Result<CodeIngestReport> {
     Ok(report)
 }
 
+/// Scan every entity/note content field and nested property value in `batch`
+/// through the runtime secret gate, before any storage write is attempted.
+/// Mirrors the fields `khive-runtime/src/operations.rs`'s `create_entity`/
+/// `create_note_inner` scan (name/description/properties for entities,
+/// content/name/properties for notes) so a credential embedded in finding
+/// evidence is rejected here exactly as it would be on the shared `create`
+/// verb path, rather than persisting verbatim.
+fn preflight_secret_gate(batch: &CodeIngestBatch) -> Result<()> {
+    for entity in &batch.entities {
+        secret_gate::check(&entity.name).map_err(|e| anyhow::anyhow!("{e}"))?;
+        if let Some(description) = &entity.description {
+            secret_gate::check(description).map_err(|e| anyhow::anyhow!("{e}"))?;
+        }
+        if let Some(properties) = &entity.properties {
+            secret_gate::check_json(properties).map_err(|e| anyhow::anyhow!("{e}"))?;
+        }
+        secret_gate::check_tags(&entity.tags).map_err(|e| anyhow::anyhow!("{e}"))?;
+    }
+    for note in &batch.notes {
+        secret_gate::check(&note.content).map_err(|e| anyhow::anyhow!("{e}"))?;
+        if let Some(name) = &note.name {
+            secret_gate::check(name).map_err(|e| anyhow::anyhow!("{e}"))?;
+        }
+        if let Some(properties) = &note.properties {
+            secret_gate::check_json(properties).map_err(|e| anyhow::anyhow!("{e}"))?;
+        }
+    }
+    Ok(())
+}
+
+/// Report what `code_ingest_batch` would create/skip without writing
+/// anything.
+///
+/// When `db_path` is absent, or points at a path that does not yet exist on
+/// disk, every record is reported as would-create and nothing is touched —
+/// there is no existing state to check identity against, so opening (and
+/// thereby creating) a database purely to answer "does this id exist" would
+/// itself be the mutation the dry-run contract forbids.
+///
+/// When the path exists, it is opened with [`StorageBackend::sqlite_read_only`]
+/// (rejects writes at the SQLite level, never creates a missing file) and
+/// existence is checked with raw `SELECT` statements over the reader
+/// connection — no migrations run and no embedding models are registered,
+/// unlike `KhiveRuntime::new`.
+async fn dry_run_report(
+    db_path: Option<&Path>,
+    batch: &CodeIngestBatch,
+) -> Result<CodeIngestReport> {
+    let mut report = CodeIngestReport {
+        dry_run: true,
+        ..CodeIngestReport::default()
+    };
+
+    let existing_path = db_path.filter(|p| p.exists());
+    let Some(db_path) = existing_path else {
+        report.entities_created = batch.entities.len() as u64;
+        report.notes_created = batch.notes.len() as u64;
+        report.edges_created = batch.edges.len() as u64;
+        return Ok(report);
+    };
+
+    let backend = StorageBackend::sqlite_read_only(db_path).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let sql = backend.sql();
+    let mut reader = sql.reader().await.map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    for entity in &batch.entities {
+        let row = reader
+            .query_scalar(SqlStatement {
+                sql: "SELECT 1 FROM entities WHERE id = ?1 AND deleted_at IS NULL".to_string(),
+                params: vec![SqlValue::Uuid(entity.id)],
+                label: Some("code-ingest dry-run entity existence".to_string()),
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        if row.is_some() {
+            report.entities_skipped_existing += 1;
+        } else {
+            report.entities_created += 1;
+        }
+    }
+    for note in &batch.notes {
+        let row = reader
+            .query_scalar(SqlStatement {
+                sql: "SELECT 1 FROM notes WHERE id = ?1 AND deleted_at IS NULL".to_string(),
+                params: vec![SqlValue::Uuid(note.id)],
+                label: Some("code-ingest dry-run note existence".to_string()),
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        if row.is_some() {
+            report.notes_skipped_existing += 1;
+        } else {
+            report.notes_created += 1;
+        }
+    }
+    for edge in &batch.edges {
+        let row = reader
+            .query_scalar(SqlStatement {
+                sql: "SELECT 1 FROM graph_edges WHERE id = ?1 AND deleted_at IS NULL".to_string(),
+                params: vec![SqlValue::Uuid(uuid::Uuid::from(edge.id))],
+                label: Some("code-ingest dry-run edge existence".to_string()),
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        if row.is_some() {
+            report.edges_skipped_existing += 1;
+        } else {
+            report.edges_created += 1;
+        }
+    }
+
+    Ok(report)
+}
+
 #[cfg(test)]
 mod tests {
+    use serial_test::serial;
+
     use super::*;
 
     fn base_args(findings: PathBuf, db: PathBuf) -> CodeIngestArgs {
@@ -335,6 +484,7 @@ mod tests {
         path
     }
 
+    #[serial]
     #[tokio::test]
     async fn code_ingest_creates_once_then_skips_on_rerun() {
         let tmp = tempfile::TempDir::new().expect("temp dir");
@@ -363,6 +513,7 @@ mod tests {
         assert_eq!(second.edges_skipped_existing, 1);
     }
 
+    #[serial]
     #[tokio::test]
     async fn code_ingest_dry_run_writes_nothing() {
         let tmp = tempfile::TempDir::new().expect("temp dir");
@@ -387,6 +538,7 @@ mod tests {
         );
     }
 
+    #[serial]
     #[tokio::test]
     async fn code_ingest_rejects_invalid_document_before_any_write() {
         let tmp = tempfile::TempDir::new().expect("temp dir");
@@ -422,6 +574,213 @@ mod tests {
             0,
             "whole-document validation must reject the sweep before any finding note is written"
         );
+    }
+
+    #[serial]
+    #[tokio::test]
+    async fn code_ingest_dry_run_against_nonexistent_db_creates_no_file() {
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let findings = write_valid_findings(tmp.path());
+        let db = tmp.path().join("does-not-exist.db");
+        assert!(!db.exists());
+
+        let mut args = base_args(findings, db.clone());
+        args.dry_run = true;
+        let report = code_ingest_batch(args).await.expect("dry-run must succeed");
+        assert!(report.dry_run);
+        assert_eq!(report.entities_created, 1);
+        assert_eq!(report.notes_created, 1);
+        assert_eq!(report.edges_created, 1);
+        assert!(
+            !db.exists(),
+            "a dry run against a nonexistent db path must not create it"
+        );
+    }
+
+    #[serial]
+    #[tokio::test]
+    async fn code_ingest_dry_run_against_existing_db_does_not_mutate_it() {
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let findings = write_valid_findings(tmp.path());
+        let db = tmp.path().join("scratch.db");
+
+        // Populate the db for real first so it exists on disk.
+        code_ingest_batch(base_args(findings.clone(), db.clone()))
+            .await
+            .expect("initial ingest must succeed");
+        let bytes_before = std::fs::read(&db).expect("read db bytes before dry run");
+
+        let mut args = base_args(findings, db.clone());
+        args.dry_run = true;
+        let report = code_ingest_batch(args)
+            .await
+            .expect("dry-run against an existing db must succeed");
+        assert!(report.dry_run);
+        assert_eq!(
+            report.entities_skipped_existing, 1,
+            "the record from the prior real ingest must be reported as already existing"
+        );
+        assert_eq!(report.notes_skipped_existing, 1);
+        assert_eq!(report.edges_skipped_existing, 1);
+
+        let bytes_after = std::fs::read(&db).expect("read db bytes after dry run");
+        assert_eq!(
+            bytes_before, bytes_after,
+            "a dry run against an existing db must not change a single byte of it"
+        );
+    }
+
+    #[serial]
+    #[tokio::test]
+    async fn code_ingest_rejects_secret_bearing_evidence_before_any_write() {
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let path = tmp.path().join("secret.json");
+        std::fs::write(
+            &path,
+            r#"{
+                "audit": {
+                    "date": "2026-07-11",
+                    "scope": "khive-pack-code",
+                    "repo": "ohdearquant/khive",
+                    "branch": "feat/adr085-code-ingest-admin",
+                    "commit": "abc1234",
+                    "standards_file": "docs/standards.md"
+                },
+                "findings": [
+                    {
+                        "id": "F-003",
+                        "title": "Example finding carrying a leaked credential",
+                        "severity": "high",
+                        "confidence": "high",
+                        "failure_scenario": "A scanner captured a live AWS key in evidence.",
+                        "evidence": "AKIAFAKEKEY1234567890",
+                        "impact": "credential AKIAFAKEKEY1234567890 must never persist verbatim"
+                    }
+                ]
+            }"#,
+        )
+        .expect("write secret-bearing fixture");
+        let db = tmp.path().join("scratch.db");
+
+        let err = code_ingest_batch(base_args(path, db.clone()))
+            .await
+            .expect_err("a secret-shaped evidence value must be rejected before any write");
+        assert!(
+            err.to_string().to_lowercase().contains("secret"),
+            "error must name the secret-gate rejection: {err}"
+        );
+        assert!(
+            !db.exists(),
+            "rejecting a secret-bearing document must leave the db path untouched"
+        );
+    }
+
+    #[serial]
+    #[tokio::test]
+    async fn code_ingest_fails_loud_when_code_pack_not_configured() {
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let findings = write_valid_findings(tmp.path());
+        let db = tmp.path().join("scratch.db");
+
+        let prior = std::env::var("KHIVE_PACKS").ok();
+        // SAFETY: `#[tokio::test]` gives each test its own single-threaded
+        // runtime, but process env is still global across the test binary;
+        // this mirrors the same accepted pattern (and its safety rationale)
+        // used by `default_config_packs_loads_all_production_packs` in
+        // `khive-runtime/src/runtime.rs`, restored in a `finally`-style tail.
+        unsafe {
+            std::env::set_var("KHIVE_PACKS", "kg");
+        }
+        let result = code_ingest_batch(base_args(findings, db.clone())).await;
+        unsafe {
+            match &prior {
+                Some(v) => std::env::set_var("KHIVE_PACKS", v),
+                None => std::env::remove_var("KHIVE_PACKS"),
+            }
+        }
+
+        let err = result.expect_err("a pack set without `code` must be rejected");
+        assert!(
+            err.to_string().contains("code"),
+            "error must name the missing `code` pack: {err}"
+        );
+        assert!(
+            !db.exists(),
+            "rejecting a misconfigured pack set must leave the db path untouched"
+        );
+    }
+
+    #[serial]
+    #[tokio::test]
+    async fn code_ingest_entity_vector_uses_canonical_body_field_label() {
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let findings = write_valid_findings(tmp.path());
+        let db = tmp.path().join("scratch.db");
+
+        code_ingest_batch(base_args(findings, db.clone()))
+            .await
+            .expect("ingest must succeed");
+
+        let cfg = resolve_runtime_config(RuntimeConfigInputs {
+            db: Some(db.to_str().expect("utf8 path")),
+            config: None,
+            namespace: Namespace::parse("local").expect("valid namespace"),
+            namespace_explicit: true,
+            actor_explicit: false,
+            no_embed: false,
+            packs: None,
+            brain_profile: None,
+        })
+        .expect("resolve runtime config");
+        let runtime = KhiveRuntime::new(cfg).expect("runtime");
+        let sql = runtime.sql();
+        let mut reader = sql.reader().await.expect("reader");
+        let tables = reader
+            .query_all(SqlStatement {
+                sql: "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'vec_%'"
+                    .to_string(),
+                params: vec![],
+                label: None,
+            })
+            .await
+            .expect("list vec tables");
+        assert!(
+            !tables.is_empty(),
+            "expected at least one vector table after ingest"
+        );
+
+        // sqlite-vec creates companion/shadow tables (e.g. `_info`, vec0
+        // virtual-table internals) alongside the real vector row table, so a
+        // bare `LIKE 'vec_%'` sweep must tolerate tables that don't carry a
+        // `field` column rather than assuming every match is a row table.
+        let mut saw_entity_row = false;
+        for table in &tables {
+            let table_name = match table.get("name") {
+                Some(SqlValue::Text(s)) => s.clone(),
+                other => panic!("unexpected table name column: {other:?}"),
+            };
+            let Ok(rows) = reader
+                .query_all(SqlStatement {
+                    sql: format!("SELECT field FROM {table_name} WHERE kind = 'entity'"),
+                    params: vec![],
+                    label: None,
+                })
+                .await
+            else {
+                continue;
+            };
+            for row in rows {
+                if let Some(SqlValue::Text(field)) = row.get("field") {
+                    assert_eq!(
+                        field, "entity.body",
+                        "entity vector metadata must use the canonical 'entity.body' field \
+                         label to match khive-runtime/src/operations.rs, got {field:?}"
+                    );
+                    saw_entity_row = true;
+                }
+            }
+        }
+        assert!(saw_entity_row, "expected at least one entity vector row");
     }
 
     /// Query the persisted `finding` note count for a scratch db, independent

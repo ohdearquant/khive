@@ -77,7 +77,7 @@ ANN_SETTLE_POLL_S = 0.25
 # Default production pack set (must match RuntimeConfig::default().packs in
 # crates/khive-runtime/src/config.rs so config_id agrees between front-end
 # and daemon child).
-_DEFAULT_PACKS = "kg,gtd,memory,brain,comm,schedule,knowledge"
+_DEFAULT_PACKS = "kg,gtd,memory,brain,comm,schedule,knowledge,session,git,code"
 
 TOPICS = [
     ("knowledge graph", ["entity", "edge", "relation", "graph", "node", "ontology", "triple", "schema", "link", "concept"]),
