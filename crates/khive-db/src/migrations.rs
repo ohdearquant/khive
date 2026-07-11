@@ -114,6 +114,8 @@ const V6_UP: &str = include_str!("../sql/006-brain-retune-driver.sql");
 
 const V7_UP: &str = include_str!("../sql/007-notes-seq.sql");
 
+const V8_UP: &str = include_str!("../sql/008-notes-seq-repair.sql");
+
 /// DDL for the `_embedding_models` registry table.
 ///
 /// Shared between the V1 schema and the belt-and-suspenders creation in
@@ -157,6 +159,11 @@ pub const MIGRATIONS: &[VersionedMigration] = &[
         version: 7,
         name: "notes_seq",
         up: V7_UP,
+    },
+    VersionedMigration {
+        version: 8,
+        name: "notes_seq_repair",
+        up: V8_UP,
     },
 ];
 

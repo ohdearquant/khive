@@ -690,35 +690,20 @@ impl NoteStore for SqlNoteStore {
     async fn upsert_notes(&self, notes: Vec<Note>) -> Result<BatchWriteSummary, StorageError> {
         let attempted = notes.len() as u64;
 
-        // ADR-067 Component A: when the write queue is enabled, route
-        // through the pool-wide WriterTask. DML-only closure — no BEGIN
-        // IMMEDIATE/COMMIT/ROLLBACK here, since the WriterTask's run loop
-        // owns the transaction (a bare BEGIN IMMEDIATE here would violate
-        // SQLite's nested-transaction rule).
-        if let Some(writer_task) = &self.writer_task {
-            return writer_task
-                .send(move |conn| {
-                    batch_upsert_notes(conn, &notes, attempted)
-                        .map_err(|e| map_err(e, "upsert_notes"))
-                })
-                .await;
-        }
-
-        // Flag-off (default) path: byte-for-byte unchanged from pre-ADR-067
-        // behavior — the closure owns its own BEGIN IMMEDIATE/COMMIT/ROLLBACK
-        // via the pool-mutex writer.
-        self.with_writer("upsert_notes", move |conn| {
-            conn.execute_batch("BEGIN IMMEDIATE")?;
+        // khive #827 Finding 2 (round 3): route through `with_writer_tx`
+        // instead of hand-rolling BEGIN IMMEDIATE/COMMIT/ROLLBACK here. The
+        // old flag-off path only rolled back when the final COMMIT failed —
+        // an earlier error from `batch_upsert_notes` (e.g. a failed
+        // `assign_note_seq`) propagated via `?` straight out of the closure,
+        // skipping ROLLBACK entirely and leaving BEGIN IMMEDIATE open on the
+        // shared pool-mutex connection, poisoning every later write on that
+        // connection. `with_writer_tx` rolls back on ANY error from `f`, on
+        // both the flag-on (WriterTask, which wraps its own transaction) and
+        // flag-off (pool-mutex) paths.
+        self.with_writer_tx("upsert_notes", move |conn| {
             let _tx_handle =
                 khive_storage::tx_registry::register(Some("note_upsert_batch".to_string()));
-
-            let summary = batch_upsert_notes(conn, &notes, attempted)?;
-
-            if let Err(e) = conn.execute_batch("COMMIT") {
-                let _ = conn.execute_batch("ROLLBACK");
-                return Err(e);
-            }
-            Ok(summary)
+            batch_upsert_notes(conn, &notes, attempted)
         })
         .await
     }

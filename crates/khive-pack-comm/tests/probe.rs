@@ -988,3 +988,195 @@ async fn probe_backfills_pre_existing_messages_across_v6_to_v7_upgrade() {
         "cursor_us must reflect the backfilled pre-existing message: {result}"
     );
 }
+
+/// Regression for #827 round-3 Finding 1: the *original* V7 migration (head
+/// 87c25939, before round 2 added a backfill) only created `notes_seq` --
+/// it never backfilled anything. A database that already ran that original
+/// V7 body has `version = 7` recorded in `_schema_migrations`, so
+/// `run_migrations` will never re-run V7's body again, no matter how it is
+/// edited later. Round 2 (9b829cf4) edited `007-notes-seq.sql` in place to
+/// add a backfill -- but on a database that already applied the original
+/// V7, that edited body never executes, and round 2's *lazy* bootstrap
+/// backfill (`notes-ddl.sql`) was itself gated on `notes_seq` being
+/// globally empty. The moment exactly one note lands a `notes_seq` row
+/// through the ordinary write path, that guard sees a non-empty table and
+/// skips -- permanently stranding every older, still-unmapped note.
+///
+/// This builds exactly that ledger directly in SQLite: apply V1..V6, then
+/// the original (backfill-less) V7 body, recording `version = 7`; insert
+/// three pre-existing notes with no `notes_seq` row; insert one
+/// post-upgrade note WITH a manually assigned `notes_seq` row (partial
+/// population); and advance `sqlite_sequence` for `notes_seq` to a value
+/// far above any row actually present (a stale high-water mark, as if
+/// earlier rows had since been deleted). Reopening through the current
+/// code (V8's forward repair migration plus the fixed anti-join lazy
+/// bootstrap) must recover all three older notes in the very first probe.
+#[tokio::test]
+async fn probe_repairs_partial_notes_seq_left_by_original_v7_on_reopen() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("v7_partial_upgrade.db");
+    let actor = "lambda:leo";
+    let counterpart = "lambda:khive";
+
+    let old_ids = [Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4()];
+    let post_upgrade_id = Uuid::new_v4();
+
+    // The exact original V7 body (khive#827 head 87c25939): creates
+    // `notes_seq` but performs no backfill at all.
+    const V7_ORIGINAL_NO_BACKFILL: &str = "\
+        CREATE TABLE IF NOT EXISTS notes_seq ( \
+            seq     INTEGER PRIMARY KEY AUTOINCREMENT, \
+            note_id TEXT NOT NULL UNIQUE \
+        ); \
+        CREATE INDEX IF NOT EXISTS idx_notes_seq_note_id ON notes_seq(note_id);";
+
+    {
+        let backend = khive_db::StorageBackend::sqlite(&path).expect("open backend");
+        let writer = backend.pool().try_writer().expect("writer");
+        let conn = writer.conn();
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS _schema_migrations ( \
+                 version INTEGER PRIMARY KEY, name TEXT NOT NULL, applied_at INTEGER NOT NULL);",
+        )
+        .expect("create migration tracking table");
+
+        let now = chrono::Utc::now().timestamp_micros();
+        for migration in khive_db::migrations::MIGRATIONS
+            .iter()
+            .filter(|m| m.version <= 6)
+        {
+            conn.execute_batch(migration.up)
+                .unwrap_or_else(|e| panic!("apply V{}: {e}", migration.version));
+            conn.execute(
+                "INSERT INTO _schema_migrations (version, name, applied_at) VALUES (?1, ?2, ?3)",
+                rusqlite::params![migration.version, migration.name, now],
+            )
+            .unwrap_or_else(|e| panic!("record V{}: {e}", migration.version));
+        }
+
+        // Apply the ORIGINAL (backfill-less) V7 body and record it as
+        // applied, simulating a database that upgraded before round 2.
+        conn.execute_batch(V7_ORIGINAL_NO_BACKFILL)
+            .expect("apply original backfill-less V7");
+        conn.execute(
+            "INSERT INTO _schema_migrations (version, name, applied_at) VALUES (7, 'notes_seq', ?1)",
+            rusqlite::params![now],
+        )
+        .expect("record original V7 as applied");
+
+        // Three pre-existing (older) notes, inserted with no notes_seq row --
+        // exactly what the original V7 leaves behind.
+        for (i, id) in old_ids.iter().enumerate() {
+            conn.execute(
+                "INSERT INTO notes \
+                 (id, namespace, kind, status, name, content, salience, decay_factor, expires_at, \
+                  properties, created_at, updated_at, deleted_at) \
+                 VALUES (?1, 'local', 'message', 'active', NULL, ?2, \
+                         NULL, NULL, NULL, ?3, ?4, ?4, NULL)",
+                rusqlite::params![
+                    id.to_string(),
+                    format!("pre-existing note {i}"),
+                    json!({
+                        "direction": "inbound",
+                        "to_actor": actor,
+                        "from_actor": counterpart,
+                        "read": false,
+                    })
+                    .to_string(),
+                    1_000_000_i64 + i as i64,
+                ],
+            )
+            .unwrap_or_else(|e| panic!("insert pre-existing note {i}: {e}"));
+        }
+
+        // One post-upgrade note, inserted the normal way -- WITH a
+        // notes_seq row, simulating `assign_note_seq` having run for it.
+        conn.execute(
+            "INSERT INTO notes \
+             (id, namespace, kind, status, name, content, salience, decay_factor, expires_at, \
+              properties, created_at, updated_at, deleted_at) \
+             VALUES (?1, 'local', 'message', 'active', NULL, 'post-upgrade note', \
+                     NULL, NULL, NULL, ?2, ?3, ?3, NULL)",
+            rusqlite::params![
+                post_upgrade_id.to_string(),
+                json!({
+                    "direction": "inbound",
+                    "to_actor": actor,
+                    "from_actor": counterpart,
+                    "read": false,
+                })
+                .to_string(),
+                2_000_000_i64,
+            ],
+        )
+        .expect("insert post-upgrade note");
+        conn.execute(
+            "INSERT INTO notes_seq (note_id) VALUES (?1)",
+            rusqlite::params![post_upgrade_id.to_string()],
+        )
+        .expect("assign notes_seq row to post-upgrade note");
+
+        // Advance the AUTOINCREMENT high-water mark far past the one row
+        // actually present, simulating earlier notes_seq rows having since
+        // been deleted (e.g. a hard-deleted note). The repair must still
+        // work correctly against a ledger whose next-assigned seq values
+        // are nowhere near contiguous with created_at order.
+        conn.execute(
+            "UPDATE sqlite_sequence SET seq = 500 WHERE name = 'notes_seq'",
+            [],
+        )
+        .expect("advance stale notes_seq high-water mark");
+    }
+
+    // Reopen through the normal runtime boot path -- this runs
+    // `run_migrations` to latest (including V8's forward repair) and the
+    // fixed anti-join lazy bootstrap.
+    let config = RuntimeConfig {
+        db_path: Some(path.clone()),
+        default_namespace: Namespace::local(),
+        embedding_model: None,
+        additional_embedding_models: vec![],
+        gate: Arc::new(AllowAllGate),
+        packs: vec!["kg".to_string(), "comm".to_string()],
+        backend_id: BackendId::main(),
+        brain_profile: None,
+        visible_namespaces: vec![],
+        allowed_outbound_namespaces: vec![],
+        actor_id: None,
+    };
+    let runtime = KhiveRuntime::new(config).expect("runtime reopens and migrates to latest");
+
+    let mut builder = VerbRegistryBuilder::new();
+    builder.register(khive_pack_kg::KgPack::new(runtime.clone()));
+    builder.register(CommPack::new(runtime.clone()));
+    let registry = builder.build().expect("registry builds");
+    registry.apply_schema_plans(runtime.backend());
+
+    let result = registry
+        .dispatch("comm.probe", json!({ "actor": actor }))
+        .await
+        .expect("probe succeeds after partial-ledger v7->v8 upgrade");
+
+    let messages = result["new_messages"].as_array().expect("array");
+    let returned_ids: Vec<String> = messages
+        .iter()
+        .map(|m| m["id"].as_str().unwrap().to_string())
+        .collect();
+
+    for id in &old_ids {
+        assert!(
+            returned_ids.contains(&id.to_string()),
+            "pre-existing note {id} left unmapped by the original V7 must be repaired \
+             and appear in the first probe after upgrade: {returned_ids:?}"
+        );
+    }
+    assert!(
+        returned_ids.contains(&post_upgrade_id.to_string()),
+        "the already-mapped post-upgrade note must still appear: {returned_ids:?}"
+    );
+    assert_eq!(
+        messages.len(),
+        4,
+        "all three older notes plus the post-upgrade note must be visible: {messages:?}"
+    );
+}
