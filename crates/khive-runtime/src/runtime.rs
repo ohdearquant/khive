@@ -1103,7 +1103,8 @@ mod tests {
         assert!(cfg.packs.contains(&"session".to_string()));
         assert!(cfg.packs.contains(&"git".to_string()));
         assert!(cfg.packs.contains(&"code".to_string()));
-        assert_eq!(cfg.packs.len(), 10);
+        assert!(cfg.packs.contains(&"workspace".to_string()));
+        assert_eq!(cfg.packs.len(), 11);
         if let Some(v) = prior {
             // SAFETY: single-threaded test cleanup; restores KHIVE_PACKS to its prior value.
             unsafe {
