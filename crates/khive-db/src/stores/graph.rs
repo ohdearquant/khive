@@ -958,6 +958,15 @@ fn edge_insert_guarded(
     if stmt.raw_execute()? > 0 {
         return Ok(GuardedWriteOutcome::Written);
     }
+    // Test-only observation point for the exact insert-to-probe seam this
+    // function's doc comment describes: a no-op in every non-test build,
+    // and a no-op in test builds unless a test has installed a barrier for
+    // this precise (source_id, target_id) pair (see
+    // `tests::insert_probe_seam` in graph_tests.rs). Lets the round-4/-5
+    // atomicity regression test force a racer to run at this seam instead
+    // of guessing at it with sleeps.
+    #[cfg(test)]
+    tests::insert_probe_seam::hook((source_id, target_id));
     let missing = edge_endpoints_exist(conn, source_id, target_id)?;
     Ok(GuardedWriteOutcome::Refused(missing))
 }

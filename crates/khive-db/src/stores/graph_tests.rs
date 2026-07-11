@@ -4,6 +4,82 @@ use khive_storage::types::{Direction, TraversalOptions};
 use serial_test::serial;
 use std::collections::HashSet;
 
+/// Deterministic barrier at the exact insert-to-probe seam
+/// [`edge_insert_guarded`] calls into (via `#[cfg(test)] hook(...)`) after a
+/// guarded `INSERT` is refused, before the missing-endpoint probe runs.
+///
+/// A pure wall-clock race at this seam is not observable: a refused,
+/// zero-row `INSERT` autocommits (and so releases SQLite's write lock)
+/// before returning, and the probe that follows it is a plain `SELECT`,
+/// which never blocks on a writer in WAL mode. Two back-to-back Rust calls
+/// on the same thread with no `.await` between them leave no real window
+/// for another OS thread to interleave — a racer would have to win a
+/// same-thread, no-I/O footrace against its own scheduling latency, which
+/// it structurally cannot do. This module replaces that footrace with a
+/// real rendezvous: the guarded call blocks at the seam until the test
+/// releases it, so the racer's write is forced to land in the seam's
+/// window on unwrapped (pre-fix) code, and forced to block behind the
+/// still-open `BEGIN IMMEDIATE` on wrapped (fixed) code.
+///
+/// Scoped by `(source_id, target_id)` rather than global so unrelated
+/// `upsert_edge_guarded` calls from other tests running concurrently in the
+/// same process are unaffected (`hook` is a no-op unless its key matches an
+/// installed barrier).
+pub(super) mod insert_probe_seam {
+    use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
+    use std::sync::Mutex;
+    use uuid::Uuid;
+
+    struct Barrier {
+        key: (Uuid, Uuid),
+        reached_tx: SyncSender<()>,
+        proceed_rx: Receiver<()>,
+    }
+
+    static BARRIER: Mutex<Option<Barrier>> = Mutex::new(None);
+
+    /// Installs a barrier for the given `(source_id, target_id)` key.
+    /// Returns the `reached` receiver (fires once the guarded call has
+    /// executed its `INSERT` and is parked at the seam) and the `proceed`
+    /// sender the caller uses to release it.
+    pub(crate) fn install(key: (Uuid, Uuid)) -> (Receiver<()>, SyncSender<()>) {
+        let (reached_tx, reached_rx) = sync_channel(0);
+        let (proceed_tx, proceed_rx) = sync_channel(0);
+        *BARRIER.lock().unwrap() = Some(Barrier {
+            key,
+            reached_tx,
+            proceed_rx,
+        });
+        (reached_rx, proceed_tx)
+    }
+
+    /// Clears any still-installed barrier. Safe to call unconditionally
+    /// after a test finishes, whether or not `hook` ever consumed it.
+    pub(crate) fn uninstall() {
+        *BARRIER.lock().unwrap() = None;
+    }
+
+    /// Called from the production insert-then-probe seam. A no-op unless a
+    /// barrier for this exact key is currently installed. Single-use: takes
+    /// the barrier out of the static the moment it matches, so a second
+    /// call with the same key (there is none in this test) would fall
+    /// through as a no-op rather than re-blocking.
+    pub(crate) fn hook(key: (Uuid, Uuid)) {
+        let barrier = {
+            let mut guard = BARRIER.lock().unwrap();
+            match guard.as_ref() {
+                Some(barrier) if barrier.key == key => guard.take(),
+                _ => None,
+            }
+        };
+        let Some(barrier) = barrier else {
+            return;
+        };
+        let _ = barrier.reached_tx.send(());
+        let _ = barrier.proceed_rx.recv();
+    }
+}
+
 fn setup_memory_store() -> SqlGraphStore {
     let config = PoolConfig {
         path: None,
@@ -2796,7 +2872,7 @@ async fn upsert_edges_guarded_writes_nothing_when_one_endpoint_vanishes() {
     }
 }
 
-/// Round-4 codex Medium: on the flag-off, file-backed singleton fallback
+/// Round-4/-5 codex Medium: on the flag-off, file-backed singleton fallback
 /// (`SqlGraphStore::with_writer`'s `is_file_backed` branch, no `WriterTask`),
 /// `upsert_edge_guarded` must run its guarded `INSERT` and, when refused,
 /// the missing-endpoint probe inside ONE `BEGIN IMMEDIATE` transaction —
@@ -2804,17 +2880,31 @@ async fn upsert_edges_guarded_writes_nothing_when_one_endpoint_vanishes() {
 /// interleave between, recreating the endpoint after the insert was
 /// refused but before the probe explains why.
 ///
-/// Forces the interleaving deterministically rather than racing on timing:
-/// an independent connection to the SAME database file grabs the write
-/// lock BEFORE the guarded call is even spawned and holds it while the
-/// guarded call's own standalone-writer connection blocks on its own
-/// `BEGIN IMMEDIATE`. Releasing that lock leaves the guarded call as the
-/// only contender, so it is guaranteed to acquire it before a third,
-/// later-spawned connection ("the racer") gets a chance to recreate the
-/// missing target. With the fix, the guarded call's insert and its
-/// missing-endpoint probe therefore always observe the same, still-missing
-/// target inside one held write lock, regardless of what the racer does
-/// immediately afterward.
+/// Round-5 sabotage-verified that a purely timing-based version of this
+/// test (sleeps guessing when the guarded call was "probably" parked on
+/// the write lock, then "probably" holding it) still passed with the
+/// round-5 transaction wrapping removed: a refused, zero-row `INSERT`
+/// autocommits — and so releases the write lock — before the guarded
+/// call's Rust code even returns from it, and the probe that follows is a
+/// plain `SELECT`, which never blocks on a writer in WAL mode. The two
+/// statements run back to back on the same thread with no `.await`
+/// between them, so there is no real scheduling gap for a racer on
+/// another OS thread to win; a sleep-based racer is really racing its own
+/// wake-up latency against a same-thread, no-I/O continuation, and loses
+/// every time.
+///
+/// So this version does not race at all. [`insert_probe_seam`] has
+/// production code itself (`edge_insert_guarded`, `#[cfg(test)]`-only)
+/// park the guarded call at the exact seam between its `INSERT` and its
+/// probe, keyed on this test's own `(source, target)` pair so unrelated
+/// concurrent tests are unaffected. The racer's write is then forced to
+/// attempt landing at that exact seam:
+///   - unwrapped (pre-fix) code holds no lock at the seam, so the racer's
+///     write always lands before the probe resumes — reproducing #769's
+///     residual bug (the probe wrongly reports the target as not missing).
+///   - wrapped (fixed) code still holds its `BEGIN IMMEDIATE` at the seam,
+///     so the racer blocks behind it and cannot land until after the
+///     probe (and the guarded call's `COMMIT`) has already run.
 #[tokio::test]
 async fn upsert_edge_guarded_probe_is_atomic_with_insert_on_file_backed_singleton_path() {
     let dir = tempfile::tempdir().unwrap();
@@ -2859,53 +2949,72 @@ async fn upsert_edge_guarded_probe_is_atomic_with_insert_on_file_backed_singleto
     let edge = make_edge(source, target, EdgeRelation::Extends, 1.0);
     let edge_id = edge.id;
 
-    // Grab the file's write lock from an independent connection before the
-    // guarded call is spawned, so its own `open_standalone_writer`
-    // connection is guaranteed to block on `BEGIN IMMEDIATE` rather than run.
-    let occupier = rusqlite::Connection::open(&path).unwrap();
-    occupier
-        .busy_timeout(std::time::Duration::from_secs(30))
-        .unwrap();
-    occupier.execute_batch("BEGIN IMMEDIATE").unwrap();
+    // Install the seam barrier before spawning the guarded call, keyed on
+    // the exact (source, target) pair `edge_insert_guarded` canonicalizes
+    // to and passes into `insert_probe_seam::hook` (Extends is not a
+    // symmetric relation, so canonicalization is a no-op here).
+    let (reached_rx, proceed_tx) = insert_probe_seam::install((source, target));
 
     let guarded_task = {
         let store = Arc::clone(&store);
         tokio::spawn(async move { store.upsert_edge_guarded(edge).await })
     };
 
-    // Give the guarded call's blocking task time to actually issue its own
-    // `BEGIN IMMEDIATE` and start waiting on the lock we hold.
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    // Deterministic rendezvous: blocks until the guarded call has actually
+    // executed its refused INSERT and is parked at the seam. No sleep, no
+    // guess — a real signal sent from production code at that exact point.
+    tokio::task::spawn_blocking(move || reached_rx.recv())
+        .await
+        .expect("waiting for the seam signal must not panic")
+        .expect("guarded call must reach the insert-to-probe seam");
 
-    // Release the lock. The guarded call, already parked in SQLite's busy
-    // retry loop, is the only contender and will acquire it next.
-    occupier.execute_batch("COMMIT").unwrap();
-
-    // Give the guarded call a moment to actually re-acquire the now-free
-    // lock before the racer even opens a connection, so the racer is the
-    // one left waiting rather than the other way around.
-    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-
-    // Only now attempt to recreate the missing target — from a THIRD
-    // connection racing the guarded call for the lock the guarded call
-    // should already be holding.
+    // Now attempt to recreate the missing target from an independent
+    // connection while the guarded call is parked exactly at the seam. On
+    // unwrapped (pre-fix) code nothing holds the write lock here, so this
+    // succeeds immediately; on wrapped (fixed) code the guarded call's own
+    // BEGIN IMMEDIATE is still open, so this blocks until it commits.
     let racer_path = path.clone();
+    let (racer_started_tx, racer_started_rx) = std::sync::mpsc::sync_channel::<()>(0);
     let racer = tokio::task::spawn_blocking(move || {
         let conn = rusqlite::Connection::open(&racer_path).unwrap();
-        conn.busy_timeout(std::time::Duration::from_secs(30))
+        conn.busy_timeout(std::time::Duration::from_secs(2))
             .unwrap();
+        let _ = racer_started_tx.send(());
         conn.execute(
             "INSERT INTO entities (id, deleted_at) VALUES (?1, NULL)",
             rusqlite::params![target.to_string()],
         )
-        .unwrap();
     });
+
+    // Deterministic signal that the racer has actually dispatched its
+    // INSERT to SQLite, then a bounded settle window for it to either
+    // complete (unwrapped code: no lock in the way) or genuinely start
+    // blocking on the guarded call's still-open transaction (fixed code).
+    // This window never has to race the guarded call itself — the guarded
+    // call cannot move past the seam until `proceed_tx` fires below.
+    tokio::task::spawn_blocking(move || racer_started_rx.recv())
+        .await
+        .expect("waiting for the racer-started signal must not panic")
+        .expect("racer must signal before attempting its INSERT");
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    // Release the guarded call. On unwrapped code the racer's write has
+    // already landed by now, so the probe below will (wrongly) see the
+    // target as present. On wrapped code the racer is still blocked behind
+    // the open transaction, so the probe still sees it missing.
+    proceed_tx
+        .send(())
+        .expect("guarded call must still be waiting at the seam");
 
     let outcome = guarded_task
         .await
         .expect("guarded task must not panic")
         .unwrap();
-    racer.await.expect("racer task must not panic");
+    racer
+        .await
+        .expect("racer task must not panic")
+        .expect("racer's INSERT must eventually succeed");
+    insert_probe_seam::uninstall();
 
     match outcome {
         khive_storage::GuardedWriteOutcome::Refused(missing) => {
