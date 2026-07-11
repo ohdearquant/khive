@@ -427,19 +427,22 @@ class ConcurrentFrameFloorTests(unittest.TestCase):
         finally:
             server.close()
 
-    def test_measure_concurrent_frames_metrics_only_frame_bypasses_config_validation(self):
-        # metrics_only frames are answered before the daemon's config_id
-        # check (namespace/config-agnostic gauge read), so served_config_id
-        # there is not a dispatch-identity guarantee and must not be
-        # validated against the requested config_id.
+    def test_measure_concurrent_frames_rejects_metrics_only_frame_as_not_a_measurement(self):
+        # A metrics_only frame is a daemon-metrics gauge probe, answered
+        # before the config_id check (namespace/config-agnostic read), never
+        # a dispatch measurement. Its elapsed time must never enter the
+        # success latency population, regardless of served_config_id.
         server = _MockDaemonServer(
             lambda frame: _base_response(frame, ok=True, served_config_id="unrelated-cfg", metrics={"wal_pages": 1})
         )
         try:
             frame = mbc.base_daemon_frame("", "cfg-under-test", probe_only=False, metrics_only=True)
             out = mbc.measure_concurrent_frames(server.sock_path, frame, attempts=3, concurrency=1, deadline_ms=2000)
-            self.assertEqual(out["successes"], 3)
-            self.assertEqual(out["errors_by_code"], {})
+            self.assertEqual(out["successes"], 0)
+            self.assertEqual(out["timed_out"], 0)
+            self.assertEqual(out["errors_by_code"], {"metrics_only": 3})
+            self.assertIsNone(out["p50_us"])
+            self.assertIsNone(out["max_us"])
         finally:
             server.close()
 

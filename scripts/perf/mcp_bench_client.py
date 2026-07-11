@@ -499,12 +499,14 @@ def _classify_bad_response(resp: dict, frame: dict) -> str | None:
     WITHOUT dispatching when the frame's `config_id` disagrees with its own
     (`crates/khive-runtime/src/daemon.rs` around 799-810), so a stale or
     mismatched daemon would otherwise produce a plausible-but-wrong
-    fast-rejection latency. `metrics_only` frames are exempt: the daemon
-    answers them before the config_id check (namespace/config-agnostic gauge
-    read), so `served_config_id` there is not a dispatch-identity guarantee.
+    fast-rejection latency. `metrics_only` frames are rejected outright: they
+    are a daemon-metrics gauge probe, answered before the config_id check
+    (namespace/config-agnostic read), never a dispatch measurement, so their
+    elapsed time must never enter the success latency population regardless
+    of what `served_config_id` they carry.
     """
     if frame.get("metrics_only"):
-        return None
+        return "metrics_only"
     if resp.get("config_mismatch"):
         return "config_mismatch"
     if resp.get("version_mismatch"):
