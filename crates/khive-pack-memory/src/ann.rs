@@ -125,6 +125,17 @@ pub(crate) struct AnnState {
     /// — only a test that explicitly sets this waits on the release signal.
     #[cfg(test)]
     pub(crate) attempt_floor_barrier: std::sync::atomic::AtomicBool,
+    /// Test-only completion signal: notified whenever `WarmingGuard::drop`
+    /// releases `key` from `warming` (#844). A test that fires a warm-up
+    /// recall has no other way to observe that the background rebuild the
+    /// recall (or a preceding `memory.remember`) triggered has actually
+    /// finished — `ensure_ann_background`'s only return value is whether it
+    /// started a task, and `track_background_task` itself hands back no
+    /// `JoinHandle` (it is deliberately fire-and-forget in production, see
+    /// its doc comment). `wait_until_warm_idle` below pairs with this to give
+    /// tests a deterministic barrier instead of polling on a sleep loop.
+    #[cfg(test)]
+    pub(crate) warming_idle: tokio::sync::Notify,
 }
 
 pub(crate) type SharedAnn = Arc<AnnState>;
@@ -144,6 +155,8 @@ pub(crate) fn new_shared() -> SharedAnn {
         attempt_floor_release: tokio::sync::Notify::new(),
         #[cfg(test)]
         attempt_floor_barrier: std::sync::atomic::AtomicBool::new(false),
+        #[cfg(test)]
+        warming_idle: tokio::sync::Notify::new(),
     })
 }
 
@@ -630,6 +643,26 @@ struct WarmingGuard {
 impl Drop for WarmingGuard {
     fn drop(&mut self) {
         lock_warming(&self.ann).remove(&self.key);
+        #[cfg(test)]
+        self.ann.warming_idle.notify_waiters();
+    }
+}
+
+/// Test-only: await until `key` is no longer in the `warming` single-flight
+/// set (#844) — i.e. every background rebuild task that was in flight for it
+/// has finished (or none ever started). Creates the `Notified` future before
+/// checking the predicate so a release that lands between the check and the
+/// `.await` is never missed (`tokio::sync::Notify`'s documented guarantee),
+/// and loops so a chained re-enqueue that grabs the guard again after this
+/// call observed a momentary release is still waited out.
+#[cfg(test)]
+pub(crate) async fn wait_until_warm_idle(ann: &SharedAnn, key: &AnnKey) {
+    loop {
+        let notified = ann.warming_idle.notified();
+        if !lock_warming(ann).contains(key) {
+            return;
+        }
+        notified.await;
     }
 }
 

@@ -1271,19 +1271,24 @@ impl BrainPack {
         // reject the feedback loop's own recalled targets. NotFound only for a
         // genuinely absent UUID.
         use khive_runtime::Resolved;
-        match self
+        // ADR-041 permits both entity and note signal targets; the resolved
+        // substrate is threaded onto the emitted event below (Finding 1,
+        // round-1 codex review of #831) so the decoder can tell entity and
+        // note signal observations apart instead of hard-coding entity.
+        let target_substrate = match self
             .runtime
             .resolve_by_id(token, target)
             .await
             .map_err(|e| RuntimeError::InvalidInput(e.to_string()))?
         {
-            Some(Resolved::Entity(_)) | Some(Resolved::Note(_)) => {}
+            Some(Resolved::Entity(_)) => khive_types::SubstrateKind::Entity,
+            Some(Resolved::Note(_)) => khive_types::SubstrateKind::Note,
             _ => {
                 return Err(RuntimeError::NotFound(format!(
                     "target_id {target:?} not found"
                 )));
             }
-        }
+        };
 
         // Compute the effective serving profile (explicit, else a matching
         // actor+namespace binding, else the system default — #697), then
@@ -1449,7 +1454,7 @@ impl BrainPack {
                         namespace_for_event,
                         "brain.feedback",
                         khive_types::EventKind::FeedbackExplicit,
-                        khive_types::SubstrateKind::Event,
+                        target_substrate,
                         "brain",
                     )
                     .with_target(target)
@@ -1491,7 +1496,7 @@ impl BrainPack {
                 token.namespace().as_str().to_string(),
                 "brain.feedback",
                 khive_types::EventKind::FeedbackExplicit,
-                khive_types::SubstrateKind::Event,
+                target_substrate,
                 "brain",
             )
             .with_target(target)

@@ -245,6 +245,19 @@ pub enum FilterOp {
     /// Equivalent to `json_type IS NULL OR json_type != value`.
     /// Used for unread filter: matches any `$.read` that is NOT the JSON boolean true.
     JsonTypeNeMissing,
+    /// Matches rows where `json_extract(properties, path)` equals any value in
+    /// the set. A row with a missing/NULL property does not match — use
+    /// `NotInOrMissing` with the complementary set when "absent" should count
+    /// as included. `PropertyFilter.value` is unused for this op; the set
+    /// lives in the variant itself.
+    In(Vec<SqlValue>),
+    /// Matches rows where the property is missing/NULL OR its value is not in
+    /// the set. Used for "exclude a small closed set of terminal values, but
+    /// treat a still-unset property as included" (e.g. GTD default task
+    /// listing excludes `done`/`cancelled` while a task with no `status` yet
+    /// still counts as `inbox`, i.e. included). `PropertyFilter.value` is
+    /// unused for this op; the set lives in the variant itself.
+    NotInOrMissing(Vec<SqlValue>),
 }
 
 /// A single `json_extract(properties, '$.field') op value` predicate.
@@ -296,6 +309,22 @@ pub trait NoteStore: Send + Sync + 'static {
     async fn get_note_including_deleted(&self, id: Uuid) -> StorageResult<Option<Note>>;
     /// Delete a note by UUID using the specified delete mode.
     async fn delete_note(&self, id: Uuid, mode: DeleteMode) -> StorageResult<bool>;
+    /// Patch `properties`/`updated_at` on an existing note in place via a real
+    /// `UPDATE`, leaving every other column (including the row's `rowid`)
+    /// untouched.
+    ///
+    /// Unlike `upsert_note` (an `INSERT OR REPLACE`, which on a primary-key
+    /// conflict is a SQLite DELETE+INSERT that silently reassigns the row's
+    /// implicit `rowid`), this never churns `rowid`, which is required by any
+    /// caller relying on `rowid` as a stable, monotonically-increasing cursor (#780).
+    /// Returns `true` when a live (non-soft-deleted) row with this `id` was
+    /// found and updated, `false` otherwise.
+    async fn update_note_properties(
+        &self,
+        id: Uuid,
+        properties: Option<Value>,
+        updated_at: i64,
+    ) -> StorageResult<bool>;
     /// Query notes by namespace and optional kind with pagination.
     async fn query_notes(
         &self,
@@ -310,6 +339,24 @@ pub trait NoteStore: Send + Sync + 'static {
         filter: &NoteFilter,
         page: PageRequest,
     ) -> StorageResult<Page<Note>>;
+    /// Fetch up to `max_rows + 1` notes matching `filter` in a single
+    /// deterministically-ordered SQL statement, with no separate `COUNT(*)`
+    /// and no pagination loop.
+    ///
+    /// A single statement observes one consistent snapshot for its entire
+    /// execution, so the result cannot be split across a concurrent insert
+    /// the way a `COUNT(*)` followed by independent `LIMIT`/`OFFSET` pages
+    /// can. Callers detect the over-bound case by checking whether the
+    /// returned `Vec` has more than `max_rows` items — that means at least
+    /// `max_rows + 1` rows matched and the caller must reject the query
+    /// rather than silently return a truncated, possibly priority-incomplete
+    /// set.
+    async fn query_notes_filtered_bounded(
+        &self,
+        namespace: &str,
+        filter: &NoteFilter,
+        max_rows: u32,
+    ) -> StorageResult<Vec<Note>>;
     /// Count notes in a namespace, optionally filtered by kind.
     async fn count_notes(&self, namespace: &str, kind: Option<&str>) -> StorageResult<u64>;
 

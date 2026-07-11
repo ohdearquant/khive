@@ -2,7 +2,7 @@
 
 use serde_json::Value;
 
-use crate::types::{ArgValue, DslError, ParsedOp};
+use crate::types::{ArgValue, DslError, ParsedOp, NESTING_DEPTH_LIMIT};
 
 use super::scan::{char_label, scan_string_end};
 
@@ -10,6 +10,10 @@ use super::scan::{char_label, scan_string_end};
 pub(crate) struct Parser<'a> {
     pub(crate) src: &'a [u8],
     pub(crate) pos: usize,
+    /// Current container-nesting depth (`[`/`{` inside arg values). Guards
+    /// `parse_array_arg`/`parse_object_arg` recursion against CWE-674, see
+    /// [`NESTING_DEPTH_LIMIT`].
+    depth: usize,
 }
 
 impl<'a> Parser<'a> {
@@ -18,7 +22,26 @@ impl<'a> Parser<'a> {
         Self {
             src: src.as_bytes(),
             pos: 0,
+            depth: 0,
         }
+    }
+
+    /// Enter one level of container nesting, rejecting once the depth limit
+    /// is exceeded. Always pair with a `self.depth -= 1` after the nested
+    /// parse completes (on both `Ok` and `Err`, so depth never leaks across
+    /// sibling containers).
+    fn enter_container(&mut self) -> Result<(), DslError> {
+        self.depth += 1;
+        if self.depth > NESTING_DEPTH_LIMIT {
+            let depth = self.depth;
+            self.depth -= 1;
+            return Err(DslError::NestingTooDeep {
+                pos: self.pos,
+                depth,
+                max: NESTING_DEPTH_LIMIT,
+            });
+        }
+        Ok(())
     }
 
     /// Return true if the cursor is at the end of input.
@@ -156,6 +179,13 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_array_arg(&mut self) -> Result<ArgValue, DslError> {
+        self.enter_container()?;
+        let result = self.parse_array_arg_body();
+        self.depth -= 1;
+        result
+    }
+
+    fn parse_array_arg_body(&mut self) -> Result<ArgValue, DslError> {
         self.advance(1); // consume '['
         self.skip_ws();
         let mut elements: Vec<ArgValue> = Vec::new();
@@ -202,6 +232,13 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_object_arg(&mut self) -> Result<ArgValue, DslError> {
+        self.enter_container()?;
+        let result = self.parse_object_arg_body();
+        self.depth -= 1;
+        result
+    }
+
+    fn parse_object_arg_body(&mut self) -> Result<ArgValue, DslError> {
         self.advance(1); // consume '{'
         self.skip_ws();
         let mut pairs: Vec<(String, ArgValue)> = Vec::new();

@@ -21,6 +21,7 @@ use uuid::Uuid;
 use khive_runtime::{secret_gate, KhiveRuntime, NamespaceToken, VerbRegistry};
 use khive_storage::types::{SqlStatement, SqlValue};
 
+use crate::hook;
 use crate::refs;
 
 /// Which record kinds a `run_ingest` pass processes. `Default` selects all
@@ -1138,6 +1139,122 @@ struct GhPr {
     body: Option<String>,
 }
 
+/// Every `GhIssue` field funnels through this constructor before it can
+/// reach `properties`/`content`/the note name/the paging cursor. `new`
+/// consumes `GhIssue` by value and destructures it exhaustively (no `..`),
+/// so the original `issue` binding no longer exists after the call -- a
+/// call site has no way to read a raw field back out, and a future new
+/// `GhIssue` field forces a compile error here before it can silently skip
+/// this boundary.
+struct MaskedIssueFields {
+    number: u64,
+    title: String,
+    body: String,
+    author_login: Option<String>,
+    labels: Vec<String>,
+    created_at: Option<String>,
+    closed_at: Option<String>,
+    updated_at: Option<String>,
+    state_reason: StateReasonField,
+}
+
+/// The classified outcome of parsing a raw `stateReason` string against the
+/// governed enum (`hook::ISSUE_STATE_REASONS`, ADR-088 §3) at the masking
+/// boundary. `Rejected` never carries the raw string forward -- the ingest
+/// loop must reject the record with a warning that names only the field,
+/// never its value (round-3 codex finding: a credential-shaped `stateReason`
+/// must never reach `report.warnings` or the hook's own error path).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum StateReasonField {
+    Absent,
+    Valid(String),
+    Rejected,
+}
+
+impl MaskedIssueFields {
+    fn new(issue: GhIssue, warnings: &mut Vec<String>) -> Self {
+        let GhIssue {
+            number,
+            title,
+            author,
+            created_at,
+            closed_at,
+            updated_at,
+            labels,
+            state_reason,
+            body,
+        } = issue;
+
+        Self {
+            number,
+            title: secret_gate::mask_secrets(&title).into_owned(),
+            body: secret_gate::mask_secrets(&body.unwrap_or_default()).into_owned(),
+            author_login: author
+                .and_then(|a| a.login)
+                .map(|login| secret_gate::mask_secrets(&login).into_owned()),
+            labels: labels
+                .unwrap_or_default()
+                .into_iter()
+                .map(|l| secret_gate::mask_secrets(&l.name).into_owned())
+                .collect(),
+            created_at: canonical_issue_timestamp("createdAt", number, created_at, warnings),
+            closed_at: canonical_issue_timestamp("closedAt", number, closed_at, warnings),
+            updated_at: canonical_issue_timestamp("updatedAt", number, updated_at, warnings),
+            state_reason: canonical_issue_state_reason(state_reason),
+        }
+    }
+}
+
+/// Classifies a raw `stateReason` string against the governed enum
+/// (`hook::ISSUE_STATE_REASONS`, ADR-088 §3) at the masking boundary. GitHub
+/// reports `stateReason` as `""` for open issues and an UPPERCASE enum value
+/// (e.g. `NOT_PLANNED`) for closed ones, so case is normalized before the
+/// membership check. A value that is present, non-empty, and not one of the
+/// four governed values is classified `Rejected` -- the caller must reject
+/// the whole record with a warning naming only the field, never echoing this
+/// (possibly credential-shaped) raw string.
+fn canonical_issue_state_reason(raw: Option<String>) -> StateReasonField {
+    let Some(raw) = raw.filter(|r| !r.is_empty()) else {
+        return StateReasonField::Absent;
+    };
+    let lowered = raw.to_ascii_lowercase();
+    if hook::ISSUE_STATE_REASONS.contains(&lowered.as_str()) {
+        StateReasonField::Valid(lowered)
+    } else {
+        StateReasonField::Rejected
+    }
+}
+
+/// Parses a GitHub issue timestamp into its canonical RFC3339 form. GitHub's
+/// API always returns valid RFC3339 timestamps; a value that fails to parse
+/// is untrusted/malformed input (round-2 codex finding: a credential-shaped
+/// string is exactly this case) and must never reach `properties` or the
+/// paging cursor as a raw string. On parse failure the field is rejected
+/// (becomes absent) and a warning is recorded -- without the raw value,
+/// which may itself be secret-shaped -- rather than letting an unparseable
+/// string silently pass the generic recursive secret scan downstream. The
+/// issue itself is still ingested; only this one field is dropped.
+fn canonical_issue_timestamp(
+    field: &'static str,
+    number: u64,
+    raw: Option<String>,
+    warnings: &mut Vec<String>,
+) -> Option<String> {
+    let raw = raw?;
+    match chrono::DateTime::parse_from_rfc3339(&raw) {
+        Ok(dt) => Some(
+            dt.with_timezone(&Utc)
+                .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        ),
+        Err(_) => {
+            warnings.push(format!(
+                "issue #{number}: {field} is not a valid RFC3339 timestamp, field dropped"
+            ));
+            None
+        }
+    }
+}
+
 fn gh_json(repo: &Path, args: &[&str]) -> Result<String> {
     // gh has no `-C` flag (unlike git) — repo targeting is via working directory.
     let output = Command::new("gh")
@@ -1462,29 +1579,41 @@ async fn ingest_issues(
     let mut window_complete = true;
 
     'paging: loop {
-        let mut page = fetch_issue_page(repo, floor.as_deref())?;
+        let page = fetch_issue_page(repo, floor.as_deref())?;
         let page_len = page.len();
+        // The ENTIRE fetched page is classified (masked strings, canonicalized
+        // timestamps, governed-enum `state_reason`) before anything else --
+        // including the sort and the paging cursor derivation below -- touches
+        // it. A raw `GhIssue.updated_at` must never reach the sort comparator,
+        // `last_updated_at`, or (via `decide_page_outcome`'s `Continue`) a
+        // future `gh --search updated:>=` argument (round-3 codex finding: a
+        // credential-shaped `updatedAt` could otherwise sort last and leak
+        // into process arguments through the paging floor).
+        let mut masked_page: Vec<MaskedIssueFields> = page
+            .into_iter()
+            .map(|issue| MaskedIssueFields::new(issue, &mut report.warnings))
+            .collect();
         // See `ingest_prs`: the frozen-cursor retry guarantee requires
         // walking records in nondecreasing updated_at order, which `--search
         // sort:updated-asc` does not itself guarantee across ties — sort
-        // defensively.
-        page.sort_by(|a, b| a.updated_at.cmp(&b.updated_at));
-        let last_updated_at = page.last().and_then(|i| i.updated_at.clone());
+        // defensively, using the canonicalized (not raw) timestamp.
+        masked_page.sort_by(|a, b| a.updated_at.cmp(&b.updated_at));
+        let last_updated_at = masked_page.last().and_then(|i| i.updated_at.clone());
 
-        for issue in page {
+        for masked in masked_page {
             let is_new = since
                 .as_deref()
-                .zip(issue.updated_at.as_deref())
+                .zip(masked.updated_at.as_deref())
                 .map(|(cursor, updated)| updated >= cursor)
                 .unwrap_or(true);
 
-            if find_by_number(runtime, token, "issue", project_id, issue.number)
+            if find_by_number(runtime, token, "issue", project_id, masked.number)
                 .await?
                 .is_some()
             {
                 report.issues_skipped_existing += 1;
                 if !cursor_stalled {
-                    if let Some(u) = &issue.updated_at {
+                    if let Some(u) = &masked.updated_at {
                         if max_updated
                             .as_deref()
                             .map(|m| u.as_str() > m)
@@ -1503,34 +1632,40 @@ async fn ingest_issues(
                 break;
             }
 
-            let raw_body = issue.body.unwrap_or_default();
-            let content = secret_gate::mask_secrets(&raw_body).into_owned();
-            let labels: Vec<String> = issue
-                .labels
-                .unwrap_or_default()
-                .into_iter()
-                .map(|l| l.name)
-                .collect();
+            let number = masked.number;
+            let updated_at = masked.updated_at.clone();
+
+            // `stateReason` was already parsed into the governed enum at the
+            // masking boundary (`canonical_issue_state_reason`). An ungoverned
+            // value is rejected here, before the record is ever built or
+            // dispatched -- the warning names only the field, never the raw
+            // (possibly credential-shaped) value, matching ADR-088's
+            // fail-closed/no-silent-coercion contract while preserving the
+            // per-record warn-and-skip / frozen-cursor-retry behavior shared
+            // with every other create-failure path in this loop.
+            if masked.state_reason == StateReasonField::Rejected {
+                report.warnings.push(format!(
+                    "issue #{number}: stateReason is not one of the governed values, record skipped"
+                ));
+                cursor_stalled = true;
+                continue;
+            }
+
+            let content = masked.body;
+            let safe_title = masked.title;
             let mut properties = json!({
-                "number": issue.number,
-                "title": issue.title,
-                "author": issue.author.and_then(|a| a.login),
-                "created_at": issue.created_at,
-                "closed_at": issue.closed_at,
-                "labels": labels,
+                "number": number,
+                "title": safe_title,
+                "author": masked.author_login,
+                "created_at": masked.created_at,
+                "closed_at": masked.closed_at,
+                "labels": masked.labels,
                 "project_id": project_id.to_string(),
             });
-            // gh reports stateReason as "" for open issues and UPPERCASE enum values
-            // (NOT_PLANNED) for closed ones; the kind hook governs any PRESENT value
-            // against the lowercase GitHub stateReason enum, so normalize case and encode
-            // "open / no reason" as absent.
-            if let Some(reason) = issue.state_reason.as_deref().filter(|r| !r.is_empty()) {
-                properties["state_reason"] = json!(reason.to_ascii_lowercase());
+            if let StateReasonField::Valid(reason) = masked.state_reason {
+                properties["state_reason"] = json!(reason);
             }
-            let name = refs::truncate_chars(
-                &format!("#{} {}", issue.number, issue.title),
-                NAME_MAX_CHARS,
-            );
+            let name = refs::truncate_chars(&format!("#{number} {safe_title}"), NAME_MAX_CHARS);
 
             budget.try_consume();
             let result = match registry
@@ -1548,9 +1683,7 @@ async fn ingest_issues(
             {
                 Ok(v) => v,
                 Err(e) => {
-                    report
-                        .warnings
-                        .push(format!("create issue #{}: {e}", issue.number));
+                    report.warnings.push(format!("create issue #{number}: {e}"));
                     cursor_stalled = true;
                     continue;
                 }
@@ -1568,7 +1701,7 @@ async fn ingest_issues(
 
             report.issues_ingested += 1;
             if !cursor_stalled {
-                if let Some(u) = &issue.updated_at {
+                if let Some(u) = &updated_at {
                     if max_updated
                         .as_deref()
                         .map(|m| u.as_str() > m)

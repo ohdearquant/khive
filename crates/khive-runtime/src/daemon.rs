@@ -95,6 +95,54 @@ pub fn lock_path() -> PathBuf {
     khive_dir().join("khived.recovery.lock")
 }
 
+/// Advisory lock file used to serialize RECOVERY (kill+respawn) attempts
+/// across concurrent clients only — the daemon's own boot sequence never
+/// acquires this file ([`lock_path`] / [`acquire_daemon_boot_guard`] is the
+/// boot-side lock).  A recoverer holding this lock across dead-confirmation
+/// → kill → spawn (khive-mcp's `kill_and_respawn`, #838 round-1 Finding 1)
+/// therefore can never deadlock against a peer daemon's boot, unlike holding
+/// the shared boot lock for that whole span would.
+///
+/// Overridable via the `KHIVE_RECOVERER_LOCK` env var (for tests).
+pub fn recoverer_lock_path() -> PathBuf {
+    if let Ok(p) = std::env::var("KHIVE_RECOVERER_LOCK") {
+        if !p.is_empty() {
+            return PathBuf::from(p);
+        }
+    }
+    khive_dir().join("khived.recoverer.lock")
+}
+
+#[cfg(unix)]
+fn open_lock_file(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(path)
+}
+
+#[cfg(unix)]
+fn acquire_flock_blocking(path: &std::path::Path, label: &str) -> Option<std::fs::File> {
+    let file = match open_lock_file(path) {
+        Ok(f) => f,
+        Err(e) => {
+            tracing::warn!(error = %e, path = ?path, "cannot open {label} lock file");
+            return None;
+        }
+    };
+    // SAFETY: flock is a POSIX advisory lock with no memory side-effects.
+    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+    if rc != 0 {
+        tracing::warn!("flock LOCK_EX failed on {label} lock");
+        return None;
+    }
+    Some(file)
+}
+
 /// Acquire an exclusive advisory flock on the recovery/startup lock file.
 ///
 /// The returned `File` holds the lock for its lifetime; dropping it releases
@@ -103,29 +151,75 @@ pub fn lock_path() -> PathBuf {
 /// mutually exclusive across processes.
 #[cfg(unix)]
 pub fn acquire_recovery_lock() -> Option<std::fs::File> {
-    let path = lock_path();
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    let file = match std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .open(&path)
-    {
-        Ok(f) => f,
-        Err(e) => {
-            tracing::warn!(error = %e, path = ?path, "cannot open recovery lock file");
-            return None;
+    acquire_flock_blocking(&lock_path(), "recovery")
+}
+
+/// Attempt to acquire an exclusive advisory flock on `path`, retrying with a
+/// non-blocking `flock(LOCK_NB)` until `deadline` elapses.
+///
+/// Unlike [`acquire_recovery_lock`]/[`acquire_daemon_boot_guard`] (unbounded
+/// blocking `flock`, correct for the daemon's own boot sequence where waiting
+/// until quiescence IS the desired behavior), a caller only trying to *detect*
+/// whether a lock is currently free — without committing to wait forever for
+/// a possibly-wedged holder — needs a deadline instead (#838 round-1
+/// Finding 2). Returns:
+///   - `Ok(Some(file))` — the lock was free within the deadline.
+///   - `Ok(None)` — `deadline` elapsed while the lock stayed held; an
+///     explicit "could not confirm" outcome, distinct from a hard I/O error.
+///   - `Err(_)` — the lock file could not be opened, or `flock` failed for a
+///     reason other than contention.
+///
+/// Blocking (paces retries with `std::thread::sleep`) — async callers must
+/// run this via `spawn_blocking`.
+#[cfg(unix)]
+fn try_acquire_flock_until(
+    path: &std::path::Path,
+    deadline: std::time::Instant,
+) -> std::io::Result<Option<std::fs::File>> {
+    let file = open_lock_file(path)?;
+    let poll_interval = std::time::Duration::from_millis(10);
+    loop {
+        // SAFETY: flock is a POSIX advisory lock with no memory side-effects.
+        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if rc == 0 {
+            return Ok(Some(file));
         }
-    };
-    // SAFETY: flock is a POSIX advisory lock with no memory side-effects.
-    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
-    if rc != 0 {
-        tracing::warn!("flock LOCK_EX failed on recovery lock");
-        return None;
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error() != Some(libc::EWOULDBLOCK) {
+            return Err(err);
+        }
+        let now = std::time::Instant::now();
+        if now >= deadline {
+            return Ok(None);
+        }
+        std::thread::sleep(poll_interval.min(deadline - now));
     }
-    Some(file)
+}
+
+/// Bounded, deadline-aware variant of [`acquire_daemon_boot_guard`]: attempts
+/// the SAME boot/recovery lock ([`lock_path`]) but gives up at `deadline`
+/// instead of blocking forever. For callers that need to detect "is a boot in
+/// progress right now" without risking an unbounded wait behind a wedged
+/// holder (#838 round-1 Finding 2) — e.g. khive-mcp's `confirm_genuinely_dead`
+/// re-probing rounds, where `DEAD_CONFIRM_ROUNDS` must bound elapsed time, not
+/// just probe count.
+#[cfg(unix)]
+pub fn try_acquire_daemon_boot_guard_until(
+    deadline: std::time::Instant,
+) -> std::io::Result<Option<DaemonBootGuard>> {
+    try_acquire_flock_until(&lock_path(), deadline)
+}
+
+/// Bounded, deadline-aware acquisition of the recoverer-only lock
+/// ([`recoverer_lock_path`]). See [`try_acquire_daemon_boot_guard_until`] for
+/// the shared rationale — a second recoverer waiting for a peer's dead
+/// confirmation/kill/spawn critical section must give up and report
+/// "uncertain" rather than block forever if that peer is itself wedged.
+#[cfg(unix)]
+pub fn try_acquire_recoverer_lock_until(
+    deadline: std::time::Instant,
+) -> std::io::Result<Option<std::fs::File>> {
+    try_acquire_flock_until(&recoverer_lock_path(), deadline)
 }
 
 /// Guard returned by [`acquire_daemon_boot_guard`], held across cold-boot
@@ -954,11 +1048,25 @@ pub async fn run_daemon_with_boot_guard<D: DaemonDispatch>(
         });
     }
 
+    // #774: the checkpoint task's own strong-count-based exit is unreachable
+    // whenever `event_store_for_checkpoint()` returns `Some` (the ordinary
+    // production shape), because the `SqlEventStore` it wraps retains its
+    // own clone of the same pool. An explicit watch channel replaces that
+    // mechanism: the sender is held for the remainder of this function's
+    // scope and signalled as the first action once shutdown is observed,
+    // below.
+    let (checkpoint_shutdown_tx, checkpoint_shutdown_rx) = tokio::sync::watch::channel(());
     if let Some(pool) = dispatcher.pool_for_checkpoint() {
         let cfg = CheckpointConfig::from_env();
         let event_store = dispatcher.event_store_for_checkpoint();
         let namespace = dispatcher.namespace().to_string();
-        tokio::spawn(run_checkpoint_task(pool, cfg, event_store, namespace));
+        track_background_task(run_checkpoint_task(
+            pool,
+            cfg,
+            event_store,
+            namespace,
+            checkpoint_shutdown_rx,
+        ));
         tracing::info!("WAL checkpoint task started");
     }
 
@@ -997,6 +1105,11 @@ pub async fn run_daemon_with_boot_guard<D: DaemonDispatch>(
         } => {}
         _ = shutdown => {}
     }
+
+    // Signal the checkpoint task to exit before draining, so `drain()`
+    // actually waits on it via `track_background_task` rather than the
+    // task outliving the drain window (or the process) unsignalled.
+    let _ = checkpoint_shutdown_tx.send(());
 
     drain(&active).await;
 
@@ -1883,28 +1996,45 @@ mod tests {
     fn shutdown_cleanup_skips_when_socket_was_rebound_by_a_replacement() {
         let dir = tempfile::tempdir().expect("tempdir");
         let sock = dir.path().join("khived.sock");
+        let original_sock = dir.path().join("original.sock");
         let pid_file = dir.path().join("khived.pid");
 
-        // This daemon's original bind — captured identity, then simulate the
-        // process exiting (listener dropped, socket path removed) before a
-        // replacement daemon rebinds the same path with a new inode.
-        let original_identity = {
-            let listener =
-                std::os::unix::net::UnixListener::bind(&sock).expect("bind original socket");
-            let id = socket_identity(&sock);
-            drop(listener);
-            let _ = std::fs::remove_file(&sock);
-            id
-        };
-        std::fs::write(&pid_file, std::process::id().to_string())
-            .expect("write pid file matching this process");
-
-        // Replacement daemon binds the same path — new inode, same PID file
-        // path (not yet overwritten, e.g. write still in flight) — the socket
-        // identity mismatch alone must be enough to block cleanup.
+        // Bind two sockets at DIFFERENT paths, both alive at the same time,
+        // so the OS cannot recycle an inode between them the way it could
+        // across a bind/drop/rebind cycle at a single path (the flakiness a
+        // prior version of this test hit on some filesystems). Both
+        // identities are captured through the real production
+        // `socket_identity()` path, not a synthetic/sentinel value, so a
+        // regression where `socket_identity()` returns a constant identity
+        // for every socket makes the `assert!` below fail loudly instead of
+        // silently passing.
+        let _original_listener =
+            std::os::unix::net::UnixListener::bind(&original_sock).expect("bind original socket");
         let _replacement_listener =
             std::os::unix::net::UnixListener::bind(&sock).expect("bind replacement socket");
 
+        let original_identity = socket_identity(&original_sock);
+        let replacement_identity = socket_identity(&sock);
+        assert!(
+            original_identity.is_some(),
+            "must read identity of the original socket"
+        );
+        assert!(
+            replacement_identity.is_some(),
+            "must read identity of the replacement socket"
+        );
+        assert!(
+            original_identity != replacement_identity,
+            "two concurrently bound sockets must have distinct identities"
+        );
+
+        std::fs::write(&pid_file, std::process::id().to_string())
+            .expect("write pid file matching this process");
+
+        // `sock` (the replacement bind's path) is checked against
+        // `original_identity` (a different, concurrently-alive socket's
+        // identity) - the mismatch alone must be enough to block cleanup,
+        // even though the pid file matches this process.
         let cleaned = shutdown_cleanup_if_owned(&sock, &pid_file, original_identity);
 
         assert!(
@@ -1913,6 +2043,10 @@ mod tests {
              inode than the one this daemon originally bound"
         );
         assert!(sock.exists(), "replacement daemon's socket must survive");
+        assert!(
+            pid_file.exists(),
+            "replacement daemon's pid file must survive"
+        );
     }
 
     // ── #667: the recovery lock actually serializes two boot sequences ───────

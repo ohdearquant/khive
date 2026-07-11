@@ -2,7 +2,7 @@
 
 use serde_json::Value;
 
-use crate::types::{ArgValue, DslError, ParsedOp};
+use crate::types::{ArgValue, DslError, ParsedOp, NESTING_DEPTH_LIMIT};
 
 /// Scan forward from an opening `"` to the matching close, handling `\\` escapes.
 pub(crate) fn scan_string_end(src: &[u8], start: usize) -> Result<usize, DslError> {
@@ -40,13 +40,63 @@ pub(super) fn is_prev_ref_string(s: &str) -> bool {
 }
 
 /// Recursively scan a JSON value for any string that is a `$prev` reference.
+///
+/// Only ever walks trees already bounded by [`check_json_nesting_depth`], but
+/// carries its own depth counter defensively (cheap, and this is an easy
+/// second recursion site to miss if the pre-pass invariant is ever changed).
 pub(crate) fn json_value_contains_prev_ref(v: &Value) -> bool {
+    json_value_contains_prev_ref_at(v, 0)
+}
+
+fn json_value_contains_prev_ref_at(v: &Value, depth: usize) -> bool {
+    if depth > NESTING_DEPTH_LIMIT {
+        return true;
+    }
     match v {
         Value::String(s) => is_prev_ref_string(s),
-        Value::Array(arr) => arr.iter().any(json_value_contains_prev_ref),
-        Value::Object(map) => map.values().any(json_value_contains_prev_ref),
+        Value::Array(arr) => arr
+            .iter()
+            .any(|e| json_value_contains_prev_ref_at(e, depth + 1)),
+        Value::Object(map) => map
+            .values()
+            .any(|e| json_value_contains_prev_ref_at(e, depth + 1)),
         _ => false,
     }
+}
+
+/// Pre-pass O(n) scan for container-nesting depth (`[`/`{`) over raw JSON-form
+/// input, bounding `serde_json::from_str::<Value>`'s otherwise-unbounded
+/// native recursive descent (CWE-674). `serde_json` exposes no depth knob
+/// for its untyped `Value` deserializer. Honors quoted strings via
+/// [`scan_string_end`] so brackets inside string literals do not count.
+pub(crate) fn check_json_nesting_depth(input: &str) -> Result<(), DslError> {
+    let bytes = input.as_bytes();
+    let mut i = 0;
+    let mut depth: usize = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'"' => {
+                i = scan_string_end(bytes, i)?;
+                continue;
+            }
+            b'[' | b'{' => {
+                depth += 1;
+                if depth > NESTING_DEPTH_LIMIT {
+                    return Err(DslError::NestingTooDeep {
+                        pos: i,
+                        depth,
+                        max: NESTING_DEPTH_LIMIT,
+                    });
+                }
+            }
+            b']' | b'}' => {
+                depth = depth.saturating_sub(1);
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    Ok(())
 }
 
 /// Scan an op's args for any `PrevRef` and return a representative position

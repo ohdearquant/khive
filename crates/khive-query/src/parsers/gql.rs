@@ -143,17 +143,53 @@ impl Parser {
                 if c == '-' {
                     self.advance();
                 }
-                while let Some(c) = self.peek() {
-                    if c.is_ascii_digit() || c == '.' {
+                // Grammar (docs/design.md): integer = ["-"] digit+ ; float = ["-"]
+                // digit+ "." digit+ -- digits are required on both sides of the
+                // dot. Reject "1." and "-.5" instead of delegating the bare
+                // lexeme to f64::parse, which accepts both.
+                let int_start = self.pos;
+                while matches!(self.peek(), Some(c) if c.is_ascii_digit()) {
+                    self.advance();
+                }
+                if self.pos == int_start {
+                    return Err(self.err("expected digit after '-'"));
+                }
+                let mut has_frac = false;
+                if self.peek() == Some('.') {
+                    has_frac = true;
+                    self.advance();
+                    let frac_start = self.pos;
+                    while matches!(self.peek(), Some(c) if c.is_ascii_digit()) {
                         self.advance();
-                    } else {
-                        break;
+                    }
+                    if self.pos == frac_start {
+                        return Err(self.err(
+                            "float literal must have digits after '.' (e.g. '1.0', not '1.')",
+                        ));
                     }
                 }
                 let s: String = self.input[start..self.pos].iter().collect();
+                // No decimal point: integer lexeme -- parse as i64 so the value
+                // survives round-trip past 2^53 (f64's exact-integer limit) and
+                // both i64 bounds. Scientific notation is not part of this
+                // grammar, so an integer lexeme is always plain decimal digits.
+                if !has_frac {
+                    let n: i64 = s.parse().map_err(|_| {
+                        self.err(format!(
+                            "integer literal '{s}' out of supported range \
+                             ({} to {})",
+                            i64::MIN,
+                            i64::MAX
+                        ))
+                    })?;
+                    return Ok(ConditionValue::Integer(n));
+                }
                 let n: f64 = s
                     .parse()
                     .map_err(|_| self.err(format!("invalid number: {s}")))?;
+                if !n.is_finite() {
+                    return Err(self.err(format!("float literal '{s}' is not finite")));
+                }
                 Ok(ConditionValue::Number(n))
             }
             _ => {
@@ -167,7 +203,7 @@ impl Parser {
         }
     }
 
-    fn parse_props(&mut self) -> Result<HashMap<String, String>, QueryError> {
+    fn parse_props(&mut self) -> Result<HashMap<String, ConditionValue>, QueryError> {
         self.expect_char('{')?;
         let mut props = HashMap::new();
         loop {
@@ -181,7 +217,7 @@ impl Parser {
             }
             let key = self.parse_ident()?;
             self.expect_char(':')?;
-            let val = self.parse_string_literal()?;
+            let val = self.parse_value()?;
             if props.insert(key.clone(), val).is_some() {
                 return Err(self.err(format!("duplicate property '{key}'")));
             }
@@ -237,7 +273,11 @@ impl Parser {
 
         // Lift entity_type out of properties so the SQL compiler targets the
         // dedicated column instead of json_extract(properties, '$.entity_type').
-        let entity_type = properties.remove("entity_type");
+        let entity_type = match properties.remove("entity_type") {
+            Some(ConditionValue::String(s)) => Some(s),
+            Some(_) => return Err(self.err("entity_type must be a string literal")),
+            None => None,
+        };
 
         self.expect_char(')')?;
         Ok(NodePattern {
@@ -561,7 +601,10 @@ mod tests {
         let q = parse("MATCH (a {name: 'LoRA'})-[:extends|variant_of*1..3]->(b) RETURN b LIMIT 20")
             .unwrap();
         let nodes: Vec<_> = q.pattern.nodes().collect();
-        assert_eq!(nodes[0].properties.get("name").unwrap(), "LoRA");
+        assert_eq!(
+            nodes[0].properties.get("name").unwrap(),
+            &ConditionValue::String("LoRA".into())
+        );
 
         let edges: Vec<_> = q.pattern.edges().collect();
         assert_eq!(edges[0].relations, vec!["extends", "variant_of"]);

@@ -61,9 +61,10 @@ fn primary_node_source(alias: &str) -> String {
 }
 
 /// Union of entity/note tables that can legally bind to a synthetic
-/// `observed_as_*` target (issue #468): `observed_as_target` admits entity OR
-/// note referents, `observed_as_signal` admits entity referents. This source
-/// lets the target join stay entity-capable instead of hard-coding `notes`.
+/// `observed_as_*` target (issue #468): `observed_as_target` and
+/// `observed_as_signal` both admit entity OR note referents (ADR-041
+/// Amendment A2). This source lets the target join stay entity-capable
+/// instead of hard-coding `notes`.
 const OBSERVATION_TARGET_SQL: &str = "\
     SELECT id, namespace, kind, entity_type, name, description, \
            NULL AS content, NULL AS status, NULL AS salience, \
@@ -215,6 +216,54 @@ fn namespace_filter(alias: &str, opts: &CompileOptions, params: &mut Vec<QueryVa
     }
 }
 
+/// Compile an inline property-map equality (`{key: value}`) to a parameterized
+/// SQL predicate, either against a direct text column (`text_column`, for keys
+/// like `name`/`content` that are stored as dedicated columns) or against
+/// `json_extract(<alias>.properties, '$.<key>')`.
+///
+/// String values bind as `TEXT` with `COLLATE NOCASE` (case-insensitive match,
+/// matching prior behavior). Integer values bind as `INTEGER`, and Bool values
+/// bind as `INTEGER` (0/1) — SQLite's `json_extract` returns JSON
+/// numbers/booleans as numeric storage classes, so a numeric literal must
+/// compare against a numeric parameter, not a `COLLATE NOCASE` text
+/// comparison that can never match (issue #755). Integer literals bind as
+/// `QueryValue::Integer` rather than `Float` so values beyond `f64`'s exact
+/// 2^53 integer range (and both `i64` bounds) survive round-trip (issue
+/// #832). Float values are rejected here if non-finite, matching the
+/// `is_finite()` invariant enforced by WHERE-clause compilation
+/// (see `docs/design.md`).
+fn compile_property_equality(
+    alias: &str,
+    key: &str,
+    value: &ConditionValue,
+    text_column: Option<&str>,
+    params: &mut Vec<QueryValue>,
+) -> Result<String, QueryError> {
+    let is_string = matches!(value, ConditionValue::String(_));
+    match value {
+        ConditionValue::String(s) => params.push(QueryValue::Text(s.clone())),
+        ConditionValue::Integer(n) => params.push(QueryValue::Integer(*n)),
+        ConditionValue::Number(n) => {
+            if !n.is_finite() {
+                return Err(QueryError::InvalidInput(
+                    "non-finite float (NaN or Infinity) is not a valid query parameter".into(),
+                ));
+            }
+            params.push(QueryValue::Float(*n));
+        }
+        ConditionValue::Bool(b) => params.push(QueryValue::Integer(if *b { 1 } else { 0 })),
+    }
+    let collate = if is_string { " COLLATE NOCASE" } else { "" };
+    Ok(match text_column {
+        Some(col) => format!("{alias}.{col} = ?{}{collate}", params.len()),
+        None => format!(
+            "json_extract({alias}.properties, '$.{}') = ?{}{collate}",
+            key.replace('\'', "''"),
+            params.len()
+        ),
+    })
+}
+
 /// Returns `(source_indices, target_indices)` for synthetic `observed_as_*` edge endpoints.
 fn synthetic_endpoint_node_indices(
     elements: &[PatternElement],
@@ -339,17 +388,18 @@ fn compile_fixed_length(
                     let mut props: Vec<_> = np.properties.iter().collect();
                     props.sort_by_key(|(k, _)| k.as_str());
                     for (key, val) in props {
-                        params.push(QueryValue::Text(val.clone()));
-                        if key == "name" || key == "content" {
-                            where_parts
-                                .push(format!("{alias}.{key} = ?{} COLLATE NOCASE", params.len()));
+                        let text_column = if key == "name" || key == "content" {
+                            Some(key.as_str())
                         } else {
-                            where_parts.push(format!(
-                                "json_extract({alias}.properties, '$.{}') = ?{} COLLATE NOCASE",
-                                key.replace('\'', "''"),
-                                params.len()
-                            ));
-                        }
+                            None
+                        };
+                        where_parts.push(compile_property_equality(
+                            &alias,
+                            key,
+                            val,
+                            text_column,
+                            &mut params,
+                        )?);
                     }
                 } else {
                     where_parts.push(format!("{alias}.deleted_at IS NULL"));
@@ -372,17 +422,14 @@ fn compile_fixed_length(
                     let mut props: Vec<_> = np.properties.iter().collect();
                     props.sort_by_key(|(k, _)| k.as_str());
                     for (key, val) in props {
-                        params.push(QueryValue::Text(val.clone()));
-                        if key == "name" {
-                            where_parts
-                                .push(format!("{alias}.name = ?{} COLLATE NOCASE", params.len()));
-                        } else {
-                            where_parts.push(format!(
-                                "json_extract({alias}.properties, '$.{}') = ?{} COLLATE NOCASE",
-                                key.replace('\'', "''"),
-                                params.len()
-                            ));
-                        }
+                        let text_column = if key == "name" { Some("name") } else { None };
+                        where_parts.push(compile_property_equality(
+                            &alias,
+                            key,
+                            val,
+                            text_column,
+                            &mut params,
+                        )?);
                     }
                 }
 
@@ -462,11 +509,12 @@ fn compile_fixed_length(
                     ));
                     // Admit exactly the in-code legal (role, referent_kind) pairs:
                     // candidate/selected -> note only; target -> entity or note;
-                    // signal -> entity only.
+                    // signal -> entity or note (ADR-041 permits both substrates
+                    // as brain.feedback targets).
                     where_parts.push(format!(
                         "(({e_alias}.role IN ('candidate', 'selected') AND {e_alias}.referent_kind = 'note') \
                           OR ({e_alias}.role = 'target' AND {e_alias}.referent_kind IN ('entity', 'note')) \
-                          OR ({e_alias}.role = 'signal' AND {e_alias}.referent_kind = 'entity'))"
+                          OR ({e_alias}.role = 'signal' AND {e_alias}.referent_kind IN ('entity', 'note')))"
                     ));
                 } else {
                     // Standard canonical edge: join graph_edges.
@@ -739,6 +787,10 @@ fn compile_single_condition(
             };
             format!("{col_expr} {op_str} ?{}{}", params.len(), collate)
         }
+        ConditionValue::Integer(n) => {
+            params.push(QueryValue::Integer(*n));
+            format!("{col_expr} {op_str} ?{}", params.len())
+        }
         ConditionValue::Number(n) => {
             if !n.is_finite() {
                 return Err(QueryError::InvalidInput(
@@ -865,6 +917,10 @@ fn compile_var_len_condition(
                 ""
             };
             format!("{col_expr} {op_str} ?{}{collate}", params.len())
+        }
+        ConditionValue::Integer(n) => {
+            params.push(QueryValue::Integer(*n));
+            format!("{col_expr} {op_str} ?{}", params.len())
         }
         ConditionValue::Number(n) => {
             if !n.is_finite() {
@@ -1054,16 +1110,14 @@ fn compile_variable_length(
     let mut start_props: Vec<_> = start.properties.iter().collect();
     start_props.sort_by_key(|(k, _)| k.as_str());
     for (key, val) in start_props {
-        params.push(QueryValue::Text(val.clone()));
-        if key == "name" {
-            start_conditions.push(format!("s.name = ?{} COLLATE NOCASE", params.len()));
-        } else {
-            start_conditions.push(format!(
-                "json_extract(s.properties, '$.{}') = ?{} COLLATE NOCASE",
-                key.replace('\'', "''"),
-                params.len()
-            ));
-        }
+        let text_column = if key == "name" { Some("name") } else { None };
+        start_conditions.push(compile_property_equality(
+            "s",
+            key,
+            val,
+            text_column,
+            &mut params,
+        )?);
     }
 
     // Relation filter
@@ -1140,16 +1194,14 @@ fn compile_variable_length(
     let mut end_props: Vec<_> = end.properties.iter().collect();
     end_props.sort_by_key(|(k, _)| k.as_str());
     for (key, val) in end_props {
-        params.push(QueryValue::Text(val.clone()));
-        if key == "name" {
-            end_conditions.push(format!("r.name = ?{} COLLATE NOCASE", params.len()));
-        } else {
-            end_conditions.push(format!(
-                "json_extract(r.properties, '$.{}') = ?{} COLLATE NOCASE",
-                key.replace('\'', "''"),
-                params.len()
-            ));
-        }
+        let text_column = if key == "name" { Some("name") } else { None };
+        end_conditions.push(compile_property_equality(
+            "r",
+            key,
+            val,
+            text_column,
+            &mut params,
+        )?);
     }
 
     // WHERE clause conditions for variable-length patterns.
@@ -2599,17 +2651,17 @@ mod tests {
         );
     }
 
-    /// `observed_as_signal` only admits entity referents (brain feedback signals
-    /// target entities, never notes).
+    /// `observed_as_signal` admits entity OR note referents (ADR-041: brain
+    /// feedback signals may target either substrate).
     #[test]
-    fn synthetic_edge_observed_as_signal_compiles_entity_referents() {
+    fn synthetic_edge_observed_as_signal_compiles_entity_and_note_referents() {
         let q = gql::parse("MATCH (ev)-[:observed_as_signal]->(t) RETURN t.id LIMIT 10").unwrap();
         let compiled = compile(&q, &opts()).unwrap();
         assert!(
             compiled
                 .sql
-                .contains("e0.role = 'signal' AND e0.referent_kind = 'entity'"),
-            "signal role must be admitted only against entity referents; sql: {}",
+                .contains("e0.role = 'signal' AND e0.referent_kind IN ('entity', 'note')"),
+            "signal role must be admitted against entity or note referents; sql: {}",
             compiled.sql
         );
     }

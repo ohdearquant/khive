@@ -958,14 +958,19 @@ a single cheap indexed query. Returns a `cursor_us` high-water mark, a `stale_un
 of inbound messages unread past the staleness window, and a `new_messages` array of up to
 100 inbound rows `{id, created_at_us, from_actor, subject?}` newer than `since_us`.
 
+`cursor_us`/`since_us` is an opaque, monotonically increasing token, not a Unix microsecond
+timestamp: round-trip whatever the previous `comm.probe` response returned as the next
+call's `since_us`, and omit it for a baseline-first probe.
+
 | Param           | Type    | Required | Notes                                               |
 | --------------- | ------- | -------- | --------------------------------------------------- |
 | `actor`         | string  | yes      | Actor label whose inbound mail is probed.           |
-| `since_us`      | integer | no       | Microsecond-epoch cursor; only newer rows returned. |
+| `since_us`      | integer | no       | Opaque cursor from a prior response's `cursor_us`.  |
 | `stale_minutes` | integer | no       | Staleness window for the unread count (default 20). |
 
 ```
-request(ops="comm.probe(actor=\"lambda:leo\", since_us=1751932800000000)")
+request(ops="comm.probe(actor=\"lambda:leo\")")
+request(ops="comm.probe(actor=\"lambda:leo\", since_us=42)")
 ```
 
 ### `comm.health` — Assertive
