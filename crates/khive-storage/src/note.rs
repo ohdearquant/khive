@@ -309,6 +309,22 @@ pub trait NoteStore: Send + Sync + 'static {
     async fn get_note_including_deleted(&self, id: Uuid) -> StorageResult<Option<Note>>;
     /// Delete a note by UUID using the specified delete mode.
     async fn delete_note(&self, id: Uuid, mode: DeleteMode) -> StorageResult<bool>;
+    /// Patch `properties`/`updated_at` on an existing note in place via a real
+    /// `UPDATE`, leaving every other column (including the row's `rowid`)
+    /// untouched.
+    ///
+    /// Unlike `upsert_note` (an `INSERT OR REPLACE`, which on a primary-key
+    /// conflict is a SQLite DELETE+INSERT that silently reassigns the row's
+    /// implicit `rowid`), this never churns `rowid`, which is required by any
+    /// caller relying on `rowid` as a stable, monotonically-increasing cursor (#780).
+    /// Returns `true` when a live (non-soft-deleted) row with this `id` was
+    /// found and updated, `false` otherwise.
+    async fn update_note_properties(
+        &self,
+        id: Uuid,
+        properties: Option<Value>,
+        updated_at: i64,
+    ) -> StorageResult<bool>;
     /// Query notes by namespace and optional kind with pagination.
     async fn query_notes(
         &self,

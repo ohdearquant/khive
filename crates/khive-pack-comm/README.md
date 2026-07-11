@@ -30,21 +30,30 @@ Args:
 
 - `actor` (required) — actor label whose inbound queue is probed, e.g.
   `"lambda:leo"`.
-- `since_us` (optional) — cursor in Unix microseconds; only messages with
-  `created_at > since_us` are returned.
+- `since_us` (optional): cursor from a previous `comm.probe` response's
+  `cursor_us`; only messages committed after that cursor are returned.
 - `stale_minutes` (optional, default 20) — unread age threshold in minutes.
 
 Returns:
 
-- `cursor_us` — max `created_at` (µs) over all inbound messages for the
-  actor, or `0` if none exist.
+- `cursor_us`: an opaque, monotonically increasing token (currently backed
+  by the durable `notes_seq.seq` commit-order sequence), or `0` if no
+  inbound messages exist for the actor.
+  Round-trip it as the next call's `since_us`; do not treat it as a
+  timestamp or compute elapsed time from it (#780).
 - `new_messages` — up to 100 newest matching rows, each `{id, created_at_us,
-  from_actor, subject?}`, ordered ascending (newest-last).
+  from_actor, subject?}`, ordered ascending (newest-last) by `created_at`.
+  `created_at_us` is a real display timestamp, useful for "how long ago did
+  this arrive", but it is not the cursor and carries no ordering guarantee
+  relative to `cursor_us`.
 - `stale_unread_count` — count of inbound unread messages older than
   `stale_minutes`.
 
 The response shape is frozen: it is a public polling contract and must stay
-minimal and stable.
+minimal and stable. `cursor_us`/`since_us` keep their `_us`-suffixed wire
+names for backward compatibility even though the value is no longer a
+microsecond timestamp (issue #780); the representation is deliberately
+opaque so it can change again without a breaking rename.
 
 ## Dual-write delivery
 

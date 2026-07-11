@@ -81,6 +81,37 @@ pub fn note_upsert_statement(note: &Note) -> SqlStatement {
     }
 }
 
+/// The exact `properties`/`updated_at` `UPDATE` this store's
+/// `update_note_properties` issues. A real `UPDATE` never triggers SQLite's
+/// `INSERT OR REPLACE` delete+insert, so the row is patched in place (#780).
+/// The `comm.probe` cursor is keyed on `notes_seq.seq`, which is fixed at
+/// first insert and survives a delete+reinsert of the same note id, so this
+/// is defensive rather than load-bearing for cursor correctness; a metadata
+/// patch should never rewrite the row regardless.
+pub fn note_update_properties_statement(
+    id: Uuid,
+    properties: &Option<serde_json::Value>,
+    updated_at: i64,
+) -> SqlStatement {
+    let properties_str = properties
+        .as_ref()
+        .map(|v| serde_json::to_string(v).unwrap_or_default());
+    SqlStatement {
+        sql: "UPDATE notes SET properties = ?1, updated_at = ?2 \
+              WHERE id = ?3 AND deleted_at IS NULL"
+            .to_string(),
+        params: vec![
+            match properties_str {
+                Some(p) => SqlValue::Text(p),
+                None => SqlValue::Null,
+            },
+            SqlValue::Integer(updated_at),
+            SqlValue::Text(id.to_string()),
+        ],
+        label: Some("note-update-properties".to_string()),
+    }
+}
+
 /// The exact soft-delete `UPDATE` this store's `delete_note(Soft)` issues.
 pub fn note_soft_delete_statement(id: Uuid, deleted_at: i64) -> SqlStatement {
     SqlStatement {
@@ -159,15 +190,18 @@ impl SqlNoteStore {
     /// `KHIVE_WRITE_QUEUE=1` and a handle is available; otherwise fall back
     /// to the legacy pool-mutex path (ADR-067 Component A, Fork C slice 2).
     ///
-    /// This is the ONE routing point for every `with_writer` caller in this
-    /// store (`upsert_note`, `try_insert_note`, `delete_note`). `f` must be
+    /// This is the routing point for single-statement `with_writer` callers
+    /// in this store (`update_note_properties`, `delete_note`). `f` must be
     /// DML-only — on the flag-on path it runs inside the WriterTask's own
     /// transaction, so a bare `BEGIN IMMEDIATE` would violate SQLite's
     /// nested-transaction rule. `upsert_notes` (the batch method) does its
     /// own flag check and returns early on `Some`, so its fallback call
     /// into this helper only ever executes on the flag-off path
     /// (`self.writer_task` is `None` by construction whenever that call is
-    /// reached) — no double-routing.
+    /// reached) — no double-routing. Callers whose `f` issues more than one
+    /// DML statement that must land atomically together (`upsert_note`,
+    /// `try_insert_note`) use [`Self::with_writer_tx`] instead — see its doc
+    /// comment (khive #827 Finding 2).
     async fn with_writer<F, R>(&self, op: &'static str, f: F) -> Result<R, StorageError>
     where
         F: FnOnce(&rusqlite::Connection) -> Result<R, rusqlite::Error> + Send + 'static,
@@ -183,6 +217,54 @@ impl SqlNoteStore {
         tokio::task::spawn_blocking(move || {
             let guard = pool.try_writer().map_err(|e| map_sqlite_err(e, op))?;
             f(guard.conn()).map_err(|e| map_err(e, op))
+        })
+        .await
+        .map_err(|e| StorageError::driver(StorageCapability::Notes, op, e))?
+    }
+
+    /// Like [`Self::with_writer`], but for callers whose closure issues more
+    /// than one DML statement that must land atomically together (khive
+    /// #827 Finding 2): a single-note insert immediately followed by
+    /// `assign_note_seq`. On the flag-on path the WriterTask already wraps
+    /// every request in its own `BEGIN IMMEDIATE`/`COMMIT`/`ROLLBACK`, so `f`
+    /// is sent unwrapped, same as `with_writer`. On the flag-off (pool-mutex)
+    /// path, `with_writer` runs `f` in SQLite's default autocommit mode --
+    /// each statement inside `f` is its own implicit transaction -- so a
+    /// crash or interleaving between the insert and the sequence assignment
+    /// can strand a note that `comm.probe`'s `INNER JOIN notes_seq` will
+    /// never see again. This wraps that path in one explicit transaction,
+    /// matching `upsert_notes`' own flag-off branch.
+    async fn with_writer_tx<F, R>(&self, op: &'static str, f: F) -> Result<R, StorageError>
+    where
+        F: FnOnce(&rusqlite::Connection) -> Result<R, rusqlite::Error> + Send + 'static,
+        R: Send + 'static,
+    {
+        if let Some(writer_task) = &self.writer_task {
+            return writer_task
+                .send(move |conn| f(conn).map_err(|e| map_err(e, op)))
+                .await;
+        }
+
+        let pool = Arc::clone(&self.pool);
+        tokio::task::spawn_blocking(move || {
+            let guard = pool.try_writer().map_err(|e| map_sqlite_err(e, op))?;
+            let conn = guard.conn();
+            conn.execute_batch("BEGIN IMMEDIATE")
+                .map_err(|e| map_err(e, op))?;
+
+            match f(conn) {
+                Ok(value) => match conn.execute_batch("COMMIT") {
+                    Ok(()) => Ok(value),
+                    Err(e) => {
+                        let _ = conn.execute_batch("ROLLBACK");
+                        Err(map_err(e, op))
+                    }
+                },
+                Err(e) => {
+                    let _ = conn.execute_batch("ROLLBACK");
+                    Err(map_err(e, op))
+                }
+            }
         })
         .await
         .map_err(|e| StorageError::driver(StorageCapability::Notes, op, e))?
@@ -312,7 +394,10 @@ fn batch_upsert_notes(
                 note.deleted_at,
             ],
         ) {
-            Ok(_) => affected += 1,
+            Ok(_) => {
+                assign_note_seq(conn, &id_str)?;
+                affected += 1;
+            }
             Err(e) => {
                 if first_error.is_empty() {
                     first_error = e.to_string();
@@ -328,6 +413,20 @@ fn batch_upsert_notes(
         failed,
         first_error,
     })
+}
+
+/// Assign a note id its durable, non-reusing sequence number the first time
+/// it is inserted (khive #827 — see `sql/007-notes-seq.sql`). `INSERT OR
+/// IGNORE` makes this idempotent across an `INSERT OR REPLACE`
+/// delete+reinsert of the same note id: the sequence value is fixed at the
+/// note's first insert and never reassigned, unlike `notes`' own implicit
+/// rowid.
+fn assign_note_seq(conn: &rusqlite::Connection, note_id: &str) -> Result<(), rusqlite::Error> {
+    conn.execute(
+        "INSERT OR IGNORE INTO notes_seq (note_id) VALUES (?1)",
+        rusqlite::params![note_id],
+    )?;
+    Ok(())
 }
 
 fn build_note_where(
@@ -516,12 +615,29 @@ fn build_note_filter_where(
 #[async_trait]
 impl NoteStore for SqlNoteStore {
     async fn upsert_note(&self, note: Note) -> Result<(), StorageError> {
+        let id_str = note.id.to_string();
         let statement = note_upsert_statement(&note);
-        self.with_writer("upsert_note", move |conn| {
+        self.with_writer_tx("upsert_note", move |conn| {
             let mut stmt = conn.prepare(&statement.sql)?;
             bind_params(&mut stmt, &statement.params)?;
             stmt.raw_execute()?;
+            assign_note_seq(conn, &id_str)?;
             Ok(())
+        })
+        .await
+    }
+
+    async fn update_note_properties(
+        &self,
+        id: Uuid,
+        properties: Option<serde_json::Value>,
+        updated_at: i64,
+    ) -> Result<bool, StorageError> {
+        let statement = note_update_properties_statement(id, &properties, updated_at);
+        self.with_writer("update_note_properties", move |conn| {
+            let mut stmt = conn.prepare(&statement.sql)?;
+            bind_params(&mut stmt, &statement.params)?;
+            Ok(stmt.raw_execute()? > 0)
         })
         .await
     }
@@ -545,7 +661,7 @@ impl NoteStore for SqlNoteStore {
             .filter(|s| !s.is_empty())
             .map(|s| s.to_string());
 
-        self.with_writer("try_insert_note", move |conn| {
+        self.with_writer_tx("try_insert_note", move |conn| {
             let rows = conn.execute(
                 "INSERT OR IGNORE INTO notes \
                  (id, namespace, kind, status, name, content, salience, decay_factor, expires_at, \
@@ -569,6 +685,7 @@ impl NoteStore for SqlNoteStore {
             )?;
 
             if rows > 0 {
+                assign_note_seq(conn, &id_str)?;
                 return Ok(true);
             }
 
@@ -609,35 +726,20 @@ impl NoteStore for SqlNoteStore {
     async fn upsert_notes(&self, notes: Vec<Note>) -> Result<BatchWriteSummary, StorageError> {
         let attempted = notes.len() as u64;
 
-        // ADR-067 Component A: when the write queue is enabled, route
-        // through the pool-wide WriterTask. DML-only closure — no BEGIN
-        // IMMEDIATE/COMMIT/ROLLBACK here, since the WriterTask's run loop
-        // owns the transaction (a bare BEGIN IMMEDIATE here would violate
-        // SQLite's nested-transaction rule).
-        if let Some(writer_task) = &self.writer_task {
-            return writer_task
-                .send(move |conn| {
-                    batch_upsert_notes(conn, &notes, attempted)
-                        .map_err(|e| map_err(e, "upsert_notes"))
-                })
-                .await;
-        }
-
-        // Flag-off (default) path: byte-for-byte unchanged from pre-ADR-067
-        // behavior — the closure owns its own BEGIN IMMEDIATE/COMMIT/ROLLBACK
-        // via the pool-mutex writer.
-        self.with_writer("upsert_notes", move |conn| {
-            conn.execute_batch("BEGIN IMMEDIATE")?;
+        // khive #827 Finding 2 (round 3): route through `with_writer_tx`
+        // instead of hand-rolling BEGIN IMMEDIATE/COMMIT/ROLLBACK here. The
+        // old flag-off path only rolled back when the final COMMIT failed —
+        // an earlier error from `batch_upsert_notes` (e.g. a failed
+        // `assign_note_seq`) propagated via `?` straight out of the closure,
+        // skipping ROLLBACK entirely and leaving BEGIN IMMEDIATE open on the
+        // shared pool-mutex connection, poisoning every later write on that
+        // connection. `with_writer_tx` rolls back on ANY error from `f`, on
+        // both the flag-on (WriterTask, which wraps its own transaction) and
+        // flag-off (pool-mutex) paths.
+        self.with_writer_tx("upsert_notes", move |conn| {
             let _tx_handle =
                 khive_storage::tx_registry::register(Some("note_upsert_batch".to_string()));
-
-            let summary = batch_upsert_notes(conn, &notes, attempted)?;
-
-            if let Err(e) = conn.execute_batch("COMMIT") {
-                let _ = conn.execute_batch("ROLLBACK");
-                return Err(e);
-            }
-            Ok(summary)
+            batch_upsert_notes(conn, &notes, attempted)
         })
         .await
     }
@@ -950,8 +1052,25 @@ impl NoteStore for SqlNoteStore {
 
 const NOTES_DDL: &str = include_str!("../../sql/notes-ddl.sql");
 
+/// Same anti-join repair as `sql/008-notes-seq-repair.sql` (the V8 forward
+/// migration) -- shared via `include_str!` from that single source file
+/// rather than duplicated as SQL text. `INSERT OR IGNORE` targets notes
+/// still missing a `notes_seq` row specifically, so it is correct to run
+/// against a fresh ledger, a partially populated one, or an already fully
+/// repaired one.
+const NOTES_SEQ_REPAIR_DDL: &str = include_str!("../../sql/008-notes-seq-repair.sql");
+
 pub(crate) fn ensure_notes_schema(conn: &rusqlite::Connection) -> Result<(), rusqlite::Error> {
     conn.execute_batch(NOTES_DDL)
+}
+
+/// Anti-join backfill of `notes_seq` for any note still missing a row
+/// (khive #827 round 3). Scans `notes` in full, so callers MUST gate this to
+/// run at most once per backend/pool rather than on every store acquisition
+/// (khive #827 round 4 perf finding) -- see
+/// `StorageBackend::notes_for_namespace`.
+pub(crate) fn repair_notes_seq(conn: &rusqlite::Connection) -> Result<(), rusqlite::Error> {
+    conn.execute_batch(NOTES_SEQ_REPAIR_DDL)
 }
 
 #[cfg(test)]

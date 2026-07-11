@@ -30,6 +30,8 @@ criterion = { workspace = true }
 toml = { workspace = true }
 khive-runtime = { version = "0.3.0", path = "../khive-runtime", features = ["fault-injection"] }
 lattice-embed = { workspace = true }
+rusqlite = { workspace = true, features = ["bundled", "column_decltype"] }
+tempfile = { workspace = true }
 
 [[bench]]
 name = "comm_bench"

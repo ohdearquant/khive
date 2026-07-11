@@ -386,6 +386,167 @@ async fn test_try_insert_note_pk_collision_returns_error_not_dedup() {
     );
 }
 
+// ── #827 Finding 2: single-note insert + notes_seq assignment atomicity ────
+
+/// Regression for #827 Finding 2: on the default flag-off (pool-mutex) path,
+/// `upsert_note` used to issue its INSERT into `notes` and `assign_note_seq`
+/// as two separate autocommit statements, so a crash or interleaving
+/// between them could strand a note with no `notes_seq` row -- permanently
+/// invisible to `comm.probe`'s `INNER JOIN notes_seq`. A `BEFORE INSERT`
+/// trigger on `notes_seq` injects a failure for one specific note id,
+/// simulating exactly that crash point (the `notes` INSERT has already run
+/// by the time this fires); the note row must not survive either, proving
+/// both statements now land in one transaction.
+#[tokio::test]
+async fn test_upsert_note_insert_and_seq_assignment_are_atomic() {
+    let store = setup_memory_store();
+
+    let fail_id = uuid::Uuid::parse_str("00000000-0000-0000-0000-0000000000aa").unwrap();
+    {
+        let writer = store.pool.try_writer().unwrap();
+        writer
+            .conn()
+            .execute_batch(&format!(
+                "CREATE TRIGGER inject_seq_failure_upsert BEFORE INSERT ON notes_seq \
+                 WHEN NEW.note_id = '{fail_id}' \
+                 BEGIN SELECT RAISE(ABORT, 'injected failure for #827 atomicity test'); END;"
+            ))
+            .unwrap();
+    }
+
+    let mut note = make_note("ns1", "message", "atomic test upsert_note");
+    note.id = fail_id;
+
+    let result = store.upsert_note(note).await;
+    assert!(
+        result.is_err(),
+        "the injected notes_seq trigger failure must surface as an error"
+    );
+
+    let fetched = store.get_note(fail_id).await.unwrap();
+    assert!(
+        fetched.is_none(),
+        "the note insert must roll back together with the failed sequence \
+         assignment, not strand the note without a notes_seq row: {fetched:?}"
+    );
+}
+
+/// Same regression as `test_upsert_note_insert_and_seq_assignment_are_atomic`
+/// for `try_insert_note`'s flag-off path.
+#[tokio::test]
+async fn test_try_insert_note_insert_and_seq_assignment_are_atomic() {
+    let store = setup_memory_store();
+
+    let fail_id = uuid::Uuid::parse_str("00000000-0000-0000-0000-0000000000bb").unwrap();
+    {
+        let writer = store.pool.try_writer().unwrap();
+        writer
+            .conn()
+            .execute_batch(&format!(
+                "CREATE TRIGGER inject_seq_failure_try_insert BEFORE INSERT ON notes_seq \
+                 WHEN NEW.note_id = '{fail_id}' \
+                 BEGIN SELECT RAISE(ABORT, 'injected failure for #827 atomicity test'); END;"
+            ))
+            .unwrap();
+    }
+
+    let mut note = make_note("ns1", "message", "atomic test try_insert_note");
+    note.id = fail_id;
+
+    let result = store.try_insert_note(note).await;
+    assert!(
+        result.is_err(),
+        "the injected notes_seq trigger failure must surface as an error"
+    );
+
+    let fetched = store.get_note(fail_id).await.unwrap();
+    assert!(
+        fetched.is_none(),
+        "the note insert must roll back together with the failed sequence \
+         assignment, not strand the note without a notes_seq row: {fetched:?}"
+    );
+}
+
+/// Regression for #827 round-3 Finding 2: on the flag-off (pool-mutex)
+/// path, `upsert_notes` used to run `batch_upsert_notes` inside a hand-rolled
+/// `BEGIN IMMEDIATE`/`COMMIT`/`ROLLBACK`, but only wired `ROLLBACK` to a
+/// failed `COMMIT` -- an error from `batch_upsert_notes` itself (e.g. a
+/// failed `assign_note_seq` mid-batch) propagated via `?` straight out of
+/// the closure, skipping `ROLLBACK` and leaving `BEGIN IMMEDIATE` open on
+/// the shared pool-mutex connection. A `BEFORE INSERT` trigger fails the
+/// sequence assignment for the SECOND note in a two-note batch (the first
+/// note's insert and `assign_note_seq` must already have succeeded by the
+/// time this fires); the whole batch must roll back -- neither note must
+/// survive -- and the connection must not be left poisoned: a subsequent
+/// write through the same pool must still succeed.
+#[tokio::test]
+async fn test_upsert_notes_batch_rolls_back_fully_on_mid_batch_seq_failure() {
+    let store = setup_memory_store();
+
+    let fail_id = uuid::Uuid::parse_str("00000000-0000-0000-0000-0000000000cc").unwrap();
+    {
+        let writer = store.pool.try_writer().unwrap();
+        writer
+            .conn()
+            .execute_batch(&format!(
+                "CREATE TRIGGER inject_seq_failure_batch BEFORE INSERT ON notes_seq \
+                 WHEN NEW.note_id = '{fail_id}' \
+                 BEGIN SELECT RAISE(ABORT, 'injected mid-batch failure for #827 round-3 test'); END;"
+            ))
+            .unwrap();
+    }
+
+    let mut note_ok = make_note(
+        "ns1",
+        "message",
+        "first note in batch, seq assignment succeeds",
+    );
+    let ok_id = note_ok.id;
+    let mut note_fail = make_note(
+        "ns1",
+        "message",
+        "second note in batch, seq assignment fails",
+    );
+    note_fail.id = fail_id;
+    // Ensure iteration order is deterministic: note_ok first, note_fail second.
+    note_ok.created_at = 1_000_000;
+    note_fail.created_at = 1_000_001;
+
+    let result = store.upsert_notes(vec![note_ok, note_fail]).await;
+    assert!(
+        result.is_err(),
+        "the injected mid-batch notes_seq trigger failure must surface as an error, not a \
+         partial BatchWriteSummary: {result:?}"
+    );
+
+    let fetched_ok = store.get_note(ok_id).await.unwrap();
+    assert!(
+        fetched_ok.is_none(),
+        "the whole batch must roll back -- the first note (whose own insert and seq \
+         assignment succeeded) must not survive a later note's failure in the same batch: \
+         {fetched_ok:?}"
+    );
+    let fetched_fail = store.get_note(fail_id).await.unwrap();
+    assert!(
+        fetched_fail.is_none(),
+        "the failed note must not survive either: {fetched_fail:?}"
+    );
+
+    // The pool-mutex connection must not be left with an open transaction --
+    // a subsequent write on the same pool must succeed.
+    let next_note = make_note("ns1", "message", "write after rolled-back batch");
+    let next_id = next_note.id;
+    store
+        .upsert_note(next_note)
+        .await
+        .expect("a write after the rolled-back batch must succeed, not hang on an open BEGIN");
+    let fetched_next = store.get_note(next_id).await.unwrap();
+    assert!(
+        fetched_next.is_some(),
+        "the post-rollback write must actually land"
+    );
+}
+
 /// STORAGE-AUD-003 / #485: PageRequest.offset > i64::MAX must return
 /// InvalidInput for both list paths instead of silently narrowing to a
 /// negative i64 offset.

@@ -283,7 +283,7 @@ pub(crate) async fn handle_read(
     let id = resolve_id(runtime, token, &p.id, "read").await?;
 
     let store = runtime.notes(token)?;
-    let mut note = store
+    let note = store
         .get_note(id)
         .await
         .map_err(|e| RuntimeError::Internal(format!("read: get_note: {e}")))?
@@ -316,16 +316,21 @@ pub(crate) async fn handle_read(
         )));
     }
 
-    // Merge `read: true` into properties.
+    // Merge `read: true` into properties and patch in place via a real
+    // `UPDATE` (not `upsert_note`'s `INSERT OR REPLACE`): the latter
+    // silently deletes and re-inserts the row on a primary-key conflict
+    // (#780). The `comm.probe` cursor is keyed on `notes_seq.seq`, which is
+    // fixed at first insert and survives such churn, so this is defensive
+    // rather than load-bearing; a metadata patch should never rewrite the
+    // row regardless.
     let mut props = note.properties.clone().unwrap_or_else(|| json!({}));
     props["read"] = json!(true);
-    note.properties = Some(props.clone());
-    note.updated_at = Utc::now().timestamp_micros();
+    let updated_at = Utc::now().timestamp_micros();
 
     store
-        .upsert_note(note)
+        .update_note_properties(id, Some(props.clone()), updated_at)
         .await
-        .map_err(|e| RuntimeError::Internal(format!("read: upsert_note: {e}")))?;
+        .map_err(|e| RuntimeError::Internal(format!("read: update_note_properties: {e}")))?;
 
     Ok(
         json!({ "id": short_id(id), "full_id": id.as_hyphenated().to_string(), "read": true, "properties": props }),
@@ -1369,39 +1374,66 @@ pub(crate) struct ProbeMessage {
 /// idx_comm_message_to_actor` is a regression fence: if a custom bootstrap
 /// skips comm schema-plan application, this query fails loudly instead of
 /// silently degrading to a table scan.
+///
+/// `cursor_us`/`since_us` are keyed on `notes_seq.seq`, not SQLite `rowid`
+/// and not `created_at` (#780, #827):
+///
+/// - `created_at` is an application-clock read taken before a note's write
+///   acquires the writer critical section, so two concurrent writers can
+///   commit out of stamp order; a `created_at`-keyed cursor can then advance
+///   past a row that committed *after* it, permanently hiding that row from
+///   every later probe.
+/// - `notes.rowid` looked monotonic with commit order, but `notes` has a
+///   TEXT PRIMARY KEY, so that rowid is *implicit*: SQLite may renumber it
+///   on `VACUUM` (khive exposes `memory.vacuum`), and reuses the highest
+///   rowid once that row is hard-deleted (khive exposes a public hard
+///   delete), either of which can permanently exclude a later message whose
+///   rowid lands at or below an already-issued cursor.
+///
+/// `notes_seq.seq` fixes both: it is assigned once, inside the same writer
+/// transaction as the note's insert, from a dedicated `INTEGER PRIMARY KEY
+/// AUTOINCREMENT` sequence that VACUUM never renumbers and SQLite never
+/// reuses (see `sql/007-notes-seq.sql`). The wire field names keep the `_us`
+/// suffix (frozen contract, ADR-D5) but the value is an opaque monotonic
+/// token, not a microsecond timestamp; do not revert this to `created_at` or
+/// `rowid`. `created_at_us` on each `new_messages` entry is unaffected: it
+/// stays a real display timestamp, still ordered ascending by `created_at`
+/// for readability, and carries no cursor guarantee of its own.
 const PROBE_SQL: &str = "WITH \
 stats AS ( \
     SELECT \
-        COALESCE(MAX(created_at), 0) AS cursor_us, \
+        COALESCE(MAX(notes_seq.seq), 0) AS cursor_us, \
         COALESCE(SUM( \
             CASE \
-                WHEN (json_type(properties, '$.read') IS NULL \
-                      OR json_type(properties, '$.read') != 'true') \
-                     AND created_at < ?4 \
+                WHEN (json_type(notes.properties, '$.read') IS NULL \
+                      OR json_type(notes.properties, '$.read') != 'true') \
+                     AND notes.created_at < ?4 \
                 THEN 1 ELSE 0 \
             END \
         ), 0) AS stale_unread_count \
     FROM notes INDEXED BY idx_comm_message_to_actor \
-    WHERE namespace = ?1 \
-      AND kind = 'message' \
-      AND deleted_at IS NULL \
-      AND json_extract(properties, '$.to_actor') = ?2 \
-      AND json_extract(properties, '$.direction') = 'inbound' \
+    JOIN notes_seq ON notes_seq.note_id = notes.id \
+    WHERE notes.namespace = ?1 \
+      AND notes.kind = 'message' \
+      AND notes.deleted_at IS NULL \
+      AND json_extract(notes.properties, '$.to_actor') = ?2 \
+      AND json_extract(notes.properties, '$.direction') = 'inbound' \
 ), \
 new_rows AS ( \
     SELECT \
-        id, \
-        created_at AS created_at_us, \
-        COALESCE(json_extract(properties, '$.from_actor'), namespace) AS from_actor, \
-        json_extract(properties, '$.subject') AS subject \
+        notes.id, \
+        notes.created_at AS created_at_us, \
+        COALESCE(json_extract(notes.properties, '$.from_actor'), notes.namespace) AS from_actor, \
+        json_extract(notes.properties, '$.subject') AS subject \
     FROM notes INDEXED BY idx_comm_message_to_actor \
-    WHERE namespace = ?1 \
-      AND kind = 'message' \
-      AND deleted_at IS NULL \
-      AND json_extract(properties, '$.to_actor') = ?2 \
-      AND json_extract(properties, '$.direction') = 'inbound' \
-      AND (?3 IS NULL OR created_at > ?3) \
-    ORDER BY created_at DESC \
+    JOIN notes_seq ON notes_seq.note_id = notes.id \
+    WHERE notes.namespace = ?1 \
+      AND notes.kind = 'message' \
+      AND notes.deleted_at IS NULL \
+      AND json_extract(notes.properties, '$.to_actor') = ?2 \
+      AND json_extract(notes.properties, '$.direction') = 'inbound' \
+      AND (?3 IS NULL OR notes_seq.seq > ?3) \
+    ORDER BY notes.created_at DESC \
     LIMIT 100 \
 ) \
 SELECT \
@@ -1451,6 +1483,36 @@ pub(crate) async fn handle_probe(
     })
 }
 
+/// A caller-supplied `since_us` above `notes_seq`'s durable high-water mark
+/// (`sqlite_sequence.seq` for the `notes_seq` table) cannot be a genuine
+/// cursor -- `notes_seq` starts at 1 and grows by exactly one per note ever
+/// inserted, so no value this store ever handed out can exceed the highest
+/// value it has ever assigned. Such a `since_us` is a pre-upgrade
+/// persisted-timestamp cursor (#827): a real Unix-microsecond timestamp from
+/// after 1970-01-12 already exceeds any realistic note count by orders of
+/// magnitude. Comparing against the actual high-water mark, instead of a
+/// fixed ceiling, keeps this correct forever as `notes_seq` grows -- a fixed
+/// ceiling would eventually reset a legitimate high sequence value to
+/// baseline, contradicting `comm.probe`'s opaque round-trip contract
+/// (`vocab.rs`).
+async fn notes_seq_high_water_mark(
+    reader: &mut Box<dyn khive_storage::sql::SqlReader>,
+) -> Result<i64, RuntimeError> {
+    let row = reader
+        .query_row(khive_storage::types::SqlStatement {
+            sql: "SELECT seq FROM sqlite_sequence WHERE name = 'notes_seq'".into(),
+            params: vec![],
+            label: Some("comm_probe_notes_seq_hwm".into()),
+        })
+        .await
+        .map_err(RuntimeError::Storage)?;
+
+    match row.and_then(|r| r.get("seq").cloned()) {
+        Some(SqlValue::Integer(v)) => Ok(v),
+        _ => Ok(0),
+    }
+}
+
 async fn query_probe(
     runtime: &KhiveRuntime,
     namespace: &str,
@@ -1458,7 +1520,26 @@ async fn query_probe(
     since_us: Option<i64>,
     stale_cutoff_us: i64,
 ) -> Result<ProbeResponse, RuntimeError> {
-    let since_param = match since_us {
+    let sql = runtime.sql();
+    let mut reader = sql.reader().await.map_err(RuntimeError::Storage)?;
+
+    let high_water_mark = notes_seq_high_water_mark(&mut reader).await?;
+
+    let effective_since = match since_us {
+        Some(v) if v > high_water_mark => {
+            tracing::warn!(
+                actor,
+                since_us = v,
+                high_water_mark,
+                "comm.probe: since_us exceeds the notes_seq high-water mark; treating it as a \
+                 stale pre-upgrade timestamp cursor and resetting to baseline"
+            );
+            None
+        }
+        other => other,
+    };
+
+    let since_param = match effective_since {
         Some(v) => SqlValue::Integer(v),
         None => SqlValue::Null,
     };
@@ -1474,8 +1555,6 @@ async fn query_probe(
         label: Some("comm_probe".into()),
     };
 
-    let sql = runtime.sql();
-    let mut reader = sql.reader().await.map_err(RuntimeError::Storage)?;
     let rows = reader
         .query_all(statement)
         .await
@@ -1516,6 +1595,18 @@ async fn query_probe(
             from_actor,
             subject,
         });
+    }
+
+    // Never let the returned cursor regress below what the caller already
+    // holds (#827): if the message that previously held the highest
+    // `notes_seq.seq` was hard-deleted since the last probe, `MAX(seq)` over
+    // the remaining rows can be smaller than a cursor already handed out.
+    // Clamping here, rather than in SQL, keeps the single indexed query a
+    // pure aggregate with no extra branch.
+    if let Some(floor) = effective_since {
+        if cursor_us < floor {
+            cursor_us = floor;
+        }
     }
 
     Ok(ProbeResponse {
