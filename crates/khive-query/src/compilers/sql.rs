@@ -216,6 +216,51 @@ fn namespace_filter(alias: &str, opts: &CompileOptions, params: &mut Vec<QueryVa
     }
 }
 
+/// Compile a node label's `kind` predicate against a primary-substrate union
+/// source (the `entities`/`notes`/`events`/`graph_edges` union carrying a
+/// `substrate_kind` column, aliased `primary_nodes` in variable-length
+/// queries and inlined in fixed-length ones).
+///
+/// A substrate label (`entity`/`note`/`event`/`edge`) names a table, not a
+/// stored `kind` value — stored `kind` is always granular (`concept`,
+/// `task`, `observation`, ...). This mirrors the substrate/granular split in
+/// `resolve_kind_spec` (`khive-pack-kg/src/handlers/common.rs`), which the
+/// verb-dispatch surface (`create`/`list`/`search`) already applies. Without
+/// it, `kind = 'entity'` is unsatisfiable by construction: no stored row's
+/// `kind` column is ever literally `"entity"` (issue #849).
+fn kind_filter_predicate(alias: &str, kind: &str, params: &mut Vec<QueryValue>) -> String {
+    match kind {
+        "entity" | "note" | "event" | "edge" => {
+            params.push(QueryValue::Text(kind.to_string()));
+            format!("{alias}.substrate_kind = ?{}", params.len())
+        }
+        _ => {
+            params.push(QueryValue::Text(kind.to_string()));
+            format!("{alias}.kind = ?{}", params.len())
+        }
+    }
+}
+
+/// Same as [`kind_filter_predicate`], for the entity/note-only observation-
+/// target union (`referent_kind` column, issue #468) — only `entity`/`note`
+/// are legal substrate labels there.
+fn observation_kind_filter_predicate(
+    alias: &str,
+    kind: &str,
+    params: &mut Vec<QueryValue>,
+) -> String {
+    match kind {
+        "entity" | "note" => {
+            params.push(QueryValue::Text(kind.to_string()));
+            format!("{alias}.referent_kind = ?{}", params.len())
+        }
+        _ => {
+            params.push(QueryValue::Text(kind.to_string()));
+            format!("{alias}.kind = ?{}", params.len())
+        }
+    }
+}
+
 /// Compile an inline property-map equality (`{key: value}`) to a parameterized
 /// SQL predicate, either against a direct text column (`text_column`, for keys
 /// like `name`/`content` that are stored as dedicated columns) or against
@@ -347,9 +392,13 @@ fn compile_fixed_length(
                         where_parts.push(ns_filter.trim_start_matches(" AND ").to_string());
                     }
                     // `kind` on an event node filters events.kind (e.g. "recall_executed").
+                    // The bare substrate label "event" needs no filter here — the FROM
+                    // source is already the events table exclusively (issue #849).
                     if let Some(ref kind) = np.kind {
-                        params.push(QueryValue::Text(kind.clone()));
-                        where_parts.push(format!("{alias}.kind = ?{}", params.len()));
+                        if kind != "event" {
+                            params.push(QueryValue::Text(kind.clone()));
+                            where_parts.push(format!("{alias}.kind = ?{}", params.len()));
+                        }
                     }
                     // entity_type and properties are not columns on events — reject explicitly.
                     if np.entity_type.is_some() {
@@ -374,8 +423,11 @@ fn compile_fixed_length(
                     }
 
                     if let Some(ref kind) = np.kind {
-                        params.push(QueryValue::Text(kind.clone()));
-                        where_parts.push(format!("{alias}.kind = ?{}", params.len()));
+                        where_parts.push(observation_kind_filter_predicate(
+                            &alias,
+                            kind,
+                            &mut params,
+                        ));
                     }
 
                     // entity_type is NULL on note rows and populated on entity rows;
@@ -410,8 +462,7 @@ fn compile_fixed_length(
                     }
 
                     if let Some(ref kind) = np.kind {
-                        params.push(QueryValue::Text(kind.clone()));
-                        where_parts.push(format!("{alias}.kind = ?{}", params.len()));
+                        where_parts.push(kind_filter_predicate(&alias, kind, &mut params));
                     }
 
                     if let Some(ref et) = np.entity_type {
@@ -1100,8 +1151,7 @@ fn compile_variable_length(
     }
 
     if let Some(ref kind) = start.kind {
-        params.push(QueryValue::Text(kind.clone()));
-        start_conditions.push(format!("s.kind = ?{}", params.len()));
+        start_conditions.push(kind_filter_predicate("s", kind, &mut params));
     }
     if let Some(ref et) = start.entity_type {
         params.push(QueryValue::Text(et.clone()));
@@ -1184,8 +1234,7 @@ fn compile_variable_length(
         end_conditions.push(r_ns_filter.trim_start_matches(" AND ").to_string());
     }
     if let Some(ref kind) = end.kind {
-        params.push(QueryValue::Text(kind.clone()));
-        end_conditions.push(format!("r.kind = ?{}", params.len()));
+        end_conditions.push(kind_filter_predicate("r", kind, &mut params));
     }
     if let Some(ref et) = end.entity_type {
         params.push(QueryValue::Text(et.clone()));

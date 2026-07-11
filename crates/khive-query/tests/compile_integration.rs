@@ -5,7 +5,9 @@
 //! QUERY-AUD-002.
 
 use khive_query::ast::{QueryValue, ReturnItem};
-use khive_query::{compile, parse, parse_auto, CompileOptions, QueryError, QueryLanguage};
+use khive_query::{
+    compile, parse, parse_auto, CompileOptions, CompiledQuery, QueryError, QueryLanguage,
+};
 
 fn opts() -> CompileOptions {
     CompileOptions::default()
@@ -1021,4 +1023,236 @@ fn gql_inline_property_map_well_formed_float_still_parses() {
         .params
         .iter()
         .any(|p| matches!(p, QueryValue::Float(n) if *n == 1.5)));
+}
+
+// --- Issue #849: substrate node labels (entity/note) must be satisfiable ---
+//
+// Stored `kind` values are always granular (concept/document/task/...); the
+// substrate words entity/note/edge/event name a *table*, not a stored `kind`.
+// Compiling a bare substrate label straight into `kind = ?` (as fixed/`event`
+// filters did) makes the predicate unsatisfiable by construction. The fix
+// filters the union's `substrate_kind` discriminator column instead. These
+// tests exercise the compiled SQL shape (fixed-length + variable-length +
+// SPARQL) and, for the fixed-length case, execute the compiled SQL against a
+// minimal in-memory fixture matching `khive-db`'s substrate schema to prove
+// the query is actually satisfiable end-to-end, not just shaped correctly.
+
+mod substrate_labels {
+    use super::*;
+    use rusqlite::Connection;
+
+    /// Minimal fixture matching `crates/khive-db/sql/schema.sql`'s substrate
+    /// tables. All four must exist (even empty) because the compiler always
+    /// binds a plain node pattern through the `entities UNION notes UNION
+    /// events UNION graph_edges` primary-substrate source.
+    fn fixture_db() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE entities (
+                id TEXT PRIMARY KEY, namespace TEXT NOT NULL, kind TEXT NOT NULL,
+                name TEXT NOT NULL, description TEXT, properties TEXT,
+                tags TEXT NOT NULL DEFAULT '[]', created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL, deleted_at INTEGER,
+                entity_type TEXT, merged_into TEXT, merge_event_id TEXT
+            );
+            CREATE TABLE notes (
+                id TEXT PRIMARY KEY, namespace TEXT NOT NULL, kind TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'active', name TEXT,
+                content TEXT NOT NULL DEFAULT '', salience REAL, decay_factor REAL,
+                expires_at INTEGER, properties TEXT, created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL, deleted_at INTEGER
+            );
+            CREATE TABLE events (
+                id TEXT PRIMARY KEY, namespace TEXT NOT NULL, verb TEXT NOT NULL,
+                substrate TEXT NOT NULL, actor TEXT NOT NULL, outcome TEXT NOT NULL,
+                data TEXT, duration_us INTEGER NOT NULL DEFAULT 0, target_id TEXT,
+                created_at INTEGER NOT NULL, kind TEXT NOT NULL DEFAULT 'audit',
+                payload TEXT NOT NULL DEFAULT '{}',
+                payload_schema_version INTEGER NOT NULL DEFAULT 1,
+                profile_state_version INTEGER, session_id TEXT,
+                aggregate_kind TEXT, aggregate_id TEXT
+            );
+            CREATE TABLE graph_edges (
+                namespace TEXT NOT NULL, id TEXT NOT NULL, source_id TEXT NOT NULL,
+                target_id TEXT NOT NULL, relation TEXT NOT NULL,
+                weight REAL NOT NULL DEFAULT 1.0, created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL, deleted_at INTEGER, metadata TEXT,
+                target_backend TEXT, PRIMARY KEY (namespace, id)
+            );
+            INSERT INTO entities
+                (id, namespace, kind, name, description, properties, tags,
+                 created_at, updated_at, deleted_at, entity_type)
+            VALUES
+                ('e-fixture-1', 'local', 'concept', 'X', NULL, '{}', '[]',
+                 0, 0, NULL, NULL);
+            INSERT INTO notes
+                (id, namespace, kind, status, name, content, salience,
+                 decay_factor, expires_at, properties, created_at, updated_at,
+                 deleted_at)
+            VALUES
+                ('n-fixture-1', 'local', 'observation', 'active', 'X', 'body',
+                 NULL, NULL, NULL, '{}', 0, 0, NULL);",
+        )
+        .unwrap();
+        conn
+    }
+
+    fn run(conn: &Connection, compiled: &CompiledQuery) -> Vec<String> {
+        let db_params: Vec<Box<dyn rusqlite::ToSql>> = compiled
+            .params
+            .iter()
+            .map(|p| -> Box<dyn rusqlite::ToSql> {
+                match p {
+                    QueryValue::Null => Box::new(Option::<i64>::None),
+                    QueryValue::Integer(n) => Box::new(*n),
+                    QueryValue::Float(n) => Box::new(*n),
+                    QueryValue::Text(s) => Box::new(s.clone()),
+                    QueryValue::Blob(b) => Box::new(b.clone()),
+                }
+            })
+            .collect();
+        let param_refs: Vec<&dyn rusqlite::ToSql> = db_params.iter().map(|b| b.as_ref()).collect();
+        let mut stmt = conn.prepare(&compiled.sql).unwrap();
+        stmt.query_map(param_refs.as_slice(), |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+    }
+
+    #[test]
+    fn entity_substrate_label_compiles_without_unsatisfiable_kind_filter() {
+        let q = parse(
+            QueryLanguage::Gql,
+            "MATCH (e:entity) WHERE e.name = 'X' RETURN e.id",
+        )
+        .unwrap();
+        let compiled = compile(&q, &opts()).unwrap();
+        assert!(
+            compiled.sql.contains("substrate_kind = ?"),
+            "substrate label 'entity' must filter substrate_kind, not kind; sql: {}",
+            compiled.sql
+        );
+        assert!(
+            !compiled.sql.contains("n0.kind = ?"),
+            "substrate label 'entity' must not also emit an unsatisfiable kind filter; sql: {}",
+            compiled.sql
+        );
+
+        let conn = fixture_db();
+        let rows = run(&conn, &compiled);
+        assert_eq!(
+            rows,
+            vec!["e-fixture-1".to_string()],
+            "MATCH (e:entity) WHERE e.name = 'X' must return the existing entity row; sql: {}",
+            compiled.sql
+        );
+    }
+
+    #[test]
+    fn note_substrate_label_compiles_without_unsatisfiable_kind_filter() {
+        let q = parse(
+            QueryLanguage::Gql,
+            "MATCH (n:note) WHERE n.name = 'X' RETURN n.id",
+        )
+        .unwrap();
+        let compiled = compile(&q, &opts()).unwrap();
+        assert!(
+            compiled.sql.contains("substrate_kind = ?"),
+            "substrate label 'note' must filter substrate_kind, not kind; sql: {}",
+            compiled.sql
+        );
+
+        let conn = fixture_db();
+        let rows = run(&conn, &compiled);
+        assert_eq!(
+            rows,
+            vec!["n-fixture-1".to_string()],
+            "MATCH (n:note) WHERE n.name = 'X' must return the existing note row; sql: {}",
+            compiled.sql
+        );
+    }
+
+    #[test]
+    fn granular_label_still_filters_kind_column() {
+        let q = parse(QueryLanguage::Gql, "MATCH (e:concept) RETURN e.id").unwrap();
+        let compiled = compile(&q, &opts()).unwrap();
+        assert!(
+            compiled.sql.contains("n0.kind = ?"),
+            "granular label 'concept' must still emit kind = ?; sql: {}",
+            compiled.sql
+        );
+        let has_concept_param = compiled
+            .params
+            .iter()
+            .any(|p| matches!(p, QueryValue::Text(s) if s == "concept"));
+        assert!(has_concept_param, "params: {:?}", compiled.params);
+
+        let conn = fixture_db();
+        let rows = run(&conn, &compiled);
+        assert_eq!(
+            rows,
+            vec!["e-fixture-1".to_string()],
+            "MATCH (e:concept) must still return the concept-kind entity row; sql: {}",
+            compiled.sql
+        );
+    }
+
+    #[test]
+    fn sparql_entity_substrate_label_compiles_and_returns_row() {
+        let q = parse(
+            QueryLanguage::Sparql,
+            "SELECT ?e WHERE { ?e a :entity . ?e :name \"X\" . }",
+        )
+        .unwrap();
+        let compiled = compile(&q, &opts()).unwrap();
+        assert!(
+            compiled.sql.contains("substrate_kind = ?"),
+            "SPARQL 'a :entity' must filter substrate_kind, not kind (frontend parity); sql: {}",
+            compiled.sql
+        );
+
+        let conn = fixture_db();
+        let db_params: Vec<Box<dyn rusqlite::ToSql>> = compiled
+            .params
+            .iter()
+            .map(|p| -> Box<dyn rusqlite::ToSql> {
+                match p {
+                    QueryValue::Null => Box::new(Option::<i64>::None),
+                    QueryValue::Integer(n) => Box::new(*n),
+                    QueryValue::Float(n) => Box::new(*n),
+                    QueryValue::Text(s) => Box::new(s.clone()),
+                    QueryValue::Blob(b) => Box::new(b.clone()),
+                }
+            })
+            .collect();
+        let param_refs: Vec<&dyn rusqlite::ToSql> = db_params.iter().map(|b| b.as_ref()).collect();
+        let mut stmt = conn.prepare(&compiled.sql).unwrap();
+        let ids: Vec<String> = stmt
+            .query_map(param_refs.as_slice(), |row| row.get::<_, String>("e_id"))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            ids,
+            vec!["e-fixture-1".to_string()],
+            "SPARQL entity-substrate query must return the existing entity row; sql: {}",
+            compiled.sql
+        );
+    }
+
+    #[test]
+    fn variable_length_entity_substrate_label_filters_substrate_kind() {
+        let q = parse(
+            QueryLanguage::Gql,
+            "MATCH (a:entity)-[:extends*1..2]->(b) RETURN b LIMIT 5",
+        )
+        .unwrap();
+        let compiled = compile(&q, &opts()).unwrap();
+        assert!(
+            compiled.sql.contains("s.substrate_kind = ?"),
+            "variable-length seed with substrate label 'entity' must filter \
+             s.substrate_kind, not s.kind; sql: {}",
+            compiled.sql
+        );
+    }
 }
