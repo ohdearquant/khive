@@ -107,6 +107,9 @@ impl MemoryPack {
         let ann_overfetch_max_rounds_cand = cfg
             .ann_overfetch_max_rounds
             .unwrap_or_else(super::common::ann_overfetch_max_rounds);
+        let ann_ready_timeout_ms_cand = cfg
+            .ann_ready_timeout_ms
+            .unwrap_or_else(super::common::ann_ready_timeout_ms);
 
         let candidates = self
             .collect_recall_candidates(
@@ -123,6 +126,7 @@ impl MemoryPack {
                     },
                     fts_gather: &effective_fts_gather_cand,
                     ann_overfetch_max_rounds: ann_overfetch_max_rounds_cand,
+                    ann_ready_timeout_ms: ann_ready_timeout_ms_cand,
                 },
             )
             .await?;
@@ -221,6 +225,9 @@ impl MemoryPack {
         let ann_overfetch_max_rounds_fuse = cfg
             .ann_overfetch_max_rounds
             .unwrap_or_else(super::common::ann_overfetch_max_rounds);
+        let ann_ready_timeout_ms_fuse = cfg
+            .ann_ready_timeout_ms
+            .unwrap_or_else(super::common::ann_ready_timeout_ms);
 
         let candidates = self
             .collect_recall_candidates(
@@ -237,6 +244,7 @@ impl MemoryPack {
                     },
                     fts_gather: &effective_fts_gather_fuse,
                     ann_overfetch_max_rounds: ann_overfetch_max_rounds_fuse,
+                    ann_ready_timeout_ms: ann_ready_timeout_ms_fuse,
                 },
             )
             .await?;
