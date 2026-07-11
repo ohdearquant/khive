@@ -28,7 +28,7 @@ impl JsonFormatAdapter {
     ///
     /// Returns `Err(AdapterError::Parse)` if `json_input` is not valid JSON or
     /// is not a JSON array at the top level. Entity `kind` is validated only
-    /// against the base ADR-001 kind set (plus aliases) — pack-registered
+    /// against the base ADR-001 kind set (plus aliases): pack-registered
     /// granular kinds (e.g. `resource`, ADR-048) are rejected here. Use
     /// [`Self::new_with_valid_kinds`] to accept a wider, caller-supplied set.
     pub fn new(json_input: &str) -> Result<Self, AdapterError> {
@@ -42,7 +42,7 @@ impl JsonFormatAdapter {
     /// Callers that have a merged pack/runtime kind registry (e.g.
     /// `KhiveRuntime::install_kind_registry`'s installed entity kinds) should
     /// pass it here so pack-registered granular kinds like `resource` are not
-    /// rejected before the runtime even sees them (issue #530 — the JSON/NDJSON
+    /// rejected before the runtime even sees them (issue #530, the JSON/NDJSON
     /// counterpart to the archive-format fix in #529 / issue #438).
     pub fn new_with_valid_kinds(
         json_input: &str,
@@ -225,7 +225,7 @@ fn parse_entity(
         Err(_) => {
             // Not one of the base ADR-001 kinds (or an alias). Accept it only
             // if the caller supplied a wider registry (pack-registered
-            // granular kinds, e.g. `resource` — ADR-048) that recognizes it;
+            // granular kinds, e.g. `resource`, ADR-048) that recognizes it;
             // otherwise this is a genuinely unknown kind.
             let normalized = raw_kind.trim().to_ascii_lowercase();
             if extra_valid_kinds

@@ -612,7 +612,7 @@ mod tests {
     // #530 (follow-up to #438): the JSON/NDJSON adapter import path
     // (`ImportFormat::Json` / `ImportFormat::Ndjson`) goes through
     // `khive_vcs_adapters::JsonFormatAdapter`, which used to independently gate
-    // entity kind through the base `khive_types::EntityKind::from_str` — before
+    // entity kind through the base `khive_types::EntityKind::from_str`, before
     // an `ExportedEntity`/`KgArchive` was even constructed, and before this
     // module's `install_import_kind_registry` had any effect. `cmd_import` now
     // threads the merged entity-kind registry into
