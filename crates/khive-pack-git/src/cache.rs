@@ -336,10 +336,20 @@ fn remove_dir_all_retrying(path: &Path) -> std::io::Result<()> {
     Err(last_err.expect("loop always sets last_err before exiting"))
 }
 
+/// `gc.auto=0` on every clone/fetch into a cache slot: git's default
+/// `gc.autoDetach=true` lets an opportunistic `gc --auto` fork and keep
+/// running in the background *after* this command already returned success
+/// -- exactly the kind of concurrent mutator that can delete a loose object
+/// `dir_size`/`evict_lru` are mid-walk over in the same slot (issue #842's
+/// macOS-only ENOENT flake family). No cache-slot repo is ever gc'd by us;
+/// eviction deletes the whole directory instead, so there is nothing for
+/// git's own gc to usefully do here.
 fn clone(url: &str, dest: &Path) -> Result<(), CacheError> {
     let status = Command::new("git")
         .arg("-c")
         .arg("core.hooksPath=/dev/null")
+        .arg("-c")
+        .arg("gc.auto=0")
         .arg("clone")
         .arg("--filter=blob:none")
         .arg(url)
@@ -359,6 +369,8 @@ fn fetch(repo: &Path) -> Result<(), CacheError> {
     let status = Command::new("git")
         .arg("-c")
         .arg("core.hooksPath=/dev/null")
+        .arg("-c")
+        .arg("gc.auto=0")
         .arg("-C")
         .arg(repo)
         .arg("fetch")
@@ -383,6 +395,8 @@ fn fetch_refetch(repo: &Path) -> Result<(), CacheError> {
     let status = Command::new("git")
         .arg("-c")
         .arg("core.hooksPath=/dev/null")
+        .arg("-c")
+        .arg("gc.auto=0")
         .arg("-C")
         .arg(repo)
         .arg("fetch")
@@ -400,8 +414,20 @@ fn fetch_refetch(repo: &Path) -> Result<(), CacheError> {
     Ok(())
 }
 
+/// Wrap an I/O error with the operation and path it happened on -- a bare
+/// `CacheError::Io(e)` at these call sites used to surface as an opaque
+/// "No such file or directory" with no way to tell which of the many paths
+/// `dir_size`/`touch`/`evict_lru` touch actually disappeared.
+fn io_err(op: &str, path: &Path, e: std::io::Error) -> CacheError {
+    CacheError::Io(std::io::Error::new(
+        e.kind(),
+        format!("{op} {}: {e}", path.display()),
+    ))
+}
+
 fn touch(repo_dir: &Path) -> Result<(), CacheError> {
-    std::fs::write(repo_dir.join(MARKER_FILE), b"")?;
+    let marker = repo_dir.join(MARKER_FILE);
+    std::fs::write(&marker, b"").map_err(|e| io_err("touch: write marker", &marker, e))?;
     Ok(())
 }
 
@@ -409,14 +435,41 @@ fn touch(repo_dir: &Path) -> Result<(), CacheError> {
 /// throughout, so a symlink itself is sized but never traversed -- clones
 /// never legitimately contain symlinked directories pointing outside the
 /// clone, and this avoids any possibility of a symlink loop).
+///
+/// Tolerant of an entry disappearing mid-walk (a vanished entry contributes
+/// 0 bytes rather than aborting the whole size computation): a cache slot's
+/// `.git` tree can legitimately be mutated by something outside this
+/// function's control while it walks it -- git's own `gc --auto` may still
+/// be finishing a background repack from an *earlier* command despite
+/// `gc.auto=0` on every command this crate issues (a slot's history predates
+/// that setting, or an operator's own `git` invocation touched the slot), or
+/// a concurrent `evict_lru`/`ensure_clone` repair on the same slot removed
+/// it. This accounting is inherently a snapshot of a possibly-changing tree
+/// (ADR-088 Amendment 1: eviction is safe because ingest cursors live in the
+/// database, not the clone), so "the thing I was about to size is already
+/// gone" is not an error here -- it is the expected outcome of a slot that
+/// eviction (by us or a racing process) has already reclaimed.
 fn dir_size(path: &Path) -> Result<u64, CacheError> {
     let mut total = 0u64;
     let mut stack = vec![path.to_path_buf()];
     while let Some(p) = stack.pop() {
-        let md = std::fs::symlink_metadata(&p)?;
+        let md = match std::fs::symlink_metadata(&p) {
+            Ok(md) => md,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(io_err("dir_size: stat", &p, e)),
+        };
         if md.is_dir() {
-            for entry in std::fs::read_dir(&p)? {
-                stack.push(entry?.path());
+            let read_dir = match std::fs::read_dir(&p) {
+                Ok(read_dir) => read_dir,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(io_err("dir_size: read_dir", &p, e)),
+            };
+            for entry in read_dir {
+                match entry {
+                    Ok(entry) => stack.push(entry.path()),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(e) => return Err(io_err("dir_size: read_dir entry", &p, e)),
+                }
             }
         } else {
             total += md.len();
@@ -462,8 +515,18 @@ fn is_owned_entry(path: &Path) -> bool {
 /// `is_owned_entry` -- eviction never touches user-owned or non-cache paths.
 fn evict_lru(root: &Path, keep: &Path) -> Result<(), CacheError> {
     let mut entries: Vec<(PathBuf, SystemTime, u64)> = Vec::new();
-    for entry in std::fs::read_dir(root)? {
-        let entry = entry?;
+    let read_dir =
+        std::fs::read_dir(root).map_err(|e| io_err("evict_lru: read_dir root", root, e))?;
+    for entry in read_dir {
+        let entry = match entry {
+            Ok(entry) => entry,
+            // The directory listing raced a concurrent removal of one of its
+            // own entries (e.g. another `evict_lru`/`ensure_clone` repairing
+            // the same root, or the tail of a background `gc --auto` from
+            // before `gc.auto=0` applied) -- nothing to evict there anymore.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(io_err("evict_lru: read_dir entry", root, e)),
+        };
         let p = entry.path();
         if !p.is_dir() || p == keep || !is_owned_entry(&p) {
             continue;
@@ -686,6 +749,66 @@ mod tests {
         std::fs::create_dir_all(dir.path().join("sub")).unwrap();
         std::fs::write(dir.path().join("sub/b.txt"), b"1234567890").unwrap();
         assert_eq!(dir_size(dir.path()).unwrap(), 15);
+    }
+
+    /// Issue #842's macOS ENOENT flake family: `dir_size` walks a tree that
+    /// can legitimately be mutated out from under it (git's own background
+    /// `gc --auto`, or a racing `evict_lru`/`ensure_clone` repair on the same
+    /// slot) -- a subdirectory disappearing between `read_dir` listing it and
+    /// this walk descending into it must shrink the total, not abort the
+    /// whole computation with `CacheError::Io(NotFound)`.
+    ///
+    /// This is a genuine cross-thread filesystem race, not a fully
+    /// deterministic single-shot repro: a `std::sync::Barrier` releases both
+    /// threads at the same instant, a wide fan of sibling subdirectories
+    /// gives the walk many entries to still be processing when the deleter
+    /// runs, and the whole race is repeated many times so the window is
+    /// almost certain to be hit at least once across the loop. Pre-fix (see
+    /// the sabotage note on `dir_size` above), this reliably reproduces
+    /// `CacheError::Io` within a handful of iterations on this machine; it is
+    /// not a `sleep`-based synchronization, so it is not always the exact
+    /// same interleaving twice, but the failure is real and observable, not
+    /// theoretical.
+    #[test]
+    fn dir_size_tolerates_a_subdirectory_removed_mid_walk() {
+        for _ in 0..200 {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let root = dir.path().to_path_buf();
+            let victim = root.join("victim");
+            std::fs::create_dir_all(&victim).unwrap();
+            for i in 0..64 {
+                std::fs::write(victim.join(format!("f{i}.txt")), b"0123456789").unwrap();
+            }
+            // A wide fan of siblings so the walk still has entries left on
+            // its stack (and is plausibly still inside `victim`) at the
+            // instant the other thread deletes it.
+            for i in 0..64 {
+                let sibling = root.join(format!("sibling{i}"));
+                std::fs::create_dir_all(&sibling).unwrap();
+                std::fs::write(sibling.join("s.txt"), b"0123456789").unwrap();
+            }
+
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+            let walk_root = root.clone();
+            let walk_barrier = barrier.clone();
+            let walker = std::thread::spawn(move || {
+                walk_barrier.wait();
+                dir_size(&walk_root)
+            });
+            let delete_victim = victim.clone();
+            let deleter = std::thread::spawn(move || {
+                barrier.wait();
+                let _ = std::fs::remove_dir_all(&delete_victim);
+            });
+
+            let result = walker.join().expect("walker thread");
+            deleter.join().expect("deleter thread");
+
+            assert!(
+                result.is_ok(),
+                "dir_size must tolerate a subdirectory vanishing mid-walk, got {result:?}"
+            );
+        }
     }
 
     // ── issue #765: refetch/reclone repair primitives ──────────────────────
