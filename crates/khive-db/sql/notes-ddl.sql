@@ -1,5 +1,8 @@
 -- Notes table and supporting indexes.
 -- Applied idempotently by StorageBackend::notes_for_namespace on every store access.
+-- Cheap on every call (CREATE ... IF NOT EXISTS is a catalog lookup, not a
+-- table scan) -- unlike the notes_seq repair, which is gated separately
+-- (see `stores/note.rs::repair_notes_seq` and `StorageBackend::notes_for_namespace`).
 
 CREATE TABLE IF NOT EXISTS notes (
     id           TEXT PRIMARY KEY,
@@ -33,20 +36,13 @@ CREATE TABLE IF NOT EXISTS notes_seq (
 
 CREATE INDEX IF NOT EXISTS idx_notes_seq_note_id ON notes_seq(note_id);
 
--- Repair, mirroring `sql/008-notes-seq-repair.sql` (khive #827 round 3) --
--- see that file for the full rationale. This DDL runs on every
--- `notes_for_namespace` call (not just once, like the versioned migration),
--- including for callers that build a store directly and never call
--- `run_migrations`. It targets notes MISSING a `notes_seq` row specifically
--- -- via an anti-join, not "the table is globally empty" -- because a
--- database can have a partially populated `notes_seq` (e.g. one post-V7
--- note landed through `assign_note_seq` before this lazy path ever ran):
--- checking global emptiness alone would see that one row and skip repairing
--- every older, still-unmapped note, permanently excluding them from
--- `comm.probe`. `INSERT OR IGNORE` makes this idempotent and cheap once the
--- ledger is fully populated -- the anti-join still scans `notes`, but every
--- row it finds is already excluded by `idx_notes_seq_note_id`.
-INSERT OR IGNORE INTO notes_seq (note_id)
-SELECT n.id FROM notes n
-WHERE NOT EXISTS (SELECT 1 FROM notes_seq s WHERE s.note_id = n.id)
-ORDER BY n.created_at ASC, n.id ASC;
+-- The notes_seq anti-join repair (khive #827 round 3) used to run here, on
+-- every `notes_for_namespace` call. On a large, already-repaired ledger that
+-- is a full `notes` scan plus a temp B-tree for the ORDER BY on every single
+-- store acquisition, serializing every caller behind the writer mutex for no
+-- benefit once the ledger has nothing left to repair (khive #827 round 4).
+-- The repair itself now lives in `stores/note.rs::repair_notes_seq` (still
+-- sourced from `sql/008-notes-seq-repair.sql`, same anti-join) and is invoked
+-- by `StorageBackend::notes_for_namespace`, gated to run at most once per
+-- backend/pool for the process's lifetime via an atomic counter on
+-- `StorageBackend`.

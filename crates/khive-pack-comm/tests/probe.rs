@@ -1180,3 +1180,62 @@ async fn probe_repairs_partial_notes_seq_left_by_original_v7_on_reopen() {
         "all three older notes plus the post-upgrade note must be visible: {messages:?}"
     );
 }
+
+/// Regression for #827 round-4 perf finding: the notes_seq anti-join repair
+/// (`stores/note.rs::repair_notes_seq`, the same statement as V8's forward
+/// migration) used to run its full `notes` table scan plus a temp B-tree for
+/// the `ORDER BY` on *every* `notes_for_namespace` call -- on a large,
+/// already-repaired ledger that serialized every caller behind the writer
+/// mutex for a scan that could never find anything to repair. It must now
+/// run at most once per backend (`StorageBackend`) for the process's
+/// lifetime, gated by an atomic counter, not once per store acquisition.
+///
+/// Verified via `StorageBackend::notes_seq_repair_run_count` -- an actual
+/// count of how many times the repair statement executed -- not via timing,
+/// per the fix's own requirement that this be observable deterministically.
+#[tokio::test]
+async fn notes_seq_repair_runs_once_per_backend_not_per_store_acquisition() {
+    let (_registry, runtime) = build_registry();
+    let token = runtime
+        .authorize(Namespace::local())
+        .expect("authorize local namespace");
+
+    // `build_registry()` already acquired a NoteStore once (to create the
+    // `notes` table before applying schema plans), and `KhiveRuntime::new`/
+    // `memory()` already ran `run_migrations` (including V8's forward
+    // repair) before that -- so by this point the ledger is fully repaired
+    // and the lazy repair has run exactly once.
+    assert_eq!(
+        runtime.backend().notes_seq_repair_run_count(),
+        1,
+        "the first store acquisition on this backend must run the repair exactly once"
+    );
+
+    // Plant a genuine message so there is real traffic through the store on
+    // each acquisition below, then repeatedly re-acquire the NoteStore --
+    // the exact shape of every real request dispatch through
+    // `KhiveRuntime::notes`.
+    let note_id = plant_inbound_message(
+        &runtime,
+        "lambda:leo",
+        "lambda:khive",
+        1_000_000,
+        None,
+        false,
+    )
+    .await;
+    for _ in 0..5 {
+        let store = runtime.notes(&token).expect("notes store");
+        assert!(
+            store.get_note(note_id).await.expect("get_note").is_some(),
+            "the store returned on each acquisition must still be fully functional"
+        );
+    }
+
+    assert_eq!(
+        runtime.backend().notes_seq_repair_run_count(),
+        1,
+        "repeated store acquisition on an already-repaired ledger must not \
+         re-run the notes_seq anti-join repair"
+    );
+}

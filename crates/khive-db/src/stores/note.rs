@@ -960,8 +960,25 @@ impl NoteStore for SqlNoteStore {
 
 const NOTES_DDL: &str = include_str!("../../sql/notes-ddl.sql");
 
+/// Same anti-join repair as `sql/008-notes-seq-repair.sql` (the V8 forward
+/// migration) -- shared via `include_str!` from that single source file
+/// rather than duplicated as SQL text. `INSERT OR IGNORE` targets notes
+/// still missing a `notes_seq` row specifically, so it is correct to run
+/// against a fresh ledger, a partially populated one, or an already fully
+/// repaired one.
+const NOTES_SEQ_REPAIR_DDL: &str = include_str!("../../sql/008-notes-seq-repair.sql");
+
 pub(crate) fn ensure_notes_schema(conn: &rusqlite::Connection) -> Result<(), rusqlite::Error> {
     conn.execute_batch(NOTES_DDL)
+}
+
+/// Anti-join backfill of `notes_seq` for any note still missing a row
+/// (khive #827 round 3). Scans `notes` in full, so callers MUST gate this to
+/// run at most once per backend/pool rather than on every store acquisition
+/// (khive #827 round 4 perf finding) -- see
+/// `StorageBackend::notes_for_namespace`.
+pub(crate) fn repair_notes_seq(conn: &rusqlite::Connection) -> Result<(), rusqlite::Error> {
+    conn.execute_batch(NOTES_SEQ_REPAIR_DDL)
 }
 
 #[cfg(test)]
