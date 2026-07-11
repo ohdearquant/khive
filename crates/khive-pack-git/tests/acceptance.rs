@@ -599,6 +599,571 @@ async fn ingest_masks_credential_shaped_pr_title_without_dropping_note() {
     );
 }
 
+/// Issue #801: a credential-shaped issue title (sibling site of #763/#785)
+/// must be masked in place rather than causing the whole issue note to be
+/// rejected by the runtime's recursive `properties` secret scan.
+#[tokio::test]
+async fn ingest_masks_credential_shaped_issue_title_without_dropping_note() {
+    let _guard = ENV_MUTEX.lock().await;
+    let (rt, token, registry) = fixture().await;
+
+    let project_id = create(
+        &registry,
+        json!({"kind": "project", "name": "issue-title-credential-repo"}),
+    )
+    .await;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo: PathBuf = dir.path().join("repo");
+    std::fs::create_dir_all(&repo).expect("mk repo dir");
+    init_repo(&repo);
+    write(&repo, "README.md", "hello\n");
+    commit(&repo, &["README.md"], "Initial commit");
+
+    let bin_dir = dir.path().join("bin");
+    std::fs::create_dir_all(&bin_dir).expect("mk bin dir");
+    let log_dir = dir.path().join("log");
+    std::fs::create_dir_all(&log_dir).expect("mk log dir");
+
+    let fake_token = "ghp_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+    let issue_json = json!([{
+        "number": 11,
+        "title": format!("Rotate leaked {fake_token} immediately"),
+        "author": {"login": "octocat"},
+        "createdAt": "2026-01-01T00:00:00Z",
+        "closedAt": null,
+        "updatedAt": "2026-01-01T00:00:00Z",
+        "labels": [],
+        "stateReason": "",
+        "body": ""
+    }])
+    .to_string();
+
+    write_fake_gh(&bin_dir, &log_dir, "[]", &issue_json);
+    let _path_guard = PathGuard::install(&bin_dir);
+
+    let report = run_ingest(
+        &rt,
+        &token,
+        &registry,
+        IngestOptions::unbounded(repo.clone(), project_id.to_string()),
+    )
+    .await
+    .expect("ingest ok");
+
+    assert_eq!(
+        report.issues_ingested, 1,
+        "the issue must not be dropped: {report:?}"
+    );
+    assert!(
+        report.warnings.iter().all(|w| !w.contains("issue #11")),
+        "no silent-drop warning may be reported: {:?}",
+        report.warnings
+    );
+
+    let issues_list = registry
+        .dispatch("list", json!({"kind": "issue", "limit": 10}))
+        .await
+        .expect("list issues ok");
+    let items = issues_list.as_array().expect("array");
+    assert_eq!(items.len(), 1);
+    let item = &items[0];
+    let stored_name = item["name"].as_str().expect("name is string");
+    let stored_title = item["properties"]["title"]
+        .as_str()
+        .expect("properties.title is string");
+    assert!(
+        !stored_name.contains(fake_token) && !stored_title.contains(fake_token),
+        "raw credential must not survive into name or properties.title: \
+         name={stored_name:?}, title={stored_title:?}"
+    );
+    assert!(
+        stored_name.contains("***MASKED***") && stored_title.contains("***MASKED***"),
+        "masked marker must be present in both name and properties.title: \
+         name={stored_name:?}, title={stored_title:?}"
+    );
+}
+
+/// A clean (non-credential) issue title and an empty body must pass through
+/// `ingest_issues` unchanged -- guards against a future over-aggressive
+/// masking regression that the detector-positive test above cannot catch.
+#[tokio::test]
+async fn ingest_leaves_clean_issue_title_unmasked() {
+    let _guard = ENV_MUTEX.lock().await;
+    let (rt, token, registry) = fixture().await;
+
+    let project_id = create(
+        &registry,
+        json!({"kind": "project", "name": "issue-clean-title-repo"}),
+    )
+    .await;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo: PathBuf = dir.path().join("repo");
+    std::fs::create_dir_all(&repo).expect("mk repo dir");
+    init_repo(&repo);
+    write(&repo, "README.md", "hello\n");
+    commit(&repo, &["README.md"], "Initial commit");
+
+    let bin_dir = dir.path().join("bin");
+    std::fs::create_dir_all(&bin_dir).expect("mk bin dir");
+    let log_dir = dir.path().join("log");
+    std::fs::create_dir_all(&log_dir).expect("mk log dir");
+
+    let issue_json = json!([{
+        "number": 12,
+        "title": "Fix the flaky retry test",
+        "author": {"login": "octocat"},
+        "createdAt": "2026-01-01T00:00:00Z",
+        "closedAt": null,
+        "updatedAt": "2026-01-01T00:00:00Z",
+        "labels": [],
+        "stateReason": "",
+        "body": ""
+    }])
+    .to_string();
+
+    write_fake_gh(&bin_dir, &log_dir, "[]", &issue_json);
+    let _path_guard = PathGuard::install(&bin_dir);
+
+    let report = run_ingest(
+        &rt,
+        &token,
+        &registry,
+        IngestOptions::unbounded(repo.clone(), project_id.to_string()),
+    )
+    .await
+    .expect("ingest ok");
+
+    assert_eq!(report.issues_ingested, 1, "{report:?}");
+
+    let issues_list = registry
+        .dispatch("list", json!({"kind": "issue", "limit": 10}))
+        .await
+        .expect("list issues ok");
+    let items = issues_list.as_array().expect("array");
+    assert_eq!(items.len(), 1);
+    let item = &items[0];
+    assert_eq!(
+        item["name"].as_str().unwrap(),
+        "#12 Fix the flaky retry test"
+    );
+    assert_eq!(
+        item["properties"]["title"].as_str().unwrap(),
+        "Fix the flaky retry test"
+    );
+}
+
+/// PR #835 round-1 codex finding: the runtime secret gate recursively scans
+/// every string in `properties` (not just `title`), so a credential-shaped
+/// label name previously tripped the gate on `create()` even after the
+/// title was masked, silently dropping the whole issue note.
+#[tokio::test]
+async fn ingest_masks_credential_shaped_issue_label_without_dropping_note() {
+    let _guard = ENV_MUTEX.lock().await;
+    let (rt, token, registry) = fixture().await;
+
+    let project_id = create(
+        &registry,
+        json!({"kind": "project", "name": "issue-label-credential-repo"}),
+    )
+    .await;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo: PathBuf = dir.path().join("repo");
+    std::fs::create_dir_all(&repo).expect("mk repo dir");
+    init_repo(&repo);
+    write(&repo, "README.md", "hello\n");
+    commit(&repo, &["README.md"], "Initial commit");
+
+    let bin_dir = dir.path().join("bin");
+    std::fs::create_dir_all(&bin_dir).expect("mk bin dir");
+    let log_dir = dir.path().join("log");
+    std::fs::create_dir_all(&log_dir).expect("mk log dir");
+
+    let fake_token = "ghp_BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB";
+    let issue_json = json!([{
+        "number": 13,
+        "title": "Rotate the leaked deploy key",
+        "author": {"login": "octocat"},
+        "createdAt": "2026-01-01T00:00:00Z",
+        "closedAt": null,
+        "updatedAt": "2026-01-01T00:00:00Z",
+        "labels": [{"name": fake_token}],
+        "stateReason": "",
+        "body": ""
+    }])
+    .to_string();
+
+    write_fake_gh(&bin_dir, &log_dir, "[]", &issue_json);
+    let _path_guard = PathGuard::install(&bin_dir);
+
+    let report = run_ingest(
+        &rt,
+        &token,
+        &registry,
+        IngestOptions::unbounded(repo.clone(), project_id.to_string()),
+    )
+    .await
+    .expect("ingest ok");
+
+    assert_eq!(
+        report.issues_ingested, 1,
+        "the issue must not be dropped: {report:?}"
+    );
+    assert!(
+        report.warnings.iter().all(|w| !w.contains("issue #13")),
+        "no silent-drop warning may be reported: {:?}",
+        report.warnings
+    );
+
+    let issues_list = registry
+        .dispatch("list", json!({"kind": "issue", "limit": 10}))
+        .await
+        .expect("list issues ok");
+    let items = issues_list.as_array().expect("array");
+    assert_eq!(items.len(), 1);
+    let item = &items[0];
+    let stored_labels = item["properties"]["labels"]
+        .as_array()
+        .expect("properties.labels is array");
+    assert_eq!(stored_labels.len(), 1);
+    let stored_label = stored_labels[0].as_str().expect("label is string");
+    assert!(
+        !stored_label.contains(fake_token),
+        "raw credential must not survive into properties.labels: {stored_label:?}"
+    );
+    assert!(
+        stored_label.contains("***MASKED***"),
+        "masked marker must be present in properties.labels: {stored_label:?}"
+    );
+}
+
+/// Same finding as above, for the author login field: a credential-shaped
+/// login previously tripped the recursive secret gate on `properties` and
+/// silently dropped the issue note.
+#[tokio::test]
+async fn ingest_masks_credential_shaped_issue_author_login_without_dropping_note() {
+    let _guard = ENV_MUTEX.lock().await;
+    let (rt, token, registry) = fixture().await;
+
+    let project_id = create(
+        &registry,
+        json!({"kind": "project", "name": "issue-login-credential-repo"}),
+    )
+    .await;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo: PathBuf = dir.path().join("repo");
+    std::fs::create_dir_all(&repo).expect("mk repo dir");
+    init_repo(&repo);
+    write(&repo, "README.md", "hello\n");
+    commit(&repo, &["README.md"], "Initial commit");
+
+    let bin_dir = dir.path().join("bin");
+    std::fs::create_dir_all(&bin_dir).expect("mk bin dir");
+    let log_dir = dir.path().join("log");
+    std::fs::create_dir_all(&log_dir).expect("mk log dir");
+
+    let fake_token = "ghp_CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC";
+    let issue_json = json!([{
+        "number": 14,
+        "title": "Investigate flaky CI runner",
+        "author": {"login": fake_token},
+        "createdAt": "2026-01-01T00:00:00Z",
+        "closedAt": null,
+        "updatedAt": "2026-01-01T00:00:00Z",
+        "labels": [],
+        "stateReason": "",
+        "body": ""
+    }])
+    .to_string();
+
+    write_fake_gh(&bin_dir, &log_dir, "[]", &issue_json);
+    let _path_guard = PathGuard::install(&bin_dir);
+
+    let report = run_ingest(
+        &rt,
+        &token,
+        &registry,
+        IngestOptions::unbounded(repo.clone(), project_id.to_string()),
+    )
+    .await
+    .expect("ingest ok");
+
+    assert_eq!(
+        report.issues_ingested, 1,
+        "the issue must not be dropped: {report:?}"
+    );
+    assert!(
+        report.warnings.iter().all(|w| !w.contains("issue #14")),
+        "no silent-drop warning may be reported: {:?}",
+        report.warnings
+    );
+
+    let issues_list = registry
+        .dispatch("list", json!({"kind": "issue", "limit": 10}))
+        .await
+        .expect("list issues ok");
+    let items = issues_list.as_array().expect("array");
+    assert_eq!(items.len(), 1);
+    let item = &items[0];
+    let stored_author = item["properties"]["author"]
+        .as_str()
+        .expect("properties.author is string");
+    assert!(
+        !stored_author.contains(fake_token),
+        "raw credential must not survive into properties.author: {stored_author:?}"
+    );
+    assert!(
+        stored_author.contains("***MASKED***"),
+        "masked marker must be present in properties.author: {stored_author:?}"
+    );
+}
+
+/// PR #835 round-2 codex finding (Major): `created_at`/`closed_at` bypassed
+/// `MaskedIssueFields` entirely and entered `properties` as arbitrary raw
+/// strings, so a credential-shaped `createdAt` tripped the runtime's
+/// recursive secret-gate scan on `properties` and silently dropped the
+/// whole issue. The fix parses every issue timestamp into a canonical
+/// RFC3339 form (or rejects it) before it ever reaches `properties` -- a
+/// credential-shaped value is not a valid timestamp, so it is rejected
+/// (becomes `null`) rather than persisted raw, and the issue itself must
+/// still be ingested.
+#[tokio::test]
+async fn ingest_rejects_credential_shaped_issue_created_at_without_dropping_note() {
+    let _guard = ENV_MUTEX.lock().await;
+    let (rt, token, registry) = fixture().await;
+
+    let project_id = create(
+        &registry,
+        json!({"kind": "project", "name": "issue-created-at-credential-repo"}),
+    )
+    .await;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo: PathBuf = dir.path().join("repo");
+    std::fs::create_dir_all(&repo).expect("mk repo dir");
+    init_repo(&repo);
+    write(&repo, "README.md", "hello\n");
+    commit(&repo, &["README.md"], "Initial commit");
+
+    let bin_dir = dir.path().join("bin");
+    std::fs::create_dir_all(&bin_dir).expect("mk bin dir");
+    let log_dir = dir.path().join("log");
+    std::fs::create_dir_all(&log_dir).expect("mk log dir");
+
+    let fake_token = "ghp_DDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDDD";
+    let issue_json = json!([{
+        "number": 20,
+        "title": "Investigate credential-shaped createdAt",
+        "author": {"login": "octocat"},
+        "createdAt": fake_token,
+        "closedAt": null,
+        "updatedAt": "2026-01-01T00:00:00Z",
+        "labels": [],
+        "stateReason": "",
+        "body": ""
+    }])
+    .to_string();
+
+    write_fake_gh(&bin_dir, &log_dir, "[]", &issue_json);
+    let _path_guard = PathGuard::install(&bin_dir);
+
+    let report = run_ingest(
+        &rt,
+        &token,
+        &registry,
+        IngestOptions::unbounded(repo.clone(), project_id.to_string()),
+    )
+    .await
+    .expect("ingest ok");
+
+    assert_eq!(
+        report.issues_ingested, 1,
+        "an unparseable createdAt must not drop the issue: {report:?}"
+    );
+
+    let issues_list = registry
+        .dispatch("list", json!({"kind": "issue", "limit": 10}))
+        .await
+        .expect("list issues ok");
+    let items = issues_list.as_array().expect("array");
+    assert_eq!(items.len(), 1);
+    let item = &items[0];
+    assert!(
+        item["properties"]["created_at"].is_null(),
+        "an unparseable createdAt must be rejected, not persisted raw: {:?}",
+        item["properties"]["created_at"]
+    );
+    let dumped = item.to_string();
+    assert!(
+        !dumped.contains(fake_token),
+        "raw credential-shaped createdAt must not survive anywhere in the stored record: {dumped}"
+    );
+}
+
+/// Sibling of the `createdAt` regression above, for `closedAt` (ingest.rs
+/// line ~1550 in the round-2 finding).
+#[tokio::test]
+async fn ingest_rejects_credential_shaped_issue_closed_at_without_dropping_note() {
+    let _guard = ENV_MUTEX.lock().await;
+    let (rt, token, registry) = fixture().await;
+
+    let project_id = create(
+        &registry,
+        json!({"kind": "project", "name": "issue-closed-at-credential-repo"}),
+    )
+    .await;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo: PathBuf = dir.path().join("repo");
+    std::fs::create_dir_all(&repo).expect("mk repo dir");
+    init_repo(&repo);
+    write(&repo, "README.md", "hello\n");
+    commit(&repo, &["README.md"], "Initial commit");
+
+    let bin_dir = dir.path().join("bin");
+    std::fs::create_dir_all(&bin_dir).expect("mk bin dir");
+    let log_dir = dir.path().join("log");
+    std::fs::create_dir_all(&log_dir).expect("mk log dir");
+
+    let fake_token = "ghp_FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF";
+    let issue_json = json!([{
+        "number": 21,
+        "title": "Investigate credential-shaped closedAt",
+        "author": {"login": "octocat"},
+        "createdAt": "2026-01-01T00:00:00Z",
+        "closedAt": fake_token,
+        "updatedAt": "2026-01-01T00:00:00Z",
+        "labels": [],
+        "stateReason": "",
+        "body": ""
+    }])
+    .to_string();
+
+    write_fake_gh(&bin_dir, &log_dir, "[]", &issue_json);
+    let _path_guard = PathGuard::install(&bin_dir);
+
+    let report = run_ingest(
+        &rt,
+        &token,
+        &registry,
+        IngestOptions::unbounded(repo.clone(), project_id.to_string()),
+    )
+    .await
+    .expect("ingest ok");
+
+    assert_eq!(
+        report.issues_ingested, 1,
+        "an unparseable closedAt must not drop the issue: {report:?}"
+    );
+
+    let issues_list = registry
+        .dispatch("list", json!({"kind": "issue", "limit": 10}))
+        .await
+        .expect("list issues ok");
+    let items = issues_list.as_array().expect("array");
+    assert_eq!(items.len(), 1);
+    let item = &items[0];
+    assert!(
+        item["properties"]["closed_at"].is_null(),
+        "an unparseable closedAt must be rejected, not persisted raw: {:?}",
+        item["properties"]["closed_at"]
+    );
+    let dumped = item.to_string();
+    assert!(
+        !dumped.contains(fake_token),
+        "raw credential-shaped closedAt must not survive anywhere in the stored record: {dumped}"
+    );
+}
+
+/// `updatedAt` is not stored in `properties` at all -- it is only used to
+/// advance the paging cursor (ingest.rs line ~1632 in the round-2 finding).
+/// A credential-shaped `updatedAt` must still not drop the issue, and the
+/// cursor persisted to `git_mirror_cursor` must never contain the raw
+/// value; it must advance only from a sibling record's validated,
+/// canonicalized timestamp.
+#[tokio::test]
+async fn ingest_rejects_credential_shaped_issue_updated_at_and_cursor_never_persists_raw_value() {
+    let _guard = ENV_MUTEX.lock().await;
+    let (rt, token, registry) = fixture().await;
+
+    let project_id = create(
+        &registry,
+        json!({"kind": "project", "name": "issue-updated-at-credential-repo"}),
+    )
+    .await;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo: PathBuf = dir.path().join("repo");
+    std::fs::create_dir_all(&repo).expect("mk repo dir");
+    init_repo(&repo);
+    write(&repo, "README.md", "hello\n");
+    commit(&repo, &["README.md"], "Initial commit");
+
+    let bin_dir = dir.path().join("bin");
+    std::fs::create_dir_all(&bin_dir).expect("mk bin dir");
+    let log_dir = dir.path().join("log");
+    std::fs::create_dir_all(&log_dir).expect("mk log dir");
+
+    let fake_token = "ghp_EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE";
+    let issue_json = json!([
+        {
+            "number": 22,
+            "title": "Credential-shaped updatedAt",
+            "author": {"login": "octocat"},
+            "createdAt": "2026-01-01T00:00:00Z",
+            "closedAt": null,
+            "updatedAt": fake_token,
+            "labels": [],
+            "stateReason": "",
+            "body": ""
+        },
+        {
+            "number": 23,
+            "title": "Clean sibling issue",
+            "author": {"login": "octocat"},
+            "createdAt": "2026-01-02T00:00:00Z",
+            "closedAt": null,
+            "updatedAt": "2026-01-02T00:00:00Z",
+            "labels": [],
+            "stateReason": "",
+            "body": ""
+        }
+    ])
+    .to_string();
+
+    write_fake_gh(&bin_dir, &log_dir, "[]", &issue_json);
+    let _path_guard = PathGuard::install(&bin_dir);
+
+    let report = run_ingest(
+        &rt,
+        &token,
+        &registry,
+        IngestOptions::unbounded(repo.clone(), project_id.to_string()),
+    )
+    .await
+    .expect("ingest ok");
+
+    assert_eq!(
+        report.issues_ingested, 2,
+        "an unparseable updatedAt must not drop the issue: {report:?}"
+    );
+
+    let cursor = read_git_cursor(&rt, project_id, "issues")
+        .await
+        .expect("cursor must be written from the sibling issue's valid updatedAt");
+    assert!(
+        !cursor.contains(fake_token),
+        "the paging cursor must never persist a raw credential-shaped updatedAt: {cursor:?}"
+    );
+    assert!(
+        cursor.starts_with("2026-01-02"),
+        "the cursor must advance to the sibling issue's valid, canonicalized updatedAt: {cursor:?}"
+    );
+}
+
 /// Multiple credential spans across both the title and the body of the same
 /// PR must all be masked, and exactly one PR note must be written.
 #[tokio::test]
@@ -1074,6 +1639,93 @@ async fn issue_hook_rejects_ungoverned_state_reason() {
     );
 }
 
+/// Round-3 codex finding (Major): before this fix, the masking boundary only
+/// lowercased `stateReason` -- validation against the governed enum was left
+/// entirely to `IssueLikeHook::prepare_create`, whose error interpolated the
+/// raw value verbatim (`"issue properties.state_reason {reason:?} invalid"`).
+/// That error propagated straight into `ingest_issues`'s `report.warnings`
+/// (`format!("create issue #{number}: {e}")`), so a credential-shaped
+/// `stateReason` landed in the ingest report before the secret gate (which
+/// only scans title/body/labels/author) ever had a chance to see it.
+///
+/// This drives the full `run_ingest` path with a credential-shaped
+/// `stateReason` and asserts it never appears anywhere in `report.warnings`,
+/// is never persisted as an issue record, and the record is cleanly
+/// warn-and-skipped (fail-closed, matching ADR-088 §3) rather than silently
+/// coerced or dropped-but-created.
+#[tokio::test]
+async fn issue_ingest_never_echoes_credential_shaped_state_reason() {
+    let _guard = ENV_MUTEX.lock().await;
+    let (rt, token, registry) = fixture().await;
+
+    let project_id = create(
+        &registry,
+        json!({"kind": "project", "name": "state-reason-leak-repo"}),
+    )
+    .await;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo: PathBuf = dir.path().join("repo");
+    std::fs::create_dir_all(&repo).expect("mk repo dir");
+    init_repo(&repo);
+    write(&repo, "README.md", "hello\n");
+    commit(&repo, &["README.md"], "Initial commit");
+
+    let bin_dir = dir.path().join("bin");
+    std::fs::create_dir_all(&bin_dir).expect("mk bin dir");
+    let log_dir = dir.path().join("log");
+    std::fs::create_dir_all(&log_dir).expect("mk log dir");
+
+    const CREDENTIAL: &str = "ghp_FAKEFAKEFAKEFAKEFAKEFAKEFAKEFAKEFAKE1";
+
+    let issue_json = json!([
+        {"number": 42, "title": "credential-shaped stateReason", "author": {"login": "a"},
+         "createdAt": "2026-01-01T00:00:00Z", "closedAt": "2026-01-01T00:00:00Z",
+         "updatedAt": "2026-01-01T00:00:00Z", "labels": [], "stateReason": CREDENTIAL, "body": ""}
+    ])
+    .to_string();
+
+    write_fake_gh(&bin_dir, &log_dir, "[]", &issue_json);
+    let _path_guard = PathGuard::install(&bin_dir);
+
+    let mut opts = IngestOptions::unbounded(repo.clone(), project_id.to_string());
+    opts.include.pull_requests = false;
+    opts.include.commits = false;
+
+    let report = run_ingest(&rt, &token, &registry, opts)
+        .await
+        .expect("ingest ok");
+
+    assert_eq!(
+        report.issues_ingested, 0,
+        "the ungoverned-stateReason record must be rejected, not created: {report:?}"
+    );
+    assert!(
+        !report.warnings.is_empty(),
+        "the rejection must be reported as a warning: {report:?}"
+    );
+    assert!(
+        report.warnings.iter().any(|w| w.contains("issue #42")),
+        "the warning must name the rejected record: {:?}",
+        report.warnings
+    );
+    assert!(
+        report.warnings.iter().all(|w| !w.contains(CREDENTIAL)),
+        "the raw credential-shaped stateReason must never appear in report.warnings: {:?}",
+        report.warnings
+    );
+
+    let issues_list = registry
+        .dispatch("list", json!({"kind": "issue", "limit": 10}))
+        .await
+        .expect("list issues ok");
+    let items = issues_list.as_array().expect("array");
+    assert!(
+        items.is_empty(),
+        "the ungoverned record must never land: {items:?}"
+    );
+}
+
 #[tokio::test]
 async fn issue_hook_requires_properties_project_id() {
     let (_rt, _token, registry) = fixture().await;
@@ -1450,6 +2102,147 @@ async fn gh_boundary_contract_and_partial_ingest_failure() {
         1,
         "the frozen cursor retries the failed record every pass, not just once: {:?}",
         report2.warnings
+    );
+}
+
+// ── round-3 codex finding (Major): raw `updatedAt` must never reach the
+//    paging floor via a full page ─────────────────────────────────────────
+
+/// Before this fix, `ingest_issues` sorted the raw `Vec<GhIssue>` and derived
+/// its paging continuation floor (`last_updated_at`) from the raw,
+/// pre-`MaskedIssueFields` `updated_at` before `MaskedIssueFields::new` ever
+/// ran. A credential-shaped raw value sorts LAST under raw ASCII string
+/// comparison (any letter-leading string outranks a digit-leading RFC3339
+/// timestamp), so it could become the next `gh --search updated:>=...`
+/// argument -- exposing it in process arguments -- or, once dropped by
+/// canonicalization, corrupt the frozen-cursor invariant.
+///
+/// This test forces the vulnerable branch directly: a page of exactly
+/// `PAGE_LIMIT` (1000) issues, one of which has a credential-shaped raw
+/// `updatedAt` that fails RFC3339 parsing. Under the fix, the ENTIRE page is
+/// masked/canonicalized before sorting, so the malformed record's
+/// `updated_at` becomes `None` and sorts FIRST, never becoming
+/// `last_updated_at`. Asserts the raw value never appears in any recorded
+/// `gh` invocation's argv, in the persisted paging cursor, or in any
+/// persisted issue record, and that a full page still triggers a
+/// continuation fetch (not a false `WindowComplete`) -- pagination remains
+/// resumable.
+#[tokio::test]
+async fn issue_full_page_never_leaks_raw_updated_at_into_paging_floor() {
+    let _guard = ENV_MUTEX.lock().await;
+    let (rt, token, registry) = fixture().await;
+
+    let project_id = create(
+        &registry,
+        json!({"kind": "project", "name": "full-page-repo"}),
+    )
+    .await;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo: PathBuf = dir.path().join("repo");
+    std::fs::create_dir_all(&repo).expect("mk repo dir");
+    init_repo(&repo);
+    write(&repo, "README.md", "hello\n");
+    commit(&repo, &["README.md"], "Initial commit");
+
+    let bin_dir = dir.path().join("bin");
+    std::fs::create_dir_all(&bin_dir).expect("mk bin dir");
+    let log_dir = dir.path().join("log");
+    std::fs::create_dir_all(&log_dir).expect("mk log dir");
+
+    // Mirrors `ingest.rs`'s private `PAGE_LIMIT` -- `gh {pr,issue} list
+    // --search` never returns more than this many results per page.
+    const PAGE_LIMIT: usize = 1000;
+    const CREDENTIAL: &str = "sk-ant-api03-FAKE1234567890FAKE1234567890FAKE1234567890FAKE";
+
+    let mut issues: Vec<Value> = (1..PAGE_LIMIT)
+        .map(|i| {
+            let minute = i / 60;
+            let second = i % 60;
+            json!({
+                "number": i,
+                "title": format!("issue {i}"),
+                "author": {"login": "a"},
+                "createdAt": "2026-01-01T00:00:00Z",
+                "closedAt": null,
+                "updatedAt": format!("2026-01-01T{minute:02}:{second:02}:00Z"),
+                "labels": [],
+                "stateReason": "",
+                "body": ""
+            })
+        })
+        .collect();
+    // Raw ASCII compare: 's' (0x73) outranks every digit (0x30-0x39), so
+    // this record's raw `updatedAt` sorts after all 999 valid timestamps
+    // above -- exactly the "sorts last" shape the finding describes.
+    issues.push(json!({
+        "number": PAGE_LIMIT,
+        "title": "issue with malformed updatedAt",
+        "author": {"login": "a"},
+        "createdAt": "2026-01-01T00:00:00Z",
+        "closedAt": null,
+        "updatedAt": CREDENTIAL,
+        "labels": [],
+        "stateReason": "",
+        "body": ""
+    }));
+    assert_eq!(
+        issues.len(),
+        PAGE_LIMIT,
+        "page must be exactly PAGE_LIMIT-sized to force the continuation branch"
+    );
+    let issue_json = Value::Array(issues).to_string();
+
+    write_fake_gh(&bin_dir, &log_dir, "[]", &issue_json);
+    let _path_guard = PathGuard::install(&bin_dir);
+
+    let mut opts = IngestOptions::unbounded(repo.clone(), project_id.to_string());
+    opts.include.pull_requests = false;
+    opts.include.commits = false;
+
+    let report = run_ingest(&rt, &token, &registry, opts)
+        .await
+        .expect("ingest ok");
+
+    assert_eq!(
+        report.issues_ingested, PAGE_LIMIT as u64,
+        "every record lands -- the malformed record only loses its updated_at field: {report:?}"
+    );
+
+    let args_log = std::fs::read_to_string(log_dir.join("args.log")).expect("read args.log");
+    assert!(
+        !args_log.contains(CREDENTIAL),
+        "the raw credential-shaped updatedAt must never reach a gh invocation's argv \
+         (paging floor leak): {args_log}"
+    );
+    // A full (PAGE_LIMIT-sized) page must trigger a second `gh issue list`
+    // invocation -- proving pagination did not silently treat the full page
+    // as window-complete.
+    let issue_invocations = args_log.lines().filter(|l| l.starts_with("issue ")).count();
+    assert!(
+        issue_invocations >= 2,
+        "a full page must be followed by a continuation fetch: {args_log}"
+    );
+
+    let cursor = read_git_cursor(&rt, project_id, "issues")
+        .await
+        .expect("cursor must be written");
+    assert!(
+        !cursor.contains(CREDENTIAL),
+        "the persisted paging cursor must never contain the raw credential value: {cursor}"
+    );
+
+    let issues_list = registry
+        .dispatch(
+            "list",
+            json!({"kind": "issue", "limit": (PAGE_LIMIT + 10) as u64}),
+        )
+        .await
+        .expect("list issues ok");
+    let items = issues_list.as_array().expect("array");
+    assert!(
+        items.iter().all(|i| !i.to_string().contains(CREDENTIAL)),
+        "no persisted issue record may contain the raw credential value"
     );
 }
 

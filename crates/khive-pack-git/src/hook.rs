@@ -95,8 +95,12 @@ impl KindHook for CommitHook {
     }
 }
 
-/// The governed `state_reason` value set for `issue` (ADR-088 §3).
-const ISSUE_STATE_REASONS: &[&str] = &["completed", "not_planned", "reopened", "duplicate"];
+/// The governed `state_reason` value set for `issue` (ADR-088 §3). `pub(crate)`
+/// so `ingest::MaskedIssueFields` can classify against the same set at the
+/// masking boundary, before an ungoverned (possibly credential-shaped) raw
+/// value can reach this hook's error path.
+pub(crate) const ISSUE_STATE_REASONS: &[&str] =
+    &["completed", "not_planned", "reopened", "duplicate"];
 
 /// `KindHook` shared by `issue` and `pull_request` — both require
 /// `properties.number` and `properties.project_id`, and, when present,
@@ -149,9 +153,12 @@ impl KindHook for IssueLikeHook {
         }
 
         if let Some(reason) = props.get("state_reason").and_then(Value::as_str) {
+            // The raw value is never interpolated into this error: it is
+            // caller-controlled (for `issue`, sourced from GitHub) and may be
+            // credential-shaped. Only the static governed set is echoed.
             if self.kind == "issue" && !ISSUE_STATE_REASONS.contains(&reason) {
                 return Err(RuntimeError::InvalidInput(format!(
-                    "issue properties.state_reason {reason:?} invalid — valid: {}",
+                    "issue properties.state_reason is not one of the governed values — valid: {}",
                     ISSUE_STATE_REASONS.join(", ")
                 )));
             }
