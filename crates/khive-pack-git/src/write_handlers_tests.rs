@@ -4,6 +4,13 @@
 //! test. Never touches `~/.khive` or any production store: `KhiveRuntime`
 //! is always an in-memory instance (`KhiveRuntime::memory()`), and the git
 //! repo under test is always a throwaway tempdir, never this workspace.
+//!
+//! Every test holds `cache::ENV_MUTEX` for its full body: `crate::cache`'s
+//! and `crate::recovery_tests`' tests shadow the process-global `PATH` (and
+//! other env vars) to inject fake `git` binaries, which would otherwise race
+//! against every `Command::new("git")` spawn here (both this module's own
+//! `git_command` helper and the handler code under test resolve `git` via
+//! `PATH` at spawn time).
 
 use std::path::Path;
 use std::process::Command;
@@ -14,13 +21,30 @@ use khive_runtime::{KhiveRuntime, Namespace, NamespaceToken};
 
 use crate::GitPack;
 
-fn run(dir: &Path, args: &[&str]) {
-    let out = Command::new("git")
+/// Builds a `git` invocation hardened against ambient host state: a global
+/// `core.hooksPath`, `init.templateDir`, or system/global config on the
+/// machine running the tests must never be able to run a hook or inject
+/// config into a scratch repo under test. Mirrors `crates/khive-pack-git/
+/// src/cache.rs`'s hardened invocations, applied to every git call this test
+/// module makes (not just the `run` helper).
+fn git_command(dir: &Path) -> Command {
+    let mut cmd = Command::new("git");
+    cmd.arg("-c")
+        .arg(format!(
+            "core.hooksPath={}",
+            dir.join(".khive-test-no-hooks").display()
+        ))
         .arg("-C")
         .arg(dir)
-        .args(args)
-        .output()
-        .expect("spawn git");
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .env("GIT_TEMPLATE_DIR", "")
+        .env("GIT_TERMINAL_PROMPT", "0");
+    cmd
+}
+
+fn run(dir: &Path, args: &[&str]) {
+    let out = git_command(dir).args(args).output().expect("spawn git");
     assert!(
         out.status.success(),
         "git {args:?} failed: {}",
@@ -70,6 +94,7 @@ async fn pack_and_token() -> (GitPack, NamespaceToken) {
 
 #[tokio::test]
 async fn commit_with_no_paths_commits_all_tracked_changes() {
+    let _env_guard = crate::cache::ENV_MUTEX.lock().await;
     let (repo, _remote) = init_repo_with_remote();
     let (pack, token) = pack_and_token().await;
 
@@ -89,9 +114,7 @@ async fn commit_with_no_paths_commits_all_tracked_changes() {
         .expect("sha present");
     assert_eq!(sha.len(), 40, "sha must be a full 40-char hex commit id");
 
-    let log = Command::new("git")
-        .arg("-C")
-        .arg(repo.path())
+    let log = git_command(repo.path())
         .args(["log", "-1", "--pretty=%s"])
         .output()
         .expect("git log");
@@ -100,6 +123,7 @@ async fn commit_with_no_paths_commits_all_tracked_changes() {
 
 #[tokio::test]
 async fn commit_with_paths_scopes_to_those_paths() {
+    let _env_guard = crate::cache::ENV_MUTEX.lock().await;
     let (repo, _remote) = init_repo_with_remote();
     let (pack, token) = pack_and_token().await;
 
@@ -120,9 +144,7 @@ async fn commit_with_paths_scopes_to_those_paths() {
     assert!(result.get("sha").is_some());
 
     // a.txt was modified but not in `paths` -- must still show as dirty.
-    let status = Command::new("git")
-        .arg("-C")
-        .arg(repo.path())
+    let status = git_command(repo.path())
         .args(["status", "--porcelain"])
         .output()
         .expect("git status");
@@ -139,6 +161,7 @@ async fn commit_with_paths_scopes_to_those_paths() {
 
 #[tokio::test]
 async fn commit_rejects_empty_message() {
+    let _env_guard = crate::cache::ENV_MUTEX.lock().await;
     let (repo, _remote) = init_repo_with_remote();
     let (pack, token) = pack_and_token().await;
 
@@ -154,6 +177,7 @@ async fn commit_rejects_empty_message() {
 
 #[tokio::test]
 async fn commit_rejects_injection_shaped_path() {
+    let _env_guard = crate::cache::ENV_MUTEX.lock().await;
     let (repo, _remote) = init_repo_with_remote();
     let (pack, token) = pack_and_token().await;
 
@@ -173,6 +197,7 @@ async fn commit_rejects_injection_shaped_path() {
 
 #[tokio::test]
 async fn commit_rejects_non_repo_path() {
+    let _env_guard = crate::cache::ENV_MUTEX.lock().await;
     let dir = tempfile::tempdir().expect("tempdir");
     let (pack, token) = pack_and_token().await;
 
@@ -190,6 +215,7 @@ async fn commit_rejects_non_repo_path() {
 
 #[tokio::test]
 async fn branch_creates_from_head_by_default() {
+    let _env_guard = crate::cache::ENV_MUTEX.lock().await;
     let (repo, _remote) = init_repo_with_remote();
     let (pack, token) = pack_and_token().await;
 
@@ -202,9 +228,7 @@ async fn branch_creates_from_head_by_default() {
         .expect("branch succeeds");
     assert_eq!(result.get("name").and_then(|v| v.as_str()), Some("feat/x"));
 
-    let branches = Command::new("git")
-        .arg("-C")
-        .arg(repo.path())
+    let branches = git_command(repo.path())
         .args(["branch", "--list", "feat/x"])
         .output()
         .expect("git branch --list");
@@ -213,6 +237,7 @@ async fn branch_creates_from_head_by_default() {
 
 #[tokio::test]
 async fn branch_rejects_injection_shaped_name() {
+    let _env_guard = crate::cache::ENV_MUTEX.lock().await;
     let (repo, _remote) = init_repo_with_remote();
     let (pack, token) = pack_and_token().await;
 
@@ -228,6 +253,7 @@ async fn branch_rejects_injection_shaped_name() {
 
 #[tokio::test]
 async fn branch_rejects_path_traversal_name() {
+    let _env_guard = crate::cache::ENV_MUTEX.lock().await;
     let (repo, _remote) = init_repo_with_remote();
     let (pack, token) = pack_and_token().await;
 
@@ -245,6 +271,7 @@ async fn branch_rejects_path_traversal_name() {
 
 #[tokio::test]
 async fn push_sends_branch_to_remote() {
+    let _env_guard = crate::cache::ENV_MUTEX.lock().await;
     let (repo, remote) = init_repo_with_remote();
     let (pack, token) = pack_and_token().await;
 
@@ -265,9 +292,7 @@ async fn push_sends_branch_to_remote() {
         Some("origin")
     );
 
-    let branches = Command::new("git")
-        .arg("-C")
-        .arg(remote.path())
+    let branches = git_command(remote.path())
         .args(["branch", "--list", "feat/pushme"])
         .output()
         .expect("git branch --list on remote");
@@ -276,6 +301,7 @@ async fn push_sends_branch_to_remote() {
 
 #[tokio::test]
 async fn push_rejects_explicit_force_true() {
+    let _env_guard = crate::cache::ENV_MUTEX.lock().await;
     let (repo, _remote) = init_repo_with_remote();
     let (pack, token) = pack_and_token().await;
 
@@ -295,6 +321,7 @@ async fn push_rejects_explicit_force_true() {
 
 #[tokio::test]
 async fn push_allows_force_false() {
+    let _env_guard = crate::cache::ENV_MUTEX.lock().await;
     let (repo, _remote) = init_repo_with_remote();
     let (pack, token) = pack_and_token().await;
 
@@ -313,6 +340,7 @@ async fn push_allows_force_false() {
 
 #[tokio::test]
 async fn push_rejects_non_boolean_force() {
+    let _env_guard = crate::cache::ENV_MUTEX.lock().await;
     let (repo, _remote) = init_repo_with_remote();
     let (pack, token) = pack_and_token().await;
 
@@ -332,6 +360,7 @@ async fn push_rejects_non_boolean_force() {
 
 #[tokio::test]
 async fn push_rejects_injection_shaped_remote() {
+    let _env_guard = crate::cache::ENV_MUTEX.lock().await;
     let (repo, _remote) = init_repo_with_remote();
     let (pack, token) = pack_and_token().await;
 
@@ -351,6 +380,7 @@ async fn push_rejects_injection_shaped_remote() {
 
 #[tokio::test]
 async fn push_rejects_nonexistent_branch() {
+    let _env_guard = crate::cache::ENV_MUTEX.lock().await;
     let (repo, _remote) = init_repo_with_remote();
     let (pack, token) = pack_and_token().await;
 

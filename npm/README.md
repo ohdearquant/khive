@@ -23,18 +23,18 @@ All 10 packs load by default. A background daemon auto-spawns to keep the runtim
 
 ## What you get
 
-| Pack          | Verbs | What it does                                                                         |
-| ------------- | ----- | ------------------------------------------------------------------------------------ |
-| **kg**        | 18    | Entities, edges, notes, graph queries, proposals                                     |
-| **gtd**       | 5     | Task lifecycle (inbox → next → active → done)                                        |
-| **memory**    | 5     | Salience-weighted remember / decay-ranked recall                                     |
-| **brain**     | 15    | Bayesian user profiles + feedback loop                                               |
-| **comm**      | 7     | Threaded messaging                                                                   |
-| **schedule**  | 4     | Reminders and scheduled verb execution                                               |
-| **knowledge** | 19    | Atom-based KB with embedding rerank search                                           |
-| **session**   | 4     | Session record persistence (store/list/resume/export)                                |
-| **git**       | 1     | Git-lifecycle note kinds (commit/issue/pull_request) + batch ingester + `git.digest` |
-| **code**      | 0     | Finding note kind; ingest is admin-CLI-only (`kkernel code-ingest`), no MCP verb     |
+| Pack          | Verbs | What it does                                                                                                                                     |
+| ------------- | ----- | ------------------------------------------------------------------------------------------------------------------------------------------------ |
+| **kg**        | 18    | Entities, edges, notes, graph queries, proposals                                                                                                 |
+| **gtd**       | 5     | Task lifecycle (inbox → next → active → done)                                                                                                    |
+| **memory**    | 5     | Salience-weighted remember / decay-ranked recall                                                                                                 |
+| **brain**     | 15    | Bayesian user profiles + feedback loop                                                                                                           |
+| **comm**      | 7     | Threaded messaging                                                                                                                               |
+| **schedule**  | 4     | Reminders and scheduled verb execution                                                                                                           |
+| **knowledge** | 19    | Atom-based KB with embedding rerank search                                                                                                       |
+| **session**   | 4     | Session record persistence (store/list/resume/export)                                                                                            |
+| **git**       | 4     | Git-lifecycle note kinds (commit/issue/pull_request) + batch ingester + `git.digest`; write verbs `git.commit`/`git.branch`/`git.push` (ADR-108) |
+| **code**      | 0     | Finding note kind; ingest is admin-CLI-only (`kkernel code-ingest`), no MCP verb                                                                 |
 
 ## Usage
 

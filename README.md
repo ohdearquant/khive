@@ -67,18 +67,18 @@ All 10 packs load by default, giving **81 verbs** out of the box (verified again
 `verbs()` registry, 2026-07-10; regenerate with `request(ops="verbs()")` before editing
 this table):
 
-| Pack          | Prefix       | Verbs | What it does                                                                      |
-| ------------- | ------------ | ----- | --------------------------------------------------------------------------------- |
-| **kg**        | _(bare)_     | 18    | Entities, edges, notes, graph queries, reference resolution                       |
-| **gtd**       | `gtd.`       | 5     | Task lifecycle (inbox → next → active → done)                                     |
-| **memory**    | `memory.`    | 5     | Salience-weighted remember / decay-ranked recall                                  |
-| **brain**     | `brain.`     | 15    | Bayesian user profiles + feedback loop                                            |
-| **comm**      | `comm.`      | 7     | Threaded messaging                                                                |
-| **schedule**  | `schedule.`  | 4     | Reminders and scheduled verb execution                                            |
-| **knowledge** | `knowledge.` | 19    | Atom-based KB with embedding rerank search                                        |
-| **session**   | `session.`   | 4     | Session record persistence (store/list/resume/export)                             |
-| **git**       | `git.`       | 1     | Commit/issue/PR provenance ingestion into the graph                               |
-| **code**      | _(none)_     | 0     | `finding` note kind only; `code.ingest` verb accepted but unimplemented (ADR-085) |
+| Pack          | Prefix       | Verbs | What it does                                                                                   |
+| ------------- | ------------ | ----- | ---------------------------------------------------------------------------------------------- |
+| **kg**        | _(bare)_     | 18    | Entities, edges, notes, graph queries, reference resolution                                    |
+| **gtd**       | `gtd.`       | 5     | Task lifecycle (inbox → next → active → done)                                                  |
+| **memory**    | `memory.`    | 5     | Salience-weighted remember / decay-ranked recall                                               |
+| **brain**     | `brain.`     | 15    | Bayesian user profiles + feedback loop                                                         |
+| **comm**      | `comm.`      | 7     | Threaded messaging                                                                             |
+| **schedule**  | `schedule.`  | 4     | Reminders and scheduled verb execution                                                         |
+| **knowledge** | `knowledge.` | 19    | Atom-based KB with embedding rerank search                                                     |
+| **session**   | `session.`   | 4     | Session record persistence (store/list/resume/export)                                          |
+| **git**       | `git.`       | 4     | `git.digest` provenance ingestion + `git.commit`/`git.branch`/`git.push` write verbs (ADR-108) |
+| **code**      | _(none)_     | 0     | `finding` note kind only; `code.ingest` verb accepted but unimplemented (ADR-085)              |
 
 `create`, `list`, `search` take `kind=entity|note` (or `kind=edge` for `list`).
 `get`, `update`, `delete`, `merge` are UUID-only: they auto-detect the record type.

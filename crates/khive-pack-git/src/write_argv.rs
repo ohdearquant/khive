@@ -146,8 +146,16 @@ pub fn validate_remote_name(value: &str) -> Result<(), GitArgError> {
 }
 
 /// Validates one entry of `git.commit`'s `paths` argument: a relative,
-/// traversal-free pathspec with no leading dash (flag injection) or control
-/// bytes.
+/// traversal-free *literal filename*, not a pathspec. Every value here
+/// reaches git as a positional argument after a `--` separator, where git
+/// still parses it for pathspec magic (`:(top)`, `:(glob)`, short-form
+/// `:!`/`:/`/`:^` signatures, …) regardless of the `--`. A caller-supplied
+/// value carrying that magic can therefore select files outside the
+/// declared path scope even though it looks like an ordinary relative path.
+/// The charset is restricted to ASCII printable (0x20-0x7e) so control bytes
+/// (tab, ESC, NUL, CR, LF, …) and non-ASCII bytes (including unicode
+/// confusables) are rejected uniformly, on top of the existing dash/slash/
+/// dotdot/absolute rules.
 pub fn validate_commit_path(value: &str) -> Result<(), GitArgError> {
     const FIELD: &str = "paths[]";
     if value.is_empty() {
@@ -162,7 +170,10 @@ pub fn validate_commit_path(value: &str) -> Result<(), GitArgError> {
     if value.starts_with('/') {
         return Err(GitArgError::InvalidCharacter(FIELD, value.to_string()));
     }
-    if value.bytes().any(|b| b == 0 || b == b'\n' || b == b'\r') {
+    if value.contains(":(") {
+        return Err(GitArgError::InvalidCharacter(FIELD, value.to_string()));
+    }
+    if !value.bytes().all(|b| (0x20..=0x7e).contains(&b)) {
         return Err(GitArgError::InvalidCharacter(FIELD, value.to_string()));
     }
     if value.split('/').any(|seg| seg == "..") {
@@ -481,6 +492,53 @@ mod tests {
     fn commit_path_rejects_embedded_newline() {
         let err = validate_commit_path("a\nb").unwrap_err();
         assert!(matches!(err, GitArgError::InvalidCharacter(..)));
+    }
+
+    #[test]
+    fn commit_path_rejects_pathspec_magic_long_form() {
+        for injected in [":(top)a.txt", ":(glob)**"] {
+            let err = validate_commit_path(injected).unwrap_err();
+            assert!(
+                matches!(err, GitArgError::InvalidCharacter(..)),
+                "{injected}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn commit_path_rejects_embedded_pathspec_magic() {
+        let err = validate_commit_path("src/:(top)evil").unwrap_err();
+        assert!(matches!(err, GitArgError::InvalidCharacter(..)));
+    }
+
+    #[test]
+    fn commit_path_rejects_tab() {
+        let err = validate_commit_path("a\tb").unwrap_err();
+        assert!(matches!(err, GitArgError::InvalidCharacter(..)));
+    }
+
+    #[test]
+    fn commit_path_rejects_esc() {
+        let err = validate_commit_path("a\x1bb").unwrap_err();
+        assert!(matches!(err, GitArgError::InvalidCharacter(..)));
+    }
+
+    #[test]
+    fn commit_path_rejects_unicode_confusable() {
+        // Cyrillic 'а' (U+0430), visually confusable with ASCII 'a'.
+        let err = validate_commit_path("src/m\u{0430}in.rs").unwrap_err();
+        assert!(matches!(err, GitArgError::InvalidCharacter(..)));
+    }
+
+    #[test]
+    fn commit_path_rejects_upload_pack_and_exec_shapes() {
+        for injected in ["--upload-pack=x", "--exec=evil"] {
+            let err = validate_commit_path(injected).unwrap_err();
+            assert!(
+                matches!(err, GitArgError::LeadingDash(..)),
+                "{injected}: {err}"
+            );
+        }
     }
 
     // -- validate_message ------------------------------------------------------
