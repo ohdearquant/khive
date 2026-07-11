@@ -2270,3 +2270,490 @@ async fn complete_blocks_secret_in_result() {
         "gtd.complete with secret in result must be rejected; got: {result:?}"
     );
 }
+
+// ── Issue #772: fixed-window pre-fetch-then-filter regression tests ─────────
+
+/// `gtd.next` must surface an actionable task even when 500+ newer,
+/// non-actionable task notes exist. Before the fix, `handle_next` pre-fetched
+/// only the newest 500 task notes (unfiltered) via `list_notes` and applied
+/// the actionable-status filter afterward in Rust — an older `next`/`active`
+/// task falling outside that fixed window was silently invisible regardless
+/// of priority.
+#[tokio::test]
+async fn next_finds_actionable_task_older_than_fixed_window() {
+    use khive_storage::note::Note;
+
+    let runtime = rt();
+    let token = runtime
+        .authorize(khive_runtime::Namespace::local())
+        .unwrap();
+    let note_store = runtime.notes(&token).expect("note store");
+
+    // An old, actionable p0 task — created long before any filler task.
+    let old_ts = chrono::Utc::now().timestamp_micros() - 1_000_000_000_000; // ~11 days ago
+    let old_task = Note {
+        id: uuid::Uuid::new_v4(),
+        namespace: "local".to_string(),
+        kind: "task".to_string(),
+        status: "active".to_string(),
+        name: Some("ancient-p0".to_string()),
+        content: "ancient p0 task".to_string(),
+        salience: None,
+        decay_factor: None,
+        expires_at: None,
+        properties: Some(json!({"status": "next", "priority": "p0"})),
+        created_at: old_ts,
+        updated_at: old_ts,
+        deleted_at: None,
+    };
+    note_store
+        .upsert_note(old_task)
+        .await
+        .expect("insert old task");
+
+    // Pad with 501 newer, non-actionable (inbox) task notes — more than the
+    // legacy fixed 500-row window, none of which are actionable themselves.
+    let now = chrono::Utc::now().timestamp_micros();
+    let fillers: Vec<Note> = (0..501_u32)
+        .map(|i| Note {
+            id: uuid::Uuid::new_v4(),
+            namespace: "local".to_string(),
+            kind: "task".to_string(),
+            status: "active".to_string(),
+            name: Some(format!("filler-{i}")),
+            content: format!("filler task {i}"),
+            salience: None,
+            decay_factor: None,
+            expires_at: None,
+            properties: Some(json!({"status": "inbox"})),
+            created_at: now + i64::from(i),
+            updated_at: now + i64::from(i),
+            deleted_at: None,
+        })
+        .collect();
+    note_store
+        .upsert_notes(fillers)
+        .await
+        .expect("insert fillers");
+
+    let pack = pack(runtime);
+    let result = pack.dispatch("gtd.next", json!({})).await.unwrap();
+    let arr = result.as_array().unwrap();
+    assert!(
+        arr.iter()
+            .any(|t| t["title"].as_str() == Some("ancient-p0")),
+        "gtd.next must surface an actionable p0 task older than 500 newer \
+         non-actionable tasks (issue #772); result: {result:?}"
+    );
+    assert_eq!(
+        arr[0]["title"], "ancient-p0",
+        "the ancient p0 task must sort first by priority"
+    );
+}
+
+/// `gtd.tasks(status="done")` must surface a done task even when 500+ newer,
+/// non-done task notes exist. Before the fix, `handle_tasks` pre-fetched
+/// `offset + limit + 500` task notes (unfiltered, always from offset 0) via
+/// `list_notes` and applied the status filter afterward in Rust — an older
+/// `done` task falling outside that window was silently invisible.
+#[tokio::test]
+async fn tasks_finds_done_task_older_than_fixed_window() {
+    use khive_storage::note::Note;
+
+    let runtime = rt();
+    let token = runtime
+        .authorize(khive_runtime::Namespace::local())
+        .unwrap();
+    let note_store = runtime.notes(&token).expect("note store");
+
+    let old_ts = chrono::Utc::now().timestamp_micros() - 1_000_000_000_000;
+    let old_task = Note {
+        id: uuid::Uuid::new_v4(),
+        namespace: "local".to_string(),
+        kind: "task".to_string(),
+        status: "active".to_string(),
+        name: Some("ancient-done".to_string()),
+        content: "ancient done task".to_string(),
+        salience: None,
+        decay_factor: None,
+        expires_at: None,
+        properties: Some(json!({"status": "done"})),
+        created_at: old_ts,
+        updated_at: old_ts,
+        deleted_at: None,
+    };
+    note_store
+        .upsert_note(old_task)
+        .await
+        .expect("insert old done task");
+
+    // The legacy default window was offset(0) + limit(50) + 500 = 550; 600
+    // newer non-done fillers exceed that so the always-offset-0 fetch never
+    // reached the ancient done task.
+    let now = chrono::Utc::now().timestamp_micros();
+    let fillers: Vec<Note> = (0..600_u32)
+        .map(|i| Note {
+            id: uuid::Uuid::new_v4(),
+            namespace: "local".to_string(),
+            kind: "task".to_string(),
+            status: "active".to_string(),
+            name: Some(format!("filler-{i}")),
+            content: format!("filler task {i}"),
+            salience: None,
+            decay_factor: None,
+            expires_at: None,
+            properties: Some(json!({"status": "inbox"})),
+            created_at: now + i64::from(i),
+            updated_at: now + i64::from(i),
+            deleted_at: None,
+        })
+        .collect();
+    note_store
+        .upsert_notes(fillers)
+        .await
+        .expect("insert fillers");
+
+    let pack = pack(runtime);
+    let result = pack
+        .dispatch("gtd.tasks", json!({"status": "done"}))
+        .await
+        .unwrap();
+    let arr = result.as_array().unwrap();
+    assert!(
+        arr.iter()
+            .any(|t| t["title"].as_str() == Some("ancient-done")),
+        "gtd.tasks(status=\"done\") must surface a done task older than the \
+         legacy fixed pre-fetch window (issue #772); result: {result:?}"
+    );
+}
+
+/// #772 follow-up (Major finding): when more tasks match the actionable
+/// filter than the scan safety bound covers, `gtd.next` must return an
+/// explicit error asking the caller to narrow the query instead of silently
+/// sorting and truncating a partial candidate set — a partial set can hide
+/// an older, higher-priority task that fell outside the scan window.
+#[tokio::test]
+async fn next_returns_explicit_error_when_matches_exceed_scan_bound() {
+    use khive_storage::note::Note;
+
+    let runtime = rt();
+    let token = runtime
+        .authorize(khive_runtime::Namespace::local())
+        .unwrap();
+    let note_store = runtime.notes(&token).expect("note store");
+
+    let now = chrono::Utc::now().timestamp_micros();
+    let tasks: Vec<Note> = (0..20_001_u32)
+        .map(|i| Note {
+            id: uuid::Uuid::new_v4(),
+            namespace: "local".to_string(),
+            kind: "task".to_string(),
+            status: "active".to_string(),
+            name: Some(format!("task-{i}")),
+            content: format!("task {i}"),
+            salience: None,
+            decay_factor: None,
+            expires_at: None,
+            properties: Some(json!({"status": "next"})),
+            created_at: now + i64::from(i),
+            updated_at: now + i64::from(i),
+            deleted_at: None,
+        })
+        .collect();
+    note_store
+        .upsert_notes(tasks)
+        .await
+        .expect("insert tasks over scan bound");
+
+    let pack = pack(runtime);
+    let err = pack
+        .dispatch("gtd.next", json!({}))
+        .await
+        .expect_err("gtd.next must reject a query matching more rows than the scan bound covers");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("exceeds") && msg.contains("scan bound"),
+        "error must explain the scan bound was exceeded; got: {msg}"
+    );
+}
+
+/// #825 round 2 boundary test: exactly `TASK_SCAN_MAX_ROWS` (20,000) matching
+/// rows must succeed — the bound is "reject when more than 20,000 rows
+/// match", not "reject at or above 20,000".
+#[tokio::test]
+async fn next_succeeds_when_matches_exactly_at_scan_bound() {
+    use khive_storage::note::Note;
+
+    let runtime = rt();
+    let token = runtime
+        .authorize(khive_runtime::Namespace::local())
+        .unwrap();
+    let note_store = runtime.notes(&token).expect("note store");
+
+    let now = chrono::Utc::now().timestamp_micros();
+    let tasks: Vec<Note> = (0..20_000_u32)
+        .map(|i| Note {
+            id: uuid::Uuid::new_v4(),
+            namespace: "local".to_string(),
+            kind: "task".to_string(),
+            status: "active".to_string(),
+            name: Some(format!("task-{i}")),
+            content: format!("task {i}"),
+            salience: None,
+            decay_factor: None,
+            expires_at: None,
+            properties: Some(json!({"status": "next"})),
+            created_at: now + i64::from(i),
+            updated_at: now + i64::from(i),
+            deleted_at: None,
+        })
+        .collect();
+    note_store
+        .upsert_notes(tasks)
+        .await
+        .expect("insert tasks at scan bound");
+
+    let pack = pack(runtime);
+    let result = pack
+        .dispatch("gtd.next", json!({"limit": 5}))
+        .await
+        .expect("gtd.next must succeed when matches are exactly at the scan bound");
+    let arr = result.as_array().unwrap();
+    assert_eq!(
+        arr.len(),
+        5,
+        "gtd.next must still honor the requested limit"
+    );
+}
+
+/// Regression for a push-down bug where an explicit `status="inbox"` filter
+/// used a plain `Eq` predicate against `json_extract(properties, '$.status')`.
+/// `json_extract` on a legacy row with no stored `status` key evaluates to
+/// SQL `NULL`, which `Eq` never matches, even though every other code path
+/// (`task_status`, `render_task`) treats a missing `status` as `"inbox"`.
+/// The filter must use `EqOrMissing` so `status="inbox"` also surfaces tasks
+/// that predate the `status` property being written at all.
+#[tokio::test]
+async fn tasks_status_inbox_filter_matches_legacy_task_missing_status_property() {
+    use khive_storage::note::Note;
+
+    let runtime = rt();
+    let token = runtime
+        .authorize(khive_runtime::Namespace::local())
+        .unwrap();
+    let note_store = runtime.notes(&token).expect("note store");
+
+    let now = chrono::Utc::now().timestamp_micros();
+    let legacy_task = Note {
+        id: uuid::Uuid::new_v4(),
+        namespace: "local".to_string(),
+        kind: "task".to_string(),
+        status: "active".to_string(),
+        name: Some("legacy-no-status".to_string()),
+        content: "task predating the status property".to_string(),
+        salience: None,
+        decay_factor: None,
+        expires_at: None,
+        properties: Some(json!({})),
+        created_at: now,
+        updated_at: now,
+        deleted_at: None,
+    };
+    note_store
+        .upsert_note(legacy_task)
+        .await
+        .expect("insert legacy task");
+
+    let pack = pack(runtime);
+    let result = pack
+        .dispatch("gtd.tasks", json!({"status": "inbox"}))
+        .await
+        .unwrap();
+    let arr = result.as_array().unwrap();
+    assert!(
+        arr.iter()
+            .any(|t| t["title"].as_str() == Some("legacy-no-status")),
+        "gtd.tasks(status=\"inbox\") must surface a legacy task with no stored \
+         status property, since a missing status defaults to inbox everywhere \
+         else; result: {result:?}"
+    );
+}
+
+/// Same bug as above, for `priority="p2"`: a legacy task with no stored
+/// `priority` property renders as `p2` (`priority_rank`, `render_task`), so
+/// an explicit `priority="p2"` filter must also match it via `EqOrMissing`.
+#[tokio::test]
+async fn tasks_priority_p2_filter_matches_legacy_task_missing_priority_property() {
+    use khive_storage::note::Note;
+
+    let runtime = rt();
+    let token = runtime
+        .authorize(khive_runtime::Namespace::local())
+        .unwrap();
+    let note_store = runtime.notes(&token).expect("note store");
+
+    let now = chrono::Utc::now().timestamp_micros();
+    let legacy_task = Note {
+        id: uuid::Uuid::new_v4(),
+        namespace: "local".to_string(),
+        kind: "task".to_string(),
+        status: "active".to_string(),
+        name: Some("legacy-no-priority".to_string()),
+        content: "task predating the priority property".to_string(),
+        salience: None,
+        decay_factor: None,
+        expires_at: None,
+        properties: Some(json!({"status": "next"})),
+        created_at: now,
+        updated_at: now,
+        deleted_at: None,
+    };
+    note_store
+        .upsert_note(legacy_task)
+        .await
+        .expect("insert legacy task");
+
+    let pack = pack(runtime);
+    let result = pack
+        .dispatch("gtd.tasks", json!({"priority": "p2"}))
+        .await
+        .unwrap();
+    let arr = result.as_array().unwrap();
+    assert!(
+        arr.iter()
+            .any(|t| t["title"].as_str() == Some("legacy-no-priority")),
+        "gtd.tasks(priority=\"p2\") must surface a legacy task with no stored \
+         priority property, since a missing priority renders as p2 everywhere \
+         else; result: {result:?}"
+    );
+}
+
+/// `gtd.tasks` pages must not overlap, and must stay complete, even when
+/// 500+ newer *non-matching* task notes exist alongside the matching set.
+///
+/// A weaker version of this test (matching rows only, no filler) would still
+/// pass under the pre-#772 implementation: with nothing to fill the old
+/// fixed-size unfiltered pre-fetch window, plain offset slicing over an
+/// all-matching set can look correct by coincidence. This version plants
+/// 600 newer `done` filler rows (excluded by the default status filter) so
+/// the old "pre-fetch `offset + limit + 500` unfiltered rows, then filter in
+/// Rust" behavior would have its window consumed by fillers and either drop
+/// matching rows or return short/overlapping pages. Real SQL-side
+/// `LIMIT`/`OFFSET` pagination over the pushed-down filter must still return
+/// full, disjoint pages containing only the expected matching records.
+#[tokio::test]
+async fn tasks_pagination_returns_disjoint_pages() {
+    use khive_storage::note::Note;
+    use std::collections::HashSet;
+
+    let runtime = rt();
+    let token = runtime
+        .authorize(khive_runtime::Namespace::local())
+        .unwrap();
+    let note_store = runtime.notes(&token).expect("note store");
+
+    // Matching set: 60 non-terminal tasks with older timestamps.
+    let base_ts = chrono::Utc::now().timestamp_micros() - 1_000_000_000_000;
+    let tasks: Vec<Note> = (0..60_u32)
+        .map(|i| Note {
+            id: uuid::Uuid::new_v4(),
+            namespace: "local".to_string(),
+            kind: "task".to_string(),
+            status: "active".to_string(),
+            name: Some(format!("task-{i}")),
+            content: format!("task {i}"),
+            salience: None,
+            decay_factor: None,
+            expires_at: None,
+            properties: Some(json!({"status": "next"})),
+            created_at: base_ts + i64::from(i),
+            updated_at: base_ts + i64::from(i),
+            deleted_at: None,
+        })
+        .collect();
+    let expected_ids: HashSet<uuid::Uuid> = tasks.iter().map(|t| t.id).collect();
+    note_store.upsert_notes(tasks).await.expect("insert tasks");
+
+    // Non-matching filler: 600 `done` tasks, all newer than the matching set,
+    // excluded by `gtd.tasks`' default status filter (done/cancelled).
+    let now = chrono::Utc::now().timestamp_micros();
+    let fillers: Vec<Note> = (0..600_u32)
+        .map(|i| Note {
+            id: uuid::Uuid::new_v4(),
+            namespace: "local".to_string(),
+            kind: "task".to_string(),
+            status: "done".to_string(),
+            name: Some(format!("filler-{i}")),
+            content: format!("filler task {i}"),
+            salience: None,
+            decay_factor: None,
+            expires_at: None,
+            properties: Some(json!({"status": "done"})),
+            created_at: now + i64::from(i),
+            updated_at: now + i64::from(i),
+            deleted_at: None,
+        })
+        .collect();
+    note_store
+        .upsert_notes(fillers)
+        .await
+        .expect("insert fillers");
+
+    let pack = pack(runtime);
+    let page1 = pack
+        .dispatch("gtd.tasks", json!({"limit": 20, "offset": 0}))
+        .await
+        .unwrap();
+    let page2 = pack
+        .dispatch("gtd.tasks", json!({"limit": 20, "offset": 20}))
+        .await
+        .unwrap();
+    let page3 = pack
+        .dispatch("gtd.tasks", json!({"limit": 20, "offset": 40}))
+        .await
+        .unwrap();
+
+    let ids1: HashSet<&str> = page1
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["full_id"].as_str().unwrap())
+        .collect();
+    let ids2: HashSet<&str> = page2
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["full_id"].as_str().unwrap())
+        .collect();
+    let ids3: HashSet<&str> = page3
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["full_id"].as_str().unwrap())
+        .collect();
+
+    assert_eq!(ids1.len(), 20, "page1 must be full; got {ids1:?}");
+    assert_eq!(ids2.len(), 20, "page2 must be full; got {ids2:?}");
+    assert_eq!(ids3.len(), 20, "page3 must be full; got {ids3:?}");
+    assert!(
+        ids1.is_disjoint(&ids2) && ids2.is_disjoint(&ids3) && ids1.is_disjoint(&ids3),
+        "pages at different offsets must not overlap (issue #772 offset-0 \
+         refetch bug); page1={ids1:?} page2={ids2:?} page3={ids3:?}"
+    );
+
+    let all_returned: HashSet<uuid::Uuid> = ids1
+        .iter()
+        .chain(ids2.iter())
+        .chain(ids3.iter())
+        .map(|s| uuid::Uuid::parse_str(s).unwrap())
+        .collect();
+    assert_eq!(
+        all_returned.len(),
+        60,
+        "all 60 matching tasks must be covered across the 3 pages; got {all_returned:?}"
+    );
+    assert!(
+        all_returned.is_subset(&expected_ids),
+        "returned tasks must be exactly the matching set, no filler rows leaked in"
+    );
+}

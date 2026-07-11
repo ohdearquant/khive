@@ -19,7 +19,8 @@ use serde_json::{json, Value};
 use uuid::Uuid;
 
 use khive_runtime::{micros_to_iso, KhiveRuntime, NamespaceToken, Resolved, RuntimeError};
-use khive_storage::types::{SqlStatement, SqlValue};
+use khive_storage::note::{FilterOp, NoteFilter, PropertyFilter};
+use khive_storage::types::{PageRequest, SqlStatement, SqlValue};
 
 use crate::schema::{
     allowed_transitions, can_transition, is_actionable, is_terminal, is_valid_priority,
@@ -326,12 +327,23 @@ pub(crate) async fn resolve_context_entity_id(
     }
 }
 
+/// Status a task is treated as when the `status` property is missing/empty.
+/// Property filters that select this value must use `FilterOp::EqOrMissing`
+/// (not plain `Eq`) so legacy rows without a stored `status` still match —
+/// `json_extract` on an absent path is SQL `NULL`, which never equals a text
+/// literal.
+const DEFAULT_STATUS: &str = "inbox";
+
+/// Priority a task is treated as when the `priority` property is missing/empty.
+/// Same `EqOrMissing` rule as [`DEFAULT_STATUS`] applies.
+const DEFAULT_PRIORITY: &str = "p2";
+
 /// Status used internally on a task. Defaults to "inbox" when missing/empty.
 fn task_status(props: Option<&Value>) -> String {
     props
         .and_then(|p| p.get("status"))
         .and_then(|v| v.as_str())
-        .unwrap_or("inbox")
+        .unwrap_or(DEFAULT_STATUS)
         .to_string()
 }
 
@@ -341,7 +353,7 @@ fn priority_rank(props: Option<&Value>) -> u8 {
     let raw = props
         .and_then(|p| p.get("priority"))
         .and_then(|v| v.as_str())
-        .unwrap_or("p2")
+        .unwrap_or(DEFAULT_PRIORITY)
         .to_ascii_lowercase();
     match raw.as_str() {
         "p0" => 0,
@@ -369,12 +381,12 @@ pub fn render_task(note: &khive_storage::note::Note) -> Value {
     let status = props
         .get("status")
         .and_then(|v| v.as_str())
-        .unwrap_or("inbox")
+        .unwrap_or(DEFAULT_STATUS)
         .to_string();
     let priority = props
         .get("priority")
         .and_then(|v| v.as_str())
-        .unwrap_or("p2")
+        .unwrap_or(DEFAULT_PRIORITY)
         .to_string();
     let assignee = props.get("assignee").cloned().unwrap_or(Value::Null);
     let due = props.get("due").cloned().unwrap_or(Value::Null);
@@ -430,6 +442,71 @@ pub(crate) fn parse_due(value: &str) -> Result<String, RuntimeError> {
 
 fn ts_to_rfc(micros: i64) -> String {
     micros_to_iso(micros)
+}
+
+/// Safety cap on matching rows [`fetch_all_matching_tasks`] will accept in a
+/// single snapshot query before refusing the request outright. A query
+/// matching more than this many rows is rejected before any priority sort
+/// runs — sorting a partial candidate set can hide an older, higher-priority
+/// task that fell outside the scan window.
+const TASK_SCAN_MAX_ROWS: u32 = 20_000;
+
+/// Fetch every `task` note matching `property_filters` in a single bounded
+/// snapshot query, instead of pre-fetching a fixed-size unfiltered window.
+/// The predicate is pushed into SQL via `query_notes_filtered_bounded`, so
+/// the candidate set this returns is bounded by how many tasks actually
+/// match — not by how many task notes of any status exist (the #772 bug: a
+/// fixed unfiltered window could be entirely filled by newer non-matching
+/// churn, hiding older matching tasks regardless of priority).
+///
+/// `query_notes_filtered_bounded` fetches at most `TASK_SCAN_MAX_ROWS + 1`
+/// rows in one SQL statement with deterministic ordering — one consistent
+/// snapshot, not a `COUNT(*)` followed by independent paged reads that a
+/// concurrent insert could split across (issue #825 round 2: the prior
+/// page-loop version re-queried the store per page with no transaction
+/// spanning them, so a row inserted between pages could appear duplicated
+/// across a page boundary, or the scan could hit its cap and still return
+/// `Ok` with an incomplete set). If `TASK_SCAN_MAX_ROWS + 1` rows come back,
+/// this returns `Err(InvalidInput)` instead of ever returning a possibly
+/// truncated result — callers must narrow the filters (e.g. add `assignee`)
+/// so the result stays complete.
+async fn fetch_all_matching_tasks(
+    runtime: &KhiveRuntime,
+    token: &NamespaceToken,
+    property_filters: Vec<PropertyFilter>,
+) -> Result<Vec<khive_storage::note::Note>, RuntimeError> {
+    let namespaces = if token.visible_namespaces().len() > 1 {
+        token
+            .visible_namespaces()
+            .iter()
+            .map(|ns| ns.as_str().to_owned())
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let filter = NoteFilter {
+        kind: Some("task".to_string()),
+        property_filters,
+        namespaces,
+        ..Default::default()
+    };
+    let store = runtime.notes(token)?;
+
+    let notes = store
+        .query_notes_filtered_bounded(token.namespace().as_str(), &filter, TASK_SCAN_MAX_ROWS)
+        .await
+        .map_err(|e| RuntimeError::Internal(format!("query_notes_filtered_bounded: {e}")))?;
+
+    if notes.len() as u32 > TASK_SCAN_MAX_ROWS {
+        return Err(RuntimeError::InvalidInput(format!(
+            "gtd: more than {TASK_SCAN_MAX_ROWS} tasks match this query, which exceeds the \
+             {TASK_SCAN_MAX_ROWS}-row scan bound; narrow the filters \
+             (e.g. specify assignee) and retry so results stay complete \
+             and priority-ordered instead of being silently truncated"
+        )));
+    }
+
+    Ok(notes)
 }
 
 /// Load a task note and verify (a) it exists, (b) namespace matches, (c) it is
@@ -784,44 +861,47 @@ impl GtdPack {
         // the `limit` ParamDef instead (issue #744 fallback ask 1).
         let limit = p.limit.unwrap_or(10).clamp(1, 200);
 
-        // Pull a broad window of recent tasks, filter in-memory by GTD status.
-        // 500 covers typical inbox/next/active backlogs without paging.
-        let notes = self
-            .runtime()
-            .list_notes(token, Some("task"), 500, 0)
-            .await?;
+        // #772: push the actionable-status (+ optional assignee) predicate into
+        // SQL via `query_notes_filtered` and scan every matching page, instead
+        // of pre-fetching a fixed unfiltered recency window and filtering in
+        // Rust — a fixed window silently drops actionable tasks once enough
+        // newer non-matching task notes (any status) fill it. The candidate
+        // set is now bounded by how many `next`/`active` tasks actually exist.
+        let mut property_filters = vec![PropertyFilter {
+            json_path: "$.status".to_string(),
+            op: FilterOp::In(vec![
+                SqlValue::Text("next".to_string()),
+                SqlValue::Text("active".to_string()),
+            ]),
+            value: SqlValue::Null,
+        }];
+        if let Some(want) = p.assignee.as_deref() {
+            property_filters.push(PropertyFilter {
+                json_path: "$.assignee".to_string(),
+                op: FilterOp::Eq,
+                value: SqlValue::Text(want.to_string()),
+            });
+        }
+        let notes = fetch_all_matching_tasks(self.runtime(), token, property_filters).await?;
 
         // Build a quick lookup map of task UUID → GTD status so dependency
-        // filtering (scenario-gtd C2) can check blocker states in O(1).
+        // filtering (scenario-gtd C2) can check blocker states in O(1). Every
+        // note here already passed the actionable(+assignee) SQL filter above
+        // (and `deleted_at IS NULL`, enforced unconditionally by
+        // `query_notes_filtered`).
         use std::collections::HashMap;
         let mut status_by_id: HashMap<uuid::Uuid, String> = notes
             .iter()
-            .filter(|n| n.deleted_at.is_none())
             .map(|n| (n.id, task_status(n.properties.as_ref())))
             .collect();
 
-        // Collect actionable candidates (before dependency check) so we can
-        // determine which blocker UUIDs are outside the 500-task window.
-        let candidates: Vec<&khive_storage::note::Note> = notes
-            .iter()
-            .filter(|n| n.deleted_at.is_none())
-            .filter(|n| is_actionable(&task_status(n.properties.as_ref())))
-            .filter(|n| match p.assignee.as_deref() {
-                None => true,
-                Some(want) => {
-                    n.properties
-                        .as_ref()
-                        .and_then(|v| v.get("assignee"))
-                        .and_then(|v| v.as_str())
-                        == Some(want)
-                }
-            })
-            .collect();
+        let candidates: Vec<&khive_storage::note::Note> = notes.iter().collect();
 
         // Gather all dependency UUIDs referenced by candidates that are not
-        // already in status_by_id — these are blockers older than the 500-task
-        // scan window.  Fetch them in one batch so the dependency filter below
-        // can evaluate their status correctly regardless of window position.
+        // already in status_by_id — these are blockers whose status isn't
+        // `next`/`active` (the common case: a `done` blocker).  Fetch them in
+        // one batch so the dependency filter below can evaluate their status
+        // correctly regardless of scan-page position.
         let missing_dep_ids: Vec<uuid::Uuid> = candidates
             .iter()
             .flat_map(|n| {
@@ -997,7 +1077,7 @@ impl GtdPack {
         // note in `handle_next` above (bare-array response shape rules out an
         // additive `truncated` field).
         let limit = p.limit.unwrap_or(50).clamp(1, 200);
-        let offset = p.offset.unwrap_or(0) as usize;
+        let offset = p.offset.unwrap_or(0);
 
         // Normalize status filter once.
         let status_filter: Option<String> = match p.status.as_deref() {
@@ -1021,50 +1101,102 @@ impl GtdPack {
             }
         }
 
-        let window = (offset as u32).saturating_add(limit).saturating_add(500);
-        let notes = self
+        // #772: push status/assignee/priority predicates into SQL via
+        // `query_notes_filtered` and use its real `PageRequest{limit, offset}`
+        // for pagination. The previous `list_notes(..., window, 0)` always
+        // refetched from offset 0 and grew an unfiltered window by a fixed
+        // +500 fudge factor — a fixed number of newer non-matching tasks could
+        // still hide older matches (e.g. `tasks(status="done")` returning
+        // empty even though done tasks exist), and deep pages re-scanned the
+        // same rows since the underlying fetch offset never advanced.
+        //
+        // When no status= is provided, exclude terminal states (done,
+        // cancelled) so the default listing shows only active work, while
+        // still counting a task with no `status` property yet as `inbox`
+        // (non-terminal, included) — hence `NotInOrMissing` rather than `Ne`,
+        // which would silently drop rows where `$.status` is absent.
+        let mut property_filters = vec![match status_filter.as_deref() {
+            Some(want) => PropertyFilter {
+                json_path: "$.status".to_string(),
+                // A legacy task with no stored `status` property is treated as
+                // `inbox` everywhere else in this pack (`task_status`,
+                // `render_task`). `json_extract` on an absent path is SQL
+                // NULL, which `Eq` never matches, so an explicit
+                // `status="inbox"` query would silently exclude those rows —
+                // `EqOrMissing` restores the "absent counts as default" rule.
+                op: if want == DEFAULT_STATUS {
+                    FilterOp::EqOrMissing
+                } else {
+                    FilterOp::Eq
+                },
+                value: SqlValue::Text(want.to_string()),
+            },
+            None => PropertyFilter {
+                json_path: "$.status".to_string(),
+                op: FilterOp::NotInOrMissing(vec![
+                    SqlValue::Text("done".to_string()),
+                    SqlValue::Text("cancelled".to_string()),
+                ]),
+                value: SqlValue::Null,
+            },
+        }];
+        if let Some(want) = p.assignee.as_deref() {
+            property_filters.push(PropertyFilter {
+                json_path: "$.assignee".to_string(),
+                op: FilterOp::Eq,
+                value: SqlValue::Text(want.to_string()),
+            });
+        }
+        if let Some(want) = p.priority.as_deref() {
+            // Priorities are always stored lowercase (`task_create`/
+            // `prepare_transition` normalize via `to_ascii_lowercase`), so an
+            // exact-match SQL predicate on the lowercased input reproduces
+            // the prior `eq_ignore_ascii_case` behavior. A legacy task with no
+            // stored `priority` renders as `p2` (`priority_rank`,
+            // `render_task`), so `priority="p2"` must also match the missing
+            // case via `EqOrMissing` — plain `Eq` never matches SQL NULL.
+            let want = want.to_ascii_lowercase();
+            property_filters.push(PropertyFilter {
+                json_path: "$.priority".to_string(),
+                op: if want == DEFAULT_PRIORITY {
+                    FilterOp::EqOrMissing
+                } else {
+                    FilterOp::Eq
+                },
+                value: SqlValue::Text(want),
+            });
+        }
+
+        let namespaces = if token.visible_namespaces().len() > 1 {
+            token
+                .visible_namespaces()
+                .iter()
+                .map(|ns| ns.as_str().to_owned())
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let filter = NoteFilter {
+            kind: Some("task".to_string()),
+            property_filters,
+            namespaces,
+            ..Default::default()
+        };
+        let page = self
             .runtime()
-            .list_notes(token, Some("task"), window, 0)
-            .await?;
+            .notes(token)?
+            .query_notes_filtered(
+                token.namespace().as_str(),
+                &filter,
+                PageRequest {
+                    limit,
+                    offset: offset.into(),
+                },
+            )
+            .await
+            .map_err(|e| RuntimeError::Internal(format!("query_notes_filtered: {e}")))?;
 
-        // When no status= is provided, exclude terminal states (done, cancelled)
-        // so the default listing shows only active work. Pass status= explicitly
-        // to see terminal tasks (e.g. tasks(status="done") for review).
-        let filtered: Vec<&khive_storage::note::Note> = notes
-            .iter()
-            .filter(|n| n.deleted_at.is_none())
-            .filter(|n| match status_filter.as_deref() {
-                None => !is_terminal(&task_status(n.properties.as_ref())),
-                Some(want) => task_status(n.properties.as_ref()) == want,
-            })
-            .filter(|n| match p.assignee.as_deref() {
-                None => true,
-                Some(want) => {
-                    n.properties
-                        .as_ref()
-                        .and_then(|v| v.get("assignee"))
-                        .and_then(|v| v.as_str())
-                        == Some(want)
-                }
-            })
-            .filter(|n| match p.priority.as_deref() {
-                None => true,
-                Some(want) => n
-                    .properties
-                    .as_ref()
-                    .and_then(|v| v.get("priority"))
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.eq_ignore_ascii_case(want))
-                    .unwrap_or(false),
-            })
-            .collect();
-
-        let result: Vec<Value> = filtered
-            .into_iter()
-            .skip(offset)
-            .take(limit as usize)
-            .map(render_task)
-            .collect();
+        let result: Vec<Value> = page.items.iter().map(render_task).collect();
         Ok(Value::Array(result))
     }
 
