@@ -406,7 +406,7 @@ appended after `code`:
 ["kg", "gtd", "memory", "brain", "comm", "schedule", "knowledge", "session", "git", "code", "workspace"]
 ```
 
-Like `code`, `workspace` contributes zero verbs of its own — it registers the `workspace`
+Like `code`, `workspace` contributes zero verbs of its own: it registers the `workspace`
 entity kind and five `contains` endpoint rules (workspace to issue/pull_request/commit/task/session
 notes) and carries no MCP verbs. The default verb count is therefore unchanged at **78**;
 only the pack count moves from ten to eleven. Every surface that enumerates the default set

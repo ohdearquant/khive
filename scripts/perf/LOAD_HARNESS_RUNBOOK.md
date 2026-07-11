@@ -37,8 +37,8 @@ uv run scripts/perf/bench_load_harness.py --mode real --workers 20 --tenants 4 -
 ```
 
 Full acceptance shape (100 connections × 20 tenant namespaces, the actual
-gate target). Pass `--packs` explicitly to measure the full 10-pack production
-posture — including `session`, `git`, and `code` — against a real multi-pack
+gate target). Pass `--packs` explicitly to measure the full 11-pack production
+posture, including `session`, `git`, `code`, and `workspace`, against a real multi-pack
 config:
 
 ```bash
