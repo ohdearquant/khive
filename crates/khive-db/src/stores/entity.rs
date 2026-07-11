@@ -380,6 +380,22 @@ fn parse_uuid(s: &str) -> Result<Uuid, rusqlite::Error> {
     })
 }
 
+/// Escape SQLite `LIKE` wildcard characters (`%`, `_`) and the escape
+/// character itself (`\`) so a caller-supplied name is matched literally
+/// under `LIKE ... ESCAPE '\'` rather than as a pattern (#818: an
+/// entity named e.g. `a_b` must not also match `aXb`, and a name containing
+/// `%` must not silently widen into a broad substring scan).
+fn escape_like(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    for c in input.chars() {
+        if matches!(c, '\\' | '%' | '_') {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}
+
 fn build_entity_where(
     namespace: &str,
     filter: &EntityFilter,
@@ -448,8 +464,8 @@ fn build_entity_where(
     }
 
     if let Some(ref prefix) = filter.name_prefix {
-        params.push(Box::new(format!("{}%", prefix)));
-        conditions.push(format!("name LIKE ?{}", params.len()));
+        params.push(Box::new(format!("{}%", escape_like(prefix))));
+        conditions.push(format!("name LIKE ?{} ESCAPE '\\'", params.len()));
     }
 
     if !filter.tags_any.is_empty() {
@@ -600,6 +616,22 @@ impl EntityStore for SqlEntityStore {
             };
 
             let (where_sql, mut data_params) = build_entity_where(&namespace, &filter);
+
+            // #818: when a name_prefix filter is active, an exact
+            // case-insensitive match must never be pushed out of the page by
+            // pattern candidates that merely share the prefix. Rank exact
+            // matches first (deterministic tiebreak via created_at) so page
+            // truncation can never hide the record a caller resolved by name.
+            let order_by = if let Some(ref prefix) = filter.name_prefix {
+                data_params.push(Box::new(prefix.to_ascii_lowercase()));
+                format!(
+                    "CASE WHEN LOWER(name) = ?{} THEN 0 ELSE 1 END, created_at DESC",
+                    data_params.len()
+                )
+            } else {
+                "created_at DESC".to_string()
+            };
+
             data_params.push(Box::new(limit_i64));
             data_params.push(Box::new(offset_i64));
 
@@ -609,8 +641,8 @@ impl EntityStore for SqlEntityStore {
             let data_sql = format!(
                 "SELECT id, namespace, kind, entity_type, name, description, properties, tags, \
                  created_at, updated_at, deleted_at, merged_into, merge_event_id \
-                 FROM entities{} ORDER BY created_at DESC LIMIT ?{} OFFSET ?{}",
-                where_sql, limit_idx, offset_idx,
+                 FROM entities{} ORDER BY {} LIMIT ?{} OFFSET ?{}",
+                where_sql, order_by, limit_idx, offset_idx,
             );
 
             let mut stmt = conn.prepare(&data_sql)?;
