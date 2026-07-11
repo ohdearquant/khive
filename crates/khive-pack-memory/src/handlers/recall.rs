@@ -1271,6 +1271,127 @@ mod tests {
         );
     }
 
+    /// #836 review fix: on a genuine SELF-BUILD timeout — no other holder of
+    /// the per-model `model_warm_lock` (unlike
+    /// `recall_836_degrades_to_fts_only_when_ann_lock_is_held` above, which
+    /// simulates a concurrent holder), this recall's own
+    /// `ensure_ann_for_model` call is the ONLY build in flight — the timed-out
+    /// build must not be dropped. This asserts the detached background build
+    /// eventually installs a fresh ANN index and a later recall takes the
+    /// vector path (no `ann_unavailable` marker), instead of every recall
+    /// restarting and re-timing-out on the same doomed build forever.
+    ///
+    /// A near-zero `ann_ready_timeout_ms` deterministically forces the bounded
+    /// wait to expire on its very first poll (the freshly spawned detached
+    /// task cannot have sent its result yet), without needing an artificially
+    /// large corpus to slow the real build down.
+    ///
+    /// Fail-on-revert proof: reverting `collect_recall_vector_hits`'s detach
+    /// (handlers/common.rs) back to a bare `tokio::time::timeout` wrapping
+    /// `ensure_ann_for_model(...)` directly drops that future on timeout —
+    /// the model never warms, so the `is_current` poll loop below exhausts
+    /// its budget and `warmed` stays `false`, and the second recall keeps
+    /// carrying the `ann_unavailable` marker forever.
+    #[tokio::test]
+    #[serial(background_tasks)]
+    async fn recall_836_self_build_timeout_detaches_build_instead_of_dropping_it() {
+        const MODEL: &str = "recall-836-self-build-detach-model";
+        const DIMS: usize = 16;
+        const NOTE_TEXT: &str = "issue 836 self build detach recall regression note";
+
+        let rt = KhiveRuntime::memory().expect("in-memory runtime");
+        rt.register_embedder(HashVecProvider {
+            model_name: MODEL.to_owned(),
+            dims: DIMS,
+        });
+
+        let ns = Namespace::parse("local").expect("local namespace");
+        let token = rt.authorize(ns).expect("authorize local");
+
+        rt.create_note(&token, "memory", None, NOTE_TEXT, Some(0.7), None, vec![])
+            .await
+            .expect("create note");
+
+        let pack = MemoryPack::new(rt.clone());
+        let ann_handle = pack.ann.clone();
+
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(KgPack::new(rt.clone()));
+        builder.register(pack);
+        let registry = builder.build().expect("registry");
+
+        // Deliberately no lock held here — this is the self-build case: this
+        // recall's own detached `ensure_ann_for_model` call is the only
+        // build in flight for this model.
+        let result = registry
+            .dispatch(
+                "memory.recall",
+                serde_json::json!({
+                    "query": "836 self build detach",
+                    "limit": 10,
+                    "config": { "ann_ready_timeout_ms": 0 }
+                }),
+            )
+            .await
+            .expect("recall must not error when the self-build ANN leg times out");
+
+        let results = result.as_array().expect("recall result must be an array");
+        assert!(
+            !results.is_empty(),
+            "FTS leg must still surface the seeded note while the ANN leg degrades"
+        );
+        for r in results {
+            assert_eq!(
+                r.get("degraded").and_then(Value::as_str),
+                Some("ann_unavailable"),
+                "first recall must still degrade to FTS-only within the \
+                 near-zero timeout, got: {r:?}"
+            );
+        }
+
+        // The detached build must keep running after the timed-out recall
+        // returns — poll the ANN cache directly (mirrors ann.rs's own
+        // #812/#844 convergence tests) rather than sleeping a fixed amount.
+        let key = crate::ann::AnnKey::new("local", MODEL);
+        let mut warmed = false;
+        for _ in 0..300 {
+            if crate::ann::is_current(&ann_handle, &key).await {
+                warmed = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            warmed,
+            "the detached build must eventually install a fresh ANN index for \
+             {MODEL} instead of being dropped on timeout (#836 review)"
+        );
+
+        // A later recall must now take the vector path — no degraded marker.
+        let result2 = registry
+            .dispatch(
+                "memory.recall",
+                serde_json::json!({
+                    "query": "836 self build detach",
+                    "limit": 10
+                }),
+            )
+            .await
+            .expect("recall must succeed once the detached build has warmed the index");
+        let results2 = result2.as_array().expect("recall result must be an array");
+        assert!(
+            !results2.is_empty(),
+            "warmed recall must still surface the seeded note"
+        );
+        for r in results2 {
+            assert!(
+                r.get("degraded").is_none(),
+                "a recall issued after the detached build completes must take \
+                 the vector path, not degrade, got: {r:?}"
+            );
+        }
+    }
+
     // ── ADR-081 §5 (#394): recall serve-time attribution + ledger append ──────
 
     fn build_full_rt_with_brain() -> khive_runtime::KhiveRuntime {

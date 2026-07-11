@@ -1031,23 +1031,65 @@ impl MemoryPack {
                 // lock the daemon's boot-time `warm_existing_memory_indexes`
                 // holds for the duration of a from-scratch corpus build
                 // (300s+ observed in production). Bound the wait: past
-                // `ann_ready_timeout_ms`, abandon this attempt and degrade
-                // this model's vector leg to FTS-only for this recall
-                // instead of blocking on the build. The build itself is
-                // untouched — it keeps running (or keeps holding the lock)
-                // in the background, and a later recall benefits once it
-                // installs.
+                // `ann_ready_timeout_ms`, abandon WAITING for this attempt and
+                // degrade this model's vector leg to FTS-only for this recall.
+                //
+                // #836 review: the build itself must never be dropped on
+                // timeout. In the CONTENDED case (some other holder — e.g.
+                // boot warm — already owns `ensure_ann_for_model`'s per-model
+                // `model_warm_lock`) that other holder's own call keeps
+                // running unaffected either way. But on a genuine SELF-BUILD
+                // (no other holder — a cold embedded runtime, or a new model
+                // introduced over a big corpus after boot) this call IS the
+                // only build in flight: dropping the bare timed-out future
+                // used to abandon it mid-build after it had already emitted
+                // `PhaseStarted`, so the matching `PhaseCompleted`/
+                // `PhaseCancelled` never fired (breaking the phase-span
+                // invariant), and left nothing running in the background —
+                // every later recall repeated the same doomed from-scratch
+                // build and timed out again, forever.
+                //
+                // Fix: spawn the `ensure_ann_for_model` call onto a tracked
+                // background task (same `khive_runtime::track_background_task`
+                // `ensure_ann_background` uses, so daemon shutdown's drain()
+                // waits for it) and race a completion signal against the
+                // deadline instead of racing the build itself. On timeout,
+                // only the receiving half is dropped — the sender side (the
+                // spawned task, and the `ensure_ann_for_model` call inside
+                // it) runs to completion regardless, so the phase-event pair
+                // always closes and a later recall finds a warm index.
+                // `ensure_ann_for_model`'s own per-model `model_warm_lock`
+                // single-flights every caller against the same key (spawned
+                // or not), so a second concurrent detach here just blocks on
+                // that lock and returns `AlreadyLoaded` once the first
+                // finishes — it can never start a second build for the same
+                // model.
                 let mut model_ann_timed_out = false;
                 let initial_raw_hits: Option<Vec<(Uuid, f32)>> = match search_result {
                     Ok(Some(hits)) => Some(hits),
                     Ok(None) => {
+                        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+                        let rt_detached = self.runtime.clone();
+                        let token_detached = token.clone();
+                        let ann_detached = self.ann.clone();
+                        let model_detached = model_name.clone();
+                        khive_runtime::track_background_task(async move {
+                            let result = ann::ensure_ann_for_model(
+                                &rt_detached,
+                                &token_detached,
+                                &ann_detached,
+                                &model_detached,
+                            )
+                            .await;
+                            let _ = done_tx.send(result);
+                        });
                         match tokio::time::timeout(
                             std::time::Duration::from_millis(ann_ready_timeout_ms),
-                            ann::ensure_ann_for_model(&self.runtime, token, &self.ann, &model_name),
+                            done_rx,
                         )
                         .await
                         {
-                            Ok(Ok(status)) => {
+                            Ok(Ok(Ok(status))) => {
                                 tracing::debug!(
                                     ?status,
                                     model = %model_name,
@@ -1056,14 +1098,36 @@ impl MemoryPack {
                                 );
                                 ann::search_loaded(&self.ann, &key, &vec, ann_fetch_limit).await?
                             }
-                            Ok(Err(e)) => return Err(e),
+                            Ok(Ok(Err(e))) => return Err(e),
+                            Ok(Err(_sender_dropped)) => {
+                                // The tracked task's sender was dropped
+                                // without sending — only reachable if that
+                                // task itself panicked (its
+                                // `BackgroundTaskGuard` still decrements the
+                                // shared counter on unwind). Degrade this
+                                // model's vector leg rather than surfacing a
+                                // different task's panic as this recall's
+                                // own error.
+                                tracing::warn!(
+                                    model = %model_name,
+                                    namespace = %ns,
+                                    "memory ANN detached build task ended \
+                                     without a result; degrading recall to \
+                                     FTS-only for this model (#836)"
+                                );
+                                model_ann_timed_out = true;
+                                ann_degraded = true;
+                                None
+                            }
                             Err(_elapsed) => {
                                 tracing::warn!(
                                     model = %model_name,
                                     namespace = %ns,
                                     timeout_ms = ann_ready_timeout_ms,
                                     "memory ANN not ready within bounded wait; \
-                                     degrading recall to FTS-only for this model (#836)"
+                                     degrading recall to FTS-only for this \
+                                     model and detaching the build to finish \
+                                     in the background (#836)"
                                 );
                                 model_ann_timed_out = true;
                                 ann_degraded = true;
