@@ -178,6 +178,13 @@ pub enum CompareOp {
 #[derive(Debug, Clone, PartialEq)]
 pub enum ConditionValue {
     String(String),
+    /// An integer literal (no decimal point in the source lexeme), preserved
+    /// as `i64` so it binds as `QueryValue::Integer` and compares exactly
+    /// against `json_extract`'s INTEGER storage class -- `f64` cannot
+    /// represent every `i64` exactly past 2^53, which silently rounds large
+    /// literals (e.g. `9007199254740993`) to the wrong value (issue #832).
+    Integer(i64),
+    /// A float literal (decimal point present in the source lexeme).
     Number(f64),
     Bool(bool),
 }

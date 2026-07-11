@@ -92,6 +92,73 @@ edges that join against `event_observations`, not `graph_edges`.
 - Event nodes do not have `entity_type` or arbitrary `properties` -- these are
   rejected at compile time with an actionable error.
 
+### Inline Property-Map Literal Grammar (issues #755, #832)
+
+Node patterns support an inline property map: `(n:kind {key: value, ...})`. The
+grammar for `value` (shared with WHERE-clause condition values, via the same
+`parse_value` parser) is:
+
+```text
+value      = string | integer | float | bool
+string     = "'" ... "'" | '"' ... '"'
+integer    = ["-"] digit+                     -- no "." in the lexeme
+float      = ["-"] digit+ "." digit+          -- "." required
+bool       = "true" | "false"                 -- case-insensitive
+```
+
+**Type binding:**
+
+- `string` binds as SQL `TEXT` with `COLLATE NOCASE` (case-insensitive
+  equality against the property's stored JSON string).
+- `integer` binds as `QueryValue::Integer(i64)` -- the full `i64` range
+  (`i64::MIN..=i64::MAX`) is supported, including magnitudes beyond `f64`'s
+  exact-integer limit of 2^53. An integer lexeme outside `i64` range is a
+  **parse-time error** (`QueryError::Parse`), not a silent truncation or a
+  fallback to a lossy float.
+- `float` binds as `QueryValue::Float(f64)`. A float lexeme whose magnitude
+  overflows `f64` to `Infinity` (or otherwise fails to parse as finite) is a
+  **parse-time error** (`QueryError::Parse`); non-finite values never reach
+  the compiler. The compiler additionally re-checks `is_finite()` on every
+  numeric parameter it binds (in `compile_property_equality` and in WHERE
+  condition compilation) as defense-in-depth, returning `InvalidInput` if a
+  non-finite value is ever constructed by a caller outside the parser (e.g. a
+  hand-built AST).
+- `bool` binds as `QueryValue::Integer(0)` / `QueryValue::Integer(1)`, no
+  `COLLATE`.
+
+**`entity_type` is string-only.** `entity_type` is lifted out of the property
+map into `NodePattern.entity_type` and compiled to the dedicated
+`entity_type` column (never `json_extract`). A non-string `entity_type`
+value (e.g. `{entity_type: 54}`) is rejected at parse time with
+`QueryError::Parse`.
+
+**Why integer and float are distinct literal kinds, not one numeric type:**
+entity/note properties are stored as JSON, and SQLite's `json_extract`
+returns a JSON number as either its INTEGER or REAL storage class depending
+on whether the JSON literal had a decimal point. Prior to #832, every numeric
+literal parsed to `f64` and compiled to `QueryValue::Float` (`REAL`)
+regardless of source form; large integers (`2^53+1` and beyond, including
+`i64::MAX`/`i64::MIN`) silently rounded to the nearest representable `f64`
+before comparison, so an equality or MATCH-map filter on the *exact* stored
+integer could round-trip to a different number and either false-match or
+(more commonly) silently match zero rows. Splitting the literal grammar at
+parse time -- an integer lexeme has no `.`, a float lexeme requires one --
+lets the compiler bind `QueryValue::Integer` for integer literals and
+preserve exact `i64` precision through to the SQLite parameter.
+
+**Unsupported forms (rejected, not silently coerced):**
+
+- Scientific notation (`1e10`, `1.5e-3`) is not part of the grammar -- the
+  lexer only consumes ASCII digits and a single `.`; an `e`/`E` character
+  ends the numeric lexeme and the parser then expects a delimiter (`,` or
+  `}`), producing a parse error.
+- `null` is not a recognized value literal in either the inline property map
+  or WHERE conditions.
+- A quoted numeric string (e.g. `{number: '54'}`) is a deliberate `TEXT`
+  literal and is never coerced to a number -- it matches JSON strings only,
+  not the JSON-number storage class. See the #755 commit for the full
+  rationale.
+
 ## Invariants and Failure Modes
 
 ### Invariants
@@ -111,11 +178,14 @@ edges that join against `event_observations`, not `graph_edges`.
 
 ### Failure Modes
 
-- `QueryError::Parse` -- malformed input syntax
+- `QueryError::Parse` -- malformed input syntax; also an integer literal
+  outside `i64` range or a float literal that overflows to a non-finite
+  value (issue #832)
 - `QueryError::Validation` -- namespace in query text, unknown relation, inverted
   hop range, malformed pattern shape
 - `QueryError::InvalidInput` -- depth exceeds cap, limit overflows `i64`,
-  non-finite float parameter
+  non-finite float parameter (defense-in-depth re-check at compile time; the
+  parser already rejects non-finite float literals, issue #832)
 - `QueryError::Unsupported` -- zero-hop range, repeated node variable, mixed
   fixed+variable chains, SPARQL `*` paths, OR spanning both endpoints
 - `QueryError::Compile` -- empty pattern, unknown variable in RETURN/WHERE, mixed
@@ -162,4 +232,4 @@ SELECT DISTINCT ... FROM traverse t JOIN entities r ... WHERE ... LIMIT ?
   `compile` to catch hand-constructed malformed ASTs.
 - The `parse_auto` fallback for unrecognized prefixes uses the GQL parser.
 
-Last reviewed: 2026-06-06
+Last reviewed: 2026-07-10

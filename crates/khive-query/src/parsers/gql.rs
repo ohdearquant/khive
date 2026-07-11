@@ -151,9 +151,28 @@ impl Parser {
                     }
                 }
                 let s: String = self.input[start..self.pos].iter().collect();
+                // No decimal point: integer lexeme -- parse as i64 so the value
+                // survives round-trip past 2^53 (f64's exact-integer limit) and
+                // both i64 bounds. Scientific notation is not part of this
+                // grammar (the loop above only consumes digits and '.'), so an
+                // integer lexeme is always plain decimal digits.
+                if !s.contains('.') {
+                    let n: i64 = s.parse().map_err(|_| {
+                        self.err(format!(
+                            "integer literal '{s}' out of supported range \
+                             ({} to {})",
+                            i64::MIN,
+                            i64::MAX
+                        ))
+                    })?;
+                    return Ok(ConditionValue::Integer(n));
+                }
                 let n: f64 = s
                     .parse()
                     .map_err(|_| self.err(format!("invalid number: {s}")))?;
+                if !n.is_finite() {
+                    return Err(self.err(format!("float literal '{s}' is not finite")));
+                }
                 Ok(ConditionValue::Number(n))
             }
             _ => {

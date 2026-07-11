@@ -221,32 +221,46 @@ fn namespace_filter(alias: &str, opts: &CompileOptions, params: &mut Vec<QueryVa
 /// `json_extract(<alias>.properties, '$.<key>')`.
 ///
 /// String values bind as `TEXT` with `COLLATE NOCASE` (case-insensitive match,
-/// matching prior behavior). Number and Bool values bind as `REAL`/`INTEGER` —
-/// SQLite's `json_extract` returns JSON numbers/booleans as numeric storage
-/// classes, so a numeric literal must compare against a numeric parameter, not
-/// a `COLLATE NOCASE` text comparison that can never match (issue #755).
+/// matching prior behavior). Integer values bind as `INTEGER`, and Bool values
+/// bind as `INTEGER` (0/1) — SQLite's `json_extract` returns JSON
+/// numbers/booleans as numeric storage classes, so a numeric literal must
+/// compare against a numeric parameter, not a `COLLATE NOCASE` text
+/// comparison that can never match (issue #755). Integer literals bind as
+/// `QueryValue::Integer` rather than `Float` so values beyond `f64`'s exact
+/// 2^53 integer range (and both `i64` bounds) survive round-trip (issue
+/// #832). Float values are rejected here if non-finite, matching the
+/// `is_finite()` invariant enforced by WHERE-clause compilation
+/// (see `docs/design.md`).
 fn compile_property_equality(
     alias: &str,
     key: &str,
     value: &ConditionValue,
     text_column: Option<&str>,
     params: &mut Vec<QueryValue>,
-) -> String {
+) -> Result<String, QueryError> {
     let is_string = matches!(value, ConditionValue::String(_));
     match value {
         ConditionValue::String(s) => params.push(QueryValue::Text(s.clone())),
-        ConditionValue::Number(n) => params.push(QueryValue::Float(*n)),
+        ConditionValue::Integer(n) => params.push(QueryValue::Integer(*n)),
+        ConditionValue::Number(n) => {
+            if !n.is_finite() {
+                return Err(QueryError::InvalidInput(
+                    "non-finite float (NaN or Infinity) is not a valid query parameter".into(),
+                ));
+            }
+            params.push(QueryValue::Float(*n));
+        }
         ConditionValue::Bool(b) => params.push(QueryValue::Integer(if *b { 1 } else { 0 })),
     }
     let collate = if is_string { " COLLATE NOCASE" } else { "" };
-    match text_column {
+    Ok(match text_column {
         Some(col) => format!("{alias}.{col} = ?{}{collate}", params.len()),
         None => format!(
             "json_extract({alias}.properties, '$.{}') = ?{}{collate}",
             key.replace('\'', "''"),
             params.len()
         ),
-    }
+    })
 }
 
 /// Returns `(source_indices, target_indices)` for synthetic `observed_as_*` edge endpoints.
@@ -384,7 +398,7 @@ fn compile_fixed_length(
                             val,
                             text_column,
                             &mut params,
-                        ));
+                        )?);
                     }
                 } else {
                     where_parts.push(format!("{alias}.deleted_at IS NULL"));
@@ -414,7 +428,7 @@ fn compile_fixed_length(
                             val,
                             text_column,
                             &mut params,
-                        ));
+                        )?);
                     }
                 }
 
@@ -771,6 +785,10 @@ fn compile_single_condition(
             };
             format!("{col_expr} {op_str} ?{}{}", params.len(), collate)
         }
+        ConditionValue::Integer(n) => {
+            params.push(QueryValue::Integer(*n));
+            format!("{col_expr} {op_str} ?{}", params.len())
+        }
         ConditionValue::Number(n) => {
             if !n.is_finite() {
                 return Err(QueryError::InvalidInput(
@@ -897,6 +915,10 @@ fn compile_var_len_condition(
                 ""
             };
             format!("{col_expr} {op_str} ?{}{collate}", params.len())
+        }
+        ConditionValue::Integer(n) => {
+            params.push(QueryValue::Integer(*n));
+            format!("{col_expr} {op_str} ?{}", params.len())
         }
         ConditionValue::Number(n) => {
             if !n.is_finite() {
@@ -1093,7 +1115,7 @@ fn compile_variable_length(
             val,
             text_column,
             &mut params,
-        ));
+        )?);
     }
 
     // Relation filter
@@ -1177,7 +1199,7 @@ fn compile_variable_length(
             val,
             text_column,
             &mut params,
-        ));
+        )?);
     }
 
     // WHERE clause conditions for variable-length patterns.
