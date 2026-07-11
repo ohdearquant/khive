@@ -1138,29 +1138,42 @@ struct GhPr {
     body: Option<String>,
 }
 
-/// Every externally controlled issue string (title, body, label names,
-/// author login) funnels through this constructor before it can reach
-/// `properties`/`content`/the note name. There is no way to read a raw
-/// field back out of this struct -- the only fields it exposes are already
-/// masked -- so a call site cannot forget to mask one without a compile
-/// error, and a future new external string only needs to be added here
-/// once to be covered everywhere it's used.
+/// Every `GhIssue` field funnels through this constructor before it can
+/// reach `properties`/`content`/the note name/the paging cursor. `new`
+/// consumes `GhIssue` by value and destructures it exhaustively (no `..`),
+/// so the original `issue` binding no longer exists after the call -- a
+/// call site has no way to read a raw field back out, and a future new
+/// `GhIssue` field forces a compile error here before it can silently skip
+/// this boundary.
 struct MaskedIssueFields {
+    number: u64,
     title: String,
     body: String,
     author_login: Option<String>,
     labels: Vec<String>,
+    created_at: Option<String>,
+    closed_at: Option<String>,
+    updated_at: Option<String>,
+    state_reason: Option<String>,
 }
 
 impl MaskedIssueFields {
-    fn new(
-        title: &str,
-        body: Option<String>,
-        author: Option<GhAuthor>,
-        labels: Option<Vec<GhLabel>>,
-    ) -> Self {
+    fn new(issue: GhIssue, warnings: &mut Vec<String>) -> Self {
+        let GhIssue {
+            number,
+            title,
+            author,
+            created_at,
+            closed_at,
+            updated_at,
+            labels,
+            state_reason,
+            body,
+        } = issue;
+
         Self {
-            title: secret_gate::mask_secrets(title).into_owned(),
+            number,
+            title: secret_gate::mask_secrets(&title).into_owned(),
             body: secret_gate::mask_secrets(&body.unwrap_or_default()).into_owned(),
             author_login: author
                 .and_then(|a| a.login)
@@ -1170,6 +1183,42 @@ impl MaskedIssueFields {
                 .into_iter()
                 .map(|l| secret_gate::mask_secrets(&l.name).into_owned())
                 .collect(),
+            created_at: canonical_issue_timestamp("createdAt", number, created_at, warnings),
+            closed_at: canonical_issue_timestamp("closedAt", number, closed_at, warnings),
+            updated_at: canonical_issue_timestamp("updatedAt", number, updated_at, warnings),
+            state_reason: state_reason
+                .filter(|r| !r.is_empty())
+                .map(|r| r.to_ascii_lowercase()),
+        }
+    }
+}
+
+/// Parses a GitHub issue timestamp into its canonical RFC3339 form. GitHub's
+/// API always returns valid RFC3339 timestamps; a value that fails to parse
+/// is untrusted/malformed input (round-2 codex finding: a credential-shaped
+/// string is exactly this case) and must never reach `properties` or the
+/// paging cursor as a raw string. On parse failure the field is rejected
+/// (becomes absent) and a warning is recorded -- without the raw value,
+/// which may itself be secret-shaped -- rather than letting an unparseable
+/// string silently pass the generic recursive secret scan downstream. The
+/// issue itself is still ingested; only this one field is dropped.
+fn canonical_issue_timestamp(
+    field: &'static str,
+    number: u64,
+    raw: Option<String>,
+    warnings: &mut Vec<String>,
+) -> Option<String> {
+    let raw = raw?;
+    match chrono::DateTime::parse_from_rfc3339(&raw) {
+        Ok(dt) => Some(
+            dt.with_timezone(&Utc)
+                .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        ),
+        Err(_) => {
+            warnings.push(format!(
+                "issue #{number}: {field} is not a valid RFC3339 timestamp, field dropped"
+            ));
+            None
         }
     }
 }
@@ -1508,19 +1557,24 @@ async fn ingest_issues(
         let last_updated_at = page.last().and_then(|i| i.updated_at.clone());
 
         for issue in page {
+            // Every field is classified (masked strings, canonicalized
+            // timestamps) before anything else touches it -- `issue` is
+            // consumed here, so nothing downstream can read a raw field.
+            let masked = MaskedIssueFields::new(issue, &mut report.warnings);
+
             let is_new = since
                 .as_deref()
-                .zip(issue.updated_at.as_deref())
+                .zip(masked.updated_at.as_deref())
                 .map(|(cursor, updated)| updated >= cursor)
                 .unwrap_or(true);
 
-            if find_by_number(runtime, token, "issue", project_id, issue.number)
+            if find_by_number(runtime, token, "issue", project_id, masked.number)
                 .await?
                 .is_some()
             {
                 report.issues_skipped_existing += 1;
                 if !cursor_stalled {
-                    if let Some(u) = &issue.updated_at {
+                    if let Some(u) = &masked.updated_at {
                         if max_updated
                             .as_deref()
                             .map(|m| u.as_str() > m)
@@ -1539,16 +1593,16 @@ async fn ingest_issues(
                 break;
             }
 
-            let masked =
-                MaskedIssueFields::new(&issue.title, issue.body, issue.author, issue.labels);
+            let number = masked.number;
+            let updated_at = masked.updated_at.clone();
             let content = masked.body;
             let safe_title = masked.title;
             let mut properties = json!({
-                "number": issue.number,
+                "number": number,
                 "title": safe_title,
                 "author": masked.author_login,
-                "created_at": issue.created_at,
-                "closed_at": issue.closed_at,
+                "created_at": masked.created_at,
+                "closed_at": masked.closed_at,
                 "labels": masked.labels,
                 "project_id": project_id.to_string(),
             });
@@ -1556,11 +1610,10 @@ async fn ingest_issues(
             // (NOT_PLANNED) for closed ones; the kind hook governs any PRESENT value
             // against the lowercase GitHub stateReason enum, so normalize case and encode
             // "open / no reason" as absent.
-            if let Some(reason) = issue.state_reason.as_deref().filter(|r| !r.is_empty()) {
-                properties["state_reason"] = json!(reason.to_ascii_lowercase());
+            if let Some(reason) = masked.state_reason {
+                properties["state_reason"] = json!(reason);
             }
-            let name =
-                refs::truncate_chars(&format!("#{} {}", issue.number, safe_title), NAME_MAX_CHARS);
+            let name = refs::truncate_chars(&format!("#{number} {safe_title}"), NAME_MAX_CHARS);
 
             budget.try_consume();
             let result = match registry
@@ -1578,9 +1631,7 @@ async fn ingest_issues(
             {
                 Ok(v) => v,
                 Err(e) => {
-                    report
-                        .warnings
-                        .push(format!("create issue #{}: {e}", issue.number));
+                    report.warnings.push(format!("create issue #{number}: {e}"));
                     cursor_stalled = true;
                     continue;
                 }
@@ -1598,7 +1649,7 @@ async fn ingest_issues(
 
             report.issues_ingested += 1;
             if !cursor_stalled {
-                if let Some(u) = &issue.updated_at {
+                if let Some(u) = &updated_at {
                     if max_updated
                         .as_deref()
                         .map(|m| u.as_str() > m)
