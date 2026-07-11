@@ -10,6 +10,9 @@ keywords.workspace = true
 categories.workspace = true
 description = "Schedule pack — time-triggered intent storage (remind, schedule, agenda, cancel) (ADR-040)"
 
+[lib]
+bench = false
+
 [dependencies]
 khive-types = { version = "0.3.0", path = "../khive-types", features = ["serde"] }
 khive-runtime = { version = "0.3.0", path = "../khive-runtime" }

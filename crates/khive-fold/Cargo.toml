@@ -10,6 +10,9 @@ keywords.workspace = true
 categories.workspace = true
 description = "Cognitive primitives — Fold, Anchor, Objective, Selector"
 
+[lib]
+bench = false
+
 [features]
 # serde: enables Serialize/Deserialize derives on all fold types.
 # Enabled by default so existing callers compile without explicit opt-in.

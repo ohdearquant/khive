@@ -10,6 +10,9 @@ keywords.workspace = true
 categories.workspace = true
 description = "HNSW (Hierarchical Navigable Small World) vector index with INT8 quantized two-phase search"
 
+[lib]
+bench = false
+
 [dependencies]
 khive-score = { version = "0.3.0", path = "../khive-score" }
 khive-types = { version = "0.3.0", path = "../khive-types", features = ["serde"] }

@@ -10,6 +10,9 @@ keywords.workspace = true
 categories.workspace = true
 description = "KG verb pack — entity/note CRUD, graph traversal, hybrid search for research knowledge graphs"
 
+[lib]
+bench = false
+
 [dependencies]
 khive-types = { version = "0.3.0", path = "../khive-types", features = ["serde"] }
 khive-runtime = { version = "0.3.0", path = "../khive-runtime" }

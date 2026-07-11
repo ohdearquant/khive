@@ -9,6 +9,9 @@ repository.workspace = true
 keywords.workspace = true
 categories.workspace = true
 
+[lib]
+bench = false
+
 [dependencies]
 rayon = { workspace = true }
 
