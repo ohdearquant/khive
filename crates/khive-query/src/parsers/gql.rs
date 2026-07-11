@@ -167,7 +167,7 @@ impl Parser {
         }
     }
 
-    fn parse_props(&mut self) -> Result<HashMap<String, String>, QueryError> {
+    fn parse_props(&mut self) -> Result<HashMap<String, ConditionValue>, QueryError> {
         self.expect_char('{')?;
         let mut props = HashMap::new();
         loop {
@@ -181,7 +181,7 @@ impl Parser {
             }
             let key = self.parse_ident()?;
             self.expect_char(':')?;
-            let val = self.parse_string_literal()?;
+            let val = self.parse_value()?;
             if props.insert(key.clone(), val).is_some() {
                 return Err(self.err(format!("duplicate property '{key}'")));
             }
@@ -237,7 +237,11 @@ impl Parser {
 
         // Lift entity_type out of properties so the SQL compiler targets the
         // dedicated column instead of json_extract(properties, '$.entity_type').
-        let entity_type = properties.remove("entity_type");
+        let entity_type = match properties.remove("entity_type") {
+            Some(ConditionValue::String(s)) => Some(s),
+            Some(_) => return Err(self.err("entity_type must be a string literal")),
+            None => None,
+        };
 
         self.expect_char(')')?;
         Ok(NodePattern {
@@ -561,7 +565,10 @@ mod tests {
         let q = parse("MATCH (a {name: 'LoRA'})-[:extends|variant_of*1..3]->(b) RETURN b LIMIT 20")
             .unwrap();
         let nodes: Vec<_> = q.pattern.nodes().collect();
-        assert_eq!(nodes[0].properties.get("name").unwrap(), "LoRA");
+        assert_eq!(
+            nodes[0].properties.get("name").unwrap(),
+            &ConditionValue::String("LoRA".into())
+        );
 
         let edges: Vec<_> = q.pattern.edges().collect();
         assert_eq!(edges[0].relations, vec!["extends", "variant_of"]);

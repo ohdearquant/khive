@@ -345,6 +345,62 @@ async fn query_via_gql() {
 }
 
 // =============================================================================
+// GQL inline property-map integer literals (issue #755)
+//
+// Properties are stored as JSON values; `number: 54` in the entity's props
+// blob is a JSON number, so `json_extract` returns SQLite's INTEGER/REAL
+// storage class for it. An inline `{number: 54}` match must bind a numeric
+// parameter so the comparison actually compares equal; a quoted `{number:
+// '54'}` is a deliberate string literal and must keep comparing against JSON
+// strings only (it must not start matching the JSON number).
+// =============================================================================
+
+#[tokio::test]
+async fn query_via_gql_inline_property_map_integer_literal_matches_json_number() {
+    let rt = rt();
+    let tok = rt.authorize(Namespace::local()).unwrap();
+
+    let props = serde_json::json!({"number": 54});
+    rt.create_entity(&tok, "artifact", None, "PR #54", None, Some(props), vec![])
+        .await
+        .unwrap();
+
+    let rows = rt
+        .query(&tok, "MATCH (n:artifact {number: 54}) RETURN n")
+        .await
+        .unwrap();
+
+    assert_eq!(
+        rows.len(),
+        1,
+        "unquoted integer literal must match the JSON-number property"
+    );
+}
+
+#[tokio::test]
+async fn query_via_gql_inline_property_map_quoted_number_does_not_match_json_number() {
+    let rt = rt();
+    let tok = rt.authorize(Namespace::local()).unwrap();
+
+    let props = serde_json::json!({"number": 54});
+    rt.create_entity(&tok, "artifact", None, "PR #54", None, Some(props), vec![])
+        .await
+        .unwrap();
+
+    let rows = rt
+        .query(&tok, "MATCH (n:artifact {number: '54'}) RETURN n")
+        .await
+        .unwrap();
+
+    assert_eq!(
+        rows.len(),
+        0,
+        "quoted string literal must not match a JSON-number property; \
+         this is the decided behavior, not a residual bug"
+    );
+}
+
+// =============================================================================
 // GQL query truncation warning (issue #777)
 //
 // The compiler cannot infer truncation from the requested LIMIT alone — it

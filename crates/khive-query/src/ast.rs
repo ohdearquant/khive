@@ -129,7 +129,7 @@ pub struct NodePattern {
     /// Governed subtype within the kind (e.g. "researcher" within "person").
     /// Compiled to `entity_type = ?` — a direct column, not a property extraction.
     pub entity_type: Option<String>,
-    pub properties: HashMap<String, String>,
+    pub properties: HashMap<String, ConditionValue>,
 }
 
 /// An edge binding in the MATCH pattern with optional relation filters, direction, and hop bounds.
@@ -175,7 +175,7 @@ pub enum CompareOp {
 }
 
 /// Right-hand side value in a WHERE condition.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum ConditionValue {
     String(String),
     Number(f64),
