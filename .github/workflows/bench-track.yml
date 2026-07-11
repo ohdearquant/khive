@@ -216,11 +216,22 @@ jobs:
             --summary-out /tmp/pipeline-trend.md
 
       - name: Run hermetic bench-1m synthetic gate (informational, --runs 1)
+        id: bench_1m
         # Same hermetic synthetic path bench-1m.yml's blocking ann-ci-gate
         # uses (seed=42, no SIFT download) - runnable on standard runners,
         # so it runs here too, but only ever informational: this workflow
         # never asserts pass/fail on its output, only records it.
-        run: bash scripts/bench_1m.sh --ci-synthetic
+        #
+        # bench_1m.sh exits 1 on a measured assertion regression (its own
+        # blocking-gate behavior, reused here) - `set +e` + an explicit rc
+        # capture (not `|| true`, which would discard the code entirely)
+        # keeps this step green so the NEXT step (recording) always runs,
+        # while still carrying the real exit code into the ledger as an
+        # advisory field instead of silently dropping the regression.
+        run: |
+          set +e
+          bash scripts/bench_1m.sh --ci-synthetic
+          echo "exit_code=$?" >> "$GITHUB_OUTPUT"
 
       - name: Record bench-1m suite (single informational run)
         run: |
@@ -232,6 +243,7 @@ jobs:
             --sha "$GITHUB_SHA" \
             --branch "$GITHUB_REF_NAME" \
             --data-dir bench-data \
+            --gate-exit-code "${{ steps.bench_1m.outputs.exit_code }}" \
             --summary-out /tmp/bench-1m-trend.md
 
       - name: Publish ledgers to perf-data branch

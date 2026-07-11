@@ -21,12 +21,28 @@ Three metric sources, one record shape:
               mean/median/std_dev point estimates (nanoseconds) per bench id.
 
 Record shape (schema_version 1):
-  {schema_version, suite, sha, branch, timestamp, metrics, host}
+  {schema_version, suite, sha, branch, timestamp, metrics, host,
+   status, error, gate_exit_code, gate_status}
 
 `timestamp` is the commit's own commit-date (`git show -s --format=%cI`), not
 wall-clock `time.time()` - two CI runs at the same SHA (e.g. a re-run) then
 carry an identical, reproducible timestamp instead of drifting with runner
 scheduling.
+
+`status` is `"ok"` for a normal record or `"error"` for a record written
+after extraction/build failed (`error` then carries the failure message and
+`metrics` is empty) - a broken run still gets a ledger entry instead of
+vanishing silently. `gate_exit_code`/`gate_status` are populated only when
+the caller passes `--gate-exit-code` (e.g. bench-1m.sh's own PASS/FAIL exit
+code): the tracker never fails a CI step on this, it just carries the
+suite's own advisory verdict alongside its metrics.
+
+The `components` suite is sharded 4 ways across matrix jobs
+(.github/workflows/bench-track.yml); each shard appends its own partial
+record for the same sha. `_aggregate_shards` merges same-sha records before
+windowing/rendering so the trend summary treats one workflow run (one sha)
+as one logical row with the full union of every shard's metrics, not one
+row per shard.
 """
 
 from __future__ import annotations
@@ -269,7 +285,16 @@ def collect_criterion_metrics(criterion_dir: pathlib.Path) -> dict[str, float]:
 # ── record + ledger ──────────────────────────────────────────────────────────
 
 
-def build_record(suite: str, metrics: dict[str, float], sha: str, branch: str) -> dict:
+def build_record(
+    suite: str,
+    metrics: dict[str, float],
+    sha: str,
+    branch: str,
+    gate_exit_code: int | None = None,
+) -> dict:
+    gate_status = None
+    if gate_exit_code is not None:
+        gate_status = "pass" if gate_exit_code == 0 else "fail"
     return {
         "schema_version": SCHEMA_VERSION,
         "suite": suite,
@@ -278,6 +303,31 @@ def build_record(suite: str, metrics: dict[str, float], sha: str, branch: str) -
         "timestamp": _commit_timestamp(sha),
         "metrics": metrics,
         "host": host_fingerprint(),
+        "status": "ok",
+        "error": None,
+        "gate_exit_code": gate_exit_code,
+        "gate_status": gate_status,
+    }
+
+
+def build_error_record(suite: str, sha: str, branch: str, error: str) -> dict:
+    """A build/extraction failure still gets a ledger row - `status: "error"`,
+    empty metrics, and the failure message - instead of raising before
+    `append_record` ever runs and leaving the ledger silently missing that
+    commit's data point (round-2 finding: build failures were invisible).
+    """
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "suite": suite,
+        "sha": sha,
+        "branch": branch,
+        "timestamp": _commit_timestamp(sha),
+        "metrics": {},
+        "host": host_fingerprint(),
+        "status": "error",
+        "error": error,
+        "gate_exit_code": None,
+        "gate_status": None,
     }
 
 
@@ -308,6 +358,37 @@ def read_records(suite: str, data_dir: pathlib.Path = DATA_DIR) -> list[dict]:
 # ── trend rendering ──────────────────────────────────────────────────────────
 
 
+def _aggregate_shards(records: list[dict]) -> list[dict]:
+    """Merge same-sha records into one logical run per commit.
+
+    The `components` suite is sharded 4 ways (bench-track.yml matrix); each
+    shard job appends its own partial record for the same sha independently.
+    Without this, the raw ledger holds up to 4 rows per commit and a naive
+    "last record" read only sees whichever shard happened to append last -
+    both undercounting distinct commits as separate "runs" and dropping
+    every other shard's metrics from the rendered trend. Records are merged
+    in ledger (append) order, keyed by sha, preserving first-seen order so
+    the result stays chronological; a later shard's metrics are unioned in,
+    and an "error" status from any shard is never masked by a later
+    "ok" shard.
+    """
+    order: list[str] = []
+    merged: dict[str, dict] = {}
+    for rec in records:
+        sha = rec["sha"]
+        if sha not in merged:
+            order.append(sha)
+            agg = dict(rec)
+            agg["metrics"] = dict(rec.get("metrics", {}))
+            merged[sha] = agg
+        else:
+            merged[sha]["metrics"].update(rec.get("metrics", {}))
+            if rec.get("status") == "error" and merged[sha].get("status") != "error":
+                merged[sha]["status"] = "error"
+                merged[sha]["error"] = rec.get("error")
+    return [merged[sha] for sha in order]
+
+
 def _arrow(prev: float, curr: float) -> str:
     if curr > prev:
         return "^ up"
@@ -317,7 +398,7 @@ def _arrow(prev: float, curr: float) -> str:
 
 
 def render_trend_markdown(suite: str, limit: int = 10, data_dir: pathlib.Path = DATA_DIR) -> str:
-    all_records = read_records(suite, data_dir)
+    all_records = _aggregate_shards(read_records(suite, data_dir))
     lines = [f"# Bench trend: `{suite}`", ""]
     if not all_records:
         lines.append("No history yet.")
@@ -328,6 +409,10 @@ def render_trend_markdown(suite: str, limit: int = 10, data_dir: pathlib.Path = 
     latest = window[-1]
     lines.append(f"- runs in window: {len(window)} (of {len(all_records)} total)")
     lines.append(f"- latest sha: `{latest['sha'][:8]}` ({latest['branch']}) at {latest['timestamp']}")
+    if latest.get("status") == "error":
+        lines.append(f"- LATEST RUN FAILED (build/extraction error): {latest.get('error')}")
+    elif latest.get("gate_status") is not None:
+        lines.append(f"- latest gate outcome: {latest['gate_status']} (exit {latest.get('gate_exit_code')})")
     lines.append("")
     lines.append(
         "Informational only - no thresholds, per the bench-program spec's promotion ladder. "
@@ -358,22 +443,40 @@ def render_trend_markdown(suite: str, limit: int = 10, data_dir: pathlib.Path = 
 def _cmd_record(args: argparse.Namespace) -> int:
     sha = args.sha or _git_sha()
     branch = args.branch or _current_branch()
+    data_dir = pathlib.Path(args.data_dir) if args.data_dir else DATA_DIR
 
-    if args.source == "calibrate":
-        run_dir = pathlib.Path(args.run_dir or (DATA_DIR / "runs" / f"{args.suite}_{sha[:8]}"))
-        metrics = collect_calibrate_metrics(args.suite, args.extra_arg, run_dir)
-    elif args.source == "json":
-        if not args.json_file:
-            raise SystemExit("--source json requires --json-file")
-        metrics = collect_json_metrics(pathlib.Path(args.json_file), prefix=args.json_prefix)
-    elif args.source == "criterion":
-        criterion_dir = pathlib.Path(args.criterion_dir or (REPO_ROOT / "crates" / "target" / "criterion"))
-        metrics = collect_criterion_metrics(criterion_dir)
-    else:  # pragma: no cover - argparse choices already constrain this
-        raise SystemExit(f"unknown source {args.source!r}")
+    try:
+        if args.source == "calibrate":
+            run_dir = pathlib.Path(args.run_dir or (DATA_DIR / "runs" / f"{args.suite}_{sha[:8]}"))
+            metrics = collect_calibrate_metrics(args.suite, args.extra_arg, run_dir)
+        elif args.source == "json":
+            if not args.json_file:
+                raise SystemExit("--source json requires --json-file")
+            metrics = collect_json_metrics(pathlib.Path(args.json_file), prefix=args.json_prefix)
+        elif args.source == "criterion":
+            criterion_dir = pathlib.Path(args.criterion_dir or (REPO_ROOT / "crates" / "target" / "criterion"))
+            metrics = collect_criterion_metrics(criterion_dir)
+        else:  # pragma: no cover - argparse choices already constrain this
+            raise SystemExit(f"unknown source {args.source!r}")
+    except (SystemExit, calibrate.SchemaError, calibrate.ChildFailure, OSError, json.JSONDecodeError) as exc:
+        # A build/extraction failure (no output produced, malformed JSON, a
+        # crashed child) must still leave a ledger row - otherwise this
+        # commit's data point is silently missing rather than visibly
+        # marked as failed. Write the error record FIRST, then surface the
+        # failure so the workflow step still goes red.
+        message = str(exc.code) if isinstance(exc, SystemExit) else str(exc)
+        error_record = build_error_record(args.suite, sha, branch, message)
+        path = append_record(error_record, data_dir)
+        print(
+            f"[bench_track] build/extraction FAILED for suite={args.suite} sha={sha[:8]} "
+            f"- wrote status=error record -> {path}",
+            file=sys.stderr,
+        )
+        print(f"[bench_track] error: {message}", file=sys.stderr)
+        return 1
 
-    record = build_record(args.suite, metrics, sha, branch)
-    path = append_record(record, pathlib.Path(args.data_dir) if args.data_dir else DATA_DIR)
+    record = build_record(args.suite, metrics, sha, branch, gate_exit_code=args.gate_exit_code)
+    path = append_record(record, data_dir)
     print(f"[bench_track] appended {len(metrics)} metrics for suite={args.suite} sha={sha[:8]} -> {path}")
 
     md = render_trend_markdown(args.suite, limit=args.limit, data_dir=path.parent)
@@ -414,6 +517,16 @@ def main(argv: list[str] | None = None) -> int:
         help="(--source calibrate) extra argv token appended to the suite's default args (repeatable)",
     )
     rec.add_argument("--run-dir", help="(--source calibrate) scratch dir for the single run's artifacts")
+    rec.add_argument(
+        "--gate-exit-code",
+        type=int,
+        default=None,
+        help=(
+            "advisory exit code from an external gate script (e.g. bench_1m.sh's own "
+            "PASS/FAIL assertion) - recorded as gate_exit_code/gate_status, never used "
+            "to skip appending the record"
+        ),
+    )
     rec.add_argument("--sha", help="commit sha to record (default: current HEAD)")
     rec.add_argument("--branch", help="branch name to record (default: $GITHUB_REF_NAME or current branch)")
     rec.add_argument("--data-dir", help="ledger directory (default: bench-data/)")

@@ -7,6 +7,7 @@ Run: python3 -m unittest scripts.perf.test_bench_track -v
 
 from __future__ import annotations
 
+import argparse
 import json
 import pathlib
 import sys
@@ -171,6 +172,147 @@ class CriterionSourceTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             with self.assertRaises(SystemExit):
                 bench_track.collect_criterion_metrics(pathlib.Path(tmp))
+
+
+class GateExitCodeTests(unittest.TestCase):
+    def test_build_record_gate_pass(self):
+        record = bench_track.build_record("bench-1m", {"recall_at_10": 0.94}, "a" * 40, "main", gate_exit_code=0)
+        self.assertEqual(record["gate_exit_code"], 0)
+        self.assertEqual(record["gate_status"], "pass")
+
+    def test_build_record_gate_fail(self):
+        record = bench_track.build_record("bench-1m", {"recall_at_10": 0.40}, "a" * 40, "main", gate_exit_code=1)
+        self.assertEqual(record["gate_exit_code"], 1)
+        self.assertEqual(record["gate_status"], "fail")
+
+    def test_build_record_no_gate_by_default(self):
+        record = bench_track.build_record("components", {"m": 1.0}, "a" * 40, "main")
+        self.assertIsNone(record["gate_exit_code"])
+        self.assertIsNone(record["gate_status"])
+
+    def test_build_record_default_status_ok(self):
+        record = bench_track.build_record("components", {"m": 1.0}, "a" * 40, "main")
+        self.assertEqual(record["status"], "ok")
+        self.assertIsNone(record["error"])
+
+
+class ErrorRecordTests(unittest.TestCase):
+    def test_build_error_record_shape(self):
+        record = bench_track.build_error_record("pipeline", "c" * 40, "main", "boom: no output")
+        self.assertEqual(record["status"], "error")
+        self.assertEqual(record["error"], "boom: no output")
+        self.assertEqual(record["metrics"], {})
+        self.assertIsNone(record["gate_exit_code"])
+
+    def test_cmd_record_writes_error_record_on_missing_json_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = pathlib.Path(tmp)
+            args = argparse.Namespace(
+                suite="bench-1m",
+                source="json",
+                json_file=str(data_dir / "does-not-exist.json"),
+                json_prefix="",
+                criterion_dir=None,
+                extra_arg=[],
+                run_dir=None,
+                gate_exit_code=1,
+                sha="d" * 40,
+                branch="main",
+                data_dir=str(data_dir),
+                limit=10,
+                summary_out=None,
+            )
+            rc = bench_track._cmd_record(args)
+            self.assertEqual(rc, 1)
+
+            records = bench_track.read_records("bench-1m", data_dir=data_dir)
+            self.assertEqual(len(records), 1)
+            self.assertEqual(records[0]["status"], "error")
+            self.assertEqual(records[0]["metrics"], {})
+
+    def test_cmd_record_writes_error_record_on_empty_criterion_dir(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = pathlib.Path(tmp)
+            empty_criterion = data_dir / "criterion"
+            empty_criterion.mkdir()
+            args = argparse.Namespace(
+                suite="components",
+                source="criterion",
+                json_file=None,
+                json_prefix="",
+                criterion_dir=str(empty_criterion),
+                extra_arg=[],
+                run_dir=None,
+                gate_exit_code=None,
+                sha="e" * 40,
+                branch="main",
+                data_dir=str(data_dir),
+                limit=10,
+                summary_out=None,
+            )
+            rc = bench_track._cmd_record(args)
+            self.assertEqual(rc, 1)
+            records = bench_track.read_records("components", data_dir=data_dir)
+            self.assertEqual(len(records), 1)
+            self.assertEqual(records[0]["status"], "error")
+            self.assertIn("no criterion estimates.json", records[0]["error"])
+
+
+class ShardAggregationTests(unittest.TestCase):
+    """Reproduces the round-2 finding: 4 `components` shards append 4
+    partial records for the same sha; the trend summary must render one
+    logical run per sha with the full union of every shard's metrics, not
+    one row per shard with only the last shard's metric names.
+    """
+
+    def test_two_sha_two_shard_aggregates_to_two_runs_with_full_metric_union(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            data_dir = pathlib.Path(tmp)
+            shas = ["a" * 40, "b" * 40]
+            for sha in shas:
+                shard1 = bench_track.build_record(
+                    "components", {"khive-score/score_ops.mean_ns": 100.0}, sha, "main"
+                )
+                shard2 = bench_track.build_record(
+                    "components", {"khive-hnsw/hnsw_build.mean_ns": 200.0}, sha, "main"
+                )
+                bench_track.append_record(shard1, data_dir=data_dir)
+                bench_track.append_record(shard2, data_dir=data_dir)
+
+            raw_records = bench_track.read_records("components", data_dir=data_dir)
+            self.assertEqual(len(raw_records), 4)  # 2 shas x 2 shards, still stored as 4 raw rows
+
+            aggregated = bench_track._aggregate_shards(raw_records)
+            self.assertEqual(len(aggregated), 2)  # but only 2 logical runs (one per sha)
+            for rec in aggregated:
+                self.assertIn("khive-score/score_ops.mean_ns", rec["metrics"])
+                self.assertIn("khive-hnsw/hnsw_build.mean_ns", rec["metrics"])
+
+            md = bench_track.render_trend_markdown("components", data_dir=data_dir)
+            self.assertIn("runs in window: 2 (of 2 total)", md)
+            self.assertIn("khive-score/score_ops.mean_ns", md)
+            self.assertIn("khive-hnsw/hnsw_build.mean_ns", md)
+
+    def test_aggregate_shards_preserves_chronological_order(self):
+        records = [
+            {"sha": "a" * 40, "metrics": {"x": 1.0}},
+            {"sha": "b" * 40, "metrics": {"y": 2.0}},
+            {"sha": "a" * 40, "metrics": {"z": 3.0}},
+        ]
+        aggregated = bench_track._aggregate_shards(records)
+        self.assertEqual([r["sha"] for r in aggregated], ["a" * 40, "b" * 40])
+        self.assertEqual(aggregated[0]["metrics"], {"x": 1.0, "z": 3.0})
+
+    def test_aggregate_shards_error_status_not_masked_by_later_ok_shard(self):
+        records = [
+            bench_track.build_error_record("components", "a" * 40, "main", "shard 1 build failed"),
+            bench_track.build_record("components", {"khive-hnsw/hnsw_build.mean_ns": 200.0}, "a" * 40, "main"),
+        ]
+        aggregated = bench_track._aggregate_shards(records)
+        self.assertEqual(len(aggregated), 1)
+        self.assertEqual(aggregated[0]["status"], "error")
+        self.assertEqual(aggregated[0]["error"], "shard 1 build failed")
+        self.assertIn("khive-hnsw/hnsw_build.mean_ns", aggregated[0]["metrics"])
 
 
 class CalibrateNoGateTests(unittest.TestCase):
