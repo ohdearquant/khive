@@ -318,9 +318,11 @@ pub(crate) async fn handle_read(
 
     // Merge `read: true` into properties and patch in place via a real
     // `UPDATE` (not `upsert_note`'s `INSERT OR REPLACE`): the latter
-    // silently reassigns the row's `rowid` on a primary-key conflict, which
-    // would let a mark-as-read bump a message's `rowid` past the current
-    // `comm.probe` cursor and resurrect it as "new" on the next poll (#780).
+    // silently deletes and re-inserts the row on a primary-key conflict
+    // (#780). The `comm.probe` cursor is keyed on `notes_seq.seq`, which is
+    // fixed at first insert and survives such churn, so this is defensive
+    // rather than load-bearing; a metadata patch should never rewrite the
+    // row regardless.
     let mut props = note.properties.clone().unwrap_or_else(|| json!({}));
     props["read"] = json!(true);
     let updated_at = Utc::now().timestamp_micros();

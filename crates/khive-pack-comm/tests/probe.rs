@@ -146,7 +146,7 @@ async fn probe_cursor_advances_and_filters_since_us() {
 }
 
 /// Regression for #780: the probe cursor must be keyed on commit order
-/// (SQLite `rowid`), not the application-clock `created_at` stamped before a
+/// (the durable `notes_seq.seq`), not the application-clock `created_at` stamped before a
 /// write acquires the writer critical section. Two concurrent writers can
 /// commit out of stamp order; a `created_at`-keyed cursor then permanently
 /// hides whichever row committed second but stamped an earlier clock read.
@@ -191,9 +191,9 @@ async fn probe_survives_out_of_order_commit_vs_created_at() {
     let second_messages = second["new_messages"].as_array().expect("array");
 
     // Under the OLD created_at-keyed cursor, t_low <= cursor_1 (t_high) would
-    // exclude the loser forever. Under the FIXED rowid-keyed cursor, the
-    // loser's rowid is still greater than cursor_1's, regardless of its
-    // created_at value.
+    // exclude the loser forever. Under the FIXED commit-order cursor
+    // (`notes_seq.seq`), the loser's sequence is still greater than
+    // cursor_1's, regardless of its created_at value.
     assert_eq!(
         second_messages.len(),
         1,
@@ -582,10 +582,11 @@ async fn probe_query_plan_uses_the_to_actor_index() {
 
 /// Regression for #780's paired hazard: `comm.read` must patch a message's
 /// `properties` via a real `UPDATE`, not `upsert_note`'s `INSERT OR REPLACE`
-/// (a SQLite DELETE+INSERT on a primary-key conflict, which reassigns the
-/// row's implicit `rowid`). If `comm.read` churned `rowid`, marking an
-/// already-probed message as read could bump its `rowid` past the current
-/// cursor, resurrecting it as "new" on the next poll.
+/// (a SQLite DELETE+INSERT on a primary-key conflict, which rewrites the
+/// row). The cursor is now keyed on `notes_seq.seq`, which is fixed at first
+/// insert and survives such churn, so this guards the defensive in-place
+/// invariant: marking an already-probed message as read must never make it
+/// resurface as "new" on the next poll.
 #[tokio::test]
 async fn probe_read_does_not_resurrect_message_via_rowid_churn() {
     let (registry, rt) = build_registry();
@@ -593,7 +594,7 @@ async fn probe_read_does_not_resurrect_message_via_rowid_churn() {
 
     let id = plant_inbound_message(&rt, actor, "lambda:khive", 1_000_000, None, false).await;
 
-    // Probe past it: the cursor now covers this message's rowid.
+    // Probe past it: the cursor now covers this message's commit-order key.
     let first = registry
         .dispatch("comm.probe", json!({ "actor": actor }))
         .await

@@ -83,9 +83,11 @@ pub fn note_upsert_statement(note: &Note) -> SqlStatement {
 
 /// The exact `properties`/`updated_at` `UPDATE` this store's
 /// `update_note_properties` issues. A real `UPDATE` never triggers SQLite's
-/// `INSERT OR REPLACE` delete+insert, so the row's `rowid` stays stable
-/// across the call (#780: `comm.read` relies on this to avoid churning the
-/// `rowid`-backed `comm.probe` cursor).
+/// `INSERT OR REPLACE` delete+insert, so the row is patched in place (#780).
+/// The `comm.probe` cursor is keyed on `notes_seq.seq`, which is fixed at
+/// first insert and survives a delete+reinsert of the same note id, so this
+/// is defensive rather than load-bearing for cursor correctness; a metadata
+/// patch should never rewrite the row regardless.
 pub fn note_update_properties_statement(
     id: Uuid,
     properties: &Option<serde_json::Value>,

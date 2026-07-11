@@ -37,7 +37,8 @@ Args:
 Returns:
 
 - `cursor_us`: an opaque, monotonically increasing token (currently backed
-  by SQLite `rowid`), or `0` if no inbound messages exist for the actor.
+  by the durable `notes_seq.seq` commit-order sequence), or `0` if no
+  inbound messages exist for the actor.
   Round-trip it as the next call's `since_us`; do not treat it as a
   timestamp or compute elapsed time from it (#780).
 - `new_messages` — up to 100 newest matching rows, each `{id, created_at_us,
