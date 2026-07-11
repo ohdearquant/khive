@@ -144,7 +144,7 @@ async fn append_event_writes_observations_atomically() {
     let candidate = Uuid::new_v4();
     let selected = Uuid::new_v4();
     let mut event = make_event("default");
-    event.kind = EventKind::RerankExecuted;
+    event.kind = EventKind::SearchExecuted;
     event.payload = json!({
         "candidates": [candidate.to_string()],
         "selected": [selected.to_string()],
@@ -212,11 +212,11 @@ async fn selected_uuids_for(store: &SqlEventStore, event_id: Uuid) -> Vec<String
 async fn rerank_executed_falls_back_to_reranked_when_final_scores_field_is_absent() {
     // Regression test (round-1 codex review of #831, Finding 2): legacy
     // events emitted before `final_scores` existed carry only `reranked`.
-    // The decoder must still fall through from the absent `selected` field,
-    // through the absent `final_scores` field, to the tuple-shaped
-    // `reranked` field instead of silently projecting zero `selected` rows.
-    // Constructed via a hand-rolled `json!` (not the typed struct) so the
-    // `final_scores` key is genuinely absent, not present-and-empty.
+    // The decoder must still fall through from the absent `final_scores`
+    // field to the tuple-shaped `reranked` field instead of silently
+    // projecting zero `selected` rows. Constructed via a hand-rolled
+    // `json!` (not the typed struct) so the `final_scores` key is
+    // genuinely absent, not present-and-empty.
     let store = setup_memory_store();
     let candidate = Uuid::new_v4();
     let reranked_winner = Uuid::new_v4();
@@ -290,6 +290,62 @@ async fn rerank_executed_prefers_final_scores_order_over_reranked_when_both_pres
         selected,
         vec![a.to_string(), b.to_string()],
         "selected order must follow `final_scores`, not `reranked`"
+    );
+}
+
+#[tokio::test]
+async fn rerank_executed_ignores_stray_selected_field_and_uses_final_scores() {
+    // Regression test (round-3 codex review of #831, Major finding):
+    // `RerankExecutedPayload` (khive_types::event::RerankExecutedPayload)
+    // has no `selected` field at all. The serde helper does not deny
+    // unknown fields, so a payload carrying the typed fields plus a stray
+    // `selected` key must still be projected from `final_scores` only —
+    // the stray field must never be consulted, even when its order
+    // differs completely from `final_scores`.
+    let store = setup_memory_store();
+    let a = Uuid::new_v4();
+    let b = Uuid::new_v4();
+    let stray_selected_winner = Uuid::new_v4();
+
+    let payload = khive_types::RerankExecutedPayload {
+        served_by_profile_id: Some("profile-a".to_string()),
+        model_id: khive_types::Id128::from_u128(1),
+        candidates: vec![
+            khive_types::Id128::from_bytes(*a.as_bytes()),
+            khive_types::Id128::from_bytes(*b.as_bytes()),
+        ],
+        reranked: vec![],
+        // authoritative ordered output: a before b
+        final_scores: vec![
+            (khive_types::Id128::from_bytes(*a.as_bytes()), 0.9),
+            (khive_types::Id128::from_bytes(*b.as_bytes()), 0.4),
+        ],
+        latency_us: 1200,
+        hook_applied: false,
+        hook_target_match: false,
+    };
+
+    let mut event = make_event("default");
+    event.kind = EventKind::RerankExecuted;
+    let mut payload_value = serde_json::to_value(&payload).unwrap();
+    // Inject a stray `selected` field with an entirely different order
+    // than `final_scores` — this field is not part of the typed contract
+    // and must not affect projection.
+    payload_value.as_object_mut().unwrap().insert(
+        "selected".to_string(),
+        json!([stray_selected_winner.to_string()]),
+    );
+    event.payload = payload_value;
+    let event_id = event.id;
+
+    store.append_event(event).await.unwrap();
+
+    let selected = selected_uuids_for(&store, event_id).await;
+    assert_eq!(
+        selected,
+        vec![a.to_string(), b.to_string()],
+        "stray `selected` field must be ignored for RerankExecuted; \
+         projection must follow `final_scores` only"
     );
 }
 
@@ -589,7 +645,7 @@ async fn query_events_filters_by_observed() {
     let store = setup_memory_store();
     let entity_id = Uuid::new_v4();
     let mut event = make_event("default");
-    event.kind = EventKind::RerankExecuted;
+    event.kind = EventKind::SearchExecuted;
     event.payload = json!({
         "candidates": [entity_id.to_string()],
         "selected": []
@@ -619,7 +675,7 @@ async fn query_events_filters_by_selected() {
     let store = setup_memory_store();
     let entity_id = Uuid::new_v4();
     let mut event = make_event("default");
-    event.kind = EventKind::RerankExecuted;
+    event.kind = EventKind::SearchExecuted;
     event.payload = json!({
         "candidates": [],
         "selected": [entity_id.to_string()]

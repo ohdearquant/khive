@@ -437,8 +437,8 @@ pub async fn append_event_on_writer(
 
 fn decode_event_observations(event: &Event) -> Result<Vec<EventObservation>, rusqlite::Error> {
     match event.kind {
-        EventKind::RerankExecuted => decode_rank_observations(event),
-        EventKind::RecallExecuted | EventKind::SearchExecuted => decode_rank_observations(event),
+        EventKind::RerankExecuted => decode_rerank_observations(event),
+        EventKind::RecallExecuted | EventKind::SearchExecuted => decode_recall_observations(event),
         EventKind::LinkCreated => decode_link_observations(event),
         EventKind::EntityCreated
         | EventKind::EntityUpdated
@@ -458,8 +458,8 @@ fn payload_uuid_array(event: &Event, field: &'static str) -> Result<Vec<Uuid>, r
 
 /// Like [`payload_uuid_array`], but distinguishes an absent `field` (`Ok(None)`)
 /// from a present-but-malformed one (`Err`). Callers that fall back across a
-/// chain of alternative field names (e.g. `decode_rank_observations`'s
-/// `selected`/`reranked`/`final_scores`) need that distinction: collapsing
+/// chain of alternative field names (e.g. `decode_rerank_observations`'s
+/// `final_scores`/`reranked`) need that distinction: collapsing
 /// "missing" into `Ok(vec![])` makes every later field in the chain
 /// unreachable, since `Result::or_else` only fires on `Err`.
 fn payload_uuid_array_opt(
@@ -552,7 +552,7 @@ fn payload_uuid(event: &Event, field: &'static str) -> Result<Option<Uuid>, rusq
         .map_err(|e| invalid_payload(event.kind, field, e))
 }
 
-fn decode_rank_observations(event: &Event) -> Result<Vec<EventObservation>, rusqlite::Error> {
+fn decode_candidate_observations(event: &Event) -> Result<Vec<EventObservation>, rusqlite::Error> {
     let mut rows = Vec::new();
 
     for (position, entity_id) in payload_uuid_array(event, "candidates")?
@@ -575,20 +575,14 @@ fn decode_rank_observations(event: &Event) -> Result<Vec<EventObservation>, rusq
         });
     }
 
-    // `selected` is the flat untyped convenience shape; `final_scores` and
-    // `reranked` are `RerankExecutedPayload`'s actual typed fields,
-    // serialized as `[uuid, ..]` tuples, not flat UUID strings. Per
-    // ADR-042 §5, `final_scores` is the ordered rerank output (positions
-    // match output order); `reranked` is per-reranker audit/debug data
-    // with no ordering guarantee, so it is only a legacy fallback when
-    // `final_scores` is absent. Each is tried in turn only when the
-    // previous field is absent (`None`) — a present-but-malformed field
-    // errors immediately instead of masking the problem by falling
-    // through to the next candidate.
-    let selected = payload_uuid_array_opt(event, "selected")?
-        .or(payload_final_scores_uuid_array_opt(event, "final_scores")?)
-        .or(payload_reranked_uuid_array_opt(event, "reranked")?)
-        .unwrap_or_default();
+    Ok(rows)
+}
+
+fn push_selected_observations(
+    event: &Event,
+    selected: Vec<Uuid>,
+    rows: &mut Vec<EventObservation>,
+) -> Result<(), rusqlite::Error> {
     for (position, entity_id) in selected.into_iter().enumerate() {
         let position_u32 = u32::try_from(position).map_err(|_| {
             invalid_payload(
@@ -605,6 +599,34 @@ fn decode_rank_observations(event: &Event) -> Result<Vec<EventObservation>, rusq
             position: position_u32,
         });
     }
+    Ok(())
+}
+
+/// `RecallExecuted`/`SearchExecuted` payloads carry a flat `selected: Vec<Uuid>`
+/// field (ADR-041 §"Projection rules") — that is their entire typed selected
+/// contract, so it is the only field consulted here.
+fn decode_recall_observations(event: &Event) -> Result<Vec<EventObservation>, rusqlite::Error> {
+    let mut rows = decode_candidate_observations(event)?;
+    let selected = payload_uuid_array_opt(event, "selected")?.unwrap_or_default();
+    push_selected_observations(event, selected, &mut rows)?;
+    Ok(rows)
+}
+
+/// `RerankExecutedPayload` (`khive_types::event::RerankExecutedPayload`) has no
+/// `selected` field at all — a stray `selected` key in the raw payload is not
+/// part of its typed contract and must never be consulted. Per ADR-042 §5,
+/// `final_scores` is the ordered rerank output (positions match output
+/// order); `reranked` is per-reranker audit/debug data with no ordering
+/// guarantee, so it is only a legacy fallback for events emitted before
+/// `final_scores` existed. `reranked` is tried only when `final_scores` is
+/// absent (`None`) — a present-but-malformed `final_scores` errors
+/// immediately instead of masking the problem by falling through.
+fn decode_rerank_observations(event: &Event) -> Result<Vec<EventObservation>, rusqlite::Error> {
+    let mut rows = decode_candidate_observations(event)?;
+    let selected = payload_final_scores_uuid_array_opt(event, "final_scores")?
+        .or(payload_reranked_uuid_array_opt(event, "reranked")?)
+        .unwrap_or_default();
+    push_selected_observations(event, selected, &mut rows)?;
 
     Ok(rows)
 }
