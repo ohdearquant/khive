@@ -3,9 +3,53 @@
 use std::fmt;
 
 use thiserror::Error;
+use uuid::Uuid;
 
 /// Convenience alias for `Result<T, RuntimeError>`.
 pub type RuntimeResult<T> = Result<T, RuntimeError>;
+
+/// A guarded edge write (`link`/`link_many`) was refused because one or both
+/// endpoints no longer existed at write time (#769). Names the exact
+/// endpoint(s) missing instead of a generic "source or target" message, and,
+/// for a batch write, which entry in the batch failed first.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GuardedWriteFailure {
+    /// Index of the failing entry within a `link_many` batch. `None` for the
+    /// singleton `link` path, which has no batch to index into.
+    pub entry_index: Option<usize>,
+    /// The source endpoint id, present only when it is the (or one of the)
+    /// missing endpoint(s).
+    pub missing_source: Option<Uuid>,
+    /// The target endpoint id, present only when it is the (or one of the)
+    /// missing endpoint(s).
+    pub missing_target: Option<Uuid>,
+}
+
+impl fmt::Display for GuardedWriteFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut missing = Vec::new();
+        if let Some(source) = self.missing_source {
+            missing.push(format!("source {source}"));
+        }
+        if let Some(target) = self.missing_target {
+            missing.push(format!("target {target}"));
+        }
+        let missing = if missing.is_empty() {
+            "endpoint(s)".to_string()
+        } else {
+            missing.join(" and ")
+        };
+        match self.entry_index {
+            Some(index) => write!(
+                f,
+                "batch entry {index}: {missing} no longer exist at write time"
+            ),
+            None => write!(f, "{missing} no longer exist at write time"),
+        }
+    }
+}
+
+impl std::error::Error for GuardedWriteFailure {}
 
 /// A single missing pack dependency.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -98,6 +142,9 @@ pub enum RuntimeError {
 
     #[error("internal: {0}")]
     Internal(String),
+
+    #[error("guarded edge write refused: {0}")]
+    GuardedWriteFailed(GuardedWriteFailure),
 
     #[error("missing pack dependency: {0}")]
     MissingPackDependency(MissingPackDependency),

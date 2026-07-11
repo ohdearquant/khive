@@ -4,6 +4,8 @@ use async_trait::async_trait;
 use khive_types::EdgeRelation;
 use uuid::Uuid;
 
+use crate::capability::StorageCapability;
+use crate::error::StorageError;
 use crate::types::{
     BatchWriteSummary, DeleteMode, DirectedNeighborHit, Direction, Edge, EdgeFilter, EdgeSeekPage,
     EdgeSortField, GraphPath, LinkId, NeighborHit, NeighborQuery, Page, PageRequest, SortOrder,
@@ -25,11 +27,31 @@ pub trait GraphStore: Send + Sync + 'static {
     /// otherwise leave a durably dangling edge (#769). Returns `false`
     /// (nothing written) when either endpoint is gone at write time, `true`
     /// when the edge was inserted or updated.
-    async fn upsert_edge_guarded(&self, edge: Edge) -> StorageResult<bool>;
+    ///
+    /// Default returns `StorageError::Unsupported`: a backend that does not
+    /// override this method cannot honor the endpoint-existence guarantee,
+    /// and silently falling back to [`GraphStore::upsert_edge`] would
+    /// reintroduce the TOCTOU window this method exists to close.
+    async fn upsert_edge_guarded(&self, _edge: Edge) -> StorageResult<bool> {
+        Err(StorageError::Unsupported {
+            capability: StorageCapability::Graph,
+            operation: "upsert_edge_guarded".into(),
+            message: "this backend does not implement guarded edge writes".into(),
+        })
+    }
     /// Batch form of [`GraphStore::upsert_edge_guarded`]. All-or-nothing:
     /// if any edge's endpoints are missing at write time, no edge from the
     /// batch is persisted and `BatchWriteSummary::affected` is `0`.
-    async fn upsert_edges_guarded(&self, edges: Vec<Edge>) -> StorageResult<BatchWriteSummary>;
+    ///
+    /// Default returns `StorageError::Unsupported`, for the same reason as
+    /// [`GraphStore::upsert_edge_guarded`]'s default.
+    async fn upsert_edges_guarded(&self, _edges: Vec<Edge>) -> StorageResult<BatchWriteSummary> {
+        Err(StorageError::Unsupported {
+            capability: StorageCapability::Graph,
+            operation: "upsert_edges_guarded".into(),
+            message: "this backend does not implement guarded edge writes".into(),
+        })
+    }
     /// Fetch an edge by link ID, returning `None` if absent. Filters soft-deleted rows.
     async fn get_edge(&self, id: LinkId) -> StorageResult<Option<Edge>>;
     /// Fetch an edge by link ID including soft-deleted rows. Used by the runtime hard-delete path

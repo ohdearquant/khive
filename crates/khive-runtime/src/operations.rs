@@ -24,11 +24,16 @@ use khive_storage::types::{
 use khive_storage::{Edge, EdgeRelation, Entity, EntityFilter, Event, EventFilter};
 use khive_types::{EdgeEndpointRule, EndpointKind, EventKind, SubstrateKind};
 
+use khive_db::stores::entity::entity_hard_delete_statement;
+use khive_db::stores::graph::{edge_hard_delete_statement, purge_incident_edges_statement};
+use khive_db::stores::note::note_hard_delete_statement;
 use khive_db::SqliteError;
 use rusqlite::OptionalExtension;
 
+use crate::atomic_plan::{AffectedRowGuard, DeletePlan, PlanStatement, PostCommitEffect};
+use crate::atomic_runner::{run_atomic_unit, AtomicOpFailure, AtomicOpPlan, AtomicRunOutcome};
 use crate::curation::{entity_fts_document, note_fts_document};
-use crate::error::{RuntimeError, RuntimeResult};
+use crate::error::{GuardedWriteFailure, RuntimeError, RuntimeResult};
 use crate::runtime::{KhiveRuntime, NamespaceToken};
 
 // Test-only failure injection for `create_note_inner`.
@@ -1720,9 +1725,22 @@ impl KhiveRuntime {
         // read above — a concurrent hard-delete landing between that read and
         // this write can no longer create a durably dangling edge.
         if !self.graph(token)?.upsert_edge_guarded(edge).await? {
-            return Err(RuntimeError::NotFound(format!(
-                "link source {source_id} or target {target_id} no longer exists at write time"
-            )));
+            // Re-probe each endpoint individually (read-only, best-effort) so
+            // the error names exactly which one vanished instead of a generic
+            // "source or target" message (codex REJECT Medium 3).
+            let missing_source = self
+                .resolve_edge_endpoint(token, source_id)
+                .await?
+                .is_none();
+            let missing_target = self
+                .resolve_edge_endpoint(token, target_id)
+                .await?
+                .is_none();
+            return Err(RuntimeError::GuardedWriteFailed(GuardedWriteFailure {
+                entry_index: None,
+                missing_source: missing_source.then_some(source_id),
+                missing_target: missing_target.then_some(target_id),
+            }));
         }
 
         // H1 fix: read back the persisted row by natural key so the returned
@@ -3497,6 +3515,68 @@ impl KhiveRuntime {
         Ok(None)
     }
 
+    /// Hard-delete a single graph node (entity, note, or edge-as-node row)
+    /// AND purge its incident edges in ONE write transaction.
+    ///
+    /// #768/#769: the endpoint row delete and the incident-edge cascade used
+    /// to run as two independently-committing storage calls. A concurrent
+    /// guarded write (`upsert_edge_guarded`/`upsert_edges_guarded`) landing
+    /// between them could see the endpoint still live, insert a fresh edge
+    /// against it, and then survive the cascade that already ran — a
+    /// durably dangling edge with no second purge. Routing both statements
+    /// through one [`run_atomic_unit`] call closes the window: since every
+    /// write (this one and the guarded insert) funnels through the same
+    /// single-writer queue, a concurrent guarded write either fully commits
+    /// before this unit starts (and its edge is then swept by the purge
+    /// below, in the same transaction as the row delete) or fully commits
+    /// after this unit has already committed (and its own endpoint-existence
+    /// check then sees the endpoint gone and refuses the write) — there is
+    /// no state in which it can observe the endpoint alive with edges
+    /// already purged.
+    ///
+    /// `row_statement` is the exact hard-delete `DELETE` for the target row
+    /// (entity, note, or edge). Returns `Ok(true)` if the row was deleted,
+    /// `Ok(false)` if it no longer existed (lost a race with a concurrent
+    /// delete of the same row) — never an error for that case, matching the
+    /// non-atomic bool-returning shape callers had before this fix.
+    async fn atomic_hard_delete_with_edge_purge(
+        &self,
+        row_statement: SqlStatement,
+        node_id: Uuid,
+    ) -> RuntimeResult<bool> {
+        let plan = AtomicOpPlan::Delete(DeletePlan {
+            target_id: node_id,
+            statements: vec![
+                PlanStatement {
+                    statement: row_statement,
+                    guard: Some(AffectedRowGuard::exactly(1)),
+                },
+                PlanStatement {
+                    statement: purge_incident_edges_statement(node_id),
+                    guard: None,
+                },
+            ],
+            post_commit: PostCommitEffect::None,
+        });
+        match run_atomic_unit(self.sql().as_ref(), vec![plan]).await {
+            Ok(AtomicRunOutcome::Committed { .. }) => Ok(true),
+            Ok(AtomicRunOutcome::RolledBack {
+                failure: AtomicOpFailure::GuardFailed { .. },
+                ..
+            }) => Ok(false),
+            Ok(AtomicRunOutcome::RolledBack {
+                failure: AtomicOpFailure::SqlError { message, .. },
+                ..
+            }) => Err(RuntimeError::Internal(format!(
+                "hard delete + edge purge for {node_id} failed: {message}"
+            ))),
+            Err(e) => Err(RuntimeError::Internal(format!(
+                "hard delete + edge purge for {node_id}: atomic unit seam failure: {}",
+                e.0
+            ))),
+        }
+    }
+
     /// Delete a note by ID, enforcing namespace isolation.
     ///
     /// On hard delete, cascades to remove all incident edges (both inbound and
@@ -3541,12 +3621,14 @@ impl KhiveRuntime {
         );
         let record_ns = note.namespace.clone();
 
-        // On hard delete, cascade-remove all incident edges (including soft-deleted) and clean up
-        // indexes. Uses purge_incident_edges so that already-soft-deleted edges are also removed,
-        // preventing dangling graph_edges rows (ADR-002 no-dangling-references).
-        if hard {
-            let graph = self.graph(&record_tok)?;
-            graph.purge_incident_edges(id).await?;
+        // On hard delete, the row delete and the incident-edge cascade (including
+        // already-soft-deleted edges) run as ONE write transaction (#768/#769) —
+        // see `atomic_hard_delete_with_edge_purge`. Index cleanup follows the
+        // commit; it is best-effort and idempotent, unlike the row/edge pair.
+        let deleted = if hard {
+            let deleted = self
+                .atomic_hard_delete_with_edge_purge(note_hard_delete_statement(id), id)
+                .await?;
             self.text_for_notes(&record_tok)?
                 .delete_document(&record_ns, id)
                 .await?;
@@ -3558,19 +3640,21 @@ impl KhiveRuntime {
                     .delete(id)
                     .await?;
             }
-        }
-
-        let deleted = note_store.delete_note(id, mode).await?;
-        if !hard && deleted {
-            self.text_for_notes(&record_tok)?
-                .delete_document(&record_ns, id)
-                .await?;
-            for model_name in self.registered_embedding_model_names() {
-                self.vectors_for_model(&record_tok, &model_name)?
-                    .delete(id)
+            deleted
+        } else {
+            let deleted = note_store.delete_note(id, mode).await?;
+            if deleted {
+                self.text_for_notes(&record_tok)?
+                    .delete_document(&record_ns, id)
                     .await?;
+                for model_name in self.registered_embedding_model_names() {
+                    self.vectors_for_model(&record_tok, &model_name)?
+                        .delete(id)
+                        .await?;
+                }
             }
-        }
+            deleted
+        };
         if deleted {
             let event_store = self.events(token)?;
             let event = khive_storage::event::Event::new(
@@ -3807,19 +3891,23 @@ impl KhiveRuntime {
                 .map_err(|e| RuntimeError::Internal(format!("entity namespace invalid: {e}")))?,
         );
 
-        // On hard delete, cascade-remove all incident edges (including soft-deleted) to prevent
-        // dangling refs. Uses purge_incident_edges so that already-soft-deleted edges are also
-        // removed (ADR-002 no-dangling-references).
-        if hard {
-            let graph = self.graph(&record_tok)?;
-            graph.purge_incident_edges(id).await?;
+        // On hard delete, the row delete and the incident-edge cascade (including
+        // already-soft-deleted edges) run as ONE write transaction (#768/#769) —
+        // see `atomic_hard_delete_with_edge_purge`. Index cleanup follows the
+        // commit; it is best-effort and idempotent, unlike the row/edge pair.
+        let deleted = if hard {
+            let deleted = self
+                .atomic_hard_delete_with_edge_purge(entity_hard_delete_statement(id), id)
+                .await?;
             self.remove_from_indexes(&record_tok, id).await?;
-        }
-
-        let deleted = self.entities(token)?.delete_entity(id, mode).await?;
-        if !hard && deleted {
-            self.remove_from_indexes(&record_tok, id).await?;
-        }
+            deleted
+        } else {
+            let deleted = self.entities(token)?.delete_entity(id, mode).await?;
+            if deleted {
+                self.remove_from_indexes(&record_tok, id).await?;
+            }
+            deleted
+        };
         if deleted {
             let event_store = self.events(token)?;
             let ns = entity.namespace.clone();
@@ -4439,14 +4527,17 @@ impl KhiveRuntime {
         let graph = self.graph(&record_tok)?;
 
         // Cascade: on hard delete, remove ALL annotates edges targeting this edge — including
-        // already-soft-deleted ones — to prevent dangling graph_edges rows (ADR-002).
+        // already-soft-deleted ones — to prevent dangling graph_edges rows (ADR-002). The row
+        // delete and the cascade purge run as ONE write transaction (#768/#769) — see
+        // `atomic_hard_delete_with_edge_purge`.
         // On soft delete the cascade is skipped (data-vs-view principle: soft-deleting the base
         // edge does not cascade to annotation edges; only a hard purge cleans up incident rows).
-        if hard {
-            graph.purge_incident_edges(edge_id).await?;
-        }
-
-        let deleted = graph.delete_edge(LinkId::from(edge_id), mode).await?;
+        let deleted = if hard {
+            self.atomic_hard_delete_with_edge_purge(edge_hard_delete_statement(edge_id), edge_id)
+                .await?
+        } else {
+            graph.delete_edge(LinkId::from(edge_id), mode).await?
+        };
         if deleted {
             // Audit event: use the record's namespace (record_ns), not the caller's namespace.
             let event_store = self.events(&record_tok)?;
@@ -4576,9 +4667,35 @@ impl KhiveRuntime {
             .upsert_edges_guarded(edges.clone())
             .await?;
         if summary.affected != edges.len() as u64 {
-            return Err(RuntimeError::NotFound(
-                "link_many: one or more edge endpoints no longer exist at write time".to_string(),
-            ));
+            // Re-probe each entry in batch order (read-only, best-effort) to find
+            // the first one with a missing endpoint and report its index — the
+            // storage-layer summary only carries a free-text `first_error`, not
+            // a structured endpoint/index pair (codex REJECT Medium 3).
+            for (index, edge) in edges.iter().enumerate() {
+                let missing_source = self
+                    .resolve_edge_endpoint(token, edge.source_id)
+                    .await?
+                    .is_none();
+                let missing_target = self
+                    .resolve_edge_endpoint(token, edge.target_id)
+                    .await?
+                    .is_none();
+                if missing_source || missing_target {
+                    return Err(RuntimeError::GuardedWriteFailed(GuardedWriteFailure {
+                        entry_index: Some(index),
+                        missing_source: missing_source.then_some(edge.source_id),
+                        missing_target: missing_target.then_some(edge.target_id),
+                    }));
+                }
+            }
+            // Every endpoint re-checked as present (e.g. deleted then
+            // recreated after the guarded write ran) — fall back to the
+            // storage layer's own diagnostic instead of claiming a phantom
+            // failing entry.
+            return Err(RuntimeError::NotFound(format!(
+                "link_many: one or more edge endpoints no longer exist at write time: {}",
+                summary.first_error
+            )));
         }
 
         // H1-bulk fix: read back each persisted edge by natural key so callers
@@ -7134,6 +7251,300 @@ mod tests {
             "link_many's guarded batch must be all-or-nothing: the live A-B edge \
              must not have been persisted alongside the doomed A-X edge"
         );
+    }
+
+    // ---- #768/#769: hard-delete row + incident-edge purge is ONE transaction ----
+    //
+    // Six tests below cover both orderings (write-then-delete, and a
+    // concurrent write raced against delete via `tokio::join!`) across all
+    // three hard-delete paths that cascade-purge incident edges: entity,
+    // note, and edge-as-node. No sleeps — the "concurrent" tests assert an
+    // invariant that must hold for EITHER interleaving the async scheduler
+    // picks, rather than forcing one specific interleaving, so they are
+    // deterministic (never flaky) without a barrier.
+
+    fn raw_edge(source_id: Uuid, target_id: Uuid, ns: &str) -> Edge {
+        let now = chrono::Utc::now();
+        Edge {
+            id: LinkId::from(Uuid::new_v4()),
+            namespace: ns.to_string(),
+            source_id,
+            target_id,
+            relation: EdgeRelation::Extends,
+            weight: 1.0,
+            created_at: now,
+            updated_at: now,
+            deleted_at: None,
+            metadata: None,
+            target_backend: None,
+        }
+    }
+
+    async fn assert_no_edges_touch(rt: &KhiveRuntime, tok: &NamespaceToken, node_id: Uuid) {
+        let as_source = rt
+            .list_edges(
+                tok,
+                crate::curation::EdgeListFilter {
+                    source_id: Some(node_id),
+                    ..Default::default()
+                },
+                10,
+                0,
+            )
+            .await
+            .unwrap();
+        let as_target = rt
+            .list_edges(
+                tok,
+                crate::curation::EdgeListFilter {
+                    target_id: Some(node_id),
+                    ..Default::default()
+                },
+                10,
+                0,
+            )
+            .await
+            .unwrap();
+        assert!(
+            as_source.is_empty() && as_target.is_empty(),
+            "no edge may reference hard-deleted node {node_id}: source-side={as_source:?} \
+             target-side={as_target:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn hard_delete_entity_purges_edge_written_before_delete() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+        let a = rt
+            .create_entity(&tok, "concept", None, "A", None, None, vec![])
+            .await
+            .unwrap();
+        let x = rt
+            .create_entity(&tok, "concept", None, "X", None, None, vec![])
+            .await
+            .unwrap();
+
+        let edge = raw_edge(a.id, x.id, tok.namespace().as_str());
+        assert!(rt
+            .graph(&tok)
+            .unwrap()
+            .upsert_edge_guarded(edge)
+            .await
+            .unwrap());
+
+        assert!(rt.delete_entity(&tok, x.id, true).await.unwrap());
+        assert_no_edges_touch(&rt, &tok, x.id).await;
+    }
+
+    #[tokio::test]
+    async fn hard_delete_entity_concurrent_with_guarded_write_never_leaves_dangling_edge() {
+        let rt = std::sync::Arc::new(rt());
+        let tok = NamespaceToken::local();
+        let a = rt
+            .create_entity(&tok, "concept", None, "A", None, None, vec![])
+            .await
+            .unwrap();
+        let x = rt
+            .create_entity(&tok, "concept", None, "X", None, None, vec![])
+            .await
+            .unwrap();
+
+        let delete_rt = std::sync::Arc::clone(&rt);
+        let delete_tok = tok.clone();
+        let delete_task =
+            tokio::spawn(async move { delete_rt.delete_entity(&delete_tok, x.id, true).await });
+
+        let write_rt = std::sync::Arc::clone(&rt);
+        let write_tok = tok.clone();
+        let ns = tok.namespace().as_str().to_string();
+        let write_task = tokio::spawn(async move {
+            let edge = raw_edge(a.id, x.id, &ns);
+            write_rt
+                .graph(&write_tok)
+                .unwrap()
+                .upsert_edge_guarded(edge)
+                .await
+        });
+
+        let (deleted, _written) = tokio::join!(delete_task, write_task);
+        deleted.unwrap().unwrap();
+        assert_no_edges_touch(&rt, &tok, x.id).await;
+    }
+
+    #[tokio::test]
+    async fn hard_delete_note_purges_edge_written_before_delete() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+        let a = rt
+            .create_entity(&tok, "concept", None, "A", None, None, vec![])
+            .await
+            .unwrap();
+        let n = rt
+            .create_note(
+                &tok,
+                "observation",
+                None,
+                "note content",
+                None,
+                None,
+                vec![],
+            )
+            .await
+            .unwrap();
+
+        let edge = raw_edge(a.id, n.id, tok.namespace().as_str());
+        assert!(rt
+            .graph(&tok)
+            .unwrap()
+            .upsert_edge_guarded(edge)
+            .await
+            .unwrap());
+
+        assert!(rt.delete_note(&tok, n.id, true).await.unwrap());
+        assert_no_edges_touch(&rt, &tok, n.id).await;
+    }
+
+    #[tokio::test]
+    async fn hard_delete_note_concurrent_with_guarded_write_never_leaves_dangling_edge() {
+        let rt = std::sync::Arc::new(rt());
+        let tok = NamespaceToken::local();
+        let a = rt
+            .create_entity(&tok, "concept", None, "A", None, None, vec![])
+            .await
+            .unwrap();
+        let n = rt
+            .create_note(
+                &tok,
+                "observation",
+                None,
+                "note content",
+                None,
+                None,
+                vec![],
+            )
+            .await
+            .unwrap();
+
+        let delete_rt = std::sync::Arc::clone(&rt);
+        let delete_tok = tok.clone();
+        let note_id = n.id;
+        let delete_task =
+            tokio::spawn(async move { delete_rt.delete_note(&delete_tok, note_id, true).await });
+
+        let write_rt = std::sync::Arc::clone(&rt);
+        let write_tok = tok.clone();
+        let ns = tok.namespace().as_str().to_string();
+        let write_task = tokio::spawn(async move {
+            let edge = raw_edge(a.id, note_id, &ns);
+            write_rt
+                .graph(&write_tok)
+                .unwrap()
+                .upsert_edge_guarded(edge)
+                .await
+        });
+
+        let (deleted, _written) = tokio::join!(delete_task, write_task);
+        deleted.unwrap().unwrap();
+        assert_no_edges_touch(&rt, &tok, note_id).await;
+    }
+
+    #[tokio::test]
+    async fn hard_delete_edge_endpoint_purges_annotating_edge_written_before_delete() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+        let a = rt
+            .create_entity(&tok, "concept", None, "A", None, None, vec![])
+            .await
+            .unwrap();
+        let b = rt
+            .create_entity(&tok, "concept", None, "B", None, None, vec![])
+            .await
+            .unwrap();
+        let n = rt
+            .create_note(
+                &tok,
+                "observation",
+                None,
+                "note content",
+                None,
+                None,
+                vec![],
+            )
+            .await
+            .unwrap();
+        let base_edge = rt
+            .link(&tok, a.id, b.id, EdgeRelation::Extends, 0.8, None)
+            .await
+            .unwrap();
+        let base_edge_id = Uuid::from(base_edge.id);
+
+        // An edge whose TARGET is another edge — the "edge-as-node" case
+        // `delete_edge`'s cascade must sweep.
+        let annotating = raw_edge(n.id, base_edge_id, tok.namespace().as_str());
+        assert!(rt
+            .graph(&tok)
+            .unwrap()
+            .upsert_edge_guarded(annotating)
+            .await
+            .unwrap());
+
+        assert!(rt.delete_edge(&tok, base_edge_id, true).await.unwrap());
+        assert_no_edges_touch(&rt, &tok, base_edge_id).await;
+    }
+
+    #[tokio::test]
+    async fn hard_delete_edge_endpoint_concurrent_with_guarded_write_never_leaves_dangling_edge() {
+        let rt = std::sync::Arc::new(rt());
+        let tok = NamespaceToken::local();
+        let a = rt
+            .create_entity(&tok, "concept", None, "A", None, None, vec![])
+            .await
+            .unwrap();
+        let b = rt
+            .create_entity(&tok, "concept", None, "B", None, None, vec![])
+            .await
+            .unwrap();
+        let n = rt
+            .create_note(
+                &tok,
+                "observation",
+                None,
+                "note content",
+                None,
+                None,
+                vec![],
+            )
+            .await
+            .unwrap();
+        let base_edge = rt
+            .link(&tok, a.id, b.id, EdgeRelation::Extends, 0.8, None)
+            .await
+            .unwrap();
+        let base_edge_id = Uuid::from(base_edge.id);
+
+        let delete_rt = std::sync::Arc::clone(&rt);
+        let delete_tok = tok.clone();
+        let delete_task =
+            tokio::spawn(
+                async move { delete_rt.delete_edge(&delete_tok, base_edge_id, true).await },
+            );
+
+        let write_rt = std::sync::Arc::clone(&rt);
+        let write_tok = tok.clone();
+        let ns = tok.namespace().as_str().to_string();
+        let write_task = tokio::spawn(async move {
+            let edge = raw_edge(n.id, base_edge_id, &ns);
+            write_rt
+                .graph(&write_tok)
+                .unwrap()
+                .upsert_edge_guarded(edge)
+                .await
+        });
+
+        let (deleted, _written) = tokio::join!(delete_task, write_task);
+        deleted.unwrap().unwrap();
+        assert_no_edges_touch(&rt, &tok, base_edge_id).await;
     }
 
     #[tokio::test]
