@@ -2114,6 +2114,71 @@ async fn link_by_name_with_percent_resolves_exactly() {
     );
 }
 
+/// Regression for a round-1 gap on #818/#834: the two tests above prove
+/// escaping keeps wildcard decoys out of the WHERE clause entirely, so they
+/// pass even without exact-match-first ordering. This test isolates that
+/// ordering through the real `link`-by-name verb path: every decoy genuinely
+/// matches the name-prefix "Base" (no wildcard characters, so escaping plays
+/// no role) and is created after the exact match, filling the 100-row
+/// resolution page with newer rows. It fails if the `ORDER BY CASE` in
+/// `query_entities` were removed, even though the WHERE clause and escaping
+/// remain correct.
+#[tokio::test]
+async fn link_by_name_exact_match_wins_over_many_prefix_matching_decoys() {
+    let rt = KhiveRuntime::memory().expect("in-memory runtime must succeed");
+    let token = rt.authorize(Namespace::local()).expect("authorize local");
+    let mut builder = VerbRegistryBuilder::new();
+    builder.register(KgPack::new(rt.clone()));
+    let f = Fixture {
+        registry: builder.build().expect("registry builds"),
+    };
+
+    // The exact-match entity is created first (oldest by created_at).
+    rt.create_entity(&token, "concept", None, "Base", None, None, vec![])
+        .await
+        .expect("create 'Base' must succeed");
+
+    // 150 decoys that genuinely match the name-prefix "Base" (no wildcard
+    // chars), created after "Base", seeded directly through the runtime to
+    // skip dispatch overhead.
+    for i in 0..150 {
+        rt.create_entity(
+            &token,
+            "concept",
+            None,
+            &format!("Base-{i:03}"),
+            None,
+            None,
+            vec![],
+        )
+        .await
+        .expect("create decoy must succeed");
+    }
+
+    f.dispatch(
+        "create",
+        json!({"kind": "entity", "name": "TargetEntity", "entity_kind": "concept"}),
+    )
+    .await
+    .expect("create TargetEntity must succeed");
+
+    let result = f
+        .dispatch(
+            "link",
+            json!({
+                "source_id": "Base",
+                "target_id": "TargetEntity",
+                "relation": "extends"
+            }),
+        )
+        .await;
+    assert!(
+        result.is_ok(),
+        "link by exact name 'Base' must resolve despite 150 newer, genuinely prefix-matching \
+         decoys filling the resolution page; got: {result:?}"
+    );
+}
+
 #[tokio::test]
 async fn list_event_kind_returns_array() {
     let pack = pack_with_events();

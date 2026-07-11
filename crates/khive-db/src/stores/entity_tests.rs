@@ -277,6 +277,53 @@ async fn test_query_by_name_prefix_escapes_percent_wildcard() {
     );
 }
 
+// Regression for a round-1 gap on #818/#834: the two tests above prove
+// escaping keeps decoys out of the WHERE clause entirely, so they pass even
+// without the exact-match-first ORDER BY CASE. This test isolates that
+// ordering: every decoy genuinely matches the LIKE pattern "Base%" (no
+// wildcard characters, escaping plays no role) and is newer than the exact
+// match, so a page ordered only by `created_at DESC` would fill entirely with
+// decoys and strand "Base" past the LIMIT 100 boundary. It fails if the
+// `ORDER BY CASE WHEN LOWER(name) = ... THEN 0 ELSE 1 END` clause is removed.
+#[tokio::test]
+async fn test_query_by_name_prefix_exact_match_ranked_before_many_matching_decoys() {
+    let store = setup_memory_store_ns("ns1");
+
+    store
+        .upsert_entity(make_entity("ns1", "concept", "Base"))
+        .await
+        .unwrap();
+
+    for i in 0..150 {
+        store
+            .upsert_entity(make_entity("ns1", "concept", &format!("Base-{i:03}")))
+            .await
+            .unwrap();
+    }
+
+    let result = store
+        .query_entities(
+            "ns1",
+            EntityFilter {
+                name_prefix: Some("Base".to_string()),
+                ..Default::default()
+            },
+            PageRequest {
+                offset: 0,
+                limit: 100,
+            },
+        )
+        .await
+        .unwrap();
+
+    let names: Vec<&str> = result.items.iter().map(|e| e.name.as_str()).collect();
+    assert!(
+        names.contains(&"Base"),
+        "exact match 'Base' must be ranked ahead of 150 newer, genuinely prefix-matching \
+         decoys within a LIMIT 100 page; got {names:?}"
+    );
+}
+
 #[tokio::test]
 async fn test_count_entities() {
     let store = setup_memory_store_ns("ns1");
