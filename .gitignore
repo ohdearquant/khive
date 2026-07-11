@@ -108,3 +108,8 @@ perf/ci-synthetic-ledger.csv
 # Named {YYYYMMDD}-{sha7}-{dataset}.json; kept out of the repo to avoid large
 # generated files in PRs. The perf/bench-runs/ directory is tracked via .gitkeep.
 perf/bench-runs/*.json
+
+# bench_calibrate.py output: per-invocation variance profiles + per-run
+# stdout/stderr/report artifacts. Sample-dependent and local-machine-noise
+# specific; not committed.
+scripts/perf/calibration/
