@@ -27,8 +27,27 @@ impl JsonFormatAdapter {
     /// Parse `json_input` and return a ready adapter.
     ///
     /// Returns `Err(AdapterError::Parse)` if `json_input` is not valid JSON or
-    /// is not a JSON array at the top level.
+    /// is not a JSON array at the top level. Entity `kind` is validated only
+    /// against the base ADR-001 kind set (plus aliases) — pack-registered
+    /// granular kinds (e.g. `resource`, ADR-048) are rejected here. Use
+    /// [`Self::new_with_valid_kinds`] to accept a wider, caller-supplied set.
     pub fn new(json_input: &str) -> Result<Self, AdapterError> {
+        Self::new_with_valid_kinds(json_input, &[])
+    }
+
+    /// Like [`Self::new`], but entity `kind` values not recognized by the
+    /// base ADR-001 enum are additionally accepted when they exact-match
+    /// (case-insensitive) an entry in `extra_valid_kinds`.
+    ///
+    /// Callers that have a merged pack/runtime kind registry (e.g.
+    /// `KhiveRuntime::install_kind_registry`'s installed entity kinds) should
+    /// pass it here so pack-registered granular kinds like `resource` are not
+    /// rejected before the runtime even sees them (issue #530 — the JSON/NDJSON
+    /// counterpart to the archive-format fix in #529 / issue #438).
+    pub fn new_with_valid_kinds(
+        json_input: &str,
+        extra_valid_kinds: &[String],
+    ) -> Result<Self, AdapterError> {
         let value: Value =
             serde_json::from_str(json_input).map_err(|e| AdapterError::Parse(e.to_string()))?;
 
@@ -71,7 +90,7 @@ impl JsonFormatAdapter {
             if has_source && has_target {
                 edges.push(parse_edge(index, obj, &mut warnings));
             } else {
-                entities.push(parse_entity(index, obj, &mut warnings));
+                entities.push(parse_entity(index, obj, &mut warnings, extra_valid_kinds));
             }
         }
 
@@ -196,17 +215,32 @@ fn parse_entity(
     index: usize,
     mut obj: serde_json::Map<String, Value>,
     warnings: &mut Vec<String>,
+    extra_valid_kinds: &[String],
 ) -> Result<EntityRecord, AdapterError> {
     let name = extract_required_string(&mut obj, index, "name")?;
 
     let raw_kind = extract_required_string(&mut obj, index, "kind")?;
-    let kind = EntityKind::from_str(&raw_kind)
-        .map_err(|_| AdapterError::UnknownKind {
-            index,
-            kind: raw_kind.clone(),
-        })?
-        .name()
-        .to_owned();
+    let kind = match EntityKind::from_str(&raw_kind) {
+        Ok(k) => k.name().to_owned(),
+        Err(_) => {
+            // Not one of the base ADR-001 kinds (or an alias). Accept it only
+            // if the caller supplied a wider registry (pack-registered
+            // granular kinds, e.g. `resource` — ADR-048) that recognizes it;
+            // otherwise this is a genuinely unknown kind.
+            let normalized = raw_kind.trim().to_ascii_lowercase();
+            if extra_valid_kinds
+                .iter()
+                .any(|k| k.eq_ignore_ascii_case(&normalized))
+            {
+                normalized
+            } else {
+                return Err(AdapterError::UnknownKind {
+                    index,
+                    kind: raw_kind.clone(),
+                });
+            }
+        }
+    };
 
     // ADR-020 subtype: prefer an explicit `entity_type`, else preserve a
     // `kind="paper"`-style alias (which `EntityKind::from_str` canonicalizes

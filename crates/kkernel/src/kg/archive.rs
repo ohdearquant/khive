@@ -90,7 +90,7 @@ pub(super) async fn cmd_import(args: ImportArgs) -> Result<()> {
         ..Default::default()
     };
     let runtime = KhiveRuntime::new(config)?;
-    install_import_kind_registry(&runtime)?;
+    let valid_entity_kinds = install_import_kind_registry(&runtime)?;
     let token = runtime.authorize(ns)?;
 
     let source = std::fs::read_to_string(&args.source)
@@ -112,7 +112,7 @@ pub(super) async fn cmd_import(args: ImportArgs) -> Result<()> {
                 ImportFormat::Ndjson => ndjson_to_json_array(&source)?,
                 ImportFormat::Archive => unreachable!(),
             };
-            let mut adapter = JsonFormatAdapter::new(&input)
+            let mut adapter = JsonFormatAdapter::new_with_valid_kinds(&input, &valid_entity_kinds)
                 .with_context(|| format!("parse adapter input {}", args.source.display()))?;
             if args.verbose {
                 for warning in adapter.warnings() {
@@ -230,7 +230,11 @@ pub(super) fn validate_archive_edge_weights(archive: &KgArchive) -> Result<()> {
 /// so that `runtime.import_kg` (and any other runtime-layer kind validation)
 /// accepts pack-registered kinds such as `resource`, not just the eight base
 /// `khive_types::EntityKind` variants.
-fn install_import_kind_registry(runtime: &KhiveRuntime) -> Result<()> {
+///
+/// Returns the merged entity-kind list so callers can also thread it into
+/// adapter-layer validation (see `JsonFormatAdapter::new_with_valid_kinds`,
+/// issue #530).
+fn install_import_kind_registry(runtime: &KhiveRuntime) -> Result<Vec<String>> {
     let mut builder = VerbRegistryBuilder::new();
     let names: Vec<String> = PackRegistry::discovered_names()
         .into_iter()
@@ -239,19 +243,18 @@ fn install_import_kind_registry(runtime: &KhiveRuntime) -> Result<()> {
     PackRegistry::register_packs(&names, runtime.clone(), &mut builder)
         .map_err(|n| anyhow::anyhow!("pack {n:?} declared in inventory but factory missing"))?;
     let registry = builder.build().context("building import VerbRegistry")?;
-    runtime.install_kind_registry(
-        registry
-            .all_entity_kinds()
-            .into_iter()
-            .map(str::to_string)
-            .collect(),
-        registry
-            .all_note_kinds()
-            .into_iter()
-            .map(str::to_string)
-            .collect(),
-    );
-    Ok(())
+    let entity_kinds: Vec<String> = registry
+        .all_entity_kinds()
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+    let note_kinds: Vec<String> = registry
+        .all_note_kinds()
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+    runtime.install_kind_registry(entity_kinds.clone(), note_kinds);
+    Ok(entity_kinds)
 }
 
 fn adapter_edge_to_exported(edge: EdgeRecord, entity_ids: &HashSet<Uuid>) -> Result<ExportedEdge> {
@@ -606,18 +609,89 @@ mod tests {
         assert_eq!(entity.name, "ImportedResource");
     }
 
-    // NOTE: the JSON/NDJSON adapter import path (`ImportFormat::Json` /
-    // `ImportFormat::Ndjson`) goes through `khive_vcs_adapters::JsonFormatAdapter`,
-    // which independently gates entity kind through the base
-    // `khive_types::EntityKind::from_str` in `parse_entity` — before an
-    // `ExportedEntity`/`KgArchive` is even constructed, and before this module's
-    // `install_import_kind_registry` fix has any effect. Making that path accept
-    // pack-registered kinds like `resource` requires an API change to the shared
-    // `khive-vcs-adapters` crate (also consumed by `khive-vcs` sync) to accept an
-    // injected valid-kind set — architecture work beyond this issue's scope
-    // (archive.rs kind validation, per #438's evidence). Only the archive-format
-    // round-trip path (the issue's reported failure scenario) is fixed here; see
-    // `import_archive_accepts_resource_kind` above.
+    // #530 (follow-up to #438): the JSON/NDJSON adapter import path
+    // (`ImportFormat::Json` / `ImportFormat::Ndjson`) goes through
+    // `khive_vcs_adapters::JsonFormatAdapter`, which used to independently gate
+    // entity kind through the base `khive_types::EntityKind::from_str` — before
+    // an `ExportedEntity`/`KgArchive` was even constructed, and before this
+    // module's `install_import_kind_registry` had any effect. `cmd_import` now
+    // threads the merged entity-kind registry into
+    // `JsonFormatAdapter::new_with_valid_kinds`, so pack-registered granular
+    // kinds like `resource` are accepted at this layer too.
+
+    #[tokio::test]
+    async fn import_json_adapter_accepts_resource_kind() {
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("import-json-resource.db");
+        let entity_id = "ffffffff-ffff-ffff-ffff-ffffffffffff";
+
+        let json_input =
+            format!(r#"[{{"id":"{entity_id}","kind":"resource","name":"JsonResource"}}]"#);
+        let source_path = tmp.path().join("records.json");
+        std::fs::write(&source_path, &json_input).unwrap();
+
+        let args = ImportArgs {
+            source: source_path,
+            db: db_path.clone(),
+            namespace: "test-ns".to_string(),
+            format: ImportFormat::Json,
+            verbose: false,
+        };
+        cmd_import(args)
+            .await
+            .expect("JSON adapter import must accept pack-registered `resource` kind");
+
+        let ns = Namespace::parse("test-ns").unwrap();
+        let config = RuntimeConfig {
+            db_path: Some(db_path),
+            default_namespace: ns.clone(),
+            embedding_model: None,
+            ..Default::default()
+        };
+        let rt2 = KhiveRuntime::new(config).unwrap();
+        let tok2 = rt2.authorize(ns).unwrap();
+        let entity_uuid: Uuid = entity_id.parse().unwrap();
+        let entity = rt2.get_entity(&tok2, entity_uuid).await.unwrap();
+        assert_eq!(entity.kind, "resource");
+        assert_eq!(entity.name, "JsonResource");
+    }
+
+    #[tokio::test]
+    async fn import_ndjson_adapter_accepts_resource_kind() {
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("import-ndjson-resource.db");
+        let entity_id = "abababab-abab-abab-abab-abababababab";
+
+        let ndjson_input =
+            format!(r#"{{"id":"{entity_id}","kind":"resource","name":"NdjsonResource"}}"#);
+        let source_path = tmp.path().join("records.ndjson");
+        std::fs::write(&source_path, &ndjson_input).unwrap();
+
+        let args = ImportArgs {
+            source: source_path,
+            db: db_path.clone(),
+            namespace: "test-ns".to_string(),
+            format: ImportFormat::Ndjson,
+            verbose: false,
+        };
+        cmd_import(args)
+            .await
+            .expect("NDJSON adapter import must accept pack-registered `resource` kind");
+
+        let ns = Namespace::parse("test-ns").unwrap();
+        let config = RuntimeConfig {
+            db_path: Some(db_path),
+            default_namespace: ns.clone(),
+            embedding_model: None,
+            ..Default::default()
+        };
+        let rt2 = KhiveRuntime::new(config).unwrap();
+        let tok2 = rt2.authorize(ns).unwrap();
+        let entity_uuid: Uuid = entity_id.parse().unwrap();
+        let entity = rt2.get_entity(&tok2, entity_uuid).await.unwrap();
+        assert_eq!(entity.kind, "resource");
+        assert_eq!(entity.name, "NdjsonResource");
+    }
 
     #[tokio::test]
     async fn import_rejects_unregistered_entity_kind() {
