@@ -31,11 +31,13 @@ An always-machine-readable copy of this page is at
 | `session`   | 4     | `KHIVE_PACKS=kg,session`   | Yes                 |
 | `git`       | 1     | `KHIVE_PACKS=kg,git`       | Yes                 |
 | `code`      | 0     | `KHIVE_PACKS=kg,code`      | Yes                 |
-| `workspace` | 0     | `KHIVE_PACKS=kg,workspace` | Yes                 |
+| `workspace` | 0     | `KHIVE_PACKS=kg,git,gtd,session,workspace` | Yes                 |
 
 `git` also registers the `commit` / `issue` / `pull_request` note kinds and the shared
 `run_ingest` core (`crates/khive-pack-git/src/ingest.rs`) that both `git.digest` and the
 `kkernel git-ingest` CLI drive.
+
+`workspace` requires `kg`, `git`, `gtd`, and `session` to be loaded alongside it (the runtime rejects a pack set that omits a declared dependency), so its minimal example lists all four.
 
 `code` registers the `finding` note kind and edge rules only; its `code.ingest` verb is
 accepted but unimplemented (ADR-085), and `findings.json` ingest runs through the
