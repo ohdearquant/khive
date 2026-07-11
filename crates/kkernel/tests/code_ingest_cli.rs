@@ -237,6 +237,35 @@ fn code_ingest(args: &[&str]) -> std::process::Output {
         .expect("run kkernel code-ingest")
 }
 
+/// The `-wal` sidecar path SQLite uses alongside a WAL-mode database file.
+fn wal_sidecar_path(db_path: &Path) -> std::path::PathBuf {
+    let mut name = db_path.as_os_str().to_owned();
+    name.push("-wal");
+    std::path::PathBuf::from(name)
+}
+
+/// The `-shm` sidecar path SQLite uses alongside a WAL-mode database file.
+fn shm_sidecar_path(db_path: &Path) -> std::path::PathBuf {
+    let mut name = db_path.as_os_str().to_owned();
+    name.push("-shm");
+    std::path::PathBuf::from(name)
+}
+
+/// File names present directly under `dir`, used to prove a dry run creates
+/// no new files anywhere in the target directory.
+fn dir_entry_names(dir: &Path) -> std::collections::BTreeSet<String> {
+    std::fs::read_dir(dir)
+        .expect("read target dir")
+        .map(|entry| {
+            entry
+                .expect("dir entry")
+                .file_name()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect()
+}
+
 /// (a) A fresh `--dry-run` against a nonexistent `--db` path must exit 0 and
 /// leave that path nonexistent — no file, no directory, nothing.
 #[test]
@@ -496,4 +525,103 @@ async fn status_mapping_reaches_storage_through_cli_dispatch() {
         "persisted (audit_status, kind_status) pairs must match the governed mapping for \
          every producer status in the sweep"
     );
+}
+
+/// (g) The binary-boundary variant of the helper-level
+/// `code_ingest_dry_run_against_existing_wal_db_leaves_sidecars_untouched`
+/// test in `code_ingest.rs`: a `--dry-run` against a db held open by a live
+/// writer connection, invoked through the actual compiled `kkernel` binary
+/// rather than `code_ingest_batch` in-tree. The WAL mutation class is caused
+/// by opening the db, so the invariant must be pinned at the binary boundary, not only at the helper function.
+#[tokio::test]
+async fn dry_run_against_existing_wal_db_held_open_by_a_writer_leaves_sidecars_untouched() {
+    let tmp = tempfile::TempDir::new().expect("temp dir");
+    let target_dir = tmp.path();
+    let findings = write_valid_findings(target_dir);
+    let db = target_dir.join("wal_scratch.db");
+
+    let seed = code_ingest(&[findings.to_str().unwrap(), "--db", db.to_str().unwrap()]);
+    assert!(
+        seed.status.success(),
+        "seeding the db with a valid ingest must succeed; stdout={} stderr={}",
+        String::from_utf8_lossy(&seed.stdout),
+        String::from_utf8_lossy(&seed.stderr)
+    );
+
+    let pin = StorageBackend::sqlite(&db).expect("open pin backend");
+    {
+        let sql = pin.sql();
+        let mut writer = sql.writer().await.expect("pin writer");
+        writer
+            .execute_script(
+                "CREATE TABLE IF NOT EXISTS wal_pin_probe(x INTEGER); \
+                 INSERT INTO wal_pin_probe VALUES (1);"
+                    .to_string(),
+            )
+            .await
+            .expect("pin write to keep the wal open");
+    }
+
+    let wal_path = wal_sidecar_path(&db);
+    let shm_path = shm_sidecar_path(&db);
+    assert!(
+        wal_path.exists(),
+        "expected a live -wal sidecar before dry-run"
+    );
+    assert!(
+        shm_path.exists(),
+        "expected a live -shm sidecar before dry-run"
+    );
+
+    let db_before = std::fs::read(&db).expect("read db before dry run");
+    let wal_before = std::fs::read(&wal_path).expect("read -wal before dry run");
+    let shm_before = std::fs::read(&shm_path).expect("read -shm before dry run");
+    let entries_before = dir_entry_names(target_dir);
+
+    let output = code_ingest(&[
+        findings.to_str().unwrap(),
+        "--db",
+        db.to_str().unwrap(),
+        "--dry-run",
+    ]);
+    assert!(
+        output.status.success(),
+        "dry-run against an existing WAL db must exit 0; stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    assert!(
+        wal_path.exists(),
+        "the existing -wal sidecar must not disappear"
+    );
+    assert!(
+        shm_path.exists(),
+        "the existing -shm sidecar must not disappear"
+    );
+
+    let entries_after = dir_entry_names(target_dir);
+    assert_eq!(
+        entries_before, entries_after,
+        "dry-run must not create any new file in the target dir"
+    );
+
+    let db_after = std::fs::read(&db).expect("read db after dry run");
+    let wal_after = std::fs::read(&wal_path).expect("read -wal after dry run");
+    let shm_after = std::fs::read(&shm_path).expect("read -shm after dry run");
+
+    assert_eq!(
+        db_before, db_after,
+        "dry-run must not touch the main db file"
+    );
+    assert_eq!(
+        wal_before, wal_after,
+        "dry-run must not touch the existing -wal sidecar"
+    );
+    assert_eq!(
+        shm_before, shm_after,
+        "dry-run must not touch the existing -shm sidecar (Finding 1 regression)"
+    );
+
+    drop(pin);
 }
