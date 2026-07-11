@@ -767,6 +767,7 @@ fn remove_daemon_paths_if_still_stale(pid_file: &std::path::Path, expected_pid: 
 }
 
 /// Outcome of the under-lock identity probe.
+#[derive(Debug)]
 enum ProbeOutcome {
     /// A live, identity-matching daemon responded before the deadline.
     Alive,
@@ -774,6 +775,16 @@ enum ProbeOutcome {
     Dead,
     /// Probe timed out — daemon may be alive but slow; do NOT kill.
     Timeout,
+    /// The boot/recovery lock ([`khive_runtime::daemon::lock_path`]) stayed
+    /// contended past its bounded acquisition deadline while
+    /// [`quiesce_then_probe_identity`] was trying to confirm no peer boot is
+    /// in flight (#838 round-1 Finding 2). Distinct from `Timeout` (which
+    /// means "the daemon itself answered slowly") — this means "could not
+    /// even confirm whether a peer boot is still running" — so a caller must
+    /// not conflate it with a healthy-but-slow daemon. NEVER-KILL on this
+    /// outcome either: an unconfirmed peer boot is exactly the ambiguity
+    /// `confirm_genuinely_dead` exists to resolve safely.
+    LockContended,
 }
 
 /// Send a `probe_only` frame to the daemon and return whether a live,
@@ -862,6 +873,7 @@ async fn probe_daemon_identity(config_id: &str, namespace: &str, timeout_ms: u64
 }
 
 /// Outcome returned by [`kill_and_respawn`] to the call site.
+#[derive(Debug)]
 enum RecoveryOutcome {
     /// A concurrent client already replaced the daemon; forward the real request
     /// via the normal path (no new spawn occurred).
@@ -869,6 +881,14 @@ enum RecoveryOutcome {
     /// This client killed the stale daemon and spawned a replacement; caller
     /// must wait for readiness then forward the real request.
     Spawned,
+    /// Could not obtain a positive confirmation either way within the
+    /// deadline-bound recovery window (the recoverer lock or the boot/recovery
+    /// lock stayed contended past its deadline) — #838 round-1 Finding 2. The
+    /// caller's behavior is identical to `Skipped` (never kill on an
+    /// unconfirmed state), but this is reported as a distinct variant rather
+    /// than silently folded into `Skipped`, so logs/metrics do not conflate
+    /// "positively confirmed alive" with "gave up without confirming".
+    Uncertain,
 }
 
 /// Bounded number of quiescence-confirm rounds [`confirm_genuinely_dead`]
@@ -876,29 +896,65 @@ enum RecoveryOutcome {
 const DEAD_CONFIRM_ROUNDS: u32 = 4;
 
 /// Pacing between [`confirm_genuinely_dead`] rounds. Not a synchronization
-/// mechanism by itself — the real synchronization is the blocking `flock` in
+/// mechanism by itself — the real synchronization is the bounded `flock` in
 /// [`quiesce_then_probe_identity`]; this only avoids busy-spinning while
 /// waiting for a peer that has not yet reached its own boot-guard call.
 const DEAD_CONFIRM_POLL_MS: u64 = 75;
 
-/// Block until no concurrent boot holds the shared boot/recovery lock, then
-/// re-probe daemon identity.
+/// Deadline for each round's bounded wait on the boot/recovery lock inside
+/// [`quiesce_then_probe_identity`]. #838 round-1 Finding 2: the previous
+/// unbounded blocking `flock` meant `DEAD_CONFIRM_ROUNDS` bounded probe
+/// *count*, not elapsed *time* — a wedged lock holder blocked recovery
+/// forever. Bounding each round's lock wait makes the whole
+/// `confirm_genuinely_dead` call bounded by
+/// `DEAD_CONFIRM_ROUNDS * (BOOT_QUIESCENCE_LOCK_TIMEOUT_MS +
+/// BOOT_FENCE_PROBE_TIMEOUT_MS + DEAD_CONFIRM_POLL_MS)` in the worst case.
+const BOOT_QUIESCENCE_LOCK_TIMEOUT_MS: u64 = 500;
+
+/// Block until no concurrent boot holds the shared boot/recovery lock (or the
+/// bounded wait's deadline elapses), then re-probe daemon identity.
 ///
 /// Same mechanism as [`wait_for_boot_quiescence_then_reprobe`], factored out
 /// so [`confirm_genuinely_dead`] can reuse it too (#758): a peer's
 /// `kill_and_respawn` (kill+spawn) or a daemon's own cold boot both hold this
 /// lock, so successfully reacquiring-then-immediately-dropping it proves
 /// neither is currently mid-critical-section at the moment this returns.
+///
+/// #838 round-1 Finding 2: unlike `wait_for_boot_quiescence_then_reprobe`
+/// (which genuinely wants to wait out a real boot once one is known to be in
+/// flight), this uses the DEADLINE-BOUNDED
+/// [`khive_runtime::daemon::try_acquire_daemon_boot_guard_until`] instead of
+/// the unbounded blocking `flock` — a wedged lock holder must not block
+/// `confirm_genuinely_dead`'s rounds forever. A deadline-elapsed or
+/// otherwise-failed acquisition returns the distinct
+/// [`ProbeOutcome::LockContended`] rather than collapsing into `Timeout`
+/// (which means something different: "the daemon itself answered slowly").
 async fn quiesce_then_probe_identity(
     config_id: &str,
     namespace: &str,
     timeout_ms: u64,
 ) -> ProbeOutcome {
-    match tokio::task::spawn_blocking(khive_runtime::daemon::acquire_daemon_boot_guard).await {
-        Ok(Ok(guard)) => drop(guard),
-        // Lock state unknown (join failure or the flock call itself failed) —
-        // never risk killing a daemon that might be alive.
-        _ => return ProbeOutcome::Timeout,
+    let deadline = std::time::Instant::now()
+        + std::time::Duration::from_millis(BOOT_QUIESCENCE_LOCK_TIMEOUT_MS);
+    match tokio::task::spawn_blocking(move || {
+        khive_runtime::daemon::try_acquire_daemon_boot_guard_until(deadline)
+    })
+    .await
+    {
+        Ok(Ok(Some(guard))) => drop(guard),
+        Ok(Ok(None)) => {
+            tracing::debug!(
+                BOOT_QUIESCENCE_LOCK_TIMEOUT_MS,
+                "boot/recovery lock still contended past its bounded wait; \
+                 could not confirm quiescence this round"
+            );
+            return ProbeOutcome::LockContended;
+        }
+        Ok(Err(e)) => {
+            tracing::warn!(error = %e, "failed to probe boot/recovery lock state");
+            return ProbeOutcome::LockContended;
+        }
+        Err(_join_err) => return ProbeOutcome::LockContended,
     }
     probe_daemon_identity(config_id, namespace, timeout_ms).await
 }
@@ -924,69 +980,148 @@ async fn quiesce_then_probe_identity(
 /// latency (single-digit to low tens of milliseconds) for the fork-to-flock
 /// gap this closes.
 async fn confirm_genuinely_dead(config_id: &str, namespace: &str) -> ProbeOutcome {
+    // `LockContended` means "still could not confirm this round" — the same
+    // "keep polling" shape as `Dead`, not a terminal state like `Alive`/
+    // `Timeout`. A peer's boot can legitimately hold the lock across several
+    // rounds; only give up (return `LockContended`) once every round agreed
+    // nobody could confirm, exactly mirroring how `Dead` only becomes trusted
+    // once every round agreed the daemon was absent.
+    let mut last_unresolved = ProbeOutcome::Dead;
     for round in 0..DEAD_CONFIRM_ROUNDS {
         match quiesce_then_probe_identity(config_id, namespace, BOOT_FENCE_PROBE_TIMEOUT_MS).await {
-            ProbeOutcome::Dead => {}
+            ProbeOutcome::Dead => last_unresolved = ProbeOutcome::Dead,
+            ProbeOutcome::LockContended => last_unresolved = ProbeOutcome::LockContended,
             other => return other,
         }
         if round + 1 < DEAD_CONFIRM_ROUNDS {
             tokio::time::sleep(std::time::Duration::from_millis(DEAD_CONFIRM_POLL_MS)).await;
         }
     }
-    ProbeOutcome::Dead
+    last_unresolved
 }
 
-/// Kill the stale daemon and spawn a fresh one under a single recovery lock.
+/// Deadline for acquiring the recoverer-only lock
+/// ([`khive_runtime::daemon::recoverer_lock_path`]) before starting the
+/// dead-confirmation → kill → spawn critical section. Generous enough to
+/// cover a peer's full worst-case critical section — up to
+/// `DEAD_CONFIRM_ROUNDS * (BOOT_QUIESCENCE_LOCK_TIMEOUT_MS +
+/// BOOT_FENCE_PROBE_TIMEOUT_MS + DEAD_CONFIRM_POLL_MS)` for
+/// `confirm_genuinely_dead`, plus kill+spawn overhead — so a healthy peer's
+/// turn is never mistaken for a wedge.
+const RECOVERER_LOCK_TIMEOUT_MS: u64 = 8_000;
+
+/// Kill the stale daemon and spawn a fresh one, serialized against concurrent
+/// recoverers by a dedicated recoverer-only lock.
 ///
-/// Implements double-checked recovery: after acquiring the lock, sends a
-/// bounded `probe_only` frame to the daemon (500 ms timeout). The probe uses
-/// a DB-free identity check that the daemon answers without dispatching any
-/// verb. Three outcomes:
+/// Implements double-checked recovery: an initial bounded `probe_only` frame
+/// (500 ms timeout) is sent under the shared boot/recovery lock
+/// ([`acquire_recovery_lock`]) before anything else — this is the same
+/// cheap fast-path check as before, letting a client that finds the daemon
+/// obviously alive return `Skipped` immediately without ever touching the
+/// recoverer lock.
 ///
-///   `Alive`   → a concurrent client already replaced the stale daemon; return
-///               `RecoveryOutcome::Skipped` without killing anything. The caller
-///               forwards the real request exactly once via the normal path.
-///   `Timeout` → daemon may be alive but slow; return `Skipped` without
-///               killing (NEVER-KILL-SLOW invariant). Caller forwards the real
-///               request; if the daemon is genuinely wedged the caller sees
-///               ParseFailure on that forward — the same recovery path re-runs.
-///   `Dead`    → confirmed via [`confirm_genuinely_dead`], then kill+spawn;
-///               return `RecoveryOutcome::Spawned`.
+/// #838 round-1 Finding 1: a bare `Dead` reading on the initial probe used to
+/// fall straight into `confirm_genuinely_dead` → kill → spawn with no
+/// linearization point across concurrent recoverers, so two clients racing
+/// from a genuinely dead daemon could both classify `Dead` and both spawn a
+/// replacement. The fix acquires
+/// [`khive_runtime::daemon::try_acquire_recoverer_lock_until`] — a SEPARATE
+/// lock file from the daemon's own boot lock — before `confirm_genuinely_dead`
+/// runs, and holds it through `kill_stale_daemon_inner` + `spawn_daemon`. This
+/// makes recovery mutually exclusive across recoverers without risking a
+/// deadlock against a booting daemon: the daemon never acquires this lock
+/// (only `kill_and_respawn` does), so nothing on the daemon-boot side is ever
+/// waiting on a client holding it. A bounded, deadline-aware acquisition
+/// (rather than an unbounded blocking `flock`) is used per Finding 2's
+/// same rationale: a second recoverer must not block forever if the first is
+/// itself wedged — see `RECOVERER_LOCK_TIMEOUT_MS`.
 ///
-/// #758: the initial probe's lock is dropped before `confirm_genuinely_dead`
-/// runs, and the kill/spawn step reacquires its own lock afterward — never
-/// held continuously across the confirm rounds. Holding one continuous lock
-/// across the whole function is not possible here: the daemon itself
-/// acquires this exact lock (via `acquire_daemon_boot_guard`) as the very
-/// first thing it does on boot (see `kkernel::main`), so a client holding it
-/// throughout would deadlock every recovery attempt against the very child
-/// it is trying to wait for. `confirm_genuinely_dead` gets the same effect
-/// without that deadlock: it repeatedly blocks on (and immediately releases)
-/// the lock a booting peer needs, so a `Dead` verdict is only trusted once
-/// several rounds have found nobody contending for it.
+/// Why a second lock file rather than reusing the boot lock for this whole
+/// span: the daemon acquires the boot lock (via `acquire_daemon_boot_guard`)
+/// as the very first thing it does on boot (see `kkernel::main`), so a client
+/// holding that SAME lock across confirm-through-spawn would deadlock every
+/// recovery attempt against the very child it just spawned and is waiting to
+/// observe. `confirm_genuinely_dead` still uses the boot lock internally
+/// (bounded, per-round) purely to detect quiescence — it never holds it
+/// across the whole function. The recoverer lock is orthogonal: it excludes
+/// PEER RECOVERERS from each other, not from the daemon.
+///
+/// Outcomes:
+///   `Alive`/`Timeout` (initial or confirmed) → `RecoveryOutcome::Skipped`,
+///       no kill. NEVER-KILL-SLOW: a timed-out probe means the daemon may be
+///       alive but busy, not dead.
+///   `LockContended` (confirm rounds could not establish quiescence) or the
+///       recoverer lock itself timing out → `RecoveryOutcome::Uncertain`,
+///       no kill. Same safe behavior as `Skipped` — the caller forwards the
+///       real request either way — but reported distinctly so this state is
+///       never silently conflated with a positive "confirmed alive" result.
+///   `Dead` (confirmed, recoverer lock held) → kill+spawn;
+///       `RecoveryOutcome::Spawned`.
 async fn kill_and_respawn(config_id: &str, namespace: &str) -> std::io::Result<RecoveryOutcome> {
     let initial_probe = {
         let _lock = acquire_recovery_lock();
         probe_daemon_identity(config_id, namespace, 500).await
     };
     match initial_probe {
-        ProbeOutcome::Alive | ProbeOutcome::Timeout => {
+        ProbeOutcome::Alive | ProbeOutcome::Timeout | ProbeOutcome::LockContended => {
             return Ok(RecoveryOutcome::Skipped);
         }
         ProbeOutcome::Dead => {}
     }
 
-    match confirm_genuinely_dead(config_id, namespace).await {
-        ProbeOutcome::Alive | ProbeOutcome::Timeout => {
-            return Ok(RecoveryOutcome::Skipped);
+    let recoverer_deadline =
+        std::time::Instant::now() + std::time::Duration::from_millis(RECOVERER_LOCK_TIMEOUT_MS);
+    let recoverer_guard = match tokio::time::timeout(
+        std::time::Duration::from_millis(RECOVERER_LOCK_TIMEOUT_MS),
+        tokio::task::spawn_blocking(move || {
+            khive_runtime::daemon::try_acquire_recoverer_lock_until(recoverer_deadline)
+        }),
+    )
+    .await
+    {
+        Ok(Ok(Ok(Some(guard)))) => guard,
+        Ok(Ok(Ok(None))) => {
+            tracing::warn!(
+                RECOVERER_LOCK_TIMEOUT_MS,
+                "recoverer lock still contended past its deadline; a peer recoverer \
+                 is likely still mid dead-confirmation/kill/spawn — skipping without \
+                 a positive confirmation rather than risking a double-spawn"
+            );
+            return Ok(RecoveryOutcome::Uncertain);
         }
-        ProbeOutcome::Dead => {}
-    }
+        Ok(Ok(Err(e))) => {
+            tracing::warn!(error = %e, "failed to acquire recoverer lock");
+            return Ok(RecoveryOutcome::Uncertain);
+        }
+        Ok(Err(_)) | Err(_) => {
+            tracing::warn!("recoverer lock acquisition task failed or exceeded its deadline");
+            return Ok(RecoveryOutcome::Uncertain);
+        }
+    };
 
-    let _lock = acquire_recovery_lock();
-    kill_stale_daemon_inner();
-    spawn_daemon()?;
-    Ok(RecoveryOutcome::Spawned)
+    let outcome = match confirm_genuinely_dead(config_id, namespace).await {
+        ProbeOutcome::Alive | ProbeOutcome::Timeout => Ok(RecoveryOutcome::Skipped),
+        ProbeOutcome::LockContended => {
+            tracing::warn!(
+                "confirm_genuinely_dead could not establish quiescence within its \
+                 bounded rounds; skipping kill+spawn without a positive confirmation"
+            );
+            Ok(RecoveryOutcome::Uncertain)
+        }
+        ProbeOutcome::Dead => {
+            // Also take the shared boot/recovery lock for the kill+spawn step
+            // itself, matching `acquire_recovery_lock`'s existing role of
+            // serializing this against the daemon server's own
+            // cleanup→bind→pid-write critical section. No deadlock risk: this
+            // is a distinct lock file from `recoverer_guard` above, acquired
+            // and dropped entirely within this arm.
+            let _boot_lock = acquire_recovery_lock();
+            kill_stale_daemon_inner();
+            spawn_daemon().map(|()| RecoveryOutcome::Spawned)
+        }
+    };
+    drop(recoverer_guard);
+    outcome
 }
 
 /// Build the hard error returned when the real request frame was fully
@@ -1414,6 +1549,16 @@ async fn wait_for_boot_quiescence_then_reprobe(frame: &DaemonRequestFrame) -> Bo
              local dispatch to avoid racing a possibly still-initializing index",
             None,
         )),
+        // `probe_daemon_identity` (unlike `quiesce_then_probe_identity`) never
+        // constructs `LockContended` — it has no lock-acquisition step of its
+        // own. Handled here only for match exhaustiveness over the shared
+        // `ProbeOutcome` type; same fail-safe HardError as `Timeout` if it
+        // were ever reached.
+        ProbeOutcome::LockContended => BootFenceOutcome::HardError(McpError::internal_error(
+            "daemon state uncertain after cold-boot quiescence (lock probe unexpectedly \
+             contended); not falling back to local dispatch",
+            None,
+        )),
     }
 }
 
@@ -1503,6 +1648,17 @@ pub async fn forward_or_spawn(frame: &DaemonRequestFrame) -> Option<Result<Strin
             // Give the kernel a moment to release the socket path and let the
             // spawned daemon process start.
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        Ok(RecoveryOutcome::Uncertain) => {
+            // Could not positively confirm the daemon's state within the
+            // deadline (#838 round-1 Finding 2) — behave like `Skipped` (never
+            // kill on an unconfirmed state) and let the forward loop below
+            // discover the real state: it will either reach a daemon a peer
+            // is spawning, or hit the readiness deadline and fall through to
+            // `wait_for_boot_quiescence_then_reprobe`.
+            tracing::debug!(
+                "daemon recovery state uncertain; forwarding without a fresh kill+spawn"
+            );
         }
     }
 
@@ -1644,6 +1800,7 @@ mod tests {
         std::env::remove_var("KHIVE_PID");
         std::env::remove_var("KHIVE_NO_DAEMON");
         std::env::remove_var("KHIVE_LOCK");
+        std::env::remove_var("KHIVE_RECOVERER_LOCK");
     }
 
     async fn connect_when_ready(sock: &std::path::Path) -> UnixStream {
@@ -3555,12 +3712,17 @@ mod tests {
     // Fail-if-reverted: without the fix, `confirm_genuinely_dead` would not
     // exist and `kill_and_respawn` would trust the bare `Dead` result
     // immediately — this test exercises the new function directly, so
-    // reverting it is a compile error, and a regression that makes the
-    // function return early (not blocking on the contended lock) fails the
-    // `elapsed >= GUARD_HOLD` assertion below.
+    // reverting it is a compile error. The regression oracle is the `timeout`
+    // window below: it asserts `confirm_genuinely_dead` does NOT resolve
+    // while the peer explicitly still holds the lock, then asserts it DOES
+    // resolve (as `Alive`) once the peer explicitly releases it — real
+    // two-way synchronization via channels, not a fixed sleep + elapsed-time
+    // assertion (#838 round-1 Finding 3: the previous version held the guard
+    // via `std::thread::sleep` and asserted `elapsed >= GUARD_HOLD`, which is
+    // timing-dependent under load).
     #[tokio::test]
     #[serial]
-    async fn confirm_genuinely_dead_waits_out_a_peers_held_boot_guard() {
+    async fn confirm_genuinely_dead_waits_for_peer_to_release_boot_guard() {
         clear_daemon_env();
         reset_counters();
         let dir = tempfile::tempdir().expect("tempdir");
@@ -3583,42 +3745,54 @@ mod tests {
         std::fs::write(&pid_file, std::process::id().to_string()).expect("write fake pid file");
         let serve_handle = tokio::spawn(serve_probe_ack_forever(listener, config_id.clone()));
 
-        const GUARD_HOLD: std::time::Duration = std::time::Duration::from_millis(300);
-        // Synchronize on the lock actually being held, not on guessed thread
-        // scheduling — under heavy parallel test load the boot thread could
-        // otherwise start late enough that `confirm_genuinely_dead` finishes
-        // its first (uncontended) round before the thread ever calls
-        // `flock`, making the test pass for the wrong reason (or flake).
-        let (acquired_tx, acquired_rx) = std::sync::mpsc::channel();
+        // Real two-way synchronization: the boot-holder thread signals once it
+        // has genuinely acquired the lock (so the test never proceeds before
+        // contention is real), then blocks on an explicit release channel
+        // instead of a fixed sleep — the test controls exactly when the lock
+        // becomes available, with no timing guess involved.
+        let (acquired_tx, acquired_rx) = std::sync::mpsc::channel::<()>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
         let boot_thread = std::thread::spawn(move || {
             let guard = khive_runtime::daemon::acquire_daemon_boot_guard()
                 .expect("test boot holder must acquire the recovery lock");
-            let _ = acquired_tx.send(());
-            std::thread::sleep(GUARD_HOLD);
+            acquired_tx.send(()).expect("signal lock acquired");
+            let _ = release_rx.recv();
             drop(guard);
         });
         acquired_rx
             .recv()
             .expect("boot-holder thread must signal after acquiring the lock");
 
-        let started = std::time::Instant::now();
-        let outcome = confirm_genuinely_dead(&config_id, "test").await;
-        let elapsed = started.elapsed();
+        let confirm_fut = confirm_genuinely_dead(&config_id, "test");
+        tokio::pin!(confirm_fut);
 
+        // Bounded assertion window (NOT the release mechanism — the lock is
+        // released explicitly below via `release_tx`): proves
+        // confirm_genuinely_dead does not resolve while the peer still holds
+        // the lock.
+        let too_early =
+            tokio::time::timeout(std::time::Duration::from_millis(150), &mut confirm_fut).await;
+        assert!(
+            too_early.is_err(),
+            "confirm_genuinely_dead must not resolve while a peer holds the \
+             boot/recovery lock"
+        );
+
+        release_tx
+            .send(())
+            .expect("boot-holder thread still awaiting release");
         boot_thread
             .join()
             .expect("boot-holder thread must not panic");
+
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(5), confirm_fut)
+            .await
+            .expect("confirm_genuinely_dead must resolve promptly once the peer releases the lock");
 
         assert!(
             matches!(outcome, ProbeOutcome::Alive),
             "confirm_genuinely_dead must observe the already-reachable daemon \
              once the contended lock clears, not conclude Dead early"
-        );
-        assert!(
-            elapsed >= GUARD_HOLD,
-            "confirm_genuinely_dead returned after {elapsed:?}, faster than the \
-             {GUARD_HOLD:?} a peer held the boot guard — it must block on that \
-             lock before trusting a Dead classification (#758)"
         );
 
         serve_handle.abort();
@@ -3626,6 +3800,104 @@ mod tests {
         reset_counters();
         clear_daemon_env();
         std::env::remove_var("KHIVE_LOCK");
+    }
+
+    // ── #838 round-1 Finding 1: two concurrent recoverers must not double-spawn ──
+    //
+    // Regression for the missing linearization point: before the recoverer
+    // lock, two clients racing `kill_and_respawn` from a genuinely dead daemon
+    // (no socket, no pid file at all) could both classify `Dead` via
+    // `confirm_genuinely_dead` and both fall through to `kill_stale_daemon_inner`
+    // + `spawn_daemon`, spawning two replacement daemons. The recoverer lock
+    // (a SEPARATE file from the daemon's own boot lock, so it cannot deadlock
+    // against a peer daemon's boot) makes the whole
+    // confirm-through-spawn critical section mutually exclusive across
+    // recoverers: only the first to acquire it proceeds to `Spawned`; the
+    // second observes `Skipped` (freshly spawned daemon now answers its
+    // re-probe under the lock) or `Uncertain`, but never spawns.
+    //
+    // Fail-if-reverted: without the recoverer lock serializing this section,
+    // both concurrent calls independently pass their own `confirm_genuinely_dead`
+    // and both call `spawn_daemon()`, making `SPAWN_COUNT == 2`.
+    #[tokio::test]
+    #[serial]
+    async fn concurrent_recoverers_spawn_exactly_one_replacement_daemon() {
+        clear_daemon_env();
+        reset_counters();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sock = dir.path().join("khived.sock");
+        let pid_file = dir.path().join("khived.pid");
+        let lock_file = dir.path().join("khived.recovery.lock");
+        let recoverer_lock_file = dir.path().join("khived.recoverer.lock");
+
+        std::env::set_var("KHIVE_SOCKET", &sock);
+        std::env::set_var("KHIVE_PID", &pid_file);
+        std::env::set_var("KHIVE_LOCK", &lock_file);
+        std::env::set_var("KHIVE_RECOVERER_LOCK", &recoverer_lock_file);
+        std::env::remove_var("KHIVE_NO_DAEMON");
+
+        // Genuinely no daemon at all: no socket, no pid file. Both recoverers
+        // must observe Dead on every probe they take.
+        let config_id = "packs=[kg];db=:memory:;embed=none;extra=[];backend=main".to_string();
+
+        // `spawn_daemon()` in this test process just forks the test binary
+        // with bad args — it exits almost immediately without ever binding
+        // anything (the same tolerated pattern used elsewhere in this file,
+        // e.g. `forward_or_spawn_blocks_on_boot_quiescence_before_local_fallback`).
+        // To prove the recoverer lock's linearization actually matters (not
+        // merely that nothing ever comes up so there is nothing to race),
+        // this watcher simulates "the first recoverer's spawned child became
+        // live" the instant `spawn_daemon()` is genuinely called: it binds
+        // the fake socket + pid file and starts answering `probe_only`
+        // frames, so the SECOND recoverer's own `confirm_genuinely_dead`
+        // (which can only proceed once the first has released the recoverer
+        // lock) observes a live daemon and skips instead of also spawning.
+        let watcher_config_id = config_id.clone();
+        let watcher_sock = sock.clone();
+        let watcher_pid_file = pid_file.clone();
+        let watcher = tokio::spawn(async move {
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+            while SPAWN_COUNT.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "no recoverer reached spawn_daemon() within 5s"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+            let listener =
+                tokio::net::UnixListener::bind(&watcher_sock).expect("bind simulated-spawn socket");
+            std::fs::write(&watcher_pid_file, std::process::id().to_string())
+                .expect("write simulated-spawn pid file");
+            serve_probe_ack_forever(listener, watcher_config_id).await;
+        });
+
+        let (a, b) = tokio::join!(
+            kill_and_respawn(&config_id, "test"),
+            kill_and_respawn(&config_id, "test"),
+        );
+
+        let spawned_count = [&a, &b]
+            .iter()
+            .filter(|r| matches!(r, Ok(RecoveryOutcome::Spawned)))
+            .count();
+        assert_eq!(
+            spawned_count, 1,
+            "exactly one of two concurrent recoverers racing from a genuinely \
+             dead daemon must spawn a replacement; got a={a:?} b={b:?}"
+        );
+        assert_eq!(
+            SPAWN_COUNT.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "spawn_daemon must be called exactly once across two concurrent \
+             recoverers racing the same dead-daemon state; got a={a:?} b={b:?}"
+        );
+
+        watcher.abort();
+        let _ = watcher.await;
+        reset_counters();
+        clear_daemon_env();
+        std::env::remove_var("KHIVE_LOCK");
+        std::env::remove_var("KHIVE_RECOVERER_LOCK");
     }
 
     // ── probe classifier is fail-CLOSED for same-protocol pre-probe daemons ──

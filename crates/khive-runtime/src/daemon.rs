@@ -95,6 +95,54 @@ pub fn lock_path() -> PathBuf {
     khive_dir().join("khived.recovery.lock")
 }
 
+/// Advisory lock file used to serialize RECOVERY (kill+respawn) attempts
+/// across concurrent clients only — the daemon's own boot sequence never
+/// acquires this file ([`lock_path`] / [`acquire_daemon_boot_guard`] is the
+/// boot-side lock).  A recoverer holding this lock across dead-confirmation
+/// → kill → spawn (khive-mcp's `kill_and_respawn`, #838 round-1 Finding 1)
+/// therefore can never deadlock against a peer daemon's boot, unlike holding
+/// the shared boot lock for that whole span would.
+///
+/// Overridable via the `KHIVE_RECOVERER_LOCK` env var (for tests).
+pub fn recoverer_lock_path() -> PathBuf {
+    if let Ok(p) = std::env::var("KHIVE_RECOVERER_LOCK") {
+        if !p.is_empty() {
+            return PathBuf::from(p);
+        }
+    }
+    khive_dir().join("khived.recoverer.lock")
+}
+
+#[cfg(unix)]
+fn open_lock_file(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(path)
+}
+
+#[cfg(unix)]
+fn acquire_flock_blocking(path: &std::path::Path, label: &str) -> Option<std::fs::File> {
+    let file = match open_lock_file(path) {
+        Ok(f) => f,
+        Err(e) => {
+            tracing::warn!(error = %e, path = ?path, "cannot open {label} lock file");
+            return None;
+        }
+    };
+    // SAFETY: flock is a POSIX advisory lock with no memory side-effects.
+    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+    if rc != 0 {
+        tracing::warn!("flock LOCK_EX failed on {label} lock");
+        return None;
+    }
+    Some(file)
+}
+
 /// Acquire an exclusive advisory flock on the recovery/startup lock file.
 ///
 /// The returned `File` holds the lock for its lifetime; dropping it releases
@@ -103,29 +151,75 @@ pub fn lock_path() -> PathBuf {
 /// mutually exclusive across processes.
 #[cfg(unix)]
 pub fn acquire_recovery_lock() -> Option<std::fs::File> {
-    let path = lock_path();
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    let file = match std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .open(&path)
-    {
-        Ok(f) => f,
-        Err(e) => {
-            tracing::warn!(error = %e, path = ?path, "cannot open recovery lock file");
-            return None;
+    acquire_flock_blocking(&lock_path(), "recovery")
+}
+
+/// Attempt to acquire an exclusive advisory flock on `path`, retrying with a
+/// non-blocking `flock(LOCK_NB)` until `deadline` elapses.
+///
+/// Unlike [`acquire_recovery_lock`]/[`acquire_daemon_boot_guard`] (unbounded
+/// blocking `flock`, correct for the daemon's own boot sequence where waiting
+/// until quiescence IS the desired behavior), a caller only trying to *detect*
+/// whether a lock is currently free — without committing to wait forever for
+/// a possibly-wedged holder — needs a deadline instead (#838 round-1
+/// Finding 2). Returns:
+///   - `Ok(Some(file))` — the lock was free within the deadline.
+///   - `Ok(None)` — `deadline` elapsed while the lock stayed held; an
+///     explicit "could not confirm" outcome, distinct from a hard I/O error.
+///   - `Err(_)` — the lock file could not be opened, or `flock` failed for a
+///     reason other than contention.
+///
+/// Blocking (paces retries with `std::thread::sleep`) — async callers must
+/// run this via `spawn_blocking`.
+#[cfg(unix)]
+fn try_acquire_flock_until(
+    path: &std::path::Path,
+    deadline: std::time::Instant,
+) -> std::io::Result<Option<std::fs::File>> {
+    let file = open_lock_file(path)?;
+    let poll_interval = std::time::Duration::from_millis(10);
+    loop {
+        // SAFETY: flock is a POSIX advisory lock with no memory side-effects.
+        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if rc == 0 {
+            return Ok(Some(file));
         }
-    };
-    // SAFETY: flock is a POSIX advisory lock with no memory side-effects.
-    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
-    if rc != 0 {
-        tracing::warn!("flock LOCK_EX failed on recovery lock");
-        return None;
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error() != Some(libc::EWOULDBLOCK) {
+            return Err(err);
+        }
+        let now = std::time::Instant::now();
+        if now >= deadline {
+            return Ok(None);
+        }
+        std::thread::sleep(poll_interval.min(deadline - now));
     }
-    Some(file)
+}
+
+/// Bounded, deadline-aware variant of [`acquire_daemon_boot_guard`]: attempts
+/// the SAME boot/recovery lock ([`lock_path`]) but gives up at `deadline`
+/// instead of blocking forever. For callers that need to detect "is a boot in
+/// progress right now" without risking an unbounded wait behind a wedged
+/// holder (#838 round-1 Finding 2) — e.g. khive-mcp's `confirm_genuinely_dead`
+/// re-probing rounds, where `DEAD_CONFIRM_ROUNDS` must bound elapsed time, not
+/// just probe count.
+#[cfg(unix)]
+pub fn try_acquire_daemon_boot_guard_until(
+    deadline: std::time::Instant,
+) -> std::io::Result<Option<DaemonBootGuard>> {
+    try_acquire_flock_until(&lock_path(), deadline)
+}
+
+/// Bounded, deadline-aware acquisition of the recoverer-only lock
+/// ([`recoverer_lock_path`]). See [`try_acquire_daemon_boot_guard_until`] for
+/// the shared rationale — a second recoverer waiting for a peer's dead
+/// confirmation/kill/spawn critical section must give up and report
+/// "uncertain" rather than block forever if that peer is itself wedged.
+#[cfg(unix)]
+pub fn try_acquire_recoverer_lock_until(
+    deadline: std::time::Instant,
+) -> std::io::Result<Option<std::fs::File>> {
+    try_acquire_flock_until(&recoverer_lock_path(), deadline)
 }
 
 /// Guard returned by [`acquire_daemon_boot_guard`], held across cold-boot
