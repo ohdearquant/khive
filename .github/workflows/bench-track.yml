@@ -190,6 +190,7 @@ jobs:
           RECORD_EXIT_CODE: ${{ steps.record.outputs.exit_code }}
           GH_TOKEN: ${{ github.token }}
         run: |
+          set +e
           MSG="bench_track.py record exited ${RECORD_EXIT_CODE} for suite=components shard=${{ matrix.shard }}; its status=error record was still published to perf-data. Run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
           echo "::warning::${MSG}"
           {
@@ -332,6 +333,7 @@ jobs:
           BENCH_1M_RECORD_EXIT_CODE: ${{ steps.record_bench_1m.outputs.exit_code }}
           GH_TOKEN: ${{ github.token }}
         run: |
+          set +e
           MSG="bench_track.py record failed: pipeline exit=${PIPELINE_EXIT_CODE} bench-1m exit=${BENCH_1M_RECORD_EXIT_CODE}; status=error record(s) were still published to perf-data. Run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
           echo "::warning::${MSG}"
           {
