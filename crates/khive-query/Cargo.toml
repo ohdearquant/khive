@@ -19,6 +19,7 @@ thiserror = { workspace = true }
 
 [dev-dependencies]
 criterion = { workspace = true }
+rusqlite = { workspace = true, features = ["bundled"] }
 
 [[bench]]
 name = "parse_bench"
