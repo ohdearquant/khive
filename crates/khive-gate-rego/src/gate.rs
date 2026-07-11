@@ -235,17 +235,29 @@ impl Gate for RegoGate {
         // A result that parses to a non-GateDecision shape (e.g. a boolean,
         // plain string, or wrong object) is also treated as deny rather than
         // propagating an Err.
+        //
+        // GATEREGO-AUD-001: a malformed policy can return caller-supplied
+        // input (e.g. `input.args`) verbatim as its "decision" value. Prior
+        // to this fix, `decision_json` — the raw policy output — was embedded
+        // in both the tracing warn and the generated Deny reason, so a
+        // request secret (API key, token) present anywhere in the request
+        // would be echoed back to the caller via `PermissionDenied` and
+        // persisted into audit events. Only a type-shape summary (never the
+        // value) is surfaced now.
         match serde_json::from_str::<GateDecision>(&decision_json) {
             Ok(decision) => Ok(decision),
             Err(e) => {
+                let shape = serde_json::from_str::<serde_json::Value>(&decision_json)
+                    .map(describe_json_shape)
+                    .unwrap_or("unparsable");
                 tracing::warn!(
                     entrypoint = %self.entrypoint,
-                    got = %decision_json,
+                    shape,
                     error = %e,
                     "policy returned non-GateDecision shape — denying (fail-closed)"
                 );
                 Ok(GateDecision::deny(format!(
-                    "policy rule {} returned unrecognized shape: {decision_json}",
+                    "policy rule {} returned an unrecognized shape ({shape}); refusing to echo policy output",
                     self.entrypoint
                 )))
             }
@@ -254,6 +266,20 @@ impl Gate for RegoGate {
 
     fn impl_name(&self) -> &'static str {
         "RegoGate"
+    }
+}
+
+/// Top-level JSON type name of `value`, with no field contents — used to
+/// describe a wrong-shaped policy result without echoing any of the
+/// (possibly caller-supplied) data it may carry.
+fn describe_json_shape(value: serde_json::Value) -> &'static str {
+    match value {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "boolean",
+        serde_json::Value::Number(_) => "number",
+        serde_json::Value::String(_) => "string",
+        serde_json::Value::Array(_) => "array",
+        serde_json::Value::Object(_) => "object",
     }
 }
 
@@ -300,5 +326,56 @@ mod tests {
             Ok(GateDecision::Allow { .. }) => panic!("expected Deny for poisoned mutex, got Allow"),
             Err(e) => panic!("expected Ok(Deny) for poisoned mutex, got Err({e})"),
         }
+    }
+
+    // ---- GATEREGO-AUD-001: wrong-shaped policy result must never echo caller args ----
+
+    #[test]
+    fn malformed_policy_echoing_input_args_does_not_leak_secret() {
+        // A misconfigured/malformed policy that echoes `input.args` back as the
+        // decision object, instead of a proper `{"decision": "allow"|"deny", ...}`
+        // shape. This is exactly the GATEREGO-AUD-001 failure mode: the policy
+        // author's mistake must not become a secret-exfiltration channel.
+        let policy = r#"
+            package khive.gate
+            import rego.v1
+            default decision := input.args
+        "#;
+        let gate = RegoGate::from_policy_str(policy).expect("policy compiles");
+
+        // FAKE key: real AKIA/AWS shape, invented suffix — see khive-runtime's
+        // secret_gate tests for the convention.
+        let fake_key = "AKIAFAKEKEY000000000";
+        let req = GateRequest::new(
+            ActorRef::anonymous(),
+            Namespace::local(),
+            "propose",
+            json!({
+                "changeset": {
+                    "entity": {
+                        "properties": {
+                            "api_key": fake_key,
+                        }
+                    }
+                }
+            }),
+        );
+
+        let decision = gate.check(&req).expect("check must not Err (fail-closed)");
+        let reason = match decision {
+            GateDecision::Deny { reason } => reason,
+            GateDecision::Allow { .. } => {
+                panic!("wrong-shaped policy result must deny, not allow")
+            }
+        };
+
+        assert!(
+            !reason.contains(fake_key),
+            "Deny reason must never echo the caller-supplied secret; got: {reason}"
+        );
+        assert!(
+            !reason.contains("api_key"),
+            "Deny reason must never echo caller-supplied field names either; got: {reason}"
+        );
     }
 }
