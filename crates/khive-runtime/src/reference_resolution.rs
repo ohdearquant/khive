@@ -1,7 +1,7 @@
 //! `resolve_reference`: the Layer-0 deterministic reference resolver from the
 //! "unified-verb" draft ADR (Slice 1 — resolver + ring).
 //!
-//! Turns a natural-language reference into an id through three ordered
+//! Turns a natural-language reference into an id through four ordered
 //! stages, never guessing among close candidates:
 //!
 //! 1. **Id-string passthrough.** A ref that already looks like a UUID or an
@@ -14,7 +14,12 @@
 //!    `NotFound` here, not an error — a caller resolving those uses `get`.
 //! 2. **Recently-referenced ring.** An exact (case-insensitive) or substring
 //!    match against this actor's ring (`reference_ring::ReferenceRing`).
-//! 3. **Hybrid-search fallback.** `KhiveRuntime::hybrid_search` over the
+//! 3. **Exact-name storage lookup.** A deterministic, case-sensitive match
+//!    against `entities.name` in the caller's namespace (`deleted_at IS
+//!    NULL`) — covers any entity that already exists but was never
+//!    created/get/updated/deleted/merged/linked by this actor in this
+//!    session, so stage 2's ring never saw it (#849).
+//! 4. **Hybrid-search fallback.** `KhiveRuntime::hybrid_search` over the
 //!    caller's namespace, ranked by RRF score.
 //!
 //! A single candidate clearing the stage's confidence bar resolves; multiple
@@ -24,6 +29,9 @@
 use std::str::FromStr;
 
 use uuid::Uuid;
+
+use khive_storage::types::PageRequest;
+use khive_storage::EntityFilter;
 
 use crate::error::{RuntimeError, RuntimeResult};
 use crate::operations::Resolved;
@@ -60,6 +68,13 @@ const RING_SUBSTRING_CONFIDENCE: f64 = 0.7;
 /// against a fixed bar is meaningful. The search stage below uses its own,
 /// deliberately separate rule — see `SEARCH_RESOLVED_CONFIDENCE`.
 const RING_AUTO_RESOLVE_CONFIDENCE: f64 = 0.7;
+/// Confidence for a stage-3 exact-name storage match: a deterministic,
+/// case-sensitive equality on `entities.name` — stronger evidence than the
+/// ring's case-insensitive session cache (`RING_EXACT_CONFIDENCE`), so it
+/// sits above both ring bands, but still below the absolute certainty of an
+/// id-string passthrough (1.0), which the caller supplied directly rather
+/// than by name.
+const EXACT_NAME_CONFIDENCE: f64 = 0.98;
 /// Hybrid-search fallback: the top hit auto-resolves over a runner-up only
 /// when it leads by at least this ratio — RRF scores are not on a fixed
 /// 0..1 confidence scale, so a fixed absolute bar can't express "decisively
@@ -209,7 +224,18 @@ pub async fn resolve_reference(
         return Ok(resolution);
     }
 
-    // Stage 3: hybrid-search fallback over the namespace.
+    // Stage 3: exact-name storage lookup (#849) — a deterministic,
+    // case-sensitive match against `entities.name` in the caller's
+    // namespace, run before the hybrid-search fallback so an existing exact
+    // name always resolves regardless of FTS ranking, RRF score, or whether
+    // this actor's session ever referenced the entity (the ring's blind
+    // spot). Single match resolves; multiple exact matches are `Ambiguous`;
+    // none falls through to hybrid search unchanged.
+    if let Some(resolution) = exact_name_match(runtime, token, trimmed, entity_kind).await? {
+        return Ok(resolution);
+    }
+
+    // Stage 4: hybrid-search fallback over the namespace.
     let hits = runtime
         .hybrid_search(
             token,
@@ -279,6 +305,61 @@ fn resolve_from_candidates(candidates: Vec<ReferenceCandidate>) -> Option<Refere
         }
         _ => Some(ReferenceResolution::Ambiguous { candidates }),
     }
+}
+
+/// Stage 3 of `resolve_reference` (#849): a deterministic, case-sensitive
+/// exact match against `entities.name`, scoped to `token.namespace()` (the
+/// same single-namespace default the rest of this pipeline and the sibling
+/// by-name lookup in `khive-pack-kg`'s `resolve_name_async` use) and to
+/// `entity_kind` when the caller filtered by one. `query_entities` already
+/// excludes soft-deleted rows (`deleted_at IS NULL` is baked into every
+/// query — see `khive-db::stores::entity::build_entity_where`), so no
+/// separate filter is needed here. Returns `None` (fall through to the next
+/// stage) when nothing matches; `Some(Resolved)` on a single hit; and
+/// `Some(Ambiguous)` when the name is not unique.
+async fn exact_name_match(
+    runtime: &KhiveRuntime,
+    token: &NamespaceToken,
+    name: &str,
+    entity_kind: Option<&str>,
+) -> RuntimeResult<Option<ReferenceResolution>> {
+    let filter = EntityFilter {
+        name_prefix: Some(name.to_string()),
+        kinds: entity_kind.map(|k| vec![k.to_string()]).unwrap_or_default(),
+        ..EntityFilter::default()
+    };
+    let page = runtime
+        .entities(token)?
+        .query_entities(
+            token.namespace().as_str(),
+            filter,
+            PageRequest {
+                offset: 0,
+                limit: 100,
+            },
+        )
+        .await
+        .map_err(RuntimeError::Storage)?;
+
+    let exact: Vec<ReferenceCandidate> = page
+        .items
+        .into_iter()
+        .filter(|e| e.name == name)
+        .map(|e| ReferenceCandidate {
+            id: e.id,
+            name: Some(e.name),
+            score: EXACT_NAME_CONFIDENCE,
+        })
+        .collect();
+
+    Ok(match exact.len() {
+        0 => None,
+        1 => Some(ReferenceResolution::Resolved {
+            id: exact[0].id,
+            confidence: EXACT_NAME_CONFIDENCE,
+        }),
+        _ => Some(ReferenceResolution::Ambiguous { candidates: exact }),
+    })
 }
 
 fn is_hex_prefix(s: &str) -> bool {

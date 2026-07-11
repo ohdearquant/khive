@@ -1237,9 +1237,11 @@ mod tests {
     /// `create`/`get`/`update`/`delete`/`merge`/`link` on THIS registry) must
     /// not resolve via the ring's high-confidence exact-match stage. It is
     /// created directly on the runtime (bypassing dispatch, hence bypassing
-    /// admission entirely) so the only way `resolve` can find it at all is
-    /// the hybrid-search fallback (stage 3) — proven by a confidence below
-    /// the ring's fixed 0.95 exact-match / 0.7 substring-match bands.
+    /// admission entirely) so the only way `resolve` can find it via the ring
+    /// is stage 2 — proven by a confidence that never equals the ring's fixed
+    /// 0.95 exact-match / 0.7 substring-match bands (it instead comes from
+    /// the stage-3 exact-name storage lookup, #849, since the ref is this
+    /// entity's exact name).
     #[tokio::test]
     async fn resolve_search_result_sets_never_populate_the_ring() {
         let rt = KhiveRuntime::memory().expect("in-memory runtime");
@@ -1275,19 +1277,24 @@ mod tests {
             .await
             .expect("resolve must succeed");
         let results = result.get("results").and_then(|v| v.as_array()).unwrap();
-        if let Some(status) = results[0].get("status").and_then(|v| v.as_str()) {
-            if status == "resolved" {
-                let confidence = results[0]
-                    .get("confidence")
-                    .and_then(|v| v.as_f64())
-                    .unwrap();
-                assert!(
-                    confidence < 0.9,
-                    "a resolved hit here must come from hybrid search, not the ring \
-                     (which would score 0.95 exact / 0.7 substring); got {confidence}"
-                );
-            }
-        }
+        // The ref is this entity's exact name, so it now resolves via the
+        // stage-3 exact-name storage lookup (#849) at EXACT_NAME_CONFIDENCE
+        // (0.98) regardless of the ring — proving the ring itself stayed
+        // empty: a ring hit would score 0.95 (exact) or 0.7 (substring),
+        // never 0.98.
+        assert_eq!(
+            results[0].get("status").and_then(|v| v.as_str()),
+            Some("resolved")
+        );
+        let confidence = results[0]
+            .get("confidence")
+            .and_then(|v| v.as_f64())
+            .unwrap();
+        assert_eq!(
+            confidence, 0.98,
+            "a resolved hit here must come from the exact-name storage lookup, \
+             not the ring (which would score 0.95 exact / 0.7 substring); got {confidence}"
+        );
     }
 
     /// Regression for the namespace-key mismatch (review finding, 2026-07-09
@@ -1413,6 +1420,265 @@ mod tests {
         assert!(
             names.contains(&"resolve"),
             "resolve must be registered as a public verb; got {names:?}"
+        );
+    }
+
+    // ---- exact-name storage lookup (stage 3, #849) ----
+    //
+    // These entities are created directly on the runtime (bypassing
+    // `registry.dispatch`, hence bypassing ring admission entirely — same
+    // technique as `resolve_search_result_sets_never_populate_the_ring`), so
+    // the only way `resolve` can find them is the exact-name storage lookup
+    // (or, for the fallback-preserved case, hybrid search).
+
+    /// An entity that already exists but was never referenced through this
+    /// registry's ring resolves via the new exact-name storage lookup, at
+    /// `EXACT_NAME_CONFIDENCE` (0.98) — above the ring's bands, below the
+    /// absolute certainty of an id-string passthrough (1.0). Also regression
+    /// coverage for the literal #849 repro: `kind="entity"` is the bare
+    /// substrate label (no filter), not a literal `entities.kind` value.
+    #[tokio::test]
+    async fn resolve_exact_name_hit_resolves_high_confidence() {
+        let rt = KhiveRuntime::memory().expect("in-memory runtime");
+        let direct_tok = rt.authorize(Namespace::local()).unwrap();
+        let entity = rt
+            .create_entity(&direct_tok, "concept", None, "RoLoRA", None, None, vec![])
+            .await
+            .expect("direct entity create must succeed");
+
+        let mut builder = VerbRegistryBuilder::new();
+        builder.with_default_namespace("local");
+        builder.register(KgPack::new(rt.clone()));
+        let registry = builder.build().expect("registry build");
+
+        let result = registry
+            .dispatch("resolve", json!({"refs": ["RoLoRA"], "kind": "entity"}))
+            .await
+            .expect("resolve must succeed");
+        let results = result.get("results").and_then(|v| v.as_array()).unwrap();
+        assert_eq!(
+            results[0].get("status").and_then(|v| v.as_str()),
+            Some("resolved"),
+            "an existing exact name must resolve even when never referenced \
+             through this session's ring: {results:?}"
+        );
+        assert_eq!(
+            results[0].get("id").and_then(|v| v.as_str()),
+            Some(entity.id.to_string().as_str())
+        );
+        assert_eq!(
+            results[0].get("confidence").and_then(|v| v.as_f64()),
+            Some(0.98)
+        );
+    }
+
+    /// Two entities sharing the exact same name resolve as `Ambiguous`,
+    /// never a silent pick, mirroring the ring's duplicate-name contract.
+    #[tokio::test]
+    async fn resolve_exact_name_ambiguous_on_duplicate_names() {
+        let rt = KhiveRuntime::memory().expect("in-memory runtime");
+        let direct_tok = rt.authorize(Namespace::local()).unwrap();
+        for _ in 0..2 {
+            rt.create_entity(
+                &direct_tok,
+                "concept",
+                None,
+                "duplicate exact name",
+                None,
+                None,
+                vec![],
+            )
+            .await
+            .expect("direct entity create must succeed");
+        }
+
+        let mut builder = VerbRegistryBuilder::new();
+        builder.with_default_namespace("local");
+        builder.register(KgPack::new(rt.clone()));
+        let registry = builder.build().expect("registry build");
+
+        let result = registry
+            .dispatch("resolve", json!({"refs": ["duplicate exact name"]}))
+            .await
+            .expect("resolve must succeed");
+        let results = result.get("results").and_then(|v| v.as_array()).unwrap();
+        assert_eq!(
+            results[0].get("status").and_then(|v| v.as_str()),
+            Some("ambiguous")
+        );
+        let candidates = results[0]
+            .get("candidates")
+            .and_then(|v| v.as_array())
+            .expect("ambiguous result must carry candidates");
+        assert_eq!(candidates.len(), 2);
+    }
+
+    /// A ref with no exact-name storage match still falls through to the
+    /// hybrid-search fallback (existing stage-4 behavior preserved): a
+    /// partial-phrase query that cannot exact-match any name resolves via
+    /// search, at a confidence below the exact-name stage's 0.98.
+    #[tokio::test]
+    async fn resolve_exact_name_miss_falls_through_to_hybrid_search() {
+        let rt = KhiveRuntime::memory().expect("in-memory runtime");
+        let direct_tok = rt.authorize(Namespace::local()).unwrap();
+        let entity = rt
+            .create_entity(
+                &direct_tok,
+                "concept",
+                None,
+                "Existing Multi Word Fallback Target",
+                None,
+                None,
+                vec![],
+            )
+            .await
+            .expect("direct entity create must succeed");
+
+        let mut builder = VerbRegistryBuilder::new();
+        builder.with_default_namespace("local");
+        builder.register(KgPack::new(rt.clone()));
+        let registry = builder.build().expect("registry build");
+
+        let result = registry
+            .dispatch("resolve", json!({"refs": ["Multi Word Fallback Target"]}))
+            .await
+            .expect("resolve must succeed");
+        let results = result.get("results").and_then(|v| v.as_array()).unwrap();
+        assert_eq!(
+            results[0].get("status").and_then(|v| v.as_str()),
+            Some("resolved"),
+            "a non-exact phrase must still resolve via the preserved hybrid \
+             fallback: {results:?}"
+        );
+        assert_eq!(
+            results[0].get("id").and_then(|v| v.as_str()),
+            Some(entity.id.to_string().as_str())
+        );
+        let confidence = results[0]
+            .get("confidence")
+            .and_then(|v| v.as_f64())
+            .unwrap();
+        assert!(
+            confidence < 0.98,
+            "a hybrid-search resolution must score below the exact-name \
+             stage's confidence, proving it came from stage 4 not stage 3; \
+             got {confidence}"
+        );
+    }
+
+    /// A soft-deleted entity is invisible to the exact-name storage lookup
+    /// (`deleted_at IS NULL` is baked into `query_entities`), matching the
+    /// rest of the KG surface's soft-delete contract.
+    #[tokio::test]
+    async fn resolve_exact_name_soft_deleted_entity_not_matched() {
+        let rt = KhiveRuntime::memory().expect("in-memory runtime");
+        let direct_tok = rt.authorize(Namespace::local()).unwrap();
+        let entity = rt
+            .create_entity(
+                &direct_tok,
+                "concept",
+                None,
+                "soon to be deleted",
+                None,
+                None,
+                vec![],
+            )
+            .await
+            .expect("direct entity create must succeed");
+        rt.delete_entity(&direct_tok, entity.id, false)
+            .await
+            .expect("soft delete must succeed");
+
+        let mut builder = VerbRegistryBuilder::new();
+        builder.with_default_namespace("local");
+        builder.register(KgPack::new(rt.clone()));
+        let registry = builder.build().expect("registry build");
+
+        let result = registry
+            .dispatch("resolve", json!({"refs": ["soon to be deleted"]}))
+            .await
+            .expect("resolve must succeed");
+        let results = result.get("results").and_then(|v| v.as_array()).unwrap();
+        assert_eq!(
+            results[0].get("status").and_then(|v| v.as_str()),
+            Some("not_found"),
+            "a soft-deleted entity must not resolve by its old exact name: {results:?}"
+        );
+    }
+
+    /// A granular `kind` filter narrows the exact-name lookup: two entities
+    /// with the exact same name but different entity kinds resolve
+    /// deterministically to the one matching `kind`, instead of `Ambiguous`.
+    #[tokio::test]
+    async fn resolve_exact_name_respects_kind_filter() {
+        let rt = KhiveRuntime::memory().expect("in-memory runtime");
+        let direct_tok = rt.authorize(Namespace::local()).unwrap();
+        let concept = rt
+            .create_entity(
+                &direct_tok,
+                "concept",
+                None,
+                "shared exact name",
+                None,
+                None,
+                vec![],
+            )
+            .await
+            .expect("direct entity create must succeed");
+        rt.create_entity(
+            &direct_tok,
+            "document",
+            None,
+            "shared exact name",
+            None,
+            None,
+            vec![],
+        )
+        .await
+        .expect("direct entity create must succeed");
+
+        let mut builder = VerbRegistryBuilder::new();
+        builder.with_default_namespace("local");
+        builder.register(KgPack::new(rt.clone()));
+        let registry = builder.build().expect("registry build");
+
+        let result = registry
+            .dispatch(
+                "resolve",
+                json!({"refs": ["shared exact name"], "kind": "concept"}),
+            )
+            .await
+            .expect("resolve must succeed");
+        let results = result.get("results").and_then(|v| v.as_array()).unwrap();
+        assert_eq!(
+            results[0].get("status").and_then(|v| v.as_str()),
+            Some("resolved"),
+            "kind=\"concept\" must narrow the two same-name entities down to \
+             one match instead of surfacing Ambiguous: {results:?}"
+        );
+        assert_eq!(
+            results[0].get("id").and_then(|v| v.as_str()),
+            Some(concept.id.to_string().as_str())
+        );
+    }
+
+    /// `resolve`'s `kind` param is entity-only, matching the id-string
+    /// passthrough and ring stages: a note kind is rejected with a clear
+    /// error rather than silently over-filtering to zero matches.
+    #[tokio::test]
+    async fn resolve_kind_rejects_non_entity_kind() {
+        let rt = KhiveRuntime::memory().expect("in-memory runtime");
+        let mut builder = VerbRegistryBuilder::new();
+        builder.with_default_namespace("local");
+        builder.register(KgPack::new(rt.clone()));
+        let registry = builder.build().expect("registry build");
+
+        let result = registry
+            .dispatch("resolve", json!({"refs": ["anything"], "kind": "note"}))
+            .await;
+        assert!(
+            result.is_err(),
+            "resolve(kind=\"note\") must fail loud, not silently over-filter"
         );
     }
 }
