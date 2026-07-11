@@ -3,9 +3,11 @@
 
 Runs a chosen bench suite K times at the CURRENT commit (unchanged) and
 emits a variance profile per metric: samples, mean, std, min, max, CV, and
-an ADVISORY floor at mean-3*std. This harness never sets a gate threshold
-itself — it measures run-to-run noise at a fixed SHA so a human can place a
-blocking floor with a known noise budget behind it.
+an ADVISORY-CALIBRATION-ONLY floor at mean-k(n)*std, where k(n) is the
+one-sided normal tolerance factor sized from the run count n (see
+_tolerance_factor_k). This harness never sets a gate threshold itself — it
+measures run-to-run noise at a fixed SHA so a human can place a blocking
+floor with a known noise budget behind it.
 
 Motivation: bench-1m.yml (recall@10 >= 0.90) and bench-pipeline (P@K >=
 0.70), plus the nine load-harness gate dimensions in bench_load_harness.py,
@@ -27,6 +29,14 @@ Suites (pluggable via SUITES registry):
             strings, per-tenant attribution detail) are not statted; they
             are still visible in the per-run stdout/report.json artifacts
             kept under --out/runs/.
+  bench-1m  drives `bash scripts/bench_1m.sh --ci-synthetic` - the exact
+            command run by the blocking ann-ci-gate job in
+            .github/workflows/bench-1m.yml. Hermetic: generates synthetic
+            clustered fixtures (seed=42, no network, no SIFT-1M dataset)
+            and runs the real khive-vamana vec_bench release binary.
+            Extracts assertion checks (recall_at_10, beam_growth_exponent,
+            speedup_vs_brute_force), per-N row metrics, and growth-exponent
+            fits from the schema-versioned result JSON it writes.
 
 Safety:
   - Refuses to run against a dirty git worktree (the whole point is
@@ -43,6 +53,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import pathlib
 import re
@@ -50,10 +61,13 @@ import signal
 import statistics
 import subprocess
 import sys
+import tempfile
 import time
+import unittest
 
 REPO_ROOT = pathlib.Path(__file__).parent.parent.parent
 PERF_SCRIPTS_DIR = pathlib.Path(__file__).parent
+_BENCH1M_FIXTURE_PATH = PERF_SCRIPTS_DIR / "testdata" / "bench1m_result_fixture.json"
 PIPELINE_SCRIPT = PERF_SCRIPTS_DIR / "bench_pipeline_daemon.py"
 LOAD_SCRIPT = PERF_SCRIPTS_DIR / "bench_load_harness.py"
 
@@ -282,6 +296,234 @@ def _load_extract(run_dir: pathlib.Path, proc: subprocess.CompletedProcess) -> d
     return metrics
 
 
+# ── suite: bench-1m ───────────────────────────────────────────────────────────
+#
+# Wraps the exact hermetic per-PR gate command run by .github/workflows/
+# bench-1m.yml's `ann-ci-gate` job: `bash scripts/bench_1m.sh --ci-synthetic`.
+# That mode generates deterministic synthetic clustered fixtures (seed=42,
+# no network, no SIFT-1M dataset) via gen_synthetic_fvecs.py and runs the
+# real khive-vamana vec_bench release binary against them - this is what
+# actually blocks PRs, unlike the manual/self-hosted-only bench-1m-sift job
+# (which requires a ~500MB SIFT-1M dataset at SIFT_DIR and cannot run
+# standalone here; that job is intentionally NOT wrapped by this suite).
+#
+# bench_1m.sh writes its full result as a schema-versioned JSON file
+# (BENCH_OUT/<dataset>.json) rather than only printing a table - the load
+# suite's JSON-report style is reused here (more robust than regexing the
+# println! summary table, which is free-form and not intended as a stable
+# grammar). BENCH_OUT is pointed at this run's isolated run_dir so a run's
+# JSON can never be read by, or leak into, another run.
+
+_BENCH1M_DATASET = "SIFT-CI-synthetic"
+_BENCH1M_EXPECTED_SCHEMA_VERSION = "1.0"  # crates/khive-vamana/examples/vec_bench.rs schema_version
+_BENCH1M_EXPECTED_ROWS = 2  # --ci-synthetic fixes NS=10000,50000 (bench_1m.sh)
+_BENCH1M_EXPECTED_ROW_NS = frozenset({10000, 50000})
+_BENCH1M_ROW_NUMERIC_FIELDS = (
+    "build_ms",
+    "iso_recall_beam",
+    "recall_at_10",
+    "query_warm_p50_us",
+    "query_warm_p95_us",
+    "query_warm_p99_us",
+    "query_warm_max_us",
+    "bruteforce_p50_us",
+    "speedup_vs_brute_force",
+)
+_BENCH1M_FITS_NUMERIC_FIELDS = (
+    "beam_growth_exponent",
+    "build_wallclock_exponent",
+    "iso_recall_query_exponent_warm",
+    "bruteforce_exponent",
+)
+# khive-vamana/ci-synthetic/clustered-128 target in perf/targets.toml. `scope`
+# governs the shape of a check's "measured" field in the result JSON
+# (evaluate_check in vec_bench.rs): "all_rows" serializes a Vec<f64> (one
+# value per row), "fits"/"max_n" serialize a single f64. A probe result with
+# an unexpected metric name or scope here is schema drift, not a metric to
+# silently accept.
+_BENCH1M_EXPECTED_CHECK_SCOPES = {
+    "recall_at_10": "all_rows",
+    "beam_growth_exponent": "fits",
+    "speedup_vs_brute_force": "max_n",
+}
+# Per-check expected length of an "all_rows" scope's "measured" array - the
+# producer emits exactly one value per row, so a check bound to a subset of
+# rows would need its own entry here rather than the global row count. Every
+# current "all_rows" check runs over the full row set (_BENCH1M_EXPECTED_ROWS).
+_BENCH1M_ALL_ROWS_CHECK_LEN = {
+    "recall_at_10": _BENCH1M_EXPECTED_ROWS,
+}
+# gate_pass (1) + 2 metrics/check (measured, pass) + row fields + fits fields.
+_BENCH1M_EXPECTED_METRIC_COUNT = (
+    1
+    + len(_BENCH1M_EXPECTED_CHECK_SCOPES) * 2
+    + _BENCH1M_EXPECTED_ROWS * len(_BENCH1M_ROW_NUMERIC_FIELDS)
+    + len(_BENCH1M_FITS_NUMERIC_FIELDS)
+)
+
+
+def _bench1m_build_cmd(run_dir: pathlib.Path, extra_args: list[str]) -> list[str]:
+    return ["bash", str(REPO_ROOT / "scripts" / "bench_1m.sh"), "--ci-synthetic", *extra_args]
+
+
+def _bench1m_build_env(run_dir: pathlib.Path) -> dict[str, str]:
+    return {"BENCH_OUT": str(run_dir / "bench-out")}
+
+
+def _bench1m_extract(run_dir: pathlib.Path, proc: subprocess.CompletedProcess) -> dict[str, float]:
+    json_path = run_dir / "bench-out" / f"{_BENCH1M_DATASET}.json"
+    if not json_path.exists():
+        raise SchemaError(
+            f"bench-1m gate did not write the expected result JSON at {json_path}; "
+            f"see {run_dir}/stdout.log"
+        )
+    result = json.loads(json_path.read_text())
+
+    schema_version = result.get("schema_version")
+    if schema_version != _BENCH1M_EXPECTED_SCHEMA_VERSION:
+        raise SchemaError(
+            f"bench-1m result schema_version={schema_version!r}, expected "
+            f"{_BENCH1M_EXPECTED_SCHEMA_VERSION!r} - result JSON shape drift; see {json_path}"
+        )
+
+    metrics: dict[str, float] = {}
+
+    assertions = result.get("assertions")
+    if not isinstance(assertions, dict) or "overall" not in assertions:
+        raise SchemaError(f"bench-1m result missing 'assertions.overall'; see {json_path}")
+    metrics["gate_pass"] = 1.0 if assertions["overall"] == "PASS" else 0.0
+
+    checks = assertions.get("checks")
+    if not isinstance(checks, list) or len(checks) != len(_BENCH1M_EXPECTED_CHECK_SCOPES):
+        raise SchemaError(
+            f"expected exactly {len(_BENCH1M_EXPECTED_CHECK_SCOPES)} assertion checks in "
+            f"bench-1m result (perf/targets.toml khive-vamana/ci-synthetic/clustered-128 "
+            f"target), got {len(checks) if isinstance(checks, list) else type(checks).__name__}; "
+            f"see {json_path}"
+        )
+    seen_check_metrics: set[str] = set()
+    for check in checks:
+        metric_name = check.get("metric")
+        scope = check.get("scope")
+        if not metric_name or metric_name in seen_check_metrics:
+            raise SchemaError(
+                f"bench-1m assertion check missing or duplicate 'metric' key: {check!r}; "
+                f"see {json_path}"
+            )
+        expected_scope = _BENCH1M_EXPECTED_CHECK_SCOPES.get(metric_name)
+        if expected_scope is None:
+            raise SchemaError(
+                f"bench-1m assertion check has unexpected metric {metric_name!r} "
+                f"(expected one of {sorted(_BENCH1M_EXPECTED_CHECK_SCOPES)}); see {json_path}"
+            )
+        if scope != expected_scope:
+            raise SchemaError(
+                f"bench-1m assertion check {metric_name!r} has scope {scope!r}, "
+                f"expected {expected_scope!r}; see {json_path}"
+            )
+        seen_check_metrics.add(metric_name)
+
+        measured = check.get("measured")
+        if scope == "all_rows":
+            # evaluate_check's "all_rows" arm serializes a Vec<f64>, one
+            # value per row - float(check["measured"]) crashes with
+            # TypeError on this shape. Reduce to the single value that
+            # actually binds the check's pass/fail (the worst case in the
+            # operator's direction), so a single "measured" metric stays
+            # comparable across scopes.
+            if not isinstance(measured, list) or not measured or any(
+                isinstance(v, bool) or not isinstance(v, (int, float)) for v in measured
+            ):
+                raise SchemaError(
+                    f"bench-1m assertion check {metric_name!r} (scope=all_rows) expected a "
+                    f"non-empty numeric array 'measured', got {measured!r}; see {json_path}"
+                )
+            expected_len = _BENCH1M_ALL_ROWS_CHECK_LEN.get(metric_name)
+            if expected_len is None:
+                raise SchemaError(
+                    f"bench-1m assertion check {metric_name!r} (scope=all_rows) has no "
+                    f"registered expected 'measured' length in _BENCH1M_ALL_ROWS_CHECK_LEN "
+                    f"- schema drift, not a check to silently accept; see {json_path}"
+                )
+            if len(measured) != expected_len:
+                raise SchemaError(
+                    f"bench-1m assertion check {metric_name!r} (scope=all_rows) expected "
+                    f"'measured' to have exactly {expected_len} values (one per row), got "
+                    f"{len(measured)}: {measured!r}; see {json_path}"
+                )
+            operator = check.get("operator")
+            if operator in (">=", ">"):
+                value = min(measured)
+            elif operator in ("<=", "<"):
+                value = max(measured)
+            else:
+                raise SchemaError(
+                    f"bench-1m assertion check {metric_name!r} (scope=all_rows) has "
+                    f"unexpected operator {operator!r}; see {json_path}"
+                )
+        elif scope in ("fits", "max_n"):
+            if isinstance(measured, bool) or not isinstance(measured, (int, float)):
+                raise SchemaError(
+                    f"bench-1m assertion check {metric_name!r} (scope={scope!r}) expected "
+                    f"a numeric 'measured', got {measured!r}; see {json_path}"
+                )
+            value = measured
+        else:
+            raise SchemaError(
+                f"bench-1m assertion check {metric_name!r} has unhandled scope {scope!r} "
+                f"(expected all_rows/fits/max_n); see {json_path}"
+            )
+        metrics[f"assertion.{metric_name}.measured"] = float(value)
+        metrics[f"assertion.{metric_name}.pass"] = 1.0 if check.get("result") == "PASS" else 0.0
+
+    missing_checks = set(_BENCH1M_EXPECTED_CHECK_SCOPES) - seen_check_metrics
+    if missing_checks:
+        raise SchemaError(
+            f"bench-1m result missing expected assertion checks: {sorted(missing_checks)}; "
+            f"see {json_path}"
+        )
+
+    rows = result.get("rows")
+    if not isinstance(rows, list) or len(rows) != _BENCH1M_EXPECTED_ROWS:
+        raise SchemaError(
+            f"expected exactly {_BENCH1M_EXPECTED_ROWS} rows in bench-1m result "
+            f"(--ci-synthetic fixes NS=10000,50000), got "
+            f"{len(rows) if isinstance(rows, list) else type(rows).__name__}; see {json_path}"
+        )
+    seen_ns: set[int] = set()
+    for row in rows:
+        n = row.get("n")
+        if n is None or n in seen_ns:
+            raise SchemaError(f"bench-1m row missing or duplicate 'n' key: {row!r}; see {json_path}")
+        seen_ns.add(n)
+        for field in _BENCH1M_ROW_NUMERIC_FIELDS:
+            if field not in row:
+                raise SchemaError(f"bench-1m row n={n} missing field {field!r}; see {json_path}")
+            metrics[f"row.n{n}.{field}"] = float(row[field])
+    if seen_ns != _BENCH1M_EXPECTED_ROW_NS:
+        raise SchemaError(
+            f"bench-1m rows have n={sorted(seen_ns)}, expected exactly "
+            f"{sorted(_BENCH1M_EXPECTED_ROW_NS)} (--ci-synthetic fixes NS=10000,50000); "
+            f"see {json_path}"
+        )
+
+    fits = result.get("fits")
+    if not isinstance(fits, dict):
+        raise SchemaError(f"bench-1m result missing 'fits' object; see {json_path}")
+    for field in _BENCH1M_FITS_NUMERIC_FIELDS:
+        if field not in fits:
+            raise SchemaError(f"bench-1m result missing fits field {field!r}; see {json_path}")
+        metrics[f"fits.{field}"] = float(fits[field])
+
+    if len(metrics) != _BENCH1M_EXPECTED_METRIC_COUNT:
+        raise SchemaError(
+            f"expected exactly {_BENCH1M_EXPECTED_METRIC_COUNT} bench-1m metrics "
+            f"(schema/cardinality drift), got {len(metrics)}; see {json_path}"
+        )
+
+    return metrics
+
+
 # ── suite registry ────────────────────────────────────────────────────────────
 #
 # Each entry: {command argv builder, metric extractor, cheap CLI defaults,
@@ -316,6 +558,16 @@ SUITES = {
         ],
         "timeout_s": 600,
     },
+    "bench-1m": {
+        "build_cmd": _bench1m_build_cmd,
+        "build_env": _bench1m_build_env,
+        "extract": _bench1m_extract,
+        "default_args": [],
+        # cargo run --release builds+runs khive-vamana's vec_bench example
+        # against synthetic 10K/50K-vector fixtures; a cold release build
+        # can take several minutes on top of the bench itself.
+        "timeout_s": 1800,
+    },
 }
 
 
@@ -332,7 +584,22 @@ def _run_once(suite_name: str, run_dir: pathlib.Path, extra_args: list[str]) -> 
     home_dir = run_dir / "home"
     home_dir.mkdir(parents=True, exist_ok=False)
     env = {**os.environ}
+    orig_home = os.environ.get("HOME", "")
     env["HOME"] = str(home_dir)
+    # Preserve toolchain resolution across the HOME swap above. rustup/cargo
+    # (bench-1m's `cargo run --release`) and the pipeline/load suites' own
+    # `~/.cargo/bin/kkernel` fallback resolve CARGO_HOME/RUSTUP_HOME/`~`
+    # relative to HOME by default; isolating HOME for application-state
+    # isolation must not also hide the toolchain from rustup ("rustup could
+    # not choose a version of cargo"). Derive CARGO_HOME/RUSTUP_HOME from the
+    # ORIGINAL HOME when the caller hasn't already pinned them explicitly, so
+    # they keep pointing at the real toolchain install after HOME moves.
+    if orig_home:
+        env.setdefault("CARGO_HOME", str(pathlib.Path(orig_home) / ".cargo"))
+        env.setdefault("RUSTUP_HOME", str(pathlib.Path(orig_home) / ".rustup"))
+    build_env = suite.get("build_env")
+    if build_env is not None:
+        env.update(build_env(run_dir))
 
     t0 = time.time()
     # start_new_session=True puts the child in its own process group so a
@@ -391,14 +658,260 @@ def _run_once(suite_name: str, run_dir: pathlib.Path, extra_args: list[str]) -> 
     return cp, metrics, wall_s
 
 
-def _advisory_floor(vals: list[float], mean: float, std: float) -> float:
-    floor = mean - 3.0 * std
+# ── n-sized one-sided normal tolerance factor (#829) ──────────────────────
+#
+# The advisory floor used to hardcode mean - 3*std, treating every run count
+# the same regardless of how many same-SHA samples actually back the
+# estimate. The bench-program calibration spec instead sizes the floor's
+# tolerance factor k from n via the one-sided normal tolerance interval:
+# with only n samples, mean and std are themselves estimates, and a small n
+# needs a wider margin than a large n to make the same coverage/confidence
+# claim. k(n) replaces the fixed 3.0 multiplier.
+#
+# Coverage P=0.99 (99%), confidence conf=0.95 (95%): the calibration spec's
+# worked example pins k(10) ~= 3.98 for this coverage/confidence pair via
+# the Wald-Wolfowitz approximation below - verified against an exact
+# erf-based inverse normal (k(10) = 3.9400, within 0.05 of the pinned
+# value).
+#
+# EXPLICIT RESOLUTION (round-1 review, #830): an earlier draft of this file's
+# prose described the target as "99.9% coverage". That was a documentation
+# error, not a second valid reading. Recomputing k(n) at 99.9%/95% gives
+# k(5) = 7.5314 and k(10) = 5.1556 - neither matches issue #829's pinned
+# k(10) ~= 3.98 acceptance target. At 99%/95% the same formula gives
+# k(5) = 5.7504 and k(10) = 3.9400, which does match. 99% coverage / 95%
+# confidence is therefore the correct reading and the only value this file
+# implements; the constants below, every printed/rendered coverage label,
+# and the JSON payload's tolerance_coverage field are all 0.99. If a future
+# maintainer finds a spec revision that deliberately widens this to 99.9%,
+# that is a spec change requiring a fresh k(10) pin and a matching update
+# here - not a silent runtime toggle.
+_TOLERANCE_COVERAGE = 0.99
+_TOLERANCE_CONFIDENCE = 0.95
+
+
+def _inv_norm_cdf(p: float) -> float:
+    """Inverse standard-normal CDF (quantile function), stdlib only.
+
+    Peter Acklam's rational approximation - relative error <= 1.15e-9 over
+    (0, 1). No dependency on scipy/numpy.
+    """
+    if not 0.0 < p < 1.0:
+        raise ValueError(f"p must be in (0, 1), got {p}")
+
+    a = [
+        -3.969683028665376e01, 2.209460984245205e02, -2.759285104469687e02,
+        1.383577518672690e02, -3.066479806614716e01, 2.506628277459239e00,
+    ]
+    b = [
+        -5.447609879822406e01, 1.615858368580409e02, -1.556989798598866e02,
+        6.680131188771972e01, -1.328068155288572e01,
+    ]
+    c = [
+        -7.784894002430293e-03, -3.223964580411365e-01, -2.400758277161838e00,
+        -2.549732539343734e00, 4.374664141464968e00, 2.938163982698783e00,
+    ]
+    d = [
+        7.784695709041462e-03, 3.224671290700398e-01, 2.445134137142996e00,
+        3.754408661907416e00,
+    ]
+    p_low = 0.02425
+    p_high = 1.0 - p_low
+
+    if p < p_low:
+        q = math.sqrt(-2.0 * math.log(p))
+        return (((((c[0] * q + c[1]) * q + c[2]) * q + c[3]) * q + c[4]) * q + c[5]) / (
+            (((d[0] * q + d[1]) * q + d[2]) * q + d[3]) * q + 1.0
+        )
+    if p <= p_high:
+        q = p - 0.5
+        r = q * q
+        return (((((a[0] * r + a[1]) * r + a[2]) * r + a[3]) * r + a[4]) * r + a[5]) * q / (
+            ((((b[0] * r + b[1]) * r + b[2]) * r + b[3]) * r + b[4]) * r + 1.0
+        )
+    q = math.sqrt(-2.0 * math.log(1.0 - p))
+    return -(((((c[0] * q + c[1]) * q + c[2]) * q + c[3]) * q + c[4]) * q + c[5]) / (
+        (((d[0] * q + d[1]) * q + d[2]) * q + d[3]) * q + 1.0
+    )
+
+
+class ToleranceDomainError(ValueError):
+    """Raised when n is too small for the tolerance-factor approximation's valid domain."""
+
+
+def _tolerance_factor_k(n: int, coverage: float = _TOLERANCE_COVERAGE, confidence: float = _TOLERANCE_CONFIDENCE) -> float:
+    """One-sided normal tolerance factor k(n) (Wald-Wolfowitz approximation).
+
+    k = (z_p + sqrt(z_p^2 - a*b)) / a
+      a = 1 - z_conf^2 / (2*(n-1))
+      b = z_p^2 - z_conf^2 / n
+
+    z_p, z_conf are standard-normal quantiles at `coverage`/`confidence`
+    (default: the module's pinned _TOLERANCE_COVERAGE/_TOLERANCE_CONFIDENCE).
+    The coverage/confidence params exist so the self-check below can verify
+    *other* readings against the spec's pinned k(10) without duplicating
+    this formula - runtime callers never pass them. Requires n >= 2 (a is
+    undefined at n=1).
+    """
+    if n < 2:
+        raise ValueError(f"_tolerance_factor_k requires n >= 2, got {n}")
+    z_p = _inv_norm_cdf(coverage)
+    z_conf = _inv_norm_cdf(confidence)
+    a = 1.0 - (z_conf**2) / (2.0 * (n - 1))
+    if a <= 0.0:
+        # The approximation's denominator only stays positive for
+        # n > 1 + z_conf^2/2 (n >= 3 at confidence=0.95); below that the
+        # formula is out of its valid domain and produces nonsense (a
+        # negative or divide-by-near-zero result).
+        raise ToleranceDomainError(
+            f"_tolerance_factor_k(n={n}) is outside the approximation's valid domain "
+            f"(a={a!r} <= 0); need a larger n"
+        )
+    b = z_p**2 - (z_conf**2) / n
+    return (z_p + math.sqrt(z_p**2 - a * b)) / a
+
+
+def _advisory_floor(
+    vals: list[float], mean: float, std: float, n: int
+) -> tuple[float, float] | tuple[None, None]:
+    try:
+        k = _tolerance_factor_k(n)
+    except ToleranceDomainError:
+        # n is too small (e.g. --runs 2) for the approximation's valid
+        # domain - report no floor rather than crash the whole run; std/CV
+        # are still meaningful at n=2, only the tolerance-sized floor is not.
+        return None, None
+    floor = mean - k * std
     # Ratios/precisions live in [0, 1] — clamp the suggested floor into that
     # range too. Counts/latencies are non-negative — never suggest a
     # negative floor.
     if min(vals) >= 0.0 and max(vals) <= 1.0:
         floor = min(floor, 1.0)
-    return max(floor, 0.0)
+    return max(floor, 0.0), k
+
+
+class ToleranceFactorSelfCheck(unittest.TestCase):
+    """Self-check for _tolerance_factor_k. Run via: python3 -m unittest scripts.perf.bench_calibrate"""
+
+    def test_k_10_matches_calibration_spec_pin(self) -> None:
+        k10 = _tolerance_factor_k(10)
+        self.assertLess(abs(k10 - 3.98), 0.05, f"k(10)={k10!r} not within 0.05 of the pinned 3.98")
+
+    def test_coverage_is_99_not_99_9_percent(self) -> None:
+        """Explicit resolution (#830 round-1): 99% coverage matches the #829
+        pin; 99.9% does not. Locks in the module constants plus both sides
+        of the discrepancy so a future edit can't silently flip this."""
+        self.assertEqual(_TOLERANCE_COVERAGE, 0.99)
+        self.assertEqual(_TOLERANCE_CONFIDENCE, 0.95)
+
+        k5_99, k10_99 = _tolerance_factor_k(5, coverage=0.99), _tolerance_factor_k(10, coverage=0.99)
+        self.assertAlmostEqual(k5_99, 5.7504, places=3)
+        self.assertAlmostEqual(k10_99, 3.9400, places=3)
+
+        k5_999, k10_999 = _tolerance_factor_k(5, coverage=0.999), _tolerance_factor_k(10, coverage=0.999)
+        self.assertAlmostEqual(k5_999, 7.5314, places=3)
+        self.assertAlmostEqual(k10_999, 5.1556, places=3)
+        self.assertGreater(
+            abs(k10_999 - 3.98), 0.05, "99.9% coverage's k(10) should NOT match the #829 pin"
+        )
+
+    def test_k_monotonically_decreasing_in_n(self) -> None:
+        ks = [_tolerance_factor_k(n) for n in range(3, 201)]
+        for i in range(len(ks) - 1):
+            self.assertGreater(
+                ks[i], ks[i + 1], f"k(n={i + 2})={ks[i]!r} <= k(n={i + 3})={ks[i + 1]!r} - not monotonically decreasing"
+            )
+
+    def test_k_requires_at_least_two_samples(self) -> None:
+        with self.assertRaises(ValueError):
+            _tolerance_factor_k(1)
+
+
+class Bench1mExtractSelfCheck(unittest.TestCase):
+    """Self-check for _bench1m_extract against the real vec_bench result shape
+    (#830 round-1 finding: scope=all_rows serializes an array, and
+    float(check["measured"]) crashed on it). Fixture captured from an actual
+    `bash scripts/bench_1m.sh --ci-synthetic` run.
+
+    Run via: python3 -m unittest scripts.perf.bench_calibrate
+    """
+
+    def _run_dir_with(self, tmp_path: pathlib.Path, payload: dict) -> pathlib.Path:
+        bench_out = tmp_path / "bench-out"
+        bench_out.mkdir()
+        (bench_out / f"{_BENCH1M_DATASET}.json").write_text(json.dumps(payload))
+        return tmp_path
+
+    def _extract(self, tmp_path: pathlib.Path, payload: dict) -> dict[str, float]:
+        run_dir = self._run_dir_with(tmp_path, payload)
+        proc = subprocess.CompletedProcess([], 0, "", "")
+        return _bench1m_extract(run_dir, proc)
+
+    def test_real_result_shape_extracts_without_crashing(self) -> None:
+        payload = json.loads(_BENCH1M_FIXTURE_PATH.read_text())
+        recall_check = next(
+            c for c in payload["assertions"]["checks"] if c["metric"] == "recall_at_10"
+        )
+        self.assertIsInstance(recall_check["measured"], list, "fixture must exercise the array shape")
+
+        with tempfile.TemporaryDirectory() as td:
+            metrics = self._extract(pathlib.Path(td), payload)
+
+        self.assertEqual(len(metrics), _BENCH1M_EXPECTED_METRIC_COUNT)
+        self.assertEqual(
+            metrics["assertion.recall_at_10.measured"], min(recall_check["measured"])
+        )
+        self.assertEqual(metrics["assertion.recall_at_10.pass"], 1.0)
+        self.assertEqual(metrics["row.n10000.recall_at_10"], payload["rows"][0]["recall_at_10"])
+
+    def test_schema_version_drift_rejected(self) -> None:
+        payload = json.loads(_BENCH1M_FIXTURE_PATH.read_text())
+        payload["schema_version"] = "999.0"
+        with tempfile.TemporaryDirectory() as td, self.assertRaises(SchemaError):
+            self._extract(pathlib.Path(td), payload)
+
+    def test_unexpected_assertion_metric_rejected(self) -> None:
+        payload = json.loads(_BENCH1M_FIXTURE_PATH.read_text())
+        payload["assertions"]["checks"][0]["metric"] = "totally_unexpected_metric"
+        with tempfile.TemporaryDirectory() as td, self.assertRaises(SchemaError):
+            self._extract(pathlib.Path(td), payload)
+
+    def test_wrong_scope_for_known_metric_rejected(self) -> None:
+        payload = json.loads(_BENCH1M_FIXTURE_PATH.read_text())
+        payload["assertions"]["checks"][0]["scope"] = "fits"
+        with tempfile.TemporaryDirectory() as td, self.assertRaises(SchemaError):
+            self._extract(pathlib.Path(td), payload)
+
+    def test_unexpected_row_n_rejected(self) -> None:
+        payload = json.loads(_BENCH1M_FIXTURE_PATH.read_text())
+        payload["rows"][0]["n"] = 12345
+        with tempfile.TemporaryDirectory() as td, self.assertRaises(SchemaError):
+            self._extract(pathlib.Path(td), payload)
+
+    def test_malformed_all_rows_measured_rejected(self) -> None:
+        payload = json.loads(_BENCH1M_FIXTURE_PATH.read_text())
+        payload["assertions"]["checks"][0]["measured"] = 0.95  # scalar, not array
+        with tempfile.TemporaryDirectory() as td, self.assertRaises(SchemaError):
+            self._extract(pathlib.Path(td), payload)
+
+    def test_short_all_rows_measured_array_rejected(self) -> None:
+        payload = json.loads(_BENCH1M_FIXTURE_PATH.read_text())
+        recall_check = next(
+            c for c in payload["assertions"]["checks"] if c["metric"] == "recall_at_10"
+        )
+        self.assertEqual(len(recall_check["measured"]), _BENCH1M_EXPECTED_ROWS)
+        recall_check["measured"] = recall_check["measured"][:-1]
+        with tempfile.TemporaryDirectory() as td, self.assertRaises(SchemaError):
+            self._extract(pathlib.Path(td), payload)
+
+    def test_long_all_rows_measured_array_rejected(self) -> None:
+        payload = json.loads(_BENCH1M_FIXTURE_PATH.read_text())
+        recall_check = next(
+            c for c in payload["assertions"]["checks"] if c["metric"] == "recall_at_10"
+        )
+        recall_check["measured"] = recall_check["measured"] + [recall_check["measured"][-1]]
+        with tempfile.TemporaryDirectory() as td, self.assertRaises(SchemaError):
+            self._extract(pathlib.Path(td), payload)
 
 
 _CV_NEAR_ZERO_EPS = 1e-9
@@ -414,6 +927,7 @@ def _build_profile(samples: dict[str, list[float]]) -> dict[str, dict]:
         # sample sizes (--runs) this harness is built around.
         std = statistics.stdev(vals) if n > 1 else 0.0
         cv = (std / mean) if abs(mean) > _CV_NEAR_ZERO_EPS else None
+        floor, k = _advisory_floor(vals, mean, std, n)
         profile[name] = {
             "n": n,
             "samples": vals,
@@ -422,7 +936,8 @@ def _build_profile(samples: dict[str, list[float]]) -> dict[str, dict]:
             "min": min(vals),
             "max": max(vals),
             "cv": cv,
-            "advisory_floor_mean_minus_3std": _advisory_floor(vals, mean, std),
+            "tolerance_k": k,
+            "advisory_floor_calibration_only": floor,
         }
     return profile
 
@@ -438,24 +953,34 @@ def _render_markdown(payload: dict) -> str:
     lines.append(f"- command: `{' '.join(payload['command_argv'])}`")
     lines.append("")
     lines.append(
-        "All floors below are **ADVISORY** — `mean - 3*std`, clamped to `[0, 1]` for "
-        "ratio-shaped metrics and to `>= 0` otherwise. This harness never sets a gate; "
-        "it only measures same-SHA noise so a human can place one with a known margin."
+        "All floors below are **ADVISORY-CALIBRATION-ONLY** — `mean - k(n)*std`, "
+        "clamped to `[0, 1]` for ratio-shaped metrics and to `>= 0` otherwise. `k(n)` "
+        "is the one-sided normal tolerance factor (Wald-Wolfowitz approximation) for "
+        f"{_TOLERANCE_COVERAGE * 100:.1f}% coverage / {_TOLERANCE_CONFIDENCE * 100:.0f}% "
+        "confidence, sized from the run count n so small same-SHA samples get a wider "
+        "margin than large ones. This harness never sets a gate; it only measures "
+        "same-SHA noise so a human can place one with a known margin."
     )
     lines.append("")
-    lines.append("| metric | n | mean | std | cv | min | max | advisory floor (mean-3*std) |")
-    lines.append("|---|---|---|---|---|---|---|---|")
+    lines.append("| metric | n | k(n) | mean | std | cv | min | max | advisory floor (calibration only) |")
+    lines.append("|---|---|---|---|---|---|---|---|---|")
     for name in sorted(payload["metrics"]):
         s = payload["metrics"][name]
         cv = f"{s['cv']:.4f}" if s["cv"] is not None else "n/a"
+        k_str = f"{s['tolerance_k']:.4f}" if s["tolerance_k"] is not None else "n/a"
+        floor_str = (
+            f"{s['advisory_floor_calibration_only']:.4g}"
+            if s["advisory_floor_calibration_only"] is not None
+            else "n/a (n too small)"
+        )
         lines.append(
-            f"| {name} | {s['n']} | {s['mean']:.4g} | {s['std']:.4g} | {cv} | "
-            f"{s['min']:.4g} | {s['max']:.4g} | {s['advisory_floor_mean_minus_3std']:.4g} |"
+            f"| {name} | {s['n']} | {k_str} | {s['mean']:.4g} | {s['std']:.4g} | {cv} | "
+            f"{s['min']:.4g} | {s['max']:.4g} | {floor_str} |"
         )
     lines.append("")
     lines.append(
         "Note: for lower-is-better metrics (latencies, error/backpressure counts), "
-        "`mean-3*std` as a *floor* is the wrong direction — read it as informational "
+        "`mean-k(n)*std` as a *floor* is the wrong direction — read it as informational "
         "spread only. Whether a metric is higher-is-better, lower-is-better, or purely "
         "observational (e.g. `_wall_s`), and where to actually place a blocking gate "
         "relative to this noise, remains a human decision."
@@ -591,6 +1116,22 @@ def main() -> int:
         return 1
 
     profile = _build_profile(samples)
+    try:
+        tolerance_k = _tolerance_factor_k(args.runs)
+        print(
+            f"[calibrate] tolerance factor k(n={args.runs})={tolerance_k:.4f} "
+            f"(coverage={_TOLERANCE_COVERAGE * 100:.1f}%, "
+            f"confidence={_TOLERANCE_CONFIDENCE * 100:.0f}%) - "
+            "floors below are advisory-calibration-only.",
+            flush=True,
+        )
+    except ToleranceDomainError as exc:
+        tolerance_k = None
+        print(
+            f"[calibrate] tolerance factor k(n={args.runs}) undefined: {exc} - "
+            "advisory floors omitted for this run (std/CV still reported).",
+            flush=True,
+        )
     payload = {
         "suite": args.suite,
         "git_sha": sha,
@@ -598,6 +1139,9 @@ def main() -> int:
         "runs": args.runs,
         "exit_codes": exit_codes,
         "produced_at": _iso_now(),
+        "tolerance_k": tolerance_k,
+        "tolerance_coverage": _TOLERANCE_COVERAGE,
+        "tolerance_confidence": _TOLERANCE_CONFIDENCE,
         "command_argv": suite["build_cmd"](runs_dir, extra_args),
         "run_artifacts_dir": str(runs_dir),
         "metrics": profile,
