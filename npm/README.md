@@ -1,6 +1,6 @@
 # khive
 
-A research knowledge graph runtime — 78 verbs, 10 packs, one MCP tool.
+A research knowledge graph runtime — 81 verbs, 10 packs, one MCP tool.
 
 [![GitHub](https://img.shields.io/github/stars/ohdearquant/khive?style=flat)](https://github.com/ohdearquant/khive)
 [![crates.io](https://img.shields.io/crates/v/khive-mcp.svg)](https://crates.io/crates/khive-mcp)
