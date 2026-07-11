@@ -937,6 +937,31 @@ fn edge_endpoints_exist(
     )
 }
 
+/// DML-only guarded single-row insert shared by both the legacy (flag-off)
+/// and WriterTask-routed (flag-on) `upsert_edge_guarded` paths.
+///
+/// Runs the guarded `INSERT` and, if it was refused, the missing-endpoint
+/// probe on the SAME connection with no gap for another writer to intervene
+/// between them, PROVIDED the caller holds the connection under a single
+/// write-locked transaction (either the WriterTask's own `BEGIN IMMEDIATE`,
+/// or an explicit one the flag-off caller opens around this call — round-4
+/// codex Medium: the singleton fallback previously ran the insert and the
+/// probe as two separate autocommit statements).
+fn edge_insert_guarded(
+    conn: &rusqlite::Connection,
+    statement: &SqlStatement,
+    source_id: Uuid,
+    target_id: Uuid,
+) -> Result<GuardedWriteOutcome, rusqlite::Error> {
+    let mut stmt = conn.prepare(&statement.sql)?;
+    bind_params(&mut stmt, &statement.params)?;
+    if stmt.raw_execute()? > 0 {
+        return Ok(GuardedWriteOutcome::Written);
+    }
+    let missing = edge_endpoints_exist(conn, source_id, target_id)?;
+    Ok(GuardedWriteOutcome::Refused(missing))
+}
+
 /// DML-only guarded batch upsert loop shared by both the legacy (flag-off)
 /// and WriterTask-routed (flag-on) `upsert_edges_guarded` paths, mirroring
 /// [`batch_upsert_edges`]'s split.
@@ -1071,21 +1096,44 @@ impl GraphStore for SqlGraphStore {
             edge.created_at.timestamp_micros(),
             metadata_str.as_deref(),
         );
+
+        // Same WriterTask routing as `upsert_edges_guarded` — the
+        // WriterTask's run loop owns its own `BEGIN IMMEDIATE`, so the
+        // insert and the missing-endpoint probe below already run inside
+        // one write-locked transaction; a bare `BEGIN IMMEDIATE` here would
+        // violate SQLite's nested-transaction rule.
+        if let Some(writer_task) = &self.writer_task {
+            return writer_task
+                .send(move |conn| {
+                    edge_insert_guarded(conn, &statement, source_id, target_id)
+                        .map_err(|e| map_err(e, "upsert_edge_guarded"))
+                })
+                .await;
+        }
+
+        // Flag-off (singleton) path: wrap the insert and the refused-probe
+        // in one explicit transaction so nothing can change an endpoint
+        // between them (round-4 codex Medium — this fallback previously
+        // ran the two as separate autocommit statements on the standalone
+        // writer connection).
         self.with_writer("upsert_edge_guarded", move |conn| {
-            let mut stmt = conn.prepare(&statement.sql)?;
-            bind_params(&mut stmt, &statement.params)?;
-            if stmt.raw_execute()? > 0 {
-                return Ok(GuardedWriteOutcome::Written);
+            conn.execute_batch("BEGIN IMMEDIATE")?;
+            let _tx_handle =
+                khive_storage::tx_registry::register(Some("graph_upsert_edge_guarded".to_string()));
+
+            let outcome = match edge_insert_guarded(conn, &statement, source_id, target_id) {
+                Ok(outcome) => outcome,
+                Err(e) => {
+                    let _ = conn.execute_batch("ROLLBACK");
+                    return Err(e);
+                }
+            };
+
+            if let Err(e) = conn.execute_batch("COMMIT") {
+                let _ = conn.execute_batch("ROLLBACK");
+                return Err(e);
             }
-            // Refused: probe which endpoint(s) were missing in the SAME
-            // writer closure as the insert above — same connection, same
-            // exclusive writer-lock hold, so nothing can delete or recreate
-            // an endpoint between the refused insert and this probe. This is
-            // what makes the reported `MissingEndpoints` an in-transaction
-            // fact rather than a reconstruction from a later, separately
-            // scheduled async read (round-2 codex Medium 1).
-            let missing = edge_endpoints_exist(conn, source_id, target_id)?;
-            Ok(GuardedWriteOutcome::Refused(missing))
+            Ok(outcome)
         })
         .await
     }

@@ -2795,3 +2795,135 @@ async fn upsert_edges_guarded_writes_nothing_when_one_endpoint_vanishes() {
         );
     }
 }
+
+/// Round-4 codex Medium: on the flag-off, file-backed singleton fallback
+/// (`SqlGraphStore::with_writer`'s `is_file_backed` branch, no `WriterTask`),
+/// `upsert_edge_guarded` must run its guarded `INSERT` and, when refused,
+/// the missing-endpoint probe inside ONE `BEGIN IMMEDIATE` transaction —
+/// not as two separate autocommit statements a concurrent writer could
+/// interleave between, recreating the endpoint after the insert was
+/// refused but before the probe explains why.
+///
+/// Forces the interleaving deterministically rather than racing on timing:
+/// an independent connection to the SAME database file grabs the write
+/// lock BEFORE the guarded call is even spawned and holds it while the
+/// guarded call's own standalone-writer connection blocks on its own
+/// `BEGIN IMMEDIATE`. Releasing that lock leaves the guarded call as the
+/// only contender, so it is guaranteed to acquire it before a third,
+/// later-spawned connection ("the racer") gets a chance to recreate the
+/// missing target. With the fix, the guarded call's insert and its
+/// missing-endpoint probe therefore always observe the same, still-missing
+/// target inside one held write lock, regardless of what the racer does
+/// immediately afterward.
+#[tokio::test]
+async fn upsert_edge_guarded_probe_is_atomic_with_insert_on_file_backed_singleton_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("guarded_atomic_singleton.db");
+
+    let pool_cfg = PoolConfig {
+        path: Some(path.clone()),
+        write_queue_enabled: false,
+        ..PoolConfig::default()
+    };
+    let pool = Arc::new(ConnectionPool::new(pool_cfg).unwrap());
+    {
+        let writer = pool.writer().unwrap();
+        writer.conn().execute_batch(GRAPH_DDL).unwrap();
+        writer
+            .conn()
+            .execute_batch(
+                "CREATE TABLE entities (id TEXT PRIMARY KEY, deleted_at INTEGER);
+                 CREATE TABLE notes (id TEXT PRIMARY KEY, deleted_at INTEGER);
+                 CREATE TABLE events (id TEXT PRIMARY KEY);",
+            )
+            .unwrap();
+    }
+    assert!(
+        pool.writer_task_handle().unwrap().is_none(),
+        "this test targets the no-WriterTask singleton fallback"
+    );
+
+    let store = Arc::new(SqlGraphStore::new_scoped(
+        Arc::clone(&pool),
+        true,
+        "default",
+    ));
+
+    let source = Uuid::new_v4();
+    let target = Uuid::new_v4();
+    insert_live_entity(&pool, source);
+    // target is intentionally never created — it is genuinely missing
+    // for the entire test, so any observed "exists" state can only come
+    // from the racer's later insert.
+
+    let edge = make_edge(source, target, EdgeRelation::Extends, 1.0);
+    let edge_id = edge.id;
+
+    // Grab the file's write lock from an independent connection before the
+    // guarded call is spawned, so its own `open_standalone_writer`
+    // connection is guaranteed to block on `BEGIN IMMEDIATE` rather than run.
+    let occupier = rusqlite::Connection::open(&path).unwrap();
+    occupier
+        .busy_timeout(std::time::Duration::from_secs(30))
+        .unwrap();
+    occupier.execute_batch("BEGIN IMMEDIATE").unwrap();
+
+    let guarded_task = {
+        let store = Arc::clone(&store);
+        tokio::spawn(async move { store.upsert_edge_guarded(edge).await })
+    };
+
+    // Give the guarded call's blocking task time to actually issue its own
+    // `BEGIN IMMEDIATE` and start waiting on the lock we hold.
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    // Release the lock. The guarded call, already parked in SQLite's busy
+    // retry loop, is the only contender and will acquire it next.
+    occupier.execute_batch("COMMIT").unwrap();
+
+    // Give the guarded call a moment to actually re-acquire the now-free
+    // lock before the racer even opens a connection, so the racer is the
+    // one left waiting rather than the other way around.
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+    // Only now attempt to recreate the missing target — from a THIRD
+    // connection racing the guarded call for the lock the guarded call
+    // should already be holding.
+    let racer_path = path.clone();
+    let racer = tokio::task::spawn_blocking(move || {
+        let conn = rusqlite::Connection::open(&racer_path).unwrap();
+        conn.busy_timeout(std::time::Duration::from_secs(30))
+            .unwrap();
+        conn.execute(
+            "INSERT INTO entities (id, deleted_at) VALUES (?1, NULL)",
+            rusqlite::params![target.to_string()],
+        )
+        .unwrap();
+    });
+
+    let outcome = guarded_task
+        .await
+        .expect("guarded task must not panic")
+        .unwrap();
+    racer.await.expect("racer task must not panic");
+
+    match outcome {
+        khive_storage::GuardedWriteOutcome::Refused(missing) => {
+            assert!(
+                missing.target,
+                "target was missing for the entire guarded write and must be \
+                 reported so, even though the racer recreated it immediately \
+                 afterward"
+            );
+            assert!(!missing.source, "source was always live");
+        }
+        other => panic!(
+            "guarded write must refuse an edge whose target never existed \
+             during the write, got {other:?}"
+        ),
+    }
+    assert!(
+        store.get_edge(edge_id).await.unwrap().is_none(),
+        "no dangling edge may be persisted"
+    );
+}
