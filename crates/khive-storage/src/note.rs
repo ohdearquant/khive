@@ -323,6 +323,24 @@ pub trait NoteStore: Send + Sync + 'static {
         filter: &NoteFilter,
         page: PageRequest,
     ) -> StorageResult<Page<Note>>;
+    /// Fetch up to `max_rows + 1` notes matching `filter` in a single
+    /// deterministically-ordered SQL statement, with no separate `COUNT(*)`
+    /// and no pagination loop.
+    ///
+    /// A single statement observes one consistent snapshot for its entire
+    /// execution, so the result cannot be split across a concurrent insert
+    /// the way a `COUNT(*)` followed by independent `LIMIT`/`OFFSET` pages
+    /// can. Callers detect the over-bound case by checking whether the
+    /// returned `Vec` has more than `max_rows` items — that means at least
+    /// `max_rows + 1` rows matched and the caller must reject the query
+    /// rather than silently return a truncated, possibly priority-incomplete
+    /// set.
+    async fn query_notes_filtered_bounded(
+        &self,
+        namespace: &str,
+        filter: &NoteFilter,
+        max_rows: u32,
+    ) -> StorageResult<Vec<Note>>;
     /// Count notes in a namespace, optionally filtered by kind.
     async fn count_notes(&self, namespace: &str, kind: Option<&str>) -> StorageResult<u64>;
 

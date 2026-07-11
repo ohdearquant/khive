@@ -2477,6 +2477,55 @@ async fn next_returns_explicit_error_when_matches_exceed_scan_bound() {
     );
 }
 
+/// #825 round 2 boundary test: exactly `TASK_SCAN_MAX_ROWS` (20,000) matching
+/// rows must succeed — the bound is "reject when more than 20,000 rows
+/// match", not "reject at or above 20,000".
+#[tokio::test]
+async fn next_succeeds_when_matches_exactly_at_scan_bound() {
+    use khive_storage::note::Note;
+
+    let runtime = rt();
+    let token = runtime
+        .authorize(khive_runtime::Namespace::local())
+        .unwrap();
+    let note_store = runtime.notes(&token).expect("note store");
+
+    let now = chrono::Utc::now().timestamp_micros();
+    let tasks: Vec<Note> = (0..20_000_u32)
+        .map(|i| Note {
+            id: uuid::Uuid::new_v4(),
+            namespace: "local".to_string(),
+            kind: "task".to_string(),
+            status: "active".to_string(),
+            name: Some(format!("task-{i}")),
+            content: format!("task {i}"),
+            salience: None,
+            decay_factor: None,
+            expires_at: None,
+            properties: Some(json!({"status": "next"})),
+            created_at: now + i64::from(i),
+            updated_at: now + i64::from(i),
+            deleted_at: None,
+        })
+        .collect();
+    note_store
+        .upsert_notes(tasks)
+        .await
+        .expect("insert tasks at scan bound");
+
+    let pack = pack(runtime);
+    let result = pack
+        .dispatch("gtd.next", json!({"limit": 5}))
+        .await
+        .expect("gtd.next must succeed when matches are exactly at the scan bound");
+    let arr = result.as_array().unwrap();
+    assert_eq!(
+        arr.len(),
+        5,
+        "gtd.next must still honor the requested limit"
+    );
+}
+
 /// Regression for a push-down bug where an explicit `status="inbox"` filter
 /// used a plain `Eq` predicate against `json_extract(properties, '$.status')`.
 /// `json_extract` on a legacy row with no stored `status` key evaluates to

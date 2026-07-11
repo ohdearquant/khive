@@ -502,16 +502,27 @@ minimal. Operators who want GTD configure it explicitly.
 - The `task` note kind is not a compile-time enum value. Validators must consult
   `VerbRegistry::all_note_kinds()`, not hard-coded sets.
   Mitigated: ADR-017's pattern; new packs work the same way.
-- `next` / `tasks` push status/assignee/priority predicates into SQL via
-  `query_notes_filtered` (issue #772) and page through every matching row (up
-  to 500 per page, 40 pages) instead of pre-fetching a fixed unfiltered
-  recency window. This keeps the candidate set bounded by how many tasks
-  actually match, not by how much unrelated churn exists. If a query matches
-  more than the 20,000-row scan bound, the op returns an explicit error
-  asking the caller to narrow the filters (e.g. add `assignee`) rather than
-  silently truncating and risking a hidden older `p0` task. Fine for
-  personal/agent workloads (typical inboxes < 50 actionable items); will need
-  property indexes or a v2 SQL path at hundreds-of-thousands scale.
+- `next` and `tasks` both push status/assignee/priority predicates into SQL
+  (issue #772) instead of pre-fetching a fixed unfiltered recency window, but
+  they bound the candidate set differently:
+  - `next` must priority-sort the _entire_ actionable (`next`/`active`) set
+    before applying the caller's `limit`, so it fetches every matching row
+    in one deterministically-ordered snapshot query
+    (`query_notes_filtered_bounded`, capped at 20,001 rows) rather than a
+    page loop — a page loop's separate `COUNT(*)` and per-page reads have no
+    spanning transaction, so a concurrent insert between pages can duplicate
+    or skip a boundary row. If more than 20,000 rows match, `next` returns an
+    explicit `InvalidInput` error asking the caller to narrow the filters
+    (e.g. add `assignee`) rather than ever sorting and returning a possibly
+    priority-incomplete set.
+  - `tasks` has no such bound: it is a caller-paginated `list`-style verb —
+    the caller supplies `limit`/`offset` via `query_notes_filtered` and pages
+    through results themselves, the same as any other paginated query verb.
+    There is no server-side row cap or over-bound rejection for `tasks`.
+
+  Fine for personal/agent workloads (typical inboxes < 50 actionable items);
+  `next`'s full-scan-then-sort will need property indexes or a v2 SQL path
+  (e.g. `ORDER BY` pushed into SQL) at hundreds-of-thousands scale.
 - Same-status transitions are no-ops, which can surprise callers expecting a write.
   Mitigated: `transitioned: false` + `note` field in the response body.
 - `depends_on` redundancy (property + edge) requires both writes to succeed for

@@ -444,35 +444,32 @@ fn ts_to_rfc(micros: i64) -> String {
     micros_to_iso(micros)
 }
 
-/// Page size used when scanning every row matching a pushed-down task filter.
-const TASK_SCAN_PAGE_SIZE: u32 = 500;
+/// Safety cap on matching rows [`fetch_all_matching_tasks`] will accept in a
+/// single snapshot query before refusing the request outright. A query
+/// matching more than this many rows is rejected before any priority sort
+/// runs — sorting a partial candidate set can hide an older, higher-priority
+/// task that fell outside the scan window.
+const TASK_SCAN_MAX_ROWS: u32 = 20_000;
 
-/// Safety cap on pages scanned by [`fetch_all_matching_tasks`] — bounds
-/// worst-case memory/latency for a pathological namespace while covering
-/// realistic actionable-task backlogs. Issue #772: this must not reintroduce
-/// a silent fixed-window cap. When the store reports more matching rows than
-/// this bound covers, the scan is aborted up front with an explicit error
-/// (see [`TASK_SCAN_MAX_ROWS`]) rather than silently returning a truncated,
-/// possibly priority-incomplete result.
-const TASK_SCAN_MAX_PAGES: u32 = 40;
-
-/// Total matching rows [`fetch_all_matching_tasks`] will scan before refusing
-/// the query outright. A query whose `COUNT(*)` exceeds this must be rejected
-/// before any priority sort runs — sorting a partial candidate set can hide
-/// an older, higher-priority task that fell outside the scan window.
-const TASK_SCAN_MAX_ROWS: u64 = TASK_SCAN_MAX_PAGES as u64 * TASK_SCAN_PAGE_SIZE as u64;
-
-/// Fetch every `task` note matching `property_filters`, paging through the
-/// store until exhausted rather than pre-fetching a single fixed-size
-/// unfiltered window. The predicate is pushed into SQL via
-/// `query_notes_filtered`, so the candidate set this returns is bounded by how
-/// many tasks actually match — not by how many task notes of any status exist
-/// (the #772 bug: a fixed unfiltered window could be entirely filled by newer
-/// non-matching churn, hiding older matching tasks regardless of priority).
+/// Fetch every `task` note matching `property_filters` in a single bounded
+/// snapshot query, instead of pre-fetching a fixed-size unfiltered window.
+/// The predicate is pushed into SQL via `query_notes_filtered_bounded`, so
+/// the candidate set this returns is bounded by how many tasks actually
+/// match — not by how many task notes of any status exist (the #772 bug: a
+/// fixed unfiltered window could be entirely filled by newer non-matching
+/// churn, hiding older matching tasks regardless of priority).
 ///
-/// If the first page's `total` exceeds [`TASK_SCAN_MAX_ROWS`], this returns
-/// `Err(InvalidInput)` instead of scanning a truncated subset — callers must
-/// narrow the filters (e.g. add `assignee`) so the result stays complete.
+/// `query_notes_filtered_bounded` fetches at most `TASK_SCAN_MAX_ROWS + 1`
+/// rows in one SQL statement with deterministic ordering — one consistent
+/// snapshot, not a `COUNT(*)` followed by independent paged reads that a
+/// concurrent insert could split across (issue #825 round 2: the prior
+/// page-loop version re-queried the store per page with no transaction
+/// spanning them, so a row inserted between pages could appear duplicated
+/// across a page boundary, or the scan could hit its cap and still return
+/// `Ok` with an incomplete set). If `TASK_SCAN_MAX_ROWS + 1` rows come back,
+/// this returns `Err(InvalidInput)` instead of ever returning a possibly
+/// truncated result — callers must narrow the filters (e.g. add `assignee`)
+/// so the result stays complete.
 async fn fetch_all_matching_tasks(
     runtime: &KhiveRuntime,
     token: &NamespaceToken,
@@ -495,48 +492,20 @@ async fn fetch_all_matching_tasks(
     };
     let store = runtime.notes(token)?;
 
-    let mut notes = Vec::new();
-    let mut offset: u32 = 0;
-    for page_idx in 0..TASK_SCAN_MAX_PAGES {
-        let page = store
-            .query_notes_filtered(
-                token.namespace().as_str(),
-                &filter,
-                PageRequest {
-                    limit: TASK_SCAN_PAGE_SIZE,
-                    offset: offset.into(),
-                },
-            )
-            .await
-            .map_err(|e| RuntimeError::Internal(format!("query_notes_filtered: {e}")))?;
-        if page_idx == 0 {
-            if let Some(total) = page.total {
-                if total > TASK_SCAN_MAX_ROWS {
-                    return Err(RuntimeError::InvalidInput(format!(
-                        "gtd: {total} tasks match this query, which exceeds the \
-                         {TASK_SCAN_MAX_ROWS}-row scan bound; narrow the filters \
-                         (e.g. specify assignee) and retry so results stay complete \
-                         and priority-ordered instead of being silently truncated"
-                    )));
-                }
-            }
-        }
-        let fetched = page.items.len() as u32;
-        notes.extend(page.items);
-        if fetched < TASK_SCAN_PAGE_SIZE {
-            return Ok(notes);
-        }
-        offset += TASK_SCAN_PAGE_SIZE;
+    let notes = store
+        .query_notes_filtered_bounded(token.namespace().as_str(), &filter, TASK_SCAN_MAX_ROWS)
+        .await
+        .map_err(|e| RuntimeError::Internal(format!("query_notes_filtered_bounded: {e}")))?;
+
+    if notes.len() as u32 > TASK_SCAN_MAX_ROWS {
+        return Err(RuntimeError::InvalidInput(format!(
+            "gtd: more than {TASK_SCAN_MAX_ROWS} tasks match this query, which exceeds the \
+             {TASK_SCAN_MAX_ROWS}-row scan bound; narrow the filters \
+             (e.g. specify assignee) and retry so results stay complete \
+             and priority-ordered instead of being silently truncated"
+        )));
     }
-    // Reached only if the matching-row count grew past TASK_SCAN_MAX_ROWS
-    // between the first page's COUNT(*) and this scan completing (concurrent
-    // writes) — the up-front check above is the primary defense. Warn loudly
-    // rather than silently return a possibly priority-incomplete set.
-    tracing::warn!(
-        namespace = token.namespace().as_str(),
-        scanned = TASK_SCAN_MAX_ROWS,
-        "gtd: task scan hit safety cap after total-based check passed; results may be incomplete"
-    );
+
     Ok(notes)
 }
 
