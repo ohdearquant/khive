@@ -1119,6 +1119,31 @@ mod substrate_labels {
             .unwrap()
     }
 
+    /// `fixture_db()` plus a second entity and a `graph_edges` row connecting
+    /// it to `e-fixture-1`. SPARQL requires at least one variable-to-variable
+    /// relation triple to parse (`no edge patterns found` otherwise), so any
+    /// SPARQL regression test needs a connected graph, unlike the single-node
+    /// GQL substrate-label tests below.
+    fn fixture_db_with_edge() -> Connection {
+        let conn = fixture_db();
+        conn.execute_batch(
+            "INSERT INTO entities
+                (id, namespace, kind, name, description, properties, tags,
+                 created_at, updated_at, deleted_at, entity_type)
+            VALUES
+                ('e-fixture-2', 'local', 'document', 'Y', NULL, '{}', '[]',
+                 0, 0, NULL, NULL);
+            INSERT INTO graph_edges
+                (namespace, id, source_id, target_id, relation, weight,
+                 created_at, updated_at, deleted_at, metadata, target_backend)
+            VALUES
+                ('local', 'edge-fixture-1', 'e-fixture-1', 'e-fixture-2',
+                 'extends', 1.0, 0, 0, NULL, NULL, NULL);",
+        )
+        .unwrap();
+        conn
+    }
+
     #[test]
     fn entity_substrate_label_compiles_without_unsatisfiable_kind_filter() {
         let q = parse(
@@ -1201,7 +1226,7 @@ mod substrate_labels {
     fn sparql_entity_substrate_label_compiles_and_returns_row() {
         let q = parse(
             QueryLanguage::Sparql,
-            "SELECT ?e WHERE { ?e a :entity . ?e :name \"X\" . }",
+            "SELECT ?e WHERE { ?e a :entity . ?e :name \"X\" . ?e :extends ?c . }",
         )
         .unwrap();
         let compiled = compile(&q, &opts()).unwrap();
@@ -1211,7 +1236,7 @@ mod substrate_labels {
             compiled.sql
         );
 
-        let conn = fixture_db();
+        let conn = fixture_db_with_edge();
         let db_params: Vec<Box<dyn rusqlite::ToSql>> = compiled
             .params
             .iter()
