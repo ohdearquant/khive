@@ -52,8 +52,6 @@ import json
 import os
 import pathlib
 import random
-import socket as socketlib
-import struct
 import subprocess
 import sys
 import tempfile
@@ -64,11 +62,12 @@ from concurrent.futures import TimeoutError as FutureTimeoutError
 
 sys.path.insert(0, str(pathlib.Path(__file__).parent))
 import bench_pipeline_daemon as bpd  # noqa: E402  (reuse framing/lifecycle helpers)
+import mcp_bench_client as mbc  # noqa: E402  (shared MCP/daemon client plumbing, PR2)
 
 REPO_ROOT = pathlib.Path(__file__).parent.parent.parent
 
 # ── Wire protocol constants (mirrors crates/khive-runtime/src/daemon.rs) ──────
-PROTOCOL_VERSION = 3
+PROTOCOL_VERSION = mbc.PROTOCOL_VERSION
 # Pack posture for the spawned scratch daemon (feeds KHIVE_PACKS). Pinned explicitly here rather
 # than reused from bpd._DEFAULT_PACKS so the config_id/registry surface is stated, not inherited.
 #
@@ -153,123 +152,14 @@ def release_metal_gpu_lock(fh) -> None:
 # Every other channel goes through the existing front-end binary (stdio MCP).
 # This is the one place we speak the daemon's Unix-socket wire protocol
 # directly in Python, because the oracle channel needs a `metrics_only` frame
-# field that the stdio/MCP surface has no verb for (it isn't merged yet).
+# field the stdio/MCP surface has no verb for. Implementation now lives in
+# mcp_bench_client.py (PR2 shared client module); these names stay so the rest
+# of this file (and any external caller) is unaffected by the move.
 
-
-def _recv_exact(sock: socketlib.socket, n: int) -> bytes:
-    buf = b""
-    while len(buf) < n:
-        chunk = sock.recv(n - len(buf))
-        if not chunk:
-            raise RuntimeError("daemon socket closed mid-frame")
-        buf += chunk
-    return buf
-
-
-def _raw_daemon_roundtrip(sock_path: str, frame: dict, timeout_s: float = 5.0) -> dict:
-    s = socketlib.socket(socketlib.AF_UNIX, socketlib.SOCK_STREAM)
-    s.settimeout(timeout_s)
-    try:
-        s.connect(sock_path)
-        payload = json.dumps(frame).encode()
-        s.sendall(struct.pack(">I", len(payload)) + payload)
-        len_buf = _recv_exact(s, 4)
-        (length,) = struct.unpack(">I", len_buf)
-        raw = _recv_exact(s, length)
-        return json.loads(raw)
-    finally:
-        s.close()
-
-
-def _base_daemon_frame(ops: str, config_id: str, probe_only: bool) -> dict:
-    """Build a DaemonRequestFrame JSON payload. `presentation` /
-    `presentation_per_op` / `namespace` have no serde default on the Rust
-    struct (unlike the rest), so they must always be present in the wire
-    payload or the daemon silently drops the connection.
-    """
-    return {
-        "ops": ops,
-        "presentation": None,
-        "presentation_per_op": None,
-        "namespace": "local",
-        "actor_id": None,
-        "visible_namespaces": [],
-        "config_id": config_id,
-        "protocol_version": PROTOCOL_VERSION,
-        "probe_only": probe_only,
-        "format": None,
-        "format_per_op": None,
-        "from_wire": False,
-    }
-
-
-def probe_oracle_channel(sock_path: str) -> dict:
-    """Two-step probe against the daemon-frame snapshot channel.
-
-    Step 1 — config_id discovery: send an intentionally WRONG config_id as a
-    probe_only frame. The daemon computes and echoes `served_config_id` on
-    EVERY response, including a `config_mismatch` one, so this harvests the
-    daemon's real config_id without reimplementing its Rust-side computation
-    in Python.
-
-    Step 2 — metrics support probe: resend with the correct config_id and an
-    extra `metrics_only: true` field (the field name the not-yet-merged
-    metrics-frame PR is expected to define). Today this field is unknown to
-    the server and silently ignored (serde ignores unrecognized JSON keys by
-    default), so the request just dispatches `ops` normally and the response
-    carries no `metrics` key — that absence IS the "PENDING" signal. Once the
-    metrics PR merges, a `metrics` key appearing in the response flips this to
-    "LIVE" with no code change required here.
-
-    Never raises: any failure degrades to PENDING with the reason recorded.
-    """
-    try:
-        resp1 = _raw_daemon_roundtrip(
-            sock_path, _base_daemon_frame("", "__loadharness_discovery_probe__", True)
-        )
-    except Exception as exc:
-        return {"oracle": "PENDING", "config_id": None, "detail": f"discovery round-trip failed: {exc!r}"}
-
-    real_config_id = resp1.get("served_config_id")
-    if not real_config_id:
-        return {
-            "oracle": "PENDING",
-            "config_id": None,
-            "detail": f"no served_config_id in discovery response: {resp1}",
-        }
-
-    metrics_frame = _base_daemon_frame("stats()", real_config_id, False)
-    metrics_frame["metrics_only"] = True
-    try:
-        resp2 = _raw_daemon_roundtrip(sock_path, metrics_frame)
-    except Exception as exc:
-        return {
-            "oracle": "PENDING",
-            "config_id": real_config_id,
-            "detail": f"metrics probe round-trip failed: {exc!r}",
-        }
-
-    if resp2.get("config_mismatch"):
-        return {
-            "oracle": "PENDING",
-            "config_id": real_config_id,
-            "detail": f"config_mismatch on metrics probe (unexpected race): {resp2}",
-        }
-    if resp2.get("metrics") is not None:
-        return {
-            "oracle": "LIVE",
-            "config_id": real_config_id,
-            "detail": "response carries a populated `metrics` key",
-            "metrics": resp2["metrics"],
-        }
-    return {
-        "oracle": "PENDING",
-        "config_id": real_config_id,
-        "detail": (
-            "no `metrics` key in response — this daemon predates the metrics-frame "
-            "PR (metrics_only was ignored as an unknown field)"
-        ),
-    }
+_recv_exact = mbc.recv_exact
+_raw_daemon_roundtrip = mbc.raw_daemon_roundtrip
+_base_daemon_frame = mbc.base_daemon_frame
+probe_oracle_channel = mbc.probe_metrics_snapshot
 
 
 # ── generic nested-value lookup (attribution readback, dim 8) ────────────────
