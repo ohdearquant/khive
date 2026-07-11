@@ -972,6 +972,35 @@ impl KhiveMcpServer {
                         .await
                     {
                         Ok(result_obj) => {
+                            // Guard against a pathologically deep handler result
+                            // (e.g. `traverse`/`context`) before it is ever cloned
+                            // into `$prev` context or handed to presentation/
+                            // serialization, both of which recurse natively over
+                            // `Value` and would otherwise be exposed to the same
+                            // unbounded-nesting stack-overflow risk (CWE-674) the
+                            // DSL parser guard already closes for syntax input.
+                            if result_exceeds_depth_limit(&result_obj) {
+                                let tool_name = result_obj
+                                    .get("tool")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or_default()
+                                    .to_string();
+                                results.push(json!({
+                                    "ok": false,
+                                    "tool": tool_name,
+                                    "error": {
+                                        "kind": "result_too_deep",
+                                        "message": format!(
+                                            "op result nesting depth exceeds max {}; \
+                                             cannot be used as $prev chain context",
+                                            khive_request::NESTING_DEPTH_LIMIT
+                                        ),
+                                    },
+                                }));
+                                prev_result = None;
+                                aborted_from = Some(i + 1);
+                                continue;
+                            }
                             // Extract canonical result for $prev (pre-presentation).
                             prev_result = result_obj.get("result").cloned();
                             // Apply presentation to the result field only,
@@ -1242,6 +1271,21 @@ async fn dispatch_via_coordinator_inner(
         }
         _ => None,
     }
+}
+
+/// Returns `true` if a dispatched op's canonical `result` field nests
+/// container values (`[`/`{`) deeper than [`khive_request::NESTING_DEPTH_LIMIT`].
+///
+/// Handler results (e.g. `traverse`/`context`) are not bounded by the DSL
+/// parser's syntax-tree guard, so a pathologically deep result could still
+/// overflow the stack via recursive `Value::clone` or serialization once
+/// stored as `$prev` chain context. Delegates to
+/// [`khive_request::value_nesting_within_limit`], which walks an explicit
+/// worklist instead of native recursion.
+fn result_exceeds_depth_limit(result_obj: &Value) -> bool {
+    result_obj.get("result").is_some_and(|v| {
+        !khive_request::value_nesting_within_limit(v, khive_request::NESTING_DEPTH_LIMIT)
+    })
 }
 
 /// Apply the presentation transform to the `result` field of a successful
@@ -1805,6 +1849,130 @@ mod tests {
             "dispatch hook must update the same BrainPack instance the registry \
              dispatches brain.* verbs to; got snapshot {state:?}"
         );
+    }
+
+    // ── #823 finding 1: runtime `$prev` result depth guard ───────────────────
+
+    /// Iteratively (no native recursion) wrap `leaf` in `depth` nested
+    /// single-key objects, a synthetic stand-in for a pathologically deep
+    /// handler result (e.g. from `traverse`/`context`) that would otherwise
+    /// overflow the stack when cloned into `$prev` chain context.
+    fn nest_object(depth: usize, leaf: Value) -> Value {
+        let mut v = leaf;
+        for _ in 0..depth {
+            v = json!({ "nested": v });
+        }
+        v
+    }
+
+    #[test]
+    fn deep_nested_result_over_limit_is_flagged() {
+        let deep = nest_object(
+            khive_request::NESTING_DEPTH_LIMIT + 5,
+            json!({"leaf": true}),
+        );
+        let result_obj = json!({ "ok": true, "tool": "traverse", "result": deep });
+        assert!(
+            result_exceeds_depth_limit(&result_obj),
+            "result nested past NESTING_DEPTH_LIMIT must be flagged"
+        );
+    }
+
+    #[test]
+    fn result_at_exactly_the_depth_limit_is_not_flagged() {
+        // A scalar leaf (not a container) so the wrapping objects alone land
+        // exactly at NESTING_DEPTH_LIMIT containers deep.
+        let at_limit = nest_object(khive_request::NESTING_DEPTH_LIMIT, json!(true));
+        let result_obj = json!({ "ok": true, "tool": "traverse", "result": at_limit });
+        assert!(
+            !result_exceeds_depth_limit(&result_obj),
+            "result nested exactly at the limit must still be usable as $prev context"
+        );
+    }
+
+    #[test]
+    fn shallow_result_is_not_flagged() {
+        let shallow = json!({"a": {"b": {"c": 1}}});
+        let result_obj = json!({ "ok": true, "tool": "get", "result": shallow });
+        assert!(!result_exceeds_depth_limit(&result_obj));
+    }
+
+    #[test]
+    fn result_missing_field_is_not_flagged() {
+        let result_obj = json!({ "ok": false, "tool": "get", "error": "not found" });
+        assert!(!result_exceeds_depth_limit(&result_obj));
+    }
+
+    #[tokio::test]
+    async fn chain_with_deep_accumulated_prev_result_errors_cleanly() {
+        // Real end-to-end reproduction: chain N `create` ops where each step's
+        // `properties.inner` embeds the previous op's full `properties` via
+        // `$prev.properties`. Each op's own DSL args stay shallow (well under
+        // NESTING_DEPTH_LIMIT), but the accumulated *runtime result* nests one
+        // level deeper per chain step, the exact CWE-674 shape the parser's
+        // syntax-tree guard cannot see. Past the limit this must surface a
+        // clean per-op `result_too_deep` error and abort the remaining chain,
+        // never attempting to clone/serialize the unbounded value.
+        let config = RuntimeConfig {
+            db_path: None,
+            default_namespace: Namespace::local(),
+            embedding_model: None,
+            additional_embedding_models: vec![],
+            packs: vec!["kg".to_string()],
+            ..RuntimeConfig::default()
+        };
+        let runtime = KhiveRuntime::new(config).expect("in-memory runtime");
+        let server = KhiveMcpServer::new(runtime).expect("server builds with kg");
+
+        let steps = khive_request::NESTING_DEPTH_LIMIT + 6;
+        let mut dsl = String::from(
+            r#"create(kind="entity", entity_kind="concept", name="d0", properties={"n": 0})"#,
+        );
+        for i in 1..steps {
+            dsl.push_str(&format!(
+                r#" | create(kind="entity", entity_kind="concept", name="d{i}", properties={{"inner": $prev.properties}})"#
+            ));
+        }
+
+        let parsed = parse_request(&dsl).expect("each op's own args stay shallow; DSL must parse");
+        assert_eq!(parsed.mode, ExecutionMode::Chain);
+
+        let response = server
+            .run_parsed(
+                parsed.ops,
+                parsed.mode,
+                PresentationMode::Verbose,
+                None,
+                false,
+                None,
+            )
+            .await;
+
+        let results = response["results"]
+            .as_array()
+            .expect("results must be an array");
+        assert_eq!(results.len(), steps);
+
+        let failure_idx = results
+            .iter()
+            .position(|r| r["ok"] == json!(false))
+            .expect("accumulated nesting must trip the depth guard before the chain completes");
+        assert_eq!(
+            results[failure_idx]["error"]["kind"],
+            json!("result_too_deep"),
+            "unexpected failure shape at index {failure_idx}: {:?}",
+            results[failure_idx]
+        );
+
+        // Every op after the failing one is marked aborted, not attempted,
+        // proving the process kept running instead of crashing.
+        for r in &results[failure_idx + 1..] {
+            assert_eq!(
+                r["aborted"],
+                json!(true),
+                "expected abort after the depth guard trips: {r:?}"
+            );
+        }
     }
 
     // ── MCP-AUD-002 regression: save_to must bypass daemon forwarding ────────

@@ -11,7 +11,15 @@ pub const MAX_OPS: usize = 100;
 /// input; does not by itself bound container-nesting depth (see
 /// [`NESTING_DEPTH_LIMIT`]), since a compact payload can still pack tens of
 /// thousands of nesting levels into a few KiB.
-pub const MAX_OPS_INPUT_LEN: usize = 256 * 1024;
+///
+/// 1 MiB, not 256 KiB: ADR-038's bulk-operations contract promises up to 1000
+/// items per bulk `create` call (`crates/khive-pack-kg/src/handler_defs.rs`,
+/// `items` param). A realistic 1000-item batch with ~220-byte descriptions
+/// runs to roughly 276 KB once wrapped in the `request` DSL/JSON envelope,
+/// which already blows past a 256 KiB cap. 1 MiB gives that documented
+/// contract several times its observed size in headroom while still
+/// rejecting the multi-hundred-MB inputs this cap exists to stop.
+pub const MAX_OPS_INPUT_LEN: usize = 1024 * 1024;
 
 /// Hard cap on container-nesting depth (`[`/`{`) tracked through the DSL
 /// parser, the JSON-form pre-pass scan, and (by construction, since
@@ -26,6 +34,40 @@ pub const NESTING_DEPTH_LIMIT: usize = 64;
 
 /// Names reserved at the request-envelope level; rejected if they appear inside verb args.
 pub const RESERVED_ENVELOPE_ARGS: &[&str] = &["presentation", "presentation_per_op"];
+
+/// Iteratively check container-nesting depth of a runtime [`Value`], returning
+/// `false` once nesting exceeds `max_depth`.
+///
+/// Unlike the parser guards above (which bound the DSL's own syntax tree),
+/// values checked here come from verb handler results, e.g. a `traverse` or
+/// `context` result about to be stored as `$prev` chain context, and are
+/// otherwise unbounded. Walks an explicit worklist on the heap instead of
+/// native recursion, so a pathologically deep result cannot overflow the
+/// thread stack via `Value::clone` or serialization (CWE-674) before this
+/// check has a chance to reject it.
+pub fn value_nesting_within_limit(value: &Value, max_depth: usize) -> bool {
+    let mut stack: Vec<(&Value, usize)> = vec![(value, 0)];
+    while let Some((v, depth)) = stack.pop() {
+        match v {
+            Value::Array(items) => {
+                let next_depth = depth + 1;
+                if next_depth > max_depth {
+                    return false;
+                }
+                stack.extend(items.iter().map(|item| (item, next_depth)));
+            }
+            Value::Object(map) => {
+                let next_depth = depth + 1;
+                if next_depth > max_depth {
+                    return false;
+                }
+                stack.extend(map.values().map(|item| (item, next_depth)));
+            }
+            _ => {}
+        }
+    }
+    true
+}
 
 /// Execution mode: `Single` (one op), `Parallel` (`[...]`), or `Chain` (`op | op`).
 #[derive(Debug, Clone, PartialEq, Eq)]
