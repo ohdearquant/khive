@@ -1,0 +1,207 @@
+name: Bench Trend Tracking
+
+# Informational trend tracking for BOTH component (Criterion) and e2e
+# (pipeline / bench-1m synthetic) benchmarks. Per the bench-program spec
+# (.khive/workspaces/20260710/bench-program/SPEC-draft.md, "Blocking-promotion
+# ladder"): every metric here is Advisory - measured, appended to
+# bench-data/<suite>.jsonl on the `perf-data` branch, and rendered as a trend
+# summary. Nothing in this workflow asserts pass/fail or sets a threshold;
+# that requires K>=10 same-SHA calibration (scripts/perf/bench_calibrate.py)
+# plus a >=2-week zero-alarm observation window before any promotion
+# conversation starts. This workflow is Wave 2's ledger-writer, not a gate.
+#
+# Efficiency (directive requirement):
+#   - Never runs on pull_request - push-to-main, nightly cron, and manual
+#     dispatch only.
+#   - Swatinem/rust-cache on both jobs; a `--no-run` compile check runs
+#     before the timed criterion pass so a bench-rot build failure is cheap.
+#   - Criterion runs with `--quick` (shortened measurement time, relaxed
+#     outlier detection) and the whole run is wall-clock bounded (~15 min)
+#     via `timeout`.
+#   - paths-filtered push trigger (crates/**, scripts/perf/**, this file) -
+#     docs-only pushes to main never fire this workflow.
+#   - concurrency: nightly cron runs share one group with
+#     cancel-in-progress, so an overlapping/stuck nightly never queues
+#     behind another; push/dispatch runs get their own group and are never
+#     cancelled (each carries a distinct commit's data point).
+#   - single repository variable (`BENCH_TRACK_DISABLED`) skips both jobs
+#     entirely.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "crates/**"
+      - "scripts/perf/**"
+      - ".github/workflows/bench-track.yml"
+  schedule:
+    - cron: "17 7 * * *" # nightly, off-peak UTC
+  workflow_dispatch: {}
+
+env:
+  CARGO_TERM_COLOR: always
+  PERF_DATA_BRANCH: perf-data
+  BENCH_BOT_NAME: khive-bench-bot
+  BENCH_BOT_EMAIL: khive-bench-bot@users.noreply.github.com
+
+concurrency:
+  group: bench-track-${{ github.event_name == 'schedule' && 'nightly' || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'schedule' }}
+
+jobs:
+  # ─────────────────────────────────────────────────────────────────────────
+  # Component benches: the 23 Criterion targets across 20 crates, quick
+  # profile, bounded wall-clock. Advisory ledger: bench-data/components.jsonl
+  # ─────────────────────────────────────────────────────────────────────────
+  components:
+    name: Component benches (Criterion, quick profile)
+    runs-on: ubuntu-latest
+    if: vars.BENCH_TRACK_DISABLED != 'true'
+    timeout-minutes: 20
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@1.94.1
+
+      - name: Pin the real toolchain bin on PATH
+        run: dirname "$(rustup which cargo)" >> "$GITHUB_PATH"
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates
+          cache-on-failure: true
+
+      - name: Compile-check every bench target (cheap, catches bench rot)
+        working-directory: crates
+        run: cargo bench --workspace --all-targets --no-run
+
+      - name: Run Criterion benches (quick profile, bounded ~12 min)
+        working-directory: crates
+        # `|| true`: a single bench's internal assertion (e.g. khive-quant's
+        # SQ8-vs-f32 speed ceiling) failing must not prevent the ledger from
+        # recording every OTHER bench's estimates.json that did get written -
+        # per-bench correctness gates are that bench's own concern, not this
+        # advisory tracker's. `timeout` bounds the whole pass; `--quick`
+        # shortens per-bench measurement time and relaxes outlier detection.
+        run: timeout 720 cargo bench --workspace -- --quick || true
+
+      - name: Record trend ledger entry
+        run: |
+          set -euo pipefail
+          python3 scripts/perf/bench_track.py record \
+            --suite components \
+            --source criterion \
+            --criterion-dir crates/target/criterion \
+            --sha "${{ github.sha }}" \
+            --branch "${{ github.ref_name }}" \
+            --data-dir bench-data \
+            --summary-out /tmp/components-trend.md
+
+      - name: Publish ledger to perf-data branch
+        run: bash scripts/perf/publish_ledger.sh bench-data/components.jsonl
+
+      - name: Write step summary
+        if: always()
+        run: cat /tmp/components-trend.md >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || true
+
+      - name: Upload raw criterion output
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: bench-track-components-${{ github.run_id }}
+          path: crates/target/criterion
+          retention-days: 90
+          if-no-files-found: ignore
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # e2e benches: the pipeline daemon suite (bench_calibrate's `pipeline`
+  # extractor, reused not duplicated) plus the hermetic bench-1m synthetic
+  # gate, run once as an informational data point. Advisory ledgers:
+  # bench-data/pipeline.jsonl, bench-data/bench-1m.jsonl
+  # ─────────────────────────────────────────────────────────────────────────
+  e2e:
+    name: E2E benches (pipeline + bench-1m synthetic)
+    runs-on: ubuntu-latest
+    if: vars.BENCH_TRACK_DISABLED != 'true'
+    timeout-minutes: 20
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@1.94.1
+        with:
+          components: rustfmt, clippy
+
+      - name: Pin the real toolchain bin on PATH
+        run: dirname "$(rustup which cargo)" >> "$GITHUB_PATH"
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates
+          cache-on-failure: true
+
+      - uses: astral-sh/setup-uv@v5
+
+      - name: Build kkernel (bench-embedder feature)
+        run: |
+          set -euo pipefail
+          cargo build --release -p kkernel --features bench-embedder --manifest-path crates/Cargo.toml
+          cp crates/target/release/kkernel crates/target/release/kkernel-bench
+
+      - name: Record pipeline suite (single informational run)
+        env:
+          KKERNEL_BENCH_BINARY: crates/target/release/kkernel-bench
+        run: |
+          set -euo pipefail
+          python3 scripts/perf/bench_track.py record \
+            --suite pipeline \
+            --source calibrate \
+            --sha "${{ github.sha }}" \
+            --branch "${{ github.ref_name }}" \
+            --data-dir bench-data \
+            --summary-out /tmp/pipeline-trend.md
+
+      - name: Run hermetic bench-1m synthetic gate (informational, --runs 1)
+        # Same hermetic synthetic path bench-1m.yml's blocking ann-ci-gate
+        # uses (seed=42, no SIFT download) - runnable on standard runners,
+        # so it runs here too, but only ever informational: this workflow
+        # never asserts pass/fail on its output, only records it.
+        run: bash scripts/bench_1m.sh --ci-synthetic
+
+      - name: Record bench-1m suite (single informational run)
+        run: |
+          set -euo pipefail
+          python3 scripts/perf/bench_track.py record \
+            --suite bench-1m \
+            --source json \
+            --json-file target/bench-out/SIFT-CI-synthetic.json \
+            --sha "${{ github.sha }}" \
+            --branch "${{ github.ref_name }}" \
+            --data-dir bench-data \
+            --summary-out /tmp/bench-1m-trend.md
+
+      - name: Publish ledgers to perf-data branch
+        run: bash scripts/perf/publish_ledger.sh bench-data/pipeline.jsonl bench-data/bench-1m.jsonl
+
+      - name: Write step summary
+        if: always()
+        run: |
+          cat /tmp/pipeline-trend.md >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || true
+          cat /tmp/bench-1m-trend.md >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || true
+
+      - name: Upload raw e2e output
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: bench-track-e2e-${{ github.run_id }}
+          path: |
+            perf/pipeline-ledger.csv
+            target/bench-out/SIFT-CI-synthetic.json
+            perf/ci-synthetic-ledger.csv
+          retention-days: 90
+          if-no-files-found: ignore
