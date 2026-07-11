@@ -9,8 +9,9 @@
 **Related**: ADR-085 (Code Pack - admin-only ingest path precedent), ADR-004 (Substrate
 Observables - `Event` store used for audit)
 
-This is a decision ADR for a human spec gate. It enumerates forks with trade-offs rather
-than picking silently. Open Questions are marked explicitly and are not resolved here.
+This ADR enumerates forks with trade-offs rather than picking silently. The forks below were
+resolved through design review; each fork's resolution is recorded in place, and the
+Resolutions section summarizes all five rulings.
 
 ## Context
 
@@ -47,8 +48,8 @@ the event plane, exactly as every other khive verb already is.
 This ADR proposes adding a write-verb surface to `khive-pack-git`, structurally consistent
 with the pack's existing `git.digest` verb (agent-facing, `pack.verb` namespaced per
 ADR-023) and dispatched through the same `VerbRegistry` / `Gate` seam every other verb uses.
-It deliberately does **not** fix the four forks below - those are the open decisions this
-ADR exists to present to the spec gate.
+The four forks below were presented to design review; each is resolved in place, with the
+full set of rulings summarized in the Resolutions section.
 
 ### Candidate verb set (subject to Fork (a))
 
@@ -62,10 +63,11 @@ At minimum, three write operations are named as design inputs:
   `force` is a parameter only for validation purposes: see the force-push rule below, which
   makes every `force=true` request a hard deny regardless of policy.
 
-A broader candidate list, to be narrowed at the spec gate: `git.checkout`, `git.merge`,
-`git.tag`, `git.pull` (fetch+merge/rebase - arguably read-adjacent, not a write to the
-target repo's canonical history, but it mutates the local working copy), `git.fetch`
-(unambiguously read-only against the remote, local-write only).
+A broader candidate list was considered and, per the resolution to Open Question 1 below, is
+out of scope for this phase: `git.checkout`, `git.merge`, `git.tag`, `git.pull`
+(fetch+merge/rebase - arguably read-adjacent, not a write to the target repo's canonical
+history, but it mutates the local working copy), `git.fetch` (unambiguously read-only
+against the remote, local-write only).
 
 ### Hard rules (not forked - these apply regardless of how the forks below resolve)
 
@@ -125,8 +127,13 @@ primitives.
 verb built from them, matching how `git.digest` is itself a convenience layer over
 `ingest::run_ingest`, which the CLI (`kkernel git-ingest`) also calls directly.
 
-**Open Question 1**: which of A1 / A2 / A3, and - if A1 or A3 - the exact verb list (is
-`git.tag` in scope for Phase B, or deferred). Not decided here.
+**Resolution (Open Question 1 - verb granularity)**: A1, thin verbs only.
+`git.commit`, `git.branch`, and `git.push` are the Phase B verb set; `git.tag`, `git.merge`,
+`git.checkout`, `git.pull`, and `git.fetch` are out of scope for this phase. The request DSL
+already chains operations, so `git.commit() | git.push()` is a single MCP call, which
+removes the round-trip motivation for a task-level verb: the case for `publish_branch` (A2)
+dissolves under DSL chaining. `publish_branch` is deferred until wrapper usage demonstrates
+the need for it.
 
 ### Fork (b): Execution home
 
@@ -163,11 +170,13 @@ before being placed in the argv array.
   are the safe primitive - the risk is a future edit that concatenates instead of passing
   argv, or a flag that was not meant to be allowlisted, e.g. `--upload-pack` on push).
 
-**Open Question 2**: B1 or B2. This ADR's default lean, given the existing ingester's
-precedent (`ingest.rs` already shells system `git`) and ADR-088 §5's explicit precedent for
-preferring the operator's existing tool credentials over reimplementing transport/auth, is
-toward B2 - but this is explicitly not decided here; the spec gate may weigh the injection
-surface differently.
+**Resolution (Open Question 2 - execution home)**: B2, hardened system-git shell-out,
+consistent with the ingester precedent and the credential-handling reasoning in ADR-088
+section 5. This resolution binds three conditions: argv-only construction (no shell
+interpolation), a fixed subcommand and flag allowlist, and restrictive character-set
+validation on branch names, remotes, and paths. The argument-construction module also
+requires a dedicated adversarial security review at implementation time; this is a named
+requirement of this ADR, not optional.
 
 ### Fork (c): Policy declaration
 
@@ -191,11 +200,10 @@ does today. No new trait, no new enforcement code path - the git pack becomes an
   which a policy author must know to inspect, rather than as typed top-level fields a policy
   schema can rely on). This is a minor extension surface, not a new trait.
 
-**Open Question 3**: C2 is the ADR-018-consistent default - this ADR does not see a case
-for a git-specific policy mechanism when the Gate trait already exists for exactly this
-purpose. What remains open is whether `repo`/`branch` need to become typed `GateRequest`
-fields (an ADR-018 amendment) or stay inside `args` (no amendment, policy authors read
-`input.args.repo`). Left to the spec gate.
+**Resolution (Open Question 3 - policy declaration)**: `repo` and `branch` remain
+ordinary verb arguments for this phase; no ADR-018 amendment is made now. Promoting them to
+typed `GateRequest` fields is deferred until policy authoring against `input.args.repo` and
+`input.args.branch` proves error-prone in practice.
 
 ### Fork (d): Composition with external-PR / fork-repo trust rules
 
@@ -216,11 +224,11 @@ rule in two distinct ways that need to be kept separate:
    touch fork-PR content, it is a separate ADR that must explicitly reconcile with the
    external-PR protocol, not an extension folded into this one.
 
-**Open Question 4**: whether the Gate policy layer (Fork (c), C2) should carry an explicit
-`source_trust` or equivalent field to make (1) vs (2) distinguishable in policy, or whether
-keeping (2) entirely unbuilt (not just unpolicied) is the correct boundary for Phase B. This
-ADR leans toward the latter - not building the capability rather than trusting policy to
-gate it correctly - but does not rule on it.
+**Resolution (Open Question 4 - composition with external-PR / fork-repo trust rules)**:
+fork-content write capability stays unbuilt for this phase. No `source_trust` field is
+introduced on the Gate policy layer; the absence of the capability is itself the trust
+boundary. Any future fork-content write path requires a separate ADR that explicitly
+reconciles with the external-contribution review protocol.
 
 ## Blast radius on ADR-088
 
@@ -248,11 +256,11 @@ This ADR proposes reversing that specific clause. Concretely:
   is unaffected: this surface does not touch GitHub's PR/review/CI machinery, only local git
   operations (commit, branch, push) that any git client already performs.
 
-**Open Question 5**: whether a successful `git.commit`/`git.push` should auto-trigger
-graph ingestion of the new commit (closing the loop between write and the existing
-read-side note kinds), or whether that stays a separate, caller-initiated `git.digest`
-call. Left open; a naive auto-trigger risks conflating a fast, latency-sensitive write path
-with a potentially slow ingest pass in the same call.
+**Resolution (Open Question 5 - digest integration)**: no automatic digest trigger
+after writes. Digest remains caller-initiated; DSL chaining (`git.push() | git.digest()`)
+provides single-call composition when a caller wants both in one round-trip, without
+conflating a fast, latency-sensitive write path with a potentially slow ingest pass by
+default.
 
 ## Threat and Risk Notes
 
@@ -276,7 +284,7 @@ caller class; they are necessary but not sufficient for an untrusted-caller thre
 
 ## Consequences
 
-### Positive (conditioned on spec-gate resolution of the Open Questions)
+### Positive
 
 - Gives khive a real authorization chokepoint for git writes, closing the gap design input 2
   depends on (fleet-level hook denial of direct `git`/`gh` writes has something to route
@@ -296,21 +304,35 @@ caller class; they are necessary but not sufficient for an untrusted-caller thre
   write credentials for whatever repos this surface targets - a new secret-management
   surface that does not exist for the read-only ingest path (`gh` read scopes are lower
   privilege than push credentials).
-- Four genuinely open forks mean this ADR cannot be implemented as written; it requires a
-  spec-gate ruling on Open Questions 1-5 before `khive-pack-git` gains any write handler.
+- The five forks below were resolved through design review (see Resolutions); with those
+  rulings in hand, `khive-pack-git` can proceed to implement the write handlers this ADR
+  specifies.
 
-## Open Questions
+## Resolutions
 
-1. Verb granularity (Fork (a)): A1 thin verbs, A2 task-level `publish_branch`, or A3 both.
-2. Execution home (Fork (b)): B1 daemon-side `git2-rs`, or B2 hardened system-git shell-out.
-   This ADR leans B2 for consistency with the existing ingester but does not decide it.
-3. Policy declaration (Fork (c)): confirmed lean toward C2 (Gate policy objects, no new
-   trait); open sub-question is whether `repo`/`branch` become typed `GateRequest` fields.
-4. Composition with external-PR trust rules (Fork (d)): whether policy needs an explicit
+1. **Verb granularity (Fork (a))**: which of A1 / A2 / A3, and - if A1 or A3 - the exact
+   verb list (is `git.tag` in scope for Phase B, or deferred). **Resolved**: A1, thin verbs
+   only - `git.commit`, `git.branch`, `git.push`. `git.tag` and the rest of the broader
+   candidate list are out of scope for this phase. See the resolution under Fork (a) above.
+2. **Execution home (Fork (b))**: B1 daemon-side `git2-rs`, or B2 hardened system-git
+   shell-out. **Resolved**: B2, consistent with the existing ingester, bound by argv-only
+   construction, a fixed subcommand/flag allowlist, restrictive character-set validation, and
+   a dedicated adversarial security review at implementation time. See the resolution under
+   Fork (b) above.
+3. **Policy declaration (Fork (c))**: whether `repo`/`branch` become typed `GateRequest`
+   fields (an ADR-018 amendment) or stay inside `args`. **Resolved**: they stay ordinary verb
+   arguments for this phase; no ADR-018 amendment now. Promotion to typed fields is deferred
+   until policy authoring proves error-prone in practice. See the resolution under Fork (c)
+   above.
+4. **Composition with external-PR trust rules (Fork (d))**: whether policy needs an explicit
    `source_trust` signal, or whether not building fork-diff-write capability is sufficient
-   boundary for Phase B.
-5. Whether a successful write auto-triggers `git.digest` ingestion of the new commit, or
-   stays a separate caller-initiated call.
+   boundary for Phase B. **Resolved**: fork-content write capability stays unbuilt; no
+   `source_trust` field is introduced. The absence of the capability is itself the trust
+   boundary. See the resolution under Fork (d) above.
+5. **Digest integration**: whether a successful write auto-triggers `git.digest` ingestion of
+   the new commit, or stays a separate caller-initiated call. **Resolved**: no automatic
+   trigger. Digest stays caller-initiated; DSL chaining (`git.push() | git.digest()`) covers
+   the single-call case. See the resolution in Blast radius on ADR-088 above.
 
 ## References
 

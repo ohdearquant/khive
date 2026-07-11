@@ -9,8 +9,9 @@ Standard), ADR-007 Rev 7 (Namespace as Attribution-Only)\
 Pack - precedent for an admin-CLI-only surface distinct from the agent-facing MCP surface),
 khive-cloud API-key scope model (design input for Fork (b))
 
-This is a decision ADR for a human spec gate. It enumerates forks with trade-offs rather
-than picking silently. Open Questions are marked explicitly and are not resolved here.
+This ADR enumerates forks with trade-offs rather than picking silently. The forks below were
+resolved through design review; each fork's resolution is recorded in place, and the
+Resolutions section summarizes all four rulings.
 
 ## Context
 
@@ -50,9 +51,9 @@ declared set of things and nothing else. Both need a surface with:
   through to a permissive default the way ADR-018's base Gate fails open on infrastructure
   errors.
 
-This ADR specs a gateway **mode** for this third trust tier. It does not resolve how that
-mode is packaged (Fork (a)) or how the sandboxed caller authenticates (Fork (b)) - those are
-the open forks below.
+This ADR specs a gateway **mode** for this third trust tier. How that mode is packaged
+(Fork (a)) and how the sandboxed caller authenticates (Fork (b)) were presented to design
+review as the forks below; each is resolved in place.
 
 ## Decision
 
@@ -61,7 +62,8 @@ sandboxed caller may invoke, plus the namespace it is pinned to and the rate/bud
 that apply. The contract is enforced at (or before) the same `VerbRegistry::dispatch` seam
 ADR-018 already uses for gate consultation - this ADR does not introduce a second dispatch
 path; it introduces a stricter policy input and a pre-dispatch allowlist check ahead of the
-existing `Gate::check` call.
+existing `Gate::check` call. The four forks below were presented to design review; each is
+resolved in place, with the full set of rulings summarized in the Resolutions section.
 
 ### Hard rules (not forked)
 
@@ -156,10 +158,15 @@ simultaneously, distinguished at the transport/connection layer.
   compromise (a bug in the demultiplexing logic) affects every caller class at once, unlike
   A1 where the sandboxed and trusted paths are different binaries entirely.
 
-**Open Question 1**: A1, A2, or A3. This ADR notes that A3 is the natural extension of
-ADR-096's already-shipped per-request-identity model over a shared warm backend, which is a
-point in its favor, but the "one shared process, higher blast radius on a demux bug" concern
-is real and unresolved. Left to the spec gate.
+**Resolution (Open Question 1 - process boundary)**: the configuration-profile
+option (A2) is rejected outright: a silent misconfiguration reverting to the full verb
+surface defeats the purpose of this ADR. This is resolved as a structural boundary. The
+recommended implementation shape is a thin gateway binary (A1) that connects to the warm
+daemon as a client, a proxy, so the sandboxed process can only ever reach the constrained
+binary while warm ANN and embedder state is still reused from the daemon. A standalone
+constrained binary is the fallback if the proxy hop proves infeasible. The in-daemon
+demultiplexer option (A3) is rejected for v1: a demux bug would have whole-surface blast
+radius. A3 is revisited only after the contract mechanism is proven in production.
 
 ### Fork (b): Authentication of the sandboxed caller
 
@@ -195,11 +202,11 @@ consults.
   design; for the OSS/self-hosted deployment this ADR is scoped to, standing up key issuance
   infrastructure is a heavier lift than B1's "just configure a Gate policy."
 
-**Open Question 2**: B1, B2, or B1 now with a documented migration path to B2 once
-khive-cloud's key infrastructure exists (avoiding building two separate credential systems).
-This ADR leans toward starting with B1 - it requires no new infrastructure and is a direct
-application of ADR-018's existing extension points - with B2 as a natural later swap given
-`Gate` is a replaceable trait by design, but does not rule this out as a decision.
+**Resolution (Open Question 2 - authentication of the sandboxed caller)**:
+transport-level identity now (B1), with a documented migration path to key-based
+authentication (B2) once the cloud key infrastructure exists. Contract documentation must
+state plainly that `ActorRef` identity is transport-level, not cryptographic, in
+open-source deployments.
 
 ### Fork (c): Capability declaration format
 
@@ -231,10 +238,9 @@ rules 2, 4, 5, and 6 above that go beyond what `Obligation` enforcement does tod
   predicates is also harder to statically review for "does this actually enforce a closed
   allowlist."
 
-**Open Question 3**: C1, C2, or a restricted subset of C2 (Rego, but with a required
-`default deny` template and a lint/validation step that rejects a policy failing to
-declare a closed allowlist - addressing C2's audit-difficulty con directly). Not decided
-here.
+**Resolution (Open Question 3 - capability declaration format)**: a restricted subset
+of C2, constrained Rego on the existing policy engine, with a required default-deny template
+and a validation lint that rejects any contract failing to declare a closed verb allowlist.
 
 ### Fork (d): Relationship to Phase B (git writes from sandboxed callers)
 
@@ -253,21 +259,19 @@ literal composition of both specs, and needs explicit treatment rather than an i
   sandboxed caller is, by definition, the caller class most likely to be executing
   prompt-injected or externally-influenced instructions - which makes ADR-108's Fork (d)
   boundary (2) (no fork-diff-write capability at all, rather than trusting policy to gate
-  it) the load-bearing protection here, not this ADR's allowlist alone. If ADR-108 resolves
-  Fork (d) toward "build it, gate it with `source_trust`," this ADR's threat model
-  (Prompt-injected agent, below) becomes materially more dangerous and needs re-review
-  before a sandboxed contract may include any git-write verb.
-- The safer default posture, and this ADR's recommendation (not a ruling): a sandboxed
-  gateway contract does not include any ADR-108 write verb until ADR-108's own Open
-  Questions are resolved and a specific, reviewed contract is drafted for that composition.
-  This is a recommendation the spec gate should either ratify or override, not a rule this
-  ADR enforces structurally.
+  it) the load-bearing protection here, not this ADR's allowlist alone. ADR-108's Fork (d)
+  resolved toward keeping fork-content write capability unbuilt rather than gating it with a
+  `source_trust` field, which keeps this ADR's threat model (Prompt-injected agent, below) at
+  its current severity; a future ADR that builds fork-content write capability would need to
+  re-review this composition before a sandboxed contract could include any git-write verb.
+- Standing policy, per the resolution of Open Question 4 below: a sandboxed gateway contract
+  does not include any ADR-108 write verb. This composition is revisited only via a new ADR,
+  once a specific, reviewed contract is drafted and demonstrated need is shown.
 
-**Open Question 4**: whether the spec gate wants to rule out git-write verbs from any
-sandboxed contract as a standing policy (simplest, most conservative), or whether a future,
-narrowly-scoped contract (e.g., sandboxed callers may `git.commit` to a caller-specific
-scratch branch only, never `git.push` to a shared remote) is worth specifying once ADR-108
-lands. Not decided here.
+**Resolution (Open Question 4 - composition with the git write surface)**:
+standing policy, no git write verb from the ADR-108 surface may appear in any sandboxed
+contract. This is revisited only via a new ADR after the write surface ships with
+demonstrated need for a narrower, sandboxed-safe composition.
 
 ## Threat Model
 
@@ -280,8 +284,8 @@ contract) is load-bearing rather than advisory - an injected agent will, by cons
 attempt to probe or exceed the contract, and the failure mode for any probe must be deny,
 never a permissive fallback. The composition risk with ADR-108 (Fork (d) above) is the
 sharpest instance of this: a prompt-injected agent with git-write capability could be
-steered into committing or pushing attacker-chosen content, which is exactly why this ADR
-recommends excluding write verbs from sandboxed contracts by default.
+steered into committing or pushing attacker-chosen content, which is exactly why this ADR's
+standing policy excludes write verbs from sandboxed contracts.
 
 **Exfiltration via verbs.** A sandboxed caller with legitimate read-verb access (`search`,
 `get`, `neighbors`, `context`) could be used to exfiltrate data outside its intended
@@ -313,9 +317,24 @@ the gateway path.
 | Extend the existing Gate to a "strict mode" that fail-closes on `Err` globally, without a separate allowlist tier | Addresses only rule 6's fail-closed requirement, not the allowlist/pinning/cap/no-admin/no-path requirements this ADR's caller class needs; conflates "stricter infra-failure handling for everyone" with "a genuinely narrower surface for one caller class." |
 | Sandbox at the OS/container level only (seccomp, container isolation), no khive-level gateway                     | Orthogonal, not a substitute - OS-level sandboxing constrains what the process can do to the _host_, not what verbs it can invoke against khive's own data once it can reach the MCP transport at all. Complements this ADR rather than replacing it.          |
 
+## Implementation Plan
+
+- Enforced rate and budget caps (rule 5) are new runtime work, not an assumed capability of
+  the existing dispatch path: `Obligation::RateLimit` is declared-but-unenforced today
+  (ADR-018), and this ADR requires actual enforcement for the gateway path. This is a named
+  implementation-phase item: the gateway dispatch path must consult and enforce a
+  rate/budget counter before dispatch proceeds, and that counter is built as part of this
+  ADR's implementation, not inherited from ADR-018.
+- The gateway process boundary (resolution of Open Question 1: a thin proxy binary in front
+  of the warm daemon) is new build/release surface and is scoped as its own implementation
+  item, separate from the pre-dispatch allowlist/pinning check.
+- The capability declaration format (resolution of Open Question 3: constrained Rego with a
+  default-deny template and a validation lint) requires the lint itself to be built; it is
+  not a byproduct of writing the Rego policy.
+
 ## Consequences
 
-### Positive (conditioned on spec-gate resolution of the Open Questions)
+### Positive
 
 - Gives khive a genuine third trust tier, closing the "full surface or nothing" gap between
   the operator and trusted-agent tiers documented in Context.
@@ -329,28 +348,34 @@ the gateway path.
 - New enforcement code path (pre-dispatch allowlist/pinning/cap check) is new surface to get
   wrong; a bug here that fails open, rather than closed, defeats the entire ADR - this is
   exactly why rule 6 is stated as a hard rule rather than left to per-deployment policy.
-- Whichever Fork (a) shape is chosen, this is nontrivial new engineering: a new binary
-  (A1), new flag-driven mode with a real risk of silent misconfiguration (A2), or new
-  daemon-side connection demultiplexing (A3). None of the three is a small addition.
-- Four open forks, one of them (Fork (d)) explicitly dependent on ADR-108's own unresolved
-  forks, mean this ADR cannot be implemented as written without a spec-gate ruling and,
-  for Fork (d), without ADR-108 reaching its own resolution first.
+- The chosen Fork (a) shape (a thin proxy binary, with a standalone constrained binary as
+  fallback) is nontrivial new engineering, per the Implementation Plan above.
+- Fork (d) ties this ADR's write-verb boundary to ADR-108: the standing policy of excluding
+  every ADR-108 write verb from sandboxed contracts holds regardless of how ADR-108's own
+  forks resolve, but any future narrower composition needs its own ADR and re-review of the
+  threat model above.
 
-## Open Questions
+## Resolutions
 
-1. Process boundary (Fork (a)): A1 separate binary, A2 mode flag, or A3 daemon-side policy
-   profile. This ADR notes A3's alignment with ADR-096's existing per-identity-over-shared-
-   backend model but does not decide.
-2. Authentication of the sandboxed caller (Fork (b)): B1 Gate-mediated ActorRef (no new
-   infra), B2 API-key scope model relating to khive-cloud, or B1-now-B2-later. This ADR
-   leans toward B1 as the lower-infrastructure starting point but does not rule.
-3. Capability declaration format (Fork (c)): C1 static allowlist file, C2 Rego policy
-   objects reusing ADR-018's engine, or a constrained C2 variant with a required
-   default-deny lint. Not decided.
-4. Relationship to Phase B (Fork (d)): whether any sandboxed contract may ever include an
-   ADR-108 git-write verb, and if so under what additional constraint (e.g., scratch-branch-
-   only, no push). This ADR recommends excluding write verbs from sandboxed contracts by
-   default until ADR-108 itself resolves, but leaves the standing policy to the spec gate.
+1. **Process boundary (Fork (a))**: A1 separate binary, A2 mode flag, or A3 daemon-side
+   policy profile. **Resolved**: the configuration-profile option (A2) is rejected outright.
+   A thin gateway binary that proxies to the warm daemon (A1) is the recommended shape; a
+   standalone constrained binary is the fallback if the proxy hop proves infeasible. The
+   in-daemon demultiplexer (A3) is rejected for v1 and revisited only after the contract
+   mechanism is proven in production. See the resolution under Fork (a) above.
+2. **Authentication of the sandboxed caller (Fork (b))**: B1 Gate-mediated `ActorRef`, B2
+   API-key scope model, or B1-now-B2-later. **Resolved**: B1-now-B2-later - transport-level
+   identity now, with a documented migration path to key-based authentication once cloud key
+   infrastructure exists. See the resolution under Fork (b) above.
+3. **Capability declaration format (Fork (c))**: C1 static allowlist file, C2 Rego policy
+   objects, or a constrained C2 variant with a required default-deny lint. **Resolved**: the
+   constrained C2 variant - Rego on the existing policy engine, with a required default-deny
+   template and a validation lint that rejects any contract lacking a closed verb allowlist.
+   See the resolution under Fork (c) above.
+4. **Relationship to Phase B (Fork (d))**: whether any sandboxed contract may ever include
+   an ADR-108 git-write verb. **Resolved**: standing policy, no ADR-108 write verb may
+   appear in any sandboxed contract. Revisited only via a new ADR once the write surface
+   ships with demonstrated need. See the resolution under Fork (d) above.
 
 ## References
 
