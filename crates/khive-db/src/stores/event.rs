@@ -570,7 +570,7 @@ fn decode_target_observation(event: &Event) -> Result<Vec<EventObservation>, rus
 }
 
 fn decode_signal_observation(event: &Event) -> Result<Vec<EventObservation>, rusqlite::Error> {
-    let Some(entity_id) = payload_uuid(event, "about_id")? else {
+    let Some(entity_id) = event.target_id else {
         return Ok(Vec::new());
     };
     Ok(vec![EventObservation {

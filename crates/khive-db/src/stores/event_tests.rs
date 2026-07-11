@@ -188,6 +188,60 @@ async fn append_event_writes_observations_atomically() {
 }
 
 #[tokio::test]
+async fn feedback_explicit_projects_signal_observation_from_target_id() {
+    // Regression test for #811: the emitter (khive-pack-brain's `brain.feedback`
+    // handler) sets `event.target_id` via `Event::with_target`, never a payload
+    // `about_id` field. The decoder must read the field the emitter actually
+    // writes so the round trip survives.
+    let store = setup_memory_store();
+    let target = Uuid::new_v4();
+    let event = Event::new(
+        "default",
+        "brain.feedback",
+        EventKind::FeedbackExplicit,
+        SubstrateKind::Event,
+        "agent:test",
+    )
+    .with_target(target)
+    .with_payload(json!({ "signal": "useful" }));
+    let event_id = event.id;
+
+    store.append_event(event).await.unwrap();
+
+    let pool = Arc::clone(&store.pool);
+    let event_id_str = event_id.to_string();
+    let (signal_count, observed_entity_id): (i64, String) =
+        tokio::task::spawn_blocking(move || {
+            let guard = pool.reader().unwrap();
+            let conn = guard.conn();
+            let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM event_observations WHERE event_id = ?1 AND role = 'signal'",
+                [&event_id_str],
+                |r| r.get(0),
+            )
+            .unwrap();
+            let entity_id: String = conn
+            .query_row(
+                "SELECT entity_id FROM event_observations WHERE event_id = ?1 AND role = 'signal'",
+                [&event_id_str],
+                |r| r.get(0),
+            )
+            .unwrap();
+            (count, entity_id)
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(signal_count, 1, "expected one signal observation row");
+    assert_eq!(
+        observed_entity_id,
+        target.to_string(),
+        "signal observation must carry the feedback's target_id"
+    );
+}
+
+#[tokio::test]
 async fn invalid_projection_payload_aborts_event_insert() {
     let store = setup_memory_store();
     let mut event = make_event("default");

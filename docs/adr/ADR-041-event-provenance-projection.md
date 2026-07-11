@@ -573,7 +573,7 @@ The generated V13 SQL adds `events.session_id TEXT`, creates `event_observations
   → `Selected` note rows.
 - `LinkCreated`: `payload.source_id` and `payload.target_id` → two entity `Target`
   rows at `position=0` and `position=1`.
-- `FeedbackExplicit`: `payload.about_id` → entity `Signal` row.
+- `FeedbackExplicit`: `event.target_id` → entity `Signal` row (Amendment A1).
 
 ### PackEventConsumer dispatch update
 
@@ -618,6 +618,28 @@ files own this behavior. Consumers that need event observations read the shipped
    isolation via the JOIN to `events.namespace`. No `namespace` column on the
    projection itself; correct by construction but worth noting in the implementation
    comment.
+
+---
+
+## Amendment A1: `FeedbackExplicit` signal decodes from `target_id`, not `payload.about_id` (2026-07-10, khive#811)
+
+§3's per-verb role mapping and §"Implementation"'s decoder examples originally specified
+`FeedbackExplicit: payload.about_id → entity Signal row`. No emitter ever wrote a payload
+`about_id` field — `brain.feedback` (`crates/khive-pack-brain/src/handlers.rs`) sets the
+feedback subject via `Event::with_target(target)`, i.e. `event.target_id`, matching every
+other target-carrying event kind (`EntityUpdated`, `NoteUpdated`, `TaskTransitioned`, …).
+`decode_signal_observation` (`crates/khive-db/src/stores/event.rs`) read the nonexistent
+payload field instead, so every `FeedbackExplicit` event projected zero `Signal` rows —
+the projection was silently empty for the entire lifetime of this ADR's implementation.
+
+This is a decoder bug, not an emitter bug: `event.target_id` is the correct, already-shipped
+carrier for "the entity/note this event is about" across every other decoded event kind, and
+changing the emitter to duplicate that value into `payload.about_id` would introduce a
+redundant field with no consumer. The fix makes `decode_signal_observation` read
+`event.target_id`, consistent with `decode_target_observation`.
+
+The role mapping in §3 (`FeedbackExplicit` → `Signal`) and its intent are unchanged — only
+the field the decoder reads to populate it.
 
 ---
 
