@@ -981,35 +981,26 @@ impl KhiveMcpServer {
                             // `Value` and would otherwise be exposed to the same
                             // unbounded-nesting stack-overflow risk (CWE-674) the
                             // DSL parser guard already closes for syntax input.
-                            if result_exceeds_depth_limit(&result_obj) {
-                                let tool_name = result_obj
-                                    .get("tool")
-                                    .and_then(Value::as_str)
-                                    .unwrap_or_default()
-                                    .to_string();
-                                results.push(json!({
-                                    "ok": false,
-                                    "tool": tool_name,
-                                    "error": {
-                                        "kind": "result_too_deep",
-                                        "message": format!(
-                                            "op result nesting depth exceeds max {}; \
-                                             cannot be used as $prev chain context",
-                                            khive_request::NESTING_DEPTH_LIMIT
-                                        ),
-                                    },
-                                }));
-                                prev_result = None;
-                                aborted_from = Some(i + 1);
-                                continue;
+                            match chain_aggregation_depth_reject(result_obj) {
+                                Err(error_entry) => {
+                                    results.push(error_entry);
+                                    prev_result = None;
+                                    aborted_from = Some(i + 1);
+                                    continue;
+                                }
+                                Ok(result_obj) => {
+                                    // Extract canonical result for $prev (pre-presentation).
+                                    prev_result = result_obj.get("result").cloned();
+                                    // Apply presentation to the result field only,
+                                    // using the effective mode (AlwaysVerbose override honored).
+                                    let presented_obj = apply_presentation_to_result(
+                                        result_obj,
+                                        effective_mode,
+                                        now_unix,
+                                    );
+                                    results.push(presented_obj);
+                                }
                             }
-                            // Extract canonical result for $prev (pre-presentation).
-                            prev_result = result_obj.get("result").cloned();
-                            // Apply presentation to the result field only,
-                            // using the effective mode (AlwaysVerbose override honored).
-                            let presented_obj =
-                                apply_presentation_to_result(result_obj, effective_mode, now_unix);
-                            results.push(presented_obj);
                         }
                         Err((tool, error_payload)) => {
                             results
@@ -1385,6 +1376,41 @@ fn result_exceeds_depth_limit(result_obj: &Value) -> bool {
     result_obj
         .get("result")
         .is_some_and(|v| !result_within_depth_limit(v))
+}
+
+/// Chain-mode aggregation-loop seam in [`KhiveMcpServer::run_parsed`]: the
+/// second, defense-in-depth check applied to a dispatched op's full
+/// `result_obj` envelope. By the time this runs, `dispatch_op`'s own
+/// `chain_ok_envelope_or_depth_error` has already screened the same
+/// `result` field, so this should never trip in practice — but if a future
+/// refactor bypasses that earlier guard, the rejected envelope must still be
+/// discarded iteratively rather than dropped natively, or the recursive
+/// `Drop` this branch exists to prevent happens anyway on the way out of
+/// scope. Returns the unchanged envelope on success, or an already-built
+/// error entry (with the oversized value already drained) on rejection.
+fn chain_aggregation_depth_reject(result_obj: Value) -> Result<Value, Value> {
+    if result_exceeds_depth_limit(&result_obj) {
+        let tool_name = result_obj
+            .get("tool")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let error_entry = json!({
+            "ok": false,
+            "tool": tool_name,
+            "error": {
+                "kind": "result_too_deep",
+                "message": format!(
+                    "op result nesting depth exceeds max {}; \
+                     cannot be used as $prev chain context",
+                    khive_request::NESTING_DEPTH_LIMIT
+                ),
+            },
+        });
+        drop_value_iteratively(result_obj);
+        return Err(error_entry);
+    }
+    Ok(result_obj)
 }
 
 /// Apply the presentation transform to the `result` field of a successful
@@ -2009,6 +2035,47 @@ mod tests {
     fn result_missing_field_is_not_flagged() {
         let result_obj = json!({ "ok": false, "tool": "get", "error": "not found" });
         assert!(!result_exceeds_depth_limit(&result_obj));
+    }
+
+    #[test]
+    fn chain_aggregation_seam_rejects_over_limit_result_via_iterative_drop() {
+        // Directly exercises the post-hoc aggregation-loop guard in
+        // `run_parsed`'s `Chain` arm (isolated as
+        // `chain_aggregation_depth_reject`) with a value nested well past
+        // NESTING_DEPTH_LIMIT. If this branch let the rejected `result_obj`
+        // fall out of scope instead of routing it through
+        // `drop_value_iteratively`, `Value`'s derived recursive `Drop` would
+        // overflow the stack on a value this deep — so this test failing to
+        // complete (rather than merely asserting wrong) is itself the
+        // regression signal for #823's post-hoc-rejection finding.
+        let deep = nest_object(khive_request::NESTING_DEPTH_LIMIT + 50_000, json!(true));
+        // Built via direct `Map` inserts, not `json!({..., "result": deep})`:
+        // the object-literal macro arm calls `serde_json::to_value(&deep)` on
+        // the already-deep value, which would recurse over the whole tree
+        // and overflow the stack while constructing the fixture itself,
+        // before the guard under test ever runs (see `nest_object` above).
+        let mut envelope = serde_json::Map::with_capacity(3);
+        envelope.insert("ok".to_string(), Value::Bool(true));
+        envelope.insert("tool".to_string(), Value::String("traverse".to_string()));
+        envelope.insert("result".to_string(), deep);
+        let result_obj = Value::Object(envelope);
+
+        let err = chain_aggregation_depth_reject(result_obj)
+            .expect_err("result nested past NESTING_DEPTH_LIMIT must be rejected");
+
+        assert_eq!(err["ok"], json!(false));
+        assert_eq!(err["tool"], json!("traverse"));
+        assert_eq!(err["error"]["kind"], json!("result_too_deep"));
+        // The error entry must never embed the oversized value itself.
+        assert!(err.get("result").is_none());
+    }
+
+    #[test]
+    fn chain_aggregation_seam_accepts_result_within_limit_unchanged() {
+        let shallow = json!({ "ok": true, "tool": "get", "result": {"a": {"b": 1}} });
+        let accepted = chain_aggregation_depth_reject(shallow.clone())
+            .expect("result within the limit must be passed through unchanged");
+        assert_eq!(accepted, shallow);
     }
 
     // ── earliest-seam guard: raw handler `Value` before json!/present/clone ──
