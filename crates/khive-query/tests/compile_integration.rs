@@ -879,6 +879,50 @@ fn gql_where_equality_i64_bounds_bind_exact() {
 }
 
 #[test]
+fn variable_length_where_i64_bounds_bind_exact() {
+    // Exercises the variable-length WHERE compiler branch (compile_var_len_condition,
+    // sql.rs:919), not the start-node inline property map path already covered above.
+    for bound in [i64::MIN, i64::MAX] {
+        let q = parse(
+            QueryLanguage::Gql,
+            &format!("MATCH (a)-[:extends*1..3]->(b) WHERE b.number = {bound} RETURN b"),
+        )
+        .unwrap();
+        let compiled = compile(&q, &opts()).unwrap();
+        assert!(
+            compiled
+                .params
+                .iter()
+                .any(|p| matches!(p, QueryValue::Integer(n) if *n == bound)),
+            "variable-length WHERE bound {bound} must bind exact i64; params: {:?}",
+            compiled.params
+        );
+    }
+}
+
+#[test]
+fn variable_length_end_node_inline_property_map_i64_bounds_bind_exact() {
+    // Exercises the end-node inline-map CTE path (end.properties compiled via
+    // compile_property_equality), not the start-node inline map already covered above.
+    for bound in [i64::MIN, i64::MAX] {
+        let q = parse(
+            QueryLanguage::Gql,
+            &format!("MATCH (a)-[:extends*1..3]->(b:artifact {{number: {bound}}}) RETURN b"),
+        )
+        .unwrap();
+        let compiled = compile(&q, &opts()).unwrap();
+        assert!(
+            compiled
+                .params
+                .iter()
+                .any(|p| matches!(p, QueryValue::Integer(n) if *n == bound)),
+            "end-node inline-map bound {bound} must bind exact i64; params: {:?}",
+            compiled.params
+        );
+    }
+}
+
+#[test]
 fn gql_inline_property_map_integer_overflow_rejected_at_parse_time() {
     // i64::MAX + 1 -- one digit sequence beyond the supported integer range.
     let overflow = "9223372036854775808";
@@ -918,4 +962,63 @@ fn gql_inline_property_map_float_overflow_rejected() {
         matches!(err, QueryError::Parse { .. }),
         "non-finite float literal must be rejected, not silently bound as Infinity; got: {err:?}"
     );
+}
+
+// --- Numeric literal grammar (docs/design.md): digits required on both
+// sides of the dot. `1.`, `-.5`, and `.5` must all be rejected, not
+// delegated to f64::parse's looser rules. ---
+
+#[test]
+fn gql_inline_property_map_trailing_dot_float_rejected() {
+    let err = parse(
+        QueryLanguage::Gql,
+        "MATCH (n:document {score: 1.}) RETURN n",
+    )
+    .unwrap_err();
+    assert!(
+        matches!(err, QueryError::Parse { .. }),
+        "'1.' has no digits after the dot and must be rejected; got: {err:?}"
+    );
+}
+
+#[test]
+fn gql_inline_property_map_negative_leading_dot_float_rejected() {
+    let err = parse(
+        QueryLanguage::Gql,
+        "MATCH (n:document {score: -.5}) RETURN n",
+    )
+    .unwrap_err();
+    assert!(
+        matches!(err, QueryError::Parse { .. }),
+        "'-.5' has no digits before the dot and must be rejected; got: {err:?}"
+    );
+}
+
+#[test]
+fn gql_inline_property_map_leading_dot_float_rejected() {
+    let err = parse(
+        QueryLanguage::Gql,
+        "MATCH (n:document {score: .5}) RETURN n",
+    )
+    .unwrap_err();
+    assert!(
+        matches!(err, QueryError::Parse { .. }),
+        "'.5' has no digits before the dot and must be rejected; got: {err:?}"
+    );
+}
+
+#[test]
+fn gql_inline_property_map_well_formed_float_still_parses() {
+    // Digits on both sides of the dot must keep working (regression guard
+    // against over-tightening the grammar check).
+    let q = parse(
+        QueryLanguage::Gql,
+        "MATCH (n:document {score: 1.5}) RETURN n",
+    )
+    .unwrap();
+    let compiled = compile(&q, &opts()).unwrap();
+    assert!(compiled
+        .params
+        .iter()
+        .any(|p| matches!(p, QueryValue::Float(n) if *n == 1.5)));
 }

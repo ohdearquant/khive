@@ -102,9 +102,13 @@ grammar for `value` (shared with WHERE-clause condition values, via the same
 value      = string | integer | float | bool
 string     = "'" ... "'" | '"' ... '"'
 integer    = ["-"] digit+                     -- no "." in the lexeme
-float      = ["-"] digit+ "." digit+          -- "." required
+float      = ["-"] digit+ "." digit+          -- "." required, digits on both sides
 bool       = "true" | "false"                 -- case-insensitive
 ```
+
+The lexer enforces this grammar exactly, not `f64::parse`'s looser rules: `1.` and
+`-.5` (digits missing on one side of the dot) are rejected with `QueryError::Parse`,
+same as `.5`.
 
 **Type binding:**
 

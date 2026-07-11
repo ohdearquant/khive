@@ -143,20 +143,37 @@ impl Parser {
                 if c == '-' {
                     self.advance();
                 }
-                while let Some(c) = self.peek() {
-                    if c.is_ascii_digit() || c == '.' {
+                // Grammar (docs/design.md): integer = ["-"] digit+ ; float = ["-"]
+                // digit+ "." digit+ -- digits are required on both sides of the
+                // dot. Reject "1." and "-.5" instead of delegating the bare
+                // lexeme to f64::parse, which accepts both.
+                let int_start = self.pos;
+                while matches!(self.peek(), Some(c) if c.is_ascii_digit()) {
+                    self.advance();
+                }
+                if self.pos == int_start {
+                    return Err(self.err("expected digit after '-'"));
+                }
+                let mut has_frac = false;
+                if self.peek() == Some('.') {
+                    has_frac = true;
+                    self.advance();
+                    let frac_start = self.pos;
+                    while matches!(self.peek(), Some(c) if c.is_ascii_digit()) {
                         self.advance();
-                    } else {
-                        break;
+                    }
+                    if self.pos == frac_start {
+                        return Err(self.err(
+                            "float literal must have digits after '.' (e.g. '1.0', not '1.')",
+                        ));
                     }
                 }
                 let s: String = self.input[start..self.pos].iter().collect();
                 // No decimal point: integer lexeme -- parse as i64 so the value
                 // survives round-trip past 2^53 (f64's exact-integer limit) and
                 // both i64 bounds. Scientific notation is not part of this
-                // grammar (the loop above only consumes digits and '.'), so an
-                // integer lexeme is always plain decimal digits.
-                if !s.contains('.') {
+                // grammar, so an integer lexeme is always plain decimal digits.
+                if !has_frac {
                     let n: i64 = s.parse().map_err(|_| {
                         self.err(format!(
                             "integer literal '{s}' out of supported range \
