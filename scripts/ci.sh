@@ -11,19 +11,26 @@ RUSTFLAGS="-D warnings" cargo check --manifest-path "$SCRIPT_DIR/../crates/khive
 cargo clippy --manifest-path "$SCRIPT_DIR/../crates/khive-merge/Cargo.toml" --all-targets -- -D warnings
 cargo test --manifest-path "$SCRIPT_DIR/../crates/khive-merge/Cargo.toml"
 
+echo "=== ADR Label Check ==="
+python3 "$SCRIPT_DIR/check-adr-labels.py"
+
 echo "=== Format Check ==="
 cargo fmt --all -- --check
 
 echo "=== SQL Lint ==="
 sh "$SCRIPT_DIR/lint-sql.sh"
 
-echo "=== No-Stub Guard (clippy restriction lints) ==="
-# AST-aware "No stubs. Ever." enforcement. clippy parses the macros, so it is
-# immune to the grep failure modes (spacing like `todo !()`, brace forms like
-# `unimplemented!{}`, macro names inside comments or string literals). Scoped to
-# --lib --bins = shipping source only (excludes tests/benches/examples), matching
-# the prior policy. khive-merge is excluded from the workspace (forward-deployed),
-# so it gets its own pass to preserve coverage.
+echo "=== No-Stub Guard ==="
+# "No stubs. Ever." enforcement, two complementary passes:
+#   1. check-no-stubs.py: a fast, dependency-free scan of tracked crates/**/*.rs
+#      for production todo!/unimplemented!/dbg! (any spacing or delimiter form)
+#      and panic!/unreachable! calls whose message carries a stub-intent word.
+#      Excludes tests/benches/examples and inline #[cfg(test)] modules.
+#   2. clippy restriction lints below: AST-aware todo!/unimplemented!/dbg_macro
+#      enforcement, immune to the same grep failure modes. Scoped to --lib
+#      --bins = shipping source only, matching the prior policy. khive-merge is
+#      excluded from the workspace (forward-deployed), so it gets its own pass.
+python3 "$SCRIPT_DIR/check-no-stubs.py"
 NOSTUB_LINTS="-Dclippy::todo -Dclippy::unimplemented -Dclippy::dbg_macro"
 # shellcheck disable=SC2086
 cargo clippy --workspace --lib --bins -- $NOSTUB_LINTS

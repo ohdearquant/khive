@@ -8,7 +8,7 @@ integration layer is extended to expose snapshot ancestry for LCA walks.
 
 ## ADR Compliance
 
-### ADR-010: KG Versioning
+### ADR-010: KG Versioning Strategy - KG Versioning
 
 - The v1 merge path is a line-merge on sorted NDJSON, implemented in `khive-vcs`.
 - `khive-merge` provides the v2 semantic merge that understands entity identity, field-level
@@ -16,7 +16,7 @@ integration layer is extended to expose snapshot ancestry for LCA walks.
 - Promotion to a workspace member depends on the VCS layer exposing snapshot ancestry via a
   `SnapshotReader`-compatible API.
 
-### ADR-020: VCS Integration Layer
+### ADR-020: Git-Native KG Implementation - VCS Integration Layer
 
 - `khive-merge` is not yet registered in any pack; the VCS integration surface must be extended
   before the `ThreeWayMergeEngine` can be wired into production.

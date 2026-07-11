@@ -38,7 +38,7 @@ This crate implements the public types and default gate defined by ADR-018:
   `input.verb`, `input.args`) are the policy input contract (e.g., for Rego). Any
   field rename is a breaking change.
 
-### ADR-007: Namespace
+### ADR-007: Namespace as Attribution-Only Open String - Dumb Storage, Single Gate, Operator-Configured Read Visibility - Namespace
 
 `GateRequest.namespace` must reflect exactly what the runtime sees, with no coercion
 at the gate layer. Coercing an empty namespace to a default inside the gate would

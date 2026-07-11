@@ -17,7 +17,7 @@ This crate is the primary implementation of the request DSL.
 - Chain mode uses `$prev` / `$prev.dotted.path` references that are substituted
   at dispatch time — the parser validates their form but not their values.
 
-### ADR-038: Write-Key Conflict Detection
+### ADR-038: Bulk Operations - Write-Key Conflict Detection
 
 Parallel-batch preflight check to prevent two ops in the same batch from
 targeting the same record for mutation.

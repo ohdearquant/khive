@@ -119,6 +119,8 @@ jobs:
           deno-version: v2.x
       - name: Check markdown formatting
         run: deno fmt --check
+      - name: Check ADR labels
+        run: python3 scripts/check-adr-labels.py
 
   marketplace:
     name: Marketplace example validator

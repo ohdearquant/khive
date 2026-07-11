@@ -22,7 +22,7 @@ Key design decisions and constraints:
 - The custom `Deserialize` impl rejects `i64::MIN` with an error, enforcing the proof boundary at
   the serialization boundary.
 
-### ADR-012: Retrieval Composition
+### ADR-012: Retrieval Composition (High-Level Composition Layer) - Retrieval Composition
 
 This crate provides the scoring primitives consumed by all retrieval backends (HNSW, Vamana,
 flat-scan). The distance-to-similarity conversion functions (`try_score_from_distance`,

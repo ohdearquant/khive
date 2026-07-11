@@ -2,7 +2,7 @@
 
 ## ADR Compliance
 
-### ADR-010: KG Versioning (git-native v1)
+### ADR-010: KG Versioning Strategy - KG Versioning (git-native v1)
 
 - KG state is stored as sorted NDJSON files in a git repository, not in a custom
   versioning system.
@@ -14,7 +14,7 @@
 - Snapshot coverage v1: entities and edges only. Notes are excluded until note packs
   define versioned export, import, privacy/redaction, and merge semantics.
 
-### ADR-020: Git-native sync, validate-first gate
+### ADR-020: Git-Native KG Implementation - Git-native sync, validate-first gate
 
 - `run_sync` rebuilds the SQLite working database from `.khive/kg/entities.ndjson` and
   `edges.ndjson` atomically: the database is built in a `.tmp` sibling file and renamed
@@ -32,20 +32,20 @@
 - Custom push/pull error variants (`RemoteUnreachable`, `AuthFailed`, `NonFastForward`,
   `MergeRequired`) were removed; git is the remote protocol.
 
-### ADR-035: Vector embeddings are local-only derived state
+### ADR-035: CLI Configuration and Automatic Embedding - Vector embeddings are local-only derived state
 
 - `run_sync` intentionally skips vector embedding during import. Vectors are local-only
   derived state computed lazily via `kkernel kg embed` when needed.
 - FTS5 text index is populated during sync so that text search works immediately
   after sync without a separate embedding pass.
 
-### ADR-036: Validation pipeline
+### ADR-036: KG Import/Export Format Adapters - Validation pipeline
 
 - The validate-first gate in `run_sync` implements the validation pipeline constraint:
   all edge relations are validated before any DB write, ensuring a clean error path
   that leaves the existing database intact.
 
-### ADR-037: Remote archive fetch with SHA-256 pin verification
+### ADR-037: Remote Entity Resolution and Content-Hash Verification - Remote archive fetch with SHA-256 pin verification
 
 - `run_sync_remote` fetches a remote KG archive via `git clone --depth=1` into a
   temporary staging directory, then sparse-checks out only the NDJSON files.
@@ -58,7 +58,7 @@
   caller to write back to `schema.yaml`. The hash is always computed and written to
   `meta.json` for auditability even when no pin is present.
 
-### ADR-020: Canonical hash algorithm
+### ADR-020: Git-Native KG Implementation - Canonical hash algorithm
 
 - Canonical JSON sort order for hashing (ADR-020: Git-Native KG Implementation
   §canonical NDJSON record shape and snapshot hash):

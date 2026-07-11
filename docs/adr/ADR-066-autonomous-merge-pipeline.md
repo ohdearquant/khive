@@ -4,7 +4,7 @@
 **Date**: 2026-06-23 (revised; original 2026-06-22)
 **Supersedes**: ADR-066 draft dated 2026-06-22 (two-lane model with CODEOWNERS hold)
 **Relates to**: CI workflow (`.github/workflows/ci.yml`, `.github/workflows/release.yml`),
-`scripts/apply-autonomous-merge.sh`, repository ruleset 17362266
+repository ruleset 17362266
 
 ---
 
@@ -51,8 +51,8 @@ A non-automatable floor (section 4) is never delegated to automation.
 
 Branch protection on `main` (ruleset 17362266) requires all of the following status contexts.
 Context strings are matched by exact name; the canonical list lives in
-`scripts/apply-autonomous-merge.sh`, which is the source of truth for the exact strings and
-must be kept in sync with this ADR.
+`.github/workflows/ci.yml`'s `ci-gate` job dependency list, which is the source of truth for the
+exact strings and must be kept in sync with this ADR.
 
 Each gate in the wall replaces a category of defect that a human reviewer would otherwise be
 responsible for catching.
@@ -107,8 +107,8 @@ actually bumps and the check is green-able: the release gate (section 3).
   in depth.
 
 The full, authoritative context list and the exact strings used in the ruleset are maintained in
-`scripts/apply-autonomous-merge.sh`. When a new gate is introduced and its context name is
-established, that script is updated first, and this ADR's prose is updated to match.
+`.github/workflows/ci.yml`'s `ci-gate` job dependency list. When a new gate is introduced and its
+context name is established, the workflow and this ADR's prose are updated together.
 
 ### 2. Auto-merge mechanics
 
@@ -237,10 +237,11 @@ required approvals to zero before the full gate wall is enforced opens a window 
 merge over a thinner wall. The order is:
 
 1. Land the companion gate PRs (#215 and the new-gates PR) on `main`. These establish the
-   `Supply-chain (cargo-deny)`, `No-stub guard`, `Doc build (-D warnings)`,
-   `Dependency review`, and `Coverage ratchet` contexts. Until a context's job exists on `main`,
-   do not add it to the required set in the ruleset; a required check that never reports
-   permanently blocks merge.
+   `Supply-chain (cargo-deny)`, `Doc build (-D warnings)`, `Dependency review`, and
+   `Coverage ratchet` contexts. The no-stub scan runs as a step of the matrix `CI` job; `CI gate`
+   aggregates that job and its dependent checks, so no separate no-stub status context is
+   required. Until a context's job exists on `main`, do not add it to the required set in the
+   ruleset; a required check that never reports permanently blocks merge.
 2. Create and configure the `publish` GitHub Environment: add it to `release.yml`'s publish
    jobs, add the required reviewer. Validate on a dry-run tag that the environment gate fires
    before any publish step.

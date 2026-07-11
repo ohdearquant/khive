@@ -2,7 +2,7 @@
 
 ## ADR Compliance
 
-### ADR-011: SIMD Foundation Layer
+### ADR-011: Embedding and Inference Architecture - SIMD Foundation Layer
 
 - Distance computation (`src/distance.rs`) delegates all vector math to `lattice-embed::simd`
   (ADR-011: Embedding and Inference — `lattice-embed` is the SIMD and quantization foundation).
@@ -10,7 +10,7 @@
 - INT8 dot product (`int8_dot_product_raw`) also routes through `lattice_embed::simd::dot_product_i8_raw`.
 - The HNSW crate itself contains no SIMD code; it is purely algorithmic.
 
-### ADR-030: HNSW Index Management Strategy
+### ADR-030: Retrieval Stack Port - khive-retrieval - HNSW Index Management Strategy
 
 - Default parameters: M=20, ef_construction=200, ef_search=80, dimensions=384
   - M=20 is empirically optimal for k=10 recall at 384d

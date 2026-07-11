@@ -27,21 +27,21 @@
 - `kkernel kg fetch` (alias: `kkernel kg sync`) fetches a remote KG archive and
   populates the local remote cache under `.khive/kg/remotes/<remote>/`.
 
-### ADR-015: Schema migrations
+### ADR-015: Schema Migrations - Schema migrations
 
 - `KhiveRuntime::new()` runs `run_migrations()` internally — constructing the runtime
   is sufficient to apply all pending migrations.
 - `kkernel db migrate` wraps this; `kkernel db check` uses a read-only runtime to
   report schema state without writing.
 
-### ADR-017: Pack standard (vocabulary + handlers)
+### ADR-017: Pack Standard - Pack standard (vocabulary + handlers)
 
 - `pack_introspect` module builds an in-memory `VerbRegistry` from all `inventory!`-
   registered packs and exposes `list_packs()` and `pack_handler(name)`.
 - Handler `visibility` distinguishes MCP-exposed `Verb` entries from internal
   `Subhandler` entries (e.g. `memory.recall_embed`).
 
-### ADR-023: Verb namespace contract
+### ADR-023: Pack Verb Surface, Visibility, and Composition - Verb namespace contract
 
 - The kg substrate pack owns 17 bare verb names (no dot prefix): `create`, `get`,
   `list`, `stats`, `update`, `delete`, `search`, `link`, `neighbors`, `traverse`,
@@ -51,14 +51,14 @@
   `memory.recall.embed`.
 - Enforced by the integration test in `tests/verb_namespace_contract.rs`.
 
-### ADR-027: Dynamic pack loading (self-registration via inventory!)
+### ADR-027: Dynamic Pack Loading via Self-Registration - Dynamic pack loading (self-registration via inventory!)
 
 - Pack crates self-register using `inventory::submit!`. The linker drops crates whose
   symbols aren't referenced, so `kkernel/lib.rs` and the contract test binary both
   include explicit `use PackName as _` anchors to prevent dead-stripping.
 - `PackRegistry::discovered_names()` returns all self-registered pack names at runtime.
 
-### ADR-029: SubstrateCoordinator
+### ADR-029: SubstrateCoordinator - Cross-Backend Operations - SubstrateCoordinator
 
 - `coordinator/mod.rs` implements D1 (BackendRegistry), D2 (LocatorCache), and D3
   (fan-out search with RRF).
@@ -80,21 +80,21 @@
 - `kkernel kg fetch` has a `visible_alias = "sync"` so `kkernel kg sync --repin <remote>`
   reaches the same handler.
 
-### ADR-043: Embedding model lifecycle
+### ADR-043: Embedding Model Migration - Embedding model lifecycle
 
 - `kkernel engine list/status` expose `_embedding_models` table data.
 - `kkernel engine migrate` and `kkernel engine drift-check` are deferred to follow-up
   #380 (EmbedMigrationWorker and lattice_transport integration).
 - No MCP verbs are exposed for engine management — these are operator-only commands.
 
-### ADR-044: Vector store capabilities and orphan sweep
+### ADR-044: Vector Store Extensions - Capabilities, Metadata Filter, Batched Search, Update, Orphan Sweep - Vector store capabilities and orphan sweep
 
 - `kkernel vector capabilities` emits the sqlite-vec baseline capability flags.
   Values match `SqliteVecStore::capabilities()` in `khive-db`.
 - `kkernel vector sweep` is deferred to follow-up #381; `SqliteVecStore` returns
   `Unsupported` for the orphan-sweep operation.
 
-### ADR-046: Proposal lifecycle
+### ADR-046: Event-Sourced Agent KG Proposals - Proposal lifecycle
 
 - The kg pack exposes `propose`, `review`, and `withdraw` verbs as part of the
   17 kg-substrate bare verbs. These are validated by the contract test.

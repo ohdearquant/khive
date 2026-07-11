@@ -2,7 +2,7 @@
 
 ## ADR Compliance
 
-### ADR-030: BM25 Configuration Defaults
+### ADR-030: Retrieval Stack Port - khive-retrieval - BM25 Configuration Defaults
 
 - This crate implements the BM25 (Okapi BM25) keyword index with the Robertson-Walker IDF
   variant, ported as part of the `khive-retrieval` stack (ADR-030: Retrieval Stack Port).

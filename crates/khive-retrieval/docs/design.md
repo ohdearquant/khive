@@ -2,7 +2,7 @@
 
 ## ADR Compliance
 
-### ADR-004: Graph Traversal Algorithms
+### ADR-004: Substrate Observables - Graph Traversal Algorithms
 
 - The legacy `graph` module (the `graph-legacy` feature) was removed (#58). It predated the
   `GraphStore` trait and duplicated traversal that now lives canonically in `khive-runtime`
@@ -18,7 +18,7 @@
 - This guarantees cross-platform ranking identity (x86_64, ARM64, WASM) and enables
   `Ord` + `Hash` on ranked results.
 
-### ADR-012: Retrieval as Composition of Storage-Capability Signals
+### ADR-012: Retrieval Composition (High-Level Composition Layer) - Retrieval as Composition of Storage-Capability Signals
 
 - `khive-retrieval` materialises the composition layer described in ADR-012.
 - `VectorSearch`, `KeywordSearch`, `HybridSearcher`, and `Reranker` are independent traits.
@@ -28,7 +28,7 @@
   Per-namespace filtering helpers (`filter_atoms_by_namespace`) are provided for callers
   operating below the runtime trust boundary.
 
-### ADR-030: Feature Flag Policy
+### ADR-030: Retrieval Stack Port - khive-retrieval - Feature Flag Policy
 
 - `replay/engine_replay.rs` is co-located with its SQL schema helpers because all five
   replay primitives share a single SQLite connection type and the same `weight_events`

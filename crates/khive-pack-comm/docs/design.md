@@ -2,7 +2,7 @@
 
 ## ADR Compliance
 
-### ADR-040: Communication Pack
+### ADR-040: Communication and Schedule Packs - Communication Pack
 
 This crate is the primary implementation of ADR-040. It provides five `comm.*` verbs over the
 standard `message` note kind stored in the notes table.
@@ -32,7 +32,7 @@ Key design decisions from ADR-040:
 - **`read()` is a recipient-only action**: marking an outbound (sent) message as read is rejected.
   Only inbound messages (direction=inbound) can be marked read.
 
-### ADR-025: Verb Categories
+### ADR-025: Verb Surface as Speech-Act Taxonomy - Verb Categories
 
 Handler definitions in `vocab.rs` assign each verb a `VerbCategory` matching the speech-act
 taxonomy from ADR-025. The mapping is enforced by the `verb_categories_match_spec` unit test.

@@ -48,7 +48,7 @@ graph-based retrieval engine (ADR-048).
 
 ## ADR Compliance
 
-### ADR-048: Vamana ANN Engine
+### ADR-048: Knowledge Section Profiles - Vamana ANN Engine
 
 This crate implements the Vamana ANN index as the knowledge-pack approximate
 nearest-neighbor engine.

@@ -71,7 +71,7 @@ ADR-008. It is intentionally split into three stages:
   text. Any attempt to set `namespace` in a query node property or WHERE condition
   is rejected at validation time.
 
-### ADR-041: Synthetic Observation Edge Paths
+### ADR-041: Event Provenance Projection - Hybrid Log + Graph Edges - Synthetic Observation Edge Paths
 
 Relations prefixed `observed_as_*` (specifically: `observed_as_candidate`,
 `observed_as_selected`, `observed_as_target`, `observed_as_signal`) are synthetic

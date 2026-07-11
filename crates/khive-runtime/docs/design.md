@@ -2,7 +2,7 @@
 
 ## ADR Compliance
 
-### ADR-002: Edge Ontology
+### ADR-002: Closed Edge Ontology - Edge Ontology
 
 - 17 closed edge relations (15 base relations plus 2 epistemic relations added by ADR-055);
   endpoint contract enforced at the runtime layer in `operations.rs`
@@ -20,7 +20,7 @@
 - The audit payload field holds the full `AuditEvent` envelope (not a bare verb result)
 - Top-level event fields follow the ADR-004/ADR-005 schema
 
-### ADR-007: Namespace Strategy (Rev 6)
+### ADR-007: Namespace as Attribution-Only Open String - Dumb Storage, Single Gate, Operator-Configured Read Visibility - Namespace Strategy (Rev 6)
 
 - Namespace is attribution and gate-policy input, not a storage partition; it is not a
   by-ID access control boundary
@@ -42,7 +42,7 @@
 - Cross-backend `merge_entity` is unsupported in v1; both entities must reside on the same backend
 - `db_path` and `embedding_model` on `RuntimeConfig` are deprecated in favour of the external-backend path
 
-### ADR-010: KG Versioning / Portability
+### ADR-010: KG Versioning Strategy - KG Versioning / Portability
 
 - Export format is `"khive-kg"` version `"0.1"` (stable identifier for archive parsers)
 - Embeddings are excluded from archives (regenerable from text + model)
@@ -98,39 +98,39 @@
 - Default decay rate: 0.01 (~69-day half-life)
 - Per-note `decay_factor` is used by `DecayAwareSalienceObjective` rather than the objective's own rate
 
-### ADR-023: Declarative Pack Format
+### ADR-023: Pack Verb Surface, Visibility, and Composition - Declarative Pack Format
 
 - Verb surface and visibility are declared per-pack; only `Visibility::Verb` entries appear in `help=true` envelopes
 - `all_verbs` returns only public verb entries; internal subhandlers require `all_handlers_with_names`
 
-### ADR-025: Pack Dispatch Trait
+### ADR-025: Verb Surface as Speech-Act Taxonomy - Pack Dispatch Trait
 
 - `PackRuntime::dispatch` is the async per-verb entry point for each pack
 - Packs that do not use an embedder registry may ignore the `register_embedders` hook
 
-### ADR-027: Dynamic Pack Loading
+### ADR-027: Dynamic Pack Loading via Self-Registration - Dynamic Pack Loading
 
 - Pack factories are discovered via `inventory` at link time; missing dependencies are a boot error
 - Missing dependencies are not silently auto-added; the requested set must be explicit
 - `PackRegistry` performs topological sort of packs using Kahn's algorithm
 
-### ADR-029: Gate Authorization
+### ADR-029: SubstrateCoordinator - Cross-Backend Operations - Gate Authorization
 
 - `RuntimeConfig::gate` defaults to `AllowAllGate`; production deployments plug in a policy-backed impl
 
-### ADR-030: Layered Retrieval Architecture
+### ADR-030: Retrieval Stack Port - khive-retrieval - Layered Retrieval Architecture
 
 - `KindHook` provides per-kind specialization for shared CRUD operations
 - The retrieval pipeline composes signal objectives without IO; the runtime layer materialises signal data
 
-### ADR-031: Pack-Extensible Embedder Registry
+### ADR-031: Multi-Engine Retrieval - Embedder Trait, Registry, Configuration, and Pack Orchestration - Pack-Extensible Embedder Registry
 
 - Pack-declared embedder providers are registered via `PackRuntime::register_embedders`
 - Pack-extensible edge endpoint rules are shared across clones via `Arc<RwLock<_>>`
 - Base ADR-002 rules apply independently; pack rules are additive
 - `KhiveRuntime::install_edge_rules` is called once by the transport after `VerbRegistry` is built
 
-### ADR-033: Recall Pipeline
+### ADR-033: Recall Pipeline - Configurable Multi-Stage Memory Retrieval - Recall Pipeline
 
 - `NoteCandidate` carries pre-computed signals; objectives are pure functions with no IO
 - `MemoryRecallPipeline::default()` uses the ADR-021 default decay parameters
@@ -143,38 +143,38 @@
 - `GraphPatch` is a deferred stub; the auto-fix write path is not yet implemented
 - Violations are grouped by rule ID and sorted canonically
 
-### ADR-037: Inter-Pack Dependencies
+### ADR-037: Remote Entity Resolution and Content-Hash Verification - Inter-Pack Dependencies
 
 - Missing pack dependencies are collected and reported as a single `MissingPackDependencies` error
 - Circular dependencies are detected during topological sort and reported as `CircularPackDependency`
 - Remote resolution errors (`UnknownRemote`, `RemoteCacheMissing`) are part of the same error family
 
-### ADR-049: ANN Warmup
+### ADR-049: khived daemon - persistent warm runtime over a Unix socket - ANN Warmup
 
 - `KhiveRuntime::warm_ann_index` is intended to run once at startup as a background task.
   The warm-start protocol is owned by the daemon (ADR-049: khived daemon); the runtime
   exposes the `warm_ann_index` hook for the daemon to invoke during startup.
 - Warm startup sequence follows steps 2–4 from the ANN warmup spec.
 
-### ADR-045: Verb Response Presentation
+### ADR-045: Verb Response Presentation Modes - Verb Response Presentation
 
 - `micros_to_iso` is the single conversion point from internal `i64` microsecond timestamps to ISO-8601
 - `Agent` mode: short UUIDs (8-char), relative timestamps within 24h, lifecycle nulls preserved, scores truncated to 3 sig-figs
 - `Human` mode at the MCP layer is identical to `Verbose`; terminal formatting is applied by the CLI layer
 - `full_id` is explicitly excluded from UUID shortening in Agent mode to preserve chaining handles
 
-### ADR-020: Stable Edge Identity
+### ADR-020: Git-Native KG Implementation - Stable Edge Identity
 
 - `ExportedEdge::edge_id` carries the stable `LinkId` UUID across export/import cycles,
   as specified in ADR-020 (Git-Native KG Implementation) §edge_id.
 - Old archives (pre-0.2) omit `edge_id`; `serde(default)` assigns a fresh UUID on import.
 
-### ADR-049: Persistent Daemon
+### ADR-049: khived daemon - persistent warm runtime over a Unix socket - Persistent Daemon
 
 - `khived` is a persistent warm runtime over a Unix socket
 - `PackRuntime::warm` is invoked on every registered pack during daemon startup
 
-### ADR-050: Namespace Token Contract
+### ADR-050: KG Token Namespace Contract - Namespace Token Contract
 
 - `NamespaceToken` is sealed to prevent external construction without gate authorization
 - Namespace authority governs which namespace(s) a dispatch can read/write (minted at

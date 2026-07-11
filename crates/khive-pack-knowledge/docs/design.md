@@ -13,7 +13,7 @@
 
 ## ADR Compliance
 
-### ADR-047: Knowledge Pack Verb Surface
+### ADR-047: Knowledge Pack - Knowledge Pack Verb Surface
 
 - This pack implements the 18 verb corpus surface: atoms/domains CRUD, TF-IDF search with
   embedding rerank, fold, import, edit, challenge, adjudicate, and concept-tier sugar.
@@ -21,7 +21,7 @@
   and comparison. The same normalized value is used in `properties.domain`, promoted tags,
   and response bodies so all three surfaces agree.
 
-### ADR-048: Section Profiles and Vamana ANN Integration
+### ADR-048: Knowledge Section Profiles - Section Profiles and Vamana ANN Integration
 
 - The `SectionType` enum is a closed 10-value set. Headings in atlas markdown files are mapped
   to canonical section types via `from_str_loose`, which accepts common heading aliases.
@@ -32,7 +32,7 @@
   fused via RRF (k=60). The index lifecycle is owned by `knowledge/vamana.rs`: warm-load from
   persistent snapshot, fingerprint validation, rebuild from sqlite-vec corpus on stale/miss.
 
-### ADR-047: Section Review Lifecycle
+### ADR-047: Knowledge Pack - Section Review Lifecycle
 
 - `knowledge.challenge` marks a section as disputed and increments `dispute_count` on the parent
   atom. `knowledge.adjudicate` resolves the dispute: `accept` → `verified`, `reject` → `reviewed`.
@@ -40,17 +40,17 @@
 - The Vamana warm-start protocol (`ensure_ann_background`) fires at most once per
   `{namespace, model}` key using a `Mutex<HashSet>` single-flight guard.
 
-### ADR-027: Pack Self-Registration
+### ADR-027: Dynamic Pack Loading via Self-Registration - Pack Self-Registration
 
 - `KnowledgePackFactory` is submitted via `inventory::submit!` so the runtime can discover and
   load this pack by name without explicit wiring. `REQUIRES = ["kg"]` declares the dependency.
 
-### ADR-002: Edge Ontology
+### ADR-002: Closed Edge Ontology - Edge Ontology
 
 - `knowledge.cite` creates an `introduced_by` edge from a concept entity to a source entity
   (document, person, or org). The edge direction is concept → source.
 
-### ADR-015: Schema Migration
+### ADR-015: Schema Migrations - Schema Migration
 
 - Corpus tables (`knowledge_atoms`, `knowledge_domains`) are added in V19 migration.
 - Section table (`knowledge_sections`) is added in a subsequent migration.

@@ -29,7 +29,7 @@
 - `register_embedders` is called on every pack after the registry is built so
   custom embedding providers are available before the first `remember`/`recall`.
 
-### ADR-027: Dynamic Pack Loading
+### ADR-027: Dynamic Pack Loading via Self-Registration - Dynamic Pack Loading
 
 - `builtin_pack_names()` is sourced from `PackRegistry::discovered_names()` so
   the list always reflects whichever pack crates are linked into the binary.
@@ -38,7 +38,7 @@
 - `pack.rs` force-references one public symbol per pack crate so the linker
   includes their `inventory::submit!` constructors in the final binary.
 
-### ADR-031: Multi-Engine Retrieval — Edge Endpoint Rules and Embedder Registration
+### ADR-031: Multi-Engine Retrieval - Embedder Trait, Registry, Configuration, and Pack Orchestration - Multi-Engine Retrieval - Edge Endpoint Rules and Embedder Registration
 
 - After the registry is built, `install_edge_rules` aggregates pack-declared
   edge endpoint rules into the runtime so `validate_edge_relation_endpoints`
@@ -46,7 +46,7 @@
 - `call_register_embedders` is invoked after registry construction, before any
   verb dispatch, to wire custom embedding providers from each pack.
 
-### ADR-018: Authorization Gate and Audit Persistence
+### ADR-018: Authorization Gate - Authorization Gate and Audit Persistence
 
 - The authorization gate from `runtime.config().gate` is threaded into the
   registry. Gate decisions are hard-enforcing — a `Deny` result blocks pack
@@ -54,7 +54,7 @@
 - The `EventStore` is wired into the registry via `builder.with_event_store` for
   audit persistence of all dispatched operations.
 
-### ADR-038: Write-Key Conflict Detection
+### ADR-038: Bulk Operations - Write-Key Conflict Detection
 
 - Before parallel/single dispatch, operations targeting the same write key in
   the same batch are detected and receive per-op error entries.
@@ -62,7 +62,7 @@
 - `results.length == summary.total` is preserved (the response envelope contract
   is never violated by conflict detection).
 
-### ADR-045: Presentation Transforms
+### ADR-045: Verb Response Presentation Modes - Presentation Transforms
 
 - Presentation transforms are applied per-op AFTER dispatch, at the response
   envelope boundary. Chain `$prev` substitution uses canonical (verbose) handler
@@ -74,7 +74,7 @@
 - Known presentation mode strings: `"agent"` (default, token-efficient),
   `"verbose"` (full canonical shape), `"human"` (same as verbose at runtime).
 
-### ADR-049: Daemon — Warm Pack Registry
+### ADR-049: khived daemon - persistent warm runtime over a Unix socket - Daemon - Warm Pack Registry
 
 - The `daemon.rs` module provides the client side: `forward_or_spawn` connects
   to a warm daemon, auto-spawns it on first use, and maps responses to MCP
@@ -86,7 +86,7 @@
 - `DaemonDispatch` is implemented on `KhiveMcpServer` so the runtime daemon
   server can call back into the MCP server's local dispatch path.
 
-### ADR-014: Fail-Fast Pack Validation
+### ADR-014: Curation Operations - Fail-Fast Pack Validation
 
 - Pack registration is fail-fast: unknown names or unsatisfied dependencies
   abort construction and return the original runtime so callers can recover.

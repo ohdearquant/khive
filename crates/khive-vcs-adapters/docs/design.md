@@ -2,7 +2,7 @@
 
 ## ADR Compliance
 
-### ADR-036: KG Import/Export Adapters
+### ADR-036: KG Import/Export Format Adapters - KG Import/Export Adapters
 
 - This crate implements the format adapter layer of the two-stage KG import pipeline.
 - Adapters are pure transforms: they parse a source format and produce `EntityRecord`/`EdgeRecord`
@@ -35,7 +35,7 @@
 - Unknown kinds produce `AdapterError::UnknownKind` — never silently defaulted.
 - Missing `kind` is a fatal `AdapterError::MissingField`.
 
-### ADR-002: Edge Ontology
+### ADR-002: Closed Edge Ontology - Edge Ontology
 
 - `EdgeRecord.relation` must be one of the 15 canonical edge relations.
 - Validation uses `khive_types::EdgeRelation::from_str` at parse time.

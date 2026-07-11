@@ -8,19 +8,19 @@
   rank 1 in the RRF formula, consistent with the `rrf_score` function in `khive-score`
   (ADR-006: Deterministic Scoring).
 
-### ADR-012: Retrieval Composition
+### ADR-012: Retrieval Composition (High-Level Composition Layer) - Retrieval Composition
 
 - This crate provides the fusion layer that combines ranked result lists from multiple retrieval
   sources. It is consumed by higher-level retrieval pipelines to aggregate dense (vector) and
   lexical (BM25) signals into a single ranked output.
 
-### ADR-030: Hybrid Retrieval
+### ADR-030: Retrieval Stack Port - khive-retrieval - Hybrid Retrieval
 
 - The five `FusionStrategy` variants (RRF, Weighted, Union, VectorOnly, KeywordOnly) implement
   the hybrid retrieval strategy options specified for the system. RRF is the default as it is
   robust to score distribution differences between sources.
 
-### ADR-031: Multi-Engine Retrieval
+### ADR-031: Multi-Engine Retrieval - Embedder Trait, Registry, Configuration, and Pack Orchestration - Multi-Engine Retrieval
 
 - The `fuse()` dispatcher accepts results from any number of retrieval sources and routes them
   through the appropriate strategy. VectorOnly and KeywordOnly are single-source passthrough

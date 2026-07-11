@@ -39,7 +39,8 @@ else
     echo "=== PREFLIGHT (metadata + tarball file list + workspace check; pass --live to publish for real) ==="
 fi
 
-cd "$(dirname "$0")/../crates"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+cd "$SCRIPT_DIR/../crates"
 
 # Dependency order: each crate only depends on crates above it.
 CRATES=(
@@ -90,9 +91,8 @@ DELAY=10  # seconds to wait for crates.io index between publishes
 # (which is why it is NOT a per-PR CI gate). Runs in preflight and live alike so
 # `make publish-dry` validates SemVer before any real publish. Crates with no
 # crates.io baseline yet (never published) have nothing to diff against and are
-# excluded until their first publish: khive-quant, plus the crates first shipped
-# in this release — khive-channel, khive-channel-email, khive-pack-formal,
-# khive-pack-session. Drop an exclusion once that crate has one published version.
+# excluded until their first publish. The exclusion set is the shared policy in
+# scripts/semver-exclusions.sh (also consumed by .github/workflows/release.yml).
 echo ""
 echo "--- SemVer gate (cargo-semver-checks vs crates.io baseline) ---"
 if ! command -v cargo-semver-checks >/dev/null 2>&1; then
@@ -100,12 +100,8 @@ if ! command -v cargo-semver-checks >/dev/null 2>&1; then
     echo "       Install it:  cargo install cargo-semver-checks --locked" >&2
     exit 1
 fi
-cargo semver-checks check-release --workspace \
-    --exclude khive-quant \
-    --exclude khive-channel \
-    --exclude khive-channel-email \
-    --exclude khive-pack-formal \
-    --exclude khive-pack-session
+source "$SCRIPT_DIR/semver-exclusions.sh"
+cargo semver-checks check-release --workspace "${SEMVER_EXCLUDE_ARGS[@]}"
 echo "    SemVer gate OK"
 
 for crate in "${CRATES[@]}"; do

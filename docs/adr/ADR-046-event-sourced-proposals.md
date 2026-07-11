@@ -108,7 +108,11 @@ pub enum ProposalChangeset {
     MergeEntities { into: Uuid, from: Uuid },
     /// Supersede an entity with another (sets `supersedes` edge).
     SupersedeEntity { old: Uuid, new: Uuid },
-    /// Compound: an ordered sequence of the above, applied atomically.
+    /// Compound: an ordered sequence of the above.
+    ///
+    /// Current v1 behavior accepts no more than one step at each nesting level.
+    /// A multi-step Compound is rejected at propose-time and legacy-apply-time
+    /// until an atomic apply primitive exists.
     Compound { steps: Vec<ProposalChangeset> },
 }
 
@@ -150,20 +154,23 @@ pub struct ProposalWithdrawnPayload {
 
 `ProposalChangeset` is a closed enum — no ad-hoc change types.
 
-**Compound changeset semantics (Fix 4):** A `Compound([step1, step2, ...])` proposal
-applies steps in order. The apply worker uses a single SQLite write transaction
-wrapping all steps (since all v1 backends share the same SQLite connection per
-`khive-db`). If ANY step's runtime validation fails, the entire transaction
-rolls back and the worker emits
-`ProposalApplied { result: Failed { error, applied_step_count: 0 } }`.
+**Compound changeset semantics (Fix 4):** A `Compound` is an ordered changeset
+container. Current v1 behavior accepts no more than one step at each nesting
+level. A multi-step `Compound` is rejected at propose-time and rejected again
+for legacy queued apply before any KG mutation. A single-step `Compound`
+follows its contained operation. The current runtime and storage APIs provide
+no shared multi-step transaction, so legacy rejection emits
+`ProposalApplied { result: Failed { error, applied_step_count: 0 } }` without a
+partial write.
 
 Cross-store atomicity (e.g., entity creation in SQLite + vector insert in
-sqlite-vec) follows the same single-transaction model — v1 backends are
-co-located. Future multi-backend deployments may relax this; the cross-backend
-caveat is tracked at ADR-014. ADR-014 does NOT expose a multi-step transactional
-primitive today; v1 correctness relies on the co-located SQLite assumption, not
-on an ADR-014 guarantee. If a future ADR-014 amendment introduces
-`runtime.curation.atomic_apply(steps)`, this section will be revised.
+sqlite-vec) has the same constraint: v1 backends are co-located, but no shared
+multi-step transaction exists across them today. Future multi-backend
+deployments may relax this; the cross-backend caveat is tracked at ADR-014.
+ADR-014 does NOT expose a multi-step transactional primitive today. A future
+multi-step contract requires a runtime/storage atomic-apply primitive; if a
+future ADR-014 amendment introduces `runtime.curation.atomic_apply(steps)`,
+this section will be revised.
 
 ### 3. Verb surface — three new verbs
 
@@ -346,7 +353,8 @@ On each approved review handled by `handle_review`, `ProposalApplyWorker::maybe_
    - `AddNote` → `runtime.notes.create(...)`
    - `MergeEntities` → `runtime.curation.merge_entities(...)`
    - `SupersedeEntity` → adds `supersedes` edge via `runtime.graph.link(...)`
-   - `Compound` → recursive within a single transaction
+   - `Compound` → recursion applies only the contained single-step form; a
+     multi-step `Compound` is rejected before this point
 4. Emits `ProposalApplied` with `Success { created_records }` or `Failed { error }`.
 
 Authorization (ADR-018) checks the apply attempt. The worker's actor identity
@@ -720,8 +728,9 @@ Lookup wire shape:
 
 - Old khive ADR-075 (Agent-Driven PR Workflow) — original git-based design,
   superseded by this ADR
-- ADR-014 (Curation Operations) — `merge_entities` and atomic compound updates
-  consumed by the apply worker
+- ADR-014 (Curation Operations): `merge_entities`; multi-step atomic compound
+  apply is not consumed by the apply worker, which currently accepts only a
+  single-step `Compound` (see the Compound semantics section above)
 - ADR-017 (Pack Standard) — handler declaration surface used by the KG pack; proposal `PackEventConsumer` registration remains deferred
 - ADR-018 (Authorization Gate) — gates the apply step
 - ADR-022 (Events Query Surface) — proposal events live as substrate events
