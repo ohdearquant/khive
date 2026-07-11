@@ -9,5 +9,6 @@ pub use atomic::{check_atomic_admissible, AtomicRejection};
 pub use conflict::write_keys_for_op_pub;
 pub use parser::parse_request;
 pub use types::{
-    ArgValue, DslError, ExecutionMode, ParsedOp, ParsedRequest, MAX_OPS, RESERVED_ENVELOPE_ARGS,
+    value_nesting_within_limit, ArgValue, DslError, ExecutionMode, ParsedOp, ParsedRequest,
+    MAX_OPS, MAX_OPS_INPUT_LEN, NESTING_DEPTH_LIMIT, RESERVED_ENVELOPE_ARGS,
 };
