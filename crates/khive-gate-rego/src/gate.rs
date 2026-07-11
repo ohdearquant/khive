@@ -238,23 +238,30 @@ impl Gate for RegoGate {
         //
         // GATEREGO-AUD-001: a malformed policy can return caller-supplied
         // input (e.g. `input.args`) verbatim as its "decision" value. Prior
-        // to this fix, `decision_json` — the raw policy output — was embedded
+        // to this fix, `decision_json` (the raw policy output) was embedded
         // in both the tracing warn and the generated Deny reason, so a
         // request secret (API key, token) present anywhere in the request
         // would be echoed back to the caller via `PermissionDenied` and
         // persisted into audit events. Only a type-shape summary (never the
         // value) is surfaced now.
+        //
+        // GATEREGO-AUD-002: `serde_json::from_str::<GateDecision>` uses an
+        // internally-tagged enum (`#[serde(tag = "decision")]`), so its
+        // deserialization error text includes the unrecognized `decision`
+        // value verbatim (e.g. `unknown variant \`<secret>\`, expected
+        // \`allow\` or \`deny\``). That error must never be logged; only a
+        // fixed, caller-data-free category is recorded.
         match serde_json::from_str::<GateDecision>(&decision_json) {
             Ok(decision) => Ok(decision),
-            Err(e) => {
+            Err(_) => {
                 let shape = serde_json::from_str::<serde_json::Value>(&decision_json)
                     .map(describe_json_shape)
                     .unwrap_or("unparsable");
                 tracing::warn!(
                     entrypoint = %self.entrypoint,
                     shape,
-                    error = %e,
-                    "policy returned non-GateDecision shape — denying (fail-closed)"
+                    error = "policy_decision_shape_mismatch",
+                    "policy returned non-GateDecision shape, denying (fail-closed)"
                 );
                 Ok(GateDecision::deny(format!(
                     "policy rule {} returned an unrecognized shape ({shape}); refusing to echo policy output",
@@ -269,7 +276,7 @@ impl Gate for RegoGate {
     }
 }
 
-/// Top-level JSON type name of `value`, with no field contents — used to
+/// Top-level JSON type name of `value`, with no field contents, used to
 /// describe a wrong-shaped policy result without echoing any of the
 /// (possibly caller-supplied) data it may carry.
 fn describe_json_shape(value: serde_json::Value) -> &'static str {
@@ -343,8 +350,8 @@ mod tests {
         "#;
         let gate = RegoGate::from_policy_str(policy).expect("policy compiles");
 
-        // FAKE key: real AKIA/AWS shape, invented suffix — see khive-runtime's
-        // secret_gate tests for the convention.
+        // FAKE key: real AKIA/AWS shape, invented suffix (see khive-runtime's
+        // secret_gate tests for the convention).
         let fake_key = "AKIAFAKEKEY000000000";
         let req = GateRequest::new(
             ActorRef::anonymous(),
@@ -376,6 +383,97 @@ mod tests {
         assert!(
             !reason.contains("api_key"),
             "Deny reason must never echo caller-supplied field names either; got: {reason}"
+        );
+    }
+
+    // ---- GATEREGO-AUD-002: the shape-mismatch warn log must never leak the
+    // caller-supplied value either, even though the Deny reason is sanitized ----
+
+    #[derive(Clone, Default)]
+    struct CapturedLog(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CapturedLog {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLog {
+        type Writer = CapturedLog;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    #[test]
+    fn malformed_policy_shape_mismatch_log_does_not_leak_secret() {
+        // Unlike the `default decision := input.args` shape in the sibling
+        // test above (which regorus rejects at eval time as an "invalid ref
+        // in default value" before any value is produced), this policy
+        // evaluates successfully and returns a well-formed object whose
+        // `decision` tag value is the caller-supplied secret itself, which
+        // is exactly what drives serde's internally-tagged "unknown variant"
+        // error message through the deserialize path this test targets.
+        let policy = r#"
+            package khive.gate
+            import rego.v1
+            decision := {"decision": input.args.changeset.entity.properties.api_key}
+        "#;
+        let gate = RegoGate::from_policy_str(policy).expect("policy compiles");
+
+        let fake_key = "AKIAFAKEKEY000000000";
+        let req = GateRequest::new(
+            ActorRef::anonymous(),
+            Namespace::local(),
+            "propose",
+            json!({
+                "changeset": {
+                    "entity": {
+                        "properties": {
+                            "api_key": fake_key,
+                        }
+                    }
+                }
+            }),
+        );
+
+        let captured = CapturedLog::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(captured.clone())
+            .with_ansi(false)
+            .finish();
+
+        let decision = tracing::subscriber::with_default(subscriber, || {
+            gate.check(&req).expect("check must not Err (fail-closed)")
+        });
+        assert!(
+            matches!(decision, GateDecision::Deny { .. }),
+            "wrong-shaped policy result must deny, not allow"
+        );
+
+        let log_output = String::from_utf8(captured.0.lock().unwrap().clone())
+            .expect("log output must be valid UTF-8");
+
+        assert!(
+            !log_output.is_empty(),
+            "expected the shape-mismatch warn log to be captured"
+        );
+        assert!(
+            log_output.contains("policy_decision_shape_mismatch"),
+            "expected the shape-mismatch branch's fixed error category in the log; got: {log_output}"
+        );
+        assert!(
+            !log_output.contains(fake_key),
+            "tracing output must never contain the caller-supplied secret; got: {log_output}"
+        );
+        assert!(
+            !log_output.contains("api_key"),
+            "tracing output must never contain caller-supplied field names either; got: {log_output}"
         );
     }
 }
