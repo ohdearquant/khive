@@ -1489,11 +1489,33 @@ pub(crate) static DRAIN_EXIT_INVOKED_COUNT: std::sync::atomic::AtomicUsize =
 pub(crate) fn reset_self_heal_counters() {
     REEXEC_INVOKED_COUNT.store(0, std::sync::atomic::Ordering::SeqCst);
     DRAIN_EXIT_INVOKED_COUNT.store(0, std::sync::atomic::Ordering::SeqCst);
+    clear_pending_self_heal();
 }
 
 #[cfg(all(test, not(unix)))]
 pub(crate) fn reset_self_heal_counters() {
     DRAIN_EXIT_INVOKED_COUNT.store(0, std::sync::atomic::Ordering::SeqCst);
+    clear_pending_self_heal();
+}
+
+/// Clear whatever `PENDING_SELF_HEAL` currently holds (#843). A test that
+/// exercises `forward_or_spawn`'s protocol-mismatch path end to end (e.g.
+/// `forward_or_spawn_rejects_old_daemon_and_returns_protocol_mismatch_error`)
+/// arms it via `trigger_bridge_self_heal` but never takes the action back
+/// out — that is `fire_pending_self_heal`'s job, and asserting the forwarding
+/// behavior alone has no reason to call it. Left armed, that leftover slot
+/// is invisible to `reset_self_heal_counters` resetting only the two
+/// invocation counters, so a later test in the same binary (e.g.
+/// `fire_pending_self_heal_is_a_no_op_when_nothing_is_armed`) can inherit it
+/// under multi-threaded test ordering and observe a spurious fire. Every
+/// existing test that intentionally arms the slot does so AFTER calling
+/// `reset_self_heal_counters`, never before, so clearing it here changes no
+/// test's semantics.
+#[cfg(test)]
+fn clear_pending_self_heal() {
+    *PENDING_SELF_HEAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
 }
 
 /// Test double for [`reexec_in_place`]: a real `exec()` would replace the test
