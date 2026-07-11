@@ -113,3 +113,9 @@ perf/bench-runs/*.json
 # stdout/stderr/report artifacts. Sample-dependent and local-machine-noise
 # specific; not committed.
 scripts/perf/calibration/
+
+# bench_track.py trend ledger. Lives only on the dedicated `perf-data`
+# branch (published by scripts/perf/publish_ledger.sh) - never committed to
+# main or a feature branch.
+bench-data/
+.perf-data-worktree/
