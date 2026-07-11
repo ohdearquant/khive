@@ -54,10 +54,14 @@ std::thread_local! {
 }
 
 // Count-targetable vector-INSERT fault injection: when set to N (N > 0), the next N
-// vector insert calls succeed and the (N+1)-th returns an injected error.  After
-// triggering the counter resets to 0.  `thread_local!` provides per-thread isolation;
-// `#[tokio::test]` uses a current-thread runtime so there is no thread migration
-// mid-test.  This lets T-E3 let model-a's insert succeed and fail on model-b's.
+// vector insert calls (entity or note, single- or multi-model) succeed and the
+// (N+1)-th returns an injected error.  After triggering the counter resets to 0.
+// `thread_local!` provides per-thread isolation; `#[tokio::test]` uses a
+// current-thread runtime so there is no thread migration mid-test.  This lets
+// T-E3 let model-a's insert succeed and fail on model-b's, and lets any caller
+// whose test suite shares one default namespace across concurrently-running
+// tests (so `VECTOR_FAIL_NS`'s namespace match could be won by an unrelated
+// test's note/entity create) get a deterministic, race-free injection instead.
 #[cfg(any(test, feature = "fault-injection"))]
 std::thread_local! {
     static VECTOR_FAIL_AFTER: std::cell::Cell<Option<usize>> =
@@ -65,7 +69,11 @@ std::thread_local! {
 }
 
 /// Arm the count-targetable vector-INSERT fault: let `n` inserts succeed, then fail
-/// the next one.  Set `n = 0` to fail immediately on the first insert.
+/// the next one (entity or note, single- or multi-model). Set `n = 0` to fail
+/// immediately on the first insert. Thread-local, so unlike `arm_vector_fail`
+/// it cannot be won or disarmed by a concurrently-running test on another
+/// thread — prefer this one whenever the caller cannot guarantee it is the
+/// only test writing into the namespace it cares about.
 /// Available when compiled with `cfg(test)` or `feature = "fault-injection"`.
 #[cfg(any(test, feature = "fault-injection"))]
 pub fn arm_vector_fail_after(n: usize) {
@@ -2652,19 +2660,38 @@ impl KhiveRuntime {
             let model_name = &embed_model_names[0];
             let vec_result = self.embed_document_with_model(model_name, embed_text).await;
 
-            // Injection: check VECTOR_FAIL_NS (armed by `arm_vector_fail(ns)`).
-            // Fires only when the armed namespace matches this note's namespace,
-            // then clears (one-shot).  No lock acquisition in release builds —
+            // Injection: check VECTOR_FAIL_NS (armed by `arm_vector_fail(ns)`) or
+            // VECTOR_FAIL_AFTER (armed by `arm_vector_fail_after(n)`). The former
+            // fires only when the armed namespace matches this note's namespace;
+            // callers that cannot guarantee no concurrently-running test also
+            // writes a note into that same namespace (e.g. a test suite whose
+            // fixtures share one default namespace) should prefer the latter,
+            // thread-local count instead — see its doc comment. Either clears
+            // (one-shot) once it fires. No lock/cell access in release builds —
             // the cfg(not) branch is a const false eliminating the if-branch.
             #[cfg(any(test, feature = "fault-injection"))]
             let vec_inject = {
-                let mut g = VECTOR_FAIL_NS.lock().unwrap();
-                if g.as_deref() == Some(ns) {
-                    *g = None;
-                    true
-                } else {
-                    false
-                }
+                let ns_inject = {
+                    let mut g = VECTOR_FAIL_NS.lock().unwrap();
+                    if g.as_deref() == Some(ns) {
+                        *g = None;
+                        true
+                    } else {
+                        false
+                    }
+                };
+                let count_inject = VECTOR_FAIL_AFTER.with(|cell| match cell.get() {
+                    Some(0) => {
+                        cell.set(None);
+                        true
+                    }
+                    Some(n) => {
+                        cell.set(Some(n - 1));
+                        false
+                    }
+                    None => false,
+                });
+                ns_inject || count_inject
             };
             #[cfg(not(any(test, feature = "fault-injection")))]
             let vec_inject = false;

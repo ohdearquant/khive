@@ -1142,7 +1142,13 @@ mod tests {
         Arc::new(ConnectionPool::new(cfg).expect("pool open"))
     }
 
+    // `checkpoint_once` -> `query_wal_pages` writes the process-wide
+    // `LAST_WAL_PAGES` gauge and resets `CHECKPOINT_CONSECUTIVE_SKIPS`
+    // (see the reset-discipline comment on `reset_checkpoint_metrics_for_tests`
+    // above) — this must join the `checkpoint_skip_metrics` group so it can
+    // never interleave with a test asserting on those same gauges.
     #[test]
+    #[serial(checkpoint_skip_metrics)]
     fn checkpoint_once_succeeds_on_file_backed_pool() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("wal_test.db");
@@ -1169,6 +1175,7 @@ mod tests {
     }
 
     #[test]
+    #[serial(checkpoint_skip_metrics)]
     fn checkpoint_once_is_noop_on_in_memory_pool() {
         // In-memory databases do not use WAL; checkpoint_once must not panic.
         let cfg = PoolConfig {
@@ -1184,6 +1191,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial(checkpoint_skip_metrics)]
     async fn checkpoint_task_exits_on_shutdown_signal() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("wal_task_shutdown.db");
@@ -1223,6 +1231,7 @@ mod tests {
     /// asserts the task still exits promptly via the watch-channel signal,
     /// proving the fix does not depend on `Arc::strong_count` at all.
     #[tokio::test]
+    #[serial(checkpoint_skip_metrics)]
     async fn checkpoint_task_exits_via_shutdown_signal_with_live_event_store_pool_clone() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("wal_task_event_store.db");
@@ -1349,6 +1358,7 @@ mod tests {
     /// busy_timeout to 2000ms keeps the PASSIVE path well below 500ms while a
     /// TRUNCATE regression blocks for ~2000ms — a 4x safety margin on both sides.
     #[test]
+    #[serial(checkpoint_skip_metrics)]
     fn checkpoint_high_water_does_not_block_behind_reader() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("high_water_test.db");
@@ -1552,7 +1562,7 @@ mod tests {
     /// at/above `truncate_high_water_pages` and no prior attempt has run, the
     /// escalation fires and stamps `last_attempt`.
     #[test]
-    #[serial(tx_registry)]
+    #[serial(tx_registry, checkpoint_skip_metrics)]
     fn truncate_attempts_when_high_water_crossed_with_no_prior_attempt() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("truncate_trigger.db");
@@ -1594,7 +1604,7 @@ mod tests {
     /// Below-threshold skip: `wal_pages < truncate_high_water_pages` must never
     /// stamp `last_attempt` — only an actual attempt advances it.
     #[test]
-    #[serial(tx_registry)]
+    #[serial(tx_registry, checkpoint_skip_metrics)]
     fn truncate_does_not_attempt_below_high_water() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("truncate_below_threshold.db");
@@ -1629,7 +1639,7 @@ mod tests {
     /// still above threshold but within `truncate_min_interval` must skip
     /// without re-stamping `last_attempt` (the timestamp must not move).
     #[test]
-    #[serial(tx_registry)]
+    #[serial(tx_registry, checkpoint_skip_metrics)]
     fn truncate_min_interval_skip_does_not_restamp_last_attempt() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("truncate_min_interval.db");
@@ -2119,6 +2129,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial(checkpoint_skip_metrics)]
     async fn checkpoint_task_emits_outcome_events_while_elevated_and_stops_after_drain() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("outcome_emit.db");
@@ -2168,6 +2179,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial(checkpoint_skip_metrics)]
     async fn checkpoint_task_emits_nothing_while_healthy() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("outcome_no_emit.db");
@@ -2206,6 +2218,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial(checkpoint_skip_metrics)]
     async fn checkpoint_task_with_no_event_store_does_not_panic() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("outcome_none_store.db");

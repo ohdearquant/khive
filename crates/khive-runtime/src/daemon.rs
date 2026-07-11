@@ -1902,28 +1902,45 @@ mod tests {
     fn shutdown_cleanup_skips_when_socket_was_rebound_by_a_replacement() {
         let dir = tempfile::tempdir().expect("tempdir");
         let sock = dir.path().join("khived.sock");
+        let original_sock = dir.path().join("original.sock");
         let pid_file = dir.path().join("khived.pid");
 
-        // This daemon's original bind — captured identity, then simulate the
-        // process exiting (listener dropped, socket path removed) before a
-        // replacement daemon rebinds the same path with a new inode.
-        let original_identity = {
-            let listener =
-                std::os::unix::net::UnixListener::bind(&sock).expect("bind original socket");
-            let id = socket_identity(&sock);
-            drop(listener);
-            let _ = std::fs::remove_file(&sock);
-            id
-        };
-        std::fs::write(&pid_file, std::process::id().to_string())
-            .expect("write pid file matching this process");
-
-        // Replacement daemon binds the same path — new inode, same PID file
-        // path (not yet overwritten, e.g. write still in flight) — the socket
-        // identity mismatch alone must be enough to block cleanup.
+        // Bind two sockets at DIFFERENT paths, both alive at the same time,
+        // so the OS cannot recycle an inode between them the way it could
+        // across a bind/drop/rebind cycle at a single path (the flakiness a
+        // prior version of this test hit on some filesystems). Both
+        // identities are captured through the real production
+        // `socket_identity()` path, not a synthetic/sentinel value, so a
+        // regression where `socket_identity()` returns a constant identity
+        // for every socket makes the `assert!` below fail loudly instead of
+        // silently passing.
+        let _original_listener =
+            std::os::unix::net::UnixListener::bind(&original_sock).expect("bind original socket");
         let _replacement_listener =
             std::os::unix::net::UnixListener::bind(&sock).expect("bind replacement socket");
 
+        let original_identity = socket_identity(&original_sock);
+        let replacement_identity = socket_identity(&sock);
+        assert!(
+            original_identity.is_some(),
+            "must read identity of the original socket"
+        );
+        assert!(
+            replacement_identity.is_some(),
+            "must read identity of the replacement socket"
+        );
+        assert!(
+            original_identity != replacement_identity,
+            "two concurrently bound sockets must have distinct identities"
+        );
+
+        std::fs::write(&pid_file, std::process::id().to_string())
+            .expect("write pid file matching this process");
+
+        // `sock` (the replacement bind's path) is checked against
+        // `original_identity` (a different, concurrently-alive socket's
+        // identity) - the mismatch alone must be enough to block cleanup,
+        // even though the pid file matches this process.
         let cleaned = shutdown_cleanup_if_owned(&sock, &pid_file, original_identity);
 
         assert!(
@@ -1932,6 +1949,10 @@ mod tests {
              inode than the one this daemon originally bound"
         );
         assert!(sock.exists(), "replacement daemon's socket must survive");
+        assert!(
+            pid_file.exists(),
+            "replacement daemon's pid file must survive"
+        );
     }
 
     // ── #667: the recovery lock actually serializes two boot sequences ───────
