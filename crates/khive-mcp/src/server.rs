@@ -708,8 +708,7 @@ impl KhiveMcpServer {
             .dispatch_via_coordinator(&tool, &args_value, identity)
             .await
         {
-            return coord_result
-                .map(|result| json!({ "ok": true, "tool": tool, "result": result }));
+            return coord_result.and_then(|result| chain_ok_envelope_or_depth_error(tool, result));
         }
 
         match self
@@ -717,7 +716,7 @@ impl KhiveMcpServer {
             .dispatch_with_identity(&tool, args_value, identity.cloned())
             .await
         {
-            Ok(result) => Ok(json!({ "ok": true, "tool": tool, "result": result })),
+            Ok(result) => chain_ok_envelope_or_depth_error(tool, result),
             Err(RuntimeError::Khive(k)) => {
                 let error_payload = serde_json::to_value(&k)
                     .unwrap_or_else(|_| json!({ "kind": "internal", "message": k.to_string() }));
@@ -899,11 +898,12 @@ impl KhiveMcpServer {
                                 .await
                                 {
                                     return match coord_result {
-                                        Ok(result) => {
-                                            let presented =
-                                                present(result, effective_mode, now_unix);
-                                            json!({ "ok": true, "tool": tool, "result": presented })
-                                        }
+                                        Ok(result) => present_ok_envelope_or_depth_error(
+                                            tool,
+                                            result,
+                                            effective_mode,
+                                            now_unix,
+                                        ),
                                         Err((_, error_payload)) => {
                                             json!({ "ok": false, "tool": tool, "error": error_payload })
                                         }
@@ -916,10 +916,12 @@ impl KhiveMcpServer {
                             .dispatch_with_identity(&tool, args_value, op_identity)
                             .await
                         {
-                            Ok(result) => {
-                                let presented = present(result, effective_mode, now_unix);
-                                json!({ "ok": true, "tool": tool, "result": presented })
-                            }
+                            Ok(result) => present_ok_envelope_or_depth_error(
+                                tool,
+                                result,
+                                effective_mode,
+                                now_unix,
+                            ),
                             Err(RuntimeError::Khive(k)) => {
                                 let error_payload = serde_json::to_value(&k).unwrap_or_else(
                                     |_| json!({ "kind": "internal", "message": k.to_string() }),
@@ -1273,19 +1275,116 @@ async fn dispatch_via_coordinator_inner(
     }
 }
 
+/// Returns `true` when a raw handler `result` value's container nesting is
+/// within [`khive_request::NESTING_DEPTH_LIMIT`].
+///
+/// Handler results (e.g. `traverse`/`context`) are not bounded by the DSL
+/// parser's syntax-tree guard, so a pathologically deep result could
+/// overflow the stack via recursive `Value::clone`, `json!`/
+/// `serde_json::to_value` serialization, or the agent-mode presentation
+/// transform — all of which recurse natively over `Value`. Callers MUST
+/// call this on the raw value coming straight out of coordinator/registry
+/// dispatch, before any of those operations touch it. Delegates to
+/// [`khive_request::value_nesting_within_limit`], which walks an explicit
+/// worklist instead of native recursion, so the check itself cannot
+/// overflow the stack on the same input it is screening.
+fn result_within_depth_limit(result: &Value) -> bool {
+    khive_request::value_nesting_within_limit(result, khive_request::NESTING_DEPTH_LIMIT)
+}
+
+/// Per-op error payload for a handler result that failed
+/// [`result_within_depth_limit`]. Carries only the configured depth limit,
+/// never the oversized value itself.
+fn depth_error_payload(context: &str) -> Value {
+    json!({
+        "kind": "result_too_deep",
+        "message": format!(
+            "op result nesting depth exceeds max {}{context}",
+            khive_request::NESTING_DEPTH_LIMIT
+        ),
+    })
+}
+
+/// Build the `{ok: true, tool, result}` envelope for a successful op,
+/// without re-serializing an already-owned `Value` through `json!` (which
+/// would call `serde_json::to_value` and recurse over the whole tree
+/// again). The depth check must already have passed before this is called.
+fn ok_envelope(tool: String, result: Value) -> Value {
+    let mut map = serde_json::Map::with_capacity(3);
+    map.insert("ok".to_string(), Value::Bool(true));
+    map.insert("tool".to_string(), Value::String(tool));
+    map.insert("result".to_string(), result);
+    Value::Object(map)
+}
+
+/// Discard a rejected over-limit `Value` without native recursion.
+///
+/// `Value`'s derived `Drop` walks nested containers the same way `Clone`
+/// and `Serialize` do, so simply letting a pathologically deep `result`
+/// fall out of scope after the depth guard rejects it would trade a stack
+/// overflow during serialization for one during drop. Draining containers
+/// onto an explicit heap-allocated worklist keeps each removal O(1) on the
+/// call stack regardless of nesting depth.
+fn drop_value_iteratively(value: Value) {
+    let mut stack = vec![value];
+    while let Some(v) = stack.pop() {
+        match v {
+            Value::Array(items) => stack.extend(items),
+            Value::Object(map) => stack.extend(map.into_values()),
+            _ => {}
+        }
+    }
+}
+
+/// Chain-mode (`dispatch_op`) success path: check the raw handler `result`
+/// against the depth guard before it is ever cloned into `$prev` context or
+/// wrapped in the response envelope. On violation returns a `result_too_deep`
+/// error that does not embed the oversized value, and discards the rejected
+/// value iteratively so its own drop can't overflow the stack either.
+fn chain_ok_envelope_or_depth_error(tool: String, result: Value) -> Result<Value, (String, Value)> {
+    if !result_within_depth_limit(&result) {
+        drop_value_iteratively(result);
+        return Err((
+            tool,
+            depth_error_payload("; cannot be used as $prev chain context"),
+        ));
+    }
+    Ok(ok_envelope(tool, result))
+}
+
+/// Parallel/single-mode success path: check the raw handler `result` against
+/// the depth guard *before* it is handed to `present` (which recurses
+/// natively over `Value` in agent mode) or wrapped in the response envelope.
+/// On violation returns a `result_too_deep` per-op error entry that does not
+/// embed the oversized value, and discards the rejected value iteratively
+/// (see [`drop_value_iteratively`]).
+fn present_ok_envelope_or_depth_error(
+    tool: String,
+    result: Value,
+    mode: PresentationMode,
+    now_unix: i64,
+) -> Value {
+    if !result_within_depth_limit(&result) {
+        drop_value_iteratively(result);
+        return json!({ "ok": false, "tool": tool, "error": depth_error_payload("") });
+    }
+    let presented = present(result, mode, now_unix);
+    ok_envelope(tool, presented)
+}
+
 /// Returns `true` if a dispatched op's canonical `result` field nests
 /// container values (`[`/`{`) deeper than [`khive_request::NESTING_DEPTH_LIMIT`].
 ///
-/// Handler results (e.g. `traverse`/`context`) are not bounded by the DSL
-/// parser's syntax-tree guard, so a pathologically deep result could still
-/// overflow the stack via recursive `Value::clone` or serialization once
-/// stored as `$prev` chain context. Delegates to
-/// [`khive_request::value_nesting_within_limit`], which walks an explicit
-/// worklist instead of native recursion.
+/// This is a second, defense-in-depth check retained on the chain-mode
+/// aggregation path in [`KhiveMcpServer::run_parsed`]: by the time it runs,
+/// [`chain_ok_envelope_or_depth_error`] has already screened the same
+/// `result` field inside `dispatch_op`, so this should never trip in
+/// practice. It stays cheap (iterative, not recursive) so keeping it costs
+/// nothing and catches a future refactor that bypasses the earlier guard.
 fn result_exceeds_depth_limit(result_obj: &Value) -> bool {
-    result_obj.get("result").is_some_and(|v| {
-        !khive_request::value_nesting_within_limit(v, khive_request::NESTING_DEPTH_LIMIT)
-    })
+    result_obj
+        .get("result")
+        .is_some_and(|v| !result_within_depth_limit(v))
 }
 
 /// Apply the presentation transform to the `result` field of a successful
@@ -1857,10 +1956,19 @@ mod tests {
     /// single-key objects, a synthetic stand-in for a pathologically deep
     /// handler result (e.g. from `traverse`/`context`) that would otherwise
     /// overflow the stack when cloned into `$prev` chain context.
+    ///
+    /// Builds each level via a direct `Map` insert rather than `json!` — the
+    /// `json!` object-literal arm calls `serde_json::to_value(&v)` on the
+    /// accumulated value, which would walk the whole tree built so far on
+    /// every iteration (recursing to the current depth each time) and
+    /// overflow the stack itself well before reaching `depth` large enough
+    /// to exercise the guard under test.
     fn nest_object(depth: usize, leaf: Value) -> Value {
         let mut v = leaf;
         for _ in 0..depth {
-            v = json!({ "nested": v });
+            let mut map = serde_json::Map::with_capacity(1);
+            map.insert("nested".to_string(), v);
+            v = Value::Object(map);
         }
         v
     }
@@ -1901,6 +2009,73 @@ mod tests {
     fn result_missing_field_is_not_flagged() {
         let result_obj = json!({ "ok": false, "tool": "get", "error": "not found" });
         assert!(!result_exceeds_depth_limit(&result_obj));
+    }
+
+    // ── earliest-seam guard: raw handler `Value` before json!/present/clone ──
+    //
+    // These exercise `chain_ok_envelope_or_depth_error` and
+    // `present_ok_envelope_or_depth_error` directly with a synthetic
+    // over-limit `Value` — no DSL parsing involved, standing in for a mock
+    // handler whose result is pathologically deep regardless of how shallow
+    // the caller's own op args were. This is the earliest point in
+    // `dispatch_op` / `run_parsed`'s parallel closure where the raw value is
+    // available, strictly before it is ever cloned, presented, or passed
+    // through `json!`/`serde_json::to_value`.
+
+    #[test]
+    fn chain_seam_rejects_over_limit_result_before_envelope_build() {
+        // Deep enough that native recursion (json!/to_value/present) over
+        // this value would be a real stack risk; the guard must reject it
+        // via the iterative checker without ever attempting that recursion.
+        let pathological = nest_object(khive_request::NESTING_DEPTH_LIMIT + 50_000, json!(true));
+        let err = chain_ok_envelope_or_depth_error("traverse".to_string(), pathological)
+            .expect_err("over-limit result must be rejected, not enveloped");
+        assert_eq!(err.0, "traverse");
+        assert_eq!(err.1["kind"], json!("result_too_deep"));
+        // The error payload must never embed the oversized value itself.
+        assert!(err.1.get("result").is_none());
+        assert!(err.1.get("nested").is_none());
+    }
+
+    #[test]
+    fn chain_seam_accepts_at_limit_result_and_moves_value_without_reserializing() {
+        let at_limit = nest_object(khive_request::NESTING_DEPTH_LIMIT, json!("leaf"));
+        let envelope = chain_ok_envelope_or_depth_error("get".to_string(), at_limit.clone())
+            .expect("result at exactly the limit must be accepted");
+        assert_eq!(envelope["ok"], json!(true));
+        assert_eq!(envelope["tool"], json!("get"));
+        assert_eq!(envelope["result"], at_limit);
+    }
+
+    #[test]
+    fn parallel_seam_rejects_over_limit_result_before_present() {
+        let pathological = nest_object(khive_request::NESTING_DEPTH_LIMIT + 50_000, json!(true));
+        let envelope = present_ok_envelope_or_depth_error(
+            "context".to_string(),
+            pathological,
+            PresentationMode::Agent,
+            0,
+        );
+        assert_eq!(envelope["ok"], json!(false));
+        assert_eq!(envelope["tool"], json!("context"));
+        assert_eq!(envelope["error"]["kind"], json!("result_too_deep"));
+        assert!(envelope["error"].get("result").is_none());
+    }
+
+    #[test]
+    fn parallel_seam_accepts_shallow_result_and_applies_presentation() {
+        let shallow = json!({"id": "11111111-1111-1111-1111-111111111111"});
+        let envelope = present_ok_envelope_or_depth_error(
+            "get".to_string(),
+            shallow,
+            PresentationMode::Verbose,
+            0,
+        );
+        assert_eq!(envelope["ok"], json!(true));
+        assert_eq!(
+            envelope["result"]["id"],
+            json!("11111111-1111-1111-1111-111111111111")
+        );
     }
 
     #[tokio::test]
