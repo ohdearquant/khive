@@ -1960,6 +1960,7 @@ mod tests {
 
     fn file_rt_with_embedder(db_path: std::path::PathBuf) -> KhiveRuntime {
         let rt = KhiveRuntime::new(RuntimeConfig {
+            git_write: Default::default(),
             db_path: Some(db_path),
             default_namespace: Namespace::local(),
             embedding_model: None,

@@ -272,6 +272,13 @@ pub struct RuntimeConfig {
     /// `ActorRef::anonymous()` and inbox is scoped to party-line messages —
     /// those addressed to `"local"` or carrying no `to_actor` stamp.
     pub actor_id: Option<String>,
+    /// Resolved `[git_write]` policy allowlist (ADR-108 Amendment), populated
+    /// from `khive.toml`'s `[[git_write.allowed]]` entries by
+    /// [`runtime_config_from_khive_config`]. Threaded through so
+    /// `khive-pack-git`'s write-verb handlers read an already-resolved policy
+    /// instead of re-running config discovery (which would ignore an
+    /// explicit `--config` path not also exported as `KHIVE_CONFIG`).
+    pub git_write: crate::engine_config::GitWriteSectionConfig,
 }
 
 /// Parse a comma- or whitespace-separated pack list from a single string.
@@ -337,6 +344,7 @@ impl Default for RuntimeConfig {
             visible_namespaces: vec![],
             allowed_outbound_namespaces: vec![],
             actor_id,
+            git_write: crate::engine_config::GitWriteSectionConfig::default(),
         }
     }
 }
@@ -638,6 +646,8 @@ pub fn runtime_config_from_khive_config(
         .filter(|s| !s.trim().is_empty())
         .or_else(|| base.actor_id.clone());
 
+    let git_write = khive_cfg.git_write.clone();
+
     if khive_cfg.engines.is_empty() {
         return RuntimeConfig {
             default_namespace,
@@ -645,6 +655,7 @@ pub fn runtime_config_from_khive_config(
             visible_namespaces,
             allowed_outbound_namespaces,
             actor_id,
+            git_write,
             ..base
         };
     }
@@ -679,6 +690,7 @@ pub fn runtime_config_from_khive_config(
         visible_namespaces,
         allowed_outbound_namespaces,
         actor_id,
+        git_write,
         ..base
     }
 }

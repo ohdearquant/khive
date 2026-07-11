@@ -1364,6 +1364,7 @@ fn rt_with_default_embedder() -> KhiveRuntime {
     use std::sync::Arc;
 
     KhiveRuntime::new(RuntimeConfig {
+        git_write: Default::default(),
         db_path: None,
         default_namespace: Namespace::local(),
         embedding_model: Some(EmbeddingModel::AllMiniLmL6V2),
@@ -2035,6 +2036,7 @@ mod embed_failure_tests {
     /// with the given fake.
     fn rt_with_fake(fake: impl EmbedderProvider + 'static) -> KhiveRuntime {
         let rt = KhiveRuntime::new(RuntimeConfig {
+            git_write: Default::default(),
             db_path: None,
             default_namespace: Namespace::local(),
             embedding_model: Some(EmbeddingModel::AllMiniLmL6V2),
@@ -2397,6 +2399,7 @@ mod ann_bypass_regression {
 
     fn rt_with_correct_embedder() -> KhiveRuntime {
         let rt = KhiveRuntime::new(RuntimeConfig {
+            git_write: Default::default(),
             db_path: None,
             default_namespace: Namespace::local(),
             embedding_model: Some(EmbeddingModel::AllMiniLmL6V2),
@@ -2992,6 +2995,7 @@ mod edit_inline_reembed {
 
     fn rt_with_embedder() -> KhiveRuntime {
         let rt = KhiveRuntime::new(RuntimeConfig {
+            git_write: Default::default(),
             db_path: None,
             default_namespace: Namespace::local(),
             embedding_model: Some(EmbeddingModel::AllMiniLmL6V2),
@@ -3343,6 +3347,7 @@ mod ann_type_filter_regression {
 
     fn rt_with_embedder() -> KhiveRuntime {
         let rt = KhiveRuntime::new(RuntimeConfig {
+            git_write: Default::default(),
             db_path: None,
             default_namespace: Namespace::local(),
             embedding_model: Some(EmbeddingModel::AllMiniLmL6V2),
@@ -3746,6 +3751,7 @@ mod compose_explain_sections {
 
     fn rt_with_embedder() -> KhiveRuntime {
         let rt = KhiveRuntime::new(RuntimeConfig {
+            git_write: Default::default(),
             db_path: None,
             default_namespace: Namespace::local(),
             embedding_model: Some(EmbeddingModel::AllMiniLmL6V2),

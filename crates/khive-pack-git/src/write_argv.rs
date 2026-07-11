@@ -148,11 +148,18 @@ pub fn validate_remote_name(value: &str) -> Result<(), GitArgError> {
 /// Validates one entry of `git.commit`'s `paths` argument: a relative,
 /// traversal-free *literal filename*, not a pathspec. Every value here
 /// reaches git as a positional argument after a `--` separator, where git
-/// still parses it for pathspec magic (`:(top)`, `:(glob)`, short-form
-/// `:!`/`:/`/`:^` signatures, …) regardless of the `--`. A caller-supplied
-/// value carrying that magic can therefore select files outside the
-/// declared path scope even though it looks like an ordinary relative path.
-/// The charset is restricted to ASCII printable (0x20-0x7e) so control bytes
+/// still parses it for pathspec magic regardless of the `--`. A
+/// caller-supplied value carrying that magic can therefore select files
+/// outside the declared path scope even though it looks like an ordinary
+/// relative path. This is enforced as a real literal-filename grammar, not
+/// just a blocklist of the long-form `:(...)` signature: a leading `:` is
+/// rejected outright (covering both the long form `:(top)`/`:(glob)` and
+/// every short-form magic signature -- `:!x`, `:^x`, `:/x`, `:x` --  since
+/// all of them are spelled with a leading colon), and the glob/character-class
+/// pathspec metacharacters `*`, `?`, `[`, `]` are rejected anywhere in the
+/// value so a caller cannot smuggle a wildcard pathspec (`*.rs`, `?.rs`,
+/// `[ab].rs`) that expands to files outside the literal name given. The
+/// charset is restricted to ASCII printable (0x20-0x7e) so control bytes
 /// (tab, ESC, NUL, CR, LF, …) and non-ASCII bytes (including unicode
 /// confusables) are rejected uniformly, on top of the existing dash/slash/
 /// dotdot/absolute rules.
@@ -170,7 +177,16 @@ pub fn validate_commit_path(value: &str) -> Result<(), GitArgError> {
     if value.starts_with('/') {
         return Err(GitArgError::InvalidCharacter(FIELD, value.to_string()));
     }
+    if value.starts_with(':') {
+        return Err(GitArgError::InvalidCharacter(FIELD, value.to_string()));
+    }
     if value.contains(":(") {
+        return Err(GitArgError::InvalidCharacter(FIELD, value.to_string()));
+    }
+    if value
+        .bytes()
+        .any(|b| matches!(b, b'*' | b'?' | b'[' | b']'))
+    {
         return Err(GitArgError::InvalidCharacter(FIELD, value.to_string()));
     }
     if !value.bytes().all(|b| (0x20..=0x7e).contains(&b)) {
@@ -531,6 +547,28 @@ mod tests {
     }
 
     #[test]
+    fn commit_path_rejects_pathspec_magic_short_form() {
+        for injected in [":!x", ":^x", ":/x"] {
+            let err = validate_commit_path(injected).unwrap_err();
+            assert!(
+                matches!(err, GitArgError::InvalidCharacter(..)),
+                "{injected}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn commit_path_rejects_wildcard_pathspec() {
+        for injected in ["*.rs", "?.rs", "[ab].rs"] {
+            let err = validate_commit_path(injected).unwrap_err();
+            assert!(
+                matches!(err, GitArgError::InvalidCharacter(..)),
+                "{injected}: {err}"
+            );
+        }
+    }
+
+    #[test]
     fn commit_path_rejects_upload_pack_and_exec_shapes() {
         for injected in ["--upload-pack=x", "--exec=evil"] {
             let err = validate_commit_path(injected).unwrap_err();
@@ -642,6 +680,16 @@ mod tests {
         assert!(build_add_argv(&["-rf".to_string()]).is_err());
     }
 
+    #[test]
+    fn build_add_argv_rejects_pathspec_shaped_paths() {
+        for injected in [":!x", ":^x", ":/x", "*.rs", "[ab].rs", "?.rs"] {
+            assert!(
+                build_add_argv(&[injected.to_string()]).is_err(),
+                "{injected} must be rejected by build_add_argv"
+            );
+        }
+    }
+
     // -- build_commit_argv -----------------------------------------------------
 
     #[test]
@@ -674,6 +722,17 @@ mod tests {
     fn build_commit_argv_rejects_injection_shaped_path() {
         let err = build_commit_argv("msg", &["--upload-pack=x".to_string()], None).unwrap_err();
         assert!(matches!(err, GitArgError::LeadingDash(..)));
+    }
+
+    #[test]
+    fn build_commit_argv_rejects_pathspec_shaped_paths() {
+        for injected in [":!x", ":^x", ":/x", "*.rs", "[ab].rs", "?.rs"] {
+            let err = build_commit_argv("msg", &[injected.to_string()], None).unwrap_err();
+            assert!(
+                matches!(err, GitArgError::InvalidCharacter(..)),
+                "{injected}: {err}"
+            );
+        }
     }
 
     // -- build_branch_argv -----------------------------------------------------

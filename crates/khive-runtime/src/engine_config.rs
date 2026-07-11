@@ -649,6 +649,18 @@ impl KhiveConfig {
                     reason: "branches entries must not be empty".to_string(),
                 });
             }
+            // ADR-108 specifies exact name or a SINGLE-star wildcard per
+            // branch pattern -- a pattern with two or more `*` (e.g. `**`,
+            // `rel-*-*-final`) is a wider grammar than the ADR authorizes
+            // and must be rejected at config load, not silently accepted.
+            if let Some(bad) = entry.branches.iter().find(|b| b.matches('*').count() > 1) {
+                return Err(ConfigError::InvalidGitWriteEntry {
+                    repo: entry.repo.clone(),
+                    reason: format!(
+                        "branch pattern {bad:?} must contain at most one '*' wildcard (ADR-108)"
+                    ),
+                });
+            }
         }
 
         if self.engines.is_empty() {
@@ -1784,6 +1796,60 @@ branches = ["main"]
             matches!(err, ConfigError::InvalidGitWriteEntry { ref repo, .. } if repo == "relative/path"),
             "expected InvalidGitWriteEntry, got {err:?}"
         );
+    }
+
+    // ADR-108: a branch pattern with more than one `*` is rejected at
+    // validate() time -- the ADR authorizes exact-name or single-wildcard
+    // patterns only.
+    #[test]
+    fn test_git_write_multi_star_branch_pattern_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_toml(
+            &dir,
+            r#"
+[[git_write.allowed]]
+repo = "/abs/path"
+branches = ["**"]
+"#,
+        );
+        let err = KhiveConfig::load(Some(&path)).expect_err("** must be rejected");
+        assert!(
+            matches!(err, ConfigError::InvalidGitWriteEntry { ref repo, .. } if repo == "/abs/path"),
+            "expected InvalidGitWriteEntry, got {err:?}"
+        );
+
+        let dir2 = tempfile::tempdir().unwrap();
+        let path2 = write_toml(
+            &dir2,
+            r#"
+[[git_write.allowed]]
+repo = "/abs/path"
+branches = ["rel-*-*-final"]
+"#,
+        );
+        let err2 = KhiveConfig::load(Some(&path2)).expect_err("rel-*-*-final must be rejected");
+        assert!(
+            matches!(err2, ConfigError::InvalidGitWriteEntry { .. }),
+            "expected InvalidGitWriteEntry, got {err2:?}"
+        );
+    }
+
+    // Single-wildcard patterns remain accepted.
+    #[test]
+    fn test_git_write_single_star_branch_pattern_accepted() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_toml(
+            &dir,
+            r#"
+[[git_write.allowed]]
+repo = "/abs/path"
+branches = ["a*b", "main"]
+"#,
+        );
+        let cfg = KhiveConfig::load(Some(&path))
+            .expect("no error")
+            .expect("file found");
+        assert_eq!(cfg.git_write.allowed[0].branches, vec!["a*b", "main"]);
     }
 
     // An entry with an empty branches list is rejected at validate() time --

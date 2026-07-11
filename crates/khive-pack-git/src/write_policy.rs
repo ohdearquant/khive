@@ -8,19 +8,27 @@
 //! this module only adds a handler-level precondition that must also pass.
 //!
 //! The policy is a closed allowlist of `(repo_path, branch_patterns)`
-//! entries loaded from the `[git_write]` section of the standard khive
-//! config file (`khive_runtime::engine_config::KhiveConfig`), resolved
-//! through the same discovery chain (`--config`/`KHIVE_CONFIG`, project
-//! `khive.toml`, db-anchored `.khive/config.toml`, `~/.khive/config.toml`)
-//! every other khive config value uses. An allowlisted repo is
-//! operator-declared trusted provenance — this is the concrete boundary
-//! ADR-108's Open Question 4 (fork-content write capability stays unbuilt)
-//! resolves to: only repos an operator has explicitly named ever accept a
-//! khive-mediated write.
+//! entries sourced from the `[git_write]` section of the standard khive
+//! config file (`khive_runtime::engine_config::KhiveConfig`). Discovery
+//! (`--config`/`KHIVE_CONFIG`, project `khive.toml`, db-anchored
+//! `.khive/config.toml`, `~/.khive/config.toml`) happens exactly once, at
+//! boot, in the transport layer (`khive-mcp::serve`) via
+//! `khive_runtime::runtime_config_from_khive_config`, which threads the
+//! resolved `[git_write]` section into `RuntimeConfig::git_write`. This
+//! module never re-reads `KHIVE_CONFIG` or re-runs discovery itself —
+//! [`GitWritePolicy::from_config`] is a pure, I/O-free conversion from the
+//! already-resolved `RuntimeConfig::git_write` the handler reads via
+//! `self.runtime().config().git_write` (ADR-108 review r2: a handler-level
+//! reload ignored an explicit `--config` path that was not also exported as
+//! `KHIVE_CONFIG`, so `kkernel mcp --config /path` silently failed closed).
+//! An allowlisted repo is operator-declared trusted provenance — this is
+//! the concrete boundary ADR-108's Open Question 4 (fork-content write
+//! capability stays unbuilt) resolves to: only repos an operator has
+//! explicitly named ever accept a khive-mediated write.
 
 use std::path::{Path, PathBuf};
 
-use khive_runtime::engine_config::{ConfigError, KhiveConfig};
+use khive_runtime::engine_config::GitWriteSectionConfig;
 
 /// One allowlisted `(repo_path, branch_patterns)` entry.
 #[derive(Debug, Clone)]
@@ -85,7 +93,16 @@ impl GitWritePolicy {
     /// Deny-by-default check: fails with [`GitWritePolicyError::NotConfigured`]
     /// when the policy is empty, otherwise requires `repo` to canonicalize
     /// to an allowlisted entry and `branch` to match one of that entry's
-    /// patterns.
+    /// patterns. On success, returns the **canonical** repo path — callers
+    /// must use this returned path for every subsequent git invocation for
+    /// the call, never the raw `repo` argument (ADR-108 review r2 High
+    /// finding): using the raw caller path after only canonicalizing it for
+    /// the comparison is a symlink TOCTOU -- a symlink that resolved to an
+    /// allowlisted repo at check time can be retargeted to an
+    /// unallowlisted repo before the mutating git command runs, which would
+    /// then silently operate on the retargeted path if handlers kept using
+    /// `repo` instead of the resolved identity this function already
+    /// computed.
     ///
     /// `repo` is canonicalized before comparison, and so is every
     /// allowlisted entry's `repo_path` — a symlink that resolves to an
@@ -94,7 +111,7 @@ impl GitWritePolicy {
     /// caller had passed that other path directly. Canonicalization never
     /// widens what is reachable, only normalizes how the same repo can be
     /// spelled.
-    pub fn check(&self, repo: &Path, branch: &str) -> Result<(), GitWritePolicyError> {
+    pub fn check(&self, repo: &Path, branch: &str) -> Result<PathBuf, GitWritePolicyError> {
         if self.allowed.is_empty() {
             return Err(GitWritePolicyError::NotConfigured);
         }
@@ -114,7 +131,7 @@ impl GitWritePolicy {
             .iter()
             .any(|pattern| glob_match(pattern, branch))
         {
-            Ok(())
+            Ok(canonical_repo)
         } else {
             Err(GitWritePolicyError::BranchNotAllowed {
                 repo: repo.display().to_string(),
@@ -127,9 +144,18 @@ impl GitWritePolicy {
 /// Minimal glob: `*` matches any run of characters (including empty); every
 /// other character must match literally. No `?`, character classes, or
 /// escaping — deliberately kept to the smallest grammar that expresses
-/// "exact name" (no `*`) and "prefix/suffix/contains" (one or more `*`)
-/// branch policies.
+/// "exact name" (no `*`) and "prefix/suffix/contains" (exactly one `*`)
+/// branch policies. ADR-108 authorizes exact name or a SINGLE wildcard only;
+/// `KhiveConfig::validate` already rejects a multi-star pattern at config
+/// load, but this guard defends the invariant here too, for any
+/// `GitWritePolicy` built directly (e.g. by a future non-TOML config path)
+/// rather than through `KhiveConfig::validate` — a pattern with two or more
+/// `*` never matches anything instead of silently widening to a broader
+/// grammar than the ADR authorizes.
 fn glob_match(pattern: &str, value: &str) -> bool {
+    if pattern.matches('*').count() > 1 {
+        return false;
+    }
     if !pattern.contains('*') {
         return pattern == value;
     }
@@ -159,29 +185,23 @@ fn glob_match(pattern: &str, value: &str) -> bool {
     true
 }
 
-/// Loads the `[git_write]` policy from the standard khive config discovery
-/// chain (`KhiveConfig::load_with_home_fallback`), anchored to `db_path`
-/// exactly like every other pack-config lookup (`engine_config.rs`'s
-/// db-dir tier-3 resolution) so a thin client and a warm daemon serving the
-/// same database agree on the same config file. A missing config file is
-/// not an error — it resolves to the empty (fail-closed) policy, same as an
-/// explicit empty `[git_write]` section.
-pub fn load_git_write_policy(db_path: Option<&Path>) -> Result<GitWritePolicy, ConfigError> {
-    let explicit_path = std::env::var_os("KHIVE_CONFIG").map(PathBuf::from);
-    let cfg = KhiveConfig::load_with_home_fallback(explicit_path.as_deref(), db_path)?;
-    let Some(cfg) = cfg else {
-        return Ok(GitWritePolicy::default());
-    };
-    let allowed = cfg
-        .git_write
-        .allowed
-        .into_iter()
-        .map(|entry| GitWritePolicyEntry {
-            repo_path: PathBuf::from(entry.repo),
-            branch_patterns: entry.branches,
-        })
-        .collect();
-    Ok(GitWritePolicy { allowed })
+impl GitWritePolicy {
+    /// Pure, I/O-free conversion from an already-resolved `[git_write]`
+    /// section (`RuntimeConfig::git_write`, threaded in at boot from
+    /// `KhiveConfig` — see the module doc). Performs no discovery and reads
+    /// no environment variables: the handler passes in whatever
+    /// `self.runtime().config().git_write` already holds.
+    pub fn from_config(section: &GitWriteSectionConfig) -> Self {
+        let allowed = section
+            .allowed
+            .iter()
+            .map(|entry| GitWritePolicyEntry {
+                repo_path: PathBuf::from(&entry.repo),
+                branch_patterns: entry.branches.clone(),
+            })
+            .collect();
+        GitWritePolicy { allowed }
+    }
 }
 
 #[cfg(test)]
@@ -252,6 +272,46 @@ mod tests {
         assert!(!glob_match("rel-*-final", "rel-1.2"));
     }
 
+    // ADR-108: exact name or a SINGLE wildcard only -- a pattern with two or
+    // more `*` must never match, even if it slipped past config validation.
+    #[test]
+    fn glob_match_rejects_multi_star_patterns() {
+        assert!(!glob_match("**", "anything"));
+        assert!(!glob_match("**", ""));
+        assert!(!glob_match("rel-*-*-final", "rel-1.2-final"));
+    }
+
+    #[test]
+    fn glob_match_single_star_boundary() {
+        assert!(glob_match("a*b", "a-mid-b"));
+        assert!(!glob_match("a*b*c", "a-x-b-y-c"));
+    }
+
+    #[test]
+    fn check_returns_canonical_repo_path_on_success() {
+        let dir = tempfile::tempdir().unwrap();
+        let policy = GitWritePolicy {
+            allowed: vec![entry(dir.path(), &["main"])],
+        };
+        let canonical = policy.check(dir.path(), "main").expect("allowed");
+        assert_eq!(canonical, std::fs::canonicalize(dir.path()).unwrap());
+    }
+
+    #[test]
+    fn from_config_converts_section() {
+        use khive_runtime::engine_config::GitWriteEntryConfig;
+        let section = GitWriteSectionConfig {
+            allowed: vec![GitWriteEntryConfig {
+                repo: "/abs/path".to_string(),
+                branches: vec!["main".to_string()],
+            }],
+        };
+        let policy = GitWritePolicy::from_config(&section);
+        assert_eq!(policy.allowed.len(), 1);
+        assert_eq!(policy.allowed[0].repo_path, PathBuf::from("/abs/path"));
+        assert_eq!(policy.allowed[0].branch_patterns, vec!["main".to_string()]);
+    }
+
     #[cfg(unix)]
     #[test]
     fn symlink_resolving_to_allowlisted_repo_succeeds() {
@@ -285,6 +345,51 @@ mod tests {
         assert!(
             matches!(err, GitWritePolicyError::RepoNotAllowlisted(_)),
             "a symlink resolving outside the allowlist must not be usable as a bypass"
+        );
+    }
+
+    /// TOCTOU regression (ADR-108 review r2 High finding): a symlink pointing
+    /// at the allowlisted repo when `check()` runs, then retargeted to a
+    /// decoy repo before execution, must not let the retargeted path be
+    /// used. `check()` returns the canonical path resolved at check time;
+    /// callers that use ONLY that returned path (never the raw symlink
+    /// again) are unaffected by any later retarget, because the returned
+    /// `PathBuf` is an ordinary absolute path string, not a live symlink
+    /// traversal — retargeting `link` after this point has no way to change
+    /// what the already-returned canonical path resolves to.
+    #[cfg(unix)]
+    #[test]
+    fn canonical_path_returned_at_check_time_is_immune_to_later_retarget() {
+        let real = tempfile::tempdir().unwrap();
+        let decoy = tempfile::tempdir().unwrap();
+        let parent = tempfile::tempdir().unwrap();
+        let link = parent.path().join("link");
+        std::os::unix::fs::symlink(real.path(), &link).unwrap();
+
+        let policy = GitWritePolicy {
+            allowed: vec![entry(real.path(), &["main"])],
+        };
+        let canonical_at_check = policy.check(&link, "main").expect("allowed at check time");
+        assert_eq!(
+            canonical_at_check,
+            std::fs::canonicalize(real.path()).unwrap()
+        );
+
+        // Retarget the symlink to the decoy repo -- simulates an attacker
+        // racing the check.
+        std::fs::remove_file(&link).unwrap();
+        std::os::unix::fs::symlink(decoy.path(), &link).unwrap();
+
+        // The path a correct caller would now use for execution is the
+        // value already returned by `check()`, not `link` -- it still names
+        // the real (allowlisted) repo, unaffected by the retarget.
+        assert_eq!(
+            canonical_at_check,
+            std::fs::canonicalize(real.path()).unwrap()
+        );
+        assert_ne!(
+            canonical_at_check,
+            std::fs::canonicalize(decoy.path()).unwrap()
         );
     }
 }

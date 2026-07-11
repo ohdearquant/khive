@@ -12,14 +12,29 @@
 //! configuration, resolved by `crate::write_policy` against the operator's
 //! `[git_write]` allowlist (ADR-108 Amendment).
 //!
-//! Every successful write additionally appends a `git.write`-shaped `Event`
-//! (kind `Audit`, ADR-108 rule 2) carrying `repo`/`branch`/`sha` beyond what
-//! the dispatch-level gate-check audit already records for every verb.
+//! `enforce_write_policy` returns the **canonical** repo path on success, and
+//! every git invocation for that call uses it from that point on — never the
+//! raw caller-supplied `repo` (ADR-108 review r2 High finding: reusing the
+//! raw path after only canonicalizing it for the comparison is a symlink
+//! TOCTOU). The check and the mutation are additionally serialized per-repo
+//! via [`repo_write_lock`] so a concurrent khive-mediated write to the same
+//! repo cannot interleave between the policy check and the git command it
+//! guards.
+//!
+//! Every write attempt — allowed or denied, whether git itself then
+//! succeeds or fails — appends exactly one `git.write`-shaped `Event` (kind
+//! `Audit`, ADR-108 rule 2) via `emit_write_audit`, carrying
+//! `repo`/`branch`/`decision` and, on success, `sha`. This is in addition
+//! to, not a replacement for, the dispatch-level gate-check audit that
+//! fires for every verb.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 
 use serde_json::{json, Value};
+use tokio::sync::Mutex as AsyncMutex;
 
 use khive_runtime::{NamespaceToken, RuntimeError};
 use khive_storage::event::Event;
@@ -29,7 +44,7 @@ use crate::write_argv::{
     build_add_argv, build_branch_argv, build_commit_argv, build_push_argv, reject_force,
     validate_repo_path, GitArgError,
 };
-use crate::write_policy::{load_git_write_policy, GitWritePolicyError};
+use crate::write_policy::{GitWritePolicy, GitWritePolicyError};
 use crate::GitPack;
 
 fn to_invalid_input(e: GitArgError) -> RuntimeError {
@@ -38,6 +53,24 @@ fn to_invalid_input(e: GitArgError) -> RuntimeError {
 
 fn to_policy_denied(e: GitWritePolicyError) -> RuntimeError {
     RuntimeError::InvalidInput(e.to_string())
+}
+
+/// Process-wide per-repo advisory lock registry, keyed by canonical repo
+/// path. Guards the window between `enforce_write_policy`'s check and the
+/// mutating git command it authorizes, so two concurrent khive-mediated
+/// writes to the same repo (e.g. two overlapping `git.commit` calls) cannot
+/// interleave a check from one call with the mutation of another (ADR-108
+/// review r2 High finding).
+static REPO_LOCKS: OnceLock<StdMutex<HashMap<PathBuf, Arc<AsyncMutex<()>>>>> = OnceLock::new();
+
+fn repo_write_lock(repo: &Path) -> Arc<AsyncMutex<()>> {
+    let key = std::fs::canonicalize(repo).unwrap_or_else(|_| repo.to_path_buf());
+    let registry = REPO_LOCKS.get_or_init(|| StdMutex::new(HashMap::new()));
+    let mut guard = registry.lock().unwrap_or_else(|e| e.into_inner());
+    guard
+        .entry(key)
+        .or_insert_with(|| Arc::new(AsyncMutex::new(())))
+        .clone()
 }
 
 fn parse_repo_param(params: &Value) -> Result<PathBuf, RuntimeError> {
@@ -141,10 +174,18 @@ impl GitPack {
     /// deliberately not dependent on Gate configuration, the same
     /// enforcement class as [`crate::write_argv::reject_force`]'s
     /// unconditional force-push denial.
-    fn enforce_write_policy(&self, repo: &Path, branch: &str) -> Result<(), RuntimeError> {
-        let db_path = self.runtime().config().db_path.as_deref();
-        let policy = load_git_write_policy(db_path)
-            .map_err(|e| RuntimeError::InvalidInput(format!("loading [git_write] policy: {e}")))?;
+    ///
+    /// Reads the already-resolved `[git_write]` policy from
+    /// `RuntimeConfig::git_write` (threaded in at boot from `--config` /
+    /// `KHIVE_CONFIG` discovery, see `crate::write_policy`'s module doc) —
+    /// never re-runs config discovery itself, so an explicit `--config` path
+    /// reaches this check even when not also exported as `KHIVE_CONFIG`.
+    ///
+    /// On success, returns the **canonical** repo path — callers must use it
+    /// for every subsequent git invocation, never the raw `repo` argument
+    /// (see the module doc's TOCTOU note).
+    fn enforce_write_policy(&self, repo: &Path, branch: &str) -> Result<PathBuf, RuntimeError> {
+        let policy = GitWritePolicy::from_config(&self.runtime().config().git_write);
         policy.check(repo, branch).map_err(to_policy_denied)
     }
 
@@ -170,25 +211,73 @@ impl GitPack {
         };
         let commit_argv = build_commit_argv(message, &paths, author).map_err(to_invalid_input)?;
 
+        let lock = repo_write_lock(&repo);
+        let _guard = lock.lock().await;
+
         let branch = current_branch(&repo)?;
-        self.enforce_write_policy(&repo, &branch)?;
 
-        if let Some(add_argv) = add_argv {
-            run_git(&repo, &add_argv)?;
-        }
-        run_git(&repo, &commit_argv)?;
+        let canonical_repo = match self.enforce_write_policy(&repo, &branch) {
+            Ok(p) => p,
+            Err(e) => {
+                self.emit_write_audit(
+                    token,
+                    "git.commit",
+                    &repo,
+                    Some(&branch),
+                    "deny",
+                    EventOutcome::Denied,
+                    None,
+                )
+                .await;
+                return Err(e);
+            }
+        };
 
-        let sha = run_git(&repo, &["rev-parse".to_string(), "HEAD".to_string()])?
+        let exec: Result<String, RuntimeError> = (|| {
+            if let Some(add_argv) = &add_argv {
+                run_git(&canonical_repo, add_argv)?;
+            }
+            run_git(&canonical_repo, &commit_argv)?;
+            let sha = run_git(
+                &canonical_repo,
+                &["rev-parse".to_string(), "HEAD".to_string()],
+            )?
             .trim()
             .to_string();
+            Ok(sha)
+        })();
 
-        self.emit_write_audit(token, "git.commit", &repo, None, Some(&sha))
-            .await;
-
-        Ok(json!({
-            "repo": repo.display().to_string(),
-            "sha": sha,
-        }))
+        match exec {
+            Ok(sha) => {
+                self.emit_write_audit(
+                    token,
+                    "git.commit",
+                    &canonical_repo,
+                    Some(&branch),
+                    "allow",
+                    EventOutcome::Success,
+                    Some(&sha),
+                )
+                .await;
+                Ok(json!({
+                    "repo": canonical_repo.display().to_string(),
+                    "sha": sha,
+                }))
+            }
+            Err(e) => {
+                self.emit_write_audit(
+                    token,
+                    "git.commit",
+                    &canonical_repo,
+                    Some(&branch),
+                    "allow",
+                    EventOutcome::Error,
+                    None,
+                )
+                .await;
+                Err(e)
+            }
+        }
     }
 
     pub(crate) async fn handle_branch(
@@ -207,18 +296,58 @@ impl GitPack {
 
         let argv = build_branch_argv(name, from).map_err(to_invalid_input)?;
 
-        self.enforce_write_policy(&repo, name)?;
+        let lock = repo_write_lock(&repo);
+        let _guard = lock.lock().await;
 
-        run_git(&repo, &argv)?;
+        let canonical_repo = match self.enforce_write_policy(&repo, name) {
+            Ok(p) => p,
+            Err(e) => {
+                self.emit_write_audit(
+                    token,
+                    "git.branch",
+                    &repo,
+                    Some(name),
+                    "deny",
+                    EventOutcome::Denied,
+                    None,
+                )
+                .await;
+                return Err(e);
+            }
+        };
 
-        self.emit_write_audit(token, "git.branch", &repo, Some(name), None)
-            .await;
-
-        Ok(json!({
-            "repo": repo.display().to_string(),
-            "name": name,
-            "from": from,
-        }))
+        match run_git(&canonical_repo, &argv) {
+            Ok(_) => {
+                self.emit_write_audit(
+                    token,
+                    "git.branch",
+                    &canonical_repo,
+                    Some(name),
+                    "allow",
+                    EventOutcome::Success,
+                    None,
+                )
+                .await;
+                Ok(json!({
+                    "repo": canonical_repo.display().to_string(),
+                    "name": name,
+                    "from": from,
+                }))
+            }
+            Err(e) => {
+                self.emit_write_audit(
+                    token,
+                    "git.branch",
+                    &canonical_repo,
+                    Some(name),
+                    "allow",
+                    EventOutcome::Error,
+                    None,
+                )
+                .await;
+                Err(e)
+            }
+        }
     }
 
     pub(crate) async fn handle_push(
@@ -243,33 +372,85 @@ impl GitPack {
 
         let argv = build_push_argv(remote, branch).map_err(to_invalid_input)?;
 
-        self.enforce_write_policy(&repo, branch)?;
+        let lock = repo_write_lock(&repo);
+        let _guard = lock.lock().await;
 
-        run_git(&repo, &argv)?;
+        let canonical_repo = match self.enforce_write_policy(&repo, branch) {
+            Ok(p) => p,
+            Err(e) => {
+                self.emit_write_audit(
+                    token,
+                    "git.push",
+                    &repo,
+                    Some(branch),
+                    "deny",
+                    EventOutcome::Denied,
+                    None,
+                )
+                .await;
+                return Err(e);
+            }
+        };
 
-        self.emit_write_audit(token, "git.push", &repo, Some(branch), None)
-            .await;
-
-        Ok(json!({
-            "repo": repo.display().to_string(),
-            "remote": remote,
-            "branch": branch,
-        }))
+        match run_git(&canonical_repo, &argv) {
+            Ok(_) => {
+                self.emit_write_audit(
+                    token,
+                    "git.push",
+                    &canonical_repo,
+                    Some(branch),
+                    "allow",
+                    EventOutcome::Success,
+                    None,
+                )
+                .await;
+                Ok(json!({
+                    "repo": canonical_repo.display().to_string(),
+                    "remote": remote,
+                    "branch": branch,
+                }))
+            }
+            Err(e) => {
+                self.emit_write_audit(
+                    token,
+                    "git.push",
+                    &canonical_repo,
+                    Some(branch),
+                    "allow",
+                    EventOutcome::Error,
+                    None,
+                )
+                .await;
+                Err(e)
+            }
+        }
     }
 
-    /// Appends a supplementary audit `Event` (ADR-108 rule 2) carrying
-    /// `repo`/`branch`/`sha` — fields the dispatch-level gate-check audit
+    /// Appends exactly one supplementary audit `Event` (ADR-108 rule 2) per
+    /// write attempt, on every exit path — handler-allowlist-denied,
+    /// git-failed, and success alike — carrying `repo`/`branch`/`decision`
+    /// and, on success, `sha`. This is in addition to, not a replacement
+    /// for, the dispatch-level gate-check audit
     /// (`khive-runtime::pack::VerbRegistry::dispatch_with_identity`, fired
-    /// automatically for every verb) does not itself carry. Best-effort: a
+    /// automatically for every verb): that audit only ever records the
+    /// Gate's own allow/deny decision, so without this call a
+    /// handler-allowlist denial left only a Gate "Allow" audit paired with
+    /// an errored outcome — a misleading trail (ADR-108 review r2 finding).
+    /// `decision` is `"allow"` when this handler's own precondition passed
+    /// (`enforce_write_policy` returned `Ok`, regardless of whether git
+    /// itself then succeeded) and `"deny"` when it did not. Best-effort: a
     /// store failure is logged and swallowed, exactly like every other audit
     /// write in this codebase (ADR-018 "audit storage failures don't
     /// propagate") — it must never fail a write that git itself completed.
+    #[allow(clippy::too_many_arguments)]
     async fn emit_write_audit(
         &self,
         token: &NamespaceToken,
         verb: &str,
         repo: &Path,
         branch: Option<&str>,
+        decision: &str,
+        outcome: EventOutcome,
         sha: Option<&str>,
     ) {
         let Ok(store) = self.runtime().events(token) else {
@@ -277,7 +458,7 @@ impl GitPack {
         };
         let mut payload = json!({
             "repo": repo.display().to_string(),
-            "decision": "allow",
+            "decision": decision,
         });
         if let Some(b) = branch {
             payload["branch"] = json!(b);
@@ -292,7 +473,7 @@ impl GitPack {
             SubstrateKind::Event,
             token.actor().id.clone(),
         )
-        .with_outcome(EventOutcome::Success)
+        .with_outcome(outcome)
         .with_payload(payload);
         if let Err(e) = store.append_event(event).await {
             tracing::warn!(

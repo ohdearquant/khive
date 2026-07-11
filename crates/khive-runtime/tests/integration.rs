@@ -924,6 +924,7 @@ async fn file_backed_runtime_persists() {
 
     {
         let config = RuntimeConfig {
+            git_write: Default::default(),
             db_path: Some(path.clone()),
             default_namespace: Namespace::local(),
             embedding_model: None,
@@ -946,6 +947,7 @@ async fn file_backed_runtime_persists() {
     // Re-open the same file
     {
         let config = RuntimeConfig {
+            git_write: Default::default(),
             db_path: Some(path.clone()),
             default_namespace: Namespace::local(),
             embedding_model: None,
@@ -1442,6 +1444,7 @@ mod embedder_registry_tests {
 
     fn memory_rt_no_model() -> KhiveRuntime {
         KhiveRuntime::new(RuntimeConfig {
+            git_write: Default::default(),
             db_path: None,
             default_namespace: Namespace::local(),
             embedding_model: None,
@@ -1503,6 +1506,7 @@ mod embedder_registry_tests {
     async fn dual_embedding_regression_both_models_registered() {
         use khive_runtime::RuntimeConfig;
         let rt = KhiveRuntime::new(RuntimeConfig {
+            git_write: Default::default(),
             db_path: None,
             default_namespace: Namespace::local(),
             embedding_model: Some(EmbeddingModel::AllMiniLmL6V2),

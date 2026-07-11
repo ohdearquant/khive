@@ -3,56 +3,61 @@
 //! `pub(crate)` handler surface against a scratch git repo initialized
 //! fresh in a `tempfile::tempdir()` for every test. Never touches
 //! `~/.khive` or any production store: `KhiveRuntime` is always an
-//! in-memory instance (`KhiveRuntime::memory()`), and the git repo under
-//! test is always a throwaway tempdir, never this workspace.
+//! in-memory instance, and the git repo under test is always a throwaway
+//! tempdir, never this workspace.
 //!
-//! Every test holds `cache::ENV_MUTEX` for its full body: `crate::cache`'s
-//! and `crate::recovery_tests`' tests shadow the process-global `PATH` (and
-//! other env vars) to inject fake `git` binaries, which would otherwise race
-//! against every `Command::new("git")` spawn here (both this module's own
-//! `git_command` helper and the handler code under test resolve `git` via
-//! `PATH` at spawn time). The same guard also covers `KHIVE_CONFIG`, which
-//! every test in this module sets explicitly (see [`set_policy`] /
-//! [`set_no_policy`]): the write handlers now load a `[git_write]` policy
-//! from the standard khive config discovery chain, and an unset
-//! `KHIVE_CONFIG` would fall through to a real `~/.khive/config.toml` on
-//! the machine running the tests -- exactly the ambient-state leak this
-//! module's doc comment above promises never happens. Setting `KHIVE_CONFIG`
-//! to an explicit tier-1 path (present or deliberately absent) always short
-//! circuits that fallback.
+//! The `[git_write]` policy is threaded in directly via
+//! `RuntimeConfig::git_write` (see [`pack_and_token_with_policy`]) rather
+//! than through `KHIVE_CONFIG`/file discovery: the write handlers read an
+//! already-resolved policy from `RuntimeConfig`, they no longer re-run
+//! config discovery themselves (ADR-108 review r2 finding -- a handler-level
+//! reload ignored an explicit `--config` path not also exported as
+//! `KHIVE_CONFIG`). This also means these tests carry zero ambient-env risk
+//! for policy resolution.
+//!
+//! Every test still holds `cache::ENV_MUTEX` for its full body:
+//! `crate::cache`'s and `crate::recovery_tests`' tests shadow the
+//! process-global `PATH` to inject fake `git` binaries, which would
+//! otherwise race against every `Command::new("git")` spawn here (both this
+//! module's own `git_command` helper and the handler code under test
+//! resolve `git` via `PATH` at spawn time).
 
 use std::path::Path;
 use std::process::Command;
 
 use serde_json::json;
 
-use khive_runtime::{KhiveRuntime, Namespace, NamespaceToken};
+use khive_runtime::engine_config::{GitWriteEntryConfig, GitWriteSectionConfig};
+use khive_runtime::{KhiveRuntime, Namespace, NamespaceToken, RuntimeConfig};
 
 use crate::GitPack;
 
-/// Writes a `[git_write]` policy TOML allowlisting `repo` for `branches`
-/// and points `KHIVE_CONFIG` at it (tier-1 override, wins over every other
-/// discovery tier). Caller must hold `cache::ENV_MUTEX` for the whole test.
-fn set_policy(config_dir: &Path, repo: &Path, branches: &[&str]) {
-    let branches_toml = branches
-        .iter()
-        .map(|b| format!("{b:?}"))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let content = format!(
-        "[[git_write.allowed]]\nrepo = {:?}\nbranches = [{branches_toml}]\n",
-        repo.display().to_string()
-    );
-    let path = config_dir.join("git-write-config.toml");
-    std::fs::write(&path, content).unwrap();
-    std::env::set_var("KHIVE_CONFIG", &path);
+/// Builds a `[git_write]` section allowlisting `repo` for `branches`.
+fn policy(repo: &Path, branches: &[&str]) -> GitWriteSectionConfig {
+    GitWriteSectionConfig {
+        allowed: vec![GitWriteEntryConfig {
+            repo: repo.display().to_string(),
+            branches: branches.iter().map(|b| b.to_string()).collect(),
+        }],
+    }
 }
 
-/// Points `KHIVE_CONFIG` at a path that does not exist -- `KhiveConfig::load`
-/// treats a missing explicit path as "no config", which resolves to the
-/// empty (fail-closed) policy without ever touching tiers 2-4.
-fn set_no_policy(config_dir: &Path) {
-    std::env::set_var("KHIVE_CONFIG", config_dir.join("does-not-exist.toml"));
+/// Constructs an in-memory `GitPack` carrying the given `[git_write]`
+/// section directly in `RuntimeConfig` -- no `KHIVE_CONFIG` env var, no
+/// file I/O, no discovery. An empty `GitWriteSectionConfig::default()`
+/// reproduces the fail-closed "not configured" state.
+async fn pack_and_token_with_policy(git_write: GitWriteSectionConfig) -> (GitPack, NamespaceToken) {
+    let config = RuntimeConfig {
+        db_path: None,
+        packs: vec!["kg".to_string()],
+        brain_profile: None,
+        actor_id: None,
+        git_write,
+        ..RuntimeConfig::no_embeddings()
+    };
+    let rt = KhiveRuntime::new(config).expect("in-memory runtime");
+    let token = rt.authorize(Namespace::local()).expect("authorize");
+    (GitPack::new(rt), token)
 }
 
 /// Builds a `git` invocation hardened against ambient host state: a global
@@ -118,21 +123,13 @@ fn init_repo_with_remote() -> (tempfile::TempDir, tempfile::TempDir) {
     (repo_dir, remote_dir)
 }
 
-async fn pack_and_token() -> (GitPack, NamespaceToken) {
-    let rt = KhiveRuntime::memory().expect("in-memory runtime");
-    let token = rt.authorize(Namespace::local()).expect("authorize");
-    (GitPack::new(rt), token)
-}
-
 // -- git.commit ---------------------------------------------------------------
 
 #[tokio::test]
 async fn commit_with_no_paths_commits_all_tracked_changes() {
     let _env_guard = crate::cache::ENV_MUTEX.lock().await;
     let (repo, _remote) = init_repo_with_remote();
-    let (pack, token) = pack_and_token().await;
-    let config_dir = tempfile::tempdir().expect("config tempdir");
-    set_policy(config_dir.path(), repo.path(), &["main"]);
+    let (pack, token) = pack_and_token_with_policy(policy(repo.path(), &["main"])).await;
 
     std::fs::write(repo.path().join("a.txt"), b"changed").unwrap();
 
@@ -161,9 +158,7 @@ async fn commit_with_no_paths_commits_all_tracked_changes() {
 async fn commit_with_paths_scopes_to_those_paths() {
     let _env_guard = crate::cache::ENV_MUTEX.lock().await;
     let (repo, _remote) = init_repo_with_remote();
-    let (pack, token) = pack_and_token().await;
-    let config_dir = tempfile::tempdir().expect("config tempdir");
-    set_policy(config_dir.path(), repo.path(), &["main"]);
+    let (pack, token) = pack_and_token_with_policy(policy(repo.path(), &["main"])).await;
 
     std::fs::write(repo.path().join("a.txt"), b"changed-a").unwrap();
     std::fs::write(repo.path().join("b.txt"), b"new-b").unwrap();
@@ -201,9 +196,7 @@ async fn commit_with_paths_scopes_to_those_paths() {
 async fn commit_rejects_empty_message() {
     let _env_guard = crate::cache::ENV_MUTEX.lock().await;
     let (repo, _remote) = init_repo_with_remote();
-    let (pack, token) = pack_and_token().await;
-    let config_dir = tempfile::tempdir().expect("config tempdir");
-    set_no_policy(config_dir.path());
+    let (pack, token) = pack_and_token_with_policy(GitWriteSectionConfig::default()).await;
 
     let err = pack
         .handle_commit(
@@ -219,9 +212,7 @@ async fn commit_rejects_empty_message() {
 async fn commit_rejects_injection_shaped_path() {
     let _env_guard = crate::cache::ENV_MUTEX.lock().await;
     let (repo, _remote) = init_repo_with_remote();
-    let (pack, token) = pack_and_token().await;
-    let config_dir = tempfile::tempdir().expect("config tempdir");
-    set_no_policy(config_dir.path());
+    let (pack, token) = pack_and_token_with_policy(GitWriteSectionConfig::default()).await;
 
     let err = pack
         .handle_commit(
@@ -241,9 +232,7 @@ async fn commit_rejects_injection_shaped_path() {
 async fn commit_rejects_non_repo_path() {
     let _env_guard = crate::cache::ENV_MUTEX.lock().await;
     let dir = tempfile::tempdir().expect("tempdir");
-    let (pack, token) = pack_and_token().await;
-    let config_dir = tempfile::tempdir().expect("config tempdir");
-    set_no_policy(config_dir.path());
+    let (pack, token) = pack_and_token_with_policy(GitWriteSectionConfig::default()).await;
 
     let err = pack
         .handle_commit(
@@ -259,9 +248,7 @@ async fn commit_rejects_non_repo_path() {
 async fn commit_denied_when_no_policy_configured() {
     let _env_guard = crate::cache::ENV_MUTEX.lock().await;
     let (repo, _remote) = init_repo_with_remote();
-    let (pack, token) = pack_and_token().await;
-    let config_dir = tempfile::tempdir().expect("config tempdir");
-    set_no_policy(config_dir.path());
+    let (pack, token) = pack_and_token_with_policy(GitWriteSectionConfig::default()).await;
 
     std::fs::write(repo.path().join("a.txt"), b"changed").unwrap();
 
@@ -283,10 +270,7 @@ async fn commit_denied_for_non_allowlisted_repo() {
     let _env_guard = crate::cache::ENV_MUTEX.lock().await;
     let (repo, _remote) = init_repo_with_remote();
     let (other_repo, _other_remote) = init_repo_with_remote();
-    let (pack, token) = pack_and_token().await;
-    let config_dir = tempfile::tempdir().expect("config tempdir");
-    // Allowlists a different repo than the one being committed to.
-    set_policy(config_dir.path(), other_repo.path(), &["main"]);
+    let (pack, token) = pack_and_token_with_policy(policy(other_repo.path(), &["main"])).await;
 
     std::fs::write(repo.path().join("a.txt"), b"changed").unwrap();
 
@@ -304,11 +288,7 @@ async fn commit_denied_for_non_allowlisted_repo() {
 async fn commit_denied_for_branch_outside_patterns() {
     let _env_guard = crate::cache::ENV_MUTEX.lock().await;
     let (repo, _remote) = init_repo_with_remote();
-    let (pack, token) = pack_and_token().await;
-    let config_dir = tempfile::tempdir().expect("config tempdir");
-    // Allowlists the repo, but only for a branch pattern that does not
-    // match "main", the branch actually checked out by `init_repo_with_remote`.
-    set_policy(config_dir.path(), repo.path(), &["release-*"]);
+    let (pack, token) = pack_and_token_with_policy(policy(repo.path(), &["release-*"])).await;
 
     std::fs::write(repo.path().join("a.txt"), b"changed").unwrap();
 
@@ -330,9 +310,7 @@ async fn commit_denied_for_branch_outside_patterns() {
 async fn commit_does_not_execute_repo_configured_hooks() {
     let _env_guard = crate::cache::ENV_MUTEX.lock().await;
     let (repo, _remote) = init_repo_with_remote();
-    let (pack, token) = pack_and_token().await;
-    let config_dir = tempfile::tempdir().expect("config tempdir");
-    set_policy(config_dir.path(), repo.path(), &["main"]);
+    let (pack, token) = pack_and_token_with_policy(policy(repo.path(), &["main"])).await;
 
     let sentinel = repo.path().join("hook-ran.sentinel");
     let hooks_dir = repo.path().join(".git/hooks");
@@ -370,9 +348,7 @@ async fn commit_does_not_execute_repo_configured_hooks() {
 async fn branch_creates_from_head_by_default() {
     let _env_guard = crate::cache::ENV_MUTEX.lock().await;
     let (repo, _remote) = init_repo_with_remote();
-    let (pack, token) = pack_and_token().await;
-    let config_dir = tempfile::tempdir().expect("config tempdir");
-    set_policy(config_dir.path(), repo.path(), &["feat/*"]);
+    let (pack, token) = pack_and_token_with_policy(policy(repo.path(), &["feat/*"])).await;
 
     let result = pack
         .handle_branch(
@@ -394,9 +370,7 @@ async fn branch_creates_from_head_by_default() {
 async fn branch_rejects_injection_shaped_name() {
     let _env_guard = crate::cache::ENV_MUTEX.lock().await;
     let (repo, _remote) = init_repo_with_remote();
-    let (pack, token) = pack_and_token().await;
-    let config_dir = tempfile::tempdir().expect("config tempdir");
-    set_no_policy(config_dir.path());
+    let (pack, token) = pack_and_token_with_policy(GitWriteSectionConfig::default()).await;
 
     let err = pack
         .handle_branch(
@@ -412,9 +386,7 @@ async fn branch_rejects_injection_shaped_name() {
 async fn branch_rejects_path_traversal_name() {
     let _env_guard = crate::cache::ENV_MUTEX.lock().await;
     let (repo, _remote) = init_repo_with_remote();
-    let (pack, token) = pack_and_token().await;
-    let config_dir = tempfile::tempdir().expect("config tempdir");
-    set_no_policy(config_dir.path());
+    let (pack, token) = pack_and_token_with_policy(GitWriteSectionConfig::default()).await;
 
     let err = pack
         .handle_branch(
@@ -430,9 +402,7 @@ async fn branch_rejects_path_traversal_name() {
 async fn branch_denied_when_no_policy_configured() {
     let _env_guard = crate::cache::ENV_MUTEX.lock().await;
     let (repo, _remote) = init_repo_with_remote();
-    let (pack, token) = pack_and_token().await;
-    let config_dir = tempfile::tempdir().expect("config tempdir");
-    set_no_policy(config_dir.path());
+    let (pack, token) = pack_and_token_with_policy(GitWriteSectionConfig::default()).await;
 
     let err = pack
         .handle_branch(
@@ -453,9 +423,7 @@ async fn branch_denied_when_no_policy_configured() {
 async fn push_sends_branch_to_remote() {
     let _env_guard = crate::cache::ENV_MUTEX.lock().await;
     let (repo, remote) = init_repo_with_remote();
-    let (pack, token) = pack_and_token().await;
-    let config_dir = tempfile::tempdir().expect("config tempdir");
-    set_policy(config_dir.path(), repo.path(), &["feat/*"]);
+    let (pack, token) = pack_and_token_with_policy(policy(repo.path(), &["feat/*"])).await;
 
     run(repo.path(), &["checkout", "-q", "-b", "feat/pushme"]);
     std::fs::write(repo.path().join("c.txt"), b"c").unwrap();
@@ -485,9 +453,7 @@ async fn push_sends_branch_to_remote() {
 async fn push_rejects_explicit_force_true() {
     let _env_guard = crate::cache::ENV_MUTEX.lock().await;
     let (repo, _remote) = init_repo_with_remote();
-    let (pack, token) = pack_and_token().await;
-    let config_dir = tempfile::tempdir().expect("config tempdir");
-    set_no_policy(config_dir.path());
+    let (pack, token) = pack_and_token_with_policy(GitWriteSectionConfig::default()).await;
 
     let err = pack
         .handle_push(
@@ -507,9 +473,7 @@ async fn push_rejects_explicit_force_true() {
 async fn push_allows_force_false() {
     let _env_guard = crate::cache::ENV_MUTEX.lock().await;
     let (repo, _remote) = init_repo_with_remote();
-    let (pack, token) = pack_and_token().await;
-    let config_dir = tempfile::tempdir().expect("config tempdir");
-    set_policy(config_dir.path(), repo.path(), &["main"]);
+    let (pack, token) = pack_and_token_with_policy(policy(repo.path(), &["main"])).await;
 
     let result = pack
         .handle_push(
@@ -528,9 +492,7 @@ async fn push_allows_force_false() {
 async fn push_rejects_non_boolean_force() {
     let _env_guard = crate::cache::ENV_MUTEX.lock().await;
     let (repo, _remote) = init_repo_with_remote();
-    let (pack, token) = pack_and_token().await;
-    let config_dir = tempfile::tempdir().expect("config tempdir");
-    set_no_policy(config_dir.path());
+    let (pack, token) = pack_and_token_with_policy(GitWriteSectionConfig::default()).await;
 
     let err = pack
         .handle_push(
@@ -550,9 +512,7 @@ async fn push_rejects_non_boolean_force() {
 async fn push_rejects_injection_shaped_remote() {
     let _env_guard = crate::cache::ENV_MUTEX.lock().await;
     let (repo, _remote) = init_repo_with_remote();
-    let (pack, token) = pack_and_token().await;
-    let config_dir = tempfile::tempdir().expect("config tempdir");
-    set_no_policy(config_dir.path());
+    let (pack, token) = pack_and_token_with_policy(GitWriteSectionConfig::default()).await;
 
     let err = pack
         .handle_push(
@@ -572,9 +532,7 @@ async fn push_rejects_injection_shaped_remote() {
 async fn push_rejects_nonexistent_branch() {
     let _env_guard = crate::cache::ENV_MUTEX.lock().await;
     let (repo, _remote) = init_repo_with_remote();
-    let (pack, token) = pack_and_token().await;
-    let config_dir = tempfile::tempdir().expect("config tempdir");
-    set_policy(config_dir.path(), repo.path(), &["*"]);
+    let (pack, token) = pack_and_token_with_policy(policy(repo.path(), &["*"])).await;
 
     let err = pack
         .handle_push(
@@ -593,9 +551,7 @@ async fn push_rejects_nonexistent_branch() {
 async fn push_denied_when_no_policy_configured() {
     let _env_guard = crate::cache::ENV_MUTEX.lock().await;
     let (repo, _remote) = init_repo_with_remote();
-    let (pack, token) = pack_and_token().await;
-    let config_dir = tempfile::tempdir().expect("config tempdir");
-    set_no_policy(config_dir.path());
+    let (pack, token) = pack_and_token_with_policy(GitWriteSectionConfig::default()).await;
 
     let err = pack
         .handle_push(
@@ -614,9 +570,7 @@ async fn push_denied_when_no_policy_configured() {
 async fn push_denied_for_branch_outside_patterns() {
     let _env_guard = crate::cache::ENV_MUTEX.lock().await;
     let (repo, _remote) = init_repo_with_remote();
-    let (pack, token) = pack_and_token().await;
-    let config_dir = tempfile::tempdir().expect("config tempdir");
-    set_policy(config_dir.path(), repo.path(), &["release-*"]);
+    let (pack, token) = pack_and_token_with_policy(policy(repo.path(), &["release-*"])).await;
 
     let err = pack
         .handle_push(
@@ -626,4 +580,158 @@ async fn push_denied_for_branch_outside_patterns() {
         .await
         .unwrap_err();
     assert!(err.to_string().contains("branch"), "{err}");
+}
+
+// -- symlink TOCTOU (ADR-108 review r2 High finding) -----------------------
+
+/// A symlink pointing at the allowlisted repo when `handle_commit` starts,
+/// retargeted to a decoy (unallowlisted) repo mid-flight, must not let the
+/// commit land in the decoy: the handler must operate only on the canonical
+/// path resolved at check time, never re-traverse the caller-supplied
+/// symlink for the actual git invocations.
+/// `handle_commit` invoked through a symlink must resolve and report the
+/// canonical repo path, and land the commit in the real repo -- not the
+/// symlink's own (mutable) path string. This is the property that closes
+/// the TOCTOU: every git invocation after the policy check uses the
+/// canonical path returned by `enforce_write_policy`, so a later symlink
+/// retarget (see `write_policy::tests::
+/// canonical_path_returned_at_check_time_is_immune_to_later_retarget` for
+/// the direct check-level regression) cannot redirect an in-flight write.
+#[cfg(unix)]
+#[tokio::test]
+async fn commit_via_symlink_resolves_and_lands_in_canonical_repo() {
+    let _env_guard = crate::cache::ENV_MUTEX.lock().await;
+    let (real_repo, _real_remote) = init_repo_with_remote();
+    let parent = tempfile::tempdir().expect("parent tempdir");
+    let link = parent.path().join("repo-link");
+    std::os::unix::fs::symlink(real_repo.path(), &link).unwrap();
+
+    let (pack, token) = pack_and_token_with_policy(policy(real_repo.path(), &["main"])).await;
+
+    std::fs::write(real_repo.path().join("a.txt"), b"changed-via-link").unwrap();
+
+    let result = pack
+        .handle_commit(
+            &token,
+            json!({ "repo": link.to_str().unwrap(), "message": "via symlink" }),
+        )
+        .await
+        .expect("commit succeeds against the canonical repo");
+
+    let reported_repo = result.get("repo").and_then(|v| v.as_str()).unwrap();
+    assert_eq!(
+        Path::new(reported_repo),
+        std::fs::canonicalize(real_repo.path()).unwrap(),
+        "handler must report the canonical repo path, not the symlink path"
+    );
+
+    let real_log = git_command(real_repo.path())
+        .args(["log", "-1", "--pretty=%s"])
+        .output()
+        .expect("git log on real repo");
+    assert_eq!(
+        String::from_utf8_lossy(&real_log.stdout).trim(),
+        "via symlink",
+        "the commit must have landed in the real repo"
+    );
+}
+
+// -- audit completeness (ADR-108 review r2 High finding) -------------------
+
+/// `handle_commit` discovers the checked-out branch internally -- the
+/// resulting audit event must carry it, not `None` (the pre-fix bug).
+#[tokio::test]
+async fn commit_audit_captures_resolved_branch_and_sha() {
+    let _env_guard = crate::cache::ENV_MUTEX.lock().await;
+    let (repo, _remote) = init_repo_with_remote();
+    let (pack, token) = pack_and_token_with_policy(policy(repo.path(), &["main"])).await;
+
+    std::fs::write(repo.path().join("a.txt"), b"changed").unwrap();
+    let result = pack
+        .handle_commit(
+            &token,
+            json!({ "repo": repo.path().to_str().unwrap(), "message": "audit check" }),
+        )
+        .await
+        .expect("commit succeeds");
+    let sha = result
+        .get("sha")
+        .and_then(|v| v.as_str())
+        .unwrap()
+        .to_string();
+
+    let events_store = pack.runtime().events(&token).expect("events store");
+    let page = events_store
+        .query_events(
+            khive_storage::event::EventFilter {
+                verbs: vec!["git.commit".to_string()],
+                ..Default::default()
+            },
+            khive_storage::types::PageRequest {
+                offset: 0,
+                limit: 10,
+            },
+        )
+        .await
+        .expect("query events");
+    let audit = page.items.first().expect("git.commit audit event present");
+    assert_eq!(
+        audit.payload.get("branch").and_then(|v| v.as_str()),
+        Some("main")
+    );
+    assert_eq!(
+        audit.payload.get("decision").and_then(|v| v.as_str()),
+        Some("allow")
+    );
+    assert_eq!(
+        audit.payload.get("sha").and_then(|v| v.as_str()),
+        Some(sha.as_str())
+    );
+}
+
+/// A handler-allowlist denial must itself emit a `deny` decision audit
+/// event, not leave the trail entirely to the dispatch-level Gate audit
+/// (which records only its own Allow/Deny, paired with an errored outcome).
+#[tokio::test]
+async fn commit_denial_emits_deny_decision_audit() {
+    let _env_guard = crate::cache::ENV_MUTEX.lock().await;
+    let (repo, _remote) = init_repo_with_remote();
+    let (pack, token) = pack_and_token_with_policy(policy(repo.path(), &["release-*"])).await;
+
+    std::fs::write(repo.path().join("a.txt"), b"changed").unwrap();
+    let err = pack
+        .handle_commit(
+            &token,
+            json!({ "repo": repo.path().to_str().unwrap(), "message": "denied" }),
+        )
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("branch"));
+
+    let events_store = pack.runtime().events(&token).expect("events store");
+    let page = events_store
+        .query_events(
+            khive_storage::event::EventFilter {
+                verbs: vec!["git.commit".to_string()],
+                ..Default::default()
+            },
+            khive_storage::types::PageRequest {
+                offset: 0,
+                limit: 10,
+            },
+        )
+        .await
+        .expect("query events");
+    let audit = page
+        .items
+        .first()
+        .expect("git.commit audit event present even on denial");
+    assert_eq!(
+        audit.payload.get("decision").and_then(|v| v.as_str()),
+        Some("deny")
+    );
+    assert_eq!(
+        audit.payload.get("branch").and_then(|v| v.as_str()),
+        Some("main")
+    );
 }
