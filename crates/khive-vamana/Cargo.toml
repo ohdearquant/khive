@@ -3,6 +3,7 @@ name = "khive-vamana"
 description = "Batch-built Vamana ANN index for pre-normalized vector search."
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true

@@ -3,6 +3,7 @@ name = "khive-quant"
 description = "SQ8 scalar quantization codecs (global-scale symmetric + per-dim affine) shared by HNSW and Vamana indexes."
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
