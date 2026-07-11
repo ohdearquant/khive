@@ -1199,6 +1199,8 @@ pub fn build_registry_for_multi_backend(
     khive_runtime::assert_db_anchor_consistent(base_config.db_path.as_deref(), cli_db_override)?;
 
     let backend_count = khive_cfg.backends.len();
+    let override_matches_main =
+        concrete_override_matches_main(cli_db_override, &khive_cfg.backends)?;
     let force_memory = match cli_db_override {
         Some(":memory:") => {
             tracing::warn!(
@@ -1207,6 +1209,13 @@ pub fn build_registry_for_multi_backend(
                  khive.toml's declared backend paths will not be used this run"
             );
             true
+        }
+        Some(_) if override_matches_main => {
+            tracing::info!(
+                "--db (or KHIVE_DB) override names the same file as the declared \"main\" \
+                 backend; treating it as a no-op instead of an ambiguity error"
+            );
+            false
         }
         Some(other) => {
             anyhow::bail!(
@@ -1646,6 +1655,48 @@ fn canonical_backend_path(cfg: &BackendConfig) -> anyhow::Result<Option<PathBuf>
         )
     })?;
     Ok(Some(canon_parent.join(file_name)))
+}
+
+/// Issue #707: decide whether a concrete `--db` / `KHIVE_DB` override names the
+/// same file as the declared `main` backend. When it does, the caller already
+/// gets what they asked for, so the override should be accepted as a no-op
+/// instead of rejected as ambiguous.
+///
+/// Returns `false` (never redirects `main`) when `main` is missing,
+/// memory-backed, has no path, or the override's parent directory does not
+/// already exist and canonicalize to the same location as `main`'s. Unlike
+/// [`canonical_backend_path`], this never creates the override's parent
+/// directory just to decide whether to reject it.
+fn concrete_override_matches_main(
+    cli_db_override: Option<&str>,
+    backends: &[BackendConfig],
+) -> anyhow::Result<bool> {
+    let Some(override_path) = cli_db_override else {
+        return Ok(false);
+    };
+    if override_path == ":memory:" {
+        return Ok(false);
+    }
+    let Some(main_cfg) = backends.iter().find(|b| b.name == BackendId::MAIN) else {
+        return Ok(false);
+    };
+    if main_cfg.kind == BackendKind::Memory || main_cfg.path.is_none() {
+        return Ok(false);
+    }
+    let Some(main_canon) = canonical_backend_path(main_cfg)? else {
+        return Ok(false);
+    };
+
+    let override_path = expand_tilde(std::path::Path::new(override_path));
+    let (Some(override_parent), Some(override_file_name)) =
+        (override_path.parent(), override_path.file_name())
+    else {
+        return Ok(false);
+    };
+    let Ok(override_canon_parent) = override_parent.canonicalize() else {
+        return Ok(false);
+    };
+    Ok(override_canon_parent.join(override_file_name) == main_canon)
 }
 
 /// Build a fully-wired multi-backend `KhiveMcpServer` (ADR-028).
@@ -3504,6 +3555,115 @@ id = "lambda:project-actor"
                  instead; got: {msg}"
             );
         }
+    }
+
+    /// Issue #707: a concrete `--db` / `KHIVE_DB` override that names exactly the
+    /// same file as the declared `main` backend is a no-op, not an ambiguity
+    /// error, because it does not collapse any distinct declared backend onto
+    /// another one.
+    #[test]
+    #[serial]
+    fn concrete_db_override_matching_main_backend_is_accepted() {
+        use khive_runtime::PackConfig;
+
+        let dir = tempfile::tempdir().unwrap();
+        let main_path = dir.path().join("main.db");
+        let secondary_path = dir.path().join("secondary.db");
+
+        let khive_cfg = KhiveConfig {
+            backends: vec![
+                BackendConfig {
+                    name: "main".to_string(),
+                    kind: BackendKind::Sqlite,
+                    path: Some(main_path.clone()),
+                    cache_mb: None,
+                    journal_mode: None,
+                    read_only: false,
+                },
+                BackendConfig {
+                    name: "secondary".to_string(),
+                    kind: BackendKind::Sqlite,
+                    path: Some(secondary_path.clone()),
+                    cache_mb: None,
+                    journal_mode: None,
+                    read_only: false,
+                },
+            ],
+            packs: {
+                let mut m = std::collections::HashMap::new();
+                m.insert(
+                    "comm".to_string(),
+                    PackConfig {
+                        backend: "secondary".to_string(),
+                    },
+                );
+                m
+            },
+            ..KhiveConfig::default()
+        };
+
+        let main_path_str = main_path.to_str().unwrap().to_string();
+        let base_cfg = RuntimeConfig {
+            db_path: khive_runtime::resolve_db_anchor(Some(&main_path_str)),
+            ..base_runtime_config_for_multi_backend()
+        };
+
+        let result = build_registry_for_multi_backend(base_cfg, &khive_cfg, Some(&main_path_str));
+        if let Err(ref e) = result {
+            panic!(
+                "a --db override naming exactly the declared main backend path must be \
+                 accepted as a no-op; got: {e}"
+            );
+        }
+        assert!(
+            main_path.exists(),
+            "main backend's declared sqlite path must still be created; a matching \
+             override must not force in-memory"
+        );
+        assert!(
+            secondary_path.exists(),
+            "secondary backend must still be opened at its own declared path"
+        );
+    }
+
+    /// Issue #707: a `--db` override that spells the same file as `main` via a
+    /// different but canonically-equivalent path (traversal through `..`) must
+    /// also be accepted as a no-op, not rejected on raw string mismatch.
+    #[test]
+    #[serial]
+    fn concrete_db_override_matching_main_backend_accepts_canonical_alias() {
+        let dir = tempfile::tempdir().unwrap();
+        let sub = dir.path().join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        let main_path = sub.join("main.db");
+        let alias_path = sub.join("..").join("sub").join("main.db");
+
+        let khive_cfg = KhiveConfig {
+            backends: vec![BackendConfig {
+                name: "main".to_string(),
+                kind: BackendKind::Sqlite,
+                path: Some(main_path.clone()),
+                cache_mb: None,
+                journal_mode: None,
+                read_only: false,
+            }],
+            ..KhiveConfig::default()
+        };
+
+        let alias_path_str = alias_path.to_str().unwrap().to_string();
+        let base_cfg = RuntimeConfig {
+            db_path: khive_runtime::resolve_db_anchor(Some(&alias_path_str)),
+            ..base_runtime_config_for_multi_backend()
+        };
+
+        let result = build_registry_for_multi_backend(base_cfg, &khive_cfg, Some(&alias_path_str));
+        if let Err(ref e) = result {
+            panic!(
+                "a --db override that is a canonically-equivalent alias of the declared \
+                 main backend path must be accepted as a no-op; got: {e}"
+            );
+        }
+        assert!(main_path.exists(), "main backend must still be opened");
     }
 
     /// Regression for B-BLOCKER-1 (design review critic): the multi-backend boot path
