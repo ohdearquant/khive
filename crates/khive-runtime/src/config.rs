@@ -313,6 +313,7 @@ impl Default for RuntimeConfig {
                     "knowledge",
                     "session",
                     "git",
+                    "code",
                 ]
                 .into_iter()
                 .map(String::from)

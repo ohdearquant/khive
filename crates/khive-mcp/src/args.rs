@@ -53,7 +53,7 @@ pub struct Args {
     /// Pack to load into the verb registry. Repeat for multiple
     /// (e.g. `--pack kg --pack gtd`). When unset, falls back to `KHIVE_PACKS`
     /// (comma- or whitespace-separated), and if that is also unset to the full
-    /// production set: `kg,gtd,memory,brain,comm,schedule,knowledge`.
+    /// production set: `kg,gtd,memory,brain,comm,schedule,knowledge,session,git,code`.
     #[arg(long = "pack")]
     pub pack: Vec<String>,
 

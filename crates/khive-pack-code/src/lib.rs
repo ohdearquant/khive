@@ -3,9 +3,10 @@
 //! Registers four concept subtypes (`module`, `function`, `datatype`,
 //! `interface`) via `khive-pack-kg`'s entity type registry, additive
 //! `EDGE_RULES` over the closed relation set, and the `finding` audit note
-//! kind. Contributes no verbs; `findings.json` ingest is an internal Rust
-//! API (see [`ingest`]), not an MCP wire surface. Opt-in only — not part of
-//! the default pack set.
+//! kind. Contributes no verbs (ADR-085 D1); `findings.json` ingest runs
+//! through the `kkernel code-ingest` admin CLI path, not an MCP wire surface
+//! (ADR-085 Amendment 3). In the default pack set as of Amendment 3, so the
+//! `finding` note kind is live on the production surface.
 
 mod error;
 mod hook;
