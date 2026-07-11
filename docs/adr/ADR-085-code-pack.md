@@ -500,6 +500,16 @@ is out of scope for this repository.
 
 ## Amendment 2 (2026-07-09): code.ingest verb + acceptance
 
+**Status (as of Amendment 3, 2026-07-11): accepted but deferred, not yet
+implemented.** The `code.ingest` verb this amendment specifies has no
+handler in `crates/khive-pack-code` today; the shipped pack contributes zero
+MCP verbs. Amendment 3 below documents the current (zero-verb) production
+surface and adds no verb of its own — it covers an unrelated admin CLI path
+for `findings.json`, not this amendment's Scanner/Extractor design. The
+design and acceptance recorded in this section remain the plan for when
+`code.ingest` is implemented; nothing here is being withdrawn or
+superseded, only marked not-yet-built.
+
 The base text left the Scanner/Extractor pipeline over the D2-D3 vocabulary as
 "separate ADR-069-layer work" and explicitly out of scope. That pipeline now has a
 design. This amendment specifies it as a single new verb, `code.ingest`, and closes
@@ -684,3 +694,74 @@ Rename detection, the deferred-edge queue (B6's v2 alternative), Lean
 shipped, commit/PR entities, and any type-checked or semantic (as opposed to
 syntactic) extraction remain out of scope for this amendment, consistent with
 D6 and the base text's Alternatives Considered.
+
+## Amendment 3 (2026-07-11): admin ingest path + default load
+
+Prior to this amendment, `ingest_findings_json` (Amendment 1 A3) was reachable
+only by linking `khive-pack-code` into a caller's own binary, and the `code`
+pack was not part of khive-mcp's default pack set, so the `finding` note kind
+existed in source but was not live on the production surface. This gap was
+identified while specifying a durable audit service (the "staged 3-pass crate
+audits" work) that needs `findings.json` sweeps to land as queryable graph
+records, not only as flat local files. This amendment closes that gap.
+
+Distinct from Amendment 2's `code.ingest` verb (an unimplemented, larger
+Scanner/Extractor design targeting dedicated map databases with symbol/call
+graphs, B1-B8 above): this amendment covers only the existing
+`ingest_findings_json` mapper and how it reaches storage. The two share the
+"ingest" word but are otherwise unrelated in scope, surface, and target
+database.
+
+### C1: The `finding` note kind is now live on the production surface
+
+This is a deliberate change, not an incidental side effect. `code` joins the
+default pack set khive-mcp and `kkernel` load when no `--pack`/`KHIVE_PACKS`
+override is given. Every default-configuration server and admin invocation
+from this point on validates and stores `finding` notes and the pack's 22
+additive `EDGE_RULES`; a caller no longer has to opt in with an explicit
+`--pack code` to make audit findings queryable. The pack still contributes
+zero MCP verbs today and zero new entity kinds; only its note kind, edge
+rules, and entity-subtype registrations become reachable by default. (This
+is a statement of current fact, not a standing invariant: Amendment 2
+accepts a `code.ingest` source-ingest verb that remains unimplemented. The
+no-verb statements in this amendment are scoped to the findings surface.)
+
+### C2: Ingestion is an admin/runner-side path, not a verb
+
+For the findings surface, D1's no-verb ruling stands unmodified: findings
+ingestion is not, and does not become, a verb. (Amendment 2's accepted
+`code.ingest` source-ingest verb is untouched by this; it targets dedicated
+map databases and has nothing to do with `findings.json`.)
+`ingest_findings_json` is exposed to
+operators through a new `kkernel code-ingest <findings.json>` admin CLI
+subcommand (`crates/kkernel/src/code_ingest.rs`), following the same shape as
+`kkernel git-ingest`: it builds a runtime directly from the configured pack
+set, validates the whole document before any write (Amendment 1 A3's
+fail-closed, all-or-nothing contract, unchanged), and persists the resulting
+entity/note/edge batch by content-derived id: a record whose id already
+exists is reported as skipped, never overwritten, so re-running the same
+sweep is a no-op and a `finding`'s curated lifecycle state (`kind_status`) is
+never reset by re-ingestion. `--dry-run` runs the same validation and
+existence checks and reports what would happen without writing.
+
+No MCP verb calls this path, and none is added. Agents that participate in
+an audit never hold a bulk-ingest verb; only the CLI, run by the audit
+service (or an operator), writes findings into the graph. This is the
+runner-writes rule: an agent's contract is to produce a validated
+`findings.json`, not to write graph records itself.
+
+### C3: Consuming service context
+
+The immediate consumer is a staged, 3-pass crate audit service: pass 1
+(logic/docs), pass 2 (architecture), and pass 3 (correctness/optimization)
+run per crate or per dependency-layer bundle, each pass sequenced so later
+passes see earlier passes' findings as context. Each pass's agent output is
+a `findings.json` sweep on disk, validated exactly as it always has been;
+the audit service then invokes `kkernel code-ingest` once per validated
+sweep so the run's findings become queryable graph records, serving as
+pass-context for that audit cycle and prior-findings context for the next
+one. Filing
+policy for GitHub issues is unchanged and orthogonal to this amendment: it
+still runs after pass 3 against the verify-dedupe-rank policy, never a bulk
+file-everything pass, and is not affected by whether a finding has also been
+ingested into khive.

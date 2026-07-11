@@ -78,7 +78,7 @@ PROTOCOL_VERSION = 3
 # writes would also confound the reduced-scale WAL / write-queue gauges this harness reads. The full
 # acceptance run against a real multi-pack config opts session back in via `--packs` (see below).
 DEFAULT_PACKS = "kg,gtd,memory,brain,comm,schedule,knowledge"
-PRODUCTION_PACKS = "kg,gtd,memory,brain,comm,schedule,knowledge,session"
+PRODUCTION_PACKS = "kg,gtd,memory,brain,comm,schedule,knowledge,session,git,code"
 
 # ── Metal GPU serialization (machine-wide convention; real-embedder mode only)
 METAL_GPU_LOCK_PATH = os.environ.get("METAL_GPU_LOCK_PATH", "/tmp/lion-metal-gpu-test.lock")

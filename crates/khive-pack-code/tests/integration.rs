@@ -565,6 +565,67 @@ fn ingest_different_content_produces_different_finding_id() {
 }
 
 #[test]
+fn ingest_maps_producer_status_fixed_to_kind_status_resolved() {
+    // ADR-085 Amendment 1 A2: the pack-owned mapper resolves the governed
+    // producer status vocabulary, not the raw passthrough this replaces.
+    let mut doc = sample_findings_json();
+    doc["findings"][0]["status"] = json!("fixed");
+    let bytes = serde_json::to_vec(&doc).expect("serializes");
+
+    let batch =
+        ingest_findings_json(&bytes, ingest_options(Some("run"))).expect("ingest must succeed");
+    let props = batch.notes[0]
+        .properties
+        .as_ref()
+        .expect("finding note must carry properties");
+    assert_eq!(
+        props["kind_status"],
+        json!("resolved"),
+        "producer status 'fixed' must normalize to kind_status 'resolved'"
+    );
+    assert_eq!(
+        props["audit_status"],
+        json!("fixed"),
+        "the raw producer value must be preserved verbatim under audit_status"
+    );
+}
+
+#[test]
+fn ingest_maps_producer_status_false_positive_to_kind_status_invalid() {
+    let mut doc = sample_findings_json();
+    doc["findings"][0]["status"] = json!("false_positive");
+    let bytes = serde_json::to_vec(&doc).expect("serializes");
+
+    let batch =
+        ingest_findings_json(&bytes, ingest_options(Some("run"))).expect("ingest must succeed");
+    let props = batch.notes[0]
+        .properties
+        .as_ref()
+        .expect("finding note must carry properties");
+    assert_eq!(
+        props["kind_status"],
+        json!("invalid"),
+        "producer status 'false_positive' must normalize to kind_status 'invalid'"
+    );
+    assert_eq!(props["audit_status"], json!("false_positive"));
+}
+
+#[test]
+fn ingest_leaves_kind_status_open_for_ungoverned_producer_status() {
+    // "open" (and any other value outside the governed set, e.g. "wontfix"
+    // as a producer term) has no mapping rule and must fall back to the
+    // finding lifecycle's initial state, per Amendment 1 A2.
+    let batch = ingest_findings_json(&valid_findings_bytes(), ingest_options(Some("run")))
+        .expect("ingest must succeed");
+    let props = batch.notes[0]
+        .properties
+        .as_ref()
+        .expect("finding note must carry properties");
+    assert_eq!(props["kind_status"], json!("open"));
+    assert_eq!(props["audit_status"], json!("open"));
+}
+
+#[test]
 fn ingest_rejects_missing_findings_array() {
     let malformed = json!({
         "audit": {

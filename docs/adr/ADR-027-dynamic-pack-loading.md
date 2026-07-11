@@ -348,6 +348,53 @@ until 10+ packs make boilerplate painful; the current ~10 LOC per pack is accept
    for memory per ADR-033)? The registry could validate pack-specific config at load
    time. Defer to per-pack ADRs.
 
+## Amendment 1 (2026-07-11): ten-pack default, and force-link is not zero-touch
+
+**Status**: accepted
+
+The "Pack selection and shipped production default" section's seven-pack list is stale.
+The shipped `RuntimeConfig::default()` now loads ten production packs:
+
+```text
+["kg", "gtd", "memory", "brain", "comm", "schedule", "knowledge", "session", "git", "code"]
+```
+
+`session`, `git`, and `code` were added after this ADR was accepted (ADR-085 Amendment 3
+most recently, adding `code`'s admin-CLI-only ingest path). Every surface that enumerates
+the shipped default — this ADR, package READMEs, `docs/multi-backend.md` — must track the
+`RuntimeConfig::default()` pack list and verb count, not a snapshot frozen at acceptance
+time.
+
+This ADR's "Zero-touch pack addition" claim (Context, item 1) and the "zero-touch"
+framing implicit in `inventory::submit!` self-registration are correct only up to the
+crate-linking boundary. `inventory`'s linker-section registration finds every pack that is
+_linked into the binary_ — it does not cause a pack crate to be linked in the first place.
+Each binary or server crate that wants a pack available at runtime still needs, at compile
+time:
+
+1. A `Cargo.toml` dependency on that pack crate.
+2. A force-link anchor: at least one reference to a public symbol from the pack crate
+   reachable from that binary's compiled code, so the linker does not discard the crate as
+   unused. Rust does not otherwise guarantee an `inventory::submit!` static in a dependency
+   survives dead-code elimination if nothing in the dependency graph visibly uses that
+   crate.
+
+`crates/khive-mcp/src/pack.rs` and `crates/kkernel/src/lib.rs` both carry an explicit
+anchor block: one `#[doc(hidden)]` re-export or `use ... as _;` line per pack crate,
+referencing a public type so the linker cannot discard it. Adding a pack to the shipped
+default without adding it to both a `Cargo.toml` dependency list and one of these anchor
+blocks means the pack is _never registered_ at runtime, regardless of what
+`RuntimeConfig::default()` says — `khive-mcp`'s dependency on `khive-pack-code` plus its
+`CodePack` anchor line, both added after the fact, are the concrete instance of this gap
+(khive#848 round 2 review Finding 3).
+
+`cargo metadata` reports exactly one workspace binary target (`kkernel`); `khive-mcp` is a
+library consumed by that binary and by the `khive-mcp` server process it spawns, so today
+there is exactly one anchor block that must stay in sync per binary, not N. That may not
+remain true as more binaries are added — the ADR's "zero-touch" framing should be read as
+"zero-touch once a pack crate is linked into every binary that needs it," not "adding a
+pack crate to the workspace is sufficient on its own."
+
 ## References
 
 - [ADR-003](ADR-003-system-architecture.md) — `kkernel` binary; `pack list` introspection

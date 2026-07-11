@@ -15,9 +15,13 @@ khive gives your agent:
 9. **Brain** — Bayesian profile tuning from feedback signals
 10. **Session** — persist and resume agent-session records
 
-All 9 packs load by default. **78 public verbs** across the packs — the `git` pack
+All 10 packs load by default. **78 public verbs** across the packs: the `git` pack
 contributes the `git.digest` verb plus the commit/issue/pull_request provenance note kinds
-and a batch ingester (regenerate via `request(ops="verbs()")` before editing this line).
+and a batch ingester; the `code` pack currently contributes zero verbs: its `finding`
+note kind is written only through the `kkernel code-ingest` admin CLI path, never a verb
+an agent can call (ADR-085 D1, Amendment 3; Amendment 2's `code.ingest` verb is accepted
+but unimplemented). Regenerate via `request(ops="verbs()")`
+before editing this line.
 
 If you're working on khive itself (writing code in this repo), see `CLAUDE.md` instead.
 

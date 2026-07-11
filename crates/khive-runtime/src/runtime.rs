@@ -1102,7 +1102,8 @@ mod tests {
         // production; its handlers are all operator-only subhandlers (0 wire verbs).
         assert!(cfg.packs.contains(&"session".to_string()));
         assert!(cfg.packs.contains(&"git".to_string()));
-        assert_eq!(cfg.packs.len(), 9);
+        assert!(cfg.packs.contains(&"code".to_string()));
+        assert_eq!(cfg.packs.len(), 10);
         if let Some(v) = prior {
             // SAFETY: single-threaded test cleanup; restores KHIVE_PACKS to its prior value.
             unsafe {

@@ -196,8 +196,8 @@ def main():
         assert "total" in verbs_result, f"verbs must return 'total' key: {verbs_result}"
         assert isinstance(verbs_result["verbs"], list), f"verbs must be a list: {verbs_result}"
         # Surface-contract tripwire: the default config (no --pack, KHIVE_PACKS
-        # unset) loads 9 production packs (kg, gtd, memory, brain, comm, schedule,
-        # knowledge, session, git), so verbs() returns exactly 78 user-facing
+        # unset) loads 10 production packs (kg, gtd, memory, brain, comm, schedule,
+        # knowledge, session, git, code), so verbs() returns exactly 78 user-facing
         # MCP-callable verbs (count what verbs() returns, not internal dispatch
         # arms). The session pack contributes 4 agent-facing T1 verbs
         # (store/list/resume/export), promoted from internal subhandlers to
@@ -207,16 +207,20 @@ def main():
         # (#606, verified live 2026-07-04), comm.probe (#644 read-only
         # inbound poll), and brain.event_counts (#724, ADR-103 Stage 1
         # windowed event read) are included in the count; git contributes
-        # git.digest (ADR-088 Amendment 1). Update this number when the
-        # pack set or verb surface changes; a silent drift here is the bug
-        # this assertion exists to catch.
+        # git.digest (ADR-088 Amendment 1); code contributes zero verbs
+        # (ADR-085 D1/Amendment 3 — its `finding` note kind and
+        # `findings.json` ingest are reached only via the `kkernel
+        # code-ingest` admin CLI, never this MCP verb surface). Update this
+        # number when the pack set or verb surface changes; a silent drift
+        # here is the bug this assertion exists to catch.
         assert verbs_result["total"] == 78, (
-            f"expected 78 user-facing verbs from the 9 default packs "
+            f"expected 78 user-facing verbs from the 10 default packs "
             f"(session contributes 4 T1 verbs promoted to Visibility::Verb per "
             f"ADR-083; context is the 17th kg-substrate bare verb per ADR-089; "
             f"resolve is the 18th kg-substrate bare verb per the unified-verb "
             f"draft ADR Slice 1; comm.health is #606; comm.probe is #644; "
-            f"brain.event_counts is #724/ADR-103; git contributes git.digest), "
+            f"brain.event_counts is #724/ADR-103; git contributes git.digest; "
+            f"code contributes zero verbs per ADR-085 D1/Amendment 3), "
             f"got {verbs_result['total']}: {verbs_result}"
         )
         verb_names = [v["verb"] for v in verbs_result["verbs"]]
@@ -244,6 +248,30 @@ def main():
         assert "create" in kg_verb_names, f"'create' must appear in kg-filtered verbs: {kg_verb_names}"
         assert "stats" in kg_verb_names, f"'stats' must appear in kg-filtered verbs: {kg_verb_names}"
         print(f"  [ok] verbs — {verbs_result['total']} total verbs, {kg_verbs['total']} in kg pack")
+
+        # 3b. Zero-verb pack load tripwire (khive#848 F6): `code` contributes
+        # no MCP verbs, so a stale/dropped default-pack entry for it would
+        # not show up in the verbs() total above at all. `finding` is a note
+        # kind declared ONLY by khive-pack-code's NOTE_KIND_SPECS (ADR-085
+        # D4/Amendment 3) — if `code` were missing from the default pack set,
+        # this create would be rejected as an unknown note kind. A
+        # successful create is therefore direct proof the pack is loaded
+        # under default config, independent of the verb count.
+        code_pack_finding = call_verb(proc, "create", {
+            "kind": "note",
+            "note_kind": "finding",
+            "title": "smoke-test tripwire finding",
+            "properties": {"severity": "low", "confidence": "high"},
+        })
+        assert code_pack_finding["kind"] == "finding", (
+            f"expected kind=finding (proves the zero-verb `code` pack is loaded "
+            f"under default config), got: {code_pack_finding}"
+        )
+        assert code_pack_finding["properties"]["kind_status"] == "open", (
+            f"a finding with no producer status must default kind_status to 'open': "
+            f"{code_pack_finding}"
+        )
+        print(f"  [ok] code pack loaded — create(kind=\"finding\") succeeded under default config")
 
         # 4. Get entity via get (auto-detects substrate; flat shape per W2 #454,
         #    granular kind at top level — same shape as create/list)
