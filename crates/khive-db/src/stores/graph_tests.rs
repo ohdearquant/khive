@@ -2642,10 +2642,11 @@ async fn upsert_edge_guarded_succeeds_when_both_endpoints_exist() {
 
     let edge = make_edge(source, target, EdgeRelation::Extends, 1.0);
     let edge_id = edge.id;
-    let written = store.upsert_edge_guarded(edge).await.unwrap();
+    let outcome = store.upsert_edge_guarded(edge).await.unwrap();
 
-    assert!(
-        written,
+    assert_eq!(
+        outcome,
+        khive_storage::GuardedWriteOutcome::Written,
         "guarded write must succeed when both endpoints exist"
     );
     assert!(store.get_edge(edge_id).await.unwrap().is_some());
@@ -2673,12 +2674,17 @@ async fn upsert_edge_guarded_returns_false_when_target_hard_deleted_before_write
 
     let edge = make_edge(source, target, EdgeRelation::Extends, 1.0);
     let edge_id = edge.id;
-    let written = store.upsert_edge_guarded(edge).await.unwrap();
+    let outcome = store.upsert_edge_guarded(edge).await.unwrap();
 
-    assert!(
-        !written,
-        "guarded write must refuse an edge whose target vanished before commit"
-    );
+    match outcome {
+        khive_storage::GuardedWriteOutcome::Refused(missing) => {
+            assert!(missing.target, "target must be reported missing");
+            assert!(!missing.source, "source was never deleted");
+        }
+        other => panic!(
+            "guarded write must refuse an edge whose target vanished before commit, got {other:?}"
+        ),
+    }
     assert!(
         store.get_edge(edge_id).await.unwrap().is_none(),
         "no dangling edge may be persisted"
@@ -2697,12 +2703,17 @@ async fn upsert_edge_guarded_returns_false_when_source_hard_deleted_before_write
 
     let edge = make_edge(source, target, EdgeRelation::Extends, 1.0);
     let edge_id = edge.id;
-    let written = store.upsert_edge_guarded(edge).await.unwrap();
+    let outcome = store.upsert_edge_guarded(edge).await.unwrap();
 
-    assert!(
-        !written,
-        "guarded write must refuse an edge whose source vanished before commit"
-    );
+    match outcome {
+        khive_storage::GuardedWriteOutcome::Refused(missing) => {
+            assert!(missing.source, "source must be reported missing");
+            assert!(!missing.target, "target was never deleted");
+        }
+        other => panic!(
+            "guarded write must refuse an edge whose source vanished before commit, got {other:?}"
+        ),
+    }
     assert!(store.get_edge(edge_id).await.unwrap().is_none());
 }
 
@@ -2722,9 +2733,10 @@ async fn upsert_edges_guarded_succeeds_when_all_endpoints_exist() {
     ];
     let ids: Vec<_> = edges.iter().map(|e| e.id).collect();
 
-    let summary = store.upsert_edges_guarded(edges).await.unwrap();
-    assert_eq!(summary.attempted, 2);
-    assert_eq!(summary.affected, 2);
+    let outcome = store.upsert_edges_guarded(edges).await.unwrap();
+    assert_eq!(outcome.summary.attempted, 2);
+    assert_eq!(outcome.summary.affected, 2);
+    assert!(outcome.refused.is_none());
 
     for id in ids {
         assert!(store.get_edge(id).await.unwrap().is_some());
@@ -2757,12 +2769,24 @@ async fn upsert_edges_guarded_writes_nothing_when_one_endpoint_vanishes() {
     ];
     let ids: Vec<_> = edges.iter().map(|e| e.id).collect();
 
-    let summary = store.upsert_edges_guarded(edges).await.unwrap();
-    assert_eq!(summary.attempted, 2);
+    let outcome = store.upsert_edges_guarded(edges).await.unwrap();
+    assert_eq!(outcome.summary.attempted, 2);
     assert_eq!(
-        summary.affected, 0,
+        outcome.summary.affected, 0,
         "no edge from the batch may be persisted when any endpoint is missing"
     );
+    let refusal = outcome
+        .refused
+        .expect("refused batch entry must be reported");
+    assert_eq!(
+        refusal.entry_index, 0,
+        "the first entry (a, b) is the one with the missing endpoint"
+    );
+    assert!(
+        refusal.missing.target,
+        "b (the batch entry's target) must be reported missing"
+    );
+    assert!(!refusal.missing.source, "a was never deleted");
 
     for id in ids {
         assert!(

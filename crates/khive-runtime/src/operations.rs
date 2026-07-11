@@ -1723,24 +1723,22 @@ impl KhiveRuntime {
         // #769: `upsert_edge_guarded` re-checks both endpoints exist as part
         // of the same write, not the separate `validate_edge_relation_endpoints`
         // read above — a concurrent hard-delete landing between that read and
-        // this write can no longer create a durably dangling edge.
-        if !self.graph(token)?.upsert_edge_guarded(edge).await? {
-            // Re-probe each endpoint individually (read-only, best-effort) so
-            // the error names exactly which one vanished instead of a generic
-            // "source or target" message (codex REJECT Medium 3).
-            let missing_source = self
-                .resolve_edge_endpoint(token, source_id)
-                .await?
-                .is_none();
-            let missing_target = self
-                .resolve_edge_endpoint(token, target_id)
-                .await?
-                .is_none();
-            return Err(RuntimeError::GuardedWriteFailed(GuardedWriteFailure {
-                entry_index: None,
-                missing_source: missing_source.then_some(source_id),
-                missing_target: missing_target.then_some(target_id),
-            }));
+        // this write can no longer create a durably dangling edge. Which
+        // endpoint(s) were missing is reported by the guard's own
+        // in-transaction probe (`GuardedWriteOutcome::Refused`), not
+        // reconstructed here by re-reading the endpoints after the fact: a
+        // second concurrent write landing between the refusal and a
+        // post-hoc read could otherwise misreport which endpoint was
+        // actually missing at write time (round-2 codex Medium 1).
+        match self.graph(token)?.upsert_edge_guarded(edge).await? {
+            khive_storage::GuardedWriteOutcome::Written => {}
+            khive_storage::GuardedWriteOutcome::Refused(missing) => {
+                return Err(RuntimeError::GuardedWriteFailed(GuardedWriteFailure {
+                    entry_index: None,
+                    missing_source: missing.source.then_some(source_id),
+                    missing_target: missing.target.then_some(target_id),
+                }));
+            }
         }
 
         // H1 fix: read back the persisted row by natural key so the returned
@@ -4661,40 +4659,31 @@ impl KhiveRuntime {
         // validation reads above. A concurrent hard-delete of any endpoint
         // landing between those reads and this write aborts the whole batch
         // (all-or-nothing, no partial write) instead of persisting a
-        // dangling edge.
-        let summary = self
+        // dangling edge. The failing entry's index and its missing
+        // endpoint(s) come from the guard's own in-transaction pre-check
+        // (`GuardedBatchOutcome::refused`), not a post-hoc re-read of the
+        // batch after the write already failed (round-2 codex Medium 1).
+        let outcome = self
             .graph(token)?
             .upsert_edges_guarded(edges.clone())
             .await?;
-        if summary.affected != edges.len() as u64 {
-            // Re-probe each entry in batch order (read-only, best-effort) to find
-            // the first one with a missing endpoint and report its index — the
-            // storage-layer summary only carries a free-text `first_error`, not
-            // a structured endpoint/index pair (codex REJECT Medium 3).
-            for (index, edge) in edges.iter().enumerate() {
-                let missing_source = self
-                    .resolve_edge_endpoint(token, edge.source_id)
-                    .await?
-                    .is_none();
-                let missing_target = self
-                    .resolve_edge_endpoint(token, edge.target_id)
-                    .await?
-                    .is_none();
-                if missing_source || missing_target {
-                    return Err(RuntimeError::GuardedWriteFailed(GuardedWriteFailure {
-                        entry_index: Some(index),
-                        missing_source: missing_source.then_some(edge.source_id),
-                        missing_target: missing_target.then_some(edge.target_id),
-                    }));
-                }
-            }
-            // Every endpoint re-checked as present (e.g. deleted then
-            // recreated after the guarded write ran) — fall back to the
-            // storage layer's own diagnostic instead of claiming a phantom
-            // failing entry.
+        if let Some(refusal) = outcome.refused {
+            return Err(RuntimeError::GuardedWriteFailed(GuardedWriteFailure {
+                entry_index: Some(refusal.entry_index),
+                missing_source: refusal
+                    .missing
+                    .source
+                    .then_some(edges[refusal.entry_index].source_id),
+                missing_target: refusal
+                    .missing
+                    .target
+                    .then_some(edges[refusal.entry_index].target_id),
+            }));
+        }
+        if outcome.summary.affected != edges.len() as u64 {
             return Err(RuntimeError::NotFound(format!(
                 "link_many: one or more edge endpoints no longer exist at write time: {}",
-                summary.first_error
+                outcome.summary.first_error
             )));
         }
 
@@ -7144,16 +7133,20 @@ mod tests {
             metadata: None,
             target_backend: None,
         };
-        let written = rt
+        let outcome = rt
             .graph(&tok)
             .unwrap()
             .upsert_edge_guarded(edge)
             .await
             .unwrap();
-        assert!(
-            !written,
-            "guarded write must refuse an edge whose target vanished before commit"
-        );
+        match outcome {
+            khive_storage::GuardedWriteOutcome::Refused(missing) => {
+                assert!(missing.target, "target must be reported missing");
+            }
+            other => panic!(
+                "guarded write must refuse an edge whose target vanished before commit, got {other:?}"
+            ),
+        }
 
         let edges = rt
             .list_edges(
@@ -7222,15 +7215,19 @@ mod tests {
         // single guarded batch write.
         assert!(rt.delete_entity(&tok, x.id, true).await.unwrap());
 
-        let summary = rt
+        let outcome = rt
             .graph(&tok)
             .unwrap()
             .upsert_edges_guarded(edges)
             .await
             .unwrap();
         assert_eq!(
-            summary.affected, 0,
+            outcome.summary.affected, 0,
             "no edge from the batch may be persisted when any endpoint vanished"
+        );
+        assert!(
+            outcome.refused.is_some(),
+            "refused batch entry must be reported"
         );
 
         let edges = rt
@@ -7326,12 +7323,14 @@ mod tests {
             .unwrap();
 
         let edge = raw_edge(a.id, x.id, tok.namespace().as_str());
-        assert!(rt
-            .graph(&tok)
-            .unwrap()
-            .upsert_edge_guarded(edge)
-            .await
-            .unwrap());
+        assert_eq!(
+            rt.graph(&tok)
+                .unwrap()
+                .upsert_edge_guarded(edge)
+                .await
+                .unwrap(),
+            khive_storage::GuardedWriteOutcome::Written
+        );
 
         assert!(rt.delete_entity(&tok, x.id, true).await.unwrap());
         assert_no_edges_touch(&rt, &tok, x.id).await;
@@ -7394,12 +7393,14 @@ mod tests {
             .unwrap();
 
         let edge = raw_edge(a.id, n.id, tok.namespace().as_str());
-        assert!(rt
-            .graph(&tok)
-            .unwrap()
-            .upsert_edge_guarded(edge)
-            .await
-            .unwrap());
+        assert_eq!(
+            rt.graph(&tok)
+                .unwrap()
+                .upsert_edge_guarded(edge)
+                .await
+                .unwrap(),
+            khive_storage::GuardedWriteOutcome::Written
+        );
 
         assert!(rt.delete_note(&tok, n.id, true).await.unwrap());
         assert_no_edges_touch(&rt, &tok, n.id).await;
@@ -7482,12 +7483,14 @@ mod tests {
         // An edge whose TARGET is another edge — the "edge-as-node" case
         // `delete_edge`'s cascade must sweep.
         let annotating = raw_edge(n.id, base_edge_id, tok.namespace().as_str());
-        assert!(rt
-            .graph(&tok)
-            .unwrap()
-            .upsert_edge_guarded(annotating)
-            .await
-            .unwrap());
+        assert_eq!(
+            rt.graph(&tok)
+                .unwrap()
+                .upsert_edge_guarded(annotating)
+                .await
+                .unwrap(),
+            khive_storage::GuardedWriteOutcome::Written
+        );
 
         assert!(rt.delete_edge(&tok, base_edge_id, true).await.unwrap());
         assert_no_edges_touch(&rt, &tok, base_edge_id).await;
@@ -7545,6 +7548,143 @@ mod tests {
         let (deleted, _written) = tokio::join!(delete_task, write_task);
         deleted.unwrap().unwrap();
         assert_no_edges_touch(&rt, &tok, base_edge_id).await;
+    }
+
+    // ---- #769 round-2 codex Medium 3: file-backed, both write-queue configs ----
+    //
+    // The six tests above run against `KhiveRuntime::memory()` and race
+    // delete against the guarded write via `tokio::join!` with no explicit
+    // ordering control, so the scheduler could run them fully sequentially
+    // on one thread without ever exercising real interleaving, and neither
+    // the file-backed storage path nor `write_queue_enabled: true`
+    // (`KHIVE_WRITE_QUEUE=1`, the `WriterTask`-routed write path in
+    // `SqlGraphStore`) is covered at all. The four tests below close both
+    // gaps: file-backed databases, one run with the writer queue off
+    // (default) and one with it on, each provably forcing the guarded write
+    // to land on one specific side of the delete — fully committed before
+    // the delete starts (swept by the delete's cascade) and attempted only
+    // after the delete has already committed (refused by the guard) — via
+    // plain `.await` sequencing rather than a race whose outcome the test
+    // does not control.
+
+    fn file_backed_runtime(
+        dir: &tempfile::TempDir,
+        name: &str,
+        write_queue_enabled: bool,
+    ) -> KhiveRuntime {
+        let path = dir.path().join(name);
+        if write_queue_enabled {
+            std::env::set_var("KHIVE_WRITE_QUEUE", "1");
+        } else {
+            std::env::remove_var("KHIVE_WRITE_QUEUE");
+        }
+        let rt = KhiveRuntime::new(crate::config::RuntimeConfig {
+            db_path: Some(path),
+            packs: vec!["kg".to_string()],
+            brain_profile: None,
+            actor_id: None,
+            ..crate::config::RuntimeConfig::no_embeddings()
+        })
+        .unwrap();
+        std::env::remove_var("KHIVE_WRITE_QUEUE");
+        rt
+    }
+
+    async fn assert_guarded_write_committed_before_delete_is_swept(rt: &KhiveRuntime) {
+        let tok = NamespaceToken::local();
+        let a = rt
+            .create_entity(&tok, "concept", None, "A", None, None, vec![])
+            .await
+            .unwrap();
+        let x = rt
+            .create_entity(&tok, "concept", None, "X", None, None, vec![])
+            .await
+            .unwrap();
+
+        // Write lands fully committed while X is still live — squarely
+        // inside the window before the delete's cascade runs.
+        let edge = raw_edge(a.id, x.id, tok.namespace().as_str());
+        assert_eq!(
+            rt.graph(&tok)
+                .unwrap()
+                .upsert_edge_guarded(edge)
+                .await
+                .unwrap(),
+            khive_storage::GuardedWriteOutcome::Written,
+            "write must succeed while both endpoints are still live"
+        );
+
+        assert!(rt.delete_entity(&tok, x.id, true).await.unwrap());
+        assert_no_edges_touch(rt, &tok, x.id).await;
+    }
+
+    async fn assert_guarded_write_attempted_after_delete_is_refused(rt: &KhiveRuntime) {
+        let tok = NamespaceToken::local();
+        let a = rt
+            .create_entity(&tok, "concept", None, "A", None, None, vec![])
+            .await
+            .unwrap();
+        let x = rt
+            .create_entity(&tok, "concept", None, "X", None, None, vec![])
+            .await
+            .unwrap();
+
+        // The delete's transaction has fully committed before the guarded
+        // write is even attempted — squarely after the window has closed.
+        assert!(rt.delete_entity(&tok, x.id, true).await.unwrap());
+
+        let edge = raw_edge(a.id, x.id, tok.namespace().as_str());
+        let outcome = rt
+            .graph(&tok)
+            .unwrap()
+            .upsert_edge_guarded(edge)
+            .await
+            .unwrap();
+        match outcome {
+            khive_storage::GuardedWriteOutcome::Refused(missing) => {
+                assert!(
+                    missing.target,
+                    "target must be reported missing once the delete has committed"
+                );
+                assert!(!missing.source, "source was never deleted");
+            }
+            other => panic!(
+                "guarded write attempted after the delete committed must be refused, got {other:?}"
+            ),
+        }
+        assert_no_edges_touch(rt, &tok, x.id).await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(khive_write_queue_env)]
+    async fn guarded_write_before_delete_swept_file_backed_write_queue_off() {
+        let dir = tempfile::tempdir().unwrap();
+        let rt = file_backed_runtime(&dir, "guard_before_off.db", false);
+        assert_guarded_write_committed_before_delete_is_swept(&rt).await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(khive_write_queue_env)]
+    async fn guarded_write_after_delete_refused_file_backed_write_queue_off() {
+        let dir = tempfile::tempdir().unwrap();
+        let rt = file_backed_runtime(&dir, "guard_after_off.db", false);
+        assert_guarded_write_attempted_after_delete_is_refused(&rt).await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(khive_write_queue_env)]
+    async fn guarded_write_before_delete_swept_file_backed_write_queue_on() {
+        let dir = tempfile::tempdir().unwrap();
+        let rt = file_backed_runtime(&dir, "guard_before_on.db", true);
+        assert_guarded_write_committed_before_delete_is_swept(&rt).await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(khive_write_queue_env)]
+    async fn guarded_write_after_delete_refused_file_backed_write_queue_on() {
+        let dir = tempfile::tempdir().unwrap();
+        let rt = file_backed_runtime(&dir, "guard_after_on.db", true);
+        assert_guarded_write_attempted_after_delete_is_refused(&rt).await;
     }
 
     #[tokio::test]

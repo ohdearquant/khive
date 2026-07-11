@@ -9,6 +9,8 @@ use uuid::Uuid;
 
 use khive_types::EdgeRelation;
 
+use super::BatchWriteSummary;
+
 /// A type-safe link ID (wraps Uuid).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct LinkId(pub Uuid);
@@ -455,6 +457,54 @@ pub struct GraphPath {
     pub root_id: Uuid,
     pub nodes: Vec<PathNode>,
     pub total_weight: f64,
+}
+
+/// Which of a would-be edge's two endpoints were missing when a guarded
+/// write's in-transaction existence check refused it (#769 round-2 codex
+/// Medium 1). Produced by the guard's own commit-time probe, not a
+/// post-hoc read after the write already failed, so a concurrent
+/// hard-delete landing after the guard ran cannot make this outcome lie
+/// about which endpoint was actually missing at write time.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MissingEndpoints {
+    pub source: bool,
+    pub target: bool,
+}
+
+impl MissingEndpoints {
+    /// True if at least one endpoint was reported missing.
+    pub fn any(&self) -> bool {
+        self.source || self.target
+    }
+}
+
+/// Outcome of [`crate::GraphStore::upsert_edge_guarded`], determined entirely
+/// inside the guard's own storage transaction.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum GuardedWriteOutcome {
+    /// The edge was inserted or updated; both endpoints existed at write time.
+    Written,
+    /// The write was refused; `MissingEndpoints` names which endpoint(s) were
+    /// gone at write time.
+    Refused(MissingEndpoints),
+}
+
+/// Which batch entry a guarded batch write refused on, and why, determined
+/// inside the same in-transaction pre-check that aborted the batch.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GuardedBatchRefusal {
+    /// Index of the first batch entry whose endpoint(s) were missing.
+    pub entry_index: usize,
+    pub missing: MissingEndpoints,
+}
+
+/// Outcome of [`crate::GraphStore::upsert_edges_guarded`]. `refused` is
+/// `Some` exactly when `summary.affected == 0` after a guard refusal;
+/// `None` when every edge in the batch was written.
+#[derive(Clone, Debug)]
+pub struct GuardedBatchOutcome {
+    pub summary: BatchWriteSummary,
+    pub refused: Option<GuardedBatchRefusal>,
 }
 
 #[cfg(test)]
