@@ -346,6 +346,13 @@ _BENCH1M_EXPECTED_CHECK_SCOPES = {
     "beam_growth_exponent": "fits",
     "speedup_vs_brute_force": "max_n",
 }
+# Per-check expected length of an "all_rows" scope's "measured" array - the
+# producer emits exactly one value per row, so a check bound to a subset of
+# rows would need its own entry here rather than the global row count. Every
+# current "all_rows" check runs over the full row set (_BENCH1M_EXPECTED_ROWS).
+_BENCH1M_ALL_ROWS_CHECK_LEN = {
+    "recall_at_10": _BENCH1M_EXPECTED_ROWS,
+}
 # gate_pass (1) + 2 metrics/check (measured, pass) + row fields + fits fields.
 _BENCH1M_EXPECTED_METRIC_COUNT = (
     1
@@ -430,6 +437,19 @@ def _bench1m_extract(run_dir: pathlib.Path, proc: subprocess.CompletedProcess) -
                 raise SchemaError(
                     f"bench-1m assertion check {metric_name!r} (scope=all_rows) expected a "
                     f"non-empty numeric array 'measured', got {measured!r}; see {json_path}"
+                )
+            expected_len = _BENCH1M_ALL_ROWS_CHECK_LEN.get(metric_name)
+            if expected_len is None:
+                raise SchemaError(
+                    f"bench-1m assertion check {metric_name!r} (scope=all_rows) has no "
+                    f"registered expected 'measured' length in _BENCH1M_ALL_ROWS_CHECK_LEN "
+                    f"- schema drift, not a check to silently accept; see {json_path}"
+                )
+            if len(measured) != expected_len:
+                raise SchemaError(
+                    f"bench-1m assertion check {metric_name!r} (scope=all_rows) expected "
+                    f"'measured' to have exactly {expected_len} values (one per row), got "
+                    f"{len(measured)}: {measured!r}; see {json_path}"
                 )
             operator = check.get("operator")
             if operator in (">=", ">"):
@@ -874,6 +894,25 @@ class Bench1mExtractSelfCheck(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td, self.assertRaises(SchemaError):
             self._extract(pathlib.Path(td), payload)
 
+    def test_short_all_rows_measured_array_rejected(self) -> None:
+        payload = json.loads(_BENCH1M_FIXTURE_PATH.read_text())
+        recall_check = next(
+            c for c in payload["assertions"]["checks"] if c["metric"] == "recall_at_10"
+        )
+        self.assertEqual(len(recall_check["measured"]), _BENCH1M_EXPECTED_ROWS)
+        recall_check["measured"] = recall_check["measured"][:-1]
+        with tempfile.TemporaryDirectory() as td, self.assertRaises(SchemaError):
+            self._extract(pathlib.Path(td), payload)
+
+    def test_long_all_rows_measured_array_rejected(self) -> None:
+        payload = json.loads(_BENCH1M_FIXTURE_PATH.read_text())
+        recall_check = next(
+            c for c in payload["assertions"]["checks"] if c["metric"] == "recall_at_10"
+        )
+        recall_check["measured"] = recall_check["measured"] + [recall_check["measured"][-1]]
+        with tempfile.TemporaryDirectory() as td, self.assertRaises(SchemaError):
+            self._extract(pathlib.Path(td), payload)
+
 
 _CV_NEAR_ZERO_EPS = 1e-9
 
@@ -941,7 +980,7 @@ def _render_markdown(payload: dict) -> str:
     lines.append("")
     lines.append(
         "Note: for lower-is-better metrics (latencies, error/backpressure counts), "
-        "`mean-3*std` as a *floor* is the wrong direction — read it as informational "
+        "`mean-k(n)*std` as a *floor* is the wrong direction — read it as informational "
         "spread only. Whether a metric is higher-is-better, lower-is-better, or purely "
         "observational (e.g. `_wall_s`), and where to actually place a blocking gate "
         "relative to this noise, remains a human decision."
