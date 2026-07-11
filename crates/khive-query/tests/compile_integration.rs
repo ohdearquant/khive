@@ -625,3 +625,400 @@ fn parse_auto_sparql() {
         ]
     );
 }
+
+// --- Issue #755: inline property-map integer literals ---
+
+#[test]
+fn gql_inline_property_map_accepts_integer_literal() {
+    // Previously a parse error: "expected string literal".
+    let q = parse(
+        QueryLanguage::Gql,
+        "MATCH (n:pull_request {number: 54}) RETURN n",
+    );
+    assert!(q.is_ok(), "integer literal must parse: {:?}", q.err());
+}
+
+#[test]
+fn gql_inline_property_map_accepts_negative_integer_literal() {
+    let q = parse(
+        QueryLanguage::Gql,
+        "MATCH (n:pull_request {offset: -54}) RETURN n",
+    );
+    assert!(
+        q.is_ok(),
+        "negative integer literal must parse: {:?}",
+        q.err()
+    );
+}
+
+#[test]
+fn gql_inline_property_map_integer_compiles_to_numeric_param() {
+    let q = parse(
+        QueryLanguage::Gql,
+        "MATCH (n:pull_request {number: 54}) RETURN n",
+    )
+    .unwrap();
+    let compiled = compile(&q, &opts()).unwrap();
+
+    let has_numeric_param = compiled
+        .params
+        .iter()
+        .any(|p| matches!(p, QueryValue::Integer(54)));
+    assert!(
+        has_numeric_param,
+        "integer literal must bind as QueryValue::Integer, not Float or text \
+         (Float loses precision past 2^53 -- issue #832); params: {:?}",
+        compiled.params
+    );
+
+    let number_predicate = compiled
+        .sql
+        .lines()
+        .find(|l| l.contains("'$.number'"))
+        .unwrap_or(&compiled.sql);
+    assert!(
+        !number_predicate.contains("COLLATE NOCASE"),
+        "numeric comparison must not use text COLLATE NOCASE; sql: {}",
+        compiled.sql
+    );
+}
+
+#[test]
+fn gql_inline_property_map_integer_matches_json_number_not_json_string() {
+    // Regression for the root cause: json_extract() returns a JSON number as a
+    // SQLite numeric storage class. Binding it as QueryValue::Text produced a
+    // predicate that could never match (TEXT vs INTEGER/REAL never compare
+    // equal in SQLite), which is exactly the silent-mismatch bug in #755.
+    let q = parse(
+        QueryLanguage::Gql,
+        "MATCH (n:pull_request {number: 54}) RETURN n",
+    )
+    .unwrap();
+    let compiled = compile(&q, &opts()).unwrap();
+    assert!(
+        compiled
+            .params
+            .iter()
+            .any(|p| matches!(p, QueryValue::Integer(_) | QueryValue::Float(_))),
+        "must bind a numeric parameter so it compares equal to json_extract's \
+         numeric result; params: {:?}",
+        compiled.params
+    );
+}
+
+#[test]
+fn gql_inline_property_map_quoted_number_still_binds_as_text() {
+    // Decided behavior (documented in PR body for #755): a quoted numeric
+    // string in an inline property map is a deliberate string literal and
+    // keeps matching JSON strings only — it must NOT be coerced to a number.
+    // This is what previously produced the "silently matches nothing" trap
+    // against a JSON-number-typed property; the fix is that the *unquoted*
+    // form (above) now works, not that the quoted form starts matching numbers.
+    let q = parse(
+        QueryLanguage::Gql,
+        "MATCH (n:pull_request {number: '54'}) RETURN n",
+    )
+    .unwrap();
+    let compiled = compile(&q, &opts()).unwrap();
+    let has_text_param = compiled
+        .params
+        .iter()
+        .any(|p| matches!(p, QueryValue::Text(s) if s == "54"));
+    assert!(
+        has_text_param,
+        "quoted numeric literal must still bind as TEXT; params: {:?}",
+        compiled.params
+    );
+}
+
+#[test]
+fn gql_inline_property_map_accepts_float_and_bool_literals() {
+    let q = parse(
+        QueryLanguage::Gql,
+        "MATCH (n:document {score: 4.5, archived: true}) RETURN n",
+    );
+    assert!(q.is_ok(), "float/bool literals must parse: {:?}", q.err());
+    let compiled = compile(&q.unwrap(), &opts()).unwrap();
+    assert!(compiled
+        .params
+        .iter()
+        .any(|p| matches!(p, QueryValue::Float(n) if *n == 4.5)));
+    assert!(compiled
+        .params
+        .iter()
+        .any(|p| matches!(p, QueryValue::Integer(1))));
+}
+
+#[test]
+fn gql_inline_property_map_entity_type_must_be_string() {
+    let err = parse(
+        QueryLanguage::Gql,
+        "MATCH (n:document {entity_type: 54}) RETURN n",
+    )
+    .unwrap_err();
+    assert!(matches!(err, QueryError::Parse { .. }));
+}
+
+#[test]
+fn variable_length_inline_property_map_integer_compiles_to_numeric_param() {
+    // Same fix, exercised through the variable-length (recursive CTE) compile path.
+    let q = parse(
+        QueryLanguage::Gql,
+        "MATCH (n:pull_request {number: 54})-[:extends*1..2]->(b) RETURN b",
+    )
+    .unwrap();
+    let compiled = compile(&q, &opts()).unwrap();
+    assert!(compiled
+        .params
+        .iter()
+        .any(|p| matches!(p, QueryValue::Integer(54))));
+}
+
+#[test]
+fn variable_length_inline_property_map_large_integer_binds_exact_i64() {
+    let q = parse(
+        QueryLanguage::Gql,
+        "MATCH (n:pull_request {number: 9007199254740993})-[:extends*1..2]->(b) RETURN b",
+    )
+    .unwrap();
+    let compiled = compile(&q, &opts()).unwrap();
+    assert!(compiled
+        .params
+        .iter()
+        .any(|p| matches!(p, QueryValue::Integer(9007199254740993))));
+}
+
+// --- Issue #832: integer literal precision (2^53+1, i64 bounds, overflow) ---
+
+#[test]
+fn gql_inline_property_map_large_integer_binds_exact_i64_not_lossy_float() {
+    // 2^53 + 1 = 9007199254740993 is the smallest positive integer that
+    // cannot be represented exactly as f64 -- it rounds to 9007199254740992.0.
+    // A JSON-number property with this value must be matched by an exact i64
+    // parameter, not a lossy float.
+    let q = parse(
+        QueryLanguage::Gql,
+        "MATCH (n:artifact {number: 9007199254740993}) RETURN n",
+    )
+    .unwrap();
+    let compiled = compile(&q, &opts()).unwrap();
+    assert!(
+        compiled
+            .params
+            .iter()
+            .any(|p| matches!(p, QueryValue::Integer(9007199254740993))),
+        "large integer literal must bind as the exact i64, not a rounded f64; params: {:?}",
+        compiled.params
+    );
+}
+
+#[test]
+fn gql_inline_property_map_i64_max_binds_exact() {
+    let q = parse(
+        QueryLanguage::Gql,
+        &format!("MATCH (n:artifact {{number: {}}}) RETURN n", i64::MAX),
+    )
+    .unwrap();
+    let compiled = compile(&q, &opts()).unwrap();
+    assert!(compiled
+        .params
+        .iter()
+        .any(|p| matches!(p, QueryValue::Integer(n) if *n == i64::MAX)));
+}
+
+#[test]
+fn gql_inline_property_map_i64_min_binds_exact() {
+    let q = parse(
+        QueryLanguage::Gql,
+        &format!("MATCH (n:artifact {{number: {}}}) RETURN n", i64::MIN),
+    )
+    .unwrap();
+    let compiled = compile(&q, &opts()).unwrap();
+    assert!(compiled
+        .params
+        .iter()
+        .any(|p| matches!(p, QueryValue::Integer(n) if *n == i64::MIN)));
+}
+
+#[test]
+fn gql_where_equality_large_integer_binds_exact_i64_not_lossy_float() {
+    let q = parse(
+        QueryLanguage::Gql,
+        "MATCH (n:artifact) WHERE n.number = 9007199254740993 RETURN n",
+    )
+    .unwrap();
+    let compiled = compile(&q, &opts()).unwrap();
+    assert!(
+        compiled
+            .params
+            .iter()
+            .any(|p| matches!(p, QueryValue::Integer(9007199254740993))),
+        "WHERE equality with a large integer literal must bind exact i64; params: {:?}",
+        compiled.params
+    );
+}
+
+#[test]
+fn gql_where_equality_i64_bounds_bind_exact() {
+    for bound in [i64::MIN, i64::MAX] {
+        let q = parse(
+            QueryLanguage::Gql,
+            &format!("MATCH (n:artifact) WHERE n.number = {bound} RETURN n"),
+        )
+        .unwrap();
+        let compiled = compile(&q, &opts()).unwrap();
+        assert!(
+            compiled
+                .params
+                .iter()
+                .any(|p| matches!(p, QueryValue::Integer(n) if *n == bound)),
+            "bound {bound} must bind exact; params: {:?}",
+            compiled.params
+        );
+    }
+}
+
+#[test]
+fn variable_length_where_i64_bounds_bind_exact() {
+    // Exercises the variable-length WHERE compiler branch (compile_var_len_condition,
+    // sql.rs:919), not the start-node inline property map path already covered above.
+    for bound in [i64::MIN, i64::MAX] {
+        let q = parse(
+            QueryLanguage::Gql,
+            &format!("MATCH (a)-[:extends*1..3]->(b) WHERE b.number = {bound} RETURN b"),
+        )
+        .unwrap();
+        let compiled = compile(&q, &opts()).unwrap();
+        assert!(
+            compiled
+                .params
+                .iter()
+                .any(|p| matches!(p, QueryValue::Integer(n) if *n == bound)),
+            "variable-length WHERE bound {bound} must bind exact i64; params: {:?}",
+            compiled.params
+        );
+    }
+}
+
+#[test]
+fn variable_length_end_node_inline_property_map_i64_bounds_bind_exact() {
+    // Exercises the end-node inline-map CTE path (end.properties compiled via
+    // compile_property_equality), not the start-node inline map already covered above.
+    for bound in [i64::MIN, i64::MAX] {
+        let q = parse(
+            QueryLanguage::Gql,
+            &format!("MATCH (a)-[:extends*1..3]->(b:artifact {{number: {bound}}}) RETURN b"),
+        )
+        .unwrap();
+        let compiled = compile(&q, &opts()).unwrap();
+        assert!(
+            compiled
+                .params
+                .iter()
+                .any(|p| matches!(p, QueryValue::Integer(n) if *n == bound)),
+            "end-node inline-map bound {bound} must bind exact i64; params: {:?}",
+            compiled.params
+        );
+    }
+}
+
+#[test]
+fn gql_inline_property_map_integer_overflow_rejected_at_parse_time() {
+    // i64::MAX + 1 -- one digit sequence beyond the supported integer range.
+    let overflow = "9223372036854775808";
+    let err = parse(
+        QueryLanguage::Gql,
+        &format!("MATCH (n:artifact {{number: {overflow}}}) RETURN n"),
+    )
+    .unwrap_err();
+    assert!(
+        matches!(err, QueryError::Parse { .. }),
+        "out-of-range integer literal must be rejected at parse time, not silently \
+         truncated or coerced to float; got: {err:?}"
+    );
+}
+
+#[test]
+fn gql_where_equality_integer_overflow_rejected_at_parse_time() {
+    let overflow = "9223372036854775808";
+    let err = parse(
+        QueryLanguage::Gql,
+        &format!("MATCH (n:artifact) WHERE n.number = {overflow} RETURN n"),
+    )
+    .unwrap_err();
+    assert!(matches!(err, QueryError::Parse { .. }));
+}
+
+#[test]
+fn gql_inline_property_map_float_overflow_rejected() {
+    // A decimal literal (has a '.') whose magnitude overflows f64 to infinity.
+    let huge = format!("{}.0", "9".repeat(400));
+    let err = parse(
+        QueryLanguage::Gql,
+        &format!("MATCH (n:document {{score: {huge}}}) RETURN n"),
+    )
+    .unwrap_err();
+    assert!(
+        matches!(err, QueryError::Parse { .. }),
+        "non-finite float literal must be rejected, not silently bound as Infinity; got: {err:?}"
+    );
+}
+
+// --- Numeric literal grammar (docs/design.md): digits required on both
+// sides of the dot. `1.`, `-.5`, and `.5` must all be rejected, not
+// delegated to f64::parse's looser rules. ---
+
+#[test]
+fn gql_inline_property_map_trailing_dot_float_rejected() {
+    let err = parse(
+        QueryLanguage::Gql,
+        "MATCH (n:document {score: 1.}) RETURN n",
+    )
+    .unwrap_err();
+    assert!(
+        matches!(err, QueryError::Parse { .. }),
+        "'1.' has no digits after the dot and must be rejected; got: {err:?}"
+    );
+}
+
+#[test]
+fn gql_inline_property_map_negative_leading_dot_float_rejected() {
+    let err = parse(
+        QueryLanguage::Gql,
+        "MATCH (n:document {score: -.5}) RETURN n",
+    )
+    .unwrap_err();
+    assert!(
+        matches!(err, QueryError::Parse { .. }),
+        "'-.5' has no digits before the dot and must be rejected; got: {err:?}"
+    );
+}
+
+#[test]
+fn gql_inline_property_map_leading_dot_float_rejected() {
+    let err = parse(
+        QueryLanguage::Gql,
+        "MATCH (n:document {score: .5}) RETURN n",
+    )
+    .unwrap_err();
+    assert!(
+        matches!(err, QueryError::Parse { .. }),
+        "'.5' has no digits before the dot and must be rejected; got: {err:?}"
+    );
+}
+
+#[test]
+fn gql_inline_property_map_well_formed_float_still_parses() {
+    // Digits on both sides of the dot must keep working (regression guard
+    // against over-tightening the grammar check).
+    let q = parse(
+        QueryLanguage::Gql,
+        "MATCH (n:document {score: 1.5}) RETURN n",
+    )
+    .unwrap();
+    let compiled = compile(&q, &opts()).unwrap();
+    assert!(compiled
+        .params
+        .iter()
+        .any(|p| matches!(p, QueryValue::Float(n) if *n == 1.5)));
+}

@@ -129,7 +129,7 @@ pub struct NodePattern {
     /// Governed subtype within the kind (e.g. "researcher" within "person").
     /// Compiled to `entity_type = ?` — a direct column, not a property extraction.
     pub entity_type: Option<String>,
-    pub properties: HashMap<String, String>,
+    pub properties: HashMap<String, ConditionValue>,
 }
 
 /// An edge binding in the MATCH pattern with optional relation filters, direction, and hop bounds.
@@ -175,9 +175,16 @@ pub enum CompareOp {
 }
 
 /// Right-hand side value in a WHERE condition.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum ConditionValue {
     String(String),
+    /// An integer literal (no decimal point in the source lexeme), preserved
+    /// as `i64` so it binds as `QueryValue::Integer` and compares exactly
+    /// against `json_extract`'s INTEGER storage class -- `f64` cannot
+    /// represent every `i64` exactly past 2^53, which silently rounds large
+    /// literals (e.g. `9007199254740993`) to the wrong value (issue #832).
+    Integer(i64),
+    /// A float literal (decimal point present in the source lexeme).
     Number(f64),
     Bool(bool),
 }

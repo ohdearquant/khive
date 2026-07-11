@@ -330,7 +330,7 @@ fn triples_to_ast(
     let return_items: Vec<ReturnItem> =
         return_items.into_iter().map(ReturnItem::Variable).collect();
     let mut node_kinds: HashMap<String, String> = HashMap::new();
-    let mut node_props: HashMap<String, HashMap<String, String>> = HashMap::new();
+    let mut node_props: HashMap<String, HashMap<String, ConditionValue>> = HashMap::new();
     let mut edges: Vec<(String, String, String, usize, usize)> = Vec::new(); // (src, tgt, rel, min, max)
     let mut where_cond_list: Vec<Condition> = Vec::new();
 
@@ -359,7 +359,7 @@ fn triples_to_ast(
                     node_props
                         .entry(triple.subject)
                         .or_default()
-                        .insert(name, val);
+                        .insert(name, ConditionValue::String(val));
                 }
                 Object::NumberLiteral(val) => {
                     where_cond_list.push(Condition {
@@ -373,7 +373,7 @@ fn triples_to_ast(
                     node_props
                         .entry(triple.subject)
                         .or_default()
-                        .insert(name, val);
+                        .insert(name, ConditionValue::String(val));
                 }
             },
         }
@@ -498,7 +498,7 @@ fn triples_to_ast(
 
     let first_var = &ordered_edges[0].0;
     let mut first_props = node_props.get(first_var).cloned().unwrap_or_default();
-    let first_entity_type = first_props.remove("entity_type");
+    let first_entity_type = extract_entity_type(&mut first_props)?;
     elements.push(PatternElement::Node(NodePattern {
         variable: Some(first_var.clone()),
         kind: node_kinds.get(first_var).cloned(),
@@ -515,7 +515,7 @@ fn triples_to_ast(
             max_hops: *max_hops,
         }));
         let mut tgt_props = node_props.get(tgt).cloned().unwrap_or_default();
-        let tgt_entity_type = tgt_props.remove("entity_type");
+        let tgt_entity_type = extract_entity_type(&mut tgt_props)?;
         elements.push(PatternElement::Node(NodePattern {
             variable: Some(tgt.clone()),
             kind: node_kinds.get(tgt).cloned(),
@@ -530,6 +530,21 @@ fn triples_to_ast(
         return_items,
         limit,
     })
+}
+
+/// Lift `entity_type` out of a node's property map, requiring a string literal —
+/// the same constraint the GQL inline-map parser enforces.
+fn extract_entity_type(
+    props: &mut HashMap<String, ConditionValue>,
+) -> Result<Option<String>, QueryError> {
+    match props.remove("entity_type") {
+        Some(ConditionValue::String(s)) => Ok(Some(s)),
+        Some(_) => Err(QueryError::Parse {
+            message: "entity_type must be a string literal".into(),
+            position: 0,
+        }),
+        None => Ok(None),
+    }
 }
 
 /// Parse a SPARQL query string into a [`GqlQuery`] AST. Errors on invalid or unsupported syntax.
@@ -628,7 +643,10 @@ mod tests {
     fn variable_length_plus() {
         let q = parse("SELECT ?b WHERE { ?a :name 'LoRA' . ?a :extends+ ?b . }").unwrap();
         let nodes: Vec<_> = q.pattern.nodes().collect();
-        assert_eq!(nodes[0].properties.get("name").unwrap(), "LoRA");
+        assert_eq!(
+            nodes[0].properties.get("name").unwrap(),
+            &ConditionValue::String("LoRA".into())
+        );
 
         let edges: Vec<_> = q.pattern.edges().collect();
         assert_eq!(edges[0].min_hops, 1);
@@ -660,7 +678,10 @@ mod tests {
             parse("SELECT ?a WHERE { ?a a :concept . ?a :domain 'attention' . ?a :extends+ ?b . }")
                 .unwrap();
         let nodes: Vec<_> = q.pattern.nodes().collect();
-        assert_eq!(nodes[0].properties.get("domain").unwrap(), "attention");
+        assert_eq!(
+            nodes[0].properties.get("domain").unwrap(),
+            &ConditionValue::String("attention".into())
+        );
     }
 
     #[test]
