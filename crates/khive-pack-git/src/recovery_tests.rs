@@ -469,7 +469,9 @@ async fn refetch_failure_falls_through_to_one_reclone_and_still_self_heals() {
         std::fs::read_to_string(&args_log)
             .unwrap()
             .lines()
-            .filter(|l| l.starts_with("-c core.hooksPath=/dev/null clone "))
+            .filter(|l| l.starts_with(
+                "-c core.hooksPath=/dev/null -c gc.auto=0 -c maintenance.auto=false clone "
+            ))
             .count(),
         2,
         "exactly one reclone (plus the initial ensure_clone) must occur"
@@ -780,7 +782,9 @@ async fn public_verb_partial_side_effects_survive_commit_snapshot_recovery() {
         std::fs::read_to_string(&args_log)
             .unwrap()
             .lines()
-            .filter(|l| l.starts_with("-c core.hooksPath=/dev/null clone "))
+            .filter(|l| l.starts_with(
+                "-c core.hooksPath=/dev/null -c gc.auto=0 -c maintenance.auto=false clone "
+            ))
             .count(),
         1,
         "no reclone: only the initial ensure_clone's own clone"

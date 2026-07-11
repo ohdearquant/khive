@@ -1870,8 +1870,16 @@ mod recovery_classifier_tests {
 
     /// A healthy repo: the snapshot loads on the first try, no `recover`
     /// call, no warning.
+    ///
+    /// Spawns real `git` via bare `Command::new("git")`, resolved through
+    /// the process-wide `PATH` -- must hold the same crate-wide
+    /// `cache::ENV_MUTEX` the `PATH`-shimming tests in `cache.rs` and
+    /// `recovery_tests.rs` hold while they swap `PATH` to a fake `git`, or
+    /// this test can spawn that shim instead of real git and misclassify a
+    /// healthy repo as corrupt.
     #[test]
     fn recover_commit_snapshot_returns_no_warning_when_healthy() {
+        let _env = crate::cache::ENV_MUTEX.blocking_lock();
         let dir = tempfile::tempdir().expect("tempdir");
         init_repo_with_commit(dir.path());
         let mut recover_calls = 0;
@@ -1888,8 +1896,12 @@ mod recovery_classifier_tests {
     /// An unclassified `git log` failure (nonexistent repo path -- a spawn-
     /// level/`bad object`-shaped failure, not a promisor one) must never
     /// reach `recover` at all, and must propagate as-is.
+    ///
+    /// Same crate-wide `ENV_MUTEX` requirement as the sibling test above --
+    /// `recover_commit_snapshot` spawns real `git log` through `PATH`.
     #[test]
     fn recover_commit_snapshot_never_calls_recover_for_unclassified_failures() {
+        let _env = crate::cache::ENV_MUTEX.blocking_lock();
         let dir = tempfile::tempdir().expect("tempdir");
         // Not a git repo at all -- `git log` fails with a plain spawn/repo
         // error, not a classified promisor one.

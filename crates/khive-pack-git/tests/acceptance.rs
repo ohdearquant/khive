@@ -3038,6 +3038,7 @@ async fn digest_verb_max_items_negative_and_zero_clamp_to_one() {
 
 #[tokio::test]
 async fn digest_verb_max_items_above_cap_clamps_to_two_thousand() {
+    let _guard = ENV_MUTEX.lock().await;
     let (_rt, _token, registry) = fixture().await;
     let dir = tempfile::tempdir().expect("tempdir");
     let repo = dir.path();
@@ -3061,6 +3062,7 @@ async fn digest_verb_max_items_above_cap_clamps_to_two_thousand() {
 
 #[tokio::test]
 async fn digest_verb_max_items_at_boundary_values() {
+    let _guard = ENV_MUTEX.lock().await;
     for (requested, expected_ingested) in [(1i64, 1u64), (2000i64, 1u64)] {
         let (_rt, _token, registry) = fixture().await;
         let dir = tempfile::tempdir().expect("tempdir");
@@ -3086,6 +3088,7 @@ async fn digest_verb_max_items_at_boundary_values() {
 
 #[tokio::test]
 async fn digest_verb_rejects_non_integer_max_items() {
+    let _guard = ENV_MUTEX.lock().await;
     let (_rt, _token, registry) = fixture().await;
     let dir = tempfile::tempdir().expect("tempdir");
     let repo = dir.path();
