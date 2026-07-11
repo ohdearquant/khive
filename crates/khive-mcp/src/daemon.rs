@@ -52,12 +52,59 @@ pub(crate) static FORCE_PID_IS_DAEMON: std::sync::atomic::AtomicBool =
 pub(crate) static DAEMON_DISPATCH: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
+/// Test-only rendezvous point: when set, every [`kill_and_respawn`] call
+/// waits on this barrier right after its own initial probe independently
+/// classifies the daemon `Dead` and BEFORE it attempts the recoverer lock.
+///
+/// #838 round-2 Finding 2: the two-recoverer regression test previously let
+/// each `kill_and_respawn` call reach that point on its own schedule, then
+/// used a side-channel poll on `SPAWN_COUNT` to decide when to fake a live
+/// replacement daemon. With the recoverer lock deliberately removed
+/// (sabotage check), the two calls still did not race concurrently — normal
+/// tokio scheduling let the first call run far enough ahead that its
+/// classification, kill, and spawn completed (flipping the fake daemon
+/// live) before the second call's own classification rounds observed
+/// anything, so the test passed even with the lock's acquisition deleted.
+/// This barrier forces every concurrent recoverer under test to reach the
+/// classification-complete point at the same instant, so the recoverer
+/// lock (or its absence) is what determines whether one or both proceed to
+/// kill+spawn — not scheduler luck.
+#[cfg(test)]
+pub(crate) static RECOVERY_RACE_BARRIER: std::sync::Mutex<
+    Option<std::sync::Arc<tokio::sync::Barrier>>,
+> = std::sync::Mutex::new(None);
+
+/// Test-only second rendezvous point, right before a recoverer that
+/// classified `Dead` actually commits to `kill_stale_daemon_inner` +
+/// `spawn_daemon`. `RECOVERY_RACE_BARRIER` alone only synchronizes the
+/// START of `confirm_genuinely_dead`; its internal rounds still run against
+/// a real, deadline-based lock check (`spawn_blocking` against a real OS
+/// thread pool), which introduces enough real-world jitter over
+/// `DEAD_CONFIRM_ROUNDS` rounds that one recoverer can still finish and
+/// call `spawn_daemon()` measurably before the other's last round — giving
+/// the fake-daemon watcher time to bind and make the slower recoverer
+/// observe `Alive` on its own, even with the recoverer lock removed. This
+/// second, BOUNDED barrier (falls through after its bound rather than
+/// waiting forever, so a recoverer that legitimately never reaches this
+/// point — e.g. because it is still blocked acquiring the real recoverer
+/// lock — cannot deadlock it) forces both recoverers that did independently
+/// classify `Dead` to commit to spawning at the same instant, closing the
+/// jitter window the fake-daemon watcher could otherwise race against.
+#[cfg(test)]
+pub(crate) static SPAWN_COMMIT_BARRIER: std::sync::Mutex<
+    Option<std::sync::Arc<tokio::sync::Barrier>>,
+> = std::sync::Mutex::new(None);
+
 #[cfg(test)]
 pub(crate) fn reset_counters() {
     KILL_COUNT.store(0, std::sync::atomic::Ordering::SeqCst);
     SPAWN_COUNT.store(0, std::sync::atomic::Ordering::SeqCst);
     FORCE_PID_IS_DAEMON.store(false, std::sync::atomic::Ordering::SeqCst);
     DAEMON_DISPATCH.store(0, std::sync::atomic::Ordering::SeqCst);
+    *RECOVERY_RACE_BARRIER
+        .lock()
+        .expect("barrier mutex poisoned") = None;
+    *SPAWN_COMMIT_BARRIER.lock().expect("barrier mutex poisoned") = None;
 }
 
 // ── local-dispatch fallback telemetry ─────────────────────────────────────────
@@ -1083,6 +1130,21 @@ async fn kill_and_respawn(config_id: &str, namespace: &str) -> std::io::Result<R
         ProbeOutcome::Dead => {}
     }
 
+    // Test-only rendezvous (see `RECOVERY_RACE_BARRIER`): forces every
+    // concurrent recoverer under test to reach "independently classified
+    // Dead" at the same instant, so the recoverer lock below is what
+    // actually determines mutual exclusion rather than scheduling order.
+    #[cfg(test)]
+    {
+        let barrier = RECOVERY_RACE_BARRIER
+            .lock()
+            .expect("barrier mutex poisoned")
+            .clone();
+        if let Some(barrier) = barrier {
+            barrier.wait().await;
+        }
+    }
+
     let recoverer_deadline =
         std::time::Instant::now() + std::time::Duration::from_millis(RECOVERER_LOCK_TIMEOUT_MS);
     let recoverer_guard = match tokio::time::timeout(
@@ -1123,6 +1185,24 @@ async fn kill_and_respawn(config_id: &str, namespace: &str) -> std::io::Result<R
             Ok(RecoveryOutcome::Uncertain)
         }
         ProbeOutcome::Dead => {
+            // Test-only second rendezvous (see `SPAWN_COMMIT_BARRIER`):
+            // bounded wait so two recoverers that both independently
+            // classified Dead commit to spawning at the same instant,
+            // instead of one's real jitter-driven head start giving the
+            // fake-daemon watcher time to save the slower one.
+            #[cfg(test)]
+            {
+                let barrier = SPAWN_COMMIT_BARRIER
+                    .lock()
+                    .expect("barrier mutex poisoned")
+                    .clone();
+                if let Some(barrier) = barrier {
+                    let _ =
+                        tokio::time::timeout(std::time::Duration::from_millis(80), barrier.wait())
+                            .await;
+                }
+            }
+
             // Also take the shared boot/recovery lock for the kill+spawn step
             // itself, matching `acquire_recovery_lock`'s existing role of
             // serializing this against the daemon server's own
@@ -3912,7 +3992,8 @@ mod tests {
         std::env::remove_var("KHIVE_LOCK");
     }
 
-    // ── #838 round-1 Finding 1: two concurrent recoverers must not double-spawn ──
+    // ── #838 round-1 Finding 1 / round-2 Finding 2: two concurrent recoverers
+    // must not double-spawn ─────────────────────────────────────────────────
     //
     // Regression for the missing linearization point: before the recoverer
     // lock, two clients racing `kill_and_respawn` from a genuinely dead daemon
@@ -3926,6 +4007,20 @@ mod tests {
     // second observes `Skipped` (freshly spawned daemon now answers its
     // re-probe under the lock) or `Uncertain`, but never spawns.
     //
+    // #838 round-2 Finding 2: this test previously let the two `kill_and_respawn`
+    // calls reach the recoverer-lock attempt on whatever schedule the tokio
+    // executor happened to give them, with the watcher below triggering off
+    // `SPAWN_COUNT` alone. That meant the test passed 6/6 even with the
+    // recoverer lock's acquisition removed entirely (sabotage-proven by
+    // review): normal scheduling let the first call run far enough ahead
+    // that its full classify+kill+spawn completed (making the watcher's fake
+    // daemon live) before the second call's own classification rounds ever
+    // observed anything, so the "lock" was never actually exercised as the
+    // thing preventing the double-spawn. `RECOVERY_RACE_BARRIER` forces both
+    // calls to reach "independently classified Dead" at the exact same
+    // instant, so it is genuinely the recoverer lock (or its absence) that
+    // decides whether one or both proceed to kill+spawn.
+    //
     // Fail-if-reverted: without the recoverer lock serializing this section,
     // both concurrent calls independently pass their own `confirm_genuinely_dead`
     // and both call `spawn_daemon()`, making `SPAWN_COUNT == 2`.
@@ -3934,6 +4029,12 @@ mod tests {
     async fn concurrent_recoverers_spawn_exactly_one_replacement_daemon() {
         clear_daemon_env();
         reset_counters();
+        *RECOVERY_RACE_BARRIER
+            .lock()
+            .expect("barrier mutex poisoned") =
+            Some(std::sync::Arc::new(tokio::sync::Barrier::new(2)));
+        *SPAWN_COMMIT_BARRIER.lock().expect("barrier mutex poisoned") =
+            Some(std::sync::Arc::new(tokio::sync::Barrier::new(2)));
         let dir = tempfile::tempdir().expect("tempdir");
         let sock = dir.path().join("khived.sock");
         let pid_file = dir.path().join("khived.pid");
@@ -3985,7 +4086,6 @@ mod tests {
             kill_and_respawn(&config_id, "test"),
             kill_and_respawn(&config_id, "test"),
         );
-
         let spawned_count = [&a, &b]
             .iter()
             .filter(|r| matches!(r, Ok(RecoveryOutcome::Spawned)))
