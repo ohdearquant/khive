@@ -164,7 +164,7 @@ impl EmbedderEntry {
                 self.provider.name()
             ))
         })?;
-        // A losing `set` (raced by another task) is fine — the two results are equivalent.
+        // A losing `set` (raced by another task) is fine: the two results are equivalent.
         let _ = self.cell.set(Arc::clone(&svc));
         Ok(svc)
     }

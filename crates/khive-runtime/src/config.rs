@@ -161,7 +161,7 @@ impl NamespaceToken {
 
     /// Return a new token with the same actor but a different namespace.
     ///
-    /// The visible set is replaced with `[ns]` — this is a full read+write token
+    /// The visible set is replaced with `[ns]`: this is a full read+write token
     /// for `ns`, not a type-enforced write-only or append-only capability. It is
     /// a capability-transfer primitive, not a policy gate: callers must enforce
     /// any ACL check before calling this and use the minted token only within
@@ -337,12 +337,12 @@ impl RuntimeConfig {
     /// embedding_model: None, ..RuntimeConfig::default() }` does NOT produce a
     /// model-less runtime: `additional_embedding_models` still carries its
     /// env-driven fallback seed, and the note-write path fans out embedding to
-    /// every registered model regardless of `embedding_model` — so the first
+    /// every registered model regardless of `embedding_model`: so the first
     /// `memory.remember` on a machine without local model files hard-fails
     /// instead of degrading to FTS-only.
     ///
     /// This constructor clears both fields together and ignores
-    /// `KHIVE_ADDITIONAL_EMBEDDING_MODELS` unconditionally — the caller wants
+    /// `KHIVE_ADDITIONAL_EMBEDDING_MODELS` unconditionally: the caller wants
     /// zero embedders, not "zero unless the environment disagrees". Use it on
     /// model-less machines (CI runners, fresh installs without local model
     /// files) instead of the two-field struct-update form.
@@ -365,7 +365,7 @@ impl RuntimeConfig {
 /// Always resolves to a concrete anchor (unlike a 2-arm "override the
 /// default?" resolver): when `HOME` is unset this falls back to
 /// `./.khive/khive.db` rather than `None`, deliberately diverging from
-/// `RuntimeConfig::default()` — a caller anchoring config discovery needs a
+/// `RuntimeConfig::default()`: a caller anchoring config discovery needs a
 /// concrete directory to search even without `HOME`.
 pub fn resolve_db_anchor(db: Option<&str>) -> Option<std::path::PathBuf> {
     match db {
@@ -378,8 +378,8 @@ pub fn resolve_db_anchor(db: Option<&str>) -> Option<std::path::PathBuf> {
     }
 }
 
-/// Assert that a resolved `db_path` — which `compute_config_id` folds into a
-/// process's `config_id` — agrees with what [`resolve_db_anchor`] derives from
+/// Assert that a resolved `db_path`: which `compute_config_id` folds into a
+/// process's `config_id`: agrees with what [`resolve_db_anchor`] derives from
 /// the same `--db`/`KHIVE_DB` input. Call this right after `db_path` is
 /// resolved at each construction boundary.
 ///
@@ -422,7 +422,7 @@ pub fn assert_db_anchor_consistent(
 /// to the default identity.
 ///
 /// This performs a separate, cwd-anchored lookup (`db_path: None`) and reads
-/// only `[actor].id` — it must not perturb `config_id` or `default_namespace`,
+/// only `[actor].id`: it must not perturb `config_id` or `default_namespace`,
 /// which remain governed exclusively by the database-anchored load.
 ///
 /// `config_path` is the same explicit `--config`/`KHIVE_CONFIG` override the
@@ -430,7 +430,7 @@ pub fn assert_db_anchor_consistent(
 /// here too.
 ///
 /// Returns `Ok(None)` when no project-anchored config exists, or it exists
-/// but carries no non-empty `[actor].id` — callers fall through to their own
+/// but carries no non-empty `[actor].id`: callers fall through to their own
 /// env/anonymous tiers in that case.
 pub fn resolve_project_actor_id(
     config_path: Option<&std::path::Path>,
@@ -520,7 +520,7 @@ pub fn runtime_config_from_khive_config(
     let default_namespace = base.default_namespace.clone();
 
     // base.brain_profile must carry only the explicit CLI tier, never an env
-    // value — env sits below toml in precedence and is applied later by the MCP resolver.
+    // value: env sits below toml in precedence and is applied later by the MCP resolver.
     let brain_profile = base.brain_profile.clone().or_else(|| {
         khive_cfg
             .runtime
@@ -580,7 +580,7 @@ pub fn runtime_config_from_khive_config(
 
     // Precedence: TOML `[actor] id` > `base.actor_id` (env/CLI-resolved) >
     // anonymous. Falls back to `base.actor_id` rather than `None` when
-    // `[actor] id` is absent — otherwise an env-resolved actor like
+    // `[actor] id` is absent: otherwise an env-resolved actor like
     // `KHIVE_ACTOR` is silently dropped whenever a project config exists
     // without an `[actor]` block.
     let actor_id = khive_cfg

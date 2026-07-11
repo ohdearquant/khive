@@ -34,7 +34,7 @@ pub type EntityTypeValidatorFn =
 /// after the mutation has been durably applied. Returns a boxed future so
 /// the hook can await async cache-invalidation work (e.g.
 /// `khive-pack-memory`'s ANN warm-cache generation bump) without
-/// `khive-runtime` depending on any pack crate — dependencies point the
+/// `khive-runtime` depending on any pack crate: dependencies point the
 /// other way, so the runtime exposes an extension point and the pack
 /// installs into it, same shape as `EntityTypeValidatorFn`, just async.
 pub type NoteMutationHookFn = Arc<
@@ -280,7 +280,7 @@ impl KhiveRuntime {
     /// Return the extra-visible namespaces assembled at config load.
     ///
     /// OSS dispatch uses this set to widen the default multi-record read scope
-    /// to `['local'] ∪ visible_namespaces`. Writes are unchanged — always
+    /// to `['local'] ∪ visible_namespaces`. Writes are unchanged: always
     /// pinned to `'local'`. This set is also available as gate/cloud policy
     /// input.
     pub fn visible_namespaces(&self) -> &[Namespace] {
@@ -1133,7 +1133,7 @@ mod tests {
 
     #[test]
     fn runtime_config_from_khive_config_actor_id_does_not_override_default_namespace() {
-        // `[actor] id` must not set `default_namespace` — writes stay pinned to
+        // `[actor] id` must not set `default_namespace`: writes stay pinned to
         // `local`. A non-`'local'` actor.id is folded into the default read
         // visible-set, but that does not change default_namespace. This test
         // asserts the write-routing invariant only.

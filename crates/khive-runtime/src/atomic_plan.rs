@@ -4,7 +4,7 @@
 //! transaction; commit later applies its statements as DML under a per-op
 //! SAVEPOINT. This module defines the plan *shapes* only, one family per
 //! admissible verb group (`update`, `delete`, `link`, `merge`,
-//! `gtd.transition`, `gtd.complete`, the governance verbs) — not yet wired
+//! `gtd.transition`, `gtd.complete`, the governance verbs): not yet wired
 //! into a live handler or the dispatch path.
 //!
 //! Every plan is deliberately inert (plain data, no async, no embedding
@@ -527,7 +527,7 @@ mod tests {
     fn plans_are_plain_data_no_async_no_embedding() {
         // Documents a compile-time property: every plan type above derives
         // only Debug/Clone/PartialEq, never Future or an embedding-provider
-        // trait. Plans must stay inert data — flag any edit that adds an
+        // trait. Plans must stay inert data: flag any edit that adds an
         // async method or embedding-model field to one of these types.
         let _ = PostCommitEffect::None;
     }

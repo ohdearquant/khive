@@ -85,7 +85,7 @@ static FTS_FAIL_MANY_NS: std::sync::Mutex<Option<String>> = std::sync::Mutex::ne
 /// Distinct from `FTS_FAIL_MANY_NS` which injects a hard `Err`.
 #[cfg(any(test, feature = "fault-injection"))]
 static FTS_FAIL_MANY_PARTIAL_NS: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
-/// Non-parser FTS *search*-leg failure injection for `search_notes` — distinct
+/// Non-parser FTS *search*-leg failure injection for `search_notes`: distinct
 /// from `FTS_FAIL_NS` (which injects at the FTS *upsert*/write step of
 /// `create_note_inner`). Injects a `StorageError::Timeout` at the `search()`
 /// call the FTS fail-open arm guards, so the arm's `is_fts5_syntax_error()`
@@ -154,7 +154,7 @@ pub fn arm_vector_fail(ns: &str) {
 }
 
 /// Failure injection for `delete_note_row_first_for_compensation`'s post-row-removal
-/// cleanup step — distinct from `FTS_FAIL_NS`/`VECTOR_FAIL_NS`, which target
+/// cleanup step: distinct from `FTS_FAIL_NS`/`VECTOR_FAIL_NS`, which target
 /// `create_note_inner`. Lets tests prove that a rollback compensation's cleanup
 /// failure still leaves the note row (and thus the live message) gone.
 #[cfg(any(test, feature = "fault-injection"))]
@@ -559,7 +559,7 @@ pub(crate) fn merge_dependency_kind(
 /// `pub`: the single source both `khive-pack-kg::handlers::link::handle_link`
 /// (via `khive_runtime::merge_entry_metadata`) and
 /// `crate::atomic_prepare::prepare_link` call. Lives in `khive-runtime` (not
-/// pack-kg) because packs depend on `khive-runtime`, never the reverse — the
+/// pack-kg) because packs depend on `khive-runtime`, never the reverse: the
 /// only direction that lets both call sites share one copy instead of a
 /// hand-duplicated block.
 pub fn merge_entry_metadata(
@@ -954,7 +954,7 @@ impl KhiveRuntime {
 
     /// Retrieve an entity by ID.
     ///
-    /// UUID v4 is globally unique — no namespace filter on by-ID ops.
+    /// UUID v4 is globally unique: no namespace filter on by-ID ops.
     pub async fn get_entity(&self, token: &NamespaceToken, id: Uuid) -> RuntimeResult<Entity> {
         self.entities(token)?
             .get_entity(id)
@@ -964,7 +964,7 @@ impl KhiveRuntime {
 
     /// Retrieve an entity by ID including soft-deleted rows.
     ///
-    /// UUID v4 is globally unique — no namespace filter on by-ID ops.
+    /// UUID v4 is globally unique: no namespace filter on by-ID ops.
     pub async fn get_entity_including_deleted(
         &self,
         token: &NamespaceToken,
@@ -978,7 +978,7 @@ impl KhiveRuntime {
 
     /// Retrieve a note by ID including soft-deleted rows.
     ///
-    /// UUID v4 is globally unique — no namespace filter on by-ID ops.
+    /// UUID v4 is globally unique: no namespace filter on by-ID ops.
     pub async fn get_note_including_deleted(
         &self,
         token: &NamespaceToken,
@@ -1256,7 +1256,7 @@ impl KhiveRuntime {
             ));
         }
         if relation == EdgeRelation::Annotates {
-            // Source must be a note. By-ID endpoint resolution is namespace-agnostic —
+            // Source must be a note. By-ID endpoint resolution is namespace-agnostic:
             // link consumes two by-ID endpoints, so it must resolve exactly what
             // get() resolves, regardless of caller namespace.
             match self.resolve_edge_endpoint(token, source_id).await? {
@@ -1709,7 +1709,7 @@ impl KhiveRuntime {
             target_backend: None,
         };
         // `upsert_edge_guarded` re-checks both endpoints exist as part of the same
-        // write, not the separate `validate_edge_relation_endpoints` read above — a
+        // write, not the separate `validate_edge_relation_endpoints` read above: a
         // concurrent hard-delete landing between that read and this write can no
         // longer create a durably dangling edge. Which endpoint(s) were missing is
         // reported by the guard's own in-transaction probe (`GuardedWriteOutcome::
@@ -1940,8 +1940,8 @@ impl KhiveRuntime {
     /// Get both-direction neighbors, each tagged with the direction (`Out`/
     /// `In`) it was found in, via a single storage query per visible
     /// namespace instead of two separate direction-scoped `neighbors_with_query`
-    /// calls — halving the neighbor SELECT count for `context(direction="both")`
-    /// expansion. `query.direction` is ignored — always both.
+    /// calls: halving the neighbor SELECT count for `context(direction="both")`
+    /// expansion. `query.direction` is ignored: always both.
     ///
     /// Mirrors `neighbors_with_query`'s dedup/enrich/soft-delete-filter/order
     /// pipeline exactly, carrying the per-hit direction tag through unchanged.
@@ -1966,7 +1966,7 @@ impl KhiveRuntime {
         }
         // Direction is part of the key (not just node_id/edge_id) so a
         // self-loop's Out row and In row — same node_id and edge_id, opposite
-        // direction — sort adjacent but distinct and both survive dedup.
+        // direction: sort adjacent but distinct and both survive dedup.
         hits.sort_by_key(|h| {
             (
                 h.hit.node_id,
@@ -1995,7 +1995,7 @@ impl KhiveRuntime {
             hits.retain(|h| !deleted.contains(&h.hit.node_id));
         }
         // Same global weight-descending/node_id-ascending restore as
-        // `neighbors_with_query` — the (node_id, edge_id, direction) sort above
+        // `neighbors_with_query`: the (node_id, edge_id, direction) sort above
         // exists only to make `dedup_by_key` adjacent-comparable.
         hits.sort_by(|a, b| {
             b.hit
@@ -2057,7 +2057,7 @@ impl KhiveRuntime {
     /// Neighbor/traverse candidates can be note-kind nodes (e.g. reached via
     /// `annotates` edges) as well as entities; a screen that only consults
     /// `entities` lets soft-deleted note targets leak through and hydrate as
-    /// blank/missing hits. This is a view-layer read-only screen — it does
+    /// blank/missing hits. This is a view-layer read-only screen: it does
     /// not touch edges or mutate any data.
     ///
     /// Returns the subset of `ids` that have `deleted_at IS NOT NULL` in
@@ -2504,7 +2504,7 @@ impl KhiveRuntime {
             crate::secret_gate::check_json(p)?;
         }
         // `embedding_content` is a caller-supplied alternate vector-embedding
-        // input — it must be a non-empty proper prefix of `content` (never a
+        // input: it must be a non-empty proper prefix of `content` (never a
         // superset, an unrelated string, or the full text) and passes the
         // same secret gate as any other stored/embedded text. Rejected
         // before any write, same as the checks above.
@@ -3177,7 +3177,7 @@ impl KhiveRuntime {
     }
 
     /// Resolve a short UUID prefix (8+ hex chars) to a full UUID with NO
-    /// namespace filter at all — mirrors `resolve_by_id`'s by-ID contract:
+    /// namespace filter at all: mirrors `resolve_by_id`'s by-ID contract:
     /// by-ID resolution is namespace-agnostic, since the Gate (not
     /// storage-layer filtering) is the authz seam. Used by the four by-ID
     /// CRUD verbs (get/update/delete/merge) so their prefix path matches
@@ -3318,7 +3318,7 @@ impl KhiveRuntime {
 
     /// Resolve a UUID to its substrate kind with NO namespace filter.
     ///
-    /// By-ID contract: UUID v4 is globally unique — by-ID substrate
+    /// By-ID contract: UUID v4 is globally unique: by-ID substrate
     /// inference must return the record regardless of caller namespace.  Used by
     /// the public `update` and `delete` verb handlers when no explicit `kind` is
     /// supplied.
@@ -3413,7 +3413,7 @@ impl KhiveRuntime {
     ///
     /// `link` and `create`'s `annotates` targets consume by-ID endpoints, so
     /// their existence check must follow the same by-ID contract as `get()`:
-    /// by-ID ops are namespace-agnostic — the Gate, not storage-layer
+    /// by-ID ops are namespace-agnostic: the Gate, not storage-layer
     /// filtering, is the authz seam. Mirrors `resolve_by_id`
     /// (entity + note, unfiltered) and additionally resolves events,
     /// unfiltered, so edge endpoint validation resolves exactly what `get()`
@@ -3572,7 +3572,7 @@ impl KhiveRuntime {
     /// references for `annotates` edges that target this note.
     /// Soft delete also cleans FTS and vector indexes; edges are left in place.
     ///
-    /// UUID v4 is globally unique — no namespace filter on by-ID ops.
+    /// UUID v4 is globally unique: no namespace filter on by-ID ops.
     /// Cascade and index cleanup target the RECORD's stored namespace, not the caller token's.
     /// Returns `Ok(false)` if the note does not exist.
     pub async fn delete_note(
@@ -3607,7 +3607,7 @@ impl KhiveRuntime {
         let record_ns = note.namespace.clone();
 
         // On hard delete, the row delete and the incident-edge cascade (including
-        // already-soft-deleted edges) run as ONE write transaction — see
+        // already-soft-deleted edges) run as ONE write transaction: see
         // `atomic_hard_delete_with_edge_purge`. Index cleanup follows the
         // commit; it is best-effort and idempotent, unlike the row/edge pair.
         let deleted = if hard {
@@ -3617,7 +3617,7 @@ impl KhiveRuntime {
             self.text_for_notes(&record_tok)?
                 .delete_document(&record_ns, id)
                 .await?;
-            // Scoped delete — iterate over EVERY registered embedding model's
+            // Scoped delete: iterate over EVERY registered embedding model's
             // vector store so non-default vectors don't orphan when the note is deleted.
             for model_name in self.registered_embedding_model_names() {
                 self.vectors_for_model(&record_tok, &model_name)?
@@ -3654,7 +3654,7 @@ impl KhiveRuntime {
                 RuntimeError::Internal(format!("delete_note: event store write failed: {e}"))
             })?;
             // A soft OR hard delete removes the note's vectors/FTS document
-            // above — any pack-owned vector-derived cache (e.g.
+            // above: any pack-owned vector-derived cache (e.g.
             // khive-pack-memory's warm ANN index) needs to know the corpus
             // changed, reached via this generic hook so khive-runtime never
             // takes a dependency on khive-pack-memory. No-op when no pack has
@@ -3809,8 +3809,8 @@ impl KhiveRuntime {
         // When the server-side cap was the binding constraint, the compiled
         // SQL asked for one extra (sentinel) row. Its presence in the actual
         // result set — not the requested LIMIT — is the truncation signal
-        // — a `LIMIT 1000` that only matches 20 rows must not warn, and a
-        // query with no `LIMIT` that matches 501+ rows must.
+        // (a `LIMIT 1000` that only matches 20 rows must not warn, and a
+        // query with no `LIMIT` that matches 501+ rows must).
         if let Some(check) = truncation_check {
             if rows.len() > check.max_limit {
                 rows.truncate(check.max_limit);
@@ -3838,7 +3838,7 @@ impl KhiveRuntime {
     /// outbound) to prevent dangling references. Soft delete also cleans FTS
     /// and vector indexes; edges are left in place.
     ///
-    /// UUID v4 is globally unique — no namespace filter on by-ID ops.
+    /// UUID v4 is globally unique: no namespace filter on by-ID ops.
     pub async fn delete_entity(
         &self,
         token: &NamespaceToken,
@@ -3873,7 +3873,7 @@ impl KhiveRuntime {
         );
 
         // On hard delete, the row delete and the incident-edge cascade (including
-        // already-soft-deleted edges) run as ONE write transaction — see
+        // already-soft-deleted edges) run as ONE write transaction: see
         // `atomic_hard_delete_with_edge_purge`. Index cleanup follows the
         // commit; it is best-effort and idempotent, unlike the row/edge pair.
         let deleted = if hard {
@@ -3931,7 +3931,7 @@ impl KhiveRuntime {
 
     /// Fetch a single edge by id.
     ///
-    /// UUID v4 is globally unique — returns the edge regardless of which
+    /// UUID v4 is globally unique: returns the edge regardless of which
     /// namespace the token carries. `Ok(None)` means the edge does not exist at all.
     pub async fn get_edge(
         &self,
@@ -3966,7 +3966,7 @@ impl KhiveRuntime {
 
     /// Fetch a single edge by id.
     ///
-    /// Delegates to `get_edge` — no visible-set check.  By-ID ops are
+    /// Delegates to `get_edge`: no visible-set check.  By-ID ops are
     /// namespace-agnostic; UUID v4 is globally unique.
     pub async fn get_edge_visible(
         &self,
@@ -3978,7 +3978,7 @@ impl KhiveRuntime {
 
     /// Fetch an edge by UUID including soft-deleted rows.
     ///
-    /// Returns the edge regardless of which namespace the token carries —
+    /// Returns the edge regardless of which namespace the token carries:
     /// UUID v4 is globally unique. Used by the hard-delete path so that a
     /// soft-deleted edge can still be purged via its edge ID.
     pub async fn get_edge_including_deleted(
@@ -4284,7 +4284,7 @@ impl KhiveRuntime {
         edge_id: Uuid,
         patch: crate::curation::EdgePatch,
     ) -> RuntimeResult<Edge> {
-        // Fetch the edge by UUID — ID-only, no namespace check.
+        // Fetch the edge by UUID: ID-only, no namespace check.
         // get_edge already uses the record's stored namespace internally.
         let graph_for_fetch = self.graph(token)?;
         let mut edge = graph_for_fetch
@@ -4504,8 +4504,8 @@ impl KhiveRuntime {
         let graph = self.graph(&record_tok)?;
 
         // Cascade: on hard delete, remove ALL annotates edges targeting this edge — including
-        // already-soft-deleted ones — to prevent dangling graph_edges rows. The row
-        // delete and the cascade purge run as ONE write transaction — see
+        // already-soft-deleted ones: to prevent dangling graph_edges rows. The row
+        // delete and the cascade purge run as ONE write transaction: see
         // `atomic_hard_delete_with_edge_purge`.
         // On soft delete the cascade is skipped (data-vs-view principle: soft-deleting the base
         // edge does not cascade to annotation edges; only a hard purge cleans up incident rows).
@@ -5013,7 +5013,7 @@ mod tests {
 
     /// Custom embedder with no lattice model in config must participate in
     /// fan-out: the gate must check `registered_embedding_model_names()`, not
-    /// `config().embedding_model.is_some()` — the latter falls through to
+    /// `config().embedding_model.is_some()`: the latter falls through to
     /// `vec![]` when only a custom provider is registered.
     #[tokio::test]
     async fn custom_embedder_only_runtime_fanout_stores_vector() {
@@ -5202,7 +5202,7 @@ mod tests {
     /// Regression test: `update_edge_symmetric_dml` previously stored
     /// `updated_at` via `chrono::Utc::now().timestamp()` (SECONDS) while every
     /// other `graph_edges` write path (`edge_upsert_statement`,
-    /// `edge_soft_delete_statement`) uses `timestamp_micros()` — a genuine
+    /// `edge_soft_delete_statement`) uses `timestamp_micros()`: a genuine
     /// pre-existing bug, found while unifying this raw-SQL path with the
     /// atomic builder (which already used `timestamp_micros()` correctly)
     /// onto the shared `EDGE_SYMMETRIC_*_SQL` text. A seconds value misread as
@@ -6022,7 +6022,7 @@ mod tests {
     }
 
     /// Regression: unlike `$`, `@` is NOT stripped by `sanitize_fts5_query`
-    /// (by design — the sanitizer stays minimal). SQLite FTS5's bareword
+    /// (by design: the sanitizer stays minimal). SQLite FTS5's bareword
     /// parser still rejects `@` unconditionally, so this query reaches the
     /// runtime-level `Err` arm in `search_notes`, which must fail loud
     /// (`RuntimeError::InvalidInput`) instead of silently degrading to
@@ -6060,7 +6060,7 @@ mod tests {
     }
 
     /// The `search_notes` FTS fail-open arm must only degrade genuine FTS5
-    /// parser syntax errors. A non-parser `StorageError` — e.g. a pool
+    /// parser syntax errors. A non-parser `StorageError`: e.g. a pool
     /// exhaustion or connection timeout on the text-search backend — is not a
     /// bad query and must propagate as `Err`, not be silently swallowed into
     /// an empty (falsely "successful") result set. `search_notes`,
@@ -6393,7 +6393,7 @@ mod tests {
 
     // ---- predicate pushdown before truncation (note branch) ----
 
-    /// Regression: notes store tags inside `properties["tags"]` — there is no
+    /// Regression: notes store tags inside `properties["tags"]`: there is no
     /// separate tags column. Without pushdown, the tag filter is applied after
     /// `hits.truncate(limit)`, so a tag-matching note ranked beyond `limit` in
     /// the raw RRF fusion is silently dropped.
@@ -6626,7 +6626,7 @@ mod tests {
         );
     }
 
-    /// Input longer than 32 hex chars is NOT truncated — the extra chars land
+    /// Input longer than 32 hex chars is NOT truncated: the extra chars land
     /// past the canonical 12-char final
     /// segment with no further hyphen, so the pattern can never match a real
     /// (36-char) stored `id`, instead of silently truncating down to a
@@ -6845,7 +6845,7 @@ mod tests {
 
     /// A single UUID legitimately present in TWO scanned tables (entities and
     /// notes here) must resolve cleanly to that one UUID, not a false
-    /// `AmbiguousPrefix` naming the same UUID twice — without cross-table
+    /// `AmbiguousPrefix` naming the same UUID twice: without cross-table
     /// dedup, `matches.len()` becomes 2 for a single record.
     #[tokio::test]
     async fn resolve_prefix_cross_table_duplicate_uuid_resolves_cleanly() {
@@ -7745,8 +7745,8 @@ mod tests {
         assert!(target_ids.contains(&t2.id));
     }
 
-    /// `link` endpoint existence is a by-ID check and therefore namespace-agnostic
-    /// — a target living in a different namespace than the caller must still
+    /// `link` endpoint existence is a by-ID check and therefore namespace-agnostic:
+    /// a target living in a different namespace than the caller must still
     /// resolve, exactly as `get()` would.
     #[tokio::test]
     async fn link_target_in_different_namespace_succeeds() {
@@ -9522,7 +9522,7 @@ mod tests {
         );
     }
 
-    // Base endpoint allowlist — unlisted triples must fail closed.
+    // Base endpoint allowlist: unlisted triples must fail closed.
     // Document->Document Extends is not in the allowlist.
     #[tokio::test]
     async fn link_extends_document_to_document_returns_invalid_input() {
@@ -9603,7 +9603,7 @@ mod tests {
         );
     }
 
-    // Supersedes — positive tests for all 5 allowed entity kinds.
+    // Supersedes: positive tests for all 5 allowed entity kinds.
     #[tokio::test]
     async fn f010_supersedes_document_to_document_allowed() {
         let rt = rt();
@@ -9688,7 +9688,7 @@ mod tests {
         );
     }
 
-    // Supersedes — negative tests for rejected entity kinds.
+    // Supersedes: negative tests for rejected entity kinds.
     #[tokio::test]
     async fn f010_supersedes_project_to_project_rejected() {
         let rt = rt();
@@ -9752,7 +9752,7 @@ mod tests {
         );
     }
 
-    // Supersedes entity→entity — same kind (concept→concept) must be allowed.
+    // Supersedes entity→entity: same kind (concept→concept) must be allowed.
     #[tokio::test]
     async fn f010_supersedes_same_kind_entity_allowed() {
         let rt = rt();
@@ -9774,7 +9774,7 @@ mod tests {
         );
     }
 
-    // target_backend invariant — all edges written through link() must have
+    // target_backend invariant: all edges written through link() must have
     // target_backend = None because validate_edge_relation_endpoints already ensured the
     // target exists locally.
     #[tokio::test]
@@ -9845,7 +9845,7 @@ mod tests {
         }
     }
 
-    // Symmetric relation neighbors — competes_with queried from the non-canonical
+    // Symmetric relation neighbors: competes_with queried from the non-canonical
     // endpoint must still return results when direction=Out is requested.
     #[tokio::test]
     async fn f012_symmetric_neighbors_visible_from_both_endpoints() {
@@ -10344,7 +10344,7 @@ mod tests {
             "edge must be visible in its own namespace"
         );
 
-        // Foreign namespace must now SUCCEED — by-ID get is namespace-agnostic.
+        // Foreign namespace must now SUCCEED: by-ID get is namespace-agnostic.
         let cross_ns = rt.get_edge(&ns_b, Uuid::from(edge.id)).await;
         assert!(
             matches!(cross_ns, Ok(Some(_))),
@@ -10894,7 +10894,7 @@ mod tests {
         );
     }
 
-    // Multi-model create_entity — second model's vector INSERT fails after the
+    // Multi-model create_entity: second model's vector INSERT fails after the
     // first model's insert succeeds, triggering inserted_models rollback.
     // Uses arm_vector_fail_after(1) so the first insert passes and the second fails,
     // exercising the inserted_models compensation path in create_entity.
@@ -11145,7 +11145,7 @@ mod tests {
 
     // ── By-ID ops must not filter by namespace ──────────────────────────────
     //
-    // A namespace-gated by-ID op on an entity stamped "lambda:leo" from a "local"
+    // A namespace-gated by-ID op on an entity stamped "foreign" from a "local"
     // token would return NotFound, causing gtd.complete / update blindness.
     // UUID is globally unique; by-ID ops find the record regardless of
     // which namespace the caller's token carries.

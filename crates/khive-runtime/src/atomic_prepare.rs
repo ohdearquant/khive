@@ -1,4 +1,4 @@
-//! ADR-099 — the per-verb async prepare pass for the KG-substrate v1
+//! ADR-099: the per-verb async prepare pass for the KG-substrate v1
 //! admissible verbs (`update`, `delete`, `link`, `merge`). Each `prepare_*`
 //! function reads current state (async, outside any transaction) and
 //! returns a plain-data [`crate::atomic_runner::AtomicOpPlan`]
@@ -7,7 +7,7 @@
 //!
 //! `gtd.transition` / `gtd.complete` prepare is deliberately **not** here:
 //! their lifecycle vocabulary (`is_terminal`, `can_transition`, ...) lives in
-//! `khive-pack-gtd`, which depends on `khive-runtime` — not the other way
+//! `khive-pack-gtd`, which depends on `khive-runtime`: not the other way
 //! around. Reproducing that dependency here would invert the crate graph, so
 //! their prepare functions live in `kkernel` (which already depends on both
 //! crates), calling back into the plain [`PlanStatement`]/[`AffectedRowGuard`]
@@ -27,7 +27,7 @@
 //! same-kind rejection are achievable as static DML, but
 //! `curation::merge_entity_sql`'s graceful edge-conflict resolution is not
 //! (it is per-row procedural, incompatible with the static predicate/guard
-//! plan shape) — rather than ship a partially-scoped atomic merge, it is
+//! plan shape): rather than ship a partially-scoped atomic merge, it is
 //! rejected at the same pre-runtime static guard as governance
 //! ([`khive_types::pack::ATOMIC_KNOWN_UNIMPLEMENTED_VERBS`]). `prepare_merge`
 //! below is therefore unreachable through `--atomic`; it remains only as the
@@ -101,7 +101,7 @@ fn optional_str<'a>(args: &'a Value, key: &str) -> Option<&'a str> {
 /// derived `Deserialize` for `Option<T>` intercepts a literal JSON `null` at
 /// the outer `Option` boundary and maps it straight to Rust `None`
 /// regardless of the inner type, so canonical's own "clear" arm is
-/// unreachable through normal struct deserialization — `update(name=null)` /
+/// unreachable through normal struct deserialization: `update(name=null)` /
 /// `update(description=null)` are no-ops, not clears. This module reads raw,
 /// un-deserialized JSON, so it must replicate that collapse explicitly: key
 /// absent OR JSON `null` -> `None` (leave unchanged, no-op); key present as a
@@ -118,9 +118,9 @@ fn optional_string_patch(args: &Value, key: &str) -> RuntimeResult<Option<Option
 
 /// Strict string-or-absent-or-null patch for entity `name`. Unlike
 /// `optional_str`'s `.as_str()`, this does not silently drop a non-string,
-/// non-null value like `name: 123` as absent — it rejects it instead of
+/// non-null value like `name: 123` as absent: it rejects it instead of
 /// reporting success for an invalid update. Canonical validates entity
-/// `name` via `string_value` on `UpdateParams.name: Option<Value>` — null
+/// `name` via `string_value` on `UpdateParams.name: Option<Value>`: null
 /// collapses to absent at the struct-deserialize boundary (see
 /// `optional_string_patch` doc above), so the reachable behavior is:
 /// absent/null -> unchanged; non-null string -> set; any other JSON type ->
@@ -140,7 +140,7 @@ fn entity_name_patch(args: &Value) -> RuntimeResult<Option<String>> {
 /// `properties: Option<Value>` on `UpdateParams` collapses a literal JSON
 /// `null` to Rust `None` at the struct-deserialize boundary (same collapse
 /// as `optional_string_patch` above), so `properties=null` is canonically a
-/// no-op (leave existing properties unchanged) — not a stored JSON `null`.
+/// no-op (leave existing properties unchanged): not a stored JSON `null`.
 /// This module reads raw JSON, so it must replicate that collapse: key
 /// absent OR JSON `null` -> `None` (no merge); any other JSON value ->
 /// `Some(value)` (merge), with no further shape validation at this layer.
@@ -260,18 +260,18 @@ async fn vector_table_exists(runtime: &KhiveRuntime, table: &str) -> RuntimeResu
 
 /// Append the FTS + every registered model's vector-row purge for `subject_id`
 /// (scoped to the RECORD's own namespace, matching `delete_entity`/
-/// `delete_note`'s `record_tok`/`record_ns` convention — not the caller
+/// `delete_note`'s `record_tok`/`record_ns` convention: not the caller
 /// token's namespace, per by-ID namespace-agnosticism) onto `statements`.
 ///
 /// FTS tables (`fts_entities`/`fts_notes`) always exist (created at schema
 /// migration time) so their purge is unconditional. `vec_*` tables are
 /// created lazily on first vector-store open, so a default runtime can
-/// register embedding models before any vector table necessarily exists —
+/// register embedding models before any vector table necessarily exists:
 /// a raw unconditional `DELETE FROM vec_*` can hit `no such table` on a
 /// fresh DB. Only push the vec purge for tables that actually exist:
 /// absence means the record definitionally has no vector row for that
 /// model, so skipping is data-parity-correct (the non-atomic path would
-/// lazily create the table then delete zero rows — same data outcome,
+/// lazily create the table then delete zero rows: same data outcome,
 /// without this read-only prepare pass performing an init side effect).
 async fn push_index_purge_statements(
     runtime: &KhiveRuntime,
@@ -309,7 +309,7 @@ async fn push_index_purge_statements(
 ///
 /// Builds the `Event` exactly as each canonical site does and turns it into
 /// plain-data `SqlStatement`s via
-/// [`khive_db::stores::event::event_insert_statements`] — the same builder
+/// [`khive_db::stores::event::event_insert_statements`]: the same builder
 /// the async execution path every canonical `event_store.append_event(...)`
 /// call reaches uses. There is exactly one place that knows the
 /// `events`/`event_observations` insert shape; this function only adapts its
@@ -369,7 +369,7 @@ pub async fn prepare_op(
         // `expected_kind: None` here — same reasoning as the `"delete"` arm
         // below: callers that need `update(kind=...)` parity must resolve
         // the kind spec themselves (it needs a `VerbRegistry`, unreachable
-        // from this crate — see `AtomicUpdateKind`'s doc comment) and call
+        // from this crate: see `AtomicUpdateKind`'s doc comment) and call
         // `prepare_update` directly with the resolved value; `kkernel`'s
         // `--atomic` seam does exactly this and bypasses this dispatch arm.
         // A caller reaching `prepare_op("update", ...)` without going
@@ -377,7 +377,7 @@ pub async fn prepare_op(
         "update" => prepare_update(runtime, token, args, None).await,
         // `expected_kind: None` here — callers that need `delete(kind=...)`
         // parity must resolve the kind spec themselves (it needs a
-        // `VerbRegistry`, unreachable from this crate — see
+        // `VerbRegistry`, unreachable from this crate: see
         // `AtomicDeleteKind`'s doc comment) and call `prepare_delete`
         // directly with the resolved value; `kkernel`'s `--atomic` seam does
         // exactly this and bypasses this dispatch arm. A caller reaching
@@ -414,7 +414,7 @@ fn prepare_governance_unimplemented(tool: &str) -> RuntimeResult<AtomicOpPlan> {
 /// the resolved substrate (e.g. `salience` on an entity, or
 /// `description`/`tags` on a note). That function has no dependency edge
 /// back to `khive-runtime`, so its exact field-applicability check list and
-/// error message shape are reimplemented here rather than imported — same
+/// error message shape are reimplemented here rather than imported: same
 /// pattern as `optional_string_patch` above. Presence is checked directly on
 /// the raw args object (this module has no `UpdateParams` struct); a JSON
 /// `null` value is treated as absent, matching `Option<T>` deserialization
@@ -493,13 +493,13 @@ fn reject_inapplicable_update_fields(args: &Value, substrate: &str) -> RuntimeRe
 }
 
 /// Caller-supplied update-kind expectation, resolved via the canonical
-/// `resolve_kind_spec` at the kkernel `--atomic` seam — the same pattern
+/// `resolve_kind_spec` at the kkernel `--atomic` seam: the same pattern
 /// [`AtomicDeleteKind`] uses. Without this check, `update(kind="document",
 /// id=<concept>)` would be canonically `NotFound` but the atomic path would
 /// ignore the explicit kind and mutate the resolved entity anyway.
 /// `khive-runtime` must not depend on `khive-pack-kg`, so this is a plain
 /// substrate-level shape rather than `khive_pack_kg::handlers::KindSpec`
-/// itself — the kkernel seam does the pack-aware resolution and passes down
+/// itself: the kkernel seam does the pack-aware resolution and passes down
 /// only what `prepare_update` needs to enforce the mismatch check.
 pub enum AtomicUpdateKind {
     Entity { specific: Option<String> },
@@ -520,7 +520,7 @@ pub async fn prepare_update(
 ) -> RuntimeResult<AtomicOpPlan> {
     let id = require_uuid(args, "id")?;
 
-    // Mirrors update.rs's entity_kind immutability guard — entity_kind is a
+    // Mirrors update.rs's entity_kind immutability guard: entity_kind is a
     // legacy top-level field, independent of the `kind` substrate
     // discriminator handled elsewhere.
     if obj(args)?.get("entity_kind").is_some_and(|v| !v.is_null()) {
@@ -580,7 +580,7 @@ pub async fn prepare_update(
             }];
             // curation.rs's `update_entity` appends an `EntityUpdated` event
             // unconditionally after `upsert_entity` succeeds, regardless of
-            // `text_changed` — match that here, not just on the
+            // `text_changed`: match that here, not just on the
             // reindex-triggering subset of updates.
             statements.extend(event_append_statements(
                 &entity.namespace,
@@ -701,7 +701,7 @@ pub async fn prepare_update(
 ///
 /// DML shape:
 /// - non-symmetric relation: a single [`edge_upsert_statement`] call on the
-///   patched `Edge` — the same builder `update_edge`'s own non-symmetric
+///   patched `Edge`: the same builder `update_edge`'s own non-symmetric
 ///   branch calls via `graph.upsert_edge(edge.clone())`
 ///   (`khive-db::stores::graph::SqlGraphStore::upsert_edge`), so parity is
 ///   exact by construction.
@@ -779,7 +779,7 @@ async fn prepare_update_edge(
 
     if edge.relation.is_symmetric() {
         // The write for a symmetric relation never branches on a
-        // prepare-time probe result — it always carries both self-guarding,
+        // prepare-time probe result: it always carries both self-guarding,
         // commit-time-predicate statements (see their doc comment in
         // khive-db's graph.rs for the full rationale). This avoids the
         // staleness window a prepare-time probe would expose: an earlier op
@@ -841,7 +841,7 @@ async fn prepare_update_edge(
     }
 
     // Mirrors `update_edge`'s unconditional post-mutation `EdgeUpdated`
-    // event append, keyed on the original `edge_id` the caller supplied —
+    // event append, keyed on the original `edge_id` the caller supplied:
     // canonical does the same (the event target is `edge_id`, not the
     // post-absorption surviving id).
     statements.extend(event_append_statements(
@@ -903,7 +903,7 @@ pub async fn prepare_delete(
     // `delete(id, hard=true)` is the public purge route after a prior soft
     // delete, so it must resolve including already-tombstoned rows (a
     // live-only resolve would never find one). Soft delete keeps the
-    // live-only resolve — a soft delete of an already-tombstoned row is a
+    // live-only resolve: a soft delete of an already-tombstoned row is a
     // no-op, matching non-atomic behavior.
     let resolved = if hard {
         runtime.resolve_by_id_including_deleted(token, id).await?
@@ -1041,7 +1041,7 @@ pub async fn prepare_delete(
             )
             .await?;
             // operations.rs's `delete_note` appends a `NoteDeleted` event
-            // after a successful row delete, on both soft and hard delete —
+            // after a successful row delete, on both soft and hard delete:
             // same reasoning as the entity branch above.
             statements.extend(event_append_statements(
                 &namespace,
@@ -1374,7 +1374,7 @@ pub async fn apply_post_commit_effects(
             }
             PostCommitEffect::GtdAudit { .. } => {
                 // Applied by the `kkernel` caller's own post-commit pass,
-                // not here — `khive-pack-gtd` (owner of
+                // not here: `khive-pack-gtd` (owner of
                 // `ensure_audit_schema`/`write_audit_record`) depends on
                 // `khive-runtime`, not the other way around, so this crate
                 // cannot act on the effect itself. See
@@ -1454,11 +1454,11 @@ mod tests {
     }
 
     /// Atomic `update` must reject a field that does not apply to the
-    /// resolved substrate — parity with
+    /// resolved substrate: parity with
     /// `khive-pack-kg::handlers::update::reject_inapplicable_fields`.
     /// Without this check, atomic prepare would silently ignore `salience`
     /// on an entity: it would set every entity field to its current value,
-    /// bump `updated_at`, satisfy the `exactly(1)` guard, and commit — a
+    /// bump `updated_at`, satisfy the `exactly(1)` guard, and commit: a
     /// spurious no-op reported as success.
     #[tokio::test]
     async fn atomic_update_entity_rejects_note_only_field_salience() {
@@ -1568,7 +1568,7 @@ mod tests {
 
     /// Updating a note's content inside an atomic unit must, after commit,
     /// leave the note recallable via FTS under its new content and its
-    /// vector row refreshed — parity with the non-atomic
+    /// vector row refreshed: parity with the non-atomic
     /// `update_note` -> `reindex_note` path.
     #[tokio::test]
     async fn atomic_update_note_content_is_fts_and_vector_reindexed_post_commit() {
@@ -1648,7 +1648,7 @@ mod tests {
     /// on the non-atomic path) and an atomic note DELETE (`DeletePlan`
     /// carries a `PostCommitEffect::NoteDeleted` that
     /// `apply_post_commit_effects` dispatches directly, mirroring
-    /// `operations.rs::delete_note`'s direct-fire, no-refetch shape — the
+    /// `operations.rs::delete_note`'s direct-fire, no-refetch shape: the
     /// row may already be gone by the time this runs, for a hard delete).
     /// A minimal counting hook proves both fire; no `khive-pack-memory`
     /// dependency is needed at this layer, since the hook itself is
@@ -1702,7 +1702,7 @@ mod tests {
             .await
             .expect("apply post-commit effects (update)");
 
-        // Delete path (soft delete — the row still exists, but the hook
+        // Delete path (soft delete: the row still exists, but the hook
         // fires directly from the captured kind rather than refetching).
         let mut del_note =
             khive_storage::note::Note::new("local", "observation", "hook-delete-target");
@@ -1754,7 +1754,7 @@ mod tests {
     }
 
     /// Atomic delete must purge the note's FTS row and vector row for both
-    /// soft and hard delete — parity with `KhiveRuntime::delete_note`'s
+    /// soft and hard delete: parity with `KhiveRuntime::delete_note`'s
     /// index-cleanup contract.
     #[tokio::test]
     async fn atomic_delete_note_purges_fts_and_vector_indexes_soft_and_hard() {
@@ -1837,7 +1837,7 @@ mod tests {
     }
 
     /// Atomic delete must purge the entity's FTS row and vector row for
-    /// both soft and hard delete — parity with
+    /// both soft and hard delete: parity with
     /// `KhiveRuntime::delete_entity`'s index-cleanup contract.
     #[tokio::test]
     async fn atomic_delete_entity_purges_fts_and_vector_indexes_soft_and_hard() {
@@ -1920,7 +1920,7 @@ mod tests {
 
     /// Atomic link must persist an explicit top-level `dependency_kind`
     /// param into edge metadata, and must infer one for `depends_on` edges
-    /// when absent — parity with
+    /// when absent: parity with
     /// `link.rs`'s `merge_entry_metadata` and `operations.rs`'s
     /// `infer_dependency_kind` table.
     #[tokio::test]
@@ -2045,7 +2045,7 @@ mod tests {
     }
 
     /// Atomic `link` must be an upsert, exactly like canonical `link` ->
-    /// `upsert_edge`'s natural-key `ON CONFLICT` arm — re-linking an
+    /// `upsert_edge`'s natural-key `ON CONFLICT` arm: re-linking an
     /// already-linked triple must succeed and update weight/metadata, not
     /// hit the `UNIQUE(namespace, source_id, target_id, relation)`
     /// constraint and roll back the whole atomic unit.
@@ -2237,7 +2237,7 @@ mod tests {
     /// Atomic delete of an entity and a note must succeed even when the
     /// registered embedding model's `vec_*` table has never been lazily
     /// created (a fresh DB registers models before any vector store is
-    /// opened) — the raw purge DML must skip tables that don't exist
+    /// opened): the raw purge DML must skip tables that don't exist
     /// rather than hit `no such table` and roll back the whole atomic
     /// unit. FTS purge still fires (those tables always exist) and the
     /// delete itself is a clean commit.
@@ -2312,7 +2312,7 @@ mod tests {
     }
 
     /// Atomic hard delete must be able to purge a record that was already
-    /// soft-deleted — parity with `delete(id, hard=true)` being the public
+    /// soft-deleted: parity with `delete(id, hard=true)` being the public
     /// purge route after a prior soft delete (the non-atomic hard path
     /// resolves including deleted rows and its DML carries no `deleted_at`
     /// predicate).
@@ -2490,7 +2490,7 @@ mod tests {
     }
 
     /// Atomic `update(id=<entity>, name=...)` must append an
-    /// `EntityUpdated` event, matching `curation::update_entity` — the
+    /// `EntityUpdated` event, matching `curation::update_entity`: the
     /// event is appended unconditionally after a successful row update,
     /// not only on the reindex-triggering subset.
     #[tokio::test]
@@ -2645,9 +2645,9 @@ mod tests {
     }
 
     /// `update` admits `kind="edge"` per `ATOMIC_ADMISSIBLE_VERBS`; this
-    /// asserts `prepare_update` actually builds a plan for one — a
+    /// asserts `prepare_update` actually builds a plan for one, a
     /// non-symmetric relation (`extends`) exercises the
-    /// `edge_upsert_statement` reuse branch — and that the committed row +
+    /// `edge_upsert_statement` reuse branch, and that the committed row +
     /// `EdgeUpdated` event match canonical `update_edge`'s shape (weight
     /// persisted, relation unchanged, exactly one event).
     #[tokio::test]
@@ -2754,7 +2754,7 @@ mod tests {
         .await
         .expect("prepare update edge (symmetric conflict)");
         // The plan does not compute a prepare-time advisory surviving id
-        // (`target_id` is just the requested id) — it carries
+        // (`target_id` is just the requested id): it carries
         // `edge_natural_key` so a post-commit caller can derive the real
         // surviving id itself. Assert the plan carries the right natural
         // key to look up; the actual surviving row's identity is verified
@@ -3011,7 +3011,7 @@ mod tests {
         }
     }
 
-    /// Parity boundary: atomic `update` of a note must append no event —
+    /// Parity boundary: atomic `update` of a note must append no event:
     /// canonical `update_note` never calls `append_event` (unlike
     /// `update_entity`, which always does).
     #[tokio::test]
@@ -3064,7 +3064,7 @@ mod tests {
         );
     }
 
-    /// Parity boundary: atomic `link` must append no event — canonical
+    /// Parity boundary: atomic `link` must append no event: canonical
     /// `link` never calls `append_event`.
     #[tokio::test]
     async fn atomic_link_appends_no_event() {

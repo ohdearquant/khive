@@ -1635,7 +1635,7 @@ fn merge_note_sql(
             rusqlite::params![&namespace, &into_str],
         )?;
         // Derive FTS scalars through the shared constructor so this raw SQL path
-        // is field-identical to TextSearch::upsert_document — critically, `title`
+        // is field-identical to TextSearch::upsert_document: critically, `title`
         // is an empty string (not SQL NULL) for nameless notes, so get_document
         // round-trips None <-> "" correctly.
         let fts_merged = {
@@ -2935,7 +2935,7 @@ mod tests {
 
     // Merging two nameless notes with no embedding model configured: a raw SQL FTS
     // INSERT binding &merged_name directly would store SQL NULL for a nameless
-    // note, while Fts5TextSearch::upsert_document stores an empty string —
+    // note, while Fts5TextSearch::upsert_document stores an empty string:
     // note_fts_scalars must keep the round-trip field-identical.
     #[tokio::test]
     async fn merge_nameless_notes_fts_document_is_parity_correct() {

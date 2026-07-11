@@ -474,7 +474,7 @@ impl KhiveConfig {
     /// not import `lattice_embed` directly to keep the dep surface minimal).
     pub fn validate(&self) -> Result<(), ConfigError> {
         // Reject a top-level `db` key loudly instead of letting serde's
-        // forward-compatible unknown-key tolerance silently swallow it — a
+        // forward-compatible unknown-key tolerance silently swallow it: a
         // config author expecting `db=` to select the database would
         // otherwise get silent divergence from `--db`/`KHIVE_DB`.
         if let Some(value) = self.db.as_deref() {
@@ -540,7 +540,7 @@ impl KhiveConfig {
                     });
                 }
 
-                // Reject fields that are parsed but not yet implemented — silently
+                // Reject fields that are parsed but not yet implemented: silently
                 // accepting them would let misconfiguration slip past startup.
                 if backend.cache_mb.is_some() {
                     return Err(ConfigError::UnsupportedBackendField {
@@ -1050,7 +1050,7 @@ id = "lambda:"
         );
     }
 
-    // actor.id must not become default_namespace — writes stay pinned to `local`
+    // actor.id must not become default_namespace: writes stay pinned to `local`
     // even though a non-local actor.id widens the default read visible-set.
     #[test]
     fn test_runtime_config_actor_id_does_not_override_namespace() {
@@ -1077,7 +1077,7 @@ id = "lambda:"
             "actor.id must NOT become default_namespace (ADR-007 Rev 4 Rule 0); \
              writes stay pinned to local"
         );
-        // actor.id must also appear in visible_namespaces — the load-bearing
+        // actor.id must also appear in visible_namespaces: the load-bearing
         // side effect that widens default reads to {local} ∪ {actor namespace}.
         assert!(
             result
@@ -1528,7 +1528,7 @@ backend = "nonexistent"
     #[test]
     fn test_pack_config_without_backends_section_is_allowed() {
         let dir = tempfile::tempdir().unwrap();
-        // When [[backends]] is absent/empty, packs are not validated — all
+        // When [[backends]] is absent/empty, packs are not validated: all
         // packs fall through to the implicit main backend.
         let path = write_toml(
             &dir,

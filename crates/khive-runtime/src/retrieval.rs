@@ -353,7 +353,7 @@ impl KhiveRuntime {
     /// Rationale: each namespace owns a separate FTS table (`fts_entities_{ns}`)
     /// and a separate ANN index instance. Cross-namespace entity-search fanout
     /// requires iterating over every visible namespace's store, issuing parallel
-    /// search requests, and fusing the results — this is deferred.
+    /// search requests, and fusing the results: this is deferred.
     ///
     /// Note: this is distinct from `memory.recall`'s cross-namespace fanout, which
     /// already iterates `visible_namespaces` across both the FTS and vector legs.
@@ -1373,7 +1373,7 @@ mod tests {
     ///     HAS "target-tag".
     ///
     /// Without predicate pushdown, `fused.truncate(1)` keeps only the decoy and the
-    /// tag-matching entity is invisible — this requires `tags_any` to be passed into
+    /// tag-matching entity is invisible: this requires `tags_any` to be passed into
     /// `query_entities`'s `EntityFilter` so the decoy is excluded before truncation.
     #[tokio::test]
     async fn hybrid_search_tag_filter_pushed_before_truncation() {

@@ -161,7 +161,7 @@ pub fn acquire_recovery_lock() -> Option<std::fs::File> {
 /// blocking `flock`, correct for the daemon's own boot sequence where waiting
 /// until quiescence IS the desired behavior), a caller only trying to *detect*
 /// whether a lock is currently free — without committing to wait forever for
-/// a possibly-wedged holder — needs a deadline instead. Returns:
+/// a possibly-wedged holder: needs a deadline instead. Returns:
 ///   - `Ok(Some(file))` — the lock was free within the deadline.
 ///   - `Ok(None)` — `deadline` elapsed while the lock stayed held; an
 ///     explicit "could not confirm" outcome, distinct from a hard I/O error.
@@ -199,7 +199,7 @@ fn try_acquire_flock_until(
 /// the SAME boot/recovery lock ([`lock_path`]) but gives up at `deadline`
 /// instead of blocking forever. For callers that need to detect "is a boot in
 /// progress right now" without risking an unbounded wait behind a wedged
-/// holder — e.g. khive-mcp's `confirm_genuinely_dead` re-probing rounds,
+/// holder: e.g. khive-mcp's `confirm_genuinely_dead` re-probing rounds,
 /// where `DEAD_CONFIRM_ROUNDS` must bound elapsed time, not just probe count.
 #[cfg(unix)]
 pub fn try_acquire_daemon_boot_guard_until(
@@ -228,7 +228,7 @@ pub type DaemonBootGuard = std::fs::File;
 
 /// Acquire the recovery/boot lock, treating failure as fatal.
 ///
-/// Unlike [`acquire_recovery_lock`] (best-effort, `None` on failure — used by
+/// Unlike [`acquire_recovery_lock`] (best-effort, `None` on failure: used by
 /// shutdown cleanup, where skipping unlink is safer than blocking forever),
 /// daemon-mode boot must hold this lock across migrations/FTS DDL through
 /// bind+pid-write. Silently continuing with no lock reopens the cold-boot FTS
@@ -275,7 +275,7 @@ pub struct DaemonRequestFrame {
     /// The client's resolved storage/gate default namespace for this request.
     ///
     /// As of protocol version 3 (ADR-096) the daemon serves the request under
-    /// this namespace instead of rejecting on mismatch — a per-request
+    /// this namespace instead of rejecting on mismatch: a per-request
     /// identity input, not a same-process-identity assertion.
     pub namespace: String,
     /// The client's resolved write-stamp / gate actor identity (ADR-057),
@@ -331,7 +331,7 @@ pub struct DaemonRequestFrame {
     pub format_per_op: Option<Vec<Option<String>>>,
     /// Whether this request originated from the agent-facing MCP `request`
     /// tool (the wire surface). When `true`, the daemon rejects
-    /// `Visibility::Subhandler` verbs — agents must not invoke internal
+    /// `Visibility::Subhandler` verbs: agents must not invoke internal
     /// subhandlers. When `false` (the default, and the only value any
     /// operator path sends), subhandlers are allowed: `kkernel exec` and
     /// other in-process callers are trusted operator surfaces.
@@ -559,7 +559,7 @@ pub trait DaemonDispatch: Clone + Send + Sync + 'static {
 // returning and the spawned task completing can abort it mid-flight with no
 // log and no row. `track_background_task` gives such spawns a process-wide
 // presence that `drain()` waits on, exactly like the `active` counter does
-// for in-flight connections — the caller still only pays for the spawn +
+// for in-flight connections: the caller still only pays for the spawn +
 // counter increment, never the task's own work.
 static BACKGROUND_TASKS: std::sync::OnceLock<Arc<std::sync::atomic::AtomicUsize>> =
     std::sync::OnceLock::new();
@@ -784,8 +784,8 @@ async fn handle_conn<D: DaemonDispatch>(mut stream: UnixStream, dispatcher: D) {
     // identity (namespace / actor / visible_namespaces, built into a
     // `RequestIdentity` below) over its one shared warm registry, rather
     // than rejecting a differently-attributed same-uid connection to a cold
-    // local-dispatch fallback. `config_id` — which governs packs/db/embed
-    // coherence for the shared warm engine — remains a hard reject; it is
+    // local-dispatch fallback. `config_id`: which governs packs/db/embed
+    // coherence for the shared warm engine: remains a hard reject; it is
     // not an identity field and softening it would let a restricted client
     // dispatch through an incompatible broader daemon.
     } else if frame.config_id != dispatcher.config_id() {

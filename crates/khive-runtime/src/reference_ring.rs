@@ -93,7 +93,7 @@ impl ReferenceRing {
     }
 
     /// Lock the shared state, recovering from mutex poisoning instead of
-    /// panicking — ring admission is best-effort cache maintenance and must
+    /// panicking: ring admission is best-effort cache maintenance and must
     /// never turn an unrelated panic into a failure for every future caller.
     fn lock_state(&self) -> std::sync::MutexGuard<'_, RingState> {
         match self.state.lock() {
@@ -123,7 +123,7 @@ impl ReferenceRing {
     /// Drop empty/aged-out outer-map keys, then if still over `max_outer_keys`
     /// evict the least-recently-touched surviving keys until back within
     /// budget. `exempt` (the key that triggered this admission) is never
-    /// evicted — admitting an id must never immediately evict its own ring.
+    /// evicted: admitting an id must never immediately evict its own ring.
     fn prune_outer_map(
         rings: &mut HashMap<RingKey, VecDeque<RingEntry>>,
         ttl: Duration,
@@ -178,11 +178,11 @@ impl ReferenceRing {
 
     /// Snapshot the live (non-stale) entries for `(namespace, actor)`,
     /// most-recently-touched first. Returns an empty vec for an unknown or
-    /// empty key — never an error, since a ring miss is always legitimate
+    /// empty key: never an error, since a ring miss is always legitimate
     /// (fresh session, restarted daemon, cross-actor query).
     ///
     /// Also runs `prune_outer_map` over the whole outer map, not just the
-    /// queried key — otherwise a daemon that only ever reads (never admits)
+    /// queried key: otherwise a daemon that only ever reads (never admits)
     /// would never prune any other actor's stale key.
     pub fn snapshot(&self, namespace: &str, actor: &str) -> Vec<RingEntry> {
         let now = Instant::now();
@@ -201,7 +201,7 @@ impl ReferenceRing {
 }
 
 /// Display name extracted from a dispatch result's `name` field. No fallback
-/// to a note's `content` — the ring only ever admits entities, and free text
+/// to a note's `content`: the ring only ever admits entities, and free text
 /// must never stand in for an entity's actual name.
 fn display_name(result: &Value) -> Option<String> {
     let name = result.get("name").and_then(Value::as_str)?;
@@ -225,14 +225,14 @@ fn is_entity_kind_value(v: &str) -> bool {
 /// handlers already return.
 ///
 /// - `edge`/`event` results carry an explicit top-level `"kind": "edge"` /
-///   `"kind": "event"` — never entities.
+///   `"kind": "event"`: never entities.
 /// - `create`/`get`/`update` return the raw storage record: entities always
 ///   serialize an `entity_type` key (even as `null`), notes always serialize
-///   a `content` key — the two shapes never overlap, so key presence alone
+///   a `content` key: the two shapes never overlap, so key presence alone
 ///   is a reliable substrate discriminator.
 /// - `delete` returns a synthetic `{deleted, id, kind}` summary carrying
 ///   neither field; its `kind` is the caller-supplied request param verbatim,
-///   which may be absent/ambiguous. Absent or ambiguous `kind` never admits —
+///   which may be absent/ambiguous. Absent or ambiguous `kind` never admits:
 ///   a delete admission is a nice-to-have, so skipping is always the safe
 ///   choice over guessing.
 fn substrate_admits_as_entity(obj: &serde_json::Map<String, Value>) -> bool {
@@ -257,7 +257,7 @@ fn substrate_admits_as_entity(obj: &serde_json::Map<String, Value>) -> bool {
 /// ring, from its already-serialized JSON `result` alone — no extra storage
 /// reads, so admission stays cheap on the Tier-1 latency budget.
 ///
-/// Only singleton by-id touches admit — `create`, `get`, `update`, `delete`,
+/// Only singleton by-id touches admit: `create`, `get`, `update`, `delete`,
 /// `merge`, and `link` (both endpoints). Bulk shapes (`items=[...]`,
 /// `links=[...]`) are identifiable by an `attempted` count in their response
 /// and are excluded: they name multiple ids, not the one-caller-named-id
@@ -285,7 +285,7 @@ pub(crate) fn ring_admissions_for(verb: &str, result: &Value) -> Vec<(Uuid, Opti
                 None => Vec::new(),
             }
         }
-        // merge is entity-only by construction — no substrate check needed;
+        // merge is entity-only by construction: no substrate check needed;
         // `MergeSummary` carries no `kind` field to check even if one were wanted.
         "merge" => match parse_id("kept_id") {
             Some(id) => vec![(id, None)],
@@ -342,7 +342,7 @@ mod tests {
     fn ring_admissions_for_note_result_is_empty() {
         let id = Uuid::new_v4();
         // Real note get/create/update responses carry `content`, never
-        // `entity_type` — the ring only ever admits entity ids.
+        // `entity_type`: the ring only ever admits entity ids.
         let result = json!({"id": id.to_string(), "name": "a note", "content": "body text"});
         assert!(ring_admissions_for("create", &result).is_empty());
         assert!(ring_admissions_for("get", &result).is_empty());
@@ -496,7 +496,7 @@ mod tests {
     }
 
     /// Regression: `snapshot` must sweep the whole outer map, not just the
-    /// queried key — otherwise a read-only daemon (one that only ever calls
+    /// queried key: otherwise a read-only daemon (one that only ever calls
     /// `snapshot`, never `admit`) never prunes any other actor's stale key.
     /// Two actors age out; only `actor:queried` is snapshotted, but
     /// `actor:other`'s stale key must be removed too.

@@ -2,7 +2,7 @@
 //!
 //! Single source of truth for "who is the caller", consumed by the gate
 //! check, storage-token minting, comm attribution, and MCP strict-mode
-//! enforcement — those four sites must agree, so drift here is a silent
+//! enforcement: those four sites must agree, so drift here is a silent
 //! trust-boundary bug.
 
 use khive_gate::ActorRef;

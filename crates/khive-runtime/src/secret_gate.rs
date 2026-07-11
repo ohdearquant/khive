@@ -98,7 +98,7 @@
 //! false positive: no window-narrowing or exemption-widening scheme survives
 //! the adversarial regression corpus without also reopening a real bypass,
 //! because the caller (or an attacker) fully controls the prose between a
-//! trigger word and a payload — narrowing `TRIGGER_WINDOW` or reinstating the
+//! trigger word and a payload: narrowing `TRIGGER_WINDOW` or reinstating the
 //! structured-identifier exemption near "bare" trigger mentions both fail the
 //! same known bypass strings that motivated closing them.
 //!
@@ -107,7 +107,7 @@
 //! flagged token.
 //!
 //! The word-boundary rule above treats underscore as a BOUNDARY for bare
-//! `TRIGGER_WORDS` (`contains_bounded_word`) — deliberately different from
+//! `TRIGGER_WORDS` (`contains_bounded_word`): deliberately different from
 //! `has_standalone_token`'s rule for the word `token`, which treats
 //! underscore as a continuation so `tokenizer`/`next_token`/`token_count`
 //! stay exempt. Treating underscore as a boundary for the bare set is what
@@ -795,7 +795,7 @@ fn check_entropy_heuristic(text: &str, from: usize) -> Option<(&str, &'static st
         // UUID/content-hash and hex-credential-token checks above (neither of
         // which it weakens) and before the entropy computation, since a
         // legitimate path can exceed ENTROPY_THRESHOLD on Shannon entropy
-        // alone. The exemption applies ONLY outside trigger context — see the
+        // alone. The exemption applies ONLY outside trigger context: see the
         // module doc for why no shape-based signal can be made sound near a
         // trigger word; in trigger context this falls through to the entropy
         // heuristic below unconditionally, an accepted false-positive
@@ -1042,7 +1042,7 @@ const MAX_CASE_TRANSITION_DENSITY: f64 = 0.3;
 ///
 /// Outside credential-trigger context this shape check alone is sufficient to
 /// exempt a token from the entropy heuristic. In trigger context the caller
-/// grants NO exemption at all — see the module doc and the call site in
+/// grants NO exemption at all: see the module doc and the call site in
 /// [`check_entropy_heuristic`].
 fn is_structured_identifier(token: &str) -> bool {
     if !token.contains(|c: char| STRUCTURAL_SEPARATORS.contains(&c)) {
@@ -1984,7 +1984,7 @@ mod tests {
         );
     }
 
-    // ── Boundary-aware token= / token: — compound identifiers must pass ─────
+    // ── Boundary-aware token= / token: (compound identifiers must pass) ─────
 
     #[test]
     fn allows_next_token_high_entropy_cursor() {
@@ -2476,7 +2476,7 @@ mod tests {
     fn github_app_token_families_are_masked() {
         // ghu_ (user-to-server), ghs_ (server-to-server), and ghr_ (refresh)
         // GitHub App tokens are real credential families. They are
-        // context-free — no trigger word needed.
+        // context-free: no trigger word needed.
         let cases = [
             "ghu_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", // gitleaks:allow
             "ghs_BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",  // gitleaks:allow
@@ -2753,7 +2753,7 @@ mod tests {
 
     #[test]
     fn blocks_extension_suffix_bypass_secret_access_key() {
-        // A file-extension check alone would exempt this — appending `.md`
+        // A file-extension check alone would exempt this: appending `.md`
         // to a random credential must not bypass detection.
         let content = "secret_access_key abcdefghij/klmnopqrst/uvwxyzabcd/efghijk.md";
         assert!(
@@ -2829,7 +2829,7 @@ mod tests {
     fn blocks_run_splitting_bypass_attempts() {
         // Splitting a credential into short (4-6 char) runs drives EVERY
         // run's own letters-only entropy toward log2(run_len), which ordinary
-        // short English path words already sit at or near — this is exactly
+        // short English path words already sit at or near: this is exactly
         // why any per-run entropy ceiling is unsound as an exemption signal.
         // With the exemption dropped, these are blocked on full-token entropy
         // regardless of run shape.
@@ -2876,7 +2876,7 @@ mod tests {
         // Accepted tradeoff: this path's full-token Shannon entropy (4.5994)
         // exceeds ENTROPY_THRESHOLD (4.5) on its own. With the
         // structured-identifier exemption dropped in trigger context, it is
-        // blocked near an explicit credential trigger word — a deliberate,
+        // blocked near an explicit credential trigger word: a deliberate,
         // documented false positive, not a regression to fix, since no sound
         // signal exists to distinguish this from a chopped/padded credential
         // of the same shape.
@@ -2976,7 +2976,7 @@ mod tests {
         // An internal task `area_id` UUID field sitting within the trigger
         // window of the SUBSTRING "auth" inside
         // `authorized_write_requires_dominance` is not a genuine mention of
-        // the word "auth" — it is a pure substring collision with
+        // the word "auth": it is a pure substring collision with
         // "authorized". Bare trigger words match at a word boundary (see
         // `contains_bounded_word`), so `auth` does not match inside
         // `authorized`; this UUID has no trigger in its window and passes via
@@ -3325,7 +3325,7 @@ mod tests {
         // `access_key` entry (`COMPOUND_TRIGGER_WORDS`, plain substring,
         // always matched regardless of word-boundary rules), AND the bare
         // `secret` entry, because underscore is a BOUNDARY for bare
-        // `TRIGGER_WORDS` — so `secret` in `secret_access_key` is itself a
+        // `TRIGGER_WORDS`: so `secret` in `secret_access_key` is itself a
         // bounded word (bounded by the following `_`), not merely a
         // substring collision. Either path alone is sufficient; this asserts
         // the end-to-end outcome.
@@ -3342,7 +3342,7 @@ mod tests {
     //
     // Bare TRIGGER_WORDS are word-boundary-aware, but underscore must be
     // treated as a boundary rather than a word character (continuation) for
-    // this set specifically — the opposite of `has_standalone_token`'s rule
+    // this set specifically: the opposite of `has_standalone_token`'s rule
     // for `token`. Treating underscore as a continuation would silently drop
     // detection of extremely common underscore-joined credential-config
     // compounds (`SECRET_KEY=`, `auth_token=`, `signing_key=`,

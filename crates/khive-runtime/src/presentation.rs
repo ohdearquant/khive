@@ -62,7 +62,7 @@ pub fn render_format(value: Value, format: OutputFormat, presentation: Presentat
     match format {
         OutputFormat::Json => serde_json::to_string(&value).unwrap_or_else(|_| "null".to_string()),
         OutputFormat::Auto | OutputFormat::Table => {
-            // Skip the redundancy-reduction pre-pass in Verbose mode — full
+            // Skip the redundancy-reduction pre-pass in Verbose mode: full
             // canonical shape must pass through unchanged.
             let reduced = if presentation == PresentationMode::Verbose {
                 value
@@ -176,7 +176,7 @@ fn render_table_forced(value: Value) -> String {
     if let Some((records, keys)) = find_record_array(&value) {
         return render_table(&records, &keys);
     }
-    // No record array detected — fall back to compact JSON.
+    // No record array detected: fall back to compact JSON.
     serde_json::to_string(&value).unwrap_or_else(|_| "null".to_string())
 }
 
@@ -809,7 +809,7 @@ mod tests {
         assert!((s - 1.0).abs() < 1e-9);
     }
 
-    // full_id must never be shortened in Agent mode — it's the caller's
+    // full_id must never be shortened in Agent mode: it's the caller's
     // stable chaining handle.
     #[test]
     fn agent_preserves_full_id_as_36_chars() {
@@ -1077,7 +1077,7 @@ mod tests {
     fn redundancy_drop_does_not_corrupt_error_shape() {
         let v = json!({"ok": false, "error": "something failed", "namespace": "local"});
         // apply_redundancy_drop is a pure value transform with no knowledge of
-        // `ok` — bypassing it for error envelopes is the caller's job
+        // `ok`: bypassing it for error envelopes is the caller's job
         // (render_result in server.rs). This only checks the pre-pass itself
         // doesn't lose the error field.
         let reduced = apply_redundancy_drop(v.clone());

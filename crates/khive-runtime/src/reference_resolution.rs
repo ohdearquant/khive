@@ -39,7 +39,7 @@ pub struct ReferenceCandidate {
 }
 
 /// Outcome of `resolve_reference`. Never a silent pick among close
-/// candidates — `Ambiguous` always lists what it found instead of guessing.
+/// candidates: `Ambiguous` always lists what it found instead of guessing.
 #[derive(Clone, Debug, PartialEq)]
 pub enum ReferenceResolution {
     Resolved { id: Uuid, confidence: f64 },
@@ -54,7 +54,7 @@ const RING_SUBSTRING_CONFIDENCE: f64 = 0.7;
 /// A single ring candidate auto-resolves only at or above this bar; below
 /// it the candidate is still surfaced as `Ambiguous` rather than silently
 /// accepted or dropped. Ring scores are fixed constants on a 0..1 scale, so
-/// a fixed bar is meaningful here — the search stage below needs a
+/// a fixed bar is meaningful here: the search stage below needs a
 /// different rule (`SEARCH_RESOLVED_CONFIDENCE`) because RRF scores aren't
 /// on that scale.
 const RING_AUTO_RESOLVE_CONFIDENCE: f64 = 0.7;
@@ -66,7 +66,7 @@ const RING_AUTO_RESOLVE_CONFIDENCE: f64 = 0.7;
 const SEARCH_MARGIN_RATIO: f64 = 2.0;
 /// Hybrid-search hits below this score never enter the candidate set at all.
 const SEARCH_SCORE_FLOOR: f64 = 0.0;
-/// Confidence reported on a search-stage `Resolved` outcome — not the raw
+/// Confidence reported on a search-stage `Resolved` outcome: not the raw
 /// RRF score, which lives on a much smaller scale (`sum 1/(k + rank)`, e.g.
 /// ~0.016-0.033) and would never clear a 0..1 confidence bar. Fixed below
 /// both ring bands so callers can tell "the ring recognized this" from
@@ -97,11 +97,11 @@ pub async fn resolve_reference(
 
     // Stage 1: id-string passthrough (UUID / 8+ hex prefix) via the existing
     // by-ID path. A ref shaped like an id but absent from storage is
-    // NotFound, not a fallthrough to ring/search — the caller named a
+    // NotFound, not a fallthrough to ring/search: the caller named a
     // specific id, so a miss there is the true answer. Scoped to entity ids
     // only (both full-UUID and prefix forms) to match the ring's entity-only
     // contract (`reference_ring::substrate_admits_as_entity`); a non-entity
-    // id-string is `NotFound` here — callers needing those already have `get`.
+    // id-string is `NotFound` here: callers needing those already have `get`.
     if let Ok(uuid) = Uuid::from_str(trimmed) {
         return match runtime.resolve_by_id(token, uuid).await? {
             Some(Resolved::Entity(_)) => Ok(ReferenceResolution::Resolved {

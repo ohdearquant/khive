@@ -731,7 +731,7 @@ pub struct VerbRegistry {
     actor_id: Option<String>,
     /// Audit event sink — `None` means tracing-only (v0.2 default).
     event_store: Option<Arc<dyn EventStore>>,
-    /// Post-dispatch hook — `None` means no real-time observation.
+    /// Post-dispatch hook: `None` means no real-time observation.
     dispatch_hook: Option<Arc<dyn DispatchHook>>,
     /// Names of all `Visibility::Verb` handlers across all packs, precomputed
     /// once at `build()` time. Used only to render the unknown-verb error
@@ -994,7 +994,7 @@ impl VerbRegistry {
         params: Value,
         identity: Option<RequestIdentity>,
     ) -> Result<Value, RuntimeError> {
-        // help=true interception — short-circuit before gate/pack.
+        // help=true interception: short-circuit before gate/pack.
         if params.get("help").and_then(Value::as_bool) == Some(true) {
             return self.describe_verb(verb);
         }
@@ -1049,7 +1049,7 @@ impl VerbRegistry {
                 // since the last dispatch and persist them as `ConfigLocked`
                 // events, riding this same audit-persistence gate. The
                 // namespace/actor stamped on these rows are whichever
-                // dispatch happens to observe the queue non-empty first —
+                // dispatch happens to observe the queue non-empty first:
                 // an accepted provenance quirk, preferred over threading an
                 // `EventStore` handle into every synchronous
                 // `OnceLock::get_or_init` call site.
@@ -1084,7 +1084,7 @@ impl VerbRegistry {
                 //
                 // Accepted trade-off: a crash between this Allow decision and
                 // the deferred append below (post-dispatch, further down this
-                // function) loses that dispatch's audit row entirely — a
+                // function) loses that dispatch's audit row entirely: a
                 // deliberate choice, not an oversight.
                 let defer_audit = !is_deny;
 
@@ -1128,7 +1128,7 @@ impl VerbRegistry {
         // Mint the authorized storage token at the dispatch boundary.
         //
         // Writes pin to `local` by default. Actor identity and config
-        // `[actor] id` are attribution and gate-context inputs only — they
+        // `[actor] id` are attribution and gate-context inputs only: they
         // never route storage. The explicit `namespace=` request param is a
         // precise single-namespace escape: the caller deliberately
         // reads/writes exactly that one set; it is NOT widened by `visible_namespaces`.
@@ -1147,7 +1147,7 @@ impl VerbRegistry {
         // (mint_with_visibility deduplicates). Writes remain pinned to
         // `'local'`. Per-actor distinctions use view-layer tag filters
         // (assignee, actor_id, from/to), not namespace partitions. `ns`/
-        // `explicit_namespace` were already validated above — reuse them
+        // `explicit_namespace` were already validated above: reuse them
         // instead of re-reading `params["namespace"]` with `as_str()`, which
         // would silently drop malformed non-string values again.
         let token = if explicit_namespace {
@@ -1322,11 +1322,11 @@ impl VerbRegistry {
                 // Keyed on `token.namespace()`, NOT `ns`: `ns` is the
                 // gate-resolved namespace, which on the default
                 // (non-explicit) dispatch path can be a non-local
-                // `default_namespace` (e.g. "lambda:leo") while the storage
+                // `default_namespace` (e.g. "foreign") while the storage
                 // token that actually created/touched the record is pinned
                 // to `local`. The ring must be keyed on the namespace the
-                // record actually lives in — the same namespace
-                // `resolve_reference`'s ring lookup uses — or admission and
+                // record actually lives in: the same namespace
+                // `resolve_reference`'s ring lookup uses: or admission and
                 // lookup silently diverge on any non-local `default_namespace`
                 // config.
                 if let Ok(ref ok_val) = result {
@@ -2967,7 +2967,7 @@ mod tests {
     }
 
     /// The gate's actor and the storage token's actor must be the exact same
-    /// resolved value — both come from one `resolve_actor` call
+    /// resolved value: both come from one `resolve_actor` call
     /// (`resolved_actor`) instead of two independently hand-synchronized
     /// `match` expressions, so a future edit to one copy but not the other
     /// cannot silently desynchronize "who the gate thinks the caller is" from
@@ -5340,7 +5340,7 @@ mod help_tests {
     // ── Unknown-verb error must not leak subhandler names ─────────
 
     /// `describe_verb` on an unknown verb must list only Verb-visibility names
-    /// in the "available" list — never subhandler names like `recall.embed`.
+    /// in the "available" list: never subhandler names like `recall.embed`.
     #[tokio::test]
     async fn help_true_unknown_verb_available_list_excludes_subhandlers() {
         let reg = build_help_registry(Arc::new(AtomicUsize::new(0)));
@@ -5576,7 +5576,7 @@ mod help_tests {
 
     // ADR-028: two packs declaring the same auxiliary table on the same
     // backend must cause apply_schema_plans_with_map to return an error that
-    // names both packs and the table — it is a boot-time failure, not a
+    // names both packs and the table: it is a boot-time failure, not a
     // silent DDL race.
     #[test]
     fn apply_schema_plans_with_map_collision_is_an_error() {
