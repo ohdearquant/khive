@@ -195,25 +195,15 @@ impl KhiveRuntime {
     ///
     /// Returns `RuntimeError::NotFound` if the entity does not exist or belongs to a different
     /// namespace. Namespace isolation is enforced at the runtime layer.
-    /// Decide step of `update_entity` (ADR-099 B3 r6 second pass): secret-gates
-    /// the patch, fetches the current row, and computes the resulting `Entity`
-    /// plus `text_changed` (drives reindex) and `changed_fields` (the event
-    /// payload) — WITHOUT writing anything. This is the ONE place that decides
-    /// what a patched entity looks like: `update_entity` below calls it then
-    /// applies the result via `store.upsert_entity` (unchanged execution
-    /// mechanism), and the ADR-099 `--atomic` prepare path
-    /// (`khive-runtime::atomic_prepare::prepare_update`) calls this SAME
-    /// function, turning the result into a `PlanStatement` via
-    /// `khive_db::stores::entity::entity_upsert_statement` — the identical
-    /// builder `upsert_entity` calls internally. No entity-patch decision
-    /// logic is duplicated between the two paths.
+    /// Computes the patched `Entity`, `text_changed`, and `changed_fields` without
+    /// writing anything, so both the normal write path and the atomic-prepare path
+    /// share one source of truth for what a patched entity looks like.
     pub(crate) async fn prepare_update_entity(
         &self,
         token: &NamespaceToken,
         id: Uuid,
         patch: EntityPatch,
     ) -> RuntimeResult<(Entity, bool, Vec<&'static str>)> {
-        // Secret gate: scan incoming text fields, properties, and tags.
         if let Some(ref name) = patch.name {
             crate::secret_gate::check(name)?;
         }
@@ -326,9 +316,8 @@ impl KhiveRuntime {
                 "cannot merge an entity into itself".into(),
             ));
         }
-        // H2 fix: enforce same-kind constraint at the runtime layer.
-        // The handler also checks this, but any direct runtime caller (CLI, tests,
-        // future SDK) would bypass the handler guard without this check here.
+        // Enforce the same-kind constraint here too: any direct runtime caller
+        // (CLI, tests, future SDK) would bypass the handler-level guard otherwise.
         {
             let into_entity = self.get_entity(token, into_id).await?;
             let from_entity = self.get_entity(token, from_id).await?;
@@ -348,24 +337,20 @@ impl KhiveRuntime {
             .map(|name| format!("vec_{}", crate::config::sanitize_key(name)))
             .collect();
 
-        // Ensure all required tables exist before entering the transaction.
-        // Each accessor applies its DDL idempotently via `CREATE TABLE IF NOT EXISTS`.
+        // Ensure all required tables exist (idempotent DDL) before the transaction.
         let _ = self.entities(token)?;
         let _ = self.graph(token)?;
         let _ = self.text(token)?;
-        // Prime DDL for every registered model's vec table.  Use vectors_for_model
-        // (not the default-model-only self.vectors()) so that custom-only runtimes
-        // (embedding_model: None but custom providers registered) work correctly.
+        // vectors_for_model (not the default-model-only self.vectors()) so
+        // custom-only runtimes (no default embedding_model) still get DDL primed.
         for model_name in &self.registered_embedding_model_names() {
             let _ = self.vectors_for_model(token, model_name)?;
         }
 
         let pool = self.backend().pool_arc();
-        // ADR-067 Component A: when the write queue is enabled, route this
-        // multi-statement merge through the single-writer task instead of the
-        // pool's writer mutex. Best-effort lookup mirrors every other migrated
-        // store: a lookup failure (no runtime context) degrades to the legacy
-        // mutex path rather than failing the merge outright.
+        // When the write queue is enabled, route this multi-statement merge through
+        // the single-writer task instead of the pool's writer mutex. A lookup
+        // failure degrades to the legacy mutex path rather than failing the merge.
         let writer_task = pool.writer_task_handle().ok().flatten();
 
         let (summary, updated_entity) = if let Some(writer_task) = writer_task {
@@ -413,9 +398,8 @@ impl KhiveRuntime {
             .map_err(|e| RuntimeError::Internal(e.to_string()))??
         };
 
-        // If vectors are configured, reindex into_entity (requires async embedding).
-        // FTS and vec-deletes for all registered models were already committed inside
-        // the transaction above.
+        // FTS and vec-deletes already committed inside the transaction above;
+        // only the embedding re-insert needs an async step outside it.
         if !dry_run && !self.registered_embedding_model_names().is_empty() {
             self.reindex_entity(token, &updated_entity).await?;
         }
@@ -598,20 +582,15 @@ impl KhiveRuntime {
         Ok(())
     }
 
-    /// Decide step of `update_note` (ADR-099 B3 r6 second pass) — same split
-    /// as `prepare_update_entity` above: secret-gates the patch, fetches the
-    /// current row, computes the resulting `Note` plus `text_changed`
-    /// (drives reindex), without writing. `update_note` and the ADR-099
-    /// `--atomic` `prepare_update` Note branch both call this ONE function;
-    /// the DML itself is `khive_db::stores::note::note_upsert_statement`,
-    /// the same builder `upsert_note` calls internally.
+    /// Computes the patched `Note` and `text_changed` without writing, mirroring
+    /// `prepare_update_entity` so both the normal write path and the
+    /// atomic-prepare path share one source of truth.
     pub(crate) async fn prepare_update_note(
         &self,
         token: &NamespaceToken,
         id: Uuid,
         patch: NotePatch,
     ) -> RuntimeResult<(khive_storage::note::Note, bool)> {
-        // Secret gate: scan incoming text fields and structured properties.
         if let Some(ref content) = patch.content {
             crate::secret_gate::check(content)?;
         }
@@ -638,8 +617,7 @@ impl KhiveRuntime {
             note.content = content;
         }
         if let Some(salience_patch) = patch.salience {
-            // Reject non-finite or out-of-range salience at the runtime boundary
-            // rather than silently clamping invalid caller input (coding-standards §608-622).
+            // Reject invalid salience rather than silently clamping caller input.
             if let Some(s) = salience_patch {
                 if !s.is_finite() || !(0.0..=1.0).contains(&s) {
                     return Err(crate::RuntimeError::InvalidInput(format!(
@@ -650,7 +628,7 @@ impl KhiveRuntime {
             note.salience = salience_patch;
         }
         if let Some(decay_patch) = patch.decay_factor {
-            // Reject non-finite or negative decay_factor at the runtime boundary.
+            // Reject invalid decay_factor rather than silently clamping caller input.
             if let Some(d) = decay_patch {
                 if !d.is_finite() || d < 0.0 {
                     return Err(crate::RuntimeError::InvalidInput(format!(
@@ -690,12 +668,9 @@ impl KhiveRuntime {
 
         if text_changed {
             self.reindex_note(token, &note).await?;
-            // #750 fix-round 1: text_changed means the note's embedding was
-            // just reindexed, which any pack-owned vector-derived cache
-            // (e.g. khive-pack-memory's warm ANN index) needs to know about —
-            // reached via this generic hook so khive-runtime/khive-pack-kg
-            // never take a dependency on khive-pack-memory. No-op when no
-            // pack has installed a hook.
+            // Notify any pack-owned vector cache (e.g. a warm ANN index) that this
+            // note's embedding changed, via a generic hook so khive-runtime/pack-kg
+            // never take a dependency on the consuming pack. No-op if unregistered.
             self.fire_note_mutation_hook(&note.kind, note.id).await;
         }
 
@@ -747,13 +722,11 @@ impl KhiveRuntime {
 
         let _ = self.graph(token)?;
         let _ = self.text_for_notes(token)?;
-        // Prime DDL for every registered model's vec table (mirrors merge_entity fix).
         for model_name in &self.registered_embedding_model_names() {
             let _ = self.vectors_for_model(token, model_name)?;
         }
 
         let pool = self.backend().pool_arc();
-        // ADR-067 Component A: same writer-task routing as merge_entity above.
         let writer_task = pool.writer_task_handle().ok().flatten();
 
         let (summary, updated_note) = if let Some(writer_task) = writer_task {
@@ -803,14 +776,9 @@ impl KhiveRuntime {
 
         if !dry_run && !self.registered_embedding_model_names().is_empty() {
             self.reindex_note(token, &updated_note).await?;
-            // #750 fix-round 2 (codex r2 High 1): a merge changes the same
-            // ANN corpus as update_note's text_changed branch — the
-            // surviving note gets a new vector via reindex_note above, and
-            // the source note is tombstoned by merge_note_sql. Fire the
-            // same hook update_note fires after its own reindex (see
-            // ~line 670 above) so a pack-owned vector cache (e.g.
-            // khive-pack-memory's warm ANN index) is notified regardless of
-            // which public write path reached the corpus change.
+            // A merge changes the same ANN corpus as update_note's text_changed
+            // branch, so fire the same mutation hook regardless of which public
+            // write path reached the corpus change.
             self.fire_note_mutation_hook(&updated_note.kind, updated_note.id)
                 .await;
         }
@@ -1116,10 +1084,8 @@ fn merge_entity_sql(
         .map(|v| serde_json::to_string(v).unwrap_or_default());
     let tags_json = serde_json::to_string(&merged_tags).unwrap_or_else(|_| "[]".to_string());
 
-    // --- Rewire edges ---
     // Writes are gated on `!dry_run` below, but the loop itself always runs so a
-    // dry-run response reports a predictive `edges_rewired` count (the number of
-    // incident edges that would be rewired) instead of always reporting zero.
+    // dry-run response reports a predictive `edges_rewired` count instead of zero.
     let mut edges_rewired = 0usize;
     for edge in all_edges {
         let raw_src = if edge.source_id == from_id {
@@ -1156,18 +1122,10 @@ fn merge_entity_sql(
         }
 
         let now_ts = chrono::Utc::now().timestamp();
-        // H3 fix: preserve the original edge ID by updating
-        // source_id/target_id in-place when no conflict exists.
-        //
-        // Two-step approach to handle all cases while keeping the original ID:
-        //   (a) No conflict (new triple): UPDATE source_id/target_id in-place.
-        //       The edge retains its original UUID — callers can still get() it
-        //       by the ID they received from link().
-        //   (b) Conflict: into_id already has an edge with this (source,target,
-        //       relation). Delete the from-edge (it is superseded) and UPDATE
-        //       the existing into-edge to refresh weight/metadata/deleted_at.
-        //       The surviving edge is the into-entity's original edge (correct).
-        //
+        // Preserve the original edge ID where possible so callers can still get()
+        // it by the ID returned from link(): update in-place when there's no
+        // conflict; when into_id already owns this (source,target,relation), drop
+        // the from-edge instead and refresh the existing into-edge.
         // Check for a conflict: does into_id already have this natural key?
         let conflict_id: Option<String> = {
             let conflict_src = new_src.to_string();
@@ -1188,8 +1146,7 @@ fn merge_entity_sql(
         };
 
         let changed = if let Some(existing_id) = conflict_id {
-            // Case (b): a live or soft-deleted row already owns this natural key.
-            // Delete the from-edge and refresh the existing row.
+            // A live or soft-deleted row already owns this natural key.
             conn.execute(
                 khive_db::stores::graph::EDGE_SYMMETRIC_DELETE_NONCANONICAL_SQL,
                 rusqlite::params![&namespace, edge.id.to_string()],
@@ -1206,8 +1163,6 @@ fn merge_entity_sql(
                 ],
             )?
         } else {
-            // Case (a): no conflict — update source_id/target_id in-place,
-            // preserving the original edge ID for callers.
             conn.execute(
                 "UPDATE graph_edges SET \
                      source_id = ?1, target_id = ?2, updated_at = ?3 \
@@ -1227,7 +1182,6 @@ fn merge_entity_sql(
     }
 
     if !dry_run {
-        // --- Upsert merged entity ---
         conn.execute(
             "INSERT OR REPLACE INTO entities \
              (id, namespace, kind, name, description, properties, tags, \
@@ -1249,10 +1203,9 @@ fn merge_entity_sql(
             ],
         )?;
 
-        // --- Reindex into_id in FTS (delete existing, insert updated) ---
-        // Body formula mirrors entity_fts_document (the canonical constructor) —
-        // this path is sync/spawn_blocking so it cannot call entity_fts_document
-        // directly, but must stay field-identical.
+        // Body formula mirrors entity_fts_document (the canonical constructor):
+        // this path is sync/spawn_blocking so it can't call it directly, but
+        // must stay field-identical.
         let fts_body = match &merged_description {
             Some(d) if !d.is_empty() => format!("{} {}", merged_name, d),
             _ => merged_name.clone(),
@@ -1285,7 +1238,6 @@ fn merge_entity_sql(
             ],
         )?;
 
-        // --- Delete from_id from FTS ---
         conn.execute(
             &format!(
                 "DELETE FROM {} WHERE namespace = ?1 AND subject_id = ?2",
@@ -1294,7 +1246,6 @@ fn merge_entity_sql(
             rusqlite::params![&namespace, &from_str],
         )?;
 
-        // --- Delete from_id from all registered model vector tables ---
         khive_db::stores::vectors::delete_subject_from_vector_tables(
             conn,
             &vec_tables,
@@ -1302,7 +1253,6 @@ fn merge_entity_sql(
             &namespace,
         )?;
 
-        // --- Tombstone from entity (soft-delete with provenance) ---
         let merge_event_id = Uuid::new_v4();
         conn.execute(
             "UPDATE entities \
@@ -1556,7 +1506,6 @@ fn merge_note_sql(
     let (merged_props, properties_merged) =
         merge_properties(&into_note.properties, &from_note.properties, strategy);
 
-    // Append merge history to properties.
     let merge_history_entry = serde_json::json!({
         "merged_from": from_id.to_string(),
         "merged_at": now,
@@ -1579,7 +1528,6 @@ fn merge_note_sql(
 
     let mut edges_rewired = 0usize;
     if !dry_run {
-        // Rewire and upsert.
         for edge in all_edges {
             let raw_src = if edge.source_id == from_id {
                 into_id
@@ -1604,8 +1552,6 @@ fn merge_note_sql(
                 continue;
             }
             let now_ts = chrono::Utc::now().timestamp();
-            // Same two-step approach as entity merge rewire: preserve original edge ID
-            // when no conflict, merge into existing row when conflict exists.
             let conflict_id: Option<String> = {
                 let conflict_src = new_src.to_string();
                 let conflict_tgt = new_tgt.to_string();
@@ -1659,7 +1605,6 @@ fn merge_note_sql(
             }
         }
 
-        // Upsert merged into-note.
         conn.execute(
             "INSERT OR REPLACE INTO notes \
              (id, namespace, kind, status, name, content, salience, decay_factor, \
@@ -1682,7 +1627,6 @@ fn merge_note_sql(
             ],
         )?;
 
-        // Update FTS for into-note.
         conn.execute(
             &format!(
                 "DELETE FROM {} WHERE namespace = ?1 AND subject_id = ?2",
@@ -1690,11 +1634,10 @@ fn merge_note_sql(
             ),
             rusqlite::params![&namespace, &into_str],
         )?;
-        // Derive FTS scalars through the shared constructor so this raw SQL
-        // path is field-identical to TextSearch::upsert_document.  Critically,
-        // `title` is an empty string (not SQL NULL) for nameless notes —
-        // matching the unwrap_or("") in Fts5TextSearch::upsert_document and
-        // allowing get_document to round-trip None ↔ "" correctly.
+        // Derive FTS scalars through the shared constructor so this raw SQL path
+        // is field-identical to TextSearch::upsert_document: critically, `title`
+        // is an empty string (not SQL NULL) for nameless notes, so get_document
+        // round-trips None <-> "" correctly.
         let fts_merged = {
             let mut merged_note = Note::new(&namespace, &*into_note.kind, &*merged_content);
             merged_note.id = into_id;
@@ -1722,7 +1665,6 @@ fn merge_note_sql(
             ],
         )?;
 
-        // Delete from-note from FTS.
         conn.execute(
             &format!(
                 "DELETE FROM {} WHERE namespace = ?1 AND subject_id = ?2",
@@ -1731,7 +1673,6 @@ fn merge_note_sql(
             rusqlite::params![&namespace, &from_str],
         )?;
 
-        // Delete from-note from all registered model vector tables.
         khive_db::stores::vectors::delete_subject_from_vector_tables(
             conn,
             &vec_tables,
@@ -1739,7 +1680,6 @@ fn merge_note_sql(
             &namespace,
         )?;
 
-        // Tombstone the from-note.
         conn.execute(
             "UPDATE notes SET status = 'deleted', deleted_at = ?1, updated_at = ?1 \
              WHERE namespace = ?2 AND id = ?3 AND deleted_at IS NULL",
@@ -1781,8 +1721,8 @@ fn merge_note_sql(
 // Merge helpers (pure functions — easier to unit test)
 // ---------------------------------------------------------------------------
 
-/// `pub(crate)` (widened, ADR-099 B3 fix round): `crate::atomic_prepare::prepare_merge`
-/// reuses this exact field-fold semantics for atomic/non-atomic parity.
+/// `pub(crate)` so `crate::atomic_prepare::prepare_merge` can reuse this exact
+/// field-fold semantics for atomic/non-atomic parity.
 pub(crate) fn merge_string_field(
     into: &str,
     from: &str,
@@ -1795,10 +1735,9 @@ pub(crate) fn merge_string_field(
 }
 
 /// Merge two property objects. Returns (merged, count_of_fields_from_from_that_were_added).
-/// `pub(crate)` (widened from private, ADR-099 B3): the atomic prepare pass
-/// (`crate::atomic_prepare`) reuses this exact properties-merge semantics when
-/// building an `update` write plan's row statement, matching `update_entity`/
-/// `update_note`'s own patch behavior byte-for-byte.
+/// `pub(crate)` so `crate::atomic_prepare` can reuse this exact properties-merge
+/// semantics when building an `update` write plan's row statement, matching
+/// `update_entity`/`update_note`'s own patch behavior byte-for-byte.
 pub(crate) fn merge_properties(
     into: &Option<Value>,
     from: &Option<Value>,
@@ -1865,8 +1804,8 @@ fn merge_json(into: &Value, from: &Value, strategy: EntityDedupMergePolicy) -> (
     }
 }
 
-/// `pub(crate)` (widened, ADR-099 B3 fix round): reused by
-/// `crate::atomic_prepare::prepare_merge` for atomic/non-atomic parity.
+/// `pub(crate)` so `crate::atomic_prepare::prepare_merge` can reuse this for
+/// atomic/non-atomic parity.
 pub(crate) fn union_tags(into: &[String], from: &[String]) -> (Vec<String>, usize) {
     let mut seen: HashSet<&str> = into.iter().map(|s| s.as_str()).collect();
     let mut result: Vec<String> = into.to_vec();
@@ -1998,7 +1937,6 @@ mod tests {
             .await
             .unwrap();
 
-        // Old name is findable.
         let hits_before = fts_hit(&rt, &tok, "OldName").await;
         assert!(
             hits_before.contains(&entity.id),
@@ -2019,7 +1957,6 @@ mod tests {
         let hits_old = fts_hit(&rt, &tok, "OldName").await;
         let hits_new = fts_hit(&rt, &tok, "NewName").await;
 
-        // After rename, old name no longer matches this entity (FTS index updated).
         assert!(
             !hits_old.contains(&entity.id),
             "old name should no longer match after rename"
@@ -2081,11 +2018,9 @@ mod tests {
             .await
             .unwrap();
 
-        // Verify it's in the index before.
         let hits_before = fts_hit(&rt, &tok, "StableIndexed").await;
         assert!(hits_before.contains(&entity.id));
 
-        // Only patch properties — text index should be untouched (still findable).
         rt.update_entity(
             &tok,
             entity.id,
@@ -2149,7 +2084,6 @@ mod tests {
         assert_eq!(summary.removed_id, b.id);
         assert_eq!(summary.edges_rewired, 2);
 
-        // Verify edges now point to D.
         let a_neighbors = rt
             .neighbors(&tok, a.id, Direction::Out, None, None)
             .await
@@ -2419,7 +2353,7 @@ mod tests {
         assert!(a_out.is_empty(), "no self-loop should remain");
     }
 
-    // ---- #778: content_strategy for entity merge ----
+    // ---- content_strategy for entity merge ----
 
     #[tokio::test]
     async fn merge_entity_append_strategy_concatenates_descriptions() {
@@ -2557,10 +2491,10 @@ mod tests {
         );
     }
 
-    /// Regression test for the codex PR #814 High finding: `content_strategy`
-    /// must be followed directly, independent of the entity-field `strategy`.
-    /// With the default entity policy `prefer_into`, an explicit
-    /// `content_strategy=prefer_from` must still keep the from-description.
+    /// `content_strategy` must be followed directly, independent of the
+    /// entity-field `strategy`: with the default entity policy `prefer_into`,
+    /// an explicit `content_strategy=prefer_from` must still keep the
+    /// from-description.
     #[tokio::test]
     async fn merge_entity_prefer_from_content_strategy_wins_over_default_entity_policy() {
         let rt = rt();
@@ -2636,9 +2570,8 @@ mod tests {
         );
     }
 
-    /// Codex PR #814 Medium finding: dry-run must be a read-only, accurate preview —
-    /// it must predict `edges_rewired` without writing, and must not append an
-    /// `EntityMerged` event.
+    /// Dry-run must be a read-only, accurate preview: it must predict
+    /// `edges_rewired` without writing, and must not append an `EntityMerged` event.
     #[tokio::test]
     async fn merge_entity_dry_run_predicts_edges_rewired_without_writing() {
         use khive_storage::EdgeRelation;
@@ -2680,7 +2613,6 @@ mod tests {
             "dry-run must predict the edge that would be rewired, not report zero"
         );
 
-        // The edge must not actually have been rewired.
         let a_neighbors = rt
             .neighbors(&tok, a.id, Direction::Out, None, None)
             .await
@@ -2691,7 +2623,6 @@ mod tests {
             "dry_run=true must not rewire any edges"
         );
 
-        // No EntityMerged event should have been appended.
         let events = rt
             .events(&tok)
             .unwrap()
@@ -2766,13 +2697,11 @@ mod tests {
         .await
         .unwrap();
 
-        // After merge, get_entity returns an error (soft-deleted rows are excluded).
         assert!(
             rt.get_entity(&tok, from_id).await.is_err(),
             "tombstoned source should not be returned by get_entity"
         );
 
-        // Verify the source row still exists in SQL with provenance.
         let pool = rt.backend().pool_arc();
         let (deleted_at, merged_into): (Option<i64>, Option<String>) =
             tokio::task::spawn_blocking(move || {
@@ -2846,7 +2775,6 @@ mod tests {
         assert!(summary.content_appended);
         assert!(!summary.dry_run);
 
-        // Source is no longer findable.
         let from_store = rt.notes(&tok).unwrap();
         assert!(
             from_store.get_note(from_id).await.unwrap().is_none(),
@@ -2854,10 +2782,8 @@ mod tests {
         );
     }
 
-    // #690 regression: after routing merge_note's conflict-probe/delete/refresh
-    // arms through the shared khive-db EDGE_SYMMETRIC_*_SQL constants, note merge
-    // must still absorb a conflicting edge natural key exactly as before —
-    // mirrors merge_entity_survives_shared_edge_to_third_party for the note path.
+    // Note merge must absorb a conflicting edge natural key exactly like entity
+    // merge does, since both route through the shared EDGE_SYMMETRIC_*_SQL arms.
     #[tokio::test]
     async fn merge_note_survives_shared_edge_to_third_party() {
         use khive_storage::EdgeRelation;
@@ -2994,7 +2920,6 @@ mod tests {
 
         assert!(summary.dry_run);
 
-        // Both notes still exist unchanged.
         let store = rt.notes(&tok).unwrap();
         let into_after = store.get_note(into_id).await.unwrap().unwrap();
         let from_after = store.get_note(from_id).await.unwrap().unwrap();
@@ -3008,12 +2933,10 @@ mod tests {
         );
     }
 
-    // Regression: merge two NAMELESS notes with no embedding model configured.
-    // Before this fix, the raw SQL FTS INSERT bound &merged_name directly — for a
-    // nameless note that is SQL NULL, while Fts5TextSearch::upsert_document stores
-    // an empty string.  The mismatch caused get_document to diverge (or fail) for
-    // nameless merged notes.  After the fix, note_fts_scalars drives every scalar
-    // and the round-trip is field-identical.
+    // Merging two nameless notes with no embedding model configured: a raw SQL FTS
+    // INSERT binding &merged_name directly would store SQL NULL for a nameless
+    // note, while Fts5TextSearch::upsert_document stores an empty string:
+    // note_fts_scalars must keep the round-trip field-identical.
     #[tokio::test]
     async fn merge_nameless_notes_fts_document_is_parity_correct() {
         use khive_storage::types::TextSearchRequest;
@@ -3060,7 +2983,6 @@ mod tests {
         .await
         .expect("merge_note must succeed");
 
-        // Fetch the merged note from the note store to get its current state.
         let note_store = rt.notes(&tok).expect("note store");
         let merged_note = note_store
             .get_note(into_id)
@@ -3068,10 +2990,8 @@ mod tests {
             .expect("get_note")
             .expect("merged note must exist");
 
-        // Compute the expected FTS document via the shared constructor.
         let expected = note_fts_document(&merged_note);
 
-        // Fetch the stored FTS document and verify field parity.
         let fts = rt.text_for_notes(&tok).expect("FTS store");
         let stored = fts
             .get_document("local", into_id)
@@ -3079,7 +2999,6 @@ mod tests {
             .expect("get_document must not error")
             .expect("FTS document must exist after merge");
 
-        // Core parity: subject_id, title (must be None, not Some("")), body.
         assert_eq!(stored.subject_id, expected.subject_id, "subject_id");
         assert_eq!(
             stored.title, expected.title,
@@ -3089,7 +3008,6 @@ mod tests {
         assert_eq!(stored.namespace, expected.namespace, "namespace");
         assert_eq!(stored.kind, expected.kind, "kind");
 
-        // The merged note is nameless — title must be None, matching the shared path.
         assert!(
             stored.title.is_none(),
             "nameless merged note must have title=None in FTS (was NULL before fix)"
@@ -3147,18 +3065,17 @@ mod tests {
         assert!((updated.weight - 0.5).abs() < 0.001, "weight unchanged");
     }
 
-    // scenario-kg-maintenance C1 regression: merge must not crash when both
-    // entities share a common third-party edge (duplicate triple after rewire).
-    // Before the fix, the double-ON-CONFLICT INSERT raised a UNIQUE constraint
-    // error at the SQLite layer and the merge aborted mid-transaction.
+    // Merge must not crash when both entities share a common third-party edge
+    // (duplicate triple after rewire): a double-ON-CONFLICT INSERT would
+    // otherwise raise a UNIQUE constraint error and abort mid-transaction.
     #[tokio::test]
     async fn merge_entity_survives_shared_edge_to_third_party() {
         use khive_storage::EdgeRelation;
         let rt = rt();
         let tok = NamespaceToken::local();
 
-        // Create three entities: A and B will be merged; shared is the common target.
-        // Use `extends` (concept→concept) which is a valid endpoint combination.
+        // A and B will be merged; shared is the common target. `extends` is used
+        // since concept→concept is a valid endpoint combination.
         let a = rt
             .create_entity(&tok, "concept", None, "A", None, None, vec![])
             .await
@@ -3181,7 +3098,6 @@ mod tests {
             .await
             .unwrap();
 
-        // Before the fix this would return Err with "UNIQUE constraint failed".
         let summary = rt
             .merge_entity(
                 &tok,
@@ -3198,13 +3114,10 @@ mod tests {
 
         assert_eq!(summary.kept_id, a.id);
         assert_eq!(summary.removed_id, b.id);
-        // A already had the Extends edge to shared; when B→shared is rewired to
-        // A→shared, the ON CONFLICT DO UPDATE refreshes the existing row (clears
-        // deleted_at, updates weight). rusqlite reports this as 1 change, so
-        // edges_rewired will be >= 0. The important invariant is that the merge
-        // did NOT crash and exactly one live edge A→shared remains.
-
-        // One live edge A→shared must exist after merge.
+        // A already had the Extends edge to shared; rewiring B->shared onto it
+        // refreshes the existing row via ON CONFLICT DO UPDATE rather than
+        // erroring. The invariant checked below is that exactly one live edge
+        // A->shared remains.
         let a_edges = rt
             .list_edges(
                 &tok,
@@ -3225,7 +3138,6 @@ mod tests {
             "C1: exactly one live A→shared Extends edge must exist after merge; got: {a_edges:?}"
         );
 
-        // Tombstone check: B must be soft-deleted after successful merge (C3).
         // get_entity filters deleted_at IS NULL, so a tombstoned entity returns None.
         let b_after = rt.entities(&tok).unwrap().get_entity(b.id).await.unwrap();
         assert!(
@@ -3234,9 +3146,9 @@ mod tests {
         );
     }
 
-    // H2 regression: merge_entity at the runtime level must reject cross-kind merges.
-    // Before the H2 fix, only the pack handler had this guard; a direct runtime caller
-    // could still merge concept+project, silently tombstoning the source entity.
+    // merge_entity at the runtime level must reject cross-kind merges: without this
+    // guard, a direct runtime caller could merge concept+project, silently
+    // tombstoning the source entity, even though the pack handler also checks it.
     #[tokio::test]
     async fn merge_entity_cross_kind_rejected_at_runtime() {
         let rt = rt();
@@ -3251,7 +3163,6 @@ mod tests {
             .await
             .unwrap();
 
-        // Cross-kind merge must return InvalidInput at the runtime level.
         let err = rt
             .merge_entity(
                 &tok,
@@ -3268,7 +3179,6 @@ mod tests {
             "H2: expected InvalidInput, got: {err:?}"
         );
 
-        // Both entities must survive the failed merge attempt with no tombstone.
         let concept_after = rt.get_entity(&tok, concept.id).await;
         let project_after = rt.get_entity(&tok, project.id).await;
         assert!(
@@ -3281,7 +3191,7 @@ mod tests {
         );
     }
 
-    // scenario-kg-maintenance C2 regression: same-kind merge must succeed.
+    // Same-kind merge must succeed.
     #[tokio::test]
     async fn merge_entity_same_kind_succeeds() {
         let rt = rt();
@@ -3310,12 +3220,11 @@ mod tests {
         assert_eq!(summary.kept_id, c1.id);
         assert_eq!(summary.removed_id, c2.id);
 
-        // c2 must be tombstoned.
         let c2_after = rt.entities(&tok).unwrap().get_entity(c2.id).await.unwrap();
         assert!(c2_after.is_none(), "from_entity must be tombstoned");
     }
 
-    // ── #567 regression: cross-namespace merge_note must be denied on either ID ──
+    // Cross-namespace merge_note must be denied on either ID.
 
     #[tokio::test]
     async fn merge_note_cross_namespace_either_id_returns_not_found() {
@@ -3372,7 +3281,7 @@ mod tests {
         );
     }
 
-    // ADR-007 PR-A1: cross-namespace update now succeeds (shared-brain model).
+    // Cross-namespace update now succeeds (shared-brain model).
 
     #[tokio::test]
     async fn update_entity_cross_namespace_succeeds() {
@@ -3395,7 +3304,6 @@ mod tests {
             .await
             .unwrap();
 
-        // ADR-007 PR-A1: update from ns_b token must now succeed on an ns_a entity.
         let result = rt
             .update_entity(
                 &ns_b,
@@ -3592,13 +3500,10 @@ mod tests {
         assert_eq!(stored.body, expected.body, "body after update");
     }
 
-    // ── Fix #135 regression tests ────────────────────────────────────────────
-    //
     // Verify that merge_entity / merge_note delete from_id vectors from ALL
-    // registered model vec tables, not just the default-model table.
-    //
-    // Uses the same ConstVecProvider/ConstVecService pattern as operations.rs
-    // so no real model files are required.
+    // registered model vec tables, not just the default-model table. Uses the
+    // same ConstVecProvider/ConstVecService pattern as operations.rs so no
+    // real model files are required.
 
     struct MergeTestVecService {
         dims: usize,
@@ -3750,7 +3655,6 @@ mod tests {
         .await
         .expect("merge_entity");
 
-        // from_id must have ZERO rows in EITHER model table after merge.
         let post_a = vs_a
             .search(VectorSearchRequest {
                 query_vectors: vec![query.clone()],
@@ -3889,7 +3793,6 @@ mod tests {
         .await
         .expect("merge_note");
 
-        // from_id must have ZERO rows in EITHER model table after merge.
         let post_a = vs_a
             .search(VectorSearchRequest {
                 query_vectors: vec![query.clone()],

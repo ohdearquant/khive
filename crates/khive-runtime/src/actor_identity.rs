@@ -1,12 +1,9 @@
 //! Shared actor-identity resolution (issue #567).
 //!
-//! Actor selection was independently reimplemented at four call sites: the
-//! runtime dispatch gate check, storage-token minting, comm attribution, and
-//! MCP strict-mode enforcement. Because the gate's actor identity, the
-//! storage token's actor identity, comm attribution, and strict-mode
-//! enforcement all need to agree on "who is the caller", drift between the
-//! four copies is a silent trust-boundary bug waiting to happen. This module
-//! is the single source of truth all four sites consume.
+//! Single source of truth for "who is the caller", consumed by the gate
+//! check, storage-token minting, comm attribution, and MCP strict-mode
+//! enforcement: those four sites must agree, so drift here is a silent
+//! trust-boundary bug.
 
 use khive_gate::ActorRef;
 
@@ -67,8 +64,7 @@ mod tests {
 
     #[test]
     fn resolve_actor_preserves_untrimmed_id() {
-        // Non-blank strings are used verbatim (not trimmed) — matches the
-        // pre-existing inline match expressions this module replaces.
+        // Trim only decides emptiness; the id itself is stored verbatim.
         let actor = resolve_actor(Some(" lambda:khive "));
         assert_eq!(actor.id, " lambda:khive ");
     }

@@ -1,4 +1,4 @@
-//! Write-time secret detection gate (issue #76).
+//! Write-time secret detection gate.
 //!
 //! Scans caller-supplied content strings before any storage write.  A match
 //! causes a hard `RuntimeError::SecretDetected` that names the detector and
@@ -27,11 +27,7 @@
 //! word in the surrounding window always dominates.** A UUID or a
 //! sha-prefixed content hash sitting directly beside "api_key"/"secret"/"auth"
 //! is exactly as ambiguous as any other high-entropy candidate and falls
-//! through to explicit detection instead of being silently allowed. A corpus
-//! replay of ~19k real notes and docs measured exactly one benign token newly
-//! blocked under this rule (an internal task UUID field incidentally
-//! co-occurring with the word "auth") — accepted as a small, traced tradeoff
-//! rather than leaving the allowlists unconditionally bypassable.
+//! through to explicit detection instead of being silently allowed.
 //! - Pure hex strings (sha256, git SHA) — passed when not near a trigger.
 //! - UUID canonical form (`xxxxxxxx-xxxx-…`) — passed when not near a trigger.
 //! - Base64/base64url content hashes with an explicit `sha<N>-` prefix (SRI
@@ -69,135 +65,65 @@
 //!   check and remains subject to the entropy heuristic below.
 //!
 //!   **This exemption applies ONLY outside an explicit credential trigger
-//!   context (round-4 decision).** Two narrower attempts to keep some form of
-//!   this exemption alive inside `near_trigger` context were tried and both
-//!   defeated: a trailing file-extension check (`.md`/`.rs`; internal review round 2
-//!   Critical — appending an extension to any random credential re-enabled
-//!   the exemption), and a dual-signal check requiring both a run-shape count
-//!   and an average per-run letters-only Shannon entropy below a threshold
-//!   (internal review round 3 Critical — an attacker who splits a credential into short
-//!   runs, or pads it with extra short/digit-bearing runs, drives the
-//!   reported entropy for every run toward `log2(run_len)`, which ordinary
-//!   short English path segments already sit at or near; e.g. a 9-char
-//!   all-distinct-letter run and the word `relations` are numerically
-//!   identical Shannon entropy). Because the attacker fully controls where
-//!   the token's separators fall, no aggregation (mean, max, or otherwise)
-//!   over per-run or whole-token letters-only entropy can be made sound —
-//!   the measure only sees a character-frequency histogram, never word
-//!   semantics, so it cannot be pinned to reject "chopped credential" while
-//!   admitting "real short word" at the same run length. Rather than ship
-//!   another attacker-suppliable signal, the exemption is dropped entirely in
-//!   trigger context: near a trigger word, a structured-identifier-shaped
-//!   token falls through to the entropy heuristic like any other token. This
-//!   is an accepted false-positive tradeoff on a small number of genuine
+//!   context.** Signals that measure Shannon entropy over an attacker-chosen
+//!   run boundary (e.g. requiring a trailing file extension, or an average
+//!   per-run letter entropy below a threshold) are not sound near a trigger
+//!   word: an attacker who controls where a credential's separators fall can
+//!   always choose run lengths whose entropy reads no higher than an ordinary
+//!   short English path segment, since the measure only sees a
+//!   character-frequency histogram, never word semantics. So near a trigger
+//!   word, a structured-identifier-shaped token gets no exemption at all and
+//!   falls through to the entropy heuristic like any other token. This is an
+//!   accepted false-positive tradeoff on a small number of genuine
 //!   paths/doc-slugs that happen to sit near a trigger word AND read above
 //!   the entropy threshold on their own — see
 //!   `accepted_false_positive_adr_draft_path_near_trigger` and its siblings
-//!   for the specific repro cases this now blocks, and the call site in
+//!   for the specific repro cases this blocks, and the call site in
 //!   `check_entropy_heuristic`.
 //!
-//! **Round 5 (issues #632 / #577 — trigger-word matching, not the exemption
-//! itself): measured, not assumed.** The round-4 accepted-FP class turned out
-//! to be systemic in practice: agents routinely cite file paths while
-//! discussing auth/secret/scanner topics, and a 26.6k-row production-corpus
-//! replay (real note content + entity descriptions) found the trigger check
-//! itself was over-broad in one specific, fixable way — `TRIGGER_WORDS` were
-//! matched as a plain substring, so `auth` fired inside `authorized` and
-//! `authentication`, `key` inside `monkey`/`keyword`, etc. This is a pure
-//! substring collision, distinct from a genuine (if topical) mention of the
-//! word, and is NOT attacker-relevant: it is a false match on prose that never
-//! mentions credentials, not a signal an adversary can weaponize by adding
-//! filler words near a real payload. Bare trigger words (`key`, `secret`,
-//! `password`, `passwd`, `credential`, `bearer`, `auth`, `apikey`) are now
-//! matched at a word boundary (`contains_bounded_word`) instead of a plain
-//! substring; the three compound entries that already embed an underscore
-//! (`api_key`, `access_key`, `private_key`) are unchanged (plain substring),
-//! since the underscore already disambiguates them and word-boundary matching
-//! would only weaken them (e.g. `secret_access_key` no longer needs the bare
+//! Trigger-word matching only fires on genuine mentions, not substring
+//! collisions: bare trigger words (`key`, `secret`, `password`, `passwd`,
+//! `credential`, `bearer`, `auth`, `apikey`) are matched at a word boundary
+//! (`contains_bounded_word`), so `auth` does not fire inside `authorized` or
+//! `authentication`, nor `key` inside `monkey`/`keyword`. The three compound
+//! entries that already embed an underscore (`api_key`, `access_key`,
+//! `private_key`) are matched as a plain substring instead, since the
+//! underscore already disambiguates them and word-boundary matching would
+//! only weaken them (e.g. `secret_access_key` no longer needs the bare
 //! `secret`/`key` matches once `access_key` fires on its own).
 //!
-//! This closes exactly the substring-collision false positive
-//! (`allows_internal_area_id_uuid_near_auth_substring_round5`, formerly
-//! `accepted_false_positive_internal_area_id_uuid_near_auth_substring`) and
-//! measurably reduced the production corpus block count from 29/26593 to
-//! 18/26601 in the same replay (~38% fewer blocks; the remaining blocks
-//! include genuine credentials — real `postgresql://user:pass@host` strings —
-//! plus the round-4 accepted-FP class that this round does NOT close: a
-//! structured-identifier-shaped token sitting near a **genuinely standalone**
-//! trigger word, e.g. `auth work saved at .../R1-repo-audit.md`, where `auth`
-//! is not a substring collision but an actual topical mention.
+//! A structured-identifier-shaped token sitting near a **genuinely standalone**
+//! trigger word (e.g. `auth work saved at .../repo-audit.md`, where `auth` is
+//! an actual topical mention rather than a substring collision) is an accepted
+//! false positive: no window-narrowing or exemption-widening scheme survives
+//! the adversarial regression corpus without also reopening a real bypass,
+//! because the caller (or an attacker) fully controls the prose between a
+//! trigger word and a payload: narrowing `TRIGGER_WINDOW` or reinstating the
+//! structured-identifier exemption near "bare" trigger mentions both fail the
+//! same known bypass strings that motivated closing them.
 //!
-//! Two other candidate directions were evaluated and REJECTED for the same
-//! reason as rounds 2–3: both are attacker-defeatable by inserting filler
-//! prose, which is exactly the failure mode the round-4 decision already
-//! ruled out for shape-based signals, and it applies identically here because
-//! the caller (or an attacker) fully controls the prose between a trigger
-//! word and a payload.
-//! - **Narrowing `TRIGGER_WINDOW` to reduce topical-prose false positives.**
-//!   Measured against every existing adversarial regression test:
-//!   round-1/2/3 bypass strings place the payload immediately adjacent to the
-//!   trigger word (0–1 byte gap: `secret_access_key <value>`, `token=<value>`),
-//!   while the accepted-FP repro paths sit only ~8–20 bytes away
-//!   (`api_key handling in <path>`, `key: see <path>`). No window cutoff
-//!   separates these classes without being trivially defeated by an attacker
-//!   inserting 1–2 filler words to push their payload just past whatever
-//!   narrower cutoff is chosen — the identical "attacker controls placement"
-//!   defeat as rounds 2–3, just measured in bytes-of-window instead of
-//!   run-shape. Window narrowing was not implemented.
-//! - **Reinstating the structured-identifier exemption for "bare"/topical
-//!   trigger mentions while keeping full strength only for assignment-shaped
-//!   triggers (`key=`, `secret:`).** This was checked against the round-1/3
-//!   bypass corpus directly: `secret_access_key abcdefghij/klmnopqrst/…` is
-//!   syntactically indistinguishable from `api_key handling in <path>` (both
-//!   are `TRIGGER_WORD <space> candidate-token`, no assignment operator
-//!   present), and the bypass payload independently decomposes into
-//!   `is_structured_identifier`-shaped runs — so this direction would have
-//!   silently re-opened the round-1/3 bypasses it was supposed to leave shut.
-//!   Not implemented.
+//! The caller-visible block message (`SecretMatch`'s `Display` impl) also
+//! carries actionable guidance (`block_guidance`) to split or reword the
+//! flagged token.
 //!
-//! The caller-visible block message (`SecretMatch`'s `Display` impl) now also
-//! carries actionable guidance (`block_guidance`) — split or reword the
-//! flagged token — regardless of which detector direction shipped, since this
-//! part carries no soundness risk.
-//!
-//! **Round 5b (recall regression caught in PR review — underscore boundary
-//! semantics): measured against both branches, not assumed.** Round 5's
-//! `contains_bounded_word` copied its boundary rule from the pre-existing
-//! `has_standalone_token` check, which treats underscore as a word character
-//! (a continuation, not a boundary) — a rule that makes sense for `token`
-//! specifically (see `has_standalone_token`'s own doc: it deliberately keeps
-//! `tokenizer`/`next_token`/`token_count` exempt). Applied to the bare
-//! `TRIGGER_WORDS` set, that same rule was wrong: it silently dropped
-//! detection of extremely common underscore-joined credential-config
-//! compounds that the pre-round-5 substring check (i.e. `main`) caught —
+//! The word-boundary rule above treats underscore as a BOUNDARY for bare
+//! `TRIGGER_WORDS` (`contains_bounded_word`): deliberately different from
+//! `has_standalone_token`'s rule for the word `token`, which treats
+//! underscore as a continuation so `tokenizer`/`next_token`/`token_count`
+//! stay exempt. Treating underscore as a boundary for the bare set is what
+//! lets common underscore-joined credential-config compounds keep firing:
 //! `SECRET_KEY=...` (Django/Flask-style config), `auth_token=...`,
-//! `session_secret_...`, `signing_key=...` — because `secret`/`key`/`auth`
-//! were never bounded by the following/preceding `_` under that rule, and
-//! none of these are in `COMPOUND_TRIGGER_WORDS`. Confirmed empirically with
-//! probes run against both `main` and this branch before fixing: `main`
-//! blocks all four shapes via plain substring; the pre-round-5b branch state
-//! let all four pass.
+//! `session_secret_...`, `signing_key=...` all match on the `secret`/`key`/
+//! `auth` half even though none of them is in `COMPOUND_TRIGGER_WORDS`. This
+//! is implemented by parameterizing the boundary rule (`contains_word`'s
+//! `underscore_is_word_char` argument) rather than sharing one rule between
+//! the two callers.
 //!
-//! Fixed by parameterizing the boundary rule (`contains_word`'s
-//! `underscore_is_word_char` argument) instead of unifying it:
-//! `contains_bounded_word` (bare `TRIGGER_WORDS`) now treats `_` as a
-//! BOUNDARY — only ASCII alphanumerics count as continuations — which
-//! restores detection of the compounds above while leaving the round-5 win
-//! intact (`authorized`, `authentication`, `monkey`, `keyword` are
-//! letter-joined, not underscore-joined, so they are unaffected by this
-//! change). `has_standalone_token`'s underscore-is-continuation rule for
-//! `token` is deliberately left unchanged — that exemption was a prior,
-//! separate decision and is out of scope here. Regression tests:
-//! `blocks_django_style_secret_key_assignment_round5b`,
-//! `blocks_auth_token_assignment_round5b`,
-//! `blocks_session_secret_and_signing_key_compounds_round5b`,
-//! `allows_authorized_authentication_keyword_prose_unaffected_by_round5b`.
-//!
-//! Re-measured against the same 26.6k-row production corpus replay after this
-//! fix: see the harness's own output for current numbers (`corpus_replay`,
-//! `#[ignore]`d, run via `KHIVE_REPLAY_DB=<path> cargo test ... -- --ignored
-//! --nocapture`) — this doc intentionally does not restate a point-in-time
-//! count here to avoid it drifting from the harness as the corpus changes.
+//! A production-corpus replay harness (`corpus_replay`, `#[ignore]`d, run via
+//! `KHIVE_REPLAY_DB=<path> cargo test ... -- --ignored --nocapture`) measures
+//! the detector's block rate against real note/entity content; see the
+//! harness's own output for current numbers rather than a point-in-time count
+//! here, which would drift as the corpus changes.
 
 use crate::error::{RuntimeError, RuntimeResult};
 
@@ -228,8 +154,7 @@ impl std::fmt::Display for SecretMatch {
 }
 
 /// Actionable, caller-visible guidance for a hard block, keyed by detector
-/// name (candidate 3 from issue #577: cheap regardless of which detector
-/// change ships). If the content genuinely is a credential, remove it. If it
+/// name. If the content genuinely is a credential, remove it. If it
 /// is not — the common case for the detectors below, which key off SHAPE
 /// near a trigger word rather than a known credential prefix — the fix is to
 /// break up the flagged token so it no longer reads as one contiguous
@@ -866,34 +791,15 @@ fn check_entropy_heuristic(text: &str, from: usize) -> Option<(&str, &'static st
 
         // Structured identifiers (file paths, branch names, ADR/doc slugs,
         // snake_case identifiers) are exempted from the entropy check — see
-        // the module doc and `is_structured_identifier`. This must come after
-        // the UUID/content-hash allowlist and the hex-credential-token check
-        // above (neither of which it weakens) and before the entropy
-        // computation, since a legitimate path can exceed ENTROPY_THRESHOLD
-        // on Shannon entropy alone.
-        //
-        // Round-4 decision (internal review round 3 Critical): this exemption applies
-        // ONLY outside an explicit credential trigger context. Two prior
-        // attempts to narrow it for `near_trigger` instead of dropping it
-        // — a trailing file-extension check (round 1→2 bypass) and a
-        // dual-signal run-shape + average-per-run-letter-entropy check
-        // (round 2→3 bypass) — were both defeated, because every variant
-        // measured Shannon entropy over an attacker-CHOSEN run boundary, and
-        // entropy over a run of length `k` has a hard ceiling of `log2(k)`
-        // that ordinary short English words already sit at or near: a 9-char
-        // all-distinct-letter run (`relations`) and a 9-char chunk chopped
-        // out of a random credential are numerically IDENTICAL Shannon
-        // entropy, because the measure only sees the character-frequency
-        // histogram, never word semantics. An attacker who controls the
-        // token can always pick run lengths that drive per-run entropy at or
-        // below whatever a genuine short path segment reads at — no
-        // aggregation function (mean, max, or otherwise) over that
-        // attacker-chosen-boundary measure is sound. In trigger context,
-        // therefore, `is_structured_identifier` grants NO exemption: the
-        // token falls through to the entropy heuristic below unconditionally.
-        // This is an accepted false-positive tradeoff — see
-        // `accepted_false_positive_adr_draft_path_near_trigger` and its two
-        // sibling tests for the specific repro paths this now blocks.
+        // the module doc and `is_structured_identifier`. Must come after the
+        // UUID/content-hash and hex-credential-token checks above (neither of
+        // which it weakens) and before the entropy computation, since a
+        // legitimate path can exceed ENTROPY_THRESHOLD on Shannon entropy
+        // alone. The exemption applies ONLY outside trigger context: see the
+        // module doc for why no shape-based signal can be made sound near a
+        // trigger word; in trigger context this falls through to the entropy
+        // heuristic below unconditionally, an accepted false-positive
+        // tradeoff for genuine paths that happen to score high entropy.
         if !near_trigger && is_structured_identifier(token) {
             continue;
         }
@@ -969,8 +875,8 @@ fn contains_bounded_word(low_window: &str, needle: &str) -> bool {
 /// word, with underscore treated as a WORD CHARACTER / continuation (see
 /// [`contains_word`]) — but NOT as part of compound identifiers such as
 /// `tokenizer`, `token_count`, or `next_token`. This underscore-as-
-/// continuation rule is unchanged from before round 5 and deliberately
-/// different from [`contains_bounded_word`]: `token` alone is not a
+/// continuation rule is deliberately different from
+/// [`contains_bounded_word`]: `token` alone is not a
 /// credential trigger (it fires on too many benign technical terms), so it
 /// needs the narrower, underscore-inclusive standalone-word definition,
 /// whereas the bare `TRIGGER_WORDS` need underscore-joined compounds like
@@ -1136,8 +1042,8 @@ const MAX_CASE_TRANSITION_DENSITY: f64 = 0.3;
 ///
 /// Outside credential-trigger context this shape check alone is sufficient to
 /// exempt a token from the entropy heuristic. In trigger context the caller
-/// grants NO exemption at all — see the round-4 decision in the module doc
-/// comment and the call site in [`check_entropy_heuristic`].
+/// grants NO exemption at all: see the module doc and the call site in
+/// [`check_entropy_heuristic`].
 fn is_structured_identifier(token: &str) -> bool {
     if !token.contains(|c: char| STRUCTURAL_SEPARATORS.contains(&c)) {
         return false;
@@ -1729,7 +1635,7 @@ mod tests {
 
     #[test]
     fn known_prefix_secret_glued_after_cjk_is_still_flagged() {
-        // Round-2 regression: a Layer-1 known-prefix secret glued directly after
+        // A Layer-1 known-prefix secret glued directly after
         // CJK prose (no ASCII whitespace) was missed, because the prefix boundary
         // check used `is_alphanumeric` — which Rust counts true for CJK — so the
         // preceding ideograph was not treated as a delimiter.  These credentials
@@ -1750,7 +1656,7 @@ mod tests {
 
     #[test]
     fn url_userinfo_after_cjk_does_not_panic_and_is_flagged() {
-        // Round-3 regression: a credential URL glued after CJK prose panicked,
+        // A credential URL glued after CJK prose panicked,
         // because scheme_start was (separator byte index + 1) — one byte into a
         // multibyte CJK separator — and the slice fell on a non-char boundary.
         // The public check() API must return a controlled error, never panic.
@@ -1769,7 +1675,7 @@ mod tests {
 
     #[test]
     fn non_ascii_glued_token_trigger_is_still_flagged() {
-        // Round-4 regression: `token=`/`token:`/standalone `token` glued directly
+        // `token=`/`token:`/standalone `token` glued directly
         // after non-ASCII prose was missed because has_standalone_token /
         // has_token_assignment used is_alphanumeric for the word boundary — CJK,
         // accented letters, and fullwidth digits all count as alphanumeric in
@@ -2078,7 +1984,7 @@ mod tests {
         );
     }
 
-    // ── Finding 6: boundary-aware token= / token: — compound identifiers must pass ──
+    // ── Boundary-aware token= / token: (compound identifiers must pass) ─────
 
     #[test]
     fn allows_next_token_high_entropy_cursor() {
@@ -2107,7 +2013,7 @@ mod tests {
         );
     }
 
-    // ── Finding 5: hex allowlist is not applied when trigger context is present ─
+    // ── Hex allowlist is not applied when trigger context is present ────────
     //
     // Pure hex strings have a theoretical maximum entropy of log2(16) = 4.0 bits/char,
     // which is below the ENTROPY_THRESHOLD of 4.5.  That means pure hex tokens cannot
@@ -2246,7 +2152,7 @@ mod tests {
         );
     }
 
-    // ── Finding 4: check_json scans object keys ───────────────────────────────
+    // ── check_json scans object keys ─────────────────────────────────────────
 
     #[test]
     fn check_json_blocks_secret_in_object_key() {
@@ -2494,8 +2400,8 @@ mod tests {
 
     #[test]
     fn mask_secrets_redacts_shapes_the_old_mirror_regex_missed() {
-        // These are exactly the detectors the session mirror's local regex did
-        // NOT cover — the Critical finding driving the move to this shared masker.
+        // These are exactly the detectors the session mirror's previous local
+        // regex did NOT cover, which is why it now shares this masker.
         let cases = [
             "key: sk-proj-FAKEKEY00000000000000000000000000000000", // gitleaks:allow
             "cred ASIAFAKEKEY00000000000",                          // gitleaks:allow
@@ -2568,11 +2474,9 @@ mod tests {
 
     #[test]
     fn github_app_token_families_are_masked() {
-        // review #368 round-2 [Critical]: ghu_ (user-to-server), ghs_
-        // (server-to-server), and ghr_ (refresh) GitHub App tokens are real
-        // credential families that previously bypassed the prefix detector and
-        // leaked through the mirror. They are context-free — no trigger word
-        // needed.
+        // ghu_ (user-to-server), ghs_ (server-to-server), and ghr_ (refresh)
+        // GitHub App tokens are real credential families. They are
+        // context-free: no trigger word needed.
         let cases = [
             "ghu_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", // gitleaks:allow
             "ghs_BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",  // gitleaks:allow
@@ -2598,7 +2502,7 @@ mod tests {
 
     #[test]
     fn mask_secrets_redacts_entropy_token_whose_trigger_is_left_of_earlier_secret() {
-        // review #368 round-2 [Critical]: the entropy detector only fires near a
+        // The entropy detector only fires near a
         // trigger word. When the trigger (`api_key`) sits to the LEFT of an
         // earlier known-prefix secret (`ghp_…`), a masker that rescans only the
         // suffix after each redaction loses that context and leaks the later
@@ -2628,26 +2532,19 @@ mod tests {
 
     // ── Structured-identifier exemption: file paths / branch names ──────────
     //
-    // Root cause (production false positives, 2026-07-01): the entropy
-    // heuristic tokenizes on whitespace, so a full file path is one long
-    // token; trigger detection is substring-based, so "auth"/"key" match
-    // inside ordinary words; and mixed-case+digit+punctuation paths
-    // legitimately exceed the Shannon-entropy threshold. The exemption
-    // originally applied in trigger context too, but round-4 (see the module
-    // doc comment) dropped it there entirely — no sound signal separates a
-    // real path from an attacker-chopped/padded credential once Shannon
-    // entropy is the only measure and the attacker controls run boundaries.
-    // The three cases below are accepted false positives post round-4: their
-    // own full-token entropy exceeds ENTROPY_THRESHOLD, so they now block
-    // near a trigger word (see `accepted_false_positive_*` for the
-    // authoritative "must block" assertions; kept here renamed to document
-    // the flip rather than silently deleted).
+    // The entropy heuristic tokenizes on whitespace, so a full file path is
+    // one long token, and mixed-case+digit+punctuation paths can legitimately
+    // exceed the Shannon-entropy threshold. The structured-identifier
+    // exemption does not apply in trigger context (see the module doc): no
+    // sound signal separates a real path from an attacker-chopped/padded
+    // credential once Shannon entropy is the only measure and the attacker
+    // controls run boundaries. The three cases below are accepted false
+    // positives: their own full-token entropy exceeds ENTROPY_THRESHOLD, so
+    // they block near a trigger word.
 
     #[test]
     fn blocks_file_path_near_secret_word_accepted_fp_round4() {
-        // Was `allows_file_path_near_secret_word` pre round-4 (structured-
-        // identifier exemption applied in trigger context). Full-token
-        // entropy 4.5994 > ENTROPY_THRESHOLD (4.5) — now an accepted FP.
+        // Full-token entropy 4.5994 > ENTROPY_THRESHOLD (4.5).
         let content =
             "workspace path fable-ops/ADR-DRAFT-adr079-slices234.md for the secret gate bug";
         assert!(
@@ -2660,8 +2557,7 @@ mod tests {
 
     #[test]
     fn blocks_workspace_path_near_key_word_accepted_fp_round4() {
-        // Was `allows_workspace_path_near_key_word` pre round-4. Full-token
-        // entropy 4.7938 > 4.5 — now an accepted FP.
+        // Full-token entropy 4.7938 > 4.5.
         let content = "key: see internal/workspaces/20260701/adr079-slices234/PACKET.md";
         assert!(
             check(content).is_err(),
@@ -2673,8 +2569,7 @@ mod tests {
 
     #[test]
     fn blocks_short_run_path_near_auth_word_accepted_fp_round4() {
-        // Was `allows_short_run_path_near_auth_word` pre round-4. Full-token
-        // entropy 4.5955 > 4.5 — now an accepted FP.
+        // Full-token entropy 4.5955 > 4.5.
         let content =
             "auth work saved at internal/workspaces/20260701/cloud-rebuild/R1-repo-audit.md";
         assert!(
@@ -2792,31 +2687,27 @@ mod tests {
         assert!(!is_structured_identifier(&token));
     }
 
-    // ── Round-4 decision: drop the structured-identifier exemption entirely
-    //    in trigger context (internal review round 3 Critical) ─────────────────────────
+    // ── Structured-identifier exemption drops entirely in trigger context ───
     //
-    // Two narrower fixes were tried in trigger context and both defeated:
-    //   round 1: required a trailing file-extension run       -> bypassed by
-    //            appending `.md`/`.rs` to any random credential (round-2).
-    //   round 2: required >= 2 path-shaped runs AND average
-    //            per-run letters-only entropy below a threshold -> bypassed
-    //            by padding with extra short/digit runs (dilutes the mean) or
-    //            by splitting the credential itself into short runs (drives
-    //            every run's own entropy toward its length ceiling,
-    //            log2(run_len), which real short path words already sit at)
-    //            (round-3).
-    // Root cause: Shannon entropy over an attacker-chosen run boundary cannot
+    // Narrower fixes that keep some exemption alive in trigger context (e.g.
+    // requiring a trailing file-extension run, or requiring >= 2 path-shaped
+    // runs with a low average per-run letters-only entropy) are all
+    // attacker-defeatable: a random credential can be extension-suffixed, or
+    // split/padded into short runs that drive each run's own entropy toward
+    // its length ceiling (log2(run_len)), which real short path words already
+    // sit at. Shannon entropy over an attacker-chosen run boundary cannot
     // distinguish "distinct letters that spell an English word" from
     // "distinct letters chosen adversarially" — both hit the same
-    // log2(length) ceiling. No aggregation is sound. The exemption is now
-    // dropped unconditionally in trigger context: a structured-identifier
-    // shaped token near a trigger word is entropy-checked like any other
-    // token, with 3 known false positives accepted (see
-    // `accepted_false_positive_*` below).
+    // log2(length) ceiling, so no aggregation is sound. The exemption is
+    // therefore dropped unconditionally in trigger context: a
+    // structured-identifier-shaped token near a trigger word is
+    // entropy-checked like any other token, with 3 known false positives
+    // accepted (see `accepted_false_positive_*` below).
 
     #[test]
     fn blocks_separator_secret_access_key_bypass() {
-        // The exact bypass string from the round-1 Critical finding.
+        // Adversarial bypass shape: an AWS-secret-key-like value split into
+        // separator-delimited word-shaped runs to dodge the entropy check.
         let content = "secret_access_key abcdefghij/klmnopqrst/uvwxyzabcd/efghijk";
         assert!(
             check(content).is_err(),
@@ -2862,8 +2753,8 @@ mod tests {
 
     #[test]
     fn blocks_extension_suffix_bypass_secret_access_key() {
-        // The round-1 bypass string with `.md` appended — this is what
-        // slipped through the round-1 extension-based exemption.
+        // A file-extension check alone would exempt this: appending `.md`
+        // to a random credential must not bypass detection.
         let content = "secret_access_key abcdefghij/klmnopqrst/uvwxyzabcd/efghijk.md";
         assert!(
             check(content).is_err(),
@@ -2914,12 +2805,10 @@ mod tests {
 
     #[test]
     fn blocks_round3_padding_run_bypass_attempts() {
-        // internal review round 3 Critical repro: a low-entropy padding run (`aaaa`)
-        // inserted before short/digit-shaped runs used to drag the round-2
-        // AVERAGE per-run letters-only entropy below its threshold while
-        // `has_low_entropy_run_signal` was satisfied by the trailing
-        // `R1`/extension runs. With the exemption dropped entirely, these
-        // must be blocked purely on full-token entropy, same as any other
+        // A low-entropy padding run (`aaaa`) inserted before short/digit-shaped
+        // runs would drag any AVERAGE per-run entropy signal below its
+        // threshold. With the exemption dropped entirely, these must be
+        // blocked purely on full-token entropy, same as any other
         // near-trigger high-entropy token.
         let cases = [
             "secret_access_key abcdefghij/klmnopqrst/uvwxyzabcd/efghijk/aaaa/R1.md",
@@ -2938,14 +2827,12 @@ mod tests {
 
     #[test]
     fn blocks_run_splitting_bypass_attempts() {
-        // A further adversarial construction found while stress-testing the
-        // round-3 fix, proving the general
-        // unsoundness): splitting a credential into short (4-6 char) runs
-        // drives EVERY run's own letters-only entropy toward log2(run_len),
-        // which ordinary short English path words already sit at or near —
-        // this is exactly why round 3 (and any per-run entropy ceiling) is
-        // unfixable. With the exemption dropped, these are blocked on
-        // full-token entropy regardless of run shape.
+        // Splitting a credential into short (4-6 char) runs drives EVERY
+        // run's own letters-only entropy toward log2(run_len), which ordinary
+        // short English path words already sit at or near: this is exactly
+        // why any per-run entropy ceiling is unsound as an exemption signal.
+        // With the exemption dropped, these are blocked on full-token entropy
+        // regardless of run shape.
         let cases = [
             "secret_access_key abcd/efgh/ijkl/mnop/qrst/uvwx/yzab/cdef.md",
             "secret_access_key abcde/fghij/klmno/pqrst/uvwxy/zabcd.md",
@@ -2986,14 +2873,13 @@ mod tests {
 
     #[test]
     fn accepted_false_positive_adr_draft_path_near_trigger() {
-        // Round-4 accepted tradeoff: this path's full-token Shannon entropy
-        // (4.5994) exceeds ENTROPY_THRESHOLD (4.5) on its own. With the
+        // Accepted tradeoff: this path's full-token Shannon entropy (4.5994)
+        // exceeds ENTROPY_THRESHOLD (4.5) on its own. With the
         // structured-identifier exemption dropped in trigger context, it is
-        // now blocked near an explicit credential trigger word. This is a
-        // deliberate, documented false positive — not a regression to fix —
-        // per the round-4 decision that no sound signal exists to
-        // distinguish this from a chopped/padded credential of the same
-        // shape.
+        // blocked near an explicit credential trigger word: a deliberate,
+        // documented false positive, not a regression to fix, since no sound
+        // signal exists to distinguish this from a chopped/padded credential
+        // of the same shape.
         let content = "api_key handling in fable-ops/ADR-DRAFT-adr079-slices234.md";
         assert!(
             check(content).is_err(),
@@ -3087,17 +2973,14 @@ mod tests {
 
     #[test]
     fn allows_internal_area_id_uuid_near_auth_substring_round5() {
-        // Was `accepted_false_positive_internal_area_id_uuid_near_auth_substring`
-        // pre round-5 (measured corpus regression, 1 of ~19,300 real notes/docs
-        // replayed): an internal task `area_id` UUID field sitting within the
-        // trigger window of the SUBSTRING "auth" inside
-        // `authorized_write_requires_dominance` — not a genuine mention of the
-        // word "auth" at all, a pure substring collision with "authorized".
-        // Round-5 (see the module doc and `contains_bounded_word`) requires
-        // bare trigger words to match at a word boundary; `auth` no longer
-        // matches inside `authorized`, so this UUID has no trigger in its
-        // window and passes via the ordinary out-of-context UUID allowlist.
-        // This is the fix for issue #577's root cause, not a new tradeoff.
+        // An internal task `area_id` UUID field sitting within the trigger
+        // window of the SUBSTRING "auth" inside
+        // `authorized_write_requires_dominance` is not a genuine mention of
+        // the word "auth": it is a pure substring collision with
+        // "authorized". Bare trigger words match at a word boundary (see
+        // `contains_bounded_word`), so `auth` does not match inside
+        // `authorized`; this UUID has no trigger in its window and passes via
+        // the ordinary out-of-context UUID allowlist.
         let content = "area_id: cfcea31d-6f50-4fd1-ad6d-5f160de1694c\n\n## Problem\nReduce Lion microkernel axioms. Converted authorized_write_requires_dominance from axiom to theorem.";
         assert!(
             check(content).is_ok(),
@@ -3296,12 +3179,12 @@ mod tests {
 
     #[test]
     fn allows_benign_url_with_scheme_and_path_separators() {
-        // Adversarial self-check (internal review round 8 guidance): any-suffix
-        // semantics must not newly block ordinary URLs, whose `://` and
-        // `/` characters produce several suffix candidates but none of
-        // them are UUID- or content-hash-shaped. Placed near a real
-        // trigger word ("key") so the check actually exercises the
-        // trigger-context path rather than being skipped outright.
+        // `value_candidates`'s any-suffix semantics must not block ordinary
+        // URLs, whose `://` and `/` characters produce several suffix
+        // candidates but none of them are UUID- or content-hash-shaped.
+        // Placed near a real trigger word ("key") so the check actually
+        // exercises the trigger-context path rather than being skipped
+        // outright.
         let content = "api_key endpoint=https://example.test/resource/for/testing";
         assert!(
             check(content).is_ok(),
@@ -3310,7 +3193,7 @@ mod tests {
         );
     }
 
-    // ── Round 5 (issues #632 / #577): trigger word-boundary matching ────────
+    // ── Trigger word-boundary matching ──────────────────────────────────────
 
     #[test]
     fn allows_authorized_and_authentication_prose_near_uuid() {
@@ -3352,8 +3235,8 @@ mod tests {
 
     #[test]
     fn blocks_standalone_auth_and_key_words_unchanged_by_round5() {
-        // Round 5 only removes SUBSTRING collisions; a genuine standalone
-        // trigger word must still dominate exactly as before.
+        // Word-boundary matching only removes SUBSTRING collisions; a genuine
+        // standalone trigger word must still dominate exactly as before.
         let opaque = "Xk9mZ2vQpLrT8nJwYuAeHfBsDcGiONvMabcdef"; // gitleaks:allow
         let cases = [
             format!("auth header {opaque}"),
@@ -3372,14 +3255,13 @@ mod tests {
 
     #[test]
     fn accepted_false_positive_workspace_artifact_path_near_standalone_secret_round5() {
-        // Repro shape from issue #632: a dot-prefixed root + date segment +
-        // hyphenated topic dir + SCREAMING_SNAKE filename, discussed in
-        // prose that genuinely (not by substring collision) mentions
-        // "secret". Round 5 does not change this: `secret` here is a real
+        // A dot-prefixed root + date segment + hyphenated topic dir +
+        // SCREAMING_SNAKE filename, discussed in prose that genuinely (not by
+        // substring collision) mentions "secret". `secret` here is a real
         // standalone word, not a substring collision, so it still dominates
         // and the path still falls through to the entropy heuristic like any
-        // other near-trigger token. Documented as a still-accepted tradeoff,
-        // not a regression.
+        // other near-trigger token. A documented accepted tradeoff, not a
+        // regression.
         let content = "writing up the secret gate false positive repro: \
              .workspace/20260101/fix-secret-gate-trigger-false-positive/MEASUREMENT_REPORT.md";
         assert!(
@@ -3392,8 +3274,8 @@ mod tests {
 
     #[test]
     fn accepted_false_positive_archive_doc_path_near_standalone_secret_round5() {
-        // Repro shape from issue #577 case 1: a docs/_archive-style path
-        // discussed near a genuine standalone "secret" mention.
+        // An archive-style doc path discussed near a genuine standalone
+        // "secret" mention.
         let content =
             "secret scanner archive notes: docs/_archive/ADR051-TenantEncryption-v2Notes.md";
         assert!(
@@ -3406,9 +3288,9 @@ mod tests {
 
     #[test]
     fn accepted_false_positive_absolute_path_near_standalone_auth_round5() {
-        // Repro shape from issue #577 case 3: an absolute path written as one
-        // unbroken token, with the surrounding message genuinely (not via
-        // substring collision) discussing "auth".
+        // An absolute path written as one unbroken token, with the
+        // surrounding message genuinely (not via substring collision)
+        // discussing "auth".
         let content = "the auth scanner flagged this file: /home/user/projects/workspace/SessionNotes20260107/AuthGateFollowup2.md";
         assert!(
             check(content).is_err(),
@@ -3420,14 +3302,13 @@ mod tests {
 
     #[test]
     fn blocks_assignment_shaped_credential_disguised_as_path_near_api_key() {
-        // Adversarial negative (must NOT be newly exempted by round 5): a
-        // credential-shaped value glued via '=' directly to a trigger word,
-        // even though it is path-shaped (separator-delimited, word-shaped
-        // runs) and looks superficially like the accepted-FP repro paths
-        // above. The compound entry `api_key` is unaffected by the
-        // word-boundary change (still a plain substring match), and the
-        // structured-identifier exemption is still unconditionally dropped in
-        // trigger context (round 4), so this must still block.
+        // Adversarial negative: a credential-shaped value glued via '='
+        // directly to a trigger word must not be exempted just because it is
+        // path-shaped (separator-delimited, word-shaped runs) and looks
+        // superficially like the accepted-FP repro paths above. The compound
+        // entry `api_key` is a plain substring match regardless of
+        // word-boundary rules, and the structured-identifier exemption is
+        // unconditionally dropped in trigger context, so this must block.
         let content = "api_key=/home/user/workspaces/2026/topic-name-example/SECRET_VALUE_HERE.md";
         assert!(
             check(content).is_err(),
@@ -3439,15 +3320,15 @@ mod tests {
 
     #[test]
     fn blocks_secret_access_key_bypass_compound_entry_unaffected_by_round5() {
-        // Adversarial negative: the round-1/3 bypass must still be blocked
-        // post round-5b. It now fires via TWO independent paths: the
-        // compound `access_key` entry (`COMPOUND_TRIGGER_WORDS`, plain
-        // substring, always matched regardless of word-boundary rules), AND
-        // the bare `secret` entry, because round-5b treats underscore as a
-        // BOUNDARY for bare `TRIGGER_WORDS` — so `secret` in
-        // `secret_access_key` is itself a bounded word (bounded by the
-        // following `_`), not merely a substring collision. Either path
-        // alone is sufficient; this asserts the end-to-end outcome.
+        // Adversarial negative: a separator-split bypass shape must still be
+        // blocked. It fires via TWO independent paths: the compound
+        // `access_key` entry (`COMPOUND_TRIGGER_WORDS`, plain substring,
+        // always matched regardless of word-boundary rules), AND the bare
+        // `secret` entry, because underscore is a BOUNDARY for bare
+        // `TRIGGER_WORDS`: so `secret` in `secret_access_key` is itself a
+        // bounded word (bounded by the following `_`), not merely a
+        // substring collision. Either path alone is sufficient; this asserts
+        // the end-to-end outcome.
         let content = "secret_access_key abcdefghij/klmnopqrst/uvwxyzabcd/efghijk.md";
         assert!(
             check(content).is_err(),
@@ -3457,28 +3338,26 @@ mod tests {
         );
     }
 
-    // ── Round 5b (recall regression vs main): underscore is a BOUNDARY for
-    //    bare TRIGGER_WORDS, not a continuation ─────────────────────────────
+    // ── Underscore is a BOUNDARY for bare TRIGGER_WORDS, not a continuation ─
     //
-    // Round 5 (above) made bare TRIGGER_WORDS word-boundary-aware but treated
-    // underscore as a word character (continuation), matching
-    // `has_standalone_token`'s existing rule for `token`. That was wrong for
-    // the bare credential words: it silently dropped detection of extremely
-    // common underscore-joined credential-config compounds that main caught
-    // via plain substring (`SECRET_KEY=`, `auth_token=`, `signing_key=`,
-    // `session_secret_...`), because `secret`/`key`/`auth` were never bounded
-    // by `_` under that rule. Fixed by treating `_` as a boundary for the
-    // bare `TRIGGER_WORDS` check specifically (see `contains_word`'s
+    // Bare TRIGGER_WORDS are word-boundary-aware, but underscore must be
+    // treated as a boundary rather than a word character (continuation) for
+    // this set specifically: the opposite of `has_standalone_token`'s rule
+    // for `token`. Treating underscore as a continuation would silently drop
+    // detection of extremely common underscore-joined credential-config
+    // compounds (`SECRET_KEY=`, `auth_token=`, `signing_key=`,
+    // `session_secret_...`), since `secret`/`key`/`auth` would never be
+    // bounded by `_` under that rule. Fixed by treating `_` as a boundary for
+    // the bare `TRIGGER_WORDS` check specifically (see `contains_word`'s
     // `underscore_is_word_char` parameter), while leaving
     // `has_standalone_token`'s `token`-specific underscore-as-continuation
     // rule (the `tokenizer`/`next_token`/`token_count` exemption) unchanged.
 
     #[test]
     fn blocks_django_style_secret_key_assignment_round5b() {
-        // Regression found in PR review: on main, `SECRET_KEY=<value>` blocks
-        // via the plain-substring `secret` trigger. Round 5's word-boundary
-        // change (with underscore as a continuation) silently dropped this,
-        // since `secret` is followed by `_`, not a boundary under that rule.
+        // `SECRET_KEY=<value>` must block via the plain-substring `secret`
+        // trigger even though `secret` is followed by `_` rather than a
+        // non-word-char boundary.
         let content = "SECRET_KEY=dGhpc2lzYXNlY3JldGtleXZhbHVlMTIzNDU2Nzg5MA=="; // gitleaks:allow
         assert!(
             check(content).is_err(),
@@ -3518,9 +3397,9 @@ mod tests {
 
     #[test]
     fn allows_authorized_authentication_keyword_prose_unaffected_by_round5b() {
-        // The round-5 win (letter-joined substring collisions) must survive
-        // round-5b's underscore-as-boundary change, since that change only
-        // affects the underscore character, not letter-joined words.
+        // The letter-joined substring-collision exemption must survive the
+        // underscore-as-boundary change, since that change only affects the
+        // underscore character, not letter-joined words.
         let cases = [
             "authorized_write_requires_dominance was converted from axiom to theorem, id 550e8400-e29b-41d4-a716-446655440000",
             "authentication flow diagram lives at 550e8400-e29b-41d4-a716-446655440000",
@@ -3565,7 +3444,7 @@ mod tests {
 //
 // Measures how many real note/entity strings the gate blocks, so a detector
 // change can be evaluated against production content rather than intuition
-// (see the module doc and issues #632 / #577). Opens the target database
+// (see the module doc). Opens the target database
 // STRICTLY read-only (`SQLITE_OPEN_READ_ONLY`) and never mutates it. Point
 // `KHIVE_REPLAY_DB` at a copy or a live KG database file path; the harness
 // never writes, locks aggressively, or deletes anything.

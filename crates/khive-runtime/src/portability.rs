@@ -62,7 +62,7 @@ pub struct ExportedEdge {
     pub edge_id: Uuid,
     pub source: Uuid,
     pub target: Uuid,
-    /// One of the 15 canonical edge relations.
+    /// One of the canonical edge relations (closed enum).
     pub relation: EdgeRelation,
     pub weight: f64,
 }
@@ -91,7 +91,6 @@ impl KhiveRuntime {
     pub async fn export_kg(&self, token: &NamespaceToken) -> RuntimeResult<KgArchive> {
         let ns = token.namespace().as_str().to_owned();
 
-        // 1. Collect all entities in the namespace.
         let entity_page = self
             .entities(token)?
             .query_entities(
@@ -126,7 +125,6 @@ impl KhiveRuntime {
             })
             .collect();
 
-        // 2. Collect edges whose source is any entity in this namespace.
         let source_ids: Vec<Uuid> = entities.iter().map(|e| e.id).collect();
         let edges = if source_ids.is_empty() {
             Vec::new()
@@ -191,7 +189,6 @@ impl KhiveRuntime {
         archive: &KgArchive,
         token: &NamespaceToken,
     ) -> RuntimeResult<ImportSummary> {
-        // Format validation.
         if archive.format != "khive-kg" {
             return Err(RuntimeError::InvalidInput(format!(
                 "unsupported archive format {:?}; expected \"khive-kg\"",
@@ -207,7 +204,6 @@ impl KhiveRuntime {
 
         let ns = token.namespace().as_str().to_owned();
 
-        // Import entities — validate kind against pack registry.
         let store = self.entities(token)?;
         let mut entities_imported = 0usize;
         for ee in &archive.entities {
@@ -230,19 +226,14 @@ impl KhiveRuntime {
                 merge_event_id: None,
             };
             store.upsert_entity(entity.clone()).await?;
-            // Index into FTS5 (and vector store if a model is configured) so that
-            // imported entities are visible to hybrid_search immediately.
+            // Reindex so imported entities are searchable via hybrid_search immediately.
             self.reindex_entity(token, &entity).await?;
             entities_imported += 1;
         }
 
-        // Import edges — validate both endpoints before inserting.
-        //
-        // An untrusted archive may contain edges whose source or target UUIDs
-        // do not correspond to any entity in the target namespace. Inserting
-        // such edges would leave dangling references in the graph store. We
-        // therefore check each endpoint with `get_entity` (namespace-scoped,
-        // fail-closed) and skip any edge whose source or target is absent.
+        // Untrusted archives may reference entities absent from the target namespace;
+        // check both endpoints and skip edges with a missing source or target to avoid
+        // dangling references in the graph store.
         let graph = self.graph(token)?;
         let mut edges_imported = 0usize;
         let mut edges_skipped = 0usize;
@@ -317,9 +308,8 @@ impl KhiveRuntime {
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
-// INLINE TEST JUSTIFICATION: tests here exercise portability serialisation
-// helpers and byte-level round-trip invariants that access private encoding
-// functions. Moving them to tests/ would require pub-exporting those helpers.
+// Kept inline: these tests exercise round-trip invariants over private encoding
+// helpers that would otherwise need to be made pub to test from tests/.
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -390,7 +380,6 @@ mod tests {
         assert_eq!(summary.entities_imported, 3);
         assert_eq!(summary.edges_imported, 2);
 
-        // Spot-check: the imported entity is retrievable.
         let got = dst.get_entity(&tok, e1.id).await.unwrap();
         assert_eq!(got.name, "FlashAttention");
         assert_eq!(got.description.as_deref(), Some("fast attention"));
@@ -451,21 +440,17 @@ mod tests {
         let archive = src.export_kg(&tok_a).await.unwrap();
         assert_eq!(archive.namespace, "a");
 
-        // Import into a fresh runtime, targeting namespace "b".
         let dst = make_rt().await;
         let summary = dst.import_kg(&archive, &tok_b).await.unwrap();
         assert_eq!(summary.entities_imported, 1);
 
-        // Entity is in "b" on the destination runtime.
         let in_b = dst.list_entities(&tok_b, None, None, 100, 0).await.unwrap();
         assert_eq!(in_b.len(), 1);
         assert_eq!(in_b[0].name, "Sinkhorn");
 
-        // Namespace "a" on the source runtime is unchanged.
         let in_a = src.list_entities(&tok_a, None, None, 100, 0).await.unwrap();
         assert_eq!(in_a.len(), 1);
 
-        // Namespace "a" on the destination runtime has nothing (only "b" was written).
         let dst_a = dst.list_entities(&tok_a, None, None, 100, 0).await.unwrap();
         assert_eq!(dst_a.len(), 0);
     }
@@ -532,7 +517,7 @@ mod tests {
         );
     }
 
-    // ── Dangling-edge validation tests (issue #28) ────────────────────────────
+    // ── Dangling-edge validation tests ────────────────────────────────────────
 
     /// 6. Edge with dangling source (source UUID not in entity table) is skipped.
     ///
@@ -544,13 +529,11 @@ mod tests {
 
         let rt = make_rt().await;
         let tok = NamespaceToken::local();
-        // Create an entity that will be the real target.
         let real = rt
             .create_entity(&tok, "concept", None, "Real", None, None, vec![])
             .await
             .unwrap();
 
-        // Build archive manually: one real entity, one edge with phantom source.
         let archive = KgArchive {
             format: "khive-kg".to_string(),
             version: "0.1".to_string(),
@@ -665,7 +648,6 @@ mod tests {
             .await
             .unwrap();
 
-        // Build archive with 3 entities and 3 edges: 2 valid, 1 dangling.
         let archive = KgArchive {
             format: "khive-kg".to_string(),
             version: "0.1".to_string(),
@@ -707,7 +689,6 @@ mod tests {
                 },
             ],
             edges: vec![
-                // Valid: A → B
                 ExportedEdge {
                     edge_id: Uuid::new_v4(),
                     source: a.id,
@@ -715,7 +696,6 @@ mod tests {
                     relation: EdgeRelation::Extends,
                     weight: 1.0,
                 },
-                // Valid: B → C
                 ExportedEdge {
                     edge_id: Uuid::new_v4(),
                     source: b.id,
@@ -723,7 +703,6 @@ mod tests {
                     relation: EdgeRelation::DependsOn,
                     weight: 0.9,
                 },
-                // Dangling: A → phantom
                 ExportedEdge {
                     edge_id: Uuid::new_v4(),
                     source: a.id,
@@ -826,7 +805,6 @@ mod tests {
         let dst = make_rt().await;
         dst.import_kg(&archive, &tok).await.unwrap();
 
-        // The imported edge must carry the same UUID as the original.
         let imported_edge = dst.get_edge(&tok, original_id).await.unwrap();
         assert!(
             imported_edge.is_some(),
@@ -846,7 +824,6 @@ mod tests {
     ///     The fixture includes two entities so the edge is not skipped during import.
     #[tokio::test]
     async fn old_archive_missing_edge_id_round_trips() {
-        // Two entity UUIDs that will appear in both the fixture and the entity list.
         let src_id = Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap();
         let tgt_id = Uuid::parse_str("00000000-0000-0000-0000-000000000002").unwrap();
 
@@ -872,7 +849,7 @@ mod tests {
             }}"#
         );
 
-        // Deserialize: serde(default) must assign a non-nil UUID.
+        // serde(default) must assign a fresh non-nil UUID when edge_id is absent.
         let archive: KgArchive = serde_json::from_str(&json)
             .expect("old archive without edge_id must deserialize successfully");
         assert_eq!(archive.edges.len(), 1);
@@ -883,7 +860,6 @@ mod tests {
             "missing edge_id in old archive must get a fresh non-nil UUID"
         );
 
-        // Import into a fresh runtime and verify the generated ID is persisted.
         let rt = make_rt().await;
         let tok = NamespaceToken::local();
         let summary = rt.import_kg(&archive, &tok).await.unwrap();
@@ -904,7 +880,6 @@ mod tests {
             "stored edge id must equal the generated edge_id"
         );
 
-        // Re-export and verify the same UUID appears in the archive.
         let re_archive = rt.export_kg(&tok).await.unwrap();
         assert_eq!(re_archive.edges.len(), 1);
         assert_eq!(
@@ -919,7 +894,6 @@ mod tests {
     ///     Verifies by (source, target, relation) key that re-export emits the original ID.
     #[tokio::test]
     async fn export_import_export_edge_id_equality() {
-        // Build a graph on the source runtime.
         let src = make_rt().await;
         let tok = NamespaceToken::local();
         let a = src
@@ -936,7 +910,6 @@ mod tests {
             .unwrap();
         let original_edge_id: Uuid = stored.id.into();
 
-        // First export.
         let archive1 = src.export_kg(&tok).await.unwrap();
         assert_eq!(archive1.edges.len(), 1);
         assert_eq!(
@@ -944,15 +917,12 @@ mod tests {
             "first export must carry the stored edge_id"
         );
 
-        // Import into a fresh runtime.
         let dst = make_rt().await;
         dst.import_kg(&archive1, &tok).await.unwrap();
 
-        // Second export from the destination runtime.
         let archive2 = dst.export_kg(&tok).await.unwrap();
         assert_eq!(archive2.edges.len(), 1);
 
-        // Find the edge by (source, target, relation) and assert the ID is unchanged.
         let re_edge = archive2
             .edges
             .iter()

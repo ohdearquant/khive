@@ -47,8 +47,7 @@ pub struct ReferenceCandidate {
 }
 
 /// Outcome of `resolve_reference`. Never a silent pick among close
-/// candidates (F7 of the unified-verb draft ADR) — `Ambiguous` always lists
-/// what it found instead of guessing.
+/// candidates: `Ambiguous` always lists what it found instead of guessing.
 #[derive(Clone, Debug, PartialEq)]
 pub enum ReferenceResolution {
     Resolved { id: Uuid, confidence: f64 },
@@ -61,12 +60,11 @@ const RING_EXACT_CONFIDENCE: f64 = 0.95;
 /// Ring-match confidence for a substring match (either direction).
 const RING_SUBSTRING_CONFIDENCE: f64 = 0.7;
 /// A single ring candidate auto-resolves only at or above this bar; below
-/// it, the sole candidate is still surfaced, just as `Ambiguous` (never
-/// silently accepted, never silently dropped — see F7). Ring-stage only:
-/// ring scores are fixed constants on this same 0..1 scale
-/// (`RING_EXACT_CONFIDENCE` / `RING_SUBSTRING_CONFIDENCE`), so comparing them
-/// against a fixed bar is meaningful. The search stage below uses its own,
-/// deliberately separate rule — see `SEARCH_RESOLVED_CONFIDENCE`.
+/// it the candidate is still surfaced as `Ambiguous` rather than silently
+/// accepted or dropped. Ring scores are fixed constants on a 0..1 scale, so
+/// a fixed bar is meaningful here: the search stage below needs a
+/// different rule (`SEARCH_RESOLVED_CONFIDENCE`) because RRF scores aren't
+/// on that scale.
 const RING_AUTO_RESOLVE_CONFIDENCE: f64 = 0.7;
 /// Confidence for a stage-3 exact-name storage match: a deterministic,
 /// case-sensitive equality on `entities.name` — stronger evidence than the
@@ -83,18 +81,12 @@ const EXACT_NAME_CONFIDENCE: f64 = 0.98;
 const SEARCH_MARGIN_RATIO: f64 = 2.0;
 /// Hybrid-search hits below this score never enter the candidate set at all.
 const SEARCH_SCORE_FLOOR: f64 = 0.0;
-/// Confidence reported on a search-stage `Resolved` outcome. NOT the raw RRF
-/// score — RRF is `sum 1/(k + rank)` (`khive-fusion::rrf`), so a rank-1
-/// single-source hit scores ~1/61 (~0.0164) and a strong two-source hit
-/// ~2/61 (~0.0328): comparing that against a 0..1 "confidence" bar the way
-/// the ring stage does would make the search fallback functionally never
-/// resolve (the bug this constant fixes). Instead, a lone hybrid-search
-/// candidate (nothing to be ambiguous against) or a decisive-margin winner
-/// (see `SEARCH_MARGIN_RATIO`) resolves at this fixed, documented
-/// search-stage confidence — deliberately below both ring bands, so callers
-/// can distinguish "the ring recognized this" from "search picked this out"
-/// by confidence alone. The raw RRF value is never discarded: it is exactly
-/// what `ReferenceCandidate.score` carries in `Ambiguous` listings.
+/// Confidence reported on a search-stage `Resolved` outcome: not the raw
+/// RRF score, which lives on a much smaller scale (`sum 1/(k + rank)`, e.g.
+/// ~0.016-0.033) and would never clear a 0..1 confidence bar. Fixed below
+/// both ring bands so callers can tell "the ring recognized this" from
+/// "search picked this out" by confidence alone; the raw RRF value is still
+/// preserved in `ReferenceCandidate.score` for `Ambiguous` listings.
 const SEARCH_RESOLVED_CONFIDENCE: f64 = 0.6;
 
 /// Resolve one natural-language reference for `token`'s actor.
@@ -118,20 +110,13 @@ pub async fn resolve_reference(
         return Ok(ReferenceResolution::NotFound);
     }
 
-    // Stage 1: id-string passthrough (UUID / 8+ hex prefix) — the existing
-    // by-ID path, never reimplemented. A ref shaped like an id but absent
-    // from storage is NotFound, not a fall-through to ring/search: the
-    // caller named a specific id, so a miss there is the true answer.
-    //
-    // Scope: entity ids only, both branches identically (review finding,
-    // 2026-07-09 fix round). `resolve_by_id` alone (entity + note) and
-    // `resolve_prefix_unfiltered` alone (entity + note + event + edge) used
-    // to disagree — a graph edge's full UUID returned `NotFound` while its
-    // short prefix resolved. The ring is entity-only by the same S1 contract
-    // (`reference_ring::substrate_admits_as_entity`), so id-string
-    // passthrough is narrowed to match: an edge or event id-string is
-    // `NotFound` here regardless of whether it arrived full or as a prefix.
-    // A caller that needs to resolve a non-entity id already has `get`.
+    // Stage 1: id-string passthrough (UUID / 8+ hex prefix) via the existing
+    // by-ID path. A ref shaped like an id but absent from storage is
+    // NotFound, not a fallthrough to ring/search: the caller named a
+    // specific id, so a miss there is the true answer. Scoped to entity ids
+    // only (both full-UUID and prefix forms) to match the ring's entity-only
+    // contract (`reference_ring::substrate_admits_as_entity`); a non-entity
+    // id-string is `NotFound` here: callers needing those already have `get`.
     if let Ok(uuid) = Uuid::from_str(trimmed) {
         return match runtime.resolve_by_id(token, uuid).await? {
             Some(Resolved::Entity(_)) => Ok(ReferenceResolution::Resolved {

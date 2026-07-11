@@ -213,7 +213,6 @@ impl DecayAwareSalienceObjective {
 impl Objective<NoteCandidate> for DecayAwareSalienceObjective {
     #[inline]
     fn score(&self, candidate: &NoteCandidate, _context: &ObjectiveContext) -> f64 {
-        // effective_salience = salience * exp(-decay_factor * age_days)
         candidate.salience * (-candidate.decay_factor * candidate.age_days).exp()
     }
 
@@ -256,9 +255,8 @@ impl AmplifiedDecayAwareSalienceObjective {
 impl Objective<NoteCandidate> for AmplifiedDecayAwareSalienceObjective {
     #[inline]
     fn score(&self, candidate: &NoteCandidate, _context: &ObjectiveContext) -> f64 {
-        // Use the pre-computed effective_salience which was produced by the caller
-        // via DecayModel::apply(). This respects all four DecayModel variants
-        // (Exponential, Hyperbolic, PowerLaw, None) instead of hardcoding exponential.
+        // effective_salience is pre-computed via the caller's DecayModel, so this
+        // works for all decay model variants, not just exponential.
         candidate.effective_salience.powf(self.alpha)
     }
 
@@ -312,7 +310,6 @@ impl Objective<NoteCandidate> for TemporalRecencyObjective {
 /// reranker was not run (key absent) — callers should gate on
 /// `RecallConfig.reranker_weights[name] > 0.0` before including this objective
 /// in a `WeightedObjective` composition.
-///
 pub struct RerankerObjective {
     /// Name of the reranker to look up in `candidate.rerank_scores`.
     pub reranker_name: String,
@@ -402,9 +399,8 @@ impl MemoryRecallPipeline {
 
 // ────────────────────────────────────────────────────────────────────────────
 
-// INLINE TEST JUSTIFICATION: tests here exercise the scoring math on internal
-// NoteCandidate fields (raw_score, salience, recency) that are not exported.
-// Moving them to tests/ would require pub-exporting those fields.
+// Kept inline: these tests exercise internal NoteCandidate fields that would
+// otherwise need to be made pub just to reach them from tests/.
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -437,7 +433,7 @@ mod tests {
         decay_factor: f64,
         age_days: f64,
     ) -> NoteCandidate {
-        // For tests, compute effective_salience using the default Exponential formula.
+        // Mirrors the caller-side DecayModel::apply() default (Exponential) for test data.
         let effective_salience = salience * (-decay_factor * age_days).exp();
         NoteCandidate {
             id: Uuid::new_v4(),
@@ -490,7 +486,6 @@ mod tests {
 
     #[test]
     fn graph_anchor_hit_scores_one() {
-        // d=0 → score = 1.0 − 0/max = 1.0
         let c = candidate(None, None, Some(0), None);
         let obj = GraphProximityObjective { max_distance: 3 };
         assert!((obj.score(&c, &ctx()) - 1.0).abs() < 1e-12);
@@ -498,7 +493,6 @@ mod tests {
 
     #[test]
     fn graph_midpoint_scores_half() {
-        // d=1, max=2 → score = 1.0 − 1/2 = 0.5
         let c = candidate(None, None, Some(1), None);
         let obj = GraphProximityObjective { max_distance: 2 };
         assert!((obj.score(&c, &ctx()) - 0.5).abs() < 1e-12);
@@ -506,7 +500,6 @@ mod tests {
 
     #[test]
     fn graph_at_boundary_scores_zero() {
-        // d == max_distance → score = 0.0 (boundary excluded)
         let c = candidate(None, None, Some(3), None);
         let obj = GraphProximityObjective { max_distance: 3 };
         assert_eq!(obj.score(&c, &ctx()), 0.0);
@@ -528,7 +521,7 @@ mod tests {
 
     #[test]
     fn graph_max_distance_zero_always_scores_zero() {
-        // max_distance=0 is degenerate; guard against divide-by-zero.
+        // Guards the divide-by-zero case: max_distance=0 must not panic.
         let c = candidate(None, None, Some(0), None);
         let obj = GraphProximityObjective { max_distance: 0 };
         assert_eq!(obj.score(&c, &ctx()), 0.0);
@@ -553,8 +546,6 @@ mod tests {
 
     #[test]
     fn weighted_composition_vector_and_text() {
-        // Candidate with vector=0.8, text=0.6
-        // Weighted(0.5*vector + 0.5*text) = 0.5*0.8 + 0.5*0.6 = 0.7
         let c = candidate(Some(0.8), Some(0.6), None, None);
 
         let obj = WeightedObjective::<RetrievalCandidate>::new()
@@ -562,15 +553,12 @@ mod tests {
             .add(Box::new(TextRelevanceObjective), 0.5);
 
         let score = obj.score(&c, &ctx());
-        // WeightedObjective divides by total weight (1.0), so result is 0.7
+        // Weights here already sum to 1.0, so normalization is a no-op.
         assert!((score - 0.7).abs() < 1e-12);
     }
 
     #[test]
     fn weighted_composition_with_graph() {
-        // vector=1.0, text=0.0, graph d=1/max=4 → proximity = 1 - 1/4 = 0.75
-        // weights: vector=0.4, text=0.3, graph=0.3
-        // weighted sum = (0.4*1.0 + 0.3*0.0 + 0.3*0.75) / 1.0 = 0.4 + 0.0 + 0.225 = 0.625
         let c = candidate(Some(1.0), Some(0.0), Some(1), None);
 
         let obj = WeightedObjective::<RetrievalCandidate>::new()
@@ -657,9 +645,8 @@ mod tests {
 
     #[test]
     fn decay_aware_uses_note_decay_factor_not_field() {
-        // uses the note's own decay_factor, not the objective's field
+        // Scoring uses the note's own decay_factor, not the objective's field.
         let obj = DecayAwareSalienceObjective::new(0.99); // obj.decay_rate ignored
-                                                          // Note's decay_factor = 0.01, age=100 days → exp(-0.01*100) ≈ 0.368
         let c = note_candidate(None, 1.0, 0.01, 100.0);
         let score = obj.score(&c, &ctx());
         let expected = (-0.01_f64 * 100.0).exp();
@@ -671,7 +658,6 @@ mod tests {
 
     #[test]
     fn decay_aware_high_decay_reduces_score_faster() {
-        // High decay note should score lower at same age
         let obj = DecayAwareSalienceObjective::new(0.0);
         let slow = note_candidate(None, 1.0, 0.001, 100.0);
         let fast = note_candidate(None, 1.0, 0.1, 100.0);
@@ -757,16 +743,14 @@ mod tests {
 
     #[test]
     fn memory_pipeline_weighted_composition() {
-        // Reproduce decay formula via WeightedObjective:
-        // score = rrf * 0.70 + salience_decayed * 0.20 + temporal * 0.10
-        // At age=0: salience_decayed = salience, temporal = 1.0
+        // Verifies WeightedObjective reproduces the same formula MemoryRecallPipeline builds.
         let c = NoteCandidate {
             id: Uuid::new_v4(),
             rrf_score: Some(0.5),
             salience: 0.8,
             decay_factor: 0.01,
             age_days: 0.0,
-            effective_salience: 0.8, // age=0, so effective_salience == salience
+            effective_salience: 0.8,
             rerank_scores: HashMap::new(),
         };
         let pipeline = WeightedObjective::<NoteCandidate>::new()
@@ -779,7 +763,6 @@ mod tests {
                 0.10,
             );
         let score = pipeline.score(&c, &ctx());
-        // (0.7*0.5 + 0.2*0.8 + 0.1*1.0) / 1.0 = 0.35 + 0.16 + 0.10 = 0.61
         assert!((score - 0.61).abs() < 1e-10, "got {score}");
     }
 }
