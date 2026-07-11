@@ -81,6 +81,101 @@ async fn finding_source_run(db: &Path, namespace: &str) -> String {
         .to_string()
 }
 
+/// Fetch every persisted `finding` note's `(finding_id, audit_status,
+/// kind_status)` triple in the given namespace, directly over sqlite (see
+/// `substrate_counts` for why): proves the mapper's output actually reached
+/// storage through the real CLI dispatch path, not just the in-tree mapper
+/// unit tests.
+async fn finding_status_pairs(db: &Path, namespace: &str) -> Vec<(String, String, String)> {
+    let backend = StorageBackend::sqlite_read_only(db).expect("open scratch db read-only");
+    let sql = backend.sql();
+    let mut reader = sql.reader().await.expect("reader");
+    let rows = reader
+        .query_all(SqlStatement {
+            sql: "SELECT properties FROM notes WHERE namespace = ?1 AND kind = 'finding' \
+                  AND deleted_at IS NULL"
+                .to_string(),
+            params: vec![SqlValue::Text(namespace.to_string())],
+            label: None,
+        })
+        .await
+        .expect("query finding notes");
+    rows.into_iter()
+        .map(|row| {
+            let properties = match row.get("properties") {
+                Some(SqlValue::Text(s)) => s.clone(),
+                other => panic!("unexpected properties column: {other:?}"),
+            };
+            let parsed: serde_json::Value =
+                serde_json::from_str(&properties).expect("properties must be valid JSON");
+            let finding_id = parsed["finding_id"]
+                .as_str()
+                .expect("finding note must carry finding_id")
+                .to_string();
+            let audit_status = parsed["audit_status"]
+                .as_str()
+                .expect("finding note must carry audit_status")
+                .to_string();
+            let kind_status = parsed["kind_status"]
+                .as_str()
+                .expect("finding note must carry kind_status")
+                .to_string();
+            (finding_id, audit_status, kind_status)
+        })
+        .collect()
+}
+
+fn write_three_status_findings(dir: &Path) -> std::path::PathBuf {
+    let path = dir.join("status_findings.json");
+    std::fs::write(
+        &path,
+        r#"{
+            "audit": {
+                "date": "2026-07-11",
+                "scope": "khive-pack-code",
+                "repo": "ohdearquant/khive",
+                "branch": "feat/adr085-code-ingest-admin",
+                "commit": "abc1234",
+                "standards_file": "docs/standards.md"
+            },
+            "findings": [
+                {
+                    "id": "F-STATUS-FIXED",
+                    "title": "A finding the producer marked fixed",
+                    "severity": "medium",
+                    "confidence": "high",
+                    "failure_scenario": "Reproduced by running kkernel code-ingest twice.",
+                    "evidence": "code_ingest_cli.rs status test, fixed case",
+                    "impact": "none, this is a test fixture",
+                    "status": "fixed"
+                },
+                {
+                    "id": "F-STATUS-FALSE-POSITIVE",
+                    "title": "A finding the producer marked false_positive",
+                    "severity": "low",
+                    "confidence": "medium",
+                    "failure_scenario": "Reproduced by running kkernel code-ingest twice.",
+                    "evidence": "code_ingest_cli.rs status test, false_positive case",
+                    "impact": "none, this is a test fixture",
+                    "status": "false_positive"
+                },
+                {
+                    "id": "F-STATUS-OPEN",
+                    "title": "A finding the producer left open",
+                    "severity": "high",
+                    "confidence": "high",
+                    "failure_scenario": "Reproduced by running kkernel code-ingest twice.",
+                    "evidence": "code_ingest_cli.rs status test, open case",
+                    "impact": "none, this is a test fixture",
+                    "status": "open"
+                }
+            ]
+        }"#,
+    )
+    .expect("write status findings.json fixture");
+    path
+}
+
 fn write_valid_findings(dir: &Path) -> std::path::PathBuf {
     let path = dir.join("findings.json");
     std::fs::write(
@@ -341,5 +436,64 @@ async fn db_namespace_and_source_run_reach_storage() {
         source_run, "explicit-source-run-marker",
         "--source-run must reach the persisted note's properties.source_run, under the \
          explicit --namespace"
+    );
+}
+
+/// (f) A three-finding sweep carrying producer `status` values `fixed`,
+/// `false_positive`, and `open` must land through the real CLI dispatch
+/// path with the governed `(audit_status, kind_status)` pairs persisted:
+/// `(fixed, resolved)`, `(false_positive, invalid)`, `(open, open)`. The
+/// mapper-level unit tests in `khive-pack-code/tests/integration.rs` cover
+/// the mapping itself; this covers the plumbing from that mapper's output
+/// through to storage over the actual compiled binary (round 2 Finding 2).
+#[tokio::test]
+async fn status_mapping_reaches_storage_through_cli_dispatch() {
+    let tmp = tempfile::TempDir::new().expect("temp dir");
+    let findings = write_three_status_findings(tmp.path());
+    let db = tmp.path().join("scratch.db");
+
+    let output = code_ingest(&[
+        findings.to_str().unwrap(),
+        "--db",
+        db.to_str().unwrap(),
+        "--source-run",
+        "status-mapping-cli-test",
+    ]);
+    assert!(
+        output.status.success(),
+        "ingest must succeed; stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("stdout must be valid JSON");
+    assert_eq!(report["notes_created"], serde_json::json!(3));
+
+    let mut pairs = finding_status_pairs(&db, "local").await;
+    pairs.sort();
+
+    let mut expected = vec![
+        (
+            "F-STATUS-FIXED".to_string(),
+            "fixed".to_string(),
+            "resolved".to_string(),
+        ),
+        (
+            "F-STATUS-FALSE-POSITIVE".to_string(),
+            "false_positive".to_string(),
+            "invalid".to_string(),
+        ),
+        (
+            "F-STATUS-OPEN".to_string(),
+            "open".to_string(),
+            "open".to_string(),
+        ),
+    ];
+    expected.sort();
+
+    assert_eq!(
+        pairs, expected,
+        "persisted (audit_status, kind_status) pairs must match the governed mapping for \
+         every producer status in the sweep"
     );
 }

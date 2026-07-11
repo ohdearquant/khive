@@ -362,11 +362,17 @@ fn preflight_secret_gate(batch: &CodeIngestBatch) -> Result<()> {
 /// thereby creating) a database purely to answer "does this id exist" would
 /// itself be the mutation the dry-run contract forbids.
 ///
-/// When the path exists, it is opened with [`StorageBackend::sqlite_read_only`]
-/// (rejects writes at the SQLite level, never creates a missing file) and
-/// existence is checked with raw `SELECT` statements over the reader
-/// connection — no migrations run and no embedding models are registered,
-/// unlike `KhiveRuntime::new`.
+/// When the path exists, existence is checked against a snapshot copy of
+/// it: `StorageBackend::sqlite_read_only`'s `SQLITE_OPEN_READ_ONLY` plus
+/// `PRAGMA query_only = ON` blocks logical writes, but SQLite still performs
+/// ordinary WAL shared-memory maintenance on open, which creates or updates
+/// the `-shm` sidecar next to whatever path it is pointed at. Opening the
+/// target path directly would therefore still touch it. Instead, the
+/// database file (and its `-wal` sidecar, if one exists — an existing WAL
+/// file holds uncheckpointed rows that a plain copy of the main db file
+/// alone would miss) are copied into a scratch temp directory first, and
+/// the read-only checks run against that copy. No migrations run and no
+/// embedding models are registered, unlike `KhiveRuntime::new`.
 async fn dry_run_report(
     db_path: Option<&Path>,
     batch: &CodeIngestBatch,
@@ -384,7 +390,7 @@ async fn dry_run_report(
         return Ok(report);
     };
 
-    let backend = StorageBackend::sqlite_read_only(db_path).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let (backend, _snapshot_dir) = open_read_only_snapshot(db_path)?;
     let sql = backend.sql();
     let mut reader = sql.reader().await.map_err(|e| anyhow::anyhow!("{e}"))?;
 
@@ -435,6 +441,40 @@ async fn dry_run_report(
     }
 
     Ok(report)
+}
+
+/// Copy `db_path` (and its `-wal` sidecar, if present) into a fresh scratch
+/// temp directory and open the copy read-only. The caller must keep the
+/// returned `TempDir` alive for as long as the backend is used; dropping it
+/// deletes the snapshot. Any `-shm` maintenance the read-only open performs
+/// lands on this disposable copy, never on `db_path`'s own sidecar.
+fn open_read_only_snapshot(db_path: &Path) -> Result<(StorageBackend, tempfile::TempDir)> {
+    let snapshot_dir = tempfile::TempDir::new()
+        .context("failed to create a scratch directory for the dry-run db snapshot")?;
+    let file_name = db_path
+        .file_name()
+        .with_context(|| format!("{} has no file name component", db_path.display()))?;
+    let snapshot_db = snapshot_dir.path().join(file_name);
+    std::fs::copy(db_path, &snapshot_db)
+        .with_context(|| format!("failed to snapshot {} for dry-run", db_path.display()))?;
+
+    let wal_path = wal_sidecar_path(db_path);
+    if wal_path.exists() {
+        let snapshot_wal = wal_sidecar_path(&snapshot_db);
+        std::fs::copy(&wal_path, &snapshot_wal)
+            .with_context(|| format!("failed to snapshot {} for dry-run", wal_path.display()))?;
+    }
+
+    let backend =
+        StorageBackend::sqlite_read_only(&snapshot_db).map_err(|e| anyhow::anyhow!("{e}"))?;
+    Ok((backend, snapshot_dir))
+}
+
+/// The `-wal` sidecar path SQLite uses alongside a WAL-mode database file.
+fn wal_sidecar_path(db_path: &Path) -> PathBuf {
+    let mut name = db_path.as_os_str().to_owned();
+    name.push("-wal");
+    PathBuf::from(name)
 }
 
 #[cfg(test)]
@@ -628,6 +668,96 @@ mod tests {
             bytes_before, bytes_after,
             "a dry run against an existing db must not change a single byte of it"
         );
+    }
+
+    /// The `-shm` sidecar path SQLite uses alongside a WAL-mode database file.
+    fn shm_sidecar_path(db_path: &std::path::Path) -> PathBuf {
+        let mut name = db_path.as_os_str().to_owned();
+        name.push("-shm");
+        PathBuf::from(name)
+    }
+
+    #[serial]
+    #[tokio::test]
+    async fn code_ingest_dry_run_against_existing_wal_db_leaves_sidecars_untouched() {
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let findings = write_valid_findings(tmp.path());
+        let db = tmp.path().join("wal_scratch.db");
+
+        // Populate the db for real first so it exists on disk in WAL mode.
+        code_ingest_batch(base_args(findings.clone(), db.clone()))
+            .await
+            .expect("initial ingest must succeed");
+
+        // Hold a live writer connection open across the dry run below, with
+        // one uncheckpointed write on it, so the target's `-wal`/`-shm`
+        // sidecars are guaranteed present with real content going into the
+        // dry run — the "existing WAL database" scenario Finding 1
+        // reproduced against (e.g. a live daemon holding the db open while
+        // an admin separately runs `code-ingest --dry-run`).
+        let pin = StorageBackend::sqlite(&db).expect("open pin backend");
+        {
+            let sql = pin.sql();
+            let mut writer = sql.writer().await.expect("pin writer");
+            writer
+                .execute_script(
+                    "CREATE TABLE IF NOT EXISTS wal_pin_probe(x INTEGER); \
+                     INSERT INTO wal_pin_probe VALUES (1);"
+                        .to_string(),
+                )
+                .await
+                .expect("pin write to keep the wal open");
+        }
+
+        let wal_path = wal_sidecar_path(&db);
+        let shm_path = shm_sidecar_path(&db);
+        assert!(
+            wal_path.exists(),
+            "expected a live -wal sidecar before dry-run"
+        );
+        assert!(
+            shm_path.exists(),
+            "expected a live -shm sidecar before dry-run"
+        );
+
+        let db_before = std::fs::read(&db).expect("read db before dry run");
+        let wal_before = std::fs::read(&wal_path).expect("read -wal before dry run");
+        let shm_before = std::fs::read(&shm_path).expect("read -shm before dry run");
+
+        let mut args = base_args(findings, db.clone());
+        args.dry_run = true;
+        let report = code_ingest_batch(args)
+            .await
+            .expect("dry-run against an existing WAL db must succeed");
+        assert!(report.dry_run);
+
+        assert!(
+            wal_path.exists(),
+            "the existing -wal sidecar must not disappear"
+        );
+        assert!(
+            shm_path.exists(),
+            "the existing -shm sidecar must not disappear"
+        );
+
+        let db_after = std::fs::read(&db).expect("read db after dry run");
+        let wal_after = std::fs::read(&wal_path).expect("read -wal after dry run");
+        let shm_after = std::fs::read(&shm_path).expect("read -shm after dry run");
+
+        assert_eq!(
+            db_before, db_after,
+            "dry-run must not touch the main db file"
+        );
+        assert_eq!(
+            wal_before, wal_after,
+            "dry-run must not touch the existing -wal sidecar"
+        );
+        assert_eq!(
+            shm_before, shm_after,
+            "dry-run must not touch the existing -shm sidecar (Finding 1 regression)"
+        );
+
+        drop(pin);
     }
 
     #[serial]
