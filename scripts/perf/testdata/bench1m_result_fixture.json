@@ -1,0 +1,157 @@
+{
+  "assertions": {
+    "checks": [
+      {
+        "measured": [
+          0.9521999999999948,
+          0.9530999999999945
+        ],
+        "metric": "recall_at_10",
+        "operator": ">=",
+        "result": "PASS",
+        "scope": "all_rows",
+        "threshold": 0.9,
+        "tolerance": 0.0
+      },
+      {
+        "measured": 0.3846306860449151,
+        "metric": "beam_growth_exponent",
+        "operator": "<=",
+        "result": "PASS",
+        "scope": "fits",
+        "threshold": 0.6,
+        "tolerance": 0.0
+      },
+      {
+        "measured": 65.38159851679808,
+        "metric": "speedup_vs_brute_force",
+        "operator": ">=",
+        "result": "PASS",
+        "scope": "max_n",
+        "threshold": 5.0,
+        "tolerance": 0.0
+      }
+    ],
+    "exit_code": 0,
+    "overall": "PASS",
+    "target_key": "khive-vamana/ci-synthetic/clustered-128",
+    "targets_file": "/Users/lion/khive-work/worktrees/fix830-r2/perf/targets.toml"
+  },
+  "caveats": [
+    "2-point fit",
+    "GT recomputed by brute-force L2 on each subset (provided GT indexes full base — invalid for subsets)",
+    "build exponent is Omega(N) floor — sublinear claim is query+update only",
+    "latency measured warm-cache on single-node; cold-cache latency is higher",
+    "high-load run: loadavg1=181.61"
+  ],
+  "config": {
+    "alpha": 1.0,
+    "build_batch": 1024,
+    "k": 10,
+    "max_degree": 64,
+    "max_iso_beam": 1024,
+    "n_gt_queries": 1000,
+    "n_latency_queries": 1000,
+    "search_list_size": 128,
+    "target_recall": 0.95
+  },
+  "dataset": {
+    "base_file": "/var/folders/5p/rcbw097d29j3s2qt861tsjfh0000gn/T/tmp.NTXmw939WK/sift_base.fvecs",
+    "base_n": 50000,
+    "dim": 128,
+    "intrinsic_dim_approx": null,
+    "name": "SIFT-CI-synthetic",
+    "normalization": "l2",
+    "query_file": "/var/folders/5p/rcbw097d29j3s2qt861tsjfh0000gn/T/tmp.NTXmw939WK/sift_query.fvecs",
+    "query_n": 1000,
+    "seed": null,
+    "source_url": null
+  },
+  "decisive_question": {
+    "criteria": {
+      "a_beam_exp": 0.3846306860449151,
+      "a_beam_flat": true,
+      "b_query_exp": 1.0804068714411033,
+      "b_query_sublinear": false,
+      "c_recall_holds": true,
+      "d_beats_brute_force": true,
+      "d_max_n": 50000,
+      "d_speedup_at_max_n": 65.38159851679808,
+      "per_n_recall": [
+        {
+          "n": 10000,
+          "recall": 0.9521999999999948,
+          "saturated": false
+        },
+        {
+          "n": 50000,
+          "recall": 0.9530999999999945,
+          "saturated": false
+        }
+      ]
+    },
+    "verdict": "PARTIAL/NO — beam_flat=true, query_sublinear=false, recall_holds=true, beats_brute_force=true"
+  },
+  "fits": {
+    "beam_growth_exponent": 0.3846306860449151,
+    "beam_growth_r2": null,
+    "bruteforce_exponent": 1.0014052972066299,
+    "bruteforce_r2": null,
+    "build_wallclock_exponent": 0.7895958926940714,
+    "build_wallclock_r2": null,
+    "build_work_exponent": null,
+    "build_work_r2": null,
+    "iso_recall_query_exponent_warm": 1.0804068714411033,
+    "iso_recall_query_r2_warm": null,
+    "note": "2-point fit"
+  },
+  "git_sha": "1bdb19a9aa75250416065bcb543e5393e2d6ffa9",
+  "gt_policy": {
+    "note": "any provided GT file indexes the full base and is invalid for subsets",
+    "source": "brute-force recomputed on subset"
+  },
+  "loadavg1": 181.61,
+  "machine_model": "Apple M2 Max",
+  "produced_at": "2026-07-11T01:53:46Z",
+  "ram_bytes": 34359738368,
+  "rows": [
+    {
+      "bruteforce_p50_us": 640.375,
+      "build_distance_calls": null,
+      "build_ms": 1824.0674999999999,
+      "gt_source": "brute-force recomputed on subset",
+      "iso_recall_beam": 14,
+      "n": 10000,
+      "per_query_resident_bytes": null,
+      "per_query_resident_exceeds_llc": false,
+      "query_flushed_p50_us": null,
+      "query_warm_max_us": 12.625,
+      "query_warm_p50_us": 8.625,
+      "query_warm_p95_us": 10.542,
+      "query_warm_p99_us": 11.541,
+      "recall_at_10": 0.9521999999999948,
+      "recall_saturated": false,
+      "speedup_vs_brute_force": 74.2463768115942
+    },
+    {
+      "bruteforce_p50_us": 3209.125,
+      "build_distance_calls": null,
+      "build_ms": 6500.469875000001,
+      "gt_source": "brute-force recomputed on subset",
+      "iso_recall_beam": 26,
+      "n": 50000,
+      "per_query_resident_bytes": null,
+      "per_query_resident_exceeds_llc": false,
+      "query_flushed_p50_us": null,
+      "query_warm_max_us": 312.209,
+      "query_warm_p50_us": 49.083,
+      "query_warm_p95_us": 68.208,
+      "query_warm_p99_us": 76.5,
+      "recall_at_10": 0.9530999999999945,
+      "recall_saturated": false,
+      "speedup_vs_brute_force": 65.38159851679808
+    }
+  ],
+  "runner_os": "macos-arm64",
+  "schema_version": "1.0"
+}
