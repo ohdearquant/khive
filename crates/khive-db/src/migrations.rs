@@ -112,6 +112,8 @@ const V5_UP: &str = include_str!("../sql/005-unique-comm-external-id.sql");
 
 const V6_UP: &str = include_str!("../sql/006-brain-retune-driver.sql");
 
+const V7_UP: &str = include_str!("../sql/007-notes-seq.sql");
+
 /// DDL for the `_embedding_models` registry table.
 ///
 /// Shared between the V1 schema and the belt-and-suspenders creation in
@@ -150,6 +152,11 @@ pub const MIGRATIONS: &[VersionedMigration] = &[
         version: 6,
         name: "brain_retune_driver",
         up: V6_UP,
+    },
+    VersionedMigration {
+        version: 7,
+        name: "notes_seq",
+        up: V7_UP,
     },
 ];
 

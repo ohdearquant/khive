@@ -377,7 +377,7 @@ pub(crate) static COMM_HANDLERS: [HandlerDef; 11] = [
                 name: "since_us",
                 param_type: "integer",
                 required: false,
-                description: "Cursor in Unix microseconds; only messages with created_at > since_us are returned.",
+                description: "Opaque cursor round-tripped from a previous comm.probe response's cursor_us; only messages committed after it are returned. Omit for a baseline-first probe. Not a computable timestamp.",
             },
             ParamDef {
                 name: "stale_minutes",

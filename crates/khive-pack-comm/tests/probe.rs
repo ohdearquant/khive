@@ -11,6 +11,7 @@
 use khive_pack_comm::CommPack;
 use khive_runtime::{KhiveRuntime, Namespace, VerbRegistry, VerbRegistryBuilder};
 use khive_storage::note::Note;
+use khive_storage::types::DeleteMode;
 use serde_json::json;
 use uuid::Uuid;
 
@@ -610,5 +611,200 @@ async fn probe_read_does_not_resurrect_message_via_rowid_churn() {
     assert!(
         second_messages.is_empty(),
         "marking a message read must not resurrect it as new: {second_messages:?}"
+    );
+}
+
+/// Regression for #827 Finding 1(a): `notes` has a TEXT PRIMARY KEY, so it
+/// carries an *implicit* rowid that SQLite may renumber on `VACUUM` (khive
+/// exposes `memory.vacuum`). The cursor must survive a VACUUM between probes
+/// without losing or replaying any message.
+#[tokio::test]
+async fn probe_survives_vacuum_between_probes() {
+    let (registry, rt) = build_registry();
+    let actor = "lambda:leo";
+
+    let t1 = 1_000_000_i64;
+    plant_inbound_message(&rt, actor, "lambda:khive", t1, None, false).await;
+
+    let first = registry
+        .dispatch("comm.probe", json!({ "actor": actor }))
+        .await
+        .expect("probe succeeds");
+    let cursor_1 = first["cursor_us"]
+        .as_i64()
+        .expect("cursor_us is an integer");
+    assert_eq!(first["new_messages"].as_array().unwrap().len(), 1);
+
+    // VACUUM the whole database between probes. If the cursor were still
+    // keyed on `notes`' implicit rowid, VACUUM could renumber it and either
+    // lose or replay messages relative to a previously issued cursor.
+    let sql = rt.sql();
+    {
+        let mut writer = sql.writer().await.expect("writer");
+        writer
+            .execute_script_top_level("VACUUM;".to_string())
+            .await
+            .expect("vacuum succeeds");
+    }
+
+    let t2 = 2_000_000_i64;
+    let id2 = plant_inbound_message(&rt, actor, "lambda:khive", t2, None, false).await;
+
+    let second = registry
+        .dispatch(
+            "comm.probe",
+            json!({ "actor": actor, "since_us": cursor_1 }),
+        )
+        .await
+        .expect("probe succeeds");
+    let messages = second["new_messages"].as_array().expect("array");
+    assert_eq!(
+        messages.len(),
+        1,
+        "VACUUM must not lose or replay messages: {messages:?}"
+    );
+    assert_eq!(messages[0]["id"], json!(id2.to_string()));
+
+    // Repeating the same `since_us` (simulating a retried poll) must not
+    // replay the first message either.
+    let replay_check = registry
+        .dispatch(
+            "comm.probe",
+            json!({ "actor": actor, "since_us": cursor_1 }),
+        )
+        .await
+        .expect("probe succeeds");
+    let replay_messages = replay_check["new_messages"].as_array().expect("array");
+    assert_eq!(
+        replay_messages.len(),
+        1,
+        "the first message must not be replayed after VACUUM: {replay_messages:?}"
+    );
+    assert_eq!(replay_messages[0]["id"], json!(id2.to_string()));
+}
+
+/// Regression for #827 Finding 1(b): SQLite reuses the highest rowid of a
+/// plain (non-AUTOINCREMENT) rowid table once that row is deleted. `notes`
+/// exposes a public hard delete, so deleting the note that currently holds
+/// the highest `notes_seq.seq` and then inserting a new note must not let
+/// the new note be silently excluded by a stale cursor.
+#[tokio::test]
+async fn probe_survives_delete_of_highest_seq_note_before_next_insert() {
+    let (registry, rt) = build_registry();
+    let actor = "lambda:leo";
+
+    let t1 = 1_000_000_i64;
+    let id1 = plant_inbound_message(&rt, actor, "lambda:khive", t1, None, false).await;
+
+    let first = registry
+        .dispatch("comm.probe", json!({ "actor": actor }))
+        .await
+        .expect("probe succeeds");
+    let cursor_1 = first["cursor_us"]
+        .as_i64()
+        .expect("cursor_us is an integer");
+
+    let token = rt
+        .authorize(Namespace::local())
+        .expect("authorize local namespace");
+    let store = rt.notes(&token).expect("notes store");
+    let deleted = store
+        .delete_note(id1, DeleteMode::Hard)
+        .await
+        .expect("hard delete succeeds");
+    assert!(deleted, "the planted note must exist before deletion");
+
+    let t2 = 2_000_000_i64;
+    let id2 = plant_inbound_message(&rt, actor, "lambda:khive", t2, None, false).await;
+
+    let second = registry
+        .dispatch(
+            "comm.probe",
+            json!({ "actor": actor, "since_us": cursor_1 }),
+        )
+        .await
+        .expect("probe succeeds");
+    let messages = second["new_messages"].as_array().expect("array");
+    assert_eq!(
+        messages.len(),
+        1,
+        "a note inserted after the highest-seq note is hard-deleted must still be \
+         visible, not permanently excluded by rowid reuse: {messages:?}"
+    );
+    assert_eq!(messages[0]["id"], json!(id2.to_string()));
+}
+
+/// Regression for #827: the returned cursor must never regress below a
+/// caller-supplied `since_us`. `stats.cursor_us` is `MAX(notes_seq.seq)`
+/// over the currently-matching rows, so hard-deleting the row that held the
+/// highest seq can otherwise make a later probe report a smaller cursor than
+/// one it already handed out.
+#[tokio::test]
+async fn probe_cursor_never_regresses_below_caller_supplied_since_us() {
+    let (registry, rt) = build_registry();
+    let actor = "lambda:leo";
+
+    let t1 = 1_000_000_i64;
+    let t2 = 2_000_000_i64;
+    plant_inbound_message(&rt, actor, "lambda:khive", t1, None, false).await;
+    let id2 = plant_inbound_message(&rt, actor, "lambda:khive", t2, None, false).await;
+
+    let first = registry
+        .dispatch("comm.probe", json!({ "actor": actor }))
+        .await
+        .expect("probe succeeds");
+    let cursor_1 = first["cursor_us"]
+        .as_i64()
+        .expect("cursor_us is an integer");
+
+    let token = rt
+        .authorize(Namespace::local())
+        .expect("authorize local namespace");
+    let store = rt.notes(&token).expect("notes store");
+    store
+        .delete_note(id2, DeleteMode::Hard)
+        .await
+        .expect("hard delete succeeds");
+
+    let second = registry
+        .dispatch(
+            "comm.probe",
+            json!({ "actor": actor, "since_us": cursor_1 }),
+        )
+        .await
+        .expect("probe succeeds");
+    assert!(
+        second["cursor_us"].as_i64().unwrap() >= cursor_1,
+        "cursor must never regress below a previously issued since_us: {second}"
+    );
+}
+
+/// Regression for #827 Finding 2: a pre-upgrade persisted cursor was a raw
+/// Unix-microsecond `created_at` timestamp -- vastly larger than any real
+/// `notes_seq` value. Passing one back as `since_us` must reset to baseline
+/// instead of permanently suppressing every message.
+#[tokio::test]
+async fn probe_resets_implausible_pre_upgrade_timestamp_cursor_to_baseline() {
+    let (registry, rt) = build_registry();
+    let actor = "lambda:leo";
+
+    let t1 = 1_000_000_i64;
+    plant_inbound_message(&rt, actor, "lambda:khive", t1, None, false).await;
+
+    let stale_timestamp_cursor = 1_751_932_800_000_000_i64;
+    let result = registry
+        .dispatch(
+            "comm.probe",
+            json!({ "actor": actor, "since_us": stale_timestamp_cursor }),
+        )
+        .await
+        .expect("probe succeeds");
+
+    let messages = result["new_messages"].as_array().expect("array");
+    assert_eq!(
+        messages.len(),
+        1,
+        "an implausible pre-upgrade timestamp cursor must reset to baseline, not \
+         permanently suppress messages: {messages:?}"
     );
 }

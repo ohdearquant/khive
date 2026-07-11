@@ -341,7 +341,10 @@ fn batch_upsert_notes(
                 note.deleted_at,
             ],
         ) {
-            Ok(_) => affected += 1,
+            Ok(_) => {
+                assign_note_seq(conn, &id_str)?;
+                affected += 1;
+            }
             Err(e) => {
                 if first_error.is_empty() {
                     first_error = e.to_string();
@@ -357,6 +360,20 @@ fn batch_upsert_notes(
         failed,
         first_error,
     })
+}
+
+/// Assign a note id its durable, non-reusing sequence number the first time
+/// it is inserted (khive #827 — see `sql/007-notes-seq.sql`). `INSERT OR
+/// IGNORE` makes this idempotent across an `INSERT OR REPLACE`
+/// delete+reinsert of the same note id: the sequence value is fixed at the
+/// note's first insert and never reassigned, unlike `notes`' own implicit
+/// rowid.
+fn assign_note_seq(conn: &rusqlite::Connection, note_id: &str) -> Result<(), rusqlite::Error> {
+    conn.execute(
+        "INSERT OR IGNORE INTO notes_seq (note_id) VALUES (?1)",
+        rusqlite::params![note_id],
+    )?;
+    Ok(())
 }
 
 fn build_note_where(
@@ -511,11 +528,13 @@ fn build_note_filter_where(
 #[async_trait]
 impl NoteStore for SqlNoteStore {
     async fn upsert_note(&self, note: Note) -> Result<(), StorageError> {
+        let id_str = note.id.to_string();
         let statement = note_upsert_statement(&note);
         self.with_writer("upsert_note", move |conn| {
             let mut stmt = conn.prepare(&statement.sql)?;
             bind_params(&mut stmt, &statement.params)?;
             stmt.raw_execute()?;
+            assign_note_seq(conn, &id_str)?;
             Ok(())
         })
         .await
@@ -579,6 +598,7 @@ impl NoteStore for SqlNoteStore {
             )?;
 
             if rows > 0 {
+                assign_note_seq(conn, &id_str)?;
                 return Ok(true);
             }
 

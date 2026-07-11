@@ -1373,52 +1373,65 @@ pub(crate) struct ProbeMessage {
 /// skips comm schema-plan application, this query fails loudly instead of
 /// silently degrading to a table scan.
 ///
-/// `cursor_us`/`since_us` are keyed on SQLite `rowid`, not `created_at`
-/// (#780): `created_at` is an application-clock read taken before a note's
-/// write acquires the writer critical section, so two concurrent writers can
-/// commit out of stamp order, so a `created_at`-keyed cursor can then advance
-/// past a row that committed *after* it, permanently hiding that row from
-/// every later probe. `rowid` is assigned by SQLite exactly once, inside the
-/// one active writer transaction, so it is monotonic with commit order by
-/// construction. The wire field names keep the `_us` suffix (frozen contract,
-/// ADR-D5) but the value is an opaque monotonic token, not a microsecond
-/// timestamp; do not revert this to `created_at`. `created_at_us` on each
-/// `new_messages` entry is unaffected: it stays a real display timestamp,
-/// still ordered ascending by `created_at` for readability, and carries no
-/// cursor guarantee of its own.
+/// `cursor_us`/`since_us` are keyed on `notes_seq.seq`, not SQLite `rowid`
+/// and not `created_at` (#780, #827):
+///
+/// - `created_at` is an application-clock read taken before a note's write
+///   acquires the writer critical section, so two concurrent writers can
+///   commit out of stamp order; a `created_at`-keyed cursor can then advance
+///   past a row that committed *after* it, permanently hiding that row from
+///   every later probe.
+/// - `notes.rowid` looked monotonic with commit order, but `notes` has a
+///   TEXT PRIMARY KEY, so that rowid is *implicit*: SQLite may renumber it
+///   on `VACUUM` (khive exposes `memory.vacuum`), and reuses the highest
+///   rowid once that row is hard-deleted (khive exposes a public hard
+///   delete), either of which can permanently exclude a later message whose
+///   rowid lands at or below an already-issued cursor.
+///
+/// `notes_seq.seq` fixes both: it is assigned once, inside the same writer
+/// transaction as the note's insert, from a dedicated `INTEGER PRIMARY KEY
+/// AUTOINCREMENT` sequence that VACUUM never renumbers and SQLite never
+/// reuses (see `sql/007-notes-seq.sql`). The wire field names keep the `_us`
+/// suffix (frozen contract, ADR-D5) but the value is an opaque monotonic
+/// token, not a microsecond timestamp; do not revert this to `created_at` or
+/// `rowid`. `created_at_us` on each `new_messages` entry is unaffected: it
+/// stays a real display timestamp, still ordered ascending by `created_at`
+/// for readability, and carries no cursor guarantee of its own.
 const PROBE_SQL: &str = "WITH \
 stats AS ( \
     SELECT \
-        COALESCE(MAX(rowid), 0) AS cursor_us, \
+        COALESCE(MAX(notes_seq.seq), 0) AS cursor_us, \
         COALESCE(SUM( \
             CASE \
-                WHEN (json_type(properties, '$.read') IS NULL \
-                      OR json_type(properties, '$.read') != 'true') \
-                     AND created_at < ?4 \
+                WHEN (json_type(notes.properties, '$.read') IS NULL \
+                      OR json_type(notes.properties, '$.read') != 'true') \
+                     AND notes.created_at < ?4 \
                 THEN 1 ELSE 0 \
             END \
         ), 0) AS stale_unread_count \
     FROM notes INDEXED BY idx_comm_message_to_actor \
-    WHERE namespace = ?1 \
-      AND kind = 'message' \
-      AND deleted_at IS NULL \
-      AND json_extract(properties, '$.to_actor') = ?2 \
-      AND json_extract(properties, '$.direction') = 'inbound' \
+    JOIN notes_seq ON notes_seq.note_id = notes.id \
+    WHERE notes.namespace = ?1 \
+      AND notes.kind = 'message' \
+      AND notes.deleted_at IS NULL \
+      AND json_extract(notes.properties, '$.to_actor') = ?2 \
+      AND json_extract(notes.properties, '$.direction') = 'inbound' \
 ), \
 new_rows AS ( \
     SELECT \
-        id, \
-        created_at AS created_at_us, \
-        COALESCE(json_extract(properties, '$.from_actor'), namespace) AS from_actor, \
-        json_extract(properties, '$.subject') AS subject \
+        notes.id, \
+        notes.created_at AS created_at_us, \
+        COALESCE(json_extract(notes.properties, '$.from_actor'), notes.namespace) AS from_actor, \
+        json_extract(notes.properties, '$.subject') AS subject \
     FROM notes INDEXED BY idx_comm_message_to_actor \
-    WHERE namespace = ?1 \
-      AND kind = 'message' \
-      AND deleted_at IS NULL \
-      AND json_extract(properties, '$.to_actor') = ?2 \
-      AND json_extract(properties, '$.direction') = 'inbound' \
-      AND (?3 IS NULL OR rowid > ?3) \
-    ORDER BY created_at DESC \
+    JOIN notes_seq ON notes_seq.note_id = notes.id \
+    WHERE notes.namespace = ?1 \
+      AND notes.kind = 'message' \
+      AND notes.deleted_at IS NULL \
+      AND json_extract(notes.properties, '$.to_actor') = ?2 \
+      AND json_extract(notes.properties, '$.direction') = 'inbound' \
+      AND (?3 IS NULL OR notes_seq.seq > ?3) \
+    ORDER BY notes.created_at DESC \
     LIMIT 100 \
 ) \
 SELECT \
@@ -1468,6 +1481,17 @@ pub(crate) async fn handle_probe(
     })
 }
 
+/// Above this bound, a caller-supplied `since_us` is treated as a
+/// pre-upgrade persisted-timestamp cursor rather than a `notes_seq` value
+/// (#827): `notes_seq` starts at 1 and grows by exactly one per note ever
+/// inserted, so no real deployment comes anywhere near this bound, while any
+/// real Unix-microsecond timestamp from after 1970-01-12 already exceeds it
+/// by three orders of magnitude. A cursor above the bound is reset to
+/// baseline (treated as absent) instead of being compared against
+/// `notes_seq.seq`, where its enormous magnitude would silently suppress
+/// every message forever.
+const PROBE_CURSOR_PLAUSIBLE_MAX: i64 = 1_000_000_000_000;
+
 async fn query_probe(
     runtime: &KhiveRuntime,
     namespace: &str,
@@ -1475,7 +1499,20 @@ async fn query_probe(
     since_us: Option<i64>,
     stale_cutoff_us: i64,
 ) -> Result<ProbeResponse, RuntimeError> {
-    let since_param = match since_us {
+    let effective_since = match since_us {
+        Some(v) if v > PROBE_CURSOR_PLAUSIBLE_MAX => {
+            tracing::warn!(
+                actor,
+                since_us = v,
+                "comm.probe: since_us exceeds the plausible notes_seq range; treating it as a \
+                 stale pre-upgrade timestamp cursor and resetting to baseline"
+            );
+            None
+        }
+        other => other,
+    };
+
+    let since_param = match effective_since {
         Some(v) => SqlValue::Integer(v),
         None => SqlValue::Null,
     };
@@ -1533,6 +1570,18 @@ async fn query_probe(
             from_actor,
             subject,
         });
+    }
+
+    // Never let the returned cursor regress below what the caller already
+    // holds (#827): if the message that previously held the highest
+    // `notes_seq.seq` was hard-deleted since the last probe, `MAX(seq)` over
+    // the remaining rows can be smaller than a cursor already handed out.
+    // Clamping here, rather than in SQL, keeps the single indexed query a
+    // pure aggregate with no extra branch.
+    if let Some(floor) = effective_since {
+        if cursor_us < floor {
+            cursor_us = floor;
+        }
     }
 
     Ok(ProbeResponse {
