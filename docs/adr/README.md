@@ -128,6 +128,8 @@ For historical context, see [v0 archive](../_archive/adr_v0/README.md). v0 ADRs 
 | [ADR-101](ADR-101-kg-changeset-model.md)                     | KG Change-Set Model — Producer-Agnostic Op-List with Stage-Time Stable IDs (Proposed)                           |
 | [ADR-102](ADR-102-tiered-validate-and-merge.md)              | Tiered Validate-and-Merge — Rule-Gated Fast Path and Reviewed Change-Set Path (Proposed)                        |
 | [ADR-106](ADR-106-schedule-pack-executor.md)                 | Schedule Pack Executor — Daemon-Resident Tick for the Pending-Event Drain (Accepted)                            |
+| [ADR-108](ADR-108-git-write-surface.md)                      | Git Write Surface Through khive (Phase B) (Proposed)                                                            |
+| [ADR-109](ADR-109-sandboxed-kkernel-gateway.md)              | Sandboxed kkernel Gateway for Untrusted Execution (Phase C) (Proposed)                                          |
 
 ## Closed Taxonomies — Quick Reference
 
