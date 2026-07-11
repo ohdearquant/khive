@@ -49,6 +49,8 @@ def _base_record(**overrides) -> dict:
         "suite": "flagship-e2e",
         "scenario_id": "f1.recall.warm.real",
         "feature": "F1",
+        "operation": "memory.recall",
+        "arm": "warm",
         "sha": "a" * 40,
         "branch": "main",
         "run_id": "123",
@@ -165,6 +167,18 @@ class SchemaValidationTests(unittest.TestCase):
         del record["workload"]
         errors = flagship_schema.validate_record(record)
         self.assertTrue(any(e.startswith("workload:") for e in errors), errors)
+
+    def test_missing_operation_or_arm_is_flagged(self):
+        for field in ("operation", "arm"):
+            record = _base_record()
+            del record[field]
+            errors = flagship_schema.validate_record(record)
+            self.assertTrue(any(field in e for e in errors), errors)
+
+    def test_arm_must_match_scenario_id_segment(self):
+        record = _base_record(arm="cold_ann_overlap")
+        errors = flagship_schema.validate_record(record)
+        self.assertTrue(any("arm" in e for e in errors), errors)
 
     def test_bad_status_enum_is_flagged(self):
         errors = flagship_schema.validate_record(_base_record(status="timed_out"))

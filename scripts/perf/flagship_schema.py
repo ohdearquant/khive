@@ -116,6 +116,18 @@ def validate_record(record: dict) -> list[str]:
     if not isinstance(scenario_id, str) or not scenario_id:
         errors.append(_err("scenario_id", "must be a non-empty string"))
 
+    # operation and arm are denormalized from the manifest so hotspot
+    # ranking (largest stable gap by verb/workload/percentile) never
+    # parses scenario_id strings.
+    for field in ("operation", "arm"):
+        if not isinstance(record.get(field), str) or not record.get(field):
+            errors.append(_err(field, "must be a non-empty string"))
+    if isinstance(scenario_id, str):
+        parts = scenario_id.split(".")
+        arm = record.get("arm")
+        if len(parts) == 4 and isinstance(arm, str) and arm and arm != parts[2]:
+            errors.append(_err("arm", f"must match the scenario_id arm segment {parts[2]!r}, got {arm!r}"))
+
     sha = record.get("sha")
     if not isinstance(sha, str) or len(sha) != 40:
         errors.append(_err("sha", "must be a full 40-character git sha"))
