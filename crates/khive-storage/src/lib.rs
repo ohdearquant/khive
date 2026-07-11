@@ -37,10 +37,11 @@ pub use vectors::VectorStore;
 
 pub use types::{
     BatchWriteSummary, DeleteMode, DirectedNeighborHit, Direction, Edge, EdgeFilter, EdgeSeekPage,
-    EdgeSortField, GraphPath, IndexRebuildScope, LinkId, NeighborHit, NeighborQuery,
-    OrphanSweepConfig, OrphanSweepResult, Page, PageRequest, PathNode, PropertyFilter, PropertyOp,
-    SortDirection, SortOrder, SparseRecord, SparseSearchHit, SparseSearchRequest, SparseVector,
-    SqlRow, SqlStatement, SqlValue, TextDocument, TextFilter, TextGatherMode, TextIndexStats,
+    EdgeSortField, GraphPath, GuardedBatchOutcome, GuardedBatchRefusal, GuardedWriteOutcome,
+    IndexRebuildScope, LinkId, MissingEndpoints, NeighborHit, NeighborQuery, OrphanSweepConfig,
+    OrphanSweepResult, Page, PageRequest, PathNode, PropertyFilter, PropertyOp, SortDirection,
+    SortOrder, SparseRecord, SparseSearchHit, SparseSearchRequest, SparseVector, SqlRow,
+    SqlStatement, SqlValue, TextDocument, TextFilter, TextGatherMode, TextIndexStats,
     TextQueryMode, TextSearchHit, TextSearchOptions, TextSearchRequest, TextTermStats,
     TextTermStatsRequest, TimeRange, TraversalOptions, TraversalRequest, VectorIndexKind,
     VectorMetadataFilter, VectorRecord, VectorSearchHit, VectorSearchRequest,

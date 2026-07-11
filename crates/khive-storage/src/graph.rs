@@ -4,10 +4,12 @@ use async_trait::async_trait;
 use khive_types::EdgeRelation;
 use uuid::Uuid;
 
+use crate::capability::StorageCapability;
+use crate::error::StorageError;
 use crate::types::{
     BatchWriteSummary, DeleteMode, DirectedNeighborHit, Direction, Edge, EdgeFilter, EdgeSeekPage,
-    EdgeSortField, GraphPath, LinkId, NeighborHit, NeighborQuery, Page, PageRequest, SortOrder,
-    StorageResult, TraversalRequest,
+    EdgeSortField, GraphPath, GuardedBatchOutcome, GuardedWriteOutcome, LinkId, NeighborHit,
+    NeighborQuery, Page, PageRequest, SortOrder, StorageResult, TraversalRequest,
 };
 
 /// Directed edge CRUD and graph traversal over the knowledge graph.
@@ -17,6 +19,47 @@ pub trait GraphStore: Send + Sync + 'static {
     async fn upsert_edge(&self, edge: Edge) -> StorageResult<()>;
     /// Insert or update a batch of edges.
     async fn upsert_edges(&self, edges: Vec<Edge>) -> StorageResult<BatchWriteSummary>;
+    /// Insert or update a single edge, re-checking that both endpoints still
+    /// exist (and are not soft-deleted) as part of the same write, not a
+    /// separate prior read. Closes the TOCTOU window between an async
+    /// prepare-time existence check and a later, unconditional write: a
+    /// concurrent hard-delete of an endpoint that lands between the two can
+    /// otherwise leave a durably dangling edge (#769).
+    ///
+    /// Returns [`GuardedWriteOutcome::Refused`] naming exactly which
+    /// endpoint(s) were missing, determined by the guard's own in-transaction
+    /// probe — never reconstructed by a caller re-reading the endpoints after
+    /// the write already failed, since a concurrent write landing between the
+    /// refusal and any such later read could misreport which endpoint was
+    /// actually missing at write time (round-2 codex Medium 1).
+    ///
+    /// Default returns `StorageError::Unsupported`: a backend that does not
+    /// override this method cannot honor the endpoint-existence guarantee,
+    /// and silently falling back to [`GraphStore::upsert_edge`] would
+    /// reintroduce the TOCTOU window this method exists to close.
+    async fn upsert_edge_guarded(&self, _edge: Edge) -> StorageResult<GuardedWriteOutcome> {
+        Err(StorageError::Unsupported {
+            capability: StorageCapability::Graph,
+            operation: "upsert_edge_guarded".into(),
+            message: "this backend does not implement guarded edge writes".into(),
+        })
+    }
+    /// Batch form of [`GraphStore::upsert_edge_guarded`]. All-or-nothing:
+    /// if any edge's endpoints are missing at write time, no edge from the
+    /// batch is persisted, `BatchWriteSummary::affected` is `0`, and
+    /// `GuardedBatchOutcome::refused` names the first failing batch entry and
+    /// its missing endpoint(s) — determined by the same in-transaction
+    /// pre-check that aborted the batch, not a post-hoc re-read.
+    ///
+    /// Default returns `StorageError::Unsupported`, for the same reason as
+    /// [`GraphStore::upsert_edge_guarded`]'s default.
+    async fn upsert_edges_guarded(&self, _edges: Vec<Edge>) -> StorageResult<GuardedBatchOutcome> {
+        Err(StorageError::Unsupported {
+            capability: StorageCapability::Graph,
+            operation: "upsert_edges_guarded".into(),
+            message: "this backend does not implement guarded edge writes".into(),
+        })
+    }
     /// Fetch an edge by link ID, returning `None` if absent. Filters soft-deleted rows.
     async fn get_edge(&self, id: LinkId) -> StorageResult<Option<Edge>>;
     /// Fetch an edge by link ID including soft-deleted rows. Used by the runtime hard-delete path

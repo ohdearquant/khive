@@ -53,7 +53,7 @@ pub use embedder_registry::{EmbedderProvider, EmbedderRegistry, LatticeEmbedderP
 pub use engine_config::{
     config_from_env, BackendConfig, BackendKind, ConfigError, EngineConfig, KhiveConfig, PackConfig,
 };
-pub use error::{fts_text_leg_or_err, RuntimeError, RuntimeResult};
+pub use error::{fts_text_leg_or_err, GuardedWriteFailure, RuntimeError, RuntimeResult};
 pub use fusion::FusionStrategy;
 pub use graph_traversal::PathNode;
 pub use khive_db::{

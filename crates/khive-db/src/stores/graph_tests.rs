@@ -4,6 +4,82 @@ use khive_storage::types::{Direction, TraversalOptions};
 use serial_test::serial;
 use std::collections::HashSet;
 
+/// Deterministic barrier at the exact insert-to-probe seam
+/// [`edge_insert_guarded`] calls into (via `#[cfg(test)] hook(...)`) after a
+/// guarded `INSERT` is refused, before the missing-endpoint probe runs.
+///
+/// A pure wall-clock race at this seam is not observable: a refused,
+/// zero-row `INSERT` autocommits (and so releases SQLite's write lock)
+/// before returning, and the probe that follows it is a plain `SELECT`,
+/// which never blocks on a writer in WAL mode. Two back-to-back Rust calls
+/// on the same thread with no `.await` between them leave no real window
+/// for another OS thread to interleave — a racer would have to win a
+/// same-thread, no-I/O footrace against its own scheduling latency, which
+/// it structurally cannot do. This module replaces that footrace with a
+/// real rendezvous: the guarded call blocks at the seam until the test
+/// releases it, so the racer's write is forced to land in the seam's
+/// window on unwrapped (pre-fix) code, and forced to block behind the
+/// still-open `BEGIN IMMEDIATE` on wrapped (fixed) code.
+///
+/// Scoped by `(source_id, target_id)` rather than global so unrelated
+/// `upsert_edge_guarded` calls from other tests running concurrently in the
+/// same process are unaffected (`hook` is a no-op unless its key matches an
+/// installed barrier).
+pub(super) mod insert_probe_seam {
+    use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
+    use std::sync::Mutex;
+    use uuid::Uuid;
+
+    struct Barrier {
+        key: (Uuid, Uuid),
+        reached_tx: SyncSender<()>,
+        proceed_rx: Receiver<()>,
+    }
+
+    static BARRIER: Mutex<Option<Barrier>> = Mutex::new(None);
+
+    /// Installs a barrier for the given `(source_id, target_id)` key.
+    /// Returns the `reached` receiver (fires once the guarded call has
+    /// executed its `INSERT` and is parked at the seam) and the `proceed`
+    /// sender the caller uses to release it.
+    pub(crate) fn install(key: (Uuid, Uuid)) -> (Receiver<()>, SyncSender<()>) {
+        let (reached_tx, reached_rx) = sync_channel(0);
+        let (proceed_tx, proceed_rx) = sync_channel(0);
+        *BARRIER.lock().unwrap() = Some(Barrier {
+            key,
+            reached_tx,
+            proceed_rx,
+        });
+        (reached_rx, proceed_tx)
+    }
+
+    /// Clears any still-installed barrier. Safe to call unconditionally
+    /// after a test finishes, whether or not `hook` ever consumed it.
+    pub(crate) fn uninstall() {
+        *BARRIER.lock().unwrap() = None;
+    }
+
+    /// Called from the production insert-then-probe seam. A no-op unless a
+    /// barrier for this exact key is currently installed. Single-use: takes
+    /// the barrier out of the static the moment it matches, so a second
+    /// call with the same key (there is none in this test) would fall
+    /// through as a no-op rather than re-blocking.
+    pub(crate) fn hook(key: (Uuid, Uuid)) {
+        let barrier = {
+            let mut guard = BARRIER.lock().unwrap();
+            match guard.as_ref() {
+                Some(barrier) if barrier.key == key => guard.take(),
+                _ => None,
+            }
+        };
+        let Some(barrier) = barrier else {
+            return;
+        };
+        let _ = barrier.reached_tx.send(());
+        let _ = barrier.proceed_rx.recv();
+    }
+}
+
 fn setup_memory_store() -> SqlGraphStore {
     let config = PoolConfig {
         path: None,
@@ -17,6 +93,57 @@ fn setup_memory_store() -> SqlGraphStore {
     }
 
     SqlGraphStore::new_scoped(pool, false, "default")
+}
+
+/// Like [`setup_memory_store`] but also seeds minimal `entities`/`notes`
+/// tables (id + deleted_at only) so the `#769` guarded-write tests can
+/// exercise the real `WHERE EXISTS(entities...) OR EXISTS(notes...)` probes
+/// `edge_insert_guarded_by_endpoints_statement` and `edge_endpoints_exist`
+/// issue against those tables.
+fn setup_memory_store_with_substrates() -> (Arc<ConnectionPool>, SqlGraphStore) {
+    let config = PoolConfig {
+        path: None,
+        ..PoolConfig::default()
+    };
+    let pool = Arc::new(ConnectionPool::new(config).unwrap());
+
+    {
+        let writer = pool.writer().unwrap();
+        writer.conn().execute_batch(GRAPH_DDL).unwrap();
+        writer
+            .conn()
+            .execute_batch(
+                "CREATE TABLE entities (id TEXT PRIMARY KEY, deleted_at INTEGER);
+                 CREATE TABLE notes (id TEXT PRIMARY KEY, deleted_at INTEGER);
+                 CREATE TABLE events (id TEXT PRIMARY KEY);",
+            )
+            .unwrap();
+    }
+
+    let store = SqlGraphStore::new_scoped(Arc::clone(&pool), false, "default");
+    (pool, store)
+}
+
+fn insert_live_entity(pool: &ConnectionPool, id: Uuid) {
+    let writer = pool.writer().unwrap();
+    writer
+        .conn()
+        .execute(
+            "INSERT INTO entities (id, deleted_at) VALUES (?1, NULL)",
+            rusqlite::params![id.to_string()],
+        )
+        .unwrap();
+}
+
+fn hard_delete_entity(pool: &ConnectionPool, id: Uuid) {
+    let writer = pool.writer().unwrap();
+    writer
+        .conn()
+        .execute(
+            "DELETE FROM entities WHERE id = ?1",
+            rusqlite::params![id.to_string()],
+        )
+        .unwrap();
 }
 
 fn make_edge(source: Uuid, target: Uuid, relation: EdgeRelation, weight: f64) -> Edge {
@@ -2574,5 +2701,338 @@ async fn upsert_edge_routes_through_writer_task_when_flag_enabled() {
     assert!(
         fetched.is_some(),
         "edge must be committed and readable after queuing behind the occupier"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// #769 — commit-time endpoint guard for canonical `link`/`link_many`
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn upsert_edge_guarded_succeeds_when_both_endpoints_exist() {
+    let (pool, store) = setup_memory_store_with_substrates();
+    let source = Uuid::new_v4();
+    let target = Uuid::new_v4();
+    insert_live_entity(&pool, source);
+    insert_live_entity(&pool, target);
+
+    let edge = make_edge(source, target, EdgeRelation::Extends, 1.0);
+    let edge_id = edge.id;
+    let outcome = store.upsert_edge_guarded(edge).await.unwrap();
+
+    assert_eq!(
+        outcome,
+        khive_storage::GuardedWriteOutcome::Written,
+        "guarded write must succeed when both endpoints exist"
+    );
+    assert!(store.get_edge(edge_id).await.unwrap().is_some());
+}
+
+/// Reproduces #769's failure scenario at the layer where the bug actually
+/// lived: an endpoint that existed when a caller validated it (mirrored here
+/// by `insert_live_entity`) is hard-deleted before the edge write reaches
+/// storage (mirrored by `hard_delete_entity`) — the exact window a
+/// concurrent MCP request could land in between `KhiveRuntime::link`'s async
+/// `validate_edge_relation_endpoints` read and its write. Before #769's fix,
+/// `SqlGraphStore::upsert_edge` had no such check and would have inserted
+/// this edge unconditionally, leaving it permanently dangling.
+#[tokio::test]
+async fn upsert_edge_guarded_returns_false_when_target_hard_deleted_before_write() {
+    let (pool, store) = setup_memory_store_with_substrates();
+    let source = Uuid::new_v4();
+    let target = Uuid::new_v4();
+    insert_live_entity(&pool, source);
+    insert_live_entity(&pool, target);
+
+    // Simulates a concurrent hard-delete landing between prepare-time
+    // validation and this write.
+    hard_delete_entity(&pool, target);
+
+    let edge = make_edge(source, target, EdgeRelation::Extends, 1.0);
+    let edge_id = edge.id;
+    let outcome = store.upsert_edge_guarded(edge).await.unwrap();
+
+    match outcome {
+        khive_storage::GuardedWriteOutcome::Refused(missing) => {
+            assert!(missing.target, "target must be reported missing");
+            assert!(!missing.source, "source was never deleted");
+        }
+        other => panic!(
+            "guarded write must refuse an edge whose target vanished before commit, got {other:?}"
+        ),
+    }
+    assert!(
+        store.get_edge(edge_id).await.unwrap().is_none(),
+        "no dangling edge may be persisted"
+    );
+}
+
+#[tokio::test]
+async fn upsert_edge_guarded_returns_false_when_source_hard_deleted_before_write() {
+    let (pool, store) = setup_memory_store_with_substrates();
+    let source = Uuid::new_v4();
+    let target = Uuid::new_v4();
+    insert_live_entity(&pool, source);
+    insert_live_entity(&pool, target);
+
+    hard_delete_entity(&pool, source);
+
+    let edge = make_edge(source, target, EdgeRelation::Extends, 1.0);
+    let edge_id = edge.id;
+    let outcome = store.upsert_edge_guarded(edge).await.unwrap();
+
+    match outcome {
+        khive_storage::GuardedWriteOutcome::Refused(missing) => {
+            assert!(missing.source, "source must be reported missing");
+            assert!(!missing.target, "target was never deleted");
+        }
+        other => panic!(
+            "guarded write must refuse an edge whose source vanished before commit, got {other:?}"
+        ),
+    }
+    assert!(store.get_edge(edge_id).await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn upsert_edges_guarded_succeeds_when_all_endpoints_exist() {
+    let (pool, store) = setup_memory_store_with_substrates();
+    let a = Uuid::new_v4();
+    let b = Uuid::new_v4();
+    let c = Uuid::new_v4();
+    insert_live_entity(&pool, a);
+    insert_live_entity(&pool, b);
+    insert_live_entity(&pool, c);
+
+    let edges = vec![
+        make_edge(a, b, EdgeRelation::Extends, 1.0),
+        make_edge(b, c, EdgeRelation::Extends, 1.0),
+    ];
+    let ids: Vec<_> = edges.iter().map(|e| e.id).collect();
+
+    let outcome = store.upsert_edges_guarded(edges).await.unwrap();
+    assert_eq!(outcome.summary.attempted, 2);
+    assert_eq!(outcome.summary.affected, 2);
+    assert!(outcome.refused.is_none());
+
+    for id in ids {
+        assert!(store.get_edge(id).await.unwrap().is_some());
+    }
+}
+
+/// Batch form of #769's regression: one edge in the batch targets an
+/// endpoint that vanished before commit. The whole batch must be rejected —
+/// no edge from it, including the ones whose endpoints were still live,
+/// may be persisted (all-or-nothing, matching `create_many`'s existing
+/// validation-failure contract).
+#[tokio::test]
+async fn upsert_edges_guarded_writes_nothing_when_one_endpoint_vanishes() {
+    let (pool, store) = setup_memory_store_with_substrates();
+    let a = Uuid::new_v4();
+    let b = Uuid::new_v4();
+    let c = Uuid::new_v4();
+    insert_live_entity(&pool, a);
+    insert_live_entity(&pool, b);
+    insert_live_entity(&pool, c);
+
+    // b's endpoint vanishes before the batch write — mirrors a concurrent
+    // hard-delete landing between per-spec validation and `link_many`'s
+    // single batched write.
+    hard_delete_entity(&pool, b);
+
+    let edges = vec![
+        make_edge(a, b, EdgeRelation::Extends, 1.0), // dangling endpoint
+        make_edge(a, c, EdgeRelation::Extends, 1.0), // both endpoints live
+    ];
+    let ids: Vec<_> = edges.iter().map(|e| e.id).collect();
+
+    let outcome = store.upsert_edges_guarded(edges).await.unwrap();
+    assert_eq!(outcome.summary.attempted, 2);
+    assert_eq!(
+        outcome.summary.affected, 0,
+        "no edge from the batch may be persisted when any endpoint is missing"
+    );
+    let refusal = outcome
+        .refused
+        .expect("refused batch entry must be reported");
+    assert_eq!(
+        refusal.entry_index, 0,
+        "the first entry (a, b) is the one with the missing endpoint"
+    );
+    assert!(
+        refusal.missing.target,
+        "b (the batch entry's target) must be reported missing"
+    );
+    assert!(!refusal.missing.source, "a was never deleted");
+
+    for id in ids {
+        assert!(
+            store.get_edge(id).await.unwrap().is_none(),
+            "batch must be all-or-nothing: {id:?} must not be persisted"
+        );
+    }
+}
+
+/// Round-4/-5 codex Medium: on the flag-off, file-backed singleton fallback
+/// (`SqlGraphStore::with_writer`'s `is_file_backed` branch, no `WriterTask`),
+/// `upsert_edge_guarded` must run its guarded `INSERT` and, when refused,
+/// the missing-endpoint probe inside ONE `BEGIN IMMEDIATE` transaction —
+/// not as two separate autocommit statements a concurrent writer could
+/// interleave between, recreating the endpoint after the insert was
+/// refused but before the probe explains why.
+///
+/// Round-5 sabotage-verified that a purely timing-based version of this
+/// test (sleeps guessing when the guarded call was "probably" parked on
+/// the write lock, then "probably" holding it) still passed with the
+/// round-5 transaction wrapping removed: a refused, zero-row `INSERT`
+/// autocommits — and so releases the write lock — before the guarded
+/// call's Rust code even returns from it, and the probe that follows is a
+/// plain `SELECT`, which never blocks on a writer in WAL mode. The two
+/// statements run back to back on the same thread with no `.await`
+/// between them, so there is no real scheduling gap for a racer on
+/// another OS thread to win; a sleep-based racer is really racing its own
+/// wake-up latency against a same-thread, no-I/O continuation, and loses
+/// every time.
+///
+/// So this version does not race at all. [`insert_probe_seam`] has
+/// production code itself (`edge_insert_guarded`, `#[cfg(test)]`-only)
+/// park the guarded call at the exact seam between its `INSERT` and its
+/// probe, keyed on this test's own `(source, target)` pair so unrelated
+/// concurrent tests are unaffected. The racer's write is then forced to
+/// attempt landing at that exact seam:
+///   - unwrapped (pre-fix) code holds no lock at the seam, so the racer's
+///     write always lands before the probe resumes — reproducing #769's
+///     residual bug (the probe wrongly reports the target as not missing).
+///   - wrapped (fixed) code still holds its `BEGIN IMMEDIATE` at the seam,
+///     so the racer blocks behind it and cannot land until after the
+///     probe (and the guarded call's `COMMIT`) has already run.
+#[tokio::test]
+async fn upsert_edge_guarded_probe_is_atomic_with_insert_on_file_backed_singleton_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("guarded_atomic_singleton.db");
+
+    let pool_cfg = PoolConfig {
+        path: Some(path.clone()),
+        write_queue_enabled: false,
+        ..PoolConfig::default()
+    };
+    let pool = Arc::new(ConnectionPool::new(pool_cfg).unwrap());
+    {
+        let writer = pool.writer().unwrap();
+        writer.conn().execute_batch(GRAPH_DDL).unwrap();
+        writer
+            .conn()
+            .execute_batch(
+                "CREATE TABLE entities (id TEXT PRIMARY KEY, deleted_at INTEGER);
+                 CREATE TABLE notes (id TEXT PRIMARY KEY, deleted_at INTEGER);
+                 CREATE TABLE events (id TEXT PRIMARY KEY);",
+            )
+            .unwrap();
+    }
+    assert!(
+        pool.writer_task_handle().unwrap().is_none(),
+        "this test targets the no-WriterTask singleton fallback"
+    );
+
+    let store = Arc::new(SqlGraphStore::new_scoped(
+        Arc::clone(&pool),
+        true,
+        "default",
+    ));
+
+    let source = Uuid::new_v4();
+    let target = Uuid::new_v4();
+    insert_live_entity(&pool, source);
+    // target is intentionally never created — it is genuinely missing
+    // for the entire test, so any observed "exists" state can only come
+    // from the racer's later insert.
+
+    let edge = make_edge(source, target, EdgeRelation::Extends, 1.0);
+    let edge_id = edge.id;
+
+    // Install the seam barrier before spawning the guarded call, keyed on
+    // the exact (source, target) pair `edge_insert_guarded` canonicalizes
+    // to and passes into `insert_probe_seam::hook` (Extends is not a
+    // symmetric relation, so canonicalization is a no-op here).
+    let (reached_rx, proceed_tx) = insert_probe_seam::install((source, target));
+
+    let guarded_task = {
+        let store = Arc::clone(&store);
+        tokio::spawn(async move { store.upsert_edge_guarded(edge).await })
+    };
+
+    // Deterministic rendezvous: blocks until the guarded call has actually
+    // executed its refused INSERT and is parked at the seam. No sleep, no
+    // guess — a real signal sent from production code at that exact point.
+    tokio::task::spawn_blocking(move || reached_rx.recv())
+        .await
+        .expect("waiting for the seam signal must not panic")
+        .expect("guarded call must reach the insert-to-probe seam");
+
+    // Now attempt to recreate the missing target from an independent
+    // connection while the guarded call is parked exactly at the seam. On
+    // unwrapped (pre-fix) code nothing holds the write lock here, so this
+    // succeeds immediately; on wrapped (fixed) code the guarded call's own
+    // BEGIN IMMEDIATE is still open, so this blocks until it commits.
+    let racer_path = path.clone();
+    let (racer_started_tx, racer_started_rx) = std::sync::mpsc::sync_channel::<()>(0);
+    let racer = tokio::task::spawn_blocking(move || {
+        let conn = rusqlite::Connection::open(&racer_path).unwrap();
+        conn.busy_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
+        let _ = racer_started_tx.send(());
+        conn.execute(
+            "INSERT INTO entities (id, deleted_at) VALUES (?1, NULL)",
+            rusqlite::params![target.to_string()],
+        )
+    });
+
+    // Deterministic signal that the racer has actually dispatched its
+    // INSERT to SQLite, then a bounded settle window for it to either
+    // complete (unwrapped code: no lock in the way) or genuinely start
+    // blocking on the guarded call's still-open transaction (fixed code).
+    // This window never has to race the guarded call itself — the guarded
+    // call cannot move past the seam until `proceed_tx` fires below.
+    tokio::task::spawn_blocking(move || racer_started_rx.recv())
+        .await
+        .expect("waiting for the racer-started signal must not panic")
+        .expect("racer must signal before attempting its INSERT");
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    // Release the guarded call. On unwrapped code the racer's write has
+    // already landed by now, so the probe below will (wrongly) see the
+    // target as present. On wrapped code the racer is still blocked behind
+    // the open transaction, so the probe still sees it missing.
+    proceed_tx
+        .send(())
+        .expect("guarded call must still be waiting at the seam");
+
+    let outcome = guarded_task
+        .await
+        .expect("guarded task must not panic")
+        .unwrap();
+    racer
+        .await
+        .expect("racer task must not panic")
+        .expect("racer's INSERT must eventually succeed");
+    insert_probe_seam::uninstall();
+
+    match outcome {
+        khive_storage::GuardedWriteOutcome::Refused(missing) => {
+            assert!(
+                missing.target,
+                "target was missing for the entire guarded write and must be \
+                 reported so, even though the racer recreated it immediately \
+                 afterward"
+            );
+            assert!(!missing.source, "source was always live");
+        }
+        other => panic!(
+            "guarded write must refuse an edge whose target never existed \
+             during the write, got {other:?}"
+        ),
+    }
+    assert!(
+        store.get_edge(edge_id).await.unwrap().is_none(),
+        "no dangling edge may be persisted"
     );
 }
