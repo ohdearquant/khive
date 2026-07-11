@@ -332,9 +332,14 @@ async fn exact_name_match(
     // filter) so a namespace with many newer case variants of `name` can
     // never page the exact target out from under a `created_at DESC` sort
     // (#849, #852) — every row this query returns already equals `name`.
-    // The page is small (10, not 1): a single hit still needs `Resolved`,
-    // but multiple hits must surface every candidate for `Ambiguous`, the
-    // same way the ring and search stages report their candidate sets.
+    // The page is small (10, not 1), but the zero/one/many decision is made
+    // from `page.total` (the storage-computed COUNT(*) under the same
+    // predicate), never from `page.items.len()` — with 11+ byte-identical
+    // exact names the fetched page is still only 10 rows, and deciding from
+    // its length alone would under-report cardinality. `Ambiguous.candidates`
+    // is a bounded sample of up to 10 of the `page.total` matches, not the
+    // complete set — the variant carries no total field, so callers must not
+    // assume `candidates.len() == page.total` (#852 review r3).
     let page = runtime
         .entities(token)?
         .query_entities(
@@ -348,6 +353,8 @@ async fn exact_name_match(
         .await
         .map_err(RuntimeError::Storage)?;
 
+    let total = page.total.unwrap_or(page.items.len() as u64);
+
     let exact: Vec<ReferenceCandidate> = page
         .items
         .into_iter()
@@ -358,12 +365,15 @@ async fn exact_name_match(
         })
         .collect();
 
-    Ok(match exact.len() {
+    Ok(match total {
         0 => None,
-        1 => Some(ReferenceResolution::Resolved {
-            id: exact[0].id,
-            confidence: EXACT_NAME_CONFIDENCE,
-        }),
+        1 => exact
+            .into_iter()
+            .next()
+            .map(|top| ReferenceResolution::Resolved {
+                id: top.id,
+                confidence: EXACT_NAME_CONFIDENCE,
+            }),
         _ => Some(ReferenceResolution::Ambiguous { candidates: exact }),
     })
 }
@@ -578,5 +588,44 @@ mod tests {
                 confidence: EXACT_NAME_CONFIDENCE,
             }
         );
+    }
+
+    /// #852 review r3: the zero/one/many decision must come from the
+    /// storage-computed `page.total` (a full `COUNT(*)` under the exact-name
+    /// predicate), not from `page.items.len()`, which the stage's own
+    /// `LIMIT 10` caps regardless of true cardinality. 11 byte-identical
+    /// exact names exceed that page limit, so the fetched page can only ever
+    /// carry 10 rows — `Ambiguous` must still fire (storage says 11 total,
+    /// not the truncated 10), and the returned `candidates` are a bounded
+    /// sample of the match set, not its entirety. That truncation is an
+    /// intentional, documented contract of this stage, not a bug: this test
+    /// pins both halves so a future change can't silently drop one.
+    #[tokio::test]
+    async fn exact_name_ambiguous_decision_uses_storage_total_not_page_len() {
+        let rt = KhiveRuntime::memory().expect("in-memory runtime");
+        let token = actor_token("resolver-test");
+        let ring = ReferenceRing::new();
+
+        for _ in 0..11 {
+            rt.create_entity(&token, "concept", None, "DupeExactName", None, None, vec![])
+                .await
+                .expect("create duplicate-named entity");
+        }
+
+        let resolution = resolve_reference(&rt, &ring, &token, "DupeExactName", 5, None)
+            .await
+            .expect("resolve_reference");
+
+        match resolution {
+            ReferenceResolution::Ambiguous { candidates } => {
+                assert_eq!(
+                    candidates.len(),
+                    10,
+                    "candidate set is a bounded 10-row sample of the 11 storage matches, \
+                     not the complete set"
+                );
+            }
+            other => panic!("expected Ambiguous driven by storage total (11), got {other:?}"),
+        }
     }
 }
