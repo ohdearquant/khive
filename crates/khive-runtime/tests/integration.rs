@@ -997,16 +997,21 @@ async fn synthetic_edge_observed_as_selected_returns_memory_note() {
         .unwrap();
     let memory_id = memory_note.id;
 
-    // Step 2: create an event of kind RerankExecuted with a payload that
+    // Step 2: create an event of kind SearchExecuted with a payload that
     // includes `selected: [memory_id]`.  The storage layer's `append_event`
-    // implementation calls `decode_rank_observations`, which reads
+    // implementation calls `decode_recall_observations`, which reads
     // `payload["selected"]` and inserts a row into `event_observations` with
-    // role="selected" and entity_id=memory_id.
+    // role="selected" and entity_id=memory_id. (`selected` is part of
+    // `SearchExecuted`/`RecallExecuted`'s ADR-041 projection contract;
+    // their payloads are untyped JSON —
+    // unlike `RerankExecuted`, which projects `selected` rows from
+    // `final_scores`/`reranked` instead, since its typed payload has no
+    // `selected` field.)
     let event_store = rt.events(&tok).unwrap();
     let mut event = Event::new(
         ns,
-        "rerank",
-        EventKind::RerankExecuted,
+        "search",
+        EventKind::SearchExecuted,
         SubstrateKind::Note,
         "agent:test",
     );

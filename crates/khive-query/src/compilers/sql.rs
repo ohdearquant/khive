@@ -61,9 +61,10 @@ fn primary_node_source(alias: &str) -> String {
 }
 
 /// Union of entity/note tables that can legally bind to a synthetic
-/// `observed_as_*` target (issue #468): `observed_as_target` admits entity OR
-/// note referents, `observed_as_signal` admits entity referents. This source
-/// lets the target join stay entity-capable instead of hard-coding `notes`.
+/// `observed_as_*` target (issue #468): `observed_as_target` and
+/// `observed_as_signal` both admit entity OR note referents (ADR-041
+/// Amendment A2). This source lets the target join stay entity-capable
+/// instead of hard-coding `notes`.
 const OBSERVATION_TARGET_SQL: &str = "\
     SELECT id, namespace, kind, entity_type, name, description, \
            NULL AS content, NULL AS status, NULL AS salience, \
@@ -508,11 +509,12 @@ fn compile_fixed_length(
                     ));
                     // Admit exactly the in-code legal (role, referent_kind) pairs:
                     // candidate/selected -> note only; target -> entity or note;
-                    // signal -> entity only.
+                    // signal -> entity or note (ADR-041 permits both substrates
+                    // as brain.feedback targets).
                     where_parts.push(format!(
                         "(({e_alias}.role IN ('candidate', 'selected') AND {e_alias}.referent_kind = 'note') \
                           OR ({e_alias}.role = 'target' AND {e_alias}.referent_kind IN ('entity', 'note')) \
-                          OR ({e_alias}.role = 'signal' AND {e_alias}.referent_kind = 'entity'))"
+                          OR ({e_alias}.role = 'signal' AND {e_alias}.referent_kind IN ('entity', 'note')))"
                     ));
                 } else {
                     // Standard canonical edge: join graph_edges.
@@ -2649,17 +2651,17 @@ mod tests {
         );
     }
 
-    /// `observed_as_signal` only admits entity referents (brain feedback signals
-    /// target entities, never notes).
+    /// `observed_as_signal` admits entity OR note referents (ADR-041: brain
+    /// feedback signals may target either substrate).
     #[test]
-    fn synthetic_edge_observed_as_signal_compiles_entity_referents() {
+    fn synthetic_edge_observed_as_signal_compiles_entity_and_note_referents() {
         let q = gql::parse("MATCH (ev)-[:observed_as_signal]->(t) RETURN t.id LIMIT 10").unwrap();
         let compiled = compile(&q, &opts()).unwrap();
         assert!(
             compiled
                 .sql
-                .contains("e0.role = 'signal' AND e0.referent_kind = 'entity'"),
-            "signal role must be admitted only against entity referents; sql: {}",
+                .contains("e0.role = 'signal' AND e0.referent_kind IN ('entity', 'note')"),
+            "signal role must be admitted against entity or note referents; sql: {}",
             compiled.sql
         );
     }

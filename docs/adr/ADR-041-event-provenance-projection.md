@@ -573,7 +573,8 @@ The generated V13 SQL adds `events.session_id TEXT`, creates `event_observations
   → `Selected` note rows.
 - `LinkCreated`: `payload.source_id` and `payload.target_id` → two entity `Target`
   rows at `position=0` and `position=1`.
-- `FeedbackExplicit`: `payload.about_id` → entity `Signal` row.
+- `FeedbackExplicit`: `event.target_id` → entity **or note** `Signal` row, per
+  `event.substrate` (Amendment A1, A2).
 
 ### PackEventConsumer dispatch update
 
@@ -618,6 +619,44 @@ files own this behavior. Consumers that need event observations read the shipped
    isolation via the JOIN to `events.namespace`. No `namespace` column on the
    projection itself; correct by construction but worth noting in the implementation
    comment.
+
+---
+
+## Amendment A1: `FeedbackExplicit` signal decodes from `target_id`, not `payload.about_id` (2026-07-10, khive#811)
+
+§3's per-verb role mapping and §"Implementation"'s decoder examples originally specified
+`FeedbackExplicit: payload.about_id → entity Signal row`. No emitter ever wrote a payload
+`about_id` field — `brain.feedback` (`crates/khive-pack-brain/src/handlers.rs`) sets the
+feedback subject via `Event::with_target(target)`, i.e. `event.target_id`, matching every
+other target-carrying event kind (`EntityUpdated`, `NoteUpdated`, `TaskTransitioned`, …).
+`decode_signal_observation` (`crates/khive-db/src/stores/event.rs`) read the nonexistent
+payload field instead, so every `FeedbackExplicit` event projected zero `Signal` rows —
+the projection was silently empty for the entire lifetime of this ADR's implementation.
+
+This is a decoder bug, not an emitter bug: `event.target_id` is the correct, already-shipped
+carrier for "the entity/note this event is about" across every other decoded event kind, and
+changing the emitter to duplicate that value into `payload.about_id` would introduce a
+redundant field with no consumer. The fix makes `decode_signal_observation` read
+`event.target_id`, consistent with `decode_target_observation`.
+
+The role mapping in §3 (`FeedbackExplicit` → `Signal`) and its intent are unchanged — only
+the field the decoder reads to populate it.
+
+---
+
+## Amendment A2: `FeedbackExplicit` `Signal` rows admit entity or note referents (2026-07-10, khive#831)
+
+§3 and Amendment A1 described the `FeedbackExplicit` → `Signal` projection as entity-only.
+`brain.feedback` targets can resolve to either an entity or a note, but the emitted event
+carried a fixed `SubstrateKind::Event` placeholder, so `decode_signal_observation`
+hard-coded `ReferentKind::Entity` and `observed_as_signal` (`crates/khive-query/src/compilers/sql.rs`)
+only admitted entity referents — a note-typed feedback target could never be resolved
+through `observed_as_signal`.
+
+The fix threads the resolved target's actual substrate (`Entity`/`Note`) onto the emitted
+event, `decode_signal_observation` picks `ReferentKind` from `event.substrate` (falling
+back to `Entity` for pre-fix historical events still carrying the `SubstrateKind::Event`
+placeholder), and `observed_as_signal` admits both entity and note referents.
 
 ---
 

@@ -144,7 +144,7 @@ async fn append_event_writes_observations_atomically() {
     let candidate = Uuid::new_v4();
     let selected = Uuid::new_v4();
     let mut event = make_event("default");
-    event.kind = EventKind::RerankExecuted;
+    event.kind = EventKind::SearchExecuted;
     event.payload = json!({
         "candidates": [candidate.to_string()],
         "selected": [selected.to_string()],
@@ -185,6 +185,341 @@ async fn append_event_writes_observations_atomically() {
 
     assert_eq!(candidate_count, 1, "expected one candidate observation row");
     assert_eq!(selected_count, 1, "expected one selected observation row");
+}
+
+async fn selected_uuids_for(store: &SqlEventStore, event_id: Uuid) -> Vec<String> {
+    let pool = Arc::clone(&store.pool);
+    let event_id_str = event_id.to_string();
+    tokio::task::spawn_blocking(move || {
+        let guard = pool.reader().unwrap();
+        let conn = guard.conn();
+        let mut stmt = conn
+            .prepare(
+                "SELECT entity_id FROM event_observations \
+                 WHERE event_id = ?1 AND role = 'selected' ORDER BY position",
+            )
+            .unwrap();
+        stmt.query_map([&event_id_str], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<Vec<String>, _>>()
+            .unwrap()
+    })
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+async fn rerank_executed_falls_back_to_reranked_when_final_scores_field_is_absent() {
+    // Regression test (round-1 codex review of #831, Finding 2): legacy
+    // events emitted before `final_scores` existed carry only `reranked`.
+    // The decoder must still fall through from the absent `final_scores`
+    // field to the tuple-shaped `reranked` field instead of silently
+    // projecting zero `selected` rows. Constructed via a hand-rolled
+    // `json!` (not the typed struct) so the `final_scores` key is
+    // genuinely absent, not present-and-empty.
+    let store = setup_memory_store();
+    let candidate = Uuid::new_v4();
+    let reranked_winner = Uuid::new_v4();
+
+    let mut event = make_event("default");
+    event.kind = EventKind::RerankExecuted;
+    event.payload = json!({
+        "candidates": [candidate.to_string()],
+        "reranked": [[reranked_winner.to_string(), [["relevance", 0.9]]]],
+    });
+    let event_id = event.id;
+
+    store.append_event(event).await.unwrap();
+
+    let selected = selected_uuids_for(&store, event_id).await;
+    assert_eq!(
+        selected,
+        vec![reranked_winner.to_string()],
+        "selected observation must decode the UUID leading the `reranked` tuple \
+         when `final_scores` is absent"
+    );
+}
+
+#[tokio::test]
+async fn rerank_executed_prefers_final_scores_order_over_reranked_when_both_present() {
+    // Finding 1 (round-2 codex review of #831): ADR-042 §5 defines
+    // `final_scores` as the ordered rerank output and `reranked` as
+    // unordered per-reranker audit/debug data. When both are present and
+    // their orderings differ, `final_scores`' order must win.
+    let store = setup_memory_store();
+    let a = Uuid::new_v4();
+    let b = Uuid::new_v4();
+
+    let payload = khive_types::RerankExecutedPayload {
+        served_by_profile_id: Some("profile-a".to_string()),
+        model_id: khive_types::Id128::from_u128(1),
+        candidates: vec![
+            khive_types::Id128::from_bytes(*a.as_bytes()),
+            khive_types::Id128::from_bytes(*b.as_bytes()),
+        ],
+        // audit-only ordering: b before a
+        reranked: vec![
+            (
+                khive_types::Id128::from_bytes(*b.as_bytes()),
+                vec![("relevance".to_string(), 0.4)],
+            ),
+            (
+                khive_types::Id128::from_bytes(*a.as_bytes()),
+                vec![("relevance".to_string(), 0.9)],
+            ),
+        ],
+        // authoritative ordered output: a before b
+        final_scores: vec![
+            (khive_types::Id128::from_bytes(*a.as_bytes()), 0.9),
+            (khive_types::Id128::from_bytes(*b.as_bytes()), 0.4),
+        ],
+        latency_us: 1200,
+        hook_applied: false,
+        hook_target_match: false,
+    };
+
+    let mut event = make_event("default");
+    event.kind = EventKind::RerankExecuted;
+    event.payload = serde_json::to_value(&payload).unwrap();
+    let event_id = event.id;
+
+    store.append_event(event).await.unwrap();
+
+    let selected = selected_uuids_for(&store, event_id).await;
+    assert_eq!(
+        selected,
+        vec![a.to_string(), b.to_string()],
+        "selected order must follow `final_scores`, not `reranked`"
+    );
+}
+
+#[tokio::test]
+async fn rerank_executed_ignores_stray_selected_field_and_uses_final_scores() {
+    // Regression test (round-3 codex review of #831, Major finding):
+    // `RerankExecutedPayload` (khive_types::event::RerankExecutedPayload)
+    // has no `selected` field at all. The serde helper does not deny
+    // unknown fields, so a payload carrying the typed fields plus a stray
+    // `selected` key must still be projected from `final_scores` only —
+    // the stray field must never be consulted, even when its order
+    // differs completely from `final_scores`.
+    let store = setup_memory_store();
+    let a = Uuid::new_v4();
+    let b = Uuid::new_v4();
+    let stray_selected_winner = Uuid::new_v4();
+
+    let payload = khive_types::RerankExecutedPayload {
+        served_by_profile_id: Some("profile-a".to_string()),
+        model_id: khive_types::Id128::from_u128(1),
+        candidates: vec![
+            khive_types::Id128::from_bytes(*a.as_bytes()),
+            khive_types::Id128::from_bytes(*b.as_bytes()),
+        ],
+        reranked: vec![],
+        // authoritative ordered output: a before b
+        final_scores: vec![
+            (khive_types::Id128::from_bytes(*a.as_bytes()), 0.9),
+            (khive_types::Id128::from_bytes(*b.as_bytes()), 0.4),
+        ],
+        latency_us: 1200,
+        hook_applied: false,
+        hook_target_match: false,
+    };
+
+    let mut event = make_event("default");
+    event.kind = EventKind::RerankExecuted;
+    let mut payload_value = serde_json::to_value(&payload).unwrap();
+    // Inject a stray `selected` field with an entirely different order
+    // than `final_scores` — this field is not part of the typed contract
+    // and must not affect projection.
+    payload_value.as_object_mut().unwrap().insert(
+        "selected".to_string(),
+        json!([stray_selected_winner.to_string()]),
+    );
+    event.payload = payload_value;
+    let event_id = event.id;
+
+    store.append_event(event).await.unwrap();
+
+    let selected = selected_uuids_for(&store, event_id).await;
+    assert_eq!(
+        selected,
+        vec![a.to_string(), b.to_string()],
+        "stray `selected` field must be ignored for RerankExecuted; \
+         projection must follow `final_scores` only"
+    );
+}
+
+#[tokio::test]
+async fn rerank_executed_uses_final_scores_when_reranked_is_empty() {
+    // Finding 1 companion case: `reranked` present-but-empty, `final_scores`
+    // populated. `final_scores` must still be used (not skipped just
+    // because `reranked` happens to come first lexically in the payload).
+    let store = setup_memory_store();
+    let winner = Uuid::new_v4();
+
+    let payload = khive_types::RerankExecutedPayload {
+        served_by_profile_id: None,
+        model_id: khive_types::Id128::from_u128(1),
+        candidates: vec![khive_types::Id128::from_bytes(*winner.as_bytes())],
+        reranked: vec![],
+        final_scores: vec![(khive_types::Id128::from_bytes(*winner.as_bytes()), 0.75)],
+        latency_us: 800,
+        hook_applied: false,
+        hook_target_match: false,
+    };
+
+    let mut event = make_event("default");
+    event.kind = EventKind::RerankExecuted;
+    event.payload = serde_json::to_value(&payload).unwrap();
+    let event_id = event.id;
+
+    store.append_event(event).await.unwrap();
+
+    let selected = selected_uuids_for(&store, event_id).await;
+    assert_eq!(
+        selected,
+        vec![winner.to_string()],
+        "final_scores must be used even when reranked is present-but-empty"
+    );
+}
+
+#[tokio::test]
+async fn rerank_executed_final_scores_single_element_tuple_rejected() {
+    // Finding 2 (round-2 codex review of #831): the typed contract
+    // (`RerankExecutedPayload::final_scores: Vec<(Id128, f32)>`) requires
+    // exact two-element tuples. A one-element tuple must error, and the
+    // event insert must roll back rather than silently accepting it.
+    let store = setup_memory_store();
+    let mut event = make_event("default");
+    event.kind = EventKind::RerankExecuted;
+    event.payload = json!({
+        "candidates": [],
+        "final_scores": [[Uuid::new_v4().to_string()]],
+    });
+    let event_id = event.id;
+
+    let result = store.append_event(event).await;
+    assert!(result.is_err(), "single-element tuple must be rejected");
+
+    let fetched = store.get_event(event_id).await.unwrap();
+    assert!(fetched.is_none(), "event row must not exist after rollback");
+}
+
+#[tokio::test]
+async fn rerank_executed_final_scores_extra_element_tuple_rejected() {
+    // Finding 2: extra-element tuples must also be rejected, not
+    // silently truncated to the first two elements.
+    let store = setup_memory_store();
+    let mut event = make_event("default");
+    event.kind = EventKind::RerankExecuted;
+    event.payload = json!({
+        "candidates": [],
+        "final_scores": [[Uuid::new_v4().to_string(), 0.5, "extra"]],
+    });
+    let event_id = event.id;
+
+    let result = store.append_event(event).await;
+    assert!(result.is_err(), "extra-element tuple must be rejected");
+
+    let fetched = store.get_event(event_id).await.unwrap();
+    assert!(fetched.is_none(), "event row must not exist after rollback");
+}
+
+#[tokio::test]
+async fn rerank_executed_final_scores_non_numeric_second_element_rejected() {
+    // Finding 2: the second element of a `final_scores` tuple must be the
+    // typed contract's `f32` score, not an arbitrary value.
+    let store = setup_memory_store();
+    let mut event = make_event("default");
+    event.kind = EventKind::RerankExecuted;
+    event.payload = json!({
+        "candidates": [],
+        "final_scores": [[Uuid::new_v4().to_string(), "not-a-number"]],
+    });
+    let event_id = event.id;
+
+    let result = store.append_event(event).await;
+    assert!(result.is_err(), "non-numeric score must be rejected");
+
+    let fetched = store.get_event(event_id).await.unwrap();
+    assert!(fetched.is_none(), "event row must not exist after rollback");
+}
+
+#[tokio::test]
+async fn rerank_executed_reranked_malformed_sub_scores_rejected() {
+    // Finding 2: `reranked`'s second element must be the typed contract's
+    // `Vec<(String, f32)>` sub-score list, not an arbitrary value.
+    let store = setup_memory_store();
+    let mut event = make_event("default");
+    event.kind = EventKind::RerankExecuted;
+    event.payload = json!({
+        "candidates": [],
+        "reranked": [[Uuid::new_v4().to_string(), "not-an-array"]],
+    });
+    let event_id = event.id;
+
+    let result = store.append_event(event).await;
+    assert!(
+        result.is_err(),
+        "malformed reranked sub-scores must be rejected"
+    );
+
+    let fetched = store.get_event(event_id).await.unwrap();
+    assert!(fetched.is_none(), "event row must not exist after rollback");
+}
+
+#[tokio::test]
+async fn feedback_explicit_projects_signal_observation_from_target_id() {
+    // Regression test for #811: the emitter (khive-pack-brain's `brain.feedback`
+    // handler) sets `event.target_id` via `Event::with_target`, never a payload
+    // `about_id` field. The decoder must read the field the emitter actually
+    // writes so the round trip survives.
+    let store = setup_memory_store();
+    let target = Uuid::new_v4();
+    let event = Event::new(
+        "default",
+        "brain.feedback",
+        EventKind::FeedbackExplicit,
+        SubstrateKind::Event,
+        "agent:test",
+    )
+    .with_target(target)
+    .with_payload(json!({ "signal": "useful" }));
+    let event_id = event.id;
+
+    store.append_event(event).await.unwrap();
+
+    let pool = Arc::clone(&store.pool);
+    let event_id_str = event_id.to_string();
+    let (signal_count, observed_entity_id): (i64, String) =
+        tokio::task::spawn_blocking(move || {
+            let guard = pool.reader().unwrap();
+            let conn = guard.conn();
+            let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM event_observations WHERE event_id = ?1 AND role = 'signal'",
+                [&event_id_str],
+                |r| r.get(0),
+            )
+            .unwrap();
+            let entity_id: String = conn
+            .query_row(
+                "SELECT entity_id FROM event_observations WHERE event_id = ?1 AND role = 'signal'",
+                [&event_id_str],
+                |r| r.get(0),
+            )
+            .unwrap();
+            (count, entity_id)
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(signal_count, 1, "expected one signal observation row");
+    assert_eq!(
+        observed_entity_id,
+        target.to_string(),
+        "signal observation must carry the feedback's target_id"
+    );
 }
 
 #[tokio::test]
@@ -310,7 +645,7 @@ async fn query_events_filters_by_observed() {
     let store = setup_memory_store();
     let entity_id = Uuid::new_v4();
     let mut event = make_event("default");
-    event.kind = EventKind::RerankExecuted;
+    event.kind = EventKind::SearchExecuted;
     event.payload = json!({
         "candidates": [entity_id.to_string()],
         "selected": []
@@ -340,7 +675,7 @@ async fn query_events_filters_by_selected() {
     let store = setup_memory_store();
     let entity_id = Uuid::new_v4();
     let mut event = make_event("default");
-    event.kind = EventKind::RerankExecuted;
+    event.kind = EventKind::SearchExecuted;
     event.payload = json!({
         "candidates": [],
         "selected": [entity_id.to_string()]

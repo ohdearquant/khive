@@ -1458,6 +1458,65 @@ async fn w4_c4_feedback_accepts_valid_target_and_profile() {
     assert_eq!(result["signal"], json!("useful"));
 }
 
+/// Regression test (round-1 codex review of #831, Finding 1): ADR-041
+/// permits `brain.feedback` targets on entities AND notes, but the emitted
+/// event previously always carried `SubstrateKind::Event`, so the
+/// `event_observations` decoder hard-coded `ReferentKind::Entity` and the
+/// `observed_as_signal` synthetic-edge query lowering only admitted entity
+/// referents — a note target's signal observation existed in storage but
+/// was unreachable from `observed_as_signal`. Feed a REAL stored note
+/// through `brain.feedback` end-to-end and confirm it resolves via the
+/// canonical ADR-041 §11 GQL query.
+#[tokio::test]
+async fn feedback_note_target_resolves_through_observed_as_signal() {
+    let (pack, rt) = make_pack();
+    let registry = empty_registry();
+    let token = rt.authorize(Namespace::local()).unwrap();
+
+    let note = rt
+        .create_note(
+            &token,
+            "observation",
+            None,
+            "a real stored note used as a feedback target",
+            None,
+            None,
+            vec![],
+        )
+        .await
+        .expect("create test note");
+
+    let result = pack
+        .dispatch(
+            "brain.feedback",
+            json!({"target_id": note.id.to_string(), "signal": "useful", "served_by_profile_id": "balanced-recall-v1"}),
+            &registry,
+            &token,
+        )
+        .await
+        .unwrap();
+    assert_eq!(result["emitted"], json!(true));
+
+    let rows = rt
+        .query(&token, "MATCH (ev)-[:observed_as_signal]->(t) RETURN t")
+        .await
+        .unwrap();
+
+    let note_id_str = note.id.to_string();
+    let found = rows.iter().any(|row| {
+        row.columns.iter().any(|col| match &col.value {
+            khive_storage::types::SqlValue::Text(s) => s == &note_id_str,
+            khive_storage::types::SqlValue::Uuid(u) => u.to_string() == note_id_str,
+            _ => false,
+        })
+    });
+    assert!(
+        found,
+        "note feedback target must resolve through observed_as_signal; rows: {:?}",
+        rows
+    );
+}
+
 // H1: brain.create_profile creates a new inactive profile.
 #[tokio::test]
 async fn w4_h1_create_profile_creates_new_profile() {
