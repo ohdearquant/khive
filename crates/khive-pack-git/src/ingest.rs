@@ -1505,6 +1505,7 @@ async fn ingest_issues(
 
             let raw_body = issue.body.unwrap_or_default();
             let content = secret_gate::mask_secrets(&raw_body).into_owned();
+            let safe_title = secret_gate::mask_secrets(&issue.title).into_owned();
             let labels: Vec<String> = issue
                 .labels
                 .unwrap_or_default()
@@ -1513,7 +1514,7 @@ async fn ingest_issues(
                 .collect();
             let mut properties = json!({
                 "number": issue.number,
-                "title": issue.title,
+                "title": safe_title,
                 "author": issue.author.and_then(|a| a.login),
                 "created_at": issue.created_at,
                 "closed_at": issue.closed_at,
@@ -1527,10 +1528,8 @@ async fn ingest_issues(
             if let Some(reason) = issue.state_reason.as_deref().filter(|r| !r.is_empty()) {
                 properties["state_reason"] = json!(reason.to_ascii_lowercase());
             }
-            let name = refs::truncate_chars(
-                &format!("#{} {}", issue.number, issue.title),
-                NAME_MAX_CHARS,
-            );
+            let name =
+                refs::truncate_chars(&format!("#{} {}", issue.number, safe_title), NAME_MAX_CHARS);
 
             budget.try_consume();
             let result = match registry

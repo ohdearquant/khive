@@ -599,6 +599,161 @@ async fn ingest_masks_credential_shaped_pr_title_without_dropping_note() {
     );
 }
 
+/// Issue #801: a credential-shaped issue title (sibling site of #763/#785)
+/// must be masked in place rather than causing the whole issue note to be
+/// rejected by the runtime's recursive `properties` secret scan.
+#[tokio::test]
+async fn ingest_masks_credential_shaped_issue_title_without_dropping_note() {
+    let _guard = ENV_MUTEX.lock().await;
+    let (rt, token, registry) = fixture().await;
+
+    let project_id = create(
+        &registry,
+        json!({"kind": "project", "name": "issue-title-credential-repo"}),
+    )
+    .await;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo: PathBuf = dir.path().join("repo");
+    std::fs::create_dir_all(&repo).expect("mk repo dir");
+    init_repo(&repo);
+    write(&repo, "README.md", "hello\n");
+    commit(&repo, &["README.md"], "Initial commit");
+
+    let bin_dir = dir.path().join("bin");
+    std::fs::create_dir_all(&bin_dir).expect("mk bin dir");
+    let log_dir = dir.path().join("log");
+    std::fs::create_dir_all(&log_dir).expect("mk log dir");
+
+    let fake_token = "ghp_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+    let issue_json = json!([{
+        "number": 11,
+        "title": format!("Rotate leaked {fake_token} immediately"),
+        "author": {"login": "octocat"},
+        "createdAt": "2026-01-01T00:00:00Z",
+        "closedAt": null,
+        "updatedAt": "2026-01-01T00:00:00Z",
+        "labels": [],
+        "stateReason": "",
+        "body": ""
+    }])
+    .to_string();
+
+    write_fake_gh(&bin_dir, &log_dir, "[]", &issue_json);
+    let _path_guard = PathGuard::install(&bin_dir);
+
+    let report = run_ingest(
+        &rt,
+        &token,
+        &registry,
+        IngestOptions::unbounded(repo.clone(), project_id.to_string()),
+    )
+    .await
+    .expect("ingest ok");
+
+    assert_eq!(
+        report.issues_ingested, 1,
+        "the issue must not be dropped: {report:?}"
+    );
+    assert!(
+        report.warnings.iter().all(|w| !w.contains("issue #11")),
+        "no silent-drop warning may be reported: {:?}",
+        report.warnings
+    );
+
+    let issues_list = registry
+        .dispatch("list", json!({"kind": "issue", "limit": 10}))
+        .await
+        .expect("list issues ok");
+    let items = issues_list.as_array().expect("array");
+    assert_eq!(items.len(), 1);
+    let item = &items[0];
+    let stored_name = item["name"].as_str().expect("name is string");
+    let stored_title = item["properties"]["title"]
+        .as_str()
+        .expect("properties.title is string");
+    assert!(
+        !stored_name.contains(fake_token) && !stored_title.contains(fake_token),
+        "raw credential must not survive into name or properties.title: \
+         name={stored_name:?}, title={stored_title:?}"
+    );
+    assert!(
+        stored_name.contains("***MASKED***") && stored_title.contains("***MASKED***"),
+        "masked marker must be present in both name and properties.title: \
+         name={stored_name:?}, title={stored_title:?}"
+    );
+}
+
+/// A clean (non-credential) issue title and an empty body must pass through
+/// `ingest_issues` unchanged -- guards against a future over-aggressive
+/// masking regression that the detector-positive test above cannot catch.
+#[tokio::test]
+async fn ingest_leaves_clean_issue_title_unmasked() {
+    let _guard = ENV_MUTEX.lock().await;
+    let (rt, token, registry) = fixture().await;
+
+    let project_id = create(
+        &registry,
+        json!({"kind": "project", "name": "issue-clean-title-repo"}),
+    )
+    .await;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo: PathBuf = dir.path().join("repo");
+    std::fs::create_dir_all(&repo).expect("mk repo dir");
+    init_repo(&repo);
+    write(&repo, "README.md", "hello\n");
+    commit(&repo, &["README.md"], "Initial commit");
+
+    let bin_dir = dir.path().join("bin");
+    std::fs::create_dir_all(&bin_dir).expect("mk bin dir");
+    let log_dir = dir.path().join("log");
+    std::fs::create_dir_all(&log_dir).expect("mk log dir");
+
+    let issue_json = json!([{
+        "number": 12,
+        "title": "Fix the flaky retry test",
+        "author": {"login": "octocat"},
+        "createdAt": "2026-01-01T00:00:00Z",
+        "closedAt": null,
+        "updatedAt": "2026-01-01T00:00:00Z",
+        "labels": [],
+        "stateReason": "",
+        "body": ""
+    }])
+    .to_string();
+
+    write_fake_gh(&bin_dir, &log_dir, "[]", &issue_json);
+    let _path_guard = PathGuard::install(&bin_dir);
+
+    let report = run_ingest(
+        &rt,
+        &token,
+        &registry,
+        IngestOptions::unbounded(repo.clone(), project_id.to_string()),
+    )
+    .await
+    .expect("ingest ok");
+
+    assert_eq!(report.issues_ingested, 1, "{report:?}");
+
+    let issues_list = registry
+        .dispatch("list", json!({"kind": "issue", "limit": 10}))
+        .await
+        .expect("list issues ok");
+    let items = issues_list.as_array().expect("array");
+    assert_eq!(items.len(), 1);
+    let item = &items[0];
+    assert_eq!(
+        item["name"].as_str().unwrap(),
+        "#12 Fix the flaky retry test"
+    );
+    assert_eq!(
+        item["properties"]["title"].as_str().unwrap(),
+        "Fix the flaky retry test"
+    );
+}
+
 /// Multiple credential spans across both the title and the body of the same
 /// PR must all be masked, and exactly one PR note must be written.
 #[tokio::test]
