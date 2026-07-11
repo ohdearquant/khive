@@ -40,6 +40,7 @@ from __future__ import annotations
 
 import argparse
 import datetime
+import hashlib
 import json
 import pathlib
 import re
@@ -87,6 +88,32 @@ STATUSES = ("measured", "stale", "missing", "wrong-surface", "confounded")
 FRESHNESS_DAYS_HOSTED = 7
 FRESHNESS_DAYS_SELF_HOSTED = 14
 HOSTED_RUNNER_CLASSES = {"hosted_hash"}
+
+# The manifest declares no `manifest_version`/`manifest_hash` field of its
+# own (checked: `flagship_workloads.toml` has no such key), so the current
+# manifest's identity is derived here rather than read - MANIFEST_VERSION is
+# this manifest format's own version track (bumped only on a structural
+# manifest revision, mirroring flagship_schema.SCHEMA_VERSION), and the hash
+# is a content fingerprint of the canonicalized scenario set so any scenario
+# addition/removal/edit changes the identity a record's workload must match.
+MANIFEST_VERSION = "1"
+
+
+def compute_manifest_hash(scenarios: list[dict]) -> str:
+    """Deterministic sha256 fingerprint of a manifest's scenario set, stable
+    across re-parses regardless of on-disk declaration order."""
+    ordered = sorted(scenarios, key=lambda sc: sc.get("scenario_id", ""))
+    canonical = json.dumps(ordered, sort_keys=True, default=str)
+    digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    return f"sha256:{digest}"
+
+
+def current_manifest_identity(manifest: dict) -> tuple[str, str]:
+    """(manifest_version, manifest_hash) for the manifest as currently
+    loaded - what a fresh record's `workload.manifest_version`/
+    `workload.manifest_hash` must match to count as measuring this
+    manifest revision, not a stale one."""
+    return MANIFEST_VERSION, compute_manifest_hash(manifest.get("scenario", []))
 
 
 class ManifestError(Exception):
@@ -250,9 +277,23 @@ def _cohort_mismatches(scenario: dict, record: dict) -> list[str]:
     return mismatches
 
 
-def scenario_status(scenario: dict, records: list[dict], now: datetime.datetime) -> tuple[str, str]:
+def scenario_status(
+    scenario: dict,
+    records: list[dict],
+    now: datetime.datetime,
+    manifest_version: str | None = None,
+    manifest_hash: str | None = None,
+) -> tuple[str, str]:
     """Return (status, reason) for one manifest scenario. `status` is one of
-    STATUSES. `reason` is a short human-readable explanation."""
+    STATUSES. `reason` is a short human-readable explanation.
+
+    `manifest_version`/`manifest_hash` are the CURRENT manifest's identity
+    (see `current_manifest_identity`) - when supplied, a record measuring a
+    different manifest revision is confounded even if its `fixture_hash`
+    still happens to match. `compute_coverage` always supplies both; the
+    parameters default to `None` (check skipped) only for direct unit-test
+    callers that construct scenario/record fixtures without a real
+    manifest."""
     latest = _latest_record(records, scenario["scenario_id"])
     if latest is None:
         return "missing", "no matching record in the records directory"
@@ -268,9 +309,36 @@ def scenario_status(scenario: dict, records: list[dict], now: datetime.datetime)
     if record_surface != scenario["surface"]:
         return "wrong-surface", f"manifest declares {scenario['surface']!r}, record measured {record_surface!r}"
 
+    record_operation = latest.get("operation")
+    if record_operation != scenario["operation"]:
+        return "confounded", f"operation mismatch: manifest {scenario['operation']!r} vs record {record_operation!r}"
+
+    record_workload_scenario_id = latest.get("workload", {}).get("scenario_id")
+    if record_workload_scenario_id != scenario["scenario_id"]:
+        return (
+            "confounded",
+            f"workload.scenario_id mismatch: manifest {scenario['scenario_id']!r} vs record {record_workload_scenario_id!r}",
+        )
+
     record_fixture_hash = latest.get("workload", {}).get("fixture_hash")
     if record_fixture_hash != scenario["fixture_hash"]:
         return "confounded", f"fixture_hash mismatch: manifest {scenario['fixture_hash']!r} vs record {record_fixture_hash!r}"
+
+    if manifest_version is not None:
+        record_manifest_version = latest.get("workload", {}).get("manifest_version")
+        if record_manifest_version != manifest_version:
+            return (
+                "confounded",
+                f"manifest_version mismatch: current {manifest_version!r} vs record {record_manifest_version!r}",
+            )
+
+    if manifest_hash is not None:
+        record_manifest_hash = latest.get("workload", {}).get("manifest_hash")
+        if record_manifest_hash != manifest_hash:
+            return (
+                "confounded",
+                f"manifest_hash mismatch: current {manifest_hash!r} vs record {record_manifest_hash!r}",
+            )
 
     cohort_mismatches = _cohort_mismatches(scenario, latest)
     if cohort_mismatches:
@@ -291,10 +359,11 @@ def scenario_status(scenario: dict, records: list[dict], now: datetime.datetime)
 
 def compute_coverage(manifest: dict, records: list[dict], now: datetime.datetime) -> dict:
     scenarios = manifest.get("scenario", [])
+    manifest_version, manifest_hash = current_manifest_identity(manifest)
     per_scenario = []
     counts = dict.fromkeys(STATUSES, 0)
     for sc in scenarios:
-        status, reason = scenario_status(sc, records, now)
+        status, reason = scenario_status(sc, records, now, manifest_version, manifest_hash)
         counts[status] += 1
         per_scenario.append(
             {

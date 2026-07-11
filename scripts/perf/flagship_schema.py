@@ -137,17 +137,20 @@ def validate_distribution(dist: dict, path: str = "distribution") -> list[str]:
             errors.append(_err(path, f"{name} must be a non-negative integer, got {value!r}"))
 
     errors_by_code = dist.get("errors_by_code")
-    if not isinstance(errors_by_code, dict):
+    errors_by_code_valid = isinstance(errors_by_code, dict)
+    if not errors_by_code_valid:
         errors.append(_err(path, "errors_by_code must be an object"))
     else:
         for code, count in errors_by_code.items():
             if not isinstance(code, str):
                 errors.append(_err(path, f"errors_by_code key must be a string, got {code!r}"))
+                errors_by_code_valid = False
             if not _is_nonneg_int(count):
                 errors.append(_err(path, f"errors_by_code[{code!r}] must be a non-negative integer, got {count!r}"))
+                errors_by_code_valid = False
 
-    if isinstance(attempts, int) and isinstance(successes, int) and isinstance(timed_out, int):
-        errors_total = sum(dist.get("errors_by_code", {}).values()) if isinstance(dist.get("errors_by_code"), dict) else 0
+    if isinstance(attempts, int) and isinstance(successes, int) and isinstance(timed_out, int) and errors_by_code_valid:
+        errors_total = sum(errors_by_code.values())
         if successes + timed_out + errors_total > attempts:
             errors.append(
                 _err(
@@ -226,7 +229,9 @@ def validate_record(record: dict) -> list[str]:
     if isinstance(scenario_id, str):
         parts = scenario_id.split(".")
         arm = record.get("arm")
-        if len(parts) == 4 and isinstance(arm, str) and arm and arm != parts[2]:
+        if len(parts) < 3:
+            errors.append(_err("scenario_id", f"must have at least 3 dot-separated segments, got {scenario_id!r}"))
+        elif isinstance(arm, str) and arm and arm != parts[2]:
             errors.append(_err("arm", f"must match the scenario_id arm segment {parts[2]!r}, got {arm!r}"))
 
     sha = record.get("sha")

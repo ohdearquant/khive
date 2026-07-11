@@ -250,6 +250,73 @@ class SchemaValidationTests(unittest.TestCase):
         errors = flagship_schema.validate_record(record)
         self.assertTrue(any("arm" in e for e in errors), errors)
 
+    def test_six_segment_f3_scenario_id_with_wrong_arm_is_rejected(self):
+        record = _base_record(
+            scenario_id="f3.context.query.hop0.budget4k.real",
+            feature="F3",
+            operation="context",
+            arm="entity_ids",
+            workload={
+                "manifest_version": "1",
+                "manifest_hash": "sha256:" + "d" * 64,
+                "scenario_id": "f3.context.query.hop0.budget4k.real",
+                "fixture": "kg_context_fixture",
+                "fixture_hash": "sha256:" + "a" * 64,
+                "scale": {"entities": 1},
+                "concurrency": 1,
+                "attempts": 1000,
+            },
+        )
+        errors = flagship_schema.validate_record(record)
+        self.assertTrue(any("arm" in e for e in errors), errors)
+
+    def test_scenario_id_with_fewer_than_3_segments_is_malformed(self):
+        record = _base_record(scenario_id="f1.recall")
+        errors = flagship_schema.validate_record(record)
+        self.assertTrue(any(e.startswith("scenario_id:") for e in errors), errors)
+
+    def test_errors_by_code_non_integer_value_is_flagged_not_raised(self):
+        dist = {
+            "estimator": "nearest_rank_v1",
+            "unit": "us",
+            "attempts": 10,
+            "successes": 8,
+            "timed_out": 0,
+            "errors_by_code": {"E_TIMEOUT": "two"},
+            "histogram_edges_us": [],
+            "histogram_counts": [],
+            "p50_us": None,
+            "p95_us": None,
+            "p99_us": None,
+            "max_us": None,
+            "conditional_on_success": True,
+        }
+        errors = flagship_schema.validate_distribution(dist)
+        self.assertTrue(any("errors_by_code" in e for e in errors), errors)
+
+    def test_errors_by_code_non_integer_value_through_validate_record(self):
+        record = _base_record(
+            distributions={
+                "latency": {
+                    "estimator": "nearest_rank_v1",
+                    "unit": "us",
+                    "attempts": 10,
+                    "successes": 8,
+                    "timed_out": 0,
+                    "errors_by_code": {"E_TIMEOUT": "two"},
+                    "histogram_edges_us": [],
+                    "histogram_counts": [],
+                    "p50_us": None,
+                    "p95_us": None,
+                    "p99_us": None,
+                    "max_us": None,
+                    "conditional_on_success": True,
+                }
+            }
+        )
+        errors = flagship_schema.validate_record(record)
+        self.assertTrue(any("errors_by_code" in e for e in errors), errors)
+
     def test_bad_status_enum_is_flagged(self):
         errors = flagship_schema.validate_record(_base_record(status="timed_out"))
         self.assertTrue(any(e.startswith("status:") for e in errors), errors)
@@ -456,6 +523,122 @@ class CoverageStatusTests(unittest.TestCase):
         status, reason = coverage_validator.scenario_status(scenario, [record], self.NOW)
         self.assertEqual(status, "confounded")
         self.assertIn("concurrency", reason)
+
+    def test_operation_mismatch_is_confounded(self):
+        scenario = _base_scenario(operation="memory.recall")
+        record = _base_record(timestamp="2026-07-10T00:00:00+00:00", operation="memory.remember")
+        status, reason = coverage_validator.scenario_status(scenario, [record], self.NOW)
+        self.assertEqual(status, "confounded")
+        self.assertIn("operation", reason)
+
+    def test_workload_scenario_id_mismatch_is_confounded(self):
+        scenario = _base_scenario()
+        record = _base_record(
+            timestamp="2026-07-10T00:00:00+00:00",
+            workload={
+                "manifest_version": "1",
+                "manifest_hash": "sha256:" + "d" * 64,
+                "scenario_id": "f1.recall.warm.hash",
+                "fixture": "memory_12k_sentinel_settled",
+                "fixture_hash": "sha256:" + "a" * 64,
+                "scale": {"memories": 12000},
+                "concurrency": 1,
+                "attempts": 1000,
+            },
+        )
+        status, reason = coverage_validator.scenario_status(scenario, [record], self.NOW)
+        self.assertEqual(status, "confounded")
+        self.assertIn("workload.scenario_id", reason)
+
+    def test_errors_by_code_non_integer_value_is_confounded_via_scenario_status(self):
+        scenario = _base_scenario()
+        record = _base_record(
+            timestamp="2026-07-10T00:00:00+00:00",
+            distributions={
+                "latency": {
+                    "estimator": "nearest_rank_v1",
+                    "unit": "us",
+                    "attempts": 10,
+                    "successes": 8,
+                    "timed_out": 0,
+                    "errors_by_code": {"E_TIMEOUT": "two"},
+                    "histogram_edges_us": [],
+                    "histogram_counts": [],
+                    "p50_us": None,
+                    "p95_us": None,
+                    "p99_us": None,
+                    "max_us": None,
+                    "conditional_on_success": True,
+                }
+            },
+        )
+        status, _ = coverage_validator.scenario_status(scenario, [record], self.NOW)
+        self.assertEqual(status, "confounded")
+
+    def test_manifest_hash_mismatch_is_confounded_via_compute_coverage(self):
+        scenario = _base_scenario()
+        manifest = {"scenario": [scenario]}
+        version, current_hash = coverage_validator.current_manifest_identity(manifest)
+        self.assertEqual(version, "1")
+        record = _base_record(
+            timestamp="2026-07-10T00:00:00+00:00",
+            workload={
+                "manifest_version": version,
+                "manifest_hash": "sha256:" + "e" * 64,  # differs from current_hash
+                "scenario_id": "f1.recall.warm.real",
+                "fixture": "memory_12k_sentinel_settled",
+                "fixture_hash": "sha256:" + "a" * 64,
+                "scale": {"memories": 12000},
+                "concurrency": 1,
+                "attempts": 1000,
+            },
+        )
+        self.assertNotEqual(record["workload"]["manifest_hash"], current_hash)
+        report = coverage_validator.compute_coverage(manifest, [record], self.NOW)
+        self.assertEqual(report["counts"]["confounded"], 1)
+        self.assertEqual(report["scenarios"][0]["status"], "confounded")
+        self.assertIn("manifest_hash", report["scenarios"][0]["reason"])
+
+    def test_manifest_version_mismatch_is_confounded_via_compute_coverage(self):
+        scenario = _base_scenario()
+        manifest = {"scenario": [scenario]}
+        _, current_hash = coverage_validator.current_manifest_identity(manifest)
+        record = _base_record(
+            timestamp="2026-07-10T00:00:00+00:00",
+            workload={
+                "manifest_version": "0",  # stale manifest revision
+                "manifest_hash": current_hash,
+                "scenario_id": "f1.recall.warm.real",
+                "fixture": "memory_12k_sentinel_settled",
+                "fixture_hash": "sha256:" + "a" * 64,
+                "scale": {"memories": 12000},
+                "concurrency": 1,
+                "attempts": 1000,
+            },
+        )
+        report = coverage_validator.compute_coverage(manifest, [record], self.NOW)
+        self.assertEqual(report["counts"]["confounded"], 1)
+        self.assertIn("manifest_version", report["scenarios"][0]["reason"])
+
+    def test_matching_manifest_identity_still_measured_via_compute_coverage(self):
+        scenario = _base_scenario()
+        manifest = {"scenario": [scenario]}
+        version, current_hash = coverage_validator.current_manifest_identity(manifest)
+        record = _base_record(
+            timestamp="2026-07-10T00:00:00+00:00",
+            workload={
+                "manifest_version": version,
+                "manifest_hash": current_hash,
+                "scenario_id": "f1.recall.warm.real",
+                "fixture": "memory_12k_sentinel_settled",
+                "fixture_hash": "sha256:" + "a" * 64,
+                "scale": {"memories": 12000},
+                "concurrency": 1,
+                "attempts": 1000,
+            },
+        )
+        report = coverage_validator.compute_coverage(manifest, [record], self.NOW)
+        self.assertEqual(report["counts"]["measured"], 1)
 
     def test_latest_record_wins_when_multiple_exist(self):
         scenario = _base_scenario()
