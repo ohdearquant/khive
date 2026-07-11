@@ -442,6 +442,8 @@ class ConcurrentFrameFloorTests(unittest.TestCase):
             self.assertEqual(out["timed_out"], 0)
             self.assertEqual(out["errors_by_code"], {"metrics_only": 3})
             self.assertIsNone(out["p50_us"])
+            self.assertIsNone(out["p95_us"])
+            self.assertIsNone(out["p99_us"])
             self.assertIsNone(out["max_us"])
         finally:
             server.close()
