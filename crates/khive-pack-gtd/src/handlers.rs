@@ -327,12 +327,23 @@ pub(crate) async fn resolve_context_entity_id(
     }
 }
 
+/// Status a task is treated as when the `status` property is missing/empty.
+/// Property filters that select this value must use `FilterOp::EqOrMissing`
+/// (not plain `Eq`) so legacy rows without a stored `status` still match —
+/// `json_extract` on an absent path is SQL `NULL`, which never equals a text
+/// literal.
+const DEFAULT_STATUS: &str = "inbox";
+
+/// Priority a task is treated as when the `priority` property is missing/empty.
+/// Same `EqOrMissing` rule as [`DEFAULT_STATUS`] applies.
+const DEFAULT_PRIORITY: &str = "p2";
+
 /// Status used internally on a task. Defaults to "inbox" when missing/empty.
 fn task_status(props: Option<&Value>) -> String {
     props
         .and_then(|p| p.get("status"))
         .and_then(|v| v.as_str())
-        .unwrap_or("inbox")
+        .unwrap_or(DEFAULT_STATUS)
         .to_string()
 }
 
@@ -342,7 +353,7 @@ fn priority_rank(props: Option<&Value>) -> u8 {
     let raw = props
         .and_then(|p| p.get("priority"))
         .and_then(|v| v.as_str())
-        .unwrap_or("p2")
+        .unwrap_or(DEFAULT_PRIORITY)
         .to_ascii_lowercase();
     match raw.as_str() {
         "p0" => 0,
@@ -370,12 +381,12 @@ pub fn render_task(note: &khive_storage::note::Note) -> Value {
     let status = props
         .get("status")
         .and_then(|v| v.as_str())
-        .unwrap_or("inbox")
+        .unwrap_or(DEFAULT_STATUS)
         .to_string();
     let priority = props
         .get("priority")
         .and_then(|v| v.as_str())
-        .unwrap_or("p2")
+        .unwrap_or(DEFAULT_PRIORITY)
         .to_string();
     let assignee = props.get("assignee").cloned().unwrap_or(Value::Null);
     let due = props.get("due").cloned().unwrap_or(Value::Null);
@@ -439,17 +450,29 @@ const TASK_SCAN_PAGE_SIZE: u32 = 500;
 /// Safety cap on pages scanned by [`fetch_all_matching_tasks`] — bounds
 /// worst-case memory/latency for a pathological namespace while covering
 /// realistic actionable-task backlogs. Issue #772: this must not reintroduce
-/// a silent fixed-window cap, so hitting this bound is a loud `tracing::warn!`,
-/// never a quiet truncation.
+/// a silent fixed-window cap. When the store reports more matching rows than
+/// this bound covers, the scan is aborted up front with an explicit error
+/// (see [`TASK_SCAN_MAX_ROWS`]) rather than silently returning a truncated,
+/// possibly priority-incomplete result.
 const TASK_SCAN_MAX_PAGES: u32 = 40;
 
+/// Total matching rows [`fetch_all_matching_tasks`] will scan before refusing
+/// the query outright. A query whose `COUNT(*)` exceeds this must be rejected
+/// before any priority sort runs — sorting a partial candidate set can hide
+/// an older, higher-priority task that fell outside the scan window.
+const TASK_SCAN_MAX_ROWS: u64 = TASK_SCAN_MAX_PAGES as u64 * TASK_SCAN_PAGE_SIZE as u64;
+
 /// Fetch every `task` note matching `property_filters`, paging through the
-/// store until exhausted (or the safety cap is hit) rather than pre-fetching
-/// a single fixed-size unfiltered window. The predicate is pushed into SQL via
+/// store until exhausted rather than pre-fetching a single fixed-size
+/// unfiltered window. The predicate is pushed into SQL via
 /// `query_notes_filtered`, so the candidate set this returns is bounded by how
 /// many tasks actually match — not by how many task notes of any status exist
 /// (the #772 bug: a fixed unfiltered window could be entirely filled by newer
 /// non-matching churn, hiding older matching tasks regardless of priority).
+///
+/// If the first page's `total` exceeds [`TASK_SCAN_MAX_ROWS`], this returns
+/// `Err(InvalidInput)` instead of scanning a truncated subset — callers must
+/// narrow the filters (e.g. add `assignee`) so the result stays complete.
 async fn fetch_all_matching_tasks(
     runtime: &KhiveRuntime,
     token: &NamespaceToken,
@@ -486,20 +509,34 @@ async fn fetch_all_matching_tasks(
             )
             .await
             .map_err(|e| RuntimeError::Internal(format!("query_notes_filtered: {e}")))?;
+        if page_idx == 0 {
+            if let Some(total) = page.total {
+                if total > TASK_SCAN_MAX_ROWS {
+                    return Err(RuntimeError::InvalidInput(format!(
+                        "gtd: {total} tasks match this query, which exceeds the \
+                         {TASK_SCAN_MAX_ROWS}-row scan bound; narrow the filters \
+                         (e.g. specify assignee) and retry so results stay complete \
+                         and priority-ordered instead of being silently truncated"
+                    )));
+                }
+            }
+        }
         let fetched = page.items.len() as u32;
         notes.extend(page.items);
         if fetched < TASK_SCAN_PAGE_SIZE {
             return Ok(notes);
         }
         offset += TASK_SCAN_PAGE_SIZE;
-        if page_idx + 1 == TASK_SCAN_MAX_PAGES {
-            tracing::warn!(
-                namespace = token.namespace().as_str(),
-                scanned = TASK_SCAN_MAX_PAGES * TASK_SCAN_PAGE_SIZE,
-                "gtd: task scan hit safety cap; results may be incomplete"
-            );
-        }
     }
+    // Reached only if the matching-row count grew past TASK_SCAN_MAX_ROWS
+    // between the first page's COUNT(*) and this scan completing (concurrent
+    // writes) — the up-front check above is the primary defense. Warn loudly
+    // rather than silently return a possibly priority-incomplete set.
+    tracing::warn!(
+        namespace = token.namespace().as_str(),
+        scanned = TASK_SCAN_MAX_ROWS,
+        "gtd: task scan hit safety cap after total-based check passed; results may be incomplete"
+    );
     Ok(notes)
 }
 
@@ -1112,7 +1149,17 @@ impl GtdPack {
         let mut property_filters = vec![match status_filter.as_deref() {
             Some(want) => PropertyFilter {
                 json_path: "$.status".to_string(),
-                op: FilterOp::Eq,
+                // A legacy task with no stored `status` property is treated as
+                // `inbox` everywhere else in this pack (`task_status`,
+                // `render_task`). `json_extract` on an absent path is SQL
+                // NULL, which `Eq` never matches, so an explicit
+                // `status="inbox"` query would silently exclude those rows —
+                // `EqOrMissing` restores the "absent counts as default" rule.
+                op: if want == DEFAULT_STATUS {
+                    FilterOp::EqOrMissing
+                } else {
+                    FilterOp::Eq
+                },
                 value: SqlValue::Text(want.to_string()),
             },
             None => PropertyFilter {
@@ -1135,11 +1182,19 @@ impl GtdPack {
             // Priorities are always stored lowercase (`task_create`/
             // `prepare_transition` normalize via `to_ascii_lowercase`), so an
             // exact-match SQL predicate on the lowercased input reproduces
-            // the prior `eq_ignore_ascii_case` behavior.
+            // the prior `eq_ignore_ascii_case` behavior. A legacy task with no
+            // stored `priority` renders as `p2` (`priority_rank`,
+            // `render_task`), so `priority="p2"` must also match the missing
+            // case via `EqOrMissing` — plain `Eq` never matches SQL NULL.
+            let want = want.to_ascii_lowercase();
             property_filters.push(PropertyFilter {
                 json_path: "$.priority".to_string(),
-                op: FilterOp::Eq,
-                value: SqlValue::Text(want.to_ascii_lowercase()),
+                op: if want == DEFAULT_PRIORITY {
+                    FilterOp::EqOrMissing
+                } else {
+                    FilterOp::Eq
+                },
+                value: SqlValue::Text(want),
             });
         }
 

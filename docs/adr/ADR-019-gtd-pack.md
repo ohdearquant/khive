@@ -502,7 +502,14 @@ minimal. Operators who want GTD configure it explicitly.
 - The `task` note kind is not a compile-time enum value. Validators must consult
   `VerbRegistry::all_note_kinds()`, not hard-coded sets.
   Mitigated: ADR-017's pattern; new packs work the same way.
-- `next` / `tasks` scan up to 500 recent tasks and filter in-memory. Fine for
+- `next` / `tasks` push status/assignee/priority predicates into SQL via
+  `query_notes_filtered` (issue #772) and page through every matching row (up
+  to 500 per page, 40 pages) instead of pre-fetching a fixed unfiltered
+  recency window. This keeps the candidate set bounded by how many tasks
+  actually match, not by how much unrelated churn exists. If a query matches
+  more than the 20,000-row scan bound, the op returns an explicit error
+  asking the caller to narrow the filters (e.g. add `assignee`) rather than
+  silently truncating and risking a hidden older `p0` task. Fine for
   personal/agent workloads (typical inboxes < 50 actionable items); will need
   property indexes or a v2 SQL path at hundreds-of-thousands scale.
 - Same-status transitions are no-ops, which can surprise callers expecting a write.

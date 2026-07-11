@@ -2427,14 +2427,14 @@ async fn tasks_finds_done_task_older_than_fixed_window() {
     );
 }
 
-/// `gtd.tasks` pages must not overlap: real SQL-level `LIMIT`/`OFFSET`
-/// pagination (this fix) must keep behaving correctly for the common case
-/// where every row already matches the filter, guarding against a regression
-/// back to any offset-0-refetch pattern.
+/// #772 follow-up (Major finding): when more tasks match the actionable
+/// filter than the scan safety bound covers, `gtd.next` must return an
+/// explicit error asking the caller to narrow the query instead of silently
+/// sorting and truncating a partial candidate set — a partial set can hide
+/// an older, higher-priority task that fell outside the scan window.
 #[tokio::test]
-async fn tasks_pagination_returns_disjoint_pages() {
+async fn next_returns_explicit_error_when_matches_exceed_scan_bound() {
     use khive_storage::note::Note;
-    use std::collections::HashSet;
 
     let runtime = rt();
     let token = runtime
@@ -2443,7 +2443,7 @@ async fn tasks_pagination_returns_disjoint_pages() {
     let note_store = runtime.notes(&token).expect("note store");
 
     let now = chrono::Utc::now().timestamp_micros();
-    let tasks: Vec<Note> = (0..60_u32)
+    let tasks: Vec<Note> = (0..20_001_u32)
         .map(|i| Note {
             id: uuid::Uuid::new_v4(),
             namespace: "local".to_string(),
@@ -2460,7 +2460,195 @@ async fn tasks_pagination_returns_disjoint_pages() {
             deleted_at: None,
         })
         .collect();
+    note_store
+        .upsert_notes(tasks)
+        .await
+        .expect("insert tasks over scan bound");
+
+    let pack = pack(runtime);
+    let err = pack
+        .dispatch("gtd.next", json!({}))
+        .await
+        .expect_err("gtd.next must reject a query matching more rows than the scan bound covers");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("exceeds") && msg.contains("scan bound"),
+        "error must explain the scan bound was exceeded; got: {msg}"
+    );
+}
+
+/// Regression for a push-down bug where an explicit `status="inbox"` filter
+/// used a plain `Eq` predicate against `json_extract(properties, '$.status')`.
+/// `json_extract` on a legacy row with no stored `status` key evaluates to
+/// SQL `NULL`, which `Eq` never matches, even though every other code path
+/// (`task_status`, `render_task`) treats a missing `status` as `"inbox"`.
+/// The filter must use `EqOrMissing` so `status="inbox"` also surfaces tasks
+/// that predate the `status` property being written at all.
+#[tokio::test]
+async fn tasks_status_inbox_filter_matches_legacy_task_missing_status_property() {
+    use khive_storage::note::Note;
+
+    let runtime = rt();
+    let token = runtime
+        .authorize(khive_runtime::Namespace::local())
+        .unwrap();
+    let note_store = runtime.notes(&token).expect("note store");
+
+    let now = chrono::Utc::now().timestamp_micros();
+    let legacy_task = Note {
+        id: uuid::Uuid::new_v4(),
+        namespace: "local".to_string(),
+        kind: "task".to_string(),
+        status: "active".to_string(),
+        name: Some("legacy-no-status".to_string()),
+        content: "task predating the status property".to_string(),
+        salience: None,
+        decay_factor: None,
+        expires_at: None,
+        properties: Some(json!({})),
+        created_at: now,
+        updated_at: now,
+        deleted_at: None,
+    };
+    note_store
+        .upsert_note(legacy_task)
+        .await
+        .expect("insert legacy task");
+
+    let pack = pack(runtime);
+    let result = pack
+        .dispatch("gtd.tasks", json!({"status": "inbox"}))
+        .await
+        .unwrap();
+    let arr = result.as_array().unwrap();
+    assert!(
+        arr.iter()
+            .any(|t| t["title"].as_str() == Some("legacy-no-status")),
+        "gtd.tasks(status=\"inbox\") must surface a legacy task with no stored \
+         status property, since a missing status defaults to inbox everywhere \
+         else; result: {result:?}"
+    );
+}
+
+/// Same bug as above, for `priority="p2"`: a legacy task with no stored
+/// `priority` property renders as `p2` (`priority_rank`, `render_task`), so
+/// an explicit `priority="p2"` filter must also match it via `EqOrMissing`.
+#[tokio::test]
+async fn tasks_priority_p2_filter_matches_legacy_task_missing_priority_property() {
+    use khive_storage::note::Note;
+
+    let runtime = rt();
+    let token = runtime
+        .authorize(khive_runtime::Namespace::local())
+        .unwrap();
+    let note_store = runtime.notes(&token).expect("note store");
+
+    let now = chrono::Utc::now().timestamp_micros();
+    let legacy_task = Note {
+        id: uuid::Uuid::new_v4(),
+        namespace: "local".to_string(),
+        kind: "task".to_string(),
+        status: "active".to_string(),
+        name: Some("legacy-no-priority".to_string()),
+        content: "task predating the priority property".to_string(),
+        salience: None,
+        decay_factor: None,
+        expires_at: None,
+        properties: Some(json!({"status": "next"})),
+        created_at: now,
+        updated_at: now,
+        deleted_at: None,
+    };
+    note_store
+        .upsert_note(legacy_task)
+        .await
+        .expect("insert legacy task");
+
+    let pack = pack(runtime);
+    let result = pack
+        .dispatch("gtd.tasks", json!({"priority": "p2"}))
+        .await
+        .unwrap();
+    let arr = result.as_array().unwrap();
+    assert!(
+        arr.iter()
+            .any(|t| t["title"].as_str() == Some("legacy-no-priority")),
+        "gtd.tasks(priority=\"p2\") must surface a legacy task with no stored \
+         priority property, since a missing priority renders as p2 everywhere \
+         else; result: {result:?}"
+    );
+}
+
+/// `gtd.tasks` pages must not overlap, and must stay complete, even when
+/// 500+ newer *non-matching* task notes exist alongside the matching set.
+///
+/// A weaker version of this test (matching rows only, no filler) would still
+/// pass under the pre-#772 implementation: with nothing to fill the old
+/// fixed-size unfiltered pre-fetch window, plain offset slicing over an
+/// all-matching set can look correct by coincidence. This version plants
+/// 600 newer `done` filler rows (excluded by the default status filter) so
+/// the old "pre-fetch `offset + limit + 500` unfiltered rows, then filter in
+/// Rust" behavior would have its window consumed by fillers and either drop
+/// matching rows or return short/overlapping pages. Real SQL-side
+/// `LIMIT`/`OFFSET` pagination over the pushed-down filter must still return
+/// full, disjoint pages containing only the expected matching records.
+#[tokio::test]
+async fn tasks_pagination_returns_disjoint_pages() {
+    use khive_storage::note::Note;
+    use std::collections::HashSet;
+
+    let runtime = rt();
+    let token = runtime
+        .authorize(khive_runtime::Namespace::local())
+        .unwrap();
+    let note_store = runtime.notes(&token).expect("note store");
+
+    // Matching set: 60 non-terminal tasks with older timestamps.
+    let base_ts = chrono::Utc::now().timestamp_micros() - 1_000_000_000_000;
+    let tasks: Vec<Note> = (0..60_u32)
+        .map(|i| Note {
+            id: uuid::Uuid::new_v4(),
+            namespace: "local".to_string(),
+            kind: "task".to_string(),
+            status: "active".to_string(),
+            name: Some(format!("task-{i}")),
+            content: format!("task {i}"),
+            salience: None,
+            decay_factor: None,
+            expires_at: None,
+            properties: Some(json!({"status": "next"})),
+            created_at: base_ts + i64::from(i),
+            updated_at: base_ts + i64::from(i),
+            deleted_at: None,
+        })
+        .collect();
+    let expected_ids: HashSet<uuid::Uuid> = tasks.iter().map(|t| t.id).collect();
     note_store.upsert_notes(tasks).await.expect("insert tasks");
+
+    // Non-matching filler: 600 `done` tasks, all newer than the matching set,
+    // excluded by `gtd.tasks`' default status filter (done/cancelled).
+    let now = chrono::Utc::now().timestamp_micros();
+    let fillers: Vec<Note> = (0..600_u32)
+        .map(|i| Note {
+            id: uuid::Uuid::new_v4(),
+            namespace: "local".to_string(),
+            kind: "task".to_string(),
+            status: "done".to_string(),
+            name: Some(format!("filler-{i}")),
+            content: format!("filler task {i}"),
+            salience: None,
+            decay_factor: None,
+            expires_at: None,
+            properties: Some(json!({"status": "done"})),
+            created_at: now + i64::from(i),
+            updated_at: now + i64::from(i),
+            deleted_at: None,
+        })
+        .collect();
+    note_store
+        .upsert_notes(fillers)
+        .await
+        .expect("insert fillers");
 
     let pack = pack(runtime);
     let page1 = pack
@@ -2469,6 +2657,10 @@ async fn tasks_pagination_returns_disjoint_pages() {
         .unwrap();
     let page2 = pack
         .dispatch("gtd.tasks", json!({"limit": 20, "offset": 20}))
+        .await
+        .unwrap();
+    let page3 = pack
+        .dispatch("gtd.tasks", json!({"limit": 20, "offset": 40}))
         .await
         .unwrap();
 
@@ -2484,12 +2676,35 @@ async fn tasks_pagination_returns_disjoint_pages() {
         .iter()
         .map(|t| t["full_id"].as_str().unwrap())
         .collect();
+    let ids3: HashSet<&str> = page3
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["full_id"].as_str().unwrap())
+        .collect();
 
-    assert_eq!(ids1.len(), 20);
-    assert_eq!(ids2.len(), 20);
+    assert_eq!(ids1.len(), 20, "page1 must be full; got {ids1:?}");
+    assert_eq!(ids2.len(), 20, "page2 must be full; got {ids2:?}");
+    assert_eq!(ids3.len(), 20, "page3 must be full; got {ids3:?}");
     assert!(
-        ids1.is_disjoint(&ids2),
+        ids1.is_disjoint(&ids2) && ids2.is_disjoint(&ids3) && ids1.is_disjoint(&ids3),
         "pages at different offsets must not overlap (issue #772 offset-0 \
-         refetch bug); page1={ids1:?} page2={ids2:?}"
+         refetch bug); page1={ids1:?} page2={ids2:?} page3={ids3:?}"
+    );
+
+    let all_returned: HashSet<uuid::Uuid> = ids1
+        .iter()
+        .chain(ids2.iter())
+        .chain(ids3.iter())
+        .map(|s| uuid::Uuid::parse_str(s).unwrap())
+        .collect();
+    assert_eq!(
+        all_returned.len(),
+        60,
+        "all 60 matching tasks must be covered across the 3 pages; got {all_returned:?}"
+    );
+    assert!(
+        all_returned.is_subset(&expected_ids),
+        "returned tasks must be exactly the matching set, no filler rows leaked in"
     );
 }
