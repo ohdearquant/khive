@@ -470,8 +470,20 @@ impl CheckpointSeverityState {
 /// Run the WAL checkpoint background task.
 ///
 /// This is a long-running async task that should be spawned with
-/// `tokio::spawn`. It loops until the pool is dropped (the `Arc` count
-/// falls to one, meaning this task holds the last reference).
+/// `tokio::spawn`. It loops until `shutdown_rx` observes a change (or its
+/// sender is dropped), at which point it exits on its next `select!` wakeup.
+/// Callers should hold the paired `tokio::sync::watch::Sender` for the
+/// daemon's run scope and send on it as part of the shutdown sequence.
+///
+/// An earlier version of this task used `Arc::strong_count(&pool) <= 1` as
+/// its exit condition instead of an explicit signal. That check is
+/// unreachable whenever a sibling owner holds its own clone of `pool` for
+/// the task's lifetime — which the production boot path does: `event_store`
+/// (`Option<Arc<dyn EventStore>>`), when `Some`, is a `SqlEventStore` that
+/// retains its own `Arc::clone` of the same pool, so the task always
+/// observed `strong_count == 2` and never exited via that mechanism
+/// (issue #774). The explicit watch channel does not depend on how many
+/// other owners exist.
 ///
 /// The task issues `PRAGMA wal_checkpoint(PASSIVE)` on every tick — ordinary
 /// ticks stay PASSIVE-only and non-blocking; see the module-level doc for the
@@ -501,6 +513,7 @@ pub async fn run_checkpoint_task(
     config: CheckpointConfig,
     event_store: Option<Arc<dyn khive_storage::EventStore>>,
     namespace: String,
+    mut shutdown_rx: tokio::sync::watch::Receiver<()>,
 ) {
     let mut interval = tokio::time::interval(config.interval);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -514,12 +527,13 @@ pub async fn run_checkpoint_task(
     let mut event_was_elevated = false;
 
     loop {
-        interval.tick().await;
-
-        // Stop looping when this task is the sole Arc holder — the daemon is
-        // shutting down and the pool will be dropped imminently.
-        if Arc::strong_count(&pool) <= 1 {
-            break;
+        // A closed sender (the daemon returning without an explicit send)
+        // makes `changed()` resolve with `Err` immediately, which `select!`
+        // treats as ready — so shutdown is observed either way, not just on
+        // an explicit send.
+        tokio::select! {
+            _ = interval.tick() => {}
+            _ = shutdown_rx.changed() => break,
         }
 
         let tick = checkpoint_once(&pool, &config, &mut truncate_state);
@@ -1178,9 +1192,9 @@ mod tests {
 
     #[tokio::test]
     #[serial(checkpoint_skip_metrics)]
-    async fn checkpoint_task_exits_when_pool_dropped() {
+    async fn checkpoint_task_exits_on_shutdown_signal() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("wal_task_drop.db");
+        let path = dir.path().join("wal_task_shutdown.db");
         let pool = file_pool(&path);
 
         // Use a very short interval so the task ticks quickly in the test.
@@ -1189,25 +1203,84 @@ mod tests {
             ..Default::default()
         };
 
-        let weak = Arc::downgrade(&pool);
-        let task_pool = Arc::clone(&pool);
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(());
         let handle = tokio::spawn(run_checkpoint_task(
-            task_pool,
+            pool,
             cfg,
             None,
             "local".to_string(),
+            shutdown_rx,
         ));
 
-        // Drop our copy — only the task holds the Arc now.
-        drop(pool);
+        shutdown_tx.send(()).expect("send shutdown signal");
 
-        // The task detects strong_count == 1 on its next tick and exits.
         tokio::time::timeout(Duration::from_secs(1), handle)
             .await
             .expect("checkpoint task should exit within 1s")
             .expect("checkpoint task panicked");
+    }
 
-        assert!(weak.upgrade().is_none(), "pool should be fully dropped");
+    /// Regression for issue #774: on the production boot path, the daemon
+    /// passes `run_checkpoint_task` both `pool` directly and an
+    /// `event_store` that internally retains its own `Arc::clone` of the
+    /// same pool (`SqlEventStore::new_scoped`). A strong-count-based exit
+    /// condition can never fire in that shape, because the task always
+    /// observes at least two live clones — its own `pool` argument plus the
+    /// one buried in `event_store`. This test reproduces that exact
+    /// ownership shape (a real `SqlEventStore` holding a sibling clone) and
+    /// asserts the task still exits promptly via the watch-channel signal,
+    /// proving the fix does not depend on `Arc::strong_count` at all.
+    #[tokio::test]
+    #[serial(checkpoint_skip_metrics)]
+    async fn checkpoint_task_exits_via_shutdown_signal_with_live_event_store_pool_clone() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wal_task_event_store.db");
+        let pool = file_pool(&path);
+
+        let cfg = CheckpointConfig {
+            interval: Duration::from_millis(10),
+            ..Default::default()
+        };
+
+        let event_store: Arc<dyn khive_storage::EventStore> =
+            Arc::new(crate::stores::event::SqlEventStore::new_scoped(
+                Arc::clone(&pool),
+                true,
+                "local".to_string(),
+            ));
+        // A second, independent sibling clone of `pool` outlives this test
+        // function's own binding — mirrors `StorageBackend` retaining
+        // `self.pool` alongside the `SqlEventStore` it hands to the
+        // checkpoint task in production.
+        let sibling_pool_clone = Arc::clone(&pool);
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(());
+        let handle = tokio::spawn(run_checkpoint_task(
+            pool,
+            cfg,
+            Some(event_store),
+            "local".to_string(),
+            shutdown_rx,
+        ));
+
+        // Confirm strong_count is well above 1 — the old check would spin
+        // forever here — before proving the new signal-based exit works
+        // regardless.
+        assert!(
+            Arc::strong_count(&sibling_pool_clone) > 1,
+            "test setup must reproduce the multi-owner shape the bug depends on"
+        );
+
+        shutdown_tx.send(()).expect("send shutdown signal");
+
+        tokio::time::timeout(Duration::from_secs(1), handle)
+            .await
+            .expect(
+                "checkpoint task should exit within 1s via the watch signal, \
+                 even with a live sibling Arc<ConnectionPool> clone held by \
+                 the event store",
+            )
+            .expect("checkpoint task panicked");
     }
 
     #[test]
@@ -2072,22 +2145,21 @@ mod tests {
         let store = Arc::new(FakeEventStore::default());
         let store_dyn: Arc<dyn khive_storage::EventStore> = store.clone();
 
-        let weak = Arc::downgrade(&pool);
-        let task_pool = Arc::clone(&pool);
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(());
         let handle = tokio::spawn(run_checkpoint_task(
-            task_pool,
+            pool,
             cfg,
             Some(store_dyn),
             "local".to_string(),
+            shutdown_rx,
         ));
 
         tokio::time::sleep(Duration::from_millis(60)).await;
-        drop(pool);
+        shutdown_tx.send(()).expect("send shutdown signal");
         tokio::time::timeout(Duration::from_secs(1), handle)
             .await
             .expect("checkpoint task should exit within 1s")
             .expect("checkpoint task panicked");
-        assert!(weak.upgrade().is_none());
 
         let events = store.events.lock().unwrap();
         assert!(
@@ -2123,22 +2195,21 @@ mod tests {
         let store = Arc::new(FakeEventStore::default());
         let store_dyn: Arc<dyn khive_storage::EventStore> = store.clone();
 
-        let weak = Arc::downgrade(&pool);
-        let task_pool = Arc::clone(&pool);
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(());
         let handle = tokio::spawn(run_checkpoint_task(
-            task_pool,
+            pool,
             cfg,
             Some(store_dyn),
             "local".to_string(),
+            shutdown_rx,
         ));
 
         tokio::time::sleep(Duration::from_millis(60)).await;
-        drop(pool);
+        shutdown_tx.send(()).expect("send shutdown signal");
         tokio::time::timeout(Duration::from_secs(1), handle)
             .await
             .expect("checkpoint task should exit within 1s")
             .expect("checkpoint task panicked");
-        assert!(weak.upgrade().is_none());
 
         assert!(
             store.events.lock().unwrap().is_empty(),
@@ -2159,21 +2230,20 @@ mod tests {
             ..CheckpointConfig::default()
         };
 
-        let weak = Arc::downgrade(&pool);
-        let task_pool = Arc::clone(&pool);
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(());
         let handle = tokio::spawn(run_checkpoint_task(
-            task_pool,
+            pool,
             cfg,
             None,
             "local".to_string(),
+            shutdown_rx,
         ));
 
         tokio::time::sleep(Duration::from_millis(40)).await;
-        drop(pool);
+        shutdown_tx.send(()).expect("send shutdown signal");
         tokio::time::timeout(Duration::from_secs(1), handle)
             .await
             .expect("checkpoint task should exit within 1s")
             .expect("checkpoint task panicked");
-        assert!(weak.upgrade().is_none());
     }
 }

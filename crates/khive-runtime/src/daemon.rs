@@ -954,11 +954,25 @@ pub async fn run_daemon_with_boot_guard<D: DaemonDispatch>(
         });
     }
 
+    // #774: the checkpoint task's own strong-count-based exit is unreachable
+    // whenever `event_store_for_checkpoint()` returns `Some` (the ordinary
+    // production shape), because the `SqlEventStore` it wraps retains its
+    // own clone of the same pool. An explicit watch channel replaces that
+    // mechanism: the sender is held for the remainder of this function's
+    // scope and signalled as the first action once shutdown is observed,
+    // below.
+    let (checkpoint_shutdown_tx, checkpoint_shutdown_rx) = tokio::sync::watch::channel(());
     if let Some(pool) = dispatcher.pool_for_checkpoint() {
         let cfg = CheckpointConfig::from_env();
         let event_store = dispatcher.event_store_for_checkpoint();
         let namespace = dispatcher.namespace().to_string();
-        tokio::spawn(run_checkpoint_task(pool, cfg, event_store, namespace));
+        track_background_task(run_checkpoint_task(
+            pool,
+            cfg,
+            event_store,
+            namespace,
+            checkpoint_shutdown_rx,
+        ));
         tracing::info!("WAL checkpoint task started");
     }
 
@@ -997,6 +1011,11 @@ pub async fn run_daemon_with_boot_guard<D: DaemonDispatch>(
         } => {}
         _ = shutdown => {}
     }
+
+    // Signal the checkpoint task to exit before draining, so `drain()`
+    // actually waits on it via `track_background_task` rather than the
+    // task outliving the drain window (or the process) unsignalled.
+    let _ = checkpoint_shutdown_tx.send(());
 
     drain(&active).await;
 
