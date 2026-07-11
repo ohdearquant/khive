@@ -37,5 +37,6 @@ pub mod write_argv;
 pub mod write_handlers;
 #[cfg(test)]
 mod write_handlers_tests;
+pub mod write_policy;
 
 pub use pack::GitPack;

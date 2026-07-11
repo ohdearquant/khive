@@ -1,12 +1,16 @@
-//! `git.commit` / `git.branch` / `git.push` verb handlers (ADR-108).
+//! `git.commit` / `git.branch` / `git.push` verb handlers (ADR-108, amended
+//! by the ADR-108 Amendment).
 //!
 //! Thin, 1:1 wrappers over system `git`, shelled via
 //! `std::process::Command::args` (never a shell string) with every
 //! caller-supplied value validated and assembled into an argv vector by
 //! `crate::write_argv` before it reaches the process boundary. `repo` is an
-//! ordinary verb argument, exactly like every other khive verb — the Gate
-//! (ADR-018) decides allow/deny before any of these functions run; nothing
-//! here re-implements authorization.
+//! ordinary verb argument like every other khive verb — the Gate (ADR-018)
+//! still decides allow/deny before any of these functions run, but it is no
+//! longer the only enforcement point: `enforce_write_policy` below is a
+//! handler-level precondition, fail-closed independent of Gate
+//! configuration, resolved by `crate::write_policy` against the operator's
+//! `[git_write]` allowlist (ADR-108 Amendment).
 //!
 //! Every successful write additionally appends a `git.write`-shaped `Event`
 //! (kind `Audit`, ADR-108 rule 2) carrying `repo`/`branch`/`sha` beyond what
@@ -25,9 +29,14 @@ use crate::write_argv::{
     build_add_argv, build_branch_argv, build_commit_argv, build_push_argv, reject_force,
     validate_repo_path, GitArgError,
 };
+use crate::write_policy::{load_git_write_policy, GitWritePolicyError};
 use crate::GitPack;
 
 fn to_invalid_input(e: GitArgError) -> RuntimeError {
+    RuntimeError::InvalidInput(e.to_string())
+}
+
+fn to_policy_denied(e: GitWritePolicyError) -> RuntimeError {
     RuntimeError::InvalidInput(e.to_string())
 }
 
@@ -73,8 +82,25 @@ fn parse_force_param(params: &Value) -> Result<Option<bool>, RuntimeError> {
 
 /// Runs `git -C <repo> <argv...>`, argv-only (no shell), returning stdout on
 /// success or a `RuntimeError` carrying git's stderr on failure.
+///
+/// Every invocation disables repo-configured hooks via
+/// `-c core.hooksPath=/dev/null` (ADR-108 Amendment), mirroring
+/// `crate::cache`'s hardened clone/fetch invocations: this function runs in
+/// the daemon's own credential context, so a hook script committed into an
+/// allowlisted repo (e.g. `.git/hooks/pre-commit`) must never get a chance
+/// to execute as a side effect of a khive-mediated write. `GIT_CONFIG_GLOBAL`
+/// / `GIT_CONFIG_SYSTEM` are deliberately left untouched here, unlike the
+/// test harness's hermetic `git_command` helper: these are real,
+/// operator-owned repos, and a commit/push needs the operator's actual
+/// author identity and credential helpers (SSH keys, `credential.helper`)
+/// configured in global/system git config to work at all — neutralizing
+/// that config would break the legitimate write path along with the attack
+/// surface it does not itself pose (hooks are the RCE risk; identity/
+/// credential config is not).
 fn run_git(repo: &Path, argv: &[String]) -> Result<String, RuntimeError> {
     let output = Command::new("git")
+        .arg("-c")
+        .arg("core.hooksPath=/dev/null")
         .arg("-C")
         .arg(repo)
         .args(argv)
@@ -89,7 +115,39 @@ fn run_git(repo: &Path, argv: &[String]) -> Result<String, RuntimeError> {
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
+/// Reads the repo's currently checked-out branch via `git symbolic-ref`.
+/// `git.commit` has no explicit branch argument — the branch it actually
+/// writes to is whatever is checked out — so this is what
+/// `enforce_write_policy` checks the allowlist against for that verb.
+/// Errors (e.g. detached HEAD) surface as an ordinary handler error.
+fn current_branch(repo: &Path) -> Result<String, RuntimeError> {
+    let out = run_git(
+        repo,
+        &[
+            "symbolic-ref".to_string(),
+            "--short".to_string(),
+            "HEAD".to_string(),
+        ],
+    )?;
+    Ok(out.trim().to_string())
+}
+
 impl GitPack {
+    /// Handler-level fail-closed precondition (ADR-108 Amendment), enforced
+    /// before any of the three write verbs mutate a repository: the write
+    /// verbs are unavailable unless a `[git_write]` policy is configured,
+    /// and even then `repo`/`branch` must resolve to an allowlisted entry.
+    /// This runs in addition to, not instead of, the Gate (ADR-018) —
+    /// deliberately not dependent on Gate configuration, the same
+    /// enforcement class as [`crate::write_argv::reject_force`]'s
+    /// unconditional force-push denial.
+    fn enforce_write_policy(&self, repo: &Path, branch: &str) -> Result<(), RuntimeError> {
+        let db_path = self.runtime().config().db_path.as_deref();
+        let policy = load_git_write_policy(db_path)
+            .map_err(|e| RuntimeError::InvalidInput(format!("loading [git_write] policy: {e}")))?;
+        policy.check(repo, branch).map_err(to_policy_denied)
+    }
+
     pub(crate) async fn handle_commit(
         &self,
         token: &NamespaceToken,
@@ -105,12 +163,19 @@ impl GitPack {
         let paths = parse_paths_param(&params)?;
         let author = params.get("author").and_then(Value::as_str);
 
-        if !paths.is_empty() {
-            let add_argv = build_add_argv(&paths).map_err(to_invalid_input)?;
+        let add_argv = if paths.is_empty() {
+            None
+        } else {
+            Some(build_add_argv(&paths).map_err(to_invalid_input)?)
+        };
+        let commit_argv = build_commit_argv(message, &paths, author).map_err(to_invalid_input)?;
+
+        let branch = current_branch(&repo)?;
+        self.enforce_write_policy(&repo, &branch)?;
+
+        if let Some(add_argv) = add_argv {
             run_git(&repo, &add_argv)?;
         }
-
-        let commit_argv = build_commit_argv(message, &paths, author).map_err(to_invalid_input)?;
         run_git(&repo, &commit_argv)?;
 
         let sha = run_git(&repo, &["rev-parse".to_string(), "HEAD".to_string()])?
@@ -141,6 +206,9 @@ impl GitPack {
         let from = params.get("from").and_then(Value::as_str);
 
         let argv = build_branch_argv(name, from).map_err(to_invalid_input)?;
+
+        self.enforce_write_policy(&repo, name)?;
+
         run_git(&repo, &argv)?;
 
         self.emit_write_audit(token, "git.branch", &repo, Some(name), None)
@@ -174,6 +242,9 @@ impl GitPack {
         reject_force(force).map_err(to_invalid_input)?;
 
         let argv = build_push_argv(remote, branch).map_err(to_invalid_input)?;
+
+        self.enforce_write_policy(&repo, branch)?;
+
         run_git(&repo, &argv)?;
 
         self.emit_write_audit(token, "git.push", &repo, Some(branch), None)
