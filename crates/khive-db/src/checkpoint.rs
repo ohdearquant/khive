@@ -1562,7 +1562,7 @@ mod tests {
     /// at/above `truncate_high_water_pages` and no prior attempt has run, the
     /// escalation fires and stamps `last_attempt`.
     #[test]
-    #[serial(tx_registry)]
+    #[serial(tx_registry, checkpoint_skip_metrics)]
     fn truncate_attempts_when_high_water_crossed_with_no_prior_attempt() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("truncate_trigger.db");
@@ -1604,7 +1604,7 @@ mod tests {
     /// Below-threshold skip: `wal_pages < truncate_high_water_pages` must never
     /// stamp `last_attempt` — only an actual attempt advances it.
     #[test]
-    #[serial(tx_registry)]
+    #[serial(tx_registry, checkpoint_skip_metrics)]
     fn truncate_does_not_attempt_below_high_water() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("truncate_below_threshold.db");
@@ -1639,7 +1639,7 @@ mod tests {
     /// still above threshold but within `truncate_min_interval` must skip
     /// without re-stamping `last_attempt` (the timestamp must not move).
     #[test]
-    #[serial(tx_registry)]
+    #[serial(tx_registry, checkpoint_skip_metrics)]
     fn truncate_min_interval_skip_does_not_restamp_last_attempt() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("truncate_min_interval.db");
