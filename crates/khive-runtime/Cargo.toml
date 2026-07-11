@@ -12,6 +12,11 @@ description = "Composable Service API: entity/note CRUD, graph traversal, hybrid
 
 [features]
 fault-injection = []
+# test-support: expose the generic daemon-protocol test helpers in
+# `daemon::test_support` to a downstream crate's dev-dependency build (#544).
+# Never enabled in a normal/release build; this crate's own tests get the
+# same module via `cfg(test)` without needing the feature.
+test-support = []
 
 [dependencies]
 khive-types = { version = "0.3.0", path = "../khive-types", features = ["serde"] }

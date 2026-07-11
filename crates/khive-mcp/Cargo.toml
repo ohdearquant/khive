@@ -55,6 +55,10 @@ bench-embedder = ["lattice-embed"]
 channel-email = ["khive-channel", "khive-channel-email"]
 
 [dev-dependencies]
+# Activates khive-runtime's `test-support` feature only for khive-mcp's own
+# test builds (#544); the normal dependency above stays feature-inert, so a
+# release build of khive-mcp never compiles the test-only surface.
+khive-runtime = { version = "0.3.0", path = "../khive-runtime", features = ["test-support"] }
 tokio = { workspace = true, features = ["test-util"] }
 rmcp = { workspace = true, features = ["server", "transport-io", "client"] }
 async-trait = { workspace = true }

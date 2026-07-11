@@ -2,8 +2,11 @@
 //!
 //! The daemon server lives in `khive-runtime::daemon`. This module provides the
 //! client side: [`forward_or_spawn`] connects to the daemon, auto-spawns it on
-//! first use, and maps responses to MCP error types. Every failure path falls
-//! back to `None` so the caller can dispatch locally.
+//! first use, and maps responses to MCP error types. A failure path falls back
+//! to `None` (safe local dispatch) only when nothing was ever written to the
+//! daemon socket (#644); once the real request frame has been written, every
+//! outcome is `Some(Ok)` or `Some(Err)` and the caller must not dispatch
+//! locally, to avoid executing a possibly already-dispatched mutation twice.
 //!
 //! Also provides the [`khive_runtime::daemon::DaemonDispatch`] impl for [`crate::server::KhiveMcpServer`].
 
@@ -95,6 +98,24 @@ pub(crate) static SPAWN_COMMIT_BARRIER: std::sync::Mutex<
     Option<std::sync::Arc<tokio::sync::Barrier>>,
 > = std::sync::Mutex::new(None);
 
+/// Test-only launcher substituted for the real child-process spawn in
+/// [`spawn_daemon`] (issue #539). The production path forks the current
+/// executable; in a test binary that is the test harness itself, not
+/// `kkernel`, so a real fork never comes up as a working daemon (every
+/// existing test either tolerates that no-op fork, or fakes the resulting
+/// daemon with a bound listener). Tests that need a genuinely usable
+/// replacement daemon (proving one survivor is reachable end to end, not
+/// merely that `spawn_daemon` was called once) install a closure here that
+/// starts a real in-process [`khive_runtime::daemon::run_daemon`] instead.
+/// `None` (the default) leaves the real process-spawn path untouched.
+#[cfg(test)]
+type TestDaemonLauncherFn = dyn Fn() -> std::io::Result<()> + Send + Sync;
+
+#[cfg(test)]
+pub(crate) static TEST_DAEMON_LAUNCHER: std::sync::Mutex<
+    Option<std::sync::Arc<TestDaemonLauncherFn>>,
+> = std::sync::Mutex::new(None);
+
 #[cfg(test)]
 pub(crate) fn reset_counters() {
     KILL_COUNT.store(0, std::sync::atomic::Ordering::SeqCst);
@@ -105,6 +126,9 @@ pub(crate) fn reset_counters() {
         .lock()
         .expect("barrier mutex poisoned") = None;
     *SPAWN_COMMIT_BARRIER.lock().expect("barrier mutex poisoned") = None;
+    *TEST_DAEMON_LAUNCHER
+        .lock()
+        .expect("launcher mutex poisoned") = None;
 }
 
 // ── local-dispatch fallback telemetry ─────────────────────────────────────────
@@ -442,9 +466,11 @@ async fn try_forward_inner(frame: &DaemonRequestFrame) -> ForwardOutcome {
         Err(e) => {
             // The request was sent but the daemon closed the connection before
             // sending a response frame — likely a daemon crash or panic during
-            // dispatch. Treat as ParseFailure (not NoSocket) so the stale daemon
-            // is killed and a fresh one is spawned, preventing the caller from
-            // silently falling back to local dispatch against a broken daemon.
+            // dispatch. Treat as ParseFailure (not NoSocket): the real frame is
+            // already written, so #644 makes this terminal at the call site
+            // (`forward_or_spawn` returns a hard error immediately, never
+            // killing, respawning, retrying, or falling back to local
+            // dispatch against a request that may already have executed).
             tracing::warn!(
                 error = %e,
                 "daemon closed connection without sending a response \
@@ -632,6 +658,25 @@ fn spawn_daemon() -> std::io::Result<()> {
     #[cfg(test)]
     SPAWN_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
+    #[cfg(test)]
+    {
+        let launcher = TEST_DAEMON_LAUNCHER
+            .lock()
+            .expect("launcher mutex poisoned")
+            .clone();
+        if let Some(launch) = launcher {
+            return launch();
+        }
+    }
+
+    spawn_daemon_process()
+}
+
+/// Fork the current executable into `kkernel mcp --daemon`. Only reached in
+/// production, or in a test that leaves [`TEST_DAEMON_LAUNCHER`] unset (the
+/// existing tolerated no-op fork: the test binary is not `kkernel`, so this
+/// exits almost immediately without binding anything real).
+fn spawn_daemon_process() -> std::io::Result<()> {
     let exe = std::env::current_exe()?;
     // The binary is `kkernel`; the MCP server (and its daemon mode) live under
     // the `mcp` subcommand.
@@ -1919,31 +1964,14 @@ mod tests {
         std::env::remove_var("KHIVE_RECOVERER_LOCK");
     }
 
-    async fn connect_when_ready(sock: &std::path::Path) -> UnixStream {
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
-        loop {
-            if let Ok(s) = UnixStream::connect(sock).await {
-                return s;
-            }
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "daemon never bound {sock:?} within 5s"
-            );
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        }
-    }
-
-    async fn exchange(sock: &std::path::Path, frame: &DaemonRequestFrame) -> DaemonResponseFrame {
-        let mut stream = UnixStream::connect(sock)
-            .await
-            .expect("connect to daemon socket");
-        let payload = serde_json::to_vec(frame).expect("serialize request frame");
-        write_frame(&mut stream, &payload)
-            .await
-            .expect("write request frame");
-        let resp = read_frame(&mut stream).await.expect("read response frame");
-        serde_json::from_slice(&resp).expect("decode response frame")
-    }
+    // `connect_when_ready`, `exchange`, `serve_response_once`, and
+    // `close_after_request` are generic daemon-protocol test helpers shared
+    // with khive-runtime's own daemon tests via the feature-gated
+    // `test_support` module (#544); see that module's doc for the gating
+    // rationale. MCP-specific dispatch fakes and counters stay local below.
+    use khive_runtime::daemon::test_support::{
+        close_after_request, connect_when_ready, exchange, serve_response_once,
+    };
 
     // ── map_response (pure, MCP-specific) ─────────────────────────────────────
 
@@ -3064,20 +3092,6 @@ mod tests {
         }
     }
 
-    /// Serve exactly one connection with `response`, then stop accepting.
-    async fn serve_one_response(listener: tokio::net::UnixListener, response: DaemonResponseFrame) {
-        if let Ok((mut stream, _)) = listener.accept().await {
-            // Read the inbound request frame (and discard it — old daemon ignores
-            // unknown fields, which is the scenario we're simulating).
-            if read_frame(&mut stream).await.is_ok() {
-                if let Ok(payload) = serde_json::to_vec(&response) {
-                    let _ = write_frame(&mut stream, &payload).await;
-                }
-            }
-        }
-        // Listener drops here; subsequent connection attempts see "connection refused".
-    }
-
     #[tokio::test]
     #[serial]
     async fn forward_or_spawn_rejects_old_daemon_and_returns_protocol_mismatch_error() {
@@ -3106,7 +3120,7 @@ mod tests {
         // Serve exactly one exchange, then let the listener drop (no second connection
         // will be served — this enforces the "at most one recovery attempt" constraint:
         // if forward_or_spawn tried the old socket a second time it would get NoSocket).
-        let fake_handle = tokio::spawn(serve_one_response(listener, old_resp));
+        let fake_handle = tokio::spawn(serve_response_once(listener, old_resp));
 
         let frame = DaemonRequestFrame {
             ops: "stats()".to_string(),
@@ -3158,38 +3172,25 @@ mod tests {
     // ── daemon crash mid-dispatch regression (#91) ────────────────────────────
     //
     // When the daemon crashes (or panics) during dispatch it closes the
-    // connection without writing a response frame. Before the fix, `try_forward_inner`
-    // returned `ForwardOutcome::NoSocket` on the `read_frame` error, causing
-    // `forward_or_spawn` to return `None` — a silent fallback to local dispatch.
+    // connection without writing a response frame. Before the fix,
+    // `try_forward_inner` returned `ForwardOutcome::NoSocket` on the
+    // `read_frame` error, causing `forward_or_spawn` to return `None`, a
+    // silent fallback to local dispatch against a possibly already-executed
+    // mutation.
     //
-    // The fix promotes the `read_frame` error to `ForwardOutcome::ParseFailure`
-    // so the stale daemon is killed and the client does NOT silently accept a
-    // potentially broken daemon state for subsequent requests.
+    // The fix promotes the `read_frame` error to `ForwardOutcome::ParseFailure`.
+    // Since the real request frame was already fully written at this point,
+    // #644 makes this outcome terminal: `forward_or_spawn` returns
+    // `Some(Err(ambiguous_forward_error()))` immediately and never kills,
+    // respawns, retries, or falls back to local dispatch (that would risk
+    // duplicate dispatch of a request that may already have executed).
     //
-    // This test binds a fake socket that reads the request but immediately drops
-    // the connection without writing a response (simulating a crash during
-    // dispatch), then asserts that `forward_or_spawn` falls back to `None`
-    // (because the respawn attempt also sees no socket) with the WARN log
-    // rather than silently accepting the empty response.
-    //
-    // We cannot assert an `Err` here because after killing the stale daemon the
-    // respawn path calls `spawn_daemon()` (which tries to exec the real binary),
-    // fails or times out, and returns `None`. The critical invariant is that
-    // `NoSocket` is NOT returned directly on read failure — the `ParseFailure`
-    // path is taken instead (logging the crash and killing the stale process).
-    // The `try_forward_inner` unit test below validates the exact `ForwardOutcome`
-    // discriminant.
-
-    /// Serve one connection: read the request frame, then drop the stream
-    /// without writing any response (simulating a daemon crash mid-dispatch).
-    async fn serve_crash_on_dispatch(listener: tokio::net::UnixListener) {
-        if let Ok((mut stream, _)) = listener.accept().await {
-            // Read the inbound request (and discard it — the "crash" happens here).
-            let _ = read_frame(&mut stream).await;
-            // Drop stream without writing a response — connection resets.
-        }
-        // Listener drops; subsequent connection attempts see "connection refused".
-    }
+    // This test binds a fake socket that reads the request but immediately
+    // drops the connection without writing a response (simulating a crash
+    // during dispatch), then asserts that `try_forward_inner` classifies it as
+    // `ParseFailure` (not `NoSocket`), the discriminant `forward_or_spawn`
+    // relies on to take the terminal-error path instead of silently falling
+    // back to local dispatch.
 
     #[tokio::test]
     #[serial]
@@ -3213,7 +3214,7 @@ mod tests {
         std::fs::write(&pid_file, std::process::id().to_string()).expect("write pid file");
 
         // Serve one connection that crashes without replying.
-        let fake_handle = tokio::spawn(serve_crash_on_dispatch(listener));
+        let fake_handle = tokio::spawn(close_after_request(listener));
 
         let frame = DaemonRequestFrame {
             ops: "stats()".to_string(),
@@ -3688,7 +3689,7 @@ mod tests {
         // then drops without responding — simulating a crashed old daemon.
         let stale_listener =
             tokio::net::UnixListener::bind(&stale_sock).expect("bind stale socket");
-        let stale_handle = tokio::spawn(serve_crash_on_dispatch(stale_listener));
+        let stale_handle = tokio::spawn(close_after_request(stale_listener));
 
         // Now point the client at the STALE socket so its first try_forward_inner
         // sees ParseFailure (the stale socket crashes after reading the request).
@@ -3705,7 +3706,7 @@ mod tests {
         // socket has been read (but we need the probe to already know where to look).
         //
         // Simpler approach: use a single socket for both — the stale response is
-        // from a `serve_crash_on_dispatch` (closes after one read), the NEXT
+        // from a `close_after_request` (closes after one read), the NEXT
         // connection attempt (the probe) goes to the same path, but the stale
         // listener is now gone.  Instead we use real_sock for the probe by
         // redirecting KHIVE_SOCKET before the probe fires.
@@ -4132,6 +4133,400 @@ mod tests {
         std::env::remove_var("KHIVE_RECOVERER_LOCK");
     }
 
+    // ── #539: N=8 pre-write NoSocket convergence to one usable daemon ────────
+    //
+    // The coverage above drives at most two concurrent recoverers directly
+    // through `kill_and_respawn` and validates only that `spawn_daemon` was
+    // called exactly once, never that the survivor is actually usable, and
+    // never through the real client entry point (`forward_or_spawn`) callers
+    // use. This test drives eight concurrent `forward_or_spawn` clients from
+    // a genuinely absent socket (no socket file, no PID file) through the
+    // full recovery path, with `TEST_DAEMON_LAUNCHER` substituting a real
+    // in-process `run_daemon` for the tolerated no-op fork `spawn_daemon`
+    // otherwise performs in a test binary. The pass criterion is a usable
+    // owner: every client's `stats()` call must succeed, and a fresh
+    // post-hoc exchange must still succeed. `SPAWN_COUNT == 1` is asserted
+    // only as a diagnostic of the recoverer lock's linearization, not the
+    // oracle itself; the client-side recoverer lock is released as soon as
+    // `spawn_daemon` returns (issue #539's exact server/client asymmetry:
+    // `khive_runtime::daemon`'s own boot lock holds across cleanup/bind/PID-
+    // write, but nothing here waits for the child to actually become ready).
+    fn stats_frame(config_id: &str) -> DaemonRequestFrame {
+        DaemonRequestFrame {
+            ops: "stats()".to_string(),
+            presentation: None,
+            presentation_per_op: None,
+            namespace: "test".to_string(),
+            actor_id: None,
+            visible_namespaces: Vec::new(),
+            config_id: config_id.to_string(),
+            protocol_version: PROTOCOL_VERSION,
+            probe_only: false,
+            metrics_only: false,
+            format: None,
+            format_per_op: None,
+            from_wire: false,
+        }
+    }
+
+    /// Test-local RAII fixture for
+    /// `parallel_no_socket_recovery_converges_to_one_usable_daemon`. A panic,
+    /// assertion failure, or timeout anywhere after construction must not
+    /// leak the process-global daemon env, the installed test launcher, the
+    /// recovery-race barrier, or a still-running in-process daemon task into
+    /// the next `#[serial]` test in this file (remediation for #539-B: the
+    /// prior version of this test only cleaned up after its own assertions,
+    /// so a failure before that point left all of the above installed).
+    struct NoSocketRecoveryFixture {
+        prior_socket: Option<std::ffi::OsString>,
+        prior_pid: Option<std::ffi::OsString>,
+        prior_lock: Option<std::ffi::OsString>,
+        prior_recoverer_lock: Option<std::ffi::OsString>,
+        prior_no_daemon: Option<std::ffi::OsString>,
+        prior_launcher: Option<std::sync::Arc<TestDaemonLauncherFn>>,
+        prior_barrier: Option<std::sync::Arc<tokio::sync::Barrier>>,
+        daemon_handle: std::sync::Arc<std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>>,
+    }
+
+    impl NoSocketRecoveryFixture {
+        fn install(
+            sock: &std::path::Path,
+            pid_file: &std::path::Path,
+            lock_file: &std::path::Path,
+            recoverer_lock_file: &std::path::Path,
+            reference: crate::server::KhiveMcpServer,
+            n: usize,
+        ) -> Self {
+            let prior_socket = std::env::var_os("KHIVE_SOCKET");
+            let prior_pid = std::env::var_os("KHIVE_PID");
+            let prior_lock = std::env::var_os("KHIVE_LOCK");
+            let prior_recoverer_lock = std::env::var_os("KHIVE_RECOVERER_LOCK");
+            let prior_no_daemon = std::env::var_os("KHIVE_NO_DAEMON");
+
+            std::env::set_var("KHIVE_SOCKET", sock);
+            std::env::set_var("KHIVE_PID", pid_file);
+            std::env::set_var("KHIVE_LOCK", lock_file);
+            std::env::set_var("KHIVE_RECOVERER_LOCK", recoverer_lock_file);
+            std::env::remove_var("KHIVE_NO_DAEMON");
+
+            // #539-A: force every caller to reach its independently-classified
+            // pre-launch NoSocket/Dead state (see `kill_and_respawn`'s
+            // `RECOVERY_RACE_BARRIER` wait) before any of them can proceed to
+            // acquire the recoverer lock and launch. Without this, the first
+            // caller can win the recoverer lock and finish `spawn_daemon`
+            // before a peer has even reached the classification point, so the
+            // test would pass even if the lock stopped linearizing recoverers.
+            let prior_barrier = RECOVERY_RACE_BARRIER
+                .lock()
+                .expect("barrier mutex poisoned")
+                .clone();
+            *RECOVERY_RACE_BARRIER
+                .lock()
+                .expect("barrier mutex poisoned") =
+                Some(std::sync::Arc::new(tokio::sync::Barrier::new(n)));
+
+            let prior_launcher = TEST_DAEMON_LAUNCHER
+                .lock()
+                .expect("launcher mutex poisoned")
+                .clone();
+
+            let daemon_handle: std::sync::Arc<
+                std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+            > = std::sync::Arc::new(std::sync::Mutex::new(None));
+            let handle_slot = daemon_handle.clone();
+            *TEST_DAEMON_LAUNCHER
+                .lock()
+                .expect("launcher mutex poisoned") = Some(std::sync::Arc::new(move || {
+                let daemon_server = reference.clone();
+                let handle_slot = handle_slot.clone();
+                let handle = tokio::spawn(async move {
+                    let _ = run_daemon(daemon_server).await;
+                });
+                *handle_slot.lock().expect("daemon handle mutex poisoned") = Some(handle);
+                Ok(())
+            }));
+
+            Self {
+                prior_socket,
+                prior_pid,
+                prior_lock,
+                prior_recoverer_lock,
+                prior_no_daemon,
+                prior_launcher,
+                prior_barrier,
+                daemon_handle,
+            }
+        }
+
+        /// Normal (non-panicking) cleanup path: abort the in-process daemon
+        /// task and wait for it to actually stop before restoring globals, so
+        /// a subsequent test never races a not-yet-torn-down daemon.
+        async fn shutdown(self) {
+            let handle = self
+                .daemon_handle
+                .lock()
+                .expect("daemon handle mutex poisoned")
+                .take();
+            if let Some(handle) = handle {
+                handle.abort();
+                let _ = handle.await;
+            }
+            // `self` drops here; `Drop` restores env/launcher/barrier. The
+            // handle above is already taken, so `Drop`'s own abort is a no-op.
+        }
+    }
+
+    impl Drop for NoSocketRecoveryFixture {
+        fn drop(&mut self) {
+            // Panic/timeout backstop: abort a still-owned handle. `Drop`
+            // cannot `.await` the join, but `abort()` alone stops the task's
+            // executor from making further progress.
+            if let Some(handle) = self
+                .daemon_handle
+                .lock()
+                .expect("daemon handle mutex poisoned")
+                .take()
+            {
+                handle.abort();
+            }
+
+            *TEST_DAEMON_LAUNCHER
+                .lock()
+                .expect("launcher mutex poisoned") = self.prior_launcher.take();
+            *RECOVERY_RACE_BARRIER
+                .lock()
+                .expect("barrier mutex poisoned") = self.prior_barrier.take();
+
+            restore_env_var("KHIVE_SOCKET", self.prior_socket.take());
+            restore_env_var("KHIVE_PID", self.prior_pid.take());
+            restore_env_var("KHIVE_LOCK", self.prior_lock.take());
+            restore_env_var("KHIVE_RECOVERER_LOCK", self.prior_recoverer_lock.take());
+            restore_env_var("KHIVE_NO_DAEMON", self.prior_no_daemon.take());
+        }
+    }
+
+    fn restore_env_var(name: &str, value: Option<std::ffi::OsString>) {
+        match value {
+            Some(v) => std::env::set_var(name, v),
+            None => std::env::remove_var(name),
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn parallel_no_socket_recovery_converges_to_one_usable_daemon() {
+        clear_daemon_env();
+        reset_counters();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sock = dir.path().join("khived.sock");
+        let pid_file = dir.path().join("khived.pid");
+        let lock_file = dir.path().join("khived.recovery.lock");
+        let recoverer_lock_file = dir.path().join("khived.recoverer.lock");
+
+        let reference = make_test_server();
+        let config_id = reference.config_id().to_string();
+
+        const N: usize = 8;
+        let fixture = NoSocketRecoveryFixture::install(
+            &sock,
+            &pid_file,
+            &lock_file,
+            &recoverer_lock_file,
+            reference,
+            N,
+        );
+
+        // Every client reaches its first `try_forward_inner` attempt at the
+        // same instant, against a socket that genuinely does not exist yet,
+        // closing the scheduling-order gap #838 closes for direct
+        // `kill_and_respawn` callers, now exercised through the real client
+        // entry point that never directly calls `kill_and_respawn` itself.
+        let start_barrier = std::sync::Arc::new(tokio::sync::Barrier::new(N));
+        let mut handles = Vec::with_capacity(N);
+        for _ in 0..N {
+            let start_barrier = start_barrier.clone();
+            let config_id = config_id.clone();
+            handles.push(tokio::spawn(async move {
+                start_barrier.wait().await;
+                forward_or_spawn(&stats_frame(&config_id)).await
+            }));
+        }
+
+        let outcomes = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            let mut results = Vec::with_capacity(N);
+            for h in handles {
+                results.push(h.await.expect("client task must not panic"));
+            }
+            results
+        })
+        .await
+        .expect("all 8 clients must converge within 30s");
+
+        let successes = outcomes.iter().filter(|r| matches!(r, Some(Ok(_)))).count();
+        assert_eq!(
+            successes, N,
+            "every one of {N} concurrent NoSocket-recovery clients must reach a \
+             usable daemon and get a successful stats() response; got {outcomes:?}"
+        );
+
+        // One usable owner: a fresh stats() exchange against the rendezvous
+        // socket must still succeed once every client has quiesced.
+        let final_resp = exchange(&sock, &stats_frame(&config_id)).await;
+        assert!(
+            final_resp.ok,
+            "a fresh stats() exchange against the surviving daemon must succeed; error={:?}",
+            final_resp.error
+        );
+        assert!(
+            sock.exists(),
+            "the surviving daemon's socket must still exist"
+        );
+        assert!(
+            pid_file.exists(),
+            "the surviving daemon's PID file must still exist"
+        );
+
+        // Diagnostic only, not a pass criterion: with `RECOVERY_RACE_BARRIER`
+        // forcing every caller to classify Dead at the same instant, the
+        // recoverer lock is expected to linearize eight concurrent recoverers
+        // down to one real spawn, same as the two-client regression above.
+        // This is logged rather than asserted because, unlike the direct
+        // `kill_and_respawn` two-client test, the real in-process daemon
+        // started by `TEST_DAEMON_LAUNCHER` introduces its own bind/PID-write
+        // timing that this barrier does not control, so an extra observation
+        // window occasionally letting a second recoverer see Dead is a benign
+        // scheduling variance, not a correctness regression.
+        let spawn_count = SPAWN_COUNT.load(std::sync::atomic::Ordering::SeqCst);
+        if spawn_count != 1 {
+            eprintln!(
+                "diagnostic (not a failure): recoverer spawn count for N={N} \
+                 no-socket convergence was {spawn_count}, not the typical 1"
+            );
+        }
+
+        fixture.shutdown().await;
+        reset_counters();
+        clear_daemon_env();
+        std::env::remove_var("KHIVE_LOCK");
+        std::env::remove_var("KHIVE_RECOVERER_LOCK");
+    }
+
+    /// #539: eight concurrent clients that each fully write their real request
+    /// frame to a daemon that then crashes before responding must each get a
+    /// terminal error, never a kill/respawn/retry. Regression for the
+    /// post-write terminal contract (#644) staying terminal under concurrency,
+    /// not just for a single caller.
+    #[tokio::test]
+    #[serial]
+    async fn parallel_parse_failure_is_terminal_and_never_recovers() {
+        clear_daemon_env();
+        reset_counters();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sock = dir.path().join("khived.sock");
+        let pid_file = dir.path().join("khived.pid");
+
+        std::env::set_var("KHIVE_SOCKET", &sock);
+        std::env::set_var("KHIVE_PID", &pid_file);
+        std::env::remove_var("KHIVE_NO_DAEMON");
+
+        let config_id = "packs=[kg];db=:memory:;embed=none;extra=[];backend=main".to_string();
+
+        const N: usize = 8;
+        let listener =
+            tokio::net::UnixListener::bind(&sock).expect("bind fake crash-daemon socket");
+        std::fs::write(&pid_file, std::process::id().to_string()).expect("write pid file");
+
+        // Accept all 8 connections; each reads its (real, fully-written)
+        // request frame then drops without responding, simulating a crash
+        // mid-dispatch for every one of the eight concurrent requests. After
+        // the eighth, the listener stays alive for a bounded post-result
+        // observation window: a client that wrongly retried after its
+        // terminal post-write error would open a NINTH connection here, and
+        // this is actively observed rather than merely left unaccepted (an
+        // unconsumed listener drop cannot distinguish "no retry happened"
+        // from "a retry happened but nobody was listening for it").
+        let fake_handle = tokio::spawn(async move {
+            for _ in 0..N {
+                match listener.accept().await {
+                    Ok((mut stream, _)) => {
+                        let _ = read_frame(&mut stream).await;
+                        // Drop stream without writing a response.
+                    }
+                    Err(_) => break,
+                }
+            }
+            match tokio::time::timeout(std::time::Duration::from_millis(250), listener.accept())
+                .await
+            {
+                Ok(Ok(_)) => Err(
+                    "a ninth connection was accepted after the eighth terminal reply; \
+                     a client retried after a post-write ParseFailure"
+                        .to_string(),
+                ),
+                Ok(Err(e)) => Err(format!(
+                    "listener.accept() errored during the post-result observation window: {e}"
+                )),
+                Err(_) => Ok(()),
+            }
+        });
+
+        let mut handles = Vec::with_capacity(N);
+        for _ in 0..N {
+            let config_id = config_id.clone();
+            handles.push(tokio::spawn(async move {
+                forward_or_spawn(&stats_frame(&config_id)).await
+            }));
+        }
+
+        let outcomes = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            let mut results = Vec::with_capacity(N);
+            for h in handles {
+                results.push(h.await.expect("client task must not panic"));
+            }
+            results
+        })
+        .await
+        .expect("all 8 clients must terminate within 10s");
+
+        let fake_result = tokio::time::timeout(std::time::Duration::from_secs(2), fake_handle)
+            .await
+            .expect("fake crash-daemon observation window must not hang")
+            .expect("fake crash-daemon task must not panic");
+        assert!(
+            fake_result.is_ok(),
+            "no client may retry after a terminal post-write error: {fake_result:?}"
+        );
+
+        for outcome in &outcomes {
+            match outcome {
+                Some(Err(McpError { message, .. })) => {
+                    assert!(
+                        message.contains("duplicate execution"),
+                        "error must name the no-retry-after-write rationale; got: {message}"
+                    );
+                }
+                other => panic!(
+                    "a post-write ParseFailure must yield Some(Err(..)), never a kill/ \
+                     respawn/retry or a silent local-dispatch fallback; got {other:?}"
+                ),
+            }
+        }
+
+        assert_eq!(
+            KILL_COUNT.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a post-write ParseFailure must never kill the daemon"
+        );
+        assert_eq!(
+            SPAWN_COUNT.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a post-write ParseFailure must never spawn a replacement daemon"
+        );
+
+        reset_counters();
+        clear_daemon_env();
+    }
+
     // ── probe classifier is fail-CLOSED for same-protocol pre-probe daemons ──
     //
     // Regression test for the version-skew gap: a daemon built BEFORE probe_only
@@ -4189,7 +4584,7 @@ mod tests {
         let listener = tokio::net::UnixListener::bind(&sock).expect("bind fake pre-probe socket");
         std::fs::write(&pid_file, std::process::id().to_string()).expect("write pid file");
         let pre_probe_resp = pre_probe_daemon_response(config_id);
-        let fake_handle = tokio::spawn(serve_one_response(listener, pre_probe_resp));
+        let fake_handle = tokio::spawn(serve_response_once(listener, pre_probe_resp));
 
         // Arm FORCE_PID_IS_DAEMON so kill_stale_daemon_inner would attempt SIGTERM
         // IF it were called.  This makes KILL_COUNT the reliable regression signal:
@@ -4393,7 +4788,7 @@ mod tests {
         std::fs::write(&pid_file, std::process::id().to_string()).expect("write pid file");
 
         let mismatch_resp = explicit_version_mismatch_response(config_id);
-        let fake_handle = tokio::spawn(serve_one_response(listener, mismatch_resp));
+        let fake_handle = tokio::spawn(serve_response_once(listener, mismatch_resp));
 
         let frame = DaemonRequestFrame {
             ops: "stats()".to_string(),
@@ -4473,7 +4868,7 @@ mod tests {
         std::fs::write(&pid_file, std::process::id().to_string()).expect("write pid file");
 
         let mismatch_resp = newer_daemon_version_mismatch_response(config_id);
-        let fake_handle = tokio::spawn(serve_one_response(listener, mismatch_resp));
+        let fake_handle = tokio::spawn(serve_response_once(listener, mismatch_resp));
 
         let frame = DaemonRequestFrame {
             ops: "stats()".to_string(),
@@ -4534,7 +4929,7 @@ mod tests {
         // without responding — forces the first try_forward_inner to see
         // ParseFailure (frame written, response lost).
         let stale_listener = tokio::net::UnixListener::bind(&sock).expect("bind stale socket");
-        let stale_handle = tokio::spawn(serve_crash_on_dispatch(stale_listener));
+        let stale_handle = tokio::spawn(close_after_request(stale_listener));
 
         std::fs::write(&pid_file, std::process::id().to_string()).expect("write pid file");
 

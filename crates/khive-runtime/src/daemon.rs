@@ -1334,6 +1334,19 @@ pub fn env_truthy(key: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Generic daemon-protocol test support shared between this crate's own
+/// daemon tests and downstream transport crates' daemon client tests (#544).
+/// Framing mechanics live beside their implementation here rather than
+/// duplicated per transport; transport-specific dispatch fakes and counters
+/// stay local to each transport crate.
+///
+/// Gated by `cfg(test)` for this crate's own test builds and by the
+/// non-default `test-support` feature for a downstream crate's dev-dependency
+/// build; never enabled in a normal/release build of either crate.
+#[cfg(any(test, feature = "test-support"))]
+#[path = "daemon_test_support.rs"]
+pub mod test_support;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1632,39 +1645,11 @@ mod tests {
         }
     }
 
-    fn base_request_frame(config_id: &str) -> DaemonRequestFrame {
-        DaemonRequestFrame {
-            ops: String::new(),
-            presentation: None,
-            presentation_per_op: None,
-            namespace: "local".to_string(),
-            actor_id: None,
-            visible_namespaces: Vec::new(),
-            config_id: config_id.to_string(),
-            protocol_version: PROTOCOL_VERSION,
-            probe_only: false,
-            metrics_only: false,
-            format: None,
-            format_per_op: None,
-            from_wire: false,
-        }
-    }
-
-    /// Drive `handle_conn` over an in-process `UnixStream::pair()` (no real
-    /// socket file needed) and decode the response frame it writes back.
-    async fn round_trip(dispatcher: MockDispatch, req: &DaemonRequestFrame) -> DaemonResponseFrame {
-        let (mut client, server) = UnixStream::pair().expect("unix stream pair");
-        let payload = serde_json::to_vec(req).expect("encode request frame");
-        let handle = tokio::spawn(async move {
-            handle_conn(server, dispatcher).await;
-        });
-        write_frame(&mut client, &payload)
-            .await
-            .expect("write request frame");
-        let raw = read_frame(&mut client).await.expect("read response frame");
-        handle.await.expect("handle_conn task panicked");
-        serde_json::from_slice(&raw).expect("decode response frame")
-    }
+    // `base_request_frame` and `round_trip` are the generic daemon-protocol
+    // test helpers shared with khive-mcp's own daemon tests via the
+    // feature-gated `test_support` module (#544); see that module's doc for
+    // the gating rationale.
+    use test_support::{base_request_frame, round_trip};
 
     /// Test 1: a `metrics_only: true` request
     /// returns `metrics: Some(_)` and never reaches the ops-dispatch path; a
