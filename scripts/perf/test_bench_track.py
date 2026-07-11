@@ -9,10 +9,12 @@ from __future__ import annotations
 
 import json
 import pathlib
+import sys
 import tempfile
 import unittest
 
 import bench_track
+import bench_calibrate
 
 
 class RecordShapeTests(unittest.TestCase):
@@ -169,6 +171,48 @@ class CriterionSourceTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             with self.assertRaises(SystemExit):
                 bench_track.collect_criterion_metrics(pathlib.Path(tmp))
+
+
+class CalibrateNoGateTests(unittest.TestCase):
+    """collect_calibrate_metrics must record metrics from a run whose
+    internal threshold FAILED (nonzero child exit) - it is a tracker, not a
+    gate. Registers a synthetic bench_calibrate suite whose child process
+    always exits 1 (simulating a suite's own "Gate: FAIL" -> exit 1, e.g.
+    bench_pipeline_daemon.py) and asserts the metric still gets extracted
+    instead of an exception propagating.
+    """
+
+    SUITE_NAME = "_test_regressed_suite"
+
+    def setUp(self):
+        def build_cmd(run_dir, extra_args):
+            return [
+                sys.executable,
+                "-c",
+                "print('metric_value=42.0'); import sys; sys.exit(1)",
+            ]
+
+        def extract(run_dir, proc):
+            for line in proc.stdout.splitlines():
+                if line.startswith("metric_value="):
+                    return {"metric_value": float(line.split("=", 1)[1])}
+            return {}
+
+        bench_calibrate.SUITES[self.SUITE_NAME] = {
+            "build_cmd": build_cmd,
+            "extract": extract,
+            "default_args": [],
+            "timeout_s": 30,
+        }
+        self.addCleanup(bench_calibrate.SUITES.pop, self.SUITE_NAME, None)
+
+    def test_regressed_run_still_records_metrics(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = pathlib.Path(tmp) / "run"
+            metrics = bench_track.collect_calibrate_metrics(self.SUITE_NAME, [], run_dir)
+            self.assertEqual(metrics["metric_value"], 42.0)
+            self.assertEqual(metrics["_exit_code"], 1.0)
+            self.assertIn("_wall_s", metrics)
 
 
 if __name__ == "__main__":

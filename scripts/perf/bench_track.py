@@ -102,9 +102,17 @@ def collect_calibrate_metrics(
 ) -> dict[str, float]:
     """Run a scripts/perf/bench_calibrate.py SUITES entry exactly once.
 
-    Reuses `bench_calibrate._run_once` (subprocess management, process-group
-    kill on timeout, isolated HOME) and the suite's own `extract` function -
-    the pipeline/load stdout and JSON parsing logic is not duplicated here.
+    Deliberately does NOT call `bench_calibrate._run_once`: that function is
+    fail-closed by design (a nonzero child exit raises `ChildFailure` before
+    any metric extraction happens), which is correct for calibration - a
+    crashed run must never pollute a same-SHA variance profile. A tracker
+    has the opposite job: it is Advisory (no thresholds, per the
+    bench-program spec's promotion ladder), so a suite whose own internal
+    recall/precision gate returns FAIL is exactly the interesting data point
+    to record, not a reason to record nothing. `_run_once_no_gate` below
+    reuses the suite's own `build_cmd`/`extract` pair (the pipeline/load
+    stdout and JSON parsing logic is not duplicated here) but always
+    attempts extraction regardless of the child's exit code.
     """
     if suite_name not in calibrate.SUITES:
         raise SystemExit(
@@ -114,10 +122,77 @@ def collect_calibrate_metrics(
     suite = calibrate.SUITES[suite_name]
     run_dir.mkdir(parents=True, exist_ok=True)
     args = [*suite["default_args"], *extra_args]
-    _proc, metrics, wall_s = calibrate._run_once(suite_name, run_dir, args)
+    metrics, wall_s = _run_once_no_gate(suite_name, run_dir, args)
     metrics = dict(metrics)
     metrics["_wall_s"] = wall_s
     return metrics
+
+
+def _run_once_no_gate(
+    suite_name: str, run_dir: pathlib.Path, extra_args: list[str]
+) -> tuple[dict[str, float], float]:
+    """Run a bench_calibrate SUITES entry once, extracting metrics no matter
+    what the child process's own exit code or internal threshold verdict
+    was. No threshold logic lives in this tracking path - a suite's exit
+    code is recorded as the `_exit_code` metric for visibility, never used
+    to gate whether the run's metrics get recorded.
+
+    Process management (isolated HOME, process-group timeout kill) mirrors
+    `bench_calibrate._run_once`; only the "abort on nonzero exit" policy is
+    intentionally different.
+    """
+    suite = calibrate.SUITES[suite_name]
+    argv = suite["build_cmd"](run_dir, extra_args)
+
+    home_dir = run_dir / "home"
+    home_dir.mkdir(parents=True, exist_ok=True)
+    env = {**os.environ}
+    env["HOME"] = str(home_dir)
+
+    t0 = calibrate.time.time()
+    proc = subprocess.Popen(
+        argv,
+        cwd=str(calibrate.REPO_ROOT),
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+    )
+    pgid = os.getpgid(proc.pid)
+    try:
+        stdout, stderr = proc.communicate(timeout=suite["timeout_s"])
+    except subprocess.TimeoutExpired:
+        calibrate._kill_process_tree(pgid, proc)
+        try:
+            stdout, stderr = proc.communicate(timeout=10)
+        except subprocess.TimeoutExpired:
+            stdout, stderr = "", ""
+        wall_s = calibrate.time.time() - t0
+        (run_dir / "stdout.log").write_text(stdout or "")
+        (run_dir / "stderr.log").write_text(stderr or "")
+        (run_dir / "argv.txt").write_text(" ".join(argv) + "\n")
+        raise
+    wall_s = calibrate.time.time() - t0
+
+    (run_dir / "stdout.log").write_text(stdout)
+    (run_dir / "stderr.log").write_text(stderr)
+    (run_dir / "argv.txt").write_text(" ".join(argv) + "\n")
+
+    cp = subprocess.CompletedProcess(argv, proc.returncode, stdout, stderr)
+    # Extraction runs regardless of proc.returncode - a nonzero exit caused
+    # by the suite's own internal threshold (e.g. bench_pipeline_daemon.py's
+    # "Gate: FAIL" -> exit 1) still has fully-formed stdout to extract from.
+    # A genuinely broken run (crash before any output) still surfaces loudly
+    # here via SchemaError from the extractor finding no expected output.
+    metrics = suite["extract"](run_dir, cp)
+    if not metrics:
+        raise SystemExit(
+            f"suite '{suite_name}' extractor returned no metrics; see {run_dir}/stdout.log"
+        )
+    metrics = dict(metrics)
+    metrics["_exit_code"] = float(proc.returncode)
+    return metrics, wall_s
 
 
 def _flatten_numeric_with_lists(prefix: str, obj, out: dict[str, float]) -> None:

@@ -11,6 +11,18 @@
 # files, never a force-push. Every retry re-copies from the SAME local
 # source files this invocation was given - it does not re-run any bench, so
 # a retry cannot double-count or drop a metric.
+#
+# The caller's local <file> (e.g. bench-data/components.jsonl) only ever
+# holds THIS run's freshly-appended record(s) - it comes from a plain main
+# checkout that never saw perf-data's history. A straight `cp` of that file
+# into the perf-data worktree would therefore overwrite every prior run's
+# history with just the current record. Instead, each destination file is
+# MERGED: the worktree's existing content (the real history, just fetched
+# from origin/perf-data) is kept, and only lines from the local file that
+# are not already present verbatim are appended. JSONL records are
+# canonicalized with sort_keys=True (bench_track.py), so an identical record
+# always serializes to an identical line, which makes plain line-set dedup
+# safe and also makes a retry of this same invocation idempotent.
 
 set -euo pipefail
 
@@ -47,7 +59,15 @@ for attempt in $(seq 1 "$MAX_ATTEMPTS"); do
 
   for f in "$@"; do
     mkdir -p "$WORKTREE_DIR/$(dirname "$f")"
-    cp "$f" "$WORKTREE_DIR/$f"
+    if [ -f "$WORKTREE_DIR/$f" ]; then
+      # History already present (checked out from origin/perf-data) - union
+      # it with this run's local lines, deduping exact-duplicate lines, so
+      # every prior run's record survives alongside the new one.
+      cat "$WORKTREE_DIR/$f" "$f" | awk '!seen[$0]++' > "$WORKTREE_DIR/$f.merged"
+      mv "$WORKTREE_DIR/$f.merged" "$WORKTREE_DIR/$f"
+    else
+      cp "$f" "$WORKTREE_DIR/$f"
+    fi
   done
 
   git -C "$WORKTREE_DIR" config user.name "$BOT_NAME"

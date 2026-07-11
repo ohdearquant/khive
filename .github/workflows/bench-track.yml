@@ -38,6 +38,17 @@ on:
     - cron: "17 7 * * *" # nightly, off-peak UTC
   workflow_dispatch: {}
 
+# Workflow-level default is read-only. `contents: write` is granted only on
+# the two jobs whose steps push to `perf-data` (components, e2e) - a
+# job-level grant, not a workflow-level one, is the smallest scope this
+# publish design can achieve: publish_ledger.sh needs the bench-data/*.jsonl
+# file this same job's earlier steps just wrote to local disk, so the push
+# step cannot be isolated into a separate job without re-uploading/
+# downloading that file as an artifact first. No other job in this workflow
+# gets contents: write.
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
   PERF_DATA_BRANCH: perf-data
@@ -52,14 +63,39 @@ jobs:
   # ─────────────────────────────────────────────────────────────────────────
   # Component benches: the 23 Criterion targets across 20 crates, quick
   # profile, bounded wall-clock. Advisory ledger: bench-data/components.jsonl
+  #
+  # Sharded 4 ways by crate group (5 crates/shard) instead of one
+  # `cargo bench --workspace` pass: a single job running all 23 targets can
+  # plausibly exceed the 20-minute job timeout before the publish step ever
+  # runs, silently dropping that commit's whole data point. Each shard
+  # compiles and benches only its own crate subset and publishes
+  # independently - `publish_ledger.sh`'s merge-on-copy (not overwrite) and
+  # push-retry loop already tolerate concurrent writers to the same ledger
+  # file (the components/e2e jobs already did this), so four shards racing
+  # to append four partial records for the same commit is the same
+  # already-handled case, not new risk. `render_trend_markdown` unions
+  # metrics by name across every record for a sha, so a metric being spread
+  # across several same-sha records renders identically to one big record.
   # ─────────────────────────────────────────────────────────────────────────
   components:
-    name: Component benches (Criterion, quick profile)
+    name: Component benches (Criterion, quick profile, shard ${{ matrix.shard }})
     runs-on: ubuntu-latest
     if: vars.BENCH_TRACK_DISABLED != 'true'
     timeout-minutes: 20
     permissions:
       contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - shard: 1
+            crates: "khive-score khive-fusion khive-retrieval khive-text khive-bm25"
+          - shard: 2
+            crates: "khive-hnsw khive-vamana khive-quant khive-query khive-request"
+          - shard: 3
+            crates: "khive-db khive-fold khive-brain-core khive-pack-brain khive-pack-comm"
+          - shard: 4
+            crates: "khive-pack-gtd khive-pack-kg khive-pack-knowledge khive-pack-memory khive-pack-schedule"
 
     steps:
       - uses: actions/checkout@v7
@@ -73,20 +109,33 @@ jobs:
         with:
           workspaces: crates
           cache-on-failure: true
+          key: shard-${{ matrix.shard }}
 
-      - name: Compile-check every bench target (cheap, catches bench rot)
+      - name: Compile-check this shard's bench targets (cheap, catches bench rot)
         working-directory: crates
-        run: cargo bench --workspace --all-targets --no-run
+        env:
+          SHARD_CRATES: ${{ matrix.crates }}
+        run: |
+          set -euo pipefail
+          pkg_args=()
+          for c in $SHARD_CRATES; do pkg_args+=(-p "$c"); done
+          cargo bench "${pkg_args[@]}" --all-targets --no-run
 
-      - name: Run Criterion benches (quick profile, bounded ~12 min)
+      - name: Run Criterion benches (quick profile, bounded ~10 min/shard)
         working-directory: crates
+        env:
+          SHARD_CRATES: ${{ matrix.crates }}
         # `|| true`: a single bench's internal assertion (e.g. khive-quant's
         # SQ8-vs-f32 speed ceiling) failing must not prevent the ledger from
         # recording every OTHER bench's estimates.json that did get written -
         # per-bench correctness gates are that bench's own concern, not this
-        # advisory tracker's. `timeout` bounds the whole pass; `--quick`
+        # advisory tracker's. `timeout` bounds this shard's pass; `--quick`
         # shortens per-bench measurement time and relaxes outlier detection.
-        run: timeout 720 cargo bench --workspace -- --quick || true
+        run: |
+          set -euo pipefail
+          pkg_args=()
+          for c in $SHARD_CRATES; do pkg_args+=(-p "$c"); done
+          timeout 600 cargo bench "${pkg_args[@]}" -- --quick || true
 
       - name: Record trend ledger entry
         run: |
@@ -95,8 +144,8 @@ jobs:
             --suite components \
             --source criterion \
             --criterion-dir crates/target/criterion \
-            --sha "${{ github.sha }}" \
-            --branch "${{ github.ref_name }}" \
+            --sha "$GITHUB_SHA" \
+            --branch "$GITHUB_REF_NAME" \
             --data-dir bench-data \
             --summary-out /tmp/components-trend.md
 
@@ -111,7 +160,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: bench-track-components-${{ github.run_id }}
+          name: bench-track-components-shard${{ matrix.shard }}-${{ github.run_id }}
           path: crates/target/criterion
           retention-days: 90
           if-no-files-found: ignore
@@ -161,8 +210,8 @@ jobs:
           python3 scripts/perf/bench_track.py record \
             --suite pipeline \
             --source calibrate \
-            --sha "${{ github.sha }}" \
-            --branch "${{ github.ref_name }}" \
+            --sha "$GITHUB_SHA" \
+            --branch "$GITHUB_REF_NAME" \
             --data-dir bench-data \
             --summary-out /tmp/pipeline-trend.md
 
@@ -180,8 +229,8 @@ jobs:
             --suite bench-1m \
             --source json \
             --json-file target/bench-out/SIFT-CI-synthetic.json \
-            --sha "${{ github.sha }}" \
-            --branch "${{ github.ref_name }}" \
+            --sha "$GITHUB_SHA" \
+            --branch "$GITHUB_REF_NAME" \
             --data-dir bench-data \
             --summary-out /tmp/bench-1m-trend.md
 
