@@ -710,12 +710,19 @@ override is given. Every default-configuration server and admin invocation
 from this point on validates and stores `finding` notes and the pack's 22
 additive `EDGE_RULES`; a caller no longer has to opt in with an explicit
 `--pack code` to make audit findings queryable. The pack still contributes
-zero MCP verbs (D1) and zero new entity kinds; only its note kind, edge
-rules, and entity-subtype registrations become reachable by default.
+zero MCP verbs today and zero new entity kinds; only its note kind, edge
+rules, and entity-subtype registrations become reachable by default. (This
+is a statement of current fact, not a standing invariant: Amendment 2
+accepts a `code.ingest` source-ingest verb that remains unimplemented. The
+no-verb statements in this amendment are scoped to the findings surface.)
 
 ### C2: Ingestion is an admin/runner-side path, not a verb
 
-D1's verb-less ruling stands unmodified. `ingest_findings_json` is exposed to
+For the findings surface, D1's no-verb ruling stands unmodified: findings
+ingestion is not, and does not become, a verb. (Amendment 2's accepted
+`code.ingest` source-ingest verb is untouched by this; it targets dedicated
+map databases and has nothing to do with `findings.json`.)
+`ingest_findings_json` is exposed to
 operators through a new `kkernel code-ingest <findings.json>` admin CLI
 subcommand (`crates/kkernel/src/code_ingest.rs`), following the same shape as
 `kkernel git-ingest`: it builds a runtime directly from the configured pack

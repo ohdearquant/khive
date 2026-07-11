@@ -17,9 +17,10 @@ khive gives your agent:
 
 All 10 packs load by default. **78 public verbs** across the packs: the `git` pack
 contributes the `git.digest` verb plus the commit/issue/pull_request provenance note kinds
-and a batch ingester; the `code` pack contributes zero verbs by design, since its `finding`
+and a batch ingester; the `code` pack currently contributes zero verbs: its `finding`
 note kind is written only through the `kkernel code-ingest` admin CLI path, never a verb
-an agent can call (ADR-085 D1, Amendment 3). Regenerate via `request(ops="verbs()")`
+an agent can call (ADR-085 D1, Amendment 3; Amendment 2's `code.ingest` verb is accepted
+but unimplemented). Regenerate via `request(ops="verbs()")`
 before editing this line.
 
 If you're working on khive itself (writing code in this repo), see `CLAUDE.md` instead.

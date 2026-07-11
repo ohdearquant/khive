@@ -2,9 +2,9 @@
 //! `findings.json` sweep into the graph via
 //! `khive_pack_code::ingest::ingest_findings_json` (ADR-085 Amendment 3).
 //!
-//! The `code` pack ships zero verbs (ADR-085 D1): this CLI is the only
-//! writer of `finding` notes, and agents never hold a bulk-ingest verb (the
-//! runner-writes rule). Validation is whole-document and fail-closed: a
+//! Findings ingestion is deliberately not a verb (ADR-085 D1, Amendment 3
+//! C2): this CLI is the only writer of `finding` notes, and agents never
+//! hold a bulk-ingest verb (the runner-writes rule). Validation is whole-document and fail-closed: a
 //! malformed `findings.json` is rejected before any record is written.
 //! `--dry-run` runs the same validation and existence checks but performs
 //! no writes.
