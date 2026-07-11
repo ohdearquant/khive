@@ -84,6 +84,7 @@ jobs:
     timeout-minutes: 20
     permissions:
       contents: write
+      issues: write
     strategy:
       fail-fast: false
       matrix:
@@ -179,13 +180,31 @@ jobs:
           retention-days: 90
           if-no-files-found: ignore
 
-      - name: Fail job if trend ledger record errored
+      # Advisory-lane semantics: a data-collection error must never paint main
+      # red. The status=error ledger record is already published above; this
+      # step surfaces a warning and upserts a tracking issue, then exits 0.
+      # A red X on main is reserved for correctness CI.
+      - name: Warn if trend ledger record errored (advisory, never fails)
         if: ${{ !cancelled() && steps.record.outputs.exit_code != '0' }}
         env:
           RECORD_EXIT_CODE: ${{ steps.record.outputs.exit_code }}
+          GH_TOKEN: ${{ github.token }}
         run: |
-          echo "bench_track.py record exited ${RECORD_EXIT_CODE} for suite=components shard=${{ matrix.shard }}; its status=error record was still published above (see 'Publish ledger to perf-data branch')." >&2
-          exit "${RECORD_EXIT_CODE}"
+          MSG="bench_track.py record exited ${RECORD_EXIT_CODE} for suite=components shard=${{ matrix.shard }}; its status=error record was still published to perf-data. Run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          echo "::warning::${MSG}"
+          {
+            echo "## Trend ledger record errored (advisory)"
+            echo ""
+            echo "${MSG}"
+          } >> "$GITHUB_STEP_SUMMARY"
+          TITLE="bench-track: trend ledger record errored (advisory)"
+          EXISTING=$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --search "in:title \"$TITLE\"" --json number --jq '.[0].number // empty')
+          if [ -n "$EXISTING" ]; then
+            gh issue comment "$EXISTING" --repo "$GITHUB_REPOSITORY" --body "$MSG" || echo "::warning::tracking-issue comment failed (non-fatal)"
+          else
+            gh issue create --repo "$GITHUB_REPOSITORY" --title "$TITLE" --body "$MSG" || echo "::warning::tracking-issue create failed (non-fatal)"
+          fi
+          exit 0
 
   # ─────────────────────────────────────────────────────────────────────────
   # e2e benches: the pipeline daemon suite (bench_calibrate's `pipeline`
@@ -200,6 +219,7 @@ jobs:
     timeout-minutes: 20
     permissions:
       contents: write
+      issues: write
 
     steps:
       - uses: actions/checkout@v7
@@ -304,14 +324,26 @@ jobs:
           retention-days: 90
           if-no-files-found: ignore
 
-      - name: Fail job if trend ledger record errored
+      # Advisory-lane semantics: see the components job note above. Exit 0.
+      - name: Warn if trend ledger record errored (advisory, never fails)
         if: ${{ !cancelled() && (steps.record_pipeline.outputs.exit_code != '0' || steps.record_bench_1m.outputs.exit_code != '0') }}
         env:
           PIPELINE_EXIT_CODE: ${{ steps.record_pipeline.outputs.exit_code }}
           BENCH_1M_RECORD_EXIT_CODE: ${{ steps.record_bench_1m.outputs.exit_code }}
+          GH_TOKEN: ${{ github.token }}
         run: |
-          echo "bench_track.py record failed: pipeline exit=${PIPELINE_EXIT_CODE} bench-1m exit=${BENCH_1M_RECORD_EXIT_CODE}; status=error record(s) were still published above (see 'Publish ledgers to perf-data branch')." >&2
-          if [ "${PIPELINE_EXIT_CODE}" != "0" ]; then
-            exit "${PIPELINE_EXIT_CODE}"
+          MSG="bench_track.py record failed: pipeline exit=${PIPELINE_EXIT_CODE} bench-1m exit=${BENCH_1M_RECORD_EXIT_CODE}; status=error record(s) were still published to perf-data. Run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          echo "::warning::${MSG}"
+          {
+            echo "## Trend ledger record errored (advisory)"
+            echo ""
+            echo "${MSG}"
+          } >> "$GITHUB_STEP_SUMMARY"
+          TITLE="bench-track: trend ledger record errored (advisory)"
+          EXISTING=$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --search "in:title \"$TITLE\"" --json number --jq '.[0].number // empty')
+          if [ -n "$EXISTING" ]; then
+            gh issue comment "$EXISTING" --repo "$GITHUB_REPOSITORY" --body "$MSG" || echo "::warning::tracking-issue comment failed (non-fatal)"
+          else
+            gh issue create --repo "$GITHUB_REPOSITORY" --title "$TITLE" --body "$MSG" || echo "::warning::tracking-issue create failed (non-fatal)"
           fi
-          exit "${BENCH_1M_RECORD_EXIT_CODE}"
+          exit 0
