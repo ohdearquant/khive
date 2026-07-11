@@ -453,8 +453,21 @@ fn decode_event_observations(event: &Event) -> Result<Vec<EventObservation>, rus
 }
 
 fn payload_uuid_array(event: &Event, field: &'static str) -> Result<Vec<Uuid>, rusqlite::Error> {
+    Ok(payload_uuid_array_opt(event, field)?.unwrap_or_default())
+}
+
+/// Like [`payload_uuid_array`], but distinguishes an absent `field` (`Ok(None)`)
+/// from a present-but-malformed one (`Err`). Callers that fall back across a
+/// chain of alternative field names (e.g. `decode_rank_observations`'s
+/// `selected`/`reranked`/`final_scores`) need that distinction: collapsing
+/// "missing" into `Ok(vec![])` makes every later field in the chain
+/// unreachable, since `Result::or_else` only fires on `Err`.
+fn payload_uuid_array_opt(
+    event: &Event,
+    field: &'static str,
+) -> Result<Option<Vec<Uuid>>, rusqlite::Error> {
     let Some(values) = event.payload.get(field) else {
-        return Ok(Vec::new());
+        return Ok(None);
     };
     let Some(array) = values.as_array() else {
         return Err(invalid_payload(event.kind, field, "expected array"));
@@ -468,7 +481,42 @@ fn payload_uuid_array(event: &Event, field: &'static str) -> Result<Vec<Uuid>, r
                 .ok_or_else(|| invalid_payload(event.kind, field, "expected UUID string"))
                 .and_then(|s| Uuid::parse_str(s).map_err(|e| invalid_payload(event.kind, field, e)))
         })
-        .collect()
+        .collect::<Result<Vec<_>, _>>()
+        .map(Some)
+}
+
+/// Decode a field shaped like `RerankExecutedPayload::reranked`/`final_scores`
+/// (`Vec<(Id128, ..)>`, which serde serializes as an array of 2+-element JSON
+/// arrays `[uuid, ...]`) into the UUID leading each tuple. Absent field is
+/// `Ok(None)`; present-but-wrong-shape is `Err`, matching
+/// [`payload_uuid_array_opt`]'s missing-vs-malformed contract.
+fn payload_uuid_tuple_array_opt(
+    event: &Event,
+    field: &'static str,
+) -> Result<Option<Vec<Uuid>>, rusqlite::Error> {
+    let Some(values) = event.payload.get(field) else {
+        return Ok(None);
+    };
+    let Some(array) = values.as_array() else {
+        return Err(invalid_payload(event.kind, field, "expected array"));
+    };
+
+    array
+        .iter()
+        .map(|entry| {
+            let tuple = entry
+                .as_array()
+                .ok_or_else(|| invalid_payload(event.kind, field, "expected [uuid, ..] tuple"))?;
+            tuple
+                .first()
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| {
+                    invalid_payload(event.kind, field, "expected UUID string as tuple[0]")
+                })
+                .and_then(|s| Uuid::parse_str(s).map_err(|e| invalid_payload(event.kind, field, e)))
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map(Some)
 }
 
 fn payload_uuid(event: &Event, field: &'static str) -> Result<Option<Uuid>, rusqlite::Error> {
@@ -506,9 +554,16 @@ fn decode_rank_observations(event: &Event) -> Result<Vec<EventObservation>, rusq
         });
     }
 
-    let selected = payload_uuid_array(event, "selected")
-        .or_else(|_| payload_uuid_array(event, "reranked"))
-        .or_else(|_| payload_uuid_array(event, "final_scores"))?;
+    // `selected` is the flat untyped convenience shape; `reranked` and
+    // `final_scores` are `RerankExecutedPayload`'s actual typed fields,
+    // serialized as `[uuid, ..]` tuples, not flat UUID strings. Each is
+    // tried in turn only when the previous field is absent (`None`) — a
+    // present-but-malformed field errors immediately instead of masking
+    // the problem by falling through to the next candidate.
+    let selected = payload_uuid_array_opt(event, "selected")?
+        .or(payload_uuid_tuple_array_opt(event, "reranked")?)
+        .or(payload_uuid_tuple_array_opt(event, "final_scores")?)
+        .unwrap_or_default();
     for (position, entity_id) in selected.into_iter().enumerate() {
         let position_u32 = u32::try_from(position).map_err(|_| {
             invalid_payload(
@@ -576,7 +631,16 @@ fn decode_signal_observation(event: &Event) -> Result<Vec<EventObservation>, rus
     Ok(vec![EventObservation {
         event_id: event.id,
         entity_id,
-        referent_kind: ReferentKind::Entity,
+        // ADR-041 permits both entity and note signal targets. `brain.feedback`
+        // threads the resolved target's substrate onto the event (Finding 1,
+        // round-1 codex review of #831); pre-fix events all carry the old
+        // `SubstrateKind::Event` placeholder and fall back to Entity, matching
+        // the decoder's prior hard-coded behavior for that historical data.
+        referent_kind: if event.substrate == SubstrateKind::Note {
+            ReferentKind::Note
+        } else {
+            ReferentKind::Entity
+        },
         role: ObservationRole::Signal,
         position: 0,
     }])

@@ -188,6 +188,71 @@ async fn append_event_writes_observations_atomically() {
 }
 
 #[tokio::test]
+async fn rerank_executed_projects_selected_from_real_typed_payload() {
+    // Regression test (round-1 codex review of #831, Finding 2): a real
+    // `RerankExecutedPayload` has no `selected` field — its fields are
+    // `reranked: Vec<(Id128, Vec<(String, f32)>)>` and
+    // `final_scores: Vec<(Id128, f32)>`, which serde serializes as arrays of
+    // `[uuid, ..]` tuples, not flat UUID strings. Push a real payload
+    // (constructed via the typed struct, not a hand-rolled `json!`) through
+    // serialization into `append_event`'s projection and confirm the
+    // decoder falls through from the absent `selected` field to the
+    // tuple-shaped `reranked`/`final_scores` fields instead of silently
+    // projecting zero `selected` rows.
+    let store = setup_memory_store();
+    let candidate = Uuid::new_v4();
+    let reranked_winner = Uuid::new_v4();
+
+    let payload = khive_types::RerankExecutedPayload {
+        served_by_profile_id: Some("profile-a".to_string()),
+        model_id: khive_types::Id128::from_u128(1),
+        candidates: vec![khive_types::Id128::from_bytes(*candidate.as_bytes())],
+        reranked: vec![(
+            khive_types::Id128::from_bytes(*reranked_winner.as_bytes()),
+            vec![("relevance".to_string(), 0.9)],
+        )],
+        final_scores: vec![],
+        latency_us: 1200,
+        hook_applied: false,
+        hook_target_match: false,
+    };
+    let payload_json = serde_json::to_value(&payload).unwrap();
+    assert!(
+        payload_json.get("selected").is_none(),
+        "the typed RerankExecutedPayload contract has no `selected` field; \
+         sanity-check that this test exercises the fallback, not the alias"
+    );
+
+    let mut event = make_event("default");
+    event.kind = EventKind::RerankExecuted;
+    event.payload = payload_json;
+    let event_id = event.id;
+
+    store.append_event(event).await.unwrap();
+
+    let pool = Arc::clone(&store.pool);
+    let event_id_str = event_id.to_string();
+    let selected_entity_id: String = tokio::task::spawn_blocking(move || {
+        let guard = pool.reader().unwrap();
+        let conn = guard.conn();
+        conn.query_row(
+            "SELECT entity_id FROM event_observations WHERE event_id = ?1 AND role = 'selected'",
+            [&event_id_str],
+            |r| r.get(0),
+        )
+        .unwrap()
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(
+        selected_entity_id,
+        reranked_winner.to_string(),
+        "selected observation must decode the UUID leading the `reranked` tuple"
+    );
+}
+
+#[tokio::test]
 async fn feedback_explicit_projects_signal_observation_from_target_id() {
     // Regression test for #811: the emitter (khive-pack-brain's `brain.feedback`
     // handler) sets `event.target_id` via `Event::with_target`, never a payload
