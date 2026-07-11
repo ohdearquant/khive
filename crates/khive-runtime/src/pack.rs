@@ -68,7 +68,7 @@ impl SchemaPlan {
     }
 }
 
-/// Hook called after every successful verb dispatch (Issue #158).
+/// Hook called after every successful verb dispatch.
 ///
 /// Packs observe enriched event views so provenance-aware consumers can use
 /// `view.observations` while legacy folds can still consume `view.event`.
@@ -154,7 +154,7 @@ pub trait PackRuntime: Send + Sync {
     /// substrate tables (entities, notes, edges, events) return this default.
     ///
     /// Plans are aggregated via [`VerbRegistry::all_schema_plans`] and applied
-    /// at startup via `KhiveMcpServer::with_packs` (c12). Packs that need their
+    /// at startup via `KhiveMcpServer::with_packs`. Packs that need their
     /// schema present (e.g. GTD) also self-bootstrap lazily on first call for
     /// robustness in test contexts that create fresh in-memory databases.
     fn schema_plan(&self) -> SchemaPlan {
@@ -203,7 +203,7 @@ pub trait PackRuntime: Send + Sync {
     /// is the correct behaviour for bare runtimes without packs.
     fn register_entity_type_validator(&self, _runtime: &KhiveRuntime) {}
 
-    /// Install a pack-owned note-mutation hook on the runtime (#750 fix-round 1).
+    /// Install a pack-owned note-mutation hook on the runtime.
     ///
     /// Called by the transport during pack initialisation, after the registry
     /// is built and before the first verb dispatch — same timing as
@@ -364,7 +364,7 @@ pub struct VerbRegistryBuilder {
     /// registry does not depend on the full `KhiveRuntime` surface — only the
     /// audit-persistence capability is needed here.
     event_store: Option<Arc<dyn EventStore>>,
-    /// Optional post-dispatch hook (Issue #158).
+    /// Optional post-dispatch hook.
     ///
     /// When set, every successful pack dispatch calls `hook.on_dispatch(event)`
     /// with a synthesized Event describing the outcome. Opt-in: when None,
@@ -474,7 +474,7 @@ impl VerbRegistryBuilder {
         self
     }
 
-    /// Register a post-dispatch hook (Issue #158).
+    /// Register a post-dispatch hook.
     ///
     /// When set, every successful pack dispatch calls `hook.on_dispatch(event)`
     /// with a synthesized [`Event`] describing the verb outcome. The hook is
@@ -596,7 +596,7 @@ impl VerbRegistryBuilder {
     }
 }
 
-/// Validate that no two packs declare the same note kind (F073).
+/// Validate that no two packs declare the same note kind.
 ///
 /// Boot-time duplicate detection prevents pack configuration errors from
 /// silently corrupting note kind routing. Returns an error naming the
@@ -616,8 +616,7 @@ fn validate_unique_note_kinds(packs: &[Box<dyn PackRuntime>]) -> Result<(), Runt
     Ok(())
 }
 
-/// Validate that no two packs declare the same `Visibility::Verb` handler name
-/// (F093).
+/// Validate that no two packs declare the same `Visibility::Verb` handler name.
 ///
 /// `Visibility::Subhandler` entries are pack-prefixed by convention and excluded
 /// from cross-pack collision detection. Two packs declaring the same subhandler
@@ -732,7 +731,7 @@ pub struct VerbRegistry {
     actor_id: Option<String>,
     /// Audit event sink — `None` means tracing-only (v0.2 default).
     event_store: Option<Arc<dyn EventStore>>,
-    /// Post-dispatch hook — `None` means no real-time observation (Issue #158).
+    /// Post-dispatch hook — `None` means no real-time observation.
     dispatch_hook: Option<Arc<dyn DispatchHook>>,
     /// Names of all `Visibility::Verb` handlers across all packs, precomputed
     /// once at `build()` time. Used only to render the unknown-verb error
@@ -879,7 +878,7 @@ impl VerbRegistry {
         self.event_store.clone()
     }
 
-    /// Return the help schema envelope for a verb (issue #287).
+    /// Return the help schema envelope for a verb.
     ///
     /// Walks registered packs for the first matching `HandlerDef` and returns a
     /// structured JSON envelope. Subhandlers carry `callable_via_mcp: false`.
@@ -902,10 +901,10 @@ impl VerbRegistry {
                             })
                         })
                         .collect();
-                    // ue-help-introspection C1: subhandlers are not callable via
-                    // the MCP request surface.  The help payload must match the
-                    // behaviour the dispatch path enforces so that agents who
-                    // read `help=true` before probing see accurate availability.
+                    // Subhandlers are not callable via the MCP request surface;
+                    // the help payload must match the behaviour the dispatch
+                    // path enforces so callers reading `help=true` before
+                    // probing see accurate availability.
                     if matches!(handler.visibility, Visibility::Subhandler) {
                         return Ok(serde_json::json!({
                             "verb": verb,
@@ -932,7 +931,7 @@ impl VerbRegistry {
         }
         // Verb-visibility handler names, precomputed at build() time (internal
         // subhandlers are excluded so they are not advertised in the
-        // unknown-verb error — ue-help-introspection C1 / internal review High).
+        // unknown-verb error).
         Err(RuntimeError::InvalidInput(format!(
             "unknown verb {verb:?}; available: {}",
             self.available_verbs.join(", ")
@@ -995,22 +994,22 @@ impl VerbRegistry {
         params: Value,
         identity: Option<RequestIdentity>,
     ) -> Result<Value, RuntimeError> {
-        // help=true interception (issue #287) — short-circuit before gate/pack.
+        // help=true interception — short-circuit before gate/pack.
         if params.get("help").and_then(Value::as_bool) == Some(true) {
             return self.describe_verb(verb);
         }
         // Resolve namespace before `params` is moved into pack.dispatch, so the
         // post-dispatch hook can reference it.
         //
-        // RUNTIME-AUD-002 (#433): absent `namespace` and a present-but-malformed
-        // `namespace` are different cases. A present non-string value (null,
-        // number, bool, array, object) is explicit caller input that failed to
-        // parse — ADR-018 requires it fail closed, not silently coerce to the
-        // default namespace. Only a genuinely absent key defaults. Shared with
-        // the multi-backend coordinator intercept via `resolve_explicit_namespace`
-        // so every MCP ingress path applies the same fail-closed rule.
+        // Absent `namespace` and a present-but-malformed `namespace` are
+        // different cases. A present non-string value (null, number, bool,
+        // array, object) is explicit caller input that failed to parse and
+        // must fail closed, not silently coerce to the default namespace.
+        // Only a genuinely absent key defaults. Shared with the multi-backend
+        // coordinator intercept via `resolve_explicit_namespace` so every MCP
+        // ingress path applies the same fail-closed rule.
         let explicit_namespace = params.get("namespace").is_some_and(Value::is_string);
-        // ADR-096 Fork 1: a supplied per-request identity overrides the baked
+        // A supplied per-request identity overrides the baked
         // default_namespace/actor_id/visible_namespaces for this call only.
         let default_namespace_str: &str = identity
             .as_ref()
@@ -1021,10 +1020,10 @@ impl VerbRegistry {
             Some(id) => id.actor_id.as_deref(),
             None => self.actor_id.as_deref(),
         };
-        // ADR-057: thread the configured actor identity into the gate request so
-        // the gate can distinguish human vs agent callers at the dispatch seam.
-        // Resolved once via the shared actor-identity policy (#567) and reused
-        // for token minting below, so the gate's notion of "who is the caller"
+        // Thread the configured actor identity into the gate request so the
+        // gate can distinguish human vs agent callers at the dispatch seam.
+        // Resolved once via the shared actor-identity policy and reused for
+        // token minting below, so the gate's notion of "who is the caller"
         // and the storage token's notion can never drift apart.
         let resolved_actor = crate::actor_identity::resolve_actor(actor_id_str);
         let gate_req = GateRequest::new(resolved_actor.clone(), ns.clone(), verb, params.clone());
@@ -1046,13 +1045,13 @@ impl VerbRegistry {
                     "gate.check"
                 );
 
-                // #623 (ADR-094): drain any process-lifetime `OnceLock` config
-                // locks queued since the last dispatch and persist them as
-                // `ConfigLocked` events, riding this same audit-persistence
-                // gate. The namespace/actor stamped on these rows are
-                // whichever dispatch happens to observe the queue non-empty
-                // first — an accepted provenance quirk (ADR-094) rather than
-                // threading an `EventStore` handle into every synchronous
+                // Drain any process-lifetime `OnceLock` config locks queued
+                // since the last dispatch and persist them as `ConfigLocked`
+                // events, riding this same audit-persistence gate. The
+                // namespace/actor stamped on these rows are whichever
+                // dispatch happens to observe the queue non-empty first —
+                // an accepted provenance quirk, preferred over threading an
+                // `EventStore` handle into every synchronous
                 // `OnceLock::get_or_init` call site.
                 if let Some(store) = &self.event_store {
                     if crate::config_ledger::PENDING
@@ -1073,23 +1072,20 @@ impl VerbRegistry {
                     }
                 }
 
-                // ADR-103 Stage 1 / #676: every Allow-outcome audit row defers
-                // its append until pack dispatch returns, so the row can carry
-                // the measured dispatch time in `duration_us` (previously the
-                // row was persisted before dispatch ran, so the persisted
-                // `duration_us` was always the `Event::new` default of 0 — see
-                // ADR-103 Stage 1). A singleton `link` call (no `links` bulk
-                // array) additionally enriches the deferred row with the
-                // created/resolved edge fields (schema v2) once dispatch
-                // resolves. Denied calls have no dispatch to wait for and keep
-                // the immediate v1 append below.
+                // Every Allow-outcome audit row defers its append until pack
+                // dispatch returns, so the row can carry the measured
+                // dispatch time in `duration_us` (persisting before dispatch
+                // ran always recorded the `Event::new` default of 0). A
+                // singleton `link` call (no `links` bulk array) additionally
+                // enriches the deferred row with the created/resolved edge
+                // fields (schema v2) once dispatch resolves. Denied calls
+                // have no dispatch to wait for and keep the immediate v1
+                // append below.
                 //
                 // Accepted trade-off: a crash between this Allow decision and
                 // the deferred append below (post-dispatch, further down this
-                // function) loses that dispatch's audit row entirely. This is
-                // deliberate, not an oversight — see ADR-103, "Stage 1
-                // clarification: audit-row write timing" for the rationale
-                // and the recorded upgrade path.
+                // function) loses that dispatch's audit row entirely — a
+                // deliberate choice, not an oversight.
                 let defer_audit = !is_deny;
 
                 // Persist to EventStore immediately only for denied calls.
@@ -1131,33 +1127,34 @@ impl VerbRegistry {
 
         // Mint the authorized storage token at the dispatch boundary.
         //
-        // ADR-007 Rev 4 Rule 0/3/3b: writes pin to `local` by default. Actor
-        // identity and config `[actor] id` are attribution and gate-context inputs
-        // only — they never route storage. The explicit `namespace=` request param
-        // is a precise single-namespace escape (Rule 3): the caller deliberately
+        // Writes pin to `local` by default. Actor identity and config
+        // `[actor] id` are attribution and gate-context inputs only — they
+        // never route storage. The explicit `namespace=` request param is a
+        // precise single-namespace escape: the caller deliberately
         // reads/writes exactly that one set; it is NOT widened by `visible_namespaces`.
         //
-        // When actor_id is configured (ADR-057), mint a token carrying that actor
+        // When actor_id is configured, mint a token carrying that actor
         // label so that comm.inbox applies the to_actor filter for directed delivery.
         // Otherwise, use ActorRef::anonymous() and inbox falls back to party-line.
-        // ADR-096 Fork 1: `actor_id_str` already reflects the per-request identity
-        // override when supplied (resolved above into `resolved_actor`, mirrored
-        // into the gate request). Reusing the same value here (#567) guarantees
-        // the gate's actor and the storage token's actor can never diverge.
+        // `actor_id_str` already reflects the per-request identity override
+        // when supplied (resolved above into `resolved_actor`, mirrored into
+        // the gate request). Reusing the same value here guarantees the
+        // gate's actor and the storage token's actor can never diverge.
         //
-        // Rule 3b (Rev 4): on the default (no explicit `namespace=`) path, the read
-        // scope widens to `['local'] ∪ visible_namespaces` (baked, or the per-request
-        // override — ADR-096 Fork 1). `'local'` is always included (mint_with_visibility
-        // deduplicates). Writes remain pinned to `'local'`. Per-actor distinctions use
-        // view-layer tag filters (assignee, actor_id, from/to), not namespace partitions.
-        // `ns`/`explicit_namespace` were already validated above (RUNTIME-AUD-002 /
-        // #433) — reuse them instead of re-reading `params["namespace"]` with
-        // `as_str()`, which would silently drop malformed non-string values again.
+        // On the default (no explicit `namespace=`) path, the read scope
+        // widens to `['local'] ∪ visible_namespaces` (baked, or the
+        // per-request override). `'local'` is always included
+        // (mint_with_visibility deduplicates). Writes remain pinned to
+        // `'local'`. Per-actor distinctions use view-layer tag filters
+        // (assignee, actor_id, from/to), not namespace partitions. `ns`/
+        // `explicit_namespace` were already validated above — reuse them
+        // instead of re-reading `params["namespace"]` with `as_str()`, which
+        // would silently drop malformed non-string values again.
         let token = if explicit_namespace {
-            // Rule 3 explicit escape: precise single-namespace scope, read+write. NOT widened.
+            // Explicit escape: precise single-namespace scope, read+write. NOT widened.
             NamespaceToken::mint_with_visibility(ns.clone(), vec![], resolved_actor)
         } else {
-            // Rule 3b: default path. Write namespace = local; read scope = ['local'] ∪ visible_namespaces.
+            // Default path: write namespace = local; read scope = ['local'] ∪ visible_namespaces.
             let primary = Namespace::local();
             let mut extra_visible: Vec<Namespace> = match identity.as_ref() {
                 Some(id) => id
@@ -1209,15 +1206,14 @@ impl VerbRegistry {
                 let result = pack.dispatch(verb, params, self, &token).await;
                 let dispatch_us = dispatch_start.elapsed().as_micros() as i64;
 
-                // ADR-103 Stage 1 / #676: append the deferred Allow-outcome
-                // audit row now that dispatch has resolved, so `duration_us`
-                // carries the measured `dispatch_us` instead of the
-                // `Event::new` default of 0. A successful singleton `link`
-                // call enriches the row with the created/resolved edge
-                // (schema v2); anything that cannot be enriched, or is not a
-                // singleton `link` call, falls back to the generic v1 audit
-                // shape so no audit row is ever dropped for the deferred
-                // path.
+                // Append the deferred Allow-outcome audit row now that
+                // dispatch has resolved, so `duration_us` carries the
+                // measured `dispatch_us` instead of the `Event::new` default
+                // of 0. A successful singleton `link` call enriches the row
+                // with the created/resolved edge (schema v2); anything that
+                // cannot be enriched, or is not a singleton `link` call,
+                // falls back to the generic v1 audit shape so no audit row
+                // is ever dropped for the deferred path.
                 if let Some(audit) = deferred_audit.take() {
                     if let Some(store) = &self.event_store {
                         let is_link_singleton =
@@ -1262,9 +1258,8 @@ impl VerbRegistry {
                                 }
                             }
                             _ => {
-                                // Review finding (issue #723 fix-round): the
-                                // persisted audit outcome must reflect the
-                                // dispatch result, not be hardcoded to
+                                // The persisted audit outcome must reflect
+                                // the dispatch result, not be hardcoded to
                                 // Success — otherwise a failed dispatch is
                                 // recorded as successful work and disappears
                                 // from `outcome=error` queries.
@@ -1282,7 +1277,7 @@ impl VerbRegistry {
                     }
                 }
 
-                // Post-dispatch hook: fires on success, opt-in (Issue #158).
+                // Post-dispatch hook: fires on success, opt-in.
                 if let (Ok(ref ok_val), Some(hook)) = (&result, &self.dispatch_hook) {
                     let mut dispatch_event = Event::new(
                         ns.as_str(),
@@ -1296,7 +1291,7 @@ impl VerbRegistry {
 
                     // For recall verbs: extract the first result's id as
                     // target_id so the brain temporal posterior can observe
-                    // real hit/miss and latency (fix for internal review P12 Major).
+                    // real hit/miss and latency.
                     if verb == "memory.recall" {
                         let first_note_id = ok_val
                             .as_array()
@@ -1319,22 +1314,21 @@ impl VerbRegistry {
                     hook.on_dispatch(&dispatch_view).await;
                 }
 
-                // Recently-referenced ring admission (unified-verb draft ADR,
-                // Slice 1 — gate condition, 2026-07-09): only by-id touches
-                // admit an id. Runs unconditionally (not gated on
-                // `dispatch_hook`, which is opt-in) because the ring is a
-                // core dispatch-boundary capability, not an observer.
+                // Recently-referenced ring admission: only by-id touches admit
+                // an id. Runs unconditionally (not gated on `dispatch_hook`,
+                // which is opt-in) because the ring is a core
+                // dispatch-boundary capability, not an observer.
                 //
-                // Keyed on `token.namespace()`, NOT `ns` (review finding,
-                // 2026-07-09 fix round): `ns` is the gate-resolved namespace,
-                // which on the default (non-explicit) dispatch path can be a
-                // non-local `default_namespace` (e.g. "lambda:leo") while the
-                // storage token that actually created/touched the record is
-                // pinned to `local` per ADR-007 Rule 0/3b. The ring must be
-                // keyed on the namespace the record actually lives in — the
-                // same namespace `resolve_reference`'s ring lookup uses —
-                // or admission and lookup silently diverge on any non-local
-                // `default_namespace` config.
+                // Keyed on `token.namespace()`, NOT `ns`: `ns` is the
+                // gate-resolved namespace, which on the default
+                // (non-explicit) dispatch path can be a non-local
+                // `default_namespace` (e.g. "lambda:leo") while the storage
+                // token that actually created/touched the record is pinned
+                // to `local`. The ring must be keyed on the namespace the
+                // record actually lives in — the same namespace
+                // `resolve_reference`'s ring lookup uses — or admission and
+                // lookup silently diverge on any non-local `default_namespace`
+                // config.
                 if let Ok(ref ok_val) = result {
                     let admissions = crate::reference_ring::ring_admissions_for(verb, ok_val);
                     if !admissions.is_empty() {
@@ -1361,9 +1355,9 @@ impl VerbRegistry {
         // trail (matches the "no audit row is ever dropped" contract above).
         if let Some(audit) = deferred_audit.take() {
             if let Some(store) = &self.event_store {
-                // Review finding (issue #723 fix-round): dispatch is about to
-                // return `InvalidInput` below (no pack owns this verb), so
-                // the persisted outcome must be `Error`, not `Success`.
+                // Dispatch is about to return `InvalidInput` below (no pack
+                // owns this verb), so the persisted outcome must be `Error`,
+                // not `Success`.
                 let storage_event =
                     build_audit_storage_event(&gate_req, &audit, EventOutcome::Error);
                 append_audit_event_best_effort(store, storage_event, verb).await;
@@ -1372,7 +1366,7 @@ impl VerbRegistry {
 
         // Verb-visibility handler names, precomputed at build() time (internal
         // subhandlers are excluded so they are not advertised in the
-        // unknown-verb error — ue-help-introspection C1 / internal review High).
+        // unknown-verb error).
         Err(RuntimeError::InvalidInput(format!(
             "unknown verb {verb:?}; available: {}",
             self.available_verbs.join(", ")
@@ -1417,7 +1411,7 @@ impl VerbRegistry {
     /// All MCP-exposed handlers across all registered packs (`Visibility::Verb` only).
     ///
     /// Subhandlers (`Visibility::Subhandler`) are excluded — they are internal
-    /// pipeline steps not surfaced on the MCP wire (F118). Returned with `'static`
+    /// pipeline steps not surfaced on the MCP wire. Returned with `'static`
     /// lifetime since pack handlers are `&'static [HandlerDef]` constants.
     pub fn all_verbs(&self) -> Vec<&'static HandlerDef> {
         self.packs
@@ -1431,7 +1425,7 @@ impl VerbRegistry {
     /// (`Visibility::Verb` only).
     ///
     /// Subhandlers (`Visibility::Subhandler`) are excluded from the MCP catalog
-    /// (F118-F123). Use `all_handlers_with_names` when internal handlers must
+    /// Use `all_handlers_with_names` when internal handlers must
     /// also be enumerated (e.g. runtime introspection).
     pub fn all_verbs_with_names(&self) -> Vec<(&str, &'static HandlerDef)> {
         self.packs
@@ -1595,8 +1589,7 @@ impl VerbRegistry {
         }
     }
 
-    /// Invoke `PackRuntime::register_note_mutation_hook` on every registered pack
-    /// (#750 fix-round 1).
+    /// Invoke `PackRuntime::register_note_mutation_hook` on every registered pack.
     ///
     /// Called by the transport during startup, after the registry is built and
     /// before the first verb dispatch, so that note-mutation notifications at
@@ -1651,8 +1644,7 @@ impl VerbRegistry {
         false
     }
 
-    /// Apply all non-empty pack-auxiliary schema plans to the given backend
-    /// (c12 startup application).
+    /// Apply all non-empty pack-auxiliary schema plans to the given backend.
     ///
     /// This is the centralized startup hook that replaced the previous lazy
     /// per-pack self-bootstrap pattern. Each pack's `SchemaPlan` carries
@@ -2006,7 +1998,7 @@ fn target_id_from_args(args: &serde_json::Value) -> Option<uuid::Uuid> {
 /// Build a v1-shape audit storage event from a gate check outcome.
 ///
 /// Shared by the immediate-append path (all verbs, denied calls, bulk
-/// `links`) and the deferred singleton-`link` fallback (#676) so both audit
+/// `links`) and the deferred singleton-`link` fallback so both audit
 /// shapes are produced by one code path.
 fn build_audit_storage_event(
     gate_req: &GateRequest,
@@ -2046,7 +2038,7 @@ async fn append_audit_event_best_effort(store: &Arc<dyn EventStore>, event: Even
     }
 }
 
-/// Schema v2 audit payload for a successful singleton `link` call (#676).
+/// Schema v2 audit payload for a successful singleton `link` call.
 ///
 /// Additive over the v1 `AuditEvent` shape: every v1 field is preserved via
 /// `#[serde(flatten)]`, and the edge identity/relation/weight the caller
@@ -2098,7 +2090,7 @@ fn link_audit_success_from_result(
 }
 
 /// Resolve and validate a caller-supplied `namespace` argument the same way
-/// on every MCP ingress path (RUNTIME-AUD-002 / #433).
+/// on every MCP ingress path.
 ///
 /// - Absent `namespace` key → parse `default_namespace`.
 /// - Present `namespace: "<string>"` → parse the caller's value.
@@ -2127,8 +2119,8 @@ pub fn resolve_explicit_namespace(
     }
 }
 
-/// JSON type name for error messages (RUNTIME-AUD-002 / #433): describes a
-/// present-but-malformed `namespace` value without echoing its contents.
+/// JSON type name for error messages: describes a present-but-malformed
+/// `namespace` value without echoing its contents.
 pub fn json_type_name(v: &Value) -> &'static str {
     match v {
         Value::Null => "null",
@@ -2361,7 +2353,7 @@ mod tests {
         assert_eq!(res["pack"], "beta");
     }
 
-    /// F093/F094: two packs declaring the same `Visibility::Verb` handler must be
+    /// Two packs declaring the same `Visibility::Verb` handler must be
     /// rejected at build time — the old "first registered wins" behaviour is
     /// replaced by a boot error.
     #[test]
@@ -2448,7 +2440,7 @@ mod tests {
         assert!(msg.contains("create"));
     }
 
-    /// `all_verbs` returns only `Visibility::Verb` entries (F118).
+    /// `all_verbs` returns only `Visibility::Verb` entries.
     ///
     /// BetaPack's `create` is `Visibility::Subhandler` — it must NOT appear
     /// in `all_verbs()` even though it has the same name as a Verb in AlphaPack.
@@ -2658,7 +2650,7 @@ mod tests {
     }
 
     // Captures the namespace each call sees so we can assert what the gate
-    // actually receives — internal review round 1 caught us hard-wiring `default_ns()`.
+    // actually receives, rather than assuming a hard-wired `default_ns()`.
     #[derive(Default, Debug)]
     struct NamespaceCapturingGate {
         seen: std::sync::Mutex<Vec<String>>,
@@ -2717,8 +2709,8 @@ mod tests {
         assert_eq!(seen, vec!["local"]);
     }
 
-    /// RUNTIME-AUD-002 (#433): a present-but-malformed `namespace` value must
-    /// never reach the gate as the default namespace. Table-driven over every
+    /// A present-but-malformed `namespace` value must never reach the gate as
+    /// the default namespace. Table-driven over every
     /// non-string JSON type; the gate-spy proves no call is ever recorded (the
     /// dispatch must short-circuit with `InvalidInput` before `GateRequest` is
     /// built), so the default namespace can never appear as a coerced stand-in.
@@ -2974,17 +2966,14 @@ mod tests {
         }
     }
 
-    /// #567: the gate's actor and the storage token's actor must be the exact
-    /// same resolved value — both now come from one `resolve_actor` call
+    /// The gate's actor and the storage token's actor must be the exact same
+    /// resolved value — both come from one `resolve_actor` call
     /// (`resolved_actor`) instead of two independently hand-synchronized
-    /// `match` expressions. This is the drift `#567` warns about: before the
-    /// unification, a future edit to one copy but not the other would silently
-    /// desynchronize "who the gate thinks the caller is" from "who the
-    /// storage layer thinks the caller is".
-    ///
-    /// FAILURE MODE: reintroducing a second independent actor-resolution copy
-    /// for the token (instead of reusing the gate's resolved value) could
-    /// diverge under a future edit and this test would catch it.
+    /// `match` expressions, so a future edit to one copy but not the other
+    /// cannot silently desynchronize "who the gate thinks the caller is" from
+    /// "who the storage layer thinks the caller is". Reintroducing a second
+    /// independent actor-resolution copy for the token would regress this and
+    /// this test would catch it.
     #[tokio::test]
     async fn gate_actor_and_token_actor_are_identical_when_actor_id_is_set() {
         let gate = Arc::new(ActorCapturingGate::default());
@@ -3046,13 +3035,14 @@ mod tests {
         assert_eq!(gate_actor.id, "local");
     }
 
-    // ---- Rego gate: fail-closed end-to-end (issue #30) ----
+    // ---- Rego gate: fail-closed end-to-end ----
 
     /// A `RegoGate` whose policy lacks the named entrypoint rule must cause
     /// `VerbRegistry::dispatch` to return `RuntimeError::PermissionDenied` —
     /// never to proceed to the pack handler.
     ///
-    /// This is the runtime-level assertion for the fix to security issue #30.
+    /// This is the runtime-level assertion that a gate evaluation failure
+    /// fails closed rather than opening a security hole.
     /// `RegoGate::check` converts all evaluation failures (missing rule,
     /// undefined result, serialization error, poisoned engine) to
     /// `Ok(GateDecision::Deny)`, so dispatch is blocked. The runtime's
@@ -3484,11 +3474,11 @@ mod tests {
 
     #[tokio::test]
     async fn audit_event_duration_us_reflects_measured_dispatch_time() {
-        // ADR-103 Stage 1: the persisted audit row's `duration_us` must carry
-        // the measured pack-dispatch time, not the `Event::new` default of 0
-        // (the bug this stage fixes — the row used to be persisted before
-        // dispatch ran at all). `SleepingPack` sleeps 20ms so the assertion
-        // has a wide, non-flaky margin over scheduling jitter.
+        // The persisted audit row's `duration_us` must carry the measured
+        // pack-dispatch time, not the `Event::new` default of 0 (persisting
+        // the row before dispatch ran always yielded 0). `SleepingPack`
+        // sleeps 20ms so the assertion has a wide, non-flaky margin over
+        // scheduling jitter.
         let store = Arc::new(MemoryEventStore::default());
         let mut builder = VerbRegistryBuilder::new();
         builder.register(SleepingPack);
@@ -3520,11 +3510,10 @@ mod tests {
 
     #[tokio::test]
     async fn dispatch_unknown_verb_allowed_by_gate_still_persists_audit_row() {
-        // ADR-103 Stage 1: generalizing audit-row deferral to every
-        // Allow-outcome verb (not just singleton `link`) must not silently
-        // drop the audit row for a verb the gate allows but no pack owns.
-        // `duration_us` stays at the `Event::new` default of 0 here since no
-        // dispatch ever ran to measure.
+        // Generalizing audit-row deferral to every Allow-outcome verb (not
+        // just singleton `link`) must not silently drop the audit row for a
+        // verb the gate allows but no pack owns. `duration_us` stays at the
+        // `Event::new` default of 0 here since no dispatch ever ran to measure.
         let store = Arc::new(MemoryEventStore::default());
         let mut builder = VerbRegistryBuilder::new();
         builder.register(AlphaPack);
@@ -3550,9 +3539,9 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(page.items[0].duration_us, 0);
-        // Review finding (issue #723 fix-round): dispatch returns
-        // InvalidInput for an unknown verb, so the persisted outcome must be
-        // Error, not the previously-hardcoded Success.
+        // Dispatch returns InvalidInput for an unknown verb, so the
+        // persisted outcome must be Error, not the previously-hardcoded
+        // Success.
         assert_eq!(page.items[0].outcome, EventOutcome::Error);
     }
 
@@ -3695,10 +3684,9 @@ mod tests {
 
     // ---- EventStore audit envelope round-trip ----
     //
-    // internal review finding (Major #1): EventStore was persisting a summary
-    // Event without the full AuditEvent fields (deny_reason, gate_impl,
-    // obligations). This test verifies the complete envelope survives
-    // append_event → query_events.
+    // EventStore must not persist a summary Event without the full
+    // AuditEvent fields (deny_reason, gate_impl, obligations). This test
+    // verifies the complete envelope survives append_event → query_events.
 
     #[tokio::test]
     async fn audit_envelope_round_trips_deny_reason_and_gate_impl_through_event_store() {
@@ -4120,7 +4108,7 @@ mod tests {
         );
     }
 
-    // #282: registry audit event must carry target_id when dispatch params include it.
+    // Registry audit event must carry target_id when dispatch params include it.
     #[tokio::test]
     async fn audit_event_threads_target_id_from_dispatch_args() {
         let store = Arc::new(MemoryEventStore::default());
@@ -4155,7 +4143,7 @@ mod tests {
         );
     }
 
-    // ---- #676: link-verb audit enrichment ----
+    // ---- Link-verb audit enrichment ----
 
     /// Test pack exposing a single `link` verb whose one-shot result is
     /// configured up front — lets tests drive both the success and failure
@@ -4335,9 +4323,8 @@ mod tests {
             ev.payload_schema_version, 1,
             "failed link keeps the v1 audit shape"
         );
-        // Review finding (issue #723 fix-round): the persisted outcome must
-        // reflect the dispatch result (Err → Error), not be hardcoded to
-        // Success from the gate's Allow decision.
+        // The persisted outcome must reflect the dispatch result (Err →
+        // Error), not be hardcoded to Success from the gate's Allow decision.
         assert_eq!(
             ev.outcome,
             EventOutcome::Error,
@@ -4818,7 +4805,7 @@ mod dep_tests {
     }
 }
 
-// ── Dispatch hook tests (Issue #158) ─────────────────────────────────────────
+// ── Dispatch hook tests ─────────────────────────────────────────
 
 #[cfg(test)]
 mod hook_tests {
@@ -5019,7 +5006,7 @@ mod hook_tests {
     }
 }
 
-// ── help=true tests (issue #287) ──────────────────────────────────────────────
+// ── help=true tests ──────────────────────────────────────────────
 
 #[cfg(test)]
 mod help_tests {
@@ -5092,8 +5079,8 @@ mod help_tests {
                 category: VerbCategory::Assertive,
                 params: &RECALL_PARAMS,
             },
-            // ue-help-introspection C1: a Subhandler used to test that
-            // help=true returns callable_via_mcp: false for internal verbs.
+            // A Subhandler used to test that help=true returns
+            // callable_via_mcp: false for internal verbs.
             HandlerDef {
                 name: "recall.embed",
                 description: "Return the embedding vector used by memory recall",
@@ -5253,7 +5240,7 @@ mod help_tests {
         );
     }
 
-    // ── ue-help-introspection C1 regressions ─────────────────────────────────
+    // ── Subhandler help-schema regressions ─────────────────────────────────
     //
     // Subhandler verbs must return `callable_via_mcp: false` in their help
     // schema so agents who read help=true before probing see accurate
@@ -5340,7 +5327,7 @@ mod help_tests {
             .await
             .expect("help=true on subhandler must succeed");
 
-        // params must always be present (H1: consistent shape).
+        // params must always be present (consistent shape).
         let params = result
             .get("params")
             .expect("subhandler help must include 'params' field");
@@ -5350,11 +5337,10 @@ mod help_tests {
         );
     }
 
-    // ── internal review High: unknown-verb error must not leak subhandler names ─────────
+    // ── Unknown-verb error must not leak subhandler names ─────────
 
     /// `describe_verb` on an unknown verb must list only Verb-visibility names
-    /// in the "available" list — never subhandler names like `recall.embed`
-    /// (internal review High — ue-help-introspection C1 / unknown-verb path).
+    /// in the "available" list — never subhandler names like `recall.embed`.
     #[tokio::test]
     async fn help_true_unknown_verb_available_list_excludes_subhandlers() {
         let reg = build_help_registry(Arc::new(AtomicUsize::new(0)));
@@ -5588,10 +5574,10 @@ mod help_tests {
         );
     }
 
-    // ADR-028 B-SHOULD-FIX-3: two packs declaring the same auxiliary table on
-    // the same backend must cause apply_schema_plans_with_map to return an
-    // error that names both packs and the table — it is a boot-time failure,
-    // not a silent DDL race.
+    // ADR-028: two packs declaring the same auxiliary table on the same
+    // backend must cause apply_schema_plans_with_map to return an error that
+    // names both packs and the table — it is a boot-time failure, not a
+    // silent DDL race.
     #[test]
     fn apply_schema_plans_with_map_collision_is_an_error() {
         let backend = khive_db::StorageBackend::memory().expect("memory backend");

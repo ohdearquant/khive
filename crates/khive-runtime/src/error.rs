@@ -9,9 +9,9 @@ use uuid::Uuid;
 pub type RuntimeResult<T> = Result<T, RuntimeError>;
 
 /// A guarded edge write (`link`/`link_many`) was refused because one or both
-/// endpoints no longer existed at write time (#769). Names the exact
-/// endpoint(s) missing instead of a generic "source or target" message, and,
-/// for a batch write, which entry in the batch failed first.
+/// endpoints no longer existed at write time. Names the exact endpoint(s)
+/// missing instead of a generic "source or target" message, and, for a batch
+/// write, which entry in the batch failed first.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GuardedWriteFailure {
     /// Index of the failing entry within a `link_many` batch. `None` for the
@@ -269,7 +269,7 @@ pub enum RuntimeError {
 }
 
 /// Resolve an FTS text-leg search result, failing loud on parser syntax
-/// errors instead of silently degrading to vector-only fusion (#569).
+/// errors instead of silently degrading to vector-only fusion.
 ///
 /// A genuine backend outage (pool exhaustion, connection failure, etc.) is
 /// NOT a bad query and is returned as-is via the fallthrough `Err(e)` arm;
@@ -305,9 +305,8 @@ fn format_uuid_list(uuids: &[uuid::Uuid]) -> String {
 }
 
 /// Maps the dependency-light `khive-types` entity-type resolution error onto
-/// `RuntimeError::InvalidInput` at the pack boundary (#571): `khive-types`
-/// cannot depend on `khive-runtime`, so it cannot produce `RuntimeError`
-/// directly.
+/// `RuntimeError::InvalidInput` at the pack boundary: `khive-types` cannot
+/// depend on `khive-runtime`, so it cannot produce `RuntimeError` directly.
 impl From<khive_types::EntityTypeError> for RuntimeError {
     fn from(e: khive_types::EntityTypeError) -> Self {
         Self::InvalidInput(e.to_string())

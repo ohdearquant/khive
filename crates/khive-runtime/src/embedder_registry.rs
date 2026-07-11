@@ -86,15 +86,10 @@ impl EmbedderRegistry {
     /// Register a provider.
     ///
     /// If a provider with the same [`name`](EmbedderProvider::name) already
-    /// exists, the new provider **replaces** the existing one (last-writer wins).
-    /// The previously cached service instance (if any) is discarded — the
-    /// replacement provider's [`build`](EmbedderProvider::build) will be
-    /// called lazily on the next access.
-    ///
-    /// **Last-wins** is chosen over rejection because pack registration order
-    /// is not guaranteed and packs may legitimately override a default model
-    /// with a custom implementation of the same logical name. Operators who
-    /// need strict collision detection should inspect
+    /// exists, it is replaced (last-writer wins) and any cached service is
+    /// discarded, since pack registration order is not guaranteed and packs
+    /// may legitimately override a default model under the same name.
+    /// Callers needing strict collision detection should check
     /// [`names`](Self::names) before registering.
     pub fn register<P: EmbedderProvider + 'static>(&mut self, provider: P) {
         let name = provider.name().to_owned();
@@ -158,11 +153,8 @@ impl EmbedderEntry {
     ///
     /// Returns `RuntimeError` if `build()` fails, rather than panicking.
     pub(crate) async fn resolve(self) -> RuntimeResult<Arc<dyn EmbeddingService>> {
-        // `OnceCell` does not expose a fallible init; we work around this by
-        // checking if the cell is already populated (cheap), and if not, calling
-        // `build()` ourselves, storing on success, and propagating on failure.
-        // Races are benign: at worst two callers both call `build()` and the
-        // loser's result is discarded — both outcomes are identical services.
+        // `OnceCell` has no fallible init, so failure is handled manually; a losing
+        // racer's build() result is simply discarded since both are equivalent.
         if let Some(svc) = self.cell.get() {
             return Ok(Arc::clone(svc));
         }
@@ -172,8 +164,7 @@ impl EmbedderEntry {
                 self.provider.name()
             ))
         })?;
-        // `set` may fail if another task raced us to initialise; that is fine —
-        // we just return our freshly-built instance (functionally identical).
+        // A losing `set` (raced by another task) is fine — the two results are equivalent.
         let _ = self.cell.set(Arc::clone(&svc));
         Ok(svc)
     }
@@ -225,8 +216,6 @@ impl EmbedderProvider for LatticeEmbedderProvider {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
-
-    // ---- minimal mock provider ----
 
     struct ConstVecProvider {
         name: String,
@@ -286,8 +275,6 @@ mod tests {
         }
     }
 
-    // ---- test: register + get round-trip ----
-
     #[test]
     fn register_and_get_provider_round_trip() {
         let mut reg = EmbedderRegistry::new();
@@ -298,8 +285,6 @@ mod tests {
         assert_eq!(provider.name(), "mock-384");
         assert_eq!(provider.dimensions(), 384);
     }
-
-    // ---- test: duplicate name is last-wins (not an error) ----
 
     #[test]
     fn duplicate_name_last_wins() {
@@ -315,8 +300,6 @@ mod tests {
         );
     }
 
-    // ---- test: names() returns all registered names ----
-
     #[test]
     fn names_returns_all_registered() {
         let mut reg = EmbedderRegistry::new();
@@ -329,8 +312,6 @@ mod tests {
         assert_eq!(names, vec!["model-a", "model-b", "model-c"]);
     }
 
-    // ---- test: get_service returns UnknownModel for unregistered name ----
-
     #[tokio::test]
     async fn get_service_unknown_name_returns_error() {
         let reg = EmbedderRegistry::new();
@@ -341,8 +322,6 @@ mod tests {
             "expected UnknownModel, got {err:?}"
         );
     }
-
-    // ---- test: get_service calls build once (lazy, cached) ----
 
     #[tokio::test]
     async fn get_service_calls_build_once() {

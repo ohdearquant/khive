@@ -62,7 +62,8 @@ pub fn render_format(value: Value, format: OutputFormat, presentation: Presentat
     match format {
         OutputFormat::Json => serde_json::to_string(&value).unwrap_or_else(|_| "null".to_string()),
         OutputFormat::Auto | OutputFormat::Table => {
-            // Redundancy-reduction pre-pass (§7): skipped in Verbose mode.
+            // Skip the redundancy-reduction pre-pass in Verbose mode — full
+            // canonical shape must pass through unchanged.
             let reduced = if presentation == PresentationMode::Verbose {
                 value
             } else {
@@ -105,16 +106,16 @@ fn drop_record(value: Value) -> Value {
         return value;
     };
 
-    // §7.1: suppress `full_id`.
+    // `full_id` is a chaining handle, not needed in view-only output.
     map.remove("full_id");
 
-    // §7.3: elide `namespace` when its value is `"local"`.
+    // `"local"` is the common case, so only surface `namespace` when it isn't.
     if map.get("namespace").and_then(Value::as_str) == Some("local") {
         map.remove("namespace");
     }
 
-    // §7.2: properties dedup — remove key-value pairs from `properties` that
-    // have an identical counterpart at the top level of this record.
+    // Properties dedup: drop key-value pairs from `properties` that
+    // duplicate an identical top-level sibling.
     let props_val = map.remove("properties");
     if let Some(Value::Object(props)) = props_val {
         let mut new_props = Map::new();
@@ -175,7 +176,7 @@ fn render_table_forced(value: Value) -> String {
     if let Some((records, keys)) = find_record_array(&value) {
         return render_table(&records, &keys);
     }
-    // No record array detected — fallback to compact JSON per §8.3.
+    // No record array detected — fall back to compact JSON.
     serde_json::to_string(&value).unwrap_or_else(|_| "null".to_string())
 }
 
@@ -229,7 +230,6 @@ fn collect_keys(records: &[Value]) -> Vec<String> {
 fn render_table(records: &[Value], keys: &[String]) -> String {
     let mut out = String::new();
 
-    // Header row.
     out.push('|');
     for k in keys {
         out.push(' ');
@@ -238,14 +238,12 @@ fn render_table(records: &[Value], keys: &[String]) -> String {
     }
     out.push('\n');
 
-    // Separator row.
     out.push('|');
     for _ in keys {
         out.push_str("---|");
     }
     out.push('\n');
 
-    // Data rows.
     for record in records {
         out.push('|');
         for k in keys {
@@ -393,7 +391,7 @@ const UUID_CANONICAL_LEN: usize = 36;
 /// Agent mode. Content-like fields are intentionally excluded even when their
 /// value happens to be UUID-shaped.
 ///
-/// `full_id` is explicitly excluded (P-C1): its purpose is to give callers a
+/// `full_id` is explicitly excluded: its purpose is to give callers a
 /// stable chaining handle, so shortening it makes it identical to `id` and
 /// defeats the field entirely.
 fn should_shorten_uuid_field(key: &str) -> bool {
@@ -434,7 +432,7 @@ pub fn present(value: Value, mode: PresentationMode, now_unix_seconds: i64) -> V
 ///
 /// `inside_properties` is `true` when recursing inside a `"properties"` object.
 /// Caller-supplied payload timestamps (e.g. `trigger_at`) must not be compacted
-/// because they encode domain semantics the agent may need to round-trip (#546).
+/// because they encode domain semantics the agent may need to round-trip.
 fn transform_agent(
     value: Value,
     lifecycle: &HashSet<&str>,
@@ -811,7 +809,8 @@ mod tests {
         assert!((s - 1.0).abs() < 1e-9);
     }
 
-    // P-C1 regression: full_id must never be shortened in Agent mode.
+    // full_id must never be shortened in Agent mode — it's the caller's
+    // stable chaining handle.
     #[test]
     fn agent_preserves_full_id_as_36_chars() {
         let uuid = "a1b2c3d4-e5f6-7890-abcd-ef1234567890";
@@ -931,7 +930,7 @@ mod tests {
         });
         let rendered = render_format(v.clone(), OutputFormat::Json, PresentationMode::Agent);
         let parsed: Value = serde_json::from_str(&rendered).unwrap();
-        // full_id must NOT be dropped in json mode (§P-C1, §4).
+        // full_id must not be dropped in json mode.
         assert!(
             parsed.get("full_id").is_some(),
             "json mode must keep full_id"
@@ -965,7 +964,7 @@ mod tests {
             json_parsed.get("namespace").and_then(Value::as_str),
             Some("local")
         );
-        // Auto mode: namespace should be elided (redundancy §7.3), full_id dropped (§7.1).
+        // Auto mode elides namespace=local and drops full_id.
         // The value itself is a single record → rendered as kv block.
         assert!(
             !auto_rendered.contains("full_id"),
@@ -985,16 +984,13 @@ mod tests {
             {"id": "def", "title": "Second"}
         ]);
         let rendered = render_format(v, OutputFormat::Auto, PresentationMode::Agent);
-        // Header row.
         assert!(rendered.starts_with('|'), "must start with |");
         assert!(
             rendered.contains("| id |") || rendered.contains("| id"),
             "must have id column"
         );
         assert!(rendered.contains("title"), "must have title column");
-        // Separator row.
         assert!(rendered.contains("|---|"), "must have separator row");
-        // Data rows.
         assert!(rendered.contains("abc"), "must have first row data");
         assert!(rendered.contains("Second"), "must have second row data");
     }
@@ -1074,19 +1070,15 @@ mod tests {
         );
     }
 
-    /// (e) error envelope invariant: ok=false entries must stay compact json under auto.
-    ///
-    /// This tests the render_result logic via the redundancy-drop + render path.
-    /// The server-level render_result function is tested indirectly: we verify that
-    /// apply_redundancy_drop does NOT touch "ok: false" envelopes (the actual
-    /// invariant is enforced by render_result checking the ok flag before dispatching).
+    /// Indirect check that the redundancy pre-pass doesn't corrupt an error
+    /// envelope's shape; the actual ok=false bypass is enforced by
+    /// `render_result`, not by this pre-pass.
     #[test]
     fn redundancy_drop_does_not_corrupt_error_shape() {
-        // An error envelope that might be passed to the pre-pass in a batch.
         let v = json!({"ok": false, "error": "something failed", "namespace": "local"});
-        // apply_redundancy_drop is a pure value transform; it doesn't know about ok.
-        // The caller (render_result in server.rs) is responsible for bypassing
-        // auto-render on ok=false entries. Here we just verify the pre-pass
+        // apply_redundancy_drop is a pure value transform with no knowledge of
+        // `ok` — bypassing it for error envelopes is the caller's job
+        // (render_result in server.rs). This only checks the pre-pass itself
         // doesn't lose the error field.
         let reduced = apply_redundancy_drop(v.clone());
         assert!(
@@ -1140,7 +1132,7 @@ mod tests {
         );
     }
 
-    /// Cell truncation must not panic on multi-byte UTF-8 characters (High 3).
+    /// Cell truncation must not panic on multi-byte UTF-8 characters.
     ///
     /// A string of 119 ASCII bytes followed by a 3-byte CJK character and more
     /// text has `len() > 120` but byte index 120 falls inside the CJK char.
@@ -1169,7 +1161,7 @@ mod tests {
         );
     }
 
-    // --- parse_iso8601_unix / relative-time offset handling (#754) ---
+    // --- parse_iso8601_unix / relative-time offset handling ---
 
     #[test]
     fn parse_iso8601_unix_negative_offset_matches_equivalent_utc() {
@@ -1259,11 +1251,9 @@ mod tests {
 
     #[test]
     fn compact_timestamp_offset_bearing_future_time_not_shown_as_ago() {
-        // Regression for #754: a wall-clock-identical-to-NOW timestamp that
-        // carries a "-02:00" offset is actually 2h in the future relative to
-        // NOW (2025-05-23T16:08:00Z). The old offset-naive parser treated
-        // the wall-clock digits as UTC and reported "0s ago"; the fixed
-        // parser must not.
+        // A wall-clock-identical-to-NOW timestamp carrying a "-02:00" offset
+        // is actually 2h in the future; an offset-naive parser would misread
+        // the wall-clock digits as UTC and report "0s ago".
         let out = compact_timestamp("2025-05-23T16:08:00-02:00", NOW);
         assert_ne!(out, "0s ago");
         assert_eq!(out, "2025-05-23T16:08");

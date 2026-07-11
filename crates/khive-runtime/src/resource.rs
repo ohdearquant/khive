@@ -37,8 +37,7 @@ pub fn process_resource_usage() -> Option<ProcessResourceUsage> {
     };
     let user_us = usage.ru_utime.tv_sec * 1_000_000 + i64::from(usage.ru_utime.tv_usec as i32);
     let sys_us = usage.ru_stime.tv_sec * 1_000_000 + i64::from(usage.ru_stime.tv_usec as i32);
-    // `ru_maxrss` is bytes on macOS/Darwin and KiB on Linux — the two
-    // platforms this fleet actually ships on (see CLAUDE.md toolchain rules).
+    // `ru_maxrss` is bytes on macOS/Darwin and KiB on Linux.
     let rss_bytes: i64 = if cfg!(target_os = "macos") {
         usage.ru_maxrss as i64
     } else {
@@ -59,15 +58,11 @@ pub fn process_resource_usage() -> Option<ProcessResourceUsage> {
 /// CPU time consumed strictly between two [`ProcessResourceUsage`] snapshots,
 /// in microseconds.
 ///
-/// Review finding (issue #723 fix-round): `cpu_us` on a snapshot is
-/// cumulative process CPU time since process start, not CPU consumed by any
-/// one phase. Callers that want a per-phase attribution must capture a
-/// snapshot at phase entry and another at phase exit and take the delta —
-/// this helper does that subtraction and floors at zero (via `saturating_sub`
-/// followed by `.max(0)`, since a plain `i64::saturating_sub` only guards
-/// against integer overflow/underflow, not against a negative *result* — a
-/// spurious (should-never-happen) decrease in cumulative CPU between two
-/// reads must never surface as a negative delta).
+/// `cpu_us` on a snapshot is cumulative process CPU time since process
+/// start, not CPU consumed by any one phase, so per-phase attribution needs
+/// the delta between an entry and exit snapshot. The result is floored at
+/// zero so a spurious (should-never-happen) decrease in cumulative CPU
+/// between two reads never surfaces as a negative delta.
 pub fn cpu_delta_us(
     start: Option<ProcessResourceUsage>,
     end: Option<ProcessResourceUsage>,
@@ -100,13 +95,10 @@ mod tests {
         );
     }
 
-    // Review finding (issue #723 fix-round): `cpu_delta_us` must report the
-    // difference between two snapshots, not either snapshot's raw
-    // (cumulative-since-process-start) value. This test uses synthetic
-    // snapshots rather than real `getrusage` reads so it fails deterministically
-    // if someone reverts the caller to reporting `end.cpu_us` directly —
-    // a huge cumulative value in `end` alone would otherwise pass a merely
-    // "non-negative" check.
+    // `cpu_delta_us` must report the difference between two snapshots, not
+    // either snapshot's raw cumulative value. Synthetic snapshots (rather
+    // than real `getrusage` reads) make this fail deterministically if the
+    // caller regresses to reporting `end.cpu_us` directly.
     #[test]
     fn cpu_delta_us_reports_the_difference_not_the_cumulative_end_value() {
         let start = ProcessResourceUsage {

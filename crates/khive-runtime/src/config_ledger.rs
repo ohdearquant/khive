@@ -93,9 +93,9 @@ mod tests {
         );
     }
 
-    /// Mirrors the `VerbRegistry::dispatch` fast path (ADR-094): rows drain
-    /// exactly once via the atomic swap-and-check, and a second dispatch
-    /// observes no pending work without needing to lock `LEDGER`.
+    /// Mirrors the dispatch fast path: rows drain exactly once via the atomic
+    /// swap-and-check, and a second dispatch observes no pending work without
+    /// needing to lock `LEDGER`.
     #[test]
     #[serial(config_ledger)]
     fn dispatch_fast_path_drains_exactly_once_then_reports_no_pending() {

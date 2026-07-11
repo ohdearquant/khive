@@ -1,19 +1,14 @@
 //! ADR-099 (cross-op atomicity for bulk apply) — prepared write-plan types.
 //!
-//! Migration step 1 (ADR-099) calls for a per-verb `prepare`/apply seam: the
-//! async prepare pass materializes a synchronous write plan outside any
-//! transaction, and the commit pass later applies that plan's statements as
-//! DML under a per-op SAVEPOINT. This module defines the plan *shapes* only —
-//! one family per v1 admissible verb group (`update`, `delete`, `link`,
-//! `merge`, `gtd.transition`, `gtd.complete`, the governance verbs). Nothing
-//! in this module is wired into a live handler or the dispatch path yet; that
-//! wiring (the actual `prepare` implementations, the atomic runner, and the
-//! `--atomic` CLI surface) is later ADR-099 migration work (steps 1 cont'd,
-//! 3, 4). These types exist so that work has a shared, plain-data target.
+//! Async prepare materializes a synchronous write plan outside any
+//! transaction; commit later applies its statements as DML under a per-op
+//! SAVEPOINT. This module defines the plan *shapes* only, one family per
+//! admissible verb group (`update`, `delete`, `link`, `merge`,
+//! `gtd.transition`, `gtd.complete`, the governance verbs) — not yet wired
+//! into a live handler or the dispatch path.
 //!
-//! Every plan is deliberately inert: plain data, no async, no embedding
-//! reference. See ADR-099 D1's two validation-staleness rules, which every
-//! plan's fields exist to satisfy:
+//! Every plan is deliberately inert (plain data, no async, no embedding
+//! reference) and exists to satisfy two validation-staleness rules:
 //!
 //! 1. **Predicate-based plans** — a plan whose effect covers "all rows
 //!    matching a condition" carries that condition as a statement evaluated
@@ -25,15 +20,13 @@
 //!    (`PlanStatement::guard`).
 //!
 //! A guard is attached to the exact [`PlanStatement`] it validates, never to
-//! the plan as a whole: the storage layer returns affected-row counts
-//! per-statement (`SqlWriter::execute`) or as a batch total
-//! (`SqlWriter::execute_batch`), so a plan-level guard field cannot tell a
-//! future runner which statement's count it is checking without an implicit
-//! ordering convention. Each plan therefore carries `Vec<PlanStatement>`
-//! (or, for `merge`, the split `rewires`/`lifecycle` fields below) so the
-//! runner contract is: apply each statement individually, and where
-//! `guard.is_some()`, check that *statement's own* affected-row count before
-//! moving to the next.
+//! the plan as a whole: affected-row counts come back per-statement or as a
+//! batch total, so a plan-level guard field could not tell a runner which
+//! statement's count it is checking. Each plan therefore carries
+//! `Vec<PlanStatement>` (or, for `merge`, the split `rewires`/`lifecycle`
+//! fields below), and the runner applies each statement individually,
+//! checking any present guard against that statement's own affected-row
+//! count before moving to the next.
 
 use uuid::Uuid;
 
@@ -450,11 +443,9 @@ mod tests {
             statements: vec![guarded("update-status", AffectedRowGuard::exactly(1))],
             post_commit: PostCommitEffect::None,
         };
-        // Property-only status mutation — the type carries no *reindex*
-        // post-commit variant it can ever construct (ADR-099 D3: task
-        // transitions "trigger no reindex"); it carries only the best-effort
-        // `GtdAudit` lifecycle-audit effect added in the B3 fix round
-        // (GAP-5), which triggers no embedding/reindex work either.
+        // A status-only transition never triggers a reindex: the type has no
+        // *reindex* post-commit variant to construct, only the best-effort
+        // `GtdAudit` lifecycle-audit effect, which itself does no embedding work.
         assert_eq!(plan.statements.len(), 1);
         assert!(plan.statements[0].guard.is_some());
         assert_eq!(plan.post_commit, PostCommitEffect::None);
@@ -462,10 +453,8 @@ mod tests {
 
     #[test]
     fn gtd_transition_plan_idempotent_noop_carries_no_statements_and_no_audit() {
-        // GAP-6 (B3 fix round 4): current == target after normalize_status
-        // is an idempotent no-op — canonical performs no write and (since it
-        // never reaches its own `write_audit_record` call) writes no audit
-        // row either.
+        // current == target after normalization is an idempotent no-op:
+        // canonical performs no write and never reaches its audit-record call.
         let plan = GtdTransitionPlan {
             task_id: Uuid::new_v4(),
             statements: vec![],
@@ -536,11 +525,10 @@ mod tests {
 
     #[test]
     fn plans_are_plain_data_no_async_no_embedding() {
-        // Compile-time property, asserted here as documentation: every plan
-        // type above derives only Debug/Clone/PartialEq, never Future or any
-        // embedding-provider trait. If a future edit adds an async method or
-        // an embedding-model field to one of these types, this comment is
-        // the marker to revert it — plans must stay inert data (ADR-099 D1).
+        // Documents a compile-time property: every plan type above derives
+        // only Debug/Clone/PartialEq, never Future or an embedding-provider
+        // trait. Plans must stay inert data — flag any edit that adds an
+        // async method or embedding-model field to one of these types.
         let _ = PostCommitEffect::None;
     }
 }

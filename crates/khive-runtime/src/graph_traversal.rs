@@ -55,7 +55,6 @@ impl KhiveRuntime {
 
         let mut visited: HashSet<Uuid> = HashSet::new();
         let mut results: Vec<PathNode> = Vec::new();
-        // Current BFS frontier: nodes whose neighbors we have not yet explored.
         let mut frontier: Vec<Uuid> = Vec::new();
 
         visited.insert(start);
@@ -79,14 +78,12 @@ impl KhiveRuntime {
             // One DB round-trip for all nodes in the current frontier.
             let all_hits = graph.batch_neighbors(&frontier, query).await?;
 
-            // Collect unvisited (node_id, edge_id) pairs for this level.
             let mut level_new: Vec<(Uuid, Uuid)> = Vec::new();
             for (_src, hit) in &all_hits {
                 if visited.contains(&hit.node_id) {
                     continue;
                 }
-                // Insert into visited eagerly so duplicate edges within the same
-                // level do not produce duplicate PathNodes.
+                // Mark visited before pushing so duplicate edges in the same level don't duplicate PathNodes.
                 if visited.insert(hit.node_id) {
                     level_new.push((hit.node_id, hit.edge_id));
                 }
@@ -109,10 +106,8 @@ impl KhiveRuntime {
             frontier.clear();
             for (node_id, edge_id) in level_new {
                 let via_edge = edge_map.get(&edge_id).cloned().or(None);
-                // via_edge being None here means the edge was soft-deleted between
-                // the neighbors call and the get_edges call. Return NotFound rather
-                // than silently dropping the node, so the concurrent-delete race
-                // surfaces instead of yielding a misleadingly-incomplete path.
+                // A missing edge here means it was soft-deleted between the neighbors and get_edges calls;
+                // error out rather than silently returning an incomplete path.
                 if via_edge.is_none() {
                     return Err(RuntimeError::NotFound(format!("edge {} missing", edge_id)));
                 }
@@ -178,7 +173,6 @@ impl KhiveRuntime {
         let mut current_depth = 0usize;
 
         while (!fwd_frontier.is_empty() || !bwd_frontier.is_empty()) && current_depth <= max_depth {
-            // Expand the forward frontier one level (one batch_neighbors call).
             if !fwd_frontier.is_empty() {
                 let hits = graph
                     .batch_neighbors(
@@ -217,7 +211,6 @@ impl KhiveRuntime {
                 break;
             }
 
-            // Expand the backward frontier one level (one batch_neighbors call).
             if !bwd_frontier.is_empty() {
                 let hits = graph
                     .batch_neighbors(
@@ -264,7 +257,6 @@ impl KhiveRuntime {
             Some(m) => m,
         };
 
-        // Reconstruct path: walk fwd map back from mid to `from`, then walk bwd map forward to `to`.
         let mut fwd_chain: Vec<(Uuid, Option<Uuid>)> = Vec::new();
         {
             let mut cur = mid;
@@ -288,7 +280,7 @@ impl KhiveRuntime {
             }
         }
 
-        // Collect all edge IDs we need to fetch for the path in one batch call.
+        // Fetch all path edges in one batch call rather than one round-trip per edge.
         let path_edge_ids: Vec<LinkId> = fwd_chain
             .iter()
             .chain(bwd_chain.iter())
@@ -301,7 +293,6 @@ impl KhiveRuntime {
             .map(|e| (Uuid::from(e.id), e))
             .collect();
 
-        // Build PathNode slice.
         let mut path: Vec<PathNode> = Vec::new();
         for (i, (node_id, edge_id)) in fwd_chain.iter().enumerate() {
             let via_edge = if i == 0 {
@@ -330,9 +321,8 @@ impl KhiveRuntime {
     }
 }
 
-// INLINE TEST JUSTIFICATION: tests here exercise graph traversal helper functions
-// (BFS ordering, cycle detection) that access private traversal state. Moving them
-// to tests/ would require pub-exporting that state, widening the API surface.
+// Kept inline (not in tests/) because these tests exercise private traversal state that
+// would otherwise need to be made pub.
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -560,7 +550,6 @@ mod tests {
             .create_entity(&tok, "concept", None, "B", None, None, vec![])
             .await
             .unwrap();
-        // No edges between them.
 
         let path = rt.shortest_path(&tok, a.id, b.id, 5).await.unwrap();
         assert!(path.is_none());
@@ -643,25 +632,8 @@ mod tests {
         );
     }
 
-    // -------------------------------------------------------------------------
-    // Query-count proof: verify the new batched traversal issues O(max_depth)
-    // round-trips, not O(nodes) or O(edges).
-    //
-    // Graph: a balanced binary tree of depth 3.
-    //
-    //           root
-    //          /    \
-    //        n1      n2
-    //       /  \    /  \
-    //     n3   n4  n5  n6
-    //    / \  / \  / \ / \
-    //   l1 l2 l3 l4 l5 l6 l7 l8
-    //
-    // 15 nodes, 14 edges.  BFS at max_depth=3:
-    //   - old code: 14 `neighbors` + 14 `get_edge` = 28 round-trips (O(nodes+edges))
-    //   - new code: 3 `batch_neighbors` + 3 `get_edges` = 6 round-trips (O(depth))
-    // -------------------------------------------------------------------------
-
+    // Proves batched BFS issues O(max_depth) round-trips, not O(nodes+edges), over a
+    // 15-node/14-edge depth-3 binary tree (root -> n1,n2 -> n3..n6 -> l1..l8).
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
 
@@ -669,12 +641,9 @@ mod tests {
     async fn bfs_query_count_is_o_depth_not_o_nodes() {
         use crate::runtime::KhiveRuntime;
 
-        // Build the in-memory runtime (includes graph store) and a plain RT for
-        // inserting nodes/edges.
         let rt = KhiveRuntime::memory().expect("memory runtime");
         let tok = NamespaceToken::local();
 
-        // Build a 3-level binary tree: root -> {n1,n2} -> {n3..n6} -> {l1..l8}.
         let root = rt
             .create_entity(&tok, "concept", None, "root", None, None, vec![])
             .await
@@ -705,12 +674,8 @@ mod tests {
             .unwrap();
         let leaves: Vec<_> = ["l1", "l2", "l3", "l4", "l5", "l6", "l7", "l8"]
             .iter()
-            .map(|n| {
-                // We need to block on this in the test; use a local variable to avoid async issues.
-                n.to_string()
-            })
+            .map(|n| n.to_string())
             .collect();
-        // Create leaves synchronously within the async context.
         let mut leaf_ids = Vec::new();
         for name in &leaves {
             let e = rt
@@ -720,14 +685,12 @@ mod tests {
             leaf_ids.push(e);
         }
 
-        // Wire depth-1 edges.
         rt.link(&tok, root.id, n1.id, EdgeRelation::Extends, 1.0, None)
             .await
             .unwrap();
         rt.link(&tok, root.id, n2.id, EdgeRelation::Extends, 1.0, None)
             .await
             .unwrap();
-        // depth-2
         rt.link(&tok, n1.id, n3.id, EdgeRelation::Extends, 1.0, None)
             .await
             .unwrap();
@@ -740,7 +703,6 @@ mod tests {
         rt.link(&tok, n2.id, n6.id, EdgeRelation::Extends, 1.0, None)
             .await
             .unwrap();
-        // depth-3 (leaves)
         let depth2 = [n3.id, n4.id, n5.id, n6.id];
         for (i, parent) in depth2.iter().enumerate() {
             rt.link(
@@ -765,7 +727,6 @@ mod tests {
             .unwrap();
         }
 
-        // Run bfs_traverse and verify correctness (15 nodes: root + 2 + 4 + 8).
         let opts = TraversalOptions {
             max_depth: 3,
             ..Default::default()
@@ -773,7 +734,6 @@ mod tests {
         let nodes = rt.bfs_traverse(&tok, root.id, opts).await.unwrap();
         assert_eq!(nodes.len(), 15, "all 15 nodes in the tree must be returned");
 
-        // Verify depth assignments.
         assert_eq!(nodes[0].depth, 0);
         let depth1_count = nodes.iter().filter(|n| n.depth == 1).count();
         let depth2_count = nodes.iter().filter(|n| n.depth == 2).count();
@@ -782,7 +742,6 @@ mod tests {
         assert_eq!(depth2_count, 4);
         assert_eq!(depth3_count, 8);
 
-        // Verify all non-root nodes have a via_edge.
         for node in nodes.iter().skip(1) {
             assert!(
                 node.via_edge.is_some(),
@@ -791,11 +750,8 @@ mod tests {
             );
         }
 
-        // The definitive proof of O(depth) call count:
-        // We obtain the GraphStore from the same runtime (which backs the BFS above)
-        // and manually simulate the level-batched algorithm, counting each call.
-        // Since the runtime's bfs_traverse uses the same GraphStore under the hood,
-        // this proves the algorithm issues O(max_depth) calls, not O(nodes).
+        // No call-counting hook exists on bfs_traverse itself, so the same GraphStore
+        // is driven manually, level by level, to count round-trips directly.
         let graph = rt.graph(&tok).expect("graph store");
 
         let get_edge_counter = Arc::new(AtomicUsize::new(0));
@@ -803,8 +759,6 @@ mod tests {
         let neighbors_counter = Arc::new(AtomicUsize::new(0));
         let batch_neighbors_counter = Arc::new(AtomicUsize::new(0));
 
-        // Manually simulate bfs_traverse level-by-level using the raw counters
-        // to prove O(depth) behavior.
         let mut sim_visited: HashSet<Uuid> = HashSet::new();
         let mut sim_results: Vec<Uuid> = Vec::new();
         let mut sim_frontier: Vec<Uuid> = vec![root.id];
@@ -847,16 +801,13 @@ mod tests {
             sim_depth += 1;
         }
 
-        // The simulation visited the same 15 nodes.
         assert_eq!(sim_results.len(), 15, "simulation must find all 15 nodes");
 
-        // KEY ASSERTION: O(max_depth) calls, not O(nodes) or O(edges).
         let bn_calls = batch_neighbors_counter.load(Ordering::Relaxed);
         let ge_calls = get_edges_counter.load(Ordering::Relaxed);
         let n_calls = neighbors_counter.load(Ordering::Relaxed);
         let ges_calls = get_edge_counter.load(Ordering::Relaxed);
 
-        // Exact expected counts for a 3-level binary tree with max_depth=3:
         assert_eq!(
             bn_calls, 3,
             "batch_neighbors must be called once per BFS level (3 levels)"

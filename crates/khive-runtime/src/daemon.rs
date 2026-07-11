@@ -44,9 +44,9 @@ pub const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 ///       added `probe_only` request field + probe-ack sentinel shape in response
 ///   2 — gate subhandler verbs by wire origin (`from_wire` request field)
 ///   3 — added per-request identity context to the request frame (`actor_id`,
-///       `visible_namespaces`, ADR-096 Fork 1); the daemon now serves a request
-///       under the frame's identity instead of rejecting on `namespace_mismatch`
-///       (the `config_id` equality reject stays hard)
+///       `visible_namespaces`); the daemon now serves a request under the
+///       frame's identity instead of rejecting on `namespace_mismatch` (the
+///       `config_id` equality reject stays hard)
 pub const PROTOCOL_VERSION: u32 = 3;
 
 const DEFAULT_DRAIN_TIMEOUT_SECS: u64 = 10;
@@ -98,10 +98,10 @@ pub fn lock_path() -> PathBuf {
 /// Advisory lock file used to serialize RECOVERY (kill+respawn) attempts
 /// across concurrent clients only — the daemon's own boot sequence never
 /// acquires this file ([`lock_path`] / [`acquire_daemon_boot_guard`] is the
-/// boot-side lock).  A recoverer holding this lock across dead-confirmation
-/// → kill → spawn (khive-mcp's `kill_and_respawn`, #838 round-1 Finding 1)
-/// therefore can never deadlock against a peer daemon's boot, unlike holding
-/// the shared boot lock for that whole span would.
+/// boot-side lock). A recoverer holding this lock across dead-confirmation
+/// → kill → spawn (khive-mcp's `kill_and_respawn`) therefore can never
+/// deadlock against a peer daemon's boot, unlike holding the shared boot
+/// lock for that whole span would.
 ///
 /// Overridable via the `KHIVE_RECOVERER_LOCK` env var (for tests).
 pub fn recoverer_lock_path() -> PathBuf {
@@ -161,8 +161,7 @@ pub fn acquire_recovery_lock() -> Option<std::fs::File> {
 /// blocking `flock`, correct for the daemon's own boot sequence where waiting
 /// until quiescence IS the desired behavior), a caller only trying to *detect*
 /// whether a lock is currently free — without committing to wait forever for
-/// a possibly-wedged holder — needs a deadline instead (#838 round-1
-/// Finding 2). Returns:
+/// a possibly-wedged holder — needs a deadline instead. Returns:
 ///   - `Ok(Some(file))` — the lock was free within the deadline.
 ///   - `Ok(None)` — `deadline` elapsed while the lock stayed held; an
 ///     explicit "could not confirm" outcome, distinct from a hard I/O error.
@@ -200,9 +199,8 @@ fn try_acquire_flock_until(
 /// the SAME boot/recovery lock ([`lock_path`]) but gives up at `deadline`
 /// instead of blocking forever. For callers that need to detect "is a boot in
 /// progress right now" without risking an unbounded wait behind a wedged
-/// holder (#838 round-1 Finding 2) — e.g. khive-mcp's `confirm_genuinely_dead`
-/// re-probing rounds, where `DEAD_CONFIRM_ROUNDS` must bound elapsed time, not
-/// just probe count.
+/// holder — e.g. khive-mcp's `confirm_genuinely_dead` re-probing rounds,
+/// where `DEAD_CONFIRM_ROUNDS` must bound elapsed time, not just probe count.
 #[cfg(unix)]
 pub fn try_acquire_daemon_boot_guard_until(
     deadline: std::time::Instant,
@@ -230,13 +228,13 @@ pub type DaemonBootGuard = std::fs::File;
 
 /// Acquire the recovery/boot lock, treating failure as fatal.
 ///
-/// #667: unlike [`acquire_recovery_lock`] (best-effort, `None` on failure —
-/// used by shutdown cleanup, where skipping unlink is safer than blocking
-/// forever), daemon-mode boot must hold this lock across migrations/FTS DDL
-/// through bind+pid-write. Silently continuing with no lock reopens the
-/// cold-boot FTS race this guard exists to close, so callers that are about
-/// to run daemon-mode boot (or wait for one to quiesce) must fail loudly
-/// instead of proceeding unguarded.
+/// Unlike [`acquire_recovery_lock`] (best-effort, `None` on failure — used by
+/// shutdown cleanup, where skipping unlink is safer than blocking forever),
+/// daemon-mode boot must hold this lock across migrations/FTS DDL through
+/// bind+pid-write. Silently continuing with no lock reopens the cold-boot FTS
+/// race this guard exists to close, so callers that are about to run
+/// daemon-mode boot (or wait for one to quiesce) must fail loudly instead of
+/// proceeding unguarded.
 #[cfg(unix)]
 pub fn acquire_daemon_boot_guard() -> anyhow::Result<DaemonBootGuard> {
     acquire_recovery_lock()
@@ -246,7 +244,7 @@ pub fn acquire_daemon_boot_guard() -> anyhow::Result<DaemonBootGuard> {
 /// Identity of a bound Unix socket path, used to tell "the socket I bound" apart
 /// from "a same-path socket some other daemon bound after mine was removed".
 ///
-/// #645: a socket path can be recreated by a different process between the time
+/// A socket path can be recreated by a different process between the time
 /// this daemon captures its identity and the time it later checks it, so `dev`
 /// and `ino` (not the path) are what must match for cleanup to be safe.
 #[cfg(unix)]
@@ -276,25 +274,21 @@ pub struct DaemonRequestFrame {
     pub presentation_per_op: Option<Vec<Option<String>>>,
     /// The client's resolved storage/gate default namespace for this request.
     ///
-    /// Historically rejected outright when it differed from the daemon's own
-    /// construction-baked namespace (`namespace_mismatch`). As of protocol
-    /// version 3 (ADR-096 Fork 1) the daemon instead serves the request under
-    /// this namespace — the field is a per-request identity input, not a
-    /// same-process-identity assertion.
+    /// As of protocol version 3 (ADR-096) the daemon serves the request under
+    /// this namespace instead of rejecting on mismatch — a per-request
+    /// identity input, not a same-process-identity assertion.
     pub namespace: String,
     /// The client's resolved write-stamp / gate actor identity (ADR-057),
     /// carried on the frame so the warm daemon stamps writes with the
-    /// *caller's* actor instead of the daemon's own baked `actor_id`
-    /// (ADR-096 Fork 1). `None` mints `ActorRef::anonymous()`, matching an
-    /// unconfigured actor. Pre-Fork-1 clients cannot send this field (an older
-    /// protocol version rejects at the version check before it would matter).
+    /// *caller's* actor instead of its own baked `actor_id` (ADR-096). `None`
+    /// mints `ActorRef::anonymous()`, matching an unconfigured actor.
     #[serde(default)]
     pub actor_id: Option<String>,
-    /// The client's resolved extra read-visibility namespaces (ADR-007 Rev 4
-    /// Rule 3b), carried on the frame so the warm daemon widens read scope to
-    /// match the caller's own configuration rather than the daemon's baked
-    /// `visible_namespaces` (ADR-096 Fork 1). Empty means no extra visibility
-    /// beyond `namespace` itself.
+    /// The client's resolved extra read-visibility namespaces (ADR-007 Rule
+    /// 3b), carried on the frame so the warm daemon widens read scope to
+    /// match the caller's own configuration rather than its own baked
+    /// `visible_namespaces` (ADR-096). Empty means no extra visibility beyond
+    /// `namespace` itself.
     #[serde(default)]
     pub visible_namespaces: Vec<String>,
     /// Fingerprint of the client's engine-coherence config: packs, db target,
@@ -336,17 +330,15 @@ pub struct DaemonRequestFrame {
     #[serde(default)]
     pub format_per_op: Option<Vec<Option<String>>>,
     /// Whether this request originated from the agent-facing MCP `request`
-    /// tool (the wire surface). When `true`, the daemon enforces verb
-    /// visibility — `Visibility::Subhandler` verbs are rejected because agents
-    /// must not invoke internal subhandlers. When `false` (the default, and the
-    /// only value any operator path sends), subhandlers are allowed: `kkernel
-    /// exec` and other in-process callers are trusted operator surfaces.
+    /// tool (the wire surface). When `true`, the daemon rejects
+    /// `Visibility::Subhandler` verbs — agents must not invoke internal
+    /// subhandlers. When `false` (the default, and the only value any
+    /// operator path sends), subhandlers are allowed: `kkernel exec` and
+    /// other in-process callers are trusted operator surfaces.
     ///
     /// This is the origin discriminator, not a daemon-vs-local one: operator
-    /// requests flow through the daemon by default too, so the gate cannot key
-    /// on transport. Pre-versioning clients omit this field (deserializes to
-    /// `false` → ungated), which is safe: the only way to reach the gated wire
-    /// surface is the MCP `request` tool, which always sets it explicitly.
+    /// requests flow through the daemon by default too, so the gate cannot
+    /// key on transport.
     #[serde(default)]
     pub from_wire: bool,
 }
@@ -503,7 +495,7 @@ pub trait DaemonDispatch: Clone + Send + Sync + 'static {
     /// the request is from a trusted operator surface and subhandlers pass.
     ///
     /// `identity` is the per-request identity context threaded from the frame
-    /// (ADR-096 Fork 1): `Some(..)` when serving a request forwarded over the
+    /// (ADR-096): `Some(..)` when serving a request forwarded over the
     /// daemon socket (built from `frame.namespace` / `frame.actor_id` /
     /// `frame.visible_namespaces` by the connection handler), `None` for any
     /// other dispatch path. Implementors should mint the storage/gate token from
@@ -560,15 +552,15 @@ pub trait DaemonDispatch: Clone + Send + Sync + 'static {
 
 // ── tracked background tasks ─────────────────────────────────────────────────
 //
-// Pack handlers (e.g. memory.recall's ADR-081 §5 serve-ledger append) fire
+// Pack handlers (e.g. memory.recall's ADR-081 serve-ledger append) fire
 // fire-and-forget `tokio::spawn`ed work off the response path so the caller
 // never waits on a cross-pack dispatch or a SQL write. Left untracked, that
 // work is invisible to `drain()`: a SIGTERM landing between the response
 // returning and the spawned task completing can abort it mid-flight with no
-// log and no row (internal review PR #583 round-1 Medium). `track_background_task`
-// gives such spawns a process-wide presence that `drain()` waits on, exactly
-// like the `active` counter does for in-flight connections — the caller still
-// only pays for the spawn + counter increment, never the task's own work.
+// log and no row. `track_background_task` gives such spawns a process-wide
+// presence that `drain()` waits on, exactly like the `active` counter does
+// for in-flight connections — the caller still only pays for the spawn +
+// counter increment, never the task's own work.
 static BACKGROUND_TASKS: std::sync::OnceLock<Arc<std::sync::atomic::AtomicUsize>> =
     std::sync::OnceLock::new();
 
@@ -579,8 +571,8 @@ fn background_tasks() -> &'static Arc<std::sync::atomic::AtomicUsize> {
 /// Decrements the shared background-task counter from `Drop`, so the count
 /// comes back down whether the tracked future returns normally, panics, or
 /// is cancelled — a plain post-`await` `fetch_sub` only covers the return
-/// path and leaks the count forever on a panic (internal review PR #583 round-2
-/// Medium), since unwinding skips every statement after the panic point.
+/// path and leaks the count forever on a panic, since unwinding skips every
+/// statement after the panic point.
 struct BackgroundTaskGuard {
     counter: Arc<std::sync::atomic::AtomicUsize>,
 }
@@ -618,7 +610,7 @@ pub fn background_task_count() -> usize {
     background_tasks().load(std::sync::atomic::Ordering::Relaxed)
 }
 
-// ── active background phase names (ADR-103 Stage 1 / issue #723 ask 2) ────────
+// ── active background phase names (ADR-103) ──────────────────────────────────
 //
 // A lightweight, best-effort process-wide gauge of which named background
 // phases (e.g. `ann_warm`) are in flight right now, read by `comm.health`'s
@@ -787,15 +779,15 @@ async fn handle_conn<D: DaemonDispatch>(mut stream: UnixStream, dispatcher: D) {
             daemon_protocol_version: PROTOCOL_VERSION,
             metrics: Some(build_metrics_snapshot(&dispatcher)),
         }
-    // ADR-096 Fork 1: there is no `frame.namespace != dispatcher.namespace()`
-    // reject here. The daemon accepts and serves the request under the
-    // frame's own identity (namespace / actor / visible_namespaces, built
-    // into a `RequestIdentity` below) over its one shared warm registry,
-    // rather than rejecting a differently-attributed same-uid connection to
-    // a cold local-dispatch fallback. `config_id` — which governs
-    // packs/db/embed coherence for the shared warm engine — remains a hard
-    // reject; it is not an identity field and softening it would let a
-    // restricted client dispatch through an incompatible broader daemon.
+    // There is no `frame.namespace != dispatcher.namespace()` reject here.
+    // The daemon accepts and serves the request under the frame's own
+    // identity (namespace / actor / visible_namespaces, built into a
+    // `RequestIdentity` below) over its one shared warm registry, rather
+    // than rejecting a differently-attributed same-uid connection to a cold
+    // local-dispatch fallback. `config_id` — which governs packs/db/embed
+    // coherence for the shared warm engine — remains a hard reject; it is
+    // not an identity field and softening it would let a restricted client
+    // dispatch through an incompatible broader daemon.
     } else if frame.config_id != dispatcher.config_id() {
         DaemonResponseFrame {
             ok: false,
@@ -824,15 +816,14 @@ async fn handle_conn<D: DaemonDispatch>(mut stream: UnixStream, dispatcher: D) {
             metrics: None,
         }
     } else {
-        // Build the per-request identity context from the frame (ADR-096
-        // Fork 1) so the implementor mints the storage/gate token from the
-        // CALLER's identity, not the dispatcher's own construction-baked
-        // scalars. This is always `Some` here: every frame that reaches
-        // this arm carries a `namespace` (required on the wire) plus
-        // whatever `actor_id`/`visible_namespaces` the client resolved
-        // (defaulting to `None`/`vec![]` for a pre-Fork-1 field-absent
-        // payload, which is exactly the prior anonymous/no-extra-visibility
-        // behavior).
+        // Build the per-request identity context from the frame so the
+        // implementor mints the storage/gate token from the CALLER's
+        // identity, not the dispatcher's own construction-baked scalars.
+        // This is always `Some` here: every frame that reaches this arm
+        // carries a `namespace` (required on the wire) plus whatever
+        // `actor_id`/`visible_namespaces` the client resolved (defaulting to
+        // `None`/`vec![]` for an older, field-absent payload, which is
+        // exactly the prior anonymous/no-extra-visibility behavior).
         let identity = RequestIdentity {
             namespace: frame.namespace.clone(),
             actor_id: frame.actor_id.clone(),
@@ -920,7 +911,7 @@ async fn handle_conn<D: DaemonDispatch>(mut stream: UnixStream, dispatcher: D) {
 /// Run the daemon: bind the socket, warm in the background, serve request
 /// frames until SIGTERM/SIGINT.
 ///
-/// Fatally acquires its own startup lock. #667: this only protects
+/// Fatally acquires its own startup lock. This only protects
 /// cleanup→bind→pid-write; by the time this function runs, `dispatcher` (a
 /// `DaemonDispatch` built from a `KhiveMcpServer`) has *already* run
 /// migrations and applied pack schema plans while constructing itself,
@@ -942,13 +933,13 @@ pub async fn run_daemon<D: DaemonDispatch>(dispatcher: D) -> anyhow::Result<()> 
 /// Run the daemon using a startup lock acquired by the caller *before*
 /// building `dispatcher`.
 ///
-/// #667: cold-boot schema initialization (migrations, pack schema plans /
-/// FTS DDL) happens while `dispatcher` is being constructed, i.e. before this
+/// Cold-boot schema initialization (migrations, pack schema plans / FTS DDL)
+/// happens while `dispatcher` is being constructed, i.e. before this
 /// function is ever called. Passing an already-held `boot_guard` in lets the
 /// caller extend that same lock backward over construction, so a second
 /// process racing to boot (e.g. two `kkernel mcp --daemon` spawns before
-/// either has bound its socket, per #645) cannot run migrations/FTS DDL
-/// concurrently against the same database file. On unix every daemon-mode
+/// either has bound its socket) cannot run migrations/FTS DDL concurrently
+/// against the same database file. On unix every daemon-mode
 /// caller passes `Some` — `run_daemon` and the production entry points
 /// (`serve.rs`, `kkernel`) all acquire the guard fatally via
 /// `acquire_daemon_boot_guard` before constructing `dispatcher`. `boot_guard`
@@ -999,7 +990,7 @@ pub async fn run_daemon_with_boot_guard<D: DaemonDispatch>(
     if let Err(e) = std::fs::set_permissions(&sock, std::fs::Permissions::from_mode(0o600)) {
         tracing::warn!(error = %e, path = ?sock, "failed to chmod 0600 socket");
     }
-    // #645: captured while still holding the startup lock, immediately after
+    // Captured while still holding the startup lock, immediately after
     // bind, so shutdown cleanup can later prove "this is still the same socket
     // I bound" rather than trusting the path alone.
     #[cfg(unix)]
@@ -1008,7 +999,7 @@ pub async fn run_daemon_with_boot_guard<D: DaemonDispatch>(
     #[cfg(unix)]
     if let Err(e) = write_pid_file_exclusive(&pid_file) {
         if e.kind() == std::io::ErrorKind::AlreadyExists {
-            // #645: a PID file appeared between our own `cleanup_stale_daemon`
+            // A PID file appeared between our own `cleanup_stale_daemon`
             // removing it and this write — only possible if the boot lock did
             // not actually exclude a concurrent booter (e.g. `acquire_recovery_lock`
             // failed for one side). Never touch the winner's files: drop only
@@ -1048,7 +1039,7 @@ pub async fn run_daemon_with_boot_guard<D: DaemonDispatch>(
         });
     }
 
-    // #774: the checkpoint task's own strong-count-based exit is unreachable
+    // The checkpoint task's own strong-count-based exit is unreachable
     // whenever `event_store_for_checkpoint()` returns `Some` (the ordinary
     // production shape), because the `SqlEventStore` it wraps retains its
     // own clone of the same pool. An explicit watch channel replaces that
@@ -1113,7 +1104,7 @@ pub async fn run_daemon_with_boot_guard<D: DaemonDispatch>(
 
     drain(&active).await;
 
-    // #645: a concurrent client's `kill_and_respawn` may have already decided
+    // A concurrent client's `kill_and_respawn` may have already decided
     // this daemon looked stale, killed it, and spawned a replacement that
     // bound the same socket/PID paths while this daemon was draining above.
     // Reacquire the recovery lock (the same one that serializes startup) and
@@ -1149,7 +1140,7 @@ pub async fn run_daemon_with_boot_guard<D: DaemonDispatch>(
 /// still be the exact one identified by `bound_identity` (dev/ino, not path).
 ///
 /// Returns `true` if cleanup ran, `false` if it was skipped because a
-/// replacement daemon already owns those paths (#645). The caller must hold
+/// replacement daemon already owns those paths. The caller must hold
 /// the recovery lock across this call — the same lock daemon startup holds
 /// across cleanup+bind+pid-write — so no replacement can bind between this
 /// function's checks and its unlinks.
@@ -1254,7 +1245,7 @@ async fn cleanup_stale_daemon(sock: &std::path::Path, pid_file: &std::path::Path
 
 /// Create `pid_file` exclusively (`O_EXCL`) and write this process's PID.
 ///
-/// #645: uses `create_new(true)` rather than `create(true).truncate(true)` so
+/// Uses `create_new(true)` rather than `create(true).truncate(true)` so
 /// this can never silently overwrite a PID file another process created —
 /// under normal operation the boot lock already serializes cleanup → bind →
 /// pid-write across processes, but that guarantee depends on
@@ -1371,8 +1362,8 @@ mod tests {
         );
     }
 
-    // #645 fix: EPERM (process exists, no permission to signal it) must not
-    // be misread as "not running" during stale-daemon cleanup.
+    // EPERM (process exists, no permission to signal it) must not be
+    // misread as "not running" during stale-daemon cleanup.
 
     #[test]
     fn classify_kill_result_zero_is_alive() {
@@ -1404,10 +1395,10 @@ mod tests {
         // PID 1 (init/launchd) always exists. An unprivileged process gets
         // EPERM signaling it (never ESRCH); running as root would get 0
         // instead. Either way `is_process_running` must report true — this
-        // is the live regression guard for the #645 bug (EPERM misread as
-        // dead); `classify_kill_result` above is the pure-function unit
-        // coverage for the same mapping, kept independent of process
-        // ownership so it is never flaky in CI.
+        // is the live regression guard for EPERM being misread as dead;
+        // `classify_kill_result` above is the pure-function unit coverage
+        // for the same mapping, kept independent of process ownership so
+        // it is never flaky in CI.
         assert!(
             is_process_running(1),
             "PID 1 always exists; EPERM must not read as dead"
@@ -1431,19 +1422,18 @@ mod tests {
         std::env::remove_var(key);
     }
 
-    // internal review PR #583 round-1 Medium: `drain()` must wait for tracked background
-    // tasks (e.g. memory.recall's serve-ledger append), not just in-flight
-    // connections, or a SIGTERM lands mid-flight with no log and no row.
+    // `drain()` must wait for tracked background tasks (e.g. memory.recall's
+    // serve-ledger append), not just in-flight connections, or a SIGTERM
+    // lands mid-flight with no log and no row.
     //
     // `#[serial(background_tasks)]`: this test reads/asserts on the
     // process-wide `BACKGROUND_TASKS` static shared with the two counter
     // tests below. Under default parallel execution one test's increment
-    // leaks into another's snapshot-then-assert window (internal review PR #583
-    // round-3 Medium, reproduced: both counter tests failed together,
-    // passed with `--test-threads=1`). Serializing just this named group
-    // isolates them from each other without forcing the whole test binary
-    // (including unrelated `#[serial]` tests elsewhere in this crate) onto
-    // one thread.
+    // leaks into another's snapshot-then-assert window (reproduced: both
+    // counter tests failed together, passed with `--test-threads=1`).
+    // Serializing just this named group isolates them from each other
+    // without forcing the whole test binary (including unrelated
+    // `#[serial]` tests elsewhere in this crate) onto one thread.
     #[tokio::test]
     #[serial(background_tasks)]
     async fn drain_waits_for_tracked_background_tasks_before_returning() {
@@ -1509,9 +1499,9 @@ mod tests {
     #[tokio::test]
     #[serial(background_tasks)]
     async fn track_background_task_count_returns_to_baseline_after_panic() {
-        // internal review PR #583 round-2 Medium: a panic inside the tracked future must
-        // still decrement the counter (via BackgroundTaskGuard's Drop), not
-        // leak it forever. `track_background_task` discards the spawned
+        // A panic inside the tracked future must still decrement the
+        // counter (via BackgroundTaskGuard's Drop), not leak it forever.
+        // `track_background_task` discards the spawned
         // task's `JoinHandle` (it is fire-and-forget by design — the caller
         // never awaits it), so this test does not await the panic directly;
         // tokio isolates the panic to the spawned task instead of aborting
@@ -1541,13 +1531,13 @@ mod tests {
         );
     }
 
-    // ── active background phase names (ADR-103 Stage 1 / issue #723 ask 2) ──
+    // ── active background phase names (ADR-103) ──────────────────────────
 
     // `#[serial(active_phases)]`: these tests read/assert on the process-wide
     // `ACTIVE_PHASES` static. No other test in this crate touches it today,
     // but the group mirrors the `background_tasks` precedent above so a
     // future addition does not silently reintroduce the same interleaving
-    // hazard (internal review PR #583 round-3 Medium) that motivated it there.
+    // hazard that motivated it there.
     #[test]
     #[serial(active_phases)]
     fn register_active_phase_appears_and_disappears_with_the_guard() {
@@ -1769,7 +1759,7 @@ mod tests {
             snapshot.wal_pages.is_some(),
             "wal_pages must be observed after a real checkpoint tick, got {snapshot:?}"
         );
-        // #646: the snapshot carries the checkpoint-pressure fields read-only
+        // The snapshot carries the checkpoint-pressure fields read-only
         // (no mutation path reachable through `MetricsSnapshot`/`DaemonRequestFrame`);
         // an observed tick (not a skip) must report a zero-length skip streak.
         assert_eq!(
@@ -1934,7 +1924,7 @@ mod tests {
         );
     }
 
-    // ── #645: owner-checked shutdown cleanup ──────────────────────────────────
+    // ── owner-checked shutdown cleanup ────────────────────────────────────────
     //
     // A draining daemon must not unlink a socket/PID pair that a replacement
     // daemon has already bound. These tests exercise `shutdown_cleanup_if_owned`
@@ -2049,7 +2039,7 @@ mod tests {
         );
     }
 
-    // ── #667: the recovery lock actually serializes two boot sequences ───────
+    // ── the recovery lock actually serializes two boot sequences ─────────────
     //
     // Production wiring (`khive_mcp::serve::run` / `serve_server`) now acquires
     // this same lock *before* building a `KhiveMcpServer` (which runs
@@ -2099,7 +2089,7 @@ mod tests {
         std::env::remove_var("KHIVE_LOCK");
     }
 
-    // ── #667: acquire_daemon_boot_guard treats lock failure as fatal ─────────
+    // ── acquire_daemon_boot_guard treats lock failure as fatal ───────────────
     // (unlike best-effort acquire_recovery_lock, whose `None` on failure is
     // correct for its own best-effort callers).
 
@@ -2128,7 +2118,7 @@ mod tests {
         // with `write(true)` fails (EISDIR), so `acquire_recovery_lock`
         // returns `None` here — the exact failure mode
         // `acquire_daemon_boot_guard` must turn into a hard `Err` instead of
-        // silently letting daemon-mode boot proceed unguarded (#667).
+        // silently letting daemon-mode boot proceed unguarded.
         std::env::set_var("KHIVE_LOCK", dir.path());
 
         let result = acquire_daemon_boot_guard();
@@ -2141,7 +2131,7 @@ mod tests {
         std::env::remove_var("KHIVE_LOCK");
     }
 
-    // ── #645: write_pid_file_exclusive never truncates a winner's pid file ───
+    // ── write_pid_file_exclusive never truncates a winner's pid file ────────
 
     #[test]
     fn write_pid_file_exclusive_creates_new_file_with_own_pid() {
@@ -2174,8 +2164,8 @@ mod tests {
     // Real (not simulated) concurrency: two OS threads race to `create_new`
     // the exact same path, synchronized with a `Barrier` so they genuinely
     // overlap at the syscall rather than relying on a sleep-based ordering
-    // guess. This is the deterministic race oracle for the #645 convergence
-    // requirement at the atomic-creation primitive `write_pid_file_exclusive`
+    // guess. This is the deterministic race oracle for the convergence
+    // requirement the atomic-creation primitive `write_pid_file_exclusive`
     // is built on: exactly one of two simultaneous daemon starters may claim
     // the pid file, and the loser must see `AlreadyExists`, never silently
     // clobber the winner's content.
