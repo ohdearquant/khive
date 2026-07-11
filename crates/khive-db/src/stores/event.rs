@@ -603,8 +603,8 @@ fn push_selected_observations(
 }
 
 /// `RecallExecuted`/`SearchExecuted` payloads carry a flat `selected: Vec<Uuid>`
-/// field (ADR-041 §"Projection rules") — that is their entire typed selected
-/// contract, so it is the only field consulted here.
+/// field (ADR-041 §"Projection rules"). These payloads are untyped JSON; the
+/// ADR-041 projection contract makes `selected` the only field consulted here.
 fn decode_recall_observations(event: &Event) -> Result<Vec<EventObservation>, rusqlite::Error> {
     let mut rows = decode_candidate_observations(event)?;
     let selected = payload_uuid_array_opt(event, "selected")?.unwrap_or_default();

@@ -836,7 +836,8 @@ async fn synthetic_edge_observed_as_selected_returns_memory_note() {
     // implementation calls `decode_recall_observations`, which reads
     // `payload["selected"]` and inserts a row into `event_observations` with
     // role="selected" and entity_id=memory_id. (`selected` is part of
-    // `SearchExecuted`/`RecallExecuted`'s typed contract per ADR-041 —
+    // `SearchExecuted`/`RecallExecuted`'s ADR-041 projection contract;
+    // their payloads are untyped JSON —
     // unlike `RerankExecuted`, which projects `selected` rows from
     // `final_scores`/`reranked` instead, since its typed payload has no
     // `selected` field.)
