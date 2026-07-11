@@ -197,12 +197,12 @@ jobs:
             echo ""
             echo "${MSG}"
           } >> "$GITHUB_STEP_SUMMARY"
-          TITLE="bench-track: trend ledger record errored (advisory)"
-          EXISTING=$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --search "in:title \"$TITLE\"" --json number --jq '.[0].number // empty')
-          if [ -n "$EXISTING" ]; then
-            gh issue comment "$EXISTING" --repo "$GITHUB_REPOSITORY" --body "$MSG" || echo "::warning::tracking-issue comment failed (non-fatal)"
-          else
-            gh issue create --repo "$GITHUB_REPOSITORY" --title "$TITLE" --body "$MSG" || echo "::warning::tracking-issue create failed (non-fatal)"
+          TRACKING_ISSUE=863
+          if ! gh issue reopen "$TRACKING_ISSUE" --repo "$GITHUB_REPOSITORY" 2>/dev/null; then
+            echo "tracking issue already open or reopen unavailable (non-fatal)"
+          fi
+          if ! gh issue comment "$TRACKING_ISSUE" --repo "$GITHUB_REPOSITORY" --body "$MSG"; then
+            echo "::warning::tracking-issue comment failed (non-fatal)"
           fi
           exit 0
 
@@ -339,11 +339,11 @@ jobs:
             echo ""
             echo "${MSG}"
           } >> "$GITHUB_STEP_SUMMARY"
-          TITLE="bench-track: trend ledger record errored (advisory)"
-          EXISTING=$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --search "in:title \"$TITLE\"" --json number --jq '.[0].number // empty')
-          if [ -n "$EXISTING" ]; then
-            gh issue comment "$EXISTING" --repo "$GITHUB_REPOSITORY" --body "$MSG" || echo "::warning::tracking-issue comment failed (non-fatal)"
-          else
-            gh issue create --repo "$GITHUB_REPOSITORY" --title "$TITLE" --body "$MSG" || echo "::warning::tracking-issue create failed (non-fatal)"
+          TRACKING_ISSUE=863
+          if ! gh issue reopen "$TRACKING_ISSUE" --repo "$GITHUB_REPOSITORY" 2>/dev/null; then
+            echo "tracking issue already open or reopen unavailable (non-fatal)"
+          fi
+          if ! gh issue comment "$TRACKING_ISSUE" --repo "$GITHUB_REPOSITORY" --body "$MSG"; then
+            echo "::warning::tracking-issue comment failed (non-fatal)"
           fi
           exit 0
