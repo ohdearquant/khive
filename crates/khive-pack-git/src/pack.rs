@@ -15,13 +15,14 @@ use khive_types::{EdgeEndpointRule, HandlerDef, Pack};
 use crate::hook::{CommitHook, IssueLikeHook};
 use crate::vocab::{GIT_NOTE_KIND_SPECS, GIT_SCHEMA_PLAN_STMTS};
 
-/// Git-lifecycle pack (ADR-088, amended by ADR-088 Amendment 1) — registers
-/// `commit` / `issue` / `pull_request` note kinds populated by the batch
-/// ingester in `src/ingest.rs`, and one agent-facing verb, `git.digest`
-/// (`src/handlers.rs`). Extends the base edge contract with `precedes`
-/// commit→commit (parent→child lineage, ADR-088 Amendment 1 ingest
-/// enrichment) — the only new endpoint rule this pack contributes;
-/// everything else uses the base `annotates` contract.
+/// Git-lifecycle pack (ADR-088, amended by ADR-088 Amendment 1 and ADR-108)
+/// — registers `commit` / `issue` / `pull_request` note kinds populated by
+/// the batch ingester in `src/ingest.rs`, one read/ingest agent-facing verb,
+/// `git.digest` (`src/handlers.rs`), and three write verbs, `git.commit` /
+/// `git.branch` / `git.push` (`src/write_handlers.rs`, ADR-108). Extends the
+/// base edge contract with `precedes` commit→commit (parent→child lineage,
+/// ADR-088 Amendment 1 ingest enrichment) — the only new endpoint rule this
+/// pack contributes; everything else uses the base `annotates` contract.
 pub struct GitPack {
     runtime: KhiveRuntime,
 }
@@ -131,6 +132,9 @@ impl PackRuntime for GitPack {
     ) -> Result<Value, RuntimeError> {
         match verb {
             "git.digest" => self.handle_digest(token, registry, params).await,
+            "git.commit" => self.handle_commit(token, params).await,
+            "git.branch" => self.handle_branch(token, params).await,
+            "git.push" => self.handle_push(token, params).await,
             _ => Err(RuntimeError::InvalidInput(format!(
                 "git pack does not handle verb {verb:?}"
             ))),
