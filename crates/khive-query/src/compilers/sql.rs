@@ -61,9 +61,10 @@ fn primary_node_source(alias: &str) -> String {
 }
 
 /// Union of entity/note tables that can legally bind to a synthetic
-/// `observed_as_*` target (issue #468): `observed_as_target` admits entity OR
-/// note referents, `observed_as_signal` admits entity referents. This source
-/// lets the target join stay entity-capable instead of hard-coding `notes`.
+/// `observed_as_*` target (issue #468): `observed_as_target` and
+/// `observed_as_signal` both admit entity OR note referents (ADR-041
+/// Amendment A2). This source lets the target join stay entity-capable
+/// instead of hard-coding `notes`.
 const OBSERVATION_TARGET_SQL: &str = "\
     SELECT id, namespace, kind, entity_type, name, description, \
            NULL AS content, NULL AS status, NULL AS salience, \

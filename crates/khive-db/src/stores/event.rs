@@ -485,35 +485,56 @@ fn payload_uuid_array_opt(
         .map(Some)
 }
 
-/// Decode a field shaped like `RerankExecutedPayload::reranked`/`final_scores`
-/// (`Vec<(Id128, ..)>`, which serde serializes as an array of 2+-element JSON
-/// arrays `[uuid, ...]`) into the UUID leading each tuple. Absent field is
+/// Decode `RerankExecutedPayload::final_scores` (`Vec<(Id128, f32)>` per
+/// `khive_types::event::RerankExecutedPayload`) into the UUID leading each
+/// tuple. Deserializes through that exact typed tuple shape, so a tuple that
+/// is not precisely two elements, or whose second element is not a finite
+/// score, is rejected rather than silently accepted. Absent field is
 /// `Ok(None)`; present-but-wrong-shape is `Err`, matching
 /// [`payload_uuid_array_opt`]'s missing-vs-malformed contract.
-fn payload_uuid_tuple_array_opt(
+fn payload_final_scores_uuid_array_opt(
     event: &Event,
     field: &'static str,
 ) -> Result<Option<Vec<Uuid>>, rusqlite::Error> {
     let Some(values) = event.payload.get(field) else {
         return Ok(None);
     };
-    let Some(array) = values.as_array() else {
-        return Err(invalid_payload(event.kind, field, "expected array"));
-    };
+    let tuples: Vec<(khive_types::Id128, f32)> = serde_json::from_value(values.clone())
+        .map_err(|e| invalid_payload(event.kind, field, e))?;
+    tuples
+        .into_iter()
+        .map(|(id, score)| {
+            if !score.is_finite() {
+                return Err(invalid_payload(event.kind, field, "score is not finite"));
+            }
+            Ok(Uuid::from_bytes(*id.as_bytes()))
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map(Some)
+}
 
-    array
-        .iter()
-        .map(|entry| {
-            let tuple = entry
-                .as_array()
-                .ok_or_else(|| invalid_payload(event.kind, field, "expected [uuid, ..] tuple"))?;
-            tuple
-                .first()
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| {
-                    invalid_payload(event.kind, field, "expected UUID string as tuple[0]")
-                })
-                .and_then(|s| Uuid::parse_str(s).map_err(|e| invalid_payload(event.kind, field, e)))
+/// Decode `RerankExecutedPayload::reranked` (`Vec<(Id128, Vec<(String, f32)>)>`
+/// per `khive_types::event::RerankExecutedPayload`) into the UUID leading each
+/// tuple. Same exact-shape decoding contract as
+/// [`payload_final_scores_uuid_array_opt`], applied to `reranked`'s
+/// per-reranker sub-score shape instead of a single scalar score.
+fn payload_reranked_uuid_array_opt(
+    event: &Event,
+    field: &'static str,
+) -> Result<Option<Vec<Uuid>>, rusqlite::Error> {
+    let Some(values) = event.payload.get(field) else {
+        return Ok(None);
+    };
+    let tuples: Vec<(khive_types::Id128, Vec<(String, f32)>)> =
+        serde_json::from_value(values.clone())
+            .map_err(|e| invalid_payload(event.kind, field, e))?;
+    tuples
+        .into_iter()
+        .map(|(id, scores)| {
+            if !scores.iter().all(|(_, s)| s.is_finite()) {
+                return Err(invalid_payload(event.kind, field, "score is not finite"));
+            }
+            Ok(Uuid::from_bytes(*id.as_bytes()))
         })
         .collect::<Result<Vec<_>, _>>()
         .map(Some)
@@ -554,15 +575,19 @@ fn decode_rank_observations(event: &Event) -> Result<Vec<EventObservation>, rusq
         });
     }
 
-    // `selected` is the flat untyped convenience shape; `reranked` and
-    // `final_scores` are `RerankExecutedPayload`'s actual typed fields,
-    // serialized as `[uuid, ..]` tuples, not flat UUID strings. Each is
-    // tried in turn only when the previous field is absent (`None`) — a
-    // present-but-malformed field errors immediately instead of masking
-    // the problem by falling through to the next candidate.
+    // `selected` is the flat untyped convenience shape; `final_scores` and
+    // `reranked` are `RerankExecutedPayload`'s actual typed fields,
+    // serialized as `[uuid, ..]` tuples, not flat UUID strings. Per
+    // ADR-042 §5, `final_scores` is the ordered rerank output (positions
+    // match output order); `reranked` is per-reranker audit/debug data
+    // with no ordering guarantee, so it is only a legacy fallback when
+    // `final_scores` is absent. Each is tried in turn only when the
+    // previous field is absent (`None`) — a present-but-malformed field
+    // errors immediately instead of masking the problem by falling
+    // through to the next candidate.
     let selected = payload_uuid_array_opt(event, "selected")?
-        .or(payload_uuid_tuple_array_opt(event, "reranked")?)
-        .or(payload_uuid_tuple_array_opt(event, "final_scores")?)
+        .or(payload_final_scores_uuid_array_opt(event, "final_scores")?)
+        .or(payload_reranked_uuid_array_opt(event, "reranked")?)
         .unwrap_or_default();
     for (position, entity_id) in selected.into_iter().enumerate() {
         let position_u32 = u32::try_from(position).map_err(|_| {

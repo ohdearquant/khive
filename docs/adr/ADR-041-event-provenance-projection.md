@@ -573,7 +573,8 @@ The generated V13 SQL adds `events.session_id TEXT`, creates `event_observations
   → `Selected` note rows.
 - `LinkCreated`: `payload.source_id` and `payload.target_id` → two entity `Target`
   rows at `position=0` and `position=1`.
-- `FeedbackExplicit`: `event.target_id` → entity `Signal` row (Amendment A1).
+- `FeedbackExplicit`: `event.target_id` → entity **or note** `Signal` row, per
+  `event.substrate` (Amendment A1, A2).
 
 ### PackEventConsumer dispatch update
 
@@ -640,6 +641,22 @@ redundant field with no consumer. The fix makes `decode_signal_observation` read
 
 The role mapping in §3 (`FeedbackExplicit` → `Signal`) and its intent are unchanged — only
 the field the decoder reads to populate it.
+
+---
+
+## Amendment A2: `FeedbackExplicit` `Signal` rows admit entity or note referents (2026-07-10, khive#831)
+
+§3 and Amendment A1 described the `FeedbackExplicit` → `Signal` projection as entity-only.
+`brain.feedback` targets can resolve to either an entity or a note, but the emitted event
+carried a fixed `SubstrateKind::Event` placeholder, so `decode_signal_observation`
+hard-coded `ReferentKind::Entity` and `observed_as_signal` (`crates/khive-query/src/compilers/sql.rs`)
+only admitted entity referents — a note-typed feedback target could never be resolved
+through `observed_as_signal`.
+
+The fix threads the resolved target's actual substrate (`Entity`/`Note`) onto the emitted
+event, `decode_signal_observation` picks `ReferentKind` from `event.substrate` (falling
+back to `Entity` for pre-fix historical events still carrying the `SubstrateKind::Event`
+placeholder), and `observed_as_signal` admits both entity and note referents.
 
 ---
 
