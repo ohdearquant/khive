@@ -240,7 +240,6 @@ fn micros_to_dt(micros: i64) -> DateTime<Utc> {
 /// After character processing, split on whitespace and remove FTS5 keyword
 /// tokens: AND, OR, NOT, NEAR.
 ///
-/// For Phrase mode, the caller wraps the result in double quotes.
 fn sanitize_fts5_query(query: &str) -> String {
     // Pass 1: replace grouping/separator chars with spaces to isolate tokens.
     // Colon, hyphen, and dot are included here (not in Pass 2) so punctuated
@@ -284,7 +283,9 @@ fn sanitize_fts5_query(query: &str) -> String {
 
 /// Legacy (pre-#397) sanitization: hyphen and dot are stripped outright
 /// instead of being space-split, so `khive-pack-memory` normalizes to the
-/// single merged bareword `khivepackmemory` rather than three terms.
+/// single merged bareword `khivepackmemory` rather than three terms. Slash is
+/// space-split because this fallback only preserves the pre-#397 hyphen/dot
+/// behavior and must not create a `GBs` alias for `GB/s`.
 ///
 /// Used only to build the merged-form OR-alternative in
 /// [`sanitize_fts5_token_group`] — never as the sole sanitized query. Content
@@ -296,7 +297,7 @@ fn sanitize_fts5_query_legacy_merged(query: &str) -> String {
     let spaced: String = query
         .chars()
         .map(|c| {
-            if matches!(c, '(' | ')' | ',' | ':') {
+            if matches!(c, '(' | ')' | ',' | ':' | '/') {
                 ' '
             } else {
                 c
@@ -309,7 +310,7 @@ fn sanitize_fts5_query_legacy_merged(query: &str) -> String {
         .filter(|c| {
             !matches!(
                 c,
-                '*' | '"' | '\'' | '+' | '-' | '^' | '.' | '/' | '~' | '!' | '$' | '\0'
+                '*' | '"' | '\'' | '+' | '-' | '^' | '.' | '~' | '!' | '$' | '\0'
             ) && !c.is_control()
         })
         .collect();
@@ -532,12 +533,7 @@ fn build_match_expr(query: &str, mode: TextQueryMode) -> Option<String> {
             }
         }
         TextQueryMode::Phrase => {
-            let sanitized = sanitize_fts5_query(query);
-            if sanitized.is_empty() {
-                None
-            } else {
-                Some(format!("\"{}\"", sanitized))
-            }
+            sanitize_fts5_phrase_literal(query).map(|literal| format!("\"{}\"", literal))
         }
     }
 }
@@ -1101,7 +1097,8 @@ impl TextSearch for Fts5TextSearch {
 
             let mut results = Vec::with_capacity(request.terms.len());
             for term in &request.terms {
-                let sanitized = sanitize_fts5_query(term);
+                // Keep document frequency aligned with the per-token search expression.
+                let sanitized = sanitize_fts5_token_group(term).unwrap_or_default();
                 if sanitized.is_empty() {
                     results.push(TextTermStats {
                         term: term.clone(),
