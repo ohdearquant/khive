@@ -104,6 +104,25 @@ pub struct EntityFilter {
     /// backward-compatible default).
     #[serde(default)]
     pub namespaces: Vec<String>,
+    /// Case-insensitive batched exact-name match (ADR-104 Stage C: entity-
+    /// anchored candidate extraction). `LOWER(name) IN (...)` over up to a
+    /// caller-bounded set of candidate strings — one SQL query recovers every
+    /// entity whose name case-insensitively equals any candidate, instead of
+    /// one `name_exact` round trip per candidate. Distinct from `name_exact`
+    /// (single value, case-sensitive `=`): this field is the batched,
+    /// case-insensitive counterpart.
+    #[serde(default)]
+    pub names_ci: Vec<String>,
+    /// Match entities whose `name` occurs as a substring **within** this
+    /// string — the reverse direction of `name_prefix`/`name_exact`, which
+    /// match the entity name against a caller-supplied pattern. ADR-104 Stage
+    /// C's CJK path: an unsegmented CJK query has no whitespace to derive
+    /// unigram/bigram candidates from, so the query text itself is supplied
+    /// here and every entity whose name it contains becomes a candidate.
+    /// Always paired by the caller with a small `PageRequest` limit — this
+    /// predicate is evaluated per row (`INSTR`), not via `idx_entities_name`.
+    #[serde(default)]
+    pub name_substring_of: Option<String>,
 }
 
 /// Entity CRUD operations over the entities substrate table.

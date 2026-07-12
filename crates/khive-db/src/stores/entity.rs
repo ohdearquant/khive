@@ -477,6 +477,33 @@ fn build_entity_where(
         conditions.push(format!("name = ?{} COLLATE BINARY", params.len()));
     }
 
+    if !filter.names_ci.is_empty() {
+        // ADR-104 Stage C, R1: one batched `LOWER(name) IN (...)` predicate,
+        // scoped by the `namespace`/`deleted_at IS NULL` conditions already
+        // pushed above — the composite `idx_entities_name (namespace, name)`
+        // index still seeks the namespace prefix, bounding the scan to that
+        // namespace's rows before this predicate is evaluated row-by-row.
+        let placeholders: Vec<String> = filter
+            .names_ci
+            .iter()
+            .map(|n| {
+                params.push(Box::new(n.to_lowercase()));
+                format!("?{}", params.len())
+            })
+            .collect();
+        conditions.push(format!("LOWER(name) IN ({})", placeholders.join(", ")));
+    }
+
+    if let Some(ref source) = filter.name_substring_of {
+        // ADR-104 Stage C CJK path: `name` is the needle, `source` (the raw
+        // query text) is the haystack — the reverse of a normal `LIKE`
+        // pattern match, so this cannot seek `idx_entities_name` at all. The
+        // caller bounds the cost with a small `PageRequest` limit and by
+        // scoping to a single namespace via the conditions above.
+        params.push(Box::new(source.to_lowercase()));
+        conditions.push(format!("INSTR(?{}, LOWER(name)) > 0", params.len()));
+    }
+
     if !filter.tags_any.is_empty() {
         let placeholders: Vec<String> = filter
             .tags_any

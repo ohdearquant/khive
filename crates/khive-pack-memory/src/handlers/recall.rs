@@ -401,9 +401,36 @@ impl MemoryPack {
         // caller didn't send the field at all. See `extract_entity_candidates`
         // for the extraction rule and why it's grounded in how `EntityMatch`
         // actually matches.
+        // ADR-104 §5 (Stage C): when the caller didn't supply `entity_names`
+        // at all, extend the #738 capitalized-token heuristic with a second,
+        // precision-safe source — query tokens/bigrams that case-insensitively
+        // name a real KG entity, resolved via one batched lookup
+        // (`entity_anchored_candidates`, R1). A lookup failure degrades to
+        // the capitalized-token list alone (never fails the recall); an
+        // explicit `entity_names` (including `Some([])`) still bypasses both
+        // sources entirely — #738 opt-out semantics unchanged.
         let entity_names: Vec<String> = match &p.entity_names {
             Some(names) => names.iter().map(|s| s.to_lowercase()).collect(),
-            None => extract_entity_candidates(query_trimmed),
+            None => {
+                let mut candidates = extract_entity_candidates(query_trimmed);
+                match self.entity_anchored_candidates(token, query_trimmed).await {
+                    Ok(anchored) => {
+                        for name in anchored {
+                            if !candidates.contains(&name) {
+                                candidates.push(name);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            "ADR-104 §5: entity-anchored candidate lookup failed; \
+                             falling back to capitalized-token extraction only"
+                        );
+                    }
+                }
+                candidates
+            }
         };
 
         struct ScoredNote {
@@ -902,6 +929,7 @@ mod tests {
     use async_trait::async_trait;
     use khive_pack_kg::KgPack;
     use khive_runtime::{EmbedderProvider, KhiveRuntime, Namespace, VerbRegistryBuilder};
+    use khive_storage::Entity;
     use lattice_embed::{EmbedError, EmbeddingModel, EmbeddingService};
     use serde_json::Value;
     use serial_test::serial;
@@ -4367,5 +4395,204 @@ mod tests {
             "the bench-a target must still appear in at least one model's \
              recall_candidates breakdown after the namespace filter: {per_model:?}"
         );
+    }
+
+    // ── ADR-104 §5 (Stage C): entity-anchored candidate extraction ─────────────
+
+    /// Dispatches `memory.recall` against a fresh single-note corpus, exactly
+    /// like `dispatch_single_note_recall` above, but first seeds a real KG
+    /// entity (`entity_name`, when `Some`) directly into the entity store —
+    /// the record `entity_anchored_candidates` must find via its batched
+    /// lookup for the boost to fire on a lowercase or CJK query. Returns the
+    /// sole hit's `rank_score`.
+    async fn dispatch_single_note_recall_with_entity(
+        entity_name: Option<&str>,
+        content: &str,
+        query: &str,
+        entity_names: Option<&[&str]>,
+    ) -> f64 {
+        let rt = KhiveRuntime::memory().expect("in-memory runtime");
+        let ns = Namespace::parse("local").expect("local namespace");
+        let token = rt.authorize(ns.clone()).expect("authorize local");
+        rt.create_note(&token, "memory", None, content, Some(0.5), None, vec![])
+            .await
+            .expect("create note");
+
+        if let Some(name) = entity_name {
+            rt.entities(&token)
+                .expect("entity store")
+                .upsert_entity(Entity::new(ns.as_str(), "concept", name))
+                .await
+                .expect("seed entity");
+        }
+
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(KgPack::new(rt.clone()));
+        builder.register(MemoryPack::new(rt.clone()));
+        let registry = builder.build().expect("registry");
+
+        let mut params = serde_json::json!({
+            "query": query,
+            "fusion_strategy": "rrf",
+            "limit": 10
+        });
+        if let Some(names) = entity_names {
+            params["entity_names"] = serde_json::json!(names);
+        }
+
+        let result = registry
+            .dispatch("memory.recall", params)
+            .await
+            .expect("memory.recall");
+        let hits = result.as_array().expect("bare array result");
+        assert_eq!(hits.len(), 1, "single-note corpus must yield one hit");
+        hits[0]["rank_score"].as_f64().expect("rank_score")
+    }
+
+    /// Gate (a): a lowercase query naming a real KG entity gets the
+    /// candidate and the EntityMatch ×1.3 boost. `extract_entity_candidates`
+    /// (#738) extracts nothing here (no capitalized token in either the
+    /// query or the entity name) — the lift can only come from the Stage C
+    /// batched entity-anchored lookup finding the seeded "zenlake" entity.
+    #[tokio::test]
+    #[serial(background_tasks)]
+    async fn adr104_stage_c_lowercase_query_naming_real_entity_gets_boost() {
+        const CONTENT: &str = "the committee reviewed the proposal from zenlake last week";
+        const QUERY: &str = "committee proposal zenlake";
+
+        let anchored_score =
+            dispatch_single_note_recall_with_entity(Some("zenlake"), CONTENT, QUERY, None).await;
+        let opted_out_score =
+            dispatch_single_note_recall_with_entity(Some("zenlake"), CONTENT, QUERY, Some(&[]))
+                .await;
+
+        assert!(
+            anchored_score > opted_out_score,
+            "a lowercase query naming a real entity must be boosted above the \
+             explicit opt-out baseline: anchored={anchored_score} opted_out={opted_out_score}"
+        );
+        let ratio = anchored_score / opted_out_score;
+        assert!(
+            (ratio - 1.3).abs() < 0.01,
+            "expected ~1.3x lift from EntityMatch firing on the entity-anchored \
+             candidate, got ratio {ratio}"
+        );
+    }
+
+    /// Gate (b): an unsegmented CJK query containing a real entity name as a
+    /// substring gets it via `EntityFilter::name_substring_of`, not
+    /// whitespace tokenization (CJK text has no spaces to split on).
+    #[tokio::test]
+    #[serial(background_tasks)]
+    async fn adr104_stage_c_unsegmented_cjk_query_gets_entity_via_substring() {
+        const ENTITY_NAME: &str = "北京大学";
+        // `content` and `query` are byte-identical (guarantees the FTS leg
+        // retrieves the note; retrieval-stage relevance is not what this
+        // test is about) — a full-width comma, not ASCII whitespace,
+        // separates the entity name from the rest, so this is still the
+        // unsegmented-CJK shape (no ASCII whitespace anywhere) while giving
+        // `contains_at_word_boundary` a non-alphanumeric character on the
+        // entity name's left edge (its right edge is end-of-string).
+        const CONTENT: &str = "详情介绍，北京大学";
+        const QUERY: &str = "详情介绍，北京大学";
+
+        let anchored_score =
+            dispatch_single_note_recall_with_entity(Some(ENTITY_NAME), CONTENT, QUERY, None).await;
+        let opted_out_score =
+            dispatch_single_note_recall_with_entity(Some(ENTITY_NAME), CONTENT, QUERY, Some(&[]))
+                .await;
+
+        assert!(
+            anchored_score > opted_out_score,
+            "an unsegmented CJK query containing a real entity name must be \
+             boosted above the explicit opt-out baseline: anchored={anchored_score} \
+             opted_out={opted_out_score}"
+        );
+        let ratio = anchored_score / opted_out_score;
+        assert!(
+            (ratio - 1.3).abs() < 0.01,
+            "expected ~1.3x lift from EntityMatch firing on the CJK \
+             substring-anchored candidate, got ratio {ratio}"
+        );
+    }
+
+    /// Gate (c): a token that does not name any real entity gets nothing —
+    /// no lexical-overlap reward. Same lowercase shape as gate (a), but no
+    /// entity named "zenlake" (or anything else) exists in the store, so the
+    /// batched lookup returns no candidates and the auto path must score
+    /// identically to the explicit opt-out.
+    #[tokio::test]
+    #[serial(background_tasks)]
+    async fn adr104_stage_c_lowercase_token_naming_no_entity_gets_no_boost() {
+        const CONTENT: &str = "the committee reviewed the proposal from zenlake last week";
+        const QUERY: &str = "committee proposal zenlake";
+
+        let auto_score = dispatch_single_note_recall_with_entity(None, CONTENT, QUERY, None).await;
+        let opted_out_score =
+            dispatch_single_note_recall_with_entity(None, CONTENT, QUERY, Some(&[])).await;
+
+        assert!(
+            (auto_score - opted_out_score).abs() < 1e-4,
+            "no real entity named \"zenlake\" exists, so a lowercase query \
+             naming it must not be boosted: auto={auto_score} opted_out={opted_out_score}"
+        );
+    }
+
+    /// Gate (e): explicit `entity_names` still wins over Stage C extraction
+    /// even when a real, matching entity exists — and `entity_names: []`
+    /// stays a full opt-out. Mirrors the #738 override tests above, but with
+    /// a seeded entity in the store to prove Stage C's batched lookup is
+    /// bypassed entirely (not merely outscored) when the caller is explicit.
+    #[tokio::test]
+    #[serial(background_tasks)]
+    async fn adr104_stage_c_explicit_entity_names_still_win_over_anchored_extraction() {
+        const CONTENT: &str = "the committee reviewed the proposal from zenlake last week";
+        const QUERY: &str = "committee proposal zenlake";
+
+        let anchored_score =
+            dispatch_single_note_recall_with_entity(Some("zenlake"), CONTENT, QUERY, None).await;
+        let opted_out_score =
+            dispatch_single_note_recall_with_entity(Some("zenlake"), CONTENT, QUERY, Some(&[]))
+                .await;
+        let explicit_score = dispatch_single_note_recall_with_entity(
+            Some("zenlake"),
+            CONTENT,
+            QUERY,
+            Some(&["zenlake"]),
+        )
+        .await;
+
+        assert!(
+            (explicit_score - anchored_score).abs() < 1e-6,
+            "explicit entity_names=[\"zenlake\"] must reach the same boosted \
+             score as Stage C anchored extraction (both resolve to the same \
+             single candidate here): explicit={explicit_score} anchored={anchored_score}"
+        );
+        assert!(
+            (explicit_score - opted_out_score).abs() > 1e-6,
+            "explicit non-empty entity_names must still be honored (boosted \
+             above the opt-out baseline): explicit={explicit_score} opted_out={opted_out_score}"
+        );
+    }
+
+    /// `entity_lookup_candidates` unit coverage (pure function, ADR-104 §5):
+    /// unigrams and adjacent bigrams, lowercased, stopwords excluded from
+    /// unigrams, capped at `MAX_ENTITY_LOOKUP_CANDIDATES`.
+    #[test]
+    fn entity_lookup_candidates_extracts_unigrams_and_bigrams_lowercased() {
+        let out = crate::scoring::entity_lookup_candidates("New York City guide");
+        assert!(out.contains(&"new".to_string()));
+        assert!(out.contains(&"york".to_string()));
+        assert!(out.contains(&"city".to_string()));
+        assert!(out.contains(&"guide".to_string()));
+        assert!(out.contains(&"new york".to_string()));
+        assert!(out.contains(&"york city".to_string()));
+        assert!(out.contains(&"city guide".to_string()));
+    }
+
+    #[test]
+    fn entity_lookup_candidates_empty_query_returns_empty() {
+        assert!(crate::scoring::entity_lookup_candidates("").is_empty());
+        assert!(crate::scoring::entity_lookup_candidates("   ").is_empty());
     }
 }

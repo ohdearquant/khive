@@ -16,9 +16,10 @@ use khive_runtime::{
 };
 use khive_score::DeterministicScore;
 use khive_storage::types::{
-    TextFilter, TextQueryMode, TextSearchHit, TextSearchRequest, VectorSearchHit,
+    PageRequest, TextFilter, TextQueryMode, TextSearchHit, TextSearchRequest, VectorSearchHit,
     VectorSearchRequest,
 };
+use khive_storage::EntityFilter;
 use khive_types::SubstrateKind;
 
 use crate::ann::{self, AnnKey};
@@ -686,6 +687,85 @@ pub(super) fn recall_text_terms_with_limit(query: &str, limit: usize) -> Vec<Str
 }
 
 impl MemoryPack {
+    /// ADR-104 §5 (Stage C): entity-anchored candidate extraction. A single,
+    /// namespace-scoped, batched lookup against the entity store's existing
+    /// `(namespace, name)` index — R1's "one batched indexed lookup per
+    /// recall, no unbounded per-recall scans of the entity table."
+    ///
+    /// Two paths, chosen by `contains_cjk` (unsegmented CJK text has no
+    /// whitespace to derive unigram/bigram candidates from):
+    /// - Latin path: `crate::scoring::entity_lookup_candidates` derives up to
+    ///   `MAX_ENTITY_LOOKUP_CANDIDATES` lowercased unigram/bigram strings
+    ///   from the query, then one `EntityFilter::names_ci` call resolves a
+    ///   `LOWER(name) IN (...)` match in a single SQL round trip.
+    /// - CJK path: one `EntityFilter::name_substring_of` call checks which
+    ///   known entity names occur as a substring of the raw query text,
+    ///   bounded by the `PageRequest` limit below.
+    ///
+    /// A candidate only survives this lookup by naming a real, non-deleted
+    /// entity in the caller's namespace — that match against a real record
+    /// is the precision-safe property the ADR-104 §5 rationale hangs on. A
+    /// storage-layer failure here degrades to no anchored candidates (never
+    /// fails the recall) — the caller still has `extract_entity_candidates`'s
+    /// capitalized-token fallback.
+    pub(super) async fn entity_anchored_candidates(
+        &self,
+        token: &NamespaceToken,
+        query: &str,
+    ) -> Result<Vec<String>, RuntimeError> {
+        let store = self.runtime.entities(token)?;
+        let namespace = token.namespace().as_str();
+
+        if crate::scoring::contains_cjk(query) {
+            let filter = EntityFilter {
+                name_substring_of: Some(query.to_string()),
+                ..EntityFilter::default()
+            };
+            let page = store
+                .query_entities(
+                    namespace,
+                    filter,
+                    PageRequest {
+                        limit: crate::scoring::MAX_ENTITY_LOOKUP_CANDIDATES as u32,
+                        offset: 0,
+                    },
+                )
+                .await?;
+            return Ok(page
+                .items
+                .into_iter()
+                .map(|e| e.name.to_lowercase())
+                .collect());
+        }
+
+        let candidates = crate::scoring::entity_lookup_candidates(query);
+        if candidates.is_empty() {
+            return Ok(Vec::new());
+        }
+        let filter = EntityFilter {
+            names_ci: candidates,
+            ..EntityFilter::default()
+        };
+        let page = store
+            .query_entities(
+                namespace,
+                filter,
+                // Bounded above `MAX_ENTITY_LOOKUP_CANDIDATES` candidates so
+                // multiple entities sharing a case-insensitive name cannot
+                // truncate a legitimate match out of the page.
+                PageRequest {
+                    limit: crate::scoring::MAX_ENTITY_LOOKUP_CANDIDATES as u32 * 4,
+                    offset: 0,
+                },
+            )
+            .await?;
+        Ok(page
+            .items
+            .into_iter()
+            .map(|e| e.name.to_lowercase())
+            .collect())
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(super) async fn collect_recall_text_hits(
         &self,

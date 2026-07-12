@@ -334,6 +334,62 @@ pub fn extract_entity_candidates(query: &str) -> Vec<String> {
     out
 }
 
+/// Maximum number of case-insensitive candidate strings (unigrams + adjacent
+/// bigrams) a single recall sends to the batched entity-name lookup
+/// (ADR-104 §5 / Stage C, rider R1). Bounds the `LOWER(name) IN (...)`
+/// placeholder list built in `khive-db`'s `build_entity_where` — independent
+/// of `MAX_AUTO_ENTITY_NAMES`, which bounds the unrelated capitalized-token
+/// fallback list above.
+pub const MAX_ENTITY_LOOKUP_CANDIDATES: usize = 16;
+
+/// Build the case-insensitive candidate strings a recall query offers to the
+/// entity-anchored lookup (ADR-104 §5 / Stage C): every non-stopword token,
+/// lowercased, plus every adjacent-token bigram (also lowercased, stopwords
+/// included — a two-token phrase is unlikely to itself be a stopword pair,
+/// and the real-entity-name check downstream is the safety net either way),
+/// deduplicated and capped at `MAX_ENTITY_LOOKUP_CANDIDATES`.
+///
+/// Unlike `extract_entity_candidates` above, this does **not** filter on
+/// capitalization — lowercase queries are the whole point of this extension.
+/// The precision-safety property instead comes from the caller (the
+/// `memory.recall` handler) only keeping a candidate that matches the *name*
+/// of a real KG entity, via one batched `EntityFilter::names_ci` lookup.
+/// Whitespace-tokenized, so this is the Latin-script path; unsegmented CJK
+/// queries use `EntityFilter::name_substring_of` instead (see the handler).
+pub fn entity_lookup_candidates(query: &str) -> Vec<String> {
+    let tokens: Vec<String> = query
+        .split_whitespace()
+        .map(strip_token_punctuation)
+        .filter(|t| !t.is_empty())
+        .map(str::to_lowercase)
+        .collect();
+
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut out: Vec<String> = Vec::new();
+
+    for t in tokens
+        .iter()
+        .filter(|t| !ENTITY_STOPWORDS.contains(&t.as_str()))
+    {
+        if seen.insert(t.clone()) {
+            out.push(t.clone());
+            if out.len() >= MAX_ENTITY_LOOKUP_CANDIDATES {
+                return out;
+            }
+        }
+    }
+    for pair in tokens.windows(2) {
+        let bigram = format!("{} {}", pair[0], pair[1]);
+        if seen.insert(bigram.clone()) {
+            out.push(bigram);
+            if out.len() >= MAX_ENTITY_LOOKUP_CANDIDATES {
+                return out;
+            }
+        }
+    }
+    out
+}
+
 // ── Scoring weights ───────────────────────────────────────────────────────────
 
 /// Weights for the combined memory score: `score = w_rel × relevance × (1 + w_temp × recency) × (1 + w_imp × salience)`.
