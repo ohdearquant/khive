@@ -193,7 +193,13 @@ The v0 JavaScript contract is:
 - `build(vectors: Float32Array, dim, config, ids?)` accepts an optional array of
   string IDs. Its length must equal the vector count, every ID must be non-empty
   and unique, and omitted IDs default to decimal ordinal strings (`"0"`, `"1"`,
-  and so on).
+  and so on). The `config` argument is a closed object with three optional
+  keys, `maxDegree`, `searchListSize`, and `alpha`, mapping to the
+  `VamanaConfig` fields `max_degree`, `search_list_size`, and `alpha`;
+  `dimensions` comes from the `dim` argument. An omitted key takes the core
+  default. An unknown key, a non-positive `maxDegree`, a `searchListSize`
+  below `maxDegree`, or a non-finite or sub-1.0 `alpha` is rejected before
+  any index state is constructed.
 - `search(query: Float32Array, k)` returns `{ ids, distances }`, where `ids` is
   a JavaScript array of string IDs and `distances` is a parallel
   `Float32Array` of f32 distances. Both arrays have the same length and index
@@ -214,10 +220,14 @@ The v0 JavaScript contract is:
   a container reframed from a native v2 directory), `deserialize` creates the
   documented default maps of decimal live-ordinal strings instead.
 
-The wasm config defaults SQ8 steering on. Full-precision mode remains
-selectable. Persistence is the host's responsibility through OPFS, IndexedDB,
-HTTP, or another byte store. An OPFS round-trip example ships in the crate
-README.
+v0 is SQ8-only. `build` always trains SQ8, matching the native
+`VamanaIndex::build` path, and no acquisition-mode selector exists in the
+JavaScript config or in either persistence format. A full-precision mode is
+deferred to a future amendment, which must specify its configuration shape,
+its core-state representation, and how both portable and native persistence
+preserve the mode across `serialize` and `deserialize`. Persistence is the
+host's responsibility through OPFS, IndexedDB, HTTP, or another byte store.
+An OPFS round-trip example ships in the crate README.
 
 The v0 module is single-threaded. Wasm threads require cross-origin isolation
 and shared memory and are deferred.
@@ -234,6 +244,7 @@ ADR is the source of truth.
 
 - Browser embedding models. Query vectors arrive from the host.
 - Porting the khive storage layer, packs, or MCP surface.
+- A selectable full-precision (non-SQ8) acquisition mode.
 - Explicit wasm SIMD128 kernels before measurements justify them.
 - WebGPU.
 - Wasm threads.
@@ -271,6 +282,7 @@ ADR is the source of truth.
 | Serialize string IDs    | `serialize` emits one versioned portable string-ID entry per live ordinal and none for tombstones                                                                                                                         |
 | Deserialize string IDs  | `deserialize` restores both ID maps so remove-by-ID and search-by-ID work without rebuilding                                                                                                                              |
 | Search by string ID     | Search returns equal-length parallel arrays of string IDs and f32 distances in result order, including after deserialize                                                                                                  |
+| Config validation       | `build` rejects an unknown config key, a non-positive `maxDegree`, a `searchListSize` below `maxDegree`, and a non-finite or sub-1.0 `alpha`, each without constructing any index state                                   |
 | Browser smoke           | A headless browser test covers build with explicit and default IDs, search, insert, remove, serialize, and deserialize with SQ8 enabled                                                                                   |
 | Size                    | Layer B CI asserts `gzip -9` of the wasm-bindgen release `khive_vamana_wasm_bg.wasm` artifact is at most 500,000 bytes                                                                                                    |
 
