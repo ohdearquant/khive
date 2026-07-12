@@ -51,7 +51,8 @@ def _call_request_raw(proc, ops_string, presentation=None):
     """Send `request(ops=<ops_string>)`. Return the parsed response body.
 
     presentation: None (default="agent"), "verbose", or "human".
-    Agent mode compacts ISO-8601 timestamps to minute granularity and shortens UUIDs.
+    Agent mode compacts metadata ISO-8601 timestamps to minute granularity and
+    shortens UUIDs; payload timestamps (e.g. trigger_at, #871) round-trip verbatim.
     Verbose mode returns the canonical handler output unchanged.
     """
     arguments = {"ops": ops_string}
@@ -155,9 +156,10 @@ def main():
 
         # 1. Happy path remind: create → agenda shows it → cancel → agenda omits it
         def test_happy_remind(proc):
-            # Use verbose presentation so trigger_at is returned unchanged.
-            # Agent mode (default) compacts ISO-8601 timestamps to minute granularity
-            # ("2099-01-01T00:00") which is by design — see presentation.rs compact_timestamp.
+            # Verbose presentation returns the canonical handler output; since
+            # #871 Agent mode also round-trips trigger_at verbatim (payload
+            # timestamp, exempt from compact_timestamp — see presentation.rs
+            # PAYLOAD_TIMESTAMP_FIELDS), covered by test 17 below.
             ev = call_verb(proc, "schedule.remind", {
                 "content": "check the build",
                 "at": FAR_FUTURE_A,
@@ -469,12 +471,11 @@ def main():
         run_test("agenda sorted ascending by trigger_at", test_agenda_sort_order, proc)
 
         # 17. Trigger_at preserved exactly (H5: no UTC canonicalisation)
-        # NOTE: Agent mode (default) compacts ALL ISO-8601 timestamps to minute
-        # granularity. trigger_at is treated as a display timestamp by the presentation
-        # layer, so "2099-03-10T15:00:00+05:30" → "2099-03-10T15:00" in Agent mode.
-        # This is a known design tension: trigger_at is a payload value (not metadata)
-        # but the presentation layer has no way to distinguish them. Use verbose mode
-        # to verify the handler preserves the original string.
+        # NOTE: trigger_at is a caller-supplied payload value, not display
+        # metadata. Since #871 the presentation layer lists it in
+        # PAYLOAD_TIMESTAMP_FIELDS (presentation.rs), so Agent mode round-trips
+        # it verbatim — seconds and offset intact — instead of minute-truncating
+        # it (which silently changed the instant by discarding the offset).
         def test_trigger_at_preserved(proc):
             offset_at = "2099-03-10T15:00:00+05:30"
             ev = call_verb(proc, "schedule.remind", {
@@ -485,16 +486,15 @@ def main():
                 f"H5: trigger_at must be returned as-is in verbose mode; "
                 f"submitted={offset_at!r} got={ev['trigger_at']!r}"
             )
-            # In Agent mode (default) the timestamp is compacted to minute granularity.
-            # "2099-03-10T15:00:00+05:30" → first 16 chars → "2099-03-10T15:00"
+            # Agent mode (default) must also round-trip trigger_at verbatim
+            # (#871: payload timestamps are exempt from compaction).
             ev_agent = call_verb(proc, "schedule.remind", {
                 "content": "tz-preservation-agent",
                 "at": offset_at,
             })  # default=agent presentation
-            expected_agent = offset_at[:16]  # "2099-03-10T15:00"
-            assert ev_agent["trigger_at"] == expected_agent, (
-                f"Agent mode: trigger_at must be compacted to minute granularity; "
-                f"expected={expected_agent!r} got={ev_agent['trigger_at']!r}"
+            assert ev_agent["trigger_at"] == offset_at, (
+                f"Agent mode: trigger_at must round-trip verbatim (#871); "
+                f"expected={offset_at!r} got={ev_agent['trigger_at']!r}"
             )
 
         run_test("trigger_at preserved exactly (no UTC canonicalisation)", test_trigger_at_preserved, proc)
