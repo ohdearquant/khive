@@ -130,7 +130,10 @@ semantics unchanged).
 - **No cross-profile blending.** A request is served by exactly one profile's state
   (resolved or overridden), or by defaults.
 - **No new storage.** Every input already exists: posterior state (brain snapshots),
-  profile resolution (ADR-081), entity names (kg store).
+  profile resolution (ADR-081), entity names (kg store). Superseded in scope by
+  Amendment 2 for Stage D: no new table, column, or external store is added, but the
+  persisted snapshot payload gains versioned fields (per-entry `last_event_at` and a
+  decay-policy record), with the migrations Amendment 2 specifies.
 
 ## Staged landing
 
@@ -393,21 +396,39 @@ config value silently breaks byte-identical replay. Ruling: **the decay policy i
 versioned input stamped into persisted state**, superseding Amendment 1's
 "one value per running instance" paragraph.
 
-- Version-2 snapshots carry a decay-policy record:
-  `(policy_version, half_life_days, mass_table_version)`.
-- Folding events into state always uses the state's own persisted policy, never the
-  process configuration. The configured value is consulted at exactly two points:
-  stamping fresh state at profile creation, and stamping during explicit migration.
-- The policy is immutable per snapshot lineage. Changing `H` (or any mass-table row)
-  for existing state is an explicit, recorded migration that bumps `policy_version`;
-  it is never adopted silently from changed process configuration. A process whose
-  configuration differs from a loaded snapshot's policy folds and projects under the
-  snapshot's policy.
-- v0/v1 migration stamps the migrating instance's configured policy into the
-  produced v2 state (those formats persisted no policy). Migration is therefore a
-  pure function of (stored bytes, configured policy): the same snapshot migrated
-  twice under the same configuration is byte-identical, and the wall clock remains
-  a non-input.
+- **Ownership is per-state.** Every version-2 `BalancedRecallSnapshot` carries its
+  own decay-policy record `(policy_version, half_life_days, mass_table_version)`:
+  the namespace's built-in state and each profile-local state (including
+  `ProfileRecord.state_snapshot`) independently. This is what makes the creation
+  rule coherent: a profile created after a configuration change stamps the new
+  policy at creation while previously created states keep theirs. Initial values
+  for fresh and migrated state are `policy_version = 1` and `mass_table_version = 1`
+  (the mass table in this amendment). v0/v1 migration and boundary validation apply
+  to every state, built-in and profile-local alike.
+- Folding events into a state always uses that state's own persisted policy, never
+  the process configuration. The configured value is consulted at exactly two
+  points: stamping fresh state at profile creation, and stamping during explicit
+  migration.
+- **Policy changes are replayable events, not configuration edits.** Changing `H`
+  (or any mass-table row) for existing state is a durable, ordered
+  policy-migration event appended to the brain event log, carrying the scope (the
+  namespace built-in state or a profile id), the full old policy record, and the
+  full new policy record with its bumped `policy_version`. Reducer behavior at the
+  event's fold position: validate that the carried old record equals the state's
+  current record (mismatch is a hard fold error, not a silent re-stamp), then
+  replace the state's policy record. The migration event touches no evidence
+  counts and no `last_event_at` stamps; a subsequent event whose decay interval
+  spans the migration decays its full interval under the new `H`. That rule is
+  deliberately simple because it is deterministic: the migration is an ordered
+  event, so every replay applies the same policy to the same fold positions. A
+  process whose configuration differs from a loaded state's policy folds and
+  projects under the state's policy; the configuration never migrates anything
+  implicitly.
+- v0/v1 snapshot migration stamps the migrating instance's configured policy into
+  the produced v2 state (those formats persisted no policy). Migration is
+  therefore a pure function of (stored bytes, configured policy): the same
+  snapshot migrated twice under the same configuration is byte-identical, and the
+  wall clock remains a non-input.
 
 ### Storage claim reconciled
 
@@ -429,5 +450,13 @@ The Stage D gate gains these assertions:
 - A replay against a snapshot whose persisted policy differs from the process
   configuration uses the snapshot's policy and yields byte-identical state across
   runs; the configured value demonstrably does not leak into the fold.
+- A replay that starts from a pre-migration snapshot and crosses a policy-migration
+  event (an `H` change and a mass-table change are both exercised) folds
+  pre-migration events under the old policy and post-migration events under the
+  new one, and is byte-identical across runs; a migration event whose carried old
+  record does not match the state's current record fails the fold loudly.
+- Two profiles created on opposite sides of a configuration change carry their
+  respective creation-time policies, and each serves under its own.
 - Migrating the same v0 or v1 snapshot twice under the same configured policy yields
-  byte-identical v2 state, and the produced state carries the stamped policy record.
+  byte-identical v2 state, and every produced state (built-in and profile-local)
+  carries the stamped policy record.
