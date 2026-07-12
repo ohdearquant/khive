@@ -130,6 +130,7 @@ For historical context, see [v0 archive](../_archive/adr_v0/README.md). v0 ADRs 
 | [ADR-106](ADR-106-schedule-pack-executor.md)                 | Schedule Pack Executor — Daemon-Resident Tick for the Pending-Event Drain (Accepted)                            |
 | [ADR-108](ADR-108-git-write-surface.md)                      | Git Write Surface Through khive (Phase B) (Proposed)                                                            |
 | [ADR-109](ADR-109-sandboxed-kkernel-gateway.md)              | Sandboxed kkernel Gateway for Untrusted Execution (Phase C) (Proposed)                                          |
+| [ADR-110](ADR-110-vamana-wasm.md)                            | WebAssembly Support for khive-vamana (Proposed)                                                                 |
 
 ## Closed Taxonomies — Quick Reference
 
