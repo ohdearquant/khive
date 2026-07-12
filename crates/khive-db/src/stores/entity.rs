@@ -484,7 +484,7 @@ fn build_entity_where(
             .names_ci
             .iter()
             .map(|n| {
-                params.push(Box::new(n.clone()));
+                params.push(Box::new(n.to_ascii_lowercase()));
                 format!("?{}", params.len())
             })
             .collect();

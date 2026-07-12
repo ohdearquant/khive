@@ -503,6 +503,28 @@ async fn test_count_entities() {
 }
 
 #[tokio::test]
+async fn count_entities_normalizes_case_insensitive_names() {
+    let store = setup_memory_store();
+    store
+        .upsert_entity(make_entity("local", "concept", "LoRA"))
+        .await
+        .unwrap();
+
+    let count = store
+        .count_entities(
+            "local",
+            EntityFilter {
+                names_ci: vec!["LORA".to_string()],
+                ..EntityFilter::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(count, 1);
+}
+
+#[tokio::test]
 async fn test_batch_upsert() {
     let store = setup_memory_store_ns("batch_ns");
 
