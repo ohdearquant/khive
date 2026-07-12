@@ -394,16 +394,44 @@ impl MemoryPack {
         // `entity_names` feeds the `EntityMatch` ×1.3 boost in `default_adjustments`
         // (scoring.rs). It used to be purely caller-supplied and no caller ever
         // populated it, leaving the boost dead code in practice. Opt-out
-        // semantics: `Some(_)` — including `Some([])` — is explicit caller
+        // semantics: `Some(_)`, including `Some([])`, is explicit caller
         // intent and is always honored verbatim (an empty explicit list means
         // "no entity boost", not "auto-derive one for me"). Auto-extraction
         // via `extract_entity_candidates` only runs on `None`, i.e. when the
         // caller didn't send the field at all. See `extract_entity_candidates`
         // for the extraction rule and why it's grounded in how `EntityMatch`
         // actually matches.
+        // ADR-104 §5 (Stage C): when the caller didn't supply `entity_names`
+        // at all, extend the #738 capitalized-token heuristic with a second,
+        // precision-safe source: query tokens/bigrams that match a real KG
+        // entity name under the bounded Stage C case contract, resolved via
+        // one batched lookup
+        // (`entity_anchored_candidates`, R1). A lookup failure degrades to
+        // the capitalized-token list alone (never fails the recall); an
+        // explicit `entity_names` (including `Some([])`) still bypasses both
+        // sources entirely. #738 opt-out semantics are unchanged.
         let entity_names: Vec<String> = match &p.entity_names {
             Some(names) => names.iter().map(|s| s.to_lowercase()).collect(),
-            None => extract_entity_candidates(query_trimmed),
+            None => {
+                let mut candidates = extract_entity_candidates(query_trimmed);
+                match self.entity_anchored_candidates(token, query_trimmed).await {
+                    Ok(anchored) => {
+                        for name in anchored {
+                            if !candidates.contains(&name) {
+                                candidates.push(name);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            "ADR-104 §5: entity-anchored candidate lookup failed; \
+                             falling back to capitalized-token extraction only"
+                        );
+                    }
+                }
+                candidates
+            }
         };
 
         struct ScoredNote {
@@ -902,6 +930,7 @@ mod tests {
     use async_trait::async_trait;
     use khive_pack_kg::KgPack;
     use khive_runtime::{EmbedderProvider, KhiveRuntime, Namespace, VerbRegistryBuilder};
+    use khive_storage::Entity;
     use lattice_embed::{EmbedError, EmbeddingModel, EmbeddingService};
     use serde_json::Value;
     use serial_test::serial;
@@ -4367,5 +4396,412 @@ mod tests {
             "the bench-a target must still appear in at least one model's \
              recall_candidates breakdown after the namespace filter: {per_model:?}"
         );
+    }
+
+    // ── ADR-104 §5 (Stage C): entity-anchored candidate extraction ─────────────
+
+    /// Dispatches `memory.recall` against a fresh single-note corpus, exactly
+    /// like `dispatch_single_note_recall` above, but first seeds a real KG
+    /// entity (`entity_name`, when `Some`) directly into the entity store.
+    /// the record `entity_anchored_candidates` must find via its batched
+    /// lookup for the boost to fire on a lowercase or CJK query. Returns the
+    /// sole hit's `rank_score`.
+    async fn dispatch_single_note_recall_with_entity(
+        entity_name: Option<&str>,
+        content: &str,
+        query: &str,
+        entity_names: Option<&[&str]>,
+    ) -> f64 {
+        let rt = KhiveRuntime::memory().expect("in-memory runtime");
+        let ns = Namespace::parse("local").expect("local namespace");
+        let token = rt.authorize(ns.clone()).expect("authorize local");
+        rt.create_note(&token, "memory", None, content, Some(0.5), None, vec![])
+            .await
+            .expect("create note");
+
+        if let Some(name) = entity_name {
+            rt.entities(&token)
+                .expect("entity store")
+                .upsert_entity(Entity::new(ns.as_str(), "concept", name))
+                .await
+                .expect("seed entity");
+        }
+
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(KgPack::new(rt.clone()));
+        builder.register(MemoryPack::new(rt.clone()));
+        let registry = builder.build().expect("registry");
+
+        let mut params = serde_json::json!({
+            "query": query,
+            "fusion_strategy": "rrf",
+            "limit": 10
+        });
+        if let Some(names) = entity_names {
+            params["entity_names"] = serde_json::json!(names);
+        }
+
+        let result = registry
+            .dispatch("memory.recall", params)
+            .await
+            .expect("memory.recall");
+        let hits = result.as_array().expect("bare array result");
+        assert_eq!(hits.len(), 1, "single-note corpus must yield one hit");
+        hits[0]["rank_score"].as_f64().expect("rank_score")
+    }
+
+    /// Gate (a): a lowercase query naming a real KG entity gets the
+    /// candidate and the EntityMatch ×1.3 boost. `extract_entity_candidates`
+    /// (#738) extracts nothing here (no capitalized token in either the
+    /// query or the entity name). The lift can only come from the Stage C
+    /// batched entity-anchored lookup finding the seeded "zenlake" entity.
+    #[tokio::test]
+    #[serial(background_tasks)]
+    async fn adr104_stage_c_lowercase_query_naming_real_entity_gets_boost() {
+        const CONTENT: &str = "the committee reviewed the proposal from zenlake last week";
+        const QUERY: &str = "committee proposal zenlake";
+
+        let anchored_score =
+            dispatch_single_note_recall_with_entity(Some("zenlake"), CONTENT, QUERY, None).await;
+        let opted_out_score =
+            dispatch_single_note_recall_with_entity(Some("zenlake"), CONTENT, QUERY, Some(&[]))
+                .await;
+
+        assert!(
+            anchored_score > opted_out_score,
+            "a lowercase query naming a real entity must be boosted above the \
+             explicit opt-out baseline: anchored={anchored_score} opted_out={opted_out_score}"
+        );
+        let ratio = anchored_score / opted_out_score;
+        assert!(
+            (ratio - 1.3).abs() < 0.01,
+            "expected ~1.3x lift from EntityMatch firing on the entity-anchored \
+             candidate, got ratio {ratio}"
+        );
+    }
+
+    #[tokio::test]
+    #[serial(background_tasks)]
+    async fn adr104_stage_c_duplicate_name_crowding_preserves_each_candidate_boost() {
+        let rt = KhiveRuntime::memory().expect("in-memory runtime");
+        let ns = Namespace::parse("local").expect("local namespace");
+        let token = rt.authorize(ns.clone()).expect("authorize local");
+        let store = rt.entities(&token).expect("entity store");
+
+        let mut older_b = Entity::new(ns.as_str(), "concept", "crowdbeta");
+        older_b.created_at = 1;
+        older_b.updated_at = 1;
+        store
+            .upsert_entity(older_b)
+            .await
+            .expect("seed candidate B");
+
+        for created_at in 2..=258 {
+            let mut newer_a = Entity::new(ns.as_str(), "concept", "CrowdAlpha");
+            newer_a.created_at = created_at;
+            newer_a.updated_at = created_at;
+            store
+                .upsert_entity(newer_a)
+                .await
+                .expect("seed duplicate candidate A");
+        }
+
+        let anchored = MemoryPack::new(rt)
+            .entity_anchored_candidates(&token, "crowdalpha crowdbeta")
+            .await
+            .expect("Stage C lookup");
+        assert!(anchored.contains(&"crowdalpha".to_string()));
+        assert!(anchored.contains(&"crowdbeta".to_string()));
+
+        let baseline_names = vec!["crowdalpha".to_string()];
+        let now_millis = chrono::Utc::now().timestamp_millis();
+        let score = |entity_names: &[String]| {
+            crate::scoring::calculate_score(
+                &crate::scoring::ScoreInput {
+                    salience: 0.5,
+                    memory_type_str: "semantic",
+                    content: "the archive concerns crowdbeta",
+                    created_at_millis: now_millis,
+                    decay_factor: 0.005,
+                    now_millis,
+                    relevance_score: 0.2,
+                    entity_names,
+                },
+                &crate::scoring::ScoringConfig::default(),
+            )
+        };
+        let boosted = score(&anchored);
+        let baseline = score(&baseline_names);
+        assert!(boosted > baseline);
+        assert!(
+            (boosted / baseline - 1.3).abs() < 0.01,
+            "candidate B must retain its EntityMatch boost after candidate A duplicate crowding: \
+             boosted={boosted} baseline={baseline}"
+        );
+    }
+
+    #[tokio::test]
+    #[serial(background_tasks)]
+    async fn adr104_stage_c_non_ascii_case_lookup_end_to_end_is_bounded() {
+        let rt = KhiveRuntime::memory().expect("in-memory runtime");
+        let ns = Namespace::parse("local").expect("local namespace");
+        let token = rt.authorize(ns.clone()).expect("authorize local");
+        rt.entities(&token)
+            .expect("entity store")
+            .upsert_entity(Entity::new(ns.as_str(), "concept", "École"))
+            .await
+            .expect("seed entity");
+        let pack = MemoryPack::new(rt);
+
+        let same_spelling = pack
+            .entity_anchored_candidates(&token, "École research archive")
+            .await
+            .expect("same-spelling extraction");
+        let different_case = pack
+            .entity_anchored_candidates(&token, "école research archive")
+            .await
+            .expect("differently-cased extraction");
+
+        // Bounded contract: ASCII is case-insensitive, but cased non-ASCII
+        // characters require the exact form used by the stored entity name.
+        assert_eq!(same_spelling, vec!["école"]);
+        assert!(different_case.is_empty());
+    }
+
+    /// Gate (b): an unsegmented CJK query containing a real entity name as a
+    /// substring gets it through bounded substring enumeration and the same
+    /// indexed exact-name lookup used by alphabetic-script candidates.
+    #[tokio::test]
+    #[serial(background_tasks)]
+    async fn adr104_stage_c_unsegmented_cjk_query_gets_entity_via_substring() {
+        const ENTITY_NAME: &str = "北京大学";
+        // `content` and `query` are byte-identical (guarantees the FTS leg
+        // retrieves the note; retrieval-stage relevance is not what this
+        // test is about). The entity has Han characters on both sides, proving
+        // CJK entity matching does not require whitespace or punctuation.
+        const CONTENT: &str = "我在北京大学学习";
+        const QUERY: &str = "我在北京大学学习";
+
+        let anchored_score =
+            dispatch_single_note_recall_with_entity(Some(ENTITY_NAME), CONTENT, QUERY, None).await;
+        let opted_out_score =
+            dispatch_single_note_recall_with_entity(Some(ENTITY_NAME), CONTENT, QUERY, Some(&[]))
+                .await;
+
+        assert!(
+            anchored_score > opted_out_score,
+            "an unsegmented CJK query containing a real entity name must be \
+             boosted above the explicit opt-out baseline: anchored={anchored_score} \
+             opted_out={opted_out_score}"
+        );
+        let ratio = anchored_score / opted_out_score;
+        assert!(
+            (ratio - 1.3).abs() < 0.01,
+            "expected ~1.3x lift from EntityMatch firing on the CJK \
+             substring-anchored candidate, got ratio {ratio}"
+        );
+    }
+
+    #[tokio::test]
+    #[serial(background_tasks)]
+    async fn adr104_stage_c_late_cjk_entity_survives_candidate_cap() {
+        const ENTITY_NAME: &str = "龍鳳凰";
+        let mut query: String = (0..62)
+            .map(|offset| char::from_u32(0x4e00 + offset).expect("valid CJK character"))
+            .collect();
+        query.push_str(ENTITY_NAME);
+        assert_eq!(query.chars().count(), 65);
+
+        let anchored_score =
+            dispatch_single_note_recall_with_entity(Some(ENTITY_NAME), &query, &query, None).await;
+        let opted_out_score =
+            dispatch_single_note_recall_with_entity(Some(ENTITY_NAME), &query, &query, Some(&[]))
+                .await;
+
+        assert!(
+            anchored_score > opted_out_score,
+            "a CJK entity in the final 10 characters of a 65-character unsegmented query must \
+             survive the candidate cap: \
+             anchored={anchored_score} opted_out={opted_out_score}"
+        );
+    }
+
+    #[tokio::test]
+    #[serial(background_tasks)]
+    async fn adr104_stage_c_first_cjk_entity_survives_candidate_cap() {
+        let query: String = (0..20)
+            .map(|offset| char::from_u32(0x4e00 + offset).expect("valid CJK character"))
+            .collect();
+        let entity_name: String = query.chars().take(2).collect();
+        assert_eq!(query.chars().count(), 20);
+
+        let anchored_score =
+            dispatch_single_note_recall_with_entity(Some(&entity_name), &query, &query, None).await;
+        let opted_out_score =
+            dispatch_single_note_recall_with_entity(Some(&entity_name), &query, &query, Some(&[]))
+                .await;
+
+        assert!(
+            anchored_score > opted_out_score,
+            "a CJK entity in the first two characters of a 20-character unsegmented query must \
+             survive the candidate cap: \
+             anchored={anchored_score} opted_out={opted_out_score}"
+        );
+    }
+
+    #[tokio::test]
+    #[serial(background_tasks)]
+    async fn adr104_stage_c_eight_character_cjk_entity_matches() {
+        const ENTITY_NAME: &str = "甲乙丙丁戊己庚辛";
+        const QUERY: &str = "甲乙丙丁戊己庚辛";
+
+        let anchored_score =
+            dispatch_single_note_recall_with_entity(Some(ENTITY_NAME), QUERY, QUERY, None).await;
+        let opted_out_score =
+            dispatch_single_note_recall_with_entity(Some(ENTITY_NAME), QUERY, QUERY, Some(&[]))
+                .await;
+
+        assert!(
+            anchored_score > opted_out_score,
+            "an eight-character CJK entity must match at the documented maximum: \
+             anchored={anchored_score} opted_out={opted_out_score}"
+        );
+    }
+
+    /// Gate (c): a token that does not name any real entity gets nothing,
+    /// no lexical-overlap reward. Same lowercase shape as gate (a), but no
+    /// entity named "zenlake" (or anything else) exists in the store, so the
+    /// batched lookup returns no candidates and the auto path must score
+    /// identically to the explicit opt-out.
+    #[tokio::test]
+    #[serial(background_tasks)]
+    async fn adr104_stage_c_lowercase_token_naming_no_entity_gets_no_boost() {
+        const CONTENT: &str = "the committee reviewed the proposal from zenlake last week";
+        const QUERY: &str = "committee proposal zenlake";
+
+        let auto_score = dispatch_single_note_recall_with_entity(None, CONTENT, QUERY, None).await;
+        let opted_out_score =
+            dispatch_single_note_recall_with_entity(None, CONTENT, QUERY, Some(&[])).await;
+
+        assert!(
+            (auto_score - opted_out_score).abs() < 1e-4,
+            "no real entity named \"zenlake\" exists, so a lowercase query \
+             naming it must not be boosted: auto={auto_score} opted_out={opted_out_score}"
+        );
+    }
+
+    /// Gate (e): explicit `entity_names` still wins over Stage C extraction
+    /// even when a real, matching entity exists, and `entity_names: []`
+    /// stays a full opt-out. Mirrors the #738 override tests above, but with
+    /// a seeded entity in the store to prove Stage C's batched lookup is
+    /// bypassed entirely (not merely outscored) when the caller is explicit.
+    #[tokio::test]
+    #[serial(background_tasks)]
+    async fn adr104_stage_c_explicit_entity_names_still_win_over_anchored_extraction() {
+        const CONTENT: &str = "the committee reviewed the proposal from zenlake last week";
+        const QUERY: &str = "committee proposal zenlake";
+
+        let anchored_score =
+            dispatch_single_note_recall_with_entity(Some("zenlake"), CONTENT, QUERY, None).await;
+        let opted_out_score =
+            dispatch_single_note_recall_with_entity(Some("zenlake"), CONTENT, QUERY, Some(&[]))
+                .await;
+        let explicit_score = dispatch_single_note_recall_with_entity(
+            Some("zenlake"),
+            CONTENT,
+            QUERY,
+            Some(&["zenlake"]),
+        )
+        .await;
+
+        assert!(
+            (explicit_score - anchored_score).abs() < 1e-6,
+            "explicit entity_names=[\"zenlake\"] must reach the same boosted \
+             score as Stage C anchored extraction (both resolve to the same \
+             single candidate here): explicit={explicit_score} anchored={anchored_score}"
+        );
+        assert!(
+            (explicit_score - opted_out_score).abs() > 1e-6,
+            "explicit non-empty entity_names must still be honored (boosted \
+             above the opt-out baseline): explicit={explicit_score} opted_out={opted_out_score}"
+        );
+    }
+
+    /// `entity_lookup_candidates` unit coverage (pure function, ADR-104 §5):
+    /// ASCII-only candidates are lowercased, candidates containing non-ASCII
+    /// characters also retain their raw form, stopwords are excluded from
+    /// unigrams, and output is capped at `MAX_ENTITY_LOOKUP_CANDIDATES`.
+    #[test]
+    fn entity_lookup_candidates_extracts_unigrams_and_bigrams_lowercased() {
+        let out = crate::scoring::entity_lookup_candidates("New York City guide");
+        assert!(out.contains(&"new".to_string()));
+        assert!(out.contains(&"york".to_string()));
+        assert!(out.contains(&"city".to_string()));
+        assert!(out.contains(&"guide".to_string()));
+        assert!(out.contains(&"new york".to_string()));
+        assert!(out.contains(&"york city".to_string()));
+        assert!(out.contains(&"city guide".to_string()));
+    }
+
+    #[test]
+    fn entity_lookup_candidates_preserves_raw_non_ascii_case() {
+        let out = crate::scoring::entity_lookup_candidates("ÉCOLE Research");
+        assert!(out.contains(&"ÉCOLE".to_string()));
+        assert!(out.contains(&"École".to_string()));
+        assert!(!out.contains(&"école".to_string()));
+    }
+
+    #[test]
+    fn entity_lookup_candidates_enumerates_bounded_cjk_substrings() {
+        let out = crate::scoring::entity_lookup_candidates("我在北京大学学习");
+        assert!(out.contains(&"北京大学".to_string()));
+        assert!(!out.iter().any(|candidate| candidate.chars().count() == 1));
+        assert!(out.iter().all(|candidate| candidate.chars().count() <= 8));
+    }
+
+    #[test]
+    fn entity_lookup_candidates_samples_both_cjk_endpoints() {
+        let query: String = (0..20)
+            .map(|offset| char::from_u32(0x4e00 + offset).expect("valid CJK character"))
+            .collect();
+        let first_bigram: String = query.chars().take(2).collect();
+        let final_bigram: String = query.chars().skip(18).collect();
+
+        let out = crate::scoring::entity_lookup_candidates(&query);
+
+        assert!(out.contains(&first_bigram));
+        assert!(out.contains(&final_bigram));
+    }
+
+    #[tokio::test]
+    #[serial(background_tasks)]
+    async fn adr104_stage_c_long_query_preserves_adjacent_bigram_entity_for_ascii_case() {
+        const ENTITY_NAME: &str = "silver comet";
+        const LOWERCASE_QUERY: &str = "alpha bravo charlie delta echo foxtrot golf hotel india \
+                                      juliet kilo lima mike november oscar papa silver comet";
+        const TITLE_CASE_QUERY: &str = "Alpha Bravo Charlie Delta Echo Foxtrot Golf Hotel India \
+                                       Juliet Kilo Lima Mike November Oscar Papa Silver Comet";
+
+        for query in [LOWERCASE_QUERY, TITLE_CASE_QUERY] {
+            let anchored_score =
+                dispatch_single_note_recall_with_entity(Some(ENTITY_NAME), query, query, None)
+                    .await;
+            let opted_out_score =
+                dispatch_single_note_recall_with_entity(Some(ENTITY_NAME), query, query, Some(&[]))
+                    .await;
+
+            assert!(
+                anchored_score > opted_out_score,
+                "an 18-token query must retain and match its final adjacent bigram entity \
+                 regardless of ASCII case: query={query:?} anchored={anchored_score} \
+                 opted_out={opted_out_score}"
+            );
+        }
+    }
+
+    #[test]
+    fn entity_lookup_candidates_empty_query_returns_empty() {
+        assert!(crate::scoring::entity_lookup_candidates("").is_empty());
+        assert!(crate::scoring::entity_lookup_candidates("   ").is_empty());
     }
 }
