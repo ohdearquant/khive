@@ -206,10 +206,13 @@ The v0 JavaScript contract is:
   that ordinal through the core delete path, and removes both map entries as
   one operation. An unknown or already removed ID is an error.
 - `serialize(): Uint8Array` emits the portable container, including the
-  external-ID segment for all live ordinals.
+  portable string-ID segment for all live ordinals.
 - `deserialize(bytes: Uint8Array)` validates the complete container, restores
-  owned vector storage and lifecycle state, reconstructs SQ8, and restores both
-  ID maps. After deserialization, search and remove use the original string IDs.
+  owned vector storage and lifecycle state, and reconstructs SQ8. When the
+  container carries a `portable_ids.bin` segment, both ID maps are restored and
+  search and remove use the original string IDs. When it does not (for example,
+  a container reframed from a native v2 directory), `deserialize` creates the
+  documented default maps of decimal live-ordinal strings instead.
 
 The wasm config defaults SQ8 steering on. Full-precision mode remains
 selectable. Persistence is the host's responsibility through OPFS, IndexedDB,
@@ -261,11 +264,11 @@ ADR is the source of truth.
 | Native bytes round-trip | `to_bytes` followed by `from_bytes` preserves lifecycle state and search results exactly                                                                                                                                  |
 | Native-to-wasm fixture  | A container reframed from a native v2 directory with no ID segment loads in wasm and returns default decimal-ordinal-string IDs and the fixture's distances                                                               |
 | Wasm-to-native fixture  | A wasm-produced container reframes to a native v2 directory, the unchanged native loader reproduces the fixture's search results, and a second wasm load round-trips the ID segment losslessly through `portable_ids.bin` |
-| Corruption rejection    | Bad magic or version, truncation, overlapping ranges, missing or duplicate segments, bad checksums, and malformed external IDs are rejected                                                                               |
+| Corruption rejection    | Bad magic or version, truncation, overlapping ranges, missing or duplicate segments, bad checksums, and malformed portable string IDs are rejected                                                                        |
 | SQ8 reconstruction      | Neither native nor portable persisted output contains an SQ8 segment, and both load paths reconstruct SQ8 with search parity                                                                                              |
 | Insert by string ID     | Inserting a unique string ID makes it searchable; duplicate insertion errors without changing index or map state; recycled ordinals map only to the new ID                                                                |
 | Remove by string ID     | Removing a string ID resolves and tombstones its ordinal, removes both mappings, and prevents that ID from appearing in search                                                                                            |
-| Serialize string IDs    | `serialize` emits one versioned external-ID entry per live ordinal and none for tombstones                                                                                                                                |
+| Serialize string IDs    | `serialize` emits one versioned portable string-ID entry per live ordinal and none for tombstones                                                                                                                         |
 | Deserialize string IDs  | `deserialize` restores both ID maps so remove-by-ID and search-by-ID work without rebuilding                                                                                                                              |
 | Search by string ID     | Search returns equal-length parallel arrays of string IDs and f32 distances in result order, including after deserialize                                                                                                  |
 | Browser smoke           | A headless browser test covers build with explicit and default IDs, search, insert, remove, serialize, and deserialize with SQ8 enabled                                                                                   |
