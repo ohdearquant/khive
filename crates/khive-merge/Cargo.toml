@@ -5,7 +5,7 @@
 # [workspace.package] below declares the shared version for this standalone workspace.
 
 [workspace.package]
-version = "0.3.1"
+version = "0.4.0"
 
 [package]
 name = "khive-merge"
@@ -18,8 +18,8 @@ homepage = "https://github.com/ohdearquant"
 description = "KG three-way merge with conflict detection (ADR-039)"
 
 [dependencies]
-khive-runtime = { version = "0.3.1", path = "../khive-runtime" }
-khive-storage = { version = "0.3.1", path = "../khive-storage" }
+khive-runtime = { version = "0.4.0", path = "../khive-runtime" }
+khive-storage = { version = "0.4.0", path = "../khive-storage" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 thiserror = "2.0"

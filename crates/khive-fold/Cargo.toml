@@ -21,10 +21,10 @@ default = ["serde"]
 serde = ["dep:serde"]
 
 [dependencies]
-khive-score = { version = "0.3.1", path = "../khive-score" }
+khive-score = { version = "0.4.0", path = "../khive-score" }
 # ADR-024 boundary: khive-types + khive-score only.
 # blake3 feature enables Hash32::from_blake3 for checkpoint hashing.
-khive-types = { version = "0.3.1", path = "../khive-types", features = ["blake3", "serde"] }
+khive-types = { version = "0.4.0", path = "../khive-types", features = ["blake3", "serde"] }
 # serde: optional, gated by the `serde` feature above.
 serde = { workspace = true, optional = true }
 # serde_json: kept direct — serde_json::Value is used in FoldContext.extra,

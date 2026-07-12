@@ -225,7 +225,7 @@ touching consumers.
 
 ## Quick start
 
-**1. Install** (from [crates.io](https://crates.io/crates/khive-mcp), currently at `0.3.1`):
+**1. Install** (from [crates.io](https://crates.io/crates/khive-mcp), currently at `0.4.0`):
 
 ```bash
 cargo install kkernel
@@ -375,7 +375,7 @@ Docs: [ohdearquant.github.io/khive](https://ohdearquant.github.io/khive/) (agent
 
 ## Status
 
-**v0.3.1, published on [crates.io](https://crates.io/crates/khive-mcp).** 78 verbs across 11
+**v0.4.0, published on [crates.io](https://crates.io/crates/khive-mcp).** 78 verbs across 11
 packs, 9 entity kinds, 17 edge relations, daemon warm startup (ADR-049), knowledge search with
 embedding rerank, Bayesian brain profiles, threaded messaging, scheduled verb execution.
 Ready for use with Claude Code and any MCP-compatible agent.
