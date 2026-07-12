@@ -161,25 +161,13 @@ impl NamespaceToken {
 
     /// Return a new token with the same actor but a different namespace.
     ///
-    /// The visible set is replaced with `[ns]` — the minted token has
-    /// `namespace = ns` and `visible = [ns]`. This is a full read+write token
-    /// for `ns`: public runtime APIs (`list_notes`, `update_note`, `delete_note`,
-    /// etc.) accept it and will operate on `ns`. It is NOT a type-enforced
-    /// write-only or append-only capability. This is a capability-transfer
-    /// primitive, not a policy gate: the caller is responsible for enforcing any
-    /// ACL check before calling this method and for using the minted token only
-    /// in the intended narrow scope (e.g. a single `create_note` call).
-    ///
-    /// Callers today:
-    /// - `khive-pack-memory` FTS fanout: iterates token's own visible set; no escalation.
-    /// - `khive-pack-comm` inbound delivery: mints a token for the recipient ns,
-    ///   gated by `actor.allowed_outbound_namespaces` allowlist check immediately
-    ///   before, and uses it for exactly one `create_note` call (append-only by
-    ///   convention, not by type enforcement).
-    ///
-    /// Under a security model (cloud, mutual auth), replace this call pattern with a
-    /// type-enforced append-only capability or a `comm.ingest` Subhandler dispatch
-    /// (see ADR-056/ADR-053) that goes through the Gate.
+    /// The visible set is replaced with `[ns]`: this is a full read+write token
+    /// for `ns`, not a type-enforced write-only or append-only capability. It is
+    /// a capability-transfer primitive, not a policy gate: callers must enforce
+    /// any ACL check before calling this and use the minted token only within
+    /// the intended narrow scope (e.g. a single `create_note` call). A future
+    /// security model should replace this pattern with a type-enforced
+    /// append-only capability that goes through the Gate.
     pub fn with_namespace(&self, ns: Namespace) -> Self {
         Self::mint_authorized(ns, self.actor.clone())
     }
@@ -321,6 +309,7 @@ impl Default for RuntimeConfig {
                     "session",
                     "git",
                     "code",
+                    "workspace",
                 ]
                 .into_iter()
                 .map(String::from)
@@ -350,28 +339,22 @@ impl Default for RuntimeConfig {
 }
 
 impl RuntimeConfig {
-    /// Build a `RuntimeConfig` with embedding disabled entirely (issue #396).
+    /// Build a `RuntimeConfig` with embedding disabled entirely.
     ///
     /// `embedding_model` and `additional_embedding_models` are computed
-    /// *independently* inside [`Default::default`] (see above): the former from
-    /// `KHIVE_EMBEDDING_MODEL`, the latter from `KHIVE_ADDITIONAL_EMBEDDING_MODELS`
-    /// (falling back to seeding `ParaphraseMultilingualMiniLmL12V2` when that var
-    /// is unset). Writing `RuntimeConfig { embedding_model: None,
-    /// ..RuntimeConfig::default() }` therefore does *not* produce a model-less
-    /// runtime: `additional_embedding_models` still carries the env-driven
-    /// fallback seed, `configured_embedding_models` still reports it, and the
-    /// note-write path fans out embedding to every *registered* model regardless
-    /// of `embedding_model` — so the first `memory.remember` on a machine without
-    /// local model files hard-fails instead of degrading to FTS-only.
+    /// independently inside [`Default::default`], so `RuntimeConfig {
+    /// embedding_model: None, ..RuntimeConfig::default() }` does NOT produce a
+    /// model-less runtime: `additional_embedding_models` still carries its
+    /// env-driven fallback seed, and the note-write path fans out embedding to
+    /// every registered model regardless of `embedding_model`: so the first
+    /// `memory.remember` on a machine without local model files hard-fails
+    /// instead of degrading to FTS-only.
     ///
-    /// This constructor clears both fields together and is the one ergonomic,
-    /// correct spelling for "no embed runtime". Model-less machines (CI runners,
-    /// fresh installs without local model files) should use it instead of the
-    /// two-field struct-update form above.
-    ///
-    /// Deliberately ignores `KHIVE_ADDITIONAL_EMBEDDING_MODELS`: a caller
-    /// reaching for `no_embeddings()` wants zero embedders unconditionally, not
-    /// "zero unless the environment happens to disagree".
+    /// This constructor clears both fields together and ignores
+    /// `KHIVE_ADDITIONAL_EMBEDDING_MODELS` unconditionally: the caller wants
+    /// zero embedders, not "zero unless the environment disagrees". Use it on
+    /// model-less machines (CI runners, fresh installs without local model
+    /// files) instead of the two-field struct-update form.
     pub fn no_embeddings() -> Self {
         Self {
             embedding_model: None,
@@ -381,26 +364,18 @@ impl RuntimeConfig {
     }
 }
 
-/// Resolve the `--db`/`KHIVE_DB` value into the db path used to ANCHOR tier-3
-/// project-local `.khive/config.toml` discovery (`KhiveConfig::load_with_home_fallback`'s
-/// `db_path` parameter), mirroring the precedence `kkernel mcp`'s and `kkernel exec`'s
-/// two call sites use to open the database itself: `:memory:` has no file to anchor on
-/// (`None`); an explicit path anchors on that path; an unset value falls back to
-/// `$HOME/.khive/khive.db`, or the relative path `./.khive/khive.db` when `HOME` is unset —
-/// matching those two call sites' own pre-existing `unwrap_or_else(|_| ".".into())` handling.
+/// Resolve the `--db`/`KHIVE_DB` value into the anchor path used for tier-3
+/// project-local `.khive/config.toml` discovery, mirroring the precedence
+/// `kkernel mcp` and `kkernel exec` use to open the database itself:
+/// `:memory:` has no file to anchor on (`None`); an explicit path anchors on
+/// that path; an unset value falls back to `$HOME/.khive/khive.db`, or
+/// `./.khive/khive.db` when `HOME` is unset.
 ///
-/// This is distinct from a plain override resolver that answers "does the caller want to
-/// override `RuntimeConfig::default().db_path`?" (2-arm, `None` meaning "keep the default").
-/// `resolve_db_anchor` always resolves to a concrete anchor value (3-arm) — it materializes
-/// an anchor path unconditionally rather than asking whether to override one.
-///
-/// Note one deliberate divergence from `RuntimeConfig::default()`: when `HOME` is unset,
-/// `RuntimeConfig::default()` maps its own `db_path` to `None` (`.ok()` on the failed env
-/// lookup short-circuits the following `Option::map`), whereas this function falls back to
-/// `./.khive/khive.db` instead. A caller anchoring config-file discovery wants a concrete
-/// directory to search even without `HOME`; this function is not a stand-in for
-/// `RuntimeConfig::default()`'s own db-path default, only for the two call sites' shared
-/// anchor-derivation logic.
+/// Always resolves to a concrete anchor (unlike a 2-arm "override the
+/// default?" resolver): when `HOME` is unset this falls back to
+/// `./.khive/khive.db` rather than `None`, deliberately diverging from
+/// `RuntimeConfig::default()`: a caller anchoring config discovery needs a
+/// concrete directory to search even without `HOME`.
 pub fn resolve_db_anchor(db: Option<&str>) -> Option<std::path::PathBuf> {
     match db {
         Some(":memory:") => None,
@@ -412,23 +387,16 @@ pub fn resolve_db_anchor(db: Option<&str>) -> Option<std::path::PathBuf> {
     }
 }
 
-/// Assert that a resolved `db_path` — the path a runtime is about to open, and
-/// the same value `compute_config_id` folds into a process's `config_id` — agrees
-/// with what [`resolve_db_anchor`] derives from the same explicit `--db` /
-/// `KHIVE_DB` input. Call this at each construction boundary right after the
-/// `db_path` that boundary is about to use has been resolved.
+/// Assert that a resolved `db_path`: which `compute_config_id` folds into a
+/// process's `config_id`: agrees with what [`resolve_db_anchor`] derives from
+/// the same `--db`/`KHIVE_DB` input. Call this right after `db_path` is
+/// resolved at each construction boundary.
 ///
-/// A construction path that recomputes `db_path` independently of
-/// `resolve_db_anchor` (instead of routing through it, directly or via
-/// `resolve_runtime_config`) would otherwise diverge only silently: its
-/// `config_id` would carry the wrong db path, so it would stop matching a
-/// daemon or peer process anchored on the same database, and would silently
-/// fall back to a disconnected, out-of-sync runtime instead of failing loud.
-/// This turns that divergence into a hard error at the point it is introduced.
-///
-/// When `resolve_db_anchor(args_db)` itself resolves to `None` (the
-/// `:memory:` sentinel), there is no canonical anchor path to compare
-/// against, so the guard is inert and returns `Ok(())` unconditionally.
+/// Guards against a construction path recomputing `db_path` independently of
+/// `resolve_db_anchor`: left unchecked, that would silently desync
+/// `config_id` from a daemon or peer sharing the same database instead of
+/// failing loud. Inert (`Ok(())`) when the anchor itself is `None` (the
+/// `:memory:` sentinel) since there is nothing to compare against.
 pub fn assert_db_anchor_consistent(
     resolved_db_path: Option<&std::path::Path>,
     args_db: Option<&str>,
@@ -452,35 +420,27 @@ pub fn assert_db_anchor_consistent(
 }
 
 /// Resolve the per-connection attribution actor from the project/cwd-anchored
-/// config tier, independently of the database-anchored config load that governs
-/// `config_id` (ADR-096 Fork 2).
+/// config tier, independently of the database-anchored config load that
+/// governs `config_id`.
 ///
-/// Anchoring tier-3 `.khive/config.toml` discovery to the resolved database's own
-/// directory (commit 10d9c92c, #651) keeps `config_id` coherent between a
-/// short-lived client and a long-running daemon that share one database — that is
-/// correct for the fields that make up `config_id` (packs/db/embed/backend/
-/// outbound policy). It also relocated discovery of the project-local `[actor]`
-/// block, though. When many per-project connections share one database under a
-/// single `HOME` (the daemon-multiplexed fleet case), the shared database-anchored
-/// config carries no `[actor]`, so every connection's write-stamp attribution
-/// collapses to the default identity.
+/// The database-anchored config load keeps `config_id` coherent between a
+/// short-lived client and a long-running daemon sharing one database, but
+/// when many per-project connections share one database under a single
+/// `HOME` (the daemon-multiplexed fleet case), that shared config carries no
+/// `[actor]` block, so every connection's write-stamp attribution collapses
+/// to the default identity.
 ///
-/// This performs a SEPARATE, cwd-anchored lookup (`db_path: None`, matching the
-/// pre-#651 tier-3 search) and reads only `[actor].id`. It intentionally does not
-/// read or return anything else from the resolved `KhiveConfig` — `config_id`,
-/// `default_namespace` remain governed exclusively by the existing
-/// database-anchored load and must not be perturbed by this tier: `actor_id`
-/// and identity-derived `visible_namespaces` are not part of
-/// `compute_config_id` (`khive-mcp` `server.rs`), and ADR-007 Rev 4 Rule 0
-/// already keeps `[actor].id` out of `default_namespace`.
+/// This performs a separate, cwd-anchored lookup (`db_path: None`) and reads
+/// only `[actor].id`: it must not perturb `config_id` or `default_namespace`,
+/// which remain governed exclusively by the database-anchored load.
 ///
-/// `config_path` is the same explicit `--config` / `KHIVE_CONFIG` override the
-/// caller's database-anchored load receives — tier 1 short-circuits identically
-/// in both loads, so an explicit override still wins here too.
+/// `config_path` is the same explicit `--config`/`KHIVE_CONFIG` override the
+/// caller's database-anchored load receives, so an explicit override wins
+/// here too.
 ///
-/// Returns `Ok(None)` when no project-anchored config exists, or it exists but
-/// carries no non-empty `[actor].id` — callers fall through to their own env /
-/// anonymous tiers in that case.
+/// Returns `Ok(None)` when no project-anchored config exists, or it exists
+/// but carries no non-empty `[actor].id`: callers fall through to their own
+/// env/anonymous tiers in that case.
 pub fn resolve_project_actor_id(
     config_path: Option<&std::path::Path>,
 ) -> Result<Option<String>, crate::engine_config::ConfigError> {
@@ -564,14 +524,12 @@ pub fn runtime_config_from_khive_config(
     khive_cfg: &crate::engine_config::KhiveConfig,
     base: RuntimeConfig,
 ) -> RuntimeConfig {
-    // ADR-007 Rev 4 Rule 0: `[actor] id` does NOT become the storage namespace
-    // (writes always pin to `local`). `default_namespace` is whatever the caller
-    // resolved into `base` (explicit `--namespace` / `KHIVE_NAMESPACE`, else `local`).
-    // `actor.id` contributes to the read visible-set only (see fold-in below).
+    // `[actor] id` never becomes the storage namespace (writes always pin to
+    // `local`); it only widens the read visible-set below.
     let default_namespace = base.default_namespace.clone();
 
-    // base.brain_profile must carry ONLY the explicit CLI tier — never an env
-    // value (env sits BELOW toml per ADR-035; the MCP resolver applies it after).
+    // base.brain_profile must carry only the explicit CLI tier, never an env
+    // value: env sits below toml in precedence and is applied later by the MCP resolver.
     let brain_profile = base.brain_profile.clone().or_else(|| {
         khive_cfg
             .runtime
@@ -595,11 +553,9 @@ pub fn runtime_config_from_khive_config(
         })
         .collect();
 
-    // ADR-007 Rev 4: fold actor.id's namespace into visible_namespaces so that
-    // default reads widen to {local} ∪ {actor namespace}. Skipped when actor.id
-    // parses to `local` (mint already includes primary=local on the default path,
-    // adding it here would create a duplicate). Also skipped when it is already
-    // present from actor.visible_namespaces above.
+    // Fold actor.id's namespace into visible_namespaces so default reads widen
+    // to {local} ∪ {actor namespace}; skipped when it parses to `local` (would
+    // duplicate the primary namespace already minted) or is already present.
     let visible_namespaces = if let Some(id) = khive_cfg.actor.id.as_deref() {
         match Namespace::parse(id) {
             Ok(actor_ns) if actor_ns != Namespace::local() => {
@@ -615,9 +571,9 @@ pub fn runtime_config_from_khive_config(
         visible_namespaces
     };
 
-    // KhiveConfig::validate() guarantees every entry in allowed_outbound_namespaces is a
-    // structurally valid Namespace string, so Namespace::parse failures here are unreachable
-    // for validated configs. We still filter_map with a warn so a runtime bug doesn't panic.
+    // KhiveConfig::validate() guarantees these are valid Namespace strings, so
+    // parse failures here are unreachable for validated configs; filter_map+warn
+    // guards against a validation bug panicking instead.
     let allowed_outbound_namespaces: Vec<Namespace> = khive_cfg
         .actor
         .allowed_outbound_namespaces
@@ -631,14 +587,11 @@ pub fn runtime_config_from_khive_config(
         })
         .collect();
 
-    // ADR-057: store actor.id as actor_id for token minting. Precedence is
-    // TOML `[actor] id` > `base.actor_id` (the env/CLI-resolved value the
-    // caller already put in `base`) > anonymous. When `[actor] id` is absent
-    // or empty, fall back to `base.actor_id` instead of clobbering it with
-    // `None` — otherwise an env-resolved actor (e.g. `KHIVE_ACTOR`) is
-    // silently dropped whenever a project config is found without an
-    // `[actor]` block, in both the engines-empty and engines-present arms
-    // below.
+    // Precedence: TOML `[actor] id` > `base.actor_id` (env/CLI-resolved) >
+    // anonymous. Falls back to `base.actor_id` rather than `None` when
+    // `[actor] id` is absent: otherwise an env-resolved actor like
+    // `KHIVE_ACTOR` is silently dropped whenever a project config exists
+    // without an `[actor]` block.
     let actor_id = khive_cfg
         .actor
         .id
@@ -790,11 +743,10 @@ mod assert_db_anchor_consistent_tests {
 
     #[test]
     fn normal_boot_with_db_unset_passes_silently() {
-        // Mirrors a normal boot: `--db` unset. `resolve_db_anchor(None)` always
-        // resolves to `Some(..)` (HOME-set or HOME-unset both produce a
-        // concrete anchor — see `absent_maps_to_home_default` above and the
-        // `resolve_db_anchor` doc comment on the HOME-unset arm), so a runtime
-        // whose resolved `db_path` equals that anchor passes silently.
+        // Mirrors a normal boot with `--db` unset: `resolve_db_anchor(None)`
+        // always resolves to `Some(..)` (HOME-set or -unset both produce a
+        // concrete anchor), so a runtime whose resolved `db_path` matches
+        // passes silently.
         let anchor = resolve_db_anchor(None);
         assert!(assert_db_anchor_consistent(anchor.as_deref(), None).is_ok());
     }
@@ -833,10 +785,9 @@ mod resolve_project_actor_id_tests {
 
     #[test]
     fn propagates_load_error_for_invalid_actor_id() {
-        // `KhiveConfig::load`'s `validate()` rejects an empty `[actor] id` at load
-        // time (`ConfigError::InvalidActorId`) before the emptiness filter in
-        // `resolve_project_actor_id` would ever see it — this asserts the error
-        // surfaces rather than being silently swallowed into `Ok(None)`.
+        // `KhiveConfig::load`'s `validate()` rejects an empty `[actor] id` before
+        // the emptiness filter in `resolve_project_actor_id` ever sees it; this
+        // asserts the error surfaces rather than being swallowed into `Ok(None)`.
         let dir = tempfile::tempdir().expect("tempdir");
         let path = write_toml(&dir, "[actor]\nid = \"\"\n");
 
@@ -899,10 +850,9 @@ mod no_embeddings_tests {
     #[test]
     #[serial]
     fn default_still_seeds_additional_models_when_env_unset() {
-        // Regression guard for issue #396's root cause: `Default` must keep
-        // computing `embedding_model` and `additional_embedding_models`
-        // independently. `no_embeddings()` is a new opt-out constructor, not a
-        // change to `Default`'s existing (env-driven) seeding behavior.
+        // `Default` must keep computing `embedding_model` and
+        // `additional_embedding_models` independently; `no_embeddings()` is a
+        // separate opt-out constructor, not a change to `Default`'s seeding.
         std::env::remove_var("KHIVE_ADDITIONAL_EMBEDDING_MODELS");
         let config = RuntimeConfig::default();
 
@@ -911,8 +861,8 @@ mod no_embeddings_tests {
             vec![EmbeddingModel::ParaphraseMultilingualMiniLmL12V2]
         );
 
-        // The bug shape from #396: overriding only `embedding_model` via
-        // struct-update syntax does not clear `additional_embedding_models`.
+        // Overriding only `embedding_model` via struct-update syntax does not
+        // clear `additional_embedding_models`.
         let buggy_form = RuntimeConfig {
             embedding_model: None,
             ..RuntimeConfig::default()

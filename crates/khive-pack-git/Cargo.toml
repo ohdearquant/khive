@@ -2,6 +2,7 @@
 name = "khive-pack-git"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -11,10 +12,10 @@ categories.workspace = true
 description = "Git-lifecycle pack — commit/issue/pull_request provenance notes over the notes substrate (ADR-088)"
 
 [dependencies]
-khive-types = { version = "0.3.0", path = "../khive-types", features = ["serde"] }
-khive-runtime = { version = "0.3.0", path = "../khive-runtime" }
+khive-types = { version = "0.4.0", path = "../khive-types", features = ["serde"] }
+khive-runtime = { version = "0.4.0", path = "../khive-runtime" }
 inventory = { workspace = true }
-khive-storage = { version = "0.3.0", path = "../khive-storage" }
+khive-storage = { version = "0.4.0", path = "../khive-storage" }
 async-trait = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -28,7 +29,7 @@ blake3 = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["full"] }
-khive-pack-kg = { version = "0.3.0", path = "../khive-pack-kg" }
+khive-pack-kg = { version = "0.4.0", path = "../khive-pack-kg" }
 tempfile = { workspace = true }
-khive-runtime = { version = "0.3.0", path = "../khive-runtime", features = ["fault-injection"] }
+khive-runtime = { version = "0.4.0", path = "../khive-runtime", features = ["fault-injection"] }
 lattice-embed = { workspace = true }

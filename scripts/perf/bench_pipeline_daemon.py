@@ -40,11 +40,13 @@ import itertools
 import json
 import os
 import pathlib
-import signal
 import subprocess
 import sys
 import tempfile
 import time
+
+sys.path.insert(0, str(pathlib.Path(__file__).parent))
+import mcp_bench_client as mbc  # noqa: E402  (shared MCP/daemon client plumbing, PR2)
 
 # ── Tunables ──────────────────────────────────────────────────────────────────
 
@@ -76,8 +78,8 @@ ANN_SETTLE_POLL_S = 0.25
 
 # Default production pack set (must match RuntimeConfig::default().packs in
 # crates/khive-runtime/src/config.rs so config_id agrees between front-end
-# and daemon child).
-_DEFAULT_PACKS = "kg,gtd,memory,brain,comm,schedule,knowledge,session,git,code"
+# and daemon child). Shared with bench_load_harness.py via mcp_bench_client.py.
+_DEFAULT_PACKS = mbc.DEFAULT_PACKS
 
 TOPICS = [
     ("knowledge graph", ["entity", "edge", "relation", "graph", "node", "ontology", "triple", "schema", "link", "concept"]),
@@ -143,72 +145,11 @@ def _make_sentinel_content():
     """
     return f"__khive_bench_settle_sentinel_pid{os.getpid()}_seq{next(_SENTINEL_SEQ)}__"
 
-# ── MCP stdio driver (mirrors smoke_test.py pattern) ─────────────────────────
+# ── MCP stdio driver (shared plumbing, mcp_bench_client.py, PR2) ─────────────
 
-_request_id = 0
-
-def _next_id():
-    global _request_id
-    _request_id += 1
-    return _request_id
-
-
-def _send(proc, method, params=None):
-    msg = {"jsonrpc": "2.0", "id": _next_id(), "method": method}
-    if params is not None:
-        msg["params"] = params
-    proc.stdin.write((json.dumps(msg) + "\n").encode())
-    proc.stdin.flush()
-
-
-def _recv(proc):
-    line = proc.stdout.readline()
-    if not line:
-        raise RuntimeError("MCP binary closed stdout unexpectedly")
-    return json.loads(line)
-
-
-def _call_request(proc, ops_string):
-    _send(proc, "tools/call", {"name": "request", "arguments": {"ops": ops_string}})
-    resp = _recv(proc)
-    if "error" in resp:
-        raise RuntimeError(f"MCP RPC error: {resp['error']}")
-    result = resp.get("result", {})
-    if result.get("isError"):
-        content = result.get("content", [])
-        text = content[0]["text"] if content else "(no text)"
-        raise RuntimeError(f"request returned protocol error: {text}")
-    content = result.get("content", [])
-    text = content[0]["text"] if content else ""
-    return json.loads(text) if text else None
-
-
-def _call_verb(proc, verb, args):
-    ops = json.dumps([{"tool": verb, "args": args}])
-    body = _call_request(proc, ops)
-    if body is None:
-        raise RuntimeError(f"Empty response for verb {verb}")
-    results = body.get("results") or []
-    if not results:
-        raise RuntimeError(f"No results in response for verb {verb}: {body}")
-    first = results[0]
-    if not first.get("ok", False):
-        raise RuntimeError(f"Verb {verb} failed: {first.get('error', '<no error>')}")
-    return first.get("result")
-
-
-def _handshake(proc):
-    _send(proc, "initialize", {
-        "protocolVersion": "2024-11-05",
-        "capabilities": {},
-        "clientInfo": {"name": "bench-pipeline", "version": "1.0.0"},
-    })
-    init = _recv(proc)
-    if "error" in init:
-        raise RuntimeError(f"initialize failed: {init['error']}")
-    notify = {"jsonrpc": "2.0", "method": "notifications/initialized"}
-    proc.stdin.write((json.dumps(notify) + "\n").encode())
-    proc.stdin.flush()
+_call_request = mbc.call_request
+_call_verb = mbc.call_verb
+_handshake = mbc.handshake
 
 # ── Quality ───────────────────────────────────────────────────────────────────
 
@@ -220,144 +161,14 @@ def precision_at_k(contents, expected_topic):
         return 0.0
     return sum(1 for c in contents if expected_topic in c) / TOP_K
 
-# ── Daemon engagement assertions ──────────────────────────────────────────────
+# ── Daemon engagement assertions (shared plumbing, mcp_bench_client.py, PR2)
 
-def _read_pid_file(pid_path):
-    """Return (pid:int, raw:str) from pid file, or (None, None) if absent/bad."""
-    try:
-        raw = pathlib.Path(pid_path).read_text().strip()
-        return int(raw), raw
-    except Exception:
-        return None, None
-
-
-def _pid_alive(pid):
-    """Return True if the process is alive (signal 0)."""
-    try:
-        os.kill(pid, 0)
-        return True
-    except (ProcessLookupError, PermissionError):
-        return False
-
-
-def _argv_is_khive_daemon(pid):
-    """Return True if ps shows this PID running kkernel (or kkernel-bench) mcp --daemon."""
-    try:
-        out = subprocess.check_output(
-            ["ps", "-p", str(pid), "-o", "args="],
-            stderr=subprocess.DEVNULL,
-        ).decode().strip()
-        tokens = out.split()
-        if not tokens:
-            return False
-        basename = os.path.basename(tokens[0])
-        # Accept kkernel (production) or kkernel-bench (bench binary, which spawns
-        # itself as the daemon via current_exe() in spawn_daemon()).
-        if basename not in ("kkernel", "kkernel-bench"):
-            return False
-        rest = tokens[1:]
-        return "mcp" in rest and "--daemon" in rest
-    except Exception:
-        return False
-
-
-def _lsof_has_bench_db(pid, bench_db):
-    """Return True if the process has bench_db open (best-effort, skips if lsof absent)."""
-    try:
-        out = subprocess.check_output(
-            ["lsof", "-p", str(pid)],
-            stderr=subprocess.DEVNULL,
-        ).decode()
-        bench_db_real = str(pathlib.Path(bench_db).resolve())
-        return bench_db_real in out
-    except FileNotFoundError:
-        print("[SKIP] lsof not available — skipping open-file sub-check", flush=True)
-        return None  # None means skipped, not False
-    except Exception:
-        return False
-
-
-def assert_daemon_engaged(sock_path, pid_path, bench_db, label="main"):
-    """Assert all three daemon-engagement checks pass. Exit non-zero on failure."""
-    errors = []
-
-    # Check 1: socket file exists
-    if not pathlib.Path(sock_path).exists():
-        errors.append(
-            f"[DAEMON-CHECK-{label}] FAIL: bench socket {sock_path!r} does not exist. "
-            "The front-end must have silently fallen back to local dispatch."
-        )
-    else:
-        print(f"[DAEMON-CHECK-{label}] PASS: bench socket {sock_path!r} exists", flush=True)
-
-    # Check 2: PID file exists, PID is alive, and argv is kkernel mcp --daemon
-    pid, _ = _read_pid_file(pid_path)
-    if pid is None:
-        errors.append(
-            f"[DAEMON-CHECK-{label}] FAIL: bench PID file {pid_path!r} absent or unreadable."
-        )
-    elif not _pid_alive(pid):
-        errors.append(
-            f"[DAEMON-CHECK-{label}] FAIL: PID {pid} from {pid_path!r} is not alive."
-        )
-    elif not _argv_is_khive_daemon(pid):
-        try:
-            argv_out = subprocess.check_output(
-                ["ps", "-p", str(pid), "-o", "args="], stderr=subprocess.DEVNULL
-            ).decode().strip()
-        except Exception:
-            argv_out = "<ps failed>"
-        errors.append(
-            f"[DAEMON-CHECK-{label}] FAIL: PID {pid} is alive but argv does not match "
-            f"'kkernel mcp --daemon'. Got: {argv_out!r}"
-        )
-    else:
-        print(
-            f"[DAEMON-CHECK-{label}] PASS: PID {pid} is a live kkernel mcp --daemon process",
-            flush=True,
-        )
-
-        # Check 3: that daemon has bench.db open (best-effort)
-        db_open = _lsof_has_bench_db(pid, bench_db)
-        if db_open is None:
-            pass  # skipped
-        elif db_open:
-            print(
-                f"[DAEMON-CHECK-{label}] PASS: PID {pid} has {bench_db!r} open (lsof confirmed)",
-                flush=True,
-            )
-        else:
-            errors.append(
-                f"[DAEMON-CHECK-{label}] FAIL: PID {pid} is 'kkernel mcp --daemon' but does NOT "
-                f"have {bench_db!r} open. It may be attached to the live DB instead."
-            )
-
-    if errors:
-        for msg in errors:
-            print(msg, file=sys.stderr, flush=True)
-        print(
-            f"FATAL: daemon-engagement assertions failed ({label} run). "
-            "The gate CANNOT rely on this run's P@K. Exiting.",
-            file=sys.stderr,
-            flush=True,
-        )
-        sys.exit(1)
-
-
-def assert_no_daemon_spawned(sock_path, label="nodaemon"):
-    """Assert no bench daemon was spawned (KHIVE_NO_DAEMON control run)."""
-    if pathlib.Path(sock_path).exists():
-        print(
-            f"[DAEMON-CHECK-{label}] FAIL: bench socket {sock_path!r} exists when "
-            "KHIVE_NO_DAEMON=1 was set — something spawned a daemon unexpectedly.",
-            file=sys.stderr,
-            flush=True,
-        )
-        sys.exit(1)
-    print(
-        f"[DAEMON-CHECK-{label}] PASS: no bench socket with KHIVE_NO_DAEMON=1 (correct)",
-        flush=True,
-    )
+_read_pid_file = mbc.read_pid_file
+_pid_alive = mbc.pid_alive
+_argv_is_khive_daemon = mbc.argv_is_khive_daemon
+_lsof_has_bench_db = mbc.lsof_has_bench_db
+assert_daemon_engaged = mbc.assert_daemon_engaged
+assert_no_daemon_spawned = mbc.assert_no_daemon_spawned
 
 
 # ── Provenance ────────────────────────────────────────────────────────────────
@@ -436,29 +247,11 @@ def _read_baseline_p50():
         return None
     return rows[0] if rows else None
 
-# ── Safety guard ──────────────────────────────────────────────────────────────
+# ── Safety guard + percentile (shared plumbing, mcp_bench_client.py, PR2) ────
 
-_LIVE_DB_PATHS = frozenset([
-    os.path.expanduser("~/.khive/khive.db"),
-    os.path.expanduser("~/.khive/khive-graph.db"),
-])
-
-
-def _assert_not_live_db(path):
-    resolved = str(pathlib.Path(path).resolve())
-    for live in _LIVE_DB_PATHS:
-        live_resolved = str(pathlib.Path(live).resolve())
-        if resolved == live_resolved or resolved.startswith(str(pathlib.Path(live).parent.resolve())):
-            print(f"FATAL: bench DB path {path!r} resolves to live DB location. Aborting.", file=sys.stderr)
-            sys.exit(2)
-
-# ── Percentile ────────────────────────────────────────────────────────────────
-
-def _pct(sorted_list, p):
-    if not sorted_list:
-        return 0.0
-    idx = min(int(len(sorted_list) * p), len(sorted_list) - 1)
-    return sorted_list[idx]
+_LIVE_DB_PATHS = mbc.LIVE_DB_PATHS
+_assert_not_live_db = mbc.assert_not_live_db
+_pct = mbc.pct
 
 # ── Ingest ────────────────────────────────────────────────────────────────────
 
@@ -574,26 +367,9 @@ def _wait_for_ann_convergence(
     )
 
 
-# ── Daemon teardown helper ────────────────────────────────────────────────────
+# ── Daemon teardown helper (shared plumbing, mcp_bench_client.py, PR2) ───────
 
-def _teardown_daemon(pid_path, tmpdir):
-    """SIGTERM the bench daemon (if any), then rmtree the tmpdir."""
-    import shutil
-    pid, _ = _read_pid_file(pid_path)
-    if pid is not None and _pid_alive(pid) and _argv_is_khive_daemon(pid):
-        try:
-            os.kill(pid, signal.SIGTERM)
-            # Give it a moment to exit cleanly.
-            for _ in range(20):
-                time.sleep(0.1)
-                if not _pid_alive(pid):
-                    break
-        except Exception:
-            pass
-    try:
-        shutil.rmtree(tmpdir, ignore_errors=True)
-    except Exception:
-        pass
+_teardown_daemon = mbc.teardown_daemon
 
 # ── No-daemon control run ─────────────────────────────────────────────────────
 

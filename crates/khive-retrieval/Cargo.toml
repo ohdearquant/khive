@@ -2,6 +2,7 @@
 name = "khive-retrieval"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -10,16 +11,19 @@ keywords.workspace = true
 categories.workspace = true
 description = "Hybrid retrieval composer (HNSW + BM25 + fusion + graph + cross-encoder) with deterministic scoring"
 
+[lib]
+bench = false
+
 [dependencies]
-khive-hnsw    = { version = "0.3.0", path = "../khive-hnsw" }
-khive-bm25    = { version = "0.3.0", path = "../khive-bm25" }
-khive-fusion  = { version = "0.3.0", path = "../khive-fusion" }
-khive-score   = { version = "0.3.0", path = "../khive-score" }
-khive-types   = { version = "0.3.0", path = "../khive-types" }
-khive-fold    = { version = "0.3.0", path = "../khive-fold", optional = true }
-khive-storage = { version = "0.3.0", path = "../khive-storage", optional = true }
-khive-db      = { version = "0.3.0", path = "../khive-db" }
-khive-gate    = { version = "0.3.0", path = "../khive-gate", optional = true }
+khive-hnsw    = { version = "0.4.0", path = "../khive-hnsw" }
+khive-bm25    = { version = "0.4.0", path = "../khive-bm25" }
+khive-fusion  = { version = "0.4.0", path = "../khive-fusion" }
+khive-score   = { version = "0.4.0", path = "../khive-score" }
+khive-types   = { version = "0.4.0", path = "../khive-types" }
+khive-fold    = { version = "0.4.0", path = "../khive-fold", optional = true }
+khive-storage = { version = "0.4.0", path = "../khive-storage", optional = true }
+khive-db      = { version = "0.4.0", path = "../khive-db" }
+khive-gate    = { version = "0.4.0", path = "../khive-gate", optional = true }
 lattice-embed = { workspace = true }
 
 serde = { workspace = true }
@@ -58,8 +62,8 @@ embed = []
 
 [dev-dependencies]
 criterion = { workspace = true }
-khive-score = { version = "0.3.0", path = "../khive-score" }
-khive-fusion = { version = "0.3.0", path = "../khive-fusion" }
+khive-score = { version = "0.4.0", path = "../khive-score" }
+khive-fusion = { version = "0.4.0", path = "../khive-fusion" }
 
 [[bench]]
 name = "fusion_bench"

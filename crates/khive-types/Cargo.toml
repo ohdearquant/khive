@@ -3,6 +3,7 @@ name = "khive-types"
 description = "Core type primitives: Id128, Timestamp, Namespace, and the 3 substrate data types (Note, Entity, Event)."
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true

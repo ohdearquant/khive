@@ -468,6 +468,15 @@ fn build_entity_where(
         conditions.push(format!("name LIKE ?{} ESCAPE '\\'", params.len()));
     }
 
+    if let Some(ref exact) = filter.name_exact {
+        params.push(Box::new(exact.clone()));
+        // `entities.name` has no `COLLATE NOCASE` (see sql/schema.sql), so
+        // `=` is already SQLite's default case-sensitive BINARY comparison.
+        // `COLLATE BINARY` is spelled out here so this predicate stays
+        // correct even if the column's default collation ever changes.
+        conditions.push(format!("name = ?{} COLLATE BINARY", params.len()));
+    }
+
     if !filter.tags_any.is_empty() {
         let placeholders: Vec<String> = filter
             .tags_any

@@ -1,0 +1,466 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://khive.dev/schemas/flagship-result-v3.json",
+  "title": "FlagshipRecord",
+  "description": "Checked result contract for the flagship E2E benchmark manifest (bench-overhaul PR 1). Implements the Distribution contract and the Ledger record contract from .khive/workspaces/20260711/bench-overhaul/DESIGN.md ('Typed interfaces'), which fixes FlagshipRecord.schema_version at 3 - the same schema_version track scripts/perf/bench_track.py's ledger will carry for flagship-e2e records once PR 2 wires this runner's output into that ledger. bench_track.py itself remains at its own SCHEMA_VERSION = 2 for its existing (non-flagship) suites until then. No runner emits documents against this schema yet - PR 2+ implement the scenario runner.",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "suite",
+    "scenario_id",
+    "feature",
+    "operation",
+    "arm",
+    "sha",
+    "branch",
+    "run_id",
+    "run_attempt",
+    "timestamp",
+    "status",
+    "metrics",
+    "distributions",
+    "workload",
+    "runtime",
+    "host",
+    "settle",
+    "calibration",
+    "artifact"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "const": 3
+    },
+    "suite": {
+      "const": "flagship-e2e"
+    },
+    "scenario_id": {
+      "type": "string",
+      "description": "Stable scenario id, f<N>.<verb>.<arm>.<embedder> convention.",
+      "pattern": "^f(10|[1-9])\\..+"
+    },
+    "feature": {
+      "type": "string",
+      "enum": [
+        "F1",
+        "F2",
+        "F3",
+        "F4",
+        "F5",
+        "F6",
+        "F7",
+        "F8",
+        "F9",
+        "F10"
+      ]
+    },
+    "operation": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Fully qualified verb measured (the manifest operation field), denormalized so hotspot ranking by verb never parses scenario_id."
+    },
+    "arm": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Scenario arm (third scenario_id segment), denormalized for structured querying."
+    },
+    "sha": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$"
+    },
+    "branch": {
+      "type": "string",
+      "minLength": 1
+    },
+    "run_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "run_attempt": {
+      "type": "string",
+      "minLength": 1
+    },
+    "timestamp": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "status": {
+      "type": "string",
+      "enum": [
+        "ok",
+        "error",
+        "confounded",
+        "insufficient_samples"
+      ]
+    },
+    "metrics": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "number"
+      }
+    },
+    "distributions": {
+      "type": "object",
+      "description": "map<metric_name, Distribution>",
+      "additionalProperties": {
+        "$ref": "#/$defs/distribution"
+      }
+    },
+    "workload": {
+      "$ref": "#/$defs/workloadMetadata"
+    },
+    "runtime": {
+      "$ref": "#/$defs/runtimeMetadata"
+    },
+    "host": {
+      "$ref": "#/$defs/hostMetadata"
+    },
+    "settle": {
+      "$ref": "#/$defs/settleEvidence"
+    },
+    "calibration": {
+      "oneOf": [
+        {
+          "type": "null"
+        },
+        {
+          "$ref": "#/$defs/calibrationReference"
+        }
+      ]
+    },
+    "artifact": {
+      "$ref": "#/$defs/artifactRef"
+    }
+  },
+  "$defs": {
+    "distribution": {
+      "type": "object",
+      "description": "Distribution contract. Timeouts are right-censored: the timed-out deadline value is never inserted into the latency vector. Percentiles describe successful calls only (conditional_on_success is always true) and are always published beside timed_out.",
+      "required": [
+        "estimator",
+        "unit",
+        "attempts",
+        "successes",
+        "timed_out",
+        "errors_by_code",
+        "histogram_edges_us",
+        "histogram_counts",
+        "p50_us",
+        "p95_us",
+        "p99_us",
+        "max_us",
+        "conditional_on_success"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "estimator": {
+          "const": "nearest_rank_v1"
+        },
+        "unit": {
+          "const": "us"
+        },
+        "attempts": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "successes": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "timed_out": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "errors_by_code": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "integer",
+            "minimum": 0
+          }
+        },
+        "histogram_edges_us": {
+          "type": "array",
+          "items": {
+            "type": "integer",
+            "minimum": 0
+          }
+        },
+        "histogram_counts": {
+          "type": "array",
+          "items": {
+            "type": "integer",
+            "minimum": 0
+          }
+        },
+        "p50_us": {
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "type": "integer",
+              "minimum": 0
+            }
+          ]
+        },
+        "p95_us": {
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "type": "integer",
+              "minimum": 0
+            }
+          ]
+        },
+        "p99_us": {
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "type": "integer",
+              "minimum": 0
+            }
+          ]
+        },
+        "max_us": {
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "type": "integer",
+              "minimum": 0
+            }
+          ]
+        },
+        "conditional_on_success": {
+          "const": true
+        }
+      }
+    },
+    "workloadMetadata": {
+      "type": "object",
+      "required": [
+        "manifest_version",
+        "manifest_hash",
+        "scenario_id",
+        "fixture",
+        "fixture_hash",
+        "scale",
+        "concurrency",
+        "attempts"
+      ],
+      "additionalProperties": true,
+      "properties": {
+        "manifest_version": {
+          "type": "string"
+        },
+        "manifest_hash": {
+          "type": "string",
+          "pattern": "^sha256:[0-9a-f]{64}$"
+        },
+        "scenario_id": {
+          "type": "string"
+        },
+        "fixture": {
+          "type": "string"
+        },
+        "fixture_hash": {
+          "type": "string",
+          "pattern": "^sha256:[0-9a-f]{64}$"
+        },
+        "scale": {
+          "type": "object"
+        },
+        "concurrency": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "attempts": {
+          "type": "integer",
+          "minimum": 1
+        }
+      }
+    },
+    "runtimeMetadata": {
+      "type": "object",
+      "required": [
+        "surface",
+        "embedder",
+        "runner_class",
+        "daemon_fallback_count"
+      ],
+      "additionalProperties": true,
+      "properties": {
+        "surface": {
+          "type": "string",
+          "enum": [
+            "mcp_daemon",
+            "admin_cli",
+            "raw_daemon_control"
+          ]
+        },
+        "embedder": {
+          "type": "string",
+          "enum": [
+            "none",
+            "bench_hash",
+            "production"
+          ]
+        },
+        "runner_class": {
+          "type": "string",
+          "enum": [
+            "hosted_hash",
+            "self_hosted_cpu",
+            "self_hosted_real_embedder"
+          ]
+        },
+        "daemon_fallback_count": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "hostMetadata": {
+      "type": "object",
+      "required": [
+        "os",
+        "arch",
+        "cpu_count"
+      ],
+      "additionalProperties": true,
+      "properties": {
+        "os": {
+          "type": "string"
+        },
+        "arch": {
+          "type": "string"
+        },
+        "cpu_count": {
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "type": "integer"
+            }
+          ]
+        }
+      }
+    },
+    "settleEvidence": {
+      "type": "object",
+      "required": [
+        "method",
+        "state"
+      ],
+      "additionalProperties": true,
+      "properties": {
+        "method": {
+          "type": "string",
+          "enum": [
+            "none",
+            "sequential_sentinel",
+            "explicit_lifecycle_predicate"
+          ]
+        },
+        "state": {
+          "type": "string",
+          "enum": [
+            "cold",
+            "settling",
+            "warm"
+          ]
+        },
+        "attempts": {
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "type": "integer",
+              "minimum": 0
+            }
+          ]
+        },
+        "duration_us": {
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "type": "integer",
+              "minimum": 0
+            }
+          ]
+        },
+        "sentinel_hash": {
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "type": "string"
+            }
+          ]
+        },
+        "overlapped_phase": {
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "type": "boolean"
+            }
+          ]
+        }
+      }
+    },
+    "calibrationReference": {
+      "type": "object",
+      "required": [
+        "artifact_sha",
+        "baseline_id",
+        "tolerance_factor",
+        "same_sha_run_count"
+      ],
+      "additionalProperties": true,
+      "properties": {
+        "artifact_sha": {
+          "type": "string"
+        },
+        "baseline_id": {
+          "type": "string"
+        },
+        "tolerance_factor": {
+          "type": "number"
+        },
+        "same_sha_run_count": {
+          "type": "integer",
+          "minimum": 10
+        }
+      }
+    },
+    "artifactRef": {
+      "type": "object",
+      "required": [
+        "name",
+        "sha256"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        }
+      }
+    }
+  }
+}

@@ -19,9 +19,6 @@ use crate::config::{
 };
 use crate::error::{RuntimeError, RuntimeResult};
 
-/// Callback type for pack-installed entity-type validation (ADR-004).
-///
-/// `(kind, entity_type) → Ok(normalised_type | None)` or `InvalidInput`.
 /// Callback type for pack-installed entity-type validators.
 ///
 /// Receives `(kind, entity_type)` and returns the normalised type string,
@@ -30,18 +27,16 @@ use crate::error::{RuntimeError, RuntimeResult};
 pub type EntityTypeValidatorFn =
     Arc<dyn Fn(&str, Option<&str>) -> Result<Option<String>, RuntimeError> + Send + Sync>;
 
-/// Callback type for a pack-installed note-mutation hook (#750 fix-round 1).
+/// Callback type for a pack-installed note-mutation hook.
 ///
 /// Invoked by `update_note` (when the note's text/embedding actually
 /// changed) and `delete_note` (soft or hard) with `(note_kind, note_id)`,
-/// AFTER the mutation has been durably applied. Returns a boxed future so
+/// after the mutation has been durably applied. Returns a boxed future so
 /// the hook can await async cache-invalidation work (e.g.
-/// `khive-pack-memory`'s ANN warm-cache generation bump) without the
-/// `KhiveRuntime`/`khive-runtime` crate depending on any pack crate — the
-/// dependency points the other way (packs depend on `khive-runtime`, not
-/// vice versa), so this is the same "runtime exposes an extension point,
-/// pack installs into it" shape as `EntityTypeValidatorFn` /
-/// `install_edge_rules`, just async.
+/// `khive-pack-memory`'s ANN warm-cache generation bump) without
+/// `khive-runtime` depending on any pack crate: dependencies point the
+/// other way, so the runtime exposes an extension point and the pack
+/// installs into it, same shape as `EntityTypeValidatorFn`, just async.
 pub type NoteMutationHookFn = Arc<
     dyn Fn(String, uuid::Uuid) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
         + Send
@@ -88,14 +83,14 @@ pub struct KhiveRuntime {
     /// handler layer is the primary enforcement point.
     valid_entity_kinds: Arc<RwLock<Vec<String>>>,
     valid_note_kinds: Arc<RwLock<Vec<String>>>,
-    /// Pack-installed entity-type validator (ADR-004 §runtime-layer validation).
+    /// Pack-installed entity-type validator.
     ///
     /// When `Some`, `create_many` calls this function to validate and normalise
     /// each `(kind, entity_type)` pair before writing. When `None` (bare runtime
     /// without packs), entity-type validation is skipped — the pack handler layer
     /// is the primary enforcement point, same as for `valid_entity_kinds`.
     entity_type_validator: Arc<RwLock<Option<EntityTypeValidatorFn>>>,
-    /// Pack-installed note-mutation hook (#750 fix-round 1).
+    /// Pack-installed note-mutation hook.
     ///
     /// When `Some`, `update_note` (on text change) and `delete_note` (soft
     /// or hard) call this after the mutation is durably applied, so a pack
@@ -125,12 +120,8 @@ impl KhiveRuntime {
             }
             None => StorageBackend::memory()?,
         };
-        // Run versioned migrations (V1..V17) at startup so file-backed and
-        // in-memory DBs both have proposals_open (V15) and the embedding_model
-        // columns (V16/V17) before any pack handler runs.  Migration is
-        // idempotent — already-applied versions are skipped.  A failure here
-        // aborts construction so the caller sees a clear error rather than a
-        // cryptic "no such table" on the first verb dispatch.
+        // Migrations must run before any pack handler touches the DB; idempotent;
+        // failure aborts construction with a clear error.
         {
             let mut writer = backend.pool().try_writer()?;
             khive_db::run_migrations(writer.conn_mut())?;
@@ -288,10 +279,10 @@ impl KhiveRuntime {
 
     /// Return the extra-visible namespaces assembled at config load.
     ///
-    /// OSS dispatch uses this set to widen the DEFAULT multi-record read scope
-    /// to `['local'] ∪ visible_namespaces` (ADR-007 Rev 4 Rule 3b). Writes are
-    /// unchanged — always pinned to `'local'`. This set is also available as
-    /// gate/cloud policy input.
+    /// OSS dispatch uses this set to widen the default multi-record read scope
+    /// to `['local'] ∪ visible_namespaces`. Writes are unchanged: always
+    /// pinned to `'local'`. This set is also available as gate/cloud policy
+    /// input.
     pub fn visible_namespaces(&self) -> &[Namespace] {
         &self.config.visible_namespaces
     }
@@ -370,7 +361,6 @@ impl KhiveRuntime {
         token: &NamespaceToken,
         model_name: &str,
     ) -> RuntimeResult<Arc<dyn khive_storage::VectorStore>> {
-        // Try the lattice enum path first (handles aliases like "paraphrase").
         if let Some(model) = parse_embedding_model_alias(model_name) {
             // Only proceed via the lattice path if this model is actually in the
             // registry; otherwise fall through to the custom-provider path.
@@ -384,8 +374,6 @@ impl KhiveRuntime {
                 return self.vectors_for_embedding_model(token, model);
             }
         }
-        // Custom provider path: look up dimensions from the registry and build
-        // the vector store using the sanitized provider name as the table key.
         let dims = {
             let registry = self.embedder_registry.read().map_err(|_| {
                 crate::RuntimeError::Internal("embedder registry lock poisoned".into())
@@ -447,7 +435,7 @@ impl KhiveRuntime {
     /// to mint a token that can read additional namespaces.
     ///
     /// When `actor_id` is configured in `RuntimeConfig`, the token carries that
-    /// actor label so that `comm.inbox` filters by `to_actor` (ADR-057). When
+    /// actor label so that `comm.inbox` filters by `to_actor`. When
     /// unconfigured, the token carries `ActorRef::anonymous()` and inbox falls
     /// back to party-line behavior.
     pub fn authorize(&self, ns: Namespace) -> RuntimeResult<NamespaceToken> {
@@ -613,7 +601,7 @@ impl KhiveRuntime {
         }
     }
 
-    /// Install a pack-supplied entity-type validator (ADR-004 §runtime-layer validation).
+    /// Install a pack-supplied entity-type validator.
     ///
     /// Called by the `KgPack` during registration so that `create_many` can validate
     /// `entity_type` values at the runtime layer, closing the hole where direct Rust
@@ -646,7 +634,7 @@ impl KhiveRuntime {
         }
     }
 
-    /// Install a pack-owned note-mutation hook (#750 fix-round 1).
+    /// Install a pack-owned note-mutation hook.
     ///
     /// Overwrites any previously-installed hook, same single-slot semantics
     /// as [`install_entity_type_validator`](Self::install_entity_type_validator).
@@ -680,12 +668,12 @@ impl KhiveRuntime {
 
     /// Snapshot of currently-installed pack edge rules.
     ///
-    /// This is the SAME composed rule set `validate_edge_relation_endpoints`
-    /// consults via `pack_rule_allows` when accepting/rejecting an edge (issue
-    /// #543). Public so pack-layer error-hint code (e.g.
-    /// `khive-pack-kg`'s `valid_relations_for_entity_pair`) can derive hints
-    /// from the exact source the validator uses, rather than maintaining a
-    /// separate hand-authored table that can drift out of sync (issue #60).
+    /// This is the same composed rule set `validate_edge_relation_endpoints`
+    /// consults via `pack_rule_allows` when accepting/rejecting an edge. Public
+    /// so pack-layer error-hint code (e.g. `khive-pack-kg`'s
+    /// `valid_relations_for_entity_pair`) can derive hints from the exact
+    /// source the validator uses, rather than maintaining a separate
+    /// hand-authored table that can drift out of sync.
     pub fn pack_edge_rules(&self) -> Vec<EdgeEndpointRule> {
         self.edge_rules
             .read()
@@ -732,8 +720,7 @@ impl KhiveRuntime {
     /// Includes both built-in lattice models and any custom embedders
     /// registered by packs via [`register_embedder`](Self::register_embedder).
     /// Useful for operations that must touch every model's storage (e.g.,
-    /// scoped vector deletion on note delete — internal review High 2 (PR #407)).
-    /// The default model is included.
+    /// scoped vector deletion on note delete). The default model is included.
     pub fn registered_embedding_model_names(&self) -> Vec<String> {
         self.embedder_registry
             .read()
@@ -754,16 +741,14 @@ impl KhiveRuntime {
     /// First call for any name loads the underlying service (cold start cost);
     /// subsequent calls are cheap (registry caches the `Arc`).
     pub async fn embedder(&self, name: &str) -> RuntimeResult<Arc<dyn EmbeddingService>> {
-        // Try to resolve as a lattice alias first (normalises "paraphrase" →
-        // "paraphrase-multilingual-minilm-l12-v2", etc.).  If that succeeds,
-        // use the canonical key; otherwise fall back to the literal name so
-        // custom providers registered with non-lattice names are reachable.
+        // Fall back to the literal name (not the alias table) so custom
+        // providers registered with non-lattice names stay reachable.
         let canonical_key = match parse_embedding_model_alias(name) {
             Some(model) => model.to_string(),
             None => name.to_owned(),
         };
-        // Clone the entry before releasing the lock so we don't hold a
-        // RwLockGuard across the async OnceCell initialisation (Send bound).
+        // Clone the entry so we don't hold the RwLockGuard across the
+        // async OnceCell initialisation (Send bound).
         let entry = {
             let registry = self.embedder_registry.read().map_err(|_| {
                 crate::RuntimeError::Internal("embedder registry lock poisoned".into())
@@ -1107,7 +1092,8 @@ mod tests {
         assert!(cfg.packs.contains(&"session".to_string()));
         assert!(cfg.packs.contains(&"git".to_string()));
         assert!(cfg.packs.contains(&"code".to_string()));
-        assert_eq!(cfg.packs.len(), 10);
+        assert!(cfg.packs.contains(&"workspace".to_string()));
+        assert_eq!(cfg.packs.len(), 11);
         if let Some(v) = prior {
             // SAFETY: single-threaded test cleanup; restores KHIVE_PACKS to its prior value.
             unsafe {
@@ -1152,10 +1138,10 @@ mod tests {
 
     #[test]
     fn runtime_config_from_khive_config_actor_id_does_not_override_default_namespace() {
-        // ADR-007 Rev 4 Rule 0: `[actor] id` must NOT set `default_namespace` —
-        // writes stay pinned to `local`. Note: a non-`'local'` actor.id IS folded
-        // into the default READ visible-set (Rule 3b), but that does not change
-        // default_namespace. This test asserts the write-routing invariant only.
+        // `[actor] id` must not set `default_namespace`: writes stay pinned to
+        // `local`. A non-`'local'` actor.id is folded into the default read
+        // visible-set, but that does not change default_namespace. This test
+        // asserts the write-routing invariant only.
         let base = RuntimeConfig {
             git_write: Default::default(),
             db_path: None,
@@ -1386,7 +1372,7 @@ mod tests {
 
     // ---- list_embedding_models tests ----
 
-    // ---- ADR-073: core_backend accessor tests ----
+    // ---- core_backend accessor tests ----
 
     /// Create a migrated in-memory backend (for tests that need raw Arc<StorageBackend>).
     fn migrated_memory_backend() -> Arc<StorageBackend> {
@@ -1458,7 +1444,7 @@ mod tests {
         );
     }
 
-    /// Decisive ADR-073 test: proves note→main and aux→secondary are each isolated.
+    /// Proves note→main and aux→secondary writes are each isolated.
     ///
     /// Backend A = main; backend B = secondary.
     /// rt_secondary is bound to B with core_backend = Some(A).
@@ -1473,7 +1459,6 @@ mod tests {
     async fn cross_backend_split_note_to_main_aux_to_secondary() {
         use khive_storage::{SqlStatement, SqlValue};
 
-        // Two independent in-memory SQLite databases.
         let main_arc = migrated_memory_backend();
         let secondary_arc = migrated_memory_backend();
 
@@ -1541,7 +1526,6 @@ mod tests {
 
         // ── Direction 2: aux write via rt_secondary.sql() lands in B, not A ──
 
-        // Create a test-only table in B and insert a sentinel row.
         {
             let mut writer = rt_secondary.sql().writer().await.expect("secondary writer");
             writer

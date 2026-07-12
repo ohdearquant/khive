@@ -1,7 +1,7 @@
 //! `resolve_reference`: the Layer-0 deterministic reference resolver from the
 //! "unified-verb" draft ADR (Slice 1 — resolver + ring).
 //!
-//! Turns a natural-language reference into an id through three ordered
+//! Turns a natural-language reference into an id through four ordered
 //! stages, never guessing among close candidates:
 //!
 //! 1. **Id-string passthrough.** A ref that already looks like a UUID or an
@@ -14,7 +14,12 @@
 //!    `NotFound` here, not an error — a caller resolving those uses `get`.
 //! 2. **Recently-referenced ring.** An exact (case-insensitive) or substring
 //!    match against this actor's ring (`reference_ring::ReferenceRing`).
-//! 3. **Hybrid-search fallback.** `KhiveRuntime::hybrid_search` over the
+//! 3. **Exact-name storage lookup.** A deterministic, case-sensitive match
+//!    against `entities.name` in the caller's namespace (`deleted_at IS
+//!    NULL`) — covers any entity that already exists but was never
+//!    created/get/updated/deleted/merged/linked by this actor in this
+//!    session, so stage 2's ring never saw it (#849).
+//! 4. **Hybrid-search fallback.** `KhiveRuntime::hybrid_search` over the
 //!    caller's namespace, ranked by RRF score.
 //!
 //! A single candidate clearing the stage's confidence bar resolves; multiple
@@ -24,6 +29,9 @@
 use std::str::FromStr;
 
 use uuid::Uuid;
+
+use khive_storage::types::PageRequest;
+use khive_storage::EntityFilter;
 
 use crate::error::{RuntimeError, RuntimeResult};
 use crate::operations::Resolved;
@@ -39,8 +47,7 @@ pub struct ReferenceCandidate {
 }
 
 /// Outcome of `resolve_reference`. Never a silent pick among close
-/// candidates (F7 of the unified-verb draft ADR) — `Ambiguous` always lists
-/// what it found instead of guessing.
+/// candidates: `Ambiguous` always lists what it found instead of guessing.
 #[derive(Clone, Debug, PartialEq)]
 pub enum ReferenceResolution {
     Resolved { id: Uuid, confidence: f64 },
@@ -53,13 +60,19 @@ const RING_EXACT_CONFIDENCE: f64 = 0.95;
 /// Ring-match confidence for a substring match (either direction).
 const RING_SUBSTRING_CONFIDENCE: f64 = 0.7;
 /// A single ring candidate auto-resolves only at or above this bar; below
-/// it, the sole candidate is still surfaced, just as `Ambiguous` (never
-/// silently accepted, never silently dropped — see F7). Ring-stage only:
-/// ring scores are fixed constants on this same 0..1 scale
-/// (`RING_EXACT_CONFIDENCE` / `RING_SUBSTRING_CONFIDENCE`), so comparing them
-/// against a fixed bar is meaningful. The search stage below uses its own,
-/// deliberately separate rule — see `SEARCH_RESOLVED_CONFIDENCE`.
+/// it the candidate is still surfaced as `Ambiguous` rather than silently
+/// accepted or dropped. Ring scores are fixed constants on a 0..1 scale, so
+/// a fixed bar is meaningful here: the search stage below needs a
+/// different rule (`SEARCH_RESOLVED_CONFIDENCE`) because RRF scores aren't
+/// on that scale.
 const RING_AUTO_RESOLVE_CONFIDENCE: f64 = 0.7;
+/// Confidence for a stage-3 exact-name storage match: a deterministic,
+/// case-sensitive equality on `entities.name` — stronger evidence than the
+/// ring's case-insensitive session cache (`RING_EXACT_CONFIDENCE`), so it
+/// sits above both ring bands, but still below the absolute certainty of an
+/// id-string passthrough (1.0), which the caller supplied directly rather
+/// than by name.
+const EXACT_NAME_CONFIDENCE: f64 = 0.98;
 /// Hybrid-search fallback: the top hit auto-resolves over a runner-up only
 /// when it leads by at least this ratio — RRF scores are not on a fixed
 /// 0..1 confidence scale, so a fixed absolute bar can't express "decisively
@@ -68,18 +81,12 @@ const RING_AUTO_RESOLVE_CONFIDENCE: f64 = 0.7;
 const SEARCH_MARGIN_RATIO: f64 = 2.0;
 /// Hybrid-search hits below this score never enter the candidate set at all.
 const SEARCH_SCORE_FLOOR: f64 = 0.0;
-/// Confidence reported on a search-stage `Resolved` outcome. NOT the raw RRF
-/// score — RRF is `sum 1/(k + rank)` (`khive-fusion::rrf`), so a rank-1
-/// single-source hit scores ~1/61 (~0.0164) and a strong two-source hit
-/// ~2/61 (~0.0328): comparing that against a 0..1 "confidence" bar the way
-/// the ring stage does would make the search fallback functionally never
-/// resolve (the bug this constant fixes). Instead, a lone hybrid-search
-/// candidate (nothing to be ambiguous against) or a decisive-margin winner
-/// (see `SEARCH_MARGIN_RATIO`) resolves at this fixed, documented
-/// search-stage confidence — deliberately below both ring bands, so callers
-/// can distinguish "the ring recognized this" from "search picked this out"
-/// by confidence alone. The raw RRF value is never discarded: it is exactly
-/// what `ReferenceCandidate.score` carries in `Ambiguous` listings.
+/// Confidence reported on a search-stage `Resolved` outcome: not the raw
+/// RRF score, which lives on a much smaller scale (`sum 1/(k + rank)`, e.g.
+/// ~0.016-0.033) and would never clear a 0..1 confidence bar. Fixed below
+/// both ring bands so callers can tell "the ring recognized this" from
+/// "search picked this out" by confidence alone; the raw RRF value is still
+/// preserved in `ReferenceCandidate.score` for `Ambiguous` listings.
 const SEARCH_RESOLVED_CONFIDENCE: f64 = 0.6;
 
 /// Resolve one natural-language reference for `token`'s actor.
@@ -103,20 +110,13 @@ pub async fn resolve_reference(
         return Ok(ReferenceResolution::NotFound);
     }
 
-    // Stage 1: id-string passthrough (UUID / 8+ hex prefix) — the existing
-    // by-ID path, never reimplemented. A ref shaped like an id but absent
-    // from storage is NotFound, not a fall-through to ring/search: the
-    // caller named a specific id, so a miss there is the true answer.
-    //
-    // Scope: entity ids only, both branches identically (review finding,
-    // 2026-07-09 fix round). `resolve_by_id` alone (entity + note) and
-    // `resolve_prefix_unfiltered` alone (entity + note + event + edge) used
-    // to disagree — a graph edge's full UUID returned `NotFound` while its
-    // short prefix resolved. The ring is entity-only by the same S1 contract
-    // (`reference_ring::substrate_admits_as_entity`), so id-string
-    // passthrough is narrowed to match: an edge or event id-string is
-    // `NotFound` here regardless of whether it arrived full or as a prefix.
-    // A caller that needs to resolve a non-entity id already has `get`.
+    // Stage 1: id-string passthrough (UUID / 8+ hex prefix) via the existing
+    // by-ID path. A ref shaped like an id but absent from storage is
+    // NotFound, not a fallthrough to ring/search: the caller named a
+    // specific id, so a miss there is the true answer. Scoped to entity ids
+    // only (both full-UUID and prefix forms) to match the ring's entity-only
+    // contract (`reference_ring::substrate_admits_as_entity`); a non-entity
+    // id-string is `NotFound` here: callers needing those already have `get`.
     if let Ok(uuid) = Uuid::from_str(trimmed) {
         return match runtime.resolve_by_id(token, uuid).await? {
             Some(Resolved::Entity(_)) => Ok(ReferenceResolution::Resolved {
@@ -209,7 +209,18 @@ pub async fn resolve_reference(
         return Ok(resolution);
     }
 
-    // Stage 3: hybrid-search fallback over the namespace.
+    // Stage 3: exact-name storage lookup (#849) — a deterministic,
+    // case-sensitive match against `entities.name` in the caller's
+    // namespace, run before the hybrid-search fallback so an existing exact
+    // name always resolves regardless of FTS ranking, RRF score, or whether
+    // this actor's session ever referenced the entity (the ring's blind
+    // spot). Single match resolves; multiple exact matches are `Ambiguous`;
+    // none falls through to hybrid search unchanged.
+    if let Some(resolution) = exact_name_match(runtime, token, trimmed, entity_kind).await? {
+        return Ok(resolution);
+    }
+
+    // Stage 4: hybrid-search fallback over the namespace.
     let hits = runtime
         .hybrid_search(
             token,
@@ -279,6 +290,77 @@ fn resolve_from_candidates(candidates: Vec<ReferenceCandidate>) -> Option<Refere
         }
         _ => Some(ReferenceResolution::Ambiguous { candidates }),
     }
+}
+
+/// Stage 3 of `resolve_reference` (#849): a deterministic, case-sensitive
+/// exact match against `entities.name`, scoped to `token.namespace()` (the
+/// same single-namespace default the rest of this pipeline and the sibling
+/// by-name lookup in `khive-pack-kg`'s `resolve_name_async` use) and to
+/// `entity_kind` when the caller filtered by one. `query_entities` already
+/// excludes soft-deleted rows (`deleted_at IS NULL` is baked into every
+/// query — see `khive-db::stores::entity::build_entity_where`), so no
+/// separate filter is needed here. Returns `None` (fall through to the next
+/// stage) when nothing matches; `Some(Resolved)` on a single hit; and
+/// `Some(Ambiguous)` when the name is not unique.
+async fn exact_name_match(
+    runtime: &KhiveRuntime,
+    token: &NamespaceToken,
+    name: &str,
+    entity_kind: Option<&str>,
+) -> RuntimeResult<Option<ReferenceResolution>> {
+    let filter = EntityFilter {
+        name_exact: Some(name.to_string()),
+        kinds: entity_kind.map(|k| vec![k.to_string()]).unwrap_or_default(),
+        ..EntityFilter::default()
+    };
+    // A storage-level `name = ?` predicate (not `name_prefix` + in-memory
+    // filter) so a namespace with many newer case variants of `name` can
+    // never page the exact target out from under a `created_at DESC` sort
+    // (#849, #852) — every row this query returns already equals `name`.
+    // The page is small (10, not 1), but the zero/one/many decision is made
+    // from `page.total` (the storage-computed COUNT(*) under the same
+    // predicate), never from `page.items.len()` — with 11+ byte-identical
+    // exact names the fetched page is still only 10 rows, and deciding from
+    // its length alone would under-report cardinality. `Ambiguous.candidates`
+    // is a bounded sample of up to 10 of the `page.total` matches, not the
+    // complete set — the variant carries no total field, so callers must not
+    // assume `candidates.len() == page.total` (#852 review r3).
+    let page = runtime
+        .entities(token)?
+        .query_entities(
+            token.namespace().as_str(),
+            filter,
+            PageRequest {
+                offset: 0,
+                limit: 10,
+            },
+        )
+        .await
+        .map_err(RuntimeError::Storage)?;
+
+    let total = page.total.unwrap_or(page.items.len() as u64);
+
+    let exact: Vec<ReferenceCandidate> = page
+        .items
+        .into_iter()
+        .map(|e| ReferenceCandidate {
+            id: e.id,
+            name: Some(e.name),
+            score: EXACT_NAME_CONFIDENCE,
+        })
+        .collect();
+
+    Ok(match total {
+        0 => None,
+        1 => exact
+            .into_iter()
+            .next()
+            .map(|top| ReferenceResolution::Resolved {
+                id: top.id,
+                confidence: EXACT_NAME_CONFIDENCE,
+            }),
+        _ => Some(ReferenceResolution::Ambiguous { candidates: exact }),
+    })
 }
 
 fn is_hex_prefix(s: &str) -> bool {
@@ -437,5 +519,98 @@ mod tests {
             .await
             .expect("resolve_reference");
         assert_eq!(resolution, ReferenceResolution::NotFound);
+    }
+
+    // Regression for #849/#852: the stage-3 exact-name lookup used to filter
+    // `name_prefix` (`LIKE 'RoLoRA%'`) in memory, and `query_entities` ranks
+    // a `name_prefix` page by `CASE WHEN LOWER(name) = prefix THEN 0 ELSE 1
+    // END, created_at DESC`. Case-insensitive variants of the target name
+    // tie for priority 0 with the true exact match, so 100+ *newer*
+    // lowercase variants can fill the `LIMIT 100` page and page the older,
+    // case-exact target out entirely — the stage then falls through to
+    // hybrid search instead of resolving deterministically. The fix issues a
+    // storage-level `name = ?` (binary) predicate instead, so decoys that
+    // merely match case-insensitively never enter the result set at all.
+    #[tokio::test]
+    async fn exact_name_stage_survives_many_newer_case_variant_decoys() {
+        let rt = KhiveRuntime::memory().expect("in-memory runtime");
+        let token = actor_token("resolver-test");
+        let ring = ReferenceRing::new();
+
+        let target = rt
+            .create_entity(&token, "concept", None, "RoLoRA", None, None, vec![])
+            .await
+            .expect("create target entity");
+
+        // Case variants of the same name, not suffixed variants: SQLite's
+        // `LIKE` is case-insensitive for ASCII, so a `rolora`-named decoy
+        // still matches the `LIKE 'RoLoRA%'` pattern the buggy `name_prefix`
+        // stage used, and the exact-match-ranking `CASE WHEN LOWER(name) =
+        // ...` ties every one of these decoys with the true target at
+        // priority 0 — leaving `created_at DESC` as the only tiebreak.
+        let decoy_cases = ["rolora", "ROLORA", "RoLoRa", "roLORA"];
+        for i in 0..120 {
+            rt.create_entity(
+                &token,
+                "concept",
+                None,
+                decoy_cases[i % decoy_cases.len()],
+                None,
+                None,
+                vec![],
+            )
+            .await
+            .expect("create decoy entity");
+        }
+
+        let resolution = resolve_reference(&rt, &ring, &token, "RoLoRA", 5, None)
+            .await
+            .expect("resolve_reference");
+        assert_eq!(
+            resolution,
+            ReferenceResolution::Resolved {
+                id: target.id,
+                confidence: EXACT_NAME_CONFIDENCE,
+            }
+        );
+    }
+
+    /// #852 review r3: the zero/one/many decision must come from the
+    /// storage-computed `page.total` (a full `COUNT(*)` under the exact-name
+    /// predicate), not from `page.items.len()`, which the stage's own
+    /// `LIMIT 10` caps regardless of true cardinality. 11 byte-identical
+    /// exact names exceed that page limit, so the fetched page can only ever
+    /// carry 10 rows — `Ambiguous` must still fire (storage says 11 total,
+    /// not the truncated 10), and the returned `candidates` are a bounded
+    /// sample of the match set, not its entirety. That truncation is an
+    /// intentional, documented contract of this stage, not a bug: this test
+    /// pins both halves so a future change can't silently drop one.
+    #[tokio::test]
+    async fn exact_name_ambiguous_decision_uses_storage_total_not_page_len() {
+        let rt = KhiveRuntime::memory().expect("in-memory runtime");
+        let token = actor_token("resolver-test");
+        let ring = ReferenceRing::new();
+
+        for _ in 0..11 {
+            rt.create_entity(&token, "concept", None, "DupeExactName", None, None, vec![])
+                .await
+                .expect("create duplicate-named entity");
+        }
+
+        let resolution = resolve_reference(&rt, &ring, &token, "DupeExactName", 5, None)
+            .await
+            .expect("resolve_reference");
+
+        match resolution {
+            ReferenceResolution::Ambiguous { candidates } => {
+                assert_eq!(
+                    candidates.len(),
+                    10,
+                    "candidate set is a bounded 10-row sample of the 11 storage matches, \
+                     not the complete set"
+                );
+            }
+            other => panic!("expected Ambiguous driven by storage total (11), got {other:?}"),
+        }
     }
 }

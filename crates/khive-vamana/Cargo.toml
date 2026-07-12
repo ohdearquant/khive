@@ -3,11 +3,15 @@ name = "khive-vamana"
 description = "Batch-built Vamana ANN index for pre-normalized vector search."
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
 keywords.workspace = true
 categories.workspace = true
+
+[lib]
+bench = false
 
 [dependencies]
 rayon = { workspace = true }
@@ -17,7 +21,7 @@ rand = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }
 blake3 = { workspace = true }
-khive-quant = { version = "0.3.0", path = "../khive-quant" }
+khive-quant = { version = "0.4.0", path = "../khive-quant" }
 
 [dev-dependencies]
 blake3 = { workspace = true }

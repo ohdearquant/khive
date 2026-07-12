@@ -1129,6 +1129,177 @@ async fn test_search_any_term_mode_with_dollar_does_not_crash() {
     assert_eq!(result.unwrap().len(), 1);
 }
 
+/// Slash-bearing query (e.g. `GB/s throughput measurements`) must not crash the FTS5
+/// leg. `/` was previously untouched by `sanitize_fts5_query`, reaching FTS5 raw and
+/// producing `fts5: syntax error near "/"`.
+#[tokio::test]
+async fn test_search_with_slash_does_not_crash_and_matches() {
+    let store = setup_memory_store("slash_query");
+
+    store
+        .upsert_document(make_document(
+            Uuid::new_v4(),
+            "bandwidth benchmark",
+            "measured 900 GB/s throughput on the device",
+        ))
+        .await
+        .unwrap();
+
+    let result = store
+        .search(TextSearchRequest {
+            query: "GB/s throughput".to_string(),
+            mode: TextQueryMode::Plain,
+            filter: Some(ns_filter("test_ns")),
+            top_k: 10,
+            snippet_chars: 64,
+        })
+        .await;
+    assert!(
+        result.is_ok(),
+        "slash query must not crash FTS5, got: {:?}",
+        result.err()
+    );
+    assert_eq!(
+        result.unwrap().len(),
+        1,
+        "slash query must still return the seeded matching document"
+    );
+}
+
+/// AnyTerm mode (used by memory.recall fanout) must also survive a slash-bearing query.
+#[tokio::test]
+async fn test_search_any_term_mode_with_slash_does_not_crash() {
+    let store = setup_memory_store("slash_any_term_query");
+
+    store
+        .upsert_document(make_document(
+            Uuid::new_v4(),
+            "bandwidth benchmark",
+            "measured 900 GB/s throughput on the device",
+        ))
+        .await
+        .unwrap();
+
+    let result = store
+        .search(TextSearchRequest {
+            query: "GB/s".to_string(),
+            mode: TextQueryMode::AnyTerm,
+            filter: Some(ns_filter("test_ns")),
+            top_k: 10,
+            snippet_chars: 64,
+        })
+        .await;
+    assert!(
+        result.is_ok(),
+        "AnyTerm slash query must not crash FTS5, got: {:?}",
+        result.err()
+    );
+    assert_eq!(result.unwrap().len(), 1);
+}
+
+/// Phrase mode must preserve slash punctuation so the production trigram
+/// tokenizer matches the literal substring rather than a space-split phrase.
+#[tokio::test]
+async fn test_search_trigram_phrase_with_slash_returns_exact_literal_id() {
+    let store = setup_trigram_store("trigram_phrase_slash_literal");
+    let target_id = Uuid::new_v4();
+    let spaced_distractor_id = Uuid::new_v4();
+
+    store
+        .upsert_document(make_document(
+            target_id,
+            "slash literal",
+            "measured 900 GB/s throughput on the device",
+        ))
+        .await
+        .unwrap();
+    store
+        .upsert_document(make_document(
+            spaced_distractor_id,
+            "space-separated distractor",
+            "measured 900 GB s throughput on the device",
+        ))
+        .await
+        .unwrap();
+
+    let hits = store
+        .search(TextSearchRequest {
+            query: "GB/s throughput".to_string(),
+            mode: TextQueryMode::Phrase,
+            filter: Some(ns_filter("test_ns")),
+            top_k: 10,
+            snippet_chars: 64,
+        })
+        .await
+        .unwrap();
+    let hit_ids: std::collections::HashSet<_> = hits.iter().map(|hit| hit.subject_id).collect();
+
+    assert_eq!(
+        hit_ids,
+        std::collections::HashSet::from([target_id]),
+        "trigram Phrase query must return only its slash-bearing literal; got {hit_ids:?}"
+    );
+}
+
+async fn assert_slash_query_excludes_merged_alias(store: Fts5TextSearch, tokenizer: &str) {
+    let slash_id = Uuid::new_v4();
+    let merged_distractor_id = Uuid::new_v4();
+
+    store
+        .upsert_document(make_document(
+            slash_id,
+            "slash spelling",
+            "the link sustained 900 GB/s transfer rates",
+        ))
+        .await
+        .unwrap();
+    store
+        .upsert_document(make_document(
+            merged_distractor_id,
+            "merged spelling",
+            "the link sustained 900 GBs transfer rates",
+        ))
+        .await
+        .unwrap();
+
+    for mode in [
+        TextQueryMode::Plain,
+        TextQueryMode::AnyTerm,
+        TextQueryMode::Phrase,
+    ] {
+        let hits = store
+            .search(TextSearchRequest {
+                query: "GB/s".to_string(),
+                mode: mode.clone(),
+                filter: Some(ns_filter("test_ns")),
+                top_k: 10,
+                snippet_chars: 64,
+            })
+            .await
+            .unwrap();
+        let hit_ids: std::collections::HashSet<_> = hits.iter().map(|hit| hit.subject_id).collect();
+
+        assert_eq!(
+            hit_ids,
+            std::collections::HashSet::from([slash_id]),
+            "{tokenizer} {mode:?} GB/s query must exclude GBs alias {merged_distractor_id}; got {hit_ids:?}"
+        );
+    }
+}
+
+/// The legacy merged alternative applies only to the pre-#397 hyphen/dot
+/// behavior. A slash query must not match the unrelated slashless spelling.
+#[tokio::test]
+async fn test_search_slash_query_excludes_merged_alias_all_modes_and_tokenizers() {
+    assert_slash_query_excludes_merged_alias(
+        setup_memory_store("unicode61_slash_alias"),
+        "unicode61",
+    )
+    .await;
+    assert_slash_query_excludes_merged_alias(setup_trigram_store("trigram_slash_alias"), "trigram")
+        .await;
+}
+
 #[tokio::test]
 async fn test_score_is_bounded() {
     let store = setup_memory_store("score_bounds");
@@ -1707,6 +1878,55 @@ async fn term_stats_missing_term_has_zero_df() {
         .unwrap();
     assert_eq!(stats.len(), 1);
     assert_eq!(stats[0].document_frequency, 0);
+}
+
+async fn assert_slash_term_stats_exclude_merged_alias(store: Fts5TextSearch, tokenizer: &str) {
+    store
+        .upsert_document(make_document(
+            Uuid::new_v4(),
+            "slash spelling",
+            "the link sustained 900 GB/s transfer rates",
+        ))
+        .await
+        .unwrap();
+    store
+        .upsert_document(make_document(
+            Uuid::new_v4(),
+            "merged spelling",
+            "the link sustained 900 GBs transfer rates",
+        ))
+        .await
+        .unwrap();
+
+    let stats = store
+        .term_stats(TextTermStatsRequest {
+            terms: vec!["GB/s".to_string()],
+            filter: Some(ns_filter("test_ns")),
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(stats.len(), 1);
+    assert_eq!(stats[0].sanitized_term, "\"GB/s\"");
+    assert_eq!(
+        stats[0].document_frequency, 1,
+        "{tokenizer} term stats must count only the slash-bearing document"
+    );
+    assert_eq!(stats[0].document_count, 2);
+}
+
+#[tokio::test]
+async fn term_stats_slash_literal_excludes_merged_alias_all_tokenizers() {
+    assert_slash_term_stats_exclude_merged_alias(
+        setup_memory_store("unicode61_term_stats_slash_alias"),
+        "unicode61",
+    )
+    .await;
+    assert_slash_term_stats_exclude_merged_alias(
+        setup_trigram_store("trigram_term_stats_slash_alias"),
+        "trigram",
+    )
+    .await;
 }
 
 /// Dropping the FTS5 virtual table makes every per-item INSERT in the batch

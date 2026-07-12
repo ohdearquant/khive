@@ -16,21 +16,17 @@ use khive_storage::types::{
 use khive_storage::EntityFilter;
 use khive_types::SubstrateKind;
 
-// Fault-injection point for backfill reader errors. When set, the next
-// `backfill_missing_embeddings` call substitutes a `StorageError::Pool` for the
-// result of `sql.reader().await`, then resets to false. Available in test builds
-// and the `fault-injection` feature for integration testing.
+// Fault-injection flag for backfill reader errors (test / `fault-injection` builds only).
 #[cfg(any(test, feature = "fault-injection"))]
 std::thread_local! {
     static BACKFILL_READER_FAIL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-/// Arm the backfill reader fault injection. When set, the next call to
-/// `backfill_missing_embeddings` will substitute a `StorageError::Pool` for the
-/// result of `sql.reader().await`, then reset the flag. The injected error
-/// passes through `map_err(RuntimeError::Storage)?` — the same path as a real
-/// reader failure — so it exercises the fail-closed guard rather than bypassing it.
-/// Available when compiled with `cfg(test)` or `feature = "fault-injection"`.
+/// Arm the backfill reader fault injection: the next `backfill_missing_embeddings`
+/// call substitutes a `StorageError::Pool` for `sql.reader().await`'s result, then
+/// resets the flag. The injected error passes through the same
+/// `map_err(RuntimeError::Storage)?` path as a real reader failure, exercising the
+/// fail-closed guard rather than bypassing it.
 #[cfg(any(test, feature = "fault-injection"))]
 pub fn arm_backfill_reader_fail() {
     BACKFILL_READER_FAIL.with(|c| c.set(true));
@@ -56,11 +52,10 @@ pub enum SearchSource {
 
 /// RRF constant. Controls how strongly top ranks dominate.
 ///
-/// The original paper uses k=60 for large-scale document retrieval. For a knowledge
-/// graph with tens to thousands of entities, k=60 over-compresses scores into a
-/// narrow band (rank 1 ≈ 0.016, rank 10 ≈ 0.014, spread ≈ 0.002). k=10 produces
+/// The paper's k=60 over-compresses scores at KG scale (tens–thousands of
+/// entities): rank 1 ≈ 0.016, rank 10 ≈ 0.014, spread ≈ 0.002. k=10 gives
 /// rank 1 ≈ 0.091, rank 10 ≈ 0.050, spread ≈ 0.041 — 20× better discrimination,
-/// making dedup-before-create reliable at graph sizes of 50–2700 entities.
+/// which dedup-before-create needs at graph sizes of 50–2700 entities.
 const RRF_K: usize = 10;
 
 /// Candidates pulled per path before fusion. Higher = better recall, more work.
@@ -95,9 +90,6 @@ impl KhiveRuntime {
     ///
     /// Returns `UnknownModel` if `model_name` is not in the embedder registry.
     pub async fn embed_with_model(&self, model_name: &str, text: &str) -> RuntimeResult<Vec<f32>> {
-        // Try to resolve as a lattice alias. If that succeeds, use the enum to
-        // inform the service which model to run. If not, fall through to the
-        // custom-provider path — custom services ignore the EmbeddingModel arg.
         let model = parse_embedding_model_alias(model_name);
         let service = self.embedder(model_name).await?;
         let emb_model = model.unwrap_or_default();
@@ -352,9 +344,6 @@ impl KhiveRuntime {
     ///   superset of the given JSON object survive. Applied BEFORE truncation.
     ///
     /// `limit` caps the final returned list; internally pulls `limit * 4` candidates per path.
-    /// The fused candidate set is kept untruncated until after the alive + kind + tag +
-    /// properties filter so that matching hits ranked below `limit` in the raw fusion
-    /// still surface when higher-ranked candidates are excluded by any filter.
     ///
     /// # Cross-namespace visibility (entity search — primary namespace only; deferred)
     ///
@@ -364,13 +353,12 @@ impl KhiveRuntime {
     /// Rationale: each namespace owns a separate FTS table (`fts_entities_{ns}`)
     /// and a separate ANN index instance. Cross-namespace entity-search fanout
     /// requires iterating over every visible namespace's store, issuing parallel
-    /// search requests, and fusing the results — this is deferred (entity-search
-    /// cross-namespace fanout is the outstanding follow-up).
+    /// search requests, and fusing the results: this is deferred.
     ///
-    /// Note: this is distinct from memory recall's cross-namespace fanout, which
-    /// ships in ADR-007 Rev 4 (`memory.recall` iterates `visible_namespaces` across
-    /// both the FTS and vector legs). Entity search fanout is the remaining deferred
-    /// piece; memory recall fanout is not deferred.
+    /// Note: this is distinct from `memory.recall`'s cross-namespace fanout, which
+    /// already iterates `visible_namespaces` across both the FTS and vector legs.
+    /// Entity search fanout is the remaining deferred piece; memory recall fanout
+    /// is not deferred.
     ///
     /// The `visible_ns` list is forwarded in the `TextFilter.namespaces` field,
     /// which limits results to those namespaces within the primary store. Because
@@ -399,12 +387,9 @@ impl KhiveRuntime {
             .iter()
             .map(|ns| ns.as_str().to_owned())
             .collect();
-        // FTS5 parser syntax errors (#388, #389 round-2 High): sanitize_fts5_query
-        // already strips known-unsafe FTS5 metacharacters, but if the lexical
-        // leg still errors at runtime on residual punctuation the sanitizer
-        // does not strip, per #569 this now fails loud instead of degrading
-        // to vector-only fusion. Errors from any other leg (vector search,
-        // entity hydration) still propagate normally.
+        // sanitize_fts5_query strips known-unsafe FTS5 metacharacters up front, but if
+        // the lexical leg still errors at runtime on residual punctuation the sanitizer
+        // doesn't strip, this fails loud instead of degrading to vector-only fusion.
         let text_search_result = self
             .text(token)?
             .search(TextSearchRequest {
@@ -437,17 +422,13 @@ impl KhiveRuntime {
             Vec::new()
         };
 
-        // Fuse without truncating: keep the full candidate pool through the
-        // alive/kind/tag/property filter so matching hits below rank `limit`
-        // aren't lost when higher-ranked candidates are excluded.
+        // Keep the full candidate pool (untruncated) through the alive/kind/tag/property
+        // filter below, so matching hits ranked below `limit` in the raw fusion aren't
+        // lost when higher-ranked candidates get excluded by a filter.
         let mut fused = rrf_fuse(text_hits, vector_hits, candidates as usize, query_text);
 
-        // Filter to alive entities (and optionally to a specific kind, tags, or
-        // properties). A single query fetches all alive IDs that match the kind
-        // and tag constraints from the fused set; any ID absent has been
-        // soft-deleted or doesn't match. The SQL-level `tags_any` filter is
-        // pushed into `query_entities`; properties filtering (no SQL column)
-        // is applied at the Rust level using the entity records already fetched.
+        // tags_any has a SQL column and is pushed into query_entities; properties
+        // filtering has no SQL column and is applied in Rust below on the fetched records.
         if !fused.is_empty() {
             let candidate_ids: Vec<Uuid> = fused.iter().map(|h| h.entity_id).collect();
             let alive_page = self
@@ -468,13 +449,11 @@ impl KhiveRuntime {
                     },
                 )
                 .await?;
-            // Keep entity metadata to enrich hits that had no FTS5 title/snippet,
-            // and to apply the properties filter before truncation.
             let mut entity_meta: HashMap<Uuid, (String, Option<String>)> = HashMap::new();
             let mut alive: HashSet<Uuid> = HashSet::new();
             for e in alive_page.items {
-                // Apply properties predicate here — before adding to the alive set —
-                // so that non-matching candidates are dropped before truncation.
+                // Drop non-matching candidates here, before the alive set is built,
+                // so they're excluded ahead of truncation.
                 if let Some(pf) = properties_filter {
                     if !entity_props_match(e.properties.as_ref(), pf) {
                         continue;
@@ -591,13 +570,12 @@ impl KhiveRuntime {
         let mut total_backfilled = 0u64;
 
         for model_name in &model_names {
-            // Derive the vec table name from the model name (must match vec_model_key logic).
+            // Must match vec_model_key's naming logic.
             let vec_table = format!("vec_{}", sanitize_key(model_name));
 
             // --- Entities: embed description where no vector entry exists ---
-            // Loop until a batch returns fewer than PAGE_SIZE rows. Because the query uses
-            // NOT IN (SELECT subject_id FROM vec_table ...), each successfully inserted row is
-            // excluded from subsequent pages — no OFFSET needed.
+            // Each inserted row satisfies the NOT IN (SELECT subject_id FROM vec_table ...)
+            // clause going forward, so no OFFSET is needed between pages.
             const PAGE_SIZE: usize = 500;
             let mut entity_total = 0usize;
             loop {
@@ -714,9 +692,8 @@ impl KhiveRuntime {
             let note_store = self.notes(token).ok();
             let mut note_total = 0usize;
             loop {
-                // Select only the id here; the full Note is fetched below so that
-                // note_fts_document receives all fields (name, properties, updated_at)
-                // and produces a parity-correct document rather than a stripped one.
+                // Only the id is selected here; the full Note is fetched below so
+                // note_fts_document gets all fields and stays parity-correct.
                 let note_sql = SqlStatement {
                     sql: format!(
                         "SELECT id FROM notes \
@@ -772,9 +749,6 @@ impl KhiveRuntime {
                         continue;
                     };
 
-                    // Fetch the full Note so that note_fts_document has all fields
-                    // (name, properties, updated_at) — prevents overwriting a correct
-                    // FTS row with a stripped content-only document.
                     let note = match &note_store {
                         Some(store) => match store.get_note(id).await {
                             Ok(Some(n)) => n,
@@ -1288,7 +1262,7 @@ mod tests {
         assert_eq!(embeddings[0].len(), model.dimensions());
     }
 
-    // ---- hybrid_search enrichment (issue #147 / #160) ----
+    // ---- hybrid_search enrichment ----
 
     #[tokio::test]
     async fn hybrid_search_entity_hit_has_title() {
@@ -1320,13 +1294,10 @@ mod tests {
         );
     }
 
-    /// #388 regression: `hybrid_search` must not hard-fail on a query containing FTS5
-    /// metacharacters like `$` (e.g. the DSL doc query `$prev.id`). After this test was
-    /// first written, `sanitize_fts5_query` (khive-db) already strips `$`, so this alone
-    /// takes the `Ok` path and does not exercise the runtime-level fail-open `Err` arm
-    /// (PR #389 internal review round 1 Medium finding) — it stays as a sanitizer-path regression;
-    /// see `hybrid_search_with_residual_fts5_char_degrades_to_vector_only` below for the
-    /// fail-open-branch regression.
+    /// `hybrid_search` must not hard-fail on a query containing FTS5 metacharacters
+    /// like `$` (e.g. the DSL doc query `$prev.id`). `sanitize_fts5_query` (khive-db)
+    /// strips `$`, so this exercises the sanitizer path and takes the `Ok` arm; see
+    /// `hybrid_search_with_residual_fts5_char_fails_loud` below for the fail-loud arm.
     #[tokio::test]
     async fn hybrid_search_with_dollar_sign_query_does_not_error() {
         let rt = KhiveRuntime::memory().unwrap();
@@ -1354,14 +1325,11 @@ mod tests {
         );
     }
 
-    /// #569 regression: unlike `$`, `@` is NOT stripped by `sanitize_fts5_query`
-    /// (by design — the sanitizer stays minimal per #388 scope). SQLite FTS5's
-    /// bareword parser still rejects `@` unconditionally, so this query reaches
-    /// the runtime-level `Err` arm in `hybrid_search`, which must now fail loud
-    /// (`RuntimeError::InvalidInput`) instead of silently degrading to
-    /// vector-only fusion as it did before #569. This assertion fails against
-    /// the pre-#569 fail-open behavior (which returned `Ok` here) and passes
-    /// once the FTS leg fails closed.
+    /// Unlike `$`, `@` is NOT stripped by `sanitize_fts5_query` (the sanitizer stays
+    /// minimal by design). SQLite FTS5's bareword parser still rejects `@`
+    /// unconditionally, so this query reaches the runtime-level `Err` arm in
+    /// `hybrid_search`, which must fail loud (`RuntimeError::InvalidInput`) instead
+    /// of silently degrading to vector-only fusion.
     #[tokio::test]
     async fn hybrid_search_with_residual_fts5_char_fails_loud() {
         let rt = KhiveRuntime::memory().unwrap();
@@ -1394,9 +1362,9 @@ mod tests {
         );
     }
 
-    // ---- issue #225 regression: predicate pushdown before truncation ----
+    // ---- predicate pushdown before truncation ----
 
-    /// Regression test for issue #225 (entity branch).
+    /// Entity-branch tag-filter regression.
     ///
     /// Scenario: `limit=1`, tag_filter=["target-tag"]. Two entities are inserted:
     ///   - "decoy_alpha_beta_gamma": many query tokens → ranks 1 in FTS (dominates).
@@ -1404,14 +1372,9 @@ mod tests {
     ///   - "alpha_beta_gamma target": fewer query tokens → ranks 2 in FTS.
     ///     HAS "target-tag".
     ///
-    /// Without predicate pushdown: `fused.truncate(1)` keeps only the decoy. The
-    /// tag-matching entity is invisible. The test asserts the matching entity IS
-    /// returned — this assertion fails on the unfixed code (where tags_any is not
-    /// passed into `query_entities`) and passes after the fix.
-    ///
-    /// Isomorphism: reverting `tags_any: tags_any.to_vec()` in the `EntityFilter`
-    /// inside `hybrid_search` re-breaks this test (the decoy survives `retain` and
-    /// occupies the single slot, dropping the target).
+    /// Without predicate pushdown, `fused.truncate(1)` keeps only the decoy and the
+    /// tag-matching entity is invisible: this requires `tags_any` to be passed into
+    /// `query_entities`'s `EntityFilter` so the decoy is excluded before truncation.
     #[tokio::test]
     async fn hybrid_search_tag_filter_pushed_before_truncation() {
         let rt = KhiveRuntime::memory().unwrap();
@@ -1472,7 +1435,7 @@ mod tests {
         );
     }
 
-    /// Regression test for issue #225 (entity branch, properties predicate).
+    /// Entity-branch properties-filter regression (analogous to the tag-filter test above).
     ///
     /// Scenario: `limit=1`, properties_filter={{"domain": "target"}}. Two entities:
     ///   - decoy: high FTS rank, properties {{"domain": "other"}}.
@@ -1532,7 +1495,7 @@ mod tests {
         );
     }
 
-    // ---- embed intent tests (issue #93) ----
+    // ---- embed intent tests ----
 
     #[test]
     #[ignore = "loads ~80 MB model; run with --include-ignored"]
@@ -1604,7 +1567,7 @@ mod tests {
         );
     }
 
-    // ---- M-07 regression: backfill reader error must be propagated, not swallowed ----
+    // ---- backfill reader error must be propagated, not swallowed ----
 
     use crate::embedder_registry::EmbedderProvider;
     use lattice_embed::EmbeddingService;
@@ -1649,17 +1612,13 @@ mod tests {
         }
     }
 
-    /// Regression test for M-07: `backfill_missing_embeddings` must propagate a
-    /// reader error rather than treating it as "zero rows to embed" (silent swallow).
-    ///
-    /// Before the fix: `Err(_) => vec![]` caused the caller to receive `Ok(0)`,
-    /// silently skipping all embeddings. After the fix: the error is returned via `?`.
+    /// `backfill_missing_embeddings` must propagate a reader error rather than
+    /// treating it as "zero rows to embed" (a silent `Err(_) => vec![]` would
+    /// return `Ok(0)` and skip all embeddings without any signal).
     ///
     /// The fault injection substitutes a `StorageError::Pool` for the result of
-    /// `sql.reader().await` (i.e., the error originates AT the reader boundary, not
-    /// before it), so the test exercises the exact `map_err(RuntimeError::Storage)?`
-    /// lines that the fix introduced. Reverting those lines to `unwrap_or_default()`
-    /// would swallow the injected error and cause this test to fail.
+    /// `sql.reader().await`, exercising the `map_err(RuntimeError::Storage)?` path;
+    /// falling back to `unwrap_or_default()` there would swallow the injected error.
     #[tokio::test]
     async fn backfill_reader_error_is_propagated_not_swallowed() {
         let rt = KhiveRuntime::memory().unwrap();

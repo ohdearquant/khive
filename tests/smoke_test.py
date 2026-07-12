@@ -196,8 +196,8 @@ def main():
         assert "total" in verbs_result, f"verbs must return 'total' key: {verbs_result}"
         assert isinstance(verbs_result["verbs"], list), f"verbs must be a list: {verbs_result}"
         # Surface-contract tripwire: the default config (no --pack, KHIVE_PACKS
-        # unset) loads 10 production packs (kg, gtd, memory, brain, comm, schedule,
-        # knowledge, session, git, code), so verbs() returns exactly 81 user-facing
+        # unset) loads 11 production packs (kg, gtd, memory, brain, comm, schedule,
+        # knowledge, session, git, code, workspace), so verbs() returns exactly 81 user-facing
         # MCP-callable verbs (count what verbs() returns, not internal dispatch
         # arms). The session pack contributes 4 agent-facing T1 verbs
         # (store/list/resume/export), promoted from internal subhandlers to
@@ -212,18 +212,21 @@ def main():
         # with hardened argv construction); code contributes zero verbs
         # (ADR-085 D1/Amendment 3 — its `finding` note kind and
         # `findings.json` ingest are reached only via the `kkernel
-        # code-ingest` admin CLI, never this MCP verb surface). Update this
+        # code-ingest` admin CLI, never this MCP verb surface); workspace
+        # (#873) also contributes zero verbs, adding only the `workspace`
+        # entity kind and `contains` endpoint rules. Update this
         # number when the pack set or verb surface changes; a silent drift
         # here is the bug this assertion exists to catch.
         assert verbs_result["total"] == 81, (
-            f"expected 81 user-facing verbs from the 10 default packs "
+            f"expected 81 user-facing verbs from the 11 default packs "
             f"(session contributes 4 T1 verbs promoted to Visibility::Verb per "
             f"ADR-083; context is the 17th kg-substrate bare verb per ADR-089; "
             f"resolve is the 18th kg-substrate bare verb per the unified-verb "
             f"draft ADR Slice 1; comm.health is #606; comm.probe is #644; "
             f"brain.event_counts is #724/ADR-103; git contributes git.digest plus "
             f"git.commit/git.branch/git.push (ADR-108); "
-            f"code contributes zero verbs per ADR-085 D1/Amendment 3), "
+            f"code contributes zero verbs per ADR-085 D1/Amendment 3; "
+            f"workspace (#873) contributes zero verbs), "
             f"got {verbs_result['total']}: {verbs_result}"
         )
         verb_names = [v["verb"] for v in verbs_result["verbs"]]

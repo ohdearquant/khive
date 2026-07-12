@@ -403,6 +403,21 @@ async fn model_warm_lock(ann: &SharedAnn, key: &AnnKey) -> Arc<tokio::sync::Mute
         .clone()
 }
 
+/// #836 test seam: acquire and hold `key`'s per-model warm single-flight
+/// lock, the same one `ensure_ann_for_model` blocks on when a concurrent
+/// caller (e.g. the daemon's boot-time `warm_existing_memory_indexes`) is
+/// mid-build. Returning the owned guard lets a test simulate "boot warm is
+/// building this model from scratch" without depending on real build
+/// latency — the guard is simply held for as long as the test wants, then
+/// dropped to release it.
+#[cfg(test)]
+pub(crate) async fn hold_model_warm_lock_for_test(
+    ann: &SharedAnn,
+    key: &AnnKey,
+) -> tokio::sync::OwnedMutexGuard<()> {
+    model_warm_lock(ann, key).await.lock_owned().await
+}
+
 #[cfg(test)]
 impl AnnState {
     pub(crate) fn warm_route_count(&self) -> usize {

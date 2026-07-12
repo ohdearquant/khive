@@ -185,7 +185,7 @@ fusion_weight = 0.5
 #   KHIVE_NAMESPACE=local        Legacy alias for KHIVE_ACTOR; loses to it when both are set.
 #   KHIVE_NO_EMBED=false         Disable the local embedding model (skips vector indexing).
 #                                STRICT bool: only "true"/"false" — "1" is a startup error.
-#   KHIVE_PACKS=kg,gtd,memory,brain,comm,schedule,knowledge,session,git,code
+#   KHIVE_PACKS=kg,gtd,memory,brain,comm,schedule,knowledge,session,git,code,workspace
 #                                Packs to load when --pack is absent. Comma / space separated.
 #   KHIVE_CONFIG=./khive.toml    Path to THIS config file. Also --config. Overrides the search order.
 #   KHIVE_LOG=warn               Stderr log level (JSON results on stdout are unaffected).

@@ -2,6 +2,7 @@
 name = "khive-gate"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -11,7 +12,7 @@ categories.workspace = true
 description = "Pluggable authorization gate trait + default AllowAllGate impl for khive verb dispatch."
 
 [dependencies]
-khive-types = { version = "0.3.0", path = "../khive-types", features = ["serde"] }
+khive-types = { version = "0.4.0", path = "../khive-types", features = ["serde"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

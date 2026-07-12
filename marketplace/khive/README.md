@@ -2,7 +2,7 @@
 
 One plugin for the whole khive surface: a knowledge graph, GTD, memory, inter-agent comm,
 scheduling, and a domain-knowledge corpus, all served by a single MCP server (`kkernel mcp`)
-exposing one tool — `request` — that dispatches 81 verbs across 10 packs.
+exposing one tool — `request` — that dispatches 81 verbs across 11 packs.
 
 This plugin is **guidance, not a second runtime**. It ships the pattern skills that teach an
 agent how to use each pack well, plus the kg stewardship agents. The data and verbs live in the

@@ -663,3 +663,53 @@ fn test_json_adapter_edge_properties_non_object_warns() {
         adapter.warnings()
     );
 }
+
+// ---------------------------------------------------------------------------
+// Test 13 - new_with_valid_kinds accepts a caller-supplied pack kind (#530)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_json_adapter_default_new_still_rejects_resource_kind() {
+    // Plain `new()` (no injected registry) must keep rejecting kinds outside
+    // the base ADR-001 set: `resource` is pack-registered (ADR-048), not a
+    // base kind or alias.
+    let mut adapter = JsonFormatAdapter::new(r#"[{"kind":"resource","name":"X"}]"#)
+        .expect("structurally valid JSON must construct");
+    let first = adapter.entities().next().expect("one record present");
+    assert!(
+        matches!(first, Err(AdapterError::UnknownKind { kind, .. }) if kind == "resource"),
+        "resource must be rejected without an injected valid-kinds registry"
+    );
+}
+
+#[test]
+fn test_json_adapter_new_with_valid_kinds_accepts_resource_kind() {
+    let valid_kinds = vec!["resource".to_string()];
+    let mut adapter = JsonFormatAdapter::new_with_valid_kinds(
+        r#"[{"kind":"resource","name":"X"}]"#,
+        &valid_kinds,
+    )
+    .expect("structurally valid JSON must construct");
+    let first = adapter
+        .entities()
+        .next()
+        .expect("one record present")
+        .expect("resource kind must be accepted when present in the injected registry");
+    assert_eq!(first.kind, "resource");
+}
+
+#[test]
+fn test_json_adapter_new_with_valid_kinds_still_rejects_unregistered_kind() {
+    // A kind that is neither a base ADR-001 kind nor present in the injected
+    // registry must still be rejected: the injected registry widens, it does
+    // not disable, validation.
+    let valid_kinds = vec!["resource".to_string()];
+    let mut adapter =
+        JsonFormatAdapter::new_with_valid_kinds(r#"[{"kind":"gadget","name":"X"}]"#, &valid_kinds)
+            .expect("structurally valid JSON must construct");
+    let first = adapter.entities().next().expect("one record present");
+    assert!(
+        matches!(first, Err(AdapterError::UnknownKind { kind, .. }) if kind == "gadget"),
+        "unregistered kind must still be rejected with a non-empty valid-kinds registry"
+    );
+}

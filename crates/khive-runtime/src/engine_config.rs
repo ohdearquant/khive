@@ -519,11 +519,10 @@ impl KhiveConfig {
     /// Model name validity is checked lazily at runtime (the config loader does
     /// not import `lattice_embed` directly to keep the dep surface minimal).
     pub fn validate(&self) -> Result<(), ConfigError> {
-        // Reject a top-level `db` key loudly (#689) instead of letting serde's
-        // forward-compatible unknown-key tolerance silently swallow it: a config
-        // author who writes `db = "..."` expecting it to select the database
-        // would otherwise get silent divergence from the actual database opened
-        // via `--db`/`KHIVE_DB`.
+        // Reject a top-level `db` key loudly instead of letting serde's
+        // forward-compatible unknown-key tolerance silently swallow it: a
+        // config author expecting `db=` to select the database would
+        // otherwise get silent divergence from `--db`/`KHIVE_DB`.
         if let Some(value) = self.db.as_deref() {
             if !value.is_empty() {
                 return Err(ConfigError::UnsupportedTopLevelDb {
@@ -548,7 +547,6 @@ impl KhiveConfig {
             })?;
         }
 
-        // Validate actor.visible_namespaces when present.
         if let Some(ref vis) = self.actor.visible_namespaces {
             for ns_str in vis {
                 if ns_str.is_empty() {
@@ -578,7 +576,7 @@ impl KhiveConfig {
             })?;
         }
 
-        // Validate [[backends]]: unique names (ADR-028).
+        // Backend names must be unique.
         if !self.backends.is_empty() {
             let mut seen_backends = std::collections::HashSet::new();
             for backend in &self.backends {
@@ -588,9 +586,8 @@ impl KhiveConfig {
                     });
                 }
 
-                // Reject fields that are parsed but not yet supported (ADR-028 §1).
-                // An operator setting cache_mb or journal_mode would get silently
-                // ignored — reject loudly so misconfiguration is caught at startup.
+                // Reject fields that are parsed but not yet implemented: silently
+                // accepting them would let misconfiguration slip past startup.
                 if backend.cache_mb.is_some() {
                     return Err(ConfigError::UnsupportedBackendField {
                         name: backend.name.clone(),
@@ -605,7 +602,7 @@ impl KhiveConfig {
                 }
             }
 
-            // Validate [packs.<name>].backend references (ADR-028).
+            // Every pack-referenced backend name must be declared in `backends`.
             let defined: Vec<&str> = self.backends.iter().map(|b| b.name.as_str()).collect();
             for (pack_name, pack_cfg) in &self.packs {
                 if !defined.contains(&pack_cfg.backend.as_str()) {
@@ -667,7 +664,6 @@ impl KhiveConfig {
             return Ok(());
         }
 
-        // Unique names
         let mut seen_names = std::collections::HashSet::new();
         for engine in &self.engines {
             if !seen_names.insert(engine.name.clone()) {
@@ -677,7 +673,6 @@ impl KhiveConfig {
             }
         }
 
-        // Exactly one default
         let default_count = self.engines.iter().filter(|e| e.default).count();
         if default_count != 1 {
             return Err(ConfigError::DefaultCount {
@@ -685,9 +680,8 @@ impl KhiveConfig {
             });
         }
 
-        // Positive, finite fusion_weight when present.
-        // NaN does not satisfy `w <= 0.0`, and positive infinity is unbounded,
-        // so reject all non-finite values explicitly before the range check.
+        // Reject non-finite fusion_weight explicitly: NaN doesn't satisfy `w <= 0.0`
+        // and +inf is unbounded, so neither is caught by the range check alone.
         for engine in &self.engines {
             if let Some(w) = engine.fusion_weight {
                 if !w.is_finite() || w <= 0.0 {
@@ -773,22 +767,18 @@ pub fn config_from_env() -> KhiveConfig {
 
 // ---- Tests ----
 
-// INLINE TEST JUSTIFICATION: tests here cover config validation error paths that
-// rely on private ConfigError variants and temp-file helpers shared with the
-// config loader. Moving them to tests/ would require pub-exporting ConfigError
-// internals that are not part of the stable public API.
+// Kept inline (not tests/): exercises private ConfigError variants not part
+// of the public API.
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    // Helper: write a temp file and return the path.
     fn write_toml(dir: &tempfile::TempDir, content: &str) -> PathBuf {
         let path = dir.path().join("config.toml");
         std::fs::write(&path, content).unwrap();
         path
     }
 
-    // 1. Minimal config parses successfully.
     #[test]
     fn test_load_minimal_config() {
         let dir = tempfile::tempdir().unwrap();
@@ -810,7 +800,6 @@ default = true
         assert!(cfg.engines[0].default);
     }
 
-    // 2. Zero default-flagged engines -> error.
     #[test]
     fn test_default_engine_required_when_engines_present() {
         let dir = tempfile::tempdir().unwrap();
@@ -829,7 +818,6 @@ model = "all-minilm-l6-v2"
         );
     }
 
-    // 3. Two engines both flagged default -> error.
     #[test]
     fn test_multiple_default_rejected() {
         let dir = tempfile::tempdir().unwrap();
@@ -854,7 +842,6 @@ default = true
         );
     }
 
-    // 4. Negative or zero fusion_weight -> error.
     #[test]
     fn test_fusion_weight_validation() {
         let dir = tempfile::tempdir().unwrap();
@@ -893,19 +880,16 @@ fusion_weight = 0.0
         );
     }
 
-    // 5. File absent + env vars set -> constructs equivalent KhiveConfig.
     #[test]
     fn test_env_var_fallback() {
         let dir = tempfile::tempdir().unwrap();
         let absent = dir.path().join("missing.toml");
 
-        // File does not exist -> KhiveConfig::load returns None.
         let loaded = KhiveConfig::load(Some(&absent)).unwrap();
         assert!(loaded.is_none());
 
-        // With env vars set, config_from_env builds a synthetic config.
-        // We can't set env vars safely in a parallel test suite, so test via
-        // the direct construction path instead.
+        // Can't safely set env vars in a parallel test suite, so exercise the
+        // direct construction path instead.
         let primary = "all-minilm-l6-v2".to_string();
         let additional = vec!["paraphrase-multilingual-minilm-l12-v2".to_string()];
 
@@ -935,7 +919,6 @@ fusion_weight = 0.0
         assert_eq!(cfg.default_engine().unwrap().name, "default");
     }
 
-    // 6. File present + env vars set -> file wins; test via RuntimeConfig.
     #[test]
     fn test_file_overrides_env() {
         let dir = tempfile::tempdir().unwrap();
@@ -949,17 +932,14 @@ default = true
 "#,
         );
 
-        // File load succeeds even if env vars would provide a different model.
-        // The caller (RuntimeConfig::from_khive_config) is responsible for
-        // checking whether env vars are also present and emitting the warning.
-        // Here we verify that KhiveConfig::load returns the file config.
+        // KhiveConfig::load returns the file config regardless of env vars;
+        // warning-on-conflict is the caller's responsibility.
         let cfg = KhiveConfig::load(Some(&path))
             .expect("load should succeed")
             .expect("file should be present");
         assert_eq!(cfg.engines[0].name, "file-engine");
     }
 
-    // 7. Duplicate engine names -> error.
     #[test]
     fn test_duplicate_engine_names_rejected() {
         let dir = tempfile::tempdir().unwrap();
@@ -983,7 +963,6 @@ model = "paraphrase-multilingual-minilm-l12-v2"
         );
     }
 
-    // 8. Empty config file -> no engines; validate succeeds.
     #[test]
     fn test_empty_config_is_valid() {
         let dir = tempfile::tempdir().unwrap();
@@ -995,7 +974,6 @@ model = "paraphrase-multilingual-minilm-l12-v2"
         cfg.validate().expect("empty config should be valid");
     }
 
-    // 9. Multi-engine config with valid positive fusion_weight -> succeeds.
     #[test]
     fn test_multi_engine_positive_fusion_weight() {
         let dir = tempfile::tempdir().unwrap();
@@ -1022,7 +1000,6 @@ fusion_weight = 0.3
         assert_eq!(cfg.engines[1].fusion_weight, Some(0.3));
     }
 
-    // 10. [actor] section with id -> parsed correctly.
     #[test]
     fn test_actor_id_parsed() {
         let dir = tempfile::tempdir().unwrap();
@@ -1042,7 +1019,6 @@ display_name = "example actor"
         assert!(cfg.engines.is_empty());
     }
 
-    // 11. [actor] section with engines -> both parsed.
     #[test]
     fn test_actor_and_engines_together() {
         let dir = tempfile::tempdir().unwrap();
@@ -1065,7 +1041,6 @@ default = true
         assert_eq!(cfg.engines.len(), 1);
     }
 
-    // 12. Missing [actor] section -> defaults to None id (backward compat).
     #[test]
     fn test_actor_absent_defaults_to_none() {
         let dir = tempfile::tempdir().unwrap();
@@ -1087,7 +1062,6 @@ default = true
         );
     }
 
-    // 13. load_with_roots returns None when no files exist in the given roots.
     #[test]
     fn test_load_with_home_fallback_no_files() {
         let project_dir = tempfile::tempdir().unwrap();
@@ -1099,7 +1073,6 @@ default = true
         );
     }
 
-    // 14. load_with_home_fallback explicit path overrides search.
     #[test]
     fn test_load_with_home_fallback_explicit_path() {
         let dir = tempfile::tempdir().unwrap();
@@ -1116,7 +1089,6 @@ id = "lambda:explicit"
         assert_eq!(cfg.actor.id.as_deref(), Some("lambda:explicit"));
     }
 
-    // 15. actor.id with an invalid namespace string -> ConfigError::InvalidActorId at load time.
     #[test]
     fn test_invalid_actor_id_rejected_at_load() {
         let dir = tempfile::tempdir().unwrap();
@@ -1134,7 +1106,6 @@ id = "bad namespace"
         );
     }
 
-    // 16. actor.id = "" (empty string) -> ConfigError::InvalidActorId.
     #[test]
     fn test_empty_actor_id_rejected() {
         let dir = tempfile::tempdir().unwrap();
@@ -1152,7 +1123,6 @@ id = ""
         );
     }
 
-    // 17. actor.id = "lambda:" (structurally invalid — no slug) -> ConfigError::InvalidActorId.
     #[test]
     fn test_malformed_actor_id_lambda_colon_only() {
         let dir = tempfile::tempdir().unwrap();
@@ -1171,10 +1141,8 @@ id = "lambda:"
         );
     }
 
-    // 18. ADR-007 Rev 4 Rule 0: actor.id must NOT become default_namespace — writes
-    //     stay pinned to `local`. A non-`'local'` actor.id IS folded into the
-    //     default READ visible-set (ADR-007 Rev 4 Rule 3b), but that does not affect
-    //     default_namespace. This test asserts the write-routing invariant only.
+    // actor.id must not become default_namespace: writes stay pinned to `local`
+    // even though a non-local actor.id widens the default read visible-set.
     #[test]
     fn test_runtime_config_actor_id_does_not_override_namespace() {
         use crate::runtime::runtime_config_from_khive_config;
@@ -1200,9 +1168,8 @@ id = "lambda:"
             "actor.id must NOT become default_namespace (ADR-007 Rev 4 Rule 0); \
              writes stay pinned to local"
         );
-        // Also assert the fold-in: actor.id MUST appear in visible_namespaces so that
-        // default reads widen to {local} ∪ {actor namespace} (ADR-007 Rev 4 Rule 3b,
-        // config.rs:~444). This is the load-bearing side-effect of the actor id config.
+        // actor.id must also appear in visible_namespaces: the load-bearing
+        // side effect that widens default reads to {local} ∪ {actor namespace}.
         assert!(
             result
                 .visible_namespaces
@@ -1213,7 +1180,6 @@ id = "lambda:"
         );
     }
 
-    // 19. runtime_config_from_khive_config with no actor preserves base namespace.
     #[test]
     fn test_runtime_config_no_actor_preserves_base() {
         use crate::runtime::runtime_config_from_khive_config;
@@ -1243,7 +1209,6 @@ id = "lambda:"
         );
     }
 
-    // 20. load_with_roots: khive.toml (tier 2) wins over .khive/config.toml (tier 3).
     #[test]
     fn test_load_with_home_fallback_project_root_over_hidden() {
         let dir = tempfile::tempdir().unwrap();
@@ -1273,7 +1238,6 @@ id = "lambda:"
         );
     }
 
-    // 21. load_with_roots: .khive/config.toml (tier 3) wins when khive.toml absent.
     #[test]
     fn test_load_with_home_fallback_hidden_over_absent_root() {
         let dir = tempfile::tempdir().unwrap();
@@ -1296,7 +1260,6 @@ id = "lambda:"
         );
     }
 
-    // 22. load_with_roots: ~/.khive/config.toml (tier 4) found when project files absent.
     #[test]
     fn test_load_with_roots_home_tier_found() {
         let project_dir = tempfile::tempdir().unwrap();
@@ -1320,7 +1283,6 @@ id = "lambda:"
         );
     }
 
-    // 23. load_with_roots: project tier wins over home tier.
     #[test]
     fn test_load_with_roots_project_wins_over_home() {
         let project_dir = tempfile::tempdir().unwrap();
@@ -1525,7 +1487,6 @@ id = "lambda:"
 
     // ── ADR-028 backend / pack config tests ─────────────────────────────────
 
-    // 22. No [[backends]] → empty vecs, no validation error.
     #[test]
     fn test_no_backends_section_is_valid() {
         let dir = tempfile::tempdir().unwrap();
@@ -1545,7 +1506,6 @@ default = true
         assert!(cfg.packs.is_empty());
     }
 
-    // 23. Single Sqlite backend deserializes correctly.
     #[test]
     fn test_single_sqlite_backend_parses() {
         let dir = tempfile::tempdir().unwrap();
@@ -1571,7 +1531,6 @@ path = "/tmp/knowledge.db"
         );
     }
 
-    // 24. Memory backend parses correctly.
     #[test]
     fn test_memory_backend_parses() {
         let dir = tempfile::tempdir().unwrap();
@@ -1590,7 +1549,6 @@ kind = "memory"
         assert!(matches!(cfg.backends[0].kind, BackendKind::Memory));
     }
 
-    // 25. Pack config backend assignment parses correctly.
     #[test]
     fn test_pack_backend_assignment_parses() {
         let dir = tempfile::tempdir().unwrap();
@@ -1613,7 +1571,6 @@ backend = "knowledge"
         assert_eq!(pc.backend, "knowledge");
     }
 
-    // 26. Duplicate backend names → DuplicateBackendName error.
     #[test]
     fn test_duplicate_backend_name_rejected() {
         let dir = tempfile::tempdir().unwrap();
@@ -1636,7 +1593,6 @@ kind = "memory"
         );
     }
 
-    // 27. Pack referencing undefined backend → UnknownPackBackend error.
     #[test]
     fn test_pack_referencing_undefined_backend_rejected() {
         let dir = tempfile::tempdir().unwrap();
@@ -1660,12 +1616,11 @@ backend = "nonexistent"
         );
     }
 
-    // 28. Pack config with no [[backends]] → packs section validated only when backends present.
     #[test]
     fn test_pack_config_without_backends_section_is_allowed() {
         let dir = tempfile::tempdir().unwrap();
-        // Per the spec: when [[backends]] is absent/empty, packs are not validated
-        // (all packs fall through to the implicit main backend).
+        // When [[backends]] is absent/empty, packs are not validated: all
+        // packs fall through to the implicit main backend.
         let path = write_toml(
             &dir,
             r#"
@@ -1673,7 +1628,6 @@ backend = "nonexistent"
 backend = "main"
 "#,
         );
-        // This should succeed: no backends declared → no validation of packs.
         let cfg = KhiveConfig::load(Some(&path))
             .expect("no error expected")
             .expect("file found");
@@ -1681,7 +1635,6 @@ backend = "main"
         assert_eq!(cfg.packs.len(), 1);
     }
 
-    // B-SHOULD-FIX-1: cache_mb in [[backends]] must be rejected at validate() with a clear error.
     #[test]
     fn test_backend_cache_mb_rejected_at_validate() {
         let dir = tempfile::tempdir().unwrap();
@@ -1701,7 +1654,6 @@ cache_mb = 128
         );
     }
 
-    // B-SHOULD-FIX-1: journal_mode in [[backends]] must be rejected at validate() with a clear error.
     #[test]
     fn test_backend_journal_mode_rejected_at_validate() {
         let dir = tempfile::tempdir().unwrap();
@@ -1721,9 +1673,8 @@ journal_mode = "wal"
         );
     }
 
-    // #689: a top-level `db` key must be rejected loudly at validate() instead
-    // of being silently ignored as an unknown key (serde's forward-compatible
-    // default) — the exact incident class the tier-3 discovery fix closes.
+    // A top-level `db` key must be rejected loudly instead of silently
+    // ignored as an unknown key by serde's forward-compatible default.
     #[test]
     fn test_top_level_db_rejected_at_validate() {
         let dir = tempfile::tempdir().unwrap();

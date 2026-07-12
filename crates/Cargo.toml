@@ -31,6 +31,7 @@ members = [
     "khive-pack-knowledge",
     "khive-pack-session",
     "khive-pack-git",
+    "khive-pack-workspace",
     "khive-mcp",
     "khive-vcs",
     "khive-vcs-adapters",
@@ -48,8 +49,13 @@ exclude = ["khive-merge"]
 # keep this exclusion from members.
 
 [workspace.package]
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
+# floor_char_boundary/ceil_char_boundary (round_char_boundary, rust-lang/rust#93743)
+# stabilized in 1.91.0; khive-pack-brain's persist.rs uses floor_char_boundary.
+# Verified by compiling a minimal probe against installed 1.90.0 (E0658,
+# unstable) vs 1.91.0 (compiles); see issue #398.
+rust-version = "1.91.0"
 authors = ["Ocean <ocean@lionagi.ai>"]
 license = "Apache-2.0"
 repository = "https://github.com/ohdearquant/khive"

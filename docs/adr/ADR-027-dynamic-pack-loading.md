@@ -395,6 +395,26 @@ remain true as more binaries are added — the ADR's "zero-touch" framing should
 "zero-touch once a pack crate is linked into every binary that needs it," not "adding a
 pack crate to the workspace is sufficient on its own."
 
+## Amendment 2 (2026-07-11): eleven-pack default, `workspace` added
+
+**Status**: accepted
+
+The `workspace` pack (#873) is now part of the shipped `RuntimeConfig::default()` set,
+appended after `code`:
+
+```text
+["kg", "gtd", "memory", "brain", "comm", "schedule", "knowledge", "session", "git", "code", "workspace"]
+```
+
+Like `code`, `workspace` contributes zero verbs of its own: it registers the `workspace`
+entity kind and five `contains` endpoint rules (workspace to issue/pull_request/commit/task/session
+notes) and carries no MCP verbs. The default verb count is therefore unchanged at **78**;
+only the pack count moves from ten to eleven. Every surface that enumerates the default set
+(this ADR, package READMEs, `docs/guide/api-reference.md`, `docs/guide/specialized-packs.md`,
+`docs/khive-config-example.toml`, `scripts/perf/mcp_bench_client.py`) tracks the eleven-pack
+list. The force-link discipline of Amendment 1 applies: `workspace` carries a `Cargo.toml`
+dependency and an anchor line in `crates/khive-mcp/src/pack.rs`.
+
 ## References
 
 - [ADR-003](ADR-003-system-architecture.md) — `kkernel` binary; `pack list` introspection

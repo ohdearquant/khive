@@ -63,6 +63,30 @@ pub(super) fn ann_overfetch_max_rounds() -> usize {
     })
 }
 
+/// #836: bounded wait, in milliseconds, for a cold-miss `ensure_ann_for_model`
+/// call on the recall path before that model's vector leg degrades to
+/// FTS-only. 8s sits in the middle of the 5-10s range judged long enough to
+/// absorb a snapshot-restore warm (the common cold-miss case) while still
+/// being far short of a from-scratch corpus rebuild (300s+ observed in
+/// production — the #836 hang). Overridable per-request via
+/// `RecallConfig::ann_ready_timeout_ms`; this env fallback covers callers
+/// that never set it.
+pub(super) fn ann_ready_timeout_ms() -> u64 {
+    static TIMEOUT_MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *TIMEOUT_MS.get_or_init(|| {
+        const DEFAULT_ANN_READY_TIMEOUT_MS: u64 = 8_000;
+        let ms = std::env::var("KHIVE_MEMORY_ANN_READY_TIMEOUT_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(DEFAULT_ANN_READY_TIMEOUT_MS);
+        khive_runtime::config_ledger::record_config_locked(
+            "KHIVE_MEMORY_ANN_READY_TIMEOUT_MS",
+            ms.to_string(),
+        );
+        ms
+    })
+}
+
 #[inline(always)]
 pub(super) fn plog(call_id: u64, stage: &str, us: u128) {
     eprintln!(r#"{{"c":{},"s":"{}","us":{}}}"#, call_id, stage, us);
@@ -395,6 +419,9 @@ pub(super) struct RecallCandidateSet {
     pub(super) multilingual_routed: bool,
     /// The caller's full visible namespace set (primary + any explicit extras).
     pub(super) visible_namespaces: Vec<String>,
+    /// #836: true when at least one model's vector leg degraded to FTS-only
+    /// after hitting the bounded ANN readiness wait.
+    pub(super) ann_degraded: bool,
 }
 
 impl RecallCandidateSet {
@@ -460,6 +487,11 @@ pub(super) struct RecallCandidateParams<'a> {
     /// `RecallConfig::ann_overfetch_max_rounds` (with OnceLock env fallback)
     /// so tests can drive both branches in-process without env mutation.
     pub(super) ann_overfetch_max_rounds: usize,
+    /// #836: bounded wait (ms) for a cold-miss `ensure_ann_for_model` before
+    /// degrading that model to FTS-only. Threaded from
+    /// `RecallConfig::ann_ready_timeout_ms` (with OnceLock env fallback) so
+    /// tests can force the timeout branch deterministically.
+    pub(super) ann_ready_timeout_ms: u64,
 }
 
 pub(super) struct RecallVectorCandidateParams<'a> {
@@ -478,11 +510,19 @@ pub(super) struct RecallVectorCandidateParams<'a> {
     /// Passed explicitly so tests can drive both branches in-process without
     /// mutating the process-wide env.
     pub(super) ann_overfetch_max_rounds: usize,
+    /// #836: bounded wait (ms) for a cold-miss `ensure_ann_for_model` before
+    /// degrading that model to FTS-only. See `RecallCandidateParams`'s field
+    /// of the same name.
+    pub(super) ann_ready_timeout_ms: u64,
 }
 
 pub(super) struct RecallVectorCandidateResult {
     pub(super) vector_hits_per_model: Vec<(String, Vec<VectorSearchHit>)>,
     pub(super) multilingual_routed: bool,
+    /// #836: true when at least one model's vector leg hit the bounded ANN
+    /// readiness wait and was served FTS-only for this recall. The ANN
+    /// build itself keeps running in the background unaffected.
+    pub(super) ann_degraded: bool,
 }
 
 pub(super) fn retrieval_hybrid_config(strategy: &FusionStrategy, limit: usize) -> HybridConfig {
@@ -740,6 +780,7 @@ impl MemoryPack {
             snippet_policy,
             fts_gather,
             ann_overfetch_max_rounds,
+            ann_ready_timeout_ms,
         } = opts;
 
         // FTS recall uses the single shared fts_notes table (V4 migration). Namespace
@@ -776,6 +817,7 @@ impl MemoryPack {
                 scoring_cfg,
                 visible_namespaces: visible.clone(),
                 ann_overfetch_max_rounds,
+                ann_ready_timeout_ms,
             },
         );
         let (text_hits, vector_result) = tokio::try_join!(text_fut, vector_fut)?;
@@ -785,6 +827,7 @@ impl MemoryPack {
             vector_hits_per_model: vector_result.vector_hits_per_model,
             multilingual_routed: vector_result.multilingual_routed,
             visible_namespaces: visible,
+            ann_degraded: vector_result.ann_degraded,
         })
     }
 
@@ -814,6 +857,7 @@ impl MemoryPack {
             scoring_cfg,
             visible_namespaces,
             ann_overfetch_max_rounds,
+            ann_ready_timeout_ms,
         } = opts;
 
         // Over-fetch factor for the ANN path: F=4, M=32.
@@ -827,6 +871,7 @@ impl MemoryPack {
         let call_id = PROF_CID.with(|c| c.get());
 
         let mut multilingual_routed = false;
+        let mut ann_degraded = false;
         let model_names: Vec<String> = if let Some(m) = embedding_model {
             vec![m.to_string()]
         } else {
@@ -980,19 +1025,115 @@ impl MemoryPack {
                 if !cache_fresh && matches!(search_result, Ok(Some(_))) {
                     ann::ensure_ann_background(&self.runtime, token, &self.ann, &model_name).await;
                 }
+                // #836: a genuine cache miss (nothing installed for this
+                // model at all) still pays for an inline `ensure_ann_for_model`,
+                // but that call contends on the same per-model single-flight
+                // lock the daemon's boot-time `warm_existing_memory_indexes`
+                // holds for the duration of a from-scratch corpus build
+                // (300s+ observed in production). Bound the wait: past
+                // `ann_ready_timeout_ms`, abandon WAITING for this attempt and
+                // degrade this model's vector leg to FTS-only for this recall.
+                //
+                // #836 review: the build itself must never be dropped on
+                // timeout. In the CONTENDED case (some other holder — e.g.
+                // boot warm — already owns `ensure_ann_for_model`'s per-model
+                // `model_warm_lock`) that other holder's own call keeps
+                // running unaffected either way. But on a genuine SELF-BUILD
+                // (no other holder — a cold embedded runtime, or a new model
+                // introduced over a big corpus after boot) this call IS the
+                // only build in flight: dropping the bare timed-out future
+                // used to abandon it mid-build after it had already emitted
+                // `PhaseStarted`, so the matching `PhaseCompleted`/
+                // `PhaseCancelled` never fired (breaking the phase-span
+                // invariant), and left nothing running in the background —
+                // every later recall repeated the same doomed from-scratch
+                // build and timed out again, forever.
+                //
+                // Fix: spawn the `ensure_ann_for_model` call onto a tracked
+                // background task (same `khive_runtime::track_background_task`
+                // `ensure_ann_background` uses, so daemon shutdown's drain()
+                // waits for it) and race a completion signal against the
+                // deadline instead of racing the build itself. On timeout,
+                // only the receiving half is dropped — the sender side (the
+                // spawned task, and the `ensure_ann_for_model` call inside
+                // it) runs to completion regardless, so the phase-event pair
+                // always closes and a later recall finds a warm index.
+                // `ensure_ann_for_model`'s own per-model `model_warm_lock`
+                // single-flights every caller against the same key (spawned
+                // or not), so a second concurrent detach here just blocks on
+                // that lock and returns `AlreadyLoaded` once the first
+                // finishes — it can never start a second build for the same
+                // model.
+                let mut model_ann_timed_out = false;
                 let initial_raw_hits: Option<Vec<(Uuid, f32)>> = match search_result {
                     Ok(Some(hits)) => Some(hits),
                     Ok(None) => {
-                        let status =
-                            ann::ensure_ann_for_model(&self.runtime, token, &self.ann, &model_name)
-                                .await?;
-                        tracing::debug!(
-                            ?status,
-                            model = %model_name,
-                            namespace = %ns,
-                            "memory ANN ensured on recall miss"
-                        );
-                        ann::search_loaded(&self.ann, &key, &vec, ann_fetch_limit).await?
+                        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+                        let rt_detached = self.runtime.clone();
+                        let token_detached = token.clone();
+                        let ann_detached = self.ann.clone();
+                        let model_detached = model_name.clone();
+                        khive_runtime::track_background_task(async move {
+                            let result = ann::ensure_ann_for_model(
+                                &rt_detached,
+                                &token_detached,
+                                &ann_detached,
+                                &model_detached,
+                            )
+                            .await;
+                            let _ = done_tx.send(result);
+                        });
+                        match tokio::time::timeout(
+                            std::time::Duration::from_millis(ann_ready_timeout_ms),
+                            done_rx,
+                        )
+                        .await
+                        {
+                            Ok(Ok(Ok(status))) => {
+                                tracing::debug!(
+                                    ?status,
+                                    model = %model_name,
+                                    namespace = %ns,
+                                    "memory ANN ensured on recall miss"
+                                );
+                                ann::search_loaded(&self.ann, &key, &vec, ann_fetch_limit).await?
+                            }
+                            Ok(Ok(Err(e))) => return Err(e),
+                            Ok(Err(_sender_dropped)) => {
+                                // The tracked task's sender was dropped
+                                // without sending — only reachable if that
+                                // task itself panicked (its
+                                // `BackgroundTaskGuard` still decrements the
+                                // shared counter on unwind). Degrade this
+                                // model's vector leg rather than surfacing a
+                                // different task's panic as this recall's
+                                // own error.
+                                tracing::warn!(
+                                    model = %model_name,
+                                    namespace = %ns,
+                                    "memory ANN detached build task ended \
+                                     without a result; degrading recall to \
+                                     FTS-only for this model (#836)"
+                                );
+                                model_ann_timed_out = true;
+                                ann_degraded = true;
+                                None
+                            }
+                            Err(_elapsed) => {
+                                tracing::warn!(
+                                    model = %model_name,
+                                    namespace = %ns,
+                                    timeout_ms = ann_ready_timeout_ms,
+                                    "memory ANN not ready within bounded wait; \
+                                     degrading recall to FTS-only for this \
+                                     model and detaching the build to finish \
+                                     in the background (#836)"
+                                );
+                                model_ann_timed_out = true;
+                                ann_degraded = true;
+                                None
+                            }
+                        }
                     }
                     Err(e) => {
                         tracing::warn!(
@@ -1005,6 +1146,17 @@ impl MemoryPack {
                         None
                     }
                 };
+
+                if model_ann_timed_out {
+                    // FTS-only degraded fallback: contribute zero vector
+                    // candidates for this model rather than falling through
+                    // to the sqlite-vec exact-search branch below, which is
+                    // itself an O(corpus) scan unsuited to a bounded-latency
+                    // fallback. `fuse_candidates` degenerates to the lexical
+                    // (FTS) arm for this model's contribution.
+                    results.push((model_name, Vec::new()));
+                    continue;
+                }
 
                 if let Some(first_raw) = initial_raw_hits {
                     // Bounded retry: widen fetch window if visible-namespace survivors
@@ -1149,6 +1301,7 @@ impl MemoryPack {
         Ok(RecallVectorCandidateResult {
             vector_hits_per_model,
             multilingual_routed,
+            ann_degraded,
         })
     }
 

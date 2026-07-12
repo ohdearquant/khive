@@ -29,3 +29,5 @@ pub use khive_pack_memory::MemoryPack as _MemoryPack;
 pub use khive_pack_schedule::SchedulePack as _SchedulePack;
 #[doc(hidden)]
 pub use khive_pack_session::SessionPack as _SessionPack;
+#[doc(hidden)]
+pub use khive_pack_workspace::WorkspacePack as _WorkspacePack;

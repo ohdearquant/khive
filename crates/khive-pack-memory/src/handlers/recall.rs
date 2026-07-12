@@ -231,6 +231,12 @@ impl MemoryPack {
             .ann_overfetch_max_rounds
             .unwrap_or_else(super::common::ann_overfetch_max_rounds);
 
+        // #836: bounded wait for a cold-miss `ensure_ann_for_model` on this
+        // recall's own vector leg before it degrades to FTS-only.
+        let ann_ready_timeout_ms = cfg
+            .ann_ready_timeout_ms
+            .unwrap_or_else(super::common::ann_ready_timeout_ms);
+
         // #430: the FTS/vector candidate cap (`candidate_limit`) is applied over all
         // note kinds, not just `memory` rows, so a query pool dominated by higher-ranking
         // non-memory notes can starve out eligible memories before hydration ever sees
@@ -253,6 +259,7 @@ impl MemoryPack {
                     snippet_policy: TextSnippetPolicy::Omit,
                     fts_gather: &effective_fts_gather,
                     ann_overfetch_max_rounds,
+                    ann_ready_timeout_ms,
                 },
             )
             .await?;
@@ -291,6 +298,7 @@ impl MemoryPack {
                         snippet_policy: TextSnippetPolicy::Omit,
                         fts_gather: &effective_fts_gather,
                         ann_overfetch_max_rounds,
+                        ann_ready_timeout_ms,
                     },
                 )
                 .await?;
@@ -317,6 +325,9 @@ impl MemoryPack {
         }
 
         let actual_multilingual_routed = candidates.multilingual_routed;
+        // #836: at least one embedding model's vector leg hit the bounded
+        // ANN readiness wait and was served FTS-only for this recall.
+        let ann_degraded = candidates.ann_degraded;
 
         if prof {
             if let Some(ref t) = t_stage {
@@ -731,6 +742,13 @@ impl MemoryPack {
                 if actual_multilingual_routed {
                     result["multilingual_routed"] = json!(true);
                 }
+                if ann_degraded {
+                    // #836: this recall's ANN leg degraded to FTS-only after
+                    // hitting the bounded readiness wait — stamped per result
+                    // (same convention as `multilingual_routed`) so a plain,
+                    // non-verbose response array still carries the signal.
+                    result["degraded"] = json!("ann_unavailable");
+                }
                 result
             })
             .collect();
@@ -1067,6 +1085,311 @@ mod tests {
              FTS5 char ('@'), not silently degrade to vector-only results, got: {:?}",
             result.ok()
         );
+    }
+
+    // ── #836: bounded ANN readiness wait + FTS-only degraded fallback ─────────
+
+    /// #836 regression: `memory.recall`'s vector leg must not block on
+    /// `ensure_ann_for_model`'s per-model single-flight lock for longer than
+    /// the configured `ann_ready_timeout_ms` bound. A concurrent holder of
+    /// that lock (mirroring the daemon's boot-time
+    /// `warm_existing_memory_indexes` mid-build) previously meant the recall
+    /// waited out the full build duration (300s+ observed in production);
+    /// this asserts the bounded wait fires instead and the recall serves
+    /// FTS-only results, marked `"degraded": "ann_unavailable"`.
+    ///
+    /// Fail-on-revert proof: reverting the `tokio::time::timeout` wrap in
+    /// `collect_recall_vector_hits` (handlers/common.rs) back to a bare
+    /// `.await` on `ensure_ann_for_model` makes this test hang until the
+    /// held lock guard is dropped (it never is, within the test), so it
+    /// would fail on the `elapsed < ...` bound (or time out entirely under
+    /// `cargo test`'s own test-thread deadline).
+    #[tokio::test]
+    #[serial(background_tasks)]
+    async fn recall_836_degrades_to_fts_only_when_ann_lock_is_held() {
+        const MODEL: &str = "recall-836-ann-timeout-model";
+        const DIMS: usize = 16;
+        const NOTE_TEXT: &str = "issue 836 bounded ann acquire recall fts fallback note";
+
+        let rt = KhiveRuntime::memory().expect("in-memory runtime");
+        rt.register_embedder(HashVecProvider {
+            model_name: MODEL.to_owned(),
+            dims: DIMS,
+        });
+
+        let ns = Namespace::parse("local").expect("local namespace");
+        let token = rt.authorize(ns).expect("authorize local");
+
+        rt.create_note(&token, "memory", None, NOTE_TEXT, Some(0.7), None, vec![])
+            .await
+            .expect("create note");
+
+        let pack = MemoryPack::new(rt.clone());
+        let ann_handle = pack.ann.clone();
+
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(KgPack::new(rt.clone()));
+        builder.register(pack);
+        let registry = builder.build().expect("registry");
+
+        // Simulate the daemon's boot-time background warm holding the
+        // per-model single-flight lock mid-build (ann.rs `model_warm_lock`),
+        // exactly the contention #836 diagnosed.
+        let key = crate::ann::AnnKey::new("local", MODEL);
+        let _held = crate::ann::hold_model_warm_lock_for_test(&ann_handle, &key).await;
+
+        let start = std::time::Instant::now();
+        let result = registry
+            .dispatch(
+                "memory.recall",
+                serde_json::json!({
+                    "query": "836 bounded ann acquire",
+                    "limit": 10,
+                    "config": { "ann_ready_timeout_ms": 100 }
+                }),
+            )
+            .await
+            .expect("recall must not error when the ANN leg times out");
+        let elapsed = start.elapsed();
+
+        assert!(
+            elapsed < std::time::Duration::from_secs(3),
+            "#836 recall must return within the bounded ANN wait, took {elapsed:?}"
+        );
+
+        let results = result.as_array().expect("recall result must be an array");
+        assert!(
+            !results.is_empty(),
+            "FTS leg must still surface the seeded note when the ANN leg degrades"
+        );
+        for r in results {
+            assert_eq!(
+                r.get("degraded").and_then(Value::as_str),
+                Some("ann_unavailable"),
+                "#836 degraded result must carry the ann_unavailable marker, got: {r:?}"
+            );
+        }
+    }
+
+    /// #836: the normal, uncontended recall path must be byte-identical to
+    /// pre-fix behavior — no `degraded` marker when the ANN leg warms (or
+    /// serves from cache) within the bounded wait.
+    #[tokio::test]
+    #[serial(background_tasks)]
+    async fn recall_836_normal_path_has_no_degraded_marker() {
+        const MODEL: &str = "recall-836-ann-normal-model";
+        const DIMS: usize = 16;
+        const NOTE_TEXT: &str = "issue 836 normal path recall without any ann contention";
+
+        let rt = KhiveRuntime::memory().expect("in-memory runtime");
+        rt.register_embedder(HashVecProvider {
+            model_name: MODEL.to_owned(),
+            dims: DIMS,
+        });
+
+        let ns = Namespace::parse("local").expect("local namespace");
+        let token = rt.authorize(ns).expect("authorize local");
+
+        rt.create_note(&token, "memory", None, NOTE_TEXT, Some(0.7), None, vec![])
+            .await
+            .expect("create note");
+
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(KgPack::new(rt.clone()));
+        builder.register(MemoryPack::new(rt.clone()));
+        let registry = builder.build().expect("registry");
+
+        let result = registry
+            .dispatch(
+                "memory.recall",
+                serde_json::json!({
+                    "query": "836 normal path recall",
+                    "limit": 10
+                }),
+            )
+            .await
+            .expect("recall must succeed on the normal, uncontended path");
+
+        let results = result.as_array().expect("recall result must be an array");
+        assert!(
+            !results.is_empty(),
+            "normal recall must surface the seeded note"
+        );
+        for r in results {
+            assert!(
+                r.get("degraded").is_none(),
+                "normal recall must not carry a degraded marker, got: {r:?}"
+            );
+        }
+    }
+
+    /// #836: an ANN-degraded recall whose FTS leg also has nothing to match
+    /// must resolve to an empty result, not an error — the timeout path
+    /// must never surface as a hard failure even with zero candidates from
+    /// either leg.
+    #[tokio::test]
+    async fn recall_836_degraded_with_zero_fts_hits_returns_empty_not_error() {
+        const MODEL: &str = "recall-836-ann-timeout-empty-model";
+        const DIMS: usize = 16;
+
+        let rt = KhiveRuntime::memory().expect("in-memory runtime");
+        rt.register_embedder(HashVecProvider {
+            model_name: MODEL.to_owned(),
+            dims: DIMS,
+        });
+
+        // Deliberately no notes seeded: the FTS leg has nothing to match, so
+        // an ANN-degraded recall must still resolve to an empty array rather
+        // than propagating an error.
+        let pack = MemoryPack::new(rt.clone());
+        let ann_handle = pack.ann.clone();
+
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(KgPack::new(rt.clone()));
+        builder.register(pack);
+        let registry = builder.build().expect("registry");
+
+        let key = crate::ann::AnnKey::new("local", MODEL);
+        let _held = crate::ann::hold_model_warm_lock_for_test(&ann_handle, &key).await;
+
+        let result = registry
+            .dispatch(
+                "memory.recall",
+                serde_json::json!({
+                    "query": "no such content exists anywhere",
+                    "limit": 10,
+                    "config": { "ann_ready_timeout_ms": 100 }
+                }),
+            )
+            .await
+            .expect("recall must not error when both legs come up empty under ANN degradation");
+
+        assert_eq!(
+            result,
+            serde_json::json!([]),
+            "#836 degraded recall with no FTS hits must return an empty array, not an error"
+        );
+    }
+
+    /// #836 review fix: on a genuine SELF-BUILD timeout — no other holder of
+    /// the per-model `model_warm_lock` (unlike
+    /// `recall_836_degrades_to_fts_only_when_ann_lock_is_held` above, which
+    /// simulates a concurrent holder), this recall's own
+    /// `ensure_ann_for_model` call is the ONLY build in flight — the timed-out
+    /// build must not be dropped. This asserts the detached background build
+    /// eventually installs a fresh ANN index and a later recall takes the
+    /// vector path (no `ann_unavailable` marker), instead of every recall
+    /// restarting and re-timing-out on the same doomed build forever.
+    ///
+    /// A near-zero `ann_ready_timeout_ms` deterministically forces the bounded
+    /// wait to expire on its very first poll (the freshly spawned detached
+    /// task cannot have sent its result yet), without needing an artificially
+    /// large corpus to slow the real build down.
+    ///
+    /// Fail-on-revert proof: reverting `collect_recall_vector_hits`'s detach
+    /// (handlers/common.rs) back to a bare `tokio::time::timeout` wrapping
+    /// `ensure_ann_for_model(...)` directly drops that future on timeout —
+    /// the model never warms, so the `is_current` poll loop below exhausts
+    /// its budget and `warmed` stays `false`, and the second recall keeps
+    /// carrying the `ann_unavailable` marker forever.
+    #[tokio::test]
+    #[serial(background_tasks)]
+    async fn recall_836_self_build_timeout_detaches_build_instead_of_dropping_it() {
+        const MODEL: &str = "recall-836-self-build-detach-model";
+        const DIMS: usize = 16;
+        const NOTE_TEXT: &str = "issue 836 self build detach recall regression note";
+
+        let rt = KhiveRuntime::memory().expect("in-memory runtime");
+        rt.register_embedder(HashVecProvider {
+            model_name: MODEL.to_owned(),
+            dims: DIMS,
+        });
+
+        let ns = Namespace::parse("local").expect("local namespace");
+        let token = rt.authorize(ns).expect("authorize local");
+
+        rt.create_note(&token, "memory", None, NOTE_TEXT, Some(0.7), None, vec![])
+            .await
+            .expect("create note");
+
+        let pack = MemoryPack::new(rt.clone());
+        let ann_handle = pack.ann.clone();
+
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(KgPack::new(rt.clone()));
+        builder.register(pack);
+        let registry = builder.build().expect("registry");
+
+        // Deliberately no lock held here — this is the self-build case: this
+        // recall's own detached `ensure_ann_for_model` call is the only
+        // build in flight for this model.
+        let result = registry
+            .dispatch(
+                "memory.recall",
+                serde_json::json!({
+                    "query": "836 self build detach",
+                    "limit": 10,
+                    "config": { "ann_ready_timeout_ms": 0 }
+                }),
+            )
+            .await
+            .expect("recall must not error when the self-build ANN leg times out");
+
+        let results = result.as_array().expect("recall result must be an array");
+        assert!(
+            !results.is_empty(),
+            "FTS leg must still surface the seeded note while the ANN leg degrades"
+        );
+        for r in results {
+            assert_eq!(
+                r.get("degraded").and_then(Value::as_str),
+                Some("ann_unavailable"),
+                "first recall must still degrade to FTS-only within the \
+                 near-zero timeout, got: {r:?}"
+            );
+        }
+
+        // The detached build must keep running after the timed-out recall
+        // returns — poll the ANN cache directly (mirrors ann.rs's own
+        // #812/#844 convergence tests) rather than sleeping a fixed amount.
+        let key = crate::ann::AnnKey::new("local", MODEL);
+        let mut warmed = false;
+        for _ in 0..300 {
+            if crate::ann::is_current(&ann_handle, &key).await {
+                warmed = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            warmed,
+            "the detached build must eventually install a fresh ANN index for \
+             {MODEL} instead of being dropped on timeout (#836 review)"
+        );
+
+        // A later recall must now take the vector path — no degraded marker.
+        let result2 = registry
+            .dispatch(
+                "memory.recall",
+                serde_json::json!({
+                    "query": "836 self build detach",
+                    "limit": 10
+                }),
+            )
+            .await
+            .expect("recall must succeed once the detached build has warmed the index");
+        let results2 = result2.as_array().expect("recall result must be an array");
+        assert!(
+            !results2.is_empty(),
+            "warmed recall must still surface the seeded note"
+        );
+        for r in results2 {
+            assert!(
+                r.get("degraded").is_none(),
+                "a recall issued after the detached build completes must take \
+                 the vector path, not degrade, got: {r:?}"
+            );
+        }
     }
 
     // ── ADR-081 §5 (#394): recall serve-time attribution + ledger append ──────

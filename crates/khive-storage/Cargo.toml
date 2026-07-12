@@ -3,6 +3,7 @@ name = "khive-storage"
 description = "Storage capability traits: SqlAccess, VectorStore, TextSearch. Zero implementations — only contracts."
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -12,8 +13,8 @@ categories.workspace = true
 [dependencies]
 async-trait = { workspace = true }
 chrono = { workspace = true }
-khive-score = { version = "0.3.0", path = "../khive-score" }
-khive-types = { version = "0.3.0", path = "../khive-types", features = ["serde"] }
+khive-score = { version = "0.4.0", path = "../khive-score" }
+khive-types = { version = "0.4.0", path = "../khive-types", features = ["serde"] }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

@@ -2,6 +2,7 @@
 name = "khive-query"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -10,12 +11,16 @@ keywords.workspace = true
 categories.workspace = true
 description = "GQL and SPARQL parsers with SQL compiler for knowledge graph queries."
 
+[lib]
+bench = false
+
 [dependencies]
-khive-types = { version = "0.3.0", path = "../khive-types" }
+khive-types = { version = "0.4.0", path = "../khive-types" }
 thiserror = { workspace = true }
 
 [dev-dependencies]
 criterion = { workspace = true }
+rusqlite = { workspace = true, features = ["bundled"] }
 
 [[bench]]
 name = "parse_bench"

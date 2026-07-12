@@ -94,6 +94,18 @@ pub struct RecallConfig {
     /// exhausted. When `None`, falls back to the `ANN_OVERFETCH_MAX_ROUNDS`
     /// env var (default 3). Pass `Some(1)` to disable widening entirely.
     pub ann_overfetch_max_rounds: Option<usize>,
+
+    /// Bounded wait (milliseconds) for a cold-miss `ensure_ann_for_model`
+    /// call on the recall path before degrading that model's contribution
+    /// to FTS-only (#836). Recall and the daemon's boot-time background
+    /// warm (`warm_existing_memory_indexes`) both funnel through
+    /// `ensure_ann_for_model`'s per-model single-flight lock; without a
+    /// bound, a recall landing while boot warm holds that lock for a
+    /// from-scratch corpus build waits out the full build (300s+ observed
+    /// in production). When `None`, falls back to the
+    /// `KHIVE_MEMORY_ANN_READY_TIMEOUT_MS` env var (default 8000ms — see
+    /// `handlers::common::ann_ready_timeout_ms`).
+    pub ann_ready_timeout_ms: Option<u64>,
 }
 
 /// Brain-profile hint for score boosting during recall.
@@ -394,6 +406,7 @@ impl Default for RecallConfig {
             brain_profile: None,
             fts_gather: RecallFtsGatherConfig::default(),
             ann_overfetch_max_rounds: None,
+            ann_ready_timeout_ms: None,
         }
     }
 }

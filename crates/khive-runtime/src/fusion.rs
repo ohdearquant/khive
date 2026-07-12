@@ -148,12 +148,10 @@ impl KhiveRuntime {
         let candidates = limit.saturating_mul(CANDIDATE_MULTIPLIER).max(limit);
 
         let ns = token.namespace().as_str().to_owned();
-        // FTS5 parser syntax errors (#388, #389 round-2 High): sanitize_fts5_query
-        // already strips known-unsafe FTS5 metacharacters, but if the lexical
-        // leg still errors at runtime on residual punctuation the sanitizer
-        // does not strip, per #569 this now fails loud instead of degrading
-        // to vector-only fusion. Errors from any other leg (vector search)
-        // still propagate normally.
+        // sanitize_fts5_query strips known-unsafe metacharacters, but residual
+        // punctuation can still trip the FTS5 parser at runtime; that error must
+        // fail loud rather than silently degrade to vector-only fusion. Errors
+        // from other legs (vector search) still propagate normally.
         let text_search_result = self
             .text(token)?
             .search(TextSearchRequest {
@@ -242,13 +240,9 @@ mod tests {
     fn rrf_custom_k_differs_from_k60() {
         let a = Uuid::new_v4();
         let b = Uuid::new_v4();
-        // With k=1, top rank contributes 1/(1+1)=0.5 vs rank-2 1/(1+2)=0.333 — bigger gap
-        // With k=60, top rank contributes 1/61 vs 1/62 — much smaller gap
-        // Use a case where combining one source forces a=rank1, b=rank2 in text, reversed in vector
-        // k=1: a from text rank1 + vector rank2 = 1/2 + 1/3 = 5/6
-        //       b from text rank2 + vector rank1 = 1/3 + 1/2 = 5/6 (tie, broken by UUID)
-        // k=60: same math, but: 1/61 + 1/62 ≈ 0.0326 each — same tie
-        // Instead verify k=1 produces larger absolute score differences for rank differences
+        // Single-source input makes a and b tie in relative order at both k values,
+        // so assert on raw score magnitude (smaller k widens the rank-1-vs-rank-2 gap)
+        // rather than ordering.
         let text = vec![text_hit(a, 0.9, "a"), text_hit(b, 0.1, "b")];
         let hits_k1 =
             fuse_with_strategy(text.clone(), vec![], &FusionStrategy::Rrf { k: 1 }, 10).unwrap();
@@ -419,12 +413,10 @@ mod tests {
         }
     }
 
-    // 10. #388 regression: hybrid_search_with_strategy must not hard-fail on a query
-    // containing FTS5 metacharacters like `$`. After this test was first written,
-    // sanitize_fts5_query (khive-db) already strips `$`, so this alone takes the `Ok`
-    // path and does not exercise the runtime-level fail-open `Err` arm (PR #389 internal review
-    // round-1 Medium finding) — kept as a sanitizer-path regression; see test 11 below
-    // for the fail-open-branch regression.
+    // 10. hybrid_search_with_strategy must not hard-fail on a query containing FTS5
+    // metacharacters like `$`, since sanitize_fts5_query strips them before the query
+    // reaches SQLite. This covers the sanitizer path; test 11 covers the fail-loud
+    // path for characters the sanitizer does not strip.
     #[tokio::test]
     async fn hybrid_search_with_strategy_dollar_sign_query_does_not_error() {
         let rt = KhiveRuntime::memory().unwrap();
@@ -452,14 +444,10 @@ mod tests {
         );
     }
 
-    // 11. #569 regression: unlike `$`, `@` is NOT stripped by sanitize_fts5_query
-    // (by design — the sanitizer stays minimal per #388 scope). SQLite FTS5's
-    // bareword parser still rejects `@` unconditionally, so this query reaches
-    // the runtime-level `Err` arm in hybrid_search_with_strategy, which must
-    // now fail loud (`RuntimeError::InvalidInput`) instead of silently
-    // degrading to vector-only fusion as it did before #569. This assertion
-    // fails against the pre-#569 fail-open behavior (which returned `Ok`
-    // here) and passes once the FTS leg fails closed.
+    // 11. Unlike `$`, `@` is not stripped by sanitize_fts5_query (kept minimal by
+    // design), and SQLite FTS5's bareword parser rejects it unconditionally. That
+    // parser error must surface as RuntimeError::InvalidInput rather than silently
+    // degrading to vector-only fusion.
     #[tokio::test]
     async fn hybrid_search_with_strategy_residual_fts5_char_fails_loud() {
         let rt = KhiveRuntime::memory().unwrap();
