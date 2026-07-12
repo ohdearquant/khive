@@ -60,6 +60,7 @@ fn case_insensitive_candidate_lookup_uses_expression_index() {
     let offset_idx = params.len();
     let sql = format!(
         "EXPLAIN QUERY PLAN SELECT id FROM entities{where_sql} \
+         GROUP BY LOWER(name) \
          ORDER BY created_at DESC LIMIT ?{limit_idx} OFFSET ?{offset_idx}"
     );
     let mut stmt = conn.prepare(&sql).unwrap();
@@ -111,6 +112,46 @@ async fn case_insensitive_candidate_lookup_skips_unbounded_total_count() {
     assert_eq!(page.items.len(), 1);
     assert_eq!(page.items[0].name, "LoRA");
     assert_eq!(page.total, None);
+}
+
+#[tokio::test]
+async fn case_insensitive_candidate_lookup_caps_folded_names_not_duplicate_rows() {
+    let store = setup_memory_store();
+    let mut older_b = make_entity("local", "concept", "crowdbeta");
+    older_b.created_at = 1;
+    older_b.updated_at = 1;
+    store.upsert_entity(older_b).await.unwrap();
+
+    for created_at in 2..=258 {
+        let mut newer_a = make_entity("local", "concept", "CrowdAlpha");
+        newer_a.created_at = created_at;
+        newer_a.updated_at = created_at;
+        store.upsert_entity(newer_a).await.unwrap();
+    }
+
+    let page = store
+        .query_entities(
+            "local",
+            EntityFilter {
+                names_ci: vec!["crowdalpha".to_string(), "crowdbeta".to_string()],
+                ..EntityFilter::default()
+            },
+            PageRequest {
+                limit: 256,
+                offset: 0,
+            },
+        )
+        .await
+        .unwrap();
+
+    let folded_names: Vec<String> = page
+        .items
+        .iter()
+        .map(|entity| entity.name.to_lowercase())
+        .collect();
+    assert_eq!(folded_names.len(), 2);
+    assert!(folded_names.contains(&"crowdalpha".to_string()));
+    assert!(folded_names.contains(&"crowdbeta".to_string()));
 }
 
 #[tokio::test]

@@ -663,12 +663,20 @@ impl EntityStore for SqlEntityStore {
             let limit_idx = data_params.len() - 1;
             let offset_idx = data_params.len();
 
-            let data_sql = format!(
-                "SELECT id, namespace, kind, entity_type, name, description, properties, tags, \
-                 created_at, updated_at, deleted_at, merged_into, merge_event_id \
-                 FROM entities{} ORDER BY {} LIMIT ?{} OFFSET ?{}",
-                where_sql, order_by, limit_idx, offset_idx,
-            );
+            let columns = "id, namespace, kind, entity_type, name, description, properties, tags, \
+                           created_at, updated_at, deleted_at, merged_into, merge_event_id";
+            let data_sql = if filter.names_ci.is_empty() {
+                format!(
+                    "SELECT {columns} FROM entities{where_sql} \
+                     ORDER BY {order_by} LIMIT ?{limit_idx} OFFSET ?{offset_idx}"
+                )
+            } else {
+                format!(
+                    "SELECT {columns} FROM entities{where_sql} \
+                     GROUP BY LOWER(name) \
+                     ORDER BY {order_by} LIMIT ?{limit_idx} OFFSET ?{offset_idx}"
+                )
+            };
 
             let mut stmt = conn.prepare(&data_sql)?;
             let param_refs: Vec<&dyn rusqlite::types::ToSql> =

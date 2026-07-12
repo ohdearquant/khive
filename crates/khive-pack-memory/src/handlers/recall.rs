@@ -4482,6 +4482,66 @@ mod tests {
 
     #[tokio::test]
     #[serial(background_tasks)]
+    async fn adr104_stage_c_duplicate_name_crowding_preserves_each_candidate_boost() {
+        let rt = KhiveRuntime::memory().expect("in-memory runtime");
+        let ns = Namespace::parse("local").expect("local namespace");
+        let token = rt.authorize(ns.clone()).expect("authorize local");
+        let store = rt.entities(&token).expect("entity store");
+
+        let mut older_b = Entity::new(ns.as_str(), "concept", "crowdbeta");
+        older_b.created_at = 1;
+        older_b.updated_at = 1;
+        store
+            .upsert_entity(older_b)
+            .await
+            .expect("seed candidate B");
+
+        for created_at in 2..=258 {
+            let mut newer_a = Entity::new(ns.as_str(), "concept", "CrowdAlpha");
+            newer_a.created_at = created_at;
+            newer_a.updated_at = created_at;
+            store
+                .upsert_entity(newer_a)
+                .await
+                .expect("seed duplicate candidate A");
+        }
+
+        let anchored = MemoryPack::new(rt)
+            .entity_anchored_candidates(&token, "crowdalpha crowdbeta")
+            .await
+            .expect("Stage C lookup");
+        assert!(anchored.contains(&"crowdalpha".to_string()));
+        assert!(anchored.contains(&"crowdbeta".to_string()));
+
+        let baseline_names = vec!["crowdalpha".to_string()];
+        let now_millis = chrono::Utc::now().timestamp_millis();
+        let score = |entity_names: &[String]| {
+            crate::scoring::calculate_score(
+                &crate::scoring::ScoreInput {
+                    salience: 0.5,
+                    memory_type_str: "semantic",
+                    content: "the archive concerns crowdbeta",
+                    created_at_millis: now_millis,
+                    decay_factor: 0.005,
+                    now_millis,
+                    relevance_score: 0.2,
+                    entity_names,
+                },
+                &crate::scoring::ScoringConfig::default(),
+            )
+        };
+        let boosted = score(&anchored);
+        let baseline = score(&baseline_names);
+        assert!(boosted > baseline);
+        assert!(
+            (boosted / baseline - 1.3).abs() < 0.01,
+            "candidate B must retain its EntityMatch boost after candidate A duplicate crowding: \
+             boosted={boosted} baseline={baseline}"
+        );
+    }
+
+    #[tokio::test]
+    #[serial(background_tasks)]
     async fn adr104_stage_c_non_ascii_case_lookup_end_to_end_is_bounded() {
         let rt = KhiveRuntime::memory().expect("in-memory runtime");
         let ns = Namespace::parse("local").expect("local namespace");

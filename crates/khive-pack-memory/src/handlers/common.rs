@@ -725,9 +725,8 @@ impl MemoryPack {
             .query_entities(
                 namespace,
                 filter,
-                // Bounded above `MAX_ENTITY_LOOKUP_CANDIDATES` candidates so
-                // multiple entities sharing an ASCII-folded name cannot
-                // truncate a legitimate match out of the page.
+                // The store reduces duplicate folded names to one row before
+                // applying this bounded page cap.
                 PageRequest {
                     limit: crate::scoring::MAX_ENTITY_LOOKUP_CANDIDATES as u32 * 4,
                     offset: 0,
