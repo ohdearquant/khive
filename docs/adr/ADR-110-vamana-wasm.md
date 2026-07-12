@@ -200,10 +200,17 @@ The v0 JavaScript contract is:
   default. An unknown key, a non-positive `maxDegree`, a `searchListSize`
   below `maxDegree`, or a non-finite or sub-1.0 `alpha` is rejected before
   any index state is constructed.
+- All numeric arguments crossing the JavaScript boundary (`dim`, `k`,
+  `maxDegree`, `searchListSize`) must be finite, integral safe integers
+  (`Number.isSafeInteger`). The binding rejects fractional, negative,
+  non-finite, and out-of-safe-range values before any conversion to `usize`;
+  no implicit truncation or rounding occurs. `dim` must be positive.
 - `search(query: Float32Array, k)` returns `{ ids, distances }`, where `ids` is
   a JavaScript array of string IDs and `distances` is a parallel
   `Float32Array` of f32 distances. Both arrays have the same length and index
-  order. Tombstoned ordinals are never returned.
+  order. Tombstoned ordinals are never returned. `k` must be a positive safe
+  integer; `k` of zero is rejected. A `k` larger than the live count returns
+  all live results.
 - `insert(id, vector)` rejects an empty or duplicate string ID. It performs the
   core insert and updates both ID maps as one operation. If the core recycles a
   tombstoned ordinal, the new mapping is installed for that ordinal in the same
@@ -267,24 +274,25 @@ ADR is the source of truth.
 
 ## Acceptance gates
 
-| Gate                    | Assertion                                                                                                                                                                                                                 |
-| ----------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| wasm check              | `cargo check --target wasm32-unknown-unknown -p khive-quant -p khive-vamana --no-default-features` passes in CI                                                                                                           |
-| Sequential coverage     | Native Vamana and quantizer tests pass with `--no-default-features`, exercising every fallback in the source-audit table                                                                                                  |
-| Build parity            | A fixed-seed corpus produces identical graph and search results with default features and with `--no-default-features`                                                                                                    |
-| Native bytes round-trip | `to_bytes` followed by `from_bytes` preserves lifecycle state and search results exactly                                                                                                                                  |
-| Native-to-wasm fixture  | A container reframed from a native v2 directory with no ID segment loads in wasm and returns default decimal-ordinal-string IDs and the fixture's distances                                                               |
-| Wasm-to-native fixture  | A wasm-produced container reframes to a native v2 directory, the unchanged native loader reproduces the fixture's search results, and a second wasm load round-trips the ID segment losslessly through `portable_ids.bin` |
-| Corruption rejection    | Bad magic or version, truncation, overlapping ranges, missing or duplicate segments, bad checksums, and malformed portable string IDs are rejected                                                                        |
-| SQ8 reconstruction      | Neither native nor portable persisted output contains an SQ8 segment, and both load paths reconstruct SQ8 with search parity                                                                                              |
-| Insert by string ID     | Inserting a unique string ID makes it searchable; duplicate insertion errors without changing index or map state; recycled ordinals map only to the new ID                                                                |
-| Remove by string ID     | Removing a string ID resolves and tombstones its ordinal, removes both mappings, and prevents that ID from appearing in search                                                                                            |
-| Serialize string IDs    | `serialize` emits one versioned portable string-ID entry per live ordinal and none for tombstones                                                                                                                         |
-| Deserialize string IDs  | `deserialize` restores both ID maps so remove-by-ID and search-by-ID work without rebuilding                                                                                                                              |
-| Search by string ID     | Search returns equal-length parallel arrays of string IDs and f32 distances in result order, including after deserialize                                                                                                  |
-| Config validation       | `build` rejects an unknown config key, a non-positive `maxDegree`, a `searchListSize` below `maxDegree`, and a non-finite or sub-1.0 `alpha`, each without constructing any index state                                   |
-| Browser smoke           | A headless browser test covers build with explicit and default IDs, search, insert, remove, serialize, and deserialize with SQ8 enabled                                                                                   |
-| Size                    | Layer B CI asserts `gzip -9` of the wasm-bindgen release `khive_vamana_wasm_bg.wasm` artifact is at most 500,000 bytes                                                                                                    |
+| Gate                    | Assertion                                                                                                                                                                                                                      |
+| ----------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| wasm check              | `cargo check --target wasm32-unknown-unknown -p khive-quant -p khive-vamana --no-default-features` passes in CI                                                                                                                |
+| Sequential coverage     | Native Vamana and quantizer tests pass with `--no-default-features`, exercising every fallback in the source-audit table                                                                                                       |
+| Build parity            | A fixed-seed corpus produces identical graph and search results with default features and with `--no-default-features`                                                                                                         |
+| Native bytes round-trip | `to_bytes` followed by `from_bytes` preserves lifecycle state and search results exactly                                                                                                                                       |
+| Native-to-wasm fixture  | A container reframed from a native v2 directory with no ID segment loads in wasm and returns default decimal-ordinal-string IDs and the fixture's distances                                                                    |
+| Wasm-to-native fixture  | A wasm-produced container reframes to a native v2 directory, the unchanged native loader reproduces the fixture's search results, and a second wasm load round-trips the ID segment losslessly through `portable_ids.bin`      |
+| Corruption rejection    | Bad magic or version, truncation, overlapping ranges, missing or duplicate segments, bad checksums, and malformed portable string IDs are rejected                                                                             |
+| SQ8 reconstruction      | Neither native nor portable persisted output contains an SQ8 segment, and both load paths reconstruct SQ8 with search parity                                                                                                   |
+| Insert by string ID     | Inserting a unique string ID makes it searchable; duplicate insertion errors without changing index or map state; recycled ordinals map only to the new ID                                                                     |
+| Remove by string ID     | Removing a string ID resolves and tombstones its ordinal, removes both mappings, and prevents that ID from appearing in search                                                                                                 |
+| Serialize string IDs    | `serialize` emits one versioned portable string-ID entry per live ordinal and none for tombstones                                                                                                                              |
+| Deserialize string IDs  | `deserialize` restores both ID maps so remove-by-ID and search-by-ID work without rebuilding                                                                                                                                   |
+| Search by string ID     | Search returns equal-length parallel arrays of string IDs and f32 distances in result order, including after deserialize                                                                                                       |
+| Config validation       | `build` rejects an unknown config key, a non-positive `maxDegree`, a `searchListSize` below `maxDegree`, and a non-finite or sub-1.0 `alpha`, each without constructing any index state                                        |
+| Numeric boundary        | Fractional, negative, non-finite, and non-safe-integer values for `dim`, `k`, `maxDegree`, and `searchListSize` are rejected before conversion; `k` of zero is rejected; browser tests cover each case including `dim` and `k` |
+| Browser smoke           | A headless browser test covers build with explicit and default IDs, search, insert, remove, serialize, and deserialize with SQ8 enabled                                                                                        |
+| Size                    | Layer B CI asserts `gzip -9` of the wasm-bindgen release `khive_vamana_wasm_bg.wasm` artifact is at most 500,000 bytes                                                                                                         |
 
 ## Rollout
 
