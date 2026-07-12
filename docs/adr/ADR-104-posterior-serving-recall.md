@@ -405,9 +405,18 @@ versioned input stamped into persisted state**, superseding Amendment 1's
     policy_version: u32,
     half_life_days: f64,
     mass_table_version: u32,
-    mass_table: [{ signal: FeedbackSignal, polarity: positive | negative, evidence_mass: f64 }, ...]
+    mass_table: [{ signal: EvidenceFeedbackSignal, polarity: positive | negative, evidence_mass: f64 }, ...]
   }
   ```
+
+  `EvidenceFeedbackSignal` is a new closed persisted-row enum containing exactly the
+  eight wire names in the signal table above. Neither shipped type covers all eight:
+  `FeedbackSignal` holds only the three legacy names and `FeedbackEventKind` holds
+  the five semantic names (`crates/khive-brain-core/src/signal.rs`). Stage D defines
+  the new enum with pinned serde names equal to the wire names, a one-way `From`
+  mapping from each `FeedbackSignal` and `FeedbackEventKind` value, and a test
+  asserting the enum has exactly eight members matching the table. The existing
+  public feedback types and their consumers are unchanged.
 
   `mass_table` is the complete signal-to-polarity-and-mass table above, in the row
   order shown and with every signal present exactly once. It is persisted inline,
@@ -456,7 +465,13 @@ PolicyMigrationPayload {
 complete records, including their inline mass tables. `new_policy` must pass complete
 boundary validation, including a finite, strictly positive `half_life_days`, every
 supported signal exactly once with its normative polarity and a finite, strictly
-positive mass, and a bumped `policy_version`.
+positive mass, and a bumped `policy_version`. At this migration boundary only, and
+never during fold or replay, `new_policy.mass_table` must also match the immutable
+code-side registry entry named by `new_policy.mass_table_version` field for field;
+a payload whose inline table diverges from its named registry version is rejected
+before anything is written. Changing any mass therefore requires registering a new
+table version first. This keeps `mass_table_version` an auditable provenance claim
+rather than a free label, while replay still reads only the inline table.
 
 The operation follows the staged-mutation pattern in
 `crates/khive-pack-brain/src/persist.rs`: mutations apply to a proposed state without
@@ -520,6 +535,12 @@ The Stage D gate gains these assertions:
 - The admin migration operation persists nothing for a stale expected-old record;
   two concurrent operations carrying the same expected-old record cannot both append;
   and an invalid complete new-policy payload persists nothing.
+- A migration payload whose inline mass table is complete, normatively signed, and
+  strictly positive but does not match the immutable registry entry named by its
+  `mass_table_version` appends neither event nor snapshot.
+- The `EvidenceFeedbackSignal` persisted-row enum has exactly the eight wire names
+  in the signal table, with pinned serde names, and every `FeedbackSignal` and
+  `FeedbackEventKind` value maps one-way onto it.
 - Two profiles created on opposite sides of a configuration change carry their
   respective creation-time policies, and each serves under its own.
 - Migrating the same v0 or v1 snapshot twice under the same configured policy yields
