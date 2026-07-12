@@ -118,10 +118,11 @@ substring lookup against entity names rather than whitespace tokenization.
 Entity-name matching is case-insensitive for ASCII, exact-form for cased non-ASCII scripts,
 and caseless scripts such as CJK are unaffected.
 
-Implementation constraint: one indexed lookup per recall (batched over tokens), reusing
-the entity store's existing name index. Explicit caller-supplied `entity_names` continues
-to win over all extraction, and `entity_names: []` remains a full opt-out (#738
-semantics unchanged).
+Implementation constraint: one indexed lookup per recall, driven by a distinct relation of at
+most 64 token candidates. Each candidate performs one `LIMIT 1` seek against a live-row partial
+index on `(namespace, LOWER(name))`; work is bounded by candidates rather than duplicate or
+tombstoned entity rows. Explicit caller-supplied `entity_names` continues to win over all
+extraction, and `entity_names: []` remains a full opt-out (#738 semantics unchanged).
 
 ## What this deliberately does not do
 

@@ -45,7 +45,7 @@ fn make_entity(namespace: &str, kind: &str, name: &str) -> Entity {
 }
 
 #[test]
-fn case_insensitive_candidate_lookup_uses_expression_index() {
+fn case_insensitive_candidate_lookup_uses_one_partial_index_seek_per_candidate() {
     let mut conn = rusqlite::Connection::open_in_memory().unwrap();
     run_migrations(&mut conn).unwrap();
 
@@ -53,16 +53,34 @@ fn case_insensitive_candidate_lookup_uses_expression_index() {
         names_ci: vec!["lora".to_string(), "北京大学".to_string()],
         ..EntityFilter::default()
     };
-    let (where_sql, mut params) = build_entity_where("local", &filter);
+    let mut lookup_filter = filter.clone();
+    lookup_filter.names_ci.clear();
+    let (where_sql, mut params) = build_entity_where("local", &lookup_filter);
+    let candidate_param_indices: Vec<usize> = filter
+        .names_ci
+        .iter()
+        .map(|candidate| {
+            params.push(Box::new(candidate.to_ascii_lowercase()));
+            params.len()
+        })
+        .collect();
     params.push(Box::new(64_i64));
     params.push(Box::new(0_i64));
     let limit_idx = params.len() - 1;
     let offset_idx = params.len();
-    let sql = format!(
-        "EXPLAIN QUERY PLAN SELECT id FROM entities{where_sql} \
-         GROUP BY LOWER(name) \
-         ORDER BY created_at DESC LIMIT ?{limit_idx} OFFSET ?{offset_idx}"
+    let data_sql = build_candidate_entity_query(
+        "id",
+        &where_sql,
+        &candidate_param_indices,
+        "created_at DESC",
+        limit_idx,
+        offset_idx,
     );
+    assert!(!data_sql.contains("GROUP BY"));
+    assert!(data_sql.contains("FROM candidates"));
+    assert!(data_sql.contains("LIMIT 1"));
+
+    let sql = format!("EXPLAIN QUERY PLAN {data_sql}");
     let mut stmt = conn.prepare(&sql).unwrap();
     let param_refs: Vec<&dyn rusqlite::types::ToSql> =
         params.iter().map(|param| param.as_ref()).collect();
@@ -79,10 +97,29 @@ fn case_insensitive_candidate_lookup_uses_expression_index() {
         "candidate lookup must seek the case-insensitive expression index: {details:?}"
     );
     assert!(
+        details
+            .iter()
+            .any(|detail| detail.contains("CORRELATED SCALAR SUBQUERY")),
+        "candidate relation must drive one scalar lookup per name: {details:?}"
+    );
+    assert!(
         !details
             .iter()
             .any(|detail| detail.contains("SCAN entities")),
         "candidate lookup must not scan entities: {details:?}"
+    );
+
+    let index_sql: String = conn
+        .query_row(
+            "SELECT sql FROM sqlite_master \
+             WHERE type = 'index' AND name = 'idx_entities_namespace_name_ci'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(
+        index_sql.contains("WHERE deleted_at IS NULL"),
+        "candidate lookup index must exclude tombstones: {index_sql}"
     );
 }
 
@@ -133,7 +170,11 @@ async fn case_insensitive_candidate_lookup_caps_folded_names_not_duplicate_rows(
         .query_entities(
             "local",
             EntityFilter {
-                names_ci: vec!["crowdalpha".to_string(), "crowdbeta".to_string()],
+                names_ci: vec![
+                    "CrowdAlpha".to_string(),
+                    "crowdalpha".to_string(),
+                    "crowdbeta".to_string(),
+                ],
                 ..EntityFilter::default()
             },
             PageRequest {

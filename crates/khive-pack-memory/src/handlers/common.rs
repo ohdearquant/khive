@@ -688,16 +688,16 @@ pub(super) fn recall_text_terms_with_limit(query: &str, limit: usize) -> Vec<Str
 
 impl MemoryPack {
     /// ADR-104 §5 (Stage C): entity-anchored candidate extraction. A single,
-    /// namespace-scoped, batched lookup against the entity store's
-    /// `(namespace, LOWER(name))` index. This satisfies R1's "one batched indexed lookup per
-    /// recall, no unbounded per-recall scans of the entity table."
+    /// namespace-scoped, batched lookup against the entity store's live-row
+    /// `(namespace, LOWER(name))` index. This satisfies R1's "one batched indexed
+    /// lookup per recall, no unbounded per-recall scans of the entity table."
     ///
     /// `crate::scoring::entity_lookup_candidates` derives up to
     /// `MAX_ENTITY_LOOKUP_CANDIDATES` raw and ASCII-lowercased unigram, bigram,
     /// and bounded CJK substring candidates. One `EntityFilter::names_ci` call
-    /// resolves them with an indexed `LOWER(name) IN (...)` match. The store
-    /// skips the separate count for this filter, so only the page-limited
-    /// query runs.
+    /// resolves a distinct candidate relation with one `LIMIT 1` index seek per
+    /// name. The store skips the separate count for this filter, so lookup work
+    /// is bounded by the 64-candidate input rather than matching entity rows.
     ///
     /// A candidate only survives this lookup by naming a real, non-deleted
     /// entity in the caller's namespace. That match against a real record
@@ -725,10 +725,8 @@ impl MemoryPack {
             .query_entities(
                 namespace,
                 filter,
-                // The store reduces duplicate folded names to one row before
-                // applying this bounded page cap.
                 PageRequest {
-                    limit: crate::scoring::MAX_ENTITY_LOOKUP_CANDIDATES as u32 * 4,
+                    limit: crate::scoring::MAX_ENTITY_LOOKUP_CANDIDATES as u32,
                     offset: 0,
                 },
             )

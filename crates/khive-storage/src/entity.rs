@@ -105,11 +105,11 @@ pub struct EntityFilter {
     #[serde(default)]
     pub namespaces: Vec<String>,
     /// ASCII-case-insensitive batched exact-name match (ADR-104 Stage C).
-    /// `LOWER(name) IN (...)` compares up to a caller-bounded set of raw and
-    /// ASCII-lowercased candidate strings. Cased non-ASCII characters require
-    /// exact form. Distinct from single-value, case-sensitive `name_exact`.
-    /// Results contain at most one representative row per folded name before
-    /// page limits and offsets are applied.
+    /// Compares a caller-bounded set of raw and ASCII-lowercased candidate
+    /// strings to `LOWER(name)`. Cased non-ASCII characters require exact form.
+    /// Distinct from single-value, case-sensitive `name_exact`. Results contain
+    /// at most one representative row per folded candidate before page limits
+    /// and offsets are applied.
     /// Implementations may omit the page total to keep this lookup page-limited
     /// instead of issuing a separate count.
     #[serde(default)]

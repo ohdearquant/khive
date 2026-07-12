@@ -512,6 +512,34 @@ fn build_entity_where(
     (clause, params)
 }
 
+fn build_candidate_entity_query(
+    columns: &str,
+    where_sql: &str,
+    candidate_param_indices: &[usize],
+    order_by: &str,
+    limit_idx: usize,
+    offset_idx: usize,
+) -> String {
+    let candidate_rows = candidate_param_indices
+        .iter()
+        .map(|idx| format!("(?{idx})"))
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    format!(
+        "WITH candidates(folded_name) AS (VALUES {candidate_rows}), \
+         matched_entities(entity_id) AS (\
+             SELECT (\
+                 SELECT id FROM entities{where_sql} \
+                 AND LOWER(name) = candidates.folded_name LIMIT 1\
+             ) FROM candidates\
+         ) \
+         SELECT {columns} FROM entities \
+         JOIN matched_entities ON entities.id = matched_entities.entity_id \
+         ORDER BY {order_by} LIMIT ?{limit_idx} OFFSET ?{offset_idx}"
+    )
+}
+
 // =============================================================================
 // EntityStore implementation
 // =============================================================================
@@ -640,7 +668,33 @@ impl EntityStore for SqlEntityStore {
                 None
             };
 
-            let (where_sql, mut data_params) = build_entity_where(&namespace, &filter);
+            let mut lookup_filter = filter.clone();
+            lookup_filter.names_ci.clear();
+            let effective_filter = if filter.names_ci.is_empty() {
+                &filter
+            } else {
+                &lookup_filter
+            };
+            let (where_sql, mut data_params) = build_entity_where(&namespace, effective_filter);
+
+            let candidate_param_indices = if filter.names_ci.is_empty() {
+                Vec::new()
+            } else {
+                let mut candidates: Vec<String> = filter
+                    .names_ci
+                    .iter()
+                    .map(|name| name.to_ascii_lowercase())
+                    .collect();
+                candidates.sort_unstable();
+                candidates.dedup();
+                candidates
+                    .into_iter()
+                    .map(|candidate| {
+                        data_params.push(Box::new(candidate));
+                        data_params.len()
+                    })
+                    .collect()
+            };
 
             // #818: when a name_prefix filter is active, an exact
             // ASCII-case-insensitive match must never be pushed out of the page by
@@ -671,10 +725,13 @@ impl EntityStore for SqlEntityStore {
                      ORDER BY {order_by} LIMIT ?{limit_idx} OFFSET ?{offset_idx}"
                 )
             } else {
-                format!(
-                    "SELECT {columns} FROM entities{where_sql} \
-                     GROUP BY LOWER(name) \
-                     ORDER BY {order_by} LIMIT ?{limit_idx} OFFSET ?{offset_idx}"
+                build_candidate_entity_query(
+                    columns,
+                    &where_sql,
+                    &candidate_param_indices,
+                    &order_by,
+                    limit_idx,
+                    offset_idx,
                 )
             };
 

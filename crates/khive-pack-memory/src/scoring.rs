@@ -339,10 +339,9 @@ pub fn extract_entity_candidates(query: &str) -> Vec<String> {
 
 /// Maximum number of candidate strings a single recall sends to the batched
 /// entity-name lookup
-/// (ADR-104 §5 / Stage C, rider R1). Bounds the `LOWER(name) IN (...)`
-/// placeholder list built in `khive-db`'s `build_entity_where`, independent
-/// of `MAX_AUTO_ENTITY_NAMES`, which bounds the unrelated capitalized-token
-/// fallback list above.
+/// (ADR-104 §5 / Stage C, rider R1). Bounds the candidate `VALUES` relation
+/// consumed by `khive-db`, independent of `MAX_AUTO_ENTITY_NAMES`, which bounds
+/// the unrelated capitalized-token fallback list above.
 pub const MAX_ENTITY_LOOKUP_CANDIDATES: usize = 64;
 
 const MAX_BIGRAM_LOOKUP_CANDIDATES: usize = MAX_ENTITY_LOOKUP_CANDIDATES / 4;
