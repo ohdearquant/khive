@@ -326,6 +326,18 @@ fn tokenize(text: &str) -> Vec<String> {
 // `KHIVE_RECALL_PROFILE` eprintln profiler in the memory pack) and logs via
 // `tracing::warn!`, matching the WARN-on-anomaly style used elsewhere in this
 // crate (see `index_handler.rs`, `vamana.rs`).
+//
+// Round-1 codex review (#915) flagged that a phase only entered the reported
+// breakdown once its work finished — so the exact case this exists to
+// diagnose (a phase that stalls and then errors, is cancelled, or is
+// abandoned by a disconnected client) logged `phases=[]`, omitting the one
+// phase an on-call engineer needed. `begin(phase)` now opens the phase
+// *before* its (possibly fallible, possibly long-running) work starts; both
+// `finish` and `Drop` flush whatever phase is still open — `last..now` — into
+// that phase's bucket before emitting, so an in-flight phase is never lost.
+// The same flush also picks up the tail of the final phase (response-JSON
+// construction after the last measured stage), which a pre-`finish` mark
+// would otherwise miss.
 
 /// Compose requests whose total handler time reaches this are logged at WARN
 /// with a per-phase breakdown. 10s matches the example threshold named in
@@ -334,26 +346,80 @@ fn tokenize(text: &str) -> Vec<String> {
 /// incident unattributable.
 pub(super) const COMPOSE_SLOW_THRESHOLD_MS: u64 = 10_000;
 
+/// The fixed, closed set of `compose` stages timed by [`ComposeTiming`].
+///
+/// Compose's actual call sequence interleaves two DB fetches (domain/atom
+/// resolution, then section-body load) and two embedding reranks (atom-level,
+/// then section-level); `Fetch` and `Rerank` are each opened twice and
+/// accumulate across both occurrences rather than getting split into four
+/// differently-named buckets, matching how #887 asked for the breakdown
+/// (`suggest`/`fetch`/`rerank`/`trim`).
+///
+/// A closed enum backing a fixed-size array — rather than `Vec<(&str, _)>` —
+/// removes the heap allocation and linear name scan `ComposeTiming` would
+/// otherwise pay on every valid request (round-1 codex review, Low finding).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Phase {
+    Suggest,
+    Fetch,
+    Rerank,
+    Trim,
+}
+
+impl Phase {
+    const COUNT: usize = 4;
+    const ALL: [Phase; Self::COUNT] = [Phase::Suggest, Phase::Fetch, Phase::Rerank, Phase::Trim];
+
+    fn name(self) -> &'static str {
+        match self {
+            Phase::Suggest => "suggest",
+            Phase::Fetch => "fetch",
+            Phase::Rerank => "rerank",
+            Phase::Trim => "trim",
+        }
+    }
+
+    fn index(self) -> usize {
+        self as usize
+    }
+}
+
 /// Per-stage elapsed-time tracker for `knowledge.compose`.
 ///
-/// `mark(phase)` accumulates the time since the previous mark (or `start`)
-/// into that phase's running total — call it multiple times with the same
-/// name to add up non-contiguous work under one bucket (e.g. `compose` does
-/// two DB fetches and two embedding reranks that interleave in code order).
+/// `begin(phase)` must be called *before* that phase's work starts (in
+/// particular, before any `.await` the phase covers) — it closes out
+/// whichever phase was previously active (accumulating `last..now` into it)
+/// and opens `phase` as the new active phase. Because the active phase is
+/// known at every instant, `finish` and `Drop` can both flush an in-flight
+/// phase's partial duration into the breakdown rather than silently omitting
+/// it, which is what a slow-then-failing or cancelled-mid-phase request
+/// needs (round-1 codex review, Medium finding).
 ///
 /// `finish` must be the last thing called on every return path that
-/// completes the request (success or a business-logic error): it flags the
-/// timing as complete and, if the total reaches [`COMPOSE_SLOW_THRESHOLD_MS`],
-/// emits the slow-request WARN. If `finish` is never reached — because the
-/// enclosing future was dropped mid-poll (client disconnect, cancellation, or
-/// daemon shutdown drain) — `Drop` emits a distinct "abandoned" WARN with
-/// whatever phases completed and the elapsed time up to the drop, so a
-/// request that never produces a response is not silently invisible.
+/// completes the request (success or a business-logic error): it flushes the
+/// active phase, flags the timing as complete, and, if the total reaches
+/// [`COMPOSE_SLOW_THRESHOLD_MS`], emits the slow-request WARN. If `finish` is
+/// never reached — because the enclosing future was dropped mid-poll (client
+/// disconnect, cancellation, or daemon shutdown drain) — `Drop` performs the
+/// same flush and emits a distinct "abandoned" WARN, so a request that never
+/// produces a response is not silently invisible.
+///
+/// `query_bytes` records the query's UTF-8 *byte* length, not a char count —
+/// `str::len()` reads a value the string already carries (O(1)), unlike
+/// `.chars().count()`'s O(n) UTF-8 walk. Because it is O(1), there is nothing
+/// to gain by deferring it to the (rare) emission path the way the Low
+/// finding suggested for a genuinely O(n) computation: storing it eagerly
+/// costs the same as storing it lazily, and eager storage avoids holding a
+/// borrow of the caller's query string for the tracker's entire lifetime —
+/// `compose()` moves `raw_query` into the response body before calling
+/// `finish()`, so a borrowing field would not compile (round-1 codex review,
+/// Low finding).
 pub(super) struct ComposeTiming {
     start: Instant,
     last: Instant,
-    phases: Vec<(&'static str, Duration)>,
-    query_len: usize,
+    phase_totals: [Duration; Phase::COUNT],
+    active_phase: Option<Phase>,
+    query_bytes: usize,
     is_auto: bool,
     completed: bool,
 }
@@ -364,33 +430,53 @@ impl ComposeTiming {
         Self {
             start: now,
             last: now,
-            phases: Vec::with_capacity(4),
-            query_len: query.chars().count(),
+            phase_totals: [Duration::ZERO; Phase::COUNT],
+            active_phase: None,
+            query_bytes: query.len(),
             is_auto,
             completed: false,
         }
     }
 
-    pub(super) fn mark(&mut self, phase: &'static str) {
+    /// Closes the currently active phase (if any) into its accumulated
+    /// total, then opens `phase` as the new active phase. Call this
+    /// immediately before starting the phase's work — including before any
+    /// `.await` — not after it completes.
+    pub(super) fn begin(&mut self, phase: Phase) {
         let now = Instant::now();
-        let elapsed = now.duration_since(self.last);
-        match self.phases.iter_mut().find(|(name, _)| *name == phase) {
-            Some((_, total)) => *total += elapsed,
-            None => self.phases.push((phase, elapsed)),
+        if let Some(prev) = self.active_phase {
+            self.phase_totals[prev.index()] += now.duration_since(self.last);
         }
+        self.active_phase = Some(phase);
         self.last = now;
     }
 
-    fn phase_ms(&self) -> Vec<(&'static str, u64)> {
-        self.phases
-            .iter()
-            .map(|(name, d)| (*name, d.as_millis() as u64))
-            .collect()
+    /// Folds `last..now` into whichever phase is still active, so a phase
+    /// that never reached its own `begin(next_phase)` call (because the
+    /// request errored, was cancelled, or was dropped mid-phase) is still
+    /// represented in the breakdown instead of reading as zero/absent.
+    fn flush_active(&mut self) {
+        let now = Instant::now();
+        if let Some(phase) = self.active_phase {
+            self.phase_totals[phase.index()] += now.duration_since(self.last);
+            self.last = now;
+        }
     }
 
-    /// Consumes the tracker, marking it complete so `Drop` does not also log
-    /// an "abandoned" warning for a request that finished normally.
+    fn phase_ms(&self) -> [(&'static str, u64); Phase::COUNT] {
+        let mut out = [("", 0u64); Phase::COUNT];
+        for p in Phase::ALL {
+            out[p.index()] = (p.name(), self.phase_totals[p.index()].as_millis() as u64);
+        }
+        out
+    }
+
+    /// Consumes the tracker: flushes any still-active phase, marks it
+    /// complete so `Drop` does not also log an "abandoned" warning for a
+    /// request that finished normally, and emits the slow-request WARN if
+    /// the total reached [`COMPOSE_SLOW_THRESHOLD_MS`].
     pub(super) fn finish(mut self, atom_count: usize) {
+        self.flush_active();
         self.completed = true;
         let total_ms = self.start.elapsed().as_millis() as u64;
         if total_ms >= COMPOSE_SLOW_THRESHOLD_MS {
@@ -399,7 +485,7 @@ impl ComposeTiming {
                 threshold_ms = COMPOSE_SLOW_THRESHOLD_MS,
                 phases = ?self.phase_ms(),
                 atom_count,
-                query_len = self.query_len,
+                query_bytes = self.query_bytes,
                 is_auto = self.is_auto,
                 "knowledge.compose exceeded slow-request threshold"
             );
@@ -410,10 +496,11 @@ impl ComposeTiming {
 impl Drop for ComposeTiming {
     fn drop(&mut self) {
         if !self.completed {
+            self.flush_active();
             tracing::warn!(
                 elapsed_ms = self.start.elapsed().as_millis() as u64,
                 phases = ?self.phase_ms(),
-                query_len = self.query_len,
+                query_bytes = self.query_bytes,
                 is_auto = self.is_auto,
                 "knowledge.compose request abandoned before completion \
                  (client disconnect, cancellation, or daemon shutdown)"
@@ -616,73 +703,96 @@ mod tests {
     }
 
     #[test]
-    fn mark_accumulates_duration_under_repeated_phase_names() {
+    fn begin_accumulates_duration_under_repeated_phase_names() {
         let mut t = ComposeTiming::start("test query", false);
-        std::thread::sleep(Duration::from_millis(2));
-        t.mark("fetch");
-        std::thread::sleep(Duration::from_millis(2));
-        t.mark("rerank");
+        t.begin(Phase::Suggest);
         std::thread::sleep(Duration::from_millis(2));
         // Second DB fetch (e.g. load_sections) accumulates into the same
-        // "fetch" bucket instead of overwriting or duplicating it.
-        t.mark("fetch");
+        // Fetch bucket instead of overwriting or duplicating it.
+        t.begin(Phase::Fetch);
+        std::thread::sleep(Duration::from_millis(2));
+        t.begin(Phase::Rerank);
+        std::thread::sleep(Duration::from_millis(2));
+        t.begin(Phase::Fetch);
+        std::thread::sleep(Duration::from_millis(2));
+        t.begin(Phase::Trim);
 
-        assert_eq!(
-            t.phases.len(),
-            2,
-            "repeated phase name must accumulate, not duplicate"
-        );
-        let fetch_ms = t
-            .phases
-            .iter()
-            .find(|(name, _)| *name == "fetch")
-            .unwrap()
-            .1
-            .as_millis();
-        let rerank_ms = t
-            .phases
-            .iter()
-            .find(|(name, _)| *name == "rerank")
-            .unwrap()
-            .1
-            .as_millis();
+        let fetch_ms = t.phase_totals[Phase::Fetch.index()].as_millis();
+        let rerank_ms = t.phase_totals[Phase::Rerank.index()].as_millis();
         assert!(
             fetch_ms >= 4,
-            "accumulated fetch time must cover both marks (~4ms), got {fetch_ms}ms"
+            "accumulated fetch time must cover both begin(Fetch) spans (~4ms), got {fetch_ms}ms"
         );
         assert!(
             rerank_ms >= 2,
-            "rerank bucket must cover its single mark, got {rerank_ms}ms"
+            "rerank bucket must cover its single span, got {rerank_ms}ms"
         );
 
         t.finish(3);
     }
 
     #[test]
-    fn finish_marks_complete_and_suppresses_drop_warning() {
-        // No log-capture harness exists for this crate (#887 scope note); this
-        // exercises the non-panicking, completed-before-drop path. The
-        // behavioral guarantee (`completed` gates the Drop-time WARN) is
-        // covered structurally below.
-        let mut t = ComposeTiming::start("q", true);
-        t.mark("suggest");
-        t.finish(1);
+    fn finish_flushes_the_still_active_phase() {
+        // Regression for round-1 codex review (#915, Medium): a phase that
+        // never reaches its own `begin(next_phase)` — because the request
+        // errors, is cancelled, or `finish` is simply called mid-phase — must
+        // still show up in the breakdown with nonzero duration rather than
+        // being silently omitted (the exact bug: a slow, then-failing
+        // `suggest` used to log `phases=[]`). `finish` consumes the tracker
+        // and emits no return value, so this exercises the same flush it
+        // performs internally (`flush_active`, called first inside `finish`)
+        // directly on `phase_totals` — no log-capture harness exists in this
+        // crate (#887 scope note).
+        let mut t = ComposeTiming::start("test query", true);
+        t.begin(Phase::Suggest);
+        std::thread::sleep(Duration::from_millis(5));
+        // No begin(Phase::Fetch) — Suggest is still the active phase.
+        t.flush_active();
+        let suggest_ms = t.phase_totals[Phase::Suggest.index()].as_millis();
+        assert!(
+            suggest_ms >= 5,
+            "in-flight Suggest phase must be flushed with nonzero duration, got {suggest_ms}ms"
+        );
+        t.finish(0);
     }
 
     #[test]
-    fn drop_without_finish_does_not_panic() {
-        // Simulates an abandoned request (future dropped before `finish`,
-        // e.g. client disconnect or cancellation) — must not panic even
-        // though `completed` was never set.
-        let t = ComposeTiming::start("abandoned", false);
+    fn drop_without_finish_flushes_the_active_phase_and_does_not_panic() {
+        // Simulates an abandoned request (future dropped mid-phase, e.g.
+        // client disconnect or cancellation) — the phase active at drop time
+        // must be flushed into the breakdown (not lost) and drop must not
+        // panic even though `completed` was never set.
+        let mut t = ComposeTiming::start("abandoned", false);
+        t.begin(Phase::Rerank);
+        std::thread::sleep(Duration::from_millis(5));
+        // `flush_active` is idempotent (repeated calls just extend `last`),
+        // so calling it here to observe the pre-drop state does not change
+        // what Drop itself will flush.
+        t.flush_active();
+        let rerank_ms = t.phase_totals[Phase::Rerank.index()].as_millis();
+        assert!(
+            rerank_ms >= 5,
+            "in-flight Rerank phase must be flushed before drop, got {rerank_ms}ms"
+        );
         drop(t);
     }
 
     #[test]
-    fn start_records_query_char_length_not_byte_length() {
-        // Multi-byte UTF-8 query: char count must not silently be byte count.
+    fn begin_with_no_prior_active_phase_does_not_panic() {
+        // The very first `begin` call has nothing to flush.
+        let t = ComposeTiming::start("q", true);
+        drop(t);
+    }
+
+    #[test]
+    fn query_bytes_is_byte_length_not_char_length() {
+        // Multi-byte UTF-8 query: byte length (the documented, O(1) choice)
+        // must not silently become a char count.
         let t = ComposeTiming::start("héllo wörld", false);
-        assert_eq!(t.query_len, 11);
+        assert_eq!(
+            t.query_bytes, 13,
+            "2 non-ASCII chars, each 2 bytes in UTF-8"
+        );
         t.finish(0);
     }
 }

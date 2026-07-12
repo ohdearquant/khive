@@ -1286,8 +1286,13 @@ impl KnowledgeHandlers {
         // WARN-on-abandoned. See `super::compose::ComposeTiming` for the
         // full rationale and the completion-contract every early return
         // below must honor (`finish()` before returning, or route the error
-        // through `try_or_finish!`).
+        // through `try_or_finish!`). Each `begin(Phase::X)` fires *before*
+        // the phase's (possibly fallible, possibly long-running) work — not
+        // after — so an in-flight phase is never lost from the breakdown if
+        // the request errors, is cancelled, or is abandoned mid-phase.
+        use super::compose::Phase;
         let mut timing = super::compose::ComposeTiming::start(&raw_query, is_auto);
+        timing.begin(Phase::Suggest);
         macro_rules! try_or_finish {
             ($e:expr) => {
                 match $e {
@@ -1355,7 +1360,7 @@ impl KnowledgeHandlers {
                 return Ok(json!({ "status": "ok", "data": data }));
             }
         }
-        timing.mark("suggest");
+        timing.begin(Phase::Fetch);
 
         let ns = token.namespace().as_str().to_owned();
 
@@ -1395,7 +1400,6 @@ impl KnowledgeHandlers {
                 !COMPOSE_EXCLUDE.contains(&status)
             });
         }
-        timing.mark("fetch");
 
         if ordered_atoms.is_empty() {
             timing.finish(0);
@@ -1422,8 +1426,8 @@ impl KnowledgeHandlers {
             })
             .collect();
 
+        timing.begin(Phase::Rerank);
         try_or_finish!(rerank_text_items(runtime, &raw_query, &mut items).await);
-        timing.mark("rerank");
 
         let atom_ids: Vec<String> = ordered_atoms.iter().map(|a| a.id.to_string()).collect();
         let atom_cosine_scores: HashMap<String, f32> = items
@@ -1431,11 +1435,12 @@ impl KnowledgeHandlers {
             .map(|item| (item.id.clone(), item.score))
             .collect();
 
+        timing.begin(Phase::Fetch);
         let section_map =
             try_or_finish!(super::compose::load_sections(runtime, &ns, &atom_ids).await);
-        timing.mark("fetch");
 
         let has_sections = !section_map.is_empty();
+        timing.begin(Phase::Rerank);
 
         let mut section_results = if has_sections {
             let domain_member_ids: HashSet<String> = member_slugs
@@ -1479,7 +1484,7 @@ impl KnowledgeHandlers {
         } else {
             Vec::new()
         };
-        timing.mark("rerank");
+        timing.begin(Phase::Trim);
 
         let max_tokens = p.max_tokens.unwrap_or(8000).clamp(500, 100_000);
         const CHARS_PER_TOKEN: usize = 4;
@@ -1572,7 +1577,6 @@ impl KnowledgeHandlers {
             .collect();
 
         let count = atom_json.len();
-        timing.mark("trim");
 
         let mut data = json!({
             "query": raw_query,
