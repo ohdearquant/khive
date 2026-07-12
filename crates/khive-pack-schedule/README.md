@@ -7,7 +7,7 @@ The schedule pack for khive — time-triggered intent storage (`remind`,
 
 | Verb                | What it does                                                            |
 | ------------------- | ----------------------------------------------------------------------- |
-| `schedule.remind`   | Create a time-triggered reminder                                        |
+| `schedule.remind`   | Deliver a time-triggered reminder to your inbox                         |
 | `schedule.schedule` | Schedule a future verb dispatch (a DSL string, validated at write time) |
 | `schedule.agenda`   | List upcoming scheduled events, optionally within a time window         |
 | `schedule.cancel`   | Cancel a scheduled event                                                |
@@ -21,9 +21,11 @@ next occurrence.
 
 ## Semantics
 
-This pack is **intent storage only**. It creates and queries
-`scheduled_event` notes; it does not itself evaluate triggers. `schedule.remind`
-stores a plain reminder payload, while `schedule.schedule`'s `action` parameter
+This pack creates and queries `scheduled_event` notes; the daemon or pending-event
+runner evaluates their triggers. At fire time, `schedule.remind` delivers its
+content to the creating actor's inbox through the same dual-write path as
+`comm.send`. Use `schedule.schedule(action="comm.send(...)")` when the recipient
+is a different actor. `schedule.schedule`'s `action` parameter
 is a full verb-dispatch string (e.g.
 `"schedule.remind(content=\"hello\", at=\"2099-06-01T09:00:00Z\")"`) that must
 satisfy a stricter *replayable* contract, validated at write time (issue
@@ -35,9 +37,9 @@ inner call must itself be independently valid, because `kkernel`'s
 pending-events runner re-parses and re-dispatches the stored string
 unmodified at trigger time. An `action` that fails any of these checks is
 rejected before the event is stored, not at trigger time. Reading pending
-events and dispatching their stored payload at `trigger_at` is the execution
-environment's responsibility (a `kkernel scheduler` daemon, or an external
-cron / cloud scheduler invoking the runtime).
+events and dispatching at `trigger_at` is the execution environment's
+responsibility (the daemon tick or an external cron / cloud scheduler invoking
+the pending-event runner).
 
 ## Usage
 

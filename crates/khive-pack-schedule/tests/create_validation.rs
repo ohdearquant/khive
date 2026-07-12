@@ -43,6 +43,50 @@ async fn remind_creates_pending_event() {
 }
 
 #[tokio::test]
+async fn remind_persists_the_creating_actor_for_delivery() {
+    let runtime = KhiveRuntime::memory().expect("in-memory runtime");
+    let mut builder = VerbRegistryBuilder::new();
+    builder.with_actor_id(Some("lambda:reminder-owner".to_string()));
+    builder.register(khive_pack_kg::KgPack::new(runtime.clone()));
+    builder.register(SchedulePack::new(runtime.clone()));
+    let registry = builder.build().expect("registry builds");
+
+    let result = registry
+        .dispatch(
+            "schedule.remind",
+            serde_json::json!({
+                "content": "check status",
+                "at": "2099-06-01T09:00:00Z"
+            }),
+        )
+        .await
+        .expect("remind succeeds");
+
+    let id = result["full_id"]
+        .as_str()
+        .expect("full_id present")
+        .parse()
+        .expect("full_id is a UUID");
+    let token = runtime
+        .authorize(khive_runtime::Namespace::local())
+        .expect("authorize");
+    let note = runtime
+        .notes(&token)
+        .expect("notes")
+        .get_note(id)
+        .await
+        .expect("read reminder")
+        .expect("reminder exists");
+
+    assert_eq!(
+        note.properties
+            .as_ref()
+            .and_then(|props| props["created_by_actor"].as_str()),
+        Some("lambda:reminder-owner")
+    );
+}
+
+#[tokio::test]
 async fn schedule_creates_pending_event_with_action() {
     let (registry, _rt) = build_registry();
 

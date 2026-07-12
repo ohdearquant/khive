@@ -803,6 +803,7 @@ pub(crate) async fn handle_remind(
         "repeat": p.repeat,
         "status": "pending",
         "event_type": "remind",
+        "created_by_actor": token.actor().id.clone(),
         "payload": null,
         "fired_at": null,
         "cancelled_at": null,
