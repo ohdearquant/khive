@@ -26,7 +26,7 @@ an error (`Sql`, `Notes`, `Entities`, `Graph`, `Events`, `Vectors`, `Sparse`,
 `khive-storage` depends on neither `rusqlite` nor `khive-db`, preserving the
 trait-only boundary. Backends implement these traits in their own crates.
 
-### [ADR-031: Multi-Engine Retrieval](../../../docs/adr/ADR-031-multi-engine-retrieval.md)
+### [ADR-031: Multi-Engine Retrieval — Embedder Trait, Registry, Configuration, and Pack Orchestration](../../../docs/adr/ADR-031-multi-engine-retrieval.md)
 
 `SparseStore` defines the sparse vector capability surface over the
 `SparseVector` type (parallel `indices`/`values` arrays). `TextSearch` defines
@@ -36,7 +36,7 @@ Non-default gather options return `StorageError::Unsupported` on backends that d
 not override the method. Term-level document-frequency statistics are exposed via
 `term_stats`, also optional (`Unsupported` by default).
 
-### [ADR-041: Event Provenance Projection](../../../docs/adr/ADR-041-event-provenance-projection.md) / [ADR-044: Vector Store Extensions](../../../docs/adr/ADR-044-vector-store-extensions.md)
+### [ADR-041: Event Provenance Projection — Hybrid Log + Graph Edges](../../../docs/adr/ADR-041-event-provenance-projection.md) / [ADR-044: Vector Store Extensions — Capabilities, Metadata Filter, Batched Search, Update, Orphan Sweep](../../../docs/adr/ADR-044-vector-store-extensions.md)
 
 `VectorStoreCapabilities` is returned by `VectorStore::capabilities()` and
 introspected by the retrieval layer at construction time to select code paths

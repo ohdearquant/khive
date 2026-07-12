@@ -2,7 +2,7 @@
 
 ## ADR Compliance
 
-### ADR-032 (Brain Pack)
+### Brain Pack (ADR-032)
 
 The brain pack implements profile-oriented Bayesian auto-tuning over the shared event log.
 
@@ -40,7 +40,7 @@ system-default fallback for `consumer_kind="recall"` when no explicit binding ma
 `FeedbackExplicit` event emitter. `brain.emit` predates this design and its log entries are
 treated as `Irrelevant` to avoid spurious updates during event replay.
 
-### ADR-048 (Section Posteriors)
+### Section Posteriors (ADR-048)
 
 Section posteriors track per-section relevance weights within a knowledge atom. Each profile
 maintains a `SectionPosteriorState` keyed by `SectionType` (10 canonical types: Overview,

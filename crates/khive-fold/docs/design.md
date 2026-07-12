@@ -36,7 +36,7 @@
 
 ## ADR Compliance
 
-### ADR-024: Fold Cognitive Primitives (no-clock rule)
+### Fold Cognitive Primitives (no-clock rule) (ADR-024)
 
 `FoldContext` and `ObjectiveContext` both default `as_of` to `DateTime::<Utc>::default()`
 (Unix epoch) rather than calling `Utc::now()`. This is deliberate: the foundation layer must

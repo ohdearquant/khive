@@ -17,6 +17,9 @@ cargo fmt --all -- --check
 echo "=== SQL Lint ==="
 sh "$SCRIPT_DIR/lint-sql.sh"
 
+echo "=== ADR Reference Lint ==="
+sh "$SCRIPT_DIR/lint-adr-refs.sh"
+
 echo "=== No-Stub Guard (clippy restriction lints) ==="
 # AST-aware "No stubs. Ever." enforcement. clippy parses the macros, so it is
 # immune to the grep failure modes (spacing like `todo !()`, brace forms like

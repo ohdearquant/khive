@@ -2,7 +2,7 @@
 
 ## ADR Compliance
 
-### ADR-009: Graph Edge Routing
+### Graph Edge Routing (ADR-009)
 
 - `graph_edges` carries a `target_backend` column added in V9 that enables
   backend-specific routing for edge traversal.
@@ -15,7 +15,7 @@
   correctly without whitespace-based tokenization. All `text()` and
   `text_with_tokenizer()` backends default to `trigram`.
 
-### ADR-015: Schema Migration System
+### Schema Migration System (ADR-015)
 
 - `migrations.rs` contains all versioned DDL in a single file — splitting
   across files would make migration sequencing harder to verify.
@@ -27,7 +27,7 @@
 - V6/V7/V8 are frozen no-op slots; their `name` strings appear in the
   production `_schema_migrations` table and must not change.
 
-### ADR-017: Pack Standard — Pack-Auxiliary Schema
+### Pack Standard — Pack-Auxiliary Schema (ADR-017)
 
 - `apply_pack_ddl_statements` runs pack DDL idempotently without version
   tracking. Pack auxiliary tables use `CREATE TABLE IF NOT EXISTS` and are
@@ -35,11 +35,11 @@
 - The `SchemaPlan` type lives in `khive-runtime` (above this crate); this
   method accepts `&[&'static str]` to avoid a circular dependency.
 
-### ADR-031: SparseStore
+### SparseStore (ADR-031)
 
 - `stores/sparse.rs` implements the SQLite-backed `SparseStore` trait.
 
-### ADR-043: Embedding Model Registry
+### Embedding Model Registry (ADR-043)
 
 - `_embedding_models` table (created in V14) tracks which embedding model
   is active per vector engine with a canonical key for deduplication.
@@ -52,32 +52,32 @@
   a preserving rebuild of vec0 virtual tables to add the same column without
   data loss.
 
-### ADR-044: Old-Schema Vec0 Detection
+### Old-Schema Vec0 Detection (ADR-044)
 
 - At vector store open time, `pragma_table_info` inspects whether the `field`
   column exists. Tables predating the field column are flagged with an error
   after V17 (the silent-drop path was removed in V17).
 
-### ADR-046: Event-Sourced Proposals
+### Event-Sourced Proposals (ADR-046)
 
 - V15 creates `proposals_open`, a fold-derived projection of proposal events
   that makes `list(kind=proposal, status="open")` an index scan.
 - V18 adds `'applying'` to the `proposals_open` status CHECK constraint to
   handle the apply/withdraw race condition.
 
-### ADR-047: Entity Domain Filter Case Sensitivity
+### Entity Domain Filter Case Sensitivity (ADR-047)
 
 - The tags/domain filter in `SqlEntityStore` normalizes values to lowercase
   before comparison so that domain filtering is case-insensitive.
 
-### ADR-048: Brain Pack + Knowledge Sections
+### Brain Pack + Knowledge Sections (ADR-048)
 
 - V20 creates `brain_profile_snapshots` and `brain_event_log` tables for
   the brain pack (Phase 1).
 - V21 creates `knowledge_sections` with a 10-value SectionType enum, FK to
   `knowledge_atoms`, and UNIQUE(atom_id, section_type) (Phase 2).
 
-### ADR-049: Daemon & Warm Startup
+### Daemon & Warm Startup (ADR-049)
 
 - V22 extends `knowledge_atoms`, `knowledge_sections`, and `knowledge_domains`
   with a `status` column (NOT NULL DEFAULT 'draft'), plus `source_uri` and

@@ -2,7 +2,7 @@
 
 ## ADR Compliance
 
-### ADR-002: Edge Ontology
+### Edge Ontology (ADR-002)
 
 - 17 closed edge relations (15 base relations plus 2 epistemic relations added by ADR-055);
   endpoint contract enforced at the runtime layer in `operations.rs`
@@ -14,13 +14,13 @@
 - `dependency_kind` metadata key is only valid on `depends_on` edges
 - Pack-declared edge endpoint rules are additive only; packs cannot tighten the base contract
 
-### ADR-004 / ADR-005: Event and Storage Capability Traits
+### Event and Storage Capability Traits (ADR-004, ADR-005)
 
 - `EventStore::append` is called after each authorized dispatch to record audit events
 - The audit payload field holds the full `AuditEvent` envelope (not a bare verb result)
 - Top-level event fields follow the ADR-004/ADR-005 schema
 
-### ADR-007: Namespace Strategy (Rev 6)
+### Namespace Strategy (Rev 6) (ADR-007)
 
 - Namespace is attribution and gate-policy input, not a storage partition; it is not a
   by-ID access control boundary
@@ -35,21 +35,21 @@
   scope produced at the gate boundary; it is not a by-ID access guard (historical:
   earlier ADR-007 revisions described it as the storage trust boundary — superseded)
 
-### ADR-009 / ADR-028: Multi-Backend Deployment
+### Multi-Backend Deployment (ADR-009, ADR-028)
 
 - `BackendId` identifies a named backend in multi-backend deployments; single-backend uses `"main"`
 - `KhiveRuntime::from_backend` is the preferred boot path for multi-backend deployments
 - Cross-backend `merge_entity` is unsupported in v1; both entities must reside on the same backend
 - `db_path` and `embedding_model` on `RuntimeConfig` are deprecated in favour of the external-backend path
 
-### ADR-010: KG Versioning / Portability
+### KG Versioning / Portability (ADR-010)
 
 - Export format is `"khive-kg"` version `"0.1"` (stable identifier for archive parsers)
 - Embeddings are excluded from archives (regenerable from text + model)
 - Edges are collected by source entity, not by namespace scan, to capture cross-entity relationships
 - `edge_id` field on `ExportedEdge` is stable across export/import cycles; old archives without it receive a fresh UUID on import
 
-### ADR-013 / ADR-024: Note Kinds and Annotation
+### Note Kinds and Annotation (ADR-013, ADR-024)
 
 - `annotates` edges targeting a note are validated before any write (atomicity)
 - `annotates` targets can be entity, note, edge, or event (cross-substrate by design)
@@ -86,7 +86,7 @@
 - `VerbRegistry` emits one `gate.check` info trace event per dispatch for observability
 - Obligations on `GateDecision::Allow` are serialized as an empty array when there are none
 
-### ADR-002 / ADR-019: Note and Edge Operations
+### Note and Edge Operations (ADR-002, ADR-019)
 
 - Three-case relation contract for link operations: annotates, supersedes, and entity→entity base rules
   (ADR-002: Edge Ontology governs the endpoint contract; ADR-019: GTD Pack extends it for task notes).
@@ -98,39 +98,39 @@
 - Default decay rate: 0.01 (~69-day half-life)
 - Per-note `decay_factor` is used by `DecayAwareSalienceObjective` rather than the objective's own rate
 
-### ADR-023: Declarative Pack Format
+### Declarative Pack Format (ADR-023)
 
 - Verb surface and visibility are declared per-pack; only `Visibility::Verb` entries appear in `help=true` envelopes
 - `all_verbs` returns only public verb entries; internal subhandlers require `all_handlers_with_names`
 
-### ADR-025: Pack Dispatch Trait
+### Pack Dispatch Trait (ADR-025)
 
 - `PackRuntime::dispatch` is the async per-verb entry point for each pack
 - Packs that do not use an embedder registry may ignore the `register_embedders` hook
 
-### ADR-027: Dynamic Pack Loading
+### Dynamic Pack Loading (ADR-027)
 
 - Pack factories are discovered via `inventory` at link time; missing dependencies are a boot error
 - Missing dependencies are not silently auto-added; the requested set must be explicit
 - `PackRegistry` performs topological sort of packs using Kahn's algorithm
 
-### ADR-029: Gate Authorization
+### Gate Authorization (ADR-029)
 
 - `RuntimeConfig::gate` defaults to `AllowAllGate`; production deployments plug in a policy-backed impl
 
-### ADR-030: Layered Retrieval Architecture
+### Layered Retrieval Architecture (ADR-030)
 
 - `KindHook` provides per-kind specialization for shared CRUD operations
 - The retrieval pipeline composes signal objectives without IO; the runtime layer materialises signal data
 
-### ADR-031: Pack-Extensible Embedder Registry
+### Pack-Extensible Embedder Registry (ADR-031)
 
 - Pack-declared embedder providers are registered via `PackRuntime::register_embedders`
 - Pack-extensible edge endpoint rules are shared across clones via `Arc<RwLock<_>>`
 - Base ADR-002 rules apply independently; pack rules are additive
 - `KhiveRuntime::install_edge_rules` is called once by the transport after `VerbRegistry` is built
 
-### ADR-033: Recall Pipeline
+### Recall Pipeline (ADR-033)
 
 - `NoteCandidate` carries pre-computed signals; objectives are pure functions with no IO
 - `MemoryRecallPipeline::default()` uses the ADR-021 default decay parameters
@@ -143,38 +143,38 @@
 - `GraphPatch` is a deferred stub; the auto-fix write path is not yet implemented
 - Violations are grouped by rule ID and sorted canonically
 
-### ADR-037: Inter-Pack Dependencies
+### Inter-Pack Dependencies (ADR-037)
 
 - Missing pack dependencies are collected and reported as a single `MissingPackDependencies` error
 - Circular dependencies are detected during topological sort and reported as `CircularPackDependency`
 - Remote resolution errors (`UnknownRemote`, `RemoteCacheMissing`) are part of the same error family
 
-### ADR-049: ANN Warmup
+### ANN Warmup (ADR-049)
 
 - `KhiveRuntime::warm_ann_index` is intended to run once at startup as a background task.
   The warm-start protocol is owned by the daemon (ADR-049: khived daemon); the runtime
   exposes the `warm_ann_index` hook for the daemon to invoke during startup.
 - Warm startup sequence follows steps 2–4 from the ANN warmup spec.
 
-### ADR-045: Verb Response Presentation
+### Verb Response Presentation (ADR-045)
 
 - `micros_to_iso` is the single conversion point from internal `i64` microsecond timestamps to ISO-8601
 - `Agent` mode: short UUIDs (8-char), relative timestamps within 24h, lifecycle nulls preserved, scores truncated to 3 sig-figs
 - `Human` mode at the MCP layer is identical to `Verbose`; terminal formatting is applied by the CLI layer
 - `full_id` is explicitly excluded from UUID shortening in Agent mode to preserve chaining handles
 
-### ADR-020: Stable Edge Identity
+### Stable Edge Identity (ADR-020)
 
 - `ExportedEdge::edge_id` carries the stable `LinkId` UUID across export/import cycles,
   as specified in ADR-020 (Git-Native KG Implementation) §edge_id.
 - Old archives (pre-0.2) omit `edge_id`; `serde(default)` assigns a fresh UUID on import.
 
-### ADR-049: Persistent Daemon
+### Persistent Daemon (ADR-049)
 
 - `khived` is a persistent warm runtime over a Unix socket
 - `PackRuntime::warm` is invoked on every registered pack during daemon startup
 
-### ADR-050: Namespace Token Contract
+### Namespace Token Contract (ADR-050)
 
 - `NamespaceToken` is sealed to prevent external construction without gate authorization
 - Namespace authority governs which namespace(s) a dispatch can read/write (minted at

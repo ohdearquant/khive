@@ -9,9 +9,9 @@ has no dependency on storage, DB, or runtime crates.
 ## ADR Links
 
 - [ADR-001: Entity Kind Taxonomy](../../../docs/adr/ADR-001-entity-kind-taxonomy.md)
-- [ADR-002: Edge Ontology](../../../docs/adr/ADR-002-edge-ontology.md)
+- [ADR-002: Closed Edge Ontology](../../../docs/adr/ADR-002-edge-ontology.md)
 - [ADR-008: Query Layer Separation](../../../docs/adr/ADR-008-query-layer-separation.md)
-- [ADR-041: Event Provenance Projection](../../../docs/adr/ADR-041-event-provenance-projection.md)
+- [ADR-041: Event Provenance Projection — Hybrid Log + Graph Edges](../../../docs/adr/ADR-041-event-provenance-projection.md)
 
 ## Modules
 
@@ -71,7 +71,7 @@ ADR-008. It is intentionally split into three stages:
   text. Any attempt to set `namespace` in a query node property or WHERE condition
   is rejected at validation time.
 
-### ADR-041: Synthetic Observation Edge Paths
+### Synthetic Observation Edge Paths (ADR-041)
 
 Relations prefixed `observed_as_*` (specifically: `observed_as_candidate`,
 `observed_as_selected`, `observed_as_target`, `observed_as_signal`) are synthetic
