@@ -137,9 +137,11 @@ The compiler rejects queries exceeding this depth at AST validation time.
 
 ### GQL WHERE expression
 
-GQL `WHERE` clauses require `OR` and `IN` AST nodes for non-trivial filtering. The
-query parser must support these in addition to `AND`, equality, and comparison predicates.
-Without `OR`/`IN`, multi-value filters require N separate queries or caller-side UNION.
+GQL `WHERE` clauses support `AND` and `OR` expression nodes plus `=`, `!=`, `>`, `<`,
+`>=`, `<=`, `LIKE`, `CONTAINS`, `STARTS WITH`, `IN` list literals, and `IS NOT NULL`
+predicates. `CONTAINS` and `STARTS WITH` compile to escaped, parameterized `LIKE`
+predicates. `IN` values are individually bound. Without `OR`/`IN`, multi-value filters
+require N separate queries or caller-side UNION.
 
 ### Read-only constraint
 

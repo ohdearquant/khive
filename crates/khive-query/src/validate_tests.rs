@@ -104,6 +104,32 @@ fn rejects_unknown_relation_in_where() {
 }
 
 #[test]
+fn where_relation_in_validates_every_list_member() {
+    let mut valid =
+        gql::parse("MATCH (a)-[e]->(b) WHERE e.relation IN ['extends', 'variant_of'] RETURN a")
+            .unwrap();
+    assert!(validate(&mut valid).is_ok());
+
+    let mut invalid =
+        gql::parse("MATCH (a)-[e]->(b) WHERE e.relation IN ['extends', 'not_real'] RETURN a")
+            .unwrap();
+    let err = validate(&mut invalid).unwrap_err();
+    assert!(err.to_string().contains("not_real"), "msg: {err}");
+
+    let mut non_string =
+        gql::parse("MATCH (a)-[e]->(b) WHERE e.relation IN ['extends', 1] RETURN a").unwrap();
+    let err = validate(&mut non_string).unwrap_err();
+    assert!(err.to_string().contains("must be strings"), "msg: {err}");
+}
+
+#[test]
+fn where_relation_contains_is_not_exact_relation_validation() {
+    let mut q =
+        gql::parse("MATCH (a)-[e]->(b) WHERE e.relation CONTAINS 'extend' RETURN a").unwrap();
+    assert!(validate(&mut q).is_ok());
+}
+
+#[test]
 fn query_edge_relation_bang_rejected() {
     // Regression for #471: relation filters with punctuation must be
     // rejected as Validation errors, not silently normalised into a

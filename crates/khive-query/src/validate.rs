@@ -5,7 +5,7 @@ use std::str::FromStr;
 
 use khive_types::EdgeRelation;
 
-use crate::ast::{Condition, ConditionValue, GqlQuery, PatternElement};
+use crate::ast::{CompareOp, Condition, ConditionValue, GqlQuery, PatternElement};
 use crate::error::QueryError;
 
 /// Valid synthetic relations; unknown `observed_as_*` strings are rejected.
@@ -209,10 +209,33 @@ fn validate_condition(cond: &mut Condition, is_edge: bool) -> Result<(), QueryEr
         )),
         "kind" if !is_edge => Ok(()),
         "relation" if is_edge => {
-            if let ConditionValue::String(ref mut s) = cond.value {
+            let normalize = |s: &mut String| -> Result<(), QueryError> {
                 let parsed = EdgeRelation::from_str(s)
                     .map_err(|err| QueryError::Validation(err.to_string()))?;
                 *s = parsed.as_str().to_string();
+                Ok(())
+            };
+            if matches!(
+                cond.op,
+                CompareOp::Contains | CompareOp::StartsWith | CompareOp::IsNotNull
+            ) {
+                return Ok(());
+            }
+            match &mut cond.value {
+                ConditionValue::String(s) => normalize(s)?,
+                ConditionValue::List(values) => {
+                    for value in values {
+                        match value {
+                            ConditionValue::String(s) => normalize(s)?,
+                            _ => {
+                                return Err(QueryError::Validation(
+                                    "relation IN list values must be strings".into(),
+                                ));
+                            }
+                        }
+                    }
+                }
+                _ => {}
             }
             Ok(())
         }

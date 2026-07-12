@@ -297,6 +297,11 @@ fn compile_property_equality(
             params.push(QueryValue::Float(*n));
         }
         ConditionValue::Bool(b) => params.push(QueryValue::Integer(if *b { 1 } else { 0 })),
+        ConditionValue::List(_) | ConditionValue::Null => {
+            return Err(QueryError::Validation(
+                "list and null operands are not valid in inline property maps".into(),
+            ));
+        }
     }
     let collate = if is_string { " COLLATE NOCASE" } else { "" };
     Ok(match text_column {
@@ -818,30 +823,16 @@ fn compile_single_condition(
         },
     };
 
-    let op_str = match cond.op {
-        CompareOp::Eq => "=",
-        CompareOp::Neq => "!=",
-        CompareOp::Gt => ">",
-        CompareOp::Lt => "<",
-        CompareOp::Gte => ">=",
-        CompareOp::Lte => "<=",
-        CompareOp::Like => "LIKE",
-    };
+    compile_condition_predicate(&col_expr, cond, params)
+}
 
-    let sql = match &cond.value {
-        ConditionValue::String(s) => {
-            params.push(QueryValue::Text(s.clone()));
-            let collate = if matches!(cond.op, CompareOp::Eq | CompareOp::Like) {
-                " COLLATE NOCASE"
-            } else {
-                ""
-            };
-            format!("{col_expr} {op_str} ?{}{}", params.len(), collate)
-        }
-        ConditionValue::Integer(n) => {
-            params.push(QueryValue::Integer(*n));
-            format!("{col_expr} {op_str} ?{}", params.len())
-        }
+fn bind_condition_value(
+    value: &ConditionValue,
+    params: &mut Vec<QueryValue>,
+) -> Result<usize, QueryError> {
+    match value {
+        ConditionValue::String(s) => params.push(QueryValue::Text(s.clone())),
+        ConditionValue::Integer(n) => params.push(QueryValue::Integer(*n)),
         ConditionValue::Number(n) => {
             if !n.is_finite() {
                 return Err(QueryError::InvalidInput(
@@ -849,14 +840,106 @@ fn compile_single_condition(
                 ));
             }
             params.push(QueryValue::Float(*n));
-            format!("{col_expr} {op_str} ?{}", params.len())
         }
         ConditionValue::Bool(b) => {
             params.push(QueryValue::Integer(if *b { 1 } else { 0 }));
-            format!("{col_expr} {op_str} ?{}", params.len())
         }
-    };
-    Ok(sql)
+        ConditionValue::List(_) | ConditionValue::Null => {
+            return Err(QueryError::Validation(
+                "operator requires a scalar value".into(),
+            ));
+        }
+    }
+    Ok(params.len())
+}
+
+fn escape_like_literal(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for ch in value.chars() {
+        if matches!(ch, '\\' | '%' | '_') {
+            escaped.push('\\');
+        }
+        escaped.push(ch);
+    }
+    escaped
+}
+
+fn compile_condition_predicate(
+    col_expr: &str,
+    cond: &Condition,
+    params: &mut Vec<QueryValue>,
+) -> Result<String, QueryError> {
+    match cond.op {
+        CompareOp::Contains | CompareOp::StartsWith => {
+            let ConditionValue::String(value) = &cond.value else {
+                return Err(QueryError::Validation(
+                    "CONTAINS and STARTS WITH require a string literal".into(),
+                ));
+            };
+            let escaped = escape_like_literal(value);
+            let pattern = if cond.op == CompareOp::Contains {
+                format!("%{escaped}%")
+            } else {
+                format!("{escaped}%")
+            };
+            params.push(QueryValue::Text(pattern));
+            Ok(format!(
+                "{col_expr} LIKE ?{} COLLATE NOCASE ESCAPE '\\'",
+                params.len()
+            ))
+        }
+        CompareOp::In => {
+            let ConditionValue::List(values) = &cond.value else {
+                return Err(QueryError::Validation("IN requires a list literal".into()));
+            };
+            if values.is_empty() {
+                return Ok("0".into());
+            }
+            let all_strings = values
+                .iter()
+                .all(|value| matches!(value, ConditionValue::String(_)));
+            let placeholders = values
+                .iter()
+                .map(|value| bind_condition_value(value, params).map(|index| format!("?{index}")))
+                .collect::<Result<Vec<_>, _>>()?;
+            let collate = if all_strings { " COLLATE NOCASE" } else { "" };
+            Ok(format!(
+                "{col_expr}{collate} IN ({})",
+                placeholders.join(", ")
+            ))
+        }
+        CompareOp::IsNotNull => {
+            if !matches!(cond.value, ConditionValue::Null) {
+                return Err(QueryError::Validation(
+                    "IS NOT NULL does not accept a value".into(),
+                ));
+            }
+            Ok(format!("{col_expr} IS NOT NULL"))
+        }
+        op => {
+            let op_str = match op {
+                CompareOp::Eq => "=",
+                CompareOp::Neq => "!=",
+                CompareOp::Gt => ">",
+                CompareOp::Lt => "<",
+                CompareOp::Gte => ">=",
+                CompareOp::Lte => "<=",
+                CompareOp::Like => "LIKE",
+                CompareOp::Contains
+                | CompareOp::StartsWith
+                | CompareOp::In
+                | CompareOp::IsNotNull => unreachable!(),
+            };
+            let is_string = matches!(cond.value, ConditionValue::String(_));
+            let param_index = bind_condition_value(&cond.value, params)?;
+            let collate = if is_string && matches!(op, CompareOp::Eq | CompareOp::Like) {
+                " COLLATE NOCASE"
+            } else {
+                ""
+            };
+            Ok(format!("{col_expr} {op_str} ?{param_index}{collate}"))
+        }
+    }
 }
 
 fn expr_endpoint_set(
@@ -949,44 +1032,7 @@ fn compile_var_len_condition(
             )
         };
 
-    let op_str = match cond.op {
-        CompareOp::Eq => "=",
-        CompareOp::Neq => "!=",
-        CompareOp::Gt => ">",
-        CompareOp::Lt => "<",
-        CompareOp::Gte => ">=",
-        CompareOp::Lte => "<=",
-        CompareOp::Like => "LIKE",
-    };
-
-    let sql = match &cond.value {
-        ConditionValue::String(s) => {
-            params.push(QueryValue::Text(s.clone()));
-            let collate = if matches!(cond.op, CompareOp::Eq | CompareOp::Like) {
-                " COLLATE NOCASE"
-            } else {
-                ""
-            };
-            format!("{col_expr} {op_str} ?{}{collate}", params.len())
-        }
-        ConditionValue::Integer(n) => {
-            params.push(QueryValue::Integer(*n));
-            format!("{col_expr} {op_str} ?{}", params.len())
-        }
-        ConditionValue::Number(n) => {
-            if !n.is_finite() {
-                return Err(QueryError::InvalidInput(
-                    "non-finite float (NaN or Infinity) is not a valid query parameter".into(),
-                ));
-            }
-            params.push(QueryValue::Float(*n));
-            format!("{col_expr} {op_str} ?{}", params.len())
-        }
-        ConditionValue::Bool(b) => {
-            params.push(QueryValue::Integer(if *b { 1 } else { 0 }));
-            format!("{col_expr} {op_str} ?{}", params.len())
-        }
-    };
+    let sql = compile_condition_predicate(&col_expr, cond, params)?;
     Ok((sql, col_alias))
 }
 
