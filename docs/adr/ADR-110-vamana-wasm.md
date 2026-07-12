@@ -122,48 +122,66 @@ SQ8 codes are not a persisted segment. Native loading reconstructs the
 `index.rs:884-915` and `index.rs:965-966`; portable loading does the same.
 
 `to_bytes` and `from_bytes` define a new versioned portable container. This is
-framing around the same four v2 segment payloads, plus the external-ID segment.
-It is not v3 of the native directory protocol.
+framing around the same four v2 segment payloads, plus an optional
+container-owned string-ID segment. It is not v3 of the native directory
+protocol.
 
 The container layout is:
 
 1. Eight-byte magic `KHVVAMAC`.
 2. Little-endian `u32` container version, initially `1`.
 3. Little-endian `u32` segment count.
-4. A segment table. Each entry contains a UTF-8 name length and name, an
-   absolute `u64` payload offset, a `u64` payload length, and a 32-byte blake3
-   checksum of that payload.
+4. A segment table with exactly `segment_count` entries. Each entry contains,
+   in order, a little-endian `u32` name length, that many raw UTF-8 name bytes,
+   a little-endian `u64` absolute payload offset, a little-endian `u64` payload
+   length, and 32 raw bytes containing the blake3 checksum of that payload. The
+   table ends exactly after the final entry.
 5. Non-overlapping payloads named `metadata.bin`, `vectors.bin`, `graph.bin`,
-   `lifecycle.bin`, and `external_ids.bin`.
+   and `lifecycle.bin`, plus optional `portable_ids.bin`.
 
-Unknown container versions, missing or duplicate required segments, duplicate
-names, overlapping or out-of-bounds ranges, checksum failures, malformed
-segment payloads, and trailing table data are errors. The existing fingerprint
-validation applies after framing and checksum validation.
+Offsets are authoritative. Readers locate payloads only through the segment
+table and do not infer payload positions from table order, adjacency, or the
+end of the preceding payload. Writers leave no gaps, but readers do not assume
+contiguity.
 
-`external_ids.bin` is itself versioned. Its payload contains an eight-byte
-magic `KHVEXTID`, a little-endian `u32` version, initially `1`, a live-entry
-count, and entries sorted by ordinal. Each entry is a `u32` ordinal, a `u32`
-UTF-8 byte length, and one non-empty string ID. There is exactly one ID for
-every live ordinal and none for a tombstoned ordinal. Duplicate strings,
-duplicate ordinals, invalid UTF-8, out-of-range ordinals, or live-set mismatch
-are errors. Deserialization reconstructs both ordinal-to-ID and ID-to-ordinal
-maps from this segment.
+Unknown container versions, missing or duplicate required core segments,
+duplicate names, overlapping or out-of-bounds ranges, checksum failures, and
+malformed segment payloads are errors. The existing fingerprint validation
+applies after framing and checksum validation.
+
+`portable_ids.bin` is itself versioned. Its payload contains, in order, the
+eight-byte magic `KHVEXTID`, a little-endian `u32` version, initially `1`, and a
+little-endian `u64` live-entry count. Entries follow sorted by ordinal. Each
+entry contains a little-endian `u32` ordinal, a little-endian `u32` UTF-8 byte
+length, and that many raw UTF-8 bytes for one non-empty string ID. There is
+exactly one ID for every live ordinal and none for a tombstoned ordinal.
+Duplicate strings, duplicate ordinals, invalid UTF-8, out-of-range ordinals,
+or live-set mismatch are errors. Deserialization reconstructs both
+ordinal-to-ID and ID-to-ordinal maps from this segment. When the optional
+segment is absent, the wasm binding constructs decimal ordinal strings (`"0"`,
+`"1"`, and so on) for the live ordinals.
 
 The native directory writer, atomic commit order, and mmap load path are
-unchanged. A pure reframing adapter maps the five named payload files to or
-from a portable container without decoding or rewriting any payload. The
-binding-owned `external_ids.bin` sidecar is not part of the four-file native
-Vamana commit and is ignored by the native core loader. Container-to-directory
-therefore restores the four native files byte-for-byte and the sidecar
-separately; directory-to-container frames those same bytes. This preserves the
-ADR-079 segment protocol while allowing native and wasm hosts to exchange one
-blob.
+unchanged. A pure reframing adapter maps the four required payload files and
+optional `portable_ids.bin` to or from a portable container without decoding
+or rewriting any payload. Container-to-directory writes the string-ID segment
+only as `portable_ids.bin`, never as `external_ids.bin`. The native directory
+loader in `crates/khive-vamana/src/index.rs` opens only the four named core
+segment paths and does not enumerate the directory, so it ignores the unknown
+extra `portable_ids.bin` file. Directory interchange therefore covers the four
+core Vamana segments plus optional `portable_ids.bin`. The native runtime
+ignores that optional sidecar; only the wasm layer, or a future amended
+knowledge bridge, consumes it.
 
 ADR-079 says there is no change to the `khive-vamana` public surface. ADR-110
-amends that statement only for the additive `to_bytes` and `from_bytes` API.
-ADR-079's native directory persistence, mmap loading, and integration contract
-otherwise remain unchanged.
+amends that statement only for the additive `to_bytes` and `from_bytes` API and
+the new native-loader-ignored `portable_ids.bin` sidecar filename. ADR-079's
+knowledge bridge owns the existing `external_ids.bin` contract, whose
+`KHVANIDS` payload binds UUIDs to the v2 commit content hash. ADR-110 neither
+reuses nor modifies that filename or format. Generic string-ID interoperability
+with the knowledge bridge is out of scope for v0 and requires a future joint
+amendment. ADR-079's native directory persistence, mmap loading, and remaining
+integration contract otherwise remain unchanged.
 
 ### Layer B: khive-vamana-wasm bindings crate
 
@@ -235,23 +253,23 @@ ADR is the source of truth.
 
 ## Acceptance gates
 
-| Gate                    | Assertion                                                                                                                                                                                  |
-| ----------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| wasm check              | `cargo check --target wasm32-unknown-unknown -p khive-quant -p khive-vamana --no-default-features` passes in CI                                                                            |
-| Sequential coverage     | Native Vamana and quantizer tests pass with `--no-default-features`, exercising every fallback in the source-audit table                                                                   |
-| Build parity            | A fixed-seed corpus produces identical graph and search results with default features and with `--no-default-features`                                                                     |
-| Native bytes round-trip | `to_bytes` followed by `from_bytes` preserves lifecycle state and search results exactly                                                                                                   |
-| Native-to-wasm fixture  | A container reframed from a native v2 directory loads in wasm and returns the fixture's string IDs and distances                                                                           |
-| Wasm-to-native fixture  | A wasm-produced container reframes to a native v2 directory whose unchanged native loader reproduces the fixture's search results; the adapter restores the external-ID sidecar separately |
-| Corruption rejection    | Bad magic or version, truncation, overlapping ranges, missing or duplicate segments, bad checksums, and malformed external IDs are rejected                                                |
-| SQ8 reconstruction      | Neither native nor portable persisted output contains an SQ8 segment, and both load paths reconstruct SQ8 with search parity                                                               |
-| Insert by string ID     | Inserting a unique string ID makes it searchable; duplicate insertion errors without changing index or map state; recycled ordinals map only to the new ID                                 |
-| Remove by string ID     | Removing a string ID resolves and tombstones its ordinal, removes both mappings, and prevents that ID from appearing in search                                                             |
-| Serialize string IDs    | `serialize` emits one versioned external-ID entry per live ordinal and none for tombstones                                                                                                 |
-| Deserialize string IDs  | `deserialize` restores both ID maps so remove-by-ID and search-by-ID work without rebuilding                                                                                               |
-| Search by string ID     | Search returns equal-length parallel arrays of string IDs and f32 distances in result order, including after deserialize                                                                   |
-| Browser smoke           | A headless browser test covers build with explicit and default IDs, search, insert, remove, serialize, and deserialize with SQ8 enabled                                                    |
-| Size                    | Layer B CI asserts `gzip -9` of the wasm-bindgen release `khive_vamana_wasm_bg.wasm` artifact is at most 500,000 bytes                                                                     |
+| Gate                    | Assertion                                                                                                                                                                                                                 |
+| ----------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| wasm check              | `cargo check --target wasm32-unknown-unknown -p khive-quant -p khive-vamana --no-default-features` passes in CI                                                                                                           |
+| Sequential coverage     | Native Vamana and quantizer tests pass with `--no-default-features`, exercising every fallback in the source-audit table                                                                                                  |
+| Build parity            | A fixed-seed corpus produces identical graph and search results with default features and with `--no-default-features`                                                                                                    |
+| Native bytes round-trip | `to_bytes` followed by `from_bytes` preserves lifecycle state and search results exactly                                                                                                                                  |
+| Native-to-wasm fixture  | A container reframed from a native v2 directory with no ID segment loads in wasm and returns default decimal-ordinal-string IDs and the fixture's distances                                                               |
+| Wasm-to-native fixture  | A wasm-produced container reframes to a native v2 directory, the unchanged native loader reproduces the fixture's search results, and a second wasm load round-trips the ID segment losslessly through `portable_ids.bin` |
+| Corruption rejection    | Bad magic or version, truncation, overlapping ranges, missing or duplicate segments, bad checksums, and malformed external IDs are rejected                                                                               |
+| SQ8 reconstruction      | Neither native nor portable persisted output contains an SQ8 segment, and both load paths reconstruct SQ8 with search parity                                                                                              |
+| Insert by string ID     | Inserting a unique string ID makes it searchable; duplicate insertion errors without changing index or map state; recycled ordinals map only to the new ID                                                                |
+| Remove by string ID     | Removing a string ID resolves and tombstones its ordinal, removes both mappings, and prevents that ID from appearing in search                                                                                            |
+| Serialize string IDs    | `serialize` emits one versioned external-ID entry per live ordinal and none for tombstones                                                                                                                                |
+| Deserialize string IDs  | `deserialize` restores both ID maps so remove-by-ID and search-by-ID work without rebuilding                                                                                                                              |
+| Search by string ID     | Search returns equal-length parallel arrays of string IDs and f32 distances in result order, including after deserialize                                                                                                  |
+| Browser smoke           | A headless browser test covers build with explicit and default IDs, search, insert, remove, serialize, and deserialize with SQ8 enabled                                                                                   |
+| Size                    | Layer B CI asserts `gzip -9` of the wasm-bindgen release `khive_vamana_wasm_bg.wasm` artifact is at most 500,000 bytes                                                                                                    |
 
 ## Rollout
 
