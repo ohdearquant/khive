@@ -12,7 +12,7 @@ categories.workspace = true
 description = "Producer-agnostic KG change-set op-list model and NDJSON-delta serialization"
 
 [dependencies]
-khive-types = { version = "0.3.0", path = "../khive-types", features = ["serde"] }
+khive-types = { version = "0.4.0", path = "../khive-types", features = ["serde"] }
 serde = { workspace = true }
 # float_roundtrip: the default float parser is a fast approximation that does
 # not always recover the exact f64 bits a prior serialize wrote (weight/
