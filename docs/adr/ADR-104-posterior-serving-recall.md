@@ -188,3 +188,91 @@ Two riders bind the stage gates (sign-off conditions, 2026-07-08):
 3. **Bigram window for entity anchoring.** Component 5 starts with unigrams and
    adjacent-token bigrams. Longer entity names (3+ tokens) fall back to capitalized
    extraction or explicit `entity_names`; extending the window is a measured decision.
+
+## Amendment 1 (2026-07-12): Prior-preserving evidence decay for per-entity posteriors
+
+**Status**: Proposed (amendment to the accepted ADR; Stage D in the staged landing)
+
+### Problem
+
+The per-entity Beta posteriors that feed component 2 accumulate evidence forever. A
+memory judged `useful` three months ago carries the same weight as one judged `useful`
+this morning, and a memory judged `wrong` once can sit at the 0.85 clamp floor
+indefinitely with no path back to neutral unless someone happens to re-serve and
+re-judge it. As feedback density grows, stale evidence dominates fresh evidence, and
+the term drifts from "what this profile currently finds useful" toward "what this
+profile ever found useful."
+
+A second latent defect shares the fix: the stored `(alpha, beta)` pair mixes the
+uninformative prior into the evidence counts. Any future operation that re-applies a
+prior to stored state (a reset that re-seeds, a merge that adds two posteriors, a
+projection that adds priors before computing a mean) double-counts it. Production
+evidence from recommender-system deployments converges on both points: decay old
+evidence rather than accumulate forever, and keep the prior decomposed from observed
+evidence so it is applied exactly once, at read time.
+
+### Decision
+
+Per-entity posterior state decomposes into **evidence-only counts plus a fixed prior
+applied at read time**, with **exponential time decay of the evidence**:
+
+```text
+stored:   (alpha_ev, beta_ev, last_event_at)        # evidence only, both start at 0
+decayed:  g = 2^(-dt_days / H)                       # dt = now - last_event_at
+          alpha' = g * alpha_ev,  beta' = g * beta_ev
+mean:     (1 + alpha') / (2 + alpha' + beta')        # Beta(1,1) prior enters here, once
+```
+
+- **Write path** (feedback and recall-hit updates): decay the stored counts by the
+  elapsed interval first, then add the new observation, then stamp `last_event_at`.
+  This is the standard prior-preserving update: the prior is never part of what decays
+  or what is written.
+- **Read path** (component 2's `entity_posterior_mean`): compute the decayed mean as a
+  pure function of stored state and the current time. No writes on read — serve-time
+  projection stays deterministic and side-effect free, exactly as the accepted ADR
+  requires.
+- **Half-life `H`**: configurable, default 30 days (`entity_evidence_half_life_days`).
+  At the default, evidence loses half its weight per month; a fully negative posterior
+  (mean pinned low) returns to within 0.05 of neutral in roughly two half-lives with no
+  further signals.
+- **Decay is the recovery mechanism.** Because the decayed mean converges to the prior
+  mean 0.5, the component-2 multiplier converges to exactly 1.0 (neutral). A memory
+  down-weighted by old negative feedback regains neutral standing on the half-life
+  clock instead of being permanently suppressed.
+
+### Snapshot migration
+
+`entity_posteriors_version` advances to 2: entries become
+`(uuid, alpha_ev, beta_ev, last_event_at)`. Version-1 snapshots load by subtracting
+the uninformative prior from the stored pair (`alpha_ev = max(alpha - 1, 0)`,
+`beta_ev = max(beta - 1, 0)`) and stamping `last_event_at` at load time, so
+grandfathered evidence starts its decay clock at migration rather than being
+retroactively expired. Version-1 snapshots are never written again after a version-2
+load.
+
+### What this amendment deliberately rejects
+
+- **Pessimistic cold-start priors** (e.g. Beta(1, 99), shipped by feed recommenders):
+  correct where candidates compete for exposure and an unproven item must earn its
+  slot, wrong here. Component 2 is neutral at no evidence by design; a pessimistic
+  prior would penalize every unjudged memory by up to 15% and invert the accepted
+  ADR's relevance-dominance property. Rejected with intent, not overlooked.
+- **A separate coverage/exploration route** (serving low-evidence items via an explicit
+  known-propensity arm to prevent cold-start starvation): the starvation loop it guards
+  against cannot close here, because ranking is relevance-dominant, the per-entity term
+  is clamped to ±15%, and decay-to-neutral restores any suppressed item without
+  requiring it to be re-served first. If a future consumer makes the posterior term
+  exposure-controlling (a larger `w_ent`, or posterior-driven candidate selection),
+  this rejection must be revisited in the same decision.
+- **Decay of the three global posteriors** (`relevance`, `salience`, `temporal`): out
+  of scope. They receive signal on effectively every recall, so staleness self-corrects
+  at event rate; the per-entity posteriors are the sparse, staleness-prone state.
+
+### Stage D gate
+
+| Stage | Contents                                              | Gate                                                                                                                                                                                                                                                                                                       |
+| ----- | ----------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| D     | Evidence/prior decomposition + lazy exponential decay | Unit: decayed mean converges to 0.5 over elapsed time; update-after-gap decays before adding; v1 snapshot migration round-trips; read path provably write-free. Behavior: a negative posterior's component-2 term returns within 0.02 of neutral after two configured half-lives in a clock-injected test. |
+
+Stage D is additive behind the shipped Stage A/B surface; the breakdown field
+`entity_posterior_mean` keeps its shape and now reports the decayed mean.
