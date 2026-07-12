@@ -59,8 +59,8 @@ Pack subcommands (ADR-050):
   init          Scaffold a new declarative pack
   check         Validate a pack.yaml manifest
 
-All 10 built-in packs (kg, gtd, memory, brain, comm, schedule, knowledge,
-session, git, code) load by default — no --pack flags needed.
+All 11 built-in packs (kg, gtd, memory, brain, comm, schedule, knowledge,
+session, git, code, workspace) load by default, no --pack flags needed.
 
 Run 'khive <group> <subcommand> --help' for detailed usage.`);
 }

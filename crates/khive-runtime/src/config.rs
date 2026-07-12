@@ -302,6 +302,7 @@ impl Default for RuntimeConfig {
                     "session",
                     "git",
                     "code",
+                    "workspace",
                 ]
                 .into_iter()
                 .map(String::from)
