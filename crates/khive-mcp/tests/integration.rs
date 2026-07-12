@@ -3977,6 +3977,72 @@ async fn schedule_agenda_agent_preserves_properties_trigger_at_verbatim() -> any
     Ok(())
 }
 
+// ── #871: schedule.remind create-response preserves top-level trigger_at ─────
+
+/// `schedule.remind`'s create response returns `trigger_at` as a top-level
+/// convenience field (sibling to `id`/`full_id`), not nested under
+/// `"properties"`. In default Agent mode this must round-trip verbatim,
+/// offset intact — the humanize layer previously misread the wall-clock
+/// digits of a non-UTC-offset `at` as UTC and could render a future trigger
+/// as if it were in the past (#871).
+#[tokio::test]
+async fn schedule_remind_agent_preserves_top_level_trigger_at_with_offset() -> anyhow::Result<()> {
+    let client = connect_schedule_only().await?;
+    // Far enough in the future (relative to "now") that a naive/offset-blind
+    // parse landing inside the 24h relative-render window would have
+    // produced a bogus "Nh ago"/"in Nh" string instead of the exact ISO
+    // string being preserved.
+    let trigger_at = "2099-06-15T19:00:00-04:00";
+
+    let result = call(
+        &client,
+        "request",
+        json!({"ops": format!(
+            r#"schedule.remind(content="agent create-response trigger_at fidelity", at="{trigger_at}")"#
+        )}),
+    )
+    .await?;
+    let body: Value = serde_json::from_str(&first_text(&result))?;
+    let first = &body["results"][0];
+    assert_eq!(
+        first["ok"],
+        json!(true),
+        "schedule.remind must succeed: {first}"
+    );
+
+    let actual = first["result"]["trigger_at"].as_str().unwrap_or("");
+    assert_eq!(
+        actual, trigger_at,
+        "top-level trigger_at in the create response must be preserved verbatim, offset intact, in Agent mode"
+    );
+    Ok(())
+}
+
+/// UTC (`Z`) and offset-less `at` inputs must likewise round-trip unchanged
+/// through the create-response humanize layer (#871 regression coverage).
+#[tokio::test]
+async fn schedule_remind_agent_preserves_top_level_trigger_at_utc_and_offset_less(
+) -> anyhow::Result<()> {
+    let client = connect_schedule_only().await?;
+
+    let utc = "2099-06-15T23:00:00Z";
+    let result = call(
+        &client,
+        "request",
+        json!({"ops": format!(
+            r#"schedule.remind(content="agent create-response trigger_at utc", at="{utc}")"#
+        )}),
+    )
+    .await?;
+    let body: Value = serde_json::from_str(&first_text(&result))?;
+    let actual = body["results"][0]["result"]["trigger_at"]
+        .as_str()
+        .unwrap_or("");
+    assert_eq!(actual, utc, "UTC trigger_at must round-trip unchanged");
+
+    Ok(())
+}
+
 // ── PR #121: proposal_id → id wire-key — DSL chain tests ─────────────────────
 //
 // These tests prove that `$prev.id` substitution works end-to-end through the
