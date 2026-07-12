@@ -4,8 +4,10 @@ use khive_pack_schedule::SchedulePack;
 use khive_runtime::{KhiveRuntime, VerbRegistry, VerbRegistryBuilder};
 use khive_types::Pack;
 
+mod support;
+
 fn build_registry() -> (VerbRegistry, KhiveRuntime) {
-    let runtime = KhiveRuntime::memory().expect("in-memory runtime");
+    let runtime = support::memory_runtime();
     let mut builder = VerbRegistryBuilder::new();
     builder.register(khive_pack_kg::KgPack::new(runtime.clone()));
     builder.register(SchedulePack::new(runtime.clone()));
@@ -730,7 +732,7 @@ async fn h2_agenda_finds_valid_event_past_corrupt_legacy_rows() {
     use khive_storage::Note;
     use serde_json::json;
 
-    let runtime = KhiveRuntime::memory().expect("in-memory runtime");
+    let runtime = support::memory_runtime();
     let mut builder = VerbRegistryBuilder::new();
     builder.register(khive_pack_kg::KgPack::new(runtime.clone()));
     builder.register(SchedulePack::new(runtime.clone()));
@@ -843,7 +845,7 @@ async fn h2_agenda_finds_valid_event_past_corrupt_legacy_rows() {
 #[tokio::test]
 async fn schedule_pack_exposes_non_empty_schema_plan() {
     use khive_runtime::PackRuntime;
-    let runtime = KhiveRuntime::memory().expect("in-memory runtime");
+    let runtime = support::memory_runtime();
     let pack = SchedulePack::new(runtime);
     let plan = pack.schema_plan();
 
@@ -1028,10 +1030,9 @@ async fn sch_aud_003_agenda_limit_boundary_values_accepted() {
 
 #[tokio::test]
 async fn sch_aud_001_cancel_with_string_properties_returns_error() {
-    use khive_runtime::KhiveRuntime;
     use khive_storage::Note;
 
-    let runtime = KhiveRuntime::memory().expect("in-memory runtime");
+    let runtime = support::memory_runtime();
     let mut builder = khive_runtime::VerbRegistryBuilder::new();
     builder.register(khive_pack_kg::KgPack::new(runtime.clone()));
     builder.register(SchedulePack::new(runtime.clone()));
