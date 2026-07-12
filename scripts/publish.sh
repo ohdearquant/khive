@@ -94,11 +94,11 @@ DELAY=10  # seconds to wait for crates.io index between publishes
 # (which is why it is NOT a per-PR CI gate). Runs in preflight and live alike so
 # `make publish-dry` validates SemVer before any real publish. Crates with no
 # crates.io baseline yet (never published) have nothing to diff against and are
-# excluded until their first publish: khive-quant, plus the crates first shipped
-# in the 0.3.0 release (khive-channel, khive-channel-email, khive-pack-formal,
-# khive-pack-session), plus the crates added since 0.3.0 that are still never
-# published (khive-changeset, khive-pack-code, khive-pack-git,
-# khive-pack-workspace). Drop an exclusion once that crate has one published version.
+# excluded until their first publish. As of the 0.4.0 cycle that is exactly the
+# four crates added since 0.3.0: khive-changeset, khive-pack-code, khive-pack-git,
+# khive-pack-workspace. Every other workspace crate, including khive-quant and the
+# crates first shipped in 0.3.0, has a published 0.3.0 baseline and MUST be
+# checked. Drop an exclusion once that crate has one published version.
 echo ""
 echo "--- SemVer gate (cargo-semver-checks vs crates.io baseline) ---"
 if ! command -v cargo-semver-checks >/dev/null 2>&1; then
@@ -107,11 +107,6 @@ if ! command -v cargo-semver-checks >/dev/null 2>&1; then
     exit 1
 fi
 cargo semver-checks check-release --workspace \
-    --exclude khive-quant \
-    --exclude khive-channel \
-    --exclude khive-channel-email \
-    --exclude khive-pack-formal \
-    --exclude khive-pack-session \
     --exclude khive-changeset \
     --exclude khive-pack-code \
     --exclude khive-pack-git \
