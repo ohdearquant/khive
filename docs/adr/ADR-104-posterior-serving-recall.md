@@ -233,9 +233,11 @@ mean:     (1 + alpha') / (2 + alpha' + beta')        # Beta(1,1) prior enters he
   day with the default half-life, replenished positive evidence reaches a steady state
   near `1 / (1 - 2^(-1/30)) = 43.8`, a decayed mean near 0.978, and a persistent
   multiplier near 1.143, enough to durably order candidates on exposure alone.
-  Exposure events continue to feed the global posteriors exactly as shipped; only the
-  per-entity accrual rule changes. This amends the accepted ADR's Stage B accrual
-  behavior as part of Stage D.
+  `RecallHit` retains its shipped global-posterior updates (relevance and temporal);
+  `NoteAccessed` has no global-posterior effect in the shipped reducer and loses only
+  its per-entity effect here, so after Stage D a `NoteAccessed` leaves every posterior
+  unchanged. Only the per-entity accrual rule changes. This amends the accepted ADR's
+  Stage B accrual behavior as part of Stage D.
 - **Evidence counts are mass, not event counts.** Each signal adds its weight
   (correction 2.0, explicit 1.5, implicit 0.1 under the existing fold-gate clamp on
   cumulative implicit mass), so `B` throughout this amendment denotes accrued evidence
@@ -248,13 +250,23 @@ mean:     (1 + alpha') / (2 + alpha' + beta')        # Beta(1,1) prior enters he
   state regardless of when the replay runs. Every write-side interval and every
   `last_event_at` stamp therefore uses the event's own persisted occurrence time
   (`Event.created_at`), carried into the profile reducer alongside the signal. The
-  reducer never reads a wall clock. Backward-clock policy: `dt = max(event_time -
-  last_event_at, 0)` days, so an out-of-order or regressed timestamp decays nothing
-  and never grows evidence; it is not an error.
+  reducer never reads a wall clock. The write rule is a complete three-way branch on
+  `event_time` versus the entry's `last_event_at`:
+  - `event_time > last_event_at`: decay by `dt = event_time - last_event_at`, add the
+    observation's weight, stamp `last_event_at = event_time`.
+  - `event_time == last_event_at`: add the observation's weight with no decay
+    (`g = 1`); the stamp is unchanged.
+  - `event_time < last_event_at`: the per-entity entry is returned unchanged. The
+    regressed event contributes no per-entity evidence and does not move the stamp;
+    it is not an error. Events arrive from an ordered log, so a regression is a clock
+    anomaly, and deterministic replay requires the same drop decision at every replay.
+    The event's global-posterior effects, if any, are unaffected by this rule.
 - **Read path** (component 2's `entity_posterior_mean`): compute the decayed mean as a
-  pure function of stored state and an injected current time. No writes on read:
-  serve-time projection stays deterministic and side-effect free, exactly as the
-  accepted ADR requires.
+  pure function of stored state and an injected current time, with
+  `dt = max(now - last_event_at, 0)` days. A read clock earlier than `last_event_at`
+  therefore projects with `g = 1` (no additional decay), never with `g > 1`: a
+  regressed clock must not amplify evidence. No writes on read: serve-time projection
+  stays deterministic and side-effect free, exactly as the accepted ADR requires.
 - **Half-life `H`**: runtime configuration `entity_evidence_half_life_days`, default
   30 days, one value per running instance (the same configuration layer, and the same
   validation posture, as the existing recall half-life: finite and strictly positive,
@@ -280,10 +292,16 @@ mean:     (1 + alpha') / (2 + alpha' + beta')        # Beta(1,1) prior enters he
 `entity_posteriors_version` advances to 2: entries become
 `(uuid, alpha_ev, beta_ev, last_event_at)`. Version-1 snapshots load by subtracting
 the uninformative prior from the stored pair (`alpha_ev = max(alpha - 1, 0)`,
-`beta_ev = max(beta - 1, 0)`) and stamping `last_event_at` at load time, so
-grandfathered evidence starts its decay clock at migration rather than being
-retroactively expired. Version-1 snapshots are never written again after a version-2
-load.
+`beta_ev = max(beta - 1, 0)`) and stamping `last_event_at` from the snapshot's own
+persisted `updated_at`, so grandfathered evidence starts its decay clock at the moment
+the snapshot state was last true rather than being retroactively expired. The anchor
+is deliberately a persisted value, never the load-time wall clock: conversion is a
+pure function of stored bytes, so migrating the same v1 snapshot at any two wall-clock
+times yields identical v2 state, and post-snapshot events replay under the ordinary
+three-way write branch (their `event_time` is at or after the snapshot's `updated_at`
+in a well-formed history, so no evidence is dropped by the regression branch). A v1
+snapshot with no persisted timestamp is malformed and is rejected at load, not
+defaulted. Version-1 snapshots are never written again after a version-2 load.
 
 ### What this amendment deliberately rejects
 
@@ -309,9 +327,9 @@ load.
 
 ### Stage D gate
 
-| Stage | Contents                                              | Gate                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
-| ----- | ----------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| D     | Evidence/prior decomposition + lazy exponential decay | Unit: decayed mean converges to 0.5 over elapsed time; update-after-gap decays before adding; v1 snapshot migration round-trips; read path provably write-free; a `RecallHit` and a `NoteAccessed` leave per-entity evidence unchanged; configuration rejects zero, negative, and non-finite `H`; a write whose event time precedes `last_event_at` neither decays nor grows evidence. Replay determinism: a snapshot-plus-event-history replay executed at two different wall-clock times yields byte-identical stored per-entity state (event-time clock, ADR-032). Behavior (clock-injected, magnitudes pinned in evidence-mass units): a `B = 1` negative posterior's component-2 term returns within 0.02 of neutral after two configured half-lives; a single-correction `B = 2.0` posterior is provably NOT within 0.02 at two half-lives; a `B >= 8` posterior is NOT within 0.02 at two half-lives but is within 0.02 by `H * (log2(B) + 2.2)`; the mean-to-multiplier mapping `clamp(1 + w_ent * (mean - 0.5), 0.85, 1.15)` is computed explicitly in the assertions rather than approximated. |
+| Stage | Contents                                              | Gate                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
+| ----- | ----------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| D     | Evidence/prior decomposition + lazy exponential decay | Unit: decayed mean converges to 0.5 over elapsed time; update-after-gap decays before adding; v1 snapshot migration round-trips; read path provably write-free; read-side clock regression projects with `g = 1`, never amplifies; a `RecallHit` leaves per-entity evidence unchanged and a `NoteAccessed` leaves every posterior unchanged; configuration rejects zero, negative, and non-finite `H`; all three write branches tested (later decays-adds-stamps, equal adds without decay, earlier leaves the entry byte-identical). Replay determinism: a replay that starts from a migrated v1 snapshot and applies post-snapshot events, executed at two different wall-clock times, yields byte-identical stored per-entity state (event-time clock plus persisted migration anchor, ADR-032). Behavior (clock-injected, magnitudes pinned in evidence-mass units): a `B = 1` negative posterior's component-2 term returns within 0.02 of neutral after two configured half-lives; a single-correction `B = 2.0` posterior is provably NOT within 0.02 at two half-lives; a `B >= 8` posterior is NOT within 0.02 at two half-lives but is within 0.02 by `H * (log2(B) + 2.2)`; the mean-to-multiplier mapping `clamp(1 + w_ent * (mean - 0.5), 0.85, 1.15)` is computed explicitly in the assertions rather than approximated. |
 
 Stage D is additive behind the shipped Stage A/B surface; the breakdown field
 `entity_posterior_mean` keeps its shape and now reports the decayed mean.
