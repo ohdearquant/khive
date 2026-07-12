@@ -1,0 +1,130 @@
+name: Reusable Component Bench
+
+on:
+  workflow_call:
+    inputs:
+      component:
+        description: Stable component name used in checks and artifacts
+        required: true
+        type: string
+      crates:
+        description: Space-separated Criterion crate packages in this component
+        required: true
+        type: string
+
+env:
+  CARGO_TERM_COLOR: always
+  PERF_DATA_BRANCH: perf-data
+  BENCH_BOT_NAME: khive-bench-bot
+  BENCH_BOT_EMAIL: khive-bench-bot@users.noreply.github.com
+
+jobs:
+  criterion:
+    name: Criterion quick profile
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@1.94.1
+
+      - name: Pin the real toolchain bin on PATH
+        run: dirname "$(rustup which cargo)" >> "$GITHUB_PATH"
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates
+          cache-on-failure: true
+          key: component-${{ inputs.component }}
+
+      - name: Compile-check this component's bench targets
+        working-directory: crates
+        env:
+          COMPONENT_CRATES: ${{ inputs.crates }}
+        run: |
+          set -euo pipefail
+          pkg_args=()
+          for crate in $COMPONENT_CRATES; do pkg_args+=(-p "$crate"); done
+          cargo bench "${pkg_args[@]}" --all-targets --no-run
+
+      - name: Run Criterion benches (quick profile, bounded to 10 minutes)
+        working-directory: crates
+        env:
+          COMPONENT_CRATES: ${{ inputs.crates }}
+        # This is an advisory tracker. Preserve every estimate produced before
+        # a benchmark assertion or the wall-clock bound terminates the pass.
+        run: |
+          set -euo pipefail
+          pkg_args=()
+          for crate in $COMPONENT_CRATES; do pkg_args+=(-p "$crate"); done
+          timeout 600 cargo bench "${pkg_args[@]}" -- --quick || true
+
+      - name: Record component trend ledger entry
+        id: record
+        run: |
+          set +e
+          python3 scripts/perf/bench_track.py record \
+            --suite components \
+            --source criterion \
+            --criterion-dir crates/target/criterion \
+            --sha "$GITHUB_SHA" \
+            --branch "$GITHUB_REF_NAME" \
+            --run-id "$GITHUB_RUN_ID" \
+            --run-attempt "$GITHUB_RUN_ATTEMPT" \
+            --data-dir bench-data \
+            --summary-out /tmp/components-trend.md
+          echo "exit_code=$?" >> "$GITHUB_OUTPUT"
+          exit 0
+
+      # PR runs record and report only the selected components, but do not
+      # add ephemeral merge commits to the durable main/release trend ledger.
+      - name: Publish ledger to perf-data branch
+        if: ${{ !cancelled() && github.event_name == 'push' }}
+        run: bash scripts/perf/publish_ledger.sh bench-data/components.jsonl
+
+      - name: Write step summary
+        if: always()
+        run: cat /tmp/components-trend.md >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || true
+
+      - name: Upload raw Criterion output
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: bench-track-${{ inputs.component }}-${{ github.run_id }}
+          path: |
+            crates/target/criterion
+            bench-data/components.jsonl
+          retention-days: 90
+          if-no-files-found: ignore
+
+      # Advisory-lane semantics: publishing happens before this warning on
+      # main/release runs, and a data-collection error never paints CI red.
+      - name: Warn if trend ledger record errored (advisory, never fails)
+        if: ${{ !cancelled() && steps.record.outputs.exit_code != '0' }}
+        env:
+          COMPONENT: ${{ inputs.component }}
+          RECORD_EXIT_CODE: ${{ steps.record.outputs.exit_code }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set +e
+          if [ "$GITHUB_EVENT_NAME" = push ]; then
+            LEDGER_NOTE="Its status=error record was still published to perf-data."
+          else
+            LEDGER_NOTE="Its status=error record is retained in the run artifact only."
+          fi
+          MSG="bench_track.py record exited ${RECORD_EXIT_CODE} for component=${COMPONENT}. ${LEDGER_NOTE} Run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          echo "::warning::${MSG}"
+          {
+            echo "## Trend ledger record errored (advisory)"
+            echo ""
+            echo "${MSG}"
+          } >> "$GITHUB_STEP_SUMMARY"
+          TRACKING_ISSUE=863
+          if ! gh issue reopen "$TRACKING_ISSUE" --repo "$GITHUB_REPOSITORY" 2>/dev/null; then
+            echo "tracking issue already open or reopen unavailable (non-fatal)"
+          fi
+          if ! gh issue comment "$TRACKING_ISSUE" --repo "$GITHUB_REPOSITORY" --body "$MSG"; then
+            echo "::warning::tracking-issue comment failed (non-fatal)"
+          fi
+          exit 0
