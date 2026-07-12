@@ -2,6 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 
+use lattice_embed::EmbeddingModel;
 use uuid::Uuid;
 
 use crate::config::{parse_embedding_model_alias, sanitize_key};
@@ -132,10 +133,9 @@ impl KhiveRuntime {
 
     /// Embed a query string for retrieval using the named model.
     ///
-    /// Applies `EmbeddingService::embed_query`, which prepends the model's
-    /// `query_instruction()` prefix when defined (e.g. `"query: "` for
-    /// multilingual-e5). For models with no query prefix (MiniLM, BGE) this
-    /// is identical to [`Self::embed_with_model`].
+    /// Applies the pre-0.6 query-role behavior. E5 and Qwen models retain
+    /// their query instructions, while BGE and custom providers receive the
+    /// original unprefixed query text.
     ///
     /// Use this for all search/recall/suggest query embedding paths so that
     /// instruction-tuned models land in the correct side of their retrieval
@@ -149,10 +149,15 @@ impl KhiveRuntime {
     ) -> RuntimeResult<Vec<f32>> {
         let model = parse_embedding_model_alias(model_name);
         let service = self.embedder(model_name).await?;
+        let texts = [text.to_string()];
         let emb_model = model.unwrap_or_default();
-        service
-            .embed_query(&[text.to_string()], emb_model)
-            .await?
+        let embeddings = match emb_model {
+            EmbeddingModel::BgeSmallEnV15
+            | EmbeddingModel::BgeBaseEnV15
+            | EmbeddingModel::BgeLargeEnV15 => service.embed(&texts, emb_model).await?,
+            _ => service.embed_query(&texts, emb_model).await?,
+        };
+        embeddings
             .into_iter()
             .next()
             .ok_or_else(|| RuntimeError::Internal("embed_query returned empty vec".into()))
@@ -265,8 +270,8 @@ impl KhiveRuntime {
 
     /// Embed a batch of queries for retrieval using the named model.
     ///
-    /// Applies `EmbeddingService::embed_query`. Use for bulk query-side
-    /// operations where multiple queries need instruction-tuned prefixing.
+    /// Applies the same pre-0.6 query-role compatibility behavior as
+    /// [`Self::embed_query_with_model`].
     ///
     /// Returns `UnknownModel` if `model_name` is not registered.
     pub async fn embed_query_batch_with_model(
@@ -280,7 +285,12 @@ impl KhiveRuntime {
         let model = parse_embedding_model_alias(model_name);
         let service = self.embedder(model_name).await?;
         let emb_model = model.unwrap_or_default();
-        Ok(service.embed_query(texts, emb_model).await?)
+        match emb_model {
+            EmbeddingModel::BgeSmallEnV15
+            | EmbeddingModel::BgeBaseEnV15
+            | EmbeddingModel::BgeLargeEnV15 => Ok(service.embed(texts, emb_model).await?),
+            _ => Ok(service.embed_query(texts, emb_model).await?),
+        }
     }
 
     /// Search vectors using either a caller-provided embedding or query text.

@@ -83,8 +83,8 @@ chrono = { version = "0.4", default-features = false, features = ["serde", "cloc
 async-trait = "0.1"
 clap = { version = "4.5", features = ["derive", "env"] }
 dotenvy = "0.15"
-lattice-embed = "0.4.2"
-lattice-fann = "0.4.2"
+lattice-embed = "0.6.0"
+lattice-fann = "0.6.0"
 parking_lot = "0.12"
 rand = "0.8"
 rand_distr = "0.4"
