@@ -51,8 +51,9 @@ def _call_request_raw(proc, ops_string, presentation=None):
     """Send `request(ops=<ops_string>)`. Return the parsed response body.
 
     presentation: None (default="agent"), "verbose", or "human".
-    Agent mode compacts metadata ISO-8601 timestamps to minute granularity and
-    shortens UUIDs; payload timestamps (e.g. trigger_at, #871) round-trip verbatim.
+    Agent mode renders metadata ISO-8601 timestamps from the last 24 hours as
+    relative text and older ones at minute granularity, and shortens UUIDs;
+    payload timestamps (e.g. trigger_at, #871) round-trip verbatim.
     Verbose mode returns the canonical handler output unchanged.
     """
     arguments = {"ops": ops_string}
