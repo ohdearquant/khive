@@ -1198,6 +1198,24 @@ mod substrate_labels {
                 "GQL string equality must remain case-insensitive; sql: {}",
                 compiled.sql
             );
+            assert!(
+                compiled.sql.contains(".name = ?"),
+                "GQL name equality must use a SQL placeholder; sql: {}",
+                compiled.sql
+            );
+            assert!(
+                compiled
+                    .params
+                    .iter()
+                    .any(|param| matches!(param, QueryValue::Text(value) if value == name)),
+                "name {name:?} must be passed as a bound text parameter; params: {:?}",
+                compiled.params
+            );
+            assert!(
+                !compiled.sql.contains(name),
+                "name {name:?} must not be interpolated into SQL: {}",
+                compiled.sql
+            );
             assert_eq!(
                 run(&conn, &compiled),
                 vec![expected_id.to_string()],

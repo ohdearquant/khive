@@ -1532,6 +1532,25 @@ mod tests {
                 Some(0.98)
             );
         }
+
+        let whitespace_variant = registry
+            .dispatch(
+                "resolve",
+                json!({"refs": ["Entity  Name With Spaces"], "kind": "entity"}),
+            )
+            .await
+            .expect("whitespace-variant resolve must succeed");
+        let whitespace_results = whitespace_variant
+            .get("results")
+            .and_then(|v| v.as_array())
+            .unwrap();
+        assert_ne!(
+            whitespace_results[0]
+                .get("confidence")
+                .and_then(|v| v.as_f64()),
+            Some(0.98),
+            "interior whitespace must be preserved by exact-name lookup: {whitespace_results:?}"
+        );
     }
 
     /// The storage exact-name tier is case-sensitive. A case-only variant
