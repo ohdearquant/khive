@@ -1114,6 +1114,30 @@ fn extended_where_operators_compile_for_variable_length_patterns() {
 }
 
 #[test]
+fn mixed_type_in_with_string_compiles_case_insensitive() {
+    let q = parse(
+        QueryLanguage::Gql,
+        "MATCH (n) WHERE n.kind IN ['CONCEPT', 1] RETURN n",
+    )
+    .unwrap();
+    let compiled = compile(&q, &opts()).unwrap();
+
+    assert!(
+        compiled.sql.contains("n0.kind COLLATE NOCASE IN (?1, ?2)"),
+        "sql: {}",
+        compiled.sql
+    );
+    assert!(matches!(
+        compiled.params.as_slice(),
+        [
+            QueryValue::Text(kind),
+            QueryValue::Integer(1),
+            QueryValue::Integer(_),
+        ] if kind == "CONCEPT"
+    ));
+}
+
+#[test]
 fn empty_in_list_compiles_to_false_without_value_parameters() {
     let q = parse(QueryLanguage::Gql, "MATCH (n) WHERE n.name IN [] RETURN n").unwrap();
     let compiled = compile(&q, &opts()).unwrap();
@@ -1284,6 +1308,19 @@ mod substrate_labels {
         let mut rows = run(&conn, &compiled);
         rows.sort();
         assert_eq!(rows, vec!["e-percent", "e-quote", "e-underscore"]);
+    }
+
+    #[test]
+    fn mixed_type_in_preserves_case_insensitive_string_matching_end_to_end() {
+        let conn = fixture_db();
+        let q = parse(
+            QueryLanguage::Gql,
+            "MATCH (e:entity) WHERE e.kind IN ['CONCEPT', 1] RETURN e.id",
+        )
+        .unwrap();
+        let compiled = compile(&q, &opts()).unwrap();
+
+        assert_eq!(run(&conn, &compiled), vec!["e-fixture-1"]);
     }
 
     #[test]

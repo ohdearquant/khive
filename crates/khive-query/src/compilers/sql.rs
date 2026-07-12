@@ -895,14 +895,14 @@ fn compile_condition_predicate(
             if values.is_empty() {
                 return Ok("0".into());
             }
-            let all_strings = values
+            let has_string = values
                 .iter()
-                .all(|value| matches!(value, ConditionValue::String(_)));
+                .any(|value| matches!(value, ConditionValue::String(_)));
             let placeholders = values
                 .iter()
                 .map(|value| bind_condition_value(value, params).map(|index| format!("?{index}")))
                 .collect::<Result<Vec<_>, _>>()?;
-            let collate = if all_strings { " COLLATE NOCASE" } else { "" };
+            let collate = if has_string { " COLLATE NOCASE" } else { "" };
             Ok(format!(
                 "{col_expr}{collate} IN ({})",
                 placeholders.join(", ")
