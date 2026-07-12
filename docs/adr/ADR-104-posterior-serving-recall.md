@@ -130,7 +130,10 @@ semantics unchanged).
 - **No cross-profile blending.** A request is served by exactly one profile's state
   (resolved or overridden), or by defaults.
 - **No new storage.** Every input already exists: posterior state (brain snapshots),
-  profile resolution (ADR-081), entity names (kg store).
+  profile resolution (ADR-081), entity names (kg store). Superseded in scope by
+  Amendment 2 for Stage D: no new table, column, or external store is added, but the
+  persisted snapshot payload gains versioned fields (per-entry `last_event_at` and a
+  decay-policy record), with the migrations Amendment 2 specifies.
 
 ## Staged landing
 
@@ -338,3 +341,212 @@ again after a version-2 load.
 
 Stage D is additive behind the shipped Stage A/B surface; the breakdown field
 `entity_posterior_mean` keeps its shape and now reports the decayed mean.
+
+## Amendment 2 (2026-07-12): Closing the Stage D contract
+
+Amendment 1's static review surfaced four gaps that leave Stage D
+implementation-ambiguous. This amendment closes them. It changes no algorithm from
+Amendment 1; it makes previously implicit inputs explicit, normative, and persisted.
+
+### Normative signal-to-mass mapping
+
+Amendment 1 assigned masses to the semantic signal names only, leaving the
+still-supported legacy feedback ladder (`useful`, `not_useful`, `wrong`) at the
+shipped unweighted count. Two interpreters could produce different state from the
+same event history. The complete mapping is now normative; every signal accepted by
+the feedback surface appears here, and Stage D asserts each row:
+
+| Signal              | Polarity | Evidence mass |
+| ------------------- | -------- | ------------- |
+| `correction`        | negative | 2.0           |
+| `explicit_positive` | positive | 1.5           |
+| `explicit_negative` | negative | 1.5           |
+| `implicit_positive` | positive | 0.1 (clamped) |
+| `implicit_negative` | negative | 0.1 (clamped) |
+| `useful`            | positive | 1.5           |
+| `not_useful`        | negative | 1.5           |
+| `wrong`             | negative | 2.0           |
+
+The legacy rows are an intentional change from the shipped unweighted 1.0, effective
+at Stage D, not a description of current behavior: `useful` and `not_useful` are
+explicit human judgments and carry explicit weight; `wrong` asserts factual
+incorrectness and carries correction weight. The clamp on cumulative implicit mass
+from Amendment 1 applies to the implicit rows only. This table is versioned as part
+of the decay policy below; changing any row is a policy-version bump, never an
+in-place edit.
+
+### Determinism restated with the read clock
+
+The accepted decision's property "same store, same query, same profile state produce
+the same ranking" predates read-time decay and is now incomplete. It is restated:
+ranking is a deterministic, side-effect-free function of **(store, query, profile
+state, read time, decay policy)**. Serve-time projection takes the read clock as an
+explicit injected input; nothing else about the property changes. Consequences:
+evaluation and score-comparison artifacts must record the read time they were
+computed at, and every Stage D ranking test pins an explicit clock. Two reads at
+different times may legitimately order results differently; that is the designed
+decay behavior, not nondeterminism.
+
+### The decay policy is persisted replay state
+
+Amendment 1 made `entity_evidence_half_life_days` bare runtime configuration. That
+contradicts the replay contract: replaying the same events against the same snapshot
+under a different configured `H` yields different state, so an unrecorded mutable
+config value silently breaks byte-identical replay. Ruling: **the decay policy is a
+versioned input stamped into persisted state**, superseding Amendment 1's
+"one value per running instance" paragraph.
+
+- **Every policy record is complete.** Every persisted decay-policy record has this
+  schema, both in a version-2 `BalancedRecallSnapshot` and in each policy-migration
+  event payload:
+
+  ```text
+  DecayPolicyRecord {
+    policy_version: u32,
+    half_life_days: f64,
+    mass_table_version: u32,
+    mass_table: [{ signal: EvidenceFeedbackSignal, polarity: positive | negative, evidence_mass: f64 }, ...]
+  }
+  ```
+
+  `EvidenceFeedbackSignal` is a new closed persisted-row enum containing exactly the
+  eight wire names in the signal table above. Neither shipped type covers all eight:
+  `FeedbackSignal` holds only the three legacy names and `FeedbackEventKind` holds
+  the five semantic names (`crates/khive-brain-core/src/signal.rs`). Stage D defines
+  the new enum with pinned serde names equal to the wire names, a one-way `From`
+  mapping from each `FeedbackSignal` and `FeedbackEventKind` value, and a test
+  asserting the enum has exactly eight members matching the table. The existing
+  public feedback types and their consumers are unchanged.
+
+  `mass_table` is the complete signal-to-polarity-and-mass table above, in the row
+  order shown and with every signal present exactly once. It is persisted inline,
+  not reconstructed from `mass_table_version`. The version remains a provenance
+  label identifying the code-side source table. Code-side mass tables are
+  version-indexed and immutable: changing any row adds a new version entry, and an
+  existing entry is never edited in place.
+- **Ownership is per-state, with one authoritative representation.** Every
+  version-2 `BalancedRecallSnapshot` carries its own complete policy record: the
+  namespace's built-in state and each profile-local state independently. The live
+  `BalancedRecallState` in `BrainState.balanced_recall` or
+  `BrainState.profile_states` is authoritative. `ProfileRecord.state_snapshot` is
+  a regenerated mirror, never an independent policy owner. Profile creation and
+  every mutation that changes a state's policy, including migration, update the
+  authoritative state and regenerate the profile-record mirror in the same durable
+  mutation, as required by ADR-032. `brain.profile` reports the policy from the
+  authoritative live state, with the mirror required to match it. Initial values for
+  fresh and migrated state are `policy_version = 1` and `mass_table_version = 1`,
+  with a complete inline copy of the mass table in this amendment. v0/v1 migration
+  and boundary validation apply to every state, built-in and profile-local alike.
+- Folding and replay read `half_life_days` and signal masses only from the state's
+  complete persisted policy record. They never consult process configuration, the
+  current code default, or the code-side table indexed by `mass_table_version`.
+  Configuration and the immutable code-side registry are consulted only to build a
+  complete policy for fresh state or v0/v1 snapshot migration. They never migrate
+  existing version-2 state implicitly.
+
+### The sole policy-migration write path
+
+Exactly one scoped administrative operation may change the decay policy of existing
+state: `kkernel brain migrate-decay-policy`. It is an operator command on the
+`kkernel` admin CLI path, not a brain verb, MCP product verb, subhandler, or other
+agent-facing operation. Its event payload schema is:
+
+```text
+PolicyMigrationPayload {
+  scope: global | { profile_id: String },
+  expected_old_policy: DecayPolicyRecord,
+  new_policy: DecayPolicyRecord,
+  actor: String,
+  timestamp: DateTime<Utc>,
+}
+```
+
+`global` targets the selected namespace's built-in state. Both policy fields are
+complete records, including their inline mass tables. `new_policy` must pass complete
+boundary validation, including a finite, strictly positive `half_life_days`, every
+supported signal exactly once with its normative polarity and a finite, strictly
+positive mass, and a bumped `policy_version`. At this migration boundary only, and
+never during fold or replay, `new_policy.mass_table` must also match the immutable
+code-side registry entry named by `new_policy.mass_table_version` field for field;
+a payload whose inline table diverges from its named registry version is rejected
+before anything is written. Changing any mass therefore requires registering a new
+table version first. This keeps `mass_table_version` an auditable provenance claim
+rather than a free label, while replay still reads only the inline table.
+
+The operation follows the staged-mutation pattern in
+`crates/khive-pack-brain/src/persist.rs`: mutations apply to a proposed state without
+touching live state, and event append plus snapshot upsert form one atomic unit. Inside
+the same transaction that appends the event, it loads the current scoped durable state,
+constructs the proposed state, validates the complete new policy against that proposed
+state, and compares `expected_old_policy` exactly with the current policy. The
+expected-old comparison is not an advisory preflight outside the transaction. On a
+match, the transaction applies the new policy to the proposed authoritative state,
+regenerates the corresponding `ProfileRecord.state_snapshot` mirror, appends the
+migration event, and upserts the namespace snapshot as one atomic unit. Only after
+commit does the proposed state replace the live state. On a stale expected-old record,
+invalid payload, append failure, snapshot failure, or commit failure, it writes nothing
+and leaves the authoritative state and its mirror unchanged. Transaction serialization
+therefore ensures that two concurrent requests carrying the same expected-old record
+cannot both append, and no unreplayable migration event can enter the log.
+
+Reducer behavior at the event's fold position is unchanged in shape: validate that
+the complete `expected_old_policy` equals the state's current complete record
+(mismatch is a hard fold error, not a silent re-stamp), then replace it with the
+complete `new_policy`. The migration event touches no evidence counts and no
+`last_event_at` stamps; a subsequent event whose decay interval spans the migration
+decays its full interval under the new `H`. Because the migration is an ordered event,
+every replay applies the same persisted policy to the same fold positions.
+
+v0/v1 snapshot migration stamps the migrating instance's complete configured policy
+into the produced v2 state because those formats persisted no policy. Migration is
+therefore a pure function of (stored bytes, configured complete policy): the same
+snapshot migrated twice under the same configuration is byte-identical, and the wall
+clock remains a non-input.
+
+### Storage claim reconciled
+
+The accepted decision's "no new storage" claim remains true at the granularity it
+was made: Stage D adds no table, no column, and no external store. It does add
+versioned fields inside the existing snapshot payload: per-entry `last_event_at`
+and the complete decay-policy record above. For profile-local state,
+`ProfileRecord.state_snapshot` is the regenerated mirror inside that same namespace
+snapshot, not a second persistence authority. The v0/v1 migration anchor is the
+existing `brain_profile_snapshots.updated_at` column, and migration must run at load,
+before snapshot deserialization discards that row-level metadata.
+
+### Stage D gate additions
+
+The Stage D gate gains these assertions:
+
+- Every signal in the mapping table folds with exactly its stated polarity and mass,
+  including the three legacy names.
+- Ranking tests inject and pin an explicit read clock; the projection function is
+  pure in it.
+- A replay folds a log whose persisted inline mass table differs from the current
+  code default and produces byte-identical state across runs using only the persisted
+  table; neither the code default, `mass_table_version` lookup, nor process
+  configuration supplies a mass to the fold.
+- A replay that starts from a pre-migration snapshot and crosses a policy-migration
+  event (an `H` change and a mass-table change are both exercised) folds
+  pre-migration events under the old policy and post-migration events under the
+  new one using the complete inline tables in both event policy records, and is
+  byte-identical across runs; a migration event whose complete expected-old record
+  does not match the state's current record fails the fold loudly.
+- The admin migration operation persists nothing for a stale expected-old record;
+  two concurrent operations carrying the same expected-old record cannot both append;
+  and an invalid complete new-policy payload persists nothing.
+- A migration payload whose inline mass table is complete, normatively signed, and
+  strictly positive but does not match the immutable registry entry named by its
+  `mass_table_version` appends neither event nor snapshot.
+- The `EvidenceFeedbackSignal` persisted-row enum has exactly the eight wire names
+  in the signal table, with pinned serde names, and every `FeedbackSignal` and
+  `FeedbackEventKind` value maps one-way onto it.
+- Two profiles created on opposite sides of a configuration change carry their
+  respective creation-time policies, and each serves under its own.
+- Migrating the same v0 or v1 snapshot twice under the same configured policy yields
+  byte-identical v2 state, and every produced state (built-in and profile-local)
+  carries the stamped complete policy record.
+- `brain.profile` reports the same decay policy as the authoritative live
+  `BalancedRecallState` after profile creation, policy migration, reload, and replay;
+  each assertion also verifies that `ProfileRecord.state_snapshot` is the regenerated
+  mirror of that live state.
