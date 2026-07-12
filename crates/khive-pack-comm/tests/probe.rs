@@ -87,6 +87,54 @@ async fn plant_inbound_message(
     id
 }
 
+/// Same as `plant_inbound_message`, but writes into an explicit (possibly
+/// non-local) namespace instead of always `"local"` — used to exercise
+/// `comm.probe`'s namespace scoping (khive #877).
+#[allow(clippy::too_many_arguments)]
+async fn plant_inbound_message_in_namespace(
+    rt: &KhiveRuntime,
+    namespace: &str,
+    to_actor: &str,
+    from_actor: &str,
+    created_at_us: i64,
+    subject: Option<&str>,
+    read: bool,
+) -> Uuid {
+    let token = rt
+        .authorize(Namespace::parse(namespace).expect("valid namespace"))
+        .expect("authorize namespace");
+    let store = rt.notes(&token).expect("notes store");
+
+    let mut properties = json!({
+        "direction": "inbound",
+        "to_actor": to_actor,
+        "from_actor": from_actor,
+        "read": read,
+    });
+    if let Some(subject) = subject {
+        properties["subject"] = json!(subject);
+    }
+
+    let id = Uuid::new_v4();
+    let note = Note {
+        id,
+        namespace: namespace.to_string(),
+        kind: "message".into(),
+        status: "active".into(),
+        name: None,
+        content: "probe namespace-scoping test message".into(),
+        salience: None,
+        decay_factor: None,
+        expires_at: None,
+        properties: Some(properties),
+        created_at: created_at_us,
+        updated_at: created_at_us,
+        deleted_at: None,
+    };
+    store.upsert_note(note).await.expect("upsert planted note");
+    id
+}
+
 #[tokio::test]
 async fn probe_empty_inbox_returns_zeroed_response() {
     let (registry, _rt) = build_registry();
@@ -1238,5 +1286,75 @@ async fn notes_seq_repair_runs_once_per_backend_not_per_store_acquisition() {
         1,
         "repeated store acquisition on an already-repaired ledger must not \
          re-run the notes_seq anti-join repair"
+    );
+}
+
+/// khive #877: `comm.probe` reads inbound message counts and cursors from the
+/// caller's injected namespace (`token.namespace()`), never a fixed `"local"`.
+/// This is a regression lock-in — `handle_probe` already threaded
+/// `token.namespace()` through `query_probe` before #877, unlike
+/// `comm.health`, which #877 fixed — but had no test proving the
+/// cross-namespace isolation directly. Plants the same actor's inbound
+/// message under `"local"` and under a non-local `"tenant-a"` namespace: an
+/// unscoped probe must see only the local message, and a probe with an
+/// explicit `namespace="tenant-a"` must see only tenant-a's message.
+#[tokio::test]
+async fn probe_scoped_to_injected_namespace_sees_only_its_own_inbound_messages() {
+    let (registry, rt) = build_registry();
+    let actor = "lambda:leo";
+
+    plant_inbound_message_in_namespace(
+        &rt,
+        "local",
+        actor,
+        "lambda:khive",
+        1_000_000,
+        Some("local message"),
+        false,
+    )
+    .await;
+    plant_inbound_message_in_namespace(
+        &rt,
+        "tenant-a",
+        actor,
+        "lambda:khive",
+        2_000_000,
+        Some("tenant-a message"),
+        false,
+    )
+    .await;
+
+    let default_probe = registry
+        .dispatch("comm.probe", json!({ "actor": actor }))
+        .await
+        .expect("unscoped probe succeeds");
+    let default_messages = default_probe["new_messages"].as_array().expect("array");
+    assert_eq!(
+        default_messages.len(),
+        1,
+        "unscoped comm.probe must default to the local namespace: {default_messages:?}"
+    );
+    assert_eq!(
+        default_messages[0]["subject"].as_str(),
+        Some("local message")
+    );
+
+    let scoped_probe = registry
+        .dispatch(
+            "comm.probe",
+            json!({ "actor": actor, "namespace": "tenant-a" }),
+        )
+        .await
+        .expect("namespace-scoped probe succeeds");
+    let scoped_messages = scoped_probe["new_messages"].as_array().expect("array");
+    assert_eq!(
+        scoped_messages.len(),
+        1,
+        "a probe scoped to tenant-a must see only tenant-a's message, not local's: \
+         {scoped_messages:?}"
+    );
+    assert_eq!(
+        scoped_messages[0]["subject"].as_str(),
+        Some("tenant-a message")
     );
 }

@@ -5574,6 +5574,95 @@ async fn health_channel_entry_never_carries_a_healthy_bool() {
     );
 }
 
+/// khive #877: `comm.health` must read `channel_health` rows from the
+/// caller's injected namespace (`token.namespace()`), not the fixed
+/// `khive_pack_comm::CHANNEL_HEALTH_NAMESPACE` constant. Plants one row
+/// directly under `"local"` and one directly under a non-local `"tenant-a"`
+/// namespace (bypassing `comm.heartbeat`, which still always writes to
+/// `"local"` — this test exercises the read path only). An unscoped call
+/// defaults to `"local"` and must see only the local row; a call with an
+/// explicit `namespace="tenant-a"` must see only tenant-a's row, never
+/// local's.
+#[tokio::test]
+async fn health_scoped_to_injected_namespace_sees_only_its_own_rows() {
+    use khive_storage::note::Note;
+
+    let (registry, rt) = build_registry_for_ns("local");
+
+    let plant = |ns: &'static str, slug: &'static str| {
+        let rt = rt.clone();
+        async move {
+            let token = rt
+                .authorize(khive_runtime::Namespace::parse(ns).expect("valid namespace"))
+                .expect("authorize namespace");
+            let store = rt.notes(&token).expect("notes store");
+            let now = chrono::Utc::now().timestamp_micros();
+            let note = Note {
+                id: uuid::Uuid::new_v4(),
+                namespace: ns.to_string(),
+                kind: "channel_health".to_string(),
+                status: "active".to_string(),
+                name: Some(format!("email:{slug}")),
+                content: format!("channel heartbeat: email:{slug}"),
+                salience: None,
+                decay_factor: None,
+                expires_at: None,
+                properties: Some(serde_json::json!({
+                    "channel_kind": "email",
+                    "channel_slug": slug,
+                    "last_success_at": chrono::Utc::now().to_rfc3339(),
+                    "last_poll_attempt_at": chrono::Utc::now().to_rfc3339(),
+                    "last_failure_at": null,
+                    "last_error": null,
+                    "consecutive_failures": 0,
+                })),
+                created_at: now,
+                updated_at: now,
+                deleted_at: None,
+            };
+            store
+                .upsert_note(note)
+                .await
+                .expect("upsert channel_health note");
+        }
+    };
+    plant("local", "local-inbox@example.com").await;
+    plant("tenant-a", "tenant-a-inbox@example.com").await;
+
+    let default_health = registry
+        .dispatch("comm.health", serde_json::json!({}))
+        .await
+        .expect("unscoped health succeeds");
+    let default_channels = default_health["channels"].as_array().expect("array");
+    assert_eq!(
+        default_channels.len(),
+        1,
+        "unscoped comm.health must default to the local namespace: {default_channels:?}"
+    );
+    assert_eq!(
+        default_channels[0]["channel_slug"].as_str(),
+        Some("local-inbox@example.com")
+    );
+
+    let scoped_health = registry
+        .dispatch(
+            "comm.health",
+            serde_json::json!({ "namespace": "tenant-a" }),
+        )
+        .await
+        .expect("namespace-scoped health succeeds");
+    let scoped_channels = scoped_health["channels"].as_array().expect("array");
+    assert_eq!(
+        scoped_channels.len(),
+        1,
+        "a call scoped to tenant-a must see only tenant-a's row, not local's: {scoped_channels:?}"
+    );
+    assert_eq!(
+        scoped_channels[0]["channel_slug"].as_str(),
+        Some("tenant-a-inbox@example.com")
+    );
+}
+
 // ── #493: comm.inbox from_actor / from_prefix sender filter ─────────────────
 
 /// A single actor namespace receives messages from two distinct senders;

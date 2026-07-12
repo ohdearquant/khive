@@ -352,11 +352,13 @@ pub(crate) static COMM_HANDLERS: [HandlerDef; 11] = [
         description: "Read-only per-channel health snapshot (khive #606). Returns the \
                        daemon-persisted heartbeat row for every known channel: timestamps \
                        and consecutive-failure counts only — never a computed healthy bool. \
-                       Health judgment belongs to the caller. Reads \
-                       `khive_pack_comm::CHANNEL_HEALTH_NAMESPACE` (\"local\") UNCONDITIONALLY \
-                       — regardless of the caller's dispatch/token namespace — so a client-role \
-                       no-arg call always sees daemon-persisted state when it exists, even if \
-                       the caller's own messages are ingested under a different namespace.",
+                       Health judgment belongs to the caller. Reads from the caller's injected \
+                       namespace (khive #877) — `token.namespace()`, the same explicit \
+                       `namespace=` escape / \"local\" default every other comm verb resolves \
+                       (ADR-007 Rev 6 Rule 3). An unscoped call defaults to \"local\", matching \
+                       the namespace heartbeat rows are persisted under; a call with an \
+                       explicit non-local `namespace=` sees only that namespace's rows, never \
+                       \"local\"'s.",
         visibility: Visibility::Verb,
         category: khive_types::VerbCategory::Assertive,
         params: &[],
