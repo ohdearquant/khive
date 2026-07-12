@@ -1464,17 +1464,20 @@ impl GraphStore for SqlGraphStore {
             grouped.entry(origin).or_default().push(hit);
         }
 
+        for hits in grouped.values_mut() {
+            hits.sort_by(|a, b| {
+                b.weight
+                    .partial_cmp(&a.weight)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then(a.node_id.cmp(&b.node_id))
+                    .then(a.edge_id.cmp(&b.edge_id))
+            });
+        }
+
         let mut ordered = Vec::new();
-        for source in unique_sources {
-            if let Some(mut hits) = grouped.remove(&source) {
-                hits.sort_by(|a, b| {
-                    b.weight
-                        .partial_cmp(&a.weight)
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                        .then(a.node_id.cmp(&b.node_id))
-                        .then(a.edge_id.cmp(&b.edge_id))
-                });
-                ordered.extend(hits.into_iter().map(|hit| (source, hit)));
+        for &source in sources {
+            if let Some(hits) = grouped.get(&source) {
+                ordered.extend(hits.iter().cloned().map(|hit| (source, hit)));
             }
         }
         Ok(ordered)

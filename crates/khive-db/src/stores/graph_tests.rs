@@ -1407,15 +1407,10 @@ fn single_neighbour_set(hits: &[NeighborHit]) -> HashSet<Uuid> {
     hits.iter().map(|h| h.node_id).collect()
 }
 
-fn grouped_neighbor_rows(
-    hits: Vec<(Uuid, NeighborHit)>,
-) -> HashMap<Uuid, HashSet<(Uuid, Uuid, EdgeRelation)>> {
-    let mut grouped: HashMap<Uuid, HashSet<(Uuid, Uuid, EdgeRelation)>> = HashMap::new();
+fn neighbor_edge_multiset(hits: &[(Uuid, NeighborHit)]) -> HashMap<(Uuid, Uuid), usize> {
+    let mut grouped = HashMap::new();
     for (origin, hit) in hits {
-        grouped
-            .entry(origin)
-            .or_default()
-            .insert((hit.node_id, hit.edge_id, hit.relation));
+        *grouped.entry((*origin, hit.edge_id)).or_default() += 1;
     }
     grouped
 }
@@ -1425,37 +1420,22 @@ async fn batch_neighbors_keeps_exact_rows_grouped_by_requested_node() {
     let store = setup_memory_store();
     let root_a = Uuid::new_v4();
     let root_b = Uuid::new_v4();
-    let root_c = Uuid::new_v4();
-    let shared = Uuid::new_v4();
-    let only_a = Uuid::new_v4();
-    let only_b = Uuid::new_v4();
-    let only_c = Uuid::new_v4();
-
-    let edges = vec![
-        make_edge(root_a, shared, EdgeRelation::Extends, 0.9),
-        make_edge(root_a, only_a, EdgeRelation::DependsOn, 0.8),
-        make_edge(root_b, shared, EdgeRelation::Extends, 0.7),
-        make_edge(root_b, only_b, EdgeRelation::DependsOn, 0.6),
-        make_edge(root_c, only_c, EdgeRelation::Extends, 0.5),
-        make_edge(shared, root_a, EdgeRelation::Extends, 0.4),
-        make_edge(only_a, root_a, EdgeRelation::DependsOn, 0.3),
-        make_edge(shared, root_b, EdgeRelation::DependsOn, 0.4),
-        make_edge(only_b, root_b, EdgeRelation::Extends, 0.3),
-        make_edge(shared, root_c, EdgeRelation::Extends, 0.4),
-        make_edge(only_c, root_c, EdgeRelation::DependsOn, 0.3),
-    ];
-    let edge_ids: Vec<Uuid> = edges.iter().map(|edge| Uuid::from(edge.id)).collect();
-    for edge in edges {
+    let root_without_edges = Uuid::new_v4();
+    let joined = make_edge(root_a, root_b, EdgeRelation::Extends, 0.9);
+    let self_loop = make_edge(root_b, root_b, EdgeRelation::DependsOn, 0.8);
+    let joined_id = Uuid::from(joined.id);
+    let self_loop_id = Uuid::from(self_loop.id);
+    for edge in [joined, self_loop] {
         store.upsert_edge(edge).await.unwrap();
     }
 
-    let sources = [root_c, root_a, root_b];
+    let sources = [root_a, root_b, root_without_edges];
     let outgoing_hits = store
         .batch_neighbors(
             &sources,
             NeighborQuery {
                 direction: Direction::Out,
-                relations: Some(vec![EdgeRelation::Extends]),
+                relations: None,
                 limit: None,
                 min_weight: None,
             },
@@ -1463,29 +1443,8 @@ async fn batch_neighbors_keeps_exact_rows_grouped_by_requested_node() {
         .await
         .unwrap();
     assert_eq!(
-        outgoing_hits
-            .iter()
-            .map(|(origin, _)| *origin)
-            .collect::<Vec<_>>(),
-        vec![root_c, root_a, root_b]
-    );
-    let outgoing = grouped_neighbor_rows(outgoing_hits);
-    assert_eq!(
-        outgoing,
-        HashMap::from([
-            (
-                root_a,
-                HashSet::from([(shared, edge_ids[0], EdgeRelation::Extends)]),
-            ),
-            (
-                root_b,
-                HashSet::from([(shared, edge_ids[2], EdgeRelation::Extends)]),
-            ),
-            (
-                root_c,
-                HashSet::from([(only_c, edge_ids[4], EdgeRelation::Extends)]),
-            ),
-        ])
+        neighbor_edge_multiset(&outgoing_hits),
+        HashMap::from([((root_a, joined_id), 1), ((root_b, self_loop_id), 1),])
     );
 
     let incoming_hits = store
@@ -1493,7 +1452,7 @@ async fn batch_neighbors_keeps_exact_rows_grouped_by_requested_node() {
             &sources,
             NeighborQuery {
                 direction: Direction::In,
-                relations: Some(vec![EdgeRelation::DependsOn]),
+                relations: None,
                 limit: None,
                 min_weight: None,
             },
@@ -1501,29 +1460,8 @@ async fn batch_neighbors_keeps_exact_rows_grouped_by_requested_node() {
         .await
         .unwrap();
     assert_eq!(
-        incoming_hits
-            .iter()
-            .map(|(origin, _)| *origin)
-            .collect::<Vec<_>>(),
-        vec![root_c, root_a, root_b]
-    );
-    let incoming = grouped_neighbor_rows(incoming_hits);
-    assert_eq!(
-        incoming,
-        HashMap::from([
-            (
-                root_a,
-                HashSet::from([(only_a, edge_ids[6], EdgeRelation::DependsOn)]),
-            ),
-            (
-                root_b,
-                HashSet::from([(shared, edge_ids[7], EdgeRelation::DependsOn)]),
-            ),
-            (
-                root_c,
-                HashSet::from([(only_c, edge_ids[10], EdgeRelation::DependsOn)]),
-            ),
-        ])
+        neighbor_edge_multiset(&incoming_hits),
+        HashMap::from([((root_b, joined_id), 1), ((root_b, self_loop_id), 1),])
     );
 
     let both_hits = store
@@ -1531,7 +1469,7 @@ async fn batch_neighbors_keeps_exact_rows_grouped_by_requested_node() {
             &sources,
             NeighborQuery {
                 direction: Direction::Both,
-                relations: Some(vec![EdgeRelation::Extends]),
+                relations: None,
                 limit: None,
                 min_weight: None,
             },
@@ -1539,38 +1477,47 @@ async fn batch_neighbors_keeps_exact_rows_grouped_by_requested_node() {
         .await
         .unwrap();
     assert_eq!(
+        neighbor_edge_multiset(&both_hits),
+        HashMap::from([
+            ((root_a, joined_id), 1),
+            ((root_b, joined_id), 1),
+            ((root_b, self_loop_id), 2),
+        ])
+    );
+    assert!(
         both_hits
             .iter()
-            .map(|(origin, _)| *origin)
-            .collect::<Vec<_>>(),
-        vec![root_c, root_c, root_a, root_a, root_b, root_b]
+            .all(|(origin, _)| *origin != root_without_edges),
+        "the requested zero-edge root must not acquire another root's rows"
     );
-    let both = grouped_neighbor_rows(both_hits);
+}
+
+#[tokio::test]
+async fn batch_neighbors_preserves_duplicate_requested_sources() {
+    let store = setup_memory_store();
+    let root = Uuid::new_v4();
+    let target = Uuid::new_v4();
+    let edge = make_edge(root, target, EdgeRelation::Extends, 1.0);
+    let edge_id = Uuid::from(edge.id);
+    store.upsert_edge(edge).await.unwrap();
+
+    let hits = store
+        .batch_neighbors(
+            &[root, root],
+            NeighborQuery {
+                direction: Direction::Out,
+                relations: None,
+                limit: None,
+                min_weight: None,
+            },
+        )
+        .await
+        .unwrap();
+
     assert_eq!(
-        both,
-        HashMap::from([
-            (
-                root_a,
-                HashSet::from([
-                    (shared, edge_ids[0], EdgeRelation::Extends),
-                    (shared, edge_ids[5], EdgeRelation::Extends),
-                ]),
-            ),
-            (
-                root_b,
-                HashSet::from([
-                    (shared, edge_ids[2], EdgeRelation::Extends),
-                    (only_b, edge_ids[8], EdgeRelation::Extends),
-                ]),
-            ),
-            (
-                root_c,
-                HashSet::from([
-                    (only_c, edge_ids[4], EdgeRelation::Extends),
-                    (shared, edge_ids[9], EdgeRelation::Extends),
-                ]),
-            ),
-        ])
+        neighbor_edge_multiset(&hits),
+        HashMap::from([((root, edge_id), 2)]),
+        "the optimized override must match the trait default's per-occurrence output"
     );
 }
 
