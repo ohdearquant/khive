@@ -217,33 +217,63 @@ Per-entity posterior state decomposes into **evidence-only counts plus a fixed p
 applied at read time**, with **exponential time decay of the evidence**:
 
 ```text
-stored:   (alpha_ev, beta_ev, last_event_at)        # evidence only, both start at 0
-decayed:  g = 2^(-dt_days / H)                       # dt = now - last_event_at
+stored:   (alpha_ev, beta_ev, last_event_at)        # evidence mass only, both start at 0
+decayed:  g = 2^(-dt_days / H)                       # dt in days, see clock rules below
           alpha' = g * alpha_ev,  beta' = g * beta_ev
 mean:     (1 + alpha') / (2 + alpha' + beta')        # Beta(1,1) prior enters here, once
 ```
 
-- **Write path** (feedback and recall-hit updates): decay the stored counts by the
-  elapsed interval first, then add the new observation, then stamp `last_event_at`.
-  This is the standard prior-preserving update: the prior is never part of what decays
-  or what is written.
+- **Evidence is judgment-bearing feedback only.** Per-entity evidence accrues from
+  feedback signals that carry a caller's judgment (explicit positive/negative,
+  implicit positive/negative, correction, and the useful/not_useful/wrong ladder),
+  each at its configured signal weight. Automatic exposure events (`RecallHit`,
+  `NoteAccessed`) are excluded from per-entity evidence: they record that an item was
+  served or opened, not that anyone judged it useful, and routing them into the term
+  that reorders the next serve creates a positional feedback loop. At one auto-hit per
+  day with the default half-life, replenished positive evidence reaches a steady state
+  near `1 / (1 - 2^(-1/30)) = 43.8`, a decayed mean near 0.978, and a persistent
+  multiplier near 1.143, enough to durably order candidates on exposure alone.
+  Exposure events continue to feed the global posteriors exactly as shipped; only the
+  per-entity accrual rule changes. This amends the accepted ADR's Stage B accrual
+  behavior as part of Stage D.
+- **Evidence counts are mass, not event counts.** Each signal adds its weight
+  (correction 2.0, explicit 1.5, implicit 0.1 under the existing fold-gate clamp on
+  cumulative implicit mass), so `B` throughout this amendment denotes accrued evidence
+  mass. A single correction is `B = 2.0`, not `B = 1`.
+- **Write path**: decay the stored counts by the interval elapsed since
+  `last_event_at`, then add the new observation's weight, then stamp `last_event_at`.
+  The prior is never part of what decays or what is written.
+- **Event-time clock, not wall clock, on the write path.** The accepted ADR's replay
+  contract (ADR-032) requires that replaying the same event history yields identical
+  state regardless of when the replay runs. Every write-side interval and every
+  `last_event_at` stamp therefore uses the event's own persisted occurrence time
+  (`Event.created_at`), carried into the profile reducer alongside the signal. The
+  reducer never reads a wall clock. Backward-clock policy: `dt = max(event_time -
+  last_event_at, 0)` days, so an out-of-order or regressed timestamp decays nothing
+  and never grows evidence; it is not an error.
 - **Read path** (component 2's `entity_posterior_mean`): compute the decayed mean as a
-  pure function of stored state and the current time. No writes on read — serve-time
-  projection stays deterministic and side-effect free, exactly as the accepted ADR
-  requires.
-- **Half-life `H`**: configurable, default 30 days (`entity_evidence_half_life_days`).
-  At the default, evidence loses half its weight per month.
+  pure function of stored state and an injected current time. No writes on read:
+  serve-time projection stays deterministic and side-effect free, exactly as the
+  accepted ADR requires.
+- **Half-life `H`**: runtime configuration `entity_evidence_half_life_days`, default
+  30 days, one value per running instance (the same configuration layer, and the same
+  validation posture, as the existing recall half-life: finite and strictly positive,
+  rejected at the configuration boundary otherwise). It is not per-profile or
+  per-request state, so identical stored posteriors always project identically within
+  a deployment.
 - **Decay is the recovery mechanism, on a magnitude-dependent clock.** Because the
   decayed mean converges to the prior mean 0.5, the component-2 multiplier converges to
-  exactly 1.0 (neutral). For a purely negative posterior with accumulated evidence `B`,
-  the decayed mean is `1 / (2 + g * B)` with `g = 2^(-dt / H)`, so the time to return
-  within a tolerance of neutral grows with `log2(B)`: a single negative judgment
-  (`B = 1`) is effectively neutral after about two half-lives, while ten accumulated
-  negative judgments take roughly `H * (log2(B) + 2)` — around five to six half-lives
-  at the default. This is intended behavior: heavily-confirmed judgments decay on a
-  proportionally longer clock, and no memory is permanently suppressed, but the
-  recovery claim is conditional on evidence magnitude, not a flat two-half-life
-  guarantee.
+  exactly 1.0 (neutral). For a purely negative posterior with accumulated evidence mass
+  `B`, the decayed mean is `1 / (2 + g * B)` with `g = 2^(-dt / H)`, so the time to
+  return within a tolerance of neutral grows with `log2(B)`: unit evidence mass
+  (`B = 1`, and anything below about 1.23) is within 0.02 of neutral (in multiplier
+  terms) after two half-lives, while a single explicit judgment (`B = 1.5`), a single
+  correction (`B = 2.0`), and any larger accumulated mass are not, and reach the 0.02
+  band by `H * (log2(B) + 2.2)` uniformly in `B` (at that elapsed time
+  `g * B = 2^(-2.2)` regardless of `B`). This is
+  intended behavior: heavily-confirmed judgments decay on a proportionally longer
+  clock, and no memory is permanently suppressed, but recovery time is conditional on
+  evidence magnitude and signal weight, never a flat two-half-life guarantee.
 
 ### Snapshot migration
 
@@ -263,21 +293,25 @@ load.
   prior would penalize every unjudged memory by up to 15% and invert the accepted
   ADR's relevance-dominance property. Rejected with intent, not overlooked.
 - **A separate coverage/exploration route** (serving low-evidence items via an explicit
-  known-propensity arm to prevent cold-start starvation): the starvation loop it guards
-  against cannot close here, because ranking is relevance-dominant, the per-entity term
-  is clamped to ±15%, and decay-to-neutral restores any suppressed item without
-  requiring it to be re-served first. If a future consumer makes the posterior term
-  exposure-controlling (a larger `w_ent`, or posterior-driven candidate selection),
-  this rejection must be revisited in the same decision.
+  known-propensity arm to prevent cold-start starvation): rejected, conditional on the
+  exposure-event exclusion above. With `RecallHit` and `NoteAccessed` excluded from
+  per-entity evidence, evidence enters only when a caller judges a result, so a
+  repeatedly served item gains no automatic advantage and the rich-get-richer loop
+  through the posterior term cannot close; ranking stays relevance-dominant, the term
+  is clamped to plus or minus 15%, and decay-to-neutral restores any suppressed item
+  without requiring it to be re-served first. Two conditions void this rejection and
+  force the decision to be retaken: reintroducing any automatic exposure signal into
+  per-entity evidence, or making the posterior term exposure-controlling (a larger
+  `w_ent`, or posterior-driven candidate selection).
 - **Decay of the three global posteriors** (`relevance`, `salience`, `temporal`): out
   of scope. They receive signal on effectively every recall, so staleness self-corrects
   at event rate; the per-entity posteriors are the sparse, staleness-prone state.
 
 ### Stage D gate
 
-| Stage | Contents                                              | Gate                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
-| ----- | ----------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| D     | Evidence/prior decomposition + lazy exponential decay | Unit: decayed mean converges to 0.5 over elapsed time; update-after-gap decays before adding; v1 snapshot migration round-trips; read path provably write-free. Behavior (clock-injected, both magnitudes pinned): a `B = 1` negative posterior's component-2 term returns within 0.02 of neutral after two configured half-lives, AND a `B >= 8` negative posterior is provably NOT yet within 0.02 at two half-lives but is within 0.02 by `H * (log2(B) + 2.2)`, with the mean-to-multiplier mapping `clamp(1 + w_ent * (mean - 0.5), 0.85, 1.15)` computed explicitly in the assertions rather than approximated. |
+| Stage | Contents                                              | Gate                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
+| ----- | ----------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| D     | Evidence/prior decomposition + lazy exponential decay | Unit: decayed mean converges to 0.5 over elapsed time; update-after-gap decays before adding; v1 snapshot migration round-trips; read path provably write-free; a `RecallHit` and a `NoteAccessed` leave per-entity evidence unchanged; configuration rejects zero, negative, and non-finite `H`; a write whose event time precedes `last_event_at` neither decays nor grows evidence. Replay determinism: a snapshot-plus-event-history replay executed at two different wall-clock times yields byte-identical stored per-entity state (event-time clock, ADR-032). Behavior (clock-injected, magnitudes pinned in evidence-mass units): a `B = 1` negative posterior's component-2 term returns within 0.02 of neutral after two configured half-lives; a single-correction `B = 2.0` posterior is provably NOT within 0.02 at two half-lives; a `B >= 8` posterior is NOT within 0.02 at two half-lives but is within 0.02 by `H * (log2(B) + 2.2)`; the mean-to-multiplier mapping `clamp(1 + w_ent * (mean - 0.5), 0.85, 1.15)` is computed explicitly in the assertions rather than approximated. |
 
 Stage D is additive behind the shipped Stage A/B surface; the breakdown field
 `entity_posterior_mean` keeps its shape and now reports the decayed mean.
