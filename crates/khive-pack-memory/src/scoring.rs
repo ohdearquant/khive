@@ -354,10 +354,10 @@ const MAX_CJK_LOOKUP_CHARS: usize = 8;
 /// ASCII-lowercased non-stopword unigrams and reserve one quarter of the cap
 /// for adjacent-token bigrams. CJK substrings reserve a fair quota for every
 /// supported length from 2 through 8, redistributing unused quota from short
-/// runs. Within each length, available start positions are sampled at an even
-/// stride, including the final valid start in the query. The result is both
-/// length-fair and position-fair under the 64-candidate cap. All candidates are
-/// deduplicated.
+/// runs. Within each length, available start positions are sampled evenly.
+/// Quotas greater than one guarantee both the first and final valid starts;
+/// a quota of one selects the first endpoint. The result is both length-fair
+/// and position-fair under the 64-candidate cap. All candidates are deduplicated.
 ///
 /// Unlike `extract_entity_candidates` above, this does **not** filter on
 /// capitalization, lowercase queries are the whole point of this extension.
@@ -452,11 +452,14 @@ pub fn entity_lookup_candidates(query: &str) -> Vec<String> {
             continue;
         }
         let num_positions = candidates.len();
-        let stride = (num_positions / quota).max(1);
-        let mut sampled_indices: Vec<usize> = (0..quota)
-            .map(|offset| num_positions - 1 - offset * stride)
-            .collect();
-        sampled_indices.reverse();
+        let mut sampled_indices = if quota == 1 {
+            vec![0]
+        } else {
+            (0..quota)
+                .map(|index| index * (num_positions - 1) / (quota - 1))
+                .collect::<Vec<_>>()
+        };
+        sampled_indices.dedup();
         for index in sampled_indices {
             let candidate = candidates[index].clone();
             if seen.insert(candidate.clone()) {

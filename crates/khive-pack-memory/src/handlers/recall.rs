@@ -4568,6 +4568,29 @@ mod tests {
 
     #[tokio::test]
     #[serial(background_tasks)]
+    async fn adr104_stage_c_first_cjk_entity_survives_candidate_cap() {
+        let query: String = (0..20)
+            .map(|offset| char::from_u32(0x4e00 + offset).expect("valid CJK character"))
+            .collect();
+        let entity_name: String = query.chars().take(2).collect();
+        assert_eq!(query.chars().count(), 20);
+
+        let anchored_score =
+            dispatch_single_note_recall_with_entity(Some(&entity_name), &query, &query, None).await;
+        let opted_out_score =
+            dispatch_single_note_recall_with_entity(Some(&entity_name), &query, &query, Some(&[]))
+                .await;
+
+        assert!(
+            anchored_score > opted_out_score,
+            "a CJK entity in the first two characters of a 20-character unsegmented query must \
+             survive the candidate cap: \
+             anchored={anchored_score} opted_out={opted_out_score}"
+        );
+    }
+
+    #[tokio::test]
+    #[serial(background_tasks)]
     async fn adr104_stage_c_eight_character_cjk_entity_matches() {
         const ENTITY_NAME: &str = "甲乙丙丁戊己庚辛";
         const QUERY: &str = "甲乙丙丁戊己庚辛";
@@ -4673,6 +4696,20 @@ mod tests {
         assert!(out.contains(&"北京大学".to_string()));
         assert!(!out.iter().any(|candidate| candidate.chars().count() == 1));
         assert!(out.iter().all(|candidate| candidate.chars().count() <= 8));
+    }
+
+    #[test]
+    fn entity_lookup_candidates_samples_both_cjk_endpoints() {
+        let query: String = (0..20)
+            .map(|offset| char::from_u32(0x4e00 + offset).expect("valid CJK character"))
+            .collect();
+        let first_bigram: String = query.chars().take(2).collect();
+        let final_bigram: String = query.chars().skip(18).collect();
+
+        let out = crate::scoring::entity_lookup_candidates(&query);
+
+        assert!(out.contains(&first_bigram));
+        assert!(out.contains(&final_bigram));
     }
 
     #[tokio::test]
