@@ -228,7 +228,9 @@ fn micros_to_dt(micros: i64) -> DateTime<Utc> {
 ///    not merged. This prevents `NEAR(smile,5)` from becoming `NEARsmile5`.
 ///    It also keeps punctuated identifiers searchable: `khive-pack-memory`
 ///    becomes `khive pack memory`, not `khivepackmemory`.
-///    Chars replaced with space: `(`, `)`, `,`, `:`, `-`, `.`
+///    Chars replaced with space: `(`, `)`, `,`, `:`, `-`, `.`, `/`
+///    (`/` added: FTS5's MATCH-expression parser rejects a bareword
+///    containing `/` as a syntax error, e.g. the throughput query `GB/s`)
 /// 2. **Remove** remaining FTS5 operator characters (H1: `~`, `!` added;
 ///    issue #388: `$` added — FTS5's MATCH-expression parser treats a bareword
 ///    starting with, containing, or consisting solely of `$` as a syntax
@@ -246,7 +248,7 @@ fn sanitize_fts5_query(query: &str) -> String {
     let spaced: String = query
         .chars()
         .map(|c| {
-            if matches!(c, '(' | ')' | ',' | ':' | '-' | '.') {
+            if matches!(c, '(' | ')' | ',' | ':' | '-' | '.' | '/') {
                 ' '
             } else {
                 c
@@ -307,7 +309,7 @@ fn sanitize_fts5_query_legacy_merged(query: &str) -> String {
         .filter(|c| {
             !matches!(
                 c,
-                '*' | '"' | '\'' | '+' | '-' | '^' | '.' | '~' | '!' | '$' | '\0'
+                '*' | '"' | '\'' | '+' | '-' | '^' | '.' | '/' | '~' | '!' | '$' | '\0'
             ) && !c.is_control()
         })
         .collect();

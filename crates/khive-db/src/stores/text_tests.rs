@@ -1129,6 +1129,74 @@ async fn test_search_any_term_mode_with_dollar_does_not_crash() {
     assert_eq!(result.unwrap().len(), 1);
 }
 
+/// Slash-bearing query (e.g. `GB/s throughput measurements`) must not crash the FTS5
+/// leg. `/` was previously untouched by `sanitize_fts5_query`, reaching FTS5 raw and
+/// producing `fts5: syntax error near "/"`.
+#[tokio::test]
+async fn test_search_with_slash_does_not_crash_and_matches() {
+    let store = setup_memory_store("slash_query");
+
+    store
+        .upsert_document(make_document(
+            Uuid::new_v4(),
+            "bandwidth benchmark",
+            "measured 900 GB/s throughput on the device",
+        ))
+        .await
+        .unwrap();
+
+    let result = store
+        .search(TextSearchRequest {
+            query: "GB/s throughput".to_string(),
+            mode: TextQueryMode::Plain,
+            filter: Some(ns_filter("test_ns")),
+            top_k: 10,
+            snippet_chars: 64,
+        })
+        .await;
+    assert!(
+        result.is_ok(),
+        "slash query must not crash FTS5, got: {:?}",
+        result.err()
+    );
+    assert_eq!(
+        result.unwrap().len(),
+        1,
+        "slash query must still return the seeded matching document"
+    );
+}
+
+/// AnyTerm mode (used by memory.recall fanout) must also survive a slash-bearing query.
+#[tokio::test]
+async fn test_search_any_term_mode_with_slash_does_not_crash() {
+    let store = setup_memory_store("slash_any_term_query");
+
+    store
+        .upsert_document(make_document(
+            Uuid::new_v4(),
+            "bandwidth benchmark",
+            "measured 900 GB/s throughput on the device",
+        ))
+        .await
+        .unwrap();
+
+    let result = store
+        .search(TextSearchRequest {
+            query: "GB/s".to_string(),
+            mode: TextQueryMode::AnyTerm,
+            filter: Some(ns_filter("test_ns")),
+            top_k: 10,
+            snippet_chars: 64,
+        })
+        .await;
+    assert!(
+        result.is_ok(),
+        "AnyTerm slash query must not crash FTS5, got: {:?}",
+        result.err()
+    );
+    assert_eq!(result.unwrap().len(), 1);
+}
+
 #[tokio::test]
 async fn test_score_is_bounded() {
     let store = setup_memory_store("score_bounds");
