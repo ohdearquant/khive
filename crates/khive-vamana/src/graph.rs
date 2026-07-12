@@ -4,6 +4,7 @@ use std::collections::{BTreeMap, HashSet};
 
 use khive_quant::{GsEncodedVector, GsSq8Codec};
 use rand::prelude::*;
+#[cfg(feature = "parallel")]
 use rayon::prelude::*;
 
 use crate::{
@@ -177,45 +178,50 @@ impl VamanaGraph {
                     .map(|&node| adjacency[node as usize].clone())
                     .collect();
 
+                let propose = |(&node, prior_neighbors): (&u32, &Vec<u32>)| {
+                    let mut visited = VisitedSet::new(num_vectors);
+                    let query = row(vectors, config.dimensions, node);
+                    let search = greedy_search_inner(
+                        vectors,
+                        config.dimensions,
+                        &adjacency,
+                        query,
+                        medoid,
+                        config.max_degree,
+                        config.search_list_size,
+                        &mut visited,
+                        None, // no tombstones during build
+                    );
+
+                    let mut candidates: Vec<u32> = search
+                        .expanded
+                        .iter()
+                        .map(|(id, _)| *id)
+                        .chain(search.results.iter().map(|(id, _)| *id))
+                        .chain(prior_neighbors.iter().copied())
+                        .collect();
+                    sort_dedup_u32(&mut candidates);
+
+                    let neighbors = robust_prune_inner(
+                        vectors,
+                        config.dimensions,
+                        node,
+                        candidates,
+                        pass_alpha,
+                        config.max_degree,
+                    );
+
+                    (node, neighbors)
+                };
+                #[cfg(feature = "parallel")]
                 let proposals: Vec<(u32, Vec<u32>)> = batch
                     .par_iter()
                     .zip(batch_prior.par_iter())
-                    .map(|(&node, prior_neighbors)| {
-                        let mut visited = VisitedSet::new(num_vectors);
-                        let query = row(vectors, config.dimensions, node);
-                        let search = greedy_search_inner(
-                            vectors,
-                            config.dimensions,
-                            &adjacency,
-                            query,
-                            medoid,
-                            config.max_degree,
-                            config.search_list_size,
-                            &mut visited,
-                            None, // no tombstones during build
-                        );
-
-                        let mut candidates: Vec<u32> = search
-                            .expanded
-                            .iter()
-                            .map(|(id, _)| *id)
-                            .chain(search.results.iter().map(|(id, _)| *id))
-                            .chain(prior_neighbors.iter().copied())
-                            .collect();
-                        sort_dedup_u32(&mut candidates);
-
-                        let neighbors = robust_prune_inner(
-                            vectors,
-                            config.dimensions,
-                            node,
-                            candidates,
-                            pass_alpha,
-                            config.max_degree,
-                        );
-
-                        (node, neighbors)
-                    })
+                    .map(propose)
                     .collect();
+                #[cfg(not(feature = "parallel"))]
+                let proposals: Vec<(u32, Vec<u32>)> =
+                    batch.iter().zip(batch_prior.iter()).map(propose).collect();
 
                 for (node, neighbors) in &proposals {
                     adjacency[*node as usize] = neighbors.clone();
@@ -314,51 +320,56 @@ impl VamanaGraph {
                     .map(|&node| adjacency[node as usize].clone())
                     .collect();
 
+                let propose = |(&node, prior_neighbors): (&u32, &Vec<u32>)| {
+                    let mut visited = VisitedSet::new(num_vectors);
+                    let query = row(vectors, config.dimensions, node);
+                    let query_enc = &encoded[node as usize];
+                    let search = greedy_search_inner_sq8(
+                        vectors,
+                        config.dimensions,
+                        encoded,
+                        codec,
+                        &adjacency,
+                        query,
+                        query_enc,
+                        medoid,
+                        config.max_degree,
+                        config.search_list_size,
+                        &mut visited,
+                        None,
+                    );
+
+                    let mut candidates: Vec<u32> = search
+                        .expanded
+                        .iter()
+                        .map(|(id, _)| *id)
+                        .chain(search.results.iter().map(|(id, _)| *id))
+                        .chain(prior_neighbors.iter().copied())
+                        .collect();
+                    sort_dedup_u32(&mut candidates);
+
+                    let neighbors = robust_prune_inner_sq8(
+                        vectors,
+                        config.dimensions,
+                        encoded,
+                        codec,
+                        node,
+                        candidates,
+                        pass_alpha,
+                        config.max_degree,
+                    );
+
+                    (node, neighbors)
+                };
+                #[cfg(feature = "parallel")]
                 let proposals: Vec<(u32, Vec<u32>)> = batch
                     .par_iter()
                     .zip(batch_prior.par_iter())
-                    .map(|(&node, prior_neighbors)| {
-                        let mut visited = VisitedSet::new(num_vectors);
-                        let query = row(vectors, config.dimensions, node);
-                        let query_enc = &encoded[node as usize];
-                        let search = greedy_search_inner_sq8(
-                            vectors,
-                            config.dimensions,
-                            encoded,
-                            codec,
-                            &adjacency,
-                            query,
-                            query_enc,
-                            medoid,
-                            config.max_degree,
-                            config.search_list_size,
-                            &mut visited,
-                            None,
-                        );
-
-                        let mut candidates: Vec<u32> = search
-                            .expanded
-                            .iter()
-                            .map(|(id, _)| *id)
-                            .chain(search.results.iter().map(|(id, _)| *id))
-                            .chain(prior_neighbors.iter().copied())
-                            .collect();
-                        sort_dedup_u32(&mut candidates);
-
-                        let neighbors = robust_prune_inner_sq8(
-                            vectors,
-                            config.dimensions,
-                            encoded,
-                            codec,
-                            node,
-                            candidates,
-                            pass_alpha,
-                            config.max_degree,
-                        );
-
-                        (node, neighbors)
-                    })
+                    .map(propose)
                     .collect();
+                #[cfg(not(feature = "parallel"))]
+                let proposals: Vec<(u32, Vec<u32>)> =
+                    batch.iter().zip(batch_prior.iter()).map(propose).collect();
 
                 for (node, neighbors) in &proposals {
                     adjacency[*node as usize] = neighbors.clone();
@@ -1048,22 +1059,27 @@ fn select_medoid(vectors: &[f32], dimensions: usize, num_vectors: usize) -> Resu
         *m *= scale;
     }
 
+    let candidate = |id| {
+        let d = l2_squared(&mean, row(vectors, dimensions, id));
+        (id, d)
+    };
+    let select = |(best_id, best_d), (id, d)| {
+        if d < best_d || (d == best_d && id < best_id) {
+            (id, d)
+        } else {
+            (best_id, best_d)
+        }
+    };
+    #[cfg(feature = "parallel")]
     let best_id = (0..num_vectors as u32)
         .into_par_iter()
-        .map(|id| {
-            let d = l2_squared(&mean, row(vectors, dimensions, id));
-            (id, d)
-        })
-        .reduce(
-            || (0u32, f32::INFINITY),
-            |(best_id, best_d), (id, d)| {
-                if d < best_d || (d == best_d && id < best_id) {
-                    (id, d)
-                } else {
-                    (best_id, best_d)
-                }
-            },
-        )
+        .map(candidate)
+        .reduce(|| (0u32, f32::INFINITY), select)
+        .0;
+    #[cfg(not(feature = "parallel"))]
+    let best_id = (0..num_vectors as u32)
+        .map(candidate)
+        .fold((0u32, f32::INFINITY), select)
         .0;
 
     Ok(best_id)

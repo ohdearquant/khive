@@ -236,6 +236,26 @@ jobs:
           fi
           echo "native and wasm32-wasip1: $(wc -l < /tmp/native.sorted) tests, identical pass/fail results"
 
+  vamana-portability:
+    name: vamana portability (ADR-110 Layer A)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: crates
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.94.1
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates
+          cache-on-failure: true
+      - name: wasm32 core compile check
+        run: cargo check --target wasm32-unknown-unknown -p khive-quant -p khive-vamana --no-default-features
+      - name: Native sequential and owned-storage tests
+        run: cargo test -p khive-quant -p khive-vamana --no-default-features
+
   coverage-ratchet:
     name: Coverage ratchet
     runs-on: ubuntu-latest
