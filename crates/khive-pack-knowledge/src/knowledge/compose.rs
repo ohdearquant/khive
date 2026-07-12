@@ -1,6 +1,7 @@
 //! Hybrid section scoring for knowledge.compose (ADR-051 read-side).
 
 use std::collections::HashMap;
+use std::time::{Duration, Instant};
 
 use khive_runtime::{KhiveRuntime, RuntimeError};
 use khive_storage::types::{SqlStatement, SqlValue};
@@ -314,6 +315,113 @@ fn tokenize(text: &str) -> Vec<String> {
         .collect()
 }
 
+// ─── slow-request / abandonment observability (#887) ─────────────────────────
+//
+// The daemon had zero compose-path evidence during a heavy-load window where
+// two consecutive `knowledge.compose` calls hit the 300s client-side MCP
+// timeout — no start/finish record, no duration, no timeout error. `rerank`
+// is embedder-CPU-bound, so load starvation was the working hypothesis, but
+// nothing in the log could confirm or refute it. `ComposeTiming` measures
+// per-stage elapsed time unconditionally (unlike the opt-in
+// `KHIVE_RECALL_PROFILE` eprintln profiler in the memory pack) and logs via
+// `tracing::warn!`, matching the WARN-on-anomaly style used elsewhere in this
+// crate (see `index_handler.rs`, `vamana.rs`).
+
+/// Compose requests whose total handler time reaches this are logged at WARN
+/// with a per-phase breakdown. 10s matches the example threshold named in
+/// #887: well above a healthy compose (sub-second in the common case) but
+/// far short of the 300s client-side MCP timeout that made the original
+/// incident unattributable.
+pub(super) const COMPOSE_SLOW_THRESHOLD_MS: u64 = 10_000;
+
+/// Per-stage elapsed-time tracker for `knowledge.compose`.
+///
+/// `mark(phase)` accumulates the time since the previous mark (or `start`)
+/// into that phase's running total — call it multiple times with the same
+/// name to add up non-contiguous work under one bucket (e.g. `compose` does
+/// two DB fetches and two embedding reranks that interleave in code order).
+///
+/// `finish` must be the last thing called on every return path that
+/// completes the request (success or a business-logic error): it flags the
+/// timing as complete and, if the total reaches [`COMPOSE_SLOW_THRESHOLD_MS`],
+/// emits the slow-request WARN. If `finish` is never reached — because the
+/// enclosing future was dropped mid-poll (client disconnect, cancellation, or
+/// daemon shutdown drain) — `Drop` emits a distinct "abandoned" WARN with
+/// whatever phases completed and the elapsed time up to the drop, so a
+/// request that never produces a response is not silently invisible.
+pub(super) struct ComposeTiming {
+    start: Instant,
+    last: Instant,
+    phases: Vec<(&'static str, Duration)>,
+    query_len: usize,
+    is_auto: bool,
+    completed: bool,
+}
+
+impl ComposeTiming {
+    pub(super) fn start(query: &str, is_auto: bool) -> Self {
+        let now = Instant::now();
+        Self {
+            start: now,
+            last: now,
+            phases: Vec::with_capacity(4),
+            query_len: query.chars().count(),
+            is_auto,
+            completed: false,
+        }
+    }
+
+    pub(super) fn mark(&mut self, phase: &'static str) {
+        let now = Instant::now();
+        let elapsed = now.duration_since(self.last);
+        match self.phases.iter_mut().find(|(name, _)| *name == phase) {
+            Some((_, total)) => *total += elapsed,
+            None => self.phases.push((phase, elapsed)),
+        }
+        self.last = now;
+    }
+
+    fn phase_ms(&self) -> Vec<(&'static str, u64)> {
+        self.phases
+            .iter()
+            .map(|(name, d)| (*name, d.as_millis() as u64))
+            .collect()
+    }
+
+    /// Consumes the tracker, marking it complete so `Drop` does not also log
+    /// an "abandoned" warning for a request that finished normally.
+    pub(super) fn finish(mut self, atom_count: usize) {
+        self.completed = true;
+        let total_ms = self.start.elapsed().as_millis() as u64;
+        if total_ms >= COMPOSE_SLOW_THRESHOLD_MS {
+            tracing::warn!(
+                total_ms,
+                threshold_ms = COMPOSE_SLOW_THRESHOLD_MS,
+                phases = ?self.phase_ms(),
+                atom_count,
+                query_len = self.query_len,
+                is_auto = self.is_auto,
+                "knowledge.compose exceeded slow-request threshold"
+            );
+        }
+    }
+}
+
+impl Drop for ComposeTiming {
+    fn drop(&mut self) {
+        if !self.completed {
+            tracing::warn!(
+                elapsed_ms = self.start.elapsed().as_millis() as u64,
+                phases = ?self.phase_ms(),
+                query_len = self.query_len,
+                is_auto = self.is_auto,
+                "knowledge.compose request abandoned before completion \
+                 (client disconnect, cancellation, or daemon shutdown)"
+            );
+        }
+    }
+}
+
 // ─── tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -480,5 +588,101 @@ mod tests {
             unembedded_result.score > 0.0,
             "unembedded section must still have positive score from other signals"
         );
+    }
+
+    // ── ComposeTiming (#887) ────────────────────────────────────────────────
+
+    #[test]
+    fn slow_threshold_is_sane() {
+        // Sanity-bounds the const rather than pinning it to exactly 10_000,
+        // so a deliberate future retune doesn't require touching the test —
+        // but a typo (e.g. dropping three zeros) still fails loudly. Both
+        // sides are compile-time-constant, so `clippy::assertions_on_constants`
+        // requires the `const { }` wrapper (this becomes a build-time check,
+        // which is strictly stronger than a runtime test assertion).
+        const {
+            assert!(
+                COMPOSE_SLOW_THRESHOLD_MS >= 1_000,
+                "threshold must be well above a healthy sub-second compose"
+            );
+        }
+        const {
+            assert!(
+                COMPOSE_SLOW_THRESHOLD_MS <= 60_000,
+                "threshold must be well under the 300s client-side MCP timeout \
+                 (#887) to give advance warning"
+            );
+        }
+    }
+
+    #[test]
+    fn mark_accumulates_duration_under_repeated_phase_names() {
+        let mut t = ComposeTiming::start("test query", false);
+        std::thread::sleep(Duration::from_millis(2));
+        t.mark("fetch");
+        std::thread::sleep(Duration::from_millis(2));
+        t.mark("rerank");
+        std::thread::sleep(Duration::from_millis(2));
+        // Second DB fetch (e.g. load_sections) accumulates into the same
+        // "fetch" bucket instead of overwriting or duplicating it.
+        t.mark("fetch");
+
+        assert_eq!(
+            t.phases.len(),
+            2,
+            "repeated phase name must accumulate, not duplicate"
+        );
+        let fetch_ms = t
+            .phases
+            .iter()
+            .find(|(name, _)| *name == "fetch")
+            .unwrap()
+            .1
+            .as_millis();
+        let rerank_ms = t
+            .phases
+            .iter()
+            .find(|(name, _)| *name == "rerank")
+            .unwrap()
+            .1
+            .as_millis();
+        assert!(
+            fetch_ms >= 4,
+            "accumulated fetch time must cover both marks (~4ms), got {fetch_ms}ms"
+        );
+        assert!(
+            rerank_ms >= 2,
+            "rerank bucket must cover its single mark, got {rerank_ms}ms"
+        );
+
+        t.finish(3);
+    }
+
+    #[test]
+    fn finish_marks_complete_and_suppresses_drop_warning() {
+        // No log-capture harness exists for this crate (#887 scope note); this
+        // exercises the non-panicking, completed-before-drop path. The
+        // behavioral guarantee (`completed` gates the Drop-time WARN) is
+        // covered structurally below.
+        let mut t = ComposeTiming::start("q", true);
+        t.mark("suggest");
+        t.finish(1);
+    }
+
+    #[test]
+    fn drop_without_finish_does_not_panic() {
+        // Simulates an abandoned request (future dropped before `finish`,
+        // e.g. client disconnect or cancellation) — must not panic even
+        // though `completed` was never set.
+        let t = ComposeTiming::start("abandoned", false);
+        drop(t);
+    }
+
+    #[test]
+    fn start_records_query_char_length_not_byte_length() {
+        // Multi-byte UTF-8 query: char count must not silently be byte count.
+        let t = ComposeTiming::start("héllo wörld", false);
+        assert_eq!(t.query_len, 11);
+        t.finish(0);
     }
 }

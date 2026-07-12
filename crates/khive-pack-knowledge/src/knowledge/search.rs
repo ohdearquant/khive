@@ -1282,6 +1282,24 @@ impl KnowledgeHandlers {
             }
         }
 
+        // #887: unconditional per-stage timing, WARN-on-slow and
+        // WARN-on-abandoned. See `super::compose::ComposeTiming` for the
+        // full rationale and the completion-contract every early return
+        // below must honor (`finish()` before returning, or route the error
+        // through `try_or_finish!`).
+        let mut timing = super::compose::ComposeTiming::start(&raw_query, is_auto);
+        macro_rules! try_or_finish {
+            ($e:expr) => {
+                match $e {
+                    Ok(v) => v,
+                    Err(e) => {
+                        timing.finish(0);
+                        return Err(e);
+                    }
+                }
+            };
+        }
+
         if is_auto {
             let auto_limit = p.auto_limit.unwrap_or(5).clamp(1, 20);
             let suggest_result = match Self::suggest(
@@ -1301,6 +1319,7 @@ impl KnowledgeHandlers {
                 }
                 Err(e) => {
                     tracing::warn!(error = %e, "auto-compose: internal suggest failed, returning empty");
+                    timing.finish(0);
                     return Ok(json!({
                         "status": "ok",
                         "data": {
@@ -1332,9 +1351,11 @@ impl KnowledgeHandlers {
                 if suggest_ann_unavailable {
                     data["ann_unavailable"] = json!(true);
                 }
+                timing.finish(0);
                 return Ok(json!({ "status": "ok", "data": data }));
             }
         }
+        timing.mark("suggest");
 
         let ns = token.namespace().as_str().to_owned();
 
@@ -1342,8 +1363,8 @@ impl KnowledgeHandlers {
         let mut member_slugs: Vec<String> = Vec::new();
 
         for id in &domain_ids {
-            let domain = load_domain_by_id_or_slug(runtime, &ns, id).await?;
-            let members = parse_domain_members(&domain)?;
+            let domain = try_or_finish!(load_domain_by_id_or_slug(runtime, &ns, id).await);
+            let members = try_or_finish!(parse_domain_members(&domain));
             member_slugs.extend(members);
             resolved_domains.push(domain);
         }
@@ -1352,13 +1373,13 @@ impl KnowledgeHandlers {
         let mut ordered_atoms: Vec<Atom> = Vec::new();
 
         for slug in &member_slugs {
-            let atom = load_atom_by_id_or_slug(runtime, &ns, slug).await?;
+            let atom = try_or_finish!(load_atom_by_id_or_slug(runtime, &ns, slug).await);
             if seen_ids.insert(atom.id.to_string()) {
                 ordered_atoms.push(atom);
             }
         }
         for id in &atom_ids {
-            let atom = load_atom_by_id_or_slug(runtime, &ns, id).await?;
+            let atom = try_or_finish!(load_atom_by_id_or_slug(runtime, &ns, id).await);
             if seen_ids.insert(atom.id.to_string()) {
                 ordered_atoms.push(atom);
             }
@@ -1374,8 +1395,10 @@ impl KnowledgeHandlers {
                 !COMPOSE_EXCLUDE.contains(&status)
             });
         }
+        timing.mark("fetch");
 
         if ordered_atoms.is_empty() {
+            timing.finish(0);
             return Ok(json!({
                 "status": "ok",
                 "data": {
@@ -1399,7 +1422,8 @@ impl KnowledgeHandlers {
             })
             .collect();
 
-        rerank_text_items(runtime, &raw_query, &mut items).await?;
+        try_or_finish!(rerank_text_items(runtime, &raw_query, &mut items).await);
+        timing.mark("rerank");
 
         let atom_ids: Vec<String> = ordered_atoms.iter().map(|a| a.id.to_string()).collect();
         let atom_cosine_scores: HashMap<String, f32> = items
@@ -1407,7 +1431,9 @@ impl KnowledgeHandlers {
             .map(|item| (item.id.clone(), item.score))
             .collect();
 
-        let section_map = super::compose::load_sections(runtime, &ns, &atom_ids).await?;
+        let section_map =
+            try_or_finish!(super::compose::load_sections(runtime, &ns, &atom_ids).await);
+        timing.mark("fetch");
 
         let has_sections = !section_map.is_empty();
 
@@ -1453,6 +1479,7 @@ impl KnowledgeHandlers {
         } else {
             Vec::new()
         };
+        timing.mark("rerank");
 
         let max_tokens = p.max_tokens.unwrap_or(8000).clamp(500, 100_000);
         const CHARS_PER_TOKEN: usize = 4;
@@ -1545,6 +1572,7 @@ impl KnowledgeHandlers {
             .collect();
 
         let count = atom_json.len();
+        timing.mark("trim");
 
         let mut data = json!({
             "query": raw_query,
@@ -1561,6 +1589,7 @@ impl KnowledgeHandlers {
             data["ann_unavailable"] = json!(true);
         }
 
+        timing.finish(count);
         Ok(json!({
             "status": "ok",
             "data": data,
