@@ -51,7 +51,8 @@ khive-pack-kg = { version = "0.4.0", path = "../khive-pack-kg" }
 # (issue #459 regression). khive-pack-memory already carries khive-pack-brain
 # as a dev-dependency for its own tests; Cargo permits cyclic dev-dependencies
 # since neither crate's normal (non-dev) dependency graph is affected.
-khive-pack-memory = { version = "0.4.0", path = "../khive-pack-memory" }
+# Path-only: cyclic dev-dep pair with khive-pack-memory; cargo strips it at publish.
+khive-pack-memory = { path = "../khive-pack-memory" }
 criterion = { workspace = true }
 tempfile = { workspace = true }
 serial_test = { workspace = true }
