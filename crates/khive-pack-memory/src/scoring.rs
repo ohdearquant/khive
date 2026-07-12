@@ -352,9 +352,12 @@ const MAX_CJK_LOOKUP_CHARS: usize = 8;
 /// Build the candidate strings a recall query offers to the entity-anchored
 /// lookup (ADR-104 §5 / Stage C). Alphabetic-script queries contribute raw and
 /// ASCII-lowercased non-stopword unigrams and reserve one quarter of the cap
-/// for adjacent-token bigrams. Each contiguous CJK run contributes substrings
-/// position-fairly across starts. Supported CJK names are 2..=8 characters,
-/// with at most 64 candidates per query. All candidates are deduplicated.
+/// for adjacent-token bigrams. CJK substrings reserve a fair quota for every
+/// supported length from 2 through 8, redistributing unused quota from short
+/// runs. Within each length, available start positions are sampled at an even
+/// stride, including the final valid start in the query. The result is both
+/// length-fair and position-fair under the 64-candidate cap. All candidates are
+/// deduplicated.
 ///
 /// Unlike `extract_entity_candidates` above, this does **not** filter on
 /// capitalization, lowercase queries are the whole point of this extension.
@@ -388,21 +391,81 @@ pub fn entity_lookup_candidates(query: &str) -> Vec<String> {
         run_start = run_end;
     }
 
-    for len in MIN_CJK_LOOKUP_CHARS..=MAX_CJK_LOOKUP_CHARS {
-        for &(run_start, run_end) in &cjk_runs {
-            if run_end - run_start < len {
-                continue;
+    let length_count = MAX_CJK_LOOKUP_CHARS - MIN_CJK_LOOKUP_CHARS + 1;
+    let base_quota = MAX_ENTITY_LOOKUP_CANDIDATES / length_count;
+    let quota_remainder = MAX_ENTITY_LOOKUP_CANDIDATES % length_count;
+
+    let cjk_candidates: Vec<Vec<String>> = (MIN_CJK_LOOKUP_CHARS..=MAX_CJK_LOOKUP_CHARS)
+        .map(|len| {
+            let mut last_start_by_candidate = std::collections::HashMap::new();
+            for &(run_start, run_end) in &cjk_runs {
+                if run_end - run_start < len {
+                    continue;
+                }
+                for start in run_start..=run_end - len {
+                    let candidate: String = chars[start..start + len].iter().collect();
+                    last_start_by_candidate.insert(candidate, start);
+                }
             }
-            for start in run_start..=run_end - len {
-                let candidate: String = chars[start..start + len].iter().collect();
-                if seen.insert(candidate.clone()) {
-                    out.push(candidate);
-                    if out.len() >= MAX_ENTITY_LOOKUP_CANDIDATES {
-                        return out;
-                    }
+
+            let mut positioned: Vec<(usize, String)> = last_start_by_candidate
+                .into_iter()
+                .map(|(candidate, start)| (start, candidate))
+                .collect();
+            positioned.sort_unstable_by_key(|(start, _)| *start);
+            positioned
+                .into_iter()
+                .map(|(_, candidate)| candidate)
+                .collect()
+        })
+        .collect();
+
+    let mut quotas: Vec<usize> = (0..length_count)
+        .map(|index| base_quota + usize::from(index < quota_remainder))
+        .collect();
+    let mut unused = 0;
+    for (quota, candidates) in quotas.iter_mut().zip(&cjk_candidates) {
+        if candidates.len() < *quota {
+            unused += *quota - candidates.len();
+            *quota = candidates.len();
+        }
+    }
+    while unused > 0 {
+        let mut redistributed = false;
+        for (quota, candidates) in quotas.iter_mut().zip(&cjk_candidates) {
+            if *quota < candidates.len() {
+                *quota += 1;
+                unused -= 1;
+                redistributed = true;
+                if unused == 0 {
+                    break;
                 }
             }
         }
+        if !redistributed {
+            break;
+        }
+    }
+
+    for (candidates, quota) in cjk_candidates.iter().zip(quotas) {
+        if quota == 0 {
+            continue;
+        }
+        let num_positions = candidates.len();
+        let stride = (num_positions / quota).max(1);
+        let mut sampled_indices: Vec<usize> = (0..quota)
+            .map(|offset| num_positions - 1 - offset * stride)
+            .collect();
+        sampled_indices.reverse();
+        for index in sampled_indices {
+            let candidate = candidates[index].clone();
+            if seen.insert(candidate.clone()) {
+                out.push(candidate);
+            }
+        }
+    }
+    if out.len() >= MAX_ENTITY_LOOKUP_CANDIDATES {
+        return out;
     }
 
     let mut bigrams = tokens
@@ -1255,6 +1318,39 @@ mod tests {
     #[test]
     fn extract_entity_candidates_all_stopwords_returns_empty() {
         assert!(extract_entity_candidates("is the a of").is_empty());
+    }
+
+    #[test]
+    fn entity_lookup_candidates_is_length_and_position_fair_for_long_cjk_run() {
+        let run: String = (0..65)
+            .map(|offset| char::from_u32(0x4e00 + offset).expect("valid CJK character"))
+            .collect();
+        let candidates = entity_lookup_candidates(&run);
+
+        assert_eq!(candidates.len(), MAX_ENTITY_LOOKUP_CANDIDATES);
+        for len in MIN_CJK_LOOKUP_CHARS..=MAX_CJK_LOOKUP_CHARS {
+            let expected_quota = MAX_ENTITY_LOOKUP_CANDIDATES
+                / (MAX_CJK_LOOKUP_CHARS - MIN_CJK_LOOKUP_CHARS + 1)
+                + usize::from(len == MIN_CJK_LOOKUP_CHARS);
+            assert_eq!(
+                candidates
+                    .iter()
+                    .filter(|candidate| candidate.chars().count() == len)
+                    .count(),
+                expected_quota,
+                "candidate set must reserve the exact quota for length {len}"
+            );
+
+            let chars: Vec<char> = run.chars().collect();
+            let has_late_candidate = (chars.len() - 10..=chars.len() - len).any(|start| {
+                let expected: String = chars[start..start + len].iter().collect();
+                candidates.contains(&expected)
+            });
+            assert!(
+                has_late_candidate,
+                "length {len} must include a candidate starting in the final 10 positions"
+            );
+        }
     }
 
     // ── EntityMatch word-boundary matching ──────────────────────────────────────

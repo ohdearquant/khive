@@ -4545,18 +4545,23 @@ mod tests {
     #[tokio::test]
     #[serial(background_tasks)]
     async fn adr104_stage_c_late_cjk_entity_survives_candidate_cap() {
-        const ENTITY_NAME: &str = "終点";
-        const QUERY: &str = "天地玄黄宇宙洪荒日月盈昃辰宿列張寒来暑往秋収冬蔵終点";
+        const ENTITY_NAME: &str = "龍鳳凰";
+        let mut query: String = (0..62)
+            .map(|offset| char::from_u32(0x4e00 + offset).expect("valid CJK character"))
+            .collect();
+        query.push_str(ENTITY_NAME);
+        assert_eq!(query.chars().count(), 65);
 
         let anchored_score =
-            dispatch_single_note_recall_with_entity(Some(ENTITY_NAME), QUERY, QUERY, None).await;
+            dispatch_single_note_recall_with_entity(Some(ENTITY_NAME), &query, &query, None).await;
         let opted_out_score =
-            dispatch_single_note_recall_with_entity(Some(ENTITY_NAME), QUERY, QUERY, Some(&[]))
+            dispatch_single_note_recall_with_entity(Some(ENTITY_NAME), &query, &query, Some(&[]))
                 .await;
 
         assert!(
             anchored_score > opted_out_score,
-            "a CJK entity near the end of a long unsegmented query must survive the candidate cap: \
+            "a CJK entity in the final 10 characters of a 65-character unsegmented query must \
+             survive the candidate cap: \
              anchored={anchored_score} opted_out={opted_out_score}"
         );
     }
