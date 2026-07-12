@@ -638,6 +638,11 @@ const TRIGGER_WORDS: &[&str] = &[
     "apikey",
 ];
 
+/// Compound triggers that retain substring matching inside assignment labels.
+/// Their underscore separator disambiguates them from ordinary prose, and
+/// suffixes are common in versioned credential names such as `api_keyv2`.
+const ASSIGNMENT_COMPOUND_TRIGGERS: &[&str] = &["api_key", "access_key", "private_key"];
+
 /// Minimum token length to apply the entropy check.
 const MIN_ENTROPY_LEN: usize = 24;
 
@@ -892,9 +897,12 @@ fn has_inline_credential_trigger(raw_token: &str) -> bool {
             .rsplit(|c: char| !c.is_ascii_alphanumeric() && c != '_')
             .next()
             .unwrap_or_default();
-        TRIGGER_WORDS
+        ASSIGNMENT_COMPOUND_TRIGGERS
             .iter()
-            .any(|tw| contains_bounded_word(label, tw))
+            .any(|tw| label.contains(tw))
+            || TRIGGER_WORDS
+                .iter()
+                .any(|tw| contains_bounded_word(label, tw))
             || label == "token"
     });
     if has_assignment_label {
@@ -3259,6 +3267,26 @@ mod tests {
             "auth=<high-entropy-value> must still be blocked; got {:?}",
             scan(content)
         );
+    }
+
+    #[test]
+    fn blocks_suffix_bearing_compound_credential_assignments() {
+        let opaque = "Xk9mZ2vQpLrT8nJwYuAeHfBsDcGiONvMabcdef"; // gitleaks:allow
+        let cases = [
+            format!("api_keyv2={opaque}"),
+            format!("access_keyv2={opaque}"),
+            format!("private_keyv2={opaque}"),
+            format!("API_KEYV2={opaque}"),
+            format!(r#"{{"private_keyv2":"{opaque}"}}"#),
+        ];
+        for content in &cases {
+            assert!(
+                check(content).is_err(),
+                "suffix-bearing compound credential assignment must be blocked: \
+                 {content:?}, got {:?}",
+                scan(content)
+            );
+        }
     }
 
     #[test]
