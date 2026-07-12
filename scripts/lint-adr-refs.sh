@@ -3,7 +3,83 @@
 set -eu
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-ROOT="$SCRIPT_DIR/.."
+
+# `--self-test`: exercise the parenthetical-prose-citation extraction (the
+# `ADR-NNN: <title>` form embedded in plain prose, e.g. inside a crate's
+# docs/design.md "ADR Compliance" section) against synthetic fixtures rather
+# than the live repo, since the real corpus only carries a handful of these.
+# Regression case 1 reproduces the bm25 design.md drift this was added for
+# (PR #886 review r1): a parenthetical citation that echoes a truncated ADR
+# title must fail. Regression case 2 asserts a bare "(ADR-030)" reference
+# with no restated title never false-positives.
+self_test() {
+    tmp="$(mktemp -d)"
+    trap 'rm -rf "$tmp"' EXIT
+
+    mkdir -p "$tmp/case-fail/docs/adr" "$tmp/case-fail/crates/fixture-crate/docs"
+    mkdir -p "$tmp/case-pass/docs/adr" "$tmp/case-pass/crates/fixture-crate/docs"
+
+    for case in case-fail case-pass; do
+        cat > "$tmp/$case/docs/adr/ADR-030-retrieval-stack-port.md" <<'FIXTURE'
+# ADR-030: Retrieval Stack Port — khive-retrieval
+
+**Status**: accepted
+FIXTURE
+        cat > "$tmp/$case/docs/adr/README.md" <<'FIXTURE'
+# ADR Index
+
+| ADR | Title |
+| --- | --- |
+FIXTURE
+    done
+
+    cat > "$tmp/case-fail/crates/fixture-crate/docs/design.md" <<'FIXTURE'
+# fixture-crate Design
+
+## ADR Compliance
+
+- ported as part of the retrieval stack (ADR-030: Retrieval Stack Port).
+FIXTURE
+
+    cat > "$tmp/case-pass/crates/fixture-crate/docs/design.md" <<'FIXTURE'
+# fixture-crate Design
+
+## ADR Compliance
+
+- ported as part of the retrieval stack (ADR-030).
+FIXTURE
+
+    status=0
+
+    if sh "$SCRIPT_DIR/lint-adr-refs.sh" "$tmp/case-fail" > "$tmp/fail.log" 2>&1; then
+        echo "self-test FAILED: drifted parenthetical prose citation (ADR-030: Retrieval Stack Port, missing the '-- khive-retrieval' suffix) was not caught"
+        cat "$tmp/fail.log"
+        status=1
+    elif ! grep -q "ADR-030 title mismatch" "$tmp/fail.log"; then
+        echo "self-test FAILED: lint failed, but not for the expected reason:"
+        cat "$tmp/fail.log"
+        status=1
+    else
+        echo "self-test OK: drifted parenthetical prose citation caught"
+    fi
+
+    if ! sh "$SCRIPT_DIR/lint-adr-refs.sh" "$tmp/case-pass" > "$tmp/pass.log" 2>&1; then
+        echo "self-test FAILED: bare ADR-030 reference (no restated title) should not trip the lint"
+        cat "$tmp/pass.log"
+        status=1
+    else
+        echo "self-test OK: bare ADR reference does not false-positive"
+    fi
+
+    return "$status"
+}
+
+if [ "${1:-}" = "--self-test" ]; then
+    self_test
+    exit $?
+fi
+
+ROOT="${1:-$SCRIPT_DIR/..}"
 
 python3 - "$ROOT" <<'PY'
 from __future__ import annotations
@@ -70,6 +146,49 @@ def parenthesized_title(line: str, match: re.Match[str]) -> str | None:
     if closing is None:
         return None
     return line[opening + 1 : closing]
+
+
+def top_level_parens(line: str) -> list[tuple[int, int]]:
+    spans: list[tuple[int, int]] = []
+    index = 0
+    while index < len(line):
+        if line[index] == "(":
+            closing = closing_delimiter(line, index, "(", ")")
+            if closing is None:
+                index += 1
+                continue
+            spans.append((index, closing))
+            index = closing + 1
+        else:
+            index += 1
+    return spans
+
+
+def prose_parenthetical_references(line: str) -> list[tuple[str, str]]:
+    # Titled ADR references embedded in plain prose, e.g. "(ADR-030: Retrieval
+    # Stack Port)" -- distinct from headings and Markdown link labels, which
+    # are handled separately. Bounded to matching parens so trailing sentence
+    # content never leaks into the captured title (unlike a naive end-of-line
+    # capture). Only fires on the colon-titled form -- a bare "(ADR-030)" or a
+    # descriptive gloss like "(ADR-030, hybrid retrieval)" never matches
+    # colon_ref_re, so it is left alone.
+    references: list[tuple[str, str]] = []
+    for open_idx, close_idx in top_level_parens(line):
+        inner = line[open_idx + 1 : close_idx]
+        inner_matches = list(colon_ref_re.finditer(inner))
+        for match_index, inner_match in enumerate(inner_matches):
+            end = (
+                inner_matches[match_index + 1].start()
+                if match_index + 1 < len(inner_matches)
+                else len(inner)
+            )
+            title = inner[inner_match.end() : end].split(";", 1)[0].strip()
+            if not title or title[0].isdigit():
+                # Empty capture, or a section/line locator like "ADR-017:451-480"
+                # rather than a titled reference.
+                continue
+            references.append((inner_match.group("number"), title))
+    return references
 
 
 def titled_references(label: str) -> list[tuple[str, str]]:
@@ -159,9 +278,18 @@ scan_paths = set((root / "docs").glob("**/*.md"))
 scan_paths.update((root / "crates").glob("**/docs/**/*.md"))
 scan_paths.update((root / "crates").glob("**/design*.md"))
 
+adr_dir_resolved = adr_dir.resolve()
+
 reference_count = 0
 for path in sorted(scan_paths):
     relative = path.relative_to(root)
+    # docs/adr/**/*.md itself is excluded from prose-citation scanning: ADR
+    # bodies routinely cross-reference sibling ADRs with a deliberately
+    # abbreviated gloss ("(ADR-002: Edge Ontology governs the endpoint
+    # contract)", "(ADR-001: Artifact entities)") rather than a literal title
+    # restatement -- an established, reviewed convention, not drift. Headings
+    # and links are still checked everywhere, including docs/adr/.
+    prose_eligible = adr_dir_resolved not in path.resolve().parents
     in_fence = False
     with path.open(encoding="utf-8") as handle:
         for line_number, raw_line in enumerate(handle, 1):
@@ -188,6 +316,11 @@ for path in sorted(scan_paths):
             references: list[tuple[str, str]] = []
             for label in labels:
                 for reference in titled_references(label):
+                    if reference not in references:
+                        references.append(reference)
+
+            if heading_match is None and prose_eligible:
+                for reference in prose_parenthetical_references(line):
                     if reference not in references:
                         references.append(reference)
 

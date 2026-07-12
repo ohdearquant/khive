@@ -5,7 +5,7 @@
 ### SIMD Foundation Layer (ADR-011)
 
 - Distance computation (`src/distance.rs`) delegates all vector math to `lattice-embed::simd`
-  (ADR-011: Embedding and Inference — `lattice-embed` is the SIMD and quantization foundation).
+  (ADR-011 — `lattice-embed` is the SIMD and quantization foundation).
 - Cosine, Dot, and L2 metrics use NEON/AVX2/AVX-512 dispatch from the lattice-embed crate.
 - INT8 dot product (`int8_dot_product_raw`) also routes through `lattice_embed::simd::dot_product_i8_raw`.
 - The HNSW crate itself contains no SIMD code; it is purely algorithmic.

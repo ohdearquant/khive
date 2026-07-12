@@ -89,7 +89,7 @@
 ### Note and Edge Operations (ADR-002, ADR-019)
 
 - Three-case relation contract for link operations: annotates, supersedes, and entity→entity base rules
-  (ADR-002: Edge Ontology governs the endpoint contract; ADR-019: GTD Pack extends it for task notes).
+  (ADR-002 governs the endpoint contract; ADR-019 extends it for task notes).
 - The endpoint validation path is centralized in `operations.rs` so both `link` and `update_edge` share the same contract.
 
 ### ADR-021: Memory Pack
@@ -152,7 +152,7 @@
 ### ANN Warmup (ADR-049)
 
 - `KhiveRuntime::warm_ann_index` is intended to run once at startup as a background task.
-  The warm-start protocol is owned by the daemon (ADR-049: khived daemon); the runtime
+  The warm-start protocol is owned by the daemon (ADR-049); the runtime
   exposes the `warm_ann_index` hook for the daemon to invoke during startup.
 - Warm startup sequence follows steps 2–4 from the ANN warmup spec.
 
