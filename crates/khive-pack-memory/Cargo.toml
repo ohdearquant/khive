@@ -15,16 +15,16 @@ description = "Memory verb pack — remember/recall semantics with decay-aware r
 bench = false
 
 [dependencies]
-khive-types = { version = "0.3.0", path = "../khive-types", features = ["serde"] }
-khive-runtime = { version = "0.3.0", path = "../khive-runtime" }
-khive-fusion = { version = "0.3.0", path = "../khive-fusion" }
-khive-retrieval = { version = "0.3.0", path = "../khive-retrieval" }
-khive-score = { version = "0.3.0", path = "../khive-score" }
-khive-brain-core = { version = "0.3.0", path = "../khive-brain-core" }
-khive-vamana = { version = "0.3.0", path = "../khive-vamana" }
+khive-types = { version = "0.3.1", path = "../khive-types", features = ["serde"] }
+khive-runtime = { version = "0.3.1", path = "../khive-runtime" }
+khive-fusion = { version = "0.3.1", path = "../khive-fusion" }
+khive-retrieval = { version = "0.3.1", path = "../khive-retrieval" }
+khive-score = { version = "0.3.1", path = "../khive-score" }
+khive-brain-core = { version = "0.3.1", path = "../khive-brain-core" }
+khive-vamana = { version = "0.3.1", path = "../khive-vamana" }
 blake3 = { workspace = true }
 inventory = { workspace = true }
-khive-storage = { version = "0.3.0", path = "../khive-storage" }
+khive-storage = { version = "0.3.1", path = "../khive-storage" }
 async-trait = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -36,9 +36,9 @@ lru = { workspace = true }
 parking_lot = { workspace = true }
 
 [dev-dependencies]
-khive-db = { version = "0.3.0", path = "../khive-db" }
-khive-pack-kg = { version = "0.3.0", path = "../khive-pack-kg" }
-khive-pack-brain = { version = "0.3.0", path = "../khive-pack-brain" }
+khive-db = { version = "0.3.1", path = "../khive-db" }
+khive-pack-kg = { version = "0.3.1", path = "../khive-pack-kg" }
+khive-pack-brain = { version = "0.3.1", path = "../khive-pack-brain" }
 tokio = { workspace = true, features = ["test-util"] }
 lattice-embed = { workspace = true }
 async-trait = { workspace = true }

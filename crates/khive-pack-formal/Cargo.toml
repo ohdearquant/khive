@@ -12,8 +12,8 @@ categories.workspace = true
 description = "Formal-math ontology pack — typed edge rules for theorem/definition/structure/instance/axiom/goal subtypes"
 
 [dependencies]
-khive-types = { version = "0.3.0", path = "../khive-types", features = ["serde"] }
-khive-runtime = { version = "0.3.0", path = "../khive-runtime" }
+khive-types = { version = "0.3.1", path = "../khive-types", features = ["serde"] }
+khive-runtime = { version = "0.3.1", path = "../khive-runtime" }
 inventory = { workspace = true }
 async-trait = { workspace = true }
 serde_json = { workspace = true }
