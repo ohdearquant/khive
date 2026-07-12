@@ -232,13 +232,18 @@ mean:     (1 + alpha') / (2 + alpha' + beta')        # Beta(1,1) prior enters he
   projection stays deterministic and side-effect free, exactly as the accepted ADR
   requires.
 - **Half-life `H`**: configurable, default 30 days (`entity_evidence_half_life_days`).
-  At the default, evidence loses half its weight per month; a fully negative posterior
-  (mean pinned low) returns to within 0.05 of neutral in roughly two half-lives with no
-  further signals.
-- **Decay is the recovery mechanism.** Because the decayed mean converges to the prior
-  mean 0.5, the component-2 multiplier converges to exactly 1.0 (neutral). A memory
-  down-weighted by old negative feedback regains neutral standing on the half-life
-  clock instead of being permanently suppressed.
+  At the default, evidence loses half its weight per month.
+- **Decay is the recovery mechanism, on a magnitude-dependent clock.** Because the
+  decayed mean converges to the prior mean 0.5, the component-2 multiplier converges to
+  exactly 1.0 (neutral). For a purely negative posterior with accumulated evidence `B`,
+  the decayed mean is `1 / (2 + g * B)` with `g = 2^(-dt / H)`, so the time to return
+  within a tolerance of neutral grows with `log2(B)`: a single negative judgment
+  (`B = 1`) is effectively neutral after about two half-lives, while ten accumulated
+  negative judgments take roughly `H * (log2(B) + 2)` — around five to six half-lives
+  at the default. This is intended behavior: heavily-confirmed judgments decay on a
+  proportionally longer clock, and no memory is permanently suppressed, but the
+  recovery claim is conditional on evidence magnitude, not a flat two-half-life
+  guarantee.
 
 ### Snapshot migration
 
@@ -270,9 +275,9 @@ load.
 
 ### Stage D gate
 
-| Stage | Contents                                              | Gate                                                                                                                                                                                                                                                                                                       |
-| ----- | ----------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| D     | Evidence/prior decomposition + lazy exponential decay | Unit: decayed mean converges to 0.5 over elapsed time; update-after-gap decays before adding; v1 snapshot migration round-trips; read path provably write-free. Behavior: a negative posterior's component-2 term returns within 0.02 of neutral after two configured half-lives in a clock-injected test. |
+| Stage | Contents                                              | Gate                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
+| ----- | ----------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| D     | Evidence/prior decomposition + lazy exponential decay | Unit: decayed mean converges to 0.5 over elapsed time; update-after-gap decays before adding; v1 snapshot migration round-trips; read path provably write-free. Behavior (clock-injected, both magnitudes pinned): a `B = 1` negative posterior's component-2 term returns within 0.02 of neutral after two configured half-lives, AND a `B >= 8` negative posterior is provably NOT yet within 0.02 at two half-lives but is within 0.02 by `H * (log2(B) + 2.2)`, with the mean-to-multiplier mapping `clamp(1 + w_ent * (mean - 0.5), 0.85, 1.15)` computed explicitly in the assertions rather than approximated. |
 
 Stage D is additive behind the shipped Stage A/B surface; the breakdown field
 `entity_posterior_mean` keeps its shape and now reports the decayed mean.
