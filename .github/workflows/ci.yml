@@ -330,6 +330,7 @@ jobs:
       - dependency-review
       - coverage-ratchet
       - wasm-parity
+      - vamana-portability
     if: always()
     steps:
       - name: Check aggregated job results
