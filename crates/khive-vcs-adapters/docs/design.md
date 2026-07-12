@@ -2,7 +2,7 @@
 
 ## ADR Compliance
 
-### ADR-036: KG Import/Export Adapters
+### KG Import/Export Adapters (ADR-036)
 
 - This crate implements the format adapter layer of the two-stage KG import pipeline.
 - Adapters are pure transforms: they parse a source format and produce `EntityRecord`/`EdgeRecord`
@@ -18,7 +18,7 @@
 - Phase P0 formats: `csv`, `tsv`, `json`, `ndjson`. Deferred to P1/P2: BibTeX, Turtle,
   JSON-LD, streaming JSON, GraphML, GEXF, Markdown.
 
-### ADR-020: Git-Native KG Implementation (field shapes)
+### Git-Native KG Implementation (field shapes) (ADR-020)
 
 - `EntityRecord` and `EdgeRecord` follow the wire shapes specified for the import pipeline.
 - `EntityRecord` carries `id`, `kind`, `name`, `description?`, `properties`, `tags`.
@@ -35,7 +35,7 @@
 - Unknown kinds produce `AdapterError::UnknownKind` — never silently defaulted.
 - Missing `kind` is a fatal `AdapterError::MissingField`.
 
-### ADR-002: Edge Ontology
+### Edge Ontology (ADR-002)
 
 - `EdgeRecord.relation` must be one of the 15 canonical edge relations.
 - Validation uses `khive_types::EdgeRelation::from_str` at parse time.

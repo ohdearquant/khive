@@ -10,9 +10,9 @@ graph-based retrieval engine (ADR-048).
   -- recall/latency targets, snapshot validation, production defaults
 - [ADR-009: Backend Architecture](../../../docs/adr/ADR-009-backend-architecture.md)
   -- in-process retrieval engine boundary
-- [ADR-012: Retrieval Composition](../../../docs/adr/ADR-012-retrieval-composition.md)
+- [ADR-012: Retrieval Composition (High-Level Composition Layer)](../../../docs/adr/ADR-012-retrieval-composition.md)
   -- hybrid retrieval stack integration
-- [ADR-030: Retrieval Stack Port](../../../docs/adr/ADR-030-retrieval-stack-port.md)
+- [ADR-030: Retrieval Stack Port — khive-retrieval](../../../docs/adr/ADR-030-retrieval-stack-port.md)
   -- Rust retrieval layer
 
 **Primary modules:**
@@ -48,7 +48,7 @@ graph-based retrieval engine (ADR-048).
 
 ## ADR Compliance
 
-### ADR-048: Vamana ANN Engine
+### Vamana ANN Engine (ADR-048)
 
 This crate implements the Vamana ANN index as the knowledge-pack approximate
 nearest-neighbor engine.

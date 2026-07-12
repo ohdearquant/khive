@@ -1446,4 +1446,4 @@ request(ops="git.digest(source=\"https://github.com/org/repo\", max_items=500)")
 - [GTD Task Management](tasks.html): task lifecycle in depth.
 - [Prompt Cookbook](prompt-cookbook.html): ready-to-use verb patterns.
 - [ADR-016: request DSL](https://github.com/ohdearquant/khive/blob/main/docs/adr/ADR-016-request-dsl.md)
-- [ADR-002: edge ontology](https://github.com/ohdearquant/khive/blob/main/docs/adr/ADR-002-edge-ontology.md)
+- [ADR-002: Closed Edge Ontology](https://github.com/ohdearquant/khive/blob/main/docs/adr/ADR-002-edge-ontology.md)

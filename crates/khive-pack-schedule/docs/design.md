@@ -128,7 +128,7 @@ The pack self-registers via `inventory::submit!`. It declares `REQUIRES = ["kg"]
 ensuring the kg pack is loaded before this pack during boot-time dependency
 resolution.
 
-### ADR-025: Verb Speech Acts
+### Verb Speech Acts (ADR-025)
 
 - `schedule.remind` and `schedule.schedule` are commissive (create future intent).
 - `schedule.agenda` is assertive (query state without side effects).
