@@ -349,12 +349,22 @@ const MAX_BIGRAM_LOOKUP_CANDIDATES: usize = MAX_ENTITY_LOOKUP_CANDIDATES / 4;
 const MIN_CJK_LOOKUP_CHARS: usize = 2;
 const MAX_CJK_LOOKUP_CHARS: usize = 8;
 
+fn entity_lookup_case_variants(candidate: String) -> [Option<String>; 2] {
+    let lower = candidate.to_ascii_lowercase();
+    if candidate.is_ascii() {
+        [None, Some(lower)]
+    } else {
+        [Some(candidate), Some(lower)]
+    }
+}
+
 /// Build the candidate strings a recall query offers to the entity-anchored
-/// lookup (ADR-104 §5 / Stage C). Alphabetic-script queries contribute raw and
+/// lookup (ADR-104 §5 / Stage C). Alphabetic-script queries contribute
 /// ASCII-lowercased non-stopword unigrams and reserve one quarter of the cap
-/// for adjacent-token bigrams. CJK substrings reserve a fair quota for every
-/// supported length from 2 through 8, redistributing unused quota from short
-/// runs. Within each length, available start positions are sampled evenly.
+/// for adjacent-token bigrams. Candidates containing non-ASCII characters also
+/// retain their raw form for exact matching. CJK substrings reserve a fair quota
+/// for every supported length from 2 through 8, redistributing unused quota from
+/// short runs. Within each length, available start positions are sampled evenly.
 /// Quotas greater than one guarantee both the first and final valid starts;
 /// a quota of one selects the first endpoint. The result is both length-fair
 /// and position-fair under the 64-candidate cap. All candidates are deduplicated.
@@ -475,7 +485,7 @@ pub fn entity_lookup_candidates(query: &str) -> Vec<String> {
         .windows(2)
         .map(|pair| format!("{} {}", pair[0], pair[1]));
     for bigram in bigrams.by_ref().take(MAX_BIGRAM_LOOKUP_CANDIDATES) {
-        for candidate in [bigram.clone(), bigram.to_ascii_lowercase()] {
+        for candidate in entity_lookup_case_variants(bigram).into_iter().flatten() {
             if seen.insert(candidate.clone()) {
                 out.push(candidate);
                 if out.len() >= MAX_ENTITY_LOOKUP_CANDIDATES {
@@ -489,7 +499,10 @@ pub fn entity_lookup_candidates(query: &str) -> Vec<String> {
         !ENTITY_STOPWORDS.contains(&token.to_ascii_lowercase().as_str())
             && !token.chars().all(is_cjk_char)
     }) {
-        for candidate in [token.clone(), token.to_ascii_lowercase()] {
+        for candidate in entity_lookup_case_variants(token.clone())
+            .into_iter()
+            .flatten()
+        {
             if seen.insert(candidate.clone()) {
                 out.push(candidate);
                 if out.len() >= MAX_ENTITY_LOOKUP_CANDIDATES {
@@ -501,7 +514,7 @@ pub fn entity_lookup_candidates(query: &str) -> Vec<String> {
 
     // If the unigram share did not fill the cap, admit more adjacent bigrams.
     for bigram in bigrams {
-        for candidate in [bigram.clone(), bigram.to_ascii_lowercase()] {
+        for candidate in entity_lookup_case_variants(bigram).into_iter().flatten() {
             if seen.insert(candidate.clone()) {
                 out.push(candidate);
                 if out.len() >= MAX_ENTITY_LOOKUP_CANDIDATES {
@@ -1354,6 +1367,21 @@ mod tests {
                 "length {len} must include a candidate starting in the final 10 positions"
             );
         }
+    }
+
+    #[test]
+    fn entity_lookup_candidates_retains_final_bigram_independent_of_ascii_case() {
+        let lowercase = "one two three four five six seven eight nine ten eleven twelve thirteen fourteen fifteen sixteen final entity";
+        let title_case = "One Two Three Four Five Six Seven Eight Nine Ten Eleven Twelve Thirteen Fourteen Fifteen Sixteen Final Entity";
+
+        let lowercase_candidates = entity_lookup_candidates(lowercase);
+        let title_case_candidates = entity_lookup_candidates(title_case);
+        let stored_name_ci = "Final Entity".to_ascii_lowercase();
+
+        assert_eq!(title_case_candidates, lowercase_candidates);
+        assert!(lowercase_candidates.contains(&stored_name_ci));
+        assert!(title_case_candidates.contains(&stored_name_ci));
+        assert!(!title_case_candidates.contains(&"Final Entity".to_string()));
     }
 
     // ── EntityMatch word-boundary matching ──────────────────────────────────────

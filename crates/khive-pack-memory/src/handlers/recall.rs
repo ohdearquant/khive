@@ -4668,8 +4668,9 @@ mod tests {
     }
 
     /// `entity_lookup_candidates` unit coverage (pure function, ADR-104 §5):
-    /// raw and ASCII-lowercased unigrams and adjacent bigrams, stopwords
-    /// excluded from unigrams, capped at `MAX_ENTITY_LOOKUP_CANDIDATES`.
+    /// ASCII-only candidates are lowercased, candidates containing non-ASCII
+    /// characters also retain their raw form, stopwords are excluded from
+    /// unigrams, and output is capped at `MAX_ENTITY_LOOKUP_CANDIDATES`.
     #[test]
     fn entity_lookup_candidates_extracts_unigrams_and_bigrams_lowercased() {
         let out = crate::scoring::entity_lookup_candidates("New York City guide");
@@ -4714,22 +4715,28 @@ mod tests {
 
     #[tokio::test]
     #[serial(background_tasks)]
-    async fn adr104_stage_c_long_query_preserves_adjacent_bigram_entity() {
+    async fn adr104_stage_c_long_query_preserves_adjacent_bigram_entity_for_ascii_case() {
         const ENTITY_NAME: &str = "silver comet";
-        const QUERY: &str = "alpha bravo charlie delta echo foxtrot golf hotel india juliet kilo \
-                             lima mike november oscar silver comet";
+        const LOWERCASE_QUERY: &str = "alpha bravo charlie delta echo foxtrot golf hotel india \
+                                      juliet kilo lima mike november oscar papa silver comet";
+        const TITLE_CASE_QUERY: &str = "Alpha Bravo Charlie Delta Echo Foxtrot Golf Hotel India \
+                                       Juliet Kilo Lima Mike November Oscar Papa Silver Comet";
 
-        let anchored_score =
-            dispatch_single_note_recall_with_entity(Some(ENTITY_NAME), QUERY, QUERY, None).await;
-        let opted_out_score =
-            dispatch_single_note_recall_with_entity(Some(ENTITY_NAME), QUERY, QUERY, Some(&[]))
-                .await;
+        for query in [LOWERCASE_QUERY, TITLE_CASE_QUERY] {
+            let anchored_score =
+                dispatch_single_note_recall_with_entity(Some(ENTITY_NAME), query, query, None)
+                    .await;
+            let opted_out_score =
+                dispatch_single_note_recall_with_entity(Some(ENTITY_NAME), query, query, Some(&[]))
+                    .await;
 
-        assert!(
-            anchored_score > opted_out_score,
-            "a 17-token query must retain its final adjacent bigram entity: \
-             anchored={anchored_score} opted_out={opted_out_score}"
-        );
+            assert!(
+                anchored_score > opted_out_score,
+                "an 18-token query must retain and match its final adjacent bigram entity \
+                 regardless of ASCII case: query={query:?} anchored={anchored_score} \
+                 opted_out={opted_out_score}"
+            );
+        }
     }
 
     #[test]
