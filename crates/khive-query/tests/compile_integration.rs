@@ -1084,6 +1084,10 @@ mod substrate_labels {
                  created_at, updated_at, deleted_at, entity_type)
             VALUES
                 ('e-fixture-1', 'local', 'concept', 'X', NULL, '{}', '[]',
+                 0, 0, NULL, NULL),
+                ('e-fixture-spaces', 'local', 'project', 'Mixed Case Entity',
+                 NULL, '{}', '[]', 0, 0, NULL, NULL),
+                ('e-fixture-cjk', 'local', 'document', '知识 图谱', NULL, '{}', '[]',
                  0, 0, NULL, NULL);
             INSERT INTO notes
                 (id, namespace, kind, status, name, content, salience,
@@ -1171,6 +1175,36 @@ mod substrate_labels {
             "MATCH (e:entity) WHERE e.name = 'X' must return the existing entity row; sql: {}",
             compiled.sql
         );
+    }
+
+    #[test]
+    fn entity_name_equality_handles_case_spaces_and_cjk() {
+        let conn = fixture_db();
+        let cases = [
+            ("Mixed Case Entity", "e-fixture-spaces"),
+            ("mixed case entity", "e-fixture-spaces"),
+            ("知识 图谱", "e-fixture-cjk"),
+        ];
+
+        for (name, expected_id) in cases {
+            let q = parse(
+                QueryLanguage::Gql,
+                &format!(r#"MATCH (e:entity) WHERE e.name = "{name}" RETURN e.id"#),
+            )
+            .unwrap();
+            let compiled = compile(&q, &opts()).unwrap();
+            assert!(
+                compiled.sql.contains("COLLATE NOCASE"),
+                "GQL string equality must remain case-insensitive; sql: {}",
+                compiled.sql
+            );
+            assert_eq!(
+                run(&conn, &compiled),
+                vec![expected_id.to_string()],
+                "name equality must find {name:?}; sql: {}",
+                compiled.sql
+            );
+        }
     }
 
     #[test]

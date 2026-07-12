@@ -1472,6 +1472,116 @@ mod tests {
         );
     }
 
+    /// Exact-name storage lookup is Unicode-safe and does not tokenize names.
+    /// CJK and embedded spaces therefore resolve with the same confidence as
+    /// an ASCII single-token name.
+    #[tokio::test]
+    async fn resolve_exact_name_handles_cjk_and_spaces() {
+        let rt = KhiveRuntime::memory().expect("in-memory runtime");
+        let direct_tok = rt.authorize(Namespace::local()).unwrap();
+        let cjk = rt
+            .create_entity(
+                &direct_tok,
+                "concept",
+                None,
+                "知识 图谱",
+                None,
+                None,
+                vec![],
+            )
+            .await
+            .expect("direct CJK entity create must succeed");
+        let spaced = rt
+            .create_entity(
+                &direct_tok,
+                "concept",
+                None,
+                "Entity Name With Spaces",
+                None,
+                None,
+                vec![],
+            )
+            .await
+            .expect("direct spaced-name entity create must succeed");
+
+        let mut builder = VerbRegistryBuilder::new();
+        builder.with_default_namespace("local");
+        builder.register(KgPack::new(rt.clone()));
+        let registry = builder.build().expect("registry build");
+
+        let result = registry
+            .dispatch(
+                "resolve",
+                json!({"refs": ["知识 图谱", "Entity Name With Spaces"], "kind": "entity"}),
+            )
+            .await
+            .expect("resolve must succeed");
+        let results = result.get("results").and_then(|v| v.as_array()).unwrap();
+        assert_eq!(results.len(), 2);
+        for (result, expected_id) in results.iter().zip([cjk.id, spaced.id]) {
+            assert_eq!(
+                result.get("status").and_then(|v| v.as_str()),
+                Some("resolved")
+            );
+            assert_eq!(
+                result.get("id").and_then(|v| v.as_str()),
+                Some(expected_id.to_string().as_str())
+            );
+            assert_eq!(
+                result.get("confidence").and_then(|v| v.as_f64()),
+                Some(0.98)
+            );
+        }
+    }
+
+    /// The storage exact-name tier is case-sensitive. A case-only variant
+    /// can still resolve through case-insensitive hybrid search, but it must
+    /// not receive the exact tier's 0.98 confidence.
+    #[tokio::test]
+    async fn resolve_case_variant_uses_hybrid_fallback() {
+        let rt = KhiveRuntime::memory().expect("in-memory runtime");
+        let direct_tok = rt.authorize(Namespace::local()).unwrap();
+        let entity = rt
+            .create_entity(
+                &direct_tok,
+                "concept",
+                None,
+                "Case Sensitive Entity",
+                None,
+                None,
+                vec![],
+            )
+            .await
+            .expect("direct entity create must succeed");
+
+        let mut builder = VerbRegistryBuilder::new();
+        builder.with_default_namespace("local");
+        builder.register(KgPack::new(rt.clone()));
+        let registry = builder.build().expect("registry build");
+
+        let result = registry
+            .dispatch("resolve", json!({"refs": ["case sensitive entity"]}))
+            .await
+            .expect("resolve must succeed");
+        let results = result.get("results").and_then(|v| v.as_array()).unwrap();
+        assert_eq!(
+            results[0].get("status").and_then(|v| v.as_str()),
+            Some("resolved"),
+            "case-only variant should remain discoverable through hybrid search: {results:?}"
+        );
+        assert_eq!(
+            results[0].get("id").and_then(|v| v.as_str()),
+            Some(entity.id.to_string().as_str())
+        );
+        assert!(
+            results[0]
+                .get("confidence")
+                .and_then(|v| v.as_f64())
+                .is_some_and(|confidence| confidence < 0.98),
+            "case-only variant must not be reported as an exact-name hit: {results:?}"
+        );
+    }
+
     /// Two entities sharing the exact same name resolve as `Ambiguous`,
     /// never a silent pick, mirroring the ring's duplicate-name contract.
     #[tokio::test]
