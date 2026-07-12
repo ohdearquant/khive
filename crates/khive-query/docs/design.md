@@ -65,6 +65,10 @@ ADR-008. It is intentionally split into three stages:
   preserving SQL OR/AND connectives rather than flattening to AND-only.
 - GQL WHERE grammar: `where_expr = and_expr ('OR' and_expr)*` where
   `and_expr = condition ('AND' condition)*`. AND binds tighter than OR.
+- GQL WHERE conditions support `=`, `!=`, `>`, `<`, `>=`, `<=`, `LIKE`,
+  `CONTAINS`, `STARTS WITH`, `IN` with a list literal, and `IS NOT NULL`.
+  `CONTAINS` and `STARTS WITH` treat `%`, `_`, and `\` as literal characters.
+  All condition values are emitted as bound SQL parameters.
 - Node kind strings are pack-agnostic and pass through the query layer unchanged.
   Kind validation is a pack-handler concern, not a query-layer concern.
 - `namespace` is always injected via `CompileOptions.scopes`, never from query
