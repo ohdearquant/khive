@@ -688,25 +688,21 @@ pub(super) fn recall_text_terms_with_limit(query: &str, limit: usize) -> Vec<Str
 
 impl MemoryPack {
     /// ADR-104 §5 (Stage C): entity-anchored candidate extraction. A single,
-    /// namespace-scoped, batched lookup against the entity store's existing
-    /// `(namespace, name)` index — R1's "one batched indexed lookup per
+    /// namespace-scoped, batched lookup against the entity store's
+    /// `(namespace, LOWER(name))` index. This satisfies R1's "one batched indexed lookup per
     /// recall, no unbounded per-recall scans of the entity table."
     ///
-    /// Two paths, chosen by `contains_cjk` (unsegmented CJK text has no
-    /// whitespace to derive unigram/bigram candidates from):
-    /// - Latin path: `crate::scoring::entity_lookup_candidates` derives up to
-    ///   `MAX_ENTITY_LOOKUP_CANDIDATES` lowercased unigram/bigram strings
-    ///   from the query, then one `EntityFilter::names_ci` call resolves a
-    ///   `LOWER(name) IN (...)` match in a single SQL round trip.
-    /// - CJK path: one `EntityFilter::name_substring_of` call checks which
-    ///   known entity names occur as a substring of the raw query text,
-    ///   bounded by the `PageRequest` limit below.
+    /// `crate::scoring::entity_lookup_candidates` derives up to
+    /// `MAX_ENTITY_LOOKUP_CANDIDATES` lowercased unigram, bigram, and bounded
+    /// CJK substring candidates. One `EntityFilter::names_ci` call resolves
+    /// them with an indexed `LOWER(name) IN (...)` match. The store skips the
+    /// separate count for this filter, so only the page-limited query runs.
     ///
     /// A candidate only survives this lookup by naming a real, non-deleted
-    /// entity in the caller's namespace — that match against a real record
+    /// entity in the caller's namespace. That match against a real record
     /// is the precision-safe property the ADR-104 §5 rationale hangs on. A
     /// storage-layer failure here degrades to no anchored candidates (never
-    /// fails the recall) — the caller still has `extract_entity_candidates`'s
+    /// fails the recall). The caller still has `extract_entity_candidates`'s
     /// capitalized-token fallback.
     pub(super) async fn entity_anchored_candidates(
         &self,
@@ -715,28 +711,6 @@ impl MemoryPack {
     ) -> Result<Vec<String>, RuntimeError> {
         let store = self.runtime.entities(token)?;
         let namespace = token.namespace().as_str();
-
-        if crate::scoring::contains_cjk(query) {
-            let filter = EntityFilter {
-                name_substring_of: Some(query.to_string()),
-                ..EntityFilter::default()
-            };
-            let page = store
-                .query_entities(
-                    namespace,
-                    filter,
-                    PageRequest {
-                        limit: crate::scoring::MAX_ENTITY_LOOKUP_CANDIDATES as u32,
-                        offset: 0,
-                    },
-                )
-                .await?;
-            return Ok(page
-                .items
-                .into_iter()
-                .map(|e| e.name.to_lowercase())
-                .collect());
-        }
 
         let candidates = crate::scoring::entity_lookup_candidates(query);
         if candidates.is_empty() {

@@ -1,4 +1,5 @@
 use super::*;
+use crate::migrations::run_migrations;
 use crate::pool::PoolConfig;
 use std::time::Duration;
 use tokio::sync::oneshot;
@@ -41,6 +42,75 @@ fn make_entity(namespace: &str, kind: &str, name: &str) -> Entity {
         merged_into: None,
         merge_event_id: None,
     }
+}
+
+#[test]
+fn case_insensitive_candidate_lookup_uses_expression_index() {
+    let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+    run_migrations(&mut conn).unwrap();
+
+    let filter = EntityFilter {
+        names_ci: vec!["lora".to_string(), "北京大学".to_string()],
+        ..EntityFilter::default()
+    };
+    let (where_sql, mut params) = build_entity_where("local", &filter);
+    params.push(Box::new(64_i64));
+    params.push(Box::new(0_i64));
+    let limit_idx = params.len() - 1;
+    let offset_idx = params.len();
+    let sql = format!(
+        "EXPLAIN QUERY PLAN SELECT id FROM entities{where_sql} \
+         ORDER BY created_at DESC LIMIT ?{limit_idx} OFFSET ?{offset_idx}"
+    );
+    let mut stmt = conn.prepare(&sql).unwrap();
+    let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+        params.iter().map(|param| param.as_ref()).collect();
+    let details: Vec<String> = stmt
+        .query_map(param_refs.as_slice(), |row| row.get(3))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+
+    assert!(
+        details.iter().any(|detail| {
+            detail.contains("SEARCH entities USING INDEX idx_entities_namespace_name_ci")
+        }),
+        "candidate lookup must seek the case-insensitive expression index: {details:?}"
+    );
+    assert!(
+        !details
+            .iter()
+            .any(|detail| detail.contains("SCAN entities")),
+        "candidate lookup must not scan entities: {details:?}"
+    );
+}
+
+#[tokio::test]
+async fn case_insensitive_candidate_lookup_skips_unbounded_total_count() {
+    let store = setup_memory_store();
+    store
+        .upsert_entity(make_entity("local", "concept", "LoRA"))
+        .await
+        .unwrap();
+
+    let page = store
+        .query_entities(
+            "local",
+            EntityFilter {
+                names_ci: vec!["lora".to_string()],
+                ..EntityFilter::default()
+            },
+            PageRequest {
+                limit: 64,
+                offset: 0,
+            },
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(page.items.len(), 1);
+    assert_eq!(page.items[0].name, "LoRA");
+    assert_eq!(page.total, None);
 }
 
 #[tokio::test]

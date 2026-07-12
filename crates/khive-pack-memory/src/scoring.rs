@@ -79,14 +79,14 @@ pub struct CandidateContext<'a> {
 }
 
 /// Returns `true` when `needle` occurs in `haystack` at a **word (character)
-/// boundary** — the character immediately before the match (if any) and the
+/// boundary**. The character immediately before the match (if any) and the
 /// character immediately after the match (if any) are both non-alphanumeric
 /// (or the match sits at the start/end of `haystack`).
 ///
 /// Plain substring `contains` matches inside unrelated words: a candidate
 /// `"beta"` matches `"alphabet"` and `"betamax"`; `"car"` matches
 /// `"scarcity"`. Anchoring to boundaries closes that class of false positive
-/// while still matching multi-word phrases on their own boundaries — a
+/// while still matching multi-word phrases on their own boundaries. A
 /// caller-supplied explicit name like `"knowledge graph"` still matches
 /// `"...the knowledge graph shows..."` because the space characters on
 /// either side of the phrase are themselves non-alphanumeric, satisfying the
@@ -97,6 +97,9 @@ pub struct CandidateContext<'a> {
 fn contains_at_word_boundary(haystack: &str, needle: &str) -> bool {
     if needle.is_empty() {
         return false;
+    }
+    if needle.chars().all(is_cjk_char) {
+        return haystack.contains(needle);
     }
     let haystack_chars: Vec<char> = haystack.chars().collect();
     let needle_chars: Vec<char> = needle.chars().collect();
@@ -334,28 +337,30 @@ pub fn extract_entity_candidates(query: &str) -> Vec<String> {
     out
 }
 
-/// Maximum number of case-insensitive candidate strings (unigrams + adjacent
-/// bigrams) a single recall sends to the batched entity-name lookup
+/// Maximum number of case-insensitive candidate strings a single recall sends
+/// to the batched entity-name lookup
 /// (ADR-104 §5 / Stage C, rider R1). Bounds the `LOWER(name) IN (...)`
-/// placeholder list built in `khive-db`'s `build_entity_where` — independent
+/// placeholder list built in `khive-db`'s `build_entity_where`, independent
 /// of `MAX_AUTO_ENTITY_NAMES`, which bounds the unrelated capitalized-token
 /// fallback list above.
-pub const MAX_ENTITY_LOOKUP_CANDIDATES: usize = 16;
+pub const MAX_ENTITY_LOOKUP_CANDIDATES: usize = 64;
+
+const MAX_BIGRAM_LOOKUP_CANDIDATES: usize = MAX_ENTITY_LOOKUP_CANDIDATES / 4;
+const MIN_CJK_LOOKUP_CHARS: usize = 2;
+const MAX_CJK_LOOKUP_CHARS: usize = 8;
 
 /// Build the case-insensitive candidate strings a recall query offers to the
-/// entity-anchored lookup (ADR-104 §5 / Stage C): every non-stopword token,
-/// lowercased, plus every adjacent-token bigram (also lowercased, stopwords
-/// included — a two-token phrase is unlikely to itself be a stopword pair,
-/// and the real-entity-name check downstream is the safety net either way),
-/// deduplicated and capped at `MAX_ENTITY_LOOKUP_CANDIDATES`.
+/// entity-anchored lookup (ADR-104 §5 / Stage C). Alphabetic-script queries
+/// contribute non-stopword unigrams and reserve one quarter of the cap for
+/// adjacent-token bigrams. Each contiguous CJK run contributes substrings of
+/// two through eight characters starting at each character. All candidates
+/// are deduplicated and share the same hard cap.
 ///
 /// Unlike `extract_entity_candidates` above, this does **not** filter on
-/// capitalization — lowercase queries are the whole point of this extension.
+/// capitalization, lowercase queries are the whole point of this extension.
 /// The precision-safety property instead comes from the caller (the
 /// `memory.recall` handler) only keeping a candidate that matches the *name*
 /// of a real KG entity, via one batched `EntityFilter::names_ci` lookup.
-/// Whitespace-tokenized, so this is the Latin-script path; unsegmented CJK
-/// queries use `EntityFilter::name_substring_of` instead (see the handler).
 pub fn entity_lookup_candidates(query: &str) -> Vec<String> {
     let tokens: Vec<String> = query
         .split_whitespace()
@@ -367,19 +372,54 @@ pub fn entity_lookup_candidates(query: &str) -> Vec<String> {
     let mut seen: HashSet<String> = HashSet::new();
     let mut out: Vec<String> = Vec::new();
 
-    for t in tokens
-        .iter()
-        .filter(|t| !ENTITY_STOPWORDS.contains(&t.as_str()))
-    {
-        if seen.insert(t.clone()) {
-            out.push(t.clone());
+    let chars: Vec<char> = query.chars().collect();
+    let mut run_start = 0;
+    while run_start < chars.len() {
+        if !is_cjk_char(chars[run_start]) {
+            run_start += 1;
+            continue;
+        }
+        let mut run_end = run_start + 1;
+        while run_end < chars.len() && is_cjk_char(chars[run_end]) {
+            run_end += 1;
+        }
+        for start in run_start..run_end {
+            let max_len = MAX_CJK_LOOKUP_CHARS.min(run_end - start);
+            for len in MIN_CJK_LOOKUP_CHARS..=max_len {
+                let candidate: String = chars[start..start + len].iter().collect();
+                if seen.insert(candidate.clone()) {
+                    out.push(candidate);
+                    if out.len() >= MAX_ENTITY_LOOKUP_CANDIDATES {
+                        return out;
+                    }
+                }
+            }
+        }
+        run_start = run_end;
+    }
+
+    let mut bigrams = tokens
+        .windows(2)
+        .map(|pair| format!("{} {}", pair[0], pair[1]));
+    for bigram in bigrams.by_ref().take(MAX_BIGRAM_LOOKUP_CANDIDATES) {
+        if seen.insert(bigram.clone()) {
+            out.push(bigram);
+        }
+    }
+
+    for token in tokens.iter().filter(|token| {
+        !ENTITY_STOPWORDS.contains(&token.as_str()) && !token.chars().all(is_cjk_char)
+    }) {
+        if seen.insert(token.clone()) {
+            out.push(token.clone());
             if out.len() >= MAX_ENTITY_LOOKUP_CANDIDATES {
                 return out;
             }
         }
     }
-    for pair in tokens.windows(2) {
-        let bigram = format!("{} {}", pair[0], pair[1]);
+
+    // If the unigram share did not fill the cap, admit more adjacent bigrams.
+    for bigram in bigrams {
         if seen.insert(bigram.clone()) {
             out.push(bigram);
             if out.len() >= MAX_ENTITY_LOOKUP_CANDIDATES {
@@ -1281,6 +1321,20 @@ mod tests {
             AdjustmentCondition::EntityMatch.matches(&ctx),
             "boundary anchoring must not break matching the actual word"
         );
+    }
+
+    #[test]
+    fn entity_match_condition_matches_contiguous_cjk_with_cjk_on_both_sides() {
+        let entity_names = vec!["北京大学".to_string()];
+        let ctx = entity_match_ctx("我在北京大学学习", &entity_names);
+        assert!(AdjustmentCondition::EntityMatch.matches(&ctx));
+    }
+
+    #[test]
+    fn entity_match_condition_keeps_alphabetic_word_boundaries() {
+        let entity_names = vec!["rust".to_string()];
+        let ctx = entity_match_ctx("trust requires evidence", &entity_names);
+        assert!(!AdjustmentCondition::EntityMatch.matches(&ctx));
     }
 
     // ── ADR-104 §2 (Stage B): entity_posterior_term ────────────────────────────

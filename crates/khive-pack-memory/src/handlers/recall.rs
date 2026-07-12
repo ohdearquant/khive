@@ -394,7 +394,7 @@ impl MemoryPack {
         // `entity_names` feeds the `EntityMatch` ×1.3 boost in `default_adjustments`
         // (scoring.rs). It used to be purely caller-supplied and no caller ever
         // populated it, leaving the boost dead code in practice. Opt-out
-        // semantics: `Some(_)` — including `Some([])` — is explicit caller
+        // semantics: `Some(_)`, including `Some([])`, is explicit caller
         // intent and is always honored verbatim (an empty explicit list means
         // "no entity boost", not "auto-derive one for me"). Auto-extraction
         // via `extract_entity_candidates` only runs on `None`, i.e. when the
@@ -403,12 +403,12 @@ impl MemoryPack {
         // actually matches.
         // ADR-104 §5 (Stage C): when the caller didn't supply `entity_names`
         // at all, extend the #738 capitalized-token heuristic with a second,
-        // precision-safe source — query tokens/bigrams that case-insensitively
+        // precision-safe source: query tokens/bigrams that case-insensitively
         // name a real KG entity, resolved via one batched lookup
         // (`entity_anchored_candidates`, R1). A lookup failure degrades to
         // the capitalized-token list alone (never fails the recall); an
         // explicit `entity_names` (including `Some([])`) still bypasses both
-        // sources entirely — #738 opt-out semantics unchanged.
+        // sources entirely. #738 opt-out semantics are unchanged.
         let entity_names: Vec<String> = match &p.entity_names {
             Some(names) => names.iter().map(|s| s.to_lowercase()).collect(),
             None => {
@@ -4401,7 +4401,7 @@ mod tests {
 
     /// Dispatches `memory.recall` against a fresh single-note corpus, exactly
     /// like `dispatch_single_note_recall` above, but first seeds a real KG
-    /// entity (`entity_name`, when `Some`) directly into the entity store —
+    /// entity (`entity_name`, when `Some`) directly into the entity store.
     /// the record `entity_anchored_candidates` must find via its batched
     /// lookup for the boost to fire on a lowercase or CJK query. Returns the
     /// sole hit's `rank_score`.
@@ -4452,7 +4452,7 @@ mod tests {
     /// Gate (a): a lowercase query naming a real KG entity gets the
     /// candidate and the EntityMatch ×1.3 boost. `extract_entity_candidates`
     /// (#738) extracts nothing here (no capitalized token in either the
-    /// query or the entity name) — the lift can only come from the Stage C
+    /// query or the entity name). The lift can only come from the Stage C
     /// batched entity-anchored lookup finding the seeded "zenlake" entity.
     #[tokio::test]
     #[serial(background_tasks)]
@@ -4480,21 +4480,18 @@ mod tests {
     }
 
     /// Gate (b): an unsegmented CJK query containing a real entity name as a
-    /// substring gets it via `EntityFilter::name_substring_of`, not
-    /// whitespace tokenization (CJK text has no spaces to split on).
+    /// substring gets it through bounded substring enumeration and the same
+    /// indexed exact-name lookup used by alphabetic-script candidates.
     #[tokio::test]
     #[serial(background_tasks)]
     async fn adr104_stage_c_unsegmented_cjk_query_gets_entity_via_substring() {
         const ENTITY_NAME: &str = "北京大学";
         // `content` and `query` are byte-identical (guarantees the FTS leg
         // retrieves the note; retrieval-stage relevance is not what this
-        // test is about) — a full-width comma, not ASCII whitespace,
-        // separates the entity name from the rest, so this is still the
-        // unsegmented-CJK shape (no ASCII whitespace anywhere) while giving
-        // `contains_at_word_boundary` a non-alphanumeric character on the
-        // entity name's left edge (its right edge is end-of-string).
-        const CONTENT: &str = "详情介绍，北京大学";
-        const QUERY: &str = "详情介绍，北京大学";
+        // test is about). The entity has Han characters on both sides, proving
+        // CJK entity matching does not require whitespace or punctuation.
+        const CONTENT: &str = "我在北京大学学习";
+        const QUERY: &str = "我在北京大学学习";
 
         let anchored_score =
             dispatch_single_note_recall_with_entity(Some(ENTITY_NAME), CONTENT, QUERY, None).await;
@@ -4516,7 +4513,7 @@ mod tests {
         );
     }
 
-    /// Gate (c): a token that does not name any real entity gets nothing —
+    /// Gate (c): a token that does not name any real entity gets nothing,
     /// no lexical-overlap reward. Same lowercase shape as gate (a), but no
     /// entity named "zenlake" (or anything else) exists in the store, so the
     /// batched lookup returns no candidates and the auto path must score
@@ -4539,7 +4536,7 @@ mod tests {
     }
 
     /// Gate (e): explicit `entity_names` still wins over Stage C extraction
-    /// even when a real, matching entity exists — and `entity_names: []`
+    /// even when a real, matching entity exists, and `entity_names: []`
     /// stays a full opt-out. Mirrors the #738 override tests above, but with
     /// a seeded entity in the store to prove Stage C's batched lookup is
     /// bypassed entirely (not merely outscored) when the caller is explicit.
@@ -4588,6 +4585,34 @@ mod tests {
         assert!(out.contains(&"new york".to_string()));
         assert!(out.contains(&"york city".to_string()));
         assert!(out.contains(&"city guide".to_string()));
+    }
+
+    #[test]
+    fn entity_lookup_candidates_enumerates_bounded_cjk_substrings() {
+        let out = crate::scoring::entity_lookup_candidates("我在北京大学学习");
+        assert!(out.contains(&"北京大学".to_string()));
+        assert!(!out.iter().any(|candidate| candidate.chars().count() == 1));
+        assert!(out.iter().all(|candidate| candidate.chars().count() <= 8));
+    }
+
+    #[tokio::test]
+    #[serial(background_tasks)]
+    async fn adr104_stage_c_long_query_preserves_adjacent_bigram_entity() {
+        const ENTITY_NAME: &str = "silver comet";
+        const QUERY: &str = "alpha bravo charlie delta echo foxtrot golf hotel india juliet kilo \
+                             lima mike november oscar silver comet";
+
+        let anchored_score =
+            dispatch_single_note_recall_with_entity(Some(ENTITY_NAME), QUERY, QUERY, None).await;
+        let opted_out_score =
+            dispatch_single_note_recall_with_entity(Some(ENTITY_NAME), QUERY, QUERY, Some(&[]))
+                .await;
+
+        assert!(
+            anchored_score > opted_out_score,
+            "a 17-token query must retain its final adjacent bigram entity: \
+             anchored={anchored_score} opted_out={opted_out_score}"
+        );
     }
 
     #[test]

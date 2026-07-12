@@ -479,10 +479,7 @@ fn build_entity_where(
 
     if !filter.names_ci.is_empty() {
         // ADR-104 Stage C, R1: one batched `LOWER(name) IN (...)` predicate,
-        // scoped by the `namespace`/`deleted_at IS NULL` conditions already
-        // pushed above — the composite `idx_entities_name (namespace, name)`
-        // index still seeks the namespace prefix, bounding the scan to that
-        // namespace's rows before this predicate is evaluated row-by-row.
+        // served by `idx_entities_namespace_name_ci (namespace, LOWER(name))`.
         let placeholders: Vec<String> = filter
             .names_ci
             .iter()
@@ -492,16 +489,6 @@ fn build_entity_where(
             })
             .collect();
         conditions.push(format!("LOWER(name) IN ({})", placeholders.join(", ")));
-    }
-
-    if let Some(ref source) = filter.name_substring_of {
-        // ADR-104 Stage C CJK path: `name` is the needle, `source` (the raw
-        // query text) is the haystack — the reverse of a normal `LIKE`
-        // pattern match, so this cannot seek `idx_entities_name` at all. The
-        // caller bounds the cost with a small `PageRequest` limit and by
-        // scoping to a single namespace via the conditions above.
-        params.push(Box::new(source.to_lowercase()));
-        conditions.push(format!("INSTR(?{}, LOWER(name)) > 0", params.len()));
     }
 
     if !filter.tags_any.is_empty() {
@@ -642,13 +629,15 @@ impl EntityStore for SqlEntityStore {
         })?;
 
         self.with_reader("query_entities", move |conn| {
-            let (count_sql, count_params) = build_entity_where(&namespace, &filter);
-            let total: i64 = {
-                let sql = format!("SELECT COUNT(*) FROM entities{}", count_sql);
+            let total = if filter.names_ci.is_empty() {
+                let (count_sql, count_params) = build_entity_where(&namespace, &filter);
+                let sql = format!("SELECT COUNT(*) FROM entities{count_sql}");
                 let mut stmt = conn.prepare(&sql)?;
                 let param_refs: Vec<&dyn rusqlite::types::ToSql> =
                     count_params.iter().map(|p| p.as_ref()).collect();
-                stmt.query_row(param_refs.as_slice(), |row| row.get(0))?
+                Some(stmt.query_row(param_refs.as_slice(), |row| row.get::<_, i64>(0))? as u64)
+            } else {
+                None
             };
 
             let (where_sql, mut data_params) = build_entity_where(&namespace, &filter);
@@ -691,10 +680,7 @@ impl EntityStore for SqlEntityStore {
                 items.push(row?);
             }
 
-            Ok(Page {
-                items,
-                total: Some(total as u64),
-            })
+            Ok(Page { items, total })
         })
         .await
     }
