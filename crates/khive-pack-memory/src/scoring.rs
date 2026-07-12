@@ -337,8 +337,8 @@ pub fn extract_entity_candidates(query: &str) -> Vec<String> {
     out
 }
 
-/// Maximum number of case-insensitive candidate strings a single recall sends
-/// to the batched entity-name lookup
+/// Maximum number of candidate strings a single recall sends to the batched
+/// entity-name lookup
 /// (ADR-104 §5 / Stage C, rider R1). Bounds the `LOWER(name) IN (...)`
 /// placeholder list built in `khive-db`'s `build_entity_where`, independent
 /// of `MAX_AUTO_ENTITY_NAMES`, which bounds the unrelated capitalized-token
@@ -349,12 +349,12 @@ const MAX_BIGRAM_LOOKUP_CANDIDATES: usize = MAX_ENTITY_LOOKUP_CANDIDATES / 4;
 const MIN_CJK_LOOKUP_CHARS: usize = 2;
 const MAX_CJK_LOOKUP_CHARS: usize = 8;
 
-/// Build the case-insensitive candidate strings a recall query offers to the
-/// entity-anchored lookup (ADR-104 §5 / Stage C). Alphabetic-script queries
-/// contribute non-stopword unigrams and reserve one quarter of the cap for
-/// adjacent-token bigrams. Each contiguous CJK run contributes substrings of
-/// two through eight characters starting at each character. All candidates
-/// are deduplicated and share the same hard cap.
+/// Build the candidate strings a recall query offers to the entity-anchored
+/// lookup (ADR-104 §5 / Stage C). Alphabetic-script queries contribute raw and
+/// ASCII-lowercased non-stopword unigrams and reserve one quarter of the cap
+/// for adjacent-token bigrams. Each contiguous CJK run contributes substrings
+/// position-fairly across starts. Supported CJK names are 2..=8 characters,
+/// with at most 64 candidates per query. All candidates are deduplicated.
 ///
 /// Unlike `extract_entity_candidates` above, this does **not** filter on
 /// capitalization, lowercase queries are the whole point of this extension.
@@ -366,13 +366,14 @@ pub fn entity_lookup_candidates(query: &str) -> Vec<String> {
         .split_whitespace()
         .map(strip_token_punctuation)
         .filter(|t| !t.is_empty())
-        .map(str::to_lowercase)
+        .map(str::to_owned)
         .collect();
 
     let mut seen: HashSet<String> = HashSet::new();
     let mut out: Vec<String> = Vec::new();
 
     let chars: Vec<char> = query.chars().collect();
+    let mut cjk_runs = Vec::new();
     let mut run_start = 0;
     while run_start < chars.len() {
         if !is_cjk_char(chars[run_start]) {
@@ -383,9 +384,16 @@ pub fn entity_lookup_candidates(query: &str) -> Vec<String> {
         while run_end < chars.len() && is_cjk_char(chars[run_end]) {
             run_end += 1;
         }
-        for start in run_start..run_end {
-            let max_len = MAX_CJK_LOOKUP_CHARS.min(run_end - start);
-            for len in MIN_CJK_LOOKUP_CHARS..=max_len {
+        cjk_runs.push((run_start, run_end));
+        run_start = run_end;
+    }
+
+    for len in MIN_CJK_LOOKUP_CHARS..=MAX_CJK_LOOKUP_CHARS {
+        for &(run_start, run_end) in &cjk_runs {
+            if run_end - run_start < len {
+                continue;
+            }
+            for start in run_start..=run_end - len {
                 let candidate: String = chars[start..start + len].iter().collect();
                 if seen.insert(candidate.clone()) {
                     out.push(candidate);
@@ -395,35 +403,44 @@ pub fn entity_lookup_candidates(query: &str) -> Vec<String> {
                 }
             }
         }
-        run_start = run_end;
     }
 
     let mut bigrams = tokens
         .windows(2)
         .map(|pair| format!("{} {}", pair[0], pair[1]));
     for bigram in bigrams.by_ref().take(MAX_BIGRAM_LOOKUP_CANDIDATES) {
-        if seen.insert(bigram.clone()) {
-            out.push(bigram);
+        for candidate in [bigram.clone(), bigram.to_ascii_lowercase()] {
+            if seen.insert(candidate.clone()) {
+                out.push(candidate);
+                if out.len() >= MAX_ENTITY_LOOKUP_CANDIDATES {
+                    return out;
+                }
+            }
         }
     }
 
     for token in tokens.iter().filter(|token| {
-        !ENTITY_STOPWORDS.contains(&token.as_str()) && !token.chars().all(is_cjk_char)
+        !ENTITY_STOPWORDS.contains(&token.to_ascii_lowercase().as_str())
+            && !token.chars().all(is_cjk_char)
     }) {
-        if seen.insert(token.clone()) {
-            out.push(token.clone());
-            if out.len() >= MAX_ENTITY_LOOKUP_CANDIDATES {
-                return out;
+        for candidate in [token.clone(), token.to_ascii_lowercase()] {
+            if seen.insert(candidate.clone()) {
+                out.push(candidate);
+                if out.len() >= MAX_ENTITY_LOOKUP_CANDIDATES {
+                    return out;
+                }
             }
         }
     }
 
     // If the unigram share did not fill the cap, admit more adjacent bigrams.
     for bigram in bigrams {
-        if seen.insert(bigram.clone()) {
-            out.push(bigram);
-            if out.len() >= MAX_ENTITY_LOOKUP_CANDIDATES {
-                return out;
+        for candidate in [bigram.clone(), bigram.to_ascii_lowercase()] {
+            if seen.insert(candidate.clone()) {
+                out.push(candidate);
+                if out.len() >= MAX_ENTITY_LOOKUP_CANDIDATES {
+                    return out;
+                }
             }
         }
     }

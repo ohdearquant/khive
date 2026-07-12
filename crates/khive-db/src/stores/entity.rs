@@ -484,7 +484,7 @@ fn build_entity_where(
             .names_ci
             .iter()
             .map(|n| {
-                params.push(Box::new(n.to_lowercase()));
+                params.push(Box::new(n.clone()));
                 format!("?{}", params.len())
             })
             .collect();
@@ -643,7 +643,7 @@ impl EntityStore for SqlEntityStore {
             let (where_sql, mut data_params) = build_entity_where(&namespace, &filter);
 
             // #818: when a name_prefix filter is active, an exact
-            // case-insensitive match must never be pushed out of the page by
+            // ASCII-case-insensitive match must never be pushed out of the page by
             // pattern candidates that merely share the prefix. Rank exact
             // matches first (deterministic tiebreak via created_at) so page
             // truncation can never hide the record a caller resolved by name.

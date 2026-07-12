@@ -104,14 +104,12 @@ pub struct EntityFilter {
     /// backward-compatible default).
     #[serde(default)]
     pub namespaces: Vec<String>,
-    /// Case-insensitive batched exact-name match (ADR-104 Stage C: entity-
-    /// anchored candidate extraction). `LOWER(name) IN (...)` over up to a
-    /// caller-bounded set of candidate strings. One SQL query recovers every
-    /// entity whose name case-insensitively equals any candidate, instead of
-    /// one `name_exact` round trip per candidate. Distinct from `name_exact`
-    /// (single value, case-sensitive `=`): this field is the batched,
-    /// case-insensitive counterpart. Implementations may omit the page total
-    /// to keep this lookup page-limited instead of issuing a separate count.
+    /// ASCII-case-insensitive batched exact-name match (ADR-104 Stage C).
+    /// `LOWER(name) IN (...)` compares up to a caller-bounded set of raw and
+    /// ASCII-lowercased candidate strings. Cased non-ASCII characters require
+    /// exact form. Distinct from single-value, case-sensitive `name_exact`.
+    /// Implementations may omit the page total to keep this lookup page-limited
+    /// instead of issuing a separate count.
     #[serde(default)]
     pub names_ci: Vec<String>,
 }

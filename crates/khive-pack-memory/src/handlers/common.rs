@@ -693,10 +693,11 @@ impl MemoryPack {
     /// recall, no unbounded per-recall scans of the entity table."
     ///
     /// `crate::scoring::entity_lookup_candidates` derives up to
-    /// `MAX_ENTITY_LOOKUP_CANDIDATES` lowercased unigram, bigram, and bounded
-    /// CJK substring candidates. One `EntityFilter::names_ci` call resolves
-    /// them with an indexed `LOWER(name) IN (...)` match. The store skips the
-    /// separate count for this filter, so only the page-limited query runs.
+    /// `MAX_ENTITY_LOOKUP_CANDIDATES` raw and ASCII-lowercased unigram, bigram,
+    /// and bounded CJK substring candidates. One `EntityFilter::names_ci` call
+    /// resolves them with an indexed `LOWER(name) IN (...)` match. The store
+    /// skips the separate count for this filter, so only the page-limited
+    /// query runs.
     ///
     /// A candidate only survives this lookup by naming a real, non-deleted
     /// entity in the caller's namespace. That match against a real record
@@ -725,7 +726,7 @@ impl MemoryPack {
                 namespace,
                 filter,
                 // Bounded above `MAX_ENTITY_LOOKUP_CANDIDATES` candidates so
-                // multiple entities sharing a case-insensitive name cannot
+                // multiple entities sharing an ASCII-folded name cannot
                 // truncate a legitimate match out of the page.
                 PageRequest {
                     limit: crate::scoring::MAX_ENTITY_LOOKUP_CANDIDATES as u32 * 4,

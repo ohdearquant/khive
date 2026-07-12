@@ -403,8 +403,9 @@ impl MemoryPack {
         // actually matches.
         // ADR-104 §5 (Stage C): when the caller didn't supply `entity_names`
         // at all, extend the #738 capitalized-token heuristic with a second,
-        // precision-safe source: query tokens/bigrams that case-insensitively
-        // name a real KG entity, resolved via one batched lookup
+        // precision-safe source: query tokens/bigrams that match a real KG
+        // entity name under the bounded Stage C case contract, resolved via
+        // one batched lookup
         // (`entity_anchored_candidates`, R1). A lookup failure degrades to
         // the capitalized-token list alone (never fails the recall); an
         // explicit `entity_names` (including `Some([])`) still bypasses both
@@ -4479,6 +4480,34 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    #[serial(background_tasks)]
+    async fn adr104_stage_c_non_ascii_case_lookup_end_to_end_is_bounded() {
+        let rt = KhiveRuntime::memory().expect("in-memory runtime");
+        let ns = Namespace::parse("local").expect("local namespace");
+        let token = rt.authorize(ns.clone()).expect("authorize local");
+        rt.entities(&token)
+            .expect("entity store")
+            .upsert_entity(Entity::new(ns.as_str(), "concept", "École"))
+            .await
+            .expect("seed entity");
+        let pack = MemoryPack::new(rt);
+
+        let same_spelling = pack
+            .entity_anchored_candidates(&token, "École research archive")
+            .await
+            .expect("same-spelling extraction");
+        let different_case = pack
+            .entity_anchored_candidates(&token, "école research archive")
+            .await
+            .expect("differently-cased extraction");
+
+        // Bounded contract: ASCII is case-insensitive, but cased non-ASCII
+        // characters require the exact form used by the stored entity name.
+        assert_eq!(same_spelling, vec!["école"]);
+        assert!(different_case.is_empty());
+    }
+
     /// Gate (b): an unsegmented CJK query containing a real entity name as a
     /// substring gets it through bounded substring enumeration and the same
     /// indexed exact-name lookup used by alphabetic-script candidates.
@@ -4510,6 +4539,44 @@ mod tests {
             (ratio - 1.3).abs() < 0.01,
             "expected ~1.3x lift from EntityMatch firing on the CJK \
              substring-anchored candidate, got ratio {ratio}"
+        );
+    }
+
+    #[tokio::test]
+    #[serial(background_tasks)]
+    async fn adr104_stage_c_late_cjk_entity_survives_candidate_cap() {
+        const ENTITY_NAME: &str = "終点";
+        const QUERY: &str = "天地玄黄宇宙洪荒日月盈昃辰宿列張寒来暑往秋収冬蔵終点";
+
+        let anchored_score =
+            dispatch_single_note_recall_with_entity(Some(ENTITY_NAME), QUERY, QUERY, None).await;
+        let opted_out_score =
+            dispatch_single_note_recall_with_entity(Some(ENTITY_NAME), QUERY, QUERY, Some(&[]))
+                .await;
+
+        assert!(
+            anchored_score > opted_out_score,
+            "a CJK entity near the end of a long unsegmented query must survive the candidate cap: \
+             anchored={anchored_score} opted_out={opted_out_score}"
+        );
+    }
+
+    #[tokio::test]
+    #[serial(background_tasks)]
+    async fn adr104_stage_c_eight_character_cjk_entity_matches() {
+        const ENTITY_NAME: &str = "甲乙丙丁戊己庚辛";
+        const QUERY: &str = "甲乙丙丁戊己庚辛";
+
+        let anchored_score =
+            dispatch_single_note_recall_with_entity(Some(ENTITY_NAME), QUERY, QUERY, None).await;
+        let opted_out_score =
+            dispatch_single_note_recall_with_entity(Some(ENTITY_NAME), QUERY, QUERY, Some(&[]))
+                .await;
+
+        assert!(
+            anchored_score > opted_out_score,
+            "an eight-character CJK entity must match at the documented maximum: \
+             anchored={anchored_score} opted_out={opted_out_score}"
         );
     }
 
@@ -4573,8 +4640,8 @@ mod tests {
     }
 
     /// `entity_lookup_candidates` unit coverage (pure function, ADR-104 §5):
-    /// unigrams and adjacent bigrams, lowercased, stopwords excluded from
-    /// unigrams, capped at `MAX_ENTITY_LOOKUP_CANDIDATES`.
+    /// raw and ASCII-lowercased unigrams and adjacent bigrams, stopwords
+    /// excluded from unigrams, capped at `MAX_ENTITY_LOOKUP_CANDIDATES`.
     #[test]
     fn entity_lookup_candidates_extracts_unigrams_and_bigrams_lowercased() {
         let out = crate::scoring::entity_lookup_candidates("New York City guide");
@@ -4585,6 +4652,14 @@ mod tests {
         assert!(out.contains(&"new york".to_string()));
         assert!(out.contains(&"york city".to_string()));
         assert!(out.contains(&"city guide".to_string()));
+    }
+
+    #[test]
+    fn entity_lookup_candidates_preserves_raw_non_ascii_case() {
+        let out = crate::scoring::entity_lookup_candidates("ÉCOLE Research");
+        assert!(out.contains(&"ÉCOLE".to_string()));
+        assert!(out.contains(&"École".to_string()));
+        assert!(!out.contains(&"école".to_string()));
     }
 
     #[test]
