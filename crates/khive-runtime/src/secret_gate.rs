@@ -916,7 +916,9 @@ fn has_assignment_credential_trigger(low_text: &str) -> bool {
             .rsplit(|c: char| !c.is_ascii_alphanumeric() && c != '_')
             .next()
             .unwrap_or_default();
-        contains_compound_trigger(label)
+        COMPOUND_TRIGGER_WORDS
+            .iter()
+            .any(|needle| label.contains(needle))
             || TRIGGER_WORDS
                 .iter()
                 .any(|tw| contains_bounded_word(label, tw))
@@ -941,7 +943,9 @@ fn has_inline_credential_trigger(raw_token: &str) -> bool {
 
     !low.contains(['/', '-', '.'])
         && low.contains('_')
-        && (contains_compound_trigger(&low)
+        && (COMPOUND_TRIGGER_WORDS
+            .iter()
+            .any(|needle| low.contains(needle))
             || TRIGGER_WORDS
                 .iter()
                 .any(|tw| contains_bounded_word(&low, tw)))
@@ -3359,6 +3363,14 @@ mod tests {
                 );
             }
         }
+
+        let prefixed = "xapi_keyv2=Xk9mZ2vQpLrT8nJwYuAeHfBsDcGiONvMabcdef"; // gitleaks:allow
+        assert!(
+            check(prefixed).is_err(),
+            "prefix-bearing compound credential assignment must be blocked: \
+             {prefixed:?}, got {:?}",
+            scan(prefixed)
+        );
     }
 
     #[test]
