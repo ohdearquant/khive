@@ -338,3 +338,96 @@ again after a version-2 load.
 
 Stage D is additive behind the shipped Stage A/B surface; the breakdown field
 `entity_posterior_mean` keeps its shape and now reports the decayed mean.
+
+## Amendment 2 (2026-07-12): Closing the Stage D contract
+
+Amendment 1's static review surfaced four gaps that leave Stage D
+implementation-ambiguous. This amendment closes them. It changes no algorithm from
+Amendment 1; it makes previously implicit inputs explicit, normative, and persisted.
+
+### Normative signal-to-mass mapping
+
+Amendment 1 assigned masses to the semantic signal names only, leaving the
+still-supported legacy feedback ladder (`useful`, `not_useful`, `wrong`) at the
+shipped unweighted count. Two interpreters could produce different state from the
+same event history. The complete mapping is now normative; every signal accepted by
+the feedback surface appears here, and Stage D asserts each row:
+
+| Signal              | Polarity | Evidence mass |
+| ------------------- | -------- | ------------- |
+| `correction`        | negative | 2.0           |
+| `explicit_positive` | positive | 1.5           |
+| `explicit_negative` | negative | 1.5           |
+| `implicit_positive` | positive | 0.1 (clamped) |
+| `implicit_negative` | negative | 0.1 (clamped) |
+| `useful`            | positive | 1.5           |
+| `not_useful`        | negative | 1.5           |
+| `wrong`             | negative | 2.0           |
+
+The legacy rows are an intentional change from the shipped unweighted 1.0, effective
+at Stage D, not a description of current behavior: `useful` and `not_useful` are
+explicit human judgments and carry explicit weight; `wrong` asserts factual
+incorrectness and carries correction weight. The clamp on cumulative implicit mass
+from Amendment 1 applies to the implicit rows only. This table is versioned as part
+of the decay policy below; changing any row is a policy-version bump, never an
+in-place edit.
+
+### Determinism restated with the read clock
+
+The accepted decision's property "same store, same query, same profile state produce
+the same ranking" predates read-time decay and is now incomplete. It is restated:
+ranking is a deterministic, side-effect-free function of **(store, query, profile
+state, read time, decay policy)**. Serve-time projection takes the read clock as an
+explicit injected input; nothing else about the property changes. Consequences:
+evaluation and score-comparison artifacts must record the read time they were
+computed at, and every Stage D ranking test pins an explicit clock. Two reads at
+different times may legitimately order results differently; that is the designed
+decay behavior, not nondeterminism.
+
+### The decay policy is persisted replay state
+
+Amendment 1 made `entity_evidence_half_life_days` bare runtime configuration. That
+contradicts the replay contract: replaying the same events against the same snapshot
+under a different configured `H` yields different state, so an unrecorded mutable
+config value silently breaks byte-identical replay. Ruling: **the decay policy is a
+versioned input stamped into persisted state**, superseding Amendment 1's
+"one value per running instance" paragraph.
+
+- Version-2 snapshots carry a decay-policy record:
+  `(policy_version, half_life_days, mass_table_version)`.
+- Folding events into state always uses the state's own persisted policy, never the
+  process configuration. The configured value is consulted at exactly two points:
+  stamping fresh state at profile creation, and stamping during explicit migration.
+- The policy is immutable per snapshot lineage. Changing `H` (or any mass-table row)
+  for existing state is an explicit, recorded migration that bumps `policy_version`;
+  it is never adopted silently from changed process configuration. A process whose
+  configuration differs from a loaded snapshot's policy folds and projects under the
+  snapshot's policy.
+- v0/v1 migration stamps the migrating instance's configured policy into the
+  produced v2 state (those formats persisted no policy). Migration is therefore a
+  pure function of (stored bytes, configured policy): the same snapshot migrated
+  twice under the same configuration is byte-identical, and the wall clock remains
+  a non-input.
+
+### Storage claim reconciled
+
+The accepted decision's "no new storage" claim remains true at the granularity it
+was made: Stage D adds no table, no column, and no external store. It does add
+versioned fields inside the existing snapshot payload: per-entry `last_event_at`
+and the decay-policy record above. The v0/v1 migration anchor is the existing
+`brain_profile_snapshots.updated_at` column, and migration must run at load, before
+snapshot deserialization discards that row-level metadata.
+
+### Stage D gate additions
+
+The Stage D gate gains these assertions:
+
+- Every signal in the mapping table folds with exactly its stated polarity and mass,
+  including the three legacy names.
+- Ranking tests inject and pin an explicit read clock; the projection function is
+  pure in it.
+- A replay against a snapshot whose persisted policy differs from the process
+  configuration uses the snapshot's policy and yields byte-identical state across
+  runs; the configured value demonstrably does not leak into the fold.
+- Migrating the same v0 or v1 snapshot twice under the same configured policy yields
+  byte-identical v2 state, and the produced state carries the stamped policy record.
