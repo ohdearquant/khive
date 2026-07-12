@@ -215,6 +215,67 @@ async fn parallel_batch_of_independent_creates_all_succeed() -> anyhow::Result<(
 }
 
 #[tokio::test]
+async fn parallel_neighbors_results_echo_their_resolved_origin() -> anyhow::Result<()> {
+    let client = connect().await?;
+    let root_a = ok_one(
+        &client,
+        r#"create(kind="entity", entity_kind="concept", name="neighbors-root-a")"#,
+    )
+    .await?;
+    let root_b = ok_one(
+        &client,
+        r#"create(kind="entity", entity_kind="concept", name="neighbors-root-b")"#,
+    )
+    .await?;
+    let leaf = ok_one(
+        &client,
+        r#"create(kind="entity", entity_kind="concept", name="neighbors-leaf")"#,
+    )
+    .await?;
+    let root_a_id = root_a["id"].as_str().expect("root A id");
+    let root_b_id = root_b["id"].as_str().expect("root B id");
+    let leaf_id = leaf["id"].as_str().expect("leaf id");
+
+    ok_one(
+        &client,
+        &format!(r#"link(source_id="{root_a_id}", target_id="{root_b_id}", relation="extends")"#),
+    )
+    .await?;
+    ok_one(
+        &client,
+        &format!(r#"link(source_id="{root_b_id}", target_id="{leaf_id}", relation="extends")"#),
+    )
+    .await?;
+
+    let response = call(
+        &client,
+        "request",
+        json!({
+            "ops": format!(
+                r#"[neighbors(node_id="{root_a_id}", direction="out"), neighbors(node_id="{root_b_id}", direction="out")]"#
+            ),
+            "presentation": "verbose"
+        }),
+    )
+    .await?;
+    let body: Value = serde_json::from_str(&first_text(&response))?;
+    let results = body["results"].as_array().expect("results array");
+    assert_eq!(results.len(), 2);
+
+    for (result, (expected_origin, expected_neighbor)) in results
+        .iter()
+        .zip([(root_a_id, root_b_id), (root_b_id, leaf_id)])
+    {
+        assert_eq!(result["ok"], json!(true), "neighbors op failed: {result}");
+        let hits = result["result"].as_array().expect("neighbors result array");
+        assert_eq!(hits.len(), 1, "unexpected neighbors result: {result}");
+        assert_eq!(hits[0]["origin_id"], expected_origin);
+        assert_eq!(hits[0]["id"], expected_neighbor);
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn create_then_list_across_separate_request_calls() -> anyhow::Result<()> {
     // Create-then-read requires two `request` calls because operations inside
     // a single batch run in parallel and have no ordering guarantee

@@ -532,7 +532,7 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 18] = [
     // Assertive: retrieves immediate graph neighbors
     HandlerDef {
         name: "neighbors",
-        description: "Immediate graph neighbors",
+        description: "Immediate graph neighbors; each hit includes origin_id for the queried node",
         visibility: Visibility::Verb,
         category: VerbCategory::Assertive,
         params: &[

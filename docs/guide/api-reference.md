@@ -315,6 +315,9 @@ request(ops="link(source_id=\"<uuid-a>\", target_id=\"<uuid-b>\", relation=\"ext
 
 Immediate graph neighbors.
 
+Each returned hit includes `origin_id`, the resolved queried node. This lets
+batch callers verify that every result is associated with the submitted root.
+
 | Param        | Type            | Required | Notes                                            |
 | ------------ | --------------- | -------- | ------------------------------------------------ |
 | `node_id`    | uuid            | yes      | Node whose neighbors to return.                  |
