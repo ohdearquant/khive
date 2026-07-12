@@ -65,6 +65,42 @@ fn portable_round_trip_preserves_lifecycle_graph_ids_and_search() {
 }
 
 #[test]
+fn portable_round_trip_preserves_medoid_pinned_overflow() {
+    let vectors = vec![0.0f32, 0.1];
+    let config = VamanaConfig::with_dimensions(1)
+        .with_max_degree(1)
+        .with_search_list_size(1);
+    let mut index = VamanaIndex::build(&vectors, config).unwrap();
+    let inserted = index.insert(&[-0.2]).unwrap();
+    let medoid = index.graph().medoid() as usize;
+    assert!(
+        index.graph().adjacency()[medoid].len() > 1,
+        "fixture must induce medoid overflow"
+    );
+
+    let ids: Vec<(u32, String)> = (0..index.num_vectors() as u32)
+        .map(|ordinal| (ordinal, format!("doc-{ordinal}")))
+        .collect();
+    let expected_search = index.search(&[-0.2], index.live_count()).unwrap();
+    assert_eq!(expected_search[0].0, inserted);
+
+    let bytes = index.to_bytes(&ids).unwrap();
+    let (restored, restored_ids) = VamanaIndex::from_bytes(&bytes).unwrap();
+
+    assert_eq!(restored_ids, ids);
+    assert_eq!(restored.graph(), index.graph());
+    assert_eq!(restored.tombstone_count(), index.tombstone_count());
+    assert_eq!(
+        restored.ops_since_consolidation(),
+        index.ops_since_consolidation()
+    );
+    assert_eq!(
+        restored.search(&[-0.2], restored.live_count()).unwrap(),
+        expected_search
+    );
+}
+
+#[test]
 fn portable_container_without_ids_returns_an_empty_mapping() {
     let dimensions = 4;
     let vectors = corpus(12, dimensions);

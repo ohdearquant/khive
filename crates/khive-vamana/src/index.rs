@@ -482,12 +482,11 @@ impl VamanaIndex {
     /// Encode this index into the ADR-110 portable container.
     pub fn to_bytes(&self, external_ids: &[(u32, String)]) -> Result<Vec<u8>> {
         let vectors = cast_slice(self.vectors()?).to_vec();
-        let graph = encode_graph(&self.graph, self.config.max_degree)?;
-        let reverse_adj = capped_reverse_adjacency(self);
+        let graph = encode_graph_lossless(&self.graph)?;
         let lifecycle = encode_lifecycle(
             &self.tombstones,
             &self.free_slots,
-            &reverse_adj,
+            self.graph.reverse_adjacency(),
             self.ops_since_consolidation,
         );
 
@@ -1629,18 +1628,9 @@ impl VamanaIndex {
             // adding the edge medoid→ordinal. The medoid is the search entry point and
             // is always reachable; it is the designated overflow node for this edge.
             //
-            // The medoid may transiently exceed max_degree due to this pin (by one
-            // edge per orphan-pinned insert; K consecutive inserts can accumulate K
-            // overflow edges). This is resolved at serialization time
-            // (save()/to_snapshot()): the medoid's adjacency is capped to max_degree
-            // so the written graph satisfies all loader degree constraints. See
-            // write_graph() and to_snapshot().
-            //
-            // If overflow edges are dropped at serialization, the affected ordinals
-            // will not be searchable after load — but they ARE searchable in the
-            // live in-memory index. Today's consolidate() handles tombstone
-            // compaction only; a future redistribution pass will recover
-            // post-load reachability for truncation-affected nodes.
+            // Native directory and snapshot writers cap this overflow for their
+            // existing degree contract. The ADR-110 portable writer preserves it
+            // losslessly so byte round trips retain reachability.
             //
             // Edge case: if the graph was empty before this insert and ordinal became
             // the medoid (live_before == 0 branch), no pin is needed — handled by the
@@ -2189,6 +2179,7 @@ fn exact_search(
     dists
 }
 
+#[cfg(feature = "mmap")]
 fn capped_reverse_adjacency(index: &VamanaIndex) -> Vec<Vec<u32>> {
     let adjacency = index.graph.adjacency();
     let medoid = index.graph.medoid() as usize;
@@ -3033,7 +3024,16 @@ fn write_graph(path: &Path, graph: &VamanaGraph, max_degree: usize) -> Result<()
     Ok(())
 }
 
+#[cfg(feature = "mmap")]
 fn encode_graph(graph: &VamanaGraph, max_degree: usize) -> Result<Vec<u8>> {
+    encode_graph_inner(graph, Some(max_degree))
+}
+
+fn encode_graph_lossless(graph: &VamanaGraph) -> Result<Vec<u8>> {
+    encode_graph_inner(graph, None)
+}
+
+fn encode_graph_inner(graph: &VamanaGraph, medoid_degree_limit: Option<usize>) -> Result<Vec<u8>> {
     let num_nodes = u32::try_from(graph.node_count()).map_err(|_| VamanaError::TooManyVectors {
         count: graph.node_count(),
     })?;
@@ -3047,12 +3047,14 @@ fn encode_graph(graph: &VamanaGraph, max_degree: usize) -> Result<Vec<u8>> {
     let medoid_adj_capped: Vec<u32>;
     let adjacency = graph.adjacency();
     let medoid_neighbors = &adjacency[medoid as usize];
-    let medoid_capped: &[u32] = if medoid_neighbors.len() > max_degree {
-        medoid_adj_capped = medoid_neighbors[..max_degree].to_vec();
-        &medoid_adj_capped
-    } else {
-        medoid_neighbors
-    };
+    let medoid_capped: &[u32] =
+        if medoid_degree_limit.is_some_and(|limit| medoid_neighbors.len() > limit) {
+            medoid_adj_capped =
+                medoid_neighbors[..medoid_degree_limit.expect("checked above")].to_vec();
+            &medoid_adj_capped
+        } else {
+            medoid_neighbors
+        };
 
     let total_edges: usize = adjacency
         .iter()
@@ -3136,9 +3138,9 @@ fn parse_graph(data: &[u8], max_degree: usize, num_vectors: usize) -> Result<Vam
         let degree = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
         offset += 4;
 
-        if degree > max_degree {
+        if degree > max_degree && _node != medoid as usize {
             return Err(VamanaError::invalid_format(format!(
-                "degree {degree} exceeds max_degree {max_degree}"
+                "node {_node} degree {degree} exceeds max_degree {max_degree}"
             )));
         }
         if offset + degree * 4 > data.len() {
