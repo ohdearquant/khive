@@ -26,6 +26,7 @@ on:
     paths:
       - "crates/**"
       - "scripts/perf/**"
+      - "scripts/bench_1m.sh"
       - ".github/workflows/bench-track.yml"
       - ".github/workflows/bench-component.yml"
   # Do not path-filter the workflow itself: a required selector check must be
@@ -94,25 +95,47 @@ jobs:
           packs=false
           all_components=false
 
-          while IFS= read -r path; do
-            case "$path" in
-              crates/khive-score/*|crates/khive-fusion/*|crates/khive-retrieval/*|crates/khive-text/*|crates/khive-bm25/*)
-                scoring_retrieval=true
-                ;;
-              crates/khive-hnsw/*|crates/khive-vamana/*|crates/khive-quant/*|crates/khive-query/*|crates/khive-request/*)
-                ann_query=true
-                ;;
-              crates/khive-db/*|crates/khive-fold/*|crates/khive-brain-core/*|crates/khive-pack-brain/*|crates/khive-pack-comm/*)
-                storage_brain=true
-                ;;
-              crates/khive-pack-gtd/*|crates/khive-pack-kg/*|crates/khive-pack-knowledge/*|crates/khive-pack-memory/*|crates/khive-pack-schedule/*)
-                packs=true
-                ;;
-              crates/Cargo.toml|crates/Cargo.lock|scripts/perf/bench_track.py|scripts/perf/bench_calibrate.py|scripts/perf/publish_ledger.sh|.github/workflows/bench-track.yml|.github/workflows/bench-component.yml)
-                all_components=true
-                ;;
-            esac
-          done < <(git diff --name-only "$BASE_SHA...$HEAD_SHA")
+          # Fail closed: a process-substitution `< <(git diff ...)` failure is
+          # invisible to `set -euo pipefail` (the subshell's exit status never
+          # reaches the script). Capture the diff to a file first and check
+          # its exit status explicitly, so an unavailable/malformed base or
+          # head object trips all_components instead of silently leaving
+          # every component flag false.
+          diff_file="$(mktemp)"
+          if ! git diff --name-only "$BASE_SHA...$HEAD_SHA" > "$diff_file"; then
+            echo "::warning::git diff failed for $BASE_SHA...$HEAD_SHA; treating as all-components (fail closed)"
+            all_components=true
+          fi
+
+          # An empty diff for two distinct SHAs is also unsafe: it should
+          # never happen for a real PR range, so treat it the same as a
+          # diff failure rather than silently skipping every component.
+          if [ "$all_components" != true ] && [ ! -s "$diff_file" ] && [ "$BASE_SHA" != "$HEAD_SHA" ]; then
+            echo "::warning::git diff returned no output for distinct SHAs $BASE_SHA...$HEAD_SHA; treating as all-components (fail closed)"
+            all_components=true
+          fi
+
+          if [ "$all_components" != true ]; then
+            while IFS= read -r path; do
+              case "$path" in
+                crates/khive-score/*|crates/khive-fusion/*|crates/khive-retrieval/*|crates/khive-text/*|crates/khive-bm25/*)
+                  scoring_retrieval=true
+                  ;;
+                crates/khive-hnsw/*|crates/khive-vamana/*|crates/khive-quant/*|crates/khive-query/*|crates/khive-request/*)
+                  ann_query=true
+                  ;;
+                crates/khive-db/*|crates/khive-fold/*|crates/khive-brain-core/*|crates/khive-pack-brain/*|crates/khive-pack-comm/*)
+                  storage_brain=true
+                  ;;
+                crates/khive-pack-gtd/*|crates/khive-pack-kg/*|crates/khive-pack-knowledge/*|crates/khive-pack-memory/*|crates/khive-pack-schedule/*)
+                  packs=true
+                  ;;
+                crates/Cargo.toml|crates/Cargo.lock|scripts/perf/bench_track.py|scripts/perf/bench_calibrate.py|scripts/perf/publish_ledger.sh|scripts/bench_1m.sh|.github/workflows/bench-track.yml|.github/workflows/bench-component.yml)
+                  all_components=true
+                  ;;
+              esac
+            done < "$diff_file"
+          fi
 
           if [ "$all_components" = true ]; then
             scoring_retrieval=true
