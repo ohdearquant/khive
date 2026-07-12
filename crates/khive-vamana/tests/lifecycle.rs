@@ -1147,24 +1147,27 @@ fn insert_saturated_low_degree_reachable() {
     // will NOT be findable after load — this is a documented quality limitation
     // of the medoid-pin under extreme saturation. Existing nodes that were
     // findable before the insert ARE still findable (their in-edges are intact).
-    let dir = tempfile::tempdir().unwrap();
-    idx.save(dir.path()).unwrap();
-    let loaded = VamanaIndex::load(dir.path()).unwrap();
-    // Existing node 1 must still be self-queryable after load: its in-edge
-    // from medoid is either preserved (if the cap kept it) or it has other
-    // in-edges. Medoid pins only ever ADD edges; they never remove existing ones.
-    let r_ex_loaded = loaded.search(&[0.1f32], 1).unwrap();
-    assert_eq!(
-        r_ex_loaded[0].0, 1u32,
-        "save/load round-trip: existing node 1 must still be self-queryable"
-    );
-    // Sanity: all adjacency lists in the loaded index satisfy max_degree.
-    for neighbors in loaded.graph().adjacency() {
-        assert!(
-            neighbors.len() <= 1,
-            "save/load round-trip: loaded degree {} exceeds max_degree 1",
-            neighbors.len()
+    #[cfg(feature = "mmap")]
+    {
+        let dir = tempfile::tempdir().unwrap();
+        idx.save(dir.path()).unwrap();
+        let loaded = VamanaIndex::load(dir.path()).unwrap();
+        // Existing node 1 must still be self-queryable after load: its in-edge
+        // from medoid is either preserved (if the cap kept it) or it has other
+        // in-edges. Medoid pins only ever ADD edges; they never remove existing ones.
+        let r_ex_loaded = loaded.search(&[0.1f32], 1).unwrap();
+        assert_eq!(
+            r_ex_loaded[0].0, 1u32,
+            "save/load round-trip: existing node 1 must still be self-queryable"
         );
+        // Sanity: all adjacency lists in the loaded index satisfy max_degree.
+        for neighbors in loaded.graph().adjacency() {
+            assert!(
+                neighbors.len() <= 1,
+                "save/load round-trip: loaded degree {} exceeds max_degree 1",
+                neighbors.len()
+            );
+        }
     }
 
     // (d) POST-insert round-trip via to_snapshot()/from_snapshot(): same guarantee.
@@ -1196,21 +1199,24 @@ fn insert_saturated_low_degree_reachable() {
 
     // (e) Mmap-promotion path: build fresh, save, load (Mmap-backed), then insert.
     // POST-insert save must succeed (medoid overflow capped at serialization).
-    let base_idx = VamanaIndex::build(&vecs, cfg).unwrap();
-    let dir2 = tempfile::tempdir().unwrap();
-    base_idx.save(dir2.path()).unwrap();
-    let mut mmap_loaded = VamanaIndex::load(dir2.path()).unwrap();
-    let _assigned_m = mmap_loaded.insert(&new_vec).unwrap();
-    let dir3 = tempfile::tempdir().unwrap();
-    mmap_loaded.save(dir3.path()).unwrap();
-    let reloaded = VamanaIndex::load(dir3.path()).unwrap();
-    // Structural invariant must hold.
-    for neighbors in reloaded.graph().adjacency() {
-        assert!(
-            neighbors.len() <= 1,
-            "mmap-path post-insert round-trip: degree {} exceeds max_degree 1",
-            neighbors.len()
-        );
+    #[cfg(feature = "mmap")]
+    {
+        let base_idx = VamanaIndex::build(&vecs, cfg).unwrap();
+        let dir2 = tempfile::tempdir().unwrap();
+        base_idx.save(dir2.path()).unwrap();
+        let mut mmap_loaded = VamanaIndex::load(dir2.path()).unwrap();
+        let _assigned_m = mmap_loaded.insert(&new_vec).unwrap();
+        let dir3 = tempfile::tempdir().unwrap();
+        mmap_loaded.save(dir3.path()).unwrap();
+        let reloaded = VamanaIndex::load(dir3.path()).unwrap();
+        // Structural invariant must hold.
+        for neighbors in reloaded.graph().adjacency() {
+            assert!(
+                neighbors.len() <= 1,
+                "mmap-path post-insert round-trip: degree {} exceeds max_degree 1",
+                neighbors.len()
+            );
+        }
     }
 }
 
