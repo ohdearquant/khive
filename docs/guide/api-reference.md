@@ -19,18 +19,18 @@ An always-machine-readable copy of this page is at
 
 ## Packs at a glance
 
-| Pack        | Verbs | Load with                  | Optional?           |
-| ----------- | ----- | -------------------------- | ------------------- |
-| `kg`        | 18    | `KHIVE_PACKS=kg` (default) | No — base substrate |
-| `gtd`       | 5     | `KHIVE_PACKS=kg,gtd`       | Yes                 |
-| `memory`    | 5     | `KHIVE_PACKS=kg,memory`    | Yes                 |
-| `brain`     | 15    | `KHIVE_PACKS=kg,brain`     | Yes                 |
-| `comm`      | 7     | `KHIVE_PACKS=kg,comm`      | Yes                 |
-| `schedule`  | 4     | `KHIVE_PACKS=kg,schedule`  | Yes                 |
-| `knowledge` | 19    | `KHIVE_PACKS=kg,knowledge` | Yes                 |
-| `session`   | 4     | `KHIVE_PACKS=kg,session`   | Yes                 |
-| `git`       | 1     | `KHIVE_PACKS=kg,git`       | Yes                 |
-| `code`      | 0     | `KHIVE_PACKS=kg,code`      | Yes                 |
+| Pack        | Verbs | Load with                                  | Optional?           |
+| ----------- | ----- | ------------------------------------------ | ------------------- |
+| `kg`        | 18    | `KHIVE_PACKS=kg` (default)                 | No — base substrate |
+| `gtd`       | 5     | `KHIVE_PACKS=kg,gtd`                       | Yes                 |
+| `memory`    | 5     | `KHIVE_PACKS=kg,memory`                    | Yes                 |
+| `brain`     | 15    | `KHIVE_PACKS=kg,brain`                     | Yes                 |
+| `comm`      | 7     | `KHIVE_PACKS=kg,comm`                      | Yes                 |
+| `schedule`  | 4     | `KHIVE_PACKS=kg,schedule`                  | Yes                 |
+| `knowledge` | 19    | `KHIVE_PACKS=kg,knowledge`                 | Yes                 |
+| `session`   | 4     | `KHIVE_PACKS=kg,session`                   | Yes                 |
+| `git`       | 1     | `KHIVE_PACKS=kg,git`                       | Yes                 |
+| `code`      | 0     | `KHIVE_PACKS=kg,code`                      | Yes                 |
 | `workspace` | 0     | `KHIVE_PACKS=kg,git,gtd,session,workspace` | Yes                 |
 
 `git` also registers the `commit` / `issue` / `pull_request` note kinds and the shared
