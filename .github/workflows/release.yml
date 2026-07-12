@@ -169,10 +169,12 @@ jobs:
         uses: obi1kenobi/cargo-semver-checks-action@6b69fcf40e9b5fb17adeb57e4b6ecd020649a239 # v2.9
         with:
           manifest-path: crates/Cargo.toml
-          # khive-quant (SQ8 codecs) has never been published, so it has no
-          # crates.io baseline and makes the check un-runnable if left in scope.
-          # Drop it from `exclude:` once it is first published to gate it too.
-          exclude: khive-quant
+          # These crates have never been published, so they have no crates.io
+          # baseline and make the check un-runnable if left in scope. Keep this
+          # list synchronized with the semver-gate excludes in
+          # scripts/publish.sh; drop each entry after its first crates.io
+          # release so it is gated too.
+          exclude: khive-quant,khive-changeset,khive-pack-code,khive-pack-git,khive-pack-workspace
 
   # ─────────────────────────────────────────────────────────────────────────
   # Phase 2: Publish all subpackages + umbrella atomically in a single job.
