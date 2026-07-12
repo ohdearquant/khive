@@ -638,10 +638,10 @@ const TRIGGER_WORDS: &[&str] = &[
     "apikey",
 ];
 
-/// Compound triggers that retain substring matching inside assignment labels.
+/// Compound triggers that retain suffix matching inside credential labels.
 /// Their underscore separator disambiguates them from ordinary prose, and
 /// suffixes are common in versioned credential names such as `api_keyv2`.
-const ASSIGNMENT_COMPOUND_TRIGGERS: &[&str] = &["api_key", "access_key", "private_key"];
+const COMPOUND_TRIGGER_WORDS: &[&str] = &["api_key", "access_key", "private_key"];
 
 /// Minimum token length to apply the entropy check.
 const MIN_ENTROPY_LEN: usize = 24;
@@ -866,12 +866,35 @@ fn contains_bounded_word(low_window: &str, needle: &str) -> bool {
     contains_word(low_window, needle, false)
 }
 
+/// Returns `true` when a compound credential label begins at an identifier
+/// boundary. The trailing edge is deliberately unbounded so version suffixes
+/// and larger underscore-composed labels remain protected.
+fn contains_compound_trigger(low_text: &str) -> bool {
+    COMPOUND_TRIGGER_WORDS.iter().any(|needle| {
+        let mut start = 0;
+        while let Some(rel) = low_text[start..].find(needle) {
+            let abs = start + rel;
+            let before_ok = abs == 0
+                || low_text[..abs]
+                    .chars()
+                    .next_back()
+                    .is_none_or(|c| !c.is_ascii_alphanumeric());
+            if before_ok {
+                return true;
+            }
+            start = abs + needle.len();
+        }
+        false
+    })
+}
+
 /// Returns `true` when `text` contains a boundary-delimited credential trigger.
 fn contains_trigger(text: &str) -> bool {
     let low = text.to_ascii_lowercase();
     TRIGGER_WORDS
         .iter()
         .any(|tw| contains_bounded_word(&low, tw))
+        || contains_compound_trigger(&low)
         || has_standalone_token(&low)
         || has_token_assignment(&low)
         || has_assignment_credential_trigger(&low)
@@ -893,9 +916,7 @@ fn has_assignment_credential_trigger(low_text: &str) -> bool {
             .rsplit(|c: char| !c.is_ascii_alphanumeric() && c != '_')
             .next()
             .unwrap_or_default();
-        ASSIGNMENT_COMPOUND_TRIGGERS
-            .iter()
-            .any(|tw| label.contains(tw))
+        contains_compound_trigger(label)
             || TRIGGER_WORDS
                 .iter()
                 .any(|tw| contains_bounded_word(label, tw))
@@ -920,9 +941,10 @@ fn has_inline_credential_trigger(raw_token: &str) -> bool {
 
     !low.contains(['/', '-', '.'])
         && low.contains('_')
-        && TRIGGER_WORDS
-            .iter()
-            .any(|tw| contains_bounded_word(&low, tw))
+        && (contains_compound_trigger(&low)
+            || TRIGGER_WORDS
+                .iter()
+                .any(|tw| contains_bounded_word(&low, tw)))
 }
 
 /// Returns `true` when `low_window` contains the word `token` as a standalone
@@ -3313,6 +3335,27 @@ mod tests {
                     "spaced suffix-bearing compound credential assignment must be \
                      blocked: {content:?}, got {:?}",
                     scan(content)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn blocks_suffix_bearing_compound_credentials_without_assignment_separator() {
+        let opaque = "Xk9mZ2vQpLrT8nJwYuAeHfBsDcGiONvMabcdef"; // gitleaks:allow
+        for label in ["api_keyv2", "access_keyv2", "private_keyv2"] {
+            let cases = [format!("{label} {opaque}"), format!("{label}{opaque}")];
+            for content in &cases {
+                assert!(
+                    check(content).is_err(),
+                    "suffix-bearing compound credential without an assignment separator must be \
+                     blocked: {content:?}, got {:?}",
+                    scan(content)
+                );
+                assert!(
+                    mask_secrets(content).contains(REDACTION_MARKER),
+                    "shared secret masker must redact separator-free compound credential: \
+                     {content:?}"
                 );
             }
         }
