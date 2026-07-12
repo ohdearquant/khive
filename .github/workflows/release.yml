@@ -210,6 +210,24 @@ jobs:
         run: |
           echo "VERSION=${{ inputs.version }}" >> "$GITHUB_ENV"
 
+      # ADR-026 same-version pinning: the manual dispatch input is untrusted.
+      # Refuse to publish anything whose version does not match the checked-in
+      # sources: the Rust workspace version (what the binaries were built as)
+      # and the umbrella npm/package.json must both equal inputs.version.
+      - name: Guard - dispatch version must match checked-in sources
+        run: |
+          CARGO_VERSION=$(awk '/^\[workspace\.package\]/{f=1;next} /^\[/{f=0} f && /^version = /{gsub(/version = |"/,""); print; exit}' crates/Cargo.toml)
+          NPM_VERSION=$(node -p "require('./npm/package.json').version")
+          echo "inputs.version=${VERSION} crates/Cargo.toml=${CARGO_VERSION} npm/package.json=${NPM_VERSION}"
+          if [ "$VERSION" != "$CARGO_VERSION" ]; then
+            echo "::error::Dispatch version ${VERSION} does not match crates/Cargo.toml workspace version ${CARGO_VERSION}"
+            exit 1
+          fi
+          if [ "$VERSION" != "$NPM_VERSION" ]; then
+            echo "::error::Dispatch version ${VERSION} does not match npm/package.json version ${NPM_VERSION}"
+            exit 1
+          fi
+
       # Download all six platform artifacts into their respective directories.
       - name: Download all platform artifacts
         uses: actions/download-artifact@v4
