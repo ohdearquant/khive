@@ -2,7 +2,7 @@ use super::*;
 use crate::pool::PoolConfig;
 use khive_storage::types::{Direction, TraversalOptions};
 use serial_test::serial;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 /// Deterministic barrier at the exact insert-to-probe seam
 /// [`edge_insert_guarded`] calls into (via `#[cfg(test)] hook(...)`) after a
@@ -1407,6 +1407,173 @@ fn single_neighbour_set(hits: &[NeighborHit]) -> HashSet<Uuid> {
     hits.iter().map(|h| h.node_id).collect()
 }
 
+fn grouped_neighbor_rows(
+    hits: Vec<(Uuid, NeighborHit)>,
+) -> HashMap<Uuid, HashSet<(Uuid, Uuid, EdgeRelation)>> {
+    let mut grouped: HashMap<Uuid, HashSet<(Uuid, Uuid, EdgeRelation)>> = HashMap::new();
+    for (origin, hit) in hits {
+        grouped
+            .entry(origin)
+            .or_default()
+            .insert((hit.node_id, hit.edge_id, hit.relation));
+    }
+    grouped
+}
+
+#[tokio::test]
+async fn batch_neighbors_keeps_exact_rows_grouped_by_requested_node() {
+    let store = setup_memory_store();
+    let root_a = Uuid::new_v4();
+    let root_b = Uuid::new_v4();
+    let root_c = Uuid::new_v4();
+    let shared = Uuid::new_v4();
+    let only_a = Uuid::new_v4();
+    let only_b = Uuid::new_v4();
+    let only_c = Uuid::new_v4();
+
+    let edges = vec![
+        make_edge(root_a, shared, EdgeRelation::Extends, 0.9),
+        make_edge(root_a, only_a, EdgeRelation::DependsOn, 0.8),
+        make_edge(root_b, shared, EdgeRelation::Extends, 0.7),
+        make_edge(root_b, only_b, EdgeRelation::DependsOn, 0.6),
+        make_edge(root_c, only_c, EdgeRelation::Extends, 0.5),
+        make_edge(shared, root_a, EdgeRelation::Extends, 0.4),
+        make_edge(only_a, root_a, EdgeRelation::DependsOn, 0.3),
+        make_edge(shared, root_b, EdgeRelation::DependsOn, 0.4),
+        make_edge(only_b, root_b, EdgeRelation::Extends, 0.3),
+        make_edge(shared, root_c, EdgeRelation::Extends, 0.4),
+        make_edge(only_c, root_c, EdgeRelation::DependsOn, 0.3),
+    ];
+    let edge_ids: Vec<Uuid> = edges.iter().map(|edge| Uuid::from(edge.id)).collect();
+    for edge in edges {
+        store.upsert_edge(edge).await.unwrap();
+    }
+
+    let sources = [root_c, root_a, root_b];
+    let outgoing_hits = store
+        .batch_neighbors(
+            &sources,
+            NeighborQuery {
+                direction: Direction::Out,
+                relations: Some(vec![EdgeRelation::Extends]),
+                limit: None,
+                min_weight: None,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        outgoing_hits
+            .iter()
+            .map(|(origin, _)| *origin)
+            .collect::<Vec<_>>(),
+        vec![root_c, root_a, root_b]
+    );
+    let outgoing = grouped_neighbor_rows(outgoing_hits);
+    assert_eq!(
+        outgoing,
+        HashMap::from([
+            (
+                root_a,
+                HashSet::from([(shared, edge_ids[0], EdgeRelation::Extends)]),
+            ),
+            (
+                root_b,
+                HashSet::from([(shared, edge_ids[2], EdgeRelation::Extends)]),
+            ),
+            (
+                root_c,
+                HashSet::from([(only_c, edge_ids[4], EdgeRelation::Extends)]),
+            ),
+        ])
+    );
+
+    let incoming_hits = store
+        .batch_neighbors(
+            &sources,
+            NeighborQuery {
+                direction: Direction::In,
+                relations: Some(vec![EdgeRelation::DependsOn]),
+                limit: None,
+                min_weight: None,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        incoming_hits
+            .iter()
+            .map(|(origin, _)| *origin)
+            .collect::<Vec<_>>(),
+        vec![root_c, root_a, root_b]
+    );
+    let incoming = grouped_neighbor_rows(incoming_hits);
+    assert_eq!(
+        incoming,
+        HashMap::from([
+            (
+                root_a,
+                HashSet::from([(only_a, edge_ids[6], EdgeRelation::DependsOn)]),
+            ),
+            (
+                root_b,
+                HashSet::from([(shared, edge_ids[7], EdgeRelation::DependsOn)]),
+            ),
+            (
+                root_c,
+                HashSet::from([(only_c, edge_ids[10], EdgeRelation::DependsOn)]),
+            ),
+        ])
+    );
+
+    let both_hits = store
+        .batch_neighbors(
+            &sources,
+            NeighborQuery {
+                direction: Direction::Both,
+                relations: Some(vec![EdgeRelation::Extends]),
+                limit: None,
+                min_weight: None,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        both_hits
+            .iter()
+            .map(|(origin, _)| *origin)
+            .collect::<Vec<_>>(),
+        vec![root_c, root_c, root_a, root_a, root_b, root_b]
+    );
+    let both = grouped_neighbor_rows(both_hits);
+    assert_eq!(
+        both,
+        HashMap::from([
+            (
+                root_a,
+                HashSet::from([
+                    (shared, edge_ids[0], EdgeRelation::Extends),
+                    (shared, edge_ids[5], EdgeRelation::Extends),
+                ]),
+            ),
+            (
+                root_b,
+                HashSet::from([
+                    (shared, edge_ids[2], EdgeRelation::Extends),
+                    (only_b, edge_ids[8], EdgeRelation::Extends),
+                ]),
+            ),
+            (
+                root_c,
+                HashSet::from([
+                    (only_c, edge_ids[4], EdgeRelation::Extends),
+                    (shared, edge_ids[9], EdgeRelation::Extends),
+                ]),
+            ),
+        ])
+    );
+}
+
 /// PARITY REGRESSION GUARD — the critical bug (HIGH).
 /// For Direction::Both + limit=Some(1), batch_neighbors must return AT MOST
 /// `limit` hits per source, not up to 2× (one per direction).
@@ -1829,14 +1996,9 @@ async fn get_edges_chunk_boundary() {
 
 /// batch_neighbors Direction::Both chunk-boundary test.
 ///
-/// With the old const CHUNK=880, Direction::Both would bind ~1761 variables
-/// (1 ns + 880 out_srcs + 880 in_srcs) into a single SQLite statement,
-/// blowing past SQLITE_MAX_VARIABLE_NUMBER=999 and returning an error.
-///
-/// This test uses 500 source nodes — enough that a single Both chunk would
-/// have exceeded 999 variables under the old constant.  After the fix the
-/// computed chunk_size for Both (no filters, no limit) is ~474, so the 500
-/// sources are split into two chunks, each staying within budget.
+/// Source IDs are bound once as a JSON array, so Direction::Both does not
+/// duplicate one SQL parameter per source for each UNION arm. This test crosses
+/// the 880-source chunk boundary and verifies that grouping remains exact.
 ///
 /// Correctness: for a random sample of sources, batch result must equal the
 /// per-source neighbors() result.
@@ -1846,8 +2008,8 @@ async fn get_edges_chunk_boundary() {
 async fn batch_neighbors_both_chunk_boundary() {
     let store = setup_memory_store();
 
-    // Create 500 source nodes, each with one outgoing and one incoming edge.
-    let source_count = 500usize;
+    // Create 900 source nodes, each with one outgoing and one incoming edge.
+    let source_count = 900usize;
     let mut sources: Vec<Uuid> = Vec::with_capacity(source_count);
     for _ in 0..source_count {
         let centre = Uuid::new_v4();
