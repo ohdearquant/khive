@@ -1382,10 +1382,25 @@ pub async fn schedule_tick_loop(
 mod tests {
     use super::*;
     use chrono::FixedOffset;
-    use khive_runtime::RuntimeConfig;
+    use khive_runtime::{Gate, GateDecision, GateError, GateRequest, RuntimeConfig};
     use khive_storage::event::EventFilter;
     use khive_storage::types::PageRequest;
     use tempfile::NamedTempFile;
+
+    #[derive(Debug)]
+    struct DenyCommSendGate;
+
+    impl Gate for DenyCommSendGate {
+        fn check(&self, request: &GateRequest) -> Result<GateDecision, GateError> {
+            if request.verb == "comm.send" {
+                Ok(GateDecision::deny(
+                    "comm.send denied by delivery-failure test",
+                ))
+            } else {
+                Ok(GateDecision::allow())
+            }
+        }
+    }
 
     fn tmp_db() -> (NamedTempFile, String) {
         let f = NamedTempFile::new().expect("tempfile");
@@ -1667,9 +1682,19 @@ mod tests {
     async fn reminder_delivery_failure_is_persisted_audited_and_drain_continues() {
         let (_tmp, db_path) = tmp_db();
         let actor = "lambda:failure-owner";
-        let rt = make_rt_with_actor(&db_path, Some(actor)).await;
-        let packs = vec!["kg".to_string(), "schedule".to_string()];
-        let server = KhiveMcpServer::with_packs(rt.clone(), &packs).expect("server without comm");
+        let cfg = RuntimeConfig {
+            db_path: Some(std::path::PathBuf::from(&db_path)),
+            default_namespace: Namespace::parse("local").unwrap(),
+            embedding_model: None,
+            additional_embedding_models: vec![],
+            gate: std::sync::Arc::new(DenyCommSendGate),
+            actor_id: Some(actor.to_string()),
+            ..Default::default()
+        };
+        let rt = KhiveRuntime::new(cfg).expect("runtime");
+        let packs = vec!["kg".to_string(), "comm".to_string(), "schedule".to_string()];
+        let server = KhiveMcpServer::with_packs(rt.clone(), &packs)
+            .expect("server with required reminder delivery pack");
         let id = create_scheduled_event(&rt, "local", &due_rfc3339(), None, None, "remind").await;
         let action_id = create_scheduled_event(
             &rt,
@@ -1709,7 +1734,7 @@ mod tests {
         assert!(
             props["delivery_error"]
                 .as_str()
-                .is_some_and(|error| error.contains("unknown verb")),
+                .is_some_and(|error| error.contains("denied by delivery-failure test")),
             "delivery error must be visible on the reminder row: {props:?}"
         );
         assert!(props["delivery_failed_at"].as_str().is_some());

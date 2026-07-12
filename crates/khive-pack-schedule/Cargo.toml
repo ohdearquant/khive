@@ -30,6 +30,7 @@ tracing = { workspace = true }
 [dev-dependencies]
 tokio = { workspace = true, features = ["full"] }
 khive-pack-kg = { version = "0.4.0", path = "../khive-pack-kg" }
+khive-pack-comm = { version = "0.4.0", path = "../khive-pack-comm" }
 khive-pack-brain = { version = "0.4.0", path = "../khive-pack-brain" }
 criterion = { workspace = true }
 

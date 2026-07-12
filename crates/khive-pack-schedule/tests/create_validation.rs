@@ -7,6 +7,7 @@ fn build_registry() -> (VerbRegistry, KhiveRuntime) {
     let runtime = KhiveRuntime::memory().expect("in-memory runtime");
     let mut builder = VerbRegistryBuilder::new();
     builder.register(khive_pack_kg::KgPack::new(runtime.clone()));
+    builder.register(khive_pack_comm::CommPack::new(runtime.clone()));
     builder.register(SchedulePack::new(runtime.clone()));
     let registry = builder.build().expect("registry builds");
     (registry, runtime)
@@ -16,6 +17,7 @@ fn build_registry_with_brain() -> (VerbRegistry, KhiveRuntime) {
     let runtime = KhiveRuntime::memory().expect("in-memory runtime");
     let mut builder = VerbRegistryBuilder::new();
     builder.register(khive_pack_kg::KgPack::new(runtime.clone()));
+    builder.register(khive_pack_comm::CommPack::new(runtime.clone()));
     builder.register(khive_pack_brain::BrainPack::new(runtime.clone()));
     builder.register(SchedulePack::new(runtime.clone()));
     let registry = builder.build().expect("registry builds");
@@ -48,6 +50,7 @@ async fn remind_persists_the_creating_actor_for_delivery() {
     let mut builder = VerbRegistryBuilder::new();
     builder.with_actor_id(Some("lambda:reminder-owner".to_string()));
     builder.register(khive_pack_kg::KgPack::new(runtime.clone()));
+    builder.register(khive_pack_comm::CommPack::new(runtime.clone()));
     builder.register(SchedulePack::new(runtime.clone()));
     let registry = builder.build().expect("registry builds");
 

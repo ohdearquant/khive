@@ -85,10 +85,8 @@ always present; `KHIVE_PACKS` / `--pack` select a subset.
 
 `khive-pack-kg` depends directly on `khive-types`, `khive-runtime`,
 `khive-query`, and `khive-storage`, and is registered into the pack runtime that
-`khive-mcp` serves. Every other pack in this workspace declares
-`REQUIRES = ["kg"]` — `gtd`, `memory`, `brain`, `comm`, `schedule`, `knowledge`,
-`session`, `git`, `code`, plus `formal` and `template` — so each depends on
-`kg` being loaded.
+`khive-mcp` serves. Every other pack in this workspace requires `kg`; schedule
+additionally requires `comm` so reminders always have an inbox-delivery path.
 Governing ADRs:
 [ADR-001](https://github.com/ohdearquant/khive/blob/main/docs/adr/ADR-001-entity-kind-taxonomy.md) (entity kinds),
 [ADR-002](https://github.com/ohdearquant/khive/blob/main/docs/adr/ADR-002-edge-ontology.md) (edge relations),

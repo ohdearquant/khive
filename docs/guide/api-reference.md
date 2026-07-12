@@ -26,7 +26,7 @@ An always-machine-readable copy of this page is at
 | `memory`    | 5     | `KHIVE_PACKS=kg,memory`                    | Yes                 |
 | `brain`     | 15    | `KHIVE_PACKS=kg,brain`                     | Yes                 |
 | `comm`      | 7     | `KHIVE_PACKS=kg,comm`                      | Yes                 |
-| `schedule`  | 4     | `KHIVE_PACKS=kg,schedule`                  | Yes                 |
+| `schedule`  | 4     | `KHIVE_PACKS=kg,comm,schedule`             | Yes                 |
 | `knowledge` | 19    | `KHIVE_PACKS=kg,knowledge`                 | Yes                 |
 | `session`   | 4     | `KHIVE_PACKS=kg,session`                   | Yes                 |
 | `git`       | 1     | `KHIVE_PACKS=kg,git`                       | Yes                 |
@@ -38,6 +38,9 @@ An always-machine-readable copy of this page is at
 `kkernel git-ingest` CLI drive.
 
 `workspace` requires `kg`, `git`, `gtd`, and `session` to be loaded alongside it (the runtime rejects a pack set that omits a declared dependency), so its minimal example lists all four.
+
+`schedule` requires both `kg` and `comm`; the runtime rejects a schedule pack set
+without `comm` so accepted reminders always have an inbox-delivery path.
 
 `code` registers the `finding` note kind and edge rules only; its `code.ingest` verb is
 accepted but unimplemented (ADR-085), and `findings.json` ingest runs through the
@@ -1003,7 +1006,7 @@ request(ops="comm.health()")
 ## `schedule` pack — 4 verbs
 
 Time-triggered reminders and deferred verb dispatch. Optional; load with
-`KHIVE_PACKS=kg,schedule`.
+`KHIVE_PACKS=kg,comm,schedule`.
 
 ### `schedule.remind` — Commissive
 

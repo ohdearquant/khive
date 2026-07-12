@@ -790,3 +790,9 @@ the same pass. The failed reminder is still finalized according to its cadence (
 one-shot becomes `fired`; a named repeat is re-armed), preventing an indefinitely
 retrying permanently broken delivery. A later successful occurrence clears stale
 `delivery_error` and `delivery_failed_at` properties.
+
+Because reminder delivery is part of the public `schedule.remind` contract, the
+schedule pack declares `REQUIRES = ["kg", "comm"]`. A pack selection that includes
+`schedule` without `comm` is rejected during boot, before a reminder can be persisted.
+The per-event failure behavior above therefore covers dispatch failures after a valid
+registry has loaded, not a permanently missing delivery verb.

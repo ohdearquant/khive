@@ -43,11 +43,13 @@ the pending-event runner).
 
 ## Usage
 
-`SchedulePack` requires the `kg` pack (`REQUIRES = ["kg"]`) for the notes
-substrate:
+`SchedulePack` requires the `kg` and `comm` packs
+(`REQUIRES = ["kg", "comm"]`): `kg` provides the notes substrate, and `comm`
+provides the delivery path for `schedule.remind`:
 
 ```rust
 use khive_pack_kg::KgPack;
+use khive_pack_comm::CommPack;
 use khive_pack_schedule::SchedulePack;
 use khive_runtime::{KhiveRuntime, RuntimeConfig, VerbRegistryBuilder};
 use serde_json::json;
@@ -56,6 +58,7 @@ let runtime = KhiveRuntime::new(RuntimeConfig::default())?;
 
 let mut builder = VerbRegistryBuilder::new();
 builder.register(KgPack::new(runtime.clone()));
+builder.register(CommPack::new(runtime.clone()));
 builder.register(SchedulePack::new(runtime));
 let registry = builder.build()?;
 
@@ -75,7 +78,8 @@ Over MCP: `request(ops="schedule.remind(content=\"Ship the 0.4.0 release\", at=\
 and `khive-pack-comm` in the pack layer, depending on `khive-pack-kg` for the
 note substrate and on `khive-request` to validate `schedule.schedule`'s
 DSL payload, registering into `khive-runtime`'s `VerbRegistry`, consumed by
-`khive-mcp`. Governing ADR:
+`khive-mcp`. The schedule pack also requires `khive-pack-comm` so every accepted
+reminder has a registered inbox-delivery verb. Governing ADR:
 [ADR-040](https://github.com/ohdearquant/khive/blob/main/docs/adr/ADR-040-communication-and-schedule-packs.md) (communication and schedule packs),
 built on [ADR-017](https://github.com/ohdearquant/khive/blob/main/docs/adr/ADR-017-pack-standard.md) (pack standard).
 

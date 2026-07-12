@@ -24,7 +24,7 @@ impl Pack for SchedulePack {
     const NOTE_KINDS: &'static [&'static str] = &["scheduled_event"];
     const ENTITY_KINDS: &'static [&'static str] = &[];
     const HANDLERS: &'static [HandlerDef] = &SCHEDULE_HANDLERS;
-    const REQUIRES: &'static [&'static str] = &["kg"];
+    const REQUIRES: &'static [&'static str] = &["kg", "comm"];
 }
 
 impl SchedulePack {
@@ -46,7 +46,7 @@ impl khive_runtime::PackFactory for SchedulePackFactory {
     }
 
     fn requires(&self) -> &'static [&'static str] {
-        &["kg"]
+        <SchedulePack as Pack>::REQUIRES
     }
 
     fn create(&self, runtime: KhiveRuntime) -> Box<dyn khive_runtime::PackRuntime> {

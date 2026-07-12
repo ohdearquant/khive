@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Smoke + behavioural tests for the khive-mcp schedule pack over stdio MCP.
 
-Spawns the binary with an in-memory DB, --pack kg --pack schedule, sends
+Spawns the binary with an in-memory DB, --pack kg --pack comm --pack schedule, sends
 JSON-RPC requests, and verifies all four verbs (schedule.remind,
 schedule.schedule, schedule.agenda, schedule.cancel) across happy paths
 and error cases.
@@ -104,11 +104,11 @@ def call_verb_expect_error(proc, name, args):
 
 
 def spawn_proc():
-    """Spawn a fresh khive-mcp process with kg + schedule packs."""
+    """Spawn a fresh khive-mcp process with kg + comm + schedule packs."""
     return subprocess.Popen(
         [
             BINARY, "mcp", "--db", ":memory:", "--no-embed", "--log", "error",
-            "--pack", "kg", "--pack", "schedule",
+            "--pack", "kg", "--pack", "comm", "--pack", "schedule",
         ],
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,

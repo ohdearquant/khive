@@ -20,8 +20,30 @@ fn schedule_pack_declares_four_handlers() {
 }
 
 #[test]
-fn schedule_pack_requires_kg() {
-    assert_eq!(SchedulePack::REQUIRES, &["kg"]);
+fn schedule_pack_requires_kg_and_comm() {
+    assert_eq!(SchedulePack::REQUIRES, &["kg", "comm"]);
+}
+
+#[test]
+fn schedule_pack_rejects_registry_without_comm() {
+    let runtime = KhiveRuntime::memory().expect("in-memory runtime");
+    let mut builder = VerbRegistryBuilder::new();
+    builder.register(khive_pack_kg::KgPack::new(runtime.clone()));
+    builder.register(SchedulePack::new(runtime));
+
+    let err = match builder.build() {
+        Ok(_) => panic!("kg + schedule must not build without comm"),
+        Err(err) => err,
+    };
+    let message = err.to_string();
+    assert!(
+        message.contains("schedule"),
+        "error must name schedule: {message}"
+    );
+    assert!(
+        message.contains("comm"),
+        "error must name missing comm: {message}"
+    );
 }
 
 #[tokio::test]
@@ -61,6 +83,7 @@ async fn verb_registry_aggregates_schedule_schema_plan() {
     let runtime = KhiveRuntime::memory().expect("in-memory runtime");
     let mut builder = VerbRegistryBuilder::new();
     builder.register(khive_pack_kg::KgPack::new(runtime.clone()));
+    builder.register(khive_pack_comm::CommPack::new(runtime.clone()));
     builder.register(SchedulePack::new(runtime.clone()));
     let registry = builder.build().expect("registry builds");
 
