@@ -110,7 +110,8 @@ Over MCP: `request(ops="comm.send(to=\"lambda:leo\", content=\"PR #372 is ready 
 
 `khive-pack-comm` sits alongside `khive-pack-gtd`, `khive-pack-memory`, and
 `khive-pack-schedule` in the pack layer, depending on `khive-pack-kg` for the
-note substrate. The schedule pack in turn requires `comm` for reminder delivery.
+note substrate. The schedule pack's `schedule.remind` verb requires the registered `comm.send`
+delivery capability at creation time; the schedule pack itself requires only `kg`.
 Both register into `khive-runtime`'s `VerbRegistry`, consumed by `khive-mcp`.
 Governing ADRs:
 [ADR-040](https://github.com/ohdearquant/khive/blob/main/docs/adr/ADR-040-communication-and-schedule-packs.md) (communication and schedule packs),
