@@ -1570,12 +1570,43 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fired_reminder_delivers_to_the_creating_actor_inbox() {
+    async fn fired_reminder_delivers_to_creator_after_daemon_actor_changes() {
         let (_tmp, db_path) = tmp_db();
-        let actor = "lambda:reminder-owner";
-        let rt = make_rt_with_actor(&db_path, Some(actor)).await;
-        let server = KhiveMcpServer::new(rt.clone()).expect("server");
-        let id = create_scheduled_event(&rt, "local", &due_rfc3339(), None, None, "remind").await;
+        let creator = "lambda:reminder-owner";
+        let daemon_actor = "lambda:replacement-daemon";
+        let id = {
+            let creator_rt = make_rt_with_actor(&db_path, Some(creator)).await;
+            let creator_server = KhiveMcpServer::new(creator_rt.clone()).expect("creator server");
+            let remind_ops = serde_json::to_string(&json!([{
+                "tool": "schedule.remind",
+                "args": {
+                    "content": "test reminder",
+                    "at": "2099-01-01T00:00:00Z"
+                }
+            }]))
+            .expect("serialize reminder op");
+            let result = creator_server
+                .dispatch_request_local(RequestParams {
+                    ops: remind_ops,
+                    ..Default::default()
+                })
+                .await
+                .expect("create reminder through schedule.remind");
+            let result: Value = serde_json::from_str(&result).expect("reminder result JSON");
+            assert_eq!(result["results"][0]["ok"], true, "{result}");
+            let id = result["results"][0]["result"]["full_id"]
+                .as_str()
+                .expect("reminder full_id")
+                .parse()
+                .expect("reminder UUID");
+            let props = get_note_props(&creator_rt, id).await;
+            assert_eq!(props["created_by_actor"], creator, "{props}");
+            make_repeat_due_again(&creator_rt, id).await;
+            id
+        };
+
+        let rt = make_rt_with_actor(&db_path, Some(daemon_actor)).await;
+        let server = KhiveMcpServer::new(rt.clone()).expect("replacement daemon server");
 
         let summary = run_pending_events_on(&rt, &server, false)
             .await
@@ -1583,12 +1614,20 @@ mod tests {
 
         assert_eq!(summary.fired, 1);
         assert_eq!(summary.failed, 0);
-        let messages = inbound_reminder_messages(&rt, actor).await;
-        assert_eq!(messages.len(), 1, "one inbound delivery");
+        let messages = inbound_reminder_messages(&rt, creator).await;
+        let daemon_messages = inbound_reminder_messages(&rt, daemon_actor).await;
+        let local_messages = inbound_reminder_messages(&rt, "local").await;
+        assert_eq!(
+            messages.len(),
+            1,
+            "one inbound delivery for the creator; daemon={daemon_messages:?}, local={local_messages:?}"
+        );
         assert_eq!(messages[0].0, "test reminder");
         assert_eq!(messages[0].1["direction"], "inbound");
-        assert_eq!(messages[0].1["to_actor"], actor);
+        assert_eq!(messages[0].1["to_actor"], creator);
         assert_eq!(messages[0].1["subject"], "[Reminder] test reminder");
+        assert!(daemon_messages.is_empty());
+        assert!(local_messages.is_empty());
         let props = get_note_props(&rt, id).await;
         assert_eq!(props["status"], "fired");
         assert!(props["fired_at"].as_str().is_some());
@@ -1625,20 +1664,46 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reminder_delivery_failure_is_persisted_and_audited() {
+    async fn reminder_delivery_failure_is_persisted_audited_and_drain_continues() {
         let (_tmp, db_path) = tmp_db();
         let actor = "lambda:failure-owner";
         let rt = make_rt_with_actor(&db_path, Some(actor)).await;
         let packs = vec!["kg".to_string(), "schedule".to_string()];
         let server = KhiveMcpServer::with_packs(rt.clone(), &packs).expect("server without comm");
         let id = create_scheduled_event(&rt, "local", &due_rfc3339(), None, None, "remind").await;
+        let action_id = create_scheduled_event(
+            &rt,
+            "local",
+            &due_rfc3339(),
+            Some("stats()"),
+            None,
+            "schedule",
+        )
+        .await;
+        let mut writer = rt.sql().writer().await.expect("open SQL writer");
+        let reordered = writer
+            .execute(SqlStatement {
+                sql: "UPDATE notes SET created_at = CASE id WHEN ?1 THEN 1 WHEN ?2 THEN 2 END \
+                      WHERE id IN (?1, ?2)"
+                    .to_string(),
+                params: vec![
+                    SqlValue::Text(id.to_string()),
+                    SqlValue::Text(action_id.to_string()),
+                ],
+                label: Some("test_reminder_failure_precedes_valid_action".into()),
+            })
+            .await
+            .expect("order reminder before action");
+        assert_eq!(reordered, 2);
+        drop(writer);
 
         let summary = run_pending_events_on(&rt, &server, false)
             .await
             .expect("drain continues after failure");
 
+        assert_eq!(summary.scanned, 2);
         assert_eq!(summary.failed, 1);
-        assert_eq!(summary.fired, 1);
+        assert_eq!(summary.fired, 2);
         assert!(inbound_reminder_messages(&rt, actor).await.is_empty());
         let props = get_note_props(&rt, id).await;
         assert!(
@@ -1648,6 +1713,9 @@ mod tests {
             "delivery error must be visible on the reminder row: {props:?}"
         );
         assert!(props["delivery_failed_at"].as_str().is_some());
+        let action_props = get_note_props(&rt, action_id).await;
+        assert_eq!(action_props["status"], "fired");
+        assert!(action_props["fired_at"].as_str().is_some());
 
         let token = rt.authorize(Namespace::local()).expect("authorize");
         let events = rt
