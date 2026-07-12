@@ -1507,6 +1507,140 @@ mod tests {
 
     // ---- embed intent tests ----
 
+    struct CapturingEmbeddingService {
+        captured: std::sync::Arc<std::sync::Mutex<Vec<Vec<String>>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl EmbeddingService for CapturingEmbeddingService {
+        async fn embed(
+            &self,
+            texts: &[String],
+            _model: EmbeddingModel,
+        ) -> std::result::Result<Vec<Vec<f32>>, lattice_embed::EmbedError> {
+            self.captured.lock().unwrap().push(texts.to_vec());
+            Ok(texts.iter().map(|_| vec![1.0]).collect())
+        }
+
+        fn supports_model(&self, _model: EmbeddingModel) -> bool {
+            true
+        }
+
+        fn name(&self) -> &'static str {
+            "capturing-embedding-service"
+        }
+    }
+
+    struct CapturingEmbedderProvider {
+        name: String,
+        captured: std::sync::Arc<std::sync::Mutex<Vec<Vec<String>>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl EmbedderProvider for CapturingEmbedderProvider {
+        fn name(&self) -> &str {
+            &self.name
+        }
+
+        fn dimensions(&self) -> usize {
+            1
+        }
+
+        async fn build(&self) -> crate::error::RuntimeResult<std::sync::Arc<dyn EmbeddingService>> {
+            Ok(std::sync::Arc::new(CapturingEmbeddingService {
+                captured: std::sync::Arc::clone(&self.captured),
+            }))
+        }
+    }
+
+    fn runtime_with_capturing_embedder(
+        model: EmbeddingModel,
+    ) -> (
+        KhiveRuntime,
+        std::sync::Arc<std::sync::Mutex<Vec<Vec<String>>>>,
+    ) {
+        let runtime = KhiveRuntime::memory().unwrap();
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        runtime.register_embedder(CapturingEmbedderProvider {
+            name: model.to_string(),
+            captured: std::sync::Arc::clone(&captured),
+        });
+        (runtime, captured)
+    }
+
+    #[tokio::test]
+    async fn bge_query_paths_pass_raw_unprefixed_text() {
+        const BGE_QUERY_INSTRUCTION: &str =
+            "Represent this sentence for searching relevant passages: ";
+        let single = "single raw query";
+        let batch = vec![
+            "first raw query".to_string(),
+            "second raw query".to_string(),
+        ];
+
+        for model in [
+            EmbeddingModel::BgeSmallEnV15,
+            EmbeddingModel::BgeBaseEnV15,
+            EmbeddingModel::BgeLargeEnV15,
+        ] {
+            let (runtime, captured) = runtime_with_capturing_embedder(model);
+            runtime
+                .embed_query_with_model(&model.to_string(), single)
+                .await
+                .unwrap();
+            runtime
+                .embed_query_batch_with_model(&model.to_string(), &batch)
+                .await
+                .unwrap();
+
+            let calls = captured.lock().unwrap().clone();
+            assert_eq!(
+                calls,
+                vec![vec![single.to_string()], batch.clone()],
+                "{model} must receive raw query text through single and batch paths"
+            );
+            assert!(
+                calls
+                    .iter()
+                    .flatten()
+                    .all(|text| !text.contains(BGE_QUERY_INSTRUCTION)),
+                "{model} must not receive the BGE retrieval instruction"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn e5_query_paths_apply_query_prefix() {
+        let model = EmbeddingModel::MultilingualE5Small;
+        let single = "single raw query";
+        let batch = vec![
+            "first raw query".to_string(),
+            "second raw query".to_string(),
+        ];
+        let (runtime, captured) = runtime_with_capturing_embedder(model);
+
+        runtime
+            .embed_query_with_model(&model.to_string(), single)
+            .await
+            .unwrap();
+        runtime
+            .embed_query_batch_with_model(&model.to_string(), &batch)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            captured.lock().unwrap().as_slice(),
+            [
+                vec!["query: single raw query".to_string()],
+                vec![
+                    "query: first raw query".to_string(),
+                    "query: second raw query".to_string(),
+                ],
+            ],
+            "E5 must receive its query prefix through single and batch paths"
+        );
+    }
+
     #[test]
     #[ignore = "loads ~80 MB model; run with --include-ignored"]
     fn minilm_document_and_query_embed_are_identical_no_prefix_model() {
