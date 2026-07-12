@@ -89,8 +89,8 @@
 //! is excluded from its own surrounding context. This prevents an internal
 //! path segment such as `cli-auth-and-kg` from making the path self-trigger.
 //! Assignment-shaped candidates such as `auth=<value>` and `api_key=<value>`
-//! are checked separately so the exclusion does not weaken credential-shaped
-//! writes.
+//! are checked separately, including when whitespace splits the label from the
+//! value, so the exclusion does not weaken credential-shaped writes.
 //!
 //! A structured-identifier-shaped token sitting near a **genuinely standalone**
 //! trigger word (e.g. `auth work saved at .../repo-audit.md`, where `auth` is
@@ -874,6 +874,33 @@ fn contains_trigger(text: &str) -> bool {
         .any(|tw| contains_bounded_word(&low, tw))
         || has_standalone_token(&low)
         || has_token_assignment(&low)
+        || has_assignment_credential_trigger(&low)
+}
+
+/// Detect a credential-bearing assignment label before an `=` or `:`.
+///
+/// The separator may be preceded by whitespace or a JSON quote. Compound
+/// triggers deliberately retain substring matching inside the label so common
+/// version suffixes such as `api_keyv2` remain protected.
+fn has_assignment_credential_trigger(low_text: &str) -> bool {
+    low_text.char_indices().any(|(index, ch)| {
+        if !matches!(ch, '=' | ':') {
+            return false;
+        }
+        let before =
+            low_text[..index].trim_end_matches(|c: char| !c.is_ascii_alphanumeric() && c != '_');
+        let label = before
+            .rsplit(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+            .next()
+            .unwrap_or_default();
+        ASSIGNMENT_COMPOUND_TRIGGERS
+            .iter()
+            .any(|tw| label.contains(tw))
+            || TRIGGER_WORDS
+                .iter()
+                .any(|tw| contains_bounded_word(label, tw))
+            || label == "token"
+    })
 }
 
 /// Detect credential labels embedded in the same whitespace token as a value.
@@ -887,25 +914,7 @@ fn contains_trigger(text: &str) -> bool {
 fn has_inline_credential_trigger(raw_token: &str) -> bool {
     let low = raw_token.to_ascii_lowercase();
 
-    let has_assignment_label = low.char_indices().any(|(index, ch)| {
-        if !matches!(ch, '=' | ':') {
-            return false;
-        }
-        let before =
-            low[..index].trim_end_matches(|c: char| !c.is_ascii_alphanumeric() && c != '_');
-        let label = before
-            .rsplit(|c: char| !c.is_ascii_alphanumeric() && c != '_')
-            .next()
-            .unwrap_or_default();
-        ASSIGNMENT_COMPOUND_TRIGGERS
-            .iter()
-            .any(|tw| label.contains(tw))
-            || TRIGGER_WORDS
-                .iter()
-                .any(|tw| contains_bounded_word(label, tw))
-            || label == "token"
-    });
-    if has_assignment_label {
+    if has_assignment_credential_trigger(&low) {
         return true;
     }
 
@@ -3286,6 +3295,26 @@ mod tests {
                  {content:?}, got {:?}",
                 scan(content)
             );
+        }
+    }
+
+    #[test]
+    fn blocks_spaced_suffix_bearing_compound_credential_assignments() {
+        let opaque = "Xk9mZ2vQpLrT8nJwYuAeHfBsDcGiONvMabcdef"; // gitleaks:allow
+        for label in ["api_keyv2", "access_keyv2", "private_keyv2"] {
+            let cases = [
+                format!("{label} = {opaque}"),
+                format!("{label} : {opaque}"),
+                format!(r#"{{"{label}": "{opaque}"}}"#),
+            ];
+            for content in &cases {
+                assert!(
+                    check(content).is_err(),
+                    "spaced suffix-bearing compound credential assignment must be \
+                     blocked: {content:?}, got {:?}",
+                    scan(content)
+                );
+            }
         }
     }
 
