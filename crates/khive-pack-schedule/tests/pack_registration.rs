@@ -1,8 +1,10 @@
 //! Pack registration and schema plan tests.
 
 use khive_pack_schedule::SchedulePack;
-use khive_runtime::{KhiveRuntime, VerbRegistryBuilder};
+use khive_runtime::VerbRegistryBuilder;
 use khive_types::Pack;
+
+mod support;
 
 #[test]
 fn schedule_pack_declares_scheduled_event_note_kind() {
@@ -27,7 +29,7 @@ fn schedule_pack_requires_kg() {
 #[tokio::test]
 async fn schedule_pack_exposes_non_empty_schema_plan() {
     use khive_runtime::PackRuntime;
-    let runtime = KhiveRuntime::memory().expect("in-memory runtime");
+    let runtime = support::memory_runtime();
     let pack = SchedulePack::new(runtime);
     let plan = pack.schema_plan();
 
@@ -58,7 +60,7 @@ async fn schedule_pack_exposes_non_empty_schema_plan() {
 
 #[tokio::test]
 async fn verb_registry_aggregates_schedule_schema_plan() {
-    let runtime = KhiveRuntime::memory().expect("in-memory runtime");
+    let runtime = support::memory_runtime();
     let mut builder = VerbRegistryBuilder::new();
     builder.register(khive_pack_kg::KgPack::new(runtime.clone()));
     builder.register(SchedulePack::new(runtime.clone()));

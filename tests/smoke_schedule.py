@@ -103,13 +103,38 @@ def call_verb_expect_error(proc, name, args):
     return first.get("error", "<no error string>")
 
 
+# Issue #779: 8 (then 14, then 42, accelerating) year-2099 schedule-pack
+# fixture rows -- matching this file's exact test content ("check the build",
+# "repeat=daily", "window-early", "sort-order-jan", ...) -- were found parked
+# in a real, on-disk store. This script's fixtures must only ever land in an
+# ephemeral store; ISOLATION_DB is the single source of truth for that, and
+# spawn_proc asserts its own argv actually carries it before returning the
+# process, so a future edit that drops or changes the `--db` flag fails this
+# script immediately instead of silently writing into whatever store the
+# environment resolves.
+ISOLATION_DB = ":memory:"
+
+
 def spawn_proc():
-    """Spawn a fresh khive-mcp process with kg + schedule packs."""
+    """Spawn a fresh khive-mcp process with kg + schedule packs.
+
+    Always isolated: `--db :memory:` is non-negotiable for this script, so we
+    build argv from ISOLATION_DB and assert it landed exactly where expected
+    rather than trusting the literal below never drifts.
+    """
+    argv = [
+        BINARY, "mcp", "--db", ISOLATION_DB, "--no-embed", "--log", "error",
+        "--pack", "kg", "--pack", "schedule",
+    ]
+    db_flag_index = argv.index("--db")
+    assert argv[db_flag_index + 1] == ISOLATION_DB, (
+        "refusing to spawn: --db must be an ephemeral store "
+        f"({ISOLATION_DB!r}), got {argv[db_flag_index + 1]!r} -- this guard "
+        "exists so this script can never silently write schedule pack "
+        "fixtures into a real database (issue #779)"
+    )
     return subprocess.Popen(
-        [
-            BINARY, "mcp", "--db", ":memory:", "--no-embed", "--log", "error",
-            "--pack", "kg", "--pack", "schedule",
-        ],
+        argv,
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
