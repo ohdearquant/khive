@@ -62,9 +62,12 @@ CRATES=(
     khive-retrieval
     khive-vcs-adapters
     khive-vcs
+    khive-changeset      # needs khive-types (above); never published, no crates.io baseline yet
     # khive-merge — excluded from workspace (ADR-043 forward-deployed, ahead of khive-vcs)
     khive-pack-formal    # needs khive-runtime + khive-types (both above); dev-dep of khive-pack-kg, so publish first
     khive-pack-kg
+    khive-pack-git       # needs khive-runtime/storage + khive-pack-kg (all above); never published, no baseline yet
+    khive-pack-code      # needs khive-runtime/storage + khive-pack-kg (all above); never published, no baseline yet
     khive-pack-gtd
     khive-brain-core
     khive-pack-brain
@@ -73,6 +76,7 @@ CRATES=(
     khive-pack-schedule
     khive-pack-knowledge
     khive-pack-session   # needs khive-pack-kg + khive-runtime/storage/types (all above)
+    khive-pack-workspace # needs khive-pack-kg/gtd/git/session (all above); never published, no baseline yet
     khive-pack-template
     khive-channel        # no khive-* deps; transport abstraction
     khive-channel-email  # needs khive-channel (above); optional dep of khive-mcp
@@ -91,8 +95,10 @@ DELAY=10  # seconds to wait for crates.io index between publishes
 # `make publish-dry` validates SemVer before any real publish. Crates with no
 # crates.io baseline yet (never published) have nothing to diff against and are
 # excluded until their first publish: khive-quant, plus the crates first shipped
-# in this release — khive-channel, khive-channel-email, khive-pack-formal,
-# khive-pack-session. Drop an exclusion once that crate has one published version.
+# in the 0.3.0 release (khive-channel, khive-channel-email, khive-pack-formal,
+# khive-pack-session), plus the crates added since 0.3.0 that are still never
+# published (khive-changeset, khive-pack-code, khive-pack-git,
+# khive-pack-workspace). Drop an exclusion once that crate has one published version.
 echo ""
 echo "--- SemVer gate (cargo-semver-checks vs crates.io baseline) ---"
 if ! command -v cargo-semver-checks >/dev/null 2>&1; then
@@ -105,7 +111,11 @@ cargo semver-checks check-release --workspace \
     --exclude khive-channel \
     --exclude khive-channel-email \
     --exclude khive-pack-formal \
-    --exclude khive-pack-session
+    --exclude khive-pack-session \
+    --exclude khive-changeset \
+    --exclude khive-pack-code \
+    --exclude khive-pack-git \
+    --exclude khive-pack-workspace
 echo "    SemVer gate OK"
 
 for crate in "${CRATES[@]}"; do
