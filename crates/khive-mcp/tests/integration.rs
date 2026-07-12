@@ -3978,20 +3978,26 @@ async fn schedule_agenda_agent_preserves_properties_trigger_at_verbatim() -> any
 }
 
 // ── #871: schedule.remind create-response preserves top-level trigger_at ─────
+//
+// These two tests deliberately cover `schedule.remind` only; `schedule` (the
+// verb-dispatch scheduling sibling) shares the same create-response shape and
+// the same presentation-layer fix, but an equivalent end-to-end case for it
+// is out of scope here to keep this regression narrow (#871).
 
 /// `schedule.remind`'s create response returns `trigger_at` as a top-level
 /// convenience field (sibling to `id`/`full_id`), not nested under
 /// `"properties"`. In default Agent mode this must round-trip verbatim,
-/// offset intact — the humanize layer previously misread the wall-clock
-/// digits of a non-UTC-offset `at` as UTC and could render a future trigger
-/// as if it were in the past (#871).
+/// offset intact — the humanize layer previously discarded the offset (and
+/// seconds) by minute-truncating or relativizing this top-level field, even
+/// though the underlying offset-to-UTC conversion used for the relative-time
+/// comparison itself was already correct (#871).
 #[tokio::test]
 async fn schedule_remind_agent_preserves_top_level_trigger_at_with_offset() -> anyhow::Result<()> {
     let client = connect_schedule_only().await?;
-    // Far enough in the future (relative to "now") that a naive/offset-blind
-    // parse landing inside the 24h relative-render window would have
-    // produced a bogus "Nh ago"/"in Nh" string instead of the exact ISO
-    // string being preserved.
+    // Far enough in the future (relative to "now") to land outside the 24h
+    // relative-render window, so pre-fix this would have been silently
+    // minute-truncated (dropping the seconds and the "-04:00" offset)
+    // instead of round-tripping the exact ISO string.
     let trigger_at = "2099-06-15T19:00:00-04:00";
 
     let result = call(
@@ -4018,11 +4024,14 @@ async fn schedule_remind_agent_preserves_top_level_trigger_at_with_offset() -> a
     Ok(())
 }
 
-/// UTC (`Z`) and offset-less `at` inputs must likewise round-trip unchanged
-/// through the create-response humanize layer (#871 regression coverage).
+/// A `Z`-suffixed UTC `at` input must likewise round-trip unchanged through
+/// the create-response humanize layer (#871 regression coverage). Bare
+/// offset-less input (no `Z`/`±HH:MM` suffix) is not a case here: it is
+/// rejected upstream as non-RFC-3339 by `schedule.remind`'s own validation
+/// (`crates/khive-pack-schedule/src/handlers.rs` `validate_at`), so it never
+/// reaches this presentation-layer fix.
 #[tokio::test]
-async fn schedule_remind_agent_preserves_top_level_trigger_at_utc_and_offset_less(
-) -> anyhow::Result<()> {
+async fn schedule_remind_agent_preserves_top_level_trigger_at_utc() -> anyhow::Result<()> {
     let client = connect_schedule_only().await?;
 
     let utc = "2099-06-15T23:00:00Z";

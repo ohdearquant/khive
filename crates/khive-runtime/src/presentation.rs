@@ -382,8 +382,9 @@ const LIFECYCLE_NULL_PRESERVE: &[&str] = &[
 /// `full_id`, not nested under `"properties"`. The `inside_properties` guard
 /// alone only protects fields nested under a literal `"properties"` key
 /// (as returned by `agenda`/`get`); it does not cover this top-level case,
-/// which was compacted into a relative string ("Nh ago") and could render a
-/// future trigger as if it were in the past (#871).
+/// which `compact_timestamp` rewrote into either a relative string or a
+/// minute-truncated absolute form — either way discarding the seconds and
+/// offset the caller needs to round-trip the exact submitted value (#871).
 const PAYLOAD_TIMESTAMP_FIELDS: &[&str] = &["trigger_at"];
 
 /// Score field names that are truncated to 3 significant figures in Agent mode.
@@ -838,9 +839,10 @@ mod tests {
         // `trigger_at` as a top-level convenience field (sibling to `id`,
         // `full_id`), not nested under `"properties"`. The pre-existing
         // `inside_properties` guard alone did not protect it, so Agent-mode
-        // compaction rewrote a real future ISO timestamp into a bogus
-        // relative string computed by misreading the wall-clock digits as
-        // UTC (e.g. rendering a time 2.5h in the future as "1h ago").
+        // compaction rewrote it: `at` here is far outside the 24h relative
+        // window, so pre-fix it would have been minute-truncated to
+        // "2026-07-11T19:00", discarding the seconds and the "-04:00"
+        // offset the caller needs to round-trip the exact value verbatim.
         let at = "2026-07-11T19:00:00-04:00";
         let v = json!({
             "id": "a1b2c3d4",
