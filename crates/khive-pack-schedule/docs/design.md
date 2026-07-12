@@ -22,7 +22,7 @@ not performed by this pack in process. Two supported execution modes exist:
 - Name: `schedule`
 - Note kinds: `["scheduled_event"]`
 - Entity kinds: `[]`
-- Requires: `["kg", "comm"]`
+- Requires: `["kg"]`; `schedule.remind` requires `comm.send` at creation time
 - Verbs: `schedule.remind`, `schedule.schedule`, `schedule.agenda`, `schedule.cancel`
 
 **Notes-as-scheduled-events.** A `scheduled_event` is a note stored with the
@@ -128,10 +128,10 @@ time when no observer is present.
 
 ### ADR-017: Pack Standard
 
-The pack self-registers via `inventory::submit!`. It declares
-`REQUIRES = ["kg", "comm"]`, ensuring the notes substrate and the
-`schedule.remind` inbox-delivery verb are both available before the schedule
-pack loads.
+The pack self-registers via `inventory::submit!`. It declares `REQUIRES = ["kg"]`,
+ensuring the notes substrate is available before the schedule pack loads.
+`schedule.remind` separately verifies that `comm.send` is registered before
+persisting a reminder; the other three schedule verbs do not require `comm`.
 
 ### ADR-025: Verb Speech Acts
 

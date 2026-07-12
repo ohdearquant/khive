@@ -193,7 +193,7 @@ kg:     REQUIRES []           → loads first
 gtd:    REQUIRES ["kg"]       → loads after kg
 memory: REQUIRES ["kg"]       → loads after kg
 brain:  REQUIRES ["memory"]   → loads after memory
-schedule: REQUIRES ["kg", "comm"] → loads after kg and comm
+schedule: REQUIRES ["kg"]     → loads after kg (remind checks comm.send per verb)
 ```
 
 `khive-fold` (ADR-024) and `khive-retrieval` (ADR-030) are foundation/runtime crates,

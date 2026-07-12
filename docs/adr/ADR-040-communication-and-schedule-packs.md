@@ -257,7 +257,7 @@ impl Pack for SchedulePack {
     ];
     // ADR-023 §4: pack-prefixed verb names — `schedule.remind` / `schedule.schedule` / `schedule.agenda` / `schedule.cancel`
     const EDGE_RULES:   &'static [EdgeEndpointRule] = &[];
-    const REQUIRES:     &'static [&'static str] = &["kg", "comm"];
+    const REQUIRES:     &'static [&'static str] = &["kg"];
 }
 ```
 
@@ -371,9 +371,10 @@ Both packs compose with the existing pack set:
 auto-transitions a task to active at the scheduled time. No coupling at the pack level —
 the interaction is at the `action` payload level.
 
-**Schedule + Comm**: `schedule` declares `comm` as a pack dependency because
-`schedule.remind` always delivers through `comm.send`. A scheduled message is a
-`scheduled_event` with
+**Schedule + Comm**: `schedule.remind` requires `comm.send` at creation time because
+reminders deliver through the comm inbox path. If that capability is not registered,
+the handler rejects the call before persisting a note; the rest of the schedule pack
+remains available. A scheduled message is a `scheduled_event` with
 `action="comm.send(to='agent:ops', content='weekly status update')"`. At trigger time the
 execution environment dispatches the `comm.send` verb.
 
@@ -397,22 +398,24 @@ inventory::submit!(Box::new(CommPack::default()) as Box<dyn Pack>);
 inventory::submit!(Box::new(SchedulePack::default()) as Box<dyn Pack>);
 ```
 
-`comm` declares `REQUIRES = ["kg"]`; `schedule` declares
-`REQUIRES = ["kg", "comm"]` so a reminder can never be accepted without its
-inbox-delivery verb. The ADR-017 boot-time dependency check enforces both requirements.
-Both use `default_backend = "main"` — no separate backend.
+Both packs declare `REQUIRES = ["kg"]`, and the ADR-017 boot-time dependency check
+enforces that shared substrate requirement. `schedule.remind` separately checks for
+the registered `comm.send` delivery capability at creation time and rejects before
+writing when it is absent. Both use `default_backend = "main"` — no separate backend.
 
 Loading is opt-in via `RuntimeConfig::packs`:
 
 ```bash
 KHIVE_PACKS=kg,comm          kkernel mcp   # communication only
-KHIVE_PACKS=kg,comm,schedule kkernel mcp   # scheduling + reminder delivery
+KHIVE_PACKS=kg,schedule      kkernel mcp   # scheduling without reminder creation
+KHIVE_PACKS=kg,comm,schedule kkernel mcp   # scheduling with reminder creation
 KHIVE_PACKS=kg,gtd,comm,schedule kkernel mcp   # full stack
 ```
 
 ADR-016's dynamic verb catalog reflects exactly what is loaded. Agents that do not load
-`schedule` see no `remind`/`schedule`/`agenda`/`cancel` verbs; loading `schedule`
-without `comm` is rejected at boot.
+`schedule` see no `remind`/`schedule`/`agenda`/`cancel` verbs. Loading `schedule`
+without `comm` leaves all four verbs registered, but `schedule.remind` rejects at creation
+before persistence until `comm.send` is available.
 
 ## Rationale
 

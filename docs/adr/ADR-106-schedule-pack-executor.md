@@ -791,8 +791,9 @@ one-shot becomes `fired`; a named repeat is re-armed), preventing an indefinitel
 retrying permanently broken delivery. A later successful occurrence clears stale
 `delivery_error` and `delivery_failed_at` properties.
 
-Because reminder delivery is part of the public `schedule.remind` contract, the
-schedule pack declares `REQUIRES = ["kg", "comm"]`. A pack selection that includes
-`schedule` without `comm` is rejected during boot, before a reminder can be persisted.
-The per-event failure behavior above therefore covers dispatch failures after a valid
-registry has loaded, not a permanently missing delivery verb.
+Because reminder delivery is part of the public `schedule.remind` contract, reminder
+creation checks that the registry provides `comm.send`. If it does not, the handler
+rejects the call before persisting a note. The schedule pack itself still declares only
+`REQUIRES = ["kg"]`, so `schedule.schedule`, `schedule.agenda`, and `schedule.cancel`
+remain available without `comm`. The per-event failure behavior above covers dispatch
+failures after a reminder has passed that creation-time capability check.

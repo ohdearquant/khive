@@ -24,7 +24,7 @@ impl Pack for SchedulePack {
     const NOTE_KINDS: &'static [&'static str] = &["scheduled_event"];
     const ENTITY_KINDS: &'static [&'static str] = &[];
     const HANDLERS: &'static [HandlerDef] = &SCHEDULE_HANDLERS;
-    const REQUIRES: &'static [&'static str] = &["kg", "comm"];
+    const REQUIRES: &'static [&'static str] = &["kg"];
 }
 
 impl SchedulePack {
@@ -93,7 +93,9 @@ impl PackRuntime for SchedulePack {
         token: &NamespaceToken,
     ) -> Result<Value, RuntimeError> {
         match verb {
-            "schedule.remind" => handlers::handle_remind(self.runtime(), token, params).await,
+            "schedule.remind" => {
+                handlers::handle_remind(self.runtime(), token, registry, params).await
+            }
             "schedule.schedule" => {
                 handlers::handle_schedule(self.runtime(), token, registry, params).await
             }

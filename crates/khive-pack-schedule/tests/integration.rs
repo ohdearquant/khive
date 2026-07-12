@@ -30,8 +30,8 @@ fn schedule_pack_declares_four_handlers() {
 }
 
 #[test]
-fn schedule_pack_requires_kg_and_comm() {
-    assert_eq!(SchedulePack::REQUIRES, &["kg", "comm"]);
+fn schedule_pack_requires_kg() {
+    assert_eq!(SchedulePack::REQUIRES, &["kg"]);
 }
 
 #[tokio::test]

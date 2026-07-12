@@ -437,7 +437,8 @@ async fn pack_gtd_without_kg_fails_at_boot() {
 }
 
 #[tokio::test]
-async fn pack_schedule_without_comm_fails_at_boot() {
+async fn pack_schedule_without_comm_rejects_only_remind_before_persisting() -> anyhow::Result<()> {
+    disable_daemon();
     let config = RuntimeConfig {
         db_path: None,
         default_namespace: Namespace::parse("test").unwrap(),
@@ -446,21 +447,53 @@ async fn pack_schedule_without_comm_fails_at_boot() {
         packs: vec!["kg".to_string(), "schedule".to_string()],
         ..RuntimeConfig::default()
     };
-    let runtime = KhiveRuntime::new(config).unwrap();
-    match KhiveMcpServer::new(runtime) {
-        Ok(_) => panic!("schedule without comm must fail at boot"),
-        Err(error) => {
-            let message = error.to_string();
-            assert!(
-                message.contains("schedule"),
-                "error must name the dependent pack: {message}"
-            );
-            assert!(
-                message.contains("comm"),
-                "error must name the missing dependency: {message}"
-            );
+    let runtime = KhiveRuntime::new(config).expect("kg+schedule runtime");
+    let server = KhiveMcpServer::new(runtime).expect("kg+schedule server builds without comm");
+    let (server_transport, client_transport) = tokio::io::duplex(65536);
+    tokio::spawn(async move {
+        if let Ok(svc) = server.serve(server_transport).await {
+            let _ = svc.waiting().await;
         }
-    }
+    });
+    let client = DummyClient.serve(client_transport).await?;
+
+    let result = call(
+        &client,
+        "request",
+        json!({
+            "ops": r#"schedule.remind(content="must not persist", at="2099-01-01T00:00:00Z")"#,
+            "presentation": "verbose"
+        }),
+    )
+    .await?;
+    let body: Value = serde_json::from_str(&first_text(&result))?;
+    let failed = &body["results"][0];
+    assert_eq!(failed["ok"], json!(false), "remind must fail: {failed}");
+    let error = failed["error"].as_str().unwrap_or_default();
+    assert!(
+        error.contains("comm.send") && error.contains("delivery"),
+        "error must name the missing comm delivery capability: {error}"
+    );
+
+    let notes = ok_one(&client, r#"list(kind="note")"#).await?;
+    assert_eq!(notes, json!([]), "failed remind must persist no note");
+    let empty_agenda = ok_one(&client, "schedule.agenda()").await?;
+    assert_eq!(empty_agenda["count"], json!(0));
+
+    let scheduled = ok_one(
+        &client,
+        r#"schedule.schedule(action="schedule.agenda()", at="2099-01-02T00:00:00Z")"#,
+    )
+    .await?;
+    let full_id = scheduled["full_id"]
+        .as_str()
+        .expect("schedule.schedule returns full_id");
+    let agenda = ok_one(&client, "schedule.agenda()").await?;
+    assert_eq!(agenda["count"], json!(1));
+    let cancelled = ok_one(&client, &format!(r#"schedule.cancel(id="{full_id}")"#)).await?;
+    assert_eq!(cancelled["status"], json!("cancelled"));
+
+    Ok(())
 }
 
 #[tokio::test]
