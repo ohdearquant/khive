@@ -11,8 +11,8 @@ categories.workspace = true
 description = "Workspace pack  -  pack-owned `workspace` entity kind with typed `contains` membership edges to issue/pull_request/commit/task/session records (issue #873)"
 
 [dependencies]
-khive-types = { version = "0.3.0", path = "../khive-types", features = ["serde"] }
-khive-runtime = { version = "0.3.0", path = "../khive-runtime" }
+khive-types = { version = "0.4.0", path = "../khive-types", features = ["serde"] }
+khive-runtime = { version = "0.4.0", path = "../khive-runtime" }
 inventory = { workspace = true }
 async-trait = { workspace = true }
 serde_json = { workspace = true }
@@ -20,7 +20,7 @@ uuid = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["full"] }
-khive-pack-kg = { version = "0.3.0", path = "../khive-pack-kg" }
-khive-pack-gtd = { version = "0.3.0", path = "../khive-pack-gtd" }
-khive-pack-git = { version = "0.3.0", path = "../khive-pack-git" }
-khive-pack-session = { version = "0.3.0", path = "../khive-pack-session" }
+khive-pack-kg = { version = "0.4.0", path = "../khive-pack-kg" }
+khive-pack-gtd = { version = "0.4.0", path = "../khive-pack-gtd" }
+khive-pack-git = { version = "0.4.0", path = "../khive-pack-git" }
+khive-pack-session = { version = "0.4.0", path = "../khive-pack-session" }

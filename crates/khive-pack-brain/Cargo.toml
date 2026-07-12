@@ -15,18 +15,18 @@ description = "Brain pack — profile-oriented orchestration via Fold + Objectiv
 bench = false
 
 [dependencies]
-khive-brain-core = { version = "0.3.0", path = "../khive-brain-core" }
-khive-types = { version = "0.3.0", path = "../khive-types", features = ["serde"] }
-khive-runtime = { version = "0.3.0", path = "../khive-runtime" }
-khive-fold = { version = "0.3.0", path = "../khive-fold" }
-khive-storage = { version = "0.3.0", path = "../khive-storage" }
+khive-brain-core = { version = "0.4.0", path = "../khive-brain-core" }
+khive-types = { version = "0.4.0", path = "../khive-types", features = ["serde"] }
+khive-runtime = { version = "0.4.0", path = "../khive-runtime" }
+khive-fold = { version = "0.4.0", path = "../khive-fold" }
+khive-storage = { version = "0.4.0", path = "../khive-storage" }
 # ADR-081 §2/§6 (codex round 2, findings 1+2): the fold gate needs the event
 # append on the SAME held `SqlWriter` transaction as the dedup claim + mass
 # fold, so it calls khive-db's transaction-enlisted `append_event_on_writer`
 # seam directly rather than going through the higher-level `EventStore`
 # trait (which always opens its own transaction). No cycle: khive-db does not
 # depend on this crate.
-khive-db = { version = "0.3.0", path = "../khive-db" }
+khive-db = { version = "0.4.0", path = "../khive-db" }
 inventory = { workspace = true }
 async-trait = { workspace = true }
 lattice-fann = { workspace = true, optional = true }
@@ -46,12 +46,12 @@ lattice-router = ["dep:lattice-fann"]
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
-khive-pack-kg = { version = "0.3.0", path = "../khive-pack-kg" }
+khive-pack-kg = { version = "0.4.0", path = "../khive-pack-kg" }
 # Dev-only: exercises the real memory.recall -> BrainPack dispatch-hook path
 # (issue #459 regression). khive-pack-memory already carries khive-pack-brain
 # as a dev-dependency for its own tests; Cargo permits cyclic dev-dependencies
 # since neither crate's normal (non-dev) dependency graph is affected.
-khive-pack-memory = { version = "0.3.0", path = "../khive-pack-memory" }
+khive-pack-memory = { version = "0.4.0", path = "../khive-pack-memory" }
 criterion = { workspace = true }
 tempfile = { workspace = true }
 serial_test = { workspace = true }
