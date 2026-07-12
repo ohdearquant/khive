@@ -3138,12 +3138,23 @@ fn parse_graph(data: &[u8], max_degree: usize, num_vectors: usize) -> Result<Vam
         let degree = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
         offset += 4;
 
+        if degree > num_vectors.saturating_sub(1) {
+            return Err(VamanaError::invalid_format(format!(
+                "node {_node} degree {degree} exceeds num_vectors-1"
+            )));
+        }
         if degree > max_degree && _node != medoid as usize {
             return Err(VamanaError::invalid_format(format!(
                 "node {_node} degree {degree} exceeds max_degree {max_degree}"
             )));
         }
-        if offset + degree * 4 > data.len() {
+        let neighbor_bytes = degree.checked_mul(4).ok_or_else(|| {
+            VamanaError::invalid_format("graph.bin neighbor byte length overflows".into())
+        })?;
+        let neighbors_end = offset.checked_add(neighbor_bytes).ok_or_else(|| {
+            VamanaError::invalid_format("graph.bin neighbor range overflows".into())
+        })?;
+        if neighbors_end > data.len() {
             return Err(VamanaError::invalid_format(
                 "graph.bin truncated at neighbors".into(),
             ));
@@ -4814,6 +4825,33 @@ mod tests {
             .copy_from_slice(&first_payload_offset);
         assert!(matches!(
             parse_portable_container(&overlap),
+            Err(VamanaError::InvalidFormat { .. })
+        ));
+    }
+
+    #[test]
+    fn portable_container_rejects_overlarge_medoid_degree() {
+        let config = VamanaConfig::with_dimensions(1)
+            .with_max_degree(1)
+            .with_search_list_size(1);
+        let index = VamanaIndex::build(&[1.0], config).unwrap();
+        let bytes = index.to_bytes(&[]).unwrap();
+        let segments = parse_portable_container(&bytes).unwrap();
+        let mut metadata = segments["metadata.bin"].to_vec();
+        let mut graph = segments["graph.bin"].to_vec();
+
+        graph[16..20].copy_from_slice(&u32::MAX.to_le_bytes());
+        metadata[40..72].copy_from_slice(blake3::hash(&graph).as_bytes());
+        let malformed = encode_portable_container(&[
+            ("metadata.bin", metadata),
+            ("vectors.bin", segments["vectors.bin"].to_vec()),
+            ("graph.bin", graph),
+            ("lifecycle.bin", segments["lifecycle.bin"].to_vec()),
+        ])
+        .unwrap();
+
+        assert!(matches!(
+            VamanaIndex::from_bytes(&malformed),
             Err(VamanaError::InvalidFormat { .. })
         ));
     }
