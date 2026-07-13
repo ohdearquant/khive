@@ -464,3 +464,157 @@ of the previous.
   (the existing per-dispatch audit row, the closed additive `EventKind` mechanism, the
   best-effort direct `append_event` emission contract) this design extends rather than
   duplicates.
+
+## Amendment 1 (2026-07-13): Batch-Scaled `cost_unit` and Daemon-Startup Warm-Hook Attribution
+
+**Status**: Proposed (amendment to ADR-103's Stage 1 design; not yet implemented)
+
+### Context
+
+Open Question 1 (resolved 2026-07-08, above) settled a narrower question: whether
+per-actor embedder CPU time is measurable. It is not, so `cost_unit` was already
+committed to being a deterministic op-class weight rather than a measured quantity. This
+amendment answers the question that resolution left open: given `cost_unit` is
+weight-based, where does the weight attach to an actor, and is the attachment as
+specified in Decision (b) and (c) correct. A 2026-07-13 spike traced every embedder call
+site to its caller and found two concrete gaps, both closed here without opening new
+design surface: the illustrative payload in Decision (b) implies one weight per verb
+dispatch, which undercounts batch- and fan-out-shaped verbs by orders of magnitude; and
+two daemon-startup warmup call sites run entirely outside any dispatch and are invisible
+on the event plane today, contrary to what Decision (c) already specifies for background
+phase work. Both gaps stay inside Stage 1 (accounting and observability); neither opens
+Stage 2 (scheduling) or Stage 3 (quota) scope.
+
+### Part 1: `cost_unit` scales with batch size and per-item model fan-out
+
+Decision (b)'s illustrative payload shows `cost_unit` as a single number per verb
+dispatch. That illustration undercounts two of the five embedding-bearing verb families,
+because they are not one-unit-of-work-per-dispatch: `knowledge.index` batches up to 1000
+items into one dispatch (`batch_size.clamp(1, 1000)`,
+`crates/khive-pack-knowledge/src/knowledge/index_handler.rs:35`), and `create` /
+`memory.remember` fan out one embed task per registered embedding model via
+`tokio::spawn` (`crates/khive-runtime/src/operations.rs:819` for entity creation, with
+the equivalent fan-out for note creation nearby). A flat per-verb weight would charge a
+1-item and a 1000-item `knowledge.index` call, or a single-model and an N-model `create`,
+identically.
+
+`cost_unit` is redefined as:
+
+```text
+cost_unit = base_weight(verb) + per_item_weight(verb) × item_count
+```
+
+`base_weight` and `per_item_weight` are deterministic, hand-set constants per verb class,
+fixed at implementation time and not measured, consistent with Decision (b)'s existing
+requirement that `cost_unit` stay deterministic and replayable, and with Open Question
+1's resolution that per-actor CPU is not attributable, so `cost_unit` was already the
+billing-safe fallback. `item_count` is read from the dispatch's own JSON result value,
+already in scope at the emission seam described below, not from a new counter:
+`result["total"]` for `knowledge.index`, array length for bulk `create` / `link`
+responses, and `1` for every singleton verb (the default when the response shape carries
+no count).
+
+The emission seam is unchanged from Decision (b): the existing deferred per-dispatch
+audit-row construction in `crates/khive-runtime/src/pack.rs`, the block spanning the
+measured `dispatch_us` (`:1205-1207`) through the Allow-outcome success arms that build
+the row (`:1217-1290`). `verb`, the gate-resolved actor and namespace, and the verb's own
+`result: &Value` are all already in scope there for every one of the six live
+embedding-bearing call sites (`create`, `update`, `memory.recall`,
+`knowledge.search`/`compose`, `knowledge.index`); no plumbing change reaches into
+`KhiveRuntime::embed*` itself.
+
+Payload shape (extends Decision (b)'s sketch; no new top-level fields):
+
+```jsonc
+// events.payload for the existing per-dispatch EventKind::Audit row
+// (AuditEvent, crates/khive-gate/src/audit.rs), gains an additive `resource` object:
+{
+  "resource": {
+    "work_class": "interactive",
+    "cost_unit": 340 // deterministic i64 = base_weight(verb) + per_item_weight(verb) * item_count
+  }
+}
+```
+
+`resource.cost_unit` remains a single `i64` field. The batch/fan-out signal is an input
+to the formula that computes it, not a separate persisted field. `AuditEvent`'s doc
+comment already states the compatibility contract this relies on: "the JSON projection
+of this struct is the public contract" and "field names are stable. Adding fields is
+non-breaking" (`crates/khive-gate/src/audit.rs:10-11`). `resource`, and `cost_unit`
+within it, is exactly this kind of additive field: no schema migration, no change to any
+existing field's meaning.
+
+Compatibility rule: an audit row with no `resource.cost_unit` field is a pre-amendment
+event, either written before a producer emitted this field, or produced by a dispatch
+outside the six-call-site emission scope, and never a zero-cost event. Consumers, including
+`brain.event_counts`'s already-implemented read path
+(`crates/khive-pack-brain/src/handlers.rs`), must treat absence as "not measured" and
+exclude the row from any `cost_unit` sum. A missing value is never inferred, defaulted to
+zero, or backfilled after the fact. This mirrors the absence-is-exclusion convention
+`counts_by_work_class` already applies to `work_class`: a row with no `work_class` is
+skipped, not counted into a default bucket.
+
+### Part 2: daemon-startup embedder warmups get phase-span events, attributed to the daemon principal
+
+`KgPack::warm()` (`crates/khive-pack-kg/src/dispatch.rs:55-57`) and
+`KnowledgePack::warm()` (`crates/khive-pack-knowledge/src/pack.rs:101-109`) each call the
+runtime's embedder once at daemon construction (or lazily on first pack install) to warm
+it. Both run through `PackRuntime::warm(&self)` (`crates/khive-runtime/src/pack.rs:232`),
+which takes no `NamespaceToken` argument, so neither call executes inside `dispatch()` or
+under the Gate. There is no actor in scope, no audit row is written (there is no dispatch
+to attach one to), and both embedder-warmup passes are currently invisible on the event
+plane entirely, the one concrete gap in Decision (c) as written, which already commits
+background phase work of this shape to the `PhaseStarted` / `PhaseCompleted`
+/ `PhaseCancelled` triple.
+
+Both hooks emit that existing triple, with `work_class: "warm"` (already a member of the
+closed enum in Decision (a); its "Covers" column already names "embedder warm"
+explicitly, so no enum amendment is required), `phase: "kg_embedder_warm"` for
+`KgPack::warm()`, and `phase: "knowledge_embedder_warm"` for `KnowledgePack::warm()`.
+`corpus_size` on the `PhaseStarted` payload is optional
+(`crates/khive-storage/src/telemetry.rs:112`) and has no meaningful value for an embedder
+warmup call (there is no corpus being counted, only a warm invocation); both hooks emit
+`None`.
+
+Attribution: since `warm()` receives no token, each hook mints its own the same way an
+existing precedent in this codebase already does. `khive-pack-memory`'s ANN
+background-rebuild task faces the identical shape of problem: it calls
+`ensure_ann_for_model` from a daemon-owned background loop with no caller-supplied
+token, and mints one via `rt.authorize(Namespace::local())`
+(`crates/khive-pack-memory/src/ann.rs:842`) before calling in.
+`KhiveRuntime::authorize` resolves the actor from `RuntimeConfig.actor_id`
+(`crates/khive-runtime/src/runtime.rs:441-442`): a configured deployment id when one is
+set, otherwise `ActorRef::anonymous()` (actor id `"local"`) as the documented fallback
+(`crates/khive-runtime/src/runtime.rs:437-440`). This is what "attributed to the daemon
+principal" means concretely: not a caller identity, since none exists at startup, but the
+same deployment-level actor every other unattributed daemon-internal event already
+resolves to. `KgPack::warm()` and `KnowledgePack::warm()` mint their token via
+`self.runtime.authorize(Namespace::local())` and use it to emit the
+`PhaseStarted`/`PhaseCompleted`/`PhaseCancelled` pair, mirroring the emission helper at
+`crates/khive-pack-memory/src/ann.rs:1079-1089` (`emit_ann_warm_phase_event`):
+best-effort, `EventStore` resolution failure or payload serialization failure is logged
+and swallowed, never propagated to fail the `warm()` call itself. This preserves
+`PackRuntime::warm`'s documented contract that overriders "must make it idempotent and
+infallible: any errors are logged internally, not propagated to the caller"
+(`crates/khive-runtime/src/pack.rs:230-231`).
+
+This is Stage 1 work: it extends Decision (c) with two additional emission sites, and
+requires no `work_class` enum amendment, no `EventKind` amendment, and no schema
+migration. It is a wiring gap in two `warm()` implementations, closed by reusing an
+already-proven mechanism, not new design surface.
+
+### Consequences
+
+- Positive: `cost_unit` becomes usable for Stage 3 quota accounting without a follow-up
+  correction once a flat-per-verb version ships and is found wrong at scale on
+  batch-shaped verbs. The two daemon-startup warmup passes join the rest of the daemon's
+  background work (ANN warm, checkpoint, channel poll) on the event plane instead of
+  remaining the one silent gap.
+- Negative: the deterministic weight table becomes two constants
+  (`base_weight`/`per_item_weight`) per embedding-bearing verb class instead of one; both
+  must be hand-set and documented at implementation time, under the same governance
+  Decision (b) already established for the single weight it replaces.
+- Neutral: this amendment does not change Decision (a)'s `work_class` enum, Decision
+  (d)'s quota mechanism, or Decision (e)'s contention signal. It narrows two Stage 1 gaps
+  identified by measurement rather than opening new design surface, and does not alter
+  the Staged Landing Plan's stage boundaries.
