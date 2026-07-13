@@ -31,9 +31,19 @@
 //! `KHIVE_GIT_DIGEST_CACHE_MAX_BYTES`, `KHIVE_GIT_DIGEST_CLONE_MAX_BYTES`,
 //! `KHIVE_GIT_DIGEST_SCRATCH_ROOT`) rather than a `[git]` TOML section --
 //! see the implementation report for why.
+//!
+//! `ensure_clone`/`refetch_clone`/`reclone` each check a slot's state (does
+//! it exist, does it pass `is_owned_entry`) and then mutate it based on that
+//! check. `slot_lock` (issue #805) holds a per-`cache_key` advisory lock for
+//! the full span of each of those functions, so two calls racing the same
+//! slot can never interleave their check-and-mutate sequences -- while calls
+//! against distinct keys never contend with each other, since each key gets
+//! its own lock entry.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
 use uuid::Uuid;
@@ -125,6 +135,34 @@ fn clone_max_bytes() -> u64 {
     env_u64("KHIVE_GIT_DIGEST_CLONE_MAX_BYTES", DEFAULT_CLONE_MAX_BYTES)
 }
 
+/// Per-cache-slot advisory locks, keyed by `cache_key` (issue #805): each of
+/// `ensure_clone`, `refetch_clone`, and `reclone` is a check-then-mutate
+/// sequence (does `is_owned_entry`/existence hold, act on the result), and
+/// nothing previously ordered two such sequences racing the *same* slot --
+/// `refetch_clone`'s own doc comment used to admit this. Holding this slot's
+/// lock for the full span of one of those functions serializes same-key
+/// mutation while leaving distinct keys free to run concurrently: each
+/// `cache_key` gets its own `Mutex` entry here, so locking one slot never
+/// blocks a caller operating on a different slot. Entries are never removed
+/// -- the map is bounded by the number of distinct repositories ever
+/// digested in this process's lifetime, which is small relative to the
+/// process's own memory footprint.
+static SLOT_LOCKS: std::sync::LazyLock<Mutex<HashMap<String, Arc<Mutex<()>>>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Get-or-create the advisory lock for cache slot `key`. Callers hold the
+/// returned lock for the entire check-and-mutate span of their operation on
+/// that slot (see `SLOT_LOCKS`).
+fn slot_lock(key: &str) -> Arc<Mutex<()>> {
+    let mut locks = SLOT_LOCKS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    locks
+        .entry(key.to_string())
+        .or_insert_with(|| Arc::new(Mutex::new(())))
+        .clone()
+}
+
 /// Ensure a local clone of `canonical_url` exists and is up to date; returns
 /// the repo's local path.
 ///
@@ -154,6 +192,8 @@ pub fn ensure_clone(canonical_url: &str) -> Result<PathBuf, CacheError> {
     let root = scratch_root();
     std::fs::create_dir_all(&root)?;
     let key = cache_key(canonical_url);
+    let lock = slot_lock(&key);
+    let _guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     let repo_dir = root.join(&key);
     let cap = clone_max_bytes();
 
@@ -163,10 +203,10 @@ pub fn ensure_clone(canonical_url: &str) -> Result<PathBuf, CacheError> {
         }
         fetch(&repo_dir)?;
         // `repo_dir` was just fetched into and its ownership already
-        // confirmed above; it vanishing here is a real problem (e.g. a
-        // racing, non-serialized `ensure_clone`/`reclone` on the same key --
-        // see `refetch_clone`'s doc comment), not a maybe-absent slot, so
-        // propagate rather than swallow.
+        // confirmed above; it vanishing here is a real problem (`slot_lock`
+        // excludes a concurrent `ensure_clone`/`refetch_clone`/`reclone` on
+        // this same key, so nothing else in this crate should be touching
+        // it), not a maybe-absent slot, so propagate rather than swallow.
         let size = dir_size(&repo_dir)?;
         if size > cap {
             remove_owned_entry(&root, &repo_dir)?;
@@ -191,10 +231,15 @@ pub fn ensure_clone(canonical_url: &str) -> Result<PathBuf, CacheError> {
 /// gap between `ensure_clone`'s own ownership check and this repair running
 /// -- project resolution and GitHub ingestion happen in between -- is wide
 /// enough for the slot to go markerless or be replaced, so this function
-/// cannot rely on the caller having checked recently.
+/// cannot rely on the caller having checked recently. Also holds this slot's
+/// `slot_lock` for its full check-and-mutate span (issue #805), so it cannot
+/// interleave with a concurrent `ensure_clone`/`refetch_clone`/`reclone` on
+/// the same `canonical_url`.
 pub(crate) fn refetch_clone(canonical_url: &str) -> Result<PathBuf, CacheError> {
     let root = scratch_root();
     let key = cache_key(canonical_url);
+    let lock = slot_lock(&key);
+    let _guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     let repo_dir = root.join(&key);
     if !repo_dir.join(".git").exists() {
         return Err(CacheError::Git(format!(
@@ -210,11 +255,14 @@ pub(crate) fn refetch_clone(canonical_url: &str) -> Result<PathBuf, CacheError> 
     // foreign directory colliding with the cache key -- in that interval.
     // Without this re-check, `fetch_refetch` below would mutate whatever
     // sits at `repo_dir` and `touch` would mark it owned, making it eligible
-    // for later deletion. There is no same-key serialization for cache
-    // mutation in this crate today (a concurrent `ensure_clone`/`reclone`
-    // racing this same slot is not otherwise excluded) -- this re-check
-    // narrows the adoption bug but does not close a true concurrent-writer
-    // race.
+    // for later deletion. `slot_lock` (issue #805) serializes this function
+    // against a concurrent `ensure_clone`/`refetch_clone`/`reclone` racing
+    // the same slot, but it does not close this particular gap: the lock is
+    // only held for this call's own span, not across the caller's earlier
+    // `ensure_clone` call (much earlier in `handle_digest`, released before
+    // project resolution and potentially lengthy GitHub ingestion run) --
+    // this re-check is what actually narrows that intra-request staleness
+    // window.
     if !is_owned_entry(&repo_dir) {
         return Err(CacheError::UnsafeToReplace(repo_dir));
     }
@@ -250,11 +298,15 @@ pub(crate) fn refetch_clone(canonical_url: &str) -> Result<PathBuf, CacheError> 
 /// prove itself an owned cache slot -- the same ownership guard `evict_lru`
 /// uses, so a `KHIVE_GIT_DIGEST_SCRATCH_ROOT` override pointed at a broader
 /// or pre-existing directory can never lose unrelated operator data here
-/// either.
+/// either. Also holds this slot's `slot_lock` for its full check-and-mutate
+/// span (issue #805), so it cannot interleave with a concurrent
+/// `ensure_clone`/`refetch_clone`/`reclone` on the same `canonical_url`.
 pub(crate) fn reclone(canonical_url: &str) -> Result<PathBuf, CacheError> {
     let root = scratch_root();
     std::fs::create_dir_all(&root)?;
     let key = cache_key(canonical_url);
+    let lock = slot_lock(&key);
+    let _guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     let repo_dir = root.join(&key);
     let cap = clone_max_bytes();
 
@@ -1337,6 +1389,91 @@ mod tests {
             real_owned.join("sentinel.txt").exists(),
             "the symlink target's sentinel data must survive a refused ensure_clone"
         );
+
+        std::env::remove_var("KHIVE_GIT_DIGEST_SCRATCH_ROOT");
+    }
+
+    // ── issue #805: same-key mutation serialization ────────────────────────
+
+    /// `slot_lock` must serialize a *repeated* lookup of the same cache key
+    /// (both calls return handles to the same underlying `Mutex`) while
+    /// leaving a distinct key completely unaffected -- the acceptance
+    /// criterion from issue #805 ("serialize per-key without serializing
+    /// distinct keys").
+    #[test]
+    fn slot_lock_serializes_same_key_but_not_distinct_keys() {
+        let key_a = "abcdef0123456789";
+        let key_b = "fedcba9876543210";
+
+        let lock_a1 = slot_lock(key_a);
+        let guard = lock_a1.lock().expect("lock key_a");
+
+        let lock_a2 = slot_lock(key_a);
+        assert!(
+            lock_a2.try_lock().is_err(),
+            "a second lookup of the same cache key must observe the first as held"
+        );
+
+        let lock_b = slot_lock(key_b);
+        assert!(
+            lock_b.try_lock().is_ok(),
+            "locking a distinct cache key must never be blocked by another key's held lock"
+        );
+
+        drop(guard);
+    }
+
+    /// The concrete regression issue #805 describes: before `slot_lock`,
+    /// concurrent `ensure_clone` calls for the same never-before-cached URL
+    /// could both observe an absent slot and both proceed to
+    /// `install_fresh_clone`, racing `std::fs::rename` onto the same
+    /// `<root>/<cache_key>/` path -- the loser's rename fails because the
+    /// winner already populated a non-empty directory there. With same-key
+    /// mutation serialized, the loser instead waits, observes the slot the
+    /// winner installed, and takes the existing-slot (`fetch`) path -- every
+    /// concurrent call succeeds and resolves to the same slot.
+    #[test]
+    fn concurrent_ensure_clone_on_same_key_never_races_the_slot() {
+        let _guard = ENV_MUTEX.blocking_lock();
+        let scratch = tempfile::tempdir().expect("tempdir");
+        std::env::set_var("KHIVE_GIT_DIGEST_SCRATCH_ROOT", scratch.path());
+
+        let origin_dir = tempfile::tempdir().expect("tempdir");
+        init_origin_with_one_commit(origin_dir.path());
+        let canonical = origin_dir.path().to_str().unwrap().to_string();
+
+        const CONCURRENCY: usize = 6;
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(CONCURRENCY));
+        let handles: Vec<_> = (0..CONCURRENCY)
+            .map(|_| {
+                let canonical = canonical.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    ensure_clone(&canonical)
+                })
+            })
+            .collect();
+
+        let results: Vec<_> = handles
+            .into_iter()
+            .map(|h| h.join().expect("ensure_clone thread panicked"))
+            .collect();
+
+        for result in &results {
+            assert!(
+                result.is_ok(),
+                "concurrent ensure_clone calls on the same key must never race the slot: {result:?}"
+            );
+        }
+        let first = results[0].as_ref().unwrap();
+        for result in &results[1..] {
+            assert_eq!(
+                result.as_ref().unwrap(),
+                first,
+                "every concurrent call must resolve to the same cache slot"
+            );
+        }
 
         std::env::remove_var("KHIVE_GIT_DIGEST_SCRATCH_ROOT");
     }
