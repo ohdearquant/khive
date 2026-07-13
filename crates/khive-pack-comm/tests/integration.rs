@@ -2737,7 +2737,11 @@ async fn t5b_reply_always_writes_same_namespace() {
     let send_val = registry_local
         .dispatch(
             "comm.send",
-            serde_json::json!({ "to": "lambda:khive", "content": "hello for reply" }),
+            serde_json::json!({
+                "to": "lambda:khive",
+                "content": "hello for reply",
+                "self_send": true,
+            }),
         )
         .await
         .expect("T5b: initial send must succeed");
@@ -3904,7 +3908,11 @@ async fn i199_anonymous_inbox_cannot_read_messages_addressed_to_other_actor() {
     registry_b
         .dispatch(
             "comm.send",
-            serde_json::json!({ "to": "lambda:b", "content": "secret for B only" }),
+            serde_json::json!({
+                "to": "lambda:b",
+                "content": "secret for B only",
+                "self_send": true,
+            }),
         )
         .await
         .expect("B sends to itself");
@@ -6369,6 +6377,7 @@ async fn t495_send_tags_present_on_outbound_copy() {
                 "to": "lambda:a",
                 "content": "self-tagged",
                 "tags": ["job:42"],
+                "self_send": true,
             }),
         )
         .await
