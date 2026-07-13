@@ -302,6 +302,9 @@ impl KhiveRuntime {
     /// runs on a single pool connection inside one `BEGIN IMMEDIATE` transaction via
     /// `merge_entity_sql`. If embedding vectors are configured, the vector re-insert for
     /// `into_id` is performed after the transaction (requires async embedding computation).
+    // REASON: these arguments mirror the merge verb's policy, content strategy,
+    // dry-run, and audit-reason fields; a builder would only move that surface.
+    #[allow(clippy::too_many_arguments)]
     pub async fn merge_entity(
         &self,
         token: &NamespaceToken,
@@ -690,6 +693,9 @@ impl KhiveRuntime {
     ///
     /// If `dry_run` is true, computes and returns the planned summary without mutating
     /// any rows, edges, or indexes.
+    // REASON: these arguments mirror the merge verb's policy, content strategy,
+    // dry-run, and audit-reason fields; a builder would only move that surface.
+    #[allow(clippy::too_many_arguments)]
     pub async fn merge_note(
         &self,
         token: &NamespaceToken,
@@ -2770,8 +2776,10 @@ mod tests {
         let with_reason = events
             .items
             .iter()
-            .find(|e| e.payload.get("from_id").and_then(|v| v.as_str())
-                == Some(from_a.id.to_string()).as_deref())
+            .find(|e| {
+                e.payload.get("from_id").and_then(|v| v.as_str())
+                    == Some(from_a.id.to_string()).as_deref()
+            })
             .expect("event for the reasoned merge must exist");
         assert_eq!(
             with_reason.payload.get("reason").and_then(|v| v.as_str()),
@@ -2782,8 +2790,10 @@ mod tests {
         let without_reason = events
             .items
             .iter()
-            .find(|e| e.payload.get("from_id").and_then(|v| v.as_str())
-                == Some(from_b.id.to_string()).as_deref())
+            .find(|e| {
+                e.payload.get("from_id").and_then(|v| v.as_str())
+                    == Some(from_b.id.to_string()).as_deref()
+            })
             .expect("event for the reasonless merge must exist");
         assert!(
             without_reason.payload.get("reason").is_none(),
