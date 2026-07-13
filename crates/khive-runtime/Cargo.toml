@@ -15,14 +15,14 @@ description = "Composable Service API: entity/note CRUD, graph traversal, hybrid
 fault-injection = []
 
 [dependencies]
-khive-types = { version = "0.4.0", path = "../khive-types", features = ["serde"] }
-khive-storage = { version = "0.4.0", path = "../khive-storage" }
-khive-score = { version = "0.4.0", path = "../khive-score" }
-khive-fusion = { version = "0.4.0", path = "../khive-fusion" }
-khive-fold = { version = "0.4.0", path = "../khive-fold" }
-khive-db = { version = "0.4.0", path = "../khive-db", features = ["vectors"] }
-khive-query = { version = "0.4.0", path = "../khive-query" }
-khive-gate = { version = "0.4.0", path = "../khive-gate" }
+khive-types = { version = "0.5.0", path = "../khive-types", features = ["serde"] }
+khive-storage = { version = "0.5.0", path = "../khive-storage" }
+khive-score = { version = "0.5.0", path = "../khive-score" }
+khive-fusion = { version = "0.5.0", path = "../khive-fusion" }
+khive-fold = { version = "0.5.0", path = "../khive-fold" }
+khive-db = { version = "0.5.0", path = "../khive-db", features = ["vectors"] }
+khive-query = { version = "0.5.0", path = "../khive-query" }
+khive-gate = { version = "0.5.0", path = "../khive-gate" }
 inventory = { workspace = true }
 tokio = { workspace = true }
 async-trait = { workspace = true }
@@ -40,7 +40,7 @@ libc = { workspace = true }
 anyhow = { workspace = true }
 
 [dev-dependencies]
-khive-gate-rego = { version = "0.4.0", path = "../khive-gate-rego" }
+khive-gate-rego = { version = "0.5.0", path = "../khive-gate-rego" }
 tokio = { workspace = true, features = ["test-util"] }
 tempfile = { workspace = true }
 tracing-subscriber = { workspace = true }
