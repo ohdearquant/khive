@@ -5958,6 +5958,7 @@ mod event_counts_tests {
         assert_eq!(result["total"], json!(0));
         assert_eq!(result["counts_by_kind"], json!({}));
         assert_eq!(result["counts_by_actor"], json!({}));
+        assert_eq!(result["counts_by_verb"], json!({}));
         assert!(
             result.get("by_profile").is_none(),
             "by_profile must be omitted when no feedback events are in the window: {result}"
@@ -6052,6 +6053,136 @@ mod event_counts_tests {
         assert_eq!(result["total"], json!(1));
         assert_eq!(result["counts_by_actor"]["lambda:b"], json!(1));
         assert!(result["counts_by_actor"].get("lambda:a").is_none());
+    }
+
+    /// #943: stored actor strings are prefixed (`actor:<kind>:<id>`), but the
+    /// verb's own param doc example is the bare seat form (`"lambda:khive"`).
+    /// The bare form must match the prefixed stored form, and the prefixed
+    /// form must keep matching exactly as before.
+    #[tokio::test]
+    async fn actor_filter_matches_bare_and_prefixed_spelling() {
+        let (pack, rt) = make_pack();
+        let registry = empty_registry();
+        let token = rt.authorize(Namespace::local()).unwrap();
+
+        seed_event(
+            &rt,
+            &token,
+            "search",
+            EventKind::SearchExecuted,
+            "actor:lambda:atlas",
+            1_000_000,
+            json!({}),
+        )
+        .await;
+        seed_event(
+            &rt,
+            &token,
+            "search",
+            EventKind::SearchExecuted,
+            "actor:lambda:khive",
+            1_000_000,
+            json!({}),
+        )
+        .await;
+
+        // Bare seat spelling must match the prefixed stored form.
+        let bare = pack
+            .dispatch(
+                "brain.event_counts",
+                json!({
+                    "since": micros_to_iso(0),
+                    "actor": "lambda:atlas",
+                }),
+                &registry,
+                &token,
+            )
+            .await
+            .expect("brain.event_counts must succeed");
+        assert_eq!(
+            bare["total"],
+            json!(1),
+            "bare seat spelling must match the actor:-prefixed stored form: {bare}"
+        );
+        assert_eq!(bare["counts_by_actor"]["actor:lambda:atlas"], json!(1));
+        assert!(bare["counts_by_actor"].get("actor:lambda:khive").is_none());
+
+        // Already-prefixed spelling must keep matching exactly (no false widening).
+        let prefixed = pack
+            .dispatch(
+                "brain.event_counts",
+                json!({
+                    "since": micros_to_iso(0),
+                    "actor": "actor:lambda:khive",
+                }),
+                &registry,
+                &token,
+            )
+            .await
+            .expect("brain.event_counts must succeed");
+        assert_eq!(
+            prefixed["total"],
+            json!(1),
+            "already-prefixed actor spelling must keep exact-match behavior: {prefixed}"
+        );
+        assert_eq!(prefixed["counts_by_actor"]["actor:lambda:khive"], json!(1));
+        assert!(prefixed["counts_by_actor"]
+            .get("actor:lambda:atlas")
+            .is_none());
+    }
+
+    /// #943: `counts_by_verb` aggregates `event.verb` over the page with the
+    /// same truncation semantics as `counts_by_kind`/`counts_by_actor`.
+    #[tokio::test]
+    async fn counts_by_verb_aggregates_per_verb() {
+        let (pack, rt) = make_pack();
+        let registry = empty_registry();
+        let token = rt.authorize(Namespace::local()).unwrap();
+
+        seed_event(
+            &rt,
+            &token,
+            "search",
+            EventKind::SearchExecuted,
+            "lambda:a",
+            1_000_000,
+            json!({}),
+        )
+        .await;
+        seed_event(
+            &rt,
+            &token,
+            "search",
+            EventKind::SearchExecuted,
+            "lambda:a",
+            1_000_000,
+            json!({}),
+        )
+        .await;
+        seed_event(
+            &rt,
+            &token,
+            "recall",
+            EventKind::RecallExecuted,
+            "lambda:a",
+            1_000_000,
+            json!({}),
+        )
+        .await;
+
+        let result = pack
+            .dispatch(
+                "brain.event_counts",
+                json!({"since": micros_to_iso(0)}),
+                &registry,
+                &token,
+            )
+            .await
+            .expect("brain.event_counts must succeed");
+
+        assert_eq!(result["total"], json!(3));
+        assert_eq!(result["counts_by_verb"]["search"], json!(2));
+        assert_eq!(result["counts_by_verb"]["recall"], json!(1));
     }
 
     #[tokio::test]

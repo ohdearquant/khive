@@ -687,19 +687,20 @@ caller. Optional; load with `KHIVE_PACKS=kg,brain`.
 
 ### `brain.event_counts` — Assertive
 
-Windowed event counts grouped by kind and actor over the event plane (ADR-103 Stage 1,
-#724 Ask A). `feedback_explicit` events are additionally split by `served_by_profile_id`.
-Events carrying a `work_class` (today: `phase_started`/`phase_completed`/`phase_cancelled`
-payloads) split by `counts_by_work_class`. `cost_unit` is not surfaced: it does not exist
-on any event payload yet (ADR-103 Stage 0 is design-only) and will be added once a
-resource payload carries it.
+Windowed event counts grouped by kind, actor, and verb over the event plane (ADR-103
+Stage 1, #724 Ask A). `feedback_explicit` events are additionally split by
+`served_by_profile_id`. Events carrying a `work_class` (today:
+`phase_started`/`phase_completed`/`phase_cancelled` payloads) split by
+`counts_by_work_class`. `cost_unit` is not surfaced: it does not exist on any event
+payload yet (ADR-103 Stage 0 is design-only) and will be added once a resource payload
+carries it.
 
-| Param   | Type   | Required | Notes                                                                  |
-| ------- | ------ | -------- | ---------------------------------------------------------------------- |
-| `since` | string | yes      | Window start, ISO-8601/RFC-3339 datetime. Inclusive.                   |
-| `until` | string | no       | Window end, ISO-8601/RFC-3339 datetime. Exclusive. Defaults to now.    |
-| `actor` | string | no       | Filter to a single actor. Omit for all actors.                         |
-| `kind`  | string | no       | Filter to a single EventKind (e.g. `"recall_executed"`). Omit for all. |
+| Param   | Type   | Required | Notes                                                                                                                                                       |
+| ------- | ------ | -------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `since` | string | yes      | Window start, ISO-8601/RFC-3339 datetime. Inclusive.                                                                                                        |
+| `until` | string | no       | Window end, ISO-8601/RFC-3339 datetime. Exclusive. Defaults to now.                                                                                         |
+| `actor` | string | no       | Filter to a single actor. Stored actor strings are prefixed (`actor:lambda:khive`); bare (`lambda:khive`) or prefixed form both match. Omit for all actors. |
+| `kind`  | string | no       | Filter to a single EventKind (e.g. `"recall_executed"`). Omit for all.                                                                                      |
 
 ```
 request(ops="brain.event_counts(since=\"2026-07-01T00:00:00Z\")")
