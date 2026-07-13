@@ -924,7 +924,7 @@ mod note_mutation_hook_tests {
     /// pattern. Also returns the `MemoryPack`'s `SharedAnn` handle (cloned
     /// before the pack is moved into the builder) so tests can assert
     /// `ann::is_current` directly.
-    fn fr1_build_registry(rt: &KhiveRuntime) -> (khive_runtime::VerbRegistry, SharedAnn) {
+    fn build_note_hook_registry(rt: &KhiveRuntime) -> (khive_runtime::VerbRegistry, SharedAnn) {
         let mut builder = VerbRegistryBuilder::new();
         builder.register(KgPack::new(rt.clone()));
         let memory_pack = MemoryPack::new(rt.clone());
@@ -935,7 +935,7 @@ mod note_mutation_hook_tests {
         (registry, ann)
     }
 
-    fn fr1_key() -> ann::AnnKey {
+    fn mutation_hook_ann_key() -> ann::AnnKey {
         ann::AnnKey::new("local", FR1_MODEL)
     }
 
@@ -945,7 +945,7 @@ mod note_mutation_hook_tests {
     /// single recall is enough to guarantee the index is installed. Returns
     /// the seeded note's id and asserts the cache is current before the
     /// caller's mutation under test.
-    async fn fr1_seed_and_warm(
+    async fn seed_and_warm_ann(
         rt: &KhiveRuntime,
         registry: &khive_runtime::VerbRegistry,
         ann: &SharedAnn,
@@ -982,7 +982,7 @@ mod note_mutation_hook_tests {
             .expect("warm recall");
 
         assert!(
-            ann::is_current(ann, &fr1_key()).await,
+            ann::is_current(ann, &mutation_hook_ann_key()).await,
             "sanity: warm-up recall must leave the ANN cache current before \
              the mutation under test"
         );
@@ -991,11 +991,11 @@ mod note_mutation_hook_tests {
 
     #[tokio::test]
     #[serial(background_tasks)]
-    async fn fr1_prune_invalidates_warm_ann_without_subsequent_remember() {
+    async fn prune_invalidates_warm_ann_without_subsequent_remember() {
         let rt = KhiveRuntime::memory().expect("in-memory runtime");
-        let (registry, ann) = fr1_build_registry(&rt);
+        let (registry, ann) = build_note_hook_registry(&rt);
 
-        fr1_seed_and_warm(&rt, &registry, &ann, "fr1 prune target content", 0.9).await;
+        seed_and_warm_ann(&rt, &registry, &ann, "fr1 prune target content", 0.9).await;
 
         // `min_salience: 1.0` is strictly above the seeded note's 0.9
         // salience, so it is the one candidate. No `memory.remember` call
@@ -1013,7 +1013,7 @@ mod note_mutation_hook_tests {
         );
 
         assert!(
-            !ann::is_current(&ann, &fr1_key()).await,
+            !ann::is_current(&ann, &mutation_hook_ann_key()).await,
             "memory.prune deleting a candidate must invalidate the warm ANN \
              generation for affected models (#750)"
         );
@@ -1021,11 +1021,11 @@ mod note_mutation_hook_tests {
 
     #[tokio::test]
     #[serial(background_tasks)]
-    async fn fr1_kg_update_reindex_invalidates_warm_ann_without_subsequent_remember() {
+    async fn kg_update_reindex_invalidates_warm_ann_without_subsequent_remember() {
         let rt = KhiveRuntime::memory().expect("in-memory runtime");
-        let (registry, ann) = fr1_build_registry(&rt);
+        let (registry, ann) = build_note_hook_registry(&rt);
 
-        let id = fr1_seed_and_warm(&rt, &registry, &ann, "fr1 update target content", 0.7).await;
+        let id = seed_and_warm_ann(&rt, &registry, &ann, "fr1 update target content", 0.7).await;
 
         // KG's generic `update` verb — NOT `memory.remember` — changes the
         // note's content. Same call shape `khive-pack-kg/src/handlers/
@@ -1040,7 +1040,7 @@ mod note_mutation_hook_tests {
             .expect("kg update on memory-kind note");
 
         assert!(
-            !ann::is_current(&ann, &fr1_key()).await,
+            !ann::is_current(&ann, &mutation_hook_ann_key()).await,
             "a KG `update` that changes a memory-kind note's content must \
              invalidate the warm ANN generation (#750)"
         );
@@ -1048,11 +1048,11 @@ mod note_mutation_hook_tests {
 
     #[tokio::test]
     #[serial(background_tasks)]
-    async fn fr1_kg_delete_invalidates_warm_ann_without_subsequent_remember() {
+    async fn kg_delete_invalidates_warm_ann_without_subsequent_remember() {
         let rt = KhiveRuntime::memory().expect("in-memory runtime");
-        let (registry, ann) = fr1_build_registry(&rt);
+        let (registry, ann) = build_note_hook_registry(&rt);
 
-        let id = fr1_seed_and_warm(&rt, &registry, &ann, "fr1 delete target content", 0.7).await;
+        let id = seed_and_warm_ann(&rt, &registry, &ann, "fr1 delete target content", 0.7).await;
 
         // KG's generic `delete` verb (soft delete by default) — NOT any
         // memory-pack verb.
@@ -1067,7 +1067,7 @@ mod note_mutation_hook_tests {
         );
 
         assert!(
-            !ann::is_current(&ann, &fr1_key()).await,
+            !ann::is_current(&ann, &mutation_hook_ann_key()).await,
             "a KG `delete` on a memory-kind note must invalidate the warm \
              ANN generation (#750)"
         );
@@ -1080,7 +1080,7 @@ mod note_mutation_hook_tests {
     /// above.
     ///
     /// Both notes are seeded and the cache is warmed only ONCE, AFTER both
-    /// exist — NOT via `fr1_seed_and_warm` for the first note followed by a
+    /// exist — NOT via `seed_and_warm_ann` for the first note followed by a
     /// second `memory.remember` for the second, because `memory.remember`'s
     /// own handler already calls `ann::bump_generation` on every create
     /// (`handlers/remember.rs`). Warming before the second note existed
@@ -1091,9 +1091,9 @@ mod note_mutation_hook_tests {
     /// call commented out).
     #[tokio::test]
     #[serial(background_tasks)]
-    async fn fr2_kg_merge_invalidates_warm_ann_without_subsequent_remember() {
+    async fn kg_merge_invalidates_warm_ann_without_subsequent_remember() {
         let rt = KhiveRuntime::memory().expect("in-memory runtime");
-        let (registry, ann) = fr1_build_registry(&rt);
+        let (registry, ann) = build_note_hook_registry(&rt);
 
         rt.register_embedder(Fr1FixedVecProvider {
             model_name: FR1_MODEL.to_string(),
@@ -1143,9 +1143,9 @@ mod note_mutation_hook_tests {
         // single-flight `warming` guard for this key to clear before
         // trusting `is_current` — the guard is only released once every
         // in-flight rebuild for this key has actually finished.
-        ann::wait_until_warm_idle(&ann, &fr1_key()).await;
+        ann::wait_until_warm_idle(&ann, &mutation_hook_ann_key()).await;
         assert!(
-            ann::is_current(&ann, &fr1_key()).await,
+            ann::is_current(&ann, &mutation_hook_ann_key()).await,
             "sanity: warm-up recall must leave the ANN cache current before \
              the merge under test"
         );
@@ -1163,7 +1163,7 @@ mod note_mutation_hook_tests {
             .expect("kg merge on memory-kind notes");
 
         assert!(
-            !ann::is_current(&ann, &fr1_key()).await,
+            !ann::is_current(&ann, &mutation_hook_ann_key()).await,
             "a KG `merge` of two memory-kind notes must invalidate the warm \
              ANN generation (#750)"
         );

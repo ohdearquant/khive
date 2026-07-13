@@ -1325,7 +1325,7 @@ async fn schedule_schedule_rejects_entity_type_under_resource_kind_bulk() {
 /// instead of silently reproducing a false-rejection bug like the one
 /// found before.
 #[tokio::test]
-async fn gap1_every_real_registry_subtype_is_accepted_by_schedule() {
+async fn schedule_accepts_every_registered_entity_subtype() {
     use khive_pack_kg::EntityTypeRegistry;
     use khive_types::EntityKind;
 

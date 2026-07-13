@@ -2623,7 +2623,7 @@ mod tests {
     // they block near a trigger word.
 
     #[test]
-    fn blocks_file_path_near_secret_word_accepted_fp_round4() {
+    fn blocks_high_entropy_file_path_near_secret_word() {
         // Full-token entropy 4.5994 > ENTROPY_THRESHOLD (4.5).
         let content =
             "workspace path fable-ops/ADR-DRAFT-adr079-slices234.md for the secret gate bug";
@@ -2636,7 +2636,7 @@ mod tests {
     }
 
     #[test]
-    fn blocks_workspace_path_near_key_word_accepted_fp_round4() {
+    fn blocks_high_entropy_workspace_path_near_key_word() {
         // Full-token entropy 4.7938 > 4.5.
         let content = "key: see internal/workspaces/20260701/adr079-slices234/PACKET.md";
         assert!(
@@ -2648,7 +2648,7 @@ mod tests {
     }
 
     #[test]
-    fn blocks_short_run_path_near_auth_word_accepted_fp_round4() {
+    fn blocks_high_entropy_short_run_path_near_auth_word() {
         // Full-token entropy 4.5955 > 4.5.
         let content =
             "auth work saved at internal/workspaces/20260701/cloud-rebuild/R1-repo-audit.md";
@@ -2854,7 +2854,7 @@ mod tests {
     }
 
     #[test]
-    fn blocks_round1_bypass_strings_still_without_extension() {
+    fn blocks_unsuffixed_separator_split_credential_bypasses() {
         let cases = [
             "secret_access_key abcdefghij/klmnopqrst/uvwxyzabcd/efghijk",
             "token=zxkqwmvbpl/trfhysjgnc/dweiaoutkz-mnbvcxzlk",
@@ -2884,7 +2884,7 @@ mod tests {
     }
 
     #[test]
-    fn blocks_round3_padding_run_bypass_attempts() {
+    fn blocks_low_entropy_padding_run_bypass_attempts() {
         // A low-entropy padding run (`aaaa`) inserted before short/digit-shaped
         // runs would drag any AVERAGE per-run entropy signal below its
         // threshold. With the exemption dropped entirely, these must be
@@ -2982,7 +2982,7 @@ mod tests {
     }
 
     #[test]
-    fn accepted_false_positive_r1_repo_audit_path_near_trigger() {
+    fn blocks_high_entropy_repo_audit_path_near_api_key() {
         // Same tradeoff as above: full-token entropy 4.5955 > 4.5.
         let content =
             "api_key handling in internal/workspaces/20260701/cloud-rebuild/R1-repo-audit.md";
@@ -3052,7 +3052,7 @@ mod tests {
     }
 
     #[test]
-    fn allows_internal_area_id_uuid_near_auth_substring_round5() {
+    fn allows_area_id_uuid_near_authorized_substring() {
         // An internal task `area_id` UUID field sitting within the trigger
         // window of the SUBSTRING "auth" inside
         // `authorized_write_requires_dominance` is not a genuine mention of
@@ -3412,7 +3412,7 @@ mod tests {
     }
 
     #[test]
-    fn blocks_standalone_auth_and_key_words_unchanged_by_round5() {
+    fn blocks_opaque_tokens_near_standalone_trigger_words() {
         // Word-boundary matching only removes SUBSTRING collisions; a genuine
         // standalone trigger word must still dominate exactly as before.
         let opaque = "Xk9mZ2vQpLrT8nJwYuAeHfBsDcGiONvMabcdef"; // gitleaks:allow
@@ -3432,7 +3432,7 @@ mod tests {
     }
 
     #[test]
-    fn accepted_false_positive_workspace_artifact_path_near_standalone_secret_round5() {
+    fn blocks_workspace_artifact_path_near_standalone_secret() {
         // A dot-prefixed root + date segment + hyphenated topic dir +
         // SCREAMING_SNAKE filename, discussed in prose that genuinely (not by
         // substring collision) mentions "secret". `secret` here is a real
@@ -3451,7 +3451,7 @@ mod tests {
     }
 
     #[test]
-    fn accepted_false_positive_archive_doc_path_near_standalone_secret_round5() {
+    fn blocks_archive_doc_path_near_standalone_secret() {
         // An archive-style doc path discussed near a genuine standalone
         // "secret" mention.
         let content =
@@ -3465,7 +3465,7 @@ mod tests {
     }
 
     #[test]
-    fn accepted_false_positive_absolute_path_near_standalone_auth_round5() {
+    fn blocks_absolute_path_near_standalone_auth() {
         // An absolute path written as one unbroken token, with the
         // surrounding message genuinely (not via substring collision)
         // discussing "auth".
@@ -3497,7 +3497,7 @@ mod tests {
     }
 
     #[test]
-    fn blocks_secret_access_key_bypass_compound_entry_unaffected_by_round5() {
+    fn blocks_separator_split_secret_access_key_compound() {
         // Adversarial negative: a separator-split bypass shape must still be
         // blocked. The `secret` and `key` entries both match because underscore
         // is a boundary for bare `TRIGGER_WORDS`. This asserts the end-to-end
@@ -3527,7 +3527,7 @@ mod tests {
     // rule (the `tokenizer`/`next_token`/`token_count` exemption) unchanged.
 
     #[test]
-    fn blocks_django_style_secret_key_assignment_round5b() {
+    fn blocks_secret_key_assignment_when_underscore_bounds_trigger() {
         // `SECRET_KEY=<value>` must block via the plain-substring `secret`
         // trigger even though `secret` is followed by `_` rather than a
         // non-word-char boundary.
@@ -3541,7 +3541,7 @@ mod tests {
     }
 
     #[test]
-    fn blocks_auth_token_assignment_round5b() {
+    fn blocks_auth_token_assignment_when_underscore_bounds_trigger() {
         let opaque = "Xk9mZ2vQpLrT8nJwYuAeHfBsDcGiONvMabcdef"; // gitleaks:allow
         let content = format!("auth_token={opaque}");
         assert!(
@@ -3552,7 +3552,7 @@ mod tests {
     }
 
     #[test]
-    fn blocks_session_secret_and_signing_key_compounds_round5b() {
+    fn blocks_underscore_joined_session_secret_and_signing_key_compounds() {
         let opaque = "Xk9mZ2vQpLrT8nJwYuAeHfBsDcGiONvMabcdef"; // gitleaks:allow
         let cases = [
             format!("session_secret_{opaque}"),
@@ -3569,7 +3569,7 @@ mod tests {
     }
 
     #[test]
-    fn allows_authorized_authentication_keyword_prose_unaffected_by_round5b() {
+    fn allows_letter_joined_trigger_substrings_in_benign_prose() {
         // The letter-joined substring-collision exemption must survive the
         // underscore-as-boundary change, since that change only affects the
         // underscore character, not letter-joined words.
