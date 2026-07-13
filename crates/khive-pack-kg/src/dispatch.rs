@@ -56,21 +56,35 @@ impl PackRuntime for KgPack {
         let _ = self.runtime.embed("khive warmup").await;
     }
 
-    fn register_entity_type_validator(&self, _runtime: &KhiveRuntime) {
+    fn register_entity_type_validator(
+        &self,
+        _runtime: &KhiveRuntime,
+        pack_entity_types: &[khive_types::EntityTypeDef],
+    ) {
         // Install the validator on the runtime this pack OWNS, not on the
         // caller-supplied runtime.  In a multi-backend deployment the pack
         // is constructed with a per-pack runtime (see PackRegistry::
         // register_packs_with_runtimes); `self.runtime` is that runtime.
         // In a single-backend deployment `self.runtime` IS the single
         // runtime, so behaviour is identical to the previous call-through.
-        let validator: EntityTypeValidatorFn = Arc::new(|kind, entity_type| {
+        //
+        // Composed once from every loaded pack's `ENTITY_TYPES`
+        // (`VerbRegistry::all_entity_types`, threaded in by
+        // `call_register_entity_type_validators`) layered over the builtin
+        // registry, so pack-declared subtypes (e.g. git's `adr` Document
+        // subtype) validate here in addition to `EntityTypeRegistry::global()`'s
+        // builtin-only set.
+        let composed = Arc::new(crate::entity_type_registry::EntityTypeRegistry::with_extra(
+            pack_entity_types.iter().cloned(),
+        ));
+        let validator: EntityTypeValidatorFn = Arc::new(move |kind, entity_type| {
             let Some(raw) = entity_type else {
                 return Ok(None);
             };
             let ek: khive_types::EntityKind = kind
                 .parse()
                 .map_err(|_| RuntimeError::InvalidInput(format!("unknown entity kind {kind:?}")))?;
-            let resolved = crate::entity_type_registry::EntityTypeRegistry::global()
+            let resolved = composed
                 .resolve(ek, Some(raw))
                 .map_err(RuntimeError::from)?;
             Ok(resolved.entity_type)

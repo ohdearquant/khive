@@ -3847,3 +3847,77 @@ async fn ingest_resolves_over_cap_commit_reference_beyond_the_embedding_cap() {
     assert_eq!(hits.len(), 1, "{hits:?}");
     assert_eq!(hits[0]["kind"], "commit");
 }
+
+// ── ENTITY_TYPES pack composition (dead-letter fix) ─────────────────────────
+//
+// The git pack declares `adr` as a `Document` entity-type subtype
+// (`vocab::GIT_ENTITY_TYPES`) — see `find_document_for_path`'s doc comment
+// above for why `document` entities matched by git-tracked file path are the
+// motivating case. These tests exercise the real `create` verb end-to-end
+// (dispatch -> handle_create -> validate_entity_type -> the boot-time
+// composed registry), not just the isolated unit-level composition covered
+// in `khive-runtime::pack`'s tests.
+
+/// The git-pack-declared `adr` Document subtype validates through the real
+/// `create` handler once `GitPack` is loaded, and its alias normalises to
+/// the canonical name.
+#[tokio::test]
+async fn git_pack_adr_entity_type_validates_through_create() {
+    let (_rt, _token, registry) = fixture().await;
+
+    let resp = registry
+        .dispatch(
+            "create",
+            json!({"kind": "document", "entity_type": "adr", "name": "ADR-001: example"}),
+        )
+        .await
+        .expect("create must accept the git-pack-declared adr Document subtype");
+    assert_eq!(resp["entity_type"], "adr", "{resp}");
+
+    let resp_alias = registry
+        .dispatch(
+            "create",
+            json!({
+                "kind": "document",
+                "entity_type": "architecture_decision_record",
+                "name": "ADR-002: example",
+            }),
+        )
+        .await
+        .expect("create must accept the adr alias");
+    assert_eq!(resp_alias["entity_type"], "adr", "{resp_alias}");
+
+    // Builtin Document subtypes remain resolvable alongside the pack extension.
+    let resp_builtin = registry
+        .dispatch(
+            "create",
+            json!({"kind": "document", "entity_type": "paper", "name": "Some paper"}),
+        )
+        .await
+        .expect("builtin paper subtype must remain resolvable when git pack adds adr");
+    assert_eq!(resp_builtin["entity_type"], "paper", "{resp_builtin}");
+}
+
+/// Without the git pack loaded, `adr` is not a registered Document subtype —
+/// proving the acceptance above is genuine pack composition, not a builtin.
+#[tokio::test]
+async fn adr_entity_type_rejected_without_git_pack_loaded() {
+    let rt = rt();
+    let mut builder = VerbRegistryBuilder::new();
+    builder.register(KgPack::new(rt.clone()));
+    let registry = builder.build().expect("registry builds");
+    rt.install_edge_rules(registry.all_edge_rules());
+    registry.apply_schema_plans(rt.backend());
+
+    let err = registry
+        .dispatch(
+            "create",
+            json!({"kind": "document", "entity_type": "adr", "name": "ADR-001: example"}),
+        )
+        .await
+        .expect_err("adr must be rejected when the declaring pack is not loaded");
+    assert!(
+        err.to_string().contains("adr"),
+        "error must name the rejected value: {err}"
+    );
+}

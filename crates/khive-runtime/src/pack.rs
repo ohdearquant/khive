@@ -22,8 +22,8 @@ use khive_types::{EventKind, EventOutcome, Namespace};
 use serde_json::Value;
 
 pub use khive_types::{
-    EdgeEndpointRule, EndpointKind, HandlerDef, NoteKindSpec, NoteLifecycleSpec, PackSchemaPlan,
-    ParamDef, VerbCategory, VerbPresentationPolicy, Visibility,
+    EdgeEndpointRule, EndpointKind, EntityTypeDef, HandlerDef, NoteKindSpec, NoteLifecycleSpec,
+    PackSchemaPlan, ParamDef, VerbCategory, VerbPresentationPolicy, Visibility,
 };
 // Backward-compat re-export.
 #[allow(deprecated)]
@@ -115,6 +115,13 @@ pub trait PackRuntime: Send + Sync {
         &[]
     }
 
+    /// Pack-extensible entity-type subtypes — must equal `<Self as Pack>::ENTITY_TYPES`.
+    /// Defaults to empty so existing packs that don't extend the entity_type
+    /// registry can ignore it.
+    fn entity_types(&self) -> &'static [EntityTypeDef] {
+        &[]
+    }
+
     /// Pack names whose vocabulary this pack references.
     /// Defaults to empty so existing packs compile without changes.
     fn requires(&self) -> &'static [&'static str] {
@@ -197,11 +204,21 @@ pub trait PackRuntime: Send + Sync {
     /// `create_entity` reject unregistered `entity_type` values at the runtime
     /// layer in addition to the handler layer.
     ///
-    /// Packs that own `EntityTypeRegistry` vocabularies (e.g. `KgPack`) should
-    /// override this to install their registry's `resolve` function.  The
-    /// default no-op leaves the runtime validator absent (skip-when-None), which
-    /// is the correct behaviour for bare runtimes without packs.
-    fn register_entity_type_validator(&self, _runtime: &KhiveRuntime) {}
+    /// `pack_entity_types` is the boot-time composed set of every loaded
+    /// pack's `ENTITY_TYPES` ([`VerbRegistry::all_entity_types`]) — the same
+    /// aggregate every pack in the loaded set receives, mirroring how
+    /// `EDGE_RULES` are aggregated once and consulted by every pack. Packs
+    /// that own `EntityTypeRegistry` vocabularies (e.g. `KgPack`) should
+    /// override this to compose `EntityTypeRegistry::with_extra(pack_entity_types)`
+    /// and install its `resolve` function. The default no-op leaves the
+    /// runtime validator absent (skip-when-None), which is the correct
+    /// behaviour for bare runtimes without packs.
+    fn register_entity_type_validator(
+        &self,
+        _runtime: &KhiveRuntime,
+        _pack_entity_types: &[EntityTypeDef],
+    ) {
+    }
 
     /// Install a pack-owned note-mutation hook on the runtime.
     ///
@@ -1527,6 +1544,19 @@ impl VerbRegistry {
             .collect()
     }
 
+    /// All pack-declared entity-type subtypes across registered packs.
+    ///
+    /// Order follows topological pack registration; duplicates are *not*
+    /// deduplicated here — same posture as [`all_edge_rules`](Self::all_edge_rules).
+    /// Consumers compose this with `EntityTypeRegistry::builtin()` via
+    /// `EntityTypeRegistry::with_extra` to get the boot-time composed registry.
+    pub fn all_entity_types(&self) -> Vec<EntityTypeDef> {
+        self.packs
+            .iter()
+            .flat_map(|p| p.entity_types().iter().cloned())
+            .collect()
+    }
+
     /// Collect all `NoteKindSpec` declarations from every loaded pack.
     ///
     /// Used by the runtime for lifecycle introspection and future enforcement.
@@ -1583,9 +1613,14 @@ impl VerbRegistry {
     ///
     /// Packs whose `register_entity_type_validator` is the default no-op pay
     /// no overhead.
+    ///
+    /// Composes [`all_entity_types`](Self::all_entity_types) once and passes
+    /// the same aggregate to every pack, mirroring how `install_edge_rules`
+    /// installs one `all_edge_rules()` aggregate for the whole registry.
     pub fn call_register_entity_type_validators(&self, runtime: &KhiveRuntime) {
+        let entity_types = self.all_entity_types();
         for pack in self.packs.iter() {
-            pack.register_entity_type_validator(runtime);
+            pack.register_entity_type_validator(runtime, &entity_types);
         }
     }
 
@@ -2554,6 +2589,159 @@ mod tests {
         let reg = build_registry();
         let kinds = reg.all_entity_kinds();
         assert_eq!(kinds, vec!["widget", "gadget"]);
+    }
+
+    // ---- ENTITY_TYPES composition (pack-declared entity-type subtypes) ----
+
+    struct GammaPack;
+
+    impl Pack for GammaPack {
+        const NAME: &'static str = "gamma";
+        const NOTE_KINDS: &'static [&'static str] = &[];
+        const ENTITY_KINDS: &'static [&'static str] = &[];
+        const HANDLERS: &'static [HandlerDef] = &[];
+        const ENTITY_TYPES: &'static [EntityTypeDef] = &[EntityTypeDef {
+            kind: khive_types::EntityKind::Document,
+            type_name: "gamma_report",
+            aliases: &["gamma_rep"],
+        }];
+    }
+
+    #[async_trait]
+    impl PackRuntime for GammaPack {
+        fn name(&self) -> &str {
+            Self::NAME
+        }
+        fn note_kinds(&self) -> &'static [&'static str] {
+            Self::NOTE_KINDS
+        }
+        fn entity_kinds(&self) -> &'static [&'static str] {
+            Self::ENTITY_KINDS
+        }
+        fn handlers(&self) -> &'static [HandlerDef] {
+            Self::HANDLERS
+        }
+        fn entity_types(&self) -> &'static [EntityTypeDef] {
+            Self::ENTITY_TYPES
+        }
+        async fn dispatch(
+            &self,
+            verb: &str,
+            _params: Value,
+            _registry: &VerbRegistry,
+            _token: &NamespaceToken,
+        ) -> Result<Value, RuntimeError> {
+            Ok(serde_json::json!({ "pack": "gamma", "verb": verb }))
+        }
+    }
+
+    /// Builtin-only behavior is unchanged when no pack declares extras:
+    /// `all_entity_types()` is empty, and composing it with the builtin
+    /// registry resolves exactly like `EntityTypeRegistry::builtin()`.
+    #[test]
+    fn all_entity_types_empty_when_no_pack_declares_extras() {
+        let reg = build_registry(); // AlphaPack + BetaPack — neither declares ENTITY_TYPES.
+        assert!(reg.all_entity_types().is_empty());
+        let composed = khive_types::EntityTypeRegistry::with_extra(reg.all_entity_types());
+        let resolved = composed
+            .resolve(khive_types::EntityKind::Document, Some("paper"))
+            .expect("builtin paper subtype must still resolve");
+        assert_eq!(resolved.entity_type.as_deref(), Some("paper"));
+    }
+
+    /// A pack-declared entity type validates through the composed registry,
+    /// and builtin subtypes remain resolvable alongside it.
+    #[test]
+    fn pack_declared_entity_type_validates_through_composed_registry() {
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(AlphaPack);
+        builder.register(GammaPack);
+        let reg = builder.build().expect("registry builds");
+
+        let extras = reg.all_entity_types();
+        assert_eq!(extras.len(), 1);
+
+        let composed = khive_types::EntityTypeRegistry::with_extra(extras);
+        let resolved = composed
+            .resolve(khive_types::EntityKind::Document, Some("gamma_rep"))
+            .expect("pack-declared alias must resolve through the composed registry");
+        assert_eq!(resolved.entity_type.as_deref(), Some("gamma_report"));
+
+        let builtin_resolved = composed
+            .resolve(khive_types::EntityKind::Document, Some("paper"))
+            .expect("builtin subtype must remain resolvable when a pack adds extras");
+        assert_eq!(builtin_resolved.entity_type.as_deref(), Some("paper"));
+
+        composed
+            .resolve(khive_types::EntityKind::Document, Some("nonexistent_type"))
+            .expect_err("undeclared entity_type must still be rejected");
+    }
+
+    /// Two packs declaring the exact same `(kind, type_name)` subtype compose
+    /// without a build-time error or panic — the same posture `all_edge_rules`
+    /// documents for exact-duplicate rules ("a harmless restatement"),
+    /// verified at source: `all_edge_rules` does not deduplicate or reject.
+    #[test]
+    fn overlapping_pack_declared_entity_types_compose_without_conflict() {
+        struct DeltaPack;
+        impl Pack for DeltaPack {
+            const NAME: &'static str = "delta";
+            const NOTE_KINDS: &'static [&'static str] = &[];
+            const ENTITY_KINDS: &'static [&'static str] = &[];
+            const HANDLERS: &'static [HandlerDef] = &[];
+            const ENTITY_TYPES: &'static [EntityTypeDef] = &[EntityTypeDef {
+                kind: khive_types::EntityKind::Document,
+                type_name: "gamma_report",
+                aliases: &["gamma_rep"],
+            }];
+        }
+        #[async_trait]
+        impl PackRuntime for DeltaPack {
+            fn name(&self) -> &str {
+                Self::NAME
+            }
+            fn note_kinds(&self) -> &'static [&'static str] {
+                Self::NOTE_KINDS
+            }
+            fn entity_kinds(&self) -> &'static [&'static str] {
+                Self::ENTITY_KINDS
+            }
+            fn handlers(&self) -> &'static [HandlerDef] {
+                Self::HANDLERS
+            }
+            fn entity_types(&self) -> &'static [EntityTypeDef] {
+                Self::ENTITY_TYPES
+            }
+            async fn dispatch(
+                &self,
+                verb: &str,
+                _params: Value,
+                _registry: &VerbRegistry,
+                _token: &NamespaceToken,
+            ) -> Result<Value, RuntimeError> {
+                Ok(serde_json::json!({ "pack": "delta", "verb": verb }))
+            }
+        }
+
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(GammaPack);
+        builder.register(DeltaPack);
+        let reg = builder
+            .build()
+            .expect("overlapping ENTITY_TYPES must not fail registry build");
+
+        let extras = reg.all_entity_types();
+        assert_eq!(
+            extras.len(),
+            2,
+            "both declarations are kept, not deduplicated"
+        );
+
+        let composed = khive_types::EntityTypeRegistry::with_extra(extras);
+        let resolved = composed
+            .resolve(khive_types::EntityKind::Document, Some("gamma_rep"))
+            .expect("overlapping declarations must still resolve");
+        assert_eq!(resolved.entity_type.as_deref(), Some("gamma_report"));
     }
 
     // ---- Gate wiring ----

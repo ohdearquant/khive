@@ -355,9 +355,9 @@ fn validate_conditional_requirements(
                 .get("entity_type")
                 .and_then(khive_request::ArgValue::as_value)
                 .and_then(Value::as_str);
-            validate_entity_type_for_replay(&canonical, entity_type_arg).map_err(|e| {
-                RuntimeError::InvalidInput(format!("schedule.action: verb \"create\": {e}"))
-            })?;
+            validate_entity_type_for_replay(&canonical, entity_type_arg, registry).map_err(
+                |e| RuntimeError::InvalidInput(format!("schedule.action: verb \"create\": {e}")),
+            )?;
         }
         CreateKindClass::Note { specific } => {
             reconcile_specific_for_replay(
@@ -551,10 +551,14 @@ fn resource_alias_for_replay(normalized: &str) -> bool {
 /// Validate an `entity_type` value the same way
 /// `khive-pack-kg::handlers::common::validate_entity_type` does: parse
 /// `canonical_kind_name` into the base `khive_types::EntityKind` first, then
-/// resolve the subtype against the canonical `khive_types::EntityTypeRegistry`
-/// (#571). KG create validation and schedule replay validation now resolve
-/// against the exact same registry instance instead of two hand-maintained
-/// copies, so this can no longer drift from the real handler's vocabulary.
+/// resolve the subtype against the boot-time composed registry (builtin
+/// subtypes plus every loaded pack's `ENTITY_TYPES`, `VerbRegistry::
+/// all_entity_types`) — NOT the builtin-only `EntityTypeRegistry::global()`.
+/// KG create validation and schedule replay validation resolve against the
+/// exact same composed set, so this cannot drift from the real handler's
+/// vocabulary, and a scheduled `create` naming a pack-declared subtype (e.g.
+/// git's `adr` Document subtype) is accepted at schedule time exactly when
+/// the real handler would accept it at trigger time.
 ///
 /// The kind-parse step is exactly what makes a pack-owned kind like
 /// `"resource"` reject *any* non-`None` `entity_type` outright: `resource`
@@ -568,6 +572,7 @@ fn resource_alias_for_replay(normalized: &str) -> bool {
 fn validate_entity_type_for_replay(
     canonical_kind_name: &str,
     entity_type: Option<&str>,
+    registry: &VerbRegistry,
 ) -> Result<Option<String>, RuntimeError> {
     let Some(raw) = entity_type else {
         return Ok(None);
@@ -577,7 +582,7 @@ fn validate_entity_type_for_replay(
         .map_err(|_| {
             RuntimeError::InvalidInput(format!("unknown entity kind {canonical_kind_name:?}"))
         })?;
-    khive_types::EntityTypeRegistry::global()
+    khive_types::EntityTypeRegistry::with_extra(registry.all_entity_types())
         .resolve(kind, Some(raw))
         .map(|resolved| resolved.entity_type)
         .map_err(RuntimeError::from)
@@ -669,13 +674,12 @@ fn validate_create_bulk_items(
                          entity_kind=<…>"
                     )));
                 };
-                validate_entity_type_for_replay(&canonical, entry.entity_type.as_deref()).map_err(
-                    |e| {
+                validate_entity_type_for_replay(&canonical, entry.entity_type.as_deref(), registry)
+                    .map_err(|e| {
                         RuntimeError::InvalidInput(format!(
                             "schedule.action: verb \"create\": items[{idx}] {e}"
                         ))
-                    },
-                )?;
+                    })?;
             }
             CreateKindClass::Note { .. } => {
                 return Err(RuntimeError::InvalidInput(format!(
