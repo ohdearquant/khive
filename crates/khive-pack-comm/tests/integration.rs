@@ -5582,7 +5582,11 @@ async fn health_channel_entry_never_carries_a_healthy_bool() {
 /// `"local"` — this test exercises the read path only). An unscoped call
 /// defaults to `"local"` and must see only the local row; a call with an
 /// explicit `namespace="tenant-a"` must see only tenant-a's row, never
-/// local's.
+/// local's. Also asserts the response's `namespace` field (khive #877 codex
+/// round 1) names the namespace actually read for both the unscoped and the
+/// explicitly-scoped call, so a caller can tell "no daemon anywhere" apart
+/// from "no rows under my scope yet" instead of the two cases being
+/// indistinguishable client-role/empty-channels responses.
 #[tokio::test]
 async fn health_scoped_to_injected_namespace_sees_only_its_own_rows() {
     use khive_storage::note::Note;
@@ -5643,6 +5647,11 @@ async fn health_scoped_to_injected_namespace_sees_only_its_own_rows() {
         default_channels[0]["channel_slug"].as_str(),
         Some("local-inbox@example.com")
     );
+    assert_eq!(
+        default_health["namespace"].as_str(),
+        Some("local"),
+        "response must echo the namespace actually read, defaulting to local: {default_health}"
+    );
 
     let scoped_health = registry
         .dispatch(
@@ -5660,6 +5669,11 @@ async fn health_scoped_to_injected_namespace_sees_only_its_own_rows() {
     assert_eq!(
         scoped_channels[0]["channel_slug"].as_str(),
         Some("tenant-a-inbox@example.com")
+    );
+    assert_eq!(
+        scoped_health["namespace"].as_str(),
+        Some("tenant-a"),
+        "response must echo the explicitly-scoped namespace, not local: {scoped_health}"
     );
 }
 

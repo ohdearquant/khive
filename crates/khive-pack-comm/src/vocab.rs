@@ -358,7 +358,13 @@ pub(crate) static COMM_HANDLERS: [HandlerDef; 11] = [
                        (ADR-007 Rev 6 Rule 3). An unscoped call defaults to \"local\", matching \
                        the namespace heartbeat rows are persisted under; a call with an \
                        explicit non-local `namespace=` sees only that namespace's rows, never \
-                       \"local\"'s.",
+                       \"local\"'s. The response carries a `namespace` field naming the \
+                       namespace actually read, so `role: \"client\"` with empty `channels` is \
+                       unambiguous: it means no heartbeat rows exist under THAT namespace, not \
+                       necessarily that no daemon exists anywhere. In the shipped OSS build \
+                       `comm.heartbeat` only ever persists under \"local\", so a non-local \
+                       `namespace=` scope returns empty channels even while a daemon is \
+                       actively heartbeating under \"local\" — that is expected, not a fault.",
         visibility: Visibility::Verb,
         category: khive_types::VerbCategory::Assertive,
         params: &[],

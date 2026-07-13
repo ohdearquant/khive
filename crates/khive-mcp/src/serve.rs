@@ -725,12 +725,15 @@ fn channel_error_class(err: &khive_channel::ChannelError) -> &'static str {
 /// Takes NO `namespace` parameter (round-2, design review Blocker fix, example actor
 /// 2026-07-04): heartbeat rows are an operational surface, not message data,
 /// so they are ALWAYS dispatched against
-/// `khive_pack_comm::CHANNEL_HEALTH_NAMESPACE` — the same constant
-/// `handle_health` reads from — regardless of what
+/// `khive_pack_comm::CHANNEL_HEALTH_NAMESPACE` regardless of what
 /// `KHIVE_EMAIL_INGEST_NAMESPACE` this daemon is configured with for message
 /// ingestion. `handle_heartbeat` additionally hardcodes the persisted row's
 /// namespace to this same constant, so the guarantee holds even if a future
-/// caller changes what this dispatch call passes.
+/// caller changes what this dispatch call passes. `comm.health` no longer
+/// mirrors this fixed pin (khive #877): it reads from the caller's dispatch
+/// token, which resolves to this constant only for an unscoped (default)
+/// read — an explicitly-scoped `comm.health` call reads its own namespace,
+/// not necessarily where this function wrote.
 #[cfg(feature = "channel-email")]
 async fn record_channel_heartbeat(
     registry: &khive_runtime::VerbRegistry,

@@ -1143,10 +1143,17 @@ pub(crate) async fn handle_heartbeat(
     // OPERATIONAL surface, not message data. Persist to
     // `crate::CHANNEL_HEALTH_NAMESPACE` ALWAYS — never `token.namespace()` —
     // so a poll loop configured with a non-local `KHIVE_EMAIL_INGEST_NAMESPACE`
-    // cannot cause heartbeat rows to land anywhere but where `handle_health`
-    // reads from. This is enforced here (not just at the serve.rs call site)
+    // cannot cause heartbeat rows to land anywhere but this one fixed
+    // namespace. This is enforced here (not just at the serve.rs call site)
     // so the guarantee holds even if a future caller passes a different
     // `namespace` dispatch param.
+    //
+    // `handle_health` (khive #877) no longer mirrors this fixed pin: it reads
+    // from `token.namespace()`, which only resolves to this same constant
+    // for an unscoped (default-namespace) caller. An explicitly-scoped
+    // `comm.health` caller reads its own namespace, not wherever this
+    // handler wrote — do not reintroduce a `handle_health` read of this
+    // constant to "fix" that; it is the cross-namespace leak #877 closed.
     let ns = crate::CHANNEL_HEALTH_NAMESPACE;
     let store = runtime.notes(token)?;
     let id = heartbeat_note_id(ns, &p.channel_kind, &p.channel_slug);
@@ -1270,6 +1277,20 @@ fn channel_health_to_json(note: &Note) -> Value {
 /// `khive-mcp`/`khive-channel-email`), so an empty result is the only
 /// fact-based response available at this layer.
 ///
+/// `namespace` in the response (khive #877) is the namespace actually read —
+/// `token.namespace().as_str()`, echoed back so the shape is self-describing
+/// for both the unscoped and the explicitly-scoped case. This exists because
+/// `role: "client"` / empty `channels` is now ambiguous on its own: it is the
+/// correct, expected shape for a `namespace=`-scoped call in the shipped OSS
+/// build, since `comm.heartbeat` only ever persists under
+/// `crate::CHANNEL_HEALTH_NAMESPACE` (`"local"`) — there is no OSS producer
+/// for tenant-scoped heartbeat rows yet (that is cloud-side follow-up, not
+/// this handler's job). A caller reading `namespace: "tenant-a"` alongside
+/// `role: "client"` can tell "no daemon anywhere" (unscoped call, `namespace:
+/// "local"`) apart from "no rows written under my scope yet" (scoped call,
+/// `namespace: "tenant-a"`) without khive silently falling back to `"local"`
+/// to paper over the difference.
+///
 /// Never returns a computed `healthy: bool` (design review amendment: "report
 /// timestamps only") — staleness/alerting judgment belongs to the caller.
 ///
@@ -1347,6 +1368,7 @@ pub(crate) async fn handle_health(
         "role": role,
         "source": source,
         "as_of": as_of,
+        "namespace": token.namespace().as_str(),
         "channels": channels,
         "resource": resource,
     }))

@@ -107,25 +107,38 @@ Each entry in the returned `channels` array carries:
 `last_error`. Compare `last_error.at` against `last_success_at` to tell a
 resolved failure from one that is still live.
 
-Heartbeat rows are always persisted to, and read from, the local operational
-namespace, regardless of the caller's own namespace or
-`KHIVE_EMAIL_INGEST_NAMESPACE`. These rows are an operational surface, not
-message data, so they must be visible to a no-arg `comm.health()` call
-independent of where the caller's own messages happen to be ingested.
+Heartbeat rows are always persisted to the fixed `local` operational
+namespace by `comm.heartbeat`, regardless of the caller's own namespace or
+`KHIVE_EMAIL_INGEST_NAMESPACE` — that write path is intentionally pinned,
+since heartbeat rows are an operational surface, not message data.
+`comm.health` itself is not pinned (khive #877): it reads from the caller's
+injected namespace, the same `namespace=` escape / `"local"` default every
+other comm verb resolves. An unscoped call still defaults to `"local"` and
+so still sees what `comm.heartbeat` wrote; a call with an explicit non-local
+`namespace=` reads only that namespace's rows, never `"local"`'s. The
+response carries a `namespace` field naming the namespace actually read.
 
 The `role` field is `"daemon"` (with `source: "daemon-heartbeat"`) whenever
-any persisted heartbeat row exists, and `"client"` with an empty `channels`
-array otherwise. This distinguishes who owns the channel loops, not which
-process answered the call: any persisted row means some daemon owns the
-loops, even when this particular call was served by a different, non-daemon
-process.
+any persisted heartbeat row exists **in the namespace read**, and `"client"`
+with an empty `channels` array otherwise. This distinguishes who owns the
+channel loops, not which process answered the call: any persisted row means
+some daemon owns the loops, even when this particular call was served by a
+different, non-daemon process.
 
 **Known ambiguity:** an empty `channels` array cannot distinguish "no daemon
 has ever run" from "channels are configured but a poll has never completed."
 The comm pack has no visibility into channel configuration (that lives in
 `khive-mcp` / `khive-channel-email`), so `role: "client"` with an empty
-`channels` array means only "no daemon heartbeat state exists," not "nothing
-is configured."
+`channels` array means only "no daemon heartbeat state exists in the
+namespace read," not "nothing is configured." The `namespace` field
+disambiguates which namespace that is: since the shipped OSS
+`comm.heartbeat` only ever writes to `"local"`, a call scoped to a non-local
+`namespace=` is expected to return `role: "client"` with empty `channels`
+even while a daemon is actively heartbeating under `"local"` — check the
+response's `namespace` field before reading that as "no daemon running."
+Producing heartbeat rows under a non-local namespace (e.g. per-tenant
+channel state on a cloud deployment) has no supported writer yet; it is
+tracked as separate follow-up work, not a `comm.health` read-path gap.
 
 Results are capped at 200 channels. A full page logs a `tracing::debug!`
 line noting that results may be silently truncated.
