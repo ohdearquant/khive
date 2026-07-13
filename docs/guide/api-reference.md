@@ -213,12 +213,12 @@ List records with optional filtering.
 request(ops="list(kind=\"entity\", entity_kind=\"concept\", limit=20)")
 ```
 
-Returns `{"items": [...], "warnings": [...]}` (`kind="edge"` with `after` set returns
-`{"edges": [...], "next_after": ..., "warnings": [...]}` instead). `warnings` is present only
-when the request's `limit` exceeded the kind's server-side row cap (entity 500, note 200, edge
-1000, event 1000) and that cap actually bound — a `limit` above the cap that still matches
-fewer rows than the cap does not warn, since nothing was dropped. Before this, a `limit` above
-the cap was silently clamped with no signal (issue #894).
+Requests within the kind's server-side row cap keep the existing array response. If `limit`
+exceeds the cap, the response is `{"items": [...], "requested_limit": N,
+"effective_limit": CAP, "limit_clamped": true}`. This lets offset-based clients advance by
+the effective limit instead of silently skipping rows. The caps are entity 500, note 200, edge
+1000, event 1000, and proposal 500. Edge cursor mode keeps its existing `{"edges": [...],
+"next_after": ...}` shape and adds the same limit metadata when clamped.
 
 ### `stats` — Assertive
 

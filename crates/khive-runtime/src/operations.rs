@@ -4029,29 +4029,7 @@ impl KhiveRuntime {
         limit: u32,
         offset: u32,
     ) -> RuntimeResult<Vec<Edge>> {
-        self.list_edges_capped(token, filter, limit.clamp(1, Self::EDGE_LIST_MAX_LIMIT), offset)
-            .await
-    }
-
-    /// Same as [`Self::list_edges`] but fetches exactly `limit` rows with no
-    /// implicit clamp to [`Self::EDGE_LIST_MAX_LIMIT`] — the caller decides
-    /// how many rows to request. [`Self::list_edges`] is a thin wrapper that
-    /// pre-clamps and delegates here, so its documented cap guarantee is
-    /// unchanged for existing callers.
-    ///
-    /// The `list` verb handler (issue #894) uses the uncapped form to probe
-    /// one row past [`Self::EDGE_LIST_MAX_LIMIT`]: requesting `cap + 1` rows
-    /// and observing whether that sentinel row comes back is how it tells
-    /// real truncation ("more than `cap` rows actually match") apart from a
-    /// harmless over-cap request ("caller asked for 2000, only 40 matched") —
-    /// the same technique `query_with_metadata` uses for GQL/SPARQL (#777).
-    pub async fn list_edges_capped(
-        &self,
-        token: &NamespaceToken,
-        filter: crate::curation::EdgeListFilter,
-        limit: u32,
-        offset: u32,
-    ) -> RuntimeResult<Vec<Edge>> {
+        let limit = limit.clamp(1, Self::EDGE_LIST_MAX_LIMIT);
         let visible = token.visible_namespaces();
 
         // Common case: a single visible namespace — page directly against the
@@ -4122,26 +4100,7 @@ impl KhiveRuntime {
         after: Option<Uuid>,
         limit: u32,
     ) -> RuntimeResult<(Vec<Edge>, Option<Uuid>)> {
-        self.list_edges_after_capped(
-            token,
-            filter,
-            after,
-            limit.clamp(1, Self::EDGE_LIST_MAX_LIMIT),
-        )
-        .await
-    }
-
-    /// Same as [`Self::list_edges_after`] but fetches exactly `limit` rows
-    /// with no implicit clamp to [`Self::EDGE_LIST_MAX_LIMIT`]. See
-    /// [`Self::list_edges_capped`] for why the `list` verb handler needs the
-    /// uncapped form (issue #894).
-    pub async fn list_edges_after_capped(
-        &self,
-        token: &NamespaceToken,
-        filter: crate::curation::EdgeListFilter,
-        after: Option<Uuid>,
-        limit: u32,
-    ) -> RuntimeResult<(Vec<Edge>, Option<Uuid>)> {
+        let limit = limit.clamp(1, Self::EDGE_LIST_MAX_LIMIT);
         let visible = token.visible_namespaces();
         let limit_usize = limit as usize;
 

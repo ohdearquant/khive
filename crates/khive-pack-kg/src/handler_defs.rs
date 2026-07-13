@@ -149,16 +149,13 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 18] = [
     // Assertive: retrieves and presents filtered records
     HandlerDef {
         name: "list",
-        description: "List records with optional filtering. Returns \
-                      {\"items\": [...], \"warnings\": [...]} (kind=\"edge\" with \"after\" set \
-                      returns {\"edges\": [...], \"next_after\": ..., \"warnings\": [...]} instead \
-                      — see the \"after\" param). \"warnings\" is present only when the row cap \
-                      bound: each kind enforces its own server-side cap (entity 500, note 200, \
-                      edge 1000, event 1000) and a \"limit\" above the cap is clamped, never \
-                      rejected — but the response says so instead of staying silent, so a caller \
-                      striding a pagination loop by its own requested \"limit\" cannot silently \
-                      skip rows between pages (issue #894). A \"limit\" over the cap that still \
-                      matches fewer than the cap rows does NOT warn — nothing was actually dropped.",
+        description: "List records with optional filtering. Requests within the kind's row cap \
+                      keep the existing array response. If limit exceeds the cap, the result is \
+                      {\"items\": [...], \"requested_limit\": N, \"effective_limit\": CAP, \
+                      \"limit_clamped\": true}. Edge cursor mode keeps its existing \
+                      {\"edges\": [...], \"next_after\": ...} shape and adds the same limit \
+                      metadata when clamped. Caps are entity 500, note 200, edge 1000, event \
+                      1000, and proposal 500.",
         visibility: Visibility::Verb,
         category: VerbCategory::Assertive,
         params: &[
@@ -172,10 +169,9 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 18] = [
                 name: "limit",
                 param_type: "integer",
                 required: false,
-                description: "Maximum records to return (default 20). Silently clamped to the \
-                              per-kind server-side cap (entity 500, note 200, edge 1000, event \
-                              1000) if higher — see the verb-level description for the \
-                              \"warnings\" signal that fires when the cap actually bound.",
+                description: "Maximum records to return (default varies by kind). Values above \
+                              the kind's server-side cap are clamped and return explicit \
+                              requested_limit, effective_limit, and limit_clamped metadata.",
             },
             ParamDef {
                 name: "offset",
@@ -195,9 +191,10 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 18] = [
                               starting from the beginning of the set. Seeks via an indexed id range \
                               scan instead of OFFSET, so cost does not grow with depth. When set, the \
                               response shape is \
-                              {\"edges\": [...], \"next_after\": <uuid-or-null>, \"warnings\"?: [...]}; \
+                              {\"edges\": [...], \"next_after\": <uuid-or-null>}; \
                               next_after is non-null while more rows remain. Mutually exclusive with \
-                              offset-based paging within a single walk.",
+                              offset-based paging within a single walk. Over-cap limits add the \
+                              limit metadata described on the verb.",
             },
             ParamDef {
                 name: "entity_kind",

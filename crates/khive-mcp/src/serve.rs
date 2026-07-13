@@ -913,9 +913,8 @@ async fn channel_outbox_loop(
 
         // Query outbound messages via the registry. The note `list` handler applies
         // the `direction` filter server-side (scanning up to its internal cap) and
-        // returns `{"items": [...], "warnings"?: [...]}` — full note objects under
-        // `items` (issue #894; previously a bare JSON array). There is no
-        // `delivered_at` or recipient-prefix filter, so the `email:` prefix and the
+        // returns a bare JSON array of full note objects. There is no `delivered_at`
+        // or recipient-prefix filter, so the `email:` prefix and the
         // already-delivered check are applied per-note below.
         let list_params = json!({
             "namespace": ingest_namespace,
@@ -932,7 +931,7 @@ async fn channel_outbox_loop(
             }
         };
 
-        let notes = match list_result.get("items").and_then(serde_json::Value::as_array) {
+        let notes = match list_result.as_array() {
             Some(arr) => arr.clone(),
             None => continue,
         };
@@ -6082,10 +6081,7 @@ backend = "kg-backend"
                 )
                 .await
                 .expect("list must succeed");
-            let notes = inbox["items"]
-                .as_array()
-                .expect("list returns {\"items\": [...]}")
-                .clone();
+            let notes = inbox.as_array().expect("list returns an array").clone();
             let matching: Vec<_> = notes
                 .iter()
                 .filter(|n| {
@@ -6327,10 +6323,7 @@ backend = "kg-backend"
                 )
                 .await
                 .expect("list must succeed");
-            let notes = inbox["items"]
-                .as_array()
-                .expect("list returns {\"items\": [...]}")
-                .clone();
+            let notes = inbox.as_array().expect("list returns an array").clone();
             let quarantined = notes
                 .iter()
                 .find(|n| {

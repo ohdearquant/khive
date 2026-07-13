@@ -21,6 +21,8 @@ use crate::KgPack;
 
 use khive_runtime::micros_to_iso;
 
+const PROPOSAL_LIST_CAP: u32 = 500;
+
 impl KgPack {
     pub(crate) async fn resolve_proposal_uuid(
         &self,
@@ -450,7 +452,9 @@ impl KgPack {
         let p: ListProposalsParams = serde_json::from_value(params)
             .map_err(|e| RuntimeError::InvalidInput(format!("bad params: {e}")))?;
         let ns = token.namespace().as_str().to_owned();
-        let limit = p.limit.unwrap_or(50).min(500) as i64;
+        let requested = p.limit.unwrap_or(50);
+        let effective = requested.min(PROPOSAL_LIST_CAP);
+        let limit = i64::from(effective);
         let offset = p.offset.unwrap_or(0) as i64;
 
         let mut sql_str = "\
@@ -547,6 +551,15 @@ impl KgPack {
             })
             .collect();
 
-        to_json(&items)
+        let items = to_json(&items)?;
+        if requested <= effective {
+            return Ok(items);
+        }
+        Ok(serde_json::json!({
+            "items": items,
+            "requested_limit": requested,
+            "effective_limit": effective,
+            "limit_clamped": true,
+        }))
     }
 }

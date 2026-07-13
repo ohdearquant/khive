@@ -1655,10 +1655,9 @@ default = true
         };
         let raw = server.dispatch_request_local(params).await.unwrap();
         let resp: serde_json::Value = serde_json::from_str(&raw).unwrap();
-        // Agent presentation: `{"results":[{"ok":true,"result":{"items":[...]},"tool":"list"}],...}`.
-        // The `list` verb returns entities under `result.items` (issue #894;
-        // previously a bare array directly under `result`).
-        let count = resp["results"][0]["result"]["items"]
+        // Agent presentation: `{"results":[{"ok":true,"result":[...],"tool":"list"}],...}`.
+        // The `list` verb returns an array of entities directly under `result`.
+        let count = resp["results"][0]["result"]
             .as_array()
             .map(|a| a.len())
             .unwrap_or(0);

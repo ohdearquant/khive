@@ -283,9 +283,8 @@ def main():
         assert fetched["name"] == "LoRA", f"unexpected: {fetched}"
         print(f"  [ok] get entity — flat response kind={fetched['kind']}")
 
-        # 5. List entities (issue #894: `list` returns {"items": [...]} now, not
-        # a bare array — the row-cap truncation signal needs somewhere to live).
-        entities = call_verb(proc, "list", {"kind": "entity", "entity_kind": "concept"})["items"]
+        # 5. List entities
+        entities = call_verb(proc, "list", {"kind": "entity", "entity_kind": "concept"})
         assert len(entities) == 2, f"expected 2 concepts, got {len(entities)}"
         print(f"  [ok] list entities — {len(entities)} concepts")
 
@@ -330,7 +329,7 @@ def main():
         print(f"  [ok] neighbors — 1 inbound + 1 outbound to LoRA")
 
         # 9. Edge list
-        edges = call_verb(proc, "list", {"kind": "edge", "source_id": qlora_id})["items"]
+        edges = call_verb(proc, "list", {"kind": "edge", "source_id": qlora_id})
         assert len(edges) == 1
         print(f"  [ok] list edges")
 
@@ -360,7 +359,7 @@ def main():
         print(f"  [ok] create note — observation ({note_id[:8]}...)")
 
         # 13. List notes
-        notes = call_verb(proc, "list", {"kind": "note", "note_kind": "observation"})["items"]
+        notes = call_verb(proc, "list", {"kind": "note", "note_kind": "observation"})
         assert len(notes) == 1
         print(f"  [ok] list notes — {len(notes)} observation")
 
