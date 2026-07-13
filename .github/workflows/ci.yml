@@ -3,23 +3,109 @@ name: CI
 on:
   push:
     branches: [main, "integration/**"]
+  # Keep pull_request (not pull_request_target): GitHub's first-time-contributor
+  # approval gate must remain in front of workflows from external forks.
   pull_request:
     branches: [main, "integration/**"]
+  workflow_dispatch:
+  schedule:
+    - cron: "17 6 * * *"
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # timeout-minutes starts after a runner is assigned; it bounds stuck execution,
+  # but GitHub does not apply it while a job is still queued.
+  automerge-push-guard:
+    name: Auto-merge push guard
+    # Run immediately from the synchronize payload. Comparing enabledAt with
+    # the push-time PR update makes reruns idempotent and prevents a request
+    # deliberately re-armed after review from being disabled by a delayed
+    # runner. CI gate depends on this job, so mutation failure is fail-closed.
+    if: >-
+      github.event_name == 'pull_request' &&
+      github.event.action == 'synchronize' &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.event.pull_request.user.type == 'User' &&
+      github.event.pull_request.auto_merge != null
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - name: Disable stale auto-merge request
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY_OWNER: ${{ github.repository_owner }}
+          REPOSITORY_NAME: ${{ github.event.repository.name }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PUSH_UPDATED_AT: ${{ github.event.pull_request.updated_at }}
+        run: |
+          set -euo pipefail
+
+          # Re-read current state because the request may have been disabled or
+          # deliberately re-armed while this job waited for a runner.
+          # shellcheck disable=SC2016
+          pr_json="$(gh api graphql \
+            -f query='query($owner: String!, $name: String!, $number: Int!) {
+              repository(owner: $owner, name: $name) {
+                pullRequest(number: $number) {
+                  id
+                  autoMergeRequest { enabledAt }
+                }
+              }
+            }' \
+            -f owner="$REPOSITORY_OWNER" \
+            -f name="$REPOSITORY_NAME" \
+            -F number="$PR_NUMBER")"
+
+          current_enabled_at="$(jq -r '.data.repository.pullRequest.autoMergeRequest.enabledAt // empty' <<<"$pr_json")"
+          if [ -z "$current_enabled_at" ]; then
+            echo "Auto-merge is already disabled for PR #${PR_NUMBER}."
+            exit 0
+          fi
+          enabled_epoch="$(date --date="$current_enabled_at" +%s)"
+          push_epoch="$(date --date="$PUSH_UPDATED_AT" +%s)"
+          if [ "$enabled_epoch" -gt "$push_epoch" ]; then
+            echo "Auto-merge was re-armed after this push; preserving the reviewed request."
+            exit 0
+          fi
+
+          pull_request_id="$(jq -r '.data.repository.pullRequest.id' <<<"$pr_json")"
+          # shellcheck disable=SC2016
+          gh api graphql \
+            -f query='mutation($pullRequestId: ID!) {
+              disablePullRequestAutoMerge(input: {pullRequestId: $pullRequestId}) {
+                pullRequest { number }
+              }
+            }' \
+            -f pullRequestId="$pull_request_id" >/dev/null
+
+          {
+            echo "### Auto-merge disabled"
+            echo
+            echo "PR #${PR_NUMBER} received a new push. Re-review it before arming auto-merge again."
+          } >> "$GITHUB_STEP_SUMMARY"
+
   ci:
     name: CI
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
     strategy:
+      # A fast failure cancels the sibling OS to control runner cost. The tradeoff
+      # is that a macOS-only failure may need a second run after Linux is fixed.
+      fail-fast: true
       matrix:
         os: [ubuntu-latest, macos-latest]
     defaults:
       run:
         working-directory: crates
     env:
+      # PRs use a focused macOS portability lane. Push, nightly, and manually
+      # dispatched runs retain the full suite on both operating systems.
+      CI_SUITE: ${{ github.event_name == 'pull_request' && matrix.os == 'macos-latest' && 'macos-pr' || 'full' }}
       # CI gates do not need full debuginfo. line-tables-only keeps file:line
       # in test backtraces while cutting most of the target-dir and linker
       # footprint that filled the ubuntu runner disk (ENOSPC surfaces as
@@ -52,26 +138,68 @@ jobs:
           # line-tables-only profile; restoring them would defeat the disk cap.
           key: line-tables
       - uses: denoland/setup-deno@v2
+        if: env.CI_SUITE == 'full'
         with:
           deno-version: v2.x
       - uses: astral-sh/setup-uv@v5
-      - run: ../scripts/ci.sh
+        if: env.CI_SUITE == 'full'
+      - name: macOS PR compile check
+        if: env.CI_SUITE == 'macos-pr'
+        run: ../scripts/ci.sh macos-pr-check
+      - name: macOS PR platform tests
+        if: env.CI_SUITE == 'macos-pr'
+        run: ../scripts/ci.sh macos-pr-tests
+      - name: Forward-deployed crate checks
+        if: env.CI_SUITE == 'full'
+        run: ../scripts/ci.sh forward-deployed
+      - name: Format, SQL, and ADR lints
+        if: env.CI_SUITE == 'full'
+        run: ../scripts/ci.sh lint
+      - name: No-stub guard
+        if: env.CI_SUITE == 'full'
+        run: ../scripts/ci.sh no-stubs
+      - name: Clippy
+        if: env.CI_SUITE == 'full'
+        run: ../scripts/ci.sh clippy
+      # Rustdoc is already the separately gated doc-build job below; keep it in
+      # ci.sh's local all-mode without paying for duplicate per-OS CI builds.
+      - name: Workspace tests
+        if: env.CI_SUITE == 'full'
+        run: ../scripts/ci.sh tests
+      - name: Channel-email feature tests
+        if: env.CI_SUITE == 'full'
+        run: ../scripts/ci.sh channel-email
+      - name: No-default-features check
+        if: env.CI_SUITE == 'full'
+        run: ../scripts/ci.sh no-default-features
+      - name: Release build
+        if: env.CI_SUITE == 'full'
+        run: ../scripts/ci.sh release
+      - name: Contract tests
+        if: env.CI_SUITE == 'full'
+        run: ../scripts/ci.sh contract-tests
+      - name: Deno tests
+        if: env.CI_SUITE == 'full'
+        run: ../scripts/ci.sh deno-tests
+      - name: Smoke tests
+        if: env.CI_SUITE == 'full'
+        run: ../scripts/ci.sh smoke-tests
+      - name: Vector smoke test
+        if: env.CI_SUITE == 'full'
+        run: ../scripts/ci.sh vector-smoke
+      - name: khive-contract suite
+        if: env.CI_SUITE == 'full'
+        run: ../scripts/ci.sh contract-suite
 
   supply-chain:
     name: Supply-chain (cargo-deny)
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
-      - uses: EmbarkStudios/cargo-deny-action@v2
-        with:
-          manifest-path: crates/Cargo.toml
-          command: check bans licenses sources
-      # Advisory/CVE gate: cargo-deny 0.19.9+ parses CVSS 4.0 entries in the 2026
-      # RustSec DB (0.18.x fails to load the DB entirely). cargo-deny-action@v2
-      # bakes 0.19.8 into its image and exposes NO input to override the binary
-      # version (it has no `deny-version` input), so we install the pinned binary
-      # ourselves rather than depend on the image version.
-      #
+      # cargo-deny 0.19.9+ parses CVSS 4.0 entries in the 2026 RustSec DB;
+      # 0.18.x fails to load the DB entirely. One pinned binary runs every check
+      # class so the supply-chain gate cannot drift between two implementations.
       # The installer action is pinned to an immutable commit SHA (not the mutable
       # @v2 tag), and the next step ASSERTS the resolved version is exactly 0.19.9
       # before gating. In an autonomous-merge model logs are not review: if the
@@ -82,14 +210,15 @@ jobs:
         uses: taiki-e/install-action@9e1e5806d4a4822de933115878265be9aaa786d9 # v2.82.2
         with:
           tool: cargo-deny@0.19.9
-      - name: cargo-deny advisories (hard gate)
+      - name: cargo-deny 0.19.9 (hard gate)
         run: |
           test "$(cargo-deny --version)" = "cargo-deny 0.19.9"
-          cargo deny --manifest-path crates/Cargo.toml check advisories
+          cargo deny --manifest-path crates/Cargo.toml --all-features check bans licenses sources advisories
 
   data-leak-guard:
     name: JSON/JSONL data-leak guard
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
       - name: Scan whole tree for corpus files
@@ -98,6 +227,7 @@ jobs:
   secret-scan:
     name: Secret scan (gitleaks)
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
         with:
@@ -112,6 +242,7 @@ jobs:
   docs:
     name: Docs lint
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
       - uses: denoland/setup-deno@v2
@@ -123,6 +254,7 @@ jobs:
   marketplace:
     name: Marketplace example validator
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v6
@@ -134,6 +266,7 @@ jobs:
   doc-build:
     name: Doc build (-D warnings)
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     defaults:
       run:
         working-directory: crates
@@ -150,6 +283,7 @@ jobs:
   dependency-review:
     name: Dependency review
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     # Declare the read scope the action needs explicitly so the gate does not
     # depend on ambient GITHUB_TOKEN defaults (an org policy could tighten them).
     # No pull-requests:write — comment-summary-in-pr is not enabled.
@@ -184,6 +318,7 @@ jobs:
   wasm-parity:
     name: wasm-parity (khive-changeset)
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     defaults:
       run:
         working-directory: crates
@@ -239,6 +374,7 @@ jobs:
   vamana-portability:
     name: vamana portability (ADR-110 Layer A)
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     defaults:
       run:
         working-directory: crates
@@ -259,6 +395,7 @@ jobs:
   coverage-ratchet:
     name: Coverage ratchet
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     # Read-only gate: fails a PR whose line coverage regresses below the committed
     # baseline (coverage-baseline.txt). It does NOT push to main — the baseline is
     # raised only by an explicit PR that edits coverage-baseline.txt, so every
@@ -319,7 +456,9 @@ jobs:
   ci-gate:
     name: CI gate
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     needs:
+      - automerge-push-guard
       - ci
       - supply-chain
       - data-leak-guard

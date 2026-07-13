@@ -72,7 +72,7 @@ async-imap = "0.9"
 async-native-tls = "0.5"
 mail-parser = "0.9"
 rusqlite = { version = "0.33" }
-anyhow = "1.0"
+anyhow = "1.0.103"
 thiserror = "2.0"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
@@ -89,7 +89,7 @@ rand_distr = "0.4"
 toml = "0.8"
 criterion = { version = "0.5", features = ["html_reports", "async_tokio"] }
 rayon = "1.10"
-memmap2 = "0.9"
+memmap2 = "0.9.11"
 bytemuck = "1.16"
 unicode-segmentation = "1.11"
 rust-stemmers = "1.2"

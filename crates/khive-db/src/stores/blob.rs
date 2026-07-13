@@ -81,7 +81,15 @@ fn crosses_floor(available: u64, required_write_bytes: u64, floor_bytes: u64) ->
     available.saturating_sub(required_write_bytes) < floor_bytes
 }
 
-fn put_blocking(root: &Path, floor_bytes: u64, bytes: Vec<u8>) -> StorageResult<ContentRef> {
+fn put_blocking_with_space_probe<F>(
+    root: &Path,
+    floor_bytes: u64,
+    bytes: Vec<u8>,
+    available_space: F,
+) -> StorageResult<ContentRef>
+where
+    F: FnOnce(&Path) -> std::io::Result<u64>,
+{
     let digest = blake3::hash(&bytes);
     let content_ref = ContentRef::from_digest_bytes(digest.as_bytes());
     let target = shard_path(root, &content_ref);
@@ -94,7 +102,7 @@ fn put_blocking(root: &Path, floor_bytes: u64, bytes: Vec<u8>) -> StorageResult<
     }
 
     let required_write_bytes = bytes.len() as u64;
-    let available = fs4::available_space(root).map_err(|e| map_io_err(e, "put_check_space"))?;
+    let available = available_space(root).map_err(|e| map_io_err(e, "put_check_space"))?;
     if crosses_floor(available, required_write_bytes, floor_bytes) {
         return Err(StorageError::CapacityFloor {
             capability: StorageCapability::Blob,
@@ -139,6 +147,10 @@ fn put_blocking(root: &Path, floor_bytes: u64, bytes: Vec<u8>) -> StorageResult<
         .map_err(|e| map_io_err(e.error, "put_persist"))?;
 
     Ok(content_ref)
+}
+
+fn put_blocking(root: &Path, floor_bytes: u64, bytes: Vec<u8>) -> StorageResult<ContentRef> {
+    put_blocking_with_space_probe(root, floor_bytes, bytes, |path| fs4::available_space(path))
 }
 
 fn walk_blob_files(root: &Path) -> std::io::Result<Vec<(ContentRef, PathBuf)>> {
@@ -589,34 +601,19 @@ mod tests {
         assert!(!crosses_floor(10, 100, 0));
     }
 
-    #[tokio::test]
-    async fn put_refuses_a_write_that_would_cross_the_floor_even_though_available_alone_clears_it()
-    {
-        // Integration-level companion to the pure `crosses_floor` tests
-        // above: proves `FsBlobStore::put` actually wires the write-size-
-        // aware check through end-to-end. Uses a generous margin/cushion
-        // (128 MiB total) rather than an exact boundary, because an earlier
-        // version of this test pinned the floor to the exact
-        // `fs4::available_space` reading and flaked: on this shared,
-        // heavily-loaded dev machine, `fs4::available_space` was observed to
-        // shift by tens of MB between two calls milliseconds apart (other
-        // agents' concurrent builds). A floor-only check would still pass
-        // here (available comfortably clears the floor by MARGIN bytes);
-        // the write-size-aware check must reject once the payload's own
-        // CUSHION-sized excess is subtracted.
-        const MARGIN: u64 = 64 * 1024 * 1024;
-        const CUSHION: u64 = 64 * 1024 * 1024;
+    #[test]
+    fn put_refuses_a_write_that_would_cross_the_floor_even_though_available_alone_clears_it() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("blobs");
         fs::create_dir_all(&root).unwrap();
-        let available = fs4::available_space(&root).unwrap();
-        let floor = available.saturating_sub(MARGIN);
-        let store = FsBlobStore::new(root, floor).unwrap();
 
-        let err = store
-            .put(vec![7u8; (MARGIN + CUSHION) as usize])
-            .await
-            .unwrap_err();
+        // Use the same blocking path as `FsBlobStore::put`, with a fixed
+        // capacity snapshot: 101 bytes clears a 100-byte floor by itself,
+        // but a pending two-byte write would leave only 99 bytes. Sampling
+        // the host-wide APFS free-space gauge here made the old test flaky:
+        // unrelated cleanup could legitimately replenish more than its
+        // 64 MiB cushion between the test's sample and the put's sample.
+        let err = put_blocking_with_space_probe(&root, 100, vec![7u8; 2], |_| Ok(101)).unwrap_err();
         assert!(
             matches!(err, StorageError::CapacityFloor { .. }),
             "a write-size-aware floor check must reject a write that pushes the volume \
@@ -624,62 +621,29 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn concurrent_puts_cannot_jointly_breach_the_floor_via_a_stale_snapshot() {
-        // Pin the floor so at most ONE `payload_len`-sized
-        // write may land before the floor is crossed. Fire two DIFFERENT
-        // (non-deduping) payloads of that size concurrently. Before the
-        // per-root `write_lock`, both puts could independently read the SAME
-        // pre-write `available_space` snapshot, both pass their own
-        // write-size-aware check against it (neither sees the other's
-        // pending write), and both actually write — jointly breaching the
-        // floor. With serialization, the second put's check only runs after
-        // the first put's write has actually landed on disk, so it observes
-        // the reduced space. The decisive, noise-tolerant invariant is that
-        // BOTH can never succeed (under the pre-fix code, both reliably
-        // would, since the floor is deliberately set a full `payload_len`
-        // below the pre-test reading and neither write's own size was
-        // subtracted): assert at most one success and at least one
-        // rejection, rather than pinning an exact 1-success/1-reject split,
-        // since which side of the boundary a given put lands on is
-        // legitimately sensitive to real, unrelated disk churn on a shared
-        // dev/CI box. `payload_len` (64 MiB) is chosen to dwarf the few-MB
-        // swings observed in this environment.
+    #[test]
+    fn a_later_put_checks_a_fresh_capacity_snapshot() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("blobs");
         fs::create_dir_all(&root).unwrap();
-        let available = fs4::available_space(&root).unwrap();
-        let payload_len: u64 = 64 * 1024 * 1024;
-        let floor = available.saturating_sub(payload_len);
-        let store = std::sync::Arc::new(FsBlobStore::new(root, floor).unwrap());
 
-        let a = {
-            let store = store.clone();
-            tokio::spawn(async move { store.put(vec![1u8; payload_len as usize]).await })
-        };
-        let b = {
-            let store = store.clone();
-            tokio::spawn(async move { store.put(vec![2u8; payload_len as usize]).await })
-        };
-        let (result_a, result_b) = (a.await.unwrap(), b.await.unwrap());
+        // Model the two snapshots observed by serialized puts without tying
+        // the assertion to a host-wide free-space gauge. The first two-byte
+        // write may land exactly on the 100-byte floor from a 102-byte
+        // snapshot. A later, different write sees 101 bytes and must refuse.
+        // Mutual exclusion itself is covered deterministically below by the
+        // shared-root lock test; together the tests prove the stale-snapshot
+        // race is closed without relying on unrelated filesystem activity.
+        let first = put_blocking_with_space_probe(&root, 100, vec![1u8; 2], |_| Ok(102));
+        let second = put_blocking_with_space_probe(&root, 100, vec![2u8; 2], |_| Ok(101));
 
-        let successes = [&result_a, &result_b]
-            .into_iter()
-            .filter(|r| r.is_ok())
-            .count();
-        let floor_rejections = [&result_a, &result_b]
-            .into_iter()
-            .filter(|r| matches!(r, Err(StorageError::CapacityFloor { .. })))
-            .count();
         assert!(
-            successes <= 1,
-            "both concurrent puts landed -- the floor was jointly breached by a stale \
-             snapshot race: {result_a:?} / {result_b:?}"
+            first.is_ok(),
+            "the first put may land on the floor: {first:?}"
         );
         assert!(
-            floor_rejections >= 1,
-            "two payload_len writes cannot both fit in a payload_len-sized budget -- at \
-             least one rejection is expected: {result_a:?} / {result_b:?}"
+            matches!(second, Err(StorageError::CapacityFloor { .. })),
+            "the later put must use its lower capacity snapshot: {second:?}"
         );
     }
 
@@ -717,9 +681,8 @@ mod tests {
         // Lock sharing is orthogonal to floor arithmetic -- the same
         // `crosses_floor`/`put_blocking` path runs regardless of which
         // `FsBlobStore` instance calls it, and that arithmetic is already
-        // covered, disk-noise-tolerantly, by
-        // `concurrent_puts_cannot_jointly_breach_the_floor_via_a_stale_snapshot`
-        // (same-instance) and the pure `crosses_floor` unit tests above.
+        // covered deterministically by `a_later_put_checks_a_fresh_capacity_snapshot`
+        // and the pure `crosses_floor` unit tests above.
         //
         // The prior fix's negative proof (B
         // must not reach its own checkpoint) still leaned on a 200ms
