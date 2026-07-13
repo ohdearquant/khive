@@ -38,6 +38,9 @@ RUNNER_CLASSES = ("hosted_hash", "self_hosted_cpu", "self_hosted_real_embedder")
 RECORD_STATUSES = ("ok", "error", "confounded", "insufficient_samples")
 ESTIMATOR = "nearest_rank_v1"
 DISTRIBUTION_UNIT = "us"
+# A distribution with zero successful samples carries no latency evidence -
+# it cannot be the basis of a "measured" coverage verdict (khive#945).
+MIN_SUCCESSFUL_SAMPLES = 1
 
 SHA256_REF_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 
@@ -135,6 +138,15 @@ def validate_distribution(dist: dict, path: str = "distribution") -> list[str]:
     for name, value in (("attempts", attempts), ("successes", successes), ("timed_out", timed_out)):
         if not _is_nonneg_int(value):
             errors.append(_err(path, f"{name} must be a non-negative integer, got {value!r}"))
+
+    if _is_nonneg_int(successes) and successes < MIN_SUCCESSFUL_SAMPLES:
+        errors.append(
+            _err(
+                path,
+                f"successes must be >= {MIN_SUCCESSFUL_SAMPLES} - a distribution with zero "
+                "successful samples carries no measurement evidence",
+            )
+        )
 
     errors_by_code = dist.get("errors_by_code")
     errors_by_code_valid = isinstance(errors_by_code, dict)
@@ -249,6 +261,14 @@ def validate_record(record: dict) -> list[str]:
     distributions = record.get("distributions")
     if not isinstance(distributions, dict):
         errors.append(_err("distributions", "must be an object"))
+    elif not distributions:
+        errors.append(
+            _err(
+                "distributions",
+                "must contain at least one distribution - an empty distributions object "
+                "carries no measurement evidence and cannot certify a scenario as measured",
+            )
+        )
     else:
         for name, dist in distributions.items():
             errors.extend(validate_distribution(dist, path=f"distributions.{name}"))
@@ -299,6 +319,14 @@ def validate_record(record: dict) -> list[str]:
                 _err(
                     "runtime.daemon_fallback_count",
                     f"must be a non-negative integer, got {runtime['daemon_fallback_count']!r}",
+                )
+            )
+        elif runtime["daemon_fallback_count"] > 0:
+            errors.append(
+                _err(
+                    "runtime.daemon_fallback_count",
+                    f"must be 0 to count as measured, got {runtime['daemon_fallback_count']!r} - fallback-engaged "
+                    "runs cannot be certified as measured until a positive daemon-engagement proof exists",
                 )
             )
 

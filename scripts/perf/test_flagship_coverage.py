@@ -9,6 +9,7 @@ Run: python3 -m unittest scripts.perf.test_flagship_coverage -v
 from __future__ import annotations
 
 import datetime
+import hashlib
 import json
 import pathlib
 import tempfile
@@ -58,7 +59,23 @@ def _base_record(**overrides) -> dict:
         "timestamp": "2026-07-11T00:00:00+00:00",
         "status": "ok",
         "metrics": {"p50_us": 1200.0},
-        "distributions": {},
+        "distributions": {
+            "latency": {
+                "estimator": "nearest_rank_v1",
+                "unit": "us",
+                "attempts": 1000,
+                "successes": 1000,
+                "timed_out": 0,
+                "errors_by_code": {},
+                "histogram_edges_us": [0, 1000, 2000],
+                "histogram_counts": [200, 700, 100],
+                "p50_us": 1200,
+                "p95_us": 1800,
+                "p99_us": 1950,
+                "max_us": 2000,
+                "conditional_on_success": True,
+            }
+        },
         "workload": {
             "manifest_version": "1",
             "manifest_hash": "sha256:" + "d" * 64,
@@ -205,6 +222,49 @@ class SchemaValidationTests(unittest.TestCase):
         record["runtime"]["daemon_fallback_count"] = -1
         errors = flagship_schema.validate_record(record)
         self.assertTrue(any("daemon_fallback_count" in e for e in errors), errors)
+
+    def test_empty_distributions_is_rejected(self):
+        """khive#945 item 1/5: the validator's own former positive fixture
+        used `distributions: {}` - that must now fail schema validation."""
+        record = _base_record(distributions={})
+        errors = flagship_schema.validate_record(record)
+        self.assertTrue(any("distributions" in e and "at least one distribution" in e for e in errors), errors)
+
+    def test_zero_successful_samples_distribution_is_rejected(self):
+        """khive#945 item 1: a distribution present but with zero successful
+        samples carries no measurement evidence."""
+        record = _base_record()
+        dist = dict(record["distributions"]["latency"])
+        dist["successes"] = 0
+        record["distributions"] = {"latency": dist}
+        errors = flagship_schema.validate_record(record)
+        self.assertTrue(any("successes" in e for e in errors), errors)
+
+    def test_distribution_missing_error_accounting_fields_is_rejected(self):
+        """khive#945 item 2/5: a distribution missing error/timeout
+        accounting fields must fail schema validation."""
+        record = _base_record()
+        dist = dict(record["distributions"]["latency"])
+        del dist["errors_by_code"]
+        del dist["timed_out"]
+        record["distributions"] = {"latency": dist}
+        errors = flagship_schema.validate_record(record)
+        self.assertTrue(any("errors_by_code" in e for e in errors), errors)
+        self.assertTrue(any("timed_out" in e for e in errors), errors)
+
+    def test_daemon_fallback_count_positive_is_rejected(self):
+        """khive#945 item 3/5: a fallback-tainted row cannot count as
+        measured until a positive daemon-engagement proof exists."""
+        record = _base_record()
+        record["runtime"]["daemon_fallback_count"] = 1
+        errors = flagship_schema.validate_record(record)
+        self.assertTrue(any("daemon_fallback_count" in e for e in errors), errors)
+
+    def test_upgraded_base_record_fixture_still_passes(self):
+        """khive#945 item 5: the upgraded positive fixture (real distribution
+        evidence) must still be schema-valid."""
+        errors = flagship_schema.validate_record(_base_record())
+        self.assertEqual(errors, [])
 
     def test_missing_workload_manifest_metadata_is_flagged(self):
         record = _base_record()
@@ -640,12 +700,127 @@ class CoverageStatusTests(unittest.TestCase):
         report = coverage_validator.compute_coverage(manifest, [record], self.NOW)
         self.assertEqual(report["counts"]["measured"], 1)
 
+    def test_empty_distributions_row_no_longer_counts_as_measured(self):
+        """khive#945 regression guard: the validator's former positive
+        fixture shape (`distributions: {}`) must not be reported measured -
+        it fails schema validation and the scenario is confounded."""
+        scenario = _base_scenario()
+        record = _base_record(timestamp="2026-07-10T00:00:00+00:00", distributions={})
+        status, reason = coverage_validator.scenario_status(scenario, [record], self.NOW)
+        self.assertEqual(status, "confounded")
+        self.assertIn("distributions", reason)
+
+    def test_fallback_tainted_row_no_longer_counts_as_measured(self):
+        scenario = _base_scenario()
+        record = _base_record(timestamp="2026-07-10T00:00:00+00:00")
+        record["runtime"]["daemon_fallback_count"] = 3
+        status, reason = coverage_validator.scenario_status(scenario, [record], self.NOW)
+        self.assertEqual(status, "confounded")
+        self.assertIn("daemon_fallback_count", reason)
+
+    def test_missing_error_accounting_row_no_longer_counts_as_measured(self):
+        scenario = _base_scenario()
+        record = _base_record(timestamp="2026-07-10T00:00:00+00:00")
+        dist = dict(record["distributions"]["latency"])
+        del dist["errors_by_code"]
+        record["distributions"] = {"latency": dist}
+        status, reason = coverage_validator.scenario_status(scenario, [record], self.NOW)
+        self.assertEqual(status, "confounded")
+
     def test_latest_record_wins_when_multiple_exist(self):
         scenario = _base_scenario()
         older = _base_record(timestamp="2026-05-01T00:00:00+00:00")  # well outside 14d -> would be stale
         newer = _base_record(timestamp="2026-07-10T00:00:00+00:00")
         status, _ = coverage_validator.scenario_status(scenario, [older, newer], self.NOW)
         self.assertEqual(status, "measured")
+
+
+class ArtifactVerificationTests(unittest.TestCase):
+    """khive#945 item 4: raw artifact existence + sha256 verification when
+    an --artifacts-dir is resolvable, and an explicit 'unverified' marker
+    (never a silent pass) when it is not."""
+
+    NOW = datetime.datetime(2026, 7, 11, tzinfo=datetime.timezone.utc)
+
+    def _write_artifact(self, tmp: pathlib.Path, name: str, content: bytes) -> str:
+        (tmp / name).write_bytes(content)
+        return hashlib.sha256(content).hexdigest()
+
+    def test_unverified_when_no_artifacts_dir_supplied(self):
+        record = _base_record()
+        verification, reason = coverage_validator.verify_artifact(record, None)
+        self.assertEqual(verification, "unverified")
+        self.assertIn("no --artifacts-dir", reason)
+
+    def test_verified_when_file_exists_and_hash_matches(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = pathlib.Path(tmp)
+            sha = self._write_artifact(tmp_path, "report.json", b"raw benchmark output")
+            record = _base_record(artifact={"name": "report.json", "sha256": sha})
+            verification, _ = coverage_validator.verify_artifact(record, tmp_path)
+            self.assertEqual(verification, "verified")
+
+    def test_missing_when_file_does_not_exist(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            record = _base_record(artifact={"name": "report.json", "sha256": "b" * 64})
+            verification, reason = coverage_validator.verify_artifact(record, pathlib.Path(tmp))
+            self.assertEqual(verification, "missing")
+            self.assertIn("not found", reason)
+
+    def test_hash_mismatch_when_file_exists_but_hash_differs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = pathlib.Path(tmp)
+            self._write_artifact(tmp_path, "report.json", b"raw benchmark output")
+            record = _base_record(artifact={"name": "report.json", "sha256": "b" * 64})
+            verification, reason = coverage_validator.verify_artifact(record, tmp_path)
+            self.assertEqual(verification, "hash_mismatch")
+            self.assertIn("hashes to", reason)
+
+    def test_compute_coverage_downgrades_measured_to_confounded_on_hash_mismatch(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = pathlib.Path(tmp)
+            self._write_artifact(tmp_path, "report.json", b"raw benchmark output")
+            scenario = _base_scenario()
+            manifest = {"scenario": [scenario]}
+            version, current_hash = coverage_validator.current_manifest_identity(manifest)
+            record = _base_record(
+                timestamp="2026-07-10T00:00:00+00:00",
+                artifact={"name": "report.json", "sha256": "b" * 64},
+                workload={
+                    "manifest_version": version,
+                    "manifest_hash": current_hash,
+                    "scenario_id": "f1.recall.warm.real",
+                    "fixture": "memory_12k_sentinel_settled",
+                    "fixture_hash": "sha256:" + "a" * 64,
+                    "scale": {"memories": 12000},
+                    "concurrency": 1,
+                    "attempts": 1000,
+                },
+            )
+            report = coverage_validator.compute_coverage(manifest, [record], self.NOW, artifacts_dir=tmp_path)
+            self.assertEqual(report["counts"]["confounded"], 1)
+            self.assertEqual(report["scenarios"][0]["artifact_verification"], "hash_mismatch")
+
+    def test_compute_coverage_reports_unverified_without_artifacts_dir(self):
+        scenario = _base_scenario()
+        manifest = {"scenario": [scenario]}
+        version, current_hash = coverage_validator.current_manifest_identity(manifest)
+        record = _base_record(
+            timestamp="2026-07-10T00:00:00+00:00",
+            workload={
+                "manifest_version": version,
+                "manifest_hash": current_hash,
+                "scenario_id": "f1.recall.warm.real",
+                "fixture": "memory_12k_sentinel_settled",
+                "fixture_hash": "sha256:" + "a" * 64,
+                "scale": {"memories": 12000},
+                "concurrency": 1,
+                "attempts": 1000,
+            },
+        )
+        report = coverage_validator.compute_coverage(manifest, [record], self.NOW)
+        self.assertEqual(report["counts"]["measured"], 1)
+        self.assertEqual(report["scenarios"][0]["artifact_verification"], "unverified")
 
 
 class RecordsLoadingTests(unittest.TestCase):
