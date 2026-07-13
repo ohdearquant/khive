@@ -7833,6 +7833,56 @@ mod tests {
             "note→edge Annotates must succeed, got {result:?}"
         );
     }
+    /// #803: `neighbors(edge_id, direction=In, relations=[Annotates])` must
+    /// find the annotating note — the storage-layer `graph_edges` query
+    /// filters on `target_id = node_id` with no substrate-type check, so an
+    /// edge id works as a neighbor-query node the same as an entity or note
+    /// id. This is the runtime capability `get(edge_id)`'s new `annotations`
+    /// field (khive-pack-kg) builds on.
+    #[tokio::test]
+    async fn neighbors_edge_id_finds_annotating_note() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+        let a = rt
+            .create_entity(&tok, "concept", None, "A", None, None, vec![])
+            .await
+            .unwrap();
+        let b = rt
+            .create_entity(&tok, "concept", None, "B", None, None, vec![])
+            .await
+            .unwrap();
+        let edge = rt
+            .link(&tok, a.id, b.id, EdgeRelation::Extends, 1.0, None)
+            .await
+            .unwrap();
+        let edge_uuid: Uuid = edge.id.into();
+
+        let note = rt
+            .create_note(
+                &tok,
+                "observation",
+                None,
+                "edge note",
+                Some(0.5),
+                None,
+                vec![edge_uuid],
+            )
+            .await
+            .unwrap();
+
+        let neighbors = rt
+            .neighbors(
+                &tok,
+                edge_uuid,
+                Direction::In,
+                None,
+                Some(vec![EdgeRelation::Annotates]),
+            )
+            .await
+            .unwrap();
+        assert_eq!(neighbors.len(), 1, "expected annotating note to show up");
+        assert_eq!(neighbors[0].node_id, note.id);
+    }
 
     #[tokio::test]
     async fn create_note_annotates_real_edge_succeeds() {

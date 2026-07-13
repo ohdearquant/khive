@@ -2,6 +2,8 @@
 
 use std::str::FromStr;
 
+use std::collections::HashMap;
+
 use serde_json::Value;
 use uuid::Uuid;
 
@@ -9,7 +11,8 @@ use khive_runtime::{
     hex_prefix_to_uuid_pattern, NamespaceToken, Resolved, RuntimeError, VerbRegistry,
 };
 use khive_storage::event::Event;
-use khive_storage::types::{SqlRow, SqlStatement, SqlValue};
+use khive_storage::types::{Direction, NeighborQuery, SqlRow, SqlStatement, SqlValue};
+use khive_storage::EdgeRelation;
 use khive_types::EventKind;
 
 use super::common::{
@@ -84,7 +87,12 @@ impl KgPack {
 
         // PR-A1: by-ID edge get returns the edge regardless of namespace.
         if let Some(edge) = self.runtime.get_edge(token, id).await? {
-            return flatten_get_result("edge", to_json(&edge)?);
+            let mut edge_val = to_json(&edge)?;
+            let annotations = self.fetch_edge_annotations(token, id).await?;
+            if let Some(obj) = edge_val.as_object_mut() {
+                obj.insert("annotations".to_string(), Value::Array(annotations));
+            }
+            return flatten_get_result("edge", edge_val);
         }
 
         if let Some(event) = self.get_event_unfiltered_by_id(id).await? {
@@ -106,6 +114,61 @@ impl KgPack {
         }
 
         Err(RuntimeError::NotFound(format!("not found: {}", p.id)))
+    }
+
+    /// Annotating notes for an edge (#803): the `annotates` convention only
+    /// writes a note→edge graph edge — nothing walked it back from the edge
+    /// side, so `get(edge_id)` returned the bare edge with no way to reach
+    /// "what annotated this and why". Reuses the existing `In`-direction
+    /// `Annotates` neighbor query (already exposed by `neighbors()`) and
+    /// hydrates the full note bodies, since a neighbor hit alone carries only
+    /// a name/kind summary, not the annotation content.
+    async fn fetch_edge_annotations(
+        &self,
+        token: &NamespaceToken,
+        edge_id: Uuid,
+    ) -> Result<Vec<Value>, RuntimeError> {
+        let hits = self
+            .runtime
+            .neighbors_with_query(
+                token,
+                edge_id,
+                NeighborQuery {
+                    direction: Direction::In,
+                    relations: Some(vec![EdgeRelation::Annotates]),
+                    limit: None,
+                    min_weight: None,
+                },
+            )
+            .await?;
+        if hits.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let note_ids: Vec<Uuid> = hits.iter().map(|h| h.node_id).collect();
+        let notes = self
+            .runtime
+            .notes(token)?
+            .get_notes_batch(&note_ids)
+            .await
+            .map_err(RuntimeError::Storage)?;
+        let note_map: HashMap<Uuid, _> = notes.into_iter().map(|n| (n.id, n)).collect();
+
+        let mut out = Vec::with_capacity(hits.len());
+        for hit in hits {
+            let Some(note) = note_map.get(&hit.node_id) else {
+                continue;
+            };
+            let mut note_val = remap_note_status(normalize_entity_timestamps(to_json(note)?));
+            if let Some(obj) = note_val.as_object_mut() {
+                obj.insert(
+                    "annotation_edge_id".to_string(),
+                    Value::String(hit.edge_id.to_string()),
+                );
+            }
+            out.push(note_val);
+        }
+        Ok(out)
     }
 
     /// Fetch an event by ID without a namespace predicate (ADR-007 Rev 6 pattern).

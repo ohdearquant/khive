@@ -3832,6 +3832,205 @@ async fn neighbors_still_excludes_soft_deleted_entity_after_note_fix() {
     );
 }
 
+// ---- #803: get(edge_id) surfaces annotating notes ----
+
+/// #803: `get(edge_id)` must include an `annotations` array with the full
+/// note bodies of every note that `annotates` the edge. Before this fix,
+/// `get()` returned the bare edge with no way to reach "what annotated this
+/// edge and why" — the only read path (`neighbors()`) does not accept edge
+/// ids as a node, and there is no `annotations()` verb.
+#[tokio::test]
+async fn get_edge_includes_annotating_notes() {
+    let pack = pack();
+
+    let a = pack
+        .dispatch(
+            "create",
+            json!({"kind": "entity", "name": "Nvk803A", "entity_kind": "concept"}),
+        )
+        .await
+        .expect("create a must succeed");
+    let a_id = a.get("id").and_then(Value::as_str).unwrap().to_string();
+
+    let b = pack
+        .dispatch(
+            "create",
+            json!({"kind": "entity", "name": "Nvk803B", "entity_kind": "concept"}),
+        )
+        .await
+        .expect("create b must succeed");
+    let b_id = b.get("id").and_then(Value::as_str).unwrap().to_string();
+
+    let edge = pack
+        .dispatch(
+            "link",
+            json!({"source_id": a_id, "target_id": b_id, "relation": "supersedes", "weight": 0.8}),
+        )
+        .await
+        .expect("link must succeed");
+    let edge_id = edge.get("id").and_then(Value::as_str).unwrap().to_string();
+
+    let note = pack
+        .dispatch(
+            "create",
+            json!({
+                "kind": "note",
+                "content": "nvk803 scope: B supersedes A because of the v2 schema migration",
+                "annotates": [edge_id.clone()],
+            }),
+        )
+        .await
+        .expect("create annotating note must succeed");
+    let note_id = note.get("id").and_then(Value::as_str).unwrap().to_string();
+
+    let fetched = pack
+        .dispatch("get", json!({"id": edge_id}))
+        .await
+        .expect("get edge must succeed");
+
+    assert_eq!(fetched.get("kind").and_then(Value::as_str), Some("edge"));
+    let annotations = fetched
+        .get("annotations")
+        .and_then(Value::as_array)
+        .expect("edge get response must carry an annotations array");
+    assert_eq!(
+        annotations.len(),
+        1,
+        "expected exactly one annotating note; got {annotations:?}"
+    );
+    let annotation = &annotations[0];
+    assert_eq!(
+        annotation.get("id").and_then(Value::as_str),
+        Some(note_id.as_str())
+    );
+    assert_eq!(
+        annotation.get("content").and_then(Value::as_str),
+        Some("nvk803 scope: B supersedes A because of the v2 schema migration")
+    );
+    assert!(
+        annotation
+            .get("annotation_edge_id")
+            .and_then(Value::as_str)
+            .is_some(),
+        "annotation entry must carry the annotates-edge id: {annotation:?}"
+    );
+}
+
+/// #803 regression guard: an edge with no annotating notes must still return
+/// an `annotations` field, just empty — additive shape, no wire break for
+/// existing callers that don't look for the key.
+#[tokio::test]
+async fn get_edge_without_annotations_returns_empty_array() {
+    let pack = pack();
+
+    let a = pack
+        .dispatch(
+            "create",
+            json!({"kind": "entity", "name": "Nvk803BareA", "entity_kind": "concept"}),
+        )
+        .await
+        .expect("create a must succeed");
+    let a_id = a.get("id").and_then(Value::as_str).unwrap().to_string();
+
+    let b = pack
+        .dispatch(
+            "create",
+            json!({"kind": "entity", "name": "Nvk803BareB", "entity_kind": "concept"}),
+        )
+        .await
+        .expect("create b must succeed");
+    let b_id = b.get("id").and_then(Value::as_str).unwrap().to_string();
+
+    let edge = pack
+        .dispatch(
+            "link",
+            json!({"source_id": a_id, "target_id": b_id, "relation": "extends"}),
+        )
+        .await
+        .expect("link must succeed");
+    let edge_id = edge.get("id").and_then(Value::as_str).unwrap().to_string();
+
+    let fetched = pack
+        .dispatch("get", json!({"id": edge_id}))
+        .await
+        .expect("get edge must succeed");
+
+    let annotations = fetched
+        .get("annotations")
+        .and_then(Value::as_array)
+        .expect("edge get response must carry an annotations array even when empty");
+    assert!(
+        annotations.is_empty(),
+        "expected no annotating notes; got {annotations:?}"
+    );
+}
+
+/// #803: a soft-deleted annotating note must not leak into `get(edge_id)`'s
+/// `annotations` — mirrors the `neighbors_excludes_soft_deleted_note` (#748)
+/// guarantee that `fetch_edge_annotations` inherits by reusing
+/// `neighbors_with_query`.
+#[tokio::test]
+async fn get_edge_excludes_soft_deleted_annotating_note() {
+    let pack = pack();
+
+    let a = pack
+        .dispatch(
+            "create",
+            json!({"kind": "entity", "name": "Nvk803DelA", "entity_kind": "concept"}),
+        )
+        .await
+        .expect("create a must succeed");
+    let a_id = a.get("id").and_then(Value::as_str).unwrap().to_string();
+
+    let b = pack
+        .dispatch(
+            "create",
+            json!({"kind": "entity", "name": "Nvk803DelB", "entity_kind": "concept"}),
+        )
+        .await
+        .expect("create b must succeed");
+    let b_id = b.get("id").and_then(Value::as_str).unwrap().to_string();
+
+    let edge = pack
+        .dispatch(
+            "link",
+            json!({"source_id": a_id, "target_id": b_id, "relation": "extends"}),
+        )
+        .await
+        .expect("link must succeed");
+    let edge_id = edge.get("id").and_then(Value::as_str).unwrap().to_string();
+
+    let note = pack
+        .dispatch(
+            "create",
+            json!({
+                "kind": "note",
+                "content": "nvk803 note that will be soft-deleted",
+                "annotates": [edge_id.clone()],
+            }),
+        )
+        .await
+        .expect("create annotating note must succeed");
+    let note_id = note.get("id").and_then(Value::as_str).unwrap().to_string();
+
+    pack.dispatch("delete", json!({"id": note_id, "kind": "note"}))
+        .await
+        .expect("delete note must succeed");
+
+    let fetched = pack
+        .dispatch("get", json!({"id": edge_id}))
+        .await
+        .expect("get edge must succeed");
+    let annotations = fetched
+        .get("annotations")
+        .and_then(Value::as_array)
+        .expect("edge get response must carry an annotations array");
+    assert!(
+        annotations.is_empty(),
+        "soft-deleted annotating note must not appear; got {annotations:?}"
+    );
+}
+
 // ---- K-C1: link response preserves caller source/target for symmetric relations ----
 
 /// K-C1 regression: for `competes_with` (symmetric), the runtime canonicalises
