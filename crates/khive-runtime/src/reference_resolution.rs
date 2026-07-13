@@ -88,6 +88,29 @@ const SEARCH_SCORE_FLOOR: f64 = 0.0;
 /// "search picked this out" by confidence alone; the raw RRF value is still
 /// preserved in `ReferenceCandidate.score` for `Ambiguous` listings.
 const SEARCH_RESOLVED_CONFIDENCE: f64 = 0.6;
+/// Floor on the retrieval depth stage 4 asks `hybrid_search` for, independent
+/// of the caller's requested `limit`.
+///
+/// `KhiveRuntime::hybrid_search` truncates its returned hit list to exactly
+/// the `limit` it is called with (its final step is `fused.truncate(limit as
+/// usize)`), so that `limit` doubles as both "how deep to search" and "how
+/// many hits to hand back" — for `resolve`, whose caller-facing default
+/// `limit` is 5 (`khive_pack_kg::handlers::resolve::DEFAULT_LIMIT`), a
+/// caller asking for a short candidate list was silently also asking for a
+/// shallow search. A genuine canonical-name match ranked, say, 6th-to-10th —
+/// exactly where a qualified natural-language ref (a project prefix ahead of
+/// a short canonical name) lands when it beats the exact-name stage above
+/// but only partially matches the text leg and is corroborated by the vector
+/// leg — was truncated out of the stage-4 candidate set entirely even though
+/// the same query against a wider `limit` (e.g. the `search` verb's own
+/// default of 10) surfaces it as the top hit (#908). Retrieving at this
+/// floor decouples "how deep to search" from "how many candidates the caller
+/// asked for" — the caller's own `limit` still governs the id-string/ring
+/// stages above and is clamped to a max of 20
+/// (`khive_pack_kg::handlers::resolve::MAX_LIMIT`) by the handler, so this
+/// floor never returns more candidates than a caller could have asked for
+/// outright.
+const STAGE4_MIN_SEARCH_LIMIT: u32 = 20;
 
 /// Resolve one natural-language reference for `token`'s actor.
 ///
@@ -220,13 +243,18 @@ pub async fn resolve_reference(
         return Ok(resolution);
     }
 
-    // Stage 4: hybrid-search fallback over the namespace.
+    // Stage 4: hybrid-search fallback over the namespace. Search deeper than
+    // the caller's requested `limit` (see `STAGE4_MIN_SEARCH_LIMIT`) so a
+    // genuine match ranked just outside a small `limit` isn't truncated out
+    // of the pool before it's even ranked against the alternatives; the
+    // caller's `limit` still bounds how many candidates get rendered below.
+    let search_limit = limit.max(STAGE4_MIN_SEARCH_LIMIT);
     let hits = runtime
         .hybrid_search(
             token,
             trimmed,
             None,
-            limit.max(1),
+            search_limit,
             entity_kind,
             None,
             &[],
@@ -612,5 +640,158 @@ mod tests {
             }
             other => panic!("expected Ambiguous driven by storage total (11), got {other:?}"),
         }
+    }
+
+    // Regression for #908: a canonical-name entity ranked outside the
+    // caller's small default `limit` (resolve's default is 5) used to be
+    // dropped entirely, because the old code called `hybrid_search` with
+    // that same small `limit` and `hybrid_search`'s own final step is
+    // `fused.truncate(limit as usize)` — so a genuine match ranked, say,
+    // 8th, never survived to reach `resolve_reference`'s own candidate list
+    // at all. Twelve decoy entities that also satisfy the (trigram, plain
+    // AND-mode) FTS query out-rank the target via heavier term repetition,
+    // pushing the target below position 5 but keeping it within
+    // `STAGE4_MIN_SEARCH_LIMIT` (20). The target must still surface in the
+    // stage-4 result — as the `Ambiguous` listing's tail if not decisively
+    // first — rather than vanish outright.
+    #[tokio::test]
+    async fn fallback_stage_recovers_canonical_name_ranked_below_default_limit() {
+        let rt = KhiveRuntime::memory().expect("in-memory runtime");
+        let token = actor_token("resolver-test");
+        let ring = ReferenceRing::new();
+
+        let target = rt
+            .create_entity(
+                &token,
+                "concept",
+                None,
+                "ADR-040",
+                Some("khive ADR-040"),
+                None,
+                vec![],
+            )
+            .await
+            .expect("create target entity");
+
+        // Decoys out-rank the target by repeating the shared query terms
+        // many times (FTS5 bm25 rewards term frequency); none share the
+        // target's canonical name, so stage 3 (exact-name) never fires and
+        // stage 4 is genuinely reached.
+        for i in 0..12 {
+            rt.create_entity(
+                &token,
+                "concept",
+                None,
+                &format!("Filler{i}"),
+                Some("khive ADR-040 khive ADR-040 khive ADR-040 khive ADR-040 khive ADR-040"),
+                None,
+                vec![],
+            )
+            .await
+            .expect("create decoy entity");
+        }
+
+        let resolution = resolve_reference(&rt, &ring, &token, "khive ADR-040", 5, None)
+            .await
+            .expect("resolve_reference");
+
+        let found_target = match resolution {
+            ReferenceResolution::Resolved { id, .. } => id == target.id,
+            ReferenceResolution::Ambiguous { candidates } => {
+                candidates.iter().any(|c| c.id == target.id)
+            }
+            ReferenceResolution::NotFound => false,
+        };
+        assert!(
+            found_target,
+            "stage 4 must surface a canonical-name match ranked below the \
+             caller's default `limit` instead of dropping it (#908)"
+        );
+    }
+
+    // Regression for #908: genuine ambiguity — two entities with the exact
+    // same canonical name — must still return `Ambiguous`, never a silent
+    // pick, after widening stage 4's retrieval floor.
+    #[tokio::test]
+    async fn fallback_stage_still_reports_ambiguous_on_genuine_tie() {
+        let rt = KhiveRuntime::memory().expect("in-memory runtime");
+        let token = actor_token("resolver-test");
+        let ring = ReferenceRing::new();
+
+        let a = rt
+            .create_entity(
+                &token,
+                "concept",
+                None,
+                "Twin Record",
+                Some("khive Twin Record document"),
+                None,
+                vec![],
+            )
+            .await
+            .expect("create entity a");
+        let b = rt
+            .create_entity(
+                &token,
+                "concept",
+                None,
+                "Twin Record",
+                Some("khive Twin Record document"),
+                None,
+                vec![],
+            )
+            .await
+            .expect("create entity b");
+
+        // Exact byte-identical names hit stage 3 (exact-name storage
+        // lookup), not stage 4 — but the same "must not silently pick"
+        // contract applies at both stages, and stage 3 is a cheaper,
+        // deterministic way to pin it.
+        let resolution = resolve_reference(&rt, &ring, &token, "Twin Record", 5, None)
+            .await
+            .expect("resolve_reference");
+
+        match resolution {
+            ReferenceResolution::Ambiguous { candidates } => {
+                let ids: std::collections::HashSet<Uuid> =
+                    candidates.iter().map(|c| c.id).collect();
+                assert!(ids.contains(&a.id) && ids.contains(&b.id));
+            }
+            other => panic!("expected Ambiguous on a genuine name tie, got {other:?}"),
+        }
+    }
+
+    // Regression for #908: garbage input that matches nothing must still be
+    // `NotFound` after widening stage 4's retrieval floor — the widened pool
+    // must not turn "nothing relevant exists" into a spurious pick.
+    #[tokio::test]
+    async fn fallback_stage_still_not_found_on_garbage() {
+        let rt = KhiveRuntime::memory().expect("in-memory runtime");
+        let token = actor_token("resolver-test");
+        let ring = ReferenceRing::new();
+
+        rt.create_entity(
+            &token,
+            "concept",
+            None,
+            "ADR-040",
+            Some("khive ADR-040"),
+            None,
+            vec![],
+        )
+        .await
+        .expect("create unrelated entity");
+
+        let resolution = resolve_reference(
+            &rt,
+            &ring,
+            &token,
+            "zzqxw completely unrelated garbage nonsense",
+            5,
+            None,
+        )
+        .await
+        .expect("resolve_reference");
+        assert_eq!(resolution, ReferenceResolution::NotFound);
     }
 }
