@@ -5199,6 +5199,248 @@ mod tests {
             "a non-UUID id must not enrich"
         );
     }
+
+    // ---- khive#948: request_id survives to the persisted audit event ----
+    //
+    // The pure `resource_payload`/`base_resource_payload` helpers are unit
+    // tested in `cost_unit.rs`; these tests prove the id actually reaches
+    // `resource.request_id` on a persisted `Event` through every one of
+    // `dispatch_with_identity`'s four audit-append sites (denied, ordinary
+    // success/error, singleton-link v2 success and its v1 fallback, and the
+    // unknown-verb error path), plus the "no id supplied" omission case.
+
+    async fn first_event(store: &Arc<MemoryEventStore>) -> Event {
+        let page = store
+            .query_events(
+                EventFilter::default(),
+                PageRequest {
+                    limit: 10,
+                    offset: 0,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            page.items.len(),
+            1,
+            "expected exactly one persisted audit event"
+        );
+        page.items[0].clone()
+    }
+
+    #[tokio::test]
+    async fn dispatch_with_identity_stamps_request_id_on_success() {
+        let store = Arc::new(MemoryEventStore::default());
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(AlphaPack);
+        builder.with_event_store(store.clone());
+        let reg = builder.build().expect("registry builds");
+
+        reg.dispatch_with_identity(
+            "list",
+            serde_json::json!({"namespace": "test-ns"}),
+            Some(RequestIdentity {
+                request_id: Some(101),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let ev = first_event(&store).await;
+        assert_eq!(ev.outcome, EventOutcome::Success);
+        assert_eq!(ev.payload["resource"]["request_id"], serde_json::json!(101));
+    }
+
+    #[tokio::test]
+    async fn dispatch_with_identity_stamps_request_id_on_dispatch_error() {
+        let store = Arc::new(MemoryEventStore::default());
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(FailingProbePack);
+        builder.with_event_store(store.clone());
+        let reg = builder.build().expect("registry builds");
+
+        let err = reg
+            .dispatch_with_identity(
+                "probe",
+                serde_json::json!({"namespace": "test-ns"}),
+                Some(RequestIdentity {
+                    request_id: Some(102),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, RuntimeError::InvalidInput(_)));
+
+        let ev = first_event(&store).await;
+        assert_eq!(ev.outcome, EventOutcome::Error);
+        assert_eq!(ev.payload["resource"]["request_id"], serde_json::json!(102));
+    }
+
+    #[tokio::test]
+    async fn dispatch_with_identity_stamps_request_id_on_denied() {
+        #[derive(Debug)]
+        struct AlwaysDenyGate;
+        impl Gate for AlwaysDenyGate {
+            fn check(&self, _req: &GateRequest) -> Result<GateDecision, GateError> {
+                Ok(GateDecision::deny("denied by test"))
+            }
+        }
+
+        let store = Arc::new(MemoryEventStore::default());
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(AlphaPack);
+        builder.with_gate(Arc::new(AlwaysDenyGate));
+        builder.with_event_store(store.clone());
+        let reg = builder.build().expect("registry builds");
+
+        let err = reg
+            .dispatch_with_identity(
+                "list",
+                serde_json::json!({"namespace": "test-ns"}),
+                Some(RequestIdentity {
+                    request_id: Some(103),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, RuntimeError::PermissionDenied { .. }));
+
+        let ev = first_event(&store).await;
+        assert_eq!(ev.payload["resource"]["request_id"], serde_json::json!(103));
+    }
+
+    #[tokio::test]
+    async fn dispatch_with_identity_stamps_request_id_on_link_v2_success() {
+        let store = Arc::new(MemoryEventStore::default());
+        let edge_id = uuid::Uuid::new_v4();
+        let source_id = uuid::Uuid::new_v4();
+        let target_id = uuid::Uuid::new_v4();
+        let edge_json = serde_json::json!({
+            "id": edge_id,
+            "namespace": "local",
+            "source_id": source_id,
+            "target_id": target_id,
+            "relation": "depends_on",
+            "weight": 1.0,
+        });
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(LinkResultPack::ok(edge_json));
+        builder.with_event_store(store.clone());
+        builder.with_default_namespace("test-ns");
+        let reg = builder.build().expect("registry builds");
+
+        reg.dispatch_with_identity(
+            "link",
+            serde_json::json!({
+                "source_id": source_id,
+                "target_id": target_id,
+                "relation": "depends_on",
+            }),
+            Some(RequestIdentity {
+                namespace: "test-ns".to_string(),
+                request_id: Some(104),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+
+        let ev = first_event(&store).await;
+        assert_eq!(
+            ev.payload_schema_version, 2,
+            "successful singleton link uses audit schema v2"
+        );
+        assert_eq!(ev.payload["resource"]["request_id"], serde_json::json!(104));
+    }
+
+    #[tokio::test]
+    async fn dispatch_with_identity_stamps_request_id_on_link_v1_fallback() {
+        let store = Arc::new(MemoryEventStore::default());
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(LinkResultPack::err("target endpoint not found"));
+        builder.with_event_store(store.clone());
+        builder.with_default_namespace("test-ns");
+        let reg = builder.build().expect("registry builds");
+
+        let err = reg
+            .dispatch_with_identity(
+                "link",
+                serde_json::json!({
+                    "source_id": "note:alpha",
+                    "target_id": "note:missing",
+                    "relation": "depends_on",
+                }),
+                Some(RequestIdentity {
+                    namespace: "test-ns".to_string(),
+                    request_id: Some(105),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, RuntimeError::InvalidInput(_)));
+
+        let ev = first_event(&store).await;
+        assert_eq!(
+            ev.payload_schema_version, 1,
+            "failed link keeps the v1 audit shape"
+        );
+        assert_eq!(ev.payload["resource"]["request_id"], serde_json::json!(105));
+    }
+
+    #[tokio::test]
+    async fn dispatch_with_identity_stamps_request_id_on_unknown_verb() {
+        let store = Arc::new(MemoryEventStore::default());
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(AlphaPack);
+        builder.with_event_store(store.clone());
+        let reg = builder.build().expect("registry builds");
+
+        let err = reg
+            .dispatch_with_identity(
+                "no_such_verb",
+                serde_json::json!({}),
+                Some(RequestIdentity {
+                    namespace: Namespace::local().as_str().to_string(),
+                    request_id: Some(106),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, RuntimeError::InvalidInput(_)));
+
+        let ev = first_event(&store).await;
+        assert_eq!(ev.outcome, EventOutcome::Error);
+        assert_eq!(ev.payload["resource"]["request_id"], serde_json::json!(106));
+    }
+
+    #[tokio::test]
+    async fn dispatch_with_identity_omits_request_id_key_when_absent() {
+        let store = Arc::new(MemoryEventStore::default());
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(AlphaPack);
+        builder.with_event_store(store.clone());
+        let reg = builder.build().expect("registry builds");
+
+        // No identity at all — the pre-#948 call shape.
+        reg.dispatch("list", serde_json::json!({"namespace": "test-ns"}))
+            .await
+            .unwrap();
+
+        let ev = first_event(&store).await;
+        let resource = ev.payload["resource"]
+            .as_object()
+            .expect("resource must be an object");
+        assert!(
+            !resource.contains_key("request_id"),
+            "request_id key must be entirely absent when no id is supplied, \
+             not present as null or 0: got {resource:?}"
+        );
+    }
 }
 
 // ---- Inter-pack dependency checking ----
