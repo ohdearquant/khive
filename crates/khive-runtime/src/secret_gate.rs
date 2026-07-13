@@ -614,7 +614,7 @@ fn find_url_userinfo(text: &str) -> Option<&str> {
 /// [`contains_bounded_word`]) — bare English words that can otherwise appear
 /// as a pure substring collision inside unrelated identifiers or prose:
 /// `auth` inside `authorized`/`authentication`, `key` inside
-/// `monkey`/`turkey`/`keyword`, `secret` inside `secretary`.  Round-5 decision
+/// `monkey`/`turkey`/`keyword`, `secret` inside `secretary`.  Design decision
 /// (see the module doc): a substring collision like this poisons the trigger
 /// window on prose that never mentions credentials at all, which is a
 /// distinct failure mode from a genuine (if topical) mention of the word —
@@ -2629,7 +2629,7 @@ mod tests {
             "workspace path fable-ops/ADR-DRAFT-adr079-slices234.md for the secret gate bug";
         assert!(
             check(content).is_err(),
-            "accepted FP post round-4: structured file path near 'secret' is now \
+            "accepted FP: structured file path near 'secret' is now \
              blocked; got {:?}",
             scan(content)
         );
@@ -2641,7 +2641,7 @@ mod tests {
         let content = "key: see internal/workspaces/20260701/adr079-slices234/PACKET.md";
         assert!(
             check(content).is_err(),
-            "accepted FP post round-4: workspace path near 'key' is now blocked; \
+            "accepted FP: workspace path near 'key' is now blocked; \
              got {:?}",
             scan(content)
         );
@@ -2654,7 +2654,7 @@ mod tests {
             "auth work saved at internal/workspaces/20260701/cloud-rebuild/R1-repo-audit.md";
         assert!(
             check(content).is_err(),
-            "accepted FP post round-4: path with a short 'R1' run near 'auth' is \
+            "accepted FP: path with a short 'R1' run near 'auth' is \
              now blocked; got {:?}",
             scan(content)
         );
@@ -2862,7 +2862,7 @@ mod tests {
         for content in cases {
             assert!(
                 check(content).is_err(),
-                "round-1 bypass string must still be blocked: {content:?}, got: {:?}",
+                "bypass string must still be blocked: {content:?}, got: {:?}",
                 scan(content)
             );
         }
@@ -2899,7 +2899,7 @@ mod tests {
         for content in cases {
             assert!(
                 check(content).is_err(),
-                "round-3 padding-run bypass attempt must be blocked: {content:?}, got: {:?}",
+                "padding-run bypass attempt must be blocked: {content:?}, got: {:?}",
                 scan(content)
             );
         }
@@ -2963,7 +2963,7 @@ mod tests {
         let content = "api_key handling in fable-ops/ADR-DRAFT-adr079-slices234.md";
         assert!(
             check(content).is_err(),
-            "accepted FP: ADR-DRAFT path near 'api_key' is now blocked post round-4; \
+            "accepted FP: ADR-DRAFT path near 'api_key' is now blocked; \
              got {:?}",
             scan(content)
         );
@@ -2976,7 +2976,7 @@ mod tests {
         assert!(
             check(content).is_err(),
             "accepted FP: PACKET.md workspace path near 'api_key' is now blocked \
-             post round-4; got {:?}",
+             got {:?}",
             scan(content)
         );
     }
@@ -2988,8 +2988,8 @@ mod tests {
             "api_key handling in internal/workspaces/20260701/cloud-rebuild/R1-repo-audit.md";
         assert!(
             check(content).is_err(),
-            "accepted FP: R1-repo-audit path near 'api_key' is now blocked post \
-             round-4; got {:?}",
+            "accepted FP: R1-repo-audit path near 'api_key' is now blocked; \
+             got {:?}",
             scan(content)
         );
     }
@@ -3064,7 +3064,7 @@ mod tests {
         let content = "area_id: cfcea31d-6f50-4fd1-ad6d-5f160de1694c\n\n## Problem\nReduce Lion microkernel axioms. Converted authorized_write_requires_dominance from axiom to theorem.";
         assert!(
             check(content).is_ok(),
-            "round-5 fix: internal area_id UUID near the 'authorized' substring \
+            "internal area_id UUID near the 'authorized' substring \
              (not a genuine 'auth' mention) must now pass; got {:?}",
             scan(content)
         );
@@ -3444,7 +3444,7 @@ mod tests {
              .workspace/20260101/fix-secret-gate-trigger-false-positive/MEASUREMENT_REPORT.md";
         assert!(
             check(content).is_err(),
-            "accepted FP (round 5 unchanged): workspace artifact path near a \
+            "accepted FP: workspace artifact path near a \
              genuine standalone 'secret' mention is still blocked; got {:?}",
             scan(content)
         );
@@ -3458,7 +3458,7 @@ mod tests {
             "secret scanner archive notes: docs/_archive/ADR051-TenantEncryption-v2Notes.md";
         assert!(
             check(content).is_err(),
-            "accepted FP (round 5 unchanged): archive doc path near a genuine \
+            "accepted FP: archive doc path near a genuine \
              standalone 'secret' mention is still blocked; got {:?}",
             scan(content)
         );
@@ -3472,7 +3472,7 @@ mod tests {
         let content = "the auth scanner flagged this file: /home/user/projects/workspace/SessionNotes20260107/AuthGateFollowup2.md";
         assert!(
             check(content).is_err(),
-            "accepted FP (round 5 unchanged): absolute path near a genuine \
+            "accepted FP: absolute path near a genuine \
              standalone 'auth' mention is still blocked; got {:?}",
             scan(content)
         );
@@ -3582,8 +3582,8 @@ mod tests {
         for content in cases {
             assert!(
                 check(content).is_ok(),
-                "letter-joined substring collision must stay exempt after \
-                 round-5b: {content:?}, got {:?}",
+                "letter-joined substring collision must stay exempt: \
+                 {content:?}, got {:?}",
                 scan(content)
             );
         }

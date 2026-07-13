@@ -196,7 +196,7 @@ async fn apply_worker_applies_add_edge_changeset() {
     assert_eq!(row.status, "applied");
 }
 
-/// ADR-046 apply-worker path test for the codex PR #814 Medium finding: the
+/// ADR-046 apply-worker path test for PR #814: the
 /// five new content_strategy tests only exercised the runtime directly, not
 /// a proposal-driven merge. `apply_merge_entities` hard-codes
 /// `EntityDedupMergePolicy::PreferInto` + `ContentMergeStrategy::Append`

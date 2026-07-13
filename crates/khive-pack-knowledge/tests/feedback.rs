@@ -360,7 +360,7 @@ async fn feedback_tier2_actor_bound_profile_credited() {
 /// exists, feedback updates the pack-local section_posteriors directly — even
 /// when balanced-recall-v1 is Active (system-default fallback, not a binding match).
 ///
-/// This is the regression test for BLOCKER-2: before the fix, tier-3 fired
+/// This is a regression test: before the fix, tier-3 fired
 /// unconditionally (before tiers 1/2 were checked), and tier-2 used consumer_kind
 /// "knowledge.search" which never matched recall bindings.
 #[tokio::test]

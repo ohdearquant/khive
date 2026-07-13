@@ -765,7 +765,7 @@ mod tests {
 
     #[test]
     fn validate_brain_state_snapshot_with_capacity_rejects_version_zero_with_partial_order() {
-        // PR #535 internal review round 2 finding 2: a version-0 snapshot with a
+        // PR #535, finding 2: a version-0 snapshot with a
         // non-empty (here: partial) order is NOT the legacy empty-order
         // compatibility case. `serde(default)` lets `entity_posteriors_version`
         // silently resolve to 0 on an omitted field, so this must be rejected

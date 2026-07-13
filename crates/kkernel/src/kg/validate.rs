@@ -742,7 +742,7 @@ fn check_referential_integrity(
 ///
 /// `deny_unknown_fields`: a misspelled key (e.g. `severtiy`) must fail the
 /// load loudly, never silently fall back to the field's default (High-2,
-/// codex re-review 4e11ee38 — the repo standard here is fail-closed config).
+/// commit 4e11ee38 — the repo standard here is fail-closed config).
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RuleConfig {
@@ -2473,7 +2473,7 @@ message = "bad"
         assert!(result.passed, "sort-order should pass after fix");
     }
 
-    // ── [High] Entity-kind registry source of truth ───────────────────────────
+    // ── Entity-kind registry source of truth ───────────────────────────
 
     #[test]
     fn invalid_entity_kind_is_rejected() {
@@ -2552,7 +2552,7 @@ message = "bad"
         assert!(result.violations.is_empty());
     }
 
-    // ── [High] Note-kind validation ───────────────────────────────────────────
+    // ── Note-kind validation ───────────────────────────────────────────
 
     #[test]
     fn invalid_note_kind_is_rejected() {
@@ -2686,7 +2686,7 @@ message = "bad"
         );
     }
 
-    // ── [Medium] Record identifier in rendered output ─────────────────────────
+    // ── Record identifier in rendered output ─────────────────────────
 
     #[test]
     fn violation_message_includes_entity_id_and_name() {
@@ -3024,8 +3024,8 @@ message = "bad"
 
     #[test]
     fn edge_endpoint_types_rejects_entity_annotates_edge_endpoint() {
-        // Regression for the edge-substrate endpoint bypass (codex re-review
-        // of 4e11ee38, High-1): a `concept -[annotates]-> <edge_id>` edge must
+        // Regression for the edge-substrate endpoint bypass (commit 4e11ee38,
+        // High-1): a `concept -[annotates]-> <edge_id>` edge must
         // fail — `annotates` requires a NOTE source (operations.rs:1226-1236),
         // and an entity source is invalid regardless of what the target is.
         let tmp = TempDir::new().unwrap();
@@ -3674,7 +3674,7 @@ message = "bad"
 
     #[test]
     fn configurable_rule_checks_misspelled_key_fails_the_load() {
-        // Regression for High-2 (codex re-review of 4e11ee38): before
+        // Regression for High-2 (commit 4e11ee38): before
         // `#[serde(deny_unknown_fields)]`, a typo like `severtiy` was silently
         // ignored and the field fell back to its default — the class then ran
         // at the DEFAULT severity instead of failing loudly. Now the whole

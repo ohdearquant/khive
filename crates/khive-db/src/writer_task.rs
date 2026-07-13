@@ -49,7 +49,7 @@ type WriteOp<R> = Box<dyn FnOnce(&Connection) -> Result<R, StorageError> + Send>
 /// while [`AnyWriteRequest`] lets the drain loop hold heterogeneous
 /// requests in one homogeneous channel.
 ///
-/// `top_level` (ADR-067 Component A, Fork C slice 2 round 2): when `true`,
+/// `top_level` (ADR-067 Component A): when `true`,
 /// the drain loop runs this request's operation WITHOUT wrapping it in a
 /// `BEGIN IMMEDIATE`/`COMMIT`/`ROLLBACK` — still serialized through the
 /// single writer owner (only one request drains at a time regardless of
@@ -283,8 +283,8 @@ impl WriterTaskHandle {
     /// [`Self::send`] — the request goes through the identical bounded
     /// channel and drain loop, one request at a time — but the drain loop
     /// skips the per-request `BEGIN IMMEDIATE`/`COMMIT`/`ROLLBACK` wrap
-    /// entirely for this request (ADR-067 Component A, Fork C slice 2
-    /// round 2, BLOCKER A). The single-writer guarantee is preserved; only
+    /// entirely for this request (ADR-067 Component A). The single-writer
+    /// guarantee is preserved; only
     /// the transaction wrap is skipped.
     pub async fn send_top_level<R, F>(&self, op: F) -> Result<R, StorageError>
     where
@@ -369,7 +369,7 @@ async fn run_writer_task(
     while let Some(request) = rx.recv().await {
         let outcome = tokio::task::spawn_blocking(move || {
             if request.is_top_level() {
-                // ADR-067 Component A, Fork C slice 2 round 2 (BLOCKER A):
+                // ADR-067 Component A:
                 // no BEGIN IMMEDIATE for this request — some statements
                 // (e.g. VACUUM) are rejected by SQLite inside any open
                 // transaction. Still runs on this task's dedicated

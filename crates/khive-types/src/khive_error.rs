@@ -201,7 +201,7 @@ pub const DETAILS_TRUNCATED_KEY: &str = "details_truncated";
 /// retained and the 8th slot becomes [`DETAILS_TRUNCATED_KEY`] mapped to the
 /// dropped-pair count. [`DETAILS_TRUNCATED_KEY`] is a *reserved* key: a
 /// client-supplied pair using that name is never retained as an ordinary
-/// entry (PR #549 round-2 review) — it is stripped and folded into the
+/// entry (PR #549) — it is stripped and folded into the
 /// drop count instead, so a client can neither fake truncation on a small
 /// map nor shadow the real indicator on an oversized one. The drop count
 /// itself is tracked in an internal, non-serialized field
@@ -352,7 +352,7 @@ impl<'de> Deserialize<'de> for Details {
                 // beyond that are counted, not stored, so an adversarially
                 // large map can't inflate memory.
                 //
-                // `DETAILS_TRUNCATED_KEY` is reserved (PR #549 round-2 review):
+                // `DETAILS_TRUNCATED_KEY` is reserved (PR #549):
                 // it is never stored as an ordinary entry. Instead we track
                 // whether the wire map looks exactly like our own truncated
                 // serialization — the reserved key appears exactly once, as

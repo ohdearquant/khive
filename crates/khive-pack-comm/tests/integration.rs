@@ -1425,7 +1425,7 @@ async fn test_inbox_paginated_scan_finds_message_beyond_prefetch_window() {
     );
 }
 
-// ── Round-3 regressions: inbox limit schema + invalid status ────────────────
+// ── Regressions: inbox limit schema + invalid status ────────────────
 
 /// inbox(limit=200) must succeed — 200 is the documented and enforced maximum.
 #[tokio::test]
@@ -2718,7 +2718,7 @@ async fn t5_recipient_inbox_sees_message() {
     );
 }
 
-// T5b — ADR-057: comm.reply always writes same-namespace (Fix 1, internal review Critical #2).
+// T5b — ADR-057: comm.reply always writes same-namespace.
 //
 // Reply on a configured-actor setup proves the fail-closed reply path: after the fix,
 // handle_reply ALWAYS passes caller_ns as both `from` and `to` to dual_write_message
@@ -4215,7 +4215,7 @@ async fn ingest_routing_no_default_falls_back_to_to_field() {
     );
 }
 
-// ── Finding 2: X-Khive-Thread-ID header correlation (thread-UUID fallback) ───
+// ── X-Khive-Thread-ID header correlation (thread-UUID fallback) ───
 //
 // When our own outbound email carries X-Khive-Thread-ID = <thread_uuid>, a reply
 // that preserves that header arrives with correlation_external_id = <thread_uuid>.
@@ -4290,13 +4290,13 @@ async fn ingest_routing_reply_via_thread_uuid_routes_to_original_sender() {
     assert_eq!(
         props["to_actor"].as_str(),
         Some("lambda:khive"),
-        "Finding 2: reply correlating via thread-UUID must route to lambda:khive \
+        "reply correlating via thread-UUID must route to lambda:khive \
          (original sender's actor); got props={props}"
     );
     assert_eq!(
         props["thread_id"].as_str(),
         Some(thread_uuid.as_str()),
-        "Finding 2: ingested reply must be attached to the original thread_id; \
+        "ingested reply must be attached to the original thread_id; \
          got props={props}"
     );
 }
@@ -4586,9 +4586,9 @@ async fn ingest_omits_wire_references_when_absent() {
     );
 }
 
-// --- issue #403 finding 1: References must carry the full ancestor chain ---
+// --- issue #403: References must carry the full ancestor chain ---
 //
-// The round-1 review flagged that References was set from the single
+// The prior implementation set References from the single
 // `in_reply_to` value, dropping any ancestors before the immediate parent.
 // These tests assert the exact serialized References/In-Reply-To values
 // (not just presence) for each required case.
@@ -4795,7 +4795,7 @@ async fn reply_dedups_tainted_parent_references_chain_containing_parent_id() {
     );
 }
 
-// --- issue #448 Finding 2: quarantine metadata must survive comm.ingest persistence ---
+// --- issue #448: quarantine metadata must survive comm.ingest persistence ---
 
 /// A quarantined envelope (as `EmailChannel::quarantine_envelope` builds it, ADR-056
 /// Amendment 2026-07-02) must persist its `quarantined`/`quarantine_reason`/
@@ -5582,8 +5582,8 @@ async fn health_channel_entry_never_carries_a_healthy_bool() {
 /// `"local"` — this test exercises the read path only). An unscoped call
 /// defaults to `"local"` and must see only the local row; a call with an
 /// explicit `namespace="tenant-a"` must see only tenant-a's row, never
-/// local's. Also asserts the response's `namespace` field (khive #877 codex
-/// round 1) names the namespace actually read for both the unscoped and the
+/// local's. Also asserts the response's `namespace` field (khive #877)
+/// names the namespace actually read for both the unscoped and the
 /// explicitly-scoped call, so a caller can tell "no daemon anywhere" apart
 /// from "no rows under my scope yet" instead of the two cases being
 /// indistinguishable client-role/empty-channels responses.
@@ -6070,7 +6070,7 @@ async fn insert_thread_message(
         .expect("insert message");
 }
 
-/// codex r1 (#494 re-review): two physical messages that share the exact same
+/// #494: two physical messages that share the exact same
 /// microsecond `created_at` (e.g. what an ADR-057 dual-write self-send can
 /// produce) must not be skipped or duplicated around an id cursor — the cursor
 /// filter and sort must compare the full `(created_at, full_id)` tuple, not
@@ -6135,7 +6135,7 @@ async fn t494_thread_after_id_cursor_ties_on_equal_created_at_no_skip_no_dup() {
     );
 }
 
-/// codex r1 (#494 re-review): an `after` timestamp cursor must be parsed to
+/// #494: an `after` timestamp cursor must be parsed to
 /// microseconds (not compared as a raw string) so non-canonical but valid RFC
 /// 3339 forms — whole-second `Z`, or an explicit `+00:00` offset — compare
 /// correctly against khive's canonical microsecond timestamps.
@@ -6187,7 +6187,7 @@ async fn t494_thread_after_timestamp_cursor_accepts_noncanonical_rfc3339() {
     }
 }
 
-/// codex r1 (#494 re-review): an `after` value that is neither a resolvable
+/// #494: an `after` value that is neither a resolvable
 /// message id nor a parseable RFC 3339 timestamp must fail loudly, never be
 /// silently coerced into "no cursor" (which would return the whole thread).
 #[tokio::test]
@@ -6221,7 +6221,7 @@ async fn t494_thread_after_invalid_string_is_hard_error() {
     );
 }
 
-/// codex r1 (#494 re-review): `order="desc"` combined with an id `after` cursor
+/// #494: `order="desc"` combined with an id `after` cursor
 /// must filter against the DESC sequence, not always `created_at >`. "After" in
 /// desc order means further along the desc traversal, i.e. strictly older.
 #[tokio::test]

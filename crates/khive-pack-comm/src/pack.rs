@@ -309,19 +309,19 @@ mod help_tests {
         assert!(
             h.params.iter().any(|p| p.name == "wire_message_id"),
             "comm.ingest must declare wire_message_id param (IngestParams carries it; \
-             metadata must stay in sync per issue #403 finding 2)"
+             metadata must stay in sync per issue #403)"
         );
         assert!(
             h.params.iter().any(|p| p.name == "wire_references"),
             "comm.ingest must declare wire_references param (IngestParams carries it; \
-             metadata must stay in sync per issue #403 finding 2)"
+             metadata must stay in sync per issue #403)"
         );
     }
 
     #[test]
     fn ingest_declares_optional_metadata_param() {
         // ADR-084 Rule 3 (help fidelity): comm.ingest's IngestParams.metadata
-        // field (issue #448 Finding 2, quarantine marker passthrough) must be
+        // field (issue #448, quarantine marker passthrough) must be
         // reflected in the ParamDef/help schema, not just the Rust struct.
         let h = CommPack::HANDLERS
             .iter()

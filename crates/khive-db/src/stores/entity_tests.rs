@@ -430,7 +430,7 @@ async fn test_query_by_name_prefix_escapes_percent_wildcard() {
     );
 }
 
-// Regression for a round-1 gap on #818/#834: the two tests above prove
+// Regression for a gap on #818/#834: the two tests above prove
 // escaping keeps decoys out of the WHERE clause entirely, so they pass even
 // without the exact-match-first ORDER BY CASE. This test isolates that
 // ordering: every decoy genuinely matches the LIKE pattern "Base%" (no
@@ -835,7 +835,7 @@ async fn page_offset_over_i64max_rejected() {
 /// the `KHIVE_WRITE_QUEUE` env var — that env var is process-global and this
 /// crate's other tests are NOT `#[serial]` against it, so a window where it
 /// is set here could leak into a concurrently-scheduled test's own pool
-/// construction (ADR-067 Fork C slice 2 round 2, LOW finding).
+/// construction (ADR-067 Component A).
 #[tokio::test]
 async fn upsert_entities_routes_through_writer_task_when_flag_enabled() {
     let dir = tempfile::tempdir().unwrap();

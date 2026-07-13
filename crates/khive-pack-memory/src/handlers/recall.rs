@@ -820,8 +820,8 @@ impl MemoryPack {
                 let served_at_us = chrono::Utc::now().timestamp_micros();
                 // Tracked, not a bare tokio::spawn, so daemon shutdown's drain()
                 // waits for this append instead of a SIGTERM aborting it
-                // mid-flight with no ledger row and no log (internal review PR #583
-                // round-1 Medium). The response path still only pays for the
+                // mid-flight with no ledger row and no log (PR #583). The
+                // response path still only pays for the
                 // enqueue (an atomic increment) — never the SQL write itself.
                 khive_runtime::track_background_task(async move {
                     let mut ledger_params = json!({
@@ -864,7 +864,7 @@ impl MemoryPack {
         }
 
         if is_verbose && candidates.vector_hits_per_model.len() > 1 {
-            // Review finding (#733 fix-round 1, High): the ANN index is global
+            // #733: the ANN index is global
             // across namespaces (`ann.rs`: "one index per model covers all
             // namespaces"), so `candidates.vector_hits_per_model` still
             // carries raw, pre-hydration over-fetch candidates from outside
@@ -945,7 +945,7 @@ mod tests {
     /// `$`, so this query no longer reaches the runtime-level fail-open `Err` arm
     /// added in PR #389 — it exercises the *sanitizer*, not the fail-open net.
     /// See `recall_with_residual_fts5_char_degrades_and_vector_leg_survives` below
-    /// for a test that forces the `Err` arm itself (PR #389 internal review round 1 Medium).
+    /// for a test that forces the `Err` arm itself (PR #389).
     ///
     /// `#[serial(background_tasks)]`: a non-empty `memory.recall` fires the
     /// serve-ledger append via `khive_runtime::track_background_task`
@@ -3275,7 +3275,7 @@ mod tests {
         );
     }
 
-    /// Isolation (row-B gate, internal review PR round-1 Medium): the earlier
+    /// Isolation (row-B gate): the earlier
     /// feedback-lift and clamp tests above give one profile strictly more
     /// feedback than another, which also perturbs that profile's *global*
     /// salience posterior (component 1, ADR-104 §1) — `on_explicit_feedback`
@@ -3427,7 +3427,7 @@ mod tests {
         );
     }
 
-    /// Regression (row-B gate, internal review PR round-1 High): the entity
+    /// Regression (row-B gate): the entity
     /// term must apply on the weighted-rerank path too, not only the
     /// default `rank_score` path. `weighted_rerank` recomposes its score
     /// from raw relevance/salience/temporal features and never reads
@@ -3882,7 +3882,7 @@ mod tests {
             "an invalid namespace string must be a per-op error, not a silent fallback",
         );
         let msg = err.to_string();
-        // Review finding (#733 fix-round 1, Medium): asserting only that the
+        // #733: asserting only that the
         // message contains the word "namespace" passes vacuously (every
         // variant of this error, valid or not, contains that word). Assert
         // the *supplied* invalid value itself appears, proving the error
@@ -4069,7 +4069,7 @@ mod tests {
         );
     }
 
-    // ── #733 fix-round 1 (codex High): verbose multi-model breakdown must not
+    // ── #733: verbose multi-model breakdown must not
     // leak off-namespace ANN candidate IDs ──────────────────────────────────
 
     const NS733B_MODEL_A: &str = "ns733b-breakdown-model-a";
@@ -4107,9 +4107,9 @@ mod tests {
     /// 0.9, target cos 0.5). No `embedding_model` on remember: auto-detect
     /// fans out to every registered model, matching
     /// `ns733_seed_three_memories`'s documented gotcha above. Shared between
-    /// the `memory.recall` verbose-breakdown regression (#733 fix-round 1,
-    /// High) and the `memory.recall_candidates` regression (#733 fix-round
-    /// 2, Medium) that protects `handle_recall_candidates`'s independent
+    /// the `memory.recall` verbose-breakdown regression (#733) and the
+    /// `memory.recall_candidates` regression (#733) that protects
+    /// `handle_recall_candidates`'s independent
     /// per-model serialization site (`sub_handlers.rs`). Returns
     /// `(local_filler_ids, target_id)`.
     async fn ns733b_seed_two_model_corpus(
@@ -4154,7 +4154,7 @@ mod tests {
         (local_filler_ids, target_id)
     }
 
-    /// Codex review finding (#733 fix-round 1, High): with `namespace="bench-a"`,
+    /// #733: with `namespace="bench-a"`,
     /// more than one registered embedding model, and `include_breakdown=true`,
     /// `memory.recall`'s verbose response embeds
     /// `candidates.vector_candidates_per_model` — built directly from the
@@ -4275,10 +4275,10 @@ mod tests {
         );
     }
 
-    // ── #733 fix-round 2 (codex Medium): `memory.recall_candidates` must be
+    // ── #733: `memory.recall_candidates` must be
     // covered by its own regression, independent of `memory.recall`'s ──────
 
-    /// Codex re-review finding (#733 fix-round 2, Medium): the fix-round-1
+    /// #733: the earlier
     /// regression above dispatches only `memory.recall` with
     /// `include_breakdown=true`, which is mutation-sensitive for
     /// `handle_recall`'s filter (`recall.rs`) but *not* for
@@ -4808,7 +4808,7 @@ mod tests {
         assert!(crate::scoring::entity_lookup_candidates("   ").is_empty());
     }
 
-    // ── #889 codex r1 [Med 2]: a genuinely held embed stage ────────────────
+    // ── #889: a genuinely held embed stage ────────────────
     //
     // A `1ms` deadline racing the real uncontended in-memory pipeline (the
     // original version of this test suite) proves the wrap *can* fire, but
@@ -4866,7 +4866,7 @@ mod tests {
         }
     }
 
-    /// #889 codex r1 [Med 1]: pure unit coverage for
+    /// #889: pure unit coverage for
     /// `parse_recall_deadline_override`'s precedence and validation — an
     /// absent or explicit-`null` override falls through (returns `None`,
     /// signaling "use the process default"), a valid positive value wins,
@@ -4911,7 +4911,7 @@ mod tests {
         }
     }
 
-    /// #889 codex r1 [Med 1]: pure unit coverage for
+    /// #889: pure unit coverage for
     /// `parse_recall_deadline_env` — unlike the per-request override path,
     /// an absent, zero, negative, or non-numeric env value must all fall
     /// back to the 30s default rather than erroring (a malformed operator
@@ -4933,7 +4933,7 @@ mod tests {
         }
     }
 
-    /// #889 codex r1 [Med 1]: an invalid per-request `recall_deadline_ms`
+    /// #889: an invalid per-request `recall_deadline_ms`
     /// override (zero) must surface as a per-op `InvalidInput` error
     /// through the full `memory.recall` dispatch, not silently fall through
     /// to the process default (which a bare `0` would otherwise turn into
@@ -4983,7 +4983,7 @@ mod tests {
         }
     }
 
-    /// #889 codex r1 [Med 2]: with the query-embed stage genuinely held (not
+    /// #889: with the query-embed stage genuinely held (not
     /// racing incidental wall time), a comfortably-sized 50ms deadline must
     /// still return `DeadlineExceeded` promptly. Fail-on-revert proof:
     /// reverting `handle_recall_with_deadline`'s `tokio::time::timeout` wrap
@@ -5068,7 +5068,7 @@ mod tests {
         }
     }
 
-    /// #889 codex r1 [Med 2]: a deadline-exceeded op must not affect a
+    /// #889: a deadline-exceeded op must not affect a
     /// concurrently-dispatched sibling — mirrors the isolation the MCP
     /// layer's parallel-batch executor already provides
     /// (`khive-mcp/src/server.rs`: each op independently mapped to

@@ -150,9 +150,8 @@ mod tests {
         // (tool name only — the parse-time check does not need args),
         // EXCLUDING the governance verbs: those are still on
         // ATOMIC_ADMISSIBLE_VERBS (conceptually admissible per the ADR) but
-        // are rejected at this same static layer as known-unimplemented (B3
-        // fix round, codex REJECT Medium finding) — see the dedicated test
-        // below.
+        // are rejected at this same static layer as known-unimplemented
+        // (ADR-099 B3) — see the dedicated test below.
         let ops: Vec<ParsedOp> = ATOMIC_ADMISSIBLE_VERBS
             .iter()
             .filter(|v| !khive_types::pack::ATOMIC_KNOWN_UNIMPLEMENTED_VERBS.contains(v))
@@ -163,8 +162,7 @@ mod tests {
 
     #[test]
     fn known_unimplemented_verbs_rejected_before_any_write() {
-        // B3 fix round (codex REJECT, Medium finding + Leo refinement on
-        // Blocker 2): propose/review/withdraw AND (deferred) merge must all
+        // ADR-099 B3: propose/review/withdraw AND (deferred) merge must all
         // be rejected at THIS pre-runtime static check — not admitted here
         // and left to fail later inside `atomic_prepare::prepare_op` after a
         // runtime has already been constructed.

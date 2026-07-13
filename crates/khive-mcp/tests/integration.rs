@@ -2717,7 +2717,7 @@ fn actor_precedence_config_actor_id_does_not_route_namespace() {
 /// Tier 2 (--namespace / KHIVE_NAMESPACE with explicit value "local"): explicit
 /// --namespace local must win over a conflicting config actor.
 ///
-/// This is the regression case for [High] finding 1: previously the value
+/// This is the regression case: previously the value
 /// comparison `args.namespace != "local"` treated `--namespace local` as
 /// identical to the absent default, letting config override it.  Now that
 /// `namespace` is `Option<String>`, `Some("local")` is correctly explicit.
@@ -2793,7 +2793,7 @@ fn actor_precedence_cli_actor_wins_over_config() {
 
 /// Invalid config actor.id must be caught at load time (not silently downgraded).
 ///
-/// This is the regression case for [High] finding 2: previously an invalid
+/// This is the regression case: previously an invalid
 /// actor.id logged a warning and fell back to the base namespace.  Now it is a
 /// hard startup error via ConfigError::InvalidActorId.
 #[test]
@@ -3008,7 +3008,7 @@ fn cli_args_khive_namespace_env_is_explicit() {
     assert_eq!(ns, Namespace::parse("lambda:from-env").unwrap());
 }
 
-/// ADR-096 Fork 2 (PR #657 review, [High]): `KHIVE_ACTOR` env var must NOT
+/// ADR-096 Fork 2 (PR #657 review): `KHIVE_ACTOR` env var must NOT
 /// occupy the CLI tier at all — it no longer marks the CLI namespace as
 /// explicit, and it no longer wins over `KHIVE_NAMESPACE`. `args.rs` used to
 /// bind `--actor` to `env = "KHIVE_ACTOR"`, which made a bare shell-level
@@ -3341,7 +3341,7 @@ async fn list_rejects_unknown_kwarg() -> anyhow::Result<()> {
     Ok(())
 }
 
-// ── Round 3: MCP-wide ISO-8601 timestamps (Blocker fix) ──────────────────────
+// ── MCP-wide ISO-8601 timestamps ──────────────────────────────────────────
 
 /// `remember` must return ISO-8601 `created_at` (not a raw microsecond i64).
 #[tokio::test]
@@ -3580,7 +3580,7 @@ async fn proposal_list_returns_iso8601_timestamps() -> anyhow::Result<()> {
     Ok(())
 }
 
-// ── Round 3: cross-pack deny_unknown_fields (High fix) ───────────────────────
+// ── Cross-pack deny_unknown_fields ─────────────────────────────────────────
 
 /// `create(kind="concept", unknownkw="x")` must return `ok: false`.
 #[tokio::test]
@@ -4732,7 +4732,7 @@ async fn presentation_per_op_verbose_preserves_full_id_namespace_and_props() {
 /// (fmt-4) AlwaysVerbose verbs must skip the redundancy-drop pre-pass under
 /// `format=auto` even with the DEFAULT Agent presentation and NO per-op override.
 ///
-/// Pins the round-2 finding: `render_result` recomputed the format-time
+/// Pins the fix: `render_result` recomputed the format-time
 /// presentation only from `presentation_per_op` → batch default, blind to the
 /// `VerbPresentationPolicy::AlwaysVerbose` that `run_parsed` applies. So a
 /// policy-verbose verb (`get`) under `format=auto` with the default Agent mode
@@ -4798,7 +4798,7 @@ async fn format_auto_always_verbose_verb_skips_redundancy_drop_without_override(
         .expect("get result must be a rendered string under format=auto");
 
     // namespace="local" is elided under agent+auto (§7.3) but MUST survive for an
-    // AlwaysVerbose verb — this is the regression the round-2 fix closes.
+    // AlwaysVerbose verb — this is the regression the fix closes.
     assert!(
         rendered.contains("namespace"),
         "AlwaysVerbose get: namespace must survive redundancy-drop under format=auto + \

@@ -2549,8 +2549,8 @@ mod tests {
     }
 }
 
-// ── ADR-067 Fork C slice 2 round 3 (BLOCKER, sibling of memory.vacuum's round-2
-// BLOCKER A): `checkpoint_wal` under the write queue ───────────────────────────
+// ── ADR-067 Fork C slice 2 (sibling of memory.vacuum's Fork C slice 2
+// fix): `checkpoint_wal` under the write queue ───────────────────────────
 //
 // `checkpoint_wal` used to send `"PRAGMA wal_checkpoint(TRUNCATE);"` via plain
 // `execute_script`, which — once `execute_script` started routing through the

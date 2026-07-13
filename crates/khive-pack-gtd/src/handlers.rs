@@ -261,7 +261,7 @@ fn short_id(uuid: Uuid) -> String {
     uuid.as_hyphenated().to_string().chars().take(8).collect()
 }
 
-/// `pub` (widened from `pub(crate)`, ADR-099 B3 fix round 5, finding 3): the
+/// `pub` (widened from `pub(crate)`, ADR-099 B3, finding 3): the
 /// `--atomic` seam in `kkernel` reuses this exact resolver (full UUID or 8+
 /// hex prefix, namespace-scoped via `resolve_prefix`) to resolve `gtd.transition`
 /// / `gtd.complete` `id` args before atomic prepare, matching what
@@ -366,7 +366,7 @@ fn priority_rank(props: Option<&Value>) -> u8 {
 
 /// Build the response object for any task-shaped operation.
 ///
-/// `pub` (widened from private, ADR-099 B3 fix round 5, finding 4): the
+/// `pub` (widened from private, ADR-099 B3, finding 4): the
 /// `--atomic` seam in `kkernel` reuses this exact renderer, post-commit, to
 /// build the `result` payload for a committed `gtd.transition`/`gtd.complete`
 /// op — matching `handle_transition`/`handle_complete`'s response shape
@@ -462,7 +462,7 @@ const TASK_SCAN_MAX_ROWS: u32 = 20_000;
 /// `query_notes_filtered_bounded` fetches at most `TASK_SCAN_MAX_ROWS + 1`
 /// rows in one SQL statement with deterministic ordering — one consistent
 /// snapshot, not a `COUNT(*)` followed by independent paged reads that a
-/// concurrent insert could split across (issue #825 round 2: the prior
+/// concurrent insert could split across (issue #825: the prior
 /// page-loop version re-queried the store per page with no transaction
 /// spanning them, so a row inserted between pages could appear duplicated
 /// across a page boundary, or the scan could hit its cap and still return

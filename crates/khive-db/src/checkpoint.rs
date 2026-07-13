@@ -1279,7 +1279,7 @@ mod tests {
     /// `#[serial(tx_registry)]`: the registry is a process-wide singleton
     /// shared across every test in this binary — see `pool.rs`'s and
     /// `sql_bridge.rs`'s registry tests, which share this same serial group
-    /// (round-1 fix: these three were previously unserialized and could
+    /// (these three were previously unserialized and could
     /// race, corrupting each other's `oldest()`/`snapshot()` reads).
     ///
     /// This test does NOT hardcode "checkpoint_tick_test" as the expected
@@ -1323,7 +1323,7 @@ mod tests {
         );
     }
 
-    /// ADR-091 Plank 0 (round-1 fix): the oldest-entry WARN and the
+    /// ADR-091 Plank 0: the oldest-entry WARN and the
     /// high-water snapshot-enumeration WARN are gated by `crossing_warn` at
     /// the call site (mirroring the WAL-threshold WARNs), so driving two
     /// consecutive above-threshold ticks through that same gate must produce
@@ -1806,7 +1806,7 @@ mod tests {
         );
     }
 
-    /// Round-2 fix (Medium finding 1): a reversed pair — `KHIVE_TX_WARN_SECS`
+    /// Fix: a reversed pair — `KHIVE_TX_WARN_SECS`
     /// >= `KHIVE_TX_MAX_AGE_SECS` — must not be honored independently. Before
     /// this fix, WARN_SECS=120 / MAX_AGE_SECS=30 parsed both values
     /// successfully (each is independently positive) and produced a sweep
@@ -1865,7 +1865,7 @@ mod tests {
         );
     }
 
-    /// Regression (Finding 1): a Skipped tick must NOT reset was_above_high_water.
+    /// Regression: a Skipped tick must NOT reset was_above_high_water.
     ///
     /// Before the fix, `checkpoint_once` returned `0` on both a genuinely-empty
     /// WAL and a writer-busy skip. The task treated `0` as an observed page count
@@ -1909,7 +1909,7 @@ mod tests {
         assert!(fired, "WARN must fire again on a new below→above crossing");
     }
 
-    /// Regression (Finding 2): warn_pages WARN fires once on crossing, not every tick.
+    /// Regression: warn_pages WARN fires once on crossing, not every tick.
     ///
     /// Before the fix, the WARN was emitted inside `checkpoint_once` on every tick
     /// while WAL sat in the warn band — log spam under sustained moderate pressure.
@@ -2626,7 +2626,7 @@ mod tests {
         );
     }
 
-    /// Round-2 fix (Medium finding 2): a stale entry (A) that closes and is
+    /// Fix: a stale entry (A) that closes and is
     /// immediately replaced by an ALREADY-stale entry (B) on the very next
     /// observed tick — no intervening below-threshold or empty tick, unlike
     /// `tx_age_sweep_rearms_after_entry_clears` above — must still emit both
@@ -3032,7 +3032,7 @@ mod tests {
             .expect("checkpoint task panicked");
     }
 
-    // Round-2 fix (Medium finding 4 + High finding): task-level regressions
+    // Fix: task-level regressions
     // that actually spawn `run_checkpoint_task` and capture its `tracing`
     // output, so the wiring at the `tx_age_state.observe(...)` call site
     // itself is under test — the pure `TxAgeSweepState` unit tests above

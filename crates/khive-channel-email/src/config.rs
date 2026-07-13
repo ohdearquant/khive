@@ -345,7 +345,7 @@ mod tests {
 
     use super::*;
 
-    // ── Env-mutation serialization (Finding 3) ────────────────────────────────
+    // ── Env-mutation serialization ────────────────────────────────────────────
     //
     // Environment variables are process-global state.  Tests that set or remove
     // them must not run concurrently or they observe each other's mutations.
@@ -439,7 +439,7 @@ mod tests {
         );
     }
 
-    // ── Finding 2: validate_sasl_string ──────────────────────────────────────
+    // ── validate_sasl_string ───────────────────────────────────────────────
 
     #[test]
     fn validate_sasl_string_rejects_control_char_in_mailbox() {

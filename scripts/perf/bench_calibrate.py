@@ -674,7 +674,7 @@ def _run_once(suite_name: str, run_dir: pathlib.Path, extra_args: list[str]) -> 
 # erf-based inverse normal (k(10) = 3.9400, within 0.05 of the pinned
 # value).
 #
-# EXPLICIT RESOLUTION (round-1 review, #830): an earlier draft of this file's
+# EXPLICIT RESOLUTION (#830): an earlier draft of this file's
 # prose described the target as "99.9% coverage". That was a documentation
 # error, not a second valid reading. Recomputing k(n) at 99.9%/95% gives
 # k(5) = 7.5314 and k(10) = 5.1556 - neither matches issue #829's pinned
@@ -798,7 +798,7 @@ class ToleranceFactorSelfCheck(unittest.TestCase):
         self.assertLess(abs(k10 - 3.98), 0.05, f"k(10)={k10!r} not within 0.05 of the pinned 3.98")
 
     def test_coverage_is_99_not_99_9_percent(self) -> None:
-        """Explicit resolution (#830 round-1): 99% coverage matches the #829
+        """Explicit resolution (#830): 99% coverage matches the #829
         pin; 99.9% does not. Locks in the module constants plus both sides
         of the discrepancy so a future edit can't silently flip this."""
         self.assertEqual(_TOLERANCE_COVERAGE, 0.99)
@@ -829,7 +829,7 @@ class ToleranceFactorSelfCheck(unittest.TestCase):
 
 class Bench1mExtractSelfCheck(unittest.TestCase):
     """Self-check for _bench1m_extract against the real vec_bench result shape
-    (#830 round-1 finding: scope=all_rows serializes an array, and
+    (#830: scope=all_rows serializes an array, and
     float(check["measured"]) crashed on it). Fixture captured from an actual
     `bash scripts/bench_1m.sh --ci-synthetic` run.
 

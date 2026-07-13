@@ -3375,8 +3375,8 @@ mod write_queue_tests {
     /// not the `KHIVE_WRITE_QUEUE` env var — that env var is process-global
     /// and this crate's other tests are NOT `#[serial]` against it, so a
     /// window where it is set here could leak into a
-    /// concurrently-scheduled test's own pool construction (ADR-067 Fork C
-    /// slice 2 round 2, LOW finding). Builds the pool inline (rather than
+    /// concurrently-scheduled test's own pool construction (ADR-067
+    /// Component A). Builds the pool inline (rather than
     /// via `make_file_backed_pool`, which hardcodes `PoolConfig::default()`)
     /// so `write_queue_enabled` can be set directly in the literal.
     #[tokio::test]

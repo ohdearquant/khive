@@ -409,7 +409,7 @@ impl PackRuntime for MemoryPack {
         fts_population_guard(&self.runtime).await;
     }
 
-    /// #750 fix-round 1: install a note-mutation hook on the runtime THIS
+    /// #750: install a note-mutation hook on the runtime THIS
     /// pack owns (`self.runtime`, not the `_runtime` param — mirrors
     /// `KgPack::register_entity_type_validator`'s multi-backend rationale:
     /// in a multi-backend deployment each pack is constructed with its own
@@ -498,7 +498,7 @@ impl MemoryPack {
     /// exactly like `handle_recall` itself already falls through to
     /// `ann_ready_timeout_ms()`. A *present*, non-null value must be a
     /// strictly positive integer — see `parse_recall_deadline_override`
-    /// (#889 codex r1 [Med 1]: a zero or malformed override is a per-op
+    /// (#889: a zero or malformed override is a per-op
     /// `InvalidInput` error, not a silent coercion to the default). This
     /// never tightens or duplicates `RecallParams`'s own validation of
     /// `params`; `handle_recall` still parses (and rejects, if malformed)
@@ -530,7 +530,7 @@ impl MemoryPack {
     }
 }
 
-/// #889 codex r1 [Med 1]: parse and validate an optional per-request
+/// #889: parse and validate an optional per-request
 /// `config.recall_deadline_ms` override. `None` (the key absent, or present
 /// as JSON `null`) means "no override" and the caller falls through to the
 /// process-wide `recall_deadline_ms()` default/env value. A *present*,
@@ -559,7 +559,7 @@ pub(crate) fn parse_recall_deadline_override(params: &Value) -> Result<Option<u6
     }
 }
 
-/// #889 codex r1 [Med 1]: pure parse/validate step for
+/// #889: pure parse/validate step for
 /// `KHIVE_MEMORY_RECALL_DEADLINE_MS`, split out of `recall_deadline_ms`'s
 /// `OnceLock` closure so it is unit-testable without touching real process
 /// environment state or the process-lifetime-cached `OnceLock` (which, once
@@ -584,7 +584,7 @@ pub(crate) fn parse_recall_deadline_env(raw: Option<&str>) -> u64 {
                 raw = %raw,
                 default_ms = DEFAULT_RECALL_DEADLINE_MS,
                 "KHIVE_MEMORY_RECALL_DEADLINE_MS=0 is not a valid recall deadline; \
-                 falling back to the default (#889 codex r1)"
+                 falling back to the default (#889)"
             );
             DEFAULT_RECALL_DEADLINE_MS
         }
@@ -593,7 +593,7 @@ pub(crate) fn parse_recall_deadline_env(raw: Option<&str>) -> u64 {
                 raw = %raw,
                 default_ms = DEFAULT_RECALL_DEADLINE_MS,
                 "KHIVE_MEMORY_RECALL_DEADLINE_MS is not a valid positive integer; \
-                 falling back to the default (#889 codex r1)"
+                 falling back to the default (#889)"
             );
             DEFAULT_RECALL_DEADLINE_MS
         }
@@ -877,10 +877,10 @@ mod ann_route_tests {
     }
 }
 
-/// #750 fix-round 1 regressions: `memory.prune`, KG `update`, and KG `delete`
+/// #750 regressions: `memory.prune`, KG `update`, and KG `delete`
 /// all mutate the same memory-note corpus the warm ANN cache is built from,
 /// but only `memory.remember` bumped `AnnState::generations` before this
-/// round. Each test here warms the cache (proving `is_current()` is `true`
+/// fix. Each test here warms the cache (proving `is_current()` is `true`
 /// for the registered model), performs the mutation WITHOUT any intervening
 /// `memory.remember`, and asserts `is_current()` is `false` afterward — the
 /// exact mechanism `handlers/common.rs`'s recall-path cache-hit gate checks
@@ -1008,7 +1008,7 @@ mod note_mutation_hook_tests {
         assert!(
             !ann::is_current(&ann, &fr1_key()).await,
             "memory.prune deleting a candidate must invalidate the warm ANN \
-             generation for affected models (#750 fix-round 1)"
+             generation for affected models (#750)"
         );
     }
 
@@ -1035,7 +1035,7 @@ mod note_mutation_hook_tests {
         assert!(
             !ann::is_current(&ann, &fr1_key()).await,
             "a KG `update` that changes a memory-kind note's content must \
-             invalidate the warm ANN generation (#750 fix-round 1)"
+             invalidate the warm ANN generation (#750)"
         );
     }
 
@@ -1062,11 +1062,11 @@ mod note_mutation_hook_tests {
         assert!(
             !ann::is_current(&ann, &fr1_key()).await,
             "a KG `delete` on a memory-kind note must invalidate the warm \
-             ANN generation (#750 fix-round 1)"
+             ANN generation (#750)"
         );
     }
 
-    /// #750 fix-round 2 (codex r2 High 1): `merge_note`'s non-dry-run
+    /// #750: `merge_note`'s non-dry-run
     /// success path reindexes the surviving note (a corpus change exactly
     /// like `update_note`'s `text_changed` branch) but never fired the
     /// note-mutation hook. Same white-box shape as the three fr1 tests
@@ -1081,8 +1081,7 @@ mod note_mutation_hook_tests {
     /// bump — this exact non-discriminating-test trap is what caught out
     /// an earlier draft of this test (confirmed by a disable/re-enable
     /// run: the earlier draft still passed with the merge fix's hook-fire
-    /// call commented out). See the fix-round-2 report for the full
-    /// before/after evidence.
+    /// call commented out).
     #[tokio::test]
     #[serial(background_tasks)]
     async fn fr2_kg_merge_invalidates_warm_ann_without_subsequent_remember() {
@@ -1159,7 +1158,7 @@ mod note_mutation_hook_tests {
         assert!(
             !ann::is_current(&ann, &fr1_key()).await,
             "a KG `merge` of two memory-kind notes must invalidate the warm \
-             ANN generation (#750 fix-round 2, codex r2 High 1)"
+             ANN generation (#750)"
         );
     }
 

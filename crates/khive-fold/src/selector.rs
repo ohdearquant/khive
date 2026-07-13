@@ -223,7 +223,7 @@ impl<T: Clone> Selector<T> for GreedySelector {
         // it must be scaled by the same weight or rank comparisons would see
         // the unweighted value while `min_score` filtering sees the weighted
         // one, silently defeating `category_weights` for any candidate that
-        // set `rank_score` (khive/PR#535 internal review round 2 finding 1).
+        // set `rank_score` (khive/PR#535, finding 1).
         if !weights.category_weights.is_empty() {
             for item in &mut inputs {
                 if let Some(ref cat) = item.category {
@@ -812,7 +812,7 @@ mod tests {
         assert_eq!(out.selected[0].id, "a");
     }
 
-    // ── DeterministicScore rank-comparator tests (fold PR #535 internal review round 1) ──
+    // ── DeterministicScore rank-comparator tests (fold PR #535) ──
 
     #[test]
     fn rejects_non_finite_rank_score() {

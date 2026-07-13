@@ -201,7 +201,7 @@ impl SqlNoteStore {
     /// reached) — no double-routing. Callers whose `f` issues more than one
     /// DML statement that must land atomically together (`upsert_note`,
     /// `try_insert_note`) use [`Self::with_writer_tx`] instead — see its doc
-    /// comment (khive #827 Finding 2).
+    /// comment (khive #827).
     async fn with_writer<F, R>(&self, op: &'static str, f: F) -> Result<R, StorageError>
     where
         F: FnOnce(&rusqlite::Connection) -> Result<R, rusqlite::Error> + Send + 'static,
@@ -224,7 +224,7 @@ impl SqlNoteStore {
 
     /// Like [`Self::with_writer`], but for callers whose closure issues more
     /// than one DML statement that must land atomically together (khive
-    /// #827 Finding 2): a single-note insert immediately followed by
+    /// #827): a single-note insert immediately followed by
     /// `assign_note_seq`. On the flag-on path the WriterTask already wraps
     /// every request in its own `BEGIN IMMEDIATE`/`COMMIT`/`ROLLBACK`, so `f`
     /// is sent unwrapped, same as `with_writer`. On the flag-off (pool-mutex)
@@ -726,7 +726,7 @@ impl NoteStore for SqlNoteStore {
     async fn upsert_notes(&self, notes: Vec<Note>) -> Result<BatchWriteSummary, StorageError> {
         let attempted = notes.len() as u64;
 
-        // khive #827 Finding 2 (round 3): route through `with_writer_tx`
+        // khive #827: route through `with_writer_tx`
         // instead of hand-rolling BEGIN IMMEDIATE/COMMIT/ROLLBACK here. The
         // old flag-off path only rolled back when the final COMMIT failed —
         // an earlier error from `batch_upsert_notes` (e.g. a failed
@@ -1065,9 +1065,9 @@ pub(crate) fn ensure_notes_schema(conn: &rusqlite::Connection) -> Result<(), rus
 }
 
 /// Anti-join backfill of `notes_seq` for any note still missing a row
-/// (khive #827 round 3). Scans `notes` in full, so callers MUST gate this to
+/// (khive #827). Scans `notes` in full, so callers MUST gate this to
 /// run at most once per backend/pool rather than on every store acquisition
-/// (khive #827 round 4 perf finding) -- see
+/// (khive #827) -- see
 /// `StorageBackend::notes_for_namespace`.
 pub(crate) fn repair_notes_seq(conn: &rusqlite::Connection) -> Result<(), rusqlite::Error> {
     conn.execute_batch(NOTES_SEQ_REPAIR_DDL)

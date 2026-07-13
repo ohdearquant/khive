@@ -1,6 +1,6 @@
 /**
  * Tests for min-edge-density rule — positive and negative cases.
- * Coverage gap identified in codex round-1 High finding.
+ * Coverage gap identified during review.
  */
 
 import { assertEquals, assertStringIncludes } from "@std/assert";

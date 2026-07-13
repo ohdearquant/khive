@@ -1272,8 +1272,7 @@ impl BrainPack {
         // genuinely absent UUID.
         use khive_runtime::Resolved;
         // ADR-041 permits both entity and note signal targets; the resolved
-        // substrate is threaded onto the emitted event below (Finding 1,
-        // round-1 codex review of #831) so the decoder can tell entity and
+        // substrate is threaded onto the emitted event below (#831) so the decoder can tell entity and
         // note signal observations apart instead of hard-coding entity.
         let target_substrate = match self
             .runtime
@@ -1365,7 +1364,7 @@ impl BrainPack {
 
         // ADR-081 §2/§6: when both scorer fields are present, the dedup claim
         // is made atomically inside the SAME `BEGIN IMMEDIATE` transaction as
-        // the fold gate's mass check-and-write AND (Finding 1, internal review round 2)
+        // the fold gate's mass check-and-write AND
         // the durable feedback event append (fold_gate.rs) — the `resolve`
         // check above is a non-atomic fast path only (it still handles the
         // common sequential case and the NotFound / forced-zero-weight
@@ -1409,7 +1408,7 @@ impl BrainPack {
             let nominal_weight = FeedbackEventKind::from_signal_str(signal)
                 .expect("is_gated_implicit implies from_signal_str is Some")
                 .update_weight();
-            // Finding 2 (internal review round 2): the forced-zero fail-safe path now
+            // The forced-zero fail-safe path now
             // runs through the SAME atomic claim+append unit as the nominal
             // path below — only the mass fold write itself is skipped — so
             // it participates in the dedup claim instead of bypassing it.
@@ -1465,7 +1464,7 @@ impl BrainPack {
             .await?;
 
             match outcome {
-                // Finding 1 fix: this is now the ONLY place a scorer-tagged
+                // This is now the ONLY place a scorer-tagged
                 // implicit call returns `deduped` — reached only when the
                 // atomic unit's claim conflicted, meaning either a prior call
                 // already committed claim+fold+event together, or (never)

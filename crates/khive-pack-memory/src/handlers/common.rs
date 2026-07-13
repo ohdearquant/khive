@@ -758,7 +758,7 @@ impl MemoryPack {
         let t_fts = if prof { Some(Instant::now()) } else { None };
         let searcher = self.runtime.text_for_notes(token)?;
 
-        // FTS5 parser syntax errors (#388, #389 round-2 High): sanitize_fts5_query
+        // FTS5 parser syntax errors (#388, #389): sanitize_fts5_query
         // already strips known-unsafe FTS5 metacharacters, but if the lexical
         // leg still errors at runtime on residual punctuation the sanitizer
         // does not strip, per #569 this now fails loud instead of degrading

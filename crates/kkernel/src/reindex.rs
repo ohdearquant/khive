@@ -2163,7 +2163,7 @@ mod tests {
 
     // Regression: run_reindex with no embedding model must still populate FTS for
     // pre-existing notes. Guards against reintroduction of the early-return that
-    // skipped the FTS pass when model_names was empty (round-1 fix).
+    // skipped the FTS pass when model_names was empty.
     #[tokio::test]
     async fn run_reindex_populates_fts_without_embedding_model() {
         use khive_storage::types::TextFilter;

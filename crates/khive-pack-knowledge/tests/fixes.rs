@@ -1931,7 +1931,7 @@ async fn search_default_rerank_decompose_guard_avoids_fts_no_such_column() {
 
 // ── embed_batch failure / count-mismatch counted as `failed` ─────────────────
 //
-// Regression for internal review round 2 HIGH finding: embed_batch Err and count-mismatch
+// Regression: embed_batch Err and count-mismatch
 // were both mapped to `skipped` (exit 0); they must map to `failed` (exit non-0
 // without --best-effort).  The knowledge index handler cannot call embed_batch
 // without a non-empty default_embedder_name, so these tests use a fake provider
@@ -2156,7 +2156,7 @@ mod embed_failure_tests {
         );
     }
 
-    // ── Section embed failure regression (internal review round 1 HIGH) ────────────────
+    // ── Section embed failure regression ────────────────
     //
     // Mirrors the atom failure tests above but exercises the SECTION path via
     // `reindex_knowledge(sections:true, atoms:false)`. Blank-text sections are
@@ -2511,7 +2511,7 @@ mod ann_bypass_regression {
     }
 }
 
-// ── exclude_status precedence regression (round-2 High-1) ─────────────────────
+// ── exclude_status precedence regression ─────────────────────
 
 // exclude_status= with NO status= must exclude matching atoms.
 // Previously the buffer logic silently ignored exclude_status when no status= was set.
@@ -2767,7 +2767,7 @@ async fn whitespace_padded_exclude_status_normalizes_to_draft() {
     );
 }
 
-// ── auto-compose draft member filter regression (round-2 High-2) ──────────────
+// ── auto-compose draft member filter regression ──────────────
 
 // When compose runs in explicit domain_ids mode (is_auto=false), draft member atoms
 // must NOT be filtered — the caller opted in by supplying the domain directly.

@@ -732,8 +732,8 @@ pub(crate) async fn ensure_ann_background(
     // Tracked, not a bare tokio::spawn, so daemon shutdown's drain() waits for
     // an in-flight remember-path warm instead of a SIGTERM (or a short-lived
     // `kkernel exec` process exiting) aborting it mid-build — same rationale
-    // as recall.rs's serve-ledger append (internal review PR #583 round-1
-    // Medium). The caller still only pays for the enqueue; the build itself
+    // as recall.rs's serve-ledger append (PR #583). The caller still only
+    // pays for the enqueue; the build itself
     // runs fully off the response path, unawaited.
     spawn_rebuild_task(rt.clone(), ann.clone(), model.to_owned(), key);
     true
@@ -2178,7 +2178,7 @@ mod tests {
         );
     }
 
-    // internal review PR #583 round-1 Medium (see the rationale comment on
+    // PR #583 (see the rationale comment on
     // ensure_ann_background): the remember-path warm must register as a
     // tracked background task, not a bare tokio::spawn, so daemon shutdown's
     // drain() waits for it. The only externally observable proof of that

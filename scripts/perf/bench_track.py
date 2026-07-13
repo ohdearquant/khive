@@ -24,7 +24,7 @@ Record shape (schema_version 2):
   {schema_version, suite, sha, branch, run_id, run_attempt, timestamp,
    metrics, host, status, error, gate_exit_code, gate_status}
 
-`run_id`/`run_attempt` (schema_version 2, round-3 finding) come from
+`run_id`/`run_attempt` (schema_version 2) come from
 `$GITHUB_RUN_ID`/`$GITHUB_RUN_ATTEMPT` and default to "local"/"1" outside
 CI. Aggregation keys on (sha, run_id, run_attempt), not sha alone - a
 rerun of the same commit (same sha, new run_id) is a distinct logical run
@@ -345,7 +345,7 @@ def build_error_record(
     """A build/extraction failure still gets a ledger row - `status: "error"`,
     empty metrics, and the failure message - instead of raising before
     `append_record` ever runs and leaving the ledger silently missing that
-    commit's data point (round-2 finding: build failures were invisible).
+    commit's data point (build failures were invisible otherwise).
     """
     return {
         "schema_version": SCHEMA_VERSION,
@@ -402,7 +402,7 @@ def _aggregate_shards(records: list[dict]) -> list[dict]:
     both undercounting distinct commits as separate "runs" and dropping
     every other shard's metrics from the rendered trend.
 
-    Keying on sha ALONE (round-3 finding) is wrong: a rerun of the same
+    Keying on sha ALONE is wrong: a rerun of the same
     commit - same sha, new `run_id` - would then merge into the FIRST run's
     row, so a pass-then-fail rerun could leave a merged record whose
     metrics came from the failing rerun but whose `gate_status` stayed
@@ -508,7 +508,7 @@ def _cmd_record(args: argparse.Namespace) -> int:
     branch = args.branch or _current_branch()
     data_dir = pathlib.Path(args.data_dir) if args.data_dir else DATA_DIR
     # `run_id`/`run_attempt` identify the workflow run/rerun a shard's record
-    # belongs to (round-3 finding: aggregating on sha alone mixes reruns of
+    # belongs to (aggregating on sha alone mixes reruns of
     # the same commit into one row). --run-id/--run-attempt let the workflow
     # pass $GITHUB_RUN_ID/$GITHUB_RUN_ATTEMPT explicitly; falling back to
     # those same env vars covers a caller that forgets the flags but still
@@ -538,8 +538,8 @@ def _cmd_record(args: argparse.Namespace) -> int:
         subprocess.TimeoutExpired,
     ) as exc:
         # A build/extraction failure (no output produced, malformed JSON, a
-        # crashed child, or a suite that ran past its timeout - round-3
-        # finding: TimeoutExpired was not caught here, so a timed-out suite
+        # crashed child, or a suite that ran past its timeout -
+        # TimeoutExpired was not caught here, so a timed-out suite
         # raised past this function instead of leaving a ledger row) must
         # still leave a ledger row - otherwise this commit's data point is
         # silently missing rather than visibly marked as failed. Write the

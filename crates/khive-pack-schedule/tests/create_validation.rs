@@ -28,7 +28,7 @@ fn build_registry_with_brain() -> (VerbRegistry, KhiveRuntime) {
 /// a `Document` subtype via its `ENTITY_TYPES`) loaded alongside schedule —
 /// used to pin that `schedule.schedule` resolves `entity_type` against the
 /// SAME boot-time composed registry as the live KG `create` handler, not
-/// just the builtin table (PR #925 codex r1, M3).
+/// just the builtin table (PR #925).
 fn build_registry_with_git() -> (VerbRegistry, KhiveRuntime) {
     let runtime = KhiveRuntime::memory().expect("in-memory runtime");
     let mut builder = VerbRegistryBuilder::new();
@@ -712,7 +712,7 @@ async fn schedule_schedule_accepts_create_with_kind() {
     assert_eq!(result["status"], "pending");
 }
 
-/// Round-2 regression: `create(kind="concept",
+/// Regression: `create(kind="concept",
 /// entity_kind="person", name="x")` is accepted by `schedule.schedule` before
 /// this fix, yet the real `create` handler
 /// (`khive-pack-kg/src/handlers/create.rs` via
@@ -899,7 +899,7 @@ async fn schedule_schedule_accepts_exact_replayable_single_action() {
     assert_eq!(result["status"], "pending");
 }
 
-// ── Round-3 review gap 1: entity_type replay-parity validation ─────────────
+// ── entity_type replay-parity validation ─────────────
 //
 // `entity_type` was never validated in the replay mirror at all: the
 // singleton path (`validate_conditional_requirements`) checked `name` but
@@ -933,7 +933,7 @@ async fn schedule_schedule_rejects_create_with_cross_kind_entity_type_singleton(
     let msg = err.to_string();
     assert!(
         msg.contains("entity_type") && msg.contains("paper"),
-        "round-3 gap 1: entity_type=\"paper\" is a Document subtype, not Concept; \
+        "entity_type=\"paper\" is a Document subtype, not Concept; \
          schedule.schedule must reject it the same way KG create does; got: {msg}"
     );
 
@@ -965,7 +965,7 @@ async fn schedule_schedule_accepts_create_with_valid_entity_type_singleton() {
             }),
         )
         .await
-        .expect("round-3 gap 1: entity_type=\"paper\" is a valid Document subtype");
+        .expect("entity_type=\"paper\" is a valid Document subtype");
 
     // Sanity: the live KG create handler must also accept this pairing.
     registry
@@ -979,7 +979,7 @@ async fn schedule_schedule_accepts_create_with_valid_entity_type_singleton() {
         .expect("sanity: the live KG create handler must accept this pairing too");
 }
 
-/// PR #925 codex r1 (M3): the tests above only ever exercise the builtin
+/// PR #925: the tests above only ever exercise the builtin
 /// `paper` subtype, so they would stay green even if schedule silently
 /// reverted to the builtin-only `EntityTypeRegistry::global()` instead of
 /// the composed `EntityTypeRegistry::with_extra(registry.all_entity_types())`
@@ -1014,7 +1014,7 @@ async fn schedule_schedule_accepts_pack_declared_entity_type_singleton_with_git_
 }
 
 /// Same pack-declared-type acceptance, but inside a bulk `create(items=[...])`
-/// entry (PR #925 codex r1, M3).
+/// entry (PR #925).
 #[tokio::test]
 async fn schedule_schedule_accepts_pack_declared_entity_type_bulk_with_git_loaded() {
     let (registry, _rt) = build_registry_with_git();
@@ -1032,7 +1032,7 @@ async fn schedule_schedule_accepts_pack_declared_entity_type_bulk_with_git_loade
 }
 
 /// Retains the no-declaring-pack rejection case alongside the new
-/// acceptance coverage above (PR #925 codex r1, M3): without a pack that
+/// acceptance coverage above (PR #925): without a pack that
 /// declares `adr`, schedule must reject it exactly like the live KG handler
 /// does when GitPack isn't loaded.
 #[tokio::test]
@@ -1071,7 +1071,7 @@ async fn schedule_schedule_accepts_entity_type_alias_singleton() {
             }),
         )
         .await
-        .expect("round-3 gap 1: entity_type alias \"algo\" must resolve to \"algorithm\"");
+        .expect("entity_type alias \"algo\" must resolve to \"algorithm\"");
 
     registry
         .dispatch(
@@ -1137,7 +1137,7 @@ async fn schedule_schedule_rejects_create_bulk_item_with_cross_kind_entity_type(
     let msg = err.to_string();
     assert!(
         msg.contains("items[0]") && msg.contains("entity_type"),
-        "round-3 gap 1: bulk items[] entity_type must be validated per-entry the same way \
+        "bulk items[] entity_type must be validated per-entry the same way \
          the real KG bulk create handler does; got: {msg}"
     );
 
@@ -1170,7 +1170,7 @@ async fn schedule_schedule_accepts_create_bulk_item_with_valid_entity_type() {
             }),
         )
         .await
-        .expect("round-3 gap 1: bulk entity_type=\"paper\" under kind=\"document\" is valid");
+        .expect("bulk entity_type=\"paper\" under kind=\"document\" is valid");
 
     registry
         .dispatch(
@@ -1268,16 +1268,16 @@ async fn schedule_schedule_rejects_entity_type_under_resource_kind_bulk() {
     );
 }
 
-/// Self-updating parity check (mitigates the exact drift that produced
-/// round-3 gap 1): iterate every real `khive_types::EntityKind` and every
+/// Self-updating parity check (mitigates the exact drift that produced this
+/// gap): iterate every real `khive_types::EntityKind` and every
 /// subtype the LIVE `khive-pack-kg::EntityTypeRegistry` actually has
 /// registered (via the dev-dependency), and assert `schedule.schedule`'s
 /// replay validation (`validate_entity_type_for_replay` in `handlers.rs`,
 /// which resolves subtypes through the shared `khive_types::EntityTypeRegistry`)
 /// accepts every one of them. If `BUILTIN_DEFS` ever gains a new subtype that
 /// the shared registry doesn't resolve, this test starts failing in CI
-/// instead of silently reproducing a false-rejection bug like the one round 3
-/// found.
+/// instead of silently reproducing a false-rejection bug like the one
+/// found before.
 #[tokio::test]
 async fn gap1_every_real_registry_subtype_is_accepted_by_schedule() {
     use khive_pack_kg::EntityTypeRegistry;
@@ -1316,7 +1316,7 @@ async fn gap1_every_real_registry_subtype_is_accepted_by_schedule() {
     }
 }
 
-// ── Round-3 review gap 2: entity_kind / kind alias replay-parity ───────────
+// ── entity_kind / kind alias replay-parity ───────────
 //
 // `classify_create_kind` had no alias resolution at all — neither the base
 // `khive_types::EntityKind` aliases (e.g. "paper" -> document) nor the
@@ -1448,7 +1448,7 @@ async fn schedule_schedule_rejects_create_bulk_over_1000_entries() {
     assert!(
         err.to_string()
             .contains("bulk create limited to 1000 entries per request"),
-        "round-4 gap: schedule must mirror KG's 1000-entry bulk cap at write time; got: {err}"
+        "schedule must mirror KG's 1000-entry bulk cap at write time; got: {err}"
     );
 
     let items: Vec<serde_json::Value> = (0..1001)
