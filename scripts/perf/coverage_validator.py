@@ -215,6 +215,13 @@ def load_manifest(path: pathlib.Path) -> tuple[dict, list[str]]:
         if not isinstance(sc["required_percentiles"], list) or not sc["required_percentiles"]:
             errors.append(f"{label}: required_percentiles must be a non-empty array")
 
+        if "min_successes" in sc and (
+            isinstance(sc["min_successes"], bool)
+            or not isinstance(sc["min_successes"], int)
+            or sc["min_successes"] <= 0
+        ):
+            errors.append(f"{label}: min_successes must be a positive integer, got {sc['min_successes']!r}")
+
     return data, errors
 
 
@@ -437,6 +444,17 @@ def scenario_status(
 
     declared_min_successes = scenario.get("min_successes")
     if declared_min_successes is not None:
+        # load_manifest rejects malformed values, but a programmatic caller can
+        # bypass it - a bad declaration must confound, never raise.
+        if (
+            isinstance(declared_min_successes, bool)
+            or not isinstance(declared_min_successes, int)
+            or declared_min_successes <= 0
+        ):
+            return (
+                "confounded",
+                f"scenario declares malformed min_successes {declared_min_successes!r} (must be a positive integer)",
+            )
         required_successes = max(flagship_schema.TIMED_MIN_SUCCESSES, declared_min_successes)
         for dist_name, dist in latest.get("distributions", {}).items():
             successes = dist.get("successes") if isinstance(dist, dict) else None

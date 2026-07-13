@@ -131,7 +131,9 @@ class ManifestTests(unittest.TestCase):
         for sc in scenarios:
             lines.append("[[scenario]]")
             for key, value in sc.items():
-                if isinstance(value, str):
+                if isinstance(value, bool):
+                    lines.append(f"{key} = {'true' if value else 'false'}")
+                elif isinstance(value, str):
                     lines.append(f'{key} = "{value}"')
                 elif isinstance(value, dict):
                     inner = ", ".join(
@@ -174,6 +176,17 @@ class ManifestTests(unittest.TestCase):
             path = self._write_manifest(pathlib.Path(tmp), [_base_scenario(scenario_id="not-a-valid-id")])
             _, errors = coverage_validator.load_manifest(path)
             self.assertTrue(any("does not match" in e for e in errors), errors)
+
+    def test_malformed_min_successes_is_flagged(self):
+        """khive#945 r2: min_successes is the signed-amendment floor control -
+        a malformed TOML value must be a manifest error, not a coverage crash."""
+        for bad in ("500", True, 0, -5):
+            with tempfile.TemporaryDirectory() as tmp:
+                path = self._write_manifest(pathlib.Path(tmp), [_base_scenario(min_successes=bad)])
+                _, errors = coverage_validator.load_manifest(path)
+                self.assertTrue(
+                    any("min_successes must be a positive integer" in e for e in errors), (bad, errors)
+                )
 
     def test_f3_context_full_18_point_grid_is_present(self):
         """F3's {anchor} x {hops} x {budget} grid is 2 x 3 x 3 = 18 points
@@ -823,6 +836,16 @@ class CoverageStatusTests(unittest.TestCase):
         record["distributions"] = {"latency": dist}
         status, _ = coverage_validator.scenario_status(scenario, [record], self.NOW)
         self.assertEqual(status, "measured")
+
+    def test_scenario_malformed_min_successes_confounds_instead_of_crashing(self):
+        """khive#945 r2: a programmatic caller bypassing load_manifest with a
+        malformed min_successes must get a confounded verdict, not a TypeError."""
+        record = _base_record(timestamp="2026-07-10T00:00:00+00:00")
+        for bad in ("500", True, 0, -5):
+            scenario = _base_scenario(min_successes=bad)
+            status, reason = coverage_validator.scenario_status(scenario, [record], self.NOW)
+            self.assertEqual(status, "confounded", (bad, reason))
+            self.assertIn("min_successes", reason)
 
     def test_artifact_sha256_none_is_confounded_not_measured_or_unverified(self):
         """khive#945 M1: an absent digest downgrades to confounded even when
