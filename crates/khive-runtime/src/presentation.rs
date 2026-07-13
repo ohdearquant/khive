@@ -385,7 +385,11 @@ const LIFECYCLE_NULL_PRESERVE: &[&str] = &[
 /// which `compact_timestamp` rewrote into either a relative string or a
 /// minute-truncated absolute form — either way discarding the seconds and
 /// offset the caller needs to round-trip the exact submitted value (#871).
-const PAYLOAD_TIMESTAMP_FIELDS: &[&str] = &["trigger_at"];
+///
+/// `due` on `gtd.assign`/`gtd.tasks`/`gtd.next` responses is the same shape:
+/// a top-level convenience field mirroring `properties.due`, which
+/// `parse_due` already normalizes to full RFC 3339.
+const PAYLOAD_TIMESTAMP_FIELDS: &[&str] = &["trigger_at", "due"];
 
 /// Score field names that are truncated to 3 significant figures in Agent mode.
 const SCORE_FIELDS: &[&str] = &[
@@ -884,6 +888,18 @@ mod tests {
         let out = agent(v);
         assert_eq!(out["trigger_at"], json!("2026-07-11T19:00:00-04:00"));
         assert_eq!(out["created_at"], json!("2020-01-01T10:30"));
+    }
+
+    #[test]
+    fn agent_does_not_compact_top_level_due() {
+        // gtd.assign/gtd.tasks/gtd.next return the caller-supplied `due` as
+        // a top-level convenience field mirroring `properties.due`; it must
+        // round-trip verbatim through Agent-mode presentation, the same
+        // guarantee already given to `trigger_at`.
+        let due = "2026-08-01T09:30:15-04:00";
+        let v = json!({"due": due});
+        let out = agent(v);
+        assert_eq!(out["due"], json!(due));
     }
 
     #[test]
