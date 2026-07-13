@@ -207,10 +207,12 @@ enum FallbackSeverity {
 
 /// `KHIVE_DAEMON_STRICT=1` elevates `Illegitimate`-severity fallbacks
 /// (`ConfigMismatch`, `NamespaceMismatch`) from a WARN to an error-level
-/// structured event plus a dedicated violation counter (D2-R1). It never
-/// disables the fallback itself — the request still completes locally so the
-/// caller is never dropped (SPEC_DRAFT §3 D2) — it only makes an illegitimate
-/// mismatch impossible to miss.
+/// structured event plus a dedicated violation counter (D2-R1) — see
+/// [`record_fallback`]. It also, independent of severity, rejects the request
+/// outright instead of letting it complete through local dispatch (#947) —
+/// see [`fallback_or_reject`]. Together these make an illegitimate mismatch
+/// impossible to miss AND make "strict mode active" a sound proof that no
+/// request in the window was served off the local fallback path.
 ///
 /// No hosted-vs-local auto-detection signal exists in this codebase (there is
 /// no build-time or runtime "is this the hosted fleet image" flag anywhere in
@@ -311,8 +313,10 @@ pub(crate) fn reset_fallback_counters() {
 /// every other case (non-strict mode, or a `RolloutTransient`/`NoDaemon`
 /// reason regardless of mode) logs at `warn!`, exactly as before this change
 /// (D2-R3 — strict mode keys on `FallbackReason`, never on "did a fallback
-/// happen at all"). The fallback itself is never disabled either way — the
-/// caller always proceeds to dispatch locally after this call returns.
+/// happen at all"). This function only records; it never decides whether the
+/// caller proceeds locally — every call site pairs it with
+/// [`fallback_or_reject`] (#947), which is what converts a strict-mode
+/// fallback into a hard error instead of a local dispatch.
 fn record_fallback(
     reason: FallbackReason,
     config_id_client: &str,
@@ -347,6 +351,40 @@ fn record_fallback(
             "daemon_fallback"
         );
     }
+}
+
+/// #947: the single decision point for what a caller sees when a request
+/// would fall back to local dispatch. Always records `reason` via
+/// [`record_fallback`] first — counters and the graduated WARN/ERROR log stay
+/// exactly as they were (D2-R1/D2-R3 are untouched by this function). Then,
+/// under `KHIVE_DAEMON_STRICT=1`, rejects the request instead of letting it
+/// complete locally: the interim daemon-engagement proof in Benchmark SPEC
+/// Amendment 1 §3 ("strict mode active AND daemon_fallback_count == 0") is
+/// only sound if a fallback that DID happen can never be reported back as a
+/// successful, locally-served response. Every `FallbackReason` is rejected
+/// here, not just the `Illegitimate` tier — that tier only governs the WARN
+/// vs ERROR log level inside `record_fallback`, an orthogonal concern.
+///
+/// Call exactly where the caller was about to `return None` (local dispatch)
+/// after a fallback; every production call site returns this directly.
+fn fallback_or_reject(
+    reason: FallbackReason,
+    config_id_client: &str,
+    config_id_daemon: Option<&str>,
+    namespace_client: &str,
+) -> Option<Result<String, McpError>> {
+    record_fallback(reason, config_id_client, config_id_daemon, namespace_client);
+    if is_daemon_strict_mode() {
+        return Some(Err(McpError::internal_error(
+            format!(
+                "daemon fallback rejected under KHIVE_DAEMON_STRICT=1: reason={}; \
+                 refusing to complete the request via local dispatch",
+                reason.as_str()
+            ),
+            None,
+        )));
+    }
+    None
 }
 
 // ── DaemonDispatch impl ───────────────────────────────────────────────────────
@@ -514,34 +552,31 @@ fn map_response(
     }
 
     if resp.namespace_mismatch {
-        record_fallback(
+        return fallback_or_reject(
             FallbackReason::NamespaceMismatch,
             expected_config_id,
             resp.served_config_id.as_deref(),
             namespace_client,
         );
-        return None;
     }
     if resp.config_mismatch {
-        record_fallback(
+        return fallback_or_reject(
             FallbackReason::ConfigMismatch,
             expected_config_id,
             resp.served_config_id.as_deref(),
             namespace_client,
         );
-        return None;
     }
     // Fail closed: only trust a result the daemon positively confirms it served
     // under our exact config. A legacy daemon omits `served_config_id` (→ None)
     // and a config-drifted daemon echoes a different id — both fall back local.
     if resp.served_config_id.as_deref() != Some(expected_config_id) {
-        record_fallback(
+        return fallback_or_reject(
             FallbackReason::ConfigMismatch,
             expected_config_id,
             resp.served_config_id.as_deref(),
             namespace_client,
         );
-        return None;
     }
     if resp.ok {
         Some(Ok(resp.result.unwrap_or_default()))
@@ -1686,6 +1721,13 @@ async fn wait_for_boot_quiescence_then_reprobe(frame: &DaemonRequestFrame) -> Bo
 /// has been written. `Some(Ok)` / `Some(Err)` both mean the request's fate is
 /// already decided at the daemon and the caller must not dispatch locally.
 ///
+/// #947: under `KHIVE_DAEMON_STRICT=1`, the `NoSocket` case is instead
+/// `Some(Err(..))` — see [`fallback_or_reject`] — so it no longer joins
+/// `KHIVE_NO_DAEMON` as a safe-to-dispatch-locally outcome. `KHIVE_NO_DAEMON`
+/// itself is unaffected: it is the caller's explicit, unconditional opt-out
+/// of the daemon (not a fallback — nothing is ever recorded or counted for
+/// it), so it is not a case strict mode has any basis to override.
+///
 /// The real (possibly mutating) request frame is written to the daemon socket
 /// at most once per call. A `NoSocket` outcome never writes anything, so it is
 /// safe to establish or recover the daemon (via `kill_and_respawn`, which
@@ -1749,13 +1791,12 @@ pub async fn forward_or_spawn(frame: &DaemonRequestFrame) -> Option<Result<Strin
     match kill_and_respawn(&frame.config_id, &frame.namespace).await {
         Err(e) => {
             tracing::warn!(error = %e, "failed to spawn/recover the daemon; falling back to local dispatch");
-            record_fallback(
+            return fallback_or_reject(
                 FallbackReason::NoSocket,
                 &frame.config_id,
                 None,
                 &frame.namespace,
             );
-            return None;
         }
         Ok(RecoveryOutcome::Skipped) => {
             // A concurrent client already has a live matching daemon ready.
@@ -1795,13 +1836,12 @@ pub async fn forward_or_spawn(frame: &DaemonRequestFrame) -> Option<Result<Strin
                     // and send it now that boot has quiesced.
                 }
                 BootFenceOutcome::SafeLocalFallback => {
-                    record_fallback(
+                    return fallback_or_reject(
                         FallbackReason::NoSocket,
                         &frame.config_id,
                         None,
                         &frame.namespace,
                     );
-                    return None;
                 }
                 BootFenceOutcome::HardError(err) => return Some(Err(err)),
             }
@@ -2412,6 +2452,73 @@ mod tests {
         );
     }
 
+    // ── fallback_or_reject: strict mode fails the request (#947) ──────────────
+    //
+    // #947: `KHIVE_DAEMON_STRICT=1` must turn a would-be fallback into a
+    // caller-visible error naming the reason, for EVERY `FallbackReason` —
+    // not just the `Illegitimate` tier that `record_fallback`'s WARN/ERROR
+    // log-level graduation (D2-R1) cares about. These tests exercise the
+    // decision function directly, at the same private-fn level as the
+    // `record_fallback_*` tests above, so they run in milliseconds instead of
+    // needing a real unreachable-socket round trip.
+
+    #[test]
+    #[serial]
+    fn fallback_or_reject_non_strict_returns_none_and_still_counts() {
+        with_daemon_strict(None, || {
+            reset_fallback_counters();
+            let out = fallback_or_reject(FallbackReason::NoSocket, CFG, None, NS);
+            assert!(
+                out.is_none(),
+                "non-strict mode must keep completing locally, unchanged by #947"
+            );
+            assert_eq!(fallback_count(FallbackReason::NoSocket), 1);
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn fallback_or_reject_strict_no_socket_errors_naming_the_reason() {
+        with_daemon_strict(Some("1"), || {
+            reset_fallback_counters();
+            match fallback_or_reject(FallbackReason::NoSocket, CFG, None, NS) {
+                Some(Err(McpError { message, .. })) => {
+                    assert!(
+                        message.contains("no_socket"),
+                        "error must name the fallback reason: {message}"
+                    );
+                    assert!(
+                        message.contains("KHIVE_DAEMON_STRICT"),
+                        "error should point at the mode that caused the rejection: {message}"
+                    );
+                }
+                other => panic!("strict mode must reject the request, got {other:?}"),
+            }
+            // Counters/telemetry are untouched by this change — still exactly
+            // what `record_fallback` alone would have produced.
+            assert_eq!(fallback_count(FallbackReason::NoSocket), 1);
+            assert_eq!(fallback_total(), 1);
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn fallback_or_reject_strict_config_mismatch_errors_naming_the_reason() {
+        with_daemon_strict(Some("1"), || {
+            reset_fallback_counters();
+            match fallback_or_reject(FallbackReason::ConfigMismatch, CFG, Some("other-cfg"), NS) {
+                Some(Err(McpError { message, .. })) => {
+                    assert!(message.contains("config_mismatch"), "{message}");
+                }
+                other => panic!("strict mode must reject the request, got {other:?}"),
+            }
+            // An `Illegitimate`-tier reason still bumps the pre-existing
+            // strict-violations counter exactly as it did before #947 — this
+            // change only affects the return value, never the telemetry.
+            assert_eq!(fallback_strict_violations(), 1);
+        });
+    }
+
     // ── forward_or_spawn fallback (env-mutating → serial) ─────────────────────
 
     #[tokio::test]
@@ -2450,6 +2557,103 @@ mod tests {
         assert_eq!(fallback_total(), 0);
 
         clear_daemon_env();
+    }
+
+    // #947: genuine daemon-unreachable fallback (no `KHIVE_NO_DAEMON` opt-out)
+    // must still complete locally in non-strict mode, and must reject the
+    // request in strict mode. `spawn_daemon()` really runs here (`SPAWN_COUNT`
+    // bumps) but the spawned process is this same test binary re-invoked with
+    // unrecognized args, so it never binds the socket and the daemon
+    // genuinely never becomes reachable — the same way
+    // `forward_or_spawn_blocks_on_boot_quiescence_before_local_fallback` below
+    // forces this path without a fake daemon. Each run pays the ~5s forward
+    // deadline plus the boot-quiescence reprobe.
+
+    fn unreachable_daemon_frame(config_id: &str) -> DaemonRequestFrame {
+        DaemonRequestFrame {
+            ops: "stats()".to_string(),
+            presentation: None,
+            presentation_per_op: None,
+            namespace: "test".to_string(),
+            actor_id: None,
+            visible_namespaces: Vec::new(),
+            config_id: config_id.to_string(),
+            protocol_version: PROTOCOL_VERSION,
+            probe_only: false,
+            metrics_only: false,
+            format: None,
+            format_per_op: None,
+            from_wire: false,
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn forward_or_spawn_non_strict_falls_back_locally_when_daemon_unreachable() {
+        clear_daemon_env();
+        reset_fallback_counters();
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::env::set_var("KHIVE_SOCKET", dir.path().join("khived.sock"));
+        std::env::set_var("KHIVE_PID", dir.path().join("khived.pid"));
+        std::env::set_var("KHIVE_LOCK", dir.path().join("khived.recovery.lock"));
+        std::env::remove_var("KHIVE_NO_DAEMON");
+        std::env::remove_var("KHIVE_DAEMON_STRICT");
+
+        let frame = unreachable_daemon_frame(CFG);
+        let out = forward_or_spawn(&frame).await;
+
+        assert!(
+            out.is_none(),
+            "non-strict mode must still complete the request via local dispatch \
+             when the daemon is genuinely unreachable, got {out:?}"
+        );
+        assert_eq!(fallback_count(FallbackReason::NoSocket), 1);
+
+        reset_fallback_counters();
+        clear_daemon_env();
+        std::env::remove_var("KHIVE_LOCK");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn forward_or_spawn_strict_mode_errors_when_daemon_unreachable() {
+        clear_daemon_env();
+        reset_fallback_counters();
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::env::set_var("KHIVE_SOCKET", dir.path().join("khived.sock"));
+        std::env::set_var("KHIVE_PID", dir.path().join("khived.pid"));
+        std::env::set_var("KHIVE_LOCK", dir.path().join("khived.recovery.lock"));
+        std::env::remove_var("KHIVE_NO_DAEMON");
+        std::env::set_var("KHIVE_DAEMON_STRICT", "1");
+
+        let frame = unreachable_daemon_frame(CFG);
+        let out = forward_or_spawn(&frame).await;
+
+        match out {
+            Some(Err(McpError { message, .. })) => {
+                assert!(
+                    message.contains("no_socket"),
+                    "strict-mode error must name the fallback reason: {message}"
+                );
+                assert!(
+                    message.contains("KHIVE_DAEMON_STRICT"),
+                    "strict-mode error should name the mode that rejected the \
+                     request: {message}"
+                );
+            }
+            other => panic!(
+                "KHIVE_DAEMON_STRICT=1 must reject the request instead of completing \
+                 it locally when the daemon is unreachable, got {other:?}"
+            ),
+        }
+        // Counters/telemetry stay exactly as they were before #947 — this
+        // change only affects what the caller gets back.
+        assert_eq!(fallback_count(FallbackReason::NoSocket), 1);
+
+        reset_fallback_counters();
+        clear_daemon_env();
+        std::env::remove_var("KHIVE_LOCK");
+        std::env::remove_var("KHIVE_DAEMON_STRICT");
     }
 
     // ── daemon socket round-trip (env-mutating → serial) ─────────────────────
