@@ -1105,11 +1105,16 @@ impl VerbRegistry {
                 // Persist to EventStore immediately only for denied calls.
                 if !defer_audit {
                     if let Some(store) = &self.event_store {
+                        // ADR-103 Decision (a): the closed `work_class` enum
+                        // is stamped on every event, denial included -- only
+                        // `resource.cost_unit` is scoped to a successful
+                        // dispatch by Amendment 1. `base_resource_payload()`
+                        // carries `work_class` alone, no `cost_unit` key.
                         let storage_event = build_audit_storage_event(
                             &gate_req,
                             &audit,
                             EventOutcome::Denied,
-                            None,
+                            Some(crate::cost_unit::base_resource_payload()),
                         );
                         append_audit_event_best_effort(store, storage_event, verb).await;
                     }
@@ -1306,7 +1311,12 @@ impl VerbRegistry {
                                 // amendment's "absence has exactly two
                                 // meanings" rule requires the field be
                                 // omitted, never defaulted to 0, on an
-                                // errored dispatch.
+                                // errored dispatch. `work_class` itself is
+                                // NOT one of those two omission cases
+                                // (ADR-103 Decision (a) stamps it on every
+                                // event), so an errored dispatch still gets
+                                // `resource: {"work_class": "interactive"}`,
+                                // just with no `cost_unit` key.
                                 let (outcome, resource) = match &result {
                                     Ok(ok_val) => (
                                         EventOutcome::Success,
@@ -1317,7 +1327,10 @@ impl VerbRegistry {
                                             || pack.registered_embedding_model_names().len() as i64,
                                         )),
                                     ),
-                                    Err(_) => (EventOutcome::Error, None),
+                                    Err(_) => (
+                                        EventOutcome::Error,
+                                        Some(crate::cost_unit::base_resource_payload()),
+                                    ),
                                 };
                                 let storage_event =
                                     build_audit_storage_event(&gate_req, &audit, outcome, resource)
@@ -1408,9 +1421,15 @@ impl VerbRegistry {
             if let Some(store) = &self.event_store {
                 // Dispatch is about to return `InvalidInput` below (no pack
                 // owns this verb), so the persisted outcome must be `Error`,
-                // not `Success`.
-                let storage_event =
-                    build_audit_storage_event(&gate_req, &audit, EventOutcome::Error, None);
+                // not `Success`. `work_class` is still stamped (ADR-103
+                // Decision (a)); `resource.cost_unit` is omitted, matching
+                // every other errored-dispatch row.
+                let storage_event = build_audit_storage_event(
+                    &gate_req,
+                    &audit,
+                    EventOutcome::Error,
+                    Some(crate::cost_unit::base_resource_payload()),
+                );
                 append_audit_event_best_effort(store, storage_event, verb).await;
             }
         }
@@ -2052,11 +2071,15 @@ fn target_id_from_args(args: &serde_json::Value) -> Option<uuid::Uuid> {
 /// `links`) and the deferred singleton-`link` fallback so both audit
 /// shapes are produced by one code path.
 ///
-/// `resource` is the ADR-103 Amendment 1 `resource` payload object
-/// (`{"work_class": ..., "cost_unit": ...}`) — `Some` only for a
-/// successfully-resolved dispatch, `None` for denied calls, errored
-/// dispatches, and the no-pack-owns-this-verb case. `None` here is exactly
-/// how a row omits `resource.cost_unit` entirely, never a `0`.
+/// `resource` is the ADR-103 `resource` payload object. ADR-103 Decision (a)
+/// stamps the closed `work_class` enum on every event, so every call site
+/// passes `Some`: `crate::cost_unit::resource_payload` (`{"work_class": ...,
+/// "cost_unit": ...}`) for a successfully-resolved dispatch, or
+/// `crate::cost_unit::base_resource_payload` (`{"work_class": ...}`, no
+/// `cost_unit` key) for denied calls, errored dispatches, and the
+/// no-pack-owns-this-verb case. `None` is reserved for a caller with no
+/// `work_class` to stamp at all (none exist today); it must never be used to
+/// omit `cost_unit` alone.
 fn build_audit_storage_event(
     gate_req: &GateRequest,
     audit: &AuditEvent,
@@ -4352,7 +4375,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resource_omitted_when_dispatch_returns_error() {
+    async fn resource_work_class_present_cost_unit_absent_when_dispatch_returns_error() {
         let store = Arc::new(MemoryEventStore::default());
         let mut builder = VerbRegistryBuilder::new();
         builder.register(FailingProbePack);
@@ -4377,15 +4400,21 @@ mod tests {
             .unwrap();
         assert_eq!(page.items.len(), 1);
         assert_eq!(page.items[0].outcome, EventOutcome::Error);
-        assert!(
-            page.items[0].payload.get("resource").is_none(),
-            "resource.cost_unit must be OMITTED entirely on an errored dispatch, never 0: {:?}",
+        // ADR-103 Decision (a): work_class is stamped on EVERY event, denial
+        // and error included -- only Amendment 1's cost_unit field is scoped
+        // to a successful dispatch. An errored dispatch keeps
+        // resource.work_class and omits only resource.cost_unit, never 0.
+        assert_eq!(
+            page.items[0].payload["resource"],
+            serde_json::json!({"work_class": "interactive"}),
+            "resource must carry work_class with cost_unit OMITTED (never 0) on an \
+             errored dispatch: {:?}",
             page.items[0].payload
         );
     }
 
     #[tokio::test]
-    async fn resource_omitted_when_no_pack_owns_the_verb() {
+    async fn resource_work_class_present_cost_unit_absent_when_no_pack_owns_the_verb() {
         let store = Arc::new(MemoryEventStore::default());
         let mut builder = VerbRegistryBuilder::new();
         builder.register(AlphaPack);
@@ -4407,11 +4436,14 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(page.items.len(), 1);
-        assert!(page.items[0].payload.get("resource").is_none());
+        assert_eq!(
+            page.items[0].payload["resource"],
+            serde_json::json!({"work_class": "interactive"})
+        );
     }
 
     #[tokio::test]
-    async fn resource_omitted_on_denied_dispatch() {
+    async fn resource_work_class_present_cost_unit_absent_on_denied_dispatch() {
         #[derive(Debug)]
         struct AlwaysDenyGate;
         impl Gate for AlwaysDenyGate {
@@ -4440,7 +4472,10 @@ mod tests {
             .unwrap();
         assert_eq!(page.items.len(), 1);
         assert_eq!(page.items[0].outcome, EventOutcome::Denied);
-        assert!(page.items[0].payload.get("resource").is_none());
+        assert_eq!(
+            page.items[0].payload["resource"],
+            serde_json::json!({"work_class": "interactive"})
+        );
     }
 
     #[tokio::test]
@@ -4491,7 +4526,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resource_omitted_on_link_dispatch_failure() {
+    async fn resource_work_class_present_cost_unit_absent_on_link_dispatch_failure() {
         let store = Arc::new(MemoryEventStore::default());
         let mut builder = VerbRegistryBuilder::new();
         builder.register(LinkResultPack::err("target endpoint not found"));
@@ -4520,7 +4555,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(page.items.len(), 1);
-        assert!(page.items[0].payload.get("resource").is_none());
+        assert_eq!(
+            page.items[0].payload["resource"],
+            serde_json::json!({"work_class": "interactive"})
+        );
     }
 
     // Registry audit event must carry target_id when dispatch params include it.

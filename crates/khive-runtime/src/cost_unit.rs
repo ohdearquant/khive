@@ -173,6 +173,21 @@ pub fn resource_payload(
     serde_json::json!({ "work_class": "interactive", "cost_unit": cost_unit })
 }
 
+/// Build the `resource` payload object for a dispatch that did not resolve
+/// `Ok`: `{"work_class": "interactive"}`, with no `cost_unit` key.
+///
+/// ADR-103 Decision (a) stamps the closed `work_class` enum on every event,
+/// with no exception for a denied, errored, or unknown-verb dispatch. Only
+/// `resource.cost_unit` is scoped to a successful dispatch by Amendment 1's
+/// "absence has exactly two meanings" rule (a pre-amendment event, or a
+/// dispatch that errored): `work_class` itself is not one of those two
+/// omission cases, so it must still be present. Every dispatch through
+/// `VerbRegistry::dispatch*` is `work_class: "interactive"` regardless of
+/// outcome; there is no non-interactive outcome for a verb dispatch.
+pub fn base_resource_payload() -> Value {
+    serde_json::json!({ "work_class": "interactive" })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

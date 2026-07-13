@@ -40,7 +40,7 @@ pub use atomic_plan::{
 pub use atomic_runner::{
     run_atomic_unit, AtomicOpFailure, AtomicOpPlan, AtomicRunOutcome, AtomicRunnerError,
 };
-pub use cost_unit::{cost_unit_for_dispatch, resource_payload};
+pub use cost_unit::{base_resource_payload, cost_unit_for_dispatch, resource_payload};
 pub use curation::{
     entity_fts_document, note_fts_document, ContentMergeStrategy, EdgeListFilter, EdgePatch,
     EntityDedupMergePolicy, EntityPatch, MergeSummary, NotePatch,
