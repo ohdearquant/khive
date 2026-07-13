@@ -21,12 +21,6 @@ khive-fusion = { version = "0.4.0", path = "../khive-fusion" }
 khive-retrieval = { version = "0.4.0", path = "../khive-retrieval" }
 khive-score = { version = "0.4.0", path = "../khive-score" }
 khive-brain-core = { version = "0.4.0", path = "../khive-brain-core" }
-# #866: `memory.recall` reuses `serve_ledger::compute_query_class` so the
-# `recall_executed` event's query_class matches the ADR-081 serve-ledger row's
-# exactly (same recall serve, one deterministic key). No cycle: khive-pack-brain's
-# own [dependencies] never reference khive-pack-memory (only its
-# [dev-dependencies] does, for the reverse dispatch-hook integration test).
-khive-pack-brain = { version = "0.4.0", path = "../khive-pack-brain" }
 khive-vamana = { version = "0.4.0", path = "../khive-vamana" }
 blake3 = { workspace = true }
 inventory = { workspace = true }
@@ -44,6 +38,7 @@ parking_lot = { workspace = true }
 [dev-dependencies]
 khive-db = { version = "0.4.0", path = "../khive-db" }
 khive-pack-kg = { version = "0.4.0", path = "../khive-pack-kg" }
+khive-pack-brain = { version = "0.4.0", path = "../khive-pack-brain" }
 tokio = { workspace = true, features = ["test-util"] }
 lattice-embed = { workspace = true }
 async-trait = { workspace = true }

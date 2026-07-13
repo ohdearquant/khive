@@ -21,6 +21,8 @@ serde_json = { workspace = true }
 uuid = { workspace = true }
 chrono = { workspace = true }
 rand = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
 
 [dev-dependencies]
 criterion = { workspace = true }
