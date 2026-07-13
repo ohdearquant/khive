@@ -493,24 +493,26 @@ impl MemoryPack {
     /// The deadline is read from `params.config.recall_deadline_ms` when
     /// present (a per-request override, checked here rather than inside
     /// `handle_recall` because the wrap has to start before that function's
-    /// own `deser(params)` runs) with a defensive, non-strict lookup — an
-    /// absent or malformed override just falls through to the process-wide
-    /// `recall_deadline_ms()` default/env value, exactly like `handle_recall`
-    /// itself already falls through to `ann_ready_timeout_ms()`. This never
-    /// tightens or duplicates `RecallParams`'s own validation of `params`;
-    /// `handle_recall` still parses (and rejects, if malformed) the full
-    /// params normally.
+    /// own `deser(params)` runs); an absent or explicit-`null` value falls
+    /// through to the process-wide `recall_deadline_ms()` default/env value,
+    /// exactly like `handle_recall` itself already falls through to
+    /// `ann_ready_timeout_ms()`. A *present*, non-null value must be a
+    /// strictly positive integer — see `parse_recall_deadline_override`
+    /// (#889 codex r1 [Med 1]: a zero or malformed override is a per-op
+    /// `InvalidInput` error, not a silent coercion to the default). This
+    /// never tightens or duplicates `RecallParams`'s own validation of
+    /// `params`; `handle_recall` still parses (and rejects, if malformed)
+    /// the full params normally.
     async fn handle_recall_with_deadline(
         &self,
         token: &NamespaceToken,
         params: Value,
         registry: &VerbRegistry,
     ) -> Result<Value, RuntimeError> {
-        let budget_ms = params
-            .get("config")
-            .and_then(|c| c.get("recall_deadline_ms"))
-            .and_then(|v| v.as_u64())
-            .unwrap_or_else(recall_deadline_ms);
+        let budget_ms = match parse_recall_deadline_override(&params)? {
+            Some(ms) => ms,
+            None => recall_deadline_ms(),
+        };
         let start = std::time::Instant::now();
         match tokio::time::timeout(
             std::time::Duration::from_millis(budget_ms),
@@ -528,6 +530,76 @@ impl MemoryPack {
     }
 }
 
+/// #889 codex r1 [Med 1]: parse and validate an optional per-request
+/// `config.recall_deadline_ms` override. `None` (the key absent, or present
+/// as JSON `null`) means "no override" and the caller falls through to the
+/// process-wide `recall_deadline_ms()` default/env value. A *present*,
+/// non-null value must be a strictly positive integer — matching
+/// ADR-033's invalid-config contract ("Invalid configs ... are caught at
+/// handler entry and return a per-op `{ok: false, error: ...}` response;
+/// the batch does not abort"), this returns `InvalidInput` rather than
+/// silently coercing a malformed override to the default. Silent coercion
+/// would otherwise turn a caller's `0` into an always-immediate timeout, or
+/// swallow a caller's negative/non-numeric typo into an unnoticed default.
+pub(crate) fn parse_recall_deadline_override(params: &Value) -> Result<Option<u64>, RuntimeError> {
+    let Some(raw) = params
+        .get("config")
+        .and_then(|c| c.get("recall_deadline_ms"))
+    else {
+        return Ok(None);
+    };
+    if raw.is_null() {
+        return Ok(None);
+    }
+    match raw.as_u64() {
+        Some(ms) if ms > 0 => Ok(Some(ms)),
+        _ => Err(RuntimeError::InvalidInput(format!(
+            "config.recall_deadline_ms must be a positive integer milliseconds value, got {raw}"
+        ))),
+    }
+}
+
+/// #889 codex r1 [Med 1]: pure parse/validate step for
+/// `KHIVE_MEMORY_RECALL_DEADLINE_MS`, split out of `recall_deadline_ms`'s
+/// `OnceLock` closure so it is unit-testable without touching real process
+/// environment state or the process-lifetime-cached `OnceLock` (which, once
+/// initialized by any test in this binary, can never re-observe a
+/// different env value for the rest of that test run).
+///
+/// An absent, zero, negative, or non-numeric env value all fall back to the
+/// default and log a warning — unlike an invalid *per-request* override
+/// (`parse_recall_deadline_override`), which is a hard per-op error. This
+/// asymmetry is deliberate: a caller's malformed request is a caller bug
+/// that should surface immediately; a malformed *operator* env value must
+/// not brick every `memory.recall` call on the daemon.
+pub(crate) fn parse_recall_deadline_env(raw: Option<&str>) -> u64 {
+    const DEFAULT_RECALL_DEADLINE_MS: u64 = 30_000;
+    let Some(raw) = raw else {
+        return DEFAULT_RECALL_DEADLINE_MS;
+    };
+    match raw.parse::<u64>() {
+        Ok(ms) if ms > 0 => ms,
+        Ok(_) => {
+            tracing::warn!(
+                raw = %raw,
+                default_ms = DEFAULT_RECALL_DEADLINE_MS,
+                "KHIVE_MEMORY_RECALL_DEADLINE_MS=0 is not a valid recall deadline; \
+                 falling back to the default (#889 codex r1)"
+            );
+            DEFAULT_RECALL_DEADLINE_MS
+        }
+        Err(_) => {
+            tracing::warn!(
+                raw = %raw,
+                default_ms = DEFAULT_RECALL_DEADLINE_MS,
+                "KHIVE_MEMORY_RECALL_DEADLINE_MS is not a valid positive integer; \
+                 falling back to the default (#889 codex r1)"
+            );
+            DEFAULT_RECALL_DEADLINE_MS
+        }
+    }
+}
+
 /// #889: bounded end-to-end deadline, in milliseconds, for the entire
 /// `memory.recall` pipeline. 30s sits comfortably above every latency this
 /// pipeline needs under normal-to-heavy load (single-digit-to-low-hundreds
@@ -536,14 +608,11 @@ impl MemoryPack {
 /// staying far short of the 300s client-side ceiling the deadline exists to
 /// preempt. Overridable via env for operators who need to tune it for a
 /// larger corpus or heavier sustained concurrency than the repro covered.
-fn recall_deadline_ms() -> u64 {
+pub(crate) fn recall_deadline_ms() -> u64 {
     static DEADLINE_MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *DEADLINE_MS.get_or_init(|| {
-        const DEFAULT_RECALL_DEADLINE_MS: u64 = 30_000;
-        let ms = std::env::var("KHIVE_MEMORY_RECALL_DEADLINE_MS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(DEFAULT_RECALL_DEADLINE_MS);
+        let raw = std::env::var("KHIVE_MEMORY_RECALL_DEADLINE_MS").ok();
+        let ms = parse_recall_deadline_env(raw.as_deref());
         khive_runtime::config_ledger::record_config_locked(
             "KHIVE_MEMORY_RECALL_DEADLINE_MS",
             ms.to_string(),

@@ -936,6 +936,7 @@ mod tests {
     use lattice_embed::{EmbedError, EmbeddingModel, EmbeddingService};
     use serde_json::Value;
     use serial_test::serial;
+    use tokio::sync::Notify;
     use uuid::Uuid;
 
     use crate::MemoryPack;
@@ -4807,18 +4808,138 @@ mod tests {
         assert!(crate::scoring::entity_lookup_candidates("   ").is_empty());
     }
 
-    /// #889: an absurdly small deadline override (1ms) must abort
-    /// `handle_recall` with a typed `DeadlineExceeded` error rather than let
-    /// the caller wait for the pipeline to finish. 1ms is comfortably below
-    /// this uncontended in-memory pipeline's minimum real wall time on any
-    /// machine, so the timeout branch fires deterministically without needing
-    /// to hold a lock or otherwise force contention (contrast with the #836
-    /// tests above, which simulate a specific held lock to force their
-    /// narrower ANN-wait timeout). Proves the wrap actually races the
-    /// deadline against the real pipeline and returns promptly on the
-    /// timeout branch, not just that the code compiles.
+    // ── #889 codex r1 [Med 2]: a genuinely held embed stage ────────────────
+    //
+    // A `1ms` deadline racing the real uncontended in-memory pipeline (the
+    // original version of this test suite) proves the wrap *can* fire, but
+    // whether the real pipeline actually takes more than 1ms is host/load
+    // dependent — not a deterministic regression proof for the deadline
+    // behavior under the contention that caused #889. `SlowEmbedService`
+    // gives the deadline tests below a real, host-independent contention
+    // point: its `embed()` blocks on a `Notify` the test controls directly,
+    // mirroring the `#836` tests' held-ANN-lock technique but for the
+    // query-embed stage specifically.
+
+    struct SlowEmbedService {
+        hold: Arc<Notify>,
+    }
+
+    #[async_trait]
+    impl EmbeddingService for SlowEmbedService {
+        async fn embed(
+            &self,
+            texts: &[String],
+            _model: EmbeddingModel,
+        ) -> Result<Vec<Vec<f32>>, EmbedError> {
+            self.hold.notified().await;
+            Ok(texts.iter().map(|_| vec![0.0_f32; 8]).collect())
+        }
+
+        fn supports_model(&self, _model: EmbeddingModel) -> bool {
+            true
+        }
+
+        fn name(&self) -> &'static str {
+            "slow-notify"
+        }
+    }
+
+    struct SlowEmbedProvider {
+        model_name: String,
+        hold: Arc<Notify>,
+    }
+
+    #[async_trait]
+    impl EmbedderProvider for SlowEmbedProvider {
+        fn name(&self) -> &str {
+            &self.model_name
+        }
+
+        fn dimensions(&self) -> usize {
+            8
+        }
+
+        async fn build(&self) -> Result<Arc<dyn EmbeddingService>, khive_runtime::RuntimeError> {
+            Ok(Arc::new(SlowEmbedService {
+                hold: self.hold.clone(),
+            }))
+        }
+    }
+
+    /// #889 codex r1 [Med 1]: pure unit coverage for
+    /// `parse_recall_deadline_override`'s precedence and validation — an
+    /// absent or explicit-`null` override falls through (returns `None`,
+    /// signaling "use the process default"), a valid positive value wins,
+    /// and zero/negative/non-numeric values are all rejected as
+    /// `InvalidInput` rather than silently coerced.
+    #[test]
+    fn recall_889_parse_deadline_override_precedence_and_validation() {
+        use crate::pack::parse_recall_deadline_override as parse_override;
+
+        assert_eq!(
+            parse_override(&serde_json::json!({ "query": "x", "limit": 5 })).unwrap(),
+            None,
+            "absent config.recall_deadline_ms must fall through to the process default"
+        );
+        assert_eq!(
+            parse_override(&serde_json::json!({
+                "config": { "recall_deadline_ms": Value::Null }
+            }))
+            .unwrap(),
+            None,
+            "an explicit JSON null override must fall through like an absent one"
+        );
+        assert_eq!(
+            parse_override(&serde_json::json!({ "config": { "recall_deadline_ms": 5000 } }))
+                .unwrap(),
+            Some(5000),
+            "a valid positive override must win over the process default"
+        );
+
+        for bad in [
+            serde_json::json!({ "config": { "recall_deadline_ms": 0 } }),
+            serde_json::json!({ "config": { "recall_deadline_ms": -5 } }),
+            serde_json::json!({ "config": { "recall_deadline_ms": "not-a-number" } }),
+            serde_json::json!({ "config": { "recall_deadline_ms": [1, 2] } }),
+        ] {
+            match parse_override(&bad) {
+                Err(RuntimeError::InvalidInput(_)) => {}
+                other => {
+                    panic!("expected InvalidInput for a malformed override {bad:?}, got: {other:?}")
+                }
+            }
+        }
+    }
+
+    /// #889 codex r1 [Med 1]: pure unit coverage for
+    /// `parse_recall_deadline_env` — unlike the per-request override path,
+    /// an absent, zero, negative, or non-numeric env value must all fall
+    /// back to the 30s default rather than erroring (a malformed operator
+    /// env var must not brick every `memory.recall` call on the daemon).
+    #[test]
+    fn recall_889_env_deadline_ms_validates_and_falls_back_to_default() {
+        use crate::pack::parse_recall_deadline_env as parse_env;
+
+        const DEFAULT_MS: u64 = 30_000;
+        assert_eq!(parse_env(None), DEFAULT_MS);
+        assert_eq!(parse_env(Some("5000")), 5000);
+
+        for bad in ["0", "-5", "not-a-number", ""] {
+            assert_eq!(
+                parse_env(Some(bad)),
+                DEFAULT_MS,
+                "invalid env value {bad:?} must fall back to the default, not brick the daemon"
+            );
+        }
+    }
+
+    /// #889 codex r1 [Med 1]: an invalid per-request `recall_deadline_ms`
+    /// override (zero) must surface as a per-op `InvalidInput` error
+    /// through the full `memory.recall` dispatch, not silently fall through
+    /// to the process default (which a bare `0` would otherwise turn into
+    /// an always-immediate timeout) and not hang.
     #[tokio::test]
-    async fn recall_889_deadline_exceeded_returns_typed_error_not_hang() {
+    async fn recall_889_zero_deadline_override_returns_invalid_input_via_dispatch() {
         let rt = KhiveRuntime::memory().expect("in-memory runtime");
         let ns = Namespace::parse("local").expect("local namespace");
         let token = rt.authorize(ns).expect("authorize local");
@@ -4827,7 +4948,74 @@ mod tests {
             &token,
             "memory",
             None,
-            "issue 889 deadline exceeded test note",
+            "issue 889 zero deadline override validation note",
+            Some(0.7),
+            None,
+            vec![],
+        )
+        .await
+        .expect("create note");
+
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(KgPack::new(rt.clone()));
+        builder.register(MemoryPack::new(rt.clone()));
+        let registry = builder.build().expect("registry");
+
+        let result = registry
+            .dispatch(
+                "memory.recall",
+                serde_json::json!({
+                    "query": "889 zero deadline override validation",
+                    "limit": 10,
+                    "config": { "recall_deadline_ms": 0 }
+                }),
+            )
+            .await;
+
+        match result {
+            Err(RuntimeError::InvalidInput(msg)) => {
+                assert!(
+                    msg.contains("recall_deadline_ms"),
+                    "InvalidInput message should name the offending field, got: {msg:?}"
+                );
+            }
+            other => panic!("expected InvalidInput for a zero deadline override, got: {other:?}"),
+        }
+    }
+
+    /// #889 codex r1 [Med 2]: with the query-embed stage genuinely held (not
+    /// racing incidental wall time), a comfortably-sized 50ms deadline must
+    /// still return `DeadlineExceeded` promptly. Fail-on-revert proof:
+    /// reverting `handle_recall_with_deadline`'s `tokio::time::timeout` wrap
+    /// back to a bare `.await` makes this test hang for the lifetime of the
+    /// held `Notify` (never signaled until after the assertion), so it
+    /// would fail on the `elapsed < ...` bound or the test binary's own
+    /// deadline.
+    #[tokio::test]
+    async fn recall_889_deadline_exceeded_with_held_embed_stage_returns_typed_error_promptly() {
+        const MODEL: &str = "recall-889-slow-model";
+        let hold = Arc::new(Notify::new());
+
+        let rt = KhiveRuntime::memory().expect("in-memory runtime");
+        rt.register_embedder(SlowEmbedProvider {
+            model_name: MODEL.to_owned(),
+            hold: hold.clone(),
+        });
+
+        let ns = Namespace::parse("local").expect("local namespace");
+        let token = rt.authorize(ns).expect("authorize local");
+
+        // Pre-store one permit so the note-creation embed call below (which
+        // shares the same `hold`) completes immediately instead of hanging
+        // setup; the recall's own query-embed call is the *next*
+        // `.notified()` call, which genuinely blocks since no permit
+        // remains.
+        hold.notify_one();
+        rt.create_note(
+            &token,
+            "memory",
+            None,
+            "issue 889 held embed stage test note",
             Some(0.7),
             None,
             vec![],
@@ -4845,18 +5033,23 @@ mod tests {
             .dispatch(
                 "memory.recall",
                 serde_json::json!({
-                    "query": "889 deadline exceeded test",
+                    "query": "889 held embed stage test",
                     "limit": 10,
-                    "config": { "recall_deadline_ms": 1 }
+                    "config": { "recall_deadline_ms": 50 }
                 }),
             )
             .await;
         let elapsed = start.elapsed();
 
+        // Release the now-stuck spawn_blocking thread so it can finish and
+        // free its blocking-pool slot; the outer timeout has already fired
+        // and dropped the awaiting future well before this point.
+        hold.notify_one();
+
         assert!(
             elapsed < std::time::Duration::from_secs(5),
-            "#889 a timed-out recall must return promptly, never hang toward \
-             an upstream client-side ceiling (300s observed in production); \
+            "#889 a timed-out recall must return promptly even while its embed \
+             stage is genuinely held, not wait for the held stage to release; \
              took {elapsed:?}"
         );
 
@@ -4867,10 +5060,99 @@ mod tests {
                 ..
             }) => {
                 assert_eq!(operation, "memory.recall");
-                assert_eq!(budget_ms, 1);
+                assert_eq!(budget_ms, 50);
             }
-            other => panic!("#889 expected DeadlineExceeded, got: {other:?}"),
+            other => {
+                panic!("#889 expected DeadlineExceeded with the embed stage held, got: {other:?}")
+            }
         }
+    }
+
+    /// #889 codex r1 [Med 2]: a deadline-exceeded op must not affect a
+    /// concurrently-dispatched sibling — mirrors the isolation the MCP
+    /// layer's parallel-batch executor already provides
+    /// (`khive-mcp/src/server.rs`: each op independently mapped to
+    /// `{ok, tool, error}` and joined via `futures::future::join_all`,
+    /// never abort-on-failure). `khive-pack-memory` has no dependency on
+    /// `khive-mcp` to drive an actual MCP wire round-trip, so this exercises
+    /// the same property one layer down, at the `VerbRegistry` dispatch
+    /// boundary the MCP executor sits on top of: two independent
+    /// `registry.dispatch` futures run concurrently via `tokio::join!`, one
+    /// held past its deadline and one a normal fast op, and both must
+    /// resolve to their own independent outcome.
+    #[tokio::test]
+    async fn recall_889_deadline_exceeded_does_not_affect_concurrent_sibling_op() {
+        const MODEL: &str = "recall-889-slow-sibling-model";
+        let hold = Arc::new(Notify::new());
+
+        let rt = KhiveRuntime::memory().expect("in-memory runtime");
+        rt.register_embedder(SlowEmbedProvider {
+            model_name: MODEL.to_owned(),
+            hold: hold.clone(),
+        });
+
+        let ns = Namespace::parse("local").expect("local namespace");
+        let token = rt.authorize(ns).expect("authorize local");
+
+        hold.notify_one();
+        rt.create_note(
+            &token,
+            "memory",
+            None,
+            "issue 889 sibling isolation held note",
+            Some(0.7),
+            None,
+            vec![],
+        )
+        .await
+        .expect("create note");
+
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(KgPack::new(rt.clone()));
+        builder.register(MemoryPack::new(rt.clone()));
+        let registry = builder.build().expect("registry");
+
+        let slow_recall = registry.dispatch(
+            "memory.recall",
+            serde_json::json!({
+                "query": "889 sibling isolation held note",
+                "limit": 10,
+                "config": { "recall_deadline_ms": 50 }
+            }),
+        );
+        // `stats` touches no embedder and no held model, so it must
+        // complete quickly regardless of the sibling recall's fate.
+        let sibling_stats = registry.dispatch("stats", serde_json::json!({}));
+
+        let (slow_result, sibling_result) = tokio::join!(slow_recall, sibling_stats);
+        hold.notify_one();
+
+        let slow_err = slow_result.expect_err("expected the held-stage recall to time out");
+        match &slow_err {
+            RuntimeError::DeadlineExceeded {
+                operation,
+                budget_ms,
+                ..
+            } => {
+                assert_eq!(operation, "memory.recall");
+                assert_eq!(*budget_ms, 50);
+            }
+            other => panic!("expected DeadlineExceeded, got: {other:?}"),
+        }
+        let slow_err_text = slow_err.to_string();
+        assert!(
+            slow_err_text.to_lowercase().contains("deadline"),
+            "DeadlineExceeded display text must name the deadline for operator/CLI \
+             visibility, got: {slow_err_text:?}"
+        );
+
+        assert!(
+            sibling_result.is_ok(),
+            "a concurrently-dispatched sibling op must succeed independently of a \
+             sibling deadline timeout — isolation must hold at the VerbRegistry \
+             dispatch boundary the MCP parallel-batch executor sits on top of; got: {:?}",
+            sibling_result.err()
+        );
     }
 
     /// #889: the default (generous, 30s) deadline must not affect a normal,
