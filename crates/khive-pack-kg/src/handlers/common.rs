@@ -74,6 +74,7 @@ pub(crate) fn canonical_note_kind(
 pub(crate) fn validate_entity_type(
     kind_name: &str,
     entity_type: Option<&str>,
+    registry: &VerbRegistry,
 ) -> Result<Option<String>, RuntimeError> {
     let Some(raw) = entity_type else {
         return Ok(None);
@@ -81,7 +82,12 @@ pub(crate) fn validate_entity_type(
     let kind = kind_name
         .parse::<khive_types::EntityKind>()
         .map_err(|_| RuntimeError::InvalidInput(format!("unknown entity kind {kind_name:?}")))?;
-    let resolved = EntityTypeRegistry::global().resolve(kind, Some(raw))?;
+    // Composed from the builtin registry plus every loaded pack's declared
+    // ENTITY_TYPES (ADR-017 additive composition, mirroring EDGE_RULES) —
+    // NOT `EntityTypeRegistry::global()`, which only knows builtin subtypes
+    // and is blind to pack-declared extras (e.g. git's `adr` Document subtype).
+    let composed = EntityTypeRegistry::with_extra(registry.all_entity_types());
+    let resolved = composed.resolve(kind, Some(raw))?;
     Ok(resolved.entity_type)
 }
 

@@ -24,6 +24,21 @@ fn build_registry_with_brain() -> (VerbRegistry, KhiveRuntime) {
     (registry, runtime)
 }
 
+/// A registry with a real type-declaring pack (git, which declares `adr` as
+/// a `Document` subtype via its `ENTITY_TYPES`) loaded alongside schedule —
+/// used to pin that `schedule.schedule` resolves `entity_type` against the
+/// SAME boot-time composed registry as the live KG `create` handler, not
+/// just the builtin table (PR #925 codex r1, M3).
+fn build_registry_with_git() -> (VerbRegistry, KhiveRuntime) {
+    let runtime = KhiveRuntime::memory().expect("in-memory runtime");
+    let mut builder = VerbRegistryBuilder::new();
+    builder.register(khive_pack_kg::KgPack::new(runtime.clone()));
+    builder.register(khive_pack_git::GitPack::new(runtime.clone()));
+    builder.register(SchedulePack::new(runtime.clone()));
+    let registry = builder.build().expect("registry builds");
+    (registry, runtime)
+}
+
 #[tokio::test]
 async fn remind_creates_pending_event() {
     let (registry, _rt) = build_registry();
@@ -962,6 +977,82 @@ async fn schedule_schedule_accepts_create_with_valid_entity_type_singleton() {
         )
         .await
         .expect("sanity: the live KG create handler must accept this pairing too");
+}
+
+/// PR #925 codex r1 (M3): the tests above only ever exercise the builtin
+/// `paper` subtype, so they would stay green even if schedule silently
+/// reverted to the builtin-only `EntityTypeRegistry::global()` instead of
+/// the composed `EntityTypeRegistry::with_extra(registry.all_entity_types())`
+/// registry. With a real type-declaring pack (git, `adr`) loaded alongside
+/// schedule, `schedule.schedule` must accept the pack-declared subtype in a
+/// singleton `create`, and the live KG `create` handler must accept it too.
+#[tokio::test]
+async fn schedule_schedule_accepts_pack_declared_entity_type_singleton_with_git_loaded() {
+    let (registry, _rt) = build_registry_with_git();
+
+    registry
+        .dispatch(
+            "schedule.schedule",
+            serde_json::json!({
+                "action": "create(kind=\"document\", entity_type=\"adr\", name=\"x\")",
+                "at": "2099-06-01T10:00:00Z"
+            }),
+        )
+        .await
+        .expect("schedule must accept the git-pack-declared adr Document subtype");
+
+    // Sanity: the live KG create handler must also accept this pairing.
+    registry
+        .dispatch(
+            "create",
+            serde_json::json!({
+                "kind": "document", "entity_type": "adr", "name": "kg-doc-adr"
+            }),
+        )
+        .await
+        .expect("sanity: the live KG create handler must accept adr with GitPack loaded");
+}
+
+/// Same pack-declared-type acceptance, but inside a bulk `create(items=[...])`
+/// entry (PR #925 codex r1, M3).
+#[tokio::test]
+async fn schedule_schedule_accepts_pack_declared_entity_type_bulk_with_git_loaded() {
+    let (registry, _rt) = build_registry_with_git();
+
+    registry
+        .dispatch(
+            "schedule.schedule",
+            serde_json::json!({
+                "action": "create(items=[{\"kind\":\"document\",\"entity_type\":\"adr\",\"name\":\"x\"}])",
+                "at": "2099-06-01T10:00:00Z"
+            }),
+        )
+        .await
+        .expect("schedule bulk create must accept the git-pack-declared adr Document subtype");
+}
+
+/// Retains the no-declaring-pack rejection case alongside the new
+/// acceptance coverage above (PR #925 codex r1, M3): without a pack that
+/// declares `adr`, schedule must reject it exactly like the live KG handler
+/// does when GitPack isn't loaded.
+#[tokio::test]
+async fn schedule_schedule_rejects_pack_declared_entity_type_without_declaring_pack_loaded() {
+    let (registry, _rt) = build_registry();
+
+    let err = registry
+        .dispatch(
+            "schedule.schedule",
+            serde_json::json!({
+                "action": "create(kind=\"document\", entity_type=\"adr\", name=\"x\")",
+                "at": "2099-06-01T10:00:00Z"
+            }),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("adr"),
+        "error must name the rejected value: {err}"
+    );
 }
 
 /// `entity_type` resolution must follow aliases, not just exact canonical
