@@ -929,7 +929,9 @@ mod tests {
 
     use async_trait::async_trait;
     use khive_pack_kg::KgPack;
-    use khive_runtime::{EmbedderProvider, KhiveRuntime, Namespace, VerbRegistryBuilder};
+    use khive_runtime::{
+        EmbedderProvider, KhiveRuntime, Namespace, RuntimeError, VerbRegistryBuilder,
+    };
     use khive_storage::Entity;
     use lattice_embed::{EmbedError, EmbeddingModel, EmbeddingService};
     use serde_json::Value;
@@ -4803,5 +4805,160 @@ mod tests {
     fn entity_lookup_candidates_empty_query_returns_empty() {
         assert!(crate::scoring::entity_lookup_candidates("").is_empty());
         assert!(crate::scoring::entity_lookup_candidates("   ").is_empty());
+    }
+
+    /// #889: an absurdly small deadline override (1ms) must abort
+    /// `handle_recall` with a typed `DeadlineExceeded` error rather than let
+    /// the caller wait for the pipeline to finish. 1ms is comfortably below
+    /// this uncontended in-memory pipeline's minimum real wall time on any
+    /// machine, so the timeout branch fires deterministically without needing
+    /// to hold a lock or otherwise force contention (contrast with the #836
+    /// tests above, which simulate a specific held lock to force their
+    /// narrower ANN-wait timeout). Proves the wrap actually races the
+    /// deadline against the real pipeline and returns promptly on the
+    /// timeout branch, not just that the code compiles.
+    #[tokio::test]
+    async fn recall_889_deadline_exceeded_returns_typed_error_not_hang() {
+        let rt = KhiveRuntime::memory().expect("in-memory runtime");
+        let ns = Namespace::parse("local").expect("local namespace");
+        let token = rt.authorize(ns).expect("authorize local");
+
+        rt.create_note(
+            &token,
+            "memory",
+            None,
+            "issue 889 deadline exceeded test note",
+            Some(0.7),
+            None,
+            vec![],
+        )
+        .await
+        .expect("create note");
+
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(KgPack::new(rt.clone()));
+        builder.register(MemoryPack::new(rt.clone()));
+        let registry = builder.build().expect("registry");
+
+        let start = std::time::Instant::now();
+        let result = registry
+            .dispatch(
+                "memory.recall",
+                serde_json::json!({
+                    "query": "889 deadline exceeded test",
+                    "limit": 10,
+                    "config": { "recall_deadline_ms": 1 }
+                }),
+            )
+            .await;
+        let elapsed = start.elapsed();
+
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "#889 a timed-out recall must return promptly, never hang toward \
+             an upstream client-side ceiling (300s observed in production); \
+             took {elapsed:?}"
+        );
+
+        match result {
+            Err(RuntimeError::DeadlineExceeded {
+                operation,
+                budget_ms,
+                ..
+            }) => {
+                assert_eq!(operation, "memory.recall");
+                assert_eq!(budget_ms, 1);
+            }
+            other => panic!("#889 expected DeadlineExceeded, got: {other:?}"),
+        }
+    }
+
+    /// #889: the default (generous, 30s) deadline must not affect a normal,
+    /// fast, uncontended recall — no new error, no behavior change on the
+    /// happy path relative to pre-#889 behavior.
+    #[tokio::test]
+    async fn recall_889_normal_path_succeeds_within_default_deadline() {
+        let rt = KhiveRuntime::memory().expect("in-memory runtime");
+        let ns = Namespace::parse("local").expect("local namespace");
+        let token = rt.authorize(ns).expect("authorize local");
+
+        rt.create_note(
+            &token,
+            "memory",
+            None,
+            "issue 889 normal path recall note",
+            Some(0.7),
+            None,
+            vec![],
+        )
+        .await
+        .expect("create note");
+
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(KgPack::new(rt.clone()));
+        builder.register(MemoryPack::new(rt.clone()));
+        let registry = builder.build().expect("registry");
+
+        let result = registry
+            .dispatch(
+                "memory.recall",
+                serde_json::json!({
+                    "query": "889 normal path recall",
+                    "limit": 10
+                }),
+            )
+            .await
+            .expect("recall must succeed within the default deadline");
+
+        let results = result.as_array().expect("recall result must be an array");
+        assert!(
+            !results.is_empty(),
+            "normal recall must surface the seeded note"
+        );
+    }
+
+    /// #889: a generous per-request override (well above real wall time) must
+    /// behave identically to the default — the override path is symmetric,
+    /// not "only ever tightens".
+    #[tokio::test]
+    async fn recall_889_generous_override_succeeds() {
+        let rt = KhiveRuntime::memory().expect("in-memory runtime");
+        let ns = Namespace::parse("local").expect("local namespace");
+        let token = rt.authorize(ns).expect("authorize local");
+
+        rt.create_note(
+            &token,
+            "memory",
+            None,
+            "issue 889 generous override recall note",
+            Some(0.7),
+            None,
+            vec![],
+        )
+        .await
+        .expect("create note");
+
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(KgPack::new(rt.clone()));
+        builder.register(MemoryPack::new(rt.clone()));
+        let registry = builder.build().expect("registry");
+
+        let result = registry
+            .dispatch(
+                "memory.recall",
+                serde_json::json!({
+                    "query": "889 generous override recall",
+                    "limit": 10,
+                    "config": { "recall_deadline_ms": 120_000 }
+                }),
+            )
+            .await
+            .expect("recall must succeed under a generous override");
+
+        let results = result.as_array().expect("recall result must be an array");
+        assert!(
+            !results.is_empty(),
+            "normal recall must surface the seeded note under a generous override"
+        );
     }
 }

@@ -458,7 +458,10 @@ impl PackRuntime for MemoryPack {
         match verb {
             "memory.remember" => self.handle_remember(token, params).await,
             "memory.feedback" => self.handle_feedback(token, params, registry).await,
-            "memory.recall" => self.handle_recall(token, params, registry).await,
+            "memory.recall" => {
+                self.handle_recall_with_deadline(token, params, registry)
+                    .await
+            }
             "memory.recall_embed" => self.handle_recall_embed(params).await,
             "memory.recall_candidates" => self.handle_recall_candidates(token, params).await,
             "memory.recall_fuse" => self.handle_recall_fuse(token, params, registry).await,
@@ -471,6 +474,82 @@ impl PackRuntime for MemoryPack {
             ))),
         }
     }
+}
+
+impl MemoryPack {
+    /// #889: wraps `handle_recall` in a bounded end-to-end deadline so a
+    /// caller under sustained concurrent-load contention gets a fast, typed
+    /// error instead of hanging until an upstream client-side ceiling fires
+    /// (300s observed in production incidents on 2026-07-12). This bounds the
+    /// *entire* pipeline (profile resolution, FTS + vector candidate gather
+    /// and its ANN-overfetch retry loop, hydration, fusion/scoring, MMR, and
+    /// supersedes suppression) — distinct from (and layered on top of)
+    /// `#836`'s narrower `ann_ready_timeout_ms`, which bounds only a single
+    /// cold-miss ANN-build wait inside the vector leg and degrades in-band to
+    /// an FTS-only result. A timeout here does not cancel any in-flight
+    /// storage work still owned by the runtime; it only bounds how long this
+    /// call waits for a response.
+    ///
+    /// The deadline is read from `params.config.recall_deadline_ms` when
+    /// present (a per-request override, checked here rather than inside
+    /// `handle_recall` because the wrap has to start before that function's
+    /// own `deser(params)` runs) with a defensive, non-strict lookup — an
+    /// absent or malformed override just falls through to the process-wide
+    /// `recall_deadline_ms()` default/env value, exactly like `handle_recall`
+    /// itself already falls through to `ann_ready_timeout_ms()`. This never
+    /// tightens or duplicates `RecallParams`'s own validation of `params`;
+    /// `handle_recall` still parses (and rejects, if malformed) the full
+    /// params normally.
+    async fn handle_recall_with_deadline(
+        &self,
+        token: &NamespaceToken,
+        params: Value,
+        registry: &VerbRegistry,
+    ) -> Result<Value, RuntimeError> {
+        let budget_ms = params
+            .get("config")
+            .and_then(|c| c.get("recall_deadline_ms"))
+            .and_then(|v| v.as_u64())
+            .unwrap_or_else(recall_deadline_ms);
+        let start = std::time::Instant::now();
+        match tokio::time::timeout(
+            std::time::Duration::from_millis(budget_ms),
+            self.handle_recall(token, params, registry),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => Err(RuntimeError::DeadlineExceeded {
+                operation: "memory.recall".to_string(),
+                budget_ms,
+                elapsed_ms: start.elapsed().as_millis() as u64,
+            }),
+        }
+    }
+}
+
+/// #889: bounded end-to-end deadline, in milliseconds, for the entire
+/// `memory.recall` pipeline. 30s sits comfortably above every latency this
+/// pipeline needs under normal-to-heavy load (single-digit-to-low-hundreds
+/// of milliseconds per stage even at 20-way concurrency in the #889
+/// load-harness repro, `.khive/workspaces/20260712/889-recall-stall/`) while
+/// staying far short of the 300s client-side ceiling the deadline exists to
+/// preempt. Overridable via env for operators who need to tune it for a
+/// larger corpus or heavier sustained concurrency than the repro covered.
+fn recall_deadline_ms() -> u64 {
+    static DEADLINE_MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *DEADLINE_MS.get_or_init(|| {
+        const DEFAULT_RECALL_DEADLINE_MS: u64 = 30_000;
+        let ms = std::env::var("KHIVE_MEMORY_RECALL_DEADLINE_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(DEFAULT_RECALL_DEADLINE_MS);
+        khive_runtime::config_ledger::record_config_locked(
+            "KHIVE_MEMORY_RECALL_DEADLINE_MS",
+            ms.to_string(),
+        );
+        ms
+    })
 }
 
 /// Check that the unified FTS tables are adequately populated relative to the
