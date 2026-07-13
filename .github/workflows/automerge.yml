@@ -45,6 +45,7 @@ jobs:
   enable-auto-merge:
     name: Enable auto-merge
     runs-on: ubuntu-latest
+    timeout-minutes: 5
 
     # Guard: only bot-authored, non-draft PRs when the variable is set.
     # Ocean flips LEO_AUTOMERGE_ENABLED to activate; flip back to deactivate.

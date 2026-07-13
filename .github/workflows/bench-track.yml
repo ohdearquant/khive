@@ -47,12 +47,12 @@ env:
   BENCH_BOT_EMAIL: khive-bench-bot@users.noreply.github.com
 
 concurrency:
-  group: bench-track-${{ github.event_name }}-${{ github.ref }}
-  # Main runs are never cancelled in progress. GitHub keeps at most one
-  # pending run per group, so merge bursts collapse queued runs to the latest
-  # main commit; that latest commit gets the full pass when the active run
-  # finishes instead of every new merge starving the suite indefinitely.
-  # Superseded PR measurements may be cancelled to avoid wasting runners.
+  # A main/release push owns a SHA-specific group so a merge burst cannot
+  # replace an older pending data point. The publisher already retries
+  # perf-data push races, so overlapping push runs remain lossless. PR runs
+  # stay ref-grouped and superseded measurements may be cancelled to avoid
+  # wasting runners.
+  group: bench-track-${{ github.event_name }}-${{ github.event_name == 'pull_request' && github.ref || github.sha }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
