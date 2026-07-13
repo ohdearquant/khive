@@ -524,30 +524,37 @@ for absence, below, is never given a third case.
 - `item_count` is read from the dispatch's own JSON result value, already in scope at the
   emission seam described below, not from a new counter, and is defined per
   embedding-bearing verb family:
-  - `create` (kind=entity/note) and `memory.remember`, singleton call: `1`.
-  - `create`, bulk call (`items=[...]`): the response's `created` field, never
-    `attempted`. `created` counts items that reached the embedding step; `attempted` also
-    counts entries that failed validation before any embed call was issued, so it would
-    overcount embedding work relative to what was actually performed
-    (`crates/khive-pack-kg/src/handlers/create.rs:158-171,196-208`). `link` has no
-    embedding-bearing path (edges carry no embedded body) and is not part of this list;
-    its dispatches fall under the non-embedding-bearing `base_weight(verb)`-only case
-    above, regardless of its own bulk summary shape
+  - `create` (kind=entity/note), singleton call, and `memory.remember`: `1`.
+  - `create`, bulk call (`items=[...]`): not embedding-bearing. The bulk path routes to
+    `create_many`, which intentionally skips embedding for bulk structural ingest and
+    backfills vectors later via a separate `reindex` call
+    (`crates/khive-runtime/src/operations.rs:4698-4709,4893-4894`). Bulk `create`
+    therefore falls under the non-embedding-bearing `base_weight(verb)`-only case above
+    (`per_item_weight(verb) = 0`), regardless of its `created`/`attempted` summary
+    counts; a distinct structural-ingest cost term, scaled by items actually written
+    rather than an invoked-model count, is a separate design question this amendment
+    does not open. `link` has no embedding-bearing path either (edges carry no embedded
+    body) and is not part of this list; its dispatches fall under the same
+    non-embedding-bearing case, regardless of its own bulk summary shape
     (`crates/khive-pack-kg/src/handlers/link.rs:61-72,138-148`).
   - `update`, `memory.recall`, `knowledge.search` / `compose`: `1` (each is a single
     entity/note update, or a single query embedding, never a batch).
   - `knowledge.index`: `result["total"]`, the full selected-item count computed across
     all internally paged reads, not the `batch_size` clamp (see the correction below).
 - `model_count` is the number of embedding models actually invoked for this dispatch:
-  - `create` and `memory.remember`: `1` when the caller passes an explicit
-    `embedding_model` parameter naming a single model
-    (`crates/khive-pack-memory/src/handlers/remember.rs:117-118` for the
-    `memory.remember` case); otherwise the length of `registered_embedding_model_names()`
-    read at dispatch time. `0` is a valid value when no embedding model is registered at
-    all: no embed call is issued, so the whole `per_item_weight(verb) × item_count ×
+  - `memory.remember`: `1` when the caller passes an explicit `embedding_model`
+    parameter naming a single model (`crates/khive-pack-memory/src/handlers/remember.rs
+    :117-118,134`); otherwise the length of `registered_embedding_model_names()` read at
+    dispatch time. `0` is a valid value when no embedding model is registered at all: no
+    embed call is issued, so the whole `per_item_weight(verb) × item_count ×
     model_count` term is `0` regardless of `item_count`, and `cost_unit` is
-    `base_weight(verb)` alone for that dispatch. The create/remember still happened; no
+    `base_weight(verb)` alone for that dispatch. The remember still happened; no
     embedding work backs its cost.
+  - `create` (kind=entity/note), singleton call: the length of
+    `registered_embedding_model_names()` read at dispatch time, with the same `0` case
+    as above. `create`'s parameters carry no `embedding_model` field
+    (`crates/khive-pack-kg/src/handlers/params.rs:29-45`), so the explicit-single-model
+    override above is `memory.remember`-only and does not apply here.
   - `update`, `memory.recall`, `knowledge.search` / `compose`, `knowledge.index`: `1`.
     None of these paths fan out to more than one embedding model; each invokes exactly
     one (a query-embedding model, or the single configured default embedder).
