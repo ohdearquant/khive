@@ -161,8 +161,8 @@ pub async fn run_pending_events(
     // still triggers `khive.toml`'s standard cwd/home search order inside
     // `resolve_runtime_config`.
     //
-    // This does NOT call `crate::serve::build_server` directly (PR #782
-    // review): `build_server` derives BOTH
+    // This does NOT call `crate::serve::build_server` directly (PR #782):
+    // `build_server` derives BOTH
     // `namespace_explicit` and `actor_explicit` from `resolve_cli_namespace`,
     // which treats "a namespace value is present" and "the operator typed
     // `--actor`/`--namespace`" as the same fact — true for a real CLI parse,
@@ -231,9 +231,9 @@ pub async fn run_pending_events(
 /// for (or, for the one-shot path, to what `build_server` just resolved).
 ///
 /// `rt` and `server` serve two different roles that must NOT be collapsed
-/// into one (an earlier version of this fix did exactly that, and review
-/// caught it): `rt` is the **schedule pack's own runtime** — the scan/
-/// claim/finalize SQL below reads and CAS-writes `scheduled_event` notes
+/// into one (an earlier version incorrectly collapsed them): `rt` is the
+/// **schedule pack's own runtime**. The scan/claim/finalize SQL below reads
+/// and CAS-writes `scheduled_event` notes
 /// directly through it, so it must point at whichever backend the `schedule`
 /// pack is wired to. `server` is the **daemon's live, fully-wired
 /// `KhiveMcpServer`** — every pack registered against its own backend per
@@ -2959,10 +2959,9 @@ mod tests {
 
     /// Two concurrent drain passes over the same store must never double-fire
     /// a row: the `pending -> firing` CAS claim (`claim_pending_event`) makes
-    /// exactly one of the two concurrent callers win each row (PR #782
-    /// review: Amendment B claims Acceptance
-    /// Criterion 2 is met, but no regression exercised concurrent drains
-    /// until now).
+    /// exactly one of the two concurrent callers win each row. PR #782
+    /// Amendment B requires Acceptance Criterion 2 to hold, but no regression
+    /// exercised concurrent drains until now.
     ///
     /// Each row's action is a genuinely side-effecting `create` writing a
     /// row-distinct marker `observation` note, rather than the read-only

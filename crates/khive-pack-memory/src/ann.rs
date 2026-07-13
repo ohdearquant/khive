@@ -1477,8 +1477,8 @@ struct PersistedMemorySnapshot {
     content_hash: CorpusContentHash,
 }
 
-/// Recompute `model`'s durable content hash directly from the store (#812
-/// review re-confirm HIGH-A/HIGH-B), for restart validation ONLY — the build
+/// Recompute `model`'s durable content hash directly from the store (#812),
+/// for restart validation ONLY. The build
 /// path computes its own hash from the exact rows it scans in
 /// `load_and_build_from_vector_store`, in the same read, rather than calling
 /// this. Deliberately NOT a cheap aggregate: it re-reads every live

@@ -389,7 +389,7 @@ async fn channel_poll_loop(
 
     const HAPPY_PATH_INTERVAL: Duration = Duration::from_secs(5);
 
-    // Per-channel bootstrap "since" floor (issue #449 High follow-up). This
+    // Per-channel bootstrap "since" floor (issue #449). This
     // only feeds the date-based SINCE search used while a channel has no
     // committed UID high-water yet (first-ever poll, or a UIDVALIDITY
     // reset); once a checkpoint has a high-water, polling is UID-ranged and
@@ -517,8 +517,8 @@ async fn channel_poll_loop(
                     .await;
 
                     // Every envelope in the page must durably ingest before
-                    // the cursor is allowed to advance past it (issue #449
-                    // Blocker fix): a partial-page ingest failure must leave
+                    // the cursor is allowed to advance past it (issue #449):
+                    // a partial-page ingest failure must leave
                     // the checkpoint untouched so the next poll re-selects
                     // the whole page -- comm.ingest's `INSERT OR IGNORE`
                     // dedup then skips re-storing the messages that already
@@ -700,7 +700,7 @@ enum HeartbeatOutcome {
 }
 
 /// Map a [`khive_channel::ChannelError`] to the `comm.heartbeat` `error_class`
-/// open string enum (#606 design review amendment 4: `auth | transport | config`
+/// open string enum (#606: `auth | transport | config`
 /// in v1, callers must tolerate unknown classes). `Auth`/`Transport` are the
 /// connectivity classes `is_backoff_eligible` already distinguishes;
 /// `Config`/`UnauthorizedSender`/`InvalidEnvelope` are static/attribution
@@ -1971,8 +1971,8 @@ pub fn resolve_runtime_config(inputs: RuntimeConfigInputs<'_>) -> anyhow::Result
     //      `KHIVE_ACTOR` can no longer masquerade as an explicit flag. When
     //      genuinely explicit, tiers 2-3 below are NOT consulted at all — an
     //      explicit `--actor local` must resolve to anonymous (`None`), not
-    //      fall through to a project/db/env actor (the Medium-severity gap
-    //      this block also closes). `kkernel exec`/`reindex` force
+    //      fall through to a project/db/env actor (the gap this block also
+    //      closes). `kkernel exec`/`reindex` force
     //      `namespace_explicit: true` for unrelated reasons (no `Option` on
     //      their `--namespace` arg) but always pass `actor_explicit: false`,
     //      so they keep falling through to tiers 2-3 exactly as before.
@@ -4886,7 +4886,7 @@ id = "lambda:project-actor"
         // "schedule" pack is explicitly routed to its OWN backend, distinct
         // from "main". `build_server`'s returned schedule-tick runtime must
         // WRITE INTO that declared backend's file, not main's — proving the
-        // High-finding fix threads the correct per-pack runtime through for
+        // correct per-pack runtime is threaded through for
         // multi-backend boots too, not only the single-backend common case.
         // (`RuntimeConfig.db_path` is not itself a reliable signal here —
         // per-pack multi-backend runtimes only override `backend_id`, not
@@ -5891,7 +5891,7 @@ backend = "kg-backend"
         }
     }
 
-    /// Regression tests for issue #449's daemon wiring (Blocker fix): the
+    /// Regression tests for issue #449's daemon wiring: the
     /// poll loop must drive `cursor_get` -> `poll_page` -> every
     /// `comm.ingest` -> `cursor_commit`, committing the cursor only when
     /// every envelope in the page durably ingested.
@@ -6105,7 +6105,7 @@ backend = "kg-backend"
         /// a `next_checkpoint` that `comm.cursor_commit` itself rejects
         /// (`generation: 0` is outside its documented `1..=i64::MAX` range).
         /// Exercises the daemon's `commit_channel_cursor`-`Err` branch
-        /// (issue #449 Blocker fix): every other test in this module drives
+        /// (issue #449): every other test in this module drives
         /// a `cursor_get` failure or a `comm.ingest` failure, never a
         /// rejected commit itself, so that branch was otherwise dead from
         /// this suite's perspective.
@@ -6396,7 +6396,7 @@ backend = "kg-backend"
         }
     }
 
-    /// Regression tests for issue #449's High follow-up: a channel's
+    /// Regression tests for issue #449: a channel's
     /// bootstrap `since` floor (the date used in the IMAP `SINCE` clause
     /// while no UID high-water is committed yet) must only advance once
     /// `cursor_get`, `poll_page`, every `comm.ingest`, and `cursor_commit`

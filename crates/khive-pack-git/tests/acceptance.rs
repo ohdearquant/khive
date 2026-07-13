@@ -1259,7 +1259,7 @@ async fn ingest_masks_multiple_credential_spans_in_pr_title_and_body() {
     );
 }
 
-/// Review #763 required regression: a clean (non-credential) PR title and a
+/// Issue #763 regression: a clean (non-credential) PR title and a
 /// null body must pass through `ingest_prs` byte-for-byte unchanged — a bare
 /// 64-hex string with no trigger word nearby is allowlisted by
 /// `mask_secrets`, so nothing in this fixture should ever be replaced.
@@ -4004,8 +4004,8 @@ async fn git_pack_adr_entity_type_validates_through_runtime_create_many() {
 
 // ── Issue #841: residual unmasked ingest fields ─────────────────────────────
 //
-// Follow-up from PR #835's review: `ingest_masks_secrets_in_commit_message`
-// and the PR-title/body tests above already cover `content`/`title`
+// PR #835's `ingest_masks_secrets_in_commit_message` and the PR-title/body
+// tests above already cover `content`/`title`
 // masking. These tests cover the fields #841 found still passed raw into
 // gated `properties`/the note `name`: the commit note `name` (built from the
 // raw subject), commit `author`/`author_email`, and PR `author`/`base_ref`/

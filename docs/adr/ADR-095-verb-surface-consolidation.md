@@ -70,7 +70,7 @@ because create's kind resolution has "no hook seam." That claim is wrong against
 hook seam exists, ships, and is used. Folding crud-plus does not require building new
 infrastructure; it requires routing through infrastructure that is already there.
 
-There is a related finding the fold must respect. `gtd.assign` (handlers.rs:497) does not go
+There is a related constraint the fold must respect. `gtd.assign` (handlers.rs:497) does not go
 through the kg create handler plus TaskHook path. It calls `create_note` directly
 (handlers.rs:633) after inline validation, salience derivation, and a
 resolve-depends_on-before-write orphan guard. Its status normalization helpers are shared

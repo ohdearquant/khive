@@ -117,8 +117,8 @@ pub(crate) fn current_generation(ann: &SharedAnn, namespace: &str) -> u64 {
         .unwrap_or(0)
 }
 
-/// Install `candidate` into the cache for `key` unless it is stale (PR #815
-/// review, HIGH — the #770 scenario through the empty-slot door). Two
+/// Install `candidate` into the cache for `key` unless it is stale (PR #815,
+/// covering issue #770's empty-slot scenario). Two
 /// independent fences, both evaluated while holding the write lock:
 ///
 /// 1. `candidate.generation` must be >= the namespace's CURRENT generation.

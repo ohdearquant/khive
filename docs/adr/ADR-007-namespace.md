@@ -368,11 +368,10 @@ update_entity, update_note, update_edge, delete_edge.
 
 CHANGE FROM ADR-007 v1: The 2026-05-27 Namespace-by-Layer amendment routed memory, gtd, comm,
 brain, and schedule multi-record ops by actor namespace ("WHERE namespace = <actor_namespace>"),
-while routing KG and knowledge to "local". Review correctly identified this
-as a contradiction of Rule 0: framing per-pack actor routing as "explicit pack policy"
-re-introduces the exact actor-as-namespace isolation coupling the accepted design removed. Review
-also noted that memory is live-audited as bulk "local" and that cross-lambda learning via
-memory.recall over one pool depends on the shared store.
+while routing KG and knowledge to "local". This contradicted Rule 0: framing per-pack actor
+routing as "explicit pack policy" re-introduced the exact actor-as-namespace isolation coupling
+the accepted design removed. Memory is live-audited as bulk "local", and cross-lambda learning
+via memory.recall over one pool depends on the shared store.
 
 Accepted Rev 3 decision (2026-06-17): ALL packs are NO-CARRY. There is no per-pack namespace
 carry, now or planned. This closes the two questions that Rev 2 left deferred to Rev 3:
@@ -560,9 +559,9 @@ every verb dispatch as the single authorization boundary.
 
 CHANGE FROM ADR-007 v1: The v1 base text and Namespace-by-Layer amendment defended the
 merge_entity same-namespace guard on the grounds that it prevents merging a "local KG entity
-with an actor-scoped operational note." Review correctly refuted this: entities and
-notes are different substrates merged by different verbs (merge_entity vs merge_note), so the
-cross-substrate scenario is structurally impossible regardless of namespace values. In an
+with an actor-scoped operational note." That scenario is structurally impossible: entities and
+notes are different substrates merged by different verbs (merge_entity vs merge_note), regardless
+of namespace values. In an
 all-"local" world the guard is circular ("local" == "local") and is dead code with respect to
 isolation.
 

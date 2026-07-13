@@ -1431,7 +1431,7 @@ default = true
         });
     }
 
-    // ── deterministic lock-blocking oracle (r2 fix) ───────────────────────────
+    // ── deterministic lock-blocking oracle ────────────────────────────────────
     //
     // The end-to-end race test below proves no corruption results when both
     // sides respect the guard, but a mutation-testing pass showed its
@@ -1985,7 +1985,7 @@ default = true
     // (enforce first) the gate rejects before the spy is invoked, so the spy
     // thread-local remains false.
     //
-    // ISOMORPHISM PROOF (performed during review, result recorded here):
+    // ISOMORPHISM PROOF:
     //   Temporarily moved `enforce_strict_actor_mode` to below the daemon block in
     //   `run_exec_inline_with_forward`.  `strict_mode_spy_confirms_enforce_fires_before_forward`
     //   failed with: "spy forward_fn was called — enforce fired after forwarding"

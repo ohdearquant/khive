@@ -585,16 +585,15 @@ same PR:
 The initial cut of this amendment (above) additionally claimed the tick "constructs its
 own short-lived `KhiveRuntime` against the daemon's configured `db`/`namespace`... rather
 than sharing the live daemon's warm runtime," and framed that as a resource-cost-only
-deviation. Review of the PR carrying this ADR (#782) identified that claim as
-incorrect: a tick that independently re-resolves `RuntimeConfig::default()` from raw
+deviation. That claim was incorrect: a tick that independently re-resolves
+`RuntimeConfig::default()` from raw
 `--db` and an inferred namespace does not merely reconstruct the _same_ configuration at
 extra cost — it silently **discards** everything the daemon's own boot path
 (`khive-mcp::serve::build_server` / `build_registry_for_multi_backend`) resolves from
 `--config`/`[[backends]]`/actor identity/`--pack` selection. A config-backed daemon's
 tick could therefore drain `$HOME/.khive/khive.db` instead of the configured schedule
 backend, trip strict-actor-mode failures the live server never has, or dispatch stored
-actions through packs the daemon never loaded. This was identified as a high-severity
-issue and fixed in the same PR, before merge:
+actions through packs the daemon never loaded. PR #782 corrected the runtime target before merge:
 
 - `build_server` now returns, alongside the server, the resolved `"schedule"`-pack
   `KhiveRuntime` handle it already constructed while building the server itself
@@ -614,8 +613,7 @@ issue and fixed in the same PR, before merge:
 - This also resolves the resource-cost concern the original text raised (a fresh
   connection-pool warm-up every tick): the tick now reuses the daemon's already-warm
   runtime and connection pool rather than constructing a new one per pass.
-- Tick cadence was also corrected in this same update (a separate, medium-severity
-  issue in the same review): `schedule_tick_loop` now ticks on
+- Tick cadence was also incorrect and was corrected in this update: `schedule_tick_loop` now ticks on
   `tokio::time::interval_at(now + interval, interval)` with
   `MissedTickBehavior::Skip`, matching Decision point 6's fixed-interval specification,
   rather than sleeping `interval` after each drain (which had produced an effective
@@ -645,9 +643,8 @@ Criterion 6:
   update beyond the cadence and runtime-targeting corrections above, which strengthen
   rather than weaken it.
 - **Criterion 2** (concurrent cron + tick invocations race to exactly one fire): **met**,
-  now backed by the concurrent-drain regression added in this update (previously
-  claimed met on the strength of the CAS design alone, with no regression exercising
-  concurrency — a medium-severity gap identified on this amendment), and strengthened in
+  now backed by the concurrent-drain regression added in this update. The prior claim relied
+  on the CAS design alone, with no regression exercising concurrency. The regression was strengthened in
   update 2 below to assert on the action's own side effect, not just the CAS-tracked
   counters.
 - **Criterion 3** (no stdio client spawns a tick): **met**, unchanged — the gate is on
@@ -660,11 +657,9 @@ Criterion 6:
 - **Criterion 6** (`kkernel exec --pending-events` implemented as a thin wrapper over
   `DaemonDispatch::drain_pending_events`): **not met**. The CLI path calls
   `khive_mcp::pending_events::run_pending_events` directly, not a `DaemonDispatch` trait
-  method — no such trait method exists. This criterion was incorrectly listed as met in
-  the original cut of this amendment; that was a direct contradiction of this same
-  amendment's own bullet stating "the tick does **not** go through a
-  `DaemonDispatch::drain_pending_events` trait method," caught during review of PR #782
-  (a medium-severity issue).
+  method; no such trait method exists. The original cut of this amendment incorrectly listed
+  the criterion as met despite its own bullet stating "the tick does **not** go through a
+  `DaemonDispatch::drain_pending_events` trait method" (PR #782).
 - **Criterion 7** (`khive-runtime` gains no new dependency after `DaemonDispatch` gains
   `drain_pending_events`): **not met** — vacuously, since no such trait method was added.
   `cargo tree -p khive-runtime` showing no edge to `khive-mcp`/`khive-request`/`kkernel`
@@ -760,8 +755,8 @@ along with two narrower regression/resource issues:
   calls, so a `"local"`-resolved default namespace falls through to the project/db/env
   actor tiers instead of being treated as an explicit override.
 
-None of this changes the Criteria 1-7 status table above — the high-severity issue this
-update closed was scoped entirely to dispatch routing, which Criterion 2 (fire-exactly-once)
+None of this changes the Criteria 1-7 status table above. The defect this update closed was
+scoped entirely to dispatch routing, which Criterion 2 (fire-exactly-once)
 already covers; no new criterion becomes met or unmet as a result.
 
 Closing the Criterion 5/6/7 gap — moving to the full `DaemonDispatch::drain_pending_events`

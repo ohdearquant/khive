@@ -41,8 +41,8 @@ pub(crate) struct MethodResult {
 /// `parse_header` only ever produces `Some` from a non-empty first token, so
 /// `Some` is always non-empty -- this is a type-level invariant, not just a
 /// convention: an "empty configured id" can never be *represented* as a
-/// matchable authserv_id, let alone accidentally match one (example actor, design review,
-/// 2026-07-03: "guards decay; types don't").
+/// matchable authserv_id, let alone accidentally match one. The type enforces
+/// this invariant independently of defensive guards.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(crate) struct AuthResults {
     pub authserv_id: Option<String>,
@@ -728,8 +728,8 @@ mod tests {
 
     #[test]
     fn select_trusted_authserv_id_mode_empty_configured_id_never_matches_no_id_header() {
-        // the exact review point (design review 2026-07-03), independent of the
-        // config-layer require_nonempty_env guard: construct
+        // Pin the type-level invariant independently of the config-layer
+        // require_nonempty_env guard: construct
         // TrustAnchor::AuthservId(String::new()) directly, bypassing
         // from_env entirely, against a header that parses to
         // authserv_id == None. Even if config validation were somehow

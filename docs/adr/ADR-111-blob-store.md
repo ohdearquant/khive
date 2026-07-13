@@ -128,8 +128,8 @@ then checks whether the target path already exists. If it does, `put` returns th
 Before writing a new object (never on a dedup hit), `put` queries the target volume's available
 space via the `fs4` crate, subtracts the size of the pending write, and compares the result
 against a configured floor — `remaining_after_write = available.saturating_sub(bytes.len())`,
-refuse when `remaining_after_write < floor_bytes`. **Amended 2026-07-13 (a high-severity issue
-identified during review):** the original implementation compared `available` directly against the floor, with no
+refuse when `remaining_after_write < floor_bytes`. **Amended 2026-07-13:** the original
+implementation compared `available` directly against the floor, with no
 accounting for the write's own size — `available == floor_bytes + 1` admitted a write of any size,
 including one that would leave the volume below the floor. The check is now write-size-aware.
 
@@ -239,9 +239,9 @@ deletes blob files directly, so a blob referenced from two places is never remov
 concurrent reader by a consumer-side heuristic. `BlobStore` owns the deletion policy; consumers only
 ever add references and let GC reconcile.
 
-**Concurrency guarantee — offline-maintenance-only (amended 2026-07-13, a high-severity issue
-identified during review).** The paragraph above, as originally written, claimed this design "is never removed out
-from under a concurrent reader" — that claim was not true of the shipped implementation and has
+**Concurrency guarantee: offline-maintenance-only (amended 2026-07-13).** The paragraph above, as
+originally written, claimed this design "is never removed out from under a concurrent reader".
+That claim was not true of the shipped implementation and has
 been corrected here rather than left standing. Both `delete` and `orphan_sweep` are
 **offline-maintenance-only** APIs, not safe to run against a live entity writer:
 
@@ -267,8 +267,8 @@ writer's own transactional boundary, so the sweep is safe to run concurrently wi
 would close this hazard properly. That is a larger design (does it live in `khive-storage` as a new
 capability, or in `khive-runtime` orchestrating `BlobStore` + `SqlAccess`/`GraphStore` together?)
 left to a follow-up: [khive#924](https://github.com/ohdearquant/khive/issues/924). It is
-**deliberately not built as part of this fix** — the smaller, honest fix here is making the existing
-hazard explicit and tested, not attempting a bigger coordination design under review pressure.
+**deliberately not built as part of this fix**. The scoped correction makes the existing hazard
+explicit and tested without expanding into a larger coordination design.
 
 ---
 
