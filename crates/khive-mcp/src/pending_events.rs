@@ -67,7 +67,7 @@
 //! comparison.
 
 use anyhow::{Context, Result};
-use chrono::{DateTime, Duration, Months, Utc};
+use chrono::{DateTime, Duration, FixedOffset, Months, Utc};
 use serde_json::{json, Value};
 
 use crate::server::KhiveMcpServer;
@@ -502,7 +502,14 @@ pub async fn run_pending_events_on(
                 // advanced `trigger_at` via a bare `DateTime<Utc>::to_rfc3339`
                 // always stamps `+00:00`, silently rewriting a non-UTC
                 // schedule to UTC on its first advance.
-                let trigger_at_fixed = match DateTime::parse_from_rfc3339(trigger_at_str) {
+                //
+                // Uses the same relaxed grammar as the write boundary
+                // (`khive-pack-schedule`'s `at.parse::<DateTime<Utc>>()`),
+                // not the strict `DateTime::parse_from_rfc3339`: already
+                // persisted `trigger_at` strings can use the relaxed RFC
+                // 3339 form (space instead of `T`, offset without a colon),
+                // and the strict parser would silently skip them forever.
+                let trigger_at_fixed = match trigger_at_str.parse::<DateTime<FixedOffset>>() {
                     Ok(dt) => dt,
                     Err(_) => {
                         if verbose {
@@ -1398,7 +1405,6 @@ pub async fn schedule_tick_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::FixedOffset;
     use khive_runtime::{Gate, GateDecision, GateError, GateRequest, RuntimeConfig};
     use khive_storage::event::EventFilter;
     use khive_storage::types::PageRequest;
@@ -2083,6 +2089,73 @@ mod tests {
             new_dt.time(),
             original_dt.time(),
             "advanced occurrence must retain the same local wall-clock time"
+        );
+    }
+
+    /// The drain must keep accepting the *same* `trigger_at` grammar the
+    /// write boundary validates with (`khive-pack-schedule`'s
+    /// `at.parse::<DateTime<Utc>>()`, which is chrono's relaxed RFC 3339
+    /// form) — not narrow to strict `DateTime::parse_from_rfc3339`. A
+    /// legacy stored timestamp using a space instead of `T` and an offset
+    /// without a colon (e.g. `2026-07-14 09:00:00+0400`) must still be
+    /// recognized as due and advanced, not silently skipped forever as
+    /// "unparseable".
+    #[tokio::test]
+    async fn relaxed_legacy_grammar_repeat_advance_preserves_offset() {
+        let (_tmp, db_path) = tmp_db();
+        let rt = make_rt(&db_path).await;
+
+        let plus_four = FixedOffset::east_opt(4 * 3600).expect("valid offset");
+        // Whole-second precision: the relaxed `%z` format below drops
+        // fractional seconds, so the fixture must match what actually
+        // round-trips through it.
+        let trigger_instant =
+            DateTime::from_timestamp((Utc::now() - Duration::seconds(5)).timestamp(), 0)
+                .expect("valid timestamp");
+        let past_relaxed = trigger_instant
+            .with_timezone(&plus_four)
+            .format("%Y-%m-%d %H:%M:%S%z")
+            .to_string();
+        assert!(
+            past_relaxed.contains(' ') && !past_relaxed.contains('T'),
+            "fixture must use the relaxed space separator, got {past_relaxed:?}"
+        );
+
+        let id = create_scheduled_event(
+            &rt,
+            "local",
+            &past_relaxed,
+            Some("stats()"),
+            Some("daily"),
+            "schedule",
+        )
+        .await;
+
+        let summary = drain_for_test(&db_path).await.expect("drain");
+        assert!(
+            summary.advanced >= 1,
+            "a relaxed-grammar legacy trigger_at must still be recognized as due and \
+             advanced, not skipped as unparseable"
+        );
+        assert_eq!(
+            summary.skipped_not_due, 0,
+            "relaxed-grammar trigger_at must not be treated as unparseable"
+        );
+
+        let props = get_note_props(&rt, id).await;
+        let new_trigger = props["trigger_at"]
+            .as_str()
+            .expect("trigger_at must be set");
+        assert!(
+            new_trigger.ends_with("+04:00"),
+            "advanced trigger_at must preserve the original +04:00 offset, got {new_trigger:?}"
+        );
+
+        let new_dt = DateTime::parse_from_rfc3339(new_trigger).expect("parseable advanced ts");
+        assert_eq!(
+            new_dt.with_timezone(&Utc),
+            trigger_instant + Duration::days(1),
+            "daily advance must add exactly 1 day to the chronological instant"
         );
     }
 
