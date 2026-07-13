@@ -97,6 +97,16 @@ fn optional_str<'a>(args: &'a Value, key: &str) -> Option<&'a str> {
     obj(args).ok()?.get(key).and_then(|v| v.as_str())
 }
 
+fn optional_create_string(args: &Value, key: &str) -> RuntimeResult<Option<String>> {
+    match obj(args)?.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(value)) => Ok(Some(value.clone())),
+        Some(other) => Err(RuntimeError::InvalidInput(format!(
+            "{key} must be a string or null, got: {other}"
+        ))),
+    }
+}
+
 /// Nullable-string patch semantics mirroring the actually-reachable behavior
 /// of `khive-pack-kg::handlers::common::optional_string_patch`/
 /// `description_patch`, reimplemented here rather than imported (that
@@ -426,8 +436,13 @@ pub async fn prepare_add_entity(
     let kind = require_str(args, "kind")?;
     let name = require_str(args, "name")?;
     runtime.validate_entity_kind(kind)?;
+    if name.trim().is_empty() {
+        return Err(RuntimeError::InvalidInput(
+            "name must not be empty".to_string(),
+        ));
+    }
 
-    let description = optional_str(args, "description").map(str::to_string);
+    let description = optional_create_string(args, "description")?;
     let properties = optional_properties(args, "properties")?;
     let tags = optional_tags(args)?.unwrap_or_default();
 
@@ -486,7 +501,7 @@ pub async fn prepare_add_note(
     let content = require_str(args, "content")?;
     runtime.validate_note_kind(kind)?;
 
-    let name = optional_str(args, "name").map(str::to_string);
+    let name = optional_create_string(args, "name")?;
     let properties = optional_properties(args, "properties")?;
 
     crate::secret_gate::check(content)?;
@@ -680,50 +695,18 @@ pub async fn prepare_update(
             let properties = optional_properties(args, "properties")?;
             let tags = optional_tags(args)?;
 
-            let (entity, text_changed, changed_fields) = runtime
-                .prepare_update_entity(
-                    token,
-                    id,
-                    crate::curation::EntityPatch {
-                        name,
-                        description,
-                        properties,
-                        tags,
-                    },
-                )
-                .await?;
-
-            let mut statements = vec![PlanStatement {
-                statement: entity_upsert_statement(&entity),
-                guard: Some(AffectedRowGuard::exactly(1)),
-            }];
-            // curation.rs's `update_entity` appends an `EntityUpdated` event
-            // unconditionally after `upsert_entity` succeeds, regardless of
-            // `text_changed`: match that here, not just on the
-            // reindex-triggering subset of updates.
-            statements.extend(event_append_statements(
-                &entity.namespace,
-                "update",
-                EventKind::EntityUpdated,
-                SubstrateKind::Entity,
+            prepare_update_entity_plan(
+                runtime,
+                token,
                 id,
-                serde_json::json!({
-                    "id": id,
-                    "namespace": entity.namespace,
-                    "changed_fields": changed_fields,
-                }),
-            )?);
-            let post_commit = if text_changed {
-                PostCommitEffect::ReindexEntity { entity_id: id }
-            } else {
-                PostCommitEffect::None
-            };
-            Ok(AtomicOpPlan::Update(UpdatePlan {
-                target_id: id,
-                statements,
-                post_commit,
-                edge_natural_key: None,
-            }))
+                crate::curation::EntityPatch {
+                    name,
+                    description,
+                    properties,
+                    tags,
+                },
+            )
+            .await
         }
         Some(Resolved::Note(note)) => {
             match &expected_kind {
@@ -807,6 +790,46 @@ pub async fn prepare_update(
             },
         },
     }
+}
+
+/// Build an entity update plan from a typed patch. Proposal changesets use
+/// this entry point so their explicit `description: null` clear operation is
+/// preserved instead of being collapsed by raw verb deserialization.
+pub async fn prepare_update_entity_plan(
+    runtime: &KhiveRuntime,
+    token: &NamespaceToken,
+    id: Uuid,
+    patch: crate::curation::EntityPatch,
+) -> RuntimeResult<AtomicOpPlan> {
+    let (entity, text_changed, changed_fields) =
+        runtime.prepare_update_entity(token, id, patch).await?;
+    let mut statements = vec![PlanStatement {
+        statement: entity_upsert_statement(&entity),
+        guard: Some(AffectedRowGuard::exactly(1)),
+    }];
+    statements.extend(event_append_statements(
+        &entity.namespace,
+        "update",
+        EventKind::EntityUpdated,
+        SubstrateKind::Entity,
+        id,
+        serde_json::json!({
+            "id": id,
+            "namespace": entity.namespace,
+            "changed_fields": changed_fields,
+        }),
+    )?);
+    let post_commit = if text_changed {
+        PostCommitEffect::ReindexEntity { entity_id: id }
+    } else {
+        PostCommitEffect::None
+    };
+    Ok(AtomicOpPlan::Update(UpdatePlan {
+        target_id: id,
+        statements,
+        post_commit,
+        edge_natural_key: None,
+    }))
 }
 
 /// Edge branch of `prepare_update`. Mirrors
@@ -3244,6 +3267,66 @@ mod tests {
     // ------------------------------------------------------------------
     // AddEntity and AddNote plans alongside link
     // ------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn prepare_add_entity_rejects_whitespace_only_name() {
+        let runtime = scratch_runtime();
+        let token = runtime
+            .authorize(Namespace::parse("local").expect("ns"))
+            .expect("authorize");
+
+        let err = prepare_add_entity(&runtime, &token, &json!({"kind": "concept", "name": "   "}))
+            .await
+            .expect_err("whitespace-only entity name must fail prepare");
+
+        assert!(matches!(
+            err,
+            RuntimeError::InvalidInput(message) if message.contains("name must not be empty")
+        ));
+    }
+
+    #[tokio::test]
+    async fn prepare_add_entity_rejects_non_string_description() {
+        let runtime = scratch_runtime();
+        let token = runtime
+            .authorize(Namespace::parse("local").expect("ns"))
+            .expect("authorize");
+
+        let err = prepare_add_entity(
+            &runtime,
+            &token,
+            &json!({"kind": "concept", "name": "Valid", "description": 42}),
+        )
+        .await
+        .expect_err("non-string entity description must fail prepare");
+
+        assert!(matches!(
+            err,
+            RuntimeError::InvalidInput(message)
+                if message.contains("description must be a string or null")
+        ));
+    }
+
+    #[tokio::test]
+    async fn prepare_add_note_rejects_non_string_name() {
+        let runtime = scratch_runtime();
+        let token = runtime
+            .authorize(Namespace::parse("local").expect("ns"))
+            .expect("authorize");
+
+        let err = prepare_add_note(
+            &runtime,
+            &token,
+            &json!({"kind": "observation", "content": "Valid", "name": 42}),
+        )
+        .await
+        .expect_err("non-string note name must fail prepare");
+
+        assert!(matches!(
+            err,
+            RuntimeError::InvalidInput(message) if message.contains("name must be a string or null")
+        ));
+    }
 
     #[tokio::test]
     async fn atomic_add_entity_link_add_note_plan_commits_entity_edge_note_and_fts_together() {
