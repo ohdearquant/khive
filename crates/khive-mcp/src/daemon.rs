@@ -5,7 +5,7 @@
 //! first use, and maps responses to MCP error types. Ordinary fallback paths
 //! return `None` so the caller can dispatch locally. `KHIVE_DAEMON_STRICT=1`
 //! (#947) is the exception: it turns a recordable fallback into a
-//! caller-visible per-op error instead, via [`fallback_or_reject`].
+//! caller-visible per-op error instead, via `fallback_or_reject`.
 //! `KHIVE_NO_DAEMON` and `crate::server`'s `save_to` bypass remain
 //! intentional, unconditional local paths — neither is affected by strict
 //! mode, since nothing is ever recorded or falls back for them.
@@ -215,7 +215,7 @@ enum FallbackSeverity {
 /// structured event plus a dedicated violation counter (D2-R1) — see
 /// [`record_fallback`]. It also, independent of severity, rejects the request
 /// outright instead of letting it complete through local dispatch (#947) —
-/// see [`fallback_or_reject`]. Together these make an illegitimate mismatch
+/// see `fallback_or_reject`. Together these make an illegitimate mismatch
 /// impossible to miss AND make "strict mode active" a sound proof that no
 /// request in the window was served off the local fallback path.
 ///
@@ -320,7 +320,7 @@ pub(crate) fn reset_fallback_counters() {
 /// (D2-R3 — strict mode keys on `FallbackReason`, never on "did a fallback
 /// happen at all"). This function only records; it never decides whether the
 /// caller proceeds locally — every call site pairs it with
-/// [`fallback_or_reject`] (#947), which is what converts a strict-mode
+/// `fallback_or_reject` (#947), which is what converts a strict-mode
 /// fallback into a hard error instead of a local dispatch.
 fn record_fallback(
     reason: FallbackReason,
@@ -1738,7 +1738,7 @@ async fn wait_for_boot_quiescence_then_reprobe(frame: &DaemonRequestFrame) -> Bo
 /// already decided at the daemon and the caller must not dispatch locally.
 ///
 /// #947: under `KHIVE_DAEMON_STRICT=1`, the `NoSocket` case is instead
-/// `Some(Err(..))` — see [`fallback_or_reject`] — so it no longer joins
+/// `Some(Err(..))` — see `fallback_or_reject` — so it no longer joins
 /// `KHIVE_NO_DAEMON` as a safe-to-dispatch-locally outcome. `KHIVE_NO_DAEMON`
 /// itself is unaffected: it is the caller's explicit, unconditional opt-out
 /// of the daemon (not a fallback — nothing is ever recorded or counted for
