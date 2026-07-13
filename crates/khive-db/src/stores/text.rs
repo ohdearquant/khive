@@ -39,14 +39,10 @@ pub fn delete_document_statement(table: &str, namespace: &str, subject_id: Uuid)
     }
 }
 
-/// The exact `INSERT` half of `upsert_document_dml`'s delete-then-insert
-/// shape, for a given FTS table (same `table`-is-trusted caveat as
-/// `delete_document_statement` above). Used by `khive-runtime`'s atomic
-/// `AddEntity`/`AddNote` prepare (ADR-104) to write a freshly created
-/// record's FTS document inside the same transaction as its row insert —
-/// there is no pre-existing row to delete first, so callers pair this with
-/// `delete_document_statement` only when upsert (not plain insert) semantics
-/// are required.
+/// Build the `INSERT` half of the FTS delete-then-insert upsert.
+///
+/// `table` must be a trusted, sanitized table name because SQL identifiers
+/// cannot be bound as parameters.
 pub fn insert_document_statement(table: &str, document: &TextDocument) -> SqlStatement {
     let tags_json = tags_to_json(&document.tags);
     let metadata_json = document.metadata.as_ref().map(|v| v.to_string());
@@ -658,39 +654,15 @@ fn upsert_document_dml(
     table: &str,
     document: &TextDocument,
 ) -> Result<(), rusqlite::Error> {
-    let namespace = &document.namespace;
-
-    let del_sql = format!(
-        "DELETE FROM {} WHERE namespace = ?1 AND subject_id = ?2",
-        table
-    );
-    conn.execute(
-        &del_sql,
-        rusqlite::params![namespace, document.subject_id.to_string()],
-    )?;
-
-    let ins_sql = format!(
-        "INSERT INTO {} \
-         (subject_id, kind, title, body, tags, namespace, metadata, updated_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-        table
-    );
-    let tags_json = tags_to_json(&document.tags);
-    let metadata_json: Option<String> = document.metadata.as_ref().map(|v| v.to_string());
-
-    conn.execute(
-        &ins_sql,
-        rusqlite::params![
-            document.subject_id.to_string(),
-            document.kind.to_string(),
-            document.title.as_deref().unwrap_or(""),
-            document.body,
-            tags_json,
-            namespace,
-            metadata_json,
-            dt_to_micros(&document.updated_at),
-        ],
-    )?;
+    let statements = [
+        delete_document_statement(table, &document.namespace, document.subject_id),
+        insert_document_statement(table, document),
+    ];
+    for statement in statements {
+        let mut stmt = conn.prepare(&statement.sql)?;
+        bind_params(&mut stmt, &statement.params)?;
+        stmt.raw_execute()?;
+    }
     Ok(())
 }
 

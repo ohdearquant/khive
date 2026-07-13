@@ -196,12 +196,9 @@ pub struct UpdatePlan {
     pub edge_natural_key: Option<EdgeNaturalKey>,
 }
 
-/// Write plan for an `AddEntity` op (ADR-046 proposal changeset / ADR-104
-/// atomic create): a fresh entity row plus its FTS document, both inside the
-/// atomic unit. Canonical `create_entity` appends no event and this plan
-/// matches that — the only deferred work is vector embedding
-/// (`post_commit`), which needs a suspending model call and so cannot run
-/// inside the transaction (ADR-104, C-ADR-014 §3 item 3).
+/// Write plan for an `AddEntity` proposal change: a fresh entity row plus its
+/// FTS document in the same atomic unit. Vector indexing remains a deferred
+/// effect because embedding may suspend.
 #[derive(Debug, Clone)]
 pub struct AddEntityPlan {
     /// The freshly generated id of the entity being created.
@@ -211,16 +208,12 @@ pub struct AddEntityPlan {
     /// FTS-insert statement that follows it is unguarded (an ordinary
     /// `INSERT` into a virtual table with no conflicting row).
     pub statements: Vec<PlanStatement>,
-    /// Always `ReindexEntity` — a created entity's vector row(s) are written
-    /// post-commit from the now-committed row content, the same shape
-    /// `update`'s text-changed case already uses.
+    /// Reindex the committed entity after the transaction closes.
     pub post_commit: PostCommitEffect,
 }
 
-/// Write plan for an `AddNote` op (ADR-046 proposal changeset / ADR-104
-/// atomic create): a fresh note row plus its FTS document, both inside the
-/// atomic unit. Mirrors [`AddEntityPlan`]; canonical `create_note` likewise
-/// appends no event.
+/// Write plan for an `AddNote` proposal change: a fresh note row plus its FTS
+/// document in the same atomic unit.
 #[derive(Debug, Clone)]
 pub struct AddNotePlan {
     /// The freshly generated id of the note being created.
@@ -228,7 +221,7 @@ pub struct AddNotePlan {
     /// Row + FTS insert statements to apply inside the atomic unit, in
     /// order, mirroring [`AddEntityPlan::statements`].
     pub statements: Vec<PlanStatement>,
-    /// Always `ReindexNote` — mirrors [`AddEntityPlan::post_commit`].
+    /// Reindex the committed note after the transaction closes.
     pub post_commit: PostCommitEffect,
 }
 
@@ -593,7 +586,10 @@ mod tests {
         assert_eq!(plan.note_id, id);
         assert_eq!(plan.statements[0].guard, Some(AffectedRowGuard::exactly(1)));
         assert_eq!(plan.statements[1].guard, None);
-        assert_eq!(plan.post_commit, PostCommitEffect::ReindexNote { note_id: id });
+        assert_eq!(
+            plan.post_commit,
+            PostCommitEffect::ReindexNote { note_id: id }
+        );
     }
 
     #[test]

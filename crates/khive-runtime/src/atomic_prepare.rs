@@ -1,5 +1,5 @@
 //! ADR-099: the per-verb async prepare pass for the KG-substrate v1
-//! admissible verbs (`update`, `delete`, `link`, `merge`), plus (ADR-104)
+//! admissible verbs (`update`, `delete`, `link`, `merge`), plus
 //! [`prepare_add_entity`]/[`prepare_add_note`] for the ADR-046 proposal
 //! changeset `AddEntity`/`AddNote` arms. Each `prepare_*` function reads
 //! current state (async, outside any transaction) and returns a plain-data
@@ -410,21 +410,14 @@ fn prepare_governance_unimplemented(tool: &str) -> RuntimeResult<AtomicOpPlan> {
 }
 
 // ---------------------------------------------------------------------------
-// create (AddEntity / AddNote — ADR-104, alongside the update/delete/link/
-// merge plans above)
+// create (AddEntity / AddNote)
 // ---------------------------------------------------------------------------
 
-/// Build the prepared plan for creating an entity (ADR-046 proposal
-/// changeset `AddEntity`). Mirrors `KhiveRuntime::create_entity`'s
-/// validation and row shape exactly, up to the point where canonical fans
-/// out to embedding: the FTS document is written inside the transaction
-/// (same SQLite database, same writer connection — C-ADR-014 §3 item 2),
-/// but vector materialization is deferred to `PostCommitEffect::
-/// ReindexEntity`, since embedding needs a suspending model call and the
-/// atomic unit permits none (C-ADR-014 §3 item 3). `kind` is expected
-/// already canonicalized by the caller — the same split `prepare_update`/
-/// `prepare_delete` use: pack-aware kind resolution needs a `VerbRegistry`,
-/// unreachable from this crate.
+/// Build the prepared plan for an `AddEntity` proposal change. The entity
+/// row and FTS document are committed together; vector indexing is deferred
+/// until after commit because embedding may suspend. `kind` must already be
+/// canonicalized by the caller because pack-aware resolution requires a
+/// `VerbRegistry`.
 pub async fn prepare_add_entity(
     runtime: &KhiveRuntime,
     token: &NamespaceToken,
@@ -479,8 +472,8 @@ pub async fn prepare_add_entity(
     }))
 }
 
-/// Build the prepared plan for creating a note (ADR-046 proposal changeset
-/// `AddNote`). Mirrors [`prepare_add_entity`]'s shape and the same
+/// Build the prepared plan for an `AddNote` proposal change. Mirrors
+/// [`prepare_add_entity`]'s shape and the same
 /// `kind`-already-canonicalized split. `annotates` is out of scope: the
 /// proposal `NoteDraft` this backs carries no annotates targets, unlike
 /// `KhiveRuntime::create_note`'s general-purpose signature.
@@ -3249,17 +3242,9 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
-    // ADR-104: AddEntity / AddNote plans, alongside update/delete/link
+    // AddEntity and AddNote plans alongside link
     // ------------------------------------------------------------------
 
-    /// Acceptance criterion (issue #904): a `create + edge + note` plan
-    /// commits the entity, the edge, the note, AND their FTS documents
-    /// together — one `run_atomic_unit` call, one SQLite transaction (the
-    /// FTS insert statements `prepare_add_entity`/`prepare_add_note` build
-    /// are applied inside the SAME unit as the row inserts, not deferred).
-    /// Vector materialization is the one piece of work post-commit
-    /// (`PostCommitEffect::ReindexEntity`/`ReindexNote`), since embedding
-    /// needs a suspending model call.
     #[tokio::test]
     async fn atomic_add_entity_link_add_note_plan_commits_entity_edge_note_and_fts_together() {
         let runtime = scratch_runtime();
@@ -3268,8 +3253,8 @@ mod tests {
             .authorize(Namespace::parse("local").expect("ns"))
             .expect("authorize");
         let entities = runtime.entities(&token).expect("entities store");
-        let a = khive_storage::Entity::new("local", "concept", "Adr104LinkA");
-        let b = khive_storage::Entity::new("local", "concept", "Adr104LinkB");
+        let a = khive_storage::Entity::new("local", "concept", "ProposalPlanLinkA");
+        let b = khive_storage::Entity::new("local", "concept", "ProposalPlanLinkB");
         let (a_id, b_id) = (a.id, b.id);
         entities.upsert_entity(a).await.expect("seed a");
         entities.upsert_entity(b).await.expect("seed b");
@@ -3277,7 +3262,7 @@ mod tests {
         let add_entity_plan = prepare_add_entity(
             &runtime,
             &token,
-            &json!({"kind": "concept", "name": "Adr104NewEntity", "description": "created atomically"}),
+            &json!({"kind": "concept", "name": "ProposalPlanNewEntity", "description": "created atomically"}),
         )
         .await
         .expect("prepare add_entity");
@@ -3315,16 +3300,14 @@ mod tests {
             crate::atomic_runner::AtomicRunOutcome::Committed { post_commit } => post_commit,
             other => panic!("expected the whole unit to commit: {other:?}"),
         };
-        apply_post_commit_effects(&runtime, &token, post_commit)
-            .await
-            .expect("apply post-commit effects");
-
         let entity = runtime
-            .get_entity(&token, entity_id)
+            .entities(&token)
+            .expect("entities store")
+            .get_entity(entity_id)
             .await
             .expect("get_entity")
             .expect("entity must exist after commit");
-        assert_eq!(entity.name, "Adr104NewEntity");
+        assert_eq!(entity.name, "ProposalPlanNewEntity");
         assert!(
             runtime
                 .text(&token)
@@ -3338,11 +3321,16 @@ mod tests {
 
         let (edge_count, _, _, edge_deleted_at) =
             probe_edge_natural_key(&runtime, "local", a_id, b_id, "extends").await;
-        assert_eq!(edge_count, 1, "the edge must be committed alongside the entity/note");
+        assert_eq!(
+            edge_count, 1,
+            "the edge must be committed alongside the entity/note"
+        );
         assert!(edge_deleted_at.is_none());
 
         let note = runtime
-            .get_note(&token, note_id)
+            .notes(&token)
+            .expect("notes store")
+            .get_note(note_id)
             .await
             .expect("get_note")
             .expect("note must exist after commit");
@@ -3358,6 +3346,10 @@ mod tests {
             "note's FTS document must exist after commit"
         );
 
+        apply_post_commit_effects(&runtime, &token, post_commit)
+            .await
+            .expect("apply post-commit effects");
+
         let vec_store = runtime
             .vectors_for_model(&token, STUB_MODEL)
             .expect("vec store");
@@ -3368,14 +3360,6 @@ mod tests {
         );
     }
 
-    /// Acceptance criterion (issue #904): a failing later SQL/validation
-    /// guard restores the pre-run SQLite AND FTS state. Plan:
-    /// `[AddEntity(C), AddNote(N), delete(X, hard), link(A, X)]` — the
-    /// trailing `link` fails its endpoint-existence guard once `X` is gone
-    /// (deleted by the op immediately before it, in the SAME unit), so the
-    /// whole unit rolls back: C and N must leave zero trace (no row, no FTS
-    /// document), and X's delete must be undone too (ADR-099 D1 "the whole
-    /// unit rolls back" applied to the new create plans).
     #[tokio::test]
     async fn atomic_add_entity_and_add_note_roll_back_on_later_link_failure_leaving_zero_trace() {
         let runtime = scratch_runtime();
@@ -3383,8 +3367,8 @@ mod tests {
             .authorize(Namespace::parse("local").expect("ns"))
             .expect("authorize");
         let entities = runtime.entities(&token).expect("entities store");
-        let a = khive_storage::Entity::new("local", "concept", "Adr104RollbackA");
-        let x = khive_storage::Entity::new("local", "concept", "Adr104RollbackX");
+        let a = khive_storage::Entity::new("local", "concept", "ProposalPlanRollbackA");
+        let x = khive_storage::Entity::new("local", "concept", "ProposalPlanRollbackX");
         let (a_id, x_id) = (a.id, x.id);
         entities.upsert_entity(a).await.expect("seed a");
         entities.upsert_entity(x.clone()).await.expect("seed x");
@@ -3392,7 +3376,7 @@ mod tests {
         let add_entity_plan = prepare_add_entity(
             &runtime,
             &token,
-            &json!({"kind": "concept", "name": "Adr104RollbackNewEntity"}),
+            &json!({"kind": "concept", "name": "ProposalPlanRollbackNewEntity"}),
         )
         .await
         .expect("prepare add_entity");
@@ -3403,13 +3387,16 @@ mod tests {
         )
         .await
         .expect("prepare add_note");
-        let delete_plan = prepare_delete(&runtime, &token, &json!({"id": x_id.to_string(), "hard": true}), None)
-            .await
-            .expect("prepare delete x");
-        // Endpoint validation runs against CURRENT (pre-transaction) state,
-        // where x still exists — same setup as atomic_runner's own
-        // dangling-edge test, replayed here against the real entity
-        // substrate with two leading create plans.
+        let delete_plan = prepare_delete(
+            &runtime,
+            &token,
+            &json!({"id": x_id.to_string(), "hard": true}),
+            None,
+        )
+        .await
+        .expect("prepare delete x");
+        // Prepare sees x before the transaction; the guarded link must detect
+        // that the preceding hard delete removed it inside the transaction.
         let link_plan = prepare_link(
             &runtime,
             &token,
@@ -3432,7 +3419,7 @@ mod tests {
             vec![add_entity_plan, add_note_plan, delete_plan, link_plan],
         )
         .await
-        .expect("the seam call itself must not error — the unit rolls back cleanly");
+        .expect("the seam call itself must not error; the unit rolls back cleanly");
         match outcome {
             crate::atomic_runner::AtomicRunOutcome::RolledBack {
                 failed_op_index, ..
@@ -3486,13 +3473,14 @@ mod tests {
             .get_entity_including_deleted(&token, x_id)
             .await
             .expect("get_entity_including_deleted")
-            .expect("x must still be present — its delete rolled back too");
+            .expect("x must still be present because its delete rolled back too");
         assert!(
             x_after.deleted_at.is_none(),
             "x's delete must have rolled back along with the failed link"
         );
 
-        let (edge_count, _, _, _) = probe_edge_natural_key(&runtime, "local", a_id, x_id, "extends").await;
+        let (edge_count, _, _, _) =
+            probe_edge_natural_key(&runtime, "local", a_id, x_id, "extends").await;
         assert_eq!(edge_count, 0, "no edge may have been committed");
     }
 }
