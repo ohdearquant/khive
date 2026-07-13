@@ -46,10 +46,30 @@ mapping to a capability trait (ADR-005 §2).
 ### 2. `ContentRef` — the opaque, content-addressed key
 
 ```rust
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 #[serde(transparent)]
 pub struct ContentRef(String);
+
+impl<'de> Deserialize<'de> for ContentRef {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let raw = String::deserialize(deserializer)?;
+        ContentRef::from_hex(raw).map_err(serde::de::Error::custom)
+    }
+}
 ```
+
+`ContentRef` derives only `Serialize` — under `#[serde(transparent)]` that just emits the inner hex
+string, which is always already valid since the type's only constructors (`from_hex`,
+`from_digest_bytes`) validate on the way in. `Deserialize` is implemented by hand, routing every
+input through `ContentRef::from_hex`, so a malformed serialized value (wrong length, uppercase,
+non-hex characters) is rejected at deserialization instead of silently constructing an invalid
+`ContentRef` that would later panic in the filesystem backend's shard-path slicing. **This is
+deliberate, not incidental: deriving `Deserialize` here — the combination this ADR's Decision
+section showed until round 2 of PR #922's review — was exactly the round-1 codex High finding.**
+Do not "simplify" this back to a derive.
 
 Backed by a lowercase-hex BLAKE3-256 digest (64 characters) of the blob's bytes. Identical content
 always produces the same `ContentRef`; storing the same bytes twice is a no-op after the first
@@ -113,15 +133,31 @@ finding):** the original implementation compared `available` directly against th
 accounting for the write's own size — `available == floor_bytes + 1` admitted a write of any size,
 including one that would leave the volume below the floor. The check is now write-size-aware.
 
-`FsBlobStore` also serializes the whole check-then-publish critical section of `put` per store
-instance (a `tokio::sync::Mutex<()>` held across the entire `spawn_blocking` call, from the
-availability check through `persist`). **Amended 2026-07-13:** without this, two concurrent puts
-could each observe the same pre-write availability snapshot, each individually pass a write-size-
-aware check against it, and both proceed to write — jointly pushing the volume under the floor even
-though neither write looked unsafe in isolation, since neither observed the other's pending write.
-A per-root async mutex is adequate at `BlobStore`'s expected write rate; it defends only against
-concurrent `FsBlobStore` callers within one process, not against another process writing to the
-same volume. Below the floor, `put` refuses with a new error variant:
+`FsBlobStore` also serializes the whole check-then-publish critical section of `put` per
+**canonical root** (a process-wide registry maps each canonicalized root path to one shared
+`Arc<tokio::sync::Mutex<()>>`, held across the entire `spawn_blocking` call, from the availability
+check through `persist`). **Amended 2026-07-13 (round-2 codex High finding):** without this, two
+concurrent puts could each observe the same pre-write availability snapshot, each individually pass
+a write-size-aware check against it, and both proceed to write — jointly pushing the volume under
+the floor even though neither write looked unsafe in isolation, since neither observed the other's
+pending write. A per-root async mutex is adequate at `BlobStore`'s expected write rate; it defends
+only against concurrent `FsBlobStore` callers within one process, not against another process
+writing to the same volume.
+
+**Amended 2026-07-13, round 2 of round-2 (a focused re-review, "H2", of the same finding): the
+first attempt at this fix scoped the mutex to one `FsBlobStore` instance** (`tokio::sync::Mutex<()>`
+as a plain struct field) **and borrowed the guard across `put`'s own async stack frame.** Both were
+insufficient: (a) `StorageBackend::blob_store` constructs a fresh `FsBlobStore` on every call, even
+for the same root, so two independently obtained stores for one root had independent locks and
+could still both pass the same snapshot; (b) cancelling or dropping the outer `put` future released
+the borrowed guard immediately, while an already-started `spawn_blocking` write kept running
+unprotected on its own thread — a second `put` could pass its check mid-persist. The fix now (1)
+keys the shared `Arc<tokio::sync::Mutex<()>>` by the filesystem's own canonicalized root path in a
+process-wide registry, so every `FsBlobStore` for the same root shares one lock regardless of how
+many separate `new` calls constructed them, and (2) acquires an **owned** guard (`lock_owned`) that
+is **moved into** the `spawn_blocking` closure rather than borrowed across its `.await`, so the
+guard's lifetime is tied to the blocking work itself, not to whether the outer future is still being
+polled. Below the floor, `put` refuses with a new error variant:
 
 ```rust
 #[error(
@@ -292,13 +328,21 @@ misses.
 - **Round-2 amendments (2026-07-13, PR #922 codex review):** `ContentRef` no longer derives
   `Deserialize` — it is hand-implemented to route every input through `from_hex`, so a malformed
   serialized value is rejected at deserialization instead of later panicking in `shard_path`.
-  `FsBlobStore::put`'s floor check now accounts for the pending write's own size and serializes its
-  check-then-publish critical section per store instance via a `tokio::sync::Mutex`. `delete` and
+  `FsBlobStore::put`'s floor check now accounts for the pending write's own size. `delete` and
   `orphan_sweep` are now explicitly documented (trait doc comments, §8 above) as
   offline-maintenance-only, requiring quiesced entity writes — a real, undefended concurrency hazard
   the original §8 text incorrectly described as absent. A DB-coordinated transactional sweep that
   would close that hazard is tracked as a follow-up, not built here:
   [khive#924](https://github.com/ohdearquant/khive/issues/924).
+- **Further round-2 amendment (same date, a focused "H2" re-review of the concurrency-guard
+  finding):** the first pass at serializing `put` scoped its `tokio::sync::Mutex` to one
+  `FsBlobStore` instance and borrowed the guard across the async fn's own frame — insufficient,
+  because `StorageBackend::blob_store` builds a fresh `FsBlobStore` per call (so independently
+  constructed stores for the same root had independent locks) and because cancelling the outer
+  `put` future released a merely-borrowed guard while an already-dispatched blocking write kept
+  running unprotected. §5 now describes the corrected design: one shared, canonical-root-keyed
+  `Arc<tokio::sync::Mutex<()>>` per root, with an **owned** guard moved into the `spawn_blocking`
+  closure rather than borrowed across it.
 
 ---
 
@@ -309,7 +353,9 @@ misses.
 - `crates/khive-storage/src/capability.rs` — `StorageCapability::Blob`.
 - `crates/khive-storage/src/error.rs` — `StorageError::CapacityFloor`.
 - `crates/khive-storage/src/entity.rs` — `Entity::content_ref`, `Entity::with_content_ref`.
-- `crates/khive-db/src/stores/blob.rs` — `FsBlobStore`, `resolve_blob_root`.
+- `crates/khive-db/src/stores/blob.rs` — `FsBlobStore`, `resolve_blob_root`,
+  `write_lock_for_root`/`root_write_locks` (the canonical-root-keyed shared-lock registry),
+  `crosses_floor` (the pure write-size-aware floor comparison).
 - `crates/khive-db/src/backend.rs` — `StorageBackend::blob_store`.
 - `crates/khive-db/sql/010-entities-content-ref.sql` — migration V10.
 - `crates/khive-db/sql/entities-ddl.sql` — mirrored `content_ref` column + index.
@@ -326,5 +372,8 @@ misses.
 - `fs4` crate (`https://crates.io/crates/fs4`) — cross-platform free-space query.
 - PR #922 codex round-1 review (`.khive/codex_reviews/codex_review_pr922_round1.md`) — source of
   the three round-2 High findings this ADR was amended to address.
+- PR #922 codex round-2 review (`.khive/codex_reviews/codex_review_pr922_round2.md`) — focused
+  re-review confirming the deserialization fix and finding the floor-guard fix incomplete (not
+  actually per-root, not cancellation-safe) and this ADR's `ContentRef` example stale.
 - [khive#924](https://github.com/ohdearquant/khive/issues/924) — follow-up: transactional,
   DB-coordinated `BlobStore` orphan sweep.

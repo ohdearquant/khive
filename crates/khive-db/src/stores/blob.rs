@@ -9,9 +9,11 @@
 //! `NamedTempFile::persist` performs the rename — crash-safe (a crash mid-write
 //! leaves an orphaned temp file, never a partially-committed blob).
 
+use std::collections::HashMap;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 
 use async_trait::async_trait;
 
@@ -175,22 +177,61 @@ fn walk_blob_files(root: &Path) -> std::io::Result<Vec<(ContentRef, PathBuf)>> {
     Ok(out)
 }
 
+/// Process-wide registry of per-canonical-root write locks.
+///
+/// A `Mutex` field scoped to one `FsBlobStore` instance does NOT serialize
+/// writes across independently constructed stores for the same root — and
+/// callers construct fresh stores for the same root routinely
+/// (`StorageBackend::blob_store` builds a new `FsBlobStore` on every call;
+/// round-2 High finding). Keying a shared `Arc<tokio::sync::Mutex<()>>` by
+/// the filesystem's own canonical path closes that gap: every `FsBlobStore`
+/// for the same root, however many separate `new` calls produced them,
+/// resolves to the exact same lock.
+fn root_write_locks() -> &'static StdMutex<HashMap<PathBuf, Arc<tokio::sync::Mutex<()>>>> {
+    static REGISTRY: OnceLock<StdMutex<HashMap<PathBuf, Arc<tokio::sync::Mutex<()>>>>> =
+        OnceLock::new();
+    REGISTRY.get_or_init(|| StdMutex::new(HashMap::new()))
+}
+
+/// Look up (or create) the shared write lock for `root`'s canonical path.
+///
+/// `root` must already exist when this is called — `FsBlobStore::new`
+/// creates it first, and `Path::canonicalize` requires the path to exist.
+/// The lookup-or-insert happens under the registry's own (synchronous, very
+/// briefly held) lock, so two `FsBlobStore::new` calls racing for the same
+/// root cannot each install a different `Arc` and defeat the sharing this
+/// exists for.
+fn write_lock_for_root(root: &Path) -> std::io::Result<Arc<tokio::sync::Mutex<()>>> {
+    let canonical = root.canonicalize()?;
+    let mut locks = root_write_locks()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    Ok(locks
+        .entry(canonical)
+        .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+        .clone())
+}
+
 /// A `BlobStore` backed by a BLAKE3-sharded directory tree.
 pub struct FsBlobStore {
     root: PathBuf,
     floor_bytes: u64,
-    /// Serializes the check-then-publish critical section of `put` per root
-    /// (round-2 High finding): without this, two concurrent puts can each
-    /// observe the same pre-write `available_space` snapshot, each pass
-    /// their own write-size-aware floor check against it, and then both
-    /// write — jointly pushing the volume under the floor even though
-    /// neither write looked unsafe in isolation. Held across the whole
-    /// `spawn_blocking` call (check, write, fsync, persist), so the second
-    /// of two racing puts always observes the first's write already landed.
-    /// A per-root async mutex is adequate at this write rate; it is not
-    /// meant to defend against another process (only within-process
-    /// `FsBlobStore` callers).
-    write_lock: tokio::sync::Mutex<()>,
+    /// Shared per-canonical-root guard (see `write_lock_for_root`) that
+    /// serializes the check-then-publish critical section of `put` — round-2
+    /// High finding: without this, two puts (whether on the same
+    /// `FsBlobStore` instance or two independently constructed ones for the
+    /// same root) can each observe the same pre-write `available_space`
+    /// snapshot, each pass their own write-size-aware floor check against
+    /// it, and then both write, jointly pushing the volume under the floor.
+    /// `put` acquires this as an OWNED guard (`lock_owned`) and MOVES it
+    /// into the `spawn_blocking` closure rather than borrowing it across the
+    /// closure's `.await` — cancelling/dropping the outer `put` future then
+    /// cannot release the guard before the underlying blocking write (which
+    /// keeps running on its own thread regardless of the outer future's
+    /// fate) actually finishes. A per-root async mutex is adequate at this
+    /// write rate; it is not meant to defend against another OS process
+    /// writing the same volume.
+    write_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl FsBlobStore {
@@ -201,10 +242,11 @@ impl FsBlobStore {
     /// Create a store rooted at `root`, creating the directory if absent.
     pub fn new(root: PathBuf, floor_bytes: u64) -> Result<Self, SqliteError> {
         fs::create_dir_all(&root)?;
+        let write_lock = write_lock_for_root(&root)?;
         Ok(Self {
             root,
             floor_bytes,
-            write_lock: tokio::sync::Mutex::new(()),
+            write_lock,
         })
     }
 
@@ -217,12 +259,24 @@ impl FsBlobStore {
 #[async_trait]
 impl BlobStore for FsBlobStore {
     async fn put(&self, bytes: Vec<u8>) -> StorageResult<ContentRef> {
-        let _write_guard = self.write_lock.lock().await;
+        // OWNED guard, MOVED into the blocking closure below (round-2 High
+        // finding, part 2): a guard merely borrowed here and held in this
+        // async fn's own stack frame would be released the instant the
+        // *outer* `put` future is cancelled or dropped, while an
+        // already-started `spawn_blocking` closure keeps running on its own
+        // thread regardless — letting a second `put` pass its check against
+        // an unprotected in-flight write. Moving the owned guard into the
+        // closure ties its lifetime to the blocking work itself, not to
+        // whether anyone is still awaiting this future.
+        let owned_guard = self.write_lock.clone().lock_owned().await;
         let root = self.root.clone();
         let floor_bytes = self.floor_bytes;
-        tokio::task::spawn_blocking(move || put_blocking(&root, floor_bytes, bytes))
-            .await
-            .map_err(|e| StorageError::driver(StorageCapability::Blob, "put", e))?
+        tokio::task::spawn_blocking(move || {
+            let _owned_guard = owned_guard;
+            put_blocking(&root, floor_bytes, bytes)
+        })
+        .await
+        .map_err(|e| StorageError::driver(StorageCapability::Blob, "put", e))?
     }
 
     async fn get(&self, content_ref: &ContentRef) -> StorageResult<Vec<u8>> {
@@ -520,6 +574,123 @@ mod tests {
             floor_rejections >= 1,
             "two payload_len writes cannot both fit in a payload_len-sized budget -- at \
              least one rejection is expected: {result_a:?} / {result_b:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_puts_from_two_independently_constructed_stores_share_the_root_lock() {
+        // Round-2 High, part 1 -- the actual gap in the round-2 fix: the
+        // test above uses ONE `FsBlobStore` behind a shared `Arc`, so it
+        // exercises only the per-instance mutex and cannot catch a missing
+        // cross-instance guarantee. `StorageBackend::blob_store` constructs
+        // a FRESH `FsBlobStore` on every call, even for the same root -- so
+        // the real regression is two SEPARATELY CONSTRUCTED stores for the
+        // same root. Before the shared canonical-root registry, each
+        // store's `write_lock` was its own independent `Mutex`, and this
+        // exact scenario would have let both puts pass the same free-space
+        // snapshot.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("blobs");
+        fs::create_dir_all(&root).unwrap();
+        let available = fs4::available_space(&root).unwrap();
+        let payload_len: u64 = 64 * 1024 * 1024;
+        let floor = available.saturating_sub(payload_len);
+
+        // Two INDEPENDENT `FsBlobStore::new` calls for the identical root --
+        // exactly what `StorageBackend::blob_store` does on repeat calls.
+        let store_a = std::sync::Arc::new(FsBlobStore::new(root.clone(), floor).unwrap());
+        let store_b = std::sync::Arc::new(FsBlobStore::new(root, floor).unwrap());
+
+        let a = tokio::spawn(async move { store_a.put(vec![5u8; payload_len as usize]).await });
+        let b = tokio::spawn(async move { store_b.put(vec![6u8; payload_len as usize]).await });
+        let (result_a, result_b) = (a.await.unwrap(), b.await.unwrap());
+
+        let successes = [&result_a, &result_b]
+            .into_iter()
+            .filter(|r| r.is_ok())
+            .count();
+        let floor_rejections = [&result_a, &result_b]
+            .into_iter()
+            .filter(|r| matches!(r, Err(StorageError::CapacityFloor { .. })))
+            .count();
+        assert!(
+            successes <= 1,
+            "two independently constructed FsBlobStore instances for the SAME root must \
+             still share one write lock -- both puts landed: {result_a:?} / {result_b:?}"
+        );
+        assert!(
+            floor_rejections >= 1,
+            "two payload_len writes cannot both fit in a payload_len-sized budget: \
+             {result_a:?} / {result_b:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn aborting_the_outer_put_future_does_not_release_the_guard_before_persist_completes() {
+        // Round-2 High, part 2: the round-2 fix held the write guard only
+        // in `put`'s own async stack frame (`let _write_guard = ...
+        // .lock().await`) while the `spawn_blocking` closure captured just
+        // root/floor_bytes/bytes. Cancelling/dropping the outer `put`
+        // future released that borrowed guard immediately, even though an
+        // already-started blocking write kept running on its own thread --
+        // a second put could then pass its floor check while the first
+        // write was still landing.
+        //
+        // White-box check (via the same private `write_lock_for_root` the
+        // fix itself uses) rather than an indirect two-store race: abort
+        // the outer task a few milliseconds into a large write (long
+        // enough that the write is almost certainly still in flight,
+        // comfortably past the near-instantaneous lock-acquire-and-dispatch
+        // step), then confirm the shared per-root lock is STILL held
+        // immediately afterward -- only possible if the guard moved into
+        // the detached `spawn_blocking` closure rather than living in the
+        // now-dropped outer frame. Finally confirm the lock does eventually
+        // free (the closure was never leaked, just outlived the cancelled
+        // future).
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("blobs");
+        fs::create_dir_all(&root).unwrap();
+        let canonical_root = root.canonicalize().unwrap();
+        let payload_len = 256 * 1024 * 1024; // large enough to still be writing a few ms in
+
+        let store = std::sync::Arc::new(FsBlobStore::new(root, 0).unwrap());
+        let handle = {
+            let store = store.clone();
+            tokio::spawn(async move { store.put(vec![4u8; payload_len]).await })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        handle.abort();
+        let abort_result = handle.await;
+        match &abort_result {
+            Err(e) if e.is_cancelled() => {}
+            other => panic!(
+                "the outer task must actually have been cancelled for this test to be \
+                 meaningful: {other:?}"
+            ),
+        }
+
+        let shared_lock = write_lock_for_root(&canonical_root).unwrap();
+        assert!(
+            shared_lock.try_lock().is_err(),
+            "the guard must still be held by the detached blocking write immediately after \
+             the outer future was cancelled -- if this is free, the guard was released with \
+             the aborted frame instead of moving into the spawn_blocking closure"
+        );
+
+        // The detached write must still run to completion and release the
+        // lock itself -- it was cancelled from the caller's point of view,
+        // not killed.
+        let mut freed = false;
+        for _ in 0..500 {
+            if shared_lock.try_lock().is_ok() {
+                freed = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            freed,
+            "the detached write must eventually release the guard"
         );
     }
 
