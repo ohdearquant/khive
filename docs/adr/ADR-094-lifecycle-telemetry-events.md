@@ -331,7 +331,7 @@ cleanup, out of scope for a docs-only ADR), but they become removable once the c
 
 ### 4. #617 consumer: windowed query over `CheckpointOutcomeRecorded`, this ADR provides the substrate only
 
-The Blocker in round-1 review of this ADR was that emitting `CheckpointOutcomeRecorded` only
+A blocker identified during review of this ADR was that emitting `CheckpointOutcomeRecorded` only
 while `above_warn` is true makes the N=3 query vacuous: no row ever exists with `above_warn =
 false`, so three isolated single-cycle crossings spread across a week (each cycle elevated
 for exactly one tick, then draining back down before the next crossing days later) would

@@ -248,7 +248,7 @@ Deno.test("validatePackManifest — non-adjacent duplicate values are rejected",
   assertStringIncludes(err.message, "'a'");
 });
 
-// ─── CLI dispatch routing regression (round-3 fix) ─────────────────────────
+// ─── CLI dispatch routing regression ─────────────────────────
 
 Deno.test("dispatchPack — 'validate' routes to deferred-phase2, not check", async () => {
   // Spawn the CLI with `pack validate` and assert it exits 1 with the

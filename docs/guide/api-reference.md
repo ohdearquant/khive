@@ -39,6 +39,10 @@ An always-machine-readable copy of this page is at
 
 `workspace` requires `kg`, `git`, `gtd`, and `session` to be loaded alongside it (the runtime rejects a pack set that omits a declared dependency), so its minimal example lists all four.
 
+`schedule` requires `kg`. `schedule.remind` additionally requires `comm.send` at
+creation time and persists nothing when that delivery capability is absent; the other
+three schedule verbs remain available without `comm`.
+
 `code` registers the `finding` note kind and edge rules only; its `code.ingest` verb is
 accepted but unimplemented (ADR-085), and `findings.json` ingest runs through the
 `kkernel code-ingest` admin CLI path, not the MCP verb surface — so it contributes 0
@@ -991,10 +995,11 @@ request(ops="comm.probe(actor=\"lambda:leo\", since_us=42)")
 
 Read-only per-channel health snapshot. Returns the daemon-persisted heartbeat row for
 every known channel: timestamps and consecutive-failure counts only, never a computed
-healthy bool. Health judgment belongs to the caller. Rows are read from the pinned
-operational namespace (`local`) unconditionally, regardless of the caller's dispatch
-namespace. An empty `channels` array cannot distinguish "no daemon running" from
-"channels configured but never polled". See the
+healthy bool. Health judgment belongs to the caller. Rows are read from the caller's
+injected namespace (`namespace=`, defaulting to `local` like every other comm verb) —
+`comm.heartbeat` is the only handler pinned to the fixed `local` operational namespace.
+The response echoes the namespace actually read in a `namespace` field, so an empty
+`channels` array is unambiguous even under a scoped read. See the
 [communication guide](communication.md) for the full response contract.
 
 No parameters.
@@ -1008,7 +1013,7 @@ request(ops="comm.health()")
 ## `schedule` pack — 4 verbs
 
 Time-triggered reminders and deferred verb dispatch. Optional; load with
-`KHIVE_PACKS=kg,schedule`.
+`KHIVE_PACKS=kg,schedule`. Add `comm` to create reminders.
 
 ### `schedule.remind` — Commissive
 

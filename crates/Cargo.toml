@@ -98,6 +98,11 @@ lru = "0.12"
 sha2 = "0.10"
 hex = "0.4"
 blake3 = { version = "1", default-features = false }
+# Cross-platform filesystem free-space query for BlobStore's fail-closed
+# floor check (khive#292). Pure Rust (rustix on Unix, windows-sys on
+# Windows) — no libc statvfs FFI to hand-maintain across the release
+# matrix's win32-x64 target.
+fs4 = "1.1"
 regorus = "0.10"
 rmcp = "1.7"
 futures = "0.3"

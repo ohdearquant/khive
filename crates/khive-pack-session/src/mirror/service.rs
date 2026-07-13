@@ -550,7 +550,7 @@ mod codex_filename_tests {
 
     #[test]
     fn timestamp_only_stem_is_rejected() {
-        // Regression for Finding 2: a stem with no UUID suffix has 4 hyphens
+        // Regression: a stem with no UUID suffix has 4 hyphens
         // in its trailing segments and must NOT be accepted as a session id.
         let path = Path::new("rollout-2025-11-11T08-32-36.jsonl");
         assert_eq!(extract_codex_session_id(path), None);

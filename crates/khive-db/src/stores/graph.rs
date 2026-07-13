@@ -43,7 +43,7 @@ fn map_sqlite_err(e: SqliteError, op: &'static str) -> StorageError {
 
 /// The natural-key conflict arm's `SET` list — shared, textually, between
 /// [`edge_upsert_statement`] and [`edge_insert_guarded_by_endpoints_statement`]
-/// (ADR-099 B3 r7, codex r7 High finding 2) so the two can never silently
+/// (ADR-099 §B3) so the two can never silently
 /// diverge again: the atomic link path previously hand-duplicated this SET
 /// list without `target_backend = excluded.target_backend`, so a re-link of
 /// an edge that had a cross-backend `target_backend` stamp behaved
@@ -123,8 +123,8 @@ pub fn edge_upsert_statement(edge: &Edge) -> SqlStatement {
     }
 }
 
-/// The atomic `link` op's variant of [`edge_upsert_statement`] (ADR-099 B3
-/// r7, codex r7 High finding 2). Shares the SAME
+/// The atomic `link` op's variant of [`edge_upsert_statement`] (ADR-099
+/// §B3). Shares the SAME
 /// `EDGE_NATURAL_KEY_CONFLICT_SET` conflict-arm text — the two builders
 /// cannot diverge on write behavior — but wraps the `INSERT` in a guarded
 /// `SELECT ... WHERE EXISTS(...)` that re-probes both endpoints for
@@ -229,8 +229,8 @@ pub fn purge_incident_edges_statement(node_id: Uuid) -> SqlStatement {
 // `SqlValue` plan-shape khive-storage abstracts elsewhere) vs. `SqlValue`
 // plan params for the async `PlanStatement` path — but the SQL TEXT itself
 // (the `EDGE_SYMMETRIC_*_SQL` constants below) is the single source of truth
-// for both, closing the class of drift that produced the ADR-099 B3 round-4
-// codex REJECT (a hand-copied SQL literal silently diverging from canonical).
+// for both, closing the class of drift that produced a hand-copied SQL
+// literal silently diverging from canonical (ADR-099 §B3).
 pub const EDGE_SYMMETRIC_CONFLICT_PROBE_SQL: &str = "SELECT id FROM graph_edges \
      WHERE namespace = ?1 AND source_id = ?2 AND target_id = ?3 \
      AND relation = ?4 AND id != ?5";
@@ -348,7 +348,7 @@ pub fn edge_symmetric_update_inplace_statement(
 
 // ---------------------------------------------------------------------------
 // Symmetric-relation update DML — atomic-only, commit-time self-guarding
-// variant (ADR-099 B3 r7, codex r7 High finding 3).
+// variant (ADR-099 §B3).
 //
 // The four builders above are still what canonical `update_edge_symmetric_dml`
 // binds: it probes and branches synchronously INSIDE its own writer-task
@@ -362,13 +362,13 @@ pub fn edge_symmetric_update_inplace_statement(
 // earlier op in the SAME atomic unit (e.g. a `delete` or another symmetric
 // `update` touching the same natural key) can change the conflict landscape
 // between this op's prepare-time probe and its own statements finally
-// executing at commit time — codex r7 flagged this as a real staleness
+// executing at commit time — this is a real staleness
 // window, not just an SQL-text duplication concern.
 //
 // The two builders below close it: instead of a Rust-level `if let
 // Some(conflict) { ... } else { ... }` that hand-picks ONE of three
-// statements at prepare time (the "second hand-assembled branch" codex
-// flagged), the atomic plan ALWAYS carries both statements, in order, and
+// statements at prepare time (the second hand-assembled branch this
+// closes), the atomic plan ALWAYS carries both statements, in order, and
 // each is a self-guarding, commit-time predicate that re-evaluates conflict
 // state fresh against whatever the transaction's state actually is when it
 // runs — not what prepare's probe said:
@@ -378,7 +378,7 @@ pub fn edge_symmetric_update_inplace_statement(
 //    exists at the target natural key at THIS moment (guard: 0 or 1 rows).
 // 2. [`edge_symmetric_refresh_or_update_inplace_statement`]: a single
 //    `UPDATE` that no longer trusts an `id = ?2 OR natural-key` predicate
-//    (ADR-099 B3 r9, codex r8 Blocker finding 1 — that predicate could
+//    (ADR-099 §B3 — that predicate could
 //    match the WRONG row: if a different op earlier in the SAME atomic unit
 //    had already deleted the requested edge, statement 1 above no-ops (its
 //    "0 rows" result is indistinguishable at the Rust level from "no
@@ -413,9 +413,9 @@ pub fn edge_symmetric_update_inplace_statement(
 // row this plan actually touched is derived post-commit by the caller via a
 // fresh natural-key lookup (`khive-runtime::KhiveRuntime::list_edges`,
 // filtered on the canonicalized endpoints/relation — the same mechanism the
-// atomic `link` op's own result rendering already uses) — ADR-099 B3 r9
-// removed the prior prepare-time advisory `target_id` probe entirely
-// (codex r8 Blocker finding 1, second half): a value computed before the
+// atomic `link` op's own result rendering already uses) — ADR-099 §B3
+// removed the prior prepare-time advisory `target_id` probe entirely:
+// a value computed before the
 // SAME atomic unit's other ops have run is not a fact this plan can stand
 // behind, so result rendering no longer trusts it.
 pub fn edge_symmetric_delete_if_conflict_statement(
@@ -868,9 +868,9 @@ fn canonical_edge_endpoints(
 /// or `WriteRequest::execute_and_reply`) issues the ROLLBACK.
 ///
 /// Per-row DML comes from [`edge_upsert_statement`] — the SAME builder
-/// singleton `upsert_edge` calls (ADR-099 B3 r9, codex r8 High finding 2:
-/// this function previously hand-wrote a second, textually-independent copy
-/// of the natural-key conflict arms here, the exact drift class round 7's
+/// singleton `upsert_edge` calls (ADR-099 §B3): this function previously
+/// hand-wrote a second, textually-independent copy of the natural-key
+/// conflict arms here, the exact drift class the
 /// [`EDGE_NATURAL_KEY_CONFLICT_SET`] extraction was meant to close for good
 /// — a future change to that constant would have silently stopped reaching
 /// this batch path). `bind_params` is the same `SqlStatement` -> rusqlite
@@ -910,8 +910,7 @@ fn batch_upsert_edges(
 /// name which endpoint(s) were missing after a refused single-row insert,
 /// in the SAME writer closure as the insert itself — this is what makes the
 /// resulting `MissingEndpoints` an in-transaction fact rather than a
-/// reconstruction from a later, separately-scheduled read (round-2 codex
-/// Medium 1).
+/// reconstruction from a later, separately-scheduled read.
 ///
 /// Returns per-endpoint existence rather than a single AND'd bool so callers
 /// can report exactly which side was missing instead of a generic
@@ -945,8 +944,8 @@ fn edge_endpoints_exist(
 /// probe on the SAME connection with no gap for another writer to intervene
 /// between them, PROVIDED the caller holds the connection under a single
 /// write-locked transaction (either the WriterTask's own `BEGIN IMMEDIATE`,
-/// or an explicit one the flag-off caller opens around this call — round-4
-/// codex Medium: the singleton fallback previously ran the insert and the
+/// or an explicit one the flag-off caller opens around this call: the
+/// singleton fallback previously ran the insert and the
 /// probe as two separate autocommit statements).
 fn edge_insert_guarded(
     conn: &rusqlite::Connection,
@@ -963,7 +962,7 @@ fn edge_insert_guarded(
     // function's doc comment describes: a no-op in every non-test build,
     // and a no-op in test builds unless a test has installed a barrier for
     // this precise (source_id, target_id) pair (see
-    // `tests::insert_probe_seam` in graph_tests.rs). Lets the round-4/-5
+    // `tests::insert_probe_seam` in graph_tests.rs). Lets the
     // atomicity regression test force a racer to run at this seam instead
     // of guessing at it with sleeps.
     #[cfg(test)]
@@ -985,8 +984,7 @@ fn edge_insert_guarded(
 ///
 /// The refusing entry's index and its `MissingEndpoints` are captured by
 /// this same pre-check pass and returned as `GuardedBatchOutcome::refused`
-/// — the runtime layer no longer re-probes endpoints after the fact
-/// (round-2 codex Medium 1).
+/// — the runtime layer no longer re-probes endpoints after the fact.
 fn batch_upsert_edges_guarded(
     conn: &rusqlite::Connection,
     edges: &[Edge],
@@ -1123,7 +1121,7 @@ impl GraphStore for SqlGraphStore {
 
         // Flag-off (singleton) path: wrap the insert and the refused-probe
         // in one explicit transaction so nothing can change an endpoint
-        // between them (round-4 codex Medium — this fallback previously
+        // between them (this fallback previously
         // ran the two as separate autocommit statements on the standalone
         // writer connection).
         self.with_writer("upsert_edge_guarded", move |conn| {
@@ -1387,7 +1385,7 @@ impl GraphStore for SqlGraphStore {
                     // ascending, applied INSIDE the window's ORDER BY — otherwise a
                     // per-origin cap can silently drop high-weight neighbors in favor
                     // of arbitrary SQLite row order (mirrors neighbors(), ADR-089
-                    // context-verb review internal review round 1 High-1; issue #589).
+                    // context-verb review; issue #589).
                     let full_sql = if let Some(lim) = query_clone.limit {
                         all_params.push(Box::new(lim as i64));
                         format!(
@@ -1701,7 +1699,7 @@ impl GraphStore for SqlGraphStore {
             // Deterministic weight-descending order, tie-broken by node_id ascending,
             // applied BEFORE `LIMIT` — otherwise a `limit`/`fanout` cap can silently
             // drop high-weight neighbors in favor of arbitrary SQLite row order
-            // (ADR-089 context-verb review, internal review round 1, High-1).
+            // (ADR-089 context-verb review).
             let full_sql = format!(
                 "SELECT node_id, edge_id, relation, weight FROM ({}){} \
                  ORDER BY weight DESC, node_id ASC{}",
@@ -1780,13 +1778,13 @@ impl GraphStore for SqlGraphStore {
             let (where_extra, limit_clause, extra_params) = neighbor_extra_clause(&query, 3);
 
             // Same global weight-descending/node_id-ascending order as `neighbors`
-            // (ADR-089 context-verb review, internal review round 1, High-1),
+            // (ADR-089 context-verb review),
             // applied across BOTH directions before `LIMIT` truncates. A
             // reciprocal pair (an Out edge and an In edge to/from the same
             // neighbor at the same weight) ties on `(weight, node_id)`, so the
             // order is extended with a direction rank (`out` before `in`) and
             // finally `edge_id` to make the pre-`LIMIT` order fully
-            // deterministic (internal review round 2, High).
+            // deterministic).
             let full_sql = format!(
                 "SELECT node_id, edge_id, relation, weight, dir FROM ({}){} \
                  ORDER BY weight DESC, node_id ASC, \

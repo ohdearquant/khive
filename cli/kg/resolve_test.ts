@@ -215,7 +215,7 @@ Deno.test("resolve --merge-properties — unions non-overlapping props", async (
   });
 });
 
-// ─── [Major] --merge-properties must fail on overlapping keys ────────────────
+// ─── --merge-properties must fail on overlapping keys ────────────────
 // Regression: previously only warned and continued (resolve_test.ts:197-205).
 // ADR-053 §3 requires explicit per-record override for overlapping properties.
 
@@ -426,7 +426,7 @@ Deno.test("resolve edge conflict with --ours", async () => {
   });
 });
 
-// ─── [Major] --edge ADR-053 form: <source> <target> <relation> ───────────────
+// ─── --edge ADR-053 form: <source> <target> <relation> ───────────────
 // Regression: parser accepted only colon-joined key; ADR-053 §4 specifies
 // --edge <source> <target> <relation> --ours|--theirs as three separate args.
 
@@ -487,7 +487,7 @@ Deno.test("resolve --edge adr-form <source> <target> <relation> --theirs", async
   });
 });
 
-// ─── [Major] schema.yaml conflict must block and exit 1 ─────────────────────
+// ─── schema.yaml conflict must block and exit 1 ─────────────────────
 // Regression: schema conflicts returned success "No conflicts to resolve."
 // ADR-053 §5 requires schema conflicts to block the merge.
 
@@ -615,10 +615,10 @@ Deno.test(
   },
 );
 
-// ─── [Major] mixed manual + auto resolution preserves manual conflict blocks ──
+// ─── mixed manual + auto resolution preserves manual conflict blocks ──
 // Regression: sortEntitiesNdjson parsed JSON lines inside manual conflict
 // blocks as normal records and moved them after the marker lines, corrupting
-// the block structure (codex finding — sort with manual leftovers).
+// the block structure (sort with manual leftovers).
 
 Deno.test(
   "resolve mixed manual + auto — sort does not corrupt remaining manual conflict block",
@@ -726,7 +726,7 @@ Deno.test(
   },
 );
 
-// ─── [Major] delete-vs-edit must require explicit override ───────────────────
+// ─── delete-vs-edit must require explicit override ───────────────────
 // ADR-053 §4 — delete-vs-edit conflicts cannot be resolved by --merge-properties.
 
 Deno.test(

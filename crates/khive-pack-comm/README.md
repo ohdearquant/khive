@@ -110,8 +110,10 @@ Over MCP: `request(ops="comm.send(to=\"lambda:leo\", content=\"PR #372 is ready 
 
 `khive-pack-comm` sits alongside `khive-pack-gtd`, `khive-pack-memory`, and
 `khive-pack-schedule` in the pack layer, depending on `khive-pack-kg` for the
-note substrate and registering into `khive-runtime`'s `VerbRegistry`, consumed
-by `khive-mcp`. Governing ADRs:
+note substrate. The schedule pack's `schedule.remind` verb requires the registered `comm.send`
+delivery capability at creation time; the schedule pack itself requires only `kg`.
+Both register into `khive-runtime`'s `VerbRegistry`, consumed by `khive-mcp`.
+Governing ADRs:
 [ADR-040](https://github.com/ohdearquant/khive/blob/main/docs/adr/ADR-040-communication-and-schedule-packs.md) (communication and schedule packs),
 [ADR-057](https://github.com/ohdearquant/khive/blob/main/docs/adr/ADR-057-comm-actor-addressed-delivery.md) (actor-addressed delivery),
 built on [ADR-017](https://github.com/ohdearquant/khive/blob/main/docs/adr/ADR-017-pack-standard.md) (pack standard).

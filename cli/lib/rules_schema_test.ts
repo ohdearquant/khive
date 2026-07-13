@@ -2,7 +2,7 @@
  * Tests for validateRulesFile() — ADR-056 §8 schema validation.
  *
  * These tests cover the blocker (exit code 2) and the closed-taxonomy
- * high-severity findings from codex round-1 review of PR #134.
+ * findings from the PR #134 review.
  */
 
 import { assertEquals, assertStringIncludes } from "@std/assert";
@@ -37,7 +37,7 @@ Deno.test("validateRulesFile — unknown top-level key is rejected", () => {
 // ─── Severity validation ──────────────────────────────────────────────────────
 
 Deno.test("validateRulesFile — invalid severity 'fatal' is rejected (blocker repro)", () => {
-  // This is the exact case that caused exit=0 in codex's blocker repro.
+  // This is the exact case that caused exit=0 in the blocker repro.
   const parsed = {
     rules: {
       "no-self-loops": { severity: "fatal", enabled: true },

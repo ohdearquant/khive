@@ -488,7 +488,7 @@ mod tests {
 
     #[test]
     fn registry_does_not_collapse_same_kind_distinct_slug() {
-        // #606 round-1 internal review, High finding: two accounts sharing
+        // #606: two accounts sharing
         // `kind()` but with distinct `slug()` values (e.g. two mailboxes)
         // must coexist as two registered adapters, not collapse into one.
         let mut reg = ChannelRegistry::new();

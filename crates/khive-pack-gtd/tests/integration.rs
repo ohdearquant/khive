@@ -2477,7 +2477,7 @@ async fn next_returns_explicit_error_when_matches_exceed_scan_bound() {
     );
 }
 
-/// #825 round 2 boundary test: exactly `TASK_SCAN_MAX_ROWS` (20,000) matching
+/// #825 boundary test: exactly `TASK_SCAN_MAX_ROWS` (20,000) matching
 /// rows must succeed — the bound is "reject when more than 20,000 rows
 /// match", not "reject at or above 20,000".
 #[tokio::test]

@@ -213,7 +213,7 @@ pub enum FeedbackGateMode {
     Nominal(f64),
     /// ADR-081 §4 fail-safe: the serve ledger row has no resolvable
     /// accounting profile. Always folds at zero weight and never writes
-    /// `brain_implicit_mass` — but (Finding 2, internal review round 2) still
+    /// `brain_implicit_mass` — but it still
     /// participates in the `(scorer_run_id, serve_ledger_id)` dedup claim,
     /// atomically with the event append, so two concurrent forced-zero
     /// submissions for the same pair cannot both append an audit event.
@@ -249,7 +249,7 @@ pub enum GateAndAppendOutcome {
     Applied(Box<GateAndAppendResult>),
 }
 
-/// ADR-081 §2/§6 (Finding 1 + Finding 2 for PR #497):
+/// ADR-081 §2/§6 (PR #497):
 /// claim the `(scorer_run_id, serve_ledger_id)` dedup key (if supplied), run
 /// the bounded-mass fold gate (or skip it for `ForcedZero`), and append the
 /// resulting `brain.feedback` event — as ONE atomic, all-or-nothing unit on
@@ -261,7 +261,7 @@ pub enum GateAndAppendOutcome {
 /// numbers; it runs inside the transaction, so an error surfaced from
 /// appending the event it returns aborts the whole unit.
 ///
-/// Finding 1 fix: on a claim conflict, this returns `Deduped` before running
+/// Claim-conflict handling: on a claim conflict, this returns `Deduped` before running
 /// the fold or building/appending any event. If instead the claim succeeds
 /// but the event append fails, the whole transaction — claim included —
 /// rolls back (the same commit/rollback shell as `apply_fold_gate`), so a
@@ -269,7 +269,7 @@ pub enum GateAndAppendOutcome {
 /// failed event append the way it could when the event append ran in its own
 /// separate transaction after this one committed.
 ///
-/// Finding 2 fix: `FeedbackGateMode::ForcedZero` still runs the dedup claim
+/// Forced-zero handling: `FeedbackGateMode::ForcedZero` still runs the dedup claim
 /// step above — only the mass fold itself is skipped — so two concurrent
 /// forced-zero submissions for the same `(scorer_run_id, serve_ledger_id)`
 /// pair can no longer both append a zero-weight audit event.
@@ -472,7 +472,7 @@ async fn fold_within_tx(
     let mass_before = decayed_mass(old_mass, now_us - last_event_at);
     let (effective_weight, mass_after) = gate_decision(mass_before, weight, IMPLICIT_MASS_CAP);
 
-    // Finding 2 (internal review round 1): never move `last_event_at` backwards. A
+    // Never move `last_event_at` backwards. A
     // negative `delta_us` above (clock skew) already keeps `mass_before`
     // undecayed and the event clamps/folds conservatively, but persisting
     // `now_us` verbatim would still drag the accumulator's clock back to the
@@ -871,7 +871,7 @@ mod tests {
         );
     }
 
-    /// Proves the Finding-1 fix (internal review round 1): concurrent duplicate scorer
+    /// Proves the claim-conflict fix: concurrent duplicate scorer
     /// submissions — identical `(scorer_run_id, serve_ledger_id)` — fold
     /// exactly once, regardless of scheduling order.
     ///
@@ -997,7 +997,7 @@ mod tests {
         );
     }
 
-    /// Proves the Finding-2 fix (internal review round 1): a negative-clock-skew event
+    /// Proves the clock-skew fix: a negative-clock-skew event
     /// must never drag the accumulator's `last_event_at` backwards, or a
     /// later, correctly-ordered event would decay mass that should still be
     /// at full weight and pass the clamp early.

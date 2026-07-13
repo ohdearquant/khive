@@ -409,7 +409,14 @@ impl PackRuntime for MemoryPack {
         fts_population_guard(&self.runtime).await;
     }
 
-    /// #750 fix-round 1: install a note-mutation hook on the runtime THIS
+    /// ADR-103 Amendment 1's `model_count` computation for `memory.remember`
+    /// without an explicit `embedding_model` override reads this at the
+    /// dispatch audit-row emission seam.
+    fn registered_embedding_model_names(&self) -> Vec<String> {
+        self.runtime.registered_embedding_model_names()
+    }
+
+    /// #750: install a note-mutation hook on the runtime THIS
     /// pack owns (`self.runtime`, not the `_runtime` param — mirrors
     /// `KgPack::register_entity_type_validator`'s multi-backend rationale:
     /// in a multi-backend deployment each pack is constructed with its own
@@ -458,7 +465,10 @@ impl PackRuntime for MemoryPack {
         match verb {
             "memory.remember" => self.handle_remember(token, params).await,
             "memory.feedback" => self.handle_feedback(token, params, registry).await,
-            "memory.recall" => self.handle_recall(token, params, registry).await,
+            "memory.recall" => {
+                self.handle_recall_with_deadline(token, params, registry)
+                    .await
+            }
             "memory.recall_embed" => self.handle_recall_embed(params).await,
             "memory.recall_candidates" => self.handle_recall_candidates(token, params).await,
             "memory.recall_fuse" => self.handle_recall_fuse(token, params, registry).await,
@@ -471,6 +481,151 @@ impl PackRuntime for MemoryPack {
             ))),
         }
     }
+}
+
+impl MemoryPack {
+    /// #889: wraps `handle_recall` in a bounded end-to-end deadline so a
+    /// caller under sustained concurrent-load contention gets a fast, typed
+    /// error instead of hanging until an upstream client-side ceiling fires
+    /// (300s observed in production incidents on 2026-07-12). This bounds the
+    /// *entire* pipeline (profile resolution, FTS + vector candidate gather
+    /// and its ANN-overfetch retry loop, hydration, fusion/scoring, MMR, and
+    /// supersedes suppression) — distinct from (and layered on top of)
+    /// `#836`'s narrower `ann_ready_timeout_ms`, which bounds only a single
+    /// cold-miss ANN-build wait inside the vector leg and degrades in-band to
+    /// an FTS-only result. A timeout here does not cancel any in-flight
+    /// storage work still owned by the runtime; it only bounds how long this
+    /// call waits for a response.
+    ///
+    /// The deadline is read from `params.config.recall_deadline_ms` when
+    /// present (a per-request override, checked here rather than inside
+    /// `handle_recall` because the wrap has to start before that function's
+    /// own `deser(params)` runs); an absent or explicit-`null` value falls
+    /// through to the process-wide `recall_deadline_ms()` default/env value,
+    /// exactly like `handle_recall` itself already falls through to
+    /// `ann_ready_timeout_ms()`. A *present*, non-null value must be a
+    /// strictly positive integer — see `parse_recall_deadline_override`
+    /// (#889: a zero or malformed override is a per-op
+    /// `InvalidInput` error, not a silent coercion to the default). This
+    /// never tightens or duplicates `RecallParams`'s own validation of
+    /// `params`; `handle_recall` still parses (and rejects, if malformed)
+    /// the full params normally.
+    async fn handle_recall_with_deadline(
+        &self,
+        token: &NamespaceToken,
+        params: Value,
+        registry: &VerbRegistry,
+    ) -> Result<Value, RuntimeError> {
+        let budget_ms = match parse_recall_deadline_override(&params)? {
+            Some(ms) => ms,
+            None => recall_deadline_ms(),
+        };
+        let start = std::time::Instant::now();
+        match tokio::time::timeout(
+            std::time::Duration::from_millis(budget_ms),
+            self.handle_recall(token, params, registry),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => Err(RuntimeError::DeadlineExceeded {
+                operation: "memory.recall".to_string(),
+                budget_ms,
+                elapsed_ms: start.elapsed().as_millis() as u64,
+            }),
+        }
+    }
+}
+
+/// #889: parse and validate an optional per-request
+/// `config.recall_deadline_ms` override. `None` (the key absent, or present
+/// as JSON `null`) means "no override" and the caller falls through to the
+/// process-wide `recall_deadline_ms()` default/env value. A *present*,
+/// non-null value must be a strictly positive integer — matching
+/// ADR-033's invalid-config contract ("Invalid configs ... are caught at
+/// handler entry and return a per-op `{ok: false, error: ...}` response;
+/// the batch does not abort"), this returns `InvalidInput` rather than
+/// silently coercing a malformed override to the default. Silent coercion
+/// would otherwise turn a caller's `0` into an always-immediate timeout, or
+/// swallow a caller's negative/non-numeric typo into an unnoticed default.
+pub(crate) fn parse_recall_deadline_override(params: &Value) -> Result<Option<u64>, RuntimeError> {
+    let Some(raw) = params
+        .get("config")
+        .and_then(|c| c.get("recall_deadline_ms"))
+    else {
+        return Ok(None);
+    };
+    if raw.is_null() {
+        return Ok(None);
+    }
+    match raw.as_u64() {
+        Some(ms) if ms > 0 => Ok(Some(ms)),
+        _ => Err(RuntimeError::InvalidInput(format!(
+            "config.recall_deadline_ms must be a positive integer milliseconds value, got {raw}"
+        ))),
+    }
+}
+
+/// #889: pure parse/validate step for
+/// `KHIVE_MEMORY_RECALL_DEADLINE_MS`, split out of `recall_deadline_ms`'s
+/// `OnceLock` closure so it is unit-testable without touching real process
+/// environment state or the process-lifetime-cached `OnceLock` (which, once
+/// initialized by any test in this binary, can never re-observe a
+/// different env value for the rest of that test run).
+///
+/// An absent, zero, negative, or non-numeric env value all fall back to the
+/// default and log a warning — unlike an invalid *per-request* override
+/// (`parse_recall_deadline_override`), which is a hard per-op error. This
+/// asymmetry is deliberate: a caller's malformed request is a caller bug
+/// that should surface immediately; a malformed *operator* env value must
+/// not brick every `memory.recall` call on the daemon.
+pub(crate) fn parse_recall_deadline_env(raw: Option<&str>) -> u64 {
+    const DEFAULT_RECALL_DEADLINE_MS: u64 = 30_000;
+    let Some(raw) = raw else {
+        return DEFAULT_RECALL_DEADLINE_MS;
+    };
+    match raw.parse::<u64>() {
+        Ok(ms) if ms > 0 => ms,
+        Ok(_) => {
+            tracing::warn!(
+                raw = %raw,
+                default_ms = DEFAULT_RECALL_DEADLINE_MS,
+                "KHIVE_MEMORY_RECALL_DEADLINE_MS=0 is not a valid recall deadline; \
+                 falling back to the default (#889)"
+            );
+            DEFAULT_RECALL_DEADLINE_MS
+        }
+        Err(_) => {
+            tracing::warn!(
+                raw = %raw,
+                default_ms = DEFAULT_RECALL_DEADLINE_MS,
+                "KHIVE_MEMORY_RECALL_DEADLINE_MS is not a valid positive integer; \
+                 falling back to the default (#889)"
+            );
+            DEFAULT_RECALL_DEADLINE_MS
+        }
+    }
+}
+
+/// #889: bounded end-to-end deadline, in milliseconds, for the entire
+/// `memory.recall` pipeline. 30s sits comfortably above every latency this
+/// pipeline needs under normal-to-heavy load (single-digit-to-low-hundreds
+/// of milliseconds per stage even at 20-way concurrency in the #889
+/// load-harness repro, `.khive/workspaces/20260712/889-recall-stall/`) while
+/// staying far short of the 300s client-side ceiling the deadline exists to
+/// preempt. Overridable via env for operators who need to tune it for a
+/// larger corpus or heavier sustained concurrency than the repro covered.
+pub(crate) fn recall_deadline_ms() -> u64 {
+    static DEADLINE_MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *DEADLINE_MS.get_or_init(|| {
+        let raw = std::env::var("KHIVE_MEMORY_RECALL_DEADLINE_MS").ok();
+        let ms = parse_recall_deadline_env(raw.as_deref());
+        khive_runtime::config_ledger::record_config_locked(
+            "KHIVE_MEMORY_RECALL_DEADLINE_MS",
+            ms.to_string(),
+        );
+        ms
+    })
 }
 
 /// Check that the unified FTS tables are adequately populated relative to the
@@ -729,10 +884,10 @@ mod ann_route_tests {
     }
 }
 
-/// #750 fix-round 1 regressions: `memory.prune`, KG `update`, and KG `delete`
+/// #750 regressions: `memory.prune`, KG `update`, and KG `delete`
 /// all mutate the same memory-note corpus the warm ANN cache is built from,
 /// but only `memory.remember` bumped `AnnState::generations` before this
-/// round. Each test here warms the cache (proving `is_current()` is `true`
+/// fix. Each test here warms the cache (proving `is_current()` is `true`
 /// for the registered model), performs the mutation WITHOUT any intervening
 /// `memory.remember`, and asserts `is_current()` is `false` afterward — the
 /// exact mechanism `handlers/common.rs`'s recall-path cache-hit gate checks
@@ -860,7 +1015,7 @@ mod note_mutation_hook_tests {
         assert!(
             !ann::is_current(&ann, &fr1_key()).await,
             "memory.prune deleting a candidate must invalidate the warm ANN \
-             generation for affected models (#750 fix-round 1)"
+             generation for affected models (#750)"
         );
     }
 
@@ -887,7 +1042,7 @@ mod note_mutation_hook_tests {
         assert!(
             !ann::is_current(&ann, &fr1_key()).await,
             "a KG `update` that changes a memory-kind note's content must \
-             invalidate the warm ANN generation (#750 fix-round 1)"
+             invalidate the warm ANN generation (#750)"
         );
     }
 
@@ -914,11 +1069,11 @@ mod note_mutation_hook_tests {
         assert!(
             !ann::is_current(&ann, &fr1_key()).await,
             "a KG `delete` on a memory-kind note must invalidate the warm \
-             ANN generation (#750 fix-round 1)"
+             ANN generation (#750)"
         );
     }
 
-    /// #750 fix-round 2 (codex r2 High 1): `merge_note`'s non-dry-run
+    /// #750: `merge_note`'s non-dry-run
     /// success path reindexes the surviving note (a corpus change exactly
     /// like `update_note`'s `text_changed` branch) but never fired the
     /// note-mutation hook. Same white-box shape as the three fr1 tests
@@ -933,8 +1088,7 @@ mod note_mutation_hook_tests {
     /// bump — this exact non-discriminating-test trap is what caught out
     /// an earlier draft of this test (confirmed by a disable/re-enable
     /// run: the earlier draft still passed with the merge fix's hook-fire
-    /// call commented out). See the fix-round-2 report for the full
-    /// before/after evidence.
+    /// call commented out).
     #[tokio::test]
     #[serial(background_tasks)]
     async fn fr2_kg_merge_invalidates_warm_ann_without_subsequent_remember() {
@@ -1011,7 +1165,7 @@ mod note_mutation_hook_tests {
         assert!(
             !ann::is_current(&ann, &fr1_key()).await,
             "a KG `merge` of two memory-kind notes must invalidate the warm \
-             ANN generation (#750 fix-round 2, codex r2 High 1)"
+             ANN generation (#750)"
         );
     }
 

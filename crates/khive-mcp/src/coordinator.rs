@@ -284,7 +284,7 @@ pub(crate) mod tests {
 
     /// T6a: A multi-backend server MUST route `link` through the coordinator.
     ///
-    /// This test must FAIL before BLOCKER-1 is wired (coordinator never called)
+    /// This test must FAIL before the coordinator routing fix is wired (coordinator never called)
     /// and PASS after wiring.
     #[tokio::test]
     async fn t6a_multi_backend_server_routes_link_through_coordinator() {
@@ -320,7 +320,7 @@ pub(crate) mod tests {
 
     /// T6b: A multi-backend server MUST route `search` through the coordinator.
     ///
-    /// This test must FAIL before BLOCKER-1 is wired and PASS after wiring.
+    /// This test must FAIL before the coordinator routing fix is wired and PASS after wiring.
     #[tokio::test]
     async fn t6b_multi_backend_server_routes_search_through_coordinator() {
         let (registry, _runtime) = make_registry();

@@ -20,7 +20,7 @@ khive-types = { version = "0.4.0", path = "../khive-types", features = ["serde"]
 khive-runtime = { version = "0.4.0", path = "../khive-runtime" }
 khive-fold = { version = "0.4.0", path = "../khive-fold" }
 khive-storage = { version = "0.4.0", path = "../khive-storage" }
-# ADR-081 §2/§6 (codex round 2, findings 1+2): the fold gate needs the event
+# ADR-081 §2/§6 (findings 1+2): the fold gate needs the event
 # append on the SAME held `SqlWriter` transaction as the dedup claim + mass
 # fold, so it calls khive-db's transaction-enlisted `append_event_on_writer`
 # seam directly rather than going through the higher-level `EventStore`
@@ -45,7 +45,8 @@ khive-pack-kg = { version = "0.4.0", path = "../khive-pack-kg" }
 # (issue #459 regression). khive-pack-memory already carries khive-pack-brain
 # as a dev-dependency for its own tests; Cargo permits cyclic dev-dependencies
 # since neither crate's normal (non-dev) dependency graph is affected.
-khive-pack-memory = { version = "0.4.0", path = "../khive-pack-memory" }
+# Path-only: cyclic dev-dep pair with khive-pack-memory; cargo strips it at publish.
+khive-pack-memory = { path = "../khive-pack-memory" }
 criterion = { workspace = true }
 tempfile = { workspace = true }
 serial_test = { workspace = true }

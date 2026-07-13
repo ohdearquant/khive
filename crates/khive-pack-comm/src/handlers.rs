@@ -640,7 +640,7 @@ pub(crate) async fn handle_thread(
         });
     }
 
-    // #494 / codex r1: `after` cursor — either a message id (short prefix or full
+    // #494: `after` cursor — either a message id (short prefix or full
     // UUID, resolved the same way `id` is) or an RFC 3339 timestamp. An id cursor
     // resolves to the full `(created_at, full_id)` tuple of the referenced note so
     // ties on equal microsecond timestamps are broken deterministically instead of
@@ -1006,7 +1006,7 @@ pub(crate) async fn handle_ingest(
     if let Some(ref kind) = p.channel_kind {
         props["channel_kind"] = json!(kind);
     }
-    // Generic transport-layer metadata passthrough (issue #448 Finding 2): merged
+    // Generic transport-layer metadata passthrough (issue #448): merged
     // additively so it can never clobber the identity/routing fields set above --
     // a key already present (from, to, from_actor, to_actor, direction, read,
     // thread_id, sent_at, subject, external_id, wire_message_id, wire_references,
@@ -1064,7 +1064,7 @@ pub(crate) async fn handle_ingest(
 /// into a single row.
 ///
 /// The three components are hashed as a JSON array of strings, NOT joined
-/// with a `:` delimiter (round-1 internal review, Medium finding). Namespaces
+/// with a `:` delimiter. Namespaces
 /// may themselves contain `:` (hierarchical namespace strings are explicitly
 /// allowed), so a delimiter-joined `format!("...:{a}:{b}:{c}")` is not an
 /// injective encoding: `(namespace="a:b", channel_kind="c", channel_slug="d")`
@@ -1143,10 +1143,17 @@ pub(crate) async fn handle_heartbeat(
     // OPERATIONAL surface, not message data. Persist to
     // `crate::CHANNEL_HEALTH_NAMESPACE` ALWAYS — never `token.namespace()` —
     // so a poll loop configured with a non-local `KHIVE_EMAIL_INGEST_NAMESPACE`
-    // cannot cause heartbeat rows to land anywhere but where `handle_health`
-    // reads from. This is enforced here (not just at the serve.rs call site)
+    // cannot cause heartbeat rows to land anywhere but this one fixed
+    // namespace. This is enforced here (not just at the serve.rs call site)
     // so the guarantee holds even if a future caller passes a different
     // `namespace` dispatch param.
+    //
+    // `handle_health` (khive #877) no longer mirrors this fixed pin: it reads
+    // from `token.namespace()`, which only resolves to this same constant
+    // for an unscoped (default-namespace) caller. An explicitly-scoped
+    // `comm.health` caller reads its own namespace, not wherever this
+    // handler wrote — do not reintroduce a `handle_health` read of this
+    // constant to "fix" that; it is the cross-namespace leak #877 closed.
     let ns = crate::CHANNEL_HEALTH_NAMESPACE;
     let store = runtime.notes(token)?;
     let id = heartbeat_note_id(ns, &p.channel_kind, &p.channel_slug);
@@ -1248,25 +1255,41 @@ fn channel_health_to_json(note: &Note) -> Value {
 
 /// `health` — read-only per-channel health snapshot (khive #606).
 ///
-/// Reads the daemon-persisted `channel_health` rows from
-/// `crate::CHANNEL_HEALTH_NAMESPACE` UNCONDITIONALLY — never
-/// `token.namespace()` (design review Blocker fix, example actor 2026-07-04). Heartbeat
-/// rows are an operational surface, not message data, so a client-role
-/// no-arg call must see them regardless of what namespace the caller's own
-/// messages happen to be ingested under (e.g. `KHIVE_EMAIL_INGEST_NAMESPACE`
-/// set to something other than `"local"`). Cross-process read is the point
-/// of this verb (design review amendment 1): a client-role process (stdio MCP
-/// without `--daemon`) has no in-memory poll-loop state of its own, so it
-/// must read what the daemon already wrote. `role` answers "who owns the
-/// loops", not "whose memory answered": any persisted row means some daemon
-/// owns the channel loops, so `role` is reported as `"daemon"` with
+/// Reads the daemon-persisted `channel_health` rows from `token.namespace()`
+/// (khive #877) — the same injected-namespace resolution every other comm
+/// verb uses (ADR-007 Rev 6 Rule 3: `namespace=` is the caller's explicit
+/// escape; absent that, the token pins to `"local"`). Unscoped callers
+/// (single-tenant local daemon, the common case) see exactly what they saw
+/// before this fix, since heartbeat rows still land under
+/// `crate::CHANNEL_HEALTH_NAMESPACE` (`"local"`) and an unscoped token also
+/// resolves to `"local"`. A caller that passes an explicit non-local
+/// `namespace=` now reads that namespace's rows only — never `"local"`'s —
+/// closing the cross-namespace operational-surface leak that held this verb
+/// off the cloud data plane (#877). `role` answers "who owns the loops", not
+/// "whose memory answered": any persisted row means some daemon owns the
+/// channel loops, so `role` is reported as `"daemon"` with
 /// `source: "daemon-heartbeat"` regardless of whether THIS process is that
-/// daemon. `role: "client"` with an empty `channels` array is correct only
+/// daemon. `role: "client"` with an empty `channels` array is correct both
 /// when no daemon heartbeat state exists at all (fresh install, or a daemon
-/// that has never completed a poll tick) — the comm pack has no visibility
-/// into which channels are configured (that lives in
+/// that has never completed a poll tick) and when the caller's injected
+/// namespace has no heartbeat rows of its own — the comm pack has no
+/// visibility into which channels are configured (that lives in
 /// `khive-mcp`/`khive-channel-email`), so an empty result is the only
 /// fact-based response available at this layer.
+///
+/// `namespace` in the response (khive #877) is the namespace actually read —
+/// `token.namespace().as_str()`, echoed back so the shape is self-describing
+/// for both the unscoped and the explicitly-scoped case. This exists because
+/// `role: "client"` / empty `channels` is now ambiguous on its own: it is the
+/// correct, expected shape for a `namespace=`-scoped call in the shipped OSS
+/// build, since `comm.heartbeat` only ever persists under
+/// `crate::CHANNEL_HEALTH_NAMESPACE` (`"local"`) — there is no OSS producer
+/// for tenant-scoped heartbeat rows yet (that is cloud-side follow-up, not
+/// this handler's job). A caller reading `namespace: "tenant-a"` alongside
+/// `role: "client"` can tell "no daemon anywhere" (unscoped call, `namespace:
+/// "local"`) apart from "no rows written under my scope yet" (scoped call,
+/// `namespace: "tenant-a"`) without khive silently falling back to `"local"`
+/// to paper over the difference.
 ///
 /// Never returns a computed `healthy: bool` (design review amendment: "report
 /// timestamps only") — staleness/alerting judgment belongs to the caller.
@@ -1308,7 +1331,7 @@ pub(crate) async fn handle_health(
     };
     let page = store
         .query_notes_filtered(
-            crate::CHANNEL_HEALTH_NAMESPACE,
+            token.namespace().as_str(),
             &filter,
             PageRequest {
                 limit: MAX_CHANNELS,
@@ -1345,6 +1368,7 @@ pub(crate) async fn handle_health(
         "role": role,
         "source": source,
         "as_of": as_of,
+        "namespace": token.namespace().as_str(),
         "channels": channels,
         "resource": resource,
     }))
@@ -1951,7 +1975,7 @@ mod tests {
     };
     use serde_json::json;
 
-    // #606 round-1 internal review, Medium finding: a delimiter-joined
+    // #606: a delimiter-joined
     // `format!("...:{a}:{b}:{c}")` id encoding is not injective once
     // components may themselves contain `:` — these two distinct triples
     // both produced `"khive:channel_health:a:b:c:d"` under the pre-fix
@@ -2168,7 +2192,7 @@ mod tests {
 
     #[test]
     fn build_references_header_extends_existing_chain_of_two_or_more() {
-        // Finding 1 core spec: a reply whose parent has an existing References
+        // Core spec: a reply whose parent has an existing References
         // chain of 2+ ids must produce chain + parent Message-ID, not just the
         // immediate parent.
         let chain = Some("<grandparent1@example.com> <grandparent2@example.com>");

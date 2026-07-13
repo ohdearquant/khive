@@ -36,11 +36,11 @@ CREATE TABLE IF NOT EXISTS notes_seq (
 
 CREATE INDEX IF NOT EXISTS idx_notes_seq_note_id ON notes_seq(note_id);
 
--- The notes_seq anti-join repair (khive #827 round 3) used to run here, on
+-- The notes_seq anti-join repair (khive #827) used to run here, on
 -- every `notes_for_namespace` call. On a large, already-repaired ledger that
 -- is a full `notes` scan plus a temp B-tree for the ORDER BY on every single
 -- store acquisition, serializing every caller behind the writer mutex for no
--- benefit once the ledger has nothing left to repair (khive #827 round 4).
+-- benefit once the ledger has nothing left to repair (khive #827).
 -- The repair itself now lives in `stores/note.rs::repair_notes_seq` (still
 -- sourced from `sql/008-notes-seq-repair.sql`, same anti-join) and is invoked
 -- by `StorageBackend::notes_for_namespace`, gated to run at most once per

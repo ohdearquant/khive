@@ -352,11 +352,19 @@ pub(crate) static COMM_HANDLERS: [HandlerDef; 11] = [
         description: "Read-only per-channel health snapshot (khive #606). Returns the \
                        daemon-persisted heartbeat row for every known channel: timestamps \
                        and consecutive-failure counts only — never a computed healthy bool. \
-                       Health judgment belongs to the caller. Reads \
-                       `khive_pack_comm::CHANNEL_HEALTH_NAMESPACE` (\"local\") UNCONDITIONALLY \
-                       — regardless of the caller's dispatch/token namespace — so a client-role \
-                       no-arg call always sees daemon-persisted state when it exists, even if \
-                       the caller's own messages are ingested under a different namespace.",
+                       Health judgment belongs to the caller. Reads from the caller's injected \
+                       namespace (khive #877) — `token.namespace()`, the same explicit \
+                       `namespace=` escape / \"local\" default every other comm verb resolves \
+                       (ADR-007 Rev 6 Rule 3). An unscoped call defaults to \"local\", matching \
+                       the namespace heartbeat rows are persisted under; a call with an \
+                       explicit non-local `namespace=` sees only that namespace's rows, never \
+                       \"local\"'s. The response carries a `namespace` field naming the \
+                       namespace actually read, so `role: \"client\"` with empty `channels` is \
+                       unambiguous: it means no heartbeat rows exist under THAT namespace, not \
+                       necessarily that no daemon exists anywhere. In the shipped OSS build \
+                       `comm.heartbeat` only ever persists under \"local\", so a non-local \
+                       `namespace=` scope returns empty channels even while a daemon is \
+                       actively heartbeating under \"local\" — that is expected, not a fault.",
         visibility: Visibility::Verb,
         category: khive_types::VerbCategory::Assertive,
         params: &[],

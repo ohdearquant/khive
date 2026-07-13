@@ -1153,7 +1153,7 @@ mod tests {
 
     #[tokio::test]
     async fn quoted_reason_semicolon_forging_dmarc_pass_does_not_bypass_gate() {
-        // Regression for review #496 Finding 1, driven through the REAL byte-parsing
+        // Regression test driven through the REAL byte-parsing
         // path (parse_raw_bytes), not a hand-built AuthResults: a quoted reason=
         // pvalue containing "; dmarc=pass; " must never be split into a separate
         // dmarc method -- the gate must see the genuine spf=fail result and

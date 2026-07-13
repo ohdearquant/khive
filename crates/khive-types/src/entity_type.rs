@@ -437,19 +437,27 @@ pub struct EntityTypeRegistry {
 
 impl EntityTypeRegistry {
     /// Build a fresh registry from the supplied definitions.
+    ///
+    /// Every lookup key (kind-qualified and bare, canonical and alias) is
+    /// routed through `to_snake_case` before insertion — the same
+    /// normalisation `resolve` applies to incoming wire values (ADR-001:106).
+    /// Two differently-cased/separated spellings that normalise to the same
+    /// key therefore land on the same registry slot instead of silently
+    /// shadowing one another under distinct raw keys.
     pub fn new(defs: impl IntoIterator<Item = EntityTypeDef>) -> Self {
         let defs: Vec<EntityTypeDef> = defs.into_iter().collect();
         let mut lookup: BTreeMap<String, usize> = BTreeMap::new();
         for (idx, def) in defs.iter().enumerate() {
-            let canonical_key = format!("{}:{}", def.kind.name(), def.type_name);
+            let canonical_type = to_snake_case(def.type_name);
+            let canonical_key = format!("{}:{}", def.kind.name(), canonical_type);
             lookup.insert(canonical_key, idx);
-            let bare_key = def.type_name.to_string();
             // Bare name without kind prefix — only insert when unambiguous.
-            lookup.entry(bare_key).or_insert(idx);
+            lookup.entry(canonical_type).or_insert(idx);
             for alias in def.aliases {
-                let kind_alias_key = format!("{}:{}", def.kind.name(), alias);
+                let normalised_alias = to_snake_case(alias);
+                let kind_alias_key = format!("{}:{}", def.kind.name(), normalised_alias);
                 lookup.insert(kind_alias_key, idx);
-                lookup.entry(alias.to_string()).or_insert(idx);
+                lookup.entry(normalised_alias).or_insert(idx);
             }
         }
         Self { lookup, defs }
@@ -467,16 +475,85 @@ impl EntityTypeRegistry {
         Self::new(defs)
     }
 
+    /// Boot-time collision check across the composed registry `with_extra`
+    /// builds: built-in defs plus every caller-supplied `(owner, def)` extra.
+    ///
+    /// `new`/`register` populate a single kind-qualified lookup keyspace
+    /// (`"{kind}:{canonical_name}"` and `"{kind}:{alias}"`) with a hard
+    /// `insert` — the later write silently wins. Two independently loaded
+    /// owners can therefore disagree on what a given key resolves to, and
+    /// the winner depends on registration order. ADR-001's registry-ownership
+    /// contract instead requires this to fail at boot: "same `(base_kind,
+    /// canonical_name)` from two different packs = boot error" and "an alias
+    /// collision = boot error." This walks the same keyspace `new`/`register`
+    /// populate and returns the first collision found, naming both
+    /// contributing owners, instead of silently picking a winner.
+    ///
+    /// `extras` is `(owner_label, def)` for pack-declared entries only — the
+    /// built-in table is checked automatically, attributed to the label
+    /// `"builtin"`.
+    ///
+    /// Every canonical and alias key is routed through the same
+    /// `to_snake_case` normalisation `new`/`register` apply before
+    /// insertion (ADR-001:104-107): two spellings that only differ in case
+    /// or separator style (e.g. `"Architecture Decision Record"` vs.
+    /// `"architecture-decision-record"`) collide here exactly as they would
+    /// collide in the composed registry's lookup keyspace.
+    pub fn check_extra_collisions<'a>(
+        extras: impl IntoIterator<Item = (&'a str, &'a EntityTypeDef)>,
+    ) -> Result<(), String> {
+        let mut all: Vec<(&'a str, &'a EntityTypeDef)> =
+            BUILTIN_DEFS.iter().map(|def| ("builtin", def)).collect();
+        all.extend(extras);
+
+        let mut seen: BTreeMap<String, (&'a str, String)> = BTreeMap::new();
+        for (owner, def) in all {
+            let canonical_type = to_snake_case(def.type_name);
+            let canonical_key = format!("{}:{}", def.kind.name(), canonical_type);
+            if let Some((first_owner, _)) = seen.get(&canonical_key) {
+                if *first_owner != owner {
+                    return Err(format!(
+                        "duplicate entity_type {canonical_key:?}: claimed by both \
+                         {first_owner:?} and {owner:?}"
+                    ));
+                }
+            } else {
+                seen.insert(canonical_key, (owner, canonical_type.clone()));
+            }
+
+            for alias in def.aliases {
+                let normalised_alias = to_snake_case(alias);
+                let alias_key = format!("{}:{}", def.kind.name(), normalised_alias);
+                if let Some((first_owner, first_type)) = seen.get(&alias_key) {
+                    if *first_owner != owner || *first_type != canonical_type {
+                        return Err(format!(
+                            "entity_type alias {alias_key:?}: claimed by both {first_owner:?} \
+                             (canonical {first_type:?}) and {owner:?} (canonical {canonical_type:?})",
+                        ));
+                    }
+                } else {
+                    seen.insert(alias_key, (owner, canonical_type.clone()));
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Register additional subtypes into an existing registry clone.
+    ///
+    /// Mirrors [`Self::new`]'s normalisation: every key is routed through
+    /// `to_snake_case` before insertion.
     pub fn register(&mut self, def: EntityTypeDef) {
         let idx = self.defs.len();
-        let canonical_key = format!("{}:{}", def.kind.name(), def.type_name);
+        let canonical_type = to_snake_case(def.type_name);
+        let canonical_key = format!("{}:{}", def.kind.name(), canonical_type);
         self.lookup.insert(canonical_key, idx);
-        self.lookup.entry(def.type_name.to_string()).or_insert(idx);
+        self.lookup.entry(canonical_type).or_insert(idx);
         for alias in def.aliases {
-            let kind_alias_key = format!("{}:{}", def.kind.name(), alias);
+            let normalised_alias = to_snake_case(alias);
+            let kind_alias_key = format!("{}:{}", def.kind.name(), normalised_alias);
             self.lookup.insert(kind_alias_key, idx);
-            self.lookup.entry(alias.to_string()).or_insert(idx);
+            self.lookup.entry(normalised_alias).or_insert(idx);
         }
         self.defs.push(def);
     }
@@ -920,5 +997,75 @@ mod tests {
             Some("structure"),
             "class must still resolve to formal-math structure, not datatype"
         );
+    }
+
+    // ── check_extra_collisions: ADR-001 normalisation (PR #925) ──
+    //
+    // `check_extra_collisions` must reject collisions that only become
+    // visible after ADR-001:104-107's write-time `to_snake_case`
+    // normalisation — i.e. two raw spellings that differ in case or
+    // separator style but land on the same kind-qualified key once
+    // normalised. Before the r2 fix these three cases silently passed
+    // (`Ok(())`) because the check compared raw, unnormalised strings.
+
+    #[test]
+    fn check_extra_collisions_detects_normalized_alias_vs_alias() {
+        let def_a = EntityTypeDef {
+            kind: EntityKind::Service,
+            type_name: "widget_service",
+            aliases: &["Widget-Alias"],
+        };
+        let def_b = EntityTypeDef {
+            kind: EntityKind::Service,
+            type_name: "gadget_service",
+            aliases: &["widget_alias"],
+        };
+        let err =
+            EntityTypeRegistry::check_extra_collisions([("pack_a", &def_a), ("pack_b", &def_b)])
+                .expect_err(
+                    "aliases that only differ in case/hyphenation but normalise to the same \
+             kind-qualified key must collide",
+                );
+        assert!(err.contains("pack_a"), "error must name pack_a: {err}");
+        assert!(err.contains("pack_b"), "error must name pack_b: {err}");
+    }
+
+    #[test]
+    fn check_extra_collisions_detects_normalized_alias_vs_canonical() {
+        let def_a = EntityTypeDef {
+            kind: EntityKind::Service,
+            type_name: "primary_service",
+            aliases: &[],
+        };
+        let def_b = EntityTypeDef {
+            kind: EntityKind::Service,
+            type_name: "secondary_service",
+            aliases: &["Primary-Service"],
+        };
+        let err =
+            EntityTypeRegistry::check_extra_collisions([("pack_a", &def_a), ("pack_b", &def_b)])
+                .expect_err(
+                    "an alias that normalises onto another owner's canonical key must collide, \
+             even when the raw spellings differ",
+                );
+        assert!(err.contains("pack_a"), "error must name pack_a: {err}");
+        assert!(err.contains("pack_b"), "error must name pack_b: {err}");
+    }
+
+    #[test]
+    fn check_extra_collisions_detects_normalized_builtin_vs_pack_collision() {
+        // BUILTIN_DEFS declares Document "paper". A pack declaring a
+        // differently-cased spelling that normalises onto the same
+        // kind-qualified key must still collide with the built-in owner.
+        let def = EntityTypeDef {
+            kind: EntityKind::Document,
+            type_name: "Paper",
+            aliases: &[],
+        };
+        let err = EntityTypeRegistry::check_extra_collisions([("pack_a", &def)]).expect_err(
+            "a pack canonical name that normalises onto a builtin canonical key must collide",
+        );
+        assert!(err.contains("builtin"), "error must name builtin: {err}");
+        assert!(err.contains("pack_a"), "error must name pack_a: {err}");
     }
 }

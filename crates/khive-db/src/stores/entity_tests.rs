@@ -41,6 +41,7 @@ fn make_entity(namespace: &str, kind: &str, name: &str) -> Entity {
         deleted_at: None,
         merged_into: None,
         merge_event_id: None,
+        content_ref: None,
     }
 }
 
@@ -429,7 +430,7 @@ async fn test_query_by_name_prefix_escapes_percent_wildcard() {
     );
 }
 
-// Regression for a round-1 gap on #818/#834: the two tests above prove
+// Regression for a gap on #818/#834: the two tests above prove
 // escaping keeps decoys out of the WHERE clause entirely, so they pass even
 // without the exact-match-first ORDER BY CASE. This test isolates that
 // ordering: every decoy genuinely matches the LIKE pattern "Base%" (no
@@ -746,6 +747,7 @@ async fn test_same_id_upsert_replaces_row() {
         deleted_at: None,
         merged_into: None,
         merge_event_id: None,
+        content_ref: None,
     };
     store.upsert_entity(entity_a).await.unwrap();
 
@@ -769,6 +771,7 @@ async fn test_same_id_upsert_replaces_row() {
         deleted_at: None,
         merged_into: None,
         merge_event_id: None,
+        content_ref: None,
     };
     store.upsert_entity(entity_b).await.unwrap();
 
@@ -832,7 +835,7 @@ async fn page_offset_over_i64max_rejected() {
 /// the `KHIVE_WRITE_QUEUE` env var — that env var is process-global and this
 /// crate's other tests are NOT `#[serial]` against it, so a window where it
 /// is set here could leak into a concurrently-scheduled test's own pool
-/// construction (ADR-067 Fork C slice 2 round 2, LOW finding).
+/// construction (ADR-067 Component A).
 #[tokio::test]
 async fn upsert_entities_routes_through_writer_task_when_flag_enabled() {
     let dir = tempfile::tempdir().unwrap();
@@ -1208,4 +1211,66 @@ async fn upsert_entity_routes_through_writer_task_when_flag_enabled() {
         "entity must be committed and readable after queuing behind the occupier"
     );
     assert_eq!(fetched.unwrap().name, "RoPE");
+}
+
+// ── content_ref (khive#292) ─────────────────────────────────────────────────
+
+#[tokio::test]
+async fn test_content_ref_roundtrip() {
+    let store = setup_memory_store();
+
+    let digest = "a".repeat(64);
+    let entity = Entity::new("default", "document", "SourcePdf").with_content_ref(digest.clone());
+    let id = entity.id;
+
+    store.upsert_entity(entity).await.unwrap();
+
+    let fetched = store.get_entity(id).await.unwrap().unwrap();
+    assert_eq!(fetched.content_ref, Some(digest));
+}
+
+#[tokio::test]
+async fn test_content_ref_defaults_to_none() {
+    let store = setup_memory_store();
+
+    let entity = Entity::new("default", "concept", "NoBlob");
+    let id = entity.id;
+    store.upsert_entity(entity).await.unwrap();
+
+    let fetched = store.get_entity(id).await.unwrap().unwrap();
+    assert_eq!(fetched.content_ref, None);
+}
+
+#[tokio::test]
+async fn test_content_ref_survives_query_entities() {
+    let store = setup_memory_store_ns("blob_ns");
+    let digest = "b".repeat(64);
+    let entity = Entity::new("blob_ns", "document", "QueriedPdf").with_content_ref(digest.clone());
+    store.upsert_entity(entity).await.unwrap();
+
+    let page = store
+        .query_entities("blob_ns", EntityFilter::default(), PageRequest::default())
+        .await
+        .unwrap();
+    assert_eq!(page.items.len(), 1);
+    assert_eq!(page.items[0].content_ref, Some(digest));
+}
+
+#[tokio::test]
+async fn test_content_ref_survives_batch_upsert() {
+    let store = setup_memory_store();
+    let digest = "c".repeat(64);
+    let entities = vec![
+        Entity::new("default", "document", "Batch1").with_content_ref(digest.clone()),
+        Entity::new("default", "document", "Batch2"),
+    ];
+    let ids: Vec<Uuid> = entities.iter().map(|e| e.id).collect();
+
+    let summary = store.upsert_entities(entities).await.unwrap();
+    assert_eq!(summary.affected, 2);
+
+    let with_ref = store.get_entity(ids[0]).await.unwrap().unwrap();
+    assert_eq!(with_ref.content_ref, Some(digest));
+    let without_ref = store.get_entity(ids[1]).await.unwrap().unwrap();
+    assert_eq!(without_ref.content_ref, None);
 }

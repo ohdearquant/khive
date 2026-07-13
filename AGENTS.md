@@ -152,12 +152,12 @@ or `comm.thread`.
 
 ### Schedule pack — 4 verbs (`schedule.` prefix)
 
-| Verb                | What it does                     | When to use                                    |
-| ------------------- | -------------------------------- | ---------------------------------------------- |
-| `schedule.remind`   | Create a time-triggered reminder | "Remind me to X at Y"                          |
-| `schedule.schedule` | Schedule a future verb dispatch  | Deferred actions (action is a DSL verb string) |
-| `schedule.agenda`   | List upcoming scheduled events   | "What's on the calendar?"                      |
-| `schedule.cancel`   | Cancel a scheduled event         | Remove a pending reminder/action               |
+| Verb                | What it does                                  | When to use                                                   |
+| ------------------- | --------------------------------------------- | ------------------------------------------------------------- |
+| `schedule.remind`   | Deliver a reminder to your inbox at fire time | "Remind me to X at Y"                                         |
+| `schedule.schedule` | Schedule a future verb dispatch               | Deferred or cross-actor actions (action is a DSL verb string) |
+| `schedule.agenda`   | List upcoming scheduled events                | "What's on the calendar?"                                     |
+| `schedule.cancel`   | Cancel a scheduled event                      | Remove a pending reminder/action                              |
 
 ### Knowledge pack — 19 verbs (`knowledge.` prefix)
 

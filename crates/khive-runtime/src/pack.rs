@@ -22,8 +22,8 @@ use khive_types::{EventKind, EventOutcome, Namespace};
 use serde_json::Value;
 
 pub use khive_types::{
-    EdgeEndpointRule, EndpointKind, HandlerDef, NoteKindSpec, NoteLifecycleSpec, PackSchemaPlan,
-    ParamDef, VerbCategory, VerbPresentationPolicy, Visibility,
+    EdgeEndpointRule, EndpointKind, EntityTypeDef, HandlerDef, NoteKindSpec, NoteLifecycleSpec,
+    PackSchemaPlan, ParamDef, VerbCategory, VerbPresentationPolicy, Visibility,
 };
 // Backward-compat re-export.
 #[allow(deprecated)]
@@ -115,6 +115,13 @@ pub trait PackRuntime: Send + Sync {
         &[]
     }
 
+    /// Pack-extensible entity-type subtypes — must equal `<Self as Pack>::ENTITY_TYPES`.
+    /// Defaults to empty so existing packs that don't extend the entity_type
+    /// registry can ignore it.
+    fn entity_types(&self) -> &'static [EntityTypeDef] {
+        &[]
+    }
+
     /// Pack names whose vocabulary this pack references.
     /// Defaults to empty so existing packs compile without changes.
     fn requires(&self) -> &'static [&'static str] {
@@ -201,7 +208,41 @@ pub trait PackRuntime: Send + Sync {
     /// override this to install their registry's `resolve` function.  The
     /// default no-op leaves the runtime validator absent (skip-when-None), which
     /// is the correct behaviour for bare runtimes without packs.
+    ///
+    /// This single-argument hook is intentionally left unchanged (not
+    /// widened) so an out-of-tree pack that already overrides it keeps
+    /// compiling even if it declares no entity types. A pack that needs the
+    /// boot-time composed pack vocabulary should override
+    /// [`register_entity_type_validator_with_types`](Self::register_entity_type_validator_with_types)
+    /// instead — `call_register_entity_type_validators` calls that hook, not
+    /// this one.
     fn register_entity_type_validator(&self, _runtime: &KhiveRuntime) {}
+
+    /// Install a pack-owned entity-type validator that also receives the
+    /// boot-time composed set of every loaded pack's `ENTITY_TYPES`
+    /// ([`VerbRegistry::all_entity_types`]) — the same aggregate every pack
+    /// in the loaded set receives, mirroring how `EDGE_RULES` are aggregated
+    /// once and consulted by every pack.
+    ///
+    /// Defaults to calling
+    /// [`register_entity_type_validator`](Self::register_entity_type_validator)
+    /// with just the runtime, so a pack that overrides only the older,
+    /// simpler hook — or overrides neither — keeps compiling and behaving
+    /// exactly as before. `call_register_entity_type_validators` calls this
+    /// hook, not the older one, so a pack that wants the composed vocabulary
+    /// must override this one.
+    ///
+    /// Packs that own `EntityTypeRegistry` vocabularies (e.g. `KgPack`)
+    /// should override this hook to compose
+    /// `EntityTypeRegistry::with_extra(pack_entity_types)` and install its
+    /// `resolve` function.
+    fn register_entity_type_validator_with_types(
+        &self,
+        runtime: &KhiveRuntime,
+        _pack_entity_types: &[EntityTypeDef],
+    ) {
+        self.register_entity_type_validator(runtime);
+    }
 
     /// Install a pack-owned note-mutation hook on the runtime.
     ///
@@ -230,6 +271,20 @@ pub trait PackRuntime: Send + Sync {
     /// state. Packs that override this must make it idempotent and infallible:
     /// any errors are logged internally, not propagated to the caller.
     async fn warm(&self) {}
+
+    /// Names of all embedding models registered on this pack's underlying
+    /// runtime handle.
+    ///
+    /// Used by ADR-103 Amendment 1's `model_count` computation at the
+    /// dispatch audit-row emission seam (`VerbRegistry::dispatch_with_identity`)
+    /// for the two embedding-bearing verb families whose model fan-out is
+    /// not a per-dispatch constant: singleton `create` and `memory.remember`
+    /// without an explicit `embedding_model` override. Defaults to empty —
+    /// only the packs that own those verbs (kg, memory) need to override
+    /// this by forwarding to their internal `KhiveRuntime`.
+    fn registered_embedding_model_names(&self) -> Vec<String> {
+        Vec::new()
+    }
 
     /// Dispatch a verb call. Returns serialized JSON response.
     ///
@@ -573,6 +628,7 @@ impl VerbRegistryBuilder {
 
         validate_unique_note_kinds(&ordered_packs)?;
         validate_unique_verb_names(&ordered_packs)?;
+        validate_unique_entity_types(&ordered_packs)?;
 
         let available_verbs: Vec<&'static str> = ordered_packs
             .iter()
@@ -639,6 +695,23 @@ fn validate_unique_verb_names(packs: &[Box<dyn PackRuntime>]) -> Result<(), Runt
         }
     }
     Ok(())
+}
+
+/// Validate that no two owners (the built-in table or a loaded pack) declare
+/// a colliding `entity_type` canonical name or alias.
+///
+/// Boot-time duplicate detection prevents pack configuration errors from
+/// silently applying insertion-order semantics to entity-type resolution
+/// (ADR-001's registry-ownership collision rule: same `(base_kind,
+/// canonical_name)` from two different packs, or an alias collision, is a
+/// boot error). Returns an error naming the colliding key and both
+/// contributing owners.
+fn validate_unique_entity_types(packs: &[Box<dyn PackRuntime>]) -> Result<(), RuntimeError> {
+    let owned_defs = packs
+        .iter()
+        .flat_map(|p| p.entity_types().iter().map(move |def| (p.name(), def)));
+    khive_types::EntityTypeRegistry::check_extra_collisions(owned_defs)
+        .map_err(RuntimeError::InvalidInput)
 }
 
 fn find_pack_dependency_cycle(
@@ -1091,8 +1164,17 @@ impl VerbRegistry {
                 // Persist to EventStore immediately only for denied calls.
                 if !defer_audit {
                     if let Some(store) = &self.event_store {
-                        let storage_event =
-                            build_audit_storage_event(&gate_req, &audit, EventOutcome::Denied);
+                        // ADR-103 Decision (a): the closed `work_class` enum
+                        // is stamped on every event, denial included -- only
+                        // `resource.cost_unit` is scoped to a successful
+                        // dispatch by Amendment 1. `base_resource_payload()`
+                        // carries `work_class` alone, no `cost_unit` key.
+                        let storage_event = build_audit_storage_event(
+                            &gate_req,
+                            &audit,
+                            EventOutcome::Denied,
+                            Some(crate::cost_unit::base_resource_payload()),
+                        );
                         append_audit_event_best_effort(store, storage_event, verb).await;
                     }
                 }
@@ -1220,8 +1302,24 @@ impl VerbRegistry {
                             verb == "link" && gate_req.args.get("links").is_none();
                         match &result {
                             Ok(ok_val) if is_link_singleton => {
+                                // ADR-103 Amendment 1: `link` (singleton or
+                                // bulk) has no embedding-bearing path — edges
+                                // carry no embedded body — so cost_unit is
+                                // always base_weight("link") alone. The
+                                // registered-model closure is never invoked
+                                // (per_item_weight("link", ..) short-circuits
+                                // to 0 before `model_count` reads it).
+                                let resource = crate::cost_unit::resource_payload(
+                                    verb,
+                                    &gate_req.args,
+                                    ok_val,
+                                    || pack.registered_embedding_model_names().len() as i64,
+                                );
                                 match link_audit_success_from_result(audit.clone(), ok_val) {
-                                    Some((edge_id, payload)) => {
+                                    Some((edge_id, mut payload)) => {
+                                        if let Value::Object(ref mut map) = payload {
+                                            map.insert("resource".to_string(), resource);
+                                        }
                                         let storage_event = Event::new(
                                             gate_req.namespace.as_str(),
                                             gate_req.verb.as_str(),
@@ -1250,6 +1348,7 @@ impl VerbRegistry {
                                             &gate_req,
                                             &audit,
                                             EventOutcome::Success,
+                                            Some(resource),
                                         )
                                         .with_duration_us(dispatch_us);
                                         append_audit_event_best_effort(store, storage_event, verb)
@@ -1263,13 +1362,37 @@ impl VerbRegistry {
                                 // Success — otherwise a failed dispatch is
                                 // recorded as successful work and disappears
                                 // from `outcome=error` queries.
-                                let outcome = if result.is_ok() {
-                                    EventOutcome::Success
-                                } else {
-                                    EventOutcome::Error
+                                //
+                                // ADR-103 Amendment 1: `resource.cost_unit` is
+                                // computed ONLY on a successful dispatch —
+                                // there is no handler `Value` to read
+                                // `item_count` from on an error, and the
+                                // amendment's "absence has exactly two
+                                // meanings" rule requires the field be
+                                // omitted, never defaulted to 0, on an
+                                // errored dispatch. `work_class` itself is
+                                // NOT one of those two omission cases
+                                // (ADR-103 Decision (a) stamps it on every
+                                // event), so an errored dispatch still gets
+                                // `resource: {"work_class": "interactive"}`,
+                                // just with no `cost_unit` key.
+                                let (outcome, resource) = match &result {
+                                    Ok(ok_val) => (
+                                        EventOutcome::Success,
+                                        Some(crate::cost_unit::resource_payload(
+                                            verb,
+                                            &gate_req.args,
+                                            ok_val,
+                                            || pack.registered_embedding_model_names().len() as i64,
+                                        )),
+                                    ),
+                                    Err(_) => (
+                                        EventOutcome::Error,
+                                        Some(crate::cost_unit::base_resource_payload()),
+                                    ),
                                 };
                                 let storage_event =
-                                    build_audit_storage_event(&gate_req, &audit, outcome)
+                                    build_audit_storage_event(&gate_req, &audit, outcome, resource)
                                         .with_duration_us(dispatch_us);
                                 append_audit_event_best_effort(store, storage_event, verb).await;
                             }
@@ -1357,9 +1480,15 @@ impl VerbRegistry {
             if let Some(store) = &self.event_store {
                 // Dispatch is about to return `InvalidInput` below (no pack
                 // owns this verb), so the persisted outcome must be `Error`,
-                // not `Success`.
-                let storage_event =
-                    build_audit_storage_event(&gate_req, &audit, EventOutcome::Error);
+                // not `Success`. `work_class` is still stamped (ADR-103
+                // Decision (a)); `resource.cost_unit` is omitted, matching
+                // every other errored-dispatch row.
+                let storage_event = build_audit_storage_event(
+                    &gate_req,
+                    &audit,
+                    EventOutcome::Error,
+                    Some(crate::cost_unit::base_resource_payload()),
+                );
                 append_audit_event_best_effort(store, storage_event, verb).await;
             }
         }
@@ -1527,6 +1656,19 @@ impl VerbRegistry {
             .collect()
     }
 
+    /// All pack-declared entity-type subtypes across registered packs.
+    ///
+    /// Order follows topological pack registration; duplicates are *not*
+    /// deduplicated here — same posture as [`all_edge_rules`](Self::all_edge_rules).
+    /// Consumers compose this with `EntityTypeRegistry::builtin()` via
+    /// `EntityTypeRegistry::with_extra` to get the boot-time composed registry.
+    pub fn all_entity_types(&self) -> Vec<EntityTypeDef> {
+        self.packs
+            .iter()
+            .flat_map(|p| p.entity_types().iter().cloned())
+            .collect()
+    }
+
     /// Collect all `NoteKindSpec` declarations from every loaded pack.
     ///
     /// Used by the runtime for lifecycle introspection and future enforcement.
@@ -1583,9 +1725,14 @@ impl VerbRegistry {
     ///
     /// Packs whose `register_entity_type_validator` is the default no-op pay
     /// no overhead.
+    ///
+    /// Composes [`all_entity_types`](Self::all_entity_types) once and passes
+    /// the same aggregate to every pack, mirroring how `install_edge_rules`
+    /// installs one `all_edge_rules()` aggregate for the whole registry.
     pub fn call_register_entity_type_validators(&self, runtime: &KhiveRuntime) {
+        let entity_types = self.all_entity_types();
         for pack in self.packs.iter() {
-            pack.register_entity_type_validator(runtime);
+            pack.register_entity_type_validator_with_types(runtime, &entity_types);
         }
     }
 
@@ -2000,15 +2147,31 @@ fn target_id_from_args(args: &serde_json::Value) -> Option<uuid::Uuid> {
 /// Shared by the immediate-append path (all verbs, denied calls, bulk
 /// `links`) and the deferred singleton-`link` fallback so both audit
 /// shapes are produced by one code path.
+///
+/// `resource` is the ADR-103 `resource` payload object. ADR-103 Decision (a)
+/// stamps the closed `work_class` enum on every event, so every call site
+/// passes `Some`: `crate::cost_unit::resource_payload` (`{"work_class": ...,
+/// "cost_unit": ...}`) for a successfully-resolved dispatch, or
+/// `crate::cost_unit::base_resource_payload` (`{"work_class": ...}`, no
+/// `cost_unit` key) for denied calls, errored dispatches, and the
+/// no-pack-owns-this-verb case. `None` is reserved for a caller with no
+/// `work_class` to stamp at all (none exist today); it must never be used to
+/// omit `cost_unit` alone.
 fn build_audit_storage_event(
     gate_req: &GateRequest,
     audit: &AuditEvent,
     outcome: EventOutcome,
+    resource: Option<Value>,
 ) -> Event {
-    let audit_data = serde_json::to_value(audit).unwrap_or_else(|e| {
+    let mut audit_data = serde_json::to_value(audit).unwrap_or_else(|e| {
         tracing::warn!(error = %e, "failed to serialize AuditEvent for EventStore");
         serde_json::Value::Null
     });
+    if let Some(resource) = resource {
+        if let Value::Object(ref mut map) = audit_data {
+            map.insert("resource".to_string(), resource);
+        }
+    }
     let mut storage_event = Event::new(
         gate_req.namespace.as_str(),
         gate_req.verb.as_str(),
@@ -2554,6 +2717,157 @@ mod tests {
         let reg = build_registry();
         let kinds = reg.all_entity_kinds();
         assert_eq!(kinds, vec!["widget", "gadget"]);
+    }
+
+    // ---- ENTITY_TYPES composition (pack-declared entity-type subtypes) ----
+
+    struct GammaPack;
+
+    impl Pack for GammaPack {
+        const NAME: &'static str = "gamma";
+        const NOTE_KINDS: &'static [&'static str] = &[];
+        const ENTITY_KINDS: &'static [&'static str] = &[];
+        const HANDLERS: &'static [HandlerDef] = &[];
+        const ENTITY_TYPES: &'static [EntityTypeDef] = &[EntityTypeDef {
+            kind: khive_types::EntityKind::Document,
+            type_name: "gamma_report",
+            aliases: &["gamma_rep"],
+        }];
+    }
+
+    #[async_trait]
+    impl PackRuntime for GammaPack {
+        fn name(&self) -> &str {
+            Self::NAME
+        }
+        fn note_kinds(&self) -> &'static [&'static str] {
+            Self::NOTE_KINDS
+        }
+        fn entity_kinds(&self) -> &'static [&'static str] {
+            Self::ENTITY_KINDS
+        }
+        fn handlers(&self) -> &'static [HandlerDef] {
+            Self::HANDLERS
+        }
+        fn entity_types(&self) -> &'static [EntityTypeDef] {
+            Self::ENTITY_TYPES
+        }
+        async fn dispatch(
+            &self,
+            verb: &str,
+            _params: Value,
+            _registry: &VerbRegistry,
+            _token: &NamespaceToken,
+        ) -> Result<Value, RuntimeError> {
+            Ok(serde_json::json!({ "pack": "gamma", "verb": verb }))
+        }
+    }
+
+    /// Builtin-only behavior is unchanged when no pack declares extras:
+    /// `all_entity_types()` is empty, and composing it with the builtin
+    /// registry resolves exactly like `EntityTypeRegistry::builtin()`.
+    #[test]
+    fn all_entity_types_empty_when_no_pack_declares_extras() {
+        let reg = build_registry(); // AlphaPack + BetaPack — neither declares ENTITY_TYPES.
+        assert!(reg.all_entity_types().is_empty());
+        let composed = khive_types::EntityTypeRegistry::with_extra(reg.all_entity_types());
+        let resolved = composed
+            .resolve(khive_types::EntityKind::Document, Some("paper"))
+            .expect("builtin paper subtype must still resolve");
+        assert_eq!(resolved.entity_type.as_deref(), Some("paper"));
+    }
+
+    /// A pack-declared entity type validates through the composed registry,
+    /// and builtin subtypes remain resolvable alongside it.
+    #[test]
+    fn pack_declared_entity_type_validates_through_composed_registry() {
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(AlphaPack);
+        builder.register(GammaPack);
+        let reg = builder.build().expect("registry builds");
+
+        let extras = reg.all_entity_types();
+        assert_eq!(extras.len(), 1);
+
+        let composed = khive_types::EntityTypeRegistry::with_extra(extras);
+        let resolved = composed
+            .resolve(khive_types::EntityKind::Document, Some("gamma_rep"))
+            .expect("pack-declared alias must resolve through the composed registry");
+        assert_eq!(resolved.entity_type.as_deref(), Some("gamma_report"));
+
+        let builtin_resolved = composed
+            .resolve(khive_types::EntityKind::Document, Some("paper"))
+            .expect("builtin subtype must remain resolvable when a pack adds extras");
+        assert_eq!(builtin_resolved.entity_type.as_deref(), Some("paper"));
+
+        composed
+            .resolve(khive_types::EntityKind::Document, Some("nonexistent_type"))
+            .expect_err("undeclared entity_type must still be rejected");
+    }
+
+    /// Two packs declaring the exact same `(kind, type_name)` subtype are
+    /// rejected at `build()` — ADR-001's registry-ownership collision rule
+    /// ("same `(base_kind, canonical_name)` from two different packs = boot
+    /// error") — instead of silently resolving via registration order the
+    /// way `EntityTypeRegistry::with_extra`'s hard-`insert` semantics would.
+    #[test]
+    fn overlapping_pack_declared_entity_types_reject_at_boot() {
+        struct DeltaPack;
+        impl Pack for DeltaPack {
+            const NAME: &'static str = "delta";
+            const NOTE_KINDS: &'static [&'static str] = &[];
+            const ENTITY_KINDS: &'static [&'static str] = &[];
+            const HANDLERS: &'static [HandlerDef] = &[];
+            const ENTITY_TYPES: &'static [EntityTypeDef] = &[EntityTypeDef {
+                kind: khive_types::EntityKind::Document,
+                type_name: "gamma_report",
+                aliases: &["gamma_rep"],
+            }];
+        }
+        #[async_trait]
+        impl PackRuntime for DeltaPack {
+            fn name(&self) -> &str {
+                Self::NAME
+            }
+            fn note_kinds(&self) -> &'static [&'static str] {
+                Self::NOTE_KINDS
+            }
+            fn entity_kinds(&self) -> &'static [&'static str] {
+                Self::ENTITY_KINDS
+            }
+            fn handlers(&self) -> &'static [HandlerDef] {
+                Self::HANDLERS
+            }
+            fn entity_types(&self) -> &'static [EntityTypeDef] {
+                Self::ENTITY_TYPES
+            }
+            async fn dispatch(
+                &self,
+                verb: &str,
+                _params: Value,
+                _registry: &VerbRegistry,
+                _token: &NamespaceToken,
+            ) -> Result<Value, RuntimeError> {
+                Ok(serde_json::json!({ "pack": "delta", "verb": verb }))
+            }
+        }
+
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(GammaPack);
+        builder.register(DeltaPack);
+        let err = builder.build().err().expect(
+            "overlapping ENTITY_TYPES declarations must fail at build, not silently compose",
+        );
+
+        let msg = err.to_string();
+        assert!(
+            msg.contains("gamma") && msg.contains("delta"),
+            "collision error must name both contributing packs: {msg}"
+        );
+        assert!(
+            msg.contains("gamma_report"),
+            "collision error must name the colliding entity_type key: {msg}"
+        );
     }
 
     // ---- Gate wiring ----
@@ -4105,6 +4419,373 @@ mod tests {
             payload_json["obligations"],
             serde_json::Value::Array(Vec::new()),
             "obligations must be [] on AllowAllGate"
+        );
+    }
+
+    // ---- ADR-103 Amendment 1: resource.cost_unit emission ----
+
+    /// Test pack whose `create` handler is a stub (mirrors `AlphaPack`) but
+    /// overrides `registered_embedding_model_names` to a configurable set,
+    /// exercising ADR-103 Amendment 1's `model_count` computation for
+    /// singleton `create` at the dispatch audit-row emission seam.
+    struct EmbeddingAwarePack {
+        models: Vec<String>,
+    }
+
+    impl khive_types::Pack for EmbeddingAwarePack {
+        const NAME: &'static str = "embedding_aware";
+        const NOTE_KINDS: &'static [&'static str] = &[];
+        const ENTITY_KINDS: &'static [&'static str] = &["widget"];
+        const HANDLERS: &'static [HandlerDef] = &[HandlerDef {
+            name: "create",
+            description: "create a widget (embedding-aware stub)",
+            visibility: Visibility::Verb,
+            category: VerbCategory::Commissive,
+            params: &[],
+        }];
+    }
+
+    #[async_trait]
+    impl PackRuntime for EmbeddingAwarePack {
+        fn name(&self) -> &str {
+            Self::NAME
+        }
+        fn note_kinds(&self) -> &'static [&'static str] {
+            Self::NOTE_KINDS
+        }
+        fn entity_kinds(&self) -> &'static [&'static str] {
+            Self::ENTITY_KINDS
+        }
+        fn handlers(&self) -> &'static [HandlerDef] {
+            Self::HANDLERS
+        }
+        fn registered_embedding_model_names(&self) -> Vec<String> {
+            self.models.clone()
+        }
+        async fn dispatch(
+            &self,
+            verb: &str,
+            _params: Value,
+            _registry: &VerbRegistry,
+            _token: &NamespaceToken,
+        ) -> Result<Value, RuntimeError> {
+            Ok(serde_json::json!({ "pack": "embedding_aware", "verb": verb }))
+        }
+    }
+
+    /// Test pack whose one verb, `probe`, always fails — used to drive the
+    /// general (non-link) deferred-audit Err arm without a real backend.
+    struct FailingProbePack;
+
+    impl khive_types::Pack for FailingProbePack {
+        const NAME: &'static str = "failing_probe";
+        const NOTE_KINDS: &'static [&'static str] = &[];
+        const ENTITY_KINDS: &'static [&'static str] = &[];
+        const HANDLERS: &'static [HandlerDef] = &[HandlerDef {
+            name: "probe",
+            description: "always fails",
+            visibility: Visibility::Verb,
+            category: VerbCategory::Assertive,
+            params: &[],
+        }];
+    }
+
+    #[async_trait]
+    impl PackRuntime for FailingProbePack {
+        fn name(&self) -> &str {
+            Self::NAME
+        }
+        fn note_kinds(&self) -> &'static [&'static str] {
+            Self::NOTE_KINDS
+        }
+        fn entity_kinds(&self) -> &'static [&'static str] {
+            Self::ENTITY_KINDS
+        }
+        fn handlers(&self) -> &'static [HandlerDef] {
+            Self::HANDLERS
+        }
+        async fn dispatch(
+            &self,
+            _verb: &str,
+            _params: Value,
+            _registry: &VerbRegistry,
+            _token: &NamespaceToken,
+        ) -> Result<Value, RuntimeError> {
+            Err(RuntimeError::InvalidInput("boom".into()))
+        }
+    }
+
+    #[tokio::test]
+    async fn resource_cost_unit_present_on_non_embedding_successful_dispatch() {
+        let store = Arc::new(MemoryEventStore::default());
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(AlphaPack);
+        builder.with_event_store(store.clone());
+        let reg = builder.build().expect("registry builds");
+
+        reg.dispatch("list", serde_json::json!({})).await.unwrap();
+
+        let page = store
+            .query_events(
+                EventFilter::default(),
+                PageRequest {
+                    limit: 10,
+                    offset: 0,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(page.items.len(), 1);
+        assert_eq!(
+            page.items[0].payload["resource"],
+            serde_json::json!({"work_class": "interactive", "cost_unit": 1}),
+            "non-embedding-bearing verb's resource.cost_unit must be base_weight(verb) alone"
+        );
+    }
+
+    #[tokio::test]
+    async fn resource_cost_unit_scales_with_registered_model_count_for_create() {
+        let store = Arc::new(MemoryEventStore::default());
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(EmbeddingAwarePack {
+            models: vec!["all-minilm-l6-v2".into(), "paraphrase".into()],
+        });
+        builder.with_event_store(store.clone());
+        let reg = builder.build().expect("registry builds");
+
+        reg.dispatch("create", serde_json::json!({"kind": "widget"}))
+            .await
+            .unwrap();
+
+        let page = store
+            .query_events(
+                EventFilter::default(),
+                PageRequest {
+                    limit: 10,
+                    offset: 0,
+                },
+            )
+            .await
+            .unwrap();
+        // base_weight(1) + per_item_weight(1) * item_count(1) * model_count(2)
+        assert_eq!(
+            page.items[0].payload["resource"],
+            serde_json::json!({"work_class": "interactive", "cost_unit": 3}),
+        );
+    }
+
+    #[tokio::test]
+    async fn resource_cost_unit_zero_registered_models_is_base_weight_only() {
+        let store = Arc::new(MemoryEventStore::default());
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(EmbeddingAwarePack { models: vec![] });
+        builder.with_event_store(store.clone());
+        let reg = builder.build().expect("registry builds");
+
+        reg.dispatch("create", serde_json::json!({"kind": "widget"}))
+            .await
+            .unwrap();
+
+        let page = store
+            .query_events(
+                EventFilter::default(),
+                PageRequest {
+                    limit: 10,
+                    offset: 0,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            page.items[0].payload["resource"]["cost_unit"], 1,
+            "zero registered embedding models must vanish the term, not error or omit"
+        );
+    }
+
+    #[tokio::test]
+    async fn resource_work_class_present_cost_unit_absent_when_dispatch_returns_error() {
+        let store = Arc::new(MemoryEventStore::default());
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(FailingProbePack);
+        builder.with_event_store(store.clone());
+        let reg = builder.build().expect("registry builds");
+
+        let err = reg
+            .dispatch("probe", serde_json::json!({}))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, RuntimeError::InvalidInput(_)));
+
+        let page = store
+            .query_events(
+                EventFilter::default(),
+                PageRequest {
+                    limit: 10,
+                    offset: 0,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(page.items.len(), 1);
+        assert_eq!(page.items[0].outcome, EventOutcome::Error);
+        // ADR-103 Decision (a): work_class is stamped on EVERY event, denial
+        // and error included -- only Amendment 1's cost_unit field is scoped
+        // to a successful dispatch. An errored dispatch keeps
+        // resource.work_class and omits only resource.cost_unit, never 0.
+        assert_eq!(
+            page.items[0].payload["resource"],
+            serde_json::json!({"work_class": "interactive"}),
+            "resource must carry work_class with cost_unit OMITTED (never 0) on an \
+             errored dispatch: {:?}",
+            page.items[0].payload
+        );
+    }
+
+    #[tokio::test]
+    async fn resource_work_class_present_cost_unit_absent_when_no_pack_owns_the_verb() {
+        let store = Arc::new(MemoryEventStore::default());
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(AlphaPack);
+        builder.with_event_store(store.clone());
+        let reg = builder.build().expect("registry builds");
+
+        let _ = reg
+            .dispatch("no_such_verb_resource_test", serde_json::json!({}))
+            .await;
+
+        let page = store
+            .query_events(
+                EventFilter::default(),
+                PageRequest {
+                    limit: 10,
+                    offset: 0,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(page.items.len(), 1);
+        assert_eq!(
+            page.items[0].payload["resource"],
+            serde_json::json!({"work_class": "interactive"})
+        );
+    }
+
+    #[tokio::test]
+    async fn resource_work_class_present_cost_unit_absent_on_denied_dispatch() {
+        #[derive(Debug)]
+        struct AlwaysDenyGate;
+        impl Gate for AlwaysDenyGate {
+            fn check(&self, _req: &GateRequest) -> Result<GateDecision, GateError> {
+                Ok(GateDecision::deny("test: always deny"))
+            }
+        }
+        let store = Arc::new(MemoryEventStore::default());
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(AlphaPack);
+        builder.with_gate(Arc::new(AlwaysDenyGate));
+        builder.with_event_store(store.clone());
+        let reg = builder.build().expect("registry builds");
+
+        let _ = reg.dispatch("list", serde_json::json!({})).await;
+
+        let page = store
+            .query_events(
+                EventFilter::default(),
+                PageRequest {
+                    limit: 10,
+                    offset: 0,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(page.items.len(), 1);
+        assert_eq!(page.items[0].outcome, EventOutcome::Denied);
+        assert_eq!(
+            page.items[0].payload["resource"],
+            serde_json::json!({"work_class": "interactive"})
+        );
+    }
+
+    #[tokio::test]
+    async fn resource_cost_unit_present_on_link_singleton_success() {
+        let store = Arc::new(MemoryEventStore::default());
+        let edge_id = uuid::Uuid::new_v4();
+        let source_id = uuid::Uuid::new_v4();
+        let target_id = uuid::Uuid::new_v4();
+        let edge_json = serde_json::json!({
+            "id": edge_id,
+            "namespace": "local",
+            "source_id": source_id,
+            "target_id": target_id,
+            "relation": "depends_on",
+            "weight": 1.0,
+        });
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(LinkResultPack::ok(edge_json));
+        builder.with_event_store(store.clone());
+        let reg = builder.build().expect("registry builds");
+
+        reg.dispatch(
+            "link",
+            serde_json::json!({
+                "source_id": source_id,
+                "target_id": target_id,
+                "relation": "depends_on",
+            }),
+        )
+        .await
+        .unwrap();
+
+        let page = store
+            .query_events(
+                EventFilter::default(),
+                PageRequest {
+                    limit: 10,
+                    offset: 0,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            page.items[0].payload["resource"],
+            serde_json::json!({"work_class": "interactive", "cost_unit": 1}),
+            "link has no embedding-bearing path -> base_weight(link) alone, even on the v2-enriched singleton path"
+        );
+    }
+
+    #[tokio::test]
+    async fn resource_work_class_present_cost_unit_absent_on_link_dispatch_failure() {
+        let store = Arc::new(MemoryEventStore::default());
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(LinkResultPack::err("target endpoint not found"));
+        builder.with_event_store(store.clone());
+        let reg = builder.build().expect("registry builds");
+
+        let _ = reg
+            .dispatch(
+                "link",
+                serde_json::json!({
+                    "source_id": "note:alpha",
+                    "target_id": "note:missing",
+                    "relation": "depends_on",
+                }),
+            )
+            .await;
+
+        let page = store
+            .query_events(
+                EventFilter::default(),
+                PageRequest {
+                    limit: 10,
+                    offset: 0,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(page.items.len(), 1);
+        assert_eq!(
+            page.items[0].payload["resource"],
+            serde_json::json!({"work_class": "interactive"})
         );
     }
 

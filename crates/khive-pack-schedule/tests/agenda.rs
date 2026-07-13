@@ -3,10 +3,13 @@
 use khive_pack_schedule::SchedulePack;
 use khive_runtime::{KhiveRuntime, VerbRegistry, VerbRegistryBuilder};
 
+mod support;
+
 fn build_registry() -> (VerbRegistry, KhiveRuntime) {
-    let runtime = KhiveRuntime::memory().expect("in-memory runtime");
+    let runtime = support::memory_runtime();
     let mut builder = VerbRegistryBuilder::new();
     builder.register(khive_pack_kg::KgPack::new(runtime.clone()));
+    builder.register(khive_pack_comm::CommPack::new(runtime.clone()));
     builder.register(SchedulePack::new(runtime.clone()));
     let registry = builder.build().expect("registry builds");
     (registry, runtime)
@@ -191,9 +194,10 @@ async fn h2_agenda_finds_valid_event_past_corrupt_legacy_rows() {
     use khive_storage::Note;
     use serde_json::json;
 
-    let runtime = KhiveRuntime::memory().expect("in-memory runtime");
+    let runtime = support::memory_runtime();
     let mut builder = VerbRegistryBuilder::new();
     builder.register(khive_pack_kg::KgPack::new(runtime.clone()));
+    builder.register(khive_pack_comm::CommPack::new(runtime.clone()));
     builder.register(SchedulePack::new(runtime.clone()));
     let registry = builder.build().expect("registry builds");
 

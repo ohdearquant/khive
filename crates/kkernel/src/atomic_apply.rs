@@ -24,8 +24,8 @@
 //!
 //! `propose` / `review` / `withdraw` are admissible per
 //! [`khive_types::pack::ATOMIC_ADMISSIBLE_VERBS`] (ADR-099 D3 intends them to
-//! gain a seam) but have no prepare implementation yet. B3 fix round (codex
-//! REJECT, Medium finding): they are now rejected by the SAME pre-runtime
+//! gain a seam) but have no prepare implementation yet. As of the B3 fix,
+//! they are now rejected by the SAME pre-runtime
 //! `check_atomic_admissible` static guard above, as
 //! [`khive_types::pack::AtomicRejectionReason::KnownUnimplemented`] — never
 //! reaching `KhiveRuntime::new` or `prepare_one` at all. `prepare_op`'s own
@@ -33,8 +33,8 @@
 //! comment) is unreachable through this CLI path and remains only as
 //! defense-in-depth for any other caller of `prepare_op`.
 //!
-//! `merge` joined this same deferred bucket in the B3 fix round (Leo
-//! refinement, codex REJECT Blocker 2): a full-parity atomic merge prepare
+//! `merge` joined this same deferred bucket in the B3 fix: a full-parity
+//! atomic merge prepare
 //! was drafted and unit-tested against `khive_runtime::atomic_prepare`
 //! directly, but its edge-conflict resolution cannot be expressed in
 //! ADR-099's static predicate/guard plan shape (see that crate's
@@ -129,7 +129,7 @@ pub(crate) async fn execute_atomic_ops_file(
         .authorize(namespace)
         .context("authorize namespace for --atomic")?;
 
-    // ADR-099 B3 fix round 5, finding 1: a `VerbRegistry` built from every
+    // ADR-099 B3: a `VerbRegistry` built from every
     // discovered pack, reusing the REAL runtime just constructed above (via
     // `.clone()` — `KhiveRuntime` derives `Clone`) rather than a second
     // throwaway one (the pattern `kkernel::pack_introspect::build_registry`
@@ -149,7 +149,7 @@ pub(crate) async fn execute_atomic_ops_file(
     let verb_registry = verb_registry_builder
         .build()
         .context("building VerbRegistry for --atomic kind resolution")?;
-    // #750 fix-round 2 (codex r2 High 2): every other entry point that
+    // #750: every other entry point that
     // builds a `VerbRegistry` from a freshly constructed `KhiveRuntime`
     // (`khive-mcp`'s `serve.rs`/`server.rs`) calls this so a pack-installed
     // note-mutation hook (e.g. khive-pack-memory's warm ANN invalidation)
@@ -160,13 +160,13 @@ pub(crate) async fn execute_atomic_ops_file(
     // it. This closes the in-process half of the gap; the note-mutation
     // hook's effect (a bumped `AnnState` generation) is itself process-
     // local, so it still cannot reach a separately-running daemon's warm
-    // cache — see the cross-process analysis in the fix-round-2 report.
+    // cache — see the cross-process analysis in #750.
     verb_registry.call_register_note_mutation_hooks(&runtime);
 
     // ── async prepare pass (reads only, no writes) ───────────────────────────
     let mut plans: Vec<AtomicOpPlan> = Vec::with_capacity(ops.len());
-    // ADR-099 B3 fix round 5, finding 4: the exact args each op's plan was
-    // built from (post id-resolution for update/delete/link — finding 3) —
+    // ADR-099 B3: the exact args each op's plan was
+    // built from (post id-resolution for update/delete/link) —
     // carried alongside the plan so the post-commit result-rendering pass
     // can re-derive natural keys (e.g. a link's canonical edge lookup)
     // without re-parsing the ops file.
@@ -182,7 +182,7 @@ pub(crate) async fn execute_atomic_ops_file(
 
     // ── synchronous commit pass (ADR-099 D1 phase 2, B2) ────────────────────
     // `plans` is cloned here: `run_atomic_unit` consumes it by value, but the
-    // post-commit result-rendering pass below (finding 4) still needs each
+    // post-commit result-rendering pass below still needs each
     // op's plan (target ids, canonical link endpoints, gtd post-commit
     // effects) to build its `result` payload.
     let outcome =
@@ -193,7 +193,7 @@ pub(crate) async fn execute_atomic_ops_file(
     let total = ops.len();
     let envelope = match outcome {
         AtomicRunOutcome::Committed { post_commit } => {
-            // GAP-5 (B3 fix round 4): `GtdAudit` effects are applied HERE,
+            // GAP-5 (ADR-099 B3): `GtdAudit` effects are applied HERE,
             // not inside `khive_runtime::atomic_prepare::apply_post_commit_effects`
             // (crate-direction: `khive-pack-gtd` depends on `khive-runtime`,
             // not the other way around — that function treats `GtdAudit` as
@@ -208,7 +208,7 @@ pub(crate) async fn execute_atomic_ops_file(
             khive_runtime::atomic_prepare::apply_post_commit_effects(&runtime, &token, post_commit)
                 .await
                 .context("post-commit reindex after atomic unit commit")?;
-            // ADR-099 B3 fix round 5, finding 4: render each committed op's
+            // ADR-099 B3: render each committed op's
             // canonical-shaped `result` payload (ADR-099 D4 requires
             // `results[i].result`; the pre-fix envelope carried only
             // `{ok, tool, op_index}`). Result rendering is itself a READ —
@@ -278,8 +278,8 @@ pub(crate) async fn execute_atomic_ops_file(
 
 /// Apply every [`PostCommitEffect::GtdAudit`] in `effects` by calling the
 /// SAME `ensure_audit_schema`/`write_audit_record` functions the canonical
-/// `handle_transition`/`handle_complete` handlers call (GAP-5, B3 fix round
-/// 4). Lives in `kkernel` rather than `khive-runtime::atomic_prepare`
+/// `handle_transition`/`handle_complete` handlers call (GAP-5, ADR-099 B3).
+/// Lives in `kkernel` rather than `khive-runtime::atomic_prepare`
 /// because those two functions are owned by `khive-pack-gtd`, which
 /// depends on `khive-runtime` — not the other way around; `kkernel` is the
 /// first crate in the dependency graph that can see both. Non-`GtdAudit`
@@ -384,10 +384,10 @@ fn validate_atomic_args(tool: &str, args: &Value) -> anyhow::Result<()> {
 
 /// Returns `(plan, resolved_args)` — `resolved_args` is `args` for
 /// `gtd.transition`/`gtd.complete` (their own prepare fns resolve `id`
-/// internally via the canonical gtd resolver, finding 3) and for any tool
+/// internally via the canonical gtd resolver) and for any tool
 /// with no id-bearing fields; for `update`/`delete`/`link` it is the
 /// id-rewritten form `resolve_kg_ids_in_args` produces, carried forward so
-/// the post-commit result-rendering pass (finding 4) can re-derive natural
+/// the post-commit result-rendering pass can re-derive natural
 /// keys (e.g. a link's canonical edge lookup) without re-resolving ids.
 async fn prepare_one(
     runtime: &KhiveRuntime,
@@ -455,8 +455,8 @@ async fn prepare_one(
 /// Rewrite an op's KG-substrate id fields (`id` for update/delete;
 /// `source_id`/`target_id` for link) to resolved full UUIDs before handing
 /// args to `khive_runtime::atomic_prepare`, which only accepts bare
-/// `Uuid::parse_str` (ADR-099 B3 fix round 5, finding 3 — codex r3 REJECT
-/// High). Canonical KG handlers resolve through `resolve_uuid_unfiltered`
+/// `Uuid::parse_str` (ADR-099 B3). Canonical KG handlers resolve through
+/// `resolve_uuid_unfiltered`
 /// (full UUID -> 8+ hex prefix -> entity-name fallback, common.rs:270; the
 /// `_including_deleted` variant for hard delete, mirroring
 /// `handle_delete`'s `hard` branch at update.rs:268-271) — both are now
@@ -517,11 +517,10 @@ async fn resolve_kg_ids_in_args(
 /// Resolve a caller-supplied `delete(kind=...)` string into the
 /// [`khive_runtime::atomic_prepare::AtomicDeleteKind`] `prepare_delete`
 /// enforces, using the SAME canonical `resolve_kind_spec` the non-atomic
-/// `handle_delete` calls (ADR-099 B3 fix round 5, finding 1 — codex r3
-/// REJECT Blocker). `kind` absent -> `Ok(None)` (no check, parity with
+/// `handle_delete` calls (ADR-099 B3). `kind` absent -> `Ok(None)` (no check, parity with
 /// canonical's own optional discriminator). `kind` resolving to `Edge` maps
-/// to `AtomicDeleteKind::Edge` (ADR-099 B3 r6 — closes the round-4 codex
-/// REJECT: `Edge` used to be rejected here even though
+/// to `AtomicDeleteKind::Edge` (ADR-099 B3 — closes a prior gap where
+/// `Edge` used to be rejected here even though
 /// `ATOMIC_ADMISSIBLE_VERBS` already allows `delete(kind="edge")`).
 /// `Event`/`Proposal` remain a fail-loud rejection BEFORE `prepare_delete`
 /// (and therefore before any write): those substrates are not v1-admissible
@@ -562,7 +561,7 @@ fn delete_expected_kind(
 /// Resolve a caller-supplied `update(kind=...)` string into the
 /// [`khive_runtime::atomic_prepare::AtomicUpdateKind`] `prepare_update`
 /// enforces, using the SAME canonical `resolve_kind_spec` the non-atomic
-/// `handle_update` calls (ADR-099 B3 r7, codex r7 Blocker finding 1). Exact
+/// `handle_update` calls (ADR-099 B3). Exact
 /// mirror of [`delete_expected_kind`] above — same reasoning, same shape,
 /// differing only in which `AtomicOpPlan`-adjacent enum it targets. `kind`
 /// absent -> `Ok(None)` (no check, parity with canonical's own optional
@@ -615,8 +614,8 @@ fn gtd_audit_from_to(effect: &PostCommitEffect) -> Option<(String, String)> {
     }
 }
 
-/// Render a committed op's canonical-shaped `result` payload (ADR-099 B3 fix
-/// round 5, finding 4 — codex r3 REJECT High: the pre-fix envelope carried
+/// Render a committed op's canonical-shaped `result` payload (ADR-099 B3:
+/// the pre-fix envelope carried
 /// only `{ok, tool, op_index}`, dropping the `results[i].result` ADR-099 D4
 /// specifies). Result rendering is a pure READ, run strictly after the
 /// commit pass — safe for the same reason the post-commit reindex pass is.
@@ -638,7 +637,7 @@ async fn build_op_result(
         // Canonical shape: `normalize_entity_timestamps(to_json(&updated))`
         // (update.rs:209-211 entity, :242-244 note) — the full updated
         // entity/note row with ISO-8601 timestamps.
-        // ADR-099 B3 r9 (codex r8 Blocker finding 1, second half): a
+        // ADR-099 B3: a
         // symmetric edge update carries `edge_natural_key` and MUST be
         // rendered from a fresh post-commit natural-key lookup, never from
         // `p.target_id` — that field is prepare-time-only (the caller's
@@ -1124,7 +1123,7 @@ mod tests {
             .expect("task must carry properties")
     }
 
-    /// B3 fix round 3 (codex r2 High finding 3): atomic `gtd.transition`
+    /// ADR-099 B3: atomic `gtd.transition`
     /// must persist a caller-supplied `note` as `properties.transition_note`
     /// — parity with `khive-pack-gtd::handlers::handle_transition`
     /// (handlers.rs:1028), which the pre-fix atomic prepare silently
@@ -1167,7 +1166,7 @@ mod tests {
         );
     }
 
-    /// B3 fix round 3 (codex r2 High finding 3): a secret in the
+    /// ADR-099 B3: a secret in the
     /// `gtd.transition` `note` arg must be REJECTED at prepare, before any
     /// DB write — parity with `handle_transition`'s pre-write secret_gate
     /// check (handlers.rs:988).
@@ -1212,7 +1211,7 @@ mod tests {
         );
     }
 
-    /// B3 fix round 3 (codex r2 High finding 3): a secret in the
+    /// ADR-099 B3: a secret in the
     /// `gtd.complete` `result` arg must be REJECTED at prepare, before any
     /// DB write — parity with `handle_complete`'s pre-write secret_gate
     /// check (handlers.rs:803); a clean result persists normally
@@ -1284,7 +1283,7 @@ mod tests {
         );
     }
 
-    /// GAP-3 (B3 fix round 4): atomic `gtd.transition(status="finished")`
+    /// GAP-3 (ADR-099 B3): atomic `gtd.transition(status="finished")`
     /// on an active task must SUCCEED with the alias normalized to "done"
     /// — parity with the `normalize_status`/`is_valid_status` gate in
     /// `handle_transition` (handlers.rs:980-987). The pre-fix atomic
@@ -1329,7 +1328,7 @@ mod tests {
         );
     }
 
-    /// GAP-6 (B3 fix round 4): an idempotent `gtd.transition` (current ==
+    /// GAP-6 (ADR-099 B3): an idempotent `gtd.transition` (current ==
     /// target after `normalize_status`) must perform NO write — parity with
     /// `handle_transition`'s early return (handlers.rs:995-1005). The
     /// pre-fix atomic prepare only special-cased `current != target` inside
@@ -1387,7 +1386,7 @@ mod tests {
         );
     }
 
-    /// GAP-5 (B3 fix round 4): a committed atomic `gtd.transition` AND a
+    /// GAP-5 (ADR-099 B3): a committed atomic `gtd.transition` AND a
     /// committed atomic `gtd.complete` must each write a
     /// `gtd_lifecycle_audit` row — parity with `handle_transition`/
     /// `handle_complete`'s best-effort `ensure_audit_schema` +

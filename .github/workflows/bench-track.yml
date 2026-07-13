@@ -10,42 +10,33 @@ name: Bench Trend Tracking
 # plus a >=2-week zero-alarm observation window before any promotion
 # conversation starts. This workflow is Wave 2's ledger-writer, not a gate.
 #
-# Efficiency (directive requirement):
-#   - Never runs on pull_request - push-to-main, nightly cron, and manual
-#     dispatch only.
-#   - Swatinem/rust-cache on both jobs; a `--no-run` compile check runs
-#     before the timed criterion pass so a bench-rot build failure is cheap.
-#   - Criterion runs with `--quick` (shortened measurement time, relaxed
-#     outlier detection) and the whole run is wall-clock bounded (~15 min)
-#     via `timeout`.
-#   - paths-filtered push trigger (crates/**, scripts/perf/**, this file) -
-#     docs-only pushes to main never fire this workflow.
-#   - concurrency: nightly cron runs share one group with
-#     cancel-in-progress, so an overlapping/stuck nightly never queues
-#     behind another; push/dispatch runs get their own group and are never
-#     cancelled (each carries a distinct commit's data point).
-#   - single repository variable (`BENCH_TRACK_DISABLED`) skips both jobs
-#     entirely.
+# Efficiency and coverage:
+#   - PRs run only affected Criterion components. The stable component jobs
+#     resolve as skipped when their crate/hotpath mapping has no changes, so
+#     required checks never disappear behind workflow-level path filtering.
+#   - The full four-component + e2e suite runs only after pushes to main and
+#     release tags. Criterion remains quick-profile and wall-clock bounded.
+#   - A single repository variable (`BENCH_TRACK_DISABLED`) skips all bench
+#     work while leaving the PR change-detection check visible.
 
 on:
   push:
     branches: [main]
+    tags: ["v*"]
     paths:
       - "crates/**"
       - "scripts/perf/**"
+      - "scripts/bench_1m.sh"
       - ".github/workflows/bench-track.yml"
-  schedule:
-    - cron: "17 7 * * *" # nightly, off-peak UTC
-  workflow_dispatch: {}
+      - ".github/workflows/bench-component.yml"
+  # Do not path-filter the workflow itself: a required selector check must be
+  # created even when every component resolves to skipped.
+  pull_request:
 
-# Workflow-level default is read-only. `contents: write` is granted only on
-# the two jobs whose steps push to `perf-data` (components, e2e) - a
-# job-level grant, not a workflow-level one, is the smallest scope this
-# publish design can achieve: publish_ledger.sh needs the bench-data/*.jsonl
-# file this same job's earlier steps just wrote to local disk, so the push
-# step cannot be isolated into a separate job without re-uploading/
-# downloading that file as an artifact first. No other job in this workflow
-# gets contents: write.
+# Workflow-level default is read-only. `contents: write` is granted only to
+# component/e2e jobs that may push to `perf-data`; PR tokens remain subject to
+# GitHub's normal fork permission downgrade, and PR component jobs never call
+# the publisher.
 permissions:
   contents: read
 
@@ -56,156 +47,165 @@ env:
   BENCH_BOT_EMAIL: khive-bench-bot@users.noreply.github.com
 
 concurrency:
-  group: bench-track-${{ github.event_name == 'schedule' && 'nightly' || github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'schedule' }}
+  group: bench-track-${{ github.event_name }}-${{ github.ref }}
+  # Main runs are never cancelled in progress. GitHub keeps at most one
+  # pending run per group, so merge bursts collapse queued runs to the latest
+  # main commit; that latest commit gets the full pass when the active run
+  # finishes instead of every new merge starving the suite indefinitely.
+  # Superseded PR measurements may be cancelled to avoid wasting runners.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   # ─────────────────────────────────────────────────────────────────────────
-  # Component benches: the 23 Criterion targets across 20 crates, quick
-  # profile, bounded wall-clock. Advisory ledger: bench-data/components.jsonl
-  #
-  # Sharded 4 ways by crate group (5 crates/shard) instead of one
-  # `cargo bench --workspace` pass: a single job running all 23 targets can
-  # plausibly exceed the 20-minute job timeout before the publish step ever
-  # runs, silently dropping that commit's whole data point. Each shard
-  # compiles and benches only its own crate subset and publishes
-  # independently - `publish_ledger.sh`'s merge-on-copy (not overwrite) and
-  # push-retry loop already tolerate concurrent writers to the same ledger
-  # file (the components/e2e jobs already did this), so four shards racing
-  # to append four partial records for the same commit is the same
-  # already-handled case, not new risk. `render_trend_markdown` unions
-  # metrics by name across every record for a sha, so a metric being spread
-  # across several same-sha records renders identically to one big record.
+  # PR component selector. Each component owns the five crates from one old
+  # shard. The explicit shared files are registered benchmark hotpaths: a
+  # change to the workspace graph, tracker/publisher, or workflow can affect
+  # every component. An unmatched PR path sets no component output, and all
+  # four component jobs skip without doing setup or bench work.
   # ─────────────────────────────────────────────────────────────────────────
-  components:
-    name: Component benches (Criterion, quick profile, shard ${{ matrix.shard }})
+  changes:
+    name: Select changed benchmark components
     runs-on: ubuntu-latest
-    if: vars.BENCH_TRACK_DISABLED != 'true'
-    timeout-minutes: 20
+    timeout-minutes: 5
     permissions:
-      contents: write
-      issues: write
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - shard: 1
-            crates: "khive-score khive-fusion khive-retrieval khive-text khive-bm25"
-          - shard: 2
-            crates: "khive-hnsw khive-vamana khive-quant khive-query khive-request"
-          - shard: 3
-            crates: "khive-db khive-fold khive-brain-core khive-pack-brain khive-pack-comm"
-          - shard: 4
-            crates: "khive-pack-gtd khive-pack-kg khive-pack-knowledge khive-pack-memory khive-pack-schedule"
+      contents: read
+    outputs:
+      scoring_retrieval: ${{ steps.paths.outputs.scoring_retrieval }}
+      ann_query: ${{ steps.paths.outputs.ann_query }}
+      storage_brain: ${{ steps.paths.outputs.storage_brain }}
+      packs: ${{ steps.paths.outputs.packs }}
 
     steps:
       - uses: actions/checkout@v7
-
-      - uses: dtolnay/rust-toolchain@1.94.1
-
-      - name: Pin the real toolchain bin on PATH
-        run: dirname "$(rustup which cargo)" >> "$GITHUB_PATH"
-
-      - uses: Swatinem/rust-cache@v2
+        if: github.event_name == 'pull_request'
         with:
-          workspaces: crates
-          cache-on-failure: true
-          key: shard-${{ matrix.shard }}
+          fetch-depth: 0
 
-      - name: Compile-check this shard's bench targets (cheap, catches bench rot)
-        working-directory: crates
+      - name: Map changed paths to components
+        id: paths
+        if: github.event_name == 'pull_request'
         env:
-          SHARD_CRATES: ${{ matrix.crates }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
           set -euo pipefail
-          pkg_args=()
-          for c in $SHARD_CRATES; do pkg_args+=(-p "$c"); done
-          cargo bench "${pkg_args[@]}" --all-targets --no-run
+          scoring_retrieval=false
+          ann_query=false
+          storage_brain=false
+          packs=false
+          all_components=false
 
-      - name: Run Criterion benches (quick profile, bounded ~10 min/shard)
-        working-directory: crates
-        env:
-          SHARD_CRATES: ${{ matrix.crates }}
-        # `|| true`: a single bench's internal assertion (e.g. khive-quant's
-        # SQ8-vs-f32 speed ceiling) failing must not prevent the ledger from
-        # recording every OTHER bench's estimates.json that did get written -
-        # per-bench correctness gates are that bench's own concern, not this
-        # advisory tracker's. `timeout` bounds this shard's pass; `--quick`
-        # shortens per-bench measurement time and relaxes outlier detection.
-        run: |
-          set -euo pipefail
-          pkg_args=()
-          for c in $SHARD_CRATES; do pkg_args+=(-p "$c"); done
-          timeout 600 cargo bench "${pkg_args[@]}" -- --quick || true
+          # Fail closed: a process-substitution `< <(git diff ...)` failure is
+          # invisible to `set -euo pipefail` (the subshell's exit status never
+          # reaches the script). Capture the diff to a file first and check
+          # its exit status explicitly, so an unavailable/malformed base or
+          # head object trips all_components instead of silently leaving
+          # every component flag false.
+          diff_file="$(mktemp)"
+          if ! git diff --name-only "$BASE_SHA...$HEAD_SHA" > "$diff_file"; then
+            echo "::warning::git diff failed for $BASE_SHA...$HEAD_SHA; treating as all-components (fail closed)"
+            all_components=true
+          fi
 
-      - name: Record trend ledger entry
-        id: record
-        # Captures bench_track.py's own exit code into $GITHUB_OUTPUT instead
-        # of letting a nonzero exit fail this step outright (round-3 finding:
-        # the step used to fail here, before the publish step ran, so an
-        # error record it had already written to local disk never reached
-        # perf-data - `if: success()` on publish silently skipped it). `set
-        # +e` plus an explicit `exit 0` keep this step green so publish/
-        # summary/upload below always run; the captured code is enforced by
-        # the final "Fail job" step after publish has had its chance.
-        run: |
-          set +e
-          python3 scripts/perf/bench_track.py record \
-            --suite components \
-            --source criterion \
-            --criterion-dir crates/target/criterion \
-            --sha "$GITHUB_SHA" \
-            --branch "$GITHUB_REF_NAME" \
-            --run-id "$GITHUB_RUN_ID" \
-            --run-attempt "$GITHUB_RUN_ATTEMPT" \
-            --data-dir bench-data \
-            --summary-out /tmp/components-trend.md
-          echo "exit_code=$?" >> "$GITHUB_OUTPUT"
-          exit 0
+          # An empty diff for two distinct SHAs is also unsafe: it should
+          # never happen for a real PR range, so treat it the same as a
+          # diff failure rather than silently skipping every component.
+          if [ "$all_components" != true ] && [ ! -s "$diff_file" ] && [ "$BASE_SHA" != "$HEAD_SHA" ]; then
+            echo "::warning::git diff returned no output for distinct SHAs $BASE_SHA...$HEAD_SHA; treating as all-components (fail closed)"
+            all_components=true
+          fi
 
-      - name: Publish ledger to perf-data branch
-        if: ${{ !cancelled() }}
-        run: bash scripts/perf/publish_ledger.sh bench-data/components.jsonl
+          if [ "$all_components" != true ]; then
+            while IFS= read -r path; do
+              case "$path" in
+                crates/khive-score/*|crates/khive-fusion/*|crates/khive-retrieval/*|crates/khive-text/*|crates/khive-bm25/*)
+                  scoring_retrieval=true
+                  ;;
+                crates/khive-hnsw/*|crates/khive-vamana/*|crates/khive-quant/*|crates/khive-query/*|crates/khive-request/*)
+                  ann_query=true
+                  ;;
+                crates/khive-db/*|crates/khive-fold/*|crates/khive-brain-core/*|crates/khive-pack-brain/*|crates/khive-pack-comm/*)
+                  storage_brain=true
+                  ;;
+                crates/khive-pack-gtd/*|crates/khive-pack-kg/*|crates/khive-pack-knowledge/*|crates/khive-pack-memory/*|crates/khive-pack-schedule/*)
+                  packs=true
+                  ;;
+                crates/Cargo.toml|crates/Cargo.lock|scripts/perf/bench_track.py|scripts/perf/bench_calibrate.py|scripts/perf/publish_ledger.sh|scripts/bench_1m.sh|.github/workflows/bench-track.yml|.github/workflows/bench-component.yml)
+                  all_components=true
+                  ;;
+              esac
+            done < "$diff_file"
+          fi
 
-      - name: Write step summary
-        if: always()
-        run: cat /tmp/components-trend.md >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || true
+          if [ "$all_components" = true ]; then
+            scoring_retrieval=true
+            ann_query=true
+            storage_brain=true
+            packs=true
+          fi
 
-      - name: Upload raw criterion output
-        if: always()
-        uses: actions/upload-artifact@v7
-        with:
-          name: bench-track-components-shard${{ matrix.shard }}-${{ github.run_id }}
-          path: crates/target/criterion
-          retention-days: 90
-          if-no-files-found: ignore
-
-      # Advisory-lane semantics: a data-collection error must never paint main
-      # red. The status=error ledger record is already published above; this
-      # step surfaces a warning and upserts a tracking issue, then exits 0.
-      # A red X on main is reserved for correctness CI.
-      - name: Warn if trend ledger record errored (advisory, never fails)
-        if: ${{ !cancelled() && steps.record.outputs.exit_code != '0' }}
-        env:
-          RECORD_EXIT_CODE: ${{ steps.record.outputs.exit_code }}
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set +e
-          MSG="bench_track.py record exited ${RECORD_EXIT_CODE} for suite=components shard=${{ matrix.shard }}; its status=error record was still published to perf-data. Run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
-          echo "::warning::${MSG}"
           {
-            echo "## Trend ledger record errored (advisory)"
-            echo ""
-            echo "${MSG}"
-          } >> "$GITHUB_STEP_SUMMARY"
-          TRACKING_ISSUE=863
-          if ! gh issue reopen "$TRACKING_ISSUE" --repo "$GITHUB_REPOSITORY" 2>/dev/null; then
-            echo "tracking issue already open or reopen unavailable (non-fatal)"
-          fi
-          if ! gh issue comment "$TRACKING_ISSUE" --repo "$GITHUB_REPOSITORY" --body "$MSG"; then
-            echo "::warning::tracking-issue comment failed (non-fatal)"
-          fi
-          exit 0
+            echo "scoring_retrieval=$scoring_retrieval"
+            echo "ann_query=$ann_query"
+            echo "storage_brain=$storage_brain"
+            echo "packs=$packs"
+          } >> "$GITHUB_OUTPUT"
+
+  component-scoring-retrieval:
+    name: Component benches / scoring-retrieval
+    needs: changes
+    if: >-
+      vars.BENCH_TRACK_DISABLED != 'true' &&
+      (github.event_name == 'push' || needs.changes.outputs.scoring_retrieval == 'true')
+    permissions:
+      contents: write
+      issues: write
+    uses: ./.github/workflows/bench-component.yml
+    with:
+      component: scoring-retrieval
+      crates: khive-score khive-fusion khive-retrieval khive-text khive-bm25
+
+  component-ann-query:
+    name: Component benches / ann-query
+    needs: changes
+    if: >-
+      vars.BENCH_TRACK_DISABLED != 'true' &&
+      (github.event_name == 'push' || needs.changes.outputs.ann_query == 'true')
+    permissions:
+      contents: write
+      issues: write
+    uses: ./.github/workflows/bench-component.yml
+    with:
+      component: ann-query
+      crates: khive-hnsw khive-vamana khive-quant khive-query khive-request
+
+  component-storage-brain:
+    name: Component benches / storage-brain
+    needs: changes
+    if: >-
+      vars.BENCH_TRACK_DISABLED != 'true' &&
+      (github.event_name == 'push' || needs.changes.outputs.storage_brain == 'true')
+    permissions:
+      contents: write
+      issues: write
+    uses: ./.github/workflows/bench-component.yml
+    with:
+      component: storage-brain
+      crates: khive-db khive-fold khive-brain-core khive-pack-brain khive-pack-comm
+
+  component-packs:
+    name: Component benches / packs
+    needs: changes
+    if: >-
+      vars.BENCH_TRACK_DISABLED != 'true' &&
+      (github.event_name == 'push' || needs.changes.outputs.packs == 'true')
+    permissions:
+      contents: write
+      issues: write
+    uses: ./.github/workflows/bench-component.yml
+    with:
+      component: packs
+      crates: khive-pack-gtd khive-pack-kg khive-pack-knowledge khive-pack-memory khive-pack-schedule
 
   # ─────────────────────────────────────────────────────────────────────────
   # e2e benches: the pipeline daemon suite (bench_calibrate's `pipeline`
@@ -216,7 +216,7 @@ jobs:
   e2e:
     name: E2E benches (pipeline + bench-1m synthetic)
     runs-on: ubuntu-latest
-    if: vars.BENCH_TRACK_DISABLED != 'true'
+    if: vars.BENCH_TRACK_DISABLED != 'true' && github.event_name == 'push'
     timeout-minutes: 20
     permissions:
       contents: write
@@ -250,9 +250,9 @@ jobs:
         env:
           KKERNEL_BENCH_BINARY: crates/target/release/kkernel-bench
         # Captures bench_track.py's own exit code instead of failing the
-        # step outright (round-3 finding: this step failing before publish
-        # ran meant an already-written error record never reached
-        # perf-data). See the "Fail job" step at the end of this job.
+        # step outright (this step failing before publish ran meant an
+        # already-written error record never reached perf-data). See the
+        # "Fail job" step at the end of this job.
         run: |
           set +e
           python3 scripts/perf/bench_track.py record \

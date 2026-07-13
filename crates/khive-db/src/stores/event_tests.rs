@@ -210,7 +210,7 @@ async fn selected_uuids_for(store: &SqlEventStore, event_id: Uuid) -> Vec<String
 
 #[tokio::test]
 async fn rerank_executed_falls_back_to_reranked_when_final_scores_field_is_absent() {
-    // Regression test (round-1 codex review of #831, Finding 2): legacy
+    // Regression test (#831): legacy
     // events emitted before `final_scores` existed carry only `reranked`.
     // The decoder must still fall through from the absent `final_scores`
     // field to the tuple-shaped `reranked` field instead of silently
@@ -242,7 +242,7 @@ async fn rerank_executed_falls_back_to_reranked_when_final_scores_field_is_absen
 
 #[tokio::test]
 async fn rerank_executed_prefers_final_scores_order_over_reranked_when_both_present() {
-    // Finding 1 (round-2 codex review of #831): ADR-042 §5 defines
+    // #831: ADR-042 §5 defines
     // `final_scores` as the ordered rerank output and `reranked` as
     // unordered per-reranker audit/debug data. When both are present and
     // their orderings differ, `final_scores`' order must win.
@@ -295,7 +295,7 @@ async fn rerank_executed_prefers_final_scores_order_over_reranked_when_both_pres
 
 #[tokio::test]
 async fn rerank_executed_ignores_stray_selected_field_and_uses_final_scores() {
-    // Regression test (round-3 codex review of #831, Major finding):
+    // Regression test (#831):
     // `RerankExecutedPayload` (khive_types::event::RerankExecutedPayload)
     // has no `selected` field at all. The serde helper does not deny
     // unknown fields, so a payload carrying the typed fields plus a stray
@@ -351,7 +351,7 @@ async fn rerank_executed_ignores_stray_selected_field_and_uses_final_scores() {
 
 #[tokio::test]
 async fn rerank_executed_uses_final_scores_when_reranked_is_empty() {
-    // Finding 1 companion case: `reranked` present-but-empty, `final_scores`
+    // Companion case: `reranked` present-but-empty, `final_scores`
     // populated. `final_scores` must still be used (not skipped just
     // because `reranked` happens to come first lexically in the payload).
     let store = setup_memory_store();
@@ -385,7 +385,7 @@ async fn rerank_executed_uses_final_scores_when_reranked_is_empty() {
 
 #[tokio::test]
 async fn rerank_executed_final_scores_single_element_tuple_rejected() {
-    // Finding 2 (round-2 codex review of #831): the typed contract
+    // #831: the typed contract
     // (`RerankExecutedPayload::final_scores: Vec<(Id128, f32)>`) requires
     // exact two-element tuples. A one-element tuple must error, and the
     // event insert must roll back rather than silently accepting it.
@@ -407,7 +407,7 @@ async fn rerank_executed_final_scores_single_element_tuple_rejected() {
 
 #[tokio::test]
 async fn rerank_executed_final_scores_extra_element_tuple_rejected() {
-    // Finding 2: extra-element tuples must also be rejected, not
+    // Extra-element tuples must also be rejected, not
     // silently truncated to the first two elements.
     let store = setup_memory_store();
     let mut event = make_event("default");
@@ -427,7 +427,7 @@ async fn rerank_executed_final_scores_extra_element_tuple_rejected() {
 
 #[tokio::test]
 async fn rerank_executed_final_scores_non_numeric_second_element_rejected() {
-    // Finding 2: the second element of a `final_scores` tuple must be the
+    // The second element of a `final_scores` tuple must be the
     // typed contract's `f32` score, not an arbitrary value.
     let store = setup_memory_store();
     let mut event = make_event("default");
@@ -447,7 +447,7 @@ async fn rerank_executed_final_scores_non_numeric_second_element_rejected() {
 
 #[tokio::test]
 async fn rerank_executed_reranked_malformed_sub_scores_rejected() {
-    // Finding 2: `reranked`'s second element must be the typed contract's
+    // `reranked`'s second element must be the typed contract's
     // `Vec<(String, f32)>` sub-score list, not an arbitrary value.
     let store = setup_memory_store();
     let mut event = make_event("default");

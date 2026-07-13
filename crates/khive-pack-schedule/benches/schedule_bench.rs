@@ -17,6 +17,7 @@ fn build_fixture() -> Fixture {
     let khive_rt = KhiveRuntime::memory().expect("in-memory runtime");
     let mut builder = VerbRegistryBuilder::new();
     builder.register(KgPack::new(khive_rt.clone()));
+    builder.register(khive_pack_comm::CommPack::new(khive_rt.clone()));
     builder.register(SchedulePack::new(khive_rt.clone()));
     let registry = builder.build().expect("registry builds");
     Fixture { registry, rt }

@@ -2464,14 +2464,14 @@ backend = "sessions"
         );
     }
 
-    /// ADR-099 B3 r9 (codex r8 Blocker finding 1, second half): the inverse
-    /// same-unit race codex named — `[link(A, B, competes_with), update(X
+    /// ADR-099 B3 (second half): the inverse
+    /// same-unit race — `[link(A, B, competes_with), update(X
     /// extends A-B -> competes_with)]`, where the CANONICAL row the update
     /// conflict-absorbs into is created by an EARLIER op in the SAME
     /// atomic unit (so it does not exist at either op's prepare time). The
     /// commit must both write correctly (X deleted, the just-linked row
     /// carries X's patch) and RENDER the correct surviving id — not X's
-    /// prepare-time-advisory id, which this fix round removed reliance on
+    /// prepare-time-advisory id, which this fix removed reliance on
     /// entirely (`build_op_result` now derives it from a post-commit
     /// natural-key lookup).
     #[tokio::test]
@@ -2668,8 +2668,8 @@ backend = "sessions"
             );
         }
 
-        // (e) governance verbs (`propose`/`review`/`withdraw`) — B3 fix round
-        // (codex REJECT, Medium finding): these are on the v1 admissible list
+        // (e) governance verbs (`propose`/`review`/`withdraw`) — ADR-099 B3:
+        // these are on the v1 admissible list
         // (ADR-099 D3 intends them to gain a seam) but have no prepare/apply
         // implementation in this slice yet. They must be rejected at this
         // SAME pre-runtime static guard — never reaching `KhiveRuntime::new`
@@ -2705,8 +2705,7 @@ backend = "sessions"
             );
         }
 
-        // (f) `merge` — B3 fix round (Leo refinement, codex REJECT Blocker 2):
-        // deferred at this SAME pre-runtime static guard rather than shipped
+        // (f) `merge` — ADR-099 B3: deferred at this SAME pre-runtime static guard rather than shipped
         // with partial parity. Must name the non-atomic merge verb as the
         // supported route, and must not reach `KhiveRuntime::new`/any write.
         {
@@ -3126,10 +3125,10 @@ backend = "sessions"
         );
     }
 
-    // ── ADR-099 B3 fix round 5 (codex r3 REJECT): delete kind parity, update
+    // ── ADR-099 B3: delete kind parity, update
     // null/type validation, canonical id resolution, per-op result payloads ──
 
-    /// Finding 1 [Blocker]: atomic `delete(id=<entity>, kind="note")` must be
+    /// Finding 1: atomic `delete(id=<entity>, kind="note")` must be
     /// REJECTED (no row deleted) — pre-fix, atomic ignored `kind` entirely
     /// and deleted the entity anyway (a destructive wrong-substrate action).
     /// `delete(id=<entity>, kind="entity")` and `kind` omitted must both
@@ -3215,7 +3214,7 @@ backend = "sessions"
         );
     }
 
-    /// Finding 2 [High]: atomic `update` null/type semantics must match
+    /// Finding 2: atomic `update` null/type semantics must match
     /// canonical's ACTUALLY REACHABLE behavior. Empirically verified against
     /// the live `handle_update` (two scratch probe tests run directly
     /// against `KgPack::handle_update`, then removed) that `name=null` and
@@ -3226,10 +3225,9 @@ backend = "sessions"
     /// regardless of the inner type — so canonical's own "reject null"/
     /// "clear on null" arms in `string_value`/`optional_string_patch` are
     /// unreachable through normal struct deserialization. This deliberately
-    /// does NOT implement the fix-round brief's literal expectation
+    /// does NOT implement the naive literal expectation
     /// ("`update(name=null)` REJECTED") — that expectation does not match
-    /// the live canonical system; see the final report for the full
-    /// evidence trail. What canonical DOES still reject is a non-null,
+    /// the live canonical system. What canonical DOES still reject is a non-null,
     /// non-string `name` (e.g. `name: 123`) — pre-fix, atomic silently
     /// treated that as absent too (reporting success for an invalid
     /// update), which is the real violation this test locks down.
@@ -3253,7 +3251,7 @@ backend = "sessions"
         };
 
         // (a) name: a non-null, non-string value must be REJECTED — the
-        // actual violation codex flagged (pre-fix: silently treated as
+        // actual violation (pre-fix: silently treated as
         // absent, reporting success).
         let ops = vec![atomic_op(
             "update",
@@ -3320,7 +3318,7 @@ backend = "sessions"
         );
     }
 
-    /// Finding 3 [High]: an atomic ops-file using an 8-hex-prefix id for
+    /// Finding 3: an atomic ops-file using an 8-hex-prefix id for
     /// `update` AND `gtd.transition` must succeed identically to canonical
     /// (which accepts full UUID or an 8+ hex prefix); a non-existent prefix
     /// must error with canonical's error shape ("no record matches
@@ -3405,10 +3403,10 @@ backend = "sessions"
         );
     }
 
-    /// Finding 4 [High]: a committed atomic unit's success output must
+    /// Finding 4: a committed atomic unit's success output must
     /// carry a canonical-shaped `result` per op (ADR-099 D4), not just
     /// `{ok, tool, op_index}`. Exercises all five v1-admissible verbs in one
-    /// unit and asserts the field the fix-round brief calls out for each:
+    /// unit and asserts the relevant field for each:
     /// updated name for `update`, the deleted marker for `delete`, edge
     /// fields for `link`, and the transition/completion shape for the two
     /// gtd verbs.

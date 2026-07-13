@@ -31,10 +31,12 @@ crossbeam-queue = { workspace = true }
 parking_lot = { workspace = true }
 sha2 = { workspace = true }
 sqlite-vec = { workspace = true, optional = true }
+blake3 = { workspace = true }
+fs4 = { workspace = true }
+tempfile = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["full", "test-util"] }
-tempfile = { workspace = true }
 rusqlite = { workspace = true, features = ["bundled", "column_decltype"] }
 khive-storage = { version = "0.4.0", path = "../khive-storage" }
 khive-types = { version = "0.4.0", path = "../khive-types", features = ["serde"] }

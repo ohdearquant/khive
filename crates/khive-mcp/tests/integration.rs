@@ -498,6 +498,66 @@ async fn pack_gtd_without_kg_fails_at_boot() {
 }
 
 #[tokio::test]
+async fn pack_schedule_without_comm_rejects_only_remind_before_persisting() -> anyhow::Result<()> {
+    disable_daemon();
+    let config = RuntimeConfig {
+        db_path: None,
+        default_namespace: Namespace::parse("test").unwrap(),
+        embedding_model: None,
+        additional_embedding_models: vec![],
+        packs: vec!["kg".to_string(), "schedule".to_string()],
+        ..RuntimeConfig::default()
+    };
+    let runtime = KhiveRuntime::new(config).expect("kg+schedule runtime");
+    let server = KhiveMcpServer::new(runtime).expect("kg+schedule server builds without comm");
+    let (server_transport, client_transport) = tokio::io::duplex(65536);
+    tokio::spawn(async move {
+        if let Ok(svc) = server.serve(server_transport).await {
+            let _ = svc.waiting().await;
+        }
+    });
+    let client = DummyClient.serve(client_transport).await?;
+
+    let result = call(
+        &client,
+        "request",
+        json!({
+            "ops": r#"schedule.remind(content="must not persist", at="2099-01-01T00:00:00Z")"#,
+            "presentation": "verbose"
+        }),
+    )
+    .await?;
+    let body: Value = serde_json::from_str(&first_text(&result))?;
+    let failed = &body["results"][0];
+    assert_eq!(failed["ok"], json!(false), "remind must fail: {failed}");
+    let error = failed["error"].as_str().unwrap_or_default();
+    assert!(
+        error.contains("comm.send") && error.contains("delivery"),
+        "error must name the missing comm delivery capability: {error}"
+    );
+
+    let notes = ok_one(&client, r#"list(kind="note")"#).await?;
+    assert_eq!(notes, json!([]), "failed remind must persist no note");
+    let empty_agenda = ok_one(&client, "schedule.agenda()").await?;
+    assert_eq!(empty_agenda["count"], json!(0));
+
+    let scheduled = ok_one(
+        &client,
+        r#"schedule.schedule(action="schedule.agenda()", at="2099-01-02T00:00:00Z")"#,
+    )
+    .await?;
+    let full_id = scheduled["full_id"]
+        .as_str()
+        .expect("schedule.schedule returns full_id");
+    let agenda = ok_one(&client, "schedule.agenda()").await?;
+    assert_eq!(agenda["count"], json!(1));
+    let cancelled = ok_one(&client, &format!(r#"schedule.cancel(id="{full_id}")"#)).await?;
+    assert_eq!(cancelled["status"], json!("cancelled"));
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn pack_gtd_with_kg_explicit_works() {
     // When both kg and gtd are listed, gtd's requires=["kg"] is satisfied.
     let config = RuntimeConfig {
@@ -2717,7 +2777,7 @@ fn actor_precedence_config_actor_id_does_not_route_namespace() {
 /// Tier 2 (--namespace / KHIVE_NAMESPACE with explicit value "local"): explicit
 /// --namespace local must win over a conflicting config actor.
 ///
-/// This is the regression case for [High] finding 1: previously the value
+/// This is the regression case: previously the value
 /// comparison `args.namespace != "local"` treated `--namespace local` as
 /// identical to the absent default, letting config override it.  Now that
 /// `namespace` is `Option<String>`, `Some("local")` is correctly explicit.
@@ -2793,7 +2853,7 @@ fn actor_precedence_cli_actor_wins_over_config() {
 
 /// Invalid config actor.id must be caught at load time (not silently downgraded).
 ///
-/// This is the regression case for [High] finding 2: previously an invalid
+/// This is the regression case: previously an invalid
 /// actor.id logged a warning and fell back to the base namespace.  Now it is a
 /// hard startup error via ConfigError::InvalidActorId.
 #[test]
@@ -3008,7 +3068,7 @@ fn cli_args_khive_namespace_env_is_explicit() {
     assert_eq!(ns, Namespace::parse("lambda:from-env").unwrap());
 }
 
-/// ADR-096 Fork 2 (PR #657 review, [High]): `KHIVE_ACTOR` env var must NOT
+/// ADR-096 Fork 2 (PR #657 review): `KHIVE_ACTOR` env var must NOT
 /// occupy the CLI tier at all — it no longer marks the CLI namespace as
 /// explicit, and it no longer wins over `KHIVE_NAMESPACE`. `args.rs` used to
 /// bind `--actor` to `env = "KHIVE_ACTOR"`, which made a bare shell-level
@@ -3341,7 +3401,7 @@ async fn list_rejects_unknown_kwarg() -> anyhow::Result<()> {
     Ok(())
 }
 
-// ── Round 3: MCP-wide ISO-8601 timestamps (Blocker fix) ──────────────────────
+// ── MCP-wide ISO-8601 timestamps ──────────────────────────────────────────
 
 /// `remember` must return ISO-8601 `created_at` (not a raw microsecond i64).
 #[tokio::test]
@@ -3458,24 +3518,24 @@ async fn send_returns_iso8601_timestamps() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn make_schedule_server_only() -> KhiveMcpServer {
+fn make_schedule_server() -> KhiveMcpServer {
     disable_daemon();
     let config = RuntimeConfig {
         db_path: None,
         default_namespace: Namespace::parse("schedtest").unwrap(),
         embedding_model: None,
         additional_embedding_models: vec![],
-        packs: vec!["kg".to_string(), "schedule".to_string()],
+        packs: vec!["kg".to_string(), "comm".to_string(), "schedule".to_string()],
         ..RuntimeConfig::default()
     };
-    let runtime = KhiveRuntime::new(config).expect("kg+schedule runtime");
-    KhiveMcpServer::new(runtime).expect("server builds with kg+schedule")
+    let runtime = KhiveRuntime::new(config).expect("kg+comm+schedule runtime");
+    KhiveMcpServer::new(runtime).expect("server builds with kg+comm+schedule")
 }
 
-async fn connect_schedule_only(
+async fn connect_schedule(
 ) -> anyhow::Result<impl std::ops::Deref<Target = rmcp::service::Peer<rmcp::RoleClient>>> {
     let (server_transport, client_transport) = tokio::io::duplex(65536);
-    let server = make_schedule_server_only();
+    let server = make_schedule_server();
     tokio::spawn(async move {
         if let Ok(svc) = server.serve(server_transport).await {
             let _ = svc.waiting().await;
@@ -3488,7 +3548,7 @@ async fn connect_schedule_only(
 /// `remind` creates a scheduled_event note; `agenda` returns ISO-8601 timestamps.
 #[tokio::test]
 async fn agenda_returns_iso8601_timestamps() -> anyhow::Result<()> {
-    let client = connect_schedule_only().await?;
+    let client = connect_schedule().await?;
 
     ok_one(
         &client,
@@ -3580,7 +3640,7 @@ async fn proposal_list_returns_iso8601_timestamps() -> anyhow::Result<()> {
     Ok(())
 }
 
-// ── Round 3: cross-pack deny_unknown_fields (High fix) ───────────────────────
+// ── Cross-pack deny_unknown_fields ─────────────────────────────────────────
 
 /// `create(kind="concept", unknownkw="x")` must return `ok: false`.
 #[tokio::test]
@@ -3663,7 +3723,7 @@ async fn send_rejects_unknown_kwarg() -> anyhow::Result<()> {
 /// `agenda(unknownkw="x")` (schedule) must return `ok: false`.
 #[tokio::test]
 async fn agenda_rejects_unknown_kwarg() -> anyhow::Result<()> {
-    let client = connect_schedule_only().await?;
+    let client = connect_schedule().await?;
 
     let result = call(
         &client,
@@ -3944,7 +4004,7 @@ async fn exec_output_valid_json_with_backslash_escape_content() -> anyhow::Resul
 /// `properties` — the full ISO-8601 string must round-trip verbatim (#546).
 #[tokio::test]
 async fn schedule_agenda_agent_preserves_properties_trigger_at_verbatim() -> anyhow::Result<()> {
-    let client = connect_schedule_only().await?;
+    let client = connect_schedule().await?;
     let trigger_at = "2099-01-01T00:00:00Z";
 
     ok_one(
@@ -3974,6 +4034,81 @@ async fn schedule_agenda_agent_preserves_properties_trigger_at_verbatim() -> any
         actual, "2099-01-01T00:00",
         "trigger_at must not be truncated to minute granularity"
     );
+    Ok(())
+}
+
+// ── #871: schedule.remind create-response preserves top-level trigger_at ─────
+//
+// These two tests deliberately cover `schedule.remind` only; `schedule` (the
+// verb-dispatch scheduling sibling) shares the same create-response shape and
+// the same presentation-layer fix, but an equivalent end-to-end case for it
+// is out of scope here to keep this regression narrow (#871).
+
+/// `schedule.remind`'s create response returns `trigger_at` as a top-level
+/// convenience field (sibling to `id`/`full_id`), not nested under
+/// `"properties"`. In default Agent mode this must round-trip verbatim,
+/// offset intact — the humanize layer previously discarded the offset (and
+/// seconds) by minute-truncating or relativizing this top-level field, even
+/// though the underlying offset-to-UTC conversion used for the relative-time
+/// comparison itself was already correct (#871).
+#[tokio::test]
+async fn schedule_remind_agent_preserves_top_level_trigger_at_with_offset() -> anyhow::Result<()> {
+    let client = connect_schedule().await?;
+    // Far enough in the future (relative to "now") to land outside the 24h
+    // relative-render window, so pre-fix this would have been silently
+    // minute-truncated (dropping the seconds and the "-04:00" offset)
+    // instead of round-tripping the exact ISO string.
+    let trigger_at = "2099-06-15T19:00:00-04:00";
+
+    let result = call(
+        &client,
+        "request",
+        json!({"ops": format!(
+            r#"schedule.remind(content="agent create-response trigger_at fidelity", at="{trigger_at}")"#
+        )}),
+    )
+    .await?;
+    let body: Value = serde_json::from_str(&first_text(&result))?;
+    let first = &body["results"][0];
+    assert_eq!(
+        first["ok"],
+        json!(true),
+        "schedule.remind must succeed: {first}"
+    );
+
+    let actual = first["result"]["trigger_at"].as_str().unwrap_or("");
+    assert_eq!(
+        actual, trigger_at,
+        "top-level trigger_at in the create response must be preserved verbatim, offset intact, in Agent mode"
+    );
+    Ok(())
+}
+
+/// A `Z`-suffixed UTC `at` input must likewise round-trip unchanged through
+/// the create-response humanize layer (#871 regression coverage). Bare
+/// offset-less input (no `Z`/`±HH:MM` suffix) is not a case here: it is
+/// rejected upstream as non-RFC-3339 by `schedule.remind`'s own validation
+/// (`crates/khive-pack-schedule/src/handlers.rs` `validate_at`), so it never
+/// reaches this presentation-layer fix.
+#[tokio::test]
+async fn schedule_remind_agent_preserves_top_level_trigger_at_utc() -> anyhow::Result<()> {
+    let client = connect_schedule().await?;
+
+    let utc = "2099-06-15T23:00:00Z";
+    let result = call(
+        &client,
+        "request",
+        json!({"ops": format!(
+            r#"schedule.remind(content="agent create-response trigger_at utc", at="{utc}")"#
+        )}),
+    )
+    .await?;
+    let body: Value = serde_json::from_str(&first_text(&result))?;
+    let actual = body["results"][0]["result"]["trigger_at"]
+        .as_str()
+        .unwrap_or("");
+    assert_eq!(actual, utc, "UTC trigger_at must round-trip unchanged");
+
     Ok(())
 }
 
@@ -4657,7 +4792,7 @@ async fn presentation_per_op_verbose_preserves_full_id_namespace_and_props() {
 /// (fmt-4) AlwaysVerbose verbs must skip the redundancy-drop pre-pass under
 /// `format=auto` even with the DEFAULT Agent presentation and NO per-op override.
 ///
-/// Pins the round-2 finding: `render_result` recomputed the format-time
+/// Pins the fix: `render_result` recomputed the format-time
 /// presentation only from `presentation_per_op` → batch default, blind to the
 /// `VerbPresentationPolicy::AlwaysVerbose` that `run_parsed` applies. So a
 /// policy-verbose verb (`get`) under `format=auto` with the default Agent mode
@@ -4723,7 +4858,7 @@ async fn format_auto_always_verbose_verb_skips_redundancy_drop_without_override(
         .expect("get result must be a rendered string under format=auto");
 
     // namespace="local" is elided under agent+auto (§7.3) but MUST survive for an
-    // AlwaysVerbose verb — this is the regression the round-2 fix closes.
+    // AlwaysVerbose verb — this is the regression the fix closes.
     assert!(
         rendered.contains("namespace"),
         "AlwaysVerbose get: namespace must survive redundancy-drop under format=auto + \

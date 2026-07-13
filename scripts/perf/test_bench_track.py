@@ -259,7 +259,7 @@ class ErrorRecordTests(unittest.TestCase):
 
 
 class ShardAggregationTests(unittest.TestCase):
-    """Reproduces the round-2 finding: 4 `components` shards append 4
+    """Reproduces the bug: 4 `components` shards append 4
     partial records for the same sha; the trend summary must render one
     logical run per sha with the full union of every shard's metrics, not
     one row per shard with only the last shard's metric names.
@@ -316,7 +316,7 @@ class ShardAggregationTests(unittest.TestCase):
 
 
 class TimeoutRecordTests(unittest.TestCase):
-    """Round-3 finding: `_run_once_no_gate` re-raises `subprocess.TimeoutExpired`
+    """`_run_once_no_gate` re-raises `subprocess.TimeoutExpired`
     on a suite that runs past its timeout, but `_cmd_record`'s except tuple
     did not catch it - a timed-out suite raised straight past `_cmd_record`
     instead of leaving a status=error ledger row. Registers a synthetic
@@ -370,7 +370,7 @@ class TimeoutRecordTests(unittest.TestCase):
 
 
 class RunIdAggregationTests(unittest.TestCase):
-    """Round-3 finding: keying `_aggregate_shards` on sha alone lets a rerun
+    """Keying `_aggregate_shards` on sha alone lets a rerun
     of the same commit (same sha, new run_id) merge into the FIRST run's
     row - a pass-then-fail rerun then produces one logical run whose
     metrics came from the failing rerun but whose gate_status stayed
@@ -427,7 +427,7 @@ class RunIdAggregationTests(unittest.TestCase):
             self.assertIn("dup", aggregated[0]["metric_collisions"])
 
     def test_rerun_same_sha_different_run_id_does_not_mix_gate_status(self):
-        """Reproduces the exact round-3 scenario: pass-then-fail rerun of
+        """Reproduces the exact scenario: pass-then-fail rerun of
         the same sha must not blend into one row with mismatched gate
         provenance."""
         with tempfile.TemporaryDirectory() as tmp:

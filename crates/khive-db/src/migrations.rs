@@ -118,6 +118,8 @@ const V8_UP: &str = include_str!("../sql/008-notes-seq-repair.sql");
 
 const V9_UP: &str = include_str!("../sql/009-entities-name-ci-index.sql");
 
+const V10_UP: &str = include_str!("../sql/010-entities-content-ref.sql");
+
 /// DDL for the `_embedding_models` registry table.
 ///
 /// Shared between the V1 schema and the belt-and-suspenders creation in
@@ -171,6 +173,11 @@ pub const MIGRATIONS: &[VersionedMigration] = &[
         version: 9,
         name: "entities_name_ci_index",
         up: V9_UP,
+    },
+    VersionedMigration {
+        version: 10,
+        name: "entities_content_ref",
+        up: V10_UP,
     },
 ];
 

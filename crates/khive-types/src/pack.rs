@@ -9,6 +9,7 @@
 //! can reference pack metadata without pulling in the full runtime.
 
 use crate::edge::EdgeRelation;
+use crate::entity_type::EntityTypeDef;
 
 /// Visibility tier for a handler.
 ///
@@ -297,6 +298,21 @@ pub trait Pack {
     /// only rely on the base endpoint contract) can ignore this.
     const EDGE_RULES: &'static [EdgeEndpointRule] = &[];
 
+    /// Entity-type subtypes this pack contributes to the `(EntityKind,
+    /// entity_type)` registry (the `entity_type` axis is distinct from and
+    /// finer-grained than the closed [`EntityKind`](crate::entity::EntityKind)
+    /// taxonomy — see `khive-types::entity_type::EntityTypeRegistry`).
+    ///
+    /// Defaults to empty, mirroring [`EDGE_RULES`]'s additive contract:
+    /// packs that introduce no new subtypes can ignore this. Entries here
+    /// are composed with `EntityTypeRegistry::builtin()` at runtime boot
+    /// (`VerbRegistry::all_entity_types`); packs must declare only new
+    /// `(kind, type_name)` pairs — they may not tighten or shadow a builtin
+    /// or another pack's declared subtype.
+    ///
+    /// [`EDGE_RULES`]: Pack::EDGE_RULES
+    const ENTITY_TYPES: &'static [EntityTypeDef] = &[];
+
     /// Other pack names whose vocabulary this pack references.
     ///
     /// The runtime checks that every name in `REQUIRES` appears in the
@@ -391,7 +407,7 @@ const ATOMIC_EMBEDDING_BEARING_VERBS: &[&str] = &[
 ///   fix-round refinement) over shipping a partially-scoped atomic merge.
 ///   `merge` stays admissible under the *non-atomic* verb.
 ///
-/// B3 fix round (codex REJECT, Medium finding — governance verbs): this set
+/// ADR-099 B3 (governance verbs): this set
 /// previously passed the static pre-runtime admissibility check (since it's a
 /// subset of `ATOMIC_ADMISSIBLE_VERBS`) and only failed later, inside
 /// `atomic_prepare::prepare_op`, AFTER `KhiveRuntime::new` had already run.
@@ -525,6 +541,11 @@ mod tests {
         assert!(TestPack::VALIDATION_RULES.is_empty());
     }
 
+    #[test]
+    fn pack_entity_types_default_empty() {
+        assert!(TestPack::ENTITY_TYPES.is_empty());
+    }
+
     // `link` must be AlwaysVerbose so edge IDs are not shortened.
     #[test]
     fn link_handler_is_always_verbose() {
@@ -636,7 +657,7 @@ mod tests {
 
     #[test]
     fn atomic_known_unimplemented_verbs_rejected_before_runtime() {
-        // B3 fix round (codex REJECT, Medium finding): propose/review/withdraw
+        // ADR-099 B3: propose/review/withdraw
         // remain on ATOMIC_ADMISSIBLE_VERBS (ADR-099 D3 intends them to gain a
         // seam) but must be rejected at this SAME static pre-runtime guard —
         // not admitted here and only failed later inside

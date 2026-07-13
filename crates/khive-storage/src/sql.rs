@@ -52,7 +52,7 @@ pub trait SqlWriter: SqlReader + Send + 'static {
     async fn execute_script(&mut self, script: String) -> StorageResult<()>;
 
     /// Execute a raw SQL script that MUST run outside any open transaction
-    /// (ADR-067 Component A, Fork C slice 2 round 2, BLOCKER A) — e.g.
+    /// (ADR-067 Component A, Fork C slice 2) — e.g.
     /// `VACUUM`, which SQLite rejects if issued inside `BEGIN`/`COMMIT`.
     ///
     /// Default implementation delegates to [`Self::execute_script`]: every

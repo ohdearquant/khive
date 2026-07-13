@@ -41,7 +41,7 @@ async fn promote_namespace(brain: &BrainPack, rt: &KhiveRuntime, namespace: &str
 /// The registry's default namespace is "local"; the hook must create a cold bucket
 /// for "local" and apply the signal there.
 ///
-/// Round-3 strengthening: after firing the hook signal, the namespace is promoted
+/// Additionally: after firing the hook signal, the namespace is promoted
 /// via the production `brain.dispatch("brain.profiles", …)` path.
 /// The signal must survive into the active state.
 #[tokio::test]
@@ -89,7 +89,7 @@ async fn dispatch_hook_fires_on_cold_namespace_no_prior_activation() {
 /// "ns-beta".  After 2 + 3 dispatches the cold buckets must hold 2 and 3
 /// respectively.
 ///
-/// Round-3 strengthening: after recording, both namespaces are promoted via
+/// Additionally: after recording, both namespaces are promoted via
 /// the production dispatch path and the totals must survive into each
 /// respective active snapshot.
 #[tokio::test]
@@ -333,7 +333,7 @@ async fn cold_hook_signal_applies_on_top_of_persisted_snapshot() {
 /// rejected the feedback loop's own recalled targets — exactly shared
 /// feedback-discipline breakage this fixes.
 ///
-/// This reverses the earlier "Finding 3" primary-only behavior, which cited
+/// This reverses the earlier primary-only behavior, which cited
 /// ADR-007 for a rule the document does not contain (the word "feedback" never
 /// appears in ADR-007; lines 213-221 are the dispatch-boundary token-minting
 /// paragraph, unrelated to targeting foreign records).

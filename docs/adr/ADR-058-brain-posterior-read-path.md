@@ -785,7 +785,7 @@ See §Binding semantics above for rationale.
 
 ### Q4 — Open: knowledge pack read-path scope
 
-**Internal review flagged this independently.** The `knowledge.compose` verb also lacks read-path
+**This gap was flagged independently during review.** The `knowledge.compose` verb also lacks read-path
 wiring: it routes feedback through `brain.resolve(consumer_kind="recall")`
 (`crates/khive-pack-knowledge/src/handlers.rs:362-403`) — **note: as of the 2026-07-03 amendment
 above, this is a known gap, not a correct baseline; it should resolve against

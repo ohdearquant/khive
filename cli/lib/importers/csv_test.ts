@@ -134,7 +134,7 @@ LoRA,concept,Low-rank adaptation
   assertEquals(r.entities[0].properties["description"], undefined);
 });
 
-// ─── CSV quoted-field regression tests (Medium finding from codex round 2) ───
+// ─── CSV quoted-field regression tests ───
 
 Deno.test("adaptCsv — leading-space before opening quote is stripped correctly", () => {
   // A common export artefact: `, "Quoted value"` where a space precedes the quote.

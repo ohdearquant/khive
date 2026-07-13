@@ -280,7 +280,7 @@ async fn test_neighbors_outbound() {
     assert!(!neighbor_ids.contains(&d));
 }
 
-/// Regression guard (ADR-089 context-verb review, internal review round 1, High-1): a
+/// Regression guard (ADR-089 context-verb review): a
 /// `limit` narrower than the neighbor set must keep the highest-weight edges,
 /// not an arbitrary SQLite row-order subset. Before the fix, `neighbors()`
 /// applied `LIMIT` with no `ORDER BY`, so a low-weight neighbor could win over
@@ -583,7 +583,7 @@ async fn test_neighbors_both_directions_halves_storage_query_count() {
     );
 }
 
-/// Reciprocal equal-weight determinism (internal review round 2, High): a
+/// Reciprocal equal-weight determinism: a
 /// node with an Out edge to a neighbor and an In edge from the SAME neighbor
 /// at the SAME weight ties on `(weight, node_id)` — the pre-fix `ORDER BY`.
 /// Under a tight `limit`, the surviving row must be picked by a deterministic
@@ -2662,7 +2662,7 @@ async fn traverse_max_depth_over_i64max_rejected() {
 /// the `KHIVE_WRITE_QUEUE` env var — that env var is process-global and this
 /// crate's other tests are NOT `#[serial]` against it, so a window where it
 /// is set here could leak into a concurrently-scheduled test's own pool
-/// construction (ADR-067 Fork C slice 2 round 2, LOW finding).
+/// construction (ADR-067 Component A).
 #[tokio::test]
 async fn upsert_edges_routes_through_writer_task_when_flag_enabled() {
     let dir = tempfile::tempdir().unwrap();
@@ -2981,7 +2981,7 @@ async fn upsert_edges_guarded_writes_nothing_when_one_endpoint_vanishes() {
     }
 }
 
-/// Round-4/-5 codex Medium: on the flag-off, file-backed singleton fallback
+/// On the flag-off, file-backed singleton fallback
 /// (`SqlGraphStore::with_writer`'s `is_file_backed` branch, no `WriterTask`),
 /// `upsert_edge_guarded` must run its guarded `INSERT` and, when refused,
 /// the missing-endpoint probe inside ONE `BEGIN IMMEDIATE` transaction —
@@ -2989,10 +2989,10 @@ async fn upsert_edges_guarded_writes_nothing_when_one_endpoint_vanishes() {
 /// interleave between, recreating the endpoint after the insert was
 /// refused but before the probe explains why.
 ///
-/// Round-5 sabotage-verified that a purely timing-based version of this
+/// Sabotage-verified that a purely timing-based version of this
 /// test (sleeps guessing when the guarded call was "probably" parked on
-/// the write lock, then "probably" holding it) still passed with the
-/// round-5 transaction wrapping removed: a refused, zero-row `INSERT`
+/// the write lock, then "probably" holding it) still passed with
+/// the transaction wrapping removed: a refused, zero-row `INSERT`
 /// autocommits — and so releases the write lock — before the guarded
 /// call's Rust code even returns from it, and the probe that follows is a
 /// plain `SELECT`, which never blocks on a writer in WAL mode. The two
