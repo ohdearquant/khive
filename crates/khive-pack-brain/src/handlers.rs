@@ -2317,10 +2317,10 @@ fn parse_rfc3339_micros(field: &'static str, value: &str) -> Result<i64, Runtime
 /// Checks two paths, phase-payload first:
 /// 1. `payload.work_class` — the shape `PhaseStarted`/`PhaseCompleted`/`PhaseCancelled`
 ///    events use today (`khive_storage::telemetry::{PhaseStartedPayload, ...}`).
-/// 2. `payload.resource.work_class` — the not-yet-emitted shape a generic audit row would
-///    use once ADR-103 Stage 1's "resource payload enrichment" lands `work_class` on
-///    non-phase events too. No producer writes this today; the fallback exists so this
-///    verb does not need a second change when one starts.
+/// 2. `payload.resource.work_class` — the shape successful-dispatch audit rows write:
+///    `khive_runtime::cost_unit` constructs the resource object with `work_class` and the
+///    runtime persists it on successful audit rows. Phase payloads keep precedence when
+///    both paths are present.
 ///
 /// Returns `None` (silently excluded from the split, not an error) when neither path is
 /// present — the overwhelming majority of event kinds today.
