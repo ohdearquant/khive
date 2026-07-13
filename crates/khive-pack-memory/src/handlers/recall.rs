@@ -966,8 +966,17 @@ async fn emit_recall_executed_event(
     result_count: usize,
     latency_us: i64,
 ) {
-    let Ok(store) = rt.events(token) else {
-        return;
+    let store = match rt.events(token) {
+        Ok(store) => store,
+        Err(err) => {
+            tracing::warn!(
+                error = %err,
+                namespace = token.namespace().as_str(),
+                event_kind = "recall_executed",
+                "recall_executed event store acquisition failed; recall result is unaffected"
+            );
+            return;
+        }
     };
     let payload = json!({
         "actor": actor,
@@ -996,7 +1005,7 @@ async fn emit_recall_executed_event(
 #[cfg(test)]
 mod tests {
     use std::collections::{HashMap, HashSet};
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex as StdMutex};
 
     use async_trait::async_trait;
     use khive_pack_kg::KgPack;
@@ -1005,9 +1014,63 @@ mod tests {
     use lattice_embed::{EmbedError, EmbeddingModel, EmbeddingService};
     use serde_json::Value;
     use serial_test::serial;
+    use tracing::field::{Field, Visit};
     use uuid::Uuid;
 
     use crate::MemoryPack;
+
+    #[derive(Clone, Debug, Default)]
+    struct CapturedWarning {
+        fields: HashMap<String, String>,
+    }
+
+    #[derive(Default)]
+    struct WarningVisitor(CapturedWarning);
+
+    impl Visit for WarningVisitor {
+        fn record_str(&mut self, field: &Field, value: &str) {
+            self.0
+                .fields
+                .insert(field.name().to_string(), value.to_string());
+        }
+
+        fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+            self.0.fields.insert(
+                field.name().to_string(),
+                format!("{value:?}").trim_matches('"').to_string(),
+            );
+        }
+    }
+
+    struct WarningCapture {
+        warnings: Arc<StdMutex<Vec<CapturedWarning>>>,
+    }
+
+    impl tracing::Subscriber for WarningCapture {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+
+        fn event(&self, event: &tracing::Event<'_>) {
+            if *event.metadata().level() == tracing::Level::WARN {
+                let mut visitor = WarningVisitor::default();
+                event.record(&mut visitor);
+                self.warnings.lock().unwrap().push(visitor.0);
+            }
+        }
+
+        fn enter(&self, _: &tracing::span::Id) {}
+
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
 
     /// #388 regression (sanitizer path): `sanitize_fts5_query` (khive-db) strips
     /// `$`, so this query no longer reaches the runtime-level fail-open `Err` arm
@@ -1599,7 +1662,7 @@ mod tests {
         );
 
         // The ledger append is fired via track_background_task off the response
-        // path — poll briefly rather than assume it has landed by the time recall returns.
+        // path, so poll briefly rather than assume it has landed by the time recall returns.
         let target_id = note_id.id.to_string();
         let mut found = false;
         for _ in 0..100 {
@@ -1679,7 +1742,7 @@ mod tests {
         assert!(!hits.is_empty(), "must find the seeded note");
 
         // The emission is fired via track_background_task off the response
-        // path (same seam as the serve-ledger append) — poll briefly rather
+        // path (same seam as the serve-ledger append), so poll briefly rather
         // than assume it has landed by the time recall returns.
         let store = rt.events(&token).expect("event store for local namespace");
         let mut recall_events = Vec::new();
@@ -1870,6 +1933,99 @@ mod tests {
             "a failed recall must not emit any recall_executed event, got: {:?}",
             page.items
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[serial(background_tasks)]
+    async fn recall_event_store_acquisition_failure_warns_without_failing_response() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let db_path = tmp.path().join("khive.db");
+        let backend = Arc::new(khive_db::StorageBackend::sqlite(&db_path).expect("backend"));
+        {
+            let mut writer = backend.pool().writer().expect("migration writer");
+            khive_db::run_migrations(writer.conn_mut()).expect("migrations");
+        }
+        let config = khive_runtime::RuntimeConfig {
+            db_path: Some(db_path),
+            embedding_model: None,
+            additional_embedding_models: vec![],
+            packs: vec!["kg".to_string(), "memory".to_string(), "brain".to_string()],
+            ..khive_runtime::RuntimeConfig::default()
+        };
+        let rt = KhiveRuntime::from_backend(Arc::clone(&backend), config);
+        let ns = Namespace::parse("local").expect("local namespace");
+        let token = rt.authorize(ns.clone()).expect("authorize local");
+
+        rt.create_note(
+            &token,
+            "memory",
+            None,
+            "event acquisition failure recall note",
+            Some(0.7),
+            None,
+            vec![],
+        )
+        .await
+        .expect("create note");
+
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(KgPack::new(rt.clone()));
+        builder.register(MemoryPack::new(rt.clone()));
+        builder.register(khive_pack_brain::BrainPack::new(rt.clone()));
+        let registry = builder.build().expect("registry");
+
+        {
+            let writer = backend.pool().writer().expect("fault injection writer");
+            writer
+                .conn()
+                .execute_batch("DROP TABLE events; PRAGMA query_only = ON;")
+                .expect("remove only the event schema and reject its recreation");
+        }
+
+        let warnings = Arc::new(StdMutex::new(Vec::new()));
+        let _capture = tracing::subscriber::set_default(WarningCapture {
+            warnings: Arc::clone(&warnings),
+        });
+
+        let result = registry
+            .dispatch(
+                "memory.recall",
+                serde_json::json!({
+                    "namespace": ns.as_str(),
+                    "query": "event acquisition failure recall note",
+                    "limit": 10
+                }),
+            )
+            .await
+            .expect("event-store acquisition failure must not fail memory.recall");
+        assert!(!result.as_array().expect("bare array result").is_empty());
+
+        let warning = loop {
+            if let Some(warning) = warnings.lock().unwrap().iter().find(|warning| {
+                warning.fields.get("message").map(String::as_str)
+                    == Some("recall_executed event store acquisition failed; recall result is unaffected")
+            }).cloned() {
+                break warning;
+            }
+            assert!(
+                khive_runtime::background_task_count() > 0,
+                "background task completed without an observable acquisition warning"
+            );
+            tokio::task::yield_now().await;
+        };
+
+        assert_eq!(
+            warning.fields.get("namespace").map(String::as_str),
+            Some("local")
+        );
+        assert_eq!(
+            warning.fields.get("event_kind").map(String::as_str),
+            Some("recall_executed")
+        );
+        assert!(warning
+            .fields
+            .get("error")
+            .is_some_and(|error| !error.is_empty()));
     }
 
     // `#[serial(background_tasks)]`: see the note on
