@@ -982,6 +982,7 @@ async fn upsert_entities(
                 deleted_at: None,
                 merge_event_id: None,
                 merged_into: None,
+                content_ref: None,
             };
             // Use the canonical FTS document constructor so sync, create, update,
             // merge, and reindex all produce identical document shapes.
@@ -2493,6 +2494,7 @@ mod tests {
             deleted_at: None,
             merge_event_id: None,
             merged_into: None,
+            content_ref: None,
         };
 
         let doc = entity_fts_document(&entity);

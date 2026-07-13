@@ -41,6 +41,7 @@ fn make_entity(namespace: &str, kind: &str, name: &str) -> Entity {
         deleted_at: None,
         merged_into: None,
         merge_event_id: None,
+        content_ref: None,
     }
 }
 
@@ -746,6 +747,7 @@ async fn test_same_id_upsert_replaces_row() {
         deleted_at: None,
         merged_into: None,
         merge_event_id: None,
+        content_ref: None,
     };
     store.upsert_entity(entity_a).await.unwrap();
 
@@ -769,6 +771,7 @@ async fn test_same_id_upsert_replaces_row() {
         deleted_at: None,
         merged_into: None,
         merge_event_id: None,
+        content_ref: None,
     };
     store.upsert_entity(entity_b).await.unwrap();
 
@@ -1208,4 +1211,66 @@ async fn upsert_entity_routes_through_writer_task_when_flag_enabled() {
         "entity must be committed and readable after queuing behind the occupier"
     );
     assert_eq!(fetched.unwrap().name, "RoPE");
+}
+
+// ── content_ref (khive#292) ─────────────────────────────────────────────────
+
+#[tokio::test]
+async fn test_content_ref_roundtrip() {
+    let store = setup_memory_store();
+
+    let digest = "a".repeat(64);
+    let entity = Entity::new("default", "document", "SourcePdf").with_content_ref(digest.clone());
+    let id = entity.id;
+
+    store.upsert_entity(entity).await.unwrap();
+
+    let fetched = store.get_entity(id).await.unwrap().unwrap();
+    assert_eq!(fetched.content_ref, Some(digest));
+}
+
+#[tokio::test]
+async fn test_content_ref_defaults_to_none() {
+    let store = setup_memory_store();
+
+    let entity = Entity::new("default", "concept", "NoBlob");
+    let id = entity.id;
+    store.upsert_entity(entity).await.unwrap();
+
+    let fetched = store.get_entity(id).await.unwrap().unwrap();
+    assert_eq!(fetched.content_ref, None);
+}
+
+#[tokio::test]
+async fn test_content_ref_survives_query_entities() {
+    let store = setup_memory_store_ns("blob_ns");
+    let digest = "b".repeat(64);
+    let entity = Entity::new("blob_ns", "document", "QueriedPdf").with_content_ref(digest.clone());
+    store.upsert_entity(entity).await.unwrap();
+
+    let page = store
+        .query_entities("blob_ns", EntityFilter::default(), PageRequest::default())
+        .await
+        .unwrap();
+    assert_eq!(page.items.len(), 1);
+    assert_eq!(page.items[0].content_ref, Some(digest));
+}
+
+#[tokio::test]
+async fn test_content_ref_survives_batch_upsert() {
+    let store = setup_memory_store();
+    let digest = "c".repeat(64);
+    let entities = vec![
+        Entity::new("default", "document", "Batch1").with_content_ref(digest.clone()),
+        Entity::new("default", "document", "Batch2"),
+    ];
+    let ids: Vec<Uuid> = entities.iter().map(|e| e.id).collect();
+
+    let summary = store.upsert_entities(entities).await.unwrap();
+    assert_eq!(summary.affected, 2);
+
+    let with_ref = store.get_entity(ids[0]).await.unwrap().unwrap();
+    assert_eq!(with_ref.content_ref, Some(digest));
+    let without_ref = store.get_entity(ids[1]).await.unwrap().unwrap();
+    assert_eq!(without_ref.content_ref, None);
 }

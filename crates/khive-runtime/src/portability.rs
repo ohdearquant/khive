@@ -224,6 +224,7 @@ impl KhiveRuntime {
                 deleted_at: None,
                 merged_into: None,
                 merge_event_id: None,
+                content_ref: None,
             };
             store.upsert_entity(entity.clone()).await?;
             // Reindex so imported entities are searchable via hybrid_search immediately.

@@ -131,6 +131,7 @@ For historical context, see [v0 archive](../_archive/adr_v0/README.md). v0 ADRs 
 | [ADR-108](ADR-108-git-write-surface.md)                      | Git Write Surface Through khive (Phase B)                                                             |
 | [ADR-109](ADR-109-sandboxed-kkernel-gateway.md)              | Sandboxed kkernel Gateway for Untrusted Execution (Phase C)                                           |
 | [ADR-110](ADR-110-vamana-wasm.md)                            | WebAssembly Support for khive-vamana                                                                  |
+| [ADR-111](ADR-111-blob-store.md)                             | BlobStore — Content-Addressed Binary Object Storage                                                   |
 
 ## Closed Taxonomies — Quick Reference
 

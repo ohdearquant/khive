@@ -13,7 +13,7 @@ use rusqlite::OptionalExtension;
 use crate::error::SqliteError;
 use crate::pool::{ConnectionPool, PoolConfig};
 use crate::sql_bridge::SqlBridge;
-use crate::stores::{entity, event, graph, note, sparse, text, vectors};
+use crate::stores::{blob, entity, event, graph, note, sparse, text, vectors};
 
 /// Concrete storage backend providing capability traits.
 pub struct StorageBackend {
@@ -574,6 +574,23 @@ impl StorageBackend {
         )))
     }
 
+    /// Get a `BlobStore` rooted per khive#292's precedence chain:
+    /// `KHIVE_BLOB_ROOT` env var > `config_root` (a caller-resolved
+    /// `khive.toml` override — `khive-db` has no TOML parser of its own) >
+    /// beside this backend's database directory. `floor_bytes` overrides the
+    /// default 100 GB fail-closed free-space floor (`None` keeps the
+    /// default). Errors if none of the three roots apply — e.g. an in-memory
+    /// backend with no override and no env var has nowhere to default to.
+    pub fn blob_store(
+        &self,
+        config_root: Option<&Path>,
+        floor_bytes: Option<u64>,
+    ) -> Result<Arc<dyn khive_storage::BlobStore>, SqliteError> {
+        let root = blob::resolve_blob_root(self.data_dir().as_deref(), config_root)?;
+        let floor = floor_bytes.unwrap_or(blob::FsBlobStore::DEFAULT_FLOOR_BYTES);
+        Ok(Arc::new(blob::FsBlobStore::new(root, floor)?))
+    }
+
     /// Is this a file-backed backend?
     pub fn is_file_backed(&self) -> bool {
         self.is_file_backed
@@ -1014,6 +1031,51 @@ mod tests {
             result.is_err(),
             "upsert_document on a read-only backend must reject, not silently no-op"
         );
+    }
+
+    #[tokio::test]
+    async fn blob_store_roundtrip_via_public_api() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("blob_backend.db");
+        let backend = StorageBackend::sqlite(&path).unwrap();
+
+        // Explicit floor_bytes=0, not the default 100GB — the free space on
+        // whatever volume runs this test is not this test's concern (and a
+        // dev machine or CI runner legitimately may not clear 100GB free).
+        let store = backend.blob_store(None, Some(0)).unwrap();
+        let bytes = b"backend-level blob roundtrip".to_vec();
+        let content_ref = store.put(bytes.clone()).await.unwrap();
+        assert_eq!(store.get(&content_ref).await.unwrap(), bytes);
+    }
+
+    #[test]
+    fn blob_store_defaults_root_beside_db_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("blob_default.db");
+        let backend = StorageBackend::sqlite(&path).unwrap();
+
+        // `blob_store` creates the root directory eagerly (`FsBlobStore::new`),
+        // so its existence at the expected default path is directly
+        // observable without reaching into the trait object.
+        let _store = backend.blob_store(None, None).unwrap();
+        assert!(
+            dir.path().join("blobs").is_dir(),
+            "default root must be created beside the database file"
+        );
+    }
+
+    #[test]
+    fn blob_store_errors_for_in_memory_backend_with_no_override() {
+        let backend = StorageBackend::memory().unwrap();
+        assert!(backend.blob_store(None, None).is_err());
+    }
+
+    #[test]
+    fn blob_store_accepts_explicit_root_for_in_memory_backend() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = StorageBackend::memory().unwrap();
+        let store = backend.blob_store(Some(dir.path()), None);
+        assert!(store.is_ok());
     }
 
     #[test]
