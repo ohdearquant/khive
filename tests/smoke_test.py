@@ -1179,7 +1179,7 @@ def schedule_smoke():
 
     schedule.remind requires the registered comm.send delivery capability at
     creation time (khive-pack-schedule/README.md "Usage"; khive-pack-comm/README.md
-    "Architecture"): the schedule pack itself only requires kg, but remind
+    "Where this sits"): the schedule pack itself only requires kg, but remind
     specifically fails fast without comm loaded. Verify both sides of that
     contract -- the loud rejection with kg+schedule only, and the happy path
     with kg+comm+schedule.
