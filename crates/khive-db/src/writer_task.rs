@@ -420,6 +420,7 @@ async fn run_writer_task(
 mod tests {
     use super::*;
     use crate::pool::PoolConfig;
+    use serial_test::serial;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
     use std::time::Duration;
@@ -432,7 +433,14 @@ mod tests {
         ConnectionPool::new(cfg).expect("pool open")
     }
 
+    // `#[serial(tx_registry)]`: `run_writer_task` registers a `writer_task_tx`
+    // handle in the process-wide `tx_registry` singleton for the life of each
+    // `BEGIN IMMEDIATE`. Tests that observe the registry (the checkpoint
+    // `tx_age_sweep_*` group) read `tx_registry::oldest()`; an un-serialized
+    // spawning test here would leak a longer-lived `writer_task_tx` into that
+    // read and make the sweep name the wrong transaction. Share the key.
     #[tokio::test]
+    #[serial(tx_registry)]
     async fn begin_immediate_failure_replies_error_without_running_op() {
         // Real lock contention, not a simulation: hold the database-level
         // write lock from the pool's own writer connection (the unmigrated
@@ -504,7 +512,11 @@ mod tests {
         );
     }
 
+    // `#[serial(tx_registry)]`: shares the key with the checkpoint
+    // `tx_age_sweep_*` tests — see the note on
+    // `begin_immediate_failure_replies_error_without_running_op`.
     #[tokio::test]
+    #[serial(tx_registry)]
     async fn writer_task_executes_op_and_commits() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("writer_task_commit.db");
@@ -627,7 +639,13 @@ mod tests {
         first.abort();
     }
 
+    // `#[serial(tx_registry)]`: this test deliberately keeps a request (and
+    // thus its `writer_task_tx` registry handle) alive past a timeout, so it is
+    // the worst polluter of the checkpoint `tx_age_sweep_*` reads if left
+    // un-serialized. Shares the key — see the note on
+    // `begin_immediate_failure_replies_error_without_running_op`.
     #[tokio::test]
+    #[serial(tx_registry)]
     async fn send_with_timeout_returns_op_result_when_op_outlives_the_timeout() {
         // `send_with_timeout`'s timeout must bound ONLY the enqueue step —
         // never the reply-wait. An accepted request (channel not full) must

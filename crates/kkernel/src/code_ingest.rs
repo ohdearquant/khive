@@ -104,6 +104,16 @@ pub async fn run_code_ingest(args: CodeIngestArgs) -> Result<()> {
 /// after validation has already succeeded and a real (non-dry-run) write is
 /// about to occur.
 async fn code_ingest_batch(args: CodeIngestArgs) -> Result<CodeIngestReport> {
+    code_ingest_batch_with_runtime_setup(args, |_| Ok(())).await
+}
+
+async fn code_ingest_batch_with_runtime_setup<F>(
+    args: CodeIngestArgs,
+    runtime_setup: F,
+) -> Result<CodeIngestReport>
+where
+    F: FnOnce(&KhiveRuntime) -> Result<()>,
+{
     let bytes = std::fs::read(&args.findings)
         .with_context(|| format!("failed to read {}", args.findings.display()))?;
 
@@ -161,6 +171,7 @@ async fn code_ingest_batch(args: CodeIngestArgs) -> Result<CodeIngestReport> {
     }
 
     let runtime = KhiveRuntime::new(cfg).map_err(|e| anyhow::anyhow!("{e}"))?;
+    runtime_setup(&runtime)?;
     let resolved_ns = runtime.config().default_namespace.clone();
     let token = runtime
         .authorize(resolved_ns)
@@ -479,9 +490,62 @@ fn wal_sidecar_path(db_path: &Path) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use async_trait::async_trait;
+    use khive_runtime::{EmbedderProvider, RuntimeError};
+    use lattice_embed::{EmbedError, EmbeddingModel, EmbeddingService};
     use serial_test::serial;
 
     use super::*;
+
+    struct FixedEmbeddingService {
+        dimensions: usize,
+    }
+
+    #[async_trait]
+    impl EmbeddingService for FixedEmbeddingService {
+        async fn embed(
+            &self,
+            texts: &[String],
+            _model: EmbeddingModel,
+        ) -> std::result::Result<Vec<Vec<f32>>, EmbedError> {
+            Ok(texts
+                .iter()
+                .map(|_| vec![1.0_f32; self.dimensions])
+                .collect())
+        }
+
+        fn supports_model(&self, _model: EmbeddingModel) -> bool {
+            true
+        }
+
+        fn name(&self) -> &'static str {
+            "code-ingest-test"
+        }
+    }
+
+    struct FixedEmbeddingProvider {
+        name: String,
+        dimensions: usize,
+    }
+
+    #[async_trait]
+    impl EmbedderProvider for FixedEmbeddingProvider {
+        fn name(&self) -> &str {
+            &self.name
+        }
+
+        fn dimensions(&self) -> usize {
+            self.dimensions
+        }
+
+        async fn build(&self) -> std::result::Result<Arc<dyn EmbeddingService>, RuntimeError> {
+            Ok(Arc::new(FixedEmbeddingService {
+                dimensions: self.dimensions,
+            }))
+        }
+    }
 
     fn base_args(findings: PathBuf, db: PathBuf) -> CodeIngestArgs {
         CodeIngestArgs {
@@ -847,9 +911,20 @@ mod tests {
         let findings = write_valid_findings(tmp.path());
         let db = tmp.path().join("scratch.db");
 
-        code_ingest_batch(base_args(findings, db.clone()))
-            .await
-            .expect("ingest must succeed");
+        code_ingest_batch_with_runtime_setup(base_args(findings, db.clone()), |runtime| {
+            let model_names = runtime.registered_embedding_model_names();
+            assert!(
+                !model_names.is_empty(),
+                "test requires at least one configured embedding model"
+            );
+            for name in model_names {
+                let dimensions = runtime.resolve_embedding_model(Some(&name))?.dimensions();
+                runtime.register_embedder(FixedEmbeddingProvider { name, dimensions });
+            }
+            Ok(())
+        })
+        .await
+        .expect("ingest must succeed");
 
         let cfg = resolve_runtime_config(RuntimeConfigInputs {
             db: Some(db.to_str().expect("utf8 path")),
