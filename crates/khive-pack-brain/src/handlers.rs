@@ -70,8 +70,8 @@ pub(crate) static BRAIN_HANDLERS: &[HandlerDef] = &[
     },
     HandlerDef {
         name: "brain.event_counts",
-        description: "Windowed event counts grouped by kind and actor over the event plane \
-            (ADR-103 Stage 1, #724 Ask A); feedback_explicit events additionally split by \
+        description: "Windowed event counts grouped by kind, actor, and verb over the event \
+            plane (ADR-103 Stage 1, #724 Ask A); feedback_explicit events additionally split by \
             served_by_profile_id; events carrying a work_class (today: phase_started / \
             phase_completed / phase_cancelled payloads, checked before any future \
             payload.resource.work_class) split by counts_by_work_class. cost_unit is not \
@@ -96,7 +96,10 @@ pub(crate) static BRAIN_HANDLERS: &[HandlerDef] = &[
                 name: "actor",
                 param_type: "string",
                 required: false,
-                description: "Filter to a single actor (e.g. \"lambda:khive\"). Omit for all actors.",
+                description: "Filter to a single actor. Stored actor strings are prefixed \
+                    (e.g. \"actor:lambda:khive\"); pass either the bare seat form \
+                    (\"lambda:khive\") or the stored prefixed form — both match. Omit for all \
+                    actors.",
             },
             khive_types::ParamDef {
                 name: "kind",
@@ -667,8 +670,8 @@ impl BrainPack {
 
     // ── brain.event_counts ──────────────────────────────────────────────────
     //
-    // ADR-103 Stage 1 (#724 Ask A): a windowed, per-actor, per-kind read verb
-    // over the event plane, additionally surfacing `work_class`
+    // ADR-103 Stage 1 (#724 Ask A): a windowed, per-actor, per-kind, per-verb
+    // read verb over the event plane, additionally surfacing `work_class`
     // (ADR-103-resource-attribution-model.md:303) via `counts_by_work_class`.
     // `work_class` is read from `payload.work_class` first — the shape the
     // three Phase* events (`PhaseStarted`/`PhaseCompleted`/`PhaseCancelled`,
@@ -698,8 +701,8 @@ impl BrainPack {
     /// Cap on events aggregated by a single `brain.event_counts` window query.
     /// `EventStore` has no SQL-side grouped-count primitive today (`count_events`
     /// returns one scalar per filter, not a GROUP BY), so this verb fetches a
-    /// bounded page via `query_events` and aggregates by kind/actor/profile in
-    /// the handler. A window wider than this cap still returns counts up to the
+    /// bounded page via `query_events` and aggregates by kind/actor/verb/profile
+    /// in the handler. A window wider than this cap still returns counts up to the
     /// cap and sets `truncated: true` plus the true `window_event_total` rather
     /// than silently reporting a partial total as complete. At current event
     /// volumes this bound is not expected to bind in practice; widening the
@@ -747,9 +750,20 @@ impl BrainPack {
             None => None,
         };
 
+        // Stored actor strings are prefixed (`actor:<kind>:<id>`). Callers naturally pass the
+        // bare seat form (e.g. "lambda:khive"), which would silently match nothing against an
+        // exact-match filter. Match either spelling by expanding the filter to both forms —
+        // `EventFilter.actors` is an IN-list, so this is a pure OR, never a guess. A caller who
+        // already passes the stored `actor:`-prefixed form keeps exact-match behavior.
+        let actor_filters: Vec<String> = match p.actor.as_deref() {
+            Some(a) if a.starts_with("actor:") => vec![a.to_string()],
+            Some(a) => vec![a.to_string(), format!("actor:{a}")],
+            None => Vec::new(),
+        };
+
         let store = self.runtime.events(token)?;
         let filter = EventFilter {
-            actors: p.actor.iter().cloned().collect(),
+            actors: actor_filters,
             kinds: kind_filter.into_iter().collect(),
             // Half-open window [since, until): `EventFilter.after` is a strict
             // `created_at > after`, so subtracting one microsecond from `since`
@@ -778,6 +792,8 @@ impl BrainPack {
             std::collections::BTreeMap::new();
         let mut counts_by_actor: std::collections::BTreeMap<String, u64> =
             std::collections::BTreeMap::new();
+        let mut counts_by_verb: std::collections::BTreeMap<String, u64> =
+            std::collections::BTreeMap::new();
         let mut by_profile: std::collections::BTreeMap<String, u64> =
             std::collections::BTreeMap::new();
         let mut counts_by_work_class: std::collections::BTreeMap<String, u64> =
@@ -788,6 +804,7 @@ impl BrainPack {
                 .entry(event.kind.name().to_string())
                 .or_insert(0) += 1;
             *counts_by_actor.entry(event.actor.clone()).or_insert(0) += 1;
+            *counts_by_verb.entry(event.verb.clone()).or_insert(0) += 1;
             if event.kind == khive_types::EventKind::FeedbackExplicit {
                 let profile = event
                     .payload
@@ -812,6 +829,7 @@ impl BrainPack {
             "total": page.items.len() as u64,
             "counts_by_kind": counts_by_kind,
             "counts_by_actor": counts_by_actor,
+            "counts_by_verb": counts_by_verb,
             "truncated": truncated,
             "window_event_total": window_event_total,
         });
