@@ -697,7 +697,7 @@ fn build_metrics_snapshot<D: DaemonDispatch>(dispatcher: &D) -> MetricsSnapshot 
     let open_tx_count = khive_storage::tx_registry::snapshot().len();
     let (oldest_pinned_tx_micros, oldest_pinned_tx_label) =
         match khive_storage::tx_registry::oldest() {
-            Some((age, label)) => (Some(age.as_micros() as u64), label),
+            Some((_id, age, label)) => (Some(age.as_micros() as u64), label),
             None => (None, None),
         };
 

@@ -13,8 +13,16 @@ use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
 /// Identifier for one registered transaction span.
+///
+/// The wrapped value is public so consumers of [`oldest`] can detect when the
+/// registry's oldest entry has *changed identity* between two observations —
+/// distinct from "is it still above a threshold" — without needing a live
+/// registration of their own (e.g. `khive-db`'s `TxAgeSweepState` pure
+/// state-machine unit tests construct synthetic ids directly). Equality is
+/// the only operation this type supports; the numeric value carries no
+/// meaning beyond "same span" vs. "different span".
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct TxId(u64);
+pub struct TxId(pub u64);
 
 #[derive(Clone, Debug)]
 struct TxMeta {
@@ -63,19 +71,27 @@ pub fn register(label: Option<String>) -> TxHandle {
     TxHandle { id }
 }
 
-/// Age and label of the oldest currently-open registry entry, if any.
+/// Identity, age, and label of the oldest currently-open registry entry, if
+/// any.
+///
+/// The [`TxId`] lets callers distinguish "the same span is still oldest and
+/// still above a threshold" from "a *different* span became oldest between
+/// two observations" — the latter must re-arm any latched escalation state,
+/// since a departed entry's threshold-crossing history says nothing about
+/// its replacement (`khive-db`'s `TxAgeSweepState` is the consumer this
+/// exists for).
 ///
 /// Recovers a poisoned lock via `into_inner()` (see [`register`]) instead of
 /// returning `None`, which would otherwise read identically to "no open
 /// transactions" — indistinguishable from the genuinely-empty case.
-pub fn oldest() -> Option<(Duration, Option<String>)> {
+pub fn oldest() -> Option<(TxId, Duration, Option<String>)> {
     let registry = REGISTRY
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     registry
-        .values()
-        .min_by_key(|meta| meta.opened_at)
-        .map(|meta| (meta.opened_at.elapsed(), meta.label.clone()))
+        .iter()
+        .min_by_key(|(_, meta)| meta.opened_at)
+        .map(|(id, meta)| (*id, meta.opened_at.elapsed(), meta.label.clone()))
 }
 
 /// Age and label of every currently-open registry entry.
@@ -108,7 +124,7 @@ mod tests {
     fn register_reports_oldest_with_label() {
         let _guard = TEST_LOCK.lock().unwrap();
         let handle = register(Some("test_span".to_string()));
-        let (_, label) = oldest().expect("expected an open entry");
+        let (_, _, label) = oldest().expect("expected an open entry");
         assert_eq!(label.as_deref(), Some("test_span"));
         drop(handle);
     }
@@ -134,11 +150,15 @@ mod tests {
         let first = register(Some("first".to_string()));
         std::thread::sleep(Duration::from_millis(5));
         let second = register(Some("second".to_string()));
-        let (_, label) = oldest().expect("expected an open entry");
+        let (first_id, _, label) = oldest().expect("expected an open entry");
         assert_eq!(label.as_deref(), Some("first"));
         drop(first);
-        let (_, label) = oldest().expect("expected an open entry");
+        let (second_id, _, label) = oldest().expect("expected an open entry");
         assert_eq!(label.as_deref(), Some("second"));
+        assert_ne!(
+            first_id, second_id,
+            "distinct registrations must carry distinct TxIds"
+        );
         drop(second);
     }
 
