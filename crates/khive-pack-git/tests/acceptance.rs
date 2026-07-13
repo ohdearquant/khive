@@ -17,8 +17,8 @@ use khive_pack_git::ingest::{run_ingest, IngestOptions};
 use khive_pack_git::GitPack;
 use khive_pack_kg::KgPack;
 use khive_runtime::{
-    AllowAllGate, BackendId, EmbedderProvider, KhiveRuntime, Namespace, NamespaceToken,
-    RuntimeConfig, RuntimeResult, VerbRegistry, VerbRegistryBuilder,
+    AllowAllGate, BackendId, EmbedderProvider, EntityCreateSpec, KhiveRuntime, Namespace,
+    NamespaceToken, RuntimeConfig, RuntimeResult, VerbRegistry, VerbRegistryBuilder,
 };
 use khive_storage::types::{SqlStatement, SqlValue};
 use lattice_embed::{EmbedError, EmbeddingModel, EmbeddingService};
@@ -115,6 +115,12 @@ async fn fixture() -> (KhiveRuntime, NamespaceToken, VerbRegistry) {
     builder.register(GitPack::new(rt.clone()));
     let registry = builder.build().expect("registry builds");
     rt.install_edge_rules(registry.all_edge_rules());
+    // Mirrors the production boot sequence (`serve.rs`): without this call,
+    // `KhiveRuntime`'s pack-installed entity-type validator (the
+    // `create_many` defense-in-depth layer) is never wired, so a test built
+    // on a fixture that skips it would still pass even if that runtime-layer
+    // aggregate were absent or builtin-only (PR #925 codex r1, M3).
+    registry.call_register_entity_type_validators(&rt);
     registry.apply_schema_plans(rt.backend());
     let token = rt.authorize(Namespace::local()).expect("authorize local");
     (rt, token, registry)
@@ -3919,5 +3925,41 @@ async fn adr_entity_type_rejected_without_git_pack_loaded() {
     assert!(
         err.to_string().contains("adr"),
         "error must name the rejected value: {err}"
+    );
+}
+
+/// Pins the RUNTIME-layer validator, not just the handler-layer check above.
+///
+/// `fixture()` now runs the same `call_register_entity_type_validators` boot
+/// step production runs in `serve.rs` before the first dispatch. This test
+/// calls `KhiveRuntime::create_many` directly (the defense-in-depth path for
+/// Rust callers that bypass the `create` verb handler) and would fail if the
+/// boot-time composed aggregate were ever absent or builtin-only — the gap
+/// PR #925 codex r1 (M3) flagged: the handler-layer test above would stay
+/// green even if that wiring were silently dropped, since it never exercises
+/// `create_many` directly.
+#[tokio::test]
+async fn git_pack_adr_entity_type_validates_through_runtime_create_many() {
+    let (rt, token, _registry) = fixture().await;
+
+    let created = rt
+        .create_many(
+            &token,
+            vec![EntityCreateSpec {
+                kind: "document".to_string(),
+                entity_type: Some("adr".to_string()),
+                name: "ADR-003: runtime layer".to_string(),
+                description: None,
+                properties: None,
+                tags: vec![],
+            }],
+        )
+        .await
+        .expect("runtime-layer create_many must accept the git-pack-declared adr subtype");
+    assert_eq!(created.len(), 1, "{created:?}");
+    assert_eq!(
+        created[0].entity_type.as_deref(),
+        Some("adr"),
+        "{created:?}"
     );
 }

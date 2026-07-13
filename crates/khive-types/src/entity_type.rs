@@ -467,6 +467,62 @@ impl EntityTypeRegistry {
         Self::new(defs)
     }
 
+    /// Boot-time collision check across the composed registry `with_extra`
+    /// builds: built-in defs plus every caller-supplied `(owner, def)` extra.
+    ///
+    /// `new`/`register` populate a single kind-qualified lookup keyspace
+    /// (`"{kind}:{canonical_name}"` and `"{kind}:{alias}"`) with a hard
+    /// `insert` — the later write silently wins. Two independently loaded
+    /// owners can therefore disagree on what a given key resolves to, and
+    /// the winner depends on registration order. ADR-001's registry-ownership
+    /// contract instead requires this to fail at boot: "same `(base_kind,
+    /// canonical_name)` from two different packs = boot error" and "an alias
+    /// collision = boot error." This walks the same keyspace `new`/`register`
+    /// populate and returns the first collision found, naming both
+    /// contributing owners, instead of silently picking a winner.
+    ///
+    /// `extras` is `(owner_label, def)` for pack-declared entries only — the
+    /// built-in table is checked automatically, attributed to the label
+    /// `"builtin"`.
+    pub fn check_extra_collisions<'a>(
+        extras: impl IntoIterator<Item = (&'a str, &'a EntityTypeDef)>,
+    ) -> Result<(), String> {
+        let mut all: Vec<(&'a str, &'a EntityTypeDef)> =
+            BUILTIN_DEFS.iter().map(|def| ("builtin", def)).collect();
+        all.extend(extras);
+
+        let mut seen: BTreeMap<String, (&'a str, &'static str)> = BTreeMap::new();
+        for (owner, def) in all {
+            let canonical_key = format!("{}:{}", def.kind.name(), def.type_name);
+            if let Some(&(first_owner, _)) = seen.get(&canonical_key) {
+                if first_owner != owner {
+                    return Err(format!(
+                        "duplicate entity_type {canonical_key:?}: claimed by both \
+                         {first_owner:?} and {owner:?}"
+                    ));
+                }
+            } else {
+                seen.insert(canonical_key, (owner, def.type_name));
+            }
+
+            for alias in def.aliases {
+                let alias_key = format!("{}:{}", def.kind.name(), alias);
+                if let Some(&(first_owner, first_type)) = seen.get(&alias_key) {
+                    if first_owner != owner || first_type != def.type_name {
+                        return Err(format!(
+                            "entity_type alias {alias_key:?}: claimed by both {first_owner:?} \
+                             (canonical {first_type:?}) and {owner:?} (canonical {:?})",
+                            def.type_name
+                        ));
+                    }
+                } else {
+                    seen.insert(alias_key, (owner, def.type_name));
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Register additional subtypes into an existing registry clone.
     pub fn register(&mut self, def: EntityTypeDef) {
         let idx = self.defs.len();

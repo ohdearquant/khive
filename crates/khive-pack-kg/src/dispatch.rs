@@ -56,7 +56,7 @@ impl PackRuntime for KgPack {
         let _ = self.runtime.embed("khive warmup").await;
     }
 
-    fn register_entity_type_validator(
+    fn register_entity_type_validator_with_types(
         &self,
         _runtime: &KhiveRuntime,
         pack_entity_types: &[khive_types::EntityTypeDef],
