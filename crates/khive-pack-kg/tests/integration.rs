@@ -10952,3 +10952,157 @@ async fn list_proposal_limit_over_cap_reports_effective_limit() {
     assert_eq!(response["effective_limit"], 500);
     assert_eq!(response["limit_clamped"], true);
 }
+
+// ── #806: `search_executed` event-plane emission ────────────────────────────
+//
+// Mirrors memory.recall's `#866` `recall_executed` regression
+// (khive-pack-memory/src/handlers/recall.rs's
+// `recall_emits_exactly_one_recall_executed_event`): `search` must append
+// exactly one `SearchExecuted` event per served search, off the response
+// path via `track_background_task`, so poll briefly instead of assuming it
+// has landed by the time `search` returns.
+
+async fn poll_search_executed_events(
+    store: &std::sync::Arc<dyn khive_storage::EventStore>,
+) -> Vec<khive_storage::Event> {
+    for _ in 0..100 {
+        let page = store
+            .query_events(
+                khive_storage::EventFilter {
+                    kinds: vec![khive_types::EventKind::SearchExecuted],
+                    ..Default::default()
+                },
+                khive_storage::types::PageRequest {
+                    limit: 50,
+                    offset: 0,
+                },
+            )
+            .await
+            .expect("query_events");
+        if !page.items.is_empty() {
+            return page.items;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    Vec::new()
+}
+
+#[tokio::test]
+async fn search_entity_emits_exactly_one_search_executed_event() {
+    let rt = KhiveRuntime::memory().expect("in-memory runtime must succeed");
+    let ns = Namespace::local();
+    let token = rt.authorize(ns.clone()).expect("authorize local");
+
+    rt.create_entity(
+        &token,
+        "concept",
+        None,
+        "806 search executed entity",
+        None,
+        None,
+        vec![],
+    )
+    .await
+    .expect("create entity");
+
+    let mut builder = VerbRegistryBuilder::new();
+    builder.register(KgPack::new(rt.clone()));
+    let registry = builder.build().expect("registry builds");
+
+    let result = registry
+        .dispatch(
+            "search",
+            json!({"kind": "entity", "query": "806 search executed entity"}),
+        )
+        .await
+        .expect("search must succeed");
+    let hits = result.as_array().expect("bare array result");
+    assert!(!hits.is_empty(), "must find the seeded entity");
+
+    let store = rt.events(&token).expect("event store for local namespace");
+    let search_events = poll_search_executed_events(&store).await;
+
+    assert_eq!(
+        search_events.len(),
+        1,
+        "exactly one search_executed event per served search, got: {search_events:?}"
+    );
+    let event = &search_events[0];
+    assert_eq!(event.kind, khive_types::EventKind::SearchExecuted);
+    assert_eq!(event.verb, "search");
+    assert_eq!(event.payload["result_kind"], json!("entity"));
+    assert_eq!(event.payload["result_count"], json!(hits.len()));
+    assert_eq!(event.payload["query"], json!("806 search executed entity"));
+    assert_eq!(
+        event.payload["served_by_profile_id"],
+        Value::Null,
+        "kg search has no profile resolution — the field must stay present but null"
+    );
+    assert!(
+        event.payload["latency_us"]
+            .as_i64()
+            .is_some_and(|us| us >= 0),
+        "latency_us must be a non-negative measured duration, got: {:?}",
+        event.payload["latency_us"]
+    );
+    assert!(
+        event.payload["actor"]
+            .as_str()
+            .is_some_and(|s| !s.is_empty()),
+        "actor must be stamped, got: {:?}",
+        event.payload["actor"]
+    );
+    let selected = event.payload["selected"]
+        .as_array()
+        .expect("selected must be a UUID array");
+    assert_eq!(
+        selected.len(),
+        hits.len(),
+        "selected must carry the full served result-ID list"
+    );
+}
+
+#[tokio::test]
+async fn search_note_emits_exactly_one_search_executed_event_with_note_result_kind() {
+    let rt = KhiveRuntime::memory().expect("in-memory runtime must succeed");
+    let ns = Namespace::local();
+    let token = rt.authorize(ns.clone()).expect("authorize local");
+
+    rt.create_note(
+        &token,
+        "observation",
+        None,
+        "806 search executed note unique_marker_9931",
+        None,
+        None,
+        vec![],
+    )
+    .await
+    .expect("create note");
+
+    let mut builder = VerbRegistryBuilder::new();
+    builder.register(KgPack::new(rt.clone()));
+    let registry = builder.build().expect("registry builds");
+
+    let result = registry
+        .dispatch(
+            "search",
+            json!({"kind": "note", "query": "unique_marker_9931"}),
+        )
+        .await
+        .expect("search must succeed");
+    let hits = result.as_array().expect("bare array result");
+    assert!(!hits.is_empty(), "must find the seeded note");
+
+    let store = rt.events(&token).expect("event store for local namespace");
+    let search_events = poll_search_executed_events(&store).await;
+
+    assert_eq!(
+        search_events.len(),
+        1,
+        "exactly one search_executed event per served search, got: {search_events:?}"
+    );
+    let event = &search_events[0];
+    assert_eq!(event.payload["result_kind"], json!("note"));
+    assert_eq!(event.payload["result_count"], json!(hits.len()));
+}
