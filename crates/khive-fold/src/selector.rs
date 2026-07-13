@@ -223,7 +223,7 @@ impl<T: Clone> Selector<T> for GreedySelector {
         // it must be scaled by the same weight or rank comparisons would see
         // the unweighted value while `min_score` filtering sees the weighted
         // one, silently defeating `category_weights` for any candidate that
-        // set `rank_score` (khive/PR#535, finding 1).
+        // set `rank_score` (khive PR #535).
         if !weights.category_weights.is_empty() {
             for item in &mut inputs {
                 if let Some(ref cat) = item.category {

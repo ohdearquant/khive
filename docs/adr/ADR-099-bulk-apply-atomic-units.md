@@ -595,8 +595,8 @@ Schema is unchanged; no migration file is required. Pack rules gain only additiv
 ## Amendment 1 (2026-07-07)
 
 The B3 implementation (`--atomic` CLI surface) initially re-implemented per-verb prepare
-logic in `khive-runtime/src/atomic_prepare.rs`. Successive review rounds surfaced twenty
-behavioral-parity gaps between that re-implementation and the canonical verb handlers,
+logic in `khive-runtime/src/atomic_prepare.rs`. Parity analysis surfaced twenty
+behavioral gaps between that re-implementation and the canonical verb handlers,
 confirming the risk this ADR's handler-logic-duplication section anticipated. The
 implementation was restructured to the seam this ADR mandates:
 
@@ -634,10 +634,10 @@ implementation was restructured to the seam this ADR mandates:
    guarded insert, and the batch upsert path. An exhaustive workspace enumeration of
    every hand-written edge-conflict SQL site was recorded in PR #683; the two
    remaining hand-copied sites (entity-merge and note-merge curation SQL) are documented
-   residuals tracked by issue #690 rather than blockers, per the review-round
-   closure policy adopted for this slice.
+   residuals tracked by issue #690 rather than blockers under this slice's
+   closure policy.
 
-5. **Superseded deferrals.** The two documented divergences accepted during earlier
-   review rounds (kind-vs-substrate NotFound shape on `update`; the `link`
+5. **Superseded deferrals.** The two previously documented divergences
+   (kind-vs-substrate NotFound shape on `update`; the `link`
    target-backend conflict arm) are obsolete: both paths now execute the same code, so
    the divergences no longer exist and no compensating documentation is required.

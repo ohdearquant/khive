@@ -1303,7 +1303,7 @@ mod tests {
         );
     }
 
-    /// #836 review fix: on a genuine SELF-BUILD timeout — no other holder of
+    /// PR #836 fix: on a genuine SELF-BUILD timeout, no other holder of
     /// the per-model `model_warm_lock` (unlike
     /// `recall_836_degrades_to_fts_only_when_ann_lock_is_held` above, which
     /// simulates a concurrent holder), this recall's own
@@ -1396,7 +1396,7 @@ mod tests {
         assert!(
             warmed,
             "the detached build must eventually install a fresh ANN index for \
-             {MODEL} instead of being dropped on timeout (#836 review)"
+             {MODEL} instead of being dropped on timeout (#836)"
         );
 
         // A later recall must now take the vector path — no degraded marker.
@@ -2126,7 +2126,7 @@ mod tests {
     /// `#[serial(background_tasks)]`: non-empty recall — see the note on
     /// `recall_with_dollar_sign_query_does_not_error` above.
     ///
-    /// [High-2 regression] `entity_names: []` is explicit caller intent
+    /// `entity_names: []` is explicit caller intent
     /// ("no entity boost"), distinct from omitting the field. This uses the
     /// exact corpus/query from the sibling test above — where omitting
     /// `entity_names` auto-extracts `"zenlake"` and fires EntityMatch — and

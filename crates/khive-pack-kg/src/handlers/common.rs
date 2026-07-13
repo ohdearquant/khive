@@ -95,7 +95,7 @@ pub(crate) fn validate_entity_type(
 
 /// Resolved shape of a `kind` discriminator string.
 ///
-/// `pub` (widened from `pub(crate)`, ADR-099 B3, finding 1): the
+/// `pub` (widened from `pub(crate)`, ADR-099 B3): the
 /// `--atomic` seam in `kkernel` reuses [`resolve_kind_spec`] and this type to
 /// resolve a caller-supplied `delete(kind=...)` the SAME way `handle_delete`
 /// does, rather than re-deriving kind-vocabulary resolution.
@@ -122,7 +122,7 @@ impl KindSpec {
 
 /// Resolve a wire-level `kind` value into a [`KindSpec`].
 ///
-/// `pub` (widened from `pub(crate)`, ADR-099 B3, finding 1) —
+/// `pub` (widened from `pub(crate)`, ADR-099 B3),
 /// see [`KindSpec`]'s doc comment.
 pub fn resolve_kind_spec(raw: &str, registry: &VerbRegistry) -> Result<KindSpec, RuntimeError> {
     let normalized = raw.trim().to_ascii_lowercase();
@@ -279,7 +279,7 @@ pub(crate) async fn resolve_uuid_async(
 /// stamped with a non-primary namespace (#391 §3). Exact copy of
 /// `resolve_uuid_async` except the prefix branch.
 ///
-/// `pub` (widened from `pub(crate)`, ADR-099 B3, finding 3) — so
+/// `pub` (widened from `pub(crate)`, ADR-099 B3), so
 /// kkernel's `--atomic` seam can resolve KG ids (full UUID / 8+ hex prefix /
 /// entity-name) with the exact same semantics as the canonical handlers.
 pub async fn resolve_uuid_unfiltered(
@@ -308,7 +308,7 @@ pub async fn resolve_uuid_unfiltered(
 /// hard-delete by-ID path (#391 §3). Exact copy of
 /// `resolve_uuid_including_deleted` except the prefix branch.
 ///
-/// `pub` (widened from `pub(crate)`, ADR-099 B3, finding 3) — for
+/// `pub` (widened from `pub(crate)`, ADR-099 B3), for
 /// the same reason as `resolve_uuid_unfiltered` above; used by the atomic
 /// hard-delete id-resolution path.
 pub async fn resolve_uuid_unfiltered_including_deleted(
@@ -634,7 +634,7 @@ pub(crate) fn deser<T: serde::de::DeserializeOwned>(params: Value) -> Result<T, 
         .map_err(|e| RuntimeError::InvalidInput(format!("bad params: {e}")))
 }
 
-/// `pub` (widened from `pub(crate)`, ADR-099 B3, finding 4) — so
+/// `pub` (widened from `pub(crate)`, ADR-099 B3), so
 /// kkernel's `--atomic` seam can render update/delete result payloads with
 /// the same timestamp normalization as the canonical handlers.
 pub fn normalize_entity_timestamps(mut v: Value) -> Value {

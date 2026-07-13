@@ -111,7 +111,7 @@ impl AffectedRowGuard {
 /// atomic unit commits (ADR-099 D1, "post-commit pass"). v1's admissible set
 /// computes no embeddings during prepare (D3's `update`/`merge` caveat), so
 /// the only post-commit effects are reindex kicks computed from the
-/// **committed** row content — plus, since the B3 fix round (GAP-5), the
+/// **committed** row content, plus the GAP-5 addition under B3: the
 /// best-effort GTD lifecycle audit row.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PostCommitEffect {
@@ -124,7 +124,7 @@ pub enum PostCommitEffect {
     /// content (ADR-099 D3 `update` caveat: note name/content change).
     ReindexNote { note_id: Uuid },
     /// Append one `gtd_lifecycle_audit` row for a committed `gtd.transition`
-    /// or `gtd.complete` (B3 fix round GAP-5): canonical `handle_transition`/
+    /// or `gtd.complete` (ADR-099 B3, GAP-5): canonical `handle_transition`/
     /// `handle_complete` call `ensure_audit_schema` + `write_audit_record`
     /// (`khive-pack-gtd::handlers`) as a best-effort side write — a failed
     /// audit insert must never roll back an already-committed transition.
@@ -207,7 +207,7 @@ pub struct DeletePlan {
     /// delete only) is unguarded — it may legitimately affect zero rows if
     /// the target had no incident edges.
     pub statements: Vec<PlanStatement>,
-    /// Deferred note-mutation-hook fire, for a note delete (#750 fix-round
+    /// Deferred note-mutation-hook fire, for a note delete (#750
     /// 2). `PostCommitEffect::None` for entity and edge deletes — the hook
     /// system is note-only.
     pub post_commit: PostCommitEffect,
@@ -266,7 +266,7 @@ pub struct GtdTransitionPlan {
     /// round) — canonical performs no write in that case either
     /// (`handlers.rs:995-1005`).
     pub statements: Vec<PlanStatement>,
-    /// Deferred lifecycle audit row (GAP-5 fix round) — `PostCommitEffect::
+    /// Deferred lifecycle audit row (GAP-5): `PostCommitEffect::
     /// None` for the idempotent no-op case, matching canonical's early
     /// return before its own `ensure_audit_schema`/`write_audit_record`
     /// call.
@@ -282,7 +282,7 @@ pub struct GtdCompletePlan {
     /// validated the task was in a completable state); the `completed_at`
     /// write targets the same already-guarded row and is unguarded.
     pub statements: Vec<PlanStatement>,
-    /// Deferred lifecycle audit row (GAP-5 fix round) — mirrors
+    /// Deferred lifecycle audit row (GAP-5): mirrors
     /// `handle_complete`'s best-effort `write_audit_record` call.
     pub post_commit: PostCommitEffect,
 }

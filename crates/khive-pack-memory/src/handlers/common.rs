@@ -1062,7 +1062,7 @@ impl MemoryPack {
                 // inside it now runs via `tokio::task::spawn_blocking`
                 // (`ann.rs::load_and_build_from_vector_store`).
                 //
-                // #812 review REQUEST CHANGES HIGH: `is_current` alone only
+                // PR #812: `is_current` alone only
                 // sees THIS process's write-generation counter, which
                 // `kkernel reindex` (a separate OS process) never touches —
                 // an already-warm daemon would otherwise trust its cached
@@ -1086,7 +1086,7 @@ impl MemoryPack {
                 // `ann_ready_timeout_ms`, abandon WAITING for this attempt and
                 // degrade this model's vector leg to FTS-only for this recall.
                 //
-                // #836 review: the build itself must never be dropped on
+                // PR #836: the build itself must never be dropped on
                 // timeout. In the CONTENDED case (some other holder — e.g.
                 // boot warm — already owns `ensure_ann_for_model`'s per-model
                 // `model_warm_lock`) that other holder's own call keeps

@@ -108,7 +108,7 @@ impl AtomicOpPlan {
     /// The deferred post-commit effect this op's plan recorded, if any.
     ///
     /// [`UpdatePlan`] carries a [`PostCommitEffect`] field for the `update`
-    /// reindex caveat (ADR-099 D3). Since the B3 fix round (GAP-5),
+    /// reindex caveat (ADR-099 D3). Under B3 (GAP-5),
     /// [`GtdTransitionPlan`]/[`GtdCompletePlan`] also carry one, for the
     /// best-effort lifecycle audit row. Since #750, [`DeletePlan`] also
     /// carries one, for the note-mutation

@@ -209,7 +209,7 @@ impl KnowledgeHandlers {
             let model_name = runtime.default_embedder_name();
             // Capture the namespace's write-generation floor before scanning the
             // corpus, mirroring `ensure_ann_for_model`'s `target_generation` capture
-            // (PR #815 review, HIGH) — `install_if_fresher` then fences this direct
+            // (PR #815); `install_if_fresher` then fences this direct
             // rebuild insertion with the same generation check the warm path uses,
             // instead of the old presence-only `insert_ann_if_absent`.
             let build_generation = vamana::current_generation(ann, &ns);

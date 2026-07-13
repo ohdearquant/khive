@@ -2427,7 +2427,7 @@ async fn tasks_finds_done_task_older_than_fixed_window() {
     );
 }
 
-/// #772 follow-up (Major finding): when more tasks match the actionable
+/// Issue #772 follow-up: when more tasks match the actionable
 /// filter than the scan safety bound covers, `gtd.next` must return an
 /// explicit error asking the caller to narrow the query instead of silently
 /// sorting and truncating a partial candidate set — a partial set can hide

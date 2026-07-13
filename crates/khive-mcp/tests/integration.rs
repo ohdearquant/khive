@@ -3068,7 +3068,7 @@ fn cli_args_khive_namespace_env_is_explicit() {
     assert_eq!(ns, Namespace::parse("lambda:from-env").unwrap());
 }
 
-/// ADR-096 Fork 2 (PR #657 review): `KHIVE_ACTOR` env var must NOT
+/// ADR-096 Fork 2 (PR #657): `KHIVE_ACTOR` env var must NOT
 /// occupy the CLI tier at all — it no longer marks the CLI namespace as
 /// explicit, and it no longer wins over `KHIVE_NAMESPACE`. `args.rs` used to
 /// bind `--actor` to `env = "KHIVE_ACTOR"`, which made a bare shell-level
@@ -4532,7 +4532,7 @@ async fn dispatch_honors_explicit_namespace_else_local_adr007() {
     );
 }
 
-// ── ADR-078 server-level format tests (Medium 4 — server seam coverage) ──────
+// ── ADR-078 server-level format tests (server seam coverage) ────────────────
 //
 // These tests drive `dispatch_request_local` directly so they pin the PUBLIC
 // server behaviour that combines `format`, `format_per_op`,
@@ -4675,7 +4675,7 @@ async fn format_per_op_override_selects_format_per_position() {
     assert_eq!(body["summary"]["succeeded"], serde_json::json!(2));
 }
 
-/// (fmt-3) `presentation_per_op=verbose` pins High 1: a verbose op under
+/// (fmt-3) `presentation_per_op=verbose` pins a verbose op under
 /// `format=auto` must preserve `full_id`, `namespace="local"`, and duplicate
 /// `properties` keys — the redundancy-drop pre-pass must be skipped.
 ///

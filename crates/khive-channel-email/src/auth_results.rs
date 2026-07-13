@@ -946,12 +946,12 @@ mod tests {
         assert!(parsed.spf_pass_aligned("evil.com"));
     }
 
-    // --- #501 remediation: reviewer finding (MEDIUM) -- quoted `=` must not
+    // --- #501 remediation: quoted `=` must not
     // be misclassified as the no-authserv-id form ---
 
     #[test]
     fn parse_header_quoted_authserv_id_containing_equals_is_not_no_id_form() {
-        // review_501.md MEDIUM: `"id=foo"` is a quote-atomic first token (RFC
+        // Issue #501: `"id=foo"` is a quote-atomic first token (RFC
         // 8601 SS2.2 permits a quoted-string authserv-id value), so the `=` it
         // contains is sealed inside quoting and must never be read as the
         // resinfo-shaped `=` that signals the no-authserv-id form. Before the
@@ -987,13 +987,12 @@ mod tests {
         assert!(parsed.spf_pass_aligned("gmail.com"));
     }
 
-    // --- #501 remediation: reviewer finding (LOW) -- nested/escaped comment
+    // --- #501 remediation: nested/escaped comment
     // combined with an internal `;`/`method=result` must not forge a method ---
 
     #[test]
     fn parse_header_nested_escaped_comment_with_semicolon_does_not_forge_dmarc() {
-        // review_501.md LOW, per the inventory's required regression
-        // (auth_results_inventory.md:236): a nested comment containing an
+        // Issue #501 regression: a nested comment containing an
         // escaped `)` (which must not prematurely close the inner nesting)
         // and an internal `; dmarc=pass` (which must stay swallowed by the
         // comment, not leak out as a real segment boundary) must not

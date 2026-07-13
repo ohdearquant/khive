@@ -31,7 +31,7 @@
 //! rejected at the same pre-runtime static guard as governance
 //! ([`khive_types::pack::ATOMIC_KNOWN_UNIMPLEMENTED_VERBS`]). `prepare_merge`
 //! below is therefore unreachable through `--atomic`; it remains only as the
-//! pre-fix-round direct-prepare implementation, exercised by this module's
+//! earlier direct-prepare implementation, exercised by this module's
 //! own tests, and as defense in depth.
 
 use serde_json::Value;

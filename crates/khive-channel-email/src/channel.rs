@@ -1800,7 +1800,7 @@ mod tests {
         );
     }
 
-    /// khive #449 High follow-up (Medium-2): the connector-level
+    /// khive #449 follow-up: the connector-level
     /// `one_poison_uid_does_not_starve_51_later_valid_uids_and_cursor_passes_it`
     /// test in `imap.rs` only proves `process_selected_page` assigns the
     /// poison UID a `SelectedMessage::Malformed` disposition -- it never

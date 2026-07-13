@@ -4330,7 +4330,7 @@ mod brain_005_section_signals {
         assert_eq!(result["emitted"], json!(true));
     }
 
-    // ── New tests for Blocker fix (PR #46 re-review) ──────────────────────────
+    // ── PR #46 regression tests ──────────────────────────────────────────────
 
     #[tokio::test]
     async fn section_signals_empty_map_is_rejected() {

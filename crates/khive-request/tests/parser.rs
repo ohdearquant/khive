@@ -575,7 +575,7 @@ fn quoted_prev_ref_deep_path_parses_as_prev_ref() {
 
 #[test]
 fn escaped_dollar_prev_stays_literal() {
-    // CC-3 escape (High-2 fix): `"\\$prev.id"` → the literal string `$prev.id`.
+    // CC-3 escape: `"\\$prev.id"` produces the literal string `$prev.id`.
     // The DSL source `"\\$prev.id"` deserializes to `\$prev.id` (one backslash).
     // string_as_prev_ref strips the leading `\` and returns Value("$prev.id").
     let r = req(r#"create(kind="concept", name="A") | get(id="\\$prev.id")"#);
@@ -762,11 +762,11 @@ fn quoted_prev_ref_with_array_index_parses() {
     );
 }
 
-// ── High-1 regression: JSON-form recursive $prev detection ────────────────────
+// ── JSON-form recursive $prev detection ──────────────────────────────────────
 
 #[test]
 fn json_form_nested_array_with_prev_ref_is_rejected() {
-    // High-1: `{"ids": ["$prev.id"]}` — $prev inside an array arg must be detected.
+    // `$prev` inside an array arg must be detected.
     let err = parse_request(
         r#"[{"tool":"create","args":{"kind":"concept","name":"A"}},{"tool":"search","args":{"ids":["$prev.id"]}}]"#,
     )
@@ -779,7 +779,7 @@ fn json_form_nested_array_with_prev_ref_is_rejected() {
 
 #[test]
 fn json_form_nested_object_with_prev_ref_is_rejected() {
-    // High-1: `{"filter": {"id": "$prev.id"}}` — $prev inside an object arg must be detected.
+    // `$prev` inside an object arg must be detected.
     let err = parse_request(
         r#"[{"tool":"create","args":{"kind":"concept","name":"A"}},{"tool":"search","args":{"filter":{"id":"$prev.id"}}}]"#,
     )
@@ -792,7 +792,7 @@ fn json_form_nested_object_with_prev_ref_is_rejected() {
 
 #[test]
 fn json_form_bracket_prev_ref_is_rejected() {
-    // High-1: `{"id": "$prev[0].id"}` — bracket-index form must also be detected.
+    // Bracket-index form must also be detected.
     let err = parse_request(
         r#"[{"tool":"create","args":{"kind":"concept","name":"A"}},{"tool":"get","args":{"id":"$prev[0].id"}}]"#,
     )
@@ -805,17 +805,17 @@ fn json_form_bracket_prev_ref_is_rejected() {
 
 #[test]
 fn json_form_prevish_id_stays_literal() {
-    // High-1 boundary: `$prevish.id` is NOT a $prev ref and must pass through.
+    // Boundary: `$prevish.id` is NOT a $prev ref and must pass through.
     let r = req(r#"[{"tool":"get","args":{"id":"$prevish.id"}}]"#);
     assert_eq!(r.mode, ExecutionMode::Parallel);
     assert_eq!(r.ops[0].args["id"], ArgValue::Value(json!("$prevish.id")));
 }
 
-// ── High-2 regression: escape semantics produce clean literal ─────────────────
+// ── Escape semantics produce clean literal ───────────────────────────────────
 
 #[test]
 fn escaped_dollar_prev_without_path_stays_literal() {
-    // High-2: `"\\$prev"` → literal `$prev` (no path), not a PrevRef.
+    // `"\\$prev"` produces literal `$prev` (no path), not a PrevRef.
     let r = req(r#"create(kind="concept", name="A") | get(id="\\$prev")"#);
     assert_eq!(r.mode, ExecutionMode::Chain);
     assert_eq!(r.ops[1].args["id"], ArgValue::Value(json!("$prev")));
@@ -823,17 +823,17 @@ fn escaped_dollar_prev_without_path_stays_literal() {
 
 #[test]
 fn escaped_dollar_prev_bracket_stays_literal() {
-    // High-2: `"\\$prev[0].id"` → literal `$prev[0].id`, not a PrevRef.
+    // `"\\$prev[0].id"` produces literal `$prev[0].id`, not a PrevRef.
     let r = req(r#"create(kind="concept", name="A") | get(id="\\$prev[0].id")"#);
     assert_eq!(r.mode, ExecutionMode::Chain);
     assert_eq!(r.ops[1].args["id"], ArgValue::Value(json!("$prev[0].id")));
 }
 
-// ── Medium-1 regression: quoted bracket index validation ──────────────────────
+// ── Quoted bracket index validation ──────────────────────────────────────────
 
 #[test]
 fn quoted_prev_ref_negative_index_treated_as_literal() {
-    // Medium-1: `"$prev[-1].id"` — negative index is invalid in bracket grammar.
+    // `"$prev[-1].id"`: negative index is invalid in bracket grammar.
     // string_as_prev_ref returns None → stored as literal Value, not PrevRef.
     // In a chain, the value is a concrete string (no $prev substitution needed).
     let r = req(r#"list(kind="concept") | get(id="$prev[-1].id")"#);
@@ -848,7 +848,7 @@ fn quoted_prev_ref_negative_index_treated_as_literal() {
 
 #[test]
 fn quoted_prev_ref_missing_close_bracket_treated_as_literal() {
-    // Medium-1: `"$prev[0.id"` — missing ']' is a malformed bracket.
+    // `"$prev[0.id"`: missing ']' is a malformed bracket.
     let r = req(r#"list(kind="concept") | get(id="$prev[0.id")"#);
     assert_eq!(r.mode, ExecutionMode::Chain);
     assert!(
@@ -860,7 +860,7 @@ fn quoted_prev_ref_missing_close_bracket_treated_as_literal() {
 
 #[test]
 fn quoted_prev_ref_non_numeric_index_treated_as_literal() {
-    // Medium-1: `"$prev[abc].id"` — non-numeric index is invalid.
+    // `"$prev[abc].id"`: a non-numeric index is invalid.
     let r = req(r#"list(kind="concept") | get(id="$prev[abc].id")"#);
     assert_eq!(r.mode, ExecutionMode::Chain);
     assert!(

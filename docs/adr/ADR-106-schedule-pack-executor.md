@@ -673,11 +673,10 @@ Criterion 6:
 
 ### Amendment B, update 2 (2026-07-09)
 
-A follow-up review pass on this PR verified the update-1 fixes above were all present
-and gates green, but found the high-severity runtime-policy fix (`build_server`
-threading the resolved `"schedule"`-pack runtime through to the tick) was still
-**incomplete** for multi-backend deployments, plus two narrower regression/resource
-issues:
+Verification confirmed the update-1 fixes above were present and gates green, but
+the runtime-policy fix (`build_server` threading the resolved `"schedule"`-pack
+runtime through to the tick) was still **incomplete** for multi-backend deployments,
+along with two narrower regression/resource issues:
 
 - **Dispatch still used the wrong runtime for multi-backend actions.** Update 1 fixed
   _scanning_ — `run_pending_events_on` now reads `scheduled_event` rows from the

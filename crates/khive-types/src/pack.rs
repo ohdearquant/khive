@@ -397,14 +397,14 @@ const ATOMIC_EMBEDDING_BEARING_VERBS: &[&str] = &[
 /// - `merge`: a full-parity atomic prepare (field folding, survivor FTS/vector
 ///   reindex, loser index purge, merge provenance, same-kind rejection,
 ///   graceful edge-conflict resolution — see `curation::merge_entity_sql`) was
-///   drafted and unit-tested in the B3 fix round, but deferred rather than
+///   drafted and unit-tested for B3, but deferred rather than
 ///   shipped: `curation.rs`'s edge-rewire conflict handling does per-row
 ///   procedural branching (read, canonicalize, probe for a conflicting
 ///   triple, delete-and-refresh vs. update-in-place) that cannot be expressed
 ///   as ADR-099 D1's static predicate/guard plan shape, so full parity is not
 ///   achievable without either accepting a documented behavioral gap or a
-///   design change to the plan model — bias-toward-defer (Leo directive,
-///   fix-round refinement) over shipping a partially-scoped atomic merge.
+///   design change to the plan model; bias toward deferral over shipping a
+///   partially scoped atomic merge.
 ///   `merge` stays admissible under the *non-atomic* verb.
 ///
 /// ADR-099 B3 (governance verbs): this set
@@ -476,7 +476,7 @@ pub enum AtomicRejectionReason {
 /// [`AtomicRejectionReason::Unlisted`], never silently admitted.
 ///
 /// `ATOMIC_KNOWN_UNIMPLEMENTED_VERBS` is checked BEFORE the general
-/// admissible-list membership check (B3 fix round, Medium finding): those
+/// admissible-list membership check (ADR-099 B3): those
 /// verbs are members of `ATOMIC_ADMISSIBLE_VERBS`, so checking membership
 /// first would admit them (`None`) and defer their rejection to prepare time,
 /// after a runtime has already been constructed.

@@ -653,7 +653,7 @@ mod tests {
         p
     }
 
-    /// ADR-088 Amendment 1 fix-round r2 Medium-1: a `git clone` failure (bad
+    /// ADR-088 Amendment 1: a `git clone` failure (bad
     /// source, no network needed -- a nonexistent local path fails
     /// immediately) must not leave a `.staging-<uuid>` directory behind.
     /// `evict_lru` deliberately never touches non-owned names, so a leaked
@@ -924,7 +924,7 @@ mod tests {
         }
     }
 
-    /// Companion to the test above, pinning the other half of the Major-2
+    /// Companion to the test above, pinning the other half of the
     /// contract (PR #847): when the vanishing path is the walk
     /// **root** itself -- not a descendant beneath a still-existing root --
     /// `dir_size` must surface an error rather than tolerate it. Same

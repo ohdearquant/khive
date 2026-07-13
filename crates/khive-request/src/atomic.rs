@@ -91,7 +91,7 @@ mod tests {
 
     #[test]
     fn all_admissible_ops_pass_with_no_rejections() {
-        // `merge` is deferred (B3 fix round, Leo refinement) — see
+        // `merge` is deferred under B3; see
         // `known_unimplemented_verbs_rejected_before_any_write` below.
         let ops = vec![op("update"), op("delete"), op("link")];
         assert!(check_atomic_admissible(&ops).is_empty());

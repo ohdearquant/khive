@@ -1241,8 +1241,7 @@ async fn schedule_schedule_accepts_create_bulk_item_with_valid_entity_type() {
 /// rejected with "unknown entity kind", regardless of the entity_type value.
 /// Verified live via `kkernel exec` against a scratch DB. `schedule.schedule`
 /// must reproduce this exact short-circuit rather than being "more lenient"
-/// than the real handler — that would be a false accept, exactly the gap-1
-/// failure mode this round of review found.
+/// than the real handler. That would be the GAP-1 false-accept failure mode.
 #[tokio::test]
 async fn schedule_schedule_rejects_entity_type_under_resource_kind_singleton() {
     let (registry, _rt) = build_registry();

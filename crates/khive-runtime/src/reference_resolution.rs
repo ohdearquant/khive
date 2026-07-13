@@ -324,7 +324,7 @@ async fn exact_name_match(
     // its length alone would under-report cardinality. `Ambiguous.candidates`
     // is a bounded sample of up to 10 of the `page.total` matches, not the
     // complete set — the variant carries no total field, so callers must not
-    // assume `candidates.len() == page.total` (#852 review r3).
+    // assume `candidates.len() == page.total` (#852).
     let page = runtime
         .entities(token)?
         .query_entities(
@@ -575,7 +575,7 @@ mod tests {
         );
     }
 
-    /// #852 review r3: the zero/one/many decision must come from the
+    /// Issue #852: the zero/one/many decision must come from the
     /// storage-computed `page.total` (a full `COUNT(*)` under the exact-name
     /// predicate), not from `page.items.len()`, which the stage's own
     /// `LIMIT 10` caps regardless of true cardinality. 11 byte-identical

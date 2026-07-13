@@ -143,7 +143,7 @@ fn spawn_email_channel_loops_if_daemon(server: &KhiveMcpServer, args: &Args) {
 /// [`serve_server`] by `kkernel`'s coordinator-attached multi-backend boot
 /// path). Passing the ALREADY-RESOLVED runtime, rather than deriving a fresh
 /// `RuntimeConfig` from raw `args.db`/an inferred namespace inside the tick,
-/// is the fix for PR #782 review: the daemon resolves
+/// is the fix for PR #782: the daemon resolves
 /// `--config`/`[[backends]]`/actor identity/`--pack` selection once at boot,
 /// and a second independent resolution inside the tick could silently target
 /// a different database, actor identity, or pack set. `None` means either
@@ -154,7 +154,7 @@ fn spawn_email_channel_loops_if_daemon(server: &KhiveMcpServer, args: &Args) {
 /// SAME one [`build_server`] returned alongside `schedule_rt` and that this
 /// process is about to serve. It is cloned (cheap — `Arc`-wrapped
 /// internally) and handed to the tick loop for action-dispatch only (a
-/// continuation of the PR #782 review, following the
+/// continuation of PR #782, following the
 /// `schedule_rt`-only fix above): `schedule_rt` alone is correct for
 /// *scanning* `scheduled_event` rows (they live on the schedule pack's own
 /// backend), but building a throwaway `KhiveMcpServer` from `schedule_rt`
@@ -1479,8 +1479,8 @@ pub fn enforce_strict_actor_mode(
 /// pack, and a multi-backend boot (ADR-028 `[[backends]]`) returns the
 /// specific per-pack runtime `"schedule"` was wired to. Threading this
 /// through — rather than having the tick loop re-resolve its own
-/// `RuntimeConfig` from raw `--db`/namespace args — is the fix for PR
-/// #782 review: a second, independently-resolved config could
+/// `RuntimeConfig` from raw `--db`/namespace args is the fix for PR #782: a
+/// second, independently-resolved config could
 /// silently target a different database, actor identity, or pack set than
 /// the daemon it claims to serve.
 ///
@@ -1505,7 +1505,7 @@ pub fn build_server(args: &Args) -> anyhow::Result<(KhiveMcpServer, Option<Khive
 /// Build a fully-configured server from parsed args plus an independently
 /// resolved `(namespace, namespace_explicit, actor_explicit)` triple.
 ///
-/// Extracted from [`build_server`] (PR #782 review) so
+/// Extracted from [`build_server`] (PR #782) so
 /// that non-interactive-CLI callers — e.g. the `--pending-events` one-shot
 /// drain wrapper in `pending_events.rs` — can supply a namespace default
 /// without it being misread as a genuine `--actor` override. `build_server`
@@ -2291,7 +2291,7 @@ brain_profile = "unrelated"
         );
     }
 
-    /// Regression for PR #52 review: project-toml brain_profile
+    /// Regression for PR #52: project-toml brain_profile
     /// MUST win over KHIVE_BRAIN_PROFILE env var.
     ///
     /// Merged ADR-035 §Precedence: CLI > project toml > global toml > env > default.
@@ -2768,7 +2768,7 @@ id = "lambda:project-actor"
         );
     }
 
-    /// PR #657 review: drives the REAL `clap` parse of `Args`
+    /// PR #657: drives the REAL `clap` parse of `Args`
     /// (not a hand-built `RuntimeConfigInputs`) to prove a bare shell-level
     /// `KHIVE_ACTOR` no longer occupies the tier-1 CLI slot. Before the fix,
     /// `args.rs` bound `--actor` to `env = "KHIVE_ACTOR"`, so this env var
@@ -2828,7 +2828,7 @@ id = "lambda:project-actor"
         );
     }
 
-    /// PR #657 review, second case: with no project config and
+    /// PR #657, second case: with no project config and
     /// no `--actor` flag, `KHIVE_ACTOR` must still land as the tier-3
     /// `actor_id` fallback (it is read directly by `RuntimeConfig::default()`,
     /// independent of the removed clap `env` binding) — and must still leave
@@ -2881,7 +2881,7 @@ id = "lambda:project-actor"
         );
     }
 
-    /// PR #657 review: an explicit `--actor local` (an operator
+    /// PR #657: an explicit `--actor local` (an operator
     /// request for the anonymous identity) must suppress BOTH the project-config
     /// and the db-anchored-config actor tiers, not just the missing-flag default.
     /// Before the fix, `resolve_runtime_config`'s tier-3 fold used
@@ -4500,8 +4500,8 @@ id = "lambda:project-actor"
         fn sustained_capped_pressure_produces_exactly_one_warn() {
             // Simulate one escalation edge followed by several repeats at the
             // same (capped) step, as the poll loop would emit them across
-            // consecutive ticks -- exactly the "riding the cap" scenario
-            // review flagged as spamming a WARN per retry.
+            // consecutive ticks, reproducing the "riding the cap" scenario
+            // that previously spammed a WARN per retry.
             let buffer = Arc::new(Mutex::new(Vec::new()));
             let subscriber = CaptureSubscriber {
                 events: Arc::clone(&buffer),
@@ -4726,10 +4726,9 @@ id = "lambda:project-actor"
         );
     }
 
-    // --- build_server's returned schedule-tick runtime (ADR-106,
-    // PR #782 review) ---
+    // --- build_server's returned schedule-tick runtime (ADR-106, PR #782) ---
     //
-    // Before this fix-round, the daemon-resident tick (`schedule_tick_loop`)
+    // Before this fix, the daemon-resident tick (`schedule_tick_loop`)
     // reconstructed its OWN `RuntimeConfig::default()` from raw `args.db` and
     // an inferred namespace, discarding everything `build_server` resolves
     // from `--config`/`[[backends]]`/`--actor`/`--pack`. These regressions
@@ -4991,7 +4990,7 @@ backend = "schedule-backend"
         );
     }
 
-    /// Multi-backend ACTION-DISPATCH routing (PR #782 review):
+    /// Multi-backend ACTION-DISPATCH routing (PR #782):
     /// `schedule` defaults to "main" (no `[packs.schedule]`
     /// entry declared), while `kg` — the pack whose `create` verb the stored
     /// action below replays — is routed to a SEPARATE declared backend. A due
@@ -6254,7 +6253,7 @@ backend = "kg-backend"
             }
         }
 
-        /// khive #449 High follow-up (Medium-2): the connector- and
+        /// khive #449 follow-up: the connector- and
         /// channel-level poison-UID tests prove a malformed message becomes
         /// a quarantine-shaped `ChannelEnvelope`, but neither proves the
         /// daemon actually turns that into a durable, queryable record.

@@ -1996,7 +1996,7 @@ async fn gh_boundary_contract_and_partial_ingest_failure() {
         !args_log.contains("-C"),
         "gh must never receive an unsupported -C flag: {args_log}"
     );
-    // ADR-088 Amendment 1 fix-round r2 High-1: the paging rewrite (--search
+    // ADR-088 Amendment 1: the paging rewrite (--search
     // "sort:updated-asc ...") must not silently drop --state all -- gh
     // defaults to open-only listing, which would make closed issues and
     // closed/merged PRs vanish from every ingest.
@@ -3002,7 +3002,7 @@ async fn digest_verb_rejects_ssh_source() {
     assert!(format!("{err}").contains("SSH"), "{err}");
 }
 
-/// `max_items` boundary handling (ADR-088 Amendment 1 fix-round Medium-2):
+/// `max_items` boundary handling (ADR-088 Amendment 1):
 /// a negative value must clamp to the lower bound (1), NOT silently fall
 /// through `as_u64`'s failure into the 500 default. `0` clamps to 1 too;
 /// values above 2000 clamp to 2000; a non-integer value is a hard error.
