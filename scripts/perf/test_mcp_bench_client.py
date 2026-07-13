@@ -504,5 +504,83 @@ class WholeRequestDeadlineTests(unittest.TestCase):
             server.close()
 
 
+
+# ── request_id join (khive#948 design note §4) ────────────────────────────────
+
+class JoinRequestIdsTests(unittest.TestCase):
+    def test_joins_unique_request_id_to_its_audit_event(self):
+        samples = [{"request_id": 1, "client_send_ts": 100.0}]
+        audit_events = [{"resource": {"request_id": 1}, "duration_us": 4200}]
+        joined = mbc.join_request_ids(samples, audit_events)
+        self.assertEqual(joined, [{
+            "request_id": 1,
+            "client_send_ts": 100.0,
+            "server_duration_us": 4200,
+            "join_status": "joined",
+        }])
+
+    def test_no_matching_audit_event_is_unavailable_not_an_error(self):
+        samples = [{"request_id": 2}]
+        joined = mbc.join_request_ids(samples, audit_events=[])
+        self.assertEqual(joined[0]["join_status"], "no_audit_row")
+        self.assertIsNone(joined[0]["server_duration_us"])
+
+    def test_sample_with_no_request_id_is_unavailable(self):
+        samples = [{"request_id": None}]
+        audit_events = [{"resource": {"request_id": 1}, "duration_us": 100}]
+        joined = mbc.join_request_ids(samples, audit_events)
+        self.assertEqual(joined[0]["join_status"], "no_audit_row")
+        self.assertIsNone(joined[0]["server_duration_us"])
+
+    def test_duplicate_request_id_in_window_marks_unavailable_never_picks_a_row(self):
+        """Binding sign-off condition (design note §4 item 7): a process-local
+        counter restarts at the same values across harness restarts, so two
+        runs inside one query window can collide on `request_id`. The join
+        must detect this and mark the sample's server-duration field
+        unavailable rather than silently picking either candidate row —
+        that heuristic pick is exactly what Amendment 1 §3 forbids.
+
+        Fixture: two distinct audit events (different `duration_us`, as they
+        would be from two different harness runs) both carry
+        `request_id: 5`.
+        """
+        samples = [{"request_id": 5, "run": "second-run"}]
+        audit_events = [
+            {"resource": {"request_id": 5}, "duration_us": 1000},  # from an earlier, colliding run
+            {"resource": {"request_id": 5}, "duration_us": 2000},  # this run's own row
+        ]
+        joined = mbc.join_request_ids(samples, audit_events)
+        self.assertEqual(len(joined), 1)
+        self.assertEqual(joined[0]["join_status"], "duplicate_request_id")
+        self.assertIsNone(
+            joined[0]["server_duration_us"],
+            "must never pick either candidate row's duration_us on a request_id collision",
+        )
+
+    def test_duplicate_guard_does_not_affect_other_samples_unique_ids(self):
+        samples = [{"request_id": 5}, {"request_id": 6}]
+        audit_events = [
+            {"resource": {"request_id": 5}, "duration_us": 1000},
+            {"resource": {"request_id": 5}, "duration_us": 2000},
+            {"resource": {"request_id": 6}, "duration_us": 300},
+        ]
+        joined = mbc.join_request_ids(samples, audit_events)
+        by_id = {j["request_id"]: j for j in joined}
+        self.assertEqual(by_id[5]["join_status"], "duplicate_request_id")
+        self.assertIsNone(by_id[5]["server_duration_us"])
+        self.assertEqual(by_id[6]["join_status"], "joined")
+        self.assertEqual(by_id[6]["server_duration_us"], 300)
+
+    def test_audit_event_with_no_request_id_key_is_ignored_not_a_none_match(self):
+        # A pre-#948 audit row (or a non-benchmark caller's row) carries no
+        # `request_id` key at all in its `resource` object. It must never be
+        # treated as matching a sample whose own request_id happens to be
+        # absent/None.
+        samples = [{"request_id": 7}]
+        audit_events = [{"resource": {"work_class": "interactive"}, "duration_us": 999}]
+        joined = mbc.join_request_ids(samples, audit_events)
+        self.assertEqual(joined[0]["join_status"], "no_audit_row")
+
+
 if __name__ == "__main__":
     unittest.main()
