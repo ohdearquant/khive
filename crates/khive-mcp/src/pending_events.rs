@@ -493,8 +493,17 @@ pub async fn run_pending_events_on(
                     .and_then(|p| p.get("trigger_at"))
                     .and_then(Value::as_str)
                     .unwrap_or("");
-                let trigger_at = match trigger_at_str.parse::<DateTime<Utc>>() {
-                    Ok(ts) => ts,
+                // Parsed as `DateTime<FixedOffset>` (not straight to
+                // `DateTime<Utc>`) so the caller's original UTC offset is
+                // retained alongside the UTC instant — `khive-pack-schedule`
+                // round-trips the caller's original `trigger_at` string
+                // verbatim, offset included (H5), and that offset must
+                // survive repeat advancement (issue #792): rendering the
+                // advanced `trigger_at` via a bare `DateTime<Utc>::to_rfc3339`
+                // always stamps `+00:00`, silently rewriting a non-UTC
+                // schedule to UTC on its first advance.
+                let trigger_at_fixed = match DateTime::parse_from_rfc3339(trigger_at_str) {
+                    Ok(dt) => dt,
                     Err(_) => {
                         if verbose {
                             eprintln!(
@@ -505,6 +514,8 @@ pub async fn run_pending_events_on(
                         continue;
                     }
                 };
+                let trigger_at = trigger_at_fixed.with_timezone(&Utc);
+                let trigger_offset = *trigger_at_fixed.offset();
 
                 if trigger_at > now {
                     summary.skipped_not_due += 1;
@@ -621,8 +632,10 @@ pub async fn run_pending_events_on(
                     match advance_repeat_past_missed(&repeat, trigger_at, now) {
                         Some(next_at) => {
                             // Repeating event: skip this occurrence, re-arm
-                            // pending at the next future one.
-                            props["trigger_at"] = json!(next_at.to_rfc3339());
+                            // pending at the next future one. Rendered at the
+                            // original offset (issue #792), not UTC.
+                            props["trigger_at"] =
+                                json!(next_at.with_timezone(&trigger_offset).to_rfc3339());
                             props["status"] = json!("pending");
                         }
                         None => {
@@ -718,7 +731,12 @@ pub async fn run_pending_events_on(
                 match next_trigger_at(&repeat, trigger_at) {
                     Some(next_at) => {
                         // Repeating event: advance to next occurrence.
-                        props["trigger_at"] = json!(next_at.to_rfc3339());
+                        // Rendered at the original offset (issue #792), not
+                        // UTC — `next_trigger_at` computes the advanced
+                        // instant in UTC, but the caller's original
+                        // `trigger_at` offset must survive serialization.
+                        props["trigger_at"] =
+                            json!(next_at.with_timezone(&trigger_offset).to_rfc3339());
                         props["status"] = json!("pending");
                         props["fired_at"] = json!(fired_at_rfc);
                         properties = Some(props);
@@ -2002,6 +2020,72 @@ mod tests {
         );
     }
 
+    /// Issue #792: repeat advancement must preserve the original
+    /// `trigger_at` timezone offset — not silently re-serialize the advanced
+    /// occurrence as UTC. A `+04:00` schedule that fires and advances must
+    /// still carry `+04:00` (and the same local wall-clock hour) on its next
+    /// occurrence, not drift to a different wall-clock hour under `+00:00`.
+    #[tokio::test]
+    async fn daily_repeat_advance_preserves_original_offset() {
+        let (_tmp, db_path) = tmp_db();
+        let rt = make_rt(&db_path).await;
+
+        // Chronologically a few seconds ago (in-grace), formatted at a
+        // non-UTC +04:00 wall-clock offset — the exact shape
+        // `khive-pack-schedule` round-trips verbatim from the caller (H5).
+        let plus_four = FixedOffset::east_opt(4 * 3600).expect("valid offset");
+        let trigger_instant = Utc::now() - Duration::seconds(5);
+        let past = trigger_instant.with_timezone(&plus_four).to_rfc3339();
+
+        let id = create_scheduled_event(
+            &rt,
+            "local",
+            &past,
+            Some("stats()"),
+            Some("daily"),
+            "schedule",
+        )
+        .await;
+
+        let summary = drain_for_test(&db_path).await.expect("drain");
+        assert!(
+            summary.advanced >= 1,
+            "daily event with a non-UTC offset must be advanced, not fired"
+        );
+
+        let props = get_note_props(&rt, id).await;
+        let new_trigger = props["trigger_at"]
+            .as_str()
+            .expect("trigger_at must be set");
+
+        // The advanced occurrence must still carry the ORIGINAL +04:00
+        // offset, not be silently re-serialized as UTC (+00:00).
+        assert!(
+            new_trigger.ends_with("+04:00"),
+            "advanced trigger_at must preserve the original +04:00 offset, got {new_trigger:?}"
+        );
+
+        let new_dt = DateTime::parse_from_rfc3339(new_trigger).expect("parseable advanced ts");
+        let original_dt = DateTime::parse_from_rfc3339(&past).expect("parseable original ts");
+        assert_eq!(
+            *new_dt.offset(),
+            plus_four,
+            "advanced trigger_at offset must equal the original +04:00 offset"
+        );
+        assert_eq!(
+            new_dt.with_timezone(&Utc),
+            original_dt.with_timezone(&Utc) + Duration::days(1),
+            "daily advance must add exactly 1 day to the chronological instant"
+        );
+        // Wall-clock hour must be unchanged (the drift this issue reports):
+        // same local time-of-day at the same offset, one day later.
+        assert_eq!(
+            new_dt.time(),
+            original_dt.time(),
+            "advanced occurrence must retain the same local wall-clock time"
+        );
+    }
+
     #[tokio::test]
     async fn namespace_isolation() {
         let (_tmp, db_path) = tmp_db();
@@ -2901,6 +2985,58 @@ mod tests {
             new_trigger <= now + Duration::days(1),
             "re-armed trigger_at must be the very next occurrence, not skip further \
              (no catch-up burst), got {new_trigger} (now={now})"
+        );
+    }
+
+    /// Issue #792 (missed-path variant): a missed repeat's re-arm must also
+    /// preserve the original `trigger_at` offset, not just the normal
+    /// fire-and-advance path — both call through the same
+    /// `next_trigger_at`-derived arithmetic and must both render at the
+    /// caller's original offset.
+    #[tokio::test]
+    async fn missed_repeat_rearm_preserves_original_offset() {
+        let (_tmp, db_path) = tmp_db();
+        let rt = make_rt(&db_path).await;
+
+        // 10 days overdue with a daily repeat, formatted at a non-UTC
+        // +04:00 wall-clock offset.
+        let plus_four = FixedOffset::east_opt(4 * 3600).expect("valid offset");
+        let original_trigger = (Utc::now() - Duration::days(10)).with_timezone(&plus_four);
+        let id = create_scheduled_event(
+            &rt,
+            "local",
+            &original_trigger.to_rfc3339(),
+            Some("stats()"),
+            Some("daily"),
+            "schedule",
+        )
+        .await;
+
+        let summary = drain_for_test(&db_path).await.expect("drain");
+        assert_eq!(
+            summary.missed.len(),
+            1,
+            "exactly one missed occurrence recorded"
+        );
+
+        let props = get_note_props(&rt, id).await;
+        let new_trigger = props["trigger_at"]
+            .as_str()
+            .expect("trigger_at must be set");
+        assert!(
+            new_trigger.ends_with("+04:00"),
+            "re-armed trigger_at must preserve the original +04:00 offset, got {new_trigger:?}"
+        );
+        let new_dt = DateTime::parse_from_rfc3339(new_trigger).expect("parseable re-armed ts");
+        assert_eq!(
+            *new_dt.offset(),
+            plus_four,
+            "re-armed trigger_at offset must equal the original +04:00 offset"
+        );
+        assert_eq!(
+            new_dt.time(),
+            original_trigger.time(),
+            "re-armed occurrence must retain the same local wall-clock time"
         );
     }
 
