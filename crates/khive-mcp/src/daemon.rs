@@ -424,6 +424,7 @@ impl daemon::DaemonDispatch for crate::server::KhiveMcpServer {
             save_to: None,
             format,
             format_per_op,
+            request_id: None,
         };
         // Honor the frame's origin: a wire-origin request enforces verb
         // visibility even when served by the daemon; an operator request does not.
@@ -920,6 +921,7 @@ async fn probe_daemon_identity(config_id: &str, namespace: &str, timeout_ms: u64
         format: None,
         format_per_op: None,
         from_wire: false,
+        request_id: None,
     };
     let deadline = std::time::Duration::from_millis(timeout_ms);
     match tokio::time::timeout(deadline, try_forward_inner(&probe)).await {
@@ -2123,6 +2125,7 @@ mod tests {
             version_mismatch: false,
             daemon_protocol_version: PROTOCOL_VERSION,
             metrics: None,
+            request_id: None,
         }
     }
 
@@ -2137,6 +2140,7 @@ mod tests {
             version_mismatch: false,
             daemon_protocol_version: PROTOCOL_VERSION,
             metrics: None,
+            request_id: None,
         }
     }
 
@@ -2159,6 +2163,7 @@ mod tests {
             version_mismatch: false,
             daemon_protocol_version: PROTOCOL_VERSION,
             metrics: None,
+            request_id: None,
         };
         assert!(map_response(resp, CFG, NS).is_none());
         assert_eq!(fallback_count(FallbackReason::NamespaceMismatch), 1);
@@ -2180,6 +2185,7 @@ mod tests {
             version_mismatch: false,
             daemon_protocol_version: PROTOCOL_VERSION,
             metrics: None,
+            request_id: None,
         };
         assert!(map_response(resp, CFG, NS).is_none());
         assert_eq!(fallback_count(FallbackReason::ConfigMismatch), 1);
@@ -2203,6 +2209,7 @@ mod tests {
             version_mismatch: false,
             daemon_protocol_version: 0,
             metrics: None,
+            request_id: None,
         };
         assert!(map_response(resp, CFG, NS).is_none());
         // The served_config_id-echo path is bucketed under config_mismatch —
@@ -2230,6 +2237,7 @@ mod tests {
             version_mismatch: false,
             daemon_protocol_version: PROTOCOL_VERSION,
             metrics: None,
+            request_id: None,
         };
         assert!(map_response(resp, CFG, NS).is_none());
         assert_eq!(fallback_count(FallbackReason::ConfigMismatch), 1);
@@ -2256,6 +2264,7 @@ mod tests {
             version_mismatch: false,
             daemon_protocol_version: PROTOCOL_VERSION,
             metrics: None,
+            request_id: None,
         };
         match map_response(resp, CFG, NS) {
             Some(Ok(s)) => assert_eq!(s, ""),
@@ -2299,6 +2308,7 @@ mod tests {
             version_mismatch: true,
             daemon_protocol_version: PROTOCOL_VERSION,
             metrics: None,
+            request_id: None,
         };
         match map_response(resp, CFG, NS) {
             Some(Err(McpError { message, .. })) => {
@@ -2327,6 +2337,7 @@ mod tests {
             version_mismatch: true,
             daemon_protocol_version: 99,
             metrics: None,
+            request_id: None,
         };
         match map_response(resp, CFG, NS) {
             Some(Err(McpError { message, .. })) => {
@@ -2668,6 +2679,7 @@ mod tests {
             format: None,
             format_per_op: None,
             from_wire: false,
+            request_id: None,
         };
         let out = forward_or_spawn(&frame).await;
         assert!(out.is_none());
@@ -2710,6 +2722,7 @@ mod tests {
             format: None,
             format_per_op: None,
             from_wire: false,
+            request_id: None,
         }
     }
 
@@ -2834,6 +2847,7 @@ mod tests {
             format: None,
             format_per_op: None,
             from_wire: false,
+            request_id: None,
         };
         let resp = exchange(&sock, &req).await;
         assert!(resp.ok, "valid op must succeed; error={:?}", resp.error);
@@ -2855,6 +2869,7 @@ mod tests {
                 save_to: None,
                 format: None,
                 format_per_op: None,
+                request_id: None,
             })
             .await
             .expect("local dispatch of stats() must succeed");
@@ -2879,6 +2894,7 @@ mod tests {
             format: None,
             format_per_op: None,
             from_wire: false,
+            request_id: None,
         };
         let resp_other = exchange(&sock, &other).await;
         assert!(
@@ -2915,6 +2931,7 @@ mod tests {
             format: None,
             format_per_op: None,
             from_wire: false,
+            request_id: None,
         };
         let resp_cfg = exchange(&sock, &mismatched_config).await;
         assert!(
@@ -2939,6 +2956,7 @@ mod tests {
             format: None,
             format_per_op: None,
             from_wire: false,
+            request_id: None,
         };
         let resp_ver = exchange(&sock, &wrong_version).await;
         assert!(
@@ -3020,6 +3038,7 @@ mod tests {
             format: None,
             format_per_op: None,
             from_wire: false,
+            request_id: None,
         };
         let bob_frame = DaemonRequestFrame {
             ops: "comm.send(to=\"alice\", content=\"hello from bob\")".to_string(),
@@ -3035,6 +3054,7 @@ mod tests {
             format: None,
             format_per_op: None,
             from_wire: false,
+            request_id: None,
         };
 
         let resp_alice = exchange(&sock, &alice_frame).await;
@@ -3148,6 +3168,7 @@ mod tests {
             format: None,
             format_per_op: None,
             from_wire: false,
+            request_id: None,
         };
 
         let seed_a = exchange(
@@ -3247,6 +3268,7 @@ mod tests {
                 save_to: None,
                 format: None,
                 format_per_op: None,
+                request_id: None,
             })
             .await
             .expect("local dispatch of comm.send must succeed");
@@ -3303,6 +3325,7 @@ mod tests {
             format: None,
             format_per_op: None,
             from_wire,
+            request_id: None,
         };
 
         // (a) from_wire=true → daemon applies the wire visibility gate:
@@ -3404,6 +3427,7 @@ mod tests {
             version_mismatch: false,
             daemon_protocol_version: 0,
             metrics: None,
+            request_id: None,
         }
     }
 
@@ -3465,6 +3489,7 @@ mod tests {
             format: None,
             format_per_op: None,
             from_wire: false,
+            request_id: None,
         };
 
         let result = forward_or_spawn(&frame).await;
@@ -3572,6 +3597,7 @@ mod tests {
             format: None,
             format_per_op: None,
             from_wire: false,
+            request_id: None,
         };
 
         // Call try_forward_inner directly to assert the discriminant.
@@ -3879,6 +3905,7 @@ mod tests {
             format: None,
             format_per_op: None,
             from_wire: false,
+            request_id: None,
         };
 
         let result = forward_or_spawn(&frame).await;
@@ -4099,6 +4126,7 @@ mod tests {
             format: None,
             format_per_op: None,
             from_wire: false,
+            request_id: None,
         };
         let fwd = try_forward_inner(&real_frame).await;
         assert!(
@@ -4145,6 +4173,7 @@ mod tests {
                 version_mismatch: false,
                 daemon_protocol_version: PROTOCOL_VERSION,
                 metrics: None,
+                request_id: None,
             };
             if let Ok(payload) = serde_json::to_vec(&response) {
                 let _ = write_frame(&mut stream, &payload).await;
@@ -4507,6 +4536,7 @@ mod tests {
             version_mismatch: false,
             daemon_protocol_version: PROTOCOL_VERSION,
             metrics: None,
+            request_id: None,
         }
     }
 
@@ -4654,6 +4684,7 @@ mod tests {
             format: None,
             format_per_op: None,
             from_wire: false,
+            request_id: None,
         };
 
         let result = forward_or_spawn(&frame).await;
@@ -4714,6 +4745,7 @@ mod tests {
             version_mismatch: true,
             daemon_protocol_version: 0,
             metrics: None,
+            request_id: None,
         }
     }
 
@@ -4752,6 +4784,7 @@ mod tests {
             format: None,
             format_per_op: None,
             from_wire: false,
+            request_id: None,
         };
 
         let outcome = try_forward_inner(&frame).await;
@@ -4795,6 +4828,7 @@ mod tests {
             version_mismatch: true,
             daemon_protocol_version: PROTOCOL_VERSION + 1,
             metrics: None,
+            request_id: None,
         }
     }
 
@@ -4832,6 +4866,7 @@ mod tests {
             format: None,
             format_per_op: None,
             from_wire: false,
+            request_id: None,
         };
 
         let outcome = try_forward_inner(&frame).await;
@@ -4922,6 +4957,7 @@ mod tests {
             format: None,
             format_per_op: None,
             from_wire: false,
+            request_id: None,
         };
 
         let result = forward_or_spawn(&frame).await;
@@ -5025,6 +5061,7 @@ mod tests {
             format: None,
             format_per_op: None,
             from_wire: false,
+            request_id: None,
         };
 
         let result = forward_or_spawn(&frame).await;
@@ -5103,6 +5140,7 @@ mod tests {
                     version_mismatch: false,
                     daemon_protocol_version: PROTOCOL_VERSION,
                     metrics: None,
+                    request_id: None,
                 };
                 let payload = serde_json::to_vec(&resp).expect("serialize response frame");
                 let _ = write_frame(&mut stream, &payload).await;
@@ -5123,6 +5161,7 @@ mod tests {
             format: None,
             format_per_op: None,
             from_wire: false,
+            request_id: None,
         };
 
         let result = forward_or_spawn(&frame).await;
@@ -5251,6 +5290,7 @@ mod tests {
             format: None,
             format_per_op: None,
             from_wire: false,
+            request_id: None,
         };
 
         let started = std::time::Instant::now();

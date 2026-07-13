@@ -163,14 +163,28 @@ pub fn cost_unit_for_dispatch(
 /// dispatch. Default for all handlers."). Background phase work (embedder
 /// warmup, ANN rebuild, etc.) uses the separate `PhaseStarted` /
 /// `PhaseCompleted` / `PhaseCancelled` event family and never this payload.
+///
+/// `request_id` (khive#948) is the caller-supplied correlation id threaded in
+/// from the daemon frame via `RequestIdentity`, stamped alongside
+/// `work_class`/`cost_unit` when the caller supplied one. Its absence has
+/// exactly one meaning (no id was supplied, e.g. a pre-#948 client or an
+/// internal/non-benchmark caller) — unlike `cost_unit`, it is never
+/// conditionally omitted on an otherwise-successful row.
 pub fn resource_payload(
     verb: &str,
     params: &Value,
     result: &Value,
     registered_model_count: impl FnOnce() -> i64,
+    request_id: Option<u64>,
 ) -> Value {
     let cost_unit = cost_unit_for_dispatch(verb, params, result, registered_model_count);
-    serde_json::json!({ "work_class": "interactive", "cost_unit": cost_unit })
+    let mut payload = serde_json::json!({ "work_class": "interactive", "cost_unit": cost_unit });
+    if let Some(id) = request_id {
+        if let Value::Object(ref mut map) = payload {
+            map.insert("request_id".to_string(), serde_json::json!(id));
+        }
+    }
+    payload
 }
 
 /// Build the `resource` payload object for a dispatch that did not resolve
@@ -184,8 +198,18 @@ pub fn resource_payload(
 /// omission cases, so it must still be present. Every dispatch through
 /// `VerbRegistry::dispatch*` is `work_class: "interactive"` regardless of
 /// outcome; there is no non-interactive outcome for a verb dispatch.
-pub fn base_resource_payload() -> Value {
-    serde_json::json!({ "work_class": "interactive" })
+///
+/// `request_id` (khive#948) is stamped the same way on this payload as on
+/// [`resource_payload`]'s: failure rows must be joinable by the same key as
+/// success rows.
+pub fn base_resource_payload(request_id: Option<u64>) -> Value {
+    let mut payload = serde_json::json!({ "work_class": "interactive" });
+    if let Some(id) = request_id {
+        if let Value::Object(ref mut map) = payload {
+            map.insert("request_id".to_string(), serde_json::json!(id));
+        }
+    }
+    payload
 }
 
 #[cfg(test)]
@@ -388,11 +412,49 @@ mod tests {
 
     #[test]
     fn resource_payload_shape_is_work_class_and_cost_unit_only() {
-        let payload = resource_payload("stats", &json!({}), &json!({}), unreachable_model_count);
+        let payload = resource_payload(
+            "stats",
+            &json!({}),
+            &json!({}),
+            unreachable_model_count,
+            None,
+        );
         assert_eq!(
             payload,
             json!({"work_class": "interactive", "cost_unit": 1}),
-            "resource payload must be exactly {{work_class, cost_unit}}, no extra fields"
+            "resource payload must be exactly {{work_class, cost_unit}}, no request_id key \
+             when the caller supplied none"
+        );
+    }
+
+    #[test]
+    fn resource_payload_stamps_request_id_when_supplied() {
+        let payload = resource_payload(
+            "stats",
+            &json!({}),
+            &json!({}),
+            unreachable_model_count,
+            Some(42),
+        );
+        assert_eq!(
+            payload,
+            json!({"work_class": "interactive", "cost_unit": 1, "request_id": 42}),
+        );
+    }
+
+    #[test]
+    fn base_resource_payload_omits_request_id_when_absent() {
+        assert_eq!(
+            base_resource_payload(None),
+            json!({"work_class": "interactive"}),
+        );
+    }
+
+    #[test]
+    fn base_resource_payload_stamps_request_id_when_supplied() {
+        assert_eq!(
+            base_resource_payload(Some(7)),
+            json!({"work_class": "interactive", "request_id": 7}),
         );
     }
 }
