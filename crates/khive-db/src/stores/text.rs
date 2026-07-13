@@ -39,6 +39,36 @@ pub fn delete_document_statement(table: &str, namespace: &str, subject_id: Uuid)
     }
 }
 
+/// Build the `INSERT` half of the FTS delete-then-insert upsert.
+///
+/// `table` must be a trusted, sanitized table name because SQL identifiers
+/// cannot be bound as parameters.
+pub fn insert_document_statement(table: &str, document: &TextDocument) -> SqlStatement {
+    let tags_json = tags_to_json(&document.tags);
+    let metadata_json = document.metadata.as_ref().map(|v| v.to_string());
+    SqlStatement {
+        sql: format!(
+            "INSERT INTO {table} \
+             (subject_id, kind, title, body, tags, namespace, metadata, updated_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)"
+        ),
+        params: vec![
+            SqlValue::Text(document.subject_id.to_string()),
+            SqlValue::Text(document.kind.to_string()),
+            SqlValue::Text(document.title.clone().unwrap_or_default()),
+            SqlValue::Text(document.body.clone()),
+            SqlValue::Text(tags_json),
+            SqlValue::Text(document.namespace.clone()),
+            match metadata_json {
+                Some(m) => SqlValue::Text(m),
+                None => SqlValue::Null,
+            },
+            SqlValue::Integer(dt_to_micros(&document.updated_at)),
+        ],
+        label: Some(format!("fts-insert-{table}")),
+    }
+}
+
 /// Ensure the FTS5 virtual table for `table_key` exists.
 ///
 /// Used in tests to set up an in-memory FTS5 table without the full `StorageBackend`.
@@ -651,39 +681,15 @@ fn upsert_document_dml(
     table: &str,
     document: &TextDocument,
 ) -> Result<(), rusqlite::Error> {
-    let namespace = &document.namespace;
-
-    let del_sql = format!(
-        "DELETE FROM {} WHERE namespace = ?1 AND subject_id = ?2",
-        table
-    );
-    conn.execute(
-        &del_sql,
-        rusqlite::params![namespace, document.subject_id.to_string()],
-    )?;
-
-    let ins_sql = format!(
-        "INSERT INTO {} \
-         (subject_id, kind, title, body, tags, namespace, metadata, updated_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-        table
-    );
-    let tags_json = tags_to_json(&document.tags);
-    let metadata_json: Option<String> = document.metadata.as_ref().map(|v| v.to_string());
-
-    conn.execute(
-        &ins_sql,
-        rusqlite::params![
-            document.subject_id.to_string(),
-            document.kind.to_string(),
-            document.title.as_deref().unwrap_or(""),
-            document.body,
-            tags_json,
-            namespace,
-            metadata_json,
-            dt_to_micros(&document.updated_at),
-        ],
-    )?;
+    let statements = [
+        delete_document_statement(table, &document.namespace, document.subject_id),
+        insert_document_statement(table, document),
+    ];
+    for statement in statements {
+        let mut stmt = conn.prepare(&statement.sql)?;
+        bind_params(&mut stmt, &statement.params)?;
+        stmt.raw_execute()?;
+    }
     Ok(())
 }
 

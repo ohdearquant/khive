@@ -3,18 +3,43 @@
 use uuid::Uuid;
 
 use khive_runtime::{
+    atomic_prepare::{
+        apply_post_commit_effects, prepare_add_entity, prepare_add_note, prepare_op,
+        prepare_update_entity_plan,
+    },
     curation::{ContentMergeStrategy, EntityDedupMergePolicy, EntityPatch},
-    KhiveRuntime, NamespaceToken, RuntimeError, VerbRegistry,
+    AtomicOpPlan, AtomicRunOutcome, EdgeListFilter, KhiveRuntime, NamespaceToken, RuntimeError,
+    VerbRegistry,
 };
 use khive_storage::types::PageRequest;
 use khive_storage::{EdgeRelation, EventFilter};
 use khive_types::{
-    ApplyResult, EntityDraft, EventKind, Id128, NoteDraft, ProposalAppliedPayload,
-    ProposalChangeset, ProposalCreatedPayload, ProposalEntityPatch, Timestamp,
+    ApplyResult, EventKind, Id128, ProposalAppliedPayload, ProposalChangeset,
+    ProposalCreatedPayload, Timestamp,
 };
 
 use super::budget::{count_new_entries, has_multi_step_compound, WriteBudget};
 use crate::projection_worker::ProposalsProjectionWorker;
+
+pub(super) enum PreparedApply {
+    Atomic {
+        plans: Vec<AtomicOpPlan>,
+        created_records: Vec<PendingCreatedRecord>,
+    },
+    CanonicalMerge {
+        into_id: Uuid,
+        from_id: Uuid,
+    },
+}
+
+pub(super) enum PendingCreatedRecord {
+    Id(Uuid),
+    Edge {
+        source_id: Uuid,
+        target_id: Uuid,
+        relation: EdgeRelation,
+    },
+}
 
 /// Worker that applies approved proposal changesets.
 pub struct ProposalApplyWorker {
@@ -197,24 +222,103 @@ impl ProposalApplyWorker {
         Ok(payload.changeset)
     }
 
-    /// Apply a single changeset arm, or recursively for `Compound`. Box-pinned for recursion.
-    fn apply_changeset<'a>(
+    async fn apply_changeset(
+        &self,
+        token: &NamespaceToken,
+        changeset: &ProposalChangeset,
+        registry: &VerbRegistry,
+        budget: &mut WriteBudget,
+    ) -> Result<Vec<Uuid>, RuntimeError> {
+        match self
+            .prepare_changeset(token, changeset, registry, budget)
+            .await?
+        {
+            PreparedApply::Atomic {
+                plans,
+                created_records,
+            } => {
+                let outcome = khive_runtime::run_atomic_unit(self.runtime.sql().as_ref(), plans)
+                    .await
+                    .map_err(|error| RuntimeError::Storage(error.0))?;
+                match outcome {
+                    AtomicRunOutcome::Committed { post_commit } => {
+                        apply_post_commit_effects(&self.runtime, token, post_commit).await?;
+                        self.resolve_created_records(token, created_records).await
+                    }
+                    AtomicRunOutcome::RolledBack {
+                        failed_op_index,
+                        failure,
+                    } => Err(RuntimeError::Internal(format!(
+                        "atomic proposal apply rolled back at plan {failed_op_index}: {failure:?}"
+                    ))),
+                }
+            }
+            PreparedApply::CanonicalMerge { into_id, from_id } => {
+                self.runtime
+                    .merge_entity(
+                        token,
+                        into_id,
+                        from_id,
+                        EntityDedupMergePolicy::PreferInto,
+                        ContentMergeStrategy::Append,
+                        false,
+                    )
+                    .await?;
+                Ok(vec![])
+            }
+        }
+    }
+
+    pub(super) fn prepare_changeset<'a>(
         &'a self,
         token: &'a NamespaceToken,
         changeset: &'a ProposalChangeset,
         registry: &'a VerbRegistry,
         budget: &'a mut WriteBudget,
     ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<Vec<Uuid>, RuntimeError>> + Send + 'a>,
+        Box<dyn std::future::Future<Output = Result<PreparedApply, RuntimeError>> + Send + 'a>,
     > {
         Box::pin(async move {
             match changeset {
                 ProposalChangeset::AddEntity { entity } => {
-                    self.apply_add_entity(token, entity, registry, budget).await
+                    let kind =
+                        crate::handlers::canonical_entity_kind(entity.kind.as_str(), registry)?;
+                    budget.consume_new_entry()?;
+                    let args = serde_json::json!({
+                        "kind": kind,
+                        "name": entity.name,
+                        "description": entity.description,
+                        "properties": entity.properties,
+                        "tags": entity.tags,
+                    });
+                    let plan = prepare_add_entity(&self.runtime, token, &args).await?;
+                    let entity_id = match &plan {
+                        AtomicOpPlan::AddEntity(plan) => plan.entity_id,
+                        _ => unreachable!("prepare_add_entity returned a different plan variant"),
+                    };
+                    Ok(PreparedApply::Atomic {
+                        plans: vec![plan],
+                        created_records: vec![PendingCreatedRecord::Id(entity_id)],
+                    })
                 }
                 ProposalChangeset::UpdateEntity { id, patch } => {
-                    self.apply_update_entity(token, *id, patch).await?;
-                    Ok(vec![])
+                    let entity_id = Uuid::from_u128(id.to_u128());
+                    let plan = prepare_update_entity_plan(
+                        &self.runtime,
+                        token,
+                        entity_id,
+                        EntityPatch {
+                            name: patch.name.clone(),
+                            description: patch.description.clone(),
+                            properties: patch.properties.clone(),
+                            tags: patch.tags.clone(),
+                        },
+                    )
+                    .await?;
+                    Ok(PreparedApply::Atomic {
+                        plans: vec![plan],
+                        created_records: vec![],
+                    })
                 }
                 ProposalChangeset::AddEdge {
                     source,
@@ -222,168 +326,124 @@ impl ProposalApplyWorker {
                     relation,
                     weight,
                 } => {
-                    let edge_id = self
-                        .apply_add_edge(token, *source, *target, *relation, *weight)
-                        .await?;
-                    Ok(vec![edge_id])
+                    let source_id = Uuid::from_u128(source.to_u128());
+                    let target_id = Uuid::from_u128(target.to_u128());
+                    let relation = crate::handlers::parse_relation(relation.as_str())?;
+                    let args = serde_json::json!({
+                        "source_id": source_id,
+                        "target_id": target_id,
+                        "relation": relation.as_str(),
+                        "weight": weight.map(f64::from),
+                    });
+                    let plan = prepare_op(&self.runtime, token, "link", &args).await?;
+                    let (source_id, target_id) = match &plan {
+                        AtomicOpPlan::Link(plan) => (plan.source_id, plan.target_id),
+                        _ => unreachable!("link prepare returned a different plan variant"),
+                    };
+                    Ok(PreparedApply::Atomic {
+                        plans: vec![plan],
+                        created_records: vec![PendingCreatedRecord::Edge {
+                            source_id,
+                            target_id,
+                            relation,
+                        }],
+                    })
                 }
                 ProposalChangeset::AddNote { note } => {
-                    self.apply_add_note(token, note, registry, budget).await
+                    let kind =
+                        crate::handlers::canonical_note_kind(note.kind.as_str(), registry)?;
+                    budget.consume_new_entry()?;
+                    let args = serde_json::json!({
+                        "kind": kind,
+                        "name": note.name,
+                        "content": note.content,
+                        "properties": note.properties,
+                    });
+                    let plan = prepare_add_note(&self.runtime, token, &args).await?;
+                    let note_id = match &plan {
+                        AtomicOpPlan::AddNote(plan) => plan.note_id,
+                        _ => unreachable!("prepare_add_note returned a different plan variant"),
+                    };
+                    Ok(PreparedApply::Atomic {
+                        plans: vec![plan],
+                        created_records: vec![PendingCreatedRecord::Id(note_id)],
+                    })
                 }
                 ProposalChangeset::MergeEntities { into, from } => {
-                    self.apply_merge_entities(token, *into, *from).await?;
-                    Ok(vec![])
+                    Ok(PreparedApply::CanonicalMerge {
+                        into_id: Uuid::from_u128(into.to_u128()),
+                        from_id: Uuid::from_u128(from.to_u128()),
+                    })
                 }
                 ProposalChangeset::SupersedeEntity { old, new } => {
-                    self.apply_supersede_entity(token, *old, *new).await?;
-                    Ok(vec![])
+                    let old_id = Uuid::from_u128(old.to_u128());
+                    let new_id = Uuid::from_u128(new.to_u128());
+                    let args = serde_json::json!({
+                        "source_id": new_id,
+                        "target_id": old_id,
+                        "relation": EdgeRelation::Supersedes.as_str(),
+                    });
+                    let plan = prepare_op(&self.runtime, token, "link", &args).await?;
+                    Ok(PreparedApply::Atomic {
+                        plans: vec![plan],
+                        created_records: vec![],
+                    })
                 }
-                ProposalChangeset::Compound { steps } => {
-                    let mut all_created = Vec::new();
-                    for step in steps {
-                        let created = self.apply_changeset(token, step, registry, budget).await?;
-                        all_created.extend(created);
-                    }
-                    Ok(all_created)
-                }
+                ProposalChangeset::Compound { steps } => match steps.as_slice() {
+                    [] => Ok(PreparedApply::Atomic {
+                        plans: vec![],
+                        created_records: vec![],
+                    }),
+                    [step] => self.prepare_changeset(token, step, registry, budget).await,
+                    _ => Err(RuntimeError::InvalidInput(
+                        "multi-step Compound proposals are not supported until atomic proposal apply is available"
+                            .to_string(),
+                    )),
+                },
             }
         })
     }
 
-    /// Apply `AddEntity`: create the entity from the structured draft.
-    async fn apply_add_entity(
+    async fn resolve_created_records(
         &self,
         token: &NamespaceToken,
-        draft: &EntityDraft,
-        registry: &VerbRegistry,
-        budget: &mut WriteBudget,
+        records: Vec<PendingCreatedRecord>,
     ) -> Result<Vec<Uuid>, RuntimeError> {
-        let kind = crate::handlers::canonical_entity_kind(draft.kind.as_str(), registry)?;
-        if draft.name.trim().is_empty() {
-            return Err(RuntimeError::InvalidInput("name must not be empty".into()));
+        let mut ids = Vec::with_capacity(records.len());
+        for record in records {
+            match record {
+                PendingCreatedRecord::Id(id) => ids.push(id),
+                PendingCreatedRecord::Edge {
+                    source_id,
+                    target_id,
+                    relation,
+                } => {
+                    let edge = self
+                        .runtime
+                        .list_edges(
+                            token,
+                            EdgeListFilter {
+                                source_id: Some(source_id),
+                                target_id: Some(target_id),
+                                relations: vec![relation],
+                                ..Default::default()
+                            },
+                            1,
+                            0,
+                        )
+                        .await?
+                        .into_iter()
+                        .next()
+                        .ok_or_else(|| {
+                            RuntimeError::Internal(
+                                "committed proposal edge was not found by natural key".to_string(),
+                            )
+                        })?;
+                    ids.push(edge.id.0);
+                }
+            }
         }
-        budget.consume_new_entry()?;
-        let entity = self
-            .runtime
-            .create_entity(
-                token,
-                kind.as_str(),
-                None,
-                draft.name.as_str(),
-                draft.description.as_deref(),
-                draft.properties.clone(),
-                draft.tags.clone(),
-            )
-            .await?;
-        Ok(vec![entity.id])
-    }
-
-    /// Apply `UpdateEntity`: apply the structured patch to the entity.
-    async fn apply_update_entity(
-        &self,
-        token: &NamespaceToken,
-        id: Id128,
-        proposal_patch: &ProposalEntityPatch,
-    ) -> Result<(), RuntimeError> {
-        let entity_id = Uuid::from_u128(id.to_u128());
-        let patch = EntityPatch {
-            name: proposal_patch.name.clone(),
-            description: proposal_patch.description.clone(),
-            properties: proposal_patch.properties.clone(),
-            tags: proposal_patch.tags.clone(),
-        };
-        self.runtime.update_entity(token, entity_id, patch).await?;
-        Ok(())
-    }
-
-    /// Apply `AddEdge`: link source→target with the given relation.
-    async fn apply_add_edge(
-        &self,
-        token: &NamespaceToken,
-        source: Id128,
-        target: Id128,
-        relation: khive_types::EdgeRelation,
-        weight: Option<f32>,
-    ) -> Result<Uuid, RuntimeError> {
-        let source_id = Uuid::from_u128(source.to_u128());
-        let target_id = Uuid::from_u128(target.to_u128());
-        let storage_relation = crate::handlers::parse_relation(relation.as_str())?;
-        let edge = self
-            .runtime
-            .link(
-                token,
-                source_id,
-                target_id,
-                storage_relation,
-                weight.unwrap_or(1.0) as f64,
-                None,
-            )
-            .await?;
-        Ok(edge.id.0)
-    }
-
-    /// Apply `AddNote`: create the note from the structured draft.
-    async fn apply_add_note(
-        &self,
-        token: &NamespaceToken,
-        draft: &NoteDraft,
-        registry: &VerbRegistry,
-        budget: &mut WriteBudget,
-    ) -> Result<Vec<Uuid>, RuntimeError> {
-        let kind = draft.kind.as_str();
-        let canonical_kind = crate::handlers::canonical_note_kind(kind, registry)?;
-        budget.consume_new_entry()?;
-        let note = self
-            .runtime
-            .create_note(
-                token,
-                &canonical_kind,
-                draft.name.as_deref(),
-                draft.content.as_str(),
-                None,
-                draft.properties.clone(),
-                vec![],
-            )
-            .await?;
-        Ok(vec![note.id])
-    }
-
-    /// Apply `MergeEntities`: merge `from` into `into`.
-    async fn apply_merge_entities(
-        &self,
-        token: &NamespaceToken,
-        into: Id128,
-        from: Id128,
-    ) -> Result<(), RuntimeError> {
-        let into_id = Uuid::from_u128(into.to_u128());
-        let from_id = Uuid::from_u128(from.to_u128());
-        self.runtime
-            .merge_entity(
-                token,
-                into_id,
-                from_id,
-                EntityDedupMergePolicy::PreferInto,
-                ContentMergeStrategy::Append,
-                false,
-            )
-            .await?;
-        Ok(())
-    }
-
-    /// Apply `SupersedeEntity`: add a `supersedes` edge from `new` → `old`.
-    async fn apply_supersede_entity(
-        &self,
-        token: &NamespaceToken,
-        old: Id128,
-        new: Id128,
-    ) -> Result<(), RuntimeError> {
-        let old_id = Uuid::from_u128(old.to_u128());
-        let new_id = Uuid::from_u128(new.to_u128());
-        let relation = EdgeRelation::Supersedes;
-        self.runtime
-            .link(token, new_id, old_id, relation, 1.0, None)
-            .await?;
-        Ok(())
+        Ok(ids)
     }
 
     /// Emit a `ProposalApplied` event with a success result.

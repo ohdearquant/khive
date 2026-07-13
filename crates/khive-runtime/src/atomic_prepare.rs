@@ -1,9 +1,11 @@
 //! ADR-099: the per-verb async prepare pass for the KG-substrate v1
-//! admissible verbs (`update`, `delete`, `link`, `merge`). Each `prepare_*`
-//! function reads current state (async, outside any transaction) and
-//! returns a plain-data [`crate::atomic_runner::AtomicOpPlan`]
-//! ([`crate::atomic_plan`]) for the synchronous commit pass
-//! ([`crate::atomic_runner::run_atomic_unit`]) to apply.
+//! admissible verbs (`update`, `delete`, `link`, `merge`), plus
+//! [`prepare_add_entity`]/[`prepare_add_note`] for the ADR-046 proposal
+//! changeset `AddEntity`/`AddNote` arms. Each `prepare_*` function reads
+//! current state (async, outside any transaction) and returns a plain-data
+//! [`crate::atomic_runner::AtomicOpPlan`] ([`crate::atomic_plan`]) for the
+//! synchronous commit pass ([`crate::atomic_runner::run_atomic_unit`]) to
+//! apply.
 //!
 //! `gtd.transition` / `gtd.complete` prepare is deliberately **not** here:
 //! their lifecycle vocabulary (`is_terminal`, `can_transition`, ...) lives in
@@ -42,10 +44,11 @@ use khive_storage::{EdgeRelation, SqlStatement};
 use khive_types::{EventKind, SubstrateKind};
 
 use crate::atomic_plan::{
-    AffectedRowGuard, DeletePlan, EdgeNaturalKey, LinkPlan, MergePlan, PlanStatement,
-    PostCommitEffect, UpdatePlan,
+    AddEntityPlan, AddNotePlan, AffectedRowGuard, DeletePlan, EdgeNaturalKey, LinkPlan, MergePlan,
+    PlanStatement, PostCommitEffect, UpdatePlan,
 };
 use crate::atomic_runner::AtomicOpPlan;
+use crate::curation::{entity_fts_document, note_fts_document};
 use crate::error::{RuntimeError, RuntimeResult};
 use crate::operations::{
     canonical_edge_endpoints, merge_dependency_kind, validate_edge_metadata, validate_edge_weight,
@@ -66,6 +69,7 @@ use khive_db::stores::graph::{
 use khive_db::stores::note::{
     note_hard_delete_statement, note_soft_delete_statement, note_upsert_statement,
 };
+use khive_db::stores::text::insert_document_statement;
 
 // ---------------------------------------------------------------------------
 // arg extraction helpers
@@ -91,6 +95,16 @@ fn require_uuid(args: &Value, key: &str) -> RuntimeResult<Uuid> {
 
 fn optional_str<'a>(args: &'a Value, key: &str) -> Option<&'a str> {
     obj(args).ok()?.get(key).and_then(|v| v.as_str())
+}
+
+fn optional_create_string(args: &Value, key: &str) -> RuntimeResult<Option<String>> {
+    match obj(args)?.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(value)) => Ok(Some(value.clone())),
+        Some(other) => Err(RuntimeError::InvalidInput(format!(
+            "{key} must be a string or null, got: {other}"
+        ))),
+    }
 }
 
 /// Nullable-string patch semantics mirroring the actually-reachable behavior
@@ -406,6 +420,126 @@ fn prepare_governance_unimplemented(tool: &str) -> RuntimeResult<AtomicOpPlan> {
 }
 
 // ---------------------------------------------------------------------------
+// create (AddEntity / AddNote)
+// ---------------------------------------------------------------------------
+
+/// Build the prepared plan for an `AddEntity` proposal change. The entity
+/// row and FTS document are committed together; vector indexing is deferred
+/// until after commit because embedding may suspend. `kind` must already be
+/// canonicalized by the caller because pack-aware resolution requires a
+/// `VerbRegistry`.
+pub async fn prepare_add_entity(
+    runtime: &KhiveRuntime,
+    token: &NamespaceToken,
+    args: &Value,
+) -> RuntimeResult<AtomicOpPlan> {
+    let kind = require_str(args, "kind")?;
+    let name = require_str(args, "name")?;
+    runtime.validate_entity_kind(kind)?;
+    if name.trim().is_empty() {
+        return Err(RuntimeError::InvalidInput(
+            "name must not be empty".to_string(),
+        ));
+    }
+
+    let description = optional_create_string(args, "description")?;
+    let properties = optional_properties(args, "properties")?;
+    let tags = optional_tags(args)?.unwrap_or_default();
+
+    crate::secret_gate::check(name)?;
+    if let Some(ref d) = description {
+        crate::secret_gate::check(d)?;
+    }
+    if let Some(ref p) = properties {
+        crate::secret_gate::check_json(p)?;
+    }
+    crate::secret_gate::check_tags(&tags)?;
+
+    let ns = token.namespace().as_str();
+    let mut entity = khive_storage::Entity::new(ns, kind, name);
+    if let Some(d) = description {
+        entity = entity.with_description(d);
+    }
+    if let Some(p) = properties {
+        entity = entity.with_properties(p);
+    }
+    if !tags.is_empty() {
+        entity = entity.with_tags(tags);
+    }
+
+    let statements = vec![
+        PlanStatement {
+            statement: entity_upsert_statement(&entity),
+            guard: Some(AffectedRowGuard::exactly(1)),
+        },
+        PlanStatement {
+            statement: insert_document_statement("fts_entities", &entity_fts_document(&entity)),
+            guard: None,
+        },
+    ];
+
+    Ok(AtomicOpPlan::AddEntity(AddEntityPlan {
+        entity_id: entity.id,
+        statements,
+        post_commit: PostCommitEffect::ReindexEntity {
+            entity_id: entity.id,
+        },
+    }))
+}
+
+/// Build the prepared plan for an `AddNote` proposal change. Mirrors
+/// [`prepare_add_entity`]'s shape and the same
+/// `kind`-already-canonicalized split. `annotates` is out of scope: the
+/// proposal `NoteDraft` this backs carries no annotates targets, unlike
+/// `KhiveRuntime::create_note`'s general-purpose signature.
+pub async fn prepare_add_note(
+    runtime: &KhiveRuntime,
+    token: &NamespaceToken,
+    args: &Value,
+) -> RuntimeResult<AtomicOpPlan> {
+    let kind = require_str(args, "kind")?;
+    let content = require_str(args, "content")?;
+    runtime.validate_note_kind(kind)?;
+
+    let name = optional_create_string(args, "name")?;
+    let properties = optional_properties(args, "properties")?;
+
+    crate::secret_gate::check(content)?;
+    if let Some(ref n) = name {
+        crate::secret_gate::check(n)?;
+    }
+    if let Some(ref p) = properties {
+        crate::secret_gate::check_json(p)?;
+    }
+
+    let ns = token.namespace().as_str();
+    let mut note = khive_storage::note::Note::new(ns, kind, content);
+    if let Some(n) = name {
+        note = note.with_name(n);
+    }
+    if let Some(p) = properties {
+        note = note.with_properties(p);
+    }
+
+    let statements = vec![
+        PlanStatement {
+            statement: note_upsert_statement(&note),
+            guard: Some(AffectedRowGuard::exactly(1)),
+        },
+        PlanStatement {
+            statement: insert_document_statement("fts_notes", &note_fts_document(&note)),
+            guard: None,
+        },
+    ];
+
+    Ok(AtomicOpPlan::AddNote(AddNotePlan {
+        note_id: note.id,
+        statements,
+        post_commit: PostCommitEffect::ReindexNote { note_id: note.id },
+    }))
+}
+
+// ---------------------------------------------------------------------------
 // update
 // ---------------------------------------------------------------------------
 
@@ -561,50 +695,18 @@ pub async fn prepare_update(
             let properties = optional_properties(args, "properties")?;
             let tags = optional_tags(args)?;
 
-            let (entity, text_changed, changed_fields) = runtime
-                .prepare_update_entity(
-                    token,
-                    id,
-                    crate::curation::EntityPatch {
-                        name,
-                        description,
-                        properties,
-                        tags,
-                    },
-                )
-                .await?;
-
-            let mut statements = vec![PlanStatement {
-                statement: entity_upsert_statement(&entity),
-                guard: Some(AffectedRowGuard::exactly(1)),
-            }];
-            // curation.rs's `update_entity` appends an `EntityUpdated` event
-            // unconditionally after `upsert_entity` succeeds, regardless of
-            // `text_changed`: match that here, not just on the
-            // reindex-triggering subset of updates.
-            statements.extend(event_append_statements(
-                &entity.namespace,
-                "update",
-                EventKind::EntityUpdated,
-                SubstrateKind::Entity,
+            prepare_update_entity_plan(
+                runtime,
+                token,
                 id,
-                serde_json::json!({
-                    "id": id,
-                    "namespace": entity.namespace,
-                    "changed_fields": changed_fields,
-                }),
-            )?);
-            let post_commit = if text_changed {
-                PostCommitEffect::ReindexEntity { entity_id: id }
-            } else {
-                PostCommitEffect::None
-            };
-            Ok(AtomicOpPlan::Update(UpdatePlan {
-                target_id: id,
-                statements,
-                post_commit,
-                edge_natural_key: None,
-            }))
+                crate::curation::EntityPatch {
+                    name,
+                    description,
+                    properties,
+                    tags,
+                },
+            )
+            .await
         }
         Some(Resolved::Note(note)) => {
             match &expected_kind {
@@ -688,6 +790,46 @@ pub async fn prepare_update(
             },
         },
     }
+}
+
+/// Build an entity update plan from a typed patch. Proposal changesets use
+/// this entry point so their explicit `description: null` clear operation is
+/// preserved instead of being collapsed by raw verb deserialization.
+pub async fn prepare_update_entity_plan(
+    runtime: &KhiveRuntime,
+    token: &NamespaceToken,
+    id: Uuid,
+    patch: crate::curation::EntityPatch,
+) -> RuntimeResult<AtomicOpPlan> {
+    let (entity, text_changed, changed_fields) =
+        runtime.prepare_update_entity(token, id, patch).await?;
+    let mut statements = vec![PlanStatement {
+        statement: entity_upsert_statement(&entity),
+        guard: Some(AffectedRowGuard::exactly(1)),
+    }];
+    statements.extend(event_append_statements(
+        &entity.namespace,
+        "update",
+        EventKind::EntityUpdated,
+        SubstrateKind::Entity,
+        id,
+        serde_json::json!({
+            "id": id,
+            "namespace": entity.namespace,
+            "changed_fields": changed_fields,
+        }),
+    )?);
+    let post_commit = if text_changed {
+        PostCommitEffect::ReindexEntity { entity_id: id }
+    } else {
+        PostCommitEffect::None
+    };
+    Ok(AtomicOpPlan::Update(UpdatePlan {
+        target_id: id,
+        statements,
+        post_commit,
+        edge_natural_key: None,
+    }))
 }
 
 /// Edge branch of `prepare_update`. Mirrors
@@ -3120,5 +3262,308 @@ mod tests {
             "link must append no event; found: {:?}",
             page.items
         );
+    }
+
+    // ------------------------------------------------------------------
+    // AddEntity and AddNote plans alongside link
+    // ------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn prepare_add_entity_rejects_whitespace_only_name() {
+        let runtime = scratch_runtime();
+        let token = runtime
+            .authorize(Namespace::parse("local").expect("ns"))
+            .expect("authorize");
+
+        let err = prepare_add_entity(&runtime, &token, &json!({"kind": "concept", "name": "   "}))
+            .await
+            .expect_err("whitespace-only entity name must fail prepare");
+
+        assert!(matches!(
+            err,
+            RuntimeError::InvalidInput(message) if message.contains("name must not be empty")
+        ));
+    }
+
+    #[tokio::test]
+    async fn prepare_add_entity_rejects_non_string_description() {
+        let runtime = scratch_runtime();
+        let token = runtime
+            .authorize(Namespace::parse("local").expect("ns"))
+            .expect("authorize");
+
+        let err = prepare_add_entity(
+            &runtime,
+            &token,
+            &json!({"kind": "concept", "name": "Valid", "description": 42}),
+        )
+        .await
+        .expect_err("non-string entity description must fail prepare");
+
+        assert!(matches!(
+            err,
+            RuntimeError::InvalidInput(message)
+                if message.contains("description must be a string or null")
+        ));
+    }
+
+    #[tokio::test]
+    async fn prepare_add_note_rejects_non_string_name() {
+        let runtime = scratch_runtime();
+        let token = runtime
+            .authorize(Namespace::parse("local").expect("ns"))
+            .expect("authorize");
+
+        let err = prepare_add_note(
+            &runtime,
+            &token,
+            &json!({"kind": "observation", "content": "Valid", "name": 42}),
+        )
+        .await
+        .expect_err("non-string note name must fail prepare");
+
+        assert!(matches!(
+            err,
+            RuntimeError::InvalidInput(message) if message.contains("name must be a string or null")
+        ));
+    }
+
+    #[tokio::test]
+    async fn atomic_add_entity_link_add_note_plan_commits_entity_edge_note_and_fts_together() {
+        let runtime = scratch_runtime();
+        runtime.register_embedder(StubProvider);
+        let token = runtime
+            .authorize(Namespace::parse("local").expect("ns"))
+            .expect("authorize");
+        let entities = runtime.entities(&token).expect("entities store");
+        let a = khive_storage::Entity::new("local", "concept", "ProposalPlanLinkA");
+        let b = khive_storage::Entity::new("local", "concept", "ProposalPlanLinkB");
+        let (a_id, b_id) = (a.id, b.id);
+        entities.upsert_entity(a).await.expect("seed a");
+        entities.upsert_entity(b).await.expect("seed b");
+
+        let add_entity_plan = prepare_add_entity(
+            &runtime,
+            &token,
+            &json!({"kind": "concept", "name": "ProposalPlanNewEntity", "description": "created atomically"}),
+        )
+        .await
+        .expect("prepare add_entity");
+        let link_plan = prepare_link(
+            &runtime,
+            &token,
+            &json!({"source_id": a_id.to_string(), "target_id": b_id.to_string(), "relation": "extends"}),
+        )
+        .await
+        .expect("prepare link");
+        let add_note_plan = prepare_add_note(
+            &runtime,
+            &token,
+            &json!({"kind": "observation", "content": "created atomically alongside the entity"}),
+        )
+        .await
+        .expect("prepare add_note");
+
+        let entity_id = match &add_entity_plan {
+            AtomicOpPlan::AddEntity(p) => p.entity_id,
+            other => panic!("expected an AddEntity plan, got {other:?}"),
+        };
+        let note_id = match &add_note_plan {
+            AtomicOpPlan::AddNote(p) => p.note_id,
+            other => panic!("expected an AddNote plan, got {other:?}"),
+        };
+
+        let outcome = crate::atomic_runner::run_atomic_unit(
+            runtime.sql().as_ref(),
+            vec![add_entity_plan, link_plan, add_note_plan],
+        )
+        .await
+        .expect("seam call ok");
+        let post_commit = match outcome {
+            crate::atomic_runner::AtomicRunOutcome::Committed { post_commit } => post_commit,
+            other => panic!("expected the whole unit to commit: {other:?}"),
+        };
+        let entity = runtime
+            .entities(&token)
+            .expect("entities store")
+            .get_entity(entity_id)
+            .await
+            .expect("get_entity")
+            .expect("entity must exist after commit");
+        assert_eq!(entity.name, "ProposalPlanNewEntity");
+        assert!(
+            runtime
+                .text(&token)
+                .expect("text store")
+                .get_document("local", entity_id)
+                .await
+                .expect("get_document")
+                .is_some(),
+            "entity's FTS document must exist after commit"
+        );
+
+        let (edge_count, _, _, edge_deleted_at) =
+            probe_edge_natural_key(&runtime, "local", a_id, b_id, "extends").await;
+        assert_eq!(
+            edge_count, 1,
+            "the edge must be committed alongside the entity/note"
+        );
+        assert!(edge_deleted_at.is_none());
+
+        let note = runtime
+            .notes(&token)
+            .expect("notes store")
+            .get_note(note_id)
+            .await
+            .expect("get_note")
+            .expect("note must exist after commit");
+        assert_eq!(note.content, "created atomically alongside the entity");
+        assert!(
+            runtime
+                .text_for_notes(&token)
+                .expect("text store")
+                .get_document("local", note_id)
+                .await
+                .expect("get_document")
+                .is_some(),
+            "note's FTS document must exist after commit"
+        );
+
+        apply_post_commit_effects(&runtime, &token, post_commit)
+            .await
+            .expect("apply post-commit effects");
+
+        let vec_store = runtime
+            .vectors_for_model(&token, STUB_MODEL)
+            .expect("vec store");
+        assert_eq!(
+            vec_store.count().await.expect("count after"),
+            2,
+            "post-commit reindex must have embedded both the new entity and the new note"
+        );
+    }
+
+    #[tokio::test]
+    async fn atomic_add_entity_and_add_note_roll_back_on_later_link_failure_leaving_zero_trace() {
+        let runtime = scratch_runtime();
+        let token = runtime
+            .authorize(Namespace::parse("local").expect("ns"))
+            .expect("authorize");
+        let entities = runtime.entities(&token).expect("entities store");
+        let a = khive_storage::Entity::new("local", "concept", "ProposalPlanRollbackA");
+        let x = khive_storage::Entity::new("local", "concept", "ProposalPlanRollbackX");
+        let (a_id, x_id) = (a.id, x.id);
+        entities.upsert_entity(a).await.expect("seed a");
+        entities.upsert_entity(x.clone()).await.expect("seed x");
+
+        let add_entity_plan = prepare_add_entity(
+            &runtime,
+            &token,
+            &json!({"kind": "concept", "name": "ProposalPlanRollbackNewEntity"}),
+        )
+        .await
+        .expect("prepare add_entity");
+        let add_note_plan = prepare_add_note(
+            &runtime,
+            &token,
+            &json!({"kind": "observation", "content": "must not survive the rollback"}),
+        )
+        .await
+        .expect("prepare add_note");
+        let delete_plan = prepare_delete(
+            &runtime,
+            &token,
+            &json!({"id": x_id.to_string(), "hard": true}),
+            None,
+        )
+        .await
+        .expect("prepare delete x");
+        // Prepare sees x before the transaction; the guarded link must detect
+        // that the preceding hard delete removed it inside the transaction.
+        let link_plan = prepare_link(
+            &runtime,
+            &token,
+            &json!({"source_id": a_id.to_string(), "target_id": x_id.to_string(), "relation": "extends"}),
+        )
+        .await
+        .expect("prepare link (endpoint still exists at prepare time)");
+
+        let entity_id = match &add_entity_plan {
+            AtomicOpPlan::AddEntity(p) => p.entity_id,
+            other => panic!("expected an AddEntity plan, got {other:?}"),
+        };
+        let note_id = match &add_note_plan {
+            AtomicOpPlan::AddNote(p) => p.note_id,
+            other => panic!("expected an AddNote plan, got {other:?}"),
+        };
+
+        let outcome = crate::atomic_runner::run_atomic_unit(
+            runtime.sql().as_ref(),
+            vec![add_entity_plan, add_note_plan, delete_plan, link_plan],
+        )
+        .await
+        .expect("the seam call itself must not error; the unit rolls back cleanly");
+        match outcome {
+            crate::atomic_runner::AtomicRunOutcome::RolledBack {
+                failed_op_index, ..
+            } => {
+                assert_eq!(
+                    failed_op_index, 3,
+                    "the trailing link (index 3) must be the op whose guard fails"
+                );
+            }
+            other => panic!("expected the whole unit to roll back, got {other:?}"),
+        }
+
+        assert!(
+            runtime
+                .get_entity_including_deleted(&token, entity_id)
+                .await
+                .expect("get_entity_including_deleted")
+                .is_none(),
+            "the new entity must leave zero trace after rollback"
+        );
+        assert!(
+            runtime
+                .text(&token)
+                .expect("text store")
+                .get_document("local", entity_id)
+                .await
+                .expect("get_document")
+                .is_none(),
+            "the new entity's FTS document must leave zero trace after rollback"
+        );
+        assert!(
+            runtime
+                .get_note_including_deleted(&token, note_id)
+                .await
+                .expect("get_note_including_deleted")
+                .is_none(),
+            "the new note must leave zero trace after rollback"
+        );
+        assert!(
+            runtime
+                .text_for_notes(&token)
+                .expect("text store")
+                .get_document("local", note_id)
+                .await
+                .expect("get_document")
+                .is_none(),
+            "the new note's FTS document must leave zero trace after rollback"
+        );
+
+        let x_after = runtime
+            .get_entity_including_deleted(&token, x_id)
+            .await
+            .expect("get_entity_including_deleted")
+            .expect("x must still be present because its delete rolled back too");
+        assert!(
+            x_after.deleted_at.is_none(),
+            "x's delete must have rolled back along with the failed link"
+        );
+
+        let (edge_count, _, _, _) =
+            probe_edge_natural_key(&runtime, "local", a_id, x_id, "extends").await;
+        assert_eq!(edge_count, 0, "no edge may have been committed");
     }
 }

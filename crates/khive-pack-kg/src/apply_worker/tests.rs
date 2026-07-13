@@ -108,6 +108,186 @@ async fn seed_proposal_created_event(
 }
 
 #[tokio::test]
+async fn changeset_adapter_builds_atomic_plans_for_supported_proposal_writes() {
+    let (rt, tok) = setup();
+    ensure_schema(&rt).await;
+    let source = rt
+        .create_entity(&tok, "concept", None, "Source", None, None, vec![])
+        .await
+        .expect("create source");
+    let target = rt
+        .create_entity(&tok, "concept", None, "Target", None, None, vec![])
+        .await
+        .expect("create target");
+    let registry = build_registry(&rt);
+    let worker = ProposalApplyWorker::new(rt);
+
+    let cases = [
+        (
+            ProposalChangeset::AddEntity {
+                entity: EntityDraft {
+                    kind: "concept".to_string(),
+                    name: "PlannedEntity".to_string(),
+                    description: None,
+                    properties: None,
+                    tags: vec![],
+                },
+            },
+            "add_entity",
+        ),
+        (
+            ProposalChangeset::AddNote {
+                note: NoteDraft {
+                    kind: "observation".to_string(),
+                    name: None,
+                    content: "Planned note".to_string(),
+                    properties: None,
+                },
+            },
+            "add_note",
+        ),
+        (
+            ProposalChangeset::UpdateEntity {
+                id: Id128::from_u128(source.id.as_u128()),
+                patch: khive_types::ProposalEntityPatch {
+                    name: Some("UpdatedSource".to_string()),
+                    description: None,
+                    properties: None,
+                    tags: None,
+                },
+            },
+            "update",
+        ),
+        (
+            ProposalChangeset::AddEdge {
+                source: Id128::from_u128(source.id.as_u128()),
+                target: Id128::from_u128(target.id.as_u128()),
+                relation: khive_types::EdgeRelation::Extends,
+                weight: Some(0.8),
+            },
+            "link",
+        ),
+        (
+            ProposalChangeset::SupersedeEntity {
+                old: Id128::from_u128(source.id.as_u128()),
+                new: Id128::from_u128(target.id.as_u128()),
+            },
+            "link",
+        ),
+    ];
+
+    for (changeset, expected) in cases {
+        let prepared = worker
+            .prepare_changeset(&tok, &changeset, &registry, &mut WriteBudget::new(None))
+            .await
+            .expect("prepare changeset");
+        let super::worker::PreparedApply::Atomic { plans, .. } = prepared else {
+            panic!("expected atomic prepared apply for {expected}");
+        };
+        assert_eq!(plans.len(), 1);
+        let actual = match &plans[0] {
+            khive_runtime::AtomicOpPlan::AddEntity(_) => "add_entity",
+            khive_runtime::AtomicOpPlan::AddNote(_) => "add_note",
+            khive_runtime::AtomicOpPlan::Update(_) => "update",
+            khive_runtime::AtomicOpPlan::Link(_) => "link",
+            other => panic!("unexpected plan for {expected}: {other:?}"),
+        };
+        assert_eq!(actual, expected);
+    }
+}
+
+#[tokio::test]
+async fn apply_worker_atomic_update_preserves_explicit_description_clear() {
+    let (rt, tok) = setup();
+    ensure_schema(&rt).await;
+    let entity = rt
+        .create_entity(
+            &tok,
+            "concept",
+            None,
+            "ClearDescription",
+            Some("remove me"),
+            None,
+            vec![],
+        )
+        .await
+        .expect("create entity");
+    let proposal_id = Uuid::new_v4();
+    let changeset = ProposalChangeset::UpdateEntity {
+        id: Id128::from_u128(entity.id.as_u128()),
+        patch: khive_types::ProposalEntityPatch {
+            name: None,
+            description: Some(None),
+            properties: None,
+            tags: None,
+        },
+    };
+    seed_proposal_created_event(&rt, &tok, proposal_id, changeset).await;
+    insert_projection_row(&rt, &tok, proposal_id, "approved").await;
+
+    let registry = build_registry(&rt);
+    ProposalApplyWorker::new(rt.clone())
+        .maybe_apply(&tok, proposal_id, &registry, None)
+        .await
+        .expect("apply proposal");
+
+    let updated = rt
+        .get_entity(&tok, entity.id)
+        .await
+        .expect("get updated entity");
+    assert_eq!(updated.description, None);
+}
+
+#[tokio::test]
+async fn apply_worker_atomic_note_plan_commits_note_and_fts_document() {
+    let (rt, tok) = setup();
+    ensure_schema(&rt).await;
+    let proposal_id = Uuid::new_v4();
+    let changeset = ProposalChangeset::AddNote {
+        note: NoteDraft {
+            kind: "observation".to_string(),
+            name: Some("AtomicProposalNote".to_string()),
+            content: "Committed through the proposal plan".to_string(),
+            properties: None,
+        },
+    };
+    seed_proposal_created_event(&rt, &tok, proposal_id, changeset).await;
+    insert_projection_row(&rt, &tok, proposal_id, "approved").await;
+
+    let registry = build_registry(&rt);
+    ProposalApplyWorker::new(rt.clone())
+        .maybe_apply(&tok, proposal_id, &registry, None)
+        .await
+        .expect("apply proposal");
+
+    let notes = rt
+        .notes(&tok)
+        .expect("notes store")
+        .query_notes(
+            tok.namespace().as_str(),
+            None,
+            PageRequest {
+                offset: 0,
+                limit: 100,
+            },
+        )
+        .await
+        .expect("query notes");
+    let note = notes
+        .items
+        .iter()
+        .find(|note| note.name.as_deref() == Some("AtomicProposalNote"))
+        .expect("created note");
+    let document = rt
+        .text_for_notes(&tok)
+        .expect("note text store")
+        .get_document(tok.namespace().as_str(), note.id)
+        .await
+        .expect("get FTS document");
+    assert!(document.is_some());
+}
+
+#[tokio::test]
 async fn apply_worker_applies_add_edge_changeset() {
     let (rt, tok) = setup();
     ensure_schema(&rt).await;
