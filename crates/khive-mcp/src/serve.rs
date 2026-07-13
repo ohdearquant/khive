@@ -3132,6 +3132,7 @@ id = "lambda:project-actor"
                 save_to: None,
                 format: None,
                 format_per_op: None,
+                request_id: None,
             })
             .await
             .expect("kg dispatch must not error");
@@ -3155,6 +3156,7 @@ id = "lambda:project-actor"
                 save_to: None,
                 format: None,
                 format_per_op: None,
+                request_id: None,
             })
             .await
             .expect("comm dispatch must not error");
@@ -3574,6 +3576,7 @@ id = "lambda:project-actor"
                         save_to: None,
                         format: None,
                         format_per_op: None,
+                        request_id: None,
                     })
                     .await
                     .expect("dispatch must not error");
@@ -4144,6 +4147,7 @@ id = "lambda:project-actor"
                         save_to: None,
                         format: None,
                         format_per_op: None,
+                        request_id: None,
                     })
                     .await
                     .expect("dispatch must not error")
