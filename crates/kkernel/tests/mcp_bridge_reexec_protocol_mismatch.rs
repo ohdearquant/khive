@@ -95,6 +95,7 @@ fn stale_daemon_response() -> DaemonResponseFrame {
         version_mismatch: false,
         daemon_protocol_version: 0,
         metrics: None,
+        request_id: None,
     }
 }
 
@@ -109,6 +110,7 @@ fn healed_daemon_response() -> DaemonResponseFrame {
         version_mismatch: false,
         daemon_protocol_version: khive_runtime::daemon::PROTOCOL_VERSION,
         metrics: None,
+        request_id: None,
     }
 }
 

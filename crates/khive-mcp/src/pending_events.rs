@@ -1168,6 +1168,7 @@ async fn dispatch_action(
             save_to: None,
             format: None,
             format_per_op: None,
+            request_id: None,
         })
         .await
         .map_err(|e| anyhow::anyhow!("pending-events: dispatch error: {e}"))?;
@@ -2427,6 +2428,7 @@ mod tests {
                 save_to: None,
                 format: None,
                 format_per_op: None,
+                request_id: None,
             })
             .await
             .expect("dispatch_request_local must not error at the RPC layer");
@@ -2769,6 +2771,7 @@ mod tests {
                 save_to: None,
                 format: None,
                 format_per_op: None,
+                request_id: None,
             })
             .await
             .expect("dispatch_request_local must not error at the RPC layer");
