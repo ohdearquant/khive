@@ -3786,6 +3786,41 @@ id = "lambda:project-actor"
         );
     }
 
+    /// RAII guard: pins `HOME` to a caller-chosen directory for the guard's
+    /// lifetime and restores the prior value on drop (even on panic/unwind).
+    ///
+    /// `build_registry_for_multi_backend` derives its db-path anchor from
+    /// `HOME` twice for a `None` `--db` input: once via a caller's own
+    /// `resolve_db_anchor` call (as `base_runtime_config_for_multi_backend`
+    /// does below), again inside `assert_db_anchor_consistent` (#661). `HOME`
+    /// is process-global state shared with every other test in this binary,
+    /// including the ADR-096 Fork 2 `SeatEnv` tests further down, which
+    /// temporarily repoint it to their own tempdir. If this test's two reads
+    /// straddle one of those repoints, they disagree and
+    /// `assert_db_anchor_consistent` panics — the exact flake in #720. Pinning
+    /// `HOME` for the whole call keeps both reads consistent regardless of
+    /// what else runs.
+    struct HomeGuard {
+        original: Option<std::ffi::OsString>,
+    }
+
+    impl HomeGuard {
+        fn redirect_to(dir: &std::path::Path) -> Self {
+            let original = std::env::var_os("HOME");
+            std::env::set_var("HOME", dir);
+            Self { original }
+        }
+    }
+
+    impl Drop for HomeGuard {
+        fn drop(&mut self) {
+            match &self.original {
+                Some(h) => std::env::set_var("HOME", h),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+    }
+
     /// B-SHOULD-FIX-2 (data safety): Two [[backends]] entries whose sqlite paths
     /// canonicalize to the same file must share a single Arc<StorageBackend> and
     /// run migrations only once. Verified by using two names that differ only by
@@ -3796,6 +3831,9 @@ id = "lambda:project-actor"
         use khive_runtime::PackConfig;
 
         let dir = tempfile::tempdir().unwrap();
+        // Pin HOME for the whole construction below — see `HomeGuard` above
+        // for why (#720).
+        let _home_guard = HomeGuard::redirect_to(dir.path());
         let db_path = dir.path().join("shared.db");
         let db_path_str = db_path.to_str().unwrap();
 
@@ -3842,6 +3880,53 @@ id = "lambda:project-actor"
                 "two backends with the same canonical path must share one Arc and boot ok; got: {e}"
             );
         }
+    }
+
+    /// Regression for #720: the dedup boot above must succeed regardless of
+    /// whatever `HOME` happens to be set to when the test starts, proving the
+    /// `HomeGuard` pin above — not the ambient environment — governs this
+    /// test's outcome. Before the fix, this construction read `HOME` twice
+    /// (once via `base_runtime_config_for_multi_backend`, once inside
+    /// `assert_db_anchor_consistent`) with nothing pinning it in between, so
+    /// whatever the process-global value happened to be at each read decided
+    /// the outcome.
+    #[test]
+    #[serial]
+    fn duplicate_sqlite_paths_dedup_unaffected_by_ambient_home() {
+        let weird_home = tempfile::tempdir().unwrap();
+        let _home_guard = HomeGuard::redirect_to(weird_home.path());
+        duplicate_sqlite_paths_deduplicated_to_single_backend();
+    }
+
+    /// Regression for #720: characterizes the exact TOCTOU
+    /// `assert_db_anchor_consistent` (#661) trips on when `HOME` changes
+    /// between the two anchor computations one multi-backend construction
+    /// makes for a `None` `--db` input — this is precisely what made
+    /// `duplicate_sqlite_paths_deduplicated_to_single_backend` flaky: a
+    /// concurrent `#[serial]` test elsewhere in this file temporarily
+    /// repoints `HOME` (see `SeatEnv` further down), and when that repoint
+    /// straddled this construction's two reads, they disagreed.
+    #[test]
+    #[serial]
+    fn db_anchor_consistency_guard_trips_when_home_changes_between_reads() {
+        let first_home = tempfile::tempdir().unwrap();
+        let home_guard = HomeGuard::redirect_to(first_home.path());
+        let first_anchor = khive_runtime::resolve_db_anchor(None);
+
+        // Simulate another thread repointing HOME mid-construction — the
+        // exact hazard #720's flake hit in CI.
+        let second_home = tempfile::tempdir().unwrap();
+        std::env::set_var("HOME", second_home.path());
+
+        let result = khive_runtime::assert_db_anchor_consistent(first_anchor.as_deref(), None);
+        assert!(
+            result.is_err(),
+            "assert_db_anchor_consistent must reject a resolved db_path computed \
+             under a different HOME than the one active when it re-derives the \
+             anchor — this is the exact drift #720's flake exercised"
+        );
+
+        drop(home_guard);
     }
 
     /// Issue #553 sibling gap: `build_server_multi_backend` is reachable from
