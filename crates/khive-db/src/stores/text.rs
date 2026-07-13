@@ -39,6 +39,40 @@ pub fn delete_document_statement(table: &str, namespace: &str, subject_id: Uuid)
     }
 }
 
+/// The exact `INSERT` half of `upsert_document_dml`'s delete-then-insert
+/// shape, for a given FTS table (same `table`-is-trusted caveat as
+/// `delete_document_statement` above). Used by `khive-runtime`'s atomic
+/// `AddEntity`/`AddNote` prepare (ADR-104) to write a freshly created
+/// record's FTS document inside the same transaction as its row insert —
+/// there is no pre-existing row to delete first, so callers pair this with
+/// `delete_document_statement` only when upsert (not plain insert) semantics
+/// are required.
+pub fn insert_document_statement(table: &str, document: &TextDocument) -> SqlStatement {
+    let tags_json = tags_to_json(&document.tags);
+    let metadata_json = document.metadata.as_ref().map(|v| v.to_string());
+    SqlStatement {
+        sql: format!(
+            "INSERT INTO {table} \
+             (subject_id, kind, title, body, tags, namespace, metadata, updated_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)"
+        ),
+        params: vec![
+            SqlValue::Text(document.subject_id.to_string()),
+            SqlValue::Text(document.kind.to_string()),
+            SqlValue::Text(document.title.clone().unwrap_or_default()),
+            SqlValue::Text(document.body.clone()),
+            SqlValue::Text(tags_json),
+            SqlValue::Text(document.namespace.clone()),
+            match metadata_json {
+                Some(m) => SqlValue::Text(m),
+                None => SqlValue::Null,
+            },
+            SqlValue::Integer(dt_to_micros(&document.updated_at)),
+        ],
+        label: Some(format!("fts-insert-{table}")),
+    }
+}
+
 /// Ensure the FTS5 virtual table for `table_key` exists.
 ///
 /// Used in tests to set up an in-memory FTS5 table without the full `StorageBackend`.

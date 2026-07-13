@@ -196,6 +196,42 @@ pub struct UpdatePlan {
     pub edge_natural_key: Option<EdgeNaturalKey>,
 }
 
+/// Write plan for an `AddEntity` op (ADR-046 proposal changeset / ADR-104
+/// atomic create): a fresh entity row plus its FTS document, both inside the
+/// atomic unit. Canonical `create_entity` appends no event and this plan
+/// matches that — the only deferred work is vector embedding
+/// (`post_commit`), which needs a suspending model call and so cannot run
+/// inside the transaction (ADR-104, C-ADR-014 §3 item 3).
+#[derive(Debug, Clone)]
+pub struct AddEntityPlan {
+    /// The freshly generated id of the entity being created.
+    pub entity_id: Uuid,
+    /// Row + FTS insert statements to apply inside the atomic unit, in
+    /// order. The row-insert statement carries the existence guard; the
+    /// FTS-insert statement that follows it is unguarded (an ordinary
+    /// `INSERT` into a virtual table with no conflicting row).
+    pub statements: Vec<PlanStatement>,
+    /// Always `ReindexEntity` — a created entity's vector row(s) are written
+    /// post-commit from the now-committed row content, the same shape
+    /// `update`'s text-changed case already uses.
+    pub post_commit: PostCommitEffect,
+}
+
+/// Write plan for an `AddNote` op (ADR-046 proposal changeset / ADR-104
+/// atomic create): a fresh note row plus its FTS document, both inside the
+/// atomic unit. Mirrors [`AddEntityPlan`]; canonical `create_note` likewise
+/// appends no event.
+#[derive(Debug, Clone)]
+pub struct AddNotePlan {
+    /// The freshly generated id of the note being created.
+    pub note_id: Uuid,
+    /// Row + FTS insert statements to apply inside the atomic unit, in
+    /// order, mirroring [`AddEntityPlan::statements`].
+    pub statements: Vec<PlanStatement>,
+    /// Always `ReindexNote` — mirrors [`AddEntityPlan::post_commit`].
+    pub post_commit: PostCommitEffect,
+}
+
 /// Write plan for a `delete` op (soft or hard).
 #[derive(Debug, Clone)]
 pub struct DeletePlan {
@@ -521,6 +557,43 @@ mod tests {
             assert_eq!(plan.op, op);
             assert!(plan.statements[0].guard.is_some());
         }
+    }
+
+    #[test]
+    fn add_entity_plan_guard_is_anchored_to_the_row_statement_not_the_fts_mirror() {
+        let id = Uuid::new_v4();
+        let plan = AddEntityPlan {
+            entity_id: id,
+            statements: vec![
+                guarded("entity-insert", AffectedRowGuard::exactly(1)),
+                unguarded("entity-fts-insert"),
+            ],
+            post_commit: PostCommitEffect::ReindexEntity { entity_id: id },
+        };
+        assert_eq!(plan.entity_id, id);
+        assert_eq!(plan.statements[0].guard, Some(AffectedRowGuard::exactly(1)));
+        assert_eq!(plan.statements[1].guard, None);
+        assert_eq!(
+            plan.post_commit,
+            PostCommitEffect::ReindexEntity { entity_id: id }
+        );
+    }
+
+    #[test]
+    fn add_note_plan_guard_is_anchored_to_the_row_statement_not_the_fts_mirror() {
+        let id = Uuid::new_v4();
+        let plan = AddNotePlan {
+            note_id: id,
+            statements: vec![
+                guarded("note-insert", AffectedRowGuard::exactly(1)),
+                unguarded("note-fts-insert"),
+            ],
+            post_commit: PostCommitEffect::ReindexNote { note_id: id },
+        };
+        assert_eq!(plan.note_id, id);
+        assert_eq!(plan.statements[0].guard, Some(AffectedRowGuard::exactly(1)));
+        assert_eq!(plan.statements[1].guard, None);
+        assert_eq!(plan.post_commit, PostCommitEffect::ReindexNote { note_id: id });
     }
 
     #[test]

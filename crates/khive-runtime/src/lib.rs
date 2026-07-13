@@ -32,8 +32,9 @@ pub mod validation;
 
 pub use actor_identity::{actor_is_unattributed, resolve_actor, should_warn_unattributed_actor};
 pub use atomic_plan::{
-    AffectedRowGuard, DeletePlan, GovernanceOp, GovernancePlan, GtdCompletePlan, GtdTransitionPlan,
-    LinkPlan, MergePlan, PlanPredicate, PlanStatement, PostCommitEffect, UpdatePlan,
+    AddEntityPlan, AddNotePlan, AffectedRowGuard, DeletePlan, GovernanceOp, GovernancePlan,
+    GtdCompletePlan, GtdTransitionPlan, LinkPlan, MergePlan, PlanPredicate, PlanStatement,
+    PostCommitEffect, UpdatePlan,
 };
 pub use atomic_runner::{
     run_atomic_unit, AtomicOpFailure, AtomicOpPlan, AtomicRunOutcome, AtomicRunnerError,
