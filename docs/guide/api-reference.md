@@ -690,10 +690,14 @@ caller. Optional; load with `KHIVE_PACKS=kg,brain`.
 Windowed event counts grouped by kind, actor, and verb over the event plane (ADR-103
 Stage 1, #724 Ask A). `feedback_explicit` events are additionally split by
 `served_by_profile_id`. Events carrying a `work_class` (today:
-`phase_started`/`phase_completed`/`phase_cancelled` payloads) split by
-`counts_by_work_class`. `cost_unit` is not surfaced: it does not exist on any event
-payload yet (ADR-103 Stage 0 is design-only) and will be added once a resource payload
-carries it.
+`phase_started`/`phase_completed`/`phase_cancelled` payloads, or `payload.resource.work_class`
+on a dispatch audit row) split by `counts_by_work_class`. Events carrying
+`payload.resource.cost_unit` (ADR-103 Amendment 1, stamped on every successful verb dispatch
+since PR #927) sum into `total_cost_unit` and `cost_unit_by_verb`; both are omitted, not
+zero-filled, when no event in the window carries `cost_unit`. Events without a `cost_unit`
+(pre-Amendment-1 events, or errored/denied dispatches) simply do not contribute. When
+`truncated` is `true`, these sums are computed over the fetched page only, same as the other
+`counts_by_*` fields.
 
 | Param   | Type   | Required | Notes                                                                                                                                                       |
 | ------- | ------ | -------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------- |

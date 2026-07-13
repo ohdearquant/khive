@@ -6554,13 +6554,12 @@ mod event_counts_tests {
         );
     }
 
-    /// `cost_unit` does not exist on any event payload in the codebase today (ADR-103
-    /// Stage 0 defines it; no Stage 1 producer emits it yet). This verb must not invent
-    /// a `cost_unit` key — asserts its literal absence from the response shape so a
-    /// future producer landing the field is a deliberate response-shape change, not a
-    /// silent no-op this test would miss.
+    /// Events with no `payload.resource.cost_unit` anywhere in the window (pre-#927
+    /// events, or events like Phase* spans that never carry `cost_unit` at all) must
+    /// not synthesize `total_cost_unit` / `cost_unit_by_verb` out of thin air — both
+    /// keys must be entirely absent, not zero-filled.
     #[tokio::test]
-    async fn cost_unit_is_not_present_in_the_response() {
+    async fn cost_unit_fields_absent_when_no_event_carries_cost_unit() {
         let (pack, rt) = make_pack();
         let registry = empty_registry();
         let token = rt.authorize(Namespace::local()).unwrap();
@@ -6575,6 +6574,17 @@ mod event_counts_tests {
             json!({"work_class": "warm", "phase": "ann_warm", "wall_us": 1, "cpu_us": null}),
         )
         .await;
+        // Pre-#927 audit row: work_class present, no cost_unit at all.
+        seed_event(
+            &rt,
+            &token,
+            "search",
+            EventKind::Audit,
+            "lambda:khive",
+            1_000_000,
+            json!({"resource": {"work_class": "interactive"}}),
+        )
+        .await;
 
         let result = pack
             .dispatch(
@@ -6587,12 +6597,209 @@ mod event_counts_tests {
             .expect("brain.event_counts must succeed");
 
         assert!(
-            result.get("cost_unit").is_none(),
-            "cost_unit must not appear anywhere at the top level: {result}"
+            result.get("total_cost_unit").is_none(),
+            "total_cost_unit must be omitted, not zero, when no event carries cost_unit: {result}"
         );
         assert!(
-            result.get("counts_by_cost_unit").is_none(),
-            "no cost_unit split must be surfaced until a producer emits the field: {result}"
+            result.get("cost_unit_by_verb").is_none(),
+            "cost_unit_by_verb must be omitted, not an empty object, when no event carries \
+             cost_unit: {result}"
+        );
+    }
+
+    /// ADR-103 Amendment 1 / PR #927: `payload.resource.cost_unit` on successful
+    /// dispatch audit rows must sum into `total_cost_unit` and split per-verb into
+    /// `cost_unit_by_verb`, following the same aggregation style as
+    /// `counts_by_kind`/`counts_by_actor`/`counts_by_work_class`.
+    #[tokio::test]
+    async fn cost_unit_sums_total_and_per_verb() {
+        let (pack, rt) = make_pack();
+        let registry = empty_registry();
+        let token = rt.authorize(Namespace::local()).unwrap();
+
+        seed_event(
+            &rt,
+            &token,
+            "create",
+            EventKind::Audit,
+            "lambda:a",
+            1_000_000,
+            json!({"resource": {"work_class": "interactive", "cost_unit": 4}}),
+        )
+        .await;
+        seed_event(
+            &rt,
+            &token,
+            "create",
+            EventKind::Audit,
+            "lambda:a",
+            1_000_000,
+            json!({"resource": {"work_class": "interactive", "cost_unit": 6}}),
+        )
+        .await;
+        seed_event(
+            &rt,
+            &token,
+            "stats",
+            EventKind::Audit,
+            "lambda:b",
+            1_000_000,
+            json!({"resource": {"work_class": "interactive", "cost_unit": 1}}),
+        )
+        .await;
+        // No cost_unit at all — must not contribute to either sum.
+        seed_event(
+            &rt,
+            &token,
+            "search",
+            EventKind::SearchExecuted,
+            "lambda:a",
+            1_000_000,
+            json!({}),
+        )
+        .await;
+        // Errored dispatch: work_class present, cost_unit absent per Amendment 1's
+        // "absence has exactly two meanings" rule — must not contribute.
+        let mut errored = Event::new(
+            token.namespace().as_str(),
+            "create",
+            EventKind::Audit,
+            SubstrateKind::Event,
+            "lambda:a",
+        );
+        errored.created_at = 1_000_000;
+        errored.outcome = khive_types::EventOutcome::Error;
+        errored.payload = json!({"resource": {"work_class": "interactive"}});
+        rt.events(&token)
+            .expect("event store")
+            .append_event(errored)
+            .await
+            .expect("seed errored audit event");
+
+        let result = pack
+            .dispatch(
+                "brain.event_counts",
+                json!({"since": micros_to_iso(0)}),
+                &registry,
+                &token,
+            )
+            .await
+            .expect("brain.event_counts must succeed");
+
+        assert_eq!(result["total"], json!(5), "got: {result}");
+        assert_eq!(
+            result["total_cost_unit"],
+            json!(11),
+            "total_cost_unit must sum only the events carrying cost_unit (4+6+1): {result}"
+        );
+        assert_eq!(
+            result["cost_unit_by_verb"]["create"],
+            json!(10),
+            "got: {result}"
+        );
+        assert_eq!(
+            result["cost_unit_by_verb"]["stats"],
+            json!(1),
+            "got: {result}"
+        );
+        assert!(
+            result["cost_unit_by_verb"].get("search").is_none(),
+            "a verb whose events carry no cost_unit must not appear in the split: {result}"
+        );
+    }
+
+    /// The window filter (`since`/`until`) must apply to `cost_unit` aggregation
+    /// exactly like every other count field — an event outside the window must not
+    /// contribute to `total_cost_unit`.
+    #[tokio::test]
+    async fn cost_unit_respects_window_filter() {
+        let (pack, rt) = make_pack();
+        let registry = empty_registry();
+        let token = rt.authorize(Namespace::local()).unwrap();
+
+        seed_event(
+            &rt,
+            &token,
+            "create",
+            EventKind::Audit,
+            "lambda:a",
+            1_500_000,
+            json!({"resource": {"work_class": "interactive", "cost_unit": 9}}),
+        )
+        .await;
+        // Outside the window entirely.
+        seed_event(
+            &rt,
+            &token,
+            "create",
+            EventKind::Audit,
+            "lambda:a",
+            5_000_000,
+            json!({"resource": {"work_class": "interactive", "cost_unit": 100}}),
+        )
+        .await;
+
+        let result = pack
+            .dispatch(
+                "brain.event_counts",
+                json!({
+                    "since": micros_to_iso(1_000_000),
+                    "until": micros_to_iso(2_000_000),
+                }),
+                &registry,
+                &token,
+            )
+            .await
+            .expect("brain.event_counts must succeed");
+
+        assert_eq!(result["total"], json!(1), "got: {result}");
+        assert_eq!(result["total_cost_unit"], json!(9), "got: {result}");
+    }
+
+    /// Mirrors `cost_unit.rs`'s own overflow-clamp tests: the sum must saturate
+    /// rather than panic when individual `cost_unit` values are extreme.
+    #[tokio::test]
+    async fn cost_unit_total_saturates_on_overflow_instead_of_panicking() {
+        let (pack, rt) = make_pack();
+        let registry = empty_registry();
+        let token = rt.authorize(Namespace::local()).unwrap();
+
+        seed_event(
+            &rt,
+            &token,
+            "knowledge.index",
+            EventKind::Audit,
+            "lambda:a",
+            1_000_000,
+            json!({"resource": {"work_class": "interactive", "cost_unit": i64::MAX}}),
+        )
+        .await;
+        seed_event(
+            &rt,
+            &token,
+            "knowledge.index",
+            EventKind::Audit,
+            "lambda:a",
+            1_000_000,
+            json!({"resource": {"work_class": "interactive", "cost_unit": 5}}),
+        )
+        .await;
+
+        let result = pack
+            .dispatch(
+                "brain.event_counts",
+                json!({"since": micros_to_iso(0)}),
+                &registry,
+                &token,
+            )
+            .await
+            .expect("brain.event_counts must succeed");
+
+        assert_eq!(result["total_cost_unit"], json!(i64::MAX), "got: {result}");
+        assert_eq!(
+            result["cost_unit_by_verb"]["knowledge.index"],
+            json!(i64::MAX),
+            "got: {result}"
         );
     }
 
