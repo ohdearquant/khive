@@ -1076,11 +1076,11 @@ mod note_mutation_hook_tests {
     /// #750: `merge_note`'s non-dry-run
     /// success path reindexes the surviving note (a corpus change exactly
     /// like `update_note`'s `text_changed` branch) but never fired the
-    /// note-mutation hook. Same white-box shape as the three fr1 tests
-    /// above.
+    /// note-mutation hook. Same white-box shape as the three ANN-invalidation
+    /// tests above.
     ///
     /// Both notes are seeded and the cache is warmed only ONCE, AFTER both
-    /// exist — NOT via `seed_and_warm_ann` for the first note followed by a
+    /// exist, NOT via `seed_and_warm_ann` for the first note followed by a
     /// second `memory.remember` for the second, because `memory.remember`'s
     /// own handler already calls `ann::bump_generation` on every create
     /// (`handlers/remember.rs`). Warming before the second note existed
