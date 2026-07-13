@@ -11,6 +11,14 @@ on:
         description: Space-separated Criterion crate packages in this component
         required: true
         type: string
+      timeout_minutes:
+        description: >-
+          Job timeout in minutes. Components whose bench-target compile is
+          heavier than the default budget (packs: ~16m compile alone) pass a
+          larger value so the Criterion step keeps its full 10-minute bound.
+        required: false
+        type: number
+        default: 20
 
 env:
   CARGO_TERM_COLOR: always
@@ -22,7 +30,7 @@ jobs:
   criterion:
     name: Criterion quick profile
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: ${{ inputs.timeout_minutes }}
 
     steps:
       - uses: actions/checkout@v7

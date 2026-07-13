@@ -206,6 +206,10 @@ jobs:
     with:
       component: packs
       crates: khive-pack-gtd khive-pack-kg khive-pack-knowledge khive-pack-memory khive-pack-schedule
+      # The packs bench-target compile alone runs ~16m (issue #940); the
+      # default 20m budget killed the Criterion step mid-run on every main
+      # push and the ledger steps skipped, leaving the trend data packs-blind.
+      timeout_minutes: 40
 
   # ─────────────────────────────────────────────────────────────────────────
   # e2e benches: the pipeline daemon suite (bench_calibrate's `pipeline`
