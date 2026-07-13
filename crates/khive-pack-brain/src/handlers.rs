@@ -1443,7 +1443,7 @@ impl BrainPack {
             // `build_audit_storage_event`). `ActorRef::anonymous()` resolves
             // to the explicit `"anonymous:local"` string rather than
             // silently mislabeling the event, so unresolved-actor calls are
-            // still distinguishable from real per-seat attribution.
+            // still distinguishable from configured caller attribution.
             let actor_label = format!("{}:{}", token.actor().kind, token.actor().id);
             // `apply_fold_gate_and_append_event`'s `build_event` closure is
             // now required to be `'static` (ADR-067 Component A, Fork C

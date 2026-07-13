@@ -6640,7 +6640,7 @@ mod feedback_actor_tests {
         rt: &KhiveRuntime,
         token: &NamespaceToken,
         signal: &str,
-    ) -> Option<String> {
+    ) -> String {
         let registry = empty_registry();
         let target = create_test_entity(rt, token).await;
         let result = pack
@@ -6676,8 +6676,7 @@ mod feedback_actor_tests {
         let token = rt.authorize(Namespace::local()).unwrap();
         let actor = feedback_event_actor(&pack, &rt, &token, "useful").await;
         assert_eq!(
-            actor.as_deref(),
-            Some("actor:seat:tester"),
+            actor, "actor:seat:tester",
             "FeedbackExplicit actor must reflect the resolved caller identity, \
              not a hardcoded \"brain\""
         );
@@ -6692,8 +6691,7 @@ mod feedback_actor_tests {
         let token = rt.authorize(Namespace::local()).unwrap();
         let actor = feedback_event_actor(&pack, &rt, &token, "implicit_positive").await;
         assert_eq!(
-            actor.as_deref(),
-            Some("actor:seat:tester"),
+            actor, "actor:seat:tester",
             "gated-implicit FeedbackExplicit actor must reflect the resolved caller identity"
         );
     }
@@ -6707,8 +6705,7 @@ mod feedback_actor_tests {
         let token = rt.authorize(Namespace::local()).unwrap();
         let actor = feedback_event_actor(&pack, &rt, &token, "useful").await;
         assert_eq!(
-            actor.as_deref(),
-            Some("anonymous:local"),
+            actor, "anonymous:local",
             "unresolved actor must fall back to an explicit label, never the literal \"brain\""
         );
     }
