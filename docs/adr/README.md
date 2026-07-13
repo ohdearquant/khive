@@ -132,6 +132,7 @@ For historical context, see [v0 archive](../_archive/adr_v0/README.md). v0 ADRs 
 | [ADR-109](ADR-109-sandboxed-kkernel-gateway.md)              | Sandboxed kkernel Gateway for Untrusted Execution (Phase C)                                           |
 | [ADR-110](ADR-110-vamana-wasm.md)                            | WebAssembly Support for khive-vamana                                                                  |
 | [ADR-111](ADR-111-blob-store.md)                             | BlobStore — Content-Addressed Binary Object Storage                                                   |
+| [ADR-112](ADR-112-git-outbound-publish-verbs.md)             | Outbound GitHub Publish Verbs with a Publication-Hygiene Scan                                         |
 
 ## Closed Taxonomies — Quick Reference
 
