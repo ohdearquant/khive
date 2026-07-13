@@ -4,6 +4,8 @@
 # THE PLAN: .khive/workspaces/20260711/bench-overhaul/DESIGN.md
 # (Typed interfaces > Scenario contract; Coverage definition; PR 1 slice).
 # Signed decisions: .khive/workspaces/20260710/bench-program/SPEC-draft.md
+# Amendment (binding, supersedes conflicting DESIGN.md/SPEC-draft.md text):
+# .khive/workspaces/20260710/bench-program/AMENDMENT-1-flagship-measurement-contract.md
 #
 # This manifest is data only. It declares every required F1-F10 scenario,
 # its measured surface, scale tier, cold/warm obligation, required
@@ -15,14 +17,33 @@
 # scenario_id convention: f<N>.<verb>.<arm>.<embedder> (N = F1..F10).
 
 [oq_rulings]
-# OQ1 (admin-ingest surface conflict): APPROVED CLI-boundary exception
-# (DESIGN.md D5). git-ingest and code-ingest are measured at the real CLI
-# process boundary (surface = "admin_cli"), not as new MCP verbs.
-oq1_admin_ingest_surface = "admin_cli exception approved for git-ingest and code-ingest (D5)"
+# OQ1 (admin-ingest surface conflict): RESOLVED by Amendment 1 §2 "Surface
+# rule" - this replaces the prior silent "approved" marker (DESIGN.md D5).
+# Real MCP tools/call through the daemon (surface = "mcp_daemon") is the
+# default and only surface that counts toward real-MCP coverage. Exactly
+# two admin-surface exceptions are named and bounded by the amendment;
+# both are reported in a separate admin-surface coverage class and never
+# count toward the real-MCP percentage. No other exception exists unless
+# added by signed amendment.
+oq1_admin_ingest_surface = "admin_cli/raw_daemon_control exception bounded to exactly two scenarios per Amendment 1 §2: F6 git-ingest/code-ingest (admin CLI is the product surface for it) and the F10 daemon-control probe; reported as a separate admin-surface coverage class, never counted toward the real-MCP percentage"
+# Amendment 1 §2 admin-surface coverage class membership (exhaustive; every
+# other scenario_id in this manifest is real-MCP coverage by default via
+# its surface = "mcp_daemon" declaration).
+oq1_admin_surface_scenario_ids = [
+    "f6.git_ingest.cli.production",
+    "f6.code_ingest.cli.production",
+    "f10.daemon.probe_only.floor",
+]
 # OQ2 (production request deadline): no product SLO exists. The harness
 # uses a labeled measurement-censoring safety cap, not a timeout claim.
-oq2_measurement_deadline_ms = 30000
-oq2_measurement_deadline_label = "harness safety cap for measurement censoring, not a product SLO"
+# Amendment 1 §2 "Deadline classifiability": the client-side censor must
+# strictly exceed the server-side recall deadline (30000 ms per #919) so a
+# timeout is attributable to exactly one deadline - the manifest's prior
+# 30000/30000 race is fixed by raising the harness censor to 45000 ms.
+oq2_measurement_deadline_ms = 45000
+oq2_measurement_deadline_label = "harness safety cap for measurement censoring, not a product SLO; set to 45000 ms to strictly exceed the 30000 ms server-side recall deadline (#919) per Amendment 1 §2"
+oq2_server_recall_deadline_ms = 30000
+oq2_server_recall_deadline_note = "server-side recall deadline default (#919), distinct from the harness measurement-censoring cap above; the two must never be equal (Amendment 1 §2)"
 oq2_mcp_client_default_timeout_ms = 300000
 oq2_mcp_client_default_note = "MCP client default request timeout, recorded as reference only, not the scenario deadline"
 # OQ7 (freshness window): approved per-runner-class staleness bound used by
@@ -44,8 +65,8 @@ settle = "explicit_lifecycle_predicate"
 attempts = 128
 concurrency = 128
 required_percentiles = ["p50", "p95", "p99"]
-request_deadline_ms = 30000
-request_deadline_provenance = "harness measurement-censoring safety cap, not a product SLO (OQ2 ruling); the MCP client's own request-timeout default is 300000 ms (300s), recorded here for reference only, see [oq_rulings] above"
+request_deadline_ms = 45000
+request_deadline_provenance = "harness measurement-censoring safety cap, set to strictly exceed the server-side recall deadline (30000 ms per #919) so a timeout is attributable to exactly one deadline (Amendment 1 §2); not a product SLO (OQ2 ruling); the MCP client's own request-timeout default is 300000 ms (300s), recorded here for reference only, see [oq_rulings] above"
 runner_class = "self_hosted_real_embedder"
 
 [[scenario]]
@@ -62,8 +83,8 @@ settle = "sequential_sentinel"
 attempts = 1000
 concurrency = 1
 required_percentiles = ["p50", "p95", "p99"]
-request_deadline_ms = 30000
-request_deadline_provenance = "harness measurement-censoring safety cap, not a product SLO (OQ2 ruling); the MCP client's own request-timeout default is 300000 ms (300s), recorded here for reference only, see [oq_rulings] above"
+request_deadline_ms = 45000
+request_deadline_provenance = "harness measurement-censoring safety cap, set to strictly exceed the server-side recall deadline (30000 ms per #919) so a timeout is attributable to exactly one deadline (Amendment 1 §2); not a product SLO (OQ2 ruling); the MCP client's own request-timeout default is 300000 ms (300s), recorded here for reference only, see [oq_rulings] above"
 runner_class = "self_hosted_real_embedder"
 
 [[scenario]]
@@ -80,8 +101,8 @@ settle = "sequential_sentinel"
 attempts = 1000
 concurrency = 1
 required_percentiles = ["p50", "p95", "p99"]
-request_deadline_ms = 30000
-request_deadline_provenance = "harness measurement-censoring safety cap, not a product SLO (OQ2 ruling); the MCP client's own request-timeout default is 300000 ms (300s), recorded here for reference only, see [oq_rulings] above"
+request_deadline_ms = 45000
+request_deadline_provenance = "harness measurement-censoring safety cap, set to strictly exceed the server-side recall deadline (30000 ms per #919) so a timeout is attributable to exactly one deadline (Amendment 1 §2); not a product SLO (OQ2 ruling); the MCP client's own request-timeout default is 300000 ms (300s), recorded here for reference only, see [oq_rulings] above"
 runner_class = "hosted_hash"
 
 [[scenario]]
@@ -98,8 +119,8 @@ settle = "sequential_sentinel"
 attempts = 1000
 concurrency = 1
 required_percentiles = ["p50", "p95", "p99"]
-request_deadline_ms = 30000
-request_deadline_provenance = "harness measurement-censoring safety cap, not a product SLO (OQ2 ruling); the MCP client's own request-timeout default is 300000 ms (300s), recorded here for reference only, see [oq_rulings] above"
+request_deadline_ms = 45000
+request_deadline_provenance = "harness measurement-censoring safety cap, set to strictly exceed the server-side recall deadline (30000 ms per #919) so a timeout is attributable to exactly one deadline (Amendment 1 §2); not a product SLO (OQ2 ruling); the MCP client's own request-timeout default is 300000 ms (300s), recorded here for reference only, see [oq_rulings] above"
 runner_class = "hosted_hash"
 
 [[scenario]]
@@ -116,8 +137,8 @@ settle = "sequential_sentinel"
 attempts = 1000
 concurrency = 1
 required_percentiles = ["p50", "p95", "p99"]
-request_deadline_ms = 30000
-request_deadline_provenance = "harness measurement-censoring safety cap, not a product SLO (OQ2 ruling); the MCP client's own request-timeout default is 300000 ms (300s), recorded here for reference only, see [oq_rulings] above"
+request_deadline_ms = 45000
+request_deadline_provenance = "harness measurement-censoring safety cap, set to strictly exceed the server-side recall deadline (30000 ms per #919) so a timeout is attributable to exactly one deadline (Amendment 1 §2); not a product SLO (OQ2 ruling); the MCP client's own request-timeout default is 300000 ms (300s), recorded here for reference only, see [oq_rulings] above"
 runner_class = "hosted_hash"
 
 [[scenario]]
@@ -134,8 +155,8 @@ settle = "sequential_sentinel"
 attempts = 1000
 concurrency = 1
 required_percentiles = ["p50", "p95", "p99"]
-request_deadline_ms = 30000
-request_deadline_provenance = "harness measurement-censoring safety cap, not a product SLO (OQ2 ruling); the MCP client's own request-timeout default is 300000 ms (300s), recorded here for reference only, see [oq_rulings] above"
+request_deadline_ms = 45000
+request_deadline_provenance = "harness measurement-censoring safety cap, set to strictly exceed the server-side recall deadline (30000 ms per #919) so a timeout is attributable to exactly one deadline (Amendment 1 §2); not a product SLO (OQ2 ruling); the MCP client's own request-timeout default is 300000 ms (300s), recorded here for reference only, see [oq_rulings] above"
 runner_class = "self_hosted_real_embedder"
 
 [[scenario]]
@@ -152,8 +173,26 @@ settle = "sequential_sentinel"
 attempts = 1000
 concurrency = 1
 required_percentiles = ["p50", "p95", "p99"]
-request_deadline_ms = 30000
-request_deadline_provenance = "harness measurement-censoring safety cap, not a product SLO (OQ2 ruling); the MCP client's own request-timeout default is 300000 ms (300s), recorded here for reference only, see [oq_rulings] above"
+request_deadline_ms = 45000
+request_deadline_provenance = "harness measurement-censoring safety cap, set to strictly exceed the server-side recall deadline (30000 ms per #919) so a timeout is attributable to exactly one deadline (Amendment 1 §2); not a product SLO (OQ2 ruling); the MCP client's own request-timeout default is 300000 ms (300s), recorded here for reference only, see [oq_rulings] above"
+runner_class = "self_hosted_real_embedder"
+
+[[scenario]]
+scenario_id = "f1.recall.warm.real.n500k"
+feature = "F1"
+surface = "mcp_daemon"
+operation = "memory.recall"
+fixture = "memory_n500k_sentinel_settled"
+fixture_hash = "sha256:74f191649fb33fe1a406f23dfddedb8eac0ee045d4a74926d300cdadb7bb0beb"
+scale = { memories = 500000 }
+embedder = "production"
+state = "warm"
+settle = "sequential_sentinel"
+attempts = 1000
+concurrency = 1
+required_percentiles = ["p50", "p95", "p99"]
+request_deadline_ms = 45000
+request_deadline_provenance = "harness measurement-censoring safety cap, set to strictly exceed the server-side recall deadline (30000 ms per #919) so a timeout is attributable to exactly one deadline (Amendment 1 §2); not a product SLO (OQ2 ruling); the MCP client's own request-timeout default is 300000 ms (300s), recorded here for reference only, see [oq_rulings] above"
 runner_class = "self_hosted_real_embedder"
 
 [[scenario]]
@@ -170,8 +209,8 @@ settle = "sequential_sentinel"
 attempts = 1000
 concurrency = 1
 required_percentiles = ["p50", "p95", "p99"]
-request_deadline_ms = 30000
-request_deadline_provenance = "harness measurement-censoring safety cap, not a product SLO (OQ2 ruling); the MCP client's own request-timeout default is 300000 ms (300s), recorded here for reference only, see [oq_rulings] above"
+request_deadline_ms = 45000
+request_deadline_provenance = "harness measurement-censoring safety cap, set to strictly exceed the server-side recall deadline (30000 ms per #919) so a timeout is attributable to exactly one deadline (Amendment 1 §2); not a product SLO (OQ2 ruling); the MCP client's own request-timeout default is 300000 ms (300s), recorded here for reference only, see [oq_rulings] above"
 runner_class = "self_hosted_real_embedder"
 
 [[scenario]]
@@ -188,8 +227,8 @@ settle = "sequential_sentinel"
 attempts = 1000
 concurrency = 1
 required_percentiles = ["p50", "p95", "p99"]
-request_deadline_ms = 30000
-request_deadline_provenance = "harness measurement-censoring safety cap, not a product SLO (OQ2 ruling); the MCP client's own request-timeout default is 300000 ms (300s), recorded here for reference only, see [oq_rulings] above"
+request_deadline_ms = 45000
+request_deadline_provenance = "harness measurement-censoring safety cap, set to strictly exceed the server-side recall deadline (30000 ms per #919) so a timeout is attributable to exactly one deadline (Amendment 1 §2); not a product SLO (OQ2 ruling); the MCP client's own request-timeout default is 300000 ms (300s), recorded here for reference only, see [oq_rulings] above"
 runner_class = "self_hosted_real_embedder"
 
 [[scenario]]
@@ -206,8 +245,8 @@ settle = "sequential_sentinel"
 attempts = 1000
 concurrency = 1
 required_percentiles = ["p50", "p95", "p99"]
-request_deadline_ms = 30000
-request_deadline_provenance = "harness measurement-censoring safety cap, not a product SLO (OQ2 ruling); the MCP client's own request-timeout default is 300000 ms (300s), recorded here for reference only, see [oq_rulings] above"
+request_deadline_ms = 45000
+request_deadline_provenance = "harness measurement-censoring safety cap, set to strictly exceed the server-side recall deadline (30000 ms per #919) so a timeout is attributable to exactly one deadline (Amendment 1 §2); not a product SLO (OQ2 ruling); the MCP client's own request-timeout default is 300000 ms (300s), recorded here for reference only, see [oq_rulings] above"
 runner_class = "self_hosted_real_embedder"
 
 [[scenario]]
@@ -224,8 +263,8 @@ settle = "sequential_sentinel"
 attempts = 1000
 concurrency = 1
 required_percentiles = ["p50", "p95", "p99"]
-request_deadline_ms = 30000
-request_deadline_provenance = "harness measurement-censoring safety cap, not a product SLO (OQ2 ruling); the MCP client's own request-timeout default is 300000 ms (300s), recorded here for reference only, see [oq_rulings] above"
+request_deadline_ms = 45000
+request_deadline_provenance = "harness measurement-censoring safety cap, set to strictly exceed the server-side recall deadline (30000 ms per #919) so a timeout is attributable to exactly one deadline (Amendment 1 §2); not a product SLO (OQ2 ruling); the MCP client's own request-timeout default is 300000 ms (300s), recorded here for reference only, see [oq_rulings] above"
 runner_class = "self_hosted_real_embedder"
 
 [[scenario]]
@@ -242,8 +281,8 @@ settle = "sequential_sentinel"
 attempts = 1000
 concurrency = 1
 required_percentiles = ["p50", "p95", "p99"]
-request_deadline_ms = 30000
-request_deadline_provenance = "harness measurement-censoring safety cap, not a product SLO (OQ2 ruling); the MCP client's own request-timeout default is 300000 ms (300s), recorded here for reference only, see [oq_rulings] above"
+request_deadline_ms = 45000
+request_deadline_provenance = "harness measurement-censoring safety cap, set to strictly exceed the server-side recall deadline (30000 ms per #919) so a timeout is attributable to exactly one deadline (Amendment 1 §2); not a product SLO (OQ2 ruling); the MCP client's own request-timeout default is 300000 ms (300s), recorded here for reference only, see [oq_rulings] above"
 runner_class = "self_hosted_real_embedder"
 
 [[scenario]]
@@ -260,8 +299,8 @@ settle = "sequential_sentinel"
 attempts = 1000
 concurrency = 1
 required_percentiles = ["p50", "p95", "p99"]
-request_deadline_ms = 30000
-request_deadline_provenance = "harness measurement-censoring safety cap, not a product SLO (OQ2 ruling); the MCP client's own request-timeout default is 300000 ms (300s), recorded here for reference only, see [oq_rulings] above"
+request_deadline_ms = 45000
+request_deadline_provenance = "harness measurement-censoring safety cap, set to strictly exceed the server-side recall deadline (30000 ms per #919) so a timeout is attributable to exactly one deadline (Amendment 1 §2); not a product SLO (OQ2 ruling); the MCP client's own request-timeout default is 300000 ms (300s), recorded here for reference only, see [oq_rulings] above"
 runner_class = "self_hosted_real_embedder"
 
 [[scenario]]
@@ -278,8 +317,8 @@ settle = "sequential_sentinel"
 attempts = 1000
 concurrency = 1
 required_percentiles = ["p50", "p95", "p99"]
-request_deadline_ms = 30000
-request_deadline_provenance = "harness measurement-censoring safety cap, not a product SLO (OQ2 ruling); the MCP client's own request-timeout default is 300000 ms (300s), recorded here for reference only, see [oq_rulings] above"
+request_deadline_ms = 45000
+request_deadline_provenance = "harness measurement-censoring safety cap, set to strictly exceed the server-side recall deadline (30000 ms per #919) so a timeout is attributable to exactly one deadline (Amendment 1 §2); not a product SLO (OQ2 ruling); the MCP client's own request-timeout default is 300000 ms (300s), recorded here for reference only, see [oq_rulings] above"
 runner_class = "self_hosted_real_embedder"
 
 [[scenario]]
@@ -296,8 +335,8 @@ settle = "sequential_sentinel"
 attempts = 1000
 concurrency = 1
 required_percentiles = ["p50", "p95", "p99"]
-request_deadline_ms = 30000
-request_deadline_provenance = "harness measurement-censoring safety cap, not a product SLO (OQ2 ruling); the MCP client's own request-timeout default is 300000 ms (300s), recorded here for reference only, see [oq_rulings] above"
+request_deadline_ms = 45000
+request_deadline_provenance = "harness measurement-censoring safety cap, set to strictly exceed the server-side recall deadline (30000 ms per #919) so a timeout is attributable to exactly one deadline (Amendment 1 §2); not a product SLO (OQ2 ruling); the MCP client's own request-timeout default is 300000 ms (300s), recorded here for reference only, see [oq_rulings] above"
 runner_class = "hosted_hash"
 
 [[scenario]]
@@ -314,8 +353,8 @@ settle = "sequential_sentinel"
 attempts = 1000
 concurrency = 1
 required_percentiles = ["p50", "p95", "p99"]
-request_deadline_ms = 30000
-request_deadline_provenance = "harness measurement-censoring safety cap, not a product SLO (OQ2 ruling); the MCP client's own request-timeout default is 300000 ms (300s), recorded here for reference only, see [oq_rulings] above"
+request_deadline_ms = 45000
+request_deadline_provenance = "harness measurement-censoring safety cap, set to strictly exceed the server-side recall deadline (30000 ms per #919) so a timeout is attributable to exactly one deadline (Amendment 1 §2); not a product SLO (OQ2 ruling); the MCP client's own request-timeout default is 300000 ms (300s), recorded here for reference only, see [oq_rulings] above"
 runner_class = "hosted_hash"
 
 [[scenario]]
@@ -332,8 +371,8 @@ settle = "sequential_sentinel"
 attempts = 1000
 concurrency = 1
 required_percentiles = ["p50", "p95", "p99"]
-request_deadline_ms = 30000
-request_deadline_provenance = "harness measurement-censoring safety cap, not a product SLO (OQ2 ruling); the MCP client's own request-timeout default is 300000 ms (300s), recorded here for reference only, see [oq_rulings] above"
+request_deadline_ms = 45000
+request_deadline_provenance = "harness measurement-censoring safety cap, set to strictly exceed the server-side recall deadline (30000 ms per #919) so a timeout is attributable to exactly one deadline (Amendment 1 §2); not a product SLO (OQ2 ruling); the MCP client's own request-timeout default is 300000 ms (300s), recorded here for reference only, see [oq_rulings] above"
 runner_class = "hosted_hash"
 
 [[scenario]]
@@ -350,8 +389,8 @@ settle = "sequential_sentinel"
 attempts = 1000
 concurrency = 1
 required_percentiles = ["p50", "p95", "p99"]
-request_deadline_ms = 30000
-request_deadline_provenance = "harness measurement-censoring safety cap, not a product SLO (OQ2 ruling); the MCP client's own request-timeout default is 300000 ms (300s), recorded here for reference only, see [oq_rulings] above"
+request_deadline_ms = 45000
+request_deadline_provenance = "harness measurement-censoring safety cap, set to strictly exceed the server-side recall deadline (30000 ms per #919) so a timeout is attributable to exactly one deadline (Amendment 1 §2); not a product SLO (OQ2 ruling); the MCP client's own request-timeout default is 300000 ms (300s), recorded here for reference only, see [oq_rulings] above"
 runner_class = "hosted_hash"
 
 [[scenario]]
@@ -368,8 +407,8 @@ settle = "sequential_sentinel"
 attempts = 1000
 concurrency = 1
 required_percentiles = ["p50", "p95", "p99"]
-request_deadline_ms = 30000
-request_deadline_provenance = "harness measurement-censoring safety cap, not a product SLO (OQ2 ruling); the MCP client's own request-timeout default is 300000 ms (300s), recorded here for reference only, see [oq_rulings] above"
+request_deadline_ms = 45000
+request_deadline_provenance = "harness measurement-censoring safety cap, set to strictly exceed the server-side recall deadline (30000 ms per #919) so a timeout is attributable to exactly one deadline (Amendment 1 §2); not a product SLO (OQ2 ruling); the MCP client's own request-timeout default is 300000 ms (300s), recorded here for reference only, see [oq_rulings] above"
 runner_class = "hosted_hash"
 
 [[scenario]]
@@ -386,8 +425,8 @@ settle = "sequential_sentinel"
 attempts = 1000
 concurrency = 1
 required_percentiles = ["p50", "p95", "p99"]
-request_deadline_ms = 30000
-request_deadline_provenance = "harness measurement-censoring safety cap, not a product SLO (OQ2 ruling); the MCP client's own request-timeout default is 300000 ms (300s), recorded here for reference only, see [oq_rulings] above"
+request_deadline_ms = 45000
+request_deadline_provenance = "harness measurement-censoring safety cap, set to strictly exceed the server-side recall deadline (30000 ms per #919) so a timeout is attributable to exactly one deadline (Amendment 1 §2); not a product SLO (OQ2 ruling); the MCP client's own request-timeout default is 300000 ms (300s), recorded here for reference only, see [oq_rulings] above"
 runner_class = "hosted_hash"
 
 [[scenario]]
@@ -404,8 +443,8 @@ settle = "sequential_sentinel"
 attempts = 1000
 concurrency = 1
 required_percentiles = ["p50", "p95", "p99"]
-request_deadline_ms = 30000
-request_deadline_provenance = "harness measurement-censoring safety cap, not a product SLO (OQ2 ruling); the MCP client's own request-timeout default is 300000 ms (300s), recorded here for reference only, see [oq_rulings] above"
+request_deadline_ms = 45000
+request_deadline_provenance = "harness measurement-censoring safety cap, set to strictly exceed the server-side recall deadline (30000 ms per #919) so a timeout is attributable to exactly one deadline (Amendment 1 §2); not a product SLO (OQ2 ruling); the MCP client's own request-timeout default is 300000 ms (300s), recorded here for reference only, see [oq_rulings] above"
 runner_class = "self_hosted_real_embedder"
 
 [[scenario]]
@@ -422,8 +461,8 @@ settle = "sequential_sentinel"
 attempts = 1000
 concurrency = 1
 required_percentiles = ["p50", "p95", "p99"]
-request_deadline_ms = 30000
-request_deadline_provenance = "harness measurement-censoring safety cap, not a product SLO (OQ2 ruling); the MCP client's own request-timeout default is 300000 ms (300s), recorded here for reference only, see [oq_rulings] above"
+request_deadline_ms = 45000
+request_deadline_provenance = "harness measurement-censoring safety cap, set to strictly exceed the server-side recall deadline (30000 ms per #919) so a timeout is attributable to exactly one deadline (Amendment 1 §2); not a product SLO (OQ2 ruling); the MCP client's own request-timeout default is 300000 ms (300s), recorded here for reference only, see [oq_rulings] above"
 runner_class = "self_hosted_real_embedder"
 
 [[scenario]]
@@ -440,8 +479,8 @@ settle = "sequential_sentinel"
 attempts = 1000
 concurrency = 1
 required_percentiles = ["p50", "p95", "p99"]
-request_deadline_ms = 30000
-request_deadline_provenance = "harness measurement-censoring safety cap, not a product SLO (OQ2 ruling); the MCP client's own request-timeout default is 300000 ms (300s), recorded here for reference only, see [oq_rulings] above"
+request_deadline_ms = 45000
+request_deadline_provenance = "harness measurement-censoring safety cap, set to strictly exceed the server-side recall deadline (30000 ms per #919) so a timeout is attributable to exactly one deadline (Amendment 1 §2); not a product SLO (OQ2 ruling); the MCP client's own request-timeout default is 300000 ms (300s), recorded here for reference only, see [oq_rulings] above"
 runner_class = "self_hosted_real_embedder"
 
 [[scenario]]
@@ -458,8 +497,8 @@ settle = "sequential_sentinel"
 attempts = 1000
 concurrency = 1
 required_percentiles = ["p50", "p95", "p99"]
-request_deadline_ms = 30000
-request_deadline_provenance = "harness measurement-censoring safety cap, not a product SLO (OQ2 ruling); the MCP client's own request-timeout default is 300000 ms (300s), recorded here for reference only, see [oq_rulings] above"
+request_deadline_ms = 45000
+request_deadline_provenance = "harness measurement-censoring safety cap, set to strictly exceed the server-side recall deadline (30000 ms per #919) so a timeout is attributable to exactly one deadline (Amendment 1 §2); not a product SLO (OQ2 ruling); the MCP client's own request-timeout default is 300000 ms (300s), recorded here for reference only, see [oq_rulings] above"
 runner_class = "self_hosted_real_embedder"
 
 [[scenario]]
@@ -476,8 +515,8 @@ settle = "sequential_sentinel"
 attempts = 1000
 concurrency = 1
 required_percentiles = ["p50", "p95", "p99"]
-request_deadline_ms = 30000
-request_deadline_provenance = "harness measurement-censoring safety cap, not a product SLO (OQ2 ruling); the MCP client's own request-timeout default is 300000 ms (300s), recorded here for reference only, see [oq_rulings] above"
+request_deadline_ms = 45000
+request_deadline_provenance = "harness measurement-censoring safety cap, set to strictly exceed the server-side recall deadline (30000 ms per #919) so a timeout is attributable to exactly one deadline (Amendment 1 §2); not a product SLO (OQ2 ruling); the MCP client's own request-timeout default is 300000 ms (300s), recorded here for reference only, see [oq_rulings] above"
 runner_class = "self_hosted_real_embedder"
 
 [[scenario]]
@@ -494,8 +533,8 @@ settle = "sequential_sentinel"
 attempts = 1000
 concurrency = 1
 required_percentiles = ["p50", "p95", "p99"]
-request_deadline_ms = 30000
-request_deadline_provenance = "harness measurement-censoring safety cap, not a product SLO (OQ2 ruling); the MCP client's own request-timeout default is 300000 ms (300s), recorded here for reference only, see [oq_rulings] above"
+request_deadline_ms = 45000
+request_deadline_provenance = "harness measurement-censoring safety cap, set to strictly exceed the server-side recall deadline (30000 ms per #919) so a timeout is attributable to exactly one deadline (Amendment 1 §2); not a product SLO (OQ2 ruling); the MCP client's own request-timeout default is 300000 ms (300s), recorded here for reference only, see [oq_rulings] above"
 runner_class = "self_hosted_real_embedder"
 
 [[scenario]]
@@ -512,8 +551,8 @@ settle = "sequential_sentinel"
 attempts = 1000
 concurrency = 1
 required_percentiles = ["p50", "p95", "p99"]
-request_deadline_ms = 30000
-request_deadline_provenance = "harness measurement-censoring safety cap, not a product SLO (OQ2 ruling); the MCP client's own request-timeout default is 300000 ms (300s), recorded here for reference only, see [oq_rulings] above"
+request_deadline_ms = 45000
+request_deadline_provenance = "harness measurement-censoring safety cap, set to strictly exceed the server-side recall deadline (30000 ms per #919) so a timeout is attributable to exactly one deadline (Amendment 1 §2); not a product SLO (OQ2 ruling); the MCP client's own request-timeout default is 300000 ms (300s), recorded here for reference only, see [oq_rulings] above"
 runner_class = "self_hosted_real_embedder"
 
 [[scenario]]
@@ -530,8 +569,8 @@ settle = "sequential_sentinel"
 attempts = 1000
 concurrency = 1
 required_percentiles = ["p50", "p95", "p99"]
-request_deadline_ms = 30000
-request_deadline_provenance = "harness measurement-censoring safety cap, not a product SLO (OQ2 ruling); the MCP client's own request-timeout default is 300000 ms (300s), recorded here for reference only, see [oq_rulings] above"
+request_deadline_ms = 45000
+request_deadline_provenance = "harness measurement-censoring safety cap, set to strictly exceed the server-side recall deadline (30000 ms per #919) so a timeout is attributable to exactly one deadline (Amendment 1 §2); not a product SLO (OQ2 ruling); the MCP client's own request-timeout default is 300000 ms (300s), recorded here for reference only, see [oq_rulings] above"
 runner_class = "self_hosted_real_embedder"
 
 [[scenario]]
@@ -548,8 +587,8 @@ settle = "sequential_sentinel"
 attempts = 1000
 concurrency = 1
 required_percentiles = ["p50", "p95", "p99"]
-request_deadline_ms = 30000
-request_deadline_provenance = "harness measurement-censoring safety cap, not a product SLO (OQ2 ruling); the MCP client's own request-timeout default is 300000 ms (300s), recorded here for reference only, see [oq_rulings] above"
+request_deadline_ms = 45000
+request_deadline_provenance = "harness measurement-censoring safety cap, set to strictly exceed the server-side recall deadline (30000 ms per #919) so a timeout is attributable to exactly one deadline (Amendment 1 §2); not a product SLO (OQ2 ruling); the MCP client's own request-timeout default is 300000 ms (300s), recorded here for reference only, see [oq_rulings] above"
 runner_class = "self_hosted_real_embedder"
 
 [[scenario]]
@@ -566,8 +605,8 @@ settle = "sequential_sentinel"
 attempts = 1000
 concurrency = 1
 required_percentiles = ["p50", "p95", "p99"]
-request_deadline_ms = 30000
-request_deadline_provenance = "harness measurement-censoring safety cap, not a product SLO (OQ2 ruling); the MCP client's own request-timeout default is 300000 ms (300s), recorded here for reference only, see [oq_rulings] above"
+request_deadline_ms = 45000
+request_deadline_provenance = "harness measurement-censoring safety cap, set to strictly exceed the server-side recall deadline (30000 ms per #919) so a timeout is attributable to exactly one deadline (Amendment 1 §2); not a product SLO (OQ2 ruling); the MCP client's own request-timeout default is 300000 ms (300s), recorded here for reference only, see [oq_rulings] above"
 runner_class = "self_hosted_real_embedder"
 
 [[scenario]]
@@ -584,8 +623,8 @@ settle = "sequential_sentinel"
 attempts = 1000
 concurrency = 1
 required_percentiles = ["p50", "p95", "p99"]
-request_deadline_ms = 30000
-request_deadline_provenance = "harness measurement-censoring safety cap, not a product SLO (OQ2 ruling); the MCP client's own request-timeout default is 300000 ms (300s), recorded here for reference only, see [oq_rulings] above"
+request_deadline_ms = 45000
+request_deadline_provenance = "harness measurement-censoring safety cap, set to strictly exceed the server-side recall deadline (30000 ms per #919) so a timeout is attributable to exactly one deadline (Amendment 1 §2); not a product SLO (OQ2 ruling); the MCP client's own request-timeout default is 300000 ms (300s), recorded here for reference only, see [oq_rulings] above"
 runner_class = "self_hosted_real_embedder"
 
 [[scenario]]
@@ -602,8 +641,8 @@ settle = "sequential_sentinel"
 attempts = 1000
 concurrency = 1
 required_percentiles = ["p50", "p95", "p99"]
-request_deadline_ms = 30000
-request_deadline_provenance = "harness measurement-censoring safety cap, not a product SLO (OQ2 ruling); the MCP client's own request-timeout default is 300000 ms (300s), recorded here for reference only, see [oq_rulings] above"
+request_deadline_ms = 45000
+request_deadline_provenance = "harness measurement-censoring safety cap, set to strictly exceed the server-side recall deadline (30000 ms per #919) so a timeout is attributable to exactly one deadline (Amendment 1 §2); not a product SLO (OQ2 ruling); the MCP client's own request-timeout default is 300000 ms (300s), recorded here for reference only, see [oq_rulings] above"
 runner_class = "self_hosted_real_embedder"
 
 [[scenario]]
@@ -620,8 +659,8 @@ settle = "sequential_sentinel"
 attempts = 1000
 concurrency = 1
 required_percentiles = ["p50", "p95", "p99"]
-request_deadline_ms = 30000
-request_deadline_provenance = "harness measurement-censoring safety cap, not a product SLO (OQ2 ruling); the MCP client's own request-timeout default is 300000 ms (300s), recorded here for reference only, see [oq_rulings] above"
+request_deadline_ms = 45000
+request_deadline_provenance = "harness measurement-censoring safety cap, set to strictly exceed the server-side recall deadline (30000 ms per #919) so a timeout is attributable to exactly one deadline (Amendment 1 §2); not a product SLO (OQ2 ruling); the MCP client's own request-timeout default is 300000 ms (300s), recorded here for reference only, see [oq_rulings] above"
 runner_class = "hosted_hash"
 
 [[scenario]]
@@ -638,8 +677,8 @@ settle = "sequential_sentinel"
 attempts = 1000
 concurrency = 1
 required_percentiles = ["p50", "p95", "p99"]
-request_deadline_ms = 30000
-request_deadline_provenance = "harness measurement-censoring safety cap, not a product SLO (OQ2 ruling); the MCP client's own request-timeout default is 300000 ms (300s), recorded here for reference only, see [oq_rulings] above"
+request_deadline_ms = 45000
+request_deadline_provenance = "harness measurement-censoring safety cap, set to strictly exceed the server-side recall deadline (30000 ms per #919) so a timeout is attributable to exactly one deadline (Amendment 1 §2); not a product SLO (OQ2 ruling); the MCP client's own request-timeout default is 300000 ms (300s), recorded here for reference only, see [oq_rulings] above"
 runner_class = "hosted_hash"
 
 [[scenario]]
@@ -656,8 +695,8 @@ settle = "sequential_sentinel"
 attempts = 1000
 concurrency = 1
 required_percentiles = ["p50", "p95", "p99"]
-request_deadline_ms = 30000
-request_deadline_provenance = "harness measurement-censoring safety cap, not a product SLO (OQ2 ruling); the MCP client's own request-timeout default is 300000 ms (300s), recorded here for reference only, see [oq_rulings] above"
+request_deadline_ms = 45000
+request_deadline_provenance = "harness measurement-censoring safety cap, set to strictly exceed the server-side recall deadline (30000 ms per #919) so a timeout is attributable to exactly one deadline (Amendment 1 §2); not a product SLO (OQ2 ruling); the MCP client's own request-timeout default is 300000 ms (300s), recorded here for reference only, see [oq_rulings] above"
 runner_class = "hosted_hash"
 
 [[scenario]]
@@ -674,8 +713,8 @@ settle = "sequential_sentinel"
 attempts = 1000
 concurrency = 1
 required_percentiles = ["p50", "p95", "p99"]
-request_deadline_ms = 30000
-request_deadline_provenance = "harness measurement-censoring safety cap, not a product SLO (OQ2 ruling); the MCP client's own request-timeout default is 300000 ms (300s), recorded here for reference only, see [oq_rulings] above"
+request_deadline_ms = 45000
+request_deadline_provenance = "harness measurement-censoring safety cap, set to strictly exceed the server-side recall deadline (30000 ms per #919) so a timeout is attributable to exactly one deadline (Amendment 1 §2); not a product SLO (OQ2 ruling); the MCP client's own request-timeout default is 300000 ms (300s), recorded here for reference only, see [oq_rulings] above"
 runner_class = "hosted_hash"
 
 [[scenario]]
@@ -692,8 +731,8 @@ settle = "sequential_sentinel"
 attempts = 1000
 concurrency = 1
 required_percentiles = ["p50", "p95", "p99"]
-request_deadline_ms = 30000
-request_deadline_provenance = "harness measurement-censoring safety cap, not a product SLO (OQ2 ruling); the MCP client's own request-timeout default is 300000 ms (300s), recorded here for reference only, see [oq_rulings] above"
+request_deadline_ms = 45000
+request_deadline_provenance = "harness measurement-censoring safety cap, set to strictly exceed the server-side recall deadline (30000 ms per #919) so a timeout is attributable to exactly one deadline (Amendment 1 §2); not a product SLO (OQ2 ruling); the MCP client's own request-timeout default is 300000 ms (300s), recorded here for reference only, see [oq_rulings] above"
 runner_class = "self_hosted_real_embedder"
 
 [[scenario]]
@@ -710,8 +749,26 @@ settle = "sequential_sentinel"
 attempts = 1000
 concurrency = 1
 required_percentiles = ["p50", "p95", "p99"]
-request_deadline_ms = 30000
-request_deadline_provenance = "harness measurement-censoring safety cap, not a product SLO (OQ2 ruling); the MCP client's own request-timeout default is 300000 ms (300s), recorded here for reference only, see [oq_rulings] above"
+request_deadline_ms = 45000
+request_deadline_provenance = "harness measurement-censoring safety cap, set to strictly exceed the server-side recall deadline (30000 ms per #919) so a timeout is attributable to exactly one deadline (Amendment 1 §2); not a product SLO (OQ2 ruling); the MCP client's own request-timeout default is 300000 ms (300s), recorded here for reference only, see [oq_rulings] above"
+runner_class = "self_hosted_real_embedder"
+
+[[scenario]]
+scenario_id = "f4.traverse.powerlaw.n500000.depth3.real"
+feature = "F4"
+surface = "mcp_daemon"
+operation = "traverse"
+fixture = "kg_graph_powerlaw"
+fixture_hash = "sha256:e679da8c661b7f9e927183e45c739a7573fb4fdd64d6886e03616026eb7fe62a"
+scale = { nodes = 500000, depth = 3 }
+embedder = "production"
+state = "warm"
+settle = "sequential_sentinel"
+attempts = 1000
+concurrency = 1
+required_percentiles = ["p50", "p95", "p99"]
+request_deadline_ms = 45000
+request_deadline_provenance = "harness measurement-censoring safety cap, set to strictly exceed the server-side recall deadline (30000 ms per #919) so a timeout is attributable to exactly one deadline (Amendment 1 §2); not a product SLO (OQ2 ruling); the MCP client's own request-timeout default is 300000 ms (300s), recorded here for reference only, see [oq_rulings] above"
 runner_class = "self_hosted_real_embedder"
 
 [[scenario]]
@@ -728,8 +785,8 @@ settle = "sequential_sentinel"
 attempts = 1000
 concurrency = 1
 required_percentiles = ["p50", "p95", "p99"]
-request_deadline_ms = 30000
-request_deadline_provenance = "harness measurement-censoring safety cap, not a product SLO (OQ2 ruling); the MCP client's own request-timeout default is 300000 ms (300s), recorded here for reference only, see [oq_rulings] above"
+request_deadline_ms = 45000
+request_deadline_provenance = "harness measurement-censoring safety cap, set to strictly exceed the server-side recall deadline (30000 ms per #919) so a timeout is attributable to exactly one deadline (Amendment 1 §2); not a product SLO (OQ2 ruling); the MCP client's own request-timeout default is 300000 ms (300s), recorded here for reference only, see [oq_rulings] above"
 runner_class = "self_hosted_real_embedder"
 
 [[scenario]]
@@ -746,8 +803,8 @@ settle = "sequential_sentinel"
 attempts = 1000
 concurrency = 1
 required_percentiles = ["p50", "p95", "p99"]
-request_deadline_ms = 30000
-request_deadline_provenance = "harness measurement-censoring safety cap, not a product SLO (OQ2 ruling); the MCP client's own request-timeout default is 300000 ms (300s), recorded here for reference only, see [oq_rulings] above"
+request_deadline_ms = 45000
+request_deadline_provenance = "harness measurement-censoring safety cap, set to strictly exceed the server-side recall deadline (30000 ms per #919) so a timeout is attributable to exactly one deadline (Amendment 1 §2); not a product SLO (OQ2 ruling); the MCP client's own request-timeout default is 300000 ms (300s), recorded here for reference only, see [oq_rulings] above"
 runner_class = "hosted_hash"
 
 [[scenario]]
@@ -764,8 +821,8 @@ settle = "sequential_sentinel"
 attempts = 1000
 concurrency = 1
 required_percentiles = ["p50", "p95", "p99"]
-request_deadline_ms = 30000
-request_deadline_provenance = "harness measurement-censoring safety cap, not a product SLO (OQ2 ruling); the MCP client's own request-timeout default is 300000 ms (300s), recorded here for reference only, see [oq_rulings] above"
+request_deadline_ms = 45000
+request_deadline_provenance = "harness measurement-censoring safety cap, set to strictly exceed the server-side recall deadline (30000 ms per #919) so a timeout is attributable to exactly one deadline (Amendment 1 §2); not a product SLO (OQ2 ruling); the MCP client's own request-timeout default is 300000 ms (300s), recorded here for reference only, see [oq_rulings] above"
 runner_class = "self_hosted_real_embedder"
 
 [[scenario]]
@@ -782,8 +839,8 @@ settle = "sequential_sentinel"
 attempts = 1000
 concurrency = 1
 required_percentiles = ["p50", "p95", "p99"]
-request_deadline_ms = 30000
-request_deadline_provenance = "harness measurement-censoring safety cap, not a product SLO (OQ2 ruling); the MCP client's own request-timeout default is 300000 ms (300s), recorded here for reference only, see [oq_rulings] above"
+request_deadline_ms = 45000
+request_deadline_provenance = "harness measurement-censoring safety cap, set to strictly exceed the server-side recall deadline (30000 ms per #919) so a timeout is attributable to exactly one deadline (Amendment 1 §2); not a product SLO (OQ2 ruling); the MCP client's own request-timeout default is 300000 ms (300s), recorded here for reference only, see [oq_rulings] above"
 runner_class = "hosted_hash"
 
 [[scenario]]
@@ -800,8 +857,8 @@ settle = "sequential_sentinel"
 attempts = 1000
 concurrency = 1
 required_percentiles = ["p50", "p95", "p99"]
-request_deadline_ms = 30000
-request_deadline_provenance = "harness measurement-censoring safety cap, not a product SLO (OQ2 ruling); the MCP client's own request-timeout default is 300000 ms (300s), recorded here for reference only, see [oq_rulings] above"
+request_deadline_ms = 45000
+request_deadline_provenance = "harness measurement-censoring safety cap, set to strictly exceed the server-side recall deadline (30000 ms per #919) so a timeout is attributable to exactly one deadline (Amendment 1 §2); not a product SLO (OQ2 ruling); the MCP client's own request-timeout default is 300000 ms (300s), recorded here for reference only, see [oq_rulings] above"
 runner_class = "hosted_hash"
 
 [[scenario]]
@@ -818,8 +875,8 @@ settle = "sequential_sentinel"
 attempts = 1000
 concurrency = 1
 required_percentiles = ["p50", "p95", "p99"]
-request_deadline_ms = 30000
-request_deadline_provenance = "harness measurement-censoring safety cap, not a product SLO (OQ2 ruling); the MCP client's own request-timeout default is 300000 ms (300s), recorded here for reference only, see [oq_rulings] above"
+request_deadline_ms = 45000
+request_deadline_provenance = "harness measurement-censoring safety cap, set to strictly exceed the server-side recall deadline (30000 ms per #919) so a timeout is attributable to exactly one deadline (Amendment 1 §2); not a product SLO (OQ2 ruling); the MCP client's own request-timeout default is 300000 ms (300s), recorded here for reference only, see [oq_rulings] above"
 runner_class = "hosted_hash"
 
 [[scenario]]
@@ -836,8 +893,8 @@ settle = "sequential_sentinel"
 attempts = 1000
 concurrency = 1
 required_percentiles = ["p50", "p95", "p99"]
-request_deadline_ms = 30000
-request_deadline_provenance = "harness measurement-censoring safety cap, not a product SLO (OQ2 ruling); the MCP client's own request-timeout default is 300000 ms (300s), recorded here for reference only, see [oq_rulings] above"
+request_deadline_ms = 45000
+request_deadline_provenance = "harness measurement-censoring safety cap, set to strictly exceed the server-side recall deadline (30000 ms per #919) so a timeout is attributable to exactly one deadline (Amendment 1 §2); not a product SLO (OQ2 ruling); the MCP client's own request-timeout default is 300000 ms (300s), recorded here for reference only, see [oq_rulings] above"
 runner_class = "hosted_hash"
 
 [[scenario]]
@@ -854,8 +911,8 @@ settle = "sequential_sentinel"
 attempts = 1000
 concurrency = 1
 required_percentiles = ["p50", "p95", "p99"]
-request_deadline_ms = 30000
-request_deadline_provenance = "harness measurement-censoring safety cap, not a product SLO (OQ2 ruling); the MCP client's own request-timeout default is 300000 ms (300s), recorded here for reference only, see [oq_rulings] above"
+request_deadline_ms = 45000
+request_deadline_provenance = "harness measurement-censoring safety cap, set to strictly exceed the server-side recall deadline (30000 ms per #919) so a timeout is attributable to exactly one deadline (Amendment 1 §2); not a product SLO (OQ2 ruling); the MCP client's own request-timeout default is 300000 ms (300s), recorded here for reference only, see [oq_rulings] above"
 runner_class = "hosted_hash"
 
 [[scenario]]
@@ -872,8 +929,8 @@ settle = "sequential_sentinel"
 attempts = 1000
 concurrency = 1
 required_percentiles = ["p50", "p95", "p99"]
-request_deadline_ms = 30000
-request_deadline_provenance = "harness measurement-censoring safety cap, not a product SLO (OQ2 ruling); the MCP client's own request-timeout default is 300000 ms (300s), recorded here for reference only, see [oq_rulings] above"
+request_deadline_ms = 45000
+request_deadline_provenance = "harness measurement-censoring safety cap, set to strictly exceed the server-side recall deadline (30000 ms per #919) so a timeout is attributable to exactly one deadline (Amendment 1 §2); not a product SLO (OQ2 ruling); the MCP client's own request-timeout default is 300000 ms (300s), recorded here for reference only, see [oq_rulings] above"
 runner_class = "hosted_hash"
 
 [[scenario]]
@@ -890,8 +947,8 @@ settle = "sequential_sentinel"
 attempts = 1000
 concurrency = 1
 required_percentiles = ["p50", "p95", "p99"]
-request_deadline_ms = 30000
-request_deadline_provenance = "harness measurement-censoring safety cap, not a product SLO (OQ2 ruling); the MCP client's own request-timeout default is 300000 ms (300s), recorded here for reference only, see [oq_rulings] above"
+request_deadline_ms = 45000
+request_deadline_provenance = "harness measurement-censoring safety cap, set to strictly exceed the server-side recall deadline (30000 ms per #919) so a timeout is attributable to exactly one deadline (Amendment 1 §2); not a product SLO (OQ2 ruling); the MCP client's own request-timeout default is 300000 ms (300s), recorded here for reference only, see [oq_rulings] above"
 runner_class = "hosted_hash"
 
 [[scenario]]
@@ -908,8 +965,8 @@ settle = "sequential_sentinel"
 attempts = 1000
 concurrency = 1
 required_percentiles = ["p50", "p95", "p99"]
-request_deadline_ms = 30000
-request_deadline_provenance = "harness measurement-censoring safety cap, not a product SLO (OQ2 ruling); the MCP client's own request-timeout default is 300000 ms (300s), recorded here for reference only, see [oq_rulings] above"
+request_deadline_ms = 45000
+request_deadline_provenance = "harness measurement-censoring safety cap, set to strictly exceed the server-side recall deadline (30000 ms per #919) so a timeout is attributable to exactly one deadline (Amendment 1 §2); not a product SLO (OQ2 ruling); the MCP client's own request-timeout default is 300000 ms (300s), recorded here for reference only, see [oq_rulings] above"
 runner_class = "hosted_hash"
 
 [[scenario]]
@@ -926,8 +983,8 @@ settle = "sequential_sentinel"
 attempts = 1000
 concurrency = 1
 required_percentiles = ["p50", "p95", "p99"]
-request_deadline_ms = 30000
-request_deadline_provenance = "harness measurement-censoring safety cap, not a product SLO (OQ2 ruling); the MCP client's own request-timeout default is 300000 ms (300s), recorded here for reference only, see [oq_rulings] above"
+request_deadline_ms = 45000
+request_deadline_provenance = "harness measurement-censoring safety cap, set to strictly exceed the server-side recall deadline (30000 ms per #919) so a timeout is attributable to exactly one deadline (Amendment 1 §2); not a product SLO (OQ2 ruling); the MCP client's own request-timeout default is 300000 ms (300s), recorded here for reference only, see [oq_rulings] above"
 runner_class = "hosted_hash"
 
 [[scenario]]
@@ -944,8 +1001,8 @@ settle = "sequential_sentinel"
 attempts = 1000
 concurrency = 1
 required_percentiles = ["p50", "p95", "p99"]
-request_deadline_ms = 30000
-request_deadline_provenance = "harness measurement-censoring safety cap, not a product SLO (OQ2 ruling); the MCP client's own request-timeout default is 300000 ms (300s), recorded here for reference only, see [oq_rulings] above"
+request_deadline_ms = 45000
+request_deadline_provenance = "harness measurement-censoring safety cap, set to strictly exceed the server-side recall deadline (30000 ms per #919) so a timeout is attributable to exactly one deadline (Amendment 1 §2); not a product SLO (OQ2 ruling); the MCP client's own request-timeout default is 300000 ms (300s), recorded here for reference only, see [oq_rulings] above"
 runner_class = "hosted_hash"
 
 [[scenario]]
@@ -962,8 +1019,8 @@ settle = "none"
 attempts = 200
 concurrency = 1
 required_percentiles = ["p50", "p95", "p99"]
-request_deadline_ms = 30000
-request_deadline_provenance = "harness measurement-censoring safety cap, not a product SLO (OQ2 ruling); the MCP client's own request-timeout default is 300000 ms (300s), recorded here for reference only, see [oq_rulings] above"
+request_deadline_ms = 45000
+request_deadline_provenance = "harness measurement-censoring safety cap, set to strictly exceed the server-side recall deadline (30000 ms per #919) so a timeout is attributable to exactly one deadline (Amendment 1 §2); not a product SLO (OQ2 ruling); the MCP client's own request-timeout default is 300000 ms (300s), recorded here for reference only, see [oq_rulings] above"
 runner_class = "hosted_hash"
 
 [[scenario]]
@@ -980,8 +1037,8 @@ settle = "none"
 attempts = 200
 concurrency = 1
 required_percentiles = ["p50", "p95", "p99"]
-request_deadline_ms = 30000
-request_deadline_provenance = "harness measurement-censoring safety cap, not a product SLO (OQ2 ruling); the MCP client's own request-timeout default is 300000 ms (300s), recorded here for reference only, see [oq_rulings] above"
+request_deadline_ms = 45000
+request_deadline_provenance = "harness measurement-censoring safety cap, set to strictly exceed the server-side recall deadline (30000 ms per #919) so a timeout is attributable to exactly one deadline (Amendment 1 §2); not a product SLO (OQ2 ruling); the MCP client's own request-timeout default is 300000 ms (300s), recorded here for reference only, see [oq_rulings] above"
 runner_class = "self_hosted_real_embedder"
 
 [[scenario]]
@@ -998,8 +1055,8 @@ settle = "none"
 attempts = 200
 concurrency = 1
 required_percentiles = ["p50", "p95", "p99"]
-request_deadline_ms = 30000
-request_deadline_provenance = "harness measurement-censoring safety cap, not a product SLO (OQ2 ruling); the MCP client's own request-timeout default is 300000 ms (300s), recorded here for reference only, see [oq_rulings] above"
+request_deadline_ms = 45000
+request_deadline_provenance = "harness measurement-censoring safety cap, set to strictly exceed the server-side recall deadline (30000 ms per #919) so a timeout is attributable to exactly one deadline (Amendment 1 §2); not a product SLO (OQ2 ruling); the MCP client's own request-timeout default is 300000 ms (300s), recorded here for reference only, see [oq_rulings] above"
 runner_class = "hosted_hash"
 
 [[scenario]]
@@ -1016,8 +1073,8 @@ settle = "none"
 attempts = 200
 concurrency = 1
 required_percentiles = ["p50", "p95", "p99"]
-request_deadline_ms = 30000
-request_deadline_provenance = "harness measurement-censoring safety cap, not a product SLO (OQ2 ruling); the MCP client's own request-timeout default is 300000 ms (300s), recorded here for reference only, see [oq_rulings] above"
+request_deadline_ms = 45000
+request_deadline_provenance = "harness measurement-censoring safety cap, set to strictly exceed the server-side recall deadline (30000 ms per #919) so a timeout is attributable to exactly one deadline (Amendment 1 §2); not a product SLO (OQ2 ruling); the MCP client's own request-timeout default is 300000 ms (300s), recorded here for reference only, see [oq_rulings] above"
 runner_class = "self_hosted_real_embedder"
 
 [[scenario]]
@@ -1034,8 +1091,8 @@ settle = "none"
 attempts = 200
 concurrency = 1
 required_percentiles = ["p50", "p95", "p99"]
-request_deadline_ms = 30000
-request_deadline_provenance = "harness measurement-censoring safety cap, not a product SLO (OQ2 ruling); the MCP client's own request-timeout default is 300000 ms (300s), recorded here for reference only, see [oq_rulings] above"
+request_deadline_ms = 45000
+request_deadline_provenance = "harness measurement-censoring safety cap, set to strictly exceed the server-side recall deadline (30000 ms per #919) so a timeout is attributable to exactly one deadline (Amendment 1 §2); not a product SLO (OQ2 ruling); the MCP client's own request-timeout default is 300000 ms (300s), recorded here for reference only, see [oq_rulings] above"
 runner_class = "hosted_hash"
 
 [[scenario]]
@@ -1052,8 +1109,8 @@ settle = "none"
 attempts = 200
 concurrency = 1
 required_percentiles = ["p50", "p95", "p99"]
-request_deadline_ms = 30000
-request_deadline_provenance = "harness measurement-censoring safety cap, not a product SLO (OQ2 ruling); the MCP client's own request-timeout default is 300000 ms (300s), recorded here for reference only, see [oq_rulings] above"
+request_deadline_ms = 45000
+request_deadline_provenance = "harness measurement-censoring safety cap, set to strictly exceed the server-side recall deadline (30000 ms per #919) so a timeout is attributable to exactly one deadline (Amendment 1 §2); not a product SLO (OQ2 ruling); the MCP client's own request-timeout default is 300000 ms (300s), recorded here for reference only, see [oq_rulings] above"
 runner_class = "hosted_hash"
 
 [[scenario]]
@@ -1070,8 +1127,8 @@ settle = "none"
 attempts = 200
 concurrency = 1
 required_percentiles = ["p50", "p95", "p99"]
-request_deadline_ms = 30000
-request_deadline_provenance = "harness measurement-censoring safety cap, not a product SLO (OQ2 ruling); the MCP client's own request-timeout default is 300000 ms (300s), recorded here for reference only, see [oq_rulings] above"
+request_deadline_ms = 45000
+request_deadline_provenance = "harness measurement-censoring safety cap, set to strictly exceed the server-side recall deadline (30000 ms per #919) so a timeout is attributable to exactly one deadline (Amendment 1 §2); not a product SLO (OQ2 ruling); the MCP client's own request-timeout default is 300000 ms (300s), recorded here for reference only, see [oq_rulings] above"
 runner_class = "self_hosted_real_embedder"
 
 [[scenario]]
@@ -1088,8 +1145,8 @@ settle = "none"
 attempts = 200
 concurrency = 1
 required_percentiles = ["p50", "p95", "p99"]
-request_deadline_ms = 30000
-request_deadline_provenance = "harness measurement-censoring safety cap, not a product SLO (OQ2 ruling); the MCP client's own request-timeout default is 300000 ms (300s), recorded here for reference only, see [oq_rulings] above"
+request_deadline_ms = 45000
+request_deadline_provenance = "harness measurement-censoring safety cap, set to strictly exceed the server-side recall deadline (30000 ms per #919) so a timeout is attributable to exactly one deadline (Amendment 1 §2); not a product SLO (OQ2 ruling); the MCP client's own request-timeout default is 300000 ms (300s), recorded here for reference only, see [oq_rulings] above"
 runner_class = "hosted_hash"
 
 [[scenario]]
@@ -1106,8 +1163,8 @@ settle = "none"
 attempts = 200
 concurrency = 1
 required_percentiles = ["p50", "p95", "p99"]
-request_deadline_ms = 30000
-request_deadline_provenance = "harness measurement-censoring safety cap, not a product SLO (OQ2 ruling); the MCP client's own request-timeout default is 300000 ms (300s), recorded here for reference only, see [oq_rulings] above"
+request_deadline_ms = 45000
+request_deadline_provenance = "harness measurement-censoring safety cap, set to strictly exceed the server-side recall deadline (30000 ms per #919) so a timeout is attributable to exactly one deadline (Amendment 1 §2); not a product SLO (OQ2 ruling); the MCP client's own request-timeout default is 300000 ms (300s), recorded here for reference only, see [oq_rulings] above"
 runner_class = "hosted_hash"
 
 [[scenario]]
@@ -1124,11 +1181,15 @@ settle = "none"
 attempts = 200
 concurrency = 1
 required_percentiles = ["p50", "p95", "p99"]
-request_deadline_ms = 30000
-request_deadline_provenance = "harness measurement-censoring safety cap, not a product SLO (OQ2 ruling); the MCP client's own request-timeout default is 300000 ms (300s), recorded here for reference only, see [oq_rulings] above"
+request_deadline_ms = 45000
+request_deadline_provenance = "harness measurement-censoring safety cap, set to strictly exceed the server-side recall deadline (30000 ms per #919) so a timeout is attributable to exactly one deadline (Amendment 1 §2); not a product SLO (OQ2 ruling); the MCP client's own request-timeout default is 300000 ms (300s), recorded here for reference only, see [oq_rulings] above"
 runner_class = "self_hosted_real_embedder"
 
 [[scenario]]
+# Amendment 1 §2 "Surface rule": F6 git-ingest/code-ingest admin-surface
+# exception (admin CLI is the product surface for it) - admin-surface
+# coverage class, excluded from real-MCP coverage (see
+# oq1_admin_surface_scenario_ids above).
 scenario_id = "f6.git_ingest.cli.production"
 feature = "F6"
 surface = "admin_cli"
@@ -1143,7 +1204,7 @@ attempts = 20
 concurrency = 1
 required_percentiles = ["p50", "p95", "p99"]
 request_deadline_ms = 300000
-request_deadline_provenance = "admin_cli surface: process wall-clock safety cap for a single CLI invocation, not a product SLO (OQ2 ruling); the MCP per-request cap of 30000 ms does not apply to this surface, see [oq_rulings] above"
+request_deadline_provenance = "admin_cli surface: process wall-clock safety cap for a single CLI invocation, not a product SLO (OQ2 ruling); the MCP per-request cap of 45000 ms does not apply to this surface, see [oq_rulings] above"
 runner_class = "self_hosted_real_embedder"
 
 [[scenario]]
@@ -1161,7 +1222,7 @@ attempts = 20
 concurrency = 1
 required_percentiles = ["p50", "p95", "p99"]
 request_deadline_ms = 300000
-request_deadline_provenance = "admin_cli surface: process wall-clock safety cap for a single CLI invocation, not a product SLO (OQ2 ruling); the MCP per-request cap of 30000 ms does not apply to this surface, see [oq_rulings] above"
+request_deadline_provenance = "admin_cli surface: process wall-clock safety cap for a single CLI invocation, not a product SLO (OQ2 ruling); the MCP per-request cap of 45000 ms does not apply to this surface, see [oq_rulings] above"
 runner_class = "self_hosted_real_embedder"
 
 [[scenario]]
@@ -1178,8 +1239,8 @@ settle = "none"
 attempts = 500
 concurrency = 1
 required_percentiles = ["p50", "p95", "p99"]
-request_deadline_ms = 30000
-request_deadline_provenance = "harness measurement-censoring safety cap, not a product SLO (OQ2 ruling); the MCP client's own request-timeout default is 300000 ms (300s), recorded here for reference only, see [oq_rulings] above"
+request_deadline_ms = 45000
+request_deadline_provenance = "harness measurement-censoring safety cap, set to strictly exceed the server-side recall deadline (30000 ms per #919) so a timeout is attributable to exactly one deadline (Amendment 1 §2); not a product SLO (OQ2 ruling); the MCP client's own request-timeout default is 300000 ms (300s), recorded here for reference only, see [oq_rulings] above"
 runner_class = "hosted_hash"
 
 [[scenario]]
@@ -1196,8 +1257,8 @@ settle = "none"
 attempts = 500
 concurrency = 1
 required_percentiles = ["p50", "p95", "p99"]
-request_deadline_ms = 30000
-request_deadline_provenance = "harness measurement-censoring safety cap, not a product SLO (OQ2 ruling); the MCP client's own request-timeout default is 300000 ms (300s), recorded here for reference only, see [oq_rulings] above"
+request_deadline_ms = 45000
+request_deadline_provenance = "harness measurement-censoring safety cap, set to strictly exceed the server-side recall deadline (30000 ms per #919) so a timeout is attributable to exactly one deadline (Amendment 1 §2); not a product SLO (OQ2 ruling); the MCP client's own request-timeout default is 300000 ms (300s), recorded here for reference only, see [oq_rulings] above"
 runner_class = "hosted_hash"
 
 [[scenario]]
@@ -1214,8 +1275,8 @@ settle = "none"
 attempts = 500
 concurrency = 1
 required_percentiles = ["p50", "p95", "p99"]
-request_deadline_ms = 30000
-request_deadline_provenance = "harness measurement-censoring safety cap, not a product SLO (OQ2 ruling); the MCP client's own request-timeout default is 300000 ms (300s), recorded here for reference only, see [oq_rulings] above"
+request_deadline_ms = 45000
+request_deadline_provenance = "harness measurement-censoring safety cap, set to strictly exceed the server-side recall deadline (30000 ms per #919) so a timeout is attributable to exactly one deadline (Amendment 1 §2); not a product SLO (OQ2 ruling); the MCP client's own request-timeout default is 300000 ms (300s), recorded here for reference only, see [oq_rulings] above"
 runner_class = "self_hosted_real_embedder"
 
 [[scenario]]
@@ -1232,8 +1293,8 @@ settle = "none"
 attempts = 500
 concurrency = 32
 required_percentiles = ["p50", "p95", "p99"]
-request_deadline_ms = 30000
-request_deadline_provenance = "harness measurement-censoring safety cap, not a product SLO (OQ2 ruling); the MCP client's own request-timeout default is 300000 ms (300s), recorded here for reference only, see [oq_rulings] above"
+request_deadline_ms = 45000
+request_deadline_provenance = "harness measurement-censoring safety cap, set to strictly exceed the server-side recall deadline (30000 ms per #919) so a timeout is attributable to exactly one deadline (Amendment 1 §2); not a product SLO (OQ2 ruling); the MCP client's own request-timeout default is 300000 ms (300s), recorded here for reference only, see [oq_rulings] above"
 runner_class = "self_hosted_real_embedder"
 
 [[scenario]]
@@ -1250,8 +1311,8 @@ settle = "sequential_sentinel"
 attempts = 1000
 concurrency = 1
 required_percentiles = ["p50", "p95", "p99"]
-request_deadline_ms = 30000
-request_deadline_provenance = "harness measurement-censoring safety cap, not a product SLO (OQ2 ruling); the MCP client's own request-timeout default is 300000 ms (300s), recorded here for reference only, see [oq_rulings] above"
+request_deadline_ms = 45000
+request_deadline_provenance = "harness measurement-censoring safety cap, set to strictly exceed the server-side recall deadline (30000 ms per #919) so a timeout is attributable to exactly one deadline (Amendment 1 §2); not a product SLO (OQ2 ruling); the MCP client's own request-timeout default is 300000 ms (300s), recorded here for reference only, see [oq_rulings] above"
 runner_class = "hosted_hash"
 
 [[scenario]]
@@ -1268,8 +1329,8 @@ settle = "sequential_sentinel"
 attempts = 1000
 concurrency = 1
 required_percentiles = ["p50", "p95", "p99"]
-request_deadline_ms = 30000
-request_deadline_provenance = "harness measurement-censoring safety cap, not a product SLO (OQ2 ruling); the MCP client's own request-timeout default is 300000 ms (300s), recorded here for reference only, see [oq_rulings] above"
+request_deadline_ms = 45000
+request_deadline_provenance = "harness measurement-censoring safety cap, set to strictly exceed the server-side recall deadline (30000 ms per #919) so a timeout is attributable to exactly one deadline (Amendment 1 §2); not a product SLO (OQ2 ruling); the MCP client's own request-timeout default is 300000 ms (300s), recorded here for reference only, see [oq_rulings] above"
 runner_class = "hosted_hash"
 
 [[scenario]]
@@ -1286,8 +1347,8 @@ settle = "sequential_sentinel"
 attempts = 1000
 concurrency = 1
 required_percentiles = ["p50", "p95", "p99"]
-request_deadline_ms = 30000
-request_deadline_provenance = "harness measurement-censoring safety cap, not a product SLO (OQ2 ruling); the MCP client's own request-timeout default is 300000 ms (300s), recorded here for reference only, see [oq_rulings] above"
+request_deadline_ms = 45000
+request_deadline_provenance = "harness measurement-censoring safety cap, set to strictly exceed the server-side recall deadline (30000 ms per #919) so a timeout is attributable to exactly one deadline (Amendment 1 §2); not a product SLO (OQ2 ruling); the MCP client's own request-timeout default is 300000 ms (300s), recorded here for reference only, see [oq_rulings] above"
 runner_class = "self_hosted_real_embedder"
 
 [[scenario]]
@@ -1304,8 +1365,8 @@ settle = "sequential_sentinel"
 attempts = 1000
 concurrency = 1
 required_percentiles = ["p50", "p95", "p99"]
-request_deadline_ms = 30000
-request_deadline_provenance = "harness measurement-censoring safety cap, not a product SLO (OQ2 ruling); the MCP client's own request-timeout default is 300000 ms (300s), recorded here for reference only, see [oq_rulings] above"
+request_deadline_ms = 45000
+request_deadline_provenance = "harness measurement-censoring safety cap, set to strictly exceed the server-side recall deadline (30000 ms per #919) so a timeout is attributable to exactly one deadline (Amendment 1 §2); not a product SLO (OQ2 ruling); the MCP client's own request-timeout default is 300000 ms (300s), recorded here for reference only, see [oq_rulings] above"
 runner_class = "self_hosted_real_embedder"
 
 [[scenario]]
@@ -1322,8 +1383,8 @@ settle = "sequential_sentinel"
 attempts = 1000
 concurrency = 1
 required_percentiles = ["p50", "p95", "p99"]
-request_deadline_ms = 30000
-request_deadline_provenance = "harness measurement-censoring safety cap, not a product SLO (OQ2 ruling); the MCP client's own request-timeout default is 300000 ms (300s), recorded here for reference only, see [oq_rulings] above"
+request_deadline_ms = 45000
+request_deadline_provenance = "harness measurement-censoring safety cap, set to strictly exceed the server-side recall deadline (30000 ms per #919) so a timeout is attributable to exactly one deadline (Amendment 1 §2); not a product SLO (OQ2 ruling); the MCP client's own request-timeout default is 300000 ms (300s), recorded here for reference only, see [oq_rulings] above"
 runner_class = "self_hosted_real_embedder"
 
 [[scenario]]
@@ -1340,8 +1401,8 @@ settle = "sequential_sentinel"
 attempts = 1000
 concurrency = 1
 required_percentiles = ["p50", "p95", "p99"]
-request_deadline_ms = 30000
-request_deadline_provenance = "harness measurement-censoring safety cap, not a product SLO (OQ2 ruling); the MCP client's own request-timeout default is 300000 ms (300s), recorded here for reference only, see [oq_rulings] above"
+request_deadline_ms = 45000
+request_deadline_provenance = "harness measurement-censoring safety cap, set to strictly exceed the server-side recall deadline (30000 ms per #919) so a timeout is attributable to exactly one deadline (Amendment 1 §2); not a product SLO (OQ2 ruling); the MCP client's own request-timeout default is 300000 ms (300s), recorded here for reference only, see [oq_rulings] above"
 runner_class = "self_hosted_real_embedder"
 
 [[scenario]]
@@ -1358,8 +1419,8 @@ settle = "sequential_sentinel"
 attempts = 1000
 concurrency = 1
 required_percentiles = ["p50", "p95", "p99"]
-request_deadline_ms = 30000
-request_deadline_provenance = "harness measurement-censoring safety cap, not a product SLO (OQ2 ruling); the MCP client's own request-timeout default is 300000 ms (300s), recorded here for reference only, see [oq_rulings] above"
+request_deadline_ms = 45000
+request_deadline_provenance = "harness measurement-censoring safety cap, set to strictly exceed the server-side recall deadline (30000 ms per #919) so a timeout is attributable to exactly one deadline (Amendment 1 §2); not a product SLO (OQ2 ruling); the MCP client's own request-timeout default is 300000 ms (300s), recorded here for reference only, see [oq_rulings] above"
 runner_class = "self_hosted_real_embedder"
 
 [[scenario]]
@@ -1376,8 +1437,8 @@ settle = "sequential_sentinel"
 attempts = 1000
 concurrency = 1
 required_percentiles = ["p50", "p95", "p99"]
-request_deadline_ms = 30000
-request_deadline_provenance = "harness measurement-censoring safety cap, not a product SLO (OQ2 ruling); the MCP client's own request-timeout default is 300000 ms (300s), recorded here for reference only, see [oq_rulings] above"
+request_deadline_ms = 45000
+request_deadline_provenance = "harness measurement-censoring safety cap, set to strictly exceed the server-side recall deadline (30000 ms per #919) so a timeout is attributable to exactly one deadline (Amendment 1 §2); not a product SLO (OQ2 ruling); the MCP client's own request-timeout default is 300000 ms (300s), recorded here for reference only, see [oq_rulings] above"
 runner_class = "self_hosted_real_embedder"
 
 [[scenario]]
@@ -1394,8 +1455,8 @@ settle = "none"
 attempts = 500
 concurrency = 1
 required_percentiles = ["p50", "p95", "p99"]
-request_deadline_ms = 30000
-request_deadline_provenance = "harness measurement-censoring safety cap, not a product SLO (OQ2 ruling); the MCP client's own request-timeout default is 300000 ms (300s), recorded here for reference only, see [oq_rulings] above"
+request_deadline_ms = 45000
+request_deadline_provenance = "harness measurement-censoring safety cap, set to strictly exceed the server-side recall deadline (30000 ms per #919) so a timeout is attributable to exactly one deadline (Amendment 1 §2); not a product SLO (OQ2 ruling); the MCP client's own request-timeout default is 300000 ms (300s), recorded here for reference only, see [oq_rulings] above"
 runner_class = "hosted_hash"
 
 [[scenario]]
@@ -1412,8 +1473,8 @@ settle = "none"
 attempts = 500
 concurrency = 1
 required_percentiles = ["p50", "p95", "p99"]
-request_deadline_ms = 30000
-request_deadline_provenance = "harness measurement-censoring safety cap, not a product SLO (OQ2 ruling); the MCP client's own request-timeout default is 300000 ms (300s), recorded here for reference only, see [oq_rulings] above"
+request_deadline_ms = 45000
+request_deadline_provenance = "harness measurement-censoring safety cap, set to strictly exceed the server-side recall deadline (30000 ms per #919) so a timeout is attributable to exactly one deadline (Amendment 1 §2); not a product SLO (OQ2 ruling); the MCP client's own request-timeout default is 300000 ms (300s), recorded here for reference only, see [oq_rulings] above"
 runner_class = "hosted_hash"
 
 [[scenario]]
@@ -1430,8 +1491,8 @@ settle = "none"
 attempts = 500
 concurrency = 1
 required_percentiles = ["p50", "p95", "p99"]
-request_deadline_ms = 30000
-request_deadline_provenance = "harness measurement-censoring safety cap, not a product SLO (OQ2 ruling); the MCP client's own request-timeout default is 300000 ms (300s), recorded here for reference only, see [oq_rulings] above"
+request_deadline_ms = 45000
+request_deadline_provenance = "harness measurement-censoring safety cap, set to strictly exceed the server-side recall deadline (30000 ms per #919) so a timeout is attributable to exactly one deadline (Amendment 1 §2); not a product SLO (OQ2 ruling); the MCP client's own request-timeout default is 300000 ms (300s), recorded here for reference only, see [oq_rulings] above"
 runner_class = "hosted_hash"
 
 [[scenario]]
@@ -1448,8 +1509,8 @@ settle = "none"
 attempts = 500
 concurrency = 1
 required_percentiles = ["p50", "p95", "p99"]
-request_deadline_ms = 30000
-request_deadline_provenance = "harness measurement-censoring safety cap, not a product SLO (OQ2 ruling); the MCP client's own request-timeout default is 300000 ms (300s), recorded here for reference only, see [oq_rulings] above"
+request_deadline_ms = 45000
+request_deadline_provenance = "harness measurement-censoring safety cap, set to strictly exceed the server-side recall deadline (30000 ms per #919) so a timeout is attributable to exactly one deadline (Amendment 1 §2); not a product SLO (OQ2 ruling); the MCP client's own request-timeout default is 300000 ms (300s), recorded here for reference only, see [oq_rulings] above"
 runner_class = "hosted_hash"
 
 [[scenario]]
@@ -1466,8 +1527,8 @@ settle = "none"
 attempts = 500
 concurrency = 1
 required_percentiles = ["p50", "p95", "p99"]
-request_deadline_ms = 30000
-request_deadline_provenance = "harness measurement-censoring safety cap, not a product SLO (OQ2 ruling); the MCP client's own request-timeout default is 300000 ms (300s), recorded here for reference only, see [oq_rulings] above"
+request_deadline_ms = 45000
+request_deadline_provenance = "harness measurement-censoring safety cap, set to strictly exceed the server-side recall deadline (30000 ms per #919) so a timeout is attributable to exactly one deadline (Amendment 1 §2); not a product SLO (OQ2 ruling); the MCP client's own request-timeout default is 300000 ms (300s), recorded here for reference only, see [oq_rulings] above"
 runner_class = "self_hosted_real_embedder"
 
 [[scenario]]
@@ -1484,11 +1545,15 @@ settle = "none"
 attempts = 500
 concurrency = 16
 required_percentiles = ["p50", "p95", "p99"]
-request_deadline_ms = 30000
-request_deadline_provenance = "harness measurement-censoring safety cap, not a product SLO (OQ2 ruling); the MCP client's own request-timeout default is 300000 ms (300s), recorded here for reference only, see [oq_rulings] above"
+request_deadline_ms = 45000
+request_deadline_provenance = "harness measurement-censoring safety cap, set to strictly exceed the server-side recall deadline (30000 ms per #919) so a timeout is attributable to exactly one deadline (Amendment 1 §2); not a product SLO (OQ2 ruling); the MCP client's own request-timeout default is 300000 ms (300s), recorded here for reference only, see [oq_rulings] above"
 runner_class = "self_hosted_real_embedder"
 
 [[scenario]]
+# Amendment 1 §2 "Surface rule": this is "the F10 daemon-control probe"
+# named exception - admin-surface coverage class, excluded from real-MCP
+# coverage (see oq1_admin_surface_scenario_ids above). surface =
+# "raw_daemon_control" (not "mcp_daemon") reflects that classification.
 scenario_id = "f10.daemon.probe_only.floor"
 feature = "F10"
 surface = "raw_daemon_control"
@@ -1502,8 +1567,8 @@ settle = "none"
 attempts = 1000
 concurrency = 1
 required_percentiles = ["p50", "p95", "p99"]
-request_deadline_ms = 30000
-request_deadline_provenance = "harness measurement-censoring safety cap, not a product SLO (OQ2 ruling); the MCP client's own request-timeout default is 300000 ms (300s), recorded here for reference only, see [oq_rulings] above"
+request_deadline_ms = 45000
+request_deadline_provenance = "harness measurement-censoring safety cap, set to strictly exceed the server-side recall deadline (30000 ms per #919) so a timeout is attributable to exactly one deadline (Amendment 1 §2); not a product SLO (OQ2 ruling); the MCP client's own request-timeout default is 300000 ms (300s), recorded here for reference only, see [oq_rulings] above"
 runner_class = "hosted_hash"
 
 [[scenario]]
@@ -1520,8 +1585,8 @@ settle = "none"
 attempts = 1000
 concurrency = 1
 required_percentiles = ["p50", "p95", "p99"]
-request_deadline_ms = 30000
-request_deadline_provenance = "harness measurement-censoring safety cap, not a product SLO (OQ2 ruling); the MCP client's own request-timeout default is 300000 ms (300s), recorded here for reference only, see [oq_rulings] above"
+request_deadline_ms = 45000
+request_deadline_provenance = "harness measurement-censoring safety cap, set to strictly exceed the server-side recall deadline (30000 ms per #919) so a timeout is attributable to exactly one deadline (Amendment 1 §2); not a product SLO (OQ2 ruling); the MCP client's own request-timeout default is 300000 ms (300s), recorded here for reference only, see [oq_rulings] above"
 runner_class = "hosted_hash"
 
 [[scenario]]
@@ -1538,8 +1603,8 @@ settle = "none"
 attempts = 1000
 concurrency = 1
 required_percentiles = ["p50", "p95", "p99"]
-request_deadline_ms = 30000
-request_deadline_provenance = "harness measurement-censoring safety cap, not a product SLO (OQ2 ruling); the MCP client's own request-timeout default is 300000 ms (300s), recorded here for reference only, see [oq_rulings] above"
+request_deadline_ms = 45000
+request_deadline_provenance = "harness measurement-censoring safety cap, set to strictly exceed the server-side recall deadline (30000 ms per #919) so a timeout is attributable to exactly one deadline (Amendment 1 §2); not a product SLO (OQ2 ruling); the MCP client's own request-timeout default is 300000 ms (300s), recorded here for reference only, see [oq_rulings] above"
 runner_class = "hosted_hash"
 
 [[scenario]]
@@ -1556,8 +1621,8 @@ settle = "none"
 attempts = 1000
 concurrency = 1
 required_percentiles = ["p50", "p95", "p99"]
-request_deadline_ms = 30000
-request_deadline_provenance = "harness measurement-censoring safety cap, not a product SLO (OQ2 ruling); the MCP client's own request-timeout default is 300000 ms (300s), recorded here for reference only, see [oq_rulings] above"
+request_deadline_ms = 45000
+request_deadline_provenance = "harness measurement-censoring safety cap, set to strictly exceed the server-side recall deadline (30000 ms per #919) so a timeout is attributable to exactly one deadline (Amendment 1 §2); not a product SLO (OQ2 ruling); the MCP client's own request-timeout default is 300000 ms (300s), recorded here for reference only, see [oq_rulings] above"
 runner_class = "hosted_hash"
 
 [[scenario]]
@@ -1574,8 +1639,8 @@ settle = "none"
 attempts = 1000
 concurrency = 2
 required_percentiles = ["p50", "p95", "p99"]
-request_deadline_ms = 30000
-request_deadline_provenance = "harness measurement-censoring safety cap, not a product SLO (OQ2 ruling); the MCP client's own request-timeout default is 300000 ms (300s), recorded here for reference only, see [oq_rulings] above"
+request_deadline_ms = 45000
+request_deadline_provenance = "harness measurement-censoring safety cap, set to strictly exceed the server-side recall deadline (30000 ms per #919) so a timeout is attributable to exactly one deadline (Amendment 1 §2); not a product SLO (OQ2 ruling); the MCP client's own request-timeout default is 300000 ms (300s), recorded here for reference only, see [oq_rulings] above"
 runner_class = "hosted_hash"
 
 [[scenario]]
@@ -1592,8 +1657,8 @@ settle = "none"
 attempts = 1000
 concurrency = 4
 required_percentiles = ["p50", "p95", "p99"]
-request_deadline_ms = 30000
-request_deadline_provenance = "harness measurement-censoring safety cap, not a product SLO (OQ2 ruling); the MCP client's own request-timeout default is 300000 ms (300s), recorded here for reference only, see [oq_rulings] above"
+request_deadline_ms = 45000
+request_deadline_provenance = "harness measurement-censoring safety cap, set to strictly exceed the server-side recall deadline (30000 ms per #919) so a timeout is attributable to exactly one deadline (Amendment 1 §2); not a product SLO (OQ2 ruling); the MCP client's own request-timeout default is 300000 ms (300s), recorded here for reference only, see [oq_rulings] above"
 runner_class = "hosted_hash"
 
 [[scenario]]
@@ -1610,8 +1675,8 @@ settle = "none"
 attempts = 1000
 concurrency = 8
 required_percentiles = ["p50", "p95", "p99"]
-request_deadline_ms = 30000
-request_deadline_provenance = "harness measurement-censoring safety cap, not a product SLO (OQ2 ruling); the MCP client's own request-timeout default is 300000 ms (300s), recorded here for reference only, see [oq_rulings] above"
+request_deadline_ms = 45000
+request_deadline_provenance = "harness measurement-censoring safety cap, set to strictly exceed the server-side recall deadline (30000 ms per #919) so a timeout is attributable to exactly one deadline (Amendment 1 §2); not a product SLO (OQ2 ruling); the MCP client's own request-timeout default is 300000 ms (300s), recorded here for reference only, see [oq_rulings] above"
 runner_class = "hosted_hash"
 
 [[scenario]]
@@ -1628,8 +1693,8 @@ settle = "none"
 attempts = 1000
 concurrency = 16
 required_percentiles = ["p50", "p95", "p99"]
-request_deadline_ms = 30000
-request_deadline_provenance = "harness measurement-censoring safety cap, not a product SLO (OQ2 ruling); the MCP client's own request-timeout default is 300000 ms (300s), recorded here for reference only, see [oq_rulings] above"
+request_deadline_ms = 45000
+request_deadline_provenance = "harness measurement-censoring safety cap, set to strictly exceed the server-side recall deadline (30000 ms per #919) so a timeout is attributable to exactly one deadline (Amendment 1 §2); not a product SLO (OQ2 ruling); the MCP client's own request-timeout default is 300000 ms (300s), recorded here for reference only, see [oq_rulings] above"
 runner_class = "hosted_hash"
 
 [[scenario]]
@@ -1646,8 +1711,8 @@ settle = "none"
 attempts = 1000
 concurrency = 32
 required_percentiles = ["p50", "p95", "p99"]
-request_deadline_ms = 30000
-request_deadline_provenance = "harness measurement-censoring safety cap, not a product SLO (OQ2 ruling); the MCP client's own request-timeout default is 300000 ms (300s), recorded here for reference only, see [oq_rulings] above"
+request_deadline_ms = 45000
+request_deadline_provenance = "harness measurement-censoring safety cap, set to strictly exceed the server-side recall deadline (30000 ms per #919) so a timeout is attributable to exactly one deadline (Amendment 1 §2); not a product SLO (OQ2 ruling); the MCP client's own request-timeout default is 300000 ms (300s), recorded here for reference only, see [oq_rulings] above"
 runner_class = "self_hosted_real_embedder"
 
 [[scenario]]
@@ -1664,8 +1729,8 @@ settle = "none"
 attempts = 1000
 concurrency = 64
 required_percentiles = ["p50", "p95", "p99"]
-request_deadline_ms = 30000
-request_deadline_provenance = "harness measurement-censoring safety cap, not a product SLO (OQ2 ruling); the MCP client's own request-timeout default is 300000 ms (300s), recorded here for reference only, see [oq_rulings] above"
+request_deadline_ms = 45000
+request_deadline_provenance = "harness measurement-censoring safety cap, set to strictly exceed the server-side recall deadline (30000 ms per #919) so a timeout is attributable to exactly one deadline (Amendment 1 §2); not a product SLO (OQ2 ruling); the MCP client's own request-timeout default is 300000 ms (300s), recorded here for reference only, see [oq_rulings] above"
 runner_class = "self_hosted_real_embedder"
 
 [[scenario]]
@@ -1682,6 +1747,6 @@ settle = "none"
 attempts = 1000
 concurrency = 128
 required_percentiles = ["p50", "p95", "p99"]
-request_deadline_ms = 30000
-request_deadline_provenance = "harness measurement-censoring safety cap, not a product SLO (OQ2 ruling); the MCP client's own request-timeout default is 300000 ms (300s), recorded here for reference only, see [oq_rulings] above"
+request_deadline_ms = 45000
+request_deadline_provenance = "harness measurement-censoring safety cap, set to strictly exceed the server-side recall deadline (30000 ms per #919) so a timeout is attributable to exactly one deadline (Amendment 1 §2); not a product SLO (OQ2 ruling); the MCP client's own request-timeout default is 300000 ms (300s), recorded here for reference only, see [oq_rulings] above"
 runner_class = "self_hosted_real_embedder"
