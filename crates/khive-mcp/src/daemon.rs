@@ -2,8 +2,13 @@
 //!
 //! The daemon server lives in `khive-runtime::daemon`. This module provides the
 //! client side: [`forward_or_spawn`] connects to the daemon, auto-spawns it on
-//! first use, and maps responses to MCP error types. Every failure path falls
-//! back to `None` so the caller can dispatch locally.
+//! first use, and maps responses to MCP error types. Ordinary fallback paths
+//! return `None` so the caller can dispatch locally. `KHIVE_DAEMON_STRICT=1`
+//! (#947) is the exception: it turns a recordable fallback into a
+//! caller-visible per-op error instead, via [`fallback_or_reject`].
+//! `KHIVE_NO_DAEMON` and `crate::server`'s `save_to` bypass remain
+//! intentional, unconditional local paths — neither is affected by strict
+//! mode, since nothing is ever recorded or falls back for them.
 //!
 //! Also provides the [`khive_runtime::daemon::DaemonDispatch`] impl for [`crate::server::KhiveMcpServer`].
 
@@ -365,6 +370,14 @@ fn record_fallback(
 /// here, not just the `Illegitimate` tier — that tier only governs the WARN
 /// vs ERROR log level inside `record_fallback`, an orthogonal concern.
 ///
+/// `data` marker on a strict-fallback rejection's [`McpError`] (#947 Medium
+/// finding): `request()` in `server.rs` inspects this to tell "the daemon was
+/// never reached and strict mode rejected the fallback" apart from every
+/// other daemon-forward `McpError` (protocol mismatch, oversized frame,
+/// ambiguous post-write outcome), which stay RPC-level errors. Kept as a
+/// shared constant so the tag and the check can never drift independently.
+pub(crate) const STRICT_FALLBACK_MARKER: &str = "khive_strict_daemon_fallback";
+
 /// Call exactly where the caller was about to `return None` (local dispatch)
 /// after a fallback; every production call site returns this directly.
 fn fallback_or_reject(
@@ -381,7 +394,10 @@ fn fallback_or_reject(
                  refusing to complete the request via local dispatch",
                 reason.as_str()
             ),
-            None,
+            Some(serde_json::json!({
+                STRICT_FALLBACK_MARKER: true,
+                "reason": reason.as_str(),
+            })),
         )));
     }
     None
