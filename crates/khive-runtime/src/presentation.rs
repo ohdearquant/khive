@@ -373,6 +373,20 @@ const LIFECYCLE_NULL_PRESERVE: &[&str] = &[
     "replaced_by",
 ];
 
+/// Field names carrying caller-supplied payload timestamps that must never be
+/// compacted (relative-time or minute-truncated), regardless of nesting.
+///
+/// These encode domain semantics the caller needs to round-trip verbatim —
+/// e.g. `trigger_at` on a `schedule.remind`/`schedule.schedule` create
+/// response, returned as a top-level convenience field alongside `id` and
+/// `full_id`, not nested under `"properties"`. The `inside_properties` guard
+/// alone only protects fields nested under a literal `"properties"` key
+/// (as returned by `agenda`/`get`); it does not cover this top-level case,
+/// which `compact_timestamp` rewrote into either a relative string or a
+/// minute-truncated absolute form — either way discarding the seconds and
+/// offset the caller needs to round-trip the exact submitted value (#871).
+const PAYLOAD_TIMESTAMP_FIELDS: &[&str] = &["trigger_at"];
+
 /// Score field names that are truncated to 3 significant figures in Agent mode.
 const SCORE_FIELDS: &[&str] = &[
     "score",
@@ -417,10 +431,13 @@ pub fn present(value: Value, mode: PresentationMode, now_unix_seconds: i64) -> V
             let lifecycle_preserve: HashSet<&str> =
                 LIFECYCLE_NULL_PRESERVE.iter().copied().collect();
             let score_fields: HashSet<&str> = SCORE_FIELDS.iter().copied().collect();
+            let payload_timestamps: HashSet<&str> =
+                PAYLOAD_TIMESTAMP_FIELDS.iter().copied().collect();
             transform_agent(
                 value,
                 &lifecycle_preserve,
                 &score_fields,
+                &payload_timestamps,
                 now_unix_seconds,
                 false,
             )
@@ -437,6 +454,7 @@ fn transform_agent(
     value: Value,
     lifecycle: &HashSet<&str>,
     scores: &HashSet<&str>,
+    payload_timestamps: &HashSet<&str>,
     now: i64,
     inside_properties: bool,
 ) -> Value {
@@ -445,8 +463,15 @@ fn transform_agent(
             let mut out = Map::new();
             for (k, v) in map {
                 let child_inside_properties = inside_properties || k == "properties";
-                let transformed =
-                    transform_field_agent(&k, v, lifecycle, scores, now, child_inside_properties);
+                let transformed = transform_field_agent(
+                    &k,
+                    v,
+                    lifecycle,
+                    scores,
+                    payload_timestamps,
+                    now,
+                    child_inside_properties,
+                );
                 match transformed {
                     None => {} // drop
                     Some(tv) => {
@@ -459,7 +484,16 @@ fn transform_agent(
         Value::Array(arr) => {
             let items: Vec<Value> = arr
                 .into_iter()
-                .map(|v| transform_agent(v, lifecycle, scores, now, inside_properties))
+                .map(|v| {
+                    transform_agent(
+                        v,
+                        lifecycle,
+                        scores,
+                        payload_timestamps,
+                        now,
+                        inside_properties,
+                    )
+                })
                 .collect();
             Value::Array(items)
         }
@@ -472,13 +506,18 @@ fn transform_agent(
 /// Returns `None` if the field should be dropped.
 ///
 /// `inside_properties` suppresses timestamp compaction for caller-submitted
-/// payload values (e.g. `trigger_at` stored under `"properties"`). Metadata
-/// timestamps at the top level (`created_at`, `updated_at`) are still compacted.
+/// payload values nested under a literal `"properties"` key (e.g. `trigger_at`
+/// as returned by `agenda`/`get`). `payload_timestamps` suppresses compaction
+/// by field name regardless of nesting, covering top-level convenience fields
+/// such as the `trigger_at` returned directly in a `schedule.remind`/
+/// `schedule.schedule` create response (#871). Metadata timestamps at the top
+/// level (`created_at`, `updated_at`) are still compacted.
 fn transform_field_agent(
     key: &str,
     value: Value,
     lifecycle: &HashSet<&str>,
     scores: &HashSet<&str>,
+    payload_timestamps: &HashSet<&str>,
     now: i64,
     inside_properties: bool,
 ) -> Option<Value> {
@@ -507,8 +546,11 @@ fn transform_field_agent(
         Value::String(s) if is_canonical_uuid(s) && should_shorten_uuid_field(key) => {
             Some(Value::String(s[..8].to_string()))
         }
-        // Compact ISO-8601 timestamps only outside caller-supplied payload objects.
-        Value::String(s) if !inside_properties && looks_like_iso8601(s) => {
+        // Compact ISO-8601 timestamps unless inside a caller-supplied payload
+        // object, or the field is a named payload timestamp at any nesting.
+        Value::String(s)
+            if !inside_properties && !payload_timestamps.contains(key) && looks_like_iso8601(s) =>
+        {
             Some(Value::String(compact_timestamp(s, now)))
         }
         // Recurse into objects and arrays.
@@ -516,6 +558,7 @@ fn transform_field_agent(
             value,
             lifecycle,
             scores,
+            payload_timestamps,
             now,
             inside_properties,
         )),
@@ -788,6 +831,73 @@ mod tests {
         let v = json!({"updated_at": ts});
         let out = agent(v);
         assert_eq!(out["updated_at"], json!("3m ago"));
+    }
+
+    #[test]
+    fn agent_does_not_compact_top_level_trigger_at_field() {
+        // Regression for #871: `schedule.remind`'s create response returns
+        // `trigger_at` as a top-level convenience field (sibling to `id`,
+        // `full_id`), not nested under `"properties"`. The pre-existing
+        // `inside_properties` guard alone did not protect it, so Agent-mode
+        // compaction rewrote it: `at` here is far outside the 24h relative
+        // window, so pre-fix it would have been minute-truncated to
+        // "2026-07-11T19:00", discarding the seconds and the "-04:00"
+        // offset the caller needs to round-trip the exact value verbatim.
+        let at = "2026-07-11T19:00:00-04:00";
+        let v = json!({
+            "id": "a1b2c3d4",
+            "full_id": "a1b2c3d4-e5f6-7890-abcd-ef1234567890",
+            "event_type": "remind",
+            "trigger_at": at,
+            "repeat": null,
+            "status": "pending",
+        });
+        let out = agent(v);
+        assert_eq!(out["trigger_at"], json!(at));
+    }
+
+    #[test]
+    fn agent_does_not_compact_top_level_trigger_at_utc() {
+        let at = "2026-07-11T23:00:00Z";
+        let v = json!({"trigger_at": at});
+        let out = agent(v);
+        assert_eq!(out["trigger_at"], json!(at));
+    }
+
+    #[test]
+    fn agent_does_not_compact_top_level_trigger_at_offset_less() {
+        let at = "2026-07-11T23:00:00";
+        let v = json!({"trigger_at": at});
+        let out = agent(v);
+        assert_eq!(out["trigger_at"], json!(at));
+    }
+
+    #[test]
+    fn agent_still_compacts_other_top_level_timestamps_alongside_trigger_at() {
+        // The `trigger_at` exemption is scoped to that field name only — a
+        // sibling generic timestamp field must still be compacted, so the
+        // fix does not blanket-disable Agent-mode compaction.
+        let v = json!({
+            "trigger_at": "2026-07-11T19:00:00-04:00",
+            "created_at": "2020-01-01T10:30:45.123456Z",
+        });
+        let out = agent(v);
+        assert_eq!(out["trigger_at"], json!("2026-07-11T19:00:00-04:00"));
+        assert_eq!(out["created_at"], json!("2020-01-01T10:30"));
+    }
+
+    #[test]
+    fn agent_still_protects_nested_trigger_at_under_properties() {
+        // Pre-existing protection (agenda/get responses nest trigger_at
+        // under "properties") must remain intact alongside the new
+        // top-level, field-name-based guard.
+        let at = "2026-07-11T19:00:00-04:00";
+        let v = json!({
+            "id": "a1b2c3d4",
+            "properties": {"trigger_at": at, "status": "pending"},
+        });
+        let out = agent(v);
+        assert_eq!(out["properties"]["trigger_at"], json!(at));
     }
 
     #[test]
