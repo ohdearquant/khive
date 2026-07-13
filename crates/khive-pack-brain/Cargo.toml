@@ -35,12 +35,6 @@ serde_json = { workspace = true }
 uuid = { workspace = true }
 chrono = { workspace = true }
 tokio = { workspace = true }
-# ADR-081 §4: brain.record_serve computes the deterministic query_class key
-# (lowercase, strip punctuation, collapse whitespace, sort unique tokens,
-# join, SHA-256, first 16 hex chars).
-sha2 = { workspace = true }
-hex = { workspace = true }
-
 [features]
 lattice-router = ["dep:lattice-fann"]
 

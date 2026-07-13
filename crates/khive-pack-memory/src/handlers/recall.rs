@@ -8,10 +8,11 @@ use crate::recall_feedback::{on_recall_hit, on_recall_miss};
 use serde_json::{json, Value};
 use uuid::Uuid;
 
-use khive_brain_core::PackTunable;
+use khive_brain_core::{compute_query_class, PackTunable};
 use khive_fusion::FusionStrategy;
 use khive_runtime::{
-    micros_to_iso, Namespace, NamespaceToken, RuntimeError, SearchSource, VerbRegistry,
+    micros_to_iso, KhiveRuntime, Namespace, NamespaceToken, RuntimeError, SearchSource,
+    VerbRegistry,
 };
 use khive_storage::types::{EdgeFilter, PageRequest};
 use khive_storage::EdgeRelation;
@@ -368,6 +369,14 @@ impl MemoryPack {
         }
 
         if fused.is_empty() {
+            self.track_recall_serve(
+                token,
+                registry,
+                query_trimmed,
+                served_by_profile_id.as_deref(),
+                Vec::new(),
+                recall_start.elapsed().as_micros() as i64,
+            );
             if let Ok(mut state) = self.recall_state.lock() {
                 on_recall_miss(&mut state);
             }
@@ -807,44 +816,18 @@ impl MemoryPack {
             }
         }
 
-        if !results.is_empty() {
-            let target_ids: Vec<String> = results
-                .iter()
-                .filter_map(|r| r.get("id").and_then(Value::as_str).map(str::to_string))
-                .collect();
-            if !target_ids.is_empty() {
-                let registry_owned = registry.clone();
-                let namespace = token.namespace().as_str().to_string();
-                let query_raw = query_trimmed.to_string();
-                let served_by = served_by_profile_id.clone();
-                let served_at_us = chrono::Utc::now().timestamp_micros();
-                // Tracked, not a bare tokio::spawn, so daemon shutdown's drain()
-                // waits for this append instead of a SIGTERM aborting it
-                // mid-flight with no ledger row and no log (PR #583). The
-                // response path still only pays for the
-                // enqueue (an atomic increment) — never the SQL write itself.
-                khive_runtime::track_background_task(async move {
-                    let mut ledger_params = json!({
-                        "namespace": namespace,
-                        "consumer_kind": "recall",
-                        "target_ids": target_ids,
-                        "query_raw": query_raw,
-                        "served_at": served_at_us,
-                    });
-                    if let Some(profile_id) = served_by {
-                        ledger_params["served_by_profile_id"] = json!(profile_id);
-                    }
-                    if let Err(e) = registry_owned
-                        .dispatch("brain.record_serve", ledger_params)
-                        .await
-                    {
-                        eprintln!(
-                            "[memory] serve ledger dispatch failed (non-fatal, ADR-081 §4): {e}"
-                        );
-                    }
-                });
-            }
-        }
+        let target_ids = results
+            .iter()
+            .filter_map(|r| r.get("id").and_then(Value::as_str).map(str::to_string))
+            .collect();
+        self.track_recall_serve(
+            token,
+            registry,
+            query_trimmed,
+            served_by_profile_id.as_deref(),
+            target_ids,
+            recall_start.elapsed().as_micros() as i64,
+        );
 
         // Update recall-domain posteriors before returning.
         {
@@ -920,12 +903,109 @@ impl MemoryPack {
 
         to_json(&results)
     }
+
+    fn track_recall_serve(
+        &self,
+        token: &NamespaceToken,
+        registry: &VerbRegistry,
+        query_raw: &str,
+        served_by_profile_id: Option<&str>,
+        target_ids: Vec<String>,
+        latency_us: i64,
+    ) {
+        let result_count = target_ids.len();
+        let registry = registry.clone();
+        let namespace = token.namespace().as_str().to_string();
+        let query_raw = query_raw.to_string();
+        let query_class = compute_query_class(&query_raw);
+        let served_by_profile_id = served_by_profile_id.map(str::to_string);
+        let served_at_us = chrono::Utc::now().timestamp_micros();
+        let actor = format!("{}:{}", token.actor().kind, token.actor().id);
+        let runtime = self.runtime.clone();
+        let token = token.clone();
+
+        khive_runtime::track_background_task(async move {
+            let mut ledger_params = json!({
+                "namespace": namespace,
+                "consumer_kind": "recall",
+                "target_ids": target_ids,
+                "query_raw": query_raw,
+                "served_at": served_at_us,
+            });
+            if let Some(ref profile_id) = served_by_profile_id {
+                ledger_params["served_by_profile_id"] = json!(profile_id);
+            }
+            if let Err(error) = registry.dispatch("brain.record_serve", ledger_params).await {
+                tracing::warn!(
+                    error = %error,
+                    "serve ledger dispatch failed; recall result is unaffected"
+                );
+            }
+
+            emit_recall_executed_event(
+                &runtime,
+                &token,
+                actor,
+                served_by_profile_id,
+                query_class,
+                result_count,
+                latency_us,
+            )
+            .await;
+        });
+    }
+}
+
+/// Append best-effort recall telemetry without affecting the recall response.
+async fn emit_recall_executed_event(
+    rt: &KhiveRuntime,
+    token: &NamespaceToken,
+    actor: String,
+    served_by_profile_id: Option<String>,
+    query_class: String,
+    result_count: usize,
+    latency_us: i64,
+) {
+    let store = match rt.events(token) {
+        Ok(store) => store,
+        Err(err) => {
+            tracing::warn!(
+                error = %err,
+                namespace = token.namespace().as_str(),
+                event_kind = "recall_executed",
+                "recall_executed event store acquisition failed; recall result is unaffected"
+            );
+            return;
+        }
+    };
+    let payload = json!({
+        "actor": actor,
+        "served_by_profile_id": served_by_profile_id,
+        "query_class": query_class,
+        "result_count": result_count,
+        "latency_us": latency_us,
+    });
+    let event = khive_storage::Event::new(
+        token.namespace().as_str(),
+        "memory.recall",
+        khive_types::EventKind::RecallExecuted,
+        khive_types::SubstrateKind::Event,
+        actor,
+    )
+    .with_payload(payload)
+    .with_duration_us(latency_us);
+    if let Err(err) = store.append_event(event).await {
+        tracing::warn!(
+            error = %err,
+            "recall_executed event append failed; recall result is unaffected"
+        );
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use std::collections::{HashMap, HashSet};
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex as StdMutex};
 
     use async_trait::async_trait;
     use khive_pack_kg::KgPack;
@@ -937,9 +1017,63 @@ mod tests {
     use serde_json::Value;
     use serial_test::serial;
     use tokio::sync::Notify;
+    use tracing::field::{Field, Visit};
     use uuid::Uuid;
 
     use crate::MemoryPack;
+
+    #[derive(Clone, Debug, Default)]
+    struct CapturedWarning {
+        fields: HashMap<String, String>,
+    }
+
+    #[derive(Default)]
+    struct WarningVisitor(CapturedWarning);
+
+    impl Visit for WarningVisitor {
+        fn record_str(&mut self, field: &Field, value: &str) {
+            self.0
+                .fields
+                .insert(field.name().to_string(), value.to_string());
+        }
+
+        fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+            self.0.fields.insert(
+                field.name().to_string(),
+                format!("{value:?}").trim_matches('"').to_string(),
+            );
+        }
+    }
+
+    struct WarningCapture {
+        warnings: Arc<StdMutex<Vec<CapturedWarning>>>,
+    }
+
+    impl tracing::Subscriber for WarningCapture {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+
+        fn event(&self, event: &tracing::Event<'_>) {
+            if *event.metadata().level() == tracing::Level::WARN {
+                let mut visitor = WarningVisitor::default();
+                event.record(&mut visitor);
+                self.warnings.lock().unwrap().push(visitor.0);
+            }
+        }
+
+        fn enter(&self, _: &tracing::span::Id) {}
+
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
 
     /// #388 regression (sanitizer path): `sanitize_fts5_query` (khive-db) strips
     /// `$`, so this query no longer reaches the runtime-level fail-open `Err` arm
@@ -1531,7 +1665,7 @@ mod tests {
         );
 
         // The ledger append is fired via track_background_task off the response
-        // path — poll briefly rather than assume it has landed by the time recall returns.
+        // path, so poll briefly rather than assume it has landed by the time recall returns.
         let target_id = note_id.id.to_string();
         let mut found = false;
         for _ in 0..100 {
@@ -1563,6 +1697,338 @@ mod tests {
             found,
             "serve ledger row for the recalled target must appear within 2s"
         );
+    }
+
+    // ── #866: `recall_executed` event-plane emission ────────────────────────
+
+    // `#[serial(background_tasks)]`: shares `recall_stamps_served_by_profile_id_
+    // and_appends_serve_ledger_row`'s rationale above: this test drives the
+    // same `track_background_task`-fired path (serve-ledger append +
+    // `recall_executed` emission now live in the same tracked task).
+    #[tokio::test]
+    #[serial(background_tasks)]
+    async fn recall_emits_exactly_one_recall_executed_event() {
+        let rt = build_full_rt_with_brain();
+        let ns = Namespace::parse("local").expect("local namespace");
+        let token = rt.authorize(ns.clone()).expect("authorize local");
+
+        rt.create_note(
+            &token,
+            "memory",
+            None,
+            "866 recall executed event note",
+            Some(0.7),
+            None,
+            vec![],
+        )
+        .await
+        .expect("create note");
+
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(KgPack::new(rt.clone()));
+        builder.register(MemoryPack::new(rt.clone()));
+        builder.register(khive_pack_brain::BrainPack::new(rt.clone()));
+        let registry = builder.build().expect("registry");
+
+        let result = registry
+            .dispatch(
+                "memory.recall",
+                serde_json::json!({
+                    "namespace": ns.as_str(),
+                    "query": "866 recall executed event note",
+                    "limit": 10
+                }),
+            )
+            .await
+            .expect("memory.recall");
+        let hits = result.as_array().expect("bare array result");
+        assert!(!hits.is_empty(), "must find the seeded note");
+
+        // The emission is fired via track_background_task off the response
+        // path (same seam as the serve-ledger append), so poll briefly rather
+        // than assume it has landed by the time recall returns.
+        let store = rt.events(&token).expect("event store for local namespace");
+        let mut recall_events = Vec::new();
+        for _ in 0..100 {
+            let page = store
+                .query_events(
+                    khive_storage::EventFilter {
+                        kinds: vec![khive_types::EventKind::RecallExecuted],
+                        ..Default::default()
+                    },
+                    khive_storage::types::PageRequest {
+                        limit: 50,
+                        offset: 0,
+                    },
+                )
+                .await
+                .expect("query_events");
+            if !page.items.is_empty() {
+                recall_events = page.items;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+
+        assert_eq!(
+            recall_events.len(),
+            1,
+            "exactly one recall_executed event per recall serve, got: {recall_events:?}"
+        );
+        let event = &recall_events[0];
+        assert_eq!(event.kind, khive_types::EventKind::RecallExecuted);
+        assert_eq!(event.verb, "memory.recall");
+        assert_eq!(
+            event.payload["result_count"],
+            serde_json::json!(hits.len()),
+            "result_count must match the number of returned results"
+        );
+        assert_eq!(
+            event.payload["served_by_profile_id"],
+            serde_json::Value::Null,
+            "no profile was bound/resolved for this call"
+        );
+        assert!(
+            event.payload["query_class"]
+                .as_str()
+                .is_some_and(|s| !s.is_empty()),
+            "query_class must be a non-empty deterministic key, got: {:?}",
+            event.payload["query_class"]
+        );
+        assert!(
+            event.payload["latency_us"]
+                .as_i64()
+                .is_some_and(|us| us >= 0),
+            "latency_us must be a non-negative measured duration, got: {:?}",
+            event.payload["latency_us"]
+        );
+        assert!(
+            event.payload["actor"]
+                .as_str()
+                .is_some_and(|s| !s.is_empty()),
+            "actor must be stamped, got: {:?}",
+            event.payload["actor"]
+        );
+        assert_eq!(event.payload["actor"], serde_json::json!(event.actor));
+
+        let counts = registry
+            .dispatch(
+                "brain.event_counts",
+                serde_json::json!({
+                    "namespace": ns.as_str(),
+                    "since": "1970-01-01T00:00:00Z",
+                    "kind": "recall_executed",
+                }),
+            )
+            .await
+            .expect("brain.event_counts");
+        assert_eq!(counts["total"], serde_json::json!(1));
+        assert_eq!(
+            counts["counts_by_kind"]["recall_executed"],
+            serde_json::json!(1)
+        );
+    }
+
+    #[tokio::test]
+    #[serial(background_tasks)]
+    async fn successful_empty_recall_emits_recall_executed_event() {
+        let rt = build_full_rt_with_brain();
+        let ns = Namespace::parse("local").expect("local namespace");
+        let token = rt.authorize(ns.clone()).expect("authorize local");
+
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(KgPack::new(rt.clone()));
+        builder.register(MemoryPack::new(rt.clone()));
+        builder.register(khive_pack_brain::BrainPack::new(rt.clone()));
+        let registry = builder.build().expect("registry");
+
+        let result = registry
+            .dispatch(
+                "memory.recall",
+                serde_json::json!({
+                    "namespace": ns.as_str(),
+                    "query": "no matching memory exists",
+                    "limit": 10
+                }),
+            )
+            .await
+            .expect("memory.recall");
+        assert_eq!(result, serde_json::json!([]));
+
+        let store = rt.events(&token).expect("event store for local namespace");
+        let mut recall_events = Vec::new();
+        for _ in 0..100 {
+            let page = store
+                .query_events(
+                    khive_storage::EventFilter {
+                        kinds: vec![khive_types::EventKind::RecallExecuted],
+                        ..Default::default()
+                    },
+                    khive_storage::types::PageRequest {
+                        limit: 50,
+                        offset: 0,
+                    },
+                )
+                .await
+                .expect("query_events");
+            if !page.items.is_empty() {
+                recall_events = page.items;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+
+        assert_eq!(recall_events.len(), 1);
+        assert_eq!(
+            recall_events[0].payload["result_count"],
+            serde_json::json!(0)
+        );
+    }
+
+    #[tokio::test]
+    #[serial(background_tasks)]
+    async fn recall_failure_emits_no_recall_executed_event() {
+        let rt = build_full_rt_with_brain();
+        let ns = Namespace::parse("local").expect("local namespace");
+        let token = rt.authorize(ns.clone()).expect("authorize local");
+
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(KgPack::new(rt.clone()));
+        builder.register(MemoryPack::new(rt.clone()));
+        builder.register(khive_pack_brain::BrainPack::new(rt.clone()));
+        let registry = builder.build().expect("registry");
+
+        // `RecallParams::query` has no `#[serde(default)]`, so omitting it fails
+        // deserialization before the handler can schedule telemetry.
+        let result = registry
+            .dispatch(
+                "memory.recall",
+                serde_json::json!({
+                    "namespace": ns.as_str(),
+                    "limit": 10
+                }),
+            )
+            .await;
+        assert!(
+            result.is_err(),
+            "a recall missing the required `query` field must fail, not silently succeed"
+        );
+
+        // Give any (incorrectly fired) background emission a moment to land,
+        // then assert the event plane stayed empty for this kind.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let store = rt.events(&token).expect("event store for local namespace");
+        let page = store
+            .query_events(
+                khive_storage::EventFilter {
+                    kinds: vec![khive_types::EventKind::RecallExecuted],
+                    ..Default::default()
+                },
+                khive_storage::types::PageRequest {
+                    limit: 50,
+                    offset: 0,
+                },
+            )
+            .await
+            .expect("query_events");
+        assert!(
+            page.items.is_empty(),
+            "a failed recall must not emit any recall_executed event, got: {:?}",
+            page.items
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[serial(background_tasks)]
+    async fn recall_event_store_acquisition_failure_warns_without_failing_response() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let db_path = tmp.path().join("khive.db");
+        let backend = Arc::new(khive_db::StorageBackend::sqlite(&db_path).expect("backend"));
+        {
+            let mut writer = backend.pool().writer().expect("migration writer");
+            khive_db::run_migrations(writer.conn_mut()).expect("migrations");
+        }
+        let config = khive_runtime::RuntimeConfig {
+            db_path: Some(db_path),
+            embedding_model: None,
+            additional_embedding_models: vec![],
+            packs: vec!["kg".to_string(), "memory".to_string(), "brain".to_string()],
+            ..khive_runtime::RuntimeConfig::default()
+        };
+        let rt = KhiveRuntime::from_backend(Arc::clone(&backend), config);
+        let ns = Namespace::parse("local").expect("local namespace");
+        let token = rt.authorize(ns.clone()).expect("authorize local");
+
+        rt.create_note(
+            &token,
+            "memory",
+            None,
+            "event acquisition failure recall note",
+            Some(0.7),
+            None,
+            vec![],
+        )
+        .await
+        .expect("create note");
+
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(KgPack::new(rt.clone()));
+        builder.register(MemoryPack::new(rt.clone()));
+        builder.register(khive_pack_brain::BrainPack::new(rt.clone()));
+        let registry = builder.build().expect("registry");
+
+        {
+            let writer = backend.pool().writer().expect("fault injection writer");
+            writer
+                .conn()
+                .execute_batch("DROP TABLE events; PRAGMA query_only = ON;")
+                .expect("remove only the event schema and reject its recreation");
+        }
+
+        let warnings = Arc::new(StdMutex::new(Vec::new()));
+        let _capture = tracing::subscriber::set_default(WarningCapture {
+            warnings: Arc::clone(&warnings),
+        });
+
+        let result = registry
+            .dispatch(
+                "memory.recall",
+                serde_json::json!({
+                    "namespace": ns.as_str(),
+                    "query": "event acquisition failure recall note",
+                    "limit": 10
+                }),
+            )
+            .await
+            .expect("event-store acquisition failure must not fail memory.recall");
+        assert!(!result.as_array().expect("bare array result").is_empty());
+
+        let warning = loop {
+            if let Some(warning) = warnings.lock().unwrap().iter().find(|warning| {
+                warning.fields.get("message").map(String::as_str)
+                    == Some("recall_executed event store acquisition failed; recall result is unaffected")
+            }).cloned() {
+                break warning;
+            }
+            assert!(
+                khive_runtime::background_task_count() > 0,
+                "background task completed without an observable acquisition warning"
+            );
+            tokio::task::yield_now().await;
+        };
+
+        assert_eq!(
+            warning.fields.get("namespace").map(String::as_str),
+            Some("local")
+        );
+        assert_eq!(
+            warning.fields.get("event_kind").map(String::as_str),
+            Some("recall_executed")
+        );
+        assert!(warning
+            .fields
+            .get("error")
+            .is_some_and(|error| !error.is_empty()));
     }
 
     // `#[serial(background_tasks)]`: see the note on

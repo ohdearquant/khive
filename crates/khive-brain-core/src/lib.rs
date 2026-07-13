@@ -4,6 +4,7 @@ pub mod brain_signal;
 pub mod brain_state;
 pub mod posterior;
 pub mod profile;
+pub mod query_class;
 pub mod section_state;
 pub mod section_type;
 pub mod signal;
@@ -19,6 +20,7 @@ pub use profile::{
     resolve_consumer_profile, BalancedRecallSnapshot, BalancedRecallState, ConsumerKind,
     ProfileBinding, ProfileLifecycle, ProfileRecord,
 };
+pub use query_class::compute_query_class;
 pub use section_state::{
     derive_deterministic_weights, derive_weights, SectionPosteriorSnapshot, SectionPosteriorState,
     DEFAULT_ESS_CAP, DEFAULT_EXPLORATION_EPOCH, DEFAULT_SECTION_WEIGHT_FLOOR, DEFAULT_TAU_0,
