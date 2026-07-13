@@ -157,6 +157,40 @@ class ManifestTests(unittest.TestCase):
         self.assertEqual(scale_by_id.get("f1.recall.warm.real.n500k", {}).get("memories"), 500000)
         self.assertEqual(scale_by_id.get("f4.traverse.powerlaw.n500000.depth3.real", {}).get("nodes"), 500000)
 
+    def test_f10_payload_size_curve_scenario_is_absent(self):
+        """khive#950 Amendment 1 §4 "Scenario executability": the F10 `stats`
+        payload curve is inadmissible - public `stats` has no payload-size
+        control (declared max 64 KiB vs the 8 MiB daemon frame cap) - and is
+        removed, never re-added under this or any other scenario_id."""
+        data, _ = coverage_validator.load_manifest(MANIFEST_PATH)
+        ids = {sc["scenario_id"] for sc in data["scenario"]}
+        self.assertNotIn("f10.daemon.payload_size_curve.mcp", ids)
+        for scenario_id in ids:
+            self.assertNotIn("payload_size_curve", scenario_id)
+
+    def test_f10_response_size_sensitivity_replacement_present(self):
+        """khive#950 Amendment 1 §4: response-size sensitivity is instead
+        measured through a surface that genuinely varies payload (`list`/
+        `traverse` with limit sweeps) - a real-MCP `list` limit-sweep cohort
+        family replaces the removed `stats` payload curve."""
+        data, _ = coverage_validator.load_manifest(MANIFEST_PATH)
+        by_id = {sc["scenario_id"]: sc for sc in data["scenario"]}
+        limit_sweep_ids = {
+            "f10.list.limit_sweep.small.mcp",
+            "f10.list.limit_sweep.medium.mcp",
+            "f10.list.limit_sweep.large.mcp",
+        }
+        limits = []
+        for scenario_id in limit_sweep_ids:
+            self.assertIn(scenario_id, by_id, f"{scenario_id} missing - §4 replacement not wired")
+            sc = by_id[scenario_id]
+            self.assertEqual(sc["feature"], "F10")
+            self.assertEqual(sc["surface"], "mcp_daemon")
+            self.assertEqual(sc["operation"], "list")
+            self.assertGreaterEqual(sc["request_deadline_ms"], 45000)
+            limits.append(sc["scale"]["limit"])
+        self.assertEqual(len(set(limits)), 3, "limit sweep must vary the limit param across cohorts")
+
     def test_every_timed_scenario_client_censor_exceeds_server_deadline(self):
         """Amendment 1 §2 "Deadline classifiability": client-side censor
         must strictly exceed the 30000 ms server-side recall deadline

@@ -1589,14 +1589,66 @@ request_deadline_ms = 45000
 request_deadline_provenance = "harness measurement-censoring safety cap, set to strictly exceed the server-side recall deadline (30000 ms per #919) so a timeout is attributable to exactly one deadline (Amendment 1 §2); not a product SLO (OQ2 ruling); the MCP client's own request-timeout default is 300000 ms (300s), recorded here for reference only, see [oq_rulings] above"
 runner_class = "hosted_hash"
 
+# Amendment 1 §4 "Scenario executability": the former
+# "f10.daemon.payload_size_curve.mcp" scenario is REMOVED. Its independent
+# variable (payload_bytes_max, declared up to 65536 bytes against an 8 MiB
+# daemon frame cap) was not generatable through its declared surface -
+# public `stats` has no payload-size control at all, so the scenario could
+# never actually vary the thing it claimed to measure. §4 replaces it with
+# two scenarios on genuinely payload-varying surfaces:
+#   1. Response-size sensitivity: the "f10.list.limit_sweep.*.mcp" cohort
+#      family below sweeps `list`'s `limit` param through a fixed 50k-entity
+#      corpus (reusing the read-only "kg_search_relevance_entity" fixture
+#      from F2, legal per §6 fixture-reuse-for-read-only), which does
+#      genuinely change response payload size end to end.
+#   2. The daemon frame cap itself: probed only in the admin-surface class
+#      by "f10.daemon.probe_only.floor" above (already the named §2
+#      admin-surface exception for the F10 daemon-control probe - no
+#      second scenario is added here).
 [[scenario]]
-scenario_id = "f10.daemon.payload_size_curve.mcp"
+scenario_id = "f10.list.limit_sweep.small.mcp"
 feature = "F10"
 surface = "mcp_daemon"
-operation = "stats"
-fixture = "daemon_idle_payload_curve"
-fixture_hash = "sha256:2d5fae7aeda7dacf9a63e51150b5862e2078617e02b44adc6d076ac35edcfa6a"
-scale = { payload_bytes_max = 65536 }
+operation = "list"
+fixture = "kg_search_relevance_entity"
+fixture_hash = "sha256:2cd9c5a27aead8d701a9f000447e9529a4f2ef038d4966071d6f28dcd39a0eda"
+scale = { entities = 50000, limit = 10 }
+embedder = "none"
+state = "warm"
+settle = "none"
+attempts = 1000
+concurrency = 1
+required_percentiles = ["p50", "p95", "p99"]
+request_deadline_ms = 45000
+request_deadline_provenance = "harness measurement-censoring safety cap, set to strictly exceed the server-side recall deadline (30000 ms per #919) so a timeout is attributable to exactly one deadline (Amendment 1 §2); not a product SLO (OQ2 ruling); the MCP client's own request-timeout default is 300000 ms (300s), recorded here for reference only, see [oq_rulings] above"
+runner_class = "hosted_hash"
+
+[[scenario]]
+scenario_id = "f10.list.limit_sweep.medium.mcp"
+feature = "F10"
+surface = "mcp_daemon"
+operation = "list"
+fixture = "kg_search_relevance_entity"
+fixture_hash = "sha256:2cd9c5a27aead8d701a9f000447e9529a4f2ef038d4966071d6f28dcd39a0eda"
+scale = { entities = 50000, limit = 100 }
+embedder = "none"
+state = "warm"
+settle = "none"
+attempts = 1000
+concurrency = 1
+required_percentiles = ["p50", "p95", "p99"]
+request_deadline_ms = 45000
+request_deadline_provenance = "harness measurement-censoring safety cap, set to strictly exceed the server-side recall deadline (30000 ms per #919) so a timeout is attributable to exactly one deadline (Amendment 1 §2); not a product SLO (OQ2 ruling); the MCP client's own request-timeout default is 300000 ms (300s), recorded here for reference only, see [oq_rulings] above"
+runner_class = "hosted_hash"
+
+[[scenario]]
+scenario_id = "f10.list.limit_sweep.large.mcp"
+feature = "F10"
+surface = "mcp_daemon"
+operation = "list"
+fixture = "kg_search_relevance_entity"
+fixture_hash = "sha256:2cd9c5a27aead8d701a9f000447e9529a4f2ef038d4966071d6f28dcd39a0eda"
+scale = { entities = 50000, limit = 1000 }
 embedder = "none"
 state = "warm"
 settle = "none"
