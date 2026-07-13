@@ -2150,6 +2150,7 @@ async fn subhandler_verbs_are_allowed_on_operator_path() -> anyhow::Result<()> {
                 save_to: None,
                 format: None,
                 format_per_op: None,
+                request_id: None,
             })
             .await
             .expect("operator dispatch must not RPC-fail");
@@ -3925,6 +3926,7 @@ async fn exec_output_valid_json_with_backslash_escape_content() -> anyhow::Resul
             save_to: None,
             format: None,
             format_per_op: None,
+            request_id: None,
         })
         .await
         .expect("dispatch must succeed");
@@ -3944,6 +3946,7 @@ async fn exec_output_valid_json_with_backslash_escape_content() -> anyhow::Resul
             save_to: None,
             format: None,
             format_per_op: None,
+            request_id: None,
         })
         .await
         .expect("get dispatch must succeed");
@@ -3982,6 +3985,7 @@ async fn exec_output_valid_json_with_backslash_escape_content() -> anyhow::Resul
             save_to: None,
             format: None,
             format_per_op: None,
+            request_id: None,
         })
         .await
         .expect("update dispatch must succeed");
@@ -4445,6 +4449,7 @@ async fn dispatch_honors_explicit_namespace_else_local_adr007() {
                 save_to: None,
                 format: None,
                 format_per_op: None,
+                request_id: None,
             })
             .await
             .expect("dispatch must not error at the MCP level");
@@ -4571,6 +4576,7 @@ async fn format_auto_mixed_ok_error_batch_error_stays_compact() {
         save_to: None,
         format: Some("auto".to_string()),
         format_per_op: None,
+        request_id: None,
     };
 
     let raw = server
@@ -4636,6 +4642,7 @@ async fn format_per_op_override_selects_format_per_position() {
             Some("json".to_string()), // op0 → json (compact, parseable)
             None,                     // op1 → inherits batch "auto"
         ]),
+        request_id: None,
     };
 
     let raw = server
@@ -4699,6 +4706,7 @@ async fn presentation_per_op_verbose_preserves_full_id_namespace_and_props() {
         save_to: None,
         format: None,
         format_per_op: None,
+        request_id: None,
     };
     let create_raw = server
         .dispatch_request_local(create_params)
@@ -4726,6 +4734,7 @@ async fn presentation_per_op_verbose_preserves_full_id_namespace_and_props() {
         save_to: None,
         format: Some("auto".to_string()),
         format_per_op: None,
+        request_id: None,
     };
 
     let raw = server
@@ -4816,6 +4825,7 @@ async fn format_auto_always_verbose_verb_skips_redundancy_drop_without_override(
         save_to: None,
         format: None,
         format_per_op: None,
+        request_id: None,
     };
     let create_raw = server
         .dispatch_request_local(create_params)
@@ -4837,6 +4847,7 @@ async fn format_auto_always_verbose_verb_skips_redundancy_drop_without_override(
         save_to: None,
         format: Some("auto".to_string()),
         format_per_op: None,
+        request_id: None,
     };
     let raw = server
         .dispatch_request_local(get_params)
