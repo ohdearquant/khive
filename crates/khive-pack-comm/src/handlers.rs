@@ -78,6 +78,35 @@ pub(crate) async fn handle_send(
     let from_actor = token.actor().id.clone();
     let to_actor = p.to.trim().to_string();
 
+    // #820: a resolved target that equals the sender's own actor identity is,
+    // outside the anonymous single-tenant fallback ("local"), almost always a
+    // mis-resolution rather than intent -- most commonly a sub-agent session
+    // spawned in the same project scope trying to reach a distinct parent
+    // orchestrator actor. Both processes resolve `[actor] id` from the same
+    // worktree-scoped `.khive/config.toml` (ADR-096 Fork 2's project-local
+    // `[actor]` injection tier is per-project, not per-session), so the
+    // sub-agent's `from_actor` and the parent label it names collapse onto the
+    // identical string with no error, no warning, and no distinct inbox: the
+    // message silently "delivers" to the sender's own attributed identity
+    // instead of a genuinely different principal. Reject by default; a caller
+    // that truly means to message its own inbox (e.g. a personal reminder) must
+    // say so explicitly via `self_send=true`, turning the collapse loud instead
+    // of silent. `to_actor == "local"` is exempted: that is the anonymous
+    // single-tenant party-line default (both sender and recipient unattributed),
+    // not a collapsed distinct-principal address.
+    if to_actor == from_actor && to_actor != "local" && !p.self_send {
+        return Err(RuntimeError::InvalidInput(format!(
+            "send: `to` ({to_actor:?}) resolves to the sender's own actor identity \
+             ({from_actor:?}); refusing to silently self-address (issue #820). If you intended \
+             to reach a distinct actor (e.g. a sub-agent addressing its parent orchestrator), \
+             the sender's actor identity collapsed onto the same value as the named target -- \
+             sessions spawned in the same project scope resolve `[actor] id` from the same \
+             worktree-scoped `.khive/config.toml`, so they are not addressable as distinct \
+             principals until each is configured with its own actor identity. If this send is \
+             genuinely a note to yourself, resend with `self_send=true`."
+        )));
+    }
+
     // #200: addressed sends from an unattributed caller will stamp from_actor="local",
     // which causes reply-threading collapse when multiple unconfigured actors interact.
     // This is a known limitation pending issue #75 (actor identity per request).
