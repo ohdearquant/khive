@@ -50,8 +50,8 @@ pub fn entity_upsert_statement(entity: &Entity) -> SqlStatement {
     SqlStatement {
         sql: "INSERT OR REPLACE INTO entities \
               (id, namespace, kind, entity_type, name, description, properties, tags, \
-               created_at, updated_at, deleted_at, merged_into, merge_event_id) \
-              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)"
+               created_at, updated_at, deleted_at, merged_into, merge_event_id, content_ref) \
+              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)"
             .to_string(),
         params: vec![
             SqlValue::Text(entity.id.to_string()),
@@ -83,6 +83,10 @@ pub fn entity_upsert_statement(entity: &Entity) -> SqlStatement {
             },
             match entity.merge_event_id {
                 Some(u) => SqlValue::Text(u.to_string()),
+                None => SqlValue::Null,
+            },
+            match &entity.content_ref {
+                Some(c) => SqlValue::Text(c.clone()),
                 None => SqlValue::Null,
             },
         ],
@@ -255,6 +259,7 @@ fn read_entity(row: &rusqlite::Row<'_>) -> Result<Entity, rusqlite::Error> {
     let deleted_at: Option<i64> = row.get(10)?;
     let merged_into_str: Option<String> = row.get(11)?;
     let merge_event_id_str: Option<String> = row.get(12)?;
+    let content_ref: Option<String> = row.get(13)?;
 
     let id = parse_uuid(&id_str)?;
 
@@ -304,6 +309,7 @@ fn read_entity(row: &rusqlite::Row<'_>) -> Result<Entity, rusqlite::Error> {
         deleted_at,
         merged_into,
         merge_event_id,
+        content_ref,
     })
 }
 
@@ -338,8 +344,8 @@ fn batch_upsert_entities(
         match conn.execute(
             "INSERT OR REPLACE INTO entities \
              (id, namespace, kind, entity_type, name, description, properties, tags, \
-              created_at, updated_at, deleted_at, merged_into, merge_event_id) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+              created_at, updated_at, deleted_at, merged_into, merge_event_id, content_ref) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
             rusqlite::params![
                 id_str,
                 &entity.namespace,
@@ -354,6 +360,7 @@ fn batch_upsert_entities(
                 entity.deleted_at,
                 merged_into_str,
                 merge_event_id_str,
+                entity.content_ref,
             ],
         ) {
             Ok(_) => affected += 1,
@@ -603,7 +610,7 @@ impl EntityStore for SqlEntityStore {
         self.with_reader("get_entity", move |conn| {
             let mut stmt = conn.prepare(
                 "SELECT id, namespace, kind, entity_type, name, description, properties, tags, \
-                 created_at, updated_at, deleted_at, merged_into, merge_event_id \
+                 created_at, updated_at, deleted_at, merged_into, merge_event_id, content_ref \
                  FROM entities WHERE id = ?1 AND deleted_at IS NULL",
             )?;
             let mut rows = stmt.query(rusqlite::params![id_str])?;
@@ -718,7 +725,7 @@ impl EntityStore for SqlEntityStore {
             let offset_idx = data_params.len();
 
             let columns = "id, namespace, kind, entity_type, name, description, properties, tags, \
-                           created_at, updated_at, deleted_at, merged_into, merge_event_id";
+                           created_at, updated_at, deleted_at, merged_into, merge_event_id, content_ref";
             let data_sql = if filter.names_ci.is_empty() {
                 format!(
                     "SELECT {columns} FROM entities{where_sql} \
@@ -756,7 +763,7 @@ impl EntityStore for SqlEntityStore {
         self.with_reader("get_entity_including_deleted", move |conn| {
             let mut stmt = conn.prepare(
                 "SELECT id, namespace, kind, entity_type, name, description, properties, tags, \
-                 created_at, updated_at, deleted_at, merged_into, merge_event_id \
+                 created_at, updated_at, deleted_at, merged_into, merge_event_id, content_ref \
                  FROM entities WHERE id = ?1",
             )?;
             let mut rows = stmt.query(rusqlite::params![id_str])?;

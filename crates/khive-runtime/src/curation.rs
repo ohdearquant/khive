@@ -901,7 +901,7 @@ fn read_merge_entity(
     let id_str = id.to_string();
     let mut stmt = conn.prepare(
         "SELECT id, namespace, kind, entity_type, name, description, properties, tags, \
-         created_at, updated_at, deleted_at, merged_into, merge_event_id \
+         created_at, updated_at, deleted_at, merged_into, merge_event_id, content_ref \
          FROM entities WHERE id = ?1 AND deleted_at IS NULL",
     )?;
     let mut rows = stmt.query(rusqlite::params![id_str])?;
@@ -922,6 +922,7 @@ fn read_merge_entity(
     let deleted_at: Option<i64> = row.get(10)?;
     let merged_into_str: Option<String> = row.get(11)?;
     let merge_event_id_str: Option<String> = row.get(12)?;
+    let content_ref: Option<String> = row.get(13)?;
 
     if ns != namespace {
         return Err(SqliteError::InvalidData(format!(
@@ -962,6 +963,7 @@ fn read_merge_entity(
         deleted_at,
         merged_into,
         merge_event_id,
+        content_ref,
     })
 }
 
@@ -1282,6 +1284,7 @@ fn merge_entity_sql(
         deleted_at: into_entity.deleted_at,
         merged_into: None,
         merge_event_id: None,
+        content_ref: into_entity.content_ref,
     };
 
     Ok((

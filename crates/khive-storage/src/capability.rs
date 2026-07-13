@@ -11,4 +11,6 @@ pub enum StorageCapability {
     Vectors,
     Sparse,
     Text,
+    /// Content-addressed binary object storage (`BlobStore`, khive#292).
+    Blob,
 }
