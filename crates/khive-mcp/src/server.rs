@@ -1609,6 +1609,9 @@ impl KhiveMcpServer {
             format: p.format.clone(),
             format_per_op: p.format_per_op.clone(),
             from_wire: true,
+            // khive#948: forwarded unchanged from the tool caller's params.
+            // `None` when the caller supplied no id (pre-#948 client).
+            request_id: p.request_id,
         }
     }
 
@@ -2319,6 +2322,29 @@ mod tests {
         std::env::remove_var("KHIVE_LOCK");
     }
 
+    /// khive#948: `wire_daemon_frame` forwards `RequestParams::request_id`
+    /// onto the `DaemonRequestFrame` unchanged, and defaults to `None` when
+    /// the caller supplied none.
+    #[test]
+    fn wire_daemon_frame_forwards_request_id() {
+        let server = make_daemon_save_to_test_server();
+
+        let with_id = RequestParams {
+            ops: "stats()".to_string(),
+            request_id: Some(123),
+            ..Default::default()
+        };
+        let frame = server.wire_daemon_frame(&with_id);
+        assert_eq!(frame.request_id, Some(123));
+
+        let without_id = RequestParams {
+            ops: "stats()".to_string(),
+            ..Default::default()
+        };
+        let frame = server.wire_daemon_frame(&without_id);
+        assert_eq!(frame.request_id, None);
+    }
+
     async fn connect_when_daemon_ready(sock: &std::path::Path) {
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
@@ -2370,6 +2396,7 @@ mod tests {
                 save_to: Some(sink_path.to_string_lossy().to_string()),
                 format: None,
                 format_per_op: None,
+                request_id: None,
             }))
             .await
             .expect("request with save_to must succeed even with a warm daemon reachable");
@@ -2451,6 +2478,7 @@ mod tests {
                 save_to: None,
                 format: None,
                 format_per_op: None,
+                request_id: None,
             })
             .await
             .expect("baseline stats() must succeed");
@@ -2463,6 +2491,7 @@ mod tests {
                 save_to: None,
                 format: None,
                 format_per_op: None,
+                request_id: None,
             }))
             .await;
 
@@ -2490,6 +2519,7 @@ mod tests {
                 save_to: None,
                 format: None,
                 format_per_op: None,
+                request_id: None,
             })
             .await
             .expect("post-request stats() must succeed");
@@ -2550,6 +2580,7 @@ mod tests {
                 save_to: None,
                 format: None,
                 format_per_op: None,
+                request_id: None,
             })
             .await
             .expect("baseline stats() must succeed");
@@ -2577,6 +2608,7 @@ mod tests {
                 save_to: None,
                 format: None,
                 format_per_op: None,
+                request_id: None,
             }))
             .await
             .expect("strict fallback must land as a normal Ok(envelope), not Err(McpError)");
@@ -2603,6 +2635,7 @@ mod tests {
                 save_to: None,
                 format: None,
                 format_per_op: None,
+                request_id: None,
             }))
             .await
             .expect("strict fallback must land as a normal Ok(envelope), not Err(McpError)");
@@ -2629,6 +2662,7 @@ mod tests {
                 save_to: None,
                 format: None,
                 format_per_op: None,
+                request_id: None,
             }))
             .await
             .expect("strict fallback must land as a normal Ok(envelope), not Err(McpError)");
@@ -2655,6 +2689,7 @@ mod tests {
                 save_to: None,
                 format: None,
                 format_per_op: None,
+                request_id: None,
             })
             .await
             .expect("post-request stats() must succeed");

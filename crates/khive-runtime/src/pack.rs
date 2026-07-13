@@ -848,6 +848,14 @@ pub struct RequestIdentity {
     /// failing the whole request — a single malformed visibility entry from a
     /// caller-supplied frame must not block dispatch.
     pub visible_namespaces: Vec<String>,
+    /// Caller-supplied correlation id for this request (khive#948), carried
+    /// unchanged from the daemon frame's `request_id` field. Stamped into the
+    /// audit event's `resource.request_id` on every outcome (success, error,
+    /// and denied) so a client can join its own pre-send sample to the
+    /// server-side audit row for the same request. `None` means the caller
+    /// supplied no id (a pre-#948 client, or an internal/non-benchmark
+    /// caller) — the audit row then carries no `request_id` key at all.
+    pub request_id: Option<u64>,
 }
 
 /// Error returned by [`VerbRegistry::apply_schema_plans_with_map`] when two
@@ -1082,6 +1090,10 @@ impl VerbRegistry {
         // coordinator intercept via `resolve_explicit_namespace` so every MCP
         // ingress path applies the same fail-closed rule.
         let explicit_namespace = params.get("namespace").is_some_and(Value::is_string);
+        // The caller-supplied correlation id (khive#948), if any. Read once
+        // here so it is in scope for every audit-append site below,
+        // including the ones that run before pack dispatch is attempted.
+        let request_id: Option<u64> = identity.as_ref().and_then(|id| id.request_id);
         // A supplied per-request identity overrides the baked
         // default_namespace/actor_id/visible_namespaces for this call only.
         let default_namespace_str: &str = identity
@@ -1173,7 +1185,7 @@ impl VerbRegistry {
                             &gate_req,
                             &audit,
                             EventOutcome::Denied,
-                            Some(crate::cost_unit::base_resource_payload()),
+                            Some(crate::cost_unit::base_resource_payload(request_id)),
                         );
                         append_audit_event_best_effort(store, storage_event, verb).await;
                     }
@@ -1314,6 +1326,7 @@ impl VerbRegistry {
                                     &gate_req.args,
                                     ok_val,
                                     || pack.registered_embedding_model_names().len() as i64,
+                                    request_id,
                                 );
                                 match link_audit_success_from_result(audit.clone(), ok_val) {
                                     Some((edge_id, mut payload)) => {
@@ -1384,11 +1397,12 @@ impl VerbRegistry {
                                             &gate_req.args,
                                             ok_val,
                                             || pack.registered_embedding_model_names().len() as i64,
+                                            request_id,
                                         )),
                                     ),
                                     Err(_) => (
                                         EventOutcome::Error,
-                                        Some(crate::cost_unit::base_resource_payload()),
+                                        Some(crate::cost_unit::base_resource_payload(request_id)),
                                     ),
                                 };
                                 let storage_event =
@@ -1487,7 +1501,7 @@ impl VerbRegistry {
                     &gate_req,
                     &audit,
                     EventOutcome::Error,
-                    Some(crate::cost_unit::base_resource_payload()),
+                    Some(crate::cost_unit::base_resource_payload(request_id)),
                 );
                 append_audit_event_best_effort(store, storage_event, verb).await;
             }
