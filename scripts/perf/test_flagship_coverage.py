@@ -121,10 +121,94 @@ class ManifestTests(unittest.TestCase):
     def test_oq_rulings_present(self):
         data, _ = coverage_validator.load_manifest(MANIFEST_PATH)
         rulings = data["oq_rulings"]
-        self.assertEqual(rulings["oq2_measurement_deadline_ms"], 30000)
+        # khive#946 Amendment 1 §2: client censor must strictly exceed the
+        # 30000 ms server-side recall deadline (#919), so the harness cap is
+        # 45000 ms, not 30000 ms.
+        self.assertEqual(rulings["oq2_measurement_deadline_ms"], 45000)
+        self.assertEqual(rulings["oq2_server_recall_deadline_ms"], 30000)
         self.assertEqual(rulings["oq2_mcp_client_default_timeout_ms"], 300000)
         self.assertEqual(rulings["oq7_freshness_days_self_hosted"], 14)
         self.assertEqual(rulings["oq7_freshness_days_hosted"], 7)
+
+    def test_oq1_admin_surface_scenario_ids_match_manifest(self):
+        """khive#946 Amendment 1 §2: exactly two admin-surface exceptions are
+        named and bounded (F6 git-ingest/code-ingest, F10 daemon-control
+        probe) - every other scenario is real-MCP coverage by default."""
+        data, _ = coverage_validator.load_manifest(MANIFEST_PATH)
+        rulings = data["oq_rulings"]
+        admin_surface_ids = set(rulings["oq1_admin_surface_scenario_ids"])
+        self.assertEqual(
+            admin_surface_ids,
+            {"f6.git_ingest.cli.production", "f6.code_ingest.cli.production", "f10.daemon.probe_only.floor"},
+        )
+        by_id = {sc["scenario_id"]: sc for sc in data["scenario"]}
+        for scenario_id in admin_surface_ids:
+            self.assertIn(scenario_id, by_id)
+            self.assertIn(by_id[scenario_id]["surface"], ("admin_cli", "raw_daemon_control"))
+        for scenario_id, sc in by_id.items():
+            if scenario_id not in admin_surface_ids:
+                self.assertEqual(sc["surface"], "mcp_daemon", f"{scenario_id} is not in the admin-surface exception list but is not mcp_daemon either")
+
+    def test_f1_and_f4_have_500k_cohort(self):
+        """Amendment 1 §7: F1 and F4 scenario sets gain a 500K cohort before
+        any "exact cohort" claim is made."""
+        data, _ = coverage_validator.load_manifest(MANIFEST_PATH)
+        scale_by_id = {sc["scenario_id"]: sc["scale"] for sc in data["scenario"]}
+        self.assertEqual(scale_by_id.get("f1.recall.warm.real.n500k", {}).get("memories"), 500000)
+        self.assertEqual(scale_by_id.get("f4.traverse.powerlaw.n500000.depth3.real", {}).get("nodes"), 500000)
+
+    def test_f10_payload_size_curve_scenario_is_absent(self):
+        """khive#950 Amendment 1 §4 "Scenario executability": the F10 `stats`
+        payload curve is inadmissible - public `stats` has no payload-size
+        control (declared max 64 KiB vs the 8 MiB daemon frame cap) - and is
+        removed, never re-added under this or any other scenario_id."""
+        data, _ = coverage_validator.load_manifest(MANIFEST_PATH)
+        ids = {sc["scenario_id"] for sc in data["scenario"]}
+        self.assertNotIn("f10.daemon.payload_size_curve.mcp", ids)
+        for scenario_id in ids:
+            self.assertNotIn("payload_size_curve", scenario_id)
+
+    def test_f10_response_size_sensitivity_replacement_present(self):
+        """khive#950 Amendment 1 §4: response-size sensitivity is instead
+        measured through a surface that genuinely varies payload (`list`/
+        `traverse` with limit sweeps) - a real-MCP `list` limit-sweep cohort
+        family replaces the removed `stats` payload curve."""
+        data, _ = coverage_validator.load_manifest(MANIFEST_PATH)
+        by_id = {sc["scenario_id"]: sc for sc in data["scenario"]}
+        limit_sweep_ids = {
+            "f10.list.limit_sweep.small.mcp",
+            "f10.list.limit_sweep.medium.mcp",
+            "f10.list.limit_sweep.large.mcp",
+        }
+        limits = []
+        for scenario_id in limit_sweep_ids:
+            self.assertIn(scenario_id, by_id, f"{scenario_id} missing - §4 replacement not wired")
+            sc = by_id[scenario_id]
+            self.assertEqual(sc["feature"], "F10")
+            self.assertEqual(sc["surface"], "mcp_daemon")
+            self.assertEqual(sc["operation"], "list")
+            self.assertGreaterEqual(sc["request_deadline_ms"], 45000)
+            limits.append(sc["scale"]["limit"])
+        self.assertEqual(len(set(limits)), 3, "limit sweep must vary the limit param across cohorts")
+
+    def test_every_timed_scenario_client_censor_exceeds_server_deadline(self):
+        """Amendment 1 §2 "Deadline classifiability": client-side censor
+        must strictly exceed the 30000 ms server-side recall deadline
+        (#919) so a timeout is attributable to exactly one deadline."""
+        data, _ = coverage_validator.load_manifest(MANIFEST_PATH)
+        server_deadline_ms = data["oq_rulings"]["oq2_server_recall_deadline_ms"]
+        censor_floor_ms = data["oq_rulings"]["oq2_measurement_deadline_ms"]
+        self.assertEqual(censor_floor_ms, 45000)
+        self.assertGreater(censor_floor_ms, server_deadline_ms)
+        for sc in data["scenario"]:
+            if sc["surface"] == "admin_cli":
+                continue
+            self.assertGreaterEqual(
+                sc["request_deadline_ms"],
+                censor_floor_ms,
+                f"{sc['scenario_id']}: request_deadline_ms {sc['request_deadline_ms']} must meet "
+                f"the {censor_floor_ms} ms client-censor floor (Amendment 1 section 2)",
+            )
 
     def _write_manifest(self, tmp: pathlib.Path, scenarios: list[dict]) -> pathlib.Path:
         lines = []
