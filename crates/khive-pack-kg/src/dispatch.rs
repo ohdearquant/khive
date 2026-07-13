@@ -1131,19 +1131,8 @@ mod tests {
         );
     }
 
-    /// #569 regression: `search(kind="note", ...)` must fail loud on a residual
-    /// FTS5 metacharacter, exercised end to end through verb dispatch.
-    ///
-    /// `sanitize_fts5_query` (khive-db) strips known-unsafe characters like `$`,
-    /// but by design stays minimal — it does not strip every character SQLite
-    /// FTS5's bareword parser rejects. `@` is one residual character that still
-    /// crashes the parser. `search_notes` (khive-runtime/operations.rs) now
-    /// surfaces that FTS parser error as `RuntimeError::InvalidInput` instead
-    /// of silently degrading to vector-only results (#569). This assertion
-    /// fails against the pre-#569 fail-open behavior (which returned `Ok`
-    /// here) and passes once the FTS leg fails closed.
     #[tokio::test]
-    async fn handler_search_note_residual_fts5_char_fails_loud() {
+    async fn handler_search_note_sanitizes_fts5_metacharacters() {
         let rt = KhiveRuntime::memory().expect("in-memory runtime");
         let tok = rt.authorize(Namespace::local()).unwrap();
 
@@ -1152,37 +1141,44 @@ mod tests {
         let registry = builder.build().expect("registry build");
         let pack = KgPack::new(rt.clone());
 
-        pack.dispatch(
-            "create",
-            json!({
-                "kind": "observation",
-                "content": "use foo@bar to chain calls"
-            }),
-            &registry,
-            &tok,
-        )
-        .await
-        .expect("note create must succeed");
-
-        let result = pack
-            .dispatch(
-                "search",
+        for (query, content) in [
+            ("#682", "tracking #682 Stage 2 work"),
+            ("B=128", "chunkwise B=128 traffic"),
+            ("Min-K%Prob", "evaluate Min-K%Prob membership inference"),
+            ("foo\"bar", "the foo\"bar identifier"),
+            ("foo@bar", "use foo@bar to chain calls"),
+        ] {
+            pack.dispatch(
+                "create",
                 json!({
-                    "kind": "note",
-                    "query": "foo@bar",
-                    "limit": 10
+                    "kind": "observation",
+                    "content": content
                 }),
                 &registry,
                 &tok,
             )
-            .await;
+            .await
+            .expect("note create must succeed");
 
-        assert!(
-            result.is_err(),
-            "#569 search(kind=\"note\") must fail loud on a residual FTS5 char ('@'), \
-             not silently degrade to vector-only results, got: {:?}",
-            result.ok()
-        );
+            let value = pack
+                .dispatch(
+                    "search",
+                    json!({
+                        "kind": "note",
+                        "query": query,
+                        "limit": 10
+                    }),
+                    &registry,
+                    &tok,
+                )
+                .await
+                .unwrap_or_else(|e| panic!("search must accept query {query:?}, got: {e:?}"));
+            let hits = value.as_array().expect("search must return an array");
+            assert!(
+                !hits.is_empty(),
+                "query {query:?} must find the seeded note; got {hits:?}"
+            );
+        }
     }
 
     // ---- `resolve` verb (unified-verb draft ADR, Slice 1) ----

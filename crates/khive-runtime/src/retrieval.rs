@@ -1307,7 +1307,8 @@ mod tests {
     /// `hybrid_search` must not hard-fail on a query containing FTS5 metacharacters
     /// like `$` (e.g. the DSL doc query `$prev.id`). `sanitize_fts5_query` (khive-db)
     /// strips `$`, so this exercises the sanitizer path and takes the `Ok` arm; see
-    /// `hybrid_search_with_residual_fts5_char_fails_loud` below for the fail-loud arm.
+    /// `hybrid_search_with_residual_fts5_char_now_sanitized` below for the character
+    /// class #916 closed (previously the fail-loud arm, prior to #916).
     #[tokio::test]
     async fn hybrid_search_with_dollar_sign_query_does_not_error() {
         let rt = KhiveRuntime::memory().unwrap();
@@ -1335,13 +1336,16 @@ mod tests {
         );
     }
 
-    /// Unlike `$`, `@` is NOT stripped by `sanitize_fts5_query` (the sanitizer stays
-    /// minimal by design). SQLite FTS5's bareword parser still rejects `@`
-    /// unconditionally, so this query reaches the runtime-level `Err` arm in
-    /// `hybrid_search`, which must fail loud (`RuntimeError::InvalidInput`) instead
-    /// of silently degrading to vector-only fusion.
+    /// #916: `@` was previously NOT stripped by `sanitize_fts5_query` and SQLite
+    /// FTS5's bareword parser rejected it unconditionally, so this query used to
+    /// reach the runtime-level fail-loud arm (`RuntimeError::InvalidInput`, #569).
+    /// `sanitize_fts5_token_group`'s bareword-safety gate now recognizes `@` (and
+    /// every other ASCII punctuation character not already handled) as unsafe for
+    /// an unquoted bareword position and routes it through the quoted-phrase
+    /// alternative instead, which FTS5 accepts literally, so the query
+    /// now succeeds and finds the seeded content rather than erroring.
     #[tokio::test]
-    async fn hybrid_search_with_residual_fts5_char_fails_loud() {
+    async fn hybrid_search_with_residual_fts5_char_now_sanitized() {
         let rt = KhiveRuntime::memory().unwrap();
         let tok = NamespaceToken::local();
         rt.create_entity(
@@ -1360,16 +1364,76 @@ mod tests {
             .hybrid_search(&tok, "foo@bar", None, 10, None, None, &[], None)
             .await;
 
+        let hits = result.unwrap_or_else(|e| {
+            panic!("#916 hybrid_search must not fail on an '@'-bearing query, got: {e:?}")
+        });
         assert!(
-            result.is_err(),
-            "#569 hybrid_search must fail loud when the FTS leg errors on a residual \
-             FTS5 char ('@'), not silently degrade to vector-only fusion, got: {:?}",
-            result.ok()
+            !hits.is_empty(),
+            "#916 '@'-bearing query must still find the seeded 'foo@bar' content via the \
+             quoted-phrase alternative"
         );
-        assert!(
-            matches!(result.unwrap_err(), RuntimeError::InvalidInput(_)),
-            "residual FTS5 parser failure must surface as RuntimeError::InvalidInput"
-        );
+    }
+
+    /// #916 end-to-end regression, using the exact character classes from the
+    /// issue's live-log evidence (`#682 Stage 2`, `Min-K%Prob`, `B=128`):
+    /// `hybrid_search`'s FTS leg must not lose its lexical signal to a parser
+    /// syntax error on `#`, `%`, or `=`. Each query below must both succeed
+    /// and actually surface a `Text`/`Both`-sourced hit, proving the FTS leg
+    /// contributed, not just that the vector leg papered over a degraded
+    /// text leg.
+    #[tokio::test]
+    async fn hybrid_search_with_916_issue_characters_finds_text_leg_hits() {
+        let rt = KhiveRuntime::memory().unwrap();
+        let tok = NamespaceToken::local();
+
+        rt.create_entity(
+            &tok,
+            "concept",
+            None,
+            "issue tracker",
+            Some("tracking #682 Stage 2: MoE expert-cache prefetch work"),
+            None,
+            vec![],
+        )
+        .await
+        .unwrap();
+        rt.create_entity(
+            &tok,
+            "concept",
+            None,
+            "benchmark notes",
+            Some("chunkwise B=128 traffic arithmetic simdgroup_matrix DPLR"),
+            None,
+            vec![],
+        )
+        .await
+        .unwrap();
+        rt.create_entity(
+            &tok,
+            "concept",
+            None,
+            "sampling notes",
+            Some("evaluated with the Min-K%Prob membership inference method"),
+            None,
+            vec![],
+        )
+        .await
+        .unwrap();
+
+        for query in ["#682 Stage 2", "B=128", "Min-K%Prob"] {
+            let result = rt
+                .hybrid_search(&tok, query, None, 10, None, None, &[], None)
+                .await;
+            let hits = result.unwrap_or_else(|e| {
+                panic!("#916 hybrid_search must not fail on query {query:?}, got: {e:?}")
+            });
+            assert!(
+                hits.iter()
+                    .any(|h| matches!(h.source, SearchSource::Text | SearchSource::Both)),
+                "#916 query {query:?} must surface a Text/Both-sourced hit \
+                 (the FTS leg must contribute, not just the vector leg); got {hits:?}"
+            );
+        }
     }
 
     // ---- predicate pushdown before truncation ----

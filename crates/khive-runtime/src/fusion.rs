@@ -444,12 +444,13 @@ mod tests {
         );
     }
 
-    // 11. Unlike `$`, `@` is not stripped by sanitize_fts5_query (kept minimal by
-    // design), and SQLite FTS5's bareword parser rejects it unconditionally. That
-    // parser error must surface as RuntimeError::InvalidInput rather than silently
-    // degrading to vector-only fusion.
+    // 11. #916: `@` used to reach SQLite FTS5's bareword parser raw and error,
+    // surfacing as RuntimeError::InvalidInput per #569's fail-loud policy.
+    // sanitize_fts5_token_group's bareword-safety gate now routes it through the
+    // quoted-phrase alternative instead, so the query succeeds and the fail-loud
+    // arm is no longer reached for ordinary punctuation.
     #[tokio::test]
-    async fn hybrid_search_with_strategy_residual_fts5_char_fails_loud() {
+    async fn hybrid_search_with_strategy_residual_fts5_char_now_sanitized() {
         let rt = KhiveRuntime::memory().unwrap();
         let tok = NamespaceToken::local();
         rt.create_entity(
@@ -468,16 +469,15 @@ mod tests {
             .hybrid_search_with_strategy(&tok, "foo@bar", None, FusionStrategy::default(), 10)
             .await;
 
+        let hits = result.unwrap_or_else(|e| {
+            panic!(
+                "#916 hybrid_search_with_strategy must not fail on an '@'-bearing query, got: {e:?}"
+            )
+        });
         assert!(
-            result.is_err(),
-            "#569 hybrid_search_with_strategy must fail loud when the FTS leg errors \
-             on a residual FTS5 char ('@'), not silently degrade to vector-only fusion, \
-             got: {:?}",
-            result.ok()
-        );
-        assert!(
-            matches!(result.unwrap_err(), RuntimeError::InvalidInput(_)),
-            "residual FTS5 parser failure must surface as RuntimeError::InvalidInput"
+            !hits.is_empty(),
+            "#916 '@'-bearing query must still find the seeded 'foo@bar' content via the \
+             quoted-phrase alternative"
         );
     }
 }
