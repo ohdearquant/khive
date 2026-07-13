@@ -262,8 +262,10 @@ compacted to a relative or minute-truncated form; and `salience`/`decay_factor` 
 - **`kind="proposal"`** is a supported `list` kind but is not a full stored record: it returns a
   purpose-built projection, `{id, proposer, title, status, created_at, updated_at, expiry,
   last_decision, review_count, approve_count, reject_count}` (built in
-  `crates/khive-pack-kg/src/handlers/proposal.rs`), always in this shape regardless of
-  `presentation`.
+  `crates/khive-pack-kg/src/handlers/proposal.rs`). That field set is the
+  `presentation="verbose"` projection; the default Agent mode applies the same generic
+  reshaping as the other `list` rows — non-lifecycle null/empty fields are omitted (a null
+  `expiry`, an empty `last_decision`), ids are shortened, and timestamps are compacted.
 
 None of these match `search`'s `{id, entity_kind|note_kind, score, title, snippet}` rows or
 `neighbors`'s flat `{origin_id, id, edge_id, relation, weight, name?, kind?, entity_type?}`
