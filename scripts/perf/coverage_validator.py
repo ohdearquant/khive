@@ -8,14 +8,19 @@ the shape a checked-out `perf-data` branch's `bench-data/` directory would
 hold once PR 2+ start writing them) and reports, per manifest scenario,
 exactly one of five statuses:
 
-  measured        latest matching record is schema-valid (which now also
-                  requires non-empty distributions with at least one
-                  successful sample, error/timeout accounting fields, and
-                  `daemon_fallback_count == 0` - khive#945), `status: "ok"`,
-                  measured through the manifest's declared surface, its
-                  `fixture_hash` matches the manifest, it is within the
+  measured        latest matching record is schema-valid, `status: "ok"`
+                  (which now also requires - for `"ok"` records only,
+                  khive#945 M3 - non-empty distributions whose `successes`
+                  clear `max(flagship_schema.TIMED_MIN_SUCCESSES, scenario
+                  min_successes)` - raise-only, 100-success global floor,
+                  khive#945 amendment §2.1 - error/timeout accounting
+                  fields, and `daemon_fallback_count == 0`), measured
+                  through the manifest's declared surface, its
+                  `fixture_hash` matches the manifest, its `artifact.name`/
+                  `artifact.sha256` are well-formed, it is within the
                   scenario's freshness window, and (when `--artifacts-dir`
-                  is supplied) its raw artifact exists and sha256-matches.
+                  is supplied) its raw artifact resolves inside that
+                  directory and exists with a matching sha256.
   stale           a measured-quality record exists but its age exceeds the
                   freshness window for the scenario's `runner_class`
                   (OQ7 ruling: 14 days self-hosted, 7 days hosted).
@@ -24,11 +29,16 @@ exactly one of five statuses:
                   manifest's declared `surface` for this scenario.
   confounded      the latest record exists but cannot be trusted as a
                   measurement: its own `status` is `"confounded"`,
-                  `"error"`, or `"insufficient_samples"`, its
-                  `workload.fixture_hash` does not match the manifest's
-                  `fixture_hash`, it fails `flagship_schema.validate_record`,
-                  or (when `--artifacts-dir` is supplied) its raw artifact
-                  is missing or sha256-mismatched.
+                  `"error"`, or `"insufficient_samples"` (a legitimately
+                  schema-valid state - non-`"ok"` records are exempt from
+                  the evidence requirements above precisely so honest
+                  failure evidence stays schema-valid without ever
+                  counting as measured), its `workload.fixture_hash` does
+                  not match the manifest's `fixture_hash`, it fails
+                  `flagship_schema.validate_record`, its `successes` fall
+                  below a scenario-declared `min_successes` raise, or its
+                  raw artifact is absent/invalid, escapes `--artifacts-dir`,
+                  is missing, or sha256-mismatches.
 
 Each scenario's report entry also carries `artifact_verification`, one of
 `"verified"`, `"hash_mismatch"`, `"missing"`, `"unverified"`, or `None`
@@ -36,7 +46,11 @@ Each scenario's report entry also carries `artifact_verification`, one of
 `"unverified"` means the raw artifact path was not locally resolvable in
 this run (no `--artifacts-dir` given, e.g. a CI run that only fetched the
 `*.jsonl` summaries) - it is recorded explicitly rather than silently
-passing as verified (khive#945 item 4).
+passing as verified (khive#945 item 4). An absent/malformed `artifact.name`
+or `artifact.sha256`, or a `name` that resolves outside `--artifacts-dir`
+(`../` traversal or an absolute path), is reported `"missing"` instead -
+never `"unverified"` - and downgrades the scenario straight to confounded
+(khive#945 M1/M2).
 
 No manifest scenario is ever reported "measured" when the records
 directory is absent or empty - the coverage percentage is 0% in that case,
@@ -268,28 +282,55 @@ def verify_artifact(record: dict, artifacts_dir: pathlib.Path | None) -> tuple[s
     summary `*.jsonl` ledger records). When `artifacts_dir` is None the raw
     artifact path is not resolvable in this run (the common CI shape, where
     only the jsonl summaries are fetched) - that is recorded as
-    `"unverified"`, not silently treated as passing, per khive#945 item 4."""
-    if artifacts_dir is None:
-        return "unverified", "no --artifacts-dir supplied; raw artifact existence/hash was not checked locally"
+    `"unverified"`, not silently treated as passing, per khive#945 item 4.
 
+    `artifact.name`/`artifact.sha256` are checked for well-formedness
+    (non-empty name, 64-lowercase-hex sha256) before that `"unverified"`
+    fallback is ever reached (khive#945 M1) - an absent or invalid digest
+    downgrades straight to `"missing"` (which `compute_coverage` treats as
+    confounding) even when no `--artifacts-dir` was supplied.
+
+    The candidate path is resolved and required to remain below the
+    resolved `artifacts_dir` (khive#945 M2) - a `name` containing `../`
+    segments or naming an absolute path that escapes `artifacts_dir` is
+    treated as `"missing"` rather than read, so a record can never certify
+    an unrelated file outside the supplied directory as its evidence."""
     artifact = record.get("artifact", {})
     name = artifact.get("name") if isinstance(artifact, dict) else None
     expected_sha = artifact.get("sha256") if isinstance(artifact, dict) else None
-    if not name:
-        return "missing", "record's artifact.name is empty; no raw artifact path to resolve"
 
-    path = artifacts_dir / name
-    if not path.is_file():
-        return "missing", f"referenced raw artifact not found at {path}"
+    if not isinstance(name, str) or not name:
+        return "missing", "record's artifact.name is empty or invalid; no raw artifact path to resolve"
+    if not isinstance(expected_sha, str) or not flagship_schema.ARTIFACT_SHA256_RE.match(expected_sha):
+        return (
+            "missing",
+            f"record's artifact.sha256 {expected_sha!r} is not a valid 64-character lowercase hex digest",
+        )
 
-    actual_sha = hashlib.sha256(path.read_bytes()).hexdigest()
+    if artifacts_dir is None:
+        return "unverified", "no --artifacts-dir supplied; raw artifact existence/hash was not checked locally"
+
+    resolved_dir = artifacts_dir.resolve()
+    candidate = (artifacts_dir / name).resolve()
+    try:
+        candidate.relative_to(resolved_dir)
+    except ValueError:
+        return (
+            "missing",
+            f"record's artifact.name {name!r} resolves to {candidate}, outside --artifacts-dir {resolved_dir}; refusing to read",
+        )
+
+    if not candidate.is_file():
+        return "missing", f"referenced raw artifact not found at {candidate}"
+
+    actual_sha = hashlib.sha256(candidate.read_bytes()).hexdigest()
     if actual_sha != expected_sha:
         return (
             "hash_mismatch",
-            f"raw artifact at {path} hashes to {actual_sha!r}, record declares artifact.sha256 {expected_sha!r}",
+            f"raw artifact at {candidate} hashes to {actual_sha!r}, record declares artifact.sha256 {expected_sha!r}",
         )
 
-    return "verified", f"raw artifact verified at {path}"
+    return "verified", f"raw artifact verified at {candidate}"
 
 
 def _cohort_mismatches(scenario: dict, record: dict) -> list[str]:
@@ -393,6 +434,19 @@ def scenario_status(
     cohort_mismatches = _cohort_mismatches(scenario, latest)
     if cohort_mismatches:
         return "confounded", "; ".join(cohort_mismatches)
+
+    declared_min_successes = scenario.get("min_successes")
+    if declared_min_successes is not None:
+        required_successes = max(flagship_schema.TIMED_MIN_SUCCESSES, declared_min_successes)
+        for dist_name, dist in latest.get("distributions", {}).items():
+            successes = dist.get("successes") if isinstance(dist, dict) else None
+            if isinstance(successes, int) and successes < required_successes:
+                return (
+                    "confounded",
+                    f"distributions.{dist_name}.successes {successes} is below the scenario's required minimum "
+                    f"{required_successes} (max of the {flagship_schema.TIMED_MIN_SUCCESSES}-success floor and the "
+                    f"scenario's declared min_successes {declared_min_successes!r} - raise-only, never lowers the floor)",
+                )
 
     try:
         record_time = _parse_timestamp(latest["timestamp"])

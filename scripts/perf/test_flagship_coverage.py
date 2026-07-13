@@ -400,6 +400,58 @@ class SchemaValidationTests(unittest.TestCase):
         errors = flagship_schema.validate_distribution(dist)
         self.assertTrue(any("p50_us <= p95_us <= p99_us" in e for e in errors), errors)
 
+    def test_artifact_sha256_none_is_rejected(self):
+        """khive#945 M1: an absent digest value must not schema-validate."""
+        record = _base_record(artifact={"name": "report.json", "sha256": None})
+        errors = flagship_schema.validate_record(record)
+        self.assertTrue(any("artifact.sha256" in e for e in errors), errors)
+
+    def test_artifact_sha256_absent_key_is_rejected(self):
+        record = _base_record(artifact={"name": "report.json"})
+        errors = flagship_schema.validate_record(record)
+        self.assertTrue(any("sha256" in e for e in errors), errors)
+
+    def test_artifact_name_empty_is_rejected(self):
+        record = _base_record(artifact={"name": "", "sha256": "b" * 64})
+        errors = flagship_schema.validate_record(record)
+        self.assertTrue(any("artifact.name" in e for e in errors), errors)
+
+    def test_artifact_sha256_wrong_length_is_rejected(self):
+        record = _base_record(artifact={"name": "report.json", "sha256": "b" * 63})
+        errors = flagship_schema.validate_record(record)
+        self.assertTrue(any("artifact.sha256" in e for e in errors), errors)
+
+    def test_artifact_sha256_uppercase_is_rejected(self):
+        record = _base_record(artifact={"name": "report.json", "sha256": "B" * 64})
+        errors = flagship_schema.validate_record(record)
+        self.assertTrue(any("artifact.sha256" in e for e in errors), errors)
+
+    def test_error_status_record_with_empty_distributions_is_schema_valid(self):
+        """khive#945 M3: an honest status='error' row with zero samples and a
+        positive daemon_fallback_count must remain schema-valid - the
+        measurement-evidence requirements are conditional on status=='ok'."""
+        record = _base_record(status="error", distributions={})
+        record["runtime"]["daemon_fallback_count"] = 3
+        errors = flagship_schema.validate_record(record)
+        self.assertEqual(errors, [])
+
+    def test_ok_status_record_with_successes_99_is_rejected(self):
+        """khive#945 item 4: the 100-success floor applies to status='ok'."""
+        record = _base_record()
+        dist = dict(record["distributions"]["latency"])
+        dist["successes"] = 99
+        record["distributions"] = {"latency": dist}
+        errors = flagship_schema.validate_record(record)
+        self.assertTrue(any("successes" in e and "100" in e for e in errors), errors)
+
+    def test_ok_status_record_with_successes_100_is_accepted(self):
+        record = _base_record()
+        dist = dict(record["distributions"]["latency"])
+        dist["successes"] = 100
+        record["distributions"] = {"latency": dist}
+        errors = flagship_schema.validate_record(record)
+        self.assertEqual(errors, [])
+
     def test_distribution_attempts_bound_is_checked(self):
         dist = {
             "estimator": "nearest_rank_v1",
@@ -727,6 +779,67 @@ class CoverageStatusTests(unittest.TestCase):
         status, reason = coverage_validator.scenario_status(scenario, [record], self.NOW)
         self.assertEqual(status, "confounded")
 
+    def test_error_status_record_is_confounded_not_measured(self):
+        """khive#945 M3: a structurally valid status='error' record with
+        empty distributions and fallback evidence passes schema validation
+        (see SchemaValidationTests) but must never be reported measured -
+        coverage_validator confounds it via its own non-'ok' status."""
+        scenario = _base_scenario()
+        record = _base_record(status="error", distributions={}, timestamp="2026-07-10T00:00:00+00:00")
+        record["runtime"]["daemon_fallback_count"] = 3
+        self.assertEqual(flagship_schema.validate_record(record), [])
+        status, reason = coverage_validator.scenario_status(scenario, [record], self.NOW)
+        self.assertEqual(status, "confounded")
+        self.assertIn("error", reason)
+
+    def test_scenario_min_successes_floor_wins_over_lower_declared_minimum(self):
+        """khive#945 item 4: a scenario cannot lower the 100-success floor -
+        declaring min_successes=1 still fails a 99-success record."""
+        scenario = _base_scenario(min_successes=1)
+        record = _base_record(timestamp="2026-07-10T00:00:00+00:00")
+        dist = dict(record["distributions"]["latency"])
+        dist["successes"] = 99
+        record["distributions"] = {"latency": dist}
+        status, _ = coverage_validator.scenario_status(scenario, [record], self.NOW)
+        self.assertEqual(status, "confounded")
+
+    def test_scenario_min_successes_raises_required_minimum(self):
+        """khive#945 item 4: a scenario declaring a minimum above the floor
+        raises the bar - a 400-success record fails a 500-declared minimum."""
+        scenario = _base_scenario(min_successes=500)
+        record = _base_record(timestamp="2026-07-10T00:00:00+00:00")
+        dist = dict(record["distributions"]["latency"])
+        dist["successes"] = 400
+        record["distributions"] = {"latency": dist}
+        status, reason = coverage_validator.scenario_status(scenario, [record], self.NOW)
+        self.assertEqual(status, "confounded")
+        self.assertIn("min_successes", reason)
+
+    def test_scenario_min_successes_above_floor_passes_when_met(self):
+        scenario = _base_scenario(min_successes=500)
+        record = _base_record(timestamp="2026-07-10T00:00:00+00:00")
+        dist = dict(record["distributions"]["latency"])
+        dist["successes"] = 500
+        record["distributions"] = {"latency": dist}
+        status, _ = coverage_validator.scenario_status(scenario, [record], self.NOW)
+        self.assertEqual(status, "measured")
+
+    def test_artifact_sha256_none_is_confounded_not_measured_or_unverified(self):
+        """khive#945 M1: an absent digest downgrades to confounded even when
+        no --artifacts-dir is supplied (never measured/unverified)."""
+        scenario = _base_scenario()
+        record = _base_record(
+            timestamp="2026-07-10T00:00:00+00:00", artifact={"name": "report.json", "sha256": None}
+        )
+        status, _ = coverage_validator.scenario_status(scenario, [record], self.NOW)
+        self.assertEqual(status, "confounded")
+
+    def test_artifact_sha256_absent_key_is_confounded_not_measured_or_unverified(self):
+        scenario = _base_scenario()
+        record = _base_record(timestamp="2026-07-10T00:00:00+00:00", artifact={"name": "report.json"})
+        status, _ = coverage_validator.scenario_status(scenario, [record], self.NOW)
+        self.assertEqual(status, "confounded")
+
     def test_latest_record_wins_when_multiple_exist(self):
         scenario = _base_scenario()
         older = _base_record(timestamp="2026-05-01T00:00:00+00:00")  # well outside 14d -> would be stale
@@ -800,6 +913,45 @@ class ArtifactVerificationTests(unittest.TestCase):
             report = coverage_validator.compute_coverage(manifest, [record], self.NOW, artifacts_dir=tmp_path)
             self.assertEqual(report["counts"]["confounded"], 1)
             self.assertEqual(report["scenarios"][0]["artifact_verification"], "hash_mismatch")
+
+    def test_verify_artifact_rejects_none_sha256_even_without_artifacts_dir(self):
+        """khive#945 M1: verify_artifact itself must check name/sha256
+        validity before ever falling through to the 'unverified' state."""
+        record = _base_record(artifact={"name": "report.json", "sha256": None})
+        verification, reason = coverage_validator.verify_artifact(record, None)
+        self.assertEqual(verification, "missing")
+        self.assertIn("sha256", reason)
+
+    def test_verify_artifact_rejects_absent_sha256_even_without_artifacts_dir(self):
+        record = _base_record(artifact={"name": "report.json"})
+        verification, reason = coverage_validator.verify_artifact(record, None)
+        self.assertEqual(verification, "missing")
+        self.assertIn("sha256", reason)
+
+    def test_relative_traversal_name_is_missing_not_verified(self):
+        """khive#945 M2: a '../' name must not resolve outside artifacts_dir."""
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = pathlib.Path(tmp)
+            artifacts_dir = tmp_path / "artifacts"
+            artifacts_dir.mkdir()
+            sha = self._write_artifact(tmp_path, "outside.json", b"unrelated sibling file")
+            record = _base_record(artifact={"name": "../outside.json", "sha256": sha})
+            verification, reason = coverage_validator.verify_artifact(record, artifacts_dir)
+            self.assertEqual(verification, "missing")
+            self.assertIn("outside", reason)
+
+    def test_absolute_name_is_missing_not_verified(self):
+        """khive#945 M2: an absolute name escaping artifacts_dir must not verify."""
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = pathlib.Path(tmp)
+            artifacts_dir = tmp_path / "artifacts"
+            artifacts_dir.mkdir()
+            sha = self._write_artifact(tmp_path, "outside.json", b"unrelated sibling file")
+            absolute_name = str((tmp_path / "outside.json").resolve())
+            record = _base_record(artifact={"name": absolute_name, "sha256": sha})
+            verification, reason = coverage_validator.verify_artifact(record, artifacts_dir)
+            self.assertEqual(verification, "missing")
+            self.assertIn("outside", reason)
 
     def test_compute_coverage_reports_unverified_without_artifacts_dir(self):
         scenario = _base_scenario()

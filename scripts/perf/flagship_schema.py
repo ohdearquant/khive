@@ -9,6 +9,20 @@ and IDE validation). This module is the one `scripts/perf/coverage_validator.py`
 actually imports - no `jsonschema` dependency, matching the stdlib-only
 convention of `bench_track.py` and `bench_calibrate.py`.
 
+Measurement-evidence requirements (non-empty `distributions`, the
+`successes` floor, and `runtime.daemon_fallback_count == 0`) apply only to
+`status == "ok"` records (khive#945 M3): an `"error"` / `"confounded"` /
+`"insufficient_samples"` record is honest failure evidence, not a
+certification of measurement, so it must remain schema-valid with zero
+samples and a positive fallback count. `coverage_validator.scenario_status`
+already refuses to count any non-`"ok"` status as `"measured"` - this module
+does not need to duplicate that rule to keep coverage correct.
+
+`artifact.name`/`artifact.sha256` are validated for every record regardless
+of status (a digest reference, when present, must be well-formed) and are
+kept aligned with `schemas/flagship-result-v3.json`'s `artifactRef` def:
+`name` a non-empty string, `sha256` a 64-character lowercase hex string.
+
 `SCHEMA_VERSION = 3` here because the Ledger record contract fixes
 `FlagshipRecord.schema_version` at 3 - the same schema_version track that
 `bench_track.py`'s ledger will carry for flagship-e2e records once PR 2
@@ -38,11 +52,15 @@ RUNNER_CLASSES = ("hosted_hash", "self_hosted_cpu", "self_hosted_real_embedder")
 RECORD_STATUSES = ("ok", "error", "confounded", "insufficient_samples")
 ESTIMATOR = "nearest_rank_v1"
 DISTRIBUTION_UNIT = "us"
-# A distribution with zero successful samples carries no latency evidence -
-# it cannot be the basis of a "measured" coverage verdict (khive#945).
-MIN_SUCCESSFUL_SAMPLES = 1
+# Global floor for status="ok" records: nearest-rank p99 needs n>=100 to
+# land on a real observation rather than interpolate/repeat a low-n sample
+# (khive#945 amendment, Leo signed §2.1). A scenario may declare a HIGHER
+# minimum (raise-only, enforced in coverage_validator.py against the
+# manifest); a declared minimum below this floor never lowers it.
+TIMED_MIN_SUCCESSES = 100
 
 SHA256_REF_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
+ARTIFACT_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 
 # These two tuples mirror the JSON Schema exactly: for the record top level
 # and for `distribution`, the schema's `properties` set equals its
@@ -115,15 +133,31 @@ def _check_closed_object(obj: dict, allowed: tuple, path: str, errors: list[str]
         errors.append(_err(path, f"unexpected field(s) not allowed: {', '.join(extra)}"))
 
 
-def validate_distribution(dist: dict, path: str = "distribution") -> list[str]:
+def validate_distribution(dist: dict, path: str = "distribution", require_evidence: bool = True) -> list[str]:
     """Validate one Distribution contract instance. Returns a list of human
     -readable error strings; an empty list means the distribution is valid.
+
+    `require_evidence` gates the error/timeout-accounting field requirement
+    (`errors_by_code`, `timed_out`) - `validate_record` passes `False` for
+    non-`"ok"` records (khive#945 M3), since an honest error/confounded
+    record need not carry full measurement accounting. The `successes`
+    floor is enforced by `validate_record` itself (khive#945 item 4), not
+    here, since it also needs the manifest-declared raise-only minimum that
+    only `coverage_validator.py` has access to.
     """
     errors: list[str] = []
     if not isinstance(dist, dict):
         return [_err(path, f"expected object, got {type(dist).__name__}")]
 
-    _check_closed_object(dist, DISTRIBUTION_FIELDS, path, errors)
+    required_fields = DISTRIBUTION_FIELDS if require_evidence else tuple(
+        f for f in DISTRIBUTION_FIELDS if f not in ("errors_by_code", "timed_out")
+    )
+    missing = [f for f in required_fields if f not in dist]
+    if missing:
+        errors.append(_err(path, f"missing required field(s): {', '.join(missing)}"))
+    extra = sorted(set(dist) - set(DISTRIBUTION_FIELDS))
+    if extra:
+        errors.append(_err(path, f"unexpected field(s) not allowed: {', '.join(extra)}"))
 
     if dist.get("estimator") != ESTIMATOR:
         errors.append(_err(path, f"estimator must be {ESTIMATOR!r}, got {dist.get('estimator')!r}"))
@@ -136,17 +170,8 @@ def validate_distribution(dist: dict, path: str = "distribution") -> list[str]:
     successes = dist.get("successes")
     timed_out = dist.get("timed_out")
     for name, value in (("attempts", attempts), ("successes", successes), ("timed_out", timed_out)):
-        if not _is_nonneg_int(value):
+        if name in dist and not _is_nonneg_int(value):
             errors.append(_err(path, f"{name} must be a non-negative integer, got {value!r}"))
-
-    if _is_nonneg_int(successes) and successes < MIN_SUCCESSFUL_SAMPLES:
-        errors.append(
-            _err(
-                path,
-                f"successes must be >= {MIN_SUCCESSFUL_SAMPLES} - a distribution with zero "
-                "successful samples carries no measurement evidence",
-            )
-        )
 
     errors_by_code = dist.get("errors_by_code")
     errors_by_code_valid = isinstance(errors_by_code, dict)
@@ -258,20 +283,32 @@ def validate_record(record: dict) -> list[str]:
     if not isinstance(metrics, dict):
         errors.append(_err("metrics", "must be an object"))
 
+    is_ok = record.get("status") == "ok"
+
     distributions = record.get("distributions")
     if not isinstance(distributions, dict):
         errors.append(_err("distributions", "must be an object"))
-    elif not distributions:
+    elif is_ok and not distributions:
         errors.append(
             _err(
                 "distributions",
-                "must contain at least one distribution - an empty distributions object "
-                "carries no measurement evidence and cannot certify a scenario as measured",
+                "must contain at least one distribution when status is 'ok' - an empty distributions "
+                "object carries no measurement evidence and cannot certify a scenario as measured",
             )
         )
     else:
         for name, dist in distributions.items():
-            errors.extend(validate_distribution(dist, path=f"distributions.{name}"))
+            errors.extend(validate_distribution(dist, path=f"distributions.{name}", require_evidence=is_ok))
+            if is_ok and isinstance(dist, dict):
+                successes = dist.get("successes")
+                if _is_nonneg_int(successes) and successes < TIMED_MIN_SUCCESSES:
+                    errors.append(
+                        _err(
+                            f"distributions.{name}.successes",
+                            f"must be >= {TIMED_MIN_SUCCESSES} for status='ok' records - nearest-rank p99 "
+                            "requires n>=100 to land on a real observation",
+                        )
+                    )
 
     workload = record.get("workload")
     if not isinstance(workload, dict):
@@ -321,11 +358,11 @@ def validate_record(record: dict) -> list[str]:
                     f"must be a non-negative integer, got {runtime['daemon_fallback_count']!r}",
                 )
             )
-        elif runtime["daemon_fallback_count"] > 0:
+        elif is_ok and runtime["daemon_fallback_count"] > 0:
             errors.append(
                 _err(
                     "runtime.daemon_fallback_count",
-                    f"must be 0 to count as measured, got {runtime['daemon_fallback_count']!r} - fallback-engaged "
+                    f"must be 0 for status='ok' records, got {runtime['daemon_fallback_count']!r} - fallback-engaged "
                     "runs cannot be certified as measured until a positive daemon-engagement proof exists",
                 )
             )
@@ -370,5 +407,16 @@ def validate_record(record: dict) -> list[str]:
         errors.append(_err("artifact", "must be an object"))
     else:
         _check_closed_object(artifact, ARTIFACT_FIELDS, "artifact", errors)
+        name = artifact.get("name")
+        if not isinstance(name, str) or not name:
+            errors.append(_err("artifact.name", f"must be a non-empty string, got {name!r}"))
+        artifact_sha256 = artifact.get("sha256")
+        if not isinstance(artifact_sha256, str) or not ARTIFACT_SHA256_RE.match(artifact_sha256):
+            errors.append(
+                _err(
+                    "artifact.sha256",
+                    f"must be a 64-character lowercase hex string, got {artifact_sha256!r}",
+                )
+            )
 
     return errors
