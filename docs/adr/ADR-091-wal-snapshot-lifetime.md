@@ -304,6 +304,20 @@ transaction regardless of which mechanism created it:
   the original "hard cap" language overclaimed).** Once a registry entry's
   `opened_at.elapsed()` exceeds `KHIVE_TX_MAX_AGE_SECS` (default **120s**; provisional, see
   Plank 0):
+  - **SUPERSEDED (see the 2026-07-12 amendment at the end of this ADR) — historical design
+    intent, not shipped behavior.** The three sub-bullets immediately below (per-statement
+    reject, `commit()`-past-cap rollback, and their raw-`SqlWriter` mirror) targeted
+    `SqliteTransaction`/`begin_tx`, an API this codebase no longer has: ADR-067's
+    `atomic_unit` closure replaced every production write-transaction path with a span that
+    structurally cannot outlive its own call, which is exactly the "closure-scoped
+    transaction API" follow-up named two paragraphs below — already delivered, for writes,
+    by a later ADR. What actually shipped is the fourth sub-bullet only (the background
+    registry sweep), generalized to run independently of `run_checkpoint_task`'s
+    Observed/Skipped WAL-checkpoint outcome and to cover every registered span, not only
+    `SqliteTransaction`/raw-`SqlWriter` sites. No reject-on-statement or rollback-on-commit
+    mechanism exists anywhere in the shipped code; a stale span is surfaced, never
+    force-closed. Kept verbatim below for the historical record of what this ADR originally
+    specified.
   - For `SqliteTransaction`: subsequent `execute`/`query_row`/`query_all` calls on that
     transaction return an error instead of running the statement, forcing the caller's own
     error-handling path to abort and drop the transaction. This is a **guard against a
@@ -323,15 +337,17 @@ transaction regardless of which mechanism created it:
       has already been flagged as stale. This closes the previously unspecified
       "`commit()` after the cap" gap: legitimate long-running batches that hit this will
       have their work rolled back and must retry in smaller chunks (see Failure modes).
-    - **Background registry sweep (Plank 0's checkpoint tick, extended):** on each
-      `run_checkpoint_task` tick, any registry entry whose `opened_at.elapsed()` exceeds
-      `KHIVE_TX_MAX_AGE_SECS` is logged at `tracing::warn!` (escalating in severity the
-      longer it persists) even if the owning caller never issues another statement or
-      calls `commit()`. This does **not** force-close the connection (that would require
-      unsafe cross-thread manipulation of a connection another task owns); it makes a
-      stuck transaction visible to an operator via the checkpoint tick's existing log
-      line, the same visibility-over-guaranteed-reclamation posture Plank 2 takes for
-      sustained TRUNCATE failure (see the severity ladder amendment below).
+    - **Background registry sweep (Plank 0's checkpoint tick, extended) — this sub-bullet is
+      the part that shipped, generalized (2026-07-12) to run on every tick regardless of
+      Observed/Skipped:** any registry entry whose `opened_at.elapsed()` exceeds
+      `KHIVE_TX_MAX_AGE_SECS` is logged (`tracing::warn!` past `KHIVE_TX_WARN_SECS`,
+      `tracing::error!` past `KHIVE_TX_MAX_AGE_SECS` — escalating in severity the longer it
+      persists) even if the owning caller never issues another statement or calls
+      `commit()`. This does **not** force-close the connection (that would require unsafe
+      cross-thread manipulation of a connection another task owns); it makes a stuck
+      transaction visible to an operator via the checkpoint tick's existing log line, the
+      same visibility-over-guaranteed-reclamation posture Plank 2 takes for sustained
+      TRUNCATE failure (see the severity ladder amendment below).
   - For raw `SqlWriter` sites, the same `commit()`-past-cap and background-sweep behavior
     apply at the registry level; each site's existing commit call is wrapped to check the
     registry entry's age before issuing `COMMIT` and to `ROLLBACK` instead past the cap,
@@ -457,16 +473,16 @@ expressed in the former, page-count, unit.
 
 ### Config summary
 
-| Key                                    | Default | Plank | Purpose                                                                                       | Status                                          |
-| -------------------------------------- | ------- | ----- | --------------------------------------------------------------------------------------------- | ----------------------------------------------- |
-| `KHIVE_TX_WARN_SECS`                   | 30      | 1     | Soft-cap WARN on a registry entry's age (`begin_tx` or raw `SqlWriter` transaction)           | Implemented, adapted — see 2026-07-12 amendment |
-| `KHIVE_TX_MAX_AGE_SECS`                | 120     | 1     | Cooperative stale-op guard: reject further statements / roll back on `commit()` past this age | Implemented, adapted — see 2026-07-12 amendment |
-| `KHIVE_READER_MAX_AGE_SECS`            | 300     | 1     | Recycle a pooled reader connection past this age on return (in-memory/test pool only)         | Carried over, scope narrowed                    |
-| `KHIVE_READER_MAX_OPS`                 | 5000    | 1     | Recycle a pooled reader connection past this op count on return (in-memory/test pool only)    | Carried over, scope narrowed                    |
-| `KHIVE_READER_CHECKOUT_WARN_SECS`      | 10      | 1     | WARN when the oldest outstanding pooled checkout exceeds this age (in-memory/test pool only)  | Carried over, scope narrowed                    |
-| `KHIVE_WAL_TRUNCATE_HIGH_WATER_PAGES`  | 20000   | 2     | WAL page count that arms a TRUNCATE attempt                                                   | Carried over                                    |
-| `KHIVE_WAL_TRUNCATE_MIN_INTERVAL_SECS` | 300     | 2     | Minimum spacing between successful TRUNCATE attempts                                          | Carried over                                    |
-| `KHIVE_WAL_TRUNCATE_BUSY_MS`           | 2000    | 2     | Temporary busy_timeout override during a TRUNCATE attempt                                     | Carried over                                    |
+| Key                                    | Default | Plank | Purpose                                                                                                                                                                        | Status                                          |
+| -------------------------------------- | ------- | ----- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ----------------------------------------------- |
+| `KHIVE_TX_WARN_SECS`                   | 30      | 1     | Background sweep: `tracing::warn!` once the shared registry's oldest entry's age exceeds this cap (any `khive_storage::tx_registry`-registered span, logging only)             | Implemented, adapted — see 2026-07-12 amendment |
+| `KHIVE_TX_MAX_AGE_SECS`                | 120     | 1     | Background sweep: `tracing::error!` once the same entry's age exceeds this cap (logging only — no per-statement reject or `commit()` rollback ships; see 2026-07-12 amendment) | Implemented, adapted — see 2026-07-12 amendment |
+| `KHIVE_READER_MAX_AGE_SECS`            | 300     | 1     | Recycle a pooled reader connection past this age on return (in-memory/test pool only)                                                                                          | Carried over, scope narrowed                    |
+| `KHIVE_READER_MAX_OPS`                 | 5000    | 1     | Recycle a pooled reader connection past this op count on return (in-memory/test pool only)                                                                                     | Carried over, scope narrowed                    |
+| `KHIVE_READER_CHECKOUT_WARN_SECS`      | 10      | 1     | WARN when the oldest outstanding pooled checkout exceeds this age (in-memory/test pool only)                                                                                   | Carried over, scope narrowed                    |
+| `KHIVE_WAL_TRUNCATE_HIGH_WATER_PAGES`  | 20000   | 2     | WAL page count that arms a TRUNCATE attempt                                                                                                                                    | Carried over                                    |
+| `KHIVE_WAL_TRUNCATE_MIN_INTERVAL_SECS` | 300     | 2     | Minimum spacing between successful TRUNCATE attempts                                                                                                                           | Carried over                                    |
+| `KHIVE_WAL_TRUNCATE_BUSY_MS`           | 2000    | 2     | Temporary busy_timeout override during a TRUNCATE attempt                                                                                                                      | Carried over                                    |
 
 Existing, unchanged: `KHIVE_CHECKPOINT_INTERVAL_MS` (500), `KHIVE_WAL_WARN_PAGES` (2000),
 `KHIVE_WAL_HIGH_WATER_PAGES` (6000), `KHIVE_JOURNAL_SIZE_LIMIT_BYTES` (64MiB),
@@ -502,6 +518,14 @@ Existing, unchanged: `KHIVE_CHECKPOINT_INTERVAL_MS` (500), `KHIVE_WAL_WARN_PAGES
 
 ## Failure modes
 
+- **SUPERSEDED — historical, not a real failure mode of the shipped code (see the
+  2026-07-12 amendment).** The following two bullets described failure modes of the
+  per-statement reject / `commit()`-rollback enforcement Plank 1 originally specified
+  against `SqliteTransaction`/`begin_tx`. That API and that enforcement do not exist in
+  the shipped code; kept for the historical record, not as a description of current
+  behavior. The failure mode that actually applies to what shipped is the THIRD bullet
+  below ("no in-process mechanism can force-close a stale span"), which now covers every
+  registered span, not only an idle-between-statements one.
 - **Stale-op guard rejection / commit-time rollback during a legitimate long-running
   batch.** If a future caller (via `begin_tx` or a raw `SqlWriter` transaction)
   legitimately needs a transaction open longer than `KHIVE_TX_MAX_AGE_SECS` (120s
@@ -521,6 +545,18 @@ Existing, unchanged: `KHIVE_CHECKPOINT_INTERVAL_MS` (500), `KHIVE_WAL_WARN_PAGES
   first iteration, not a silent one: the closure-scoped transaction API follow-up (Plank 1)
   is the structural fix, deferred pending Plank 0 telemetry showing whether this actually
   occurs.
+- **No in-process mechanism force-closes any stale span (what actually shipped).** Every
+  span registered in `khive_storage::tx_registry` — not only an idle-between-statements
+  one, since no per-statement or per-commit check exists at all — gets a `warn!` past
+  `KHIVE_TX_WARN_SECS` and an `error!` past `KHIVE_TX_MAX_AGE_SECS` from the background
+  sweep (every `run_checkpoint_task` tick, Observed or Skipped) and nothing more: no
+  reject, no rollback, no kill. This is the accepted gap this ADR's first shipped
+  iteration lands on. ADR-067's `atomic_unit` already eliminates the "held past the
+  return of an async function" class of risk for every production write path, which is
+  most of what the deferred closure-scoped-API follow-up would have targeted; the
+  remaining un-bounded spans are `graph.rs`'s chunked-traversal read snapshot
+  (`graph_traverse_read`) and any future caller of a registry-registered span this ADR
+  did not anticipate.
 - **TRUNCATE contention**: bounded to `truncate_busy_timeout` (default 2s) per attempt,
   at most once per `truncate_min_interval` under normal conditions (see the flap/backoff
   note: a skipped attempt due to writer contention does not consume the interval).
@@ -542,15 +578,20 @@ Existing, unchanged: `KHIVE_CHECKPOINT_INTERVAL_MS` (500), `KHIVE_WAL_WARN_PAGES
 - The false premise from the original draft (idle pooled readers pin production WAL) is
   retracted; this ADR no longer claims a fix for a mechanism that does not exist in the
   production code path.
-- WAL growth now has a cooperative age guard covering every caller-controllable
-  transaction mechanism this review confirmed exists: `begin_tx`'s `SqliteTransaction`
-  **and** the raw `SqlWriter`-held transactions in `khive-pack-brain` (`fold_gate.rs`,
-  `persist.rs`), `sql_bridge.rs`'s own writer implementations, `curation.rs`'s
-  `merge_entity`, every store's batch-upsert method, and `khive-vcs`'s chunked sync
-  writes, all sharing one open-transaction registry. This guard rejects further
-  statements and rolls back a stale `commit()` past `KHIVE_TX_MAX_AGE_SECS`; it does not
-  (yet) force-close a transaction held idle across an await with no further calls, an
-  accepted gap tracked as a follow-up (see Failure modes).
+- WAL growth now has a visibility sweep (SUPERSEDED description below — see the
+  2026-07-12 amendment) covering every caller-controllable transaction mechanism this
+  review confirmed exists: `begin_tx`'s `SqliteTransaction` **and** the raw
+  `SqlWriter`-held transactions in `khive-pack-brain` (`fold_gate.rs`, `persist.rs`),
+  `sql_bridge.rs`'s own writer implementations, `curation.rs`'s `merge_entity`, every
+  store's batch-upsert method, and `khive-vcs`'s chunked sync writes, all sharing one
+  open-transaction registry (in practice, today, `atomic_unit`'s registered span for
+  every production write path). The shipped guard **escalates a stale span to
+  `tracing::warn!`/`error!` (background sweep, every checkpoint tick); it does not reject
+  statements, roll back a `commit()`, or force-close a connection held idle across an
+  await with no further calls** — visibility only, an accepted gap tracked as a
+  follow-up (see Failure modes). The originally-specified per-statement reject and
+  commit-time rollback against `SqliteTransaction`/`begin_tx` were never built against
+  that API before ADR-067's `atomic_unit` superseded it for writes.
 - Plank 0's instrumentation is the load-bearing deliverable of this ADR's first
   iteration: it converts "we don't know what's pinning the WAL" into a concrete,
   loggable answer the next time sustained WAL pressure occurs, which Plank 1's
@@ -563,11 +604,13 @@ Existing, unchanged: `KHIVE_CHECKPOINT_INTERVAL_MS` (500), `KHIVE_WAL_WARN_PAGES
   drain failure, and `truncate_high_water_pages` arming the TRUNCATE escalation is the
   ALARM tier. `high_water_pages` crossing remains a shipped intermediate log, not a ladder
   tier on its own.
-- Two new config knobs for the shared transaction-registry guard (Plank 1), covering both
-  `begin_tx` and raw `SqlWriter` transactions, three carried-over knobs narrowed in scope,
-  three for TRUNCATE escalation (Plank 2); the two new keys are explicitly marked
-  provisional pending one cycle of production telemetry rather than presented as tuned
-  defaults.
+- Two new config knobs for the shared transaction-registry sweep (Plank 1), covering
+  every `khive_storage::tx_registry`-registered span — `begin_tx`'s historical
+  `SqliteTransaction` target no longer exists; the real coverage today is `atomic_unit`'s
+  registered span for every production write path, plus `graph.rs`'s chunked-traversal
+  read snapshot — three carried-over knobs narrowed in scope, three for TRUNCATE
+  escalation (Plank 2); the two new keys are explicitly marked provisional pending one
+  cycle of production telemetry rather than presented as tuned defaults.
 - `SqlTxOptions`/`SqlStatement`'s existing `label: Option<String>` field
   (`khive-storage/src/types/sql.rs:66-69`) is reused for registry entries; no new field or
   schema change is introduced by this ADR.
@@ -599,16 +642,25 @@ Plank 1's stale-op guard was designed to catch.
 
 What shipped for this amendment (`crates/khive-db/src/checkpoint.rs`, `TxAgeSweepState`):
 `KHIVE_TX_WARN_SECS`/`KHIVE_TX_MAX_AGE_SECS` are implemented as **config knobs feeding a
-background sweep**, not a per-statement guard. On every observed checkpoint tick, independent
-of WAL page pressure, the sweep checks `khive_storage::tx_registry::oldest()`'s age against
-both thresholds and escalates to `tracing::warn!`/`tracing::error!` on each below→above
-crossing (edge-triggered, same debounce idiom as the WAL-pressure severity ladder — a sustained
-stale span logs once per rung, not once per tick). This is Plank 1's registry-driven half,
-applied uniformly to every registered span regardless of which mechanism created it, exactly as
-originally specified ("applied uniformly to every registered transaction regardless of which
-mechanism created it"). It is visibility, not reclamation: no per-statement rejection or
-commit-time rollback is implemented, because there is no live call site left that holds a
-caller-controlled handle across multiple statements for such a check to intercept.
+background sweep**, not a per-statement guard. On every checkpoint tick — including a tick
+where `checkpoint_once` observes `CheckpointTick::Skipped` because the writer mutex is busy,
+independent of WAL page pressure either way — the sweep checks
+`khive_storage::tx_registry::oldest()`'s age against both thresholds and escalates to
+`tracing::warn!`/`tracing::error!` on each below→above crossing (edge-triggered, same debounce
+idiom as the WAL-pressure severity ladder — a sustained stale span logs once per rung, not once
+per tick). Round-2 fix (2026-07-12, same day): the sweep originally ran only on an Observed
+tick, which meant a registered `WriterGuard::transaction` span — holding the writer mutex for
+its entire registered lifetime — made the checkpoint tick observe `Skipped` and silently
+bypassed the sweep for exactly the scenario it exists to catch. The sweep now runs
+unconditionally before that early-continue, and additionally tracks the oldest entry's identity
+(not just its age) so a stale span that is immediately replaced by an already-stale successor
+re-arms and re-emits for the new span rather than staying latched to the departed one. This is
+Plank 1's registry-driven half, applied uniformly to every registered span regardless of which
+mechanism created it, exactly as originally specified ("applied uniformly to every registered
+transaction regardless of which mechanism created it"). It is visibility, not reclamation: no
+per-statement rejection or commit-time rollback is implemented, because there is no live call
+site left that holds a caller-controlled handle across multiple statements for such a check to
+intercept.
 
 This does **not** by itself explain or fix #580's specific 2026-07-12 recurrence. The one
 remaining candidate this review turned up that fits "long-lived reader holding a chunked span

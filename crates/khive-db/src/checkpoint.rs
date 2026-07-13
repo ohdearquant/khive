@@ -34,7 +34,9 @@
 //! high-water snapshot enumeration) ride the SAME crossing gates — they are
 //! not independently rate-limited, so they never repeat on consecutive ticks
 //! that remain above a threshold. Only the per-tick `debug!` trace of the
-//! oldest open entry fires unconditionally.
+//! oldest open entry, and the ADR-091 Plank 1 age sweep below, run
+//! unconditionally on every tick — including a Skipped one; the sweep's own
+//! emissions stay edge-triggered per rung via `TxAgeSweepState`.
 //!
 //! ADR-091 Plank 2: rare TRUNCATE escalation. The periodic tick above stays
 //! PASSIVE-only and non-blocking; on top of it, `checkpoint_once` also
@@ -67,14 +69,19 @@
 //! is the ADR's own named follow-up ("closure-scoped transaction API"),
 //! already delivered for writes by a later ADR. What ships here instead is
 //! the part of Plank 1 that still applies to every registered span
-//! regardless of which mechanism created it: on each observed tick,
-//! `TxAgeSweepState` checks `khive_storage::tx_registry::oldest()`'s age
-//! against `tx_warn_secs`/`tx_max_age_secs` and escalates to `warn!`/`error!`
-//! on each below→above crossing (same debounce idiom as the WAL-pressure
-//! ladder — a sustained stale span logs once per rung, not once per tick).
-//! This is visibility, not reclamation: nothing here force-closes a stale
-//! span, matching the ADR's own accepted gap for a transaction "held idle
-//! across an await with no further calls."
+//! regardless of which mechanism created it: on EVERY tick — Skipped as well
+//! as Observed, since a registered `WriterGuard::transaction` span holds the
+//! writer mutex for its whole lifetime and would otherwise make the busiest,
+//! most relevant tick invisible to this sweep — `TxAgeSweepState` checks
+//! `khive_storage::tx_registry::oldest()`'s age against
+//! `tx_warn_secs`/`tx_max_age_secs` and escalates to `warn!`/`error!` on each
+//! below→above crossing (same debounce idiom as the WAL-pressure ladder — a
+//! sustained stale span logs once per rung, not once per tick), also
+//! re-arming both rungs if the oldest entry's identity changes between ticks
+//! so a departed span's latched state cannot suppress its replacement. This
+//! is visibility, not reclamation: nothing here force-closes a stale span,
+//! matching the ADR's own accepted gap for a transaction "held idle across
+//! an await with no further calls."
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -285,9 +292,10 @@ pub struct CheckpointConfig {
     /// shared open-transaction registry (`khive_storage::tx_registry`,
     /// covering every registered span regardless of which call site created
     /// it) is surfaced at `tracing::warn!` on the background sweep this
-    /// module runs every observed tick, independent of WAL page pressure —
-    /// a registered span can go stale while `wal_pages` sits well under
-    /// `warn_pages`.
+    /// module runs on EVERY tick — Skipped as well as Observed — independent
+    /// of WAL page pressure: a registered span can go stale while
+    /// `wal_pages` sits well under `warn_pages`, or while the writer is busy
+    /// and no WAL page count is sampled at all this tick.
     ///
     /// Overridable via `KHIVE_TX_WARN_SECS`.
     /// Default: 30 seconds.
@@ -404,6 +412,29 @@ impl CheckpointConfig {
                     cfg.tx_max_age_secs = Duration::from_secs(n);
                 }
             }
+        }
+
+        // The severity ladder assumes tx_warn_secs < tx_max_age_secs (Warn
+        // fires before Stale as an entry ages). A reversed or equal pair —
+        // whether from one misconfigured var or the interaction of both —
+        // would invert or collapse that ordering (e.g. WARN_SECS=120,
+        // MAX_AGE_SECS=30 emits Stale at 30s and never reaches the Warn
+        // crossing until 120s), so both are rejected together rather than
+        // silently honored. Resetting both to their defaults (rather than
+        // just clamping one) avoids guessing which of the two the operator
+        // actually meant to change.
+        if cfg.tx_warn_secs >= cfg.tx_max_age_secs {
+            let default = Self::default();
+            tracing::warn!(
+                configured_tx_warn_secs = cfg.tx_warn_secs.as_secs_f64(),
+                configured_tx_max_age_secs = cfg.tx_max_age_secs.as_secs_f64(),
+                fallback_tx_warn_secs = default.tx_warn_secs.as_secs_f64(),
+                fallback_tx_max_age_secs = default.tx_max_age_secs.as_secs_f64(),
+                "KHIVE_TX_WARN_SECS must be strictly less than KHIVE_TX_MAX_AGE_SECS; \
+                 both transaction-age thresholds were rejected and reset to their defaults"
+            );
+            cfg.tx_warn_secs = default.tx_warn_secs;
+            cfg.tx_max_age_secs = default.tx_max_age_secs;
         }
 
         cfg
@@ -578,34 +609,54 @@ pub struct TxAgeSweepState {
     /// Whether the previous observed tick's oldest entry was at/above
     /// `tx_max_age_secs`. Drives the below→above edge that fires `Stale`.
     was_above_max_age: bool,
+    /// Identity of the entry the previous observed tick reported as oldest,
+    /// or `None` if the registry was empty. Tracked separately from the two
+    /// latches above so a change in *which span* is oldest can be detected
+    /// even when both latches are already `true` (see [`Self::observe`]).
+    tracked_id: Option<khive_storage::tx_registry::TxId>,
 }
 
 impl TxAgeSweepState {
     /// Advance by one observed tick given the registry's current oldest
-    /// entry (or `None` if the registry is empty). Returns zero, one, or two
-    /// emissions: an entry can cross both rungs on the same tick if it was
-    /// already stale the first time this sweep observed it (e.g. right after
-    /// process start).
+    /// entry (identity, age, label), or `None` if the registry is empty.
+    /// Returns zero, one, or two emissions: an entry can cross both rungs on
+    /// the same tick if it was already stale the first time this sweep
+    /// observed it in that identity — e.g. right after process start, or
+    /// right after it became the new oldest entry by replacing a
+    /// since-closed span.
     ///
-    /// A below-threshold oldest entry (or no entry at all — the previously
-    /// stale span closed and either nothing or a fresher span is now
-    /// oldest) resets both latches, so a future stale span re-arms both
-    /// rungs. This is computed directly from the current oldest entry's own
-    /// age every tick, so no separate "did the registry change identity"
-    /// tracking is needed: a fresher oldest entry naturally reads as
-    /// below-threshold and clears the latch.
+    /// A below-threshold oldest entry (or no entry at all) resets both
+    /// latches, so a future stale span re-arms both rungs. Identity is also
+    /// tracked explicitly: if the oldest entry's [`TxId`](khive_storage::tx_registry::TxId)
+    /// differs from the previous tick's, both latches are force-reset before
+    /// re-evaluating the new entry's age, even though this happens on the
+    /// SAME tick as the age check (not a separate below-threshold tick in
+    /// between). Without this, an already-latched-`true` state from the
+    /// *departed* entry would silently suppress the crossing for a
+    /// *different* span that replaced it while already stale — naming
+    /// nobody at exactly the moment a new long-lived span starts pinning the
+    /// database, which is the scenario this sweep exists to catch. A merely
+    /// fresher replacement still reads as below-threshold either way, so the
+    /// identity check changes behavior only for an already-stale successor.
     pub fn observe(
         &mut self,
-        oldest: Option<(Duration, Option<String>)>,
+        oldest: Option<(khive_storage::tx_registry::TxId, Duration, Option<String>)>,
         config: &CheckpointConfig,
     ) -> Vec<TxAgeEmission> {
         let mut emissions = Vec::new();
 
-        let Some((age, label)) = oldest else {
+        let Some((id, age, label)) = oldest else {
             self.was_above_warn = false;
             self.was_above_max_age = false;
+            self.tracked_id = None;
             return emissions;
         };
+
+        if self.tracked_id != Some(id) {
+            self.was_above_warn = false;
+            self.was_above_max_age = false;
+        }
+        self.tracked_id = Some(id);
 
         let above_warn = age >= config.tx_warn_secs;
         let above_max_age = age >= config.tx_max_age_secs;
@@ -728,6 +779,26 @@ pub async fn run_checkpoint_task(
         }
 
         let tick = checkpoint_once(&pool, &config, &mut truncate_state);
+
+        // ADR-091 Plank 1: age-based sweep over the registry's oldest entry
+        // MUST run on every tick, including a Skipped one — deliberately
+        // BEFORE the Skipped early-continue below. A registered
+        // `WriterGuard::transaction` span (`pool.rs`) holds the writer mutex
+        // for its entire registered lifetime, so exactly the long-running
+        // transaction this sweep exists to name is the one that makes an
+        // ordinary checkpoint tick observe `Skipped` — gating the sweep on
+        // `Observed` would silence it for precisely that scenario, defeating
+        // the WAL-independent diagnostic the ADR specifies. Independent of
+        // WAL page pressure by the same design: a registered span can go
+        // stale (KHIVE_TX_WARN_SECS / KHIVE_TX_MAX_AGE_SECS) while
+        // wal_pages sits well under warn_pages, or isn't sampled at all this
+        // tick. Edge-triggered per rung, same debounce idiom as the severity
+        // ladder below, so a sustained stale span logs once per rung rather
+        // than once per tick.
+        for emission in tx_age_state.observe(khive_storage::tx_registry::oldest(), &config) {
+            log_tx_age_emission(&emission);
+        }
+
         // Skipped ticks leave crossing state unchanged — a busy tick must not
         // re-arm the rate limit while WAL pressure is still elevated.
         let wal_pages = match tick {
@@ -744,16 +815,6 @@ pub async fn run_checkpoint_task(
         // gated on the SAME crossing state as the WAL-threshold WARNs above,
         // so sustained pressure logs once per crossing, not once per tick.
         log_tx_registry_oldest_debug(wal_pages);
-
-        // ADR-091 Plank 1: age-based sweep over the registry's oldest entry,
-        // independent of WAL page pressure — a registered span can go stale
-        // (KHIVE_TX_WARN_SECS / KHIVE_TX_MAX_AGE_SECS) while wal_pages sits
-        // well under warn_pages. Edge-triggered per rung, same debounce
-        // idiom as the severity ladder below, so a sustained stale span logs
-        // once per rung rather than once per tick.
-        for emission in tx_age_state.observe(khive_storage::tx_registry::oldest(), &config) {
-            log_tx_age_emission(&emission);
-        }
 
         // ADR-091 severity ladder: INFO on the first below→above crossing,
         // WARN once `warn_sustained_cycles` consecutive ticks stay elevated.
@@ -880,7 +941,7 @@ async fn append_checkpoint_lifecycle_event<P: serde::Serialize>(
 /// crossing rather than once per tick. Observe only: this never enforces or
 /// force-closes anything.
 fn log_tx_registry_oldest_debug(wal_pages: u64) {
-    if let Some((age, label)) = khive_storage::tx_registry::oldest() {
+    if let Some((_id, age, label)) = khive_storage::tx_registry::oldest() {
         tracing::debug!(
             wal_pages,
             oldest_tx_age_secs = age.as_secs_f64(),
@@ -896,7 +957,7 @@ fn log_tx_registry_oldest_debug(wal_pages: u64) {
 /// `crossing_warn`) — it is not rate-limited internally, so calling it every
 /// tick would reproduce the log-spam bug this rewrite fixes.
 fn log_tx_registry_oldest_warn(wal_pages: u64) {
-    if let Some((age, label)) = khive_storage::tx_registry::oldest() {
+    if let Some((_id, age, label)) = khive_storage::tx_registry::oldest() {
         tracing::warn!(
             wal_pages,
             oldest_tx_age_secs = age.as_secs_f64(),
@@ -1244,7 +1305,7 @@ mod tests {
             khive_storage::tx_registry::register(Some("checkpoint_tick_test".to_string()));
 
         let expected_label = khive_storage::tx_registry::oldest()
-            .and_then(|(_, label)| label)
+            .and_then(|(_, _, label)| label)
             .unwrap_or_else(|| "<unlabeled>".to_string());
 
         tracing::subscriber::with_default(subscriber, || {
@@ -1742,6 +1803,65 @@ mod tests {
         assert_eq!(
             cfg.tx_max_age_secs, default.tx_max_age_secs,
             "zero tx_max_age_secs must fall back to default"
+        );
+    }
+
+    /// Round-2 fix (Medium finding 1): a reversed pair — `KHIVE_TX_WARN_SECS`
+    /// >= `KHIVE_TX_MAX_AGE_SECS` — must not be honored independently. Before
+    /// this fix, WARN_SECS=120 / MAX_AGE_SECS=30 parsed both values
+    /// successfully (each is independently positive) and produced a sweep
+    /// that emits `Stale` at 30s while never reaching the `Warn` crossing
+    /// until 120s — inverting the intended severity ladder. Both thresholds
+    /// must instead fall back to their defaults together.
+    #[test]
+    #[serial]
+    fn checkpoint_config_rejects_reversed_tx_thresholds() {
+        let default = CheckpointConfig::default();
+        std::env::set_var("KHIVE_TX_WARN_SECS", "120");
+        std::env::set_var("KHIVE_TX_MAX_AGE_SECS", "30");
+
+        let cfg = CheckpointConfig::from_env();
+
+        std::env::remove_var("KHIVE_TX_WARN_SECS");
+        std::env::remove_var("KHIVE_TX_MAX_AGE_SECS");
+
+        assert_eq!(
+            cfg.tx_warn_secs, default.tx_warn_secs,
+            "a reversed pair must fall back tx_warn_secs to its default, got: {:?}",
+            cfg.tx_warn_secs
+        );
+        assert_eq!(
+            cfg.tx_max_age_secs, default.tx_max_age_secs,
+            "a reversed pair must fall back tx_max_age_secs to its default, got: {:?}",
+            cfg.tx_max_age_secs
+        );
+    }
+
+    /// Same invariant, the degenerate equal case: WARN_SECS == MAX_AGE_SECS
+    /// would make an entry cross both rungs on the exact same tick every
+    /// time, collapsing the two-rung severity ladder into one. Must also
+    /// fall back to defaults, not merely reject a strictly-reversed pair.
+    #[test]
+    #[serial]
+    fn checkpoint_config_rejects_equal_tx_thresholds() {
+        let default = CheckpointConfig::default();
+        std::env::set_var("KHIVE_TX_WARN_SECS", "60");
+        std::env::set_var("KHIVE_TX_MAX_AGE_SECS", "60");
+
+        let cfg = CheckpointConfig::from_env();
+
+        std::env::remove_var("KHIVE_TX_WARN_SECS");
+        std::env::remove_var("KHIVE_TX_MAX_AGE_SECS");
+
+        assert_eq!(
+            cfg.tx_warn_secs, default.tx_warn_secs,
+            "an equal pair must fall back tx_warn_secs to its default, got: {:?}",
+            cfg.tx_warn_secs
+        );
+        assert_eq!(
+            cfg.tx_max_age_secs, default.tx_max_age_secs,
+            "an equal pair must fall back tx_max_age_secs to its default, got: {:?}",
+            cfg.tx_max_age_secs
         );
     }
 
@@ -2296,6 +2416,14 @@ mod tests {
         }
     }
 
+    /// Synthetic identity for `TxAgeSweepState::observe`'s pure unit tests
+    /// below, which exercise identity-change detection without paying for a
+    /// real `tx_registry::register` call. `TxId`'s wrapped value is public
+    /// exactly to support this (see its doc comment in `khive-storage`).
+    fn tx_id(n: u64) -> khive_storage::tx_registry::TxId {
+        khive_storage::tx_registry::TxId(n)
+    }
+
     /// No open entry: nothing fires, and any prior latch state clears.
     #[test]
     fn tx_age_sweep_empty_registry_emits_nothing() {
@@ -2313,7 +2441,11 @@ mod tests {
         let mut state = TxAgeSweepState::default();
 
         let emissions = state.observe(
-            Some((Duration::from_secs(5), Some("fresh_span".to_string()))),
+            Some((
+                tx_id(1),
+                Duration::from_secs(5),
+                Some("fresh_span".to_string()),
+            )),
             &config,
         );
         assert!(emissions.is_empty(), "a fresh entry must emit nothing");
@@ -2328,7 +2460,11 @@ mod tests {
         let mut state = TxAgeSweepState::default();
 
         let tick1 = state.observe(
-            Some((Duration::from_secs(45), Some("stale_span".to_string()))),
+            Some((
+                tx_id(1),
+                Duration::from_secs(45),
+                Some("stale_span".to_string()),
+            )),
             &config,
         );
         assert_eq!(
@@ -2342,7 +2478,11 @@ mod tests {
         );
 
         let tick2 = state.observe(
-            Some((Duration::from_secs(50), Some("stale_span".to_string()))),
+            Some((
+                tx_id(1),
+                Duration::from_secs(50),
+                Some("stale_span".to_string()),
+            )),
             &config,
         );
         assert!(
@@ -2362,6 +2502,7 @@ mod tests {
         // progression (an entry ages through the warn band before the max).
         state.observe(
             Some((
+                tx_id(1),
                 Duration::from_secs(45),
                 Some("stuck_writer_task_tx".to_string()),
             )),
@@ -2370,6 +2511,7 @@ mod tests {
 
         let tick = state.observe(
             Some((
+                tx_id(1),
                 Duration::from_secs(130),
                 Some("stuck_writer_task_tx".to_string()),
             )),
@@ -2387,6 +2529,7 @@ mod tests {
 
         let tick_repeat = state.observe(
             Some((
+                tx_id(1),
                 Duration::from_secs(200),
                 Some("stuck_writer_task_tx".to_string()),
             )),
@@ -2407,7 +2550,11 @@ mod tests {
         let mut state = TxAgeSweepState::default();
 
         let tick = state.observe(
-            Some((Duration::from_secs(300), Some("ancient_tx".to_string()))),
+            Some((
+                tx_id(1),
+                Duration::from_secs(300),
+                Some("ancient_tx".to_string()),
+            )),
             &config,
         );
         assert_eq!(
@@ -2436,7 +2583,11 @@ mod tests {
         let mut state = TxAgeSweepState::default();
 
         state.observe(
-            Some((Duration::from_secs(150), Some("first_span".to_string()))),
+            Some((
+                tx_id(1),
+                Duration::from_secs(150),
+                Some("first_span".to_string()),
+            )),
             &config,
         );
 
@@ -2446,14 +2597,22 @@ mod tests {
 
         // A fresh entry (unrelated span) is now oldest — still below threshold.
         let fresh = state.observe(
-            Some((Duration::from_secs(2), Some("second_span".to_string()))),
+            Some((
+                tx_id(2),
+                Duration::from_secs(2),
+                Some("second_span".to_string()),
+            )),
             &config,
         );
         assert!(fresh.is_empty(), "a fresh oldest entry must emit nothing");
 
         // That second span goes stale in turn — must WARN again (re-armed).
         let rewarn = state.observe(
-            Some((Duration::from_secs(35), Some("second_span".to_string()))),
+            Some((
+                tx_id(2),
+                Duration::from_secs(35),
+                Some("second_span".to_string()),
+            )),
             &config,
         );
         assert_eq!(
@@ -2464,6 +2623,62 @@ mod tests {
                 label: Some("second_span".to_string()),
             }],
             "a fresh stale episode after a clear must Warn again"
+        );
+    }
+
+    /// Round-2 fix (Medium finding 2): a stale entry (A) that closes and is
+    /// immediately replaced by an ALREADY-stale entry (B) on the very next
+    /// observed tick — no intervening below-threshold or empty tick, unlike
+    /// `tx_age_sweep_rearms_after_entry_clears` above — must still emit both
+    /// rungs for B. Before the identity-tracking fix, `was_above_warn` and
+    /// `was_above_max_age` were already `true` from A, so B's crossing was
+    /// silently swallowed: the alert stayed latched to a departed caller
+    /// while a different long-lived span was now pinning the database.
+    #[test]
+    fn tx_age_sweep_stale_replacement_without_intervening_clear_still_names_new_entry() {
+        let config = tx_age_test_config();
+        let mut state = TxAgeSweepState::default();
+
+        let tick_a = state.observe(
+            Some((
+                tx_id(1),
+                Duration::from_secs(300),
+                Some("stale_entry_a".to_string()),
+            )),
+            &config,
+        );
+        assert_eq!(
+            tick_a.len(),
+            2,
+            "entry A must cross both rungs on its first observed tick, got: {tick_a:?}"
+        );
+
+        // B replaces A as the oldest entry on the VERY NEXT tick — already
+        // stale itself, with no intervening None/below-threshold tick.
+        let tick_b = state.observe(
+            Some((
+                tx_id(2),
+                Duration::from_secs(400),
+                Some("stale_entry_b".to_string()),
+            )),
+            &config,
+        );
+        assert_eq!(
+            tick_b,
+            vec![
+                TxAgeEmission {
+                    rung: TxAgeRung::Warn,
+                    age: Duration::from_secs(400),
+                    label: Some("stale_entry_b".to_string()),
+                },
+                TxAgeEmission {
+                    rung: TxAgeRung::Stale,
+                    age: Duration::from_secs(400),
+                    label: Some("stale_entry_b".to_string()),
+                },
+            ],
+            "a same-tick identity change to an already-stale successor must re-emit both \
+             rungs naming the NEW entry, got: {tick_b:?}"
         );
     }
 
@@ -2482,7 +2697,11 @@ mod tests {
         let mut state = TxAgeSweepState::default();
 
         let tick = state.observe(
-            Some((Duration::from_millis(5), Some("fast_cap_span".to_string()))),
+            Some((
+                tx_id(1),
+                Duration::from_millis(5),
+                Some("fast_cap_span".to_string()),
+            )),
             &config,
         );
         assert_eq!(
@@ -2811,5 +3030,213 @@ mod tests {
             .await
             .expect("checkpoint task should exit within 1s")
             .expect("checkpoint task panicked");
+    }
+
+    // Round-2 fix (Medium finding 4 + High finding): task-level regressions
+    // that actually spawn `run_checkpoint_task` and capture its `tracing`
+    // output, so the wiring at the `tx_age_state.observe(...)` call site
+    // itself is under test — the pure `TxAgeSweepState` unit tests above
+    // stay green even if that call site is deleted; these do not. All three
+    // share `#[serial(tx_registry, checkpoint_skip_metrics)]`: `tx_registry`
+    // because they read the process-wide registry singleton (see the
+    // `log_tx_registry_oldest_debug_reports_oldest_open_entry` doc comment
+    // above for why other tests in this same binary can transiently touch
+    // it too), `checkpoint_skip_metrics` because they spawn the real task
+    // that updates the module's skip-tracking atomics.
+
+    /// (1) A stale labeled entry with a healthy WAL: the spawned task itself
+    /// must sweep and escalate it to `Stale`, with WAL-pressure thresholds
+    /// set unreachably high so only the age sweep — never the WAL-pressure
+    /// ladder — could be responsible for the captured emission.
+    #[tokio::test]
+    #[serial(tx_registry, checkpoint_skip_metrics)]
+    async fn checkpoint_task_sweeps_stale_registry_entry_while_wal_is_healthy() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tx_age_sweep_task_healthy_wal.db");
+        let pool = file_pool(&path);
+
+        let buffer = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let subscriber = CaptureSubscriber {
+            events: std::sync::Arc::clone(&buffer),
+        };
+        let _tracing_guard = tracing::subscriber::set_default(subscriber);
+
+        let _tx_handle = khive_storage::tx_registry::register(Some(
+            "checkpoint_task_healthy_wal_sweep_test".to_string(),
+        ));
+
+        let cfg = CheckpointConfig {
+            interval: Duration::from_millis(10),
+            warn_pages: u64::MAX,
+            high_water_pages: u64::MAX,
+            truncate_high_water_pages: u64::MAX,
+            tx_warn_secs: Duration::from_millis(1),
+            tx_max_age_secs: Duration::from_millis(1),
+            ..CheckpointConfig::default()
+        };
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(());
+        let handle = tokio::spawn(run_checkpoint_task(
+            pool,
+            cfg,
+            None,
+            "local".to_string(),
+            shutdown_rx,
+        ));
+
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        shutdown_tx.send(()).expect("send shutdown signal");
+        tokio::time::timeout(Duration::from_secs(1), handle)
+            .await
+            .expect("checkpoint task should exit within 1s")
+            .expect("checkpoint task panicked");
+
+        drop(_tx_handle);
+
+        let events = buffer.lock().unwrap();
+        assert!(
+            events.iter().any(|e| {
+                e.tx_label.as_deref() == Some("checkpoint_task_healthy_wal_sweep_test")
+                    && e.message
+                        .as_deref()
+                        .is_some_and(|m| m.contains("stale-op cap"))
+            }),
+            "expected the spawned task to sweep and escalate the stale registry entry \
+             to Stale on its own, got: {events:?}"
+        );
+    }
+
+    /// (2) An empty registry must never produce a Plank 1 age emission from
+    /// the real spawned task, mirroring the pure
+    /// `tx_age_sweep_empty_registry_emits_nothing` unit test above.
+    #[tokio::test]
+    #[serial(tx_registry, checkpoint_skip_metrics)]
+    async fn checkpoint_task_emits_no_age_alert_for_an_empty_registry() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tx_age_sweep_task_empty_registry.db");
+        let pool = file_pool(&path);
+
+        let buffer = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let subscriber = CaptureSubscriber {
+            events: std::sync::Arc::clone(&buffer),
+        };
+        let _tracing_guard = tracing::subscriber::set_default(subscriber);
+
+        let cfg = CheckpointConfig {
+            interval: Duration::from_millis(10),
+            tx_warn_secs: Duration::from_millis(1),
+            tx_max_age_secs: Duration::from_millis(1),
+            ..CheckpointConfig::default()
+        };
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(());
+        let handle = tokio::spawn(run_checkpoint_task(
+            pool,
+            cfg,
+            None,
+            "local".to_string(),
+            shutdown_rx,
+        ));
+
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        shutdown_tx.send(()).expect("send shutdown signal");
+        tokio::time::timeout(Duration::from_secs(1), handle)
+            .await
+            .expect("checkpoint task should exit within 1s")
+            .expect("checkpoint task panicked");
+
+        let events = buffer.lock().unwrap();
+        assert!(
+            events.iter().all(|e| e
+                .message
+                .as_deref()
+                .is_none_or(|m| !m.contains("ADR-091 Plank 1"))),
+            "an empty registry must never produce a Plank 1 age emission, got: {events:?}"
+        );
+    }
+
+    /// (3) High-finding regression: a writer-busy tick must NOT silence the
+    /// age sweep. Holds the pool's writer mutex (via `pool.try_writer()`,
+    /// never released for the task's entire run) across several checkpoint
+    /// intervals alongside a stale registered entry, and asserts the age
+    /// alert still fires even though `checkpoint_once` observes
+    /// `CheckpointTick::Skipped` on every single tick. Before the fix, the
+    /// sweep call sat after the `Skipped` early-continue and never ran here.
+    #[tokio::test]
+    #[serial(tx_registry, checkpoint_skip_metrics)]
+    async fn checkpoint_task_sweeps_stale_entry_even_when_writer_is_busy_every_tick() {
+        reset_checkpoint_metrics_for_tests();
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tx_age_sweep_task_writer_busy.db");
+        let pool = file_pool(&path);
+        {
+            let writer = pool.try_writer().unwrap();
+            writer
+                .conn()
+                .execute_batch("CREATE TABLE IF NOT EXISTS t (x INTEGER);")
+                .unwrap();
+        }
+
+        let buffer = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let subscriber = CaptureSubscriber {
+            events: std::sync::Arc::clone(&buffer),
+        };
+        let _tracing_guard = tracing::subscriber::set_default(subscriber);
+
+        let _tx_handle = khive_storage::tx_registry::register(Some(
+            "checkpoint_task_writer_busy_sweep_test".to_string(),
+        ));
+
+        // Held for the checkpoint task's entire run, acquired BEFORE spawn
+        // (and with no `.await` in between) so the task cannot possibly
+        // observe a free writer on any tick.
+        let _writer_guard = pool.try_writer().expect("acquire writer for busy hold");
+
+        let cfg = CheckpointConfig {
+            interval: Duration::from_millis(10),
+            tx_warn_secs: Duration::from_millis(1),
+            tx_max_age_secs: Duration::from_millis(1),
+            ..CheckpointConfig::default()
+        };
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(());
+        let handle = tokio::spawn(run_checkpoint_task(
+            Arc::clone(&pool),
+            cfg,
+            None,
+            "local".to_string(),
+            shutdown_rx,
+        ));
+
+        // Several 10ms intervals, every one of them writer-busy.
+        tokio::time::sleep(Duration::from_millis(60)).await;
+
+        assert!(
+            checkpoint_skipped_ticks() > 0,
+            "test setup must actually drive at least one Skipped tick for this \
+             regression to mean anything"
+        );
+
+        shutdown_tx.send(()).expect("send shutdown signal");
+        tokio::time::timeout(Duration::from_secs(1), handle)
+            .await
+            .expect("checkpoint task should exit within 1s")
+            .expect("checkpoint task panicked");
+
+        drop(_writer_guard);
+        drop(_tx_handle);
+
+        let events = buffer.lock().unwrap();
+        assert!(
+            events.iter().any(|e| {
+                e.tx_label.as_deref() == Some("checkpoint_task_writer_busy_sweep_test")
+                    && e.message
+                        .as_deref()
+                        .is_some_and(|m| m.contains("stale-op cap"))
+            }),
+            "expected the age sweep to fire even though every tick's writer checkout \
+             was skipped, got: {events:?}"
+        );
     }
 }
