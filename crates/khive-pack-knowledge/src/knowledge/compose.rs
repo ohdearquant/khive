@@ -335,9 +335,21 @@ fn tokenize(text: &str) -> Vec<String> {
 // *before* its (possibly fallible, possibly long-running) work starts; both
 // `finish` and `Drop` flush whatever phase is still open — `last..now` — into
 // that phase's bucket before emitting, so an in-flight phase is never lost.
-// The same flush also picks up the tail of the final phase (response-JSON
-// construction after the last measured stage), which a pre-`finish` mark
-// would otherwise miss.
+//
+// Round-2 codex review (#915) found two follow-ups, both addressed here and
+// in `search.rs`: (1) the round-1 regression tests called the private
+// `flush_active` manually before `finish`/`drop`, so they exercised the
+// flush logic but not the actual call sites that must invoke it — `finish`
+// now returns its post-flush breakdown so a test can assert on the real call
+// site's output directly, and the `Drop` path is covered by a `tracing`
+// capture subscriber (see the test module). (2) `compose()` was calling
+// `finish` before constructing its response `Value` on three routine return
+// paths, so the response-JSON assembly and the trailing bit of whichever
+// phase was active went unattributed; every routine return now builds its
+// response into a local binding, calls `finish`, then returns it, so `finish`
+// is genuinely the last thing that happens on every routine path — the flush
+// picks up the tail of the final phase (including the response-JSON
+// construction), not just the last explicitly `begin`-marked stage.
 
 /// Compose requests whose total handler time reaches this are logged at WARN
 /// with a per-phase breakdown. 10s matches the example threshold named in
@@ -396,13 +408,17 @@ impl Phase {
 /// needs (round-1 codex review, Medium finding).
 ///
 /// `finish` must be the last thing called on every return path that
-/// completes the request (success or a business-logic error): it flushes the
-/// active phase, flags the timing as complete, and, if the total reaches
-/// [`COMPOSE_SLOW_THRESHOLD_MS`], emits the slow-request WARN. If `finish` is
-/// never reached — because the enclosing future was dropped mid-poll (client
-/// disconnect, cancellation, or daemon shutdown drain) — `Drop` performs the
-/// same flush and emits a distinct "abandoned" WARN, so a request that never
-/// produces a response is not silently invisible.
+/// completes the request (success or a business-logic error) — in
+/// particular, after the response `Value` is fully constructed, not before
+/// (round-2 codex review, Low finding: response-JSON assembly is real work
+/// and belongs inside whichever phase is still active, typically `Trim`).
+/// `finish` flushes the active phase, flags the timing as complete, and, if
+/// the total reaches [`COMPOSE_SLOW_THRESHOLD_MS`], emits the slow-request
+/// WARN. If `finish` is never reached — because the enclosing future was
+/// dropped mid-poll (client disconnect, cancellation, or daemon shutdown
+/// drain) — `Drop` performs the same flush and emits a distinct "abandoned"
+/// WARN, so a request that never produces a response is not silently
+/// invisible.
 ///
 /// `query_bytes` records the query's UTF-8 *byte* length, not a char count —
 /// `str::len()` reads a value the string already carries (O(1)), unlike
@@ -475,21 +491,34 @@ impl ComposeTiming {
     /// complete so `Drop` does not also log an "abandoned" warning for a
     /// request that finished normally, and emits the slow-request WARN if
     /// the total reached [`COMPOSE_SLOW_THRESHOLD_MS`].
-    pub(super) fn finish(mut self, atom_count: usize) {
+    ///
+    /// Returns the post-flush per-phase breakdown in milliseconds.
+    /// Production callers (`compose()`) discard it — the WARN above is the
+    /// real delivery mechanism there. It exists so tests can assert the
+    /// *actual* `finish()` call site flushed the still-active phase without
+    /// needing the request to run long enough to cross
+    /// [`COMPOSE_SLOW_THRESHOLD_MS`] and trigger the WARN itself (round-2
+    /// codex review, Medium finding: the round-1 regression tests called the
+    /// private `flush_active` manually before `finish`/`drop`, so they never
+    /// exercised — and would not have caught a regression in — the flush
+    /// call inside `finish`/`Drop` itself).
+    pub(super) fn finish(mut self, atom_count: usize) -> [(&'static str, u64); Phase::COUNT] {
         self.flush_active();
         self.completed = true;
+        let breakdown = self.phase_ms();
         let total_ms = self.start.elapsed().as_millis() as u64;
         if total_ms >= COMPOSE_SLOW_THRESHOLD_MS {
             tracing::warn!(
                 total_ms,
                 threshold_ms = COMPOSE_SLOW_THRESHOLD_MS,
-                phases = ?self.phase_ms(),
+                phases = ?breakdown,
                 atom_count,
                 query_bytes = self.query_bytes,
                 is_auto = self.is_auto,
                 "knowledge.compose exceeded slow-request threshold"
             );
         }
+        breakdown
     }
 }
 
@@ -732,17 +761,13 @@ mod tests {
     }
 
     #[test]
-    fn finish_flushes_the_still_active_phase() {
-        // Regression for round-1 codex review (#915, Medium): a phase that
-        // never reaches its own `begin(next_phase)` — because the request
-        // errors, is cancelled, or `finish` is simply called mid-phase — must
-        // still show up in the breakdown with nonzero duration rather than
-        // being silently omitted (the exact bug: a slow, then-failing
-        // `suggest` used to log `phases=[]`). `finish` consumes the tracker
-        // and emits no return value, so this exercises the same flush it
-        // performs internally (`flush_active`, called first inside `finish`)
-        // directly on `phase_totals` — no log-capture harness exists in this
-        // crate (#887 scope note).
+    fn helper_level_flush_active_covers_an_in_flight_phase() {
+        // Unit-level check of `flush_active` itself (kept separate from the
+        // call-site regressions below, per round-2 codex review guidance:
+        // "keep the current helper-level checks as separate unit tests if
+        // useful"). Does not by itself guard `finish`/`Drop` — see
+        // `finish_call_site_flushes_the_still_active_phase` and
+        // `drop_call_site_flushes_the_still_active_phase` for that.
         let mut t = ComposeTiming::start("test query", true);
         t.begin(Phase::Suggest);
         std::thread::sleep(Duration::from_millis(5));
@@ -757,24 +782,137 @@ mod tests {
     }
 
     #[test]
-    fn drop_without_finish_flushes_the_active_phase_and_does_not_panic() {
-        // Simulates an abandoned request (future dropped mid-phase, e.g.
-        // client disconnect or cancellation) — the phase active at drop time
-        // must be flushed into the breakdown (not lost) and drop must not
-        // panic even though `completed` was never set.
-        let mut t = ComposeTiming::start("abandoned", false);
-        t.begin(Phase::Rerank);
+    fn finish_call_site_flushes_the_still_active_phase() {
+        // Regression for round-2 codex review (#915, Medium): the previous
+        // version of this test called the private `flush_active` manually
+        // before `finish`, so deleting `self.flush_active()` from inside
+        // `finish` itself would have left the test green. This version calls
+        // `finish` directly — with Suggest still active and NO manual
+        // pre-flush — and asserts on `finish`'s own return value (the
+        // post-flush breakdown), so the assertion can only pass if `finish`
+        // performed the flush itself.
+        let mut t = ComposeTiming::start("test query", true);
+        t.begin(Phase::Suggest);
         std::thread::sleep(Duration::from_millis(5));
-        // `flush_active` is idempotent (repeated calls just extend `last`),
-        // so calling it here to observe the pre-drop state does not change
-        // what Drop itself will flush.
-        t.flush_active();
-        let rerank_ms = t.phase_totals[Phase::Rerank.index()].as_millis();
+        // No begin(Phase::Fetch), no manual flush_active() — Suggest is still
+        // the active phase when finish() is called, simulating finish()
+        // being reached mid-phase (e.g. an error return partway through
+        // suggest, per the round-1 incident this feature diagnoses).
+        let breakdown = t.finish(0);
+        let suggest_ms = breakdown[Phase::Suggest.index()].1;
         assert!(
-            rerank_ms >= 5,
-            "in-flight Rerank phase must be flushed before drop, got {rerank_ms}ms"
+            suggest_ms >= 5,
+            "finish() must flush the in-flight Suggest phase before returning/emitting, \
+             got {suggest_ms}ms in breakdown {breakdown:?}"
         );
-        drop(t);
+    }
+
+    // ── tracing-capture harness for the Drop path ──────────────────────────
+    //
+    // `Drop::drop` cannot return a value (unlike `finish`), and its
+    // "abandoned" WARN fires unconditionally — no slow-threshold gate — so a
+    // real `tracing::Subscriber` capture is both necessary and cheap here
+    // (no multi-second sleep needed to cross COMPOSE_SLOW_THRESHOLD_MS, as
+    // would be required to observe `finish`'s WARN the same way). Mirrors the
+    // `CaptureSubscriber`/`Visit` pattern already used for the same purpose
+    // in `khive-runtime/src/pack.rs` and `khive-db/src/checkpoint.rs` —
+    // installed only as this test's thread-local default via
+    // `tracing::subscriber::with_default`, so it cannot observe or interfere
+    // with any other test.
+
+    #[derive(Clone, Debug, Default)]
+    struct CapturedEvent {
+        message: Option<String>,
+        phases: Option<String>,
+    }
+
+    #[derive(Default)]
+    struct CapturedEventVisitor(CapturedEvent);
+
+    impl tracing::field::Visit for CapturedEventVisitor {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            let formatted = format!("{value:?}");
+            match field.name() {
+                "message" => {
+                    self.0.message = Some(
+                        formatted
+                            .trim_start_matches('"')
+                            .trim_end_matches('"')
+                            .to_string(),
+                    )
+                }
+                "phases" => self.0.phases = Some(formatted),
+                _ => {}
+            }
+        }
+    }
+
+    struct CaptureSubscriber {
+        events: std::sync::Arc<std::sync::Mutex<Vec<CapturedEvent>>>,
+    }
+
+    impl tracing::Subscriber for CaptureSubscriber {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            let mut visitor = CapturedEventVisitor::default();
+            event.record(&mut visitor);
+            self.events.lock().unwrap().push(visitor.0);
+        }
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    #[test]
+    fn drop_call_site_flushes_the_still_active_phase() {
+        // Regression for round-2 codex review (#915, Medium): the previous
+        // version of this test called the private `flush_active` manually
+        // before `drop(t)`, so deleting `self.flush_active()` from inside
+        // `Drop::drop` itself would have left the test green. This version
+        // captures the real event `Drop::drop` emits — with Rerank still
+        // active and NO manual pre-flush — so the assertion can only pass if
+        // `Drop` performed the flush itself.
+        let buffer = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let subscriber = CaptureSubscriber {
+            events: std::sync::Arc::clone(&buffer),
+        };
+
+        tracing::subscriber::with_default(subscriber, || {
+            let mut t = ComposeTiming::start("abandoned", false);
+            t.begin(Phase::Rerank);
+            std::thread::sleep(Duration::from_millis(5));
+            // No begin(next phase), no manual flush_active() — Rerank is
+            // still active when `t` is dropped, simulating a future dropped
+            // mid-phase (client disconnect, cancellation, daemon shutdown).
+            drop(t);
+        });
+
+        let events = buffer.lock().unwrap();
+        let abandoned = events
+            .iter()
+            .find(|e| {
+                e.message.as_deref()
+                    == Some(
+                        "knowledge.compose request abandoned before completion \
+                         (client disconnect, cancellation, or daemon shutdown)",
+                    )
+            })
+            .unwrap_or_else(|| panic!("expected the abandoned-request WARN, got: {events:?}"));
+        let phases = abandoned
+            .phases
+            .as_deref()
+            .expect("abandoned WARN must carry a phases field");
+        assert!(
+            !phases.contains("(\"rerank\", 0)"),
+            "Drop must flush the in-flight Rerank phase into the emitted breakdown \
+             (nonzero duration), got: {phases}"
+        );
     }
 
     #[test]

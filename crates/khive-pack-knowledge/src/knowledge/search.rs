@@ -1324,8 +1324,7 @@ impl KnowledgeHandlers {
                 }
                 Err(e) => {
                     tracing::warn!(error = %e, "auto-compose: internal suggest failed, returning empty");
-                    timing.finish(0);
-                    return Ok(json!({
+                    let response = json!({
                         "status": "ok",
                         "data": {
                             "query": raw_query,
@@ -1335,7 +1334,9 @@ impl KnowledgeHandlers {
                             "count": 0,
                             "suggest_error": e.to_string(),
                         },
-                    }));
+                    });
+                    timing.finish(0);
+                    return Ok(response);
                 }
             };
             if let Some(results) = suggest_result.get("results").and_then(|v| v.as_array()) {
@@ -1356,8 +1357,9 @@ impl KnowledgeHandlers {
                 if suggest_ann_unavailable {
                     data["ann_unavailable"] = json!(true);
                 }
+                let response = json!({ "status": "ok", "data": data });
                 timing.finish(0);
-                return Ok(json!({ "status": "ok", "data": data }));
+                return Ok(response);
             }
         }
         timing.begin(Phase::Fetch);
@@ -1402,8 +1404,7 @@ impl KnowledgeHandlers {
         }
 
         if ordered_atoms.is_empty() {
-            timing.finish(0);
-            return Ok(json!({
+            let response = json!({
                 "status": "ok",
                 "data": {
                     "query": raw_query,
@@ -1412,7 +1413,9 @@ impl KnowledgeHandlers {
                     "atoms": [],
                     "count": 0,
                 },
-            }));
+            });
+            timing.finish(0);
+            return Ok(response);
         }
 
         let mut items: Vec<ScoredTextItem> = ordered_atoms
@@ -1593,11 +1596,12 @@ impl KnowledgeHandlers {
             data["ann_unavailable"] = json!(true);
         }
 
-        timing.finish(count);
-        Ok(json!({
+        let response = json!({
             "status": "ok",
             "data": data,
-        }))
+        });
+        timing.finish(count);
+        Ok(response)
     }
 }
 
