@@ -1977,7 +1977,7 @@ async fn recall_presentation_alias_is_rejected_by_deny_unknown_fields() {
     );
 }
 
-// ── internal review High fixes regressions (#444) ──────────────────────────────────────
+// ── PR #444 regressions ──────────────────────────────────────────────────────
 
 /// Trivial constant-vector embedding service for testing without real model weights.
 /// The `_model` parameter is ignored; returns a synthetic `dims × seed` vector.
@@ -2039,7 +2039,7 @@ impl EmbedderProvider for ConstVecProvider {
     }
 }
 
-/// Fix 1 regression (internal review High #1, PR #444): a runtime with no lattice
+/// PR #444 regression: a runtime with no lattice
 /// `embedding_model` in config but a custom registered embedder must fan out
 /// `remember` through that embedder and store a vector.
 ///
@@ -2102,7 +2102,7 @@ async fn test_custom_embedder_only_runtime_fanout_remember_recall() {
     );
 }
 
-/// Fix 2 regression (internal review High #2, PR #444): Weighted fusion with N > 1
+/// PR #444 regression: Weighted fusion with N > 1
 /// vector models must not zero-weight the text source.
 ///
 /// Previously `fuse_candidates` passed [vec_a, vec_b, text] as 3 sources to

@@ -1259,7 +1259,7 @@ async fn ingest_masks_multiple_credential_spans_in_pr_title_and_body() {
     );
 }
 
-/// Review #763 required regression: a clean (non-credential) PR title and a
+/// Issue #763 regression: a clean (non-credential) PR title and a
 /// null body must pass through `ingest_prs` byte-for-byte unchanged — a bare
 /// 64-hex string with no trigger word nearby is allowlisted by
 /// `mask_secrets`, so nothing in this fixture should ever be replaced.
@@ -1996,7 +1996,7 @@ async fn gh_boundary_contract_and_partial_ingest_failure() {
         !args_log.contains("-C"),
         "gh must never receive an unsupported -C flag: {args_log}"
     );
-    // ADR-088 Amendment 1 fix-round r2 High-1: the paging rewrite (--search
+    // ADR-088 Amendment 1: the paging rewrite (--search
     // "sort:updated-asc ...") must not silently drop --state all -- gh
     // defaults to open-only listing, which would make closed issues and
     // closed/merged PRs vanish from every ingest.
@@ -3024,7 +3024,7 @@ async fn digest_verb_rejects_ssh_source() {
     assert!(format!("{err}").contains("SSH"), "{err}");
 }
 
-/// `max_items` boundary handling (ADR-088 Amendment 1 fix-round Medium-2):
+/// `max_items` boundary handling (ADR-088 Amendment 1):
 /// a negative value must clamp to the lower bound (1), NOT silently fall
 /// through `as_u64`'s failure into the 500 default. `0` clamps to 1 too;
 /// values above 2000 clamp to 2000; a non-integer value is a hard error.
@@ -4026,8 +4026,8 @@ async fn git_pack_adr_entity_type_validates_through_runtime_create_many() {
 
 // ── Issue #841: residual unmasked ingest fields ─────────────────────────────
 //
-// Follow-up from PR #835's review: `ingest_masks_secrets_in_commit_message`
-// and the PR-title/body tests above already cover `content`/`title`
+// PR #835's `ingest_masks_secrets_in_commit_message` and the PR-title/body
+// tests above already cover `content`/`title`
 // masking. These tests cover the fields #841 found still passed raw into
 // gated `properties`/the note `name`: the commit note `name` (built from the
 // raw subject), commit `author`/`author_email`, and PR `author`/`base_ref`/

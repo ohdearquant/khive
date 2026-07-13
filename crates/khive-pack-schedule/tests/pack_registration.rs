@@ -35,7 +35,7 @@ fn schedule_pack_builds_registry_without_comm() {
     builder.build().expect("kg + schedule registry builds");
 }
 
-/// #897 review: `schedule.remind` gates on `registry.describe_verb("comm.send")`
+/// Issue #897: `schedule.remind` gates on `registry.describe_verb("comm.send")`
 /// at dispatch time. This must be exercised against the real multi-pack
 /// registry-build path (kg + comm + schedule registered together through
 /// `VerbRegistryBuilder`, the same construction production pack loading

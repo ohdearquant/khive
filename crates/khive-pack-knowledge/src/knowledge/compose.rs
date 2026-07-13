@@ -327,8 +327,8 @@ fn tokenize(text: &str) -> Vec<String> {
 // `tracing::warn!`, matching the WARN-on-anomaly style used elsewhere in this
 // crate (see `index_handler.rs`, `vamana.rs`).
 //
-// Round-1 codex review (#915) flagged that a phase only entered the reported
-// breakdown once its work finished — so the exact case this exists to
+// PR #915 identified that a phase only entered the reported breakdown once
+// its work finished, so the exact case this exists to
 // diagnose (a phase that stalls and then errors, is cancelled, or is
 // abandoned by a disconnected client) logged `phases=[]`, omitting the one
 // phase an on-call engineer needed. `begin(phase)` now opens the phase
@@ -336,8 +336,8 @@ fn tokenize(text: &str) -> Vec<String> {
 // `finish` and `Drop` flush whatever phase is still open — `last..now` — into
 // that phase's bucket before emitting, so an in-flight phase is never lost.
 //
-// Round-2 codex review (#915) found two follow-ups, both addressed here and
-// in `search.rs`: (1) the round-1 regression tests called the private
+// Further validation for PR #915 found two follow-ups, both addressed here
+// and in `search.rs`: (1) the regression tests called the private
 // `flush_active` manually before `finish`/`drop`, so they exercised the
 // flush logic but not the actual call sites that must invoke it — `finish`
 // now returns its post-flush breakdown so a test can assert on the real call
@@ -369,7 +369,7 @@ pub(super) const COMPOSE_SLOW_THRESHOLD_MS: u64 = 10_000;
 ///
 /// A closed enum backing a fixed-size array — rather than `Vec<(&str, _)>` —
 /// removes the heap allocation and linear name scan `ComposeTiming` would
-/// otherwise pay on every valid request (round-1 codex review, Low finding).
+/// otherwise pay on every valid request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Phase {
     Suggest,
@@ -405,13 +405,13 @@ impl Phase {
 /// known at every instant, `finish` and `Drop` can both flush an in-flight
 /// phase's partial duration into the breakdown rather than silently omitting
 /// it, which is what a slow-then-failing or cancelled-mid-phase request
-/// needs (round-1 codex review, Medium finding).
+/// needs.
 ///
 /// `finish` must be the last thing called on every return path that
 /// completes the request (success or a business-logic error) — in
-/// particular, after the response `Value` is fully constructed, not before
-/// (round-2 codex review, Low finding: response-JSON assembly is real work
-/// and belongs inside whichever phase is still active, typically `Trim`).
+/// particular, after the response `Value` is fully constructed, not before.
+/// Response-JSON assembly is real work and belongs inside whichever phase is
+/// still active, typically `Trim`.
 /// `finish` flushes the active phase, flags the timing as complete, and, if
 /// the total reaches [`COMPOSE_SLOW_THRESHOLD_MS`], emits the slow-request
 /// WARN. If `finish` is never reached — because the enclosing future was
@@ -423,13 +423,12 @@ impl Phase {
 /// `query_bytes` records the query's UTF-8 *byte* length, not a char count —
 /// `str::len()` reads a value the string already carries (O(1)), unlike
 /// `.chars().count()`'s O(n) UTF-8 walk. Because it is O(1), there is nothing
-/// to gain by deferring it to the (rare) emission path the way the Low
-/// finding suggested for a genuinely O(n) computation: storing it eagerly
+/// to gain by deferring it to the rare emission path as one would for a
+/// genuinely O(n) computation: storing it eagerly
 /// costs the same as storing it lazily, and eager storage avoids holding a
-/// borrow of the caller's query string for the tracker's entire lifetime —
+/// borrow of the caller's query string for the tracker's entire lifetime;
 /// `compose()` moves `raw_query` into the response body before calling
-/// `finish()`, so a borrowing field would not compile (round-1 codex review,
-/// Low finding).
+/// `finish()`, so a borrowing field would not compile.
 pub(super) struct ComposeTiming {
     start: Instant,
     last: Instant,
@@ -497,11 +496,10 @@ impl ComposeTiming {
     /// real delivery mechanism there. It exists so tests can assert the
     /// *actual* `finish()` call site flushed the still-active phase without
     /// needing the request to run long enough to cross
-    /// [`COMPOSE_SLOW_THRESHOLD_MS`] and trigger the WARN itself (round-2
-    /// codex review, Medium finding: the round-1 regression tests called the
-    /// private `flush_active` manually before `finish`/`drop`, so they never
-    /// exercised — and would not have caught a regression in — the flush
-    /// call inside `finish`/`Drop` itself).
+    /// [`COMPOSE_SLOW_THRESHOLD_MS`] and trigger the WARN itself. Earlier
+    /// regression tests called the private `flush_active` manually before
+    /// `finish`/`drop`, so they never exercised the flush call inside
+    /// `finish`/`Drop` itself.
     pub(super) fn finish(mut self, atom_count: usize) -> [(&'static str, u64); Phase::COUNT] {
         self.flush_active();
         self.completed = true;
@@ -762,10 +760,8 @@ mod tests {
 
     #[test]
     fn helper_level_flush_active_covers_an_in_flight_phase() {
-        // Unit-level check of `flush_active` itself (kept separate from the
-        // call-site regressions below, per round-2 codex review guidance:
-        // "keep the current helper-level checks as separate unit tests if
-        // useful"). Does not by itself guard `finish`/`Drop` — see
+        // Unit-level check of `flush_active` itself, kept separate from the
+        // call-site regressions below. Does not by itself guard `finish`/`Drop`; see
         // `finish_call_site_flushes_the_still_active_phase` and
         // `drop_call_site_flushes_the_still_active_phase` for that.
         let mut t = ComposeTiming::start("test query", true);
@@ -783,12 +779,12 @@ mod tests {
 
     #[test]
     fn finish_call_site_flushes_the_still_active_phase() {
-        // Regression for round-2 codex review (#915, Medium): the previous
+        // Regression for PR #915: the previous
         // version of this test called the private `flush_active` manually
         // before `finish`, so deleting `self.flush_active()` from inside
         // `finish` itself would have left the test green. This version calls
         // `finish` directly — with Suggest still active and NO manual
-        // pre-flush — and asserts on `finish`'s own return value (the
+        // pre-flush, and asserts on `finish`'s own return value (the
         // post-flush breakdown), so the assertion can only pass if `finish`
         // performed the flush itself.
         let mut t = ComposeTiming::start("test query", true);
@@ -797,7 +793,7 @@ mod tests {
         // No begin(Phase::Fetch), no manual flush_active() — Suggest is still
         // the active phase when finish() is called, simulating finish()
         // being reached mid-phase (e.g. an error return partway through
-        // suggest, per the round-1 incident this feature diagnoses).
+        // suggest, matching the incident this feature diagnoses).
         let breakdown = t.finish(0);
         let suggest_ms = breakdown[Phase::Suggest.index()].1;
         assert!(
@@ -871,12 +867,12 @@ mod tests {
 
     #[test]
     fn drop_call_site_flushes_the_still_active_phase() {
-        // Regression for round-2 codex review (#915, Medium): the previous
+        // Regression for PR #915: the previous
         // version of this test called the private `flush_active` manually
         // before `drop(t)`, so deleting `self.flush_active()` from inside
         // `Drop::drop` itself would have left the test green. This version
-        // captures the real event `Drop::drop` emits — with Rerank still
-        // active and NO manual pre-flush — so the assertion can only pass if
+        // captures the real event `Drop::drop` emits with Rerank still
+        // active and NO manual pre-flush, so the assertion can only pass if
         // `Drop` performed the flush itself.
         let buffer = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let subscriber = CaptureSubscriber {

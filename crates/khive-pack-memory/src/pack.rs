@@ -74,8 +74,8 @@ impl Pack for MemoryPack {
     const ENTITY_KINDS: &'static [&'static str] = &[];
     const HANDLERS: &'static [HandlerDef] = &MEMORY_HANDLERS;
     const REQUIRES: &'static [&'static str] = &["kg"];
-    /// `memory_ann_epoch` (#812 review REQUEST CHANGES MEDIUM — pack schema
-    /// contract): declared here instead of created inline on the epoch
+    /// `memory_ann_epoch` (#812), a pack schema contract declared here instead
+    /// of created inline on the epoch
     /// bump/read path, matching every other pack-auxiliary table in this
     /// codebase (ADR-028). Applied at boot by `server.rs`/`serve.rs`.
     const SCHEMA_PLAN: Option<PackSchemaPlan> = Some(PackSchemaPlan {

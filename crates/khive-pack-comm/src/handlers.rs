@@ -1139,7 +1139,7 @@ pub(crate) async fn handle_heartbeat(
         ));
     }
 
-    // #606 design review Blocker fix (review fix): heartbeat rows are an
+    // Issue #606: heartbeat rows are an
     // OPERATIONAL surface, not message data. Persist to
     // `crate::CHANNEL_HEALTH_NAMESPACE` ALWAYS — never `token.namespace()` —
     // so a poll loop configured with a non-local `KHIVE_EMAIL_INGEST_NAMESPACE`

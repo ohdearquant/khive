@@ -1389,8 +1389,8 @@ mod tests {
         );
     }
 
-    /// Regression for the namespace-key mismatch (review finding, 2026-07-09
-    /// fix round): ring admission used the gate-resolved `ns` (which is the
+    /// Regression for the namespace-key mismatch: ring admission used the
+    /// gate-resolved `ns` (which is the
     /// configured `default_namespace`, e.g. `"lambda:leo"`, on the default
     /// dispatch path) while `resolve_reference`'s ring lookup used
     /// `token.namespace()` (always `"local"` on that same path, per ADR-007
@@ -1434,7 +1434,7 @@ mod tests {
     }
 
     /// Id-string passthrough is entity-scoped, identically for full UUIDs
-    /// and short prefixes (review finding, 2026-07-09 fix round): a note's
+    /// and short prefixes: a note's
     /// id-string is `NotFound` through `resolve`, even though `get` on the
     /// same id would succeed.
     #[tokio::test]

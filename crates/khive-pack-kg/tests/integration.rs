@@ -8235,7 +8235,7 @@ async fn create_bulk_items_malformed_unknown_field_returns_error_creates_nothing
     );
 }
 
-// ── High-2: entity-type validator is installed by normal pack registration ──
+// ── entity-type validator is installed by normal pack registration ─────────
 
 /// Build a `(KhiveRuntime, VerbRegistry)` pair using the same boot sequence as
 /// the production MCP server: register the pack, build the registry, install edge
@@ -8364,7 +8364,7 @@ async fn create_many_runtime_validator_installed_on_per_pack_runtime_multi_backe
     );
 }
 
-// ── High-2: invalid entity_type in bulk items is rejected at the handler layer ──
+// ── invalid entity_type in bulk items is rejected at the handler layer ──────
 
 /// An invalid `entity_type` inside a bulk item must be rejected with the valid
 /// types listed, and must write nothing.

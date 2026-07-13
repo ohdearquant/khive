@@ -603,7 +603,7 @@ mod tests {
         assert!((mass16 - 1.5).abs() < 1e-9);
     }
 
-    /// Proves the Finding-1 fix: the check-and-fold is atomic under genuine
+    /// Proves the check-and-fold is atomic under genuine
     /// concurrent access, not just within one process's async runtime.
     ///
     /// Spawns 30 concurrent tasks, each calling `apply_fold_gate` directly
@@ -1132,7 +1132,7 @@ mod tests {
         assert!((outcome2.mass_after - IMPLICIT_MASS_CAP).abs() < 1e-9);
     }
 
-    /// Proves the Finding-1 fix for PR #497: if the
+    /// Proves the PR #497 fix: if the
     /// feedback event append fails AFTER a successful dedup claim, the whole
     /// atomic unit — claim and (skipped-on-clamp-aside) mass write included
     /// — rolls back, so a retry sees no claim and proceeds normally.
@@ -1393,7 +1393,7 @@ mod tests {
         );
     }
 
-    /// Proves the Finding-2 fix for PR #497: the
+    /// Proves the PR #497 fix: the
     /// ADR-081 §4 forced-zero fail-safe (`FeedbackGateMode::ForcedZero`) now
     /// claims the dedup key atomically, on the SAME held transaction as the
     /// (skipped) mass fold and the event append — so N concurrent identical

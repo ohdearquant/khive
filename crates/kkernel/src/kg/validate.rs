@@ -741,8 +741,8 @@ fn check_referential_integrity(
 /// A single configurable lint rule loaded from `rules.toml`.
 ///
 /// `deny_unknown_fields`: a misspelled key (e.g. `severtiy`) must fail the
-/// load loudly, never silently fall back to the field's default (High-2,
-/// commit 4e11ee38 — the repo standard here is fail-closed config).
+/// load loudly, never silently fall back to the field's default (commit
+/// 4e11ee38). The repository standard here is fail-closed config.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RuleConfig {
@@ -819,7 +819,7 @@ struct EdgeEndpointTypesConfig {
 /// must name a real [`EdgeRelation`], and both kind lists must be non-empty —
 /// a misspelled field name (e.g. `forward_source_kind`) must fail the whole
 /// `rules.toml` load, not silently produce an empty-list entry that
-/// [`check_edge_direction_conventions`] then skips as a no-op (High-2).
+/// [`check_edge_direction_conventions`] then skips as a no-op.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct DirectionRuleConfig {
@@ -939,7 +939,7 @@ fn validate_severity(rule_id: &str, s: &str) -> Option<RuleResult> {
 }
 
 /// Post-parse validation for `[[edge_direction_conventions.relations]]`
-/// entries (High-2): each entry's `relation` must name a real [`EdgeRelation`]
+/// entries: each entry's `relation` must name a real [`EdgeRelation`]
 /// and both `forward_source_kinds`/`forward_target_kinds` must be non-empty.
 ///
 /// `#[serde(default)]` on both kind-list fields means TOML deserialization
@@ -3025,7 +3025,7 @@ message = "bad"
     #[test]
     fn edge_endpoint_types_rejects_entity_annotates_edge_endpoint() {
         // Regression for the edge-substrate endpoint bypass (commit 4e11ee38,
-        // High-1): a `concept -[annotates]-> <edge_id>` edge must
+        // A `concept -[annotates]-> <edge_id>` edge must
         // fail — `annotates` requires a NOTE source (operations.rs:1226-1236),
         // and an entity source is invalid regardless of what the target is.
         let tmp = TempDir::new().unwrap();
@@ -3070,7 +3070,7 @@ message = "bad"
 
     #[test]
     fn edge_endpoint_types_rejects_edge_as_endpoint_of_extends() {
-        // Regression for the edge-substrate endpoint bypass (High-1): a
+        // Regression for the edge-substrate endpoint bypass: a
         // non-`annotates` relation naming a known edge ID as an endpoint must
         // fail — every relation other than `annotates` requires entity
         // endpoints (operations.rs:1355-1402); an edge endpoint is invalid
@@ -3674,7 +3674,7 @@ message = "bad"
 
     #[test]
     fn configurable_rule_checks_misspelled_key_fails_the_load() {
-        // Regression for High-2 (commit 4e11ee38): before
+        // Regression for commit 4e11ee38: before
         // `#[serde(deny_unknown_fields)]`, a typo like `severtiy` was silently
         // ignored and the field fell back to its default — the class then ran
         // at the DEFAULT severity instead of failing loudly. Now the whole
@@ -3704,7 +3704,7 @@ message = "bad"
 
     #[test]
     fn configurable_rule_checks_malformed_direction_entry_fails_the_load() {
-        // Regression for High-2: `forward_source_kind` (missing the trailing
+        // Regression: `forward_source_kind` (missing the trailing
         // `s`) is not a field `DirectionRuleConfig` recognizes. Before this
         // fix it silently parsed as an unrelated no-op (an entry with an
         // empty `forward_source_kinds` that `check_edge_direction_conventions`
@@ -3743,7 +3743,7 @@ message = "bad"
 
     #[test]
     fn configurable_rule_checks_direction_entry_with_empty_kind_list_fails_the_load() {
-        // Post-parse validation (High-2): a syntactically valid but
+        // Post-parse validation: a syntactically valid but
         // semantically empty `forward_source_kinds = []` must also fail the
         // load loudly, not silently no-op the whole entry.
         let tmp = TempDir::new().unwrap();

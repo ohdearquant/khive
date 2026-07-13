@@ -1431,7 +1431,7 @@ default = true
         });
     }
 
-    // ── deterministic lock-blocking oracle (r2 fix) ───────────────────────────
+    // ── deterministic lock-blocking oracle ────────────────────────────────────
     //
     // The end-to-end race test below proves no corruption results when both
     // sides respect the guard, but a mutation-testing pass showed its
@@ -1985,7 +1985,7 @@ default = true
     // (enforce first) the gate rejects before the spy is invoked, so the spy
     // thread-local remains false.
     //
-    // ISOMORPHISM PROOF (performed during review, result recorded here):
+    // ISOMORPHISM PROOF:
     //   Temporarily moved `enforce_strict_actor_mode` to below the daemon block in
     //   `run_exec_inline_with_forward`.  `strict_mode_spy_confirms_enforce_fires_before_forward`
     //   failed with: "spy forward_fn was called — enforce fired after forwarding"
@@ -3128,7 +3128,7 @@ backend = "sessions"
     // ── ADR-099 B3: delete kind parity, update
     // null/type validation, canonical id resolution, per-op result payloads ──
 
-    /// Finding 1: atomic `delete(id=<entity>, kind="note")` must be
+    /// Atomic `delete(id=<entity>, kind="note")` must be
     /// REJECTED (no row deleted) — pre-fix, atomic ignored `kind` entirely
     /// and deleted the entity anyway (a destructive wrong-substrate action).
     /// `delete(id=<entity>, kind="entity")` and `kind` omitted must both
@@ -3214,7 +3214,7 @@ backend = "sessions"
         );
     }
 
-    /// Finding 2: atomic `update` null/type semantics must match
+    /// Atomic `update` null/type semantics must match
     /// canonical's ACTUALLY REACHABLE behavior. Empirically verified against
     /// the live `handle_update` (two scratch probe tests run directly
     /// against `KgPack::handle_update`, then removed) that `name=null` and
@@ -3318,7 +3318,7 @@ backend = "sessions"
         );
     }
 
-    /// Finding 3: an atomic ops-file using an 8-hex-prefix id for
+    /// An atomic ops-file using an 8-hex-prefix id for
     /// `update` AND `gtd.transition` must succeed identically to canonical
     /// (which accepts full UUID or an 8+ hex prefix); a non-existent prefix
     /// must error with canonical's error shape ("no record matches
@@ -3403,7 +3403,7 @@ backend = "sessions"
         );
     }
 
-    /// Finding 4: a committed atomic unit's success output must
+    /// A committed atomic unit's success output must
     /// carry a canonical-shaped `result` per op (ADR-099 D4), not just
     /// `{ok, tool, op_index}`. Exercises all five v1-admissible verbs in one
     /// unit and asserts the relevant field for each:

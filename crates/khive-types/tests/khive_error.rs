@@ -247,7 +247,7 @@ mod serde_tests {
     /// successfully (the visitor must keep draining MapAccess until None, not
     /// stop reading once 8 entries have been retained).
     ///
-    /// Follow-up (PR #549 review): truncation must be observable, not silent.
+    /// Follow-up (PR #549): truncation must be observable, not silent.
     /// The bounded wire shape stays at 8 entries, but the 8th slot is now the
     /// `details_truncated` indicator carrying the dropped-pair count, so only
     /// the first 7 insertion-order client pairs are retained verbatim.

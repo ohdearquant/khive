@@ -117,8 +117,8 @@ pub(crate) fn current_generation(ann: &SharedAnn, namespace: &str) -> u64 {
         .unwrap_or(0)
 }
 
-/// Install `candidate` into the cache for `key` unless it is stale (PR #815
-/// review, HIGH — the #770 scenario through the empty-slot door). Two
+/// Install `candidate` into the cache for `key` unless it is stale (PR #815,
+/// covering issue #770's empty-slot scenario). Two
 /// independent fences, both evaluated while holding the write lock:
 ///
 /// 1. `candidate.generation` must be >= the namespace's CURRENT generation.
@@ -194,7 +194,7 @@ pub(crate) async fn insert_ann_if_absent(ann: &SharedAnn, key: AnnKey, bridge: A
 pub(crate) async fn clear_namespace(ann: &SharedAnn, namespace: &str) {
     {
         // Evict and bump the generation counter inside the SAME write-lock
-        // scope (PR #815 review, HIGH). `install_if_fresher` takes this same
+        // scope (PR #815). `install_if_fresher` takes this same
         // lock before reading the namespace's current generation, so there
         // is no window between "slot emptied" and "generation bumped" where
         // a concurrent install could read a stale (pre-bump) generation and
@@ -1022,7 +1022,7 @@ pub(crate) async fn ensure_ann_for_model(
     let target_generation = current_generation(ann, &ns);
 
     // 1. Fast path: already loaded AND at least as fresh as this namespace's
-    // current generation (PR #815 review, HIGH). A present entry with a
+    // current generation (PR #815). A present entry with a
     // stale generation is not a hit — mere presence let a pre-invalidation
     // build served from an emptied-then-refilled slot serve indefinitely.
     // Falling through here re-enters the same rebuild path a genuine cache
@@ -1533,7 +1533,7 @@ mod tests {
     #[tokio::test]
     async fn stale_build_rejected_installing_into_still_empty_post_invalidation_slot() {
         // Deterministic reproduction of the #770 scenario through the EMPTY-SLOT
-        // door (PR #815 review, HIGH): unlike the test above (where a fresh build
+        // door (PR #815): unlike the test above (where a fresh build
         // B installs first, so the stale build has an incumbent to lose against),
         // this exercises the case where NOTHING has installed yet when the stale
         // build arrives. Build A captures its generation floor, an invalidating
@@ -2183,7 +2183,7 @@ mod tests {
     }
 
     /// `ensure_ann_for_model`'s fast path must treat a present-but-generation-stale
-    /// cached entry as a miss, not a hit (PR #815 review, HIGH). In production
+    /// cached entry as a miss, not a hit (PR #815). In production
     /// `install_if_fresher`'s own fencing prevents a stale entry from ever
     /// installing, so this test bumps the namespace generation directly
     /// (bypassing `clear_namespace`'s eviction) to construct the "present but

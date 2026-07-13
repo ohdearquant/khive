@@ -1199,7 +1199,7 @@ async fn test_thread_verb_returns_threaded_messages() {
     );
 }
 
-// ── High 1 regression: reply() delivers inbound copy alongside the outbound copy ─
+// ── reply() delivers inbound copy alongside the outbound copy ────────────────
 
 /// reply() must write both an outbound copy and an inbound copy within the same namespace.
 ///
@@ -1253,7 +1253,7 @@ async fn test_reply_delivers_inbound_to_recipient() {
         .expect("count field");
     assert!(
         count_after >= 2,
-        "High-1 regression: reply() must deliver an inbound copy; \
+        "reply() must deliver an inbound copy; \
          inbox count={count_after} (expected >= 2)"
     );
 
@@ -1268,12 +1268,12 @@ async fn test_reply_delivers_inbound_to_recipient() {
             .and_then(|p| p.get("direction"))
             .and_then(|v| v.as_str())
             == Some("inbound")),
-        "High-1 regression: all inbox items must have direction=inbound; \
+        "all inbox items must have direction=inbound; \
          got {inbox_after}"
     );
 }
 
-// ── High 3 regression: thread() rejects nonexistent or non-message root ────────
+// ── thread() rejects nonexistent or non-message root ─────────────────────────
 
 /// thread(id=X) with a nonexistent UUID must return an error, not a silent empty result.
 /// Before the fix, thread() accepted any resolvable UUID and returned Ok with count=0.
@@ -1289,7 +1289,7 @@ async fn test_thread_rejects_nonexistent_root() {
 
     assert!(
         result.is_err(),
-        "High-3 regression: thread() with nonexistent root UUID must return an error; \
+        "thread() with nonexistent root UUID must return an error; \
          got ok with result={result:?}"
     );
 }
@@ -1337,13 +1337,13 @@ async fn test_thread_rejects_non_message_root() {
 
     assert!(
         result.is_err(),
-        "High-3 regression: thread() with non-message root must return an error; \
+        "thread() with non-message root must return an error; \
          got ok with result={result:?}"
     );
     let err = result.unwrap_err().to_string();
     assert!(
         err.contains("message") || err.contains("kind"),
-        "High-3: error must mention 'message' or 'kind'; got {err}"
+        "error must mention 'message' or 'kind'; got {err}"
     );
 }
 

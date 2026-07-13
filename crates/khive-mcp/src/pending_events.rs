@@ -143,7 +143,7 @@ pub async fn run_pending_events(
 ) -> Result<DrainSummary> {
     // Resolve through the SAME multi-backend-aware construction the daemon
     // boot path uses (`khive-mcp::serve::build_server_with_explicit_namespace`),
-    // rather than a throwaway `RuntimeConfig::default()` (PR #782 review):
+    // rather than a throwaway `RuntimeConfig::default()` (PR #782):
     // `RuntimeConfig::default()`
     // is env-only — it never consulted `khive.toml` (`[[backends]]`,
     // `[actor] id`, `[packs.*].backend`) at all, so a project with a
@@ -161,8 +161,8 @@ pub async fn run_pending_events(
     // still triggers `khive.toml`'s standard cwd/home search order inside
     // `resolve_runtime_config`.
     //
-    // This does NOT call `crate::serve::build_server` directly (PR #782
-    // review): `build_server` derives BOTH
+    // This does NOT call `crate::serve::build_server` directly (PR #782):
+    // `build_server` derives BOTH
     // `namespace_explicit` and `actor_explicit` from `resolve_cli_namespace`,
     // which treats "a namespace value is present" and "the operator typed
     // `--actor`/`--namespace`" as the same fact — true for a real CLI parse,
@@ -231,9 +231,9 @@ pub async fn run_pending_events(
 /// for (or, for the one-shot path, to what `build_server` just resolved).
 ///
 /// `rt` and `server` serve two different roles that must NOT be collapsed
-/// into one (an earlier version of this fix did exactly that, and review
-/// caught it): `rt` is the **schedule pack's own runtime** — the scan/
-/// claim/finalize SQL below reads and CAS-writes `scheduled_event` notes
+/// into one (an earlier version incorrectly collapsed them): `rt` is the
+/// **schedule pack's own runtime**. The scan/claim/finalize SQL below reads
+/// and CAS-writes `scheduled_event` notes
 /// directly through it, so it must point at whichever backend the `schedule`
 /// pack is wired to. `server` is the **daemon's live, fully-wired
 /// `KhiveMcpServer`** — every pack registered against its own backend per
@@ -288,7 +288,7 @@ pub async fn run_pending_events_on(
             continue;
         }
 
-        // Bounded, mutation-immune keyset pagination (PR #782 review —
+        // Bounded, mutation-immune keyset pagination (PR #782,
         // a continuation of the prior fix).
         //
         // The prior version snapshotted every `status="pending"` row for the namespace
@@ -320,7 +320,7 @@ pub async fn run_pending_events_on(
             let (sql, params): (String, Vec<SqlValue>) = match &cursor {
                 //
                 // The due-ness predicate compares via SQLite's `datetime()`,
-                // not a raw string `<=` (PR #782 review): stored
+                // not a raw string `<=` (PR #782): stored
                 // `trigger_at` values are NOT normalized to UTC —
                 // `khive-pack-schedule`'s `handle_remind`/`handle_schedule`
                 // deliberately round-trip the caller's original string
@@ -1175,7 +1175,7 @@ async fn dispatch_action(
 ///
 /// Uses a direct SQL query for efficiency — avoids fetching all pending notes
 /// across all namespaces up front. The `trigger_at` comparison is done via
-/// SQLite's `datetime(...)`, not a raw string comparison (PR #782 review):
+/// SQLite's `datetime(...)`, not a raw string comparison (PR #782):
 /// `khive-pack-schedule` round-trips the caller's
 /// original `trigger_at` string verbatim, offset included (H5), and
 /// `validate_at` in `handlers.rs` accepts any RFC 3339 offset — a raw-text
@@ -1202,7 +1202,7 @@ async fn discover_pending_namespaces(rt: &KhiveRuntime, now: DateTime<Utc>) -> R
     // candidate scan below, not the final due-ness decision — but a
     // namespace excluded HERE never reaches that scan at all, so it must be
     // held to the same correctness bar as the candidate-page queries
-    // (`datetime(...)` normalization, PR #782 review): comparing
+    // (`datetime(...)` normalization, PR #782): comparing
     // `trigger_at` against `now` as raw TEXT is only chronologically correct
     // when every stored string happens to share `now`'s UTC offset.
     // `khive-pack-schedule` round-trips the caller's original `trigger_at`
@@ -1306,7 +1306,7 @@ pub fn tick_interval_from_env() -> std::time::Duration {
 /// actor-identity/`--pack` resolution the live server itself uses) and passes
 /// it through here, so every tick drains the SAME storage target under the
 /// SAME actor identity and pack set as the daemon it belongs to — never a
-/// silently-reconstructed `RuntimeConfig::default()` (PR #782 review:
+/// silently-reconstructed `RuntimeConfig::default()` (PR #782):
 /// a config-backed daemon's tick could otherwise drain
 /// `$HOME/.khive/khive.db` instead of the configured backend, trip
 /// strict-actor-mode failures the live server never has, or dispatch stored
@@ -1318,8 +1318,7 @@ pub fn tick_interval_from_env() -> std::time::Duration {
 /// [`tokio::time::MissedTickBehavior::Skip`] rather than sleeping `interval`
 /// AFTER each drain: a sleep-after-drain loop's effective cadence is
 /// `interval + drain_duration`, which drifts further behind on every pass
-/// that finds a nontrivial backlog (PR #782 review —
-/// "tick cadence deviates from the accepted interval contract": ADR-106
+/// that finds a nontrivial backlog (PR #782). ADR-106
 /// specifies a fixed interval). The first tick fires after one full
 /// `interval` has elapsed (via `interval_at(now + interval, interval)`),
 /// matching the original sleep-based boot behavior instead of draining
@@ -1328,7 +1327,7 @@ pub fn tick_interval_from_env() -> std::time::Duration {
 /// `server` is the daemon's own live [`KhiveMcpServer`] (cloned — cheap,
 /// `Arc`-wrapped internally), used ONLY for replaying a fired event's stored
 /// action DSL (`dispatch_action`, inside [`run_pending_events_on`]). This is
-/// a SEPARATE handle from `rt` on purpose (PR #782 review): an earlier
+/// a SEPARATE handle from `rt` on purpose (PR #782): an earlier
 /// version of this fix built a fresh `KhiveMcpServer::new(rt
 /// .clone())` from the schedule runtime alone, which registered EVERY pack
 /// against the schedule backend — correct for scanning `scheduled_event`
@@ -1449,7 +1448,7 @@ mod tests {
     /// CLI-facing one-shot entrypoint this test module used to call directly).
     ///
     /// `run_pending_events` now resolves through `khive-mcp::serve::build_server`
-    /// (PR #782 review), which is
+    /// (PR #782), which is
     /// TOML-aware (`KhiveConfig::load_with_home_fallback`) so that `kkernel
     /// exec --pending-events` honors a project's `[[backends]]`/`[actor]`
     /// config exactly like the daemon does. That makes it depend on process
@@ -1461,9 +1460,8 @@ mod tests {
     /// the drain logic these tests actually target. These tests are about
     /// drain semantics (claim/dispatch/finalize/pagination/cadence), not CLI
     /// config resolution, so they build their own runtime + server directly —
-    /// exactly what `run_pending_events_on` itself required even before this
-    /// fix-round, and what `run_pending_events` did internally, unconditionally,
-    /// prior to this fix-round's config-resolution fix.
+    /// exactly what `run_pending_events_on` itself already required and what
+    /// `run_pending_events` did internally before the config-resolution fix.
     async fn drain_for_test(db_path: &str) -> Result<DrainSummary> {
         let rt = make_rt(db_path).await;
         let server = KhiveMcpServer::new(rt.clone()).map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -1821,7 +1819,7 @@ mod tests {
     }
 
     /// A due event whose `trigger_at` carries a POSITIVE offset must still
-    /// fire (PR #782 review).
+    /// fire (PR #782).
     ///
     /// `khive-pack-schedule` round-trips the caller's original `trigger_at`
     /// string verbatim, offset included (H5) — it is never normalized to
@@ -1885,7 +1883,7 @@ mod tests {
     /// `datetime(...)` normalization correctly excludes it from the
     /// candidate page; even if it were fetched, the retained Rust-side
     /// `trigger_at > now` re-check is the belt-and-suspenders backstop that
-    /// already made this direction benign before the SQL fix (PR #782 review:
+    /// already made this direction benign before the SQL fix (PR #782):
     /// "Negative-offset strings produce false POSITIVES, which the retained
     /// Rust re-check filters — benign").
     #[tokio::test]
@@ -2231,7 +2229,7 @@ mod tests {
     }
 
     /// Deterministic regression for the fire-side of issue #462: simulates
-    /// the exact interleaving the reviewer/critic flagged — a drain claims a
+    /// the exact interleaving where a drain claims a
     /// row for firing (its read-then-act window), and only *after* that does
     /// a `schedule.cancel` request arrive for the same id. Before this fix,
     /// the drain read a `pending` snapshot and later did a full-row
@@ -2257,8 +2255,8 @@ mod tests {
             .expect("claim query")
             .expect("claim must succeed on a fresh pending row");
 
-        // A `schedule.cancel` arriving after the claim (the race window the
-        // reviewer identified) must now fail instead of clobbering the
+        // A `schedule.cancel` arriving after the claim in this race window
+        // must now fail instead of clobbering the
         // in-flight fire.
         let cancel_ops = serde_json::to_string(&serde_json::json!([
             { "tool": "schedule.cancel", "args": { "id": id.to_string() } }
@@ -2719,7 +2717,7 @@ mod tests {
     /// not just that `summary.fired`/`summary.advanced` read zero. A
     /// regression that accidentally fires the missed path would otherwise be
     /// caught only by the summary counters, which is weaker evidence than
-    /// confirming the action's own write never landed (PR #782 review:
+    /// confirming the action's own write never landed (PR #782):
     /// the previous fixture used `stats()`, contradicting this
     /// comment's claim of a side-effecting action).
     #[tokio::test]
@@ -2908,7 +2906,7 @@ mod tests {
 
     /// A backlog larger than the drain's internal page size (200) must be
     /// fully processed in ONE drain pass, not silently truncated at the page
-    /// boundary (PR #782 review: the previous
+    /// boundary (PR #782): the previous
     /// implementation paged `status="pending"` with `LIMIT/OFFSET` while
     /// simultaneously mutating rows out of that predicate, so once the first
     /// page's 200 rows left `"pending"`, the page-2 query at `OFFSET 200`
@@ -2961,14 +2959,13 @@ mod tests {
 
     /// Two concurrent drain passes over the same store must never double-fire
     /// a row: the `pending -> firing` CAS claim (`claim_pending_event`) makes
-    /// exactly one of the two concurrent callers win each row (PR #782
-    /// review: Amendment B claims Acceptance
-    /// Criterion 2 is met, but no regression exercised concurrent drains
-    /// until now).
+    /// exactly one of the two concurrent callers win each row. PR #782
+    /// Amendment B requires Acceptance Criterion 2 to hold, but no regression
+    /// exercised concurrent drains until now.
     ///
     /// Each row's action is a genuinely side-effecting `create` writing a
     /// row-distinct marker `observation` note, rather than the read-only
-    /// `stats()` an earlier version of this test used (PR #782 review:
+    /// `stats()` an earlier version of this test used (PR #782):
     /// a read-only action makes the summary
     /// counters the ONLY signal, which cannot distinguish "claimed once,
     /// dispatched once" from "claimed once, dispatched TWICE, only one
@@ -3064,7 +3061,7 @@ mod tests {
         }
     }
 
-    // ── PR #782 review: `run_pending_events`'s wrapper
+    // ── PR #782: `run_pending_events`'s wrapper
     //    seam must not misread a default namespace as an explicit actor
     //    override ──────────────────────────────────────────────────────────
     //
@@ -3126,7 +3123,7 @@ mod tests {
     /// false`) must let a `"local"`-resolved default namespace fall through
     /// to the project-configured actor — never clear it the way a genuine
     /// `--actor`/`--namespace` CLI override would (`build_server`'s own,
-    /// correctly-narrower semantic). Regression for PR #782 review:
+    /// correctly-narrower semantic). Regression for PR #782:
     /// before this fix, `run_pending_events` called
     /// `build_server` directly with a synthesized `namespace: Some("local")`,
     /// which `resolve_cli_namespace` reported as `explicit = true` and
@@ -3179,7 +3176,7 @@ mod tests {
 
     /// Positive control for the failure mode the fix above closes: routing
     /// the same inputs through `build_server` (the genuine CLI-flag seam,
-    /// unchanged by this fix-round) DOES clear the actor, because there a
+    /// unchanged by this fix) DOES clear the actor, because there a
     /// present namespace value really does mean "the operator typed
     /// --namespace". This documents why `run_pending_events` must not reuse
     /// that entry point for a synthesized, non-CLI-parsed namespace default.

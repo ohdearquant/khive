@@ -45,7 +45,7 @@ use crate::GtdPack;
 /// `gtd.complete` prepare functions live in `kkernel` (a crate that already
 /// depends on both `khive-runtime` and `khive-pack-gtd` — see that crate's
 /// `atomic_apply` module doc for the crate-direction rationale), and the B3
-/// fix round (GAP-5) applies this exact function as a deferred post-commit
+/// GAP-5 applies this exact function as a deferred post-commit
 /// effect so atomic transitions/completes write the same best-effort
 /// lifecycle audit row the canonical handlers do, rather than re-deriving
 /// the DDL/INSERT here a second time.
@@ -103,7 +103,7 @@ pub async fn ensure_audit_schema(runtime: &KhiveRuntime) {
 ///
 /// `pub` for the same reason as `ensure_audit_schema` above — the ADR-099
 /// `--atomic` surface's `kkernel`-side post-commit pass calls this directly
-/// (B3 fix round, GAP-5) rather than re-deriving the INSERT.
+/// (ADR-099 B3, GAP-5) rather than re-deriving the INSERT.
 pub async fn write_audit_record(
     runtime: &KhiveRuntime,
     note_id: Uuid,
@@ -261,7 +261,7 @@ fn short_id(uuid: Uuid) -> String {
     uuid.as_hyphenated().to_string().chars().take(8).collect()
 }
 
-/// `pub` (widened from `pub(crate)`, ADR-099 B3, finding 3): the
+/// `pub` (widened from `pub(crate)`, ADR-099 B3): the
 /// `--atomic` seam in `kkernel` reuses this exact resolver (full UUID or 8+
 /// hex prefix, namespace-scoped via `resolve_prefix`) to resolve `gtd.transition`
 /// / `gtd.complete` `id` args before atomic prepare, matching what
@@ -366,7 +366,7 @@ fn priority_rank(props: Option<&Value>) -> u8 {
 
 /// Build the response object for any task-shaped operation.
 ///
-/// `pub` (widened from private, ADR-099 B3, finding 4): the
+/// `pub` (widened from private, ADR-099 B3): the
 /// `--atomic` seam in `kkernel` reuses this exact renderer, post-commit, to
 /// build the `result` payload for a committed `gtd.transition`/`gtd.complete`
 /// op — matching `handle_transition`/`handle_complete`'s response shape

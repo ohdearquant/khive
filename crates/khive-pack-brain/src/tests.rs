@@ -1255,7 +1255,7 @@ async fn test_355_posteriors_update_after_dispatch_via_hook() {
     );
 }
 
-// ── Wave-4 Critical regressions (C1-C4) ──────────────────────────────────
+// ── Regression tests ──────────────────────────────────────────────────────
 
 // C2: brain.unbind with zero filters must be rejected.
 #[tokio::test]
@@ -1778,7 +1778,7 @@ async fn r2_archived_exact_binding_defers_to_live_wildcard() {
     assert_eq!(
         result["resolved_profile_id"],
         json!("search-v1"),
-        "r2 fix 3: archived high-priority binding must not suppress the live wildcard binding"
+        "archived high-priority binding must not suppress the live wildcard binding"
     );
 }
 
@@ -1825,10 +1825,10 @@ async fn r2_feedback_rejects_archived_served_by_profile() {
     if let RuntimeError::InvalidInput(msg) = &err {
         assert!(
             msg.contains("archived"),
-            "r2 fix 4: feedback to archived profile must mention 'archived'; got: {msg}"
+            "feedback to archived profile must mention 'archived'; got: {msg}"
         );
     } else {
-        panic!("r2 fix 4: feedback to archived served_by_profile_id must return InvalidInput, got {err:?}");
+        panic!("feedback to archived served_by_profile_id must return InvalidInput, got {err:?}");
     }
 }
 
@@ -1850,7 +1850,7 @@ async fn r2_create_profile_rejects_empty_consumer_kind() {
         .unwrap_err();
     assert!(
         matches!(err, RuntimeError::InvalidInput(_)),
-        "r2 fix 5: empty consumer_kind must return InvalidInput, got {err:?}"
+        "empty consumer_kind must return InvalidInput, got {err:?}"
     );
 }
 
@@ -1872,10 +1872,10 @@ async fn r2_create_profile_rejects_wildcard_consumer_kind() {
     if let RuntimeError::InvalidInput(msg) = &err {
         assert!(
             msg.contains("wildcard") || msg.contains("sentinel") || msg.contains("*"),
-            "r2 fix 5: wildcard consumer_kind rejection must explain the issue; got: {msg}"
+            "wildcard consumer_kind rejection must explain the issue; got: {msg}"
         );
     } else {
-        panic!("r2 fix 5: wildcard consumer_kind must return InvalidInput, got {err:?}");
+        panic!("wildcard consumer_kind must return InvalidInput, got {err:?}");
     }
 }
 
@@ -1896,7 +1896,7 @@ async fn r2_create_profile_rejects_whitespace_consumer_kind() {
         .unwrap_err();
     assert!(
         matches!(err, RuntimeError::InvalidInput(_)),
-        "r2 fix 5: whitespace consumer_kind must return InvalidInput, got {err:?}"
+        "whitespace consumer_kind must return InvalidInput, got {err:?}"
     );
 }
 
@@ -2060,7 +2060,7 @@ async fn r2_user_profile_reset_mutates_posteriors() {
         .expect("state_snapshot.salience.alpha() must be a number");
     assert!(
         salience_alpha_before > 2.0,
-        "r3 fix 2: feedback must have moved salience alpha above prior 2.0; got {salience_alpha_before}"
+        "feedback must have moved salience alpha above prior 2.0; got {salience_alpha_before}"
     );
     let epoch_before = mutated["exploration_epoch"].as_u64().unwrap();
 
@@ -2090,7 +2090,7 @@ async fn r2_user_profile_reset_mutates_posteriors() {
     let epoch_after = after["exploration_epoch"].as_u64().unwrap();
     assert!(
         epoch_after > epoch_before,
-        "r3 fix 2: reset must increment exploration_epoch on user-created profile; before={epoch_before} after={epoch_after}"
+        "reset must increment exploration_epoch on user-created profile; before={epoch_before} after={epoch_after}"
     );
 
     // All three posteriors must return exactly to priors:
@@ -2100,7 +2100,7 @@ async fn r2_user_profile_reset_mutates_posteriors() {
     let snap = &after["state_snapshot"];
     assert!(
         !snap.is_null(),
-        "r3 fix 2: state_snapshot must be non-null after reset"
+        "state_snapshot must be non-null after reset"
     );
 
     let rel_alpha = snap["relevance"]["alpha"]
@@ -2111,7 +2111,7 @@ async fn r2_user_profile_reset_mutates_posteriors() {
         .expect("relevance.beta()");
     assert!(
         (rel_alpha - 7.0).abs() < 1e-9 && (rel_beta - 3.0).abs() < 1e-9,
-        "r3 fix 2: relevance must be Beta(7,3) after reset; got ({rel_alpha},{rel_beta})"
+        "relevance must be Beta(7,3) after reset; got ({rel_alpha},{rel_beta})"
     );
 
     let sal_alpha = snap["salience"]["alpha"]
@@ -2120,7 +2120,7 @@ async fn r2_user_profile_reset_mutates_posteriors() {
     let sal_beta = snap["salience"]["beta"].as_f64().expect("salience.beta()");
     assert!(
         (sal_alpha - 2.0).abs() < 1e-9 && (sal_beta - 8.0).abs() < 1e-9,
-        "r3 fix 2: salience must be Beta(2,8) after reset; got ({sal_alpha},{sal_beta})"
+        "salience must be Beta(2,8) after reset; got ({sal_alpha},{sal_beta})"
     );
 
     let tmp_alpha = snap["temporal"]["alpha"]
@@ -2129,7 +2129,7 @@ async fn r2_user_profile_reset_mutates_posteriors() {
     let tmp_beta = snap["temporal"]["beta"].as_f64().expect("temporal.beta()");
     assert!(
         (tmp_alpha - 1.0).abs() < 1e-9 && (tmp_beta - 9.0).abs() < 1e-9,
-        "r3 fix 2: temporal must be Beta(1,9) after reset; got ({tmp_alpha},{tmp_beta})"
+        "temporal must be Beta(1,9) after reset; got ({tmp_alpha},{tmp_beta})"
     );
 }
 
@@ -2191,7 +2191,7 @@ async fn r2_user_profile_feedback_routes_to_profile_state() {
     let events_after = after["total_events"].as_u64().unwrap();
     assert!(
         events_after > events_before,
-        "r2 fix 2: feedback routed to custom profile must increment its total_events; before={events_before} after={events_after}"
+        "feedback routed to custom profile must increment its total_events; before={events_before} after={events_after}"
     );
 }
 
@@ -2573,7 +2573,7 @@ async fn w4_h4_profile_accepts_profile_id_and_id_alias() {
 
 // ── Regression tests ──────────────────────────────────────────────
 
-// R3-1: archiving balanced-recall-v1 then calling brain.feedback without
+// Archiving balanced-recall-v1 then calling brain.feedback without
 // served_by_profile_id must return InvalidInput and must NOT append an event.
 #[tokio::test]
 async fn r3_feedback_default_profile_archived_rejected() {
@@ -2640,10 +2640,10 @@ async fn r3_feedback_default_profile_archived_rejected() {
         RuntimeError::InvalidInput(msg) => {
             assert!(
                 msg.contains("archived"),
-                "r3-1: error must mention 'archived'; got: {msg}"
+                "error must mention 'archived'; got: {msg}"
             );
         }
-        other => panic!("r3-1: expected InvalidInput(archived), got {other:?}"),
+        other => panic!("expected InvalidInput(archived), got {other:?}"),
     }
 
     // No state mutation: total_events must be unchanged.
@@ -2659,7 +2659,7 @@ async fn r3_feedback_default_profile_archived_rejected() {
     let events_after = snap_after["total_events"].as_u64().unwrap_or(0);
     assert_eq!(
         events_after, events_before,
-        "r3-1: archived default profile must not have events appended; before={events_before} after={events_after}"
+        "archived default profile must not have events appended; before={events_before} after={events_after}"
     );
 
     // Defense-in-depth: also verify nothing landed in the event log itself.
@@ -2673,11 +2673,11 @@ async fn r3_feedback_default_profile_archived_rejected() {
     let log_count_after = log_after["events"].as_array().map(|a| a.len()).unwrap_or(0);
     assert_eq!(
         log_count_after, log_count_before,
-        "r3-1: rejected feedback must not append a FeedbackExplicit event; before={log_count_before} after={log_count_after}"
+        "rejected feedback must not append a FeedbackExplicit event; before={log_count_before} after={log_count_after}"
     );
 }
 
-// R3-3: brain.create_profile profile-id grammar enforcement.
+// brain.create_profile profile-id grammar enforcement.
 #[tokio::test]
 async fn r3_create_profile_id_grammar_enforced() {
     let (pack, rt) = make_pack();
@@ -2696,7 +2696,7 @@ async fn r3_create_profile_id_grammar_enforced() {
         .unwrap_err();
     assert!(
         matches!(err, RuntimeError::InvalidInput(_)),
-        "r3-3: whitespace-only name must return InvalidInput; got {err:?}"
+        "whitespace-only name must return InvalidInput; got {err:?}"
     );
 
     // Leading/trailing space: trimmed name "my-profile" must be accepted.
@@ -2707,7 +2707,7 @@ async fn r3_create_profile_id_grammar_enforced() {
         &token,
     )
     .await
-    .expect("r3-3: name with leading/trailing spaces should be accepted after trim");
+    .expect("name with leading/trailing spaces should be accepted after trim");
 
     // Dot in name must be rejected.
     let err = pack
@@ -2721,7 +2721,7 @@ async fn r3_create_profile_id_grammar_enforced() {
         .unwrap_err();
     assert!(
         matches!(err, RuntimeError::InvalidInput(_)),
-        "r3-3: dot in name must return InvalidInput; got {err:?}"
+        "dot in name must return InvalidInput; got {err:?}"
     );
 
     // Underscore in name must be rejected.
@@ -2736,7 +2736,7 @@ async fn r3_create_profile_id_grammar_enforced() {
         .unwrap_err();
     assert!(
         matches!(err, RuntimeError::InvalidInput(_)),
-        "r3-3: underscore in name must return InvalidInput; got {err:?}"
+        "underscore in name must return InvalidInput; got {err:?}"
     );
 
     // Asterisk in name must be rejected.
@@ -2751,7 +2751,7 @@ async fn r3_create_profile_id_grammar_enforced() {
         .unwrap_err();
     assert!(
         matches!(err, RuntimeError::InvalidInput(_)),
-        "r3-3: asterisk name must return InvalidInput; got {err:?}"
+        "asterisk name must return InvalidInput; got {err:?}"
     );
 
     // Valid alphanumeric-hyphen name must succeed.
@@ -2762,7 +2762,7 @@ async fn r3_create_profile_id_grammar_enforced() {
         &token,
     )
     .await
-    .expect("r3-3: valid alphanumeric-hyphen name must succeed");
+    .expect("valid alphanumeric-hyphen name must succeed");
 }
 
 // #289: feedback event must record a non-zero duration_us.
@@ -4330,7 +4330,7 @@ mod brain_005_section_signals {
         assert_eq!(result["emitted"], json!(true));
     }
 
-    // ── New tests for Blocker fix (PR #46 re-review) ──────────────────────────
+    // ── PR #46 regression tests ──────────────────────────────────────────────
 
     #[tokio::test]
     async fn section_signals_empty_map_is_rejected() {

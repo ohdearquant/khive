@@ -896,9 +896,8 @@ fn truncated_embedding_head(content: &str) -> Option<&str> {
 /// exhaustively (no `..`), so a future new field on `RawCommit` forces a
 /// compile error here before it can silently skip this boundary -- the same
 /// discipline `MaskedIssueFields` (below) already applies to `GhIssue`
-/// (issue #841, mirroring the #835 review's fix direction: "one sanitization
-/// boundary that masks every externally controlled string before
-/// constructing properties, so omissions are structurally hard").
+/// (issue #841), following the same one-boundary-per-record approach as #835
+/// so omissions are structurally hard.
 ///
 /// `sha`/`short_sha`/`committed_at`/`parents` are git-computed hashes and an
 /// RFC3339 timestamp -- not attacker-authored free text -- so they pass
@@ -1329,8 +1328,8 @@ fn gh_json(repo: &Path, args: &[&str]) -> Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
-/// Per-page fetch cap for both PR and issue paging (ADR-088 Amendment 1 fix
-/// round, Issue High-1). `gh {pr,issue} list --search` is backed by GitHub's
+/// Per-page fetch cap for both PR and issue paging (ADR-088 Amendment 1).
+/// `gh {pr,issue} list --search` is backed by GitHub's
 /// search API, which never returns more than this many results for a single
 /// query regardless of `--limit` — paging works around that ceiling by
 /// advancing an `updated:>=` floor between calls, not by requesting more
@@ -1340,7 +1339,7 @@ const PAGE_LIMIT: usize = 1000;
 /// What a paging loop should do after processing one fetched page. Pure and
 /// unit-testable independent of `gh`, the database, or async machinery — the
 /// entire "was the remote window proven exhausted" decision lives here
-/// (ADR-088 Amendment 1 fix-round High-1: a single hard-coded `--limit 1000`
+/// (ADR-088 Amendment 1): a single hard-coded `--limit 1000`
 /// fetch could previously report `done: true` while a repo's remaining
 /// PRs/issues past position 1000 were never seen).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1447,8 +1446,8 @@ fn fetch_issue_page(repo: &Path, floor: Option<&str>) -> Result<Vec<GhIssue>> {
 /// future new `GhPr` field forces a compile error here before it can
 /// silently skip this boundary -- the same discipline `MaskedIssueFields`
 /// applies to `GhIssue` (issue #841: PR author, base ref, and head ref were
-/// the residual raw fields after #835's title fix; mirrors the #835 review's
-/// fix direction of one sanitization boundary per record type).
+/// the residual raw fields after #835's title fix, using one sanitization
+/// boundary per record type).
 ///
 /// `number`, `created_at`/`merged_at`/`closed_at`/`updated_at`, and
 /// `merge_commit`'s `oid` are GitHub-generated (not attacker-authored free
@@ -1665,7 +1664,7 @@ async fn ingest_prs(
 
     if !window_complete {
         // The remote window may hold more PRs than this pass ever fetched
-        // (ADR-088 Amendment 1 fix-round High-1) — the local budget alone is
+        // (ADR-088 Amendment 1); the local budget alone is
         // not a complete signal; report `done = false` regardless of budget
         // state so the caller's resume loop keeps going.
         report.done = false;
@@ -1890,7 +1889,7 @@ mod paging_tests {
         assert_eq!(outcome, PageOutcome::WindowComplete);
     }
 
-    /// This is the exact ADR-088 Amendment 1 fix-round High-1 scenario: a
+    /// This is the exact ADR-088 Amendment 1 scenario: a
     /// full (`PAGE_LIMIT`-sized) page came back, but the local budget was
     /// NOT exhausted (e.g. every record in the page already existed and
     /// consumed no budget) and paging is still forced to stop because the
@@ -2172,7 +2171,7 @@ mod compact_prefix_resolver_tests {
     }
 }
 
-/// PR #816 r3 Major finding: `find_document_for_path` bound an unescaped
+/// PR #816: `find_document_for_path` bound an unescaped
 /// path into a `LIKE` pattern (`%`/`_` in a filename became pattern
 /// wildcards) and picked whichever candidate the unordered `LIMIT 1` scan
 /// happened to return first, even when an exact match existed.
@@ -2239,7 +2238,7 @@ mod find_document_for_path_tests {
         );
     }
 
-    /// PR #816 r5 Major finding: running the exact-match read and the
+    /// PR #816: running the exact-match read and the
     /// LIKE-fallback read as two separate awaited queries left a TOCTOU gap
     /// where a document inserted between them could still lose to the
     /// unordered fallback `LIMIT 1`. Resolution must now happen in one

@@ -375,7 +375,7 @@ async fn on_proposal_withdrawn_cas_returns_false_on_second_call() {
     );
 }
 
-// H1 / internal-review R3 regression: two sequential `withdrawn_and_emit` calls on the same
+// H1 regression: two sequential `withdrawn_and_emit` calls on the same
 // open proposal must produce exactly ONE ProposalWithdrawn event in the events
 // table, and the second call must return cas_hit=false.
 #[tokio::test]

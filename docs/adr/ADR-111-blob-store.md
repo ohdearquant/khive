@@ -67,8 +67,8 @@ string, which is always already valid since the type's only constructors (`from_
 input through `ContentRef::from_hex`, so a malformed serialized value (wrong length, uppercase,
 non-hex characters) is rejected at deserialization instead of silently constructing an invalid
 `ContentRef` that would later panic in the filesystem backend's shard-path slicing. **This is
-deliberate, not incidental: deriving `Deserialize` here — the combination this ADR's Decision
-section showed until a later review pass — was exactly the high-severity issue identified during review of PR #922.**
+deliberate, not incidental: the former derived `Deserialize` in this ADR's Decision section
+bypassed validation (PR #922).**
 Do not "simplify" this back to a derive.
 
 Backed by a lowercase-hex BLAKE3-256 digest (64 characters) of the blob's bytes. Identical content
@@ -128,15 +128,15 @@ then checks whether the target path already exists. If it does, `put` returns th
 Before writing a new object (never on a dedup hit), `put` queries the target volume's available
 space via the `fs4` crate, subtracts the size of the pending write, and compares the result
 against a configured floor — `remaining_after_write = available.saturating_sub(bytes.len())`,
-refuse when `remaining_after_write < floor_bytes`. **Amended 2026-07-13 (a high-severity issue
-identified during review):** the original implementation compared `available` directly against the floor, with no
+refuse when `remaining_after_write < floor_bytes`. **Amended 2026-07-13:** the original
+implementation compared `available` directly against the floor, with no
 accounting for the write's own size — `available == floor_bytes + 1` admitted a write of any size,
 including one that would leave the volume below the floor. The check is now write-size-aware.
 
 `FsBlobStore` also serializes the whole check-then-publish critical section of `put` per
 **canonical root** (a process-wide registry maps each canonicalized root path to one shared
 `Arc<tokio::sync::Mutex<()>>`, held across the entire `spawn_blocking` call, from the availability
-check through `persist`). **Amended 2026-07-13 (a high-severity issue identified during review):** without this, two
+check through `persist`). **Amended 2026-07-13:** without this, two
 concurrent puts could each observe the same pre-write availability snapshot, each individually pass
 a write-size-aware check against it, and both proceed to write — jointly pushing the volume under
 the floor even though neither write looked unsafe in isolation, since neither observed the other's
@@ -144,8 +144,8 @@ pending write. A per-root async mutex is adequate at `BlobStore`'s expected writ
 only against concurrent `FsBlobStore` callers within one process, not against another process
 writing to the same volume.
 
-**Amended 2026-07-13 (a focused re-review found the same fix incomplete): the
-first attempt at this fix scoped the mutex to one `FsBlobStore` instance** (`tokio::sync::Mutex<()>`
+**Amended 2026-07-13: the first fix was incomplete because it scoped the mutex
+to one `FsBlobStore` instance** (`tokio::sync::Mutex<()>`
 as a plain struct field) **and borrowed the guard across `put`'s own async stack frame.** Both were
 insufficient: (a) `StorageBackend::blob_store` constructs a fresh `FsBlobStore` on every call, even
 for the same root, so two independently obtained stores for one root had independent locks and
@@ -239,9 +239,9 @@ deletes blob files directly, so a blob referenced from two places is never remov
 concurrent reader by a consumer-side heuristic. `BlobStore` owns the deletion policy; consumers only
 ever add references and let GC reconcile.
 
-**Concurrency guarantee — offline-maintenance-only (amended 2026-07-13, a high-severity issue
-identified during review).** The paragraph above, as originally written, claimed this design "is never removed out
-from under a concurrent reader" — that claim was not true of the shipped implementation and has
+**Concurrency guarantee: offline-maintenance-only (amended 2026-07-13).** The paragraph above, as
+originally written, claimed this design "is never removed out from under a concurrent reader".
+That claim was not true of the shipped implementation and has
 been corrected here rather than left standing. Both `delete` and `orphan_sweep` are
 **offline-maintenance-only** APIs, not safe to run against a live entity writer:
 
@@ -267,8 +267,8 @@ writer's own transactional boundary, so the sweep is safe to run concurrently wi
 would close this hazard properly. That is a larger design (does it live in `khive-storage` as a new
 capability, or in `khive-runtime` orchestrating `BlobStore` + `SqlAccess`/`GraphStore` together?)
 left to a follow-up: [khive#924](https://github.com/ohdearquant/khive/issues/924). It is
-**deliberately not built as part of this fix** — the smaller, honest fix here is making the existing
-hazard explicit and tested, not attempting a bigger coordination design under review pressure.
+**deliberately not built as part of this fix**. The scoped correction makes the existing hazard
+explicit and tested without expanding into a larger coordination design.
 
 ---
 
@@ -325,7 +325,7 @@ misses.
   into this ADR's scope.
 - No MCP wire-surface change: `blob_store` is reached only through `StorageBackend`, not through
   any pack verb. A future doc/file pack ADR will define what (if anything) becomes MCP-visible.
-- **Amendments (2026-07-13, PR #922 review):** `ContentRef` no longer derives
+- **Amendments (2026-07-13, PR #922):** `ContentRef` no longer derives
   `Deserialize` — it is hand-implemented to route every input through `from_hex`, so a malformed
   serialized value is rejected at deserialization instead of later panicking in `shard_path`.
   `FsBlobStore::put`'s floor check now accounts for the pending write's own size. `delete` and
@@ -334,8 +334,8 @@ misses.
   the original §8 text incorrectly described as absent. A DB-coordinated transactional sweep that
   would close that hazard is tracked as a follow-up, not built here:
   [khive#924](https://github.com/ohdearquant/khive/issues/924).
-- **Further amendment (same date, a focused re-review of the concurrency-guard
-  fix):** the first pass at serializing `put` scoped its `tokio::sync::Mutex` to one
+- **Further amendment (same date):** the first fix for serializing `put` scoped
+  its `tokio::sync::Mutex` to one
   `FsBlobStore` instance and borrowed the guard across the async fn's own frame — insufficient,
   because `StorageBackend::blob_store` builds a fresh `FsBlobStore` per call (so independently
   constructed stores for the same root had independent locks) and because cancelling the outer
@@ -370,8 +370,8 @@ misses.
 - [ADR-044](ADR-044-vector-store-extensions.md) — `orphan_sweep` precedent.
 - [ADR-086](ADR-086-doc-file-pack.md) — deferred `StorageCapability::Blob`.
 - `fs4` crate (`https://crates.io/crates/fs4`) — cross-platform free-space query.
-- PR #922 review — source of the three high-severity issues this ADR was amended to address.
-- PR #922 follow-up review — confirmed the deserialization fix and found the floor-guard fix
+- PR #922, source of the three corrections this ADR was amended to address.
+- PR #922 follow-up confirmed the deserialization fix and found the floor-guard fix
   incomplete (not actually per-root, not cancellation-safe) and this ADR's `ContentRef` example
   stale.
 - [khive#924](https://github.com/ohdearquant/khive/issues/924) — follow-up: transactional,

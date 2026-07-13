@@ -280,7 +280,7 @@ mod tests {
     /// Fork C slice 2: proves `record_serve`'s single-row INSERT — issued via
     /// `sql.writer().execute(..)` — is actually enqueued on the pool's shared
     /// `WriterTaskHandle` channel when the write queue is enabled. This is
-    /// the BLOCKER 2 Part A fix (`SqliteWriter::execute` routes through the
+    /// the `SqliteWriter::execute` fix, which routes through the
     /// writer task like `execute_batch` already did): `record_serve` itself
     /// needed zero code changes, but this test proves the fix actually
     /// reaches this call site rather than asserting it by inspection alone.

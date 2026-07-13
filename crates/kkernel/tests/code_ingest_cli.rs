@@ -6,7 +6,7 @@
 //! only a real subprocess exercises clap argument parsing, `main`'s
 //! subcommand dispatch, the process exit code, and — most importantly — the
 //! filesystem side effects (or lack thereof) of `--dry-run` and a rejected
-//! document, which is exactly what the PR #848 review found
+//! document, matching the failure fixed by PR #848
 //! missing.
 
 use std::path::Path;

@@ -692,7 +692,7 @@ mod tests {
         // Hold a live writer connection open across the dry run below, with
         // one uncheckpointed write on it, so the target's `-wal`/`-shm`
         // sidecars are guaranteed present with real content going into the
-        // dry run — the "existing WAL database" scenario Finding 1
+        // Dry run of the "existing WAL database" scenario
         // reproduced against (e.g. a live daemon holding the db open while
         // an admin separately runs `code-ingest --dry-run`).
         let pin = StorageBackend::sqlite(&db).expect("open pin backend");
@@ -754,7 +754,7 @@ mod tests {
         );
         assert_eq!(
             shm_before, shm_after,
-            "dry-run must not touch the existing -shm sidecar (Finding 1 regression)"
+            "dry-run must not touch the existing -shm sidecar"
         );
 
         drop(pin);
