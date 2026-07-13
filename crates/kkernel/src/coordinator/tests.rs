@@ -1033,6 +1033,7 @@ async fn t7a_multi_backend_search_populates_real_entity_kind() {
             save_to: None,
             format: None,
             format_per_op: None,
+            request_id: None,
         })
         .await
         .expect("T7a: dispatch");
@@ -1123,6 +1124,7 @@ async fn t7b_multi_backend_search_kind_filter_excludes_off_kind() {
             save_to: None,
             format: None,
             format_per_op: None,
+            request_id: None,
         })
         .await
         .expect("T7b: dispatch");
@@ -1185,6 +1187,7 @@ async fn t7c_multi_backend_search_min_score_applied() {
             save_to: None,
             format: None,
             format_per_op: None,
+            request_id: None,
         })
         .await
         .expect("T7c: dispatch");
@@ -1245,6 +1248,7 @@ async fn t7d_multi_backend_search_session_kind_routes_to_note_substrate() {
             save_to: None,
             format: None,
             format_per_op: None,
+            request_id: None,
         })
         .await
         .expect("T7d: dispatch");

@@ -1251,6 +1251,7 @@ mod tests {
                         save_to: None,
                         format: None,
                         format_per_op: None,
+                        request_id: None,
                     })
                     .await
                     .expect("dispatch must not error");

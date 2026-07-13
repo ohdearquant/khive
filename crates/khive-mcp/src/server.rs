@@ -1609,6 +1609,9 @@ impl KhiveMcpServer {
             format: p.format.clone(),
             format_per_op: p.format_per_op.clone(),
             from_wire: true,
+            // khive#948: forwarded unchanged from the tool caller's params.
+            // `None` when the caller supplied no id (pre-#948 client).
+            request_id: p.request_id,
         }
     }
 
@@ -1620,8 +1623,11 @@ impl KhiveMcpServer {
     /// (or sets `from_wire` on the daemon frame), which enforces verb visibility.
     ///
     /// Pure local dispatch: no [`khive_runtime::RequestIdentity`] override is
-    /// applied (ADR-096 Fork 1) — this server's own construction-baked
-    /// identity is used, unchanged from before per-request identity existed.
+    /// applied by this caller (ADR-096 Fork 1) — this server's own
+    /// construction-baked namespace/actor/visibility is used, unchanged from
+    /// before per-request identity existed. `dispatch_request_inner` (khive#948)
+    /// may still synthesize an identity carrying those same baked scalars if
+    /// `p.request_id` is set, purely so the audit row is correlatable.
     pub async fn dispatch_request_local(&self, p: RequestParams) -> Result<String, McpError> {
         self.dispatch_request_inner(p, false, None).await
     }
@@ -1640,6 +1646,17 @@ impl KhiveMcpServer {
     /// frame (ADR-096 Fork 1, see `crate::daemon`'s `DaemonDispatch` impl).
     /// `None` for every local (non-daemon-served) call — this server's own
     /// baked identity applies, exactly as before this parameter existed.
+    ///
+    /// khive#948: when `identity` is `None` (every local-dispatch call —
+    /// `KHIVE_NO_DAEMON`/soft daemon-fallback and the `save_to` bypass both
+    /// route here via `dispatch_request_wire`) and the caller supplied a
+    /// `request_id`, a `RequestIdentity` is synthesized so the audit row
+    /// stamped by this dispatch is still correlatable. The synthesized
+    /// identity mirrors this server's own baked `default_namespace` /
+    /// `actor_id` / `visible_namespaces` exactly — it changes no dispatch
+    /// semantics, only adds the correlation id — so a request with no
+    /// `request_id` still dispatches through the untouched `identity = None`
+    /// path.
     pub(crate) async fn dispatch_request_inner(
         &self,
         p: RequestParams,
@@ -1647,6 +1664,19 @@ impl KhiveMcpServer {
         identity: Option<khive_runtime::RequestIdentity>,
     ) -> Result<String, McpError> {
         let save_to = p.save_to.clone();
+        let identity = identity.or_else(|| {
+            p.request_id
+                .map(|request_id| khive_runtime::RequestIdentity {
+                    namespace: self.default_namespace.clone(),
+                    actor_id: self.actor_id().map(str::to_string),
+                    visible_namespaces: self
+                        .visible_namespaces()
+                        .iter()
+                        .map(|ns| ns.as_str().to_string())
+                        .collect(),
+                    request_id: Some(request_id),
+                })
+        });
         let parsed = parse_request(&p.ops).map_err(dsl_err_to_mcp)?;
 
         // Parse presentation strings → PresentationMode.
@@ -1931,6 +1961,7 @@ impl ServerHandler for KhiveMcpServer {
 mod tests {
     use super::*;
     use khive_runtime::Namespace;
+    use khive_storage::{EventFilter, PageRequest};
     use serial_test::serial;
 
     fn t(pack: &str, verb: &str, desc: &str) -> (String, String, String) {
@@ -2373,6 +2404,126 @@ mod tests {
         std::env::remove_var("KHIVE_LOCK");
     }
 
+    /// khive#948: `wire_daemon_frame` forwards `RequestParams::request_id`
+    /// onto the `DaemonRequestFrame` unchanged, and defaults to `None` when
+    /// the caller supplied none.
+    #[test]
+    fn wire_daemon_frame_forwards_request_id() {
+        let server = make_daemon_save_to_test_server();
+
+        let with_id = RequestParams {
+            ops: "stats()".to_string(),
+            request_id: Some(123),
+            ..Default::default()
+        };
+        let frame = server.wire_daemon_frame(&with_id);
+        assert_eq!(frame.request_id, Some(123));
+
+        let without_id = RequestParams {
+            ops: "stats()".to_string(),
+            ..Default::default()
+        };
+        let frame = server.wire_daemon_frame(&without_id);
+        assert_eq!(frame.request_id, None);
+    }
+
+    /// Query every persisted audit event and find the one whose
+    /// `resource.request_id` matches `id`, if any.
+    async fn find_audit_event_with_request_id(
+        store: &Arc<dyn khive_storage::EventStore>,
+        id: u64,
+    ) -> Option<khive_storage::Event> {
+        let page = store
+            .query_events(
+                EventFilter::default(),
+                PageRequest {
+                    limit: 50,
+                    offset: 0,
+                },
+            )
+            .await
+            .expect("query_events must succeed");
+        page.items
+            .into_iter()
+            .find(|ev| ev.payload["resource"]["request_id"] == json!(id))
+    }
+
+    /// khive#948: `request_id` was previously dropped on the
+    /// `KHIVE_NO_DAEMON`/soft-fallback local dispatch path because
+    /// `dispatch_request_wire` always passed `identity = None`. This drives
+    /// `request()` end-to-end under `KHIVE_NO_DAEMON=1` and inspects the
+    /// persisted audit event, proving the id now survives to
+    /// `resource.request_id` on the local-dispatch path too, not just the
+    /// daemon-forward path.
+    #[tokio::test]
+    #[serial]
+    async fn request_no_daemon_fallback_preserves_request_id_in_audit_event() {
+        clear_daemon_env();
+        std::env::set_var("KHIVE_NO_DAEMON", "1");
+
+        let server = make_daemon_save_to_test_server();
+        server
+            .request(Parameters(RequestParams {
+                // Explicit `namespace="local"` so the write lands in the
+                // same namespace the server's audit `EventStore` handle is
+                // scoped to at construction (`Namespace::local()`), matching
+                // `find_audit_event_with_request_id`'s read scope.
+                ops: "stats(namespace=\"local\")".to_string(),
+                request_id: Some(9001),
+                ..Default::default()
+            }))
+            .await
+            .expect("request() must succeed via local dispatch under KHIVE_NO_DAEMON");
+
+        let store = server
+            .event_store()
+            .expect("in-memory runtime must configure an EventStore");
+        let matched = find_audit_event_with_request_id(&store, 9001).await;
+        assert!(
+            matched.is_some(),
+            "KHIVE_NO_DAEMON local dispatch must stamp request_id onto the persisted \
+             audit event"
+        );
+
+        clear_daemon_env();
+    }
+
+    /// khive#948: the `save_to` bypass (MCP-AUD-002) also routes through
+    /// `dispatch_request_wire`'s local dispatch — this proves the id
+    /// survives that path too.
+    #[tokio::test]
+    #[serial]
+    async fn request_save_to_bypass_preserves_request_id_in_audit_event() {
+        clear_daemon_env();
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::env::set_var("KHIVE_SAVE_TO_ROOT", dir.path());
+
+        let server = make_daemon_save_to_test_server();
+        let sink_path = dir.path().join("out.jsonl");
+        server
+            .request(Parameters(RequestParams {
+                ops: "stats(namespace=\"local\")".to_string(),
+                save_to: Some(sink_path.to_string_lossy().to_string()),
+                request_id: Some(9002),
+                ..Default::default()
+            }))
+            .await
+            .expect("request() with save_to must succeed");
+
+        let store = server
+            .event_store()
+            .expect("in-memory runtime must configure an EventStore");
+        let matched = find_audit_event_with_request_id(&store, 9002).await;
+        assert!(
+            matched.is_some(),
+            "save_to local-dispatch bypass must stamp request_id onto the persisted \
+             audit event"
+        );
+
+        clear_daemon_env();
+        std::env::remove_var("KHIVE_SAVE_TO_ROOT");
+    }
+
     async fn connect_when_daemon_ready(sock: &std::path::Path) {
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
@@ -2424,6 +2575,7 @@ mod tests {
                 save_to: Some(sink_path.to_string_lossy().to_string()),
                 format: None,
                 format_per_op: None,
+                request_id: None,
             }))
             .await
             .expect("request with save_to must succeed even with a warm daemon reachable");
@@ -2505,6 +2657,7 @@ mod tests {
                 save_to: None,
                 format: None,
                 format_per_op: None,
+                request_id: None,
             })
             .await
             .expect("baseline stats() must succeed");
@@ -2517,6 +2670,7 @@ mod tests {
                 save_to: None,
                 format: None,
                 format_per_op: None,
+                request_id: None,
             }))
             .await;
 
@@ -2544,6 +2698,7 @@ mod tests {
                 save_to: None,
                 format: None,
                 format_per_op: None,
+                request_id: None,
             })
             .await
             .expect("post-request stats() must succeed");
@@ -2604,6 +2759,7 @@ mod tests {
                 save_to: None,
                 format: None,
                 format_per_op: None,
+                request_id: None,
             })
             .await
             .expect("baseline stats() must succeed");
@@ -2631,6 +2787,7 @@ mod tests {
                 save_to: None,
                 format: None,
                 format_per_op: None,
+                request_id: None,
             }))
             .await
             .expect("strict fallback must land as a normal Ok(envelope), not Err(McpError)");
@@ -2657,6 +2814,7 @@ mod tests {
                 save_to: None,
                 format: None,
                 format_per_op: None,
+                request_id: None,
             }))
             .await
             .expect("strict fallback must land as a normal Ok(envelope), not Err(McpError)");
@@ -2683,6 +2841,7 @@ mod tests {
                 save_to: None,
                 format: None,
                 format_per_op: None,
+                request_id: None,
             }))
             .await
             .expect("strict fallback must land as a normal Ok(envelope), not Err(McpError)");
@@ -2709,6 +2868,7 @@ mod tests {
                 save_to: None,
                 format: None,
                 format_per_op: None,
+                request_id: None,
             })
             .await
             .expect("post-request stats() must succeed");
