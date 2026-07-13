@@ -152,7 +152,7 @@ matching every other khive verb's error contract) with scan-specific fields:
 Three layers, evaluated in order, all inside the verb handler:
 
 1. **Token denylist.** Pattern matching (regex, fail-closed) against categories described
-   in the Pattern File Format section below: actor/seat-identifier tokens, internal
+   in the Pattern File Format section below: actor and deployment identifier tokens, internal
    process and workflow vocabulary that would be meaningless or confusing to an external
    reader, internal filesystem paths, and commercial-strategy vocabulary in an
    OSS-facing context. Patterns are pack data, not code - a versioned file, editable and
@@ -181,8 +181,9 @@ Three layers, evaluated in order, all inside the verb handler:
 `[git] publish_repos = ["org/repo", ...]` in daemon configuration, read at daemon startup
 
 - resolved as per-daemon config (see Resolutions, F4). A repo not explicitly listed is
-  never writable through this surface; fork and external repos are categorically excluded,
-  since they can never appear in an operator's own allowlist. This is distinct from, and
+  never writable through this surface. The explicit allowlist is authoritative: an operator
+  must not add a fork or external repository slug to it, and a slug that is not listed is never
+  writable regardless of its origin. This is distinct from, and
   does not replace, Gate-level authorization: the allowlist bounds which repos this daemon
   process may ever publish into, regardless of which actor is calling; Gate policy (if
   configured beyond the permissive default) further bounds which actors may call the verb at
@@ -193,7 +194,9 @@ Three layers, evaluated in order, all inside the verb handler:
 ### Audit and the event plane
 
 Every dispatch of a publish verb - allowed or denied - produces an `Event` record (ADR-004
-substrate, immutable and append-only), queryable via GQL/SPARQL like any other Event:
+substrate, immutable and append-only), accessible through the `list(kind="event", verb=..., ...)`
+access path like any other Event (ADR-022 makes `list` the supported event-access path and
+excludes `query()` / GQL / SPARQL for events):
 
 - **Deny**: `kind = "hygiene_deny"`, with `properties` carrying `verb`, `repo`,
   `pattern_ids` (every pattern id that matched, matching the `hits[]` array returned to the
@@ -271,15 +274,15 @@ not required by this ADR.
 1. **In-repo generic pattern file** - versioned in the khive repository, public-visible.
    Contains only generic pattern _classes_: a pattern that matches the _shape_ of an
    actor-namespace token, an internal-path prefix, or org-mechanics phrasing, never a
-   concrete seat name, alias, or literal internal term. This file must never contain
-   seat-specific tokens; if a pattern would only make sense with a concrete literal
+   concrete internal identifier, alias, or literal internal term. This file must never contain
+   concrete internal-identifier tokens; if a pattern would only make sense with a concrete literal
    internal term hardcoded into it, that pattern does not belong in this file - it belongs
    in the overlay.
 2. **Local overlay file** - not versioned in the repository, resolved from a
    daemon-configured path (for example, an environment variable or a `[git]` config key
    pointing outside the repository tree, matching the operational shape the git-digest
    scratch cache already uses for daemon-owned paths outside version control). Contains the
-   concrete internal tokens: seat names, aliases, literal internal-process phrasing. This
+   concrete internal tokens: internal identifiers, aliases, literal internal-process phrasing. This
    file is a private, per-installation overlay - it is never committed, never published,
    and is out of scope for this ADR's public-repo artifact.
 
@@ -439,7 +442,7 @@ Four forks were presented for this design; each is resolved in place.
    entirely in a private overlay, or split. **Resolved**: split. Generic pattern classes
    ship in-repo, versioned and public-visible; the concrete internal-token list is a
    private local overlay file, merged at load per the rules in "Pattern File Format"
-   above. The in-repo file must never contain seat-specific tokens.
+   above. The in-repo file must never contain concrete internal-identifier tokens.
 3. **Deny-event notification (F3)**: whether a scan deny also notifies the calling actor's
    own inbox or messaging channel, in addition to the synchronous deny response.
    **Resolved**: no per-deny notification in v0. The synchronous deny to the caller plus
@@ -484,13 +487,13 @@ Four forks were presented for this design; each is resolved in place.
 
 ## Alternatives Considered
 
-| Alternative                                                      | Why not adopted                                                                                                                                                                                                                                                                |
-| ---------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| Enforce hygiene only at the client-side hook, no server verb     | Does not compose with the eventual "raw `gh` denied for content writes" endpoint: any caller not running a current hook has no enforcement at all. A server-side verb is the one chokepoint every caller must pass through regardless of local hook state.                     |
-| Semantic or LLM-based content classification instead of patterns | Rejected for v0. Patterns are deterministic, auditable as a file diff, and portable across two independent implementations by construction; a classifier's decisions are neither deterministic nor reviewable in the same way, and out-of-scope per this ADR's scope decision. |
-| A `force=true` per-call escape parameter                         | Rejected. Defeats the review property the allowlist file provides: a legitimate exception must be a versioned, reviewable config edit, never a call-site flag any caller can set for itself.                                                                                   |
-| A single merged pattern file, no in-repo/overlay split           | Rejected. The in-repo file must never carry seat-specific tokens (F2); a single file would either leak internal terms into a public repository or force every installation to maintain a full private copy instead of layering a small overlay onto a shared generic base.     |
-| Fold outbound publish into `git.digest` with a write mode        | Rejected, matching ADR-108's identical rejection of overloading `git.digest`: it is read/ingest-shaped, and conflating it with a write-and-scan operation mixes two operations with entirely different audit and failure-mode needs.                                           |
+| Alternative                                                      | Why not adopted                                                                                                                                                                                                                                                                           |
+| ---------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Enforce hygiene only at the client-side hook, no server verb     | Does not compose with the eventual "raw `gh` denied for content writes" endpoint: any caller not running a current hook has no enforcement at all. A server-side verb is the one chokepoint every caller must pass through regardless of local hook state.                                |
+| Semantic or LLM-based content classification instead of patterns | Rejected for v0. Patterns are deterministic, auditable as a file diff, and portable across two independent implementations by construction; a classifier's decisions are neither deterministic nor reviewable in the same way, and out-of-scope per this ADR's scope decision.            |
+| A `force=true` per-call escape parameter                         | Rejected. Defeats the review property the allowlist file provides: a legitimate exception must be a versioned, reviewable config edit, never a call-site flag any caller can set for itself.                                                                                              |
+| A single merged pattern file, no in-repo/overlay split           | Rejected. The in-repo file must never carry concrete internal-identifier tokens (F2); a single file would either leak internal terms into a public repository or force every installation to maintain a full private copy instead of layering a small overlay onto a shared generic base. |
+| Fold outbound publish into `git.digest` with a write mode        | Rejected, matching ADR-108's identical rejection of overloading `git.digest`: it is read/ingest-shaped, and conflating it with a write-and-scan operation mixes two operations with entirely different audit and failure-mode needs.                                                      |
 
 ## References
 
