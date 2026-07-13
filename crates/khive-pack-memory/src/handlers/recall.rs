@@ -1699,7 +1699,7 @@ mod tests {
     // ── #866: `recall_executed` event-plane emission ────────────────────────
 
     // `#[serial(background_tasks)]`: shares `recall_stamps_served_by_profile_id_
-    // and_appends_serve_ledger_row`'s rationale above — this test drives the
+    // and_appends_serve_ledger_row`'s rationale above: this test drives the
     // same `track_background_task`-fired path (serve-ledger append +
     // `recall_executed` emission now live in the same tracked task).
     #[tokio::test]
