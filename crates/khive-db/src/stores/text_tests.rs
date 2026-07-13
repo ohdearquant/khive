@@ -1300,10 +1300,6 @@ async fn test_search_slash_query_excludes_merged_alias_all_modes_and_tokenizers(
         .await;
 }
 
-/// #916 unit coverage for the allowlist helper itself: only ASCII
-/// alphanumerics and `_` are bareword-safe; every metacharacter named in the
-/// issue (`#`, `%`, `=`), plus the wider FTS5 punctuation set the empirical
-/// probe found unsafe, must be rejected.
 #[test]
 fn test_is_fts5_bareword_safe() {
     assert!(is_fts5_bareword_safe("hello"));
@@ -1322,11 +1318,6 @@ fn test_is_fts5_bareword_safe() {
     }
 }
 
-/// #916 regression: `#682` (a bare issue-number query, e.g. from an agent
-/// recalling "#682 Stage 2") must not crash the FTS5 leg. Previously `#` was
-/// untouched by `sanitize_fts5_query`, so a single-token query reached
-/// `sanitize_fts5_token_group`'s old unconditional `split_terms.len() == 1`
-/// shortcut and hit FTS5 raw, producing `fts5: syntax error near "#"`.
 #[tokio::test]
 async fn test_search_with_hash_sign_does_not_crash_and_matches() {
     let store = setup_trigram_store("hash_sign_query");
@@ -1363,9 +1354,6 @@ async fn test_search_with_hash_sign_does_not_crash_and_matches() {
     }
 }
 
-/// #916 regression: `B=128` (an equals-bearing token from a technical query
-/// like "chunkwise B=128 traffic") must not crash the FTS5 leg. `=` was
-/// previously untouched by `sanitize_fts5_query`.
 #[tokio::test]
 async fn test_search_with_equals_sign_does_not_crash_and_matches() {
     let store = setup_trigram_store("equals_sign_query");
@@ -1402,11 +1390,6 @@ async fn test_search_with_equals_sign_does_not_crash_and_matches() {
     }
 }
 
-/// #916 regression: `Min-K%Prob` (a percent-bearing punctuated identifier,
-/// verbatim from the issue's live-log evidence) must not crash the FTS5 leg.
-/// `%` was previously untouched by `sanitize_fts5_query`, and the hyphen
-/// split it into a multi-term group whose second term (`K%Prob`) carried the
-/// unsanitized `%` straight into a bareword position.
 #[tokio::test]
 async fn test_search_with_percent_sign_does_not_crash_and_matches() {
     let store = setup_trigram_store("percent_sign_query");
@@ -1443,12 +1426,54 @@ async fn test_search_with_percent_sign_does_not_crash_and_matches() {
     }
 }
 
-/// #916 regression: a realistic multi-token query mixing FTS5-unsafe
-/// punctuated tokens with ordinary barewords (verbatim shape from the
-/// issue's live-log evidence: `"#682 Stage 2: MoE expert-cache prefetch"`)
-/// must not crash the FTS5 leg and must preserve AND-like discrimination —
-/// an unrelated document that only shares the plain bareword terms must not
-/// match.
+#[tokio::test]
+async fn test_search_with_embedded_quote_preserves_literal_match() {
+    let store = setup_trigram_store("embedded_quote_query");
+    let target_id = Uuid::new_v4();
+    let unquoted_id = Uuid::new_v4();
+
+    store
+        .upsert_document(make_document(
+            target_id,
+            "quoted identifier",
+            "the foo\"bar identifier appears here",
+        ))
+        .await
+        .unwrap();
+    store
+        .upsert_document(make_document(
+            unquoted_id,
+            "unquoted identifier",
+            "the foobar identifier appears here",
+        ))
+        .await
+        .unwrap();
+
+    for mode in [
+        TextQueryMode::Plain,
+        TextQueryMode::AnyTerm,
+        TextQueryMode::Phrase,
+    ] {
+        let hits = store
+            .search(TextSearchRequest {
+                query: "foo\"bar".to_string(),
+                mode: mode.clone(),
+                filter: Some(ns_filter("test_ns")),
+                top_k: 10,
+                snippet_chars: 64,
+            })
+            .await
+            .unwrap();
+        let hit_ids: std::collections::HashSet<_> =
+            hits.into_iter().map(|hit| hit.subject_id).collect();
+
+        assert!(
+            hit_ids.contains(&target_id),
+            "{mode:?} must preserve an embedded quote as literal query text; got {hit_ids:?}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn test_search_with_mixed_punctuated_and_plain_tokens_does_not_crash() {
     let store = setup_trigram_store("mixed_punctuated_plain_query");
@@ -1476,7 +1501,7 @@ async fn test_search_with_mixed_punctuated_and_plain_tokens_does_not_crash() {
     for mode in [TextQueryMode::Plain, TextQueryMode::AnyTerm] {
         let result = store
             .search(TextSearchRequest {
-                query: "#682 Stage".to_string(),
+                query: "#682 Stage 2".to_string(),
                 mode: mode.clone(),
                 filter: Some(ns_filter("test_ns")),
                 top_k: 10,

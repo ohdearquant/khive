@@ -1035,17 +1035,8 @@ mod tests {
         );
     }
 
-    /// #916 regression: `search(kind="note", ...)` must succeed on a query
-    /// containing `@`, exercised end to end through verb dispatch.
-    ///
-    /// `@` used to reach SQLite FTS5's bareword parser raw (`sanitize_fts5_query`
-    /// did not strip it) and crash it, which `search_notes`
-    /// (khive-runtime/operations.rs) surfaced as `RuntimeError::InvalidInput`
-    /// per #569's fail-loud policy. `sanitize_fts5_token_group`'s
-    /// bareword-safety gate (#916) now routes `@` through the quoted-phrase
-    /// alternative instead, so the query succeeds and finds the seeded note.
     #[tokio::test]
-    async fn handler_search_note_residual_fts5_char_now_sanitized() {
+    async fn handler_search_note_sanitizes_fts5_metacharacters() {
         let rt = KhiveRuntime::memory().expect("in-memory runtime");
         let tok = rt.authorize(Namespace::local()).unwrap();
 
@@ -1054,39 +1045,44 @@ mod tests {
         let registry = builder.build().expect("registry build");
         let pack = KgPack::new(rt.clone());
 
-        pack.dispatch(
-            "create",
-            json!({
-                "kind": "observation",
-                "content": "use foo@bar to chain calls"
-            }),
-            &registry,
-            &tok,
-        )
-        .await
-        .expect("note create must succeed");
-
-        let result = pack
-            .dispatch(
-                "search",
+        for (query, content) in [
+            ("#682", "tracking #682 Stage 2 work"),
+            ("B=128", "chunkwise B=128 traffic"),
+            ("Min-K%Prob", "evaluate Min-K%Prob membership inference"),
+            ("foo\"bar", "the foo\"bar identifier"),
+            ("foo@bar", "use foo@bar to chain calls"),
+        ] {
+            pack.dispatch(
+                "create",
                 json!({
-                    "kind": "note",
-                    "query": "foo@bar",
-                    "limit": 10
+                    "kind": "observation",
+                    "content": content
                 }),
                 &registry,
                 &tok,
             )
-            .await;
+            .await
+            .expect("note create must succeed");
 
-        let value = result.unwrap_or_else(|e| {
-            panic!("#916 search(kind=\"note\") must not fail on an '@'-bearing query, got: {e:?}")
-        });
-        let hits = value.as_array().expect("search must return an array");
-        assert!(
-            !hits.is_empty(),
-            "#916 '@'-bearing query must still find the seeded 'foo@bar' note; got {hits:?}"
-        );
+            let value = pack
+                .dispatch(
+                    "search",
+                    json!({
+                        "kind": "note",
+                        "query": query,
+                        "limit": 10
+                    }),
+                    &registry,
+                    &tok,
+                )
+                .await
+                .unwrap_or_else(|e| panic!("search must accept query {query:?}, got: {e:?}"));
+            let hits = value.as_array().expect("search must return an array");
+            assert!(
+                !hits.is_empty(),
+                "query {query:?} must find the seeded note; got {hits:?}"
+            );
+        }
     }
 
     // ---- `resolve` verb (unified-verb draft ADR, Slice 1) ----

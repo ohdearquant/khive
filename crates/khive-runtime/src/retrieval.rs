@@ -1342,7 +1342,7 @@ mod tests {
     /// `sanitize_fts5_token_group`'s bareword-safety gate now recognizes `@` (and
     /// every other ASCII punctuation character not already handled) as unsafe for
     /// an unquoted bareword position and routes it through the quoted-phrase
-    /// alternative instead — which FTS5 always accepts literally — so the query
+    /// alternative instead, which FTS5 accepts literally, so the query
     /// now succeeds and finds the seeded content rather than erroring.
     #[tokio::test]
     async fn hybrid_search_with_residual_fts5_char_now_sanitized() {
@@ -1378,7 +1378,7 @@ mod tests {
     /// issue's live-log evidence (`#682 Stage 2`, `Min-K%Prob`, `B=128`):
     /// `hybrid_search`'s FTS leg must not lose its lexical signal to a parser
     /// syntax error on `#`, `%`, or `=`. Each query below must both succeed
-    /// and actually surface a `Text`/`Both`-sourced hit — proving the FTS leg
+    /// and actually surface a `Text`/`Both`-sourced hit, proving the FTS leg
     /// contributed, not just that the vector leg papered over a degraded
     /// text leg.
     #[tokio::test]

@@ -327,19 +327,26 @@ fn sanitize_fts5_query_legacy_merged(query: &str) -> String {
         .join(" ")
 }
 
-/// Strip a raw token down to what is safe inside a double-quoted FTS5 phrase:
-/// the closing delimiter (`"`), the trailing-`*` prefix-query trigger, and
-/// control characters. Everything else — including `-`, `.`, `:`, `$`, `'`,
-/// digits — passes through literally, since FTS5 phrase text is matched
+/// Escape a raw token for use inside a double-quoted FTS5 phrase. Embedded
+/// double quotes are doubled; the trailing-`*` prefix-query trigger and
+/// control characters are removed. Everything else, including punctuation,
+/// passes through literally, since FTS5 phrase text is matched
 /// against the column's own tokenization of that literal text (word-exact
 /// under `unicode61`, substring-exact under `trigram`), not re-sanitized.
 ///
 /// Returns `None` if nothing survives the filter.
 fn sanitize_fts5_phrase_literal(token: &str) -> Option<String> {
-    let literal: String = token
+    let mut literal = String::with_capacity(token.len());
+    for c in token
         .chars()
-        .filter(|c| !matches!(c, '"' | '*' | '\0') && !c.is_control())
-        .collect();
+        .filter(|c| !matches!(c, '*' | '\0') && !c.is_control())
+    {
+        if c == '"' {
+            literal.push_str("\"\"");
+        } else {
+            literal.push(c);
+        }
+    }
     if literal.is_empty() {
         None
     } else {
@@ -356,31 +363,9 @@ fn sanitize_fts5_phrase_literal(token: &str) -> Option<String> {
 /// split segment at or below this length as trigram-unsafe.
 const FTS5_TRIGRAM_MIN_SAFE_LEN: usize = 3;
 
-/// True if every character in `s` is safe to emit unquoted at any bareword
-/// position in an FTS5 MATCH expression.
-///
-/// Verified empirically (2026-07-13, khive #916) by feeding `"a<char>b"` as
-/// a bound MATCH argument for every printable ASCII character 0x21-0x7e to
-/// a live `tokenize='trigram'` table: only ASCII alphanumerics and `_` were
-/// error-free *and* matched as plain substring text in every position.
-/// Every other punctuation character is unsafe as a bareword — most raise a
-/// direct `fts5: syntax error near "<char>"` (`#`, `%`, `=`, `&`, `;`, `<`,
-/// `>`, `?`, `@`, `[`, `\`, `]`, `` ` ``, `|`, `!`, `$`, `'`, `"`, `,`, `.`,
-/// `/`, `(`, `)`, `~`), while `-`, `:`, `{`, `}` are instead silently
-/// reinterpreted as FTS5's column-filter syntax (`col: term`, `{col1
-/// col2}: term`) — just as wrong for a content-matching query, since it
-/// changes what the expression means rather than erroring. `*`, `+`, `^`
-/// are individually error-free too, but [`sanitize_fts5_query`]'s Pass 2
-/// already strips them out of every string this helper is called on, so it
-/// does not need to special-case them.
-///
-/// This is an allowlist, not a denylist, precisely because the denylist
-/// approach ([`sanitize_fts5_query`]'s Pass 2) has needed a new character
-/// added on every prior FTS5-syntax-error report (`$` in #388, `'` in
-/// #570, `#`/`%`/`=` in #916) and will keep needing one for whatever
-/// punctuation the next query happens to contain. An allowlist converges:
-/// nothing reaches an unquoted bareword position unless it is provably
-/// safe.
+/// FTS5 reserves punctuation in barewords for query syntax, including some
+/// forms that change query meaning without producing an error. Keep bareword
+/// alternatives to the conservative ASCII set and quote everything else.
 fn is_fts5_bareword_safe(s: &str) -> bool {
     !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
@@ -424,28 +409,15 @@ fn is_fts5_bareword_safe(s: &str) -> bool {
 ///   requiring adjacency for that token, which is the trade-off intended
 ///   by the finding this fixes (khive #397 Finding 2): correctness over a
 ///   marginally more lenient match.
-/// - (#916) `sanitize_fts5_query`'s Pass 1/2 only reroute a *curated* set of
-///   punctuation characters (grouping chars to spaces, a handful of FTS5
-///   operator chars removed outright) — anything outside that set, e.g.
-///   `#682`, `B=128`, `Min-K%Prob`'s `%`, reaches this function's split and
-///   merged forms unchanged and is an invalid FTS5 bareword. Every bareword
-///   alternative (the split AND-group and the legacy merge) is now gated on
-///   [`is_fts5_bareword_safe`] before being emitted; when a term fails that
-///   check, the alternative is dropped rather than emitted broken, and the
-///   quoted-phrase alternative below — which FTS5 accepts literally,
-///   verified for every ASCII punctuation character (#916) — is what
-///   carries that token instead. A single-term token that sanitizes to one
-///   unsafe bareword (`#682`) now falls through to the same alternative
-///   pipeline the multi-term case already used, rather than returning the
-///   raw bareword unconditionally.
+/// - Punctuation outside the legacy sanitizer, such as `#`, `%`, and `=`,
+///   is invalid or meaningful FTS5 bareword syntax. Bareword alternatives
+///   are emitted only when every term is safe; the quoted phrase preserves
+///   the literal spelling for all other input.
 ///
 /// All emitted readings are additive OR-alternatives otherwise — the result
 /// is never a narrower match than any single (safe) form alone.
 ///
-/// Returns `None` if the token sanitizes to nothing, or if every candidate
-/// alternative was unsafe to emit (only reachable when the raw token
-/// consists solely of characters `sanitize_fts5_phrase_literal` also
-/// strips — quotes, `*`, NUL, control characters).
+/// Returns `None` if the token sanitizes to nothing.
 fn sanitize_fts5_token_group(token: &str) -> Option<String> {
     let split = sanitize_fts5_query(token);
     let split_terms: Vec<&str> = split.split_whitespace().collect();
@@ -454,17 +426,17 @@ fn sanitize_fts5_token_group(token: &str) -> Option<String> {
     }
 
     let all_bareword_safe = split_terms.iter().all(|t| is_fts5_bareword_safe(t));
+    if split_terms.len() == 1 && is_fts5_bareword_safe(token) {
+        return Some(split_terms[0].to_string());
+    }
+
     let has_trigram_unsafe_segment = split_terms
         .iter()
         .any(|t| t.chars().count() < FTS5_TRIGRAM_MIN_SAFE_LEN);
 
     let mut alternatives = Vec::new();
-    if all_bareword_safe {
-        if split_terms.len() == 1 {
-            alternatives.push(split_terms[0].to_string());
-        } else if !has_trigram_unsafe_segment {
-            alternatives.push(format!("({})", split_terms.join(" ")));
-        }
+    if all_bareword_safe && !has_trigram_unsafe_segment {
+        alternatives.push(format!("({})", split_terms.join(" ")));
     }
 
     // An operator-bearing token (e.g. `NEAR(alpha-beta,5)`) can make the
