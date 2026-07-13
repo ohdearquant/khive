@@ -346,6 +346,7 @@ async fn apply_ops_file(
             save_to: None,
             format: None,
             format_per_op: None,
+            request_id: None,
         };
 
         let raw = server
@@ -609,6 +610,7 @@ async fn run_exec_inline_with_forward(
             // `kkernel exec` is a trusted operator surface: subhandler verbs are
             // allowed. Only the agent-facing MCP `request` tool sets this true.
             from_wire: false,
+            request_id: None,
         };
         if let Some(res) = forward_fn(&frame).await {
             let output = res.map_err(|e| anyhow::anyhow!("{}", e.message))?;
@@ -635,6 +637,7 @@ async fn run_exec_inline_with_forward(
         // Tier-1: CLI --output-format overrides the server default (env/builtin).
         format: output_format,
         format_per_op: None,
+        request_id: None,
     };
 
     let output = server
@@ -1269,6 +1272,7 @@ default = true
                 save_to: None,
                 format: None,
                 format_per_op: None,
+                request_id: None,
             })
             .await
             .expect("comm.send must dispatch");
@@ -1299,6 +1303,7 @@ default = true
                     save_to: None,
                     format: None,
                     format_per_op: None,
+                    request_id: None,
                 })
                 .await
                 .expect("list must dispatch");
@@ -1416,6 +1421,7 @@ default = true
                     save_to: None,
                     format: None,
                     format_per_op: None,
+                    request_id: None,
                 };
                 let raw = server
                     .dispatch_request_local(params)
@@ -1652,6 +1658,7 @@ default = true
             save_to: None,
             format: None,
             format_per_op: None,
+            request_id: None,
         };
         let raw = server.dispatch_request_local(params).await.unwrap();
         let resp: serde_json::Value = serde_json::from_str(&raw).unwrap();
@@ -1692,6 +1699,7 @@ default = true
                 save_to: None,
                 format: None,
                 format_per_op: None,
+                request_id: None,
             };
             let raw = server
                 .dispatch_request_local(params)
@@ -1822,6 +1830,7 @@ default = true
             save_to: None,
             format: None,
             format_per_op: None,
+            request_id: None,
         };
         let raw = server.dispatch_request_local(params).await.unwrap();
         let resp: serde_json::Value = serde_json::from_str(&raw).unwrap();
@@ -2285,6 +2294,7 @@ backend = "sessions"
             save_to: None,
             format: None,
             format_per_op: None,
+            request_id: None,
         };
         let raw = server.dispatch_request_local(params).await.unwrap();
         let resp: serde_json::Value = serde_json::from_str(&raw).unwrap();
@@ -2320,6 +2330,7 @@ backend = "sessions"
             save_to: None,
             format: None,
             format_per_op: None,
+            request_id: None,
         };
         let raw = server.dispatch_request_local(params).await.unwrap();
         serde_json::from_str(&raw).unwrap()
