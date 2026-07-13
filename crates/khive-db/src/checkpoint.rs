@@ -2783,10 +2783,12 @@ mod tests {
         );
 
         // The Plank 1 sweep, given the SAME registry state, must name the
-        // pinning reader at the Stale rung (millisecond-scale caps mean the
-        // freshly-registered handle is already "stale" by the time we
-        // observe it here, exactly like the always-stale-on-first-tick case
-        // covered by the pure unit test above).
+        // pinning reader at the Stale rung. The handle's age must exceed the
+        // 1ms `tx_max_age_secs` cap deterministically: the inserts plus one
+        // PASSIVE checkpoint above can complete in under a millisecond on a
+        // warm page cache, so sleep past the cap instead of assuming
+        // the elapsed work already crossed it.
+        std::thread::sleep(Duration::from_millis(5));
         let mut tx_age_state = TxAgeSweepState::default();
         let emissions = tx_age_state.observe(khive_storage::tx_registry::oldest(), &config);
         assert!(
