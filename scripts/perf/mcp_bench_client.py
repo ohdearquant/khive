@@ -398,11 +398,23 @@ def raw_daemon_roundtrip(sock_path: str, frame: dict, timeout_s: float = 5.0) ->
         s.close()
 
 
-def base_daemon_frame(ops: str, config_id: str, probe_only: bool = False, metrics_only: bool = False) -> dict:
+def base_daemon_frame(
+    ops: str,
+    config_id: str,
+    probe_only: bool = False,
+    metrics_only: bool = False,
+    request_id: int | None = None,
+) -> dict:
     """Build a DaemonRequestFrame JSON payload. `presentation` /
     `presentation_per_op` / `namespace` have no serde default on the Rust
     struct (unlike the rest), so they must always be present in the wire
     payload or the daemon silently drops the connection.
+
+    `request_id` (khive#948) is the caller's own process-local monotonic
+    counter value for this request, echoed back on the response and stamped
+    into the dispatch's audit event so `join_request_ids` below can pair a
+    client-side sample with its server-side audit row. `None` (the default)
+    sends no id, matching a pre-#948 caller.
     """
     return {
         "ops": ops,
@@ -418,7 +430,73 @@ def base_daemon_frame(ops: str, config_id: str, probe_only: bool = False, metric
         "format": None,
         "format_per_op": None,
         "from_wire": False,
+        "request_id": request_id,
     }
+
+
+# ── Client-side request_id join (khive#948 design note §4) ──────────────────
+
+
+def join_request_ids(samples: list[dict], audit_events: list[dict]) -> list[dict]:
+    """Join client-side per-request samples to server-side audit events by
+    `request_id`, per the khive#948 design note's §4 client-side join
+    procedure.
+
+    `samples`: one dict per request the harness sent, each carrying at least
+    `request_id` (the value the harness generated and put on the frame) and
+    `client_send_ts`/`client_recv_ts` (or any other client-measured fields —
+    this function does not read them, only passes them through unchanged).
+
+    `audit_events`: the persisted audit rows read back for the run's
+    namespace/verb/time window (e.g. via `brain.event_counts` or a direct
+    event-store query). Each event's `resource.request_id` (if present) is
+    the correlation key; `duration_us` is the server-side dispatch time to
+    pull across for the client/server latency decomposition.
+
+    Returns one dict per input sample, `{**sample, "server_duration_us":
+    int | None, "join_status": str}`:
+      - `"joined"`: exactly one audit event carried this `request_id`;
+        `server_duration_us` is that event's `duration_us`.
+      - `"no_audit_row"`: no audit event in the window carried this
+        `request_id` (talking to a pre-#948 daemon, or the row hasn't landed
+        yet / fell outside the query window). `server_duration_us` is `None`.
+      - `"duplicate_request_id"`: MORE THAN ONE audit event in the window
+        carries this `request_id`. Binding sign-off condition (design note
+        §4 item 7): a process-local counter restarts at the same values
+        across harness restarts, so two runs inside one query window can
+        collide on ids. This is the never-pick-a-row guard — silently
+        joining to either candidate row would be exactly the heuristic join
+        the benchmark Amendment 1 §3 forbids. `server_duration_us` is `None`
+        even though duration data technically exists on the ambiguous rows:
+        it is unattributable, not merely absent.
+
+    A sample with no `request_id` at all (the harness sent the request
+    without one) is not joinable by definition and is returned with
+    `"no_audit_row"` — the same "unavailable" outcome as a request_id that
+    matched nothing, since neither case has an unambiguous server-side row.
+    """
+    matches_by_id: dict[int, list[dict]] = {}
+    for event in audit_events:
+        rid = (event.get("resource") or {}).get("request_id")
+        if rid is None:
+            continue
+        matches_by_id.setdefault(rid, []).append(event)
+
+    joined = []
+    for sample in samples:
+        rid = sample.get("request_id")
+        matches = matches_by_id.get(rid, []) if rid is not None else []
+        if rid is None or not matches:
+            status = "no_audit_row"
+            server_duration_us = None
+        elif len(matches) > 1:
+            status = "duplicate_request_id"
+            server_duration_us = None
+        else:
+            status = "joined"
+            server_duration_us = matches[0].get("duration_us")
+        joined.append({**sample, "server_duration_us": server_duration_us, "join_status": status})
+    return joined
 
 
 def probe_metrics_snapshot(sock_path: str) -> dict:
