@@ -18,7 +18,7 @@ use khive_pack_git::GitPack;
 use khive_pack_kg::KgPack;
 use khive_runtime::{
     AllowAllGate, BackendId, EmbedderProvider, EntityCreateSpec, KhiveRuntime, Namespace,
-    NamespaceToken, RuntimeConfig, RuntimeResult, VerbRegistry, VerbRegistryBuilder,
+    NamespaceToken, RuntimeConfig, RuntimeError, RuntimeResult, VerbRegistry, VerbRegistryBuilder,
 };
 use khive_storage::types::{SqlStatement, SqlValue};
 use lattice_embed::{EmbedError, EmbeddingModel, EmbeddingService};
@@ -3938,6 +3938,15 @@ async fn adr_entity_type_rejected_without_git_pack_loaded() {
 /// PR #925 codex r1 (M3) flagged: the handler-layer test above would stay
 /// green even if that wiring were silently dropped, since it never exercises
 /// `create_many` directly.
+///
+/// The positive `adr` assertion alone cannot prove the aggregate validator is
+/// actually installed: `KhiveRuntime::validate_entity_type_for_kind` returns
+/// its input unchanged when no validator is installed at all, so a
+/// positive-only test also passes with the boot wiring deleted entirely
+/// (PR #925 codex r2, Medium). The negative case below — an unregistered
+/// Document subtype rejected as `RuntimeError::InvalidInput` — is what
+/// actually distinguishes "composed from pack `ENTITY_TYPES`" from
+/// "builtin-only" from "absent".
 #[tokio::test]
 async fn git_pack_adr_entity_type_validates_through_runtime_create_many() {
     let (rt, token, _registry) = fixture().await;
@@ -3961,5 +3970,38 @@ async fn git_pack_adr_entity_type_validates_through_runtime_create_many() {
         created[0].entity_type.as_deref(),
         Some("adr"),
         "{created:?}"
+    );
+
+    // Negative companion (PR #925 codex r2, Medium): the positive `adr`
+    // assertion above passes whether the aggregate validator is wired up
+    // OR entirely absent, since `KhiveRuntime::validate_entity_type_for_kind`
+    // returns the input unchanged when no validator is installed. Only a
+    // rejection of an UNREGISTERED Document subtype proves a validator is
+    // actually composed and consulted — this call fails closed if the boot
+    // wiring (`call_register_entity_type_validators`) were ever dropped.
+    let err = rt
+        .create_many(
+            &token,
+            vec![EntityCreateSpec {
+                kind: "document".to_string(),
+                entity_type: Some("not_a_registered_subtype".to_string()),
+                name: "not an ADR".to_string(),
+                description: None,
+                properties: None,
+                tags: vec![],
+            }],
+        )
+        .await
+        .expect_err(
+            "runtime-layer create_many must reject an unregistered Document subtype when the \
+             aggregate entity-type validator is composed",
+        );
+    assert!(
+        matches!(err, RuntimeError::InvalidInput(_)),
+        "unregistered entity_type must fail as InvalidInput, got: {err:?}"
+    );
+    assert!(
+        err.to_string().contains("not_a_registered_subtype"),
+        "error must name the rejected value: {err}"
     );
 }
