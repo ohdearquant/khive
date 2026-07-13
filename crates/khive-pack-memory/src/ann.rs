@@ -6,7 +6,9 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
-use khive_runtime::{KhiveRuntime, Namespace, NamespaceToken, RuntimeError};
+use khive_runtime::{
+    is_benign_shutdown_cancellation, KhiveRuntime, Namespace, NamespaceToken, RuntimeError,
+};
 use khive_storage::types::{SqlStatement, SqlValue};
 use khive_storage::StorageError;
 use khive_vamana::{CorpusFingerprint, VamanaConfig, VamanaIndex, VamanaSnapshot};
@@ -681,23 +683,11 @@ pub(crate) async fn wait_until_warm_idle(ann: &SharedAnn, key: &AnnKey) {
     }
 }
 
-/// True when `err` is the direct result of a `spawn_blocking` cancellation —
-/// e.g. a short-lived process (or daemon shutdown) tearing the runtime down
-/// mid-build — rather than a genuine backend/driver failure.
-///
-/// Matches the concrete `tokio::task::JoinError` boxed inside
-/// `StorageError::Driver` (the shape `with_reader`/`with_writer` produce when
-/// their `spawn_blocking(...).await` is cut short) via a typed downcast, not
-/// a message substring, so a real `vec_count`/SQL driver error is never
-/// misclassified as benign.
-fn is_benign_shutdown_cancellation(err: &RuntimeError) -> bool {
-    let RuntimeError::Storage(StorageError::Driver { source, .. }) = err else {
-        return false;
-    };
-    source
-        .downcast_ref::<tokio::task::JoinError>()
-        .is_some_and(tokio::task::JoinError::is_cancelled)
-}
+// `is_benign_shutdown_cancellation` moved to `khive_runtime::phase_events`
+// (re-exported at the crate root) so ADR-103 Amendment 1's kg/knowledge
+// embedder-warm phase hooks can reuse the same shutdown-cancellation
+// classification this module originated, without duplicating the typed
+// downcast. Imported below via `use khive_runtime::is_benign_shutdown_cancellation;`.
 
 /// Fire-once per-model background warm. Returns `true` if a new task was started.
 pub(crate) async fn ensure_ann_background(

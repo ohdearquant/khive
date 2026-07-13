@@ -10,7 +10,8 @@ use khive_brain_core::SectionPosteriorState;
 use khive_runtime::pack::{PackByIdResolver, PackRuntime};
 use khive_runtime::{KhiveRuntime, NamespaceToken, Resolved, RuntimeError, VerbRegistry};
 use khive_storage::types::{SqlStatement, SqlValue};
-use khive_types::{HandlerDef, Pack};
+use khive_storage::{PhaseCancelledPayload, PhaseCompletedPayload, PhaseStartedPayload};
+use khive_types::{EventKind, HandlerDef, Pack};
 
 use crate::knowledge::util::{atom_from_row, atom_to_json, domain_from_row, domain_to_json};
 use crate::knowledge::vamana;
@@ -102,8 +103,83 @@ impl PackRuntime for KnowledgePack {
         crate::knowledge::vamana::warm_known_snapshots(&self.runtime, &self.ann).await;
         if !self.runtime.default_embedder_name().is_empty() {
             let runtime = self.runtime.clone();
+            // ADR-103 Amendment 1 Part 2: the phase span brackets ONLY this
+            // configured-embedder branch's spawned embed call, not the
+            // unconditional `warm_known_snapshots` above -- an unconditional
+            // span would record a phase for an embedder warmup that never
+            // ran whenever no embedder is configured. Minted here (before
+            // spawn) rather than inside the task: `authorize` is cheap and
+            // synchronous, and minting outside keeps the same shape as
+            // KgPack::warm's unconditional case.
+            let token = match runtime.authorize(khive_runtime::Namespace::local()) {
+                Ok(token) => Some(token),
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "knowledge_embedder_warm: failed to mint ADR-103 phase-span \
+                         attribution token; warmup proceeds without telemetry"
+                    );
+                    None
+                }
+            };
             tokio::spawn(async move {
-                let _ = runtime.embed("__khive_knowledge_warm__").await;
+                if let Some(token) = &token {
+                    khive_runtime::emit_phase_event(
+                        &runtime,
+                        token,
+                        "knowledge.embedder_warm",
+                        EventKind::PhaseStarted,
+                        PhaseStartedPayload {
+                            work_class: "warm".into(),
+                            phase: "knowledge_embedder_warm".into(),
+                            corpus_size: None,
+                        },
+                    )
+                    .await;
+                }
+                let phase_start = std::time::Instant::now();
+                let cpu_start = khive_runtime::process_resource_usage();
+                let result = runtime.embed("__khive_knowledge_warm__").await;
+                if let Some(token) = &token {
+                    let wall_us = phase_start.elapsed().as_micros() as i64;
+                    let cpu_us = khive_runtime::cpu_delta_us(
+                        cpu_start,
+                        khive_runtime::process_resource_usage(),
+                    );
+                    match &result {
+                        Err(e) if khive_runtime::is_benign_shutdown_cancellation(e) => {
+                            khive_runtime::emit_phase_event(
+                                &runtime,
+                                token,
+                                "knowledge.embedder_warm",
+                                EventKind::PhaseCancelled,
+                                PhaseCancelledPayload {
+                                    work_class: "warm".into(),
+                                    phase: "knowledge_embedder_warm".into(),
+                                    wall_us,
+                                    cpu_us,
+                                },
+                            )
+                            .await;
+                        }
+                        _ => {
+                            khive_runtime::emit_phase_event(
+                                &runtime,
+                                token,
+                                "knowledge.embedder_warm",
+                                EventKind::PhaseCompleted,
+                                PhaseCompletedPayload {
+                                    work_class: "warm".into(),
+                                    phase: "knowledge_embedder_warm".into(),
+                                    wall_us,
+                                    cpu_us,
+                                },
+                            )
+                            .await;
+                        }
+                    }
+                }
+                let _ = result;
             });
         }
     }
@@ -447,5 +523,50 @@ impl PackByIdResolver for KnowledgePack {
             "kind": kind,
             "hard": hard,
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use khive_runtime::pack::PackRuntime;
+    use khive_runtime::{KhiveRuntime, Namespace};
+
+    use super::KnowledgePack;
+
+    // ADR-103 Amendment 1 Part 2: knowledge_embedder_warm phase-span events.
+    //
+    // `KhiveRuntime::memory()` builds on `RuntimeConfig::no_embeddings()`
+    // (runtime.rs), so `default_embedder_name()` is empty and the
+    // configured-embedder branch in `KnowledgePack::warm()` never runs. This
+    // pins that gating: the unconditional `vamana::warm_known_snapshots` call
+    // above the branch must never itself emit a phase event, and the
+    // configured-only branch must not fire when unconfigured.
+    #[tokio::test]
+    async fn knowledge_warm_emits_no_phase_events_when_no_embedder_configured() {
+        let rt = KhiveRuntime::memory().expect("in-memory runtime");
+        let token = rt.authorize(Namespace::local()).expect("authorize local");
+        let event_store = rt.events(&token).expect("event store must be available");
+
+        let pack = KnowledgePack::new(rt.clone());
+        pack.warm().await;
+
+        let page = event_store
+            .query_events(
+                khive_storage::EventFilter::default(),
+                khive_storage::PageRequest {
+                    limit: 10,
+                    offset: 0,
+                },
+            )
+            .await
+            .expect("query events");
+
+        assert!(
+            page.items.is_empty(),
+            "no embedder configured -> KnowledgePack::warm() must emit zero phase events \
+             (configured-only branch must not fire, and warm_known_snapshots must not \
+             independently emit): {:?}",
+            page.items
+        );
     }
 }
