@@ -109,9 +109,12 @@ sequences are literal. Unlike strict JSON, a double-quoted value in the
 function-call form may also contain a literal newline, carriage return, or
 tab byte verbatim (not just the backslash-escaped form); the parser rewrites
 those bytes to their JSON escape before decoding, so multi-paragraph content
-round-trips without requiring callers to pre-escape line breaks. The JSON
-form (`ops="[{\"tool\":...}]"`) keeps strict JSON string rules: raw control
-characters there remain a parse error, per the JSON spec.
+round-trips without requiring callers to pre-escape line breaks. This
+exception is limited to exactly those three bytes: every other raw
+U+0000-U+001F control character inside a function-call quoted value remains
+a parse error, same as strict JSON. The JSON form (`ops="[{\"tool\":...}]"`)
+keeps strict JSON string rules: raw control characters there remain a parse
+error, per the JSON spec.
 
 #### `$prev` reference grammar
 

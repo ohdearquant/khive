@@ -156,6 +156,104 @@ fn json_form_rejects_literal_newline_in_string() {
     assert!(matches!(err, DslError::InvalidJson { .. }));
 }
 
+// ── ADR-016 grammar-boundary matrix (round-1 review, PR #957) ────────────────
+
+#[test]
+fn crlf_preserved_exact_in_quoted_value() {
+    // A literal CRLF pair (not just LF or CR alone) inside a quoted value
+    // round-trips byte-for-byte, proving both bytes are rewritten
+    // independently rather than the pair being collapsed or reordered.
+    let src = "gtd.assign(title=\"line one\r\nline two\")";
+    let v = ops(src);
+    assert_eq!(val(&v[0].args["title"]), &json!("line one\r\nline two"));
+}
+
+#[test]
+fn literal_newline_immediately_before_closing_quote() {
+    // The raw newline is the very last byte before the closing `"`, with no
+    // trailing content — the scanner must not mistake it for trailing
+    // whitespace to trim, nor the rewrite skip the final byte.
+    let src = "gtd.assign(title=\"abc\n\")";
+    let v = ops(src);
+    assert_eq!(val(&v[0].args["title"]), &json!("abc\n"));
+}
+
+#[test]
+fn raw_newline_immediately_after_escaped_quote_boundary() {
+    // A `\"` escape pair is immediately followed by a raw literal newline.
+    // `scan_string_end` must consume the escape pair as a unit (not treat
+    // its second byte as the closing quote), and the rewrite must copy the
+    // escape pair through untouched before rewriting the adjacent raw LF.
+    let src = "gtd.assign(title=\"a\\\"\nb\")";
+    let v = ops(src);
+    assert_eq!(val(&v[0].args["title"]), &json!("a\"\nb"));
+}
+
+#[test]
+fn raw_control_char_in_bareword_position_rejected() {
+    // The literal-control-char exception only applies inside a
+    // double-quoted string value (`parse_value` only calls
+    // `escape_literal_control_chars` when the trimmed slice starts with
+    // `"`). A raw NUL embedded in an unquoted (bareword) numeric value must
+    // still fail to parse as JSON, exactly as before this PR.
+    let src = format!("gtd.assign(weight=1{}0)", '\u{0}');
+    let err = parse_request(&src).unwrap_err();
+    assert!(
+        matches!(err, DslError::InvalidValue { .. }),
+        "expected InvalidValue for a raw control byte in bareword position, got {err:?}"
+    );
+}
+
+#[test]
+fn other_raw_control_chars_in_quoted_string_still_rejected() {
+    // Only `\n`, `\r`, and `\t` are exempted (ADR-016). Every other raw
+    // U+0000-U+001F byte inside a quoted value must remain a parse error,
+    // matching pre-PR behavior — NUL, form feed, and ESC here.
+    for raw in ['\u{0}', '\u{c}', '\u{1b}'] {
+        let src = format!("gtd.assign(title=\"a{raw}b\")");
+        let err = parse_request(&src).unwrap_err();
+        assert!(
+            matches!(err, DslError::InvalidValue { .. }),
+            "expected InvalidValue for raw control byte {:#04x}, got {err:?}",
+            raw as u32
+        );
+    }
+}
+
+#[test]
+fn invalid_backslash_escape_in_quoted_string_rejected() {
+    // A negative invalid-escape case: `\q` is not a JSON escape sequence.
+    // This must fail regardless of the literal-newline carve-out.
+    let src = r#"gtd.assign(title="bad \q escape")"#;
+    let err = parse_request(src).unwrap_err();
+    assert!(matches!(err, DslError::InvalidValue { .. }));
+}
+
+#[test]
+fn batch_ops_separated_by_raw_newlines() {
+    // The top-level batch `,` separator may be split across literal
+    // newlines between ops, since `skip_ws` treats `\n` as ordinary
+    // whitespace around the separator.
+    let src = "[create(kind=\"entity\", name=\"A\"),\ncreate(kind=\"entity\", name=\"B\")]";
+    let r = req(src);
+    assert_eq!(r.mode, ExecutionMode::Parallel);
+    assert_eq!(r.ops.len(), 2);
+    assert_eq!(val(&r.ops[0].args["name"]), &json!("A"));
+    assert_eq!(val(&r.ops[1].args["name"]), &json!("B"));
+}
+
+#[test]
+fn chain_ops_separated_by_raw_newlines() {
+    // The chain `|` separator may likewise be split across literal
+    // newlines between ops.
+    let src = "create(kind=\"entity\", name=\"A\")\n|\ncreate(kind=\"entity\", name=\"B\")";
+    let r = req(src);
+    assert_eq!(r.mode, ExecutionMode::Chain);
+    assert_eq!(r.ops.len(), 2);
+    assert_eq!(val(&r.ops[0].args["name"]), &json!("A"));
+    assert_eq!(val(&r.ops[1].args["name"]), &json!("B"));
+}
+
 #[test]
 fn null_and_negative_number() {
     let v = ops(r#"update(id="x", description=null, weight=-0.5)"#);

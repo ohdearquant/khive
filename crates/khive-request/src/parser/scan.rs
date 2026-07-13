@@ -20,15 +20,20 @@ pub(crate) fn scan_string_end(src: &[u8], start: usize) -> Result<usize, DslErro
     Err(DslError::UnclosedString)
 }
 
-/// Rewrite raw control bytes (0x00-0x1F) inside a double-quoted string
-/// literal into their JSON escape form, so a value containing a literal
-/// newline, carriage return, or tab (as opposed to a `\n`/`\r`/`\t` escape
-/// sequence) still parses as valid JSON. Existing backslash-escape pairs are
-/// copied through untouched: this walks the same `\` + next-byte pairing
-/// [`scan_string_end`] uses, so an already-escaped sequence is never
-/// reinterpreted.
+/// Rewrite raw literal newline, carriage return, and tab bytes inside a
+/// double-quoted string literal into their JSON escape form, so a value
+/// containing one of those three bytes verbatim (as opposed to a
+/// `\n`/`\r`/`\t` escape sequence) still parses as valid JSON. Existing
+/// backslash-escape pairs are copied through untouched: this walks the same
+/// `\` + next-byte pairing [`scan_string_end`] uses, so an already-escaped
+/// sequence is never reinterpreted.
+///
+/// Per ADR-016, this exception is limited to exactly those three
+/// characters. Every other raw U+0000-U+001F control byte is left as-is and
+/// falls through to `serde_json`, which rejects it as invalid JSON — the
+/// same behavior as before this exception existed.
 pub(crate) fn escape_literal_control_chars(s: &str) -> String {
-    if !s.contains(|c: char| (c as u32) < 0x20) {
+    if !s.contains(['\n', '\r', '\t']) {
         return s.to_owned();
     }
     let mut out = String::with_capacity(s.len() + 8);
@@ -45,7 +50,6 @@ pub(crate) fn escape_literal_control_chars(s: &str) -> String {
             '\n' => out.push_str("\\n"),
             '\r' => out.push_str("\\r"),
             '\t' => out.push_str("\\t"),
-            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
             c => out.push(c),
         }
     }
