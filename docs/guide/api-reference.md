@@ -264,7 +264,7 @@ compacted to a relative or minute-truncated form; and `salience`/`decay_factor` 
   last_decision, review_count, approve_count, reject_count}` (built in
   `crates/khive-pack-kg/src/handlers/proposal.rs`). That field set is the
   `presentation="verbose"` projection; the default Agent mode applies the same generic
-  reshaping as the other `list` rows — non-lifecycle null/empty fields are omitted (a null
+  reshaping as the other `list` rows: non-lifecycle null/empty fields are omitted (a null
   `expiry`, an empty `last_decision`), ids are shortened, and timestamps are compacted.
 
 None of these match `search`'s `{id, entity_kind|note_kind, score, title, snippet}` rows or
