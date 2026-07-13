@@ -271,9 +271,34 @@ impl BlobStore for FsBlobStore {
         let owned_guard = self.write_lock.clone().lock_owned().await;
         let root = self.root.clone();
         let floor_bytes = self.floor_bytes;
+        // Round-3 Medium (codex r3, PR #922): `sync_hook::take` is the
+        // test-only seam that lets regression tests observe/control
+        // exactly when this call is inside the guarded section, replacing
+        // fixed-sleep/fixed-duration-poll timing assumptions with
+        // deterministic, event-driven synchronization. `#[cfg(test)]`-
+        // gated end to end -- zero effect on non-test builds.
+        #[cfg(test)]
+        let hook = sync_hook::take(&root);
         tokio::task::spawn_blocking(move || {
-            let _owned_guard = owned_guard;
-            put_blocking(&root, floor_bytes, bytes)
+            // The guard lives in this inner block so it is dropped BEFORE
+            // the test hook's `done` signal fires below -- a test that
+            // waits on `done` and then immediately asserts the lock is
+            // free needs that ordering to hold exactly, not "usually".
+            #[cfg_attr(not(test), allow(clippy::let_and_return))]
+            let result = {
+                let _owned_guard = owned_guard;
+                #[cfg(test)]
+                if let Some(h) = &hook {
+                    let _ = h.reached.send(());
+                    let _ = h.release.recv();
+                }
+                put_blocking(&root, floor_bytes, bytes)
+            };
+            #[cfg(test)]
+            if let Some(h) = &hook {
+                let _ = h.done.send(());
+            }
+            result
         })
         .await
         .map_err(|e| StorageError::driver(StorageCapability::Blob, "put", e))?
@@ -356,6 +381,76 @@ impl BlobStore for FsBlobStore {
     }
 }
 
+/// Test-only synchronization seam into `put`'s write-lock-guarded critical
+/// section (round-3 Medium finding, codex r3 on PR #922).
+///
+/// The round-2 regression tests proved mutual exclusion and cancellation-
+/// safety with a fixed sleep before racing/aborting and a fixed-duration
+/// poll loop waiting for the lock to free -- timing-dependent, and the poll
+/// loop actually failed once in codex's own required-suite run (a flaky
+/// gate, not a real regression). This seam replaces both edges of the race
+/// with event-driven coordination: a one-shot hook, queued per canonical
+/// root, signals `reached` the instant execution is inside the guarded
+/// closure (the owned guard already moved in) and blocks there until the
+/// test sends `release`; `done` fires only after the guard has actually
+/// been dropped (see `put`'s inner-block scoping of `_owned_guard`).
+/// `#[cfg(test)]`-gated end to end -- zero effect on non-test builds.
+#[cfg(test)]
+mod sync_hook {
+    use std::collections::{HashMap, VecDeque};
+    use std::path::{Path, PathBuf};
+    use std::sync::mpsc::{Receiver, Sender};
+    use std::sync::{Mutex as StdMutex, OnceLock};
+
+    pub(super) struct Hook {
+        pub(super) reached: Sender<()>,
+        pub(super) release: Receiver<()>,
+        pub(super) done: Sender<()>,
+    }
+
+    fn registry() -> &'static StdMutex<HashMap<PathBuf, VecDeque<Hook>>> {
+        static REGISTRY: OnceLock<StdMutex<HashMap<PathBuf, VecDeque<Hook>>>> = OnceLock::new();
+        REGISTRY.get_or_init(|| StdMutex::new(HashMap::new()))
+    }
+
+    /// Queue a one-shot hook for the NEXT `put` against `root`'s canonical
+    /// path. Consumed exactly once, FIFO -- a test expecting several
+    /// sequential puts to each pause installs several hooks.
+    pub(super) fn install(root: &Path) -> (Receiver<()>, Sender<()>, Receiver<()>) {
+        let canonical = root
+            .canonicalize()
+            .expect("root must exist before installing a sync_hook");
+        let (reached_tx, reached_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        registry()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(canonical)
+            .or_default()
+            .push_back(Hook {
+                reached: reached_tx,
+                release: release_rx,
+                done: done_tx,
+            });
+        (reached_rx, release_tx, done_rx)
+    }
+
+    /// Pop the next queued hook for `root`'s canonical path, if any (`None`
+    /// for every ordinary, non-instrumented test -- `put` runs completely
+    /// unaffected). `root` need not be pre-canonicalized by the caller --
+    /// both `install` and `take` canonicalize, matching how
+    /// `write_lock_for_root` keys the shared lock registry.
+    pub(super) fn take(root: &Path) -> Option<Hook> {
+        let canonical = root.canonicalize().ok()?;
+        registry()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get_mut(&canonical)
+            .and_then(VecDeque::pop_front)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -365,6 +460,34 @@ mod tests {
         let root = dir.path().join("blobs");
         let store = FsBlobStore::new(root, floor_bytes).unwrap();
         (dir, store)
+    }
+
+    /// Block on `rx.recv()` on a dedicated thread so a `#[tokio::test]`
+    /// (current-thread runtime) doesn't stall other spawned tasks while
+    /// waiting on a `sync_hook` signal. Round-3 Medium: the deterministic,
+    /// event-driven replacement for fixed-sleep / fixed-duration-poll
+    /// assertions.
+    async fn recv_blocking(rx: std::sync::mpsc::Receiver<()>) -> bool {
+        tokio::task::spawn_blocking(move || rx.recv().is_ok())
+            .await
+            .expect("recv_blocking thread panicked")
+    }
+
+    /// Bounded-wait variant, used ONLY as a failure backstop proving a
+    /// signal did NOT arrive within a generous window -- never as the
+    /// positive correctness proof (that is always an unbounded
+    /// `recv_blocking`). Returns the receiver back so the caller can keep
+    /// waiting on it afterward.
+    async fn recv_timeout_blocking(
+        rx: std::sync::mpsc::Receiver<()>,
+        timeout: std::time::Duration,
+    ) -> (bool, std::sync::mpsc::Receiver<()>) {
+        tokio::task::spawn_blocking(move || {
+            let arrived = rx.recv_timeout(timeout).is_ok();
+            (arrived, rx)
+        })
+        .await
+        .expect("recv_timeout_blocking thread panicked")
     }
 
     #[tokio::test]
@@ -589,40 +712,92 @@ mod tests {
         // store's `write_lock` was its own independent `Mutex`, and this
         // exact scenario would have let both puts pass the same free-space
         // snapshot.
+        //
+        // Round-3 Medium (codex r3): the earlier version of this test let
+        // two real `tokio::spawn`ed puts race with no control over
+        // interleaving -- it could PASS on the round-2 per-instance-mutex
+        // bug purely because the blocking thread pool happened to run them
+        // sequentially, which is not a deterministic regression guard.
+        //
+        // The first attempt at a `sync_hook`-driven fix kept proving
+        // exclusion INDIRECTLY, through a free-space floor sized to admit
+        // exactly one `payload_len` write -- but this dev box's real
+        // `fs4::available_space` swings by many tens to hundreds of MB in
+        // either direction over the several-second window the hook
+        // orchestration takes (concurrent fleet `cargo clean`/build
+        // activity), and no floor margin proved robust: it was observed to
+        // both under-shoot (store_a's own write refused; available_bytes
+        // 25521500160 vs floor_bytes 25517096960, a ~60 MiB drop) and
+        // over-shoot (store_b's write unexpectedly SUCCEEDED after
+        // store_a's landed, meaning available space had *grown* by more
+        // than the margin during the test) in back-to-back runs.
+        //
+        // Lock sharing is orthogonal to floor arithmetic -- the same
+        // `crosses_floor`/`put_blocking` path runs regardless of which
+        // `FsBlobStore` instance calls it, and that arithmetic is already
+        // covered, disk-noise-tolerantly, by
+        // `concurrent_puts_cannot_jointly_breach_the_floor_via_a_stale_snapshot`
+        // (same-instance) and the pure `crosses_floor` unit tests above.
+        // So this test proves ONLY the lock-sharing property, directly and
+        // deterministically via the `sync_hook` seam's reached/release
+        // ordering, with `floor_bytes = 0` -- zero dependence on real disk
+        // space, hence zero exposure to this host's volatility.
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("blobs");
         fs::create_dir_all(&root).unwrap();
-        let available = fs4::available_space(&root).unwrap();
-        let payload_len: u64 = 64 * 1024 * 1024;
-        let floor = available.saturating_sub(payload_len);
+        let canonical_root = root.canonicalize().unwrap();
 
         // Two INDEPENDENT `FsBlobStore::new` calls for the identical root --
         // exactly what `StorageBackend::blob_store` does on repeat calls.
-        let store_a = std::sync::Arc::new(FsBlobStore::new(root.clone(), floor).unwrap());
-        let store_b = std::sync::Arc::new(FsBlobStore::new(root, floor).unwrap());
+        let store_a = std::sync::Arc::new(FsBlobStore::new(root.clone(), 0).unwrap());
+        let store_b = std::sync::Arc::new(FsBlobStore::new(root, 0).unwrap());
 
-        let a = tokio::spawn(async move { store_a.put(vec![5u8; payload_len as usize]).await });
-        let b = tokio::spawn(async move { store_b.put(vec![6u8; payload_len as usize]).await });
-        let (result_a, result_b) = (a.await.unwrap(), b.await.unwrap());
+        let (a_reached, a_release, _a_done) = sync_hook::install(&canonical_root);
+        let a = {
+            let store_a = store_a.clone();
+            tokio::spawn(async move { store_a.put(b"store_a payload".to_vec()).await })
+        };
+        assert!(
+            recv_blocking(a_reached).await,
+            "store_a's put must reach the sync_hook checkpoint"
+        );
 
-        let successes = [&result_a, &result_b]
-            .into_iter()
-            .filter(|r| r.is_ok())
-            .count();
-        let floor_rejections = [&result_a, &result_b]
-            .into_iter()
-            .filter(|r| matches!(r, Err(StorageError::CapacityFloor { .. })))
-            .count();
+        // While A is paused (owned guard held, not yet released), queue B's
+        // own hook and spawn B. If the two stores truly share one lock, B
+        // cannot even enter its guarded closure yet, so it cannot possibly
+        // reach its own checkpoint within a generous bounded window -- a
+        // failure backstop, not the primary proof (the primary proof is
+        // that B's checkpoint fires only AFTER A releases, asserted below).
+        let (b_reached, b_release, _b_done) = sync_hook::install(&canonical_root);
+        let b = {
+            let store_b = store_b.clone();
+            tokio::spawn(async move { store_b.put(b"store_b payload".to_vec()).await })
+        };
+        let (b_reached_early, b_reached) =
+            recv_timeout_blocking(b_reached, std::time::Duration::from_millis(200)).await;
         assert!(
-            successes <= 1,
-            "two independently constructed FsBlobStore instances for the SAME root must \
-             still share one write lock -- both puts landed: {result_a:?} / {result_b:?}"
+            !b_reached_early,
+            "store_b reached the sync_hook checkpoint while store_a still held the write \
+             lock -- the two independently constructed stores do NOT share one lock"
         );
+
+        // Release A and let it finish. Awaiting A's outer task
+        // deterministically waits for the guard to be dropped too (see
+        // `put`'s inner-block scoping).
+        a_release.send(()).unwrap();
+        let result_a = a.await.unwrap();
+        assert!(result_a.is_ok(), "store_a's put must succeed: {result_a:?}");
+
+        // NOW B can enter its own critical section and reach its
+        // checkpoint -- proves the ordering directly, not by inferring it
+        // from a disk-capacity side effect.
         assert!(
-            floor_rejections >= 1,
-            "two payload_len writes cannot both fit in a payload_len-sized budget: \
-             {result_a:?} / {result_b:?}"
+            recv_blocking(b_reached).await,
+            "store_b's put must reach the sync_hook checkpoint once store_a released the lock"
         );
+        b_release.send(()).unwrap();
+        let result_b = b.await.unwrap();
+        assert!(result_b.is_ok(), "store_b's put must succeed: {result_b:?}");
     }
 
     #[tokio::test]
@@ -636,29 +811,34 @@ mod tests {
         // a second put could then pass its floor check while the first
         // write was still landing.
         //
-        // White-box check (via the same private `write_lock_for_root` the
-        // fix itself uses) rather than an indirect two-store race: abort
-        // the outer task a few milliseconds into a large write (long
-        // enough that the write is almost certainly still in flight,
-        // comfortably past the near-instantaneous lock-acquire-and-dispatch
-        // step), then confirm the shared per-root lock is STILL held
-        // immediately afterward -- only possible if the guard moved into
-        // the detached `spawn_blocking` closure rather than living in the
-        // now-dropped outer frame. Finally confirm the lock does eventually
-        // free (the closure was never leaked, just outlived the cancelled
-        // future).
+        // Round-3 Medium (codex r3): the earlier version of this test
+        // proved the fix with a fixed 10ms sleep before abort and a fixed
+        // 500x10ms poll loop waiting for the lock to free -- and the poll
+        // loop actually FAILED once in codex's own required-suite run (a
+        // flaky gate, not a regression). This version uses the `sync_hook`
+        // seam instead: `reached` fires only once execution is genuinely
+        // inside the guarded closure (owned guard already moved in) and
+        // blocks there until released; `done` fires only after the guard
+        // has actually been dropped (see `put`'s inner-block scoping) --
+        // both edges event-driven, no sleeps, no polling.
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("blobs");
         fs::create_dir_all(&root).unwrap();
         let canonical_root = root.canonicalize().unwrap();
-        let payload_len = 256 * 1024 * 1024; // large enough to still be writing a few ms in
 
         let store = std::sync::Arc::new(FsBlobStore::new(root, 0).unwrap());
+        let (reached, release, done) = sync_hook::install(&canonical_root);
         let handle = {
             let store = store.clone();
-            tokio::spawn(async move { store.put(vec![4u8; payload_len]).await })
+            tokio::spawn(async move { store.put(b"cancellation race payload".to_vec()).await })
         };
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+        assert!(
+            recv_blocking(reached).await,
+            "put must reach the sync_hook checkpoint -- owned guard already moved into the \
+             closure -- before this test can mean anything"
+        );
+
         handle.abort();
         let abort_result = handle.await;
         match &abort_result {
@@ -677,20 +857,18 @@ mod tests {
              the aborted frame instead of moving into the spawn_blocking closure"
         );
 
-        // The detached write must still run to completion and release the
-        // lock itself -- it was cancelled from the caller's point of view,
-        // not killed.
-        let mut freed = false;
-        for _ in 0..500 {
-            if shared_lock.try_lock().is_ok() {
-                freed = true;
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
+        // Let the detached write proceed and finish, then wait for its
+        // explicit completion signal -- no polling, no fixed durations.
+        // `done` only fires after the guard is actually dropped (see
+        // `put`), so the very next check is race-free.
+        release.send(()).unwrap();
         assert!(
-            freed,
-            "the detached write must eventually release the guard"
+            recv_blocking(done).await,
+            "the detached write must signal completion once it actually persists"
+        );
+        assert!(
+            shared_lock.try_lock().is_ok(),
+            "the guard must be free once the detached write's completion was observed"
         );
     }
 
