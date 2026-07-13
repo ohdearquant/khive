@@ -473,23 +473,6 @@ mod tests {
             .expect("recv_blocking thread panicked")
     }
 
-    /// Bounded-wait variant, used ONLY as a failure backstop proving a
-    /// signal did NOT arrive within a generous window -- never as the
-    /// positive correctness proof (that is always an unbounded
-    /// `recv_blocking`). Returns the receiver back so the caller can keep
-    /// waiting on it afterward.
-    async fn recv_timeout_blocking(
-        rx: std::sync::mpsc::Receiver<()>,
-        timeout: std::time::Duration,
-    ) -> (bool, std::sync::mpsc::Receiver<()>) {
-        tokio::task::spawn_blocking(move || {
-            let arrived = rx.recv_timeout(timeout).is_ok();
-            (arrived, rx)
-        })
-        .await
-        .expect("recv_timeout_blocking thread panicked")
-    }
-
     #[tokio::test]
     async fn put_get_roundtrip() {
         let (_dir, store) = store(0);
@@ -719,9 +702,9 @@ mod tests {
         // bug purely because the blocking thread pool happened to run them
         // sequentially, which is not a deterministic regression guard.
         //
-        // The first attempt at a `sync_hook`-driven fix kept proving
-        // exclusion INDIRECTLY, through a free-space floor sized to admit
-        // exactly one `payload_len` write -- but this dev box's real
+        // The first `sync_hook`-driven attempt kept proving exclusion
+        // INDIRECTLY, through a free-space floor sized to admit exactly one
+        // `payload_len` write -- but this dev box's real
         // `fs4::available_space` swings by many tens to hundreds of MB in
         // either direction over the several-second window the hook
         // orchestration takes (concurrent fleet `cargo clean`/build
@@ -729,8 +712,7 @@ mod tests {
         // both under-shoot (store_a's own write refused; available_bytes
         // 25521500160 vs floor_bytes 25517096960, a ~60 MiB drop) and
         // over-shoot (store_b's write unexpectedly SUCCEEDED after
-        // store_a's landed, meaning available space had *grown* by more
-        // than the margin during the test) in back-to-back runs.
+        // store_a's landed) in back-to-back runs.
         //
         // Lock sharing is orthogonal to floor arithmetic -- the same
         // `crosses_floor`/`put_blocking` path runs regardless of which
@@ -738,10 +720,24 @@ mod tests {
         // covered, disk-noise-tolerantly, by
         // `concurrent_puts_cannot_jointly_breach_the_floor_via_a_stale_snapshot`
         // (same-instance) and the pure `crosses_floor` unit tests above.
-        // So this test proves ONLY the lock-sharing property, directly and
-        // deterministically via the `sync_hook` seam's reached/release
-        // ordering, with `floor_bytes = 0` -- zero dependence on real disk
-        // space, hence zero exposure to this host's volatility.
+        //
+        // Round-4 Medium (codex r4): the round-3 fix's negative proof (B
+        // must not reach its own checkpoint) still leaned on a 200ms
+        // `recv_timeout` as the CORRECTNESS decision -- under sufficiently
+        // delayed scheduling, old per-instance-mutex code's B could simply
+        // arrive after the window and every assertion would still pass,
+        // silently defeating the regression guard. Fix: assert directly
+        // and immediately (no timeout, no second hook, no second
+        // `tokio::spawn` racing at all) that `store_b.write_lock` -- a
+        // private field, reachable here because `tests` is a child module
+        // of the module that declares it -- is ALREADY held the instant
+        // store_a's put holds ITS guard. Under the fixed canonical-root
+        // registry this is the exact same `Arc` store_a's own `write_lock`
+        // resolves to, so `try_lock()` fails with zero timing dependence;
+        // under the old per-instance-mutex code, `store_b.write_lock` is a
+        // completely independent, unheld `Mutex`, so `try_lock()` would
+        // succeed immediately, pinning the defect on the spot regardless
+        // of scheduling.
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("blobs");
         fs::create_dir_all(&root).unwrap();
@@ -762,23 +758,14 @@ mod tests {
             "store_a's put must reach the sync_hook checkpoint"
         );
 
-        // While A is paused (owned guard held, not yet released), queue B's
-        // own hook and spawn B. If the two stores truly share one lock, B
-        // cannot even enter its guarded closure yet, so it cannot possibly
-        // reach its own checkpoint within a generous bounded window -- a
-        // failure backstop, not the primary proof (the primary proof is
-        // that B's checkpoint fires only AFTER A releases, asserted below).
-        let (b_reached, b_release, _b_done) = sync_hook::install(&canonical_root);
-        let b = {
-            let store_b = store_b.clone();
-            tokio::spawn(async move { store_b.put(b"store_b payload".to_vec()).await })
-        };
-        let (b_reached_early, b_reached) =
-            recv_timeout_blocking(b_reached, std::time::Duration::from_millis(200)).await;
+        // The deterministic proof: store_b's OWN write_lock field must
+        // already be unavailable while store_a holds its guard -- true
+        // only if the two independently constructed stores share one
+        // Arc<Mutex<()>>. No timeout, no scheduling dependence.
         assert!(
-            !b_reached_early,
-            "store_b reached the sync_hook checkpoint while store_a still held the write \
-             lock -- the two independently constructed stores do NOT share one lock"
+            store_b.write_lock.try_lock().is_err(),
+            "store_b's write_lock was NOT held while store_a's put held its guard -- the two \
+             independently constructed stores do NOT share one lock"
         );
 
         // Release A and let it finish. Awaiting A's outer task
@@ -788,15 +775,9 @@ mod tests {
         let result_a = a.await.unwrap();
         assert!(result_a.is_ok(), "store_a's put must succeed: {result_a:?}");
 
-        // NOW B can enter its own critical section and reach its
-        // checkpoint -- proves the ordering directly, not by inferring it
-        // from a disk-capacity side effect.
-        assert!(
-            recv_blocking(b_reached).await,
-            "store_b's put must reach the sync_hook checkpoint once store_a released the lock"
-        );
-        b_release.send(()).unwrap();
-        let result_b = b.await.unwrap();
+        // Liveness coverage: an ordinary put on store_b succeeds once
+        // store_a has released the (shared) lock.
+        let result_b = store_b.put(b"store_b payload".to_vec()).await;
         assert!(result_b.is_ok(), "store_b's put must succeed: {result_b:?}");
     }
 
