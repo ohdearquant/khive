@@ -1367,10 +1367,19 @@ fn respawn_failed_error(detail: &str) -> McpError {
         detail,
         "daemon respawn failed loudly (#898): respawn attempt confirmed dead"
     );
-    McpError::internal_error(
-        msg,
-        Some(serde_json::json!({"reason": "respawn_failed"})),
-    )
+    // Under strict mode this is also a pre-dispatch rejection, so preserve
+    // #947's request-envelope contract by tagging it for `server::request`.
+    // Non-strict callers still receive the raw, loud MCP error introduced by
+    // #898; in neither mode may the request fall through to local dispatch.
+    let data = if is_daemon_strict_mode() {
+        serde_json::json!({
+            STRICT_FALLBACK_MARKER: true,
+            "reason": "respawn_failed",
+        })
+    } else {
+        serde_json::json!({"reason": "respawn_failed"})
+    };
+    McpError::internal_error(msg, Some(data))
 }
 
 // ── bridge self-heal: re-exec in place on ProtocolMismatch (#714) ───────────

@@ -1492,13 +1492,14 @@ result (e.g. create then link with the new entity's id)."#)]
             if let Some(res) = crate::daemon::forward_or_spawn(&frame).await {
                 return match res {
                     Ok(s) => Ok(s),
-                    // #947: a strict-mode fallback rejection is tagged with
+                    // #947/#898: a strict-mode pre-dispatch rejection is
+                    // tagged with
                     // `daemon::STRICT_FALLBACK_MARKER` so it can be reshaped
                     // into the normal per-op envelope instead of surfacing as
                     // an RPC-level error. Every other daemon-forward error
-                    // (protocol mismatch, oversized frame, ambiguous
-                    // post-write outcome) is untagged and passes through
-                    // unchanged.
+                    // (non-strict respawn failure, protocol mismatch,
+                    // oversized frame, ambiguous post-write outcome) is
+                    // untagged and passes through unchanged.
                     Err(e) => match strict_fallback_reason(&e) {
                         Some(reason) => strict_fallback_envelope_response(&p, reason),
                         None => Err(e),
@@ -2678,8 +2679,9 @@ mod tests {
         clear_daemon_env();
         crate::daemon::reset_fallback_counters();
         let dir = tempfile::tempdir().expect("tempdir");
-        // Never bound by anything in this test — the daemon is genuinely
-        // unreachable, exactly like `daemon::forward_or_spawn_strict_mode_errors_when_daemon_unreachable`.
+        // Never bound by anything in this test. The spawned test harness exits
+        // immediately on `mcp --daemon`, so #898 classifies this as a confirmed
+        // respawn failure rather than the older generic `no_socket` fallback.
         std::env::set_var("KHIVE_SOCKET", dir.path().join("khived.sock"));
         std::env::set_var("KHIVE_PID", dir.path().join("khived.pid"));
         std::env::set_var("KHIVE_LOCK", dir.path().join("khived.recovery.lock"));
@@ -2719,8 +2721,8 @@ mod tests {
                 "error must name the strict mode that rejected the fallback: {msg}"
             );
             assert!(
-                msg.contains("no_socket"),
-                "error must name the fallback reason: {msg}"
+                msg.contains("respawn_failed"),
+                "error must name the confirmed respawn failure: {msg}"
             );
         }
 
