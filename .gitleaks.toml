@@ -1,0 +1,10 @@
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Known false positives: documentation headings and test fixtures matched by generic-api-key"
+regexes = [
+  '''wasm32-compilable''',
+  '''abcdef0123456789''',
+  '''fedcba9876543210''',
+]
