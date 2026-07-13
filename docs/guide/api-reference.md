@@ -991,10 +991,11 @@ request(ops="comm.probe(actor=\"lambda:leo\", since_us=42)")
 
 Read-only per-channel health snapshot. Returns the daemon-persisted heartbeat row for
 every known channel: timestamps and consecutive-failure counts only, never a computed
-healthy bool. Health judgment belongs to the caller. Rows are read from the pinned
-operational namespace (`local`) unconditionally, regardless of the caller's dispatch
-namespace. An empty `channels` array cannot distinguish "no daemon running" from
-"channels configured but never polled". See the
+healthy bool. Health judgment belongs to the caller. Rows are read from the caller's
+injected namespace (`namespace=`, defaulting to `local` like every other comm verb) —
+`comm.heartbeat` is the only handler pinned to the fixed `local` operational namespace.
+The response echoes the namespace actually read in a `namespace` field, so an empty
+`channels` array is unambiguous even under a scoped read. See the
 [communication guide](communication.md) for the full response contract.
 
 No parameters.
