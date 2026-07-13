@@ -17,7 +17,7 @@
 //! raw caller-supplied `repo` (ADR-108 review r2 High finding: reusing the
 //! raw path after only canonicalizing it for the comparison is a symlink
 //! TOCTOU). The check and the mutation are additionally serialized per-repo
-//! via [`repo_write_lock`] so a concurrent khive-mediated write to the same
+//! via the private `repo_write_lock` helper so a concurrent khive-mediated write to the same
 //! repo cannot interleave between the policy check and the git command it
 //! guards.
 //!
