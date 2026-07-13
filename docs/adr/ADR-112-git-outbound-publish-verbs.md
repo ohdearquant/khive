@@ -313,7 +313,7 @@ severity = "deny"
 [[pattern]]
 id = "internal-path-worktree"
 category = "internal_path"
-regex = '/[A-Za-z0-9_./-]+/khive-work/'
+regex = '/[A-Za-z0-9_./-]+/agent-worktrees/'
 description = "local worktree absolute path"
 severity = "deny"
 ```
