@@ -110,6 +110,53 @@ fn string_with_escaped_quote() {
 }
 
 #[test]
+fn multiline_string_value_round_trips() {
+    // A literal raw newline (0x0A) inside a double-quoted value, as an agent
+    // client would send it directly rather than escaping it to `\n` text.
+    let src = "gtd.assign(title=\"line one\nline two\")";
+    let v = ops(src);
+    assert_eq!(val(&v[0].args["title"]), &json!("line one\nline two"));
+}
+
+#[test]
+fn tab_and_carriage_return_literal_in_string() {
+    let src = "gtd.assign(title=\"a\tb\rc\")";
+    let v = ops(src);
+    assert_eq!(val(&v[0].args["title"]), &json!("a\tb\rc"));
+}
+
+#[test]
+fn mixed_literal_newline_and_escaped_sequences() {
+    // A literal raw newline sits next to escaped-quote and escaped-backslash
+    // pairs in the same value, proving the control-char rewrite does not
+    // disturb adjacent backslash-escape pairs.
+    let src = "comm.reply(content=\"line one \\\"quoted\\\"\nline two a\\\\b\")";
+    let v = ops(src);
+    assert_eq!(
+        val(&v[0].args["content"]),
+        &json!("line one \"quoted\"\nline two a\\b")
+    );
+}
+
+#[test]
+fn unterminated_multiline_string_rejected() {
+    // A raw newline mid-string does not make an unclosed string legal; the
+    // closing quote is still required somewhere in the input.
+    let src = "gtd.assign(title=\"line one\nline two)";
+    let err = parse_request(src).unwrap_err();
+    assert!(matches!(err, DslError::UnclosedString));
+}
+
+#[test]
+fn json_form_rejects_literal_newline_in_string() {
+    // JSON form stays strict JSON: a raw control character inside a quoted
+    // string is a parse error there, unlike the function-call form above.
+    let src = "[{\"tool\":\"gtd.next\",\"args\":{\"note\":\"line one\nline two\"}}]";
+    let err = parse_request(src).unwrap_err();
+    assert!(matches!(err, DslError::InvalidJson { .. }));
+}
+
+#[test]
 fn null_and_negative_number() {
     let v = ops(r#"update(id="x", description=null, weight=-0.5)"#);
     assert_eq!(val(&v[0].args["description"]), &json!(null));

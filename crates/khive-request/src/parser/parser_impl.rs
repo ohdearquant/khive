@@ -4,7 +4,7 @@ use serde_json::Value;
 
 use crate::types::{ArgValue, DslError, ParsedOp, NESTING_DEPTH_LIMIT};
 
-use super::scan::{char_label, scan_string_end};
+use super::scan::{char_label, escape_literal_control_chars, scan_string_end};
 
 /// Byte-slice cursor for the DSL input.
 pub(crate) struct Parser<'a> {
@@ -391,11 +391,23 @@ impl<'a> Parser<'a> {
         let end = self.scan_value_end()?;
         let slice = std::str::from_utf8(&self.src[start..end])
             .expect("ascii-or-utf8 maintained by scanner");
-        let value: Value =
-            serde_json::from_str(slice.trim()).map_err(|e| DslError::InvalidValue {
-                pos: start,
-                error: e.to_string(),
-            })?;
+        let trimmed = slice.trim();
+        // A quoted string literal may contain raw control bytes (newline, CR,
+        // tab) verbatim in the DSL source; JSON proper forbids that, so
+        // rewrite them to JSON escapes before handing the slice to
+        // `serde_json`. Non-string values (numbers, bool, null) never
+        // legitimately contain such bytes, so this only touches strings.
+        let normalized;
+        let json_src: &str = if trimmed.starts_with('"') {
+            normalized = escape_literal_control_chars(trimmed);
+            &normalized
+        } else {
+            trimmed
+        };
+        let value: Value = serde_json::from_str(json_src).map_err(|e| DslError::InvalidValue {
+            pos: start,
+            error: e.to_string(),
+        })?;
         self.pos = end;
         Ok(value)
     }
