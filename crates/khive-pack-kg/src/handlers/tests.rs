@@ -980,8 +980,9 @@ async fn list_note_thread_filter_non_ascii_stored_no_panic() {
     );
     let arr = result.unwrap();
     assert!(
-        arr.as_array()
-            .expect("list result must be a JSON array")
+        arr["items"]
+            .as_array()
+            .expect("list result must be {\"items\": [...]}")
             .is_empty(),
         "no note should match a non-overlapping thread_id prefix"
     );
@@ -1025,7 +1026,9 @@ async fn list_note_thread_filter_non_ascii_exact_match() {
         .await
         .expect("exact-match list must succeed");
 
-    let arr = result.as_array().expect("list result must be a JSON array");
+    let arr = result["items"]
+        .as_array()
+        .expect("list result must be {\"items\": [...]}");
     assert_eq!(
         arr.len(),
         1,
@@ -1467,7 +1470,7 @@ async fn create_entity_rejects_embedding_content() {
         .await
         .expect("list ok");
     assert_eq!(
-        list.as_array().expect("array").len(),
+        list["items"].as_array().expect("array").len(),
         0,
         "rejected create must leave no entity behind"
     );

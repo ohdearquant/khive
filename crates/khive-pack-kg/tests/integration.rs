@@ -10546,3 +10546,408 @@ async fn create_note_top_level_tags_wins_over_properties_tags_conflict() {
         Some("test747d")
     );
 }
+
+// =============================================================================
+// list() row-cap truncation signal (issue #894)
+//
+// Every server-side page cap (entity 500, note 200, edge/event 1000) was
+// silently binding: a `limit` above the cap returned fewer rows than asked
+// for with no signal, so a caller striding a pagination loop by its own
+// requested `limit` could silently skip rows between pages (atlas's
+// provenance sweep hit this, missing ~48% of a 4194-entity corpus). These
+// tests exercise the fix end-to-end through the real handler + runtime +
+// storage, mirroring the sentinel-row technique the `query()` verb already
+// uses for the identical defect class (issue #777 — see
+// khive-runtime/tests/integration.rs "GQL query truncation warning"). Pure
+// boundary-arithmetic coverage for the shared `cap_fetch_limit` /
+// `cap_truncation_warning` helpers lives in
+// khive-pack-kg/src/handlers/common.rs `cap_signal_tests`.
+// =============================================================================
+
+/// Build a `Fixture` (registry-wrapped dispatch, same path the MCP server
+/// uses) alongside the underlying `KhiveRuntime` and a `local`-namespace
+/// token, so tests can seed data via fast direct runtime calls (bypassing
+/// the JSON `create` verb) while still exercising the real `list` verb
+/// through the registry for assertions.
+fn pack_and_runtime() -> (Fixture, KhiveRuntime, NamespaceToken) {
+    let rt = KhiveRuntime::memory().expect("in-memory runtime must succeed");
+    let tok = rt.authorize(Namespace::local()).expect("authorize local");
+    let mut builder = VerbRegistryBuilder::new();
+    builder.register(KgPack::new(rt.clone()));
+    let registry = builder.build().expect("registry builds");
+    (Fixture { registry }, rt, tok)
+}
+
+/// `list(kind="entity")`: a `limit` at or under the cap (500) is honored
+/// exactly, with no `warnings` key — the fix must not change the common case.
+#[tokio::test]
+async fn list_entity_limit_under_cap_honored_exactly() {
+    let (pack, rt, tok) = pack_and_runtime();
+    for i in 0..5u32 {
+        rt.create_entity(
+            &tok,
+            "concept",
+            None,
+            &format!("cap894-under-{i}"),
+            None,
+            None,
+            vec![],
+        )
+        .await
+        .unwrap_or_else(|e| panic!("create entity {i} must succeed: {e}"));
+    }
+
+    let resp = pack
+        .dispatch("list", json!({"kind": "entity", "limit": 3}))
+        .await
+        .expect("#894: list under cap must succeed");
+
+    let items = resp["items"].as_array().expect("items must be an array");
+    assert_eq!(
+        items.len(),
+        3,
+        "limit=3 under the entity cap (500) must return exactly 3 rows"
+    );
+    assert!(
+        resp.get("warnings").is_none(),
+        "no warnings when limit never exceeded the cap: {resp}"
+    );
+}
+
+/// `limit` above the cap but the true match count stays under the cap:
+/// nothing was actually dropped, so `warnings` must NOT appear — the
+/// false-positive guard from the query()-verb fix (#777) applied to list().
+#[tokio::test]
+async fn list_entity_limit_over_cap_but_matches_under_cap_no_warning() {
+    let (pack, rt, tok) = pack_and_runtime();
+    for i in 0..10u32 {
+        rt.create_entity(
+            &tok,
+            "concept",
+            None,
+            &format!("cap894-fewmatch-{i}"),
+            None,
+            None,
+            vec![],
+        )
+        .await
+        .unwrap_or_else(|e| panic!("create entity {i} must succeed: {e}"));
+    }
+
+    let resp = pack
+        .dispatch("list", json!({"kind": "entity", "limit": 1000}))
+        .await
+        .expect("#894: over-cap limit with few real matches must succeed");
+
+    let items = resp["items"].as_array().expect("items must be an array");
+    assert_eq!(
+        items.len(),
+        10,
+        "only 10 entities exist; all must be returned"
+    );
+    assert!(
+        resp.get("warnings").is_none(),
+        "limit=1000 over the cap must not warn when only 10 rows actually matched: {resp}"
+    );
+}
+
+/// `limit` above the cap AND the true match count exceeds the cap: this is
+/// issue #894's actual repro. The response must truncate to the cap (500)
+/// and carry a `warnings` entry naming both the cap and the requested limit.
+#[tokio::test]
+async fn list_entity_limit_over_cap_truncates_and_warns() {
+    let (pack, rt, tok) = pack_and_runtime();
+    for i in 0..501u32 {
+        rt.create_entity(
+            &tok,
+            "concept",
+            None,
+            &format!("cap894-over-{i}"),
+            None,
+            None,
+            vec![],
+        )
+        .await
+        .unwrap_or_else(|e| panic!("create entity {i} must succeed: {e}"));
+    }
+
+    let resp = pack
+        .dispatch("list", json!({"kind": "entity", "limit": 600}))
+        .await
+        .expect("#894: list must succeed even when the cap binds");
+
+    let items = resp["items"].as_array().expect("items must be an array");
+    assert_eq!(
+        items.len(),
+        500,
+        "must truncate to the entity cap (500) exactly, not silently return fewer/more"
+    );
+
+    let warnings = resp["warnings"]
+        .as_array()
+        .expect("truncation must carry a warnings array");
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    let msg = warnings[0].as_str().expect("warning must be a string");
+    assert!(msg.contains("500"), "{msg}");
+    assert!(msg.contains("600"), "{msg}");
+}
+
+/// Same "under cap honored exactly" behavior as the entity test, at the note
+/// cap (200).
+#[tokio::test]
+async fn list_note_limit_under_cap_honored_exactly() {
+    let (pack, rt, tok) = pack_and_runtime();
+    for i in 0..4u32 {
+        rt.create_note(
+            &tok,
+            "observation",
+            None,
+            &format!("cap894 note under {i}"),
+            None,
+            None,
+            vec![],
+        )
+        .await
+        .unwrap_or_else(|e| panic!("create note {i} must succeed: {e}"));
+    }
+
+    let resp = pack
+        .dispatch("list", json!({"kind": "note", "limit": 2}))
+        .await
+        .expect("#894: list notes under cap must succeed");
+    let items = resp["items"].as_array().expect("items must be an array");
+    assert_eq!(
+        items.len(),
+        2,
+        "limit=2 under the note cap (200) must return exactly 2 rows"
+    );
+    assert!(resp.get("warnings").is_none(), "{resp}");
+}
+
+/// Same "truncates and warns" behavior as the entity test, at the note cap
+/// (200).
+#[tokio::test]
+async fn list_note_limit_over_cap_truncates_and_warns() {
+    let (pack, rt, tok) = pack_and_runtime();
+    for i in 0..201u32 {
+        rt.create_note(
+            &tok,
+            "observation",
+            None,
+            &format!("cap894 note over {i}"),
+            None,
+            None,
+            vec![],
+        )
+        .await
+        .unwrap_or_else(|e| panic!("create note {i} must succeed: {e}"));
+    }
+
+    let resp = pack
+        .dispatch("list", json!({"kind": "note", "limit": 300}))
+        .await
+        .expect("#894: list notes must succeed even when the cap binds");
+    let items = resp["items"].as_array().expect("items must be an array");
+    assert_eq!(
+        items.len(),
+        200,
+        "must truncate to the note cap (200) exactly"
+    );
+    let warnings = resp["warnings"]
+        .as_array()
+        .expect("truncation must carry a warnings array");
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    let msg = warnings[0].as_str().expect("warning must be a string");
+    assert!(msg.contains("200"), "{msg}");
+    assert!(msg.contains("300"), "{msg}");
+}
+
+/// `list(kind="edge")` offset-mode: now wraps in `{"items": [...]}` like
+/// every other kind (previously a bare array). Under-cap case honored
+/// exactly with no warnings, and the response must NOT carry the cursor-mode
+/// `edges`/`next_after` keys (those are `after`-mode only).
+#[tokio::test]
+async fn list_edge_offset_mode_limit_under_cap_honored_exactly() {
+    use khive_storage::EdgeRelation;
+
+    let (pack, rt, tok) = pack_and_runtime();
+    let mut node_ids = Vec::new();
+    for i in 0..6u32 {
+        let e = rt
+            .create_entity(
+                &tok,
+                "concept",
+                None,
+                &format!("cap894-edgenode-{i}"),
+                None,
+                None,
+                vec![],
+            )
+            .await
+            .unwrap_or_else(|e| panic!("create node {i} must succeed: {e}"));
+        node_ids.push(e.id);
+    }
+    for i in 0..5usize {
+        rt.link(
+            &tok,
+            node_ids[i],
+            node_ids[i + 1],
+            EdgeRelation::Extends,
+            1.0,
+            None,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("create edge {i} must succeed: {e}"));
+    }
+
+    let resp = pack
+        .dispatch("list", json!({"kind": "edge", "limit": 3}))
+        .await
+        .expect("#894: list edges under cap must succeed");
+    let items = resp["items"].as_array().expect("items must be an array");
+    assert_eq!(
+        items.len(),
+        3,
+        "limit=3 under the edge cap must return exactly 3 rows"
+    );
+    assert!(resp.get("warnings").is_none(), "{resp}");
+    assert!(
+        resp.get("edges").is_none(),
+        "offset-mode edges use the shared \"items\" envelope, not \"edges\": {resp}"
+    );
+}
+
+/// `list(kind="edge", limit=<over EDGE_LIST_MAX_LIMIT>)`: the cap genuinely
+/// binds and the response truncates + warns, exactly like the entity/note
+/// cases — in BOTH offset mode (`{"items": [...]}`) and cursor mode
+/// (`{"edges": [...], "next_after": ...}`), since both paths route through
+/// `list_edges_capped` / `list_edges_after_capped` with the same probe
+/// technique. Seeds via distinct concept pairs (edges are unique per
+/// (source, target, relation) triple, `idx_graph_edges_unique_triple`) to
+/// reach 1001 real matching edges — one past `EDGE_LIST_MAX_LIMIT` (1000).
+#[tokio::test]
+async fn list_edge_limit_over_cap_truncates_and_warns_offset_and_cursor_mode() {
+    use khive_storage::EdgeRelation;
+
+    let (pack, rt, tok) = pack_and_runtime();
+    let n_nodes = 34usize; // 34*33 = 1122 distinct ordered pairs >= 1001 needed
+    let mut node_ids = Vec::with_capacity(n_nodes);
+    for i in 0..n_nodes {
+        let e = rt
+            .create_entity(
+                &tok,
+                "concept",
+                None,
+                &format!("cap894-edgenode-big-{i}"),
+                None,
+                None,
+                vec![],
+            )
+            .await
+            .unwrap_or_else(|e| panic!("create node {i} must succeed: {e}"));
+        node_ids.push(e.id);
+    }
+
+    let mut created = 0usize;
+    'seed: for i in 0..n_nodes {
+        for j in 0..n_nodes {
+            if i == j {
+                continue;
+            }
+            rt.link(
+                &tok,
+                node_ids[i],
+                node_ids[j],
+                EdgeRelation::Extends,
+                1.0,
+                None,
+            )
+            .await
+            .unwrap_or_else(|e| panic!("create edge ({i},{j}) must succeed: {e}"));
+            created += 1;
+            if created >= 1001 {
+                break 'seed;
+            }
+        }
+    }
+    assert_eq!(
+        created, 1001,
+        "must have seeded exactly 1001 edges for this test's premise"
+    );
+
+    // Offset mode.
+    let resp = pack
+        .dispatch("list", json!({"kind": "edge", "limit": 1500}))
+        .await
+        .expect("#894: list edges must succeed even when the cap binds");
+    let items = resp["items"].as_array().expect("items must be an array");
+    assert_eq!(
+        items.len(),
+        1000,
+        "must truncate to EDGE_LIST_MAX_LIMIT (1000) exactly"
+    );
+    let warnings = resp["warnings"]
+        .as_array()
+        .expect("truncation must carry a warnings array");
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    let msg = warnings[0].as_str().expect("warning must be a string");
+    assert!(msg.contains("1000"), "{msg}");
+    assert!(msg.contains("1500"), "{msg}");
+
+    // Cursor mode: same cap, same probe technique
+    // (`list_edges_after_capped`) — must also truncate, warn, and recompute
+    // `next_after` against the truncated set rather than trusting the raw
+    // probe fetch's own page boundary.
+    let cursor_resp = pack
+        .dispatch("list", json!({"kind": "edge", "after": "", "limit": 1500}))
+        .await
+        .expect("#894: cursor-mode list edges must succeed even when the cap binds");
+    let cursor_edges = cursor_resp["edges"]
+        .as_array()
+        .expect("cursor mode keeps the {\"edges\": [...]} envelope");
+    assert_eq!(
+        cursor_edges.len(),
+        1000,
+        "cursor mode must also truncate to the cap"
+    );
+    assert!(
+        cursor_resp["next_after"].is_string(),
+        "truncated cursor page must still offer a next_after cursor: {cursor_resp}"
+    );
+    let cursor_warnings = cursor_resp["warnings"]
+        .as_array()
+        .expect("cursor mode truncation must also carry a warnings array");
+    assert_eq!(cursor_warnings.len(), 1, "{cursor_warnings:?}");
+}
+
+/// `list(kind="event")`: same `{"items": [...]}` envelope and under-cap
+/// behavior as every other kind. The event cap (1000) shares the identical
+/// `cap_fetch_limit` / `cap_truncation_warning` functions exercised at their
+/// exact boundary by the entity/edge tests above and by
+/// `cap_signal_tests` (khive-pack-kg/src/handlers/common.rs) — a live
+/// 1000+-event corpus isn't manufactured here since events are an audit
+/// side effect of other ops, not directly creatable.
+#[tokio::test]
+async fn list_event_limit_under_cap_honored_exactly() {
+    let f = pack_with_events();
+    for i in 0..4u32 {
+        f.dispatch(
+            "create",
+            json!({"kind": "concept", "name": format!("cap894-event-{i}")}),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("create entity {i} must succeed: {e}"));
+    }
+
+    let resp = f
+        .dispatch("list", json!({"kind": "event", "limit": 2}))
+        .await
+        .expect("#894: list events under cap must succeed");
+    let items = resp["items"].as_array().expect("items must be an array");
+    assert!(
+        items.len() <= 2,
+        "limit=2 must never return more than 2 rows; got {}",
+        items.len()
+    );
+    assert!(resp.get("warnings").is_none(), "{resp}");
+}

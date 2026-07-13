@@ -213,6 +213,13 @@ List records with optional filtering.
 request(ops="list(kind=\"entity\", entity_kind=\"concept\", limit=20)")
 ```
 
+Returns `{"items": [...], "warnings": [...]}` (`kind="edge"` with `after` set returns
+`{"edges": [...], "next_after": ..., "warnings": [...]}` instead). `warnings` is present only
+when the request's `limit` exceeded the kind's server-side row cap (entity 500, note 200, edge
+1000, event 1000) and that cap actually bound — a `limit` above the cap that still matches
+fewer rows than the cap does not warn, since nothing was dropped. Before this, a `limit` above
+the cap was silently clamped with no signal (issue #894).
+
 ### `stats` — Assertive
 
 Return aggregate KG substrate counts (entities, edges, notes). No params.

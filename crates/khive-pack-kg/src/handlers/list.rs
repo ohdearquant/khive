@@ -2,19 +2,27 @@
 
 use serde_json::Value;
 
-use khive_runtime::{NamespaceToken, RuntimeError, VerbRegistry};
+use khive_runtime::{KhiveRuntime, NamespaceToken, RuntimeError, VerbRegistry};
 use khive_storage::types::PageRequest;
 use khive_storage::EntityFilter;
 
 use khive_runtime::EdgeListFilter;
 
 use super::common::{
-    canonical_entity_kind, canonical_note_kind, deser, event_filter_from_params,
-    normalize_entity_timestamps, normalize_entity_timestamps_array,
+    canonical_entity_kind, canonical_note_kind, cap_fetch_limit, cap_truncation_warning, deser,
+    event_filter_from_params, normalize_entity_timestamps, normalize_entity_timestamps_array,
     normalize_event_timestamps_array, parse_relation, reconcile_specific, remap_note_status,
-    resolve_kind_spec, resolve_uuid_async, to_json, validate_entity_type, KindSpec, ListParams,
+    resolve_kind_spec, resolve_uuid_async, to_json, validate_entity_type, wrap_list_items,
+    KindSpec, ListParams,
 };
 use crate::KgPack;
+
+/// Server-side row caps enforced by each `list` branch (issue #894). Kept as
+/// named constants, not magic numbers, so the cap value used to compute the
+/// truncation signal always matches the cap actually enforced below.
+const ENTITY_LIST_CAP: u32 = 500;
+const NOTE_LIST_CAP: u32 = 200;
+const EVENT_LIST_CAP: u32 = 1000;
 
 impl KgPack {
     pub(crate) async fn handle_list(
@@ -58,9 +66,10 @@ impl KgPack {
                 } else {
                     None
                 };
-                let limit = p.limit.unwrap_or(50).min(500);
+                let requested = p.limit.unwrap_or(50);
+                let limit = cap_fetch_limit(requested, ENTITY_LIST_CAP);
                 let offset = p.offset.unwrap_or(0);
-                let entities = if let Some(ref tag_list) = p.tags {
+                let mut entities = if let Some(ref tag_list) = p.tags {
                     if tag_list.is_empty() {
                         self.runtime
                             .list_entities(
@@ -115,7 +124,16 @@ impl KgPack {
                         )
                         .await?
                 };
-                Ok(normalize_entity_timestamps_array(to_json(&entities)?))
+                let mut warnings = Vec::new();
+                if let Some(w) = cap_truncation_warning(entities.len(), requested, ENTITY_LIST_CAP)
+                {
+                    entities.truncate(ENTITY_LIST_CAP as usize);
+                    warnings.push(w);
+                }
+                Ok(wrap_list_items(
+                    normalize_entity_timestamps_array(to_json(&entities)?),
+                    warnings,
+                ))
             }
             KindSpec::Edge => {
                 let source_id = match p.source_id.as_deref() {
@@ -139,7 +157,9 @@ impl KgPack {
                     min_weight: p.min_weight,
                     max_weight: p.max_weight,
                 };
-                let limit = p.limit.unwrap_or(100);
+                let requested = p.limit.unwrap_or(100);
+                let cap = KhiveRuntime::EDGE_LIST_MAX_LIMIT;
+                let fetch_limit = cap_fetch_limit(requested, cap);
                 if let Some(ref after_str) = p.after {
                     // An empty string opts into cursor-mode pagination while
                     // starting from the beginning of the set (no prior page).
@@ -152,21 +172,42 @@ impl KgPack {
                             ))
                         })?)
                     };
-                    let (edges, next_after) = self
+                    let (mut edges, mut next_after) = self
                         .runtime
-                        .list_edges_after(token, filter, after, limit)
+                        .list_edges_after_capped(token, filter, after, fetch_limit)
                         .await?;
-                    Ok(serde_json::json!({
+                    // `list_edges_after_capped` computes `next_after` against
+                    // whatever `fetch_limit` we asked for. When `fetch_limit`
+                    // is the probe value (`cap + 1`), that `next_after` marks
+                    // the boundary one row past our own truncation point, so
+                    // it must be recomputed from the truncated set instead of
+                    // trusted as-is. See `cap_truncation_warning` (#894).
+                    let mut warnings = Vec::new();
+                    if let Some(w) = cap_truncation_warning(edges.len(), requested, cap) {
+                        edges.truncate(cap as usize);
+                        next_after = edges.last().map(|e| uuid::Uuid::from(e.id));
+                        warnings.push(w);
+                    }
+                    let mut out = serde_json::json!({
                         "edges": to_json(&edges)?,
                         "next_after": next_after,
-                    }))
+                    });
+                    if !warnings.is_empty() {
+                        out["warnings"] = serde_json::json!(warnings);
+                    }
+                    Ok(out)
                 } else {
                     let offset = p.offset.unwrap_or(0);
-                    let edges = self
+                    let mut edges = self
                         .runtime
-                        .list_edges(token, filter, limit, offset)
+                        .list_edges_capped(token, filter, fetch_limit, offset)
                         .await?;
-                    to_json(&edges)
+                    let mut warnings = Vec::new();
+                    if let Some(w) = cap_truncation_warning(edges.len(), requested, cap) {
+                        edges.truncate(cap as usize);
+                        warnings.push(w);
+                    }
+                    Ok(wrap_list_items(to_json(&edges)?, warnings))
                 }
             }
             KindSpec::Note { specific } => {
@@ -176,7 +217,8 @@ impl KgPack {
                     |s| canonical_note_kind(s, registry),
                     "note_kind",
                 )?;
-                let limit = p.limit.unwrap_or(20).min(200);
+                let requested = p.limit.unwrap_or(20);
+                let limit = cap_fetch_limit(requested, NOTE_LIST_CAP);
                 let offset = p.offset.unwrap_or(0);
 
                 let has_msg_filter = p.thread_id.is_some()
@@ -301,7 +343,7 @@ impl KgPack {
                         .await?
                 };
 
-                let remapped: Vec<Value> = if has_msg_filter {
+                let mut remapped: Vec<Value> = if has_msg_filter {
                     notes
                         .into_iter()
                         .skip(offset as usize)
@@ -325,15 +367,21 @@ impl KgPack {
                         })
                         .collect()
                 };
-                to_json(&remapped)
+                let mut warnings = Vec::new();
+                if let Some(w) = cap_truncation_warning(remapped.len(), requested, NOTE_LIST_CAP) {
+                    remapped.truncate(NOTE_LIST_CAP as usize);
+                    warnings.push(w);
+                }
+                Ok(wrap_list_items(to_json(&remapped)?, warnings))
             }
             KindSpec::Proposal => unreachable!("kind=proposal fast-pathed before deser"),
             KindSpec::Event => {
-                let limit = p.limit.unwrap_or(100).clamp(1, 1000);
+                let requested = p.limit.unwrap_or(100).max(1);
+                let limit = cap_fetch_limit(requested, EVENT_LIST_CAP);
                 let offset = p.offset.unwrap_or(0);
                 let (filter, outcome) = event_filter_from_params(&p)?;
 
-                if let Some(wanted_outcome) = outcome {
+                let mut items = if let Some(wanted_outcome) = outcome {
                     let mut items = Vec::new();
                     let mut skipped = 0u32;
                     let mut raw_offset = 0u32;
@@ -381,7 +429,7 @@ impl KgPack {
                             break;
                         }
                     }
-                    Ok(normalize_event_timestamps_array(to_json(&items)?))
+                    items
                 } else {
                     let page = self
                         .runtime
@@ -394,8 +442,17 @@ impl KgPack {
                             },
                         )
                         .await?;
-                    Ok(normalize_event_timestamps_array(to_json(&page.items)?))
+                    page.items
+                };
+                let mut warnings = Vec::new();
+                if let Some(w) = cap_truncation_warning(items.len(), requested, EVENT_LIST_CAP) {
+                    items.truncate(EVENT_LIST_CAP as usize);
+                    warnings.push(w);
                 }
+                Ok(wrap_list_items(
+                    normalize_event_timestamps_array(to_json(&items)?),
+                    warnings,
+                ))
             }
         }
     }
