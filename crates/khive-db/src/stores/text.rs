@@ -356,6 +356,35 @@ fn sanitize_fts5_phrase_literal(token: &str) -> Option<String> {
 /// split segment at or below this length as trigram-unsafe.
 const FTS5_TRIGRAM_MIN_SAFE_LEN: usize = 3;
 
+/// True if every character in `s` is safe to emit unquoted at any bareword
+/// position in an FTS5 MATCH expression.
+///
+/// Verified empirically (2026-07-13, khive #916) by feeding `"a<char>b"` as
+/// a bound MATCH argument for every printable ASCII character 0x21-0x7e to
+/// a live `tokenize='trigram'` table: only ASCII alphanumerics and `_` were
+/// error-free *and* matched as plain substring text in every position.
+/// Every other punctuation character is unsafe as a bareword — most raise a
+/// direct `fts5: syntax error near "<char>"` (`#`, `%`, `=`, `&`, `;`, `<`,
+/// `>`, `?`, `@`, `[`, `\`, `]`, `` ` ``, `|`, `!`, `$`, `'`, `"`, `,`, `.`,
+/// `/`, `(`, `)`, `~`), while `-`, `:`, `{`, `}` are instead silently
+/// reinterpreted as FTS5's column-filter syntax (`col: term`, `{col1
+/// col2}: term`) — just as wrong for a content-matching query, since it
+/// changes what the expression means rather than erroring. `*`, `+`, `^`
+/// are individually error-free too, but [`sanitize_fts5_query`]'s Pass 2
+/// already strips them out of every string this helper is called on, so it
+/// does not need to special-case them.
+///
+/// This is an allowlist, not a denylist, precisely because the denylist
+/// approach ([`sanitize_fts5_query`]'s Pass 2) has needed a new character
+/// added on every prior FTS5-syntax-error report (`$` in #388, `'` in
+/// #570, `#`/`%`/`=` in #916) and will keep needing one for whatever
+/// punctuation the next query happens to contain. An allowlist converges:
+/// nothing reaches an unquoted bareword position unless it is provably
+/// safe.
+fn is_fts5_bareword_safe(s: &str) -> bool {
+    !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
 /// Sanitize a single whitespace-isolated raw token into an FTS5
 /// match-expression fragment.
 ///
@@ -395,28 +424,47 @@ const FTS5_TRIGRAM_MIN_SAFE_LEN: usize = 3;
 ///   requiring adjacency for that token, which is the trade-off intended
 ///   by the finding this fixes (khive #397 Finding 2): correctness over a
 ///   marginally more lenient match.
+/// - (#916) `sanitize_fts5_query`'s Pass 1/2 only reroute a *curated* set of
+///   punctuation characters (grouping chars to spaces, a handful of FTS5
+///   operator chars removed outright) — anything outside that set, e.g.
+///   `#682`, `B=128`, `Min-K%Prob`'s `%`, reaches this function's split and
+///   merged forms unchanged and is an invalid FTS5 bareword. Every bareword
+///   alternative (the split AND-group and the legacy merge) is now gated on
+///   [`is_fts5_bareword_safe`] before being emitted; when a term fails that
+///   check, the alternative is dropped rather than emitted broken, and the
+///   quoted-phrase alternative below — which FTS5 accepts literally,
+///   verified for every ASCII punctuation character (#916) — is what
+///   carries that token instead. A single-term token that sanitizes to one
+///   unsafe bareword (`#682`) now falls through to the same alternative
+///   pipeline the multi-term case already used, rather than returning the
+///   raw bareword unconditionally.
 ///
 /// All emitted readings are additive OR-alternatives otherwise — the result
 /// is never a narrower match than any single (safe) form alone.
 ///
-/// Returns `None` if the token sanitizes to nothing.
+/// Returns `None` if the token sanitizes to nothing, or if every candidate
+/// alternative was unsafe to emit (only reachable when the raw token
+/// consists solely of characters `sanitize_fts5_phrase_literal` also
+/// strips — quotes, `*`, NUL, control characters).
 fn sanitize_fts5_token_group(token: &str) -> Option<String> {
     let split = sanitize_fts5_query(token);
     let split_terms: Vec<&str> = split.split_whitespace().collect();
     if split_terms.is_empty() {
         return None;
     }
-    if split_terms.len() == 1 {
-        return Some(split_terms[0].to_string());
-    }
 
+    let all_bareword_safe = split_terms.iter().all(|t| is_fts5_bareword_safe(t));
     let has_trigram_unsafe_segment = split_terms
         .iter()
         .any(|t| t.chars().count() < FTS5_TRIGRAM_MIN_SAFE_LEN);
 
     let mut alternatives = Vec::new();
-    if !has_trigram_unsafe_segment {
-        alternatives.push(format!("({})", split_terms.join(" ")));
+    if all_bareword_safe {
+        if split_terms.len() == 1 {
+            alternatives.push(split_terms[0].to_string());
+        } else if !has_trigram_unsafe_segment {
+            alternatives.push(format!("({})", split_terms.join(" ")));
+        }
     }
 
     // An operator-bearing token (e.g. `NEAR(alpha-beta,5)`) can make the
@@ -431,6 +479,8 @@ fn sanitize_fts5_token_group(token: &str) -> Option<String> {
     // here whenever the merge is multi-term.
     let merged = sanitize_fts5_query_legacy_merged(token);
     let merged_terms: Vec<&str> = merged.split_whitespace().collect();
+    let merged_all_bareword_safe =
+        !merged_terms.is_empty() && merged_terms.iter().all(|t| is_fts5_bareword_safe(t));
     let merged_has_unsafe_segment = merged_terms.len() > 1
         && merged_terms
             .iter()
@@ -446,7 +496,12 @@ fn sanitize_fts5_token_group(token: &str) -> Option<String> {
     let phrase = sanitize_fts5_phrase_literal(token);
     let duplicates_split = merged == split_terms.join(" ");
     let duplicates_phrase = phrase.as_deref() == Some(merged.as_str());
-    if !merged.is_empty() && !duplicates_split && !duplicates_phrase && !merged_has_unsafe_segment {
+    if merged_all_bareword_safe
+        && !merged.is_empty()
+        && !duplicates_split
+        && !duplicates_phrase
+        && !merged_has_unsafe_segment
+    {
         alternatives.push(merged);
     }
 
@@ -455,7 +510,7 @@ fn sanitize_fts5_token_group(token: &str) -> Option<String> {
     }
 
     match alternatives.len() {
-        0 => Some(format!("({})", split_terms.join(" "))),
+        0 => None,
         1 => alternatives.into_iter().next(),
         _ => Some(format!("({})", alternatives.join(" OR "))),
     }

@@ -1055,20 +1055,18 @@ mod tests {
         }
     }
 
-    /// #569 regression: unlike `$`, `@` is NOT stripped by `sanitize_fts5_query`
-    /// (by design — the sanitizer stays minimal per #388 scope). SQLite FTS5's
-    /// bareword parser still rejects `@` unconditionally, so this query reaches
-    /// the `Err` arm in `collect_recall_text_hits`
-    /// (khive-pack-memory/handlers/common.rs), which must now fail loud
-    /// instead of degrading to vector-only results as it did before #569.
-    /// This assertion fails against the pre-#569 fail-open behavior (which
-    /// returned `Ok` with a non-empty result here) and passes once the FTS
-    /// leg fails closed.
+    /// #916 regression: `@` used to reach SQLite FTS5's bareword parser raw
+    /// (`sanitize_fts5_query` did not strip it) and crash it, so this query
+    /// used to reach the `Err` arm in `collect_recall_text_hits`
+    /// (khive-pack-memory/handlers/common.rs), which failed loud per #569.
+    /// `sanitize_fts5_token_group`'s bareword-safety gate (#916) now routes
+    /// `@` through the quoted-phrase alternative instead, so `memory.recall`
+    /// succeeds end to end through verb dispatch.
     // `#[serial(background_tasks)]`: kept to match the fixture setup used by
     // the sibling dollar-sign test above.
     #[tokio::test]
     #[serial(background_tasks)]
-    async fn recall_with_residual_fts5_char_fails_loud() {
+    async fn recall_with_residual_fts5_char_now_sanitized() {
         const MODEL: &str = "recall-residual-char-test-model";
         const DIMS: usize = 32;
         const NOTE_TEXT: &str = "foo@bar chain call helper note";
@@ -1108,11 +1106,13 @@ mod tests {
             )
             .await;
 
+        let value = result.unwrap_or_else(|e| {
+            panic!("#916 memory.recall must not fail on an '@'-bearing query, got: {e:?}")
+        });
+        let hits = value.as_array().expect("recall result must be an array");
         assert!(
-            result.is_err(),
-            "#569 memory.recall must fail loud when the FTS leg errors on a residual \
-             FTS5 char ('@'), not silently degrade to vector-only results, got: {:?}",
-            result.ok()
+            !hits.is_empty(),
+            "#916 '@'-bearing query must still find the seeded note; got {value:?}"
         );
     }
 
@@ -3983,7 +3983,7 @@ mod tests {
         // path fans out to every *registered* model when the field is
         // omitted (`resolve_embedding_model` only accepts lattice aliases —
         // an explicit custom provider name here would hit `UnknownModel`,
-        // same gotcha documented on `recall_with_residual_fts5_char_fails_loud`
+        // same gotcha documented on `recall_with_residual_fts5_char_now_sanitized`
         // above). `NS733_ANN_MODEL` is the only model registered on this
         // runtime, so auto-detect resolves to exactly it.
         for i in 0..NS733_FILLER_COUNT {

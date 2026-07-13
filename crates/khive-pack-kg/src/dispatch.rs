@@ -1035,19 +1035,17 @@ mod tests {
         );
     }
 
-    /// #569 regression: `search(kind="note", ...)` must fail loud on a residual
-    /// FTS5 metacharacter, exercised end to end through verb dispatch.
+    /// #916 regression: `search(kind="note", ...)` must succeed on a query
+    /// containing `@`, exercised end to end through verb dispatch.
     ///
-    /// `sanitize_fts5_query` (khive-db) strips known-unsafe characters like `$`,
-    /// but by design stays minimal — it does not strip every character SQLite
-    /// FTS5's bareword parser rejects. `@` is one residual character that still
-    /// crashes the parser. `search_notes` (khive-runtime/operations.rs) now
-    /// surfaces that FTS parser error as `RuntimeError::InvalidInput` instead
-    /// of silently degrading to vector-only results (#569). This assertion
-    /// fails against the pre-#569 fail-open behavior (which returned `Ok`
-    /// here) and passes once the FTS leg fails closed.
+    /// `@` used to reach SQLite FTS5's bareword parser raw (`sanitize_fts5_query`
+    /// did not strip it) and crash it, which `search_notes`
+    /// (khive-runtime/operations.rs) surfaced as `RuntimeError::InvalidInput`
+    /// per #569's fail-loud policy. `sanitize_fts5_token_group`'s
+    /// bareword-safety gate (#916) now routes `@` through the quoted-phrase
+    /// alternative instead, so the query succeeds and finds the seeded note.
     #[tokio::test]
-    async fn handler_search_note_residual_fts5_char_fails_loud() {
+    async fn handler_search_note_residual_fts5_char_now_sanitized() {
         let rt = KhiveRuntime::memory().expect("in-memory runtime");
         let tok = rt.authorize(Namespace::local()).unwrap();
 
@@ -1081,11 +1079,13 @@ mod tests {
             )
             .await;
 
+        let value = result.unwrap_or_else(|e| {
+            panic!("#916 search(kind=\"note\") must not fail on an '@'-bearing query, got: {e:?}")
+        });
+        let hits = value.as_array().expect("search must return an array");
         assert!(
-            result.is_err(),
-            "#569 search(kind=\"note\") must fail loud on a residual FTS5 char ('@'), \
-             not silently degrade to vector-only results, got: {:?}",
-            result.ok()
+            !hits.is_empty(),
+            "#916 '@'-bearing query must still find the seeded 'foo@bar' note; got {hits:?}"
         );
     }
 
