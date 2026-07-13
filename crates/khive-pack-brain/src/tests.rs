@@ -6356,6 +6356,73 @@ mod event_counts_tests {
         );
     }
 
+    /// ADR-103 Amendment 1 (PR #927): the dispatch-boundary audit-row emitter
+    /// now stamps `resource: {"work_class": "interactive"}` on EVERY audit
+    /// row outcome, denied and errored included -- only `resource.cost_unit`
+    /// is scoped to a successful dispatch (ADR-103 Decision (a) requires
+    /// `work_class` on every event; Amendment 1's omission rule covers
+    /// `cost_unit` alone). This pins that a failed and a denied dispatch's
+    /// audit rows are still counted in `counts_by_work_class` via the same
+    /// `payload.resource.work_class` fallback path other non-phase events
+    /// use: outcome plays no role in the split, only payload shape does.
+    #[tokio::test]
+    async fn failed_and_denied_audit_rows_count_via_resource_work_class_fallback() {
+        let (pack, rt) = make_pack();
+        let registry = empty_registry();
+        let token = rt.authorize(Namespace::local()).unwrap();
+
+        let mut errored = Event::new(
+            token.namespace().as_str(),
+            "probe",
+            EventKind::Audit,
+            SubstrateKind::Event,
+            "lambda:khive",
+        );
+        errored.created_at = 1_000_000;
+        errored.outcome = khive_types::EventOutcome::Error;
+        errored.payload = json!({"resource": {"work_class": "interactive"}});
+        rt.events(&token)
+            .expect("event store")
+            .append_event(errored)
+            .await
+            .expect("seed errored audit event");
+
+        let mut denied = Event::new(
+            token.namespace().as_str(),
+            "list",
+            EventKind::Audit,
+            SubstrateKind::Event,
+            "lambda:khive",
+        );
+        denied.created_at = 1_000_000;
+        denied.outcome = khive_types::EventOutcome::Denied;
+        denied.payload = json!({"resource": {"work_class": "interactive"}});
+        rt.events(&token)
+            .expect("event store")
+            .append_event(denied)
+            .await
+            .expect("seed denied audit event");
+
+        let result = pack
+            .dispatch(
+                "brain.event_counts",
+                json!({"since": micros_to_iso(0)}),
+                &registry,
+                &token,
+            )
+            .await
+            .expect("brain.event_counts must succeed");
+
+        assert_eq!(result["total"], json!(2), "got: {result}");
+        assert_eq!(
+            result["counts_by_work_class"]["interactive"],
+            json!(2),
+            "a failed dispatch and a denied dispatch must both still count under \
+             counts_by_work_class -- work_class is stamped on every event outcome \
+             (ADR-103 Decision (a)), unlike cost_unit which is success-only: {result}"
+        );
+    }
+
     /// `cost_unit` does not exist on any event payload in the codebase today (ADR-103
     /// Stage 0 defines it; no Stage 1 producer emits it yet). This verb must not invent
     /// a `cost_unit` key — asserts its literal absence from the response shape so a

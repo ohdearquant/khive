@@ -22,7 +22,7 @@ not performed by this pack in process. Two supported execution modes exist:
 - Name: `schedule`
 - Note kinds: `["scheduled_event"]`
 - Entity kinds: `[]`
-- Requires: `["kg"]`
+- Requires: `["kg"]`; `schedule.remind` requires `comm.send` at creation time
 - Verbs: `schedule.remind`, `schedule.schedule`, `schedule.agenda`, `schedule.cancel`
 
 **Notes-as-scheduled-events.** A `scheduled_event` is a note stored with the
@@ -34,21 +34,25 @@ following `properties` shape:
   "repeat": "daily",
   "status": "pending",
   "event_type": "remind",
+  "created_by_actor": "lambda:owner",
   "payload": null,
   "fired_at": null,
   "cancelled_at": null
 }
 ```
 
-`event_type` distinguishes `remind` (no action payload; fires a notification)
-from `schedule` (stores a serialized verb+args payload for replay). `payload`
-is null for reminders and a JSON-encoded verb call string for scheduled dispatch.
+`event_type` distinguishes `remind` (no action payload; delivers its content to
+the `created_by_actor` inbox) from `schedule` (stores a serialized verb+args
+payload for replay). `payload` is null for reminders and a JSON-encoded verb
+call string for scheduled dispatch. Reminder delivery uses the same dual-write
+path as `comm.send`. Use `schedule.schedule(action="comm.send(...)")` for
+delivery to an actor other than the creator.
 
 **Four verbs:**
 
 | Verb | Speech act | Args | What it does |
 |------|-----------|------|-------------|
-| `schedule.remind` | commissive | `content`, `at`, `repeat?` | Create a `scheduled_event` with `event_type="remind"` |
+| `schedule.remind` | commissive | `content`, `at`, `repeat?` | Create a `scheduled_event` that delivers `content` to the creating actor's inbox at fire time |
 | `schedule.schedule` | commissive | `action`, `at`, `repeat?` | Create a `scheduled_event` with `event_type="schedule"`; `action` is a DSL verb string |
 | `schedule.agenda` | assertive | `from?`, `to?`, `limit?` | List pending `scheduled_event` notes ordered by `trigger_at` ascending |
 | `schedule.cancel` | declaration | `id` | Set `properties.status = "cancelled"`, record `cancelled_at` |
@@ -125,8 +129,9 @@ time when no observer is present.
 ### ADR-017: Pack Standard
 
 The pack self-registers via `inventory::submit!`. It declares `REQUIRES = ["kg"]`,
-ensuring the kg pack is loaded before this pack during boot-time dependency
-resolution.
+ensuring the notes substrate is available before the schedule pack loads.
+`schedule.remind` separately verifies that `comm.send` is registered before
+persisting a reminder; the other three schedule verbs do not require `comm`.
 
 ### Verb Speech Acts (ADR-025)
 

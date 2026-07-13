@@ -778,8 +778,16 @@ pub(crate) struct CancelParams {
 pub(crate) async fn handle_remind(
     runtime: &KhiveRuntime,
     token: &NamespaceToken,
+    registry: &VerbRegistry,
     params: Value,
 ) -> Result<Value, RuntimeError> {
+    if registry.describe_verb("comm.send").is_err() {
+        return Err(RuntimeError::InvalidInput(
+            "schedule.remind requires the comm delivery capability `comm.send`; load the `comm` pack"
+                .into(),
+        ));
+    }
+
     let p: RemindParams = deser(params)?;
     if p.content.trim().is_empty() {
         return Err(RuntimeError::InvalidInput(
@@ -807,6 +815,7 @@ pub(crate) async fn handle_remind(
         "repeat": p.repeat,
         "status": "pending",
         "event_type": "remind",
+        "created_by_actor": token.actor().id.clone(),
         "payload": null,
         "fired_at": null,
         "cancelled_at": null,

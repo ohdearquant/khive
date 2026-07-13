@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Smoke + behavioural tests for the khive-mcp schedule pack over stdio MCP.
 
-Spawns the binary with an in-memory DB, --pack kg --pack schedule, sends
+Spawns the binary with an in-memory DB, --pack kg --pack comm --pack schedule, sends
 JSON-RPC requests, and verifies all four verbs (schedule.remind,
 schedule.schedule, schedule.agenda, schedule.cancel) across happy paths
 and error cases.
@@ -118,7 +118,10 @@ ISOLATION_DB = ":memory:"
 
 
 def spawn_proc():
-    """Spawn a fresh khive-mcp process with kg + schedule packs.
+    """Spawn a fresh khive-mcp process with kg + comm + schedule packs.
+
+    comm is required alongside schedule: schedule.remind fails fast without
+    the comm delivery capability (comm.send) registered (#897 review).
 
     Always isolated: `--db :memory:` is non-negotiable for this script, so we
     build argv from ISOLATION_DB and assert it landed exactly where expected
@@ -126,7 +129,7 @@ def spawn_proc():
     """
     argv = [
         BINARY, "mcp", "--db", ISOLATION_DB, "--no-embed", "--log", "error",
-        "--pack", "kg", "--pack", "schedule",
+        "--pack", "kg", "--pack", "comm", "--pack", "schedule",
     ]
     db_flag_index = argv.index("--db")
     assert argv[db_flag_index + 1] == ISOLATION_DB, (

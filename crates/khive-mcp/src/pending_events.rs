@@ -2,10 +2,11 @@
 //! daemon-resident tick (ADR-106, [`schedule_tick_loop`]).
 //!
 //! Scans all `scheduled_event` notes with `status="pending"` whose `trigger_at`
-//! is at or before now, fires their stored action through the registry in the
-//! event's own namespace, marks each as `"fired"`, and advances repeating events
-//! to their next occurrence. Events overdue by more than the configured grace
-//! window are never dispatched — see "Missed-event policy" below.
+//! is at or before now, dispatches scheduled actions or delivers reminders to
+//! their creating actors through `comm.send`, marks each as `"fired"`, and
+//! advances repeating events to their next occurrence. Events overdue by more
+//! than the configured grace window are never dispatched. See "Missed-event
+//! policy" below.
 //!
 //! This module lives in `khive-mcp` (not `kkernel`, where it originated)
 //! because the daemon tick loop needs to call it in-process from
@@ -73,6 +74,7 @@ use crate::server::KhiveMcpServer;
 use crate::tools::request::RequestParams;
 use khive_runtime::{KhiveRuntime, Namespace};
 use khive_storage::types::{SqlStatement, SqlValue};
+use khive_types::{EventKind, EventOutcome, SubstrateKind};
 
 /// A `scheduled_event` row stuck in `status="firing"` for longer than this is
 /// considered abandoned by a drain process that crashed or was killed between
@@ -125,7 +127,7 @@ pub struct DrainSummary {
 ///
 /// - Scans for `scheduled_event` notes with `status="pending"` and
 ///   `trigger_at <= now`.
-/// - Dispatches the stored action DSL in the event's namespace.
+/// - Dispatches the stored action DSL or reminder inbox delivery in the event's namespace.
 /// - Marks fired events: status → `"fired"`, `fired_at` → now.
 /// - For repeating events with named aliases (`"daily"` / `"weekly"` /
 ///   `"monthly"`), resets status to `"pending"` and advances `trigger_at`.
@@ -346,7 +348,7 @@ pub async fn run_pending_events_on(
                 // unparseable `trigger_at` at write time, so this only
                 // matters for a hand-written or pre-validation row.
                 None => (
-                    "SELECT id, properties, created_at FROM notes \
+                    "SELECT id, content, properties, created_at FROM notes \
                      WHERE namespace = ?1 AND kind = 'scheduled_event' \
                        AND deleted_at IS NULL \
                        AND json_extract(properties, '$.status') = 'pending' \
@@ -363,7 +365,7 @@ pub async fn run_pending_events_on(
                     ],
                 ),
                 Some((c_created_at, c_id)) => (
-                    "SELECT id, properties, created_at FROM notes \
+                    "SELECT id, content, properties, created_at FROM notes \
                      WHERE namespace = ?1 AND kind = 'scheduled_event' \
                        AND deleted_at IS NULL \
                        AND json_extract(properties, '$.status') = 'pending' \
@@ -470,6 +472,18 @@ pub async fn run_pending_events_on(
                         continue;
                     }
                 };
+                let content = match row.get("content") {
+                    Some(SqlValue::Text(s)) => s.clone(),
+                    other => {
+                        tracing::error!(
+                            scheduled_event_id = %id,
+                            content_column = ?other,
+                            "pending-events: scheduled event has invalid content"
+                        );
+                        summary.failed += 1;
+                        continue;
+                    }
+                };
 
                 summary.scanned += 1;
 
@@ -513,20 +527,39 @@ pub async fn run_pending_events_on(
                     .and_then(Value::as_str)
                     .unwrap_or("remind");
 
-                let action_dsl: Option<String> = if event_type == "schedule" && !is_missed {
+                let reminder_actor = if event_type == "remind" && !is_missed {
+                    let stored_actor = properties
+                        .as_ref()
+                        .and_then(|p| p.get("created_by_actor"))
+                        .and_then(Value::as_str);
+                    if stored_actor.is_none() {
+                        tracing::warn!(
+                            scheduled_event_id = %id,
+                            "pending-events: legacy reminder has no created_by_actor; using the \
+                             scheduler actor"
+                        );
+                    }
+                    Some(
+                        stored_actor
+                            .or_else(|| server.actor_id())
+                            .unwrap_or("local")
+                            .to_string(),
+                    )
+                } else {
+                    None
+                };
+                let action_dsl: Option<String> = if is_missed {
+                    None
+                } else if event_type == "schedule" {
                     properties
                         .as_ref()
                         .and_then(|p| p.get("payload"))
                         .and_then(Value::as_str)
                         .map(str::to_string)
                 } else {
-                    // remind events: no DSL action to dispatch. We mark as fired
-                    // to acknowledge the trigger. The notification channel (comm,
-                    // channel transport, etc.) is out of scope for this drain.
-                    // Missed `schedule` events take this branch too: the whole
-                    // point of the missed policy is that the action is never
-                    // dispatched.
-                    None
+                    reminder_actor
+                        .as_deref()
+                        .map(|actor| reminder_delivery_action(actor, &content))
                 };
 
                 // ── Determine repeat (read before claim; only informs which
@@ -633,13 +666,33 @@ pub async fn run_pending_events_on(
                 }
 
                 // ── Dispatch the action ──────────────────────────────────
+                let mut reminder_delivery_error = None;
                 if let Some(dsl) = &action_dsl {
                     let dispatch_result = dispatch_action(dsl, ns_str, server, verbose).await;
                     if let Err(e) = dispatch_result {
+                        tracing::error!(
+                            scheduled_event_id = %id,
+                            event_type,
+                            recipient_actor = reminder_actor.as_deref(),
+                            error = %e,
+                            "pending-events: scheduled event delivery failed"
+                        );
                         if verbose {
                             eprintln!("[pending-events] dispatch failed for note {id}: {e}");
                         }
                         summary.failed += 1;
+                        if event_type == "remind" {
+                            let error = e.to_string();
+                            append_reminder_delivery_failure_event(
+                                server,
+                                ns_str,
+                                id,
+                                reminder_actor.as_deref().unwrap_or("local"),
+                                &error,
+                            )
+                            .await;
+                            reminder_delivery_error = Some(error);
+                        }
                         // Per-event failure does NOT abort the drain. Continue.
                         // Still mark as fired so the drain doesn't retry infinitely
                         // on a permanently broken action. The error is reported
@@ -651,6 +704,15 @@ pub async fn run_pending_events_on(
 
                 let fired_at_rfc = Utc::now().to_rfc3339();
                 let mut props = properties.clone().unwrap_or_else(|| json!({}));
+                if event_type == "remind" {
+                    if let Some(error) = reminder_delivery_error {
+                        props["delivery_error"] = json!(error);
+                        props["delivery_failed_at"] = json!(fired_at_rfc);
+                    } else if let Some(obj) = props.as_object_mut() {
+                        obj.remove("delivery_error");
+                        obj.remove("delivery_failed_at");
+                    }
+                }
                 let updated_at;
 
                 match next_trigger_at(&repeat, trigger_at) {
@@ -964,6 +1026,65 @@ fn advance_repeat_past_missed(
     }
 }
 
+fn reminder_delivery_action(actor: &str, content: &str) -> String {
+    let action = json!([{
+        "tool": "comm.send",
+        "args": {
+            "to": actor,
+            "subject": reminder_subject(content),
+            "content": content,
+        }
+    }]);
+    serde_json::to_string(&action).expect("reminder delivery action is JSON-serializable")
+}
+
+fn reminder_subject(content: &str) -> String {
+    const MAX_HEAD_CHARS: usize = 80;
+    let collapsed = content.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut chars = collapsed.chars();
+    let head: String = chars.by_ref().take(MAX_HEAD_CHARS).collect();
+    if chars.next().is_some() {
+        format!("[Reminder] {head}…")
+    } else if head.is_empty() {
+        "[Reminder]".to_string()
+    } else {
+        format!("[Reminder] {head}")
+    }
+}
+
+async fn append_reminder_delivery_failure_event(
+    server: &KhiveMcpServer,
+    namespace: &str,
+    scheduled_event_id: uuid::Uuid,
+    recipient_actor: &str,
+    error: &str,
+) {
+    let Some(store) = server.event_store() else {
+        return;
+    };
+    let event = khive_storage::Event::new(
+        namespace,
+        "schedule.remind.fire",
+        EventKind::Audit,
+        SubstrateKind::Note,
+        recipient_actor,
+    )
+    .with_outcome(EventOutcome::Error)
+    .with_target(scheduled_event_id)
+    .with_payload(json!({
+        "scheduled_event_id": scheduled_event_id,
+        "recipient_actor": recipient_actor,
+        "error": error,
+    }));
+    if let Err(trace_error) = store.append_event(event).await {
+        tracing::error!(
+            scheduled_event_id = %scheduled_event_id,
+            error = %trace_error,
+            "pending-events: reminder delivery failure event append failed"
+        );
+    }
+}
+
 /// Dispatch a DSL action string in the given namespace.
 ///
 /// The action is wrapped as a JSON-form batch with `namespace` injected into
@@ -1261,9 +1382,25 @@ pub async fn schedule_tick_loop(
 mod tests {
     use super::*;
     use chrono::FixedOffset;
-    use khive_runtime::RuntimeConfig;
+    use khive_runtime::{Gate, GateDecision, GateError, GateRequest, RuntimeConfig};
+    use khive_storage::event::EventFilter;
     use khive_storage::types::PageRequest;
     use tempfile::NamedTempFile;
+
+    #[derive(Debug)]
+    struct DenyCommSendGate;
+
+    impl Gate for DenyCommSendGate {
+        fn check(&self, request: &GateRequest) -> Result<GateDecision, GateError> {
+            if request.verb == "comm.send" {
+                Ok(GateDecision::deny(
+                    "comm.send denied by delivery-failure test",
+                ))
+            } else {
+                Ok(GateDecision::allow())
+            }
+        }
+    }
 
     fn tmp_db() -> (NamedTempFile, String) {
         let f = NamedTempFile::new().expect("tempfile");
@@ -1292,11 +1429,16 @@ mod tests {
     }
 
     async fn make_rt(db_path: &str) -> KhiveRuntime {
+        make_rt_with_actor(db_path, None).await
+    }
+
+    async fn make_rt_with_actor(db_path: &str, actor_id: Option<&str>) -> KhiveRuntime {
         let cfg = RuntimeConfig {
             db_path: Some(std::path::PathBuf::from(db_path)),
             default_namespace: Namespace::parse("local").unwrap(),
             embedding_model: None,
             additional_embedding_models: vec![],
+            actor_id: actor_id.map(str::to_string),
             ..Default::default()
         };
         KhiveRuntime::new(cfg).expect("runtime")
@@ -1339,20 +1481,18 @@ mod tests {
         repeat: Option<&str>,
         event_type: &str,
     ) -> uuid::Uuid {
+        let ns = Namespace::parse(namespace).expect("ns");
+        let token = rt.authorize(ns).expect("authorize");
         let props = json!({
             "trigger_at": trigger_at,
             "repeat": repeat,
             "status": "pending",
             "event_type": event_type,
+            "created_by_actor": token.actor().id.clone(),
             "payload": action_dsl,
             "fired_at": null,
             "cancelled_at": null,
         });
-
-        let ns = Namespace::parse(namespace).expect("ns");
-        // We need a NamespaceToken. In tests within `khive-runtime`, `for_namespace`
-        // is pub(crate). External crates use `rt.authorize()`.
-        let token = rt.authorize(ns).expect("authorize");
 
         let content = action_dsl.unwrap_or("test reminder");
         let note = rt
@@ -1382,6 +1522,246 @@ mod tests {
             .expect("get_note")
             .expect("note exists");
         note.properties.unwrap_or(json!({}))
+    }
+
+    async fn inbound_reminder_messages(rt: &KhiveRuntime, actor: &str) -> Vec<(String, Value)> {
+        let mut reader = rt.sql().reader().await.expect("open SQL reader");
+        let rows = reader
+            .query_all(SqlStatement {
+                sql: "SELECT content, properties FROM notes \
+                      WHERE kind = 'message' \
+                        AND json_extract(properties, '$.direction') = 'inbound' \
+                        AND json_extract(properties, '$.to_actor') = ?1 \
+                      ORDER BY created_at ASC, id ASC"
+                    .to_string(),
+                params: vec![SqlValue::Text(actor.to_string())],
+                label: Some("test_inbound_reminder_messages".into()),
+            })
+            .await
+            .expect("query reminder messages");
+        rows.into_iter()
+            .map(|row| {
+                let content = match row.get("content") {
+                    Some(SqlValue::Text(value)) => value.clone(),
+                    other => panic!("unexpected content column: {other:?}"),
+                };
+                let properties = match row.get("properties") {
+                    Some(SqlValue::Text(value)) => {
+                        serde_json::from_str(value).expect("message properties JSON")
+                    }
+                    other => panic!("unexpected properties column: {other:?}"),
+                };
+                (content, properties)
+            })
+            .collect()
+    }
+
+    async fn make_repeat_due_again(rt: &KhiveRuntime, id: uuid::Uuid) {
+        let mut writer = rt.sql().writer().await.expect("open SQL writer");
+        let rows = writer
+            .execute(SqlStatement {
+                sql: "UPDATE notes \
+                      SET properties = json_set(properties, '$.trigger_at', ?1) \
+                      WHERE id = ?2"
+                    .to_string(),
+                params: vec![
+                    SqlValue::Text(due_rfc3339()),
+                    SqlValue::Text(id.to_string()),
+                ],
+                label: Some("test_repeat_due_again".into()),
+            })
+            .await
+            .expect("make repeat due again");
+        assert_eq!(rows, 1, "repeat fixture row updated");
+    }
+
+    #[test]
+    fn reminder_subject_marks_and_truncates_the_content_head() {
+        let content = format!("  {}\n tail", "x".repeat(90));
+        let subject = reminder_subject(&content);
+        assert!(subject.starts_with("[Reminder] "));
+        assert!(subject.ends_with('…'));
+        assert_eq!(subject.chars().count(), "[Reminder] ".chars().count() + 81);
+    }
+
+    #[tokio::test]
+    async fn fired_reminder_delivers_to_creator_after_daemon_actor_changes() {
+        let (_tmp, db_path) = tmp_db();
+        let creator = "lambda:reminder-owner";
+        let daemon_actor = "lambda:replacement-daemon";
+        let id = {
+            let creator_rt = make_rt_with_actor(&db_path, Some(creator)).await;
+            let creator_server = KhiveMcpServer::new(creator_rt.clone()).expect("creator server");
+            let remind_ops = serde_json::to_string(&json!([{
+                "tool": "schedule.remind",
+                "args": {
+                    "content": "test reminder",
+                    "at": "2099-01-01T00:00:00Z"
+                }
+            }]))
+            .expect("serialize reminder op");
+            let result = creator_server
+                .dispatch_request_local(RequestParams {
+                    ops: remind_ops,
+                    ..Default::default()
+                })
+                .await
+                .expect("create reminder through schedule.remind");
+            let result: Value = serde_json::from_str(&result).expect("reminder result JSON");
+            assert_eq!(result["results"][0]["ok"], true, "{result}");
+            let id = result["results"][0]["result"]["full_id"]
+                .as_str()
+                .expect("reminder full_id")
+                .parse()
+                .expect("reminder UUID");
+            let props = get_note_props(&creator_rt, id).await;
+            assert_eq!(props["created_by_actor"], creator, "{props}");
+            make_repeat_due_again(&creator_rt, id).await;
+            id
+        };
+
+        let rt = make_rt_with_actor(&db_path, Some(daemon_actor)).await;
+        let server = KhiveMcpServer::new(rt.clone()).expect("replacement daemon server");
+
+        let summary = run_pending_events_on(&rt, &server, false)
+            .await
+            .expect("drain");
+
+        assert_eq!(summary.fired, 1);
+        assert_eq!(summary.failed, 0);
+        let messages = inbound_reminder_messages(&rt, creator).await;
+        let daemon_messages = inbound_reminder_messages(&rt, daemon_actor).await;
+        let local_messages = inbound_reminder_messages(&rt, "local").await;
+        assert_eq!(
+            messages.len(),
+            1,
+            "one inbound delivery for the creator; daemon={daemon_messages:?}, local={local_messages:?}"
+        );
+        assert_eq!(messages[0].0, "test reminder");
+        assert_eq!(messages[0].1["direction"], "inbound");
+        assert_eq!(messages[0].1["to_actor"], creator);
+        assert_eq!(messages[0].1["subject"], "[Reminder] test reminder");
+        assert!(daemon_messages.is_empty());
+        assert!(local_messages.is_empty());
+        let props = get_note_props(&rt, id).await;
+        assert_eq!(props["status"], "fired");
+        assert!(props["fired_at"].as_str().is_some());
+    }
+
+    #[tokio::test]
+    async fn repeating_reminder_delivers_on_consecutive_fires() {
+        let (_tmp, db_path) = tmp_db();
+        let actor = "lambda:repeat-owner";
+        let rt = make_rt_with_actor(&db_path, Some(actor)).await;
+        let server = KhiveMcpServer::new(rt.clone()).expect("server");
+        let id =
+            create_scheduled_event(&rt, "local", &due_rfc3339(), None, Some("daily"), "remind")
+                .await;
+
+        let first = run_pending_events_on(&rt, &server, false)
+            .await
+            .expect("first drain");
+        assert_eq!(first.advanced, 1);
+        assert_eq!(inbound_reminder_messages(&rt, actor).await.len(), 1);
+
+        make_repeat_due_again(&rt, id).await;
+        let second = run_pending_events_on(&rt, &server, false)
+            .await
+            .expect("second drain");
+
+        assert_eq!(second.advanced, 1);
+        assert_eq!(second.failed, 0);
+        assert_eq!(
+            inbound_reminder_messages(&rt, actor).await.len(),
+            2,
+            "each fire delivers one inbound message"
+        );
+    }
+
+    #[tokio::test]
+    async fn reminder_delivery_failure_is_persisted_audited_and_drain_continues() {
+        let (_tmp, db_path) = tmp_db();
+        let actor = "lambda:failure-owner";
+        let cfg = RuntimeConfig {
+            db_path: Some(std::path::PathBuf::from(&db_path)),
+            default_namespace: Namespace::parse("local").unwrap(),
+            embedding_model: None,
+            additional_embedding_models: vec![],
+            gate: std::sync::Arc::new(DenyCommSendGate),
+            actor_id: Some(actor.to_string()),
+            ..Default::default()
+        };
+        let rt = KhiveRuntime::new(cfg).expect("runtime");
+        let packs = vec!["kg".to_string(), "comm".to_string(), "schedule".to_string()];
+        let server = KhiveMcpServer::with_packs(rt.clone(), &packs)
+            .expect("server with required reminder delivery pack");
+        let id = create_scheduled_event(&rt, "local", &due_rfc3339(), None, None, "remind").await;
+        let action_id = create_scheduled_event(
+            &rt,
+            "local",
+            &due_rfc3339(),
+            Some("stats()"),
+            None,
+            "schedule",
+        )
+        .await;
+        let mut writer = rt.sql().writer().await.expect("open SQL writer");
+        let reordered = writer
+            .execute(SqlStatement {
+                sql: "UPDATE notes SET created_at = CASE id WHEN ?1 THEN 1 WHEN ?2 THEN 2 END \
+                      WHERE id IN (?1, ?2)"
+                    .to_string(),
+                params: vec![
+                    SqlValue::Text(id.to_string()),
+                    SqlValue::Text(action_id.to_string()),
+                ],
+                label: Some("test_reminder_failure_precedes_valid_action".into()),
+            })
+            .await
+            .expect("order reminder before action");
+        assert_eq!(reordered, 2);
+        drop(writer);
+
+        let summary = run_pending_events_on(&rt, &server, false)
+            .await
+            .expect("drain continues after failure");
+
+        assert_eq!(summary.scanned, 2);
+        assert_eq!(summary.failed, 1);
+        assert_eq!(summary.fired, 2);
+        assert!(inbound_reminder_messages(&rt, actor).await.is_empty());
+        let props = get_note_props(&rt, id).await;
+        assert!(
+            props["delivery_error"]
+                .as_str()
+                .is_some_and(|error| error.contains("denied by delivery-failure test")),
+            "delivery error must be visible on the reminder row: {props:?}"
+        );
+        assert!(props["delivery_failed_at"].as_str().is_some());
+        let action_props = get_note_props(&rt, action_id).await;
+        assert_eq!(action_props["status"], "fired");
+        assert!(action_props["fired_at"].as_str().is_some());
+
+        let token = rt.authorize(Namespace::local()).expect("authorize");
+        let events = rt
+            .events(&token)
+            .expect("event store")
+            .query_events(
+                EventFilter {
+                    verbs: vec!["schedule.remind.fire".to_string()],
+                    ..Default::default()
+                },
+                PageRequest {
+                    limit: 10,
+                    offset: 0,
+                },
+            )
+            .await
+            .expect("query reminder failure events");
+        assert!(events
+            .items
+            .iter()
+            .any(|event| { event.outcome == EventOutcome::Error && event.target_id == Some(id) }));
     }
 
     #[tokio::test]

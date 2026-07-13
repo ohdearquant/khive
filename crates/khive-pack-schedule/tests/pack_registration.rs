@@ -26,6 +26,54 @@ fn schedule_pack_requires_kg() {
     assert_eq!(SchedulePack::REQUIRES, &["kg"]);
 }
 
+#[test]
+fn schedule_pack_builds_registry_without_comm() {
+    let runtime = support::memory_runtime();
+    let mut builder = VerbRegistryBuilder::new();
+    builder.register(khive_pack_kg::KgPack::new(runtime.clone()));
+    builder.register(SchedulePack::new(runtime));
+    builder.build().expect("kg + schedule registry builds");
+}
+
+/// #897 review: `schedule.remind` gates on `registry.describe_verb("comm.send")`
+/// at dispatch time. This must be exercised against the real multi-pack
+/// registry-build path (kg + comm + schedule registered together through
+/// `VerbRegistryBuilder`, the same construction production pack loading
+/// uses), not a mock or a hand-rolled stand-in for the comm pack. A prior
+/// incident conflated two independent server processes in the same smoke
+/// run and mistook this for a broken capability-discovery mechanism; this
+/// test proves the mechanism itself is correct when both packs are actually
+/// registered together.
+#[tokio::test]
+async fn schedule_pack_registry_with_comm_dispatches_remind() {
+    let runtime = support::memory_runtime();
+    let mut builder = VerbRegistryBuilder::new();
+    builder.register(khive_pack_kg::KgPack::new(runtime.clone()));
+    builder.register(khive_pack_comm::CommPack::new(runtime.clone()));
+    builder.register(SchedulePack::new(runtime));
+    let registry = builder
+        .build()
+        .expect("kg + comm + schedule registry builds");
+
+    registry.describe_verb("comm.send").expect(
+        "comm.send must be discoverable once the comm pack is registered alongside schedule",
+    );
+
+    let result = registry
+        .dispatch(
+            "schedule.remind",
+            serde_json::json!({
+                "content": "pack-registration regression: comm capability visible",
+                "at": "2099-06-01T09:00:00Z",
+            }),
+        )
+        .await
+        .expect("schedule.remind must succeed when comm is registered alongside schedule");
+
+    assert!(result.get("id").is_some(), "remind returns id: {result}");
+    assert_eq!(result["status"], "pending");
+}
+
 #[tokio::test]
 async fn schedule_pack_exposes_non_empty_schema_plan() {
     use khive_runtime::PackRuntime;

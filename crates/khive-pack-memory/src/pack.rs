@@ -409,6 +409,13 @@ impl PackRuntime for MemoryPack {
         fts_population_guard(&self.runtime).await;
     }
 
+    /// ADR-103 Amendment 1's `model_count` computation for `memory.remember`
+    /// without an explicit `embedding_model` override reads this at the
+    /// dispatch audit-row emission seam.
+    fn registered_embedding_model_names(&self) -> Vec<String> {
+        self.runtime.registered_embedding_model_names()
+    }
+
     /// #750: install a note-mutation hook on the runtime THIS
     /// pack owns (`self.runtime`, not the `_runtime` param — mirrors
     /// `KgPack::register_entity_type_validator`'s multi-backend rationale:

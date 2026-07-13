@@ -498,6 +498,66 @@ async fn pack_gtd_without_kg_fails_at_boot() {
 }
 
 #[tokio::test]
+async fn pack_schedule_without_comm_rejects_only_remind_before_persisting() -> anyhow::Result<()> {
+    disable_daemon();
+    let config = RuntimeConfig {
+        db_path: None,
+        default_namespace: Namespace::parse("test").unwrap(),
+        embedding_model: None,
+        additional_embedding_models: vec![],
+        packs: vec!["kg".to_string(), "schedule".to_string()],
+        ..RuntimeConfig::default()
+    };
+    let runtime = KhiveRuntime::new(config).expect("kg+schedule runtime");
+    let server = KhiveMcpServer::new(runtime).expect("kg+schedule server builds without comm");
+    let (server_transport, client_transport) = tokio::io::duplex(65536);
+    tokio::spawn(async move {
+        if let Ok(svc) = server.serve(server_transport).await {
+            let _ = svc.waiting().await;
+        }
+    });
+    let client = DummyClient.serve(client_transport).await?;
+
+    let result = call(
+        &client,
+        "request",
+        json!({
+            "ops": r#"schedule.remind(content="must not persist", at="2099-01-01T00:00:00Z")"#,
+            "presentation": "verbose"
+        }),
+    )
+    .await?;
+    let body: Value = serde_json::from_str(&first_text(&result))?;
+    let failed = &body["results"][0];
+    assert_eq!(failed["ok"], json!(false), "remind must fail: {failed}");
+    let error = failed["error"].as_str().unwrap_or_default();
+    assert!(
+        error.contains("comm.send") && error.contains("delivery"),
+        "error must name the missing comm delivery capability: {error}"
+    );
+
+    let notes = ok_one(&client, r#"list(kind="note")"#).await?;
+    assert_eq!(notes, json!([]), "failed remind must persist no note");
+    let empty_agenda = ok_one(&client, "schedule.agenda()").await?;
+    assert_eq!(empty_agenda["count"], json!(0));
+
+    let scheduled = ok_one(
+        &client,
+        r#"schedule.schedule(action="schedule.agenda()", at="2099-01-02T00:00:00Z")"#,
+    )
+    .await?;
+    let full_id = scheduled["full_id"]
+        .as_str()
+        .expect("schedule.schedule returns full_id");
+    let agenda = ok_one(&client, "schedule.agenda()").await?;
+    assert_eq!(agenda["count"], json!(1));
+    let cancelled = ok_one(&client, &format!(r#"schedule.cancel(id="{full_id}")"#)).await?;
+    assert_eq!(cancelled["status"], json!("cancelled"));
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn pack_gtd_with_kg_explicit_works() {
     // When both kg and gtd are listed, gtd's requires=["kg"] is satisfied.
     let config = RuntimeConfig {
@@ -3458,24 +3518,24 @@ async fn send_returns_iso8601_timestamps() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn make_schedule_server_only() -> KhiveMcpServer {
+fn make_schedule_server() -> KhiveMcpServer {
     disable_daemon();
     let config = RuntimeConfig {
         db_path: None,
         default_namespace: Namespace::parse("schedtest").unwrap(),
         embedding_model: None,
         additional_embedding_models: vec![],
-        packs: vec!["kg".to_string(), "schedule".to_string()],
+        packs: vec!["kg".to_string(), "comm".to_string(), "schedule".to_string()],
         ..RuntimeConfig::default()
     };
-    let runtime = KhiveRuntime::new(config).expect("kg+schedule runtime");
-    KhiveMcpServer::new(runtime).expect("server builds with kg+schedule")
+    let runtime = KhiveRuntime::new(config).expect("kg+comm+schedule runtime");
+    KhiveMcpServer::new(runtime).expect("server builds with kg+comm+schedule")
 }
 
-async fn connect_schedule_only(
+async fn connect_schedule(
 ) -> anyhow::Result<impl std::ops::Deref<Target = rmcp::service::Peer<rmcp::RoleClient>>> {
     let (server_transport, client_transport) = tokio::io::duplex(65536);
-    let server = make_schedule_server_only();
+    let server = make_schedule_server();
     tokio::spawn(async move {
         if let Ok(svc) = server.serve(server_transport).await {
             let _ = svc.waiting().await;
@@ -3488,7 +3548,7 @@ async fn connect_schedule_only(
 /// `remind` creates a scheduled_event note; `agenda` returns ISO-8601 timestamps.
 #[tokio::test]
 async fn agenda_returns_iso8601_timestamps() -> anyhow::Result<()> {
-    let client = connect_schedule_only().await?;
+    let client = connect_schedule().await?;
 
     ok_one(
         &client,
@@ -3663,7 +3723,7 @@ async fn send_rejects_unknown_kwarg() -> anyhow::Result<()> {
 /// `agenda(unknownkw="x")` (schedule) must return `ok: false`.
 #[tokio::test]
 async fn agenda_rejects_unknown_kwarg() -> anyhow::Result<()> {
-    let client = connect_schedule_only().await?;
+    let client = connect_schedule().await?;
 
     let result = call(
         &client,
@@ -3944,7 +4004,7 @@ async fn exec_output_valid_json_with_backslash_escape_content() -> anyhow::Resul
 /// `properties` — the full ISO-8601 string must round-trip verbatim (#546).
 #[tokio::test]
 async fn schedule_agenda_agent_preserves_properties_trigger_at_verbatim() -> anyhow::Result<()> {
-    let client = connect_schedule_only().await?;
+    let client = connect_schedule().await?;
     let trigger_at = "2099-01-01T00:00:00Z";
 
     ok_one(
@@ -3993,7 +4053,7 @@ async fn schedule_agenda_agent_preserves_properties_trigger_at_verbatim() -> any
 /// comparison itself was already correct (#871).
 #[tokio::test]
 async fn schedule_remind_agent_preserves_top_level_trigger_at_with_offset() -> anyhow::Result<()> {
-    let client = connect_schedule_only().await?;
+    let client = connect_schedule().await?;
     // Far enough in the future (relative to "now") to land outside the 24h
     // relative-render window, so pre-fix this would have been silently
     // minute-truncated (dropping the seconds and the "-04:00" offset)
@@ -4032,7 +4092,7 @@ async fn schedule_remind_agent_preserves_top_level_trigger_at_with_offset() -> a
 /// reaches this presentation-layer fix.
 #[tokio::test]
 async fn schedule_remind_agent_preserves_top_level_trigger_at_utc() -> anyhow::Result<()> {
-    let client = connect_schedule_only().await?;
+    let client = connect_schedule().await?;
 
     let utc = "2099-06-15T23:00:00Z";
     let result = call(

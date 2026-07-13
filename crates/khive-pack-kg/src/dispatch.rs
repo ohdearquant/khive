@@ -9,7 +9,8 @@ use khive_runtime::pack::PackRuntime;
 use khive_runtime::{
     EntityTypeValidatorFn, KhiveRuntime, NamespaceToken, RuntimeError, VerbRegistry,
 };
-use khive_types::{EdgeEndpointRule, HandlerDef};
+use khive_storage::{PhaseCancelledPayload, PhaseCompletedPayload, PhaseStartedPayload};
+use khive_types::{EdgeEndpointRule, EventKind, HandlerDef};
 
 use crate::handler_defs::{handle_verbs, KG_HANDLERS};
 use crate::pack::{KgPack, KG_EDGE_RULES};
@@ -53,7 +54,88 @@ impl PackRuntime for KgPack {
     }
 
     async fn warm(&self) {
-        let _ = self.runtime.embed("khive warmup").await;
+        // ADR-103 Amendment 1 Part 2: `warm()` runs at daemon construction /
+        // first pack install, outside `dispatch()` entirely -- there is no
+        // caller-supplied token. Mint one the same way
+        // `khive-pack-memory`'s ANN background-rebuild task does
+        // (`rt.authorize(Namespace::local())`), so this daemon-startup
+        // embedder warmup is attributed to the daemon principal instead of
+        // remaining invisible on the event plane. A mint failure only
+        // removes this pass's telemetry -- the warmup itself still runs.
+        let token = match self.runtime.authorize(khive_runtime::Namespace::local()) {
+            Ok(token) => Some(token),
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "kg_embedder_warm: failed to mint ADR-103 phase-span attribution token; \
+                     warmup proceeds without telemetry"
+                );
+                None
+            }
+        };
+        if let Some(token) = &token {
+            khive_runtime::emit_phase_event(
+                &self.runtime,
+                token,
+                "kg.embedder_warm",
+                EventKind::PhaseStarted,
+                PhaseStartedPayload {
+                    work_class: "warm".into(),
+                    phase: "kg_embedder_warm".into(),
+                    corpus_size: None,
+                },
+            )
+            .await;
+        }
+        let phase_start = std::time::Instant::now();
+        let cpu_start = khive_runtime::process_resource_usage();
+        let result = self.runtime.embed("khive warmup").await;
+        if let Some(token) = &token {
+            let wall_us = phase_start.elapsed().as_micros() as i64;
+            let cpu_us =
+                khive_runtime::cpu_delta_us(cpu_start, khive_runtime::process_resource_usage());
+            match &result {
+                Err(e) if khive_runtime::is_benign_shutdown_cancellation(e) => {
+                    khive_runtime::emit_phase_event(
+                        &self.runtime,
+                        token,
+                        "kg.embedder_warm",
+                        EventKind::PhaseCancelled,
+                        PhaseCancelledPayload {
+                            work_class: "warm".into(),
+                            phase: "kg_embedder_warm".into(),
+                            wall_us,
+                            cpu_us,
+                        },
+                    )
+                    .await;
+                }
+                _ => {
+                    khive_runtime::emit_phase_event(
+                        &self.runtime,
+                        token,
+                        "kg.embedder_warm",
+                        EventKind::PhaseCompleted,
+                        PhaseCompletedPayload {
+                            work_class: "warm".into(),
+                            phase: "kg_embedder_warm".into(),
+                            wall_us,
+                            cpu_us,
+                        },
+                    )
+                    .await;
+                }
+            }
+        }
+        // `PackRuntime::warm` is documented infallible: errors are logged
+        // internally, never propagated. The embed outcome is already
+        // captured in the phase-span payload above (Completed vs
+        // Cancelled); nothing further to do with it here.
+        let _ = result;
+    }
+
+    fn registered_embedding_model_names(&self) -> Vec<String> {
+        self.runtime.registered_embedding_model_names()
     }
 
     fn register_entity_type_validator_with_types(
@@ -1822,6 +1904,68 @@ mod tests {
         assert!(
             result.is_err(),
             "resolve(kind=\"note\") must fail loud, not silently over-filter"
+        );
+    }
+
+    // ---- ADR-103 Amendment 1 Part 2: kg_embedder_warm phase-span events ----
+
+    #[tokio::test]
+    async fn kg_warm_emits_exactly_one_phase_started_and_one_terminal_event() {
+        let rt = KhiveRuntime::memory().expect("in-memory runtime");
+        let token = rt.authorize(Namespace::local()).expect("authorize local");
+        let event_store = rt.events(&token).expect("event store must be available");
+
+        let pack = KgPack::new(rt.clone());
+        pack.warm().await;
+
+        let page = event_store
+            .query_events(
+                khive_storage::EventFilter::default(),
+                khive_storage::PageRequest {
+                    limit: 10,
+                    offset: 0,
+                },
+            )
+            .await
+            .expect("query events");
+
+        let started: Vec<_> = page
+            .items
+            .iter()
+            .filter(|e| e.kind == khive_types::EventKind::PhaseStarted)
+            .collect();
+        let completed: Vec<_> = page
+            .items
+            .iter()
+            .filter(|e| e.kind == khive_types::EventKind::PhaseCompleted)
+            .collect();
+        let cancelled: Vec<_> = page
+            .items
+            .iter()
+            .filter(|e| e.kind == khive_types::EventKind::PhaseCancelled)
+            .collect();
+
+        assert_eq!(
+            started.len(),
+            1,
+            "kg_embedder_warm must emit exactly one PhaseStarted event, got: {:?}",
+            page.items
+        );
+        assert_eq!(
+            completed.len() + cancelled.len(),
+            1,
+            "kg_embedder_warm must emit exactly one terminal event (Completed xor \
+             Cancelled), got completed={} cancelled={}: {:?}",
+            completed.len(),
+            cancelled.len(),
+            page.items
+        );
+        assert_eq!(started[0].payload["work_class"], "warm");
+        assert_eq!(started[0].payload["phase"], "kg_embedder_warm");
+        assert_eq!(
+            page.items.len(),
+            2,
+            "no event besides the Started/terminal pair -- warm() itself never dispatches"
         );
     }
 }
