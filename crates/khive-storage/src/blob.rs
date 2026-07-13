@@ -26,9 +26,25 @@ const CONTENT_REF_HEX_LEN: usize = 64;
 /// twice is a no-op after the first write. Callers must treat the value as
 /// opaque — the backend, not the caller, decides how a `ContentRef` maps to
 /// physical storage (a filesystem path, an object-store key, etc.).
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+///
+/// `Deserialize` is implemented by hand (below), routing every input through
+/// [`ContentRef::from_hex`] — deriving it under `#[serde(transparent)]` would
+/// construct a `ContentRef` from any string, including one that is not 64
+/// lowercase hex characters (round-2 codex High finding: an unvalidated
+/// value reaching `shard_path`'s `[0..2]`/`[2..4]` slices panics).
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 #[serde(transparent)]
 pub struct ContentRef(String);
+
+impl<'de> Deserialize<'de> for ContentRef {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let raw = String::deserialize(deserializer)?;
+        ContentRef::from_hex(raw).map_err(serde::de::Error::custom)
+    }
+}
 
 impl ContentRef {
     /// Parse a `ContentRef` from a caller-supplied hex string.
@@ -101,11 +117,17 @@ fn hex_encode(bytes: &[u8]) -> String {
 /// per the operating rule that `BlobStore` is the *only* deletion path
 /// besides an explicit [`BlobStore::delete`] (no consumer deletes blobs
 /// directly).
+///
+/// `live_refs` is a point-in-time snapshot, not a live query — see
+/// [`BlobStore::orphan_sweep`]'s doc comment for the concurrency hazard this
+/// implies (offline-maintenance-only; requires quiesced entity writes).
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct BlobOrphanSweepConfig {
     /// Content refs currently referenced by at least one live row somewhere
-    /// in the system. Anything this backend stores that is NOT in this set
-    /// is orphaned.
+    /// in the system, as of when the caller assembled this set. Anything
+    /// this backend stores that is NOT in this set is treated as orphaned
+    /// and deleted (or reported, in `dry_run` mode) — including a
+    /// `content_ref` that becomes live after this snapshot was taken.
     pub live_refs: HashSet<ContentRef>,
     /// When `true`, report what would be deleted without deleting anything.
     pub dry_run: bool,
@@ -151,6 +173,18 @@ pub trait BlobStore: Send + Sync + 'static {
     ///
     /// Returns `true` when an object was actually removed, `false` when
     /// none existed — deleting an absent object is not an error.
+    ///
+    /// # Concurrency hazard — offline-maintenance-only (ADR-111 §8, amended
+    /// round 2)
+    ///
+    /// `delete` performs an unconditional physical removal with **no
+    /// coordination against any entity that might reference
+    /// `content_ref`**. It is safe to call only when the caller has
+    /// independently ensured — outside this trait, typically by quiescing
+    /// whatever writer could attach a new `content_ref` to an entity — that
+    /// nothing live references `content_ref` for the duration of the call. A
+    /// caller that races an entity write against a `delete` can dangle a
+    /// live reference; this trait does not detect or prevent that.
     async fn delete(&self, content_ref: &ContentRef) -> StorageResult<bool>;
 
     /// Enumerate every object this backend holds and delete (or, in
@@ -161,6 +195,25 @@ pub trait BlobStore: Send + Sync + 'static {
     /// `VectorStore::orphan_sweep`'s CLI-only precedent (ADR-044). Default
     /// returns `StorageError::Unsupported`; the filesystem backend
     /// overrides it with a real directory walk. No silent no-op.
+    ///
+    /// # Concurrency hazard — offline-maintenance-only (ADR-111 §8, amended
+    /// round 2)
+    ///
+    /// `config.live_refs` is a **snapshot** the caller assembled before this
+    /// call. `orphan_sweep` has no way to detect a `content_ref` that
+    /// becomes newly live — an entity write lands referencing it — between
+    /// when that snapshot was taken and when this sweep runs; such a
+    /// reference is deleted anyway (see `khive-db`'s
+    /// `orphan_sweep_race_demonstrates_the_documented_quiescence_requirement`
+    /// test, which reproduces exactly this in code). This trait provides no
+    /// transactional coordination with an entity writer. **Callers MUST
+    /// quiesce entity writes** (nothing may create a new `content_ref`
+    /// reference) for the duration of snapshot-plus-sweep — a maintenance
+    /// window, a single-writer admin CLI invocation with no live traffic, or
+    /// equivalent. A DB-coordinated, transactional sweep (select-and-delete
+    /// under the entity writer's own transactional boundary) would close
+    /// this hazard properly; that is a larger design tracked as a follow-up
+    /// (khive#924), not built in this round.
     async fn orphan_sweep(
         &self,
         config: &BlobOrphanSweepConfig,
@@ -246,6 +299,50 @@ mod tests {
             out[i] = u8::from_str_radix(s, 16).unwrap();
         }
         out
+    }
+
+    #[test]
+    fn deserialize_accepts_a_valid_lowercase_digest() {
+        let hex = "d".repeat(64);
+        let json = serde_json::to_string(&hex).unwrap();
+        let cref: ContentRef = serde_json::from_str(&json).unwrap();
+        assert_eq!(cref.as_str(), hex);
+    }
+
+    #[test]
+    fn deserialize_rejects_short_string() {
+        // The exact repro from the round-2 codex finding: a naive derived
+        // `Deserialize` would construct `ContentRef("x")` here, and any
+        // caller passing it to `get`/`exists`/`delete` would then panic in
+        // `shard_path`'s `[0..2]`/`[2..4]` slices.
+        let err = serde_json::from_str::<ContentRef>("\"x\"").unwrap_err();
+        assert!(
+            err.to_string().contains("64"),
+            "deserialize error must mention the expected length: {err}"
+        );
+    }
+
+    #[test]
+    fn deserialize_rejects_uppercase() {
+        let hex = "A".repeat(64);
+        let json = serde_json::to_string(&hex).unwrap();
+        let err = serde_json::from_str::<ContentRef>(&json).unwrap_err();
+        assert!(
+            err.to_string().contains("lowercase"),
+            "deserialize error must mention the lowercase requirement: {err}"
+        );
+    }
+
+    #[test]
+    fn deserialize_rejects_non_hex_characters() {
+        let mut hex = "a".repeat(63);
+        hex.push('z');
+        let json = serde_json::to_string(&hex).unwrap();
+        let err = serde_json::from_str::<ContentRef>(&json).unwrap_err();
+        assert!(
+            err.to_string().contains("lowercase hex"),
+            "deserialize error must mention the hex requirement: {err}"
+        );
     }
 
     #[test]

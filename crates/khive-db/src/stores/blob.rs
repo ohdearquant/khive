@@ -62,6 +62,23 @@ pub fn resolve_blob_root(
     ))
 }
 
+/// Whether writing `required_write_bytes` more bytes to a volume currently
+/// reporting `available` free bytes would leave it below `floor_bytes`.
+///
+/// Pure and filesystem-independent on purpose (round-2 High finding): the
+/// exact boundary this guards — `available == floor_bytes + 1` must still
+/// refuse a 2-byte write, because a floor-only check (`available <
+/// floor_bytes`) does not account for the pending write's own size — is unit
+/// tested directly against this function rather than against the real
+/// filesystem's `fs4::available_space`, which fluctuates under concurrent
+/// build/agent activity on a shared machine and made an earlier
+/// exact-boundary integration test flaky. `saturating_sub` avoids underflow
+/// when `required_write_bytes` exceeds `available` outright — that case
+/// still correctly refuses for any nonzero floor.
+fn crosses_floor(available: u64, required_write_bytes: u64, floor_bytes: u64) -> bool {
+    available.saturating_sub(required_write_bytes) < floor_bytes
+}
+
 fn put_blocking(root: &Path, floor_bytes: u64, bytes: Vec<u8>) -> StorageResult<ContentRef> {
     let digest = blake3::hash(&bytes);
     let content_ref = ContentRef::from_digest_bytes(digest.as_bytes());
@@ -74,8 +91,9 @@ fn put_blocking(root: &Path, floor_bytes: u64, bytes: Vec<u8>) -> StorageResult<
         return Ok(content_ref);
     }
 
+    let required_write_bytes = bytes.len() as u64;
     let available = fs4::available_space(root).map_err(|e| map_io_err(e, "put_check_space"))?;
-    if available < floor_bytes {
+    if crosses_floor(available, required_write_bytes, floor_bytes) {
         return Err(StorageError::CapacityFloor {
             capability: StorageCapability::Blob,
             volume: root.display().to_string(),
@@ -161,6 +179,18 @@ fn walk_blob_files(root: &Path) -> std::io::Result<Vec<(ContentRef, PathBuf)>> {
 pub struct FsBlobStore {
     root: PathBuf,
     floor_bytes: u64,
+    /// Serializes the check-then-publish critical section of `put` per root
+    /// (round-2 High finding): without this, two concurrent puts can each
+    /// observe the same pre-write `available_space` snapshot, each pass
+    /// their own write-size-aware floor check against it, and then both
+    /// write — jointly pushing the volume under the floor even though
+    /// neither write looked unsafe in isolation. Held across the whole
+    /// `spawn_blocking` call (check, write, fsync, persist), so the second
+    /// of two racing puts always observes the first's write already landed.
+    /// A per-root async mutex is adequate at this write rate; it is not
+    /// meant to defend against another process (only within-process
+    /// `FsBlobStore` callers).
+    write_lock: tokio::sync::Mutex<()>,
 }
 
 impl FsBlobStore {
@@ -171,7 +201,11 @@ impl FsBlobStore {
     /// Create a store rooted at `root`, creating the directory if absent.
     pub fn new(root: PathBuf, floor_bytes: u64) -> Result<Self, SqliteError> {
         fs::create_dir_all(&root)?;
-        Ok(Self { root, floor_bytes })
+        Ok(Self {
+            root,
+            floor_bytes,
+            write_lock: tokio::sync::Mutex::new(()),
+        })
     }
 
     /// The resolved root directory this store writes under.
@@ -183,6 +217,7 @@ impl FsBlobStore {
 #[async_trait]
 impl BlobStore for FsBlobStore {
     async fn put(&self, bytes: Vec<u8>) -> StorageResult<ContentRef> {
+        let _write_guard = self.write_lock.lock().await;
         let root = self.root.clone();
         let floor_bytes = self.floor_bytes;
         tokio::task::spawn_blocking(move || put_blocking(&root, floor_bytes, bytes))
@@ -228,6 +263,11 @@ impl BlobStore for FsBlobStore {
         .map_err(|e| StorageError::driver(StorageCapability::Blob, "delete", e))?
     }
 
+    // Offline-maintenance-only — see `BlobStore::orphan_sweep`'s doc comment
+    // for the concurrency hazard (`config.live_refs` is a snapshot; a
+    // `content_ref` that becomes live after the snapshot is deleted anyway).
+    // This method performs no DB coordination; it only compares against
+    // whatever set the caller handed it.
     async fn orphan_sweep(
         &self,
         config: &BlobOrphanSweepConfig,
@@ -356,6 +396,177 @@ mod tests {
             "must name the floor: {msg}"
         );
         assert!(msg.contains("Blob"), "must name the capability: {msg}");
+    }
+
+    #[test]
+    fn crosses_floor_is_write_size_aware_at_the_exact_boundary() {
+        // Round-2 High, codex's own example verbatim: `available ==
+        // floor_bytes + 1` must still refuse a 2-byte write. A floor-only
+        // check (`available < floor_bytes`) would NOT catch this — 101 is
+        // not below 100 — but the write's own size must be subtracted first.
+        assert!(crosses_floor(101, 2, 100));
+        assert!(!crosses_floor(101, 1, 100));
+    }
+
+    #[test]
+    fn crosses_floor_accepts_a_write_that_lands_exactly_on_the_floor() {
+        assert!(!crosses_floor(100, 0, 100));
+    }
+
+    #[test]
+    fn crosses_floor_rejects_a_write_that_lands_one_byte_under_the_floor() {
+        assert!(crosses_floor(100, 1, 100));
+    }
+
+    #[test]
+    fn crosses_floor_saturates_instead_of_underflowing_when_write_exceeds_available() {
+        assert!(crosses_floor(10, 100, 50));
+        // floor_bytes == 0 means "no floor enforced" (the convention every
+        // other test in this file uses via `store(0)`) — even a write far
+        // exceeding available space is not refused by the floor check itself
+        // in that case; `saturating_sub` floors the subtraction at 0, and
+        // `0 < 0` is false.
+        assert!(!crosses_floor(10, 100, 0));
+    }
+
+    #[tokio::test]
+    async fn put_refuses_a_write_that_would_cross_the_floor_even_though_available_alone_clears_it()
+    {
+        // Integration-level companion to the pure `crosses_floor` tests
+        // above: proves `FsBlobStore::put` actually wires the write-size-
+        // aware check through end-to-end. Uses a generous margin/cushion
+        // (128 MiB total) rather than an exact boundary, because an earlier
+        // version of this test pinned the floor to the exact
+        // `fs4::available_space` reading and flaked: on this shared,
+        // heavily-loaded dev machine, `fs4::available_space` was observed to
+        // shift by tens of MB between two calls milliseconds apart (other
+        // agents' concurrent builds). A floor-only check would still pass
+        // here (available comfortably clears the floor by MARGIN bytes);
+        // the write-size-aware check must reject once the payload's own
+        // CUSHION-sized excess is subtracted.
+        const MARGIN: u64 = 64 * 1024 * 1024;
+        const CUSHION: u64 = 64 * 1024 * 1024;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("blobs");
+        fs::create_dir_all(&root).unwrap();
+        let available = fs4::available_space(&root).unwrap();
+        let floor = available.saturating_sub(MARGIN);
+        let store = FsBlobStore::new(root, floor).unwrap();
+
+        let err = store
+            .put(vec![7u8; (MARGIN + CUSHION) as usize])
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, StorageError::CapacityFloor { .. }),
+            "a write-size-aware floor check must reject a write that pushes the volume \
+             below the floor even though available space alone still clears it: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_puts_cannot_jointly_breach_the_floor_via_a_stale_snapshot() {
+        // Round-2 High: pin the floor so at most ONE `payload_len`-sized
+        // write may land before the floor is crossed. Fire two DIFFERENT
+        // (non-deduping) payloads of that size concurrently. Before the
+        // per-root `write_lock`, both puts could independently read the SAME
+        // pre-write `available_space` snapshot, both pass their own
+        // write-size-aware check against it (neither sees the other's
+        // pending write), and both actually write — jointly breaching the
+        // floor. With serialization, the second put's check only runs after
+        // the first put's write has actually landed on disk, so it observes
+        // the reduced space. The decisive, noise-tolerant invariant is that
+        // BOTH can never succeed (under the pre-fix code, both reliably
+        // would, since the floor is deliberately set a full `payload_len`
+        // below the pre-test reading and neither write's own size was
+        // subtracted): assert at most one success and at least one
+        // rejection, rather than pinning an exact 1-success/1-reject split,
+        // since which side of the boundary a given put lands on is
+        // legitimately sensitive to real, unrelated disk churn on a shared
+        // dev/CI box. `payload_len` (64 MiB) is chosen to dwarf the few-MB
+        // swings observed in this environment.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("blobs");
+        fs::create_dir_all(&root).unwrap();
+        let available = fs4::available_space(&root).unwrap();
+        let payload_len: u64 = 64 * 1024 * 1024;
+        let floor = available.saturating_sub(payload_len);
+        let store = std::sync::Arc::new(FsBlobStore::new(root, floor).unwrap());
+
+        let a = {
+            let store = store.clone();
+            tokio::spawn(async move { store.put(vec![1u8; payload_len as usize]).await })
+        };
+        let b = {
+            let store = store.clone();
+            tokio::spawn(async move { store.put(vec![2u8; payload_len as usize]).await })
+        };
+        let (result_a, result_b) = (a.await.unwrap(), b.await.unwrap());
+
+        let successes = [&result_a, &result_b]
+            .into_iter()
+            .filter(|r| r.is_ok())
+            .count();
+        let floor_rejections = [&result_a, &result_b]
+            .into_iter()
+            .filter(|r| matches!(r, Err(StorageError::CapacityFloor { .. })))
+            .count();
+        assert!(
+            successes <= 1,
+            "both concurrent puts landed -- the floor was jointly breached by a stale \
+             snapshot race: {result_a:?} / {result_b:?}"
+        );
+        assert!(
+            floor_rejections >= 1,
+            "two payload_len writes cannot both fit in a payload_len-sized budget -- at \
+             least one rejection is expected: {result_a:?} / {result_b:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn orphan_sweep_race_demonstrates_the_documented_quiescence_requirement() {
+        // Round-2 High: `orphan_sweep` and `delete` are documented
+        // (`BlobStore::orphan_sweep`'s doc comment, ADR-111 §8) as
+        // offline-maintenance-only APIs that require the caller to quiesce
+        // entity writes for the duration of snapshot-plus-sweep, because
+        // `live_refs` is a snapshot with no database coordination. This test
+        // reproduces the exact hazard in code rather than leaving it as
+        // prose: a blob that becomes newly "live" AFTER the caller's
+        // `live_refs` snapshot was taken, but BEFORE the sweep runs, is
+        // deleted anyway. That is the documented boundary, not a bug in this
+        // test — it exists so a future change that silently narrows this
+        // hazard (without updating the docs) breaks a test instead of
+        // shipping a doc/behavior mismatch.
+        let (_dir, store) = store(0);
+        let blob = store
+            .put(b"about to become live mid-sweep".to_vec())
+            .await
+            .unwrap();
+
+        // The caller's live_refs snapshot was taken before an entity write
+        // referencing `blob` landed (represented here by simply never adding
+        // it to the snapshot — orphan_sweep has no other way to learn about
+        // it).
+        let live_refs_snapshot = std::collections::HashSet::new();
+
+        let result = store
+            .orphan_sweep(&BlobOrphanSweepConfig {
+                live_refs: live_refs_snapshot,
+                dry_run: false,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            result.deleted, 1,
+            "the now-live blob is deleted anyway: this is the documented hazard"
+        );
+        assert!(
+            !store.exists(&blob).await.unwrap(),
+            "orphan_sweep is unsafe against a content_ref that becomes live after the \
+             snapshot was taken — callers MUST quiesce entity writes before running it \
+             (ADR-111 §8)"
+        );
     }
 
     #[tokio::test]

@@ -1,7 +1,7 @@
 # ADR-111: BlobStore — Content-Addressed Binary Object Storage
 
 **Status**: accepted
-**Date**: 2026-07-12
+**Date**: 2026-07-12 (amended 2026-07-13 — round-2 codex review, PR #922)
 **Authors**: khive maintainers
 **Depends on**:
 
@@ -106,8 +106,22 @@ then checks whether the target path already exists. If it does, `put` returns th
 ### 5. Free-space fail-closed floor
 
 Before writing a new object (never on a dedup hit), `put` queries the target volume's available
-space via the `fs4` crate and compares it against a configured floor. Below the floor, `put`
-refuses with a new error variant:
+space via the `fs4` crate, subtracts the size of the pending write, and compares the result
+against a configured floor — `remaining_after_write = available.saturating_sub(bytes.len())`,
+refuse when `remaining_after_write < floor_bytes`. **Amended 2026-07-13 (round-2 codex High
+finding):** the original implementation compared `available` directly against the floor, with no
+accounting for the write's own size — `available == floor_bytes + 1` admitted a write of any size,
+including one that would leave the volume below the floor. The check is now write-size-aware.
+
+`FsBlobStore` also serializes the whole check-then-publish critical section of `put` per store
+instance (a `tokio::sync::Mutex<()>` held across the entire `spawn_blocking` call, from the
+availability check through `persist`). **Amended 2026-07-13:** without this, two concurrent puts
+could each observe the same pre-write availability snapshot, each individually pass a write-size-
+aware check against it, and both proceed to write — jointly pushing the volume under the floor even
+though neither write looked unsafe in isolation, since neither observed the other's pending write.
+A per-root async mutex is adequate at `BlobStore`'s expected write rate; it defends only against
+concurrent `FsBlobStore` callers within one process, not against another process writing to the
+same volume. Below the floor, `put` refuses with a new error variant:
 
 ```rust
 #[error(
@@ -185,10 +199,40 @@ everything not in that set.
 
 This is deliberately the _only_ deletion path a consumer has besides an explicit
 `BlobStore::delete(content_ref)` call (SPEC-gate ruling, 2026-07-12): a future doc/file pack never
-deletes blob files directly, so a blob referenced from two places (or briefly orphaned mid-write by
-some other in-flight operation) is never removed out from under a concurrent reader by a
-consumer-side heuristic. `BlobStore` owns the deletion policy; consumers only ever add references
-and let GC reconcile.
+deletes blob files directly, so a blob referenced from two places is never removed out from under a
+concurrent reader by a consumer-side heuristic. `BlobStore` owns the deletion policy; consumers only
+ever add references and let GC reconcile.
+
+**Concurrency guarantee — offline-maintenance-only (amended 2026-07-13, round-2 codex High
+finding).** The paragraph above, as originally written, claimed this design "is never removed out
+from under a concurrent reader" — that claim was not true of the shipped implementation and has
+been corrected here rather than left standing. Both `delete` and `orphan_sweep` are
+**offline-maintenance-only** APIs, not safe to run against a live entity writer:
+
+- `orphan_sweep`'s `live_refs` set is a **snapshot** the caller assembles before the call. Nothing
+  in `BlobStore` detects a `content_ref` that becomes newly live — an entity write lands
+  referencing it — between when that snapshot was taken and when the sweep runs; such a blob is
+  deleted anyway. `khive-db`'s
+  `orphan_sweep_race_demonstrates_the_documented_quiescence_requirement` test reproduces this
+  exactly, so the hazard is pinned in code, not just prose.
+- `delete` is an unconditional physical removal with the same class of hazard: any caller can
+  delete a `content_ref` an entity write races into existence a moment later, with no coordination
+  from this trait.
+
+The actual guarantee is narrower than the original text implied: **run `orphan_sweep` and `delete`
+only when writes that could create a new `content_ref` reference are quiesced** — a maintenance
+window, a single-writer admin CLI invocation with no live traffic, or equivalent. `BlobStore` has no
+visibility into the entity substrate (ADR-005 constraint 4) and therefore cannot enforce this
+itself; it is a caller obligation, now stated explicitly on `BlobStore::delete` and
+`BlobStore::orphan_sweep`'s doc comments.
+
+A transactional, DB-coordinated sweep — selecting and deleting live/orphaned blobs under the entity
+writer's own transactional boundary, so the sweep is safe to run concurrently with normal traffic —
+would close this hazard properly. That is a larger design (does it live in `khive-storage` as a new
+capability, or in `khive-runtime` orchestrating `BlobStore` + `SqlAccess`/`GraphStore` together?)
+left to a follow-up: [khive#924](https://github.com/ohdearquant/khive/issues/924). It is
+**deliberately not built in this round** — the smaller, honest fix here is making the existing
+hazard explicit and tested, not attempting a bigger coordination design under review pressure.
 
 ---
 
@@ -245,6 +289,16 @@ misses.
   into this ADR's scope.
 - No MCP wire-surface change: `blob_store` is reached only through `StorageBackend`, not through
   any pack verb. A future doc/file pack ADR will define what (if anything) becomes MCP-visible.
+- **Round-2 amendments (2026-07-13, PR #922 codex review):** `ContentRef` no longer derives
+  `Deserialize` — it is hand-implemented to route every input through `from_hex`, so a malformed
+  serialized value is rejected at deserialization instead of later panicking in `shard_path`.
+  `FsBlobStore::put`'s floor check now accounts for the pending write's own size and serializes its
+  check-then-publish critical section per store instance via a `tokio::sync::Mutex`. `delete` and
+  `orphan_sweep` are now explicitly documented (trait doc comments, §8 above) as
+  offline-maintenance-only, requiring quiesced entity writes — a real, undefended concurrency hazard
+  the original §8 text incorrectly described as absent. A DB-coordinated transactional sweep that
+  would close that hazard is tracked as a follow-up, not built here:
+  [khive#924](https://github.com/ohdearquant/khive/issues/924).
 
 ---
 
@@ -270,3 +324,7 @@ misses.
 - [ADR-044](ADR-044-vector-store-extensions.md) — `orphan_sweep` precedent.
 - [ADR-086](ADR-086-doc-file-pack.md) — deferred `StorageCapability::Blob`.
 - `fs4` crate (`https://crates.io/crates/fs4`) — cross-platform free-space query.
+- PR #922 codex round-1 review (`.khive/codex_reviews/codex_review_pr922_round1.md`) — source of
+  the three round-2 High findings this ADR was amended to address.
+- [khive#924](https://github.com/ohdearquant/khive/issues/924) — follow-up: transactional,
+  DB-coordinated `BlobStore` orphan sweep.
