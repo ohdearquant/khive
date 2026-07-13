@@ -7,7 +7,7 @@ The schedule pack for khive — time-triggered intent storage (`remind`,
 
 | Verb                | What it does                                                            |
 | ------------------- | ----------------------------------------------------------------------- |
-| `schedule.remind`   | Create a time-triggered reminder                                        |
+| `schedule.remind`   | Deliver a time-triggered reminder to your inbox                         |
 | `schedule.schedule` | Schedule a future verb dispatch (a DSL string, validated at write time) |
 | `schedule.agenda`   | List upcoming scheduled events, optionally within a time window         |
 | `schedule.cancel`   | Cancel a scheduled event                                                |
@@ -21,9 +21,11 @@ next occurrence.
 
 ## Semantics
 
-This pack is **intent storage only**. It creates and queries
-`scheduled_event` notes; it does not itself evaluate triggers. `schedule.remind`
-stores a plain reminder payload, while `schedule.schedule`'s `action` parameter
+This pack creates and queries `scheduled_event` notes; the daemon or pending-event
+runner evaluates their triggers. At fire time, `schedule.remind` delivers its
+content to the creating actor's inbox through the same dual-write path as
+`comm.send`. Use `schedule.schedule(action="comm.send(...)")` when the recipient
+is a different actor. `schedule.schedule`'s `action` parameter
 is a full verb-dispatch string (e.g.
 `"schedule.remind(content=\"hello\", at=\"2099-06-01T09:00:00Z\")"`) that must
 satisfy a stricter *replayable* contract, validated at write time (issue
@@ -35,17 +37,20 @@ inner call must itself be independently valid, because `kkernel`'s
 pending-events runner re-parses and re-dispatches the stored string
 unmodified at trigger time. An `action` that fails any of these checks is
 rejected before the event is stored, not at trigger time. Reading pending
-events and dispatching their stored payload at `trigger_at` is the execution
-environment's responsibility (a `kkernel scheduler` daemon, or an external
-cron / cloud scheduler invoking the runtime).
+events and dispatching at `trigger_at` is the execution environment's
+responsibility (the daemon tick or an external cron / cloud scheduler invoking
+the pending-event runner).
 
 ## Usage
 
-`SchedulePack` requires the `kg` pack (`REQUIRES = ["kg"]`) for the notes
-substrate:
+`SchedulePack` requires only the `kg` pack (`REQUIRES = ["kg"]`) for the notes
+substrate. `schedule.remind` additionally requires the `comm.send` delivery
+capability at creation time; without it, the call fails before any
+`scheduled_event` note is persisted. Include `CommPack` when creating reminders:
 
 ```rust
 use khive_pack_kg::KgPack;
+use khive_pack_comm::CommPack;
 use khive_pack_schedule::SchedulePack;
 use khive_runtime::{KhiveRuntime, RuntimeConfig, VerbRegistryBuilder};
 use serde_json::json;
@@ -54,6 +59,7 @@ let runtime = KhiveRuntime::new(RuntimeConfig::default())?;
 
 let mut builder = VerbRegistryBuilder::new();
 builder.register(KgPack::new(runtime.clone()));
+builder.register(CommPack::new(runtime.clone()));
 builder.register(SchedulePack::new(runtime));
 let registry = builder.build()?;
 
@@ -73,7 +79,8 @@ Over MCP: `request(ops="schedule.remind(content=\"Ship the 0.4.0 release\", at=\
 and `khive-pack-comm` in the pack layer, depending on `khive-pack-kg` for the
 note substrate and on `khive-request` to validate `schedule.schedule`'s
 DSL payload, registering into `khive-runtime`'s `VerbRegistry`, consumed by
-`khive-mcp`. Governing ADR:
+`khive-mcp`. The pack can load without `khive-pack-comm`; only
+`schedule.remind` requires a registered `comm.send` delivery verb. Governing ADR:
 [ADR-040](https://github.com/ohdearquant/khive/blob/main/docs/adr/ADR-040-communication-and-schedule-packs.md) (communication and schedule packs),
 built on [ADR-017](https://github.com/ohdearquant/khive/blob/main/docs/adr/ADR-017-pack-standard.md) (pack standard).
 

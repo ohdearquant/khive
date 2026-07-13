@@ -2,7 +2,8 @@
 
 **Status**: Accepted
 **Date**: 2026-07-09
-**Amended**: 2026-07-09 (missed-event grace policy, Amendment A; implementation note, Amendment B)
+**Amended**: 2026-07-12 (missed-event grace policy, Amendment A; implementation note,
+Amendment B; reminder delivery and failure observability, Amendment C)
 **Depends on**: [ADR-040](ADR-040-communication-and-schedule-packs.md) (schedule pack
 verbs and `scheduled_event` note kind), [ADR-049](ADR-049-khived-daemon.md) (warm daemon
 process model), [ADR-016](ADR-016-request-dsl.md) (request DSL, replayed at fire time)
@@ -411,19 +412,11 @@ unaffected by this ADR.
 
 ## Explicitly Deferred
 
-The following are real, identified gaps in the schedule pack's execution story but are
-out of scope for this ADR, which is limited to wiring the existing drain into a
-daemon-resident tick:
+Reminder delivery and structured reminder-failure observability were implemented as
+follow-on work and are now part of the accepted contract; see Amendment C.
 
-- **Delivery of fired `schedule.remind` events.** The drain's own dispatch logic
-  treats `event_type != "schedule"` as a no-op today: a fired reminder is marked
-  `fired` but nothing reads its content or delivers it anywhere. Building an
-  owner/actor attribution field on `scheduled_event` and wiring fired reminders to an
-  inbound delivery path is separate follow-on work.
-- **Structured per-row failure reason.** A dispatch failure is currently visible only
-  in the drain's own aggregate summary counter and verbose logging output; the
-  `scheduled_event` note itself carries no persisted failure detail. Adding a
-  dispatch-error property to the row is separate follow-on work.
+The following identified gaps remain out of scope for this ADR:
+
 - **`agenda()` visibility into non-pending state.** `schedule.agenda` filters to
   `status = "pending"` only and does not distinguish an overdue-but-undrained row from
   a genuinely future one. Extending `agenda` (or adding a history-style query) is
@@ -775,3 +768,32 @@ trait seam with tracked, graceful shutdown and `DrainSummary`/`DrainError` owned
 `khive-runtime` — remains open follow-on work, tracked separately from the missed-event
 policy (Amendment A) and the runtime-targeting/cadence/pagination fixes (this fix-round)
 this ADR has delivered so far.
+
+## Amendment C: Reminder delivery and failure observability (2026-07-12)
+
+`schedule.remind` persists the creating actor's identity in the scheduled-event row as
+`created_by_actor`. When an in-grace reminder fires, the drain reads that stored value
+and dispatches `comm.send(to=<created_by_actor>, ...)`, producing an inbound message in
+the creator's actor-addressed inbox. Delivery therefore remains attributed to the
+creator across daemon restarts and changes in the daemon's own actor identity. Rows
+created before `created_by_actor` existed are the only exception: the drain logs a
+warning and falls back to the current server actor, then to `local` when the server has
+no configured actor.
+
+A reminder-delivery failure is observable through the drain and persisted state. The
+drain logs the error, increments `DrainSummary.failed`, and persists `delivery_error` plus
+`delivery_failed_at` on the `scheduled_event` row. It also appends an error-outcome
+audit event with verb `schedule.remind.fire`, the scheduled-event note as its target,
+and the intended recipient actor and error text in its payload. Failure remains
+per-event: it does not abort the drain or prevent later due rows from dispatching in
+the same pass. The failed reminder is still finalized according to its cadence (a
+one-shot becomes `fired`; a named repeat is re-armed), preventing an indefinitely
+retrying permanently broken delivery. A later successful occurrence clears stale
+`delivery_error` and `delivery_failed_at` properties.
+
+Because reminder delivery is part of the public `schedule.remind` contract, reminder
+creation checks that the registry provides `comm.send`. If it does not, the handler
+rejects the call before persisting a note. The schedule pack itself still declares only
+`REQUIRES = ["kg"]`, so `schedule.schedule`, `schedule.agenda`, and `schedule.cancel`
+remain available without `comm`. The per-event failure behavior above covers dispatch
+failures after a reminder has passed that creation-time capability check.

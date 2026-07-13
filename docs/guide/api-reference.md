@@ -39,6 +39,10 @@ An always-machine-readable copy of this page is at
 
 `workspace` requires `kg`, `git`, `gtd`, and `session` to be loaded alongside it (the runtime rejects a pack set that omits a declared dependency), so its minimal example lists all four.
 
+`schedule` requires `kg`. `schedule.remind` additionally requires `comm.send` at
+creation time and persists nothing when that delivery capability is absent; the other
+three schedule verbs remain available without `comm`.
+
 `code` registers the `finding` note kind and edge rules only; its `code.ingest` verb is
 accepted but unimplemented (ADR-085), and `findings.json` ingest runs through the
 `kkernel code-ingest` admin CLI path, not the MCP verb surface — so it contributes 0
@@ -1009,7 +1013,7 @@ request(ops="comm.health()")
 ## `schedule` pack — 4 verbs
 
 Time-triggered reminders and deferred verb dispatch. Optional; load with
-`KHIVE_PACKS=kg,schedule`.
+`KHIVE_PACKS=kg,schedule`. Add `comm` to create reminders.
 
 ### `schedule.remind` — Commissive
 
