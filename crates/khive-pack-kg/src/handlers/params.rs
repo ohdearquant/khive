@@ -143,6 +143,7 @@ pub(crate) struct MergeParams {
     pub(crate) dry_run: Option<bool>,
     #[allow(dead_code)]
     pub(crate) verbose: Option<bool>,
+    pub(crate) reason: Option<String>,
 }
 
 #[derive(Deserialize)]

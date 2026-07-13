@@ -310,6 +310,7 @@ impl KhiveRuntime {
         strategy: EntityDedupMergePolicy,
         content_strategy: ContentMergeStrategy,
         dry_run: bool,
+        reason: Option<String>,
     ) -> RuntimeResult<MergeSummary> {
         if into_id == from_id {
             return Err(RuntimeError::InvalidInput(
@@ -414,6 +415,16 @@ impl KhiveRuntime {
                 EntityDedupMergePolicy::PreferFrom => "prefer_from",
                 EntityDedupMergePolicy::Union => "union",
             };
+            let mut payload = serde_json::json!({
+                "into_id": summary.kept_id,
+                "from_id": summary.removed_id,
+                "policy": policy_str,
+                "content_strategy": format!("{:?}", content_strategy),
+                "edges_rewired": summary.edges_rewired,
+            });
+            if let Some(reason) = reason.as_deref().filter(|r| !r.is_empty()) {
+                payload["reason"] = serde_json::Value::String(reason.to_string());
+            }
             let event = khive_storage::event::Event::new(
                 updated_entity.namespace.clone(),
                 "merge",
@@ -422,13 +433,7 @@ impl KhiveRuntime {
                 "",
             )
             .with_target(summary.kept_id)
-            .with_payload(serde_json::json!({
-                "into_id": summary.kept_id,
-                "from_id": summary.removed_id,
-                "policy": policy_str,
-                "content_strategy": format!("{:?}", content_strategy),
-                "edges_rewired": summary.edges_rewired,
-            }));
+            .with_payload(payload);
             event_store.append_event(event).await.map_err(|e| {
                 RuntimeError::Internal(format!("merge_entity: event store write failed: {e}"))
             })?;
@@ -693,6 +698,7 @@ impl KhiveRuntime {
         strategy: EntityDedupMergePolicy,
         content_strategy: ContentMergeStrategy,
         dry_run: bool,
+        reason: Option<String>,
     ) -> RuntimeResult<MergeSummary> {
         if into_id == from_id {
             return Err(RuntimeError::InvalidInput(
@@ -782,6 +788,41 @@ impl KhiveRuntime {
             self.fire_note_mutation_hook(&updated_note.kind, updated_note.id)
                 .await;
         }
+
+        // Dry-run is a read-only preview: it must not append a merge event.
+        if !dry_run {
+            let event_store = self.events(token)?;
+            // Mirror the wire-level strategy spelling from MergeParams so consumers
+            // can round-trip the policy string back into a request.
+            let policy_str = match strategy {
+                EntityDedupMergePolicy::PreferInto => "prefer_into",
+                EntityDedupMergePolicy::PreferFrom => "prefer_from",
+                EntityDedupMergePolicy::Union => "union",
+            };
+            let mut payload = serde_json::json!({
+                "into_id": summary.kept_id,
+                "from_id": summary.removed_id,
+                "policy": policy_str,
+                "content_strategy": format!("{:?}", content_strategy),
+                "edges_rewired": summary.edges_rewired,
+            });
+            if let Some(reason) = reason.as_deref().filter(|r| !r.is_empty()) {
+                payload["reason"] = serde_json::Value::String(reason.to_string());
+            }
+            let event = khive_storage::event::Event::new(
+                updated_note.namespace.clone(),
+                "merge",
+                EventKind::NoteMerged,
+                SubstrateKind::Note,
+                "",
+            )
+            .with_target(summary.kept_id)
+            .with_payload(payload);
+            event_store.append_event(event).await.map_err(|e| {
+                RuntimeError::Internal(format!("merge_note: event store write failed: {e}"))
+            })?;
+        }
+
         Ok(summary)
     }
 }
@@ -2079,6 +2120,7 @@ mod tests {
                 EntityDedupMergePolicy::PreferInto,
                 ContentMergeStrategy::Append,
                 false,
+                None,
             )
             .await
             .unwrap();
@@ -2118,6 +2160,7 @@ mod tests {
                 EntityDedupMergePolicy::PreferInto,
                 ContentMergeStrategy::Append,
                 false,
+                None,
             )
             .await
             .unwrap_err();
@@ -2163,6 +2206,7 @@ mod tests {
             EntityDedupMergePolicy::PreferInto,
             ContentMergeStrategy::Append,
             false,
+            None,
         )
         .await
         .unwrap();
@@ -2210,6 +2254,7 @@ mod tests {
             EntityDedupMergePolicy::PreferFrom,
             ContentMergeStrategy::Append,
             false,
+            None,
         )
         .await
         .unwrap();
@@ -2257,6 +2302,7 @@ mod tests {
             EntityDedupMergePolicy::Union,
             ContentMergeStrategy::Append,
             false,
+            None,
         )
         .await
         .unwrap();
@@ -2304,6 +2350,7 @@ mod tests {
             EntityDedupMergePolicy::PreferInto,
             ContentMergeStrategy::Append,
             false,
+            None,
         )
         .await
         .unwrap();
@@ -2340,6 +2387,7 @@ mod tests {
                 EntityDedupMergePolicy::PreferInto,
                 ContentMergeStrategy::Append,
                 false,
+                None,
             )
             .await
             .unwrap();
@@ -2379,6 +2427,7 @@ mod tests {
                 EntityDedupMergePolicy::PreferInto,
                 ContentMergeStrategy::Append,
                 false,
+                None,
             )
             .await
             .unwrap();
@@ -2412,6 +2461,7 @@ mod tests {
                 EntityDedupMergePolicy::PreferInto,
                 ContentMergeStrategy::Append,
                 false,
+                None,
             )
             .await
             .unwrap();
@@ -2445,6 +2495,7 @@ mod tests {
                 EntityDedupMergePolicy::PreferInto,
                 ContentMergeStrategy::Append,
                 false,
+                None,
             )
             .await
             .unwrap();
@@ -2478,6 +2529,7 @@ mod tests {
                 EntityDedupMergePolicy::PreferInto,
                 ContentMergeStrategy::PreferInto,
                 false,
+                None,
             )
             .await
             .unwrap();
@@ -2519,6 +2571,7 @@ mod tests {
                 EntityDedupMergePolicy::PreferInto,
                 ContentMergeStrategy::PreferFrom,
                 false,
+                None,
             )
             .await
             .unwrap();
@@ -2556,6 +2609,7 @@ mod tests {
                 EntityDedupMergePolicy::PreferInto,
                 ContentMergeStrategy::Append,
                 true,
+                None,
             )
             .await
             .unwrap();
@@ -2606,6 +2660,7 @@ mod tests {
                 EntityDedupMergePolicy::PreferInto,
                 ContentMergeStrategy::Append,
                 true,
+                None,
             )
             .await
             .unwrap();
@@ -2644,6 +2699,160 @@ mod tests {
         assert!(
             events.items.is_empty(),
             "dry_run=true must not append an EntityMerged event"
+        );
+    }
+
+    /// ADR-014/ADR-103: `reason` is additive — when supplied it must land in the
+    /// `EntityMerged` payload verbatim; the key must be entirely absent (not
+    /// `null`) when the caller omits it.
+    #[tokio::test]
+    async fn merge_entity_event_reason_present_when_supplied_absent_when_not() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+
+        let into_a = rt
+            .create_entity(&tok, "concept", None, "IntoA", None, None, vec![])
+            .await
+            .unwrap();
+        let from_a = rt
+            .create_entity(&tok, "concept", None, "FromA", None, None, vec![])
+            .await
+            .unwrap();
+        rt.merge_entity(
+            &tok,
+            into_a.id,
+            from_a.id,
+            EntityDedupMergePolicy::PreferInto,
+            ContentMergeStrategy::Append,
+            false,
+            Some("duplicate".to_string()),
+        )
+        .await
+        .unwrap();
+
+        let into_b = rt
+            .create_entity(&tok, "concept", None, "IntoB", None, None, vec![])
+            .await
+            .unwrap();
+        let from_b = rt
+            .create_entity(&tok, "concept", None, "FromB", None, None, vec![])
+            .await
+            .unwrap();
+        rt.merge_entity(
+            &tok,
+            into_b.id,
+            from_b.id,
+            EntityDedupMergePolicy::PreferInto,
+            ContentMergeStrategy::Append,
+            false,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let events = rt
+            .events(&tok)
+            .unwrap()
+            .query_events(
+                khive_storage::EventFilter {
+                    kinds: vec![EventKind::EntityMerged],
+                    ..Default::default()
+                },
+                khive_storage::types::PageRequest {
+                    offset: 0,
+                    limit: 10,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(events.items.len(), 2);
+
+        let with_reason = events
+            .items
+            .iter()
+            .find(|e| e.payload.get("from_id").and_then(|v| v.as_str())
+                == Some(from_a.id.to_string()).as_deref())
+            .expect("event for the reasoned merge must exist");
+        assert_eq!(
+            with_reason.payload.get("reason").and_then(|v| v.as_str()),
+            Some("duplicate"),
+            "reason must be threaded verbatim into the payload when supplied"
+        );
+
+        let without_reason = events
+            .items
+            .iter()
+            .find(|e| e.payload.get("from_id").and_then(|v| v.as_str())
+                == Some(from_b.id.to_string()).as_deref())
+            .expect("event for the reasonless merge must exist");
+        assert!(
+            without_reason.payload.get("reason").is_none(),
+            "reason key must be absent (never null) when the caller omits it, got: {:?}",
+            without_reason.payload
+        );
+    }
+
+    /// ADR-103: `merge_note` must be as auditable as `merge_entity` — exactly one
+    /// `NoteMerged` event, carrying kept/absorbed ids, per note merge.
+    #[tokio::test]
+    async fn merge_note_emits_exactly_one_note_merged_event_with_kept_and_absorbed_ids() {
+        let rt = rt();
+        let tok = NamespaceToken::local();
+        let into = rt
+            .create_note(&tok, "observation", None, "into note", None, None, vec![])
+            .await
+            .unwrap();
+        let from = rt
+            .create_note(&tok, "observation", None, "from note", None, None, vec![])
+            .await
+            .unwrap();
+
+        let summary = rt
+            .merge_note(
+                &tok,
+                into.id,
+                from.id,
+                EntityDedupMergePolicy::PreferInto,
+                ContentMergeStrategy::Append,
+                false,
+                Some("duplicate".to_string()),
+            )
+            .await
+            .unwrap();
+
+        let events = rt
+            .events(&tok)
+            .unwrap()
+            .query_events(
+                khive_storage::EventFilter {
+                    kinds: vec![EventKind::NoteMerged],
+                    ..Default::default()
+                },
+                khive_storage::types::PageRequest {
+                    offset: 0,
+                    limit: 10,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            events.items.len(),
+            1,
+            "merge_note must emit exactly one NoteMerged event"
+        );
+
+        let payload = &events.items[0].payload;
+        assert_eq!(
+            payload.get("into_id").and_then(|v| v.as_str()),
+            Some(summary.kept_id.to_string()).as_deref()
+        );
+        assert_eq!(
+            payload.get("from_id").and_then(|v| v.as_str()),
+            Some(summary.removed_id.to_string()).as_deref()
+        );
+        assert_eq!(
+            payload.get("reason").and_then(|v| v.as_str()),
+            Some("duplicate")
         );
     }
 
@@ -2696,6 +2905,7 @@ mod tests {
             EntityDedupMergePolicy::PreferInto,
             ContentMergeStrategy::Append,
             false,
+            None,
         )
         .await
         .unwrap();
@@ -2769,6 +2979,7 @@ mod tests {
                 EntityDedupMergePolicy::PreferInto,
                 ContentMergeStrategy::Append,
                 false,
+                None,
             )
             .await
             .unwrap();
@@ -2824,6 +3035,7 @@ mod tests {
                 EntityDedupMergePolicy::PreferInto,
                 ContentMergeStrategy::Append,
                 false,
+                None,
             )
             .await
             .expect("merge must succeed even when both notes annotate the same entity");
@@ -2873,6 +3085,7 @@ mod tests {
                 EntityDedupMergePolicy::PreferInto,
                 ContentMergeStrategy::Append,
                 false,
+                None,
             )
             .await;
         assert!(result.is_err(), "merging different note kinds must fail");
@@ -2917,6 +3130,7 @@ mod tests {
                 EntityDedupMergePolicy::PreferInto,
                 ContentMergeStrategy::Append,
                 true,
+                None,
             )
             .await
             .unwrap();
@@ -2982,6 +3196,7 @@ mod tests {
             EntityDedupMergePolicy::PreferInto,
             ContentMergeStrategy::Append,
             false,
+            None,
         )
         .await
         .expect("merge_note must succeed");
@@ -3109,6 +3324,7 @@ mod tests {
                 crate::EntityDedupMergePolicy::PreferInto,
                 ContentMergeStrategy::Append,
                 false,
+                None,
             )
             .await
             .expect(
@@ -3174,6 +3390,7 @@ mod tests {
                 crate::EntityDedupMergePolicy::PreferInto,
                 ContentMergeStrategy::Append,
                 false,
+                None,
             )
             .await
             .expect_err("H2: cross-kind merge must be rejected by runtime");
@@ -3217,6 +3434,7 @@ mod tests {
                 crate::EntityDedupMergePolicy::PreferInto,
                 ContentMergeStrategy::Append,
                 false,
+                None,
             )
             .await
             .expect("same-kind merge must succeed");
@@ -3260,6 +3478,7 @@ mod tests {
                 EntityDedupMergePolicy::PreferInto,
                 ContentMergeStrategy::Append,
                 false,
+                None,
             )
             .await;
         assert!(
@@ -3276,6 +3495,7 @@ mod tests {
                 EntityDedupMergePolicy::PreferInto,
                 ContentMergeStrategy::Append,
                 false,
+                None,
             )
             .await;
         assert!(
@@ -3358,6 +3578,7 @@ mod tests {
                 EntityDedupMergePolicy::PreferInto,
                 ContentMergeStrategy::Append,
                 false,
+                None,
             )
             .await;
         assert!(
@@ -3374,6 +3595,7 @@ mod tests {
                 EntityDedupMergePolicy::PreferInto,
                 ContentMergeStrategy::Append,
                 false,
+                None,
             )
             .await;
         assert!(
@@ -3654,6 +3876,7 @@ mod tests {
             EntityDedupMergePolicy::PreferInto,
             ContentMergeStrategy::Append,
             false,
+            None,
         )
         .await
         .expect("merge_entity");
@@ -3792,6 +4015,7 @@ mod tests {
             EntityDedupMergePolicy::PreferInto,
             ContentMergeStrategy::PreferInto,
             false,
+            None,
         )
         .await
         .expect("merge_note");
@@ -3879,6 +4103,7 @@ mod tests {
                 EntityDedupMergePolicy::PreferInto,
                 ContentMergeStrategy::Append,
                 false,
+                None,
             )
             .await
             .expect("merge_entity");

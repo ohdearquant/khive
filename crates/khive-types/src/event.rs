@@ -62,7 +62,7 @@ impl fmt::Display for EventOutcome {
     }
 }
 
-/// Discriminant for the 37 typed event variants produced by the verb dispatch path
+/// Discriminant for the 38 typed event variants produced by the verb dispatch path
 /// and by lifecycle telemetry producers (channel polling/backoff, config-lock,
 /// checkpoint outcome, background phase spans).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -87,6 +87,8 @@ pub enum EventKind {
     EntityDeleted,
     /// Two entities were merged (deduplication).
     EntityMerged,
+    /// Two notes were merged (deduplication).
+    NoteMerged,
     /// A new note was created.
     NoteCreated,
     /// An existing note was patched.
@@ -146,8 +148,8 @@ pub enum EventKind {
 }
 
 impl EventKind {
-    /// All 37 event kind variants in declaration order.
-    pub const ALL: [Self; 37] = [
+    /// All 38 event kind variants in declaration order.
+    pub const ALL: [Self; 38] = [
         Self::Audit,
         Self::RecallExecuted,
         Self::RerankExecuted,
@@ -157,6 +159,7 @@ impl EventKind {
         Self::EntityUpdated,
         Self::EntityDeleted,
         Self::EntityMerged,
+        Self::NoteMerged,
         Self::NoteCreated,
         Self::NoteUpdated,
         Self::NoteDeleted,
@@ -199,6 +202,7 @@ impl EventKind {
             Self::EntityUpdated => "entity_updated",
             Self::EntityDeleted => "entity_deleted",
             Self::EntityMerged => "entity_merged",
+            Self::NoteMerged => "note_merged",
             Self::NoteCreated => "note_created",
             Self::NoteUpdated => "note_updated",
             Self::NoteDeleted => "note_deleted",
