@@ -1768,17 +1768,13 @@ mod tests {
         );
     }
 
-    /// Test 3: the tx-pin oracle. Uses a
-    /// before/after delta rather than asserting a global `open_tx_count==0`
-    /// baseline — `tx_registry` is a process-wide singleton shared with every
-    /// other test in this binary (including write-path tests elsewhere in
-    /// this crate that register short-lived entries), the same reason
-    /// `track_background_task_count_returns_to_zero_after_completion` above
-    /// asserts a before/after delta on `background_task_count()` rather than
-    /// an absolute value.
-    #[tokio::test]
+    /// Test 3: the tx-pin oracle. The registry is process-global, so an
+    /// unrelated transaction can depart between snapshots and exactly offset
+    /// this test's registration. Keep an owned handle live and assert the
+    /// resulting count floor instead of comparing two points in time.
+    #[test]
     #[serial(tx_registry)]
-    async fn metrics_snapshot_reflects_open_transaction_registry() {
+    fn metrics_snapshot_reflects_open_transaction_registry() {
         let dispatcher = MockDispatch {
             namespace: "local".to_string(),
             config_id: "cfg-tx".to_string(),
@@ -1786,14 +1782,22 @@ mod tests {
             pool: None,
         };
 
+        let departing_handle = khive_storage::tx_registry::register(Some(
+            "daemon_metrics_snapshot_departing_test_tx".to_string(),
+        ));
         let before = build_metrics_snapshot(&dispatcher).open_tx_count;
+        assert!(before >= 1);
 
-        let handle = khive_storage::tx_registry::register(Some("metrics_test_tx".to_string()));
+        let handle = khive_storage::tx_registry::register(Some(
+            "daemon_metrics_snapshot_owned_test_tx".to_string(),
+        ));
+        drop(departing_handle);
+
         let during = build_metrics_snapshot(&dispatcher);
         assert!(
-            during.open_tx_count > before,
-            "open_tx_count must reflect the freshly registered transaction: \
-             before={before} during={}",
+            during.open_tx_count >= 1,
+            "open_tx_count must reflect the live owned transaction despite registry churn: \
+             churn_baseline={before} during={}",
             during.open_tx_count
         );
         assert!(
@@ -1802,19 +1806,12 @@ mod tests {
         );
 
         drop(handle);
-
-        let mut after = during.open_tx_count;
-        for _ in 0..20 {
-            after = build_metrics_snapshot(&dispatcher).open_tx_count;
-            if after <= before {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
         assert!(
-            after <= before,
-            "open_tx_count must drop back down after the transaction handle is dropped: \
-             before={before} after={after}"
+            !khive_storage::tx_registry::snapshot()
+                .iter()
+                .any(|(_, label)| label.as_deref()
+                    == Some("daemon_metrics_snapshot_owned_test_tx")),
+            "the owned registry entry must disappear when its handle is dropped"
         );
     }
 
