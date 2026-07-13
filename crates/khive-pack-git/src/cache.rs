@@ -134,7 +134,7 @@ fn clone_max_bytes() -> u64 {
 /// directory that happens to collide with the cache key, or a directory a
 /// crashed prior run left in a pre-`touch` state) is refused with
 /// `CacheError::UnsafeToReplace` rather than fetched into or adopted (issue
-/// #765 review round-2 \[High\]-1). A fresh clone is written into a private
+/// #765). A fresh clone is written into a private
 /// staging directory first (`git clone --filter=blob:none`), measured there,
 /// marked with `.khive-last-used` there, and only *moved* into the
 /// addressable `<root>/<cache_key>/` slot once it is under the cap and
@@ -187,7 +187,7 @@ pub fn ensure_clone(canonical_url: &str) -> Result<PathBuf, CacheError> {
 /// repairing a partial/pruned clone in place. Only ever operates on an
 /// existing slot -- callers repair a slot only after a prior `ensure_clone`
 /// already produced one. Re-checks `is_owned_entry` immediately before
-/// fetching (review round-3 \[High\]-1, issue #765 follow-up PR #788): the
+/// fetching (issue #765 follow-up PR #788): the
 /// gap between `ensure_clone`'s own ownership check and this repair running
 /// -- project resolution and GitHub ingestion happen in between -- is wide
 /// enough for the slot to go markerless or be replaced, so this function
@@ -202,8 +202,8 @@ pub(crate) fn refetch_clone(canonical_url: &str) -> Result<PathBuf, CacheError> 
             repo_dir.display()
         )));
     }
-    // Re-check ownership immediately before mutating the slot (review
-    // round-3 \[High\]-1, issue #765 follow-up PR #788): the caller's own
+    // Re-check ownership immediately before mutating the slot (issue #765
+    // follow-up PR #788): the caller's own
     // ownership check (`ensure_clone`, much earlier in `handle_digest`)
     // happens before project resolution and potentially lengthy GitHub
     // ingestion, so the slot can go markerless -- or be replaced by a
@@ -228,11 +228,11 @@ pub(crate) fn refetch_clone(canonical_url: &str) -> Result<PathBuf, CacheError> 
     let size = dir_size(&repo_dir)?;
     if size > cap {
         // Route through the same ownership-guarded removal `reclone` uses
-        // (issue #765 remediation, review round-1 \[High\]-1) rather than a raw
+        // (issue #765 remediation) rather than a raw
         // `remove_dir_all` -- a repair primitive must never delete a path
         // that doesn't prove itself an owned cache slot, even on the cap-
         // exceeded cleanup path. Propagate a cleanup/ownership failure
-        // instead of discarding it (review round-2 \[High\]-1): a refused or
+        // instead of discarding it: a refused or
         // failed removal must surface as its own error, not be silently
         // swallowed behind `CloneTooLarge`.
         remove_owned_entry(&root, &repo_dir)?;
@@ -273,7 +273,7 @@ pub(crate) fn reclone(canonical_url: &str) -> Result<PathBuf, CacheError> {
 /// an oversized clone never enters the cache slot, and because the marker is
 /// written before the atomic rename, a process interruption between clone
 /// and rename can never leave a live, markerless slot at the cache-key path
-/// (issue #765 review round-2 \[High\]-1).
+/// (issue #765).
 fn install_fresh_clone(
     canonical_url: &str,
     root: &Path,
@@ -653,7 +653,7 @@ mod tests {
         p
     }
 
-    /// ADR-088 Amendment 1 fix-round r2 Medium-1: a `git clone` failure (bad
+    /// ADR-088 Amendment 1: a `git clone` failure (bad
     /// source, no network needed -- a nonexistent local path fails
     /// immediately) must not leave a `.staging-<uuid>` directory behind.
     /// `evict_lru` deliberately never touches non-owned names, so a leaked
@@ -820,7 +820,7 @@ mod tests {
         assert_eq!(dir_size(dir.path()).unwrap(), 15);
     }
 
-    /// PR #847 round-3 Major-2: the walk root vanishing must surface as an
+    /// PR #847: the walk root vanishing must surface as an
     /// error, never a laundered `Ok(0)` -- distinct from a descendant
     /// vanishing beneath a still-existing root (see the Barrier tests
     /// below). A root that was never there to begin with is the simplest,
@@ -924,8 +924,8 @@ mod tests {
         }
     }
 
-    /// Companion to the test above, pinning the other half of the Major-2
-    /// contract (PR #847 round-3): when the vanishing path is the walk
+    /// Companion to the test above, pinning the other half of the
+    /// contract (PR #847): when the vanishing path is the walk
     /// **root** itself -- not a descendant beneath a still-existing root --
     /// `dir_size` must surface an error rather than tolerate it. Same
     /// barrier-race harness, but `root` is left empty (an empty-directory
@@ -1052,15 +1052,14 @@ mod tests {
         std::env::remove_var("KHIVE_GIT_DIGEST_SCRATCH_ROOT");
     }
 
-    /// Review round-1 \[High\]-1 remediation (issue #765), tightened by review
-    /// round-2 \[High\]-1: `refetch_clone`'s over-cap cleanup must go through
+    /// Remediation (issue #765): `refetch_clone`'s over-cap cleanup must go through
     /// the same ownership guard `reclone` uses, not a raw `remove_dir_all`,
     /// AND must propagate that guard's failure rather than discarding it --
     /// a slot that has lost its `.khive-last-used` marker (simulating a
     /// directory the guard cannot prove it owns) survives over-cap cleanup,
     /// and the caller sees the ownership failure (`UnsafeToReplace`) that
-    /// actually occurred, not a laundered `CloneTooLarge`. Since review
-    /// round-3 \[High\]-1 added a pre-fetch ownership re-check, this markerless
+    /// actually occurred, not a laundered `CloneTooLarge`. Since a later
+    /// fix added a pre-fetch ownership re-check, this markerless
     /// slot is now refused before `fetch_refetch` even runs (see
     /// `refetch_clone_refuses_a_markerless_slot_under_the_cap` below) rather
     /// than at the over-cap cleanup step this test originally targeted --
@@ -1099,7 +1098,7 @@ mod tests {
         std::env::remove_var("KHIVE_GIT_DIGEST_SCRATCH_ROOT");
     }
 
-    /// Review round-3 \[High\]-1 remediation (issue #765 follow-up PR #788):
+    /// Remediation (issue #765 follow-up PR #788):
     /// `refetch_clone` must refuse a markerless slot *before* ever calling
     /// `fetch_refetch`, not only on the over-cap cleanup branch the previous
     /// test exercises. Under the default (non-cap-exceeded) cap, a
@@ -1260,7 +1259,7 @@ mod tests {
         std::env::remove_var("KHIVE_GIT_DIGEST_SCRATCH_ROOT");
     }
 
-    /// Review round-2 \[High\]-1 remediation (issue #765): `ensure_clone` must
+    /// Remediation (issue #765): `ensure_clone` must
     /// never adopt, fetch into, or touch a directory sitting at the
     /// cache-key path that does not already prove itself owned via
     /// `is_owned_entry`. Here the directory is a genuine Git repository (so

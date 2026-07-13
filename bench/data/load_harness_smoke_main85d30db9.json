@@ -1,0 +1,184 @@
+{
+  "meta": {
+    "mode": "real",
+    "workers": 20,
+    "tenants": 4,
+    "workers_per_tenant": 5,
+    "ops_per_worker": 20,
+    "git_sha": "85d30db9d6eefc8d4346bfa2a2a8a2f1e1e57f9c",
+    "started_at": "2026-07-13T00:41:41Z",
+    "db_path": "/var/folders/5p/rcbw097d29j3s2qt861tsjfh0000gn/T/khive-loadharness-q4inw7kh/loadharness.db",
+    "run_posture": "KHIVE_DAEMON_STRICT=1 KHIVE_WRITE_QUEUE=1",
+    "finished_at": "2026-07-13T00:42:32Z"
+  },
+  "smoke_result": "PASS",
+  "smoke_errors": [],
+  "oracle_probe_t0": {
+    "oracle": "LIVE",
+    "config_id": "packs=[brain,comm,gtd,kg,knowledge,memory,schedule];db=/var/folders/5p/rcbw097d29j3s2qt861tsjfh0000gn/T/khive-loadharness-q4inw7kh/loadharness.db;embed=AllMiniLmL6V2;extra=[ParaphraseMultilingualMiniLmL12V2];backend=BackendId(\"main\");outbound=[]",
+    "detail": "response carries a populated `metrics` key",
+    "metrics": {
+      "wal_pages": 981,
+      "wal_truncate_attempts": 0,
+      "wal_truncate_consecutive_failures": 0,
+      "wal_checkpoint_skipped_ticks": 0,
+      "wal_checkpoint_consecutive_skips": 0,
+      "wal_checkpoint_last_skip_wal_pages": null,
+      "oldest_pinned_tx_micros": null,
+      "oldest_pinned_tx_label": null,
+      "open_tx_count": 0,
+      "write_queue_depth": 0,
+      "write_queue_capacity": 256
+    }
+  },
+  "oracle_probe_post_load": {
+    "oracle": "LIVE",
+    "config_id": "packs=[brain,comm,gtd,kg,knowledge,memory,schedule];db=/var/folders/5p/rcbw097d29j3s2qt861tsjfh0000gn/T/khive-loadharness-q4inw7kh/loadharness.db;embed=AllMiniLmL6V2;extra=[ParaphraseMultilingualMiniLmL12V2];backend=BackendId(\"main\");outbound=[]",
+    "detail": "response carries a populated `metrics` key",
+    "metrics": {
+      "wal_pages": 67,
+      "wal_truncate_attempts": 0,
+      "wal_truncate_consecutive_failures": 0,
+      "wal_checkpoint_skipped_ticks": 3,
+      "wal_checkpoint_consecutive_skips": 0,
+      "wal_checkpoint_last_skip_wal_pages": 22,
+      "oldest_pinned_tx_micros": null,
+      "oldest_pinned_tx_label": null,
+      "open_tx_count": 0,
+      "write_queue_depth": 0,
+      "write_queue_capacity": 256
+    }
+  },
+  "op_counts": {
+    "memory.recall": 173,
+    "knowledge.search": 76,
+    "create": 51,
+    "memory.remember": 61,
+    "knowledge.compose": 39
+  },
+  "op_error_counts": {
+    "memory.recall": 0,
+    "knowledge.search": 0,
+    "create": 0,
+    "memory.remember": 0,
+    "knowledge.compose": 0
+  },
+  "dimensions": {
+    "1_fallback": {
+      "channel": "worker-stderr-scrape",
+      "daemon_fallback_lines": 0,
+      "reason_breakdown": {
+        "config_mismatch": 0,
+        "namespace_mismatch": 0,
+        "other": 0
+      },
+      "note": "grep for literal 'daemon_fallback' event across every worker front-end's stderr; STRICT=1 elevates config/namespace-mismatch fallbacks to error-level but the substring is the same either way"
+    },
+    "2_recall_latency": {
+      "channel": "client-measured",
+      "n": 173,
+      "p50_us": 46769,
+      "p95_us": 165921,
+      "p99_us": 206865,
+      "note": "meaningful cold-spike read requires --mode real; bench-embedder has no cold init to spike"
+    },
+    "3_embed_cold_start": {
+      "channel": "daemon-log-scrape",
+      "status": "not-implemented-this-round",
+      "note": "no confirmed embedder-init log-event text found in this worktree during recon; only indirect corroboration available via dim-2's latency shape (no direct probe here)"
+    },
+    "4_wal_floor": {
+      "channel": "daemon-frame (oracle)",
+      "status": "LIVE",
+      "t0": {
+        "oracle": "LIVE",
+        "config_id": "packs=[brain,comm,gtd,kg,knowledge,memory,schedule];db=/var/folders/5p/rcbw097d29j3s2qt861tsjfh0000gn/T/khive-loadharness-q4inw7kh/loadharness.db;embed=AllMiniLmL6V2;extra=[ParaphraseMultilingualMiniLmL12V2];backend=BackendId(\"main\");outbound=[]",
+        "detail": "response carries a populated `metrics` key",
+        "metrics": {
+          "wal_pages": 981,
+          "wal_truncate_attempts": 0,
+          "wal_truncate_consecutive_failures": 0,
+          "wal_checkpoint_skipped_ticks": 0,
+          "wal_checkpoint_consecutive_skips": 0,
+          "wal_checkpoint_last_skip_wal_pages": null,
+          "oldest_pinned_tx_micros": null,
+          "oldest_pinned_tx_label": null,
+          "open_tx_count": 0,
+          "write_queue_depth": 0,
+          "write_queue_capacity": 256
+        }
+      },
+      "post_load": {
+        "oracle": "LIVE",
+        "config_id": "packs=[brain,comm,gtd,kg,knowledge,memory,schedule];db=/var/folders/5p/rcbw097d29j3s2qt861tsjfh0000gn/T/khive-loadharness-q4inw7kh/loadharness.db;embed=AllMiniLmL6V2;extra=[ParaphraseMultilingualMiniLmL12V2];backend=BackendId(\"main\");outbound=[]",
+        "detail": "response carries a populated `metrics` key",
+        "metrics": {
+          "wal_pages": 67,
+          "wal_truncate_attempts": 0,
+          "wal_truncate_consecutive_failures": 0,
+          "wal_checkpoint_skipped_ticks": 3,
+          "wal_checkpoint_consecutive_skips": 0,
+          "wal_checkpoint_last_skip_wal_pages": 22,
+          "oldest_pinned_tx_micros": null,
+          "oldest_pinned_tx_label": null,
+          "open_tx_count": 0,
+          "write_queue_depth": 0,
+          "write_queue_capacity": 256
+        }
+      }
+    },
+    "5_wal_pin": {
+      "channel": "daemon-frame (oracle)",
+      "status": "LIVE"
+    },
+    "6_write_backpressure": {
+      "channel": "client-op-results",
+      "sqlite_busy_or_locked_count": 0,
+      "note": "should be 0 under KHIVE_WRITE_QUEUE=1; a nonzero count means the write-queue is not absorbing write-write contention"
+    },
+    "7_backpressure_surfaced": {
+      "channel": "client-op-results + daemon-frame (oracle)",
+      "write_queue_full_typed_errors": 0,
+      "oracle_status": "LIVE"
+    },
+    "8_attribution": {
+      "channel": "client-readback",
+      "checked": 4,
+      "consistent_write_then_read": 4,
+      "inconsistent_write_then_read": 0,
+      "errored": 0,
+      "distinct_attributed_actors": 4,
+      "expected_distinct_actors": 4,
+      "note": "does NOT assert a specific actor-string convention (see docstring on _attribution_probe for a real finding: the KHIVE_ACTOR-per-session pinning this harness's spec recommends is superseded by ADR-096's explicit-namespace fill rule in this worktree, so the attributed actor equals the namespace string, not '<namespace>_actor'). This checks write-then-read consistency and that distinct tenants get distinct attributed identities (no cross-tenant collapse).",
+      "detail": [
+        {
+          "tenant": 0,
+          "status": "consistent",
+          "attributed_actor": "tenant_0"
+        },
+        {
+          "tenant": 1,
+          "status": "consistent",
+          "attributed_actor": "tenant_1"
+        },
+        {
+          "tenant": 2,
+          "status": "consistent",
+          "attributed_actor": "tenant_2"
+        },
+        {
+          "tenant": 3,
+          "status": "consistent",
+          "attributed_actor": "tenant_3"
+        }
+      ]
+    },
+    "9_brain_slot_throughput": {
+      "channel": "client-measured",
+      "n": 115,
+      "p50_us": 5048807,
+      "p95_us": 5118550,
+      "p99_us": 5128291
+    }
+  }
+}

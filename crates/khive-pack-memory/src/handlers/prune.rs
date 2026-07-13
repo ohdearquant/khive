@@ -136,7 +136,7 @@ impl MemoryPack {
             }
         }
 
-        // #750 fix-round 1: `note_store.delete_note` above is the raw
+        // #750: `note_store.delete_note` above is the raw
         // `NoteStore` capability — it bypasses `KhiveRuntime::delete_note`'s
         // orchestration entirely (no FTS/vector cleanup, no note-mutation
         // hook fire), so it does NOT go through the generic hook wired into
@@ -174,8 +174,8 @@ impl MemoryPack {
         // VACUUM must run outside an open transaction. Under
         // `KHIVE_WRITE_QUEUE=1`, a plain `execute_script` call would run
         // inside the WriterTask's per-request `BEGIN IMMEDIATE` — SQLite
-        // rejects VACUUM there (ADR-067 Component A, Fork C slice 2 round 2,
-        // BLOCKER A). `execute_script_top_level` is still serialized through
+        // rejects VACUUM there (ADR-067 Component A, Fork C slice 2).
+        // `execute_script_top_level` is still serialized through
         // the single writer owner but skips that transaction wrap, so
         // VACUUM runs genuinely top-level on both the flag-on and flag-off
         // paths.
@@ -189,15 +189,15 @@ impl MemoryPack {
     }
 }
 
-// ── ADR-067 Fork C slice 2 round 2 (BLOCKER A): memory.vacuum under the write
+// ── ADR-067 Fork C slice 2: memory.vacuum under the write
 // queue ──────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod vacuum_write_queue_tests {
-    /// Fork C slice 2 round 2 (BLOCKER A): before this fix, `handle_vacuum`
+    /// Fork C slice 2: before this fix, `handle_vacuum`
     /// sent `"VACUUM;"` via plain `execute_script`, which — once
     /// `execute_script`'s flag-on path was migrated to route through the
-    /// writer task (Fork C slice 2 round 1) — ran inside that task's
+    /// writer task (an earlier Fork C slice) — ran inside that task's
     /// per-request `BEGIN IMMEDIATE`. SQLite rejects `VACUUM` inside any
     /// open transaction ("cannot VACUUM from within a transaction"), so
     /// `memory.vacuum` broke under `KHIVE_WRITE_QUEUE=1`. This proves the

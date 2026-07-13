@@ -336,7 +336,7 @@ impl KhiveMcpServer {
         // entity-type validation is active at the runtime layer for all write
         // paths, including direct `create_many` callers that bypass the handler.
         registry.call_register_entity_type_validators(&runtime);
-        // #750 fix-round 1: install pack-owned note-mutation hooks (currently
+        // #750: install pack-owned note-mutation hooks (currently
         // only khive-pack-memory's warm-ANN-cache invalidation) so KG's
         // update/delete verbs notify caching packs even though there is no
         // crate-level dependency between them.
@@ -1490,11 +1490,91 @@ result (e.g. create then link with the new entity's id)."#)]
         if p.save_to.is_none() {
             let frame = self.wire_daemon_frame(&p);
             if let Some(res) = crate::daemon::forward_or_spawn(&frame).await {
-                return res;
+                return match res {
+                    Ok(s) => Ok(s),
+                    // #947: a strict-mode fallback rejection is tagged with
+                    // `daemon::STRICT_FALLBACK_MARKER` so it can be reshaped
+                    // into the normal per-op envelope instead of surfacing as
+                    // an RPC-level error. Every other daemon-forward error
+                    // (protocol mismatch, oversized frame, ambiguous
+                    // post-write outcome) is untagged and passes through
+                    // unchanged.
+                    Err(e) => match strict_fallback_reason(&e) {
+                        Some(reason) => strict_fallback_envelope_response(&p, reason),
+                        None => Err(e),
+                    },
+                };
             }
         }
         self.dispatch_request_wire(p).await
     }
+}
+
+/// Extract the fallback-reason string from a strict-mode rejection's
+/// [`McpError`] (#947), or `None` if `e` is not tagged with
+/// [`crate::daemon::STRICT_FALLBACK_MARKER`] — i.e. some other daemon-forward
+/// error that must stay an RPC-level error.
+fn strict_fallback_reason(e: &McpError) -> Option<String> {
+    let data = e.data.as_ref()?;
+    if data.get(crate::daemon::STRICT_FALLBACK_MARKER)?.as_bool() != Some(true) {
+        return None;
+    }
+    data.get("reason")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+}
+
+/// Build the wire-contract failed-op envelope for a strict-mode daemon
+/// fallback rejection (#947 Medium finding).
+///
+/// The request was never attempted — locally or on the daemon — but the wire
+/// response must still be a normal per-op envelope
+/// (`{"results": [...], "summary": {...}}`) reporting the fallback reason as
+/// each op's `error`, not an RPC-level `McpError`. Chain mode aborts after the
+/// first op, matching `run_parsed`'s `Chain` arm and the wire contract's
+/// documented abort-on-failure behavior for `|`-chained ops.
+fn strict_fallback_envelope_response(
+    p: &RequestParams,
+    reason: String,
+) -> Result<String, McpError> {
+    let parsed = parse_request(&p.ops).map_err(dsl_err_to_mcp)?;
+    let total = parsed.ops.len();
+    let error_msg = format!(
+        "daemon fallback rejected under KHIVE_DAEMON_STRICT=1: reason={reason}; \
+         refusing to complete the request via local dispatch"
+    );
+
+    let results: Vec<Value> = match parsed.mode {
+        ExecutionMode::Chain => parsed
+            .ops
+            .iter()
+            .enumerate()
+            .map(|(i, op)| {
+                if i == 0 {
+                    json!({ "ok": false, "tool": op.tool, "error": error_msg })
+                } else {
+                    json!({ "ok": false, "tool": op.tool, "aborted": true })
+                }
+            })
+            .collect(),
+        ExecutionMode::Single | ExecutionMode::Parallel => parsed
+            .ops
+            .iter()
+            .map(|op| json!({ "ok": false, "tool": op.tool, "error": error_msg }))
+            .collect(),
+    };
+
+    let aborted = if parsed.mode == ExecutionMode::Chain {
+        total.saturating_sub(1)
+    } else {
+        0
+    };
+    let failed = total - aborted;
+    Ok(serde_json::to_string(&json!({
+        "results": results,
+        "summary": { "total": total, "succeeded": 0, "failed": failed, "aborted": aborted },
+    }))
+    .expect("envelope of string/bool JSON values always serializes"))
 }
 
 impl KhiveMcpServer {
@@ -1529,6 +1609,9 @@ impl KhiveMcpServer {
             format: p.format.clone(),
             format_per_op: p.format_per_op.clone(),
             from_wire: true,
+            // khive#948: forwarded unchanged from the tool caller's params.
+            // `None` when the caller supplied no id (pre-#948 client).
+            request_id: p.request_id,
         }
     }
 
@@ -1540,8 +1623,11 @@ impl KhiveMcpServer {
     /// (or sets `from_wire` on the daemon frame), which enforces verb visibility.
     ///
     /// Pure local dispatch: no [`khive_runtime::RequestIdentity`] override is
-    /// applied (ADR-096 Fork 1) — this server's own construction-baked
-    /// identity is used, unchanged from before per-request identity existed.
+    /// applied by this caller (ADR-096 Fork 1) — this server's own
+    /// construction-baked namespace/actor/visibility is used, unchanged from
+    /// before per-request identity existed. `dispatch_request_inner` (khive#948)
+    /// may still synthesize an identity carrying those same baked scalars if
+    /// `p.request_id` is set, purely so the audit row is correlatable.
     pub async fn dispatch_request_local(&self, p: RequestParams) -> Result<String, McpError> {
         self.dispatch_request_inner(p, false, None).await
     }
@@ -1560,6 +1646,17 @@ impl KhiveMcpServer {
     /// frame (ADR-096 Fork 1, see `crate::daemon`'s `DaemonDispatch` impl).
     /// `None` for every local (non-daemon-served) call — this server's own
     /// baked identity applies, exactly as before this parameter existed.
+    ///
+    /// khive#948: when `identity` is `None` (every local-dispatch call —
+    /// `KHIVE_NO_DAEMON`/soft daemon-fallback and the `save_to` bypass both
+    /// route here via `dispatch_request_wire`) and the caller supplied a
+    /// `request_id`, a `RequestIdentity` is synthesized so the audit row
+    /// stamped by this dispatch is still correlatable. The synthesized
+    /// identity mirrors this server's own baked `default_namespace` /
+    /// `actor_id` / `visible_namespaces` exactly — it changes no dispatch
+    /// semantics, only adds the correlation id — so a request with no
+    /// `request_id` still dispatches through the untouched `identity = None`
+    /// path.
     pub(crate) async fn dispatch_request_inner(
         &self,
         p: RequestParams,
@@ -1567,6 +1664,19 @@ impl KhiveMcpServer {
         identity: Option<khive_runtime::RequestIdentity>,
     ) -> Result<String, McpError> {
         let save_to = p.save_to.clone();
+        let identity = identity.or_else(|| {
+            p.request_id
+                .map(|request_id| khive_runtime::RequestIdentity {
+                    namespace: self.default_namespace.clone(),
+                    actor_id: self.actor_id().map(str::to_string),
+                    visible_namespaces: self
+                        .visible_namespaces()
+                        .iter()
+                        .map(|ns| ns.as_str().to_string())
+                        .collect(),
+                    request_id: Some(request_id),
+                })
+        });
         let parsed = parse_request(&p.ops).map_err(dsl_err_to_mcp)?;
 
         // Parse presentation strings → PresentationMode.
@@ -1851,6 +1961,7 @@ impl ServerHandler for KhiveMcpServer {
 mod tests {
     use super::*;
     use khive_runtime::Namespace;
+    use khive_storage::{EventFilter, PageRequest};
     use serial_test::serial;
 
     fn t(pack: &str, verb: &str, desc: &str) -> (String, String, String) {
@@ -1976,7 +2087,7 @@ mod tests {
         );
     }
 
-    // ── #823 finding 1: runtime `$prev` result depth guard ───────────────────
+    // ── #823: runtime `$prev` result depth guard ────────────────────────────
 
     /// Iteratively (no native recursion) wrap `leaf` in `depth` nested
     /// single-key objects, a synthetic stand-in for a pathologically deep
@@ -2239,6 +2350,126 @@ mod tests {
         std::env::remove_var("KHIVE_LOCK");
     }
 
+    /// khive#948: `wire_daemon_frame` forwards `RequestParams::request_id`
+    /// onto the `DaemonRequestFrame` unchanged, and defaults to `None` when
+    /// the caller supplied none.
+    #[test]
+    fn wire_daemon_frame_forwards_request_id() {
+        let server = make_daemon_save_to_test_server();
+
+        let with_id = RequestParams {
+            ops: "stats()".to_string(),
+            request_id: Some(123),
+            ..Default::default()
+        };
+        let frame = server.wire_daemon_frame(&with_id);
+        assert_eq!(frame.request_id, Some(123));
+
+        let without_id = RequestParams {
+            ops: "stats()".to_string(),
+            ..Default::default()
+        };
+        let frame = server.wire_daemon_frame(&without_id);
+        assert_eq!(frame.request_id, None);
+    }
+
+    /// Query every persisted audit event and find the one whose
+    /// `resource.request_id` matches `id`, if any.
+    async fn find_audit_event_with_request_id(
+        store: &Arc<dyn khive_storage::EventStore>,
+        id: u64,
+    ) -> Option<khive_storage::Event> {
+        let page = store
+            .query_events(
+                EventFilter::default(),
+                PageRequest {
+                    limit: 50,
+                    offset: 0,
+                },
+            )
+            .await
+            .expect("query_events must succeed");
+        page.items
+            .into_iter()
+            .find(|ev| ev.payload["resource"]["request_id"] == json!(id))
+    }
+
+    /// khive#948: `request_id` was previously dropped on the
+    /// `KHIVE_NO_DAEMON`/soft-fallback local dispatch path because
+    /// `dispatch_request_wire` always passed `identity = None`. This drives
+    /// `request()` end-to-end under `KHIVE_NO_DAEMON=1` and inspects the
+    /// persisted audit event, proving the id now survives to
+    /// `resource.request_id` on the local-dispatch path too, not just the
+    /// daemon-forward path.
+    #[tokio::test]
+    #[serial]
+    async fn request_no_daemon_fallback_preserves_request_id_in_audit_event() {
+        clear_daemon_env();
+        std::env::set_var("KHIVE_NO_DAEMON", "1");
+
+        let server = make_daemon_save_to_test_server();
+        server
+            .request(Parameters(RequestParams {
+                // Explicit `namespace="local"` so the write lands in the
+                // same namespace the server's audit `EventStore` handle is
+                // scoped to at construction (`Namespace::local()`), matching
+                // `find_audit_event_with_request_id`'s read scope.
+                ops: "stats(namespace=\"local\")".to_string(),
+                request_id: Some(9001),
+                ..Default::default()
+            }))
+            .await
+            .expect("request() must succeed via local dispatch under KHIVE_NO_DAEMON");
+
+        let store = server
+            .event_store()
+            .expect("in-memory runtime must configure an EventStore");
+        let matched = find_audit_event_with_request_id(&store, 9001).await;
+        assert!(
+            matched.is_some(),
+            "KHIVE_NO_DAEMON local dispatch must stamp request_id onto the persisted \
+             audit event"
+        );
+
+        clear_daemon_env();
+    }
+
+    /// khive#948: the `save_to` bypass (MCP-AUD-002) also routes through
+    /// `dispatch_request_wire`'s local dispatch — this proves the id
+    /// survives that path too.
+    #[tokio::test]
+    #[serial]
+    async fn request_save_to_bypass_preserves_request_id_in_audit_event() {
+        clear_daemon_env();
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::env::set_var("KHIVE_SAVE_TO_ROOT", dir.path());
+
+        let server = make_daemon_save_to_test_server();
+        let sink_path = dir.path().join("out.jsonl");
+        server
+            .request(Parameters(RequestParams {
+                ops: "stats(namespace=\"local\")".to_string(),
+                save_to: Some(sink_path.to_string_lossy().to_string()),
+                request_id: Some(9002),
+                ..Default::default()
+            }))
+            .await
+            .expect("request() with save_to must succeed");
+
+        let store = server
+            .event_store()
+            .expect("in-memory runtime must configure an EventStore");
+        let matched = find_audit_event_with_request_id(&store, 9002).await;
+        assert!(
+            matched.is_some(),
+            "save_to local-dispatch bypass must stamp request_id onto the persisted \
+             audit event"
+        );
+
+        clear_daemon_env();
+        std::env::remove_var("KHIVE_SAVE_TO_ROOT");
+    }
+
     async fn connect_when_daemon_ready(sock: &std::path::Path) {
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
@@ -2290,6 +2521,7 @@ mod tests {
                 save_to: Some(sink_path.to_string_lossy().to_string()),
                 format: None,
                 format_per_op: None,
+                request_id: None,
             }))
             .await
             .expect("request with save_to must succeed even with a warm daemon reachable");
@@ -2371,6 +2603,7 @@ mod tests {
                 save_to: None,
                 format: None,
                 format_per_op: None,
+                request_id: None,
             })
             .await
             .expect("baseline stats() must succeed");
@@ -2383,6 +2616,7 @@ mod tests {
                 save_to: None,
                 format: None,
                 format_per_op: None,
+                request_id: None,
             }))
             .await;
 
@@ -2410,6 +2644,7 @@ mod tests {
                 save_to: None,
                 format: None,
                 format_per_op: None,
+                request_id: None,
             })
             .await
             .expect("post-request stats() must succeed");
@@ -2420,6 +2655,176 @@ mod tests {
         );
 
         let _ = tokio::time::timeout(std::time::Duration::from_secs(2), fake_handle).await;
+        clear_daemon_env();
+    }
+
+    // ── #947 Medium regression: strict fallback lands as a per-op envelope ──
+    //
+    // Before this fix, `request()` returned `forward_or_spawn`'s strict-mode
+    // rejection as a raw `Err(McpError)`, bypassing the per-op `{ok, tool,
+    // result/error}` / `summary` wire contract every other failure mode goes
+    // through. This drives `request()` end to end with a genuinely
+    // unreachable daemon under `KHIVE_DAEMON_STRICT=1` and asserts: (1) the
+    // response is `Ok(envelope_json)`, never an RPC error; (2) each shape
+    // (single op, parallel batch, chain) reports the fallback reason as a
+    // normal failed-op `error`, with chain aborting the remaining ops exactly
+    // like a real op failure would (`run_parsed`'s `Chain` arm); (3) summary
+    // counts match `results`; and (4) none of the ops ever ran locally (a
+    // `stats()` snapshot taken via the trusted `dispatch_request_local` path
+    // is unchanged after all three calls).
+    #[tokio::test]
+    #[serial]
+    async fn request_strict_fallback_lands_as_failed_op_envelope_not_rpc_error() {
+        clear_daemon_env();
+        crate::daemon::reset_fallback_counters();
+        let dir = tempfile::tempdir().expect("tempdir");
+        // Never bound by anything in this test — the daemon is genuinely
+        // unreachable, exactly like `daemon::forward_or_spawn_strict_mode_errors_when_daemon_unreachable`.
+        std::env::set_var("KHIVE_SOCKET", dir.path().join("khived.sock"));
+        std::env::set_var("KHIVE_PID", dir.path().join("khived.pid"));
+        std::env::set_var("KHIVE_LOCK", dir.path().join("khived.recovery.lock"));
+        std::env::remove_var("KHIVE_NO_DAEMON");
+        std::env::set_var("KHIVE_DAEMON_STRICT", "1");
+
+        let config = RuntimeConfig {
+            db_path: None,
+            default_namespace: Namespace::parse("test").unwrap(),
+            embedding_model: None,
+            additional_embedding_models: vec![],
+            packs: vec!["kg".to_string(), "comm".to_string()],
+            ..RuntimeConfig::default()
+        };
+        let runtime = KhiveRuntime::new(config).expect("in-memory runtime");
+        let server = KhiveMcpServer::new(runtime).expect("server builds with kg + comm");
+
+        let baseline = server
+            .dispatch_request_local(RequestParams {
+                ops: "stats()".to_string(),
+                presentation: None,
+                presentation_per_op: None,
+                save_to: None,
+                format: None,
+                format_per_op: None,
+                request_id: None,
+            })
+            .await
+            .expect("baseline stats() must succeed");
+
+        fn assert_fallback_error(entry: &Value, tool: &str) {
+            assert_eq!(entry["ok"], json!(false), "entry: {entry}");
+            assert_eq!(entry["tool"], json!(tool), "entry: {entry}");
+            let msg = entry["error"].as_str().expect("error must be a string");
+            assert!(
+                msg.contains("KHIVE_DAEMON_STRICT"),
+                "error must name the strict mode that rejected the fallback: {msg}"
+            );
+            assert!(
+                msg.contains("no_socket"),
+                "error must name the fallback reason: {msg}"
+            );
+        }
+
+        // ── single op ──────────────────────────────────────────────────────
+        let single_resp = server
+            .request(Parameters(RequestParams {
+                ops: "comm.send(to=\"bob\", content=\"strict-single-probe\")".to_string(),
+                presentation: None,
+                presentation_per_op: None,
+                save_to: None,
+                format: None,
+                format_per_op: None,
+                request_id: None,
+            }))
+            .await
+            .expect("strict fallback must land as a normal Ok(envelope), not Err(McpError)");
+        let single: Value =
+            serde_json::from_str(&single_resp).expect("response must be the request envelope");
+        assert_eq!(
+            single["results"].as_array().expect("results array").len(),
+            1
+        );
+        assert_fallback_error(&single["results"][0], "comm.send");
+        assert_eq!(
+            single["summary"],
+            json!({ "total": 1, "succeeded": 0, "failed": 1, "aborted": 0 })
+        );
+
+        // ── parallel batch ─────────────────────────────────────────────────
+        let batch_resp = server
+            .request(Parameters(RequestParams {
+                ops: "[comm.send(to=\"bob\", content=\"strict-batch-1\"), \
+                       comm.send(to=\"bob\", content=\"strict-batch-2\")]"
+                    .to_string(),
+                presentation: None,
+                presentation_per_op: None,
+                save_to: None,
+                format: None,
+                format_per_op: None,
+                request_id: None,
+            }))
+            .await
+            .expect("strict fallback must land as a normal Ok(envelope), not Err(McpError)");
+        let batch: Value =
+            serde_json::from_str(&batch_resp).expect("response must be the request envelope");
+        let batch_results = batch["results"].as_array().expect("results array");
+        assert_eq!(batch_results.len(), 2);
+        for entry in batch_results {
+            assert_fallback_error(entry, "comm.send");
+        }
+        assert_eq!(
+            batch["summary"],
+            json!({ "total": 2, "succeeded": 0, "failed": 2, "aborted": 0 })
+        );
+
+        // ── chain (must abort remaining ops per the wire contract) ─────────
+        let chain_resp = server
+            .request(Parameters(RequestParams {
+                ops: "comm.send(to=\"bob\", content=\"strict-chain-1\") | \
+                      comm.send(to=\"bob\", content=\"strict-chain-2\")"
+                    .to_string(),
+                presentation: None,
+                presentation_per_op: None,
+                save_to: None,
+                format: None,
+                format_per_op: None,
+                request_id: None,
+            }))
+            .await
+            .expect("strict fallback must land as a normal Ok(envelope), not Err(McpError)");
+        let chain: Value =
+            serde_json::from_str(&chain_resp).expect("response must be the request envelope");
+        let chain_results = chain["results"].as_array().expect("results array");
+        assert_eq!(chain_results.len(), 2);
+        assert_fallback_error(&chain_results[0], "comm.send");
+        assert_eq!(
+            chain_results[1],
+            json!({ "ok": false, "tool": "comm.send", "aborted": true })
+        );
+        assert_eq!(
+            chain["summary"],
+            json!({ "total": 2, "succeeded": 0, "failed": 1, "aborted": 1 })
+        );
+
+        // ── no local dispatch ever happened for any of the three calls ─────
+        let after = server
+            .dispatch_request_local(RequestParams {
+                ops: "stats()".to_string(),
+                presentation: None,
+                presentation_per_op: None,
+                save_to: None,
+                format: None,
+                format_per_op: None,
+                request_id: None,
+            })
+            .await
+            .expect("post-request stats() must succeed");
+        assert_eq!(
+            after, baseline,
+            "no comm.send op must ever have run locally under strict-mode fallback \
+             rejection — a local dispatch would mutate local state here"
+        );
+
+        crate::daemon::reset_fallback_counters();
         clear_daemon_env();
     }
 }

@@ -243,7 +243,7 @@ mod tests {
             let tick = b.record_failure();
             assert!(tick.step <= max);
             assert!(tick.delay >= tick.step.min(max));
-            // internal review round 1 finding: the post-jitter delay must never exceed
+            // The post-jitter delay must never exceed
             // `max`, even once `step` itself has saturated at `max` (an
             // unclamped 25% jitter window on a capped 600s step would reach
             // 750s otherwise).

@@ -460,8 +460,8 @@ pub struct GraphPath {
 }
 
 /// Which of a would-be edge's two endpoints were missing when a guarded
-/// write's in-transaction existence check refused it (#769 round-2 codex
-/// Medium 1). Produced by the guard's own commit-time probe, not a
+/// write's in-transaction existence check refused it (#769). Produced by
+/// the guard's own commit-time probe, not a
 /// post-hoc read after the write already failed, so a concurrent
 /// hard-delete landing after the guard ran cannot make this outcome lie
 /// about which endpoint was actually missing at write time.

@@ -45,7 +45,7 @@ impl KgPack {
                 )?;
                 let validated_et: Option<String> = if let Some(ref raw_et) = p.entity_type {
                     if let Some(ref kf) = kind_filter {
-                        validate_entity_type(kf, Some(raw_et))?
+                        validate_entity_type(kf, Some(raw_et), registry)?
                     } else {
                         let norm = raw_et.trim().to_ascii_lowercase();
                         Some(norm)

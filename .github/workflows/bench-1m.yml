@@ -66,6 +66,7 @@ jobs:
   ann-ci-gate:
     name: ANN structural regression gate (synthetic, hermetic)
     runs-on: ubuntu-latest
+    timeout-minutes: 20
 
     # BLOCKING: this gate must not be bypassed. Structural ANN regression
     # (recall collapse, broken build) must block the PR. Infra failures
@@ -120,6 +121,7 @@ jobs:
   bench-1m-sift:
     name: Vamana SIFT-1M scale-proof (banked, manual)
     runs-on: ubuntu-latest
+    timeout-minutes: 180
 
     # This job is workflow_dispatch-only (see 'on' triggers above, which do
     # not include pull_request/push for this job path). It runs gracefully

@@ -31,7 +31,7 @@ pub trait GraphStore: Send + Sync + 'static {
     /// probe — never reconstructed by a caller re-reading the endpoints after
     /// the write already failed, since a concurrent write landing between the
     /// refusal and any such later read could misreport which endpoint was
-    /// actually missing at write time (round-2 codex Medium 1).
+    /// actually missing at write time.
     ///
     /// Default returns `StorageError::Unsupported`: a backend that does not
     /// override this method cannot honor the endpoint-existence guarantee,

@@ -2,14 +2,14 @@
 
 ## ADR Compliance
 
-### ADR-002: Edge Ontology (17 edge relations — closed set; 15 base + 2 epistemic via ADR-055)
+### Edge Ontology (17 edge relations — closed set; 15 base + 2 epistemic via ADR-055) (ADR-002)
 
 - The GTD pack does NOT add new edge relation variants; `depends_on` is already in the base set.
 - The pack additively extends the _endpoint contract_ to allow `depends_on` between two `task`
   notes (base contract restricts it to entity→entity). This is pack-extensible per ADR-017 rules.
 - Edge relation enum remains closed; packs may only extend endpoint pairs, not add new relations.
 
-### ADR-004: NoteKindSpec lifecycle declaration
+### NoteKindSpec lifecycle declaration (ADR-004)
 
 - `GtdPack` declares a `NoteKindSpec` for the `task` note kind.
 - Lifecycle field is named `kind_status` (NOT `status`) to avoid semantic collision with
@@ -20,7 +20,7 @@
   This is intentional and differs from the original ADR-019 draft which considered reopen semantics.
   The no-reopen rule is authoritative; use `gtd.assign` to create a new task instead.
 
-### ADR-017: Pack Standard (Pack trait, `EDGE_RULES`, pack-extensible edge endpoints)
+### Pack Standard (Pack trait, `EDGE_RULES`, pack-extensible edge endpoints) (ADR-017)
 
 - `GtdPack` implements the `Pack` trait and `PackRuntime` trait.
 - Declares vocabulary via constants: `NOTE_KINDS`, `ENTITY_KINDS`, `HANDLERS`, `EDGE_RULES`,
@@ -30,7 +30,7 @@
 - `EDGE_RULES` contains one rule: `depends_on` between two `task` notes (task→task).
 - Endpoint rules are additive only — this pack cannot tighten the base contract.
 
-### ADR-019: GTD lifecycle contract
+### GTD lifecycle contract (ADR-019)
 
 - Five verbs: `gtd.assign`, `gtd.next`, `gtd.complete`, `gtd.tasks`, `gtd.transition`.
 - Lifecycle states: `inbox → next | waiting | someday | active | done | cancelled`.
@@ -42,7 +42,7 @@
 - `depends_on` property stores UUIDs of blocking tasks; `gtd.next` excludes tasks whose
   blockers are not in `done` state (scenario-gtd C2).
 
-### ADR-025: Illocutionary verb classification (Searle 1976)
+### Illocutionary verb classification (Searle 1976) (ADR-025)
 
 - `gtd.assign` → Directive (directs an actor to perform work)
 - `gtd.next` → Assertive (retrieves actionable task state)
@@ -50,20 +50,20 @@
 - `gtd.complete` → Declaration (changes task institutional status to terminal)
 - `gtd.transition` → Declaration (changes task lifecycle status by fiat)
 
-### ADR-027: Inventory self-registration
+### Inventory self-registration (ADR-027)
 
 - `GtdPack` self-registers via `inventory::submit!` so it can be loaded dynamically from
   the pack registry by name (`"gtd"`) without a hard compile-time dependency in the MCP binary.
 - Requires `"kg"` pack as a dependency (`REQUIRES = &["kg"]`).
 
-### ADR-019: Non-propagating after_create failures
+### Non-propagating after_create failures (ADR-019)
 
 - If `depends_on` edge creation fails after the task note is successfully written,
   the error is logged and swallowed. A `properties["depends_on"]` key captures the same
   dependency information for queries that bypass the graph layer.
 - This avoids misleading the caller with `ok: false` for a task that is already on disk.
 
-### ADR-017: Pack-extensible edge rule for task blockers
+### Pack-extensible edge rule for task blockers (ADR-017)
 
 - The GTD pack's `EDGE_RULES` extends the base `depends_on` endpoint contract to allow
   task-note→task-note links (ADR-017 Pack Standard §"Pack-extensible edge endpoints").

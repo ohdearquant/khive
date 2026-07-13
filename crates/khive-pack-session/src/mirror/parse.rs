@@ -816,7 +816,7 @@ mod tests {
 
     #[test]
     fn test_codex_user_message_input_text_block() {
-        // Regression for Finding 1: real Codex user messages use `input_text` blocks.
+        // Regression: real Codex user messages use `input_text` blocks.
         let line = codex_user_msg("Hello Codex");
         let ev = parse_codex_line(&line, CDX_SID, 128).expect("user message should parse");
         assert_eq!(ev.session_id, CDX_SID);
@@ -830,7 +830,7 @@ mod tests {
 
     #[test]
     fn test_codex_assistant_message_output_text_block() {
-        // Regression for Finding 1: real Codex assistant messages use `output_text` blocks.
+        // Regression: real Codex assistant messages use `output_text` blocks.
         let line = codex_asst_msg("Hello from assistant");
         let ev = parse_codex_line(&line, CDX_SID, 256).expect("assistant message should parse");
         assert_eq!(ev.role.as_deref(), Some("assistant"));

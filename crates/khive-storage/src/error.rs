@@ -108,6 +108,22 @@ pub enum StorageError {
         "KHIVE_WRITE_QUEUE=1 but no Tokio runtime context is available to spawn the writer task"
     )]
     WriterTaskNoRuntime,
+
+    /// A filesystem-backed capability (e.g. `BlobStore`) refused a write
+    /// because `volume`'s available space, after accounting for the pending
+    /// write, would drop below the configured free-space floor. Carries the
+    /// floor and the volume so callers can surface a precise message without
+    /// re-deriving them (khive#292).
+    #[error(
+        "refusing write on {capability:?} at {volume}: {available_bytes} bytes available, \
+         below the {floor_bytes}-byte floor"
+    )]
+    CapacityFloor {
+        capability: StorageCapability,
+        volume: String,
+        available_bytes: u64,
+        floor_bytes: u64,
+    },
 }
 
 impl StorageError {
@@ -134,7 +150,8 @@ impl StorageError {
             | Self::Unsupported { capability, .. }
             | Self::Serialization { capability, .. }
             | Self::IndexMaintenance { capability, .. }
-            | Self::Driver { capability, .. } => Some(*capability),
+            | Self::Driver { capability, .. }
+            | Self::CapacityFloor { capability, .. } => Some(*capability),
             Self::Pool { .. }
             | Self::Timeout { .. }
             | Self::Transaction { .. }
@@ -165,7 +182,7 @@ impl StorageError {
     /// same `Driver` variant for a malformed MATCH expression *and* for a
     /// genuine backend outage (pool exhaustion, connection failure, reader
     /// open failure) — treating every `Err` as degradable turns a real outage
-    /// into a silently-empty "successful" search (issue #389 round-2 High).
+    /// into a silently-empty "successful" search (issue #389).
     ///
     /// SQLite's FTS5 query parser (`sqlite3Fts5ParseError`, fts5_expr.c)
     /// prefixes every message it emits with the literal `"fts5: "` token —
@@ -338,7 +355,7 @@ mod tests {
 
     #[test]
     fn unprefixed_detail_message_is_not_classified_as_syntax_error() {
-        // Round-3 High: a driver message containing the detail-mode substring
+        // A driver message containing the detail-mode substring
         // WITHOUT the `fts5: ` parser prefix is not from the FTS5 query
         // parser — must propagate, not degrade.
         let e = driver_err(

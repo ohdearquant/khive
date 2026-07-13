@@ -437,8 +437,8 @@ fn resolve_command(exec: Option<String>, command: Option<Command>) -> Command {
 /// include `"schedule"`. The caller threads this through
 /// `khive_mcp::serve::serve_server` so the daemon-resident tick loop
 /// (`spawn_schedule_tick_loop_if_daemon`) drains the exact backend this
-/// coordinator-attached boot resolved, never a re-derived config (codex PR
-/// #782 review, High finding).
+/// coordinator-attached boot resolved, never a re-derived config (PR
+/// #782).
 fn build_multi_backend_server_with_coordinator(
     base_cfg: RuntimeConfig,
     khive_cfg: &KhiveConfig,
@@ -904,7 +904,7 @@ mod tests {
 
     #[test]
     fn exec_shortcut_flag_like_ops_binds_as_ops_not_as_exec_flag() {
-        // Regression for the round-1 review finding: without the `--` separator
+        // Regression: without the `--` separator
         // in the synthetic argv, `-e '--pending-events'` reparsed as exec's
         // `--pending-events` FLAG (running the pending-event drain with no ops)
         // instead of binding as the OPS value.
@@ -1048,7 +1048,7 @@ mod tests {
         );
     }
 
-    /// internal review round 1 (#613) finding: the two sibling tests above never configure
+    /// #613: the two sibling tests above never configure
     /// a non-default output format, so `output_format` parity was vacuous —
     /// both paths landing on the built-in `Json` default would pass even if one
     /// path silently dropped `apply_env_output_format(khive_cfg.runtime.default_output_format)`
@@ -1069,7 +1069,7 @@ mod tests {
         // original value (or leaves it removed) on drop — including on panic, so
         // a failing assertion or an unexpected constructor error never leaks the
         // cleared env var to later #[serial] tests. Mirrors `EmailEnvGuard` in
-        // `khive-mcp/src/serve.rs` (round 2 of the #603 internal review, PR #613:
+        // `khive-mcp/src/serve.rs` (#603, PR #613:
         // the prior manual save/clear/restore only ran on the success path).
         struct OutputFormatEnvGuard {
             prev: Option<String>,
@@ -1251,6 +1251,7 @@ mod tests {
                         save_to: None,
                         format: None,
                         format_per_op: None,
+                        request_id: None,
                     })
                     .await
                     .expect("dispatch must not error");

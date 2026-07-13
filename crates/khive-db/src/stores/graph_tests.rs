@@ -2,7 +2,7 @@ use super::*;
 use crate::pool::PoolConfig;
 use khive_storage::types::{Direction, TraversalOptions};
 use serial_test::serial;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 /// Deterministic barrier at the exact insert-to-probe seam
 /// [`edge_insert_guarded`] calls into (via `#[cfg(test)] hook(...)`) after a
@@ -280,7 +280,7 @@ async fn test_neighbors_outbound() {
     assert!(!neighbor_ids.contains(&d));
 }
 
-/// Regression guard (ADR-089 context-verb review, internal review round 1, High-1): a
+/// Regression guard (ADR-089 context-verb review): a
 /// `limit` narrower than the neighbor set must keep the highest-weight edges,
 /// not an arbitrary SQLite row-order subset. Before the fix, `neighbors()`
 /// applied `LIMIT` with no `ORDER BY`, so a low-weight neighbor could win over
@@ -583,7 +583,7 @@ async fn test_neighbors_both_directions_halves_storage_query_count() {
     );
 }
 
-/// Reciprocal equal-weight determinism (internal review round 2, High): a
+/// Reciprocal equal-weight determinism: a
 /// node with an Out edge to a neighbor and an In edge from the SAME neighbor
 /// at the SAME weight ties on `(weight, node_id)` — the pre-fix `ORDER BY`.
 /// Under a tight `limit`, the surviving row must be picked by a deterministic
@@ -1407,6 +1407,120 @@ fn single_neighbour_set(hits: &[NeighborHit]) -> HashSet<Uuid> {
     hits.iter().map(|h| h.node_id).collect()
 }
 
+fn neighbor_edge_multiset(hits: &[(Uuid, NeighborHit)]) -> HashMap<(Uuid, Uuid), usize> {
+    let mut grouped = HashMap::new();
+    for (origin, hit) in hits {
+        *grouped.entry((*origin, hit.edge_id)).or_default() += 1;
+    }
+    grouped
+}
+
+#[tokio::test]
+async fn batch_neighbors_keeps_exact_rows_grouped_by_requested_node() {
+    let store = setup_memory_store();
+    let root_a = Uuid::new_v4();
+    let root_b = Uuid::new_v4();
+    let root_without_edges = Uuid::new_v4();
+    let joined = make_edge(root_a, root_b, EdgeRelation::Extends, 0.9);
+    let self_loop = make_edge(root_b, root_b, EdgeRelation::DependsOn, 0.8);
+    let joined_id = Uuid::from(joined.id);
+    let self_loop_id = Uuid::from(self_loop.id);
+    for edge in [joined, self_loop] {
+        store.upsert_edge(edge).await.unwrap();
+    }
+
+    let sources = [root_a, root_b, root_without_edges];
+    let outgoing_hits = store
+        .batch_neighbors(
+            &sources,
+            NeighborQuery {
+                direction: Direction::Out,
+                relations: None,
+                limit: None,
+                min_weight: None,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        neighbor_edge_multiset(&outgoing_hits),
+        HashMap::from([((root_a, joined_id), 1), ((root_b, self_loop_id), 1),])
+    );
+
+    let incoming_hits = store
+        .batch_neighbors(
+            &sources,
+            NeighborQuery {
+                direction: Direction::In,
+                relations: None,
+                limit: None,
+                min_weight: None,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        neighbor_edge_multiset(&incoming_hits),
+        HashMap::from([((root_b, joined_id), 1), ((root_b, self_loop_id), 1),])
+    );
+
+    let both_hits = store
+        .batch_neighbors(
+            &sources,
+            NeighborQuery {
+                direction: Direction::Both,
+                relations: None,
+                limit: None,
+                min_weight: None,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        neighbor_edge_multiset(&both_hits),
+        HashMap::from([
+            ((root_a, joined_id), 1),
+            ((root_b, joined_id), 1),
+            ((root_b, self_loop_id), 2),
+        ])
+    );
+    assert!(
+        both_hits
+            .iter()
+            .all(|(origin, _)| *origin != root_without_edges),
+        "the requested zero-edge root must not acquire another root's rows"
+    );
+}
+
+#[tokio::test]
+async fn batch_neighbors_preserves_duplicate_requested_sources() {
+    let store = setup_memory_store();
+    let root = Uuid::new_v4();
+    let target = Uuid::new_v4();
+    let edge = make_edge(root, target, EdgeRelation::Extends, 1.0);
+    let edge_id = Uuid::from(edge.id);
+    store.upsert_edge(edge).await.unwrap();
+
+    let hits = store
+        .batch_neighbors(
+            &[root, root],
+            NeighborQuery {
+                direction: Direction::Out,
+                relations: None,
+                limit: None,
+                min_weight: None,
+            },
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        neighbor_edge_multiset(&hits),
+        HashMap::from([((root, edge_id), 2)]),
+        "the optimized override must match the trait default's per-occurrence output"
+    );
+}
+
 /// PARITY REGRESSION GUARD — the critical bug (HIGH).
 /// For Direction::Both + limit=Some(1), batch_neighbors must return AT MOST
 /// `limit` hits per source, not up to 2× (one per direction).
@@ -1829,14 +1943,9 @@ async fn get_edges_chunk_boundary() {
 
 /// batch_neighbors Direction::Both chunk-boundary test.
 ///
-/// With the old const CHUNK=880, Direction::Both would bind ~1761 variables
-/// (1 ns + 880 out_srcs + 880 in_srcs) into a single SQLite statement,
-/// blowing past SQLITE_MAX_VARIABLE_NUMBER=999 and returning an error.
-///
-/// This test uses 500 source nodes — enough that a single Both chunk would
-/// have exceeded 999 variables under the old constant.  After the fix the
-/// computed chunk_size for Both (no filters, no limit) is ~474, so the 500
-/// sources are split into two chunks, each staying within budget.
+/// Source IDs are bound once as a JSON array, so Direction::Both does not
+/// duplicate one SQL parameter per source for each UNION arm. This test crosses
+/// the 880-source chunk boundary and verifies that grouping remains exact.
 ///
 /// Correctness: for a random sample of sources, batch result must equal the
 /// per-source neighbors() result.
@@ -1846,8 +1955,8 @@ async fn get_edges_chunk_boundary() {
 async fn batch_neighbors_both_chunk_boundary() {
     let store = setup_memory_store();
 
-    // Create 500 source nodes, each with one outgoing and one incoming edge.
-    let source_count = 500usize;
+    // Create 900 source nodes, each with one outgoing and one incoming edge.
+    let source_count = 900usize;
     let mut sources: Vec<Uuid> = Vec::with_capacity(source_count);
     for _ in 0..source_count {
         let centre = Uuid::new_v4();
@@ -2553,7 +2662,7 @@ async fn traverse_max_depth_over_i64max_rejected() {
 /// the `KHIVE_WRITE_QUEUE` env var — that env var is process-global and this
 /// crate's other tests are NOT `#[serial]` against it, so a window where it
 /// is set here could leak into a concurrently-scheduled test's own pool
-/// construction (ADR-067 Fork C slice 2 round 2, LOW finding).
+/// construction (ADR-067 Component A).
 #[tokio::test]
 async fn upsert_edges_routes_through_writer_task_when_flag_enabled() {
     let dir = tempfile::tempdir().unwrap();
@@ -2872,7 +2981,7 @@ async fn upsert_edges_guarded_writes_nothing_when_one_endpoint_vanishes() {
     }
 }
 
-/// Round-4/-5 codex Medium: on the flag-off, file-backed singleton fallback
+/// On the flag-off, file-backed singleton fallback
 /// (`SqlGraphStore::with_writer`'s `is_file_backed` branch, no `WriterTask`),
 /// `upsert_edge_guarded` must run its guarded `INSERT` and, when refused,
 /// the missing-endpoint probe inside ONE `BEGIN IMMEDIATE` transaction —
@@ -2880,10 +2989,10 @@ async fn upsert_edges_guarded_writes_nothing_when_one_endpoint_vanishes() {
 /// interleave between, recreating the endpoint after the insert was
 /// refused but before the probe explains why.
 ///
-/// Round-5 sabotage-verified that a purely timing-based version of this
+/// Sabotage-verified that a purely timing-based version of this
 /// test (sleeps guessing when the guarded call was "probably" parked on
-/// the write lock, then "probably" holding it) still passed with the
-/// round-5 transaction wrapping removed: a refused, zero-row `INSERT`
+/// the write lock, then "probably" holding it) still passed with
+/// the transaction wrapping removed: a refused, zero-row `INSERT`
 /// autocommits — and so releases the write lock — before the guarded
 /// call's Rust code even returns from it, and the probe that follows is a
 /// plain `SELECT`, which never blocks on a writer in WAL mode. The two

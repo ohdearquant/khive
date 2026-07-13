@@ -52,8 +52,8 @@ use std::sync::{Arc, Mutex};
 use khive_storage::{AtomicUnitOp, SqlAccess, SqlStatement, SqlWriter, StorageError};
 
 use crate::atomic_plan::{
-    AffectedRowGuard, DeletePlan, GovernancePlan, GtdCompletePlan, GtdTransitionPlan, LinkPlan,
-    MergePlan, PlanStatement, PostCommitEffect, UpdatePlan,
+    AddEntityPlan, AddNotePlan, AffectedRowGuard, DeletePlan, GovernancePlan, GtdCompletePlan,
+    GtdTransitionPlan, LinkPlan, MergePlan, PlanStatement, PostCommitEffect, UpdatePlan,
 };
 
 /// One admissible op's prepared write plan (ADR-099 D3's v1 admissible verb
@@ -64,6 +64,8 @@ use crate::atomic_plan::{
 /// (`post_commit_effect`).
 #[derive(Debug, Clone)]
 pub enum AtomicOpPlan {
+    AddEntity(AddEntityPlan),
+    AddNote(AddNotePlan),
     Update(UpdatePlan),
     Delete(DeletePlan),
     Link(LinkPlan),
@@ -84,6 +86,8 @@ impl AtomicOpPlan {
     /// variant already carries a flat `Vec<PlanStatement>` in apply order.
     fn plan_statements(&self) -> Vec<PlanStatement> {
         match self {
+            AtomicOpPlan::AddEntity(p) => p.statements.clone(),
+            AtomicOpPlan::AddNote(p) => p.statements.clone(),
             AtomicOpPlan::Update(p) => p.statements.clone(),
             AtomicOpPlan::Delete(p) => p.statements.clone(),
             AtomicOpPlan::Link(p) => vec![p.statement.clone()],
@@ -108,10 +112,10 @@ impl AtomicOpPlan {
     /// The deferred post-commit effect this op's plan recorded, if any.
     ///
     /// [`UpdatePlan`] carries a [`PostCommitEffect`] field for the `update`
-    /// reindex caveat (ADR-099 D3). Since the B3 fix round (GAP-5),
+    /// reindex caveat (ADR-099 D3). Under B3 (GAP-5),
     /// [`GtdTransitionPlan`]/[`GtdCompletePlan`] also carry one, for the
-    /// best-effort lifecycle audit row. Since the #750 fix-round 2 (codex
-    /// r2 High 2), [`DeletePlan`] also carries one, for the note-mutation
+    /// best-effort lifecycle audit row. Since #750, [`DeletePlan`] also
+    /// carries one, for the note-mutation
     /// hook fire on a committed note delete. Every other admissible verb's
     /// apply is pure DML with no deferred side effect. `merge`'s existing
     /// post-transaction vector re-insert (D3: "merge already performs its
@@ -120,6 +124,12 @@ impl AtomicOpPlan {
     /// carries no `post_commit` field, so this runner records none for it.
     fn post_commit_effect(&self) -> Option<PostCommitEffect> {
         match self {
+            AtomicOpPlan::AddEntity(p) if p.post_commit != PostCommitEffect::None => {
+                Some(p.post_commit.clone())
+            }
+            AtomicOpPlan::AddNote(p) if p.post_commit != PostCommitEffect::None => {
+                Some(p.post_commit.clone())
+            }
             AtomicOpPlan::Update(p) if p.post_commit != PostCommitEffect::None => {
                 Some(p.post_commit.clone())
             }

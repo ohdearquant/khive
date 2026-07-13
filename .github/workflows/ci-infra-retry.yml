@@ -1,0 +1,155 @@
+name: CI infra retry
+
+# Retry only a first-attempt CI failure on a trusted main push when every
+# failing leaf job died in runner setup before repository code ran. Code/test
+# failures are deliberately excluded: a green retry must not hide a flake.
+# If matrix fail-fast cancelled a sibling, rerun the whole workflow so that
+# cancellation cannot leave main red after the failed job recovers.
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [main]
+
+permissions:
+  actions: write
+  contents: read
+
+concurrency:
+  group: ci-infra-retry-${{ github.event.workflow_run.id }}
+  cancel-in-progress: false
+
+jobs:
+  retry-failed-jobs:
+    name: Retry first-attempt infrastructure failures
+    if: >-
+      github.event.workflow_run.event == 'push' &&
+      github.event.workflow_run.conclusion == 'failure' &&
+      github.event.workflow_run.head_branch == 'main' &&
+      github.event.workflow_run.run_attempt == 1
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Inspect failed jobs and retry setup-only failures once
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+        run: |
+          set -euo pipefail
+
+          api_version="2026-03-10"
+          run_json="$(gh api \
+            -H "X-GitHub-Api-Version: ${api_version}" \
+            "repos/${REPOSITORY}/actions/runs/${RUN_ID}")"
+          attempt="$(jq -r '.run_attempt' <<<"$run_json")"
+          if [ "$attempt" != "1" ]; then
+            echo "Run ${RUN_ID} is attempt ${attempt}; retry budget is exhausted."
+            exit 0
+          fi
+
+          jobs_json="$(gh api \
+            -H "X-GitHub-Api-Version: ${api_version}" \
+            "repos/${REPOSITORY}/actions/runs/${RUN_ID}/attempts/${attempt}/jobs?per_page=100")"
+
+          # CI gate is an aggregate consequence, not a leaf failure. An
+          # infrastructure-shaped leaf has no steps, or exactly one failed
+          # internal "Set up job" step. Any repository/action step failure
+          # makes this run ineligible for automatic recovery.
+          failed_count="$(jq '[
+            .jobs[]
+            | select(.conclusion == "failure" and .name != "CI gate")
+          ] | length' <<<"$jobs_json")"
+          infra_count="$(jq '[
+            .jobs[]
+            | select(.conclusion == "failure" and .name != "CI gate")
+            | select(
+                ((.steps // []) | length) == 0
+                or (
+                  ((.steps // []) | length) == 1
+                  and .steps[0].name == "Set up job"
+                  and .steps[0].conclusion == "failure"
+                )
+              )
+          ] | length' <<<"$jobs_json")"
+          gate_failed_count="$(jq '[
+            .jobs[]
+            | select(.conclusion == "failure" and .name == "CI gate")
+          ] | length' <<<"$jobs_json")"
+          gate_infra_count="$(jq '[
+            .jobs[]
+            | select(.conclusion == "failure" and .name == "CI gate")
+            | select(
+                ((.steps // []) | length) == 0
+                or (
+                  ((.steps // []) | length) == 1
+                  and .steps[0].name == "Set up job"
+                  and .steps[0].conclusion == "failure"
+                )
+              )
+          ] | length' <<<"$jobs_json")"
+          cancelled_count="$(jq '[
+            .jobs[]
+            | select(.conclusion == "cancelled" and .name != "CI gate")
+          ] | length' <<<"$jobs_json")"
+          failed_names="$(jq -r '[
+            .jobs[]
+            | select(.conclusion == "failure")
+            | .name
+          ] | join(", ")' <<<"$jobs_json")"
+          infra_names="$(jq -r '[
+            .jobs[]
+            | select(.conclusion == "failure")
+            | select(
+                ((.steps // []) | length) == 0
+                or (
+                  ((.steps // []) | length) == 1
+                  and .steps[0].name == "Set up job"
+                  and .steps[0].conclusion == "failure"
+                )
+              )
+            | .name
+          ] | join(", ")' <<<"$jobs_json")"
+
+          # A normally failing CI gate only reflects a failed dependency and
+          # is ignored. If it is the sole failure and itself dies in setup,
+          # however, it is the infrastructure failure that needs recovery.
+          eligible=false
+          if [ "$failed_count" -gt 0 ] \
+            && [ "$failed_count" -eq "$infra_count" ]; then
+            eligible=true
+          elif [ "$failed_count" -eq 0 ] \
+            && [ "$gate_failed_count" -gt 0 ] \
+            && [ "$gate_failed_count" -eq "$gate_infra_count" ]; then
+            eligible=true
+          fi
+
+          if [ "$eligible" != true ]; then
+            {
+              echo "### CI infra retry: no automatic retry"
+              echo
+              echo "Run ${RUN_ID} had ${failed_count} failed leaf job(s), ${infra_count} setup-only leaf failure(s), ${gate_infra_count}/${gate_failed_count} setup-only CI gate failure(s), and ${cancelled_count} cancelled leaf job(s)."
+              echo "Failed jobs: ${failed_names:-none}."
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          if [ "$cancelled_count" -eq 0 ]; then
+            rerun_endpoint="rerun-failed-jobs"
+            rerun_scope="failed jobs"
+          else
+            # GitHub's failed-jobs endpoint does not include jobs cancelled by
+            # matrix fail-fast. A full rerun restores that lost sibling lane.
+            rerun_endpoint="rerun"
+            rerun_scope="the full workflow (${cancelled_count} cancelled leaf job(s))"
+          fi
+
+          gh api --method POST \
+            -H "X-GitHub-Api-Version: ${api_version}" \
+            "repos/${REPOSITORY}/actions/runs/${RUN_ID}/${rerun_endpoint}"
+          {
+            echo "### CI infra retry requested"
+            echo
+            echo "Re-running ${rerun_scope} for run ${RUN_ID} after setup-only failure(s): ${infra_names}."
+          } >> "$GITHUB_STEP_SUMMARY"

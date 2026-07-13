@@ -1199,7 +1199,7 @@ async fn test_thread_verb_returns_threaded_messages() {
     );
 }
 
-// ── High 1 regression: reply() delivers inbound copy alongside the outbound copy ─
+// ── reply() delivers inbound copy alongside the outbound copy ────────────────
 
 /// reply() must write both an outbound copy and an inbound copy within the same namespace.
 ///
@@ -1253,7 +1253,7 @@ async fn test_reply_delivers_inbound_to_recipient() {
         .expect("count field");
     assert!(
         count_after >= 2,
-        "High-1 regression: reply() must deliver an inbound copy; \
+        "reply() must deliver an inbound copy; \
          inbox count={count_after} (expected >= 2)"
     );
 
@@ -1268,12 +1268,12 @@ async fn test_reply_delivers_inbound_to_recipient() {
             .and_then(|p| p.get("direction"))
             .and_then(|v| v.as_str())
             == Some("inbound")),
-        "High-1 regression: all inbox items must have direction=inbound; \
+        "all inbox items must have direction=inbound; \
          got {inbox_after}"
     );
 }
 
-// ── High 3 regression: thread() rejects nonexistent or non-message root ────────
+// ── thread() rejects nonexistent or non-message root ─────────────────────────
 
 /// thread(id=X) with a nonexistent UUID must return an error, not a silent empty result.
 /// Before the fix, thread() accepted any resolvable UUID and returned Ok with count=0.
@@ -1289,7 +1289,7 @@ async fn test_thread_rejects_nonexistent_root() {
 
     assert!(
         result.is_err(),
-        "High-3 regression: thread() with nonexistent root UUID must return an error; \
+        "thread() with nonexistent root UUID must return an error; \
          got ok with result={result:?}"
     );
 }
@@ -1337,13 +1337,13 @@ async fn test_thread_rejects_non_message_root() {
 
     assert!(
         result.is_err(),
-        "High-3 regression: thread() with non-message root must return an error; \
+        "thread() with non-message root must return an error; \
          got ok with result={result:?}"
     );
     let err = result.unwrap_err().to_string();
     assert!(
         err.contains("message") || err.contains("kind"),
-        "High-3: error must mention 'message' or 'kind'; got {err}"
+        "error must mention 'message' or 'kind'; got {err}"
     );
 }
 
@@ -1425,7 +1425,7 @@ async fn test_inbox_paginated_scan_finds_message_beyond_prefetch_window() {
     );
 }
 
-// ── Round-3 regressions: inbox limit schema + invalid status ────────────────
+// ── Regressions: inbox limit schema + invalid status ────────────────
 
 /// inbox(limit=200) must succeed — 200 is the documented and enforced maximum.
 #[tokio::test]
@@ -2719,7 +2719,7 @@ async fn t5_recipient_inbox_sees_message() {
     );
 }
 
-// T5b — ADR-057: comm.reply always writes same-namespace (Fix 1, internal review Critical #2).
+// T5b — ADR-057: comm.reply always writes same-namespace.
 //
 // Reply on a configured-actor setup proves the fail-closed reply path: after the fix,
 // handle_reply ALWAYS passes caller_ns as both `from` and `to` to dual_write_message
@@ -4220,7 +4220,7 @@ async fn ingest_routing_no_default_falls_back_to_to_field() {
     );
 }
 
-// ── Finding 2: X-Khive-Thread-ID header correlation (thread-UUID fallback) ───
+// ── X-Khive-Thread-ID header correlation (thread-UUID fallback) ───
 //
 // When our own outbound email carries X-Khive-Thread-ID = <thread_uuid>, a reply
 // that preserves that header arrives with correlation_external_id = <thread_uuid>.
@@ -4295,13 +4295,13 @@ async fn ingest_routing_reply_via_thread_uuid_routes_to_original_sender() {
     assert_eq!(
         props["to_actor"].as_str(),
         Some("lambda:khive"),
-        "Finding 2: reply correlating via thread-UUID must route to lambda:khive \
+        "reply correlating via thread-UUID must route to lambda:khive \
          (original sender's actor); got props={props}"
     );
     assert_eq!(
         props["thread_id"].as_str(),
         Some(thread_uuid.as_str()),
-        "Finding 2: ingested reply must be attached to the original thread_id; \
+        "ingested reply must be attached to the original thread_id; \
          got props={props}"
     );
 }
@@ -4591,9 +4591,9 @@ async fn ingest_omits_wire_references_when_absent() {
     );
 }
 
-// --- issue #403 finding 1: References must carry the full ancestor chain ---
+// --- issue #403: References must carry the full ancestor chain ---
 //
-// The round-1 review flagged that References was set from the single
+// The prior implementation set References from the single
 // `in_reply_to` value, dropping any ancestors before the immediate parent.
 // These tests assert the exact serialized References/In-Reply-To values
 // (not just presence) for each required case.
@@ -4800,7 +4800,7 @@ async fn reply_dedups_tainted_parent_references_chain_containing_parent_id() {
     );
 }
 
-// --- issue #448 Finding 2: quarantine metadata must survive comm.ingest persistence ---
+// --- issue #448: quarantine metadata must survive comm.ingest persistence ---
 
 /// A quarantined envelope (as `EmailChannel::quarantine_envelope` builds it, ADR-056
 /// Amendment 2026-07-02) must persist its `quarantined`/`quarantine_reason`/
@@ -5579,6 +5579,109 @@ async fn health_channel_entry_never_carries_a_healthy_bool() {
     );
 }
 
+/// khive #877: `comm.health` must read `channel_health` rows from the
+/// caller's injected namespace (`token.namespace()`), not the fixed
+/// `khive_pack_comm::CHANNEL_HEALTH_NAMESPACE` constant. Plants one row
+/// directly under `"local"` and one directly under a non-local `"tenant-a"`
+/// namespace (bypassing `comm.heartbeat`, which still always writes to
+/// `"local"` — this test exercises the read path only). An unscoped call
+/// defaults to `"local"` and must see only the local row; a call with an
+/// explicit `namespace="tenant-a"` must see only tenant-a's row, never
+/// local's. Also asserts the response's `namespace` field (khive #877)
+/// names the namespace actually read for both the unscoped and the
+/// explicitly-scoped call, so a caller can tell "no daemon anywhere" apart
+/// from "no rows under my scope yet" instead of the two cases being
+/// indistinguishable client-role/empty-channels responses.
+#[tokio::test]
+async fn health_scoped_to_injected_namespace_sees_only_its_own_rows() {
+    use khive_storage::note::Note;
+
+    let (registry, rt) = build_registry_for_ns("local");
+
+    let plant = |ns: &'static str, slug: &'static str| {
+        let rt = rt.clone();
+        async move {
+            let token = rt
+                .authorize(khive_runtime::Namespace::parse(ns).expect("valid namespace"))
+                .expect("authorize namespace");
+            let store = rt.notes(&token).expect("notes store");
+            let now = chrono::Utc::now().timestamp_micros();
+            let note = Note {
+                id: uuid::Uuid::new_v4(),
+                namespace: ns.to_string(),
+                kind: "channel_health".to_string(),
+                status: "active".to_string(),
+                name: Some(format!("email:{slug}")),
+                content: format!("channel heartbeat: email:{slug}"),
+                salience: None,
+                decay_factor: None,
+                expires_at: None,
+                properties: Some(serde_json::json!({
+                    "channel_kind": "email",
+                    "channel_slug": slug,
+                    "last_success_at": chrono::Utc::now().to_rfc3339(),
+                    "last_poll_attempt_at": chrono::Utc::now().to_rfc3339(),
+                    "last_failure_at": null,
+                    "last_error": null,
+                    "consecutive_failures": 0,
+                })),
+                created_at: now,
+                updated_at: now,
+                deleted_at: None,
+            };
+            store
+                .upsert_note(note)
+                .await
+                .expect("upsert channel_health note");
+        }
+    };
+    plant("local", "local-inbox@example.com").await;
+    plant("tenant-a", "tenant-a-inbox@example.com").await;
+
+    let default_health = registry
+        .dispatch("comm.health", serde_json::json!({}))
+        .await
+        .expect("unscoped health succeeds");
+    let default_channels = default_health["channels"].as_array().expect("array");
+    assert_eq!(
+        default_channels.len(),
+        1,
+        "unscoped comm.health must default to the local namespace: {default_channels:?}"
+    );
+    assert_eq!(
+        default_channels[0]["channel_slug"].as_str(),
+        Some("local-inbox@example.com")
+    );
+    assert_eq!(
+        default_health["namespace"].as_str(),
+        Some("local"),
+        "response must echo the namespace actually read, defaulting to local: {default_health}"
+    );
+
+    let scoped_health = registry
+        .dispatch(
+            "comm.health",
+            serde_json::json!({ "namespace": "tenant-a" }),
+        )
+        .await
+        .expect("namespace-scoped health succeeds");
+    let scoped_channels = scoped_health["channels"].as_array().expect("array");
+    assert_eq!(
+        scoped_channels.len(),
+        1,
+        "a call scoped to tenant-a must see only tenant-a's row, not local's: {scoped_channels:?}"
+    );
+    assert_eq!(
+        scoped_channels[0]["channel_slug"].as_str(),
+        Some("tenant-a-inbox@example.com")
+    );
+    assert_eq!(
+        scoped_health["namespace"].as_str(),
+        Some("tenant-a"),
+        "response must echo the explicitly-scoped namespace, not local: {scoped_health}"
+    );
+}
+
 // ── #493: comm.inbox from_actor / from_prefix sender filter ─────────────────
 
 /// A single actor namespace receives messages from two distinct senders;
@@ -5972,7 +6075,7 @@ async fn insert_thread_message(
         .expect("insert message");
 }
 
-/// codex r1 (#494 re-review): two physical messages that share the exact same
+/// #494: two physical messages that share the exact same
 /// microsecond `created_at` (e.g. what an ADR-057 dual-write self-send can
 /// produce) must not be skipped or duplicated around an id cursor — the cursor
 /// filter and sort must compare the full `(created_at, full_id)` tuple, not
@@ -6037,7 +6140,7 @@ async fn t494_thread_after_id_cursor_ties_on_equal_created_at_no_skip_no_dup() {
     );
 }
 
-/// codex r1 (#494 re-review): an `after` timestamp cursor must be parsed to
+/// #494: an `after` timestamp cursor must be parsed to
 /// microseconds (not compared as a raw string) so non-canonical but valid RFC
 /// 3339 forms — whole-second `Z`, or an explicit `+00:00` offset — compare
 /// correctly against khive's canonical microsecond timestamps.
@@ -6089,7 +6192,7 @@ async fn t494_thread_after_timestamp_cursor_accepts_noncanonical_rfc3339() {
     }
 }
 
-/// codex r1 (#494 re-review): an `after` value that is neither a resolvable
+/// #494: an `after` value that is neither a resolvable
 /// message id nor a parseable RFC 3339 timestamp must fail loudly, never be
 /// silently coerced into "no cursor" (which would return the whole thread).
 #[tokio::test]
@@ -6123,7 +6226,7 @@ async fn t494_thread_after_invalid_string_is_hard_error() {
     );
 }
 
-/// codex r1 (#494 re-review): `order="desc"` combined with an id `after` cursor
+/// #494: `order="desc"` combined with an id `after` cursor
 /// must filter against the DESC sequence, not always `created_at >`. "After" in
 /// desc order means further along the desc traversal, i.e. strictly older.
 #[tokio::test]

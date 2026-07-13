@@ -222,8 +222,8 @@ struct ReindexReport {
     /// Note FTS upserts that failed during the backfill pass.
     notes_fts_failed: u64,
     /// True when the completion ("settled") durable memory-ANN epoch bump
-    /// failed after entity/note mutations were already committed (#812
-    /// review REQUEST CHANGES HIGH — crash safety). The start-of-pass bump
+    /// failed after entity/note mutations were already committed (#812). The
+    /// start-of-pass bump
     /// (`begin_reindex_epoch`) aborts the whole run before any mutation on
     /// failure, so there is nothing left to "abort" here — but a swallowed
     /// failure at this point is exactly the bug this fix closes, so it now
@@ -651,8 +651,8 @@ pub async fn run_reindex(args: ReindexArgs) -> Result<()> {
         // `global::memory_vamana::*`; old per-ns rows are orphaned and waste space.
         purge_stale_memory_vamana_snapshots(&rt).await;
 
-        // Invalidate the ACTIVE global memory Vamana snapshot too (#812 review
-        // re-confirm HIGH-A defense in depth). Its key (`global::memory_vamana::*`)
+        // Invalidate the ACTIVE global memory Vamana snapshot too (#812).
+        // Its key (`global::memory_vamana::*`)
         // never matched `invalidate_vamana_snapshots`'s `{namespace}::vamana::%`
         // pattern above, so the note re-embed this pass just did left that
         // snapshot installed and untouched — the content-hash restart check in
@@ -661,7 +661,7 @@ pub async fn run_reindex(args: ReindexArgs) -> Result<()> {
         // very next warm regardless, without depending on that check alone.
         //
         // This also performs the completion ("settled") durable epoch bump
-        // (#812 review REQUEST CHANGES HIGH) — see its own doc comment for
+        // (#812); see its own doc comment for
         // why a failure here is reported rather than warned-and-ignored.
         epoch_bump_failed = !invalidate_active_memory_vamana_snapshot(&rt).await;
 
@@ -875,7 +875,7 @@ async fn purge_stale_memory_vamana_snapshots(rt: &KhiveRuntime) {
 }
 
 /// Durably mark the reindex-in-progress epoch, before ANY vector mutation in
-/// this pass (#812 review REQUEST CHANGES HIGH — crash safety). The previous
+/// this pass (#812). The previous
 /// design bumped the durable epoch only as a best-effort step AFTER every
 /// vector mutation had already committed (see
 /// `invalidate_active_memory_vamana_snapshot`'s completion bump below); a
@@ -915,7 +915,7 @@ async fn begin_reindex_epoch(rt: &KhiveRuntime) -> Result<()> {
 
 /// Delete the ACTIVE global memory Vamana snapshot row (`global::memory_vamana::*`),
 /// distinct from `purge_stale_memory_vamana_snapshots`'s legacy-row cleanup above
-/// (#812 review re-confirm HIGH-A defense in depth). Reindex rewrites note
+/// (#812). Reindex rewrites note
 /// embeddings directly, bypassing `memory.remember`, so it never bumps the memory
 /// pack's in-memory write-generation counter — that daemon-side signal simply
 /// cannot see this change. The DELETE itself stays best-effort (a missing table
@@ -964,7 +964,7 @@ async fn invalidate_active_memory_vamana_snapshot(rt: &KhiveRuntime) -> bool {
         }
     }
 
-    // #812 review REQUEST CHANGES HIGH: the completion half of the
+    // #812: the completion half of the
     // in-progress/completed epoch protocol described on `begin_reindex_epoch`.
     // A khive daemon that warmed its in-memory ANN index before this reindex
     // ran shares no process, and therefore no in-memory write-generation
@@ -1399,8 +1399,8 @@ mod tests {
         );
     }
 
-    /// Reviewer-requested regression test (#812 review re-confirm HIGH-A
-    /// defense in depth): the active global memory Vamana snapshot row must
+    /// Regression test (#812): the active global memory Vamana snapshot row
+    /// must
     /// be deleted by `invalidate_active_memory_vamana_snapshot`, since
     /// `invalidate_vamana_snapshots`'s `{namespace}::vamana::%` pattern never
     /// matches the memory pack's distinct `global::memory_vamana::*` key.
@@ -2163,7 +2163,7 @@ mod tests {
 
     // Regression: run_reindex with no embedding model must still populate FTS for
     // pre-existing notes. Guards against reintroduction of the early-return that
-    // skipped the FTS pass when model_names was empty (round-1 fix).
+    // skipped the FTS pass when model_names was empty.
     #[tokio::test]
     async fn run_reindex_populates_fts_without_embedding_model() {
         use khive_storage::types::TextFilter;

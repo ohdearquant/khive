@@ -13,7 +13,7 @@ use rusqlite::OptionalExtension;
 use crate::error::SqliteError;
 use crate::pool::{ConnectionPool, PoolConfig};
 use crate::sql_bridge::SqlBridge;
-use crate::stores::{entity, event, graph, note, sparse, text, vectors};
+use crate::stores::{blob, entity, event, graph, note, sparse, text, vectors};
 
 /// Concrete storage backend providing capability traits.
 pub struct StorageBackend {
@@ -24,7 +24,7 @@ pub struct StorageBackend {
     /// executed against this backend's pool. Gates `notes_for_namespace` so
     /// the repair (a full `notes` scan) runs at most once per backend for
     /// the process's lifetime instead of on every store acquisition (khive
-    /// #827 round 4 perf finding). Also exposed via
+    /// #827). Also exposed via
     /// `notes_seq_repair_run_count` for regression tests.
     notes_seq_repair_runs: AtomicUsize,
 }
@@ -232,7 +232,7 @@ impl StorageBackend {
         // access to the single writer connection for this whole function,
         // so this load-then-run-then-store is race-free: no other caller on
         // this pool can observe or advance `notes_seq_repair_runs` while we
-        // hold the writer guard (khive #827 round 4 perf finding).
+        // hold the writer guard (khive #827).
         if self.notes_seq_repair_runs.load(Ordering::Relaxed) == 0 {
             note::repair_notes_seq(writer.conn())?;
             self.notes_seq_repair_runs.fetch_add(1, Ordering::Relaxed);
@@ -247,8 +247,7 @@ impl StorageBackend {
     /// How many times the lazy `notes_seq` anti-join repair has actually
     /// executed against this backend's pool. Exposed for regression tests
     /// asserting the repair runs at most once per backend for the process's
-    /// lifetime, not once per `notes_for_namespace` call (khive #827 round 4
-    /// perf finding).
+    /// lifetime, not once per `notes_for_namespace` call (khive #827).
     pub fn notes_seq_repair_run_count(&self) -> usize {
         self.notes_seq_repair_runs.load(Ordering::Relaxed)
     }
@@ -572,6 +571,23 @@ impl StorageBackend {
             self.is_file_backed,
             table_key.to_string(),
         )))
+    }
+
+    /// Get a `BlobStore` rooted per khive#292's precedence chain:
+    /// `KHIVE_BLOB_ROOT` env var > `config_root` (a caller-resolved
+    /// `khive.toml` override — `khive-db` has no TOML parser of its own) >
+    /// beside this backend's database directory. `floor_bytes` overrides the
+    /// default 100 GB fail-closed free-space floor (`None` keeps the
+    /// default). Errors if none of the three roots apply — e.g. an in-memory
+    /// backend with no override and no env var has nowhere to default to.
+    pub fn blob_store(
+        &self,
+        config_root: Option<&Path>,
+        floor_bytes: Option<u64>,
+    ) -> Result<Arc<dyn khive_storage::BlobStore>, SqliteError> {
+        let root = blob::resolve_blob_root(self.data_dir().as_deref(), config_root)?;
+        let floor = floor_bytes.unwrap_or(blob::FsBlobStore::DEFAULT_FLOOR_BYTES);
+        Ok(Arc::new(blob::FsBlobStore::new(root, floor)?))
     }
 
     /// Is this a file-backed backend?
@@ -1014,6 +1030,51 @@ mod tests {
             result.is_err(),
             "upsert_document on a read-only backend must reject, not silently no-op"
         );
+    }
+
+    #[tokio::test]
+    async fn blob_store_roundtrip_via_public_api() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("blob_backend.db");
+        let backend = StorageBackend::sqlite(&path).unwrap();
+
+        // Explicit floor_bytes=0, not the default 100GB — the free space on
+        // whatever volume runs this test is not this test's concern (and a
+        // dev machine or CI runner legitimately may not clear 100GB free).
+        let store = backend.blob_store(None, Some(0)).unwrap();
+        let bytes = b"backend-level blob roundtrip".to_vec();
+        let content_ref = store.put(bytes.clone()).await.unwrap();
+        assert_eq!(store.get(&content_ref).await.unwrap(), bytes);
+    }
+
+    #[test]
+    fn blob_store_defaults_root_beside_db_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("blob_default.db");
+        let backend = StorageBackend::sqlite(&path).unwrap();
+
+        // `blob_store` creates the root directory eagerly (`FsBlobStore::new`),
+        // so its existence at the expected default path is directly
+        // observable without reaching into the trait object.
+        let _store = backend.blob_store(None, None).unwrap();
+        assert!(
+            dir.path().join("blobs").is_dir(),
+            "default root must be created beside the database file"
+        );
+    }
+
+    #[test]
+    fn blob_store_errors_for_in_memory_backend_with_no_override() {
+        let backend = StorageBackend::memory().unwrap();
+        assert!(backend.blob_store(None, None).is_err());
+    }
+
+    #[test]
+    fn blob_store_accepts_explicit_root_for_in_memory_backend() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = StorageBackend::memory().unwrap();
+        let store = backend.blob_store(Some(dir.path()), None);
+        assert!(store.is_ok());
     }
 
     #[test]

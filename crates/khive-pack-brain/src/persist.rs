@@ -324,7 +324,7 @@ pub struct BrainMutationEvent {
 /// `state` mutex) built via a snapshot round-trip. Its result and the
 /// resulting snapshot are then persisted — brain event-log append AND
 /// snapshot upsert — as ONE atomic unit via `SqlAccess::atomic_unit`
-/// (ADR-067 Component A, Fork C slice 2 round 2). Only after that unit
+/// (ADR-067 Component A, Fork C slice 2). Only after that unit
 /// commits does the proposed state replace the live state and the tracker
 /// get marked clean.
 ///
@@ -1368,7 +1368,7 @@ mod braincore_aud_001_capacity {
         assert!(result.is_ok(), "in-capacity snapshot must load cleanly");
     }
 
-    /// PR #535 internal review round 2 finding 2: a persisted snapshot with `{A, B}`
+    /// PR #535: a persisted snapshot with `{A, B}`
     /// entity_posteriors, `entity_posterior_order = [A]`, and an EXPLICIT
     /// `entity_posteriors_version = 0` must be rejected at the
     /// `load_latest_snapshot` boundary rather than silently normalized by
@@ -1489,7 +1489,7 @@ mod braincore_aud_001_capacity {
     }
 }
 
-// ── ADR-067 Fork C slice 2 round 2 (BLOCKER B): persist_brain_state_mutation
+// ── ADR-067 Fork C slice 2: persist_brain_state_mutation
 // write-queue routing ──────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -1498,7 +1498,7 @@ mod persist_write_queue_routing {
     use khive_brain_core::BrainState;
     use khive_runtime::{KhiveRuntime, Namespace};
 
-    /// Fork C slice 2 round 2 (BLOCKER B): proves `persist_brain_state_mutation`
+    /// Fork C slice 2: proves `persist_brain_state_mutation`
     /// — after its conversion from a manual `BEGIN IMMEDIATE`/`COMMIT` sequence
     /// to the `SqlAccess::atomic_unit` seam — is actually enqueued on the
     /// pool's shared `WriterTaskHandle` channel when the write queue is

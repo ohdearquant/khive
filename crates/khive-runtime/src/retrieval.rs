@@ -2,6 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 
+use lattice_embed::EmbeddingModel;
 use uuid::Uuid;
 
 use crate::config::{parse_embedding_model_alias, sanitize_key};
@@ -132,10 +133,9 @@ impl KhiveRuntime {
 
     /// Embed a query string for retrieval using the named model.
     ///
-    /// Applies `EmbeddingService::embed_query`, which prepends the model's
-    /// `query_instruction()` prefix when defined (e.g. `"query: "` for
-    /// multilingual-e5). For models with no query prefix (MiniLM, BGE) this
-    /// is identical to [`Self::embed_with_model`].
+    /// Applies the pre-0.6 query-role behavior. E5 and Qwen models retain
+    /// their query instructions, while BGE and custom providers receive the
+    /// original unprefixed query text.
     ///
     /// Use this for all search/recall/suggest query embedding paths so that
     /// instruction-tuned models land in the correct side of their retrieval
@@ -149,10 +149,15 @@ impl KhiveRuntime {
     ) -> RuntimeResult<Vec<f32>> {
         let model = parse_embedding_model_alias(model_name);
         let service = self.embedder(model_name).await?;
+        let texts = [text.to_string()];
         let emb_model = model.unwrap_or_default();
-        service
-            .embed_query(&[text.to_string()], emb_model)
-            .await?
+        let embeddings = match emb_model {
+            EmbeddingModel::BgeSmallEnV15
+            | EmbeddingModel::BgeBaseEnV15
+            | EmbeddingModel::BgeLargeEnV15 => service.embed(&texts, emb_model).await?,
+            _ => service.embed_query(&texts, emb_model).await?,
+        };
+        embeddings
             .into_iter()
             .next()
             .ok_or_else(|| RuntimeError::Internal("embed_query returned empty vec".into()))
@@ -265,8 +270,8 @@ impl KhiveRuntime {
 
     /// Embed a batch of queries for retrieval using the named model.
     ///
-    /// Applies `EmbeddingService::embed_query`. Use for bulk query-side
-    /// operations where multiple queries need instruction-tuned prefixing.
+    /// Applies the same pre-0.6 query-role compatibility behavior as
+    /// [`Self::embed_query_with_model`].
     ///
     /// Returns `UnknownModel` if `model_name` is not registered.
     pub async fn embed_query_batch_with_model(
@@ -280,7 +285,12 @@ impl KhiveRuntime {
         let model = parse_embedding_model_alias(model_name);
         let service = self.embedder(model_name).await?;
         let emb_model = model.unwrap_or_default();
-        Ok(service.embed_query(texts, emb_model).await?)
+        match emb_model {
+            EmbeddingModel::BgeSmallEnV15
+            | EmbeddingModel::BgeBaseEnV15
+            | EmbeddingModel::BgeLargeEnV15 => Ok(service.embed(texts, emb_model).await?),
+            _ => Ok(service.embed_query(texts, emb_model).await?),
+        }
     }
 
     /// Search vectors using either a caller-provided embedding or query text.
@@ -1297,7 +1307,8 @@ mod tests {
     /// `hybrid_search` must not hard-fail on a query containing FTS5 metacharacters
     /// like `$` (e.g. the DSL doc query `$prev.id`). `sanitize_fts5_query` (khive-db)
     /// strips `$`, so this exercises the sanitizer path and takes the `Ok` arm; see
-    /// `hybrid_search_with_residual_fts5_char_fails_loud` below for the fail-loud arm.
+    /// `hybrid_search_with_residual_fts5_char_now_sanitized` below for the character
+    /// class #916 closed (previously the fail-loud arm, prior to #916).
     #[tokio::test]
     async fn hybrid_search_with_dollar_sign_query_does_not_error() {
         let rt = KhiveRuntime::memory().unwrap();
@@ -1325,13 +1336,16 @@ mod tests {
         );
     }
 
-    /// Unlike `$`, `@` is NOT stripped by `sanitize_fts5_query` (the sanitizer stays
-    /// minimal by design). SQLite FTS5's bareword parser still rejects `@`
-    /// unconditionally, so this query reaches the runtime-level `Err` arm in
-    /// `hybrid_search`, which must fail loud (`RuntimeError::InvalidInput`) instead
-    /// of silently degrading to vector-only fusion.
+    /// #916: `@` was previously NOT stripped by `sanitize_fts5_query` and SQLite
+    /// FTS5's bareword parser rejected it unconditionally, so this query used to
+    /// reach the runtime-level fail-loud arm (`RuntimeError::InvalidInput`, #569).
+    /// `sanitize_fts5_token_group`'s bareword-safety gate now recognizes `@` (and
+    /// every other ASCII punctuation character not already handled) as unsafe for
+    /// an unquoted bareword position and routes it through the quoted-phrase
+    /// alternative instead, which FTS5 accepts literally, so the query
+    /// now succeeds and finds the seeded content rather than erroring.
     #[tokio::test]
-    async fn hybrid_search_with_residual_fts5_char_fails_loud() {
+    async fn hybrid_search_with_residual_fts5_char_now_sanitized() {
         let rt = KhiveRuntime::memory().unwrap();
         let tok = NamespaceToken::local();
         rt.create_entity(
@@ -1350,16 +1364,76 @@ mod tests {
             .hybrid_search(&tok, "foo@bar", None, 10, None, None, &[], None)
             .await;
 
+        let hits = result.unwrap_or_else(|e| {
+            panic!("#916 hybrid_search must not fail on an '@'-bearing query, got: {e:?}")
+        });
         assert!(
-            result.is_err(),
-            "#569 hybrid_search must fail loud when the FTS leg errors on a residual \
-             FTS5 char ('@'), not silently degrade to vector-only fusion, got: {:?}",
-            result.ok()
+            !hits.is_empty(),
+            "#916 '@'-bearing query must still find the seeded 'foo@bar' content via the \
+             quoted-phrase alternative"
         );
-        assert!(
-            matches!(result.unwrap_err(), RuntimeError::InvalidInput(_)),
-            "residual FTS5 parser failure must surface as RuntimeError::InvalidInput"
-        );
+    }
+
+    /// #916 end-to-end regression, using the exact character classes from the
+    /// issue's live-log evidence (`#682 Stage 2`, `Min-K%Prob`, `B=128`):
+    /// `hybrid_search`'s FTS leg must not lose its lexical signal to a parser
+    /// syntax error on `#`, `%`, or `=`. Each query below must both succeed
+    /// and actually surface a `Text`/`Both`-sourced hit, proving the FTS leg
+    /// contributed, not just that the vector leg papered over a degraded
+    /// text leg.
+    #[tokio::test]
+    async fn hybrid_search_with_916_issue_characters_finds_text_leg_hits() {
+        let rt = KhiveRuntime::memory().unwrap();
+        let tok = NamespaceToken::local();
+
+        rt.create_entity(
+            &tok,
+            "concept",
+            None,
+            "issue tracker",
+            Some("tracking #682 Stage 2: MoE expert-cache prefetch work"),
+            None,
+            vec![],
+        )
+        .await
+        .unwrap();
+        rt.create_entity(
+            &tok,
+            "concept",
+            None,
+            "benchmark notes",
+            Some("chunkwise B=128 traffic arithmetic simdgroup_matrix DPLR"),
+            None,
+            vec![],
+        )
+        .await
+        .unwrap();
+        rt.create_entity(
+            &tok,
+            "concept",
+            None,
+            "sampling notes",
+            Some("evaluated with the Min-K%Prob membership inference method"),
+            None,
+            vec![],
+        )
+        .await
+        .unwrap();
+
+        for query in ["#682 Stage 2", "B=128", "Min-K%Prob"] {
+            let result = rt
+                .hybrid_search(&tok, query, None, 10, None, None, &[], None)
+                .await;
+            let hits = result.unwrap_or_else(|e| {
+                panic!("#916 hybrid_search must not fail on query {query:?}, got: {e:?}")
+            });
+            assert!(
+                hits.iter()
+                    .any(|h| matches!(h.source, SearchSource::Text | SearchSource::Both)),
+                "#916 query {query:?} must surface a Text/Both-sourced hit \
+                 (the FTS leg must contribute, not just the vector leg); got {hits:?}"
+            );
+        }
     }
 
     // ---- predicate pushdown before truncation ----
@@ -1496,6 +1570,140 @@ mod tests {
     }
 
     // ---- embed intent tests ----
+
+    struct CapturingEmbeddingService {
+        captured: std::sync::Arc<std::sync::Mutex<Vec<Vec<String>>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl EmbeddingService for CapturingEmbeddingService {
+        async fn embed(
+            &self,
+            texts: &[String],
+            _model: EmbeddingModel,
+        ) -> std::result::Result<Vec<Vec<f32>>, lattice_embed::EmbedError> {
+            self.captured.lock().unwrap().push(texts.to_vec());
+            Ok(texts.iter().map(|_| vec![1.0]).collect())
+        }
+
+        fn supports_model(&self, _model: EmbeddingModel) -> bool {
+            true
+        }
+
+        fn name(&self) -> &'static str {
+            "capturing-embedding-service"
+        }
+    }
+
+    struct CapturingEmbedderProvider {
+        name: String,
+        captured: std::sync::Arc<std::sync::Mutex<Vec<Vec<String>>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl EmbedderProvider for CapturingEmbedderProvider {
+        fn name(&self) -> &str {
+            &self.name
+        }
+
+        fn dimensions(&self) -> usize {
+            1
+        }
+
+        async fn build(&self) -> crate::error::RuntimeResult<std::sync::Arc<dyn EmbeddingService>> {
+            Ok(std::sync::Arc::new(CapturingEmbeddingService {
+                captured: std::sync::Arc::clone(&self.captured),
+            }))
+        }
+    }
+
+    fn runtime_with_capturing_embedder(
+        model: EmbeddingModel,
+    ) -> (
+        KhiveRuntime,
+        std::sync::Arc<std::sync::Mutex<Vec<Vec<String>>>>,
+    ) {
+        let runtime = KhiveRuntime::memory().unwrap();
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        runtime.register_embedder(CapturingEmbedderProvider {
+            name: model.to_string(),
+            captured: std::sync::Arc::clone(&captured),
+        });
+        (runtime, captured)
+    }
+
+    #[tokio::test]
+    async fn bge_query_paths_pass_raw_unprefixed_text() {
+        const BGE_QUERY_INSTRUCTION: &str =
+            "Represent this sentence for searching relevant passages: ";
+        let single = "single raw query";
+        let batch = vec![
+            "first raw query".to_string(),
+            "second raw query".to_string(),
+        ];
+
+        for model in [
+            EmbeddingModel::BgeSmallEnV15,
+            EmbeddingModel::BgeBaseEnV15,
+            EmbeddingModel::BgeLargeEnV15,
+        ] {
+            let (runtime, captured) = runtime_with_capturing_embedder(model);
+            runtime
+                .embed_query_with_model(&model.to_string(), single)
+                .await
+                .unwrap();
+            runtime
+                .embed_query_batch_with_model(&model.to_string(), &batch)
+                .await
+                .unwrap();
+
+            let calls = captured.lock().unwrap().clone();
+            assert_eq!(
+                calls,
+                vec![vec![single.to_string()], batch.clone()],
+                "{model} must receive raw query text through single and batch paths"
+            );
+            assert!(
+                calls
+                    .iter()
+                    .flatten()
+                    .all(|text| !text.contains(BGE_QUERY_INSTRUCTION)),
+                "{model} must not receive the BGE retrieval instruction"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn e5_query_paths_apply_query_prefix() {
+        let model = EmbeddingModel::MultilingualE5Small;
+        let single = "single raw query";
+        let batch = vec![
+            "first raw query".to_string(),
+            "second raw query".to_string(),
+        ];
+        let (runtime, captured) = runtime_with_capturing_embedder(model);
+
+        runtime
+            .embed_query_with_model(&model.to_string(), single)
+            .await
+            .unwrap();
+        runtime
+            .embed_query_batch_with_model(&model.to_string(), &batch)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            captured.lock().unwrap().as_slice(),
+            [
+                vec!["query: single raw query".to_string()],
+                vec![
+                    "query: first raw query".to_string(),
+                    "query: second raw query".to_string(),
+                ],
+            ],
+            "E5 must receive its query prefix through single and batch paths"
+        );
+    }
 
     #[test]
     #[ignore = "loads ~80 MB model; run with --include-ignored"]

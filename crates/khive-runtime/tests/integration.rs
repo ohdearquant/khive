@@ -657,7 +657,7 @@ async fn explicit_limit_variants_against_501_matches() {
         at_cap.warnings
     );
 
-    // LIMIT below the cap: this is the reviewer's false-positive regression
+    // LIMIT below the cap: this is the false-positive regression
     // case (LIMIT above the requested value but under real matches would have
     // wrongly warned under the old requested-limit-only inference). Here the
     // requested LIMIT is under the cap, so it must never warn regardless of
@@ -1068,7 +1068,7 @@ async fn synthetic_edge_observed_as_selected_returns_memory_note() {
 }
 
 // =============================================================================
-// update_edge conflict handling regression tests (internal review round 3 H1)
+// update_edge conflict handling regression tests (H1)
 // =============================================================================
 
 /// Regression for Bug 1: when update_edge absorbs a conflict (the requested edge
@@ -1259,7 +1259,7 @@ async fn update_edge_canonical_orientation_conflict() {
 }
 
 // =============================================================================
-// Secret gate: structured-field bypass regression (#83 fix round)
+// Secret gate: structured-field bypass regression (#83)
 // =============================================================================
 
 #[tokio::test]
@@ -2614,7 +2614,7 @@ async fn create_note_annotates_target_in_visible_only_namespace_succeeds() {
 }
 
 // =============================================================================
-// Finding 5: hybrid_search cross-namespace Option B limitation documented + tested
+// hybrid_search cross-namespace Option B limitation documented and tested
 // =============================================================================
 
 /// Verifies that `hybrid_search` with a visible-set token returns entities from

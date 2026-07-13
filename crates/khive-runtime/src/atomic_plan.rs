@@ -111,7 +111,7 @@ impl AffectedRowGuard {
 /// atomic unit commits (ADR-099 D1, "post-commit pass"). v1's admissible set
 /// computes no embeddings during prepare (D3's `update`/`merge` caveat), so
 /// the only post-commit effects are reindex kicks computed from the
-/// **committed** row content — plus, since the B3 fix round (GAP-5), the
+/// **committed** row content, plus the GAP-5 addition under B3: the
 /// best-effort GTD lifecycle audit row.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PostCommitEffect {
@@ -124,7 +124,7 @@ pub enum PostCommitEffect {
     /// content (ADR-099 D3 `update` caveat: note name/content change).
     ReindexNote { note_id: Uuid },
     /// Append one `gtd_lifecycle_audit` row for a committed `gtd.transition`
-    /// or `gtd.complete` (B3 fix round GAP-5): canonical `handle_transition`/
+    /// or `gtd.complete` (ADR-099 B3, GAP-5): canonical `handle_transition`/
     /// `handle_complete` call `ensure_audit_schema` + `write_audit_record`
     /// (`khive-pack-gtd::handlers`) as a best-effort side write — a failed
     /// audit insert must never roll back an already-committed transition.
@@ -143,8 +143,8 @@ pub enum PostCommitEffect {
         namespace: String,
     },
     /// A committed note delete (soft or hard) — fire the pack-installed
-    /// note-mutation hook with the deleted note's kind (#750 fix-round 2,
-    /// codex r2 High 2: `DeletePlan` previously carried no `post_commit`
+    /// note-mutation hook with the deleted note's kind (#750:
+    /// `DeletePlan` previously carried no `post_commit`
     /// slot at all, so an atomic note delete never reached
     /// `KhiveRuntime::fire_note_mutation_hook`, unlike `operations.rs`'s
     /// `delete_note`, which fires it directly after a successful row
@@ -155,7 +155,7 @@ pub enum PostCommitEffect {
 }
 
 /// The natural key a committed symmetric edge update's surviving row must
-/// be looked up by (ADR-099 B3 r9, codex r8 Blocker finding 1, second
+/// be looked up by (ADR-099 B3, second
 /// half). `khive-db`'s `edge_symmetric_refresh_or_update_inplace_statement`
 /// pair never trusts a prepare-time-computed target id (see that builder's
 /// doc comment); a caller rendering this op's result derives the actual
@@ -196,6 +196,35 @@ pub struct UpdatePlan {
     pub edge_natural_key: Option<EdgeNaturalKey>,
 }
 
+/// Write plan for an `AddEntity` proposal change: a fresh entity row plus its
+/// FTS document in the same atomic unit. Vector indexing remains a deferred
+/// effect because embedding may suspend.
+#[derive(Debug, Clone)]
+pub struct AddEntityPlan {
+    /// The freshly generated id of the entity being created.
+    pub entity_id: Uuid,
+    /// Row + FTS insert statements to apply inside the atomic unit, in
+    /// order. The row-insert statement carries the existence guard; the
+    /// FTS-insert statement that follows it is unguarded (an ordinary
+    /// `INSERT` into a virtual table with no conflicting row).
+    pub statements: Vec<PlanStatement>,
+    /// Reindex the committed entity after the transaction closes.
+    pub post_commit: PostCommitEffect,
+}
+
+/// Write plan for an `AddNote` proposal change: a fresh note row plus its FTS
+/// document in the same atomic unit.
+#[derive(Debug, Clone)]
+pub struct AddNotePlan {
+    /// The freshly generated id of the note being created.
+    pub note_id: Uuid,
+    /// Row + FTS insert statements to apply inside the atomic unit, in
+    /// order, mirroring [`AddEntityPlan::statements`].
+    pub statements: Vec<PlanStatement>,
+    /// Reindex the committed note after the transaction closes.
+    pub post_commit: PostCommitEffect,
+}
+
 /// Write plan for a `delete` op (soft or hard).
 #[derive(Debug, Clone)]
 pub struct DeletePlan {
@@ -207,7 +236,7 @@ pub struct DeletePlan {
     /// delete only) is unguarded — it may legitimately affect zero rows if
     /// the target had no incident edges.
     pub statements: Vec<PlanStatement>,
-    /// Deferred note-mutation-hook fire, for a note delete (#750 fix-round
+    /// Deferred note-mutation-hook fire, for a note delete (#750
     /// 2). `PostCommitEffect::None` for entity and edge deletes — the hook
     /// system is note-only.
     pub post_commit: PostCommitEffect,
@@ -266,7 +295,7 @@ pub struct GtdTransitionPlan {
     /// round) — canonical performs no write in that case either
     /// (`handlers.rs:995-1005`).
     pub statements: Vec<PlanStatement>,
-    /// Deferred lifecycle audit row (GAP-5 fix round) — `PostCommitEffect::
+    /// Deferred lifecycle audit row (GAP-5): `PostCommitEffect::
     /// None` for the idempotent no-op case, matching canonical's early
     /// return before its own `ensure_audit_schema`/`write_audit_record`
     /// call.
@@ -282,7 +311,7 @@ pub struct GtdCompletePlan {
     /// validated the task was in a completable state); the `completed_at`
     /// write targets the same already-guarded row and is unguarded.
     pub statements: Vec<PlanStatement>,
-    /// Deferred lifecycle audit row (GAP-5 fix round) — mirrors
+    /// Deferred lifecycle audit row (GAP-5): mirrors
     /// `handle_complete`'s best-effort `write_audit_record` call.
     pub post_commit: PostCommitEffect,
 }
@@ -521,6 +550,46 @@ mod tests {
             assert_eq!(plan.op, op);
             assert!(plan.statements[0].guard.is_some());
         }
+    }
+
+    #[test]
+    fn add_entity_plan_guard_is_anchored_to_the_row_statement_not_the_fts_mirror() {
+        let id = Uuid::new_v4();
+        let plan = AddEntityPlan {
+            entity_id: id,
+            statements: vec![
+                guarded("entity-insert", AffectedRowGuard::exactly(1)),
+                unguarded("entity-fts-insert"),
+            ],
+            post_commit: PostCommitEffect::ReindexEntity { entity_id: id },
+        };
+        assert_eq!(plan.entity_id, id);
+        assert_eq!(plan.statements[0].guard, Some(AffectedRowGuard::exactly(1)));
+        assert_eq!(plan.statements[1].guard, None);
+        assert_eq!(
+            plan.post_commit,
+            PostCommitEffect::ReindexEntity { entity_id: id }
+        );
+    }
+
+    #[test]
+    fn add_note_plan_guard_is_anchored_to_the_row_statement_not_the_fts_mirror() {
+        let id = Uuid::new_v4();
+        let plan = AddNotePlan {
+            note_id: id,
+            statements: vec![
+                guarded("note-insert", AffectedRowGuard::exactly(1)),
+                unguarded("note-fts-insert"),
+            ],
+            post_commit: PostCommitEffect::ReindexNote { note_id: id },
+        };
+        assert_eq!(plan.note_id, id);
+        assert_eq!(plan.statements[0].guard, Some(AffectedRowGuard::exactly(1)));
+        assert_eq!(plan.statements[1].guard, None);
+        assert_eq!(
+            plan.post_commit,
+            PostCommitEffect::ReindexNote { note_id: id }
+        );
     }
 
     #[test]

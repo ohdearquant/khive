@@ -136,8 +136,7 @@ pub(crate) struct IngestParams {
     /// it only persists it. A channel adapter that needs to attach adapter-specific
     /// markers (e.g. the email channel's quarantine flags, ADR-056 Amendment
     /// 2026-07-02) sets `ChannelEnvelope.metadata`; the MCP poll loop forwards it
-    /// here unchanged. Absent metadata is today's behavior exactly (issue #448
-    /// Finding 2).
+    /// here unchanged. Absent metadata is today's behavior exactly (issue #448).
     #[serde(default)]
     pub metadata: Option<serde_json::Map<String, Value>>,
 }

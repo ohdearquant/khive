@@ -16,9 +16,10 @@ use khive_runtime::{
 };
 use khive_score::DeterministicScore;
 use khive_storage::types::{
-    TextFilter, TextQueryMode, TextSearchHit, TextSearchRequest, VectorSearchHit,
+    PageRequest, TextFilter, TextQueryMode, TextSearchHit, TextSearchRequest, VectorSearchHit,
     VectorSearchRequest,
 };
+use khive_storage::EntityFilter;
 use khive_types::SubstrateKind;
 
 use crate::ann::{self, AnnKey};
@@ -686,6 +687,57 @@ pub(super) fn recall_text_terms_with_limit(query: &str, limit: usize) -> Vec<Str
 }
 
 impl MemoryPack {
+    /// ADR-104 §5 (Stage C): entity-anchored candidate extraction. A single,
+    /// namespace-scoped, batched lookup against the entity store's live-row
+    /// `(namespace, LOWER(name))` index. This satisfies R1's "one batched indexed
+    /// lookup per recall, no unbounded per-recall scans of the entity table."
+    ///
+    /// `crate::scoring::entity_lookup_candidates` derives up to
+    /// `MAX_ENTITY_LOOKUP_CANDIDATES` raw and ASCII-lowercased unigram, bigram,
+    /// and bounded CJK substring candidates. One `EntityFilter::names_ci` call
+    /// resolves a distinct candidate relation with one `LIMIT 1` index seek per
+    /// name. The store skips the separate count for this filter, so lookup work
+    /// is bounded by the 64-candidate input rather than matching entity rows.
+    ///
+    /// A candidate only survives this lookup by naming a real, non-deleted
+    /// entity in the caller's namespace. That match against a real record
+    /// is the precision-safe property the ADR-104 §5 rationale hangs on. A
+    /// storage-layer failure here degrades to no anchored candidates (never
+    /// fails the recall). The caller still has `extract_entity_candidates`'s
+    /// capitalized-token fallback.
+    pub(super) async fn entity_anchored_candidates(
+        &self,
+        token: &NamespaceToken,
+        query: &str,
+    ) -> Result<Vec<String>, RuntimeError> {
+        let store = self.runtime.entities(token)?;
+        let namespace = token.namespace().as_str();
+
+        let candidates = crate::scoring::entity_lookup_candidates(query);
+        if candidates.is_empty() {
+            return Ok(Vec::new());
+        }
+        let filter = EntityFilter {
+            names_ci: candidates,
+            ..EntityFilter::default()
+        };
+        let page = store
+            .query_entities(
+                namespace,
+                filter,
+                PageRequest {
+                    limit: crate::scoring::MAX_ENTITY_LOOKUP_CANDIDATES as u32,
+                    offset: 0,
+                },
+            )
+            .await?;
+        Ok(page
+            .items
+            .into_iter()
+            .map(|e| e.name.to_lowercase())
+            .collect())
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(super) async fn collect_recall_text_hits(
         &self,
@@ -706,7 +758,7 @@ impl MemoryPack {
         let t_fts = if prof { Some(Instant::now()) } else { None };
         let searcher = self.runtime.text_for_notes(token)?;
 
-        // FTS5 parser syntax errors (#388, #389 round-2 High): sanitize_fts5_query
+        // FTS5 parser syntax errors (#388, #389): sanitize_fts5_query
         // already strips known-unsafe FTS5 metacharacters, but if the lexical
         // leg still errors at runtime on residual punctuation the sanitizer
         // does not strip, per #569 this now fails loud instead of degrading
@@ -1010,7 +1062,7 @@ impl MemoryPack {
                 // inside it now runs via `tokio::task::spawn_blocking`
                 // (`ann.rs::load_and_build_from_vector_store`).
                 //
-                // #812 review REQUEST CHANGES HIGH: `is_current` alone only
+                // PR #812: `is_current` alone only
                 // sees THIS process's write-generation counter, which
                 // `kkernel reindex` (a separate OS process) never touches —
                 // an already-warm daemon would otherwise trust its cached
@@ -1034,7 +1086,7 @@ impl MemoryPack {
                 // `ann_ready_timeout_ms`, abandon WAITING for this attempt and
                 // degrade this model's vector leg to FTS-only for this recall.
                 //
-                // #836 review: the build itself must never be dropped on
+                // PR #836: the build itself must never be dropped on
                 // timeout. In the CONTENDED case (some other holder — e.g.
                 // boot warm — already owns `ensure_ann_for_model`'s per-model
                 // `model_warm_lock`) that other holder's own call keeps

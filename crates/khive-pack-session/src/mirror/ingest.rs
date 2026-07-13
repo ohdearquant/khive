@@ -33,7 +33,7 @@
 //! scan; once the line eventually terminates (or the file stops growing and
 //! reaches true EOF mid-line), it resolves to the normal `Oversized`
 //! skip-and-advance path or stays a bounded `Partial`/`OversizedUnterminated`
-//! retry, never a full-file read in one call (PACKSESSION-AUD-003 round 2).
+//! retry, never a full-file read in one call (PACKSESSION-AUD-003).
 
 use std::io::{BufRead, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -218,7 +218,7 @@ enum LineRead {
     /// Unlike `Oversized`, the caller must not advance past it: `bytes` is
     /// reported for logging only, and the reader is intentionally not
     /// exhausted any further this call. This is the hard bound behind
-    /// PACKSESSION-AUD-003 round 2 — the loop below returns as soon as one
+    /// PACKSESSION-AUD-003 — the loop below returns as soon as one
     /// `fill_buf` window crosses the cap without a `\n`, instead of looping
     /// `fill_buf`/`consume` all the way to EOF searching for a terminator
     /// that may never come.
@@ -241,7 +241,7 @@ enum LineRead {
 /// the real line is.
 ///
 /// The same bound applies to the number of bytes *read* per call, not just
-/// buffered (PACKSESSION-AUD-003 round 2): once a line has crossed
+/// buffered (PACKSESSION-AUD-003): once a line has crossed
 /// `max_line_bytes` without a terminating `\n`, the very next `fill_buf`
 /// window that still has no `\n` returns `OversizedUnterminated` immediately
 /// rather than looping `fill_buf`/`consume` onward in search of one. A line
@@ -296,8 +296,8 @@ fn read_line_bounded(
         if oversized {
             // Already over the cap and this fill_buf window had no `\n`:
             // stop here rather than looping onward toward EOF (or forever,
-            // if the file keeps growing). See the PACKSESSION-AUD-003
-            // round-2 bound above.
+            // if the file keeps growing). See the PACKSESSION-AUD-003 bound
+            // above.
             return Ok(LineRead::OversizedUnterminated { bytes: total });
         }
         // No `\n` in this fill_buf window yet, and still under the cap;
@@ -357,7 +357,7 @@ fn read_bounded_chunk(
             LineRead::Partial => break, // leave partial trailing line for next pass
             LineRead::OversizedUnterminated { bytes } => {
                 // Already over max_line_bytes with no `\n` found in this
-                // bounded read (see `read_line_bounded`'s round-2 bound):
+                // bounded read (see `read_line_bounded`'s bound above):
                 // do NOT advance new_offset past line_offset. The next call
                 // re-reads from the same line_offset and is bounded the
                 // same way — cheap and repeatable, whether the file is
@@ -1362,7 +1362,7 @@ mod tests {
 
     #[test]
     fn test_read_line_bounded_oversized_unterminated_reads_are_capped_per_call() {
-        // Regression for PACKSESSION-AUD-003 round 2 (High): a huge final
+        // Regression for PACKSESSION-AUD-003: a huge final
         // line with no trailing `\n` used to be scanned all the way to EOF
         // in one `read_line_bounded` call (`fill_buf`/`consume` looped until
         // the reader ran dry), even though the discarded bytes past the cap
@@ -1417,7 +1417,7 @@ mod tests {
     #[tokio::test]
     async fn test_oversized_unterminated_line_leaves_cursor_at_line_start_and_is_bounded_on_retry()
     {
-        // Regression for PACKSESSION-AUD-003 round 2 (High): a single huge
+        // Regression for PACKSESSION-AUD-003: a single huge
         // line with NO trailing newline (a still-growing or corrupt final
         // line) must not advance the cursor, and repeated calls from the
         // same persisted offset must each be bounded, not replay an

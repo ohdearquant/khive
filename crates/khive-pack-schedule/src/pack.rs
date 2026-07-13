@@ -13,8 +13,8 @@ use crate::vocab::{SCHEDULE_HANDLERS, SCHEDULE_SCHEMA_PLAN_STMTS};
 /// Schedule pack — stores time-triggered reminders and verb dispatches.
 ///
 /// Intent storage only: the pack creates and queries `scheduled_event` notes.
-/// Trigger evaluation (reading pending events and dispatching their payloads)
-/// is the responsibility of the runtime or an external scheduler — not this pack.
+/// The execution environment delivers reminder content to the creating actor's
+/// inbox and dispatches scheduled payloads when their triggers become due.
 pub struct SchedulePack {
     runtime: KhiveRuntime,
 }
@@ -46,7 +46,7 @@ impl khive_runtime::PackFactory for SchedulePackFactory {
     }
 
     fn requires(&self) -> &'static [&'static str] {
-        &["kg"]
+        <SchedulePack as Pack>::REQUIRES
     }
 
     fn create(&self, runtime: KhiveRuntime) -> Box<dyn khive_runtime::PackRuntime> {
@@ -93,7 +93,9 @@ impl PackRuntime for SchedulePack {
         token: &NamespaceToken,
     ) -> Result<Value, RuntimeError> {
         match verb {
-            "schedule.remind" => handlers::handle_remind(self.runtime(), token, params).await,
+            "schedule.remind" => {
+                handlers::handle_remind(self.runtime(), token, registry, params).await
+            }
             "schedule.schedule" => {
                 handlers::handle_schedule(self.runtime(), token, registry, params).await
             }

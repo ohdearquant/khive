@@ -375,7 +375,7 @@ async fn on_proposal_withdrawn_cas_returns_false_on_second_call() {
     );
 }
 
-// H1 / internal-review R3 regression: two sequential `withdrawn_and_emit` calls on the same
+// H1 regression: two sequential `withdrawn_and_emit` calls on the same
 // open proposal must produce exactly ONE ProposalWithdrawn event in the events
 // table, and the second call must return cas_hit=false.
 #[tokio::test]
@@ -468,7 +468,7 @@ async fn withdrawn_and_emit_second_call_no_duplicate_event() {
     drop(rows); // silence unused-variable lint
 }
 
-// internal review round 4 regression: same-microsecond `updated_at` collision.
+// Regression: same-microsecond `updated_at` collision.
 #[tokio::test]
 async fn same_microsecond_timestamp_no_duplicate_event_changes_guard() {
     let (rt, tok) = setup();
@@ -582,7 +582,7 @@ async fn same_microsecond_timestamp_no_duplicate_event_changes_guard() {
         assert_eq!(
             total, 0,
             "caller B's UPDATE hits 0 rows; changes() = 0 so INSERT must be skipped; \
-             got {total} (round-3 guard would have returned 1 here — duplicate event)"
+             got {total} (an earlier guard would have returned 1 here — duplicate event)"
         );
     }
 
@@ -612,7 +612,7 @@ async fn same_microsecond_timestamp_no_duplicate_event_changes_guard() {
         count, 1,
         "R4: exactly ONE ProposalWithdrawn event must exist even with identical \
          `updated_at` timestamps; got {count}. \
-         A value of 2 means the guard is checking timestamp equality (round-3 bug), \
+         A value of 2 means the guard is incorrectly checking timestamp equality, \
          not connection-local changes()."
     );
 }

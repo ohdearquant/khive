@@ -19,7 +19,7 @@ pub(crate) static SCHEDULE_SCHEMA_PLAN_STMTS: [&str; 1] =
 pub(crate) static SCHEDULE_HANDLERS: [HandlerDef; 4] = [
     HandlerDef {
         name: "schedule.remind",
-        description: "Create a time-triggered reminder.",
+        description: "Deliver a time-triggered reminder to the creating actor's inbox.",
         visibility: Visibility::Verb,
         category: khive_types::VerbCategory::Commissive,
         params: &[

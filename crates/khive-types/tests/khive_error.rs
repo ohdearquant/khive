@@ -247,7 +247,7 @@ mod serde_tests {
     /// successfully (the visitor must keep draining MapAccess until None, not
     /// stop reading once 8 entries have been retained).
     ///
-    /// Follow-up (PR #549 review): truncation must be observable, not silent.
+    /// Follow-up (PR #549): truncation must be observable, not silent.
     /// The bounded wire shape stays at 8 entries, but the 8th slot is now the
     /// `details_truncated` indicator carrying the dropped-pair count, so only
     /// the first 7 insertion-order client pairs are retained verbatim.
@@ -311,7 +311,7 @@ mod serde_tests {
         );
     }
 
-    /// PR #549 round-2 Medium finding: a client-supplied `details_truncated`
+    /// PR #549: a client-supplied `details_truncated`
     /// pair must never be retained as an ordinary entry, even when the total
     /// pair count is within the 8-entry bound. Retaining it verbatim let a
     /// client-controlled value flow straight into `dropped_count()` via

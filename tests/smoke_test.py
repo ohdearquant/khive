@@ -1178,16 +1178,65 @@ def comm_smoke():
 
 
 def schedule_smoke():
-    """Optional smoke test for the schedule pack -- remind, agenda, cancel, and schedule."""
+    """Optional smoke test for the schedule pack -- remind, agenda, cancel, and schedule.
+
+    schedule.remind requires the registered comm.send delivery capability at
+    creation time (khive-pack-schedule/README.md "Usage"; khive-pack-comm/README.md
+    "Where this sits"): the schedule pack itself only requires kg, but remind
+    specifically fails fast without comm loaded. Verify both sides of that
+    contract -- the loud rejection with kg+schedule only, and the happy path
+    with kg+comm+schedule.
+    """
     future_at = (
         datetime.now(timezone.utc) + timedelta(days=30)
     ).strftime("%Y-%m-%dT%H:%M:%S") + "Z"
 
     env = {**os.environ, "KHIVE_NO_DAEMON": "1"}
-    proc = subprocess.Popen(
+
+    # Without comm loaded, schedule.remind must be rejected before any
+    # scheduled_event note is persisted -- fail fast, not silently degrade.
+    no_comm_proc = subprocess.Popen(
         [
             BINARY, "mcp", "--db", ":memory:", "--no-embed", "--log", "error",
             "--pack", "kg", "--pack", "schedule",
+        ],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=env,
+    )
+    try:
+        send(no_comm_proc, "initialize", {
+            "protocolVersion": "2024-11-05",
+            "capabilities": {},
+            "clientInfo": {"name": "schedule-smoke-no-comm", "version": "0.1.0"},
+        })
+        recv(no_comm_proc)
+        notify = {"jsonrpc": "2.0", "method": "notifications/initialized"}
+        no_comm_proc.stdin.write((json.dumps(notify) + "\n").encode())
+        no_comm_proc.stdin.flush()
+
+        try:
+            call_verb(no_comm_proc, "schedule.remind", {
+                "content": "should be rejected without comm",
+                "at": future_at,
+            })
+            raise AssertionError(
+                "schedule.remind must fail without the comm pack loaded"
+            )
+        except RuntimeError as e:
+            assert "comm" in str(e).lower(), (
+                f"expected 'comm' delivery-capability hint in rejection; got: {e}"
+            )
+        print("  [schedule] schedule.remind without comm pack -- rejected as expected")
+    finally:
+        no_comm_proc.stdin.close()
+        no_comm_proc.wait(timeout=5)
+
+    proc = subprocess.Popen(
+        [
+            BINARY, "mcp", "--db", ":memory:", "--no-embed", "--log", "error",
+            "--pack", "kg", "--pack", "comm", "--pack", "schedule",
         ],
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,

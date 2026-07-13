@@ -43,7 +43,7 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 18] = [
                 name: "entity_kind",
                 param_type: "string",
                 required: false,
-                description: "Fine-grained entity kind when kind=\"entity\" (concept | document | dataset | project | person | org | artifact | service).",
+                description: "Fine-grained entity kind when kind=\"entity\" (concept | document | dataset | project | person | org | artifact | service | resource).",
             },
             ParamDef {
                 name: "note_kind",
@@ -149,7 +149,13 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 18] = [
     // Assertive: retrieves and presents filtered records
     HandlerDef {
         name: "list",
-        description: "List records with optional filtering",
+        description: "List records with optional filtering. Requests within the kind's row cap \
+                      keep the existing array response. If limit exceeds the cap, the result is \
+                      {\"items\": [...], \"requested_limit\": N, \"effective_limit\": CAP, \
+                      \"limit_clamped\": true}. Edge cursor mode keeps its existing \
+                      {\"edges\": [...], \"next_after\": ...} shape and adds the same limit \
+                      metadata when clamped. Caps are entity 500, note 200, edge 1000, event \
+                      1000, and proposal 500.",
         visibility: Visibility::Verb,
         category: VerbCategory::Assertive,
         params: &[
@@ -163,7 +169,9 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 18] = [
                 name: "limit",
                 param_type: "integer",
                 required: false,
-                description: "Maximum records to return (default 20).",
+                description: "Maximum records to return (default varies by kind). Values above \
+                              the kind's server-side cap are clamped and return explicit \
+                              requested_limit, effective_limit, and limit_clamped metadata.",
             },
             ParamDef {
                 name: "offset",
@@ -182,16 +190,17 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 18] = [
                               previous page, or \"\" (empty string) to opt into cursor-mode pagination \
                               starting from the beginning of the set. Seeks via an indexed id range \
                               scan instead of OFFSET, so cost does not grow with depth. When set, the \
-                              response shape changes from a bare array to \
-                              {\"edges\": [...], \"next_after\": <uuid-or-null>}; next_after is \
-                              non-null while more rows remain. Mutually exclusive with offset-based \
-                              paging within a single walk.",
+                              response shape is \
+                              {\"edges\": [...], \"next_after\": <uuid-or-null>}; \
+                              next_after is non-null while more rows remain. Mutually exclusive with \
+                              offset-based paging within a single walk. Over-cap limits add the \
+                              limit metadata described on the verb.",
             },
             ParamDef {
                 name: "entity_kind",
                 param_type: "string",
                 required: false,
-                description: "Fine-grained entity kind filter when kind=\"entity\" (concept | document | dataset | project | person | org | artifact | service).",
+                description: "Fine-grained entity kind filter when kind=\"entity\" (concept | document | dataset | project | person | org | artifact | service | resource).",
             },
             ParamDef {
                 name: "entity_type",
@@ -532,7 +541,7 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 18] = [
     // Assertive: retrieves immediate graph neighbors
     HandlerDef {
         name: "neighbors",
-        description: "Immediate graph neighbors",
+        description: "Immediate graph neighbors; each hit includes origin_id for the queried node",
         visibility: Visibility::Verb,
         category: VerbCategory::Assertive,
         params: &[
@@ -908,6 +917,31 @@ mod tests {
             .unwrap_or_else(|| panic!("handler {name:?} not found in KG_HANDLERS"))
     }
 
+    /// Regression for #899: `create.entity_kind` and `list.entity_kind` hand-write
+    /// the enumerated entity-kind list in their `help=true` description text. This
+    /// asserts every canonical name in `EntityKind::NAMES` (the actual vocabulary,
+    /// ADR-001 + ADR-048's 9-kind set) appears in both descriptions, so adding or
+    /// renaming an entity kind without updating the doc text fails loudly here
+    /// instead of shipping a stale `help=true` schema.
+    #[test]
+    fn entity_kind_param_descriptions_list_all_canonical_kinds() {
+        for handler_name in ["create", "list"] {
+            let h = find_handler(handler_name);
+            let entity_kind_param = h
+                .params
+                .iter()
+                .find(|p| p.name == "entity_kind")
+                .unwrap_or_else(|| panic!("{handler_name}.entity_kind param not found"));
+            for kind in crate::vocab::EntityKind::NAMES {
+                assert!(
+                    entity_kind_param.description.contains(kind),
+                    "{handler_name}.entity_kind description missing canonical kind {kind:?}: {:?}",
+                    entity_kind_param.description
+                );
+            }
+        }
+    }
+
     #[test]
     fn propose_params_has_required_title_description_changeset() {
         let h = find_handler("propose");
@@ -1031,7 +1065,7 @@ mod tests {
         );
     }
 
-    /// update.help must document `relation` for edges (internal review High).
+    /// update.help must document `relation` for edges.
     #[test]
     fn update_params_documents_relation_for_edges() {
         let h = find_handler("update");
@@ -1046,7 +1080,7 @@ mod tests {
         );
     }
 
-    /// update.help must document `weight` for edges (internal review High).
+    /// update.help must document `weight` for edges.
     #[test]
     fn update_params_documents_weight_for_edges() {
         let h = find_handler("update");

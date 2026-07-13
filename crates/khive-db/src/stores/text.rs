@@ -39,6 +39,36 @@ pub fn delete_document_statement(table: &str, namespace: &str, subject_id: Uuid)
     }
 }
 
+/// Build the `INSERT` half of the FTS delete-then-insert upsert.
+///
+/// `table` must be a trusted, sanitized table name because SQL identifiers
+/// cannot be bound as parameters.
+pub fn insert_document_statement(table: &str, document: &TextDocument) -> SqlStatement {
+    let tags_json = tags_to_json(&document.tags);
+    let metadata_json = document.metadata.as_ref().map(|v| v.to_string());
+    SqlStatement {
+        sql: format!(
+            "INSERT INTO {table} \
+             (subject_id, kind, title, body, tags, namespace, metadata, updated_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)"
+        ),
+        params: vec![
+            SqlValue::Text(document.subject_id.to_string()),
+            SqlValue::Text(document.kind.to_string()),
+            SqlValue::Text(document.title.clone().unwrap_or_default()),
+            SqlValue::Text(document.body.clone()),
+            SqlValue::Text(tags_json),
+            SqlValue::Text(document.namespace.clone()),
+            match metadata_json {
+                Some(m) => SqlValue::Text(m),
+                None => SqlValue::Null,
+            },
+            SqlValue::Integer(dt_to_micros(&document.updated_at)),
+        ],
+        label: Some(format!("fts-insert-{table}")),
+    }
+}
+
 /// Ensure the FTS5 virtual table for `table_key` exists.
 ///
 /// Used in tests to set up an in-memory FTS5 table without the full `StorageBackend`.
@@ -327,19 +357,26 @@ fn sanitize_fts5_query_legacy_merged(query: &str) -> String {
         .join(" ")
 }
 
-/// Strip a raw token down to what is safe inside a double-quoted FTS5 phrase:
-/// the closing delimiter (`"`), the trailing-`*` prefix-query trigger, and
-/// control characters. Everything else — including `-`, `.`, `:`, `$`, `'`,
-/// digits — passes through literally, since FTS5 phrase text is matched
+/// Escape a raw token for use inside a double-quoted FTS5 phrase. Embedded
+/// double quotes are doubled; the trailing-`*` prefix-query trigger and
+/// control characters are removed. Everything else, including punctuation,
+/// passes through literally, since FTS5 phrase text is matched
 /// against the column's own tokenization of that literal text (word-exact
 /// under `unicode61`, substring-exact under `trigram`), not re-sanitized.
 ///
 /// Returns `None` if nothing survives the filter.
 fn sanitize_fts5_phrase_literal(token: &str) -> Option<String> {
-    let literal: String = token
+    let mut literal = String::with_capacity(token.len());
+    for c in token
         .chars()
-        .filter(|c| !matches!(c, '"' | '*' | '\0') && !c.is_control())
-        .collect();
+        .filter(|c| !matches!(c, '*' | '\0') && !c.is_control())
+    {
+        if c == '"' {
+            literal.push_str("\"\"");
+        } else {
+            literal.push(c);
+        }
+    }
     if literal.is_empty() {
         None
     } else {
@@ -355,6 +392,13 @@ fn sanitize_fts5_phrase_literal(token: &str) -> Option<String> {
 /// `2026` regardless of month/day. `sanitize_fts5_token_group` treats any
 /// split segment at or below this length as trigram-unsafe.
 const FTS5_TRIGRAM_MIN_SAFE_LEN: usize = 3;
+
+/// FTS5 reserves punctuation in barewords for query syntax, including some
+/// forms that change query meaning without producing an error. Keep bareword
+/// alternatives to the conservative ASCII set and quote everything else.
+fn is_fts5_bareword_safe(s: &str) -> bool {
+    !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
 
 /// Sanitize a single whitespace-isolated raw token into an FTS5
 /// match-expression fragment.
@@ -393,8 +437,12 @@ const FTS5_TRIGRAM_MIN_SAFE_LEN: usize = 3;
 ///   OR would still admit its broadened matches. Retrieval stays correct
 ///   (still matches the right content, still discriminates) at the cost of
 ///   requiring adjacency for that token, which is the trade-off intended
-///   by the finding this fixes (khive #397 Finding 2): correctness over a
+///   by the fix (khive #397): correctness over a
 ///   marginally more lenient match.
+/// - Punctuation outside the legacy sanitizer, such as `#`, `%`, and `=`,
+///   is invalid or meaningful FTS5 bareword syntax. Bareword alternatives
+///   are emitted only when every term is safe; the quoted phrase preserves
+///   the literal spelling for all other input.
 ///
 /// All emitted readings are additive OR-alternatives otherwise — the result
 /// is never a narrower match than any single (safe) form alone.
@@ -406,7 +454,9 @@ fn sanitize_fts5_token_group(token: &str) -> Option<String> {
     if split_terms.is_empty() {
         return None;
     }
-    if split_terms.len() == 1 {
+
+    let all_bareword_safe = split_terms.iter().all(|t| is_fts5_bareword_safe(t));
+    if split_terms.len() == 1 && is_fts5_bareword_safe(token) {
         return Some(split_terms[0].to_string());
     }
 
@@ -415,7 +465,7 @@ fn sanitize_fts5_token_group(token: &str) -> Option<String> {
         .any(|t| t.chars().count() < FTS5_TRIGRAM_MIN_SAFE_LEN);
 
     let mut alternatives = Vec::new();
-    if !has_trigram_unsafe_segment {
+    if all_bareword_safe && !has_trigram_unsafe_segment {
         alternatives.push(format!("({})", split_terms.join(" ")));
     }
 
@@ -431,6 +481,8 @@ fn sanitize_fts5_token_group(token: &str) -> Option<String> {
     // here whenever the merge is multi-term.
     let merged = sanitize_fts5_query_legacy_merged(token);
     let merged_terms: Vec<&str> = merged.split_whitespace().collect();
+    let merged_all_bareword_safe =
+        !merged_terms.is_empty() && merged_terms.iter().all(|t| is_fts5_bareword_safe(t));
     let merged_has_unsafe_segment = merged_terms.len() > 1
         && merged_terms
             .iter()
@@ -446,7 +498,12 @@ fn sanitize_fts5_token_group(token: &str) -> Option<String> {
     let phrase = sanitize_fts5_phrase_literal(token);
     let duplicates_split = merged == split_terms.join(" ");
     let duplicates_phrase = phrase.as_deref() == Some(merged.as_str());
-    if !merged.is_empty() && !duplicates_split && !duplicates_phrase && !merged_has_unsafe_segment {
+    if merged_all_bareword_safe
+        && !merged.is_empty()
+        && !duplicates_split
+        && !duplicates_phrase
+        && !merged_has_unsafe_segment
+    {
         alternatives.push(merged);
     }
 
@@ -455,7 +512,7 @@ fn sanitize_fts5_token_group(token: &str) -> Option<String> {
     }
 
     match alternatives.len() {
-        0 => Some(format!("({})", split_terms.join(" "))),
+        0 => None,
         1 => alternatives.into_iter().next(),
         _ => Some(format!("({})", alternatives.join(" OR "))),
     }
@@ -624,39 +681,15 @@ fn upsert_document_dml(
     table: &str,
     document: &TextDocument,
 ) -> Result<(), rusqlite::Error> {
-    let namespace = &document.namespace;
-
-    let del_sql = format!(
-        "DELETE FROM {} WHERE namespace = ?1 AND subject_id = ?2",
-        table
-    );
-    conn.execute(
-        &del_sql,
-        rusqlite::params![namespace, document.subject_id.to_string()],
-    )?;
-
-    let ins_sql = format!(
-        "INSERT INTO {} \
-         (subject_id, kind, title, body, tags, namespace, metadata, updated_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-        table
-    );
-    let tags_json = tags_to_json(&document.tags);
-    let metadata_json: Option<String> = document.metadata.as_ref().map(|v| v.to_string());
-
-    conn.execute(
-        &ins_sql,
-        rusqlite::params![
-            document.subject_id.to_string(),
-            document.kind.to_string(),
-            document.title.as_deref().unwrap_or(""),
-            document.body,
-            tags_json,
-            namespace,
-            metadata_json,
-            dt_to_micros(&document.updated_at),
-        ],
-    )?;
+    let statements = [
+        delete_document_statement(table, &document.namespace, document.subject_id),
+        insert_document_statement(table, document),
+    ];
+    for statement in statements {
+        let mut stmt = conn.prepare(&statement.sql)?;
+        bind_params(&mut stmt, &statement.params)?;
+        stmt.raw_execute()?;
+    }
     Ok(())
 }
 

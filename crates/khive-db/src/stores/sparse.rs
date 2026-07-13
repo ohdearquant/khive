@@ -954,8 +954,8 @@ mod tests {
     /// not the `KHIVE_WRITE_QUEUE` env var — that env var is process-global
     /// and this crate's other tests are NOT `#[serial]` against it, so a
     /// window where it is set here could leak into a
-    /// concurrently-scheduled test's own pool construction (ADR-067 Fork C
-    /// slice 2 round 2, LOW finding).
+    /// concurrently-scheduled test's own pool construction (ADR-067
+    /// Component A).
     #[tokio::test]
     async fn insert_batch_routes_through_writer_task_when_flag_enabled() {
         use chrono::Utc;

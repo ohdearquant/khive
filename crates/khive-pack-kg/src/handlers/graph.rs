@@ -1,15 +1,24 @@
 //! `neighbors`, `traverse`, and `query` verb handlers.
 
+use serde::Serialize;
 use serde_json::Value;
+use uuid::Uuid;
 
 use khive_runtime::{NamespaceToken, RuntimeError};
-use khive_storage::types::{NeighborQuery, TraversalOptions, TraversalRequest};
+use khive_storage::types::{NeighborHit, NeighborQuery, TraversalOptions, TraversalRequest};
 
 use super::common::{
     deser, parse_direction, parse_relation, render_query_result, resolve_uuid_async, to_json,
     NeighborsParams, QueryParams, TraverseParams, HARD_CAP,
 };
 use crate::KgPack;
+
+#[derive(Serialize)]
+struct NeighborHitResponse {
+    origin_id: Uuid,
+    #[serde(flatten)]
+    hit: NeighborHit,
+}
 
 impl KgPack {
     pub(crate) async fn handle_neighbors(
@@ -49,7 +58,15 @@ impl KgPack {
                 hit.entity_type = None;
             }
         }
-        to_json(&hits)
+        to_json(
+            &hits
+                .into_iter()
+                .map(|hit| NeighborHitResponse {
+                    origin_id: node_id,
+                    hit,
+                })
+                .collect::<Vec<_>>(),
+        )
     }
 
     pub(crate) async fn handle_traverse(

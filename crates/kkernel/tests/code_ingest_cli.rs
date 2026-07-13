@@ -6,7 +6,7 @@
 //! only a real subprocess exercises clap argument parsing, `main`'s
 //! subcommand dispatch, the process exit code, and — most importantly — the
 //! filesystem side effects (or lack thereof) of `--dry-run` and a rejected
-//! document, which is exactly what round 1 of the PR #848 review found
+//! document, matching the failure fixed by PR #848
 //! missing.
 
 use std::path::Path;
@@ -474,7 +474,7 @@ async fn db_namespace_and_source_run_reach_storage() {
 /// `(fixed, resolved)`, `(false_positive, invalid)`, `(open, open)`. The
 /// mapper-level unit tests in `khive-pack-code/tests/integration.rs` cover
 /// the mapping itself; this covers the plumbing from that mapper's output
-/// through to storage over the actual compiled binary (round 2 Finding 2).
+/// through to storage over the actual compiled binary.
 #[tokio::test]
 async fn status_mapping_reaches_storage_through_cli_dispatch() {
     let tmp = tempfile::TempDir::new().expect("temp dir");
@@ -620,7 +620,7 @@ async fn dry_run_against_existing_wal_db_held_open_by_a_writer_leaves_sidecars_u
     );
     assert_eq!(
         shm_before, shm_after,
-        "dry-run must not touch the existing -shm sidecar (Finding 1 regression)"
+        "dry-run must not touch the existing -shm sidecar (regression)"
     );
 
     drop(pin);

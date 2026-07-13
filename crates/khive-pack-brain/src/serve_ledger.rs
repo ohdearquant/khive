@@ -11,27 +11,8 @@
 use khive_runtime::RuntimeError;
 use khive_storage::types::{SqlStatement, SqlValue};
 use khive_storage::SqlAccess;
-use sha2::{Digest, Sha256};
 
-/// Compute the deterministic `query_class` key (ADR-081 §4): lowercase, strip
-/// punctuation to whitespace, collapse whitespace, sort+dedup unique tokens,
-/// join, SHA-256, first 16 hex chars. Order-insensitive so two queries with
-/// the same token set (in any order) fold into the same accounting key.
-pub fn compute_query_class(query_raw: &str) -> String {
-    let lowered = query_raw.to_lowercase();
-    let stripped: String = lowered
-        .chars()
-        .map(|c| if c.is_alphanumeric() { c } else { ' ' })
-        .collect();
-    let mut tokens: Vec<&str> = stripped.split_whitespace().collect();
-    tokens.sort_unstable();
-    tokens.dedup();
-    let normalized = tokens.join(" ");
-    let mut hasher = Sha256::new();
-    hasher.update(normalized.as_bytes());
-    let digest = hasher.finalize();
-    hex::encode(digest)[..16].to_string()
-}
+pub use khive_brain_core::compute_query_class;
 
 fn sql_err(context: &str, e: impl std::fmt::Display) -> RuntimeError {
     RuntimeError::Internal(format!("serve ledger {context}: {e}"))
@@ -144,7 +125,7 @@ pub async fn record_serve(
     match result {
         Ok(_) => Ok(true),
         Err(e) if e.is_unique_constraint_violation() => {
-            // internal review PR #583 round-1 Low: `is_unique_constraint_violation` fires
+            // PR #583: `is_unique_constraint_violation` fires
             // for ANY unique-index collision on this table — the intended
             // natural key `(namespace, target_id, query_class, served_at)`,
             // but also the `id TEXT PRIMARY KEY` column and any future unique
@@ -299,7 +280,7 @@ mod tests {
     /// Fork C slice 2: proves `record_serve`'s single-row INSERT — issued via
     /// `sql.writer().execute(..)` — is actually enqueued on the pool's shared
     /// `WriterTaskHandle` channel when the write queue is enabled. This is
-    /// the BLOCKER 2 Part A fix (`SqliteWriter::execute` routes through the
+    /// the `SqliteWriter::execute` fix, which routes through the
     /// writer task like `execute_batch` already did): `record_serve` itself
     /// needed zero code changes, but this test proves the fix actually
     /// reaches this call site rather than asserting it by inspection alone.

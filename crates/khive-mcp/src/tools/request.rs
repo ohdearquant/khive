@@ -89,4 +89,16 @@ pub struct RequestParams {
     #[serde(default)]
     #[schemars(description = "Per-op output format override (optional)")]
     pub format_per_op: Option<Vec<Option<String>>>,
+
+    /// Caller-supplied correlation id (khive#948), forwarded unchanged onto
+    /// the daemon request frame and echoed back on the response so a
+    /// benchmark harness can join its own pre-send sample to the server-side
+    /// audit row for this request. Purely a correlation label — it never
+    /// changes how a request is dispatched. When omitted, the request
+    /// carries no id and its audit row has no `request_id` key.
+    #[serde(default)]
+    #[schemars(
+        description = "Caller-supplied correlation id, echoed back and stamped into the audit event (optional)"
+    )]
+    pub request_id: Option<u64>,
 }

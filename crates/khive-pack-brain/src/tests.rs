@@ -927,7 +927,7 @@ async fn test_357_feedback_no_double_count() {
 
 // #295: brain.reset must restore domain-informed priors, not Beta(1,1).
 //
-// Strengthened per internal review P12 Medium: this test now exercises the full
+// This test now exercises the full
 // production path — handle_reset → reset_posteriors → sync helper — and
 // verifies that ALL three profile record fields (total_events,
 // exploration_epoch, state_snapshot) reflect the restored priors.
@@ -1107,7 +1107,7 @@ async fn test_295_reset_restores_domain_priors_not_uniform() {
     );
 }
 
-// Round-4 fix: brain.reset must reject unknown kwargs (deny_unknown_fields).
+// brain.reset must reject unknown kwargs (deny_unknown_fields).
 #[tokio::test]
 async fn brain_reset_rejects_unknown_kwargs() {
     let (pack, rt) = make_pack();
@@ -1255,7 +1255,7 @@ async fn test_355_posteriors_update_after_dispatch_via_hook() {
     );
 }
 
-// ── Wave-4 Critical regressions (C1-C4) ──────────────────────────────────
+// ── Regression tests ──────────────────────────────────────────────────────
 
 // C2: brain.unbind with zero filters must be rejected.
 #[tokio::test]
@@ -1458,7 +1458,7 @@ async fn w4_c4_feedback_accepts_valid_target_and_profile() {
     assert_eq!(result["signal"], json!("useful"));
 }
 
-/// Regression test (round-1 codex review of #831, Finding 1): ADR-041
+/// Regression test (#831): ADR-041
 /// permits `brain.feedback` targets on entities AND notes, but the emitted
 /// event previously always carried `SubstrateKind::Event`, so the
 /// `event_observations` decoder hard-coded `ReferentKind::Entity` and the
@@ -1711,7 +1711,7 @@ async fn w4_h3_resolve_exact_match_returns_exact_kind() {
     assert_eq!(result["matched_consumer_kind"], json!("recall"));
 }
 
-// Round-2 fix 3: archived high-priority binding + live lower-priority wildcard → live wins.
+// Archived high-priority binding + live lower-priority wildcard → live wins.
 #[tokio::test]
 async fn r2_archived_exact_binding_defers_to_live_wildcard() {
     let (pack, rt) = make_pack();
@@ -1778,11 +1778,11 @@ async fn r2_archived_exact_binding_defers_to_live_wildcard() {
     assert_eq!(
         result["resolved_profile_id"],
         json!("search-v1"),
-        "r2 fix 3: archived high-priority binding must not suppress the live wildcard binding"
+        "archived high-priority binding must not suppress the live wildcard binding"
     );
 }
 
-// Round-2 fix 4: brain.feedback rejects archived served_by_profile_id.
+// brain.feedback rejects archived served_by_profile_id.
 #[tokio::test]
 async fn r2_feedback_rejects_archived_served_by_profile() {
     let (pack, rt) = make_pack();
@@ -1825,14 +1825,14 @@ async fn r2_feedback_rejects_archived_served_by_profile() {
     if let RuntimeError::InvalidInput(msg) = &err {
         assert!(
             msg.contains("archived"),
-            "r2 fix 4: feedback to archived profile must mention 'archived'; got: {msg}"
+            "feedback to archived profile must mention 'archived'; got: {msg}"
         );
     } else {
-        panic!("r2 fix 4: feedback to archived served_by_profile_id must return InvalidInput, got {err:?}");
+        panic!("feedback to archived served_by_profile_id must return InvalidInput, got {err:?}");
     }
 }
 
-// Round-2 fix 5: brain.create_profile rejects empty and wildcard consumer_kind.
+// brain.create_profile rejects empty and wildcard consumer_kind.
 #[tokio::test]
 async fn r2_create_profile_rejects_empty_consumer_kind() {
     let (pack, rt) = make_pack();
@@ -1850,7 +1850,7 @@ async fn r2_create_profile_rejects_empty_consumer_kind() {
         .unwrap_err();
     assert!(
         matches!(err, RuntimeError::InvalidInput(_)),
-        "r2 fix 5: empty consumer_kind must return InvalidInput, got {err:?}"
+        "empty consumer_kind must return InvalidInput, got {err:?}"
     );
 }
 
@@ -1872,10 +1872,10 @@ async fn r2_create_profile_rejects_wildcard_consumer_kind() {
     if let RuntimeError::InvalidInput(msg) = &err {
         assert!(
             msg.contains("wildcard") || msg.contains("sentinel") || msg.contains("*"),
-            "r2 fix 5: wildcard consumer_kind rejection must explain the issue; got: {msg}"
+            "wildcard consumer_kind rejection must explain the issue; got: {msg}"
         );
     } else {
-        panic!("r2 fix 5: wildcard consumer_kind must return InvalidInput, got {err:?}");
+        panic!("wildcard consumer_kind must return InvalidInput, got {err:?}");
     }
 }
 
@@ -1896,11 +1896,11 @@ async fn r2_create_profile_rejects_whitespace_consumer_kind() {
         .unwrap_err();
     assert!(
         matches!(err, RuntimeError::InvalidInput(_)),
-        "r2 fix 5: whitespace consumer_kind must return InvalidInput, got {err:?}"
+        "whitespace consumer_kind must return InvalidInput, got {err:?}"
     );
 }
 
-// Round-2 fix 6: brain.bindings AND-semantics pinned with ≥3 bindings and combined filters.
+// brain.bindings AND-semantics pinned with ≥3 bindings and combined filters.
 #[tokio::test]
 async fn r2_bindings_and_semantics_multi_filter() {
     let (pack, rt) = make_pack();
@@ -2006,8 +2006,8 @@ async fn r2_bindings_and_semantics_multi_filter() {
     assert_eq!(r3["bindings"], json!([]));
 }
 
-// Round-2 fix 2: user-created profile has real posterior state that reset mutates.
-// Round-3 strengthening: emit feedback first to move posteriors, then assert all three
+// User-created profile has real posterior state that reset mutates.
+// Emit feedback first to move posteriors, then assert all three
 // posterior alpha/beta values return to their priors after reset.
 #[tokio::test]
 async fn r2_user_profile_reset_mutates_posteriors() {
@@ -2060,7 +2060,7 @@ async fn r2_user_profile_reset_mutates_posteriors() {
         .expect("state_snapshot.salience.alpha() must be a number");
     assert!(
         salience_alpha_before > 2.0,
-        "r3 fix 2: feedback must have moved salience alpha above prior 2.0; got {salience_alpha_before}"
+        "feedback must have moved salience alpha above prior 2.0; got {salience_alpha_before}"
     );
     let epoch_before = mutated["exploration_epoch"].as_u64().unwrap();
 
@@ -2090,7 +2090,7 @@ async fn r2_user_profile_reset_mutates_posteriors() {
     let epoch_after = after["exploration_epoch"].as_u64().unwrap();
     assert!(
         epoch_after > epoch_before,
-        "r3 fix 2: reset must increment exploration_epoch on user-created profile; before={epoch_before} after={epoch_after}"
+        "reset must increment exploration_epoch on user-created profile; before={epoch_before} after={epoch_after}"
     );
 
     // All three posteriors must return exactly to priors:
@@ -2100,7 +2100,7 @@ async fn r2_user_profile_reset_mutates_posteriors() {
     let snap = &after["state_snapshot"];
     assert!(
         !snap.is_null(),
-        "r3 fix 2: state_snapshot must be non-null after reset"
+        "state_snapshot must be non-null after reset"
     );
 
     let rel_alpha = snap["relevance"]["alpha"]
@@ -2111,7 +2111,7 @@ async fn r2_user_profile_reset_mutates_posteriors() {
         .expect("relevance.beta()");
     assert!(
         (rel_alpha - 7.0).abs() < 1e-9 && (rel_beta - 3.0).abs() < 1e-9,
-        "r3 fix 2: relevance must be Beta(7,3) after reset; got ({rel_alpha},{rel_beta})"
+        "relevance must be Beta(7,3) after reset; got ({rel_alpha},{rel_beta})"
     );
 
     let sal_alpha = snap["salience"]["alpha"]
@@ -2120,7 +2120,7 @@ async fn r2_user_profile_reset_mutates_posteriors() {
     let sal_beta = snap["salience"]["beta"].as_f64().expect("salience.beta()");
     assert!(
         (sal_alpha - 2.0).abs() < 1e-9 && (sal_beta - 8.0).abs() < 1e-9,
-        "r3 fix 2: salience must be Beta(2,8) after reset; got ({sal_alpha},{sal_beta})"
+        "salience must be Beta(2,8) after reset; got ({sal_alpha},{sal_beta})"
     );
 
     let tmp_alpha = snap["temporal"]["alpha"]
@@ -2129,11 +2129,11 @@ async fn r2_user_profile_reset_mutates_posteriors() {
     let tmp_beta = snap["temporal"]["beta"].as_f64().expect("temporal.beta()");
     assert!(
         (tmp_alpha - 1.0).abs() < 1e-9 && (tmp_beta - 9.0).abs() < 1e-9,
-        "r3 fix 2: temporal must be Beta(1,9) after reset; got ({tmp_alpha},{tmp_beta})"
+        "temporal must be Beta(1,9) after reset; got ({tmp_alpha},{tmp_beta})"
     );
 }
 
-// Round-2 fix 2: feedback routes to the user-created profile's own state.
+// Feedback routes to the user-created profile's own state.
 #[tokio::test]
 async fn r2_user_profile_feedback_routes_to_profile_state() {
     let (pack, rt) = make_pack();
@@ -2191,7 +2191,7 @@ async fn r2_user_profile_feedback_routes_to_profile_state() {
     let events_after = after["total_events"].as_u64().unwrap();
     assert!(
         events_after > events_before,
-        "r2 fix 2: feedback routed to custom profile must increment its total_events; before={events_before} after={events_after}"
+        "feedback routed to custom profile must increment its total_events; before={events_before} after={events_after}"
     );
 }
 
@@ -2572,9 +2572,9 @@ async fn w4_h4_profile_accepts_profile_id_and_id_alias() {
     assert_eq!(r2["id"], json!("balanced-recall-v1"));
 }
 
-// ── Round-3 regression tests ──────────────────────────────────────────────
+// ── Regression tests ──────────────────────────────────────────────
 
-// R3-1: archiving balanced-recall-v1 then calling brain.feedback without
+// Archiving balanced-recall-v1 then calling brain.feedback without
 // served_by_profile_id must return InvalidInput and must NOT append an event.
 #[tokio::test]
 async fn r3_feedback_default_profile_archived_rejected() {
@@ -2641,10 +2641,10 @@ async fn r3_feedback_default_profile_archived_rejected() {
         RuntimeError::InvalidInput(msg) => {
             assert!(
                 msg.contains("archived"),
-                "r3-1: error must mention 'archived'; got: {msg}"
+                "error must mention 'archived'; got: {msg}"
             );
         }
-        other => panic!("r3-1: expected InvalidInput(archived), got {other:?}"),
+        other => panic!("expected InvalidInput(archived), got {other:?}"),
     }
 
     // No state mutation: total_events must be unchanged.
@@ -2660,7 +2660,7 @@ async fn r3_feedback_default_profile_archived_rejected() {
     let events_after = snap_after["total_events"].as_u64().unwrap_or(0);
     assert_eq!(
         events_after, events_before,
-        "r3-1: archived default profile must not have events appended; before={events_before} after={events_after}"
+        "archived default profile must not have events appended; before={events_before} after={events_after}"
     );
 
     // Defense-in-depth: also verify nothing landed in the event log itself.
@@ -2674,11 +2674,11 @@ async fn r3_feedback_default_profile_archived_rejected() {
     let log_count_after = log_after["events"].as_array().map(|a| a.len()).unwrap_or(0);
     assert_eq!(
         log_count_after, log_count_before,
-        "r3-1: rejected feedback must not append a FeedbackExplicit event; before={log_count_before} after={log_count_after}"
+        "rejected feedback must not append a FeedbackExplicit event; before={log_count_before} after={log_count_after}"
     );
 }
 
-// R3-3: brain.create_profile profile-id grammar enforcement.
+// brain.create_profile profile-id grammar enforcement.
 #[tokio::test]
 async fn r3_create_profile_id_grammar_enforced() {
     let (pack, rt) = make_pack();
@@ -2697,7 +2697,7 @@ async fn r3_create_profile_id_grammar_enforced() {
         .unwrap_err();
     assert!(
         matches!(err, RuntimeError::InvalidInput(_)),
-        "r3-3: whitespace-only name must return InvalidInput; got {err:?}"
+        "whitespace-only name must return InvalidInput; got {err:?}"
     );
 
     // Leading/trailing space: trimmed name "my-profile" must be accepted.
@@ -2708,7 +2708,7 @@ async fn r3_create_profile_id_grammar_enforced() {
         &token,
     )
     .await
-    .expect("r3-3: name with leading/trailing spaces should be accepted after trim");
+    .expect("name with leading/trailing spaces should be accepted after trim");
 
     // Dot in name must be rejected.
     let err = pack
@@ -2722,7 +2722,7 @@ async fn r3_create_profile_id_grammar_enforced() {
         .unwrap_err();
     assert!(
         matches!(err, RuntimeError::InvalidInput(_)),
-        "r3-3: dot in name must return InvalidInput; got {err:?}"
+        "dot in name must return InvalidInput; got {err:?}"
     );
 
     // Underscore in name must be rejected.
@@ -2737,7 +2737,7 @@ async fn r3_create_profile_id_grammar_enforced() {
         .unwrap_err();
     assert!(
         matches!(err, RuntimeError::InvalidInput(_)),
-        "r3-3: underscore in name must return InvalidInput; got {err:?}"
+        "underscore in name must return InvalidInput; got {err:?}"
     );
 
     // Asterisk in name must be rejected.
@@ -2752,7 +2752,7 @@ async fn r3_create_profile_id_grammar_enforced() {
         .unwrap_err();
     assert!(
         matches!(err, RuntimeError::InvalidInput(_)),
-        "r3-3: asterisk name must return InvalidInput; got {err:?}"
+        "asterisk name must return InvalidInput; got {err:?}"
     );
 
     // Valid alphanumeric-hyphen name must succeed.
@@ -2763,7 +2763,7 @@ async fn r3_create_profile_id_grammar_enforced() {
         &token,
     )
     .await
-    .expect("r3-3: valid alphanumeric-hyphen name must succeed");
+    .expect("valid alphanumeric-hyphen name must succeed");
 }
 
 // #289: feedback event must record a non-zero duration_us.
@@ -3271,7 +3271,7 @@ mod help_tests {
         );
     }
 
-    // ── Regression: schema-aware namespace strip (internal review round 2 H1) ──────────
+    // ── Regression: schema-aware namespace strip ──────────
     //
     // brain.bind / brain.resolve / brain.unbind / brain.bindings declare
     // `namespace` as a *business* parameter in their HandlerDef.params.  The
@@ -4331,7 +4331,7 @@ mod brain_005_section_signals {
         assert_eq!(result["emitted"], json!(true));
     }
 
-    // ── New tests for Blocker fix (PR #46 re-review) ──────────────────────────
+    // ── PR #46 regression tests ──────────────────────────────────────────────
 
     #[tokio::test]
     async fn section_signals_empty_map_is_rejected() {
@@ -5304,7 +5304,7 @@ mod adr081_retune_driver_tests {
         assert!(!second, "exact-key duplicate must report written=false");
     }
 
-    /// internal review PR #583 round-1 Low: a `UNIQUE` violation on the `id TEXT PRIMARY
+    /// PR #583: a `UNIQUE` violation on the `id TEXT PRIMARY
     /// KEY` column (same `id`, different natural key) must NOT be reported as
     /// a tolerated natural-key duplicate — the row that actually exists does
     /// not match `(namespace, target_id, query_class, served_at)`, so the
@@ -5959,6 +5959,7 @@ mod event_counts_tests {
         assert_eq!(result["total"], json!(0));
         assert_eq!(result["counts_by_kind"], json!({}));
         assert_eq!(result["counts_by_actor"], json!({}));
+        assert_eq!(result["counts_by_verb"], json!({}));
         assert!(
             result.get("by_profile").is_none(),
             "by_profile must be omitted when no feedback events are in the window: {result}"
@@ -6053,6 +6054,136 @@ mod event_counts_tests {
         assert_eq!(result["total"], json!(1));
         assert_eq!(result["counts_by_actor"]["lambda:b"], json!(1));
         assert!(result["counts_by_actor"].get("lambda:a").is_none());
+    }
+
+    /// #943: stored actor strings are prefixed (`actor:<kind>:<id>`), but the
+    /// verb's own param doc example is the bare seat form (`"lambda:khive"`).
+    /// The bare form must match the prefixed stored form, and the prefixed
+    /// form must keep matching exactly as before.
+    #[tokio::test]
+    async fn actor_filter_matches_bare_and_prefixed_spelling() {
+        let (pack, rt) = make_pack();
+        let registry = empty_registry();
+        let token = rt.authorize(Namespace::local()).unwrap();
+
+        seed_event(
+            &rt,
+            &token,
+            "search",
+            EventKind::SearchExecuted,
+            "actor:lambda:atlas",
+            1_000_000,
+            json!({}),
+        )
+        .await;
+        seed_event(
+            &rt,
+            &token,
+            "search",
+            EventKind::SearchExecuted,
+            "actor:lambda:khive",
+            1_000_000,
+            json!({}),
+        )
+        .await;
+
+        // Bare seat spelling must match the prefixed stored form.
+        let bare = pack
+            .dispatch(
+                "brain.event_counts",
+                json!({
+                    "since": micros_to_iso(0),
+                    "actor": "lambda:atlas",
+                }),
+                &registry,
+                &token,
+            )
+            .await
+            .expect("brain.event_counts must succeed");
+        assert_eq!(
+            bare["total"],
+            json!(1),
+            "bare seat spelling must match the actor:-prefixed stored form: {bare}"
+        );
+        assert_eq!(bare["counts_by_actor"]["actor:lambda:atlas"], json!(1));
+        assert!(bare["counts_by_actor"].get("actor:lambda:khive").is_none());
+
+        // Already-prefixed spelling must keep matching exactly (no false widening).
+        let prefixed = pack
+            .dispatch(
+                "brain.event_counts",
+                json!({
+                    "since": micros_to_iso(0),
+                    "actor": "actor:lambda:khive",
+                }),
+                &registry,
+                &token,
+            )
+            .await
+            .expect("brain.event_counts must succeed");
+        assert_eq!(
+            prefixed["total"],
+            json!(1),
+            "already-prefixed actor spelling must keep exact-match behavior: {prefixed}"
+        );
+        assert_eq!(prefixed["counts_by_actor"]["actor:lambda:khive"], json!(1));
+        assert!(prefixed["counts_by_actor"]
+            .get("actor:lambda:atlas")
+            .is_none());
+    }
+
+    /// #943: `counts_by_verb` aggregates `event.verb` over the page with the
+    /// same truncation semantics as `counts_by_kind`/`counts_by_actor`.
+    #[tokio::test]
+    async fn counts_by_verb_aggregates_per_verb() {
+        let (pack, rt) = make_pack();
+        let registry = empty_registry();
+        let token = rt.authorize(Namespace::local()).unwrap();
+
+        seed_event(
+            &rt,
+            &token,
+            "search",
+            EventKind::SearchExecuted,
+            "lambda:a",
+            1_000_000,
+            json!({}),
+        )
+        .await;
+        seed_event(
+            &rt,
+            &token,
+            "search",
+            EventKind::SearchExecuted,
+            "lambda:a",
+            1_000_000,
+            json!({}),
+        )
+        .await;
+        seed_event(
+            &rt,
+            &token,
+            "recall",
+            EventKind::RecallExecuted,
+            "lambda:a",
+            1_000_000,
+            json!({}),
+        )
+        .await;
+
+        let result = pack
+            .dispatch(
+                "brain.event_counts",
+                json!({"since": micros_to_iso(0)}),
+                &registry,
+                &token,
+            )
+            .await
+            .expect("brain.event_counts must succeed");
+
+        assert_eq!(result["total"], json!(3));
+        assert_eq!(result["counts_by_verb"]["search"], json!(2));
+        assert_eq!(result["counts_by_verb"]["recall"], json!(1));
     }
 
     #[tokio::test]
@@ -6354,6 +6485,73 @@ mod event_counts_tests {
             result.get("counts_by_work_class").is_none(),
             "counts_by_work_class must be omitted, not an empty object, when no event in \
              the window carries a work_class: {result}"
+        );
+    }
+
+    /// ADR-103 Amendment 1 (PR #927): the dispatch-boundary audit-row emitter
+    /// now stamps `resource: {"work_class": "interactive"}` on EVERY audit
+    /// row outcome, denied and errored included -- only `resource.cost_unit`
+    /// is scoped to a successful dispatch (ADR-103 Decision (a) requires
+    /// `work_class` on every event; Amendment 1's omission rule covers
+    /// `cost_unit` alone). This pins that a failed and a denied dispatch's
+    /// audit rows are still counted in `counts_by_work_class` via the same
+    /// `payload.resource.work_class` fallback path other non-phase events
+    /// use: outcome plays no role in the split, only payload shape does.
+    #[tokio::test]
+    async fn failed_and_denied_audit_rows_count_via_resource_work_class_fallback() {
+        let (pack, rt) = make_pack();
+        let registry = empty_registry();
+        let token = rt.authorize(Namespace::local()).unwrap();
+
+        let mut errored = Event::new(
+            token.namespace().as_str(),
+            "probe",
+            EventKind::Audit,
+            SubstrateKind::Event,
+            "lambda:khive",
+        );
+        errored.created_at = 1_000_000;
+        errored.outcome = khive_types::EventOutcome::Error;
+        errored.payload = json!({"resource": {"work_class": "interactive"}});
+        rt.events(&token)
+            .expect("event store")
+            .append_event(errored)
+            .await
+            .expect("seed errored audit event");
+
+        let mut denied = Event::new(
+            token.namespace().as_str(),
+            "list",
+            EventKind::Audit,
+            SubstrateKind::Event,
+            "lambda:khive",
+        );
+        denied.created_at = 1_000_000;
+        denied.outcome = khive_types::EventOutcome::Denied;
+        denied.payload = json!({"resource": {"work_class": "interactive"}});
+        rt.events(&token)
+            .expect("event store")
+            .append_event(denied)
+            .await
+            .expect("seed denied audit event");
+
+        let result = pack
+            .dispatch(
+                "brain.event_counts",
+                json!({"since": micros_to_iso(0)}),
+                &registry,
+                &token,
+            )
+            .await
+            .expect("brain.event_counts must succeed");
+
+        assert_eq!(result["total"], json!(2), "got: {result}");
+        assert_eq!(
+            result["counts_by_work_class"]["interactive"],
+            json!(2),
+            "a failed dispatch and a denied dispatch must both still count under \
+             counts_by_work_class -- work_class is stamped on every event outcome \
+             (ADR-103 Decision (a)), unlike cost_unit which is success-only: {result}"
         );
     }
 

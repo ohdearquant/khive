@@ -266,6 +266,26 @@ pub enum RuntimeError {
     /// Store a pointer (env-var name, keychain item) rather than the raw value.
     #[error("write blocked: {0}")]
     SecretDetected(crate::secret_gate::SecretMatch),
+
+    /// A bounded per-operation deadline elapsed before the operation
+    /// completed (#889). The operation may still be running in the
+    /// background (this is a client-observable timeout, not a cancellation
+    /// signal to the underlying work) — callers should treat this as "no
+    /// answer within budget", not "the operation failed or was rolled back".
+    ///
+    /// Distinct from `#836`'s narrower `ann_ready_timeout_ms`, which bounds
+    /// only a single cold-miss ANN-build wait inside the recall vector leg
+    /// and degrades to an in-band FTS-only result. This variant bounds the
+    /// *entire* operation end-to-end and is surfaced as a typed error so a
+    /// caller under sustained contention gets a fast, clear answer instead
+    /// of hanging until an upstream client-side ceiling (observed at 300s in
+    /// production, #889) fires instead.
+    #[error("{operation} exceeded its {budget_ms}ms deadline (elapsed {elapsed_ms}ms)")]
+    DeadlineExceeded {
+        operation: String,
+        budget_ms: u64,
+        elapsed_ms: u64,
+    },
 }
 
 /// Resolve an FTS text-leg search result, failing loud on parser syntax

@@ -198,8 +198,13 @@ impl khive_runtime::pack::PackRuntime for BrainPackRuntime {
         self.0.register_embedders(runtime)
     }
 
-    fn register_entity_type_validator(&self, runtime: &KhiveRuntime) {
-        self.0.register_entity_type_validator(runtime)
+    fn register_entity_type_validator_with_types(
+        &self,
+        runtime: &KhiveRuntime,
+        pack_entity_types: &[khive_types::EntityTypeDef],
+    ) {
+        self.0
+            .register_entity_type_validator_with_types(runtime, pack_entity_types)
     }
 
     async fn warm(&self) {

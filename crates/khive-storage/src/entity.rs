@@ -27,6 +27,12 @@ pub struct Entity {
     pub merged_into: Option<Uuid>,
     /// Opaque event ID for the merge that tombstoned this entity.
     pub merge_event_id: Option<Uuid>,
+    /// Content-addressed reference into a `BlobStore` (khive#292), stored as
+    /// the raw hex digest string. `None` when this entity has no attached
+    /// binary payload. Storage does not validate that the referenced blob
+    /// actually exists — callers publish the blob before setting this field
+    /// (see `docs/adr` BlobStore ADR "publish-then-reference" ordering).
+    pub content_ref: Option<String>,
 }
 
 impl Entity {
@@ -51,7 +57,14 @@ impl Entity {
             deleted_at: None,
             merged_into: None,
             merge_event_id: None,
+            content_ref: None,
         }
+    }
+
+    /// Set the content-addressed blob reference (khive#292).
+    pub fn with_content_ref(mut self, content_ref: impl Into<String>) -> Self {
+        self.content_ref = Some(content_ref.into());
+        self
     }
 
     /// Set the pack-governed entity subtype token.
@@ -104,6 +117,16 @@ pub struct EntityFilter {
     /// backward-compatible default).
     #[serde(default)]
     pub namespaces: Vec<String>,
+    /// ASCII-case-insensitive batched exact-name match (ADR-104 Stage C).
+    /// Compares a caller-bounded set of raw and ASCII-lowercased candidate
+    /// strings to `LOWER(name)`. Cased non-ASCII characters require exact form.
+    /// Distinct from single-value, case-sensitive `name_exact`. Results contain
+    /// at most one representative row per folded candidate before page limits
+    /// and offsets are applied.
+    /// Implementations may omit the page total to keep this lookup page-limited
+    /// instead of issuing a separate count.
+    #[serde(default)]
+    pub names_ci: Vec<String>,
 }
 
 /// Entity CRUD operations over the entities substrate table.

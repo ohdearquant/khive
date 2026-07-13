@@ -143,7 +143,7 @@ fn spawn_email_channel_loops_if_daemon(server: &KhiveMcpServer, args: &Args) {
 /// [`serve_server`] by `kkernel`'s coordinator-attached multi-backend boot
 /// path). Passing the ALREADY-RESOLVED runtime, rather than deriving a fresh
 /// `RuntimeConfig` from raw `args.db`/an inferred namespace inside the tick,
-/// is the fix for codex PR #782 review's High finding: the daemon resolves
+/// is the fix for PR #782: the daemon resolves
 /// `--config`/`[[backends]]`/actor identity/`--pack` selection once at boot,
 /// and a second independent resolution inside the tick could silently target
 /// a different database, actor identity, or pack set. `None` means either
@@ -153,8 +153,8 @@ fn spawn_email_channel_loops_if_daemon(server: &KhiveMcpServer, args: &Args) {
 /// `server` is the daemon's own live, fully-wired `KhiveMcpServer` — the
 /// SAME one [`build_server`] returned alongside `schedule_rt` and that this
 /// process is about to serve. It is cloned (cheap — `Arc`-wrapped
-/// internally) and handed to the tick loop for action-dispatch only (round 2
-/// of codex PR #782 review's High finding, a continuation of the
+/// internally) and handed to the tick loop for action-dispatch only (a
+/// continuation of PR #782, following the
 /// `schedule_rt`-only fix above): `schedule_rt` alone is correct for
 /// *scanning* `scheduled_event` rows (they live on the schedule pack's own
 /// backend), but building a throwaway `KhiveMcpServer` from `schedule_rt`
@@ -389,7 +389,7 @@ async fn channel_poll_loop(
 
     const HAPPY_PATH_INTERVAL: Duration = Duration::from_secs(5);
 
-    // Per-channel bootstrap "since" floor (issue #449 High follow-up). This
+    // Per-channel bootstrap "since" floor (issue #449). This
     // only feeds the date-based SINCE search used while a channel has no
     // committed UID high-water yet (first-ever poll, or a UIDVALIDITY
     // reset); once a checkpoint has a high-water, polling is UID-ranged and
@@ -402,8 +402,8 @@ async fn channel_poll_loop(
     // poll's SINCE clause would use the newer date, permanently skipping the
     // previous day's uncommitted mail.
     let mut bootstrap_since: HashMap<(String, String), DateTime<Utc>> = HashMap::new();
-    // One backoff state per (kind, slug) — i.e. per credential (#606 round-1
-    // internal review, High finding). Keying by kind alone would throttle a
+    // One backoff state per (kind, slug) — i.e. per credential (#606).
+    // Keying by kind alone would throttle a
     // second same-kind credential (e.g. a second mailbox) whenever the first
     // one's connection fails, even though the two are independent
     // credentials with independent connectivity.
@@ -415,8 +415,8 @@ async fn channel_poll_loop(
     let mut last_error_class: HashMap<(String, String), &'static str> = HashMap::new();
     let mut next_interval = HAPPY_PATH_INTERVAL;
     let event_store = registry.event_store();
-    // Captured before the loop's first sleep (issue #449 High follow-up,
-    // codex re-review). A channel's very first bootstrap floor must reflect
+    // Captured before the loop's first sleep (issue #449 follow-up).
+    // A channel's very first bootstrap floor must reflect
     // when the daemon actually started, not whenever its first tick happens
     // to fire: `tokio::time::sleep` below runs before any polling, so
     // computing `now` after it (as the loop used to) can land on the far
@@ -517,8 +517,8 @@ async fn channel_poll_loop(
                     .await;
 
                     // Every envelope in the page must durably ingest before
-                    // the cursor is allowed to advance past it (issue #449
-                    // Blocker fix): a partial-page ingest failure must leave
+                    // the cursor is allowed to advance past it (issue #449):
+                    // a partial-page ingest failure must leave
                     // the checkpoint untouched so the next poll re-selects
                     // the whole page -- comm.ingest's `INSERT OR IGNORE`
                     // dedup then skips re-storing the messages that already
@@ -700,7 +700,7 @@ enum HeartbeatOutcome {
 }
 
 /// Map a [`khive_channel::ChannelError`] to the `comm.heartbeat` `error_class`
-/// open string enum (#606 design review amendment 4: `auth | transport | config`
+/// open string enum (#606: `auth | transport | config`
 /// in v1, callers must tolerate unknown classes). `Auth`/`Transport` are the
 /// connectivity classes `is_backoff_eligible` already distinguishes;
 /// `Config`/`UnauthorizedSender`/`InvalidEnvelope` are static/attribution
@@ -722,15 +722,18 @@ fn channel_error_class(err: &khive_channel::ChannelError) -> &'static str {
 /// interrupt the poll loop — the heartbeat row is an observability surface,
 /// not a correctness dependency for message delivery.
 ///
-/// Takes NO `namespace` parameter (round-2, design review Blocker fix, example actor
-/// 2026-07-04): heartbeat rows are an operational surface, not message data,
+/// Takes NO `namespace` parameter (2026-07-04): heartbeat rows are an
+/// operational surface, not message data,
 /// so they are ALWAYS dispatched against
-/// `khive_pack_comm::CHANNEL_HEALTH_NAMESPACE` — the same constant
-/// `handle_health` reads from — regardless of what
+/// `khive_pack_comm::CHANNEL_HEALTH_NAMESPACE` regardless of what
 /// `KHIVE_EMAIL_INGEST_NAMESPACE` this daemon is configured with for message
 /// ingestion. `handle_heartbeat` additionally hardcodes the persisted row's
 /// namespace to this same constant, so the guarantee holds even if a future
-/// caller changes what this dispatch call passes.
+/// caller changes what this dispatch call passes. `comm.health` no longer
+/// mirrors this fixed pin (khive #877): it reads from the caller's dispatch
+/// token, which resolves to this constant only for an unscoped (default)
+/// read — an explicitly-scoped `comm.health` call reads its own namespace,
+/// not necessarily where this function wrote.
 #[cfg(feature = "channel-email")]
 async fn record_channel_heartbeat(
     registry: &khive_runtime::VerbRegistry,
@@ -843,7 +846,7 @@ async fn commit_channel_cursor(
 /// Log a backoff-eligible poll failure at the level ADR-091's `crossing_warn`
 /// discipline calls for: `warn!` only on an escalation edge
 /// (`tick.should_warn`, i.e. the computed step just changed), `debug!` on a
-/// repeat at the same step. internal review round 1 finding (2026-07-04): the poll loop
+/// repeat at the same step. Regression fix (2026-07-04): the poll loop
 /// previously emitted a generic `warn!` on every eligible retry in addition
 /// to the escalation-edge warn, so sustained pressure spammed warn-level logs
 /// once per retry instead of once per escalation. Extracted to a standalone
@@ -1005,7 +1008,7 @@ async fn channel_outbox_loop(
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string());
 
-            // Issue #403 finding 1: the full References chain (parent's existing
+            // Issue #403: the full References chain (parent's existing
             // chain, if any, followed by the parent's Message-ID), computed at
             // reply time by comm.reply. Forwarded verbatim so the SMTP layer can
             // set References without truncating ancestry; absent for non-reply sends.
@@ -1361,7 +1364,7 @@ pub fn build_registry_for_multi_backend(
     }
     registry.call_register_embedders(&default_runtime);
     registry.call_register_entity_type_validators(&default_runtime);
-    // #750 fix-round 1: install pack-owned note-mutation hooks (currently
+    // #750: install pack-owned note-mutation hooks (currently
     // only khive-pack-memory's warm-ANN-cache invalidation) so KG's
     // update/delete verbs notify caching packs even though there is no
     // crate-level dependency between them.
@@ -1476,8 +1479,8 @@ pub fn enforce_strict_actor_mode(
 /// pack, and a multi-backend boot (ADR-028 `[[backends]]`) returns the
 /// specific per-pack runtime `"schedule"` was wired to. Threading this
 /// through — rather than having the tick loop re-resolve its own
-/// `RuntimeConfig` from raw `--db`/namespace args — is the fix for codex PR
-/// #782 review's High finding: a second, independently-resolved config could
+/// `RuntimeConfig` from raw `--db`/namespace args is the fix for PR #782: a
+/// second, independently-resolved config could
 /// silently target a different database, actor identity, or pack set than
 /// the daemon it claims to serve.
 ///
@@ -1502,7 +1505,7 @@ pub fn build_server(args: &Args) -> anyhow::Result<(KhiveMcpServer, Option<Khive
 /// Build a fully-configured server from parsed args plus an independently
 /// resolved `(namespace, namespace_explicit, actor_explicit)` triple.
 ///
-/// Extracted from [`build_server`] (PR #782 review round 4, High finding) so
+/// Extracted from [`build_server`] (PR #782) so
 /// that non-interactive-CLI callers — e.g. the `--pending-events` one-shot
 /// drain wrapper in `pending_events.rs` — can supply a namespace default
 /// without it being misread as a genuine `--actor` override. `build_server`
@@ -1968,8 +1971,8 @@ pub fn resolve_runtime_config(inputs: RuntimeConfigInputs<'_>) -> anyhow::Result
     //      `KHIVE_ACTOR` can no longer masquerade as an explicit flag. When
     //      genuinely explicit, tiers 2-3 below are NOT consulted at all — an
     //      explicit `--actor local` must resolve to anonymous (`None`), not
-    //      fall through to a project/db/env actor (the Medium-severity gap
-    //      this block also closes). `kkernel exec`/`reindex` force
+    //      fall through to a project/db/env actor (the gap this block also
+    //      closes). `kkernel exec`/`reindex` force
     //      `namespace_explicit: true` for unrelated reasons (no `Option` on
     //      their `--namespace` arg) but always pass `actor_explicit: false`,
     //      so they keep falling through to tiers 2-3 exactly as before.
@@ -2288,7 +2291,7 @@ brain_profile = "unrelated"
         );
     }
 
-    /// Regression for BLOCKER-1 (PR #52 internal review): project-toml brain_profile
+    /// Regression for PR #52: project-toml brain_profile
     /// MUST win over KHIVE_BRAIN_PROFILE env var.
     ///
     /// Merged ADR-035 §Precedence: CLI > project toml > global toml > env > default.
@@ -2405,7 +2408,7 @@ brain_profile = "project-profile"
         );
     }
 
-    /// Regression for code-review Finding 1 (#203): the `--actor` / `--namespace`
+    /// Regression for #203: the `--actor` / `--namespace`
     /// CLI flag must set `actor_id`, not just `default_namespace`. Before the fix,
     /// `--actor lambda:x` with no `KHIVE_ACTOR` env and no config-file `[actor] id`
     /// left actor_id None → anonymous token → degraded ADR-057 comm + false warning.
@@ -2765,7 +2768,7 @@ id = "lambda:project-actor"
         );
     }
 
-    /// Codex PR #657 review, [High]: drives the REAL `clap` parse of `Args`
+    /// PR #657: drives the REAL `clap` parse of `Args`
     /// (not a hand-built `RuntimeConfigInputs`) to prove a bare shell-level
     /// `KHIVE_ACTOR` no longer occupies the tier-1 CLI slot. Before the fix,
     /// `args.rs` bound `--actor` to `env = "KHIVE_ACTOR"`, so this env var
@@ -2825,7 +2828,7 @@ id = "lambda:project-actor"
         );
     }
 
-    /// Codex PR #657 review, [High], second case: with no project config and
+    /// PR #657, second case: with no project config and
     /// no `--actor` flag, `KHIVE_ACTOR` must still land as the tier-3
     /// `actor_id` fallback (it is read directly by `RuntimeConfig::default()`,
     /// independent of the removed clap `env` binding) — and must still leave
@@ -2878,7 +2881,7 @@ id = "lambda:project-actor"
         );
     }
 
-    /// Codex PR #657 review, [Medium]: an explicit `--actor local` (an operator
+    /// PR #657: an explicit `--actor local` (an operator
     /// request for the anonymous identity) must suppress BOTH the project-config
     /// and the db-anchored-config actor tiers, not just the missing-flag default.
     /// Before the fix, `resolve_runtime_config`'s tier-3 fold used
@@ -3129,6 +3132,7 @@ id = "lambda:project-actor"
                 save_to: None,
                 format: None,
                 format_per_op: None,
+                request_id: None,
             })
             .await
             .expect("kg dispatch must not error");
@@ -3152,6 +3156,7 @@ id = "lambda:project-actor"
                 save_to: None,
                 format: None,
                 format_per_op: None,
+                request_id: None,
             })
             .await
             .expect("comm dispatch must not error");
@@ -3506,7 +3511,7 @@ id = "lambda:project-actor"
         }
     }
 
-    /// Regression for B-BLOCKER-1 (design review critic): the multi-backend boot path
+    /// Regression: the multi-backend boot path
     /// MUST thread the configured actor identity (issue #75) into the registry,
     /// exactly as the single-backend path does. If `with_actor_id` is dropped,
     /// dispatch mints `ActorRef::anonymous()` and `comm.inbox` reverts to
@@ -3571,6 +3576,7 @@ id = "lambda:project-actor"
                         save_to: None,
                         format: None,
                         format_per_op: None,
+                        request_id: None,
                     })
                     .await
                     .expect("dispatch must not error");
@@ -3601,7 +3607,7 @@ id = "lambda:project-actor"
         );
         assert!(
             !contents.contains(&"for-a"),
-            "actor-b must NOT see the message addressed to actor-a (leak #75 / B-BLOCKER-1); \
+            "actor-b must NOT see the message addressed to actor-a (leak #75); \
              got {contents:?} — actor identity was not threaded into the multi-backend registry"
         );
     }
@@ -4141,6 +4147,7 @@ id = "lambda:project-actor"
                         save_to: None,
                         format: None,
                         format_per_op: None,
+                        request_id: None,
                     })
                     .await
                     .expect("dispatch must not error")
@@ -4373,7 +4380,7 @@ id = "lambda:project-actor"
         }
     }
 
-    // --- log_eligible_poll_failure: edge-triggered warn (internal review round 1 finding 2) ---
+    // --- log_eligible_poll_failure: edge-triggered warn ---
 
     #[cfg(feature = "channel-email")]
     mod eligible_poll_failure_log_tests {
@@ -4497,8 +4504,8 @@ id = "lambda:project-actor"
         fn sustained_capped_pressure_produces_exactly_one_warn() {
             // Simulate one escalation edge followed by several repeats at the
             // same (capped) step, as the poll loop would emit them across
-            // consecutive ticks -- exactly the "riding the cap" scenario
-            // internal review round 1 flagged as spamming a WARN per retry.
+            // consecutive ticks, reproducing the "riding the cap" scenario
+            // that previously spammed a WARN per retry.
             let buffer = Arc::new(Mutex::new(Vec::new()));
             let subscriber = CaptureSubscriber {
                 events: Arc::clone(&buffer),
@@ -4639,7 +4646,7 @@ id = "lambda:project-actor"
     }
 
     // --- enforce_strict_actor_mode: shared seam regression tests ---
-    // These cover the enforcement seam itself (finding 1 regression guard).
+    // These cover the enforcement seam itself (regression guard).
 
     #[test]
     #[serial]
@@ -4723,10 +4730,9 @@ id = "lambda:project-actor"
         );
     }
 
-    // --- build_server's returned schedule-tick runtime (ADR-106 fix-round,
-    // codex PR #782 review, High finding) ---
+    // --- build_server's returned schedule-tick runtime (ADR-106, PR #782) ---
     //
-    // Before this fix-round, the daemon-resident tick (`schedule_tick_loop`)
+    // Before this fix, the daemon-resident tick (`schedule_tick_loop`)
     // reconstructed its OWN `RuntimeConfig::default()` from raw `args.db` and
     // an inferred namespace, discarding everything `build_server` resolves
     // from `--config`/`[[backends]]`/`--actor`/`--pack`. These regressions
@@ -4826,7 +4832,7 @@ id = "lambda:project-actor"
     #[serial]
     fn build_server_schedule_tick_runtime_satisfies_strict_actor_mode_like_the_live_server() {
         // Regression for the exact "strict actor mode can make every tick
-        // fail" scenario codex's High finding named: before this fix, the
+        // fail" scenario this fix addressed: before this fix, the
         // tick's separately-reconstructed `RuntimeConfig::default()` carried
         // NO actor regardless of what `--actor` the daemon itself was given,
         // so a strict-mode daemon's tick would trip `enforce_strict_actor_mode`
@@ -4884,7 +4890,7 @@ id = "lambda:project-actor"
         // "schedule" pack is explicitly routed to its OWN backend, distinct
         // from "main". `build_server`'s returned schedule-tick runtime must
         // WRITE INTO that declared backend's file, not main's — proving the
-        // High-finding fix threads the correct per-pack runtime through for
+        // correct per-pack runtime is threaded through for
         // multi-backend boots too, not only the single-backend common case.
         // (`RuntimeConfig.db_path` is not itself a reliable signal here —
         // per-pack multi-backend runtimes only override `backend_id`, not
@@ -4988,14 +4994,14 @@ backend = "schedule-backend"
         );
     }
 
-    /// Multi-backend ACTION-DISPATCH routing (codex PR #782 review round 2,
-    /// High finding): `schedule` defaults to "main" (no `[packs.schedule]`
+    /// Multi-backend ACTION-DISPATCH routing (PR #782):
+    /// `schedule` defaults to "main" (no `[packs.schedule]`
     /// entry declared), while `kg` — the pack whose `create` verb the stored
     /// action below replays — is routed to a SEPARATE declared backend. A due
     /// scheduled event whose action writes through `kg` must land its side
     /// effect in `kg`'s OWN declared backend, never "main".
     ///
-    /// This is the regression the round-1 fix-round was missing: round 1
+    /// This is the regression the prior fix was missing: it
     /// fixed SCANNING (`scheduled_event` rows now correctly read from
     /// `schedule`'s own backend, proven by
     /// `build_server_schedule_tick_uses_the_declared_multi_backend_not_main`
@@ -5227,7 +5233,7 @@ backend = "kg-backend"
             );
         }
 
-        /// #606 round-1 internal review, Blocker finding: a daemon polling under a
+        /// #606: a daemon polling under a
         /// non-local `KHIVE_EMAIL_INGEST_NAMESPACE` must not cause a client-role
         /// no-arg `comm.health()` to report empty state. `record_channel_heartbeat`
         /// takes no `namespace` parameter — the write is unconditionally pinned to
@@ -5293,7 +5299,7 @@ backend = "kg-backend"
         }
     }
 
-    // --- ChannelRegistry composite-key production path (round-1 internal review, High finding) ---
+    // --- ChannelRegistry composite-key production path ---
 
     #[cfg(feature = "channel-email")]
     mod composite_key_registry_tests {
@@ -5423,7 +5429,7 @@ backend = "kg-backend"
         }
     }
 
-    // --- note_already_delivered: outbox defensive-guard regression (round-2 finding 1) ---
+    // --- note_already_delivered: outbox defensive-guard regression ---
 
     #[cfg(feature = "channel-email")]
     mod outbox_delivered_guard_tests {
@@ -5889,7 +5895,7 @@ backend = "kg-backend"
         }
     }
 
-    /// Regression tests for issue #449's daemon wiring (Blocker fix): the
+    /// Regression tests for issue #449's daemon wiring: the
     /// poll loop must drive `cursor_get` -> `poll_page` -> every
     /// `comm.ingest` -> `cursor_commit`, committing the cursor only when
     /// every envelope in the page durably ingested.
@@ -6103,7 +6109,7 @@ backend = "kg-backend"
         /// a `next_checkpoint` that `comm.cursor_commit` itself rejects
         /// (`generation: 0` is outside its documented `1..=i64::MAX` range).
         /// Exercises the daemon's `commit_channel_cursor`-`Err` branch
-        /// (issue #449 Blocker fix): every other test in this module drives
+        /// (issue #449): every other test in this module drives
         /// a `cursor_get` failure or a `comm.ingest` failure, never a
         /// rejected commit itself, so that branch was otherwise dead from
         /// this suite's perspective.
@@ -6251,7 +6257,7 @@ backend = "kg-backend"
             }
         }
 
-        /// khive #449 High follow-up (Medium-2): the connector- and
+        /// khive #449 follow-up: the connector- and
         /// channel-level poison-UID tests prove a malformed message becomes
         /// a quarantine-shaped `ChannelEnvelope`, but neither proves the
         /// daemon actually turns that into a durable, queryable record.
@@ -6394,7 +6400,7 @@ backend = "kg-backend"
         }
     }
 
-    /// Regression tests for issue #449's High follow-up: a channel's
+    /// Regression tests for issue #449: a channel's
     /// bootstrap `since` floor (the date used in the IMAP `SINCE` clause
     /// while no UID high-water is committed yet) must only advance once
     /// `cursor_get`, `poll_page`, every `comm.ingest`, and `cursor_commit`
@@ -6735,7 +6741,7 @@ backend = "kg-backend"
             );
         }
 
-        /// First-tick regression (issue #449 High, codex re-review): the
+        /// First-tick regression (issue #449): the
         /// very first bootstrap floor a channel ever sees must be seeded
         /// from when the daemon started, not from whenever the loop's
         /// first sleep happens to finish. Runs on a live (unpaused) clock

@@ -14,8 +14,8 @@ pub mod tunable;
 
 pub use pack::MemoryPack;
 
-/// Bump the durable memory-ANN corpus epoch (#812 review REQUEST CHANGES
-/// HIGH). `kkernel reindex` mutates note vectors and deletes the persisted
+/// Bump the durable memory-ANN corpus epoch (#812). `kkernel reindex` mutates
+/// note vectors and deletes the persisted
 /// Vamana snapshot directly, out of process from any running khive daemon —
 /// its in-memory write-generation counter (`ann::bump_generation`) is simply
 /// unreachable from a separate process. Call this after invalidating the
@@ -29,8 +29,8 @@ pub async fn bump_memory_ann_epoch(
     ann::bump_durable_epoch(rt).await
 }
 
-/// Ensure the `memory_ann_epoch` table exists on `rt` (idempotent, #812
-/// review REQUEST CHANGES MEDIUM — pack schema contract). Declared via
+/// Ensure the `memory_ann_epoch` table exists on `rt` (idempotent, #812).
+/// Declared via
 /// `MemoryPack::SCHEMA_PLAN` for daemon boot (`server.rs`/`serve.rs` apply
 /// every loaded pack's schema plan up front), but `kkernel reindex` runs
 /// directly against a raw `KhiveRuntime` without ever booting a pack

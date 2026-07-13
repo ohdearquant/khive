@@ -8,10 +8,11 @@ use crate::recall_feedback::{on_recall_hit, on_recall_miss};
 use serde_json::{json, Value};
 use uuid::Uuid;
 
-use khive_brain_core::PackTunable;
+use khive_brain_core::{compute_query_class, PackTunable};
 use khive_fusion::FusionStrategy;
 use khive_runtime::{
-    micros_to_iso, Namespace, NamespaceToken, RuntimeError, SearchSource, VerbRegistry,
+    micros_to_iso, KhiveRuntime, Namespace, NamespaceToken, RuntimeError, SearchSource,
+    VerbRegistry,
 };
 use khive_storage::types::{EdgeFilter, PageRequest};
 use khive_storage::EdgeRelation;
@@ -368,6 +369,14 @@ impl MemoryPack {
         }
 
         if fused.is_empty() {
+            self.track_recall_serve(
+                token,
+                registry,
+                query_trimmed,
+                served_by_profile_id.as_deref(),
+                Vec::new(),
+                recall_start.elapsed().as_micros() as i64,
+            );
             if let Ok(mut state) = self.recall_state.lock() {
                 on_recall_miss(&mut state);
             }
@@ -394,16 +403,44 @@ impl MemoryPack {
         // `entity_names` feeds the `EntityMatch` ×1.3 boost in `default_adjustments`
         // (scoring.rs). It used to be purely caller-supplied and no caller ever
         // populated it, leaving the boost dead code in practice. Opt-out
-        // semantics: `Some(_)` — including `Some([])` — is explicit caller
+        // semantics: `Some(_)`, including `Some([])`, is explicit caller
         // intent and is always honored verbatim (an empty explicit list means
         // "no entity boost", not "auto-derive one for me"). Auto-extraction
         // via `extract_entity_candidates` only runs on `None`, i.e. when the
         // caller didn't send the field at all. See `extract_entity_candidates`
         // for the extraction rule and why it's grounded in how `EntityMatch`
         // actually matches.
+        // ADR-104 §5 (Stage C): when the caller didn't supply `entity_names`
+        // at all, extend the #738 capitalized-token heuristic with a second,
+        // precision-safe source: query tokens/bigrams that match a real KG
+        // entity name under the bounded Stage C case contract, resolved via
+        // one batched lookup
+        // (`entity_anchored_candidates`, R1). A lookup failure degrades to
+        // the capitalized-token list alone (never fails the recall); an
+        // explicit `entity_names` (including `Some([])`) still bypasses both
+        // sources entirely. #738 opt-out semantics are unchanged.
         let entity_names: Vec<String> = match &p.entity_names {
             Some(names) => names.iter().map(|s| s.to_lowercase()).collect(),
-            None => extract_entity_candidates(query_trimmed),
+            None => {
+                let mut candidates = extract_entity_candidates(query_trimmed);
+                match self.entity_anchored_candidates(token, query_trimmed).await {
+                    Ok(anchored) => {
+                        for name in anchored {
+                            if !candidates.contains(&name) {
+                                candidates.push(name);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            "ADR-104 §5: entity-anchored candidate lookup failed; \
+                             falling back to capitalized-token extraction only"
+                        );
+                    }
+                }
+                candidates
+            }
         };
 
         struct ScoredNote {
@@ -779,44 +816,18 @@ impl MemoryPack {
             }
         }
 
-        if !results.is_empty() {
-            let target_ids: Vec<String> = results
-                .iter()
-                .filter_map(|r| r.get("id").and_then(Value::as_str).map(str::to_string))
-                .collect();
-            if !target_ids.is_empty() {
-                let registry_owned = registry.clone();
-                let namespace = token.namespace().as_str().to_string();
-                let query_raw = query_trimmed.to_string();
-                let served_by = served_by_profile_id.clone();
-                let served_at_us = chrono::Utc::now().timestamp_micros();
-                // Tracked, not a bare tokio::spawn, so daemon shutdown's drain()
-                // waits for this append instead of a SIGTERM aborting it
-                // mid-flight with no ledger row and no log (internal review PR #583
-                // round-1 Medium). The response path still only pays for the
-                // enqueue (an atomic increment) — never the SQL write itself.
-                khive_runtime::track_background_task(async move {
-                    let mut ledger_params = json!({
-                        "namespace": namespace,
-                        "consumer_kind": "recall",
-                        "target_ids": target_ids,
-                        "query_raw": query_raw,
-                        "served_at": served_at_us,
-                    });
-                    if let Some(profile_id) = served_by {
-                        ledger_params["served_by_profile_id"] = json!(profile_id);
-                    }
-                    if let Err(e) = registry_owned
-                        .dispatch("brain.record_serve", ledger_params)
-                        .await
-                    {
-                        eprintln!(
-                            "[memory] serve ledger dispatch failed (non-fatal, ADR-081 §4): {e}"
-                        );
-                    }
-                });
-            }
-        }
+        let target_ids = results
+            .iter()
+            .filter_map(|r| r.get("id").and_then(Value::as_str).map(str::to_string))
+            .collect();
+        self.track_recall_serve(
+            token,
+            registry,
+            query_trimmed,
+            served_by_profile_id.as_deref(),
+            target_ids,
+            recall_start.elapsed().as_micros() as i64,
+        );
 
         // Update recall-domain posteriors before returning.
         {
@@ -836,7 +847,7 @@ impl MemoryPack {
         }
 
         if is_verbose && candidates.vector_hits_per_model.len() > 1 {
-            // Review finding (#733 fix-round 1, High): the ANN index is global
+            // #733: the ANN index is global
             // across namespaces (`ann.rs`: "one index per model covers all
             // namespaces"), so `candidates.vector_hits_per_model` still
             // carries raw, pre-hydration over-fetch candidates from outside
@@ -892,28 +903,183 @@ impl MemoryPack {
 
         to_json(&results)
     }
+
+    fn track_recall_serve(
+        &self,
+        token: &NamespaceToken,
+        registry: &VerbRegistry,
+        query_raw: &str,
+        served_by_profile_id: Option<&str>,
+        target_ids: Vec<String>,
+        latency_us: i64,
+    ) {
+        let result_count = target_ids.len();
+        let registry = registry.clone();
+        let namespace = token.namespace().as_str().to_string();
+        let query_raw = query_raw.to_string();
+        let query_class = compute_query_class(&query_raw);
+        let served_by_profile_id = served_by_profile_id.map(str::to_string);
+        let served_at_us = chrono::Utc::now().timestamp_micros();
+        let actor = format!("{}:{}", token.actor().kind, token.actor().id);
+        let runtime = self.runtime.clone();
+        let token = token.clone();
+
+        khive_runtime::track_background_task(async move {
+            let mut ledger_params = json!({
+                "namespace": namespace,
+                "consumer_kind": "recall",
+                "target_ids": target_ids,
+                "query_raw": query_raw,
+                "served_at": served_at_us,
+            });
+            if let Some(ref profile_id) = served_by_profile_id {
+                ledger_params["served_by_profile_id"] = json!(profile_id);
+            }
+            if let Err(error) = registry.dispatch("brain.record_serve", ledger_params).await {
+                tracing::warn!(
+                    error = %error,
+                    "serve ledger dispatch failed; recall result is unaffected"
+                );
+            }
+
+            emit_recall_executed_event(
+                &runtime,
+                &token,
+                actor,
+                served_by_profile_id,
+                query_class,
+                result_count,
+                latency_us,
+            )
+            .await;
+        });
+    }
+}
+
+/// Append best-effort recall telemetry without affecting the recall response.
+async fn emit_recall_executed_event(
+    rt: &KhiveRuntime,
+    token: &NamespaceToken,
+    actor: String,
+    served_by_profile_id: Option<String>,
+    query_class: String,
+    result_count: usize,
+    latency_us: i64,
+) {
+    let store = match rt.events(token) {
+        Ok(store) => store,
+        Err(err) => {
+            tracing::warn!(
+                error = %err,
+                namespace = token.namespace().as_str(),
+                event_kind = "recall_executed",
+                "recall_executed event store acquisition failed; recall result is unaffected"
+            );
+            return;
+        }
+    };
+    let payload = json!({
+        "actor": actor,
+        "served_by_profile_id": served_by_profile_id,
+        "query_class": query_class,
+        "result_count": result_count,
+        "latency_us": latency_us,
+    });
+    let event = khive_storage::Event::new(
+        token.namespace().as_str(),
+        "memory.recall",
+        khive_types::EventKind::RecallExecuted,
+        khive_types::SubstrateKind::Event,
+        actor,
+    )
+    .with_payload(payload)
+    .with_duration_us(latency_us);
+    if let Err(err) = store.append_event(event).await {
+        tracing::warn!(
+            error = %err,
+            "recall_executed event append failed; recall result is unaffected"
+        );
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use std::collections::{HashMap, HashSet};
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex as StdMutex};
 
     use async_trait::async_trait;
     use khive_pack_kg::KgPack;
-    use khive_runtime::{EmbedderProvider, KhiveRuntime, Namespace, VerbRegistryBuilder};
+    use khive_runtime::{
+        EmbedderProvider, KhiveRuntime, Namespace, RuntimeError, VerbRegistryBuilder,
+    };
+    use khive_storage::Entity;
     use lattice_embed::{EmbedError, EmbeddingModel, EmbeddingService};
     use serde_json::Value;
     use serial_test::serial;
+    use tokio::sync::Notify;
+    use tracing::field::{Field, Visit};
     use uuid::Uuid;
 
     use crate::MemoryPack;
+
+    #[derive(Clone, Debug, Default)]
+    struct CapturedWarning {
+        fields: HashMap<String, String>,
+    }
+
+    #[derive(Default)]
+    struct WarningVisitor(CapturedWarning);
+
+    impl Visit for WarningVisitor {
+        fn record_str(&mut self, field: &Field, value: &str) {
+            self.0
+                .fields
+                .insert(field.name().to_string(), value.to_string());
+        }
+
+        fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+            self.0.fields.insert(
+                field.name().to_string(),
+                format!("{value:?}").trim_matches('"').to_string(),
+            );
+        }
+    }
+
+    struct WarningCapture {
+        warnings: Arc<StdMutex<Vec<CapturedWarning>>>,
+    }
+
+    impl tracing::Subscriber for WarningCapture {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+
+        fn event(&self, event: &tracing::Event<'_>) {
+            if *event.metadata().level() == tracing::Level::WARN {
+                let mut visitor = WarningVisitor::default();
+                event.record(&mut visitor);
+                self.warnings.lock().unwrap().push(visitor.0);
+            }
+        }
+
+        fn enter(&self, _: &tracing::span::Id) {}
+
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
 
     /// #388 regression (sanitizer path): `sanitize_fts5_query` (khive-db) strips
     /// `$`, so this query no longer reaches the runtime-level fail-open `Err` arm
     /// added in PR #389 — it exercises the *sanitizer*, not the fail-open net.
     /// See `recall_with_residual_fts5_char_degrades_and_vector_leg_survives` below
-    /// for a test that forces the `Err` arm itself (PR #389 internal review round 1 Medium).
+    /// for a test that forces the `Err` arm itself (PR #389).
     ///
     /// `#[serial(background_tasks)]`: a non-empty `memory.recall` fires the
     /// serve-ledger append via `khive_runtime::track_background_task`
@@ -1026,20 +1192,18 @@ mod tests {
         }
     }
 
-    /// #569 regression: unlike `$`, `@` is NOT stripped by `sanitize_fts5_query`
-    /// (by design — the sanitizer stays minimal per #388 scope). SQLite FTS5's
-    /// bareword parser still rejects `@` unconditionally, so this query reaches
-    /// the `Err` arm in `collect_recall_text_hits`
-    /// (khive-pack-memory/handlers/common.rs), which must now fail loud
-    /// instead of degrading to vector-only results as it did before #569.
-    /// This assertion fails against the pre-#569 fail-open behavior (which
-    /// returned `Ok` with a non-empty result here) and passes once the FTS
-    /// leg fails closed.
+    /// #916 regression: `@` used to reach SQLite FTS5's bareword parser raw
+    /// (`sanitize_fts5_query` did not strip it) and crash it, so this query
+    /// used to reach the `Err` arm in `collect_recall_text_hits`
+    /// (khive-pack-memory/handlers/common.rs), which failed loud per #569.
+    /// `sanitize_fts5_token_group`'s bareword-safety gate (#916) now routes
+    /// `@` through the quoted-phrase alternative instead, so `memory.recall`
+    /// succeeds end to end through verb dispatch.
     // `#[serial(background_tasks)]`: kept to match the fixture setup used by
     // the sibling dollar-sign test above.
     #[tokio::test]
     #[serial(background_tasks)]
-    async fn recall_with_residual_fts5_char_fails_loud() {
+    async fn recall_with_residual_fts5_char_now_sanitized() {
         const MODEL: &str = "recall-residual-char-test-model";
         const DIMS: usize = 32;
         const NOTE_TEXT: &str = "foo@bar chain call helper note";
@@ -1079,11 +1243,13 @@ mod tests {
             )
             .await;
 
+        let value = result.unwrap_or_else(|e| {
+            panic!("#916 memory.recall must not fail on an '@'-bearing query, got: {e:?}")
+        });
+        let hits = value.as_array().expect("recall result must be an array");
         assert!(
-            result.is_err(),
-            "#569 memory.recall must fail loud when the FTS leg errors on a residual \
-             FTS5 char ('@'), not silently degrade to vector-only results, got: {:?}",
-            result.ok()
+            !hits.is_empty(),
+            "#916 '@'-bearing query must still find the seeded note; got {value:?}"
         );
     }
 
@@ -1271,7 +1437,7 @@ mod tests {
         );
     }
 
-    /// #836 review fix: on a genuine SELF-BUILD timeout — no other holder of
+    /// PR #836 fix: on a genuine SELF-BUILD timeout, no other holder of
     /// the per-model `model_warm_lock` (unlike
     /// `recall_836_degrades_to_fts_only_when_ann_lock_is_held` above, which
     /// simulates a concurrent holder), this recall's own
@@ -1364,7 +1530,7 @@ mod tests {
         assert!(
             warmed,
             "the detached build must eventually install a fresh ANN index for \
-             {MODEL} instead of being dropped on timeout (#836 review)"
+             {MODEL} instead of being dropped on timeout (#836)"
         );
 
         // A later recall must now take the vector path — no degraded marker.
@@ -1499,7 +1665,7 @@ mod tests {
         );
 
         // The ledger append is fired via track_background_task off the response
-        // path — poll briefly rather than assume it has landed by the time recall returns.
+        // path, so poll briefly rather than assume it has landed by the time recall returns.
         let target_id = note_id.id.to_string();
         let mut found = false;
         for _ in 0..100 {
@@ -1531,6 +1697,338 @@ mod tests {
             found,
             "serve ledger row for the recalled target must appear within 2s"
         );
+    }
+
+    // ── #866: `recall_executed` event-plane emission ────────────────────────
+
+    // `#[serial(background_tasks)]`: shares `recall_stamps_served_by_profile_id_
+    // and_appends_serve_ledger_row`'s rationale above: this test drives the
+    // same `track_background_task`-fired path (serve-ledger append +
+    // `recall_executed` emission now live in the same tracked task).
+    #[tokio::test]
+    #[serial(background_tasks)]
+    async fn recall_emits_exactly_one_recall_executed_event() {
+        let rt = build_full_rt_with_brain();
+        let ns = Namespace::parse("local").expect("local namespace");
+        let token = rt.authorize(ns.clone()).expect("authorize local");
+
+        rt.create_note(
+            &token,
+            "memory",
+            None,
+            "866 recall executed event note",
+            Some(0.7),
+            None,
+            vec![],
+        )
+        .await
+        .expect("create note");
+
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(KgPack::new(rt.clone()));
+        builder.register(MemoryPack::new(rt.clone()));
+        builder.register(khive_pack_brain::BrainPack::new(rt.clone()));
+        let registry = builder.build().expect("registry");
+
+        let result = registry
+            .dispatch(
+                "memory.recall",
+                serde_json::json!({
+                    "namespace": ns.as_str(),
+                    "query": "866 recall executed event note",
+                    "limit": 10
+                }),
+            )
+            .await
+            .expect("memory.recall");
+        let hits = result.as_array().expect("bare array result");
+        assert!(!hits.is_empty(), "must find the seeded note");
+
+        // The emission is fired via track_background_task off the response
+        // path (same seam as the serve-ledger append), so poll briefly rather
+        // than assume it has landed by the time recall returns.
+        let store = rt.events(&token).expect("event store for local namespace");
+        let mut recall_events = Vec::new();
+        for _ in 0..100 {
+            let page = store
+                .query_events(
+                    khive_storage::EventFilter {
+                        kinds: vec![khive_types::EventKind::RecallExecuted],
+                        ..Default::default()
+                    },
+                    khive_storage::types::PageRequest {
+                        limit: 50,
+                        offset: 0,
+                    },
+                )
+                .await
+                .expect("query_events");
+            if !page.items.is_empty() {
+                recall_events = page.items;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+
+        assert_eq!(
+            recall_events.len(),
+            1,
+            "exactly one recall_executed event per recall serve, got: {recall_events:?}"
+        );
+        let event = &recall_events[0];
+        assert_eq!(event.kind, khive_types::EventKind::RecallExecuted);
+        assert_eq!(event.verb, "memory.recall");
+        assert_eq!(
+            event.payload["result_count"],
+            serde_json::json!(hits.len()),
+            "result_count must match the number of returned results"
+        );
+        assert_eq!(
+            event.payload["served_by_profile_id"],
+            serde_json::Value::Null,
+            "no profile was bound/resolved for this call"
+        );
+        assert!(
+            event.payload["query_class"]
+                .as_str()
+                .is_some_and(|s| !s.is_empty()),
+            "query_class must be a non-empty deterministic key, got: {:?}",
+            event.payload["query_class"]
+        );
+        assert!(
+            event.payload["latency_us"]
+                .as_i64()
+                .is_some_and(|us| us >= 0),
+            "latency_us must be a non-negative measured duration, got: {:?}",
+            event.payload["latency_us"]
+        );
+        assert!(
+            event.payload["actor"]
+                .as_str()
+                .is_some_and(|s| !s.is_empty()),
+            "actor must be stamped, got: {:?}",
+            event.payload["actor"]
+        );
+        assert_eq!(event.payload["actor"], serde_json::json!(event.actor));
+
+        let counts = registry
+            .dispatch(
+                "brain.event_counts",
+                serde_json::json!({
+                    "namespace": ns.as_str(),
+                    "since": "1970-01-01T00:00:00Z",
+                    "kind": "recall_executed",
+                }),
+            )
+            .await
+            .expect("brain.event_counts");
+        assert_eq!(counts["total"], serde_json::json!(1));
+        assert_eq!(
+            counts["counts_by_kind"]["recall_executed"],
+            serde_json::json!(1)
+        );
+    }
+
+    #[tokio::test]
+    #[serial(background_tasks)]
+    async fn successful_empty_recall_emits_recall_executed_event() {
+        let rt = build_full_rt_with_brain();
+        let ns = Namespace::parse("local").expect("local namespace");
+        let token = rt.authorize(ns.clone()).expect("authorize local");
+
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(KgPack::new(rt.clone()));
+        builder.register(MemoryPack::new(rt.clone()));
+        builder.register(khive_pack_brain::BrainPack::new(rt.clone()));
+        let registry = builder.build().expect("registry");
+
+        let result = registry
+            .dispatch(
+                "memory.recall",
+                serde_json::json!({
+                    "namespace": ns.as_str(),
+                    "query": "no matching memory exists",
+                    "limit": 10
+                }),
+            )
+            .await
+            .expect("memory.recall");
+        assert_eq!(result, serde_json::json!([]));
+
+        let store = rt.events(&token).expect("event store for local namespace");
+        let mut recall_events = Vec::new();
+        for _ in 0..100 {
+            let page = store
+                .query_events(
+                    khive_storage::EventFilter {
+                        kinds: vec![khive_types::EventKind::RecallExecuted],
+                        ..Default::default()
+                    },
+                    khive_storage::types::PageRequest {
+                        limit: 50,
+                        offset: 0,
+                    },
+                )
+                .await
+                .expect("query_events");
+            if !page.items.is_empty() {
+                recall_events = page.items;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+
+        assert_eq!(recall_events.len(), 1);
+        assert_eq!(
+            recall_events[0].payload["result_count"],
+            serde_json::json!(0)
+        );
+    }
+
+    #[tokio::test]
+    #[serial(background_tasks)]
+    async fn recall_failure_emits_no_recall_executed_event() {
+        let rt = build_full_rt_with_brain();
+        let ns = Namespace::parse("local").expect("local namespace");
+        let token = rt.authorize(ns.clone()).expect("authorize local");
+
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(KgPack::new(rt.clone()));
+        builder.register(MemoryPack::new(rt.clone()));
+        builder.register(khive_pack_brain::BrainPack::new(rt.clone()));
+        let registry = builder.build().expect("registry");
+
+        // `RecallParams::query` has no `#[serde(default)]`, so omitting it fails
+        // deserialization before the handler can schedule telemetry.
+        let result = registry
+            .dispatch(
+                "memory.recall",
+                serde_json::json!({
+                    "namespace": ns.as_str(),
+                    "limit": 10
+                }),
+            )
+            .await;
+        assert!(
+            result.is_err(),
+            "a recall missing the required `query` field must fail, not silently succeed"
+        );
+
+        // Give any (incorrectly fired) background emission a moment to land,
+        // then assert the event plane stayed empty for this kind.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let store = rt.events(&token).expect("event store for local namespace");
+        let page = store
+            .query_events(
+                khive_storage::EventFilter {
+                    kinds: vec![khive_types::EventKind::RecallExecuted],
+                    ..Default::default()
+                },
+                khive_storage::types::PageRequest {
+                    limit: 50,
+                    offset: 0,
+                },
+            )
+            .await
+            .expect("query_events");
+        assert!(
+            page.items.is_empty(),
+            "a failed recall must not emit any recall_executed event, got: {:?}",
+            page.items
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[serial(background_tasks)]
+    async fn recall_event_store_acquisition_failure_warns_without_failing_response() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let db_path = tmp.path().join("khive.db");
+        let backend = Arc::new(khive_db::StorageBackend::sqlite(&db_path).expect("backend"));
+        {
+            let mut writer = backend.pool().writer().expect("migration writer");
+            khive_db::run_migrations(writer.conn_mut()).expect("migrations");
+        }
+        let config = khive_runtime::RuntimeConfig {
+            db_path: Some(db_path),
+            embedding_model: None,
+            additional_embedding_models: vec![],
+            packs: vec!["kg".to_string(), "memory".to_string(), "brain".to_string()],
+            ..khive_runtime::RuntimeConfig::default()
+        };
+        let rt = KhiveRuntime::from_backend(Arc::clone(&backend), config);
+        let ns = Namespace::parse("local").expect("local namespace");
+        let token = rt.authorize(ns.clone()).expect("authorize local");
+
+        rt.create_note(
+            &token,
+            "memory",
+            None,
+            "event acquisition failure recall note",
+            Some(0.7),
+            None,
+            vec![],
+        )
+        .await
+        .expect("create note");
+
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(KgPack::new(rt.clone()));
+        builder.register(MemoryPack::new(rt.clone()));
+        builder.register(khive_pack_brain::BrainPack::new(rt.clone()));
+        let registry = builder.build().expect("registry");
+
+        {
+            let writer = backend.pool().writer().expect("fault injection writer");
+            writer
+                .conn()
+                .execute_batch("DROP TABLE events; PRAGMA query_only = ON;")
+                .expect("remove only the event schema and reject its recreation");
+        }
+
+        let warnings = Arc::new(StdMutex::new(Vec::new()));
+        let _capture = tracing::subscriber::set_default(WarningCapture {
+            warnings: Arc::clone(&warnings),
+        });
+
+        let result = registry
+            .dispatch(
+                "memory.recall",
+                serde_json::json!({
+                    "namespace": ns.as_str(),
+                    "query": "event acquisition failure recall note",
+                    "limit": 10
+                }),
+            )
+            .await
+            .expect("event-store acquisition failure must not fail memory.recall");
+        assert!(!result.as_array().expect("bare array result").is_empty());
+
+        let warning = loop {
+            if let Some(warning) = warnings.lock().unwrap().iter().find(|warning| {
+                warning.fields.get("message").map(String::as_str)
+                    == Some("recall_executed event store acquisition failed; recall result is unaffected")
+            }).cloned() {
+                break warning;
+            }
+            assert!(
+                khive_runtime::background_task_count() > 0,
+                "background task completed without an observable acquisition warning"
+            );
+            tokio::task::yield_now().await;
+        };
+
+        assert_eq!(
+            warning.fields.get("namespace").map(String::as_str),
+            Some("local")
+        );
+        assert_eq!(
+            warning.fields.get("event_kind").map(String::as_str),
+            Some("recall_executed")
+        );
+        assert!(warning
+            .fields
+            .get("error")
+            .is_some_and(|error| !error.is_empty()));
     }
 
     // `#[serial(background_tasks)]`: see the note on
@@ -2094,7 +2592,7 @@ mod tests {
     /// `#[serial(background_tasks)]`: non-empty recall — see the note on
     /// `recall_with_dollar_sign_query_does_not_error` above.
     ///
-    /// [High-2 regression] `entity_names: []` is explicit caller intent
+    /// `entity_names: []` is explicit caller intent
     /// ("no entity boost"), distinct from omitting the field. This uses the
     /// exact corpus/query from the sibling test above — where omitting
     /// `entity_names` auto-extracts `"zenlake"` and fires EntityMatch — and
@@ -3243,7 +3741,7 @@ mod tests {
         );
     }
 
-    /// Isolation (row-B gate, internal review PR round-1 Medium): the earlier
+    /// Isolation (row-B gate): the earlier
     /// feedback-lift and clamp tests above give one profile strictly more
     /// feedback than another, which also perturbs that profile's *global*
     /// salience posterior (component 1, ADR-104 §1) — `on_explicit_feedback`
@@ -3395,7 +3893,7 @@ mod tests {
         );
     }
 
-    /// Regression (row-B gate, internal review PR round-1 High): the entity
+    /// Regression (row-B gate): the entity
     /// term must apply on the weighted-rerank path too, not only the
     /// default `rank_score` path. `weighted_rerank` recomposes its score
     /// from raw relevance/salience/temporal features and never reads
@@ -3850,7 +4348,7 @@ mod tests {
             "an invalid namespace string must be a per-op error, not a silent fallback",
         );
         let msg = err.to_string();
-        // Review finding (#733 fix-round 1, Medium): asserting only that the
+        // #733: asserting only that the
         // message contains the word "namespace" passes vacuously (every
         // variant of this error, valid or not, contains that word). Assert
         // the *supplied* invalid value itself appears, proving the error
@@ -3954,7 +4452,7 @@ mod tests {
         // path fans out to every *registered* model when the field is
         // omitted (`resolve_embedding_model` only accepts lattice aliases —
         // an explicit custom provider name here would hit `UnknownModel`,
-        // same gotcha documented on `recall_with_residual_fts5_char_fails_loud`
+        // same gotcha documented on `recall_with_residual_fts5_char_now_sanitized`
         // above). `NS733_ANN_MODEL` is the only model registered on this
         // runtime, so auto-detect resolves to exactly it.
         for i in 0..NS733_FILLER_COUNT {
@@ -4037,7 +4535,7 @@ mod tests {
         );
     }
 
-    // ── #733 fix-round 1 (codex High): verbose multi-model breakdown must not
+    // ── #733: verbose multi-model breakdown must not
     // leak off-namespace ANN candidate IDs ──────────────────────────────────
 
     const NS733B_MODEL_A: &str = "ns733b-breakdown-model-a";
@@ -4075,9 +4573,9 @@ mod tests {
     /// 0.9, target cos 0.5). No `embedding_model` on remember: auto-detect
     /// fans out to every registered model, matching
     /// `ns733_seed_three_memories`'s documented gotcha above. Shared between
-    /// the `memory.recall` verbose-breakdown regression (#733 fix-round 1,
-    /// High) and the `memory.recall_candidates` regression (#733 fix-round
-    /// 2, Medium) that protects `handle_recall_candidates`'s independent
+    /// the `memory.recall` verbose-breakdown regression (#733) and the
+    /// `memory.recall_candidates` regression (#733) that protects
+    /// `handle_recall_candidates`'s independent
     /// per-model serialization site (`sub_handlers.rs`). Returns
     /// `(local_filler_ids, target_id)`.
     async fn ns733b_seed_two_model_corpus(
@@ -4122,7 +4620,7 @@ mod tests {
         (local_filler_ids, target_id)
     }
 
-    /// Codex review finding (#733 fix-round 1, High): with `namespace="bench-a"`,
+    /// #733: with `namespace="bench-a"`,
     /// more than one registered embedding model, and `include_breakdown=true`,
     /// `memory.recall`'s verbose response embeds
     /// `candidates.vector_candidates_per_model` — built directly from the
@@ -4243,10 +4741,10 @@ mod tests {
         );
     }
 
-    // ── #733 fix-round 2 (codex Medium): `memory.recall_candidates` must be
+    // ── #733: `memory.recall_candidates` must be
     // covered by its own regression, independent of `memory.recall`'s ──────
 
-    /// Codex re-review finding (#733 fix-round 2, Medium): the fix-round-1
+    /// #733: the earlier
     /// regression above dispatches only `memory.recall` with
     /// `include_breakdown=true`, which is mutation-sensitive for
     /// `handle_recall`'s filter (`recall.rs`) but *not* for
@@ -4366,6 +4864,849 @@ mod tests {
             any_model_has_target,
             "the bench-a target must still appear in at least one model's \
              recall_candidates breakdown after the namespace filter: {per_model:?}"
+        );
+    }
+
+    // ── ADR-104 §5 (Stage C): entity-anchored candidate extraction ─────────────
+
+    /// Dispatches `memory.recall` against a fresh single-note corpus, exactly
+    /// like `dispatch_single_note_recall` above, but first seeds a real KG
+    /// entity (`entity_name`, when `Some`) directly into the entity store.
+    /// the record `entity_anchored_candidates` must find via its batched
+    /// lookup for the boost to fire on a lowercase or CJK query. Returns the
+    /// sole hit's `rank_score`.
+    async fn dispatch_single_note_recall_with_entity(
+        entity_name: Option<&str>,
+        content: &str,
+        query: &str,
+        entity_names: Option<&[&str]>,
+    ) -> f64 {
+        let rt = KhiveRuntime::memory().expect("in-memory runtime");
+        let ns = Namespace::parse("local").expect("local namespace");
+        let token = rt.authorize(ns.clone()).expect("authorize local");
+        rt.create_note(&token, "memory", None, content, Some(0.5), None, vec![])
+            .await
+            .expect("create note");
+
+        if let Some(name) = entity_name {
+            rt.entities(&token)
+                .expect("entity store")
+                .upsert_entity(Entity::new(ns.as_str(), "concept", name))
+                .await
+                .expect("seed entity");
+        }
+
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(KgPack::new(rt.clone()));
+        builder.register(MemoryPack::new(rt.clone()));
+        let registry = builder.build().expect("registry");
+
+        let mut params = serde_json::json!({
+            "query": query,
+            "fusion_strategy": "rrf",
+            "limit": 10
+        });
+        if let Some(names) = entity_names {
+            params["entity_names"] = serde_json::json!(names);
+        }
+
+        let result = registry
+            .dispatch("memory.recall", params)
+            .await
+            .expect("memory.recall");
+        let hits = result.as_array().expect("bare array result");
+        assert_eq!(hits.len(), 1, "single-note corpus must yield one hit");
+        hits[0]["rank_score"].as_f64().expect("rank_score")
+    }
+
+    /// Gate (a): a lowercase query naming a real KG entity gets the
+    /// candidate and the EntityMatch ×1.3 boost. `extract_entity_candidates`
+    /// (#738) extracts nothing here (no capitalized token in either the
+    /// query or the entity name). The lift can only come from the Stage C
+    /// batched entity-anchored lookup finding the seeded "zenlake" entity.
+    #[tokio::test]
+    #[serial(background_tasks)]
+    async fn adr104_stage_c_lowercase_query_naming_real_entity_gets_boost() {
+        const CONTENT: &str = "the committee reviewed the proposal from zenlake last week";
+        const QUERY: &str = "committee proposal zenlake";
+
+        let anchored_score =
+            dispatch_single_note_recall_with_entity(Some("zenlake"), CONTENT, QUERY, None).await;
+        let opted_out_score =
+            dispatch_single_note_recall_with_entity(Some("zenlake"), CONTENT, QUERY, Some(&[]))
+                .await;
+
+        assert!(
+            anchored_score > opted_out_score,
+            "a lowercase query naming a real entity must be boosted above the \
+             explicit opt-out baseline: anchored={anchored_score} opted_out={opted_out_score}"
+        );
+        let ratio = anchored_score / opted_out_score;
+        assert!(
+            (ratio - 1.3).abs() < 0.01,
+            "expected ~1.3x lift from EntityMatch firing on the entity-anchored \
+             candidate, got ratio {ratio}"
+        );
+    }
+
+    #[tokio::test]
+    #[serial(background_tasks)]
+    async fn adr104_stage_c_duplicate_name_crowding_preserves_each_candidate_boost() {
+        let rt = KhiveRuntime::memory().expect("in-memory runtime");
+        let ns = Namespace::parse("local").expect("local namespace");
+        let token = rt.authorize(ns.clone()).expect("authorize local");
+        let store = rt.entities(&token).expect("entity store");
+
+        let mut older_b = Entity::new(ns.as_str(), "concept", "crowdbeta");
+        older_b.created_at = 1;
+        older_b.updated_at = 1;
+        store
+            .upsert_entity(older_b)
+            .await
+            .expect("seed candidate B");
+
+        for created_at in 2..=258 {
+            let mut newer_a = Entity::new(ns.as_str(), "concept", "CrowdAlpha");
+            newer_a.created_at = created_at;
+            newer_a.updated_at = created_at;
+            store
+                .upsert_entity(newer_a)
+                .await
+                .expect("seed duplicate candidate A");
+        }
+
+        let anchored = MemoryPack::new(rt)
+            .entity_anchored_candidates(&token, "crowdalpha crowdbeta")
+            .await
+            .expect("Stage C lookup");
+        assert!(anchored.contains(&"crowdalpha".to_string()));
+        assert!(anchored.contains(&"crowdbeta".to_string()));
+
+        let baseline_names = vec!["crowdalpha".to_string()];
+        let now_millis = chrono::Utc::now().timestamp_millis();
+        let score = |entity_names: &[String]| {
+            crate::scoring::calculate_score(
+                &crate::scoring::ScoreInput {
+                    salience: 0.5,
+                    memory_type_str: "semantic",
+                    content: "the archive concerns crowdbeta",
+                    created_at_millis: now_millis,
+                    decay_factor: 0.005,
+                    now_millis,
+                    relevance_score: 0.2,
+                    entity_names,
+                },
+                &crate::scoring::ScoringConfig::default(),
+            )
+        };
+        let boosted = score(&anchored);
+        let baseline = score(&baseline_names);
+        assert!(boosted > baseline);
+        assert!(
+            (boosted / baseline - 1.3).abs() < 0.01,
+            "candidate B must retain its EntityMatch boost after candidate A duplicate crowding: \
+             boosted={boosted} baseline={baseline}"
+        );
+    }
+
+    #[tokio::test]
+    #[serial(background_tasks)]
+    async fn adr104_stage_c_non_ascii_case_lookup_end_to_end_is_bounded() {
+        let rt = KhiveRuntime::memory().expect("in-memory runtime");
+        let ns = Namespace::parse("local").expect("local namespace");
+        let token = rt.authorize(ns.clone()).expect("authorize local");
+        rt.entities(&token)
+            .expect("entity store")
+            .upsert_entity(Entity::new(ns.as_str(), "concept", "École"))
+            .await
+            .expect("seed entity");
+        let pack = MemoryPack::new(rt);
+
+        let same_spelling = pack
+            .entity_anchored_candidates(&token, "École research archive")
+            .await
+            .expect("same-spelling extraction");
+        let different_case = pack
+            .entity_anchored_candidates(&token, "école research archive")
+            .await
+            .expect("differently-cased extraction");
+
+        // Bounded contract: ASCII is case-insensitive, but cased non-ASCII
+        // characters require the exact form used by the stored entity name.
+        assert_eq!(same_spelling, vec!["école"]);
+        assert!(different_case.is_empty());
+    }
+
+    /// Gate (b): an unsegmented CJK query containing a real entity name as a
+    /// substring gets it through bounded substring enumeration and the same
+    /// indexed exact-name lookup used by alphabetic-script candidates.
+    #[tokio::test]
+    #[serial(background_tasks)]
+    async fn adr104_stage_c_unsegmented_cjk_query_gets_entity_via_substring() {
+        const ENTITY_NAME: &str = "北京大学";
+        // `content` and `query` are byte-identical (guarantees the FTS leg
+        // retrieves the note; retrieval-stage relevance is not what this
+        // test is about). The entity has Han characters on both sides, proving
+        // CJK entity matching does not require whitespace or punctuation.
+        const CONTENT: &str = "我在北京大学学习";
+        const QUERY: &str = "我在北京大学学习";
+
+        let anchored_score =
+            dispatch_single_note_recall_with_entity(Some(ENTITY_NAME), CONTENT, QUERY, None).await;
+        let opted_out_score =
+            dispatch_single_note_recall_with_entity(Some(ENTITY_NAME), CONTENT, QUERY, Some(&[]))
+                .await;
+
+        assert!(
+            anchored_score > opted_out_score,
+            "an unsegmented CJK query containing a real entity name must be \
+             boosted above the explicit opt-out baseline: anchored={anchored_score} \
+             opted_out={opted_out_score}"
+        );
+        let ratio = anchored_score / opted_out_score;
+        assert!(
+            (ratio - 1.3).abs() < 0.01,
+            "expected ~1.3x lift from EntityMatch firing on the CJK \
+             substring-anchored candidate, got ratio {ratio}"
+        );
+    }
+
+    #[tokio::test]
+    #[serial(background_tasks)]
+    async fn adr104_stage_c_late_cjk_entity_survives_candidate_cap() {
+        const ENTITY_NAME: &str = "龍鳳凰";
+        let mut query: String = (0..62)
+            .map(|offset| char::from_u32(0x4e00 + offset).expect("valid CJK character"))
+            .collect();
+        query.push_str(ENTITY_NAME);
+        assert_eq!(query.chars().count(), 65);
+
+        let anchored_score =
+            dispatch_single_note_recall_with_entity(Some(ENTITY_NAME), &query, &query, None).await;
+        let opted_out_score =
+            dispatch_single_note_recall_with_entity(Some(ENTITY_NAME), &query, &query, Some(&[]))
+                .await;
+
+        assert!(
+            anchored_score > opted_out_score,
+            "a CJK entity in the final 10 characters of a 65-character unsegmented query must \
+             survive the candidate cap: \
+             anchored={anchored_score} opted_out={opted_out_score}"
+        );
+    }
+
+    #[tokio::test]
+    #[serial(background_tasks)]
+    async fn adr104_stage_c_first_cjk_entity_survives_candidate_cap() {
+        let query: String = (0..20)
+            .map(|offset| char::from_u32(0x4e00 + offset).expect("valid CJK character"))
+            .collect();
+        let entity_name: String = query.chars().take(2).collect();
+        assert_eq!(query.chars().count(), 20);
+
+        let anchored_score =
+            dispatch_single_note_recall_with_entity(Some(&entity_name), &query, &query, None).await;
+        let opted_out_score =
+            dispatch_single_note_recall_with_entity(Some(&entity_name), &query, &query, Some(&[]))
+                .await;
+
+        assert!(
+            anchored_score > opted_out_score,
+            "a CJK entity in the first two characters of a 20-character unsegmented query must \
+             survive the candidate cap: \
+             anchored={anchored_score} opted_out={opted_out_score}"
+        );
+    }
+
+    #[tokio::test]
+    #[serial(background_tasks)]
+    async fn adr104_stage_c_eight_character_cjk_entity_matches() {
+        const ENTITY_NAME: &str = "甲乙丙丁戊己庚辛";
+        const QUERY: &str = "甲乙丙丁戊己庚辛";
+
+        let anchored_score =
+            dispatch_single_note_recall_with_entity(Some(ENTITY_NAME), QUERY, QUERY, None).await;
+        let opted_out_score =
+            dispatch_single_note_recall_with_entity(Some(ENTITY_NAME), QUERY, QUERY, Some(&[]))
+                .await;
+
+        assert!(
+            anchored_score > opted_out_score,
+            "an eight-character CJK entity must match at the documented maximum: \
+             anchored={anchored_score} opted_out={opted_out_score}"
+        );
+    }
+
+    /// Gate (c): a token that does not name any real entity gets nothing,
+    /// no lexical-overlap reward. Same lowercase shape as gate (a), but no
+    /// entity named "zenlake" (or anything else) exists in the store, so the
+    /// batched lookup returns no candidates and the auto path must score
+    /// identically to the explicit opt-out.
+    #[tokio::test]
+    #[serial(background_tasks)]
+    async fn adr104_stage_c_lowercase_token_naming_no_entity_gets_no_boost() {
+        const CONTENT: &str = "the committee reviewed the proposal from zenlake last week";
+        const QUERY: &str = "committee proposal zenlake";
+
+        let auto_score = dispatch_single_note_recall_with_entity(None, CONTENT, QUERY, None).await;
+        let opted_out_score =
+            dispatch_single_note_recall_with_entity(None, CONTENT, QUERY, Some(&[])).await;
+
+        assert!(
+            (auto_score - opted_out_score).abs() < 1e-4,
+            "no real entity named \"zenlake\" exists, so a lowercase query \
+             naming it must not be boosted: auto={auto_score} opted_out={opted_out_score}"
+        );
+    }
+
+    /// Gate (e): explicit `entity_names` still wins over Stage C extraction
+    /// even when a real, matching entity exists, and `entity_names: []`
+    /// stays a full opt-out. Mirrors the #738 override tests above, but with
+    /// a seeded entity in the store to prove Stage C's batched lookup is
+    /// bypassed entirely (not merely outscored) when the caller is explicit.
+    #[tokio::test]
+    #[serial(background_tasks)]
+    async fn adr104_stage_c_explicit_entity_names_still_win_over_anchored_extraction() {
+        const CONTENT: &str = "the committee reviewed the proposal from zenlake last week";
+        const QUERY: &str = "committee proposal zenlake";
+
+        let anchored_score =
+            dispatch_single_note_recall_with_entity(Some("zenlake"), CONTENT, QUERY, None).await;
+        let opted_out_score =
+            dispatch_single_note_recall_with_entity(Some("zenlake"), CONTENT, QUERY, Some(&[]))
+                .await;
+        let explicit_score = dispatch_single_note_recall_with_entity(
+            Some("zenlake"),
+            CONTENT,
+            QUERY,
+            Some(&["zenlake"]),
+        )
+        .await;
+
+        assert!(
+            (explicit_score - anchored_score).abs() < 1e-6,
+            "explicit entity_names=[\"zenlake\"] must reach the same boosted \
+             score as Stage C anchored extraction (both resolve to the same \
+             single candidate here): explicit={explicit_score} anchored={anchored_score}"
+        );
+        assert!(
+            (explicit_score - opted_out_score).abs() > 1e-6,
+            "explicit non-empty entity_names must still be honored (boosted \
+             above the opt-out baseline): explicit={explicit_score} opted_out={opted_out_score}"
+        );
+    }
+
+    /// `entity_lookup_candidates` unit coverage (pure function, ADR-104 §5):
+    /// ASCII-only candidates are lowercased, candidates containing non-ASCII
+    /// characters also retain their raw form, stopwords are excluded from
+    /// unigrams, and output is capped at `MAX_ENTITY_LOOKUP_CANDIDATES`.
+    #[test]
+    fn entity_lookup_candidates_extracts_unigrams_and_bigrams_lowercased() {
+        let out = crate::scoring::entity_lookup_candidates("New York City guide");
+        assert!(out.contains(&"new".to_string()));
+        assert!(out.contains(&"york".to_string()));
+        assert!(out.contains(&"city".to_string()));
+        assert!(out.contains(&"guide".to_string()));
+        assert!(out.contains(&"new york".to_string()));
+        assert!(out.contains(&"york city".to_string()));
+        assert!(out.contains(&"city guide".to_string()));
+    }
+
+    #[test]
+    fn entity_lookup_candidates_preserves_raw_non_ascii_case() {
+        let out = crate::scoring::entity_lookup_candidates("ÉCOLE Research");
+        assert!(out.contains(&"ÉCOLE".to_string()));
+        assert!(out.contains(&"École".to_string()));
+        assert!(!out.contains(&"école".to_string()));
+    }
+
+    #[test]
+    fn entity_lookup_candidates_enumerates_bounded_cjk_substrings() {
+        let out = crate::scoring::entity_lookup_candidates("我在北京大学学习");
+        assert!(out.contains(&"北京大学".to_string()));
+        assert!(!out.iter().any(|candidate| candidate.chars().count() == 1));
+        assert!(out.iter().all(|candidate| candidate.chars().count() <= 8));
+    }
+
+    #[test]
+    fn entity_lookup_candidates_samples_both_cjk_endpoints() {
+        let query: String = (0..20)
+            .map(|offset| char::from_u32(0x4e00 + offset).expect("valid CJK character"))
+            .collect();
+        let first_bigram: String = query.chars().take(2).collect();
+        let final_bigram: String = query.chars().skip(18).collect();
+
+        let out = crate::scoring::entity_lookup_candidates(&query);
+
+        assert!(out.contains(&first_bigram));
+        assert!(out.contains(&final_bigram));
+    }
+
+    #[tokio::test]
+    #[serial(background_tasks)]
+    async fn adr104_stage_c_long_query_preserves_adjacent_bigram_entity_for_ascii_case() {
+        const ENTITY_NAME: &str = "silver comet";
+        const LOWERCASE_QUERY: &str = "alpha bravo charlie delta echo foxtrot golf hotel india \
+                                      juliet kilo lima mike november oscar papa silver comet";
+        const TITLE_CASE_QUERY: &str = "Alpha Bravo Charlie Delta Echo Foxtrot Golf Hotel India \
+                                       Juliet Kilo Lima Mike November Oscar Papa Silver Comet";
+
+        for query in [LOWERCASE_QUERY, TITLE_CASE_QUERY] {
+            let anchored_score =
+                dispatch_single_note_recall_with_entity(Some(ENTITY_NAME), query, query, None)
+                    .await;
+            let opted_out_score =
+                dispatch_single_note_recall_with_entity(Some(ENTITY_NAME), query, query, Some(&[]))
+                    .await;
+
+            assert!(
+                anchored_score > opted_out_score,
+                "an 18-token query must retain and match its final adjacent bigram entity \
+                 regardless of ASCII case: query={query:?} anchored={anchored_score} \
+                 opted_out={opted_out_score}"
+            );
+        }
+    }
+
+    #[test]
+    fn entity_lookup_candidates_empty_query_returns_empty() {
+        assert!(crate::scoring::entity_lookup_candidates("").is_empty());
+        assert!(crate::scoring::entity_lookup_candidates("   ").is_empty());
+    }
+
+    // ── #889: a genuinely held embed stage ────────────────
+    //
+    // A `1ms` deadline racing the real uncontended in-memory pipeline (the
+    // original version of this test suite) proves the wrap *can* fire, but
+    // whether the real pipeline actually takes more than 1ms is host/load
+    // dependent — not a deterministic regression proof for the deadline
+    // behavior under the contention that caused #889. `SlowEmbedService`
+    // gives the deadline tests below a real, host-independent contention
+    // point: its `embed()` blocks on a `Notify` the test controls directly,
+    // mirroring the `#836` tests' held-ANN-lock technique but for the
+    // query-embed stage specifically.
+
+    struct SlowEmbedService {
+        hold: Arc<Notify>,
+    }
+
+    #[async_trait]
+    impl EmbeddingService for SlowEmbedService {
+        async fn embed(
+            &self,
+            texts: &[String],
+            _model: EmbeddingModel,
+        ) -> Result<Vec<Vec<f32>>, EmbedError> {
+            self.hold.notified().await;
+            Ok(texts.iter().map(|_| vec![0.0_f32; 8]).collect())
+        }
+
+        fn supports_model(&self, _model: EmbeddingModel) -> bool {
+            true
+        }
+
+        fn name(&self) -> &'static str {
+            "slow-notify"
+        }
+    }
+
+    struct SlowEmbedProvider {
+        model_name: String,
+        hold: Arc<Notify>,
+    }
+
+    #[async_trait]
+    impl EmbedderProvider for SlowEmbedProvider {
+        fn name(&self) -> &str {
+            &self.model_name
+        }
+
+        fn dimensions(&self) -> usize {
+            8
+        }
+
+        async fn build(&self) -> Result<Arc<dyn EmbeddingService>, khive_runtime::RuntimeError> {
+            Ok(Arc::new(SlowEmbedService {
+                hold: self.hold.clone(),
+            }))
+        }
+    }
+
+    /// #889: pure unit coverage for
+    /// `parse_recall_deadline_override`'s precedence and validation — an
+    /// absent or explicit-`null` override falls through (returns `None`,
+    /// signaling "use the process default"), a valid positive value wins,
+    /// and zero/negative/non-numeric values are all rejected as
+    /// `InvalidInput` rather than silently coerced.
+    #[test]
+    fn recall_889_parse_deadline_override_precedence_and_validation() {
+        use crate::pack::parse_recall_deadline_override as parse_override;
+
+        assert_eq!(
+            parse_override(&serde_json::json!({ "query": "x", "limit": 5 })).unwrap(),
+            None,
+            "absent config.recall_deadline_ms must fall through to the process default"
+        );
+        assert_eq!(
+            parse_override(&serde_json::json!({
+                "config": { "recall_deadline_ms": Value::Null }
+            }))
+            .unwrap(),
+            None,
+            "an explicit JSON null override must fall through like an absent one"
+        );
+        assert_eq!(
+            parse_override(&serde_json::json!({ "config": { "recall_deadline_ms": 5000 } }))
+                .unwrap(),
+            Some(5000),
+            "a valid positive override must win over the process default"
+        );
+
+        for bad in [
+            serde_json::json!({ "config": { "recall_deadline_ms": 0 } }),
+            serde_json::json!({ "config": { "recall_deadline_ms": -5 } }),
+            serde_json::json!({ "config": { "recall_deadline_ms": "not-a-number" } }),
+            serde_json::json!({ "config": { "recall_deadline_ms": [1, 2] } }),
+        ] {
+            match parse_override(&bad) {
+                Err(RuntimeError::InvalidInput(_)) => {}
+                other => {
+                    panic!("expected InvalidInput for a malformed override {bad:?}, got: {other:?}")
+                }
+            }
+        }
+    }
+
+    /// #889: pure unit coverage for
+    /// `parse_recall_deadline_env` — unlike the per-request override path,
+    /// an absent, zero, negative, or non-numeric env value must all fall
+    /// back to the 30s default rather than erroring (a malformed operator
+    /// env var must not brick every `memory.recall` call on the daemon).
+    #[test]
+    fn recall_889_env_deadline_ms_validates_and_falls_back_to_default() {
+        use crate::pack::parse_recall_deadline_env as parse_env;
+
+        const DEFAULT_MS: u64 = 30_000;
+        assert_eq!(parse_env(None), DEFAULT_MS);
+        assert_eq!(parse_env(Some("5000")), 5000);
+
+        for bad in ["0", "-5", "not-a-number", ""] {
+            assert_eq!(
+                parse_env(Some(bad)),
+                DEFAULT_MS,
+                "invalid env value {bad:?} must fall back to the default, not brick the daemon"
+            );
+        }
+    }
+
+    /// #889: an invalid per-request `recall_deadline_ms`
+    /// override (zero) must surface as a per-op `InvalidInput` error
+    /// through the full `memory.recall` dispatch, not silently fall through
+    /// to the process default (which a bare `0` would otherwise turn into
+    /// an always-immediate timeout) and not hang.
+    #[tokio::test]
+    async fn recall_889_zero_deadline_override_returns_invalid_input_via_dispatch() {
+        let rt = KhiveRuntime::memory().expect("in-memory runtime");
+        let ns = Namespace::parse("local").expect("local namespace");
+        let token = rt.authorize(ns).expect("authorize local");
+
+        rt.create_note(
+            &token,
+            "memory",
+            None,
+            "issue 889 zero deadline override validation note",
+            Some(0.7),
+            None,
+            vec![],
+        )
+        .await
+        .expect("create note");
+
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(KgPack::new(rt.clone()));
+        builder.register(MemoryPack::new(rt.clone()));
+        let registry = builder.build().expect("registry");
+
+        let result = registry
+            .dispatch(
+                "memory.recall",
+                serde_json::json!({
+                    "query": "889 zero deadline override validation",
+                    "limit": 10,
+                    "config": { "recall_deadline_ms": 0 }
+                }),
+            )
+            .await;
+
+        match result {
+            Err(RuntimeError::InvalidInput(msg)) => {
+                assert!(
+                    msg.contains("recall_deadline_ms"),
+                    "InvalidInput message should name the offending field, got: {msg:?}"
+                );
+            }
+            other => panic!("expected InvalidInput for a zero deadline override, got: {other:?}"),
+        }
+    }
+
+    /// #889: with the query-embed stage genuinely held (not
+    /// racing incidental wall time), a comfortably-sized 50ms deadline must
+    /// still return `DeadlineExceeded` promptly. Fail-on-revert proof:
+    /// reverting `handle_recall_with_deadline`'s `tokio::time::timeout` wrap
+    /// back to a bare `.await` makes this test hang for the lifetime of the
+    /// held `Notify` (never signaled until after the assertion), so it
+    /// would fail on the `elapsed < ...` bound or the test binary's own
+    /// deadline.
+    #[tokio::test]
+    async fn recall_889_deadline_exceeded_with_held_embed_stage_returns_typed_error_promptly() {
+        const MODEL: &str = "recall-889-slow-model";
+        let hold = Arc::new(Notify::new());
+
+        let rt = KhiveRuntime::memory().expect("in-memory runtime");
+        rt.register_embedder(SlowEmbedProvider {
+            model_name: MODEL.to_owned(),
+            hold: hold.clone(),
+        });
+
+        let ns = Namespace::parse("local").expect("local namespace");
+        let token = rt.authorize(ns).expect("authorize local");
+
+        // Pre-store one permit so the note-creation embed call below (which
+        // shares the same `hold`) completes immediately instead of hanging
+        // setup; the recall's own query-embed call is the *next*
+        // `.notified()` call, which genuinely blocks since no permit
+        // remains.
+        hold.notify_one();
+        rt.create_note(
+            &token,
+            "memory",
+            None,
+            "issue 889 held embed stage test note",
+            Some(0.7),
+            None,
+            vec![],
+        )
+        .await
+        .expect("create note");
+
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(KgPack::new(rt.clone()));
+        builder.register(MemoryPack::new(rt.clone()));
+        let registry = builder.build().expect("registry");
+
+        let start = std::time::Instant::now();
+        let result = registry
+            .dispatch(
+                "memory.recall",
+                serde_json::json!({
+                    "query": "889 held embed stage test",
+                    "limit": 10,
+                    "config": { "recall_deadline_ms": 50 }
+                }),
+            )
+            .await;
+        let elapsed = start.elapsed();
+
+        // Release the now-stuck spawn_blocking thread so it can finish and
+        // free its blocking-pool slot; the outer timeout has already fired
+        // and dropped the awaiting future well before this point.
+        hold.notify_one();
+
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "#889 a timed-out recall must return promptly even while its embed \
+             stage is genuinely held, not wait for the held stage to release; \
+             took {elapsed:?}"
+        );
+
+        match result {
+            Err(RuntimeError::DeadlineExceeded {
+                operation,
+                budget_ms,
+                ..
+            }) => {
+                assert_eq!(operation, "memory.recall");
+                assert_eq!(budget_ms, 50);
+            }
+            other => {
+                panic!("#889 expected DeadlineExceeded with the embed stage held, got: {other:?}")
+            }
+        }
+    }
+
+    /// #889: a deadline-exceeded op must not affect a
+    /// concurrently-dispatched sibling — mirrors the isolation the MCP
+    /// layer's parallel-batch executor already provides
+    /// (`khive-mcp/src/server.rs`: each op independently mapped to
+    /// `{ok, tool, error}` and joined via `futures::future::join_all`,
+    /// never abort-on-failure). `khive-pack-memory` has no dependency on
+    /// `khive-mcp` to drive an actual MCP wire round-trip, so this exercises
+    /// the same property one layer down, at the `VerbRegistry` dispatch
+    /// boundary the MCP executor sits on top of: two independent
+    /// `registry.dispatch` futures run concurrently via `tokio::join!`, one
+    /// held past its deadline and one a normal fast op, and both must
+    /// resolve to their own independent outcome.
+    #[tokio::test]
+    async fn recall_889_deadline_exceeded_does_not_affect_concurrent_sibling_op() {
+        const MODEL: &str = "recall-889-slow-sibling-model";
+        let hold = Arc::new(Notify::new());
+
+        let rt = KhiveRuntime::memory().expect("in-memory runtime");
+        rt.register_embedder(SlowEmbedProvider {
+            model_name: MODEL.to_owned(),
+            hold: hold.clone(),
+        });
+
+        let ns = Namespace::parse("local").expect("local namespace");
+        let token = rt.authorize(ns).expect("authorize local");
+
+        hold.notify_one();
+        rt.create_note(
+            &token,
+            "memory",
+            None,
+            "issue 889 sibling isolation held note",
+            Some(0.7),
+            None,
+            vec![],
+        )
+        .await
+        .expect("create note");
+
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(KgPack::new(rt.clone()));
+        builder.register(MemoryPack::new(rt.clone()));
+        let registry = builder.build().expect("registry");
+
+        let slow_recall = registry.dispatch(
+            "memory.recall",
+            serde_json::json!({
+                "query": "889 sibling isolation held note",
+                "limit": 10,
+                "config": { "recall_deadline_ms": 50 }
+            }),
+        );
+        // `stats` touches no embedder and no held model, so it must
+        // complete quickly regardless of the sibling recall's fate.
+        let sibling_stats = registry.dispatch("stats", serde_json::json!({}));
+
+        let (slow_result, sibling_result) = tokio::join!(slow_recall, sibling_stats);
+        hold.notify_one();
+
+        let slow_err = slow_result.expect_err("expected the held-stage recall to time out");
+        match &slow_err {
+            RuntimeError::DeadlineExceeded {
+                operation,
+                budget_ms,
+                ..
+            } => {
+                assert_eq!(operation, "memory.recall");
+                assert_eq!(*budget_ms, 50);
+            }
+            other => panic!("expected DeadlineExceeded, got: {other:?}"),
+        }
+        let slow_err_text = slow_err.to_string();
+        assert!(
+            slow_err_text.to_lowercase().contains("deadline"),
+            "DeadlineExceeded display text must name the deadline for operator/CLI \
+             visibility, got: {slow_err_text:?}"
+        );
+
+        assert!(
+            sibling_result.is_ok(),
+            "a concurrently-dispatched sibling op must succeed independently of a \
+             sibling deadline timeout — isolation must hold at the VerbRegistry \
+             dispatch boundary the MCP parallel-batch executor sits on top of; got: {:?}",
+            sibling_result.err()
+        );
+    }
+
+    /// #889: the default (generous, 30s) deadline must not affect a normal,
+    /// fast, uncontended recall — no new error, no behavior change on the
+    /// happy path relative to pre-#889 behavior.
+    #[tokio::test]
+    async fn recall_889_normal_path_succeeds_within_default_deadline() {
+        let rt = KhiveRuntime::memory().expect("in-memory runtime");
+        let ns = Namespace::parse("local").expect("local namespace");
+        let token = rt.authorize(ns).expect("authorize local");
+
+        rt.create_note(
+            &token,
+            "memory",
+            None,
+            "issue 889 normal path recall note",
+            Some(0.7),
+            None,
+            vec![],
+        )
+        .await
+        .expect("create note");
+
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(KgPack::new(rt.clone()));
+        builder.register(MemoryPack::new(rt.clone()));
+        let registry = builder.build().expect("registry");
+
+        let result = registry
+            .dispatch(
+                "memory.recall",
+                serde_json::json!({
+                    "query": "889 normal path recall",
+                    "limit": 10
+                }),
+            )
+            .await
+            .expect("recall must succeed within the default deadline");
+
+        let results = result.as_array().expect("recall result must be an array");
+        assert!(
+            !results.is_empty(),
+            "normal recall must surface the seeded note"
+        );
+    }
+
+    /// #889: a generous per-request override (well above real wall time) must
+    /// behave identically to the default — the override path is symmetric,
+    /// not "only ever tightens".
+    #[tokio::test]
+    async fn recall_889_generous_override_succeeds() {
+        let rt = KhiveRuntime::memory().expect("in-memory runtime");
+        let ns = Namespace::parse("local").expect("local namespace");
+        let token = rt.authorize(ns).expect("authorize local");
+
+        rt.create_note(
+            &token,
+            "memory",
+            None,
+            "issue 889 generous override recall note",
+            Some(0.7),
+            None,
+            vec![],
+        )
+        .await
+        .expect("create note");
+
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(KgPack::new(rt.clone()));
+        builder.register(MemoryPack::new(rt.clone()));
+        let registry = builder.build().expect("registry");
+
+        let result = registry
+            .dispatch(
+                "memory.recall",
+                serde_json::json!({
+                    "query": "889 generous override recall",
+                    "limit": 10,
+                    "config": { "recall_deadline_ms": 120_000 }
+                }),
+            )
+            .await
+            .expect("recall must succeed under a generous override");
+
+        let results = result.as_array().expect("recall result must be an array");
+        assert!(
+            !results.is_empty(),
+            "normal recall must surface the seeded note under a generous override"
         );
     }
 }

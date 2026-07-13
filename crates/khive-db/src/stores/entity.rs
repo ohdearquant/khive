@@ -50,8 +50,8 @@ pub fn entity_upsert_statement(entity: &Entity) -> SqlStatement {
     SqlStatement {
         sql: "INSERT OR REPLACE INTO entities \
               (id, namespace, kind, entity_type, name, description, properties, tags, \
-               created_at, updated_at, deleted_at, merged_into, merge_event_id) \
-              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)"
+               created_at, updated_at, deleted_at, merged_into, merge_event_id, content_ref) \
+              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)"
             .to_string(),
         params: vec![
             SqlValue::Text(entity.id.to_string()),
@@ -83,6 +83,10 @@ pub fn entity_upsert_statement(entity: &Entity) -> SqlStatement {
             },
             match entity.merge_event_id {
                 Some(u) => SqlValue::Text(u.to_string()),
+                None => SqlValue::Null,
+            },
+            match &entity.content_ref {
+                Some(c) => SqlValue::Text(c.clone()),
                 None => SqlValue::Null,
             },
         ],
@@ -255,6 +259,7 @@ fn read_entity(row: &rusqlite::Row<'_>) -> Result<Entity, rusqlite::Error> {
     let deleted_at: Option<i64> = row.get(10)?;
     let merged_into_str: Option<String> = row.get(11)?;
     let merge_event_id_str: Option<String> = row.get(12)?;
+    let content_ref: Option<String> = row.get(13)?;
 
     let id = parse_uuid(&id_str)?;
 
@@ -304,6 +309,7 @@ fn read_entity(row: &rusqlite::Row<'_>) -> Result<Entity, rusqlite::Error> {
         deleted_at,
         merged_into,
         merge_event_id,
+        content_ref,
     })
 }
 
@@ -338,8 +344,8 @@ fn batch_upsert_entities(
         match conn.execute(
             "INSERT OR REPLACE INTO entities \
              (id, namespace, kind, entity_type, name, description, properties, tags, \
-              created_at, updated_at, deleted_at, merged_into, merge_event_id) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+              created_at, updated_at, deleted_at, merged_into, merge_event_id, content_ref) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
             rusqlite::params![
                 id_str,
                 &entity.namespace,
@@ -354,6 +360,7 @@ fn batch_upsert_entities(
                 entity.deleted_at,
                 merged_into_str,
                 merge_event_id_str,
+                entity.content_ref,
             ],
         ) {
             Ok(_) => affected += 1,
@@ -477,6 +484,20 @@ fn build_entity_where(
         conditions.push(format!("name = ?{} COLLATE BINARY", params.len()));
     }
 
+    if !filter.names_ci.is_empty() {
+        // ADR-104 Stage C, R1: one batched `LOWER(name) IN (...)` predicate,
+        // served by `idx_entities_namespace_name_ci (namespace, LOWER(name))`.
+        let placeholders: Vec<String> = filter
+            .names_ci
+            .iter()
+            .map(|n| {
+                params.push(Box::new(n.to_ascii_lowercase()));
+                format!("?{}", params.len())
+            })
+            .collect();
+        conditions.push(format!("LOWER(name) IN ({})", placeholders.join(", ")));
+    }
+
     if !filter.tags_any.is_empty() {
         let placeholders: Vec<String> = filter
             .tags_any
@@ -496,6 +517,34 @@ fn build_entity_where(
 
     let clause = format!(" WHERE {}", conditions.join(" AND "));
     (clause, params)
+}
+
+fn build_candidate_entity_query(
+    columns: &str,
+    where_sql: &str,
+    candidate_param_indices: &[usize],
+    order_by: &str,
+    limit_idx: usize,
+    offset_idx: usize,
+) -> String {
+    let candidate_rows = candidate_param_indices
+        .iter()
+        .map(|idx| format!("(?{idx})"))
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    format!(
+        "WITH candidates(folded_name) AS (VALUES {candidate_rows}), \
+         matched_entities(entity_id) AS (\
+             SELECT (\
+                 SELECT id FROM entities{where_sql} \
+                 AND LOWER(name) = candidates.folded_name LIMIT 1\
+             ) FROM candidates\
+         ) \
+         SELECT {columns} FROM entities \
+         JOIN matched_entities ON entities.id = matched_entities.entity_id \
+         ORDER BY {order_by} LIMIT ?{limit_idx} OFFSET ?{offset_idx}"
+    )
 }
 
 // =============================================================================
@@ -561,7 +610,7 @@ impl EntityStore for SqlEntityStore {
         self.with_reader("get_entity", move |conn| {
             let mut stmt = conn.prepare(
                 "SELECT id, namespace, kind, entity_type, name, description, properties, tags, \
-                 created_at, updated_at, deleted_at, merged_into, merge_event_id \
+                 created_at, updated_at, deleted_at, merged_into, merge_event_id, content_ref \
                  FROM entities WHERE id = ?1 AND deleted_at IS NULL",
             )?;
             let mut rows = stmt.query(rusqlite::params![id_str])?;
@@ -615,19 +664,47 @@ impl EntityStore for SqlEntityStore {
         })?;
 
         self.with_reader("query_entities", move |conn| {
-            let (count_sql, count_params) = build_entity_where(&namespace, &filter);
-            let total: i64 = {
-                let sql = format!("SELECT COUNT(*) FROM entities{}", count_sql);
+            let total = if filter.names_ci.is_empty() {
+                let (count_sql, count_params) = build_entity_where(&namespace, &filter);
+                let sql = format!("SELECT COUNT(*) FROM entities{count_sql}");
                 let mut stmt = conn.prepare(&sql)?;
                 let param_refs: Vec<&dyn rusqlite::types::ToSql> =
                     count_params.iter().map(|p| p.as_ref()).collect();
-                stmt.query_row(param_refs.as_slice(), |row| row.get(0))?
+                Some(stmt.query_row(param_refs.as_slice(), |row| row.get::<_, i64>(0))? as u64)
+            } else {
+                None
             };
 
-            let (where_sql, mut data_params) = build_entity_where(&namespace, &filter);
+            let mut lookup_filter = filter.clone();
+            lookup_filter.names_ci.clear();
+            let effective_filter = if filter.names_ci.is_empty() {
+                &filter
+            } else {
+                &lookup_filter
+            };
+            let (where_sql, mut data_params) = build_entity_where(&namespace, effective_filter);
+
+            let candidate_param_indices = if filter.names_ci.is_empty() {
+                Vec::new()
+            } else {
+                let mut candidates: Vec<String> = filter
+                    .names_ci
+                    .iter()
+                    .map(|name| name.to_ascii_lowercase())
+                    .collect();
+                candidates.sort_unstable();
+                candidates.dedup();
+                candidates
+                    .into_iter()
+                    .map(|candidate| {
+                        data_params.push(Box::new(candidate));
+                        data_params.len()
+                    })
+                    .collect()
+            };
 
             // #818: when a name_prefix filter is active, an exact
-            // case-insensitive match must never be pushed out of the page by
+            // ASCII-case-insensitive match must never be pushed out of the page by
             // pattern candidates that merely share the prefix. Rank exact
             // matches first (deterministic tiebreak via created_at) so page
             // truncation can never hide the record a caller resolved by name.
@@ -647,12 +724,23 @@ impl EntityStore for SqlEntityStore {
             let limit_idx = data_params.len() - 1;
             let offset_idx = data_params.len();
 
-            let data_sql = format!(
-                "SELECT id, namespace, kind, entity_type, name, description, properties, tags, \
-                 created_at, updated_at, deleted_at, merged_into, merge_event_id \
-                 FROM entities{} ORDER BY {} LIMIT ?{} OFFSET ?{}",
-                where_sql, order_by, limit_idx, offset_idx,
-            );
+            let columns = "id, namespace, kind, entity_type, name, description, properties, tags, \
+                           created_at, updated_at, deleted_at, merged_into, merge_event_id, content_ref";
+            let data_sql = if filter.names_ci.is_empty() {
+                format!(
+                    "SELECT {columns} FROM entities{where_sql} \
+                     ORDER BY {order_by} LIMIT ?{limit_idx} OFFSET ?{offset_idx}"
+                )
+            } else {
+                build_candidate_entity_query(
+                    columns,
+                    &where_sql,
+                    &candidate_param_indices,
+                    &order_by,
+                    limit_idx,
+                    offset_idx,
+                )
+            };
 
             let mut stmt = conn.prepare(&data_sql)?;
             let param_refs: Vec<&dyn rusqlite::types::ToSql> =
@@ -664,10 +752,7 @@ impl EntityStore for SqlEntityStore {
                 items.push(row?);
             }
 
-            Ok(Page {
-                items,
-                total: Some(total as u64),
-            })
+            Ok(Page { items, total })
         })
         .await
     }
@@ -678,7 +763,7 @@ impl EntityStore for SqlEntityStore {
         self.with_reader("get_entity_including_deleted", move |conn| {
             let mut stmt = conn.prepare(
                 "SELECT id, namespace, kind, entity_type, name, description, properties, tags, \
-                 created_at, updated_at, deleted_at, merged_into, merge_event_id \
+                 created_at, updated_at, deleted_at, merged_into, merge_event_id, content_ref \
                  FROM entities WHERE id = ?1",
             )?;
             let mut rows = stmt.query(rusqlite::params![id_str])?;

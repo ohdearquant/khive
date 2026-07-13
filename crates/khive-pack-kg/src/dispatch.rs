@@ -9,7 +9,8 @@ use khive_runtime::pack::PackRuntime;
 use khive_runtime::{
     EntityTypeValidatorFn, KhiveRuntime, NamespaceToken, RuntimeError, VerbRegistry,
 };
-use khive_types::{EdgeEndpointRule, HandlerDef};
+use khive_storage::{PhaseCancelledPayload, PhaseCompletedPayload, PhaseStartedPayload};
+use khive_types::{EdgeEndpointRule, EventKind, HandlerDef};
 
 use crate::handler_defs::{handle_verbs, KG_HANDLERS};
 use crate::pack::{KgPack, KG_EDGE_RULES};
@@ -53,24 +54,119 @@ impl PackRuntime for KgPack {
     }
 
     async fn warm(&self) {
-        let _ = self.runtime.embed("khive warmup").await;
+        // ADR-103 Amendment 1 Part 2: `warm()` runs at daemon construction /
+        // first pack install, outside `dispatch()` entirely -- there is no
+        // caller-supplied token. Mint one the same way
+        // `khive-pack-memory`'s ANN background-rebuild task does
+        // (`rt.authorize(Namespace::local())`), so this daemon-startup
+        // embedder warmup is attributed to the daemon principal instead of
+        // remaining invisible on the event plane. A mint failure only
+        // removes this pass's telemetry -- the warmup itself still runs.
+        let token = match self.runtime.authorize(khive_runtime::Namespace::local()) {
+            Ok(token) => Some(token),
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "kg_embedder_warm: failed to mint ADR-103 phase-span attribution token; \
+                     warmup proceeds without telemetry"
+                );
+                None
+            }
+        };
+        if let Some(token) = &token {
+            khive_runtime::emit_phase_event(
+                &self.runtime,
+                token,
+                "kg.embedder_warm",
+                EventKind::PhaseStarted,
+                PhaseStartedPayload {
+                    work_class: "warm".into(),
+                    phase: "kg_embedder_warm".into(),
+                    corpus_size: None,
+                },
+            )
+            .await;
+        }
+        let phase_start = std::time::Instant::now();
+        let cpu_start = khive_runtime::process_resource_usage();
+        let result = self.runtime.embed("khive warmup").await;
+        if let Some(token) = &token {
+            let wall_us = phase_start.elapsed().as_micros() as i64;
+            let cpu_us =
+                khive_runtime::cpu_delta_us(cpu_start, khive_runtime::process_resource_usage());
+            match &result {
+                Err(e) if khive_runtime::is_benign_shutdown_cancellation(e) => {
+                    khive_runtime::emit_phase_event(
+                        &self.runtime,
+                        token,
+                        "kg.embedder_warm",
+                        EventKind::PhaseCancelled,
+                        PhaseCancelledPayload {
+                            work_class: "warm".into(),
+                            phase: "kg_embedder_warm".into(),
+                            wall_us,
+                            cpu_us,
+                        },
+                    )
+                    .await;
+                }
+                _ => {
+                    khive_runtime::emit_phase_event(
+                        &self.runtime,
+                        token,
+                        "kg.embedder_warm",
+                        EventKind::PhaseCompleted,
+                        PhaseCompletedPayload {
+                            work_class: "warm".into(),
+                            phase: "kg_embedder_warm".into(),
+                            wall_us,
+                            cpu_us,
+                        },
+                    )
+                    .await;
+                }
+            }
+        }
+        // `PackRuntime::warm` is documented infallible: errors are logged
+        // internally, never propagated. The embed outcome is already
+        // captured in the phase-span payload above (Completed vs
+        // Cancelled); nothing further to do with it here.
+        let _ = result;
     }
 
-    fn register_entity_type_validator(&self, _runtime: &KhiveRuntime) {
+    fn registered_embedding_model_names(&self) -> Vec<String> {
+        self.runtime.registered_embedding_model_names()
+    }
+
+    fn register_entity_type_validator_with_types(
+        &self,
+        _runtime: &KhiveRuntime,
+        pack_entity_types: &[khive_types::EntityTypeDef],
+    ) {
         // Install the validator on the runtime this pack OWNS, not on the
         // caller-supplied runtime.  In a multi-backend deployment the pack
         // is constructed with a per-pack runtime (see PackRegistry::
         // register_packs_with_runtimes); `self.runtime` is that runtime.
         // In a single-backend deployment `self.runtime` IS the single
         // runtime, so behaviour is identical to the previous call-through.
-        let validator: EntityTypeValidatorFn = Arc::new(|kind, entity_type| {
+        //
+        // Composed once from every loaded pack's `ENTITY_TYPES`
+        // (`VerbRegistry::all_entity_types`, threaded in by
+        // `call_register_entity_type_validators`) layered over the builtin
+        // registry, so pack-declared subtypes (e.g. git's `adr` Document
+        // subtype) validate here in addition to `EntityTypeRegistry::global()`'s
+        // builtin-only set.
+        let composed = Arc::new(crate::entity_type_registry::EntityTypeRegistry::with_extra(
+            pack_entity_types.iter().cloned(),
+        ));
+        let validator: EntityTypeValidatorFn = Arc::new(move |kind, entity_type| {
             let Some(raw) = entity_type else {
                 return Ok(None);
             };
             let ek: khive_types::EntityKind = kind
                 .parse()
                 .map_err(|_| RuntimeError::InvalidInput(format!("unknown entity kind {kind:?}")))?;
-            let resolved = crate::entity_type_registry::EntityTypeRegistry::global()
+            let resolved = composed
                 .resolve(ek, Some(raw))
                 .map_err(RuntimeError::from)?;
             Ok(resolved.entity_type)
@@ -1035,19 +1131,8 @@ mod tests {
         );
     }
 
-    /// #569 regression: `search(kind="note", ...)` must fail loud on a residual
-    /// FTS5 metacharacter, exercised end to end through verb dispatch.
-    ///
-    /// `sanitize_fts5_query` (khive-db) strips known-unsafe characters like `$`,
-    /// but by design stays minimal — it does not strip every character SQLite
-    /// FTS5's bareword parser rejects. `@` is one residual character that still
-    /// crashes the parser. `search_notes` (khive-runtime/operations.rs) now
-    /// surfaces that FTS parser error as `RuntimeError::InvalidInput` instead
-    /// of silently degrading to vector-only results (#569). This assertion
-    /// fails against the pre-#569 fail-open behavior (which returned `Ok`
-    /// here) and passes once the FTS leg fails closed.
     #[tokio::test]
-    async fn handler_search_note_residual_fts5_char_fails_loud() {
+    async fn handler_search_note_sanitizes_fts5_metacharacters() {
         let rt = KhiveRuntime::memory().expect("in-memory runtime");
         let tok = rt.authorize(Namespace::local()).unwrap();
 
@@ -1056,37 +1141,44 @@ mod tests {
         let registry = builder.build().expect("registry build");
         let pack = KgPack::new(rt.clone());
 
-        pack.dispatch(
-            "create",
-            json!({
-                "kind": "observation",
-                "content": "use foo@bar to chain calls"
-            }),
-            &registry,
-            &tok,
-        )
-        .await
-        .expect("note create must succeed");
-
-        let result = pack
-            .dispatch(
-                "search",
+        for (query, content) in [
+            ("#682", "tracking #682 Stage 2 work"),
+            ("B=128", "chunkwise B=128 traffic"),
+            ("Min-K%Prob", "evaluate Min-K%Prob membership inference"),
+            ("foo\"bar", "the foo\"bar identifier"),
+            ("foo@bar", "use foo@bar to chain calls"),
+        ] {
+            pack.dispatch(
+                "create",
                 json!({
-                    "kind": "note",
-                    "query": "foo@bar",
-                    "limit": 10
+                    "kind": "observation",
+                    "content": content
                 }),
                 &registry,
                 &tok,
             )
-            .await;
+            .await
+            .expect("note create must succeed");
 
-        assert!(
-            result.is_err(),
-            "#569 search(kind=\"note\") must fail loud on a residual FTS5 char ('@'), \
-             not silently degrade to vector-only results, got: {:?}",
-            result.ok()
-        );
+            let value = pack
+                .dispatch(
+                    "search",
+                    json!({
+                        "kind": "note",
+                        "query": query,
+                        "limit": 10
+                    }),
+                    &registry,
+                    &tok,
+                )
+                .await
+                .unwrap_or_else(|e| panic!("search must accept query {query:?}, got: {e:?}"));
+            let hits = value.as_array().expect("search must return an array");
+            assert!(
+                !hits.is_empty(),
+                "query {query:?} must find the seeded note; got {hits:?}"
+            );
+        }
     }
 
     // ---- `resolve` verb (unified-verb draft ADR, Slice 1) ----
@@ -1297,8 +1389,8 @@ mod tests {
         );
     }
 
-    /// Regression for the namespace-key mismatch (review finding, 2026-07-09
-    /// fix round): ring admission used the gate-resolved `ns` (which is the
+    /// Regression for the namespace-key mismatch: ring admission used the
+    /// gate-resolved `ns` (which is the
     /// configured `default_namespace`, e.g. `"lambda:leo"`, on the default
     /// dispatch path) while `resolve_reference`'s ring lookup used
     /// `token.namespace()` (always `"local"` on that same path, per ADR-007
@@ -1342,7 +1434,7 @@ mod tests {
     }
 
     /// Id-string passthrough is entity-scoped, identically for full UUIDs
-    /// and short prefixes (review finding, 2026-07-09 fix round): a note's
+    /// and short prefixes: a note's
     /// id-string is `NotFound` through `resolve`, even though `get` on the
     /// same id would succeed.
     #[tokio::test]
@@ -1469,6 +1561,135 @@ mod tests {
         assert_eq!(
             results[0].get("confidence").and_then(|v| v.as_f64()),
             Some(0.98)
+        );
+    }
+
+    /// Exact-name storage lookup is Unicode-safe and does not tokenize names.
+    /// CJK and embedded spaces therefore resolve with the same confidence as
+    /// an ASCII single-token name.
+    #[tokio::test]
+    async fn resolve_exact_name_handles_cjk_and_spaces() {
+        let rt = KhiveRuntime::memory().expect("in-memory runtime");
+        let direct_tok = rt.authorize(Namespace::local()).unwrap();
+        let cjk = rt
+            .create_entity(
+                &direct_tok,
+                "concept",
+                None,
+                "知识 图谱",
+                None,
+                None,
+                vec![],
+            )
+            .await
+            .expect("direct CJK entity create must succeed");
+        let spaced = rt
+            .create_entity(
+                &direct_tok,
+                "concept",
+                None,
+                "Entity Name With Spaces",
+                None,
+                None,
+                vec![],
+            )
+            .await
+            .expect("direct spaced-name entity create must succeed");
+
+        let mut builder = VerbRegistryBuilder::new();
+        builder.with_default_namespace("local");
+        builder.register(KgPack::new(rt.clone()));
+        let registry = builder.build().expect("registry build");
+
+        let result = registry
+            .dispatch(
+                "resolve",
+                json!({"refs": ["知识 图谱", "Entity Name With Spaces"], "kind": "entity"}),
+            )
+            .await
+            .expect("resolve must succeed");
+        let results = result.get("results").and_then(|v| v.as_array()).unwrap();
+        assert_eq!(results.len(), 2);
+        for (result, expected_id) in results.iter().zip([cjk.id, spaced.id]) {
+            assert_eq!(
+                result.get("status").and_then(|v| v.as_str()),
+                Some("resolved")
+            );
+            assert_eq!(
+                result.get("id").and_then(|v| v.as_str()),
+                Some(expected_id.to_string().as_str())
+            );
+            assert_eq!(
+                result.get("confidence").and_then(|v| v.as_f64()),
+                Some(0.98)
+            );
+        }
+
+        let whitespace_variant = registry
+            .dispatch(
+                "resolve",
+                json!({"refs": ["Entity  Name With Spaces"], "kind": "entity"}),
+            )
+            .await
+            .expect("whitespace-variant resolve must succeed");
+        let whitespace_results = whitespace_variant
+            .get("results")
+            .and_then(|v| v.as_array())
+            .unwrap();
+        assert_ne!(
+            whitespace_results[0]
+                .get("confidence")
+                .and_then(|v| v.as_f64()),
+            Some(0.98),
+            "interior whitespace must be preserved by exact-name lookup: {whitespace_results:?}"
+        );
+    }
+
+    /// The storage exact-name tier is case-sensitive. A case-only variant
+    /// can still resolve through case-insensitive hybrid search, but it must
+    /// not receive the exact tier's 0.98 confidence.
+    #[tokio::test]
+    async fn resolve_case_variant_uses_hybrid_fallback() {
+        let rt = KhiveRuntime::memory().expect("in-memory runtime");
+        let direct_tok = rt.authorize(Namespace::local()).unwrap();
+        let entity = rt
+            .create_entity(
+                &direct_tok,
+                "concept",
+                None,
+                "Case Sensitive Entity",
+                None,
+                None,
+                vec![],
+            )
+            .await
+            .expect("direct entity create must succeed");
+
+        let mut builder = VerbRegistryBuilder::new();
+        builder.with_default_namespace("local");
+        builder.register(KgPack::new(rt.clone()));
+        let registry = builder.build().expect("registry build");
+
+        let result = registry
+            .dispatch("resolve", json!({"refs": ["case sensitive entity"]}))
+            .await
+            .expect("resolve must succeed");
+        let results = result.get("results").and_then(|v| v.as_array()).unwrap();
+        assert_eq!(
+            results[0].get("status").and_then(|v| v.as_str()),
+            Some("resolved"),
+            "case-only variant should remain discoverable through hybrid search: {results:?}"
+        );
+        assert_eq!(
+            results[0].get("id").and_then(|v| v.as_str()),
+            Some(entity.id.to_string().as_str())
+        );
+        assert!(
+            results[0]
+                .get("confidence")
+                .and_then(|v| v.as_f64())
+                .is_some_and(|confidence| confidence < 0.98),
+            "case-only variant must not be reported as an exact-name hit: {results:?}"
         );
     }
 
@@ -1679,6 +1900,68 @@ mod tests {
         assert!(
             result.is_err(),
             "resolve(kind=\"note\") must fail loud, not silently over-filter"
+        );
+    }
+
+    // ---- ADR-103 Amendment 1 Part 2: kg_embedder_warm phase-span events ----
+
+    #[tokio::test]
+    async fn kg_warm_emits_exactly_one_phase_started_and_one_terminal_event() {
+        let rt = KhiveRuntime::memory().expect("in-memory runtime");
+        let token = rt.authorize(Namespace::local()).expect("authorize local");
+        let event_store = rt.events(&token).expect("event store must be available");
+
+        let pack = KgPack::new(rt.clone());
+        pack.warm().await;
+
+        let page = event_store
+            .query_events(
+                khive_storage::EventFilter::default(),
+                khive_storage::PageRequest {
+                    limit: 10,
+                    offset: 0,
+                },
+            )
+            .await
+            .expect("query events");
+
+        let started: Vec<_> = page
+            .items
+            .iter()
+            .filter(|e| e.kind == khive_types::EventKind::PhaseStarted)
+            .collect();
+        let completed: Vec<_> = page
+            .items
+            .iter()
+            .filter(|e| e.kind == khive_types::EventKind::PhaseCompleted)
+            .collect();
+        let cancelled: Vec<_> = page
+            .items
+            .iter()
+            .filter(|e| e.kind == khive_types::EventKind::PhaseCancelled)
+            .collect();
+
+        assert_eq!(
+            started.len(),
+            1,
+            "kg_embedder_warm must emit exactly one PhaseStarted event, got: {:?}",
+            page.items
+        );
+        assert_eq!(
+            completed.len() + cancelled.len(),
+            1,
+            "kg_embedder_warm must emit exactly one terminal event (Completed xor \
+             Cancelled), got completed={} cancelled={}: {:?}",
+            completed.len(),
+            cancelled.len(),
+            page.items
+        );
+        assert_eq!(started[0].payload["work_class"], "warm");
+        assert_eq!(started[0].payload["phase"], "kg_embedder_warm");
+        assert_eq!(
+            page.items.len(),
+            2,
+            "no event besides the Started/terminal pair -- warm() itself never dispatches"
         );
     }
 }

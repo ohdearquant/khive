@@ -679,7 +679,7 @@ mod tests {
 
     #[test]
     fn build_message_references_carries_full_ancestor_chain() {
-        // Issue #403 finding 1: References must be the parent's existing chain
+        // Issue #403: References must be the parent's existing chain
         // (2+ ids here) followed by the parent's own Message-ID -- NOT just the
         // immediate parent. In-Reply-To stays the parent Message-ID only.
         let msg = build_message(

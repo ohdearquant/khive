@@ -6021,14 +6021,14 @@ mod tests {
         );
     }
 
-    /// Regression: unlike `$`, `@` is NOT stripped by `sanitize_fts5_query`
-    /// (by design: the sanitizer stays minimal). SQLite FTS5's bareword
-    /// parser still rejects `@` unconditionally, so this query reaches the
-    /// runtime-level `Err` arm in `search_notes`, which must fail loud
-    /// (`RuntimeError::InvalidInput`) instead of silently degrading to
-    /// vector-only fusion.
+    /// #916: `@` used to reach SQLite FTS5's bareword parser raw and error
+    /// (`sanitize_fts5_query` did not strip it), surfacing as
+    /// `RuntimeError::InvalidInput` per #569's fail-loud policy.
+    /// `sanitize_fts5_token_group`'s bareword-safety gate now routes it
+    /// through the quoted-phrase alternative instead, so `search_notes`
+    /// succeeds and finds the seeded content.
     #[tokio::test]
-    async fn search_notes_with_residual_fts5_char_fails_loud() {
+    async fn search_notes_with_residual_fts5_char_now_sanitized() {
         let rt = rt();
         let tok = NamespaceToken::local();
         rt.create_note(
@@ -6047,15 +6047,13 @@ mod tests {
             .search_notes(&tok, "foo@bar", None, 10, None, false, &[], None)
             .await;
 
+        let hits = result.unwrap_or_else(|e| {
+            panic!("#916 search_notes must not fail on an '@'-bearing query, got: {e:?}")
+        });
         assert!(
-            result.is_err(),
-            "#569 search_notes must fail loud when the FTS leg errors on a residual \
-             FTS5 char ('@'), not silently degrade to vector-only fusion, got: {:?}",
-            result.ok()
-        );
-        assert!(
-            matches!(result.unwrap_err(), RuntimeError::InvalidInput(_)),
-            "residual FTS5 parser failure must surface as RuntimeError::InvalidInput"
+            !hits.is_empty(),
+            "#916 '@'-bearing query must still find the seeded 'foo@bar' content via the \
+             quoted-phrase alternative"
         );
     }
 

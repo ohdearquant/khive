@@ -14,17 +14,17 @@ types for proposals, events, and namespace isolation.
 ## Relevant ADRs
 
 - [ADR-001: Entity Kind Taxonomy](../../../docs/adr/ADR-001-entity-kind-taxonomy.md)
-- [ADR-002: Edge Ontology](../../../docs/adr/ADR-002-edge-ontology.md)
+- [ADR-002: Closed Edge Ontology](../../../docs/adr/ADR-002-edge-ontology.md)
 - [ADR-004: Substrate Observables](../../../docs/adr/ADR-004-substrate-observables.md)
 - [ADR-013: Note Kind Taxonomy](../../../docs/adr/ADR-013-note-kind-taxonomy.md)
 - [ADR-017: Pack Standard](../../../docs/adr/ADR-017-pack-standard.md)
 - [ADR-019: GTD Pack](../../../docs/adr/ADR-019-gtd-pack.md)
 - [ADR-021: Memory Pack](../../../docs/adr/ADR-021-memory-pack.md)
-- [ADR-023: Declarative Pack Format](../../../docs/adr/ADR-023-declarative-pack-format.md)
-- [ADR-025: Verb Speech Acts](../../../docs/adr/ADR-025-verb-speech-acts.md)
+- [ADR-023: Pack Verb Surface, Visibility, and Composition](../../../docs/adr/ADR-023-declarative-pack-format.md)
+- [ADR-025: Verb Surface as Speech-Act Taxonomy](../../../docs/adr/ADR-025-verb-speech-acts.md)
 - [ADR-034: KG Validation Pipelines](../../../docs/adr/ADR-034-kg-validation-pipelines.md)
-- [ADR-045: Verb Response Presentation](../../../docs/adr/ADR-045-verb-response-presentation.md)
-- [ADR-046: Event-Sourced Proposals](../../../docs/adr/ADR-046-event-sourced-proposals.md)
+- [ADR-045: Verb Response Presentation Modes](../../../docs/adr/ADR-045-verb-response-presentation.md)
+- [ADR-046: Event-Sourced Agent KG Proposals](../../../docs/adr/ADR-046-event-sourced-proposals.md)
 
 ## Primary Modules
 
@@ -84,7 +84,7 @@ types for proposals, events, and namespace isolation.
 - `Entity.entity_type` holds the pack-governed subtype token; ontology type
   strings must not be stored raw in `properties`.
 
-### ADR-002: Edge Ontology
+### Edge Ontology (ADR-002)
 
 - `EdgeRelation` is a closed enum with exactly 17 canonical relations (15 base
   per ADR-002 + 2 epistemic `supports`/`refutes` added by ADR-055).
@@ -98,7 +98,7 @@ types for proposals, events, and namespace isolation.
 - Symmetric relations (`competes_with`, `composed_with`) are identified via
   `is_symmetric()`.
 
-### ADR-004: Substrate Model
+### Substrate Model (ADR-004)
 
 - Three substrates: `Note`, `Entity`, `Event` -- represented by `SubstrateKind`.
 - `SUBSTRATE_COUNT` is a compile-time constant (3).
@@ -117,7 +117,7 @@ types for proposals, events, and namespace isolation.
   This crate only carries the `Note` struct with a free-form `kind: String`
   validated at the pack boundary.
 
-### ADR-017: Pack-Extensible Edge Endpoints
+### Pack-Extensible Edge Endpoints (ADR-017)
 
 - `EdgeEndpointRule` declares the types allowed at each end of an edge for a
   specific relation.
@@ -138,7 +138,7 @@ types for proposals, events, and namespace isolation.
 - The `EdgeRelation` enum is the closed set -- not extensible. Only the
   per-relation endpoint contract (via `EdgeEndpointRule`) is extensible by packs.
 
-### ADR-023: Handler Visibility and Discovery
+### Handler Visibility and Discovery (ADR-023)
 
 - `HandlerDef` replaces the deprecated `VerbDef` type alias.
 - `Visibility::Verb` entries are surfaced on the MCP wire; `Visibility::Subhandler`
@@ -147,7 +147,7 @@ types for proposals, events, and namespace isolation.
   Empty (`&[]`) is the correct default for handlers without a fixed parameter
   schema.
 
-### ADR-025: Speech-Act Taxonomy for Verbs
+### Speech-Act Taxonomy for Verbs (ADR-025)
 
 - `VerbCategory` classifies verbs by illocutionary force: `Assertive`,
   `Directive`, `Commissive`, `Declaration`. `Expressive` is intentionally
@@ -156,13 +156,13 @@ types for proposals, events, and namespace isolation.
   permission checking, transport routing, or return-shape selection.
 - Every `Visibility::Verb` handler MUST carry a category.
 
-### ADR-034: Pack Validation Rules
+### Pack Validation Rules (ADR-034)
 
 - `Pack::VALIDATION_RULES` is a declarative catalog of rule identifiers
   contributed by a pack. Rule IDs are namespaced `<pack-name>/<rule-id>`. Actual
   rule implementations live in `khive-runtime`; this const is metadata-only.
 
-### ADR-045: Verb Presentation Policy
+### Verb Presentation Policy (ADR-045)
 
 - `VerbPresentationPolicy` controls whether a verb's response can be trimmed by
   agent-mode transforms.
@@ -176,7 +176,7 @@ types for proposals, events, and namespace isolation.
   the response into subsequent feedback or profile queries; an 8-char prefix is
   ambiguous.
 
-### ADR-046: Proposal Lifecycle
+### Proposal Lifecycle (ADR-046)
 
 - `EventKind` includes `ProposalCreated`, `ProposalReviewed`,
   `ProposalApplied`, `ProposalWithdrawn` for the event-sourced proposal state

@@ -9,6 +9,7 @@
 //! can reference pack metadata without pulling in the full runtime.
 
 use crate::edge::EdgeRelation;
+use crate::entity_type::EntityTypeDef;
 
 /// Visibility tier for a handler.
 ///
@@ -297,6 +298,21 @@ pub trait Pack {
     /// only rely on the base endpoint contract) can ignore this.
     const EDGE_RULES: &'static [EdgeEndpointRule] = &[];
 
+    /// Entity-type subtypes this pack contributes to the `(EntityKind,
+    /// entity_type)` registry (the `entity_type` axis is distinct from and
+    /// finer-grained than the closed [`EntityKind`](crate::entity::EntityKind)
+    /// taxonomy — see `khive-types::entity_type::EntityTypeRegistry`).
+    ///
+    /// Defaults to empty, mirroring [`EDGE_RULES`]'s additive contract:
+    /// packs that introduce no new subtypes can ignore this. Entries here
+    /// are composed with `EntityTypeRegistry::builtin()` at runtime boot
+    /// (`VerbRegistry::all_entity_types`); packs must declare only new
+    /// `(kind, type_name)` pairs — they may not tighten or shadow a builtin
+    /// or another pack's declared subtype.
+    ///
+    /// [`EDGE_RULES`]: Pack::EDGE_RULES
+    const ENTITY_TYPES: &'static [EntityTypeDef] = &[];
+
     /// Other pack names whose vocabulary this pack references.
     ///
     /// The runtime checks that every name in `REQUIRES` appears in the
@@ -381,17 +397,17 @@ const ATOMIC_EMBEDDING_BEARING_VERBS: &[&str] = &[
 /// - `merge`: a full-parity atomic prepare (field folding, survivor FTS/vector
 ///   reindex, loser index purge, merge provenance, same-kind rejection,
 ///   graceful edge-conflict resolution — see `curation::merge_entity_sql`) was
-///   drafted and unit-tested in the B3 fix round, but deferred rather than
+///   drafted and unit-tested for B3, but deferred rather than
 ///   shipped: `curation.rs`'s edge-rewire conflict handling does per-row
 ///   procedural branching (read, canonicalize, probe for a conflicting
 ///   triple, delete-and-refresh vs. update-in-place) that cannot be expressed
 ///   as ADR-099 D1's static predicate/guard plan shape, so full parity is not
 ///   achievable without either accepting a documented behavioral gap or a
-///   design change to the plan model — bias-toward-defer (Leo directive,
-///   fix-round refinement) over shipping a partially-scoped atomic merge.
+///   design change to the plan model; bias toward deferral over shipping a
+///   partially scoped atomic merge.
 ///   `merge` stays admissible under the *non-atomic* verb.
 ///
-/// B3 fix round (codex REJECT, Medium finding — governance verbs): this set
+/// ADR-099 B3 (governance verbs): this set
 /// previously passed the static pre-runtime admissibility check (since it's a
 /// subset of `ATOMIC_ADMISSIBLE_VERBS`) and only failed later, inside
 /// `atomic_prepare::prepare_op`, AFTER `KhiveRuntime::new` had already run.
@@ -460,7 +476,7 @@ pub enum AtomicRejectionReason {
 /// [`AtomicRejectionReason::Unlisted`], never silently admitted.
 ///
 /// `ATOMIC_KNOWN_UNIMPLEMENTED_VERBS` is checked BEFORE the general
-/// admissible-list membership check (B3 fix round, Medium finding): those
+/// admissible-list membership check (ADR-099 B3): those
 /// verbs are members of `ATOMIC_ADMISSIBLE_VERBS`, so checking membership
 /// first would admit them (`None`) and defer their rejection to prepare time,
 /// after a runtime has already been constructed.
@@ -523,6 +539,11 @@ mod tests {
     #[test]
     fn pack_validation_rules_default_empty() {
         assert!(TestPack::VALIDATION_RULES.is_empty());
+    }
+
+    #[test]
+    fn pack_entity_types_default_empty() {
+        assert!(TestPack::ENTITY_TYPES.is_empty());
     }
 
     // `link` must be AlwaysVerbose so edge IDs are not shortened.
@@ -636,7 +657,7 @@ mod tests {
 
     #[test]
     fn atomic_known_unimplemented_verbs_rejected_before_runtime() {
-        // B3 fix round (codex REJECT, Medium finding): propose/review/withdraw
+        // ADR-099 B3: propose/review/withdraw
         // remain on ATOMIC_ADMISSIBLE_VERBS (ADR-099 D3 intends them to gain a
         // seam) but must be rejected at this SAME static pre-runtime guard —
         // not admitted here and only failed later inside

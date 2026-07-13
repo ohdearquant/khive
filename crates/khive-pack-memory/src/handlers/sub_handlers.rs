@@ -170,7 +170,7 @@ impl MemoryPack {
         });
 
         if candidates.vector_hits_per_model.len() > 1 {
-            // Review finding (#733 fix-round 1, High): same fix as
+            // Fix (#733): same fix as
             // `handle_recall`'s verbose multi-model breakdown — the global
             // per-model ANN candidate lists are pre-hydration and must be
             // filtered through `memory_ids` (the visible-namespace

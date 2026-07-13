@@ -9,9 +9,9 @@ has no dependency on storage, DB, or runtime crates.
 ## ADR Links
 
 - [ADR-001: Entity Kind Taxonomy](../../../docs/adr/ADR-001-entity-kind-taxonomy.md)
-- [ADR-002: Edge Ontology](../../../docs/adr/ADR-002-edge-ontology.md)
+- [ADR-002: Closed Edge Ontology](../../../docs/adr/ADR-002-edge-ontology.md)
 - [ADR-008: Query Layer Separation](../../../docs/adr/ADR-008-query-layer-separation.md)
-- [ADR-041: Event Provenance Projection](../../../docs/adr/ADR-041-event-provenance-projection.md)
+- [ADR-041: Event Provenance Projection — Hybrid Log + Graph Edges](../../../docs/adr/ADR-041-event-provenance-projection.md)
 
 ## Modules
 
@@ -65,13 +65,17 @@ ADR-008. It is intentionally split into three stages:
   preserving SQL OR/AND connectives rather than flattening to AND-only.
 - GQL WHERE grammar: `where_expr = and_expr ('OR' and_expr)*` where
   `and_expr = condition ('AND' condition)*`. AND binds tighter than OR.
+- GQL WHERE conditions support `=`, `!=`, `>`, `<`, `>=`, `<=`, `LIKE`,
+  `CONTAINS`, `STARTS WITH`, `IN` with a list literal, and `IS NOT NULL`.
+  `CONTAINS` and `STARTS WITH` treat `%`, `_`, and `\` as literal characters.
+  All condition values are emitted as bound SQL parameters.
 - Node kind strings are pack-agnostic and pass through the query layer unchanged.
   Kind validation is a pack-handler concern, not a query-layer concern.
 - `namespace` is always injected via `CompileOptions.scopes`, never from query
   text. Any attempt to set `namespace` in a query node property or WHERE condition
   is rejected at validation time.
 
-### ADR-041: Synthetic Observation Edge Paths
+### Synthetic Observation Edge Paths (ADR-041)
 
 Relations prefixed `observed_as_*` (specifically: `observed_as_candidate`,
 `observed_as_selected`, `observed_as_target`, `observed_as_signal`) are synthetic

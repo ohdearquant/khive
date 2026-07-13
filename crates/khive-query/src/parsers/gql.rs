@@ -225,6 +225,22 @@ impl Parser {
         Ok(props)
     }
 
+    fn parse_list_literal(&mut self) -> Result<Vec<ConditionValue>, QueryError> {
+        self.expect_char('[')?;
+        let mut values = Vec::new();
+        loop {
+            self.skip_whitespace();
+            if self.peek() == Some(']') {
+                self.advance();
+                return Ok(values);
+            }
+            if !values.is_empty() {
+                self.expect_char(',')?;
+            }
+            values.push(self.parse_value()?);
+        }
+    }
+
     fn parse_node_pattern(&mut self) -> Result<NodePattern, QueryError> {
         self.expect_char('(')?;
         self.skip_whitespace();
@@ -429,6 +445,17 @@ impl Parser {
             _ => {
                 if self.try_keyword("LIKE") {
                     Ok(CompareOp::Like)
+                } else if self.try_keyword("CONTAINS") {
+                    Ok(CompareOp::Contains)
+                } else if self.try_keyword("STARTS") {
+                    self.expect_keyword("WITH")?;
+                    Ok(CompareOp::StartsWith)
+                } else if self.try_keyword("IN") {
+                    Ok(CompareOp::In)
+                } else if self.try_keyword("IS") {
+                    self.expect_keyword("NOT")?;
+                    self.expect_keyword("NULL")?;
+                    Ok(CompareOp::IsNotNull)
                 } else {
                     Err(self.err("expected comparison operator"))
                 }
@@ -442,7 +469,18 @@ impl Parser {
         self.expect_char('.')?;
         let property = self.parse_ident()?;
         let op = self.parse_compare_op()?;
-        let value = self.parse_value()?;
+        let value = match op {
+            CompareOp::In => ConditionValue::List(self.parse_list_literal()?),
+            CompareOp::IsNotNull => ConditionValue::Null,
+            CompareOp::Contains | CompareOp::StartsWith => {
+                let value = self.parse_value()?;
+                if !matches!(value, ConditionValue::String(_)) {
+                    return Err(self.err("CONTAINS and STARTS WITH require a string literal"));
+                }
+                value
+            }
+            _ => self.parse_value()?,
+        };
         Ok(Condition {
             variable,
             property,
@@ -663,6 +701,56 @@ mod tests {
             matches!(&q.where_clause, WhereExpr::Or(_, _)),
             "top-level should be Or"
         );
+    }
+
+    #[test]
+    fn where_clause_extended_operators() {
+        let q = parse(
+            "MATCH (n:entity) WHERE n.name CONTAINS '%_' AND n.name STARTS WITH 'pre' \
+             AND n.kind IN ['concept', 'document'] AND n.domain IS NOT NULL RETURN n",
+        )
+        .unwrap();
+        let conds: Vec<_> = q.where_clause.conditions().collect();
+        assert_eq!(conds.len(), 4);
+        assert_eq!(conds[0].op, CompareOp::Contains);
+        assert_eq!(conds[0].value, ConditionValue::String("%_".into()));
+        assert_eq!(conds[1].op, CompareOp::StartsWith);
+        assert_eq!(conds[2].op, CompareOp::In);
+        assert_eq!(
+            conds[2].value,
+            ConditionValue::List(vec![
+                ConditionValue::String("concept".into()),
+                ConditionValue::String("document".into()),
+            ])
+        );
+        assert_eq!(conds[3].op, CompareOp::IsNotNull);
+        assert_eq!(conds[3].value, ConditionValue::Null);
+    }
+
+    #[test]
+    fn where_in_accepts_scalar_list_and_empty_list() {
+        let q = parse("MATCH (n) WHERE n.value IN ['x', 1, 2.5, true] OR n.value IN [] RETURN n")
+            .unwrap();
+        let conds: Vec<_> = q.where_clause.conditions().collect();
+        assert_eq!(
+            conds[0].value,
+            ConditionValue::List(vec![
+                ConditionValue::String("x".into()),
+                ConditionValue::Integer(1),
+                ConditionValue::Number(2.5),
+                ConditionValue::Bool(true),
+            ])
+        );
+        assert_eq!(conds[1].value, ConditionValue::List(vec![]));
+    }
+
+    #[test]
+    fn contains_and_starts_with_require_strings() {
+        let contains = parse("MATCH (n) WHERE n.name CONTAINS 1 RETURN n").unwrap_err();
+        assert!(contains.to_string().contains("require a string literal"));
+
+        let starts = parse("MATCH (n) WHERE n.name STARTS WITH true RETURN n").unwrap_err();
+        assert!(starts.to_string().contains("require a string literal"));
     }
 
     #[test]

@@ -64,13 +64,13 @@ gtd already ships a production KindHook. `TaskHook` (crates/khive-pack-gtd/src/h
 implements the trait: `prepare_create` (hook.rs:26) normalizes task fields, and
 `after_create` (hook.rs:207) creates `depends_on` edges best-effort.
 
-This is decisive for the mechanism forks. The inventory claimed (gtd.assign row, section 5
-blocker 3) that folding crud-plus verbs "needs a parameter/hook extension, not just a rename"
+This is decisive for the mechanism forks. The inventory claimed (gtd.assign row, section 5)
+that folding crud-plus verbs "needs a parameter/hook extension, not just a rename"
 because create's kind resolution has "no hook seam." That claim is wrong against source. The
 hook seam exists, ships, and is used. Folding crud-plus does not require building new
 infrastructure; it requires routing through infrastructure that is already there.
 
-There is a related finding the fold must respect. `gtd.assign` (handlers.rs:497) does not go
+There is a related constraint the fold must respect. `gtd.assign` (handlers.rs:497) does not go
 through the kg create handler plus TaskHook path. It calls `create_note` directly
 (handlers.rs:633) after inline validation, salience derivation, and a
 resolve-depends_on-before-write orphan guard. Its status normalization helpers are shared
@@ -268,8 +268,7 @@ Verb-count deltas:
   F2(b) alias +0 short term but a permanent doubled internal surface. This ADR takes none of
   these.
 
-Doc and tripwire touchpoints (none move under this ADR, listed so the reviewer can confirm the
-no-op):
+Doc and tripwire touchpoints (none move under this ADR, listed to make the no-op explicit):
 
 - tests/smoke_test.py:209 (`assert verbs_result["total"] == 74`): unchanged.
 - AGENTS.md verb catalog: unchanged.

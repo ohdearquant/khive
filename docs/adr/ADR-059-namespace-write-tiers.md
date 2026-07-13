@@ -49,7 +49,7 @@ Design intent (2026-06-15):
   stored in the creator's namespace and the visibility filter must check all three namespace
   columns (edge, source endpoint, target endpoint) to avoid leaks.
 
-An internal review (2026-06-14) produced three binding corrections incorporated
+Review on 2026-06-14 produced three binding corrections incorporated
 here:
 
 1. Edge namespace is stored on the edge (scheme B1), not derived from endpoint namespaces.
@@ -285,7 +285,7 @@ accept `namespaces: &[&str]` (or an equivalent `IN`-clause parameter). This is a
 breaking change to the trait contract and requires updates to all `GraphStore`
 implementations.
 
-This change is a cost callout (internal review finding, 2026-06-14) and is tracked in a
+This change is a cost callout (identified 2026-06-14) and is tracked in a
 separate implementation ticket. The ADR specifies the required end state; the migration path
 is implementation-owned.
 
@@ -395,7 +395,7 @@ runtime and additive for a misconfigured one.
 
 All existing data becomes shared immediately. No migration required.
 
-Rejected by internal review (2026-06-14): lambda:alpha's working memory (tasks, episodic
+Rejected (2026-06-14): lambda:alpha's working memory (tasks, episodic
 notes, session state) is not appropriate shared content. Dumping it into the shared namespace
 pollutes the cooperative KG and exposes operator context to every cooperating agent.
 

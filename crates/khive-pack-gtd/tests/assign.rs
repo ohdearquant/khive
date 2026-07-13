@@ -162,6 +162,56 @@ async fn assign_due_free_text_rejected() {
 }
 
 #[tokio::test]
+async fn assign_due_survives_agent_mode_presentation_round_trip() {
+    // The top-level `due` convenience field returned by gtd.assign (and
+    // echoed by gtd.tasks/gtd.next) must survive Agent-mode presentation
+    // verbatim, not get minute-truncated like a generic top-level timestamp.
+    let pack = pack(rt());
+    let resp = assign(
+        &pack,
+        json!({"title": "ship release", "status": "next", "due": "2026-08-01T09:30:15-04:00"}),
+    )
+    .await;
+    let due = resp["due"]
+        .as_str()
+        .expect("due must be a string")
+        .to_string();
+    chrono::DateTime::parse_from_rfc3339(&due)
+        .unwrap_or_else(|e| panic!("due not RFC 3339: {due}, error: {e}"));
+
+    let presented_assign =
+        khive_runtime::present(resp.clone(), khive_runtime::PresentationMode::Agent, 0);
+    assert_eq!(
+        presented_assign["due"],
+        json!(due),
+        "gtd.assign due must round-trip verbatim through Agent-mode presentation"
+    );
+
+    let tasks = pack
+        .dispatch("gtd.tasks", json!({"status": "next"}))
+        .await
+        .expect("tasks ok");
+    let presented_tasks = khive_runtime::present(tasks, khive_runtime::PresentationMode::Agent, 0);
+    let via_tasks = presented_tasks
+        .as_array()
+        .expect("gtd.tasks response is an array")
+        .iter()
+        .find(|t| t["title"] == "ship release")
+        .expect("assigned task present in gtd.tasks");
+    assert_eq!(via_tasks["due"], json!(due));
+
+    let next = pack.dispatch("gtd.next", json!({})).await.expect("next ok");
+    let presented_next = khive_runtime::present(next, khive_runtime::PresentationMode::Agent, 0);
+    let via_next = presented_next
+        .as_array()
+        .expect("gtd.next response is an array")
+        .iter()
+        .find(|t| t["title"] == "ship release")
+        .expect("assigned task present in gtd.next");
+    assert_eq!(via_next["due"], json!(due));
+}
+
+#[tokio::test]
 async fn assign_due_natural_language_rejected() {
     let pack = pack(rt());
     let err = pack

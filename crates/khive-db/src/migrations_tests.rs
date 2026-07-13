@@ -608,3 +608,56 @@ fn v6_implicit_mass_upsert_on_conflict() {
         .expect("count rows");
     assert_eq!(count, 1, "upsert must not create a second row");
 }
+
+// ── V10: entities.content_ref (khive#292) ───────────────────────────────────
+
+#[test]
+fn v10_adds_content_ref_column_and_partial_index() {
+    let mut conn = open_memory();
+    run_migrations(&mut conn).expect("migrations should succeed");
+    assert!(
+        column_exists(&conn, "entities", "content_ref"),
+        "V10 must add entities.content_ref"
+    );
+    assert!(
+        index_exists(&conn, "idx_entities_content_ref"),
+        "V10 must create idx_entities_content_ref"
+    );
+}
+
+#[test]
+fn v10_content_ref_defaults_null_and_accepts_a_value() {
+    let mut conn = open_memory();
+    run_migrations(&mut conn).expect("migrations should succeed");
+
+    conn.execute(
+        "INSERT INTO entities (id, namespace, kind, name, tags, created_at, updated_at) \
+         VALUES ('e1', 'local', 'concept', 'NullRef', '[]', 0, 0)",
+        [],
+    )
+    .expect("insert without content_ref");
+    let null_ref: Option<String> = conn
+        .query_row(
+            "SELECT content_ref FROM entities WHERE id = 'e1'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("read content_ref");
+    assert_eq!(null_ref, None, "content_ref must default to NULL");
+
+    let digest = "a".repeat(64);
+    conn.execute(
+        "INSERT INTO entities (id, namespace, kind, name, tags, created_at, updated_at, content_ref) \
+         VALUES ('e2', 'local', 'concept', 'WithRef', '[]', 0, 0, ?1)",
+        rusqlite::params![digest],
+    )
+    .expect("insert with content_ref");
+    let stored_ref: Option<String> = conn
+        .query_row(
+            "SELECT content_ref FROM entities WHERE id = 'e2'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("read content_ref");
+    assert_eq!(stored_ref, Some(digest));
+}

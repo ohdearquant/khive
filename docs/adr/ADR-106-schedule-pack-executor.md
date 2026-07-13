@@ -2,7 +2,8 @@
 
 **Status**: Accepted
 **Date**: 2026-07-09
-**Amended**: 2026-07-09 (missed-event grace policy, Amendment A; implementation note, Amendment B)
+**Amended**: 2026-07-12 (missed-event grace policy, Amendment A; implementation note,
+Amendment B; reminder delivery and failure observability, Amendment C)
 **Depends on**: [ADR-040](ADR-040-communication-and-schedule-packs.md) (schedule pack
 verbs and `scheduled_event` note kind), [ADR-049](ADR-049-khived-daemon.md) (warm daemon
 process model), [ADR-016](ADR-016-request-dsl.md) (request DSL, replayed at fire time)
@@ -364,8 +365,8 @@ unaffected by this ADR.
    schedule tick, verified the same way the existing `is_daemon_role_false_for_client_args`
    /`is_daemon_role_true_for_daemon_args` tests verify the email-channel gate.
 4. The tick interval is overridable via `KHIVE_SCHEDULE_TICK_SECS` (seconds) and defaults
-   to 60 seconds when unset, unparseable, or zero. (Amended 2026-07-09, codex PR #782
-   review fix-round: the shipped implementation uses this name and unit — see Amendment
+   to 60 seconds when unset, unparseable, or zero. (Amended 2026-07-09, PR #782:
+   the shipped implementation uses this name and unit — see Amendment
    B — and this criterion is restated to name the accepted contract rather than the
    originally-proposed `KHIVE_SCHEDULE_TICK_INTERVAL_MS`/milliseconds form.)
 5. A production-shaped shutdown regression, built against `KhiveMcpServer` (the real
@@ -411,19 +412,11 @@ unaffected by this ADR.
 
 ## Explicitly Deferred
 
-The following are real, identified gaps in the schedule pack's execution story but are
-out of scope for this ADR, which is limited to wiring the existing drain into a
-daemon-resident tick:
+Reminder delivery and structured reminder-failure observability were implemented as
+follow-on work and are now part of the accepted contract; see Amendment C.
 
-- **Delivery of fired `schedule.remind` events.** The drain's own dispatch logic
-  treats `event_type != "schedule"` as a no-op today: a fired reminder is marked
-  `fired` but nothing reads its content or delivers it anywhere. Building an
-  owner/actor attribution field on `scheduled_event` and wiring fired reminders to an
-  inbound delivery path is separate follow-on work.
-- **Structured per-row failure reason.** A dispatch failure is currently visible only
-  in the drain's own aggregate summary counter and verbose logging output; the
-  `scheduled_event` note itself carries no persisted failure detail. Adding a
-  dispatch-error property to the row is separate follow-on work.
+The following identified gaps remain out of scope for this ADR:
+
 - **`agenda()` visibility into non-pending state.** `schedule.agenda` filters to
   `status = "pending"` only and does not distinguish an overdue-but-undrained row from
   a genuinely future one. Extending `agenda` (or adding a history-style query) is
@@ -587,21 +580,20 @@ same PR:
   variable name and unit differ from the original decision — Acceptance Criterion 4
   above is amended to name this shipped contract directly.
 
-### Fix-round update (2026-07-09, codex PR #782 review)
+### Amendment B, update 1 (2026-07-09)
 
 The initial cut of this amendment (above) additionally claimed the tick "constructs its
 own short-lived `KhiveRuntime` against the daemon's configured `db`/`namespace`... rather
 than sharing the live daemon's warm runtime," and framed that as a resource-cost-only
-deviation. Codex's review of the PR carrying this ADR (#782) identified that claim as
-incorrect: a tick that independently re-resolves `RuntimeConfig::default()` from raw
+deviation. That claim was incorrect: a tick that independently re-resolves
+`RuntimeConfig::default()` from raw
 `--db` and an inferred namespace does not merely reconstruct the _same_ configuration at
 extra cost — it silently **discards** everything the daemon's own boot path
 (`khive-mcp::serve::build_server` / `build_registry_for_multi_backend`) resolves from
 `--config`/`[[backends]]`/actor identity/`--pack` selection. A config-backed daemon's
 tick could therefore drain `$HOME/.khive/khive.db` instead of the configured schedule
 backend, trip strict-actor-mode failures the live server never has, or dispatch stored
-actions through packs the daemon never loaded. This was filed as the review's High
-finding and fixed in the same PR, before merge:
+actions through packs the daemon never loaded. PR #782 corrected the runtime target before merge:
 
 - `build_server` now returns, alongside the server, the resolved `"schedule"`-pack
   `KhiveRuntime` handle it already constructed while building the server itself
@@ -621,8 +613,7 @@ finding and fixed in the same PR, before merge:
 - This also resolves the resource-cost concern the original text raised (a fresh
   connection-pool warm-up every tick): the tick now reuses the daemon's already-warm
   runtime and connection pool rather than constructing a new one per pass.
-- Tick cadence was also corrected in the same fix-round (a separate, Medium-severity
-  finding in the same review): `schedule_tick_loop` now ticks on
+- Tick cadence was also incorrect and was corrected in this update: `schedule_tick_loop` now ticks on
   `tokio::time::interval_at(now + interval, interval)` with
   `MissedTickBehavior::Skip`, matching Decision point 6's fixed-interval specification,
   rather than sleeping `interval` after each drain (which had produced an effective
@@ -634,12 +625,12 @@ finding and fixed in the same PR, before merge:
   the offset from the shrinking result set. Fixed by snapshotting every candidate row for
   a namespace before any mutation begins, then processing the fixed-size snapshot with no
   further paginated queries. A regression with 201 overdue rows (`PAGE_SIZE + 1`) covers
-  this. **Superseded in round 2 below** — the full-namespace snapshot this round
+  this. **Superseded in update 2 below** — the full-namespace snapshot this update
   introduced turned out to have its own unbounded-memory failure mode.
 - A new concurrent-drain regression (two `run_pending_events` calls racing over the same
   store, asserting exactly one fire per row across both) was added alongside the existing
   CAS-race unit tests, closing the exact gap Acceptance Criterion 2 names. **Strengthened
-  in round 2 below** — this version dispatched a read-only `stats()` action, which cannot
+  in update 2 below** — this version dispatched a read-only `stats()` action, which cannot
   distinguish a clean single fire from a double-dispatch-one-finalize race.
 
 None of this changes Acceptance Criteria 1, 3, 4, or 6's _scope_ — but their status
@@ -649,13 +640,13 @@ against the shipped implementation is restated here precisely, since the origina
 Criterion 6:
 
 - **Criterion 1** (a due row fires within one tick interval): **met**. Unaffected by this
-  fix-round beyond the cadence and runtime-targeting corrections above, which strengthen
+  update beyond the cadence and runtime-targeting corrections above, which strengthen
   rather than weaken it.
 - **Criterion 2** (concurrent cron + tick invocations race to exactly one fire): **met**,
-  now backed by the concurrent-drain regression added in this fix-round (previously
-  claimed met on the strength of the CAS design alone, with no regression exercising
-  concurrency — codex's Medium finding on this amendment), and strengthened in round 2
-  below to assert on the action's own side effect, not just the CAS-tracked counters.
+  now backed by the concurrent-drain regression added in this update. The prior claim relied
+  on the CAS design alone, with no regression exercising concurrency. The regression was strengthened in
+  update 2 below to assert on the action's own side effect, not just the CAS-tracked
+  counters.
 - **Criterion 3** (no stdio client spawns a tick): **met**, unchanged — the gate is on
   `args.daemon` regardless of which file spawns the loop.
 - **Criterion 4** (interval configurable, 60s default): **met**, under the shipped
@@ -666,25 +657,23 @@ Criterion 6:
 - **Criterion 6** (`kkernel exec --pending-events` implemented as a thin wrapper over
   `DaemonDispatch::drain_pending_events`): **not met**. The CLI path calls
   `khive_mcp::pending_events::run_pending_events` directly, not a `DaemonDispatch` trait
-  method — no such trait method exists. This criterion was incorrectly listed as met in
-  the original cut of this amendment; that was a direct contradiction of this same
-  amendment's own bullet stating "the tick does **not** go through a
-  `DaemonDispatch::drain_pending_events` trait method," caught in the codex PR #782
-  review (Medium finding).
+  method; no such trait method exists. The original cut of this amendment incorrectly listed
+  the criterion as met despite its own bullet stating "the tick does **not** go through a
+  `DaemonDispatch::drain_pending_events` trait method" (PR #782).
 - **Criterion 7** (`khive-runtime` gains no new dependency after `DaemonDispatch` gains
   `drain_pending_events`): **not met** — vacuously, since no such trait method was added.
   `cargo tree -p khive-runtime` showing no edge to `khive-mcp`/`khive-request`/`kkernel`
   remains true today, but for a different reason than the criterion describes (nothing
   was added to `khive-runtime` at all, rather than something being added safely).
 
-### Fix-round 2 update (2026-07-09, codex PR #782 review round 2)
+### Amendment B, update 2 (2026-07-09)
 
-Codex's round-2 pass on this PR verified the round-1 fixes above were all present and
-gates green, but found the High runtime-policy fix (`build_server` threading the
-resolved `"schedule"`-pack runtime through to the tick) was still **incomplete** for
-multi-backend deployments, plus two narrower regression/resource issues:
+Verification confirmed the update-1 fixes above were present and gates green, but
+the runtime-policy fix (`build_server` threading the resolved `"schedule"`-pack
+runtime through to the tick) was still **incomplete** for multi-backend deployments,
+along with two narrower regression/resource issues:
 
-- **Dispatch still used the wrong runtime for multi-backend actions.** Round 1 fixed
+- **Dispatch still used the wrong runtime for multi-backend actions.** Update 1 fixed
   _scanning_ — `run_pending_events_on` now reads `scheduled_event` rows from the
   daemon's own resolved `"schedule"`-pack runtime, correct for multi-backend boots
   where `schedule` is wired to its own declared backend. But the same function then
@@ -711,8 +700,8 @@ multi-backend deployments, plus two narrower regression/resource issues:
   whose action is `create(kind="observation", ...)` (a `kg` verb), drains via
   `run_pending_events_on(&rt, &server, false)`, and asserts the resulting note lands
   only in `kg`'s declared backend file, never `main`.
-- **The round-1 pagination fix introduced its own unbounded-memory failure mode.**
-  Snapshotting every `status="pending"` row for a namespace before mutation (round 1's
+- **The update-1 pagination fix introduced its own unbounded-memory failure mode.**
+  Snapshotting every `status="pending"` row for a namespace before mutation (update 1's
   fix, above) correctly closed the offset-skip bug, but the snapshot filter checked
   only `status`, not `trigger_at` — a namespace with one due event sitting in a large
   FUTURE schedule pulled the entire future backlog into memory on every tick. Fixed by
@@ -721,7 +710,7 @@ multi-backend deployments, plus two narrower regression/resource issues:
   are never fetched at all, and (b) pages via a `(created_at, id)` keyset cursor instead
   of `LIMIT/OFFSET` — both columns are immutable (this drain never rewrites either), so
   a row's claim/dispatch/finalize mutation between pages can never shift a later page's
-  boundary (the original round-1 bug class), and at most `PAGE_SIZE` rows are held in
+  boundary (the original update-1 bug class), and at most `PAGE_SIZE` rows are held in
   memory at once, never the whole namespace. The existing 201-row backlog regression
   continues to cover the keyset-pagination-under-mutation property.
 - **The concurrent-drain regression's `stats()` action was too weak to catch its own
@@ -735,8 +724,8 @@ multi-backend deployments, plus two narrower regression/resource issues:
   detect.
 - The PR description was updated to match this shipped state (shared resolved runtime
   for scan, the daemon's real live server for dispatch, Criteria 5-7 unmet) rather than
-  the pre-fix-round "fresh per-tick runtime" / "Criterion 6 met" text it still carried.
-- **Fix-round 3 addendum (2026-07-09):** the round-2 keyset page queries and
+  the pre-update "fresh per-tick runtime" / "Criterion 6 met" text it still carried.
+- **Update 3 addendum (2026-07-09):** the update-2 keyset page queries and
   `discover_pending_namespaces` compared `trigger_at` as raw RFC3339 text, which sorts
   lexicographically rather than chronologically for values carrying a non-UTC offset
   (`handlers.rs` deliberately round-trips the caller's original offset, so this was
@@ -745,9 +734,9 @@ multi-backend deployments, plus two narrower regression/resource issues:
   unparseable `trigger_at` values stay visible to the existing Rust-side skip/log path
   instead of being silently excluded) in all three affected queries: both keyset page
   branches and `discover_pending_namespaces`. The comparison is now chronological via
-  SQLite `datetime()`; storage still round-trips the caller's original string — H5
-  unchanged.
-- **Fix-round 4 addendum (2026-07-09):** the one-shot CLI path (`run_pending_events`)
+  SQLite `datetime()`; storage still round-trips the caller's original string — this
+  point is unchanged.
+- **Update 4 addendum (2026-07-09):** the one-shot CLI path (`run_pending_events`)
   synthesized an `Args` value with `namespace: Some("local")` and called `build_server`
   directly — the same entry point real `--actor`/`--namespace` CLI flags go through.
   `build_server` derives both `namespace_explicit` and `actor_explicit` from a single
@@ -766,12 +755,41 @@ multi-backend deployments, plus two narrower regression/resource issues:
   calls, so a `"local"`-resolved default namespace falls through to the project/db/env
   actor tiers instead of being treated as an explicit override.
 
-None of this changes the Criteria 1-7 status table above — the High finding this round
-closed was scoped entirely to dispatch routing, which Criterion 2 (fire-exactly-once)
+None of this changes the Criteria 1-7 status table above. The defect this update closed was
+scoped entirely to dispatch routing, which Criterion 2 (fire-exactly-once)
 already covers; no new criterion becomes met or unmet as a result.
 
 Closing the Criterion 5/6/7 gap — moving to the full `DaemonDispatch::drain_pending_events`
 trait seam with tracked, graceful shutdown and `DrainSummary`/`DrainError` owned by
 `khive-runtime` — remains open follow-on work, tracked separately from the missed-event
-policy (Amendment A) and the runtime-targeting/cadence/pagination fixes (this fix-round)
+policy (Amendment A) and the runtime-targeting/cadence/pagination fixes (this amendment)
 this ADR has delivered so far.
+
+## Amendment C: Reminder delivery and failure observability (2026-07-12)
+
+`schedule.remind` persists the creating actor's identity in the scheduled-event row as
+`created_by_actor`. When an in-grace reminder fires, the drain reads that stored value
+and dispatches `comm.send(to=<created_by_actor>, ...)`, producing an inbound message in
+the creator's actor-addressed inbox. Delivery therefore remains attributed to the
+creator across daemon restarts and changes in the daemon's own actor identity. Rows
+created before `created_by_actor` existed are the only exception: the drain logs a
+warning and falls back to the current server actor, then to `local` when the server has
+no configured actor.
+
+A reminder-delivery failure is observable through the drain and persisted state. The
+drain logs the error, increments `DrainSummary.failed`, and persists `delivery_error` plus
+`delivery_failed_at` on the `scheduled_event` row. It also appends an error-outcome
+audit event with verb `schedule.remind.fire`, the scheduled-event note as its target,
+and the intended recipient actor and error text in its payload. Failure remains
+per-event: it does not abort the drain or prevent later due rows from dispatching in
+the same pass. The failed reminder is still finalized according to its cadence (a
+one-shot becomes `fired`; a named repeat is re-armed), preventing an indefinitely
+retrying permanently broken delivery. A later successful occurrence clears stale
+`delivery_error` and `delivery_failed_at` properties.
+
+Because reminder delivery is part of the public `schedule.remind` contract, reminder
+creation checks that the registry provides `comm.send`. If it does not, the handler
+rejects the call before persisting a note. The schedule pack itself still declares only
+`REQUIRES = ["kg"]`, so `schedule.schedule`, `schedule.agenda`, and `schedule.cancel`
+remain available without `comm`. The per-event failure behavior above covers dispatch
+failures after a reminder has passed that creation-time capability check.

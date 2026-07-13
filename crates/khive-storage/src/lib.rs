@@ -1,5 +1,6 @@
-//! Storage capability traits: `SqlAccess`, `VectorStore`, `TextSearch`, `GraphStore`, `NoteStore`, `EventStore`.
+//! Storage capability traits: `SqlAccess`, `VectorStore`, `TextSearch`, `GraphStore`, `NoteStore`, `EventStore`, `BlobStore`.
 
+pub mod blob;
 pub mod capability;
 pub mod entity;
 pub mod error;
@@ -14,6 +15,7 @@ pub mod tx_registry;
 pub mod types;
 pub mod vectors;
 
+pub use blob::{BlobOrphanSweepConfig, BlobOrphanSweepResult, BlobStore, ContentRef};
 pub use capability::StorageCapability;
 pub use entity::{Entity, EntityFilter, EntityStore};
 pub use error::StorageError;

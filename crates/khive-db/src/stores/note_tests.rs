@@ -386,9 +386,9 @@ async fn test_try_insert_note_pk_collision_returns_error_not_dedup() {
     );
 }
 
-// ── #827 Finding 2: single-note insert + notes_seq assignment atomicity ────
+// ── #827: single-note insert + notes_seq assignment atomicity ────────────
 
-/// Regression for #827 Finding 2: on the default flag-off (pool-mutex) path,
+/// Regression for #827: on the default flag-off (pool-mutex) path,
 /// `upsert_note` used to issue its INSERT into `notes` and `assign_note_seq`
 /// as two separate autocommit statements, so a crash or interleaving
 /// between them could strand a note with no `notes_seq` row -- permanently
@@ -467,7 +467,7 @@ async fn test_try_insert_note_insert_and_seq_assignment_are_atomic() {
     );
 }
 
-/// Regression for #827 round-3 Finding 2: on the flag-off (pool-mutex)
+/// Regression for #827: on the flag-off (pool-mutex)
 /// path, `upsert_notes` used to run `batch_upsert_notes` inside a hand-rolled
 /// `BEGIN IMMEDIATE`/`COMMIT`/`ROLLBACK`, but only wired `ROLLBACK` to a
 /// failed `COMMIT` -- an error from `batch_upsert_notes` itself (e.g. a
@@ -491,7 +491,7 @@ async fn test_upsert_notes_batch_rolls_back_fully_on_mid_batch_seq_failure() {
             .execute_batch(&format!(
                 "CREATE TRIGGER inject_seq_failure_batch BEFORE INSERT ON notes_seq \
                  WHEN NEW.note_id = '{fail_id}' \
-                 BEGIN SELECT RAISE(ABORT, 'injected mid-batch failure for #827 round-3 test'); END;"
+                 BEGIN SELECT RAISE(ABORT, 'injected mid-batch failure for #827 test'); END;"
             ))
             .unwrap();
     }
@@ -586,7 +586,7 @@ async fn page_offset_over_i64max_rejected() {
 /// the `KHIVE_WRITE_QUEUE` env var — that env var is process-global and this
 /// crate's other tests are NOT `#[serial]` against it, so a window where it
 /// is set here could leak into a concurrently-scheduled test's own pool
-/// construction (ADR-067 Fork C slice 2 round 2, LOW finding).
+/// construction (ADR-067 Fork C slice 2).
 #[tokio::test]
 async fn upsert_notes_routes_through_writer_task_when_flag_enabled() {
     let dir = tempfile::tempdir().unwrap();

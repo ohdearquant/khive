@@ -2114,7 +2114,7 @@ async fn link_by_name_with_percent_resolves_exactly() {
     );
 }
 
-/// Regression for a round-1 gap on #818/#834: the two tests above prove
+/// Regression for a gap on #818/#834: the two tests above prove
 /// escaping keeps wildcard decoys out of the WHERE clause entirely, so they
 /// pass even without exact-match-first ordering. This test isolates that
 /// ordering through the real `link`-by-name verb path: every decoy genuinely
@@ -2335,7 +2335,7 @@ async fn get_event_uuid_cross_namespace_succeeds() {
 }
 
 // ADR-045 §5: event `created_at` must be an ISO-8601 string at the MCP boundary,
-// not a raw microsecond integer (round-4 blocker fix).
+// not a raw microsecond integer.
 
 #[tokio::test]
 async fn list_event_created_at_is_iso8601_string() {
@@ -3021,7 +3021,7 @@ async fn bulk_link_verbose_controls_edges_key() {
     );
 }
 
-// ---- ADR-014 curation event payload regression tests (internal review round 2) ----
+// ---- ADR-014 curation event payload regression tests ----
 
 /// Update an entity → list entity_updated events → assert payload has id, namespace,
 /// changed_fields per ADR-014.
@@ -3164,11 +3164,11 @@ async fn curation_merge_entity_event_payload_has_adr014_fields() {
     );
     assert!(
         payload.get("content_strategy").is_some(),
-        "entity_merged payload must contain 'content_strategy' (codex PR #814 Medium finding); got {payload}"
+        "entity_merged payload must contain 'content_strategy' (PR #814); got {payload}"
     );
 }
 
-/// Handler-wiring test for the codex PR #814 High finding: `content_strategy`
+/// Handler-wiring test for PR #814: `content_strategy`
 /// passed on the wire through `merge(kind="entity", ...)` must reach
 /// `KhiveRuntime::merge_entity` and be honored independently of the default
 /// entity `strategy` (`prefer_into`).
@@ -3280,7 +3280,7 @@ async fn curation_delete_entity_hard_event_payload_has_adr014_fields() {
     );
 }
 
-// ---- ADR-022 provenance filter regression tests (internal review round 2) ----
+// ---- ADR-022 provenance filter regression tests ----
 
 /// list(kind="event", observed=[uuid]) must pass the filter down to storage and
 /// return only events whose observed list contains that UUID.
@@ -4168,7 +4168,7 @@ async fn traverse_invalid_direction_is_rejected() {
     );
 }
 
-// ── verbs() dispatch-level tests (internal review Medium: H5 not covered) ────────
+// ── verbs() dispatch-level tests ────────
 //
 // A fake pack with one public verb and one subhandler so we can verify that
 // `verbs()` excludes subhandlers and that category/pack filters work correctly.
@@ -4695,7 +4695,7 @@ async fn merge_rewire_symmetric_relation_canonicalization() {
     );
 }
 
-// ---- H1 internal review round 3: update_edge canonicalizes symmetric relations ----
+// ---- H1: update_edge canonicalizes symmetric relations ----
 
 /// H1-a: updating an edge from a non-symmetric relation to `competes_with`
 /// must store the row with `source_uuid < target_uuid` (canonical form).
@@ -5129,7 +5129,7 @@ async fn delete_note_cross_namespace_succeeds() {
     );
 }
 
-// ADR-045 §5 round-5 blocker: payload-level Timestamp fields must be ISO-8601
+// ADR-045 §5: payload-level Timestamp fields must be ISO-8601
 // strings at the MCP boundary, not raw integer microseconds.
 //
 // khive_types::Timestamp derives serde as a transparent u64, so
@@ -5153,7 +5153,7 @@ async fn proposal_created_event_expiry_is_iso8601_string() {
             "propose",
             json!({
                 "title": "ExpiryTimestampTest",
-                "description": "round-5 regression: expiry must be ISO string",
+                "description": "expiry must be ISO string",
                 "changeset": {"kind": "add_note", "note": {"kind": "observation", "content": "test note"}},
                 "expiry": expiry_micros
             }),
@@ -5209,13 +5209,13 @@ async fn proposal_created_event_expiry_is_iso8601_string() {
     );
 }
 
-// ---- Round-6: recursive event payload timestamp normalization ----
+// ---- Recursive event payload timestamp normalization ----
 //
-// The r6 fix walks the entire event Value recursively (no depth limit) so that
+// This walks the entire event Value recursively (no depth limit) so that
 // Timestamp integers at any nesting level — nested objects, array elements — are
 // converted to ISO-8601 strings before reaching the MCP boundary.
 
-/// Round-6 regression: verifies the recursive walker is wired into the live
+/// Regression: verifies the recursive walker is wired into the live
 /// propose→approve→applied dispatch path and processes `payload.applied_at`.
 ///
 /// The name reflects what this test actually asserts: a direct payload child
@@ -5238,7 +5238,7 @@ async fn proposal_applied_event_payload_applied_at_via_live_dispatch() {
             "propose",
             json!({
                 "title": "NestedTimestampTest",
-                "description": "round-6: recursive walker must handle any depth",
+                "description": "recursive walker must handle any depth",
                 "changeset": {"kind": "add_note", "note": {"kind": "observation", "content": "nested-ts test"}}
             }),
         )
@@ -5298,7 +5298,7 @@ async fn proposal_applied_event_payload_applied_at_via_live_dispatch() {
     }
 }
 
-/// Round-6 regression: verifies that all events returned by `list(kind="event")`
+/// Regression: verifies that all events returned by `list(kind="event")`
 /// have ISO-8601 `created_at` strings — confirming the array branch of
 /// `normalize_event_timestamps_array` is live in the dispatch path.
 ///
@@ -5342,7 +5342,7 @@ async fn event_list_created_at_normalized_via_live_dispatch() {
     }
 }
 
-/// Round-6 regression: verifies that `payload.expiry` on a `ProposalCreated`
+/// Regression: verifies that `payload.expiry` on a `ProposalCreated`
 /// event is returned as an ISO-8601 string by the full dispatch path.
 ///
 /// The name reflects what this test actually asserts: `payload.expiry` (a direct
@@ -5362,7 +5362,7 @@ async fn proposal_created_event_expiry_normalized_via_live_dispatch() {
         "propose",
         json!({
             "title": "LegacyI64TimestampTest",
-            "description": "round-6: i64 timestamps in payload must normalize",
+            "description": "i64 timestamps in payload must normalize",
             "changeset": {"kind": "add_note", "note": {"kind": "observation", "content": "i64-ts test"}},
             "expiry": expiry_micros
         }),
@@ -5410,7 +5410,7 @@ async fn proposal_applied_event_applied_at_is_iso8601_string() {
             "propose",
             json!({
                 "title": "AppliedAtTimestampTest",
-                "description": "round-5 regression: applied_at must be ISO string",
+                "description": "applied_at must be ISO string",
                 "changeset": {"kind": "add_note", "note": {"kind": "observation", "content": "applied-at-test note"}}
             }),
         )
@@ -5467,13 +5467,13 @@ async fn proposal_applied_event_applied_at_is_iso8601_string() {
     );
 }
 
-// ---- Round-7: note expires_at normalization ----
+// ---- Note expires_at normalization ----
 //
-// The r7 fix adds `expires_at` to the `normalize_entity_timestamps` key set.
+// This adds `expires_at` to the `normalize_entity_timestamps` key set.
 // Any note row with a non-null `expires_at` (stored as i64 microseconds) must
 // cross the MCP boundary as an ISO-8601 string, not a raw integer.
 
-/// Round-7 regression: `get(id=<note>)` and `list(kind="note")` must return
+/// Regression: `get(id=<note>)` and `list(kind="note")` must return
 /// `expires_at` as an ISO-8601 string when the field is non-null.
 ///
 /// We insert a note with `expires_at` set directly via the `NoteStore` (the
@@ -7508,7 +7508,7 @@ async fn get_proposal_by_compact_hex_prefix_over_8_chars() {
     );
 }
 
-/// PR #816 Major finding 1: `review(id=<compact-hex-prefix>)` must resolve
+/// PR #816: `review(id=<compact-hex-prefix>)` must resolve
 /// via `resolve_proposal_uuid` (proposal.rs), independent of `get`'s own
 /// `proposals_open` scan. Before the fix, `resolve_proposal_uuid` built the
 /// `LIKE` pattern from the raw compact prefix instead of normalizing it with
@@ -7549,7 +7549,7 @@ async fn review_proposal_by_compact_hex_prefix_over_8_chars() {
     );
 }
 
-/// PR #816 Major finding 1: `withdraw(id=<compact-hex-prefix>)` must resolve
+/// PR #816: `withdraw(id=<compact-hex-prefix>)` must resolve
 /// via `resolve_proposal_uuid` (proposal.rs) the same way `review` does.
 #[tokio::test]
 async fn withdraw_proposal_by_compact_hex_prefix_over_8_chars() {
@@ -8235,7 +8235,7 @@ async fn create_bulk_items_malformed_unknown_field_returns_error_creates_nothing
     );
 }
 
-// ── High-2 (Round 2): entity-type validator is installed by normal pack registration ──
+// ── entity-type validator is installed by normal pack registration ─────────
 
 /// Build a `(KhiveRuntime, VerbRegistry)` pair using the same boot sequence as
 /// the production MCP server: register the pack, build the registry, install edge
@@ -8287,7 +8287,7 @@ async fn create_many_runtime_validator_installed_via_pack_registration() {
     );
 }
 
-// ── Round-3 High: multi-backend per-pack runtime validator regression ──
+// ── Multi-backend per-pack runtime validator regression ──
 
 /// In a multi-backend deployment the KG pack is constructed with its OWN runtime
 /// (not the `default_runtime`).  After `call_register_entity_type_validators` the
@@ -8364,7 +8364,7 @@ async fn create_many_runtime_validator_installed_on_per_pack_runtime_multi_backe
     );
 }
 
-// ── High-2: invalid entity_type in bulk items is rejected at the handler layer ──
+// ── invalid entity_type in bulk items is rejected at the handler layer ──────
 
 /// An invalid `entity_type` inside a bulk item must be rejected with the valid
 /// types listed, and must write nothing.
@@ -8579,7 +8579,7 @@ async fn proposal_add_note_changeset_note_exists_in_kg_after_apply() {
     );
 }
 
-// ── Finding 1: delivered filter must reach past 200 delivered notes ────────────
+// ── delivered filter must reach past 200 delivered notes ────────────
 //
 // Regression: before the fix, list(kind=message, direction=outbound) fetched
 // the 200 most-recent notes and applied the delivered_at check in Rust — so an
@@ -8658,14 +8658,14 @@ async fn list_delivered_filter_finds_undelivered_note_past_200_delivered() {
     assert_eq!(
         items.len(),
         1,
-        "Finding 1: list(delivered=false) must find the 1 undelivered note past 210 delivered; \
+        "list(delivered=false) must find the 1 undelivered note past 210 delivered; \
          got {} items",
         items.len()
     );
     let returned_id = items[0].get("id").and_then(|v| v.as_str()).unwrap_or("");
     assert_eq!(
         returned_id, old_id,
-        "Finding 1: returned note id={returned_id} must equal the undelivered note id={old_id}"
+        "returned note id={returned_id} must equal the undelivered note id={old_id}"
     );
 
     // delivered=true must return only delivered notes.
@@ -8687,7 +8687,7 @@ async fn list_delivered_filter_finds_undelivered_note_past_200_delivered() {
     assert_eq!(
         delivered_items.len(),
         200,
-        "Finding 1: list(delivered=true) must return 200 delivered notes (page cap); \
+        "list(delivered=true) must return 200 delivered notes (page cap); \
          got {}",
         delivered_items.len()
     );
@@ -8698,7 +8698,7 @@ async fn list_delivered_filter_finds_undelivered_note_past_200_delivered() {
             .and_then(|v| v.as_str());
         assert!(
             da.is_some(),
-            "Finding 1: list(delivered=true) items must all have delivered_at; got {item}"
+            "list(delivered=true) items must all have delivered_at; got {item}"
         );
     }
 
@@ -8718,7 +8718,7 @@ async fn list_delivered_filter_finds_undelivered_note_past_200_delivered() {
     assert_eq!(
         all_items.len(),
         200,
-        "Finding 1: list(no delivered filter) must return 200 notes (page cap of 211 total); \
+        "list(no delivered filter) must return 200 notes (page cap of 211 total); \
          got {}",
         all_items.len()
     );
@@ -8795,7 +8795,7 @@ async fn context_entity_ids_anchor_carries_full_entity_record() {
 
 #[tokio::test]
 async fn context_entity_ids_random_nonexistent_uuid_is_rejected() {
-    // internal review round 1, High-2: a syntactically valid but nonexistent UUID must
+    // a syntactically valid but nonexistent UUID must
     // error, not silently vanish from the response.
     let pack = pack();
     let random_id = uuid::Uuid::new_v4().to_string();
@@ -9343,7 +9343,7 @@ async fn context_query_and_entity_ids_combine_explicit_ids_first_then_search_fil
 
 #[tokio::test]
 async fn context_query_fill_reaches_limit_after_top_hit_duplicates_explicit_anchor() {
-    // internal review round 1, Medium-1: if the query's top hit is also an explicit anchor,
+    // if the query's top hit is also an explicit anchor,
     // the query leg must still fill up to `limit` DISTINCT non-explicit anchors
     // rather than silently returning fewer once the duplicate collapses.
     let pack = pack();
@@ -9547,7 +9547,7 @@ async fn context_fanout_caps_neighbors_per_node_per_hop() {
 
 #[tokio::test]
 async fn context_direction_outgoing_fanout_keeps_highest_weight_not_node_id_order() {
-    // internal review round 2, High: khive-runtime's neighbors_with_query re-sorts hits by
+    // khive-runtime's neighbors_with_query re-sorts hits by
     // (node_id, edge_id) for dedup and, before this fix, never restored the
     // weight-descending order the storage layer established. That meant
     // context(direction="outgoing") returned neighbors in arbitrary node_id
@@ -10082,11 +10082,11 @@ async fn link_supersedes_notes_cross_namespace_succeeds() {
     );
 }
 
-// ---- #638 round 1 codex findings ----
+// ---- #638 ----
 
 /// `create(kind="note", annotates=[...])` must resolve a short hex prefix of an
 /// `annotates` target the same way `get()` resolves it, even when the caller
-/// is in a different namespace than the target (round-1 finding 1). Pre-fix,
+/// is in a different namespace than the target. Pre-fix,
 /// `create.rs`'s `annotates[]` handling used `resolve_uuid_async`, whose
 /// prefix branch is namespace-scoped (`resolve_prefix`), so a short prefix to
 /// a foreign-namespace target failed with
@@ -10123,14 +10123,14 @@ async fn create_note_annotates_by_short_prefix_cross_namespace_succeeds() {
         .await;
     assert!(
         result.is_ok(),
-        "create note annotates by short prefix from a different namespace must succeed (#638 round 1 finding 1); got: {result:?}"
+        "create note annotates by short prefix from a different namespace must succeed (#638); got: {result:?}"
     );
 }
 
 /// `create(kind=entity, edges=[{target_id, relation}])` must resolve a short
 /// hex prefix of an edge target the same way `get()` resolves it, even when
-/// the caller is in a different namespace than the target (round-1 finding
-/// 1's second call site, `create.rs:427`).
+/// the caller is in a different namespace than the target (the second call
+/// site for this fix, `create.rs:427`).
 #[tokio::test]
 async fn create_entity_with_edges_target_by_short_prefix_cross_namespace_succeeds() {
     let f = pack();
@@ -10165,7 +10165,7 @@ async fn create_entity_with_edges_target_by_short_prefix_cross_namespace_succeed
     // must actually have been created.
     assert!(
         created.get("edge_errors").is_none(),
-        "edges[].target_id by short prefix from a different namespace must resolve (#638 round 1 finding 1); got: {created:?}"
+        "edges[].target_id by short prefix from a different namespace must resolve (#638); got: {created:?}"
     );
     let edges = created
         .get("edges")
@@ -10181,7 +10181,7 @@ async fn create_entity_with_edges_target_by_short_prefix_cross_namespace_succeed
 /// Cross-namespace `depends_on` link between two `project` entities must still
 /// infer `dependency_kind = "build"` (ADR-002 §inference default), even though
 /// endpoint validation now allows the target to live outside the caller's
-/// namespace (round-1 finding 2). Pre-fix, `link`'s `dependency_kind`
+/// namespace (#638). Pre-fix, `link`'s `dependency_kind`
 /// inference used the visible-set-scoped `resolve`, which silently dropped
 /// the inferred metadata for an endpoint outside the caller's visible set —
 /// the edge was created, but without the ADR-002 default.
@@ -10232,7 +10232,7 @@ async fn link_depends_on_project_to_project_cross_namespace_infers_dependency_ki
             .and_then(|m| m.get("dependency_kind"))
             .and_then(Value::as_str),
         Some("build"),
-        "cross-namespace depends_on must still infer dependency_kind=build (#638 round 1 finding 2); got edge: {edge:?}"
+        "cross-namespace depends_on must still infer dependency_kind=build (#638); got edge: {edge:?}"
     );
 }
 
@@ -10545,4 +10545,410 @@ async fn create_note_top_level_tags_wins_over_properties_tags_conflict() {
         props.get("domain").and_then(Value::as_str),
         Some("test747d")
     );
+}
+
+// =============================================================================
+// list() row-cap signal (issue #894)
+//
+// Every server-side page cap (entity 500, note 200, edge/event 1000) was
+// silently binding: a `limit` above the cap returned fewer rows than asked
+// for with no signal, so a caller striding a pagination loop by its own
+// requested `limit` could silently skip rows between pages. These tests
+// exercise the response contract end-to-end through the real handler,
+// runtime, and storage layers.
+// =============================================================================
+
+/// Build a `Fixture` (registry-wrapped dispatch, same path the MCP server
+/// uses) alongside the underlying `KhiveRuntime` and a `local`-namespace
+/// token, so tests can seed data via fast direct runtime calls (bypassing
+/// the JSON `create` verb) while still exercising the real `list` verb
+/// through the registry for assertions.
+fn pack_and_runtime() -> (Fixture, KhiveRuntime, NamespaceToken) {
+    let rt = KhiveRuntime::memory().expect("in-memory runtime must succeed");
+    let tok = rt.authorize(Namespace::local()).expect("authorize local");
+    let mut builder = VerbRegistryBuilder::new();
+    builder.register(KgPack::new(rt.clone()));
+    let registry = builder.build().expect("registry builds");
+    (Fixture { registry }, rt, tok)
+}
+
+/// `list(kind="entity")`: a `limit` at or under the cap (500) keeps the
+/// existing bare-array response shape.
+#[tokio::test]
+async fn list_entity_limit_under_cap_honored_exactly() {
+    let (pack, rt, tok) = pack_and_runtime();
+    for i in 0..5u32 {
+        rt.create_entity(
+            &tok,
+            "concept",
+            None,
+            &format!("cap894-under-{i}"),
+            None,
+            None,
+            vec![],
+        )
+        .await
+        .unwrap_or_else(|e| panic!("create entity {i} must succeed: {e}"));
+    }
+
+    let resp = pack
+        .dispatch("list", json!({"kind": "entity", "limit": 3}))
+        .await
+        .expect("#894: list under cap must succeed");
+
+    let items = resp.as_array().expect("list must return an array");
+    assert_eq!(
+        items.len(),
+        3,
+        "limit=3 under the entity cap (500) must return exactly 3 rows"
+    );
+}
+
+/// An over-cap request reports the effective limit even when the result set
+/// happens to contain fewer rows than the cap.
+#[tokio::test]
+async fn list_entity_limit_over_cap_reports_effective_limit() {
+    let (pack, rt, tok) = pack_and_runtime();
+    for i in 0..10u32 {
+        rt.create_entity(
+            &tok,
+            "concept",
+            None,
+            &format!("cap894-fewmatch-{i}"),
+            None,
+            None,
+            vec![],
+        )
+        .await
+        .unwrap_or_else(|e| panic!("create entity {i} must succeed: {e}"));
+    }
+
+    let resp = pack
+        .dispatch("list", json!({"kind": "entity", "limit": 1000}))
+        .await
+        .expect("#894: an over-cap limit must succeed with metadata");
+
+    let items = resp["items"].as_array().expect("items must be an array");
+    assert_eq!(
+        items.len(),
+        10,
+        "only 10 entities exist; all must be returned"
+    );
+    assert_eq!(resp["requested_limit"], 1000);
+    assert_eq!(resp["effective_limit"], 500);
+    assert_eq!(resp["limit_clamped"], true);
+}
+
+/// `limit` above the cap AND the true match count exceeds the cap: this is
+/// issue #894's actual repro. The response must truncate to the cap (500)
+/// and carries the same machine-readable limit metadata.
+#[tokio::test]
+async fn list_entity_limit_over_cap_truncates_with_metadata() {
+    let (pack, rt, tok) = pack_and_runtime();
+    for i in 0..501u32 {
+        rt.create_entity(
+            &tok,
+            "concept",
+            None,
+            &format!("cap894-over-{i}"),
+            None,
+            None,
+            vec![],
+        )
+        .await
+        .unwrap_or_else(|e| panic!("create entity {i} must succeed: {e}"));
+    }
+
+    let resp = pack
+        .dispatch("list", json!({"kind": "entity", "limit": 600}))
+        .await
+        .expect("#894: list must succeed even when the cap binds");
+
+    let items = resp["items"].as_array().expect("items must be an array");
+    assert_eq!(
+        items.len(),
+        500,
+        "must truncate to the entity cap (500) exactly, not silently return fewer/more"
+    );
+
+    assert_eq!(resp["requested_limit"], 600);
+    assert_eq!(resp["effective_limit"], 500);
+    assert_eq!(resp["limit_clamped"], true);
+}
+
+/// Same "under cap honored exactly" behavior as the entity test, at the note
+/// cap (200).
+#[tokio::test]
+async fn list_note_limit_under_cap_honored_exactly() {
+    let (pack, rt, tok) = pack_and_runtime();
+    for i in 0..4u32 {
+        rt.create_note(
+            &tok,
+            "observation",
+            None,
+            &format!("cap894 note under {i}"),
+            None,
+            None,
+            vec![],
+        )
+        .await
+        .unwrap_or_else(|e| panic!("create note {i} must succeed: {e}"));
+    }
+
+    let resp = pack
+        .dispatch("list", json!({"kind": "note", "limit": 2}))
+        .await
+        .expect("#894: list notes under cap must succeed");
+    let items = resp.as_array().expect("list must return an array");
+    assert_eq!(
+        items.len(),
+        2,
+        "limit=2 under the note cap (200) must return exactly 2 rows"
+    );
+}
+
+/// Same truncation metadata as the entity path, at the note cap (200).
+#[tokio::test]
+async fn list_note_limit_over_cap_truncates_with_metadata() {
+    let (pack, rt, tok) = pack_and_runtime();
+    for i in 0..201u32 {
+        rt.create_note(
+            &tok,
+            "observation",
+            None,
+            &format!("cap894 note over {i}"),
+            None,
+            None,
+            vec![],
+        )
+        .await
+        .unwrap_or_else(|e| panic!("create note {i} must succeed: {e}"));
+    }
+
+    let resp = pack
+        .dispatch("list", json!({"kind": "note", "limit": 300}))
+        .await
+        .expect("#894: list notes must succeed even when the cap binds");
+    let items = resp["items"].as_array().expect("items must be an array");
+    assert_eq!(
+        items.len(),
+        200,
+        "must truncate to the note cap (200) exactly"
+    );
+    assert_eq!(resp["requested_limit"], 300);
+    assert_eq!(resp["effective_limit"], 200);
+    assert_eq!(resp["limit_clamped"], true);
+}
+
+/// `list(kind="edge")` offset mode keeps the existing bare-array shape when
+/// the request does not exceed the cap.
+#[tokio::test]
+async fn list_edge_offset_mode_limit_under_cap_honored_exactly() {
+    use khive_storage::EdgeRelation;
+
+    let (pack, rt, tok) = pack_and_runtime();
+    let mut node_ids = Vec::new();
+    for i in 0..6u32 {
+        let e = rt
+            .create_entity(
+                &tok,
+                "concept",
+                None,
+                &format!("cap894-edgenode-{i}"),
+                None,
+                None,
+                vec![],
+            )
+            .await
+            .unwrap_or_else(|e| panic!("create node {i} must succeed: {e}"));
+        node_ids.push(e.id);
+    }
+    for i in 0..5usize {
+        rt.link(
+            &tok,
+            node_ids[i],
+            node_ids[i + 1],
+            EdgeRelation::Extends,
+            1.0,
+            None,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("create edge {i} must succeed: {e}"));
+    }
+
+    let resp = pack
+        .dispatch("list", json!({"kind": "edge", "limit": 3}))
+        .await
+        .expect("#894: list edges under cap must succeed");
+    let items = resp.as_array().expect("list must return an array");
+    assert_eq!(
+        items.len(),
+        3,
+        "limit=3 under the edge cap must return exactly 3 rows"
+    );
+}
+
+/// `list(kind="edge", limit=<over EDGE_LIST_MAX_LIMIT>)`: the cap genuinely
+/// binds and the response truncates with explicit metadata, like the entity/note
+/// cases in both offset mode (`{"items": [...]}`) and cursor mode
+/// (`{"edges": [...], "next_after": ...}`). Seeds via distinct concept pairs
+/// (edges are unique per
+/// (source, target, relation) triple, `idx_graph_edges_unique_triple`) to
+/// reach 1001 real matching edges, one past `EDGE_LIST_MAX_LIMIT` (1000).
+#[tokio::test]
+async fn list_edge_limit_over_cap_truncates_with_metadata_in_both_modes() {
+    use khive_storage::EdgeRelation;
+
+    let (pack, rt, tok) = pack_and_runtime();
+    let n_nodes = 34usize; // 34*33 = 1122 distinct ordered pairs >= 1001 needed
+    let mut node_ids = Vec::with_capacity(n_nodes);
+    for i in 0..n_nodes {
+        let e = rt
+            .create_entity(
+                &tok,
+                "concept",
+                None,
+                &format!("cap894-edgenode-big-{i}"),
+                None,
+                None,
+                vec![],
+            )
+            .await
+            .unwrap_or_else(|e| panic!("create node {i} must succeed: {e}"));
+        node_ids.push(e.id);
+    }
+
+    let mut created = 0usize;
+    'seed: for i in 0..n_nodes {
+        for j in 0..n_nodes {
+            if i == j {
+                continue;
+            }
+            rt.link(
+                &tok,
+                node_ids[i],
+                node_ids[j],
+                EdgeRelation::Extends,
+                1.0,
+                None,
+            )
+            .await
+            .unwrap_or_else(|e| panic!("create edge ({i},{j}) must succeed: {e}"));
+            created += 1;
+            if created >= 1001 {
+                break 'seed;
+            }
+        }
+    }
+    assert_eq!(
+        created, 1001,
+        "must have seeded exactly 1001 edges for this test's premise"
+    );
+
+    // Offset mode.
+    let resp = pack
+        .dispatch("list", json!({"kind": "edge", "limit": 1500}))
+        .await
+        .expect("#894: list edges must succeed even when the cap binds");
+    let items = resp["items"].as_array().expect("items must be an array");
+    assert_eq!(
+        items.len(),
+        1000,
+        "must truncate to EDGE_LIST_MAX_LIMIT (1000) exactly"
+    );
+    assert_eq!(resp["requested_limit"], 1500);
+    assert_eq!(resp["effective_limit"], 1000);
+    assert_eq!(resp["limit_clamped"], true);
+
+    // Cursor mode retains its cursor metadata and adds the limit metadata.
+    let cursor_resp = pack
+        .dispatch("list", json!({"kind": "edge", "after": "", "limit": 1500}))
+        .await
+        .expect("#894: cursor-mode list edges must succeed even when the cap binds");
+    let cursor_edges = cursor_resp["edges"]
+        .as_array()
+        .expect("cursor mode keeps the {\"edges\": [...]} envelope");
+    assert_eq!(
+        cursor_edges.len(),
+        1000,
+        "cursor mode must also truncate to the cap"
+    );
+    assert!(
+        cursor_resp["next_after"].is_string(),
+        "truncated cursor page must still offer a next_after cursor: {cursor_resp}"
+    );
+    assert_eq!(cursor_resp["requested_limit"], 1500);
+    assert_eq!(cursor_resp["effective_limit"], 1000);
+    assert_eq!(cursor_resp["limit_clamped"], true);
+}
+
+/// `list(kind="event")` also keeps the bare-array response below its cap.
+#[tokio::test]
+async fn list_event_limit_under_cap_honored_exactly() {
+    let f = pack_with_events();
+    for i in 0..4u32 {
+        f.dispatch(
+            "create",
+            json!({"kind": "concept", "name": format!("cap894-event-{i}")}),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("create entity {i} must succeed: {e}"));
+    }
+
+    let resp = f
+        .dispatch("list", json!({"kind": "event", "limit": 2}))
+        .await
+        .expect("#894: list events under cap must succeed");
+    let items = resp.as_array().expect("list must return an array");
+    assert!(
+        items.len() <= 2,
+        "limit=2 must never return more than 2 rows; got {}",
+        items.len()
+    );
+}
+
+#[tokio::test]
+async fn list_event_limit_over_cap_reports_effective_limit() {
+    let f = pack_with_events();
+    f.dispatch(
+        "create",
+        json!({"kind": "concept", "name": "cap894-event-over"}),
+    )
+    .await
+    .expect("create must succeed");
+
+    let response = f
+        .dispatch("list", json!({"kind": "event", "limit": 1500}))
+        .await
+        .expect("over-cap event list must succeed");
+
+    assert!(response["items"].is_array());
+    assert_eq!(response["requested_limit"], 1500);
+    assert_eq!(response["effective_limit"], 1000);
+    assert_eq!(response["limit_clamped"], true);
+}
+
+#[tokio::test]
+async fn list_proposal_limit_over_cap_reports_effective_limit() {
+    let f = pack_with_events();
+    f.dispatch(
+        "propose",
+        json!({
+            "title": "cap894 proposal",
+            "description": "Verify proposal list limit metadata",
+            "changeset": changeset_add_entity(),
+        }),
+    )
+    .await
+    .expect("propose must succeed");
+
+    let response = f
+        .dispatch("list", json!({"kind": "proposal", "limit": 600}))
+        .await
+        .expect("over-cap proposal list must succeed");
+
+    assert!(response["items"].is_array());
+    assert_eq!(response["requested_limit"], 600);
+    assert_eq!(response["effective_limit"], 500);
+    assert_eq!(response["limit_clamped"], true);
 }

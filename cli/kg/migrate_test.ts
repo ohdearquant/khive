@@ -1,8 +1,7 @@
 /**
  * Tests for cli/kg/migrate.ts — `khive kg migrate` (ADR-054).
  *
- * Regression suite added in codex round-2 to prevent the defects identified
- * in round-1 REJECT:
+ * Regression suite added to prevent the defects identified during review:
  *  - reg-endpoint-kind-filtering: remove_relation_endpoint must filter by
  *    (relation, source_kind, target_kind), not relation alone.
  *  - reg-atomicity: schema write failure must leave all files at original version.

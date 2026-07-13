@@ -41,6 +41,10 @@ with hardened, allowlisted argv construction.
 
 `workspace` requires `kg`, `git`, `gtd`, and `session` to be loaded alongside it (the runtime rejects a pack set that omits a declared dependency), so its minimal example lists all four.
 
+`schedule` requires `kg`. `schedule.remind` additionally requires `comm.send` at
+creation time and persists nothing when that delivery capability is absent; the other
+three schedule verbs remain available without `comm`.
+
 `code` registers the `finding` note kind and edge rules only; its `code.ingest` verb is
 accepted but unimplemented (ADR-085), and `findings.json` ingest runs through the
 `kkernel code-ingest` admin CLI path, not the MCP verb surface — so it contributes 0
@@ -215,6 +219,61 @@ List records with optional filtering.
 request(ops="list(kind=\"entity\", entity_kind=\"concept\", limit=20)")
 ```
 
+Requests within the kind's server-side row cap keep the existing array response. If `limit`
+exceeds the cap, the response is `{"items": [...], "requested_limit": N,
+"effective_limit": CAP, "limit_clamped": true}`. This lets offset-based clients advance by
+the effective limit instead of silently skipping rows. The caps are entity 500, note 200, edge
+1000, event 1000, and proposal 500. Edge cursor mode keeps its existing `{"edges": [...],
+"next_after": ...}` shape and adds the same limit metadata when clamped.
+
+Row shape (each item in the array, or in `"items"`/`"edges"` when clamped) depends on `kind`.
+For `kind="entity"`, `"note"`, `"edge"`, and `"event"`, the row is the **full stored record**
+for that substrate, listed below in its **verbose** form (the shape returned with
+`presentation="verbose"`, which is also the default for `kkernel exec` and the `khive` CLI).
+This is the key difference from `search` and `neighbors` below, which both return narrow
+projections regardless of presentation mode.
+
+Every MCP call that omits `presentation` gets **Agent** mode instead (`list` is not on the
+`AlwaysVerbose` verb list in `crates/khive-types/src/pack.rs`), which conditionally reshapes the
+rows below (`crates/khive-runtime/src/presentation.rs`): a null field is dropped entirely rather
+than returned as `null`, unless its name is on the lifecycle-preserve list (`deleted_at` among
+others, but not `merged_into`/`merge_event_id`/`expires_at`); empty strings, arrays, and objects
+are dropped; `id`/`source_id`/`target_id`/`merge_event_id` and other `_id`-suffixed fields are
+shortened to an 8-character prefix; `created_at`/`updated_at`/`deleted_at` are
+compacted to a relative or minute-truncated form; and `salience`/`decay_factor` are truncated to
+3 significant figures. Pass `presentation="verbose"` to get the exact shapes below unconditionally.
+
+- **`kind="entity"`**: `{id, namespace, kind, entity_type, name, description, properties, tags,
+  created_at, updated_at, deleted_at, merged_into, merge_event_id, content_ref}`.
+  `created_at`/`updated_at`/`deleted_at` are ISO-8601 strings (the store keeps them as
+  epoch-microseconds internally; the handler converts before returning).
+- **`kind="note"`**: `{id, namespace, kind, status, name, content, salience, decay_factor,
+  expires_at, properties, created_at, updated_at, deleted_at}`. Notes have **no top-level
+  `tags` field**: unlike entities, tags live inside `properties.tags`. If the note's
+  `properties.status` is set (e.g. a `gtd` task's lifecycle status, or a `comm` message's
+  delivery state), the row's substrate-level `status` (normally `"active"`) is renamed to
+  `lifecycle`, and the top-level `status` is replaced with the `properties.status` value,
+  so a `gtd`/`comm` consumer reads the pack-level status directly off the row instead of
+  digging into `properties`. When no `properties.status` is set, `status` stays the raw
+  substrate value and there is no `lifecycle` key.
+- **`kind="edge"`**: `{id, namespace, source_id, target_id, relation, weight, created_at,
+  updated_at, deleted_at, metadata, target_backend}`.
+- **`kind="event"`**: `{id, namespace, verb, substrate, actor, kind, outcome, payload,
+  payload_schema_version, profile_state_version, duration_us, target_id, session_id,
+  aggregate_kind, aggregate_id, created_at}`.
+- **`kind="proposal"`** is a supported `list` kind but is not a full stored record: it returns a
+  purpose-built projection, `{id, proposer, title, status, created_at, updated_at, expiry,
+  last_decision, review_count, approve_count, reject_count}` (built in
+  `crates/khive-pack-kg/src/handlers/proposal.rs`). That field set is the
+  `presentation="verbose"` projection; the default Agent mode applies the same generic
+  reshaping as the other `list` rows: non-lifecycle null/empty fields are omitted (a null
+  `expiry`, an empty `last_decision`), ids are shortened, and timestamps are compacted.
+
+None of these match `search`'s `{id, entity_kind|note_kind, score, title, snippet}` rows or
+`neighbors`'s flat `{origin_id, id, edge_id, relation, weight, name?, kind?, entity_type?}`
+rows. `search` and `neighbors` are built for ranking and graph-walking, not display: fetch the
+full record with `get(id=...)` (or `list`) when you need more than what they return.
+
 ### `stats` — Assertive
 
 Return aggregate KG substrate counts (entities, edges, notes). No params.
@@ -298,6 +357,48 @@ Hybrid FTS + vector search with RRF fusion.
 request(ops="search(kind=\"entity\", query=\"knowledge graph runtime\", limit=10)")
 ```
 
+Response shape (`kind="entity"` rows, `presentation="verbose"`):
+
+```json
+[
+  {
+    "id": "3f2a9c1e-...",
+    "entity_kind": "concept",
+    "score": 0.0909,
+    "title": "LoRA",
+    "snippet": "matched text from the description/properties"
+  }
+]
+```
+
+`kind="note"` rows are identical except the kind field is named `note_kind` instead of
+`entity_kind`. That kind field is present on every row in the verbose shape above but is `null`
+in the rare case where the record was deleted between the search hit and the metadata lookup
+that fills it in; `title`/`snippet` are `null` for the same reason, or when the underlying
+FTS/vector hit carried no snippet text. `search` is not on the `AlwaysVerbose` verb list
+(`crates/khive-types/src/pack.rs`), so a call that omits `presentation` gets Agent mode instead:
+`entity_kind`/`note_kind`/`title`/`snippet` are omitted from the row entirely when `null` rather
+than returned as `null` (they are not on the lifecycle-preserve list), and `id` is shortened to
+an 8-character prefix (`crates/khive-runtime/src/presentation.rs`).
+
+`score` is an implementation-defined ranking value, not a normalized 0.0-1.0 similarity, and its
+construction differs by kind (see the `min_score` row above for typical magnitudes):
+
+- **Entity** (`crates/khive-runtime/src/retrieval.rs`): each retrieval leg (lexical, vector) that
+  returns the entity contributes `1 / (k + rank)` with `k = 10`; contributions from every leg
+  that hit the entity are summed, then a flat `+0.5` boost is added when the entity's title is
+  an exact case-insensitive match for the query. A single-leg rank-1 hit is `0.0909`; an entity
+  hit by both legs at rank 1, with an exact title match, would score `1/11 + 1/11 + 0.5 ≈ 0.682`.
+- **Note** (`crates/khive-runtime/src/operations.rs`): the same per-leg RRF sum, but with `k = 60`,
+  is then multiplied by a salience-derived weight, `0.5 + 0.5 * salience` (salience defaults to
+  `0.5` when unset), so the fused rank score is scaled down for low-salience notes and left
+  closer to unscaled for high-salience ones.
+
+This row shape never includes the full entity/note record (no `description`, `content`,
+`properties`, `tags`, timestamps, …) in either presentation mode, only enough to rank and
+identify the hit. It diverges from both `neighbors` and `list`'s row shapes above; see `list`'s
+"Row shape" note above for the full comparison.
+
 ### `link` — Commissive
 
 Create a typed directed edge.
@@ -317,6 +418,9 @@ request(ops="link(source_id=\"<uuid-a>\", target_id=\"<uuid-b>\", relation=\"ext
 
 Immediate graph neighbors.
 
+Each returned hit includes `origin_id`, the resolved queried node. This lets
+batch callers verify that every result is associated with the submitted root.
+
 | Param        | Type            | Required | Notes                                            |
 | ------------ | --------------- | -------- | ------------------------------------------------ |
 | `node_id`    | uuid            | yes      | Node whose neighbors to return.                  |
@@ -327,6 +431,43 @@ Immediate graph neighbors.
 ```
 request(ops="neighbors(node_id=\"<uuid>\", direction=\"both\")")
 ```
+
+Response shape:
+
+```json
+[
+  {
+    "origin_id": "<the queried node_id>",
+    "id": "<neighbor node id>",
+    "edge_id": "<uuid>",
+    "relation": "extends",
+    "weight": 0.9,
+    "name": "LoRA",
+    "kind": "concept",
+    "entity_type": "paper"
+  }
+]
+```
+
+Flat rows, one per edge: never the neighbor's full entity/note record. `name`, `kind`, and
+`entity_type` are filled in by a batch entity+note lookup performed after the graph query, and
+are **omitted from the JSON entirely (not `null`)** when that lookup can't resolve the neighbor
+id (a dangling/bogus id that never matched an entity or note row). Soft-deleted entity neighbors
+are a separate case: the runtime filters them out before the response is built
+(`crates/khive-runtime/src/operations.rs`, `neighbors_with_query`), so a soft-deleted neighbor
+produces no row at all rather than a row with omitted fields. `neighbors` is `AlwaysVerbose`
+(`crates/khive-types/src/pack.rs`), so this omission behavior is unconditional regardless of
+`presentation`; `search`'s `entity_kind`/`note_kind` follows the opposite rule in verbose mode
+(always present, only ever `null`), but is itself omitted-when-null under the default Agent mode.
+`entity_type` is included only when `include_entity_type=true` was passed, and is never set for
+a note neighbor (notes have no `entity_type`).
+
+`kind` is overloaded: for an entity neighbor it is the entity's base kind (e.g. `concept`); for
+a note neighbor it is the note's kind (e.g. `observation`); annotation edges routinely link an
+entity to a note, so a `neighbors` result set can mix both. There is no separate field stating
+which substrate a given neighbor belongs to; disambiguate by checking `kind` against the closed
+entity-kind vocabulary (§"The 9 entity kinds" in AGENTS.md) vs. the note-kind vocabulary
+(§"The 5 note kinds"), or call `get(id=...)` on the neighbor's `id`.
 
 ### `traverse` — Assertive
 
@@ -401,7 +542,8 @@ GQL or SPARQL pattern matching (read-only). Write-shaped input (SPARQL
 INSERT/DELETE/LOAD/WITH…DELETE, GQL/Cypher CREATE/DELETE/DETACH DELETE/SET/MERGE) is
 rejected — use `create`/`update`/`link`/`merge`/`delete` to mutate the graph. Queries
 that mix fixed-length and variable-length chains are not compiled in one call; split
-them into separate `query()` calls.
+them into separate `query()` calls. GQL string equality uses SQLite `COLLATE NOCASE`,
+so `WHERE e.name = "LoRA"` matches both `LoRA` and ASCII case variants such as `lora`.
 
 | Param   | Type    | Required | Notes                                    |
 | ------- | ------- | -------- | ---------------------------------------- |
@@ -462,15 +604,16 @@ request(ops="withdraw(id=\"<proposal-id>\")")
 
 Resolve natural-language references to ids. Each ref in `refs` is resolved through:
 (1) id-string passthrough (UUID or 8+ hex prefix) via the existing by-ID path; (2) this
-actor's recently-referenced ring; (3) hybrid search over the namespace. Returns one of
+actor's recently-referenced ring; (3) a case-sensitive exact match on `entities.name`;
+(4) hybrid search over the namespace. Returns one of
 `Resolved{id,confidence}` | `Ambiguous{candidates}` | `NotFound` per ref — never a
 silent pick among close candidates. Read-only: performs no mutation.
 
-| Param   | Type            | Required | Notes                                                                                                        |
-| ------- | --------------- | -------- | ------------------------------------------------------------------------------------------------------------ |
-| `refs`  | array\<string\> | yes      | Natural-language references to resolve (UUID, hex prefix, exact entity name, or free text).                  |
-| `kind`  | string          | no       | Restricts the hybrid-search fallback (stage 3) to an entity kind. No effect on the id-string or ring stages. |
-| `limit` | integer         | no       | Max candidates returned per ref from the hybrid-search fallback. Default 5, max 20.                          |
+| Param   | Type            | Required | Notes                                                                                                           |
+| ------- | --------------- | -------- | --------------------------------------------------------------------------------------------------------------- |
+| `refs`  | array\<string\> | yes      | Natural-language references to resolve (UUID, hex prefix, exact entity name, or free text).                     |
+| `kind`  | string          | no       | Restricts the exact-name and hybrid-search stages to an entity kind. No effect on the id-string or ring stages. |
+| `limit` | integer         | no       | Max candidates returned per ref from the stage 4 hybrid-search fallback. Default 5, max 20.                     |
 
 ```
 request(ops="resolve(refs=[\"the old record\", \"<uuid>\"])")
@@ -673,19 +816,20 @@ caller. Optional; load with `KHIVE_PACKS=kg,brain`.
 
 ### `brain.event_counts` — Assertive
 
-Windowed event counts grouped by kind and actor over the event plane (ADR-103 Stage 1,
-#724 Ask A). `feedback_explicit` events are additionally split by `served_by_profile_id`.
-Events carrying a `work_class` (today: `phase_started`/`phase_completed`/`phase_cancelled`
-payloads) split by `counts_by_work_class`. `cost_unit` is not surfaced: it does not exist
-on any event payload yet (ADR-103 Stage 0 is design-only) and will be added once a
-resource payload carries it.
+Windowed event counts grouped by kind, actor, and verb over the event plane (ADR-103
+Stage 1, #724 Ask A). `feedback_explicit` events are additionally split by
+`served_by_profile_id`. Events carrying a `work_class` (today:
+`phase_started`/`phase_completed`/`phase_cancelled` payloads) split by
+`counts_by_work_class`. `cost_unit` is not surfaced: it does not exist on any event
+payload yet (ADR-103 Stage 0 is design-only) and will be added once a resource payload
+carries it.
 
-| Param   | Type   | Required | Notes                                                                  |
-| ------- | ------ | -------- | ---------------------------------------------------------------------- |
-| `since` | string | yes      | Window start, ISO-8601/RFC-3339 datetime. Inclusive.                   |
-| `until` | string | no       | Window end, ISO-8601/RFC-3339 datetime. Exclusive. Defaults to now.    |
-| `actor` | string | no       | Filter to a single actor. Omit for all actors.                         |
-| `kind`  | string | no       | Filter to a single EventKind (e.g. `"recall_executed"`). Omit for all. |
+| Param   | Type   | Required | Notes                                                                                                                                                       |
+| ------- | ------ | -------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `since` | string | yes      | Window start, ISO-8601/RFC-3339 datetime. Inclusive.                                                                                                        |
+| `until` | string | no       | Window end, ISO-8601/RFC-3339 datetime. Exclusive. Defaults to now.                                                                                         |
+| `actor` | string | no       | Filter to a single actor. Stored actor strings are prefixed (`actor:lambda:khive`); bare (`lambda:khive`) or prefixed form both match. Omit for all actors. |
+| `kind`  | string | no       | Filter to a single EventKind (e.g. `"recall_executed"`). Omit for all.                                                                                      |
 
 ```
 request(ops="brain.event_counts(since=\"2026-07-01T00:00:00Z\")")
@@ -988,10 +1132,11 @@ request(ops="comm.probe(actor=\"lambda:leo\", since_us=42)")
 
 Read-only per-channel health snapshot. Returns the daemon-persisted heartbeat row for
 every known channel: timestamps and consecutive-failure counts only, never a computed
-healthy bool. Health judgment belongs to the caller. Rows are read from the pinned
-operational namespace (`local`) unconditionally, regardless of the caller's dispatch
-namespace. An empty `channels` array cannot distinguish "no daemon running" from
-"channels configured but never polled". See the
+healthy bool. Health judgment belongs to the caller. Rows are read from the caller's
+injected namespace (`namespace=`, defaulting to `local` like every other comm verb) —
+`comm.heartbeat` is the only handler pinned to the fixed `local` operational namespace.
+The response echoes the namespace actually read in a `namespace` field, so an empty
+`channels` array is unambiguous even under a scoped read. See the
 [communication guide](communication.md) for the full response contract.
 
 No parameters.
@@ -1005,7 +1150,7 @@ request(ops="comm.health()")
 ## `schedule` pack — 4 verbs
 
 Time-triggered reminders and deferred verb dispatch. Optional; load with
-`KHIVE_PACKS=kg,schedule`.
+`KHIVE_PACKS=kg,schedule`. Add `comm` to create reminders.
 
 ### `schedule.remind` — Commissive
 
@@ -1472,4 +1617,4 @@ request(ops="git.commit(repo=\"/abs/path/repo\", message=\"fix: thing\") | git.p
 - [GTD Task Management](tasks.html): task lifecycle in depth.
 - [Prompt Cookbook](prompt-cookbook.html): ready-to-use verb patterns.
 - [ADR-016: request DSL](https://github.com/ohdearquant/khive/blob/main/docs/adr/ADR-016-request-dsl.md)
-- [ADR-002: edge ontology](https://github.com/ohdearquant/khive/blob/main/docs/adr/ADR-002-edge-ontology.md)
+- [ADR-002: Closed Edge Ontology](https://github.com/ohdearquant/khive/blob/main/docs/adr/ADR-002-edge-ontology.md)

@@ -598,7 +598,7 @@ async fn assign_and_create_task_reject_malformed_context_entity_id() {
     assert!(create_err.to_string().contains("context_entity_id"));
 }
 
-// ---- Finding 1 regression: generic create must normalize nested properties ----
+// ---- generic create must normalize nested properties -------------------------
 
 #[tokio::test]
 async fn create_task_normalizes_nested_priority_and_depends_on_before_write() {
@@ -742,7 +742,7 @@ async fn create_task_rejects_nested_depends_on_non_task_without_persisting() {
     );
 }
 
-// ---- Finding 2 regression: depends_on and context_entity_id must be primary-only ----
+// ---- depends_on and context_entity_id must be primary-only -------------------
 
 /// A task in a visible (non-primary) namespace must be treated as NotFound
 /// when referenced as a `depends_on` target.

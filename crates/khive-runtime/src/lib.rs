@@ -8,6 +8,7 @@ pub mod atomic_prepare;
 pub mod atomic_runner;
 pub mod config;
 pub mod config_ledger;
+pub mod cost_unit;
 pub mod curation;
 #[cfg(unix)]
 pub mod daemon;
@@ -19,6 +20,7 @@ pub mod graph_traversal;
 pub mod objectives;
 pub mod operations;
 pub mod pack;
+pub mod phase_events;
 pub mod portability;
 pub mod presentation;
 pub mod reference_resolution;
@@ -32,12 +34,14 @@ pub mod validation;
 
 pub use actor_identity::{actor_is_unattributed, resolve_actor, should_warn_unattributed_actor};
 pub use atomic_plan::{
-    AffectedRowGuard, DeletePlan, GovernanceOp, GovernancePlan, GtdCompletePlan, GtdTransitionPlan,
-    LinkPlan, MergePlan, PlanPredicate, PlanStatement, PostCommitEffect, UpdatePlan,
+    AddEntityPlan, AddNotePlan, AffectedRowGuard, DeletePlan, GovernanceOp, GovernancePlan,
+    GtdCompletePlan, GtdTransitionPlan, LinkPlan, MergePlan, PlanPredicate, PlanStatement,
+    PostCommitEffect, UpdatePlan,
 };
 pub use atomic_runner::{
     run_atomic_unit, AtomicOpFailure, AtomicOpPlan, AtomicRunOutcome, AtomicRunnerError,
 };
+pub use cost_unit::{base_resource_payload, cost_unit_for_dispatch, resource_payload};
 pub use curation::{
     entity_fts_document, note_fts_document, ContentMergeStrategy, EdgeListFilter, EdgePatch,
     EntityDedupMergePolicy, EntityPatch, MergeSummary, NotePatch,
@@ -90,6 +94,7 @@ pub use pack::{
     SchemaPlan, VerbCategory, VerbPresentationPolicy, VerbRegistry, VerbRegistryBuilder,
     Visibility,
 };
+pub use phase_events::{emit_phase_event, is_benign_shutdown_cancellation};
 pub use portability::{ImportSummary, KgArchive};
 pub use presentation::{
     apply_redundancy_drop, micros_to_iso, present, render_format, OutputFormat, PresentationMode,

@@ -82,15 +82,15 @@
 //!   `check_entropy_heuristic`.
 //!
 //! Trigger-word matching only fires on genuine mentions, not substring
-//! collisions: bare trigger words (`key`, `secret`, `password`, `passwd`,
+//! collisions: trigger words (`key`, `secret`, `password`, `passwd`,
 //! `credential`, `bearer`, `auth`, `apikey`) are matched at a word boundary
 //! (`contains_bounded_word`), so `auth` does not fire inside `authorized` or
-//! `authentication`, nor `key` inside `monkey`/`keyword`. The three compound
-//! entries that already embed an underscore (`api_key`, `access_key`,
-//! `private_key`) are matched as a plain substring instead, since the
-//! underscore already disambiguates them and word-boundary matching would
-//! only weaken them (e.g. `secret_access_key` no longer needs the bare
-//! `secret`/`key` matches once `access_key` fires on its own).
+//! `authentication`, nor `key` inside `monkey`/`keyword`. The candidate token
+//! is excluded from its own surrounding context. This prevents an internal
+//! path segment such as `cli-auth-and-kg` from making the path self-trigger.
+//! Assignment-shaped candidates such as `auth=<value>` and `api_key=<value>`
+//! are checked separately, including when whitespace splits the label from the
+//! value, so the exclusion does not weaken credential-shaped writes.
 //!
 //! A structured-identifier-shaped token sitting near a **genuinely standalone**
 //! trigger word (e.g. `auth work saved at .../repo-audit.md`, where `auth` is
@@ -114,10 +114,9 @@
 //! lets common underscore-joined credential-config compounds keep firing:
 //! `SECRET_KEY=...` (Django/Flask-style config), `auth_token=...`,
 //! `session_secret_...`, `signing_key=...` all match on the `secret`/`key`/
-//! `auth` half even though none of them is in `COMPOUND_TRIGGER_WORDS`. This
-//! is implemented by parameterizing the boundary rule (`contains_word`'s
-//! `underscore_is_word_char` argument) rather than sharing one rule between
-//! the two callers.
+//! `auth` half. This is implemented by parameterizing the boundary rule
+//! (`contains_word`'s `underscore_is_word_char` argument) rather than sharing
+//! one rule between the two callers.
 //!
 //! A production-corpus replay harness (`corpus_replay`, `#[ignore]`d, run via
 //! `KHIVE_REPLAY_DB=<path> cargo test ... -- --ignored --nocapture`) measures
@@ -615,7 +614,7 @@ fn find_url_userinfo(text: &str) -> Option<&str> {
 /// [`contains_bounded_word`]) — bare English words that can otherwise appear
 /// as a pure substring collision inside unrelated identifiers or prose:
 /// `auth` inside `authorized`/`authentication`, `key` inside
-/// `monkey`/`turkey`/`keyword`, `secret` inside `secretary`.  Round-5 decision
+/// `monkey`/`turkey`/`keyword`, `secret` inside `secretary`.  Design decision
 /// (see the module doc): a substring collision like this poisons the trigger
 /// window on prose that never mentions credentials at all, which is a
 /// distinct failure mode from a genuine (if topical) mention of the word —
@@ -639,14 +638,9 @@ const TRIGGER_WORDS: &[&str] = &[
     "apikey",
 ];
 
-/// Trigger words checked as a plain substring (unchanged behavior) rather than
-/// a bounded word — these already embed the underscore separator that
-/// disambiguates them from ordinary prose (`secret_access_key`, `api_key`),
-/// so word-boundary matching would only weaken detection: an attacker who
-/// glues the compound onto a longer identifier (`secret_access_key_v2`) or
-/// composes it inside another compound (`aws_secret_access_key`) must still
-/// trip the gate. Do not move an entry here unless it structurally requires
-/// an underscore to make sense as a trigger.
+/// Compound triggers that retain suffix matching inside credential labels.
+/// Their underscore separator disambiguates them from ordinary prose, and
+/// suffixes are common in versioned credential names such as `api_keyv2`.
 const COMPOUND_TRIGGER_WORDS: &[&str] = &["api_key", "access_key", "private_key"];
 
 /// Minimum token length to apply the entropy check.
@@ -717,16 +711,17 @@ fn check_entropy_heuristic(text: &str, from: usize) -> Option<(&str, &'static st
         let window_start = floor_char_boundary(text, tok_offset.saturating_sub(TRIGGER_WINDOW));
         let window_end = floor_char_boundary(text, tok_offset + raw_token.len() + TRIGGER_WINDOW);
         let window = &text[window_start..window_end];
-        let low_window = window.to_ascii_lowercase();
+        let raw_start = tok_offset - window_start;
+        let raw_end = raw_start + raw_token.len();
 
-        let near_trigger = COMPOUND_TRIGGER_WORDS
-            .iter()
-            .any(|tw| low_window.contains(tw))
-            || TRIGGER_WORDS
-                .iter()
-                .any(|tw| contains_bounded_word(&low_window, tw))
-            || has_standalone_token(&low_window)
-            || has_token_assignment(&low_window);
+        // A high-entropy candidate must not provide its own surrounding
+        // trigger context. This matters for paths whose slugs contain a real
+        // trigger token, such as `ADR-051-cli-auth-and-kg-git-workflow.md`.
+        // Search the prose on either side independently, then preserve inline
+        // credential shapes through a focused assignment/config check.
+        let near_trigger = contains_trigger(&window[..raw_start])
+            || contains_trigger(&window[raw_end..])
+            || has_inline_credential_trigger(raw_token);
 
         // UUID canonical form and sha-prefixed base64 content hashes (SRI /
         // npm lockfile integrity) are allowlisted only outside trigger
@@ -869,6 +864,91 @@ fn contains_word(low_window: &str, needle: &str, underscore_is_word_char: bool) 
 /// collisions like `authorized`/`authentication`/`monkey`/`keyword` do not.
 fn contains_bounded_word(low_window: &str, needle: &str) -> bool {
     contains_word(low_window, needle, false)
+}
+
+/// Returns `true` when a compound credential label begins at an identifier
+/// boundary. The trailing edge is deliberately unbounded so version suffixes
+/// and larger underscore-composed labels remain protected.
+fn contains_compound_trigger(low_text: &str) -> bool {
+    COMPOUND_TRIGGER_WORDS.iter().any(|needle| {
+        let mut start = 0;
+        while let Some(rel) = low_text[start..].find(needle) {
+            let abs = start + rel;
+            let before_ok = abs == 0
+                || low_text[..abs]
+                    .chars()
+                    .next_back()
+                    .is_none_or(|c| !c.is_ascii_alphanumeric());
+            if before_ok {
+                return true;
+            }
+            start = abs + needle.len();
+        }
+        false
+    })
+}
+
+/// Returns `true` when `text` contains a boundary-delimited credential trigger.
+fn contains_trigger(text: &str) -> bool {
+    let low = text.to_ascii_lowercase();
+    TRIGGER_WORDS
+        .iter()
+        .any(|tw| contains_bounded_word(&low, tw))
+        || contains_compound_trigger(&low)
+        || has_standalone_token(&low)
+        || has_token_assignment(&low)
+        || has_assignment_credential_trigger(&low)
+}
+
+/// Detect a credential-bearing assignment label before an `=` or `:`.
+///
+/// The separator may be preceded by whitespace or a JSON quote. Compound
+/// triggers deliberately retain substring matching inside the label so common
+/// version suffixes such as `api_keyv2` remain protected.
+fn has_assignment_credential_trigger(low_text: &str) -> bool {
+    low_text.char_indices().any(|(index, ch)| {
+        if !matches!(ch, '=' | ':') {
+            return false;
+        }
+        let before =
+            low_text[..index].trim_end_matches(|c: char| !c.is_ascii_alphanumeric() && c != '_');
+        let label = before
+            .rsplit(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+            .next()
+            .unwrap_or_default();
+        COMPOUND_TRIGGER_WORDS
+            .iter()
+            .any(|needle| label.contains(needle))
+            || TRIGGER_WORDS
+                .iter()
+                .any(|tw| contains_bounded_word(label, tw))
+            || label == "token"
+    })
+}
+
+/// Detect credential labels embedded in the same whitespace token as a value.
+///
+/// The surrounding-context scan deliberately excludes the candidate token so
+/// a trigger word inside a path cannot make that path self-trigger. Credential
+/// assignments still need to fire when no whitespace separates label and
+/// value, including JSON-like forms. Underscore-delimited config identifiers
+/// without an assignment are retained for compatibility with shapes such as
+/// `session_secret_<value>`.
+fn has_inline_credential_trigger(raw_token: &str) -> bool {
+    let low = raw_token.to_ascii_lowercase();
+
+    if has_assignment_credential_trigger(&low) {
+        return true;
+    }
+
+    !low.contains(['/', '-', '.'])
+        && low.contains('_')
+        && (COMPOUND_TRIGGER_WORDS
+            .iter()
+            .any(|needle| low.contains(needle))
+            || TRIGGER_WORDS
+                .iter()
+                .any(|tw| contains_bounded_word(&low, tw)))
 }
 
 /// Returns `true` when `low_window` contains the word `token` as a standalone
@@ -2543,38 +2623,38 @@ mod tests {
     // they block near a trigger word.
 
     #[test]
-    fn blocks_file_path_near_secret_word_accepted_fp_round4() {
+    fn blocks_high_entropy_file_path_near_secret_word() {
         // Full-token entropy 4.5994 > ENTROPY_THRESHOLD (4.5).
         let content =
             "workspace path fable-ops/ADR-DRAFT-adr079-slices234.md for the secret gate bug";
         assert!(
             check(content).is_err(),
-            "accepted FP post round-4: structured file path near 'secret' is now \
+            "accepted FP: structured file path near 'secret' is now \
              blocked; got {:?}",
             scan(content)
         );
     }
 
     #[test]
-    fn blocks_workspace_path_near_key_word_accepted_fp_round4() {
+    fn blocks_high_entropy_workspace_path_near_key_word() {
         // Full-token entropy 4.7938 > 4.5.
         let content = "key: see internal/workspaces/20260701/adr079-slices234/PACKET.md";
         assert!(
             check(content).is_err(),
-            "accepted FP post round-4: workspace path near 'key' is now blocked; \
+            "accepted FP: workspace path near 'key' is now blocked; \
              got {:?}",
             scan(content)
         );
     }
 
     #[test]
-    fn blocks_short_run_path_near_auth_word_accepted_fp_round4() {
+    fn blocks_high_entropy_short_run_path_near_auth_word() {
         // Full-token entropy 4.5955 > 4.5.
         let content =
             "auth work saved at internal/workspaces/20260701/cloud-rebuild/R1-repo-audit.md";
         assert!(
             check(content).is_err(),
-            "accepted FP post round-4: path with a short 'R1' run near 'auth' is \
+            "accepted FP: path with a short 'R1' run near 'auth' is \
              now blocked; got {:?}",
             scan(content)
         );
@@ -2774,7 +2854,7 @@ mod tests {
     }
 
     #[test]
-    fn blocks_round1_bypass_strings_still_without_extension() {
+    fn blocks_unsuffixed_separator_split_credential_bypasses() {
         let cases = [
             "secret_access_key abcdefghij/klmnopqrst/uvwxyzabcd/efghijk",
             "token=zxkqwmvbpl/trfhysjgnc/dweiaoutkz-mnbvcxzlk",
@@ -2782,7 +2862,7 @@ mod tests {
         for content in cases {
             assert!(
                 check(content).is_err(),
-                "round-1 bypass string must still be blocked: {content:?}, got: {:?}",
+                "bypass string must still be blocked: {content:?}, got: {:?}",
                 scan(content)
             );
         }
@@ -2804,7 +2884,7 @@ mod tests {
     }
 
     #[test]
-    fn blocks_round3_padding_run_bypass_attempts() {
+    fn blocks_low_entropy_padding_run_bypass_attempts() {
         // A low-entropy padding run (`aaaa`) inserted before short/digit-shaped
         // runs would drag any AVERAGE per-run entropy signal below its
         // threshold. With the exemption dropped entirely, these must be
@@ -2819,7 +2899,7 @@ mod tests {
         for content in cases {
             assert!(
                 check(content).is_err(),
-                "round-3 padding-run bypass attempt must be blocked: {content:?}, got: {:?}",
+                "padding-run bypass attempt must be blocked: {content:?}, got: {:?}",
                 scan(content)
             );
         }
@@ -2883,7 +2963,7 @@ mod tests {
         let content = "api_key handling in fable-ops/ADR-DRAFT-adr079-slices234.md";
         assert!(
             check(content).is_err(),
-            "accepted FP: ADR-DRAFT path near 'api_key' is now blocked post round-4; \
+            "accepted FP: ADR-DRAFT path near 'api_key' is now blocked; \
              got {:?}",
             scan(content)
         );
@@ -2896,20 +2976,20 @@ mod tests {
         assert!(
             check(content).is_err(),
             "accepted FP: PACKET.md workspace path near 'api_key' is now blocked \
-             post round-4; got {:?}",
+             got {:?}",
             scan(content)
         );
     }
 
     #[test]
-    fn accepted_false_positive_r1_repo_audit_path_near_trigger() {
+    fn blocks_high_entropy_repo_audit_path_near_api_key() {
         // Same tradeoff as above: full-token entropy 4.5955 > 4.5.
         let content =
             "api_key handling in internal/workspaces/20260701/cloud-rebuild/R1-repo-audit.md";
         assert!(
             check(content).is_err(),
-            "accepted FP: R1-repo-audit path near 'api_key' is now blocked post \
-             round-4; got {:?}",
+            "accepted FP: R1-repo-audit path near 'api_key' is now blocked; \
+             got {:?}",
             scan(content)
         );
     }
@@ -2972,7 +3052,7 @@ mod tests {
     }
 
     #[test]
-    fn allows_internal_area_id_uuid_near_auth_substring_round5() {
+    fn allows_area_id_uuid_near_authorized_substring() {
         // An internal task `area_id` UUID field sitting within the trigger
         // window of the SUBSTRING "auth" inside
         // `authorized_write_requires_dominance` is not a genuine mention of
@@ -2984,7 +3064,7 @@ mod tests {
         let content = "area_id: cfcea31d-6f50-4fd1-ad6d-5f160de1694c\n\n## Problem\nReduce Lion microkernel axioms. Converted authorized_write_requires_dominance from axiom to theorem.";
         assert!(
             check(content).is_ok(),
-            "round-5 fix: internal area_id UUID near the 'authorized' substring \
+            "internal area_id UUID near the 'authorized' substring \
              (not a genuine 'auth' mention) must now pass; got {:?}",
             scan(content)
         );
@@ -3196,6 +3276,104 @@ mod tests {
     // ── Trigger word-boundary matching ──────────────────────────────────────
 
     #[test]
+    fn allows_trigger_substrings_inside_benign_path_slugs() {
+        let paths = [
+            "docs/_archive/adr_v0/ADR-051-cli-auth-and-kg-git-workflow.md",
+            "docs/platform/oauth-callback-docs-and-redirect-handling-v2.md",
+            "docs/research/author-attribution-and-collaboration-notes.md",
+            "docs/security/passwordless-authentication-overview-v3.md",
+            "docs/platform/private_keynote-authoring-guide-v2.md",
+        ];
+        for path in paths {
+            assert!(
+                check(path).is_ok(),
+                "trigger substring inside a benign path slug must not make the path \
+                 its own credential context: {path:?}, got {:?}",
+                scan(path)
+            );
+        }
+    }
+
+    #[test]
+    fn blocks_inline_auth_assignment_with_high_entropy_value() {
+        let content = "auth=Xk9mZ2vQpLrT8nJwYuAeHfBsDcGiONvMabcdef"; // gitleaks:allow
+        assert!(
+            check(content).is_err(),
+            "auth=<high-entropy-value> must still be blocked; got {:?}",
+            scan(content)
+        );
+    }
+
+    #[test]
+    fn blocks_suffix_bearing_compound_credential_assignments() {
+        let opaque = "Xk9mZ2vQpLrT8nJwYuAeHfBsDcGiONvMabcdef"; // gitleaks:allow
+        let cases = [
+            format!("api_keyv2={opaque}"),
+            format!("access_keyv2={opaque}"),
+            format!("private_keyv2={opaque}"),
+            format!("API_KEYV2={opaque}"),
+            format!(r#"{{"private_keyv2":"{opaque}"}}"#),
+        ];
+        for content in &cases {
+            assert!(
+                check(content).is_err(),
+                "suffix-bearing compound credential assignment must be blocked: \
+                 {content:?}, got {:?}",
+                scan(content)
+            );
+        }
+    }
+
+    #[test]
+    fn blocks_spaced_suffix_bearing_compound_credential_assignments() {
+        let opaque = "Xk9mZ2vQpLrT8nJwYuAeHfBsDcGiONvMabcdef"; // gitleaks:allow
+        for label in ["api_keyv2", "access_keyv2", "private_keyv2"] {
+            let cases = [
+                format!("{label} = {opaque}"),
+                format!("{label} : {opaque}"),
+                format!(r#"{{"{label}": "{opaque}"}}"#),
+            ];
+            for content in &cases {
+                assert!(
+                    check(content).is_err(),
+                    "spaced suffix-bearing compound credential assignment must be \
+                     blocked: {content:?}, got {:?}",
+                    scan(content)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn blocks_suffix_bearing_compound_credentials_without_assignment_separator() {
+        let opaque = "Xk9mZ2vQpLrT8nJwYuAeHfBsDcGiONvMabcdef"; // gitleaks:allow
+        for label in ["api_keyv2", "access_keyv2", "private_keyv2"] {
+            let cases = [format!("{label} {opaque}"), format!("{label}{opaque}")];
+            for content in &cases {
+                assert!(
+                    check(content).is_err(),
+                    "suffix-bearing compound credential without an assignment separator must be \
+                     blocked: {content:?}, got {:?}",
+                    scan(content)
+                );
+                assert!(
+                    mask_secrets(content).contains(REDACTION_MARKER),
+                    "shared secret masker must redact separator-free compound credential: \
+                     {content:?}"
+                );
+            }
+        }
+
+        let prefixed = "xapi_keyv2=Xk9mZ2vQpLrT8nJwYuAeHfBsDcGiONvMabcdef"; // gitleaks:allow
+        assert!(
+            check(prefixed).is_err(),
+            "prefix-bearing compound credential assignment must be blocked: \
+             {prefixed:?}, got {:?}",
+            scan(prefixed)
+        );
+    }
+
+    #[test]
     fn allows_authorized_and_authentication_prose_near_uuid() {
         // The word-boundary fix directly: "auth" no longer matches the
         // substring inside "authorized"/"authentication", so ordinary prose
@@ -3234,7 +3412,7 @@ mod tests {
     }
 
     #[test]
-    fn blocks_standalone_auth_and_key_words_unchanged_by_round5() {
+    fn blocks_opaque_tokens_near_standalone_trigger_words() {
         // Word-boundary matching only removes SUBSTRING collisions; a genuine
         // standalone trigger word must still dominate exactly as before.
         let opaque = "Xk9mZ2vQpLrT8nJwYuAeHfBsDcGiONvMabcdef"; // gitleaks:allow
@@ -3254,7 +3432,7 @@ mod tests {
     }
 
     #[test]
-    fn accepted_false_positive_workspace_artifact_path_near_standalone_secret_round5() {
+    fn blocks_workspace_artifact_path_near_standalone_secret() {
         // A dot-prefixed root + date segment + hyphenated topic dir +
         // SCREAMING_SNAKE filename, discussed in prose that genuinely (not by
         // substring collision) mentions "secret". `secret` here is a real
@@ -3266,35 +3444,35 @@ mod tests {
              .workspace/20260101/fix-secret-gate-trigger-false-positive/MEASUREMENT_REPORT.md";
         assert!(
             check(content).is_err(),
-            "accepted FP (round 5 unchanged): workspace artifact path near a \
+            "accepted FP: workspace artifact path near a \
              genuine standalone 'secret' mention is still blocked; got {:?}",
             scan(content)
         );
     }
 
     #[test]
-    fn accepted_false_positive_archive_doc_path_near_standalone_secret_round5() {
+    fn blocks_archive_doc_path_near_standalone_secret() {
         // An archive-style doc path discussed near a genuine standalone
         // "secret" mention.
         let content =
             "secret scanner archive notes: docs/_archive/ADR051-TenantEncryption-v2Notes.md";
         assert!(
             check(content).is_err(),
-            "accepted FP (round 5 unchanged): archive doc path near a genuine \
+            "accepted FP: archive doc path near a genuine \
              standalone 'secret' mention is still blocked; got {:?}",
             scan(content)
         );
     }
 
     #[test]
-    fn accepted_false_positive_absolute_path_near_standalone_auth_round5() {
+    fn blocks_absolute_path_near_standalone_auth() {
         // An absolute path written as one unbroken token, with the
         // surrounding message genuinely (not via substring collision)
         // discussing "auth".
         let content = "the auth scanner flagged this file: /home/user/projects/workspace/SessionNotes20260107/AuthGateFollowup2.md";
         assert!(
             check(content).is_err(),
-            "accepted FP (round 5 unchanged): absolute path near a genuine \
+            "accepted FP: absolute path near a genuine \
              standalone 'auth' mention is still blocked; got {:?}",
             scan(content)
         );
@@ -3306,9 +3484,9 @@ mod tests {
         // directly to a trigger word must not be exempted just because it is
         // path-shaped (separator-delimited, word-shaped runs) and looks
         // superficially like the accepted-FP repro paths above. The compound
-        // entry `api_key` is a plain substring match regardless of
-        // word-boundary rules, and the structured-identifier exemption is
-        // unconditionally dropped in trigger context, so this must block.
+        // label `api_key` is assignment-shaped, and the structured-identifier
+        // exemption is unconditionally dropped in trigger context, so this
+        // must block.
         let content = "api_key=/home/user/workspaces/2026/topic-name-example/SECRET_VALUE_HERE.md";
         assert!(
             check(content).is_err(),
@@ -3319,16 +3497,11 @@ mod tests {
     }
 
     #[test]
-    fn blocks_secret_access_key_bypass_compound_entry_unaffected_by_round5() {
+    fn blocks_separator_split_secret_access_key_compound() {
         // Adversarial negative: a separator-split bypass shape must still be
-        // blocked. It fires via TWO independent paths: the compound
-        // `access_key` entry (`COMPOUND_TRIGGER_WORDS`, plain substring,
-        // always matched regardless of word-boundary rules), AND the bare
-        // `secret` entry, because underscore is a BOUNDARY for bare
-        // `TRIGGER_WORDS`: so `secret` in `secret_access_key` is itself a
-        // bounded word (bounded by the following `_`), not merely a
-        // substring collision. Either path alone is sufficient; this asserts
-        // the end-to-end outcome.
+        // blocked. The `secret` and `key` entries both match because underscore
+        // is a boundary for bare `TRIGGER_WORDS`. This asserts the end-to-end
+        // outcome.
         let content = "secret_access_key abcdefghij/klmnopqrst/uvwxyzabcd/efghijk.md";
         assert!(
             check(content).is_err(),
@@ -3354,7 +3527,7 @@ mod tests {
     // rule (the `tokenizer`/`next_token`/`token_count` exemption) unchanged.
 
     #[test]
-    fn blocks_django_style_secret_key_assignment_round5b() {
+    fn blocks_secret_key_assignment_when_underscore_bounds_trigger() {
         // `SECRET_KEY=<value>` must block via the plain-substring `secret`
         // trigger even though `secret` is followed by `_` rather than a
         // non-word-char boundary.
@@ -3368,7 +3541,7 @@ mod tests {
     }
 
     #[test]
-    fn blocks_auth_token_assignment_round5b() {
+    fn blocks_auth_token_assignment_when_underscore_bounds_trigger() {
         let opaque = "Xk9mZ2vQpLrT8nJwYuAeHfBsDcGiONvMabcdef"; // gitleaks:allow
         let content = format!("auth_token={opaque}");
         assert!(
@@ -3379,7 +3552,7 @@ mod tests {
     }
 
     #[test]
-    fn blocks_session_secret_and_signing_key_compounds_round5b() {
+    fn blocks_underscore_joined_session_secret_and_signing_key_compounds() {
         let opaque = "Xk9mZ2vQpLrT8nJwYuAeHfBsDcGiONvMabcdef"; // gitleaks:allow
         let cases = [
             format!("session_secret_{opaque}"),
@@ -3396,7 +3569,7 @@ mod tests {
     }
 
     #[test]
-    fn allows_authorized_authentication_keyword_prose_unaffected_by_round5b() {
+    fn allows_letter_joined_trigger_substrings_in_benign_prose() {
         // The letter-joined substring-collision exemption must survive the
         // underscore-as-boundary change, since that change only affects the
         // underscore character, not letter-joined words.
@@ -3409,8 +3582,8 @@ mod tests {
         for content in cases {
             assert!(
                 check(content).is_ok(),
-                "letter-joined substring collision must stay exempt after \
-                 round-5b: {content:?}, got {:?}",
+                "letter-joined substring collision must stay exempt: \
+                 {content:?}, got {:?}",
                 scan(content)
             );
         }

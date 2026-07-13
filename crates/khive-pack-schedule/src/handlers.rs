@@ -270,7 +270,7 @@ fn validate_replayable_single_action(
 /// require `content`, and a bare `kind="entity"` requires an `entity_kind`
 /// (or a granular entity kind) to resolve a concrete kind. It also validates
 /// `entity_type` against the KG entity-type/subtype registry when present
-/// (round-3 review gap 1) — see `validate_entity_type_for_replay`.
+/// — see `validate_entity_type_for_replay`.
 /// `khive-pack-schedule` does not depend on `khive-pack-kg` (only as a
 /// dev-dependency for tests), so this reimplements the classification using
 /// `VerbRegistry::all_entity_kinds` / `all_note_kinds` — the same data
@@ -355,9 +355,9 @@ fn validate_conditional_requirements(
                 .get("entity_type")
                 .and_then(khive_request::ArgValue::as_value)
                 .and_then(Value::as_str);
-            validate_entity_type_for_replay(&canonical, entity_type_arg).map_err(|e| {
-                RuntimeError::InvalidInput(format!("schedule.action: verb \"create\": {e}"))
-            })?;
+            validate_entity_type_for_replay(&canonical, entity_type_arg, registry).map_err(
+                |e| RuntimeError::InvalidInput(format!("schedule.action: verb \"create\": {e}")),
+            )?;
         }
         CreateKindClass::Note { specific } => {
             reconcile_specific_for_replay(
@@ -409,7 +409,7 @@ enum CreateKindClass {
 /// via `link`), `event` (immutable), `proposal` (create via `propose`), or
 /// an unrecognized kind string.
 ///
-/// Round-3 review (gap 2) found the pre-fix version skipped alias resolution
+/// The pre-fix version skipped alias resolution
 /// entirely, causing schedule-time false rejections (not a security hole)
 /// for legitimate KG-accepted spellings like `"paper"` and `"atom"`.
 fn classify_create_kind(
@@ -483,7 +483,7 @@ fn classify_create_kind(
 /// dev-dependency only, for tests), then fall back to the registry's merged
 /// entity-kind vocabulary (covers any further pack-declared additions).
 ///
-/// Round-3 review (gap 2) found the pre-fix version resolved neither alias
+/// The pre-fix version resolved neither alias
 /// set, causing schedule-time false rejections (not a security hole) for
 /// legitimate KG-accepted spellings like `"paper"` and `"atom"`.
 fn canonical_entity_kind_for_replay(
@@ -540,7 +540,7 @@ fn canonical_note_kind_for_replay(
 /// `entity_kind_resource_aliases_match_real_vocab` in `create_validation.rs`,
 /// which asserts this list against the live `khive-pack-kg` vocab (via the
 /// dev-dependency) so drift is caught in CI rather than silently reproducing
-/// a round-3-style false rejection.
+/// a similar false rejection.
 fn resource_alias_for_replay(normalized: &str) -> bool {
     matches!(
         normalized,
@@ -551,10 +551,14 @@ fn resource_alias_for_replay(normalized: &str) -> bool {
 /// Validate an `entity_type` value the same way
 /// `khive-pack-kg::handlers::common::validate_entity_type` does: parse
 /// `canonical_kind_name` into the base `khive_types::EntityKind` first, then
-/// resolve the subtype against the canonical `khive_types::EntityTypeRegistry`
-/// (#571). KG create validation and schedule replay validation now resolve
-/// against the exact same registry instance instead of two hand-maintained
-/// copies, so this can no longer drift from the real handler's vocabulary.
+/// resolve the subtype against the boot-time composed registry (builtin
+/// subtypes plus every loaded pack's `ENTITY_TYPES`, `VerbRegistry::
+/// all_entity_types`) — NOT the builtin-only `EntityTypeRegistry::global()`.
+/// KG create validation and schedule replay validation resolve against the
+/// exact same composed set, so this cannot drift from the real handler's
+/// vocabulary, and a scheduled `create` naming a pack-declared subtype (e.g.
+/// git's `adr` Document subtype) is accepted at schedule time exactly when
+/// the real handler would accept it at trigger time.
 ///
 /// The kind-parse step is exactly what makes a pack-owned kind like
 /// `"resource"` reject *any* non-`None` `entity_type` outright: `resource`
@@ -568,6 +572,7 @@ fn resource_alias_for_replay(normalized: &str) -> bool {
 fn validate_entity_type_for_replay(
     canonical_kind_name: &str,
     entity_type: Option<&str>,
+    registry: &VerbRegistry,
 ) -> Result<Option<String>, RuntimeError> {
     let Some(raw) = entity_type else {
         return Ok(None);
@@ -577,7 +582,7 @@ fn validate_entity_type_for_replay(
         .map_err(|_| {
             RuntimeError::InvalidInput(format!("unknown entity kind {canonical_kind_name:?}"))
         })?;
-    khive_types::EntityTypeRegistry::global()
+    khive_types::EntityTypeRegistry::with_extra(registry.all_entity_types())
         .resolve(kind, Some(raw))
         .map(|resolved| resolved.entity_type)
         .map_err(RuntimeError::from)
@@ -669,13 +674,12 @@ fn validate_create_bulk_items(
                          entity_kind=<…>"
                     )));
                 };
-                validate_entity_type_for_replay(&canonical, entry.entity_type.as_deref()).map_err(
-                    |e| {
+                validate_entity_type_for_replay(&canonical, entry.entity_type.as_deref(), registry)
+                    .map_err(|e| {
                         RuntimeError::InvalidInput(format!(
                             "schedule.action: verb \"create\": items[{idx}] {e}"
                         ))
-                    },
-                )?;
+                    })?;
             }
             CreateKindClass::Note { .. } => {
                 return Err(RuntimeError::InvalidInput(format!(
@@ -774,8 +778,16 @@ pub(crate) struct CancelParams {
 pub(crate) async fn handle_remind(
     runtime: &KhiveRuntime,
     token: &NamespaceToken,
+    registry: &VerbRegistry,
     params: Value,
 ) -> Result<Value, RuntimeError> {
+    if registry.describe_verb("comm.send").is_err() {
+        return Err(RuntimeError::InvalidInput(
+            "schedule.remind requires the comm delivery capability `comm.send`; load the `comm` pack"
+                .into(),
+        ));
+    }
+
     let p: RemindParams = deser(params)?;
     if p.content.trim().is_empty() {
         return Err(RuntimeError::InvalidInput(
@@ -803,6 +815,7 @@ pub(crate) async fn handle_remind(
         "repeat": p.repeat,
         "status": "pending",
         "event_type": "remind",
+        "created_by_actor": token.actor().id.clone(),
         "payload": null,
         "fired_at": null,
         "cancelled_at": null,

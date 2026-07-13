@@ -1025,6 +1025,130 @@ fn gql_inline_property_map_well_formed_float_still_parses() {
         .any(|p| matches!(p, QueryValue::Float(n) if *n == 1.5)));
 }
 
+// --- GQL extended WHERE operators (#804, #864) ---
+
+#[test]
+fn extended_where_operators_compile_with_bound_parameters() {
+    let q = parse(
+        QueryLanguage::Gql,
+        r#"MATCH (n) WHERE n.name CONTAINS "%_\' OR 1=1 --" AND n.name STARTS WITH "pre%_\" AND n.kind IN ["concept", "' OR 1=1 --"] AND n.domain IS NOT NULL RETURN n"#,
+    )
+    .unwrap();
+    let compiled = compile(&q, &opts()).unwrap();
+
+    assert!(
+        compiled.sql.contains("LIKE ?1 COLLATE NOCASE ESCAPE '\\'"),
+        "sql: {}",
+        compiled.sql
+    );
+    assert!(
+        compiled.sql.contains("LIKE ?2 COLLATE NOCASE ESCAPE '\\'"),
+        "sql: {}",
+        compiled.sql
+    );
+    assert!(
+        compiled.sql.contains("n0.kind COLLATE NOCASE IN (?3, ?4)"),
+        "sql: {}",
+        compiled.sql
+    );
+    assert!(
+        compiled
+            .sql
+            .contains("json_extract(n0.properties, '$.domain') IS NOT NULL"),
+        "sql: {}",
+        compiled.sql
+    );
+    assert!(
+        !compiled.sql.contains("OR 1=1"),
+        "injection-shaped data must not appear in SQL: {}",
+        compiled.sql
+    );
+    assert!(matches!(
+        compiled.params.as_slice(),
+        [
+            QueryValue::Text(contains),
+            QueryValue::Text(starts),
+            QueryValue::Text(first),
+            QueryValue::Text(second),
+            QueryValue::Integer(_),
+        ] if contains == r#"%\%\_\\' OR 1=1 --%"#
+            && starts == r#"pre\%\_\\%"#
+            && first == "concept"
+            && second == "' OR 1=1 --"
+    ));
+}
+
+#[test]
+fn extended_where_operators_compile_for_variable_length_patterns() {
+    let q = parse(
+        QueryLanguage::Gql,
+        "MATCH (a)-[:extends*1..2]->(b) WHERE a.name CONTAINS 'Lo' \
+         AND a.name STARTS WITH 'L' AND b.kind IN ['concept', 'document'] \
+         AND b.domain IS NOT NULL RETURN b",
+    )
+    .unwrap();
+    let compiled = compile(&q, &opts()).unwrap();
+
+    assert!(
+        compiled.sql.contains("s.name LIKE ?"),
+        "sql: {}",
+        compiled.sql
+    );
+    assert!(
+        compiled.sql.contains("s.name LIKE ?") && compiled.sql.contains("ESCAPE '\\'"),
+        "sql: {}",
+        compiled.sql
+    );
+    assert!(
+        compiled.sql.contains("r.kind COLLATE NOCASE IN ("),
+        "sql: {}",
+        compiled.sql
+    );
+    assert!(
+        compiled
+            .sql
+            .contains("json_extract(r.properties, '$.domain') IS NOT NULL"),
+        "sql: {}",
+        compiled.sql
+    );
+}
+
+#[test]
+fn mixed_type_in_with_string_compiles_case_insensitive() {
+    let q = parse(
+        QueryLanguage::Gql,
+        "MATCH (n) WHERE n.kind IN ['CONCEPT', 1] RETURN n",
+    )
+    .unwrap();
+    let compiled = compile(&q, &opts()).unwrap();
+
+    assert!(
+        compiled.sql.contains("n0.kind COLLATE NOCASE IN (?1, ?2)"),
+        "sql: {}",
+        compiled.sql
+    );
+    assert!(matches!(
+        compiled.params.as_slice(),
+        [
+            QueryValue::Text(kind),
+            QueryValue::Integer(1),
+            QueryValue::Integer(_),
+        ] if kind == "CONCEPT"
+    ));
+}
+
+#[test]
+fn empty_in_list_compiles_to_false_without_value_parameters() {
+    let q = parse(QueryLanguage::Gql, "MATCH (n) WHERE n.name IN [] RETURN n").unwrap();
+    let compiled = compile(&q, &opts()).unwrap();
+    assert!(compiled.sql.contains("WHERE") && compiled.sql.contains(" AND 0 LIMIT"));
+    assert_eq!(
+        compiled.params.len(),
+        1,
+        "only the LIMIT parameter is expected"
+    );
+}
+
 // --- Issue #849: substrate node labels (entity/note) must be satisfiable ---
 //
 // Stored `kind` values are always granular (concept/document/task/...); the
@@ -1084,6 +1208,10 @@ mod substrate_labels {
                  created_at, updated_at, deleted_at, entity_type)
             VALUES
                 ('e-fixture-1', 'local', 'concept', 'X', NULL, '{}', '[]',
+                 0, 0, NULL, NULL),
+                ('e-fixture-spaces', 'local', 'project', 'Mixed Case Entity',
+                 NULL, '{}', '[]', 0, 0, NULL, NULL),
+                ('e-fixture-cjk', 'local', 'document', '知识 图谱', NULL, '{}', '[]',
                  0, 0, NULL, NULL);
             INSERT INTO notes
                 (id, namespace, kind, status, name, content, salience,
@@ -1117,6 +1245,106 @@ mod substrate_labels {
             .unwrap()
             .collect::<Result<_, _>>()
             .unwrap()
+    }
+
+    fn insert_entity(conn: &Connection, id: &str, name: &str, properties: &str) {
+        conn.execute(
+            "INSERT INTO entities
+                (id, namespace, kind, name, description, properties, tags,
+                 created_at, updated_at, deleted_at, entity_type)
+             VALUES (?1, 'local', 'concept', ?2, NULL, ?3, '[]', 0, 0, NULL, NULL)",
+            rusqlite::params![id, name, properties],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn contains_escapes_wildcards_backslash_and_quote_end_to_end() {
+        let conn = fixture_db();
+        insert_entity(&conn, "e-literal", r#"prefix%_\' OR 1=1 --suffix"#, "{}");
+        insert_entity(
+            &conn,
+            "e-wildcard-distractor",
+            r#"prefixAB\' OR 1=1 --suffix"#,
+            "{}",
+        );
+        let q = parse(
+            QueryLanguage::Gql,
+            r#"MATCH (e:entity) WHERE e.name CONTAINS "%_\' OR 1=1 --" RETURN e.id"#,
+        )
+        .unwrap();
+        let compiled = compile(&q, &opts()).unwrap();
+
+        assert!(!compiled.sql.contains("OR 1=1"), "sql: {}", compiled.sql);
+        assert_eq!(run(&conn, &compiled), vec!["e-literal"]);
+    }
+
+    #[test]
+    fn starts_with_escapes_wildcards_and_backslash_end_to_end() {
+        let conn = fixture_db();
+        insert_entity(&conn, "e-prefix", r#"pre%_\suffix"#, "{}");
+        insert_entity(&conn, "e-prefix-distractor", r#"preAB\suffix"#, "{}");
+        let q = parse(
+            QueryLanguage::Gql,
+            r#"MATCH (e:entity) WHERE e.name STARTS WITH "pre%_\" RETURN e.id"#,
+        )
+        .unwrap();
+        let compiled = compile(&q, &opts()).unwrap();
+
+        assert_eq!(run(&conn, &compiled), vec!["e-prefix"]);
+    }
+
+    #[test]
+    fn in_list_binds_injection_shaped_strings_end_to_end() {
+        let conn = fixture_db();
+        insert_entity(&conn, "e-percent", "%", "{}");
+        insert_entity(&conn, "e-underscore", "_", "{}");
+        insert_entity(&conn, "e-quote", "' OR 1=1 --", "{}");
+        insert_entity(&conn, "e-other", "not a match", "{}");
+        let q = parse(
+            QueryLanguage::Gql,
+            r#"MATCH (e:entity) WHERE e.name IN ["%", "_", "' OR 1=1 --"] RETURN e.id"#,
+        )
+        .unwrap();
+        let compiled = compile(&q, &opts()).unwrap();
+        assert!(!compiled.sql.contains("OR 1=1"), "sql: {}", compiled.sql);
+
+        let mut rows = run(&conn, &compiled);
+        rows.sort();
+        assert_eq!(rows, vec!["e-percent", "e-quote", "e-underscore"]);
+    }
+
+    #[test]
+    fn mixed_type_in_preserves_case_insensitive_string_matching_end_to_end() {
+        let conn = fixture_db();
+        let q = parse(
+            QueryLanguage::Gql,
+            "MATCH (e:entity) WHERE e.kind IN ['CONCEPT', 1] RETURN e.id",
+        )
+        .unwrap();
+        let compiled = compile(&q, &opts()).unwrap();
+
+        assert_eq!(run(&conn, &compiled), vec!["e-fixture-1"]);
+    }
+
+    #[test]
+    fn is_not_null_filters_json_property_presence_end_to_end() {
+        let conn = fixture_db();
+        insert_entity(
+            &conn,
+            "e-with-domain",
+            "with domain",
+            r#"{"domain":"attention"}"#,
+        );
+        insert_entity(&conn, "e-without-domain", "without domain", "{}");
+        let q = parse(
+            QueryLanguage::Gql,
+            "MATCH (e:entity) WHERE e.domain IS NOT NULL RETURN e.id",
+        )
+        .unwrap();
+        let compiled = compile(&q, &opts()).unwrap();
+
+        assert_eq!(run(&conn, &compiled), vec!["e-with-domain"]);
     }
 
     /// `fixture_db()` plus a second entity and a `graph_edges` row connecting
@@ -1171,6 +1399,54 @@ mod substrate_labels {
             "MATCH (e:entity) WHERE e.name = 'X' must return the existing entity row; sql: {}",
             compiled.sql
         );
+    }
+
+    #[test]
+    fn entity_name_equality_handles_case_spaces_and_cjk() {
+        let conn = fixture_db();
+        let cases = [
+            ("Mixed Case Entity", "e-fixture-spaces"),
+            ("mixed case entity", "e-fixture-spaces"),
+            ("知识 图谱", "e-fixture-cjk"),
+        ];
+
+        for (name, expected_id) in cases {
+            let q = parse(
+                QueryLanguage::Gql,
+                &format!(r#"MATCH (e:entity) WHERE e.name = "{name}" RETURN e.id"#),
+            )
+            .unwrap();
+            let compiled = compile(&q, &opts()).unwrap();
+            assert!(
+                compiled.sql.contains("COLLATE NOCASE"),
+                "GQL string equality must remain case-insensitive; sql: {}",
+                compiled.sql
+            );
+            assert!(
+                compiled.sql.contains(".name = ?"),
+                "GQL name equality must use a SQL placeholder; sql: {}",
+                compiled.sql
+            );
+            assert!(
+                compiled
+                    .params
+                    .iter()
+                    .any(|param| matches!(param, QueryValue::Text(value) if value == name)),
+                "name {name:?} must be passed as a bound text parameter; params: {:?}",
+                compiled.params
+            );
+            assert!(
+                !compiled.sql.contains(name),
+                "name {name:?} must not be interpolated into SQL: {}",
+                compiled.sql
+            );
+            assert_eq!(
+                run(&conn, &compiled),
+                vec![expected_id.to_string()],
+                "name equality must find {name:?}; sql: {}",
+                compiled.sql
+            );
+        }
     }
 
     #[test]

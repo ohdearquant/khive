@@ -16,7 +16,7 @@ fn setup_memory_store(table_key: &str) -> Fts5TextSearch {
     Fts5TextSearch::new(pool, false, table_key.to_string())
 }
 
-/// #397 Finding 2 regression fixture: the FTS5 `trigram` tokenizer, matching
+/// #397 regression fixture: the FTS5 `trigram` tokenizer, matching
 /// `StorageBackend::text()`'s production default (`backend.rs`) byte-for-byte
 /// (`tokenize = 'trigram'`), rather than the bare `ensure_fts5_schema` helper
 /// above, which omits `tokenize=` and so falls back to SQLite's own default
@@ -638,7 +638,7 @@ async fn test_search_with_hyphenated_and_dotted_queries_matches_literal_tokens()
     }
 }
 
-/// Round-2 codex re-review regression: `sanitize_fts5_token_group` must keep
+/// Regression: `sanitize_fts5_token_group` must keep
 /// the legacy-merged bareword alternative reachable for ordinary punctuated
 /// identifiers under `unicode61`. The merged form (`khivepackmemory`,
 /// `previd`) is content indexed before #397's split-terms change, or content
@@ -738,7 +738,7 @@ async fn test_search_matches_legacy_merged_and_punctuated_forms_exact_ids() {
     }
 }
 
-/// #397 Finding 2 regression: production defaults to the FTS5 `trigram`
+/// #397 regression: production defaults to the FTS5 `trigram`
 /// tokenizer (`backend.rs`'s `StorageBackend::text()`), and generic search
 /// (`operations.rs::search_notes`) queries it in `Plain` mode — neither of
 /// which the prior `unicode61`/`AnyTerm`-only coverage exercised. Assert
@@ -838,7 +838,7 @@ async fn test_search_trigram_punctuated_and_decimal_queries_matches_exact_ids() 
     }
 }
 
-/// #397 Finding 2 concrete broadening regression: a hyphenated date query
+/// #397 concrete broadening regression: a hyphenated date query
 /// under the trigram tokenizer must not collapse to matching every document
 /// that merely shares the year. `sanitize_fts5_token_group`'s split reading
 /// keeps the year term ("2026", 4 chars) fully discriminating under trigram;
@@ -892,7 +892,7 @@ async fn test_search_trigram_date_query_does_not_broaden_to_same_year() {
     }
 }
 
-/// #397 Finding 2 round-3 regression: a punctuated operand of an FTS5
+/// #397 regression: a punctuated operand of an FTS5
 /// operator expression (`NEAR(alpha-beta,5)`, `NOT(alpha-beta,5)`) makes the
 /// legacy-merged OR-alternative in `sanitize_fts5_token_group` collapse to
 /// multiple space-separated terms (`"alphabeta 5"`) instead of one bareword,
@@ -1298,6 +1298,228 @@ async fn test_search_slash_query_excludes_merged_alias_all_modes_and_tokenizers(
     .await;
     assert_slash_query_excludes_merged_alias(setup_trigram_store("trigram_slash_alias"), "trigram")
         .await;
+}
+
+#[test]
+fn test_is_fts5_bareword_safe() {
+    assert!(is_fts5_bareword_safe("hello"));
+    assert!(is_fts5_bareword_safe("hello123"));
+    assert!(is_fts5_bareword_safe("_prefixed"));
+    assert!(is_fts5_bareword_safe("682"));
+    assert!(!is_fts5_bareword_safe(""));
+    for bad in [
+        "#682", "B=128", "K%Prob", "a&b", "a;b", "a<b", "a>b", "a?b", "a@b", "a[b", "a\\b", "a]b",
+        "a`b", "a{b", "a|b", "a}b", "a:b", "a-b",
+    ] {
+        assert!(
+            !is_fts5_bareword_safe(bad),
+            "{bad:?} must not be treated as a bareword-safe token"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_search_with_hash_sign_does_not_crash_and_matches() {
+    let store = setup_trigram_store("hash_sign_query");
+
+    store
+        .upsert_document(make_document(
+            Uuid::new_v4(),
+            "issue tracker",
+            "tracking #682 Stage 2: MoE expert-cache prefetch work",
+        ))
+        .await
+        .unwrap();
+
+    for mode in [TextQueryMode::Plain, TextQueryMode::AnyTerm] {
+        let result = store
+            .search(TextSearchRequest {
+                query: "#682".to_string(),
+                mode: mode.clone(),
+                filter: Some(ns_filter("test_ns")),
+                top_k: 10,
+                snippet_chars: 64,
+            })
+            .await;
+        assert!(
+            result.is_ok(),
+            "#916 {mode:?} hash-sign query must not crash FTS5, got: {:?}",
+            result.err()
+        );
+        assert_eq!(
+            result.unwrap().len(),
+            1,
+            "#916 {mode:?} hash-sign query must still match the seeded document"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_search_with_equals_sign_does_not_crash_and_matches() {
+    let store = setup_trigram_store("equals_sign_query");
+
+    store
+        .upsert_document(make_document(
+            Uuid::new_v4(),
+            "benchmark notes",
+            "chunkwise B=128 traffic arithmetic simdgroup_matrix DPLR",
+        ))
+        .await
+        .unwrap();
+
+    for mode in [TextQueryMode::Plain, TextQueryMode::AnyTerm] {
+        let result = store
+            .search(TextSearchRequest {
+                query: "B=128".to_string(),
+                mode: mode.clone(),
+                filter: Some(ns_filter("test_ns")),
+                top_k: 10,
+                snippet_chars: 64,
+            })
+            .await;
+        assert!(
+            result.is_ok(),
+            "#916 {mode:?} equals-sign query must not crash FTS5, got: {:?}",
+            result.err()
+        );
+        assert_eq!(
+            result.unwrap().len(),
+            1,
+            "#916 {mode:?} equals-sign query must still match the seeded document"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_search_with_percent_sign_does_not_crash_and_matches() {
+    let store = setup_trigram_store("percent_sign_query");
+
+    store
+        .upsert_document(make_document(
+            Uuid::new_v4(),
+            "sampling notes",
+            "evaluated with the Min-K%Prob membership inference method",
+        ))
+        .await
+        .unwrap();
+
+    for mode in [TextQueryMode::Plain, TextQueryMode::AnyTerm] {
+        let result = store
+            .search(TextSearchRequest {
+                query: "Min-K%Prob".to_string(),
+                mode: mode.clone(),
+                filter: Some(ns_filter("test_ns")),
+                top_k: 10,
+                snippet_chars: 64,
+            })
+            .await;
+        assert!(
+            result.is_ok(),
+            "#916 {mode:?} percent-sign query must not crash FTS5, got: {:?}",
+            result.err()
+        );
+        assert_eq!(
+            result.unwrap().len(),
+            1,
+            "#916 {mode:?} percent-sign query must still match the seeded document"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_search_with_embedded_quote_preserves_literal_match() {
+    let store = setup_trigram_store("embedded_quote_query");
+    let target_id = Uuid::new_v4();
+    let unquoted_id = Uuid::new_v4();
+
+    store
+        .upsert_document(make_document(
+            target_id,
+            "quoted identifier",
+            "the foo\"bar identifier appears here",
+        ))
+        .await
+        .unwrap();
+    store
+        .upsert_document(make_document(
+            unquoted_id,
+            "unquoted identifier",
+            "the foobar identifier appears here",
+        ))
+        .await
+        .unwrap();
+
+    for mode in [
+        TextQueryMode::Plain,
+        TextQueryMode::AnyTerm,
+        TextQueryMode::Phrase,
+    ] {
+        let hits = store
+            .search(TextSearchRequest {
+                query: "foo\"bar".to_string(),
+                mode: mode.clone(),
+                filter: Some(ns_filter("test_ns")),
+                top_k: 10,
+                snippet_chars: 64,
+            })
+            .await
+            .unwrap();
+        let hit_ids: std::collections::HashSet<_> =
+            hits.into_iter().map(|hit| hit.subject_id).collect();
+
+        assert!(
+            hit_ids.contains(&target_id),
+            "{mode:?} must preserve an embedded quote as literal query text; got {hit_ids:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_search_with_mixed_punctuated_and_plain_tokens_does_not_crash() {
+    let store = setup_trigram_store("mixed_punctuated_plain_query");
+
+    let target_id = Uuid::new_v4();
+    store
+        .upsert_document(make_document(
+            target_id,
+            "issue tracker",
+            "tracking #682 Stage 2: MoE expert-cache prefetch work",
+        ))
+        .await
+        .unwrap();
+
+    let unrelated_id = Uuid::new_v4();
+    store
+        .upsert_document(make_document(
+            unrelated_id,
+            "doc",
+            "completely unrelated content about gardening Stage props",
+        ))
+        .await
+        .unwrap();
+
+    for mode in [TextQueryMode::Plain, TextQueryMode::AnyTerm] {
+        let result = store
+            .search(TextSearchRequest {
+                query: "#682 Stage 2".to_string(),
+                mode: mode.clone(),
+                filter: Some(ns_filter("test_ns")),
+                top_k: 10,
+                snippet_chars: 64,
+            })
+            .await;
+        assert!(
+            result.is_ok(),
+            "#916 {mode:?} mixed punctuated+plain query must not crash FTS5, got: {:?}",
+            result.err()
+        );
+        let hit_ids: std::collections::HashSet<_> =
+            result.unwrap().into_iter().map(|h| h.subject_id).collect();
+        assert!(
+            hit_ids.contains(&target_id),
+            "#916 {mode:?} mixed query must match the seeded document; got {hit_ids:?}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -1989,7 +2211,7 @@ async fn upsert_documents_first_error_populated_on_item_failure() {
 /// the `KHIVE_WRITE_QUEUE` env var — that env var is process-global and this
 /// crate's other tests are NOT `#[serial]` against it, so a window where it
 /// is set here could leak into a concurrently-scheduled test's own pool
-/// construction (ADR-067 Fork C slice 2 round 2, LOW finding).
+/// construction (ADR-067 Component A).
 #[tokio::test]
 async fn upsert_documents_routes_through_writer_task_when_flag_enabled() {
     let table_key = "write_queue_flag_test";

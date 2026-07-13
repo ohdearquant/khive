@@ -10,10 +10,10 @@ use khive_runtime::{
     KhiveRuntime, KindHook, NamespaceToken, NoteKindSpec, PackSchemaPlan, RuntimeError, SchemaPlan,
     VerbRegistry,
 };
-use khive_types::{EdgeEndpointRule, HandlerDef, Pack};
+use khive_types::{EdgeEndpointRule, EntityTypeDef, HandlerDef, Pack};
 
 use crate::hook::{CommitHook, IssueLikeHook};
-use crate::vocab::{GIT_NOTE_KIND_SPECS, GIT_SCHEMA_PLAN_STMTS};
+use crate::vocab::{GIT_ENTITY_TYPES, GIT_NOTE_KIND_SPECS, GIT_SCHEMA_PLAN_STMTS};
 
 /// Git-lifecycle pack (ADR-088, amended by ADR-088 Amendment 1 and ADR-108)
 /// — registers `commit` / `issue` / `pull_request` note kinds populated by
@@ -33,6 +33,7 @@ impl Pack for GitPack {
     const ENTITY_KINDS: &'static [&'static str] = &[];
     const HANDLERS: &'static [HandlerDef] = &crate::vocab::GIT_HANDLERS;
     const EDGE_RULES: &'static [EdgeEndpointRule] = &crate::vocab::GIT_EDGE_RULES;
+    const ENTITY_TYPES: &'static [EntityTypeDef] = &GIT_ENTITY_TYPES;
     const REQUIRES: &'static [&'static str] = &["kg"];
     const NOTE_KIND_SPECS: &'static [NoteKindSpec] = &GIT_NOTE_KIND_SPECS;
     const SCHEMA_PLAN: Option<PackSchemaPlan> = Some(PackSchemaPlan {
@@ -95,6 +96,10 @@ impl PackRuntime for GitPack {
 
     fn edge_rules(&self) -> &'static [EdgeEndpointRule] {
         <GitPack as Pack>::EDGE_RULES
+    }
+
+    fn entity_types(&self) -> &'static [EntityTypeDef] {
+        <GitPack as Pack>::ENTITY_TYPES
     }
 
     fn requires(&self) -> &'static [&'static str] {

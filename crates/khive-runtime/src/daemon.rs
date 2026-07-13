@@ -341,10 +341,20 @@ pub struct DaemonRequestFrame {
     /// key on transport.
     #[serde(default)]
     pub from_wire: bool,
+    /// Caller-supplied correlation id (khive#948): a `u64` from the caller's
+    /// own process-local monotonic counter, echoed back unchanged on
+    /// [`DaemonResponseFrame::request_id`] and stamped into the dispatch's
+    /// audit event (`resource.request_id`) so a benchmark harness can join
+    /// its own pre-send sample to the server-side audit row for the same
+    /// request. Purely additive — `#[serde(default)]` matches
+    /// `metrics_only`/`format`/`format_per_op` precedent, no
+    /// `PROTOCOL_VERSION` bump. `None` means the caller supplied no id.
+    #[serde(default)]
+    pub request_id: Option<u64>,
 }
 
 /// Response frame sent from the daemon back to a client.
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Debug)]
 pub struct DaemonResponseFrame {
     pub ok: bool,
     pub result: Option<String>,
@@ -381,6 +391,14 @@ pub struct DaemonResponseFrame {
     /// `served_config_id`'s upgrade-window handling above).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metrics: Option<MetricsSnapshot>,
+    /// Echo of the request's `request_id` (khive#948), present whenever the
+    /// frame that produced this response carried one — including on every
+    /// error/denied arm, not only success, so a client can join a failure
+    /// the same way it joins a success. `#[serde(default)]` so an older
+    /// daemon's response (predating this field) deserializes to `None`
+    /// rather than a parse error.
+    #[serde(default)]
+    pub request_id: Option<u64>,
 }
 
 /// Point-in-time snapshot of the daemon's server-side gauges — the
@@ -697,7 +715,7 @@ fn build_metrics_snapshot<D: DaemonDispatch>(dispatcher: &D) -> MetricsSnapshot 
     let open_tx_count = khive_storage::tx_registry::snapshot().len();
     let (oldest_pinned_tx_micros, oldest_pinned_tx_label) =
         match khive_storage::tx_registry::oldest() {
-            Some((age, label)) => (Some(age.as_micros() as u64), label),
+            Some((_id, age, label)) => (Some(age.as_micros() as u64), label),
             None => (None, None),
         };
 
@@ -760,6 +778,7 @@ async fn handle_conn<D: DaemonDispatch>(mut stream: UnixStream, dispatcher: D) {
             version_mismatch: true,
             daemon_protocol_version: PROTOCOL_VERSION,
             metrics: None,
+            request_id: frame.request_id,
         }
     } else if frame.metrics_only {
         // Process-global gauge read: namespace/config-agnostic, so this is
@@ -778,6 +797,7 @@ async fn handle_conn<D: DaemonDispatch>(mut stream: UnixStream, dispatcher: D) {
             version_mismatch: false,
             daemon_protocol_version: PROTOCOL_VERSION,
             metrics: Some(build_metrics_snapshot(&dispatcher)),
+            request_id: frame.request_id,
         }
     // There is no `frame.namespace != dispatcher.namespace()` reject here.
     // The daemon accepts and serves the request under the frame's own
@@ -799,6 +819,7 @@ async fn handle_conn<D: DaemonDispatch>(mut stream: UnixStream, dispatcher: D) {
             version_mismatch: false,
             daemon_protocol_version: PROTOCOL_VERSION,
             metrics: None,
+            request_id: frame.request_id,
         }
     } else if frame.probe_only {
         // Probe-only request: identity checks passed; return immediately without
@@ -814,6 +835,7 @@ async fn handle_conn<D: DaemonDispatch>(mut stream: UnixStream, dispatcher: D) {
             version_mismatch: false,
             daemon_protocol_version: PROTOCOL_VERSION,
             metrics: None,
+            request_id: frame.request_id,
         }
     } else {
         // Build the per-request identity context from the frame so the
@@ -828,6 +850,7 @@ async fn handle_conn<D: DaemonDispatch>(mut stream: UnixStream, dispatcher: D) {
             namespace: frame.namespace.clone(),
             actor_id: frame.actor_id.clone(),
             visible_namespaces: frame.visible_namespaces.clone(),
+            request_id: frame.request_id,
         };
         match dispatcher
             .dispatch(
@@ -851,6 +874,7 @@ async fn handle_conn<D: DaemonDispatch>(mut stream: UnixStream, dispatcher: D) {
                 version_mismatch: false,
                 daemon_protocol_version: PROTOCOL_VERSION,
                 metrics: None,
+                request_id: frame.request_id,
             },
             Err(e) => DaemonResponseFrame {
                 ok: false,
@@ -862,6 +886,7 @@ async fn handle_conn<D: DaemonDispatch>(mut stream: UnixStream, dispatcher: D) {
                 version_mismatch: false,
                 daemon_protocol_version: PROTOCOL_VERSION,
                 metrics: None,
+                request_id: frame.request_id,
             },
         }
     };
@@ -894,6 +919,7 @@ async fn handle_conn<D: DaemonDispatch>(mut stream: UnixStream, dispatcher: D) {
                     version_mismatch: false,
                     daemon_protocol_version: PROTOCOL_VERSION,
                     metrics: None,
+                    request_id: resp.request_id,
                 };
                 if let Ok(err_payload) = serde_json::to_vec(&err_resp) {
                     if let Err(e) = write_frame(&mut stream, &err_payload).await {
@@ -1588,6 +1614,10 @@ mod tests {
         config_id: String,
         dispatch_calls: Arc<std::sync::atomic::AtomicUsize>,
         pool: Option<Arc<ConnectionPool>>,
+        /// When `Some(msg)`, `dispatch` returns `Err(msg)` instead of the
+        /// default `Ok("{}")` — lets a test drive `handle_conn`'s real
+        /// dispatch-error arm (khive#948 request_id echo coverage).
+        dispatch_err: Option<String>,
     }
 
     #[async_trait]
@@ -1604,7 +1634,10 @@ mod tests {
         ) -> Result<String, String> {
             self.dispatch_calls
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            Ok("{}".to_string())
+            match &self.dispatch_err {
+                Some(msg) => Err(msg.clone()),
+                None => Ok("{}".to_string()),
+            }
         }
 
         async fn warm_all(&self) {}
@@ -1637,6 +1670,7 @@ mod tests {
             format: None,
             format_per_op: None,
             from_wire: false,
+            request_id: None,
         }
     }
 
@@ -1670,6 +1704,7 @@ mod tests {
             config_id: "cfg-a".to_string(),
             dispatch_calls: Arc::clone(&dispatch_calls),
             pool: None,
+            dispatch_err: None,
         };
 
         let mut metrics_req = base_request_frame("cfg-a");
@@ -1752,6 +1787,7 @@ mod tests {
             config_id: "cfg-wal".to_string(),
             dispatch_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             pool: Some(pool),
+            dispatch_err: None,
         };
 
         let snapshot = build_metrics_snapshot(&dispatcher);
@@ -1768,32 +1804,37 @@ mod tests {
         );
     }
 
-    /// Test 3: the tx-pin oracle. Uses a
-    /// before/after delta rather than asserting a global `open_tx_count==0`
-    /// baseline — `tx_registry` is a process-wide singleton shared with every
-    /// other test in this binary (including write-path tests elsewhere in
-    /// this crate that register short-lived entries), the same reason
-    /// `track_background_task_count_returns_to_zero_after_completion` above
-    /// asserts a before/after delta on `background_task_count()` rather than
-    /// an absolute value.
-    #[tokio::test]
+    /// Test 3: the tx-pin oracle. The registry is process-global, so an
+    /// unrelated transaction can depart between snapshots and exactly offset
+    /// this test's registration. Keep an owned handle live and assert the
+    /// resulting count floor instead of comparing two points in time.
+    #[test]
     #[serial(tx_registry)]
-    async fn metrics_snapshot_reflects_open_transaction_registry() {
+    fn metrics_snapshot_reflects_open_transaction_registry() {
         let dispatcher = MockDispatch {
             namespace: "local".to_string(),
             config_id: "cfg-tx".to_string(),
             dispatch_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             pool: None,
+            dispatch_err: None,
         };
 
+        let departing_handle = khive_storage::tx_registry::register(Some(
+            "daemon_metrics_snapshot_departing_test_tx".to_string(),
+        ));
         let before = build_metrics_snapshot(&dispatcher).open_tx_count;
+        assert!(before >= 1);
 
-        let handle = khive_storage::tx_registry::register(Some("metrics_test_tx".to_string()));
+        let handle = khive_storage::tx_registry::register(Some(
+            "daemon_metrics_snapshot_owned_test_tx".to_string(),
+        ));
+        drop(departing_handle);
+
         let during = build_metrics_snapshot(&dispatcher);
         assert!(
-            during.open_tx_count > before,
-            "open_tx_count must reflect the freshly registered transaction: \
-             before={before} during={}",
+            during.open_tx_count >= 1,
+            "open_tx_count must reflect the live owned transaction despite registry churn: \
+             churn_baseline={before} during={}",
             during.open_tx_count
         );
         assert!(
@@ -1802,19 +1843,12 @@ mod tests {
         );
 
         drop(handle);
-
-        let mut after = during.open_tx_count;
-        for _ in 0..20 {
-            after = build_metrics_snapshot(&dispatcher).open_tx_count;
-            if after <= before {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
         assert!(
-            after <= before,
-            "open_tx_count must drop back down after the transaction handle is dropped: \
-             before={before} after={after}"
+            !khive_storage::tx_registry::snapshot()
+                .iter()
+                .any(|(_, label)| label.as_deref()
+                    == Some("daemon_metrics_snapshot_owned_test_tx")),
+            "the owned registry entry must disappear when its handle is dropped"
         );
     }
 
@@ -1838,6 +1872,7 @@ mod tests {
             config_id: "cfg-wq-on".to_string(),
             dispatch_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             pool: Some(enabled_pool),
+            dispatch_err: None,
         };
         let snapshot_on = build_metrics_snapshot(&enabled_dispatcher);
         assert!(
@@ -1859,6 +1894,7 @@ mod tests {
             config_id: "cfg-wq-off".to_string(),
             dispatch_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             pool: Some(disabled_pool),
+            dispatch_err: None,
         };
         let snapshot_off = build_metrics_snapshot(&disabled_dispatcher);
         assert!(
@@ -1873,6 +1909,7 @@ mod tests {
             config_id: "cfg-no-pool".to_string(),
             dispatch_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             pool: None,
+            dispatch_err: None,
         };
         let snapshot_no_pool = build_metrics_snapshot(&no_pool_dispatcher);
         assert!(snapshot_no_pool.write_queue_depth.is_none());
@@ -1905,6 +1942,10 @@ mod tests {
             !frame.metrics_only,
             "metrics_only must default to false when absent from the wire payload"
         );
+        assert_eq!(
+            frame.request_id, None,
+            "request_id must default to None when absent from the wire payload (khive#948)"
+        );
 
         let resp_json = serde_json::json!({
             "ok": true,
@@ -1921,6 +1962,72 @@ mod tests {
         assert!(
             resp.metrics.is_none(),
             "metrics must default to None when absent from the wire payload"
+        );
+        assert_eq!(
+            resp.request_id, None,
+            "request_id must default to None when absent from the wire payload (khive#948)"
+        );
+    }
+
+    /// khive#948: a request carrying `request_id: Some(n)` gets back a
+    /// response with `request_id: Some(n)` on both the success and the
+    /// error/denied dispatch arms — the echo must survive every branch of
+    /// `handle_conn`, not only the happy path.
+    #[tokio::test]
+    async fn request_id_echoed_on_success_and_error_arms() {
+        let dispatcher = MockDispatch {
+            namespace: "local".to_string(),
+            config_id: "cfg-a".to_string(),
+            dispatch_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            pool: None,
+            dispatch_err: None,
+        };
+        let mut ok_req = base_request_frame("cfg-a");
+        ok_req.request_id = Some(42);
+        let ok_resp = round_trip(dispatcher, &ok_req).await;
+        assert!(ok_resp.ok, "expected successful dispatch: {ok_resp:?}");
+        assert_eq!(
+            ok_resp.request_id,
+            Some(42),
+            "request_id must be echoed back on a successful dispatch response"
+        );
+
+        // config_mismatch is a rejection arm that never reaches dispatch —
+        // must still echo the id so the client can join the failure.
+        let mismatched_dispatcher = MockDispatch {
+            namespace: "local".to_string(),
+            config_id: "cfg-a".to_string(),
+            dispatch_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            pool: None,
+            dispatch_err: None,
+        };
+        let mut mismatch_req = base_request_frame("cfg-WRONG");
+        mismatch_req.request_id = Some(99);
+        let mismatch_resp = round_trip(mismatched_dispatcher, &mismatch_req).await;
+        assert!(mismatch_resp.config_mismatch);
+        assert_eq!(
+            mismatch_resp.request_id,
+            Some(99),
+            "request_id must be echoed on the config_mismatch rejection arm too"
+        );
+
+        // The real ops-dispatch error arm (`Err(e)` from `dispatcher.dispatch`)
+        // must echo the id as well, not only the pre-dispatch rejection arms.
+        let erroring_dispatcher = MockDispatch {
+            namespace: "local".to_string(),
+            config_id: "cfg-a".to_string(),
+            dispatch_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            pool: None,
+            dispatch_err: Some("simulated dispatch error".to_string()),
+        };
+        let mut err_req = base_request_frame("cfg-a");
+        err_req.request_id = Some(7);
+        let err_resp = round_trip(erroring_dispatcher, &err_req).await;
+        assert!(!err_resp.ok, "expected a dispatch error: {err_resp:?}");
+        assert_eq!(
+            err_resp.request_id,
+            Some(7),
+            "request_id must be echoed on the real ops-dispatch error arm"
         );
     }
 

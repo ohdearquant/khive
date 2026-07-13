@@ -13,7 +13,8 @@
 
 use khive_runtime::{NoteKindSpec, NoteLifecycleSpec};
 use khive_types::{
-    EdgeEndpointRule, EdgeRelation, EndpointKind, HandlerDef, ParamDef, VerbCategory, Visibility,
+    EdgeEndpointRule, EdgeRelation, EndpointKind, EntityKind, EntityTypeDef, HandlerDef, ParamDef,
+    VerbCategory, Visibility,
 };
 
 /// Lifecycle declaration shared by `issue` and `pull_request` — both track an
@@ -74,6 +75,29 @@ pub(crate) static GIT_EDGE_RULES: [EdgeEndpointRule; 1] = [EdgeEndpointRule {
     relation: EdgeRelation::Precedes,
     source: EndpointKind::NoteOfKind("commit"),
     target: EndpointKind::NoteOfKind("commit"),
+}];
+
+/// Pack-declared `Document` entity-type subtype: Architecture Decision
+/// Records.
+///
+/// `find_document_for_path` (`src/ingest.rs`) resolves pre-existing
+/// `document` entities by git-tracked file path (`properties.source_uri`) so
+/// commits/PRs can `annotates`-link to them; this pack never creates those
+/// document entities itself ("v0 never creates documents on the ingester's
+/// behalf"). The single most common git-tracked document kind ingesting
+/// agents attach to a repo's `document` entities is its ADR corpus
+/// (`docs/adr/*.md`) — but `EntityTypeRegistry::BUILTIN_DEFS` has no `adr`
+/// Document subtype, so any caller attempting `entity_type="adr"` was
+/// rejected at the handler layer, and callers omitted `entity_type`
+/// entirely rather than retry against an unknown value: a schema gap, not a
+/// data gap. Declaring it here (composed at boot via
+/// `VerbRegistry::all_entity_types`, ADR-017's additive pack-vocabulary
+/// pattern) makes ADR documents representable without editing the builtin
+/// registry.
+pub(crate) static GIT_ENTITY_TYPES: [EntityTypeDef; 1] = [EntityTypeDef {
+    kind: EntityKind::Document,
+    type_name: "adr",
+    aliases: &["architecture_decision_record", "decision_record"],
 }];
 
 /// Illocutionary classification (Searle 1976): `git.digest` commits data to

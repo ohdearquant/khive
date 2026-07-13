@@ -17,8 +17,8 @@ use khive_pack_git::ingest::{run_ingest, IngestOptions};
 use khive_pack_git::GitPack;
 use khive_pack_kg::KgPack;
 use khive_runtime::{
-    AllowAllGate, BackendId, EmbedderProvider, KhiveRuntime, Namespace, NamespaceToken,
-    RuntimeConfig, RuntimeResult, VerbRegistry, VerbRegistryBuilder,
+    AllowAllGate, BackendId, EmbedderProvider, EntityCreateSpec, KhiveRuntime, Namespace,
+    NamespaceToken, RuntimeConfig, RuntimeError, RuntimeResult, VerbRegistry, VerbRegistryBuilder,
 };
 use khive_storage::types::{SqlStatement, SqlValue};
 use lattice_embed::{EmbedError, EmbeddingModel, EmbeddingService};
@@ -115,6 +115,12 @@ async fn fixture() -> (KhiveRuntime, NamespaceToken, VerbRegistry) {
     builder.register(GitPack::new(rt.clone()));
     let registry = builder.build().expect("registry builds");
     rt.install_edge_rules(registry.all_edge_rules());
+    // Mirrors the production boot sequence (`serve.rs`): without this call,
+    // `KhiveRuntime`'s pack-installed entity-type validator (the
+    // `create_many` defense-in-depth layer) is never wired, so a test built
+    // on a fixture that skips it would still pass even if that runtime-layer
+    // aggregate were absent or builtin-only (PR #925).
+    registry.call_register_entity_type_validators(&rt);
     registry.apply_schema_plans(rt.backend());
     let token = rt.authorize(Namespace::local()).expect("authorize local");
     (rt, token, registry)
@@ -754,7 +760,7 @@ async fn ingest_leaves_clean_issue_title_unmasked() {
     );
 }
 
-/// PR #835 round-1 codex finding: the runtime secret gate recursively scans
+/// PR #835: the runtime secret gate recursively scans
 /// every string in `properties` (not just `title`), so a credential-shaped
 /// label name previously tripped the gate on `create()` even after the
 /// title was masked, silently dropping the whole issue note.
@@ -921,7 +927,7 @@ async fn ingest_masks_credential_shaped_issue_author_login_without_dropping_note
     );
 }
 
-/// PR #835 round-2 codex finding (Major): `created_at`/`closed_at` bypassed
+/// PR #835: `created_at`/`closed_at` bypassed
 /// `MaskedIssueFields` entirely and entered `properties` as arbitrary raw
 /// strings, so a credential-shaped `createdAt` tripped the runtime's
 /// recursive secret-gate scan on `properties` and silently dropped the
@@ -1004,7 +1010,7 @@ async fn ingest_rejects_credential_shaped_issue_created_at_without_dropping_note
 }
 
 /// Sibling of the `createdAt` regression above, for `closedAt` (ingest.rs
-/// line ~1550 in the round-2 finding).
+/// line ~1550).
 #[tokio::test]
 async fn ingest_rejects_credential_shaped_issue_closed_at_without_dropping_note() {
     let _guard = ENV_MUTEX.lock().await;
@@ -1079,7 +1085,7 @@ async fn ingest_rejects_credential_shaped_issue_closed_at_without_dropping_note(
 }
 
 /// `updatedAt` is not stored in `properties` at all -- it is only used to
-/// advance the paging cursor (ingest.rs line ~1632 in the round-2 finding).
+/// advance the paging cursor (ingest.rs line ~1632).
 /// A credential-shaped `updatedAt` must still not drop the issue, and the
 /// cursor persisted to `git_mirror_cursor` must never contain the raw
 /// value; it must advance only from a sibling record's validated,
@@ -1253,7 +1259,7 @@ async fn ingest_masks_multiple_credential_spans_in_pr_title_and_body() {
     );
 }
 
-/// Review #763 required regression: a clean (non-credential) PR title and a
+/// Issue #763 regression: a clean (non-credential) PR title and a
 /// null body must pass through `ingest_prs` byte-for-byte unchanged — a bare
 /// 64-hex string with no trigger word nearby is allowlisted by
 /// `mask_secrets`, so nothing in this fixture should ever be replaced.
@@ -1639,7 +1645,7 @@ async fn issue_hook_rejects_ungoverned_state_reason() {
     );
 }
 
-/// Round-3 codex finding (Major): before this fix, the masking boundary only
+/// Before this fix, the masking boundary only
 /// lowercased `stateReason` -- validation against the governed enum was left
 /// entirely to `IssueLikeHook::prepare_create`, whose error interpolated the
 /// raw value verbatim (`"issue properties.state_reason {reason:?} invalid"`).
@@ -1756,7 +1762,7 @@ async fn commit_hook_requires_properties_sha() {
     assert!(format!("{err}").contains("sha"));
 }
 
-// ── project-scoped idempotency (review round-1 [High] #1) ──────────────────
+// ── project-scoped idempotency ──────────────────────────────────────────
 
 /// GitHub issue/PR numbers are repository-scoped: two different `project`
 /// entities can each have a `#1`. Both a direct `find_by_number` collision
@@ -1891,8 +1897,7 @@ async fn issue_and_pr_idempotency_is_scoped_per_project() {
     );
 }
 
-// ── gh boundary contract + per-record warning aggregation (review round-1
-//    [High] #2, [Medium] #3, [Medium] #4) ───────────────────────────────────
+// ── gh boundary contract + per-record warning aggregation ───────────────────
 
 /// End-to-end over a PATH-shadowing fake `gh`: locks the four demo-found
 /// regression classes ((a) no `-C`, correct cwd; (b) empty `stateReason`
@@ -1991,7 +1996,7 @@ async fn gh_boundary_contract_and_partial_ingest_failure() {
         !args_log.contains("-C"),
         "gh must never receive an unsupported -C flag: {args_log}"
     );
-    // ADR-088 Amendment 1 fix-round r2 High-1: the paging rewrite (--search
+    // ADR-088 Amendment 1: the paging rewrite (--search
     // "sort:updated-asc ...") must not silently drop --state all -- gh
     // defaults to open-only listing, which would make closed issues and
     // closed/merged PRs vanish from every ingest.
@@ -2025,7 +2030,7 @@ async fn gh_boundary_contract_and_partial_ingest_failure() {
         );
     }
 
-    // (b)/(c)/(d) + Finding 2: pull_request properties use base_ref/head_ref.
+    // (b)/(c)/(d): pull_request properties use base_ref/head_ref.
     let issues_list = registry
         .dispatch("list", json!({"kind": "issue", "limit": 20}))
         .await
@@ -2105,7 +2110,7 @@ async fn gh_boundary_contract_and_partial_ingest_failure() {
     );
 }
 
-// ── round-3 codex finding (Major): raw `updatedAt` must never reach the
+// ── raw `updatedAt` must never reach the
 //    paging floor via a full page ─────────────────────────────────────────
 
 /// Before this fix, `ingest_issues` sorted the raw `Vec<GhIssue>` and derived
@@ -2232,22 +2237,43 @@ async fn issue_full_page_never_leaks_raw_updated_at_into_paging_floor() {
         "the persisted paging cursor must never contain the raw credential value: {cursor}"
     );
 
-    let issues_list = registry
-        .dispatch(
-            "list",
-            json!({"kind": "issue", "limit": (PAGE_LIMIT + 10) as u64}),
-        )
-        .await
-        .expect("list issues ok");
-    let items = issues_list.as_array().expect("array");
+    // `list` clamps over-cap requests and returns `{items, effective_limit, ..}`
+    // instead of a bare array (#894), so scan every persisted issue by paging.
+    let mut scanned = 0usize;
+    let mut offset = 0u64;
+    loop {
+        let page = registry
+            .dispatch(
+                "list",
+                json!({"kind": "issue", "limit": (PAGE_LIMIT + 10) as u64, "offset": offset}),
+            )
+            .await
+            .expect("list issues ok");
+        let items = match page.as_array() {
+            Some(items) => items.clone(),
+            None => page
+                .get("items")
+                .and_then(Value::as_array)
+                .expect("clamped list response must carry an items array")
+                .clone(),
+        };
+        assert!(
+            items.iter().all(|i| !i.to_string().contains(CREDENTIAL)),
+            "no persisted issue record may contain the raw credential value"
+        );
+        scanned += items.len();
+        if items.is_empty() {
+            break;
+        }
+        offset += items.len() as u64;
+    }
     assert!(
-        items.iter().all(|i| !i.to_string().contains(CREDENTIAL)),
-        "no persisted issue record may contain the raw credential value"
+        scanned >= PAGE_LIMIT,
+        "paging scan must cover every persisted issue: scanned {scanned}"
     );
 }
 
-// ── unsorted `gh` output must not desync the frozen-cursor retry guarantee
-//    (review round-2 [Medium]) ───────────────────────────────────────────────
+// ── unsorted `gh` output must not desync the frozen-cursor retry guarantee ──
 
 /// Reads the git-ingest cursor row directly, mirroring `ingest.rs`'s private
 /// `read_cursor` — the acceptance tests otherwise only observe cursor state
@@ -2275,8 +2301,8 @@ async fn read_git_cursor(rt: &KhiveRuntime, project_id: Uuid, kind: &str) -> Opt
     })
 }
 
-/// `gh issue list` / `gh pr list` make no ordering guarantee (review round-2
-/// [Medium]): the frozen-cursor retry contract only holds if records are
+/// `gh issue list` / `gh pr list` make no ordering guarantee: the
+/// frozen-cursor retry contract only holds if records are
 /// walked in nondecreasing `updatedAt` order, so unsorted `gh` output can let
 /// a later, newer record's timestamp overwrite the freeze point before an
 /// earlier, older record fails — after which the older failure looks
@@ -2542,10 +2568,9 @@ async fn pr_ingest_sorts_by_updated_at_so_frozen_cursor_survives_out_of_order_li
     assert_eq!(cursor_after_pass2, "2026-01-03T00:00:00Z");
 }
 
-// ── equal-`updated_at` ties must not strand a failed record (review round-3
-//    [Medium]) ─────────────────────────────────────────────────────────────
+// ── equal-`updated_at` ties must not strand a failed record ─────────────────
 
-/// Sorting alone (the round-2 fix) does not cover a TIE: if a successful
+/// Sorting alone (the earlier fix) does not cover a TIE: if a successful
 /// record and a failing record share the exact same `updated_at`, the
 /// success still advances the cursor to that shared timestamp, and an
 /// exclusive `updated > cursor` retry check would then see the failed
@@ -2999,7 +3024,7 @@ async fn digest_verb_rejects_ssh_source() {
     assert!(format!("{err}").contains("SSH"), "{err}");
 }
 
-/// `max_items` boundary handling (ADR-088 Amendment 1 fix-round Medium-2):
+/// `max_items` boundary handling (ADR-088 Amendment 1):
 /// a negative value must clamp to the lower bound (1), NOT silently fall
 /// through `as_u64`'s failure into the 500 default. `0` clamps to 1 too;
 /// values above 2000 clamp to 2000; a non-integer value is a hard error.
@@ -3389,8 +3414,7 @@ impl EmbedderProvider for FailingEmbedProvider {
 /// removes the note row and its FTS document, the pass reports the failure
 /// as a create-commit warning, and neither `commits_ingested` nor
 /// `commit_embeddings_truncated` moves for that commit, since both only ever
-/// advance on the successful-create arm (review round-2 [Medium]-1
-/// remediation).
+/// advance on the successful-create arm (a prior fix).
 #[tokio::test]
 async fn ingest_over_cap_commit_with_failing_embedder_creates_nothing_and_warns() {
     let _guard = ENV_MUTEX.lock().await;
@@ -3467,7 +3491,7 @@ async fn ingest_over_cap_commit_with_failing_embedder_creates_nothing_and_warns(
     );
 }
 
-/// Semantic-only retrieval (review round-2 [Medium]-1): an explicit
+/// Semantic-only retrieval: an explicit
 /// deterministic query vector matching a real registered embedder's
 /// constant output, paired with query text that is lexically absent from
 /// the commit message, can only resolve the note through the vector leg --
@@ -3847,4 +3871,749 @@ async fn ingest_resolves_over_cap_commit_reference_beyond_the_embedding_cap() {
     let hits = issue_neighbors.as_array().expect("array");
     assert_eq!(hits.len(), 1, "{hits:?}");
     assert_eq!(hits[0]["kind"], "commit");
+}
+
+// ── ENTITY_TYPES pack composition (dead-letter fix) ─────────────────────────
+//
+// The git pack declares `adr` as a `Document` entity-type subtype
+// (`vocab::GIT_ENTITY_TYPES`) — see `find_document_for_path`'s doc comment
+// above for why `document` entities matched by git-tracked file path are the
+// motivating case. These tests exercise the real `create` verb end-to-end
+// (dispatch -> handle_create -> validate_entity_type -> the boot-time
+// composed registry), not just the isolated unit-level composition covered
+// in `khive-runtime::pack`'s tests.
+
+/// The git-pack-declared `adr` Document subtype validates through the real
+/// `create` handler once `GitPack` is loaded, and its alias normalises to
+/// the canonical name.
+#[tokio::test]
+async fn git_pack_adr_entity_type_validates_through_create() {
+    let (_rt, _token, registry) = fixture().await;
+
+    let resp = registry
+        .dispatch(
+            "create",
+            json!({"kind": "document", "entity_type": "adr", "name": "ADR-001: example"}),
+        )
+        .await
+        .expect("create must accept the git-pack-declared adr Document subtype");
+    assert_eq!(resp["entity_type"], "adr", "{resp}");
+
+    let resp_alias = registry
+        .dispatch(
+            "create",
+            json!({
+                "kind": "document",
+                "entity_type": "architecture_decision_record",
+                "name": "ADR-002: example",
+            }),
+        )
+        .await
+        .expect("create must accept the adr alias");
+    assert_eq!(resp_alias["entity_type"], "adr", "{resp_alias}");
+
+    // Builtin Document subtypes remain resolvable alongside the pack extension.
+    let resp_builtin = registry
+        .dispatch(
+            "create",
+            json!({"kind": "document", "entity_type": "paper", "name": "Some paper"}),
+        )
+        .await
+        .expect("builtin paper subtype must remain resolvable when git pack adds adr");
+    assert_eq!(resp_builtin["entity_type"], "paper", "{resp_builtin}");
+}
+
+/// Without the git pack loaded, `adr` is not a registered Document subtype —
+/// proving the acceptance above is genuine pack composition, not a builtin.
+#[tokio::test]
+async fn adr_entity_type_rejected_without_git_pack_loaded() {
+    let rt = rt();
+    let mut builder = VerbRegistryBuilder::new();
+    builder.register(KgPack::new(rt.clone()));
+    let registry = builder.build().expect("registry builds");
+    rt.install_edge_rules(registry.all_edge_rules());
+    registry.apply_schema_plans(rt.backend());
+
+    let err = registry
+        .dispatch(
+            "create",
+            json!({"kind": "document", "entity_type": "adr", "name": "ADR-001: example"}),
+        )
+        .await
+        .expect_err("adr must be rejected when the declaring pack is not loaded");
+    assert!(
+        err.to_string().contains("adr"),
+        "error must name the rejected value: {err}"
+    );
+}
+
+/// Pins the RUNTIME-layer validator, not just the handler-layer check above.
+///
+/// `fixture()` now runs the same `call_register_entity_type_validators` boot
+/// step production runs in `serve.rs` before the first dispatch. This test
+/// calls `KhiveRuntime::create_many` directly (the defense-in-depth path for
+/// Rust callers that bypass the `create` verb handler) and would fail if the
+/// boot-time composed aggregate were ever absent or builtin-only — the gap
+/// PR #925 flagged: the handler-layer test above would stay
+/// green even if that wiring were silently dropped, since it never exercises
+/// `create_many` directly.
+///
+/// The positive `adr` assertion alone cannot prove the aggregate validator is
+/// actually installed: `KhiveRuntime::validate_entity_type_for_kind` returns
+/// its input unchanged when no validator is installed at all, so a
+/// positive-only test also passes with the boot wiring deleted entirely
+/// (PR #925). The negative case below — an unregistered
+/// Document subtype rejected as `RuntimeError::InvalidInput` — is what
+/// actually distinguishes "composed from pack `ENTITY_TYPES`" from
+/// "builtin-only" from "absent".
+#[tokio::test]
+async fn git_pack_adr_entity_type_validates_through_runtime_create_many() {
+    let (rt, token, _registry) = fixture().await;
+
+    let created = rt
+        .create_many(
+            &token,
+            vec![EntityCreateSpec {
+                kind: "document".to_string(),
+                entity_type: Some("adr".to_string()),
+                name: "ADR-003: runtime layer".to_string(),
+                description: None,
+                properties: None,
+                tags: vec![],
+            }],
+        )
+        .await
+        .expect("runtime-layer create_many must accept the git-pack-declared adr subtype");
+    assert_eq!(created.len(), 1, "{created:?}");
+    assert_eq!(
+        created[0].entity_type.as_deref(),
+        Some("adr"),
+        "{created:?}"
+    );
+
+    // Negative companion (PR #925): the positive `adr`
+    // assertion above passes whether the aggregate validator is wired up
+    // OR entirely absent, since `KhiveRuntime::validate_entity_type_for_kind`
+    // returns the input unchanged when no validator is installed. Only a
+    // rejection of an UNREGISTERED Document subtype proves a validator is
+    // actually composed and consulted — this call fails closed if the boot
+    // wiring (`call_register_entity_type_validators`) were ever dropped.
+    let err = rt
+        .create_many(
+            &token,
+            vec![EntityCreateSpec {
+                kind: "document".to_string(),
+                entity_type: Some("not_a_registered_subtype".to_string()),
+                name: "not an ADR".to_string(),
+                description: None,
+                properties: None,
+                tags: vec![],
+            }],
+        )
+        .await
+        .expect_err(
+            "runtime-layer create_many must reject an unregistered Document subtype when the \
+             aggregate entity-type validator is composed",
+        );
+    assert!(
+        matches!(err, RuntimeError::InvalidInput(_)),
+        "unregistered entity_type must fail as InvalidInput, got: {err:?}"
+    );
+    assert!(
+        err.to_string().contains("not_a_registered_subtype"),
+        "error must name the rejected value: {err}"
+    );
+}
+
+// ── Issue #841: residual unmasked ingest fields ─────────────────────────────
+//
+// PR #835's `ingest_masks_secrets_in_commit_message` and the PR-title/body
+// tests above already cover `content`/`title`
+// masking. These tests cover the fields #841 found still passed raw into
+// gated `properties`/the note `name`: the commit note `name` (built from the
+// raw subject), commit `author`/`author_email`, and PR `author`/`base_ref`/
+// `head_ref`. Each fix pairs a credential-shaped positive (record must not
+// be dropped, field must be masked) with a clean-input regression guard
+// (field must survive byte-for-byte unchanged).
+
+/// The commit note `name` was built from the raw (unmasked) commit subject
+/// even though `content` already masked the same text — a credential-shaped
+/// subject line tripped the runtime's `secret_gate::check(name)` call and
+/// silently dropped the whole commit, despite `content` being safe.
+#[tokio::test]
+async fn ingest_masks_credential_shaped_commit_subject_in_name_without_dropping_note() {
+    let _guard = ENV_MUTEX.lock().await;
+    let (rt, token, registry) = fixture().await;
+
+    let project_id = create(
+        &registry,
+        json!({"kind": "project", "name": "commit-subject-credential-repo"}),
+    )
+    .await;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    init_repo(repo);
+
+    let fake_token = "ghp_EEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEEE";
+    write(repo, "README.md", "hello\n");
+    commit(repo, &["README.md"], fake_token);
+
+    let report = run_ingest(
+        &rt,
+        &token,
+        &registry,
+        IngestOptions::unbounded(repo.to_path_buf(), project_id.to_string()),
+    )
+    .await
+    .expect("ingest ok");
+
+    assert_eq!(
+        report.commits_ingested, 1,
+        "the commit must not be dropped: {report:?}"
+    );
+    assert!(
+        report.warnings.iter().all(|w| !w.contains("create commit")),
+        "no silent-drop warning may be reported: {:?}",
+        report.warnings
+    );
+
+    let list = registry
+        .dispatch("list", json!({"kind": "commit", "limit": 10}))
+        .await
+        .expect("list ok");
+    let items = list.as_array().expect("array");
+    assert_eq!(items.len(), 1);
+    let stored_name = items[0]["name"].as_str().expect("name is string");
+    assert!(
+        !stored_name.contains(fake_token),
+        "raw token must not survive into the stored name: {stored_name:?}"
+    );
+    assert!(
+        stored_name.contains("***MASKED***"),
+        "masked marker must be present in name: {stored_name:?}"
+    );
+}
+
+/// The commit `author` field entered gated `properties` raw — a
+/// credential-shaped `git config user.name` silently dropped the commit via
+/// the runtime's recursive `properties` secret scan.
+#[tokio::test]
+async fn ingest_masks_credential_shaped_commit_author_without_dropping_note() {
+    let _guard = ENV_MUTEX.lock().await;
+    let (rt, token, registry) = fixture().await;
+
+    let project_id = create(
+        &registry,
+        json!({"kind": "project", "name": "commit-author-credential-repo"}),
+    )
+    .await;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    init_repo(repo);
+
+    let fake_token = "ghp_FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF";
+    git(repo, &["config", "user.name", fake_token]);
+    write(repo, "README.md", "hello\n");
+    commit(repo, &["README.md"], "Normal commit message");
+
+    let report = run_ingest(
+        &rt,
+        &token,
+        &registry,
+        IngestOptions::unbounded(repo.to_path_buf(), project_id.to_string()),
+    )
+    .await
+    .expect("ingest ok");
+
+    assert_eq!(
+        report.commits_ingested, 1,
+        "the commit must not be dropped: {report:?}"
+    );
+    assert!(
+        report.warnings.iter().all(|w| !w.contains("create commit")),
+        "no silent-drop warning may be reported: {:?}",
+        report.warnings
+    );
+
+    let list = registry
+        .dispatch("list", json!({"kind": "commit", "limit": 10}))
+        .await
+        .expect("list ok");
+    let items = list.as_array().expect("array");
+    assert_eq!(items.len(), 1);
+    let stored_author = items[0]["properties"]["author"]
+        .as_str()
+        .expect("properties.author is string");
+    assert!(
+        !stored_author.contains(fake_token),
+        "raw token must not survive into properties.author: {stored_author:?}"
+    );
+    assert!(
+        stored_author.contains("***MASKED***"),
+        "masked marker must be present in properties.author: {stored_author:?}"
+    );
+}
+
+/// The commit `author_email` field entered gated `properties` raw — a
+/// credential-shaped `git config user.email` silently dropped the commit via
+/// the runtime's recursive `properties` secret scan.
+#[tokio::test]
+async fn ingest_masks_credential_shaped_commit_author_email_without_dropping_note() {
+    let _guard = ENV_MUTEX.lock().await;
+    let (rt, token, registry) = fixture().await;
+
+    let project_id = create(
+        &registry,
+        json!({"kind": "project", "name": "commit-author-email-credential-repo"}),
+    )
+    .await;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    init_repo(repo);
+
+    let fake_token = "ghp_GGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGG";
+    git(
+        repo,
+        &["config", "user.email", &format!("{fake_token}@example.com")],
+    );
+    write(repo, "README.md", "hello\n");
+    commit(repo, &["README.md"], "Normal commit message");
+
+    let report = run_ingest(
+        &rt,
+        &token,
+        &registry,
+        IngestOptions::unbounded(repo.to_path_buf(), project_id.to_string()),
+    )
+    .await
+    .expect("ingest ok");
+
+    assert_eq!(
+        report.commits_ingested, 1,
+        "the commit must not be dropped: {report:?}"
+    );
+    assert!(
+        report.warnings.iter().all(|w| !w.contains("create commit")),
+        "no silent-drop warning may be reported: {:?}",
+        report.warnings
+    );
+
+    let list = registry
+        .dispatch("list", json!({"kind": "commit", "limit": 10}))
+        .await
+        .expect("list ok");
+    let items = list.as_array().expect("array");
+    assert_eq!(items.len(), 1);
+    let stored_email = items[0]["properties"]["author_email"]
+        .as_str()
+        .expect("properties.author_email is string");
+    assert!(
+        !stored_email.contains(fake_token),
+        "raw token must not survive into properties.author_email: {stored_email:?}"
+    );
+    assert!(
+        stored_email.contains("***MASKED***"),
+        "masked marker must be present in properties.author_email: {stored_email:?}"
+    );
+}
+
+/// Regression guard: clean (non-credential-shaped) commit author, email, and
+/// subject must survive byte-for-byte unchanged — the fix above must not
+/// become an over-aggressive masking regression.
+#[tokio::test]
+async fn ingest_leaves_clean_commit_author_and_subject_unmasked() {
+    let _guard = ENV_MUTEX.lock().await;
+    let (rt, token, registry) = fixture().await;
+
+    let project_id = create(
+        &registry,
+        json!({"kind": "project", "name": "commit-clean-fields-repo"}),
+    )
+    .await;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo = dir.path();
+    init_repo(repo);
+    git(repo, &["config", "user.name", "Ada Lovelace"]);
+    git(repo, &["config", "user.email", "ada@example.com"]);
+    write(repo, "README.md", "hello\n");
+    commit(repo, &["README.md"], "Add README with usage notes");
+
+    let report = run_ingest(
+        &rt,
+        &token,
+        &registry,
+        IngestOptions::unbounded(repo.to_path_buf(), project_id.to_string()),
+    )
+    .await
+    .expect("ingest ok");
+    assert_eq!(report.commits_ingested, 1, "{report:?}");
+
+    let list = registry
+        .dispatch("list", json!({"kind": "commit", "limit": 10}))
+        .await
+        .expect("list ok");
+    let items = list.as_array().expect("array");
+    assert_eq!(items.len(), 1);
+    let item = &items[0];
+    let stored_author = item["properties"]["author"]
+        .as_str()
+        .expect("author is string");
+    let stored_email = item["properties"]["author_email"]
+        .as_str()
+        .expect("author_email is string");
+    let stored_name = item["name"].as_str().expect("name is string");
+    assert_eq!(
+        stored_author, "Ada Lovelace",
+        "clean author must be stored unchanged"
+    );
+    assert_eq!(
+        stored_email, "ada@example.com",
+        "clean author_email must be stored unchanged"
+    );
+    assert!(
+        stored_name.ends_with("Add README with usage notes"),
+        "clean subject must survive unmodified in name: {stored_name:?}"
+    );
+    assert!(
+        !stored_author.contains("***MASKED***")
+            && !stored_email.contains("***MASKED***")
+            && !stored_name.contains("***MASKED***"),
+        "no masking marker may appear on clean input: author={stored_author:?} email={stored_email:?} name={stored_name:?}"
+    );
+}
+
+/// The PR `author` field entered gated `properties` raw — a credential-shaped
+/// GitHub login silently dropped the PR via the runtime's recursive
+/// `properties` secret scan (the sibling of the already-fixed issue
+/// `author_login` bug).
+#[tokio::test]
+async fn ingest_masks_credential_shaped_pr_author_login_without_dropping_note() {
+    let _guard = ENV_MUTEX.lock().await;
+    let (rt, token, registry) = fixture().await;
+
+    let project_id = create(
+        &registry,
+        json!({"kind": "project", "name": "pr-author-credential-repo"}),
+    )
+    .await;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo: PathBuf = dir.path().join("repo");
+    std::fs::create_dir_all(&repo).expect("mk repo dir");
+    init_repo(&repo);
+    write(&repo, "README.md", "hello\n");
+    commit(&repo, &["README.md"], "Initial commit");
+
+    let bin_dir = dir.path().join("bin");
+    std::fs::create_dir_all(&bin_dir).expect("mk bin dir");
+    let log_dir = dir.path().join("log");
+    std::fs::create_dir_all(&log_dir).expect("mk log dir");
+
+    let fake_token = "ghp_HHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHHH";
+    let pr_json = json!([{
+        "number": 55,
+        "title": "Fix pagination edge case",
+        "author": {"login": fake_token},
+        "createdAt": "2026-01-01T00:00:00Z",
+        "mergedAt": null,
+        "closedAt": null,
+        "updatedAt": "2026-01-01T00:00:00Z",
+        "baseRefName": "main",
+        "headRefName": "fix/pagination",
+        "mergeCommit": null,
+        "body": ""
+    }])
+    .to_string();
+
+    write_fake_gh(&bin_dir, &log_dir, &pr_json, "[]");
+    let _path_guard = PathGuard::install(&bin_dir);
+
+    let report = run_ingest(
+        &rt,
+        &token,
+        &registry,
+        IngestOptions::unbounded(repo.clone(), project_id.to_string()),
+    )
+    .await
+    .expect("ingest ok");
+
+    assert_eq!(
+        report.prs_ingested, 1,
+        "the PR must not be dropped: {report:?}"
+    );
+    assert!(
+        report.warnings.iter().all(|w| !w.contains("pull_request")),
+        "no silent-drop warning may be reported: {:?}",
+        report.warnings
+    );
+
+    let prs_list = registry
+        .dispatch("list", json!({"kind": "pull_request", "limit": 10}))
+        .await
+        .expect("list prs ok");
+    let items = prs_list.as_array().expect("array");
+    assert_eq!(items.len(), 1);
+    let stored_author = items[0]["properties"]["author"]
+        .as_str()
+        .expect("properties.author is string");
+    assert!(
+        !stored_author.contains(fake_token),
+        "raw credential must not survive into properties.author: {stored_author:?}"
+    );
+    assert!(
+        stored_author.contains("***MASKED***"),
+        "masked marker must be present in properties.author: {stored_author:?}"
+    );
+}
+
+/// The PR `base_ref` field entered gated `properties` raw — a
+/// credential-shaped base branch name silently dropped the PR.
+#[tokio::test]
+async fn ingest_masks_credential_shaped_pr_base_ref_without_dropping_note() {
+    let _guard = ENV_MUTEX.lock().await;
+    let (rt, token, registry) = fixture().await;
+
+    let project_id = create(
+        &registry,
+        json!({"kind": "project", "name": "pr-base-ref-credential-repo"}),
+    )
+    .await;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo: PathBuf = dir.path().join("repo");
+    std::fs::create_dir_all(&repo).expect("mk repo dir");
+    init_repo(&repo);
+    write(&repo, "README.md", "hello\n");
+    commit(&repo, &["README.md"], "Initial commit");
+
+    let bin_dir = dir.path().join("bin");
+    std::fs::create_dir_all(&bin_dir).expect("mk bin dir");
+    let log_dir = dir.path().join("log");
+    std::fs::create_dir_all(&log_dir).expect("mk log dir");
+
+    let fake_token = "ghp_IIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIIII";
+    let pr_json = json!([{
+        "number": 56,
+        "title": "Retarget release branch",
+        "author": {"login": "octocat"},
+        "createdAt": "2026-01-01T00:00:00Z",
+        "mergedAt": null,
+        "closedAt": null,
+        "updatedAt": "2026-01-01T00:00:00Z",
+        "baseRefName": fake_token,
+        "headRefName": "release/next",
+        "mergeCommit": null,
+        "body": ""
+    }])
+    .to_string();
+
+    write_fake_gh(&bin_dir, &log_dir, &pr_json, "[]");
+    let _path_guard = PathGuard::install(&bin_dir);
+
+    let report = run_ingest(
+        &rt,
+        &token,
+        &registry,
+        IngestOptions::unbounded(repo.clone(), project_id.to_string()),
+    )
+    .await
+    .expect("ingest ok");
+
+    assert_eq!(
+        report.prs_ingested, 1,
+        "the PR must not be dropped: {report:?}"
+    );
+    assert!(
+        report.warnings.iter().all(|w| !w.contains("pull_request")),
+        "no silent-drop warning may be reported: {:?}",
+        report.warnings
+    );
+
+    let prs_list = registry
+        .dispatch("list", json!({"kind": "pull_request", "limit": 10}))
+        .await
+        .expect("list prs ok");
+    let items = prs_list.as_array().expect("array");
+    assert_eq!(items.len(), 1);
+    let stored_base_ref = items[0]["properties"]["base_ref"]
+        .as_str()
+        .expect("properties.base_ref is string");
+    assert!(
+        !stored_base_ref.contains(fake_token),
+        "raw credential must not survive into properties.base_ref: {stored_base_ref:?}"
+    );
+    assert!(
+        stored_base_ref.contains("***MASKED***"),
+        "masked marker must be present in properties.base_ref: {stored_base_ref:?}"
+    );
+}
+
+/// The PR `head_ref` field entered gated `properties` raw — a
+/// credential-shaped head branch name (realistic for a fork PR, where the
+/// contributor fully controls the branch name) silently dropped the PR.
+#[tokio::test]
+async fn ingest_masks_credential_shaped_pr_head_ref_without_dropping_note() {
+    let _guard = ENV_MUTEX.lock().await;
+    let (rt, token, registry) = fixture().await;
+
+    let project_id = create(
+        &registry,
+        json!({"kind": "project", "name": "pr-head-ref-credential-repo"}),
+    )
+    .await;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo: PathBuf = dir.path().join("repo");
+    std::fs::create_dir_all(&repo).expect("mk repo dir");
+    init_repo(&repo);
+    write(&repo, "README.md", "hello\n");
+    commit(&repo, &["README.md"], "Initial commit");
+
+    let bin_dir = dir.path().join("bin");
+    std::fs::create_dir_all(&bin_dir).expect("mk bin dir");
+    let log_dir = dir.path().join("log");
+    std::fs::create_dir_all(&log_dir).expect("mk log dir");
+
+    let fake_token = "ghp_JJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJJ";
+    let pr_json = json!([{
+        "number": 57,
+        "title": "Fork contribution",
+        "author": {"login": "octocat"},
+        "createdAt": "2026-01-01T00:00:00Z",
+        "mergedAt": null,
+        "closedAt": null,
+        "updatedAt": "2026-01-01T00:00:00Z",
+        "baseRefName": "main",
+        "headRefName": fake_token,
+        "mergeCommit": null,
+        "body": ""
+    }])
+    .to_string();
+
+    write_fake_gh(&bin_dir, &log_dir, &pr_json, "[]");
+    let _path_guard = PathGuard::install(&bin_dir);
+
+    let report = run_ingest(
+        &rt,
+        &token,
+        &registry,
+        IngestOptions::unbounded(repo.clone(), project_id.to_string()),
+    )
+    .await
+    .expect("ingest ok");
+
+    assert_eq!(
+        report.prs_ingested, 1,
+        "the PR must not be dropped: {report:?}"
+    );
+    assert!(
+        report.warnings.iter().all(|w| !w.contains("pull_request")),
+        "no silent-drop warning may be reported: {:?}",
+        report.warnings
+    );
+
+    let prs_list = registry
+        .dispatch("list", json!({"kind": "pull_request", "limit": 10}))
+        .await
+        .expect("list prs ok");
+    let items = prs_list.as_array().expect("array");
+    assert_eq!(items.len(), 1);
+    let stored_head_ref = items[0]["properties"]["head_ref"]
+        .as_str()
+        .expect("properties.head_ref is string");
+    assert!(
+        !stored_head_ref.contains(fake_token),
+        "raw credential must not survive into properties.head_ref: {stored_head_ref:?}"
+    );
+    assert!(
+        stored_head_ref.contains("***MASKED***"),
+        "masked marker must be present in properties.head_ref: {stored_head_ref:?}"
+    );
+}
+
+/// Regression guard: clean (non-credential-shaped) PR author, base ref, and
+/// head ref must survive byte-for-byte unchanged.
+#[tokio::test]
+async fn ingest_leaves_clean_pr_author_and_refs_unmasked() {
+    let _guard = ENV_MUTEX.lock().await;
+    let (rt, token, registry) = fixture().await;
+
+    let project_id = create(
+        &registry,
+        json!({"kind": "project", "name": "pr-clean-author-refs-repo"}),
+    )
+    .await;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let repo: PathBuf = dir.path().join("repo");
+    std::fs::create_dir_all(&repo).expect("mk repo dir");
+    init_repo(&repo);
+    write(&repo, "README.md", "hello\n");
+    commit(&repo, &["README.md"], "Initial commit");
+
+    let bin_dir = dir.path().join("bin");
+    std::fs::create_dir_all(&bin_dir).expect("mk bin dir");
+    let log_dir = dir.path().join("log");
+    std::fs::create_dir_all(&log_dir).expect("mk log dir");
+
+    let pr_json = json!([{
+        "number": 58,
+        "title": "Improve README clarity",
+        "author": {"login": "octocat"},
+        "createdAt": "2026-01-01T00:00:00Z",
+        "mergedAt": null,
+        "closedAt": null,
+        "updatedAt": "2026-01-01T00:00:00Z",
+        "baseRefName": "main",
+        "headRefName": "docs/readme-clarity",
+        "mergeCommit": null,
+        "body": ""
+    }])
+    .to_string();
+
+    write_fake_gh(&bin_dir, &log_dir, &pr_json, "[]");
+    let _path_guard = PathGuard::install(&bin_dir);
+
+    let report = run_ingest(
+        &rt,
+        &token,
+        &registry,
+        IngestOptions::unbounded(repo.clone(), project_id.to_string()),
+    )
+    .await
+    .expect("ingest ok");
+    assert_eq!(report.prs_ingested, 1, "{report:?}");
+
+    let prs_list = registry
+        .dispatch("list", json!({"kind": "pull_request", "limit": 10}))
+        .await
+        .expect("list prs ok");
+    let items = prs_list.as_array().expect("array");
+    assert_eq!(items.len(), 1);
+    let item = &items[0];
+    let stored_author = item["properties"]["author"]
+        .as_str()
+        .expect("author is string");
+    let stored_base_ref = item["properties"]["base_ref"]
+        .as_str()
+        .expect("base_ref is string");
+    let stored_head_ref = item["properties"]["head_ref"]
+        .as_str()
+        .expect("head_ref is string");
+    assert_eq!(stored_author, "octocat", "clean author must be unchanged");
+    assert_eq!(stored_base_ref, "main", "clean base_ref must be unchanged");
+    assert_eq!(
+        stored_head_ref, "docs/readme-clarity",
+        "clean head_ref must be unchanged"
+    );
+    assert!(
+        !stored_author.contains("***MASKED***")
+            && !stored_base_ref.contains("***MASKED***")
+            && !stored_head_ref.contains("***MASKED***"),
+        "no masking marker may appear on clean input: author={stored_author:?} base_ref={stored_base_ref:?} head_ref={stored_head_ref:?}"
+    );
 }

@@ -13,15 +13,20 @@ categories.workspace = true
 [lib]
 bench = false
 
+[features]
+default = ["parallel", "mmap"]
+parallel = ["dep:rayon", "khive-quant/parallel"]
+mmap = ["dep:memmap2"]
+
 [dependencies]
-rayon = { workspace = true }
-memmap2 = { workspace = true }
+rayon = { workspace = true, optional = true }
+memmap2 = { workspace = true, optional = true }
 bytemuck = { workspace = true }
-rand = { workspace = true }
+rand = { version = "0.8", default-features = false, features = ["std_rng"] }
 serde = { workspace = true }
 thiserror = { workspace = true }
 blake3 = { workspace = true }
-khive-quant = { version = "0.4.0", path = "../khive-quant" }
+khive-quant = { version = "0.4.0", path = "../khive-quant", default-features = false }
 
 [dev-dependencies]
 blake3 = { workspace = true }
@@ -36,3 +41,4 @@ harness = false
 
 [[example]]
 name = "vec_bench"
+required-features = ["mmap"]

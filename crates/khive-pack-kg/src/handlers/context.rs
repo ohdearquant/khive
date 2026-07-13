@@ -266,7 +266,7 @@ impl KgPack {
         // or an edge UUID would otherwise resolve here and then silently vanish
         // from the response in Stage 4's lenient "missing entity" fallback. Fail
         // loudly instead: one batch existence check naming every offending id
-        // (internal review round 1, High-2).
+        // Regression coverage.
         if !explicit_ids.is_empty() {
             let mut dedup_explicit = explicit_ids.clone();
             dedup_explicit.sort_unstable();
@@ -475,7 +475,7 @@ impl KgPack {
         // ---- Stage 4: assembly with budget enforcement ----
         let t4 = if prof { Some(Instant::now()) } else { None };
         // Explicit `entity_ids` anchors are already verified to exist in Stage 1
-        // (internal review round 1, High-2), so this only guards the residual race of an
+        // This only guards the residual race of an
         // anchor deleted concurrently between resolution and this fetch, or a
         // neighbor entity that vanished the same way. Neighbors get the same
         // lenient "missing node reads as absent" convention `neighbors_with_query`

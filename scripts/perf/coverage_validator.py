@@ -8,10 +8,19 @@ the shape a checked-out `perf-data` branch's `bench-data/` directory would
 hold once PR 2+ start writing them) and reports, per manifest scenario,
 exactly one of five statuses:
 
-  measured        latest matching record is schema-valid, `status: "ok"`,
-                  measured through the manifest's declared surface, its
-                  `fixture_hash` matches the manifest, and it is within
-                  the scenario's freshness window.
+  measured        latest matching record is schema-valid, `status: "ok"`
+                  (which now also requires - for `"ok"` records only,
+                  khive#945 M3 - non-empty distributions whose `successes`
+                  clear `max(flagship_schema.TIMED_MIN_SUCCESSES, scenario
+                  min_successes)` - raise-only, 100-success global floor,
+                  khive#945 amendment §2.1 - error/timeout accounting
+                  fields, and `daemon_fallback_count == 0`), measured
+                  through the manifest's declared surface, its
+                  `fixture_hash` matches the manifest, its `artifact.name`/
+                  `artifact.sha256` are well-formed, it is within the
+                  scenario's freshness window, and (when `--artifacts-dir`
+                  is supplied) its raw artifact resolves inside that
+                  directory and exists with a matching sha256.
   stale           a measured-quality record exists but its age exceeds the
                   freshness window for the scenario's `runner_class`
                   (OQ7 ruling: 14 days self-hosted, 7 days hosted).
@@ -20,9 +29,28 @@ exactly one of five statuses:
                   manifest's declared `surface` for this scenario.
   confounded      the latest record exists but cannot be trusted as a
                   measurement: its own `status` is `"confounded"`,
-                  `"error"`, or `"insufficient_samples"`, its
-                  `workload.fixture_hash` does not match the manifest's
-                  `fixture_hash`, or it fails `flagship_schema.validate_record`.
+                  `"error"`, or `"insufficient_samples"` (a legitimately
+                  schema-valid state - non-`"ok"` records are exempt from
+                  the evidence requirements above precisely so honest
+                  failure evidence stays schema-valid without ever
+                  counting as measured), its `workload.fixture_hash` does
+                  not match the manifest's `fixture_hash`, it fails
+                  `flagship_schema.validate_record`, its `successes` fall
+                  below a scenario-declared `min_successes` raise, or its
+                  raw artifact is absent/invalid, escapes `--artifacts-dir`,
+                  is missing, or sha256-mismatches.
+
+Each scenario's report entry also carries `artifact_verification`, one of
+`"verified"`, `"hash_mismatch"`, `"missing"`, `"unverified"`, or `None`
+(only set once a scenario clears every other "measured" check).
+`"unverified"` means the raw artifact path was not locally resolvable in
+this run (no `--artifacts-dir` given, e.g. a CI run that only fetched the
+`*.jsonl` summaries) - it is recorded explicitly rather than silently
+passing as verified (khive#945 item 4). An absent/malformed `artifact.name`
+or `artifact.sha256`, or a `name` that resolves outside `--artifacts-dir`
+(`../` traversal or an absolute path), is reported `"missing"` instead -
+never `"unverified"` - and downgrades the scenario straight to confounded
+(khive#945 M1/M2).
 
 No manifest scenario is ever reported "measured" when the records
 directory is absent or empty - the coverage percentage is 0% in that case,
@@ -187,6 +215,13 @@ def load_manifest(path: pathlib.Path) -> tuple[dict, list[str]]:
         if not isinstance(sc["required_percentiles"], list) or not sc["required_percentiles"]:
             errors.append(f"{label}: required_percentiles must be a non-empty array")
 
+        if "min_successes" in sc and (
+            isinstance(sc["min_successes"], bool)
+            or not isinstance(sc["min_successes"], int)
+            or sc["min_successes"] <= 0
+        ):
+            errors.append(f"{label}: min_successes must be a positive integer, got {sc['min_successes']!r}")
+
     return data, errors
 
 
@@ -240,6 +275,69 @@ def _latest_record(records: list[dict], scenario_id: str) -> dict | None:
 
 def _freshness_window_days(runner_class: str) -> int:
     return FRESHNESS_DAYS_HOSTED if runner_class in HOSTED_RUNNER_CLASSES else FRESHNESS_DAYS_SELF_HOSTED
+
+
+ARTIFACT_VERIFICATION_STATES = ("verified", "hash_mismatch", "missing", "unverified")
+
+
+def verify_artifact(record: dict, artifacts_dir: pathlib.Path | None) -> tuple[str, str]:
+    """Resolve a measured record's `artifact.name` against `artifacts_dir` and
+    check existence + sha256. Returns (verification, reason).
+
+    `artifacts_dir` is the local directory a raw artifact file would be
+    checked out into (distinct from `--records-dir`, which holds the
+    summary `*.jsonl` ledger records). When `artifacts_dir` is None the raw
+    artifact path is not resolvable in this run (the common CI shape, where
+    only the jsonl summaries are fetched) - that is recorded as
+    `"unverified"`, not silently treated as passing, per khive#945 item 4.
+
+    `artifact.name`/`artifact.sha256` are checked for well-formedness
+    (non-empty name, 64-lowercase-hex sha256) before that `"unverified"`
+    fallback is ever reached (khive#945 M1) - an absent or invalid digest
+    downgrades straight to `"missing"` (which `compute_coverage` treats as
+    confounding) even when no `--artifacts-dir` was supplied.
+
+    The candidate path is resolved and required to remain below the
+    resolved `artifacts_dir` (khive#945 M2) - a `name` containing `../`
+    segments or naming an absolute path that escapes `artifacts_dir` is
+    treated as `"missing"` rather than read, so a record can never certify
+    an unrelated file outside the supplied directory as its evidence."""
+    artifact = record.get("artifact", {})
+    name = artifact.get("name") if isinstance(artifact, dict) else None
+    expected_sha = artifact.get("sha256") if isinstance(artifact, dict) else None
+
+    if not isinstance(name, str) or not name:
+        return "missing", "record's artifact.name is empty or invalid; no raw artifact path to resolve"
+    if not isinstance(expected_sha, str) or not flagship_schema.ARTIFACT_SHA256_RE.match(expected_sha):
+        return (
+            "missing",
+            f"record's artifact.sha256 {expected_sha!r} is not a valid 64-character lowercase hex digest",
+        )
+
+    if artifacts_dir is None:
+        return "unverified", "no --artifacts-dir supplied; raw artifact existence/hash was not checked locally"
+
+    resolved_dir = artifacts_dir.resolve()
+    candidate = (artifacts_dir / name).resolve()
+    try:
+        candidate.relative_to(resolved_dir)
+    except ValueError:
+        return (
+            "missing",
+            f"record's artifact.name {name!r} resolves to {candidate}, outside --artifacts-dir {resolved_dir}; refusing to read",
+        )
+
+    if not candidate.is_file():
+        return "missing", f"referenced raw artifact not found at {candidate}"
+
+    actual_sha = hashlib.sha256(candidate.read_bytes()).hexdigest()
+    if actual_sha != expected_sha:
+        return (
+            "hash_mismatch",
+            f"raw artifact at {candidate} hashes to {actual_sha!r}, record declares artifact.sha256 {expected_sha!r}",
+        )
+
+    return "verified", f"raw artifact verified at {candidate}"
 
 
 def _cohort_mismatches(scenario: dict, record: dict) -> list[str]:
@@ -344,6 +442,30 @@ def scenario_status(
     if cohort_mismatches:
         return "confounded", "; ".join(cohort_mismatches)
 
+    declared_min_successes = scenario.get("min_successes")
+    if declared_min_successes is not None:
+        # load_manifest rejects malformed values, but a programmatic caller can
+        # bypass it - a bad declaration must confound, never raise.
+        if (
+            isinstance(declared_min_successes, bool)
+            or not isinstance(declared_min_successes, int)
+            or declared_min_successes <= 0
+        ):
+            return (
+                "confounded",
+                f"scenario declares malformed min_successes {declared_min_successes!r} (must be a positive integer)",
+            )
+        required_successes = max(flagship_schema.TIMED_MIN_SUCCESSES, declared_min_successes)
+        for dist_name, dist in latest.get("distributions", {}).items():
+            successes = dist.get("successes") if isinstance(dist, dict) else None
+            if isinstance(successes, int) and successes < required_successes:
+                return (
+                    "confounded",
+                    f"distributions.{dist_name}.successes {successes} is below the scenario's required minimum "
+                    f"{required_successes} (max of the {flagship_schema.TIMED_MIN_SUCCESSES}-success floor and the "
+                    f"scenario's declared min_successes {declared_min_successes!r} - raise-only, never lowers the floor)",
+                )
+
     try:
         record_time = _parse_timestamp(latest["timestamp"])
     except (KeyError, ValueError):
@@ -357,13 +479,25 @@ def scenario_status(
     return "measured", f"latest record is {age_days:.1f} days old (within the {window_days}-day freshness window)"
 
 
-def compute_coverage(manifest: dict, records: list[dict], now: datetime.datetime) -> dict:
+def compute_coverage(
+    manifest: dict,
+    records: list[dict],
+    now: datetime.datetime,
+    artifacts_dir: pathlib.Path | None = None,
+) -> dict:
     scenarios = manifest.get("scenario", [])
     manifest_version, manifest_hash = current_manifest_identity(manifest)
     per_scenario = []
     counts = dict.fromkeys(STATUSES, 0)
     for sc in scenarios:
         status, reason = scenario_status(sc, records, now, manifest_version, manifest_hash)
+        artifact_verification = None
+        if status == "measured":
+            latest = _latest_record(records, sc["scenario_id"])
+            artifact_verification, artifact_reason = verify_artifact(latest, artifacts_dir)
+            if artifact_verification in ("missing", "hash_mismatch"):
+                status = "confounded"
+                reason = artifact_reason
         counts[status] += 1
         per_scenario.append(
             {
@@ -373,6 +507,7 @@ def compute_coverage(manifest: dict, records: list[dict], now: datetime.datetime
                 "runner_class": sc["runner_class"],
                 "status": status,
                 "reason": reason,
+                "artifact_verification": artifact_verification,
             }
         )
 
@@ -422,6 +557,14 @@ def main(argv: list[str] | None = None) -> int:
         "omit or point at a nonexistent path to get the 0%%-measured report",
     )
     ap.add_argument("--now", default=None, help="ISO8601 timestamp to use as 'now' (default: current UTC time)")
+    ap.add_argument(
+        "--artifacts-dir",
+        default=None,
+        help="directory of raw per-record artifact files (referenced by a record's artifact.name); "
+        "when supplied, a 'measured' scenario's raw artifact must exist and sha256-match or it is "
+        "downgraded to 'confounded'; when omitted, artifact_verification is reported as 'unverified' "
+        "rather than silently passing (e.g. CI runs that only fetch the *.jsonl summaries)",
+    )
     ap.add_argument("--format", choices=["json", "markdown"], default="markdown")
     ap.add_argument("--out", help="write the report to this path instead of stdout")
     ap.add_argument(
@@ -443,7 +586,8 @@ def main(argv: list[str] | None = None) -> int:
     now = _parse_timestamp(args.now) if args.now else datetime.datetime.now(datetime.timezone.utc)
     records_dir = pathlib.Path(args.records_dir) if args.records_dir else None
     records = load_records(records_dir)
-    report = compute_coverage(manifest, records, now)
+    artifacts_dir = pathlib.Path(args.artifacts_dir) if args.artifacts_dir else None
+    report = compute_coverage(manifest, records, now, artifacts_dir)
     report["manifest_errors"] = manifest_errors
 
     if args.format == "json":
