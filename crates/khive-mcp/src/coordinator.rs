@@ -307,6 +307,7 @@ pub(crate) mod tests {
                 save_to: None,
                 format: None,
                 format_per_op: None,
+                request_id: None,
             })
             .await;
 
@@ -336,6 +337,7 @@ pub(crate) mod tests {
                 save_to: None,
                 format: None,
                 format_per_op: None,
+                request_id: None,
             })
             .await;
 
@@ -374,6 +376,7 @@ pub(crate) mod tests {
                 save_to: None,
                 format: None,
                 format_per_op: None,
+                request_id: None,
             })
             .await
             .expect("T6d: dispatch must not return an MCP-level error");
@@ -437,6 +440,7 @@ pub(crate) mod tests {
                     save_to: None,
                     format: None,
                     format_per_op: None,
+                    request_id: None,
                 })
                 .await
                 .unwrap_or_else(|e| panic!("T6e case {label}: dispatch must not MCP-error: {e}"));
@@ -500,6 +504,7 @@ pub(crate) mod tests {
                     save_to: None,
                     format: None,
                     format_per_op: None,
+                    request_id: None,
                 })
                 .await
                 .unwrap_or_else(|e| panic!("T6f case {label}: dispatch must not MCP-error: {e}"));
@@ -557,6 +562,7 @@ pub(crate) mod tests {
                 save_to: None,
                 format: None,
                 format_per_op: None,
+                request_id: None,
             })
             .await;
 
@@ -595,6 +601,7 @@ pub(crate) mod tests {
                 save_to: None,
                 format: None,
                 format_per_op: None,
+                request_id: None,
             })
             .await
             .expect("T6e: dispatch must not return an MCP-level error");
@@ -643,6 +650,7 @@ pub(crate) mod tests {
                 save_to: None,
                 format: None,
                 format_per_op: None,
+                request_id: None,
             })
             .await
             .expect("T6e: dispatch must not return an MCP-level error");
