@@ -2,7 +2,7 @@
 
 use serde_json::Value;
 
-use khive_runtime::{NamespaceToken, RuntimeError, VerbRegistry};
+use khive_runtime::{KhiveRuntime, NamespaceToken, RuntimeError, VerbRegistry};
 use khive_storage::types::PageRequest;
 use khive_storage::EntityFilter;
 
@@ -15,6 +15,35 @@ use super::common::{
     resolve_kind_spec, resolve_uuid_async, to_json, validate_entity_type, KindSpec, ListParams,
 };
 use crate::KgPack;
+
+const ENTITY_LIST_CAP: u32 = 500;
+const NOTE_LIST_CAP: u32 = 200;
+const EVENT_LIST_CAP: u32 = 1000;
+
+fn effective_list_limit(requested: u32, cap: u32) -> u32 {
+    requested.min(cap)
+}
+
+fn render_list_response(items: Value, requested: u32, effective: u32) -> Value {
+    if requested <= effective {
+        return items;
+    }
+    serde_json::json!({
+        "items": items,
+        "requested_limit": requested,
+        "effective_limit": effective,
+        "limit_clamped": true,
+    })
+}
+
+fn add_list_limit_metadata(response: &mut Value, requested: u32, effective: u32) {
+    if requested <= effective {
+        return;
+    }
+    response["requested_limit"] = serde_json::json!(requested);
+    response["effective_limit"] = serde_json::json!(effective);
+    response["limit_clamped"] = serde_json::json!(true);
+}
 
 impl KgPack {
     pub(crate) async fn handle_list(
@@ -58,7 +87,8 @@ impl KgPack {
                 } else {
                     None
                 };
-                let limit = p.limit.unwrap_or(50).min(500);
+                let requested = p.limit.unwrap_or(50);
+                let limit = effective_list_limit(requested, ENTITY_LIST_CAP);
                 let offset = p.offset.unwrap_or(0);
                 let entities = if let Some(ref tag_list) = p.tags {
                     if tag_list.is_empty() {
@@ -115,7 +145,11 @@ impl KgPack {
                         )
                         .await?
                 };
-                Ok(normalize_entity_timestamps_array(to_json(&entities)?))
+                Ok(render_list_response(
+                    normalize_entity_timestamps_array(to_json(&entities)?),
+                    requested,
+                    limit,
+                ))
             }
             KindSpec::Edge => {
                 let source_id = match p.source_id.as_deref() {
@@ -139,7 +173,9 @@ impl KgPack {
                     min_weight: p.min_weight,
                     max_weight: p.max_weight,
                 };
-                let limit = p.limit.unwrap_or(100);
+                let requested = p.limit.unwrap_or(100);
+                let cap = KhiveRuntime::EDGE_LIST_MAX_LIMIT;
+                let limit = effective_list_limit(requested, cap);
                 if let Some(ref after_str) = p.after {
                     // An empty string opts into cursor-mode pagination while
                     // starting from the beginning of the set (no prior page).
@@ -156,17 +192,19 @@ impl KgPack {
                         .runtime
                         .list_edges_after(token, filter, after, limit)
                         .await?;
-                    Ok(serde_json::json!({
+                    let mut out = serde_json::json!({
                         "edges": to_json(&edges)?,
                         "next_after": next_after,
-                    }))
+                    });
+                    add_list_limit_metadata(&mut out, requested, limit);
+                    Ok(out)
                 } else {
                     let offset = p.offset.unwrap_or(0);
                     let edges = self
                         .runtime
                         .list_edges(token, filter, limit, offset)
                         .await?;
-                    to_json(&edges)
+                    Ok(render_list_response(to_json(&edges)?, requested, limit))
                 }
             }
             KindSpec::Note { specific } => {
@@ -176,7 +214,8 @@ impl KgPack {
                     |s| canonical_note_kind(s, registry),
                     "note_kind",
                 )?;
-                let limit = p.limit.unwrap_or(20).min(200);
+                let requested = p.limit.unwrap_or(20);
+                let limit = effective_list_limit(requested, NOTE_LIST_CAP);
                 let offset = p.offset.unwrap_or(0);
 
                 let has_msg_filter = p.thread_id.is_some()
@@ -325,15 +364,16 @@ impl KgPack {
                         })
                         .collect()
                 };
-                to_json(&remapped)
+                Ok(render_list_response(to_json(&remapped)?, requested, limit))
             }
             KindSpec::Proposal => unreachable!("kind=proposal fast-pathed before deser"),
             KindSpec::Event => {
-                let limit = p.limit.unwrap_or(100).clamp(1, 1000);
+                let requested = p.limit.unwrap_or(100).max(1);
+                let limit = effective_list_limit(requested, EVENT_LIST_CAP);
                 let offset = p.offset.unwrap_or(0);
                 let (filter, outcome) = event_filter_from_params(&p)?;
 
-                if let Some(wanted_outcome) = outcome {
+                let items = if let Some(wanted_outcome) = outcome {
                     let mut items = Vec::new();
                     let mut skipped = 0u32;
                     let mut raw_offset = 0u32;
@@ -381,7 +421,7 @@ impl KgPack {
                             break;
                         }
                     }
-                    Ok(normalize_event_timestamps_array(to_json(&items)?))
+                    items
                 } else {
                     let page = self
                         .runtime
@@ -394,8 +434,13 @@ impl KgPack {
                             },
                         )
                         .await?;
-                    Ok(normalize_event_timestamps_array(to_json(&page.items)?))
-                }
+                    page.items
+                };
+                Ok(render_list_response(
+                    normalize_event_timestamps_array(to_json(&items)?),
+                    requested,
+                    limit,
+                ))
             }
         }
     }

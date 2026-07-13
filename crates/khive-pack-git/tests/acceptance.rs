@@ -2237,17 +2237,39 @@ async fn issue_full_page_never_leaks_raw_updated_at_into_paging_floor() {
         "the persisted paging cursor must never contain the raw credential value: {cursor}"
     );
 
-    let issues_list = registry
-        .dispatch(
-            "list",
-            json!({"kind": "issue", "limit": (PAGE_LIMIT + 10) as u64}),
-        )
-        .await
-        .expect("list issues ok");
-    let items = issues_list.as_array().expect("array");
+    // `list` clamps over-cap requests and returns `{items, effective_limit, ..}`
+    // instead of a bare array (#894), so scan every persisted issue by paging.
+    let mut scanned = 0usize;
+    let mut offset = 0u64;
+    loop {
+        let page = registry
+            .dispatch(
+                "list",
+                json!({"kind": "issue", "limit": (PAGE_LIMIT + 10) as u64, "offset": offset}),
+            )
+            .await
+            .expect("list issues ok");
+        let items = match page.as_array() {
+            Some(items) => items.clone(),
+            None => page
+                .get("items")
+                .and_then(Value::as_array)
+                .expect("clamped list response must carry an items array")
+                .clone(),
+        };
+        assert!(
+            items.iter().all(|i| !i.to_string().contains(CREDENTIAL)),
+            "no persisted issue record may contain the raw credential value"
+        );
+        scanned += items.len();
+        if items.is_empty() {
+            break;
+        }
+        offset += items.len() as u64;
+    }
     assert!(
-        items.iter().all(|i| !i.to_string().contains(CREDENTIAL)),
-        "no persisted issue record may contain the raw credential value"
+        scanned >= PAGE_LIMIT,
+        "paging scan must cover every persisted issue: scanned {scanned}"
     );
 }
 

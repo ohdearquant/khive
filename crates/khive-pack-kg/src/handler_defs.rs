@@ -149,7 +149,13 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 18] = [
     // Assertive: retrieves and presents filtered records
     HandlerDef {
         name: "list",
-        description: "List records with optional filtering",
+        description: "List records with optional filtering. Requests within the kind's row cap \
+                      keep the existing array response. If limit exceeds the cap, the result is \
+                      {\"items\": [...], \"requested_limit\": N, \"effective_limit\": CAP, \
+                      \"limit_clamped\": true}. Edge cursor mode keeps its existing \
+                      {\"edges\": [...], \"next_after\": ...} shape and adds the same limit \
+                      metadata when clamped. Caps are entity 500, note 200, edge 1000, event \
+                      1000, and proposal 500.",
         visibility: Visibility::Verb,
         category: VerbCategory::Assertive,
         params: &[
@@ -163,7 +169,9 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 18] = [
                 name: "limit",
                 param_type: "integer",
                 required: false,
-                description: "Maximum records to return (default 20).",
+                description: "Maximum records to return (default varies by kind). Values above \
+                              the kind's server-side cap are clamped and return explicit \
+                              requested_limit, effective_limit, and limit_clamped metadata.",
             },
             ParamDef {
                 name: "offset",
@@ -182,10 +190,11 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 18] = [
                               previous page, or \"\" (empty string) to opt into cursor-mode pagination \
                               starting from the beginning of the set. Seeks via an indexed id range \
                               scan instead of OFFSET, so cost does not grow with depth. When set, the \
-                              response shape changes from a bare array to \
-                              {\"edges\": [...], \"next_after\": <uuid-or-null>}; next_after is \
-                              non-null while more rows remain. Mutually exclusive with offset-based \
-                              paging within a single walk.",
+                              response shape is \
+                              {\"edges\": [...], \"next_after\": <uuid-or-null>}; \
+                              next_after is non-null while more rows remain. Mutually exclusive with \
+                              offset-based paging within a single walk. Over-cap limits add the \
+                              limit metadata described on the verb.",
             },
             ParamDef {
                 name: "entity_kind",

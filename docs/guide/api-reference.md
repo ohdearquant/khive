@@ -217,6 +217,13 @@ List records with optional filtering.
 request(ops="list(kind=\"entity\", entity_kind=\"concept\", limit=20)")
 ```
 
+Requests within the kind's server-side row cap keep the existing array response. If `limit`
+exceeds the cap, the response is `{"items": [...], "requested_limit": N,
+"effective_limit": CAP, "limit_clamped": true}`. This lets offset-based clients advance by
+the effective limit instead of silently skipping rows. The caps are entity 500, note 200, edge
+1000, event 1000, and proposal 500. Edge cursor mode keeps its existing `{"edges": [...],
+"next_after": ...}` shape and adds the same limit metadata when clamped.
+
 ### `stats` — Assertive
 
 Return aggregate KG substrate counts (entities, edges, notes). No params.
