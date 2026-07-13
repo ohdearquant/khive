@@ -110,8 +110,8 @@ impl AtomicOpPlan {
     /// [`UpdatePlan`] carries a [`PostCommitEffect`] field for the `update`
     /// reindex caveat (ADR-099 D3). Since the B3 fix round (GAP-5),
     /// [`GtdTransitionPlan`]/[`GtdCompletePlan`] also carry one, for the
-    /// best-effort lifecycle audit row. Since the #750 fix-round 2 (codex
-    /// r2 High 2), [`DeletePlan`] also carries one, for the note-mutation
+    /// best-effort lifecycle audit row. Since #750, [`DeletePlan`] also
+    /// carries one, for the note-mutation
     /// hook fire on a committed note delete. Every other admissible verb's
     /// apply is pure DML with no deferred side effect. `merge`'s existing
     /// post-transaction vector re-insert (D3: "merge already performs its

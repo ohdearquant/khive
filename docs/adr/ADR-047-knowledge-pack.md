@@ -6,7 +6,7 @@
 
 ## Amendment (2026-06-10b): exclude_status precedence fix; auto-compose member filter; atom status taxonomy clarification
 
-Follow-up to the 2026-06-10 amendment (PR #90, round 2 review findings):
+Follow-up to the 2026-06-10 amendment (PR #90):
 
 - **`exclude_status` precedence corrected**: the parameter now works as documented.
   Precedence: explicit `status=` → no exclusion; else explicit `exclude_status=` → use it;

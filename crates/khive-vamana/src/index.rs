@@ -1599,8 +1599,8 @@ impl VamanaIndex {
             // back-edge j→ordinal ONLY IF j has a free slot (|adj(j)| < max_degree).
             // If j is already full, SKIP the back-edge entirely — do NOT call
             // robust_prune_inner(j) and do NOT drop any of j's existing edges.
-            // Pruning j's adjacency to make room is what caused the round-1 and
-            // round-2 orphan/disconnect defects.
+            // Pruning j's adjacency to make room is what caused earlier
+            // orphan/disconnect defects.
             //
             // Trade-off: skipping back-edges on saturated neighbors lowers incremental
             // graph quality on heavily-saturated graphs (ordinal becomes less
@@ -4420,7 +4420,7 @@ mod tests {
         );
     }
 
-    /// OOD fallback — deterministic ranking-flip fixture (ADR-052 §2 — R2 Finding 1).
+    /// OOD fallback — deterministic ranking-flip fixture (ADR-052 §2).
     ///
     /// Corpus: 10 fixed 2-D vectors in [0,1]×[0,1]. Global-scale codec: gs ≈ 0.00287
     /// (range anchored by the widest observed dim spread ~0.733). OOD query has
@@ -4536,7 +4536,7 @@ mod tests {
         );
     }
 
-    /// Equal-code collision test (ADR-052 §2 — Finding 3).
+    /// Equal-code collision test (ADR-052 §2).
     ///
     /// Forces two distinct f32 vectors to collide in u8 code space (low-dim corpus
     /// trained on [0, 1] quantizes differently from a corpus with range >> 1/255).
@@ -4640,7 +4640,7 @@ mod tests {
         );
     }
 
-    /// RobustPrune alpha-predicate regression (ADR-052 §2 — R2 Finding 2).
+    /// RobustPrune alpha-predicate regression (ADR-052 §2).
     ///
     /// Regression reproduction: when node AND multiple candidates all collapse to the same u8 code,
     /// d2_node_candidate from the SQ8 pool is 0. The strict-≤ check then reads

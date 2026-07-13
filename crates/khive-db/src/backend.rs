@@ -24,7 +24,7 @@ pub struct StorageBackend {
     /// executed against this backend's pool. Gates `notes_for_namespace` so
     /// the repair (a full `notes` scan) runs at most once per backend for
     /// the process's lifetime instead of on every store acquisition (khive
-    /// #827 round 4 perf finding). Also exposed via
+    /// #827). Also exposed via
     /// `notes_seq_repair_run_count` for regression tests.
     notes_seq_repair_runs: AtomicUsize,
 }
@@ -232,7 +232,7 @@ impl StorageBackend {
         // access to the single writer connection for this whole function,
         // so this load-then-run-then-store is race-free: no other caller on
         // this pool can observe or advance `notes_seq_repair_runs` while we
-        // hold the writer guard (khive #827 round 4 perf finding).
+        // hold the writer guard (khive #827).
         if self.notes_seq_repair_runs.load(Ordering::Relaxed) == 0 {
             note::repair_notes_seq(writer.conn())?;
             self.notes_seq_repair_runs.fetch_add(1, Ordering::Relaxed);
@@ -247,8 +247,7 @@ impl StorageBackend {
     /// How many times the lazy `notes_seq` anti-join repair has actually
     /// executed against this backend's pool. Exposed for regression tests
     /// asserting the repair runs at most once per backend for the process's
-    /// lifetime, not once per `notes_for_namespace` call (khive #827 round 4
-    /// perf finding).
+    /// lifetime, not once per `notes_for_namespace` call (khive #827).
     pub fn notes_seq_repair_run_count(&self) -> usize {
         self.notes_seq_repair_runs.load(Ordering::Relaxed)
     }

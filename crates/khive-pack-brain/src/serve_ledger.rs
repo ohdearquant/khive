@@ -144,7 +144,7 @@ pub async fn record_serve(
     match result {
         Ok(_) => Ok(true),
         Err(e) if e.is_unique_constraint_violation() => {
-            // internal review PR #583 round-1 Low: `is_unique_constraint_violation` fires
+            // PR #583: `is_unique_constraint_violation` fires
             // for ANY unique-index collision on this table — the intended
             // natural key `(namespace, target_id, query_class, served_at)`,
             // but also the `id TEXT PRIMARY KEY` column and any future unique

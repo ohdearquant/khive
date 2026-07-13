@@ -948,7 +948,7 @@ Deno.test(
       const harnessScript = await writeHarnessScript(dir);
 
       // Act: spawn subprocess, crash after entities renamed but before edges.
-      // This is the exact scenario codex observed: new entities.ndjson present,
+      // This is the exact scenario that surfaced during review: new entities.ndjson present,
       // missing live edges.ndjson, .bak files left, staging dir left.
       const exitCode = await runCrashHarness(
         harnessScript,
@@ -959,7 +959,7 @@ Deno.test(
       assertEquals(exitCode, 42, "subprocess should exit 42 at crash point");
 
       // Verify partial state: entities.ndjson has NEW content (renamed into place).
-      // This is the partial state codex found — prove we can recover from it.
+      // This is the partial state found — prove we can recover from it.
       const partialEntities = await Deno.readFile(join(dir, ".khive/kg/entities.ndjson"));
       assertEquals(
         partialEntities.length !== originalEntitiesBytes.length ||

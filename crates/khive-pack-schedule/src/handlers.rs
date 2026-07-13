@@ -270,7 +270,7 @@ fn validate_replayable_single_action(
 /// require `content`, and a bare `kind="entity"` requires an `entity_kind`
 /// (or a granular entity kind) to resolve a concrete kind. It also validates
 /// `entity_type` against the KG entity-type/subtype registry when present
-/// (round-3 review gap 1) — see `validate_entity_type_for_replay`.
+/// — see `validate_entity_type_for_replay`.
 /// `khive-pack-schedule` does not depend on `khive-pack-kg` (only as a
 /// dev-dependency for tests), so this reimplements the classification using
 /// `VerbRegistry::all_entity_kinds` / `all_note_kinds` — the same data
@@ -409,7 +409,7 @@ enum CreateKindClass {
 /// via `link`), `event` (immutable), `proposal` (create via `propose`), or
 /// an unrecognized kind string.
 ///
-/// Round-3 review (gap 2) found the pre-fix version skipped alias resolution
+/// The pre-fix version skipped alias resolution
 /// entirely, causing schedule-time false rejections (not a security hole)
 /// for legitimate KG-accepted spellings like `"paper"` and `"atom"`.
 fn classify_create_kind(
@@ -483,7 +483,7 @@ fn classify_create_kind(
 /// dev-dependency only, for tests), then fall back to the registry's merged
 /// entity-kind vocabulary (covers any further pack-declared additions).
 ///
-/// Round-3 review (gap 2) found the pre-fix version resolved neither alias
+/// The pre-fix version resolved neither alias
 /// set, causing schedule-time false rejections (not a security hole) for
 /// legitimate KG-accepted spellings like `"paper"` and `"atom"`.
 fn canonical_entity_kind_for_replay(
@@ -540,7 +540,7 @@ fn canonical_note_kind_for_replay(
 /// `entity_kind_resource_aliases_match_real_vocab` in `create_validation.rs`,
 /// which asserts this list against the live `khive-pack-kg` vocab (via the
 /// dev-dependency) so drift is caught in CI rather than silently reproducing
-/// a round-3-style false rejection.
+/// a similar false rejection.
 fn resource_alias_for_replay(normalized: &str) -> bool {
     matches!(
         normalized,

@@ -241,7 +241,7 @@ jobs:
       # actions/checkout@v4 above restored npm/kernel-*/bin/.gitkeep (it's tracked
       # in git so the bin/ dirs exist for new clones). actions/download-artifact
       # does not delete it. Remove it here so the published tarball ships only
-      # the platform binary, not the placeholder. (NEW-1 round-2 fix.)
+      # the platform binary, not the placeholder.
       - name: Remove .gitkeep placeholders before publish
         run: rm -f npm/kernel-*/bin/.gitkeep
 

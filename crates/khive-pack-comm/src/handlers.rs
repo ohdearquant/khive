@@ -640,7 +640,7 @@ pub(crate) async fn handle_thread(
         });
     }
 
-    // #494 / codex r1: `after` cursor — either a message id (short prefix or full
+    // #494: `after` cursor — either a message id (short prefix or full
     // UUID, resolved the same way `id` is) or an RFC 3339 timestamp. An id cursor
     // resolves to the full `(created_at, full_id)` tuple of the referenced note so
     // ties on equal microsecond timestamps are broken deterministically instead of
@@ -1006,7 +1006,7 @@ pub(crate) async fn handle_ingest(
     if let Some(ref kind) = p.channel_kind {
         props["channel_kind"] = json!(kind);
     }
-    // Generic transport-layer metadata passthrough (issue #448 Finding 2): merged
+    // Generic transport-layer metadata passthrough (issue #448): merged
     // additively so it can never clobber the identity/routing fields set above --
     // a key already present (from, to, from_actor, to_actor, direction, read,
     // thread_id, sent_at, subject, external_id, wire_message_id, wire_references,
@@ -1064,7 +1064,7 @@ pub(crate) async fn handle_ingest(
 /// into a single row.
 ///
 /// The three components are hashed as a JSON array of strings, NOT joined
-/// with a `:` delimiter (round-1 internal review, Medium finding). Namespaces
+/// with a `:` delimiter. Namespaces
 /// may themselves contain `:` (hierarchical namespace strings are explicitly
 /// allowed), so a delimiter-joined `format!("...:{a}:{b}:{c}")` is not an
 /// injective encoding: `(namespace="a:b", channel_kind="c", channel_slug="d")`
@@ -1975,7 +1975,7 @@ mod tests {
     };
     use serde_json::json;
 
-    // #606 round-1 internal review, Medium finding: a delimiter-joined
+    // #606: a delimiter-joined
     // `format!("...:{a}:{b}:{c}")` id encoding is not injective once
     // components may themselves contain `:` — these two distinct triples
     // both produced `"khive:channel_health:a:b:c:d"` under the pre-fix
@@ -2192,7 +2192,7 @@ mod tests {
 
     #[test]
     fn build_references_header_extends_existing_chain_of_two_or_more() {
-        // Finding 1 core spec: a reply whose parent has an existing References
+        // Core spec: a reply whose parent has an existing References
         // chain of 2+ ids must produce chain + parent Message-ID, not just the
         // immediate parent.
         let chain = Some("<grandparent1@example.com> <grandparent2@example.com>");

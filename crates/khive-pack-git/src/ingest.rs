@@ -1219,7 +1219,7 @@ struct MaskedIssueFields {
 /// governed enum (`hook::ISSUE_STATE_REASONS`, ADR-088 §3) at the masking
 /// boundary. `Rejected` never carries the raw string forward -- the ingest
 /// loop must reject the record with a warning that names only the field,
-/// never its value (round-3 codex finding: a credential-shaped `stateReason`
+/// never its value (a credential-shaped `stateReason`
 /// must never reach `report.warnings` or the hook's own error path).
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum StateReasonField {
@@ -1284,7 +1284,7 @@ fn canonical_issue_state_reason(raw: Option<String>) -> StateReasonField {
 
 /// Parses a GitHub issue timestamp into its canonical RFC3339 form. GitHub's
 /// API always returns valid RFC3339 timestamps; a value that fails to parse
-/// is untrusted/malformed input (round-2 codex finding: a credential-shaped
+/// is untrusted/malformed input (a credential-shaped
 /// string is exactly this case) and must never reach `properties` or the
 /// paging cursor as a raw string. On parse failure the field is rejected
 /// (becomes absent) and a warning is recorded -- without the raw value,
@@ -1708,7 +1708,7 @@ async fn ingest_issues(
         // including the sort and the paging cursor derivation below -- touches
         // it. A raw `GhIssue.updated_at` must never reach the sort comparator,
         // `last_updated_at`, or (via `decide_page_outcome`'s `Continue`) a
-        // future `gh --search updated:>=` argument (round-3 codex finding: a
+        // future `gh --search updated:>=` argument (a
         // credential-shaped `updatedAt` could otherwise sort last and leak
         // into process arguments through the paging floor).
         let mut masked_page: Vec<MaskedIssueFields> = page
@@ -2112,7 +2112,7 @@ mod truncation_tests {
     }
 }
 
-/// PR #816 Minor finding 4: `resolve_id`/`resolve_project_id` call the
+/// PR #816: `resolve_id`/`resolve_project_id` call the
 /// public `resolve_prefix_unfiltered` resolver without their own all-hex
 /// gate, so a `%`-bearing (or otherwise non-hex) `project` argument reached
 /// the bound `LIKE` pattern unfiltered. The runtime resolver boundary

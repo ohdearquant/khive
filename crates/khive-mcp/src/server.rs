@@ -336,7 +336,7 @@ impl KhiveMcpServer {
         // entity-type validation is active at the runtime layer for all write
         // paths, including direct `create_many` callers that bypass the handler.
         registry.call_register_entity_type_validators(&runtime);
-        // #750 fix-round 1: install pack-owned note-mutation hooks (currently
+        // #750: install pack-owned note-mutation hooks (currently
         // only khive-pack-memory's warm-ANN-cache invalidation) so KG's
         // update/delete verbs notify caching packs even though there is no
         // crate-level dependency between them.
@@ -1976,7 +1976,7 @@ mod tests {
         );
     }
 
-    // ── #823 finding 1: runtime `$prev` result depth guard ───────────────────
+    // ── #823: runtime `$prev` result depth guard ────────────────────────────
 
     /// Iteratively (no native recursion) wrap `leaf` in `depth` nested
     /// single-key objects, a synthetic stand-in for a pathologically deep

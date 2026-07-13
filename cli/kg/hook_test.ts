@@ -1,7 +1,7 @@
 /**
  * Integration tests for `khive kg hook` — ADR-056 §3 symlink model.
  *
- * Covers High finding from codex round-1 review:
+ * Covers a finding from review:
  *   - install writes tracked script + symlink (not direct file)
  *   - status reports symlink validity
  *   - uninstall removes symlink but preserves tracked script

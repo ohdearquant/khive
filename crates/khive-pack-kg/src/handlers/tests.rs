@@ -22,7 +22,7 @@ fn parse_relation_error_lists_all_relations() {
 //   null    → Some(None) (clear the value)
 //   number  → Some(Some(v)) (set to v)
 //
-// Regression for round-3 finding: the previous `Option<Value>` representation
+// Regression: the previous `Option<Value>` representation
 // collapsed absent and null into the same `None`, so JSON null could not
 // distinguish "clear" from "preserve" through the MCP wire surface.
 #[test]
@@ -340,7 +340,7 @@ fn search_params_min_score_absent_is_none() {
     );
 }
 
-// ---- Round-6: recursive walk_timestamps unit tests ----
+// ---- Recursive walk_timestamps unit tests ----
 
 #[test]
 fn walk_timestamps_converts_top_level_created_at() {
@@ -642,7 +642,7 @@ async fn valid_relations_hint_matches_real_validator_acceptance_across_all_entit
     }
 }
 
-// internal review round 1 High finding on #621: `valid_relations_for_entity_pair` only
+// #621: `valid_relations_for_entity_pair` only
 // matched `EndpointKind::EntityOfKind` pack rules, silently omitting
 // `EndpointKind::EntityOfType` rules such as khive-pack-formal's typed
 // `concept/theorem -> concept/definition` `depends_on` rule
@@ -674,7 +674,7 @@ async fn valid_relations_hint_covers_formal_pack_entity_of_type_rules() {
     );
     assert!(
         hinted.contains(&"depends_on"),
-        "#621 round-2: hint for concept/theorem->concept/definition must \
+        "#621: hint for concept/theorem->concept/definition must \
          include depends_on from khive-pack-formal's EntityOfType rule; \
          got: {hinted:?}"
     );
@@ -725,7 +725,7 @@ async fn valid_relations_hint_covers_formal_pack_entity_of_type_rules() {
 
     assert_eq!(
         hinted, expected,
-        "#621 round-2: hint set for typed concept/theorem->concept/definition \
+        "#621: hint set for typed concept/theorem->concept/definition \
          must equal the real validator's acceptance set; hinted={hinted:?} \
          expected={expected:?}"
     );
@@ -777,7 +777,7 @@ async fn valid_relations_hint_does_not_cover_gtd_note_scoped_rules() {
     );
 }
 
-// internal review round 1 Medium finding on #621: proves the GTD boundary on the REAL
+// #621: proves the GTD boundary on the REAL
 // `KgPack::handle_link` path with real task notes, not just rule presence in
 // `pack_edge_rules()`. A task->task relation outside GTD's declared
 // `depends_on` must fail with the substrate-mismatch error ("must be an

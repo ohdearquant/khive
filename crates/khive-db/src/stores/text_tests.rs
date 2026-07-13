@@ -16,7 +16,7 @@ fn setup_memory_store(table_key: &str) -> Fts5TextSearch {
     Fts5TextSearch::new(pool, false, table_key.to_string())
 }
 
-/// #397 Finding 2 regression fixture: the FTS5 `trigram` tokenizer, matching
+/// #397 regression fixture: the FTS5 `trigram` tokenizer, matching
 /// `StorageBackend::text()`'s production default (`backend.rs`) byte-for-byte
 /// (`tokenize = 'trigram'`), rather than the bare `ensure_fts5_schema` helper
 /// above, which omits `tokenize=` and so falls back to SQLite's own default
@@ -638,7 +638,7 @@ async fn test_search_with_hyphenated_and_dotted_queries_matches_literal_tokens()
     }
 }
 
-/// Round-2 codex re-review regression: `sanitize_fts5_token_group` must keep
+/// Regression: `sanitize_fts5_token_group` must keep
 /// the legacy-merged bareword alternative reachable for ordinary punctuated
 /// identifiers under `unicode61`. The merged form (`khivepackmemory`,
 /// `previd`) is content indexed before #397's split-terms change, or content
@@ -738,7 +738,7 @@ async fn test_search_matches_legacy_merged_and_punctuated_forms_exact_ids() {
     }
 }
 
-/// #397 Finding 2 regression: production defaults to the FTS5 `trigram`
+/// #397 regression: production defaults to the FTS5 `trigram`
 /// tokenizer (`backend.rs`'s `StorageBackend::text()`), and generic search
 /// (`operations.rs::search_notes`) queries it in `Plain` mode — neither of
 /// which the prior `unicode61`/`AnyTerm`-only coverage exercised. Assert
@@ -838,7 +838,7 @@ async fn test_search_trigram_punctuated_and_decimal_queries_matches_exact_ids() 
     }
 }
 
-/// #397 Finding 2 concrete broadening regression: a hyphenated date query
+/// #397 concrete broadening regression: a hyphenated date query
 /// under the trigram tokenizer must not collapse to matching every document
 /// that merely shares the year. `sanitize_fts5_token_group`'s split reading
 /// keeps the year term ("2026", 4 chars) fully discriminating under trigram;
@@ -892,7 +892,7 @@ async fn test_search_trigram_date_query_does_not_broaden_to_same_year() {
     }
 }
 
-/// #397 Finding 2 round-3 regression: a punctuated operand of an FTS5
+/// #397 regression: a punctuated operand of an FTS5
 /// operator expression (`NEAR(alpha-beta,5)`, `NOT(alpha-beta,5)`) makes the
 /// legacy-merged OR-alternative in `sanitize_fts5_token_group` collapse to
 /// multiple space-separated terms (`"alphabeta 5"`) instead of one bareword,
@@ -1989,7 +1989,7 @@ async fn upsert_documents_first_error_populated_on_item_failure() {
 /// the `KHIVE_WRITE_QUEUE` env var — that env var is process-global and this
 /// crate's other tests are NOT `#[serial]` against it, so a window where it
 /// is set here could leak into a concurrently-scheduled test's own pool
-/// construction (ADR-067 Fork C slice 2 round 2, LOW finding).
+/// construction (ADR-067 Component A).
 #[tokio::test]
 async fn upsert_documents_routes_through_writer_task_when_flag_enabled() {
     let table_key = "write_queue_flag_test";

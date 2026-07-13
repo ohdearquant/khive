@@ -149,7 +149,7 @@ export async function validate(repoRoot: string): Promise<ValidationResult> {
         continue;
       }
 
-      // Cross-check kind against schema (error, not warning — codex finding)
+      // Cross-check kind against schema (error, not warning)
       if (!schemaEntityKinds.has(entity.kind)) {
         errors.push({
           file: ENTITIES_FILE,
@@ -218,7 +218,7 @@ export async function validate(repoRoot: string): Promise<ValidationResult> {
         continue;
       }
 
-      // Cross-check relation against schema (error, not warning — codex finding)
+      // Cross-check relation against schema (error, not warning)
       if (!schemaRelations.has(edge.relation)) {
         errors.push({
           file: EDGES_FILE,

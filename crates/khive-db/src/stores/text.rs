@@ -393,7 +393,7 @@ const FTS5_TRIGRAM_MIN_SAFE_LEN: usize = 3;
 ///   OR would still admit its broadened matches. Retrieval stays correct
 ///   (still matches the right content, still discriminates) at the cost of
 ///   requiring adjacency for that token, which is the trade-off intended
-///   by the finding this fixes (khive #397 Finding 2): correctness over a
+///   by the fix (khive #397): correctness over a
 ///   marginally more lenient match.
 ///
 /// All emitted readings are additive OR-alternatives otherwise — the result

@@ -386,7 +386,7 @@ default without adding it to both a `Cargo.toml` dependency list and one of thes
 blocks means the pack is _never registered_ at runtime, regardless of what
 `RuntimeConfig::default()` says — `khive-mcp`'s dependency on `khive-pack-code` plus its
 `CodePack` anchor line, both added after the fact, are the concrete instance of this gap
-(khive#848 round 2 review Finding 3).
+(khive#848, finding 3).
 
 `cargo metadata` reports exactly one workspace binary target (`kkernel`); `khive-mcp` is a
 library consumed by that binary and by the `khive-mcp` server process it spawns, so today

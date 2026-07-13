@@ -473,11 +473,11 @@ mod tests {
         assert!(parse_header("   ").is_none());
     }
 
-    // --- Finding 1: quoted-string / CFWS-comment semicolons must not forge a method ---
+    // --- quoted-string / CFWS-comment semicolons must not forge a method ---
 
     #[test]
     fn parse_header_reason_quoted_semicolon_does_not_forge_dmarc_pass() {
-        // review #496 repro: a `;` inside a quoted reason= pvalue must never be
+        // A `;` inside a quoted reason= pvalue must never be
         // treated as a top-level segment boundary, so this must NOT produce a
         // dmarc method result at all -- the real result here is spf=fail.
         let parsed = parse_header(
@@ -522,7 +522,7 @@ mod tests {
         );
     }
 
-    // --- Finding 3: RFC 8601 method "/version" suffix must not fail closed ---
+    // --- RFC 8601 method "/version" suffix must not fail closed ---
 
     #[test]
     fn parse_header_dkim_version_suffix_is_stripped_before_matching() {
@@ -545,7 +545,7 @@ mod tests {
 
     #[test]
     fn parse_header_dkim_non_numeric_version_suffix_is_ignored_not_trusted_as_v1() {
-        // internal review round 2 evidence: a non-numeric "version" must never be silently
+        // A non-numeric "version" must never be silently
         // treated as the supported version 1 -- the whole resinfo must be ignored.
         let parsed = parse_header("mx.example.com; dkim/evil=pass header.d=example.com").unwrap();
         assert!(
@@ -1024,12 +1024,12 @@ mod tests {
         );
     }
 
-    // --- #501 remediation: tester-identified coverage gap (T09/T10) -- close
+    // --- #501 remediation: coverage gap (T09/T10) -- close
     // at the parse_header/props/alignment level, not just the tokenizer helper ---
 
     #[test]
     fn parse_header_escaped_quote_inside_quoted_property_does_not_forge_alignment() {
-        // T09 (test_501.md Finding 1): an escaped quote inside a quoted
+        // T09: an escaped quote inside a quoted
         // property value, followed by injected-looking key=value text still
         // inside the same quoted value, must never let that inner text become
         // its own property. Previously only exercised at the tokenizer-helper
@@ -1051,7 +1051,7 @@ mod tests {
 
     #[test]
     fn parse_header_escaped_backslash_before_quote_in_property_does_not_break_later_property() {
-        // T10 (test_501.md Finding 1): an escaped backslash immediately
+        // T10: an escaped backslash immediately
         // before the closing quote of a property value (pair-consumption
         // parity) must not create a premature token boundary that corrupts
         // the real, later property. Previously only exercised at the

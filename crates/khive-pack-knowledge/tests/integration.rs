@@ -1919,7 +1919,7 @@ async fn compose_returns_markdown_for_domain() {
     );
 }
 
-/// PR #816 Major finding 2: `knowledge.compose` accepts compact hex prefixes
+/// PR #816: `knowledge.compose` accepts compact hex prefixes
 /// for domains but must normalize them (`hex_prefix_to_uuid_pattern`) before
 /// binding the `LIKE` pattern — a >8-char compact prefix could not match the
 /// hyphenated `id` column before the fix.
@@ -1979,7 +1979,7 @@ async fn compose_resolves_domain_by_compact_hex_prefix_over_8_chars() {
     );
 }
 
-/// PR #816 Major finding 2: same normalization requirement for atom ids.
+/// PR #816: same normalization requirement for atom ids.
 #[tokio::test]
 async fn compose_resolves_atom_by_compact_hex_prefix_over_8_chars() {
     let f = pack(rt());
@@ -2027,7 +2027,7 @@ async fn compose_resolves_atom_by_compact_hex_prefix_over_8_chars() {
     );
 }
 
-/// PR #816 Major finding 2 (precedence): an all-hex slug must still win over
+/// PR #816 (precedence): an all-hex slug must still win over
 /// prefix interpretation. Atom B's slug is deliberately set to the same
 /// hex string as the first 16 chars of atom A's compact id — a value that
 /// is *also* a syntactically valid compact prefix. Because `compose` tries

@@ -31,9 +31,9 @@ contended at diagnosis time; the writer was simply slow underneath a bloated WAL
 timeouts during separate bursts. Root cause is squarely "something pinned the checkpoint
 boundary," not writer contention.
 
-### Internal review correction (this section replaces the original draft's Plank 1 basis)
+### Correction: revised Plank 1 basis (this section replaces the original draft's basis)
 
-An internal review of this ADR rejected the original mechanism on two Blockers, both
+Review of this ADR rejected the original mechanism on two points, both
 confirmed correct against the code:
 
 1. **An idle, returned autocommit connection does not pin a WAL snapshot.** The
@@ -111,7 +111,7 @@ caller (none exists in the tree today) or the entire backend opened via
 today's call graph, not a proven explanation for #580.**
 
 **(2b) Raw `SqlWriter`-held transactions: a second, separate caller-controlled-duration
-mechanism that bypasses `begin_tx` entirely (missed in the round-1 revision, confirmed by
+mechanism that bypasses `begin_tx` entirely (missed in the first revision, confirmed by
 a full-workspace grep for `BEGIN (IMMEDIATE|DEFERRED|EXCLUSIVE)` across every crate).**
 `begin_tx`/`SqliteTransaction` is not, in fact, "the one place in the codebase where
 transaction duration is fully caller-controlled." A separate, more common pattern
@@ -300,7 +300,7 @@ transaction regardless of which mechanism created it:
   edge-triggered pattern as `crossing_warn`, `checkpoint.rs:224-228`) once it exceeds
   `KHIVE_TX_WARN_SECS` (default **30s**; provisional, see Plank 0), including the entry's
   `label` if supplied.
-- **Cooperative stale-operation guard, not a lifetime bound (reworded after internal review:
+- **Cooperative stale-operation guard, not a lifetime bound (reworded:
   the original "hard cap" language overclaimed).** Once a registry entry's
   `opened_at.elapsed()` exceeds `KHIVE_TX_MAX_AGE_SECS` (default **120s**; provisional, see
   Plank 0):
@@ -367,7 +367,7 @@ transaction regardless of which mechanism created it:
 age/op-count recycling on `return_reader` (`pool.rs:434-454`) is retained exactly as
 designed, because it is harmless and still correct hygiene, but the ADR no longer claims
 it protects production file-backed traffic: it only ever executes for in-memory/test
-`ConnectionPool` instances (see the Round-1 correction above). State this explicitly so a
+`ConnectionPool` instances (see the correction above). State this explicitly so a
 future reader of this ADR does not re-inherit the false production claim.
 `KHIVE_READER_MAX_AGE_SECS` (default 300s) and `KHIVE_READER_MAX_OPS` (default 5000)
 config keys are retained under this narrowed scope.
@@ -648,7 +648,7 @@ independent of WAL page pressure either way — the sweep checks
 `khive_storage::tx_registry::oldest()`'s age against both thresholds and escalates to
 `tracing::warn!`/`tracing::error!` on each below→above crossing (edge-triggered, same debounce
 idiom as the WAL-pressure severity ladder — a sustained stale span logs once per rung, not once
-per tick). Round-2 fix (2026-07-12, same day): the sweep originally ran only on an Observed
+per tick). Fix (2026-07-12, same day): the sweep originally ran only on an Observed
 tick, which meant a registered `WriterGuard::transaction` span — holding the writer mutex for
 its entire registered lifetime — made the checkpoint tick observe `Skipped` and silently
 bypassed the sweep for exactly the scenario it exists to catch. The sweep now runs

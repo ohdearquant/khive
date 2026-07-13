@@ -1,4 +1,4 @@
--- V8: repair partially-populated `notes_seq` ledgers (khive #827 round 3).
+-- V8: repair partially-populated `notes_seq` ledgers (khive #827).
 --
 -- V7 (`007-notes-seq.sql`) backfilled `notes_seq` with an unconditional
 -- `INSERT OR IGNORE ... SELECT`, then recorded itself as applied in

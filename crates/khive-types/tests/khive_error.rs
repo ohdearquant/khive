@@ -311,7 +311,7 @@ mod serde_tests {
         );
     }
 
-    /// PR #549 round-2 Medium finding: a client-supplied `details_truncated`
+    /// PR #549: a client-supplied `details_truncated`
     /// pair must never be retained as an ordinary entry, even when the total
     /// pair count is within the 8-entry bound. Retaining it verbatim let a
     /// client-controlled value flow straight into `dropped_count()` via

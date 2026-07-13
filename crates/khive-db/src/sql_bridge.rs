@@ -450,7 +450,7 @@ impl khive_storage::SqlWriter for SqliteWriter {
         &mut self,
         script: String,
     ) -> khive_storage::types::StorageResult<()> {
-        // ADR-067 Component A (Fork C slice 2 round 2, BLOCKER A): unlike
+        // ADR-067 Component A: unlike
         // `execute_script`, this must NOT run inside the writer task's
         // per-request `BEGIN IMMEDIATE` — statements such as VACUUM are
         // rejected by SQLite inside any open transaction. Route through
@@ -834,7 +834,7 @@ impl khive_storage::SqlWriter for InlineWriter {
 /// this module drives an [`InlineWriter`], whose methods are pure
 /// synchronous rusqlite calls with no real `.await` point.
 ///
-/// ADR-067 Component A, Fork C slice 2 round 2 (HIGH finding): this used to
+/// ADR-067 Component A: this used to
 /// `unreachable!()`-panic on `Poll::Pending`, and a panicking closure
 /// running inside the writer task's `spawn_blocking` (see
 /// `SqlBridge::atomic_unit`'s flag-on branch) would surface as a
@@ -1027,7 +1027,7 @@ impl khive_storage::SqlAccess for SqlBridge {
                         // StorageError>` (outer = "did the future actually
                         // resolve on first poll", inner = the op's own
                         // `StorageResult`) instead of panicking on `Pending`
-                        // (HIGH finding, ADR-067 Fork C slice 2 round 2). Either
+                        // (ADR-067 Component A). Either
                         // error flows through this closure's ordinary `Err`
                         // return, which `WriteRequest::execute_and_reply`
                         // already turns into a normal ROLLBACK + error reply —
@@ -1207,7 +1207,7 @@ mod tests {
         );
     }
 
-    /// ADR-067 Component A, Fork C slice 2 round 2 (HIGH finding): before
+    /// ADR-067 Component A: before
     /// this fix, `block_on_sync` (this file) `unreachable!()`-panicked if
     /// an `atomic_unit` closure's future was `Pending` on its first poll.
     /// That panic ran inside the writer task's own `spawn_blocking` frame

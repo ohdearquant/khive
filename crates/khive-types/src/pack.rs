@@ -407,7 +407,7 @@ const ATOMIC_EMBEDDING_BEARING_VERBS: &[&str] = &[
 ///   fix-round refinement) over shipping a partially-scoped atomic merge.
 ///   `merge` stays admissible under the *non-atomic* verb.
 ///
-/// B3 fix round (codex REJECT, Medium finding — governance verbs): this set
+/// ADR-099 B3 (governance verbs): this set
 /// previously passed the static pre-runtime admissibility check (since it's a
 /// subset of `ATOMIC_ADMISSIBLE_VERBS`) and only failed later, inside
 /// `atomic_prepare::prepare_op`, AFTER `KhiveRuntime::new` had already run.
@@ -657,7 +657,7 @@ mod tests {
 
     #[test]
     fn atomic_known_unimplemented_verbs_rejected_before_runtime() {
-        // B3 fix round (codex REJECT, Medium finding): propose/review/withdraw
+        // ADR-099 B3: propose/review/withdraw
         // remain on ATOMIC_ADMISSIBLE_VERBS (ADR-099 D3 intends them to gain a
         // seam) but must be rejected at this SAME static pre-runtime guard —
         // not admitted here and only failed later inside

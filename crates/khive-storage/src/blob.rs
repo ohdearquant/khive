@@ -30,7 +30,7 @@ const CONTENT_REF_HEX_LEN: usize = 64;
 /// `Deserialize` is implemented by hand (below), routing every input through
 /// [`ContentRef::from_hex`] — deriving it under `#[serde(transparent)]` would
 /// construct a `ContentRef` from any string, including one that is not 64
-/// lowercase hex characters (round-2 codex High finding: an unvalidated
+/// lowercase hex characters (an unvalidated
 /// value reaching `shard_path`'s `[0..2]`/`[2..4]` slices panics).
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 #[serde(transparent)]
@@ -174,8 +174,7 @@ pub trait BlobStore: Send + Sync + 'static {
     /// Returns `true` when an object was actually removed, `false` when
     /// none existed — deleting an absent object is not an error.
     ///
-    /// # Concurrency hazard — offline-maintenance-only (ADR-111 §8, amended
-    /// round 2)
+    /// # Concurrency hazard — offline-maintenance-only (ADR-111 §8, amended)
     ///
     /// `delete` performs an unconditional physical removal with **no
     /// coordination against any entity that might reference
@@ -196,8 +195,7 @@ pub trait BlobStore: Send + Sync + 'static {
     /// returns `StorageError::Unsupported`; the filesystem backend
     /// overrides it with a real directory walk. No silent no-op.
     ///
-    /// # Concurrency hazard — offline-maintenance-only (ADR-111 §8, amended
-    /// round 2)
+    /// # Concurrency hazard — offline-maintenance-only (ADR-111 §8, amended)
     ///
     /// `config.live_refs` is a **snapshot** the caller assembled before this
     /// call. `orphan_sweep` has no way to detect a `content_ref` that
@@ -311,7 +309,7 @@ mod tests {
 
     #[test]
     fn deserialize_rejects_short_string() {
-        // The exact repro from the round-2 codex finding: a naive derived
+        // The exact repro that motivates a hand-written impl: a naive derived
         // `Deserialize` would construct `ContentRef("x")` here, and any
         // caller passing it to `get`/`exists`/`delete` would then panic in
         // `shard_path`'s `[0..2]`/`[2..4]` slices.

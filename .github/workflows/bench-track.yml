@@ -250,9 +250,9 @@ jobs:
         env:
           KKERNEL_BENCH_BINARY: crates/target/release/kkernel-bench
         # Captures bench_track.py's own exit code instead of failing the
-        # step outright (round-3 finding: this step failing before publish
-        # ran meant an already-written error record never reached
-        # perf-data). See the "Fail job" step at the end of this job.
+        # step outright (this step failing before publish ran meant an
+        # already-written error record never reached perf-data). See the
+        # "Fail job" step at the end of this job.
         run: |
           set +e
           python3 scripts/perf/bench_track.py record \

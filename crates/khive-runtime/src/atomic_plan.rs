@@ -143,8 +143,8 @@ pub enum PostCommitEffect {
         namespace: String,
     },
     /// A committed note delete (soft or hard) — fire the pack-installed
-    /// note-mutation hook with the deleted note's kind (#750 fix-round 2,
-    /// codex r2 High 2: `DeletePlan` previously carried no `post_commit`
+    /// note-mutation hook with the deleted note's kind (#750:
+    /// `DeletePlan` previously carried no `post_commit`
     /// slot at all, so an atomic note delete never reached
     /// `KhiveRuntime::fire_note_mutation_hook`, unlike `operations.rs`'s
     /// `delete_note`, which fires it directly after a successful row
@@ -155,7 +155,7 @@ pub enum PostCommitEffect {
 }
 
 /// The natural key a committed symmetric edge update's surviving row must
-/// be looked up by (ADR-099 B3 r9, codex r8 Blocker finding 1, second
+/// be looked up by (ADR-099 B3, second
 /// half). `khive-db`'s `edge_symmetric_refresh_or_update_inplace_statement`
 /// pair never trusts a prepare-time-computed target id (see that builder's
 /// doc comment); a caller rendering this op's result derives the actual

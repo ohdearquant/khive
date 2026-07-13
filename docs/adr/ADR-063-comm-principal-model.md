@@ -345,7 +345,7 @@ per-lambda namespace partitions). The correct fix for cross-machine is Step 3 (r
 Reopen the ADR-007 Rev 3 "all packs no-carry" ruling specifically for the comm pack, allowing
 comm to use the actor namespace as the storage namespace for message rows.
 
-Rejected. ADR-007 Rev 3 was an accepted design decision after internal review that
+Rejected. ADR-007 Rev 3 was an accepted design decision that
 found per-pack actor routing to be a contradiction of Rule 0. Reopening it for one pack would
 require re-arguing the same ground and would leave the decision unstable. The Rule 8 carve-out
 is the correct mechanism: it permits a different backend, not a different namespace routing

@@ -340,7 +340,7 @@ fn batch_append_events_dml(
 /// prepare path (which needs plain-data statements it can fold into a
 /// synchronous commit-phase plan, not an async writer call) build on this
 /// function rather than each hand-writing the INSERT text — the divergence
-/// that produced the ADR-099 B3 round-4 finding this cut fixes.
+/// that produced the drift this cut fixes.
 pub fn event_insert_statements(event: &Event) -> Result<Vec<SqlStatement>, rusqlite::Error> {
     let id_str = event.id.to_string();
     let substrate_str = event.substrate.name().to_string();
@@ -679,8 +679,8 @@ fn decode_signal_observation(event: &Event) -> Result<Vec<EventObservation>, rus
         event_id: event.id,
         entity_id,
         // ADR-041 permits both entity and note signal targets. `brain.feedback`
-        // threads the resolved target's substrate onto the event (Finding 1,
-        // round-1 codex review of #831); pre-fix events all carry the old
+        // threads the resolved target's substrate onto the event (#831);
+        // pre-fix events all carry the old
         // `SubstrateKind::Event` placeholder and fall back to Entity, matching
         // the decoder's prior hard-coded behavior for that historical data.
         referent_kind: if event.substrate == SubstrateKind::Note {

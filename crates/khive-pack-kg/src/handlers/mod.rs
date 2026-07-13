@@ -26,7 +26,7 @@ pub(crate) use common::{canonical_entity_kind, canonical_note_kind, parse_relati
 /// `kkernel::atomic_apply::validate_atomic_args`.
 pub use params::{DeleteParams, LinkParams, UpdateParams};
 
-/// ADR-099 B3 fix round 5 (findings 1, 3, 4): re-exported as real `pub`
+/// ADR-099 B3 (findings 1, 3, 4): re-exported as real `pub`
 /// paths so `kkernel`'s `--atomic` seam can resolve kinds/ids and render
 /// result payloads through the exact canonical logic `handle_update`/
 /// `handle_delete`/`handle_link` use, rather than reimplementing it.

@@ -1,7 +1,7 @@
 /**
  * Tests for runValidate() exit codes and --strict / --no-rules / --format json.
  *
- * Covers High findings from codex round-1 review of PR #134:
+ * Covers findings from the PR #134 review:
  *   - Exit code 2 for malformed rules.yaml (Blocker)
  *   - JSON output matches ADR-056 contract (Medium)
  *   - --strict raises exit code for warnings

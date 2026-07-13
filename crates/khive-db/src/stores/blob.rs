@@ -67,7 +67,7 @@ pub fn resolve_blob_root(
 /// Whether writing `required_write_bytes` more bytes to a volume currently
 /// reporting `available` free bytes would leave it below `floor_bytes`.
 ///
-/// Pure and filesystem-independent on purpose (round-2 High finding): the
+/// Pure and filesystem-independent on purpose: the
 /// exact boundary this guards — `available == floor_bytes + 1` must still
 /// refuse a 2-byte write, because a floor-only check (`available <
 /// floor_bytes`) does not account for the pending write's own size — is unit
@@ -182,8 +182,8 @@ fn walk_blob_files(root: &Path) -> std::io::Result<Vec<(ContentRef, PathBuf)>> {
 /// A `Mutex` field scoped to one `FsBlobStore` instance does NOT serialize
 /// writes across independently constructed stores for the same root — and
 /// callers construct fresh stores for the same root routinely
-/// (`StorageBackend::blob_store` builds a new `FsBlobStore` on every call;
-/// round-2 High finding). Keying a shared `Arc<tokio::sync::Mutex<()>>` by
+/// (`StorageBackend::blob_store` builds a new `FsBlobStore` on every call).
+/// Keying a shared `Arc<tokio::sync::Mutex<()>>` by
 /// the filesystem's own canonical path closes that gap: every `FsBlobStore`
 /// for the same root, however many separate `new` calls produced them,
 /// resolves to the exact same lock.
@@ -217,8 +217,8 @@ pub struct FsBlobStore {
     root: PathBuf,
     floor_bytes: u64,
     /// Shared per-canonical-root guard (see `write_lock_for_root`) that
-    /// serializes the check-then-publish critical section of `put` — round-2
-    /// High finding: without this, two puts (whether on the same
+    /// serializes the check-then-publish critical section of `put`: without
+    /// this, two puts (whether on the same
     /// `FsBlobStore` instance or two independently constructed ones for the
     /// same root) can each observe the same pre-write `available_space`
     /// snapshot, each pass their own write-size-aware floor check against
@@ -259,8 +259,8 @@ impl FsBlobStore {
 #[async_trait]
 impl BlobStore for FsBlobStore {
     async fn put(&self, bytes: Vec<u8>) -> StorageResult<ContentRef> {
-        // OWNED guard, MOVED into the blocking closure below (round-2 High
-        // finding, part 2): a guard merely borrowed here and held in this
+        // OWNED guard, MOVED into the blocking closure below: a guard merely
+        // borrowed here and held in this
         // async fn's own stack frame would be released the instant the
         // *outer* `put` future is cancelled or dropped, while an
         // already-started `spawn_blocking` closure keeps running on its own
@@ -271,7 +271,7 @@ impl BlobStore for FsBlobStore {
         let owned_guard = self.write_lock.clone().lock_owned().await;
         let root = self.root.clone();
         let floor_bytes = self.floor_bytes;
-        // Round-3 Medium (codex r3, PR #922): `sync_hook::take` is the
+        // `sync_hook::take` (added for PR #922) is the
         // test-only seam that lets regression tests observe/control
         // exactly when this call is inside the guarded section, replacing
         // fixed-sleep/fixed-duration-poll timing assumptions with
@@ -382,12 +382,12 @@ impl BlobStore for FsBlobStore {
 }
 
 /// Test-only synchronization seam into `put`'s write-lock-guarded critical
-/// section (round-3 Medium finding, codex r3 on PR #922).
+/// section (added for PR #922).
 ///
-/// The round-2 regression tests proved mutual exclusion and cancellation-
+/// The prior regression tests proved mutual exclusion and cancellation-
 /// safety with a fixed sleep before racing/aborting and a fixed-duration
 /// poll loop waiting for the lock to free -- timing-dependent, and the poll
-/// loop actually failed once in codex's own required-suite run (a flaky
+/// loop actually failed once in a required-suite run (a flaky
 /// gate, not a real regression). This seam replaces both edges of the race
 /// with event-driven coordination: a one-shot hook, queued per canonical
 /// root, signals `reached` the instant execution is inside the guarded
@@ -464,7 +464,7 @@ mod tests {
 
     /// Block on `rx.recv()` on a dedicated thread so a `#[tokio::test]`
     /// (current-thread runtime) doesn't stall other spawned tasks while
-    /// waiting on a `sync_hook` signal. Round-3 Medium: the deterministic,
+    /// waiting on a `sync_hook` signal: the deterministic,
     /// event-driven replacement for fixed-sleep / fixed-duration-poll
     /// assertions.
     async fn recv_blocking(rx: std::sync::mpsc::Receiver<()>) -> bool {
@@ -560,7 +560,7 @@ mod tests {
 
     #[test]
     fn crosses_floor_is_write_size_aware_at_the_exact_boundary() {
-        // Round-2 High, codex's own example verbatim: `available ==
+        // Exact-boundary case, verbatim from the report: `available ==
         // floor_bytes + 1` must still refuse a 2-byte write. A floor-only
         // check (`available < floor_bytes`) would NOT catch this — 101 is
         // not below 100 — but the write's own size must be subtracted first.
@@ -626,7 +626,7 @@ mod tests {
 
     #[tokio::test]
     async fn concurrent_puts_cannot_jointly_breach_the_floor_via_a_stale_snapshot() {
-        // Round-2 High: pin the floor so at most ONE `payload_len`-sized
+        // Pin the floor so at most ONE `payload_len`-sized
         // write may land before the floor is crossed. Fire two DIFFERENT
         // (non-deduping) payloads of that size concurrently. Before the
         // per-root `write_lock`, both puts could independently read the SAME
@@ -685,7 +685,7 @@ mod tests {
 
     #[tokio::test]
     async fn concurrent_puts_from_two_independently_constructed_stores_share_the_root_lock() {
-        // Round-2 High, part 1 -- the actual gap in the round-2 fix: the
+        // The actual gap in the prior fix: the
         // test above uses ONE `FsBlobStore` behind a shared `Arc`, so it
         // exercises only the per-instance mutex and cannot catch a missing
         // cross-instance guarantee. `StorageBackend::blob_store` constructs
@@ -696,9 +696,9 @@ mod tests {
         // exact scenario would have let both puts pass the same free-space
         // snapshot.
         //
-        // Round-3 Medium (codex r3): the earlier version of this test let
+        // The earlier version of this test let
         // two real `tokio::spawn`ed puts race with no control over
-        // interleaving -- it could PASS on the round-2 per-instance-mutex
+        // interleaving -- it could PASS on the prior per-instance-mutex
         // bug purely because the blocking thread pool happened to run them
         // sequentially, which is not a deterministic regression guard.
         //
@@ -721,7 +721,7 @@ mod tests {
         // `concurrent_puts_cannot_jointly_breach_the_floor_via_a_stale_snapshot`
         // (same-instance) and the pure `crosses_floor` unit tests above.
         //
-        // Round-4 Medium (codex r4): the round-3 fix's negative proof (B
+        // The prior fix's negative proof (B
         // must not reach its own checkpoint) still leaned on a 200ms
         // `recv_timeout` as the CORRECTNESS decision -- under sufficiently
         // delayed scheduling, old per-instance-mutex code's B could simply
@@ -783,7 +783,7 @@ mod tests {
 
     #[tokio::test]
     async fn aborting_the_outer_put_future_does_not_release_the_guard_before_persist_completes() {
-        // Round-2 High, part 2: the round-2 fix held the write guard only
+        // The prior fix held the write guard only
         // in `put`'s own async stack frame (`let _write_guard = ...
         // .lock().await`) while the `spawn_blocking` closure captured just
         // root/floor_bytes/bytes. Cancelling/dropping the outer `put`
@@ -792,10 +792,10 @@ mod tests {
         // a second put could then pass its floor check while the first
         // write was still landing.
         //
-        // Round-3 Medium (codex r3): the earlier version of this test
+        // The earlier version of this test
         // proved the fix with a fixed 10ms sleep before abort and a fixed
         // 500x10ms poll loop waiting for the lock to free -- and the poll
-        // loop actually FAILED once in codex's own required-suite run (a
+        // loop actually FAILED once in a required-suite run (a
         // flaky gate, not a regression). This version uses the `sync_hook`
         // seam instead: `reached` fires only once execution is genuinely
         // inside the guarded closure (owned guard already moved in) and
@@ -855,7 +855,7 @@ mod tests {
 
     #[tokio::test]
     async fn orphan_sweep_race_demonstrates_the_documented_quiescence_requirement() {
-        // Round-2 High: `orphan_sweep` and `delete` are documented
+        // `orphan_sweep` and `delete` are documented
         // (`BlobStore::orphan_sweep`'s doc comment, ADR-111 §8) as
         // offline-maintenance-only APIs that require the caller to quiesce
         // entity writes for the duration of snapshot-plus-sweep, because

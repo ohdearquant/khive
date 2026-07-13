@@ -16,7 +16,7 @@ use tokio::sync::Mutex;
 
 const TOKEN_REFRESH_TIMEOUT: Duration = Duration::from_secs(15);
 
-// ──────────────────────────── OAuth error-body sanitization (Finding 1)
+// ──────────────────────────── OAuth error-body sanitization
 
 /// Allowlisted OAuth 2.0 error codes from RFC 6749 §5.2 and Microsoft AADSTS.
 ///
@@ -348,7 +348,7 @@ mod tests {
         );
     }
 
-    // ── Finding 1 regression: sanitize_oauth_error must not leak the body ────
+    // ── Regression: sanitize_oauth_error must not leak the body ─────────────
 
     /// A token-endpoint error body containing credential-shaped strings, a CRLF
     /// sequence, and bearer-looking text must produce a sanitized indicator that
@@ -419,7 +419,7 @@ mod tests {
         assert_eq!(sanitize_oauth_error(""), "oauth_error");
     }
 
-    // ── Finding 2: validate_token_response rejects dangerous token values ────
+    // ── validate_token_response rejects dangerous token values ─────────────
 
     /// A token that contains a control character (\x01 is the XOAUTH2 delimiter)
     /// must be rejected before being cached or used in a SASL payload.

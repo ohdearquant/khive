@@ -119,7 +119,7 @@ async fn fixture() -> (KhiveRuntime, NamespaceToken, VerbRegistry) {
     // `KhiveRuntime`'s pack-installed entity-type validator (the
     // `create_many` defense-in-depth layer) is never wired, so a test built
     // on a fixture that skips it would still pass even if that runtime-layer
-    // aggregate were absent or builtin-only (PR #925 codex r1, M3).
+    // aggregate were absent or builtin-only (PR #925).
     registry.call_register_entity_type_validators(&rt);
     registry.apply_schema_plans(rt.backend());
     let token = rt.authorize(Namespace::local()).expect("authorize local");
@@ -760,7 +760,7 @@ async fn ingest_leaves_clean_issue_title_unmasked() {
     );
 }
 
-/// PR #835 round-1 codex finding: the runtime secret gate recursively scans
+/// PR #835: the runtime secret gate recursively scans
 /// every string in `properties` (not just `title`), so a credential-shaped
 /// label name previously tripped the gate on `create()` even after the
 /// title was masked, silently dropping the whole issue note.
@@ -927,7 +927,7 @@ async fn ingest_masks_credential_shaped_issue_author_login_without_dropping_note
     );
 }
 
-/// PR #835 round-2 codex finding (Major): `created_at`/`closed_at` bypassed
+/// PR #835: `created_at`/`closed_at` bypassed
 /// `MaskedIssueFields` entirely and entered `properties` as arbitrary raw
 /// strings, so a credential-shaped `createdAt` tripped the runtime's
 /// recursive secret-gate scan on `properties` and silently dropped the
@@ -1010,7 +1010,7 @@ async fn ingest_rejects_credential_shaped_issue_created_at_without_dropping_note
 }
 
 /// Sibling of the `createdAt` regression above, for `closedAt` (ingest.rs
-/// line ~1550 in the round-2 finding).
+/// line ~1550).
 #[tokio::test]
 async fn ingest_rejects_credential_shaped_issue_closed_at_without_dropping_note() {
     let _guard = ENV_MUTEX.lock().await;
@@ -1085,7 +1085,7 @@ async fn ingest_rejects_credential_shaped_issue_closed_at_without_dropping_note(
 }
 
 /// `updatedAt` is not stored in `properties` at all -- it is only used to
-/// advance the paging cursor (ingest.rs line ~1632 in the round-2 finding).
+/// advance the paging cursor (ingest.rs line ~1632).
 /// A credential-shaped `updatedAt` must still not drop the issue, and the
 /// cursor persisted to `git_mirror_cursor` must never contain the raw
 /// value; it must advance only from a sibling record's validated,
@@ -1645,7 +1645,7 @@ async fn issue_hook_rejects_ungoverned_state_reason() {
     );
 }
 
-/// Round-3 codex finding (Major): before this fix, the masking boundary only
+/// Before this fix, the masking boundary only
 /// lowercased `stateReason` -- validation against the governed enum was left
 /// entirely to `IssueLikeHook::prepare_create`, whose error interpolated the
 /// raw value verbatim (`"issue properties.state_reason {reason:?} invalid"`).
@@ -1762,7 +1762,7 @@ async fn commit_hook_requires_properties_sha() {
     assert!(format!("{err}").contains("sha"));
 }
 
-// ── project-scoped idempotency (review round-1 [High] #1) ──────────────────
+// ── project-scoped idempotency ──────────────────────────────────────────
 
 /// GitHub issue/PR numbers are repository-scoped: two different `project`
 /// entities can each have a `#1`. Both a direct `find_by_number` collision
@@ -1897,8 +1897,7 @@ async fn issue_and_pr_idempotency_is_scoped_per_project() {
     );
 }
 
-// ── gh boundary contract + per-record warning aggregation (review round-1
-//    [High] #2, [Medium] #3, [Medium] #4) ───────────────────────────────────
+// ── gh boundary contract + per-record warning aggregation ───────────────────
 
 /// End-to-end over a PATH-shadowing fake `gh`: locks the four demo-found
 /// regression classes ((a) no `-C`, correct cwd; (b) empty `stateReason`
@@ -2031,7 +2030,7 @@ async fn gh_boundary_contract_and_partial_ingest_failure() {
         );
     }
 
-    // (b)/(c)/(d) + Finding 2: pull_request properties use base_ref/head_ref.
+    // (b)/(c)/(d): pull_request properties use base_ref/head_ref.
     let issues_list = registry
         .dispatch("list", json!({"kind": "issue", "limit": 20}))
         .await
@@ -2111,7 +2110,7 @@ async fn gh_boundary_contract_and_partial_ingest_failure() {
     );
 }
 
-// ── round-3 codex finding (Major): raw `updatedAt` must never reach the
+// ── raw `updatedAt` must never reach the
 //    paging floor via a full page ─────────────────────────────────────────
 
 /// Before this fix, `ingest_issues` sorted the raw `Vec<GhIssue>` and derived
@@ -2252,8 +2251,7 @@ async fn issue_full_page_never_leaks_raw_updated_at_into_paging_floor() {
     );
 }
 
-// ── unsorted `gh` output must not desync the frozen-cursor retry guarantee
-//    (review round-2 [Medium]) ───────────────────────────────────────────────
+// ── unsorted `gh` output must not desync the frozen-cursor retry guarantee ──
 
 /// Reads the git-ingest cursor row directly, mirroring `ingest.rs`'s private
 /// `read_cursor` — the acceptance tests otherwise only observe cursor state
@@ -2281,8 +2279,8 @@ async fn read_git_cursor(rt: &KhiveRuntime, project_id: Uuid, kind: &str) -> Opt
     })
 }
 
-/// `gh issue list` / `gh pr list` make no ordering guarantee (review round-2
-/// [Medium]): the frozen-cursor retry contract only holds if records are
+/// `gh issue list` / `gh pr list` make no ordering guarantee: the
+/// frozen-cursor retry contract only holds if records are
 /// walked in nondecreasing `updatedAt` order, so unsorted `gh` output can let
 /// a later, newer record's timestamp overwrite the freeze point before an
 /// earlier, older record fails — after which the older failure looks
@@ -2548,10 +2546,9 @@ async fn pr_ingest_sorts_by_updated_at_so_frozen_cursor_survives_out_of_order_li
     assert_eq!(cursor_after_pass2, "2026-01-03T00:00:00Z");
 }
 
-// ── equal-`updated_at` ties must not strand a failed record (review round-3
-//    [Medium]) ─────────────────────────────────────────────────────────────
+// ── equal-`updated_at` ties must not strand a failed record ─────────────────
 
-/// Sorting alone (the round-2 fix) does not cover a TIE: if a successful
+/// Sorting alone (the earlier fix) does not cover a TIE: if a successful
 /// record and a failing record share the exact same `updated_at`, the
 /// success still advances the cursor to that shared timestamp, and an
 /// exclusive `updated > cursor` retry check would then see the failed
@@ -3395,8 +3392,7 @@ impl EmbedderProvider for FailingEmbedProvider {
 /// removes the note row and its FTS document, the pass reports the failure
 /// as a create-commit warning, and neither `commits_ingested` nor
 /// `commit_embeddings_truncated` moves for that commit, since both only ever
-/// advance on the successful-create arm (review round-2 [Medium]-1
-/// remediation).
+/// advance on the successful-create arm (a prior fix).
 #[tokio::test]
 async fn ingest_over_cap_commit_with_failing_embedder_creates_nothing_and_warns() {
     let _guard = ENV_MUTEX.lock().await;
@@ -3473,7 +3469,7 @@ async fn ingest_over_cap_commit_with_failing_embedder_creates_nothing_and_warns(
     );
 }
 
-/// Semantic-only retrieval (review round-2 [Medium]-1): an explicit
+/// Semantic-only retrieval: an explicit
 /// deterministic query vector matching a real registered embedder's
 /// constant output, paired with query text that is lexically absent from
 /// the commit message, can only resolve the note through the vector leg --
@@ -3935,7 +3931,7 @@ async fn adr_entity_type_rejected_without_git_pack_loaded() {
 /// calls `KhiveRuntime::create_many` directly (the defense-in-depth path for
 /// Rust callers that bypass the `create` verb handler) and would fail if the
 /// boot-time composed aggregate were ever absent or builtin-only — the gap
-/// PR #925 codex r1 (M3) flagged: the handler-layer test above would stay
+/// PR #925 flagged: the handler-layer test above would stay
 /// green even if that wiring were silently dropped, since it never exercises
 /// `create_many` directly.
 ///
@@ -3943,7 +3939,7 @@ async fn adr_entity_type_rejected_without_git_pack_loaded() {
 /// actually installed: `KhiveRuntime::validate_entity_type_for_kind` returns
 /// its input unchanged when no validator is installed at all, so a
 /// positive-only test also passes with the boot wiring deleted entirely
-/// (PR #925 codex r2, Medium). The negative case below — an unregistered
+/// (PR #925). The negative case below — an unregistered
 /// Document subtype rejected as `RuntimeError::InvalidInput` — is what
 /// actually distinguishes "composed from pack `ENTITY_TYPES`" from
 /// "builtin-only" from "absent".
@@ -3972,7 +3968,7 @@ async fn git_pack_adr_entity_type_validates_through_runtime_create_many() {
         "{created:?}"
     );
 
-    // Negative companion (PR #925 codex r2, Medium): the positive `adr`
+    // Negative companion (PR #925): the positive `adr`
     // assertion above passes whether the aggregate validator is wired up
     // OR entirely absent, since `KhiveRuntime::validate_entity_type_for_kind`
     // returns the input unchanged when no validator is installed. Only a

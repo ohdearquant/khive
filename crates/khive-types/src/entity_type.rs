@@ -999,7 +999,7 @@ mod tests {
         );
     }
 
-    // ── check_extra_collisions: ADR-001 normalisation (PR #925 codex r2, High) ──
+    // ── check_extra_collisions: ADR-001 normalisation (PR #925) ──
     //
     // `check_extra_collisions` must reject collisions that only become
     // visible after ADR-001:104-107's write-time `to_snake_case`

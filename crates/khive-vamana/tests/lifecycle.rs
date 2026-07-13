@@ -1075,7 +1075,7 @@ fn oq2_consolidate_beats_no_consolidate_on_memory() {
     );
 }
 
-// ---- Regression tests (internal review round 2 required) ----
+// ---- Regression tests ----
 
 /// T-R1: insert a distinctive vector, self-query k=1, assert the assigned ordinal is found.
 /// The previous suite only queried ORIGINAL vectors (lifecycle.rs:538). This closes that gap.

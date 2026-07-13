@@ -668,7 +668,7 @@ async fn probe_read_does_not_resurrect_message_via_rowid_churn() {
     );
 }
 
-/// Regression for #827 Finding 1(a): `notes` has a TEXT PRIMARY KEY, so it
+/// Regression for #827: `notes` has a TEXT PRIMARY KEY, so it
 /// carries an *implicit* rowid that SQLite may renumber on `VACUUM` (khive
 /// exposes `memory.vacuum`). The cursor must survive a VACUUM between probes
 /// without losing or replaying any message.
@@ -737,7 +737,7 @@ async fn probe_survives_vacuum_between_probes() {
     assert_eq!(replay_messages[0]["id"], json!(id2.to_string()));
 }
 
-/// Regression for #827 Finding 1(b): SQLite reuses the highest rowid of a
+/// Regression for #827: SQLite reuses the highest rowid of a
 /// plain (non-AUTOINCREMENT) rowid table once that row is deleted. `notes`
 /// exposes a public hard delete, so deleting the note that currently holds
 /// the highest `notes_seq.seq` and then inserting a new note must not let
@@ -833,7 +833,7 @@ async fn probe_cursor_never_regresses_below_caller_supplied_since_us() {
     );
 }
 
-/// Regression for #827 Finding 2: a pre-upgrade persisted cursor was a raw
+/// Regression for #827: a pre-upgrade persisted cursor was a raw
 /// Unix-microsecond `created_at` timestamp -- vastly larger than any real
 /// `notes_seq` value. Passing one back as `since_us` must reset to baseline
 /// instead of permanently suppressing every message.
@@ -863,7 +863,7 @@ async fn probe_resets_implausible_pre_upgrade_timestamp_cursor_to_baseline() {
     );
 }
 
-/// Regression for #827 Finding 3: `notes_seq` has no fixed ceiling on how
+/// Regression for #827: `notes_seq` has no fixed ceiling on how
 /// high a legitimate sequence value can grow. A `since_us` far above the
 /// old fixed `1_000_000_000_000` cutoff, but still at or below the actual
 /// `notes_seq` high-water mark, must round-trip normally -- not be reset to
@@ -935,7 +935,7 @@ async fn probe_round_trips_a_legitimately_high_sequence_cursor() {
     assert_eq!(messages[0]["id"], json!(id2.to_string()));
 }
 
-/// Regression for #827 Finding 1: `V7` (`sql/007-notes-seq.sql`) must
+/// Regression for #827: `V7` (`sql/007-notes-seq.sql`) must
 /// backfill `notes_seq` for every note that already existed on a populated
 /// V6 database, not just notes inserted after the upgrade. Without the
 /// backfill, `comm.probe`'s `INNER JOIN notes_seq` would silently drop every
@@ -1038,14 +1038,14 @@ async fn probe_backfills_pre_existing_messages_across_v6_to_v7_upgrade() {
     );
 }
 
-/// Regression for #827 round-3 Finding 1: the *original* V7 migration (head
-/// 87c25939, before round 2 added a backfill) only created `notes_seq` --
+/// Regression for #827: the *original* V7 migration (head
+/// 87c25939, before a later edit added a backfill) only created `notes_seq` --
 /// it never backfilled anything. A database that already ran that original
 /// V7 body has `version = 7` recorded in `_schema_migrations`, so
 /// `run_migrations` will never re-run V7's body again, no matter how it is
-/// edited later. Round 2 (9b829cf4) edited `007-notes-seq.sql` in place to
+/// edited later. Commit 9b829cf4 edited `007-notes-seq.sql` in place to
 /// add a backfill -- but on a database that already applied the original
-/// V7, that edited body never executes, and round 2's *lazy* bootstrap
+/// V7, that edited body never executes, and that commit's *lazy* bootstrap
 /// backfill (`notes-ddl.sql`) was itself gated on `notes_seq` being
 /// globally empty. The moment exactly one note lands a `notes_seq` row
 /// through the ordinary write path, that guard sees a non-empty table and
@@ -1104,7 +1104,7 @@ async fn probe_repairs_partial_notes_seq_left_by_original_v7_on_reopen() {
         }
 
         // Apply the ORIGINAL (backfill-less) V7 body and record it as
-        // applied, simulating a database that upgraded before round 2.
+        // applied, simulating a database that upgraded before the backfill fix.
         conn.execute_batch(V7_ORIGINAL_NO_BACKFILL)
             .expect("apply original backfill-less V7");
         conn.execute(
@@ -1230,7 +1230,7 @@ async fn probe_repairs_partial_notes_seq_left_by_original_v7_on_reopen() {
     );
 }
 
-/// Regression for #827 round-4 perf finding: the notes_seq anti-join repair
+/// Regression for #827: the notes_seq anti-join repair
 /// (`stores/note.rs::repair_notes_seq`, the same statement as V8's forward
 /// migration) used to run its full `notes` table scan plus a temp B-tree for
 /// the `ORDER BY` on *every* `notes_for_namespace` call -- on a large,

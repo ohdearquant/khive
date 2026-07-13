@@ -927,7 +927,7 @@ async fn test_357_feedback_no_double_count() {
 
 // #295: brain.reset must restore domain-informed priors, not Beta(1,1).
 //
-// Strengthened per internal review P12 Medium: this test now exercises the full
+// This test now exercises the full
 // production path — handle_reset → reset_posteriors → sync helper — and
 // verifies that ALL three profile record fields (total_events,
 // exploration_epoch, state_snapshot) reflect the restored priors.
@@ -1107,7 +1107,7 @@ async fn test_295_reset_restores_domain_priors_not_uniform() {
     );
 }
 
-// Round-4 fix: brain.reset must reject unknown kwargs (deny_unknown_fields).
+// brain.reset must reject unknown kwargs (deny_unknown_fields).
 #[tokio::test]
 async fn brain_reset_rejects_unknown_kwargs() {
     let (pack, rt) = make_pack();
@@ -1458,7 +1458,7 @@ async fn w4_c4_feedback_accepts_valid_target_and_profile() {
     assert_eq!(result["signal"], json!("useful"));
 }
 
-/// Regression test (round-1 codex review of #831, Finding 1): ADR-041
+/// Regression test (#831): ADR-041
 /// permits `brain.feedback` targets on entities AND notes, but the emitted
 /// event previously always carried `SubstrateKind::Event`, so the
 /// `event_observations` decoder hard-coded `ReferentKind::Entity` and the
@@ -1711,7 +1711,7 @@ async fn w4_h3_resolve_exact_match_returns_exact_kind() {
     assert_eq!(result["matched_consumer_kind"], json!("recall"));
 }
 
-// Round-2 fix 3: archived high-priority binding + live lower-priority wildcard → live wins.
+// Archived high-priority binding + live lower-priority wildcard → live wins.
 #[tokio::test]
 async fn r2_archived_exact_binding_defers_to_live_wildcard() {
     let (pack, rt) = make_pack();
@@ -1782,7 +1782,7 @@ async fn r2_archived_exact_binding_defers_to_live_wildcard() {
     );
 }
 
-// Round-2 fix 4: brain.feedback rejects archived served_by_profile_id.
+// brain.feedback rejects archived served_by_profile_id.
 #[tokio::test]
 async fn r2_feedback_rejects_archived_served_by_profile() {
     let (pack, rt) = make_pack();
@@ -1832,7 +1832,7 @@ async fn r2_feedback_rejects_archived_served_by_profile() {
     }
 }
 
-// Round-2 fix 5: brain.create_profile rejects empty and wildcard consumer_kind.
+// brain.create_profile rejects empty and wildcard consumer_kind.
 #[tokio::test]
 async fn r2_create_profile_rejects_empty_consumer_kind() {
     let (pack, rt) = make_pack();
@@ -1900,7 +1900,7 @@ async fn r2_create_profile_rejects_whitespace_consumer_kind() {
     );
 }
 
-// Round-2 fix 6: brain.bindings AND-semantics pinned with ≥3 bindings and combined filters.
+// brain.bindings AND-semantics pinned with ≥3 bindings and combined filters.
 #[tokio::test]
 async fn r2_bindings_and_semantics_multi_filter() {
     let (pack, rt) = make_pack();
@@ -2006,8 +2006,8 @@ async fn r2_bindings_and_semantics_multi_filter() {
     assert_eq!(r3["bindings"], json!([]));
 }
 
-// Round-2 fix 2: user-created profile has real posterior state that reset mutates.
-// Round-3 strengthening: emit feedback first to move posteriors, then assert all three
+// User-created profile has real posterior state that reset mutates.
+// Emit feedback first to move posteriors, then assert all three
 // posterior alpha/beta values return to their priors after reset.
 #[tokio::test]
 async fn r2_user_profile_reset_mutates_posteriors() {
@@ -2133,7 +2133,7 @@ async fn r2_user_profile_reset_mutates_posteriors() {
     );
 }
 
-// Round-2 fix 2: feedback routes to the user-created profile's own state.
+// Feedback routes to the user-created profile's own state.
 #[tokio::test]
 async fn r2_user_profile_feedback_routes_to_profile_state() {
     let (pack, rt) = make_pack();
@@ -2571,7 +2571,7 @@ async fn w4_h4_profile_accepts_profile_id_and_id_alias() {
     assert_eq!(r2["id"], json!("balanced-recall-v1"));
 }
 
-// ── Round-3 regression tests ──────────────────────────────────────────────
+// ── Regression tests ──────────────────────────────────────────────
 
 // R3-1: archiving balanced-recall-v1 then calling brain.feedback without
 // served_by_profile_id must return InvalidInput and must NOT append an event.
@@ -3270,7 +3270,7 @@ mod help_tests {
         );
     }
 
-    // ── Regression: schema-aware namespace strip (internal review round 2 H1) ──────────
+    // ── Regression: schema-aware namespace strip ──────────
     //
     // brain.bind / brain.resolve / brain.unbind / brain.bindings declare
     // `namespace` as a *business* parameter in their HandlerDef.params.  The
@@ -5303,7 +5303,7 @@ mod adr081_retune_driver_tests {
         assert!(!second, "exact-key duplicate must report written=false");
     }
 
-    /// internal review PR #583 round-1 Low: a `UNIQUE` violation on the `id TEXT PRIMARY
+    /// PR #583: a `UNIQUE` violation on the `id TEXT PRIMARY
     /// KEY` column (same `id`, different natural key) must NOT be reported as
     /// a tolerated natural-key duplicate — the row that actually exists does
     /// not match `(namespace, target_id, query_class, served_at)`, so the
