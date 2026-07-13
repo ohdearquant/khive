@@ -25,7 +25,7 @@
 # both are reported in a separate admin-surface coverage class and never
 # count toward the real-MCP percentage. No other exception exists unless
 # added by signed amendment.
-oq1_admin_ingest_surface = "admin_cli/raw_daemon_control exception bounded to exactly two scenarios per Amendment 1 §2: F6 git-ingest/code-ingest (admin CLI is the product surface for it) and the F10 daemon-control probe; reported as a separate admin-surface coverage class, never counted toward the real-MCP percentage"
+oq1_admin_ingest_surface = "admin_cli/raw_daemon_control exception bounded to exactly two exception classes per Amendment 1 §2 - F6 git-ingest/code-ingest (admin CLI is the product surface for it, two scenario rows) and the F10 daemon-control probe (one scenario row), three scenario ids total; reported as a separate admin-surface coverage class, never counted toward the real-MCP percentage"
 # Amendment 1 §2 admin-surface coverage class membership (exhaustive; every
 # other scenario_id in this manifest is real-MCP coverage by default via
 # its surface = "mcp_daemon" declaration).

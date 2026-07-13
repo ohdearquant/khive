@@ -197,14 +197,17 @@ class ManifestTests(unittest.TestCase):
         (#919) so a timeout is attributable to exactly one deadline."""
         data, _ = coverage_validator.load_manifest(MANIFEST_PATH)
         server_deadline_ms = data["oq_rulings"]["oq2_server_recall_deadline_ms"]
+        censor_floor_ms = data["oq_rulings"]["oq2_measurement_deadline_ms"]
+        self.assertEqual(censor_floor_ms, 45000)
+        self.assertGreater(censor_floor_ms, server_deadline_ms)
         for sc in data["scenario"]:
             if sc["surface"] == "admin_cli":
                 continue
-            self.assertGreater(
+            self.assertGreaterEqual(
                 sc["request_deadline_ms"],
-                server_deadline_ms,
-                f"{sc['scenario_id']}: request_deadline_ms {sc['request_deadline_ms']} must strictly exceed "
-                f"the {server_deadline_ms} ms server-side recall deadline",
+                censor_floor_ms,
+                f"{sc['scenario_id']}: request_deadline_ms {sc['request_deadline_ms']} must meet "
+                f"the {censor_floor_ms} ms client-censor floor (Amendment 1 section 2)",
             )
 
     def _write_manifest(self, tmp: pathlib.Path, scenarios: list[dict]) -> pathlib.Path:
