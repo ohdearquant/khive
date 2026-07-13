@@ -224,6 +224,34 @@ the effective limit instead of silently skipping rows. The caps are entity 500, 
 1000, event 1000, and proposal 500. Edge cursor mode keeps its existing `{"edges": [...],
 "next_after": ...}` shape and adds the same limit metadata when clamped.
 
+Row shape (each item in the array, or in `"items"`/`"edges"` when clamped) depends on `kind`
+and is always the **full stored record** for that substrate — this is the key difference from
+`search` and `neighbors` below, which both return narrow projections:
+
+- **`kind="entity"`**: `{id, namespace, kind, entity_type, name, description, properties, tags,
+  created_at, updated_at, deleted_at, merged_into, merge_event_id, content_ref}`.
+  `created_at`/`updated_at`/`deleted_at` are ISO-8601 strings (the store keeps them as
+  epoch-microseconds internally; the handler converts before returning).
+- **`kind="note"`**: `{id, namespace, kind, status, name, content, salience, decay_factor,
+  expires_at, properties, created_at, updated_at, deleted_at}`. Notes have **no top-level
+  `tags` field** — unlike entities, tags live inside `properties.tags`. If the note's
+  `properties.status` is set (e.g. a `gtd` task's lifecycle status, or a `comm` message's
+  delivery state), the row's substrate-level `status` (normally `"active"`) is renamed to
+  `lifecycle`, and the top-level `status` is replaced with the `properties.status` value —
+  so a `gtd`/`comm` consumer reads the pack-level status directly off the row instead of
+  digging into `properties`. When no `properties.status` is set, `status` stays the raw
+  substrate value and there is no `lifecycle` key.
+- **`kind="edge"`**: `{id, namespace, source_id, target_id, relation, weight, created_at,
+  updated_at, deleted_at, metadata, target_backend}`.
+- **`kind="event"`**: `{id, namespace, verb, substrate, actor, kind, outcome, payload,
+  payload_schema_version, profile_state_version, duration_us, target_id, session_id,
+  aggregate_kind, aggregate_id, created_at}`.
+
+None of these match `search`'s `{id, entity_kind|note_kind, score, title, snippet}` rows or
+`neighbors`'s flat `{origin_id, id, edge_id, relation, weight, name?, kind?, entity_type?}`
+rows. `search` and `neighbors` are built for ranking and graph-walking, not display — fetch the
+full record with `get(id=...)` (or `list`) when you need more than what they return.
+
 ### `stats` — Assertive
 
 Return aggregate KG substrate counts (entities, edges, notes). No params.
@@ -307,6 +335,32 @@ Hybrid FTS + vector search with RRF fusion.
 request(ops="search(kind=\"entity\", query=\"knowledge graph runtime\", limit=10)")
 ```
 
+Response shape (`kind="entity"` rows):
+
+```json
+[
+  {
+    "id": "3f2a9c1e-...",
+    "entity_kind": "concept",
+    "score": 0.0909,
+    "title": "LoRA",
+    "snippet": "matched text from the description/properties"
+  }
+]
+```
+
+`kind="note"` rows are identical except the kind field is named `note_kind` instead of
+`entity_kind`. That kind field is present on every row but is `null` in the rare case where the
+record was deleted between the search hit and the metadata lookup that fills it in. `score` is
+the RRF-fused rank score (`1 / (k + rank)`, `k = 10`), **not** a normalized 0.0-1.0 similarity —
+see the `min_score` row above for the typical magnitude. `title`/`snippet` are `null` when the
+underlying FTS/vector hit carried no snippet text.
+
+This row shape never includes the full entity/note record (no `description`, `content`,
+`properties`, `tags`, timestamps, …) — only enough to rank and identify the hit. It diverges
+from both `neighbors` and `list`'s row shapes below; see `list`'s "Row shape" note above for the
+full comparison.
+
 ### `link` — Commissive
 
 Create a typed directed edge.
@@ -339,6 +393,38 @@ batch callers verify that every result is associated with the submitted root.
 ```
 request(ops="neighbors(node_id=\"<uuid>\", direction=\"both\")")
 ```
+
+Response shape:
+
+```json
+[
+  {
+    "origin_id": "<the queried node_id>",
+    "id": "<neighbor node id>",
+    "edge_id": "<uuid>",
+    "relation": "extends",
+    "weight": 0.9,
+    "name": "LoRA",
+    "kind": "concept",
+    "entity_type": "paper"
+  }
+]
+```
+
+Flat rows, one per edge — never the neighbor's full entity/note record. `name`, `kind`, and
+`entity_type` are filled in by a batch entity+note lookup performed after the graph query, and
+are **omitted from the JSON entirely (not `null`)** when the neighbor node could not be
+resolved (soft-deleted entity, or a dangling/bogus id). This differs from `search`'s
+`entity_kind`/`note_kind`, which is always present on the row and only ever `null`.
+`entity_type` is included only when `include_entity_type=true` was passed, and is never set for
+a note neighbor (notes have no `entity_type`).
+
+`kind` is overloaded: for an entity neighbor it is the entity's base kind (e.g. `concept`); for
+a note neighbor it is the note's kind (e.g. `observation`) — annotation edges routinely link an
+entity to a note, so a `neighbors` result set can mix both. There is no separate field stating
+which substrate a given neighbor belongs to; disambiguate by checking `kind` against the closed
+entity-kind vocabulary (§"The 9 entity kinds" in AGENTS.md) vs. the note-kind vocabulary
+(§"The 5 note kinds"), or call `get(id=...)` on the neighbor's `id`.
 
 ### `traverse` — Assertive
 
