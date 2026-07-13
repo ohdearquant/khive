@@ -5133,11 +5133,21 @@ backend = "kg-backend"
         );
 
         use clap::Parser;
-        let args = Args::parse_from(["mcp", "--config", config_path.to_str().expect("utf8 path")]);
+        let args = Args::parse_from([
+            "mcp",
+            "--config",
+            config_path.to_str().expect("utf8 path"),
+            "--no-embed",
+        ]);
 
         let (server, schedule_rt) = build_server(&args).expect("build_server must succeed");
         // No `[packs.schedule]` entry above, so it defaults to "main".
         let rt = schedule_rt.expect("schedule pack is loaded by default");
+        assert!(
+            rt.config().embedding_model.is_none()
+                && rt.config().additional_embedding_models.is_empty(),
+            "the backend-routing fixture must remain independent of external embedding models"
+        );
 
         let marker = "adr106-multi-backend-dispatch-marker";
         let action_dsl = format!("create(kind=\"observation\", content=\"{marker}\")");
