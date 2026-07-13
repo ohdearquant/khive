@@ -679,7 +679,7 @@ fn prepare_daemon_log_file(log_path: &std::path::Path) -> Option<std::fs::File> 
     prepare_daemon_log_file_with_cap(log_path, DAEMON_LOG_MAX_BYTES)
 }
 
-fn spawn_daemon() -> std::io::Result<()> {
+fn spawn_daemon() -> std::io::Result<std::process::Child> {
     #[cfg(test)]
     SPAWN_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
@@ -709,8 +709,14 @@ fn spawn_daemon() -> std::io::Result<()> {
         use std::os::unix::process::CommandExt;
         cmd.process_group(0);
     }
-    cmd.spawn()?;
-    Ok(())
+    // #898: return the live `Child` (rather than discarding it) so the caller
+    // can positively confirm the respawned process is still alive before
+    // treating recovery as healthy — see `RecoveryOutcome::Spawned` and its
+    // use in `forward_or_spawn`. A binary that predates or otherwise rejects
+    // `mcp --daemon` (version skew) exits immediately with a clap parse
+    // error; without this handle that failure was invisible to everything
+    // except `khived.log`.
+    cmd.spawn()
 }
 
 /// Return `true` if `args` (the full `ps -o args=` output for a process)
@@ -977,8 +983,13 @@ enum RecoveryOutcome {
     /// via the normal path (no new spawn occurred).
     Skipped,
     /// This client killed the stale daemon and spawned a replacement; caller
-    /// must wait for readiness then forward the real request.
-    Spawned,
+    /// must wait for readiness then forward the real request. Carries the
+    /// spawned [`std::process::Child`] (#898) so `forward_or_spawn` can, once
+    /// it is otherwise about to give up and fall back locally, positively
+    /// confirm whether that specific respawn attempt already exited instead
+    /// of ever binding the socket — turning a version-skewed binary's silent,
+    /// forever-repeating respawn failure into a loud, caller-visible error.
+    Spawned(std::process::Child),
     /// Could not obtain a positive confirmation either way within the
     /// deadline-bound recovery window (the recoverer lock or the boot/recovery
     /// lock stayed contended past its deadline) — #838. The
@@ -1262,7 +1273,7 @@ async fn kill_and_respawn(config_id: &str, namespace: &str) -> std::io::Result<R
             // and dropped entirely within this arm.
             let _boot_lock = acquire_recovery_lock();
             kill_stale_daemon_inner();
-            spawn_daemon().map(|()| RecoveryOutcome::Spawned)
+            spawn_daemon().map(RecoveryOutcome::Spawned)
         }
     };
     drop(recoverer_guard);
@@ -1283,6 +1294,80 @@ fn ambiguous_forward_error() -> McpError {
         "daemon response lost after request was sent; not retrying or locally \
          dispatching to avoid duplicate execution",
         None,
+    )
+}
+
+// ── #898: loud, unambiguous respawn-failure error ───────────────────────────
+//
+// Root cause (2026-07-12 incident): `spawn_daemon` already resolves the spawn
+// target deterministically via `std::env::current_exe()` (never ambient
+// `PATH`), so a version-skewed binary reaching `mcp --daemon` means THIS
+// process's own on-disk binary predates (or otherwise rejects) that flag —
+// respawning via `current_exe()` faithfully relaunches the very same stale
+// binary. That relaunch fails immediately with a clap parse error
+// (`error: Unrecognized option: 'daemon'`) written only to `khived.log`.
+// Because `spawn_daemon` was fire-and-forget (the `Child` was discarded) and
+// `forward_or_spawn` cannot distinguish "our own respawn attempt definitely
+// already died" from "no daemon is configured to run here at all", every
+// request repeated the same failing respawn, burned the full connect
+// deadline plus the boot-quiescence wait, and then quietly completed via
+// local dispatch (or, in `KHIVE_DAEMON_STRICT=1`, rejected with the generic
+// `no_socket` reason) — a silent, forever-repeating failure invisible to the
+// caller and to every metric except a `khived.log` grep.
+//
+// The fix: `spawn_daemon` now returns the live `Child` (see
+// `RecoveryOutcome::Spawned`), and `forward_or_spawn` checks — only at the
+// point it would otherwise fall back locally, never earlier, so the existing
+// connect-retry window and #667's boot-quiescence fence are unchanged —
+// whether the respawn attempt IT made has already exited. A confirmed exit is
+// unambiguous (this process spawned that exact child); it is never treated as
+// the legitimate ADR-049 no-daemon case and never silently swallowed, in
+// either strict or non-strict mode.
+
+/// Best-effort tail of `khived.log` for the loud respawn-failure diagnostic.
+/// Returns `None` on any read failure or if the tail is empty — logging is
+/// best-effort and must never turn a diagnostic path into a second failure.
+fn tail_daemon_log(max_bytes: usize) -> Option<String> {
+    let path = daemon_log_path()?;
+    let bytes = std::fs::read(&path).ok()?;
+    let start = bytes.len().saturating_sub(max_bytes);
+    let tail = String::from_utf8_lossy(&bytes[start..]).trim().to_string();
+    if tail.is_empty() {
+        None
+    } else {
+        Some(tail)
+    }
+}
+
+/// Build the loud, caller-visible error for a respawn attempt this process
+/// made and can now positively confirm failed — `detail` names what was
+/// observed (an exit status, or a `Command::spawn` error). Always logs at
+/// `error!` and is always returned to the caller regardless of
+/// `KHIVE_DAEMON_STRICT`: unlike the ordinary "no daemon reachable" fallback
+/// (which may be the legitimate ADR-049 no-daemon deployment), a respawn WE
+/// attempted and can prove failed is never a case for quietly completing the
+/// request via local dispatch. See #898.
+fn respawn_failed_error(detail: &str) -> McpError {
+    let exe = std::env::current_exe()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| "<current_exe unresolved>".to_string());
+    let mut msg = format!(
+        "daemon respawn failed: {detail} — resolved daemon binary was \
+         `{exe} mcp --daemon`; this is most likely binary version skew (an \
+         on-disk kkernel predating or otherwise rejecting `mcp --daemon`); \
+         rebuild with `make local`."
+    );
+    if let Some(tail) = tail_daemon_log(2048) {
+        msg.push_str(&format!("\nkhived.log tail:\n{tail}"));
+    }
+    tracing::error!(
+        exe = %exe,
+        detail,
+        "daemon respawn failed loudly (#898): respawn attempt confirmed dead"
+    );
+    McpError::internal_error(
+        msg,
+        Some(serde_json::json!({"reason": "respawn_failed"})),
     )
 }
 
@@ -1804,22 +1889,29 @@ pub async fn forward_or_spawn(frame: &DaemonRequestFrame) -> Option<Result<Strin
     // single recovery lock, using only `probe_only` frames for the identity
     // check. `kill_and_respawn` is a no-op kill when there is nothing stale to
     // remove, so first-spawn and recovery share this one path.
+    //
+    // #898: `spawned_child` holds the live handle from `RecoveryOutcome::Spawned`
+    // (if THIS call actually spawned one) purely so the two "about to give up
+    // and fall back locally" points below can check whether that specific
+    // attempt already exited — never polled eagerly, never used to cut the
+    // connect-retry window or the #667 boot-quiescence wait short.
+    let mut spawned_child: Option<std::process::Child> = None;
     match kill_and_respawn(&frame.config_id, &frame.namespace).await {
         Err(e) => {
-            tracing::warn!(error = %e, "failed to spawn/recover the daemon; falling back to local dispatch");
-            return fallback_or_reject(
-                FallbackReason::NoSocket,
-                &frame.config_id,
-                None,
-                &frame.namespace,
-            );
+            // #898: `Command::spawn` itself failed to start the child at all —
+            // an unambiguous, already-fully-diagnosed respawn failure. Loud in
+            // both strict and non-strict mode; never a silent local fallback.
+            return Some(Err(respawn_failed_error(&format!(
+                "failed to start the replacement process: {e}"
+            ))));
         }
         Ok(RecoveryOutcome::Skipped) => {
             // A concurrent client already has a live matching daemon ready.
         }
-        Ok(RecoveryOutcome::Spawned) => {
+        Ok(RecoveryOutcome::Spawned(child)) => {
             // Give the kernel a moment to release the socket path and let the
             // spawned daemon process start.
+            spawned_child = Some(child);
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
         Ok(RecoveryOutcome::Uncertain) => {
@@ -1852,6 +1944,20 @@ pub async fn forward_or_spawn(frame: &DaemonRequestFrame) -> Option<Result<Strin
                     // and send it now that boot has quiesced.
                 }
                 BootFenceOutcome::SafeLocalFallback => {
+                    // #898: only now — after the full connect-retry window AND
+                    // the #667 boot-quiescence wait, exactly as before — check
+                    // whether the respawn THIS call made has already exited.
+                    // A confirmed exit is unambiguous (this process spawned
+                    // that exact child) and is never treated as the
+                    // legitimate ADR-049 no-daemon case.
+                    if let Some(child) = spawned_child.as_mut() {
+                        if let Ok(Some(status)) = child.try_wait() {
+                            return Some(Err(respawn_failed_error(&format!(
+                                "the spawned process exited with {status} instead \
+                                 of binding the daemon socket"
+                            ))));
+                        }
+                    }
                     return fallback_or_reject(
                         FallbackReason::NoSocket,
                         &frame.config_id,
@@ -2575,15 +2681,19 @@ mod tests {
         clear_daemon_env();
     }
 
-    // #947: genuine daemon-unreachable fallback (no `KHIVE_NO_DAEMON` opt-out)
-    // must still complete locally in non-strict mode, and must reject the
-    // request in strict mode. `spawn_daemon()` really runs here (`SPAWN_COUNT`
-    // bumps) but the spawned process is this same test binary re-invoked with
-    // unrecognized args, so it never binds the socket and the daemon
-    // genuinely never becomes reachable — the same way
-    // `forward_or_spawn_blocks_on_boot_quiescence_before_local_fallback` below
-    // forces this path without a fake daemon. Each run pays the ~5s forward
-    // deadline plus the boot-quiescence reprobe.
+    // #898: genuine daemon-unreachable fallback (no `KHIVE_NO_DAEMON` opt-out),
+    // where the respawn THIS call attempted can be positively confirmed dead.
+    // `spawn_daemon()` really runs here (`SPAWN_COUNT` bumps), spawning this
+    // same test binary re-invoked with unrecognized `mcp --daemon` args; it
+    // exits immediately without ever binding the socket — mirroring the
+    // 2026-07-12 incident's version-skewed binary (`error: Unrecognized
+    // option: 'daemon'`). This must surface as a loud, caller-visible error in
+    // BOTH strict and non-strict mode: unlike the ordinary "no daemon
+    // reachable, cause unknown" fallback, a respawn this process made and can
+    // prove failed is never eligible for a silent local-dispatch completion.
+    // Each run pays the ~5s forward deadline plus the boot-quiescence reprobe
+    // — see `forward_or_spawn_blocks_on_boot_quiescence_before_local_fallback`
+    // below, which asserts that wait is unaffected by this change.
 
     fn unreachable_daemon_frame(config_id: &str) -> DaemonRequestFrame {
         DaemonRequestFrame {
@@ -2605,7 +2715,7 @@ mod tests {
 
     #[tokio::test]
     #[serial]
-    async fn forward_or_spawn_non_strict_falls_back_locally_when_daemon_unreachable() {
+    async fn forward_or_spawn_surfaces_loud_error_when_respawn_confirmed_dead_non_strict() {
         clear_daemon_env();
         reset_fallback_counters();
         let dir = tempfile::tempdir().expect("tempdir");
@@ -2618,12 +2728,29 @@ mod tests {
         let frame = unreachable_daemon_frame(CFG);
         let out = forward_or_spawn(&frame).await;
 
-        assert!(
-            out.is_none(),
-            "non-strict mode must still complete the request via local dispatch \
-             when the daemon is genuinely unreachable, got {out:?}"
-        );
-        assert_eq!(fallback_count(FallbackReason::NoSocket), 1);
+        match out {
+            Some(Err(McpError { message, .. })) => {
+                assert!(
+                    message.contains("respawn failed"),
+                    "must name the respawn failure specifically, not a generic \
+                     fallback: {message}"
+                );
+                assert!(
+                    message.contains("make local"),
+                    "must point the operator at the fix: {message}"
+                );
+            }
+            other => panic!(
+                "a respawn attempt confirmed dead must surface loudly even in \
+                 non-strict mode (#898) instead of completing the request via \
+                 silent local dispatch, got {other:?}"
+            ),
+        }
+        // #898's loud respawn-failure path bypasses the ordinary
+        // fallback/telemetry machinery entirely — a confirmed respawn failure
+        // is never the legitimate ADR-049 no-daemon case that telemetry
+        // exists to count.
+        assert_eq!(fallback_count(FallbackReason::NoSocket), 0);
 
         reset_fallback_counters();
         clear_daemon_env();
@@ -2632,7 +2759,7 @@ mod tests {
 
     #[tokio::test]
     #[serial]
-    async fn forward_or_spawn_strict_mode_errors_when_daemon_unreachable() {
+    async fn forward_or_spawn_surfaces_loud_error_when_respawn_confirmed_dead_strict() {
         clear_daemon_env();
         reset_fallback_counters();
         let dir = tempfile::tempdir().expect("tempdir");
@@ -2648,23 +2775,19 @@ mod tests {
         match out {
             Some(Err(McpError { message, .. })) => {
                 assert!(
-                    message.contains("no_socket"),
-                    "strict-mode error must name the fallback reason: {message}"
-                );
-                assert!(
-                    message.contains("KHIVE_DAEMON_STRICT"),
-                    "strict-mode error should name the mode that rejected the \
-                     request: {message}"
+                    message.contains("respawn failed"),
+                    "strict mode must still surface the specific respawn-failure \
+                     diagnosis, not the generic no_socket reason: {message}"
                 );
             }
             other => panic!(
-                "KHIVE_DAEMON_STRICT=1 must reject the request instead of completing \
-                 it locally when the daemon is unreachable, got {other:?}"
+                "KHIVE_DAEMON_STRICT=1 must reject the request when the daemon is \
+                 unreachable, got {other:?}"
             ),
         }
-        // Counters/telemetry stay exactly as they were before #947 — this
-        // change only affects what the caller gets back.
-        assert_eq!(fallback_count(FallbackReason::NoSocket), 1);
+        // Strict mode changes nothing here: #898's loud path is unconditional
+        // and never reaches record_fallback/fallback_or_reject at all.
+        assert_eq!(fallback_count(FallbackReason::NoSocket), 0);
 
         reset_fallback_counters();
         clear_daemon_env();
@@ -4330,7 +4453,7 @@ mod tests {
         );
         let spawned_count = [&a, &b]
             .iter()
-            .filter(|r| matches!(r, Ok(RecoveryOutcome::Spawned)))
+            .filter(|r| matches!(r, Ok(RecoveryOutcome::Spawned(_))))
             .count();
         assert_eq!(
             spawned_count, 1,
@@ -4427,7 +4550,7 @@ mod tests {
         // must attempt kill+spawn (Spawned outcome — spawn itself fails because there
         // is no real kkernel binary in test, but KILL_COUNT is checked BEFORE spawn).
         assert!(
-            matches!(outcome, Ok(RecoveryOutcome::Spawned) | Err(_)),
+            matches!(outcome, Ok(RecoveryOutcome::Spawned(_)) | Err(_)),
             "pre-probe same-protocol daemon must NOT be classified Alive; \
              expected Spawned or spawn-error, got Skipped"
         );
@@ -5063,12 +5186,19 @@ mod tests {
     // Once the boot thread holds the guard (for `GUARD_HOLD`, deliberately
     // longer than `forward_or_spawn`'s fixed 5s readiness deadline), the fix
     // must block inside `wait_for_boot_quiescence_then_reprobe` until that
-    // guard is released before it is allowed to decide "genuinely no daemon"
-    // and return `None`. The elapsed-time assertion below is the
-    // fail-if-reverted oracle: reverting the fence makes `forward_or_spawn`
-    // return right at the 5s readiness deadline (measured from well before
-    // the boot thread even starts holding the guard), strictly before
-    // `GUARD_HOLD` has elapsed.
+    // guard is released before it is allowed to decide "genuinely no daemon".
+    // The elapsed-time assertion below is the fail-if-reverted oracle for
+    // #667: reverting that fence makes `forward_or_spawn` return right at the
+    // 5s readiness deadline (measured from well before the boot thread even
+    // starts holding the guard), strictly before `GUARD_HOLD` has elapsed.
+    //
+    // #898: by the time that wait finally ends, THIS call's own spawned child
+    // (the test binary, rejected `mcp --daemon` and exited within
+    // milliseconds) has long since exited — so the final outcome is now the
+    // loud, specific respawn-failure error rather than a silent `None`. That
+    // change is orthogonal to what this test actually guards: the fence must
+    // still be waited out in full regardless of which terminal outcome
+    // follows it, which the elapsed-time assertion below continues to prove.
     #[tokio::test]
     #[serial]
     async fn forward_or_spawn_blocks_on_boot_quiescence_before_local_fallback() {
@@ -5131,11 +5261,21 @@ mod tests {
             .join()
             .expect("boot-holder thread must not panic");
 
-        assert!(
-            result.is_none(),
-            "genuinely no daemon after boot quiescence must fall back to local \
-             dispatch (None), got {result:?}"
-        );
+        match &result {
+            Some(Err(McpError { message, .. })) => {
+                assert!(
+                    message.contains("respawn failed"),
+                    "#898: this call's own spawned child is confirmed dead by \
+                     now, so the outcome must be the specific loud respawn- \
+                     failure error, not a generic message: {message}"
+                );
+            }
+            other => panic!(
+                "after boot quiescence, a respawn attempt confirmed dead must \
+                 surface loudly (#898) rather than falling back silently, got \
+                 {other:?}"
+            ),
+        }
         assert!(
             elapsed >= GUARD_HOLD,
             "forward_or_spawn must block until the cold-boot guard is released \
