@@ -26,6 +26,7 @@
 //! - `u8_dot_u32`: NEON `vmull_u8` (16-wide u8→u16→u32) or chunked portable fallback.
 //! - `u8_l2sq_u32`: NEON `vabdq_u8` + `vmull_u8` squaring or chunked portable fallback.
 
+#[cfg(feature = "parallel")]
 use rayon::prelude::*;
 
 // ─── NEON helpers ─────────────────────────────────────────────────────────────
@@ -451,7 +452,7 @@ impl Sq8Codec {
         }
     }
 
-    /// Encode a batch of flat-row vectors in parallel.
+    /// Encode a batch of flat-row vectors, using Rayon when the `parallel` feature is enabled.
     ///
     /// Panics on invalid input. See [`Self::try_encode_flat_par`] for a
     /// fallible variant that returns [`QuantError`] instead.
@@ -486,13 +487,19 @@ impl Sq8Codec {
             });
         }
         let n = vectors.len() / dims;
-        Ok((0..n)
+        #[cfg(feature = "parallel")]
+        let encoded = (0..n)
             .into_par_iter()
             .map(|i| self.encode_unchecked(&vectors[i * dims..(i + 1) * dims]))
-            .collect())
+            .collect();
+        #[cfg(not(feature = "parallel"))]
+        let encoded = (0..n)
+            .map(|i| self.encode_unchecked(&vectors[i * dims..(i + 1) * dims]))
+            .collect();
+        Ok(encoded)
     }
 
-    /// Encode a batch of row vectors in parallel.
+    /// Encode a batch of row vectors, using Rayon when the `parallel` feature is enabled.
     ///
     /// Panics if any row's length does not match the codec's trained dims.
     /// See [`Self::try_encode_par`] for a fallible variant that returns
@@ -517,10 +524,14 @@ impl Sq8Codec {
                 });
             }
         }
-        Ok(vectors
+        #[cfg(feature = "parallel")]
+        let encoded = vectors
             .par_iter()
             .map(|v| self.encode_unchecked(v))
-            .collect())
+            .collect();
+        #[cfg(not(feature = "parallel"))]
+        let encoded = vectors.iter().map(|v| self.encode_unchecked(v)).collect();
+        Ok(encoded)
     }
 
     /// Approximate dot product between two encoded vectors (same codec).
@@ -733,7 +744,7 @@ impl GsSq8Codec {
         GsEncodedVector { codes }
     }
 
-    /// Encode a batch of flat-row vectors in parallel.
+    /// Encode a batch of flat-row vectors, using Rayon when the `parallel` feature is enabled.
     ///
     /// Panics on invalid input. See [`Self::try_encode_flat_par`] for a
     /// fallible variant that returns [`QuantError`] instead.
@@ -767,10 +778,16 @@ impl GsSq8Codec {
             });
         }
         let n = vectors.len() / dims;
-        Ok((0..n)
+        #[cfg(feature = "parallel")]
+        let encoded = (0..n)
             .into_par_iter()
             .map(|i| self.encode_unchecked(&vectors[i * dims..(i + 1) * dims]))
-            .collect())
+            .collect();
+        #[cfg(not(feature = "parallel"))]
+        let encoded = (0..n)
+            .map(|i| self.encode_unchecked(&vectors[i * dims..(i + 1) * dims]))
+            .collect();
+        Ok(encoded)
     }
 
     /// Approximate squared L2 distance.

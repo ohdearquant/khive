@@ -54,7 +54,7 @@ docs/
   - `Visibility::Subhandler` — internal / CLI-only; not on the MCP wire.
 - Pack dependencies are declared in `Pack::REQUIRES`; the runtime validates they are loaded.
 
-### ADR-027: Dynamic pack loading via inventory self-registration
+### Dynamic pack loading via inventory self-registration (ADR-027)
 
 - Each pack crate must call `inventory::submit! { khive_runtime::PackRegistration(&Factory) }`
   exactly once. This causes the linker to include the pack factory in the binary's startup inventory.

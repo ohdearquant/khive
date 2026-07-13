@@ -153,7 +153,7 @@ pub enum EdgeDirection {
     Both,
 }
 
-/// A scalar comparison in the WHERE clause: `variable.property op value`.
+/// A predicate in the WHERE clause: `variable.property op value`.
 #[derive(Debug, Clone)]
 pub struct Condition {
     pub variable: String,
@@ -172,6 +172,10 @@ pub enum CompareOp {
     Gte,
     Lte,
     Like,
+    Contains,
+    StartsWith,
+    In,
+    IsNotNull,
 }
 
 /// Right-hand side value in a WHERE condition.
@@ -187,4 +191,8 @@ pub enum ConditionValue {
     /// A float literal (decimal point present in the source lexeme).
     Number(f64),
     Bool(bool),
+    /// A list literal used by the `IN` operator.
+    List(Vec<ConditionValue>),
+    /// The operand marker for the operand-free `IS NOT NULL` operator.
+    Null,
 }

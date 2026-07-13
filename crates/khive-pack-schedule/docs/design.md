@@ -133,7 +133,7 @@ ensuring the notes substrate is available before the schedule pack loads.
 `schedule.remind` separately verifies that `comm.send` is registered before
 persisting a reminder; the other three schedule verbs do not require `comm`.
 
-### ADR-025: Verb Speech Acts
+### Verb Speech Acts (ADR-025)
 
 - `schedule.remind` and `schedule.schedule` are commissive (create future intent).
 - `schedule.agenda` is assertive (query state without side effects).

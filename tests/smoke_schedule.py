@@ -51,7 +51,9 @@ def _call_request_raw(proc, ops_string, presentation=None):
     """Send `request(ops=<ops_string>)`. Return the parsed response body.
 
     presentation: None (default="agent"), "verbose", or "human".
-    Agent mode compacts ISO-8601 timestamps to minute granularity and shortens UUIDs.
+    Agent mode renders metadata ISO-8601 timestamps from the last 24 hours as
+    relative text and older ones at minute granularity, and shortens UUIDs;
+    payload timestamps (e.g. trigger_at, #871) round-trip verbatim.
     Verbose mode returns the canonical handler output unchanged.
     """
     arguments = {"ops": ops_string}
@@ -103,13 +105,41 @@ def call_verb_expect_error(proc, name, args):
     return first.get("error", "<no error string>")
 
 
+# Issue #779: 8 (then 14, then 42, accelerating) year-2099 schedule-pack
+# fixture rows -- matching this file's exact test content ("check the build",
+# "repeat=daily", "window-early", "sort-order-jan", ...) -- were found parked
+# in a real, on-disk store. This script's fixtures must only ever land in an
+# ephemeral store; ISOLATION_DB is the single source of truth for that, and
+# spawn_proc asserts its own argv actually carries it before returning the
+# process, so a future edit that drops or changes the `--db` flag fails this
+# script immediately instead of silently writing into whatever store the
+# environment resolves.
+ISOLATION_DB = ":memory:"
+
+
 def spawn_proc():
-    """Spawn a fresh khive-mcp process with kg + comm + schedule packs."""
+    """Spawn a fresh khive-mcp process with kg + comm + schedule packs.
+
+    comm is required alongside schedule: schedule.remind fails fast without
+    the comm delivery capability (comm.send) registered (#897 review).
+
+    Always isolated: `--db :memory:` is non-negotiable for this script, so we
+    build argv from ISOLATION_DB and assert it landed exactly where expected
+    rather than trusting the literal below never drifts.
+    """
+    argv = [
+        BINARY, "mcp", "--db", ISOLATION_DB, "--no-embed", "--log", "error",
+        "--pack", "kg", "--pack", "comm", "--pack", "schedule",
+    ]
+    db_flag_index = argv.index("--db")
+    assert argv[db_flag_index + 1] == ISOLATION_DB, (
+        "refusing to spawn: --db must be an ephemeral store "
+        f"({ISOLATION_DB!r}), got {argv[db_flag_index + 1]!r} -- this guard "
+        "exists so this script can never silently write schedule pack "
+        "fixtures into a real database (issue #779)"
+    )
     return subprocess.Popen(
-        [
-            BINARY, "mcp", "--db", ":memory:", "--no-embed", "--log", "error",
-            "--pack", "kg", "--pack", "comm", "--pack", "schedule",
-        ],
+        argv,
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -155,9 +185,10 @@ def main():
 
         # 1. Happy path remind: create → agenda shows it → cancel → agenda omits it
         def test_happy_remind(proc):
-            # Use verbose presentation so trigger_at is returned unchanged.
-            # Agent mode (default) compacts ISO-8601 timestamps to minute granularity
-            # ("2099-01-01T00:00") which is by design — see presentation.rs compact_timestamp.
+            # Verbose presentation returns the canonical handler output; since
+            # #871 Agent mode also round-trips trigger_at verbatim (payload
+            # timestamp, exempt from compact_timestamp — see presentation.rs
+            # PAYLOAD_TIMESTAMP_FIELDS), covered by test 17 below.
             ev = call_verb(proc, "schedule.remind", {
                 "content": "check the build",
                 "at": FAR_FUTURE_A,
@@ -469,12 +500,11 @@ def main():
         run_test("agenda sorted ascending by trigger_at", test_agenda_sort_order, proc)
 
         # 17. Trigger_at preserved exactly (H5: no UTC canonicalisation)
-        # NOTE: Agent mode (default) compacts ALL ISO-8601 timestamps to minute
-        # granularity. trigger_at is treated as a display timestamp by the presentation
-        # layer, so "2099-03-10T15:00:00+05:30" → "2099-03-10T15:00" in Agent mode.
-        # This is a known design tension: trigger_at is a payload value (not metadata)
-        # but the presentation layer has no way to distinguish them. Use verbose mode
-        # to verify the handler preserves the original string.
+        # NOTE: trigger_at is a caller-supplied payload value, not display
+        # metadata. Since #871 the presentation layer lists it in
+        # PAYLOAD_TIMESTAMP_FIELDS (presentation.rs), so Agent mode round-trips
+        # it verbatim — seconds and offset intact — instead of minute-truncating
+        # it (which silently changed the instant by discarding the offset).
         def test_trigger_at_preserved(proc):
             offset_at = "2099-03-10T15:00:00+05:30"
             ev = call_verb(proc, "schedule.remind", {
@@ -485,16 +515,15 @@ def main():
                 f"H5: trigger_at must be returned as-is in verbose mode; "
                 f"submitted={offset_at!r} got={ev['trigger_at']!r}"
             )
-            # In Agent mode (default) the timestamp is compacted to minute granularity.
-            # "2099-03-10T15:00:00+05:30" → first 16 chars → "2099-03-10T15:00"
+            # Agent mode (default) must also round-trip trigger_at verbatim
+            # (#871: payload timestamps are exempt from compaction).
             ev_agent = call_verb(proc, "schedule.remind", {
                 "content": "tz-preservation-agent",
                 "at": offset_at,
             })  # default=agent presentation
-            expected_agent = offset_at[:16]  # "2099-03-10T15:00"
-            assert ev_agent["trigger_at"] == expected_agent, (
-                f"Agent mode: trigger_at must be compacted to minute granularity; "
-                f"expected={expected_agent!r} got={ev_agent['trigger_at']!r}"
+            assert ev_agent["trigger_at"] == offset_at, (
+                f"Agent mode: trigger_at must round-trip verbatim (#871); "
+                f"expected={offset_at!r} got={ev_agent['trigger_at']!r}"
             )
 
         run_test("trigger_at preserved exactly (no UTC canonicalisation)", test_trigger_at_preserved, proc)

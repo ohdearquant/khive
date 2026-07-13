@@ -319,6 +319,9 @@ request(ops="link(source_id=\"<uuid-a>\", target_id=\"<uuid-b>\", relation=\"ext
 
 Immediate graph neighbors.
 
+Each returned hit includes `origin_id`, the resolved queried node. This lets
+batch callers verify that every result is associated with the submitted root.
+
 | Param        | Type            | Required | Notes                                            |
 | ------------ | --------------- | -------- | ------------------------------------------------ |
 | `node_id`    | uuid            | yes      | Node whose neighbors to return.                  |
@@ -403,7 +406,8 @@ GQL or SPARQL pattern matching (read-only). Write-shaped input (SPARQL
 INSERT/DELETE/LOAD/WITH…DELETE, GQL/Cypher CREATE/DELETE/DETACH DELETE/SET/MERGE) is
 rejected — use `create`/`update`/`link`/`merge`/`delete` to mutate the graph. Queries
 that mix fixed-length and variable-length chains are not compiled in one call; split
-them into separate `query()` calls.
+them into separate `query()` calls. GQL string equality uses SQLite `COLLATE NOCASE`,
+so `WHERE e.name = "LoRA"` matches both `LoRA` and ASCII case variants such as `lora`.
 
 | Param   | Type    | Required | Notes                                    |
 | ------- | ------- | -------- | ---------------------------------------- |
@@ -464,15 +468,16 @@ request(ops="withdraw(id=\"<proposal-id>\")")
 
 Resolve natural-language references to ids. Each ref in `refs` is resolved through:
 (1) id-string passthrough (UUID or 8+ hex prefix) via the existing by-ID path; (2) this
-actor's recently-referenced ring; (3) hybrid search over the namespace. Returns one of
+actor's recently-referenced ring; (3) a case-sensitive exact match on `entities.name`;
+(4) hybrid search over the namespace. Returns one of
 `Resolved{id,confidence}` | `Ambiguous{candidates}` | `NotFound` per ref — never a
 silent pick among close candidates. Read-only: performs no mutation.
 
-| Param   | Type            | Required | Notes                                                                                                        |
-| ------- | --------------- | -------- | ------------------------------------------------------------------------------------------------------------ |
-| `refs`  | array\<string\> | yes      | Natural-language references to resolve (UUID, hex prefix, exact entity name, or free text).                  |
-| `kind`  | string          | no       | Restricts the hybrid-search fallback (stage 3) to an entity kind. No effect on the id-string or ring stages. |
-| `limit` | integer         | no       | Max candidates returned per ref from the hybrid-search fallback. Default 5, max 20.                          |
+| Param   | Type            | Required | Notes                                                                                                           |
+| ------- | --------------- | -------- | --------------------------------------------------------------------------------------------------------------- |
+| `refs`  | array\<string\> | yes      | Natural-language references to resolve (UUID, hex prefix, exact entity name, or free text).                     |
+| `kind`  | string          | no       | Restricts the exact-name and hybrid-search stages to an entity kind. No effect on the id-string or ring stages. |
+| `limit` | integer         | no       | Max candidates returned per ref from the stage 4 hybrid-search fallback. Default 5, max 20.                     |
 
 ```
 request(ops="resolve(refs=[\"the old record\", \"<uuid>\"])")
@@ -1445,4 +1450,4 @@ request(ops="git.digest(source=\"https://github.com/org/repo\", max_items=500)")
 - [GTD Task Management](tasks.html): task lifecycle in depth.
 - [Prompt Cookbook](prompt-cookbook.html): ready-to-use verb patterns.
 - [ADR-016: request DSL](https://github.com/ohdearquant/khive/blob/main/docs/adr/ADR-016-request-dsl.md)
-- [ADR-002: edge ontology](https://github.com/ohdearquant/khive/blob/main/docs/adr/ADR-002-edge-ontology.md)
+- [ADR-002: Closed Edge Ontology](https://github.com/ohdearquant/khive/blob/main/docs/adr/ADR-002-edge-ontology.md)

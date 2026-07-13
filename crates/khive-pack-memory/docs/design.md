@@ -2,7 +2,7 @@
 
 ## ADR Compliance
 
-### ADR-021: Memory Pack (remember / recall verbs)
+### Memory Pack (remember / recall verbs) (ADR-021)
 
 - Implements `memory.remember` (commissive — creates a memory note with salience and decay)
   and `memory.recall` (assertive — retrieves memory notes via decay-aware hybrid ranking).
@@ -19,20 +19,20 @@
 - `decay_factor` must be finite and `>= 0`; no upper clamp is required.
 - Final composite score must be in `[0, 1]`.
 
-### ADR-025: Illocutionary Verb Classification
+### Illocutionary Verb Classification (ADR-025)
 
 - `memory.remember` — Commissive: commits the caller to a persistent change in the namespace.
 - `memory.recall` — Assertive: retrieves and presents the current state of affairs.
 - Sub-handlers (`recall_embed`, `recall_candidates`, `recall_fuse`, `recall_rerank`, `recall_score`)
   are all Assertive.
 
-### ADR-027: Inventory Self-Registration
+### Inventory Self-Registration (ADR-027)
 
 - `MemoryPackFactory` is submitted via `inventory::submit!` so the pack is auto-discovered at
   startup without requiring explicit registration at the call site.
 - The factory declares `requires = ["kg"]` so the runtime enforces dependency ordering.
 
-### ADR-032: Brain-Tunable Parameters
+### Brain-Tunable Parameters (ADR-032)
 
 - `MemoryPack` implements `PackTunable` so the brain pack can adjust recall scoring weights
   based on observed usage patterns.
@@ -40,7 +40,7 @@
   `memory::temporal_weight`) correspond to the three Beta posteriors in `BalancedRecallState`.
   Posterior means flow directly into `RecallConfig`.
 
-### ADR-033: Recall Reranking and Weighted Fusion
+### Recall Reranking and Weighted Fusion (ADR-033)
 
 - A rerank stage sits between fusion and final scoring in the recall pipeline.
 - When `reranker_weights` is non-empty in `RecallConfig`, weighted reranking replaces the
@@ -49,7 +49,7 @@
   config (`RecallConfig.reranker_weights`), not from the incoming request body.
 - Sub-handler `memory.recall_rerank` exposes the rerank stage as a dotted sub-verb.
 
-### ADR-043: CJK Routing for Multilingual Embedding
+### CJK Routing for Multilingual Embedding (ADR-043)
 
 - When the recall query is primarily CJK text and a multilingual embedding model is registered,
   that model is preferred over other registered models.
@@ -58,7 +58,7 @@
 - The model preference is configured via `ScoringConfig.multilingual_model` or by matching
   registered model names against known multilingual substrings.
 
-### ADR-002: Edge Ontology — Supersedes Suppression
+### Edge Ontology — Supersedes Suppression (ADR-002)
 
 - Memory recall suppresses candidates that have an inbound `supersedes` edge (i.e., the memory
   has been explicitly superseded by a newer one).
@@ -67,7 +67,7 @@
 - A property shortcut (`superseded_by` in `properties`) provides a secondary suppression path
   for archive-import compatibility when graph edges are not available.
 
-### ADR-023: Dotted Sub-Handler Naming
+### Dotted Sub-Handler Naming (ADR-023)
 
 - Recall pipeline stages are exposed as sub-handlers using dotted names:
   `memory.recall_embed`, `memory.recall_candidates`, `memory.recall_fuse`,

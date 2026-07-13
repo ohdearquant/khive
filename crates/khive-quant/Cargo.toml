@@ -13,8 +13,12 @@ categories.workspace = true
 [lib]
 bench = false
 
+[features]
+default = ["parallel"]
+parallel = ["dep:rayon"]
+
 [dependencies]
-rayon = { workspace = true }
+rayon = { workspace = true, optional = true }
 
 [dev-dependencies]
 rand = { workspace = true }

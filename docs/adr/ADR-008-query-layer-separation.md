@@ -137,8 +137,13 @@ The compiler rejects queries exceeding this depth at AST validation time.
 
 ### GQL WHERE expression
 
-GQL `WHERE` clauses require `OR` and `IN` AST nodes for non-trivial filtering. The
-query parser must support these in addition to `AND`, equality, and comparison predicates.
+GQL `WHERE` clauses support `AND` and `OR` expression nodes plus `=`, `!=`, `>`, `<`,
+`>=`, `<=`, `LIKE`, `CONTAINS`, `STARTS WITH`, `IN` list literals, and `IS NOT NULL`
+predicates. `CONTAINS` and `STARTS WITH` compile to escaped, parameterized `LIKE`
+predicates. `IN` list items may be string, integer, finite float, or boolean scalars, and
+lists may mix those types. Values are individually bound, and a list containing any string
+uses case-insensitive string collation. An empty list compiles to match nothing without
+binding value parameters. `NULL` is not a valid list item and is rejected during parsing.
 Without `OR`/`IN`, multi-value filters require N separate queries or caller-side UNION.
 
 ### Read-only constraint

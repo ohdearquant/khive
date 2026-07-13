@@ -43,7 +43,7 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 18] = [
                 name: "entity_kind",
                 param_type: "string",
                 required: false,
-                description: "Fine-grained entity kind when kind=\"entity\" (concept | document | dataset | project | person | org | artifact | service).",
+                description: "Fine-grained entity kind when kind=\"entity\" (concept | document | dataset | project | person | org | artifact | service | resource).",
             },
             ParamDef {
                 name: "note_kind",
@@ -191,7 +191,7 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 18] = [
                 name: "entity_kind",
                 param_type: "string",
                 required: false,
-                description: "Fine-grained entity kind filter when kind=\"entity\" (concept | document | dataset | project | person | org | artifact | service).",
+                description: "Fine-grained entity kind filter when kind=\"entity\" (concept | document | dataset | project | person | org | artifact | service | resource).",
             },
             ParamDef {
                 name: "entity_type",
@@ -532,7 +532,7 @@ pub(crate) static KG_HANDLERS: [HandlerDef; 18] = [
     // Assertive: retrieves immediate graph neighbors
     HandlerDef {
         name: "neighbors",
-        description: "Immediate graph neighbors",
+        description: "Immediate graph neighbors; each hit includes origin_id for the queried node",
         visibility: Visibility::Verb,
         category: VerbCategory::Assertive,
         params: &[
@@ -906,6 +906,31 @@ mod tests {
             .iter()
             .find(|h| h.name == name)
             .unwrap_or_else(|| panic!("handler {name:?} not found in KG_HANDLERS"))
+    }
+
+    /// Regression for #899: `create.entity_kind` and `list.entity_kind` hand-write
+    /// the enumerated entity-kind list in their `help=true` description text. This
+    /// asserts every canonical name in `EntityKind::NAMES` (the actual vocabulary,
+    /// ADR-001 + ADR-048's 9-kind set) appears in both descriptions, so adding or
+    /// renaming an entity kind without updating the doc text fails loudly here
+    /// instead of shipping a stale `help=true` schema.
+    #[test]
+    fn entity_kind_param_descriptions_list_all_canonical_kinds() {
+        for handler_name in ["create", "list"] {
+            let h = find_handler(handler_name);
+            let entity_kind_param = h
+                .params
+                .iter()
+                .find(|p| p.name == "entity_kind")
+                .unwrap_or_else(|| panic!("{handler_name}.entity_kind param not found"));
+            for kind in crate::vocab::EntityKind::NAMES {
+                assert!(
+                    entity_kind_param.description.contains(kind),
+                    "{handler_name}.entity_kind description missing canonical kind {kind:?}: {:?}",
+                    entity_kind_param.description
+                );
+            }
+        }
     }
 
     #[test]

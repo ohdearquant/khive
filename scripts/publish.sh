@@ -48,9 +48,9 @@ CRATES=(
     khive-quant
     khive-vamana
     khive-fold
-    khive-text
     khive-storage
     khive-bm25
+    khive-text          # dev-dep on khive-bm25 (versioned), so publish after it
     khive-fusion
     khive-db
     khive-hnsw

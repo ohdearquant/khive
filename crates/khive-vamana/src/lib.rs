@@ -9,10 +9,11 @@ pub mod index;
 pub use config::VamanaConfig;
 pub use error::{Result, VamanaError};
 pub use graph::{GreedySearchResult, VamanaGraph, VisitedSet};
+#[cfg(feature = "mmap")]
+pub use index::read_commit_fingerprint;
 pub use index::{
-    corpus_content_hash, read_commit_fingerprint, CorpusFingerprint, PersistedFingerprint,
-    VamanaIndex, VamanaIndexSnapshot, VamanaSnapshot, VAMANA_SNAPSHOT_FORMAT,
-    VAMANA_SNAPSHOT_VERSION,
+    corpus_content_hash, CorpusFingerprint, PersistedFingerprint, VamanaIndex, VamanaIndexSnapshot,
+    VamanaSnapshot, VAMANA_SNAPSHOT_FORMAT, VAMANA_SNAPSHOT_VERSION,
 };
 
 /// Build a Vamana index from a flat row-major vector slice.

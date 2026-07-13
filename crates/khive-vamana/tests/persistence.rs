@@ -1,6 +1,7 @@
 //! Integration tests for Vamana snapshot serialization, deserialization, and corruption handling.
 //! Includes v2 persistence (KHVVAMG2) tests.
 
+#[cfg(feature = "mmap")]
 use std::fs;
 
 use khive_vamana::{
@@ -23,6 +24,7 @@ fn rand_unit_vectors(n: usize, dim: usize, seed: u64) -> Vec<f32> {
     raw
 }
 
+#[cfg(feature = "mmap")]
 #[test]
 fn save_load_roundtrip_preserves_search_results() {
     let vectors = rand_unit_vectors(40, 8, 7);
@@ -41,6 +43,7 @@ fn save_load_roundtrip_preserves_search_results() {
     assert_eq!(r1, r2, "save/load must preserve search results");
 }
 
+#[cfg(feature = "mmap")]
 #[test]
 fn load_rejects_bad_metadata_magic() {
     let dir = tempfile::tempdir().unwrap();
@@ -51,6 +54,7 @@ fn load_rejects_bad_metadata_magic() {
     ));
 }
 
+#[cfg(feature = "mmap")]
 #[test]
 fn load_rejects_bad_graph_magic() {
     let vectors = rand_unit_vectors(5, 4, 8);
@@ -71,6 +75,7 @@ fn load_rejects_bad_graph_magic() {
     ));
 }
 
+#[cfg(feature = "mmap")]
 #[test]
 fn load_rejects_vector_file_wrong_length() {
     let vectors = rand_unit_vectors(5, 4, 9);
@@ -90,6 +95,7 @@ fn load_rejects_vector_file_wrong_length() {
     ));
 }
 
+#[cfg(feature = "mmap")]
 #[test]
 fn load_rejects_neighbor_out_of_range() {
     let vectors = rand_unit_vectors(4, 4, 10);
@@ -119,6 +125,7 @@ fn load_rejects_neighbor_out_of_range() {
     ));
 }
 
+#[cfg(feature = "mmap")]
 #[test]
 fn loaded_vectors_are_mmap_backed_and_searchable() {
     let vectors = rand_unit_vectors(20, 8, 11);
@@ -236,6 +243,7 @@ fn stale_snapshot_detected_by_fingerprint_mismatch() {
 // ---- V2 persistence (KHVVAMG2) tests ----
 
 /// Round-trip: save_atomic → load_or_build → all lifecycle state preserved.
+#[cfg(feature = "mmap")]
 #[test]
 fn v2_roundtrip_preserves_lifecycle_state() {
     let dim = 8usize;
@@ -308,6 +316,7 @@ fn v2_roundtrip_preserves_lifecycle_state() {
 }
 
 /// Crash consistency: corrupt metadata.bin after writing segments → load_or_build rebuilds.
+#[cfg(feature = "mmap")]
 #[test]
 fn v2_crash_corrupted_metadata_falls_back_to_rebuild() {
     let dim = 4usize;
@@ -338,6 +347,7 @@ fn v2_crash_corrupted_metadata_falls_back_to_rebuild() {
 }
 
 /// Fingerprint mismatch: modify corpus → load_or_build triggers rebuild.
+#[cfg(feature = "mmap")]
 #[test]
 fn v2_fingerprint_mismatch_triggers_rebuild() {
     let dim = 4usize;
@@ -367,6 +377,7 @@ fn v2_fingerprint_mismatch_triggers_rebuild() {
 /// FIX 1: A hub graph whose reverse-adj degree exceeds max_degree*4 must load successfully.
 /// Before the fix, parse_lifecycle would reject valid hub reverse-adjacency lists with degree
 /// > max_degree*4 even though inbound degree can legitimately reach num_vectors-1.
+#[cfg(feature = "mmap")]
 #[test]
 fn v2_hub_graph_high_inbound_degree_loads_successfully() {
     // Use a large max_degree relative to n to avoid the constraint firing for normal nodes,
@@ -400,6 +411,7 @@ fn v2_hub_graph_high_inbound_degree_loads_successfully() {
 
 /// FIX 3: metadata.bin with >=8 bytes of unknown/garbage magic causes load_or_build to
 /// rebuild rather than return InvalidFormat. (VamanaIndex::load remains strict.)
+#[cfg(feature = "mmap")]
 #[test]
 fn v2_garbage_magic_causes_load_or_build_to_rebuild() {
     let dim = 4usize;
@@ -432,6 +444,7 @@ fn v2_garbage_magic_causes_load_or_build_to_rebuild() {
 }
 
 /// V1 compat: v1-format save → load_or_build upgrades to v2.
+#[cfg(feature = "mmap")]
 #[test]
 fn v2_upgrades_v1_format_to_v2() {
     let dim = 4usize;
@@ -474,6 +487,7 @@ fn v2_upgrades_v1_format_to_v2() {
 }
 
 /// Search correctness: load via v2 → search returns same results as in-memory index.
+#[cfg(feature = "mmap")]
 #[test]
 fn v2_search_correctness_matches_in_memory() {
     let dim = 8usize;
@@ -505,6 +519,7 @@ fn v2_search_correctness_matches_in_memory() {
 
 // ---- Fix 1: reverse-adj consistency after saturated insert ----
 
+#[cfg(feature = "mmap")]
 fn assert_rev_adj_consistent(graph: &khive_vamana::VamanaGraph) {
     let adj = graph.adjacency();
     let rev = graph.reverse_adjacency();
@@ -521,6 +536,7 @@ fn assert_rev_adj_consistent(graph: &khive_vamana::VamanaGraph) {
     }
 }
 
+#[cfg(feature = "mmap")]
 #[test]
 fn v2_reverse_adj_consistent_after_saturated_insert() {
     let dim = 4usize;
@@ -545,6 +561,7 @@ fn v2_reverse_adj_consistent_after_saturated_insert() {
 
 // ---- Fix 2: rebuild on clean first run and missing segments ----
 
+#[cfg(feature = "mmap")]
 #[test]
 fn v2_empty_dir_falls_back_to_build() {
     let dim = 4usize;
@@ -557,6 +574,7 @@ fn v2_empty_dir_falls_back_to_build() {
     assert_eq!(idx.num_vectors(), 10);
 }
 
+#[cfg(feature = "mmap")]
 #[test]
 fn v2_truncated_metadata_falls_back_to_rebuild() {
     let dim = 4usize;
@@ -577,6 +595,7 @@ fn v2_truncated_metadata_falls_back_to_rebuild() {
     assert_eq!(rebuilt.num_vectors(), 10);
 }
 
+#[cfg(feature = "mmap")]
 #[test]
 fn v2_missing_vectors_bin_falls_back_to_rebuild() {
     let dim = 4usize;
@@ -595,6 +614,7 @@ fn v2_missing_vectors_bin_falls_back_to_rebuild() {
     assert_eq!(rebuilt.num_vectors(), 10);
 }
 
+#[cfg(feature = "mmap")]
 #[test]
 fn v2_missing_graph_bin_falls_back_to_rebuild() {
     let dim = 4usize;
@@ -613,6 +633,7 @@ fn v2_missing_graph_bin_falls_back_to_rebuild() {
     assert_eq!(rebuilt.num_vectors(), 10);
 }
 
+#[cfg(feature = "mmap")]
 #[test]
 fn v2_missing_lifecycle_bin_falls_back_to_rebuild() {
     let dim = 4usize;
@@ -644,6 +665,7 @@ fn v2_missing_lifecycle_bin_falls_back_to_rebuild() {
 /// Asserts both recovery paths:
 ///   (a) load_or_build REBUILDS — fresh KHVVAMG2 written, a query returns sane results.
 ///   (b) VamanaIndex::load returns InvalidFormat (strict path, no fallback).
+#[cfg(feature = "mmap")]
 #[test]
 fn v2_corrupt_reverse_adj_not_inverse_of_graph_triggers_rebuild() {
     let dim = 4usize;
@@ -766,6 +788,7 @@ fn v2_corrupt_reverse_adj_not_inverse_of_graph_triggers_rebuild() {
 
 // ---- Fix 3: staged v2new segments do not corrupt v1 restore ----
 
+#[cfg(feature = "mmap")]
 #[test]
 fn v2_v1_metadata_with_staged_v2_segments_not_torn() {
     let dim = 4usize;
@@ -794,6 +817,7 @@ fn v2_v1_metadata_with_staged_v2_segments_not_torn() {
 /// Helper: write `body` as lifecycle.bin, recompute its blake3, and patch the
 /// lifecycle_hash field in metadata.bin so the checksum gate passes.  Returns the
 /// mutated on-disk state ready for load_or_build / VamanaIndex::load.
+#[cfg(feature = "mmap")]
 fn install_corrupt_lifecycle(dir: &std::path::Path, lifecycle_body: &[u8]) {
     let lhash = *blake3::hash(lifecycle_body).as_bytes();
     fs::write(dir.join("lifecycle.bin"), lifecycle_body).unwrap();
@@ -816,6 +840,7 @@ fn install_corrupt_lifecycle(dir: &std::path::Path, lifecycle_body: &[u8]) {
 /// The lifecycle.bin blob is crafted so the blake3/commit-record gate passes (hash
 /// recomputed and patched into metadata.bin); the overflowing multiply is the gate
 /// that must trip, not the checksum.
+#[cfg(feature = "mmap")]
 #[test]
 fn v2_parse_lifecycle_huge_ts_words_returns_invalid_format_not_panic() {
     let dim = 4usize;
@@ -853,6 +878,7 @@ fn v2_parse_lifecycle_huge_ts_words_returns_invalid_format_not_panic() {
     assert_eq!(&meta_after[..8], b"KHVVAMG2");
 }
 
+#[cfg(feature = "mmap")]
 #[test]
 fn v2_parse_lifecycle_huge_fs_count_returns_invalid_format_not_panic() {
     let dim = 4usize;
@@ -901,6 +927,7 @@ fn v2_parse_lifecycle_huge_fs_count_returns_invalid_format_not_panic() {
 //   (a) VamanaIndex::load returns InvalidFormat (no panic).
 //   (b) load_or_build rebuilds successfully (no panic).
 
+#[cfg(feature = "mmap")]
 #[test]
 fn v2_parse_lifecycle_ts_add_overflow_returns_invalid_format_not_panic() {
     let dim = 4usize;
@@ -940,6 +967,7 @@ fn v2_parse_lifecycle_ts_add_overflow_returns_invalid_format_not_panic() {
     assert_eq!(&meta_after[..8], b"KHVVAMG2");
 }
 
+#[cfg(feature = "mmap")]
 #[test]
 fn v2_parse_lifecycle_fs_add_overflow_returns_invalid_format_not_panic() {
     let dim = 4usize;
@@ -988,6 +1016,7 @@ fn v2_parse_lifecycle_fs_add_overflow_returns_invalid_format_not_panic() {
 /// corrupt commit record propagate as an error out of `load_or_build` instead of rebuilding.
 /// With the fix, `parse_v2_commit` validates the embedded config and maps failures to
 /// `InvalidFormat`, so the existing corrupt-snapshot rebuild path handles it.
+#[cfg(feature = "mmap")]
 #[test]
 fn load_or_build_rebuilds_when_v2_commit_config_invalid() {
     let dim = 8usize;
@@ -1025,6 +1054,7 @@ fn load_or_build_rebuilds_when_v2_commit_config_invalid() {
 /// counted into `tombstone_count` and silently treated as tombstoned nodes past the valid
 /// node-id domain. With the fix, `parse_lifecycle` rejects tombstone bits set beyond
 /// `num_vectors` with `InvalidFormat` instead of accepting the corrupt state.
+#[cfg(feature = "mmap")]
 #[test]
 fn v2_parse_lifecycle_rejects_tombstone_bits_past_num_vectors_not_panic() {
     let dim = 4usize;

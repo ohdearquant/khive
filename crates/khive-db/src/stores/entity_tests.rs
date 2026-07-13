@@ -1,4 +1,5 @@
 use super::*;
+use crate::migrations::run_migrations;
 use crate::pool::PoolConfig;
 use std::time::Duration;
 use tokio::sync::oneshot;
@@ -41,6 +42,157 @@ fn make_entity(namespace: &str, kind: &str, name: &str) -> Entity {
         merged_into: None,
         merge_event_id: None,
     }
+}
+
+#[test]
+fn case_insensitive_candidate_lookup_uses_one_partial_index_seek_per_candidate() {
+    let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+    run_migrations(&mut conn).unwrap();
+
+    let filter = EntityFilter {
+        names_ci: vec!["lora".to_string(), "北京大学".to_string()],
+        ..EntityFilter::default()
+    };
+    let mut lookup_filter = filter.clone();
+    lookup_filter.names_ci.clear();
+    let (where_sql, mut params) = build_entity_where("local", &lookup_filter);
+    let candidate_param_indices: Vec<usize> = filter
+        .names_ci
+        .iter()
+        .map(|candidate| {
+            params.push(Box::new(candidate.to_ascii_lowercase()));
+            params.len()
+        })
+        .collect();
+    params.push(Box::new(64_i64));
+    params.push(Box::new(0_i64));
+    let limit_idx = params.len() - 1;
+    let offset_idx = params.len();
+    let data_sql = build_candidate_entity_query(
+        "id",
+        &where_sql,
+        &candidate_param_indices,
+        "created_at DESC",
+        limit_idx,
+        offset_idx,
+    );
+    assert!(!data_sql.contains("GROUP BY"));
+    assert!(data_sql.contains("FROM candidates"));
+    assert!(data_sql.contains("LIMIT 1"));
+
+    let sql = format!("EXPLAIN QUERY PLAN {data_sql}");
+    let mut stmt = conn.prepare(&sql).unwrap();
+    let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+        params.iter().map(|param| param.as_ref()).collect();
+    let details: Vec<String> = stmt
+        .query_map(param_refs.as_slice(), |row| row.get(3))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+
+    assert!(
+        details.iter().any(|detail| {
+            detail.contains("SEARCH entities USING INDEX idx_entities_namespace_name_ci")
+        }),
+        "candidate lookup must seek the case-insensitive expression index: {details:?}"
+    );
+    assert!(
+        details
+            .iter()
+            .any(|detail| detail.contains("CORRELATED SCALAR SUBQUERY")),
+        "candidate relation must drive one scalar lookup per name: {details:?}"
+    );
+    assert!(
+        !details
+            .iter()
+            .any(|detail| detail.contains("SCAN entities")),
+        "candidate lookup must not scan entities: {details:?}"
+    );
+
+    let index_sql: String = conn
+        .query_row(
+            "SELECT sql FROM sqlite_master \
+             WHERE type = 'index' AND name = 'idx_entities_namespace_name_ci'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(
+        index_sql.contains("WHERE deleted_at IS NULL"),
+        "candidate lookup index must exclude tombstones: {index_sql}"
+    );
+}
+
+#[tokio::test]
+async fn case_insensitive_candidate_lookup_skips_unbounded_total_count() {
+    let store = setup_memory_store();
+    store
+        .upsert_entity(make_entity("local", "concept", "LoRA"))
+        .await
+        .unwrap();
+
+    let page = store
+        .query_entities(
+            "local",
+            EntityFilter {
+                names_ci: vec!["lora".to_string()],
+                ..EntityFilter::default()
+            },
+            PageRequest {
+                limit: 64,
+                offset: 0,
+            },
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(page.items.len(), 1);
+    assert_eq!(page.items[0].name, "LoRA");
+    assert_eq!(page.total, None);
+}
+
+#[tokio::test]
+async fn case_insensitive_candidate_lookup_caps_folded_names_not_duplicate_rows() {
+    let store = setup_memory_store();
+    let mut older_b = make_entity("local", "concept", "crowdbeta");
+    older_b.created_at = 1;
+    older_b.updated_at = 1;
+    store.upsert_entity(older_b).await.unwrap();
+
+    for created_at in 2..=258 {
+        let mut newer_a = make_entity("local", "concept", "CrowdAlpha");
+        newer_a.created_at = created_at;
+        newer_a.updated_at = created_at;
+        store.upsert_entity(newer_a).await.unwrap();
+    }
+
+    let page = store
+        .query_entities(
+            "local",
+            EntityFilter {
+                names_ci: vec![
+                    "CrowdAlpha".to_string(),
+                    "crowdalpha".to_string(),
+                    "crowdbeta".to_string(),
+                ],
+                ..EntityFilter::default()
+            },
+            PageRequest {
+                limit: 256,
+                offset: 0,
+            },
+        )
+        .await
+        .unwrap();
+
+    let folded_names: Vec<String> = page
+        .items
+        .iter()
+        .map(|entity| entity.name.to_lowercase())
+        .collect();
+    assert_eq!(folded_names.len(), 2);
+    assert!(folded_names.contains(&"crowdalpha".to_string()));
+    assert!(folded_names.contains(&"crowdbeta".to_string()));
 }
 
 #[tokio::test]
@@ -348,6 +500,28 @@ async fn test_count_entities() {
         .await
         .unwrap();
     assert_eq!(count_other, 0);
+}
+
+#[tokio::test]
+async fn count_entities_normalizes_case_insensitive_names() {
+    let store = setup_memory_store();
+    store
+        .upsert_entity(make_entity("local", "concept", "LoRA"))
+        .await
+        .unwrap();
+
+    let count = store
+        .count_entities(
+            "local",
+            EntityFilter {
+                names_ci: vec!["LORA".to_string()],
+                ..EntityFilter::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(count, 1);
 }
 
 #[tokio::test]

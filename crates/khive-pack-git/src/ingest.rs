@@ -891,6 +891,60 @@ fn truncated_embedding_head(content: &str) -> Option<&str> {
     Some(&content[..end])
 }
 
+/// Every `RawCommit` string field funnels through this constructor before it
+/// can reach `properties` or the note `name`. `new` destructures `RawCommit`
+/// exhaustively (no `..`), so a future new field on `RawCommit` forces a
+/// compile error here before it can silently skip this boundary -- the same
+/// discipline `MaskedIssueFields` (below) already applies to `GhIssue`
+/// (issue #841, mirroring the #835 review's fix direction: "one sanitization
+/// boundary that masks every externally controlled string before
+/// constructing properties, so omissions are structurally hard").
+///
+/// `sha`/`short_sha`/`committed_at`/`parents` are git-computed hashes and an
+/// RFC3339 timestamp -- not attacker-authored free text -- so they pass
+/// through unchanged, matching how `MaskedIssueFields` leaves its own
+/// timestamp fields to a separate canonicalization step rather than masking
+/// them. `author`, `author_email`, `subject`, and `body` are git-config- and
+/// commit-message-controlled prose and go through the same `mask_secrets`
+/// gate `content` already used -- closing the gap where the commit note
+/// `name` (built from the raw subject) and its `author`/`author_email`
+/// properties skipped masking entirely.
+struct MaskedCommitFields {
+    sha: String,
+    short_sha: String,
+    author: String,
+    author_email: String,
+    committed_at: String,
+    parents: Vec<String>,
+    subject: String,
+    body: String,
+}
+
+impl MaskedCommitFields {
+    fn new(commit: &RawCommit) -> Self {
+        let RawCommit {
+            sha,
+            short_sha,
+            author,
+            author_email,
+            committed_at,
+            parents,
+            subject,
+            body,
+        } = commit;
+        Self {
+            sha: sha.clone(),
+            short_sha: short_sha.clone(),
+            author: secret_gate::mask_secrets(author).into_owned(),
+            author_email: secret_gate::mask_secrets(author_email).into_owned(),
+            committed_at: committed_at.clone(),
+            parents: parents.clone(),
+            subject: secret_gate::mask_secrets(subject).into_owned(),
+            body: secret_gate::mask_secrets(body).into_owned(),
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn ingest_commits(
     runtime: &KhiveRuntime,
@@ -948,12 +1002,12 @@ async fn ingest_commits(
             break;
         }
 
-        let raw_content = if c.body.trim().is_empty() {
-            c.subject.clone()
+        let masked = MaskedCommitFields::new(c);
+        let content = if masked.body.trim().is_empty() {
+            masked.subject.clone()
         } else {
-            format!("{}\n\n{}", c.subject, c.body)
+            format!("{}\n\n{}", masked.subject, masked.body)
         };
-        let content = secret_gate::mask_secrets(&raw_content).into_owned();
 
         let mut annotates = vec![project_id.to_string()];
 
@@ -988,15 +1042,18 @@ async fn ingest_commits(
         }
 
         let properties = json!({
-            "sha": c.sha,
-            "short_sha": c.short_sha,
-            "author": c.author,
-            "author_email": c.author_email,
-            "committed_at": c.committed_at,
-            "parents": c.parents,
+            "sha": masked.sha,
+            "short_sha": masked.short_sha,
+            "author": masked.author,
+            "author_email": masked.author_email,
+            "committed_at": masked.committed_at,
+            "parents": masked.parents,
         });
 
-        let name = refs::truncate_chars(&format!("{} {}", c.short_sha, c.subject), NAME_MAX_CHARS);
+        let name = refs::truncate_chars(
+            &format!("{} {}", masked.short_sha, masked.subject),
+            NAME_MAX_CHARS,
+        );
         let embedding_head = truncated_embedding_head(&content);
 
         let mut create_request = json!({
@@ -1383,6 +1440,70 @@ fn fetch_issue_page(repo: &Path, floor: Option<&str>) -> Result<Vec<GhIssue>> {
     serde_json::from_str(&raw).context("parsing gh issue list --json")
 }
 
+/// Every `GhPr` field funnels through this constructor before it can reach
+/// `properties`/`content`/the note `name`/the in-memory PR-linking maps.
+/// `new` consumes `GhPr` by value and destructures it exhaustively (no
+/// `..`), so the original `pr` binding no longer exists after the call and a
+/// future new `GhPr` field forces a compile error here before it can
+/// silently skip this boundary -- the same discipline `MaskedIssueFields`
+/// applies to `GhIssue` (issue #841: PR author, base ref, and head ref were
+/// the residual raw fields after #835's title fix; mirrors the #835 review's
+/// fix direction of one sanitization boundary per record type).
+///
+/// `number`, `created_at`/`merged_at`/`closed_at`/`updated_at`, and
+/// `merge_commit`'s `oid` are GitHub-generated (not attacker-authored free
+/// text) and pass through unchanged, matching how `MaskedIssueFields`
+/// leaves its own timestamp fields to canonicalization rather than masking.
+/// `title`, `body`, the author login, and both ref names are
+/// contributor-controlled prose and go through the same `mask_secrets` gate
+/// `content`/`title` already used for PRs.
+struct MaskedPrFields {
+    number: u64,
+    title: String,
+    body: String,
+    author_login: Option<String>,
+    created_at: Option<String>,
+    merged_at: Option<String>,
+    closed_at: Option<String>,
+    updated_at: Option<String>,
+    base_ref_name: Option<String>,
+    head_ref_name: Option<String>,
+    merge_commit_oid: Option<String>,
+}
+
+impl MaskedPrFields {
+    fn new(pr: GhPr) -> Self {
+        let GhPr {
+            number,
+            title,
+            author,
+            created_at,
+            merged_at,
+            closed_at,
+            updated_at,
+            base_ref_name,
+            head_ref_name,
+            merge_commit,
+            body,
+        } = pr;
+        Self {
+            number,
+            title: secret_gate::mask_secrets(&title).into_owned(),
+            body: secret_gate::mask_secrets(&body.unwrap_or_default()).into_owned(),
+            author_login: author
+                .and_then(|a| a.login)
+                .map(|login| secret_gate::mask_secrets(&login).into_owned()),
+            created_at,
+            merged_at,
+            closed_at,
+            updated_at,
+            base_ref_name: base_ref_name.map(|r| secret_gate::mask_secrets(&r).into_owned()),
+            head_ref_name: head_ref_name.map(|r| secret_gate::mask_secrets(&r).into_owned()),
+            merge_commit_oid: merge_commit.and_then(|m| m.oid),
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn ingest_prs(
     runtime: &KhiveRuntime,
@@ -1457,22 +1578,23 @@ async fn ingest_prs(
                 break;
             }
 
-            let raw_body = pr.body.unwrap_or_default();
-            let content = secret_gate::mask_secrets(&raw_body).into_owned();
-            let safe_title = secret_gate::mask_secrets(&pr.title).into_owned();
+            let masked = MaskedPrFields::new(pr);
+            let content = masked.body;
             let properties = json!({
-                "number": pr.number,
-                "title": safe_title,
-                "author": pr.author.and_then(|a| a.login),
-                "created_at": pr.created_at,
-                "merged_at": pr.merged_at,
-                "closed_at": pr.closed_at,
-                "base_ref": pr.base_ref_name,
-                "head_ref": pr.head_ref_name,
+                "number": masked.number,
+                "title": masked.title,
+                "author": masked.author_login,
+                "created_at": masked.created_at,
+                "merged_at": masked.merged_at,
+                "closed_at": masked.closed_at,
+                "base_ref": masked.base_ref_name,
+                "head_ref": masked.head_ref_name,
                 "project_id": project_id.to_string(),
             });
-            let name =
-                refs::truncate_chars(&format!("#{} {}", pr.number, safe_title), NAME_MAX_CHARS);
+            let name = refs::truncate_chars(
+                &format!("#{} {}", masked.number, masked.title),
+                NAME_MAX_CHARS,
+            );
 
             budget.try_consume();
             let result = match registry
@@ -1492,7 +1614,7 @@ async fn ingest_prs(
                 Err(e) => {
                     report
                         .warnings
-                        .push(format!("create pull_request #{}: {e}", pr.number));
+                        .push(format!("create pull_request #{}: {e}", masked.number));
                     cursor_stalled = true;
                     continue;
                 }
@@ -1503,8 +1625,8 @@ async fn ingest_prs(
                 .and_then(|v| v.as_str())
                 .and_then(|s| Uuid::parse_str(s).ok())
             {
-                number_to_pr.insert(pr.number, id);
-                if let Some(oid) = pr.merge_commit.and_then(|m| m.oid) {
+                number_to_pr.insert(masked.number, id);
+                if let Some(oid) = masked.merge_commit_oid {
                     merge_sha_to_pr.insert(oid, id);
                 }
                 new_records.push(NewRecordForRef {
@@ -1514,7 +1636,7 @@ async fn ingest_prs(
             }
             report.prs_ingested += 1;
             if !cursor_stalled {
-                if let Some(u) = &pr.updated_at {
+                if let Some(u) = &masked.updated_at {
                     if max_updated
                         .as_deref()
                         .map(|m| u.as_str() > m)

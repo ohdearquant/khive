@@ -79,14 +79,14 @@ pub struct CandidateContext<'a> {
 }
 
 /// Returns `true` when `needle` occurs in `haystack` at a **word (character)
-/// boundary** — the character immediately before the match (if any) and the
+/// boundary**. The character immediately before the match (if any) and the
 /// character immediately after the match (if any) are both non-alphanumeric
 /// (or the match sits at the start/end of `haystack`).
 ///
 /// Plain substring `contains` matches inside unrelated words: a candidate
 /// `"beta"` matches `"alphabet"` and `"betamax"`; `"car"` matches
 /// `"scarcity"`. Anchoring to boundaries closes that class of false positive
-/// while still matching multi-word phrases on their own boundaries — a
+/// while still matching multi-word phrases on their own boundaries. A
 /// caller-supplied explicit name like `"knowledge graph"` still matches
 /// `"...the knowledge graph shows..."` because the space characters on
 /// either side of the phrase are themselves non-alphanumeric, satisfying the
@@ -97,6 +97,9 @@ pub struct CandidateContext<'a> {
 fn contains_at_word_boundary(haystack: &str, needle: &str) -> bool {
     if needle.is_empty() {
         return false;
+    }
+    if needle.chars().all(is_cjk_char) {
+        return haystack.contains(needle);
     }
     let haystack_chars: Vec<char> = haystack.chars().collect();
     let needle_chars: Vec<char> = needle.chars().collect();
@@ -328,6 +331,194 @@ pub fn extract_entity_candidates(query: &str) -> Vec<String> {
             out.push(lower);
             if out.len() >= MAX_AUTO_ENTITY_NAMES {
                 break;
+            }
+        }
+    }
+    out
+}
+
+/// Maximum number of candidate strings a single recall sends to the batched
+/// entity-name lookup
+/// (ADR-104 §5 / Stage C, rider R1). Bounds the candidate `VALUES` relation
+/// consumed by `khive-db`, independent of `MAX_AUTO_ENTITY_NAMES`, which bounds
+/// the unrelated capitalized-token fallback list above.
+pub const MAX_ENTITY_LOOKUP_CANDIDATES: usize = 64;
+
+const MAX_BIGRAM_LOOKUP_CANDIDATES: usize = MAX_ENTITY_LOOKUP_CANDIDATES / 4;
+const MIN_CJK_LOOKUP_CHARS: usize = 2;
+const MAX_CJK_LOOKUP_CHARS: usize = 8;
+
+fn entity_lookup_case_variants(candidate: String) -> [Option<String>; 2] {
+    let lower = candidate.to_ascii_lowercase();
+    if candidate.is_ascii() {
+        [None, Some(lower)]
+    } else {
+        [Some(candidate), Some(lower)]
+    }
+}
+
+/// Build the candidate strings a recall query offers to the entity-anchored
+/// lookup (ADR-104 §5 / Stage C). Alphabetic-script queries contribute
+/// ASCII-lowercased non-stopword unigrams and reserve one quarter of the cap
+/// for adjacent-token bigrams. Candidates containing non-ASCII characters also
+/// retain their raw form for exact matching. CJK substrings reserve a fair quota
+/// for every supported length from 2 through 8, redistributing unused quota from
+/// short runs. Within each length, available start positions are sampled evenly.
+/// Quotas greater than one guarantee both the first and final valid starts;
+/// a quota of one selects the first endpoint. The result is both length-fair
+/// and position-fair under the 64-candidate cap. All candidates are deduplicated.
+///
+/// Unlike `extract_entity_candidates` above, this does **not** filter on
+/// capitalization, lowercase queries are the whole point of this extension.
+/// The precision-safety property instead comes from the caller (the
+/// `memory.recall` handler) only keeping a candidate that matches the *name*
+/// of a real KG entity, via one batched `EntityFilter::names_ci` lookup.
+pub fn entity_lookup_candidates(query: &str) -> Vec<String> {
+    let tokens: Vec<String> = query
+        .split_whitespace()
+        .map(strip_token_punctuation)
+        .filter(|t| !t.is_empty())
+        .map(str::to_owned)
+        .collect();
+
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut out: Vec<String> = Vec::new();
+
+    let chars: Vec<char> = query.chars().collect();
+    let mut cjk_runs = Vec::new();
+    let mut run_start = 0;
+    while run_start < chars.len() {
+        if !is_cjk_char(chars[run_start]) {
+            run_start += 1;
+            continue;
+        }
+        let mut run_end = run_start + 1;
+        while run_end < chars.len() && is_cjk_char(chars[run_end]) {
+            run_end += 1;
+        }
+        cjk_runs.push((run_start, run_end));
+        run_start = run_end;
+    }
+
+    let length_count = MAX_CJK_LOOKUP_CHARS - MIN_CJK_LOOKUP_CHARS + 1;
+    let base_quota = MAX_ENTITY_LOOKUP_CANDIDATES / length_count;
+    let quota_remainder = MAX_ENTITY_LOOKUP_CANDIDATES % length_count;
+
+    let cjk_candidates: Vec<Vec<String>> = (MIN_CJK_LOOKUP_CHARS..=MAX_CJK_LOOKUP_CHARS)
+        .map(|len| {
+            let mut last_start_by_candidate = std::collections::HashMap::new();
+            for &(run_start, run_end) in &cjk_runs {
+                if run_end - run_start < len {
+                    continue;
+                }
+                for start in run_start..=run_end - len {
+                    let candidate: String = chars[start..start + len].iter().collect();
+                    last_start_by_candidate.insert(candidate, start);
+                }
+            }
+
+            let mut positioned: Vec<(usize, String)> = last_start_by_candidate
+                .into_iter()
+                .map(|(candidate, start)| (start, candidate))
+                .collect();
+            positioned.sort_unstable_by_key(|(start, _)| *start);
+            positioned
+                .into_iter()
+                .map(|(_, candidate)| candidate)
+                .collect()
+        })
+        .collect();
+
+    let mut quotas: Vec<usize> = (0..length_count)
+        .map(|index| base_quota + usize::from(index < quota_remainder))
+        .collect();
+    let mut unused = 0;
+    for (quota, candidates) in quotas.iter_mut().zip(&cjk_candidates) {
+        if candidates.len() < *quota {
+            unused += *quota - candidates.len();
+            *quota = candidates.len();
+        }
+    }
+    while unused > 0 {
+        let mut redistributed = false;
+        for (quota, candidates) in quotas.iter_mut().zip(&cjk_candidates) {
+            if *quota < candidates.len() {
+                *quota += 1;
+                unused -= 1;
+                redistributed = true;
+                if unused == 0 {
+                    break;
+                }
+            }
+        }
+        if !redistributed {
+            break;
+        }
+    }
+
+    for (candidates, quota) in cjk_candidates.iter().zip(quotas) {
+        if quota == 0 {
+            continue;
+        }
+        let num_positions = candidates.len();
+        let mut sampled_indices = if quota == 1 {
+            vec![0]
+        } else {
+            (0..quota)
+                .map(|index| index * (num_positions - 1) / (quota - 1))
+                .collect::<Vec<_>>()
+        };
+        sampled_indices.dedup();
+        for index in sampled_indices {
+            let candidate = candidates[index].clone();
+            if seen.insert(candidate.clone()) {
+                out.push(candidate);
+            }
+        }
+    }
+    if out.len() >= MAX_ENTITY_LOOKUP_CANDIDATES {
+        return out;
+    }
+
+    let mut bigrams = tokens
+        .windows(2)
+        .map(|pair| format!("{} {}", pair[0], pair[1]));
+    for bigram in bigrams.by_ref().take(MAX_BIGRAM_LOOKUP_CANDIDATES) {
+        for candidate in entity_lookup_case_variants(bigram).into_iter().flatten() {
+            if seen.insert(candidate.clone()) {
+                out.push(candidate);
+                if out.len() >= MAX_ENTITY_LOOKUP_CANDIDATES {
+                    return out;
+                }
+            }
+        }
+    }
+
+    for token in tokens.iter().filter(|token| {
+        !ENTITY_STOPWORDS.contains(&token.to_ascii_lowercase().as_str())
+            && !token.chars().all(is_cjk_char)
+    }) {
+        for candidate in entity_lookup_case_variants(token.clone())
+            .into_iter()
+            .flatten()
+        {
+            if seen.insert(candidate.clone()) {
+                out.push(candidate);
+                if out.len() >= MAX_ENTITY_LOOKUP_CANDIDATES {
+                    return out;
+                }
+            }
+        }
+    }
+
+    // If the unigram share did not fill the cap, admit more adjacent bigrams.
+    for bigram in bigrams {
+        for candidate in entity_lookup_case_variants(bigram).into_iter().flatten() {
+            if seen.insert(candidate.clone()) {
+                out.push(candidate);
+                if out.len() >= MAX_ENTITY_LOOKUP_CANDIDATES {
+                    return out;
+                }
             }
         }
     }
@@ -1144,6 +1335,54 @@ mod tests {
         assert!(extract_entity_candidates("is the a of").is_empty());
     }
 
+    #[test]
+    fn entity_lookup_candidates_is_length_and_position_fair_for_long_cjk_run() {
+        let run: String = (0..65)
+            .map(|offset| char::from_u32(0x4e00 + offset).expect("valid CJK character"))
+            .collect();
+        let candidates = entity_lookup_candidates(&run);
+
+        assert_eq!(candidates.len(), MAX_ENTITY_LOOKUP_CANDIDATES);
+        for len in MIN_CJK_LOOKUP_CHARS..=MAX_CJK_LOOKUP_CHARS {
+            let expected_quota = MAX_ENTITY_LOOKUP_CANDIDATES
+                / (MAX_CJK_LOOKUP_CHARS - MIN_CJK_LOOKUP_CHARS + 1)
+                + usize::from(len == MIN_CJK_LOOKUP_CHARS);
+            assert_eq!(
+                candidates
+                    .iter()
+                    .filter(|candidate| candidate.chars().count() == len)
+                    .count(),
+                expected_quota,
+                "candidate set must reserve the exact quota for length {len}"
+            );
+
+            let chars: Vec<char> = run.chars().collect();
+            let has_late_candidate = (chars.len() - 10..=chars.len() - len).any(|start| {
+                let expected: String = chars[start..start + len].iter().collect();
+                candidates.contains(&expected)
+            });
+            assert!(
+                has_late_candidate,
+                "length {len} must include a candidate starting in the final 10 positions"
+            );
+        }
+    }
+
+    #[test]
+    fn entity_lookup_candidates_retains_final_bigram_independent_of_ascii_case() {
+        let lowercase = "one two three four five six seven eight nine ten eleven twelve thirteen fourteen fifteen sixteen final entity";
+        let title_case = "One Two Three Four Five Six Seven Eight Nine Ten Eleven Twelve Thirteen Fourteen Fifteen Sixteen Final Entity";
+
+        let lowercase_candidates = entity_lookup_candidates(lowercase);
+        let title_case_candidates = entity_lookup_candidates(title_case);
+        let stored_name_ci = "Final Entity".to_ascii_lowercase();
+
+        assert_eq!(title_case_candidates, lowercase_candidates);
+        assert!(lowercase_candidates.contains(&stored_name_ci));
+        assert!(title_case_candidates.contains(&stored_name_ci));
+        assert!(!title_case_candidates.contains(&"Final Entity".to_string()));
+    }
+
     // ── EntityMatch word-boundary matching ──────────────────────────────────────
 
     fn entity_match_ctx<'a>(content: &'a str, entity_names: &'a [String]) -> CandidateContext<'a> {
@@ -1225,6 +1464,20 @@ mod tests {
             AdjustmentCondition::EntityMatch.matches(&ctx),
             "boundary anchoring must not break matching the actual word"
         );
+    }
+
+    #[test]
+    fn entity_match_condition_matches_contiguous_cjk_with_cjk_on_both_sides() {
+        let entity_names = vec!["北京大学".to_string()];
+        let ctx = entity_match_ctx("我在北京大学学习", &entity_names);
+        assert!(AdjustmentCondition::EntityMatch.matches(&ctx));
+    }
+
+    #[test]
+    fn entity_match_condition_keeps_alphabetic_word_boundaries() {
+        let entity_names = vec!["rust".to_string()];
+        let ctx = entity_match_ctx("trust requires evidence", &entity_names);
+        assert!(!AdjustmentCondition::EntityMatch.matches(&ctx));
     }
 
     // ── ADR-104 §2 (Stage B): entity_posterior_term ────────────────────────────

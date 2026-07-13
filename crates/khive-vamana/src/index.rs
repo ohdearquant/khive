@@ -1,5 +1,8 @@
 //! Vamana index: build, search, save/load, and snapshot serialization.
 
+use std::collections::{HashMap, HashSet};
+
+#[cfg(feature = "mmap")]
 use std::{
     fs::{self, File},
     io::Write,
@@ -7,7 +10,9 @@ use std::{
 };
 
 use bytemuck::cast_slice;
+#[cfg(feature = "mmap")]
 use memmap2::MmapOptions;
+#[cfg(feature = "parallel")]
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
@@ -23,6 +28,7 @@ use crate::{
     },
 };
 
+#[cfg(feature = "mmap")]
 const METADATA_MAGIC: &[u8; 8] = b"KHVVAMM1";
 const GRAPH_MAGIC: &[u8; 8] = b"KHVVAMG1";
 
@@ -31,6 +37,10 @@ const V2_COMMIT_MAGIC: &[u8; 8] = b"KHVVAMG2";
 
 // lifecycle.bin magic for v2 persistence.
 const LIFECYCLE_MAGIC: &[u8; 8] = b"KHVVLIF1";
+const PORTABLE_MAGIC: &[u8; 8] = b"KHVVAMAC";
+const PORTABLE_VERSION: u32 = 1;
+const PORTABLE_IDS_MAGIC: &[u8; 8] = b"KHVEXTID";
+const PORTABLE_IDS_VERSION: u32 = 1;
 
 /// Default ops-since-consolidation threshold (ADR-052 §2, OQ5 resolution).
 const DEFAULT_CONSOLIDATION_TAU: usize = 40_000;
@@ -268,13 +278,18 @@ pub struct VamanaSnapshot {
 
 enum VectorStorage {
     Owned(Vec<f32>),
-    Mmap { mmap: memmap2::Mmap, len_f32: usize },
+    #[cfg(feature = "mmap")]
+    Mmap {
+        mmap: memmap2::Mmap,
+        len_f32: usize,
+    },
 }
 
 impl std::fmt::Debug for VectorStorage {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Owned(v) => write!(f, "Owned(len={})", v.len()),
+            #[cfg(feature = "mmap")]
             Self::Mmap { len_f32, .. } => write!(f, "Mmap(len_f32={len_f32})"),
         }
     }
@@ -284,6 +299,7 @@ impl VectorStorage {
     fn as_slice(&self) -> Result<&[f32]> {
         match self {
             Self::Owned(v) => Ok(v.as_slice()),
+            #[cfg(feature = "mmap")]
             Self::Mmap { mmap, len_f32 } => {
                 let floats: &[f32] = bytemuck::try_cast_slice(mmap.as_ref())
                     .map_err(|_| VamanaError::invalid_format("vector mmap cast failed".into()))?;
@@ -463,7 +479,164 @@ impl VamanaIndex {
         Ok(output)
     }
 
+    /// Encode this index into the ADR-110 portable container.
+    pub fn to_bytes(&self, external_ids: &[(u32, String)]) -> Result<Vec<u8>> {
+        let vectors = cast_slice(self.vectors()?).to_vec();
+        let graph = encode_graph_lossless(&self.graph)?;
+        let lifecycle = encode_lifecycle(
+            &self.tombstones,
+            &self.free_slots,
+            self.graph.reverse_adjacency(),
+            self.ops_since_consolidation,
+        );
+
+        let vectors_hash = *blake3::hash(&vectors).as_bytes();
+        let graph_hash = *blake3::hash(&graph).as_bytes();
+        let lifecycle_hash = *blake3::hash(&lifecycle).as_bytes();
+        let fingerprint = V2CorpusFingerprint {
+            vector_count: self.num_vectors as u64,
+            dimensions: self.dimensions as u64,
+            content_hash: vectors_hash,
+        };
+        let metadata = encode_v2_commit_full(
+            &vectors_hash,
+            &graph_hash,
+            &lifecycle_hash,
+            &fingerprint,
+            self.num_vectors,
+            self.dimensions,
+            self.config.max_degree,
+            self.config.search_list_size,
+            self.config.alpha,
+        );
+
+        let mut segments = vec![
+            ("metadata.bin", metadata),
+            ("vectors.bin", vectors),
+            ("graph.bin", graph),
+            ("lifecycle.bin", lifecycle),
+        ];
+        if !external_ids.is_empty() {
+            segments.push(("portable_ids.bin", encode_portable_ids(self, external_ids)?));
+        }
+        encode_portable_container(&segments)
+    }
+
+    /// Decode an ADR-110 portable container into owned storage and its live ID mapping.
+    pub fn from_bytes(bytes: &[u8]) -> Result<(Self, Vec<(u32, String)>)> {
+        let segments = parse_portable_container(bytes)?;
+        let metadata = required_segment(&segments, "metadata.bin")?;
+        let vectors = required_segment(&segments, "vectors.bin")?;
+        let graph = required_segment(&segments, "graph.bin")?;
+        let lifecycle = required_segment(&segments, "lifecycle.bin")?;
+
+        let index = Self::from_v2_bytes(metadata, vectors, graph, lifecycle)?;
+        let external_ids = match segments.get("portable_ids.bin") {
+            Some(ids) => parse_portable_ids(ids, &index)?,
+            None => Vec::new(),
+        };
+        Ok((index, external_ids))
+    }
+
+    fn from_v2_bytes(
+        metadata: &[u8],
+        vector_bytes: &[u8],
+        graph_bytes: &[u8],
+        lifecycle_bytes: &[u8],
+    ) -> Result<Self> {
+        let commit = parse_v2_commit(metadata)?;
+        let vectors_hash = *blake3::hash(vector_bytes).as_bytes();
+        if vectors_hash != commit.vectors_hash
+            || *blake3::hash(graph_bytes).as_bytes() != commit.graph_hash
+            || *blake3::hash(lifecycle_bytes).as_bytes() != commit.lifecycle_hash
+        {
+            return Err(VamanaError::invalid_format(
+                "v2 segment checksum mismatch".into(),
+            ));
+        }
+        if commit.fingerprint.vector_count != commit.index_meta.num_vectors as u64
+            || commit.fingerprint.dimensions != commit.index_meta.dimensions as u64
+            || commit.fingerprint.content_hash != vectors_hash
+        {
+            return Err(VamanaError::invalid_format(
+                "v2 corpus fingerprint mismatch".into(),
+            ));
+        }
+
+        let config = VamanaConfig {
+            dimensions: commit.index_meta.dimensions,
+            max_degree: commit.index_meta.max_degree,
+            search_list_size: commit.index_meta.search_list_size,
+            alpha: commit.index_meta.alpha,
+        };
+        config.validate()?;
+        let num_vectors = commit.index_meta.num_vectors;
+        let expected_floats = num_vectors
+            .checked_mul(config.dimensions)
+            .ok_or_else(|| VamanaError::invalid_format("v2 metadata overflow".into()))?;
+        let expected_bytes = expected_floats
+            .checked_mul(std::mem::size_of::<f32>())
+            .ok_or_else(|| {
+                VamanaError::invalid_format("vectors.bin byte length overflow".into())
+            })?;
+        if vector_bytes.len() != expected_bytes {
+            return Err(VamanaError::invalid_format(format!(
+                "vectors.bin byte length {} != expected {expected_bytes}",
+                vector_bytes.len()
+            )));
+        }
+        let vectors: Vec<f32> = vector_bytes
+            .chunks_exact(4)
+            .map(|bytes| f32::from_le_bytes(bytes.try_into().expect("four-byte chunk")))
+            .collect();
+        require_finite(&vectors, "portable vectors")?;
+
+        let mut graph = parse_graph(graph_bytes, config.max_degree, num_vectors)?;
+        let parsed = parse_lifecycle(lifecycle_bytes, num_vectors, config.max_degree)?;
+        validate_reverse_adjacency(&graph, &parsed.reverse_adj)?;
+        graph.restore_reverse_adj(parsed.reverse_adj);
+
+        let tombstone_count = parsed
+            .tombstones
+            .iter()
+            .map(|word| word.count_ones() as usize)
+            .sum();
+        if tombstone_count > num_vectors {
+            return Err(VamanaError::invalid_format(format!(
+                "lifecycle.bin tombstone_count {tombstone_count} exceeds num_vectors {num_vectors}"
+            )));
+        }
+        let mut free_slots = HashSet::with_capacity(parsed.free_slots.len());
+        for &slot in &parsed.free_slots {
+            if slot as usize >= num_vectors
+                || !is_tombstoned_bit(&parsed.tombstones, slot as usize)
+                || !free_slots.insert(slot)
+            {
+                return Err(VamanaError::invalid_format(format!(
+                    "lifecycle.bin invalid free slot {slot}"
+                )));
+            }
+        }
+
+        let (gs_codec, gs_codes) = train_codec_and_encode(&vectors, config.dimensions);
+        Ok(Self {
+            vectors: VectorStorage::Owned(vectors),
+            graph,
+            dimensions: config.dimensions,
+            config,
+            num_vectors,
+            tombstones: parsed.tombstones,
+            tombstone_count,
+            ops_since_consolidation: parsed.ops_since_consolidation,
+            free_slots: parsed.free_slots,
+            consolidation_tau: DEFAULT_CONSOLIDATION_TAU,
+            gs_codec,
+            gs_codes,
+        })
+    }
+
     /// Persist the index to `path` (a directory); writes `metadata.bin`, `graph.bin`, `vectors.bin`.
+    #[cfg(feature = "mmap")]
     pub fn save(&self, path: &Path) -> Result<()> {
         fs::create_dir_all(path)?;
         write_metadata(&path.join("metadata.bin"), self)?;
@@ -479,6 +652,7 @@ impl VamanaIndex {
     /// segment path (`load_v2_raw`); a legacy v1 metadata blob takes the path
     /// below. Neither path rebuilds — a corrupt, torn, or absent index returns an error,
     /// leaving the recovery decision to the caller (see [`Self::load_or_build`]).
+    #[cfg(feature = "mmap")]
     pub fn load(path: &Path) -> Result<Self> {
         let metadata_path = path.join("metadata.bin");
         let head = fs::read(&metadata_path)?;
@@ -549,6 +723,7 @@ impl VamanaIndex {
     ///
     /// Segments are staged under `.v2new` suffixes so a crash between segment write and
     /// metadata rename does not corrupt a live v1-format set of segments.
+    #[cfg(feature = "mmap")]
     pub fn save_atomic(&self, path: &Path) -> Result<()> {
         fs::create_dir_all(path)?;
 
@@ -573,20 +748,7 @@ impl VamanaIndex {
         //    The medoid's forward list may exceed max_degree in-memory; write_graph caps it
         //    before serialization. Build reverse adj from the same capped view so that
         //    lifecycle.bin stays consistent with graph.bin after restore.
-        let adjacency = self.graph.adjacency();
-        let medoid = self.graph.medoid() as usize;
-        let max_degree = self.config.max_degree;
-        let mut capped_reverse_adj: Vec<Vec<u32>> = vec![Vec::new(); adjacency.len()];
-        for (u, neighbors) in adjacency.iter().enumerate() {
-            let effective: &[u32] = if u == medoid {
-                &neighbors[..max_degree.min(neighbors.len())]
-            } else {
-                neighbors
-            };
-            for &v in effective {
-                capped_reverse_adj[v as usize].push(u as u32);
-            }
-        }
+        let capped_reverse_adj = capped_reverse_adjacency(self);
 
         // 4. Write lifecycle.bin.v2new with the capped reverse adjacency.
         write_lifecycle(
@@ -664,6 +826,7 @@ impl VamanaIndex {
     /// - metadata.bin with KHVVAMG2 but checksum or fingerprint mismatch → rebuild from commit config + save_atomic
     /// - metadata.bin with KHVVAMM1 (v1) → v1 load + save_atomic upgrade
     /// - metadata.bin missing or corrupt → rebuild from fallback_config + save_atomic
+    #[cfg(feature = "mmap")]
     pub fn load_or_build(
         path: &Path,
         corpus_vectors: &[f32],
@@ -856,6 +1019,7 @@ impl VamanaIndex {
     /// inconsistent lifecycle segment. Unlike [`Self::load_or_build`] it never rebuilds;
     /// callers that hold a corpus decide whether to fall back. [`Self::load`] surfaces the
     /// error directly.
+    #[cfg(feature = "mmap")]
     fn load_v2_raw(path: &Path) -> Result<Self> {
         let metadata_bytes = fs::read(path.join("metadata.bin"))?;
         if metadata_bytes.len() < 8 || &metadata_bytes[..8] != V2_COMMIT_MAGIC {
@@ -882,6 +1046,7 @@ impl VamanaIndex {
     }
 
     /// Load all v2 segments from `path` and restore lifecycle state from `lifecycle_data`.
+    #[cfg(feature = "mmap")]
     fn load_v2_fast(path: &Path, lifecycle_data: &[u8]) -> Result<Self> {
         let meta_bytes = fs::read(path.join("metadata.bin"))?;
         let commit = parse_v2_commit(&meta_bytes)?;
@@ -982,6 +1147,7 @@ impl VamanaIndex {
 
     /// Build a fresh VamanaIndex from `corpus_vectors` using the supplied `config`.
     /// Used when fingerprint mismatches, metadata is corrupt/missing, or on a clean first run.
+    #[cfg(feature = "mmap")]
     fn rebuild_from_corpus(corpus_vectors: &[f32], config: VamanaConfig) -> Result<Self> {
         VamanaIndex::build(corpus_vectors, config)
     }
@@ -1265,6 +1431,7 @@ impl VamanaIndex {
     /// `Owned`, this is a no-op. O(N × dim) once per promotion; the next `save`
     /// creates a fresh mmap at next load.
     fn ensure_owned(&mut self) -> Result<()> {
+        #[cfg(feature = "mmap")]
         if let VectorStorage::Mmap { .. } = &self.vectors {
             let owned: Vec<f32> = self.vectors.as_slice()?.to_vec();
             self.vectors = VectorStorage::Owned(owned);
@@ -1329,6 +1496,7 @@ impl VamanaIndex {
             let end = start + self.dimensions;
             match &mut self.vectors {
                 VectorStorage::Owned(v) => v[start..end].copy_from_slice(vector),
+                #[cfg(feature = "mmap")]
                 VectorStorage::Mmap { .. } => {
                     return Err(VamanaError::invalid_format(
                         "insert: unexpected Mmap after ensure_owned".into(),
@@ -1354,6 +1522,7 @@ impl VamanaIndex {
             // Append vector to Owned storage.
             match &mut self.vectors {
                 VectorStorage::Owned(v) => v.extend_from_slice(vector),
+                #[cfg(feature = "mmap")]
                 VectorStorage::Mmap { .. } => {
                     return Err(VamanaError::invalid_format(
                         "insert: unexpected Mmap after ensure_owned".into(),
@@ -1459,18 +1628,9 @@ impl VamanaIndex {
             // adding the edge medoid→ordinal. The medoid is the search entry point and
             // is always reachable; it is the designated overflow node for this edge.
             //
-            // The medoid may transiently exceed max_degree due to this pin (by one
-            // edge per orphan-pinned insert; K consecutive inserts can accumulate K
-            // overflow edges). This is resolved at serialization time
-            // (save()/to_snapshot()): the medoid's adjacency is capped to max_degree
-            // so the written graph satisfies all loader degree constraints. See
-            // write_graph() and to_snapshot().
-            //
-            // If overflow edges are dropped at serialization, the affected ordinals
-            // will not be searchable after load — but they ARE searchable in the
-            // live in-memory index. Today's consolidate() handles tombstone
-            // compaction only; a future redistribution pass will recover
-            // post-load reachability for truncation-affected nodes.
+            // Native directory and snapshot writers cap this overflow for their
+            // existing degree contract. The ADR-110 portable writer preserves it
+            // losslessly so byte round trips retain reachability.
             //
             // Edge case: if the graph was empty before this insert and ordinal became
             // the medoid (live_before == 0 branch), no pin is needed — handled by the
@@ -1718,6 +1878,7 @@ impl VamanaIndex {
         // inside the loop.
         let vecs: &[f32] = match &self.vectors {
             VectorStorage::Owned(v) => v.as_slice(),
+            #[cfg(feature = "mmap")]
             VectorStorage::Mmap { mmap, len_f32 } => {
                 let floats: &[f32] = bytemuck::try_cast_slice(mmap.as_ref())
                     .map_err(|_| VamanaError::invalid_format("vector mmap cast failed".into()))?;
@@ -1984,8 +2145,11 @@ fn exact_search(
     tombstones: Option<&[u64]>,
 ) -> Vec<(u32, f32)> {
     let n = vectors.len() / dimensions;
-    let mut dists: Vec<(u32, f32)> = (0..n as u32)
-        .into_par_iter()
+    #[cfg(feature = "parallel")]
+    let ids = (0..n as u32).into_par_iter();
+    #[cfg(not(feature = "parallel"))]
+    let ids = 0..n as u32;
+    let mut dists: Vec<(u32, f32)> = ids
         .filter(|&id| {
             tombstones
                 .map(|ts| !is_tombstoned_bit(ts, id as usize))
@@ -2013,6 +2177,338 @@ fn exact_search(
         a_d.total_cmp(b_d).then_with(|| a_id.cmp(b_id))
     });
     dists
+}
+
+#[cfg(feature = "mmap")]
+fn capped_reverse_adjacency(index: &VamanaIndex) -> Vec<Vec<u32>> {
+    let adjacency = index.graph.adjacency();
+    let medoid = index.graph.medoid() as usize;
+    let mut reverse_adj = vec![Vec::new(); adjacency.len()];
+    for (source, neighbors) in adjacency.iter().enumerate() {
+        let neighbors = if source == medoid {
+            &neighbors[..index.config.max_degree.min(neighbors.len())]
+        } else {
+            neighbors
+        };
+        for &target in neighbors {
+            reverse_adj[target as usize].push(source as u32);
+        }
+    }
+    reverse_adj
+}
+
+fn validate_reverse_adjacency(graph: &VamanaGraph, reverse_adj: &[Vec<u32>]) -> Result<()> {
+    let mut expected = vec![Vec::new(); graph.node_count()];
+    for (source, neighbors) in graph.adjacency().iter().enumerate() {
+        for &target in neighbors {
+            expected[target as usize].push(source as u32);
+        }
+    }
+    for neighbors in &mut expected {
+        neighbors.sort_unstable();
+    }
+    for (node, (expected, actual)) in expected.iter().zip(reverse_adj).enumerate() {
+        let mut actual = actual.clone();
+        actual.sort_unstable();
+        if *expected != actual {
+            return Err(VamanaError::invalid_format(format!(
+                "lifecycle.bin reverse_adj[{node}] is not the inverse of graph.bin forward adjacency"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn encode_portable_ids(index: &VamanaIndex, external_ids: &[(u32, String)]) -> Result<Vec<u8>> {
+    if external_ids.len() != index.live_count() {
+        return Err(VamanaError::invalid_format(format!(
+            "portable ID count {} != live count {}",
+            external_ids.len(),
+            index.live_count()
+        )));
+    }
+    let mut ids = external_ids.to_vec();
+    ids.sort_unstable_by_key(|(ordinal, _)| *ordinal);
+    let mut seen_ordinals = HashSet::with_capacity(ids.len());
+    let mut seen_ids = HashSet::with_capacity(ids.len());
+    for (ordinal, id) in &ids {
+        if *ordinal as usize >= index.num_vectors
+            || index.is_tombstoned(*ordinal)
+            || id.is_empty()
+            || !seen_ordinals.insert(*ordinal)
+            || !seen_ids.insert(id.as_str())
+        {
+            return Err(VamanaError::invalid_format(format!(
+                "invalid portable ID entry for ordinal {ordinal}"
+            )));
+        }
+    }
+    for ordinal in 0..index.num_vectors as u32 {
+        if !index.is_tombstoned(ordinal) && !seen_ordinals.contains(&ordinal) {
+            return Err(VamanaError::invalid_format(format!(
+                "missing portable ID for live ordinal {ordinal}"
+            )));
+        }
+    }
+
+    let mut buf = Vec::new();
+    buf.extend_from_slice(PORTABLE_IDS_MAGIC);
+    buf.extend_from_slice(&PORTABLE_IDS_VERSION.to_le_bytes());
+    buf.extend_from_slice(&(ids.len() as u64).to_le_bytes());
+    for (ordinal, id) in ids {
+        let len = u32::try_from(id.len())
+            .map_err(|_| VamanaError::invalid_format("portable ID length overflows u32".into()))?;
+        buf.extend_from_slice(&ordinal.to_le_bytes());
+        buf.extend_from_slice(&len.to_le_bytes());
+        buf.extend_from_slice(id.as_bytes());
+    }
+    Ok(buf)
+}
+
+fn parse_portable_ids(data: &[u8], index: &VamanaIndex) -> Result<Vec<(u32, String)>> {
+    let mut offset = 0;
+    if take_bytes(data, &mut offset, 8, "portable ID magic")? != PORTABLE_IDS_MAGIC {
+        return Err(VamanaError::invalid_format(
+            "portable_ids.bin magic mismatch".into(),
+        ));
+    }
+    let version = read_u32(data, &mut offset, "portable ID version")?;
+    if version != PORTABLE_IDS_VERSION {
+        return Err(VamanaError::invalid_format(format!(
+            "unsupported portable ID version {version}"
+        )));
+    }
+    let count = usize::try_from(read_u64(data, &mut offset, "portable ID count")?)
+        .map_err(|_| VamanaError::invalid_format("portable ID count overflows usize".into()))?;
+    if count != index.live_count() {
+        return Err(VamanaError::invalid_format(format!(
+            "portable ID count {count} != live count {}",
+            index.live_count()
+        )));
+    }
+
+    let mut entries = Vec::with_capacity(count);
+    let mut seen_ordinals = HashSet::with_capacity(count);
+    let mut seen_ids = HashSet::with_capacity(count);
+    let mut previous = None;
+    for _ in 0..count {
+        let ordinal = read_u32(data, &mut offset, "portable ID ordinal")?;
+        let len = read_u32(data, &mut offset, "portable ID length")? as usize;
+        let raw = take_bytes(data, &mut offset, len, "portable ID bytes")?;
+        let id = std::str::from_utf8(raw)
+            .map_err(|_| VamanaError::invalid_format("portable ID is not UTF-8".into()))?
+            .to_owned();
+        if previous.is_some_and(|previous| ordinal <= previous)
+            || ordinal as usize >= index.num_vectors
+            || index.is_tombstoned(ordinal)
+            || id.is_empty()
+            || !seen_ordinals.insert(ordinal)
+            || !seen_ids.insert(id.clone())
+        {
+            return Err(VamanaError::invalid_format(format!(
+                "invalid portable ID entry for ordinal {ordinal}"
+            )));
+        }
+        previous = Some(ordinal);
+        entries.push((ordinal, id));
+    }
+    if offset != data.len() {
+        return Err(VamanaError::invalid_format(format!(
+            "portable_ids.bin has {} trailing bytes",
+            data.len() - offset
+        )));
+    }
+    for ordinal in 0..index.num_vectors as u32 {
+        if !index.is_tombstoned(ordinal) && !seen_ordinals.contains(&ordinal) {
+            return Err(VamanaError::invalid_format(format!(
+                "missing portable ID for live ordinal {ordinal}"
+            )));
+        }
+    }
+    Ok(entries)
+}
+
+fn encode_portable_container(segments: &[(&str, Vec<u8>)]) -> Result<Vec<u8>> {
+    let segment_count = u32::try_from(segments.len())
+        .map_err(|_| VamanaError::invalid_format("portable segment count overflows u32".into()))?;
+    let table_len = segments.iter().try_fold(16usize, |total, (name, _)| {
+        total
+            .checked_add(4 + name.len() + 8 + 8 + 32)
+            .ok_or_else(|| VamanaError::invalid_format("portable table length overflow".into()))
+    })?;
+    let payload_len = segments.iter().try_fold(0usize, |total, (_, payload)| {
+        total
+            .checked_add(payload.len())
+            .ok_or_else(|| VamanaError::invalid_format("portable payload length overflow".into()))
+    })?;
+    let mut buf = Vec::with_capacity(
+        table_len
+            .checked_add(payload_len)
+            .ok_or_else(|| VamanaError::invalid_format("portable container overflow".into()))?,
+    );
+    buf.extend_from_slice(PORTABLE_MAGIC);
+    buf.extend_from_slice(&PORTABLE_VERSION.to_le_bytes());
+    buf.extend_from_slice(&segment_count.to_le_bytes());
+    let mut payload_offset = table_len;
+    for (name, payload) in segments {
+        let name_len = u32::try_from(name.len())
+            .map_err(|_| VamanaError::invalid_format("portable segment name too long".into()))?;
+        buf.extend_from_slice(&name_len.to_le_bytes());
+        buf.extend_from_slice(name.as_bytes());
+        buf.extend_from_slice(&(payload_offset as u64).to_le_bytes());
+        buf.extend_from_slice(&(payload.len() as u64).to_le_bytes());
+        buf.extend_from_slice(blake3::hash(payload).as_bytes());
+        payload_offset += payload.len();
+    }
+    for (_, payload) in segments {
+        buf.extend_from_slice(payload);
+    }
+    Ok(buf)
+}
+
+struct PortableSegment {
+    offset: usize,
+    len: usize,
+    checksum: [u8; 32],
+}
+
+fn parse_portable_container(data: &[u8]) -> Result<HashMap<String, &[u8]>> {
+    let mut offset = 0;
+    if take_bytes(data, &mut offset, 8, "portable magic")? != PORTABLE_MAGIC {
+        return Err(VamanaError::invalid_format(
+            "portable container magic mismatch".into(),
+        ));
+    }
+    let version = read_u32(data, &mut offset, "portable version")?;
+    if version != PORTABLE_VERSION {
+        return Err(VamanaError::invalid_format(format!(
+            "unsupported portable container version {version}"
+        )));
+    }
+    let segment_count = read_u32(data, &mut offset, "portable segment count")? as usize;
+    if !(4..=5).contains(&segment_count) {
+        return Err(VamanaError::invalid_format(format!(
+            "portable segment count {segment_count} is invalid"
+        )));
+    }
+
+    let allowed = [
+        "metadata.bin",
+        "vectors.bin",
+        "graph.bin",
+        "lifecycle.bin",
+        "portable_ids.bin",
+    ];
+    let mut table = HashMap::with_capacity(segment_count);
+    for _ in 0..segment_count {
+        let name_len = read_u32(data, &mut offset, "portable segment name length")? as usize;
+        let name = std::str::from_utf8(take_bytes(
+            data,
+            &mut offset,
+            name_len,
+            "portable segment name",
+        )?)
+        .map_err(|_| VamanaError::invalid_format("portable segment name is not UTF-8".into()))?
+        .to_owned();
+        if !allowed.contains(&name.as_str()) {
+            return Err(VamanaError::invalid_format(format!(
+                "unknown portable segment {name}"
+            )));
+        }
+        let payload_offset = usize::try_from(read_u64(data, &mut offset, "payload offset")?)
+            .map_err(|_| VamanaError::invalid_format("payload offset overflows usize".into()))?;
+        let payload_len = usize::try_from(read_u64(data, &mut offset, "payload length")?)
+            .map_err(|_| VamanaError::invalid_format("payload length overflows usize".into()))?;
+        let mut checksum = [0; 32];
+        checksum.copy_from_slice(take_bytes(data, &mut offset, 32, "payload checksum")?);
+        if table
+            .insert(
+                name.clone(),
+                PortableSegment {
+                    offset: payload_offset,
+                    len: payload_len,
+                    checksum,
+                },
+            )
+            .is_some()
+        {
+            return Err(VamanaError::invalid_format(format!(
+                "duplicate portable segment {name}"
+            )));
+        }
+    }
+
+    let table_end = offset;
+    let mut ranges = Vec::with_capacity(table.len());
+    for (name, segment) in &table {
+        let end = segment.offset.checked_add(segment.len).ok_or_else(|| {
+            VamanaError::invalid_format(format!("portable segment {name} range overflows"))
+        })?;
+        if segment.offset < table_end || end > data.len() {
+            return Err(VamanaError::invalid_format(format!(
+                "portable segment {name} range is out of bounds"
+            )));
+        }
+        ranges.push((segment.offset, end, name));
+    }
+    ranges.sort_unstable_by_key(|(start, _, _)| *start);
+    for pair in ranges.windows(2) {
+        if pair[0].1 > pair[1].0 {
+            return Err(VamanaError::invalid_format(format!(
+                "portable segments {} and {} overlap",
+                pair[0].2, pair[1].2
+            )));
+        }
+    }
+
+    let mut payloads = HashMap::with_capacity(table.len());
+    for (name, segment) in table {
+        let payload = &data[segment.offset..segment.offset + segment.len];
+        if blake3::hash(payload).as_bytes() != &segment.checksum {
+            return Err(VamanaError::invalid_format(format!(
+                "portable segment {name} checksum mismatch"
+            )));
+        }
+        payloads.insert(name, payload);
+    }
+    Ok(payloads)
+}
+
+fn required_segment<'a>(segments: &'a HashMap<String, &'a [u8]>, name: &str) -> Result<&'a [u8]> {
+    segments
+        .get(name)
+        .copied()
+        .ok_or_else(|| VamanaError::invalid_format(format!("missing portable segment {name}")))
+}
+
+fn take_bytes<'a>(data: &'a [u8], offset: &mut usize, len: usize, field: &str) -> Result<&'a [u8]> {
+    let end = offset
+        .checked_add(len)
+        .ok_or_else(|| VamanaError::invalid_format(format!("{field} offset overflows")))?;
+    if end > data.len() {
+        return Err(VamanaError::invalid_format(format!(
+            "portable container truncated at {field}"
+        )));
+    }
+    let bytes = &data[*offset..end];
+    *offset = end;
+    Ok(bytes)
+}
+
+fn read_u32(data: &[u8], offset: &mut usize, field: &str) -> Result<u32> {
+    Ok(u32::from_le_bytes(
+        take_bytes(data, offset, 4, field)?
+            .try_into()
+            .expect("four-byte field"),
+    ))
+}
+
+fn read_u64(data: &[u8], offset: &mut usize, field: &str) -> Result<u64> {
+    Ok(u64::from_le_bytes(
+        take_bytes(data, offset, 8, field)?
+            .try_into()
+            .expect("eight-byte field"),
+    ))
 }
 
 // ---- V2 persistence helpers ----
@@ -2044,6 +2540,7 @@ struct ParsedLifecycle {
 
 /// Write the KHVVAMG2 commit record including embedded v1 metadata fields.
 #[allow(clippy::too_many_arguments)]
+#[cfg(feature = "mmap")]
 fn write_v2_commit_full(
     path: &Path,
     vectors_hash: &[u8; 32],
@@ -2056,25 +2553,51 @@ fn write_v2_commit_full(
     search_list_size: usize,
     alpha: f64,
 ) -> Result<()> {
+    let buf = encode_v2_commit_full(
+        vectors_hash,
+        graph_hash,
+        lifecycle_hash,
+        fp,
+        num_vectors,
+        dimensions,
+        max_degree,
+        search_list_size,
+        alpha,
+    );
     let file = File::create(path)?;
     let mut w = std::io::BufWriter::new(file);
-
-    w.write_all(V2_COMMIT_MAGIC)?;
-    w.write_all(vectors_hash)?;
-    w.write_all(graph_hash)?;
-    w.write_all(lifecycle_hash)?;
-    w.write_all(&fp.vector_count.to_le_bytes())?;
-    w.write_all(&fp.dimensions.to_le_bytes())?;
-    w.write_all(&fp.content_hash)?;
-    // Embedded v1-style index metadata.
-    w.write_all(&(num_vectors as u64).to_le_bytes())?;
-    w.write_all(&(dimensions as u64).to_le_bytes())?;
-    w.write_all(&(max_degree as u64).to_le_bytes())?;
-    w.write_all(&(search_list_size as u64).to_le_bytes())?;
-    w.write_all(&alpha.to_le_bytes())?;
+    w.write_all(&buf)?;
     let file = w.into_inner().map_err(|e| e.into_error())?;
     file.sync_all()?;
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn encode_v2_commit_full(
+    vectors_hash: &[u8; 32],
+    graph_hash: &[u8; 32],
+    lifecycle_hash: &[u8; 32],
+    fp: &V2CorpusFingerprint,
+    num_vectors: usize,
+    dimensions: usize,
+    max_degree: usize,
+    search_list_size: usize,
+    alpha: f64,
+) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(200);
+    buf.extend_from_slice(V2_COMMIT_MAGIC);
+    buf.extend_from_slice(vectors_hash);
+    buf.extend_from_slice(graph_hash);
+    buf.extend_from_slice(lifecycle_hash);
+    buf.extend_from_slice(&fp.vector_count.to_le_bytes());
+    buf.extend_from_slice(&fp.dimensions.to_le_bytes());
+    buf.extend_from_slice(&fp.content_hash);
+    buf.extend_from_slice(&(num_vectors as u64).to_le_bytes());
+    buf.extend_from_slice(&(dimensions as u64).to_le_bytes());
+    buf.extend_from_slice(&(max_degree as u64).to_le_bytes());
+    buf.extend_from_slice(&(search_list_size as u64).to_le_bytes());
+    buf.extend_from_slice(&alpha.to_le_bytes());
+    buf
 }
 
 /// Parse a KHVVAMG2 commit record from bytes.
@@ -2082,9 +2605,9 @@ fn parse_v2_commit(data: &[u8]) -> Result<V2Commit> {
     // magic(8) + 3 hashes(96) + fp.vector_count(8) + fp.dimensions(8) + fp.content_hash(32)
     // + num_vectors(8) + dimensions(8) + max_degree(8) + search_list_size(8) + alpha(8)
     let expected_len = 8 + 32 + 32 + 32 + 8 + 8 + 32 + 8 + 8 + 8 + 8 + 8;
-    if data.len() < expected_len {
+    if data.len() != expected_len {
         return Err(VamanaError::invalid_format(format!(
-            "v2 commit record too short: {} < {expected_len}",
+            "v2 commit record length {} != {expected_len}",
             data.len()
         )));
     }
@@ -2198,6 +2721,7 @@ fn parse_v2_commit(data: &[u8]) -> Result<V2Commit> {
 ///   for each node:
 ///     degree         4 B   (u32)
 ///     neighbors      degree × 4 B (u32 each)
+#[cfg(feature = "mmap")]
 fn write_lifecycle(
     path: &Path,
     tombstones: &[u64],
@@ -2205,42 +2729,40 @@ fn write_lifecycle(
     reverse_adj: &[Vec<u32>],
     ops_since_consolidation: usize,
 ) -> Result<()> {
+    let buf = encode_lifecycle(tombstones, free_slots, reverse_adj, ops_since_consolidation);
     let file = File::create(path)?;
     let mut w = std::io::BufWriter::new(file);
-
-    w.write_all(LIFECYCLE_MAGIC)?;
-
-    // Tombstones.
-    let ts_words = tombstones.len() as u64;
-    w.write_all(&ts_words.to_le_bytes())?;
-    for &word in tombstones {
-        w.write_all(&word.to_le_bytes())?;
-    }
-
-    // Free slots.
-    let fs_count = free_slots.len() as u64;
-    w.write_all(&fs_count.to_le_bytes())?;
-    for &slot in free_slots {
-        w.write_all(&slot.to_le_bytes())?;
-    }
-
-    // ops_since_consolidation.
-    w.write_all(&(ops_since_consolidation as u64).to_le_bytes())?;
-
-    // Reverse adjacency (already capped to match the written forward graph).
-    let rev_nodes = reverse_adj.len() as u64;
-    w.write_all(&rev_nodes.to_le_bytes())?;
-    for neighbors in reverse_adj {
-        let degree = neighbors.len() as u32;
-        w.write_all(&degree.to_le_bytes())?;
-        for &nb in neighbors {
-            w.write_all(&nb.to_le_bytes())?;
-        }
-    }
-
+    w.write_all(&buf)?;
     let file = w.into_inner().map_err(|e| e.into_error())?;
     file.sync_all()?;
     Ok(())
+}
+
+fn encode_lifecycle(
+    tombstones: &[u64],
+    free_slots: &[u32],
+    reverse_adj: &[Vec<u32>],
+    ops_since_consolidation: usize,
+) -> Vec<u8> {
+    let mut buf = Vec::new();
+    buf.extend_from_slice(LIFECYCLE_MAGIC);
+    buf.extend_from_slice(&(tombstones.len() as u64).to_le_bytes());
+    for &word in tombstones {
+        buf.extend_from_slice(&word.to_le_bytes());
+    }
+    buf.extend_from_slice(&(free_slots.len() as u64).to_le_bytes());
+    for &slot in free_slots {
+        buf.extend_from_slice(&slot.to_le_bytes());
+    }
+    buf.extend_from_slice(&(ops_since_consolidation as u64).to_le_bytes());
+    buf.extend_from_slice(&(reverse_adj.len() as u64).to_le_bytes());
+    for neighbors in reverse_adj {
+        buf.extend_from_slice(&(neighbors.len() as u32).to_le_bytes());
+        for &neighbor in neighbors {
+            buf.extend_from_slice(&neighbor.to_le_bytes());
+        }
+    }
+    buf
 }
 
 /// Parse lifecycle.bin bytes into `ParsedLifecycle`.
@@ -2264,7 +2786,10 @@ fn parse_lifecycle(data: &[u8], num_vectors: usize, _max_degree: usize) -> Resul
             "lifecycle.bin truncated at tombstone_words".into(),
         ));
     }
-    let ts_words = u64::from_le_bytes(data[offset..offset + 8].try_into().unwrap()) as usize;
+    let ts_words = usize::try_from(u64::from_le_bytes(
+        data[offset..offset + 8].try_into().unwrap(),
+    ))
+    .map_err(|_| VamanaError::invalid_format("lifecycle.bin ts_words overflows usize".into()))?;
     offset += 8;
     let ts_bytes = ts_words
         .checked_mul(8)
@@ -2315,7 +2840,10 @@ fn parse_lifecycle(data: &[u8], num_vectors: usize, _max_degree: usize) -> Resul
             "lifecycle.bin truncated at free_slots_count".into(),
         ));
     }
-    let fs_count = u64::from_le_bytes(data[offset..offset + 8].try_into().unwrap()) as usize;
+    let fs_count = usize::try_from(u64::from_le_bytes(
+        data[offset..offset + 8].try_into().unwrap(),
+    ))
+    .map_err(|_| VamanaError::invalid_format("lifecycle.bin fs_count overflows usize".into()))?;
     offset += 8;
     let fs_bytes = fs_count
         .checked_mul(4)
@@ -2341,8 +2869,10 @@ fn parse_lifecycle(data: &[u8], num_vectors: usize, _max_degree: usize) -> Resul
             "lifecycle.bin truncated at ops".into(),
         ));
     }
-    let ops_since_consolidation =
-        u64::from_le_bytes(data[offset..offset + 8].try_into().unwrap()) as usize;
+    let ops_since_consolidation = usize::try_from(u64::from_le_bytes(
+        data[offset..offset + 8].try_into().unwrap(),
+    ))
+    .map_err(|_| VamanaError::invalid_format("lifecycle.bin ops overflows usize".into()))?;
     offset += 8;
 
     // Reverse adjacency.
@@ -2351,7 +2881,12 @@ fn parse_lifecycle(data: &[u8], num_vectors: usize, _max_degree: usize) -> Resul
             "lifecycle.bin truncated at rev_num_nodes".into(),
         ));
     }
-    let rev_num_nodes = u64::from_le_bytes(data[offset..offset + 8].try_into().unwrap()) as usize;
+    let rev_num_nodes = usize::try_from(u64::from_le_bytes(
+        data[offset..offset + 8].try_into().unwrap(),
+    ))
+    .map_err(|_| {
+        VamanaError::invalid_format("lifecycle.bin rev_num_nodes overflows usize".into())
+    })?;
     offset += 8;
 
     if rev_num_nodes != num_vectors {
@@ -2411,6 +2946,13 @@ fn parse_lifecycle(data: &[u8], num_vectors: usize, _max_degree: usize) -> Resul
         reverse_adj.push(neighbors);
     }
 
+    if offset != data.len() {
+        return Err(VamanaError::invalid_format(format!(
+            "lifecycle.bin has {} trailing bytes",
+            data.len() - offset
+        )));
+    }
+
     Ok(ParsedLifecycle {
         tombstones,
         free_slots,
@@ -2419,6 +2961,7 @@ fn parse_lifecycle(data: &[u8], num_vectors: usize, _max_degree: usize) -> Resul
     })
 }
 
+#[cfg(feature = "mmap")]
 fn write_metadata(path: &Path, index: &VamanaIndex) -> Result<()> {
     let mut buf = Vec::with_capacity(64);
     buf.extend_from_slice(METADATA_MAGIC);
@@ -2431,6 +2974,7 @@ fn write_metadata(path: &Path, index: &VamanaIndex) -> Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "mmap")]
 fn read_metadata(path: &Path) -> Result<IndexMetadata> {
     let data = fs::read(path)?;
     if data.len() < 8 {
@@ -2471,7 +3015,25 @@ fn read_metadata(path: &Path) -> Result<IndexMetadata> {
     })
 }
 
+#[cfg(feature = "mmap")]
 fn write_graph(path: &Path, graph: &VamanaGraph, max_degree: usize) -> Result<()> {
+    let buf = encode_graph(graph, max_degree)?;
+    let mut f = File::create(path)?;
+    f.write_all(&buf)?;
+    f.sync_all()?;
+    Ok(())
+}
+
+#[cfg(feature = "mmap")]
+fn encode_graph(graph: &VamanaGraph, max_degree: usize) -> Result<Vec<u8>> {
+    encode_graph_inner(graph, Some(max_degree))
+}
+
+fn encode_graph_lossless(graph: &VamanaGraph) -> Result<Vec<u8>> {
+    encode_graph_inner(graph, None)
+}
+
+fn encode_graph_inner(graph: &VamanaGraph, medoid_degree_limit: Option<usize>) -> Result<Vec<u8>> {
     let num_nodes = u32::try_from(graph.node_count()).map_err(|_| VamanaError::TooManyVectors {
         count: graph.node_count(),
     })?;
@@ -2485,12 +3047,14 @@ fn write_graph(path: &Path, graph: &VamanaGraph, max_degree: usize) -> Result<()
     let medoid_adj_capped: Vec<u32>;
     let adjacency = graph.adjacency();
     let medoid_neighbors = &adjacency[medoid as usize];
-    let medoid_capped: &[u32] = if medoid_neighbors.len() > max_degree {
-        medoid_adj_capped = medoid_neighbors[..max_degree].to_vec();
-        &medoid_adj_capped
-    } else {
-        medoid_neighbors
-    };
+    let medoid_capped: &[u32] =
+        if medoid_degree_limit.is_some_and(|limit| medoid_neighbors.len() > limit) {
+            medoid_adj_capped =
+                medoid_neighbors[..medoid_degree_limit.expect("checked above")].to_vec();
+            &medoid_adj_capped
+        } else {
+            medoid_neighbors
+        };
 
     let total_edges: usize = adjacency
         .iter()
@@ -2529,14 +3093,16 @@ fn write_graph(path: &Path, graph: &VamanaGraph, max_degree: usize) -> Result<()
         }
     }
 
-    let mut f = File::create(path)?;
-    f.write_all(&buf)?;
-    f.sync_all()?;
-    Ok(())
+    Ok(buf)
 }
 
+#[cfg(feature = "mmap")]
 fn read_graph(path: &Path, max_degree: usize, num_vectors: usize) -> Result<VamanaGraph> {
     let data = fs::read(path)?;
+    parse_graph(&data, max_degree, num_vectors)
+}
+
+fn parse_graph(data: &[u8], max_degree: usize, num_vectors: usize) -> Result<VamanaGraph> {
     if data.len() < 16 {
         return Err(VamanaError::invalid_format("graph.bin too short".into()));
     }
@@ -2572,12 +3138,23 @@ fn read_graph(path: &Path, max_degree: usize, num_vectors: usize) -> Result<Vama
         let degree = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
         offset += 4;
 
-        if degree > max_degree {
+        if degree > num_vectors.saturating_sub(1) {
             return Err(VamanaError::invalid_format(format!(
-                "degree {degree} exceeds max_degree {max_degree}"
+                "node {_node} degree {degree} exceeds num_vectors-1"
             )));
         }
-        if offset + degree * 4 > data.len() {
+        if degree > max_degree && _node != medoid as usize {
+            return Err(VamanaError::invalid_format(format!(
+                "node {_node} degree {degree} exceeds max_degree {max_degree}"
+            )));
+        }
+        let neighbor_bytes = degree.checked_mul(4).ok_or_else(|| {
+            VamanaError::invalid_format("graph.bin neighbor byte length overflows".into())
+        })?;
+        let neighbors_end = offset.checked_add(neighbor_bytes).ok_or_else(|| {
+            VamanaError::invalid_format("graph.bin neighbor range overflows".into())
+        })?;
+        if neighbors_end > data.len() {
             return Err(VamanaError::invalid_format(
                 "graph.bin truncated at neighbors".into(),
             ));
@@ -2633,6 +3210,7 @@ fn read_graph(path: &Path, max_degree: usize, num_vectors: usize) -> Result<Vama
     Ok(graph)
 }
 
+#[cfg(feature = "mmap")]
 fn write_vectors(path: &Path, vectors: &[f32]) -> Result<()> {
     let bytes: &[u8] = cast_slice(vectors);
     let mut f = File::create(path)?;
@@ -2641,6 +3219,7 @@ fn write_vectors(path: &Path, vectors: &[f32]) -> Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "mmap")]
 fn mmap_vectors(path: &Path, expected_len_f32: usize) -> Result<VectorStorage> {
     let file = File::open(path)?;
     let byte_len = usize::try_from(file.metadata()?.len())
@@ -2679,6 +3258,7 @@ fn mmap_vectors(path: &Path, expected_len_f32: usize) -> Result<VectorStorage> {
 ///
 /// In the `None` cases the caller should treat the segment as Cold and proceed
 /// to build. Returns `Err` only for unexpected IO failures (not `NotFound`).
+#[cfg(feature = "mmap")]
 pub fn read_commit_fingerprint(path: &Path) -> Result<Option<PersistedFingerprint>> {
     let metadata_path = path.join("metadata.bin");
     let bytes = match fs::read(&metadata_path) {
@@ -2833,6 +3413,7 @@ mod tests {
         assert_eq!(recall, 1.0, "exact self-query must recall 1.0");
     }
 
+    #[cfg(feature = "mmap")]
     #[test]
     fn save_load_roundtrip_preserves_search_results() {
         let vectors = rand_unit_vectors(40, 8, 7);
@@ -2851,6 +3432,7 @@ mod tests {
         assert_eq!(r1, r2, "save/load must preserve search results");
     }
 
+    #[cfg(feature = "mmap")]
     #[test]
     fn load_rejects_bad_metadata_magic() {
         let dir = tempfile::tempdir().unwrap();
@@ -2861,6 +3443,7 @@ mod tests {
         ));
     }
 
+    #[cfg(feature = "mmap")]
     #[test]
     fn load_rejects_bad_graph_magic() {
         let vectors = rand_unit_vectors(5, 4, 8);
@@ -2882,6 +3465,7 @@ mod tests {
         ));
     }
 
+    #[cfg(feature = "mmap")]
     #[test]
     fn load_rejects_vector_file_wrong_length() {
         let vectors = rand_unit_vectors(5, 4, 9);
@@ -2902,6 +3486,7 @@ mod tests {
         ));
     }
 
+    #[cfg(feature = "mmap")]
     #[test]
     fn load_rejects_neighbor_out_of_range() {
         let vectors = rand_unit_vectors(4, 4, 10);
@@ -2934,6 +3519,7 @@ mod tests {
         ));
     }
 
+    #[cfg(feature = "mmap")]
     #[test]
     fn loaded_vectors_are_mmap_backed_and_searchable() {
         let vectors = rand_unit_vectors(20, 8, 11);
@@ -3088,6 +3674,7 @@ mod tests {
 
     /// After `VamanaIndex::load`, reverse_adj must be consistent with forward adjacency
     /// (v1 format does not persist reverse_adj; it is rebuilt at load time).
+    #[cfg(feature = "mmap")]
     #[test]
     fn index_load_reverse_adj_consistent_with_forward() {
         let vectors = rand_unit_vectors(20, 4, 0x0010_AD52);
@@ -3180,6 +3767,7 @@ mod tests {
     }
 
     /// P1: load must reject duplicate neighbors in graph.bin.
+    #[cfg(feature = "mmap")]
     #[test]
     fn load_rejects_duplicate_neighbors() {
         let vectors = rand_unit_vectors(5, 4, 12);
@@ -3217,6 +3805,7 @@ mod tests {
     }
 
     /// P1: load must reject graph.bin with trailing bytes.
+    #[cfg(feature = "mmap")]
     #[test]
     fn load_rejects_trailing_graph_bytes() {
         let vectors = rand_unit_vectors(5, 4, 13);
@@ -3705,6 +4294,7 @@ mod tests {
     /// Regression test for MEDIUM: rejected insert and no-op consolidate must NOT
     /// promote a Mmap-backed index to Owned. Verified via the private `VectorStorage`
     /// variant (only accessible inside `mod tests` due to `use super::*`).
+    #[cfg(feature = "mmap")]
     #[test]
     fn mmap_atomicity_rejected_insert_and_noop_consolidate_stay_mmap() {
         let dir = tempfile::tempdir().unwrap();
@@ -4121,6 +4711,7 @@ mod tests {
 
     // ---- read_commit_fingerprint + corpus_content_hash tests ----
 
+    #[cfg(feature = "mmap")]
     #[test]
     fn read_commit_fingerprint_matches_save_atomic() {
         // Build a small index from normalized vectors, save it, then verify
@@ -4147,6 +4738,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "mmap")]
     #[test]
     fn read_commit_fingerprint_absent_dir_returns_none() {
         // A directory with no metadata.bin must return Ok(None), not an error.
@@ -4155,6 +4747,7 @@ mod tests {
         assert!(result.is_none(), "expected None for empty directory");
     }
 
+    #[cfg(feature = "mmap")]
     #[test]
     fn read_commit_fingerprint_v1_magic_returns_none() {
         // A metadata.bin with the v1 KHVVAMM1 magic (no v2 commit record) must
@@ -4191,8 +4784,99 @@ mod tests {
         assert_ne!(h1, h3, "corpus_content_hash must be order-sensitive");
     }
 
+    #[test]
+    fn portable_container_rejects_missing_duplicate_and_overlapping_segments() {
+        let missing = encode_portable_container(&[
+            ("metadata.bin", vec![1]),
+            ("vectors.bin", vec![2]),
+            ("lifecycle.bin", vec![3]),
+            ("portable_ids.bin", vec![4]),
+        ])
+        .unwrap();
+        assert!(matches!(
+            VamanaIndex::from_bytes(&missing),
+            Err(VamanaError::InvalidFormat { .. })
+        ));
+
+        let duplicate = encode_portable_container(&[
+            ("metadata.bin", vec![1]),
+            ("metadata.bin", vec![2]),
+            ("graph.bin", vec![3]),
+            ("lifecycle.bin", vec![4]),
+        ])
+        .unwrap();
+        assert!(matches!(
+            parse_portable_container(&duplicate),
+            Err(VamanaError::InvalidFormat { .. })
+        ));
+
+        let mut overlap = encode_portable_container(&[
+            ("metadata.bin", vec![1]),
+            ("vectors.bin", vec![2]),
+            ("graph.bin", vec![3]),
+            ("lifecycle.bin", vec![4]),
+        ])
+        .unwrap();
+        let first_offset_field = 16 + 4 + "metadata.bin".len();
+        let first_payload_offset = overlap[first_offset_field..first_offset_field + 8].to_vec();
+        let second_entry = first_offset_field + 8 + 8 + 32;
+        let second_offset_field = second_entry + 4 + "vectors.bin".len();
+        overlap[second_offset_field..second_offset_field + 8]
+            .copy_from_slice(&first_payload_offset);
+        assert!(matches!(
+            parse_portable_container(&overlap),
+            Err(VamanaError::InvalidFormat { .. })
+        ));
+    }
+
+    #[test]
+    fn portable_container_rejects_overlarge_medoid_degree() {
+        let config = VamanaConfig::with_dimensions(1)
+            .with_max_degree(1)
+            .with_search_list_size(1);
+        let index = VamanaIndex::build(&[1.0], config).unwrap();
+        let bytes = index.to_bytes(&[]).unwrap();
+        let segments = parse_portable_container(&bytes).unwrap();
+        let mut metadata = segments["metadata.bin"].to_vec();
+        let mut graph = segments["graph.bin"].to_vec();
+
+        graph[16..20].copy_from_slice(&u32::MAX.to_le_bytes());
+        metadata[40..72].copy_from_slice(blake3::hash(&graph).as_bytes());
+        let malformed = encode_portable_container(&[
+            ("metadata.bin", metadata),
+            ("vectors.bin", segments["vectors.bin"].to_vec()),
+            ("graph.bin", graph),
+            ("lifecycle.bin", segments["lifecycle.bin"].to_vec()),
+        ])
+        .unwrap();
+
+        assert!(matches!(
+            VamanaIndex::from_bytes(&malformed),
+            Err(VamanaError::InvalidFormat { .. })
+        ));
+    }
+
+    #[test]
+    fn portable_ids_reject_invalid_utf8() {
+        let vectors = rand_unit_vectors(4, 4, 0x110);
+        let config = VamanaConfig::with_dimensions(4)
+            .with_max_degree(3)
+            .with_search_list_size(4);
+        let index = VamanaIndex::build(&vectors, config).unwrap();
+        let ids: Vec<(u32, String)> = (0..4)
+            .map(|ordinal| (ordinal, format!("id{ordinal}")))
+            .collect();
+        let mut encoded = encode_portable_ids(&index, &ids).unwrap();
+        encoded[28] = 0xff;
+        assert!(matches!(
+            parse_portable_ids(&encoded, &index),
+            Err(VamanaError::InvalidFormat { .. })
+        ));
+    }
+
     // ---- VamanaIndex::load v2-aware dispatch (load_v2_raw) tests ----
 
+    #[cfg(feature = "mmap")]
     #[test]
     fn load_reads_v2_segments_after_save_atomic() {
         // load() must detect the v2 commit magic and raw-load the segments with no
@@ -4217,6 +4901,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "mmap")]
     #[test]
     fn load_v2_matches_load_or_build_fast_path() {
         // The raw load() path and load_or_build()'s fast path must agree when the
@@ -4240,6 +4925,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "mmap")]
     #[test]
     fn load_v2_rejects_torn_segment() {
         // A checksum mismatch on any segment must error (load never rebuilds).
@@ -4263,6 +4949,7 @@ mod tests {
         ));
     }
 
+    #[cfg(feature = "mmap")]
     #[test]
     fn load_v2_rejects_missing_segment() {
         // A v2 commit whose backing segment is gone must error, not rebuild.

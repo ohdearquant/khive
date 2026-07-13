@@ -119,6 +119,24 @@ The canonical ledger of database schema migration versions. Migration versions a
 > be recreated from the current `schema.sql`; in-place downgrade across the reset is not
 > supported.
 
+### Post-consolidation migration ledger (live)
+
+The live sequence starts from the consolidated V1 baseline. This table is the
+canonical allocation ledger for databases created at or after v0.2.8; the table
+above remains the historical pre-consolidation record.
+
+| Version | Owning ADR / issue | Migration name                     | Status  |
+| ------: | ------------------ | ---------------------------------- | ------- |
+|      V1 | ADR-015            | initial_schema                     | shipped |
+|      V2 | ADR-051            | narrow_fts_sections_update_trigger | shipped |
+|      V3 | ADR-051            | backfill_domain_mirror_atoms       | shipped |
+|      V4 | ADR-062            | fts_consolidation                  | shipped |
+|      V5 | ADR-056            | unique_comm_message_external_id    | shipped |
+|      V6 | ADR-081            | brain_retune_driver                | shipped |
+|      V7 | #827               | notes_seq                          | shipped |
+|      V8 | #827               | notes_seq_repair                   | shipped |
+|      V9 | ADR-104            | entities_name_ci_index             | claimed |
+
 > **Invariant**: ADR number order and migration version order are independent. Migration versions reflect schema ledger assignment order. A migration may only depend on schema created by earlier versions.
 
 > **Process**: When a new ADR introduces a schema migration, it MUST request the next ledger version here (claim by editing this table in the same PR). ADRs MUST NOT use placeholder text like "version: <next>" once merged.

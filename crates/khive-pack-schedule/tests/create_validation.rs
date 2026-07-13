@@ -3,8 +3,10 @@
 use khive_pack_schedule::SchedulePack;
 use khive_runtime::{KhiveRuntime, VerbRegistry, VerbRegistryBuilder};
 
+mod support;
+
 fn build_registry() -> (VerbRegistry, KhiveRuntime) {
-    let runtime = KhiveRuntime::memory().expect("in-memory runtime");
+    let runtime = support::memory_runtime();
     let mut builder = VerbRegistryBuilder::new();
     builder.register(khive_pack_kg::KgPack::new(runtime.clone()));
     builder.register(khive_pack_comm::CommPack::new(runtime.clone()));
@@ -14,7 +16,7 @@ fn build_registry() -> (VerbRegistry, KhiveRuntime) {
 }
 
 fn build_registry_with_brain() -> (VerbRegistry, KhiveRuntime) {
-    let runtime = KhiveRuntime::memory().expect("in-memory runtime");
+    let runtime = support::memory_runtime();
     let mut builder = VerbRegistryBuilder::new();
     builder.register(khive_pack_kg::KgPack::new(runtime.clone()));
     builder.register(khive_pack_comm::CommPack::new(runtime.clone()));

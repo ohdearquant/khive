@@ -3,8 +3,10 @@
 use khive_pack_schedule::SchedulePack;
 use khive_runtime::{KhiveRuntime, VerbRegistry, VerbRegistryBuilder};
 
+mod support;
+
 fn build_registry() -> (VerbRegistry, KhiveRuntime) {
-    let runtime = KhiveRuntime::memory().expect("in-memory runtime");
+    let runtime = support::memory_runtime();
     let mut builder = VerbRegistryBuilder::new();
     builder.register(khive_pack_kg::KgPack::new(runtime.clone()));
     builder.register(khive_pack_comm::CommPack::new(runtime.clone()));
@@ -103,7 +105,7 @@ async fn cancel_rejects_already_cancelled_event() {
 async fn cancel_rejects_fired_event_without_clobbering_fired_at() {
     use khive_storage::Note;
 
-    let runtime = KhiveRuntime::memory().expect("in-memory runtime");
+    let runtime = support::memory_runtime();
     let mut builder = khive_runtime::VerbRegistryBuilder::new();
     builder.register(khive_pack_kg::KgPack::new(runtime.clone()));
     builder.register(khive_pack_comm::CommPack::new(runtime.clone()));
@@ -188,7 +190,7 @@ async fn cancel_rejects_non_pending_statuses() {
     use khive_storage::Note;
 
     for status in ["fired", "cancelled", "bogus-status"] {
-        let runtime = KhiveRuntime::memory().expect("in-memory runtime");
+        let runtime = support::memory_runtime();
         let mut builder = khive_runtime::VerbRegistryBuilder::new();
         builder.register(khive_pack_kg::KgPack::new(runtime.clone()));
         builder.register(khive_pack_comm::CommPack::new(runtime.clone()));
@@ -257,7 +259,7 @@ async fn cancel_rejects_non_pending_statuses() {
 async fn sch_aud_001_cancel_with_string_properties_returns_error() {
     use khive_storage::Note;
 
-    let runtime = KhiveRuntime::memory().expect("in-memory runtime");
+    let runtime = support::memory_runtime();
     let mut builder = khive_runtime::VerbRegistryBuilder::new();
     builder.register(khive_pack_kg::KgPack::new(runtime.clone()));
     builder.register(khive_pack_comm::CommPack::new(runtime.clone()));
