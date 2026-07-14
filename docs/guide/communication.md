@@ -22,6 +22,7 @@ request(ops="comm.send(to=\"another-actor\", subject=\"Review needed\", content=
 
 The recipient checks its inbox. It returns inbound messages addressed to the
 calling actor; unread is the default view.
+For compatibility, legacy messages without `to_actor` remain visible.
 
 ```text
 request(ops="comm.inbox(status=\"unread\", limit=10)")
@@ -71,15 +72,16 @@ Inspect the response `namespace`: a non-local scoped call can validly return
 When the optional email channel is configured, it uses the same comm message
 model. Address a new email as `email:person@example.com` and provide a
 `subject` conventionally, but it is optional; when omitted, the channel
-delivers `(no subject)`. The channel delivers stored outbound messages
-asynchronously. Reply to an inbound email with `comm.reply` to preserve its
-conversation linkage.
+delivers `(no subject)`. The daemon asynchronously delivers eligible stored
+outbound messages. Recipients must be in its configured outbound allowlist,
+which defaults to the maintainer address. Reply to an inbound email with
+`comm.reply` to preserve its conversation linkage.
 See [Configuration](../configuration.md) for email-channel setup.
 
 ## Gotchas
 
 - A send to your own configured actor address is refused unless you explicitly
-  pass `self_send=true`.
+  pass `self_send=true`; the anonymous `local` fallback is exempt.
 - An email `subject` is conventional but optional; an omitted subject is
   delivered as `(no subject)`.
 - An inbox is scoped to the calling actor address. If an expected message is
