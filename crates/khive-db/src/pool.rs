@@ -405,7 +405,7 @@ impl ConnectionPool {
     /// Return the pool-wide ADR-067 Component A writer task, spawning it
     /// lazily on first access if `PoolConfig::write_queue_enabled` is set.
     /// Exactly one writer task exists per `ConnectionPool` (per DB file); see
-    /// crates/khive-db/docs/pool-writer-backend-internals.md#connectionpoolwriter_task_handle--single-writer-task-rationale
+    /// crates/khive-db/docs/api/pool.md#connectionpoolwriter_task_handle--single-writer-task-rationale
     /// for why a per-store writer task would defeat the single-writer
     /// guarantee.
     ///
@@ -888,7 +888,7 @@ mod tests {
 
     /// ADR-091 Plank 0: `WriterGuard::transaction` registers/deregisters a
     /// tx_registry entry around the closure. See
-    /// crates/khive-db/docs/pool-writer-backend-internals.md#writer_guard_transaction_registers_during_closure_only
+    /// crates/khive-db/docs/api/pool.md#writer_guard_transaction_registers_during_closure_only
     #[test]
     #[serial(tx_registry)]
     fn writer_guard_transaction_registers_during_closure_only() {
@@ -922,7 +922,7 @@ mod tests {
 
     /// ADR-067 Component A: `writer_task_handle` must fail loud (typed
     /// error, not panic) with no Tokio runtime available. See
-    /// crates/khive-db/docs/pool-writer-backend-internals.md#writer_task_handle_fails_loud_without_tokio_runtime
+    /// crates/khive-db/docs/api/pool.md#writer_task_handle_fails_loud_without_tokio_runtime
     #[test]
     fn writer_task_handle_fails_loud_without_tokio_runtime() {
         let dir = tempfile::tempdir().unwrap();

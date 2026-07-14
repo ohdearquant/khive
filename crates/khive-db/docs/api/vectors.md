@@ -1,9 +1,10 @@
-# Vector store internals
+# Vector Store
 
-Long-form rationale extracted from `src/stores/vectors.rs` doc-comments
-(sqlite-vec backed `VectorStore`). Public-item contracts stay complete in
-the source; this file carries the "why", design history, and
-cross-references for non-public helpers and tests.
+`SqliteVectorStore` (`crates/khive-db/src/stores/vectors.rs`) implements the
+`VectorStore` capability trait over sqlite-vec `vec0` virtual tables. This is
+the function-specific technical reference for its private write-routing
+helpers and the SAVEPOINT/transaction-rollback guarantees the test suite
+pins down; public-item contracts stay complete in their own doc-comments.
 
 ## `with_writer` / `with_writer_unmanaged` — WriterTask routing (ADR-067 Component A, Fork C slice 2)
 
