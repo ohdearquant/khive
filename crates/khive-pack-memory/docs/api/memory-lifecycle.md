@@ -45,10 +45,10 @@ The 50 ms threshold reflects normal local SQLite FTS5 latency of roughly 1–20 
 
 Prune selects live memory notes in the requested namespace. It can match raw salience strictly below `min_salience`, expiry at or before `before`, or both. `before` defaults to the current Unix microsecond timestamp; zero disables the expiry predicate. `dry_run` returns the count without mutation.
 
-Deletion is soft. The handler uses the runtime note-deletion path so mutation hooks and event semantics remain consistent, then bumps ANN generations and schedules background rebuilding for affected models. A candidate disappearing after selection is tolerated as ordinary concurrent mutation.
+Deletion is soft, performed directly through `NoteStore`. That raw path bypasses the runtime mutation hooks, so the handler itself bumps ANN generations and schedules background rebuilding for affected models. A candidate disappearing after selection is tolerated as ordinary concurrent mutation.
 
 ## `memory.vacuum`
 
 Vacuum reclaims database pages after soft deletion. It accepts no parameters and rejects unexpected fields.
 
-SQLite `VACUUM` must run outside an open transaction and needs exclusive database access. The handler delegates to the storage backend's vacuum operation rather than issuing it through the ordinary transactional writer. Failures are returned as runtime storage errors; success reports completion without claiming how many bytes SQLite reclaimed.
+SQLite `VACUUM` must run outside an open transaction. The handler issues `VACUUM;` through the writer's top-level script path (`execute_script_top_level`), which skips the usual transaction wrapper while still serializing on the single writer. Failures are returned as runtime storage errors; success reports completion without claiming how many bytes SQLite reclaimed.

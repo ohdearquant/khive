@@ -4,7 +4,7 @@
 
 ## `RecallConfig`
 
-The three primary weights are relevance `0.70`, salience `0.20`, and temporal `0.10`. Validation requires finite, non-negative weights with a positive sum. Temporal half-life must be positive, score and salience floors must be valid, and nested gather/scoring configuration must also validate.
+The three primary weights are relevance `0.70`, salience `0.20`, and temporal `0.10`. Validation requires finite, non-negative weights with a positive sum. Temporal half-life must be positive, per-reranker weights must be finite and non-negative, a provided candidate limit must be positive, and the score and salience floors must be finite. Nested gather/scoring configuration is not validated here.
 
 Retrieval defaults include a candidate multiplier of 20, optional explicit candidate limit, weighted vector/text fusion, score floor zero, salience floor zero, and breakdowns disabled. Weighted fusion defaults to vector `0.7` and text `0.3`, preserving the prior semantic-over-keyword preference while respecting score magnitude. RRF remains selectable.
 
@@ -33,7 +33,7 @@ Decay operates on raw salience and age in days:
 | `PowerLaw` | `salience * half_life / (half_life + age_days)` |
 | `None` | raw salience |
 
-Exponential and linear use the note's own decay factor. Power-law uses its configured half-life override. The independent temporal recency component uses `temporal_half_life_days`; it does not replace the note's salience decay.
+Exponential and hyperbolic use the note's own decay factor. Power-law uses its configured half-life override. The independent temporal recency component uses `temporal_half_life_days`; it does not replace the note's salience decay.
 
 Episodic memories default to salience `0.3` and decay factor `0.02` (about 35 days exponential half-life). Semantic memories default to `0.5` and `0.005` (about 139 days). Explicit values always win.
 
@@ -41,7 +41,7 @@ Episodic memories default to salience `0.3` and decay factor `0.02` (about 35 da
 
 `from_env()` returns `None` when none of the FTS gather variables are set and an error for malformed values. Supported variables control enablement, selected-term count, selection mode, gather mode, row limit, multiplier, and CJK bypass.
 
-`validate()` requires positive limits and multipliers and rejects inconsistent options. `effective_gather_limit(candidate_limit)` uses an explicit gather limit or checked multiplication by the multiplier. `to_search_options(candidate_limit)` returns the storage-layer options.
+`validate()` requires positive limits and multipliers and rejects inconsistent options. `effective_gather_limit(candidate_limit)` uses an explicit gather limit or saturating multiplication by the multiplier. `to_search_options(candidate_limit)` returns the storage-layer options.
 
 Selection rules are original order, lowest document frequency, and highest IDF. Gather modes mirror the database ranked and rank-within-cap modes.
 

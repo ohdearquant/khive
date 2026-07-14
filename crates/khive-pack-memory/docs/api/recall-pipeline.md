@@ -38,7 +38,7 @@ FTS uses the unified `fts_notes` table and filters `kind = "memory"` plus visibl
 
 Every selected model is embedded concurrently. The vector leg prefers the global ANN graph and uses sqlite-vec as an exact fallback when ANN cannot serve.
 
-On a current warm graph, search begins with an over-fetch window. ANN results cover all namespaces, so IDs are hydrated and post-filtered to the token's visible set before returning. The initial window is `max(candidate_limit * 4, 32)` and is capped by corpus size.
+On a current warm graph, search begins with an over-fetch window. ANN results cover all namespaces, so IDs are hydrated and post-filtered to the token's visible set before returning. The initial window is `max(candidate_limit * 4, candidate_limit + 32)` and is capped by corpus size.
 
 When too few visible candidates survive, the loop may double the window for a configured number of rounds. Widening only runs when the installed graph contains namespaces outside the caller's visible set; otherwise a larger search cannot recover namespace-filtered candidates. The loop also stops at corpus exhaustion. `ann_overfetch_max_rounds = 1` disables widening.
 
