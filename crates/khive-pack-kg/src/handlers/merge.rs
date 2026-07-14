@@ -44,7 +44,7 @@ impl KgPack {
                     )));
                 }
                 self.runtime
-                    .merge_entity(
+                    .merge_entity_with_reason(
                         token,
                         into_id,
                         from_id,
@@ -59,7 +59,7 @@ impl KgPack {
                 ensure_note_kind(&self.runtime, token, into_id, specific.as_deref()).await?;
                 ensure_note_kind(&self.runtime, token, from_id, specific.as_deref()).await?;
                 self.runtime
-                    .merge_note(
+                    .merge_note_with_reason(
                         token,
                         into_id,
                         from_id,

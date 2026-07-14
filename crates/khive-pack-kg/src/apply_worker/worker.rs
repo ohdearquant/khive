@@ -262,7 +262,6 @@ impl ProposalApplyWorker {
                         EntityDedupMergePolicy::PreferInto,
                         ContentMergeStrategy::Append,
                         false,
-                        None,
                     )
                     .await?;
                 Ok(vec![])
