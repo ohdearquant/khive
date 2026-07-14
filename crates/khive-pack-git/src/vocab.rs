@@ -2,7 +2,7 @@
 //! declaration, the `precedes` commit→commit edge extension, and the
 //! pack-auxiliary cursor schema.
 //!
-//! See crates/khive-pack-git/docs/vocab.md for the ADR-088 v0 → Amendment 1
+//! See crates/khive-pack-git/docs/api/vocab.md for the ADR-088 v0 → Amendment 1
 //! rationale behind this module's design.
 
 use khive_runtime::{NoteKindSpec, NoteLifecycleSpec};
@@ -12,7 +12,7 @@ use khive_types::{
 };
 
 /// Shared open/closed lifecycle for `issue` and `pull_request`. See
-/// crates/khive-pack-git/docs/vocab.md#git_lifecycle.
+/// crates/khive-pack-git/docs/api/vocab.md#git_lifecycle.
 const GIT_LIFECYCLE: NoteLifecycleSpec = NoteLifecycleSpec {
     field: "kind_status",
     initial: "open",
@@ -38,7 +38,7 @@ pub(crate) static GIT_NOTE_KIND_SPECS: [NoteKindSpec; 2] = [
 ];
 
 /// Pack-auxiliary schema: the git-ingest cursor table (ADR-088 §5). See
-/// crates/khive-pack-git/docs/vocab.md#git_schema_plan_stmts.
+/// crates/khive-pack-git/docs/api/vocab.md#git_schema_plan_stmts.
 pub(crate) static GIT_SCHEMA_PLAN_STMTS: [&str; 2] = [
     "CREATE TABLE IF NOT EXISTS git_mirror_cursor (\
         project_id   TEXT NOT NULL,\
@@ -52,7 +52,7 @@ pub(crate) static GIT_SCHEMA_PLAN_STMTS: [&str; 2] = [
 ];
 
 /// ADR-088 Amendment 1: parent→child commit lineage as `precedes` edges
-/// (note→note extension). See crates/khive-pack-git/docs/vocab.md#git_edge_rules.
+/// (note→note extension). See crates/khive-pack-git/docs/api/vocab.md#git_edge_rules.
 pub(crate) static GIT_EDGE_RULES: [EdgeEndpointRule; 1] = [EdgeEndpointRule {
     relation: EdgeRelation::Precedes,
     source: EndpointKind::NoteOfKind("commit"),
@@ -60,7 +60,7 @@ pub(crate) static GIT_EDGE_RULES: [EdgeEndpointRule; 1] = [EdgeEndpointRule {
 }];
 
 /// Pack-declared `Document` entity-type subtype: Architecture Decision
-/// Records. See crates/khive-pack-git/docs/vocab.md#git_entity_types.
+/// Records. See crates/khive-pack-git/docs/api/vocab.md#git_entity_types.
 pub(crate) static GIT_ENTITY_TYPES: [EntityTypeDef; 1] = [EntityTypeDef {
     kind: EntityKind::Document,
     type_name: "adr",
