@@ -12,9 +12,9 @@ Attribution-Only)
 
 ## Context
 
-Fleet agents write GitHub content - issue bodies, PR descriptions, review comments,
+Callers write GitHub content - issue bodies, PR descriptions, review comments, and
 release notes - through the raw `gh` CLI today. That content is free text assembled from
-an agent's own prose, relayed messages, file contents, or other agent output, and nothing
+caller prose, relayed messages, file contents, or other generated output, and nothing
 inspects it before it reaches a public repository. An incident in which internal-only
 vocabulary reached a public issue body (via text relayed from another internal channel,
 not authored directly by the publishing agent) showed the failure mode concretely: the
@@ -34,7 +34,7 @@ arrival:
    running.
 3. **Later, not specified here**: `gh` is denied for content writes entirely once the verb
    surface has proven itself; the verbs become the only path. That transition is a
-   fleet-operational and hook-configuration change, not a khive code change, and is out of
+   deployment and hook-configuration change, not a khive code change, and is out of
    this ADR's implementation scope (see Migration).
 
 ### Relationship to ADR-108
@@ -54,23 +54,57 @@ precedent rather than re-deriving them: the hardened-shell-out execution model (
 Fork (b), resolved B2 - argv-only construction, no shell interpolation, a fixed
 subcommand/flag surface, and a required adversarial security review at implementation
 time), and the full-audit-via-Event-substrate rule (ADR-108's hard rule 2, restated below
-for this surface's own event kind).
+for this surface's typed audit payload).
 
 ## Decision
 
 ### Verb table (four verbs)
 
-| Verb                  | Args                                              | Returns         |
-| --------------------- | ------------------------------------------------- | --------------- |
-| `git.publish_issue`   | `repo`, `title`, `body`, `labels?`, `assignees?`  | `{url, number}` |
-| `git.publish_comment` | `repo`, `target` (`issue`\|`pr`#N), `body`        | `{url, id}`     |
-| `git.publish_pr`      | `repo`, `head`, `base`, `title`, `body`, `draft?` | `{url, number}` |
-| `git.publish_release` | `repo`, `tag`, `title?`, `notes`                  | `{url}`         |
+| Verb                  | Args                                                                 | Returns         |
+| --------------------- | -------------------------------------------------------------------- | --------------- |
+| `git.publish_issue`   | `repo`, `idempotency_key`, `title`, `body`, `labels?`, `assignees?`  | `{url, number}` |
+| `git.publish_comment` | `repo`, `idempotency_key`, `target`, `body`                          | `{url, id}`     |
+| `git.publish_pr`      | `repo`, `idempotency_key`, `head`, `base`, `title`, `body`, `draft?` | `{url, number}` |
+| `git.publish_release` | `repo`, `idempotency_key`, `tag`, `title?`, `notes`                  | `{url}`         |
 
 Verb naming follows the `git.publish_*` family (resolved fork - see Resolutions). All four
 verbs are `git`-pack verbs, `pack.verb` namespaced per ADR-023, dispatched through the
 existing `VerbRegistry` / `Gate` seam every other khive verb uses - no new dispatch
 mechanism.
+
+`idempotency_key` is required on all four verbs. It is a caller-generated UUID in
+canonical lowercase hyphenated form and identifies one logical publication across retries.
+The handler applies defaults, preserves array order, sorts object keys lexicographically,
+serializes the normalized arguments other than `idempotency_key` as compact UTF-8 JSON,
+and stores the BLAKE3 hash of those bytes. The generated reconciliation marker is not part
+of the hash. The same key with the same hash resumes that operation; reusing it with a
+different hash is rejected before any network call. The implementation stores the key as
+`operation_id` in the recovery ledger described below. A successful retry returns the
+cached remote result. This explicit key is necessary because neither `gh` nor a GitHub
+create operation supplies a transactional boundary shared with khive's graph store.
+
+### Comment target grammar
+
+`git.publish_comment.target` has exactly this ASCII grammar:
+
+```abnf
+target           = target-kind "#" positive-integer
+target-kind      = "issue" / "pr"
+positive-integer = nonzero-digit *DIGIT
+nonzero-digit    = %x31-39
+```
+
+Valid examples are `issue#42` and `pr#978`. Parsing is case-sensitive and the decimal
+number must fit in `u64`. The handler rejects zero, a leading zero, a sign, any whitespace,
+overflow, a bare number, a URL, or any string that embeds a repository. Examples of invalid
+input include `issue#0`, `issue#042`, `issue #42`, `PR#42`, `42`,
+`https://github.com/org/repo/issues/42`, and `org/repo#42`.
+
+The `repo` argument is the only repository authority. After local grammar validation and
+the hygiene scan, but before a comment write, the handler performs a read-only lookup in
+that exact repository and verifies both that the number exists and that its remote object
+kind matches `issue` or `pr`. A missing object, a kind mismatch, or any attempt to encode a
+different repository in `target` fails before the comment is published.
 
 Deliberately excluded from v0:
 
@@ -83,32 +117,47 @@ Deliberately excluded from v0:
 
 ### Handler pipeline
 
-Each verb executes the following steps, in order, before any network call:
+Each verb executes the following steps in order. No remote write occurs until validation,
+authorization, and hygiene scanning have completed:
 
-1. **Repo allowlist check.** `repo` is validated against `[git] publish_repos` (daemon
-   config; see "Repo allowlist" below). An unregistered repo fails fast, independent of
-   content - there is no reason to scan text for a repository this daemon can never
-   publish into.
+1. **Argument and repo checks.** Arguments are normalized, `idempotency_key` is validated,
+   the comment-target grammar is validated where applicable, and `repo` is checked against
+   `[git] publish_repos` (daemon config; see "Repo allowlist" below). An unregistered repo
+   fails fast, independent of content - there is no reason to scan text for a repository
+   this daemon can never publish into.
 2. **Publication-hygiene scan.** Every free-text field submitted to the verb - `title`,
    `body`, `notes`, and every string inside `labels`/`assignees` - is scanned by the three
    layers described in "Scan module" below. The scan is origin-agnostic: it does not
    distinguish an agent's own prose from relayed or pasted text. There is no trusted-source
    bypass and no `force=true` parameter on any verb.
 3. **Deny path.** Any hit not covered by an allowlist escape produces a synchronous deny to
-   the caller (see "Deny semantics") and an event-plane `hygiene_deny` record (see "Audit
-   and the event plane"). No GitHub API call is made.
-4. **GitHub API call.** On a clean scan, the verb shells the configured GitHub CLI (`gh`)
-   under the daemon's identity - the same transport ADR-088's ingester and Amendment 1's
-   `git.digest` already use, argv-only, no shell interpolation, matching the discipline
+   the caller (see "Deny semantics") and an additional typed audit record (see "Audit and
+   the event plane"). No GitHub API call is made.
+4. **Comment-target read check.** For `git.publish_comment`, the handler performs the
+   repository-scoped, kind-aware read described in "Comment target grammar". This is a
+   read-only validation call, not a content write.
+5. **Claim the durable operation.** The handler inserts the pending-operation row in state
+   `unconfirmed_publish`, including the normalized request and its generated reconciliation
+   marker. This commit happens before `gh` is spawned. An existing row follows the recovery
+   state machine; only a proven `not_published` row may enter the create path.
+6. **GitHub API call.** For a newly claimed or proven `not_published` operation only, the
+   verb shells the configured GitHub CLI (`gh`) under the daemon's identity - the same
+   transport ADR-088's ingester and Amendment 1's `git.digest` already use, argv-only, no
+   shell interpolation, matching the discipline
    ADR-108 Fork (b) required for `git`. `gh` is reused rather than a direct REST client for
    the same reason ADR-088 §5 gave: it already handles auth and pagination correctly for
-   this environment.
-5. **Dual-write self-ingest.** On success, the verb creates the corresponding graph record
-   through the existing `create`/`link` verbs (see "Dual write" below) so the KG reflects
-   fleet-authored GitHub content the same wake it is published, without waiting on the next
-   digest sweep.
-6. **Return.** The verb returns the shape in the table above. A publish also emits an
-   `Event` (`kind = "git.publish"`) on success, for audit parity with the deny path.
+   this environment. The fixed marker described in "Publish recovery state machine" is
+   appended after user content has passed the scan.
+7. **Persist the remote receipt.** Once GitHub returns, the handler durably stores the
+   remote URL and number or id and moves the operation to `published_pending_ingest`
+   before attempting any graph write.
+8. **Idempotent self-ingest.** The handler reconciles the corresponding graph record and
+   `annotates` edge (see "Dual write"), then moves the operation to
+   `ingested_pending_audit`.
+9. **Typed publication audit and return.** The handler appends the additional
+   `EventKind::Audit` publication record. Only after that append is durable does it mark
+   the operation `complete` and return the shape in the table. A resumed operation returns
+   the same cached remote identity.
 
 Verb dispatch passes through the Gate (ADR-018) exactly as every other khive verb does -
 this is inherited from the existing dispatch path, not a new mechanism this ADR
@@ -193,51 +242,205 @@ Three layers, evaluated in order, all inside the verb handler:
 
 ### Audit and the event plane
 
-Every dispatch of a publish verb - allowed or denied - produces an `Event` record (ADR-004
-substrate, immutable and append-only), accessible through the `list(kind="event", verb=..., ...)`
-access path like any other Event (ADR-022 makes `list` the supported event-access path and
-excludes `query()` / GQL / SPARQL for events):
+The existing typed surface is authoritative. Every domain-specific row required here uses
+the closed `EventKind::Audit` variant (serialized as `"audit"`), the precise top-level
+`verb` (`git.publish_issue`, `git.publish_comment`, `git.publish_pr`, or
+`git.publish_release`), an `EventOutcome`, and the storage Event's JSON `payload`. This ADR
+does not add `hygiene_deny`, `git.publish`, or any other `EventKind` variant, and does not
+use a nonexistent Event `properties` field. The row has `substrate = SubstrateKind::Event`
+and `payload_schema_version = 1`. It is appended through a runtime helper that stamps the
+same gate-resolved namespace and actor as the automatic audit row.
 
-- **Deny**: `kind = "hygiene_deny"`, with `properties` carrying `verb`, `repo`,
-  `pattern_ids` (every pattern id that matched, matching the `hits[]` array returned to the
-  caller), and a field count. No content excerpt is stored in the Event - the same masking
-  discipline that applies to the caller-facing response applies to the durable audit
-  record.
-- **Allow**: `kind = "git.publish"`, with `properties` carrying `verb`, `repo`, and the
-  resulting `url`/`number`/`id` on success.
+Outcome mapping is exact:
+
+- A hygiene rejection uses `EventOutcome::Denied` (`"denied"`).
+- A completed remote publication whose local ingest and required audit append both
+  succeeded uses `EventOutcome::Success` (`"success"`).
+- A validation or transport failure, an unconfirmed remote result, or an unfinished
+  recovery stage uses `EventOutcome::Error` (`"error"`) for that invocation. A later
+  successful recovery emits its own success record; append-only history is not rewritten.
+
+Every additional row carries these required payload keys:
+
+| Key             | Contract                                                                                                                                      |
+| --------------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
+| `audit_type`    | `publication_hygiene` for a scan deny; `github_publish` otherwise                                                                             |
+| `verb`          | The same precise publish verb as the Event's top-level `verb`                                                                                 |
+| `repo`          | Canonical `owner/name` slug, or `null` if repository validation failed                                                                        |
+| `target`        | `issue`, `pr`, the canonical comment target such as `issue#42`, `tag:<tag>` for a release, or `null` if target validation failed              |
+| `operation_id`  | Canonical idempotency UUID supplied by the call, or `null` if key validation failed                                                           |
+| `state`         | Recovery state after this invocation, or `not_claimed` if the operation ledger was not reached                                                |
+| `rule_ids`      | Sorted, unique pattern ids on deny; empty array otherwise                                                                                     |
+| `field_count`   | Number of distinct denied fields on deny; zero otherwise                                                                                      |
+| `remote_url`    | Published URL on success and whenever already known during recovery; `null` otherwise                                                         |
+| `remote_number` | Positive issue/PR number on issue or PR success; `null` for comments, releases, denies, and errors before that identity is known              |
+| `remote_id`     | Comment id on comment success; `null` for issues, pull requests, releases, denies, and errors before that identity is known                   |
+| `stage`         | `validation`, `scan`, `remote_publish`, `remote_reconcile`, `graph_ingest`, or `audit_append` on denied/error outcomes; `complete` on success |
+
+No title, body, notes, labels, assignee, matched span, or excerpt is stored in this
+payload. In particular, `rule_ids` identifies every hygiene rule hit without persisting
+the rejected content.
+
+These rows are **additional to**, not replacements for, the dispatch-audit row that
+`VerbRegistry` already attempts for every call. The automatic row also has
+`EventKind::Audit`, but carries the generic Gate `AuditEvent` payload and the dispatch
+outcome. After the Gate allows dispatch, the handler adds one hygiene/publication-domain
+row for its invocation, identified by `payload.audit_type`. Thus a normal handler call has
+the generic dispatch row plus one extra domain row; a Gate-denied call has only the generic
+row because the handler never runs. Retries create their own dispatch history. Event reads
+use `list(kind="event", verb="git.publish_issue", ...)` (or another precise verb) and
+inspect `payload.audit_type`; ADR-022 still excludes `query()` / GQL / SPARQL for events.
+
+The success-domain row uses UUIDv5 over the operation UUID's canonical string under a fixed,
+code-defined git-publish audit namespace UUID. This makes its Event id deterministic
+without accepting a caller-selected Event id. A duplicate-key result for the same operation
+and payload is treated as already recorded. The operation cannot advance from
+`ingested_pending_audit` to `complete` until this row is durable. This makes the
+handler-owned success audit recoverable even though the registry's generic dispatch audit
+remains best-effort.
+
+The additional row is a synchronous, required write. If a validation or hygiene-deny row
+cannot be appended, the handler fails closed and performs no remote write. If an audit
+append fails after a remote publication, the operation remains in its recoverable ledger
+state; it is never reported complete merely because the registry may have written its
+best-effort generic row.
 
 This is the v0 audit surface for hygiene enforcement. There is no per-deny notification to
 an actor's inbox or messaging channel in v0 (Resolutions, F3) - the synchronous deny
-response to the caller plus this queryable event record together are considered
-sufficient for v0. A louder, push-based feedback loop is deferred until the event-plane
-record alone proves insufficient in practice; the event kind and property shape above are
-designed so that a future notification layer can be built directly on top of `hygiene_deny`
-Event queries without a schema change.
+response to the caller plus this queryable audit row are sufficient for v0. A push-based
+feedback loop is deferred until evidence shows that event-plane records alone are
+insufficient.
 
 ### Dual write: self-ingest via ADR-088 note kinds
 
-A successful publish creates a graph record through the existing generic `create` and
-`link` verbs - no new verb, no new edge relation, `annotates` only, matching ADR-088's own
-usage:
+A successful publish reconciles a graph record through the existing generic `create`,
+`update`, and `link` verbs - no new graph verb, no new edge relation, `annotates` only,
+matching ADR-088's own usage. The repo-anchor `project` entity is resolved exactly as
+`git.digest` resolves it (ADR-088 Amendment 1): match on `properties.repo_url`, or create
+the anchor if none is found and report that creation.
 
-- `git.publish_issue` creates an `issue` note (ADR-088 §2 shape) and `annotates` the
-  repo-anchor `project` entity, resolved the same way `git.digest` resolves it (ADR-088
-  Amendment 1): match on `properties.repo_url`, or create the anchor entity if none is
-  found, reported rather than silent.
-- `git.publish_pr` creates a `pull_request` note (ADR-088 v0-implementation shape) and
-  `annotates` the repo-anchor `project` entity the same way.
+Issue and PR self-ingest uses the same natural key as the current digest implementation:
+
+```text
+(kind, namespace, properties.number, properties.project_id)
+```
+
+`properties.project_id` is the full UUID string of the resolved repo-anchor project.
+Repository-scoped GitHub numbers are never looked up by `kind` and `number` alone. The
+handler performs a create-or-update upsert on this key: if no note exists it creates one;
+if one exists it updates the governed fields from the remote read-back while preserving
+unrelated extension properties. It then ensures one, and only one, `annotates` edge from
+that note to the resolved project. Replaying either step is a no-op once the desired note
+and edge exist.
+
+The remote read-back after publication (or marker reconciliation) supplies the complete
+property shapes used by `git.digest` today:
+
+- An `issue` note has `name = "#<number> <title>"`, the marker-free remote body in
+  `content`, and common properties `number`, `title`, `author`, `created_at`, `closed_at`,
+  `labels`, and `project_id`. `state_reason` is included when GitHub returns one and must
+  satisfy ADR-088's governed lowercase enum.
+- A `pull_request` note has `name = "#<number> <title>"`, the marker-free remote body in
+  `content`, and common properties `number`, `title`, `author`, `created_at`, `merged_at`,
+  `closed_at`, `base_ref`, `head_ref`, and `project_id`.
+
+Nullable remote fields are retained as JSON `null`, matching the current ingest shape;
+arrays such as issue `labels` are present even when empty. The namespace in the natural key
+is the storage namespace from the handler's `NamespaceToken`, matching `git.digest`.
+Self-ingest does not substitute a publication URL for any of these common properties.
+
 - `git.publish_release` and `git.publish_comment` have no dedicated ADR-088 note kind -
   ADR-088's taxonomy covers `commit`, `issue`, and `pull_request` only. Rather than adding
   new pack-owned note kinds for this ADR's own purposes, both use the existing base
   `reference` note kind (ADR-013), with `content` set to the release notes or comment body
-  and `properties.url` set to the published URL. A `git.publish_comment` targeting an
+  with the khive reconciliation marker removed, `properties.url` set to the published URL,
+  and `properties.publish_operation_id` set to the operation UUID. The latter is the
+  reference-note upsert key used during recovery. A `git.publish_comment` targeting an
   already-ingested issue or pull request `annotates` that note; if the target was never
   ingested, it `annotates` the repo-anchor `project` entity instead. This mirrors ADR-088
-  Amendment 1's own precedent for best-effort enrichment: no match means a narrower edge,
-  never a failed publish.
-- This dual write happens synchronously, in the same handler call, immediately after a
-  successful GitHub API response - not on the next digest sweep, and not through a
-  background job.
+  Amendment 1's best-effort enrichment precedent: no match means a narrower edge, never a
+  second remote publish.
+
+This graph reconciliation runs synchronously after a successful GitHub response and is
+resumed from durable state after a failure; it is not deferred to the next digest sweep or
+to a background job. The required regression is: publish an issue or PR, run `git.digest`
+for the same repository until `done`, and assert exactly one note with that natural key and
+exactly one `annotates` edge from it to the repo project.
+
+### Publish recovery state machine
+
+GitHub and the graph store cannot share a transaction. The git pack therefore owns a
+durable `git_publish_operation` ledger. Its minimum persisted fields are `operation_id`
+(the idempotency UUID, primary key), `namespace`, `verb`, `repo`, a canonical request hash,
+the normalized request needed for local replay, `marker`, `state`, `remote_url`,
+`remote_number`, `remote_id`, `note_id`, `audit_event_id`, `last_error`, `created_at`, and
+`updated_at`. The stored request has already passed the hygiene and secret scans, is local
+daemon state, and must never be copied into an Event payload or error response.
+
+The closed v0 state set and transitions are:
+
+```text
+new -> unconfirmed_publish
+unconfirmed_publish -> not_published
+not_published -> unconfirmed_publish
+unconfirmed_publish -> published_pending_ingest
+published_pending_ingest -> ingested_pending_audit
+ingested_pending_audit -> complete
+```
+
+- **`unconfirmed_publish`** is committed before `gh` is spawned. It means a remote create
+  may not have started, may have failed without a response, or may have succeeded without
+  its response becoming durable. A retry in this state never issues another create.
+- **`not_published`** is reachable only when `std::process::Command::spawn` itself returns
+  an error, proving that no child process and therefore no remote request started. A retry
+  with the same key may move back to `unconfirmed_publish` and make the first remote
+  attempt. No child exit status or output-parse failure is strong enough for this state.
+- **`published_pending_ingest`** requires a durably stored remote URL and the applicable
+  remote number or id. It means GitHub accepted the object but graph reconciliation is not
+  yet complete. Retries perform only the local upsert and edge reconciliation.
+- **`ingested_pending_audit`** means the graph note and edge are reconciled but the
+  operation-level success audit has not yet been confirmed durable. Retries perform only
+  the idempotent audit append.
+- **`complete`** requires remote identity, graph reconciliation, and the success-domain
+  audit. Retries return the stored result without network or graph mutation.
+
+For remote reconciliation, every create appends this fixed, inert marker after the scanned
+user content:
+
+```html
+<!-- khive-publish:<operation_id> -->
+```
+
+The marker contains only the opaque publication UUID and is generated by the handler after
+the caller content passes the scan. It is applied to issue and PR bodies, comment bodies,
+and release notes. Graph self-ingest strips exactly this generated trailing marker from
+`content`; it does not remove arbitrary HTML comments supplied by the caller.
+
+On a retry from `unconfirmed_publish`, the handler performs a read-only, repo- and
+object-kind-scoped search for the exact marker. One match supplies the remote identity and
+advances to `published_pending_ingest`; multiple matches are an integrity error; no match
+leaves the operation unconfirmed and returns an error carrying `operation_id` and
+`state`, but no publish content. It never calls a GitHub create command. An operator may
+resolve a persistently unconfirmed operation only after independently establishing whether
+the remote object exists; silently changing the idempotency key is not a recovery action.
+
+The crash and failure windows are therefore explicit:
+
+| Window                                                   | Durable state              | Retry behavior                                                                 |
+| -------------------------------------------------------- | -------------------------- | ------------------------------------------------------------------------------ |
+| Before the operation insert commits                      | No operation               | The request may claim its key; no remote write has occurred                    |
+| Spawn fails before a child exists                        | `not_published`            | A same-key retry may safely attempt the first create                           |
+| After spawn, during `gh`, before receipt commit          | `unconfirmed_publish`      | Read-only marker reconciliation; never create                                  |
+| After receipt commit, before/during note or edge write   | `published_pending_ingest` | Upsert note and ensure edge; never create                                      |
+| After graph reconciliation, before/during audit append   | `ingested_pending_audit`   | Append the deterministic success audit idempotently; never create or re-ingest |
+| After audit append, before the ledger reaches `complete` | `ingested_pending_audit`   | Duplicate Event id proves audit durability, then mark complete                 |
+
+The ledger update that records remote identity is committed before the first graph write.
+The graph upsert and edge ensure are independently idempotent because a crash can occur
+between them. The domain-separated deterministic success Event id closes the final
+append-versus-ledger window. No retry with a possible or confirmed prior remote attempt
+blindly reissues a GitHub create; only the proven pre-spawn `not_published` state permits
+another attempt.
 
 ### `gh` transport and degradation
 
@@ -246,12 +449,14 @@ argv-only construction (`std::process::Command`, no shell string interpolation),
 token storage. Degradation posture is the opposite of the read/ingest path's: where
 ADR-088's ingester skips gh-dependent work with a warning when `gh` is unavailable or
 unauthenticated, this ADR's publish verbs treat that same condition as a **hard error**.
-A publish verb never silently skips, never falls back to an alternate transport, and never
-partially succeeds - if `gh` cannot execute the request, the verb returns
-`{ok:false, error: "gh unavailable: ..."}` and nothing is published. This asymmetry is
-deliberate: a skipped ingest loses nothing that cannot be recovered on the next digest
-pass, while a silently skipped publish would leave a caller believing content shipped when
-it did not.
+A publish verb never silently skips and never falls back to an alternate transport. A
+failure to spawn `gh` is a confirmed no-publish hard error. Once the child process starts,
+an error or missing parseable response is conservatively `unconfirmed_publish`, because
+GitHub may have accepted the request before the local failure became visible. The caller
+receives `{ok:false, error: "publication state unresolved", operation_id, state}` and must
+retry with the same idempotency key; recovery follows the read-only marker path above.
+This asymmetry is deliberate: skipped ingest work is recoverable on the next digest pass,
+whereas a retried create could duplicate public content.
 
 ## Pattern File Format (normative)
 
@@ -324,7 +529,7 @@ severity = "deny"
 Fields:
 
 - `id` (required, string, unique across the merged set) - stable identifier referenced in
-  deny responses (`hits[].pattern_id`) and in `hygiene_deny` event records.
+  deny responses (`hits[].pattern_id`) and in deny-audit `payload.rule_ids`.
 - `category` (required, one of `actor_token` | `org_mechanics` | `internal_path` |
   `commercial_strategy`) - the pattern class. `secret` is deliberately not a valid value
   here; secret patterns live in the separate `secret_gate` module (see above).
@@ -393,6 +598,42 @@ the two layers could disagree about the same content, which this format exists t
   implementations - is: the TOML shape above, the cross-file `id`-uniqueness rule, the
   regex-portability subset, and the per-field, per-pattern hit semantics.
 
+## Implementation requirements and verification
+
+The implementation ships the verbs, operation ledger, pattern loader, scan, audit rows,
+graph reconciliation, and tests as one change. In addition to unit coverage for the
+pattern file, it must include these contract tests:
+
+1. **Typed audit surface.** Allow, hygiene-deny, transport-error, and recovery-error cases
+   append additional rows with `EventKind::Audit`, the precise top-level verb, the correct
+   `EventOutcome::{Success, Denied, Error}`, and every required JSON payload key. Tests
+   assert that no new `EventKind` spelling is introduced and that deny payloads contain
+   rule ids but no rejected content or excerpt. They also distinguish the handler-owned
+   row from the automatic generic dispatch row by `payload.audit_type`.
+2. **Comment target validation.** Table-driven handler tests accept `issue#42` and
+   `pr#978`; reject zero, leading zero, case changes, signs, whitespace, overflow, bare
+   numbers, URLs, and embedded repositories; and reject a repository-scoped read whose
+   remote kind disagrees with the parsed kind. A transport spy proves rejection occurs
+   before any comment write.
+3. **Digest-compatible idempotency.** Publish an issue and a PR, then run `git.digest` on
+   the same repo until complete. For each remote number, assert one note under
+   `(kind, namespace, number, project_id)`, the full common property shape, and one
+   project `annotates` edge. Repeat self-ingest and digest to prove the counts remain one.
+4. **Recovery failure injection.** Inject a crash or store error after each boundary in
+   the recovery table: operation insert, remote response, note upsert, edge ensure, audit
+   append, and completion update. Resume with the same idempotency key and assert that the
+   remote create spy observed exactly one create, unfinished local work completed, and the
+   final success Event exists exactly once. The unconfirmed case must exercise marker
+   recovery and the no-match error path.
+5. **Idempotency-key conflict.** Reusing a key with identical normalized arguments returns
+   or resumes the original operation; reusing it with different arguments fails before
+   transport.
+
+`tests/smoke_test.py` must cover one allowed publish against a controlled fake `gh`, one
+hygiene deny, one comment-target validation failure, and one resumed
+`published_pending_ingest` operation. Unit and integration tests use a fake transport; the
+test suite must not create real GitHub content.
+
 ## Out of Scope (v0)
 
 - **Reads.** `gh pr view`, checks, API reads, and any other read-only GitHub operation are
@@ -414,11 +655,12 @@ the two layers could disagree about the same content, which this format exists t
 
 1. This ADR through review and sign-off.
 2. **v0**: the four publish verbs, the scan module (pattern file loader, three-layer scan,
-   deny path), the `hygiene_deny`/`git.publish` event records, the dual-write self-ingest,
-   and the repo allowlist ship together, with coverage added to `tests/smoke_test.py`.
-3. **Fleet notice and hook convergence**: outbound GitHub content publication moves to the
-   verb surface. The existing client-side hook converges onto the same pattern file this
-   ADR defines (rather than an independently maintained rule set) and narrows its own role
+   deny path), typed `EventKind::Audit` domain records, the durable operation ledger, the
+   idempotent self-ingest, and the repo allowlist ship together, with coverage added to
+   `tests/smoke_test.py`.
+3. **Deployment notice and hook convergence**: outbound GitHub content publication moves
+   to the verb surface. The existing client-side hook converges onto the same pattern file
+   this ADR defines (rather than an independently maintained rule set) and narrows its role
    to denying raw `gh` content writes outright, pointing the caller at the equivalent verb
    - it no longer needs to make its own allow/deny judgment once the verb enforces the
      identical scan server-side.
@@ -446,8 +688,9 @@ Four forks were presented for this design; each is resolved in place.
 3. **Deny-event notification (F3)**: whether a scan deny also notifies the calling actor's
    own inbox or messaging channel, in addition to the synchronous deny response.
    **Resolved**: no per-deny notification in v0. The synchronous deny to the caller plus
-   the `hygiene_deny` event-plane record together are the v0 audit surface. Revisit only if
-   evidence shows deny records going unreviewed in practice.
+   the additional `EventKind::Audit` row with `payload.audit_type =
+   "publication_hygiene"` together are the v0 audit surface. Revisit only if evidence
+   shows deny records going unreviewed in practice.
 4. **Repo allowlist ownership (F4)**: per-daemon static configuration, or admin-plane data
    shared across daemons. **Resolved**: per-daemon config (`[git] publish_repos`) for v0.
    Centrally managed allowlist data is deferred until a deployment with multiple daemons
@@ -460,11 +703,11 @@ Four forks were presented for this design; each is resolved in place.
 - A single, server-side enforcement point for outbound GitHub content hygiene, reachable
   by every caller through the standard verb dispatch path - not contingent on which hook
   version, if any, an individual agent process happens to have installed.
-- A durable, queryable audit trail (`hygiene_deny` and `git.publish` events) that closes
-  the "cleaned up after the fact" gap the motivating incident exposed, and gives future
+- A durable, queryable audit trail on the existing typed Event surface that closes the
+  "cleaned up after the fact" gap the motivating incident exposed, and gives future
   pattern-tuning work an evidence base instead of anecdote.
-- Same-wake KG visibility of fleet-authored GitHub content via dual write, without waiting
-  on the next digest sweep.
+- Same-call KG visibility of caller-authored GitHub content via recoverable self-ingest,
+  without waiting on the next digest sweep.
 - Pattern data is versioned and reviewable as an ordinary file diff, rather than scattered
   across independently maintained hook and verb implementations that could silently drift
   apart.
@@ -474,6 +717,13 @@ Four forks were presented for this design; each is resolved in place.
 - Hard-error degradation on `gh` unavailability means a publish verb can block a caller's
   task on transport flakiness, where the read/ingest path would have degraded gracefully.
   This is a deliberate tradeoff: a silently skipped publish is worse than a blocked one.
+- Every remote object carries an HTML-comment reconciliation marker that is observable to
+  anyone who inspects the source content.
+- A post-spawn failure with no marker match remains `unconfirmed_publish` rather than
+  guessing that no object exists. This can require operator reconciliation, deliberately
+  preferring a blocked operation over duplicate public content.
+- The recovery ledger stores outbound content that has passed the scan so local graph work
+  can be replayed. It is daemon-local state and expands the data-retention surface.
 - The overlay-file split (F2) is an operational dependency, not a solved problem: a missing
   or stale overlay changes what the scan catches, and if the verb handler and the hook load
   overlays from different paths or versions, the two layers can still drift despite sharing
@@ -517,7 +767,12 @@ Four forks were presented for this design; each is resolved in place.
   kinds.
 - ADR-007 Rev 7 - Namespace as attribution; publish-verb dispatch stamps namespace/actor
   exactly as every other verb does, no new namespace semantics.
+- `crates/khive-types/src/event.rs` and `crates/khive-storage/src/event.rs` - the closed
+  `EventKind`, `EventOutcome`, and JSON payload storage contract used by the additional
+  audit rows.
+- `crates/khive-runtime/src/pack.rs` - the existing generic dispatch-audit path whose row
+  remains separate from this ADR's handler-owned domain row.
 - `crates/khive-runtime/src/secret_gate.rs` - existing secret-detection module, reused
   unchanged as scan layer 2.
-- `crates/khive-pack-git/src/ingest.rs` - existing `gh`/`git` shell-out precedent this
-  ADR's transport follows.
+- `crates/khive-pack-git/src/ingest.rs` - the digest natural key, issue/PR property shapes,
+  and existing `gh`/`git` shell-out precedent this ADR follows.
