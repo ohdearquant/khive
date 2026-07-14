@@ -29,8 +29,8 @@ pub struct SelectorInput<T> {
     ///
     /// Defaults to 0.0 when `None`. Only affects selection when
     /// `SelectorWeights.epistemic_weight > 0.0`. See
-    /// crates/khive-fold/docs/design.md#consistency-notes for why this is
-    /// caller-supplied rather than computed by the Selector.
+    /// crates/khive-fold/docs/design.md#adr-024-bayesian-extensions-selector-budget-packing-and-precision-weighted-scoring
+    /// for why this is caller-supplied rather than computed by the Selector.
     #[cfg_attr(feature = "serde", serde(default))]
     pub information_gain: Option<f32>,
     /// Higher-precision pre-conversion effective score used for rank
@@ -40,8 +40,8 @@ pub struct SelectorInput<T> {
     /// `DeterministicScore::from_f32`. Does not affect `min_score` filtering,
     /// which always operates on `score`. `category_weights` multipliers scale
     /// `rank_score` by the same weight applied to `score`. See
-    /// crates/khive-fold/docs/design.md#rank-score-precision-pr-535 for why
-    /// callers need this instead of relying on the narrowed `score` field.
+    /// crates/khive-fold/docs/api/selector.md#rank-score-precision-pr-535 for
+    /// why callers need this instead of relying on the narrowed `score` field.
     #[cfg_attr(feature = "serde", serde(default))]
     pub rank_score: Option<f64>,
 }
@@ -108,7 +108,7 @@ pub trait Selector<T>: Send + Sync {
 pub struct GreedySelector;
 
 /// Widen `score` (or `rank_score` if set) to `f64` for rank comparisons.
-/// See crates/khive-fold/docs/design.md#rank-score-precision-pr-535.
+/// See crates/khive-fold/docs/api/selector.md#rank-score-precision-pr-535.
 #[inline]
 fn rank_base<T>(item: &SelectorInput<T>) -> f64 {
     item.rank_score.unwrap_or(item.score as f64)
