@@ -1,8 +1,8 @@
 //! File sink for `request` results — writes JSONL and returns a self-describing manifest.
 //!
-//! See crates/khive-mcp/docs/misc.md#save-sink-rationale for why the manifest
-//! self-reports null counts and why `save_to` is treated as an untrusted,
-//! client-supplied filesystem path.
+//! See `crates/khive-mcp/docs/save-sink.md` for why the manifest self-reports
+//! null counts and why `save_to` is treated as an untrusted, client-supplied
+//! filesystem path.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -30,14 +30,9 @@ fn export_root() -> anyhow::Result<PathBuf> {
 }
 
 /// Validate a client-supplied `save_to` path against the allowed export `root`
-/// and return the canonicalized destination.
-///
-/// Rejects:
-/// - `..` traversal components anywhere in the requested path
-/// - a resolved parent directory outside `root` (catches absolute-path escapes
-///   and symlinked intermediate directories, since canonicalization follows them)
-/// - an existing symlink at the destination itself (no-follow: a symlink must
-///   never be silently written through to its target)
+/// and return the canonicalized destination. Rejects `..` traversal, a
+/// resolved parent outside `root`, and an existing symlink at the
+/// destination. See `crates/khive-mcp/docs/save-sink.md`.
 fn validate_destination(root: &Path, requested: &Path) -> anyhow::Result<PathBuf> {
     if requested.as_os_str().is_empty() {
         anyhow::bail!("save_to path must not be empty");
@@ -224,7 +219,7 @@ fn hex_sha256(data: &[u8]) -> String {
 
 /// Write `data` to `path` via a securely-created, randomly-named temp file in
 /// the same directory, then rename over the destination (same-filesystem,
-/// atomic). See crates/khive-mcp/docs/misc.md#write-atomic-rationale for the
+/// atomic). See `crates/khive-mcp/docs/save-sink.md` for the
 /// symlink/predictable-path race this closes vs. a sibling `.tmp` file.
 fn write_atomic(path: &Path, data: &[u8]) -> anyhow::Result<()> {
     use std::io::Write;

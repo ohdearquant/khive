@@ -130,45 +130,16 @@ fn spawn_email_channel_loops_if_daemon(server: &KhiveMcpServer, args: &Args) {
     }
 }
 
-/// Spawn the daemon-resident schedule-event tick loop (ADR-106) if — and
-/// only if — `args` indicates this process is the daemon. Mirrors
-/// [`spawn_email_channel_loops_if_daemon`]'s `args.daemon` role gate (#602):
-/// a short-lived `kkernel exec`/stdio client process never spawns this, only
-/// the daemon does, exactly once per live process. Unlike the email loops,
-/// this is not behind a Cargo feature — the schedule pack is always linked,
-/// so the tick loop is always available.
-///
-/// `schedule_rt` is the daemon's own resolved `"schedule"`-pack runtime
-/// handle, as returned by [`build_server`] (or threaded through
-/// [`serve_server`] by `kkernel`'s coordinator-attached multi-backend boot
-/// path). Passing the ALREADY-RESOLVED runtime, rather than deriving a fresh
-/// `RuntimeConfig` from raw `args.db`/an inferred namespace inside the tick,
-/// is the fix for PR #782: the daemon resolves
-/// `--config`/`[[backends]]`/actor identity/`--pack` selection once at boot,
-/// and a second independent resolution inside the tick could silently target
-/// a different database, actor identity, or pack set. `None` means either
-/// this isn't the daemon role, or the resolved pack set does not include
-/// `"schedule"` (nothing to drain) — either way the tick loop is skipped.
-///
-/// `server` is the daemon's own live, fully-wired `KhiveMcpServer` — the
-/// SAME one [`build_server`] returned alongside `schedule_rt` and that this
-/// process is about to serve. It is cloned (cheap — `Arc`-wrapped
-/// internally) and handed to the tick loop for action-dispatch only (a
-/// continuation of PR #782, following the
-/// `schedule_rt`-only fix above): `schedule_rt` alone is correct for
-/// *scanning* `scheduled_event` rows (they live on the schedule pack's own
-/// backend), but building a throwaway `KhiveMcpServer` from `schedule_rt`
-/// alone for *dispatch* would register every pack against the schedule
-/// backend, so a replayed action belonging to another pack (e.g.
-/// `comm.send`) would route to the wrong backend in a multi-backend
-/// deployment. Passing the daemon's real `server` keeps replay routing
-/// identical to a live request.
-///
-/// If no daemon is running, scheduled events are simply not drained by this
-/// mechanism — the documented external-cron invocation
-/// (`kkernel exec --pending-events`) still works independently and safely
-/// races the tick loop when both are present (see the module docs on
-/// [`crate::pending_events`]).
+/// Spawn the daemon-resident schedule-event tick loop (ADR-106) iff `args`
+/// indicates this process is the daemon (mirrors
+/// [`spawn_email_channel_loops_if_daemon`]'s role gate, #602). `schedule_rt`
+/// MUST be the daemon's own already-resolved `"schedule"`-pack runtime
+/// (never a fresh `RuntimeConfig`, PR #782); `None` means either this isn't
+/// the daemon role or the pack set has no `"schedule"`. `server` MUST be the
+/// daemon's own live `KhiveMcpServer`, cloned for action-dispatch only — a
+/// throwaway server built from `schedule_rt` alone would misroute replayed
+/// actions in a multi-backend deployment. See
+/// `crates/khive-mcp/docs/api/pending-events.md`.
 fn spawn_schedule_tick_loop_if_daemon(
     args: &Args,
     server: &KhiveMcpServer,
@@ -718,22 +689,12 @@ fn channel_error_class(err: &khive_channel::ChannelError) -> &'static str {
 }
 
 /// Persist one poll attempt's outcome via the `comm.heartbeat` subhandler
-/// (#606). Best-effort: a failed heartbeat write is logged and does not
-/// interrupt the poll loop — the heartbeat row is an observability surface,
-/// not a correctness dependency for message delivery.
-///
-/// Takes NO `namespace` parameter (2026-07-04): heartbeat rows are an
-/// operational surface, not message data,
-/// so they are ALWAYS dispatched against
-/// `khive_pack_comm::CHANNEL_HEALTH_NAMESPACE` regardless of what
-/// `KHIVE_EMAIL_INGEST_NAMESPACE` this daemon is configured with for message
-/// ingestion. `handle_heartbeat` additionally hardcodes the persisted row's
-/// namespace to this same constant, so the guarantee holds even if a future
-/// caller changes what this dispatch call passes. `comm.health` no longer
-/// mirrors this fixed pin (khive #877): it reads from the caller's dispatch
-/// token, which resolves to this constant only for an unscoped (default)
-/// read — an explicitly-scoped `comm.health` call reads its own namespace,
-/// not necessarily where this function wrote.
+/// (#606). Best-effort: a failed write is logged, never interrupts the poll
+/// loop. Takes NO `namespace` param — heartbeat rows are always dispatched
+/// against `khive_pack_comm::CHANNEL_HEALTH_NAMESPACE` regardless of the
+/// daemon's configured `KHIVE_EMAIL_INGEST_NAMESPACE` (2026-07-04); an
+/// explicitly-scoped `comm.health` read may see a different namespace
+/// (khive #877).
 #[cfg(feature = "channel-email")]
 async fn record_channel_heartbeat(
     registry: &khive_runtime::VerbRegistry,
@@ -1464,14 +1425,11 @@ pub(crate) fn is_strict_actor_mode() -> bool {
 /// - `khive_mcp::pending_events::run_pending_events` — drains and dispatches
 ///   scheduled events
 ///
-/// **Pure-introspection registry construction is intentionally EXEMPT** because it
-/// never dispatches verbs or reads comm/tenant data, so it carries no
-/// tenant-isolation risk. Requiring an actor identity there would make
-/// `kkernel pack list` and `kkernel kg validate` fail under strict mode without
-/// any security benefit — an operator must be able to introspect a strict-mode
-/// deployment. Exempt paths: `build_registry` in `crates/kkernel/src/pack_introspect.rs`
-/// and `build_taxonomy` in `crates/kkernel/src/kg/validate.rs`. Each of those
-/// functions carries an inline comment explaining why.
+/// **Pure-introspection registry construction is intentionally EXEMPT**
+/// (`build_registry` in `crates/kkernel/src/pack_introspect.rs`,
+/// `build_taxonomy` in `crates/kkernel/src/kg/validate.rs`) because it never
+/// dispatches verbs or reads comm/tenant data — an operator must still be
+/// able to introspect a strict-mode deployment.
 pub fn enforce_strict_actor_mode(
     actor_id: Option<&str>,
     loaded_packs: &[String],
@@ -1490,25 +1448,16 @@ pub fn enforce_strict_actor_mode(
 /// Build a fully-configured server from parsed args (without serving).
 ///
 /// Returns, alongside the server, the resolved [`KhiveRuntime`] handle the
-/// `"schedule"` pack is bound to — `None` when the resolved pack set does not
-/// include `"schedule"` — for `spawn_schedule_tick_loop_if_daemon` to drain
-/// against (ADR-106). This is the SAME runtime the server itself dispatches
-/// through: a single-backend boot shares one `KhiveRuntime` across every
-/// pack, and a multi-backend boot (ADR-028 `[[backends]]`) returns the
-/// specific per-pack runtime `"schedule"` was wired to. Threading this
-/// through — rather than having the tick loop re-resolve its own
-/// `RuntimeConfig` from raw `--db`/namespace args is the fix for PR #782: a
-/// second, independently-resolved config could
-/// silently target a different database, actor identity, or pack set than
-/// the daemon it claims to serve.
+/// `"schedule"` pack is bound to — `None` when the resolved pack set does
+/// not include `"schedule"` — for `spawn_schedule_tick_loop_if_daemon` to
+/// drain against (ADR-106). This is the SAME runtime the server itself
+/// dispatches through, never an independently re-resolved one (PR #782 —
+/// see `crates/khive-mcp/docs/api/pending-events.md`).
 ///
 /// Thin wrapper over [`build_server_with_explicit_namespace`]: derives the
-/// `(namespace, namespace_explicit)` pair from a real CLI parse via
-/// [`resolve_cli_namespace`], and — because this is the genuine `--actor`
-/// / `--namespace` CLI flag path — also treats that explicitness as a real
-/// actor override (`actor_explicit` mirrors `namespace_explicit` here; see
-/// `RuntimeConfigInputs::actor_explicit`'s field doc for why only this call
-/// site is allowed to do that).
+/// `(namespace, namespace_explicit)` pair from a real CLI parse and, because
+/// this is the genuine `--actor`/`--namespace` CLI flag path, also treats
+/// that explicitness as a real actor override.
 pub fn build_server(args: &Args) -> anyhow::Result<(KhiveMcpServer, Option<KhiveRuntime>)> {
     let (cli_namespace_explicit, cli_namespace) =
         resolve_cli_namespace(args).map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -1523,23 +1472,16 @@ pub fn build_server(args: &Args) -> anyhow::Result<(KhiveMcpServer, Option<Khive
 /// Build a fully-configured server from parsed args plus an independently
 /// resolved `(namespace, namespace_explicit, actor_explicit)` triple.
 ///
-/// Extracted from [`build_server`] (PR #782) so
-/// that non-interactive-CLI callers — e.g. the `--pending-events` one-shot
-/// drain wrapper in `pending_events.rs` — can supply a namespace default
-/// without it being misread as a genuine `--actor` override. `build_server`
-/// derives its namespace from a real CLI parse (`resolve_cli_namespace`),
-/// where "a namespace value is present" and "the operator explicitly
-/// overrode the actor identity" are the same fact by construction — there is
-/// no way to type `--namespace foo` without meaning it. A caller that
-/// synthesizes an `Args` value programmatically (no real flag parse behind
-/// it) does not get to make that same inference: passing a default
-/// namespace through `namespace_explicit: true` while asserting the actor
-/// identity was never touched (`actor_explicit: false`) is exactly the
-/// `kkernel exec` / `kkernel reindex` shape (see their own
-/// `resolve_runtime_config` call sites and the field doc on
-/// `RuntimeConfigInputs::actor_explicit`), and this function is the seam
-/// that lets any caller opt into that same, narrower semantic instead of
-/// `build_server`'s CLI-only one.
+/// Extracted from [`build_server`] (PR #782) so non-interactive-CLI callers
+/// (e.g. the `--pending-events` one-shot drain wrapper) can supply a
+/// namespace default without it being misread as a genuine `--actor`
+/// override. `build_server` derives `namespace_explicit` from a real CLI
+/// parse, where "a namespace value is present" and "the operator explicitly
+/// overrode the actor identity" are the same fact by construction. A caller
+/// that synthesizes an `Args` value programmatically does not get to make
+/// that inference — pass `actor_explicit: false` while `namespace_explicit`
+/// is still `true` (the `kkernel exec` / `kkernel reindex` shape; see
+/// `RuntimeConfigInputs::actor_explicit`'s field doc).
 pub fn build_server_with_explicit_namespace(
     args: &Args,
     namespace: khive_runtime::Namespace,

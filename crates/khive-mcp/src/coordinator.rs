@@ -344,7 +344,7 @@ pub(crate) mod tests {
 
     /// T6d: a multi-backend search with a malformed `tags` value must return a
     /// per-op error rather than silently returning unfiltered results (see
-    /// crates/khive-mcp/docs/misc.md#t6d for the regression this guards).
+    /// crates/khive-mcp/docs/api/coordinator.md#t6d for the regression this guards).
     #[tokio::test]
     async fn t6d_malformed_tags_return_per_op_error_in_multi_backend() {
         let (registry, _runtime) = make_registry();
@@ -390,7 +390,7 @@ pub(crate) mod tests {
 
     /// T6e / PR #549 blocker: a multi-backend `search` with a malformed
     /// `namespace` must fail closed and never reach the coordinator (see
-    /// crates/khive-mcp/docs/misc.md#t6e-namespace for the RUNTIME-AUD-002 regression).
+    /// crates/khive-mcp/docs/api/coordinator.md#t6e-namespace for the RUNTIME-AUD-002 regression).
     #[tokio::test]
     async fn t6e_multi_backend_search_malformed_namespace_fails_closed() {
         let cases: [(&str, &str); 5] = [
@@ -552,7 +552,7 @@ pub(crate) mod tests {
 
     /// T6e: a multi-backend `search` limit beyond `u32::MAX` must be rejected
     /// with a per-op error, not silently wrapped by `as u32` (see
-    /// crates/khive-mcp/docs/misc.md#t6e-limit for the MCP-AUD-003 regression).
+    /// crates/khive-mcp/docs/api/coordinator.md#t6e-limit for the MCP-AUD-003 regression).
     #[tokio::test]
     async fn t6e_multi_backend_search_limit_matches_single_backend_u32_contract() {
         let (registry, _runtime) = make_registry();

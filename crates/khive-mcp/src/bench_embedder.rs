@@ -24,7 +24,7 @@ fn fnv1a_64(data: &[u8]) -> u64 {
 }
 
 /// Feature-hashing embedder: tokenise → per-token (dim, sign) → accumulate →
-/// L2-normalise. See crates/khive-mcp/docs/misc.md#hash-embed-rationale.
+/// L2-normalise. See `crates/khive-mcp/docs/design.md` (Bench embedder).
 fn hash_embed(text: &str) -> Vec<f32> {
     let mut v = vec![0.0f32; DIM];
     for token in text

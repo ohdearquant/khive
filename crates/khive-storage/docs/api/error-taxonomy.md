@@ -1,10 +1,10 @@
-# khive-storage — core types guide
+# Error taxonomy — `StorageError`
 
-Long-form rationale extracted from doc-comments in `error.rs`, `blob.rs`, `note.rs`,
-and `types/graph.rs`. Each section links back to the source item; the source
-doc-comment keeps a complete standalone contract and a one-line pointer here.
+`StorageError` (`src/error.rs`) is the single error type returned across every
+storage capability trait. This document covers the classifier predicates whose
+full rationale does not fit inline in the rustdoc contract.
 
-## `StorageError::WriterTaskNoRuntime` (error.rs)
+## `WriterTaskNoRuntime`
 
 Returned instead of panicking: a caller that constructs a store from a plain,
 non-async context with `KHIVE_WRITE_QUEUE=1` set gets a clean, typed failure
@@ -12,7 +12,7 @@ at first write rather than a `tokio::spawn`-outside-runtime panic. Flag-off
 callers never see this variant — `writer_task_handle` only attempts to spawn
 when `PoolConfig::write_queue_enabled` is set.
 
-## `StorageError::is_fts5_syntax_error` (error.rs)
+## `is_fts5_syntax_error`
 
 `TextSearch::search` returns the same `Driver` variant for a malformed MATCH
 expression *and* for a genuine backend outage (pool exhaustion, connection
@@ -32,9 +32,15 @@ just the `fts5:` namespace prefix.
 
 Only applies to `Driver` errors from the `Text` capability at the
 `fts_search` operation — the exact seam `Fts5TextSearch::search` uses
-(`crates/khive-db/src/stores/text.rs`).
+(`crates/khive-db/src/stores/text.rs`). Pool, Timeout, Transaction, and any
+other `operation` value (e.g. `fts_count`, `open_fts_reader`) always return
+`false`.
 
-## `StorageError::is_unique_constraint_violation` (error.rs)
+Callers that fail-open the FTS leg of a hybrid search (degrading to
+vector-only results on a bad query string) MUST gate on this predicate rather
+than on `StorageError` broadly.
+
+## `is_unique_constraint_violation`
 
 `khive-db`'s `sql_bridge` labels a single-statement execute operation
 differently depending on which `SqlAccess` seam produced the writer — a bare
@@ -45,15 +51,7 @@ partway through a multi-statement batch is not the same single-row-duplicate
 case this predicate exists to tolerate. `pool_writer.execute` is the exact
 seam `brain.record_serve` writes through.
 
-## `blake3_hash_of_empty` test helper (blob.rs)
-
-khive-storage has zero heavy dependencies (ADR-005), so this test hand-rolls
-the one known `BLAKE3("")` vector instead of pulling in the `blake3` crate
-just to exercise `hex_encode`.
-
-## `deserialize_rejects_short_string` test (blob.rs)
-
-This is the exact repro that motivates `ContentRef`'s hand-written
-`Deserialize` impl: a naive derived `Deserialize` would construct
-`ContentRef("x")` here, and any caller passing it to `get`/`exists`/`delete`
-would then panic in `shard_path`'s `[0..2]`/`[2..4]` slices.
+Callers that treat exact-key duplicates as a tolerated no-op (ADR-081 §4
+serve-ledger idempotency) MUST gate on this predicate rather than swallowing
+every `Driver` error at `execute` — that would also hide genuine write
+failures (disk full, corruption).

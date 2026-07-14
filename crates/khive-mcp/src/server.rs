@@ -1053,24 +1053,13 @@ impl KhiveMcpServer {
 }
 
 /// Route a `link` or `search` verb through `coord` when in multi-backend mode.
-///
-/// This is the shared logic behind both dispatch sites (`dispatch_op` chain mode
-/// and the parallel/single closure in `run_parsed`). Extracted as a free async
-/// function so closures that don't have access to `&self` can call it.
-///
-/// Returns `Some(Ok(Value))` when the coordinator handled the op successfully.
-/// Returns `Some(Err((tool, error_value)))` when the coordinator returned an error,
-/// including when a caller-supplied `namespace` argument fails fail-closed
-/// validation (see below).
-/// Returns `None` to indicate fall-through (caller should dispatch through the registry).
-///
-/// RUNTIME-AUD-002 (#433, PR #549 blocker): this coordinator intercept runs
-/// *before* `VerbRegistry::dispatch`, so it must apply the exact same
-/// fail-closed namespace rule `dispatch` applies — a present-but-non-string
-/// `namespace` (null/number/bool/array/object) must be rejected, never
-/// silently substituted with the server default. Both call sites route
-/// through `resolve_explicit_namespace` (the same chokepoint `dispatch` uses)
-/// so this can't drift out of sync again.
+/// Shared logic behind both dispatch sites (`dispatch_op` chain mode and the
+/// parallel/single closure in `run_parsed`). Returns `Some(Ok(Value))` when
+/// the coordinator handled the op, `Some(Err((tool, error_value)))` on a
+/// coordinator error (including fail-closed namespace rejection), `None` to
+/// fall through to the registry. Must apply the exact same fail-closed
+/// namespace rule as `VerbRegistry::dispatch` (RUNTIME-AUD-002, #433) — see
+/// `crates/khive-mcp/docs/api/coordinator.md`.
 async fn dispatch_via_coordinator_inner(
     coord: &dyn CoordinatorService,
     tool: &str,
@@ -1291,18 +1280,10 @@ async fn dispatch_via_coordinator_inner(
 }
 
 /// Returns `true` when a raw handler `result` value's container nesting is
-/// within [`khive_request::NESTING_DEPTH_LIMIT`].
-///
-/// Handler results (e.g. `traverse`/`context`) are not bounded by the DSL
-/// parser's syntax-tree guard, so a pathologically deep result could
-/// overflow the stack via recursive `Value::clone`, `json!`/
-/// `serde_json::to_value` serialization, or the agent-mode presentation
-/// transform — all of which recurse natively over `Value`. Callers MUST
-/// call this on the raw value coming straight out of coordinator/registry
-/// dispatch, before any of those operations touch it. Delegates to
-/// [`khive_request::value_nesting_within_limit`], which walks an explicit
-/// worklist instead of native recursion, so the check itself cannot
-/// overflow the stack on the same input it is screening.
+/// within [`khive_request::NESTING_DEPTH_LIMIT`]. Callers MUST call this on
+/// the raw value straight out of coordinator/registry dispatch, before any
+/// recursive `Value` operation (clone, serialize, presentation transform)
+/// touches it — see `crates/khive-mcp/docs/design.md` (Result depth guard).
 fn result_within_depth_limit(result: &Value) -> bool {
     khive_request::value_nesting_within_limit(result, khive_request::NESTING_DEPTH_LIMIT)
 }
@@ -1402,16 +1383,12 @@ fn result_exceeds_depth_limit(result_obj: &Value) -> bool {
         .is_some_and(|v| !result_within_depth_limit(v))
 }
 
-/// Chain-mode aggregation-loop seam in [`KhiveMcpServer::run_parsed`]: the
-/// second, defense-in-depth check applied to a dispatched op's full
-/// `result_obj` envelope. By the time this runs, `dispatch_op`'s own
-/// `chain_ok_envelope_or_depth_error` has already screened the same
-/// `result` field, so this should never trip in practice — but if a future
-/// refactor bypasses that earlier guard, the rejected envelope must still be
-/// discarded iteratively rather than dropped natively, or the recursive
-/// `Drop` this branch exists to prevent happens anyway on the way out of
-/// scope. Returns the unchanged envelope on success, or an already-built
-/// error entry (with the oversized value already drained) on rejection.
+/// Chain-mode aggregation-loop seam in [`KhiveMcpServer::run_parsed`]:
+/// defense-in-depth depth check on a dispatched op's full `result_obj`
+/// envelope (should never trip — `dispatch_op` already screened `result`).
+/// Returns the unchanged envelope on success, or an already-built error
+/// entry on rejection. See `crates/khive-mcp/docs/design.md` (Result depth
+/// guard) for why the rejected envelope is drained iteratively.
 fn chain_aggregation_depth_reject(result_obj: Value) -> Result<Value, Value> {
     if result_exceeds_depth_limit(&result_obj) {
         let tool_name = result_obj

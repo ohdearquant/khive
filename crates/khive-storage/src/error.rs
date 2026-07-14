@@ -96,9 +96,8 @@ pub enum StorageError {
 
     /// `KHIVE_WRITE_QUEUE=1` is set but the calling thread has no Tokio
     /// runtime context, so the writer task cannot be spawned (ADR-067
-    /// Component A). Returned instead of panicking. See
-    /// crates/khive-storage/docs/storage-core.md#writertasknoruntime for why
-    /// this variant exists instead of a `tokio::spawn`-outside-runtime panic.
+    /// Component A). Returned instead of panicking.
+    /// See `crates/khive-storage/docs/api/error-taxonomy.md#writertasknoruntime`.
     #[error(
         "KHIVE_WRITE_QUEUE=1 but no Tokio runtime context is available to spawn the writer task"
     )]
@@ -172,17 +171,14 @@ impl StorageError {
     /// True only for `Driver` errors from the `Text` capability at the
     /// `fts_search` operation whose message names one of SQLite's FTS5
     /// parser failure modes (syntax error, stack overflow, unsupported
-    /// column/phrase/NEAR query). Pool, Timeout, Transaction, and any other
-    /// `operation` value (e.g. `fts_count`, `open_fts_reader`) always return
-    /// `false` (propagate as a real failure).
+    /// column/phrase/NEAR query); all other errors return `false`.
     ///
     /// Callers that fail-open the FTS leg of a hybrid search (degrading to
     /// vector-only results on a bad query string) MUST gate on this
     /// predicate rather than on `StorageError` broadly — treating every
     /// `Err` as degradable turns a real backend outage into a silently-empty
-    /// "successful" search. See
-    /// crates/khive-storage/docs/storage-core.md#is_fts5_syntax_error for
-    /// why the message-prefix match is safe (issue #389).
+    /// "successful" search (issue #389).
+    /// See `crates/khive-storage/docs/api/error-taxonomy.md#is_fts5_syntax_error`.
     pub fn is_fts5_syntax_error(&self) -> bool {
         let Self::Driver {
             capability,
@@ -207,16 +203,14 @@ impl StorageError {
     /// `execute` (e.g. an `INSERT` racing an existing row under a natural
     /// key). True only for `Driver` errors from the `Sql` capability whose
     /// `operation` is one of `execute`, `pool_writer.execute`, or
-    /// `tx.execute` (the three single-statement seams `khive-db`'s
-    /// `sql_bridge` can label) and whose message contains `UNIQUE constraint
-    /// failed`. Batch/script operations are intentionally excluded.
+    /// `tx.execute`, and whose message contains `UNIQUE constraint failed`.
+    /// Batch/script operations are intentionally excluded.
     ///
     /// Callers that treat exact-key duplicates as a tolerated no-op
     /// (ADR-081 §4 serve-ledger idempotency) MUST gate on this predicate
     /// rather than swallowing every `Driver` error at `execute` — that would
-    /// also hide genuine write failures (disk full, corruption). See
-    /// crates/khive-storage/docs/storage-core.md#is_unique_constraint_violation
-    /// for the per-seam operation-label rationale.
+    /// also hide genuine write failures (disk full, corruption).
+    /// See `crates/khive-storage/docs/api/error-taxonomy.md#is_unique_constraint_violation`.
     pub fn is_unique_constraint_violation(&self) -> bool {
         let Self::Driver {
             capability,
