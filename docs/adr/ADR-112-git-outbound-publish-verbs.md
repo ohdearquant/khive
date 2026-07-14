@@ -291,11 +291,14 @@ authorization, and hygiene scanning have completed:
    validation calls, not content writes, and both finish before an operation is claimed.
 5. **Claim the durable operation.** For a new operation, the handler obtains a
    cryptographically random reconciliation nonce, generates a standard UUIDv7 for the eventual
-   success-domain Event, and atomically inserts the pending-operation row in state
-   `unconfirmed_publish`, including the normalized request, nonce, full generated
-   reconciliation marker, and `audit_event_id`. This commit happens before `gh` is spawned.
-   An existing row reuses its persisted nonce, marker, and audit Event id and follows the
-   recovery state machine; only a proven `not_published` row may enter the create path.
+   success-domain Event, resolves the daemon's current immutable GitHub author node id under
+   the publishing identity through a read-only `gh api graphql` viewer query (the same
+   transport used elsewhere in this pipeline), and atomically inserts the pending-operation row
+   in state `unconfirmed_publish`, including the normalized request, nonce, full generated
+   reconciliation marker, resolved `author_node_id`, and `audit_event_id`. This commit happens
+   before `gh` is spawned. An existing row reuses its persisted nonce, marker, `author_node_id`,
+   and audit Event id and follows the recovery state machine; only a proven `not_published` row
+   may enter the create path.
 6. **GitHub API call.** For a newly claimed or proven `not_published` operation only, the
    verb shells the configured GitHub CLI (`gh`) under the daemon's identity - the same
    transport ADR-088's ingester and Amendment 1's `git.digest` already use, with the fixed
@@ -637,9 +640,13 @@ exactly one `annotates` edge from it to the repo project.
 GitHub and the graph store cannot share a transaction. The git pack therefore owns a
 durable `git_publish_operation` ledger. Its minimum persisted fields are `operation_id`
 (the idempotency UUID), `namespace`, `verb`, `repo`, a canonical request hash, the normalized
-request needed for local replay, `reconciliation_nonce`, `marker`, `state`, `remote_url`,
-`remote_number`, `remote_id`, `note_id`, `audit_event_id`, `last_error`, `created_at`, and
-`updated_at`. The composite `(namespace, verb, operation_id)` is the ledger's primary key
+request needed for local replay, `reconciliation_nonce`, `marker`, `author_node_id`, `state`,
+`remote_url`, `remote_number`, `remote_id`, `note_id`, `audit_event_id`, `last_error`,
+`created_at`, and `updated_at`. `author_node_id` is the daemon's own immutable GitHub GraphQL
+author node id under the publishing identity, resolved and persisted at claim time, before any
+create; the recovery binding rule below compares a candidate's server-assigned author node id
+against this stored value, never the ambient login at retry time. The composite
+`(namespace, verb, operation_id)` is the ledger's primary key
 and unique operation identity; no global uniqueness constraint on `operation_id` may collapse
 two supported dispatch scopes. The stored request has already passed the hygiene and secret
 scans, is local daemon state, and must never be copied into an Event payload or error
@@ -679,11 +686,28 @@ ingested_pending_audit -> complete
   audit. Retries return the stored result without network or graph mutation.
 
 For remote reconciliation, every create appends this inert, operation-bound marker after the
-scanned user content:
+scanned user content, separated from it by exactly two ASCII line-feed bytes (`\n\n`) so the
+append point is byte-exact and reversible:
 
 ```html
 <!-- khive-publish:<operation_id>:<reconciliation_nonce> -->
 ```
+
+The complete appended suffix - the two-line-feed separator followed by the marker above - is
+therefore `\n\n<!-- khive-publish:<operation_id>:<reconciliation_nonce> -->`, bound to this
+operation's own persisted `operation_id` and `reconciliation_nonce`. An empty scanned body or
+notes value receives only this suffix, with no leading content before it.
+
+**Trailing-marker removal.** Both graph self-ingest and recovery's per-verb content reduction
+strip the appended marker through one named routine, defined here and applied identically by
+both callers: given a body string and an operation's persisted `operation_id` and
+`reconciliation_nonce`, the routine computes the exact expected trailing byte sequence
+`\n\n<!-- khive-publish:<operation_id>:<reconciliation_nonce> -->` bound to those two exact
+values. If the body's trailing bytes equal that exact sequence, the routine returns the body
+with exactly that suffix removed; otherwise it returns the body unchanged, including when the
+body has no trailing marker at all. The routine matches only the specific `operation_id` and
+nonce it is given - never a generic marker-shaped pattern - so a caller-supplied HTML comment
+that merely looks like a marker, or a different operation's genuine marker, is never stripped.
 
 `reconciliation_nonce` is exactly 32 bytes obtained from the operating system's
 cryptographically secure random source and encoded as 64 lowercase hexadecimal characters.
@@ -706,8 +730,9 @@ operation exists, because no one can predict it in advance - but it cannot and d
 a post-disclosure copy of the genuine marker. The binding rule below exists precisely to keep
 recovery correct under that copy. Neither the nonce nor the marker appears in receipts, error
 responses, audit payloads, graph properties, or logs. The marker is applied uniformly to issue
-and PR bodies, comment bodies, and release notes. Graph self-ingest strips exactly the
-persisted generated trailing marker from `content`; it does not remove arbitrary HTML comments
+and PR bodies, comment bodies, and release notes. Graph self-ingest applies the trailing-marker
+removal routine defined above, using this operation's own persisted `operation_id` and
+`reconciliation_nonce`, to produce `content`; it does not remove arbitrary HTML comments
 supplied by the caller. Caller content may therefore contain operation UUIDs, legacy
 operation-id-only marker text, or marker-shaped HTML comments with caller-chosen nonce text
 without being rewritten. Such text is not a candidate hit for a pending operation because it
@@ -727,19 +752,19 @@ addition to the marker text itself:
 
 - issues: the repository's `issues` connection, with `states: [OPEN, CLOSED]`,
   `orderBy: {field: CREATED_AT, direction: ASC}`, and the issue `id`, `url`, `number`,
-  `body`, `createdAt`, and `author { login }`;
+  `body`, `createdAt`, and `author { id }`;
 - pull requests: the repository's `pullRequests` connection, with
   `states: [OPEN, CLOSED, MERGED]`, `orderBy: {field: CREATED_AT, direction: ASC}`, and the
   pull request `id`, `url`, `number`, `body`, `baseRefName`, `headRefName`, `createdAt`, and
-  `author { login }`;
+  `author { id }`;
 - comments: the already-validated target returned by the repository's
   `issueOrPullRequest(number:)` field, followed by the concrete `Issue.comments` or
   `PullRequest.comments` connection with
   `orderBy: {field: UPDATED_AT, direction: ASC}`, and the comment `id`, `url`, `body`,
-  `createdAt`, and `author { login }`;
+  `createdAt`, and `author { id }`;
 - releases: the repository's `releases` connection, with
   `orderBy: {field: CREATED_AT, direction: ASC}`, and the release `id`, `url`, `description`,
-  `tagName`, `createdAt`, and `author { login }`.
+  `tagName`, `createdAt`, and `author { id }`.
 
 These are fixed GraphQL object connections, not the GraphQL `search` connection. The handler
 invokes them through the code-selected literal `gh api graphql` command shape. The literal
@@ -774,26 +799,50 @@ the marker scan produced (zero, one, or more than one):
 - Scope every candidate to (a) the single repository named on this operation's ledger row -
   already guaranteed by the repo-scoped scan above, so a marker copied into a _different_
   allowed repository is out of scope by construction and never enters the candidate set;
-  (b) a per-verb content reduction of the ledger's stored normalized request - for
-  `git.publish_release`, candidate `tagName` equals the ledger's normalized `tag`; for
-  `git.publish_issue`, candidate `title` and `body` equal the ledger's normalized `title` and
-  `body`; for `git.publish_pr`, candidate `title`, `body`, `baseRefName`, and `headRefName`
-  equal the ledger's normalized `title`, `body`, `base`, and `head`; for `git.publish_comment`,
-  the candidate is already scoped to the exact parent issue/PR by the query path above, so
-  candidate `body` equals the ledger's normalized `body` - a candidate failing its verb's
-  reduction is discarded, not counted as a match; and (c) server-assigned,
-  non-caller-controllable metadata on the candidate node - GraphQL `id` (GitHub's `node_id`),
-  `createdAt` falling within the recorded crash window `[ledger.created_at, now]`, and
-  `author.login` equal to the `gh` identity the daemon publishes under - a candidate failing
-  any of (a)-(c) is discarded, not counted as a match.
-- **Zero candidates survive (a)-(c):** treat every exact-marker hit as a foreign copy out of
-  scope for this operation and proceed exactly as if no marker existed - the operation is not
-  bound to any remote object, and a same-identity retry may attempt the create. This is safe
-  because a genuine create for this operation always writes the marker into the object it
-  creates, so a genuinely-published object for this operation is always a candidate that
-  satisfies (a)-(c); zero surviving candidates therefore proves no such object exists yet, and
-  the retry cannot create a marker-confusable duplicate of an object that was never actually
-  published. This case never returns an integrity error and never leaves the operation stuck.
+  (b) a per-verb content reduction of the ledger's stored normalized request, comparing every
+  body-bearing field only after applying the trailing-marker removal routine defined above
+  (using this operation's own persisted `operation_id` and `reconciliation_nonce`) to strip the
+  candidate's trailing marker first - for `git.publish_release`, candidate `tagName` equals the
+  ledger's normalized `tag`; for `git.publish_issue`, candidate `title` equals the ledger's
+  normalized `title` and the marker-stripped candidate `body` equals the ledger's normalized
+  `body`; for `git.publish_pr`, candidate `title`, `baseRefName`, and `headRefName` equal the
+  ledger's normalized `title`, `base`, and `head`, and the marker-stripped candidate `body`
+  equals the ledger's normalized `body`; for `git.publish_comment`, the candidate is already
+  scoped to the exact parent issue/PR by the query path above, so the marker-stripped candidate
+  `body` equals the ledger's normalized `body` - a candidate failing its verb's reduction,
+  before or after stripping, is discarded, not counted as a match; and (c) server-assigned,
+  non-caller-controllable metadata on the candidate node - GraphQL `id` (GitHub's `node_id`)
+  and the candidate's immutable author node id (`author.id`) equal to the `author_node_id`
+  value persisted in this operation's ledger row at claim time - a candidate failing any of
+  (a)-(c) is discarded, not counted as a match. The candidate's `createdAt` is deliberately not
+  used as a discard filter: repository scope (a), per-verb content reduction (b), and the
+  immutable GraphQL object id and author node id in (c) already bind the candidate to this
+  operation, and a local-clock lower bound would be redundant on top of that binding while
+  remaining vulnerable to skew between the daemon's local ledger clock and GitHub's
+  server-assigned timestamp. `createdAt` is still fetched on every candidate node, but only for
+  the earliest-survivor ordering the "more than one candidate" case below uses, never to
+  discard a candidate. Binding on the immutable author node id rather than the ambient login
+  also means a credential rotation or GitHub login rename between the uncertain publish and the
+  retry cannot hide a genuine object: the object's `author.id` does not change even though the
+  daemon's current login might.
+- **Zero candidates survive (a)-(c):** every exact-marker hit, if any, was a foreign copy out
+  of scope for this operation. Zero surviving candidates is evidence that no object bound to
+  this operation is currently visible in the scanned repository, but it is not proof of
+  non-publication - a credential rotation or login rename can hide a genuine object behind the
+  wrong ambient identity (closed above by binding on `author_node_id` rather than login), and
+  more generally the daemon cannot distinguish "never published" from "published but not yet
+  locatable" from an absence of candidates alone. Because this operation's create child process
+  has already started by the time a retry reaches recovery from `unconfirmed_publish`, a
+  zero-candidate result never authorizes a create: the operation remains `unconfirmed_publish`,
+  and recovery returns a content-free unresolved reconciliation result. This is the same
+  terminal class the bounded-traversal-failure case above already uses - a bounded,
+  operator-resolvable state, not the fatal integrity error the marker-copy analysis in this
+  section rules out - and an operator resolves it the same way, by independently establishing
+  whether the remote object exists, or by a separately specified durable provider-side proof,
+  before any further action. The copied-marker denial-of-service risk this scoping rule exists
+  to close stays closed either way: the ledger-tuple binding in (a)-(c) discards a foreign copy
+  - wrong repository, wrong content reduction, or wrong author - before it can force a fatal
+    multi-match, and it does so without ever using an absent candidate as license to create.
 - **Exactly one candidate survives (a)-(c):** it supplies the remote identity and the operation
   advances to `published_pending_ingest`. This is the ordinary case.
 - **More than one candidate survives (a)-(c):** this can only mean the genuine object was
@@ -805,12 +854,15 @@ the marker scan produced (zero, one, or more than one):
   referencing its own `id` and `createdAt` - never a fatal integrity error, and never a reason
   to leave the operation unconfirmed.
 
-Recovery therefore always terminates in either a confirmed binding (`published_pending_ingest`
-or later) or a safe same-identity republish; the marker scan by itself never blocks either
-outcome, and no path leaves a genuinely-published operation permanently unrecoverable solely
-because its marker became visible and was copied. Only the bounded-traversal-failure case
-above requires operator judgment, and only because the scan itself did not complete - never
-because of what the scan found.
+Recovery therefore always terminates in one of two outcomes: a confirmed binding
+(`published_pending_ingest` or later), or the operation remaining `unconfirmed_publish` pending
+operator or durable-provider-side resolution - never a second create issued from
+`unconfirmed_publish`, and never a fatal integrity error solely because a marker became visible
+and was copied. The bounded-traversal-failure case and the zero-candidate case both fall into
+that second outcome, for different reasons: the former because the scan itself did not
+complete, the latter because the scan completed but could not prove the operation's remote
+object exists. Neither case is evidence that the object was never published, so neither
+authorizes a create.
 
 The crash and failure windows are therefore explicit:
 
@@ -1232,7 +1284,23 @@ and no handler or remote work occurs.
    retry runs - assert the first operation's recovery binds the earliest `createdAt` candidate,
    records the later one as a benign idempotent-replay audit note carrying its own `id` and
    `createdAt`, issues no second create, and reaches a terminal confirmed state rather than an
-   integrity error.
+   integrity error. A sixth set of cases proves marker-stripping equality for every
+   body-bearing verb: publish a genuine issue, pull request, and comment, each with a
+   non-empty body, force the operation back into `unconfirmed_publish`, and run recovery -
+   assert the marker-stripped candidate body equals the ledger's normalized body and the
+   operation binds without a false mismatch caused by the trailing marker bytes. A companion
+   case for each of those verbs submits caller content that itself contains marker-shaped HTML
+   comment text with a UUID and nonce that do not match this operation's persisted values,
+   embedded inside the body rather than at its trailing edge, and asserts that text is
+   preserved unchanged in both the published object and the ledger's normalized request, is
+   never stripped, and does not cause a false content-reduction mismatch. A seventh set of
+   cases proves immutable-identity binding: publish a genuine object, then change the ambient
+   `gh` identity's login (simulating a credential rotation or GitHub login rename) before
+   running recovery, and assert the operation still binds via the `author_node_id` persisted
+   in the ledger at claim time rather than the current ambient login. A companion clock-skew
+   case sets the candidate's server-assigned `createdAt` earlier than the ledger's
+   `created_at` and asserts recovery still binds the candidate, proving that the removed
+   lower-bound filter is not required for correct binding.
 6. **Idempotency scope and request conflict.** Reusing a key with identical normalized
    arguments returns or resumes the original operation within the same namespace and verb;
    reusing it with different arguments in that same scope fails before transport. Reuse the
