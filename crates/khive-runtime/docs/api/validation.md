@@ -1,25 +1,45 @@
 # KG Validation Pipeline
 
-`validation.rs` defines the pack-contributed KG validation pipeline: how a pack declares a
-`ValidationRule`, how severity levels map to `kkernel kg validate` exit behavior, and where rule
-configuration is read from at runtime.
+`validation.rs` defines the pack-contributed KG validation API: the `ValidationRule` /
+`ValidationContext` / `Violation` types a pack declares through `PackRuntime::validation_rules()`.
+Two distinct validation surfaces exist under ADR-034, in different states of wiring — this
+document keeps them separate, because only one of them runs today.
 
 ## ADR Links
 
 - [ADR-034](../../../../docs/adr/ADR-034-kg-validation-pipelines.md) — KG validation pipelines specification
 
-## Rule Configuration File
+## 1. Shipped: the data-driven TOML RulePass
 
-Rules are configured at `.khive/kg/rules.toml` (TOML format, per ADR-034).
-The `ValidationContext::config` map is populated from that file at runtime.
+What `kkernel kg validate` actually executes today is the ADR-020 built-in structural checks
+plus an optional TOML RulePass: when `.khive/kg/rules.toml` exists and `--no-rules` is not set,
+each `[[rules]]` entry (`kind = "entity"` or `"edge"`, optional `condition`, optional
+`require_field`, `message` with `{id}` substitution) runs after the structural pass. Severity
+for these data-driven rules is configured per rule in `rules.toml`:
 
-## Rule Declaration
+- `Error` — `kkernel kg validate` exits with code 1.
+- `Warning` — reported; no exit-code effect unless `--strict`.
+- `Info` — informational; no exit-code effect.
+
+This TOML pass does not go through the Rust `ValidationRule` API below — it is a separate,
+data-driven runner.
+
+## 2. Declared but deferred: the Rust pack-validator API
+
+The types in `validation.rs` are shipped API surface, but **the CLI runner does not call them**
+(ADR-034 "What changes and what does not"): `kkernel kg validate` never invokes
+`PackRuntime::validation_rules()` against live corpus data, `VerbRegistry::all_validation_rules`
+currently has no non-test caller, no runtime-populated `ValidationContext` is constructed, and a
+declared rule cannot yet affect validation output, CLI exit status, or auto-fix behavior. Wiring
+this API into the CLI runner is explicitly deferred by ADR-034.
+
+### Rule Declaration
 
 Pack authors declare an array of `ValidationRule` in their `PackRuntime::validation_rules()`
-method. Rule IDs must follow `<pack>/<rule-id>` namespace convention. Built-in rules
+method. Rule IDs must follow the `<pack>/<rule-id>` namespace convention. Built-in rules
 use no pack prefix (e.g. `"min-edge-density"`).
 
-## Rule Shape
+### Rule Shape
 
 ```rust
 pub struct ValidationRule {
@@ -31,26 +51,22 @@ pub struct ValidationRule {
 }
 ```
 
-## Severity Levels
+The `Severity` values carry the same intended exit-code semantics as §1, but for
+pack-declared rules those semantics are design intent, not current behavior — nothing
+executes these rules yet.
 
-- `Error` — `kkernel kg validate` exits with code 1.
-- `Warning` — reported; no exit-code effect unless `--strict`.
-- `Info` — informational; no exit-code effect.
-
-Severity can be overridden per rule in `.khive/kg/rules.toml`.
-
-## GraphPatch
+### GraphPatch
 
 `GraphPatch` is a deferred stub (ADR-034 §auto-fix write path is deferred). The auto-fix
-write path is not yet implemented; `fix: Some(...)` is reserved for future use.
+write path is not implemented; `fix: Some(...)` is reserved for future use.
 
-## Invariants
+### Invariants (design contract for the deferred runner)
 
 - Rule IDs must be unique across all loaded packs.
 - Pack-contributed rules must carry the pack namespace prefix.
 - `CorpusCheck` receives a `GraphSnapshot`; it must not reach through to the storage layer.
 
-## Failure Modes
+### Failure Modes (apply once the runner is wired)
 
 | Condition           | Behaviour                                                 |
 | ------------------- | --------------------------------------------------------- |

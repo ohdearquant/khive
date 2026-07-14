@@ -16,9 +16,11 @@ pub type RuleId = &'static str;
 
 /// Severity of a validation finding.
 ///
-/// - `Error`: causes `kkernel kg validate` to exit with code 1.
-/// - `Warning`: reported but does not affect exit code (unless `--strict`).
-/// - `Info`: informational; no exit-code effect.
+/// Intended exit-code semantics (`Error` = exit 1, `Warning` = report-only
+/// unless `--strict`, `Info` = informational) apply to the shipped TOML
+/// RulePass; pack-declared rules are not yet executed by `kkernel kg
+/// validate` (ADR-034 defers CLI runner wiring). See
+/// `crates/khive-runtime/docs/api/validation.md` for the shipped-vs-deferred split.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Severity {
     Info,
@@ -65,7 +67,7 @@ pub struct Violation {
     pub severity: Severity,
     /// Human-readable explanation of the violation.
     pub message: String,
-    /// Whether the violation can be fixed by `kkernel kg validate --fix`.
+    /// Whether the violation is auto-fixable (the `--fix` write path is deferred; ADR-034).
     pub fixable: bool,
     /// Optional entity UUID (short-form) that the violation targets.
     pub entity_id: Option<String>,
@@ -130,7 +132,7 @@ pub struct ValidationRule {
     pub id: RuleId,
     /// Default severity; can be overridden in `.khive/kg/rules.toml`.
     pub severity: Severity,
-    /// Human-readable description shown in `kkernel kg validate` output.
+    /// Human-readable description (surfaced once the CLI runner wiring lands; ADR-034).
     pub description: &'static str,
     /// Whole-corpus check function.
     pub check: RuleFn,

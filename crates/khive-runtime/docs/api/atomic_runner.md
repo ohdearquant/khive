@@ -12,9 +12,12 @@ This module is the synchronous commit-pass piece of the shipped ADR-099 B3 flow.
 caller is `kkernel exec --ops-file --atomic` (see `kkernel`'s `atomic_apply` module): it runs the
 parse-time admissibility check (B1), drives the async prepare pass (ops → `AtomicOpPlan`), calls
 `run_atomic_unit` here for the one synchronous commit pass (B2), then applies the async
-post-commit effects (reindex). Only the v1 admissible verb set (`update`, `delete`, `link`,
-`merge`, `gtd.transition`, `gtd.complete`) may appear in an atomic ops-file; embedding-bearing,
-read, or unlisted verbs are rejected before any write.
+post-commit effects (reindex). Only the currently executable verb set (`update`, `delete`,
+`link`, `gtd.transition`, `gtd.complete`) may appear in an atomic ops-file. `merge` and the
+governance verbs (`propose`, `review`, `withdraw`) remain conceptually admissible under
+ADR-099 D3 but are rejected up front as known-unimplemented (`ATOMIC_KNOWN_UNIMPLEMENTED_VERBS`
+in `khive-types`) — no full-parity prepare/apply seam exists for them yet. Embedding-bearing,
+read, or unlisted verbs are likewise rejected before any write.
 
 ## Suspend-free invariant
 
