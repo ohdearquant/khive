@@ -1,7 +1,7 @@
 //! `KindHook` implementations for the three note kinds this pack contributes.
 //! Validation only — provenance edges are supplied by the caller and linked
 //! by the runtime's `create_note` path itself. See
-//! crates/khive-pack-git/docs/hooks.md for why no `after_create` edge work
+//! crates/khive-pack-git/docs/api/hooks.md for why no `after_create` edge work
 //! is needed here.
 
 use async_trait::async_trait;
@@ -92,7 +92,7 @@ impl KindHook for CommitHook {
 }
 
 /// The governed `state_reason` value set for `issue` (ADR-088 §3). See
-/// crates/khive-pack-git/docs/hooks.md#issuelikehook for why this is
+/// crates/khive-pack-git/docs/api/hooks.md#issuelikehook for why this is
 /// `pub(crate)`.
 pub(crate) const ISSUE_STATE_REASONS: &[&str] =
     &["completed", "not_planned", "reopened", "duplicate"];
@@ -101,7 +101,7 @@ pub(crate) const ISSUE_STATE_REASONS: &[&str] =
 /// `properties.number` (integer) and `properties.project_id` (UUID), and,
 /// when present, validate `properties.state_reason` (governed to a fixed
 /// set for `issue` per ADR-088 §3; only checked for non-emptiness for
-/// `pull_request`). See crates/khive-pack-git/docs/hooks.md#issuelikehook
+/// `pull_request`). See crates/khive-pack-git/docs/api/hooks.md#issuelikehook
 /// for why `project_id` is required here rather than left to caller
 /// discipline.
 #[derive(Debug)]

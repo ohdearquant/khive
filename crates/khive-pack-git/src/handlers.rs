@@ -23,7 +23,7 @@ use crate::source::{parse_source, repo_basename, DigestSource};
 use crate::GitPack;
 
 /// Issue #765 bounded repair policy: at most one refetch, then at most one
-/// reclone. See crates/khive-pack-git/docs/handlers.md#remoterecoverystage.
+/// reclone. See crates/khive-pack-git/docs/api/handlers.md#remoterecoverystage.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RemoteRecoveryStage {
     Initial,
@@ -45,7 +45,7 @@ impl RemoteCommitRecovery {
     }
 
     /// Advance the repair state machine by one step for a classified
-    /// `GitLogError`. See crates/khive-pack-git/docs/handlers.md#repair.
+    /// `GitLogError`. See crates/khive-pack-git/docs/api/handlers.md#repair.
     pub(crate) fn repair(
         &mut self,
         _repo: &Path,

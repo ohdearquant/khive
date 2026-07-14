@@ -1,7 +1,7 @@
 //! Batch, cursor-based git-history ingester (ADR-088 §5). One-shot: walks
 //! local git history plus (optionally) `gh`-fetched issues and pull
 //! requests, and writes `commit` / `issue` / `pull_request` notes through
-//! the standard `create` verb. See crates/khive-pack-git/docs/ingest.md for
+//! the standard `create` verb. See crates/khive-pack-git/docs/api/ingest.md for
 //! the full module overview.
 
 use std::collections::HashMap;
@@ -69,7 +69,7 @@ impl IngestOptions {
 }
 
 /// Bounds new-record creation attempts across a `run_ingest` pass. See
-/// crates/khive-pack-git/docs/ingest.md#budget.
+/// crates/khive-pack-git/docs/api/ingest.md#budget.
 struct Budget {
     remaining: Option<u64>,
 }
@@ -93,7 +93,7 @@ impl Budget {
 
 /// A newly created note this pass, for `link_references`'s
 /// same-pass cross-reference resolution. See
-/// crates/khive-pack-git/docs/ingest.md#newrecordforref.
+/// crates/khive-pack-git/docs/api/ingest.md#newrecordforref.
 struct NewRecordForRef {
     id: Uuid,
     text: String,
@@ -148,7 +148,7 @@ pub struct IngestReport {
 /// `IngestReport.done` is `false`). Returns an error only for a failure that
 /// aborts the whole pass (e.g. an unresolvable `opts.project`); per-record
 /// failures are collected in `IngestReport.warnings` instead. See
-/// crates/khive-pack-git/docs/ingest.md#run_ingest_with_commit_recovery for
+/// crates/khive-pack-git/docs/api/ingest.md#run_ingest_with_commit_recovery for
 /// why this has no self-healing recovery (unlike the verb-handler path).
 pub async fn run_ingest(
     runtime: &KhiveRuntime,
@@ -162,7 +162,7 @@ pub async fn run_ingest(
 /// Same one-shot ingest pass as `run_ingest`, but a classified
 /// missing-promisor-object failure is retried through `recover` (issue
 /// #765) instead of aborting the whole pass. See
-/// crates/khive-pack-git/docs/ingest.md#run_ingest_with_commit_recovery.
+/// crates/khive-pack-git/docs/api/ingest.md#run_ingest_with_commit_recovery.
 pub(crate) async fn run_ingest_with_commit_recovery(
     runtime: &KhiveRuntime,
     token: &NamespaceToken,
@@ -324,7 +324,7 @@ async fn find_issue_or_pr_by_number(
 /// Post-ingestion sweep: extract GitHub reference-grammar mentions from
 /// every note created this pass and materialize `annotates` edges to the
 /// referenced issue/PR note. Fail-open. See
-/// crates/khive-pack-git/docs/ingest.md#link_references.
+/// crates/khive-pack-git/docs/api/ingest.md#link_references.
 async fn link_references(
     runtime: &KhiveRuntime,
     token: &NamespaceToken,
@@ -420,7 +420,7 @@ async fn find_commit_by_sha(
 
 /// Look up an existing `issue`/`pull_request` note by its `properties.number`,
 /// scoped by kind + namespace + `project_id` (GitHub numbers are
-/// repository-scoped — see crates/khive-pack-git/docs/ingest.md).
+/// repository-scoped — see crates/khive-pack-git/docs/api/ingest.md).
 async fn find_by_number(
     runtime: &KhiveRuntime,
     token: &NamespaceToken,
@@ -473,7 +473,7 @@ fn escape_like(input: &str) -> String {
 /// Find an existing `document` entity whose `properties.source_uri` or
 /// `name` matches `path` (ADR-086 keying convention); `None` when no match
 /// (v0 never creates documents on the ingester's behalf). See
-/// crates/khive-pack-git/docs/ingest.md#find_document_for_path for the
+/// crates/khive-pack-git/docs/api/ingest.md#find_document_for_path for the
 /// single-query exact-vs-suffix-match ordering rationale.
 async fn find_document_for_path(
     runtime: &KhiveRuntime,
@@ -539,7 +539,7 @@ async fn read_cursor(
 }
 
 /// Advance the `(project_id, kind)` cursor. See
-/// crates/khive-pack-git/docs/ingest.md#write_cursor for the
+/// crates/khive-pack-git/docs/api/ingest.md#write_cursor for the
 /// stall-then-retry cursor semantics.
 async fn write_cursor(
     runtime: &KhiveRuntime,
@@ -586,7 +586,7 @@ struct RawCommit {
 }
 
 /// Which `git log` pass a classified failure came from (issue #765). See
-/// crates/khive-pack-git/docs/ingest.md#issue-765-commit-snapshot-recovery.
+/// crates/khive-pack-git/docs/api/ingest.md#issue-765-commit-snapshot-recovery.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum GitLogPhase {
     Metadata,
@@ -617,7 +617,7 @@ impl GitLogError {
     /// `true` for exactly the class of failure issue #765 authorizes
     /// self-healing for: a missing-object diagnostic that names a promisor
     /// remote. Deliberately narrow — see
-    /// crates/khive-pack-git/docs/ingest.md#issue-765-commit-snapshot-recovery.
+    /// crates/khive-pack-git/docs/api/ingest.md#issue-765-commit-snapshot-recovery.
     pub(crate) fn is_missing_promisor_object(&self) -> bool {
         let lower = self.stderr.to_ascii_lowercase();
         lower.contains("promisor")
@@ -626,7 +626,7 @@ impl GitLogError {
 }
 
 /// Walk local git history via `git log` with a stable, machine-parseable
-/// format. See crates/khive-pack-git/docs/ingest.md#issue-765-commit-snapshot-recovery.
+/// format. See crates/khive-pack-git/docs/api/ingest.md#issue-765-commit-snapshot-recovery.
 fn walk_commits(repo: &Path, since_sha: Option<&str>) -> Result<Vec<RawCommit>> {
     // Raw control-byte separators embedded directly in the format string
     // (not git's `%xHH` escape syntax) — passed as a single argv element
@@ -742,7 +742,7 @@ fn load_commit_snapshot(repo: &Path, since_sha: Option<&str>) -> Result<CommitSn
 }
 
 /// Which repair `RemoteCommitRecovery` (`handlers.rs`) performed. See
-/// crates/khive-pack-git/docs/ingest.md#issue-765-commit-snapshot-recovery.
+/// crates/khive-pack-git/docs/api/ingest.md#issue-765-commit-snapshot-recovery.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CacheRepairStrategy {
     Refetch,
@@ -769,7 +769,7 @@ fn cache_repair_warning(strategy: CacheRepairStrategy) -> String {
 
 /// Load a commit-history snapshot, retrying through `recover` when the
 /// failure is a classified missing-promisor-object error (issue #765). See
-/// crates/khive-pack-git/docs/ingest.md#issue-765-commit-snapshot-recovery
+/// crates/khive-pack-git/docs/api/ingest.md#issue-765-commit-snapshot-recovery
 /// for the retry-bound semantics.
 fn recover_commit_snapshot(
     repo: &Path,
@@ -837,7 +837,7 @@ fn truncated_embedding_head(content: &str) -> Option<&str> {
 /// Every `RawCommit` string field funnels through this constructor before it
 /// can reach `properties` or the note `name`, masking secrets in
 /// caller-controlled prose fields. See
-/// crates/khive-pack-git/docs/ingest.md#masking-boundaries-maskedcommitfields-maskedissuefields-maskedprfields.
+/// crates/khive-pack-git/docs/api/ingest.md#masking-boundaries-maskedcommitfields-maskedissuefields-maskedprfields.
 struct MaskedCommitFields {
     sha: String,
     short_sha: String,
@@ -1127,7 +1127,7 @@ struct GhPr {
 
 /// Every `GhIssue` field funnels through this constructor before it can
 /// reach `properties`/`content`/the note name/the paging cursor. See
-/// crates/khive-pack-git/docs/ingest.md#masking-boundaries-maskedcommitfields-maskedissuefields-maskedprfields.
+/// crates/khive-pack-git/docs/api/ingest.md#masking-boundaries-maskedcommitfields-maskedissuefields-maskedprfields.
 struct MaskedIssueFields {
     number: u64,
     title: String,
@@ -1142,7 +1142,7 @@ struct MaskedIssueFields {
 
 /// Classified outcome of parsing a raw `stateReason` against the governed
 /// enum. `Rejected` never carries the raw string forward. See
-/// crates/khive-pack-git/docs/ingest.md#masking-boundaries-maskedcommitfields-maskedissuefields-maskedprfields.
+/// crates/khive-pack-git/docs/api/ingest.md#masking-boundaries-maskedcommitfields-maskedissuefields-maskedprfields.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum StateReasonField {
     Absent,
@@ -1186,7 +1186,7 @@ impl MaskedIssueFields {
 
 /// Classifies a raw `stateReason` string against the governed enum
 /// (`hook::ISSUE_STATE_REASONS`, ADR-088 §3), case-normalized first. See
-/// crates/khive-pack-git/docs/ingest.md#masking-boundaries-maskedcommitfields-maskedissuefields-maskedprfields.
+/// crates/khive-pack-git/docs/api/ingest.md#masking-boundaries-maskedcommitfields-maskedissuefields-maskedprfields.
 fn canonical_issue_state_reason(raw: Option<String>) -> StateReasonField {
     let Some(raw) = raw.filter(|r| !r.is_empty()) else {
         return StateReasonField::Absent;
@@ -1202,7 +1202,7 @@ fn canonical_issue_state_reason(raw: Option<String>) -> StateReasonField {
 /// Parses a GitHub issue timestamp into canonical RFC3339 form; on parse
 /// failure the field is dropped (with a warning, never the raw value) and
 /// the issue is still ingested. See
-/// crates/khive-pack-git/docs/ingest.md#masking-boundaries-maskedcommitfields-maskedissuefields-maskedprfields.
+/// crates/khive-pack-git/docs/api/ingest.md#masking-boundaries-maskedcommitfields-maskedissuefields-maskedprfields.
 fn canonical_issue_timestamp(
     field: &'static str,
     number: u64,
@@ -1244,12 +1244,12 @@ fn gh_json(repo: &Path, args: &[&str]) -> Result<String> {
 /// Per-page fetch cap for both PR and issue paging — `gh {pr,issue} list
 /// --search` never returns more than this many results for a single query
 /// regardless of `--limit`. See
-/// crates/khive-pack-git/docs/ingest.md#paging-pageoutcome-decide_page_outcome-page_limit.
+/// crates/khive-pack-git/docs/api/ingest.md#paging-pageoutcome-decide_page_outcome-page_limit.
 const PAGE_LIMIT: usize = 1000;
 
 /// What a paging loop should do after processing one fetched page — the
 /// entire "was the remote window proven exhausted" decision lives here. See
-/// crates/khive-pack-git/docs/ingest.md#paging-pageoutcome-decide_page_outcome-page_limit.
+/// crates/khive-pack-git/docs/api/ingest.md#paging-pageoutcome-decide_page_outcome-page_limit.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum PageOutcome {
     /// Page held fewer than `PAGE_LIMIT` items: remote window proven exhausted.
@@ -1340,7 +1340,7 @@ fn fetch_issue_page(repo: &Path, floor: Option<&str>) -> Result<Vec<GhIssue>> {
 /// Every `GhPr` field funnels through this constructor before it can reach
 /// `properties`/`content`/the note `name`/the in-memory PR-linking maps,
 /// masking secrets in contributor-controlled prose fields. See
-/// crates/khive-pack-git/docs/ingest.md#masking-boundaries-maskedcommitfields-maskedissuefields-maskedprfields.
+/// crates/khive-pack-git/docs/api/ingest.md#masking-boundaries-maskedcommitfields-maskedissuefields-maskedprfields.
 struct MaskedPrFields {
     number: u64,
     title: String,
@@ -1810,7 +1810,7 @@ mod paging_tests {
 
 /// Issue #765: `GitLogError` classification + `recover_commit_snapshot`
 /// retry loop (pure/synchronous). See
-/// crates/khive-pack-git/docs/ingest.md#test-module-notes.
+/// crates/khive-pack-git/docs/api/ingest.md#test-module-notes.
 #[cfg(test)]
 mod recovery_classifier_tests {
     use super::*;
@@ -1873,7 +1873,7 @@ mod recovery_classifier_tests {
     }
 
     /// Healthy repo: loads on first try, no recover call, no warning. Holds
-    /// `cache::ENV_MUTEX` — see crates/khive-pack-git/docs/ingest.md#test-module-notes.
+    /// `cache::ENV_MUTEX` — see crates/khive-pack-git/docs/api/ingest.md#test-module-notes.
     #[test]
     fn recover_commit_snapshot_returns_no_warning_when_healthy() {
         let _env = crate::cache::ENV_MUTEX.blocking_lock();
@@ -1982,7 +1982,7 @@ mod truncation_tests {
 }
 
 /// PR #816: `resolve_id`/`resolve_project_id` LIKE-wildcard-injection
-/// regression tests. See crates/khive-pack-git/docs/ingest.md#test-module-notes.
+/// regression tests. See crates/khive-pack-git/docs/api/ingest.md#test-module-notes.
 #[cfg(test)]
 mod compact_prefix_resolver_tests {
     use super::*;
@@ -2038,7 +2038,7 @@ mod compact_prefix_resolver_tests {
 }
 
 /// PR #816: `find_document_for_path` LIKE-escaping + exact-match-ordering
-/// regression tests. See crates/khive-pack-git/docs/ingest.md#test-module-notes.
+/// regression tests. See crates/khive-pack-git/docs/api/ingest.md#test-module-notes.
 #[cfg(test)]
 mod find_document_for_path_tests {
     use super::*;
