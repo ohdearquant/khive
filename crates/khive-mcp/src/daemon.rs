@@ -1914,7 +1914,8 @@ mod tests {
 
     use khive_runtime::engine_config::ActorConfig;
     use khive_runtime::{
-        runtime_config_from_khive_config, KhiveConfig, KhiveRuntime, Namespace, RuntimeConfig,
+        runtime_config_from_khive_config, GitWriteEntryConfig, GitWriteSectionConfig, KhiveConfig,
+        KhiveRuntime, Namespace, RuntimeConfig,
     };
 
     fn memory_runtime_config() -> RuntimeConfig {
@@ -2866,6 +2867,85 @@ mod tests {
 
         handle.abort();
         let _ = handle.await;
+        clear_daemon_env();
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn daemon_rejects_client_after_git_write_policy_is_revoked() {
+        clear_daemon_env();
+        reset_fallback_counters();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sock = dir.path().join("khived.sock");
+        let pid = dir.path().join("khived.pid");
+        std::env::set_var("KHIVE_SOCKET", &sock);
+        std::env::set_var("KHIVE_PID", &pid);
+        std::env::remove_var("KHIVE_NO_DAEMON");
+
+        let mut allowed_config = memory_runtime_config();
+        allowed_config.default_namespace = Namespace::parse("test").unwrap();
+        allowed_config.packs = vec!["kg".to_string()];
+        allowed_config.git_write = GitWriteSectionConfig {
+            allowed: vec![GitWriteEntryConfig {
+                repo: "/srv/repos/alpha".to_string(),
+                branches: vec!["feat/*".to_string()],
+            }],
+        };
+        let revoked_config = RuntimeConfig {
+            git_write: GitWriteSectionConfig::default(),
+            ..allowed_config.clone()
+        };
+
+        let daemon_server = crate::server::KhiveMcpServer::new(
+            KhiveRuntime::new(allowed_config).expect("allowed-policy runtime"),
+        )
+        .expect("allowed-policy server");
+        let daemon_config_id = daemon_server.config_id().to_string();
+        let revoked_config_id = crate::server::compute_config_id(&revoked_config, None);
+        assert_ne!(
+            daemon_config_id, revoked_config_id,
+            "revoking the allowlist must change the daemon identity"
+        );
+
+        let handle = tokio::spawn(async move {
+            let _ = run_daemon(daemon_server).await;
+        });
+        let ready = connect_when_ready(&sock).await;
+        drop(ready);
+
+        let request = DaemonRequestFrame {
+            ops: "stats()".to_string(),
+            presentation: None,
+            presentation_per_op: None,
+            namespace: "test".to_string(),
+            actor_id: None,
+            visible_namespaces: Vec::new(),
+            config_id: revoked_config_id.clone(),
+            protocol_version: PROTOCOL_VERSION,
+            probe_only: false,
+            metrics_only: false,
+            format: None,
+            format_per_op: None,
+            from_wire: false,
+            request_id: None,
+        };
+        let response = exchange(&sock, &request).await;
+
+        assert!(response.config_mismatch, "revoked policy must be rejected");
+        assert!(!response.ok, "the old-policy daemon must not dispatch");
+        assert_eq!(
+            response.served_config_id.as_deref(),
+            Some(daemon_config_id.as_str())
+        );
+        assert!(
+            map_response(response, &revoked_config_id, "test").is_none(),
+            "non-strict clients must take the established config-mismatch fallback path"
+        );
+        assert_eq!(fallback_count(FallbackReason::ConfigMismatch), 1);
+
+        handle.abort();
+        let _ = handle.await;
+        reset_fallback_counters();
         clear_daemon_env();
     }
 
