@@ -258,7 +258,12 @@ pub fn builtin_pack_names() -> Vec<&'static str> {
 }
 
 /// Which MCP handshake mode [`KhiveMcpServer::serve_stdio`] should use for
-/// this process instance (#714).
+/// this process instance (#714). Unix-only: the resumed-generation self-heal
+/// re-exec this decides between requires `crate::daemon`'s Unix-only
+/// mismatch-recovery machinery (in turn only ever armed by a Unix-domain-socket
+/// daemon-forwarding protocol mismatch); non-Unix `serve_stdio` always takes
+/// the plain handshake path (see its `#[cfg(not(unix))]` variant below).
+#[cfg(unix)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StdioServeMode {
     /// Normal MCP `initialize` handshake — the overwhelmingly common case.
@@ -271,6 +276,7 @@ enum StdioServeMode {
 /// Pure decision behind [`StdioServeMode`], factored out so it is
 /// unit-testable without driving real stdio I/O. `resumed_generation` is
 /// [`crate::daemon::resumed_generation`]'s return value.
+#[cfg(unix)]
 fn stdio_serve_mode_for(resumed_generation: Option<u32>) -> StdioServeMode {
     match resumed_generation {
         Some(_) => StdioServeMode::Resumed,
@@ -547,6 +553,7 @@ impl KhiveMcpServer {
     /// edge that fires an armed self-heal re-exec (or drain-and-exit) only
     /// once a message has genuinely finished flushing to the client, never
     /// on a fixed timer that could race a slow or backpressured stdout.
+    #[cfg(unix)]
     pub async fn serve_stdio(self) -> anyhow::Result<()> {
         use rmcp::transport::{async_rw::AsyncRwTransport, stdio};
 
@@ -565,6 +572,23 @@ impl KhiveMcpServer {
                 service.waiting().await?;
             }
         }
+        Ok(())
+    }
+
+    /// Non-Unix stdio serving. The #714 self-heal re-exec mechanism
+    /// (`crate::daemon`'s `SelfHealOnFlushTransport`/resumed-generation
+    /// machinery) requires `exec()` (POSIX-only) and is only ever armed by a
+    /// Unix-domain-socket daemon-forwarding protocol mismatch — there is
+    /// nothing to self-heal from on this target (`--daemon` mode itself is
+    /// Unix-only, see `serve.rs::serve_server`), so this path always runs the
+    /// normal MCP `initialize` handshake directly over the raw stdio
+    /// transport, with no resumed-generation skip and no flush-triggered hook.
+    #[cfg(not(unix))]
+    pub async fn serve_stdio(self) -> anyhow::Result<()> {
+        use rmcp::transport::stdio;
+
+        let service = self.serve(stdio()).await?;
+        service.waiting().await?;
         Ok(())
     }
 
@@ -1515,6 +1539,7 @@ result (e.g. create then link with the new entity's id)."#)]
 /// [`McpError`] (#947), or `None` if `e` is not tagged with
 /// [`crate::daemon::STRICT_FALLBACK_MARKER`] — i.e. some other daemon-forward
 /// error that must stay an RPC-level error.
+#[cfg(unix)]
 fn strict_fallback_reason(e: &McpError) -> Option<String> {
     let data = e.data.as_ref()?;
     if data.get(crate::daemon::STRICT_FALLBACK_MARKER)?.as_bool() != Some(true) {
@@ -1534,6 +1559,7 @@ fn strict_fallback_reason(e: &McpError) -> Option<String> {
 /// each op's `error`, not an RPC-level `McpError`. Chain mode aborts after the
 /// first op, matching `run_parsed`'s `Chain` arm and the wire contract's
 /// documented abort-on-failure behavior for `|`-chained ops.
+#[cfg(unix)]
 fn strict_fallback_envelope_response(
     p: &RequestParams,
     reason: String,
@@ -1971,11 +1997,13 @@ mod tests {
 
     // ── serve_stdio handshake-mode decision (#714) ────────────────────────────
 
+    #[cfg(unix)]
     #[test]
     fn stdio_serve_mode_cold_start_uses_handshake() {
         assert_eq!(stdio_serve_mode_for(None), StdioServeMode::Handshake);
     }
 
+    #[cfg(unix)]
     #[test]
     fn stdio_serve_mode_resumed_generation_skips_handshake() {
         assert_eq!(stdio_serve_mode_for(Some(1)), StdioServeMode::Resumed);
@@ -2354,6 +2382,7 @@ mod tests {
     /// khive#948: `wire_daemon_frame` forwards `RequestParams::request_id`
     /// onto the `DaemonRequestFrame` unchanged, and defaults to `None` when
     /// the caller supplied none.
+    #[cfg(unix)]
     #[test]
     fn wire_daemon_frame_forwards_request_id() {
         let server = make_daemon_save_to_test_server();
@@ -2471,6 +2500,7 @@ mod tests {
         std::env::remove_var("KHIVE_SAVE_TO_ROOT");
     }
 
+    #[cfg(unix)]
     async fn connect_when_daemon_ready(sock: &std::path::Path) {
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
@@ -2492,6 +2522,7 @@ mod tests {
     /// `save_to` request must still take the local path and return the
     /// manifest with the file actually written — proving the daemon was
     /// bypassed rather than silently dropping the sink.
+    #[cfg(unix)]
     #[tokio::test]
     #[serial]
     async fn request_save_to_bypasses_daemon_forwarding_and_writes_manifest() {
@@ -2563,6 +2594,7 @@ mod tests {
     // mid-dispatch would) and proves both that the caller sees the
     // ambiguous-forward error verbatim AND that the mutating op never actually
     // ran locally.
+    #[cfg(unix)]
     #[tokio::test]
     #[serial]
     async fn request_returns_ambiguous_forward_error_without_local_double_dispatch() {
@@ -2673,6 +2705,7 @@ mod tests {
     // counts match `results`; and (4) none of the ops ever ran locally (a
     // `stats()` snapshot taken via the trusted `dispatch_request_local` path
     // is unchanged after all three calls).
+    #[cfg(unix)]
     #[tokio::test]
     #[serial]
     async fn request_strict_fallback_lands_as_failed_op_envelope_not_rpc_error() {
