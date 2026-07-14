@@ -858,6 +858,42 @@ pub struct RequestIdentity {
     pub request_id: Option<u64>,
 }
 
+/// A non-blank, out-of-band authenticated principal for [`VerbRegistry::dispatch_as`].
+///
+/// Embedding hosts authenticate a principal through their own channel (not the
+/// request DSL) and then need that principal to become the effective actor
+/// for one dispatch. The constructor rejects an empty or whitespace-only
+/// identifier so an authentication-integration failure (an empty subject)
+/// fails closed at construction time instead of silently resolving to the
+/// anonymous/local actor at dispatch time — see [`crate::actor_identity::resolve_actor`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedActor(String);
+
+impl VerifiedActor {
+    /// Validate and wrap a verified principal identifier.
+    ///
+    /// Returns `RuntimeError::InvalidInput` when `id` is empty or contains
+    /// only whitespace.
+    pub fn new(id: impl Into<String>) -> Result<Self, RuntimeError> {
+        let id = id.into();
+        if id.trim().is_empty() {
+            return Err(RuntimeError::InvalidInput(
+                "VerifiedActor: identifier must not be empty or whitespace-only".to_string(),
+            ));
+        }
+        Ok(Self(id))
+    }
+
+    /// Borrow the validated identifier.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    fn into_inner(self) -> String {
+        self.0
+    }
+}
+
 /// Error returned by [`VerbRegistry::apply_schema_plans_with_map`] when two
 /// packs on the same backend declare the same auxiliary table (ADR-028 §7).
 #[derive(Debug)]
@@ -1514,6 +1550,56 @@ impl VerbRegistry {
             "unknown verb {verb:?}; available: {}",
             self.available_verbs.join(", ")
         )))
+    }
+
+    /// Dispatch a verb under an out-of-band verified actor identity.
+    ///
+    /// For embedding hosts (gateways, servers, or other processes that embed
+    /// this runtime as a library) that authenticate a principal through their
+    /// own channel — not through the request DSL — and then need that
+    /// principal to be the effective actor for one dispatch. `verified_actor`
+    /// is a typed Rust-side argument: it can only be supplied by code holding
+    /// a `VerbRegistry` handle. `dispatch_as` never reads `params["actor"]`
+    /// to derive the effective actor; individual verbs may still accept an
+    /// `actor` field for their own documented business semantics, unrelated
+    /// to the acting principal.
+    ///
+    /// `verified_actor` is a [`VerifiedActor`], whose constructor rejects
+    /// blank identifiers. This keeps an authentication-integration failure
+    /// (an empty subject from the host's own auth channel) from silently
+    /// downgrading to the anonymous/local actor — the failure surfaces at
+    /// `VerifiedActor::new` instead of being laundered into a valid dispatch.
+    ///
+    /// Every pack handler that reads "who is calling" (for example, a
+    /// proposal review's `reviewer` field) resolves it from the
+    /// `NamespaceToken` the dispatch boundary mints, so `verified_actor`
+    /// becomes exactly the principal those handlers observe.
+    ///
+    /// Equivalent to `dispatch_with_identity(verb, params, Some(identity))`
+    /// with `identity.actor_id = Some(verified_actor)` and every other
+    /// identity scalar (namespace, visible namespaces) left at this
+    /// registry's construction-baked value — only the acting principal
+    /// changes for this one call. [`Self::dispatch`] and
+    /// [`Self::dispatch_with_identity`] are unaffected: this is a purely
+    /// additive entry point.
+    pub async fn dispatch_as(
+        &self,
+        verb: &str,
+        params: Value,
+        verified_actor: VerifiedActor,
+    ) -> Result<Value, RuntimeError> {
+        let identity = RequestIdentity {
+            namespace: self.default_namespace.clone(),
+            actor_id: Some(verified_actor.into_inner()),
+            visible_namespaces: self
+                .visible_namespaces
+                .iter()
+                .map(|ns| ns.as_str().to_string())
+                .collect(),
+            request_id: None,
+        };
+        self.dispatch_with_identity(verb, params, Some(identity))
+            .await
     }
 
     /// Registered pack-level by-ID resolvers, in registration order.
@@ -3361,6 +3447,138 @@ mod tests {
         assert_eq!(gate_actor.kind, token_actor.kind);
         assert_eq!(gate_actor.id, token_actor.id);
         assert_eq!(gate_actor.id, "local");
+    }
+
+    // ---- dispatch_as: verified-actor dispatch for embedding hosts ----
+
+    /// `dispatch_as` must thread the caller-supplied verified actor through
+    /// to the pack handler's `NamespaceToken`, exactly as `dispatch_with_identity`
+    /// does with a `RequestIdentity.actor_id` — this is the observable
+    /// contract embedding hosts rely on.
+    #[tokio::test]
+    async fn dispatch_as_threads_verified_actor_into_token() {
+        let gate = Arc::new(ActorCapturingGate::default());
+        let actors = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let pack = TokenCapturingPack {
+            actors: actors.clone(),
+        };
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(pack);
+        builder.with_gate(gate.clone());
+        let reg = builder.build().expect("registry builds");
+
+        reg.dispatch_as(
+            "list",
+            Value::Null,
+            VerifiedActor::new("gateway:principal-42").unwrap(),
+        )
+        .await
+        .unwrap();
+
+        let reqs = gate.requests.lock().unwrap();
+        assert_eq!(reqs[0].actor.kind, "actor");
+        assert_eq!(reqs[0].actor.id, "gateway:principal-42");
+        drop(reqs);
+
+        let captured = actors.lock().unwrap();
+        assert_eq!(captured[0].kind, "actor");
+        assert_eq!(
+            captured[0].id, "gateway:principal-42",
+            "the storage token actor must be the verified_actor supplied to dispatch_as, \
+             matching exactly what pack handlers read as the acting principal"
+        );
+    }
+
+    /// `dispatch_as` is purely additive: a registry with a baked `actor_id`
+    /// must still serve plain `dispatch()` calls under its own baked actor,
+    /// unaffected by any `dispatch_as` call made on the same (cheaply
+    /// cloneable) registry. No shared mutable state links the two calls.
+    #[tokio::test]
+    async fn dispatch_as_does_not_change_plain_dispatch_behavior() {
+        let gate = Arc::new(ActorCapturingGate::default());
+        let actors = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let pack = TokenCapturingPack {
+            actors: actors.clone(),
+        };
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(pack);
+        builder.with_gate(gate.clone());
+        builder.with_actor_id(Some("baked-actor".to_string()));
+        let reg = builder.build().expect("registry builds");
+
+        reg.dispatch_as(
+            "list",
+            Value::Null,
+            VerifiedActor::new("verified-actor").unwrap(),
+        )
+        .await
+        .unwrap();
+        reg.dispatch("list", Value::Null).await.unwrap();
+
+        let captured = actors.lock().unwrap();
+        assert_eq!(captured.len(), 2);
+        assert_eq!(captured[0].id, "verified-actor", "dispatch_as call");
+        assert_eq!(
+            captured[1].id, "baked-actor",
+            "a later plain dispatch() call must still use the registry's baked \
+             actor_id, unaffected by the prior dispatch_as call"
+        );
+    }
+
+    /// A request `params` payload cannot inject or override the actor:
+    /// `dispatch_as` resolves the acting principal solely from its Rust-side
+    /// `verified_actor` argument, never from `params`. An `actor` key placed
+    /// in `params` passes through untouched to the pack handler like any
+    /// other unrecognized field — the dispatch boundary itself never reads
+    /// `params["actor"]`.
+    #[tokio::test]
+    async fn dispatch_as_ignores_actor_key_in_params() {
+        let gate = Arc::new(ActorCapturingGate::default());
+        let actors = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let pack = TokenCapturingPack {
+            actors: actors.clone(),
+        };
+        let mut builder = VerbRegistryBuilder::new();
+        builder.register(pack);
+        builder.with_gate(gate.clone());
+        let reg = builder.build().expect("registry builds");
+
+        reg.dispatch_as(
+            "list",
+            serde_json::json!({"actor": "spoofed-actor"}),
+            VerifiedActor::new("verified-actor").unwrap(),
+        )
+        .await
+        .unwrap();
+
+        let captured = actors.lock().unwrap();
+        assert_eq!(
+            captured[0].id, "verified-actor",
+            "an 'actor' key inside params must never override the verified_actor \
+             argument threaded through dispatch_as"
+        );
+    }
+
+    /// `VerifiedActor::new` must reject an empty identifier rather than
+    /// letting it reach dispatch and silently resolve to the anonymous actor.
+    #[test]
+    fn verified_actor_rejects_empty_identifier() {
+        let err = VerifiedActor::new("").unwrap_err();
+        assert!(
+            matches!(err, RuntimeError::InvalidInput(_)),
+            "expected InvalidInput, got {err:?}"
+        );
+    }
+
+    /// `VerifiedActor::new` must reject a whitespace-only identifier for the
+    /// same reason: it must never launder into `ActorRef::anonymous()`.
+    #[test]
+    fn verified_actor_rejects_whitespace_only_identifier() {
+        let err = VerifiedActor::new("   ").unwrap_err();
+        assert!(
+            matches!(err, RuntimeError::InvalidInput(_)),
+            "expected InvalidInput, got {err:?}"
+        );
     }
 
     // ---- Rego gate: fail-closed end-to-end ----
