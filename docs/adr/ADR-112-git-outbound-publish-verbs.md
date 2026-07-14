@@ -80,21 +80,27 @@ string or another type. Validation applies to the decoded string, so a prohibite
 still prohibited when written as a JSON escape. The handler validates every required field
 before hashing, claiming an operation, or invoking `gh`.
 
-| Argument                                                                    | Wire type | Empty-string rule                   | Size and content contract                                                                                                                                                |
-| --------------------------------------------------------------------------- | --------- | ----------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| All verbs: `repo`                                                           | `string`  | Rejected                            | 3-140 ASCII bytes and exactly one `/`; must satisfy the canonical repository grammar below                                                                               |
-| All verbs: `idempotency_key`                                                | `string`  | Rejected                            | Exactly 36 ASCII bytes; canonical lowercase hyphenated UUID (`8-4-4-4-12` hexadecimal digits)                                                                            |
-| `git.publish_issue.title`, `git.publish_pr.title`                           | `string`  | Rejected                            | 1-256 Unicode scalar values; no Unicode control scalar (`General_Category=Cc`)                                                                                           |
-| `git.publish_issue.body`, `git.publish_comment.body`, `git.publish_pr.body` | `string`  | Accepted and distinct from omission | 0-65,536 Unicode scalar values; no Unicode control scalar except horizontal tab (`U+0009`), line feed (`U+000A`), and carriage return (`U+000D`); NUL is always rejected |
-| `git.publish_comment.target`                                                | `string`  | Rejected                            | 4-26 ASCII bytes and the closed comment-target grammar below                                                                                                             |
-| `git.publish_pr.head`, `git.publish_pr.base`                                | `string`  | Rejected                            | 1-255 ASCII bytes and the GitHub branch-name subset below                                                                                                                |
-| `git.publish_release.tag`                                                   | `string`  | Rejected                            | 1-255 ASCII bytes and the GitHub tag-name subset below                                                                                                                   |
-| `git.publish_release.notes`                                                 | `string`  | Accepted and distinct from omission | 0-65,536 Unicode scalar values; no Unicode control scalar except horizontal tab (`U+0009`), line feed (`U+000A`), and carriage return (`U+000D`); NUL is always rejected |
+| Argument                                                                    | Wire type | Empty-string rule                   | Size and content contract                                                                                                                                                            |
+| --------------------------------------------------------------------------- | --------- | ----------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| All verbs: `repo`                                                           | `string`  | Rejected                            | 3-140 ASCII bytes and exactly one `/`; must satisfy the canonical repository grammar below                                                                                           |
+| All verbs: `idempotency_key`                                                | `string`  | Rejected                            | Exactly 36 ASCII bytes; canonical lowercase hyphenated UUID (`8-4-4-4-12` hexadecimal digits)                                                                                        |
+| `git.publish_issue.title`, `git.publish_pr.title`                           | `string`  | Rejected                            | 1-256 Unicode scalar values; no Unicode control or format scalar (`General_Category=Cc` or `Cf`)                                                                                     |
+| `git.publish_issue.body`, `git.publish_comment.body`, `git.publish_pr.body` | `string`  | Accepted and distinct from omission | 0-65,536 Unicode scalar values; no Unicode format scalar (`Cf`) and no Unicode control scalar except horizontal tab (`U+0009`), line feed (`U+000A`), and carriage return (`U+000D`) |
+| `git.publish_comment.target`                                                | `string`  | Rejected                            | 4-26 ASCII bytes and the closed comment-target grammar below                                                                                                                         |
+| `git.publish_pr.head`, `git.publish_pr.base`                                | `string`  | Rejected                            | 1-255 ASCII bytes and the GitHub branch-name subset below                                                                                                                            |
+| `git.publish_release.tag`                                                   | `string`  | Rejected                            | 1-255 ASCII bytes and the GitHub tag-name subset below                                                                                                                               |
+| `git.publish_release.notes`                                                 | `string`  | Accepted and distinct from omission | 0-65,536 Unicode scalar values; no Unicode format scalar (`Cf`) and no Unicode control scalar except horizontal tab (`U+0009`), line feed (`U+000A`), and carriage return (`U+000D`) |
 
 Required strings are otherwise preserved byte-for-byte. The handler does not trim them,
 apply Unicode normalization, change line endings, or case-fold them. An accepted empty
 `body` or `notes` value therefore remains an empty string in the canonical request; the
 generated reconciliation marker is transport metadata and is not part of that value.
+The `Cc`/`Cf` rejection is performed on decoded Unicode scalars before preservation or
+scanning. Only the multiline `body` and `notes` fields permit any `Cc` scalar, and their
+closed exception set is HT, LF, and CR. Single-line titles, the optional release title,
+and issue labels permit neither `Cc` nor `Cf`. The ASCII grammars for `repo`,
+`idempotency_key`, `target`, `head`, `base`, `tag`, and assignees reject both categories
+by construction.
 
 The `idempotency_key` syntax accepts every canonical 128-bit UUID spelling except the nil
 UUID (`00000000-0000-0000-0000-000000000000`); it imposes no version or variant-bit
@@ -164,12 +170,12 @@ grammar before transport.
 
 The optional arguments have one wire shape and one normalized representation:
 
-| Argument                      | Wire type       | Default and normalization                                                                                                                                                   | Validation limit                                                                                                                              |
-| ----------------------------- | --------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
-| `git.publish_issue.labels`    | `array<string>` | Omitted and `[]` both normalize to `[]`. Otherwise, reject exact duplicates and sort strings by unsigned UTF-8 byte order before hashing and transport.                     | At most 100 entries; each entry is 1-50 Unicode scalar values and contains no NUL, carriage return, or line feed.                             |
-| `git.publish_issue.assignees` | `array<string>` | Omitted and `[]` both normalize to `[]`. Normalize each login to ASCII lowercase, reject duplicates after lowercasing, and sort by unsigned UTF-8 byte order.               | At most 10 entries; each entry is 1-39 ASCII alphanumeric-or-hyphen characters, starts and ends alphanumeric, and has no consecutive hyphens. |
-| `git.publish_pr.draft`        | `boolean`       | Omitted and `false` both normalize to `false`; `true` remains `true`.                                                                                                       | Boolean only.                                                                                                                                 |
-| `git.publish_release.title`   | `string`        | Omitted, `""`, and a value exactly equal to the normalized `tag` all normalize to the normalized `tag`. The handler always passes the resulting non-empty title explicitly. | The resulting title is 1-256 Unicode scalar values and contains no NUL, carriage return, or line feed.                                        |
+| Argument                      | Wire type       | Default and normalization                                                                                                                                                   | Validation limit                                                                                                                                |
+| ----------------------------- | --------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------- |
+| `git.publish_issue.labels`    | `array<string>` | Omitted and `[]` both normalize to `[]`. Otherwise, reject exact duplicates and sort strings by unsigned UTF-8 byte order before hashing and transport.                     | At most 100 entries; each entry is 1-50 Unicode scalar values and contains no Unicode control or format scalar (`General_Category=Cc` or `Cf`). |
+| `git.publish_issue.assignees` | `array<string>` | Omitted and `[]` both normalize to `[]`. Normalize each login to ASCII lowercase, reject duplicates after lowercasing, and sort by unsigned UTF-8 byte order.               | At most 10 entries; each entry is 1-39 ASCII alphanumeric-or-hyphen characters, starts and ends alphanumeric, and has no consecutive hyphens.   |
+| `git.publish_pr.draft`        | `boolean`       | Omitted and `false` both normalize to `false`; `true` remains `true`.                                                                                                       | Boolean only.                                                                                                                                   |
+| `git.publish_release.title`   | `string`        | Omitted, `""`, and a value exactly equal to the normalized `tag` all normalize to the normalized `tag`. The handler always passes the resulting non-empty title explicitly. | The resulting title is 1-256 Unicode scalar values and contains no Unicode control or format scalar (`General_Category=Cc` or `Cf`).            |
 
 For these four optional arguments, JSON `null` is invalid rather than another spelling of
 omission. String content is otherwise preserved byte-for-byte: the handler does not trim
@@ -305,8 +311,11 @@ matching every other khive verb's error contract) with scan-specific fields:
 }
 ```
 
-- `hits` lists every field/pattern combination that matched (not just the first), so a
-  caller can fix everything in one pass instead of retrying repeatedly.
+- `hits` lists every field/pattern combination that matched across both the token and
+  secret scanners (not just the first), sorted by unsigned UTF-8 byte order on
+  `(field, pattern_id)`. A pair appears once even if the same rule matches multiple spans
+  or array elements within that field, so a caller can fix everything in one pass instead
+  of retrying repeatedly.
 - A hit contains only the outward field name and stable pattern id. It contains no matched
   span, excerpt, prefix, suffix, hash, length, or other value derived from the denied field.
   A deny response must not itself become a channel for the content it is denying.
@@ -333,9 +342,22 @@ the normalized outward-facing strings from Handler pipeline step 2, including `t
    pattern files (a generic in-repo class list plus a private overlay), never in prose
    documentation. An ADR that listed the actual internal tokens would itself be exactly the
    kind of publication-hygiene violation this system exists to prevent.
-2. **Secret scan.** Reuses the existing `secret_gate` module's compiled patterns (the same
-   ones ADR-088 §5 applies at ingest) against the same candidate fields, including `tag`,
-   `head`, and `base`. Unlike the ingest path,
+2. **Secret scan.** Reuses the existing `secret_gate` module's detector definitions and
+   matching semantics (the same ones ADR-088 §5 applies at ingest) against the same
+   candidate fields, including `tag`, `head`, and `base`. The module adds a publication
+   API with the semantic shape
+   `detector_ids(content: &str) -> sorted unique detector ids`. It evaluates every
+   canonical detector class against the original content and returns a detector id when
+   that class matches any span, including a span that overlaps a match from another
+   detector. It never returns a span, masked excerpt, offset, length, candidate fragment,
+   or `SecretMatch`; the existing first-match `check` and all-span `mask_secrets` APIs keep
+   their current contracts for existing callers. Publication-facing ids are the stable,
+   content-free spelling `secret:<secret_gate detector name>`, which cannot collide with
+   token-pattern ids because the latter's grammar excludes `:`. A detector name exposed
+   through this API is a stable wire identifier: it may not be renamed or reused for a
+   different detector semantic. The publish handler must call this all-matches API for
+   every candidate field; repeatedly calling the existing first-match `check` API does not
+   satisfy this contract. Unlike the ingest path,
    which masks a detected secret and keeps the record, outbound publish **denies** on a
    secret-scan hit and masks nothing silently. The directionality is deliberate: inbound
    content is sanitized and kept because the record has independent value once the secret
@@ -450,9 +472,38 @@ insufficient.
 
 A successful publish reconciles a graph record through the existing generic `create`,
 `update`, and `link` verbs - no new graph verb, no new edge relation, `annotates` only,
-matching ADR-088's own usage. The repo-anchor `project` entity is resolved exactly as
-`git.digest` resolves it (ADR-088 Amendment 1): match on `properties.repo_url`, or create
-the anchor if none is found and report that creation.
+matching ADR-088's own usage.
+
+For GitHub repositories, this ADR narrows ADR-088 Amendment 1's project-anchor fallback to
+one shared identity mapping. `GitHubRepoIdentity` is the validated lowercase
+`owner/name` slug, and its only stored URL is
+`https://github.com/<owner>/<name>`. An accepted remote `git.digest` source using
+`www.github.com`, an optional trailing slash or `.git` suffix, or ASCII case differences
+in the host or owner/name components is an input alias for that identity; it is never a
+distinct `properties.repo_url`. A URL with user information, a port, query, fragment,
+percent-encoded path separator, or any path component beyond the owner and repository is
+not a GitHub identity alias. After alias removal and ASCII lowercasing, the slug must
+satisfy this ADR's canonical `repo` grammar.
+
+`git.digest` and publish self-ingest must call the same project-identity resolver in the
+handler namespace whenever the digest source identifies a GitHub repository. A remote
+source gets that identity from its accepted URL alias. A local source that ingests GitHub
+issues or pull requests must first derive the same identity from its configured GitHub
+origin; if it cannot derive one unambiguously, that GitHub-object ingest fails rather than
+falling back to the local directory name. The resolver considers only live `project`
+entities whose string `properties.repo_url` parses to the same `GitHubRepoIdentity`; it
+never matches `project.name`, a path basename, or an unscoped repository name. If no anchor
+matches, it creates one with the canonical URL. If exactly one alias-form anchor matches,
+it rewrites that anchor's `properties.repo_url` to the canonical URL before ingest. If
+more than one live anchor maps to the identity, resolution fails as an integrity error
+before any note write; an operator must explicitly merge the duplicate projects and retry,
+rather than the resolver selecting an arbitrary row. This enumeration-and-rewrite is the
+required alias migration for existing data and runs before either digest or publish can
+ingest a GitHub object. A caller-supplied `git.digest project` id is accepted for a GitHub
+source only when that project's `properties.repo_url` parses to the same identity; it is
+otherwise rejected. For commits-only local paths and non-GitHub URLs, ADR-088's exact
+canonical path/URL remains the identity, but its basename fallback is removed; those
+identities cannot be selected by a publish slug.
 
 Issue and PR self-ingest uses the same natural key as the current digest implementation:
 
@@ -489,12 +540,18 @@ Self-ingest does not substitute a publication URL for any of these common proper
   new pack-owned note kinds for this ADR's own purposes, both use the existing base
   `reference` note kind (ADR-013), with `content` set to the release notes or comment body
   with the khive reconciliation marker removed, `properties.url` set to the published URL,
-  and `properties.publish_operation_id` set to the operation UUID. The latter is the
-  reference-note upsert key used during recovery. A `git.publish_comment` targeting an
-  already-ingested issue or pull request `annotates` that note; if the target was never
-  ingested, it `annotates` the repo-anchor `project` entity instead. This mirrors ADR-088
-  Amendment 1's best-effort enrichment precedent: no match means a narrower edge, never a
-  second remote publish.
+  and `properties.publish_operation_id` set to the operation UUID.
+- A release reconciliation is an upsert with exactly one live `reference` note under
+  `(kind=reference, namespace, properties.publish_operation_id)`. It creates or updates
+  that note and ensures exactly one `annotates` edge from the note to the resolved
+  repo-anchor `project`. Replaying the initial self-ingest or recovering after either the
+  note upsert or edge ensure must leave one note and one such edge; a release reference
+  without that edge is not ingested and cannot advance to `ingested_pending_audit`.
+- A comment uses the same reference-note upsert key. A comment targeting an already-ingested
+  issue or pull request `annotates` that note; if the target was never ingested, it
+  `annotates` the repo-anchor `project` entity instead. This mirrors ADR-088 Amendment 1's
+  best-effort enrichment precedent: no match means a narrower edge, never a second remote
+  publish.
 
 This graph reconciliation runs synchronously after a successful GitHub response and is
 resumed from durable state after a failure; it is not deferred to the next digest sweep or
@@ -863,7 +920,13 @@ pattern file, it must include these contract tests:
    Free-text `title`, `body`, and `notes` values and an issue label beginning with `--` are
    accepted when otherwise valid and arrive byte-for-byte in fixed value slots; a transport
    spy asserts that they add no option, change no subcommand, and cannot consume a following
-   fixed option. Rejected cases reach neither the operation ledger nor transport.
+   fixed option. For each externally visible Unicode-capable field - issue title, PR title,
+   each of the three body fields, release notes, an explicit release title, and an issue
+   label element - the table inserts a `Cf` scalar such as U+200B into (a) an otherwise
+   denied token fixture and (b) an otherwise credential-shaped secret fixture. Every case
+   is rejected during argument validation before a ledger claim or transport call, and the
+   serialized Event, response, error, and captured logs contain neither source fixture.
+   Rejected cases reach neither the operation ledger nor transport.
 2. **Typed audit surface.** Allow, hygiene-deny, transport-error, and recovery-error cases
    append additional rows with `EventKind::Audit`, the precise top-level verb, the correct
    `EventOutcome::{Success, Denied, Error}`, and every required JSON payload key. Tests
@@ -877,16 +940,28 @@ pattern file, it must include these contract tests:
    numbers, URLs, and embedded repositories; and reject a repository-scoped read whose
    remote kind disagrees with the parsed kind. A transport spy proves rejection occurs
    before any comment write.
-4. **Digest-compatible idempotency.** Publish an issue and a PR, then run `git.digest` on
-   the same repo until complete. For each remote number, assert one note under
-   `(kind, namespace, number, project_id)`, the full common property shape, and one
-   project `annotates` edge. Repeat self-ingest and digest to prove the counts remain one.
+4. **Canonical project identity and digest-compatible idempotency.** Digest an accepted
+   GitHub URL alias such as `https://www.github.com/Org/Repo.git`, publish an issue and a PR
+   through canonical slug `org/repo`, then run `git.digest` again through the canonical URL
+   until complete. Assert one project whose `properties.repo_url` is
+   `https://github.com/org/repo`; for each remote number, assert one note under
+   `(kind, namespace, number, project_id)`, the full common property shape, and one project
+   `annotates` edge. Repeat self-ingest and both digest URL forms to prove the project,
+   natural-key, and edge counts remain one. Separate cases pre-seed one alias-form project
+   and prove it is canonicalized in place, pre-seed two aliases and prove resolution fails
+   without choosing either, prove an unrelated same-basename project is ignored, and prove
+   a mismatched explicit `git.digest project` id is rejected. An initial release publish
+   also asserts exactly one reference note under its operation-id upsert key and exactly one
+   `annotates` edge to this canonical project.
 5. **Recovery failure injection.** Inject a crash or store error after each boundary in
    the recovery table: operation insert, remote response, note upsert, edge ensure, audit
    append, and completion update. Resume with the same idempotency key and assert that the
    remote create spy observed exactly one create, unfinished local work completed, and the
    final success Event exists exactly once. The unconfirmed case must exercise marker
-   recovery and the no-match error path.
+   recovery and the no-match error path. Release cases inject failures immediately after
+   the reference-note upsert and immediately after its project-edge ensure; each recovery
+   must finish with exactly one reference note and exactly one `annotates` edge to the
+   resolved repo-anchor project.
 6. **Idempotency-key conflict.** Reusing a key with identical normalized arguments returns
    or resumes the original operation; reusing it with different arguments fails before
    transport.
@@ -898,7 +973,12 @@ pattern file, it must include these contract tests:
    credential-shaped secret-pattern tag, proving that automatic tag creation cannot bypass
    either scan layer. For each release-tag denial, the stored Event has `target = "release"`;
    a serialized-Event assertion proves the raw tag is absent from the complete payload, and
-   the operation ledger remains empty for that idempotency key.
+   the operation ledger remains empty for that idempotency key. Secret-scan regressions put
+   at least two detector classes in one field and distribute multiple detector classes
+   across multiple fields. They assert the exact sorted set of `secret:<detector>` ids and
+   `(field, pattern_id)` pairs, including overlapping detector-class matches, and assert
+   that the response, audit Event, error, and logs contain no source text, masked excerpt,
+   span, offset, or length.
 8. **Optional-argument normalization.** For labels and assignees, compare omission with
    `[]`, compare at least two permutations of the same non-empty array, and retry each form
    with one idempotency key. For draft, compare omission with `false`. For release title,
@@ -1064,7 +1144,8 @@ Four forks were presented for this design; each is resolved in place.
   audit rows.
 - `crates/khive-runtime/src/pack.rs` - the existing generic dispatch-audit path whose row
   remains separate from this ADR's handler-owned domain row.
-- `crates/khive-runtime/src/secret_gate.rs` - existing secret-detection module, reused
-  unchanged as scan layer 2.
+- `crates/khive-runtime/src/secret_gate.rs` - existing secret detector definitions and
+  matching semantics, extended with the content-free all-detector-id API required by scan
+  layer 2; existing first-match and masking callers retain their contracts.
 - `crates/khive-pack-git/src/ingest.rs` - the digest natural key, issue/PR property shapes,
   and existing `gh`/`git` shell-out precedent this ADR follows.
