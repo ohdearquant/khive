@@ -267,7 +267,7 @@ pub fn parse_codex_line(line: &str, session_id: &str, abs_byte_offset: u64) -> O
 /// valid array is skipped individually, not the whole file. The returned
 /// `raw` and `text` fields have secrets masked, exactly like
 /// `parse_cc_line`/`parse_codex_line`. See
-/// `crates/khive-pack-session/docs/mirror-parse.md` for the DFS/sidechain
+/// `crates/khive-pack-session/docs/api/mirror-parse.md` for the DFS/sidechain
 /// algorithm detail.
 pub fn parse_chatgpt_export(content: &str) -> Option<Vec<ParsedEvent>> {
     let value: Value = serde_json::from_str(content).ok()?;
@@ -299,7 +299,7 @@ fn extract_text(content: Option<&Value>) -> Option<String> {
 
 /// Extract a display string from a single content block (`"text"` /
 /// `"input_text"` / `"output_text"` / `"tool_use"` / `"tool_result"`). See
-/// `crates/khive-pack-session/docs/mirror-parse.md#extract_text--extract_block-claude-code--codex-block-extraction`.
+/// `crates/khive-pack-session/docs/api/mirror-parse.md#extract_text--extract_block-claude-code--codex-block-extraction`.
 fn extract_block(block: &Value) -> Option<String> {
     let map = block.as_object()?;
     match map.get("type")?.as_str()? {
@@ -341,7 +341,7 @@ fn truncate(s: &str, max_chars: usize) -> String {
 }
 
 /// Context threaded through one conversation's DFS walk. See
-/// `crates/khive-pack-session/docs/mirror-parse.md#convcontext`.
+/// `crates/khive-pack-session/docs/api/mirror-parse.md#convcontext`.
 struct ConvContext<'a> {
     mapping: &'a Map<String, Value>,
     current_path: &'a HashSet<String>,
@@ -353,7 +353,7 @@ struct ConvContext<'a> {
 /// Parse one ChatGPT export conversation object (skips the whole
 /// conversation on a missing/empty `id` or missing `mapping`), appending its
 /// message-bearing nodes to `out` in deterministic DFS preorder. See
-/// `crates/khive-pack-session/docs/mirror-parse.md#parse_conversation`.
+/// `crates/khive-pack-session/docs/api/mirror-parse.md#parse_conversation`.
 fn parse_conversation(conv: &Value, out: &mut Vec<ParsedEvent>) {
     let Some(conv_obj) = conv.as_object() else {
         return;
@@ -451,7 +451,7 @@ fn parse_conversation(conv: &Value, out: &mut Vec<ParsedEvent>) {
 /// Build a `ParsedEvent` for a single message-bearing mapping node; `None`
 /// on a missing `id` or empty/whitespace-only extracted text (ChatGPT
 /// scaffolding nodes). See
-/// `crates/khive-pack-session/docs/mirror-parse.md#build_chatgpt_event`.
+/// `crates/khive-pack-session/docs/api/mirror-parse.md#build_chatgpt_event`.
 fn build_chatgpt_event(
     node_id: &str,
     node: &Map<String, Value>,
@@ -528,7 +528,7 @@ fn build_chatgpt_event(
 
 /// Extract display text from a ChatGPT message `content` object per its
 /// `content_type`. See
-/// `crates/khive-pack-session/docs/mirror-parse.md#extract_chatgpt_text`.
+/// `crates/khive-pack-session/docs/api/mirror-parse.md#extract_chatgpt_text`.
 fn extract_chatgpt_text(
     content_type: &str,
     content: Option<&Map<String, Value>>,
