@@ -681,10 +681,14 @@ fn prepare_daemon_log_file(log_path: &std::path::Path) -> Option<std::fs::File> 
 }
 
 fn spawn_daemon() -> std::io::Result<std::process::Child> {
+    let exe = std::env::current_exe()?;
+    spawn_daemon_with_exe(&exe)
+}
+
+fn spawn_daemon_with_exe(exe: &std::path::Path) -> std::io::Result<std::process::Child> {
     #[cfg(test)]
     SPAWN_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
-    let exe = std::env::current_exe()?;
     // The binary is `kkernel`; the MCP server (and its daemon mode) live under
     // the `mcp` subcommand.
     let mut cmd = std::process::Command::new(exe);
@@ -1182,7 +1186,14 @@ const RECOVERER_LOCK_TIMEOUT_MS: u64 = 8_000;
 ///       never silently conflated with a positive "confirmed alive" result.
 ///   `Dead` (confirmed, recoverer lock held) → kill+spawn;
 ///       `RecoveryOutcome::Spawned`.
-async fn kill_and_respawn(config_id: &str, namespace: &str) -> std::io::Result<RecoveryOutcome> {
+async fn kill_and_respawn<F>(
+    config_id: &str,
+    namespace: &str,
+    spawn: &F,
+) -> std::io::Result<RecoveryOutcome>
+where
+    F: Fn() -> std::io::Result<std::process::Child> + Sync,
+{
     let initial_probe = {
         let _lock = acquire_recovery_lock();
         probe_daemon_identity(config_id, namespace, 500).await
@@ -1275,7 +1286,7 @@ async fn kill_and_respawn(config_id: &str, namespace: &str) -> std::io::Result<R
             // and dropped entirely within this arm.
             let _boot_lock = acquire_recovery_lock();
             kill_stale_daemon_inner();
-            spawn_daemon().map(RecoveryOutcome::Spawned)
+            spawn().map(RecoveryOutcome::Spawned)
         }
     };
     drop(recoverer_guard);
@@ -1842,6 +1853,25 @@ async fn wait_for_boot_quiescence_then_reprobe(frame: &DaemonRequestFrame) -> Bo
 /// (`ambiguous_forward_error`) instead of killing/respawning/retrying or
 /// falling back locally. See #644.
 pub async fn forward_or_spawn(frame: &DaemonRequestFrame) -> Option<Result<String, McpError>> {
+    forward_or_spawn_with(frame, &spawn_daemon).await
+}
+
+#[cfg(test)]
+async fn forward_or_spawn_with_exe(
+    frame: &DaemonRequestFrame,
+    exe: &std::path::Path,
+) -> Option<Result<String, McpError>> {
+    let spawn = || spawn_daemon_with_exe(exe);
+    forward_or_spawn_with(frame, &spawn).await
+}
+
+async fn forward_or_spawn_with<F>(
+    frame: &DaemonRequestFrame,
+    spawn: &F,
+) -> Option<Result<String, McpError>>
+where
+    F: Fn() -> std::io::Result<std::process::Child> + Sync,
+{
     if env_truthy("KHIVE_NO_DAEMON") {
         return None;
     }
@@ -1898,7 +1928,7 @@ pub async fn forward_or_spawn(frame: &DaemonRequestFrame) -> Option<Result<Strin
     // attempt already exited — never polled eagerly, never used to cut the
     // connect-retry window or the #667 boot-quiescence wait short.
     let mut spawned_child: Option<std::process::Child> = None;
-    match kill_and_respawn(&frame.config_id, &frame.namespace).await {
+    match kill_and_respawn(&frame.config_id, &frame.namespace, spawn).await {
         Err(e) => {
             // #898: `Command::spawn` itself failed to start the child at all —
             // an unambiguous, already-fully-diagnosed respawn failure. Loud in
@@ -2727,40 +2757,22 @@ mod tests {
         sentinel: &'static str,
     }
 
-    #[cfg(unix)]
-    struct ExecutablePermissionsGuard {
-        path: std::path::PathBuf,
-        permissions: std::fs::Permissions,
-    }
+    fn daemon_script_fixture(
+        dir: &tempfile::TempDir,
+        name: &str,
+        body: &str,
+    ) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
 
-    #[cfg(unix)]
-    impl ExecutablePermissionsGuard {
-        fn make_current_exe_unexecutable() -> Self {
-            use std::os::unix::fs::PermissionsExt;
-
-            let path = std::env::current_exe().expect("resolve current test executable");
-            let permissions = std::fs::metadata(&path)
-                .expect("read current test executable metadata")
-                .permissions();
-            assert_ne!(
-                permissions.mode() & 0o111,
-                0,
-                "current test executable must initially have an execute bit"
-            );
-            let mut unexecutable = permissions.clone();
-            unexecutable.set_mode(permissions.mode() & !0o111);
-            std::fs::set_permissions(&path, unexecutable)
-                .expect("make current test executable unexecutable");
-            Self { path, permissions }
-        }
-    }
-
-    #[cfg(unix)]
-    impl Drop for ExecutablePermissionsGuard {
-        fn drop(&mut self) {
-            std::fs::set_permissions(&self.path, self.permissions.clone())
-                .expect("restore current test executable permissions");
-        }
+        let path = dir.path().join(name);
+        std::fs::write(&path, body).expect("write daemon executable fixture");
+        let mut permissions = std::fs::metadata(&path)
+            .expect("read daemon executable fixture metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&path, permissions)
+            .expect("make daemon executable fixture executable");
+        path
     }
 
     #[derive(Clone, Default)]
@@ -2852,8 +2864,9 @@ mod tests {
         }
     }
 
-    async fn forward_with_captured_events(
+    async fn forward_with_exe_and_captured_events(
         frame: &DaemonRequestFrame,
+        exe: &std::path::Path,
     ) -> (Option<Result<String, McpError>>, String) {
         let captured = CapturedLog::default();
         let subscriber = tracing_subscriber::fmt()
@@ -2862,7 +2875,7 @@ mod tests {
             .without_time()
             .finish();
         let subscriber_guard = tracing::subscriber::set_default(subscriber);
-        let output = forward_or_spawn(frame).await;
+        let output = forward_or_spawn_with_exe(frame, exe).await;
         drop(subscriber_guard);
         let events = captured.contents();
         (output, events)
@@ -2904,9 +2917,10 @@ mod tests {
         std::env::remove_var("KHIVE_DAEMON_STRICT");
         let disclosure =
             RespawnDisclosureFixture::new("KHIVE_RESPAWN_LOG_SENTINEL_NON_STRICT_4d9813b72e");
+        let exe = daemon_script_fixture(&dir, "exits-before-bind", "#!/bin/sh\nexit 23\n");
 
         let frame = unreachable_daemon_frame(CFG);
-        let (out, events) = forward_with_captured_events(&frame).await;
+        let (out, events) = forward_with_exe_and_captured_events(&frame, &exe).await;
         disclosure.assert_output_is_sanitized("bridge tracing events", &events);
         assert!(
             events.contains("reason=\"respawn_failed\""),
@@ -2964,9 +2978,10 @@ mod tests {
         std::env::set_var("KHIVE_DAEMON_STRICT", "1");
         let disclosure =
             RespawnDisclosureFixture::new("KHIVE_RESPAWN_LOG_SENTINEL_STRICT_7ac60d5391");
+        let exe = daemon_script_fixture(&dir, "exits-before-bind", "#!/bin/sh\nexit 23\n");
 
         let frame = unreachable_daemon_frame(CFG);
-        let (out, events) = forward_with_captured_events(&frame).await;
+        let (out, events) = forward_with_exe_and_captured_events(&frame, &exe).await;
         disclosure.assert_output_is_sanitized("strict-mode bridge tracing events", &events);
         assert!(
             events.contains("reason=\"respawn_failed\""),
@@ -3010,7 +3025,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     #[serial]
-    async fn forward_or_spawn_sanitizes_spawn_error_without_local_fallback() {
+    async fn forward_or_spawn_with_injected_exe_sanitizes_spawn_error_without_local_fallback() {
         clear_daemon_env();
         reset_fallback_counters();
         let dir = tempfile::tempdir().expect("tempdir");
@@ -3021,10 +3036,11 @@ mod tests {
         std::env::remove_var("KHIVE_DAEMON_STRICT");
         let disclosure =
             RespawnDisclosureFixture::new("KHIVE_RESPAWN_LOG_SENTINEL_SPAWN_ERROR_f6a81b23c9");
-        let _permissions = ExecutablePermissionsGuard::make_current_exe_unexecutable();
+        let exe = dir.path().join("not-executable");
+        std::fs::write(&exe, "not an executable").expect("write non-executable fixture");
 
         let frame = unreachable_daemon_frame(CFG);
-        let (out, events) = forward_with_captured_events(&frame).await;
+        let (out, events) = forward_with_exe_and_captured_events(&frame, &exe).await;
         disclosure.assert_output_is_sanitized("spawn-error bridge tracing events", &events);
         assert!(
             events.contains("reason=\"respawn_failed\""),
@@ -3067,43 +3083,9 @@ mod tests {
     }
 
     #[cfg(unix)]
-    struct SleepingExecutableGuard {
-        path: std::path::PathBuf,
-        backup: std::path::PathBuf,
-    }
-
-    #[cfg(unix)]
-    impl SleepingExecutableGuard {
-        fn replace_current_exe() -> Self {
-            use std::os::unix::fs::PermissionsExt;
-
-            let path = std::env::current_exe().expect("resolve current test executable");
-            let backup =
-                path.with_extension(format!("khive-respawn-backup-{}", std::process::id()));
-            std::fs::rename(&path, &backup).expect("back up current test executable");
-            std::fs::write(&path, b"#!/bin/sh\nsleep 10\n")
-                .expect("install sleeping executable wrapper");
-            let mut permissions = std::fs::metadata(&path)
-                .expect("read sleeping wrapper metadata")
-                .permissions();
-            permissions.set_mode(0o755);
-            std::fs::set_permissions(&path, permissions).expect("make sleeping wrapper executable");
-            Self { path, backup }
-        }
-    }
-
-    #[cfg(unix)]
-    impl Drop for SleepingExecutableGuard {
-        fn drop(&mut self) {
-            std::fs::remove_file(&self.path).expect("remove sleeping executable wrapper");
-            std::fs::rename(&self.backup, &self.path).expect("restore current test executable");
-        }
-    }
-
-    #[cfg(unix)]
     #[tokio::test]
     #[serial]
-    async fn forward_or_spawn_falls_back_when_spawned_child_is_still_alive() {
+    async fn forward_or_spawn_with_injected_exe_falls_back_when_child_stays_alive() {
         clear_daemon_env();
         reset_fallback_counters();
         let dir = tempfile::tempdir().expect("tempdir");
@@ -3112,9 +3094,9 @@ mod tests {
         std::env::set_var("KHIVE_LOCK", dir.path().join("khived.recovery.lock"));
         std::env::remove_var("KHIVE_NO_DAEMON");
         std::env::remove_var("KHIVE_DAEMON_STRICT");
-        let _executable = SleepingExecutableGuard::replace_current_exe();
+        let exe = daemon_script_fixture(&dir, "still-running", "#!/bin/sh\nsleep 10\n");
 
-        let out = forward_or_spawn(&unreachable_daemon_frame(CFG)).await;
+        let out = forward_or_spawn_with_exe(&unreachable_daemon_frame(CFG), &exe).await;
 
         assert!(
             out.is_none(),
@@ -4065,7 +4047,7 @@ mod tests {
         // whose turn arrives after the first recoverer already replaced the stale
         // daemon.  The bounded probe confirms the live daemon; Skipped is returned
         // without killing.
-        let outcome = kill_and_respawn(&config_id, "test").await;
+        let outcome = kill_and_respawn(&config_id, "test", &spawn_daemon).await;
 
         assert!(
             matches!(outcome, Ok(RecoveryOutcome::Skipped)),
@@ -4413,7 +4395,7 @@ mod tests {
         // Simulate the exactly-once scenario:
         //   (a) kill_and_respawn sees a live daemon → returns Skipped (0 dispatches)
         //   (b) call site forwards the real request once → 1 dispatch
-        let recovery = kill_and_respawn(config_id, "test").await;
+        let recovery = kill_and_respawn(config_id, "test", &spawn_daemon).await;
         assert!(
             matches!(recovery, Ok(RecoveryOutcome::Skipped)),
             "probe must find the live CountingDispatch daemon and return Skipped"
@@ -4792,8 +4774,8 @@ mod tests {
         });
 
         let (a, b) = tokio::join!(
-            kill_and_respawn(&config_id, "test"),
-            kill_and_respawn(&config_id, "test"),
+            kill_and_respawn(&config_id, "test", &spawn_daemon),
+            kill_and_respawn(&config_id, "test", &spawn_daemon),
         );
         let spawned_count = [&a, &b]
             .iter()
@@ -4886,7 +4868,7 @@ mod tests {
         FORCE_PID_IS_DAEMON.store(true, std::sync::atomic::Ordering::SeqCst);
         reset_counters();
 
-        let outcome = kill_and_respawn(config_id, "test").await;
+        let outcome = kill_and_respawn(config_id, "test", &spawn_daemon).await;
 
         // The fake socket served exactly one response; join it before asserting.
         let _ = tokio::time::timeout(std::time::Duration::from_secs(2), fake_handle).await;
