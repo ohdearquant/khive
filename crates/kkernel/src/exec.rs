@@ -467,7 +467,10 @@ pub async fn run_exec(args: ExecArgs) -> Result<()> {
     // Regression fence: `cfg.db_path` must agree with the canonical anchor for
     // this same `--db`/`KHIVE_DB` input, or `compute_config_id` would silently
     // desynchronize `kkernel exec` from the daemon it is trying to reach.
-    khive_runtime::assert_db_anchor_consistent(cfg.db_path.as_deref(), db_anchor.as_deref())?;
+    khive_runtime::assert_captured_db_anchor_consistent(
+        cfg.db_path.as_deref(),
+        db_anchor.as_deref(),
+    )?;
 
     match mode {
         ExecMode::Inline(ops) => {
@@ -1244,7 +1247,7 @@ default = true
         // `db_path` here is NOT the actual storage location when `[[backends]]`
         // is declared — `build_server_multi_backend` opens each backend's own
         // declared path (the tempfiles above) independently. It is only the
-        // identity/fingerprint value `assert_db_anchor_consistent` checks
+        // identity/fingerprint value `assert_captured_db_anchor_consistent` checks
         // against `resolve_db_anchor(cli_db_override)`, exactly mirroring what
         // a real `kkernel exec` invocation with NO explicit `--db` flag would
         // resolve to (the realistic shape when `[[backends]]` fully governs

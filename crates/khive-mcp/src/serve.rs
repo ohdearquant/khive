@@ -1218,7 +1218,7 @@ pub fn build_registry_for_multi_backend_with_db_anchor(
     // through — `build_server_multi_backend` in this file and `kkernel`'s
     // `Command::Mcp` coordinator-attached branch — so the guard lives here
     // once instead of at each caller.
-    khive_runtime::assert_db_anchor_consistent(base_config.db_path.as_deref(), db_anchor)?;
+    khive_runtime::assert_captured_db_anchor_consistent(base_config.db_path.as_deref(), db_anchor)?;
 
     let backend_count = khive_cfg.backends.len();
     let force_memory = match cli_db_override {
@@ -1566,7 +1566,10 @@ pub fn build_server_with_explicit_namespace(
     // resolver derives from this same `--db` input, or `config_id` (computed
     // from `config.db_path` below) would silently desynchronize this process
     // from any daemon/peer anchored on the same database.
-    khive_runtime::assert_db_anchor_consistent(config.db_path.as_deref(), db_anchor.as_deref())?;
+    khive_runtime::assert_captured_db_anchor_consistent(
+        config.db_path.as_deref(),
+        db_anchor.as_deref(),
+    )?;
 
     // Load the KhiveConfig to check for multi-backend declarations (ADR-028).
     // When no [[backends]] are declared, fall through to the existing single-backend path
