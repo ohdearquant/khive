@@ -16,7 +16,7 @@ use super::common::{
 use crate::KgPack;
 
 // Field applicability guard, authoritative field sets per substrate — see
-// docs/handlers-common.md#reject_inapplicable_fields-handlersupdaters. MUST be updated
+// docs/api/note-crud-fields.md#reject_inapplicable_fields-handlersupdaters. MUST be updated
 // whenever UpdateParams or a patch struct changes.
 fn reject_inapplicable_fields(spec: &KindSpec, p: &UpdateParams) -> Result<(), RuntimeError> {
     let (bad_field, valid): (Option<&str>, &str) = match spec {
