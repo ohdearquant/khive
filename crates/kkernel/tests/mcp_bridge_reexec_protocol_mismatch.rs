@@ -42,6 +42,12 @@
 //! marker can ever emit, and the only way that marker exists is a completed
 //! `exec()` (this test never spawns a second process itself).
 
+//! Unix-only: drives `khive_runtime::daemon::{read_frame, write_frame}` and
+//! `tokio::net::UnixListener`, both gated `#[cfg(unix)]`, and exercises the
+//! real `exec()`-based bridge self-heal path, which is POSIX-only.
+
+#![cfg(unix)]
+
 use std::process::Stdio;
 use std::time::Duration;
 
