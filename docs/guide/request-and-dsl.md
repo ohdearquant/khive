@@ -86,8 +86,8 @@ from running; completed operations are not rolled back.
 
 ## Read the result envelope
 
-`request` returns a `results` array and an aggregate `summary`. Each completed
-operation has one of these shapes:
+By default, `request` returns a `results` array and an aggregate `summary`
+inline. Each completed operation has one of these shapes:
 
 ```json
 { "ok": true, "tool": "search", "result": { "...": "..." } }
@@ -112,6 +112,13 @@ For example, a parallel batch can return:
 A failure in a parallel batch does not stop its siblings. In a chain, entries
 after the failure are returned as `{ "ok": false, "tool": "...", "aborted": true }`;
 the summary records their count in `aborted`.
+
+The inline `results`/`summary` envelope is the default. Set the optional
+`save_to` parameter to sink the full results to a JSONL file instead; `request`
+then returns a small manifest (the file path, row count, and integrity fields)
+rather than the inline envelope. Read `results` and `summary` only when
+`save_to` is omitted. See the [API reference](api-reference.md) for `save_to`
+and its export-destination restriction.
 
 ## Distinguish syntax errors from operation errors
 
