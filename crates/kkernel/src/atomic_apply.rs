@@ -1,50 +1,10 @@
 //! ADR-099 Slice B3 — the `--atomic` execution path for `kkernel exec
-//! --ops-file`.
-//!
-//! This module is the CLI-boundary orchestrator: it runs the parse-time
-//! admissibility check ([`khive_request::atomic::check_atomic_admissible`],
-//! B1) and the op-count guard BEFORE building any runtime or touching the
-//! database, then drives the async prepare pass (KG-substrate verbs via
-//! [`khive_runtime::atomic_prepare::prepare_op`]; `gtd.transition` /
-//! `gtd.complete` via the two `prepare_gtd_*` functions below — thin
-//! `AtomicOpPlan` adapters over the shared decide steps
-//! `khive_pack_gtd::handlers::prepare_transition` / `prepare_complete`,
-//! the SAME functions the canonical, non-atomic `handle_transition` /
-//! `handle_complete` call before applying (ADR-099 B3 r6 second pass). The
-//! adapters live in this crate rather than `khive-pack-gtd` purely because
-//! `AtomicOpPlan`/`PlanStatement` are `khive-runtime` atomic-plan vocabulary
-//! this CLI orchestrator owns; the decide LOGIC itself is not duplicated —
-//! it lives once, in `khive-pack-gtd::handlers::{prepare_transition,
-//! prepare_complete}`, consumed both by canonical `handle_transition` /
-//! `handle_complete` (which apply it directly) and by the two adapters
-//! below (which turn the same decision into an `AtomicOpPlan`)), the
-//! synchronous commit pass ([`khive_runtime::atomic_runner::run_atomic_unit`],
-//! B2), and finally the async post-commit reindex pass
-//! ([`khive_runtime::atomic_prepare::apply_post_commit_effects`]).
-//!
-//! `propose` / `review` / `withdraw` are admissible per
-//! [`khive_types::pack::ATOMIC_ADMISSIBLE_VERBS`] (ADR-099 D3 intends them to
-//! gain a seam) but have no prepare implementation yet. As of the B3 fix,
-//! they are now rejected by the SAME pre-runtime
-//! `check_atomic_admissible` static guard above, as
-//! [`khive_types::pack::AtomicRejectionReason::KnownUnimplemented`] — never
-//! reaching `KhiveRuntime::new` or `prepare_one` at all. `prepare_op`'s own
-//! `prepare_governance_unimplemented` fallback (see that module's doc
-//! comment) is unreachable through this CLI path and remains only as
-//! defense-in-depth for any other caller of `prepare_op`.
-//!
-//! `merge` joined this same deferred bucket in the B3 fix: a full-parity
-//! atomic merge prepare
-//! was drafted and unit-tested against `khive_runtime::atomic_prepare`
-//! directly, but its edge-conflict resolution cannot be expressed in
-//! ADR-099's static predicate/guard plan shape (see that crate's
-//! `atomic_prepare` module doc), so it is rejected here rather than shipped
-//! partially-scoped — `merge is not yet supported under --atomic; use the
-//! non-atomic merge verb` is the message callers see.
-//!
-//! The returned envelope is additive-only and lives entirely outside
-//! `dispatch_request_local`'s response shape: non-atomic `--ops-file` runs
-//! (and every other exec path) are untouched by this module.
+//! --ops-file`: CLI-boundary orchestrator running admissibility check ->
+//! prepare pass -> commit pass -> post-commit reindex. See
+//! `crates/kkernel/docs/design.md#atomic-exec---ops-file---atomic-execution-path-adr-099-slice-b3`
+//! for the full pipeline, why `propose`/`review`/`withdraw`/`merge` are
+//! rejected pre-runtime rather than partially supported, and the gtd-adapter
+//! ownership split with `khive-pack-gtd`.
 
 use anyhow::{Context, Result};
 use serde_json::{json, Value};
@@ -276,17 +236,10 @@ pub(crate) async fn execute_atomic_ops_file(
     Ok(envelope)
 }
 
-/// Apply every [`PostCommitEffect::GtdAudit`] in `effects` by calling the
-/// SAME `ensure_audit_schema`/`write_audit_record` functions the canonical
-/// `handle_transition`/`handle_complete` handlers call (GAP-5, ADR-099 B3).
-/// Lives in `kkernel` rather than `khive-runtime::atomic_prepare`
-/// because those two functions are owned by `khive-pack-gtd`, which
-/// depends on `khive-runtime` — not the other way around; `kkernel` is the
-/// first crate in the dependency graph that can see both. Non-`GtdAudit`
-/// effects are ignored here (they are `khive_runtime::atomic_prepare::
-/// apply_post_commit_effects`'s job, called separately). Best-effort by
-/// construction: both callee functions log-and-swallow their own errors, so
-/// this function itself cannot fail.
+/// Applies every [`PostCommitEffect::GtdAudit`] via the canonical gtd audit
+/// functions (GAP-5, ADR-099 B3); best-effort, cannot fail. See
+/// `crates/kkernel/docs/design.md#atomic-exec---ops-file---atomic-execution-path-adr-099-slice-b3`
+/// for why this lives in `kkernel` rather than `khive-runtime`.
 async fn apply_gtd_audit_post_commit_effects(runtime: &KhiveRuntime, effects: &[PostCommitEffect]) {
     for effect in effects {
         if let PostCommitEffect::GtdAudit {
@@ -329,38 +282,10 @@ fn describe_failure(failure: &AtomicOpFailure) -> String {
 }
 
 /// ADR-099 B3 parity fix: reject unknown/typo'd arg keys on the five v1
-/// atomic-admissible write verbs, BEFORE building any plan.
-///
-/// Canonical (non-atomic) `handle_update`/`handle_delete`/`handle_link`
-/// (`khive-pack-kg`) and `handle_transition`/`handle_complete`
-/// (`khive-pack-gtd`) all deserialize their args through a
-/// `#[serde(deny_unknown_fields)]` param struct, so a typo like
-/// `conten` (for `content`) is rejected with `bad params: unknown field
-/// 'conten'` rather than silently ignored. The pre-fix `--atomic` path had
-/// no equivalent gate: each `prepare_*` fn only read the keys it knew
-/// about via `obj(args)?.get(...)`, so a typo'd key was dropped on the
-/// floor and the op reported `ok:true` with every OTHER field reset to its
-/// current value — the caller's intended change silently lost.
-///
-/// This is Approach A (reuse, not reimplement): `kkernel` already depends
-/// on both `khive-pack-kg` and `khive-pack-gtd` directly (see
-/// `kkernel/Cargo.toml`) — no crate-graph inversion is needed to reach
-/// their param structs, which are now re-exported `pub` (widened from
-/// `pub(crate)`/private specifically for this seam; see the doc comments
-/// on `UpdateParams`/`DeleteParams`/`LinkParams`
-/// [`khive_pack_kg::handlers::params`] and
-/// `TransitionParams`/`CompleteParams` [`khive_pack_gtd::handlers`]).
-/// Deserializing an op's args through the SAME struct the canonical
-/// handler uses reproduces its `deny_unknown_fields` rejection AND its
-/// exact error message shape for free, with no duplicated key list to
-/// drift out of sync. The deserialized value is discarded — the
-/// `prepare_*` fns below still read from the raw `Value` map unchanged;
-/// this is a pure additive gate in front of them.
-///
-/// `merge`, `create`, and the read/governance verbs are out of scope here:
-/// `merge` and the embedding-bearing/read/governance verbs are already
-/// rejected earlier, at `check_atomic_admissible` (before this function is
-/// ever reached) or are not part of the v1 admissible set at all.
+/// atomic-admissible write verbs, BEFORE building any plan — by reusing each
+/// canonical handler's own `#[serde(deny_unknown_fields)]` param struct. See
+/// `crates/kkernel/docs/design.md#atomic-exec---ops-file---atomic-execution-path-adr-099-slice-b3`
+/// for why this exists and why it reuses rather than reimplements.
 fn validate_atomic_args(tool: &str, args: &Value) -> anyhow::Result<()> {
     fn reject<T: serde::de::DeserializeOwned>(args: &Value) -> anyhow::Result<()> {
         serde_json::from_value::<T>(args.clone())
@@ -514,17 +439,8 @@ async fn resolve_kg_ids_in_args(
     Ok(out)
 }
 
-/// Resolve a caller-supplied `delete(kind=...)` string into the
-/// [`khive_runtime::atomic_prepare::AtomicDeleteKind`] `prepare_delete`
-/// enforces, using the SAME canonical `resolve_kind_spec` the non-atomic
-/// `handle_delete` calls (ADR-099 B3). `kind` absent -> `Ok(None)` (no check, parity with
-/// canonical's own optional discriminator). `kind` resolving to `Edge` maps
-/// to `AtomicDeleteKind::Edge` (ADR-099 B3 — closes a prior gap where
-/// `Edge` used to be rejected here even though
-/// `ATOMIC_ADMISSIBLE_VERBS` already allows `delete(kind="edge")`).
-/// `Event`/`Proposal` remain a fail-loud rejection BEFORE `prepare_delete`
-/// (and therefore before any write): those substrates are not v1-admissible
-/// for atomic delete at all.
+/// Resolves a caller-supplied `delete(kind=...)` into `AtomicDeleteKind`. See
+/// `crates/kkernel/docs/design.md#atomic-exec---ops-file---atomic-execution-path-adr-099-slice-b3`.
 fn delete_expected_kind(
     args: &Value,
     registry: &VerbRegistry,
@@ -558,16 +474,9 @@ fn delete_expected_kind(
     }
 }
 
-/// Resolve a caller-supplied `update(kind=...)` string into the
-/// [`khive_runtime::atomic_prepare::AtomicUpdateKind`] `prepare_update`
-/// enforces, using the SAME canonical `resolve_kind_spec` the non-atomic
-/// `handle_update` calls (ADR-099 B3). Exact
-/// mirror of [`delete_expected_kind`] above — same reasoning, same shape,
-/// differing only in which `AtomicOpPlan`-adjacent enum it targets. `kind`
-/// absent -> `Ok(None)` (no check, parity with canonical's own optional
-/// discriminator). `Event`/`Proposal` remain a fail-loud rejection BEFORE
-/// `prepare_update` (and therefore before any write): those substrates are
-/// not v1-admissible for atomic update at all.
+/// Resolves a caller-supplied `update(kind=...)` into `AtomicUpdateKind`;
+/// mirrors [`delete_expected_kind`] above. See
+/// `crates/kkernel/docs/design.md#atomic-exec---ops-file---atomic-execution-path-adr-099-slice-b3`.
 fn update_expected_kind(
     args: &Value,
     registry: &VerbRegistry,

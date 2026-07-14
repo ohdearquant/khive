@@ -309,9 +309,8 @@ mod tests {
         assert_eq!(config.keyword_weight, 0.0);
     }
 
-    /// JSON has no NaN token; the parser rejects the literal before `TryFrom` is ever
-    /// reached. This documents that trivial case but is NOT the real regression guard —
-    /// see `test_try_from_rejects_nan_vector_weight` below for the genuine boundary test.
+    /// Parser-level rejection only; see `crates/khive-retrieval/docs/api/hybrid-config.md`
+    /// for why this is not the real `TryFrom` regression guard.
     #[test]
     fn test_serde_json_rejects_nan_literal_vector_weight() {
         let json = r#"{
@@ -347,22 +346,9 @@ mod tests {
         );
     }
 
-    /// `serde_json` refuses any JSON number literal that overflows `f64` (e.g. `1e400`)
-    /// with its own "number out of range" parse error, regardless of any custom
-    /// validation — verified empirically: this also occurs for a bare `f64` field with no
-    /// `TryFrom` involved at all. So it cannot be used to prove `TryFrom` is wired up; it's
-    /// omitted here to avoid a misleading assertion. The genuine regression guard for both
-    /// NaN and infinity is `RawHybridConfig` constructed directly below, which is exactly
-    /// the value `TryFrom<RawHybridConfig>` receives once `serde` finishes parsing the raw
-    /// wire form — see `test_try_from_rejects_*` below.
-    ///
-    /// `serde_json` also cannot encode a literal NaN value at all
-    /// (`serde_json::Number::from_f64(f64::NAN)` returns `None`), so the only way to
-    /// exercise `TryFrom<RawHybridConfig>` with an actual non-finite value is to construct
-    /// the raw struct directly. Without the fix, `RawHybridConfig`/`TryFrom` do not exist
-    /// and these tests would not compile; with the old plain-derive `Deserialize`, this
-    /// exact input would have deserialized successfully (uncaught in release, since the
-    /// only prior guard was a `debug_assert!` in the unrelated `with_weights` builder).
+    /// The real `TryFrom<RawHybridConfig>` regression guard (constructed directly since
+    /// `serde_json` cannot encode a literal NaN). See
+    /// `crates/khive-retrieval/docs/api/hybrid-config.md` for the full rationale.
     #[test]
     fn test_try_from_rejects_nan_vector_weight() {
         let raw = RawHybridConfig {
