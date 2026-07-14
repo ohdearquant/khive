@@ -144,12 +144,45 @@ fn clone_max_bytes() -> u64 {
 /// lock for the full span of one of those functions serializes same-key
 /// mutation while leaving distinct keys free to run concurrently: each
 /// `cache_key` gets its own `Mutex` entry here, so locking one slot never
-/// blocks a caller operating on a different slot. Entries are never removed
-/// -- the map is bounded by the number of distinct repositories ever
-/// digested in this process's lifetime, which is small relative to the
-/// process's own memory footprint.
+/// blocks a caller operating on a different slot. `SlotLock::drop` removes
+/// an entry once the final live handle releases it, keeping the registry
+/// bounded by active slot operations rather than process-lifetime history.
 static SLOT_LOCKS: std::sync::LazyLock<Mutex<HashMap<String, Arc<Mutex<()>>>>> =
     std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+
+struct SlotLock {
+    key: String,
+    mutex: Arc<Mutex<()>>,
+}
+
+impl std::ops::Deref for SlotLock {
+    type Target = Mutex<()>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.mutex
+    }
+}
+
+impl Drop for SlotLock {
+    fn drop(&mut self) {
+        let mut locks = SLOT_LOCKS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // The registry and this handle are the final two owners only when no
+        // waiter or guard can still reference this mutex.
+        let is_final_handle = Arc::strong_count(&self.mutex) == 2;
+        let is_registered = locks
+            .get(&self.key)
+            .is_some_and(|mutex| Arc::ptr_eq(mutex, &self.mutex));
+        if is_final_handle && is_registered {
+            locks.remove(&self.key);
+            let live_entries = locks.len();
+            if locks.capacity() > live_entries.saturating_mul(4) {
+                locks.shrink_to(live_entries);
+            }
+        }
+    }
+}
 
 /// Eviction passes are serialized so the last overlapping slot mutation to
 /// reach eviction observes every earlier successful operation that has
@@ -161,15 +194,19 @@ static EVICTION_LOCK: Mutex<()> = Mutex::new(());
 
 /// Get-or-create the advisory lock for cache slot `key`. Callers hold the
 /// returned lock for the entire check-and-mutate span of their operation on
-/// that slot (see `SLOT_LOCKS`).
-fn slot_lock(key: &str) -> Arc<Mutex<()>> {
+/// that slot (see `SLOT_LOCKS`). The handle's drop check runs while holding
+/// the registry mutex, so a concurrent lookup either increments the same
+/// `Arc` first or observes the entry only after its final handle is gone.
+fn slot_lock(key: &str) -> SlotLock {
     let mut locks = SLOT_LOCKS
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    locks
-        .entry(key.to_string())
+    let key = key.to_string();
+    let mutex = locks
+        .entry(key.clone())
         .or_insert_with(|| Arc::new(Mutex::new(())))
-        .clone()
+        .clone();
+    SlotLock { key, mutex }
 }
 
 /// Ensure a local clone of `canonical_url` exists and is up to date; returns
@@ -590,6 +627,13 @@ fn dir_size(path: &Path) -> Result<u64, CacheError> {
     Ok(total)
 }
 
+fn is_cache_key_name(name: &str) -> bool {
+    name.len() == 16
+        && name
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+}
+
 /// Whether `path` is a directory `ensure_clone` could plausibly have
 /// created: a 16-lowercase-hex `cache_key`-shaped directory name (never a
 /// UUID staging dir, never an arbitrary operator directory), itself a real
@@ -606,11 +650,7 @@ fn is_owned_entry(path: &Path) -> bool {
         Some(n) => n,
         None => return false,
     };
-    if name.len() != 16
-        || !name
-            .chars()
-            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
-    {
+    if !is_cache_key_name(name) {
         return false;
     }
     match std::fs::symlink_metadata(path) {
@@ -661,6 +701,9 @@ fn evict_lru(root: &Path, keep: &Path) -> Result<(), CacheError> {
         let Some(key) = p.file_name().and_then(|name| name.to_str()) else {
             continue;
         };
+        if !is_cache_key_name(key) || !is_owned_entry(&p) {
+            continue;
+        }
         let key = key.to_string();
         let lock = slot_lock(&key);
         let _candidate_guard = match lock.try_lock() {
@@ -747,6 +790,20 @@ mod tests {
             std::fs::write(p.join(MARKER_FILE), b"").unwrap();
         }
         p
+    }
+
+    fn slot_lock_registry_len() -> usize {
+        SLOT_LOCKS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .len()
+    }
+
+    fn slot_lock_registry_capacity() -> usize {
+        SLOT_LOCKS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .capacity()
     }
 
     /// ADR-088 Amendment 1: a `git clone` failure (bad
@@ -856,6 +913,27 @@ mod tests {
     }
 
     #[test]
+    fn evict_lru_does_not_grow_registry_for_unrelated_scratch_root_children() {
+        let _guard = ENV_MUTEX.blocking_lock();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("scratch-root");
+        std::fs::create_dir_all(&root).unwrap();
+        let kept = make_owned_entry(&root, "4444444444444444", true);
+
+        for index in 0..32 {
+            std::fs::create_dir_all(root.join(format!("operator-data-{index}"))).unwrap();
+        }
+
+        let baseline = slot_lock_registry_len();
+        evict_lru(&root, &kept).expect("evict");
+        assert_eq!(
+            slot_lock_registry_len(),
+            baseline,
+            "unrelated scratch-root children must not allocate slot locks"
+        );
+    }
+
+    #[test]
     fn evict_lru_never_removes_an_owned_looking_dir_missing_the_marker() {
         let _guard = ENV_MUTEX.blocking_lock();
         let dir = tempfile::tempdir().expect("tempdir");
@@ -869,11 +947,17 @@ mod tests {
         let no_marker = make_owned_entry(&root, "5555555555555555", false);
         let kept = make_owned_entry(&root, "6666666666666666", true);
 
+        let baseline = slot_lock_registry_len();
         evict_lru(&root, &kept).expect("evict");
 
         assert!(
             no_marker.exists(),
             "an owned-looking directory without the marker must survive eviction"
+        );
+        assert_eq!(
+            slot_lock_registry_len(),
+            baseline,
+            "an unowned cache-shaped child must not allocate a slot lock"
         );
 
         std::env::remove_var("KHIVE_GIT_DIGEST_CACHE_MAX_REPOS");
@@ -1446,6 +1530,7 @@ mod tests {
     /// distinct keys").
     #[test]
     fn slot_lock_serializes_same_key_but_not_distinct_keys() {
+        let _env_guard = ENV_MUTEX.blocking_lock();
         let key_a = "abcdef0123456789";
         let key_b = "fedcba9876543210";
 
@@ -1465,6 +1550,41 @@ mod tests {
         );
 
         drop(guard);
+        drop(lock_a1);
+
+        let guard = lock_a2.lock().expect("re-lock key_a");
+        let lock_a3 = slot_lock(key_a);
+        assert!(
+            lock_a3.try_lock().is_err(),
+            "dropping one handle must not replace the lock while another handle still exists"
+        );
+        drop(guard);
+    }
+
+    #[test]
+    fn released_distinct_slot_locks_do_not_grow_the_registry() {
+        let _env_guard = ENV_MUTEX.blocking_lock();
+        let baseline = slot_lock_registry_len();
+        let baseline_capacity = slot_lock_registry_capacity();
+        let locks: Vec<_> = (0..64)
+            .map(|index| slot_lock(&format!("released-distinct-key-{index}")))
+            .collect();
+
+        assert_eq!(
+            slot_lock_registry_len(),
+            baseline + locks.len(),
+            "live handles must remain registered"
+        );
+        drop(locks);
+        assert_eq!(
+            slot_lock_registry_len(),
+            baseline,
+            "released handles must remove idle registry entries"
+        );
+        assert!(
+            slot_lock_registry_capacity() <= baseline_capacity,
+            "released handles must not retain registry capacity above its baseline"
+        );
     }
 
     /// An eviction pass for one key must not delete another key while that
