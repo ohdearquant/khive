@@ -14,8 +14,13 @@ document keeps them separate, because only one of them runs today.
 What `kkernel kg validate` actually executes today is the ADR-020 built-in structural checks
 plus an optional TOML RulePass: when `.khive/kg/rules.toml` exists and `--no-rules` is not set,
 each `[[rules]]` entry (`kind = "entity"` or `"edge"`, optional `condition`, optional
-`require_field`, `message` with `{id}` substitution) runs after the structural pass. Severity
-for these data-driven rules is configured per rule in `rules.toml`:
+`require_field`, `message` with `{id}` substitution) runs after the structural pass. The TOML
+file also accepts five opt-in named rule-class tables, evaluated after the generic `[[rules]]`
+entries: `edge_endpoint_types` (endpoint contract against the live pack/base allowlist),
+`edge_direction_conventions`, `dangling_refs`, `naming_conventions`, and `citation_date_lint`
+(full syntax: `RulesFile` in `crates/kkernel/src/kg/validate.rs` and the kg-rules guide,
+`crates/kkernel/docs/kg-rules.md`). Severity for these data-driven rules is configured per
+rule in `rules.toml`:
 
 - `Error` — `kkernel kg validate` exits with code 1.
 - `Warning` — reported; no exit-code effect unless `--strict`.

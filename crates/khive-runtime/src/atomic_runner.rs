@@ -4,9 +4,10 @@
 //! [`SqlAccess::atomic_unit`], under a per-op `SAVEPOINT`, committing every
 //! plan or rolling back the whole unit.
 //!
-//! Production caller: `kkernel exec --ops-file --atomic` (ADR-099 B3) — async
-//! prepare, then this runner's one synchronous commit pass, then async
-//! post-commit effects. See `docs/api/atomic_runner.md` for the full
+//! ADR-099 B3 caller: `kkernel exec --ops-file --atomic` — async prepare,
+//! then this runner's one synchronous commit pass, then async post-commit
+//! effects. Runtime callers also supply prepared plans directly (hard-delete
+//! in `operations.rs`). See `docs/api/atomic_runner.md` for the full
 //! three-phase shape (ADR-099 D1).
 //!
 //! # Safety: suspend-free invariant

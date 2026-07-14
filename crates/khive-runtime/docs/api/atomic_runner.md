@@ -8,7 +8,7 @@ module is one piece of, and its current wiring status.
 
 ## Wiring status (ADR-099 — B3 shipped)
 
-This module is the synchronous commit-pass piece of the shipped ADR-099 B3 flow. The production
+This module is the synchronous commit-pass piece of the shipped ADR-099 B3 flow. The ADR-099 B3
 caller is `kkernel exec --ops-file --atomic` (see `kkernel`'s `atomic_apply` module): it runs the
 parse-time admissibility check (B1), drives the async prepare pass (ops → `AtomicOpPlan`), calls
 `run_atomic_unit` here for the one synchronous commit pass (B2), then applies the async
@@ -18,6 +18,11 @@ governance verbs (`propose`, `review`, `withdraw`) remain conceptually admissibl
 ADR-099 D3 but are rejected up front as known-unimplemented (`ATOMIC_KNOWN_UNIMPLEMENTED_VERBS`
 in `khive-types`) — no full-parity prepare/apply seam exists for them yet. Embedding-bearing,
 read, or unlisted verbs are likewise rejected before any write.
+
+The CLI is not the runner's sole production consumer: runtime callers can also supply prepared
+plans directly — the hard-delete path (`atomic_hard_delete_with_edge_purge` in `operations.rs`)
+constructs a `DeletePlan` and invokes `run_atomic_unit` for its row-delete + incident-edge purge.
+Tests construct plans directly as well.
 
 ## Suspend-free invariant
 
@@ -43,8 +48,8 @@ proof).
 ## Two-phase shape (ADR-099 D1)
 
 Only the **commit pass** (phase 2) lives here: given an already-prepared `Vec<AtomicOpPlan>`
-(phase 1, the async prepare pass, is out of scope for B2 — a test-only caller constructs plans
-directly), `run_atomic_unit` opens one `atomic_unit`, applies each plan's statements under a
+(phase 1, the async prepare pass, is out of scope for B2), `run_atomic_unit` opens one
+`atomic_unit`, applies each plan's statements under a
 named `SAVEPOINT`, and returns either every op's collected `PostCommitEffect`s (phase 3, the
 async post-commit pass — the B3 wiring point: nothing in B2 executes these effects, a test
 consumer only drains the returned list) or the first op's failure and its index.
