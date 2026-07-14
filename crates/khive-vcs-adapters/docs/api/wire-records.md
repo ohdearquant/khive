@@ -20,6 +20,6 @@ responsibility.
 ## Error taxonomy
 
 `MissingField`, `InvalidField`, `Parse`, `UnknownKind`, and `UnknownRelation` are fatal record or
-source errors. `UnsupportedFormat` identifies formats deferred from this crate. Fatal errors are
+source errors. `NotYetImplemented` identifies formats deferred from this crate. Fatal errors are
 returned through iterator items and must be handled atomically by the import caller; non-fatal
 optional-field issues belong in `FormatAdapter::warnings()`.

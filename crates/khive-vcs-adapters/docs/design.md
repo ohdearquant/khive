@@ -6,7 +6,7 @@
 
 - This crate implements the format adapter layer of the two-stage KG import pipeline.
 - Adapters are pure transforms: they parse a source format and produce `EntityRecord`/`EdgeRecord`
-  streams with no database access and no ID generation side-effects.
+  streams with no database access; records missing an ID receive a freshly generated UUID at parse time.
 - Fatal errors (missing required fields, unknown kinds/relations, out-of-range weights) abort the
   iterator immediately. Non-fatal warnings accumulate in `FormatAdapter::warnings()` and are
   available after the iterator is exhausted.
@@ -28,8 +28,8 @@
 
 ### ADR-001: Entity Kind Taxonomy
 
-- `EntityRecord.kind` must be one of the 8 canonical entity kinds: `concept`, `document`,
-  `dataset`, `project`, `person`, `org`, `artifact`, `service`.
+- `EntityRecord.kind` must be one of the 9 canonical entity kinds: `concept`, `document`,
+  `dataset`, `project`, `person`, `org`, `artifact`, `service`, `resource`.
 - Validation uses `khive_types::EntityKind::from_str` at parse time, which also handles
   recognized aliases (e.g. `paper` → `document`).
 - Unknown kinds produce `AdapterError::UnknownKind` — never silently defaulted.
@@ -37,7 +37,7 @@
 
 ### Edge Ontology (ADR-002)
 
-- `EdgeRecord.relation` must be one of the 15 canonical edge relations.
+- `EdgeRecord.relation` must be one of the 17 canonical relations (ADR-002 base 15 plus the ADR-055 epistemic pair).
 - Validation uses `khive_types::EdgeRelation::from_str` at parse time.
 - Unknown relations always produce `AdapterError::UnknownRelation`, regardless of schema mode.
 - `EdgeRecord.weight` must be finite and in `[0.0, 1.0]`. Out-of-range values produce

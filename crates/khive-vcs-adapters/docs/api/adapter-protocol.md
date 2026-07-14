@@ -2,14 +2,14 @@
 
 Format adapters are pure transforms from external data into the intermediate entity and edge
 records consumed by khive's two-stage KG import pipeline. The protocol follows
-[ADR-020](../../../docs/adr/ADR-020-git-native-kg-implementation.md) and
-[ADR-036](../../../docs/adr/ADR-036-kg-import-export-adapters.md).
+[ADR-020](../../../../docs/adr/ADR-020-git-native-kg-implementation.md) and
+[ADR-036](../../../../docs/adr/ADR-036-kg-import-export-adapters.md).
 
 ## Pipeline
 
 ```text
 source file
-    | adapter (pure transform — no DB access, no ID generation)
+    | adapter (pure transform — no DB access; missing IDs are minted fresh)
 intermediate NDJSON (EntityRecord + EdgeRecord, in-memory)
     | khive kg import (validates + loads into working.db)
 working.db
@@ -18,8 +18,7 @@ working.db
 ## `FormatAdapter`
 
 An adapter reports its short format `name`, exposes separate `entities` and `edges` iterators,
-and accumulates non-fatal issues in `warnings`. Implementations write no database state and do not
-generate IDs. Record-level fatal errors remain in the iterator as `AdapterError` values.
+and accumulates non-fatal issues in `warnings`. Implementations write no database state. IDs are accepted when supplied and validated as UUIDs; when an entity omits `id` or an edge omits `edge_id`/`id`, the adapter mints a fresh `Uuid::new_v4()` for that record, so ID-free input is not deterministic across parses. Record-level fatal errors remain in the iterator as `AdapterError` values.
 
 The current modules divide responsibilities as follows: `adapter` defines the trait,
 `json_adapter` implements JSON-array parsing, `record` defines the intermediate wire shapes, and
@@ -28,9 +27,9 @@ The current modules divide responsibilities as follows: `adapter` defines the tr
 
 ## Taxonomy invariants
 
-- `EntityRecord.kind` — must be one of the 8 ADR-001 canonical kinds; validated via
+- `EntityRecord.kind` — must be one of the 9 canonical kinds (ADR-001 base plus the ADR-048 `resource` kind); validated via
   `khive_types::EntityKind::from_str` at parse time. Unknown kinds return `AdapterError::UnknownKind`.
-- `EdgeRecord.relation` — must be one of the 15 ADR-002 canonical relations; validated via
+- `EdgeRecord.relation` — must be one of the 17 canonical relations (ADR-002 base 15 plus the ADR-055 epistemic pair `supports`/`refutes`); validated via
   `khive_types::EdgeRelation::from_str` at parse time. Unknown relations return `AdapterError::UnknownRelation`.
 - `EdgeRecord.weight` — must be finite and in `[0.0, 1.0]`. Out-of-range values return
   `AdapterError::InvalidField`. Default when absent: `0.7`.

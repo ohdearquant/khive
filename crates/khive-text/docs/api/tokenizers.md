@@ -5,7 +5,7 @@ optional Unicode word boundaries.
 
 ## `WhitespaceTokenizer`
 
-Splits on ASCII whitespace, removes leading and trailing ASCII punctuation, and drops empty tokens.
+Splits on Unicode whitespace, removes leading and trailing ASCII punctuation, and drops empty tokens.
 It performs no case normalization.
 
 ## `CjkCharTokenizer`

@@ -6,8 +6,9 @@ search. This reference describes construction, mutation, serialization, and reco
 ## Configuration and construction
 
 `Bm25Config::try_new(k1, b)` rejects non-finite or negative `k1` and any `b` outside `[0, 1]`.
-`Bm25Config::new` and `Bm25Index::new` are convenience constructors that panic on invalid inputs;
-callers handling untrusted configuration should use `try_new`. Defaults are `k1 = 1.2` and
+`Bm25Config::new` stores the values unchecked — it neither validates nor panics. The deprecated
+`Bm25Index::new` validates and panics on invalid inputs; callers handling untrusted
+configuration should use `try_new`. Defaults are `k1 = 1.2` and
 `b = 0.75`.
 
 `Bm25Index::try_with_tokenizer` applies the same validation while installing a caller-supplied

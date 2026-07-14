@@ -22,5 +22,5 @@ consumers never need to distinguish absence from an empty array.
 ## `AuditEvent::from_check`
 
 The constructor copies actor, namespace, verb, backend name, and optional session ID from the
-request, stamps the current UTC time, and projects the decision. Allow carries its obligations and
+request, uses the request-context timestamp when supplied (stamping the current UTC time only when it is absent), and projects the decision. Allow carries its obligations and
 no deny reason; deny carries its reason and an empty obligation array.

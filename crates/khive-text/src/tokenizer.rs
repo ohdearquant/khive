@@ -4,7 +4,7 @@ use crate::identifier::{is_identifier, split_identifier};
 use crate::lang::is_cjk_char;
 use crate::Tokenizer;
 
-/// Splits on ASCII whitespace, trims leading/trailing ASCII punctuation from
+/// Splits on Unicode whitespace, trims leading/trailing ASCII punctuation from
 /// each token, and drops empty results.
 ///
 /// See `crates/khive-text/docs/api/tokenizers.md`.
