@@ -62,7 +62,7 @@ fn deser<T: serde::de::DeserializeOwned>(params: Value) -> Result<T, RuntimeErro
 }
 
 /// Validates `at` is an RFC 3339 timestamp lying in the future; returns the
-/// parsed instant. See `docs/replay-validation.md#validate_at` for accepted
+/// parsed instant. See `docs/api/replay-validation.md#validate_at` for accepted
 /// formats and rationale.
 fn validate_at(verb: &str, at: &str) -> Result<DateTime<Utc>, RuntimeError> {
     let parsed = at.parse::<DateTime<Utc>>().map_err(|_| {
@@ -81,7 +81,7 @@ fn validate_at(verb: &str, at: &str) -> Result<DateTime<Utc>, RuntimeError> {
 
 /// Validates a repeat spec: `daily`/`weekly`/`monthly`, or a limited 5-field
 /// `MIN HOUR DOM MON DOW` cron-lite form (no steps/ranges/lists — issue
-/// #481). See `docs/replay-validation.md#validate_repeat` for field ranges
+/// #481). See `docs/api/replay-validation.md#validate_repeat` for field ranges
 /// and rationale.
 fn validate_repeat(repeat: &str) -> Result<(), RuntimeError> {
     match repeat {
@@ -146,7 +146,7 @@ fn validate_action(action: &str) -> Result<khive_request::ParsedRequest, Runtime
 /// stored (issue #461): single op, exactly-registered handler, literal args
 /// only, all required params present, and no handler that treats
 /// `namespace` as a business arg (issue #461/#462). See
-/// `docs/replay-validation.md#validate_replayable_single_action`.
+/// `docs/api/replay-validation.md#validate_replayable_single_action`.
 fn validate_replayable_single_action(
     parsed: &khive_request::ParsedRequest,
     registry: &VerbRegistry,
@@ -181,7 +181,7 @@ fn validate_replayable_single_action(
     }
 
     // Reject handlers whose schema declares `namespace` as a business param
-    // (issue #461/#462) — see docs/replay-validation.md#validate_replayable_single_action.
+    // (issue #461/#462) — see docs/api/replay-validation.md#validate_replayable_single_action.
     let handler_accepts_namespace =
         help.get("params")
             .and_then(Value::as_array)
@@ -208,7 +208,7 @@ fn validate_replayable_single_action(
 /// required param even though `describe_verb` marks none of the
 /// alternatives `required:true` (issue #461) — hard-codes the `create`
 /// kind/name/content cases. See
-/// `docs/replay-validation.md#validate_conditional_requirements`.
+/// `docs/api/replay-validation.md#validate_conditional_requirements`.
 fn validate_conditional_requirements(
     tool: &str,
     args: &std::collections::BTreeMap<String, khive_request::ArgValue>,
@@ -331,7 +331,7 @@ enum CreateKindClass {
 /// Classifies a `create(kind=...)` value mirroring
 /// `khive-pack-kg::handlers::common::resolve_kind_spec`; errors on any kind
 /// guaranteed to fail replay (`edge`, `event`, `proposal`, unrecognized). See
-/// `docs/replay-validation.md#classify_create_kind`.
+/// `docs/api/replay-validation.md#classify_create_kind`.
 fn classify_create_kind(
     raw: &str,
     registry: &VerbRegistry,
@@ -393,7 +393,7 @@ fn classify_create_kind(
 
 /// Canonicalizes a legacy `entity_kind` value mirroring
 /// `khive-pack-kg::handlers::common::canonical_entity_kind`. See
-/// `docs/replay-validation.md#canonical_entity_kind_for_replay-canonical_note_kind_for_replay`.
+/// `docs/api/replay-validation.md#canonical_entity_kind_for_replay-canonical_note_kind_for_replay`.
 fn canonical_entity_kind_for_replay(
     raw: &str,
     registry: &VerbRegistry,
@@ -439,7 +439,7 @@ fn canonical_note_kind_for_replay(
 /// `khive-pack-kg::vocab::EntityKind`'s `FromStr` arm (that type is
 /// pack-private). `normalized` must already be trimmed + lowercased. Kept in
 /// sync with the CI-checked `entity_kind_resource_aliases_match_real_vocab`
-/// test. See `docs/replay-validation.md#resource_alias_for_replay`.
+/// test. See `docs/api/replay-validation.md#resource_alias_for_replay`.
 fn resource_alias_for_replay(normalized: &str) -> bool {
     matches!(
         normalized,
@@ -452,7 +452,7 @@ fn resource_alias_for_replay(normalized: &str) -> bool {
 /// resolving subtypes against the boot-time composed registry (builtin +
 /// every loaded pack's `ENTITY_TYPES`), not the builtin-only
 /// `EntityTypeRegistry::global()`. See
-/// `docs/replay-validation.md#validate_entity_type_for_replay`.
+/// `docs/api/replay-validation.md#validate_entity_type_for_replay`.
 fn validate_entity_type_for_replay(
     canonical_kind_name: &str,
     entity_type: Option<&str>,
@@ -476,7 +476,7 @@ fn validate_entity_type_for_replay(
 /// `entity_kind`/`note_kind` argument, mirroring
 /// `khive-pack-kg::handlers::common::reconcile_specific` exactly. `context`
 /// prefixes error messages (e.g. `"items[3] "` for a bulk entry). See
-/// `docs/replay-validation.md#reconcile_specific_for_replay`.
+/// `docs/api/replay-validation.md#reconcile_specific_for_replay`.
 fn reconcile_specific_for_replay(
     context: &str,
     spec_specific: Option<String>,
