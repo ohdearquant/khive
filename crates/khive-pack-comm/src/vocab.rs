@@ -3,7 +3,7 @@
 use khive_types::{HandlerDef, ParamDef, Visibility};
 
 /// Pack-auxiliary indexes for comm inbox and thread queries (idempotent). See
-/// crates/khive-pack-comm/docs/handlers.md#vocabrscomm_schema_plan_stmts for
+/// crates/khive-pack-comm/docs/api/message-lifecycle.md#vocabrscomm_schema_plan_stmts for
 /// why they filter on `deleted_at IS NULL` rather than a literal `kind` value,
 /// and why `idx_comm_message_external_id` is deliberately absent from this list.
 pub(crate) static COMM_SCHEMA_PLAN_STMTS: [&str; 4] = [
@@ -26,7 +26,7 @@ pub(crate) static COMM_SCHEMA_PLAN_STMTS: [&str; 4] = [
 
 /// Pack-owned auxiliary cursor table for durable channel poll progress (issue
 /// #449), idempotent (`CREATE TABLE IF NOT EXISTS`). See
-/// crates/khive-pack-comm/docs/handlers.md#vocabrscomm_channel_cursor_schema_stmt
+/// crates/khive-pack-comm/docs/api/probe-cursor.md#vocabrscomm_channel_cursor_schema_stmt
 pub(crate) const COMM_CHANNEL_CURSOR_SCHEMA_STMT: &str =
     "CREATE TABLE IF NOT EXISTS comm_channel_cursor (\
     channel_kind TEXT NOT NULL CHECK (length(trim(channel_kind)) > 0),\

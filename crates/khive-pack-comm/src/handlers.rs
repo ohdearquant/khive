@@ -43,7 +43,7 @@ fn validate_actor_label(verb: &str, label: &str, field: &str) -> Result<(), Runt
 /// `send` — create a message note in the caller's namespace (outbound) AND
 /// deliver an inbound copy addressed to the actor label in `to` (ADR-057).
 /// Both copies land in the caller's namespace; no cross-namespace write occurs.
-/// See crates/khive-pack-comm/docs/handlers.md#handlersrshandle_send
+/// See crates/khive-pack-comm/docs/api/message-lifecycle.md#handlersrshandle_send
 pub(crate) async fn handle_send(
     runtime: &KhiveRuntime,
     token: &NamespaceToken,
@@ -72,7 +72,7 @@ pub(crate) async fn handle_send(
     // #820: reject a target that collapses onto the sender's own actor identity
     // unless self_send=true — usually a sub-agent/parent mis-resolution, not intent.
     // "local" is exempt (anonymous single-tenant party-line default).
-    // See crates/khive-pack-comm/docs/handlers.md#handlersrshandle_send
+    // See crates/khive-pack-comm/docs/api/message-lifecycle.md#handlersrshandle_send
     if to_actor == from_actor && to_actor != "local" && !p.self_send {
         return Err(RuntimeError::InvalidInput(format!(
             "send: `to` ({to_actor:?}) resolves to the sender's own actor identity \
@@ -131,7 +131,7 @@ pub(crate) async fn handle_send(
 }
 
 /// `inbox` — list inbound messages for the caller's actor label (ADR-057).
-/// See crates/khive-pack-comm/docs/handlers.md#handlersrshandle_inbox
+/// See crates/khive-pack-comm/docs/api/message-lifecycle.md#handlersrshandle_inbox
 pub(crate) async fn handle_inbox(
     runtime: &KhiveRuntime,
     token: &NamespaceToken,
@@ -200,7 +200,7 @@ pub(crate) async fn handle_inbox(
     let store = runtime.notes(token)?;
 
     // #493: `FilterOp` has no prefix-match op, so a sender filter is applied in Rust
-    // over paged results (see docs/handlers.md#handlersrshandle_inbox) instead of SQL.
+    // over paged results (see docs/api/message-lifecycle.md#handlersrshandle_inbox) instead of SQL.
     let messages: Vec<Value> = if p.from_actor.is_some() || p.from_prefix.is_some() {
         const PAGE_SIZE: u32 = 200;
         let mut collected: Vec<Value> = Vec::new();
@@ -302,7 +302,7 @@ pub(crate) async fn handle_read(
     }
 
     // Patch via a real `UPDATE`, not `upsert_note`'s `INSERT OR REPLACE` (#780
-    // silently re-inserts the row on conflict). See docs/handlers.md#handlersrshandle_read
+    // silently re-inserts the row on conflict). See docs/api/message-lifecycle.md#handlersrshandle_read
     let mut props = note.properties.clone().unwrap_or_else(|| json!({}));
     props["read"] = json!(true);
     let updated_at = Utc::now().timestamp_micros();
@@ -318,7 +318,7 @@ pub(crate) async fn handle_read(
 }
 
 /// `reply` — reply to a message, threading linkage. See
-/// crates/khive-pack-comm/docs/handlers.md#handlersrshandle_reply
+/// crates/khive-pack-comm/docs/api/message-lifecycle.md#handlersrshandle_reply
 pub(crate) async fn handle_reply(
     runtime: &KhiveRuntime,
     token: &NamespaceToken,
@@ -358,7 +358,7 @@ pub(crate) async fn handle_reply(
         .unwrap_or_else(|| json!({}));
 
     // Issue #403: parent's wire Message-ID drives In-Reply-To/References for native
-    // mail clients. `None` when the parent has none — see docs/handlers.md.
+    // mail clients. `None` when the parent has none — see docs/api/message-lifecycle.md.
     let in_reply_to_message_id = parent_wire_message_id(&orig_props);
 
     // References carries the FULL ancestor chain per RFC 5322, not just the parent.
@@ -464,7 +464,7 @@ pub(crate) async fn handle_reply(
 /// chronologically: the originating message plus all messages whose
 /// `properties.thread_id` equals the root UUID. The root ID is validated: it
 /// must exist in the caller namespace and its `kind` must be `"message"`.
-/// See crates/khive-pack-comm/docs/handlers.md#handlersrshandle_thread
+/// See crates/khive-pack-comm/docs/api/message-lifecycle.md#handlersrshandle_thread
 pub(crate) async fn handle_thread(
     runtime: &KhiveRuntime,
     token: &NamespaceToken,
@@ -511,7 +511,7 @@ pub(crate) async fn handle_thread(
         // Cross-namespace root resolution: use the stored thread_id as canonical root
         // when it differs from the note's own UUID (dual_write_message patches both
         // copies to match); falls back to the note's own UUID otherwise (issue #479b,
-        // ADR-040). See crates/khive-pack-comm/docs/handlers.md#handlersrshandle_thread
+        // ADR-040). See crates/khive-pack-comm/docs/api/message-lifecycle.md#handlersrshandle_thread
         let canonical = match note
             .properties
             .as_ref()
@@ -581,7 +581,7 @@ pub(crate) async fn handle_thread(
     }
 
     // #494: `after` cursor — message id or RFC 3339 timestamp; a hard error if
-    // neither. See crates/khive-pack-comm/docs/handlers.md#handlersrshandle_thread
+    // neither. See crates/khive-pack-comm/docs/api/message-lifecycle.md#handlersrshandle_thread
     let after_cursor: Option<AfterCursor> = match p.after.as_deref() {
         None => None,
         Some(raw) => {
@@ -678,7 +678,7 @@ enum AfterCursor {
 /// `Visibility::Subhandler`: not accessible via the MCP wire, only callable
 /// in-process (e.g. the polling loop in `khive-mcp`); the authoritative write
 /// path for all channel-delivered messages. See
-/// crates/khive-pack-comm/docs/handlers.md#handlersrshandle_ingest
+/// crates/khive-pack-comm/docs/api/message-lifecycle.md#handlersrshandle_ingest
 pub(crate) async fn handle_ingest(
     runtime: &KhiveRuntime,
     token: &NamespaceToken,
@@ -723,7 +723,7 @@ pub(crate) async fn handle_ingest(
 
     // Thread resolution: resolve correlation_external_id to the original message's
     // thread_id + from_actor. Two-query fallback (Message-ID pass, then thread-UUID
-    // pass) — see crates/khive-pack-comm/docs/handlers.md#handlersrshandle_ingest
+    // pass) — see crates/khive-pack-comm/docs/api/message-lifecycle.md#handlersrshandle_ingest
     let resolved: Option<(String, String)> = if let Some(ref corr) = p.correlation_external_id {
         if !corr.is_empty() {
             // Pass 1: match by $.external_id (RFC 822 Message-ID, standard In-Reply-To path).
@@ -941,7 +941,7 @@ pub(crate) async fn handle_ingest(
 /// `(namespace, channel_kind, channel_slug)` triple (khive #606). Hashes the
 /// triple as a JSON array (not a `:`-joined string, which is not injective
 /// when a component itself contains `:`). See
-/// crates/khive-pack-comm/docs/handlers.md#handlersrsheartbeat_note_id
+/// crates/khive-pack-comm/docs/api/channel-health.md#handlersrsheartbeat_note_id
 fn heartbeat_note_id(namespace: &str, channel_kind: &str, channel_slug: &str) -> Uuid {
     let key = serde_json::to_vec(&(
         "khive:channel_health",
@@ -1001,7 +1001,7 @@ pub(crate) async fn handle_heartbeat(
 
     // #606: heartbeat rows are OPERATIONAL, not message data — always persist to
     // `CHANNEL_HEALTH_NAMESPACE`, never `token.namespace()` (never read back by
-    // `handle_health`'s #877 namespace-scoped read either; see docs/handlers.md).
+    // `handle_health`'s #877 namespace-scoped read either; see docs/api/channel-health.md).
     let ns = crate::CHANNEL_HEALTH_NAMESPACE;
     let store = runtime.notes(token)?;
     let id = heartbeat_note_id(ns, &p.channel_kind, &p.channel_slug);
@@ -1104,7 +1104,7 @@ fn channel_health_to_json(note: &Note) -> Value {
 /// `health` — read-only per-channel health snapshot (khive #606). Reads
 /// `channel_health` rows from `token.namespace()` (khive #877 namespace
 /// scoping); never returns a computed `healthy: bool` — that judgment belongs
-/// to the caller. See crates/khive-pack-comm/docs/handlers.md#handlersrshandle_health
+/// to the caller. See crates/khive-pack-comm/docs/api/channel-health.md#handlersrshandle_health
 /// for the `role`/`namespace`/`resource` field semantics (ADR-103 Stage 1).
 ///
 /// `resource` is a process-level self-report of this process's own CPU/RSS
@@ -1203,7 +1203,7 @@ pub(crate) struct ProbeMessage {
 /// `cursor_us`/`since_us` are keyed on `notes_seq.seq`, NOT `created_at` or
 /// SQLite `rowid` — both can regress/collide across concurrent writers, VACUUM,
 /// or hard-delete. Do not revert to either. See
-/// crates/khive-pack-comm/docs/handlers.md#handlersrsprobe_sql for the full
+/// crates/khive-pack-comm/docs/api/probe-cursor.md#handlersrsprobe_sql for the full
 /// #780/#827 incident history.
 const PROBE_SQL: &str = "WITH \
 stats AS ( \
@@ -1291,7 +1291,7 @@ pub(crate) async fn handle_probe(
 
 /// A caller-supplied `since_us` above `notes_seq`'s durable high-water mark
 /// cannot be a genuine cursor — it must be a pre-upgrade persisted-timestamp
-/// cursor (#827). See crates/khive-pack-comm/docs/handlers.md#handlersrsnotes_seq_high_water_mark
+/// cursor (#827). See crates/khive-pack-comm/docs/api/probe-cursor.md#handlersrsnotes_seq_high_water_mark
 async fn notes_seq_high_water_mark(
     reader: &mut Box<dyn khive_storage::sql::SqlReader>,
 ) -> Result<i64, RuntimeError> {
@@ -1581,7 +1581,7 @@ pub(crate) async fn handle_cursor_commit(
 
 /// Candidate `$.external_id` values (as received, plus bracket-toggled) to
 /// match an inbound correlation key against. See
-/// crates/khive-pack-comm/docs/handlers.md#message-id--references-header-helpers-403
+/// crates/khive-pack-comm/docs/api/message-lifecycle.md#message-id--references-header-helpers-403
 fn message_id_match_candidates(corr: &str) -> Vec<String> {
     let bare = corr
         .strip_prefix('<')
@@ -1628,7 +1628,7 @@ fn parent_wire_message_id(orig_props: &Value) -> Option<String> {
 /// (inbound: `wire_references`; outbound: `references_chain`). `None` when
 /// the parent has no chain to extend (RFC 5322: caller then falls back to the
 /// parent's Message-ID alone). See
-/// crates/khive-pack-comm/docs/handlers.md#message-id--references-header-helpers-403
+/// crates/khive-pack-comm/docs/api/message-lifecycle.md#message-id--references-header-helpers-403
 fn parent_references_chain(orig_props: &Value) -> Option<&str> {
     let direction = orig_props.get("direction").and_then(Value::as_str);
     let raw = if direction == Some("outbound") {

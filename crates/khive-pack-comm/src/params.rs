@@ -19,7 +19,7 @@ pub(crate) struct SendParams {
     #[serde(default)]
     pub tags: Option<Vec<String>>,
     /// Opt-in to send to one's own actor identity (khive #820). See
-    /// crates/khive-pack-comm/docs/handlers.md#paramsrs-field-notes
+    /// crates/khive-pack-comm/docs/api/message-lifecycle.md#handlersrshandle_send
     #[serde(default)]
     pub self_send: bool,
 }
@@ -71,7 +71,7 @@ pub(crate) struct ThreadParams {
     #[serde(default)]
     pub order: Option<String>,
     /// Message id or RFC 3339 timestamp cursor. See
-    /// crates/khive-pack-comm/docs/handlers.md#handlersrshandle_thread
+    /// crates/khive-pack-comm/docs/api/message-lifecycle.md#handlersrshandle_thread
     #[serde(default)]
     pub after: Option<String>,
 }
@@ -80,7 +80,7 @@ pub(crate) struct ThreadParams {
 /// channel adapter. `deny_unknown_fields` is intentionally absent (forward-
 /// compat with future handler fields); `namespace` is consumed by
 /// `VerbRegistry::dispatch`, not read from this struct. See
-/// crates/khive-pack-comm/docs/handlers.md#paramsrs-field-notes
+/// crates/khive-pack-comm/docs/api/message-lifecycle.md#handlersrshandle_ingest
 #[derive(Deserialize)]
 pub(crate) struct IngestParams {
     /// Sender address in `channel-kind:addr` form.
@@ -119,7 +119,8 @@ pub(crate) struct IngestParams {
     #[serde(default)]
     pub wire_references: Option<String>,
     /// Transport-layer metadata passthrough, merged verbatim into the stored
-    /// note's properties. Generic and channel-agnostic — see docs/handlers.md.
+    /// note's properties. Generic and channel-agnostic — see
+    /// docs/api/message-lifecycle.md#handlersrshandle_ingest.
     #[serde(default)]
     pub metadata: Option<serde_json::Map<String, Value>>,
 }
