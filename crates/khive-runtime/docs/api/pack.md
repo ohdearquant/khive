@@ -1,8 +1,11 @@
-# pack.rs — extended rationale
+# Pack Runtime Integration Points
 
-Long-form rationale extracted from `crates/khive-runtime/src/pack.rs` doc-comments during the
-rustdoc condense pass. Each section links back to the item whose in-source doc-comment now
-carries only the standalone contract plus a one-line pointer here.
+`pack.rs` defines the `PackRuntime` trait — the hooks a pack implements to integrate with a
+`KhiveRuntime` (embedders, entity-type validators, note-mutation notifications) — and the
+`VerbRegistry` dispatch surface that routes a verb call through gate, audit, and namespace
+resolution before reaching a pack handler. Each section below is the extended technical contract
+for one hook or dispatch-path function; the in-source doc-comment on each item carries only the
+concise standalone summary plus a pointer here.
 
 ## register_embedders
 

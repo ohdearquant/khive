@@ -4,29 +4,20 @@
 //! transaction; commit later applies its statements as DML under a per-op
 //! SAVEPOINT. This module defines the plan *shapes* only, one family per
 //! admissible verb group (`update`, `delete`, `link`, `merge`,
-//! `gtd.transition`, `gtd.complete`, the governance verbs): not yet wired
-//! into a live handler or the dispatch path.
+//! `gtd.transition`, `gtd.complete`, the governance verbs) — not yet wired
+//! into a live handler or the dispatch path. Every plan is deliberately
+//! inert (plain data, no async, no embedding reference).
 //!
-//! Every plan is deliberately inert (plain data, no async, no embedding
-//! reference) and exists to satisfy two validation-staleness rules:
+//! Two validation-staleness invariants every plan must satisfy:
+//! 1. **Predicate-based plans** carry an "all rows matching a condition"
+//!    effect as a statement evaluated inside the transaction
+//!    (`PlanPredicate`), never as a prepare-time-enumerated row list.
+//! 2. **Affected-row guards** (`PlanStatement::guard`) are attached to the
+//!    exact statement they validate, checked in-transaction; a mismatch
+//!    fails the op and rolls back the whole unit.
 //!
-//! 1. **Predicate-based plans** — a plan whose effect covers "all rows
-//!    matching a condition" carries that condition as a statement evaluated
-//!    inside the transaction, never as a prepare-time-enumerated row list
-//!    (`PlanPredicate`).
-//! 2. **Affected-row guards** — any statement whose prepare-time validation
-//!    assumed a target row exists carries an expected-effect guard, checked
-//!    in-transaction; a mismatch fails the op and rolls back the whole unit
-//!    (`PlanStatement::guard`).
-//!
-//! A guard is attached to the exact [`PlanStatement`] it validates, never to
-//! the plan as a whole: affected-row counts come back per-statement or as a
-//! batch total, so a plan-level guard field could not tell a runner which
-//! statement's count it is checking. Each plan therefore carries
-//! `Vec<PlanStatement>` (or, for `merge`, the split `rewires`/`lifecycle`
-//! fields below), and the runner applies each statement individually,
-//! checking any present guard against that statement's own affected-row
-//! count before moving to the next.
+//! See `docs/atomic-plan.md` for why guards are per-statement rather than
+//! per-plan.
 
 use uuid::Uuid;
 

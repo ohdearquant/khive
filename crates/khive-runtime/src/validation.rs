@@ -124,7 +124,7 @@ pub struct GraphPatch;
 /// A pack-contributed validation rule.
 ///
 /// Rule IDs must follow the `<pack>/<rule-id>` namespace convention.
-/// See `docs/validation.md` for declaration examples and severity override rules.
+/// See `docs/api/validation.md` for declaration examples and severity override rules.
 pub struct ValidationRule {
     /// Stable rule identifier in `<pack>/<rule-id>` format.
     pub id: RuleId,

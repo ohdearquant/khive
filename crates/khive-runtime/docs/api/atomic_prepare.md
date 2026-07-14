@@ -1,9 +1,12 @@
-# atomic_prepare.rs — extended rationale
+# Atomic Prepare — DML Plan Builders
 
-Long-form rationale extracted from `crates/khive-runtime/src/atomic_prepare.rs` doc-comments
-during the rustdoc condense pass.
+`atomic_prepare.rs` turns a subset of verb calls into a static, guarded DML plan
+(`crate::atomic_plan::PlanStatement`s) that the `--atomic` execution path can run inside one
+transaction without invoking the normal async handler. This document covers which verbs are
+in scope, why some are deliberately excluded, and the DML-shape parity guarantees for the
+functions that build those plans.
 
-## module-scope
+## Scope: what is excluded and why
 
 `gtd.transition` / `gtd.complete` prepare is deliberately **not** here: their lifecycle
 vocabulary (`is_terminal`, `can_transition`, ...) lives in `khive-pack-gtd`, which depends on
