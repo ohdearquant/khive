@@ -82,10 +82,8 @@ pub(crate) fn validate_entity_type(
     let kind = kind_name
         .parse::<khive_types::EntityKind>()
         .map_err(|_| RuntimeError::InvalidInput(format!("unknown entity kind {kind_name:?}")))?;
-    // Composed from the builtin registry plus every loaded pack's declared
-    // ENTITY_TYPES (ADR-017 additive composition, mirroring EDGE_RULES) —
-    // NOT `EntityTypeRegistry::global()`, which only knows builtin subtypes
-    // and is blind to pack-declared extras (e.g. git's `adr` Document subtype).
+    // ADR-017 additive composition (not `EntityTypeRegistry::global()`); see
+    // docs/handlers-common.md#validate_entity_type.
     let composed = EntityTypeRegistry::with_extra(registry.all_entity_types());
     let resolved = composed.resolve(kind, Some(raw))?;
     Ok(resolved.entity_type)
@@ -93,12 +91,9 @@ pub(crate) fn validate_entity_type(
 
 // ---- Granular `kind` discriminator ----
 
-/// Resolved shape of a `kind` discriminator string.
-///
-/// `pub` (widened from `pub(crate)`, ADR-099 B3): the
-/// `--atomic` seam in `kkernel` reuses [`resolve_kind_spec`] and this type to
-/// resolve a caller-supplied `delete(kind=...)` the SAME way `handle_delete`
-/// does, rather than re-deriving kind-vocabulary resolution.
+/// Resolved shape of a `kind` discriminator string: which substrate (entity, note,
+/// edge, event, proposal) it names, plus the specific granular kind if any.
+/// See `docs/handlers-common.md` for why this is `pub` rather than `pub(crate)`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum KindSpec {
     Entity { specific: Option<String> },
@@ -120,10 +115,14 @@ impl KindSpec {
     }
 }
 
-/// Resolve a wire-level `kind` value into a [`KindSpec`].
+/// Resolve a wire-level `kind` value into a [`KindSpec`]. Accepts a bare substrate
+/// name (`entity`, `note`, `edge`, `event`, `proposal`) or a granular entity/note kind
+/// registered on `registry`.
 ///
-/// `pub` (widened from `pub(crate)`, ADR-099 B3),
-/// see [`KindSpec`]'s doc comment.
+/// # Errors
+///
+/// Returns [`RuntimeError::InvalidInput`] listing every valid value if `raw` matches
+/// neither a substrate name nor a registered granular kind.
 pub fn resolve_kind_spec(raw: &str, registry: &VerbRegistry) -> Result<KindSpec, RuntimeError> {
     let normalized = raw.trim().to_ascii_lowercase();
 
@@ -271,17 +270,16 @@ pub(crate) async fn resolve_uuid_async(
     resolve_name_async(s, runtime, token).await
 }
 
-/// By-ID contract (ADR-007 Rev 6): UUID resolution for get/update/delete/merge
-/// is namespace-agnostic — the Gate is the authz seam, not storage-layer
-/// filtering. Full-UUID inputs were already unfiltered (`resolve_by_id`); this
-/// closes the gap for the *prefix* form, which previously fell through to the
-/// primary-namespace-only `resolve_prefix` and was invisible for any row
-/// stamped with a non-primary namespace (#391 §3). Exact copy of
-/// `resolve_uuid_async` except the prefix branch.
+/// Resolve `s` (a full UUID, an 8+ hex-digit UUID prefix, or an entity name) to a
+/// [`Uuid`], namespace-agnostic (ADR-007 Rev 6 by-ID contract — no namespace filtering
+/// is applied to the prefix or full-UUID forms; name resolution still scopes to
+/// `token`'s namespace).
 ///
-/// `pub` (widened from `pub(crate)`, ADR-099 B3), so
-/// kkernel's `--atomic` seam can resolve KG ids (full UUID / 8+ hex prefix /
-/// entity-name) with the exact same semantics as the canonical handlers.
+/// # Errors
+///
+/// [`RuntimeError::InvalidInput`] if a hex-prefix matches no record;
+/// [`RuntimeError::NotFound`]/[`RuntimeError::Ambiguous`] from name resolution.
+/// See `docs/handlers-common.md` for the ADR-099 B3 pub-widening rationale.
 pub async fn resolve_uuid_unfiltered(
     s: &str,
     runtime: &KhiveRuntime,
@@ -304,13 +302,13 @@ pub async fn resolve_uuid_unfiltered(
     resolve_name_async(s, runtime, token).await
 }
 
-/// `resolve_uuid_unfiltered`, including soft-deleted rows — used by the
-/// hard-delete by-ID path (#391 §3). Exact copy of
-/// `resolve_uuid_including_deleted` except the prefix branch.
+/// Same as [`resolve_uuid_unfiltered`], but the prefix-resolution branch also matches
+/// soft-deleted rows. Used by the hard-delete by-ID path (#391 §3), which must be able
+/// to target a record regardless of its `deleted_at` state.
 ///
-/// `pub` (widened from `pub(crate)`, ADR-099 B3), for
-/// the same reason as `resolve_uuid_unfiltered` above; used by the atomic
-/// hard-delete id-resolution path.
+/// # Errors
+///
+/// Same error conditions as [`resolve_uuid_unfiltered`].
 pub async fn resolve_uuid_unfiltered_including_deleted(
     s: &str,
     runtime: &KhiveRuntime,
@@ -415,27 +413,9 @@ pub(crate) fn validate_weight(weight: Option<f64>) -> Result<f64, RuntimeError> 
     Ok(w)
 }
 
-/// Relations valid for a `(src_kind, src_entity_type, tgt_kind,
-/// tgt_entity_type)` entity pair, derived from the SAME sources
-/// `validate_edge_relation_endpoints` consults when accepting or rejecting a
-/// link (issue #543): the base entity endpoint allowlist
-/// (`khive_runtime::operations::base_entity_endpoint_rules`) plus the
-/// runtime's live composed pack `EDGE_RULES`, matched through
-/// `khive_runtime::operations::accepted_pack_relations_for_entities` — the
-/// same `endpoint_matches` semantics `pack_rule_allows` applies internally
-/// (`EntityOfKind`, `EntityOfType`, `NoteOfKind`). There is no separate
-/// hand-authored table and no local re-filter of endpoint kinds here: a hint
-/// can no longer diverge from what the validator itself accepts, including
-/// pack rules scoped to a granular `entity_type` (e.g. `khive-pack-formal`'s
-/// typed `theorem -> definition` `depends_on` rule).
-///
-/// Note-scoped pack rules (e.g. GTD's `task` -> `task` `depends_on`,
-/// declared as `NoteOfKind`) cannot match here regardless of the shared
-/// matcher, because this function is only ever reached (via
-/// `enrich_allowlist_error`) after both endpoints have already been resolved
-/// as entities — a note/note mismatch produces a different validation error
-/// entirely ("must be an entity for relation ..."), not the base-allowlist
-/// error this function enriches.
+/// Relations valid for an entity-kind pair, derived from the same allowlist +
+/// pack `EDGE_RULES` sources the real link validator consults (issue #543).
+/// See `docs/handlers-common.md#valid_relations_for_entity_pair`.
 pub(crate) fn valid_relations_for_entity_pair(
     runtime: &KhiveRuntime,
     src_kind: &str,
@@ -634,9 +614,10 @@ pub(crate) fn deser<T: serde::de::DeserializeOwned>(params: Value) -> Result<T, 
         .map_err(|e| RuntimeError::InvalidInput(format!("bad params: {e}")))
 }
 
-/// `pub` (widened from `pub(crate)`, ADR-099 B3), so
-/// kkernel's `--atomic` seam can render update/delete result payloads with
-/// the same timestamp normalization as the canonical handlers.
+/// Convert `created_at`/`updated_at`/`deleted_at`/`expires_at` fields on a JSON entity
+/// object from epoch-micros integers to ISO-8601 strings, in place. Fields that are
+/// absent or already non-integer are left untouched.
+/// See `docs/handlers-common.md` for the ADR-099 B3 pub-widening rationale.
 pub fn normalize_entity_timestamps(mut v: Value) -> Value {
     if let Some(obj) = v.as_object_mut() {
         for field in &["created_at", "updated_at", "deleted_at", "expires_at"] {
@@ -737,17 +718,9 @@ pub(crate) fn tags_match_any(entity_tags: &[String], wanted: &[String]) -> bool 
         .any(|tag| wanted.iter().any(|w| tag.eq_ignore_ascii_case(w)))
 }
 
-/// Merge the top-level `tags` create-param into `properties["tags"]` for a
-/// note. Notes have no dedicated tags column (see search.rs's `tag_filter`
-/// handling) — `properties["tags"]` is the storage convention already used
-/// by `memory.remember` (khive-pack-memory/src/handlers/remember.rs) and by
-/// this pack's own `search`/`list` note-tag filters. Without this merge,
-/// `create(kind=note, tags=[...])` silently dropped the tags (#747).
-///
-/// Precedence: an empty/absent `tags` param leaves `properties` untouched.
-/// A non-empty `tags` param always WINS over any `properties["tags"]` the
-/// caller also supplied — the top-level, typed param is the more explicit
-/// signal, so it overwrites rather than merges with a same-named nested key.
+/// Merge the top-level `tags` create-param into `properties["tags"]` for a note
+/// (#747). A non-empty `tags` param always wins over any `properties["tags"]` the
+/// caller also supplied. See `docs/handlers-common.md#merge_note_tags`.
 pub(crate) fn merge_note_tags(
     properties: Option<Value>,
     tags: Option<Vec<String>>,

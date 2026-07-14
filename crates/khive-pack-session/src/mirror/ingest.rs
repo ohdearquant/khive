@@ -1,39 +1,14 @@
 //! Idempotent file tail + upsert into the session mirror tables.
 //!
-//! `mirror_file` reads new bytes from a JSONL file starting at `start_offset`
-//! via a buffered, line-at-a-time reader bounded by an internal per-pass
-//! byte/event cap AND a per-line byte cap, parses complete lines using the
-//! parser selected by [`LineTailSource`] (mapped internally to
-//! [`MirrorSource`]), and writes the resulting bounded chunk to the session
-//! mirror tables in a single transaction.  A single call processes at most
-//! one bounded chunk — never the whole file at once — so the caller's
-//! polling loop advances the persisted cursor incrementally across multiple
-//! calls for large deltas.  It is safe to call repeatedly on the same file;
-//! `INSERT OR IGNORE` keyed by the event UUID ensures idempotency.
+//! `mirror_file` reads new bytes from a JSONL file starting at `start_offset`,
+//! parses complete lines via the parser selected by [`LineTailSource`], and
+//! writes one bounded chunk (never the whole file at once) to the session
+//! mirror tables per call — callers poll repeatedly to drain large deltas.
+//! `INSERT OR IGNORE` keyed by the event UUID makes replays idempotent.
 //!
-//! No single line, complete or partial, is ever buffered past
-//! `MirrorLimits::max_line_bytes` (see `read_line_bounded`): a complete
-//! line over that cap is skipped with a `tracing::warn!` naming the file and
-//! byte offset, and the offset advances past it so ingestion never wedges on
-//! one oversized line. The pass cap is gated on at least one complete line
-//! (blank or not) having been consumed, and the cursor is persisted whenever
-//! a pass durably advances the offset even if it scanned zero parseable
-//! events — a long run of blank or oversized lines can no longer read to EOF
-//! unbounded, nor lose its cursor advance.
-//!
-//! A line that crosses `max_line_bytes` with no terminating `\n` yet — a
-//! still-growing file's in-progress final line, or a genuinely truncated /
-//! corrupt tail — is its own bounded case, distinct from the complete
-//! (terminated) oversized-line skip above: `read_line_bounded` reports
-//! `LineRead::OversizedUnterminated` as soon as one bounded read window
-//! crosses the cap without finding `\n`, instead of scanning onward to EOF
-//! looking for one. The cursor is intentionally left at that line's start
-//! (like an ordinary `Partial`), so the next poll — or the next daemon
-//! start — repeats the same bounded read rather than an unbounded tail
-//! scan; once the line eventually terminates (or the file stops growing and
-//! reaches true EOF mid-line), it resolves to the normal `Oversized`
-//! skip-and-advance path or stays a bounded `Partial`/`OversizedUnterminated`
-//! retry, never a full-file read in one call (PACKSESSION-AUD-003).
+//! See `crates/khive-pack-session/docs/mirror-ingest.md` for the full bounded
+//! tail-read algorithm, the oversized/unterminated-line handling
+//! (PACKSESSION-AUD-003), and the write-path (ADR-099 D5) rationale.
 
 use std::io::{BufRead, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -109,25 +84,21 @@ pub struct MirrorStats {
     pub new_offset: u64,
 }
 
-/// Ceiling on bytes read per `mirror_file` call in production. Bounds worst-case
-/// memory use when a file has accumulated a very large delta (e.g. after daemon
-/// downtime or a multi-GB transcript).
+/// Ceiling on bytes read per `mirror_file` call in production (8 MiB); bounds
+/// worst-case memory on a very large accumulated delta. See
+/// `crates/khive-pack-session/docs/mirror-ingest.md#mirrorlimits--per-pass-caps`.
 const MIRROR_MAX_BYTES_PER_PASS: usize = 8 * 1024 * 1024;
 
 /// Ceiling on parsed events collected per `mirror_file` call in production.
 const MIRROR_MAX_EVENTS_PER_PASS: usize = 1024;
 
-/// Hard ceiling on a single JSONL line's buffered size in production. This is
-/// enforced by `read_line_bounded` itself (never appended to past this many
-/// bytes), independently of `max_bytes_per_pass` — a single oversized line
-/// must not be able to allocate past this bound even as the very first line
-/// of a pass (PACKSESSION-AUD-003).
+/// Hard ceiling on a single JSONL line's buffered size, enforced by
+/// `read_line_bounded` independently of `max_bytes_per_pass` (PACKSESSION-AUD-003).
 const MIRROR_MAX_LINE_BYTES: usize = MIRROR_MAX_BYTES_PER_PASS;
 
-/// Per-call caps on how much of a file's delta `mirror_file` will read and
-/// parse before writing a bounded chunk. Production always uses
-/// [`MirrorLimits::production`]; tests use a much smaller cap to force
-/// multi-pass behavior without giant fixtures.
+/// Per-call caps on how much of a file's delta `mirror_file` reads/parses
+/// before writing a bounded chunk; tests use smaller caps to force multi-pass
+/// behavior without giant fixtures.
 #[derive(Clone, Copy, Debug)]
 struct MirrorLimits {
     max_bytes_per_pass: usize,
@@ -181,78 +152,36 @@ pub async fn mirror_file(
 }
 
 /// A single bounded read pass: at most `limits.max_bytes_per_pass` bytes and
-/// `limits.max_events_per_pass` parsed events, always stopping on a complete
-/// line boundary.
+/// `limits.max_events_per_pass` parsed events, stopping on a line boundary.
 struct MirrorChunk {
     events: Vec<parse::ParsedEvent>,
-    /// Complete, nonblank, non-oversized lines that were handed to the
-    /// per-source parser (whether or not the parser returned an event).
     scanned: u64,
     new_offset: u64,
 }
 
-/// Outcome of `read_line_bounded` for one line.
+/// Outcome of `read_line_bounded` for one line. See
+/// `crates/khive-pack-session/docs/mirror-ingest.md#lineread--read_line_bounded--the-packsession-aud-003-bound`
+/// for the full PACKSESSION-AUD-003 rationale.
 #[derive(Debug)]
 enum LineRead {
     /// EOF with nothing read at all.
     Eof,
-    /// EOF reached before a terminating `\n`: an incomplete trailing line,
-    /// left for the next pass. No bytes are considered consumed by the
-    /// caller (the offset does not advance), regardless of how large the
-    /// partial line has already grown.
+    /// EOF before a terminating `\n`; caller must not advance past it.
     Partial,
-    /// A complete line (through the terminating `\n`) fit within
-    /// `max_line_bytes`; `buf` holds the full line including the `\n`.
-    /// `bytes` is the total bytes consumed from the reader, used to advance
-    /// the caller's byte offset.
+    /// A complete line fit within `max_line_bytes`.
     Complete { bytes: usize },
-    /// A complete line (through the terminating `\n`) exceeded
-    /// `max_line_bytes` before the newline was found. `buf` was never fully
-    /// populated — bytes past the cap were scanned for `\n` and discarded
-    /// without buffering — so the caller must skip it, not parse `buf`.
-    /// `bytes` is the total bytes consumed from the reader.
+    /// A complete line exceeded `max_line_bytes`; caller must skip it, not
+    /// parse `buf` (never fully populated for this case).
     Oversized { bytes: usize },
-    /// The line has already exceeded `max_line_bytes` and no terminating
-    /// `\n` has been found yet, but this is NOT end-of-file — there may be
-    /// more bytes (a still-growing file) or a genuinely unterminated tail.
-    /// Unlike `Oversized`, the caller must not advance past it: `bytes` is
-    /// reported for logging only, and the reader is intentionally not
-    /// exhausted any further this call. This is the hard bound behind
-    /// PACKSESSION-AUD-003 — the loop below returns as soon as one
-    /// `fill_buf` window crosses the cap without a `\n`, instead of looping
-    /// `fill_buf`/`consume` all the way to EOF searching for a terminator
-    /// that may never come.
+    /// Exceeded `max_line_bytes` with no `\n` found yet, and NOT at EOF.
+    /// Unlike `Oversized`, the caller must not advance past it.
     OversizedUnterminated { bytes: usize },
 }
 
-/// Read one line from `reader` into `buf`, never buffering more than
-/// `max_line_bytes` regardless of how long the underlying line turns out to
-/// be.
-///
-/// This is the hard bound behind PACKSESSION-AUD-003: `BufRead::read_until`
-/// alone appends an entire line to its buffer before any cap check can run,
-/// so a single arbitrarily large complete line (or a line that starts below
-/// a per-pass threshold and ends far beyond it) can still allocate without
-/// limit before the calling loop ever inspects it. Reading via `fill_buf`/
-/// `consume` directly means a line longer than `max_line_bytes` is never
-/// appended to `buf` past the cap — bytes beyond it are scanned for `\n` and
-/// dropped immediately, bounding this function's own resident memory to
-/// `max_line_bytes` (plus one `BufRead` internal buffer) no matter how long
-/// the real line is.
-///
-/// The same bound applies to the number of bytes *read* per call, not just
-/// buffered (PACKSESSION-AUD-003): once a line has crossed
-/// `max_line_bytes` without a terminating `\n`, the very next `fill_buf`
-/// window that still has no `\n` returns `OversizedUnterminated` immediately
-/// rather than looping `fill_buf`/`consume` onward in search of one. A line
-/// that is oversized but DOES terminate within that same window still comes
-/// back as `Oversized` (the existing skip-and-advance path) — only the
-/// no-terminator-in-this-window case is capped early. This means one call to
-/// `read_line_bounded` never reads more than `max_line_bytes` plus one
-/// `BufRead` internal buffer for a line with no discoverable `\n`, whether
-/// that line is still growing (append-in-progress) or truly unterminated at
-/// EOF — instead of scanning the remainder of the file (or forever, on a
-/// still-growing file) in a single pass.
+/// Read one line from `reader` into `buf`, never buffering — or reading —
+/// more than `max_line_bytes` regardless of how long the underlying line
+/// turns out to be (the PACKSESSION-AUD-003 bound; see the docs guide above
+/// for why `BufRead::read_until` alone is unsafe here).
 fn read_line_bounded(
     reader: &mut impl BufRead,
     buf: &mut Vec<u8>,
@@ -305,16 +234,11 @@ fn read_line_bounded(
     }
 }
 
-/// Read at most one bounded chunk of `path` starting at `start_offset`, one
-/// complete line at a time via a buffered reader — never allocating more than
-/// `limits.max_line_bytes` for any single line. A partial trailing line (no
-/// terminating `\n`) is left for the next call.
-///
-/// A complete line whose buffered size would exceed `limits.max_line_bytes`
-/// is rejected outright: it is never parsed, its bytes are counted and the
-/// offset advances past it (so ingestion does not wedge on it forever), and
-/// a `tracing::warn!` names the file and starting byte offset so an operator
-/// can find and inspect it (PACKSESSION-AUD-003 — no silent coercion).
+/// Read at most one bounded chunk of `path` starting at `start_offset`. A
+/// complete line whose buffered size exceeds `limits.max_line_bytes` is
+/// skipped outright (bytes counted, offset advances past it, `tracing::warn!`
+/// names the file/offset — PACKSESSION-AUD-003, no silent coercion); a
+/// partial trailing line is left for the next call.
 fn read_bounded_chunk(
     path: &Path,
     start_offset: u64,
@@ -478,24 +402,18 @@ async fn mirror_file_with_limits(
     .await
 }
 
-/// Default ceiling on the byte length of a ChatGPT export `conversations.json`
-/// file read in one [`mirror_chatgpt_export_file`] pass. Overridable via
-/// `KHIVE_MIRROR_CHATGPT_MAX_BYTES` (see `chatgpt_max_bytes`).
-///
-/// Unlike the JSONL line-tail sources, a ChatGPT export has no incremental
-/// "new bytes" boundary — it is always read and parsed whole (see the
-/// function doc below) — so this is a ceiling on the *entire file*, not a
-/// per-pass delta. An export over this size is skipped for that pass
-/// (loudly logged via `tracing::warn!`, never a crash or an unbounded
-/// `read_to_string`), and the cursor is left untouched so the oversized
-/// source keeps being retried — and re-warned — on every later tick instead
-/// of silently dropping forever (PACKSESSION-AUD-003).
+/// Default ceiling (256 MiB) on a ChatGPT export `conversations.json` file
+/// read in one [`mirror_chatgpt_export_file`] pass — a ceiling on the entire
+/// file, not a per-pass delta (unlike the JSONL line-tail sources). An export
+/// over this size is skipped (warn-logged) and the cursor is left untouched
+/// so it is retried on every later tick rather than dropped (PACKSESSION-AUD-003).
+/// See `crates/khive-pack-session/docs/mirror-ingest.md#chatgpt-export-whole-file-re-parse-mirror_chatgpt_export_file`.
 const DEFAULT_CHATGPT_MAX_BYTES: u64 = 256 * 1024 * 1024;
 
 /// Resolve the ChatGPT export size ceiling from `KHIVE_MIRROR_CHATGPT_MAX_BYTES`,
 /// falling back to [`DEFAULT_CHATGPT_MAX_BYTES`] for missing, non-numeric, or
-/// zero values (a zero ceiling would skip every export unconditionally,
-/// which is never useful, so it is treated the same as unset).
+/// zero values (zero would skip every export unconditionally, so it is
+/// treated the same as unset).
 fn chatgpt_max_bytes() -> u64 {
     std::env::var("KHIVE_MIRROR_CHATGPT_MAX_BYTES")
         .ok()
@@ -505,23 +423,20 @@ fn chatgpt_max_bytes() -> u64 {
 }
 
 /// Read the whole ChatGPT export `conversations.json` at `path`, parse every
-/// conversation's mapping tree via [`parse::parse_chatgpt_export`], and upsert
-/// every message-bearing event idempotently into the session mirror tables in
-/// a single transaction.
+/// conversation's mapping tree via [`parse::parse_chatgpt_export`], and
+/// upsert every message-bearing event idempotently into the session mirror
+/// tables in a single transaction. Unlike `mirror_file`, this always
+/// re-reads and re-parses the whole file (a ChatGPT export has no stable
+/// "new bytes" boundary to tail) — `start_offset` is only a cheap
+/// re-poll guard: if the file has not grown past it, nothing is read.
 ///
-/// Unlike `mirror_file` (append-only line-tail), a ChatGPT export is a single
-/// static JSON array with no stable "new bytes" boundary to tail, so this
-/// function always re-reads and re-parses the whole file. `start_offset` is
-/// used only as a cheap re-poll guard: if the file has not grown past it,
-/// nothing is read or parsed. `new_offset` is set to the whole file's byte
-/// length only after a successful parse and commit — any IO, parse, or DB
-/// error leaves the persisted cursor untouched, so a partially-downloaded
-/// export is retried whole on the next tick, never half-consumed.
-///
-/// Before reading, the file is checked against `chatgpt_max_bytes`: an
-/// export over that ceiling is skipped (warn-logged) without ever calling
-/// `read_to_string`, so a very large export cannot materialize its full
-/// content (and, downstream, a full `Vec` of parsed events) in one pass.
+/// `new_offset` is set to the whole file's byte length only after a
+/// successful parse and commit; any IO, parse, or DB error leaves the
+/// persisted cursor untouched, so a partially-downloaded export is retried
+/// whole on the next tick, never half-consumed. An export over
+/// `chatgpt_max_bytes` is skipped (warn-logged) without ever calling
+/// `read_to_string`. See the docs guide linked above `chatgpt_max_bytes`
+/// for the full rationale.
 pub async fn mirror_chatgpt_export_file(
     runtime: &KhiveRuntime,
     path: &Path,
@@ -594,12 +509,10 @@ async fn mirror_chatgpt_export_file_with_max_bytes(
 }
 
 /// Upsert `events` and the mirror cursor for `path` in one transaction.
-///
-/// Shared by `mirror_file`'s eventful line-tail path and
-/// `mirror_chatgpt_export_file`'s whole-file path, so the session/message row
-/// construction and cursor semantics (create-only sessions, `INSERT OR
-/// IGNORE` message dedup, monotonic `last_seen_at`, cursor advances only on
-/// success) live in exactly one place.
+/// Shared by `mirror_file`'s line-tail path and `mirror_chatgpt_export_file`'s
+/// whole-file path. See
+/// `crates/khive-pack-session/docs/mirror-ingest.md#write-path-write_events_and_cursor-and-friends-adr-099-d5`
+/// for the ADR-099 D5 suspension-free rationale.
 async fn write_events_and_cursor(
     runtime: &KhiveRuntime,
     path: &Path,
@@ -611,16 +524,6 @@ async fn write_events_and_cursor(
     let now_us = Utc::now().timestamp_micros();
     let sql = runtime.sql();
 
-    // ADR-099 D5: this closure is verified suspension-free (it drives only
-    // `writer` with inline-built `SqlStatement`s — session/message INSERTs,
-    // the count refresh, and the cursor UPDATE — with no embedding, no ANN
-    // warming, and no other `await` on an external service), so handing it
-    // to `atomic_unit` satisfies the atomic-unit suspend-free invariant
-    // (`SqlAccess::atomic_unit`'s doc comment) identically on the
-    // single-writer and flag-off paths. This replaces the standalone
-    // `begin_tx` this function used before ADR-099: the whole sequence
-    // still commits once or rolls back as one unit, but no longer opens its
-    // own connection outside the writer task.
     let events_owned: Vec<parse::ParsedEvent> = events.to_vec();
     let path_owned: PathBuf = path.to_path_buf();
 
@@ -658,11 +561,10 @@ async fn write_events_and_cursor(
 }
 
 /// The synchronous-DML body of `write_events_and_cursor`, run inside one
-/// `atomic_unit` closure (see that function's doc comment for the
-/// suspension-free justification). Takes a plain `&mut dyn SqlWriter`
-/// (not `&mut dyn SqlTransaction`) because `atomic_unit` owns the
-/// transaction boundary entirely — this function must not, and does not,
-/// issue its own `BEGIN`/`COMMIT`/`ROLLBACK`.
+/// `atomic_unit` closure. Takes a plain `&mut dyn SqlWriter` (not `&mut dyn
+/// SqlTransaction`) because `atomic_unit` owns the transaction boundary
+/// entirely — this function must not, and does not, issue its own
+/// `BEGIN`/`COMMIT`/`ROLLBACK`.
 async fn write_events_and_cursor_on_writer(
     writer: &mut dyn SqlWriter,
     path: &Path,
@@ -682,13 +584,8 @@ async fn write_events_and_cursor_on_writer(
             now_us
         };
 
-        // ── sessions row: create-only ─────────────────────────────────────────
-        //
-        // First sight of a session creates the row (first_seen_at = last_seen_at =
-        // this event's timestamp). Replays are a cheap no-op (`DO NOTHING`), so a
-        // pass that inserts no new messages writes no session metadata at all —
-        // strict replay idempotency. `last_seen_at` is advanced below, but only
-        // when a genuinely new message lands.
+        // sessions row: create-only (see docs guide — replay is a no-op via
+        // `DO NOTHING`; `last_seen_at` advances below only on a new message).
         writer
             .execute(SqlStatement {
                 sql: format!(
@@ -726,7 +623,7 @@ async fn write_events_and_cursor_on_writer(
                 )
             })?;
 
-        // ── session_messages insert (idempotent) ──────────────────────────────
+        // session_messages insert, idempotent via INSERT OR IGNORE.
         let affected = writer
             .execute(SqlStatement {
                 sql: "INSERT OR IGNORE INTO session_messages \
@@ -767,12 +664,9 @@ async fn write_events_and_cursor_on_writer(
                 )
             })?;
 
-        // ── advance session metadata ONLY when a new message landed ────────────
-        //
-        // Keeps `last_seen_at` monotonic (`MAX`) so a timestamp-missing replay
-        // (whose `created_at` fell back to `now_us`) cannot move it forward, and
-        // backfills metadata that may have been NULL at create time. A pure
-        // replay (`affected == 0`) touches nothing.
+        // Advance session metadata only when a new message landed — keeps
+        // last_seen_at monotonic (MAX) and backfills NULL metadata; a pure
+        // replay (affected == 0) touches nothing (see docs guide).
         if affected > 0 {
             writer
                 .execute(SqlStatement {
@@ -815,12 +709,8 @@ async fn write_events_and_cursor_on_writer(
         last_session_id = Some(ev.session_id.clone());
     }
 
-    // ── refresh message_count for each distinct session ───────────────────────
-    //
-    // In practice one file maps to one session_id, but we refresh every
-    // session_id we touched to stay correct even if that changes. Skipped
-    // entirely on a pure replay (`inserted == 0`): the counts cannot have
-    // changed, so writing them would be needless churn.
+    // Refresh message_count for each distinct session touched; skipped on a
+    // pure replay (inserted == 0) since counts cannot have changed.
     if inserted > 0 {
         let mut seen_sessions: Vec<String> = events
             .iter()
@@ -853,13 +743,8 @@ async fn write_events_and_cursor_on_writer(
 
     upsert_cursor_on_writer(writer, path, last_session_id.as_deref(), new_offset, now_us).await?;
 
-    // ── commit ────────────────────────────────────────────────────────────────
-    //
-    // No explicit COMMIT here: `atomic_unit` owns the transaction boundary
-    // entirely (see this function's doc comment) and commits once this
-    // closure returns `Ok`, or rolls back the whole unit on `Err` — the
-    // same all-or-nothing contract the old `begin_tx`/`tx.commit()` shape
-    // gave, now provided by the seam instead of a manual transaction.
+    // No explicit COMMIT: `atomic_unit` owns the transaction boundary and
+    // commits on `Ok` / rolls back the whole unit on `Err`.
     Ok(MirrorStats {
         inserted,
         scanned,
@@ -868,9 +753,8 @@ async fn write_events_and_cursor_on_writer(
 }
 
 /// Upsert the `session_mirror_cursor` row for `path` inside the open
-/// `atomic_unit` transaction. Takes `&mut dyn SqlWriter` (see
-/// `write_events_and_cursor_on_writer`'s doc comment) — it issues only the
-/// one cursor DML statement, no transaction control of its own.
+/// `atomic_unit` transaction — issues only the one cursor DML statement, no
+/// transaction control of its own.
 async fn upsert_cursor_on_writer(
     writer: &mut dyn SqlWriter,
     path: &Path,
@@ -910,8 +794,10 @@ async fn upsert_cursor_on_writer(
     Ok(())
 }
 
-/// Write only the cursor row (no events).  Used when there are no parseable
-/// events so the offset still advances past blank/unparseable content.
+/// Write only the cursor row (no events); used when a pass consumed bytes
+/// but produced no parseable events, so the offset still advances past
+/// blank/unparseable content. A failure here must propagate — see
+/// `crates/khive-pack-session/docs/mirror-ingest.md#write-path-write_events_and_cursor-and-friends-adr-099-d5`.
 async fn write_cursor_only(
     runtime: &KhiveRuntime,
     path: &Path,
@@ -949,8 +835,6 @@ async fn write_cursor_only(
     Ok(())
 }
 
-// ── integration tests ─────────────────────────────────────────────────────────
-
 #[cfg(test)]
 mod tests {
     use std::io::Write;
@@ -965,13 +849,9 @@ mod tests {
     use super::*;
     use crate::vocab::SESSION_SCHEMA_PLAN_STMTS;
 
-    /// Build a file-backed runtime and apply the session schema.
-    ///
-    /// File-backed so tests exercise the same `atomic_unit` single-writer
-    /// path (`mirror_file` → `write_events_and_cursor` → `atomic_unit`,
-    /// ADR-099 D5) production runs against — an in-memory pool would take
-    /// `atomic_unit`'s pool-backed manual-transaction branch instead. The
-    /// caller must keep the returned `TempDir` alive for the test.
+    /// Build a file-backed runtime (exercises the real `atomic_unit`
+    /// single-writer path) and apply the session schema. Caller must keep
+    /// the returned `TempDir` alive.
     async fn setup() -> (KhiveRuntime, TempDir) {
         let dir = TempDir::new().expect("tempdir");
         let db_path = dir.path().join("test.db");
@@ -1130,13 +1010,7 @@ mod tests {
 
     #[tokio::test]
     async fn mirror_file_respects_low_test_cap_and_advances_over_multiple_passes() {
-        // Regression for PACKSESSION-AUD-003: `mirror_file` used to allocate
-        // and read the entire file delta in one shot via `read_from_offset`
-        // (`Vec::with_capacity(file_len - offset)` + `read_to_end`), which
-        // could OOM or stall the daemon on a very large accumulated delta.
-        // With a tiny test-only byte cap, a multi-line file must now be
-        // consumed across multiple bounded passes — each committing its own
-        // chunk and cursor advance — never reading the whole file at once.
+        // PACKSESSION-AUD-003 regression: multi-pass bounded reads (see docs guide).
         let (rt, _dir) = setup().await;
 
         let lines: Vec<String> = (0..6)
@@ -1233,11 +1107,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_oversized_line_is_skipped_and_offset_advances() {
-        // Regression for PACKSESSION-AUD-003 (High): a single complete line
-        // larger than `max_line_bytes` must never be fully buffered and
-        // parsed — it must be rejected outright, with the offset advancing
-        // past it so ingestion does not wedge, and surrounding valid lines
-        // in the same pass still land.
+        // PACKSESSION-AUD-003 regression: oversized complete line (see docs guide).
         let (rt, _dir) = setup().await;
 
         let small1 = user_line("uuid-small1", "sess-OV", "ok");
@@ -1287,12 +1157,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_line_just_under_cap_then_oversized_next_line_is_bounded() {
-        // Regression for PACKSESSION-AUD-003 (High): the old bound only
-        // checked the pass cap before reading another line, so a line that
-        // starts under the cap but is followed by one that balloons far
-        // beyond it could still get fully buffered via `read_until` before
-        // any check ran. The per-line bound must catch this regardless of
-        // where in the pass it happens.
+        // PACKSESSION-AUD-003 regression: under-cap line followed by an
+        // oversized one (see docs guide).
         let (rt, _dir) = setup().await;
 
         let max_line_bytes: usize = 256;
@@ -1342,10 +1208,8 @@ mod tests {
         assert_eq!(count_rows(&rt, "session_messages").await, 1);
     }
 
-    /// Counts every byte pulled through `Read::read`, so a test can assert a
-    /// hard ceiling on how much of the underlying source `read_line_bounded`
-    /// ever touches in one call — independent of how large the backing
-    /// buffer actually is.
+    /// Counts every byte pulled through `Read::read`, for asserting a hard
+    /// ceiling on `read_line_bounded`'s reads independent of buffer size.
     struct CountingReader<R> {
         inner: R,
         total_read: std::rc::Rc<std::cell::Cell<usize>>,
@@ -1361,13 +1225,8 @@ mod tests {
 
     #[test]
     fn test_read_line_bounded_oversized_unterminated_reads_are_capped_per_call() {
-        // Regression for PACKSESSION-AUD-003: a huge final
-        // line with no trailing `\n` used to be scanned all the way to EOF
-        // in one `read_line_bounded` call (`fill_buf`/`consume` looped until
-        // the reader ran dry), even though the discarded bytes past the cap
-        // were never buffered. The READ itself must be bounded too, not just
-        // the buffered memory. Use a small, explicit `BufReader` capacity so
-        // the bound is provable independent of the platform default (8KiB).
+        // PACKSESSION-AUD-003 regression: oversized-unterminated reads are
+        // capped per call, not just per buffered byte (see docs guide).
         let max_line_bytes: usize = 64;
         let buf_capacity: usize = 256;
         // Far larger than max_line_bytes + a handful of buffer refills, and
@@ -1416,11 +1275,8 @@ mod tests {
     #[tokio::test]
     async fn test_oversized_unterminated_line_leaves_cursor_at_line_start_and_is_bounded_on_retry()
     {
-        // Regression for PACKSESSION-AUD-003: a single huge
-        // line with NO trailing newline (a still-growing or corrupt final
-        // line) must not advance the cursor, and repeated calls from the
-        // same persisted offset must each be bounded, not replay an
-        // unbounded scan of the whole file every poll.
+        // PACKSESSION-AUD-003 regression: unterminated-oversized-line cursor
+        // handling and bounded retry (see docs guide).
         let (rt, _dir) = setup().await;
 
         let max_line_bytes: usize = 256;
@@ -1512,11 +1368,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_still_growing_partial_line_under_cap_is_unaffected() {
-        // Guard: an ordinary still-growing file whose latest line is under
-        // `max_line_bytes` and has no newline YET must still behave as a
-        // plain `Partial` — cursor does not advance past it, and once the
-        // line completes on a later pass it is picked up normally. This
-        // must not regress from the new oversized-unterminated handling.
+        // Guard: still-growing partial line under the cap must not regress
+        // from the oversized-unterminated handling (see docs guide).
         let (rt, _dir) = setup().await;
 
         let small1 = user_line("uuid-g1", "sess-GROW", "first");
@@ -1564,12 +1417,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_large_run_of_blank_lines_is_bounded_and_persists_cursor() {
-        // Regression for PACKSESSION-AUD-003 (Medium): a run of blank lines
-        // used to bypass the pass cap (only nonblank `scanned` lines tripped
-        // it) and, when a chunk scanned zero events, the cursor was never
-        // persisted even though bytes had durably advanced. Both must be
-        // fixed: the cap must trip on blank lines too, and the cursor must
-        // be written whenever the pass consumed any bytes.
+        // PACKSESSION-AUD-003 regression: blank-line runs are bounded and the
+        // cursor persists on every durable advance (see docs guide).
         let (rt, _dir) = setup().await;
 
         let mut file = NamedTempFile::new().expect("tmpfile");
@@ -1721,10 +1570,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_replay_does_not_mutate_session_metadata() {
-        // Regression for the replay-idempotency finding: a timestamp-missing
-        // event's `created_at` falls back to `now_us`, which differs between
-        // calls. A pure replay (0 new messages) must NOT advance `last_seen_at`
-        // or otherwise touch the session row.
+        // Replay-idempotency regression (see docs guide): a pure replay must
+        // not advance last_seen_at.
         let (rt, _dir) = setup().await;
 
         let line = user_line_no_ts("uuid-nts", "sess-NTS", "no timestamp here");
@@ -1781,9 +1628,9 @@ mod tests {
 
     // ── Codex source integration tests ────────────────────────────────────────
 
-    /// Build a minimal Codex response_item/message line. Block type mirrors the
-    /// real shape: `input_text` for user messages, `output_text` for assistant
-    /// messages (the generic `text` type does not occur in real Codex transcripts).
+    /// Build a minimal Codex response_item/message line (`input_text` for
+    /// user, `output_text` for assistant — the generic `text` type does not
+    /// occur in real Codex transcripts).
     fn codex_message_line(role: &str, text: &str) -> String {
         let block_type = if role == "assistant" {
             "output_text"
@@ -2370,11 +2217,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_chatgpt_export_over_max_bytes_is_skipped_without_reading() {
-        // Regression for PACKSESSION-AUD-003 (Medium, "adjacent unbounded
-        // external-file path"): an export over the configured ceiling must
-        // be skipped (not `read_to_string`'d, not parsed, not erroring) and
-        // the cursor must stay untouched so the oversized source is retried
-        // — and re-warned — on the next tick rather than silently dropped.
+        // PACKSESSION-AUD-003 regression: oversized ChatGPT exports are
+        // skipped without reading (see docs guide).
         let (rt, _dir) = setup().await;
         let (_file, path) = write_export_file("[]");
 
@@ -2480,24 +2324,10 @@ mod tests {
         );
     }
 
-    /// SS6 invariants #4 ("an ingest error never advances the cursor") and #5
-    /// ("one transaction per file pass") both rest on the same underlying
-    /// contract `write_events_and_cursor` depends on: an `atomic_unit` whose
-    /// closure returns `Err` before its final statement must leave no
-    /// visible trace of ANY write it made in that pass — including the
-    /// cursor upsert, which runs last, right before the closure returns
-    /// `Ok`.
-    ///
-    /// The real ingest loop can't be driven into a mid-loop DB error through
-    /// crafted event data: the `sessions` insert uses `ON CONFLICT(id) DO
-    /// NOTHING` and the `session_messages` insert uses `INSERT OR IGNORE`,
-    /// both of which swallow constraint violations by design (that's what
-    /// makes re-ingest idempotent). So this test drives the same
-    /// `atomic_unit`/`writer.execute`/`Err`-return path directly — the exact
-    /// machinery `write_events_and_cursor`'s `?`-propagated errors rely on
-    /// (ADR-099 D5) — and forces a genuine, non-suppressed SQL error (a
-    /// `prepare()` failure on a nonexistent table) after a session write AND
-    /// a cursor advance have already succeeded within the same open unit.
+    /// SS6 invariants #4/#5 (error never advances cursor; one transaction per
+    /// pass) — see
+    /// `crates/khive-pack-session/docs/mirror-ingest.md#test_mid_transaction_db_error_leaves_no_partial_state_and_cursor_unadvanced`
+    /// for why this drives `atomic_unit` directly instead of through crafted event data.
     #[tokio::test]
     async fn test_mid_transaction_db_error_leaves_no_partial_state_and_cursor_unadvanced() {
         let (rt, _dir) = setup().await;
@@ -2560,16 +2390,9 @@ mod tests {
         );
     }
 
-    /// Build a bare, file-backed, write-queue-enabled `SqlAccess` handle —
-    /// no `KhiveRuntime`, no `KHIVE_WRITE_QUEUE` env var. Mirrors
-    /// khive-pack-brain's `fold_gate.rs`/`persist.rs` write-queue-routing
-    /// tests: `PoolConfig::default()` reads `KHIVE_WRITE_QUEUE` at
-    /// construction time, and that env var is process-global, so mutating
-    /// it here would race every other test in this binary that calls
-    /// `KhiveRuntime::new()` (that binary-wide hazard is exactly what those
-    /// two tests' doc comments document having hit). A `PoolConfig` literal
-    /// with `write_queue_enabled: true` sidesteps it entirely — no
-    /// `#[serial]`, no risk to any other test in this crate.
+    /// Build a bare, file-backed, write-queue-enabled `SqlAccess` handle
+    /// (sidesteps the process-global `KHIVE_WRITE_QUEUE` env var race — see
+    /// docs guide ADR-099 D5 notes).
     fn write_queue_pool(db_path: std::path::PathBuf) -> Arc<khive_db::ConnectionPool> {
         let pool_cfg = khive_db::PoolConfig {
             path: Some(db_path),
@@ -2589,15 +2412,10 @@ mod tests {
         pool
     }
 
-    /// ADR-099 D5 acceptance: the converted `write_events_and_cursor`
-    /// closure is suspension-free — it drives only synchronous DML through
-    /// `writer`, so it resolves on its first poll and is `block_on_sync`-safe
-    /// on the single-writer path. Exercises the real production closure
-    /// (`write_events_and_cursor_on_writer` via `atomic_unit`) over a
-    /// write-queue-enabled pool built directly (see `write_queue_pool`), so
-    /// this proves the actual shipped code — not a stand-in — never
-    /// suspends: if it ever did, `block_on_sync` would return the "future
-    /// suspended" error and this call would fail instead of returning `Ok`.
+    /// ADR-099 D5 acceptance: `write_events_and_cursor_on_writer` is
+    /// suspension-free under `atomic_unit` on the real single-writer path
+    /// (see docs guide) — a suspending closure would fail `block_on_sync`
+    /// instead of returning `Ok`.
     #[tokio::test]
     async fn write_events_and_cursor_is_suspension_free_under_single_writer() {
         let dir = TempDir::new().expect("tempdir");
@@ -2667,21 +2485,10 @@ mod tests {
         }
     }
 
-    /// ADR-099 D5 acceptance ("single-writer concurrency test, mandatory"):
-    /// with the write queue enabled, concurrent session-mirror ingest
-    /// (`write_events_and_cursor_on_writer` via `atomic_unit`) and normal
-    /// write traffic through `SqlBridge::writer()` must not contend at
-    /// `BEGIN IMMEDIATE` — the converted ingest path routes through the
-    /// single writer task rather than opening its own standalone
-    /// transaction (the `begin_tx` hole this ADR closes). Uses the same
-    /// queue-depth + occupier-parked-on-oneshot technique as
-    /// khive-pack-brain's `fold_gate_apply_routes_through_writer_task_when_flag_enabled`
-    /// (a wall-clock/timing probe would be indistinguishable from the
-    /// flag-off fallback, which also serializes via real SQLite file
-    /// locking): while an occupier deterministically holds the writer
-    /// task's one drain slot open, the ingest call must appear in the
-    /// channel's queue depth rather than opening a second, competing
-    /// standalone `BEGIN IMMEDIATE`.
+    /// ADR-099 D5 acceptance ("single-writer concurrency, mandatory"):
+    /// session-mirror ingest must route through the shared writer task, not
+    /// open its own standalone `BEGIN IMMEDIATE` (see docs guide for the
+    /// queue-depth + occupier-parked-on-oneshot technique).
     #[tokio::test]
     async fn session_ingest_routes_through_writer_task_when_flag_enabled() {
         let dir = TempDir::new().expect("tempdir");
@@ -2784,17 +2591,10 @@ mod tests {
         assert_eq!(stats.inserted, 1, "the ingest event must be committed");
     }
 
-    /// ADR-099 acceptance ("revert-companion test"): the OLD shape — a
-    /// closure that issues its own `BEGIN IMMEDIATE` through the writer it
-    /// was handed, instead of relying on `atomic_unit`'s own transaction —
-    /// must fail deterministically with a nested-transaction error. This
-    /// proves the suspension-free / single-transaction-owner assertions
-    /// above are non-vacuous: the pre-conversion shape (a caller managing
-    /// its own `BEGIN`/`COMMIT` inside the seam) does NOT silently pass.
-    /// Built over a write-queue-enabled pool (see `write_queue_pool`) so the
-    /// closure is deterministically driven through `block_on_sync`'s
-    /// `InlineWriter` on the real single-writer production path, not the
-    /// flag-off manual-transaction fallback.
+    /// ADR-099 revert-companion test: the pre-conversion shape (a closure
+    /// issuing its own `BEGIN IMMEDIATE` inside `atomic_unit`) must fail
+    /// deterministically with a nested-transaction error — proves the
+    /// suspension-free assertions above are non-vacuous (see docs guide).
     #[tokio::test]
     async fn old_shape_manual_begin_immediate_inside_atomic_unit_fails() {
         let dir = TempDir::new().expect("tempdir");

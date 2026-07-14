@@ -1,12 +1,5 @@
-//! `resolve` verb handler (unified-verb draft ADR, Slice 1).
-//!
-//! Thin and read-only: deserializes params, calls the runtime's
-//! `resolve_reference` capability once per ref, and renders each
-//! `ReferenceResolution` to its wire shape. All resolution logic (id-string
-//! passthrough, ring lookup, hybrid-search fallback) lives in
-//! `khive_runtime::reference_resolution` — this handler performs no mutation
-//! and no side effect beyond the ring reads/admissions `resolve_reference`
-//! and the dispatch boundary already make.
+//! `resolve` verb handler (unified-verb draft ADR, Slice 1). Thin and read-only — see
+//! `docs/handlers-common.md#resolve-handler-handlersresolveers`.
 
 use serde_json::{json, Value};
 
@@ -35,14 +28,8 @@ impl KgPack {
         let limit = p.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
         let ring = registry.reference_ring();
 
-        // `resolve`'s pipeline (id-string passthrough, ring, exact-name
-        // storage lookup, hybrid search) is entity-only, so `kind` here
-        // follows the same substrate-or-granular discriminant as
-        // `create`/`list`/`search` (see `resolve_kind_spec`): the bare
-        // substrate label `"entity"` means "no kind filter", not a literal
-        // `entities.kind` value. Forwarding the raw string as-is would filter
-        // every real match out (#849) — `entities.kind` only ever holds a
-        // granular value like `"concept"`, never `"entity"`.
+        // #849: bare "entity" means no kind filter, not a literal entities.kind value.
+        // See docs/handlers-common.md#resolve-handler-handlersresolveers.
         let entity_kind = match &p.kind {
             Some(raw) => match resolve_kind_spec(raw, registry)? {
                 KindSpec::Entity { specific } => specific,

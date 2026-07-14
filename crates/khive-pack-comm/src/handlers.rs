@@ -40,19 +40,10 @@ fn validate_actor_label(verb: &str, label: &str, field: &str) -> Result<(), Runt
     Ok(())
 }
 
-/// `send` — create a message note in the caller's namespace (outbound) AND deliver
-/// an inbound copy addressed to the actor label supplied in `to` (ADR-057).
-///
+/// `send` — create a message note in the caller's namespace (outbound) AND
+/// deliver an inbound copy addressed to the actor label in `to` (ADR-057).
 /// Both copies land in the caller's namespace; no cross-namespace write occurs.
-/// `from_actor` is set to `token.namespace().as_str()`. `to_actor` is set to the
-/// `to` argument. When the caller's actor label is `"local"` (single-actor fallback),
-/// `comm.inbox` does not apply an actor filter, preserving backward compatibility.
-///
-/// The routing `from` and `to` passed to `dual_write_message` are both set to the
-/// caller's namespace string so that `from == recipient_ns_str` is always true: this
-/// naturally bypasses the cross-namespace allowlist gate in `dual_write_message`
-/// (ADR-057 §"Interaction with ADR-040"). The actor labels are propagated via the
-/// `from_actor`/`to_actor` arguments and stored in message properties.
+/// See crates/khive-pack-comm/docs/handlers.md#handlersrshandle_send
 pub(crate) async fn handle_send(
     runtime: &KhiveRuntime,
     token: &NamespaceToken,
@@ -78,22 +69,10 @@ pub(crate) async fn handle_send(
     let from_actor = token.actor().id.clone();
     let to_actor = p.to.trim().to_string();
 
-    // #820: a resolved target that equals the sender's own actor identity is,
-    // outside the anonymous single-tenant fallback ("local"), almost always a
-    // mis-resolution rather than intent -- most commonly a sub-agent session
-    // spawned in the same project scope trying to reach a distinct parent
-    // orchestrator actor. Both processes resolve `[actor] id` from the same
-    // worktree-scoped `.khive/config.toml` (ADR-096 Fork 2's project-local
-    // `[actor]` injection tier is per-project, not per-session), so the
-    // sub-agent's `from_actor` and the parent label it names collapse onto the
-    // identical string with no error, no warning, and no distinct inbox: the
-    // message silently "delivers" to the sender's own attributed identity
-    // instead of a genuinely different principal. Reject by default; a caller
-    // that truly means to message its own inbox (e.g. a personal reminder) must
-    // say so explicitly via `self_send=true`, turning the collapse loud instead
-    // of silent. `to_actor == "local"` is exempted: that is the anonymous
-    // single-tenant party-line default (both sender and recipient unattributed),
-    // not a collapsed distinct-principal address.
+    // #820: reject a target that collapses onto the sender's own actor identity
+    // unless self_send=true — usually a sub-agent/parent mis-resolution, not intent.
+    // "local" is exempt (anonymous single-tenant party-line default).
+    // See crates/khive-pack-comm/docs/handlers.md#handlersrshandle_send
     if to_actor == from_actor && to_actor != "local" && !p.self_send {
         return Err(RuntimeError::InvalidInput(format!(
             "send: `to` ({to_actor:?}) resolves to the sender's own actor identity \
@@ -107,15 +86,8 @@ pub(crate) async fn handle_send(
         )));
     }
 
-    // #200: addressed sends from an unattributed caller will stamp from_actor="local",
-    // which causes reply-threading collapse when multiple unconfigured actors interact.
-    // This is a known limitation pending issue #75 (actor identity per request).
-    // We surface a visible warning so operators can diagnose mis-attribution; the send
-    // proceeds rather than hard-erroring to preserve backward compatibility with
-    // sessions that set default_namespace but not actor_id.
-    //
-    // Uses the shared actor-identity policy (#567) so this warning fires under
-    // exactly the same "unattributed" definition the gate and token minter use.
+    // #200: unattributed callers stamp from_actor="local", corrupting reply-thread
+    // routing; warn (don't hard-error, for back-compat) rather than silently proceed.
     if khive_runtime::actor_is_unattributed(token.actor()) && to_actor != "local" {
         tracing::warn!(
             to_actor = %to_actor,
@@ -159,11 +131,7 @@ pub(crate) async fn handle_send(
 }
 
 /// `inbox` — list inbound messages for the caller's actor label (ADR-057).
-///
-/// When the caller's actor label is `"local"` (single-actor fallback), no `to_actor`
-/// filter is applied and the inbox behaves as before (party-line). When the caller has
-/// a non-`"local"` actor label, only messages addressed to that actor are returned.
-/// Legacy messages without a `to_actor` field are visible regardless (Q3: OR IS NULL).
+/// See crates/khive-pack-comm/docs/handlers.md#handlersrshandle_inbox
 pub(crate) async fn handle_inbox(
     runtime: &KhiveRuntime,
     token: &NamespaceToken,
@@ -194,9 +162,8 @@ pub(crate) async fn handle_inbox(
 
     let caller_actor = token.actor().id.clone();
 
-    // Push direction + read-status filters into SQL so idx_comm_message_direction is usable.
-    // Read filter uses json_type to match the old as_bool().unwrap_or(false) semantics:
-    // only JSON boolean `true` counts as read; missing/false/string/integer all count as unread.
+    // Push direction + read-status into SQL for idx_comm_message_direction; json_type
+    // read-check keeps only JSON boolean `true` as read (matches prior as_bool semantics).
     let mut property_filters = vec![PropertyFilter {
         json_path: "$.direction".to_string(),
         op: FilterOp::Eq,
@@ -216,16 +183,8 @@ pub(crate) async fn handle_inbox(
         _ => {} // "all" — no read-status filter
     }
 
-    // ADR-057 Q3: filter inbox by to_actor.
-    //
-    // When the caller has a configured actor label (non-"local"), apply an exact
-    // to_actor filter so each actor sees only their own messages. Legacy messages
-    // without a to_actor field (EqOrMissing) remain visible for the configured actor.
-    //
-    // When the caller is anonymous ("local") — the OSS single-tenant case — apply
-    // EqOrMissing("local") so the caller sees only party-line messages (to_actor=
-    // "local" or absent). This closes the #199 multi-actor read leak while preserving
-    // backward-compatible behavior for deployments where everyone is 'local'.
+    // ADR-057 Q3: to_actor filter, EqOrMissing so legacy to_actor-less messages stay
+    // visible; closes the #199 multi-actor read leak for non-"local" callers.
     property_filters.push(PropertyFilter {
         json_path: "$.to_actor".to_string(),
         op: FilterOp::EqOrMissing,
@@ -240,11 +199,8 @@ pub(crate) async fn handle_inbox(
     };
     let store = runtime.notes(token)?;
 
-    // #493: when a sender filter is supplied, apply it in Rust after the standard
-    // direction/status/to_actor filters (which stay pushed into SQL for index usage) —
-    // `FilterOp` has no prefix-match operator, so from_prefix cannot be pushed down.
-    // Pages beyond the first are scanned (same unbounded-page-loop shape `handle_thread`
-    // uses) until `limit` matches are collected or the store is exhausted.
+    // #493: `FilterOp` has no prefix-match op, so a sender filter is applied in Rust
+    // over paged results (see docs/handlers.md#handlersrshandle_inbox) instead of SQL.
     let messages: Vec<Value> = if p.from_actor.is_some() || p.from_prefix.is_some() {
         const PAGE_SIZE: u32 = 200;
         let mut collected: Vec<Value> = Vec::new();
@@ -345,13 +301,8 @@ pub(crate) async fn handle_read(
         )));
     }
 
-    // Merge `read: true` into properties and patch in place via a real
-    // `UPDATE` (not `upsert_note`'s `INSERT OR REPLACE`): the latter
-    // silently deletes and re-inserts the row on a primary-key conflict
-    // (#780). The `comm.probe` cursor is keyed on `notes_seq.seq`, which is
-    // fixed at first insert and survives such churn, so this is defensive
-    // rather than load-bearing; a metadata patch should never rewrite the
-    // row regardless.
+    // Patch via a real `UPDATE`, not `upsert_note`'s `INSERT OR REPLACE` (#780
+    // silently re-inserts the row on conflict). See docs/handlers.md#handlersrshandle_read
     let mut props = note.properties.clone().unwrap_or_else(|| json!({}));
     props["read"] = json!(true);
     let updated_at = Utc::now().timestamp_micros();
@@ -366,7 +317,8 @@ pub(crate) async fn handle_read(
     )
 }
 
-/// `reply` — reply to a message, threading linkage.
+/// `reply` — reply to a message, threading linkage. See
+/// crates/khive-pack-comm/docs/handlers.md#handlersrshandle_reply
 pub(crate) async fn handle_reply(
     runtime: &KhiveRuntime,
     token: &NamespaceToken,
@@ -405,25 +357,17 @@ pub(crate) async fn handle_reply(
         .cloned()
         .unwrap_or_else(|| json!({}));
 
-    // Issue #403: capture the parent's wire Message-ID so native mail clients
-    // (not khive's own X-Khive-Thread-ID/external_id correlation) can group this
-    // reply into the same conversation via In-Reply-To/References. `None` when
-    // the parent has no wire Message-ID -- the reply then sends without those
-    // headers, exactly as before this feature.
+    // Issue #403: parent's wire Message-ID drives In-Reply-To/References for native
+    // mail clients. `None` when the parent has none — see docs/handlers.md.
     let in_reply_to_message_id = parent_wire_message_id(&orig_props);
 
-    // References must carry the FULL ancestor chain per RFC 5322, not just the
-    // immediate parent: the parent's existing chain (if any) followed by the
-    // parent's own Message-ID. `None` when the parent has no wire Message-ID at
-    // all (mirrors `in_reply_to_message_id`); malformed tokens in the parent's
-    // stored chain are individually skipped rather than corrupting the header.
+    // References carries the FULL ancestor chain per RFC 5322, not just the parent.
     let references_chain = in_reply_to_message_id.as_deref().map(|parent_mid| {
         build_references_header(parent_references_chain(&orig_props), parent_mid)
     });
 
-    // UE6-H2: thread_id must always be a full 36-char hyphenated UUID.
-    // If the stored thread_id is a valid full UUID, use it; otherwise fall
-    // back to the original message's own full UUID as the thread root.
+    // UE6-H2: thread_id must be a full 36-char hyphenated UUID; falls back to the
+    // original message's own UUID as thread root when the stored value isn't one.
     let thread_id = orig_props
         .get("thread_id")
         .and_then(Value::as_str)
@@ -431,8 +375,7 @@ pub(crate) async fn handle_reply(
         .map(|u| u.as_hyphenated().to_string())
         .unwrap_or_else(|| original.id.as_hyphenated().to_string());
 
-    // ADR-057: prefer from_actor/to_actor fields when present (actor-addressed messages).
-    // Fall back to from/to namespace strings for legacy messages.
+    // ADR-057: prefer from_actor/to_actor; fall back to from/to for legacy messages.
     let original_from_actor = orig_props
         .get("from_actor")
         .and_then(Value::as_str)
@@ -468,10 +411,7 @@ pub(crate) async fn handle_reply(
     let from_actor_label = token.actor().id.clone();
     let sent_at = Utc::now().to_rfc3339();
 
-    // UE6-H1: route reply to the "other party" — not always to the original sender.
-    // If the reply caller is the original sender (from_actor or from), route to the
-    // original recipient. If the reply caller is the original recipient, route back
-    // to the original sender.
+    // UE6-H1: route to the "other party" — not always the original sender.
     let reply_to = if from_actor_label == original_from {
         original_to.clone()
     } else {
@@ -479,11 +419,7 @@ pub(crate) async fn handle_reply(
     };
 
     // ADR-057: always set from_actor/to_actor on replies (fail-closed on cross-namespace
-    // write). Both copies land in the caller's namespace regardless of whether the
-    // original message carried actor labels. The reply_to label is derived from the
-    // original's actor fields when present, else from the legacy from/to strings treated
-    // as labels. No legacy code path can cause dual_write_message to mint a token in a
-    // foreign namespace.
+    // write) — both copies land in the caller's namespace regardless of legacy labels.
     let reply_from_actor = from_actor_label.clone();
     let reply_to_actor = reply_to.clone();
 
@@ -524,23 +460,11 @@ pub(crate) async fn handle_reply(
     }))
 }
 
-/// `thread` — retrieve all messages in a conversation thread, ordered chronologically.
-///
-/// Returns the originating message (the one whose `id` matches the `thread_id`
-/// root) plus all messages whose `properties.thread_id` equals the root UUID,
-/// ordered by `created_at` ascending (chronological).
-///
-/// Cross-namespace thread resolution: when the resolved note carries a `thread_id`
-/// in its properties that differs from its own UUID, that stored `thread_id` IS the
-/// canonical root (e.g., this is an inbound copy of the root, or a non-root message).
-/// `comm.thread` resolves to that canonical root so that `thread(id=id_A)` and
-/// `thread(id=id_B)` both return the full conversation regardless of which copy UUID
-/// the caller holds.
-///
-/// The root ID is validated: it must exist in the caller namespace and its
-/// `kind` must be `"message"`. A full UUID that does not resolve, belongs to a
-/// different namespace, or has the wrong kind returns an error — the same
-/// behaviour as `read()` and `reply()`.
+/// `thread` — retrieve all messages in a conversation thread, ordered
+/// chronologically: the originating message plus all messages whose
+/// `properties.thread_id` equals the root UUID. The root ID is validated: it
+/// must exist in the caller namespace and its `kind` must be `"message"`.
+/// See crates/khive-pack-comm/docs/handlers.md#handlersrshandle_thread
 pub(crate) async fn handle_thread(
     runtime: &KhiveRuntime,
     token: &NamespaceToken,
@@ -584,16 +508,10 @@ pub(crate) async fn handle_thread(
             )));
         }
 
-        // Cross-namespace root resolution: if the note's properties.thread_id is a
-        // valid full UUID that differs from the note's own UUID, use that as the
-        // canonical thread_id.  This handles the case where the caller holds an
-        // inbound copy UUID (id_B) but the canonical root is the outbound UUID (id_A).
-        // Both copies were written with the same canonical thread_id by dual_write_message.
-        //
-        // Missing/invalid `thread_id` (issue #479b -- e.g. a legacy/imported root
-        // written before the canonical field existed) falls back to the passed
-        // note's own UUID, matching ADR-040: a target with no `thread_id` becomes
-        // the root for its chain.
+        // Cross-namespace root resolution: use the stored thread_id as canonical root
+        // when it differs from the note's own UUID (dual_write_message patches both
+        // copies to match); falls back to the note's own UUID otherwise (issue #479b,
+        // ADR-040). See crates/khive-pack-comm/docs/handlers.md#handlersrshandle_thread
         let canonical = match note
             .properties
             .as_ref()
@@ -611,8 +529,6 @@ pub(crate) async fn handle_thread(
     };
 
     // Push thread_id predicate into SQL so idx_comm_message_thread can be used.
-    // The root note always has properties.thread_id == own_uuid == canonical_thread_id
-    // (patched by dual_write_message), so it is captured by the same SQL filter as replies.
     let thread_store = runtime.notes(token)?;
     let thread_filter = NoteFilter {
         kind: Some("message".to_string()),
@@ -653,13 +569,8 @@ pub(crate) async fn handle_thread(
         db_offset += PAGE_SIZE;
     }
 
-    // Practical equivalent of `id == root OR properties.thread_id == root`
-    // (issue #479b): the SQL filter above only matches `properties.thread_id ==
-    // canonical_thread_id`, which misses a root note that lacks a `thread_id`
-    // property at all (e.g. legacy/imported data). Explicitly include the
-    // already-validated root note when the query didn't already return it, so
-    // `comm.thread(id=root)` never reports an empty/incomplete thread for a
-    // root that exists but predates the canonical `thread_id` field.
+    // Explicitly include the already-validated root when the SQL filter missed it
+    // (issue #479b: a root lacking a `thread_id` property, e.g. legacy/imported data).
     let root_already_present = rows.iter().any(|r| r.full_id == root_note.id);
     if !root_already_present {
         rows.push(ThreadRow {
@@ -669,17 +580,8 @@ pub(crate) async fn handle_thread(
         });
     }
 
-    // #494: `after` cursor — either a message id (short prefix or full
-    // UUID, resolved the same way `id` is) or an RFC 3339 timestamp. An id cursor
-    // resolves to the full `(created_at, full_id)` tuple of the referenced note so
-    // ties on equal microsecond timestamps are broken deterministically instead of
-    // being skipped or duplicated. A timestamp cursor is parsed to microseconds via
-    // chrono (matching the pattern in khive-pack-brain/src/handlers.rs and
-    // khive-vcs/src/sync.rs) rather than compared as a raw string, so non-canonical
-    // but valid RFC 3339 forms (whole-second `Z`, `+00:00` offsets, ...) compare
-    // correctly against khive's canonical microsecond timestamps. An `after` value
-    // that is neither a resolvable id nor a parseable RFC 3339 timestamp is a hard
-    // error — never silently coerced or treated as "no cursor".
+    // #494: `after` cursor — message id or RFC 3339 timestamp; a hard error if
+    // neither. See crates/khive-pack-comm/docs/handlers.md#handlersrshandle_thread
     let after_cursor: Option<AfterCursor> = match p.after.as_deref() {
         None => None,
         Some(raw) => {
@@ -716,10 +618,7 @@ pub(crate) async fn handle_thread(
     };
     if let Some(cursor) = &after_cursor {
         rows.retain(|r| match cursor {
-            // Tuple compare, not timestamp-only: two rows sharing a microsecond
-            // `created_at` (e.g. ADR-057 dual-write self-send copies) are ordered
-            // deterministically by `full_id`, so an id cursor sitting on one of them
-            // never skips or re-includes its tie.
+            // Tuple compare (not timestamp-only) breaks same-microsecond ties by `full_id`.
             AfterCursor::Id {
                 created_at,
                 full_id,
@@ -727,8 +626,7 @@ pub(crate) async fn handle_thread(
                 let row_key = (r.created_at, r.full_id);
                 let cursor_key = (*created_at, *full_id);
                 match order {
-                    // "after" in desc order means further along the desc sequence,
-                    // i.e. strictly older (smaller key) than the cursor.
+                    // desc "after" means further along the desc sequence (strictly older).
                     "desc" => row_key < cursor_key,
                     _ => row_key > cursor_key,
                 }
@@ -740,11 +638,8 @@ pub(crate) async fn handle_thread(
         });
     }
 
-    // Total order: sort by `(created_at, full_id)` — the same tuple the cursor
-    // filter above compares against — ascending for order="asc", reversed for
-    // "desc". Sorting on timestamp alone (prior behavior) left ties among
-    // same-microsecond rows in query-return order, which is not stable across
-    // pages/backends.
+    // Total order: sort by `(created_at, full_id)`, not timestamp alone, so ties
+    // are stable across pages/backends (matches the cursor filter's key above).
     rows.sort_by(|a, b| {
         let a_key = (a.created_at, a.full_id);
         let b_key = (b.created_at, b.full_id);
@@ -764,41 +659,26 @@ pub(crate) async fn handle_thread(
     }))
 }
 
-/// A thread row carries the sort/cursor key (`created_at`, `full_id`) alongside
-/// the already-rendered message JSON, so the total-order sort and cursor filter
-/// in `handle_thread` compare exact `(i64, Uuid)` tuples instead of re-parsing
-/// the ISO string embedded in the JSON.
+/// Sort/cursor key (`created_at`, `full_id`) plus rendered message JSON, so
+/// `handle_thread` compares exact tuples instead of re-parsing the ISO string.
 struct ThreadRow {
     created_at: i64,
     full_id: Uuid,
     json: Value,
 }
 
-/// `after` cursor resolved to a comparable key. An id cursor carries the full
-/// `(created_at, full_id)` tuple of the referenced message for tie-breaking; a
-/// timestamp cursor carries only the parsed microsecond value (there is no
-/// specific row to break ties against).
+/// `after` cursor resolved to a comparable key (id cursor: full tie-break tuple;
+/// timestamp cursor: parsed microseconds only).
 enum AfterCursor {
     Id { created_at: i64, full_id: Uuid },
     Timestamp { micros: i64 },
 }
 
 /// `ingest` — write a single inbound message note from a channel adapter.
-///
-/// This is a `Visibility::Subhandler` verb: it is not accessible via the MCP
-/// wire and is only callable from within the process (e.g. the polling loop in
-/// `khive-mcp`). It is the authoritative write path for all channel-delivered
-/// messages; the polling loop must not bypass it.
-///
-/// Thread resolution: when `correlation_external_id` is supplied, the handler
-/// queries for an existing message note whose `external_id` matches that value,
-/// reads its `thread_id`, and attaches the new note to the same thread.
-///
-/// Deduplication: when `external_id` is supplied, `try_create_note` uses
-/// a verify-after-insert check on the durable unique index on `external_id`.
-/// A confirmed duplicate returns `Ok(None)` without error; only an
-/// external_id collision is treated as dedup; other constraint violations
-/// surface as errors.
+/// `Visibility::Subhandler`: not accessible via the MCP wire, only callable
+/// in-process (e.g. the polling loop in `khive-mcp`); the authoritative write
+/// path for all channel-delivered messages. See
+/// crates/khive-pack-comm/docs/handlers.md#handlersrshandle_ingest
 pub(crate) async fn handle_ingest(
     runtime: &KhiveRuntime,
     token: &NamespaceToken,
@@ -823,11 +703,8 @@ pub(crate) async fn handle_ingest(
             "ingest: `content` must not be empty".into(),
         ));
     }
-    // Reject a malformed caller-supplied thread_id at the boundary (issue #479a):
-    // a present, non-empty `thread_id` that is not a valid UUID must fail closed
-    // rather than being silently dropped and replaced with a fresh UUID, which
-    // would split the message into the wrong conversation. A blank/absent value
-    // is not an error -- it just means "no caller-supplied thread_id".
+    // #479a: a non-empty malformed thread_id must fail closed, not silently get a
+    // fresh UUID (which would split the message into the wrong conversation).
     if let Some(tid) = p
         .thread_id
         .as_deref()
@@ -844,24 +721,12 @@ pub(crate) async fn handle_ingest(
     let ns = token.namespace().as_str();
     let store = runtime.notes(token)?;
 
-    // Thread resolution: if correlation_external_id is present, find the message it refers to
-    // and extract both its internal thread_id and the from_actor of the original sender so that
-    // replies route back to the actor who sent the original, not to the raw email address.
-    //
-    // Two-query fallback: `corr` may be either a Message-ID (matched via $.external_id) from
-    // a human webmail In-Reply-To header, OR a thread UUID (matched via $.thread_id) from
-    // a preserved X-Khive-Thread-ID header on our own outbound emails.  We try external_id
-    // first (preserves the In-Reply-To path); if that misses we fall back to thread_id.
+    // Thread resolution: resolve correlation_external_id to the original message's
+    // thread_id + from_actor. Two-query fallback (Message-ID pass, then thread-UUID
+    // pass) — see crates/khive-pack-comm/docs/handlers.md#handlersrshandle_ingest
     let resolved: Option<(String, String)> = if let Some(ref corr) = p.correlation_external_id {
         if !corr.is_empty() {
             // Pass 1: match by $.external_id (RFC 822 Message-ID, standard In-Reply-To path).
-            // Our own outbound mail stores its Message-ID in wire form `<id@domain>`
-            // (angle brackets included), while `mail_parser` strips the brackets from an
-            // inbound `In-Reply-To`, yielding `id@domain`. Match the correlation key as
-            // received and in its bracket-toggled form so `<id>` and `id` correlate either
-            // way; the exact form is tried first. Restricted to outbound notes (mirrors
-            // Pass 2) so an inbound note's own external_id can never be matched as a
-            // threading parent.
             let mut pass1 = None;
             for candidate in message_id_match_candidates(corr) {
                 let corr_filter = NoteFilter {
@@ -891,14 +756,8 @@ pub(crate) async fn handle_ingest(
                     )
                     .await?;
                 pass1 = corr_page.items.first().map(|n| {
-                    // Fall back to the matched note's own UUID as the canonical
-                    // root (issue #479b) when it carries no valid `thread_id` --
-                    // e.g. a legacy/imported outbound row written before the
-                    // canonical `thread_id` field existed. Per ADR-040, a
-                    // target message with no `thread_id` becomes the root for
-                    // the new chain, so replies stay attached to the right
-                    // conversation/actor instead of splitting into a fresh
-                    // thread routed to the default inbound actor.
+                    // Falls back to the matched note's own UUID as root (#479b, ADR-040)
+                    // when it carries no valid thread_id (e.g. legacy/imported row).
                     let thread_id = n
                         .properties
                         .as_ref()
@@ -1035,12 +894,8 @@ pub(crate) async fn handle_ingest(
     if let Some(ref kind) = p.channel_kind {
         props["channel_kind"] = json!(kind);
     }
-    // Generic transport-layer metadata passthrough (issue #448): merged
-    // additively so it can never clobber the identity/routing fields set above --
-    // a key already present (from, to, from_actor, to_actor, direction, read,
-    // thread_id, sent_at, subject, external_id, wire_message_id, wire_references,
-    // channel_kind) always wins. The comm pack does not interpret any metadata
-    // key; the email channel happens to use it for quarantine markers.
+    // Metadata passthrough (#448): merged additively so it never clobbers the
+    // identity/routing fields set above — a key already present always wins.
     if let Some(metadata) = p.metadata {
         if let Some(obj) = props.as_object_mut() {
             for (k, v) in metadata {
@@ -1083,25 +938,10 @@ pub(crate) async fn handle_ingest(
 }
 
 /// Deterministic UUID identifying the `channel_health` row for one
-/// `(namespace, channel_kind, channel_slug)` triple (khive #606).
-///
-/// Deterministic (not `Uuid::new_v4`) so `handle_heartbeat` can compute the
-/// same id on every poll tick and `upsert_note`'s `INSERT OR REPLACE` updates
-/// the same row instead of accumulating a new one per tick. Keying by slug in
-/// addition to kind is the point of #606's amendment 2: two accounts of the
-/// same kind (e.g. two mailboxes, both `kind() == "email"`) must not collapse
-/// into a single row.
-///
-/// The three components are hashed as a JSON array of strings, NOT joined
-/// with a `:` delimiter. Namespaces
-/// may themselves contain `:` (hierarchical namespace strings are explicitly
-/// allowed), so a delimiter-joined `format!("...:{a}:{b}:{c}")` is not an
-/// injective encoding: `(namespace="a:b", channel_kind="c", channel_slug="d")`
-/// and `(namespace="a", channel_kind="b:c", channel_slug="d")` both produced
-/// the identical string `"khive:channel_health:a:b:c:d"` under the old
-/// scheme. `serde_json::to_vec` of an array of strings is unambiguous —
-/// each element is quoted and internal quotes/backslashes are escaped — so
-/// distinct triples always serialize to distinct byte sequences.
+/// `(namespace, channel_kind, channel_slug)` triple (khive #606). Hashes the
+/// triple as a JSON array (not a `:`-joined string, which is not injective
+/// when a component itself contains `:`). See
+/// crates/khive-pack-comm/docs/handlers.md#handlersrsheartbeat_note_id
 fn heartbeat_note_id(namespace: &str, channel_kind: &str, channel_slug: &str) -> Uuid {
     let key = serde_json::to_vec(&(
         "khive:channel_health",
@@ -1115,26 +955,17 @@ fn heartbeat_note_id(namespace: &str, channel_kind: &str, channel_slug: &str) ->
 
 /// `heartbeat` — persist one poll attempt's outcome into the channel's
 /// heartbeat row (khive #606). Subhandler — only the daemon's channel poll
-/// loop (`crates/khive-mcp/src/serve.rs::channel_poll_loop`) calls this.
-///
-/// Read-modify-write against the existing row (if any) so that:
-/// - `created_at` is preserved across updates (first-seen time), not reset
-///   every tick.
-/// - `last_error` is RETAINED across a subsequent success (design review
-///   amendment 3): callers compare `last_error.at` against
-///   `last_success_at`/`last_failure_at` to tell a resolved issue from a live
-///   one, so a success must never clear it.
-/// - `consecutive_failures` resets to 0 on success and increments on failure,
-///   read from the prior row rather than any in-process counter, so it is
-///   correct even across a daemon restart.
+/// loop calls this. Read-modify-write: `created_at` is preserved across
+/// updates, `last_error` is RETAINED across a subsequent success (design
+/// review amendment 3), and `consecutive_failures` resets on success /
+/// increments on failure, read from the prior row (correct across restarts).
 pub(crate) async fn handle_heartbeat(
     runtime: &KhiveRuntime,
     token: &NamespaceToken,
     params: Value,
 ) -> Result<Value, RuntimeError> {
-    // Note: HeartbeatParams does not use deny_unknown_fields — mirrors
-    // IngestParams, since the poll loop passes `namespace` alongside these
-    // fields for VerbRegistry::dispatch to consume before the handler runs.
+    // HeartbeatParams omits deny_unknown_fields — mirrors IngestParams (dispatch
+    // consumes `namespace` before the handler runs).
     let p: HeartbeatParams = serde_json::from_value(params)
         .map_err(|e| RuntimeError::InvalidInput(format!("heartbeat: bad params: {e}")))?;
 
@@ -1168,21 +999,9 @@ pub(crate) async fn handle_heartbeat(
         ));
     }
 
-    // Issue #606: heartbeat rows are an
-    // OPERATIONAL surface, not message data. Persist to
-    // `crate::CHANNEL_HEALTH_NAMESPACE` ALWAYS — never `token.namespace()` —
-    // so a poll loop configured with a non-local `KHIVE_EMAIL_INGEST_NAMESPACE`
-    // cannot cause heartbeat rows to land anywhere but this one fixed
-    // namespace. This is enforced here (not just at the serve.rs call site)
-    // so the guarantee holds even if a future caller passes a different
-    // `namespace` dispatch param.
-    //
-    // `handle_health` (khive #877) no longer mirrors this fixed pin: it reads
-    // from `token.namespace()`, which only resolves to this same constant
-    // for an unscoped (default-namespace) caller. An explicitly-scoped
-    // `comm.health` caller reads its own namespace, not wherever this
-    // handler wrote — do not reintroduce a `handle_health` read of this
-    // constant to "fix" that; it is the cross-namespace leak #877 closed.
+    // #606: heartbeat rows are OPERATIONAL, not message data — always persist to
+    // `CHANNEL_HEALTH_NAMESPACE`, never `token.namespace()` (never read back by
+    // `handle_health`'s #877 namespace-scoped read either; see docs/handlers.md).
     let ns = crate::CHANNEL_HEALTH_NAMESPACE;
     let store = runtime.notes(token)?;
     let id = heartbeat_note_id(ns, &p.channel_kind, &p.channel_slug);
@@ -1282,61 +1101,17 @@ fn channel_health_to_json(note: &Note) -> Value {
     })
 }
 
-/// `health` — read-only per-channel health snapshot (khive #606).
+/// `health` — read-only per-channel health snapshot (khive #606). Reads
+/// `channel_health` rows from `token.namespace()` (khive #877 namespace
+/// scoping); never returns a computed `healthy: bool` — that judgment belongs
+/// to the caller. See crates/khive-pack-comm/docs/handlers.md#handlersrshandle_health
+/// for the `role`/`namespace`/`resource` field semantics (ADR-103 Stage 1).
 ///
-/// Reads the daemon-persisted `channel_health` rows from `token.namespace()`
-/// (khive #877) — the same injected-namespace resolution every other comm
-/// verb uses (ADR-007 Rev 6 Rule 3: `namespace=` is the caller's explicit
-/// escape; absent that, the token pins to `"local"`). Unscoped callers
-/// (single-tenant local daemon, the common case) see exactly what they saw
-/// before this fix, since heartbeat rows still land under
-/// `crate::CHANNEL_HEALTH_NAMESPACE` (`"local"`) and an unscoped token also
-/// resolves to `"local"`. A caller that passes an explicit non-local
-/// `namespace=` now reads that namespace's rows only — never `"local"`'s —
-/// closing the cross-namespace operational-surface leak that held this verb
-/// off the cloud data plane (#877). `role` answers "who owns the loops", not
-/// "whose memory answered": any persisted row means some daemon owns the
-/// channel loops, so `role` is reported as `"daemon"` with
-/// `source: "daemon-heartbeat"` regardless of whether THIS process is that
-/// daemon. `role: "client"` with an empty `channels` array is correct both
-/// when no daemon heartbeat state exists at all (fresh install, or a daemon
-/// that has never completed a poll tick) and when the caller's injected
-/// namespace has no heartbeat rows of its own — the comm pack has no
-/// visibility into which channels are configured (that lives in
-/// `khive-mcp`/`khive-channel-email`), so an empty result is the only
-/// fact-based response available at this layer.
-///
-/// `namespace` in the response (khive #877) is the namespace actually read —
-/// `token.namespace().as_str()`, echoed back so the shape is self-describing
-/// for both the unscoped and the explicitly-scoped case. This exists because
-/// `role: "client"` / empty `channels` is now ambiguous on its own: it is the
-/// correct, expected shape for a `namespace=`-scoped call in the shipped OSS
-/// build, since `comm.heartbeat` only ever persists under
-/// `crate::CHANNEL_HEALTH_NAMESPACE` (`"local"`) — there is no OSS producer
-/// for tenant-scoped heartbeat rows yet (that is cloud-side follow-up, not
-/// this handler's job). A caller reading `namespace: "tenant-a"` alongside
-/// `role: "client"` can tell "no daemon anywhere" (unscoped call, `namespace:
-/// "local"`) apart from "no rows written under my scope yet" (scoped call,
-/// `namespace: "tenant-a"`) without khive silently falling back to `"local"`
-/// to paper over the difference.
-///
-/// Never returns a computed `healthy: bool` (design review amendment: "report
-/// timestamps only") — staleness/alerting judgment belongs to the caller.
-///
-/// `resource` (ADR-103 Stage 1, issue #723 ask 2): a process-level self-report
-/// of this process's own cumulative CPU time and RSS (via `getrusage`,
-/// `khive_runtime::process_resource_usage`) plus the names of any background
-/// phases (e.g. `ann_warm`) currently in flight in this process
-/// (`khive_runtime::active_phase_names`). "This process" is, in the common
-/// case, the daemon itself: a client-role stdio session without an in-memory
-/// poll loop of its own still forwards `dispatch` calls to the daemon over
-/// its socket, so this handler body executes inside the daemon process, not
-/// the thin client. `cpu_us`/`rss_bytes` are `null` only if the underlying
-/// `getrusage` read is unavailable on this platform; `active_phases` is
-/// always present and empty when nothing is in flight. Raw observations
-/// only, per the same "no computed healthy bool" rule as the rest of this
-/// verb — attributing severity to a given CPU/RSS number is the caller's
-/// judgment, not this verb's.
+/// `resource` is a process-level self-report of this process's own CPU/RSS
+/// (via `getrusage`) plus in-flight background phase names. `cpu_us`/
+/// `rss_bytes` are `null` only if `getrusage` is unavailable; `active_phases`
+/// is always present and empty when nothing is in flight — raw observations
+/// only, same "no computed healthy bool" rule as the rest of this verb.
 pub(crate) async fn handle_health(
     runtime: &KhiveRuntime,
     token: &NamespaceToken,
@@ -1424,34 +1199,12 @@ pub(crate) struct ProbeMessage {
 }
 
 /// The single indexed read powering `comm.probe` (ADR-D5). `INDEXED BY
-/// idx_comm_message_to_actor` is a regression fence: if a custom bootstrap
-/// skips comm schema-plan application, this query fails loudly instead of
-/// silently degrading to a table scan.
-///
-/// `cursor_us`/`since_us` are keyed on `notes_seq.seq`, not SQLite `rowid`
-/// and not `created_at` (#780, #827):
-///
-/// - `created_at` is an application-clock read taken before a note's write
-///   acquires the writer critical section, so two concurrent writers can
-///   commit out of stamp order; a `created_at`-keyed cursor can then advance
-///   past a row that committed *after* it, permanently hiding that row from
-///   every later probe.
-/// - `notes.rowid` looked monotonic with commit order, but `notes` has a
-///   TEXT PRIMARY KEY, so that rowid is *implicit*: SQLite may renumber it
-///   on `VACUUM` (khive exposes `memory.vacuum`), and reuses the highest
-///   rowid once that row is hard-deleted (khive exposes a public hard
-///   delete), either of which can permanently exclude a later message whose
-///   rowid lands at or below an already-issued cursor.
-///
-/// `notes_seq.seq` fixes both: it is assigned once, inside the same writer
-/// transaction as the note's insert, from a dedicated `INTEGER PRIMARY KEY
-/// AUTOINCREMENT` sequence that VACUUM never renumbers and SQLite never
-/// reuses (see `sql/007-notes-seq.sql`). The wire field names keep the `_us`
-/// suffix (frozen contract, ADR-D5) but the value is an opaque monotonic
-/// token, not a microsecond timestamp; do not revert this to `created_at` or
-/// `rowid`. `created_at_us` on each `new_messages` entry is unaffected: it
-/// stays a real display timestamp, still ordered ascending by `created_at`
-/// for readability, and carries no cursor guarantee of its own.
+/// idx_comm_message_to_actor` is a regression fence against silent table scans.
+/// `cursor_us`/`since_us` are keyed on `notes_seq.seq`, NOT `created_at` or
+/// SQLite `rowid` — both can regress/collide across concurrent writers, VACUUM,
+/// or hard-delete. Do not revert to either. See
+/// crates/khive-pack-comm/docs/handlers.md#handlersrsprobe_sql for the full
+/// #780/#827 incident history.
 const PROBE_SQL: &str = "WITH \
 stats AS ( \
     SELECT \
@@ -1537,17 +1290,8 @@ pub(crate) async fn handle_probe(
 }
 
 /// A caller-supplied `since_us` above `notes_seq`'s durable high-water mark
-/// (`sqlite_sequence.seq` for the `notes_seq` table) cannot be a genuine
-/// cursor -- `notes_seq` starts at 1 and grows by exactly one per note ever
-/// inserted, so no value this store ever handed out can exceed the highest
-/// value it has ever assigned. Such a `since_us` is a pre-upgrade
-/// persisted-timestamp cursor (#827): a real Unix-microsecond timestamp from
-/// after 1970-01-12 already exceeds any realistic note count by orders of
-/// magnitude. Comparing against the actual high-water mark, instead of a
-/// fixed ceiling, keeps this correct forever as `notes_seq` grows -- a fixed
-/// ceiling would eventually reset a legitimate high sequence value to
-/// baseline, contradicting `comm.probe`'s opaque round-trip contract
-/// (`vocab.rs`).
+/// cannot be a genuine cursor — it must be a pre-upgrade persisted-timestamp
+/// cursor (#827). See crates/khive-pack-comm/docs/handlers.md#handlersrsnotes_seq_high_water_mark
 async fn notes_seq_high_water_mark(
     reader: &mut Box<dyn khive_storage::sql::SqlReader>,
 ) -> Result<i64, RuntimeError> {
@@ -1650,12 +1394,8 @@ async fn query_probe(
         });
     }
 
-    // Never let the returned cursor regress below what the caller already
-    // holds (#827): if the message that previously held the highest
-    // `notes_seq.seq` was hard-deleted since the last probe, `MAX(seq)` over
-    // the remaining rows can be smaller than a cursor already handed out.
-    // Clamping here, rather than in SQL, keeps the single indexed query a
-    // pure aggregate with no extra branch.
+    // #827: never let the returned cursor regress below what the caller already
+    // holds (a hard-deleted high-seq row can lower MAX(seq) below a prior cursor).
     if let Some(floor) = effective_since {
         if cursor_us < floor {
             cursor_us = floor;
@@ -1670,14 +1410,9 @@ async fn query_probe(
 }
 
 /// `cursor_get` — read the persisted channel poll checkpoint for
-/// `(channel_kind, channel_slug)` (issue #449). Subhandler — only the
-/// daemon's channel poll loop calls this. Returns JSON `null` when no row
-/// exists yet (first-run compatibility mode).
-///
-/// Runs the pack-owned `comm_channel_cursor` schema statement before the
-/// query so an in-memory/test runtime that never applied the boot-time
-/// schema plan still works (matches the repository's lazy pack-schema
-/// bootstrap convention).
+/// `(channel_kind, channel_slug)` (issue #449). Subhandler. Returns JSON
+/// `null` when no row exists yet. Runs the pack-owned schema statement first
+/// (lazy pack-schema bootstrap for in-memory/test runtimes).
 pub(crate) async fn handle_cursor_get(
     runtime: &KhiveRuntime,
     params: Value,
@@ -1844,13 +1579,9 @@ pub(crate) async fn handle_cursor_commit(
     }))
 }
 
-/// Candidate `$.external_id` values to match an inbound correlation key against.
-///
-/// Outbound mail stores its Message-ID in wire form `<id@domain>` (angle brackets
-/// included); `mail_parser` strips those brackets from an inbound `In-Reply-To`,
-/// yielding `id@domain`. To correlate a reply back to the sending actor we must
-/// match either representation, so this returns the key as received plus its
-/// bracket-toggled variant, exact form first.
+/// Candidate `$.external_id` values (as received, plus bracket-toggled) to
+/// match an inbound correlation key against. See
+/// crates/khive-pack-comm/docs/handlers.md#message-id--references-header-helpers-403
 fn message_id_match_candidates(corr: &str) -> Vec<String> {
     let bare = corr
         .strip_prefix('<')
@@ -1863,13 +1594,8 @@ fn message_id_match_candidates(corr: &str) -> Vec<String> {
     }
 }
 
-/// Normalize a stored Message-ID into RFC 5322 wire form (angle-bracketed).
-///
-/// Stored values may already be bracketed (an outbound note's self-minted
-/// `external_id`, e.g. `<uuid@domain>`) or bracket-free (an inbound note's
-/// `wire_message_id`, since `mail_parser` strips brackets when parsing). This is
-/// the single place that normalizes to the wire form the `In-Reply-To` /
-/// `References` headers require.
+/// Normalize a stored Message-ID into RFC 5322 wire form (angle-bracketed);
+/// the single place that does so for `In-Reply-To`/`References` headers.
 fn wrap_message_id(raw: &str) -> String {
     let trimmed = raw.trim();
     if trimmed.starts_with('<') && trimmed.ends_with('>') {
@@ -1879,16 +1605,10 @@ fn wrap_message_id(raw: &str) -> String {
     }
 }
 
-/// Resolve the parent message's wire Message-ID for an outbound reply's
-/// `In-Reply-To`/`References` headers (issue #403).
-///
-/// Direction-aware: an outbound parent's own Message-ID is self-minted into
-/// `external_id` at send time (e.g. `<uuid@domain>`). An inbound parent's
-/// Message-ID lives in `wire_message_id` instead -- an inbound note's
-/// `external_id` is the IMAP UIDVALIDITY/UID dedup key, never a Message-ID, and
-/// must not be read here. Returns `None` when the parent carries no wire
-/// Message-ID at all (e.g. a khive-internal parent, or an email parent the
-/// channel never captured one for).
+/// Resolve the parent message's wire Message-ID (issue #403), direction-aware:
+/// outbound parents read `external_id`, inbound parents read `wire_message_id`
+/// (never the reverse — `external_id` on an inbound note is the IMAP dedup
+/// key, not a Message-ID). `None` when the parent has no wire Message-ID.
 fn parent_wire_message_id(orig_props: &Value) -> Option<String> {
     let direction = orig_props.get("direction").and_then(Value::as_str);
     let raw = if direction == Some("outbound") {
@@ -1905,16 +1625,10 @@ fn parent_wire_message_id(orig_props: &Value) -> Option<String> {
 }
 
 /// Resolve the parent message's own `References` chain, direction-aware
-/// (issue #403 finding: References must carry the full ancestor chain, not
-/// just the immediate parent).
-///
-/// An inbound parent's chain (as received over the wire) lives in
-/// `wire_references`. An outbound parent's chain is whatever we persisted on
-/// it as `references_chain` when *it* was sent (i.e. the chain that reply
-/// itself extended) -- an outbound note that was a fresh send, not a reply,
-/// carries no `references_chain`. Returns `None` when the parent has no chain
-/// to extend; the caller then falls back to the parent's Message-ID alone,
-/// matching RFC 5322 (References = prior chain, if any, + parent Message-ID).
+/// (inbound: `wire_references`; outbound: `references_chain`). `None` when
+/// the parent has no chain to extend (RFC 5322: caller then falls back to the
+/// parent's Message-ID alone). See
+/// crates/khive-pack-comm/docs/handlers.md#message-id--references-header-helpers-403
 fn parent_references_chain(orig_props: &Value) -> Option<&str> {
     let direction = orig_props.get("direction").and_then(Value::as_str);
     let raw = if direction == Some("outbound") {
@@ -1963,16 +1677,10 @@ fn bare_reference_id(token: &str) -> String {
         .to_string()
 }
 
-/// Build the full `References` header value for a reply: the parent's existing
-/// chain (each token individually sanitized; malformed tokens skipped per
-/// issue #403 finding), followed by the parent's own Message-ID.
-///
-/// `parent_chain` tokens are whitespace-separated per RFC 5322. `parent_message_id`
-/// is expected already wire-wrapped (as returned by [`parent_wire_message_id`]).
-/// A stored chain can already contain an equivalent of the parent's own id (e.g.
-/// tainted or legacy data); tokens are de-duplicated by their bracket-stripped
-/// form, keeping first-seen order, so the parent id is skipped rather than
-/// appended a second time when an equivalent token is already present.
+/// Build the full `References` header value for a reply: the parent's
+/// existing chain (sanitized, malformed tokens skipped) followed by the
+/// parent's own Message-ID, de-duplicated by bracket-stripped form
+/// (first-seen order). `parent_message_id` is expected already wire-wrapped.
 fn build_references_header(parent_chain: Option<&str>, parent_message_id: &str) -> String {
     let chain_tokens = parent_chain
         .map(|chain| {

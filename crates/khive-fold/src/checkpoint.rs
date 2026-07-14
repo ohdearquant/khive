@@ -230,10 +230,8 @@ impl<S: Clone + Send + Sync + Serialize + 'static> CheckpointStore<S>
 }
 
 /// Sort a `Vec<String>` of checkpoint IDs into lexicographic order.
-///
-/// Extracted as a standalone helper so it can be unit-tested with intentionally
-/// unsorted input, giving fail-before/pass-after coverage independent of
-/// `HashMap` randomisation.
+/// See crates/khive-fold/docs/design.md#test-rationale-notes for why this is
+/// a standalone helper.
 pub fn sort_checkpoint_keys(mut keys: Vec<String>) -> Vec<String> {
     keys.sort();
     keys
@@ -443,13 +441,8 @@ mod tests {
         assert_eq!(ids.len(), n, "expected {n} checkpoints, got {}", ids.len());
     }
 
-    /// `sort_checkpoint_keys` must return lexicographic order on an intentionally
-    /// reverse-sorted input.
-    ///
-    /// This is a fail-before/pass-after unit test for the ordering helper itself:
-    /// the old `HashMap.keys().cloned().collect()` path returned keys in HashMap
-    /// iteration order (non-deterministic).  Passing a reversed vector guarantees
-    /// the test fails against any implementation that skips the sort step.
+    // Reverse-sorted input is the worst case for an unsorted implementation;
+    // see design.md#test-rationale-notes.
     #[test]
     fn sort_checkpoint_keys_produces_lexicographic_order() {
         // Intentionally REVERSE alphabetical — worst case for unsorted implementations.

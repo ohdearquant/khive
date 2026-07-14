@@ -128,11 +128,7 @@ impl VamanaGraph {
         })
     }
 
-    /// Rebuild `reverse_adj` from scratch by scanning the current `adjacency`.
-    ///
-    /// O(N × R) where N is node count and R is average out-degree. Called after
-    /// `build()` completes, and after `load` / `from_snapshot` restores adjacency
-    /// from disk (v1 format does not persist `reverse_adj`).
+    /// Rebuild `reverse_adj` from `adjacency`. See crates/khive-vamana/docs/algorithm.md#reverse-adjacency-rebuild for cost and call-site rationale.
     pub(crate) fn rebuild_reverse_adj_from_adjacency(&mut self) {
         let n = self.adjacency.len();
         let mut rev: Vec<Vec<u32>> = vec![Vec::new(); n];
@@ -276,11 +272,8 @@ impl VamanaGraph {
     }
 
     /// Build a Vamana graph using SQ8 acquisition-tier distances (ADR-052 §1, Step 2).
-    ///
-    /// Identical to `build` but routes greedy search and RobustPrune candidate scoring
-    /// through `GsSq8Codec::l2_sq` (integer L2²) instead of the f32 kernel. The graph
-    /// topology produced is equivalent; caller trains the codec and encodes the corpus
-    /// before calling this function.
+    /// Produces a topology equivalent to `build`; caller must train `codec` and encode
+    /// `vectors` into `encoded` first (see crates/khive-vamana/docs/algorithm.md#sq8-acquisition-tier).
     pub fn build_sq8(
         vectors: &[f32],
         encoded: &[GsEncodedVector],
@@ -454,11 +447,7 @@ impl VamanaGraph {
         &mut self.adjacency
     }
 
-    /// Install a previously serialized in-neighbor list as `reverse_adj`.
-    /// Called by the v2 fast-load path after `load_v2_fast` has already paid the O(N*R)
-    /// cost to validate bidirectional consistency against the forward adjacency; this call
-    /// itself is O(1) (a move). The O(N*R) work is not avoided — it is done by the
-    /// consistency check before this call, not here.
+    /// Install a pre-validated in-neighbor list as `reverse_adj`. See crates/khive-vamana/docs/persistence.md#v2-fast-load-path for the validation this relies on.
     pub(crate) fn restore_reverse_adj(&mut self, reverse_adj: Vec<Vec<u32>>) {
         self.reverse_adj = reverse_adj;
     }
@@ -468,10 +457,7 @@ impl VamanaGraph {
         (&mut self.adjacency, &mut self.reverse_adj)
     }
 
-    /// Replace `adjacency[node]` with `new_neighbors` and update `reverse_adj` in lockstep.
-    ///
-    /// For every node removed from the old list, `node` is removed from its `reverse_adj`
-    /// entry. For every node added, `node` is appended. Called by Wolverine repair.
+    /// Replace `adjacency[node]` with `new_neighbors`, updating `reverse_adj` in lockstep.
     pub(crate) fn replace_adjacency_and_update_reverse(
         &mut self,
         node: u32,
@@ -537,9 +523,9 @@ impl VamanaGraph {
 
     /// Run greedy beam search from the medoid and return the `k` nearest candidates.
     ///
-    /// `tombstones` is an optional bit-packed slice produced by `VamanaIndex`.
-    /// Tombstoned nodes are skipped during beam expansion (defense-in-depth for
-    /// the pre-PR4 window where the Wolverine invariant is not crash-safe).
+    /// `tombstones` is an optional bit-packed slice produced by `VamanaIndex`; when
+    /// present, tombstoned nodes are skipped during beam expansion and excluded from
+    /// results (see crates/khive-vamana/docs/algorithm.md#tombstone-defense-in-depth).
     // REASON: `tombstones` was added to the existing 7-parameter signature (PR2);
     // bundling params into a struct would add allocation overhead on the hot path.
     #[allow(clippy::too_many_arguments)]
@@ -806,11 +792,9 @@ pub(crate) fn robust_prune_inner(
     selected
 }
 
-/// SQ8 acquisition-tier greedy search (ADR-052 §1, two-tier principle).
-///
-/// Uses `GsSq8Codec::l2_sq` on pre-encoded corpus vectors for the frontier priority queue
-/// (candidate acquisition), then re-scores the final top-k with exact f32 L2².
-/// The caller is responsible for: tombstone filtering, dimension checks, k > 0 check.
+/// SQ8 acquisition-tier greedy search: two-tier candidate acquisition + exact re-score.
+/// See crates/khive-vamana/docs/algorithm.md#sq8-acquisition-tier. Caller must do
+/// tombstone filtering, dimension checks, and k > 0 check.
 // REASON: nine parameters mirror `greedy_search_inner`; the SQ8 codec + encoded slice
 // are the only additions. Bundling into a struct would add allocation overhead on the hot path.
 #[allow(clippy::too_many_arguments)]
@@ -930,14 +914,9 @@ pub(crate) fn greedy_search_inner_sq8(
     }
 }
 
-/// SQ8 acquisition-tier robust prune (ADR-052 §1, two-tier principle).
-///
-/// Uses `GsSq8Codec::l2_sq` on pre-encoded corpus vectors for candidate scoring and
-/// ordering; equal SQ8 scores are tiebroken by exact f32 distance. The alpha
-/// diversity predicate itself uses exact f32 distances on both sides (node→candidate
-/// and selected→candidate), so equal-code collisions cannot vacuously prune. Selected
-/// neighbor IDs match the f32 variant on the collision cases covered by tests; callers
-/// that need exact distances re-score after prune.
+/// SQ8 acquisition-tier robust prune: SQ8-scored candidates, exact-f32 alpha predicate.
+/// See crates/khive-vamana/docs/algorithm.md#sq8-acquisition-tier for why the predicate
+/// stays exact-f32 (SQ8 code collisions would otherwise vacuously prune).
 // REASON: mirrors robust_prune_inner signature with two additional SQ8 params (encoded, codec).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn robust_prune_inner_sq8(
