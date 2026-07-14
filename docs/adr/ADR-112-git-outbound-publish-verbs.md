@@ -251,7 +251,8 @@ authorization, and hygiene scanning have completed:
    visible reconciliation marker. They are therefore validated, not pattern-scanned.
 3. **Deny path.** Any hit not covered by an allowlist escape produces a synchronous deny to
    the caller (see "Deny semantics") and an additional typed audit record (see "Audit and
-   the event plane"). No GitHub API call is made.
+   the event plane"). No GitHub API call is made, and no operation-ledger row is claimed;
+   the rejected normalized request therefore has no recovery-ledger representation.
 4. **Comment-target read check.** For `git.publish_comment`, the handler performs the
    repository-scoped, kind-aware read described in "Comment target grammar". This is a
    read-only validation call, not a content write.
@@ -299,16 +300,16 @@ matching every other khive verb's error contract) with scan-specific fields:
   "tool": "git.publish_issue",
   "error": "publication-hygiene: denied",
   "hits": [
-    { "field": "body", "pattern_id": "actor-token-namespace-prefix", "excerpt": "...te***** the" }
+    { "field": "body", "pattern_id": "actor-token-namespace-prefix" }
   ]
 }
 ```
 
 - `hits` lists every field/pattern combination that matched (not just the first), so a
   caller can fix everything in one pass instead of retrying repeatedly.
-- `excerpt` shows masked context around the match - enough for the caller to locate the
-  offending text, never the full matched span unmasked. A deny response must not itself
-  become a channel for the content it is denying.
+- A hit contains only the outward field name and stable pattern id. It contains no matched
+  span, excerpt, prefix, suffix, hash, length, or other value derived from the denied field.
+  A deny response must not itself become a channel for the content it is denying.
 - The batch does not abort on a deny: a failed publish op in a multi-op `request` batch is
   one failed entry among others, per the standing khive batch contract.
 - No silent rewrite. The verb never substitutes, truncates, or auto-corrects denied text;
@@ -386,25 +387,34 @@ Outcome mapping is exact:
 
 Every additional row carries these required payload keys:
 
-| Key             | Contract                                                                                                                                      |
-| --------------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
-| `audit_type`    | `publication_hygiene` for a scan deny; `github_publish` otherwise                                                                             |
-| `verb`          | The same precise publish verb as the Event's top-level `verb`                                                                                 |
-| `repo`          | Canonical `owner/name` slug, or `null` if repository validation failed                                                                        |
-| `target`        | `issue`, `pr`, the canonical comment target such as `issue#42`, `tag:<tag>` for a release, or `null` if target validation failed              |
-| `operation_id`  | Canonical idempotency UUID supplied by the call, or `null` if key validation failed                                                           |
-| `state`         | Recovery state after this invocation, or `not_claimed` if the operation ledger was not reached                                                |
-| `rule_ids`      | Sorted, unique pattern ids on deny; empty array otherwise                                                                                     |
-| `denied_fields` | Sorted, unique outward field names on deny (including `tag`, `head`, or `base` when applicable); empty array otherwise                        |
-| `field_count`   | Number of distinct denied fields on deny; zero otherwise                                                                                      |
-| `remote_url`    | Published URL on success and whenever already known during recovery; `null` otherwise                                                         |
-| `remote_number` | Positive issue/PR number on issue or PR success; `null` for comments, releases, denies, and errors before that identity is known              |
-| `remote_id`     | Comment id on comment success; `null` for issues, pull requests, releases, denies, and errors before that identity is known                   |
-| `stage`         | `validation`, `scan`, `remote_publish`, `remote_reconcile`, `graph_ingest`, or `audit_append` on denied/error outcomes; `complete` on success |
+| Key             | Contract                                                                                                                                       |
+| --------------- | ---------------------------------------------------------------------------------------------------------------------------------------------- |
+| `audit_type`    | `publication_hygiene` for a scan deny; `github_publish` otherwise                                                                              |
+| `verb`          | The same precise publish verb as the Event's top-level `verb`                                                                                  |
+| `repo`          | Canonical, configured `owner/name` slug after grammar and allowlist checks; `null` before both checks succeed                                  |
+| `target`        | `issue`, `pr`, or the content-free literal `release`; for a comment, its canonical target only after the kind-aware read succeeds, else `null` |
+| `operation_id`  | Canonical idempotency UUID supplied by the call, or `null` if key validation failed                                                            |
+| `state`         | Recovery state after this invocation, or `not_claimed` if the operation ledger was not reached                                                 |
+| `rule_ids`      | Sorted, unique pattern ids on deny; empty array otherwise                                                                                      |
+| `denied_fields` | Sorted, unique outward field names on deny (including `tag`, `head`, or `base` when applicable); empty array otherwise                         |
+| `field_count`   | Number of distinct denied fields on deny; zero otherwise                                                                                       |
+| `remote_url`    | Published URL on success and whenever already known during recovery; `null` otherwise                                                          |
+| `remote_number` | Positive issue/PR number on issue or PR success; `null` for comments, releases, denies, and errors before that identity is known               |
+| `remote_id`     | Comment id on comment success; `null` for issues, pull requests, releases, denies, and errors before that identity is known                    |
+| `stage`         | `validation`, `scan`, `remote_publish`, `remote_reconcile`, `graph_ingest`, or `audit_append` on denied/error outcomes; `complete` on success  |
 
-No title, body, notes, tag, head, base, label, assignee, matched span, or excerpt is stored
-in this payload. `rule_ids` and `denied_fields` identify the rules and field names that
-caused a hygiene denial without persisting the rejected content.
+For `git.publish_release`, `target` is the literal `release` for every outcome, including
+validation failures, scan denials, transport errors, and recovery errors; the tag is never
+copied into `target` or another payload key. Before the repository allowlist check or a
+comment's kind-aware read succeeds, the corresponding `repo` or comment `target` is `null`.
+
+No title, body, notes, tag, head, base, label, assignee, matched span, excerpt, or value
+derived from one is stored in this payload. `rule_ids` and `denied_fields` identify the
+rules and field names that caused a hygiene denial without persisting the rejected content.
+Normatively, no value from a field that failed validation or caused a hygiene denial may
+appear in any audit payload, Event, operation-ledger row, log line, error message, or error
+response. The automatic Gate audit row is also content-free: per ADR-018 it records the
+verb and decision envelope, not request arguments.
 
 These rows are **additional to**, not replacements for, the dispatch-audit row that
 `VerbRegistry` already attempts for every call. The automatic row also has
@@ -501,6 +511,10 @@ the normalized request needed for local replay, `marker`, `state`, `remote_url`,
 `remote_number`, `remote_id`, `note_id`, `audit_event_id`, `last_error`, `created_at`, and
 `updated_at`. The stored request has already passed the hygiene and secret scans, is local
 daemon state, and must never be copied into an Event payload or error response.
+Because the scan precedes the ledger claim, a validation failure or hygiene denial creates
+no ledger row. `last_error` is a code-selected, content-free error class and stage; it never
+contains transport stdout or stderr, a command or argv rendering, or any caller-supplied
+field value. The same restriction applies to tracing and all other log output.
 
 The closed v0 state set and transitions are:
 
@@ -589,8 +603,8 @@ The token-denylist (scan layer 1) and allowlist-escape (scan layer 3) patterns a
 in TOML files, loaded by both the server-side verb handler and the client-side pre-tool-use
 hook described in the Context section. Both implementations must reach the same allow/deny
 decision on the same content. The authoritative paths, overlay selection, content revision,
-reload behavior, and shared conformance corpus below are the executable contract for that
-property.
+reload behavior, and ASCII byte-pattern grammar below are the executable contract for that
+property. The shared corpus is regression coverage for this contract, not its definition.
 
 This normative contract covers only scan layers 1 and 3. Scan layer 2 (the secret scan)
 reuses the existing, already-deployed `secret_gate` module and its own pattern set; it is
@@ -663,7 +677,8 @@ continuing to use stale overlay bytes.
 [[pattern]]
 id = "actor-token-namespace-prefix"
 category = "actor_token"
-regex = '(?i)\bnamespace:[a-z0-9_-]+\b'
+regex = '\bnamespace:[a-z0-9_-]+\b'
+case = "ascii_insensitive"
 description = "actor-namespace-style token"
 severity = "deny"
 
@@ -671,21 +686,28 @@ severity = "deny"
 id = "internal-path-worktree"
 category = "internal_path"
 regex = '/[A-Za-z0-9_./-]+/agent-worktrees/'
+case = "sensitive"
 description = "local worktree absolute path"
 severity = "deny"
 ```
 
 Fields:
 
-- `id` (required, string, unique across the merged set) - stable identifier referenced in
-  deny responses (`hits[].pattern_id`) and in deny-audit `payload.rule_ids`.
+- `id` (required, string, unique across the merged set) - a content-free stable identifier
+  matching `[a-z][a-z0-9-]{0,63}`. Because it is exposed in deny responses
+  (`hits[].pattern_id`) and deny-audit `payload.rule_ids`, it must describe a generic rule
+  class and must not contain a matched literal, credential fragment, or deployment-specific
+  term; either loader rejects a nonconforming id.
 - `category` (required, one of `actor_token` | `org_mechanics` | `internal_path` |
   `commercial_strategy`) - the pattern class. `secret` is deliberately not a valid value
   here; secret patterns live in the separate `secret_gate` module (see above).
-- `regex` (required, string) - the match pattern. See "Regex portability" below for the
-  syntax restriction that keeps two independent implementations in agreement.
-- `description` (required, string) - human-readable, shown in review/audit contexts; never
-  shown to end users in a deny response beyond the `pattern_id`.
+- `regex` (required, string) - the match pattern. See "ASCII byte-pattern grammar and
+  portability" below for the closed syntax and matching semantics.
+- `case` (required, exactly `"sensitive"` or `"ascii_insensitive"`) - selects the ASCII
+  comparison rule below. There is no inline flag syntax.
+- `description` (required, string) - human-readable configuration-review context. It is
+  never copied into an audit payload, log, or deny response; those expose only the
+  `pattern_id`.
 - `severity` (required, string, `"deny"` in v0) - present as a field now so a future
   graduated-severity model (for example, `"warn"`) does not require a schema migration; v0
   recognizes only `"deny"` and treats any other value as a load-time error.
@@ -711,23 +733,59 @@ never suppresses a pattern globally, never suppresses secret-scan hits (layer 2 
 allowlist - a detected secret is always denied), and there is no equivalent per-call
 parameter on any verb.
 
-### Regex portability
+### ASCII byte-pattern grammar and portability
 
-Because the same file must be consumed by a Rust implementation (the verb handler) and a
-separate implementation in the hook's own language, patterns are restricted to a portable
-subset that both a linear-time regex engine (for example, Rust's `regex` crate, which is
-RE2-derived) and common scripting-language regex engines can execute identically:
+The `regex` field is not an arbitrary host-language regular expression. It is an ASCII-only
+byte-pattern language with this grammar; both consumers parse this language before compiling
+or evaluating it:
 
-- No lookahead or lookbehind assertions.
-- No backreferences.
-- No possessive or atomic groups.
-- Only character classes, anchors (`^`, `$`, `\b`), quantifiers, alternation, and inline
-  case-insensitivity flags (`(?i)`) are permitted.
+```ebnf
+pattern      = [ "^" ], alternation, [ "$" ] ;
+alternation  = sequence, { "|", sequence } ;
+sequence     = piece, { piece } ;
+piece        = atom, [ quantifier ] ;
+atom         = literal | class | "(" , alternation , ")" | "\\b" ;
+class        = "[", class_item, { class_item }, "]" ;
+class_item   = class_literal | class_literal, "-", class_literal ;
+quantifier   = "?" | "*" | "+" | "{", count, [ ",", [ count ] ], "}" ;
+count        = "0" | nonzero_digit, { digit } ;
+digit        = "0" | "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" ;
+nonzero_digit = "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" ;
+```
 
-A pattern file containing a construct outside this subset fails to load in either
-implementation - this is intentionally a hard parse-time failure, not a warning, because a
-pattern that only one of the two layers can execute is precisely the condition under which
-the two layers could disagree about the same content, which this format exists to prevent.
+The lexical and semantic rules are closed:
+
+- Pattern source must contain only printable ASCII bytes `0x20` through `0x7e`. A literal
+  is any such byte except `\`, `.`, `^`, `$`, `|`, `(`, `)`, `[`, `]`, `{`, `}`, `*`,
+  `+`, or `?`. A metacharacter is literal only when escaped with `\`; `\b` alone denotes
+  the boundary atom. A bare `.` wildcard and every other escape are rejected.
+- A class is positive, ASCII-only, and non-empty. `]` and `\` must be escaped; `-` is
+  literal only when escaped or first or last, and `^` as the first class byte is rejected.
+  Inside a class, the only accepted escapes are `\]`, `\\`, and `\-`; every other
+  printable ASCII byte is a class literal. Range endpoints must be ASCII bytes in ascending
+  order. Negated classes, POSIX classes, Unicode properties, and shorthand classes such as
+  `\d`, `\s`, and `\w` are rejected.
+- Alternation branches, sequences, and groups are non-empty. `^` and `$` are permitted
+  only once in the outer positions shown. Each atom has at most one quantifier. Counts are
+  canonical decimal integers from 0 through 65,535; for `{m,n}`, `m` must not exceed `n`.
+- The candidate is matched as its exact UTF-8 byte sequence, with no Unicode normalization
+  and with multiline and dot-all modes disabled. `^` means before byte zero and `$` means
+  after the final byte, including when the final byte is a line feed.
+- ASCII word bytes are exactly `[A-Za-z0-9_]`. `\b` matches only at the start or end of the
+  candidate, or between an ASCII word byte and any other byte. Every byte of a non-ASCII
+  UTF-8 encoding is a non-word byte.
+- With `case = "sensitive"`, byte comparison is exact. With
+  `case = "ascii_insensitive"`, and only then, ASCII `A` through `Z` compare equal to the
+  corresponding `a` through `z`; all other bytes compare exactly. No Unicode case folding
+  is performed.
+
+Each loader must consume the entire pattern into this grammar and reject any other syntax
+before scan service becomes available. A host engine accepting a pattern does not make it
+valid. An implementation may translate the parsed form to a host regex only if it selects
+byte mode and preserves these exact anchor, boundary, and ASCII-case rules; otherwise it
+must evaluate the parsed form directly. This grammar and byte semantics, rather than the
+behavior of either host regex engine or a finite fixture set, define cross-client
+equivalence.
 
 ### Match semantics
 
@@ -736,11 +794,10 @@ the two layers could disagree about the same content, which this format exists t
   `labels`/`assignees`) - never to a concatenation of fields, so that a reported hit's
   `field` value is accurate. The candidate set is fixed by Handler pipeline step 2; neither
   scanner may silently omit an identifier field.
-- A pattern matching anywhere within a field's string is a hit for that field. An
+- A pattern matching anywhere within a field's byte sequence is a hit for that field. An
   implementation is not required to find every possible match within a single field for a
-  single pattern - one is sufficient to deny - but the reference verb implementation
-  reports the first match per `(field, pattern_id)` pair in `hits[]` for completeness of
-  the audit record.
+  single pattern - one is sufficient to deny. It reports each matching
+  `(field, pattern_id)` pair once and reports no match span or derived content.
 - A repo-specific `[[allow]]` entry is applied only after the implementation has collected
   the token-pattern hit. The shared corpus therefore observes the same hit before the same
   `(repo, pattern_id)` suppression in both implementations.
@@ -766,25 +823,29 @@ expected_rule_ids = ["fixture-word-boundary"]
 [[load_case]]
 id = "reject-lookbehind"
 regex = '(?<=x)y'
+case = "sensitive"
 expected = "reject"
 ```
 
 For `scan_case`, `id`, `repo`, `field`, `text`, and the sorted unique
 `expected_rule_ids` are required; an empty expected list means allow. For `load_case`,
-`id`, `regex`, and `expected = "accept" | "reject"` are required. Unknown keys or duplicate
-case ids fail the corpus loader. Both implementations execute every case and must produce
-the exact expected result; neither maintains a private copy or language-specific expected
-file.
+`id`, `regex`, `case`, and `expected = "accept" | "reject"` are required. Unknown keys or
+duplicate case ids fail the corpus loader. Both implementations execute every case and must
+produce the exact expected result; neither maintains a private copy or language-specific
+expected file. Passing these cases detects regressions but cannot admit syntax or define
+semantics beyond the normative grammar above.
 
 The committed corpus must cover at least: allow and deny for every pattern category;
-matches and near-misses for anchors, `\b`, alternation, quantifiers, character classes, and
-`(?i)`; non-ASCII adjacent text that can expose word-boundary differences; rejection of
-lookaround, backreferences, possessive quantifiers, and atomic groups; multiple rule hits;
-all outward field names including `tag`, `head`, and `base`; a repo-specific allowlist hit
-that is allowed in exactly one repo and denied in another; duplicate ids across generic and
-overlay files; an absent overlay; and malformed or revision-mismatched overlays. Passing
-this corpus in both the Rust handler suite and the hook suite is a release gate for any
-pattern-format, loader, or regex-engine change.
+matches and near-misses for strict anchors, ASCII `\b`, alternation, quantifiers, positive
+character classes, and both case modes; non-ASCII adjacent text that exercises the specified
+byte boundary and absence of Unicode case folding; rejection of non-ASCII pattern bytes,
+wildcards, negated classes, shorthand or Unicode classes, inline flags, lookaround,
+backreferences, possessive quantifiers, and atomic groups; multiple rule hits; all outward
+field names including `tag`, `head`, and `base`; a repo-specific allowlist hit that is
+allowed in exactly one repo and denied in another; duplicate ids across generic and overlay
+files; an absent overlay; and malformed or revision-mismatched overlays. Passing this corpus
+in both the Rust handler suite and the hook suite is a regression gate for any pattern-format,
+loader, or matcher change; it is not the definition of cross-client equivalence.
 
 ## Implementation requirements and verification
 
@@ -807,8 +868,10 @@ pattern file, it must include these contract tests:
    append additional rows with `EventKind::Audit`, the precise top-level verb, the correct
    `EventOutcome::{Success, Denied, Error}`, and every required JSON payload key. Tests
    assert that no new `EventKind` spelling is introduced and that deny payloads contain
-   rule ids but no rejected content or excerpt. They also distinguish the handler-owned
-   row from the automatic generic dispatch row by `payload.audit_type`.
+   rule ids and field names but no rejected or derived content. Validation and deny tests
+   inspect serialized Events, captured logs, error messages, responses, and the operation
+   ledger for absence of every rejected field value. They also distinguish the
+   handler-owned row from the automatic generic dispatch row by `payload.audit_type`.
 3. **Comment target validation.** Table-driven handler tests accept `issue#42` and
    `pr#978`; reject zero, leading zero, case changes, signs, whitespace, overflow, bare
    numbers, URLs, and embedded repositories; and reject a repository-scoped read whose
@@ -833,7 +896,9 @@ pattern file, it must include these contract tests:
    spy observes zero GitHub writes, and the deny response plus audit identify the exact
    field. The release cases must include both a denied generic-pattern tag and a
    credential-shaped secret-pattern tag, proving that automatic tag creation cannot bypass
-   either scan layer.
+   either scan layer. For each release-tag denial, the stored Event has `target = "release"`;
+   a serialized-Event assertion proves the raw tag is absent from the complete payload, and
+   the operation ledger remains empty for that idempotency key.
 8. **Optional-argument normalization.** For labels and assignees, compare omission with
    `[]`, compare at least two permutations of the same non-empty array, and retry each form
    with one idempotency key. For draft, compare omission with `false`. For release title,
@@ -845,8 +910,10 @@ pattern file, it must include these contract tests:
    suite both execute every case in
    `crates/khive-pack-git/tests/fixtures/publication-hygiene-conformance.toml` against the
    authoritative generic file and test overlay. CI fails on a skipped case, divergent
-   allow/deny result, field or rule-id mismatch, regex-portability mismatch, allowlist
-   mismatch, or revision mismatch.
+   allow/deny result, field or rule-id mismatch, byte-grammar loader mismatch, allowlist
+   mismatch, or revision mismatch. Separate loader tests prove that both implementations
+   reject every source outside the closed grammar even when their host regex engine would
+   accept it.
 
 `tests/smoke_test.py` must cover one allowed publish against a controlled fake `gh`, one
 hygiene deny, one comment-target validation failure, and one resumed
@@ -879,11 +946,11 @@ test suite must not create real GitHub content.
    `tests/smoke_test.py`.
 3. **Deployment notice and hook convergence**: outbound GitHub content publication moves
    to the verb surface only after the Rust handler and hook both pass the shared conformance
-   corpus, consume the authoritative generic file, resolve the same absolute config path,
-   and validate the same configured pattern-set revision. The hook then narrows its role to
-   denying raw `gh` content writes outright and pointing the caller at the equivalent verb;
-   it no longer makes an independent content allow/deny judgment once the verb enforces the
-   scan server-side.
+   corpus, implement the normative ASCII byte-pattern grammar, consume the authoritative
+   generic file, resolve the same absolute config path, and validate the same configured
+   pattern-set revision. The hook then narrows its role to denying raw `gh` content writes
+   outright and pointing the caller at the equivalent verb; it no longer makes an
+   independent content allow/deny judgment once the verb enforces the scan server-side.
 4. **Second wave** (a follow-on ADR or amendment, not specified by this document): the
    review-verdict comment path adopts the verb surface, and edit verbs are added, reusing
    the same scan module.
@@ -904,9 +971,10 @@ Four forks were presented for this design; each is resolved in place.
    entirely in a private overlay, or split. **Resolved**: split. Generic pattern classes
    ship at the single authoritative in-repo path, versioned and public-visible; the
    concrete internal-token list is selected only by the resolved config's absolute overlay
-   path. A required merged-content revision and the shared hook/server conformance corpus
-   prevent file-version and scanner-semantic drift. The in-repo file must never contain
-   concrete internal-identifier tokens.
+   path. The ASCII byte-pattern grammar defines common scanner semantics, the merged-content
+   revision prevents file-version drift, and the shared hook/server corpus detects
+   regressions in both implementations. The in-repo file must never contain concrete
+   internal-identifier tokens.
 3. **Deny-event notification (F3)**: whether a scan deny also notifies the calling actor's
    own inbox or messaging channel, in addition to the synchronous deny response.
    **Resolved**: no per-deny notification in v0. The synchronous deny to the caller plus
@@ -931,9 +999,10 @@ Four forks were presented for this design; each is resolved in place.
 - Same-call KG visibility of caller-authored GitHub content via recoverable self-ingest,
   without waiting on the next digest sweep.
 - Pattern data is versioned and reviewable as an ordinary file diff, rather than scattered
-  across independently maintained hook and verb implementations. The shared corpus and
-  configured merged-content revision make semantic or file-version drift a failing check
-  instead of a silent behavior change.
+  across independently maintained hook and verb implementations. The byte-pattern grammar
+  defines common semantics; the shared corpus and configured merged-content revision make
+  implementation regressions or file-version drift a failing check instead of a silent
+  behavior change.
 
 ### Negative
 
