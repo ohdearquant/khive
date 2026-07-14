@@ -50,13 +50,15 @@ Once installed, invoke them as `khive:digester`, `khive:polisher`, and so on.
 ## Requirements
 
 The `kg` pack is the base (entities, edges, notes); every other pack builds on it. The default
-server config loads all ten (`kg`, `gtd`, `memory`, `brain`, `comm`, `schedule`, `knowledge`,
-`session`, `git`, `code` — `git` contributes note kinds, a batch ingester, the `git.digest` verb,
-and three write verbs — `git.commit`/`git.branch`/`git.push` — that shell to system git with
-hardened, allowlisted argv construction and unconditional force-push denial (ADR-108); `code`
-contributes a `finding` note kind, with ingestion reached only through the `kkernel code-ingest`
-admin CLI, no MCP-callable verb) — this plugin currently ships pattern skills for the first
-seven; `session`, `git`, and `code` have no skill yet (see the Pattern skills table above).
+server config loads all eleven (`kg`, `gtd`, `memory`, `brain`, `comm`, `schedule`, `knowledge`,
+`session`, `git`, `code`, `workspace` — `git` contributes note kinds, a batch ingester, the
+`git.digest` verb, and three write verbs — `git.commit`/`git.branch`/`git.push` — that shell to
+system git with hardened, allowlisted argv construction and unconditional force-push denial
+(ADR-108); `code` contributes a `finding` note kind, with ingestion reached only through the
+`kkernel code-ingest` admin CLI, no MCP-callable verb; `workspace` contributes zero verbs and
+adds the `workspace` entity kind plus `contains` endpoint rules to git/gtd/session notes (#873)) —
+this plugin currently ships pattern skills for the first seven; `session`, `git`, `code`, and
+`workspace` have no skill yet (see the Pattern skills table above).
 See [INSTALL.md](../INSTALL.md) for setup, the actor config, and per-pack smoke tests.
 
 ## Links

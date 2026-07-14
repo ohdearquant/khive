@@ -22,6 +22,7 @@
 //! module's own `git_command` helper and the handler code under test
 //! resolve `git` via `PATH` at spawn time).
 
+use std::ffi::{OsStr, OsString};
 use std::path::Path;
 use std::process::Command;
 
@@ -32,6 +33,30 @@ use khive_runtime::{KhiveRuntime, Namespace, NamespaceToken, RuntimeConfig};
 use khive_types::EventOutcome;
 
 use crate::GitPack;
+
+/// Restores one process-global environment variable when dropped. Callers
+/// must hold [`crate::cache::ENV_MUTEX`] for the guard's full lifetime.
+struct EnvVarGuard {
+    key: &'static str,
+    previous: Option<OsString>,
+}
+
+impl EnvVarGuard {
+    fn set(key: &'static str, value: impl AsRef<OsStr>) -> Self {
+        let previous = std::env::var_os(key);
+        std::env::set_var(key, value);
+        Self { key, previous }
+    }
+}
+
+impl Drop for EnvVarGuard {
+    fn drop(&mut self) {
+        match &self.previous {
+            Some(value) => std::env::set_var(self.key, value),
+            None => std::env::remove_var(self.key),
+        }
+    }
+}
 
 /// Builds a `[git_write]` section allowlisting `repo` for `branches`.
 fn policy(repo: &Path, branches: &[&str]) -> GitWriteSectionConfig {
@@ -178,6 +203,38 @@ async fn commit_with_no_paths_commits_all_tracked_changes() {
         .output()
         .expect("git log");
     assert_eq!(String::from_utf8_lossy(&log.stdout).trim(), "update a.txt");
+}
+
+/// Regression for review round 6: the handler command used by this test
+/// suite must not inherit a developer's global/system Git configuration.
+/// Enabling commit signing with a nonexistent signer makes that ambient
+/// configuration deterministically hostile to `git commit`.
+#[tokio::test]
+async fn commit_ignores_hostile_ambient_global_config_in_tests() {
+    let _env_guard = crate::cache::ENV_MUTEX.lock().await;
+    let (repo, _remote) = init_repo_with_remote();
+    let (pack, token) = pack_and_token_with_policy(policy(repo.path(), &["main"])).await;
+    let config_dir = tempfile::tempdir().expect("global config tempdir");
+    let global_config = config_dir.path().join("gitconfig");
+    std::fs::write(
+        &global_config,
+        format!(
+            "[commit]\n\tgpgSign = true\n[gpg]\n\tprogram = {}\n",
+            config_dir.path().join("missing-gpg").display()
+        ),
+    )
+    .expect("write hostile global config");
+    let _global_config = EnvVarGuard::set("GIT_CONFIG_GLOBAL", &global_config);
+    let _system_config = EnvVarGuard::set("GIT_CONFIG_SYSTEM", "/dev/null");
+
+    std::fs::write(repo.path().join("a.txt"), b"changed").unwrap();
+
+    pack.handle_commit(
+        &token,
+        json!({ "repo": repo.path().to_str().unwrap(), "message": "update a.txt" }),
+    )
+    .await
+    .expect("handler test ignores hostile ambient git config");
 }
 
 #[tokio::test]

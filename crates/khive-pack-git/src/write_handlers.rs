@@ -129,14 +129,22 @@ fn parse_force_param(params: &Value) -> Result<Option<bool>, RuntimeError> {
 /// configured in global/system git config to work at all — neutralizing
 /// that config would break the legitimate write path along with the attack
 /// surface it does not itself pose (hooks are the RCE risk; identity/
-/// credential config is not).
+/// credential config is not). Unit-test builds override both config sources
+/// below so handler tests remain hermetic; that override is not compiled into
+/// production builds.
 fn run_git(repo: &Path, argv: &[String]) -> Result<String, RuntimeError> {
-    let output = Command::new("git")
+    let mut command = Command::new("git");
+    command
         .arg("-c")
         .arg("core.hooksPath=/dev/null")
         .arg("-C")
         .arg(repo)
-        .args(argv)
+        .args(argv);
+    #[cfg(test)]
+    command
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null");
+    let output = command
         .output()
         .map_err(|e| RuntimeError::InvalidInput(format!("spawning git {argv:?}: {e}")))?;
     if !output.status.success() {

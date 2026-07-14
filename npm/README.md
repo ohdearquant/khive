@@ -35,6 +35,7 @@ All 11 packs load by default. A background daemon auto-spawns to keep the runtim
 | **session**   | 4     | Session record persistence (store/list/resume/export)                                                                                            |
 | **git**       | 4     | Git-lifecycle note kinds (commit/issue/pull_request) + batch ingester + `git.digest`; write verbs `git.commit`/`git.branch`/`git.push` (ADR-108) |
 | **code**      | 0     | Finding note kind; ingest is admin-CLI-only (`kkernel code-ingest`), no MCP verb                                                                 |
+| **workspace** | 0     | Adds the `workspace` entity kind + `contains` endpoint rules to git/gtd/session notes (#873)                                                      |
 
 ## Usage
 
