@@ -105,9 +105,13 @@ the canonical helper was updated but the inline copy wasn't.
 
 ## WAL checkpoint under the write queue
 
-`run_sync`'s WAL truncate-checkpoint must go through the write queue's
-`BEGIN IMMEDIATE` wrapping, not a plain `execute_script` call — the latter
-was the old, broken call shape. The regression test
+`run_sync`'s WAL truncate-checkpoint must bypass the write queue's
+per-request `BEGIN IMMEDIATE` wrapping via `execute_script_top_level` — a
+checkpoint cannot complete while a transaction is open on the same
+connection. Ordinary `execute_script` is the old, broken call shape: under
+`KHIVE_WRITE_QUEUE=1` it wraps the statement in `BEGIN IMMEDIATE`, which
+silently no-ops the checkpoint and can lose WAL-resident writes at the
+subsequent rename. The regression test
 `wal_checkpoint_truncate_via_plain_execute_script_fails_with_write_queue_enabled`
 is a revert-and-confirm-fails companion: it asserts the OLD call shape
 *fails* under the write queue, which proves the paired "succeeds" test is

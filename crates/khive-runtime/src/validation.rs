@@ -16,9 +16,11 @@ pub type RuleId = &'static str;
 
 /// Severity of a validation finding.
 ///
-/// - `Error`: causes `kkernel kg validate` to exit with code 1.
-/// - `Warning`: reported but does not affect exit code (unless `--strict`).
-/// - `Info`: informational; no exit-code effect.
+/// Intended exit-code semantics (`Error` = exit 1, `Warning` = report-only
+/// unless `--strict`, `Info` = informational) apply to the shipped TOML
+/// RulePass; pack-declared rules are not yet executed by `kkernel kg
+/// validate` (ADR-034 defers CLI runner wiring). See
+/// `crates/khive-runtime/docs/api/validation.md` for the shipped-vs-deferred split.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Severity {
     Info,
@@ -43,8 +45,10 @@ pub struct GraphSnapshot {
 
 /// Context passed to all rule implementations.
 ///
-/// Carries configuration overrides from `.khive/kg/rules.toml` merged with
-/// pack defaults. Rules read per-rule config from `config[rule_id]`.
+/// Design contract for the deferred pack-rule runner (ADR-034): once wired,
+/// it will carry configuration overrides from `.khive/kg/rules.toml` merged
+/// with pack defaults, read per-rule from `config[rule_id]`. No runtime code
+/// currently constructs a populated `ValidationContext`.
 #[non_exhaustive]
 pub struct ValidationContext<'a> {
     /// The corpus snapshot for whole-corpus rules.
@@ -65,7 +69,7 @@ pub struct Violation {
     pub severity: Severity,
     /// Human-readable explanation of the violation.
     pub message: String,
-    /// Whether the violation can be fixed by `kkernel kg validate --fix`.
+    /// Whether the violation is auto-fixable (the `--fix` write path is deferred; ADR-034).
     pub fixable: bool,
     /// Optional entity UUID (short-form) that the violation targets.
     pub entity_id: Option<String>,
@@ -104,8 +108,10 @@ pub type RuleFn = fn(&ValidationContext<'_>) -> Vec<Violation>;
 /// Optional auto-fix function type.
 ///
 /// Receives the context and violations emitted by the corresponding `RuleFn`.
-/// Returns a `GraphPatch` (opaque in v1 — see below) that the validator applies
-/// before writing NDJSON. Returning `None` leaves the graph unchanged.
+/// Returns a `GraphPatch` (opaque in v1 — see below). Applying patches is part
+/// of the deferred auto-fix write path (ADR-034) — no validator currently
+/// invokes fix functions or applies patches. Returning `None` leaves the graph
+/// unchanged.
 ///
 /// `GraphPatch` is a placeholder type in v1; the auto-fix write path is out of
 /// scope for this cluster.
@@ -124,13 +130,15 @@ pub struct GraphPatch;
 /// A pack-contributed validation rule.
 ///
 /// Rule IDs must follow the `<pack>/<rule-id>` namespace convention.
-/// See `docs/api/validation.md` for declaration examples and severity override rules.
+/// See `docs/api/validation.md` for declaration examples and the
+/// shipped-vs-deferred split.
 pub struct ValidationRule {
     /// Stable rule identifier in `<pack>/<rule-id>` format.
     pub id: RuleId,
-    /// Default severity; can be overridden in `.khive/kg/rules.toml`.
+    /// Default severity. TOML severity override for pack rules is part of the
+    /// deferred runner wiring (ADR-034); no override mapping exists yet.
     pub severity: Severity,
-    /// Human-readable description shown in `kkernel kg validate` output.
+    /// Human-readable description (surfaced once the CLI runner wiring lands; ADR-034).
     pub description: &'static str,
     /// Whole-corpus check function.
     pub check: RuleFn,

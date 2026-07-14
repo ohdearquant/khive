@@ -6,13 +6,23 @@ migration: given an already-prepared sequence of write plans, it applies them as
 whole unit. This document covers the suspend-free safety argument, the three-phase shape the
 module is one piece of, and its current wiring status.
 
-## Wiring status (ADR-099 migration step 3, sub-slice B2)
+## Wiring status (ADR-099 — B3 shipped)
 
-This module is the **mechanism only**. It has no production caller in B2 — no verb dispatch, no
-CLI `--atomic` surface, no daemon wiring. Tests in this file are the only consumer. Wiring a real
-per-verb `prepare` step (ops → `AtomicOpPlan`) and the `exec --ops-file --atomic` CLI surface is
-ADR-099 migration steps 1 (cont'd) and 4 — referred to throughout the source as the **B3 wiring
-point**.
+This module is the synchronous commit-pass piece of the shipped ADR-099 B3 flow. The ADR-099 B3
+caller is `kkernel exec --ops-file --atomic` (see `kkernel`'s `atomic_apply` module): it runs the
+parse-time admissibility check (B1), drives the async prepare pass (ops → `AtomicOpPlan`), calls
+`run_atomic_unit` here for the one synchronous commit pass (B2), then applies the async
+post-commit effects (reindex). Only the currently executable verb set (`update`, `delete`,
+`link`, `gtd.transition`, `gtd.complete`) may appear in an atomic ops-file. `merge` and the
+governance verbs (`propose`, `review`, `withdraw`) remain conceptually admissible under
+ADR-099 D3 but are rejected up front as known-unimplemented (`ATOMIC_KNOWN_UNIMPLEMENTED_VERBS`
+in `khive-types`) — no full-parity prepare/apply seam exists for them yet. Embedding-bearing,
+read, or unlisted verbs are likewise rejected before any write.
+
+The CLI is not the runner's sole production consumer: runtime callers can also supply prepared
+plans directly — the hard-delete path (`atomic_hard_delete_with_edge_purge` in `operations.rs`)
+constructs a `DeletePlan` and invokes `run_atomic_unit` for its row-delete + incident-edge purge.
+Tests construct plans directly as well.
 
 ## Suspend-free invariant
 
@@ -38,8 +48,8 @@ proof).
 ## Two-phase shape (ADR-099 D1)
 
 Only the **commit pass** (phase 2) lives here: given an already-prepared `Vec<AtomicOpPlan>`
-(phase 1, the async prepare pass, is out of scope for B2 — a test-only caller constructs plans
-directly), `run_atomic_unit` opens one `atomic_unit`, applies each plan's statements under a
+(phase 1, the async prepare pass, is out of scope for B2), `run_atomic_unit` opens one
+`atomic_unit`, applies each plan's statements under a
 named `SAVEPOINT`, and returns either every op's collected `PostCommitEffect`s (phase 3, the
 async post-commit pass — the B3 wiring point: nothing in B2 executes these effects, a test
 consumer only drains the returned list) or the first op's failure and its index.

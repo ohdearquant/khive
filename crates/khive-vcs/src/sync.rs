@@ -1202,7 +1202,7 @@ mod tests {
     }
 
     /// Chunk-boundary round-trip across `SYNC_CHUNK_SIZE`. See
-    /// `docs/test-rationale.md#sync_chunk_boundary_round_trip`.
+    /// `docs/api/sync.md#local-sync--run_sync`.
     #[tokio::test]
     async fn sync_chunk_boundary_round_trip() {
         const N: usize = 11; // > SYNC_CHUNK_SIZE (5 in test mode)
@@ -1805,7 +1805,7 @@ mod tests {
     }
 
     /// Issue #474: path-traversal remote names must be unconstructable. See
-    /// `docs/test-rationale.md#run_sync_remote_cannot_be_constructed_with_invalid_name`.
+    /// `docs/api/sync.md#remotename--construction-time-path-traversal-safety`.
     #[tokio::test]
     async fn run_sync_remote_cannot_be_constructed_with_invalid_name() {
         let repo_dir = TempDir::new().unwrap();
@@ -2349,7 +2349,7 @@ mod tests {
     // the caller actually sees in `err.to_string()`.
 
     /// Credential-bearing HTTPS URLs must not leak into the public error
-    /// string. See `docs/test-rationale.md#public_error_redacts_https_credential_url`.
+    /// string. See `docs/api/sync.md#credential-redaction-in-git-error-output--redact_git_stderr`.
     #[tokio::test]
     async fn public_error_redacts_https_credential_url() {
         let repo_dir = tempfile::TempDir::new().unwrap();
@@ -2388,7 +2388,7 @@ mod tests {
     }
 
     /// scp-style `git@host:org/repo.git` must not leak through the sanitiser.
-    /// See `docs/test-rationale.md#public_error_redacts_scp_style_remote`.
+    /// See `docs/api/sync.md#credential-redaction-in-git-error-output--redact_git_stderr`.
     #[tokio::test]
     async fn public_error_redacts_scp_style_remote() {
         let repo_dir = tempfile::TempDir::new().unwrap();
@@ -2432,7 +2432,7 @@ mod tests {
 
     /// Regression: VCS sync FTS document must be field-identical to
     /// `entity_fts_document`'s output. See
-    /// `docs/test-rationale.md#sync_fts_document_matches_entity_fts_document`.
+    /// `docs/api/sync.md#fts-document-consistency`.
     #[test]
     fn sync_fts_document_matches_entity_fts_document() {
         use khive_runtime::entity_fts_document;
@@ -2569,7 +2569,7 @@ mod checkpoint_wal_write_queue_tests {
     }
 
     /// Revert-and-confirm-fails companion to the test above. See
-    /// `docs/test-rationale.md#wal_checkpoint_truncate_via_plain_execute_script_fails_with_write_queue_enabled`.
+    /// `docs/api/sync.md#wal-checkpoint-under-the-write-queue`.
     #[tokio::test]
     async fn wal_checkpoint_truncate_via_plain_execute_script_fails_with_write_queue_enabled() {
         let dir = tempfile::tempdir().expect("tempdir");
