@@ -34,7 +34,7 @@ pub(crate) async fn resolve_id(
 }
 
 /// Rolls back a partially-written outbound note after a dual-write failure.
-/// See crates/khive-pack-comm/docs/handlers.md#messagersrollback_outbound
+/// See crates/khive-pack-comm/docs/api/message-lifecycle.md#messagersrollback_outbound
 async fn rollback_outbound(
     runtime: &KhiveRuntime,
     token: &NamespaceToken,
@@ -122,7 +122,7 @@ fn build_preview(content: &str) -> String {
 /// `comm.thread` finds replies regardless of which copy they replied to. When
 /// `thread_id` is already supplied (reply path), it is forwarded unchanged.
 ///
-/// See crates/khive-pack-comm/docs/handlers.md#messagersdual_write_message for
+/// See crates/khive-pack-comm/docs/api/message-lifecycle.md#messagersdual_write_message for
 /// the `in_reply_to_message_id`/`references_chain` header-threading contract.
 // REASON: dual_write_message mirrors the send wire shape exactly (from, to, subject,
 // content, thread_id, sent_at) plus the two context args (runtime, token). Grouping them into
