@@ -1,7 +1,8 @@
-# Session mirror parse — internal notes
+# Session mirror parse
 
-Source: `crates/khive-pack-session/src/mirror/parse.rs`. Long-form rationale
-for non-public parsing helpers, relocated out of inline doc comments.
+Technical reference for the ChatGPT-export parsing helpers in
+`crates/khive-pack-session/src/mirror/parse.rs` — the DFS conversation walk, per-conversation
+context, and text/block extraction that turn a raw export tree into mirrored session events.
 
 ## `parse_chatgpt_export` — DFS walk and per-conversation isolation
 

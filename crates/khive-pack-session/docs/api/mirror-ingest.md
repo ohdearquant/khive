@@ -1,9 +1,10 @@
-# Session mirror ingest — internal notes
+# Session mirror ingest
 
-Source: `crates/khive-pack-session/src/mirror/ingest.rs`. This guide holds the
-long-form rationale that used to live inline as doc comments on non-public
-items; the `.rs` file keeps only the published contract for `mirror_file` and
-`mirror_chatgpt_export_file` plus short pointers back here.
+Technical reference for the bounded tail-read ingest algorithm in
+`crates/khive-pack-session/src/mirror/ingest.rs` — how `mirror_file` and
+`mirror_chatgpt_export_file` read, bound, and durably checkpoint session transcripts. The
+`.rs` file keeps the published contract for those two entry points plus short pointers
+back to the sections below.
 
 ## Bounded tail-read algorithm (module overview)
 
