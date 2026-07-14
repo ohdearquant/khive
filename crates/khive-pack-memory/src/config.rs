@@ -1,4 +1,5 @@
 //! Recall configuration types — scoring weights, decay models, and FTS gather options.
+//! See `crates/khive-pack-memory/docs/api/configuration.md` for the full policy reference.
 
 use std::collections::HashMap;
 
@@ -65,7 +66,7 @@ pub struct RecallConfig {
     /// Explicit max candidates per retrieval path before fusion. When None,
     /// candidate_multiplier keeps the legacy behavior.
     pub candidate_limit: Option<u32>,
-    /// Strategy used to fuse retrieval-source candidate lists. Default RRF k=60.
+    /// Strategy used to fuse retrieval lists. Default weighted `[vector=0.7, text=0.3]`.
     pub fuse_strategy: FusionStrategy,
     /// Minimum composite score to include in results. Default 0.0.
     pub min_score: f64,
@@ -100,8 +101,7 @@ pub struct RecallConfig {
     /// `KHIVE_MEMORY_ANN_READY_TIMEOUT_MS` env var (default 8000ms — see
     /// `handlers::common::ann_ready_timeout_ms`).
     ///
-    /// See crates/khive-pack-memory/docs/config-reference.md#ann_ready_timeout_ms
-    /// for why this bound exists.
+    /// See `crates/khive-pack-memory/docs/api/configuration.md` for the operational rationale.
     pub ann_ready_timeout_ms: Option<u64>,
 }
 

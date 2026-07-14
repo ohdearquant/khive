@@ -1,4 +1,5 @@
 //! Handler for `memory.recall` — the main retrieval pipeline.
+//! See `crates/khive-pack-memory/docs/api/recall-pipeline.md`.
 
 use std::collections::{HashMap, HashSet};
 use std::time::Instant;
@@ -44,18 +45,8 @@ impl MemoryPack {
         let recall_start = Instant::now();
         let p: RecallParams = deser(params)?;
 
-        // #733: exact-match read-namespace escape. `VerbRegistry::dispatch`'s
-        // Rule-3 explicit-namespace escape already mints `token` with
-        // `visible=[namespace]` when the caller passed `namespace=` at the
-        // dispatch boundary, so this is normally a no-op re-derivation of the
-        // token we were already handed. It is defense-in-depth for direct
-        // (non-dispatch) callers, mirroring `handle_remember`'s identical
-        // pattern for the write-namespace override. Every subsequent use of
-        // `token` in this function (FTS/vector candidate fetch, the ANN
-        // over-fetch retry loop's visible-namespace gate, the supersedes
-        // graph read, and the serve-ledger namespace stamp) reads this
-        // shadowed binding, so the effective namespace flows uniformly
-        // through the whole pipeline.
+        // Re-derive dispatch's exact namespace as direct-call defense in depth; all later
+        // candidate, graph, and ledger operations use this shadowed token.
         let effective_token: NamespaceToken = match p.namespace.as_deref() {
             Some(ns_str) => {
                 let ns = Namespace::parse(ns_str).map_err(|e| {
@@ -152,18 +143,8 @@ impl MemoryPack {
             t_stage = Some(Instant::now());
         }
 
-        // ADR-104 §1 (Stage A) + §4: resolve the serving profile *before*
-        // scoring, either via an explicit `profile_id` override (§4,
-        // short-circuits binding resolution; unknown/invalid id is a hard
-        // per-op error, not a silent fallback) or the ADR-081 binding
-        // resolution already used for the serve-time stamp. This is the
-        // same `served_by_profile_id` stamped on the response and appended
-        // to the serve ledger further down — resolved once here, reused
-        // throughout, so the two paths cannot drift apart.
-        //
-        // A resolved-but-unreadable profile state degrades to configured
-        // defaults with a WARN log (never fails the recall) — only the
-        // explicit override treats a lookup failure as caller error.
+        // Resolve once BEFORE scoring so projection, response stamp, and ledger cannot drift.
+        // Explicit unknown IDs error; unreadable bound state degrades to configured defaults.
         let mut profile_state: Option<khive_brain_core::BalancedRecallState> = None;
         let served_by_profile_id: Option<String> = if let Some(ref pid) = p.profile_id {
             let resp = registry
@@ -200,11 +181,7 @@ impl MemoryPack {
             resolved
         };
 
-        // Serve-time projection (ADR-104 §1): derive this request's scoring
-        // weights from the served profile's posterior means via the existing
-        // `PackTunable::project_config` path, used as a pure function — never
-        // `apply_config`, never a mutation of `self.config`. `default_weights`
-        // is kept for the breakdown's `profile_component` ratio (§3).
+        // Project request-local weights without mutating pack config; retain defaults for ratios.
         let default_weights = scoring_cfg.weights.clone();
         if let Some(ref state) = profile_state {
             if let Ok(projected) =
@@ -226,26 +203,18 @@ impl MemoryPack {
             .map_err(|e| RuntimeError::InvalidInput(format!("fts_gather env parse error: {e}")))?
             .unwrap_or_else(|| cfg.fts_gather.clone());
 
-        // Prefer the per-request config param; fall back to the process-wide OnceLock
-        // env so production callers without an explicit config field get the default (3).
+        // Request widening policy precedes the process-wide fallback.
         let ann_overfetch_max_rounds = cfg
             .ann_overfetch_max_rounds
             .unwrap_or_else(super::common::ann_overfetch_max_rounds);
 
-        // #836: bounded wait for a cold-miss `ensure_ann_for_model` on this
-        // recall's own vector leg before it degrades to FTS-only.
+        // Bound cold ANN readiness before degrading this vector leg to FTS-only.
         let ann_ready_timeout_ms = cfg
             .ann_ready_timeout_ms
             .unwrap_or_else(super::common::ann_ready_timeout_ms);
 
-        // #430: the FTS/vector candidate cap (`candidate_limit`) is applied over all
-        // note kinds, not just `memory` rows, so a query pool dominated by higher-ranking
-        // non-memory notes can starve out eligible memories before hydration ever sees
-        // them. `load_memory_candidate_notes` is the first point where kind=="memory"
-        // eligibility is known, so widen the cap and re-gather here (bounded by
-        // `ann_overfetch_max_rounds` and `max_recall_candidates`) until enough eligible
-        // memories are hydrated or the corpus is exhausted, instead of applying the
-        // memory-kind scope only after the cap has already discarded candidates.
+        // Retrieval caps all note kinds, so re-gather after hydration when non-memory rows
+        // starve eligible memories; widening remains round- and server-cap bounded.
         let mut current_candidate_limit = candidate_limit;
         let mut candidates = self
             .collect_recall_candidates(
@@ -400,25 +369,9 @@ impl MemoryPack {
         let now_micros = chrono::Utc::now().timestamp_micros();
         let now_millis = now_micros / 1_000;
 
-        // `entity_names` feeds the `EntityMatch` ×1.3 boost in `default_adjustments`
-        // (scoring.rs). It used to be purely caller-supplied and no caller ever
-        // populated it, leaving the boost dead code in practice. Opt-out
-        // semantics: `Some(_)`, including `Some([])`, is explicit caller
-        // intent and is always honored verbatim (an empty explicit list means
-        // "no entity boost", not "auto-derive one for me"). Auto-extraction
-        // via `extract_entity_candidates` only runs on `None`, i.e. when the
-        // caller didn't send the field at all. See `extract_entity_candidates`
-        // for the extraction rule and why it's grounded in how `EntityMatch`
-        // actually matches.
-        // ADR-104 §5 (Stage C): when the caller didn't supply `entity_names`
-        // at all, extend the #738 capitalized-token heuristic with a second,
-        // precision-safe source: query tokens/bigrams that match a real KG
-        // entity name under the bounded Stage C case contract, resolved via
-        // one batched lookup
-        // (`entity_anchored_candidates`, R1). A lookup failure degrades to
-        // the capitalized-token list alone (never fails the recall); an
-        // explicit `entity_names` (including `Some([])`) still bypasses both
-        // sources entirely. #738 opt-out semantics are unchanged.
+        // Any explicit list, including empty, bypasses both automatic entity sources.
+        // Otherwise combine capitalized heuristics with one bounded real-entity lookup;
+        // lookup failure preserves the heuristic result and never fails recall.
         let entity_names: Vec<String> = match &p.entity_names {
             Some(names) => names.iter().map(|s| s.to_lowercase()).collect(),
             None => {
@@ -457,9 +410,7 @@ impl MemoryPack {
 
         let recall_pipeline = make_pipeline(&cfg);
 
-        // ADR-104 §3: breakdown fields are only reported when the caller asked
-        // for them — gate the extra default-weight score computation on that
-        // rather than paying it on every candidate.
+        // Only verbose responses pay for the second default-weight score.
         let is_verbose = cfg.include_breakdown || p.include_breakdown.unwrap_or(false);
 
         let mut ranked: Vec<ScoredNote> = Vec::new();
@@ -525,15 +476,7 @@ impl MemoryPack {
             };
             let rank_score = calculate_score(&score_input, &scoring_cfg);
 
-            // ADR-104 §3: `profile_component` reports the projected-weight
-            // score's ratio against what the same candidate would have
-            // scored under configured-default weights — computed only for
-            // verbose responses, since it costs a second `calculate_score`
-            // call per candidate. Neutral (1.0) when no profile served the
-            // request (component 1 never ran). It is computed against the
-            // pre-entity-term `rank_score` so it stays a pure read on
-            // component 1 (weight projection) — component 2 (the entity
-            // term, applied below) is orthogonal to the weight ratio.
+            // Profile component is projected/default before the orthogonal entity term.
             let profile_component = if is_verbose {
                 match &profile_state {
                     Some(_) => {
@@ -552,24 +495,8 @@ impl MemoryPack {
                 1.0
             };
 
-            // ADR-104 §2 (Stage B): bounded per-entity posterior term. This
-            // is a single `HashMap::get` against the profile state Stage A
-            // already fetched once per recall (see the profile-resolution
-            // block above) — never a second profile-state read, and never
-            // gated behind `is_verbose` like `profile_component`, because
-            // (unlike that diagnostic ratio) it actually feeds the score
-            // below and so must run for every request, breakdown or not.
-            //
-            // Applied to `final_score` (below), not to the local
-            // `rank_score` here — `final_score` is whichever composite score
-            // actually reaches ranking (either `rank_score` on the default
-            // path, or `weighted_rerank(...)`'s output when a caller sets
-            // `reranker_weights`). Applying the multiplier to `rank_score`
-            // alone would leave it dead code on the weighted-rerank path:
-            // `weighted_rerank` recomposes its own score from raw features
-            // and never reads `rank_score`, so the entity term must be the
-            // *last* step, applied exactly once regardless of which path
-            // produced the pre-entity-term composite.
+            // Read profile state once per recall. Apply the entity term LAST and exactly once
+            // to whichever composite (default or weighted rerank) actually reaches ranking.
             let entity_posterior_mean: Option<f64> = profile_state
                 .as_ref()
                 .and_then(|s| s.entity_posteriors.get(&id))
@@ -780,24 +707,14 @@ impl MemoryPack {
                     result["multilingual_routed"] = json!(true);
                 }
                 if ann_degraded {
-                    // #836: this recall's ANN leg degraded to FTS-only after
-                    // hitting the bounded readiness wait — stamped per result
-                    // (same convention as `multilingual_routed`) so a plain,
-                    // non-verbose response array still carries the signal.
+                    // Per-result stamp keeps degradation visible without verbose output.
                     result["degraded"] = json!("ann_unavailable");
                 }
                 result
             })
             .collect();
 
-        // ADR-081 §5 (#394): stamp the serving profile resolved earlier
-        // (ADR-104 §1, above — same value, so the score projection and the
-        // response stamp can never drift apart) into each result, then fire
-        // the cross-session serve-ledger append (ADR-081 §4) asynchronously
-        // off the response path — the recall caller must not wait on a
-        // brain-pack dispatch. An unresolved profile omits the stamp rather
-        // than guessing one; the ledger row is still written with a null
-        // served_by_profile_id in that case.
+        // Stamp the same profile used for scoring; ledger append stays off the response path.
         if prof {
             if let Some(ref t) = t_stage {
                 plog_n(
@@ -847,18 +764,7 @@ impl MemoryPack {
         }
 
         if is_verbose && candidates.vector_hits_per_model.len() > 1 {
-            // #733: the ANN index is global
-            // across namespaces (`ann.rs`: "one index per model covers all
-            // namespaces"), so `candidates.vector_hits_per_model` still
-            // carries raw, pre-hydration over-fetch candidates from outside
-            // the effective namespace at this point — unlike `results` above,
-            // which is scoped via `memory_ids` (populated by
-            // `load_memory_candidate_notes`'s visible-namespace post-filter).
-            // Filter each per-model list through the same `memory_ids` set
-            // before serializing it into this diagnostic breakdown, or a
-            // verbose multi-model recall with an explicit `namespace=` can
-            // leak off-namespace candidate UUIDs even though `results` itself
-            // stays correctly scoped.
+            // Raw global ANN diagnostics MUST use the same hydrated namespace filter as results.
             let per_model: Vec<Value> = candidates
                 .vector_hits_per_model
                 .iter()
@@ -1075,17 +981,7 @@ mod tests {
         fn exit(&self, _: &tracing::span::Id) {}
     }
 
-    /// #388 regression (sanitizer path): `sanitize_fts5_query` (khive-db) strips
-    /// `$`, so this query no longer reaches the runtime-level fail-open `Err` arm
-    /// added in PR #389 — it exercises the *sanitizer*, not the fail-open net.
-    /// See `recall_with_residual_fts5_char_degrades_and_vector_leg_survives` below
-    /// for a test that forces the `Err` arm itself (PR #389).
-    ///
-    /// `#[serial(background_tasks)]`: a non-empty `memory.recall` fires the
-    /// serve-ledger append via `khive_runtime::track_background_task`
-    /// (see below), which drives the same process-wide counter that
-    /// `ann.rs`'s `ensure_ann_background_registers_a_tracked_task_not_a_bare_spawn`
-    /// asserts on — untagged, cargo's default parallelism can race them.
+    /// Exercises `$` sanitization; serialized because non-empty recall tracks background work.
     #[tokio::test]
     #[serial(background_tasks)]
     async fn recall_with_dollar_sign_query_does_not_error() {
@@ -1192,13 +1088,7 @@ mod tests {
         }
     }
 
-    /// #916 regression: `@` used to reach SQLite FTS5's bareword parser raw
-    /// (`sanitize_fts5_query` did not strip it) and crash it, so this query
-    /// used to reach the `Err` arm in `collect_recall_text_hits`
-    /// (khive-pack-memory/handlers/common.rs), which failed loud per #569.
-    /// `sanitize_fts5_token_group`'s bareword-safety gate (#916) now routes
-    /// `@` through the quoted-phrase alternative instead, so `memory.recall`
-    /// succeeds end to end through verb dispatch.
+    /// Verifies `@` is quoted as an unsafe FTS5 bareword and dispatch succeeds.
     // `#[serial(background_tasks)]`: kept to match the fixture setup used by
     // the sibling dollar-sign test above.
     #[tokio::test]
@@ -1255,21 +1145,8 @@ mod tests {
 
     // ── #836: bounded ANN readiness wait + FTS-only degraded fallback ─────────
 
-    /// #836 regression: `memory.recall`'s vector leg must not block on
-    /// `ensure_ann_for_model`'s per-model single-flight lock for longer than
-    /// the configured `ann_ready_timeout_ms` bound. A concurrent holder of
-    /// that lock (mirroring the daemon's boot-time
-    /// `warm_existing_memory_indexes` mid-build) previously meant the recall
-    /// waited out the full build duration (300s+ observed in production);
-    /// this asserts the bounded wait fires instead and the recall serves
-    /// FTS-only results, marked `"degraded": "ann_unavailable"`.
-    ///
-    /// Fail-on-revert proof: reverting the `tokio::time::timeout` wrap in
-    /// `collect_recall_vector_hits` (handlers/common.rs) back to a bare
-    /// `.await` on `ensure_ann_for_model` makes this test hang until the
-    /// held lock guard is dropped (it never is, within the test), so it
-    /// would fail on the `elapsed < ...` bound (or time out entirely under
-    /// `cargo test`'s own test-thread deadline).
+    /// A held ANN warm lock must time out to a marked FTS-only result.
+    /// See `crates/khive-pack-memory/docs/recall-reliability.md`.
     #[tokio::test]
     #[serial(background_tasks)]
     async fn recall_836_degrades_to_fts_only_when_ann_lock_is_held() {
@@ -1337,9 +1214,7 @@ mod tests {
         }
     }
 
-    /// #836: the normal, uncontended recall path must be byte-identical to
-    /// pre-fix behavior — no `degraded` marker when the ANN leg warms (or
-    /// serves from cache) within the bounded wait.
+    /// Uncontended ANN readiness must not add a degradation marker.
     #[tokio::test]
     #[serial(background_tasks)]
     async fn recall_836_normal_path_has_no_degraded_marker() {
@@ -1389,10 +1264,7 @@ mod tests {
         }
     }
 
-    /// #836: an ANN-degraded recall whose FTS leg also has nothing to match
-    /// must resolve to an empty result, not an error — the timeout path
-    /// must never surface as a hard failure even with zero candidates from
-    /// either leg.
+    /// ANN timeout plus no FTS match returns an empty result, never an error.
     #[tokio::test]
     async fn recall_836_degraded_with_zero_fts_hits_returns_empty_not_error() {
         const MODEL: &str = "recall-836-ann-timeout-empty-model";
@@ -1437,27 +1309,8 @@ mod tests {
         );
     }
 
-    /// PR #836 fix: on a genuine SELF-BUILD timeout, no other holder of
-    /// the per-model `model_warm_lock` (unlike
-    /// `recall_836_degrades_to_fts_only_when_ann_lock_is_held` above, which
-    /// simulates a concurrent holder), this recall's own
-    /// `ensure_ann_for_model` call is the ONLY build in flight — the timed-out
-    /// build must not be dropped. This asserts the detached background build
-    /// eventually installs a fresh ANN index and a later recall takes the
-    /// vector path (no `ann_unavailable` marker), instead of every recall
-    /// restarting and re-timing-out on the same doomed build forever.
-    ///
-    /// A near-zero `ann_ready_timeout_ms` deterministically forces the bounded
-    /// wait to expire on its very first poll (the freshly spawned detached
-    /// task cannot have sent its result yet), without needing an artificially
-    /// large corpus to slow the real build down.
-    ///
-    /// Fail-on-revert proof: reverting `collect_recall_vector_hits`'s detach
-    /// (handlers/common.rs) back to a bare `tokio::time::timeout` wrapping
-    /// `ensure_ann_for_model(...)` directly drops that future on timeout —
-    /// the model never warms, so the `is_current` poll loop below exhausts
-    /// its budget and `warmed` stays `false`, and the second recall keeps
-    /// carrying the `ann_unavailable` marker forever.
+    /// A self-build timeout must leave a tracked build that warms later recalls.
+    /// See `crates/khive-pack-memory/docs/recall-reliability.md`.
     #[tokio::test]
     #[serial(background_tasks)]
     async fn recall_836_self_build_timeout_detaches_build_instead_of_dropping_it() {
@@ -2184,14 +2037,7 @@ mod tests {
         );
     }
 
-    // ADR-104 §1 resolution-path regression: the profile that SERVES the
-    // request (projects weights, gets stamped) must be the one `brain.bind`
-    // resolves through the actor-scoped dispatch path (#699/#708) — not the
-    // `profile_id` override (component 4), which is a separate, deliberate
-    // short-circuit covered by its own test. A resolution regression here
-    // (e.g. `resolve_serving_profile` losing actor-threading, or serve-time
-    // projection reading the wrong profile's state) must fail this test
-    // rather than being masked by the override path.
+    // The actor-resolved profile must both project weights and stamp the response.
     #[tokio::test]
     #[serial(background_tasks)]
     async fn recall_serve_time_projection_uses_the_actor_resolved_profile() {
@@ -2270,11 +2116,7 @@ mod tests {
             .await
             .expect("bind profile to actor");
 
-        // Skew the bound profile's salience posterior away from the default
-        // prior BEFORE issuing the recall — this is what makes
-        // `profile_component != 1.0` a genuine assertion about serve-time
-        // projection reading the actor-resolved profile's state, not merely
-        // about the stamp.
+        // Skew the posterior so the assertion verifies projection, not only stamping.
         adr104_skew_salience(&registry, "adr104-resolution-v1", note_id, 30).await;
 
         let result = registry
@@ -2311,17 +2153,7 @@ mod tests {
         );
     }
 
-    // `#[serial(background_tasks)]`: non-empty recall — see the note on
-    // `recall_with_dollar_sign_query_does_not_error` above.
-    //
-    // Systemic-fix regression: an ANONYMOUS caller must not match an explicit
-    // `actor="local"` binding. `ActorRef::anonymous()` carries `id: "local"`
-    // (`khive-gate/src/actor.rs`); before the `binding_id()` fix,
-    // `resolve_serving_profile` threaded `token.actor().id` unconditionally,
-    // so an anonymous token could match a binding a pre-actor-aware `None`
-    // never could. This binds `anon-local-recall-v1` by `actor="local"` and
-    // asserts an anonymous-token recall omits the serve stamp (falls through
-    // exactly as before actor-threading), rather than crediting the bound profile.
+    // Anonymous callers must not match an explicit `actor="local"` binding.
     #[tokio::test]
     #[serial(background_tasks)]
     async fn recall_anonymous_caller_does_not_match_explicit_actor_local_binding() {
@@ -2491,24 +2323,7 @@ mod tests {
 
     // ── Auto entity-name extraction (dead `entity_names` parameter fix) ────────
 
-    /// Dispatches `memory.recall` against a fresh single-note corpus and
-    /// returns the sole hit's `rank_score`.
-    ///
-    /// `entity_names`: `None` omits the request field entirely (the JSON key
-    /// is absent, so `RecallParams::entity_names` deserializes to `None` —
-    /// auto-extraction runs). `Some(&[])` sends an explicit empty JSON array
-    /// (`RecallParams::entity_names` deserializes to `Some(vec![])` —
-    /// explicit opt-out, auto-extraction must NOT run). `Some(&[..])`
-    /// non-empty sends explicit names verbatim.
-    ///
-    /// A single-note corpus + forced RRF fusion keeps retrieval-stage
-    /// relevance identical across calls (fusion/RRF normalization does not
-    /// consult `entity_names`; with one hit, `normalize_rrf_scores` collapses
-    /// to the constant `baseline_relevance + range`), so any `rank_score`
-    /// difference between calls is attributable to the EntityMatch scoring
-    /// adjustment alone — not to a query term also moving retrieval-stage
-    /// rank (the two-item-corpus percentile-normalization confound: see the
-    /// design note below).
+    /// Return one hit's score; a single-note RRF corpus isolates entity adjustment effects.
     async fn dispatch_single_note_recall(
         content: &str,
         query: &str,
@@ -2544,28 +2359,8 @@ mod tests {
         hits[0]["rank_score"].as_f64().expect("rank_score")
     }
 
-    /// `#[serial(background_tasks)]`: non-empty recall — see the note on
-    /// `recall_with_dollar_sign_query_does_not_error` above.
-    ///
-    /// Proves the full wiring (`handle_recall` → `extract_entity_candidates`
-    /// → `calculate_score`) by comparing `rank_score` for the *same*
-    /// single-note corpus and query, varying only `entity_names`:
-    /// - `entity_names` omitted (`None`) → `extract_entity_candidates`
-    ///   derives `["zenlake"]` from the capitalized query token, which
-    ///   matches the note's content → EntityMatch fires.
-    /// - explicit empty list (`Some([])`) → opt-out, auto-extraction does
-    ///   not run → EntityMatch does not fire.
-    ///
-    /// An earlier version of this test instead compared two *different*
-    /// notes (one mentioning the entity, one not) and asserted ranking
-    /// order. Review correctly flagged that as non-vacuous-looking but
-    /// actually weak: the entity term is, by construction, also a query
-    /// term, so it already changes retrieval-stage relevance independent of
-    /// the EntityMatch adjustment — the test would still pass if
-    /// auto-extraction were deleted entirely. Comparing the *same*
-    /// single-hit corpus/query across two calls (only `entity_names`
-    /// differing) isolates the scoring-stage effect and asserts the exact
-    /// ×1.3 ratio directly, so it fails if auto-extraction stops firing.
+    /// Omitted entity names auto-extract a 1.3x boost; explicit empty opts out.
+    /// See `crates/khive-pack-memory/docs/recall-reliability.md`.
     #[tokio::test]
     #[serial(background_tasks)]
     async fn recall_auto_extraction_from_capitalized_query_fires_entity_match() {
@@ -2589,16 +2384,7 @@ mod tests {
         );
     }
 
-    /// `#[serial(background_tasks)]`: non-empty recall — see the note on
-    /// `recall_with_dollar_sign_query_does_not_error` above.
-    ///
-    /// `entity_names: []` is explicit caller intent
-    /// ("no entity boost"), distinct from omitting the field. This uses the
-    /// exact corpus/query from the sibling test above — where omitting
-    /// `entity_names` auto-extracts `"zenlake"` and fires EntityMatch — and
-    /// proves that sending `Some([])` disables the boost instead of being
-    /// treated the same as `None` (which would silently re-enable
-    /// auto-extraction and leave callers with no way to opt out).
+    /// An explicit empty entity list disables automatic extraction.
     #[tokio::test]
     #[serial(background_tasks)]
     async fn recall_explicit_empty_entity_names_disables_boost_where_auto_extraction_would_fire() {
@@ -2606,10 +2392,7 @@ mod tests {
         const QUERY: &str = "committee proposal Zenlake";
 
         let opted_out_score = dispatch_single_note_recall(CONTENT, QUERY, Some(&[])).await;
-        // A query/content pair with no entity-boost opportunity at all
-        // (all-stopword query → `extract_entity_candidates` yields nothing
-        // even on `None`) establishes the true "no boost applied" baseline
-        // score for comparison, independent of any entity-extraction path.
+        // An all-stopword query provides a baseline with no entity boost opportunity.
         let never_boosted_baseline =
             dispatch_single_note_recall("is it for me too", "is it for me", None).await;
 
@@ -2621,18 +2404,7 @@ mod tests {
         );
     }
 
-    /// `#[serial(background_tasks)]`: non-empty recall — see the note on
-    /// `recall_with_dollar_sign_query_does_not_error` above.
-    ///
-    /// Both calls target the exact same single-note corpus and the exact same
-    /// query — a query built entirely out of `ENTITY_STOPWORDS` tokens, so
-    /// `extract_entity_candidates` deterministically yields an *empty* list
-    /// (see `extract_entity_candidates_all_stopwords_returns_empty` in
-    /// scoring.rs). The only way the note (whose content contains
-    /// "glorptastic") can pick up the EntityMatch ×1.3 boost is if the
-    /// handler passes the caller's explicit, non-empty, query-unrelated
-    /// `entity_names` straight through instead of (re-)deriving candidates
-    /// from the query.
+    /// A non-empty explicit entity list passes through even when the query yields none.
     #[tokio::test]
     #[serial(background_tasks)]
     async fn recall_explicit_nonempty_entity_names_suppresses_auto_extraction() {
@@ -2759,12 +2531,7 @@ mod tests {
 
     // ── ADR-104 Stage A: serve-time profile projection ─────────────────────
 
-    /// Deterministic embedding service returning a hand-picked fixed vector
-    /// per exact input text. Unlike `HashVecService` above (deterministic
-    /// but not analytically controllable), this lets a test pin the exact
-    /// cosine similarity between a query and a given note's content, which
-    /// the ADR-104 ranking tests need to build a small corpus with a known,
-    /// controlled relevance gap between two candidates.
+    /// Exact-text vectors make ADR-104 cosine gaps analytically controllable.
     struct FixedVecService {
         map: HashMap<String, Vec<f32>>,
     }
@@ -2820,14 +2587,7 @@ mod tests {
     const ADR104_H_CONTENT: &str = "candidate h content marker";
     const ADR104_L_CONTENT: &str = "candidate l content marker";
 
-    /// 8-dim unit vectors, only the first two components carrying signal —
-    /// cosine similarity between any two of these equals the dot product of
-    /// those two components. Query = `(1, 0)`. `FILLER_LOW` is orthogonal
-    /// (cos 0.0) and `FILLER_HIGH` is identical to the query (cos 1.0); they
-    /// anchor the min/max of `normalize_rank_fusion_scores`'s percentile
-    /// band so that `H` (cos 0.717) and `L` (cos 0.5) calibrate to a known,
-    /// modest ~1.3x relevance ratio instead of the min/max extremes a
-    /// 2-point corpus would otherwise force them to.
+    /// Unit vectors anchor H/L inside a known percentile band rather than at its extremes.
     fn adr104_fixed_vectors() -> HashMap<String, Vec<f32>> {
         let mut m = HashMap::new();
         m.insert(
@@ -2853,17 +2613,7 @@ mod tests {
         m
     }
 
-    /// Builds a runtime with kg+memory+brain registered, the deterministic
-    /// fixed-vector embedder above, and a 4-note corpus: two filler notes
-    /// anchoring the relevance percentile band, plus two candidates —
-    /// `H` (higher relevance, cos 0.717; lower salience, 0.1) and `L`
-    /// (lower relevance, cos 0.5; higher salience, 0.9). The ~1.3x
-    /// calibrated relevance edge for `H` is deliberately small enough that
-    /// pushing the salience posterior's projected weight high enough (via
-    /// repeated `brain.feedback` "useful" signals against a profile) flips
-    /// the ranking to `L` — proving the projection is load-bearing for
-    /// ordering, not just magnitude. Returns `(runtime, registry, namespace,
-    /// h_id, l_id)`.
+    /// Build a controlled four-note corpus whose profile salience projection flips H/L order.
     async fn adr104_build_ranking_corpus() -> (
         khive_runtime::KhiveRuntime,
         khive_runtime::VerbRegistry,
@@ -2939,14 +2689,7 @@ mod tests {
         (rt, registry, ns, h_id, l_id)
     }
 
-    /// Skews `profile_id`'s salience posterior via `n` repeated explicit
-    /// "useful" `brain.feedback` signals targeted at `target_id`
-    /// (`served_by_profile_id` bypasses binding resolution). Each signal
-    /// updates both the profile's global salience posterior (starts at
-    /// `Beta(2,8)`, mean 0.2) and `target_id`'s per-entity posterior (starts
-    /// at the uninformative `Beta(1,1)`, mean 0.5) — the same feedback event
-    /// drives both ADR-104 component 1 (via the global posterior) and the
-    /// component-3 `entity_posterior_mean` report (via the per-entity one).
+    /// Send useful feedback that updates both global salience and target posterior.
     async fn adr104_skew_salience(
         registry: &khive_runtime::VerbRegistry,
         profile_id: &str,
@@ -2976,13 +2719,7 @@ mod tests {
             .unwrap_or_else(|| panic!("id {target} not present in recall hits: {hits:?}"))
     }
 
-    /// Profile-differentiated ranking (ADR-104 §1): two profiles with
-    /// different posterior state must produce DIFFERENT orderings for the
-    /// same store+query. `H` leads `L` at configured-default weights (its
-    /// modest relevance edge dominates); pushing a profile's salience
-    /// posterior far above the default weight overturns that edge and `L`
-    /// leads instead. Deleting the serve-time projection call collapses
-    /// both cases to the same (default) ordering, failing this test.
+    /// Different profile state must flip ordering for the same corpus and query.
     #[tokio::test]
     #[serial(background_tasks)]
     async fn adr104_profile_differentiated_ranking_flips_order() {
@@ -3035,10 +2772,7 @@ mod tests {
         );
     }
 
-    /// No-profile path unchanged (ADR-104 §1): a request with no resolvable
-    /// profile must score byte-identically whether or not the brain pack is
-    /// even loaded — merely having a default profile registered must not
-    /// perturb scoring absent an explicit config or a matching binding.
+    /// Without a resolved profile, loading the brain pack must not change scores.
     #[tokio::test]
     #[serial(background_tasks)]
     async fn recall_no_profile_scores_identically_with_or_without_brain_pack() {
@@ -3102,10 +2836,7 @@ mod tests {
         );
     }
 
-    /// `profile_id` override (ADR-104 §4): stamps the named profile with no
-    /// binding required, participates in the serve ledger identically to a
-    /// resolved profile, and an unknown profile_id is a hard per-op error
-    /// rather than a silent fallback to defaults.
+    /// Explicit profile override stamps results/ledger; an unknown ID is an error.
     #[tokio::test]
     #[serial(background_tasks)]
     async fn recall_profile_id_override_stamps_ledger_and_rejects_unknown_profile() {
@@ -3219,18 +2950,7 @@ mod tests {
         );
     }
 
-    /// Breakdown fields (ADR-104 §3): `profile_component` is neutral (1.0)
-    /// with no profile and != 1.0 once a differentiating profile serves the
-    /// request; `entity_posterior_mean` is absent for a target with no
-    /// feedback and present+correct for one with a seeded posterior. With
-    /// Stage B (§2) live, the entity term on `H` is also in effect here —
-    /// bounded to at most +15% — but the salience-projection margin that
-    /// puts `L` ahead (component 1, driven by 30 signals against the global
-    /// salience posterior) is wide enough that the entity term alone does
-    /// not overturn it. Component 2's isolated, order-flipping effect is
-    /// covered by the feedback-lift and neutrality tests below (ADR-104
-    /// Stage B gate), which hold the corpus fixed and vary only the entity
-    /// posterior.
+    /// Breakdown reports neutral/default profile state and learned entity posterior state.
     #[tokio::test]
     #[serial(background_tasks)]
     async fn recall_breakdown_reports_profile_component_and_entity_posterior_mean() {
@@ -3349,10 +3069,7 @@ mod tests {
         );
     }
 
-    /// Determinism (ADR-104 §1): identical store/query/profile-state must
-    /// produce identical ranking and identical `rank_score` values across
-    /// repeated calls — `project_config` is used as a pure function, never
-    /// mutating shared state.
+    /// Identical store, query, and profile state must yield identical ranks and scores.
     #[tokio::test]
     #[serial(background_tasks)]
     async fn recall_profile_projection_is_deterministic_across_repeated_calls() {
@@ -3423,16 +3140,7 @@ mod tests {
 
     // ── ADR-104 Stage B: bounded per-entity posterior term (row-B gate) ────
 
-    /// Neutrality (row-B gate): a candidate with no per-entity posterior must
-    /// score identically whether or not a profile serves the request, as
-    /// long as that profile's *global* weights also equal defaults (a fresh
-    /// profile with untouched Beta priors projects to exactly
-    /// `RecallConfig::default()` — see `tunable.rs`'s
-    /// `project_config_with_default_priors_matches_expected_defaults`). This
-    /// isolates component 2 (the entity term) from component 1 (weight
-    /// projection): with no posterior for this UUID, component 2 must be
-    /// the identity multiplier, so profile-served and default-served scores
-    /// coincide exactly.
+    /// A missing entity posterior is an exact identity under a fresh default profile.
     #[tokio::test]
     #[serial(background_tasks)]
     async fn adr104_stage_b_no_posterior_candidate_scores_identically_with_fresh_profile() {
@@ -3516,14 +3224,7 @@ mod tests {
         );
     }
 
-    /// Feedback-lift (row-B gate, the ADR's headline test): one explicit
-    /// `useful` signal on a recalled memory changes that memory's rank_score
-    /// on the next equivalent query — under the profile the signal targeted
-    /// — and does NOT change it under a different profile or under defaults.
-    /// Both non-targeted arms start numerically identical to the pre-signal
-    /// baseline (a fresh profile projects to default weights, per the
-    /// neutrality test above), so any post-signal divergence is attributable
-    /// to the signal.
+    /// One useful signal lifts only the targeted profile's next equivalent recall.
     #[tokio::test]
     #[serial(background_tasks)]
     async fn adr104_stage_b_one_signal_lifts_rank_only_under_the_served_profile() {
@@ -3631,15 +3332,7 @@ mod tests {
         );
     }
 
-    /// Clamp (row-B gate) at the pipeline level: driving a profile's
-    /// per-entity posterior to its practical ceiling (repeated `useful`
-    /// signals push the Beta posterior mean arbitrarily close to 1.0, never
-    /// reaching it exactly) must never lift `rank_score` by more than the
-    /// documented +15% bound relative to the same candidate's score under a
-    /// fresh, untouched profile. The exact-boundary case
-    /// (`entity_posterior_term`'s clamp at mean=0.0/1.0 precisely) is
-    /// covered at the unit level in `scoring.rs`; this test proves the bound
-    /// holds end-to-end through the handler, not just in the pure function.
+    /// Near-saturated entity feedback must remain inside the ±15% pipeline clamp.
     #[tokio::test]
     #[serial(background_tasks)]
     async fn adr104_stage_b_saturated_posterior_never_exceeds_clamp_bound_end_to_end() {
@@ -3721,12 +3414,7 @@ mod tests {
             "expected a near-saturated mean, got {ent_mean}"
         );
 
-        // 200 "useful" signals also drive the global salience posterior
-        // (component 1) far from its prior, so `saturated_score` reflects
-        // both components, not component 2 alone. Bound the *entity term's*
-        // contribution directly instead of the composite ratio: divide out
-        // the component-1 (profile_component) ratio the response already
-        // reports, leaving only component 2's multiplier for the assertion.
+        // Divide out the global component to assert the entity clamp in isolation.
         let profile_component = hits[0]["breakdown"]["profile_component"]
             .as_f64()
             .expect("profile_component present");
@@ -3741,26 +3429,8 @@ mod tests {
         );
     }
 
-    /// Isolation (row-B gate): the earlier
-    /// feedback-lift and clamp tests above give one profile strictly more
-    /// feedback than another, which also perturbs that profile's *global*
-    /// salience posterior (component 1, ADR-104 §1) — `on_explicit_feedback`
-    /// updates `state.salience` on every signal regardless of `target_id`
-    /// (see `recall_feedback.rs`). So a passing feedback-lift test alone does
-    /// not prove component 2 (the entity term) did the lifting; it could be
-    /// entirely a Stage A weight-projection effect.
-    ///
-    /// This test controls for that: two profiles each receive exactly ONE
-    /// `useful` signal — identical global salience posterior state — but
-    /// aimed at *different* targets (`target_x` for profile X, `target_y`
-    /// for profile Y). Recalling `target_x`'s note under both profiles must
-    /// therefore show identical `profile_component` (component 1 is
-    /// target-independent), while `entity_posterior_mean` for `target_x` is
-    /// present only under profile X. The measured `rank_score` ratio between
-    /// the two must equal `entity_posterior_term(mean, ENTITY_POSTERIOR_WEIGHT)`
-    /// exactly — the only degree of freedom left once component 1 is held
-    /// constant — proving the multiplier is live end-to-end, not just
-    /// present in the pure function.
+    /// Matched global feedback counts isolate the target-specific entity multiplier.
+    /// See `crates/khive-pack-memory/docs/recall-reliability.md`.
     #[tokio::test]
     #[serial(background_tasks)]
     async fn adr104_stage_b_entity_term_isolated_via_matched_global_feedback_count() {
@@ -3818,18 +3488,11 @@ mod tests {
                 .expect("create profile");
         }
 
-        // Exactly one signal per profile — same weight, same count — but
-        // profile X's signal targets target_x and profile Y's targets
-        // target_y. Global salience posterior state ends up identical;
-        // per-entity posterior state does not.
+        // Equal signal counts keep global state equal while entity state differs.
         adr104_skew_salience(&registry, "adr104b-iso-x-v1", target_x_id, 1).await;
         adr104_skew_salience(&registry, "adr104b-iso-y-v1", target_y_id, 1).await;
 
-        // Both notes share most of their vocabulary ("adr104b isolation ...
-        // note"), so an FTS query naming only `target_x_id`'s note can still
-        // surface `target_y_id`'s note as a secondary hit — locate
-        // `target_x_id` by id within the returned hits rather than assuming
-        // a single-hit result.
+        // Shared vocabulary can return both notes, so locate the target by ID.
         async fn recall_target_x(
             registry: &khive_runtime::VerbRegistry,
             ns: &Namespace,
@@ -3893,16 +3556,7 @@ mod tests {
         );
     }
 
-    /// Regression (row-B gate): the entity
-    /// term must apply on the weighted-rerank path too, not only the
-    /// default `rank_score` path. `weighted_rerank` recomposes its score
-    /// from raw relevance/salience/temporal features and never reads
-    /// `rank_score`, so a naive "multiply `rank_score`" fix is dead code
-    /// whenever a caller sets non-empty `reranker_weights`. This drives a
-    /// single-note corpus through the reranker path before and after one
-    /// `useful` signal and asserts the score moves by exactly the entity
-    /// term, proving the multiplier is applied to whichever composite score
-    /// actually reaches ranking.
+    /// The entity term must apply after weighted reranking, not only default scoring.
     #[tokio::test]
     #[serial(background_tasks)]
     async fn adr104_stage_b_entity_term_applies_under_weighted_reranker() {
@@ -4014,13 +3668,7 @@ mod tests {
 
     // ── ADR-104 R2: measured per-recall overhead of the profile-state read ─
 
-    /// Median + p95 wall-clock overhead of the ADR-104 §1 profile-state read
-    /// (`brain.profile` dispatch + snapshot deserialize + `project_config`)
-    /// against an otherwise identical recall with no resolvable profile.
-    /// `#[ignore]`d — a timing measurement, not a correctness gate; run
-    /// explicitly (`cargo test -p khive-pack-memory -- --ignored
-    /// adr104_r2`) and the printed numbers are recorded verbatim in
-    /// IMPL_REPORT.md per the Stage A binding sign-off rider (R2).
+    /// Ignored benchmark comparing median/p95 recall with and without profile-state reads.
     #[tokio::test]
     #[ignore]
     async fn adr104_r2_measure_profile_state_read_overhead() {
@@ -4086,10 +3734,7 @@ mod tests {
             .await
             .expect("bind profile");
 
-        // The "without profile" arm exercises the exact same handler path
-        // with binding resolution finding nothing: a fresh namespace with no
-        // binding, rather than an invalid profile_id (which would error,
-        // not degrade).
+        // A fresh unbound namespace exercises the genuine no-profile path.
         let unbound_ns = Namespace::parse("adr104-r2-unbound").expect("ns");
         let unbound_token = rt.authorize(unbound_ns.clone()).expect("token");
         rt.create_note(
@@ -4148,20 +3793,7 @@ mod tests {
 
     // ── #733 slice 1: optional `namespace` param on memory.recall ──────────
 
-    /// #791: `memory.recall`'s ANN cache-hit path now serves a
-    /// present-but-stale entry immediately rather than blocking the request
-    /// on a synchronous full-corpus rebuild (`ann::search_loaded`'s call
-    /// site in `handlers/common.rs` no longer gates on `ann::is_current`).
-    /// A `memory.remember` immediately followed by a `memory.recall` for the
-    /// same model is therefore only eventually, not immediately, consistent:
-    /// the background warm the write fires (`ann::ensure_ann_background`)
-    /// has to install before the just-written note is reflected. Tests that
-    /// seed notes and then assert on recall results poll a bounded number of
-    /// times instead of asserting on a single dispatch, matching the
-    /// documented indexing-latency contract ("a stale ANN serving window is
-    /// acceptable"). `ready` decides when the response is settled enough to
-    /// assert against; on exhaustion this returns the last response so the
-    /// caller's own assertions produce the real diagnostic.
+    /// Poll eventually consistent ANN results, returning the last response on exhaustion.
     async fn recall_until(
         registry: &khive_runtime::VerbRegistry,
         verb: &str,
@@ -4172,11 +3804,7 @@ mod tests {
             .dispatch(verb, args.clone())
             .await
             .unwrap_or_else(|e| panic!("{verb}: {e}"));
-        // 300 * 25ms = ~7.5s ceiling — generous relative to the small
-        // in-memory corpora these tests seed, to stay reliable under
-        // parallel test-suite CPU contention (background warms share the
-        // process-wide blocking pool with every other concurrently running
-        // test), while still resolving in low milliseconds in the common case.
+        // 7.5s tolerates blocking-pool contention; common cases settle in milliseconds.
         for _ in 0..300 {
             if ready(&result) {
                 return result;
@@ -4190,11 +3818,7 @@ mod tests {
         result
     }
 
-    /// Seeds a fresh in-memory runtime with `kg` + `memory` registered, three
-    /// memories — two in `local`, one in `bench-a` — all sharing a query term
-    /// so a namespace-agnostic FTS/RRF recall would surface all three absent
-    /// any namespace filtering. Returns `(registry, local_id_1, local_id_2,
-    /// bench_id)`.
+    /// Seed two local memories and one bench-a memory sharing a query term.
     async fn ns733_seed_three_memories() -> (khive_runtime::VerbRegistry, Uuid, Uuid, Uuid) {
         let rt = KhiveRuntime::memory().expect("in-memory runtime");
         let mut builder = VerbRegistryBuilder::new();
@@ -4232,11 +3856,7 @@ mod tests {
         (registry, local_id_1, local_id_2, bench_id)
     }
 
-    /// Regression (spec item 1): `namespace` absent must be byte-identical to
-    /// pre-#733 behavior — recall reads the caller token's default visible
-    /// namespace set (`local` here), so a no-arg recall over a corpus with
-    /// two `local` memories and one `bench-a` memory surfaces only the two
-    /// `local` hits.
+    /// With no override, recall uses exactly the caller token's visible namespaces.
     #[tokio::test]
     #[serial(background_tasks)]
     async fn ns733_recall_namespace_absent_regresses_to_local_only() {
@@ -4266,9 +3886,7 @@ mod tests {
         );
     }
 
-    /// Spec item 2: `namespace="bench-a"` returns only the bench-a memory,
-    /// not either `local` memory — the exact-match escape narrows the read
-    /// scope instead of widening it.
+    /// An explicit namespace narrows recall to that exact namespace.
     #[tokio::test]
     #[serial(background_tasks)]
     async fn ns733_recall_namespace_explicit_returns_only_that_namespace() {
@@ -4299,8 +3917,7 @@ mod tests {
         );
     }
 
-    /// Spec item 3: a `namespace` that matches nothing in the corpus returns
-    /// an empty result set with `ok:true` (dispatch succeeds), not an error.
+    /// An absent namespace returns an empty successful result.
     #[tokio::test]
     #[serial(background_tasks)]
     async fn ns733_recall_namespace_no_match_returns_empty_ok() {
@@ -4324,10 +3941,7 @@ mod tests {
         );
     }
 
-    /// Spec item 4: an invalid `namespace` string is a per-op error naming
-    /// the problem, never silent coercion to a fallback namespace. Validated
-    /// via the same `Namespace::parse` machinery used elsewhere (a space is
-    /// rejected — `NamespaceError::InvalidCharacter`).
+    /// An invalid namespace is a per-operation error naming the supplied value.
     #[tokio::test]
     #[serial(background_tasks)]
     async fn ns733_recall_invalid_namespace_is_a_per_op_error() {
@@ -4348,14 +3962,7 @@ mod tests {
             "an invalid namespace string must be a per-op error, not a silent fallback",
         );
         let msg = err.to_string();
-        // #733: asserting only that the
-        // message contains the word "namespace" passes vacuously (every
-        // variant of this error, valid or not, contains that word). Assert
-        // the *supplied* invalid value itself appears, proving the error
-        // actually names the problem rather than a generic namespace
-        // complaint (`resolve_explicit_namespace` in
-        // `khive-runtime/src/pack.rs`, the path this dispatched call goes
-        // through, now includes `{ns_str:?}` in its message).
+        // Checking the supplied value distinguishes this from a generic namespace error.
         assert!(
             msg.contains("bad namespace"),
             "error message must name the supplied invalid value \"bad namespace\", got: {msg}"
@@ -4367,12 +3974,7 @@ mod tests {
     const NS733_TARGET_CONTENT: &str = "ns733 ann overfetch bench target";
     const NS733_FILLER_COUNT: usize = 35;
 
-    /// 8-dim vectors, first two components carry signal (ADR-104 test pattern
-    /// reused here). Query = (1, 0) — cos 1.0 against itself. All 35 `local`
-    /// filler notes share an identical vector at cos 0.9 against the query;
-    /// the single `bench-a` target sits at cos 0.5, strictly below every
-    /// filler. Cosine-ranked purely by similarity, the target is therefore
-    /// guaranteed last (rank 36 of 36) — not a probabilistic near-miss.
+    /// Fixed vectors place the bench-a target deterministically behind all local fillers.
     fn ns733_ann_fixed_vectors() -> HashMap<String, Vec<f32>> {
         let mut m = HashMap::new();
         m.insert(
@@ -4392,51 +3994,12 @@ mod tests {
         m
     }
 
-    /// Spec item 5: the ANN over-fetch retry loop (`config.rs`'s
-    /// "visible-namespace candidates" widening, `ann_overfetch_max_rounds`)
-    /// must respect the effective (explicit-namespace-narrowed) visible set,
-    /// not just eventually surface *a* result.
-    ///
-    /// Setup: a single global per-model ANN index (confirmed at the source —
-    /// `AnnKey` carries no namespace field, `ann.rs`: "One index per model
-    /// covers all namespaces") holds 35 `local` filler vectors all closer to
-    /// the query than the one `bench-a` target vector, with `candidate_limit`
-    /// pinned to 1 so the initial over-fetch window (`max(limit*4,
-    /// limit+32)` = 33) is narrower than the filler count — round 1 excludes
-    /// the target outright. This proves two things in one test:
-    ///
-    /// 1. With default widening (`ann_overfetch_max_rounds` unset, env
-    ///    fallback 3): the retry loop widens past round 1, the target enters
-    ///    the fetch window, and `namespace="bench-a"`'s post-filter still
-    ///    returns *only* the target — none of the 35 `local` fillers ever
-    ///    leak into the response despite sharing the same global ANN index.
-    /// 2. With widening explicitly disabled (`ann_overfetch_max_rounds: 1`,
-    ///    per `config.rs`'s "Pass `Some(1)` to disable widening entirely"):
-    ///    the same query against the same corpus returns nothing — proving
-    ///    the round-1 result in case 1 was not a coincidence of corpus size,
-    ///    but genuinely produced by the widening loop.
+    /// Widening finds only the bench-a target; disabling widening leaves it unreachable.
+    /// See `crates/khive-pack-memory/docs/recall-reliability.md`.
     #[tokio::test]
     #[serial(background_tasks)]
     async fn ns733_recall_ann_overfetch_retry_loop_respects_effective_namespace() {
-        // #750: this test used to retry the whole seed-and-recall flow
-        // against a fresh `KhiveRuntime` up to 5 times, and separately poll
-        // `memory.recall` for up to 500ms per attempt, to paper over a
-        // pre-existing ANN warm-cache race: `ensure_ann_for_model` installed
-        // whichever queued build acquired the per-model lock first via
-        // `entry(key).or_insert(bridge)`, permanently, even when it had
-        // snapshotted the corpus before a still-in-flight `remember`
-        // committed. The write-generation-checked install
-        // (`install_if_fresher` in ann.rs) fixed that permanent-win bug.
-        //
-        // #791: `handlers/common.rs`'s recall path now serves a
-        // stale-but-present cache entry immediately instead of treating it
-        // as a miss, to stop a recall from paying for a synchronous
-        // full-corpus rebuild on its own request path. That reintroduces a
-        // *bounded, eventually-resolving* staleness window here: the very
-        // next recall right after `remember`ing the target can observe a
-        // cache that predates it. `recall_until` polls for the settled
-        // (post-background-warm) response instead of asserting on a single
-        // dispatch.
+        // Poll only through the bounded stale-serve window; never retry corpus setup.
         let rt = KhiveRuntime::memory().expect("in-memory runtime");
         rt.register_embedder(FixedVecProvider {
             model_name: NS733_ANN_MODEL.to_string(),
@@ -4448,13 +4011,7 @@ mod tests {
         builder.register(MemoryPack::new(rt.clone()));
         let registry = builder.build().expect("registry");
 
-        // No `embedding_model` on remember: `create_note_inner`'s auto-detect
-        // path fans out to every *registered* model when the field is
-        // omitted (`resolve_embedding_model` only accepts lattice aliases —
-        // an explicit custom provider name here would hit `UnknownModel`,
-        // same gotcha documented on `recall_with_residual_fts5_char_now_sanitized`
-        // above). `NS733_ANN_MODEL` is the only model registered on this
-        // runtime, so auto-detect resolves to exactly it.
+        // Omitting the model fans out to the sole registered custom provider.
         for i in 0..NS733_FILLER_COUNT {
             registry
                 .dispatch(
@@ -4544,10 +4101,7 @@ mod tests {
     const NS733B_TARGET_CONTENT: &str = "ns733b breakdown bench target";
     const NS733B_FILLER_COUNT: usize = 5;
 
-    /// Same fixed-vector scheme as `ns733_ann_fixed_vectors` (query cos 1.0,
-    /// `local` fillers cos 0.9, `bench-a` target cos 0.5) — reused for both
-    /// registered models so the ANN over-fetch genuinely returns filler IDs
-    /// under each model, not just the target.
+    /// Reuse the controlled namespace vector ordering for both registered models.
     fn ns733b_fixed_vectors() -> HashMap<String, Vec<f32>> {
         let mut m = HashMap::new();
         m.insert(
@@ -4567,17 +4121,7 @@ mod tests {
         m
     }
 
-    /// Seeds `registry`'s runtime with `NS733B_FILLER_COUNT` `local` filler
-    /// memories plus one `bench-a` target memory, all sharing
-    /// `ns733b_fixed_vectors`'s vector scheme (query cos 1.0, fillers cos
-    /// 0.9, target cos 0.5). No `embedding_model` on remember: auto-detect
-    /// fans out to every registered model, matching
-    /// `ns733_seed_three_memories`'s documented gotcha above. Shared between
-    /// the `memory.recall` verbose-breakdown regression (#733) and the
-    /// `memory.recall_candidates` regression (#733) that protects
-    /// `handle_recall_candidates`'s independent
-    /// per-model serialization site (`sub_handlers.rs`). Returns
-    /// `(local_filler_ids, target_id)`.
+    /// Seed local fillers and one bench-a target across every registered model.
     async fn ns733b_seed_two_model_corpus(
         registry: &khive_runtime::VerbRegistry,
     ) -> (HashSet<Uuid>, Uuid) {
@@ -4620,38 +4164,11 @@ mod tests {
         (local_filler_ids, target_id)
     }
 
-    /// #733: with `namespace="bench-a"`,
-    /// more than one registered embedding model, and `include_breakdown=true`,
-    /// `memory.recall`'s verbose response embeds
-    /// `candidates.vector_candidates_per_model` — built directly from the
-    /// (pre-hydration, namespace-agnostic) global ANN over-fetch results,
-    /// bypassing the `memory_ids` visible-namespace filter that scopes
-    /// `results` itself. This seeds two registered models, five `local`
-    /// filler memories ranked closer to the query than the one `bench-a`
-    /// target (guaranteeing the raw per-model over-fetch actually contains
-    /// filler IDs under both models — a non-vacuous corpus), and asserts no
-    /// `local` filler UUID appears anywhere in the breakdown for either
-    /// model, while the target UUID is present.
+    /// Multi-model verbose breakdown must exclude every off-namespace ANN candidate.
     #[tokio::test]
     #[serial(background_tasks)]
     async fn ns733b_recall_verbose_multi_model_breakdown_excludes_off_namespace_candidates() {
-        // #750: this test used to retry the whole corpus-seed-and-recall flow
-        // against a fresh `KhiveRuntime` up to 5 times, and separately poll
-        // `memory.recall` for up to 500ms per attempt, to paper over the
-        // same pre-existing ANN warm-cache race documented in detail on
-        // `ns733_recall_ann_overfetch_retry_loop_respects_effective_namespace`
-        // above — `ensure_ann_for_model`'s old `entry(key).or_insert(bridge)`
-        // let whichever queued build acquired the per-model lock first win
-        // permanently, even one that had snapshotted the corpus before a
-        // still-in-flight sibling `remember` committed. The
-        // write-generation-checked install (`install_if_fresher`, ann.rs)
-        // fixed that permanent-win bug.
-        //
-        // #791: `handlers/common.rs`'s recall path now serves a
-        // stale-but-present cache entry immediately (see the rationale on
-        // `ns733_recall_ann_overfetch_retry_loop_respects_effective_namespace`
-        // above), so `recall_until` polls for the settled response instead
-        // of asserting on a single dispatch.
+        // Poll only through the bounded stale-serve window; never retry corpus setup.
         let rt = KhiveRuntime::memory().expect("in-memory runtime");
         rt.register_embedder(FixedVecProvider {
             model_name: NS733B_MODEL_A.to_string(),
@@ -4695,10 +4212,7 @@ mod tests {
         ns733b_assert_breakdown(&result, &local_filler_ids, target_id);
     }
 
-    /// Assertion body for
-    /// `ns733b_recall_verbose_multi_model_breakdown_excludes_off_namespace_candidates`,
-    /// split out so the retry loop above can call it once a settled response
-    /// is in hand without duplicating the assertions per attempt.
+    /// Assert both model breakdowns exclude local fillers and retain the bench target.
     fn ns733b_assert_breakdown(result: &Value, local_filler_ids: &HashSet<Uuid>, target_id: Uuid) {
         let per_model = result["candidates"]["vector_candidates_per_model"]
             .as_array()
@@ -4744,36 +4258,11 @@ mod tests {
     // ── #733: `memory.recall_candidates` must be
     // covered by its own regression, independent of `memory.recall`'s ──────
 
-    /// #733: the earlier
-    /// regression above dispatches only `memory.recall` with
-    /// `include_breakdown=true`, which is mutation-sensitive for
-    /// `handle_recall`'s filter (`recall.rs`) but *not* for
-    /// `handle_recall_candidates`'s independent filter (`sub_handlers.rs:182`,
-    /// reached via the separate `memory.recall_candidates` verb —
-    /// `pack.rs`'s dispatch table routes the two verbs to two different
-    /// handler functions with two separate `vector_hits_per_model`
-    /// serialization sites). Removing the `.filter(...)` at
-    /// `sub_handlers.rs:182` would not fail any existing test. This
-    /// dispatches `memory.recall_candidates` directly against the identical
-    /// two-model/`local`-fillers/`bench-a`-target corpus and asserts the
-    /// same no-leak + target-present properties against
-    /// `handle_recall_candidates`'s response shape, which differs from
-    /// `handle_recall`'s: `vector_candidates_per_model` here is a JSON
-    /// *object* keyed by model name (`{"model-a": [...], "model-b": [...]}`,
-    /// `sub_handlers.rs:194`), not an array of `{model, hits}` entries.
+    /// The candidates subhandler's independent model map must exclude off-namespace IDs.
     #[tokio::test]
     #[serial(background_tasks)]
     async fn ns733b_recall_candidates_multi_model_excludes_off_namespace_candidates() {
-        // #750: same pre-existing ANN warm-cache race documented in detail on
-        // `ns733b_recall_verbose_multi_model_breakdown_excludes_off_namespace_candidates`
-        // above applied identically here — `handle_recall_candidates` reads
-        // the same shared per-model ANN index via the same
-        // `collect_recall_candidates` path `handle_recall` uses. Fixed the
-        // same way (write-generation-checked install).
-        //
-        // #791: same stale-serve behavior change as the sibling test above
-        // — polls for the settled response via `recall_until` rather than
-        // asserting on a single dispatch.
+        // Candidate diagnostics share the same bounded stale-serve window as recall.
         let rt = KhiveRuntime::memory().expect("in-memory runtime");
         rt.register_embedder(FixedVecProvider {
             model_name: NS733B_MODEL_A.to_string(),
@@ -4791,16 +4280,7 @@ mod tests {
 
         let (local_filler_ids, target_id) = ns733b_seed_two_model_corpus(&registry).await;
 
-        // `memory.recall_candidates`'s `HandlerDef` declares no
-        // `namespace` `ParamDef` (`pack.rs`: `params: &[]`), so
-        // `VerbRegistry::dispatch`'s generic Rule-3 explicit-namespace
-        // escape (ADR-007 Rev 4/6) is the *only* thing scoping this call
-        // — it mints the token with `visible=["bench-a"]` before
-        // `handle_recall_candidates` ever runs, then strips the
-        // `namespace` key from params (the handler never sees it). No
-        // `fusion_strategy`/`include_breakdown` params exist on this
-        // sub-verb — it always returns the per-model breakdown whenever
-        // more than one model is registered (`sub_handlers.rs:168`).
+        // Registry dispatch scopes the token before stripping this sub-handler's namespace.
         let recall_candidates_args = serde_json::json!({
             "query": NS733B_QUERY,
             "namespace": "bench-a",
@@ -4869,12 +4349,7 @@ mod tests {
 
     // ── ADR-104 §5 (Stage C): entity-anchored candidate extraction ─────────────
 
-    /// Dispatches `memory.recall` against a fresh single-note corpus, exactly
-    /// like `dispatch_single_note_recall` above, but first seeds a real KG
-    /// entity (`entity_name`, when `Some`) directly into the entity store.
-    /// the record `entity_anchored_candidates` must find via its batched
-    /// lookup for the boost to fire on a lowercase or CJK query. Returns the
-    /// sole hit's `rank_score`.
+    /// Recalls one note after optionally seeding the entity needed for anchored lookup.
     async fn dispatch_single_note_recall_with_entity(
         entity_name: Option<&str>,
         content: &str,
@@ -4919,11 +4394,7 @@ mod tests {
         hits[0]["rank_score"].as_f64().expect("rank_score")
     }
 
-    /// Gate (a): a lowercase query naming a real KG entity gets the
-    /// candidate and the EntityMatch ×1.3 boost. `extract_entity_candidates`
-    /// (#738) extracts nothing here (no capitalized token in either the
-    /// query or the entity name). The lift can only come from the Stage C
-    /// batched entity-anchored lookup finding the seeded "zenlake" entity.
+    /// Anchored lookup gives a lowercase real-entity query the EntityMatch boost.
     #[tokio::test]
     #[serial(background_tasks)]
     async fn adr104_stage_c_lowercase_query_naming_real_entity_gets_boost() {
@@ -5037,17 +4508,12 @@ mod tests {
         assert!(different_case.is_empty());
     }
 
-    /// Gate (b): an unsegmented CJK query containing a real entity name as a
-    /// substring gets it through bounded substring enumeration and the same
-    /// indexed exact-name lookup used by alphabetic-script candidates.
+    /// Bounded substring enumeration finds entities in unsegmented CJK queries.
     #[tokio::test]
     #[serial(background_tasks)]
     async fn adr104_stage_c_unsegmented_cjk_query_gets_entity_via_substring() {
         const ENTITY_NAME: &str = "北京大学";
-        // `content` and `query` are byte-identical (guarantees the FTS leg
-        // retrieves the note; retrieval-stage relevance is not what this
-        // test is about). The entity has Han characters on both sides, proving
-        // CJK entity matching does not require whitespace or punctuation.
+        // Identical query/content isolates entity matching from retrieval relevance.
         const CONTENT: &str = "我在北京大学学习";
         const QUERY: &str = "我在北京大学学习";
 
@@ -5137,11 +4603,7 @@ mod tests {
         );
     }
 
-    /// Gate (c): a token that does not name any real entity gets nothing,
-    /// no lexical-overlap reward. Same lowercase shape as gate (a), but no
-    /// entity named "zenlake" (or anything else) exists in the store, so the
-    /// batched lookup returns no candidates and the auto path must score
-    /// identically to the explicit opt-out.
+    /// A token with no matching entity receives no lexical-overlap reward.
     #[tokio::test]
     #[serial(background_tasks)]
     async fn adr104_stage_c_lowercase_token_naming_no_entity_gets_no_boost() {
@@ -5159,11 +4621,7 @@ mod tests {
         );
     }
 
-    /// Gate (e): explicit `entity_names` still wins over Stage C extraction
-    /// even when a real, matching entity exists, and `entity_names: []`
-    /// stays a full opt-out. Mirrors the #738 override tests above, but with
-    /// a seeded entity in the store to prove Stage C's batched lookup is
-    /// bypassed entirely (not merely outscored) when the caller is explicit.
+    /// Explicit entity names override extraction; an empty list remains a full opt-out.
     #[tokio::test]
     #[serial(background_tasks)]
     async fn adr104_stage_c_explicit_entity_names_still_win_over_anchored_extraction() {
@@ -5196,10 +4654,7 @@ mod tests {
         );
     }
 
-    /// `entity_lookup_candidates` unit coverage (pure function, ADR-104 §5):
-    /// ASCII-only candidates are lowercased, candidates containing non-ASCII
-    /// characters also retain their raw form, stopwords are excluded from
-    /// unigrams, and output is capped at `MAX_ENTITY_LOOKUP_CANDIDATES`.
+    /// Candidate extraction covers ASCII case, non-ASCII forms, stopwords, and caps.
     #[test]
     fn entity_lookup_candidates_extracts_unigrams_and_bigrams_lowercased() {
         let out = crate::scoring::entity_lookup_candidates("New York City guide");
@@ -5274,17 +4729,7 @@ mod tests {
         assert!(crate::scoring::entity_lookup_candidates("   ").is_empty());
     }
 
-    // ── #889: a genuinely held embed stage ────────────────
-    //
-    // A `1ms` deadline racing the real uncontended in-memory pipeline (the
-    // original version of this test suite) proves the wrap *can* fire, but
-    // whether the real pipeline actually takes more than 1ms is host/load
-    // dependent — not a deterministic regression proof for the deadline
-    // behavior under the contention that caused #889. `SlowEmbedService`
-    // gives the deadline tests below a real, host-independent contention
-    // point: its `embed()` blocks on a `Notify` the test controls directly,
-    // mirroring the `#836` tests' held-ANN-lock technique but for the
-    // query-embed stage specifically.
+    // A controlled `Notify` makes deadline contention deterministic across hosts.
 
     struct SlowEmbedService {
         hold: Arc<Notify>,
@@ -5332,12 +4777,7 @@ mod tests {
         }
     }
 
-    /// #889: pure unit coverage for
-    /// `parse_recall_deadline_override`'s precedence and validation — an
-    /// absent or explicit-`null` override falls through (returns `None`,
-    /// signaling "use the process default"), a valid positive value wins,
-    /// and zero/negative/non-numeric values are all rejected as
-    /// `InvalidInput` rather than silently coerced.
+    /// Deadline overrides accept positive values, fall through on null, and reject invalid input.
     #[test]
     fn recall_889_parse_deadline_override_precedence_and_validation() {
         use crate::pack::parse_recall_deadline_override as parse_override;
@@ -5377,11 +4817,7 @@ mod tests {
         }
     }
 
-    /// #889: pure unit coverage for
-    /// `parse_recall_deadline_env` — unlike the per-request override path,
-    /// an absent, zero, negative, or non-numeric env value must all fall
-    /// back to the 30s default rather than erroring (a malformed operator
-    /// env var must not brick every `memory.recall` call on the daemon).
+    /// Invalid or absent operator deadline values fall back to 30 seconds.
     #[test]
     fn recall_889_env_deadline_ms_validates_and_falls_back_to_default() {
         use crate::pack::parse_recall_deadline_env as parse_env;
@@ -5399,11 +4835,7 @@ mod tests {
         }
     }
 
-    /// #889: an invalid per-request `recall_deadline_ms`
-    /// override (zero) must surface as a per-op `InvalidInput` error
-    /// through the full `memory.recall` dispatch, not silently fall through
-    /// to the process default (which a bare `0` would otherwise turn into
-    /// an always-immediate timeout) and not hang.
+    /// A zero request deadline is a per-operation `InvalidInput` error.
     #[tokio::test]
     async fn recall_889_zero_deadline_override_returns_invalid_input_via_dispatch() {
         let rt = KhiveRuntime::memory().expect("in-memory runtime");
@@ -5449,14 +4881,7 @@ mod tests {
         }
     }
 
-    /// #889: with the query-embed stage genuinely held (not
-    /// racing incidental wall time), a comfortably-sized 50ms deadline must
-    /// still return `DeadlineExceeded` promptly. Fail-on-revert proof:
-    /// reverting `handle_recall_with_deadline`'s `tokio::time::timeout` wrap
-    /// back to a bare `.await` makes this test hang for the lifetime of the
-    /// held `Notify` (never signaled until after the assertion), so it
-    /// would fail on the `elapsed < ...` bound or the test binary's own
-    /// deadline.
+    /// A genuinely held embed stage returns typed `DeadlineExceeded` promptly.
     #[tokio::test]
     async fn recall_889_deadline_exceeded_with_held_embed_stage_returns_typed_error_promptly() {
         const MODEL: &str = "recall-889-slow-model";
@@ -5471,11 +4896,7 @@ mod tests {
         let ns = Namespace::parse("local").expect("local namespace");
         let token = rt.authorize(ns).expect("authorize local");
 
-        // Pre-store one permit so the note-creation embed call below (which
-        // shares the same `hold`) completes immediately instead of hanging
-        // setup; the recall's own query-embed call is the *next*
-        // `.notified()` call, which genuinely blocks since no permit
-        // remains.
+        // The setup embed consumes the sole permit, so the recall embed genuinely blocks.
         hold.notify_one();
         rt.create_note(
             &token,
@@ -5507,9 +4928,7 @@ mod tests {
             .await;
         let elapsed = start.elapsed();
 
-        // Release the now-stuck spawn_blocking thread so it can finish and
-        // free its blocking-pool slot; the outer timeout has already fired
-        // and dropped the awaiting future well before this point.
+        // Release the timed-out worker so it does not occupy a blocking-pool slot.
         hold.notify_one();
 
         assert!(
@@ -5534,18 +4953,8 @@ mod tests {
         }
     }
 
-    /// #889: a deadline-exceeded op must not affect a
-    /// concurrently-dispatched sibling — mirrors the isolation the MCP
-    /// layer's parallel-batch executor already provides
-    /// (`khive-mcp/src/server.rs`: each op independently mapped to
-    /// `{ok, tool, error}` and joined via `futures::future::join_all`,
-    /// never abort-on-failure). `khive-pack-memory` has no dependency on
-    /// `khive-mcp` to drive an actual MCP wire round-trip, so this exercises
-    /// the same property one layer down, at the `VerbRegistry` dispatch
-    /// boundary the MCP executor sits on top of: two independent
-    /// `registry.dispatch` futures run concurrently via `tokio::join!`, one
-    /// held past its deadline and one a normal fast op, and both must
-    /// resolve to their own independent outcome.
+    /// A deadline-exceeded dispatch does not affect a concurrent sibling dispatch.
+    /// See `crates/khive-pack-memory/docs/recall-reliability.md`.
     #[tokio::test]
     async fn recall_889_deadline_exceeded_does_not_affect_concurrent_sibling_op() {
         const MODEL: &str = "recall-889-slow-sibling-model";
@@ -5621,9 +5030,7 @@ mod tests {
         );
     }
 
-    /// #889: the default (generous, 30s) deadline must not affect a normal,
-    /// fast, uncontended recall — no new error, no behavior change on the
-    /// happy path relative to pre-#889 behavior.
+    /// The 30-second default leaves normal uncontended recall unchanged.
     #[tokio::test]
     async fn recall_889_normal_path_succeeds_within_default_deadline() {
         let rt = KhiveRuntime::memory().expect("in-memory runtime");
@@ -5665,9 +5072,7 @@ mod tests {
         );
     }
 
-    /// #889: a generous per-request override (well above real wall time) must
-    /// behave identically to the default — the override path is symmetric,
-    /// not "only ever tightens".
+    /// A generous request override leaves normal recall unchanged.
     #[tokio::test]
     async fn recall_889_generous_override_succeeds() {
         let rt = KhiveRuntime::memory().expect("in-memory runtime");
