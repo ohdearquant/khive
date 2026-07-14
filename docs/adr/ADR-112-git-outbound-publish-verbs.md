@@ -27,15 +27,14 @@ arrival:
    they run and denies on a pattern match. This is per-agent-process enforcement - it only
    applies where the hook is installed and current.
 2. **This ADR**: outbound-publish verbs on the git pack, with the same class of scan
-   enforced server-side, inside the verb handler, before any GitHub API call. Once this
-   surface exists, the hook narrows from "scan and decide" to "deny raw `gh` content
-   writes outright, point the caller at the verb" - the verb becomes the one path a scan
-   cannot be bypassed on, regardless of which hook version an agent process happens to be
-   running.
-3. **Later, not specified here**: `gh` is denied for content writes entirely once the verb
-   surface has proven itself; the verbs become the only path. That transition is a
-   deployment and hook-configuration change, not a khive code change, and is out of
-   this ADR's implementation scope (see Migration).
+   enforced server-side, inside the verb handler, before any GitHub API call. The verb is
+   the one path on which the server-side scan cannot be bypassed, regardless of which hook
+   version an agent process happens to be running.
+3. **Migration after the verb surface ships**: the hook stops using its scanner result as a
+   final command decision and instead denies raw `gh` content writes outright, pointing the
+   caller at the equivalent verb. The verbs become the only publication path. That
+   command-routing transition is a deployment and hook-configuration change, not a khive
+   code change (see Migration).
 
 ### Relationship to ADR-108
 
@@ -321,14 +320,31 @@ authorization, and hygiene scanning have completed:
    the operation `complete` and return the shape in the table. A resumed operation returns
    the same cached remote identity.
 
-Verb dispatch passes through the Gate (ADR-018) exactly as every other khive verb does -
-this is inherited from the existing dispatch path, not a new mechanism this ADR
-introduces. The publication-hygiene scan is a separate concern from Gate authorization:
-Gate answers "may this actor call this verb at all," enforced through pluggable policy;
-the scan answers "does this specific content contain a class of string this system must
-never let reach GitHub," enforced as fixed pattern matching inside the handler,
-deliberately not delegated to Gate policy. The two are independent gates in series, not
-alternatives to each other.
+#### Strict Gate authorization for publish verbs
+
+Verb dispatch passes through the Gate (ADR-018) at the registry boundary before the pack
+handler. For exactly `git.publish_issue`, `git.publish_comment`, `git.publish_pr`, and
+`git.publish_release`, that boundary **must use strict fail-closed Gate evaluation**. This is
+a verb-scoped override of ADR-018's general fail-open default for Gate errors
+(ADR-018 lines 32-34 and 209-222); it does not change Gate-error handling for any other
+verb.
+
+For any of these four verbs, `Gate::check` returning `Err` is a denial. The registry must
+not mint the authorized storage token, enter the handler, read a remote target, create or
+mutate an operation-ledger row, or execute `gh`. It must append a content-free generic
+dispatch denial record before returning the error. That record uses the existing Gate audit
+envelope, the precise publish verb, `EventOutcome::Denied`, `decision = "deny"`, empty
+obligations, and the stable `deny_reason = "gate_error_fail_closed"`; it includes no request
+arguments, caller content, matched value, or Gate error text. Failure to persist this record
+also remains fail-closed: the call returns an audit-persistence error and still cannot enter
+the handler or execute any remote operation. An explicit `GateDecision::Deny` retains
+ADR-018's standing behavior, and only `GateDecision::Allow` permits handler entry.
+
+The publication-hygiene scan is a separate concern from Gate authorization: Gate answers
+"may this actor call this verb at all," enforced through pluggable policy; the scan answers
+"does this specific content contain a class of string this system must never let reach
+GitHub," enforced as fixed pattern matching inside the handler, deliberately not delegated
+to Gate policy. The two are independent gates in series, not alternatives to each other.
 
 ### Deny semantics
 
@@ -416,9 +432,9 @@ the normalized outward-facing strings from Handler pipeline step 2, including `t
   must not add a fork or external repository slug to it, and a slug that is not listed is never
   writable regardless of its origin. This is distinct from, and
   does not replace, Gate-level authorization: the allowlist bounds which repos this daemon
-  process may ever publish into, regardless of which actor is calling; Gate policy (if
-  configured beyond the permissive default) further bounds which actors may call the verb at
-  all. Promoting the allowlist to centrally managed admin-plane data is deferred (Resolutions
+  process may ever publish into, regardless of which actor is calling; an affirmative Gate
+  decision is independently required before any publish handler runs. Promoting the
+  allowlist to centrally managed admin-plane data is deferred (Resolutions
   F4) until a multi-daemon deployment needs it enforced consistently across daemons rather
   than per-daemon.
 
@@ -471,15 +487,18 @@ rules and field names that caused a hygiene denial without persisting the reject
 Normatively, no value from a field that failed validation or caused a hygiene denial may
 appear in any audit payload, Event, operation-ledger row, log line, error message, or error
 response. The automatic Gate audit row is also content-free: per ADR-018 it records the
-verb and decision envelope, not request arguments.
+verb and decision envelope, not request arguments. A strict publish Gate-error denial uses
+the content-free registry-owned record specified above and never copies the Gate error text.
 
 These rows are **additional to**, not replacements for, the dispatch-audit row that
 `VerbRegistry` already attempts for every call. The automatic row also has
 `EventKind::Audit`, but carries the generic Gate `AuditEvent` payload and the dispatch
 outcome. After the Gate allows dispatch, the handler adds one hygiene/publication-domain
 row for its invocation, identified by `payload.audit_type`. Thus a normal handler call has
-the generic dispatch row plus one extra domain row; a Gate-denied call has only the generic
-row because the handler never runs. Retries create their own dispatch history. Event reads
+the generic dispatch row plus one extra domain row; an explicit Gate denial or strict publish
+Gate-error denial has only the generic row because the handler never runs. The strict-error
+row is a required write even though ADR-018's ordinary generic dispatch audit remains
+best-effort. Retries create their own dispatch history. Event reads
 use `list(kind="event", verb="git.publish_issue", ...)` (or another precise verb) and
 inspect `payload.audit_type`; ADR-022 still excludes `query()` / GQL / SPARQL for events.
 
@@ -511,39 +530,37 @@ A successful publish reconciles a graph record through the existing generic `cre
 `update`, and `link` verbs - no new graph verb, no new edge relation, `annotates` only,
 matching ADR-088's own usage.
 
-For the GitHub-specific identity path defined below, publish self-ingest and `git.digest`
-use one shared project mapping. `GitHubRepoIdentity` is the validated lowercase
-`owner/name` slug, and its only stored URL is
-`https://github.com/<owner>/<name>`. An accepted remote `git.digest` source using
-`www.github.com`, an optional trailing slash or `.git` suffix, or ASCII case differences
-in the host or owner/name components is an input alias for that identity; it is never a
-distinct `properties.repo_url`. A URL with user information, a port, query, fragment,
-percent-encoded path separator, or any path component beyond the owner and repository is
-not a GitHub identity alias. After alias removal and ASCII lowercasing, the slug must
-satisfy this ADR's canonical `repo` grammar.
+Publish self-ingest resolves its repo-anchor through the publish-only GitHub identity path
+defined below. `GitHubRepoIdentity` is the validated lowercase `owner/name` slug, and its
+only stored URL is `https://github.com/<owner>/<name>`. For purposes of finding an existing
+publish target, a stored `properties.repo_url` using `www.github.com`, an optional trailing
+slash or `.git` suffix, or ASCII case differences in the host or owner/name components is
+an alias for that identity; it is never a distinct publish target. A URL with user
+information, a port, query, fragment, percent-encoded path separator, or any path component
+beyond the owner and repository is not an identity alias. After alias removal and ASCII
+lowercasing, the slug must satisfy this ADR's canonical `repo` grammar.
 
-`git.digest` and publish self-ingest must call the same project-identity resolver in the
-handler namespace on the GitHub-specific identity path. For `git.digest`, that path applies
-only when `source` is an accepted remote GitHub URL; the identity comes from its accepted URL
-alias. Publish self-ingest gets the same identity from its canonical `repo` slug. The resolver
-considers only live `project`
+All four `git.publish_*` handlers call this publish project-identity resolver in the handler
+namespace before self-ingest. The resolver considers only live `project`
 entities whose string `properties.repo_url` parses to the same `GitHubRepoIdentity`; it
 never matches `project.name`, a path basename, or an unscoped repository name. If no anchor
 matches, it creates one with the canonical URL. If exactly one alias-form anchor matches,
 it rewrites that anchor's `properties.repo_url` to the canonical URL before ingest. If
 more than one live anchor maps to the identity, resolution fails as an integrity error
 before any note write; an operator must explicitly merge the duplicate projects and retry,
-rather than the resolver selecting an arbitrary row. This enumeration-and-rewrite is the
-required alias migration for existing data and runs before either digest or publish can
-ingest a GitHub object. A caller-supplied `git.digest project` id is accepted for a GitHub
-source only when that project's `properties.repo_url` parses to the same identity; it is
-otherwise rejected. Outside this GitHub-specific identity path - including every local path,
-whether or not it has a GitHub origin, and every non-GitHub URL - `git.digest` retains
-ADR-088 Amendment 1's accepted resolution contract unchanged: an omitted `project` matches
-either the exact canonical path/URL in `properties.repo_url` or the name derived from the
-source basename, and creates an anchor only when neither matches. This ADR neither reselects
-nor migrates those anchors; their project ids, cursors, and issue/PR natural keys remain
-unchanged. Such identities cannot be selected by a publish slug.
+rather than the resolver selecting an arbitrary row. This enumeration and canonical rewrite
+applies only when a publish handler resolves its self-ingest target.
+
+**`git.digest` project-resolution behavior is unchanged by this ADR; the resolver specified
+here applies only to the `git.publish_*` verbs.** ADR-088 Amendment 1 remains the sole
+authority for `git.digest` project resolution: when `project` is omitted, `git.digest`
+matches either `properties.repo_url` or the name derived from the source basename and creates
+an anchor only when neither matches. This ADR adds no GitHub alias rewrite, duplicate-anchor
+migration, same-identity validation for an explicit `project`, or other selection rule to
+`git.digest`. Existing digest project ids, cursors, and natural keys therefore remain under
+ADR-088 Amendment 1's accepted contract. A publish call can reuse a digest anchor when its
+stored `properties.repo_url` maps to the canonical GitHub identity; a name-only digest
+anchor is not silently reselected or rewritten by this publish-only resolver.
 
 Issue and PR self-ingest uses the same natural key as the current digest implementation:
 
@@ -758,11 +775,23 @@ whereas a retried create could duplicate public content.
 ## Pattern File Format (normative)
 
 The token-denylist (scan layer 1) and allowlist-escape (scan layer 3) patterns are defined
-in TOML files, loaded by both the server-side verb handler and the client-side pre-tool-use
-hook described in the Context section. Both implementations must reach the same allow/deny
-decision on the same content. The authoritative paths, overlay selection, content revision,
-reload behavior, and ASCII byte-pattern grammar below are the executable contract for that
-property. The shared corpus is regression coverage for this contract, not its definition.
+in TOML files, loaded by both the server-side verb handler's scanner and the client-side
+hook's scanner module described in the Context section. For one `(repo, field, text)` input,
+the shared **scanner result** is `{decision, rule_ids}`: `rule_ids` is the sorted unique set
+of token-pattern ids that match after repo-specific allowlist escapes, and `decision` is
+`"deny"` exactly when that set is non-empty, otherwise `"allow"`. The two scanner
+implementations must return the same scanner result on the same input. This scanner result
+is the sole cross-client conformance target; it is not the server handler's final decision
+and is not the hook's final command-routing decision. The authoritative paths, overlay
+selection, content revision, reload behavior, and ASCII byte-pattern grammar below are the
+executable contract for scanner equivalence. The shared corpus is regression coverage for
+this contract, not its definition.
+
+The hook's command-routing policy is a separate layer. After the migration in this ADR, a
+raw `gh` content-write command is always route-denied and directed to the equivalent
+`git.publish_*` verb, regardless of whether the hook scanner result is `allow` or `deny`.
+The scanner module remains independently testable for conformance, but its result cannot
+turn a raw content-write command into an allowed command after migration.
 
 This normative contract covers only scan layers 1 and 3. Scan layer 2 (the secret scan)
 reuses the existing, already-deployed `secret_gate` module and its own pattern set; it is
@@ -940,7 +969,7 @@ The lexical and semantic rules are closed:
 
 Each loader must consume the entire pattern into this grammar and reject any other syntax
 before scan service becomes available. A host engine accepting a pattern does not make it
-valid. Both the server publish path and the paired hook **must** evaluate the parsed grammar
+valid. Both the server scanner and the hook scanner **must** evaluate the parsed grammar
 with a bounded, worst-case linear-time byte matcher, such as a Thompson-automaton or
 RE2-style engine, with no backtracking execution path. Translation to a host regex engine is
 permitted only when that engine guarantees linear-time evaluation for every accepted
@@ -963,8 +992,9 @@ either host regex engine or a finite fixture set, define cross-client equivalenc
   single pattern - one is sufficient to deny. It reports each matching
   `(field, pattern_id)` pair once and reports no match span or derived content.
 - A repo-specific `[[allow]]` entry is applied only after the implementation has collected
-  the token-pattern hit. The shared corpus therefore observes the same hit before the same
-  `(repo, pattern_id)` suppression in both implementations.
+  the token-pattern hit. Both scanners apply the same `(repo, pattern_id)` suppression; the
+  shared scanner result contains only the unsuppressed sorted unique rule ids and derives its
+  allow/deny decision from that final set.
 
 ### Shared conformance corpus
 
@@ -992,11 +1022,12 @@ expected = "reject"
 ```
 
 For `scan_case`, `id`, `repo`, `field`, `text`, and the sorted unique
-`expected_rule_ids` are required; an empty expected list means allow. For `load_case`,
+`expected_rule_ids` after allowlist suppression are required. The expected scanner decision
+is `"allow"` when that list is empty and `"deny"` otherwise. For `load_case`,
 `id`, `regex`, `case`, and `expected = "accept" | "reject"` are required. Unknown keys or
-duplicate case ids fail the corpus loader. Both implementations execute every case and must
-produce the exact expected result; neither maintains a private copy or language-specific
-expected file. Passing these cases detects regressions but cannot admit syntax or define
+duplicate case ids fail the corpus loader. Both scanner implementations execute every case
+and must produce the exact expected scanner result; neither maintains a private copy or
+language-specific expected file. Passing these cases detects regressions but cannot admit syntax or define
 semantics beyond the normative grammar above.
 
 The committed corpus must cover at least: allow and deny for every pattern category;
@@ -1008,8 +1039,9 @@ backreferences, possessive quantifiers, and atomic groups; multiple rule hits; a
 field names including `tag`, `head`, and `base`; a repo-specific allowlist hit that is
 allowed in exactly one repo and denied in another; duplicate ids across generic and overlay
 files; an absent overlay; and malformed or revision-mismatched overlays. Passing this corpus
-in both the Rust handler suite and the hook suite is a regression gate for any pattern-format,
-loader, or matcher change; it is not the definition of cross-client equivalence.
+in both the Rust scanner suite and the hook scanner suite is a regression gate for any
+pattern-format, loader, or matcher change; it is not the definition of cross-client
+equivalence.
 
 The shared corpus must also include an ambiguous-repetition near-miss evaluated against a
 maximum-length 65,536-scalar candidate. Both consumers must prove the linear bound with an
@@ -1022,6 +1054,13 @@ no-match result in both suites and must not permit a backtracking fallback.
 The implementation ships the verbs, operation ledger, pattern loader, scan, audit rows,
 graph reconciliation, and tests as one change. In addition to unit coverage for the
 pattern file, it must include these contract tests:
+
+A registry-boundary test matrix injects a Gate `Err` for each of the four publish verbs.
+Every case must prove that the handler is not entered, no operation-ledger row is created or
+mutated, the transport observes zero remote writes and no `gh` execution, and exactly one
+content-free strict-error denial audit record is durable with no request argument, caller
+content, or Gate error text. An audit-store failure case must prove that the call remains
+denied and still performs no handler or remote work.
 
 1. **Required-argument and argv safety.** Table-driven tests cover omission, JSON `null`,
    wrong JSON types, the specified empty-string behavior, every accepted control-character
@@ -1053,19 +1092,23 @@ pattern file, it must include these contract tests:
    numbers, URLs, and embedded repositories; and reject a repository-scoped read whose
    remote kind disagrees with the parsed kind. A transport spy proves rejection occurs
    before any comment write.
-4. **Canonical project identity and digest-compatible idempotency.** Digest an accepted
-   GitHub URL alias such as `https://www.github.com/Org/Repo.git`, publish an issue and a PR
-   through canonical slug `org/repo`, then run `git.digest` again through the canonical URL
+4. **Publish project identity and digest compatibility boundary.** Publish an issue and a PR
+   through canonical slug `org/repo`, then run `git.digest` through the exact canonical URL
    until complete. Assert one project whose `properties.repo_url` is
    `https://github.com/org/repo`; for each remote number, assert one note under
    `(kind, namespace, number, project_id)`, the full common property shape, and one project
-   `annotates` edge. Repeat self-ingest and both digest URL forms to prove the project,
-   natural-key, and edge counts remain one. Separate cases pre-seed one alias-form project
-   and prove it is canonicalized in place, pre-seed two aliases and prove resolution fails
-   without choosing either, prove an unrelated same-basename project is ignored, and prove
-   a mismatched explicit `git.digest project` id is rejected. An initial release publish
-   also asserts exactly one reference note under its verb-qualified operation-identity upsert
-   key and exactly one `annotates` edge to this canonical project.
+   `annotates` edge. Repeat self-ingest and the exact-URL digest to prove the project,
+   natural-key, and edge counts remain one. Publish-resolver cases pre-seed one alias-form
+   `properties.repo_url` and prove the publish call canonicalizes it in place, pre-seed two
+   URL aliases and prove publish resolution fails without choosing either, and prove an
+   unrelated same-basename project is ignored by publish resolution. Separate compatibility
+   cases prove ADR-088 Amendment 1 remains unchanged: with `project` omitted, `git.digest`
+   still reuses a source-basename name match even when its `properties.repo_url` is absent or
+   does not map to the publish identity, and an explicit digest `project` still follows its
+   existing UUID/prefix resolution contract. The publish-only resolver must neither migrate
+   nor reject those digest selections. An initial release publish also asserts exactly one
+   reference note under its verb-qualified operation-identity upsert key and exactly one
+   `annotates` edge to the project selected by the publish resolver.
 5. **Recovery failure injection.** Inject a crash or store error after each boundary in
    the recovery table: operation insert, remote response, note upsert, edge ensure, audit
    append, and completion update. Resume with the same operation identity and assert that the
@@ -1130,16 +1173,21 @@ pattern file, it must include these contract tests:
    same-identity retry; each genuinely different normalized value must conflict on that
    identity.
    Limit, element-shape, duplicate, and JSON-`null` failures occur before transport.
-10. **Hook/server scan conformance.** The Rust handler suite and the hook implementation's
-    suite both execute every case in
+10. **Cross-client scanner conformance and hook command routing.** The Rust scanner suite
+    and the hook scanner suite both execute every case in
     `crates/khive-pack-git/tests/fixtures/publication-hygiene-conformance.toml` against the
-    authoritative generic file and test overlay. CI fails on a skipped case, divergent
-    allow/deny result, field or rule-id mismatch, byte-grammar loader mismatch, allowlist
-    mismatch, or revision mismatch. Separate loader tests prove that both implementations
+    authoritative generic file and test overlay. CI compares scanner result to scanner result
+    and fails on a skipped case, divergent `decision` or `rule_ids`, field or rule-id
+    mismatch, byte-grammar loader mismatch, allowlist mismatch, or revision mismatch. It
+    never compares the server handler's final decision with the hook's final routing
+    decision. Separate loader tests prove that both scanner implementations
     reject every source outside the closed grammar even when their host regex engine would
     accept it. Both suites also run the shared ambiguous-repetition near-miss against a
     65,536-scalar field under the deterministic linear matcher-work bound; neither may invoke
-    or fall back to a backtracking engine.
+    or fall back to a backtracking engine. Independently, the hook command-routing suite
+    supplies raw `gh` content-write commands whose scanner results are `allow` and `deny` and
+    asserts that both are route-denied after migration and point to the equivalent publish
+    verb. Scanner conformance and command routing are separate required test layers.
 
 `tests/smoke_test.py` must cover one allowed publish against a controlled fake `gh`, one
 hygiene deny, one comment-target validation failure, and one resumed
@@ -1175,18 +1223,22 @@ test suite must not create real GitHub content.
    idempotent self-ingest, and the repo allowlist ship together, with coverage added to
    `tests/smoke_test.py`.
 3. **Deployment notice and hook convergence**: outbound GitHub content publication moves
-   to the verb surface only after the Rust handler and hook both pass the shared conformance
-   corpus, implement the normative ASCII byte-pattern grammar, consume the authoritative
-   generic file, resolve the same absolute config path, and validate the same configured
-   pattern-set revision. The hook then narrows its role to denying raw `gh` content writes
-   outright and pointing the caller at the equivalent verb; it no longer makes an
-   independent content allow/deny judgment once the verb enforces the scan server-side.
+   to the verb surface only after the Rust scanner and hook scanner return matching shared
+   scanner results for the conformance corpus, implement the normative ASCII byte-pattern
+   grammar, consume the authoritative generic file, resolve the same absolute config path,
+   and validate the same configured pattern-set revision. The deployed hook then applies a
+   separate command-routing rule: every raw `gh` content write is denied and points the
+   caller at the equivalent verb, regardless of the scanner result. It no longer uses that
+   result as an independent final content allow/deny judgment once the verb enforces the
+   scan server-side.
 4. **Second wave** (a follow-on ADR or amendment, not specified by this document): the
    review-verdict comment path adopts the verb surface, and edit verbs are added, reusing
    the same scan module.
-5. **Eventual**: `gh` denied outright for content writes once the verb surface has proven
-   itself in the second wave. This is a hook/process configuration change, not a khive code
-   change, and is out of this ADR's implementation scope.
+5. **Eventual**: remove the legacy hook mode that allowed raw `gh` content writes on a clean
+   scan result once the verb surface has proven itself in the second wave. The route-deny
+   policy from step 3 is then the only deployed raw-command behavior. This is a hook/process
+   configuration change, not a khive code change, and is out of this ADR's implementation
+   scope.
 
 ## Resolutions
 
@@ -1202,8 +1254,8 @@ Four forks were presented for this design; each is resolved in place.
    ship at the single authoritative in-repo path, versioned and public-visible; the
    concrete internal-token list is selected only by the resolved config's absolute overlay
    path. The ASCII byte-pattern grammar defines common scanner semantics, the merged-content
-   revision prevents file-version drift, and the shared hook/server corpus detects
-   regressions in both implementations. The in-repo file must never contain concrete
+   revision prevents file-version drift, and the shared cross-client scanner corpus detects
+   regressions in both scanner implementations. The in-repo file must never contain concrete
    internal-identifier tokens.
 3. **Deny-event notification (F3)**: whether a scan deny also notifies the calling actor's
    own inbox or messaging channel, in addition to the synchronous deny response.
@@ -1274,14 +1326,16 @@ Four forks were presented for this design; each is resolved in place.
 
 - ADR-088 - Git-Lifecycle Pack; `commit`/`issue`/`pull_request` note kinds and `annotates`
   usage this ADR's dual write reuses unchanged.
-- ADR-088 Amendment 1 - `git.digest`; the project-anchor resolution logic and `gh`
-  transport conventions this ADR follows for the publish direction.
+- ADR-088 Amendment 1 - `git.digest`; the unchanged authority for digest project resolution,
+  plus the note shapes and `gh` transport conventions this ADR reuses for the publish
+  direction. This ADR's strict GitHub resolver is publish-only.
 - ADR-108 - Git Write Surface Through khive (Phase B); the repo-level write surface this
   ADR is scoped alongside, not duplicated with. The scan module described here is a
   candidate for future adoption by ADR-108 surfaces (for example, scanning a `git.commit`
   message) - not specified by this ADR, noted as a natural extension point.
 - ADR-018 - Authorization Gate; the dispatch-time authorization seam every verb, including
-  this ADR's four, passes through independent of the hygiene scan.
+  this ADR's four, passes through independent of the hygiene scan. ADR-112 overrides only
+  ADR-018's general fail-open-on-`Err` default for the four publish verbs.
 - ADR-017 - Pack Standard; `HandlerDef`, `PackRuntime::dispatch`, the mechanism these verbs
   register through.
 - ADR-016 - Request DSL; the wire surface these verbs are reachable through.
