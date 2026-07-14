@@ -286,9 +286,7 @@ mod tests {
         );
     }
 
-    // khive-storage has zero heavy dependencies (ADR-005) so this test hand-rolls
-    // the one known BLAKE3("") vector instead of pulling in the `blake3` crate
-    // just to exercise `hex_encode`.
+    // hand-rolled BLAKE3("") vector (see docs/storage-core.md#blake3_hash_of_empty)
     fn blake3_hash_of_empty() -> [u8; 32] {
         let hex = "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262";
         let mut out = [0u8; 32];
@@ -309,10 +307,6 @@ mod tests {
 
     #[test]
     fn deserialize_rejects_short_string() {
-        // The exact repro that motivates a hand-written impl: a naive derived
-        // `Deserialize` would construct `ContentRef("x")` here, and any
-        // caller passing it to `get`/`exists`/`delete` would then panic in
-        // `shard_path`'s `[0..2]`/`[2..4]` slices.
         let err = serde_json::from_str::<ContentRef>("\"x\"").unwrap_err();
         assert!(
             err.to_string().contains("64"),

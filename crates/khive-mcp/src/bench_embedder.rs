@@ -23,12 +23,8 @@ fn fnv1a_64(data: &[u8]) -> u64 {
     h
 }
 
-/// Feature-hashing embedder: tokenise → per-token (dim, sign) → accumulate → L2-normalise.
-///
-/// Lexically similar texts share tokens and therefore accumulate signal in the
-/// same dimensions with the same sign, producing correlated vectors. This lets
-/// the gate exercise the vector/ANN/fusion legs rather than treating them as
-/// pure noise (as the previous whole-text FNV avalanche did).
+/// Feature-hashing embedder: tokenise → per-token (dim, sign) → accumulate →
+/// L2-normalise. See crates/khive-mcp/docs/misc.md#hash-embed-rationale.
 fn hash_embed(text: &str) -> Vec<f32> {
     let mut v = vec![0.0f32; DIM];
     for token in text
@@ -109,9 +105,8 @@ impl EmbedderProvider for FeatureHashProvider {
 mod tests {
     use super::*;
 
-    /// Same-cluster strings (sharing several topic words) must be more similar
-    /// to each other than cross-cluster strings (disjoint vocabularies).
-    /// This locks the clustering property of the feature-hashing embedder.
+    /// Locks the clustering property: same-cluster strings must be more
+    /// similar than cross-cluster ones.
     #[test]
     fn feature_hash_same_cluster_more_similar_than_cross_cluster() {
         let a = hash_embed("knowledge graph entity edge relation ontology");

@@ -167,9 +167,7 @@ pub(crate) mod tests {
         pub link_called: std::sync::atomic::AtomicBool,
         pub search_called: std::sync::atomic::AtomicBool,
         pub single_backend: bool,
-        /// Records the `limit` value `fan_out_search` was last called with, so
-        /// callers can assert the coordinator received the already-capped value
-        /// (MCP-AUD-003 regression).
+        /// The `limit` value `fan_out_search` was last called with (MCP-AUD-003).
         pub last_limit: std::sync::atomic::AtomicU32,
     }
 
@@ -282,10 +280,7 @@ pub(crate) mod tests {
         (registry, runtime)
     }
 
-    /// T6a: A multi-backend server MUST route `link` through the coordinator.
-    ///
-    /// This test must FAIL before the coordinator routing fix is wired (coordinator never called)
-    /// and PASS after wiring.
+    /// T6a: a multi-backend server MUST route `link` through the coordinator.
     #[tokio::test]
     async fn t6a_multi_backend_server_routes_link_through_coordinator() {
         let (registry, _runtime) = make_registry();
@@ -319,9 +314,7 @@ pub(crate) mod tests {
         );
     }
 
-    /// T6b: A multi-backend server MUST route `search` through the coordinator.
-    ///
-    /// This test must FAIL before the coordinator routing fix is wired and PASS after wiring.
+    /// T6b: a multi-backend server MUST route `search` through the coordinator.
     #[tokio::test]
     async fn t6b_multi_backend_server_routes_search_through_coordinator() {
         let (registry, _runtime) = make_registry();
@@ -349,17 +342,9 @@ pub(crate) mod tests {
         );
     }
 
-    /// T6d: A multi-backend search with a malformed `tags` value must return a
-    /// per-op error (`ok: false`) rather than silently returning unfiltered results.
-    ///
-    /// Single-backend rejects malformed tags via `SearchParams` deserialisation
-    /// (RuntimeError::InvalidInput → `ok: false`).  Multi-backend must match that
-    /// contract: the server must reject before reaching the coordinator, not silently
-    /// collapse the filter to an empty Vec.
-    ///
-    /// This test FAILS against the old `filter_map(as_str)` code (which would call
-    /// the coordinator with an empty tags Vec and return `ok: true, result: []`),
-    /// and PASSES after the strict `serde_json::from_value::<Vec<String>>` fix.
+    /// T6d: a multi-backend search with a malformed `tags` value must return a
+    /// per-op error rather than silently returning unfiltered results (see
+    /// crates/khive-mcp/docs/misc.md#t6d for the regression this guards).
     #[tokio::test]
     async fn t6d_malformed_tags_return_per_op_error_in_multi_backend() {
         let (registry, _runtime) = make_registry();
@@ -403,18 +388,9 @@ pub(crate) mod tests {
         );
     }
 
-    /// T6e / PR #549 blocker: a multi-backend `search` with a present-but-malformed
-    /// `namespace` (null/number/bool/array/object) must fail closed — `ok: false`,
-    /// an error naming the namespace — and the coordinator must NEVER be invoked
-    /// under the server's default namespace.
-    ///
-    /// Before the fix, `dispatch_via_coordinator_inner` never inspected
-    /// `args_value["namespace"]` at all: it always parsed the server's
-    /// `default_namespace` and called `coord.fan_out_search` under it, silently
-    /// substituting the default for a caller value that failed to parse. This
-    /// test FAILS against that code (coordinator IS called, `ok: true`) and
-    /// PASSES once the coordinator intercept shares `resolve_explicit_namespace`
-    /// with `VerbRegistry::dispatch` (RUNTIME-AUD-002 / #433).
+    /// T6e / PR #549 blocker: a multi-backend `search` with a malformed
+    /// `namespace` must fail closed and never reach the coordinator (see
+    /// crates/khive-mcp/docs/misc.md#t6e-namespace for the RUNTIME-AUD-002 regression).
     #[tokio::test]
     async fn t6e_multi_backend_search_malformed_namespace_fails_closed() {
         let cases: [(&str, &str); 5] = [
@@ -472,9 +448,7 @@ pub(crate) mod tests {
         }
     }
 
-    /// T6f / PR #549 blocker: a multi-backend UUID-form `link` with a
-    /// present-but-malformed `namespace` must fail closed the same way T6e does
-    /// for `search`, and the coordinator must never be invoked.
+    /// T6f / PR #549 blocker: same as T6e but for `link`'s namespace argument.
     #[tokio::test]
     async fn t6f_multi_backend_link_malformed_namespace_fails_closed() {
         let cases: [(&str, &str); 5] = [
@@ -534,10 +508,8 @@ pub(crate) mod tests {
         }
     }
 
-    /// T6c: A single-backend server must NOT route through the coordinator.
-    ///
-    /// When the coordinator reports `is_single_backend() == true`, the zero-change
-    /// invariant requires the registry path (unchanged from pre-coordinator code).
+    /// T6c: a single-backend server must NOT route through the coordinator
+    /// (zero-change invariant: unchanged from pre-coordinator code).
     #[tokio::test]
     async fn t6c_single_backend_server_bypasses_coordinator() {
         let (registry, runtime) = make_registry();
@@ -578,13 +550,9 @@ pub(crate) mod tests {
         );
     }
 
-    /// T6e: A multi-backend `search` limit beyond `u32::MAX` must be rejected
-    /// with a per-op error, not silently wrapped by `as u32` and passed through.
-    ///
-    /// Before the fix, `limit=4294967297` (`u32::MAX as u64 + 2`) was parsed as
-    /// `u64`, cast with `as u32` (wrapping to `1`), then `.min(100)` left `1` —
-    /// the coordinator was called with a near-empty limit instead of rejecting
-    /// the out-of-range input (MCP-AUD-003).
+    /// T6e: a multi-backend `search` limit beyond `u32::MAX` must be rejected
+    /// with a per-op error, not silently wrapped by `as u32` (see
+    /// crates/khive-mcp/docs/misc.md#t6e-limit for the MCP-AUD-003 regression).
     #[tokio::test]
     async fn t6e_multi_backend_search_limit_matches_single_backend_u32_contract() {
         let (registry, _runtime) = make_registry();
@@ -629,9 +597,8 @@ pub(crate) mod tests {
         );
     }
 
-    /// T6e companion: a valid-but-huge `u32` limit (`u32::MAX`) must still reach
-    /// the coordinator, capped at 100 — proving the strict parser doesn't
-    /// over-reject in-range values.
+    /// T6e companion: a valid-but-huge `u32` limit (`u32::MAX`) must still
+    /// reach the coordinator, capped at 100.
     #[tokio::test]
     async fn t6e_multi_backend_search_limit_u32_max_is_capped_at_100() {
         let (registry, _runtime) = make_registry();

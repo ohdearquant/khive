@@ -1,12 +1,8 @@
 //! File sink for `request` results — writes JSONL and returns a self-describing manifest.
 //!
-//! Why the manifest matters: a sink that self-reports null counts catches bulk export
-//! corruption (e.g. `content=null` across 10 000 rows) in one second rather than after
-//! a downstream agent fleet has graded blind.
-//!
-//! Why the destination policy matters: `save_to` is a client-supplied string reaching
-//! the filesystem. Without a root + traversal + symlink check, a client could request
-//! `../../etc/cron.d/x` or overwrite an existing symlinked file outside any sandbox.
+//! See crates/khive-mcp/docs/misc.md#save-sink-rationale for why the manifest
+//! self-reports null counts and why `save_to` is treated as an untrusted,
+//! client-supplied filesystem path.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -18,10 +14,7 @@ use sha2::{Digest, Sha256};
 const EXPORT_ROOT_ENV: &str = "KHIVE_SAVE_TO_ROOT";
 
 /// Resolve (and create) the allowed export root for `save_to` destinations.
-///
-/// Defaults to `~/.khive/exports`; overridable via `KHIVE_SAVE_TO_ROOT` (used by
-/// tests to scope each case to its own temp directory). Every `save_to` request
-/// must resolve to a path inside this root — see `validate_destination`.
+/// Defaults to `~/.khive/exports`; overridable via `KHIVE_SAVE_TO_ROOT`.
 fn export_root() -> anyhow::Result<PathBuf> {
     let root = match std::env::var(EXPORT_ROOT_ENV) {
         Ok(v) if !v.trim().is_empty() => PathBuf::from(v),
@@ -174,14 +167,12 @@ pub fn write_and_manifest(
     };
     let path = dest.as_path();
 
-    // Collect per-op rows from the results array.
     let results_arr = results_envelope
         .get("results")
         .and_then(Value::as_array)
         .map(|v| v.as_slice())
         .unwrap_or(&[]);
 
-    // Serialize to JSONL: one line per row entry.
     let mut jsonl_bytes: Vec<u8> = Vec::new();
     for row in results_arr {
         let line =
@@ -190,16 +181,12 @@ pub fn write_and_manifest(
         jsonl_bytes.push(b'\n');
     }
 
-    // Write atomically via a securely-created unique temp file in the same
-    // directory, then rename over the destination.
     write_atomic(path, &jsonl_bytes)?;
 
-    // Compute manifest fields.
     let rows = results_arr.len();
 
-    // Per-column null counts and schema: inspect each `.result` value.
-    // Only object-shaped results contribute to the column schema; scalar /
-    // array results contribute nothing (they have no named fields).
+    // Only object-shaped `.result` values contribute to the column schema;
+    // scalar/array results have no named fields to count.
     let mut null_counts: BTreeMap<String, u64> = BTreeMap::new();
     let mut seen_fields: BTreeSet<String> = BTreeSet::new();
 
@@ -214,17 +201,10 @@ pub fn write_and_manifest(
         }
     }
 
-    // Schema fingerprint: sha256 of sorted field names joined by "|".
     let schema_input = seen_fields.iter().cloned().collect::<Vec<_>>().join("|");
     let schema_fingerprint = hex_sha256(schema_input.as_bytes());
-
-    // File checksum: sha256 of JSONL bytes.
     let checksum = hex_sha256(&jsonl_bytes);
-
-    // Canonical absolute path for the manifest.
     let abs_path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-
-    // Convert per_column_null_counts to a JSON object.
     let null_counts_val: Value = serde_json::to_value(&null_counts).unwrap_or_else(|_| json!({}));
 
     Ok(json!({
@@ -243,13 +223,9 @@ fn hex_sha256(data: &[u8]) -> String {
 }
 
 /// Write `data` to `path` via a securely-created, randomly-named temp file in
-/// the same directory, then rename over the destination.
-///
-/// Using `tempfile::Builder::tempfile_in` (instead of a predictable
-/// `path.with_extension("tmp")` sibling) closes the symlink-following /
-/// predictable-path race the previous sibling-tmp approach was open to, and
-/// the temp file always lives in the same directory as `path` so the final
-/// rename is same-filesystem and atomic.
+/// the same directory, then rename over the destination (same-filesystem,
+/// atomic). See crates/khive-mcp/docs/misc.md#write-atomic-rationale for the
+/// symlink/predictable-path race this closes vs. a sibling `.tmp` file.
 fn write_atomic(path: &Path, data: &[u8]) -> anyhow::Result<()> {
     use std::io::Write;
 
@@ -317,28 +293,19 @@ mod tests {
 
         let manifest = write_and_manifest(&envelope, &path, false).unwrap();
 
-        // File must exist.
         assert!(path.exists());
-
-        // rows == number of result entries.
         assert_eq!(manifest["rows"], json!(2));
-
-        // `notes` is null in one row → null count 1.
         assert_eq!(manifest["per_column_null_counts"]["notes"], json!(1));
-        // `entities` has no nulls → absent from null counts.
         assert!(manifest["per_column_null_counts"]["entities"].is_null());
 
-        // schema_fingerprint is a non-empty hex string.
         let fp = manifest["schema_fingerprint"].as_str().unwrap();
         assert!(!fp.is_empty());
         assert!(fp.chars().all(|c| c.is_ascii_hexdigit()));
 
-        // checksum is a non-empty hex string.
         let ck = manifest["checksum"].as_str().unwrap();
         assert!(!ck.is_empty());
         assert!(ck.chars().all(|c| c.is_ascii_hexdigit()));
 
-        // checksum matches sha256 of file content.
         let file_bytes = std::fs::read(&path).unwrap();
         let expected_ck = {
             use sha2::{Digest, Sha256};
@@ -348,11 +315,9 @@ mod tests {
         };
         assert_eq!(ck, expected_ck);
 
-        // JSONL: 2 lines.
         let content = String::from_utf8(file_bytes).unwrap();
         let lines: Vec<_> = content.lines().collect();
         assert_eq!(lines.len(), 2);
-        // Each line parses as JSON.
         for line in &lines {
             serde_json::from_str::<Value>(line).expect("valid JSON line");
         }

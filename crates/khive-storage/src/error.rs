@@ -83,8 +83,7 @@ pub enum StorageError {
     /// The bounded write-queue channel (ADR-067 Component A) did not free
     /// capacity within the caller-supplied deadline. Returned only when a
     /// caller wraps `WriterTaskHandle::send`'s `channel.send().await` in a
-    /// `tokio::time::timeout` — there is no immediate-error `try_send` path;
-    /// an un-timed-out send simply keeps applying backpressure.
+    /// `tokio::time::timeout`; there is no immediate-error `try_send` path.
     #[error("write queue full: timed out after {timeout_ms}ms waiting for writer task capacity")]
     WriteQueueFull { timeout_ms: u64 },
 
@@ -96,14 +95,10 @@ pub enum StorageError {
     Internal(String),
 
     /// `KHIVE_WRITE_QUEUE=1` is set but the calling thread has no Tokio
-    /// runtime context, so the writer task (which spawns via `tokio::spawn`)
-    /// cannot be started (ADR-067 Component A).
-    ///
-    /// Returned instead of panicking: a caller that constructs a store from
-    /// a plain, non-async context with the flag on gets a clean, typed
-    /// failure at first write rather than a `tokio::spawn`-outside-runtime
-    /// panic. Flag-off callers never see this variant — `writer_task_handle`
-    /// only attempts to spawn when `PoolConfig::write_queue_enabled` is set.
+    /// runtime context, so the writer task cannot be spawned (ADR-067
+    /// Component A). Returned instead of panicking. See
+    /// crates/khive-storage/docs/storage-core.md#writertasknoruntime for why
+    /// this variant exists instead of a `tokio::spawn`-outside-runtime panic.
     #[error(
         "KHIVE_WRITE_QUEUE=1 but no Tokio runtime context is available to spawn the writer task"
     )]
@@ -111,9 +106,7 @@ pub enum StorageError {
 
     /// A filesystem-backed capability (e.g. `BlobStore`) refused a write
     /// because `volume`'s available space, after accounting for the pending
-    /// write, would drop below the configured free-space floor. Carries the
-    /// floor and the volume so callers can surface a precise message without
-    /// re-deriving them (khive#292).
+    /// write, would drop below the configured free-space floor (khive#292).
     #[error(
         "refusing write on {capability:?} at {volume}: {available_bytes} bytes available, \
          below the {floor_bytes}-byte floor"
@@ -176,29 +169,20 @@ impl StorageError {
     /// expression itself, as opposed to a connection/pool/driver-level
     /// failure of the text-search backend.
     ///
+    /// True only for `Driver` errors from the `Text` capability at the
+    /// `fts_search` operation whose message names one of SQLite's FTS5
+    /// parser failure modes (syntax error, stack overflow, unsupported
+    /// column/phrase/NEAR query). Pool, Timeout, Transaction, and any other
+    /// `operation` value (e.g. `fts_count`, `open_fts_reader`) always return
+    /// `false` (propagate as a real failure).
+    ///
     /// Callers that fail-open the FTS leg of a hybrid search (degrading to
-    /// vector-only results on a bad query string) MUST gate on this predicate
-    /// rather than on `StorageError` broadly. `TextSearch::search` returns the
-    /// same `Driver` variant for a malformed MATCH expression *and* for a
-    /// genuine backend outage (pool exhaustion, connection failure, reader
-    /// open failure) — treating every `Err` as degradable turns a real outage
-    /// into a silently-empty "successful" search (issue #389).
-    ///
-    /// SQLite's FTS5 query parser (`sqlite3Fts5ParseError`, fts5_expr.c)
-    /// prefixes every message it emits with the literal `"fts5: "` token —
-    /// e.g. `fts5: syntax error near "@"`, `fts5: parser stack overflow`,
-    /// `fts5: column queries are not supported (detail=none)`. This is a
-    /// stable SQLite-internal convention, not a substring picked to match one
-    /// observed message. It excludes non-parser FTS5 subsystem failures such
-    /// as `fts5: error creating shadow table ...` (schema/storage corruption)
-    /// by requiring the message to name one of the parser's own failure
-    /// modes, not just the `fts5:` namespace prefix.
-    ///
-    /// Only applies to `Driver` errors from the `Text` capability at the
-    /// `fts_search` operation — the exact seam `Fts5TextSearch::search` uses
-    /// (`crates/khive-db/src/stores/text.rs`). Pool, Timeout, Transaction,
-    /// and any other `operation` value (e.g. `fts_count`, `open_fts_reader`)
-    /// always propagate.
+    /// vector-only results on a bad query string) MUST gate on this
+    /// predicate rather than on `StorageError` broadly — treating every
+    /// `Err` as degradable turns a real backend outage into a silently-empty
+    /// "successful" search. See
+    /// crates/khive-storage/docs/storage-core.md#is_fts5_syntax_error for
+    /// why the message-prefix match is safe (issue #389).
     pub fn is_fts5_syntax_error(&self) -> bool {
         let Self::Driver {
             capability,
@@ -220,20 +204,19 @@ impl StorageError {
     }
 
     /// Whether this error is a UNIQUE constraint violation from a raw SQL
-    /// `execute` (e.g. an `INSERT` racing an existing row under the ledger's
-    /// natural key). Callers that treat exact-key duplicates as a tolerated
-    /// no-op (ADR-081 §4 serve-ledger idempotency) MUST gate on this
-    /// predicate rather than swallowing every `Driver` error at `execute` —
-    /// that would also hide genuine write failures (disk full, corruption).
+    /// `execute` (e.g. an `INSERT` racing an existing row under a natural
+    /// key). True only for `Driver` errors from the `Sql` capability whose
+    /// `operation` is one of `execute`, `pool_writer.execute`, or
+    /// `tx.execute` (the three single-statement seams `khive-db`'s
+    /// `sql_bridge` can label) and whose message contains `UNIQUE constraint
+    /// failed`. Batch/script operations are intentionally excluded.
     ///
-    /// Only applies to `Driver` errors from the `Sql` capability at a single-
-    /// statement execute operation. `khive-db`'s `sql_bridge` labels this
-    /// operation differently depending on which `SqlAccess` seam produced the
-    /// writer — a bare transaction's `execute` vs. a pooled `writer()`'s
-    /// `pool_writer.execute` vs. an explicit `tx.execute` — so all three are
-    /// accepted; batch/script variants are intentionally excluded since a
-    /// UNIQUE violation partway through a multi-statement batch is not the
-    /// same single-row-duplicate case this predicate exists to tolerate.
+    /// Callers that treat exact-key duplicates as a tolerated no-op
+    /// (ADR-081 §4 serve-ledger idempotency) MUST gate on this predicate
+    /// rather than swallowing every `Driver` error at `execute` — that would
+    /// also hide genuine write failures (disk full, corruption). See
+    /// crates/khive-storage/docs/storage-core.md#is_unique_constraint_violation
+    /// for the per-seam operation-label rationale.
     pub fn is_unique_constraint_violation(&self) -> bool {
         let Self::Driver {
             capability,
@@ -320,17 +303,12 @@ mod tests {
 
     #[test]
     fn driver_error_at_non_search_operation_is_not_classified_as_syntax_error() {
-        // Same message text, but at a different operation (e.g. reader open
-        // failure) — must not be classified as a syntax error even if the
-        // underlying message happened to mention "fts5:".
         let e = driver_err("open_fts_reader", "fts5: syntax error near \"@\"");
         assert!(!e.is_fts5_syntax_error());
     }
 
     #[test]
     fn driver_error_with_unrelated_message_is_not_classified_as_syntax_error() {
-        // A genuine connection/driver outage at the fts_search operation, but
-        // whose message does not name a parser failure mode — must propagate.
         let e = driver_err("fts_search", "disk I/O error");
         assert!(!e.is_fts5_syntax_error());
     }
@@ -355,9 +333,6 @@ mod tests {
 
     #[test]
     fn unprefixed_detail_message_is_not_classified_as_syntax_error() {
-        // A driver message containing the detail-mode substring
-        // WITHOUT the `fts5: ` parser prefix is not from the FTS5 query
-        // parser — must propagate, not degrade.
         let e = driver_err(
             "fts_search",
             "phrase queries are not supported (detail!=full)",
@@ -367,8 +342,6 @@ mod tests {
 
     #[test]
     fn fts5_shadow_table_corruption_is_not_classified_as_syntax_error() {
-        // A real FTS5-subsystem failure (schema/storage corruption), not a
-        // MATCH-expression parser rejection — must propagate, not degrade.
         let e = driver_err(
             "fts_search",
             "fts5: error creating shadow table notes_content: no such table",
@@ -407,9 +380,6 @@ mod tests {
 
     #[test]
     fn unique_constraint_failure_at_pool_writer_execute_is_classified() {
-        // khive-db's pooled writer seam (`SqlAccess::writer()`) labels its
-        // single-statement execute operation "pool_writer.execute", not bare
-        // "execute" — this is the exact seam brain.record_serve writes through.
         let e = driver_err_sql("pool_writer.execute", "UNIQUE constraint failed: t.id");
         assert!(e.is_unique_constraint_violation());
     }
