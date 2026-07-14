@@ -1,6 +1,6 @@
 # ADR-079: ANN Persistence Warm-Path Integration — Wiring v2 Persistence into the Daemon
 
-**Status**: proposed
+**Status**: Accepted
 **Date**: 2026-06-28
 **Authors**: khive maintainers
 
