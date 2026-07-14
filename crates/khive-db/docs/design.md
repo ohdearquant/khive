@@ -85,6 +85,25 @@
   status-filtered list/search paths. Existing finalized atoms are backfilled
   to `'reviewed'`.
 
+### Single-Writer Write Queue (ADR-067 Component A)
+
+Multiple stores and namespaces can be constructed over the same
+`ConnectionPool` (per DB file), but every mutating statement must still
+serialize through exactly one writer connection — otherwise concurrent
+stores would open independent connections that contend with each other at
+`BEGIN IMMEDIATE`, defeating the purpose of a write queue. `ConnectionPool`
+lazily spawns a single `WriterTask` behind a `OnceLock`: the first caller to
+need it runs the init closure, every later caller (from any store, any
+namespace) receives a clone of the same handle. When `KHIVE_WRITE_QUEUE=1`,
+store methods route single-row DML through this shared `WriterTask` instead
+of taking the pool mutex directly; `orphan_sweep` and other closures that
+manage their own transaction bypass the queue via the "unmanaged" path
+instead, since a transaction-owning closure cannot be sent through a channel
+that already wraps every request in its own transaction.
+
+See `crates/khive-db/docs/api/pool.md` and `crates/khive-db/docs/api/vectors.md`
+for the per-function routing rules and the tests that pin them down.
+
 ## Consistency Notes
 
 - **sqlite-vec KNN non-monotonicity** (`stores/vectors.rs`): The IN-subquery

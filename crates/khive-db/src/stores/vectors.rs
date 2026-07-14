@@ -255,7 +255,7 @@ impl SqliteVecStore {
 
     /// Route a single-row DML-only write through the pool-wide `WriterTask`
     /// when available, else fall back to `with_writer_unmanaged`. See
-    /// crates/khive-db/docs/vectors-internals.md#with_writer--with_writer_unmanaged--writertask-routing-adr-067-component-a-fork-c-slice-2
+    /// crates/khive-db/docs/api/vectors.md#with_writer--with_writer_unmanaged--writertask-routing-adr-067-component-a-fork-c-slice-2
     async fn with_writer<F, R>(&self, op: &'static str, f: F) -> Result<R, StorageError>
     where
         F: FnOnce(&rusqlite::Connection) -> Result<R, rusqlite::Error> + Send + 'static,
@@ -273,7 +273,7 @@ impl SqliteVecStore {
     /// Legacy pool-mutex write path; bypasses the WriterTask channel
     /// unconditionally. Reserved for closures that manage their own
     /// transaction. See
-    /// crates/khive-db/docs/vectors-internals.md#with_writer--with_writer_unmanaged--writertask-routing-adr-067-component-a-fork-c-slice-2
+    /// crates/khive-db/docs/api/vectors.md#with_writer--with_writer_unmanaged--writertask-routing-adr-067-component-a-fork-c-slice-2
     async fn with_writer_unmanaged<F, R>(&self, op: &'static str, f: F) -> Result<R, StorageError>
     where
         F: FnOnce(&rusqlite::Connection) -> Result<R, rusqlite::Error> + Send + 'static,
@@ -324,7 +324,7 @@ struct VectorRowRef<'a> {
 
 /// Shared DELETE-then-INSERT replacement DML for a single vector row (#546);
 /// caller owns the enclosing transaction/savepoint. See
-/// crates/khive-db/docs/vectors-internals.md#replace_vector_row_dml--shared-delete-then-insert-replacement-546
+/// crates/khive-db/docs/api/vectors.md#replace_vector_row_dml--shared-delete-then-insert-replacement-546
 fn replace_vector_row_dml(
     conn: &rusqlite::Connection,
     table: &str,
@@ -1997,7 +1997,7 @@ mod atomic_replace_tests {
 
     /// insert_batch: SAVEPOINT/ROLLBACK path — INSERT failure inside the
     /// savepoint via a PK conflict. See
-    /// crates/khive-db/docs/vectors-internals.md#insert_batch_savepoint_rollback_on_pk_conflict_preserves_stale
+    /// crates/khive-db/docs/api/vectors.md#insert_batch_savepoint_rollback_on_pk_conflict_preserves_stale
     #[tokio::test]
     async fn insert_batch_savepoint_rollback_on_pk_conflict_preserves_stale() {
         let pool = make_vec_pool();
@@ -2094,7 +2094,7 @@ mod atomic_replace_tests {
 
     /// insert_batch: a rolled-back first record must not corrupt a
     /// successful second record. See
-    /// crates/khive-db/docs/vectors-internals.md#insert_batch_rollback_does_not_corrupt_subsequent_record
+    /// crates/khive-db/docs/api/vectors.md#insert_batch_rollback_does_not_corrupt_subsequent_record
     #[tokio::test]
     async fn insert_batch_rollback_does_not_corrupt_subsequent_record() {
         let pool = make_vec_pool();
@@ -2188,7 +2188,7 @@ mod atomic_replace_tests {
 
     /// update: PK-conflict INSERT inside `unchecked_transaction` rolls back
     /// and preserves the stale row. See
-    /// crates/khive-db/docs/vectors-internals.md#update_pk_conflict_rolls_back_transaction_preserves_stale
+    /// crates/khive-db/docs/api/vectors.md#update_pk_conflict_rolls_back_transaction_preserves_stale
     #[tokio::test]
     async fn update_pk_conflict_rolls_back_transaction_preserves_stale() {
         let pool = make_vec_pool();
@@ -2276,11 +2276,11 @@ mod atomic_replace_tests {
     }
 
     // True ROLLBACK TO SAVEPOINT sentinels (failpoint-driven) — see
-    // crates/khive-db/docs/vectors-internals.md#true-rollback-to-savepoint-sentinels-failpoint-driven
+    // crates/khive-db/docs/api/vectors.md#true-rollback-to-savepoint-sentinels-failpoint-driven
 
     /// SENTINEL — insert_batch: stale row is restored when DELETE succeeds
     /// but INSERT is forced to fail via the cfg(test) failpoint. See
-    /// crates/khive-db/docs/vectors-internals.md#insert_batch_rollback_restores_deleted_stale_after_post_delete_insert_failure
+    /// crates/khive-db/docs/api/vectors.md#insert_batch_rollback_restores_deleted_stale_after_post_delete_insert_failure
     #[tokio::test]
     async fn insert_batch_rollback_restores_deleted_stale_after_post_delete_insert_failure() {
         let pool = make_vec_pool();
@@ -2401,7 +2401,7 @@ mod atomic_replace_tests {
 
     /// SENTINEL — update: stale row is restored when DELETE succeeds but
     /// INSERT is forced to fail via the cfg(test) failpoint. See
-    /// crates/khive-db/docs/vectors-internals.md#update_rollback_restores_deleted_stale_after_post_delete_insert_failure
+    /// crates/khive-db/docs/api/vectors.md#update_rollback_restores_deleted_stale_after_post_delete_insert_failure
     #[tokio::test]
     async fn update_rollback_restores_deleted_stale_after_post_delete_insert_failure() {
         let pool = make_vec_pool();
@@ -2487,7 +2487,7 @@ mod atomic_replace_tests {
     /// #546: `insert` now routes through the shared `replace_vector_row_dml`
     /// helper, so the same post-delete-failpoint rollback guarantee that
     /// covers `update` must also cover `insert`. See
-    /// crates/khive-db/docs/vectors-internals.md#insert_rollback_restores_deleted_stale_after_post_delete_insert_failure
+    /// crates/khive-db/docs/api/vectors.md#insert_rollback_restores_deleted_stale_after_post_delete_insert_failure
     #[tokio::test]
     async fn insert_rollback_restores_deleted_stale_after_post_delete_insert_failure() {
         let pool = make_vec_pool();
