@@ -2,14 +2,8 @@
 //! declaration, the `precedes` commit→commit edge extension, and the
 //! pack-auxiliary cursor schema.
 //!
-//! ADR-088 v0 shipped with no `HANDLERS` and no `EDGE_RULES`: zero new verbs,
-//! relying exclusively on the base `annotates` contract (note -> any
-//! substrate) for provenance edges. ADR-088 Amendment 1 adds exactly one
-//! verb (`git.digest`) and one endpoint extension (`precedes` commit→commit,
-//! for parent→child commit lineage — the base contract only allows
-//! `precedes` between five entity kinds, never between notes; this pack
-//! extends it the same additive way `khive-pack-gtd` extends `depends_on` to
-//! task→task). See `crates/khive-pack-git/src/pack.rs`.
+//! See crates/khive-pack-git/docs/vocab.md for the ADR-088 v0 → Amendment 1
+//! rationale behind this module's design.
 
 use khive_runtime::{NoteKindSpec, NoteLifecycleSpec};
 use khive_types::{
@@ -17,9 +11,8 @@ use khive_types::{
     VerbCategory, Visibility,
 };
 
-/// Lifecycle declaration shared by `issue` and `pull_request` — both track an
-/// open/closed state with the same posture as ADR-088's `finding` precedent:
-/// declared for introspection, not yet enforced by the runtime (Phase 1).
+/// Shared open/closed lifecycle for `issue` and `pull_request`. See
+/// crates/khive-pack-git/docs/vocab.md#git_lifecycle.
 const GIT_LIFECYCLE: NoteLifecycleSpec = NoteLifecycleSpec {
     field: "kind_status",
     initial: "open",
@@ -44,15 +37,8 @@ pub(crate) static GIT_NOTE_KIND_SPECS: [NoteKindSpec; 2] = [
     },
 ];
 
-/// Pack-auxiliary schema: the git-ingest cursor table (ADR-088 §5, ADR-087
-/// operational pattern reused).
-///
-/// Shape is intentionally generic across git record kinds within a project —
-/// `kind` distinguishes `commits` / `issues` / `prs` cursors so a follow-up
-/// pack (e.g. a code-review pack) can reuse this exact table for its own
-/// cursor rows without a schema change, keyed by its own `project_id`/`kind`
-/// pair. Idempotent (`CREATE TABLE IF NOT EXISTS`), applied once at pack
-/// registration time; not part of the core versioned migration chain.
+/// Pack-auxiliary schema: the git-ingest cursor table (ADR-088 §5). See
+/// crates/khive-pack-git/docs/vocab.md#git_schema_plan_stmts.
 pub(crate) static GIT_SCHEMA_PLAN_STMTS: [&str; 2] = [
     "CREATE TABLE IF NOT EXISTS git_mirror_cursor (\
         project_id   TEXT NOT NULL,\
@@ -65,12 +51,8 @@ pub(crate) static GIT_SCHEMA_PLAN_STMTS: [&str; 2] = [
         ON git_mirror_cursor(updated_at DESC)",
 ];
 
-/// ADR-088 Amendment 1 ingest enrichment: parent→child commit lineage as
-/// `precedes` edges. The base endpoint contract only allows `precedes`
-/// between five entity kinds (`document`, `dataset`, `artifact`, `service`,
-/// `project` — see `khive-runtime::operations::BASE_ENTITY_ENDPOINT_RULES`);
-/// it has no note→note case at all. This is the same additive-extension
-/// mechanism `khive-pack-gtd` uses for `depends_on` task→task.
+/// ADR-088 Amendment 1: parent→child commit lineage as `precedes` edges
+/// (note→note extension). See crates/khive-pack-git/docs/vocab.md#git_edge_rules.
 pub(crate) static GIT_EDGE_RULES: [EdgeEndpointRule; 1] = [EdgeEndpointRule {
     relation: EdgeRelation::Precedes,
     source: EndpointKind::NoteOfKind("commit"),
@@ -78,22 +60,7 @@ pub(crate) static GIT_EDGE_RULES: [EdgeEndpointRule; 1] = [EdgeEndpointRule {
 }];
 
 /// Pack-declared `Document` entity-type subtype: Architecture Decision
-/// Records.
-///
-/// `find_document_for_path` (`src/ingest.rs`) resolves pre-existing
-/// `document` entities by git-tracked file path (`properties.source_uri`) so
-/// commits/PRs can `annotates`-link to them; this pack never creates those
-/// document entities itself ("v0 never creates documents on the ingester's
-/// behalf"). The single most common git-tracked document kind ingesting
-/// agents attach to a repo's `document` entities is its ADR corpus
-/// (`docs/adr/*.md`) — but `EntityTypeRegistry::BUILTIN_DEFS` has no `adr`
-/// Document subtype, so any caller attempting `entity_type="adr"` was
-/// rejected at the handler layer, and callers omitted `entity_type`
-/// entirely rather than retry against an unknown value: a schema gap, not a
-/// data gap. Declaring it here (composed at boot via
-/// `VerbRegistry::all_entity_types`, ADR-017's additive pack-vocabulary
-/// pattern) makes ADR documents representable without editing the builtin
-/// registry.
+/// Records. See crates/khive-pack-git/docs/vocab.md#git_entity_types.
 pub(crate) static GIT_ENTITY_TYPES: [EntityTypeDef; 1] = [EntityTypeDef {
     kind: EntityKind::Document,
     type_name: "adr",

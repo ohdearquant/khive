@@ -1,12 +1,8 @@
 //! `KindHook` implementations for the three note kinds this pack contributes.
-//!
-//! Validation only — this pack introduces no new edges at `after_create` time.
-//! Provenance edges (`annotates` -> project / document / merging PR) are
-//! supplied by the caller (the ingester, see `src/ingest.rs`) as part of the
-//! generic `create(kind=..., annotates=[...])` call; the runtime's own
-//! `create_note` path validates and links them atomically, so no
-//! `after_create` edge-creation logic is needed here (unlike gtd's
-//! `TaskHook::after_create`).
+//! Validation only — provenance edges are supplied by the caller and linked
+//! by the runtime's `create_note` path itself. See
+//! crates/khive-pack-git/docs/hooks.md for why no `after_create` edge work
+//! is needed here.
 
 use async_trait::async_trait;
 use serde_json::Value;
@@ -95,25 +91,19 @@ impl KindHook for CommitHook {
     }
 }
 
-/// The governed `state_reason` value set for `issue` (ADR-088 §3). `pub(crate)`
-/// so `ingest::MaskedIssueFields` can classify against the same set at the
-/// masking boundary, before an ungoverned (possibly credential-shaped) raw
-/// value can reach this hook's error path.
+/// The governed `state_reason` value set for `issue` (ADR-088 §3). See
+/// crates/khive-pack-git/docs/hooks.md#issuelikehook for why this is
+/// `pub(crate)`.
 pub(crate) const ISSUE_STATE_REASONS: &[&str] =
     &["completed", "not_planned", "reopened", "duplicate"];
 
 /// `KindHook` shared by `issue` and `pull_request` — both require
-/// `properties.number` and `properties.project_id`, and, when present,
-/// validate `properties.state_reason`. `issue`'s `state_reason` is governed
-/// to a fixed set (ADR-088 §3); v0 does not document a fixed set for
-/// `pull_request`'s `state_reason`, so it is only checked for non-emptiness
-/// there.
-///
-/// GitHub issue/PR numbers are repository-scoped, not globally unique — two
-/// different `project` entities in the same namespace can each have a `#1`.
-/// `properties.project_id` is the natural-key scoping field the ingester's
-/// `find_by_number` lookup filters on, so it is required and validated as a
-/// UUID here rather than left to the caller's discipline.
+/// `properties.number` (integer) and `properties.project_id` (UUID), and,
+/// when present, validate `properties.state_reason` (governed to a fixed
+/// set for `issue` per ADR-088 §3; only checked for non-emptiness for
+/// `pull_request`). See crates/khive-pack-git/docs/hooks.md#issuelikehook
+/// for why `project_id` is required here rather than left to caller
+/// discipline.
 #[derive(Debug)]
 pub struct IssueLikeHook {
     /// The note kind this instance validates: `"issue"` or `"pull_request"`.
