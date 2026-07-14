@@ -25,13 +25,12 @@ const CONTENT_REF_HEX_LEN: usize = 64;
 /// content always produces the same `ContentRef`, so storing the same bytes
 /// twice is a no-op after the first write. Callers must treat the value as
 /// opaque — the backend, not the caller, decides how a `ContentRef` maps to
-/// physical storage (a filesystem path, an object-store key, etc.).
+/// physical storage.
 ///
-/// `Deserialize` is implemented by hand (below), routing every input through
-/// [`ContentRef::from_hex`] — deriving it under `#[serde(transparent)]` would
-/// construct a `ContentRef` from any string, including one that is not 64
-/// lowercase hex characters (an unvalidated
-/// value reaching `shard_path`'s `[0..2]`/`[2..4]` slices panics).
+/// `Deserialize` is hand-written (below) to reject any string that is not 64
+/// lowercase hex characters — a naive derive would let an unvalidated value
+/// panic later in `shard_path`'s slicing.
+/// See `crates/khive-storage/docs/api/blob-store.md` for the full rationale.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 #[serde(transparent)]
 pub struct ContentRef(String);
@@ -50,11 +49,8 @@ impl ContentRef {
     /// Parse a `ContentRef` from a caller-supplied hex string.
     ///
     /// Rejects anything that is not exactly 64 lowercase hex characters.
-    /// Rejecting uppercase (rather than lowercase-normalizing) keeps a
-    /// single canonical string form per digest, since the value doubles as
-    /// a filesystem path component in the shipped filesystem backend —
-    /// accepting both cases would let two `ContentRef` values that compare
-    /// unequal as `String`s resolve to the same bytes.
+    /// Uppercase is rejected (not normalized) to keep one canonical string
+    /// form per digest — see `docs/api/blob-store.md`.
     pub fn from_hex(hex: impl Into<String>) -> Result<Self, String> {
         let hex = hex.into();
         if hex.len() != CONTENT_REF_HEX_LEN {
@@ -109,18 +105,11 @@ fn hex_encode(bytes: &[u8]) -> String {
 
 /// Configuration for [`BlobStore::orphan_sweep`].
 ///
-/// `BlobStore` has no visibility into SQL substrates (ADR-005 constraint 4:
-/// a trait instance talks to exactly one backend), so it cannot itself
-/// discover which content refs are still referenced by, e.g., the
-/// `entities.content_ref` column. The caller assembles that set and passes
-/// it in — the blob backend then owns the actual comparison and deletion,
-/// per the operating rule that `BlobStore` is the *only* deletion path
-/// besides an explicit [`BlobStore::delete`] (no consumer deletes blobs
-/// directly).
-///
-/// `live_refs` is a point-in-time snapshot, not a live query — see
-/// [`BlobStore::orphan_sweep`]'s doc comment for the concurrency hazard this
-/// implies (offline-maintenance-only; requires quiesced entity writes).
+/// `live_refs` is a point-in-time snapshot the caller assembles (this trait
+/// has no visibility into SQL substrates — ADR-005 constraint 4), not a live
+/// query. See [`BlobStore::orphan_sweep`] for the concurrency hazard this
+/// implies, and `crates/khive-storage/docs/api/blob-store.md` for the full
+/// rationale.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct BlobOrphanSweepConfig {
     /// Content refs currently referenced by at least one live row somewhere
@@ -174,44 +163,30 @@ pub trait BlobStore: Send + Sync + 'static {
     /// Returns `true` when an object was actually removed, `false` when
     /// none existed — deleting an absent object is not an error.
     ///
-    /// # Concurrency hazard — offline-maintenance-only (ADR-111 §8, amended)
+    /// # Safety / concurrency hazard (ADR-111 §8, amended)
     ///
-    /// `delete` performs an unconditional physical removal with **no
-    /// coordination against any entity that might reference
-    /// `content_ref`**. It is safe to call only when the caller has
-    /// independently ensured — outside this trait, typically by quiescing
-    /// whatever writer could attach a new `content_ref` to an entity — that
-    /// nothing live references `content_ref` for the duration of the call. A
-    /// caller that races an entity write against a `delete` can dangle a
-    /// live reference; this trait does not detect or prevent that.
+    /// Unconditional physical removal with **no coordination against any
+    /// entity that might reference `content_ref`**. Safe to call only when
+    /// the caller has independently quiesced whatever writer could attach a
+    /// new `content_ref` to an entity for the duration of the call — this
+    /// trait does not detect or prevent a race. Offline-maintenance-only.
+    /// See `crates/khive-storage/docs/api/blob-store.md`.
     async fn delete(&self, content_ref: &ContentRef) -> StorageResult<bool>;
 
     /// Enumerate every object this backend holds and delete (or, in
     /// `dry_run` mode, report) those absent from `config.live_refs`.
+    /// Operator-side GC path (khive#292 deliverable 5) — admin-only, not an
+    /// MCP verb. Default returns `StorageError::Unsupported`; the filesystem
+    /// backend overrides it with a real directory walk.
     ///
-    /// This is the operator-side GC path (khive#292 deliverable 5) — an
-    /// admin-side operation, not an MCP verb, mirroring
-    /// `VectorStore::orphan_sweep`'s CLI-only precedent (ADR-044). Default
-    /// returns `StorageError::Unsupported`; the filesystem backend
-    /// overrides it with a real directory walk. No silent no-op.
+    /// # Safety / concurrency hazard (ADR-111 §8, amended)
     ///
-    /// # Concurrency hazard — offline-maintenance-only (ADR-111 §8, amended)
-    ///
-    /// `config.live_refs` is a **snapshot** the caller assembled before this
-    /// call. `orphan_sweep` has no way to detect a `content_ref` that
-    /// becomes newly live — an entity write lands referencing it — between
-    /// when that snapshot was taken and when this sweep runs; such a
-    /// reference is deleted anyway (see `khive-db`'s
-    /// `orphan_sweep_race_demonstrates_the_documented_quiescence_requirement`
-    /// test, which reproduces exactly this in code). This trait provides no
-    /// transactional coordination with an entity writer. **Callers MUST
-    /// quiesce entity writes** (nothing may create a new `content_ref`
-    /// reference) for the duration of snapshot-plus-sweep — a maintenance
-    /// window, a single-writer admin CLI invocation with no live traffic, or
-    /// equivalent. A DB-coordinated, transactional sweep (select-and-delete
-    /// under the entity writer's own transactional boundary) would close
-    /// this hazard properly; that is a larger design tracked as a follow-up
-    /// (khive#924), not built in this round.
+    /// `config.live_refs` is a **snapshot**; a `content_ref` that becomes
+    /// newly live between the snapshot and the sweep is deleted anyway.
+    /// **Callers MUST quiesce entity writes** for the duration of
+    /// snapshot-plus-sweep. See `crates/khive-storage/docs/api/blob-store.md`
+    /// for the race repro and the tracked transactional-sweep follow-up
+    /// (khive#924).
     async fn orphan_sweep(
         &self,
         config: &BlobOrphanSweepConfig,
@@ -286,9 +261,7 @@ mod tests {
         );
     }
 
-    // khive-storage has zero heavy dependencies (ADR-005) so this test hand-rolls
-    // the one known BLAKE3("") vector instead of pulling in the `blake3` crate
-    // just to exercise `hex_encode`.
+    // hand-rolled BLAKE3("") vector (see docs/api/blob-store.md)
     fn blake3_hash_of_empty() -> [u8; 32] {
         let hex = "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262";
         let mut out = [0u8; 32];
@@ -309,10 +282,6 @@ mod tests {
 
     #[test]
     fn deserialize_rejects_short_string() {
-        // The exact repro that motivates a hand-written impl: a naive derived
-        // `Deserialize` would construct `ContentRef("x")` here, and any
-        // caller passing it to `get`/`exists`/`delete` would then panic in
-        // `shard_path`'s `[0..2]`/`[2..4]` slices.
         let err = serde_json::from_str::<ContentRef>("\"x\"").unwrap_err();
         assert!(
             err.to_string().contains("64"),
