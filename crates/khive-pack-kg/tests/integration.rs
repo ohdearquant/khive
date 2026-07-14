@@ -11,7 +11,7 @@ use khive_runtime::{
     EntityCreateSpec, KhiveRuntime, Namespace, NamespaceToken, ParamDef, RuntimeError,
     VerbCategory, VerbRegistry, VerbRegistryBuilder, Visibility,
 };
-use khive_storage::Note;
+use khive_storage::{Edge, EdgeRelation, Note};
 use khive_types::Pack;
 use serde_json::{json, Value};
 
@@ -3846,7 +3846,7 @@ async fn get_edge_includes_annotating_notes() {
     let a = pack
         .dispatch(
             "create",
-            json!({"kind": "entity", "name": "Nvk803A", "entity_kind": "concept"}),
+            json!({"kind": "entity", "name": "EdgeAnnotationSourceA", "entity_kind": "concept"}),
         )
         .await
         .expect("create a must succeed");
@@ -3855,7 +3855,7 @@ async fn get_edge_includes_annotating_notes() {
     let b = pack
         .dispatch(
             "create",
-            json!({"kind": "entity", "name": "Nvk803B", "entity_kind": "concept"}),
+            json!({"kind": "entity", "name": "EdgeAnnotationTargetB", "entity_kind": "concept"}),
         )
         .await
         .expect("create b must succeed");
@@ -3875,7 +3875,7 @@ async fn get_edge_includes_annotating_notes() {
             "create",
             json!({
                 "kind": "note",
-                "content": "nvk803 scope: B supersedes A because of the v2 schema migration",
+                "content": "edge annotation test content explaining the superseding relationship",
                 "annotates": [edge_id.clone()],
             }),
         )
@@ -3905,7 +3905,7 @@ async fn get_edge_includes_annotating_notes() {
     );
     assert_eq!(
         annotation.get("content").and_then(Value::as_str),
-        Some("nvk803 scope: B supersedes A because of the v2 schema migration")
+        Some("edge annotation test content explaining the superseding relationship")
     );
     assert!(
         annotation
@@ -3926,7 +3926,7 @@ async fn get_edge_without_annotations_returns_empty_array() {
     let a = pack
         .dispatch(
             "create",
-            json!({"kind": "entity", "name": "Nvk803BareA", "entity_kind": "concept"}),
+            json!({"kind": "entity", "name": "EdgeWithoutAnnotationSource", "entity_kind": "concept"}),
         )
         .await
         .expect("create a must succeed");
@@ -3935,7 +3935,7 @@ async fn get_edge_without_annotations_returns_empty_array() {
     let b = pack
         .dispatch(
             "create",
-            json!({"kind": "entity", "name": "Nvk803BareB", "entity_kind": "concept"}),
+            json!({"kind": "entity", "name": "EdgeWithoutAnnotationTarget", "entity_kind": "concept"}),
         )
         .await
         .expect("create b must succeed");
@@ -3967,8 +3967,7 @@ async fn get_edge_without_annotations_returns_empty_array() {
 
 /// #803: a soft-deleted annotating note must not leak into `get(edge_id)`'s
 /// `annotations` — mirrors the `neighbors_excludes_soft_deleted_note` (#748)
-/// guarantee that `fetch_edge_annotations` inherits by reusing
-/// `neighbors_with_query`.
+/// guarantee at the by-ID edge read surface.
 #[tokio::test]
 async fn get_edge_excludes_soft_deleted_annotating_note() {
     let pack = pack();
@@ -3976,7 +3975,7 @@ async fn get_edge_excludes_soft_deleted_annotating_note() {
     let a = pack
         .dispatch(
             "create",
-            json!({"kind": "entity", "name": "Nvk803DelA", "entity_kind": "concept"}),
+            json!({"kind": "entity", "name": "DeletedAnnotationSource", "entity_kind": "concept"}),
         )
         .await
         .expect("create a must succeed");
@@ -3985,7 +3984,7 @@ async fn get_edge_excludes_soft_deleted_annotating_note() {
     let b = pack
         .dispatch(
             "create",
-            json!({"kind": "entity", "name": "Nvk803DelB", "entity_kind": "concept"}),
+            json!({"kind": "entity", "name": "DeletedAnnotationTarget", "entity_kind": "concept"}),
         )
         .await
         .expect("create b must succeed");
@@ -4005,7 +4004,7 @@ async fn get_edge_excludes_soft_deleted_annotating_note() {
             "create",
             json!({
                 "kind": "note",
-                "content": "nvk803 note that will be soft-deleted",
+                "content": "edge annotation note that will be soft-deleted",
                 "annotates": [edge_id.clone()],
             }),
         )
@@ -4028,6 +4027,177 @@ async fn get_edge_excludes_soft_deleted_annotating_note() {
     assert!(
         annotations.is_empty(),
         "soft-deleted annotating note must not appear; got {annotations:?}"
+    );
+}
+
+/// ADR-007 by-ID reads are namespace-agnostic. Fetching a foreign edge must
+/// therefore include annotations even when neither the edge nor its annotating
+/// note is visible to the caller's explicit namespace.
+#[tokio::test]
+async fn get_edge_cross_namespace_includes_foreign_annotation() {
+    let pack = pack();
+
+    let source = pack
+        .dispatch(
+            "create",
+            json!({
+                "kind": "entity",
+                "name": "CrossNamespaceAnnotationSource",
+                "entity_kind": "concept",
+                "namespace": "ns-a",
+            }),
+        )
+        .await
+        .expect("create source in ns-a");
+    let target = pack
+        .dispatch(
+            "create",
+            json!({
+                "kind": "entity",
+                "name": "CrossNamespaceAnnotationTarget",
+                "entity_kind": "concept",
+                "namespace": "ns-a",
+            }),
+        )
+        .await
+        .expect("create target in ns-a");
+    let edge = pack
+        .dispatch(
+            "link",
+            json!({
+                "source_id": source["id"],
+                "target_id": target["id"],
+                "relation": "extends",
+                "namespace": "ns-a",
+            }),
+        )
+        .await
+        .expect("create edge in ns-a");
+    let edge_id = edge["id"].as_str().expect("edge id").to_string();
+    let note = pack
+        .dispatch(
+            "create",
+            json!({
+                "kind": "note",
+                "content": "cross-namespace edge annotation content",
+                "annotates": [edge_id.clone()],
+                "namespace": "ns-a",
+            }),
+        )
+        .await
+        .expect("create annotating note in ns-a");
+
+    let fetched = pack
+        .dispatch("get", json!({"id": edge_id, "namespace": "ns-b"}))
+        .await
+        .expect("get foreign edge from ns-b");
+    let annotations = fetched["annotations"]
+        .as_array()
+        .expect("edge get must include annotations");
+    assert_eq!(annotations.len(), 1, "foreign annotation must be returned");
+    assert_eq!(annotations[0]["id"], note["id"]);
+    assert_eq!(
+        annotations[0]["content"],
+        "cross-namespace edge annotation content"
+    );
+}
+
+/// Hydrating more notes than SQLite's traditional 999-variable ceiling must
+/// be chunked internally while the public response still contains every note.
+#[tokio::test]
+async fn get_edge_returns_annotations_beyond_sqlite_bind_limit() {
+    const ANNOTATION_COUNT: usize = 1_000;
+
+    let (pack, runtime, token) = pack_and_runtime();
+    let source = runtime
+        .create_entity(
+            &token,
+            "concept",
+            None,
+            "HeavilyAnnotatedEdgeSource",
+            None,
+            None,
+            vec![],
+        )
+        .await
+        .expect("create source");
+    let target = runtime
+        .create_entity(
+            &token,
+            "concept",
+            None,
+            "HeavilyAnnotatedEdgeTarget",
+            None,
+            None,
+            vec![],
+        )
+        .await
+        .expect("create target");
+    let edge = runtime
+        .link(
+            &token,
+            source.id,
+            target.id,
+            EdgeRelation::Extends,
+            1.0,
+            None,
+        )
+        .await
+        .expect("create annotated edge");
+    let edge_id = uuid::Uuid::from(edge.id);
+
+    let notes: Vec<Note> = (0..ANNOTATION_COUNT)
+        .map(|index| {
+            Note::new(
+                "local",
+                "observation",
+                format!("bulk edge annotation {index}"),
+            )
+        })
+        .collect();
+    let now = chrono::Utc::now();
+    let annotation_edges: Vec<Edge> = notes
+        .iter()
+        .map(|note| Edge {
+            id: uuid::Uuid::new_v4().into(),
+            namespace: "local".to_string(),
+            source_id: note.id,
+            target_id: edge_id,
+            relation: EdgeRelation::Annotates,
+            weight: 1.0,
+            created_at: now,
+            updated_at: now,
+            deleted_at: None,
+            metadata: None,
+            target_backend: None,
+        })
+        .collect();
+    runtime
+        .notes(&token)
+        .expect("note store")
+        .upsert_notes(notes)
+        .await
+        .expect("seed annotation notes");
+    runtime
+        .graph(&token)
+        .expect("graph store")
+        .upsert_edges(annotation_edges)
+        .await
+        .expect("seed annotation edges");
+
+    let fetched = pack
+        .dispatch("get", json!({"id": edge_id.to_string()}))
+        .await
+        .expect("get heavily annotated edge");
+    let annotations = fetched["annotations"]
+        .as_array()
+        .expect("edge get must include annotations");
+    assert_eq!(annotations.len(), ANNOTATION_COUNT);
+    assert!(
+        annotations
+            .iter()
+            .all(|annotation| annotation["annotation_edge_id"].is_string()),
+        "every hydrated note must retain its annotates-edge id"
     );
 }
 

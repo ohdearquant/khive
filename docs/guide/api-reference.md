@@ -190,6 +190,12 @@ Fetch any record by UUID (auto-detects entity/note/edge/event/proposal).
 request(ops="get(id=\"3f2a9c1e\")")
 ```
 
+The returned object has the full substrate shape documented under `list` below. For an edge,
+`get` additionally returns `annotations: Note[]`. The array is always present (empty when no live
+notes annotate the edge), and each full note object includes `annotation_edge_id`, the UUID of the
+`annotates` edge connecting that note to the fetched edge. Because `get` is a by-ID operation,
+annotation discovery is namespace-agnostic under ADR-007, matching the fetched edge itself.
+
 ### `list` — Assertive
 
 List records with optional filtering.

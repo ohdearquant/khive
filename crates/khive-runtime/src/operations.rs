@@ -1937,6 +1937,68 @@ impl KhiveRuntime {
         Ok(hits)
     }
 
+    /// Find live `annotates` edges targeting one record without applying a
+    /// namespace predicate.
+    ///
+    /// This is the graph counterpart to the namespace-agnostic by-ID `get`
+    /// contract (ADR-007 Rev 6). Multi-record neighbor traversal remains
+    /// visibility-scoped; callers should use this only after resolving a live
+    /// target through a by-ID operation.
+    pub async fn annotation_neighbors_by_target_id(
+        &self,
+        target_id: Uuid,
+    ) -> RuntimeResult<Vec<NeighborHit>> {
+        let mut reader = self.sql().reader().await?;
+        let rows = reader
+            .query_all(SqlStatement {
+                sql: "SELECT source_id, id, weight FROM graph_edges \
+                      WHERE target_id = ?1 AND relation = ?2 AND deleted_at IS NULL \
+                      ORDER BY weight DESC, source_id ASC"
+                    .to_string(),
+                params: vec![
+                    SqlValue::Text(target_id.to_string()),
+                    SqlValue::Text(EdgeRelation::Annotates.to_string()),
+                ],
+                label: Some("annotations.by_target_id_unfiltered".into()),
+            })
+            .await?;
+
+        rows.into_iter()
+            .map(|row| {
+                let parse_uuid = |name: &str| match row.get(name) {
+                    Some(SqlValue::Text(value)) => Uuid::from_str(value).map_err(|error| {
+                        RuntimeError::Internal(format!("graph_edges.{name} is not a UUID: {error}"))
+                    }),
+                    Some(value) => Err(RuntimeError::Internal(format!(
+                        "graph_edges.{name} has unexpected SQL value {value:?}"
+                    ))),
+                    None => Err(RuntimeError::Internal(format!(
+                        "graph_edges row missing {name}"
+                    ))),
+                };
+                let weight = match row.get("weight") {
+                    Some(SqlValue::Float(value)) => Ok(*value),
+                    Some(value) => Err(RuntimeError::Internal(format!(
+                        "graph_edges.weight has unexpected SQL value {value:?}"
+                    ))),
+                    None => Err(RuntimeError::Internal(
+                        "graph_edges row missing weight".into(),
+                    )),
+                }?;
+
+                Ok(NeighborHit {
+                    node_id: parse_uuid("source_id")?,
+                    edge_id: parse_uuid("id")?,
+                    relation: EdgeRelation::Annotates,
+                    weight,
+                    name: None,
+                    kind: None,
+                    entity_type: None,
+                })
+            })
+            .collect()
+    }
+
     /// Get both-direction neighbors, each tagged with the direction (`Out`/
     /// `In`) it was found in, via a single storage query per visible
     /// namespace instead of two separate direction-scoped `neighbors_with_query`

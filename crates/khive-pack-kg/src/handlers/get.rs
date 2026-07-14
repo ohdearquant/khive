@@ -11,8 +11,7 @@ use khive_runtime::{
     hex_prefix_to_uuid_pattern, NamespaceToken, Resolved, RuntimeError, VerbRegistry,
 };
 use khive_storage::event::Event;
-use khive_storage::types::{Direction, NeighborQuery, SqlRow, SqlStatement, SqlValue};
-use khive_storage::EdgeRelation;
+use khive_storage::types::{SqlRow, SqlStatement, SqlValue};
 use khive_types::EventKind;
 
 use super::common::{
@@ -119,8 +118,8 @@ impl KgPack {
     /// Annotating notes for an edge (#803): the `annotates` convention only
     /// writes a note→edge graph edge — nothing walked it back from the edge
     /// side, so `get(edge_id)` returned the bare edge with no way to reach
-    /// "what annotated this and why". Reuses the existing `In`-direction
-    /// `Annotates` neighbor query (already exposed by `neighbors()`) and
+    /// "what annotated this and why". Discovery follows the namespace-agnostic
+    /// by-ID contract rather than the visible-set neighbor contract, then
     /// hydrates the full note bodies, since a neighbor hit alone carries only
     /// a name/kind summary, not the annotation content.
     async fn fetch_edge_annotations(
@@ -130,16 +129,7 @@ impl KgPack {
     ) -> Result<Vec<Value>, RuntimeError> {
         let hits = self
             .runtime
-            .neighbors_with_query(
-                token,
-                edge_id,
-                NeighborQuery {
-                    direction: Direction::In,
-                    relations: Some(vec![EdgeRelation::Annotates]),
-                    limit: None,
-                    min_weight: None,
-                },
-            )
+            .annotation_neighbors_by_target_id(edge_id)
             .await?;
         if hits.is_empty() {
             return Ok(Vec::new());
