@@ -230,7 +230,7 @@ impl<S: Clone + Send + Sync + Serialize + 'static> CheckpointStore<S>
 }
 
 /// Sort a `Vec<String>` of checkpoint IDs into lexicographic order.
-/// See crates/khive-fold/docs/design.md#test-rationale-notes for why this is
+/// See crates/khive-fold/docs/api/checkpoint.md#ordering for why this is
 /// a standalone helper.
 pub fn sort_checkpoint_keys(mut keys: Vec<String>) -> Vec<String> {
     keys.sort();
