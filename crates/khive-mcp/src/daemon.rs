@@ -2727,6 +2727,42 @@ mod tests {
         sentinel: &'static str,
     }
 
+    #[cfg(unix)]
+    struct ExecutablePermissionsGuard {
+        path: std::path::PathBuf,
+        permissions: std::fs::Permissions,
+    }
+
+    #[cfg(unix)]
+    impl ExecutablePermissionsGuard {
+        fn make_current_exe_unexecutable() -> Self {
+            use std::os::unix::fs::PermissionsExt;
+
+            let path = std::env::current_exe().expect("resolve current test executable");
+            let permissions = std::fs::metadata(&path)
+                .expect("read current test executable metadata")
+                .permissions();
+            assert_ne!(
+                permissions.mode() & 0o111,
+                0,
+                "current test executable must initially have an execute bit"
+            );
+            let mut unexecutable = permissions.clone();
+            unexecutable.set_mode(permissions.mode() & !0o111);
+            std::fs::set_permissions(&path, unexecutable)
+                .expect("make current test executable unexecutable");
+            Self { path, permissions }
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for ExecutablePermissionsGuard {
+        fn drop(&mut self) {
+            std::fs::set_permissions(&self.path, self.permissions.clone())
+                .expect("restore current test executable permissions");
+        }
+    }
+
     #[derive(Clone, Default)]
     struct CapturedLog(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
 
@@ -2938,6 +2974,65 @@ mod tests {
     }
 
     // ── daemon socket round-trip (env-mutating → serial) ─────────────────────
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial]
+    async fn forward_or_spawn_sanitizes_spawn_error_without_local_fallback() {
+        clear_daemon_env();
+        reset_fallback_counters();
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::env::set_var("KHIVE_SOCKET", dir.path().join("khived.sock"));
+        std::env::set_var("KHIVE_PID", dir.path().join("khived.pid"));
+        std::env::set_var("KHIVE_LOCK", dir.path().join("khived.recovery.lock"));
+        std::env::remove_var("KHIVE_NO_DAEMON");
+        std::env::remove_var("KHIVE_DAEMON_STRICT");
+        let disclosure =
+            RespawnDisclosureFixture::new("KHIVE_RESPAWN_LOG_SENTINEL_SPAWN_ERROR_f6a81b23c9");
+        let _permissions = ExecutablePermissionsGuard::make_current_exe_unexecutable();
+
+        let frame = unreachable_daemon_frame(CFG);
+        let (out, events) = forward_with_captured_events(&frame).await;
+        disclosure.assert_output_is_sanitized("spawn-error bridge tracing events", &events);
+        assert!(
+            events.contains("reason=\"respawn_failed\""),
+            "trace must retain the stable reason code: {events}"
+        );
+        assert!(
+            events.contains("failure_category=\"spawn_error\""),
+            "trace must classify the process-start failure without raw detail: {events}"
+        );
+        assert!(
+            events.contains("os_error_code=Some(13)"),
+            "trace diagnostic must be the numeric permission-denied code only: {events}"
+        );
+        assert!(
+            !events.contains("Permission denied") && !events.contains("os error"),
+            "trace must not expose the raw OS error text: {events}"
+        );
+
+        match out {
+            Some(Err(error)) => {
+                disclosure.assert_caller_output_is_sanitized(&error);
+                let caller_output =
+                    serde_json::to_string(&error).expect("serialize caller MCP error");
+                assert!(
+                    !caller_output.contains("Permission denied")
+                        && !caller_output.contains("os error"),
+                    "caller must not receive the raw OS error text: {caller_output}"
+                );
+            }
+            other => panic!(
+                "a confirmed process-start failure must return respawn_failed instead of \
+                 permitting local dispatch, got {other:?}"
+            ),
+        }
+        assert_eq!(fallback_total(), 0);
+
+        reset_fallback_counters();
+        clear_daemon_env();
+        std::env::remove_var("KHIVE_LOCK");
+    }
 
     #[tokio::test]
     #[serial]
