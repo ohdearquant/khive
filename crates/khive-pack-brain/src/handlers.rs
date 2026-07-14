@@ -1455,6 +1455,14 @@ impl BrainPack {
             };
 
             let namespace = token.namespace().as_str().to_string();
+            // ADR-096 per-request identity: stamp the resolved caller actor,
+            // not a hardcoded pack name — matches the `kind:id` convention
+            // the generic Audit event already uses (khive-runtime pack.rs
+            // `build_audit_storage_event`). `ActorRef::anonymous()` resolves
+            // to the explicit `"anonymous:local"` string rather than
+            // silently mislabeling the event, so unresolved-actor calls are
+            // still distinguishable from configured caller attribution.
+            let actor_label = format!("{}:{}", token.actor().kind, token.actor().id);
             // `apply_fold_gate_and_append_event`'s `build_event` closure is
             // now required to be `'static` (ADR-067 Component A, Fork C
             // slice 2 — it is boxed into an `AtomicUnitOp` and may run
@@ -1463,6 +1471,7 @@ impl BrainPack {
             // separate `namespace_for_event` clone avoids conflicting with
             // the `&namespace` borrow passed as this call's own argument.
             let namespace_for_event = namespace.clone();
+            let actor_label_for_event = actor_label.clone();
             let base_data_for_event = base_data.clone();
             let outcome = crate::fold_gate::apply_fold_gate_and_append_event(
                 sql.as_ref(),
@@ -1490,7 +1499,7 @@ impl BrainPack {
                         "brain.feedback",
                         khive_types::EventKind::FeedbackExplicit,
                         target_substrate,
-                        "brain",
+                        actor_label_for_event,
                     )
                     .with_target(target)
                     .with_payload(data)
@@ -1532,7 +1541,7 @@ impl BrainPack {
                 "brain.feedback",
                 khive_types::EventKind::FeedbackExplicit,
                 target_substrate,
-                "brain",
+                format!("{}:{}", token.actor().kind, token.actor().id),
             )
             .with_target(target)
             .with_payload(base_data)
