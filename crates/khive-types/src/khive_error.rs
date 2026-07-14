@@ -263,11 +263,8 @@ impl Details {
         Self::build(ordinary, total_ordinary, collisions)
     }
 
-    /// Bound `ordinary` (already capped at 8 entries, `total_ordinary` the
-    /// true count before capping) plus a reserved-key `collisions` count to
-    /// the wire shape: at most 8 entries, with a [`DETAILS_TRUNCATED_KEY`]
-    /// indicator appended whenever anything was dropped (either overflow
-    /// past 7 ordinary pairs, or a stripped reserved-key collision).
+    /// Bounding/truncation core. See
+    /// crates/khive-types/docs/pack-error-internals.md#detailsbuild--boundingtruncation-algorithm
     fn build(
         ordinary: alloc::vec::Vec<(Cow<'static, str>, Cow<'static, str>)>,
         total_ordinary: usize,
@@ -345,25 +342,11 @@ impl<'de> Deserialize<'de> for Details {
             }
 
             fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Details, A::Error> {
-                // Drain to completion regardless of size (#487: a naive early-exit
-                // once 8 entries are collected leaves trailing map bytes unconsumed
-                // and corrupts the surrounding deserializer). Only the first 8
-                // ordinary pairs are retained in memory as they arrive; pairs
-                // beyond that are counted, not stored, so an adversarially
-                // large map can't inflate memory.
-                //
-                // `DETAILS_TRUNCATED_KEY` is reserved (PR #549):
-                // it is never stored as an ordinary entry. Instead we track
-                // whether the wire map looks exactly like our own truncated
-                // serialization — the reserved key appears exactly once, as
-                // the very last pair, immediately after exactly 7 ordinary
-                // pairs, with a value that parses as a count — and if so,
-                // restore that as the trusted drop count (round-trip of a
-                // `Details` we truncated ourselves). Any other occurrence
-                // (wrong position, duplicated, or paired with an ordinary
-                // count that isn't 7) is treated as a client-supplied
-                // collision: stripped and folded into `Details::build`'s
-                // drop accounting like any other reserved-key collision.
+                // Drains to completion regardless of size (fixes #487: early-exit
+                // at 8 entries left trailing map bytes unconsumed). Detects a
+                // round-tripped self-truncated map vs. a client-supplied
+                // DETAILS_TRUNCATED_KEY collision — see
+                // crates/khive-types/docs/pack-error-internals.md#details-deserialization--round-trip-detection-of-self-truncated-maps
                 let mut ordinary: alloc::vec::Vec<(Cow<'static, str>, Cow<'static, str>)> =
                     alloc::vec::Vec::new();
                 let mut total_ordinary: usize = 0;
