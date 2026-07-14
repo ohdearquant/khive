@@ -1,5 +1,5 @@
 //! `resolve` verb handler (unified-verb draft ADR, Slice 1). Thin and read-only — see
-//! `docs/handlers-common.md#resolve-handler-handlersresolveers`.
+//! `docs/api/resolve-verb.md#handler-shape`.
 
 use serde_json::{json, Value};
 
@@ -29,7 +29,7 @@ impl KgPack {
         let ring = registry.reference_ring();
 
         // #849: bare "entity" means no kind filter, not a literal entities.kind value.
-        // See docs/handlers-common.md#resolve-handler-handlersresolveers.
+        // See docs/api/resolve-verb.md#handler-shape.
         let entity_kind = match &p.kind {
             Some(raw) => match resolve_kind_spec(raw, registry)? {
                 KindSpec::Entity { specific } => specific,

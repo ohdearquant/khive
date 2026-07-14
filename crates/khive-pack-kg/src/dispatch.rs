@@ -55,7 +55,7 @@ impl PackRuntime for KgPack {
 
     async fn warm(&self) {
         // ADR-103 Amendment 1 Part 2: mint an attribution token for daemon-startup
-        // telemetry (see docs/dispatch-tests.md#warm-token-minting); a mint failure
+        // telemetry (see docs/api/pack-lifecycle.md#warm-telemetry-adr-103-amendment-1-part-2); a mint failure
         // only drops telemetry, warmup still runs.
         let token = match self.runtime.authorize(khive_runtime::Namespace::local()) {
             Ok(token) => Some(token),
@@ -137,7 +137,7 @@ impl PackRuntime for KgPack {
     ) {
         // Installs on the runtime this pack OWNS (`self.runtime`, not the caller-supplied
         // one), composed over every loaded pack's ENTITY_TYPES layered on the builtin
-        // registry. See docs/dispatch-tests.md#entity-type-validator-installation.
+        // registry. See docs/api/pack-lifecycle.md#entity-type-validator-installation.
         let composed = Arc::new(crate::entity_type_registry::EntityTypeRegistry::with_extra(
             pack_entity_types.iter().cloned(),
         ));
@@ -238,7 +238,7 @@ mod tests {
 
     use super::*;
 
-    /// By-ID get is namespace-agnostic; namespace on the record reflects the creator, not the caller. See `docs/dispatch-tests.md`.
+    /// By-ID get is namespace-agnostic; namespace on the record reflects the creator, not the caller. See `docs/api/namespace-dispatch.md`.
     #[tokio::test]
     async fn kg_create_entity_honors_caller_namespace() {
         let rt = KhiveRuntime::memory().expect("in-memory runtime");
@@ -333,7 +333,7 @@ mod tests {
         );
     }
 
-    /// Two creates with no explicit namespace land in the same `local` namespace. See `docs/dispatch-tests.md`.
+    /// Two creates with no explicit namespace land in the same `local` namespace. See `docs/api/namespace-dispatch.md`.
     #[tokio::test]
     async fn kg_oss_default_namespace_entities_colocate() {
         let rt = KhiveRuntime::memory().expect("in-memory runtime");
@@ -378,7 +378,7 @@ mod tests {
             .expect("Beta must be retrievable via local token");
     }
 
-    /// ADR-007 Rev 4 Rule 3b: default list read scope widens to `['local'] ∪ visible_namespaces`. See `docs/dispatch-tests.md`.
+    /// ADR-007 Rev 4 Rule 3b: default list read scope widens to `['local'] ∪ visible_namespaces`. See `docs/api/namespace-dispatch.md`.
     #[tokio::test]
     async fn dispatch_list_honors_configured_visible_namespaces_adr007_rev4() {
         let rt = KhiveRuntime::memory().expect("in-memory runtime");
@@ -465,7 +465,7 @@ mod tests {
         );
     }
 
-    /// ADR-007 Rev 4 backward-compat: unset visible_namespaces scopes list reads to 'local' only. See `docs/dispatch-tests.md`.
+    /// ADR-007 Rev 4 backward-compat: unset visible_namespaces scopes list reads to 'local' only. See `docs/api/namespace-dispatch.md`.
     #[tokio::test]
     async fn dispatch_list_empty_visible_namespaces_scopes_to_local_only_adr007_rev4() {
         let rt = KhiveRuntime::memory().expect("in-memory runtime");
@@ -535,7 +535,7 @@ mod tests {
         );
     }
 
-    /// ADR-007 Rev 4: 'local' is always in the default read scope even if not in visible_namespaces. See `docs/dispatch-tests.md`.
+    /// ADR-007 Rev 4: 'local' is always in the default read scope even if not in visible_namespaces. See `docs/api/namespace-dispatch.md`.
     #[tokio::test]
     async fn dispatch_list_local_always_included_when_visible_ns_set_adr007_rev4() {
         let rt = KhiveRuntime::memory().expect("in-memory runtime");
@@ -599,7 +599,7 @@ mod tests {
         );
     }
 
-    /// ADR-007 Rev 4: an explicit `namespace=` param scopes precisely, never widened to the union set. See `docs/dispatch-tests.md`.
+    /// ADR-007 Rev 4: an explicit `namespace=` param scopes precisely, never widened to the union set. See `docs/api/namespace-dispatch.md`.
     #[tokio::test]
     async fn dispatch_explicit_namespace_param_is_precise_not_widened_adr007_rev4() {
         let rt = KhiveRuntime::memory().expect("in-memory runtime");
@@ -666,7 +666,7 @@ mod tests {
         );
     }
 
-    /// ADR-007 Rev 4 Rule 0: a non-local `default_namespace` actor config never routes write/read storage. See `docs/dispatch-tests.md`.
+    /// ADR-007 Rev 4 Rule 0: a non-local `default_namespace` actor config never routes write/read storage. See `docs/api/namespace-dispatch.md`.
     #[tokio::test]
     async fn non_local_actor_config_does_not_route_storage_adr007_rule0() {
         let rt = KhiveRuntime::memory().expect("in-memory runtime");
@@ -751,9 +751,9 @@ mod tests {
     }
 
     // ---- Handler-level regression tests for issue #225 (filter-pushdown cliff) ----
-    // See docs/dispatch-tests.md#issue-225-scan-cliff-mechanics for the budget math.
+    // See docs/api/scan-cliff.md#the-cliff-mechanics for the budget math.
 
-    /// Issue #225 regression: entity tag filter finds a match past the FTS scan cliff via predicate pushdown. See `docs/dispatch-tests.md`.
+    /// Issue #225 regression: entity tag filter finds a match past the FTS scan cliff via predicate pushdown. See `docs/api/scan-cliff.md`.
     #[tokio::test]
     async fn handler_search_entity_tag_filter_beyond_scan_cliff() {
         let rt = KhiveRuntime::memory().expect("in-memory runtime");
@@ -831,7 +831,7 @@ mod tests {
         );
     }
 
-    /// Issue #225 regression: entity properties filter finds a match past the FTS scan cliff. See `docs/dispatch-tests.md`.
+    /// Issue #225 regression: entity properties filter finds a match past the FTS scan cliff. See `docs/api/scan-cliff.md`.
     #[tokio::test]
     async fn handler_search_entity_props_filter_beyond_scan_cliff() {
         let rt = KhiveRuntime::memory().expect("in-memory runtime");
@@ -903,7 +903,7 @@ mod tests {
         );
     }
 
-    /// Issue #225 regression: note tag filter finds a match past the FTS scan cliff. See `docs/dispatch-tests.md`.
+    /// Issue #225 regression: note tag filter finds a match past the FTS scan cliff. See `docs/api/scan-cliff.md`.
     #[tokio::test]
     async fn handler_search_note_tag_filter_beyond_scan_cliff() {
         let rt = KhiveRuntime::memory().expect("in-memory runtime");
@@ -973,7 +973,7 @@ mod tests {
         );
     }
 
-    /// Issue #225 regression: note properties filter finds a match past the FTS scan cliff. See `docs/dispatch-tests.md`.
+    /// Issue #225 regression: note properties filter finds a match past the FTS scan cliff. See `docs/api/scan-cliff.md`.
     #[tokio::test]
     async fn handler_search_note_props_filter_beyond_scan_cliff() {
         let rt = KhiveRuntime::memory().expect("in-memory runtime");
@@ -1094,9 +1094,9 @@ mod tests {
     }
 
     // ---- `resolve` verb (unified-verb draft ADR, Slice 1) ----
-    // See docs/dispatch-tests.md#resolve-ring-admission-boundary.
+    // See docs/api/resolve-verb.md#test-fixture-notes.
 
-    /// A UUID ref resolves via id-string passthrough regardless of prior ring exposure. See `docs/dispatch-tests.md`.
+    /// A UUID ref resolves via id-string passthrough regardless of prior ring exposure. See `docs/api/resolve-verb.md`.
     #[tokio::test]
     async fn resolve_id_string_passthrough_through_dispatch() {
         let rt = KhiveRuntime::memory().expect("in-memory runtime");
@@ -1131,7 +1131,7 @@ mod tests {
         );
     }
 
-    /// `create`'s id admits to the ring under its name; a same-actor `resolve(refs=[name])` hits the ring, not hybrid search. See `docs/dispatch-tests.md`.
+    /// `create`'s id admits to the ring under its name; a same-actor `resolve(refs=[name])` hits the ring, not hybrid search. See `docs/api/resolve-verb.md`.
     #[tokio::test]
     async fn resolve_via_recently_referenced_ring_after_create() {
         let rt = KhiveRuntime::memory().expect("in-memory runtime");
@@ -1167,7 +1167,7 @@ mod tests {
         );
     }
 
-    /// Two ring entries sharing a name resolve as `Ambiguous`, never a silent pick. See `docs/dispatch-tests.md`.
+    /// Two ring entries sharing a name resolve as `Ambiguous`, never a silent pick. See `docs/api/resolve-verb.md`.
     #[tokio::test]
     async fn resolve_ambiguous_on_duplicate_ring_names() {
         let rt = KhiveRuntime::memory().expect("in-memory runtime");
@@ -1202,7 +1202,7 @@ mod tests {
         assert_eq!(candidates.len(), 2);
     }
 
-    /// A ref matching nothing in the ring or hybrid search is `NotFound`. See `docs/dispatch-tests.md`.
+    /// A ref matching nothing in the ring or hybrid search is `NotFound`. See `docs/api/resolve-verb.md`.
     #[tokio::test]
     async fn resolve_not_found_when_nothing_matches() {
         let rt = KhiveRuntime::memory().expect("in-memory runtime");
@@ -1225,7 +1225,7 @@ mod tests {
         );
     }
 
-    /// `search` result-sets never admit to the ring (gate condition, 2026-07-09). See `docs/dispatch-tests.md`.
+    /// `search` result-sets never admit to the ring (gate condition, 2026-07-09). See `docs/api/resolve-verb.md`.
     #[tokio::test]
     async fn resolve_search_result_sets_never_populate_the_ring() {
         let rt = KhiveRuntime::memory().expect("in-memory runtime");
@@ -1281,7 +1281,7 @@ mod tests {
         );
     }
 
-    /// Ring admission and lookup are keyed identically even under a non-local `default_namespace`. See `docs/dispatch-tests.md`.
+    /// Ring admission and lookup are keyed identically even under a non-local `default_namespace`. See `docs/api/resolve-verb.md`.
     #[tokio::test]
     async fn resolve_via_ring_survives_non_local_default_namespace() {
         let rt = KhiveRuntime::memory().expect("in-memory runtime");
@@ -1318,7 +1318,7 @@ mod tests {
         );
     }
 
-    /// Id-string passthrough is entity-only: a note id-string is `NotFound` through `resolve`. See `docs/dispatch-tests.md`.
+    /// Id-string passthrough is entity-only: a note id-string is `NotFound` through `resolve`. See `docs/api/resolve-verb.md`.
     #[tokio::test]
     async fn resolve_id_string_passthrough_is_entity_only() {
         let rt = KhiveRuntime::memory().expect("in-memory runtime");
@@ -1374,7 +1374,7 @@ mod tests {
         );
     }
 
-    /// `resolve` is registered as a public verb and appears in `verbs()`. See `docs/dispatch-tests.md`.
+    /// `resolve` is registered as a public verb and appears in `verbs()`. See `docs/api/resolve-verb.md`.
     #[tokio::test]
     async fn resolve_appears_in_verbs_introspection() {
         let rt = KhiveRuntime::memory().expect("in-memory runtime");
@@ -1398,9 +1398,9 @@ mod tests {
     }
 
     // ---- exact-name storage lookup (stage 3, #849) ----
-    // See docs/dispatch-tests.md#exact-name-storage-lookup-fixtures.
+    // See docs/api/resolve-verb.md#test-fixture-notes.
 
-    /// An unreferenced existing entity resolves via exact-name storage lookup at `EXACT_NAME_CONFIDENCE` (0.98). See `docs/dispatch-tests.md`.
+    /// An unreferenced existing entity resolves via exact-name storage lookup at `EXACT_NAME_CONFIDENCE` (0.98). See `docs/api/resolve-verb.md`.
     #[tokio::test]
     async fn resolve_exact_name_hit_resolves_high_confidence() {
         let rt = KhiveRuntime::memory().expect("in-memory runtime");
@@ -1436,7 +1436,7 @@ mod tests {
         );
     }
 
-    /// Exact-name storage lookup is Unicode-safe and untokenized: CJK/spaced names resolve at full confidence. See `docs/dispatch-tests.md`.
+    /// Exact-name storage lookup is Unicode-safe and untokenized: CJK/spaced names resolve at full confidence. See `docs/api/resolve-verb.md`.
     #[tokio::test]
     async fn resolve_exact_name_handles_cjk_and_spaces() {
         let rt = KhiveRuntime::memory().expect("in-memory runtime");
@@ -1515,7 +1515,7 @@ mod tests {
         );
     }
 
-    /// The exact-name tier is case-sensitive; a case-only variant falls back to hybrid search, not 0.98 confidence. See `docs/dispatch-tests.md`.
+    /// The exact-name tier is case-sensitive; a case-only variant falls back to hybrid search, not 0.98 confidence. See `docs/api/resolve-verb.md`.
     #[tokio::test]
     async fn resolve_case_variant_uses_hybrid_fallback() {
         let rt = KhiveRuntime::memory().expect("in-memory runtime");
@@ -1561,7 +1561,7 @@ mod tests {
         );
     }
 
-    /// Two entities sharing an exact name resolve as `Ambiguous`, mirroring the ring's contract. See `docs/dispatch-tests.md`.
+    /// Two entities sharing an exact name resolve as `Ambiguous`, mirroring the ring's contract. See `docs/api/resolve-verb.md`.
     #[tokio::test]
     async fn resolve_exact_name_ambiguous_on_duplicate_names() {
         let rt = KhiveRuntime::memory().expect("in-memory runtime");
@@ -1601,7 +1601,7 @@ mod tests {
         assert_eq!(candidates.len(), 2);
     }
 
-    /// A ref with no exact-name match falls through to hybrid search at lower confidence. See `docs/dispatch-tests.md`.
+    /// A ref with no exact-name match falls through to hybrid search at lower confidence. See `docs/api/resolve-verb.md`.
     #[tokio::test]
     async fn resolve_exact_name_miss_falls_through_to_hybrid_search() {
         let rt = KhiveRuntime::memory().expect("in-memory runtime");
@@ -1651,7 +1651,7 @@ mod tests {
         );
     }
 
-    /// A soft-deleted entity is invisible to the exact-name storage lookup. See `docs/dispatch-tests.md`.
+    /// A soft-deleted entity is invisible to the exact-name storage lookup. See `docs/api/resolve-verb.md`.
     #[tokio::test]
     async fn resolve_exact_name_soft_deleted_entity_not_matched() {
         let rt = KhiveRuntime::memory().expect("in-memory runtime");
@@ -1689,7 +1689,7 @@ mod tests {
         );
     }
 
-    /// A granular `kind` filter disambiguates same-name entities of different kinds instead of `Ambiguous`. See `docs/dispatch-tests.md`.
+    /// A granular `kind` filter disambiguates same-name entities of different kinds instead of `Ambiguous`. See `docs/api/resolve-verb.md`.
     #[tokio::test]
     async fn resolve_exact_name_respects_kind_filter() {
         let rt = KhiveRuntime::memory().expect("in-memory runtime");
@@ -1743,7 +1743,7 @@ mod tests {
         );
     }
 
-    /// `resolve`'s `kind` param is entity-only; a note kind is rejected with a clear error. See `docs/dispatch-tests.md`.
+    /// `resolve`'s `kind` param is entity-only; a note kind is rejected with a clear error. See `docs/api/resolve-verb.md`.
     #[tokio::test]
     async fn resolve_kind_rejects_non_entity_kind() {
         let rt = KhiveRuntime::memory().expect("in-memory runtime");

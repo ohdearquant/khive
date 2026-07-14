@@ -556,7 +556,7 @@ fn valid_relations_unsupported_pair_returns_empty() {
     );
 }
 
-// Issue #543/#621: generative hint/validator divergence sweep. See docs/handlers-tests.md.
+// Issue #543/#621: generative hint/validator divergence sweep. See docs/api/entity-kind-validation.md#test-coverage-hintvalidator-divergence-sweep-issue-543.
 #[tokio::test]
 async fn valid_relations_hint_matches_real_validator_acceptance_across_all_entity_kind_pairs() {
     use crate::vocab::EntityKind as KgEntityKind;
@@ -572,7 +572,7 @@ async fn valid_relations_hint_matches_real_validator_acceptance_across_all_entit
         let token = rt.authorize(Namespace::local()).unwrap();
         let mut accepted = Vec::new();
         for relation in EdgeRelation::ALL {
-            // annotates is entity-invalid; see docs/handlers-tests.md.
+            // annotates is entity-invalid; see docs/api/entity-kind-validation.md.
             if relation == EdgeRelation::Annotates {
                 continue;
             }

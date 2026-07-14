@@ -5,7 +5,7 @@ use khive_types::{EdgeEndpointRule, EdgeRelation, EndpointKind, HandlerDef, Pack
 use crate::handler_defs::KG_HANDLERS;
 
 /// Pack-extensible edge endpoint rules (person↔org, person↔project, org↔org).
-/// See `docs/design.md#kg_edge_rules`.
+/// See `docs/api/edge-rules-pack-kg.md`.
 pub(crate) static KG_EDGE_RULES: [EdgeEndpointRule; 9] = [
     EdgeEndpointRule {
         relation: EdgeRelation::PartOf,

@@ -75,72 +75,8 @@ It is the first-party pack shipped with the khive binary.
 - **Proposal CAS miss**: returns success with `cas_hit: false`; no duplicate
   events are emitted.
 
-## `KG_EDGE_RULES` (pack.rs)
+## Edge rules and the `context` verb
 
-Adds person→org, person→project, and org→org pairs to the base edge-endpoint allowlist.
-The person→project rows mirror person→org (issue #60): a person is a member of a project
-the same way they are a member of an org, so the same member-not-component semantic
-stretch accepted for person→org is extended here.
-
-Test rationale (`pack.rs::tests`):
-
-- `kg_pack_edge_rules_contain_no_duplicate_triples`: a duplicated `(relation, source,
-  target)` triple would be a no-op additive rule (adding the same endpoint pair a second
-  time changes nothing) and is a sign of a copy-paste error. Semantic similarity between
-  relations (e.g. multiple relations accepting `org→org`) is expected and correct; the
-  test checks only for exact-triple duplicates, not for shared per-relation endpoint sets.
-- `kg_pack_edge_rules_cover_expected_relations`: a deliberate-change tripwire over the
-  live `KG_EDGE_RULES`, complementing the ADR-076 §D2 non-redundancy certificate in the
-  certificate test suite. A change to the set of relations that get pack-level endpoint
-  extensions should be a deliberate, reviewed decision — not an accidental side effect.
-
-## `context` verb internals (handlers/context.rs)
-
-`relations_all_symmetric` mirrors `normalize_symmetric_direction` in
-`khive-runtime/src/operations.rs` (private to that crate) — kept in lockstep because
-`neighbors_with_query` forces `Direction::Both` under this exact condition regardless of
-the direction actually requested, and the handler must know that happened to tag
-direction correctly instead of issuing a second, redundant call.
-
-`fetch_directed_neighbors` fetches up to `fanout` neighbors of `node_id`, each tagged with
-its actual direction relative to `node_id` — it can't just trust a `direction` field on a
-plain `NeighborHit` because `neighbors_with_query_directed` only ever tags hits `Out`/`In`
-(`Both` never appears in a `DirectedNeighborHit`).
-
-`assemble_within_budget` is a deterministic-order budget walk: it appends anchor entity
-records and their neighbor records (each already produced in final display order) until
-the next record's compact-JSON Unicode-scalar length would push the running total past
-`budget`. Returns (assembled anchors, truncated, dropped anchors, dropped neighbors). A
-budget exactly equal to the cumulative size does NOT truncate — the stop condition is
-"would push the running total PAST budget", so a record landing exactly on the boundary
-still fits.
-
-### `handle_context` stage notes
-
-- **Directed-neighbor fetch**: a single UNION ALL query for both directions (ADR-089
-  context-verb optimization) instead of two separate direction-scoped calls — halves the
-  storage neighbor SELECT count for this branch. The op already returns hits in global
-  weight-descending, node_id-ascending order truncated to `fanout`, so no local
-  re-sort/truncate is needed.
-- **Stage 1 (anchor resolution)**: `entity_ids` is an explicit entity-anchor contract
-  (ADR-089 §1: "honored in full"). `resolve_uuid_async` accepts any syntactically valid
-  UUID without checking substrate or existence, so a random UUID, a note UUID, or an edge
-  UUID would otherwise resolve here and then silently vanish from the response in Stage
-  4's lenient "missing entity" fallback. The handler fails loudly instead: one batch
-  existence check names every offending id.
-- **Query-anchor overfetch**: fetches a larger candidate window than `limit` so that
-  anchors which collapse into `entity_ids` duplicates don't under-fill the query leg —
-  ADR-089 §1 promises search "fills up to `limit` additional anchors" after explicit ids,
-  which requires looking past the first `limit` hits when some of them overlap explicit
-  anchors. Bounded by a documented cap so a pathological overlap can't turn into an
-  unbounded search.
-- **Stage 2 (expansion), hop-1 stratum**: one stratum across all hop-1 parents under an
-  anchor, sorted by weight desc, then neighbor id, then parent id (the last key only
-  arbitrates true ties — same neighbor, same weight, different parent — so the "first
-  discovering parent" is deterministic).
-- **Stage 4 (assembly)**: explicit `entity_ids` anchors are already verified to exist in
-  Stage 1; the Stage 4 existence check only guards the residual race of an anchor deleted
-  concurrently between resolution and this fetch, or a neighbor entity that vanished the
-  same way. Neighbors get the same lenient "missing node reads as absent" convention
-  `neighbors_with_query` already applies (it returns an empty Vec rather than erroring on
-  a nonexistent `node_id`) — they never enter the budget accounting.
+The kg pack's own additive edge-endpoint extensions and the `context` verb's staged
+anchor/neighbor assembly are both function-specific technical reference material — see
+[api/edge-rules-pack-kg.md](api/edge-rules-pack-kg.md) and [api/context-verb.md](api/context-verb.md).

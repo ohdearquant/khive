@@ -74,7 +74,7 @@ struct NeighborRecord {
     via: Option<Uuid>,
 }
 
-/// True iff every relation in the filter is symmetric. See `docs/design.md#context-verb`.
+/// True iff every relation in the filter is symmetric. See `docs/api/context-verb.md`.
 fn relations_all_symmetric(relations: Option<&[EdgeRelation]>) -> bool {
     match relations {
         None => false,
@@ -86,7 +86,7 @@ fn relations_all_symmetric(relations: Option<&[EdgeRelation]>) -> bool {
 }
 
 /// Fetch up to `fanout` neighbors of `node_id`, each tagged with its actual direction.
-/// See `docs/design.md#context-verb`.
+/// See `docs/api/context-verb.md`.
 async fn fetch_directed_neighbors(
     runtime: &KhiveRuntime,
     token: &NamespaceToken,
@@ -154,7 +154,7 @@ async fn fetch_directed_neighbors(
                 .collect())
         }
         Direction::Both => {
-            // ADR-089 UNION ALL optimization; see docs/design.md#context-verb-internals.
+            // ADR-089 UNION ALL optimization; see docs/api/context-verb.md.
             let hits = runtime
                 .neighbors_with_query_directed(
                     token,
@@ -249,7 +249,7 @@ impl KgPack {
             }
         }
         // ADR-089 §1 explicit-anchor contract; fail loudly on bad ids instead of
-        // silently vanishing them in Stage 4. See docs/design.md#context-verb-internals.
+        // silently vanishing them in Stage 4. See docs/api/context-verb.md.
         if !explicit_ids.is_empty() {
             let mut dedup_explicit = explicit_ids.clone();
             dedup_explicit.sort_unstable();
@@ -297,7 +297,7 @@ impl KgPack {
         if has_query {
             let q = p.query.as_deref().unwrap();
             // Overfetch so entity_ids-overlap doesn't under-fill (ADR-089 §1); see
-            // docs/design.md#context-verb-internals.
+            // docs/api/context-verb.md.
             const QUERY_FILL_WINDOW_MULTIPLIER: u32 = 4;
             let fetch_n = limit
                 .saturating_add(explicit_ids.len() as u32)
@@ -378,7 +378,7 @@ impl KgPack {
                         hop2_pool.push((*parent, id, relation, weight, dir));
                     }
                 }
-                // Deterministic hop-1 stratum ordering; see docs/design.md#context-verb-internals.
+                // Deterministic hop-1 stratum ordering; see docs/api/context-verb.md.
                 hop2_pool.sort_by(|a, b| {
                     b.3.partial_cmp(&a.3)
                         .unwrap_or(std::cmp::Ordering::Equal)
@@ -449,7 +449,7 @@ impl KgPack {
 
         // ---- Stage 4: assembly with budget enforcement ----
         let t4 = if prof { Some(Instant::now()) } else { None };
-        // Guards only the residual delete race; see docs/design.md#context-verb-internals.
+        // Guards only the residual delete race; see docs/api/context-verb.md.
         let mut blocks: Vec<AnchorBlock> = Vec::with_capacity(anchor_ids.len());
         for (i, anchor) in anchor_ids.iter().enumerate() {
             let Some(e) = entity_meta.get(anchor) else {
@@ -504,7 +504,7 @@ impl KgPack {
     }
 }
 
-/// Deterministic-order budget walk over anchors + neighbors. See `docs/design.md#context-verb`.
+/// Deterministic-order budget walk over anchors + neighbors. See `docs/api/context-verb.md`.
 fn assemble_within_budget(
     blocks: &[AnchorBlock],
     budget: usize,

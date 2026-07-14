@@ -83,7 +83,7 @@ pub(crate) fn validate_entity_type(
         .parse::<khive_types::EntityKind>()
         .map_err(|_| RuntimeError::InvalidInput(format!("unknown entity kind {kind_name:?}")))?;
     // ADR-017 additive composition (not `EntityTypeRegistry::global()`); see
-    // docs/handlers-common.md#validate_entity_type.
+    // docs/api/entity-kind-validation.md#validate_entity_type.
     let composed = EntityTypeRegistry::with_extra(registry.all_entity_types());
     let resolved = composed.resolve(kind, Some(raw))?;
     Ok(resolved.entity_type)
@@ -93,7 +93,7 @@ pub(crate) fn validate_entity_type(
 
 /// Resolved shape of a `kind` discriminator string: which substrate (entity, note,
 /// edge, event, proposal) it names, plus the specific granular kind if any.
-/// See `docs/handlers-common.md` for why this is `pub` rather than `pub(crate)`.
+/// See `docs/api/entity-kind-validation.md#adr-099-b3-pub-widening-rationale` for why this is `pub` rather than `pub(crate)`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum KindSpec {
     Entity { specific: Option<String> },
@@ -279,7 +279,7 @@ pub(crate) async fn resolve_uuid_async(
 ///
 /// [`RuntimeError::InvalidInput`] if a hex-prefix matches no record;
 /// [`RuntimeError::NotFound`]/[`RuntimeError::Ambiguous`] from name resolution.
-/// See `docs/handlers-common.md` for the ADR-099 B3 pub-widening rationale.
+/// See `docs/api/entity-kind-validation.md#adr-099-b3-pub-widening-rationale`.
 pub async fn resolve_uuid_unfiltered(
     s: &str,
     runtime: &KhiveRuntime,
@@ -415,7 +415,7 @@ pub(crate) fn validate_weight(weight: Option<f64>) -> Result<f64, RuntimeError> 
 
 /// Relations valid for an entity-kind pair, derived from the same allowlist +
 /// pack `EDGE_RULES` sources the real link validator consults (issue #543).
-/// See `docs/handlers-common.md#valid_relations_for_entity_pair`.
+/// See `docs/api/entity-kind-validation.md#valid_relations_for_entity_pair`.
 pub(crate) fn valid_relations_for_entity_pair(
     runtime: &KhiveRuntime,
     src_kind: &str,
@@ -617,7 +617,7 @@ pub(crate) fn deser<T: serde::de::DeserializeOwned>(params: Value) -> Result<T, 
 /// Convert `created_at`/`updated_at`/`deleted_at`/`expires_at` fields on a JSON entity
 /// object from epoch-micros integers to ISO-8601 strings, in place. Fields that are
 /// absent or already non-integer are left untouched.
-/// See `docs/handlers-common.md` for the ADR-099 B3 pub-widening rationale.
+/// See `docs/api/entity-kind-validation.md#adr-099-b3-pub-widening-rationale`.
 pub fn normalize_entity_timestamps(mut v: Value) -> Value {
     if let Some(obj) = v.as_object_mut() {
         for field in &["created_at", "updated_at", "deleted_at", "expires_at"] {
@@ -720,7 +720,7 @@ pub(crate) fn tags_match_any(entity_tags: &[String], wanted: &[String]) -> bool 
 
 /// Merge the top-level `tags` create-param into `properties["tags"]` for a note
 /// (#747). A non-empty `tags` param always wins over any `properties["tags"]` the
-/// caller also supplied. See `docs/handlers-common.md#merge_note_tags`.
+/// caller also supplied. See `docs/api/note-crud-fields.md#merge_note_tags`.
 pub(crate) fn merge_note_tags(
     properties: Option<Value>,
     tags: Option<Vec<String>>,
