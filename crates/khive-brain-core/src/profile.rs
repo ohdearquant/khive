@@ -388,7 +388,7 @@ mod tests {
     }
 
     /// ADR-048 Phase-1 gate: ESS cap convergence must shift the mean by ≥0.3.
-    /// See crates/khive-brain-core/docs/testing-notes.md#profilersadr048_ess_cap_mean_shift_ge_0_3-adr-048-phase-1-gate
+    /// See crates/khive-brain-core/docs/testing-strategy.md#profilersadr048_ess_cap_mean_shift_ge_0_3-adr-048-phase-1-gate
     #[test]
     fn adr048_ess_cap_mean_shift_ge_0_3() {
         let mut state = BalancedRecallState::new(200);
@@ -422,7 +422,7 @@ mod tests {
     }
 
     /// BRAINCORE-AUD-001: legacy (version 0) oversized restore is bounded.
-    /// See crates/khive-brain-core/docs/testing-notes.md#profilerslegacy_entity_posteriors_restore_uses_deterministic_order_and_capacity-braincore-aud-001
+    /// See crates/khive-brain-core/docs/testing-strategy.md#profilerslegacy_entity_posteriors_restore_uses_deterministic_order_and_capacity-braincore-aud-001
     #[test]
     fn legacy_entity_posteriors_restore_uses_deterministic_order_and_capacity() {
         let capacity = 2;

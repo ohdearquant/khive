@@ -13,7 +13,7 @@ use crate::section_state::{SectionPosteriorSnapshot, SectionPosteriorState};
 ///
 /// This is the canonical fallback selection key: earliest creation time wins,
 /// with alphabetical `id` as a tiebreaker. See
-/// crates/khive-brain-core/docs/design-notes.md#sort_fallback_candidates--why-its-a-standalone-helper
+/// crates/khive-brain-core/docs/design-rationale.md#sort_fallback_candidates--why-its-a-standalone-helper
 /// for why this is a standalone helper rather than inlined.
 pub fn sort_fallback_candidates(candidates: &mut [&ProfileRecord]) {
     candidates.sort_by(|a, b| a.created_at.cmp(&b.created_at).then(a.id.cmp(&b.id)));
@@ -311,7 +311,7 @@ pub fn validate_brain_state_snapshot(snapshot: &BrainStateSnapshot) -> Result<()
 ///   exactly (same length, no duplicates, no unknown ids).
 /// - any other version — rejected outright as unknown.
 ///
-/// See crates/khive-brain-core/docs/design-notes.md#validate_brain_state_snapshot_with_capacity--entity_posterior_order-version-gating-rationale
+/// See crates/khive-brain-core/docs/api/snapshot-validation.md#validate_brain_state_snapshot_with_capacity--entity_posterior_order-version-gating-rationale
 /// for why each of these is rejected outright rather than silently repaired.
 pub fn validate_brain_state_snapshot_with_capacity(
     snapshot: &BrainStateSnapshot,
@@ -410,7 +410,7 @@ mod tests {
     }
 
     /// `sort_fallback_candidates` produces `(created_at ASC, id ASC)` order.
-    /// See crates/khive-brain-core/docs/testing-notes.md#brain_staters-sort_fallback_candidates_produces_created_at_then_id_order
+    /// See crates/khive-brain-core/docs/testing-strategy.md#brain_staters-sort_fallback_candidates_produces_created_at_then_id_order
     #[test]
     fn sort_fallback_candidates_produces_created_at_then_id_order() {
         // Three profiles inserted in DESCENDING created_at order (worst case for
