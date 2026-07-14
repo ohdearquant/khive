@@ -1,29 +1,22 @@
 // Copyright 2026 Haiyang Li. Licensed under Apache-2.0.
 //
-//! Least-common-ancestor (LCA) computation for snapshot histories.
+//! Cycle-safe lowest-common-ancestor discovery for snapshot histories.
 //!
-//! Algorithm: iterative walk of the `ours` parent chain into a HashSet;
-//! then walk the `theirs` parent chain until the first ID in the set.
-//! O(D_ours + D_theirs) snapshot metadata reads.
-//!
-//! The `SnapshotReader` trait abstracts the storage backend so the algorithm
-//! can be tested independently. Production wiring goes through `KhiveRuntime`.
+//! See `crates/khive-merge/docs/api/lowest-common-ancestor.md`.
 
 use std::collections::HashSet;
 
-/// Snapshot reader trait for LCA computation.
-///
-/// Implementations provide the parent chain for a given snapshot ID.
+/// Storage-neutral parent lookup for LCA traversal; implementations are shareable.
 pub trait SnapshotReader: Send + Sync {
     /// Return the parent snapshot ID for `id`, or `None` if `id` is a root.
     fn parent_of(&self, id: &str) -> Option<String>;
 }
 
-/// Find the lowest common ancestor of two snapshot histories.
+/// Finds the lowest common ancestor of two single-parent snapshot histories.
 ///
-/// Returns `None` if the two histories are disjoint (no common ancestor).
-/// In that case the merge uses an empty `KgArchive` as the base.
-/// Cycle-safe: both the `ours` and `theirs` parent chains are guarded by visited sets.
+/// Returns `None` for disjoint histories. Both walks are cycle-safe and require
+/// `O(D_ours + D_theirs)` parent reads.
+/// See `crates/khive-merge/docs/api/lowest-common-ancestor.md` for integration behavior.
 pub fn find_lca(reader: &dyn SnapshotReader, ours_id: &str, theirs_id: &str) -> Option<String> {
     if ours_id == theirs_id {
         return Some(ours_id.to_string());
@@ -31,7 +24,6 @@ pub fn find_lca(reader: &dyn SnapshotReader, ours_id: &str, theirs_id: &str) -> 
 
     let ours_ancestors = collect_ancestors(reader, ours_id);
 
-    // Guard against cycles in the theirs parent chain.
     let mut visited_theirs: HashSet<String> = HashSet::new();
     visited_theirs.insert(theirs_id.to_string());
     let mut current = Some(theirs_id.to_string());
@@ -105,8 +97,6 @@ mod tests {
 
     #[test]
     fn lca_fork() {
-        // ours: d -> c -> base
-        // theirs: e -> c -> base
         let mut parents = HashMap::new();
         parents.insert("d".into(), "c".into());
         parents.insert("e".into(), "c".into());
@@ -117,23 +107,19 @@ mod tests {
 
     #[test]
     fn lca_cycle_in_theirs_terminates() {
-        // Cycle in theirs chain: f -> g -> f (infinite without guard).
-        // ours is linear with no common node.
         let mut parents = HashMap::new();
         parents.insert("a".into(), "root_a".into());
         parents.insert("f".into(), "g".into());
-        parents.insert("g".into(), "f".into()); // cycle
+        parents.insert("g".into(), "f".into());
         let reader = MockReader { parents };
         assert_eq!(find_lca(&reader, "a", "f"), None);
     }
 
     #[test]
     fn lca_cycle_in_ours_terminates() {
-        // Cycle in ours chain: h -> i -> h.
-        // collect_ancestors must not loop; theirs is linear with no shared node.
         let mut parents = HashMap::new();
         parents.insert("h".into(), "i".into());
-        parents.insert("i".into(), "h".into()); // cycle
+        parents.insert("i".into(), "h".into());
         parents.insert("b".into(), "root_b".into());
         let reader = MockReader { parents };
         assert_eq!(find_lca(&reader, "h", "b"), None);
