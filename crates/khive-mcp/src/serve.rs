@@ -1193,14 +1193,32 @@ pub fn build_registry_for_multi_backend(
     khive_cfg: &KhiveConfig,
     cli_db_override: Option<&str>,
 ) -> anyhow::Result<MultiBackendRegistry> {
+    khive_runtime::assert_db_anchor_consistent(base_config.db_path.as_deref(), cli_db_override)?;
+    build_registry_for_multi_backend_inner(base_config, khive_cfg, cli_db_override)
+}
+
+pub fn build_registry_for_multi_backend_with_db_anchor(
+    base_config: RuntimeConfig,
+    khive_cfg: &KhiveConfig,
+    cli_db_override: Option<&str>,
+    db_anchor: Option<&std::path::Path>,
+) -> anyhow::Result<MultiBackendRegistry> {
     // Regression fence: `base_config.db_path` feeds `compute_config_id` below,
     // so it must agree with the canonical anchor for this same `--db` input.
     // This is the shared choke point both multi-backend boot paths funnel
     // through — `build_server_multi_backend` in this file and `kkernel`'s
     // `Command::Mcp` coordinator-attached branch — so the guard lives here
     // once instead of at each caller.
-    khive_runtime::assert_db_anchor_consistent(base_config.db_path.as_deref(), cli_db_override)?;
+    khive_runtime::assert_captured_db_anchor_consistent(base_config.db_path.as_deref(), db_anchor)?;
 
+    build_registry_for_multi_backend_inner(base_config, khive_cfg, cli_db_override)
+}
+
+fn build_registry_for_multi_backend_inner(
+    base_config: RuntimeConfig,
+    khive_cfg: &KhiveConfig,
+    cli_db_override: Option<&str>,
+) -> anyhow::Result<MultiBackendRegistry> {
     let backend_count = khive_cfg.backends.len();
     let force_memory = match cli_db_override {
         Some(":memory:") => {
@@ -1528,7 +1546,7 @@ pub fn build_server_with_explicit_namespace(
     namespace_explicit: bool,
     actor_explicit: bool,
 ) -> anyhow::Result<(KhiveMcpServer, Option<KhiveRuntime>)> {
-    let config = resolve_runtime_config(RuntimeConfigInputs {
+    let (config, db_anchor) = resolve_runtime_config_with_db_anchor(RuntimeConfigInputs {
         db: args.db.as_deref(),
         config: args.config.as_deref(),
         namespace,
@@ -1547,7 +1565,10 @@ pub fn build_server_with_explicit_namespace(
     // resolver derives from this same `--db` input, or `config_id` (computed
     // from `config.db_path` below) would silently desynchronize this process
     // from any daemon/peer anchored on the same database.
-    khive_runtime::assert_db_anchor_consistent(config.db_path.as_deref(), args.db.as_deref())?;
+    khive_runtime::assert_captured_db_anchor_consistent(
+        config.db_path.as_deref(),
+        db_anchor.as_deref(),
+    )?;
 
     // Load the KhiveConfig to check for multi-backend declarations (ADR-028).
     // When no [[backends]] are declared, fall through to the existing single-backend path
@@ -1603,7 +1624,12 @@ pub fn build_server_with_explicit_namespace(
     }
 
     // Multi-backend path (ADR-028).
-    let multi = build_registry_for_multi_backend(config, &khive_cfg, args.db.as_deref())?;
+    let multi = build_registry_for_multi_backend_with_db_anchor(
+        config,
+        &khive_cfg,
+        args.db.as_deref(),
+        db_anchor.as_deref(),
+    )?;
     let schedule_rt = multi
         .per_pack_runtimes
         .get("schedule")
@@ -1667,10 +1693,28 @@ pub fn build_server_multi_backend(
     khive_cfg: &KhiveConfig,
     cli_db_override: Option<&str>,
 ) -> anyhow::Result<KhiveMcpServer> {
+    khive_runtime::assert_db_anchor_consistent(base_config.db_path.as_deref(), cli_db_override)?;
+    let multi = build_registry_for_multi_backend_inner(base_config, khive_cfg, cli_db_override)?;
+    Ok(build_server_from_multi_backend_registry(
+        multi, khive_cfg, None,
+    ))
+}
+
+pub fn build_server_multi_backend_with_db_anchor(
+    base_config: RuntimeConfig,
+    khive_cfg: &KhiveConfig,
+    cli_db_override: Option<&str>,
+    db_anchor: Option<&std::path::Path>,
+) -> anyhow::Result<KhiveMcpServer> {
     // The db-anchor consistency guard runs inside `build_registry_for_multi_backend`
     // (the shared choke point every multi-backend boot path funnels through),
     // so it is not duplicated here.
-    let multi = build_registry_for_multi_backend(base_config, khive_cfg, cli_db_override)?;
+    let multi = build_registry_for_multi_backend_with_db_anchor(
+        base_config,
+        khive_cfg,
+        cli_db_override,
+        db_anchor,
+    )?;
     Ok(build_server_from_multi_backend_registry(
         multi, khive_cfg, None,
     ))
@@ -1903,7 +1947,18 @@ pub struct RuntimeConfigInputs<'a> {
 /// default/env model set while the MCP server serves recall from the
 /// config-file `[[engines]]` set.
 pub fn resolve_runtime_config(inputs: RuntimeConfigInputs<'_>) -> anyhow::Result<RuntimeConfig> {
-    let db_path = khive_runtime::resolve_db_anchor(inputs.db);
+    let (config, _) = resolve_runtime_config_with_db_anchor(inputs)?;
+    Ok(config)
+}
+
+/// Resolve a [`RuntimeConfig`] and return the database anchor captured at the
+/// same construction boundary. Server boot paths thread this value through
+/// consistency validation and registry construction without re-reading HOME.
+pub fn resolve_runtime_config_with_db_anchor(
+    inputs: RuntimeConfigInputs<'_>,
+) -> anyhow::Result<(RuntimeConfig, Option<PathBuf>)> {
+    let db_anchor = khive_runtime::resolve_db_anchor(inputs.db);
+    let db_path = db_anchor.clone();
 
     let packs = inputs
         .packs
@@ -2026,7 +2081,7 @@ pub fn resolve_runtime_config(inputs: RuntimeConfigInputs<'_>) -> anyhow::Result
 
     // Tier-3 env fallback: KHIVE_BRAIN_PROFILE is applied AFTER CLI (tier-1) and
     // config-file (tier-2) so that a project or global TOML always wins over the env var.
-    Ok(apply_env_brain_profile(resolved))
+    Ok((apply_env_brain_profile(resolved), db_anchor))
 }
 
 /// Apply `KHIVE_BRAIN_PROFILE` env var as the tier-3 fallback for `brain_profile`.
@@ -3584,10 +3639,12 @@ id = "lambda:project-actor"
             }
         };
 
-        // One message to a different actor, one to ourselves.
+        // One message to a different actor, one explicit message to ourselves.
         let to_a = dispatch(r#"comm.send(to="actor-a", content="for-a")"#.to_string()).await;
         assert_eq!(to_a["results"][0]["ok"].as_bool(), Some(true), "{to_a}");
-        let to_b = dispatch(r#"comm.send(to="actor-b", content="for-b")"#.to_string()).await;
+        let to_b =
+            dispatch(r#"comm.send(to="actor-b", content="for-b", self_send=true)"#.to_string())
+                .await;
         assert_eq!(to_b["results"][0]["ok"].as_bool(), Some(true), "{to_b}");
 
         // Inbox for the configured actor (actor-b) must be filtered by to_actor.
@@ -3789,26 +3846,37 @@ id = "lambda:project-actor"
         );
     }
 
-    /// B-SHOULD-FIX-2 (data safety): Two [[backends]] entries whose sqlite paths
-    /// canonicalize to the same file must share a single Arc<StorageBackend> and
-    /// run migrations only once. Verified by using two names that differ only by
-    /// `./` prefix while pointing at the same absolute path.
-    #[test]
-    #[serial]
-    fn duplicate_sqlite_paths_deduplicated_to_single_backend() {
+    /// RAII guard: redirects `HOME` and restores the prior value on drop.
+    struct HomeGuard {
+        original: Option<std::ffi::OsString>,
+    }
+
+    impl HomeGuard {
+        fn redirect_to(dir: &std::path::Path) -> Self {
+            let original = std::env::var_os("HOME");
+            std::env::set_var("HOME", dir);
+            Self { original }
+        }
+    }
+
+    impl Drop for HomeGuard {
+        fn drop(&mut self) {
+            match &self.original {
+                Some(h) => std::env::set_var("HOME", h),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+    }
+
+    fn duplicate_sqlite_path_config(db_path: &std::path::Path) -> KhiveConfig {
         use khive_runtime::PackConfig;
 
-        let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.path().join("shared.db");
-        let db_path_str = db_path.to_str().unwrap();
-
-        // Two backend names pointing to the same file (one with ./ prefix).
-        let khive_cfg = KhiveConfig {
+        KhiveConfig {
             backends: vec![
                 BackendConfig {
                     name: "main".to_string(),
                     kind: BackendKind::Sqlite,
-                    path: Some(db_path.clone()),
+                    path: Some(db_path.to_path_buf()),
                     cache_mb: None,
                     journal_mode: None,
                     read_only: false,
@@ -3816,25 +3884,120 @@ id = "lambda:project-actor"
                 BackendConfig {
                     name: "alias".to_string(),
                     kind: BackendKind::Sqlite,
-                    path: Some(db_path.clone()),
+                    path: Some(db_path.to_path_buf()),
                     cache_mb: None,
                     journal_mode: None,
                     read_only: false,
                 },
             ],
             packs: {
-                let mut m = std::collections::HashMap::new();
-                m.insert(
+                let mut packs = std::collections::HashMap::new();
+                packs.insert(
                     "comm".to_string(),
                     PackConfig {
                         backend: "alias".to_string(),
                     },
                 );
-                m
+                packs
             },
             ..KhiveConfig::default()
+        }
+    }
+
+    fn memory_main_backend_config() -> KhiveConfig {
+        KhiveConfig {
+            backends: vec![BackendConfig {
+                name: "main".to_string(),
+                kind: BackendKind::Memory,
+                path: None,
+                cache_mb: None,
+                journal_mode: None,
+                read_only: false,
+            }],
+            ..KhiveConfig::default()
+        }
+    }
+
+    fn assert_db_anchor_drift<T>(result: anyhow::Result<T>) {
+        match result {
+            Err(error) => assert!(
+                error.to_string().contains("db-path resolution drift"),
+                "legacy builder must reject raw db input that disagrees with the resolved config: {error}"
+            ),
+            Ok(_) => panic!("legacy builder accepted raw db input that disagrees with the resolved config"),
+        }
+    }
+
+    #[test]
+    fn legacy_registry_rejects_mismatched_explicit_db_override() {
+        let base_cfg = RuntimeConfig {
+            db_path: Some(PathBuf::from("/tmp/khive-resolved.db")),
+            ..base_runtime_config_for_multi_backend()
         };
-        let _ = db_path_str; // used above to show intent
+
+        assert_db_anchor_drift(build_registry_for_multi_backend(
+            base_cfg,
+            &memory_main_backend_config(),
+            Some("/tmp/khive-raw.db"),
+        ));
+    }
+
+    #[test]
+    fn legacy_server_rejects_mismatched_explicit_db_override() {
+        let base_cfg = RuntimeConfig {
+            db_path: Some(PathBuf::from("/tmp/khive-resolved.db")),
+            ..base_runtime_config_for_multi_backend()
+        };
+
+        assert_db_anchor_drift(build_server_multi_backend(
+            base_cfg,
+            &memory_main_backend_config(),
+            Some("/tmp/khive-raw.db"),
+        ));
+    }
+
+    #[test]
+    #[serial]
+    fn legacy_registry_rejects_unset_db_after_home_changes() {
+        let first_home = tempfile::tempdir().unwrap();
+        let _home_guard = HomeGuard::redirect_to(first_home.path());
+        let base_cfg = base_runtime_config_for_multi_backend();
+        let second_home = tempfile::tempdir().unwrap();
+        std::env::set_var("HOME", second_home.path());
+
+        assert_db_anchor_drift(build_registry_for_multi_backend(
+            base_cfg,
+            &memory_main_backend_config(),
+            None,
+        ));
+    }
+
+    #[test]
+    #[serial]
+    fn legacy_server_rejects_unset_db_after_home_changes() {
+        let first_home = tempfile::tempdir().unwrap();
+        let _home_guard = HomeGuard::redirect_to(first_home.path());
+        let base_cfg = base_runtime_config_for_multi_backend();
+        let second_home = tempfile::tempdir().unwrap();
+        std::env::set_var("HOME", second_home.path());
+
+        assert_db_anchor_drift(build_server_multi_backend(
+            base_cfg,
+            &memory_main_backend_config(),
+            None,
+        ));
+    }
+
+    /// B-SHOULD-FIX-2 (data safety): Two [[backends]] entries whose sqlite paths
+    /// canonicalize to the same file must share a single Arc<StorageBackend> and
+    /// run migrations only once. Verified by using two names that differ only by
+    /// `./` prefix while pointing at the same absolute path.
+    #[test]
+    #[serial]
+    fn duplicate_sqlite_paths_deduplicated_to_single_backend() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("shared.db");
+        let khive_cfg = duplicate_sqlite_path_config(&db_path);
 
         let base_cfg = base_runtime_config_for_multi_backend();
 
@@ -3843,6 +4006,48 @@ id = "lambda:project-actor"
         if let Err(ref e) = result {
             panic!(
                 "two backends with the same canonical path must share one Arc and boot ok; got: {e}"
+            );
+        }
+    }
+
+    /// Regression for #720: changing `HOME` after runtime-config resolution but
+    /// before multi-backend registry construction must not change the database
+    /// anchor used by the consistency guard.
+    #[test]
+    #[serial]
+    fn multi_backend_boot_uses_anchor_captured_by_runtime_config() {
+        let first_home = tempfile::tempdir().unwrap();
+        let _home_guard = HomeGuard::redirect_to(first_home.path());
+        let config_path = first_home.path().join("config.toml");
+        std::fs::write(&config_path, "").expect("write empty config");
+        let (base_cfg, db_anchor) = resolve_runtime_config_with_db_anchor(RuntimeConfigInputs {
+            db: None,
+            config: Some(&config_path),
+            namespace: Namespace::parse("local").expect("namespace"),
+            namespace_explicit: false,
+            actor_explicit: false,
+            no_embed: true,
+            packs: Some(vec!["kg".to_string()]),
+            brain_profile: None,
+        })
+        .expect("resolve runtime config before HOME changes");
+
+        let db_dir = tempfile::tempdir().unwrap();
+        let db_path = db_dir.path().join("shared.db");
+        let khive_cfg = duplicate_sqlite_path_config(&db_path);
+
+        let second_home = tempfile::tempdir().unwrap();
+        std::env::set_var("HOME", second_home.path());
+        let result = build_server_multi_backend_with_db_anchor(
+            base_cfg,
+            &khive_cfg,
+            None,
+            db_anchor.as_deref(),
+        );
+        if let Err(error) = result {
+            panic!(
+                "multi-backend construction must retain the anchor captured by \
+                 resolve_runtime_config instead of re-reading HOME: {error}"
             );
         }
     }

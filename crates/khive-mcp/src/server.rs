@@ -1502,8 +1502,12 @@ several independent ops can run together; use chain when each op needs the prior
 result (e.g. create then link with the new entity's id)."#)]
     async fn request(&self, Parameters(p): Parameters<RequestParams>) -> Result<String, McpError> {
         // Forward to the warm daemon when reachable, auto-spawning it
-        // on first use. Any failure (no socket, spawn failure, namespace
-        // mismatch, KHIVE_NO_DAEMON) falls through to local dispatch.
+        // on first use. An ordinary no-socket condition, a namespace
+        // mismatch, or KHIVE_NO_DAEMON falls through to local dispatch.
+        // A confirmed respawn failure (spawn error, or the child exits
+        // before binding the socket) instead returns a caller-visible
+        // `respawn_failed` error without local dispatch, per ADR-049
+        // Amendment 2.
         //
         // MCP-AUD-002: the daemon wire frame has no `save_to` field, so
         // daemon-forwarded requests silently drop the sink and return the
@@ -1516,13 +1520,14 @@ result (e.g. create then link with the new entity's id)."#)]
             if let Some(res) = crate::daemon::forward_or_spawn(&frame).await {
                 return match res {
                     Ok(s) => Ok(s),
-                    // #947: a strict-mode fallback rejection is tagged with
+                    // #947/#898: a strict-mode pre-dispatch rejection is
+                    // tagged with
                     // `daemon::STRICT_FALLBACK_MARKER` so it can be reshaped
                     // into the normal per-op envelope instead of surfacing as
                     // an RPC-level error. Every other daemon-forward error
-                    // (protocol mismatch, oversized frame, ambiguous
-                    // post-write outcome) is untagged and passes through
-                    // unchanged.
+                    // (non-strict respawn failure, protocol mismatch,
+                    // oversized frame, ambiguous post-write outcome) is
+                    // untagged and passes through unchanged.
                     Err(e) => match strict_fallback_reason(&e) {
                         Some(reason) => strict_fallback_envelope_response(&p, reason),
                         None => Err(e),
@@ -1567,7 +1572,8 @@ fn strict_fallback_envelope_response(
     let total = parsed.ops.len();
     let error_msg = format!(
         "daemon fallback rejected under KHIVE_DAEMON_STRICT=1: reason={reason}; \
-         refusing to complete the request via local dispatch"
+         refusing to complete the request via local dispatch; \
+         rebuild with `make local` and retry"
     );
 
     let results: Vec<Value> = match parsed.mode {
@@ -2711,8 +2717,9 @@ mod tests {
         clear_daemon_env();
         crate::daemon::reset_fallback_counters();
         let dir = tempfile::tempdir().expect("tempdir");
-        // Never bound by anything in this test — the daemon is genuinely
-        // unreachable, exactly like `daemon::forward_or_spawn_strict_mode_errors_when_daemon_unreachable`.
+        // Never bound by anything in this test. The spawned test harness exits
+        // immediately on `mcp --daemon`, so #898 classifies this as a confirmed
+        // respawn failure rather than the older generic `no_socket` fallback.
         std::env::set_var("KHIVE_SOCKET", dir.path().join("khived.sock"));
         std::env::set_var("KHIVE_PID", dir.path().join("khived.pid"));
         std::env::set_var("KHIVE_LOCK", dir.path().join("khived.recovery.lock"));
@@ -2752,8 +2759,12 @@ mod tests {
                 "error must name the strict mode that rejected the fallback: {msg}"
             );
             assert!(
-                msg.contains("no_socket"),
-                "error must name the fallback reason: {msg}"
+                msg.contains("respawn_failed"),
+                "error must name the confirmed respawn failure: {msg}"
+            );
+            assert!(
+                msg.contains("make local"),
+                "error must include the safe respawn remediation: {msg}"
             );
         }
 

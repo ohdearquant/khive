@@ -151,6 +151,30 @@ mod help_tests {
     }
 
     #[test]
+    fn send_declares_optional_self_send_contract() {
+        let h = find_handler("comm.send");
+        let self_send = h
+            .params
+            .iter()
+            .find(|p| p.name == "self_send")
+            .expect("comm.send help must declare 'self_send'");
+
+        assert_eq!(self_send.param_type, "boolean");
+        assert!(!self_send.required, "send.self_send must be optional");
+        assert!(
+            self_send.description.contains("Defaults to false"),
+            "send.self_send help must document its default"
+        );
+        assert!(
+            self_send
+                .description
+                .contains("matches the configured sender actor")
+                && self_send.description.contains("`local`"),
+            "send.self_send help must document when the opt-in is required"
+        );
+    }
+
+    #[test]
     fn inbox_has_optional_limit_and_status() {
         let h = find_handler("comm.inbox");
         assert!(!h.params.is_empty(), "inbox must have non-empty params");

@@ -44,8 +44,9 @@ pub type NoteMutationHookFn = Arc<
 >;
 
 pub use crate::config::{
-    assert_db_anchor_consistent, parse_pack_list, resolve_db_anchor, resolve_project_actor_id,
-    runtime_config_from_khive_config, BackendId, NamespaceToken, RuntimeConfig,
+    assert_captured_db_anchor_consistent, assert_db_anchor_consistent, parse_pack_list,
+    resolve_db_anchor, resolve_project_actor_id, runtime_config_from_khive_config, BackendId,
+    NamespaceToken, RuntimeConfig,
 };
 
 // ---- KhiveRuntime ----

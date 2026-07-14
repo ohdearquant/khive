@@ -132,6 +132,7 @@ For historical context, see [v0 archive](../_archive/adr_v0/README.md). v0 ADRs 
 | [ADR-109](ADR-109-sandboxed-kkernel-gateway.md)              | Sandboxed kkernel Gateway for Untrusted Execution (Phase C)                                           |
 | [ADR-110](ADR-110-vamana-wasm.md)                            | WebAssembly Support for khive-vamana                                                                  |
 | [ADR-111](ADR-111-blob-store.md)                             | BlobStore — Content-Addressed Binary Object Storage                                                   |
+| [ADR-113](ADR-113-identifier-continuity.md)                  | Identifier Continuity — Merged-Entity Redirect Resolution and Split Endpoint-Move                     |
 
 ## Closed Taxonomies — Quick Reference
 
