@@ -33,3 +33,12 @@ a genuinely O(n) computation: storing it eagerly costs the same as storing it la
 eager storage avoids holding a borrow of the caller's query string for the tracker's
 entire lifetime; `compose()` moves `raw_query` into the response body before calling
 `finish()`, so a borrowing field would not compile.
+
+## Why `finish` returns the per-phase breakdown
+
+Production callers (`compose()`) discard the return value — the slow-request WARN above is
+the real delivery mechanism there. The return value exists so tests can assert the *actual*
+`finish()` call site flushed the still-active phase, without needing the request to run
+long enough to cross `COMPOSE_SLOW_THRESHOLD_MS` and trigger the WARN itself. Earlier
+regression tests called the private `flush_active` manually before `finish`/`drop`, so they
+never exercised the flush call inside `finish`/`Drop` itself.
