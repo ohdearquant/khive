@@ -3584,10 +3584,12 @@ id = "lambda:project-actor"
             }
         };
 
-        // One message to a different actor, one to ourselves.
+        // One message to a different actor, one explicit message to ourselves.
         let to_a = dispatch(r#"comm.send(to="actor-a", content="for-a")"#.to_string()).await;
         assert_eq!(to_a["results"][0]["ok"].as_bool(), Some(true), "{to_a}");
-        let to_b = dispatch(r#"comm.send(to="actor-b", content="for-b")"#.to_string()).await;
+        let to_b =
+            dispatch(r#"comm.send(to="actor-b", content="for-b", self_send=true)"#.to_string())
+                .await;
         assert_eq!(to_b["results"][0]["ok"].as_bool(), Some(true), "{to_b}");
 
         // Inbox for the configured actor (actor-b) must be filtered by to_actor.

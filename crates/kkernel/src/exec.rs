@@ -1265,7 +1265,7 @@ default = true
 
         let send = server
             .dispatch_request_local(RequestParams {
-                ops: r#"comm.send(to="actor-routing-test", content="routed-via-secondary")"#
+                ops: r#"comm.send(to="actor-routing-test", content="routed-via-secondary", self_send=true)"#
                     .to_string(),
                 presentation: None,
                 presentation_per_op: None,

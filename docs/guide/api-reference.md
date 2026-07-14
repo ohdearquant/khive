@@ -1045,12 +1045,13 @@ Actor-to-actor messaging with threading. Optional; load with `KHIVE_PACKS=kg,com
 
 Send a message, optionally threaded.
 
-| Param       | Type   | Required | Notes                                                                                                          |
-| ----------- | ------ | -------- | -------------------------------------------------------------------------------------------------------------- |
-| `to`        | string | yes      | Actor label, e.g. `"lambda:leo"`. Both copies land in the caller's namespace; no cross-namespace write occurs. |
-| `content`   | string | yes      | Non-empty message body.                                                                                        |
-| `subject`   | string | no       | Optional subject line.                                                                                         |
-| `thread_id` | uuid   | no       | Groups the message into an existing thread.                                                                    |
+| Param       | Type   | Required | Notes                                                                                                                                                                                           |
+| ----------- | ------ | -------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `to`        | string | yes      | Actor label, e.g. `"lambda:leo"`. Both copies land in the caller's namespace; no cross-namespace write occurs.                                                                                  |
+| `content`   | string | yes      | Non-empty message body.                                                                                                                                                                         |
+| `subject`   | string | no       | Optional subject line.                                                                                                                                                                          |
+| `thread_id` | uuid   | no       | Groups the message into an existing thread.                                                                                                                                                     |
+| `self_send` | bool   | no       | Default false. Required when `to` matches the configured sender actor; otherwise the send is rejected. The anonymous `local` fallback is exempt. Use true only for an intentional note to self. |
 
 ```
 request(ops="comm.send(to=\"lambda:leo\", subject=\"PR ready\", content=\"#600 is open for review\")")

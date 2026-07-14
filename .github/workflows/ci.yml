@@ -435,6 +435,7 @@ jobs:
         with:
           workspaces: crates
           cache-on-failure: true
+          cache-targets: false
       # Pinned to a commit SHA, not the mutable @v2 tag (same rationale as the
       # #215 cargo-deny installer pin): a required gate's tooling must not drift.
       - uses: taiki-e/install-action@9e1e5806d4a4822de933115878265be9aaa786d9 # v2.82.2
