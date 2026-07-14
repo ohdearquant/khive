@@ -190,6 +190,12 @@ Fetch any record by UUID (auto-detects entity/note/edge/event/proposal).
 request(ops="get(id=\"3f2a9c1e\")")
 ```
 
+The returned object has the full substrate shape documented under `list` below. For an edge,
+`get` additionally returns `annotations: Note[]`. The array is always present (empty when no live
+notes annotate the edge), and each full note object includes `annotation_edge_id`, the UUID of the
+`annotates` edge connecting that note to the fetched edge. Because `get` is a by-ID operation,
+annotation discovery is namespace-agnostic under ADR-007, matching the fetched edge itself.
+
 ### `list` — Assertive
 
 List records with optional filtering.
@@ -1045,12 +1051,13 @@ Actor-to-actor messaging with threading. Optional; load with `KHIVE_PACKS=kg,com
 
 Send a message, optionally threaded.
 
-| Param       | Type   | Required | Notes                                                                                                          |
-| ----------- | ------ | -------- | -------------------------------------------------------------------------------------------------------------- |
-| `to`        | string | yes      | Actor label, e.g. `"lambda:leo"`. Both copies land in the caller's namespace; no cross-namespace write occurs. |
-| `content`   | string | yes      | Non-empty message body.                                                                                        |
-| `subject`   | string | no       | Optional subject line.                                                                                         |
-| `thread_id` | uuid   | no       | Groups the message into an existing thread.                                                                    |
+| Param       | Type   | Required | Notes                                                                                                                                                                                           |
+| ----------- | ------ | -------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `to`        | string | yes      | Actor label, e.g. `"lambda:leo"`. Both copies land in the caller's namespace; no cross-namespace write occurs.                                                                                  |
+| `content`   | string | yes      | Non-empty message body.                                                                                                                                                                         |
+| `subject`   | string | no       | Optional subject line.                                                                                                                                                                          |
+| `thread_id` | uuid   | no       | Groups the message into an existing thread.                                                                                                                                                     |
+| `self_send` | bool   | no       | Default false. Required when `to` matches the configured sender actor; otherwise the send is rejected. The anonymous `local` fallback is exempt. Use true only for an intentional note to self. |
 
 ```
 request(ops="comm.send(to=\"lambda:leo\", subject=\"PR ready\", content=\"#600 is open for review\")")

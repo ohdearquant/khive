@@ -2789,8 +2789,22 @@ mod tests {
         // warm page cache, so sleep past the cap instead of assuming
         // the elapsed work already crossed it.
         std::thread::sleep(Duration::from_millis(5));
+        // `tx_registry` is a process-wide singleton shared by every test in
+        // this binary (cargo runs `#[test]`s in parallel threads of the same
+        // process): `#[serial(tx_registry)]` only excludes other tests that
+        // carry the same key, not every production write path elsewhere in
+        // the crate (e.g. `graph_upsert_edges`) that also calls `register()`
+        // as ordinary telemetry. If one of those happens to still be open and
+        // was registered before this test's own handle, raw `oldest()` would
+        // return THAT entry instead of the fixture's reader — see #926. Look
+        // up this test's own entry by its known label instead of trusting
+        // global `oldest()`, so the assertion is immune to that noise.
+        let our_entry = khive_storage::tx_registry::snapshot()
+            .into_iter()
+            .find(|(_, label)| label.as_deref() == Some("tx_age_sweep_reader_pin_test"))
+            .expect("this test's own tx_registry entry must still be open");
         let mut tx_age_state = TxAgeSweepState::default();
-        let emissions = tx_age_state.observe(khive_storage::tx_registry::oldest(), &config);
+        let emissions = tx_age_state.observe(Some((tx_id(1), our_entry.0, our_entry.1)), &config);
         assert!(
             emissions.iter().any(|e| e.rung == TxAgeRung::Stale
                 && e.label.as_deref() == Some("tx_age_sweep_reader_pin_test")),
@@ -2800,6 +2814,56 @@ mod tests {
         reader.execute_batch("COMMIT;").ok();
         drop(reader);
         drop(_tx_handle);
+    }
+
+    /// Regression for #926: reproduces the exact race that made
+    /// `tx_age_sweep_names_long_lived_reader_pinning_wal_past_high_water`
+    /// flaky, directly rather than hoping cargo's test scheduler happens to
+    /// interleave two unrelated tests. `tx_registry` is a process-wide
+    /// singleton; a decoy entry registered before this test's own entry is
+    /// genuinely older, so raw `oldest()` returns the decoy — exactly what an
+    /// unrelated, concurrently-running write path (e.g. `graph_upsert_edges`)
+    /// could do in the real suite. The fix (looking up this test's own entry
+    /// by label via `snapshot()` instead of trusting global `oldest()`) must
+    /// still correctly name and escalate THIS entry despite that older decoy.
+    #[test]
+    #[serial(tx_registry, checkpoint_skip_metrics)]
+    fn tx_age_sweep_own_entry_survives_concurrent_older_registration() {
+        let _decoy = khive_storage::tx_registry::register(Some("decoy_unrelated_span".to_string()));
+        std::thread::sleep(Duration::from_millis(2));
+        let _own = khive_storage::tx_registry::register(Some("this_test_own_span".to_string()));
+        std::thread::sleep(Duration::from_millis(5));
+
+        // Confirm the race condition is actually reproduced: the decoy must
+        // currently be the process-wide oldest entry, same as the bug report.
+        let global_oldest = khive_storage::tx_registry::oldest().expect("registry not empty");
+        assert_eq!(
+            global_oldest.2.as_deref(),
+            Some("decoy_unrelated_span"),
+            "test setup must reproduce the race: an older, unrelated entry must be \
+             the current global oldest, got: {global_oldest:?}"
+        );
+
+        let our_entry = khive_storage::tx_registry::snapshot()
+            .into_iter()
+            .find(|(_, label)| label.as_deref() == Some("this_test_own_span"))
+            .expect("this test's own tx_registry entry must still be open");
+
+        let config = CheckpointConfig {
+            tx_warn_secs: Duration::from_millis(1),
+            tx_max_age_secs: Duration::from_millis(1),
+            ..CheckpointConfig::default()
+        };
+        let mut state = TxAgeSweepState::default();
+        let emissions = state.observe(Some((tx_id(2), our_entry.0, our_entry.1)), &config);
+        assert!(
+            emissions
+                .iter()
+                .any(|e| e.rung == TxAgeRung::Stale
+                    && e.label.as_deref() == Some("this_test_own_span")),
+            "expected a Stale emission naming this test's own span despite an older, \
+             unrelated concurrent registration, got: {emissions:?}"
+        );
     }
 
     /// `KHIVE_WAL_WARN_SUSTAINED_CYCLES` overrides the default and rejects 0.
