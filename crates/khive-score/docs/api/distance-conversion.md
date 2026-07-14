@@ -1,19 +1,8 @@
 # Distance-to-Similarity Conversion
 
-**Scope:** Canonical formulas used by `khive-score` to convert raw vector distances to
-[`DeterministicScore`](../src/score.rs) values consumed by all retrieval backends (HNSW,
-Vamana, flat-scan).
-
-**ADRs:** [ADR-006 Deterministic Scoring](../../../../docs/adr/ADR-006-deterministic-scoring.md) |
-[ADR-012 Retrieval Composition](../../../../docs/adr/ADR-012-retrieval-composition.md) |
-ADR-030 Formal verification (Lean proofs, Phase 2)
-
-**Source:** [`crates/khive-score/src/distance.rs`](../src/distance.rs)
-**Tests:** inline `#[cfg(test)] mod tests` in `distance.rs`
-**Bench:** [`crates/khive-score/benches/score_ops.rs`](../benches/score_ops.rs) — targets
-`distance_cosine`, `distance_l2`, `distance_dot`
-
----
+The distance helpers convert raw vector distances into the [`DeterministicScore`](../../src/score.rs)
+values shared by HNSW, Vamana, and flat-scan retrieval. Their formulas and failure behavior are the
+canonical boundary between vector backends and deterministic ranking.
 
 ## Formulas
 
@@ -46,12 +35,37 @@ metrics.
 
 New callers **must** use `try_score_from_distance` or `score_from_distance_lossy`.
 
+## `try_score_from_distance`
+
+The strict API returns a score for supported, valid inputs. It reports `NonFiniteDistance` for NaN
+or infinity, `InvalidDistanceRange` for cosine values outside `[0, 2]` and negative L2 values, and
+`UnsupportedMetric` for future or otherwise unsupported metrics.
+
+## `score_from_distance_lossy`
+
+The lossy API applies the same validation and maps every error to `DeterministicScore::NEG_INF` so
+invalid candidates rank last. It is appropriate only when callers intentionally prefer a sentinel
+over inspecting the error taxonomy.
+
+## Deprecated `score_from_distance`
+
+The legacy API is retained for compatibility. It maps NaN to distance zero, permits ranges rejected
+by the strict API, clamps negative L2 distance to zero, and ranks unknown metrics last. New code
+must not rely on those behaviors.
+
 ## Proof correspondence
 
 `khive.Retrieval.Distance.distanceToSimilarity` and `khive.Retrieval.Distance.similarity_nonneg`
-in `proofs/Retrieval/Distance.lean` (ADR-030 §Phase 2).
+in `proofs/Retrieval/Distance.lean` cover the ADR-030 phase-2 formalization. The API also implements
+[ADR-006 deterministic scoring](../../../../docs/adr/ADR-006-deterministic-scoring.md) and
+[ADR-012 retrieval composition](../../../../docs/adr/ADR-012-retrieval-composition.md).
 
-## Commands
+## Verification and benchmarks
+
+The conversion tests are the inline `#[cfg(test)]` module in
+[`distance.rs`](../../src/distance.rs). Benchmarks in
+[`benches/score_ops.rs`](../../benches/score_ops.rs) cover the `distance_cosine`, `distance_l2`,
+and `distance_dot` targets.
 
 ```bash
 # Run all distance conversion tests
@@ -61,4 +75,5 @@ cargo test -p khive-score distance
 cargo bench -p khive-score --bench score_ops
 ```
 
-Last reviewed: 2026-06-06 (v0.2.3, deprecation of `score_from_distance`)
+This contract was last reviewed on 2026-06-06 for v0.2.3, when `score_from_distance` was
+deprecated.

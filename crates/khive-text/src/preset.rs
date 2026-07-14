@@ -4,10 +4,9 @@ use crate::analyzer::StandardAnalyzer;
 use crate::filter::{Bm25StopWordFilter, LowercaseFilter, MaxLengthFilter, MinLengthFilter};
 use crate::tokenizer::{CjkCharTokenizer, KeywordTokenizer, WhitespaceTokenizer};
 
-/// Standard English analyzer: whitespace + lowercase + stop words.
+/// Return the whitespace/lowercase/stop-word pipeline matching BM25's default tokenizer.
 ///
-/// Produces the same token stream as `khive-bm25`'s `SimpleTokenizer::default()`,
-/// but returns a `StandardAnalyzer` rather than a `khive-bm25` tokenizer type.
+/// See `crates/khive-text/docs/api/analyzer-pipeline.md`.
 pub fn standard() -> StandardAnalyzer {
     StandardAnalyzer::with_tokenizer(WhitespaceTokenizer)
         .filter(LowercaseFilter)

@@ -3,7 +3,9 @@
 use crate::{DeterministicScore, ScoreError};
 use khive_types::DistanceMetric;
 
-/// Strict distance → score conversion. Errors on NaN, non-finite, out-of-range, or unknown metric.
+/// Strict metric conversion; rejects non-finite, out-of-range, and unsupported inputs.
+///
+/// See `crates/khive-score/docs/api/distance-conversion.md` for formulas and error variants.
 pub fn try_score_from_distance(
     dist: f32,
     metric: DistanceMetric,
@@ -39,7 +41,9 @@ pub fn try_score_from_distance(
     Ok(DeterministicScore::from_f64(similarity))
 }
 
-/// Infallible distance conversion: invalid inputs map to [`DeterministicScore::NEG_INF`].
+/// Convert a distance, mapping every invalid input to [`DeterministicScore::NEG_INF`].
+///
+/// See `crates/khive-score/docs/api/distance-conversion.md`.
 #[inline]
 pub fn score_from_distance_lossy(dist: f32, metric: DistanceMetric) -> DeterministicScore {
     try_score_from_distance(dist, metric).unwrap_or(DeterministicScore::NEG_INF)
@@ -135,8 +139,6 @@ mod tests {
         );
     }
 
-    // ── try_score_from_distance ───────────────────────────────────────────────
-
     #[test]
     fn try_score_nan_returns_error() {
         let err = try_score_from_distance(f32::NAN, DistanceMetric::Cosine).unwrap_err();
@@ -218,8 +220,6 @@ mod tests {
         assert!((s.to_f64() - 5.0).abs() < 1e-6);
     }
 
-    // ── score_from_distance_lossy ─────────────────────────────────────────────
-
     #[test]
     fn lossy_nan_maps_to_neg_inf() {
         let s = score_from_distance_lossy(f32::NAN, DistanceMetric::Cosine);
@@ -242,9 +242,7 @@ mod tests {
         assert!((s.to_f64() - 0.5).abs() < 1e-6);
     }
 
-    /// Verify byte-identical output to the historical khive-hnsw local impl for
-    /// all three metrics and the NaN edge case.  These values are the regression
-    /// fixture: the refactor MUST NOT change them.
+    /// Preserve historical khive-hnsw bytes for all metrics and legacy NaN handling.
     #[test]
     fn parity_with_hnsw_local_impl() {
         // The old khive-hnsw impl used exactly:

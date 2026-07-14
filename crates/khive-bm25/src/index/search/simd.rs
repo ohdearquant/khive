@@ -1,9 +1,5 @@
 //! SIMD batch BM25 scoring: 4-wide NEON/scalar and 8-wide AVX2/scalar implementations.
 
-// ---------------------------------------------------------------------------
-// SIMD batch BM25 scoring (4-wide)
-// ---------------------------------------------------------------------------
-
 /// Batch-score 4 postings using ARM NEON. Safety: aarch64 only; NEON is baseline on ARMv8-A.
 #[cfg(target_arch = "aarch64")]
 #[inline]
@@ -19,7 +15,6 @@ pub(super) unsafe fn score_batch_neon(
 ) -> [f32; 4] {
     use std::arch::aarch64::*;
 
-    // Widen u8 term frequencies to u32, then convert to f32.
     let tfs_u32: [u32; 4] = [
         term_freqs[0] as u32,
         term_freqs[1] as u32,
@@ -27,7 +22,6 @@ pub(super) unsafe fn score_batch_neon(
         term_freqs[3] as u32,
     ];
     let tf = vcvtq_f32_u32(vld1q_u32(tfs_u32.as_ptr()));
-    // Load 4 pre-converted f32 document lengths.
     let dl = vld1q_f32(doc_lengths.as_ptr());
 
     let k1p1 = vdupq_n_f32(k1_plus_1);
@@ -35,11 +29,8 @@ pub(super) unsafe fn score_batch_neon(
     let dl_fac = vdupq_n_f32(denom_dl_factor);
     let idf_v = vdupq_n_f32(idf);
 
-    // numerator = tf * k1_plus_1
     let num = vmulq_f32(tf, k1p1);
-    // denominator = tf + denom_base + denom_dl_factor * doc_len
     let denom = vaddq_f32(tf, vaddq_f32(base, vmulq_f32(dl_fac, dl)));
-    // score = idf * num / denom
     let score = vmulq_f32(idf_v, vdivq_f32(num, denom));
 
     let mut result = [0.0f32; 4];
@@ -89,10 +80,6 @@ pub(super) fn score_batch_scalar_8(
     result
 }
 
-// ---------------------------------------------------------------------------
-// AVX2 batch BM25 scoring (8-wide, x86_64 only)
-// ---------------------------------------------------------------------------
-
 /// Batch-score 8 postings using AVX2. Safety: requires avx2 runtime detection.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
@@ -109,31 +96,24 @@ pub(super) unsafe fn score_batch_avx2(
 ) -> [f32; 8] {
     use std::arch::x86_64::*;
 
-    // Load 8 u8 term frequencies from a 64-bit chunk into the low half of
-    // a 128-bit register, then widen u8 -> i32 (AVX2) and convert i32 -> f32.
+    // Widen the eight packed `u8` frequencies to `f32` lanes.
     let tfs_raw = _mm_loadl_epi64(term_freqs.as_ptr() as *const __m128i);
     let tfs_i32 = _mm256_cvtepu8_epi32(tfs_raw);
     let tf = _mm256_cvtepi32_ps(tfs_i32);
 
-    // Load 8 contiguous f32 doc lengths.
     let dl = _mm256_loadu_ps(doc_lengths.as_ptr());
 
-    // Broadcast scalar constants to all 8 lanes.
     let k1p1 = _mm256_set1_ps(k1_plus_1);
     let base = _mm256_set1_ps(denom_base);
     let dl_fac = _mm256_set1_ps(denom_dl_factor);
     let idf_v = _mm256_set1_ps(idf);
 
-    // numerator = tf * k1_plus_1
     let num = _mm256_mul_ps(tf, k1p1);
 
-    // denominator = tf + denom_base + denom_dl_factor * doc_len
-    //             = tf + (denom_base + denom_dl_factor * doc_len)
     let dl_term = _mm256_mul_ps(dl_fac, dl);
     let base_plus_dl = _mm256_add_ps(base, dl_term);
     let denom = _mm256_add_ps(tf, base_plus_dl);
 
-    // score = idf * (num / denom)
     let ratio = _mm256_div_ps(num, denom);
     let score = _mm256_mul_ps(idf_v, ratio);
 

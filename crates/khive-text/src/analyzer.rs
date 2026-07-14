@@ -4,7 +4,9 @@ use std::sync::Arc;
 
 use crate::{Analyzer, BoxedTokenizer, TokenFilter, Tokenizer};
 
-/// Composes one Tokenizer and N TokenFilters into a full analysis pipeline.
+/// Runs one tokenizer followed by filters in insertion order.
+///
+/// See `crates/khive-text/docs/api/analyzer-pipeline.md`.
 pub struct StandardAnalyzer {
     tokenizer: BoxedTokenizer,
     filters: Vec<Box<dyn TokenFilter>>,
