@@ -12,7 +12,7 @@
 //! results can be fused with FTS5 candidates via RRF. Persistence (ADR-079):
 //! v2 binary segments under `data_dir/ann/<hex>/`, falling back to legacy v1
 //! JSON snapshot rows, then a full corpus rebuild on cache-miss. See
-//! crates/khive-pack-knowledge/docs/vamana-internals.md for the persistence
+//! crates/khive-pack-knowledge/docs/api/vamana.md for the persistence
 //! fallback chain and the file-size/module-coupling rationale.
 
 use std::collections::{HashMap, HashSet};
@@ -63,7 +63,7 @@ pub(crate) struct AnnState {
     /// Per-namespace write-generation counter (issue #770), keyed by
     /// namespace (not the full `AnnKey`). Bumped by `clear_namespace`;
     /// `install_if_fresher` uses it to reject stale builds. See
-    /// crates/khive-pack-knowledge/docs/vamana-internals.md#annstategenerations-per-namespace-write-generation-counter-issue-770.
+    /// crates/khive-pack-knowledge/docs/api/vamana.md#annstategenerations-per-namespace-write-generation-counter-issue-770.
     generations: std::sync::Mutex<HashMap<String, u64>>,
 }
 
@@ -112,7 +112,7 @@ pub(crate) fn current_generation(ann: &SharedAnn, namespace: &str) -> u64 {
 /// entry's, since `clear_namespace` may have emptied the slot entirely), AND
 /// at least any already-installed entry's generation, so a slower-but-staler
 /// build can never clobber a faster build that scanned a newer corpus. See
-/// crates/khive-pack-knowledge/docs/vamana-internals.md#install_if_fresher-pr-815-covering-issue-770s-empty-slot-scenario.
+/// crates/khive-pack-knowledge/docs/api/vamana.md#install_if_fresher-pr-815-covering-issue-770s-empty-slot-scenario.
 pub(crate) async fn install_if_fresher(ann: &SharedAnn, key: &AnnKey, candidate: AnnBridge) {
     let mut idxs = ann.indexes.write().await;
 
@@ -359,7 +359,7 @@ impl AnnBridge {
     /// leaves the sidecar's stamped hash mismatched against the commit's
     /// hash, so the load-time cross-check detects the torn pair and the
     /// caller rebuilds -- ordering alone is not the guarantee, the hash
-    /// cross-check is. See crates/khive-pack-knowledge/docs/vamana-internals.md#save_atomic.
+    /// cross-check is. See crates/khive-pack-knowledge/docs/api/vamana.md#save_atomic.
     #[allow(dead_code)]
     pub fn save_atomic(&self, dir: &std::path::Path) -> Result<(), String> {
         let count = self.id_map.len();
@@ -967,7 +967,7 @@ pub(crate) fn ensure_ann_background(rt: &KhiveRuntime, token: &NamespaceToken, a
 /// in-memory cache fast path, (2) v2 segment directory (content-hash gated),
 /// (3) legacy v1 JSON snapshot, (4) full corpus rebuild, atomically persisted
 /// as v2 for next restart. See
-/// crates/khive-pack-knowledge/docs/vamana-internals.md#ensure_ann_for_model-load-order
+/// crates/khive-pack-knowledge/docs/api/vamana.md#ensure_ann_for_model-load-order
 /// for the per-step detail.
 pub(crate) async fn ensure_ann_for_model(
     rt: &KhiveRuntime,

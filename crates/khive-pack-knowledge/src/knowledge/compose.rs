@@ -404,7 +404,7 @@ impl Phase {
 /// `finish`/`Drop` both flush the active phase's partial duration -- `Drop`
 /// covers the cancelled-mid-poll case with a distinct "abandoned" WARN so a
 /// request that never responds is not silently invisible. See
-/// crates/khive-pack-knowledge/docs/compose-timing.md for the full
+/// crates/khive-pack-knowledge/docs/api/compose-timing.md for the full
 /// call-ordering contract and the `query_bytes` eager-storage rationale.
 pub(super) struct ComposeTiming {
     start: Instant,
@@ -464,19 +464,11 @@ impl ComposeTiming {
     }
 
     /// Consumes the tracker: flushes any still-active phase, marks it
-    /// complete so `Drop` does not also log an "abandoned" warning for a
-    /// request that finished normally, and emits the slow-request WARN if
-    /// the total reached [`COMPOSE_SLOW_THRESHOLD_MS`].
-    ///
-    /// Returns the post-flush per-phase breakdown in milliseconds.
-    /// Production callers (`compose()`) discard it — the WARN above is the
-    /// real delivery mechanism there. It exists so tests can assert the
-    /// *actual* `finish()` call site flushed the still-active phase without
-    /// needing the request to run long enough to cross
-    /// [`COMPOSE_SLOW_THRESHOLD_MS`] and trigger the WARN itself. Earlier
-    /// regression tests called the private `flush_active` manually before
-    /// `finish`/`drop`, so they never exercised the flush call inside
-    /// `finish`/`Drop` itself.
+    /// complete so `Drop` does not also log an "abandoned" warning, and
+    /// emits the slow-request WARN if the total reached
+    /// [`COMPOSE_SLOW_THRESHOLD_MS`]. Returns the post-flush per-phase
+    /// breakdown (mainly for test assertions — see
+    /// crates/khive-pack-knowledge/docs/api/compose-timing.md).
     pub(super) fn finish(mut self, atom_count: usize) -> [(&'static str, u64); Phase::COUNT] {
         self.flush_active();
         self.completed = true;

@@ -1,6 +1,10 @@
-# Regression test notes
+# Dispatch gate and namespace-isolation invariants
 
-Source: `crates/khive-pack-brain/src/tests.rs` (private `mod tests`, internal to the crate).
+`khive-pack-brain` keeps one live `BrainState` slot per namespace, swapped in and out of a
+single tracker by `ensure_loaded` (`persist.rs`) as `dispatch()` (`pack.rs`) handles calls
+across namespaces. This doc covers the races that arise from that design and the
+regression tests in `crates/khive-pack-brain/src/tests.rs` (private `mod tests`) that pin
+the fixes.
 
 ## `concurrent_cold_load_does_not_clobber_live_state`
 

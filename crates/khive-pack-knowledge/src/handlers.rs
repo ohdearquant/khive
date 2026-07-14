@@ -592,7 +592,7 @@ mod tests {
     }
 
     /// Regression for #346: Tier 3 must read tuned `section_posteriors`, not a
-    /// fresh default. See crates/khive-pack-knowledge/docs/regression-notes.md.
+    /// fresh default. See crates/khive-pack-knowledge/docs/api/compose-type-weights.md.
     #[tokio::test]
     async fn resolve_compose_type_weights_reads_tuned_section_posteriors_at_tier3() {
         let rt = KhiveRuntime::memory().expect("in-memory runtime");
@@ -659,7 +659,7 @@ mod tests {
 
     /// Regression for #346 Tier-2: must read weights from a namespace-bound
     /// brain profile (`brain.bind`), not fall through to Tier 3/default. See
-    /// crates/khive-pack-knowledge/docs/regression-notes.md.
+    /// crates/khive-pack-knowledge/docs/api/compose-type-weights.md.
     #[tokio::test]
     async fn resolve_compose_type_weights_reads_bound_profile_weights_at_tier2() {
         use khive_pack_brain::BrainPack;

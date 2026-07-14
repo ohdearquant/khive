@@ -1,6 +1,6 @@
 //! Per-credential IMAP guardrail: single-flight connection cap + jittered
 //! exponential backoff on connect/auth failure (#605). See
-//! crates/khive-channel-email/docs/backoff-and-retry.md for the 2026-07-04
+//! crates/khive-channel-email/docs/api/backoff.md for the 2026-07-04
 //! outage (#602) this was built to prevent a recurrence of.
 
 use std::time::Duration;
@@ -101,7 +101,7 @@ impl ImapBackoff {
     /// Invariant: `delay <= max` always, even once `step` has itself
     /// saturated at `max` and jitter would otherwise push the sum over the
     /// cap -- `delay` is explicitly clamped, not just additively jittered.
-    /// See crates/khive-channel-email/docs/backoff-and-retry.md for the
+    /// See crates/khive-channel-email/docs/api/backoff.md for the
     /// numeric example this regression guard prevents.
     pub fn record_failure(&mut self) -> BackoffTick {
         self.attempt = self.attempt.saturating_add(1);
@@ -150,7 +150,7 @@ fn jitter(step: Duration) -> Duration {
 /// misconfiguration — backing off only delays the operator noticing),
 /// [`ChannelError::UnauthorizedSender`] and [`ChannelError::InvalidEnvelope`]
 /// (never produced by `poll`/`connect`). See
-/// crates/khive-channel-email/docs/backoff-and-retry.md for the incident
+/// crates/khive-channel-email/docs/api/backoff.md for the incident
 /// grounding behind this classification.
 pub fn is_backoff_eligible(err: &ChannelError) -> bool {
     matches!(err, ChannelError::Auth(_) | ChannelError::Transport(_))
