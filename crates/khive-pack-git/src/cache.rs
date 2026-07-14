@@ -36,9 +36,10 @@
 //! it exist, does it pass `is_owned_entry`) and then mutate it based on that
 //! check. `slot_lock` (issue #805) holds a per-`cache_key` advisory lock for
 //! the full span of each of those functions, so two calls racing the same
-//! slot can never interleave their check-and-mutate sequences -- while calls
-//! against distinct keys never contend with each other, since each key gets
-//! its own lock entry.
+//! slot can never interleave their check-and-mutate sequences. Calls against
+//! distinct keys run their clone/fetch work concurrently; only their short
+//! cache-wide eviction passes are serialized, and those passes defer any
+//! candidate whose per-slot lock is active.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -149,6 +150,14 @@ fn clone_max_bytes() -> u64 {
 /// process's own memory footprint.
 static SLOT_LOCKS: std::sync::LazyLock<Mutex<HashMap<String, Arc<Mutex<()>>>>> =
     std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Eviction passes are serialized so the last overlapping slot mutation to
+/// reach eviction observes every earlier successful operation that has
+/// released its slot lock and can restore the configured caps. Callers
+/// already hold their own slot lock; eviction only probes candidate locks
+/// with `try_lock`, so this ordering cannot deadlock with another mutation
+/// waiting here.
+static EVICTION_LOCK: Mutex<()> = Mutex::new(());
 
 /// Get-or-create the advisory lock for cache slot `key`. Callers hold the
 /// returned lock for the entire check-and-mutate span of their operation on
@@ -623,13 +632,17 @@ fn is_owned_entry(path: &Path) -> bool {
 /// disappearing out from under this call is not an expected repair race --
 /// it is either a genuine bug or an external actor deleting our slot, and
 /// silently sizing it to `0` would let eviction report success while the
-/// slot the caller asked to keep is actually gone. A listed *candidate*
-/// entry (below) is different -- another `evict_lru`/`ensure_clone`
-/// repairing the same root can legitimately delete it between the
-/// `read_dir` listing above and the `dir_size` call below, so that vanish is
-/// tolerated by skipping the entry rather than aborting the whole pass.
+/// slot the caller asked to keep is actually gone. Candidate slots are
+/// sized and removed only while holding their own
+/// `slot_lock`. An active candidate is deferred rather than waited on: every
+/// mutation calls `evict_lru` before releasing its own slot lock, and the
+/// serialized final overlapping successful pass restores the caps after
+/// earlier active candidates finish.
 fn evict_lru(root: &Path, keep: &Path) -> Result<(), CacheError> {
-    let mut entries: Vec<(PathBuf, SystemTime, u64)> = Vec::new();
+    let _eviction_guard = EVICTION_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut entries: Vec<(PathBuf, String, SystemTime, u64)> = Vec::new();
     let read_dir =
         std::fs::read_dir(root).map_err(|e| io_err("evict_lru: read_dir root", root, e))?;
     for entry in read_dir {
@@ -642,7 +655,20 @@ fn evict_lru(root: &Path, keep: &Path) -> Result<(), CacheError> {
             Err(e) => return Err(io_err("evict_lru: read_dir entry", root, e)),
         };
         let p = entry.path();
-        if !p.is_dir() || p == keep || !is_owned_entry(&p) {
+        if p == keep {
+            continue;
+        }
+        let Some(key) = p.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        let key = key.to_string();
+        let lock = slot_lock(&key);
+        let _candidate_guard = match lock.try_lock() {
+            Ok(guard) => guard,
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => continue,
+        };
+        if !p.is_dir() || !is_owned_entry(&p) {
             continue;
         }
         let mtime = std::fs::metadata(p.join(MARKER_FILE))
@@ -656,23 +682,41 @@ fn evict_lru(root: &Path, keep: &Path) -> Result<(), CacheError> {
             Err(CacheError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => continue,
             Err(e) => return Err(e),
         };
-        entries.push((p, mtime, size));
+        entries.push((p, key, mtime, size));
     }
-    entries.sort_by_key(|(_, mtime, _)| *mtime);
+    entries.sort_by_key(|(_, _, mtime, _)| *mtime);
 
     let keep_size = dir_size(keep)?;
-    let mut total: u64 = entries.iter().map(|(_, _, s)| s).sum::<u64>() + keep_size;
+    let mut total: u64 = entries.iter().map(|(_, _, _, s)| s).sum::<u64>() + keep_size;
     let mut count = entries.len() + 1;
     let cap_repos = max_repos();
     let cap_bytes = max_total_bytes();
 
-    for (path, _, size) in entries {
+    for (path, key, _, measured_size) in entries {
         if count <= cap_repos && total <= cap_bytes {
             break;
         }
-        let _ = std::fs::remove_dir_all(&path);
+        let lock = slot_lock(&key);
+        let _candidate_guard = match lock.try_lock() {
+            Ok(guard) => guard,
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => continue,
+        };
+        if !is_owned_entry(&path) {
+            count = count.saturating_sub(1);
+            total = total.saturating_sub(measured_size);
+            continue;
+        }
+        let current_size = dir_size(&path)?;
+        total = total
+            .saturating_sub(measured_size)
+            .saturating_add(current_size);
+        if count <= cap_repos && total <= cap_bytes {
+            break;
+        }
+        remove_owned_entry(root, &path)?;
         count -= 1;
-        total = total.saturating_sub(size);
+        total = total.saturating_sub(current_size);
     }
     Ok(())
 }
@@ -1421,6 +1465,51 @@ mod tests {
         );
 
         drop(guard);
+    }
+
+    /// An eviction pass for one key must not delete another key while that
+    /// key is inside its slot-locked mutation span. The active thread models
+    /// the interval in which `ensure_clone` is blocked in `git fetch`; before
+    /// eviction consulted candidate locks, the count cap deleted `active`
+    /// despite its guard and the operation resumed over a missing slot.
+    #[test]
+    fn eviction_defers_a_candidate_with_an_active_slot_mutation() {
+        let _guard = ENV_MUTEX.blocking_lock();
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::env::set_var("KHIVE_GIT_DIGEST_CACHE_MAX_REPOS", "1");
+        std::env::set_var("KHIVE_GIT_DIGEST_CACHE_MAX_BYTES", "1000000000");
+
+        let root = dir.path();
+        let active_key = "aaaaaaaaaaaaaaaa";
+        let active = make_owned_entry(root, active_key, true);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let keep = make_owned_entry(root, "bbbbbbbbbbbbbbbb", true);
+
+        let active_lock = slot_lock(active_key);
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let active_for_thread = active.clone();
+        let handle = std::thread::spawn(move || {
+            let _active_guard = active_lock.lock().expect("lock active slot");
+            started_tx.send(()).expect("signal active mutation");
+            release_rx.recv().expect("release active mutation");
+            assert!(
+                active_for_thread.exists(),
+                "an active slot must still exist when its mutation resumes"
+            );
+            std::fs::write(active_for_thread.join("mutation-complete"), b"")
+                .expect("complete active mutation");
+        });
+
+        started_rx.recv().expect("wait for active mutation");
+        evict_lru(root, &keep).expect("evict around active slot");
+        assert!(active.exists(), "eviction must defer the active candidate");
+        release_tx.send(()).expect("release active mutation");
+        handle.join().expect("active mutation thread");
+        assert!(active.join("mutation-complete").exists());
+
+        std::env::remove_var("KHIVE_GIT_DIGEST_CACHE_MAX_REPOS");
+        std::env::remove_var("KHIVE_GIT_DIGEST_CACHE_MAX_BYTES");
     }
 
     /// The concrete regression issue #805 describes: before `slot_lock`,
