@@ -1326,7 +1326,7 @@ fn ambiguous_forward_error() -> McpError {
 // the legitimate ADR-049 no-daemon case and never silently swallowed, in
 // either strict or non-strict mode.
 
-/// Best-effort tail of `khived.log` for the loud respawn-failure diagnostic.
+/// Best-effort tail of `khived.log` for the local respawn-failure diagnostic.
 /// Returns `None` on any read failure or if the tail is empty — logging is
 /// best-effort and must never turn a diagnostic path into a second failure.
 fn tail_daemon_log(max_bytes: usize) -> Option<String> {
@@ -1341,10 +1341,11 @@ fn tail_daemon_log(max_bytes: usize) -> Option<String> {
     }
 }
 
-/// Build the loud, caller-visible error for a respawn attempt this process
-/// made and can now positively confirm failed — `detail` names what was
-/// observed (an exit status, or a `Command::spawn` error). Always logs at
-/// `error!` and is always returned to the caller regardless of
+/// Build the caller-visible error for a respawn attempt this process made and
+/// can now positively confirm failed. The detailed observation, resolved
+/// executable path, and shared daemon-log tail stay in local error-level
+/// tracing; callers receive only a stable code and safe remediation. The error
+/// is returned regardless of
 /// `KHIVE_DAEMON_STRICT`: unlike the ordinary "no daemon reachable" fallback
 /// (which may be the legitimate ADR-049 no-daemon deployment), a respawn WE
 /// attempted and can prove failed is never a case for quietly completing the
@@ -1353,18 +1354,11 @@ fn respawn_failed_error(detail: &str) -> McpError {
     let exe = std::env::current_exe()
         .map(|p| p.display().to_string())
         .unwrap_or_else(|_| "<current_exe unresolved>".to_string());
-    let mut msg = format!(
-        "daemon respawn failed: {detail} — resolved daemon binary was \
-         `{exe} mcp --daemon`; this is most likely binary version skew (an \
-         on-disk kkernel predating or otherwise rejecting `mcp --daemon`); \
-         rebuild with `make local`."
-    );
-    if let Some(tail) = tail_daemon_log(2048) {
-        msg.push_str(&format!("\nkhived.log tail:\n{tail}"));
-    }
+    let log_tail = tail_daemon_log(2048);
     tracing::error!(
         exe = %exe,
         detail,
+        daemon_log_tail = log_tail.as_deref().unwrap_or("<unavailable>"),
         "daemon respawn failed loudly (#898): respawn attempt confirmed dead"
     );
     // Under strict mode this is also a pre-dispatch rejection, so preserve
@@ -1379,7 +1373,10 @@ fn respawn_failed_error(detail: &str) -> McpError {
     } else {
         serde_json::json!({"reason": "respawn_failed"})
     };
-    McpError::internal_error(msg, Some(data))
+    McpError::internal_error(
+        "daemon respawn failed (respawn_failed); rebuild with `make local` and retry",
+        Some(data),
+    )
 }
 
 // ── bridge self-heal: re-exec in place on ProtocolMismatch (#714) ───────────
@@ -2735,6 +2732,62 @@ mod tests {
         }
     }
 
+    struct RespawnDisclosureFixture {
+        original_home: Option<std::ffi::OsString>,
+        _home: tempfile::TempDir,
+        sentinel: &'static str,
+    }
+
+    impl RespawnDisclosureFixture {
+        fn new(sentinel: &'static str) -> Self {
+            let original_home = std::env::var_os("HOME");
+            let home = tempfile::tempdir().expect("isolated HOME tempdir");
+            std::env::set_var("HOME", home.path());
+            let log_path = daemon_log_path().expect("HOME resolves daemon log path");
+            std::fs::create_dir_all(log_path.parent().expect("daemon log has parent"))
+                .expect("create daemon log directory");
+            std::fs::write(&log_path, format!("{sentinel}\n")).expect("seed daemon log sentinel");
+            Self {
+                original_home,
+                _home: home,
+                sentinel,
+            }
+        }
+
+        fn assert_caller_output_is_sanitized(&self, error: &McpError) {
+            let caller_output = serde_json::to_string(error).expect("serialize caller MCP error");
+            let executable = std::env::current_exe()
+                .expect("resolve current test executable")
+                .display()
+                .to_string();
+            assert!(
+                !caller_output.contains(self.sentinel),
+                "shared daemon log content must not reach the caller: {caller_output}"
+            );
+            assert!(
+                !caller_output.contains(&executable),
+                "absolute daemon executable path must not reach the caller: {caller_output}"
+            );
+            assert!(
+                caller_output.contains("respawn_failed"),
+                "caller must receive the stable respawn_failed code: {caller_output}"
+            );
+            assert!(
+                caller_output.contains("make local"),
+                "caller must receive safe remediation text: {caller_output}"
+            );
+        }
+    }
+
+    impl Drop for RespawnDisclosureFixture {
+        fn drop(&mut self) {
+            match self.original_home.take() {
+                Some(home) => std::env::set_var("HOME", home),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+    }
+
     #[tokio::test]
     #[serial]
     async fn forward_or_spawn_surfaces_loud_error_when_respawn_confirmed_dead_non_strict() {
@@ -2746,12 +2799,16 @@ mod tests {
         std::env::set_var("KHIVE_LOCK", dir.path().join("khived.recovery.lock"));
         std::env::remove_var("KHIVE_NO_DAEMON");
         std::env::remove_var("KHIVE_DAEMON_STRICT");
+        let disclosure =
+            RespawnDisclosureFixture::new("KHIVE_RESPAWN_LOG_SENTINEL_NON_STRICT_4d9813b72e");
 
         let frame = unreachable_daemon_frame(CFG);
         let out = forward_or_spawn(&frame).await;
 
         match out {
-            Some(Err(McpError { message, .. })) => {
+            Some(Err(error)) => {
+                disclosure.assert_caller_output_is_sanitized(&error);
+                let message = &error.message;
                 assert!(
                     message.contains("respawn failed"),
                     "must name the respawn failure specifically, not a generic \
@@ -2790,12 +2847,16 @@ mod tests {
         std::env::set_var("KHIVE_LOCK", dir.path().join("khived.recovery.lock"));
         std::env::remove_var("KHIVE_NO_DAEMON");
         std::env::set_var("KHIVE_DAEMON_STRICT", "1");
+        let disclosure =
+            RespawnDisclosureFixture::new("KHIVE_RESPAWN_LOG_SENTINEL_STRICT_7ac60d5391");
 
         let frame = unreachable_daemon_frame(CFG);
         let out = forward_or_spawn(&frame).await;
 
         match out {
-            Some(Err(McpError { message, .. })) => {
+            Some(Err(error)) => {
+                disclosure.assert_caller_output_is_sanitized(&error);
+                let message = &error.message;
                 assert!(
                     message.contains("respawn failed"),
                     "strict mode must still surface the specific respawn-failure \
