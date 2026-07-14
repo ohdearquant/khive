@@ -5,7 +5,7 @@
 //! `dmarc`/`spf`/`dkim` verdicts plus their `header.d` / `smtp.mailfrom` /
 //! `header.from` alignment properties. CFWS-aware (quoted strings, nested
 //! comments) so a `;` or `=` inside a quoted pvalue or comment can never forge
-//! an extra segment. See crates/khive-channel-email/docs/auth-results-parsing.md
+//! an extra segment. See crates/khive-channel-email/docs/api/auth-results.md
 //! for the full parsing walkthrough and the two-shapes (RFC 8601 /
 //! no-authserv-id) detection rationale.
 
@@ -112,7 +112,7 @@ fn domain_of(value: &str) -> String {
 }
 
 /// Split a raw header value into top-level `resinfo` segments on `;`,
-/// quote/comment-aware. See crates/khive-channel-email/docs/auth-results-parsing.md#segment-splitting-split_top_level_segments.
+/// quote/comment-aware. See crates/khive-channel-email/docs/api/auth-results.md#segment-splitting-split_top_level_segments.
 fn split_top_level_segments(raw: &str) -> Vec<String> {
     let mut segments = Vec::new();
     let mut current = String::new();
@@ -169,7 +169,7 @@ fn split_top_level_segments(raw: &str) -> Vec<String> {
 /// Split one top-level `resinfo` segment (from [`split_top_level_segments`])
 /// into whitespace-delimited tokens, quote-aware. Malformed quoted input is
 /// retained as one atomic token through EOF rather than resuming whitespace
-/// splitting. See crates/khive-channel-email/docs/auth-results-parsing.md#whitespace-tokenizing-split_top_level_ws.
+/// splitting. See crates/khive-channel-email/docs/api/auth-results.md#whitespace-tokenizing-split_top_level_ws.
 fn split_top_level_ws(segment: &str) -> Vec<String> {
     let mut tokens = Vec::new();
     let mut current = String::new();
@@ -215,7 +215,7 @@ fn split_top_level_ws(segment: &str) -> Vec<String> {
 /// True if `target` occurs in `token` outside a quoted-string span (same
 /// quoted-pair semantics as [`split_top_level_ws`]) -- unlike `str::contains`,
 /// distinguishes a quoted `=` from an unquoted one. See
-/// crates/khive-channel-email/docs/auth-results-parsing.md#contains_unquoted.
+/// crates/khive-channel-email/docs/api/auth-results.md#contains_unquoted.
 fn contains_unquoted(token: &str, target: char) -> bool {
     let mut in_quotes = false;
     let mut chars = token.chars();
@@ -247,7 +247,7 @@ fn contains_unquoted(token: &str, target: char) -> bool {
 /// Detects the RFC 8601 form (leading `authserv-id` token) vs. the
 /// no-authserv-id form (Exchange Online's internal-hop stamp, where the first
 /// token is itself a `resinfo`). Returns `None` only when no signal can be
-/// extracted at all -- see crates/khive-channel-email/docs/auth-results-parsing.md#parse_header
+/// extracted at all -- see crates/khive-channel-email/docs/api/auth-results.md#parse_header
 /// for the full shape-detection contract and the empty-vs-zero-signal distinction.
 pub(crate) fn parse_header(raw: &str) -> Option<AuthResults> {
     let mut all_segments = split_top_level_segments(raw).into_iter();
@@ -355,7 +355,7 @@ pub(crate) fn parse_header(raw: &str) -> Option<AuthResults> {
 /// exists); it is trusted only if it parses AND is itself in the
 /// no-authserv-id form -- any authserv-id on it, or a parse failure, fails
 /// closed to `None` rather than falling through to a lower header. See
-/// crates/khive-channel-email/docs/auth-results-parsing.md#select_trusted for
+/// crates/khive-channel-email/docs/api/auth-results.md#select_trusted for
 /// the topmost-wins rationale and its receiving-MTA precondition.
 pub(crate) fn select_trusted(raw_headers: &[String], anchor: &TrustAnchor) -> Option<AuthResults> {
     match anchor {

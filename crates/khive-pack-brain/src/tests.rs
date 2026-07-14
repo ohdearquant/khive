@@ -1460,7 +1460,7 @@ async fn w4_c4_feedback_accepts_valid_target_and_profile() {
 
 /// Regression (#831): a note-target `brain.feedback` signal must resolve via
 /// `observed_as_signal` (previously unreachable — the decoder hard-coded
-/// `ReferentKind::Entity`). See crates/khive-pack-brain/docs/regression-notes.md#feedback_note_target_resolves_through_observed_as_signal.
+/// `ReferentKind::Entity`). See crates/khive-pack-brain/docs/dispatch-namespace-isolation.md#feedback_note_target_resolves_through_observed_as_signal.
 #[tokio::test]
 async fn feedback_note_target_resolves_through_observed_as_signal() {
     let (pack, rt) = make_pack();
@@ -3569,7 +3569,7 @@ async fn crit1_create_profile_accepts_seed_priors_within_ess_cap() {
 /// must be in a consistent three-way view: `active_namespace == namespace`,
 /// `loaded_namespaces` contains `namespace`, and the shared `BrainState` is
 /// the one for that namespace. Exercised across an A→B→A load sequence. See
-/// crates/khive-pack-brain/docs/regression-notes.md#ensure_loaded_publication_is_atomic.
+/// crates/khive-pack-brain/docs/dispatch-namespace-isolation.md#ensure_loaded_publication_is_atomic.
 #[tokio::test]
 async fn ensure_loaded_publication_is_atomic() {
     use core::convert::TryFrom;
@@ -3818,7 +3818,7 @@ async fn ensure_loaded_cross_namespace_concurrent_does_not_corrupt_saved_states(
 
 /// Deterministic interleaving test for the concurrent cold-load race, using
 /// the test-only `POST_LOAD_HOOK` in persist.rs to pause a loader mid-load.
-/// See crates/khive-pack-brain/docs/regression-notes.md#concurrent_cold_load_does_not_clobber_live_state.
+/// See crates/khive-pack-brain/docs/dispatch-namespace-isolation.md#concurrent_cold_load_does_not_clobber_live_state.
 #[tokio::test]
 async fn concurrent_cold_load_does_not_clobber_live_state() {
     use core::convert::TryFrom;
@@ -3920,7 +3920,7 @@ async fn concurrent_cold_load_does_not_clobber_live_state() {
 /// Proves the dispatch atomicity race EXISTS without the gate: manually
 /// sequences ensure_loaded + handler calls (bypassing `dispatch()`'s gate)
 /// to deterministically reproduce a cross-namespace bookkeeping corruption.
-/// See crates/khive-pack-brain/docs/regression-notes.md#dispatch_gate_race_is_observable_without_gate.
+/// See crates/khive-pack-brain/docs/dispatch-namespace-isolation.md#dispatch_gate_race_is_observable_without_gate.
 #[tokio::test]
 async fn dispatch_gate_race_is_observable_without_gate() {
     use core::convert::TryFrom;
@@ -3984,7 +3984,7 @@ async fn dispatch_gate_race_is_observable_without_gate() {
 /// Proves the dispatch gate FIXES the race from
 /// `dispatch_gate_race_is_observable_without_gate`: with the gate held
 /// across ensure_loaded + handler, no concurrent namespace swap can occur.
-/// See crates/khive-pack-brain/docs/regression-notes.md#dispatch_gate_prevents_cross_namespace_slot_swap.
+/// See crates/khive-pack-brain/docs/dispatch-namespace-isolation.md#dispatch_gate_prevents_cross_namespace_slot_swap.
 #[tokio::test]
 async fn dispatch_gate_prevents_cross_namespace_slot_swap() {
     use core::convert::TryFrom;

@@ -63,8 +63,8 @@ fn sanitize_oauth_error(body: &str) -> &'static str {
 
 /// Test-only reference implementation of the XOAUTH2 SASL wire encoding
 /// (`user=<mailbox>\x01auth=Bearer <token>\x01\x01`, base64). See
-/// crates/khive-channel-email/docs/oauth-notes.md#xoauth2_sasl for why this
-/// is wire-equivalent to what lettre/async-imap do in production.
+/// crates/khive-channel-email/docs/api/oauth.md#xoauth2_sasl-test-only-reference-implementation
+/// for why this is wire-equivalent to what lettre/async-imap do in production.
 #[cfg(test)]
 pub(crate) fn xoauth2_sasl(mailbox: &str, token: &str) -> String {
     let raw = format!("user={mailbox}\x01auth=Bearer {token}\x01\x01");
