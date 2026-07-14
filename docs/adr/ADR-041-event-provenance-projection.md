@@ -658,6 +658,35 @@ event, `decode_signal_observation` picks `ReferentKind` from `event.substrate` (
 back to `Entity` for pre-fix historical events still carrying the `SubstrateKind::Event`
 placeholder), and `observed_as_signal` admits both entity and note referents.
 
+## Amendment A3: `SearchExecuted` admits a typed `result_kind` (2026-07-14, khive#806)
+
+§3's per-verb role mapping and the per-kind decoder examples describe `SearchExecuted`
+`Candidate`/`Selected` projections as note rows only. Entity searches (`search(kind="entity")`)
+also serve results and must be observable with correct typing: stamping entity UUIDs as
+`ReferentKind::Note` would durably misclassify references in the append-only projection.
+
+This amendment makes the `SearchExecuted` referent typing polymorphic:
+
+**Payload key.** `SearchExecuted` payloads gain a `result_kind` string with exactly two
+accepted values, `"entity"` and `"note"`, describing the substrate of every UUID in that
+payload's `candidates` and `selected` lists. A single `SearchExecuted` event never mixes
+substrates; the emitting handler sets `result_kind` from the search's resolved kind.
+
+**Projection rule.** The decoder stamps both `Candidate` and `Selected` rows with
+`ReferentKind::Entity` when `result_kind` is `"entity"` and `ReferentKind::Note` when it is
+`"note"`. Any other present value is a decode error for that event (consistent with the
+closed-value posture elsewhere in this ADR); the error is surfaced, not silently coerced.
+
+**Legacy payloads.** A `SearchExecuted` payload with no `result_kind` key is the documented
+historical note shape: the decoder projects note rows exactly as before this amendment.
+Missing `result_kind` is never a decode error and requires no payload migration — the
+event log is append-only and historical events remain valid as written.
+
+**Query surface.** Synthetic `observed_as_*` traversal and `EventFilter::observed`/`selected`
+matching follow the projected `referent_kind`; entity-search observations resolve to entity
+referents. `RecallExecuted` and `RerankExecuted` are unchanged by this amendment: their
+`Candidate`/`Selected` projections remain note rows (memory recall serves memory notes).
+
 ---
 
 ## References
