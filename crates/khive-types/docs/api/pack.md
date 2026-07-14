@@ -1,12 +1,12 @@
-# Pack + error internals
+# Pack Trait — Atomic Admissibility
 
-Long-form rationale extracted from `src/pack.rs` and `src/khive_error.rs` doc-comments.
-Public-item contracts stay complete in the source; this file carries the
-"why", design history, and cross-references.
+`Pack` (`crates/khive-types/src/pack.rs`) is the trait every khive pack
+(kg, gtd, memory, ...) implements to register its verbs, vocabulary, and
+edge-endpoint rules with the runtime. This is the function-specific
+technical reference for the ADR-099 D3 atomic-unit admissibility rules that
+gate which verbs may run inside a `--atomic` op batch.
 
-## `pack.rs`
-
-### ADR-099 D3 atomic-admissibility rejection classes
+## ADR-099 D3 atomic-admissibility rejection classes
 
 See `crates/khive-types/src/pack.rs` — `ATOMIC_KNOWN_UNIMPLEMENTED_VERBS`.
 
@@ -46,7 +46,7 @@ The `atomic_admissible_list_matches_adr` test in `pack.rs` pins the exact
 list, so an edit to the const forces the editor to also touch the test and
 its ADR citation.
 
-### `ATOMIC_MAX_OPS_DEFAULT` = 2000 — rationale
+## `ATOMIC_MAX_OPS_DEFAULT` = 2000 — rationale
 
 See `crates/khive-types/src/pack.rs` — `ATOMIC_MAX_OPS_DEFAULT`.
 
@@ -57,6 +57,7 @@ default", Open Question 2), so this constant is an explicit interim choice,
 not a value read directly out of the ADR text.
 
 Rationale for 2000 specifically:
+
 - inside D2's "a few thousand" band
 - comfortably bounds the duration of the single cross-process `BEGIN
   IMMEDIATE` hold an atomic unit takes on the daemon's writer lock (ADR-099
@@ -66,39 +67,3 @@ Rationale for 2000 specifically:
 
 Revisit once the load-harness (ADR-067 Component A) has real
 per-op-count latency data under contention.
-
-## `khive_error.rs`
-
-### `Details::build` — bounding/truncation algorithm
-
-See `crates/khive-types/src/khive_error.rs` — private fn `Details::build`.
-
-Takes `ordinary` (already capped at 8 entries, with `total_ordinary` the true
-pre-cap count) plus a reserved-key `collisions` count, and produces the wire
-shape: at most 8 entries, with a `DETAILS_TRUNCATED_KEY` indicator entry
-appended whenever anything was dropped (either overflow past 7 ordinary
-pairs, or a stripped reserved-key collision). This is the shared
-bounding/truncation logic used by both the public `Details::new` constructor
-and the `serde::Deserialize` impl.
-
-### `Details` deserialization — round-trip detection of self-truncated maps
-
-See `crates/khive-types/src/khive_error.rs` — `impl<'de> Visitor<'de> for
-DetailsVisitor` / `visit_map`.
-
-The map visitor drains to completion regardless of size (fixes #487: a naive
-early-exit once 8 entries are collected leaves trailing map bytes unconsumed
-and corrupts the surrounding deserializer). Only the first 8 ordinary pairs
-are retained in memory as they arrive; pairs beyond that are counted, not
-stored, so an adversarially large map can't inflate memory.
-
-`DETAILS_TRUNCATED_KEY` is reserved (PR #549): it is never stored as an
-ordinary entry. Instead the visitor tracks whether the wire map looks
-*exactly* like khive's own truncated serialization — the reserved key
-appears exactly once, as the very last pair, immediately after exactly 7
-ordinary pairs, with a value that parses as a count — and if so, restores
-that as the trusted drop count (a round-trip of a `Details` khive truncated
-itself). Any other occurrence (wrong position, duplicated, or paired with an
-ordinary count that isn't 7) is treated as a client-supplied collision:
-stripped and folded into `Details::build`'s drop accounting like any other
-reserved-key collision.

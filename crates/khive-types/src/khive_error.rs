@@ -264,7 +264,7 @@ impl Details {
     }
 
     /// Bounding/truncation core. See
-    /// crates/khive-types/docs/pack-error-internals.md#detailsbuild--boundingtruncation-algorithm
+    /// crates/khive-types/docs/api/error-taxonomy.md#detailsbuild--boundingtruncation-algorithm
     fn build(
         ordinary: alloc::vec::Vec<(Cow<'static, str>, Cow<'static, str>)>,
         total_ordinary: usize,
@@ -346,7 +346,7 @@ impl<'de> Deserialize<'de> for Details {
                 // at 8 entries left trailing map bytes unconsumed). Detects a
                 // round-tripped self-truncated map vs. a client-supplied
                 // DETAILS_TRUNCATED_KEY collision — see
-                // crates/khive-types/docs/pack-error-internals.md#details-deserialization--round-trip-detection-of-self-truncated-maps
+                // crates/khive-types/docs/api/error-taxonomy.md#details-deserialization--round-trip-detection-of-self-truncated-maps
                 let mut ordinary: alloc::vec::Vec<(Cow<'static, str>, Cow<'static, str>)> =
                     alloc::vec::Vec::new();
                 let mut total_ordinary: usize = 0;

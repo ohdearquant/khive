@@ -1,8 +1,11 @@
-# Pool / writer-task / backend internals
+# Connection Pool
 
-Long-form rationale extracted from `src/pool.rs` doc-comments. Public-item
-contracts stay complete in the source; this file carries the "why" and
-cross-references.
+`ConnectionPool` (`crates/khive-db/src/pool.rs`) owns the SQLite connection(s)
+for a single database file and, when the write queue is enabled, the one
+`WriterTask` that serializes every mutating statement through it. This is the
+function-specific technical reference for the pool's private/internal
+mechanics and the tests that pin them down; see `crates/khive-db/docs/design.md`
+("Single-Writer Write Queue") for the ADR-067 rationale.
 
 ## `ConnectionPool::writer_task_handle` — single-writer-task rationale
 
@@ -18,7 +21,7 @@ writer task would let concurrent migrated stores over the same pool spawn
 independent writer connections that contend with each other at `BEGIN
 IMMEDIATE`, defeating the point of ADR-067 Component A.
 
-## `pool.rs` tests
+## Test coverage notes
 
 ### `writer_guard_transaction_registers_during_closure_only`
 

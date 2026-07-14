@@ -383,7 +383,7 @@ const ATOMIC_EMBEDDING_BEARING_VERBS: &[&str] = &[
 /// that have no *full-parity* prepare/apply seam yet, so they are rejected up
 /// front (checked BEFORE the general admissible-list check) rather than
 /// admitted with a silent gap. See
-/// crates/khive-types/docs/pack-error-internals.md#adr-099-d3-atomic-admissibility-rejection-classes
+/// crates/khive-types/docs/api/pack.md#adr-099-d3-atomic-admissibility-rejection-classes
 /// for why each verb is deferred and the ADR-099 B3 ordering rationale.
 pub const ATOMIC_KNOWN_UNIMPLEMENTED_VERBS: &[&str] = &["propose", "review", "withdraw", "merge"];
 
@@ -405,7 +405,7 @@ const ATOMIC_READ_VERBS: &[&str] = &[
 /// Conservative default maximum op count for one `--atomic` unit (ADR-099
 /// migration step 7 / B3). Override per invocation with
 /// `kkernel exec --atomic --atomic-max-ops N`. See
-/// crates/khive-types/docs/pack-error-internals.md#atomic_max_ops_default--2000--rationale
+/// crates/khive-types/docs/api/pack.md#atomic_max_ops_default--2000--rationale
 /// for why 2000 specifically was chosen and when to revisit it.
 pub const ATOMIC_MAX_OPS_DEFAULT: usize = 2000;
 
