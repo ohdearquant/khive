@@ -72,6 +72,94 @@ verbs are `git`-pack verbs, `pack.verb` namespaced per ADR-023, dispatched throu
 existing `VerbRegistry` / `Gate` seam every other khive verb uses - no new dispatch
 mechanism.
 
+### Required-argument wire and validation contract
+
+Every required argument is a JSON string on the request wire. Omission, JSON `null`, a
+non-string JSON value, and an invalid UTF-8 request are errors; none is coerced to an empty
+string or another type. Validation applies to the decoded string, so a prohibited scalar is
+still prohibited when written as a JSON escape. The handler validates every required field
+before hashing, claiming an operation, or invoking `gh`.
+
+| Argument                                                                    | Wire type | Empty-string rule                   | Size and content contract                                                                                                                                                |
+| --------------------------------------------------------------------------- | --------- | ----------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| All verbs: `repo`                                                           | `string`  | Rejected                            | 3-140 ASCII bytes and exactly one `/`; must satisfy the canonical repository grammar below                                                                               |
+| All verbs: `idempotency_key`                                                | `string`  | Rejected                            | Exactly 36 ASCII bytes; canonical lowercase hyphenated UUID (`8-4-4-4-12` hexadecimal digits)                                                                            |
+| `git.publish_issue.title`, `git.publish_pr.title`                           | `string`  | Rejected                            | 1-256 Unicode scalar values; no Unicode control scalar (`General_Category=Cc`)                                                                                           |
+| `git.publish_issue.body`, `git.publish_comment.body`, `git.publish_pr.body` | `string`  | Accepted and distinct from omission | 0-65,536 Unicode scalar values; no Unicode control scalar except horizontal tab (`U+0009`), line feed (`U+000A`), and carriage return (`U+000D`); NUL is always rejected |
+| `git.publish_comment.target`                                                | `string`  | Rejected                            | 4-26 ASCII bytes and the closed comment-target grammar below                                                                                                             |
+| `git.publish_pr.head`, `git.publish_pr.base`                                | `string`  | Rejected                            | 1-255 ASCII bytes and the GitHub branch-name subset below                                                                                                                |
+| `git.publish_release.tag`                                                   | `string`  | Rejected                            | 1-255 ASCII bytes and the GitHub tag-name subset below                                                                                                                   |
+| `git.publish_release.notes`                                                 | `string`  | Accepted and distinct from omission | 0-65,536 Unicode scalar values; no Unicode control scalar except horizontal tab (`U+0009`), line feed (`U+000A`), and carriage return (`U+000D`); NUL is always rejected |
+
+Required strings are otherwise preserved byte-for-byte. The handler does not trim them,
+apply Unicode normalization, change line endings, or case-fold them. An accepted empty
+`body` or `notes` value therefore remains an empty string in the canonical request; the
+generated reconciliation marker is transport metadata and is not part of that value.
+
+The `idempotency_key` syntax accepts every canonical 128-bit UUID spelling except the nil
+UUID (`00000000-0000-0000-0000-000000000000`); it imposes no version or variant-bit
+restriction. Uppercase hexadecimal, braces, a `urn:uuid:` prefix, missing hyphens, and any
+other spelling are rejected rather than normalized.
+
+`repo` is canonical only when both components are already lowercase ASCII and satisfy all
+of these rules:
+
+```abnf
+repo        = owner "/" repo-name
+owner       = lower-alnum [*37owner-char lower-alnum]
+owner-char  = lower-alnum / "-"
+repo-name   = lower-alnum [*98repo-char lower-alnum]
+repo-char   = lower-alnum / "." / "_" / "-"
+lower-alnum = %x61-7A / DIGIT
+```
+
+- `owner` is 1-39 ASCII lowercase alphanumeric-or-hyphen characters, starts and ends
+  alphanumeric, and contains no consecutive hyphens.
+- `name` is 1-100 ASCII lowercase alphanumeric, `.`, `_`, or `-` characters, starts and
+  ends alphanumeric, and contains no consecutive dots.
+- The wire value is exactly `owner/name`: no hostname, scheme, port, leading or trailing
+  slash, repeated slash, `.git` transport suffix, query, fragment, or surrounding
+  whitespace. Uppercase spellings are rejected rather than silently case-folded.
+
+Every `[git] publish_repos` entry and every pattern-file `[[allow]].repo` value must satisfy
+this same grammar at configuration load time. The validated wire `repo` must then equal one
+configured `publish_repos` entry byte-for-byte. This exact validated value is the only repo
+form stored, hashed, audited, or sent to the transport.
+
+`head`, `base`, and `tag` use this closed ASCII ref subset:
+
+```abnf
+ref       = segment *("/" segment)
+segment   = ref-first *ref-rest
+ref-first = ALPHA / DIGIT / "_"
+ref-rest  = ALPHA / DIGIT / "_" / "-" / "."
+```
+
+The whole value is 1-255 bytes. In addition to the grammar, it must not equal `HEAD`, start
+with `refs/`, contain `..`, have a segment ending in `.` or `.lock`, or have an empty
+segment. These checks are case-sensitive except that the reserved name `HEAD` is rejected
+in any ASCII case. This subset accepts ordinary names such as `main`, `feature/adr-112`,
+and `v1.2.3`, while rejecting whitespace, control characters, backslash, `~`, `^`, `:`,
+`?`, `*`, `[`, a leading dash, and fully qualified ref spellings. `head` is a branch in the
+same repository named by `repo`; fork-qualified PR heads such as `owner:branch` are not
+supported in v0 and are rejected because `:` is outside the grammar. `base` is likewise a
+branch name, and `tag` is a tag name; the caller never supplies `refs/heads/` or
+`refs/tags/`.
+
+The `gh` process boundary has a fixed interpretation. Code selects the executable,
+subcommand, and complete option-name set for each verb; no caller string can select or add
+a command, subcommand, option, environment-variable name, API field name, or output parser.
+Every caller-controlled value emitted in the `gh` argument vector is a separate value bound
+to a code-selected, fixed value-taking option. The builder must not use a command form that
+requires an unbound caller-controlled positional operand: it must instead choose an
+equivalent fixed-option form, encode the value through structured stdin under fixed field
+names, or reject before spawn. It never concatenates a value into an option name or shell
+string. Typed booleans may select only their one documented fixed flag, and arrays expand
+only into repetitions of their documented fixed value-taking option. Thus an accepted
+free-text value such as a title beginning `--` remains data, while an option-looking
+identifier such as a `repo`, `target`, `head`, `base`, or `tag` beginning `-` fails its
+grammar before transport.
+
 ### Canonical request and optional-argument contract
 
 The optional arguments have one wire shape and one normalized representation:
@@ -141,11 +229,11 @@ Deliberately excluded from v0:
 Each verb executes the following steps in order. No remote write occurs until validation,
 authorization, and hygiene scanning have completed:
 
-1. **Argument and repo checks.** Arguments are normalized, `idempotency_key` is validated,
-   the comment-target grammar is validated where applicable, and `repo` is checked against
-   `[git] publish_repos` (daemon config; see "Repo allowlist" below). An unregistered repo
-   fails fast, independent of content - there is no reason to scan text for a repository
-   this daemon can never publish into.
+1. **Argument and repo checks.** Required arguments are validated against the normative wire
+   contract above, optional arguments are normalized, and `repo` is checked against the
+   `[git] publish_repos` daemon config (see "Repo allowlist" below). An unregistered repo fails
+   fast, independent of content - there is no reason to scan text for a repository this
+   daemon can never publish into.
 2. **Publication-hygiene scan.** Every caller-controlled string that can become externally
    visible - `title`, `body`, `notes`, `tag`, `head`, `base`, and every string inside
    `labels`/`assignees` - is scanned by both the token denylist and the secret scan described
@@ -173,8 +261,9 @@ authorization, and hygiene scanning have completed:
    state machine; only a proven `not_published` row may enter the create path.
 6. **GitHub API call.** For a newly claimed or proven `not_published` operation only, the
    verb shells the configured GitHub CLI (`gh`) under the daemon's identity - the same
-   transport ADR-088's ingester and Amendment 1's `git.digest` already use, argv-only, no
-   shell interpolation, matching the discipline
+   transport ADR-088's ingester and Amendment 1's `git.digest` already use, with the fixed
+   option/value binding contract above, argv-only construction, and no shell interpolation,
+   matching the discipline
    ADR-108 Fork (b) required for `git`. `gh` is reused rather than a direct REST client for
    the same reason ADR-088 §5 gave: it already handles auth and pagination correctly for
    this environment. The fixed marker described in "Publish recovery state machine" is
@@ -703,45 +792,56 @@ The implementation ships the verbs, operation ledger, pattern loader, scan, audi
 graph reconciliation, and tests as one change. In addition to unit coverage for the
 pattern file, it must include these contract tests:
 
-1. **Typed audit surface.** Allow, hygiene-deny, transport-error, and recovery-error cases
+1. **Required-argument and argv safety.** Table-driven tests cover omission, JSON `null`,
+   wrong JSON types, the specified empty-string behavior, every accepted control-character
+   exception, every rejected control-character class, and each required text field's
+   minimum, maximum, and maximum-plus-one boundary. Repository component lengths, UUID shape
+   and nil rejection, the target's `u64` boundary, and whole-ref length receive their own
+   boundary cases. Grammar tests also include malformed values, fully qualified refs, a
+   fork-qualified `owner:branch` head, and option-looking identifiers beginning with `-`.
+   Free-text `title`, `body`, and `notes` values and an issue label beginning with `--` are
+   accepted when otherwise valid and arrive byte-for-byte in fixed value slots; a transport
+   spy asserts that they add no option, change no subcommand, and cannot consume a following
+   fixed option. Rejected cases reach neither the operation ledger nor transport.
+2. **Typed audit surface.** Allow, hygiene-deny, transport-error, and recovery-error cases
    append additional rows with `EventKind::Audit`, the precise top-level verb, the correct
    `EventOutcome::{Success, Denied, Error}`, and every required JSON payload key. Tests
    assert that no new `EventKind` spelling is introduced and that deny payloads contain
    rule ids but no rejected content or excerpt. They also distinguish the handler-owned
    row from the automatic generic dispatch row by `payload.audit_type`.
-2. **Comment target validation.** Table-driven handler tests accept `issue#42` and
+3. **Comment target validation.** Table-driven handler tests accept `issue#42` and
    `pr#978`; reject zero, leading zero, case changes, signs, whitespace, overflow, bare
    numbers, URLs, and embedded repositories; and reject a repository-scoped read whose
    remote kind disagrees with the parsed kind. A transport spy proves rejection occurs
    before any comment write.
-3. **Digest-compatible idempotency.** Publish an issue and a PR, then run `git.digest` on
+4. **Digest-compatible idempotency.** Publish an issue and a PR, then run `git.digest` on
    the same repo until complete. For each remote number, assert one note under
    `(kind, namespace, number, project_id)`, the full common property shape, and one
    project `annotates` edge. Repeat self-ingest and digest to prove the counts remain one.
-4. **Recovery failure injection.** Inject a crash or store error after each boundary in
+5. **Recovery failure injection.** Inject a crash or store error after each boundary in
    the recovery table: operation insert, remote response, note upsert, edge ensure, audit
    append, and completion update. Resume with the same idempotency key and assert that the
    remote create spy observed exactly one create, unfinished local work completed, and the
    final success Event exists exactly once. The unconfirmed case must exercise marker
    recovery and the no-match error path.
-5. **Idempotency-key conflict.** Reusing a key with identical normalized arguments returns
+6. **Idempotency-key conflict.** Reusing a key with identical normalized arguments returns
    or resumes the original operation; reusing it with different arguments fails before
    transport.
-6. **External identifier hygiene.** Table-driven fake-transport tests put a token-denylist
+7. **External identifier hygiene.** Table-driven fake-transport tests put a token-denylist
    match and a `secret_gate` match in each of `tag`, `head`, and `base`. Every case returns
    a hygiene denial before an operation-ledger claim or any `gh` invocation, the transport
    spy observes zero GitHub writes, and the deny response plus audit identify the exact
    field. The release cases must include both a denied generic-pattern tag and a
    credential-shaped secret-pattern tag, proving that automatic tag creation cannot bypass
    either scan layer.
-7. **Optional-argument normalization.** For labels and assignees, compare omission with
+8. **Optional-argument normalization.** For labels and assignees, compare omission with
    `[]`, compare at least two permutations of the same non-empty array, and retry each form
    with one idempotency key. For draft, compare omission with `false`. For release title,
    compare omission, `""`, and the normalized tag. Each equivalence case must produce the
    same canonical JSON and request hash and must resume or return the same operation on a
    same-key retry; each genuinely different normalized value must conflict on that key.
    Limit, element-shape, duplicate, and JSON-`null` failures occur before transport.
-8. **Hook/server scan conformance.** The Rust handler suite and the hook implementation's
+9. **Hook/server scan conformance.** The Rust handler suite and the hook implementation's
    suite both execute every case in
    `crates/khive-pack-git/tests/fixtures/publication-hygiene-conformance.toml` against the
    authoritative generic file and test overlay. CI fails on a skipped case, divergent
