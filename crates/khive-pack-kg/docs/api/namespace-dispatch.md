@@ -42,11 +42,11 @@ preserves the ability to read a single named set precisely.
 ## Rule 0: non-local actor config never routes storage
 
 A `VerbRegistry` whose `default_namespace` is a non-local actor (e.g. `[actor] id =
-"lambda:example"`, simulated via `--actor lambda:example`) still routes both `create` and `list`
+"sample-actor"`, simulated via `--actor sample-actor`) still routes both `create` and `list`
 writes/reads through `VerbRegistry::dispatch` (the real MCP path) to `"local"`:
 
 1. A created entity lands in `"local"`, not the configured actor namespace.
 2. A subsequent registry `list` returns the entity — write and read both operate on
    `"local"` regardless of the non-local actor configuration.
-3. A direct-token `list` scoped to the actor namespace (e.g. `"lambda:example"`) returns an empty
+3. A direct-token `list` scoped to the actor namespace (e.g. `"sample-actor"`) returns an empty
    set, proving storage was never written there.

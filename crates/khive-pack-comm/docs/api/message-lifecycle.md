@@ -24,7 +24,9 @@ complete.
 
 Writes an outbound copy (caller namespace) and an inbound copy (recipient
 namespace), rolling back the outbound note if the inbound write fails
-(atomicity guarantee).
+(atomicity guarantee). The recipient-namespace behavior applies to this
+generic cross-namespace path; the public actor-addressed `comm.send` keeps
+both copies in the caller namespace (see below).
 
 `subject`, `thread_id` are optional. `sent_at` is the RFC3339 timestamp for
 both copies. `from_actor` and `to_actor` are optional actor labels (ADR-057)
@@ -62,7 +64,7 @@ Creates a message note in the caller's namespace (outbound) AND delivers an
 inbound copy addressed to the actor label supplied in `to` (ADR-057).
 
 Both copies land in the caller's namespace; no cross-namespace write occurs.
-`from_actor` is set to `token.namespace().as_str()`. `to_actor` is set to the
+`from_actor` is set to `token.actor().id`; the caller namespace is carried separately as the routing `from`/`to` values passed to `dual_write_message`. `to_actor` is set to the
 `to` argument. When the caller's actor label is `"local"` (single-actor
 fallback), `comm.inbox` does not apply an actor filter, preserving backward
 compatibility.

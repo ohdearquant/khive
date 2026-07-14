@@ -7,8 +7,9 @@ built-in `ConsensusObjective` combinator (`objective/` module).
 
 Both the `Objective` trait and the `Selector` (see [selector.md](selector.md)) implement
 precision-weighted scoring as specified in ADR-024. The `precision()` hook returns an
-inverse-variance estimate in $(0, 1]$ for each candidate's score. The default is 1.0 (fully
-trusted). The effective ranking score is:
+inverse-variance estimate for each candidate's score; the default is 1.0 (fully
+trusted). The trait enforces no range: any finite value is used verbatim in
+ranking, and a non-finite value falls back to 1.0. The effective ranking score is:
 
 $$\text{effective} = \text{score} \times \text{precision}$$
 
