@@ -38,7 +38,7 @@ use crate::GtdPack;
 /// Logs a warning and continues if the DDL fails (e.g. read-only replica) —
 /// the audit is best-effort, not load-bearing. `pub`: also called from
 /// `kkernel`'s ADR-099 `--atomic` seam. See
-/// `docs/handlers-internals.md#ensure_audit_schema--why-per-call-not-oncelock`.
+/// `docs/api/lifecycle-audit.md#ensure_audit_schema--why-per-call-not-oncelock`.
 pub async fn ensure_audit_schema(runtime: &KhiveRuntime) {
     let Ok(mut w) = runtime.sql().writer().await else {
         tracing::warn!("gtd: failed to acquire SQL writer for audit schema (non-fatal)");
@@ -182,7 +182,7 @@ struct NextParams {
 /// `handle_complete`'s deserialization target. `pub` with private fields:
 /// `kkernel`'s ADR-099 `--atomic` validation seam reuses this exact struct to
 /// validate `gtd.complete` args, needing only the `Result<_, _>` outcome. See
-/// `docs/handlers-internals.md#completeparams--transitionparams--why-pub-with-private-fields`.
+/// `docs/api/lifecycle-audit.md#completeparams--transitionparams--pub-structs-private-fields`.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CompleteParams {
@@ -440,7 +440,7 @@ const TASK_SCAN_MAX_ROWS: u32 = 20_000;
 /// snapshot query (not a fixed-size unfiltered window — issue #772/#825).
 /// Returns `Err(InvalidInput)` rather than a possibly-truncated result if
 /// more than `TASK_SCAN_MAX_ROWS` rows match. See
-/// `docs/handlers-internals.md#fetch_all_matching_tasks--bounded-single-snapshot-scan-issue-772-825`.
+/// `docs/api/task-query.md#fetch_all_matching_tasks--bounded-single-snapshot-scan-issue-772-825`.
 async fn fetch_all_matching_tasks(
     runtime: &KhiveRuntime,
     token: &NamespaceToken,
