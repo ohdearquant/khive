@@ -41,13 +41,9 @@ const ALLOWED_OAUTH_ERROR_CODES: &[&str] = &[
 ];
 
 /// Extract and allowlist an OAuth error code from a JSON error response body.
-///
-/// Parses the standardized `error` field from the response JSON.  If the field
-/// is present and its value appears in [`ALLOWED_OAUTH_ERROR_CODES`], that
-/// static string slice is returned.  Otherwise `"oauth_error"` is returned as
-/// an opaque, safe indicator.
-///
-/// The raw `body` string is **never** returned or interpolated.
+/// Returns `"oauth_error"` if the `error` field is absent or not in
+/// [`ALLOWED_OAUTH_ERROR_CODES`]. The raw `body` string is **never** returned
+/// or interpolated (see the allowlist doc above for why).
 fn sanitize_oauth_error(body: &str) -> &'static str {
     if let Ok(val) = serde_json::from_str::<serde_json::Value>(body) {
         if let Some(code) = val.get("error").and_then(|v| v.as_str()) {
@@ -65,23 +61,10 @@ fn sanitize_oauth_error(body: &str) -> &'static str {
 
 // ──────────────────────────────────────────────────── XOAUTH2 SASL helpers
 
-/// Return the XOAUTH2 SASL payload as a standard base64 string.
-///
-/// The raw SASL bytes are:
-/// ```text
-/// user=<mailbox>\x01auth=Bearer <token>\x01\x01
-/// ```
-/// which are base64-encoded before being sent on the wire.
-///
-/// For SMTP, `lettre`'s `Mechanism::Xoauth2` constructs the same raw bytes
-/// internally via `Credentials::new(mailbox, access_token)`.
-///
-/// For IMAP, `XOAuth2Authenticator::process` returns the **raw** bytes;
-/// async-imap 0.9 base64-encodes them before sending (see `do_auth_handshake`
-/// in async-imap client.rs:282).  Both paths are therefore wire-equivalent.
-///
-/// This helper is a reference implementation used in tests to verify the
-/// wire encoding.  Production code uses lettre and async-imap directly.
+/// Test-only reference implementation of the XOAUTH2 SASL wire encoding
+/// (`user=<mailbox>\x01auth=Bearer <token>\x01\x01`, base64). See
+/// crates/khive-channel-email/docs/oauth-notes.md#xoauth2_sasl for why this
+/// is wire-equivalent to what lettre/async-imap do in production.
 #[cfg(test)]
 pub(crate) fn xoauth2_sasl(mailbox: &str, token: &str) -> String {
     let raw = format!("user={mailbox}\x01auth=Bearer {token}\x01\x01");

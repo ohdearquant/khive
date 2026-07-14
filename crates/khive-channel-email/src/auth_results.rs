@@ -1,27 +1,13 @@
 //! RFC 8601 `Authentication-Results` header parsing (structural subset).
 //!
-//! `mail-parser` has no structured support for this header -- it is not one of
-//! the RFC 5322 shapes it recognizes, so it always falls through to
-//! `HeaderValue::Text` (or `TextList` when duplicated) via the generic `Other`
-//! header path. This module hand-parses only what the attribution gate needs:
-//! the `authserv-id`, and the `dmarc`/`spf`/`dkim` method verdicts plus the
-//! `header.d` / `smtp.mailfrom` / `header.from` alignment properties.
-//!
-//! The top-level split into `resinfo` segments is CFWS-aware: it walks the raw
-//! header value once, tracking quoted-string state (honoring `\` escapes) and
-//! `(...)` comment nesting (RFC 5322 comments nest), and only treats a `;` as a
-//! segment boundary when it appears outside both. Comments are stripped
-//! entirely before segment text is retained; quoted-string content is kept
-//! verbatim (including any `;` or `=` it contains) as part of the single
-//! segment it belongs to. This guarantees a `;` inside a `reason="..."`
-//! quoted pvalue or inside a `(...)` comment can never manufacture an
-//! additional, unintended `method=result` segment -- see
-//! `parse_header_reason_quoted_semicolon_does_not_forge_dmarc_pass` and
-//! `parse_header_comment_semicolon_does_not_forge_dmarc_pass` below. It does
-//! not attempt full ABNF conformance beyond that (e.g. `ptype.property`
-//! values containing bare `=`) -- those are tolerated as harmless unmatched
-//! tokens, never as false positives against the three keys this module
-//! actually reads.
+//! Hand-parsed because `mail-parser` has no structured support for this header.
+//! Extracts only what the attribution gate needs: `authserv-id`, and the
+//! `dmarc`/`spf`/`dkim` verdicts plus their `header.d` / `smtp.mailfrom` /
+//! `header.from` alignment properties. CFWS-aware (quoted strings, nested
+//! comments) so a `;` or `=` inside a quoted pvalue or comment can never forge
+//! an extra segment. See crates/khive-channel-email/docs/auth-results-parsing.md
+//! for the full parsing walkthrough and the two-shapes (RFC 8601 /
+//! no-authserv-id) detection rationale.
 
 use std::collections::HashMap;
 
@@ -125,13 +111,8 @@ fn domain_of(value: &str) -> String {
     }
 }
 
-/// Split a raw `Authentication-Results` header value into top-level
-/// `resinfo` segments on `;`, tracking RFC 5322 quoted-string state (with `\`
-/// escapes) and `(...)` comment nesting so a `;` inside either is never
-/// treated as a segment boundary. Comment text is stripped entirely (CFWS is
-/// insignificant for token purposes); quoted-string text -- including any `;`
-/// or `=` inside it -- is preserved verbatim as part of its enclosing
-/// segment.
+/// Split a raw header value into top-level `resinfo` segments on `;`,
+/// quote/comment-aware. See crates/khive-channel-email/docs/auth-results-parsing.md#segment-splitting-split_top_level_segments.
 fn split_top_level_segments(raw: &str) -> Vec<String> {
     let mut segments = Vec::new();
     let mut current = String::new();
@@ -185,25 +166,10 @@ fn split_top_level_segments(raw: &str) -> Vec<String> {
     segments
 }
 
-/// Split one top-level `resinfo` segment (already produced by
-/// [`split_top_level_segments`], so comments are already stripped and only
-/// quoted semicolons can remain) into whitespace-delimited tokens, tracking
-/// RFC 5322 quoted-string state (with `\` escapes) so quoted whitespace is
-/// never treated as a token boundary.
-///
-/// This is the second of two delimiter layers: the segment scanner above
-/// finds `;` boundaries; this one finds whitespace boundaries within a
-/// segment. Both share the same quoted-pair semantics (`\` plus the
-/// following character is one atomic unit, regardless of what that character
-/// is), but this layer never sees `(...)` comments -- those were already
-/// discarded by the segment scanner. A token is returned verbatim, including
-/// any retained quote and backslash characters; it is never unquoted.
-///
-/// Malformed input (an unmatched `"`, or a `\` as the final character while
-/// quoted) is handled conservatively: the remainder of the segment is
+/// Split one top-level `resinfo` segment (from [`split_top_level_segments`])
+/// into whitespace-delimited tokens, quote-aware. Malformed quoted input is
 /// retained as one atomic token through EOF rather than resuming whitespace
-/// splitting, so a malformed quoted tail can never be reinterpreted as
-/// additional tokens -- see `split_top_level_ws_keeps_malformed_quoted_tail_atomic`.
+/// splitting. See crates/khive-channel-email/docs/auth-results-parsing.md#whitespace-tokenizing-split_top_level_ws.
 fn split_top_level_ws(segment: &str) -> Vec<String> {
     let mut tokens = Vec::new();
     let mut current = String::new();
@@ -246,13 +212,10 @@ fn split_top_level_ws(segment: &str) -> Vec<String> {
     tokens
 }
 
-/// Returns true if `target` occurs anywhere in `token` *outside* of a
-/// quoted-string span, using the same quoted-pair (`\`) escaping semantics
-/// as [`split_top_level_ws`]. A plain `str::contains` would treat a `=`
-/// inside a quoted value (e.g. a quoted `authserv-id` like `"id=foo"`, which
-/// RFC 8601 §2.2 permits as a valid `value`) the same as an unquoted `=`,
-/// even though the tokenizer that produced `token` already knows the
-/// difference -- this keeps the classification consistent with that state.
+/// True if `target` occurs in `token` outside a quoted-string span (same
+/// quoted-pair semantics as [`split_top_level_ws`]) -- unlike `str::contains`,
+/// distinguishes a quoted `=` from an unquoted one. See
+/// crates/khive-channel-email/docs/auth-results-parsing.md#contains_unquoted.
 fn contains_unquoted(token: &str, target: char) -> bool {
     let mut in_quotes = false;
     let mut chars = token.chars();
@@ -281,26 +244,11 @@ fn contains_unquoted(token: &str, target: char) -> bool {
 
 /// Parse one raw `Authentication-Results` header value.
 ///
-/// Detects two shapes for the first `resinfo`-or-authserv-id segment:
-///
-/// - **RFC 8601 form**: the first whitespace token of the first top-level
-///   segment is the `authserv-id` (a dot-atom/value that can never contain an
-///   unquoted `=`). The remaining segments are parsed as `resinfo` entries.
-/// - **No-authserv-id form** (observed from Exchange Online's internal-hop
-///   stamp): the first whitespace token of the first segment itself contains
-///   an unquoted `=`, which is impossible for a valid authserv-id and
-///   unambiguous for a `resinfo` (`method[/version]=result`). In this case
-///   `authserv_id` is set to `None` and segment 0 is parsed as a `resinfo`
-///   entry through the *same* loop as every other segment -- it is never
-///   discarded as a (nonexistent) authserv-id.
-///
-/// Returns `None` when no signal can be extracted at all: an empty/whitespace
-/// header (no first token), or -- in the no-authserv-id form only -- a header
-/// whose segments contain no recognized `dmarc`/`spf`/`dkim` method entry
-/// anywhere. In the RFC 8601 form, a non-empty authserv-id with no method the
-/// gate recognizes still parses successfully to an `AuthResults` with empty
-/// method vectors (unchanged from prior behavior) -- the gate treats "no
-/// recognized passing method" uniformly regardless of which of those it was.
+/// Detects the RFC 8601 form (leading `authserv-id` token) vs. the
+/// no-authserv-id form (Exchange Online's internal-hop stamp, where the first
+/// token is itself a `resinfo`). Returns `None` only when no signal can be
+/// extracted at all -- see crates/khive-channel-email/docs/auth-results-parsing.md#parse_header
+/// for the full shape-detection contract and the empty-vs-zero-signal distinction.
 pub(crate) fn parse_header(raw: &str) -> Option<AuthResults> {
     let mut all_segments = split_top_level_segments(raw).into_iter();
     let first_segment = all_segments.next()?;
@@ -400,25 +348,15 @@ pub(crate) fn parse_header(raw: &str) -> Option<AuthResults> {
 /// [`TrustAnchor`] (ADR-056 Amendment 2026-07-03, "EXO no-authserv-id trust
 /// anchor").
 ///
-/// - [`TrustAnchor::AuthservId`]: the first (topmost) header, in document
-///   order, whose `authserv-id` matches the configured id (case-insensitive).
-///   Topmost wins: a receiving MTA prepends its own stamp on each hop, so the
-///   header nearest the top of the document is the one added by the final,
-///   trusted receiving boundary -- PROVIDED that boundary strips or renames
-///   any pre-existing header already claiming its own `authserv-id` before
-///   adding its stamp. That stripping is an operational precondition of the
-///   receiving MTA, verified by deployment configuration, not re-derived from
-///   message content here.
-/// - [`TrustAnchor::TopmostNoAuthservId`]: the boundary emits no authserv-id
-///   at all (e.g. Exchange Online's internal-hop stamp), so position is the
-///   *sole* discriminator. Only the literal topmost `Authentication-Results`
-///   header (`raw_headers[0]`) is ever considered -- never a later one, even
-///   if the topmost fails to parse. It is trusted only if it parses AND is
-///   itself in the no-authserv-id form (`authserv_id.is_none()`); if the
-///   topmost carries any authserv-id, or fails to parse, that violates the
-///   invariant that this boundary's own stamp is topmost and unadorned, so the
-///   message quarantines (fails closed) rather than falling through to a
-///   lower header.
+/// `TrustAnchor::AuthservId`: topmost header (document order) whose
+/// `authserv-id` matches the configured id, case-insensitive.
+/// `TrustAnchor::TopmostNoAuthservId`: ONLY `raw_headers[0]` is ever
+/// considered (position is the sole discriminator when no authserv-id
+/// exists); it is trusted only if it parses AND is itself in the
+/// no-authserv-id form -- any authserv-id on it, or a parse failure, fails
+/// closed to `None` rather than falling through to a lower header. See
+/// crates/khive-channel-email/docs/auth-results-parsing.md#select_trusted for
+/// the topmost-wins rationale and its receiving-MTA precondition.
 pub(crate) fn select_trusted(raw_headers: &[String], anchor: &TrustAnchor) -> Option<AuthResults> {
     match anchor {
         TrustAnchor::AuthservId(configured_id) => raw_headers

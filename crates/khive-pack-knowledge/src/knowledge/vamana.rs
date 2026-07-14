@@ -9,14 +9,11 @@
 //! Vamana ANN bridge — parallel semantic signal for `knowledge.search`.
 //!
 //! Wraps `khive_vamana::VamanaIndex` with an ID map (u32 → UUID) so search
-//! results can be fused with FTS5 candidates via RRF.
-//!
-//! Persistence (ADR-079): v2 binary segments are written to `data_dir/ann/<hex>/`
-//! on every cold-start rebuild or explicit reindex.  `ensure_ann_for_model` checks
-//! the v2 segment directory first (content-hash gated), falling back to legacy v1
-//! JSON rows in `retrieval_snapshots` for in-place upgrades, then rebuilds from the
-//! full sqlite-vec corpus on cache-miss.  `kkernel reindex` re-persists v2 segments
-//! and calls `invalidate_snapshot` to clean up stale v1 rows.
+//! results can be fused with FTS5 candidates via RRF. Persistence (ADR-079):
+//! v2 binary segments under `data_dir/ann/<hex>/`, falling back to legacy v1
+//! JSON snapshot rows, then a full corpus rebuild on cache-miss. See
+//! crates/khive-pack-knowledge/docs/vamana-internals.md for the persistence
+//! fallback chain and the file-size/module-coupling rationale.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -63,19 +60,10 @@ pub(crate) struct AnnState {
     /// Keys currently being warmed (or already warmed). `std::sync::Mutex`
     /// so the fire-and-check guard in `ensure_ann_background` stays sync.
     warming: std::sync::Mutex<HashSet<AnnKey>>,
-    /// Per-namespace write-generation counter (issue #770). Bumped by
-    /// `clear_namespace` whenever a corpus mutation invalidates a namespace's
-    /// ANN slots. `ensure_ann_for_model` captures the current value for its
-    /// namespace before doing anything else — including before its own
-    /// "already loaded" fast path and before the corpus scan — and stamps it
-    /// on the resulting `AnnBridge`. `install_if_fresher` then only replaces
-    /// an already-installed entry when the candidate's generation is >= the
-    /// installed entry's, instead of the old `entry(key).or_insert(...)`,
-    /// which always kept whichever build reached the install site first even
-    /// if it had scanned a corpus version predating a later invalidation.
-    /// Keyed by namespace (not the full `AnnKey`) because `clear_namespace`
-    /// only knows the namespace being invalidated, not which models have (or
-    /// will have) a build in flight for it.
+    /// Per-namespace write-generation counter (issue #770), keyed by
+    /// namespace (not the full `AnnKey`). Bumped by `clear_namespace`;
+    /// `install_if_fresher` uses it to reject stale builds. See
+    /// crates/khive-pack-knowledge/docs/vamana-internals.md#annstategenerations-per-namespace-write-generation-counter-issue-770.
     generations: std::sync::Mutex<HashMap<String, u64>>,
 }
 
@@ -118,21 +106,13 @@ pub(crate) fn current_generation(ann: &SharedAnn, namespace: &str) -> u64 {
 }
 
 /// Install `candidate` into the cache for `key` unless it is stale (PR #815,
-/// covering issue #770's empty-slot scenario). Two
-/// independent fences, both evaluated while holding the write lock:
-///
-/// 1. `candidate.generation` must be >= the namespace's CURRENT generation.
-///    Comparing only against an existing entry (the old behavior) has
-///    nothing to compare against once `clear_namespace` has emptied the
-///    slot — a pre-invalidation candidate would install unconditionally
-///    even though it scanned a corpus version the namespace has since
-///    invalidated. `clear_namespace` bumps the generation counter inside
-///    this same write-lock scope, so a candidate's read of the current
-///    generation here can never observe a pre-bump value for a slot that
-///    has already been (or is about to be) evicted.
-/// 2. `candidate.generation` must be >= any already-installed entry's
-///    generation, so a slower-but-staler build can never clobber a faster
-///    build that already scanned a newer corpus.
+/// covering issue #770's empty-slot scenario). Two independent fences, both
+/// evaluated while holding the write lock: candidate's generation must be at
+/// least the namespace's CURRENT generation (not just any already-installed
+/// entry's, since `clear_namespace` may have emptied the slot entirely), AND
+/// at least any already-installed entry's generation, so a slower-but-staler
+/// build can never clobber a faster build that scanned a newer corpus. See
+/// crates/khive-pack-knowledge/docs/vamana-internals.md#install_if_fresher-pr-815-covering-issue-770s-empty-slot-scenario.
 pub(crate) async fn install_if_fresher(ann: &SharedAnn, key: &AnnKey, candidate: AnnBridge) {
     let mut idxs = ann.indexes.write().await;
 
@@ -372,19 +352,14 @@ impl AnnBridge {
         })
     }
 
-    /// Save this bridge to `dir` atomically.
-    ///
-    /// Writes Vamana index segments via [`VamanaIndex::save_atomic`] (which commits
-    /// a v2 KHVVAMG2 record in `metadata.bin` carrying a `content_hash`), then writes
-    /// the id-map sidecar (`external_ids.bin`) atomically via a tmp-then-rename sequence.
-    /// The sidecar is stamped with the corpus `content_hash` taken from the v2 commit
-    /// record.
-    ///
-    /// Crash-safety rationale: the v2 segment commit gate is `metadata.bin`, and the
-    /// sidecar is written second. On any crash between the two writes the sidecar's
-    /// stamped hash will not match the new commit's hash, so the load-time cross-check
-    /// detects the torn pair and the caller rebuilds. Ordering alone is insufficient;
-    /// the cross-check is the guarantee.
+    /// Save this bridge to `dir` atomically: writes v2 Vamana segments (commits
+    /// `metadata.bin` with a `content_hash`), then the id-map sidecar
+    /// (`external_ids.bin`, tmp-then-rename) stamped with that same
+    /// `content_hash`. Crash-safety invariant: a crash between the two writes
+    /// leaves the sidecar's stamped hash mismatched against the commit's
+    /// hash, so the load-time cross-check detects the torn pair and the
+    /// caller rebuilds -- ordering alone is not the guarantee, the hash
+    /// cross-check is. See crates/khive-pack-knowledge/docs/vamana-internals.md#save_atomic.
     #[allow(dead_code)]
     pub fn save_atomic(&self, dir: &std::path::Path) -> Result<(), String> {
         let count = self.id_map.len();
@@ -988,21 +963,12 @@ pub(crate) fn ensure_ann_background(rt: &KhiveRuntime, token: &NamespaceToken, a
     });
 }
 
-/// Lazy warm-load for a specific `model`.
-///
-/// Load order (first hit wins):
-///
-/// 1. **Fast path** — already in the in-memory cache; return immediately.
-/// 2. **v2 segment path** — if a `data_dir/ann/<hex>/` directory exists with a
-///    valid `metadata.bin`, compare its `content_hash` against a freshly computed
-///    `live_content_hash`.  On match, load the Vamana binary segments directly via
-///    `AnnBridge::load` (O(load), no rebuild).  On mismatch, fall through.
-/// 3. **v1 JSON snapshot path** — try `retrieval_snapshots`; on hit, validate
-///    the `CorpusFingerprint` (count + dims) and restore from JSON.  On miss /
-///    stale / corrupt, fall through.
-/// 4. **Rebuild fallthrough** — scan the full sqlite-vec corpus, build the index
-///    from scratch, and atomically write a v2 segment directory so the next daemon
-///    restart can use path 2.  Write failures are logged and do not block search.
+/// Lazy warm-load for a specific `model`. Load order (first hit wins): (1)
+/// in-memory cache fast path, (2) v2 segment directory (content-hash gated),
+/// (3) legacy v1 JSON snapshot, (4) full corpus rebuild, atomically persisted
+/// as v2 for next restart. See
+/// crates/khive-pack-knowledge/docs/vamana-internals.md#ensure_ann_for_model-load-order
+/// for the per-step detail.
 pub(crate) async fn ensure_ann_for_model(
     rt: &KhiveRuntime,
     token: &NamespaceToken,
