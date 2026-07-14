@@ -438,7 +438,8 @@ pub async fn append_event_on_writer(
 fn decode_event_observations(event: &Event) -> Result<Vec<EventObservation>, rusqlite::Error> {
     match event.kind {
         EventKind::RerankExecuted => decode_rerank_observations(event),
-        EventKind::RecallExecuted | EventKind::SearchExecuted => decode_recall_observations(event),
+        EventKind::RecallExecuted => decode_recall_observations(event),
+        EventKind::SearchExecuted => decode_search_observations(event),
         EventKind::LinkCreated => decode_link_observations(event),
         EventKind::EntityCreated
         | EventKind::EntityUpdated
@@ -552,7 +553,10 @@ fn payload_uuid(event: &Event, field: &'static str) -> Result<Option<Uuid>, rusq
         .map_err(|e| invalid_payload(event.kind, field, e))
 }
 
-fn decode_candidate_observations(event: &Event) -> Result<Vec<EventObservation>, rusqlite::Error> {
+fn decode_candidate_observations(
+    event: &Event,
+    referent_kind: ReferentKind,
+) -> Result<Vec<EventObservation>, rusqlite::Error> {
     let mut rows = Vec::new();
 
     for (position, entity_id) in payload_uuid_array(event, "candidates")?
@@ -569,7 +573,7 @@ fn decode_candidate_observations(event: &Event) -> Result<Vec<EventObservation>,
         rows.push(EventObservation {
             event_id: event.id,
             entity_id,
-            referent_kind: ReferentKind::Note,
+            referent_kind,
             role: ObservationRole::Candidate,
             position: position_u32,
         });
@@ -581,6 +585,7 @@ fn decode_candidate_observations(event: &Event) -> Result<Vec<EventObservation>,
 fn push_selected_observations(
     event: &Event,
     selected: Vec<Uuid>,
+    referent_kind: ReferentKind,
     rows: &mut Vec<EventObservation>,
 ) -> Result<(), rusqlite::Error> {
     for (position, entity_id) in selected.into_iter().enumerate() {
@@ -594,7 +599,7 @@ fn push_selected_observations(
         rows.push(EventObservation {
             event_id: event.id,
             entity_id,
-            referent_kind: ReferentKind::Note,
+            referent_kind,
             role: ObservationRole::Selected,
             position: position_u32,
         });
@@ -602,13 +607,43 @@ fn push_selected_observations(
     Ok(())
 }
 
-/// `RecallExecuted`/`SearchExecuted` payloads carry a flat `selected: Vec<Uuid>`
-/// field (ADR-041 §"Projection rules"). These payloads are untyped JSON; the
-/// ADR-041 projection contract makes `selected` the only field consulted here.
+/// `RecallExecuted` payloads carry flat candidate and selected note UUID lists.
 fn decode_recall_observations(event: &Event) -> Result<Vec<EventObservation>, rusqlite::Error> {
-    let mut rows = decode_candidate_observations(event)?;
+    let mut rows = decode_candidate_observations(event, ReferentKind::Note)?;
     let selected = payload_uuid_array_opt(event, "selected")?.unwrap_or_default();
-    push_selected_observations(event, selected, &mut rows)?;
+    push_selected_observations(event, selected, ReferentKind::Note, &mut rows)?;
+    Ok(rows)
+}
+
+/// `SearchExecuted.result_kind` identifies which substrate owns every UUID in
+/// the candidate and selected lists. Rejecting missing or unknown values keeps
+/// the append-only projection from persisting an untyped reference.
+fn decode_search_observations(event: &Event) -> Result<Vec<EventObservation>, rusqlite::Error> {
+    let referent_kind = match event
+        .payload
+        .get("result_kind")
+        .and_then(|value| value.as_str())
+    {
+        Some("entity") => ReferentKind::Entity,
+        Some("note") => ReferentKind::Note,
+        Some(_) => {
+            return Err(invalid_payload(
+                event.kind,
+                "result_kind",
+                "expected \"entity\" or \"note\"",
+            ));
+        }
+        None => {
+            return Err(invalid_payload(
+                event.kind,
+                "result_kind",
+                "expected string \"entity\" or \"note\"",
+            ));
+        }
+    };
+    let mut rows = decode_candidate_observations(event, referent_kind)?;
+    let selected = payload_uuid_array_opt(event, "selected")?.unwrap_or_default();
+    push_selected_observations(event, selected, referent_kind, &mut rows)?;
     Ok(rows)
 }
 
@@ -622,11 +657,11 @@ fn decode_recall_observations(event: &Event) -> Result<Vec<EventObservation>, ru
 /// absent (`None`) — a present-but-malformed `final_scores` errors
 /// immediately instead of masking the problem by falling through.
 fn decode_rerank_observations(event: &Event) -> Result<Vec<EventObservation>, rusqlite::Error> {
-    let mut rows = decode_candidate_observations(event)?;
+    let mut rows = decode_candidate_observations(event, ReferentKind::Note)?;
     let selected = payload_final_scores_uuid_array_opt(event, "final_scores")?
         .or(payload_reranked_uuid_array_opt(event, "reranked")?)
         .unwrap_or_default();
-    push_selected_observations(event, selected, &mut rows)?;
+    push_selected_observations(event, selected, ReferentKind::Note, &mut rows)?;
 
     Ok(rows)
 }

@@ -1016,6 +1016,7 @@ async fn synthetic_edge_observed_as_selected_returns_memory_note() {
         "agent:test",
     );
     event.payload = serde_json::json!({
+        "result_kind": "note",
         "candidates": [],
         "selected": [memory_id.to_string()]
     });

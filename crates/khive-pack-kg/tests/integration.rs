@@ -11,7 +11,7 @@ use khive_runtime::{
     EntityCreateSpec, KhiveRuntime, Namespace, NamespaceToken, ParamDef, RuntimeError,
     VerbCategory, VerbRegistry, VerbRegistryBuilder, Visibility,
 };
-use khive_storage::Note;
+use khive_storage::{Note, SqlStatement, SqlValue};
 use khive_types::Pack;
 use serde_json::{json, Value};
 
@@ -10987,6 +10987,109 @@ async fn poll_search_executed_events(
     Vec::new()
 }
 
+async fn assert_search_projection(
+    rt: &KhiveRuntime,
+    store: &std::sync::Arc<dyn khive_storage::EventStore>,
+    event: &khive_storage::Event,
+    hits: &[Value],
+    referent_kind: &str,
+) {
+    let expected_ids: Vec<String> = hits
+        .iter()
+        .map(|hit| {
+            hit["id"]
+                .as_str()
+                .expect("search hit id must be a UUID string")
+                .to_string()
+        })
+        .collect();
+    assert_eq!(event.payload["candidates"], json!(expected_ids));
+    assert_eq!(event.payload["selected"], json!(expected_ids));
+
+    let mut reader = rt.sql().reader().await.expect("sql reader must open");
+    let rows = reader
+        .query_all(SqlStatement {
+            sql: "SELECT entity_id, referent_kind, role, position \
+                  FROM event_observations WHERE event_id = ?1 \
+                  ORDER BY CASE role WHEN 'candidate' THEN 0 ELSE 1 END, position"
+                .into(),
+            params: vec![SqlValue::Text(event.id.to_string())],
+            label: Some("search_observation_projection".into()),
+        })
+        .await
+        .expect("projection query must succeed");
+
+    let projected: Vec<(String, String, String, i64)> = rows
+        .iter()
+        .map(|row| {
+            let text = |column| match row.get(column) {
+                Some(SqlValue::Text(value)) => value.clone(),
+                other => panic!("{column} must be text, got {other:?}"),
+            };
+            let position = match row.get("position") {
+                Some(SqlValue::Integer(value)) => *value,
+                other => panic!("position must be integer, got {other:?}"),
+            };
+            (
+                text("entity_id"),
+                text("referent_kind"),
+                text("role"),
+                position,
+            )
+        })
+        .collect();
+    let expected_projection: Vec<(String, String, String, i64)> = ["candidate", "selected"]
+        .into_iter()
+        .flat_map(|role| {
+            expected_ids.iter().enumerate().map(move |(position, id)| {
+                (
+                    id.clone(),
+                    referent_kind.to_string(),
+                    role.to_string(),
+                    position as i64,
+                )
+            })
+        })
+        .collect();
+    assert_eq!(projected, expected_projection);
+
+    let first_id = uuid::Uuid::parse_str(&expected_ids[0]).expect("search hit id must parse");
+    for (filter_name, filter) in [
+        (
+            "observed",
+            khive_storage::EventFilter {
+                kinds: vec![khive_types::EventKind::SearchExecuted],
+                observed: vec![first_id],
+                ..Default::default()
+            },
+        ),
+        (
+            "selected",
+            khive_storage::EventFilter {
+                kinds: vec![khive_types::EventKind::SearchExecuted],
+                selected: vec![first_id],
+                ..Default::default()
+            },
+        ),
+    ] {
+        let page = store
+            .query_events(
+                filter,
+                khive_storage::types::PageRequest {
+                    limit: 10,
+                    offset: 0,
+                },
+            )
+            .await
+            .unwrap_or_else(|error| panic!("{filter_name} filter failed: {error}"));
+        assert_eq!(
+            page.items.iter().map(|item| item.id).collect::<Vec<_>>(),
+            vec![event.id],
+            "{filter_name} must find the search event through its projection"
+        );
+    }
+}
+
 #[tokio::test]
 async fn search_entity_emits_exactly_one_search_executed_event() {
     let rt = KhiveRuntime::memory().expect("in-memory runtime must succeed");
@@ -11060,6 +11163,7 @@ async fn search_entity_emits_exactly_one_search_executed_event() {
         hits.len(),
         "selected must carry the full served result-ID list"
     );
+    assert_search_projection(&rt, &store, event, hits, "entity").await;
 }
 
 #[tokio::test]
@@ -11105,4 +11209,5 @@ async fn search_note_emits_exactly_one_search_executed_event_with_note_result_ki
     let event = &search_events[0];
     assert_eq!(event.payload["result_kind"], json!("note"));
     assert_eq!(event.payload["result_count"], json!(hits.len()));
+    assert_search_projection(&rt, &store, event, hits, "note").await;
 }

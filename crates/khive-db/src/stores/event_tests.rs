@@ -25,6 +25,7 @@ fn make_event(namespace: &str) -> Event {
         SubstrateKind::Note,
         "agent:test",
     )
+    .with_payload(json!({ "result_kind": "note" }))
 }
 
 #[tokio::test]
@@ -146,6 +147,7 @@ async fn append_event_writes_observations_atomically() {
     let mut event = make_event("default");
     event.kind = EventKind::SearchExecuted;
     event.payload = json!({
+        "result_kind": "note",
         "candidates": [candidate.to_string()],
         "selected": [selected.to_string()],
         "served_by_profile_id": "profile-a"
@@ -185,6 +187,25 @@ async fn append_event_writes_observations_atomically() {
 
     assert_eq!(candidate_count, 1, "expected one candidate observation row");
     assert_eq!(selected_count, 1, "expected one selected observation row");
+}
+
+#[tokio::test]
+async fn search_executed_rejects_unknown_result_kind() {
+    let store = setup_memory_store();
+    let mut event = make_event("default");
+    event.payload = json!({
+        "result_kind": "edge",
+        "candidates": [Uuid::new_v4().to_string()],
+        "selected": []
+    });
+    let event_id = event.id;
+
+    let result = store.append_event(event).await;
+    assert!(result.is_err(), "unknown result_kind must be rejected");
+    assert!(
+        store.get_event(event_id).await.unwrap().is_none(),
+        "invalid event and projection must roll back atomically"
+    );
 }
 
 async fn selected_uuids_for(store: &SqlEventStore, event_id: Uuid) -> Vec<String> {
@@ -647,6 +668,7 @@ async fn query_events_filters_by_observed() {
     let mut event = make_event("default");
     event.kind = EventKind::SearchExecuted;
     event.payload = json!({
+        "result_kind": "entity",
         "candidates": [entity_id.to_string()],
         "selected": []
     });
@@ -677,6 +699,7 @@ async fn query_events_filters_by_selected() {
     let mut event = make_event("default");
     event.kind = EventKind::SearchExecuted;
     event.payload = json!({
+        "result_kind": "entity",
         "candidates": [],
         "selected": [entity_id.to_string()]
     });

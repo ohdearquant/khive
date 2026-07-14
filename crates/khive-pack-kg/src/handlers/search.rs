@@ -356,6 +356,7 @@ async fn emit_search_executed_event(
         "query": query,
         "result_kind": result_kind,
         "result_count": result_count,
+        "candidates": selected,
         "selected": selected,
         "latency_us": latency_us,
     });
