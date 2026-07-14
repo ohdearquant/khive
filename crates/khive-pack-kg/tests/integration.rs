@@ -9,7 +9,7 @@ use khive_pack_kg::KgPack;
 use khive_runtime::pack::{HandlerDef, PackRuntime};
 use khive_runtime::{
     EntityCreateSpec, KhiveRuntime, Namespace, NamespaceToken, ParamDef, RuntimeError,
-    VerbCategory, VerbRegistry, VerbRegistryBuilder, Visibility,
+    VerbCategory, VerbRegistry, VerbRegistryBuilder, VerifiedActor, Visibility,
 };
 use khive_storage::{Note, SqlStatement, SqlValue};
 use khive_types::Pack;
@@ -7638,6 +7638,132 @@ async fn review_with_old_proposal_id_param_is_rejected() {
     assert!(
         msg.contains("proposal_id"),
         "error must mention 'proposal_id'; got: {msg}"
+    );
+}
+
+// ── dispatch_as: verified-actor dispatch for embedding hosts ────────────────
+
+/// `VerbRegistry::dispatch_as` must make the supplied verified actor become
+/// exactly the `reviewer` a `review` handler observes — the same
+/// `token.actor().id` field `handle_review` already reads for every dispatch
+/// path. This is the end-to-end proof that an embedding host's out-of-band
+/// authenticated principal becomes the acting principal through this pack's
+/// handlers, with no changes to `proposal.rs` itself.
+#[tokio::test]
+async fn dispatch_as_routes_verified_actor_to_review_handler() {
+    let f = pack_with_events();
+
+    let propose = f
+        .dispatch(
+            "propose",
+            json!({
+                "title": "dispatch_as reviewer routing",
+                "description": "verify reviewer field reflects verified_actor",
+                "changeset": changeset_add_entity(),
+            }),
+        )
+        .await
+        .expect("propose must succeed");
+    let pid = propose["id"].as_str().expect("id").to_string();
+
+    let review = f
+        .registry
+        .dispatch_as(
+            "review",
+            json!({ "id": pid, "decision": "approve" }),
+            VerifiedActor::new("gateway:verified-principal").unwrap(),
+        )
+        .await
+        .expect("dispatch_as(review) must succeed");
+
+    assert_eq!(
+        review.get("reviewer").and_then(|v| v.as_str()),
+        Some("gateway:verified-principal"),
+        "review handler must observe the verified_actor supplied to dispatch_as as \
+         the reviewer; got {review}"
+    );
+}
+
+/// Regression: `VerbRegistry::dispatch` (no verified actor) is unaffected by
+/// the existence of `dispatch_as` — the default/anonymous actor path through
+/// `propose`/`review` behaves exactly as before this API was added.
+#[tokio::test]
+async fn dispatch_unchanged_after_dispatch_as_added() {
+    let f = pack_with_events();
+
+    let propose = f
+        .dispatch(
+            "propose",
+            json!({
+                "title": "plain dispatch regression",
+                "description": "reviewer must still default to anonymous local actor",
+                "changeset": changeset_add_entity(),
+            }),
+        )
+        .await
+        .expect("propose must succeed");
+    let pid = propose["id"].as_str().expect("id").to_string();
+    assert_eq!(
+        propose.get("proposer").and_then(|v| v.as_str()),
+        Some("local")
+    );
+
+    let review = f
+        .dispatch("review", json!({ "id": pid, "decision": "approve" }))
+        .await
+        .expect("plain dispatch(review) must still succeed");
+
+    assert_eq!(
+        review.get("reviewer").and_then(|v| v.as_str()),
+        Some("local"),
+        "plain dispatch() must keep resolving the anonymous/local actor, unchanged \
+         by dispatch_as being added to the registry"
+    );
+}
+
+/// A request `params` payload cannot inject an actor through `dispatch_as`:
+/// `review`'s params schema has no `actor` field and denies unknown fields,
+/// so an `actor` key in `params` is rejected exactly like any other unknown
+/// field — it never reaches (and can never override) the verified actor.
+#[tokio::test]
+async fn dispatch_as_rejects_actor_key_in_params() {
+    let f = pack_with_events();
+
+    let propose = f
+        .dispatch(
+            "propose",
+            json!({
+                "title": "dispatch_as actor injection guard",
+                "description": "an actor key in params must be rejected, not honored",
+                "changeset": changeset_add_entity(),
+            }),
+        )
+        .await
+        .expect("propose must succeed");
+    let pid = propose["id"].as_str().expect("id").to_string();
+
+    let err = f
+        .registry
+        .dispatch_as(
+            "review",
+            json!({ "id": pid, "decision": "approve", "actor": "spoofed-actor" }),
+            VerifiedActor::new("gateway:verified-principal").unwrap(),
+        )
+        .await;
+
+    assert!(
+        err.is_err(),
+        "review(..., actor=<spoofed>) via dispatch_as must be rejected; got Ok"
+    );
+    let e = err.unwrap_err();
+    assert!(
+        is_invalid_input(&e),
+        "actor key in params must produce InvalidInput; got {e:?}"
+    );
+    let msg = invalid_input_message(&e);
+    assert!(
+        msg.contains("unknown field"),
+        "error must mention 'unknown field'; got: {msg}"
     );
 }
 
