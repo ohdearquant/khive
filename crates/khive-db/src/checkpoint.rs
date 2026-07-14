@@ -2821,11 +2821,12 @@ mod tests {
     /// flaky, directly rather than hoping cargo's test scheduler happens to
     /// interleave two unrelated tests. `tx_registry` is a process-wide
     /// singleton; a decoy entry registered before this test's own entry is
-    /// genuinely older, so raw `oldest()` returns the decoy — exactly what an
-    /// unrelated, concurrently-running write path (e.g. `graph_upsert_edges`)
-    /// could do in the real suite. The fix (looking up this test's own entry
-    /// by label via `snapshot()` instead of trusting global `oldest()`) must
-    /// still correctly name and escalate THIS entry despite that older decoy.
+    /// genuinely older, so raw `oldest()` cannot return the test fixture —
+    /// exactly what an unrelated, concurrently-running write path (e.g.
+    /// `graph_upsert_edges`) could do in the real suite. The fix (looking up
+    /// this test's own entry by label via `snapshot()` instead of trusting
+    /// global `oldest()`) must still correctly name and escalate THIS entry
+    /// despite that older decoy.
     #[test]
     #[serial(tx_registry, checkpoint_skip_metrics)]
     fn tx_age_sweep_own_entry_survives_concurrent_older_registration() {
@@ -2834,12 +2835,15 @@ mod tests {
         let _own = khive_storage::tx_registry::register(Some("this_test_own_span".to_string()));
         std::thread::sleep(Duration::from_millis(5));
 
-        // Confirm the race condition is actually reproduced: the decoy must
-        // currently be the process-wide oldest entry, same as the bug report.
+        // Confirm the race condition is actually reproduced: an entry older
+        // than this test's own span must currently lead the process-wide
+        // registry. Another concurrently running test may have registered an
+        // entry before the decoy, so do not assume the decoy is globally
+        // oldest; the required invariant is only that our span is not.
         let global_oldest = khive_storage::tx_registry::oldest().expect("registry not empty");
-        assert_eq!(
+        assert_ne!(
             global_oldest.2.as_deref(),
-            Some("decoy_unrelated_span"),
+            Some("this_test_own_span"),
             "test setup must reproduce the race: an older, unrelated entry must be \
              the current global oldest, got: {global_oldest:?}"
         );
