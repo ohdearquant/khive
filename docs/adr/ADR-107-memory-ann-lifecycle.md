@@ -10,8 +10,8 @@
 [ADR-021](ADR-021-memory-pack.md) specifies `memory.recall`'s scoring and candidate-scoping
 contract but does not address ANN cache freshness — recall is defined as if the index were
 always current. [ADR-079](ADR-079-ann-persistence-warm-path-integration.md) defines a warm/stale/cold
-serving model with a durable content-hash restart check, but it is Proposed, scoped to the
-knowledge pack's v2 segment format, and explicitly excludes memory-pack migration from its
+serving model with a durable content-hash restart check, but it is scoped to the
+knowledge pack's v2 segment format and explicitly excludes memory-pack migration from its
 scope.
 
 Issue #791 found that `memory.recall` could hang for the full rebuild duration: a write
@@ -261,5 +261,5 @@ leaking through.
 
 ## Status
 
-Proposed. Implemented by PR #812 (issue #791), most recently on
+Accepted. Implemented by PR #812 (issue #791), most recently on
 `fix/791-recall-ann-rebuild-blocking`.
