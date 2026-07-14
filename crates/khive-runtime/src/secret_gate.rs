@@ -26,7 +26,7 @@
 //! matching, the underscore-boundary asymmetry between bare trigger words and
 //! the word `token`, and the adversarial-corpus rationale for why some
 //! false positives are accepted) are documented in full in
-//! `docs/secret_gate.md#module-level-detection-algorithm` — read that before
+//! `docs/api/secret_gate.md#module-level-detection-algorithm` — read that before
 //! changing any detection or exemption logic in this file.
 //!
 //! The caller-visible block message (`SecretMatch`'s `Display` impl) also
@@ -227,7 +227,7 @@ fn scan(text: &str) -> Option<SecretMatch> {
 /// an allocation. Spans are discovered left to right against the ORIGINAL text,
 /// always evaluating trigger context over the full input — a high-entropy value
 /// whose only trigger word sits to the left of an earlier-redacted secret is
-/// still detected. See `docs/secret_gate.md#mask_secrets` for the scan-cursor
+/// still detected. See `docs/api/secret_gate.md#mask_secrets` for the scan-cursor
 /// mechanics.
 pub fn mask_secrets(text: &str) -> std::borrow::Cow<'_, str> {
     let base = text.as_ptr() as usize;
@@ -524,7 +524,7 @@ fn find_url_userinfo(text: &str) -> Option<&str> {
 /// Trigger words checked as a bounded standalone word (see
 /// [`contains_bounded_word`]). `token` is deliberately excluded — see
 /// `has_standalone_token`/`has_token_assignment` instead.
-/// See `docs/secret_gate.md#trigger_words` for the substring-collision
+/// See `docs/api/secret_gate.md#trigger_words` for the substring-collision
 /// rationale (issues #577 / #632).
 const TRIGGER_WORDS: &[&str] = &[
     "key",
@@ -715,7 +715,7 @@ fn check_entropy_heuristic(text: &str, from: usize) -> Option<(&str, &'static st
 /// bounded on both sides by a character outside the word-char set (or
 /// start/end of string) — rather than merely as a substring.
 /// `underscore_is_word_char` selects the boundary rule the caller needs; see
-/// `docs/secret_gate.md#contains_word` for the two deliberately different
+/// `docs/api/secret_gate.md#contains_word` for the two deliberately different
 /// rules and why each caller needs its own.
 fn contains_word(low_window: &str, needle: &str, underscore_is_word_char: bool) -> bool {
     let is_word_char = |c: char| c.is_ascii_alphanumeric() || (underscore_is_word_char && c == '_');
@@ -903,7 +903,7 @@ fn is_pure_hex(token: &str) -> bool {
 /// Returns `true` for tokens that are unambiguous base64/base64url content
 /// hashes with an explicit `sha<N>-` prefix (SRI hash, npm lockfile integrity).
 /// Bare base64 of the same length WITHOUT the prefix is NOT allowlisted — see
-/// `docs/secret_gate.md#is_base64_content_hash` for the full criteria list and
+/// `docs/api/secret_gate.md#is_base64_content_hash` for the full criteria list and
 /// why the explicit prefix is required.
 fn is_base64_content_hash(token: &str) -> bool {
     // Known vendor prefixes — never allowlist even if they look like base64.
@@ -986,7 +986,7 @@ const MAX_CASE_TRANSITION_DENSITY: f64 = 0.3;
 /// other structured identifier rather than a high-entropy secret (word-shaped
 /// runs separated by `/`, `-`, `_`, `.`). Exempts from the entropy heuristic
 /// ONLY outside trigger context — see the module doc and
-/// `docs/secret_gate.md#is_structured_identifier` for the run-shape criteria.
+/// `docs/api/secret_gate.md#is_structured_identifier` for the run-shape criteria.
 fn is_structured_identifier(token: &str) -> bool {
     if !token.contains(|c: char| STRUCTURAL_SEPARATORS.contains(&c)) {
         return false;
@@ -1092,7 +1092,7 @@ fn wrapper_strip_repeated(token: &str) -> &str {
 
 /// Yields every candidate value an assignment/wrapper-glued token could
 /// contain, for the near-trigger UUID/content-hash exact-shape checks only.
-/// See `docs/secret_gate.md#value_candidates` for why every `=`/`:` suffix
+/// See `docs/api/secret_gate.md#value_candidates` for why every `=`/`:` suffix
 /// must be tried rather than just the first or last.
 fn value_candidates(token: &str) -> impl Iterator<Item = &str> {
     let cur = wrapper_strip_repeated(token);

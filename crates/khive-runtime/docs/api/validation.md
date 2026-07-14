@@ -1,9 +1,8 @@
-# khive-runtime Validation Rules
+# KG Validation Pipeline
 
-## Purpose
-
-Describes the pack-contributed KG validation pipeline: how rules are declared, how
-severity overrides work, and where rule configuration lives.
+`validation.rs` defines the pack-contributed KG validation pipeline: how a pack declares a
+`ValidationRule`, how severity levels map to `kkernel kg validate` exit behavior, and where rule
+configuration is read from at runtime.
 
 ## ADR Links
 

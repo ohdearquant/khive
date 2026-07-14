@@ -1,8 +1,10 @@
-# secret_gate.rs — extended rationale
+# Secret Gate — Credential Detection Algorithm
 
-Long-form rationale extracted from `crates/khive-runtime/src/secret_gate.rs` doc-comments during
-the rustdoc condense pass. The module-level doc-comment in the source now carries a concise
-summary plus a pointer to this file; this is the full algorithm spec.
+`secret_gate.rs` scans transcript/audit text for accidentally-embedded credentials (API keys,
+tokens, passwords) before it is persisted or logged, and masks any it finds. This document is the
+full algorithm spec: the allowlist layers that suppress false positives, the trigger-word
+matching rules, and the per-function shape criteria used by the detection helpers. The in-source
+module doc-comment carries only a concise summary and points here.
 
 ## Module-level detection algorithm
 

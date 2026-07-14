@@ -45,7 +45,7 @@ pub const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 /// in every request; the daemon rejects mismatches with an explicit error
 /// that names both sides so the operator knows exactly what to do
 /// (`make local` rebuilds the client binary).
-/// See `docs/daemon.md#protocol_version` for the version-by-version history.
+/// See `docs/api/daemon.md#protocol_version` for the version-by-version history.
 pub const PROTOCOL_VERSION: u32 = 3;
 
 #[cfg(unix)]
@@ -162,7 +162,7 @@ pub fn acquire_recovery_lock() -> Option<std::fs::File> {
 /// Attempt to acquire an exclusive advisory flock on `path`, retrying with a
 /// non-blocking `flock(LOCK_NB)` until `deadline` elapses. Bounded alternative
 /// to `acquire_recovery_lock`/`acquire_daemon_boot_guard`'s unbounded blocking
-/// flock — see `docs/daemon.md#try_acquire_flock_until` for why a caller
+/// flock — see `docs/api/daemon.md#try_acquire_flock_until` for why a caller
 /// merely detecting lock freedom needs a deadline instead.
 ///
 /// - `Ok(Some(file))` — the lock was free within the deadline.
@@ -705,7 +705,7 @@ pub fn active_phase_names() -> Vec<String> {
 /// Build a point-in-time [`MetricsSnapshot`] of this process's server-side
 /// gauges. Called only from `handle_conn`'s `metrics_only` arm — a
 /// process-global, read-only assembly with no side effects of its own.
-/// See `docs/daemon.md#build_metrics_snapshot` for where each gauge is sourced
+/// See `docs/api/daemon.md#build_metrics_snapshot` for where each gauge is sourced
 /// from and why.
 #[cfg(unix)]
 fn build_metrics_snapshot<D: DaemonDispatch>(dispatcher: &D) -> MetricsSnapshot {

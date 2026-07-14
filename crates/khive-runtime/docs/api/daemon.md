@@ -1,7 +1,10 @@
-# daemon.rs — extended rationale
+# Daemon Wire Protocol and Metrics
 
-Long-form rationale extracted from `crates/khive-runtime/src/daemon.rs` doc-comments during the
-rustdoc condense pass.
+`daemon.rs` implements the long-lived `kkernel mcp --daemon` process that keeps ANN/embedder
+state warm across MCP sessions (ADR-049): its framed request/response protocol, boot-time
+locking, and the metrics snapshot served to callers. This document covers the versioned wire
+protocol, the two lock-acquisition strategies the daemon uses, and where each metrics gauge is
+sourced from.
 
 ## protocol_version
 

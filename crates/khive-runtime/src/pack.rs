@@ -183,14 +183,14 @@ pub trait PackRuntime: Send + Sync {
     /// initialisation, before the first verb dispatch, so `KhiveRuntime::embedder(name)`
     /// resolves provider names declared here. Default no-op — packs that only use
     /// built-in lattice models do not need to override this.
-    /// See `docs/pack.md#register_embedders` for a usage example.
+    /// See `docs/api/pack.md#register_embedders` for a usage example.
     fn register_embedders(&self, _runtime: &KhiveRuntime) {}
 
     /// Install a pack-owned entity-type validator on the runtime, called during pack
     /// initialisation (after the registry is built, before the first dispatch) so
     /// `create_many`/`create_entity` reject unregistered `entity_type` values at the
     /// runtime layer. Default no-op leaves the validator absent (skip-when-None).
-    /// See `docs/pack.md#register_entity_type_validator` for the two-hook compatibility contract.
+    /// See `docs/api/pack.md#register_entity_type_validator` for the two-hook compatibility contract.
     fn register_entity_type_validator(&self, _runtime: &KhiveRuntime) {}
 
     /// Install a pack-owned entity-type validator that also receives the boot-time
@@ -198,7 +198,7 @@ pub trait PackRuntime: Send + Sync {
     /// Defaults to calling [`register_entity_type_validator`](Self::register_entity_type_validator)
     /// with just the runtime. `call_register_entity_type_validators` calls this hook, not
     /// the simpler one — override this to receive the composed vocabulary.
-    /// See `docs/pack.md#register_entity_type_validator` for the two-hook compatibility contract.
+    /// See `docs/api/pack.md#register_entity_type_validator` for the two-hook compatibility contract.
     fn register_entity_type_validator_with_types(
         &self,
         runtime: &KhiveRuntime,
@@ -212,7 +212,7 @@ pub trait PackRuntime: Send + Sync {
     /// that cache derived state keyed by note content (e.g. `khive-pack-memory`'s warm
     /// ANN index) override this to install a hook via
     /// `KhiveRuntime::install_note_mutation_hook`. Default no-op leaves the hook absent.
-    /// See `docs/pack.md#register_note_mutation_hook` for cross-pack notification rationale.
+    /// See `docs/api/pack.md#register_note_mutation_hook` for cross-pack notification rationale.
     fn register_note_mutation_hook(&self, _runtime: &KhiveRuntime) {}
 
     /// Warm up any in-memory state from persisted snapshots (optional). Called after
@@ -223,7 +223,7 @@ pub trait PackRuntime: Send + Sync {
     /// Names of all embedding models registered on this pack's underlying runtime
     /// handle. Defaults to empty — only packs that own embedding-bearing verbs
     /// (kg, memory) need to override this.
-    /// See `docs/pack.md#registered_embedding_model_names` for the ADR-103 consumer.
+    /// See `docs/api/pack.md#registered_embedding_model_names` for the ADR-103 consumer.
     fn registered_embedding_model_names(&self) -> Vec<String> {
         Vec::new()
     }
@@ -1043,7 +1043,7 @@ impl VerbRegistry {
     /// `self.visible_namespaces` for this call's namespace resolution, gate
     /// request, and token minting. The registry's own fields are never mutated,
     /// so concurrent calls with different (or no) identity are independent.
-    /// See `docs/pack.md#dispatch_with_identity` for why this enables one warm
+    /// See `docs/api/pack.md#dispatch_with_identity` for why this enables one warm
     /// registry to serve many attribution identities over a shared backend.
     pub async fn dispatch_with_identity(
         &self,
@@ -1507,7 +1507,7 @@ impl VerbRegistry {
     /// `identity.actor_id = Some(verified_actor)` and every other identity scalar
     /// (namespace, visible namespaces) left at this registry's construction-baked
     /// value. [`Self::dispatch`] and [`Self::dispatch_with_identity`] are unaffected.
-    /// See `docs/pack.md#dispatch_as` for the embedding-host use case and the
+    /// See `docs/api/pack.md#dispatch_as` for the embedding-host use case and the
     /// blank-identifier safety rationale.
     pub async fn dispatch_as(
         &self,
@@ -2170,7 +2170,7 @@ fn target_id_from_args(args: &serde_json::Value) -> Option<uuid::Uuid> {
 }
 
 /// Build a v1-shape audit storage event from a gate check outcome.
-/// See `docs/pack.md#build_audit_storage_event` for the `resource` payload contract.
+/// See `docs/api/pack.md#build_audit_storage_event` for the `resource` payload contract.
 fn build_audit_storage_event(
     gate_req: &GateRequest,
     audit: &AuditEvent,
@@ -2216,7 +2216,7 @@ async fn append_audit_event_best_effort(store: &Arc<dyn EventStore>, event: Even
 }
 
 /// Schema v2 audit payload for a successful singleton `link` call — additive
-/// over v1 via `#[serde(flatten)]`. See `docs/pack.md#linkauditsuccessv2`.
+/// over v1 via `#[serde(flatten)]`. See `docs/api/pack.md#linkauditsuccessv2`.
 #[derive(Debug, Clone, serde::Serialize)]
 struct LinkAuditSuccessV2 {
     #[serde(flatten)]
@@ -2230,7 +2230,7 @@ struct LinkAuditSuccessV2 {
 
 /// Extract edge fields to enrich a successful singleton `link` audit row.
 /// Returns `None` on any missing/malformed field (falls back to v1 shape).
-/// See `docs/pack.md#link_audit_success_from_result`.
+/// See `docs/api/pack.md#link_audit_success_from_result`.
 fn link_audit_success_from_result(
     audit: AuditEvent,
     result: &serde_json::Value,
@@ -2271,7 +2271,7 @@ fn link_audit_success_from_result(
 ///   default namespace.
 ///
 /// Single chokepoint for both `VerbRegistry::dispatch` and the multi-backend
-/// coordinator intercept — see `docs/pack.md#resolve_explicit_namespace`.
+/// coordinator intercept — see `docs/api/pack.md#resolve_explicit_namespace`.
 pub fn resolve_explicit_namespace(
     params: &Value,
     default_namespace: &str,
