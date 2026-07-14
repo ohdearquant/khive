@@ -16,7 +16,7 @@ You work with two kinds of record directly:
 An edge is a typed relationship within the entity graph layer, not a record you
 create on its own. Entities and notes are two of khive's three storage
 substrates; the third, events, is an immutable audit log the system writes and
-you query, not something you author directly. The entity, note, and edge
+you query, not something you author directly. The active entity, note, and edge
 vocabularies are all closed sets. Model distinctions that do not belong in a
 kind or relation as properties instead of inventing a new label.
 
@@ -43,8 +43,9 @@ notes that annotate it.
 | `service`   | APIs, endpoints, and hosted products                                      |
 | `resource`  | Reusable operational content such as atoms, skills, prompts, and runbooks |
 
-These nine entity kinds are closed. Use `entity_type`, tags, and properties for
-finer distinctions; for example, a `document` can have `entity_type="paper"`.
+These nine KG base entity kinds are closed. Use `entity_type`, tags, and
+properties for finer distinctions; for example, a `document` can have
+`entity_type="paper"`.
 
 | Note kind     | Use for                                    |
 | ------------- | ------------------------------------------ |
@@ -54,8 +55,12 @@ finer distinctions; for example, a `document` can have `entity_type="paper"`.
 | `decision`    | A choice and its rationale                 |
 | `reference`   | A pointer to an external source            |
 
-These five note kinds are also closed. `observation` is the default for a KG
-note when no note kind is supplied.
+These five KG base note kinds are also closed. `observation` is the default for
+a KG note when no note kind is supplied. Loaded packs can register additional
+closed kinds and additive endpoint rules. For example, the default `workspace`
+pack adds the `workspace` entity kind, which requires an integer
+`properties.schema_version` when created; use `verbs()` and the API reference
+for your server's loaded-pack surface.
 
 ## Model relationships deliberately
 
@@ -77,8 +82,9 @@ by purpose below; the set is closed.
 The endpoint rules are part of the model, not suggestions. `annotates` is the
 cross-substrate relation. `supersedes`, `supports`, and `refutes` are
 same-substrate only: entity → entity or note → note. The source of a
-`supports` or `refutes` edge is evidence; the target is the claim. The remaining
-base relations are entity → entity, subject to their specific allowlist.
+`supports` or `refutes` edge is evidence; the target is the claim. In the KG
+base contract, the remaining base relations are entity → entity, subject to
+their specific allowlist.
 
 ## Work through the request DSL
 
