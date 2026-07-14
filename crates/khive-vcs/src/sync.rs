@@ -1213,12 +1213,8 @@ mod tests {
         assert_eq!(alpha.kind, "concept");
     }
 
-    /// Chunk-boundary round-trip: write N > SYNC_CHUNK_SIZE entities and edges
-    /// so the batching path exercises at least two transaction boundaries, then
-    /// verify the full count and spot-check the last record of the final chunk.
-    ///
-    /// In test builds SYNC_CHUNK_SIZE = 5, so N = 11 produces three chunks
-    /// (5 + 5 + 1) for both entities and edges.
+    /// Chunk-boundary round-trip across `SYNC_CHUNK_SIZE`. See
+    /// `docs/test-rationale.md#sync_chunk_boundary_round_trip`.
     #[tokio::test]
     async fn sync_chunk_boundary_round_trip() {
         const N: usize = 11; // > SYNC_CHUNK_SIZE (5 in test mode)
@@ -1820,12 +1816,8 @@ mod tests {
         }
     }
 
-    /// #474: `run_sync_remote("../evil" | "/tmp/evil" | "safe/name")` must be
-    /// impossible to even construct — `RemoteConfig::name` is a `RemoteName`,
-    /// and `RemoteName::parse` is its only constructor — so these names never
-    /// reach `run_sync_remote`'s cache-directory join. Confirm both the
-    /// construction-time rejection AND (via filesystem check) that nothing
-    /// was created at the traversal targets or under `.khive/kg/remotes/`.
+    /// Issue #474: path-traversal remote names must be unconstructable. See
+    /// `docs/test-rationale.md#run_sync_remote_cannot_be_constructed_with_invalid_name`.
     #[tokio::test]
     async fn run_sync_remote_cannot_be_constructed_with_invalid_name() {
         let repo_dir = TempDir::new().unwrap();
@@ -2368,12 +2360,8 @@ mod tests {
     // combined with these wiring tests that confirm the sanitised output is what
     // the caller actually sees in `err.to_string()`.
 
-    /// HTTPS URL with embedded `user:pass` credentials must not appear in the
-    /// public error string produced by a clone failure.
-    ///
-    /// git echoes credential-bearing HTTPS URLs in its stderr on auth failure,
-    /// e.g.: `fatal: Authentication failed for 'https://user:token@host/repo.git'`
-    /// The sanitiser must strip that before it reaches the caller.
+    /// Credential-bearing HTTPS URLs must not leak into the public error
+    /// string. See `docs/test-rationale.md#public_error_redacts_https_credential_url`.
     #[tokio::test]
     async fn public_error_redacts_https_credential_url() {
         let repo_dir = tempfile::TempDir::new().unwrap();
@@ -2411,20 +2399,8 @@ mod tests {
         );
     }
 
-    /// scp-style `git@host:org/repo.git` must not leak through the sanitiser
-    /// into the public error string.
-    ///
-    /// This test exercises the FAIL-before/PASS-after property of the scp fix:
-    /// the sanitiser is called on the raw git stderr, which git may populate with
-    /// lines like `fatal: Could not read from remote repository.` that do NOT
-    /// contain the URL — so for scp remotes that fail at DNS/SSH level the URL
-    /// is not re-echoed by git.  What we assert here is that the sanitiser IS
-    /// wired into the error path and that the rendered error does not include the
-    /// scp token from any source.
-    ///
-    /// The companion unit tests `redact_strips_scp_style_remote` and
-    /// `redact_strips_user_at_host_colon_path` directly verify the sanitiser
-    /// strips scp tokens from git stderr strings; this test confirms the wiring.
+    /// scp-style `git@host:org/repo.git` must not leak through the sanitiser.
+    /// See `docs/test-rationale.md#public_error_redacts_scp_style_remote`.
     #[tokio::test]
     async fn public_error_redacts_scp_style_remote() {
         let repo_dir = tempfile::TempDir::new().unwrap();
@@ -2467,10 +2443,8 @@ mod tests {
     }
 
     /// Regression: VCS sync FTS document must be field-identical to
-    /// `entity_fts_document` output for the same entity.  Before this fix,
-    /// `upsert_entities` built a `TextDocument` inline with slightly different
-    /// field mapping than the canonical helper, which could produce divergent
-    /// FTS shapes when the helper is updated.
+    /// `entity_fts_document`'s output. See
+    /// `docs/test-rationale.md#sync_fts_document_matches_entity_fts_document`.
     #[test]
     fn sync_fts_document_matches_entity_fts_document() {
         use khive_runtime::entity_fts_document;
@@ -2606,11 +2580,8 @@ mod checkpoint_wal_write_queue_tests {
         );
     }
 
-    /// Revert-and-confirm-fails companion: the OLD (broken) call shape —
-    /// plain `execute_script`, which wraps the pragma in the WriterTask's
-    /// `BEGIN IMMEDIATE` — must fail under the write queue. This proves the
-    /// test above is actually exercising the regression, not passing
-    /// vacuously.
+    /// Revert-and-confirm-fails companion to the test above. See
+    /// `docs/test-rationale.md#wal_checkpoint_truncate_via_plain_execute_script_fails_with_write_queue_enabled`.
     #[tokio::test]
     async fn wal_checkpoint_truncate_via_plain_execute_script_fails_with_write_queue_enabled() {
         let dir = tempfile::tempdir().expect("tempdir");

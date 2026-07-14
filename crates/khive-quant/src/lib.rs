@@ -616,13 +616,9 @@ impl Sq8Codec {
 /// the original f32 L2² can reach ~15% for anisotropic or out-of-distribution data.
 /// Recall safety must be established by probe (see `sq8_recall_parity_vs_f32_oracle`
 /// and `sq8_ood_fallback_deterministic_ranking_flip`), not by an exactness argument.
-/// No residual pass, no gate, no silent fallback for anisotropic data.
-///
-/// Historical note: the predecessor per-dim codec required `approx_l2_sq_fast` + an
-/// anisotropy gate (ratio ≤ 4.0) to achieve the integer-only hot path. The gate was
-/// calibrated on an LCG corpus that gave ratio ≈ 4.0; real transformer embeddings
-/// have rogue dimensions (ratio 10–32) that silently fell back to the full residual
-/// path, defeating the purpose. Global-scale eliminates the gate entirely — see ADR-052.
+/// No residual pass, no gate, no silent fallback for anisotropic data. See
+/// `docs/design-notes.md#gssq8codec--why-global-scale-not-per-dimension-anisotropy-gating`
+/// for why this replaced the earlier per-dim anisotropy-gated design.
 #[derive(Debug, Clone)]
 pub struct GsSq8Codec {
     /// Per-dimension minimum values.
