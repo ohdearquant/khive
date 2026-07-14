@@ -324,21 +324,33 @@ authorization, and hygiene scanning have completed:
 
 Verb dispatch passes through the Gate (ADR-018) at the registry boundary before the pack
 handler. For exactly `git.publish_issue`, `git.publish_comment`, `git.publish_pr`, and
-`git.publish_release`, that boundary **must use strict fail-closed Gate evaluation**. This is
-a verb-scoped override of ADR-018's general fail-open default for Gate errors
-(ADR-018 lines 32-34 and 209-222); it does not change Gate-error handling for any other
-verb.
+`git.publish_release`, that boundary **must use strict fail-closed Gate evaluation and
+publish-specific reason redaction**. These are verb-scoped overrides of ADR-018's general
+fail-open default for Gate errors and reason-preserving explicit denials (ADR-018 lines 32-34,
+71-74, 184-194, and 209-222); they do not change Gate behavior for any other verb.
 
-For any of these four verbs, `Gate::check` returning `Err` is a denial. The registry must
-not mint the authorized storage token, enter the handler, read a remote target, create or
-mutate an operation-ledger row, or execute `gh`. It must append a content-free generic
-dispatch denial record before returning the error. That record uses the existing Gate audit
-envelope, the precise publish verb, `EventOutcome::Denied`, `decision = "deny"`, empty
-obligations, and the stable `deny_reason = "gate_error_fail_closed"`; it includes no request
-arguments, caller content, matched value, or Gate error text. Failure to persist this record
-also remains fail-closed: the call returns an audit-persistence error and still cannot enter
-the handler or execute any remote operation. An explicit `GateDecision::Deny` retains
-ADR-018's standing behavior, and only `GateDecision::Allow` permits handler entry.
+For these four verbs, the registry owns a publish-specific redaction boundary immediately
+after `Gate::check` returns and before `AuditEvent::from_check`, tracing, Event construction
+or persistence, or response/error construction. It maps the result as follows:
+
+- `Ok(GateDecision::Allow { .. })` is passed through unchanged.
+- `Ok(GateDecision::Deny { .. })` discards the Gate-provided reason and substitutes the
+  stable content-free `deny_reason = "publish_gate_denied"`.
+- `Err(_)` discards the Gate error text and synthesizes a denial with the stable content-free
+  `deny_reason = "gate_error_fail_closed"`.
+
+The discarded reason or error text must not remain available to any downstream tracing,
+audit-persistence, or response path; masking only the serialized Event is insufficient. Both
+non-allow outcomes prevent the registry from minting the authorized storage token, entering
+the handler, reading a remote target, creating or mutating an operation-ledger row, or
+executing `gh`. Their generic dispatch records use the existing Gate audit envelope, the
+precise publish verb, `EventOutcome::Denied`, `decision = "deny"`, empty obligations, and the
+corresponding stable reason above; they include no request arguments, caller content, matched
+value, Gate-provided denial reason, or Gate error text. An explicit denial otherwise retains
+ADR-018's standing enforcement and best-effort audit-persistence behavior. A Gate `Err` is
+the stricter case: its content-free dispatch denial record is a required write, and failure to
+persist it returns a content-free audit-persistence error while still denying handler entry
+and all remote work. Only `GateDecision::Allow` permits handler entry.
 
 The publication-hygiene scan is a separate concern from Gate authorization: Gate answers
 "may this actor call this verb at all," enforced through pluggable policy; the scan answers
@@ -486,9 +498,11 @@ derived from one is stored in this payload. `rule_ids` and `denied_fields` ident
 rules and field names that caused a hygiene denial without persisting the rejected content.
 Normatively, no value from a field that failed validation or caused a hygiene denial may
 appear in any audit payload, Event, operation-ledger row, log line, error message, or error
-response. The automatic Gate audit row is also content-free: per ADR-018 it records the
-verb and decision envelope, not request arguments. A strict publish Gate-error denial uses
-the content-free registry-owned record specified above and never copies the Gate error text.
+response. The automatic Gate audit row is also content-free because the publish-specific
+registry boundary replaces both an explicit Gate denial reason and Gate error text before
+the generic audit, tracing, persistence, and response paths can observe them. The row may
+contain only the decision envelope and the applicable stable reason defined above; it never
+contains request arguments or either discarded Gate string.
 
 These rows are **additional to**, not replacements for, the dispatch-audit row that
 `VerbRegistry` already attempts for every call. The automatic row also has
@@ -1055,12 +1069,17 @@ The implementation ships the verbs, operation ledger, pattern loader, scan, audi
 graph reconciliation, and tests as one change. In addition to unit coverage for the
 pattern file, it must include these contract tests:
 
-A registry-boundary test matrix injects a Gate `Err` for each of the four publish verbs.
-Every case must prove that the handler is not entered, no operation-ledger row is created or
-mutated, the transport observes zero remote writes and no `gh` execution, and exactly one
-content-free strict-error denial audit record is durable with no request argument, caller
-content, or Gate error text. An audit-store failure case must prove that the call remains
-denied and still performs no handler or remote work.
+A registry-boundary test matrix uses a custom Gate to inject both
+`GateDecision::Deny { reason }` and Gate `Err` for each of the four publish verbs. Each
+reason/error contains a sentinel copied from that request's body, notes, or tag. Every case
+must prove that the handler is not entered, no operation-ledger row is created or mutated,
+and the transport observes zero remote writes and no `gh` execution. It must also assert the
+exact stable reason (`publish_gate_denied` or `gate_error_fail_closed`) and prove that neither
+the sentinel nor any other Gate-provided text appears in the returned error or response,
+captured tracing output, or serialized generic dispatch Event. With a working store, exactly
+one content-free generic denial record is durable. A Gate-`Err` audit-store failure case must
+prove that the returned audit-persistence error is content-free, the call remains denied,
+and no handler or remote work occurs.
 
 1. **Required-argument and argv safety.** Table-driven tests cover omission, JSON `null`,
    wrong JSON types, the specified empty-string behavior, every accepted control-character
@@ -1334,8 +1353,10 @@ Four forks were presented for this design; each is resolved in place.
   candidate for future adoption by ADR-108 surfaces (for example, scanning a `git.commit`
   message) - not specified by this ADR, noted as a natural extension point.
 - ADR-018 - Authorization Gate; the dispatch-time authorization seam every verb, including
-  this ADR's four, passes through independent of the hygiene scan. ADR-112 overrides only
-  ADR-018's general fail-open-on-`Err` default for the four publish verbs.
+  this ADR's four, passes through independent of the hygiene scan. ADR-112 makes two
+  verb-scoped exceptions for the four publish verbs: Gate errors fail closed, and both
+  Gate-provided explicit-denial reasons and error text are replaced at the registry boundary
+  with stable content-free reasons. All other verbs retain ADR-018 behavior.
 - ADR-017 - Pack Standard; `HandlerDef`, `PackRuntime::dispatch`, the mechanism these verbs
   register through.
 - ADR-016 - Request DSL; the wire surface these verbs are reachable through.
