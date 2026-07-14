@@ -88,3 +88,6 @@
 - `brain_profile` integration in `RecallConfig` is partially implemented: the configuration
   field is live but the runtime lookup (cross-pack call to `brain.profile`) is not yet wired
   at the handler level. See TODO(#484).
+- `scoring.rs` bundles `ScoringConfig`, all normalization helpers, CJK routing, and the full
+  test suite for the scoring pipeline. The tests require access to module-private helpers;
+  splitting would require `pub(crate)` promotion of private fns.
