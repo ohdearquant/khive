@@ -1572,7 +1572,8 @@ fn strict_fallback_envelope_response(
     let total = parsed.ops.len();
     let error_msg = format!(
         "daemon fallback rejected under KHIVE_DAEMON_STRICT=1: reason={reason}; \
-         refusing to complete the request via local dispatch"
+         refusing to complete the request via local dispatch; \
+         rebuild with `make local` and retry"
     );
 
     let results: Vec<Value> = match parsed.mode {
@@ -2760,6 +2761,10 @@ mod tests {
             assert!(
                 msg.contains("respawn_failed"),
                 "error must name the confirmed respawn failure: {msg}"
+            );
+            assert!(
+                msg.contains("make local"),
+                "error must include the safe respawn remediation: {msg}"
             );
         }
 
