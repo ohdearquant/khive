@@ -858,6 +858,42 @@ pub struct RequestIdentity {
     pub request_id: Option<u64>,
 }
 
+/// A non-blank, out-of-band authenticated principal for [`VerbRegistry::dispatch_as`].
+///
+/// Embedding hosts authenticate a principal through their own channel (not the
+/// request DSL) and then need that principal to become the effective actor
+/// for one dispatch. The constructor rejects an empty or whitespace-only
+/// identifier so an authentication-integration failure (an empty subject)
+/// fails closed at construction time instead of silently resolving to the
+/// anonymous/local actor at dispatch time — see [`crate::actor_identity::resolve_actor`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedActor(String);
+
+impl VerifiedActor {
+    /// Validate and wrap a verified principal identifier.
+    ///
+    /// Returns `RuntimeError::InvalidInput` when `id` is empty or contains
+    /// only whitespace.
+    pub fn new(id: impl Into<String>) -> Result<Self, RuntimeError> {
+        let id = id.into();
+        if id.trim().is_empty() {
+            return Err(RuntimeError::InvalidInput(
+                "VerifiedActor: identifier must not be empty or whitespace-only".to_string(),
+            ));
+        }
+        Ok(Self(id))
+    }
+
+    /// Borrow the validated identifier.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    fn into_inner(self) -> String {
+        self.0
+    }
+}
+
 /// Error returned by [`VerbRegistry::apply_schema_plans_with_map`] when two
 /// packs on the same backend declare the same auxiliary table (ADR-028 §7).
 #[derive(Debug)]
@@ -1523,9 +1559,16 @@ impl VerbRegistry {
     /// own channel — not through the request DSL — and then need that
     /// principal to be the effective actor for one dispatch. `verified_actor`
     /// is a typed Rust-side argument: it can only be supplied by code holding
-    /// a `VerbRegistry` handle. No verb accepts an `actor` request parameter,
-    /// so a caller cannot inject or override the acting principal through
-    /// `params` — the wire surface is unchanged.
+    /// a `VerbRegistry` handle. `dispatch_as` never reads `params["actor"]`
+    /// to derive the effective actor; individual verbs may still accept an
+    /// `actor` field for their own documented business semantics, unrelated
+    /// to the acting principal.
+    ///
+    /// `verified_actor` is a [`VerifiedActor`], whose constructor rejects
+    /// blank identifiers. This keeps an authentication-integration failure
+    /// (an empty subject from the host's own auth channel) from silently
+    /// downgrading to the anonymous/local actor — the failure surfaces at
+    /// `VerifiedActor::new` instead of being laundered into a valid dispatch.
     ///
     /// Every pack handler that reads "who is calling" (for example, a
     /// proposal review's `reviewer` field) resolves it from the
@@ -1543,11 +1586,11 @@ impl VerbRegistry {
         &self,
         verb: &str,
         params: Value,
-        verified_actor: impl Into<String>,
+        verified_actor: VerifiedActor,
     ) -> Result<Value, RuntimeError> {
         let identity = RequestIdentity {
             namespace: self.default_namespace.clone(),
-            actor_id: Some(verified_actor.into()),
+            actor_id: Some(verified_actor.into_inner()),
             visible_namespaces: self
                 .visible_namespaces
                 .iter()
@@ -3424,9 +3467,13 @@ mod tests {
         builder.with_gate(gate.clone());
         let reg = builder.build().expect("registry builds");
 
-        reg.dispatch_as("list", Value::Null, "gateway:principal-42")
-            .await
-            .unwrap();
+        reg.dispatch_as(
+            "list",
+            Value::Null,
+            VerifiedActor::new("gateway:principal-42").unwrap(),
+        )
+        .await
+        .unwrap();
 
         let reqs = gate.requests.lock().unwrap();
         assert_eq!(reqs[0].actor.kind, "actor");
@@ -3459,9 +3506,13 @@ mod tests {
         builder.with_actor_id(Some("baked-actor".to_string()));
         let reg = builder.build().expect("registry builds");
 
-        reg.dispatch_as("list", Value::Null, "verified-actor")
-            .await
-            .unwrap();
+        reg.dispatch_as(
+            "list",
+            Value::Null,
+            VerifiedActor::new("verified-actor").unwrap(),
+        )
+        .await
+        .unwrap();
         reg.dispatch("list", Value::Null).await.unwrap();
 
         let captured = actors.lock().unwrap();
@@ -3495,7 +3546,7 @@ mod tests {
         reg.dispatch_as(
             "list",
             serde_json::json!({"actor": "spoofed-actor"}),
-            "verified-actor",
+            VerifiedActor::new("verified-actor").unwrap(),
         )
         .await
         .unwrap();
@@ -3505,6 +3556,28 @@ mod tests {
             captured[0].id, "verified-actor",
             "an 'actor' key inside params must never override the verified_actor \
              argument threaded through dispatch_as"
+        );
+    }
+
+    /// `VerifiedActor::new` must reject an empty identifier rather than
+    /// letting it reach dispatch and silently resolve to the anonymous actor.
+    #[test]
+    fn verified_actor_rejects_empty_identifier() {
+        let err = VerifiedActor::new("").unwrap_err();
+        assert!(
+            matches!(err, RuntimeError::InvalidInput(_)),
+            "expected InvalidInput, got {err:?}"
+        );
+    }
+
+    /// `VerifiedActor::new` must reject a whitespace-only identifier for the
+    /// same reason: it must never launder into `ActorRef::anonymous()`.
+    #[test]
+    fn verified_actor_rejects_whitespace_only_identifier() {
+        let err = VerifiedActor::new("   ").unwrap_err();
+        assert!(
+            matches!(err, RuntimeError::InvalidInput(_)),
+            "expected InvalidInput, got {err:?}"
         );
     }
 

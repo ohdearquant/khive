@@ -9,7 +9,7 @@ use khive_pack_kg::KgPack;
 use khive_runtime::pack::{HandlerDef, PackRuntime};
 use khive_runtime::{
     EntityCreateSpec, KhiveRuntime, Namespace, NamespaceToken, ParamDef, RuntimeError,
-    VerbCategory, VerbRegistry, VerbRegistryBuilder, Visibility,
+    VerbCategory, VerbRegistry, VerbRegistryBuilder, VerifiedActor, Visibility,
 };
 use khive_storage::Note;
 use khive_types::Pack;
@@ -7671,7 +7671,7 @@ async fn dispatch_as_routes_verified_actor_to_review_handler() {
         .dispatch_as(
             "review",
             json!({ "id": pid, "decision": "approve" }),
-            "gateway:verified-principal",
+            VerifiedActor::new("gateway:verified-principal").unwrap(),
         )
         .await
         .expect("dispatch_as(review) must succeed");
@@ -7747,7 +7747,7 @@ async fn dispatch_as_rejects_actor_key_in_params() {
         .dispatch_as(
             "review",
             json!({ "id": pid, "decision": "approve", "actor": "spoofed-actor" }),
-            "gateway:verified-principal",
+            VerifiedActor::new("gateway:verified-principal").unwrap(),
         )
         .await;
 
