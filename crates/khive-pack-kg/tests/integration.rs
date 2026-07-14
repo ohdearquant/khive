@@ -3883,6 +3883,52 @@ async fn get_edge_includes_annotating_notes() {
         .expect("create annotating note must succeed");
     let note_id = note.get("id").and_then(Value::as_str).unwrap().to_string();
 
+    // Recover the exact annotates-edge id created by the annotates= param path.
+    let note_edges = pack
+        .dispatch(
+            "list",
+            json!({"kind": "edge", "source_id": note_id, "target_id": edge_id, "relations": ["annotates"]}),
+        )
+        .await
+        .expect("list annotates edges for note must succeed");
+    let note_edges = note_edges.as_array().expect("edge list must return array");
+    assert_eq!(
+        note_edges.len(),
+        1,
+        "expected one annotates edge for the note"
+    );
+    let note_annotation_edge_id = note_edges[0]
+        .get("id")
+        .and_then(Value::as_str)
+        .unwrap()
+        .to_string();
+
+    // Second annotation via explicit link() so the created edge id is retained directly.
+    let note2 = pack
+        .dispatch(
+            "create",
+            json!({
+                "kind": "note",
+                "content": "second edge annotation recording a follow-up incident",
+            }),
+        )
+        .await
+        .expect("create second annotating note must succeed");
+    let note2_id = note2.get("id").and_then(Value::as_str).unwrap().to_string();
+    let annotation_link = pack
+        .dispatch(
+            "link",
+            json!({"source_id": note2_id, "target_id": edge_id, "relation": "annotates"}),
+        )
+        .await
+        .expect("explicit annotates link must succeed");
+    let note2_annotation_edge_id = annotation_link
+        .get("id")
+        .and_then(Value::as_str)
+        .unwrap()
+        .to_string();
+    assert_ne!(note_annotation_edge_id, note2_annotation_edge_id);
+
     let fetched = pack
         .dispatch("get", json!({"id": edge_id}))
         .await
@@ -3895,24 +3941,36 @@ async fn get_edge_includes_annotating_notes() {
         .expect("edge get response must carry an annotations array");
     assert_eq!(
         annotations.len(),
-        1,
-        "expected exactly one annotating note; got {annotations:?}"
+        2,
+        "expected exactly two annotating notes; got {annotations:?}"
     );
-    let annotation = &annotations[0];
-    assert_eq!(
-        annotation.get("id").and_then(Value::as_str),
-        Some(note_id.as_str())
-    );
+    let by_note = |wanted: &str| {
+        annotations
+            .iter()
+            .find(|a| a.get("id").and_then(Value::as_str) == Some(wanted))
+            .unwrap_or_else(|| panic!("annotation for note {wanted} missing: {annotations:?}"))
+    };
+    let annotation = by_note(&note_id);
     assert_eq!(
         annotation.get("content").and_then(Value::as_str),
         Some("edge annotation test content explaining the superseding relationship")
     );
-    assert!(
-        annotation
+    assert_eq!(
+        annotation.get("annotation_edge_id").and_then(Value::as_str),
+        Some(note_annotation_edge_id.as_str()),
+        "annotation entry must carry the exact annotates-edge id: {annotation:?}"
+    );
+    let annotation2 = by_note(&note2_id);
+    assert_eq!(
+        annotation2.get("content").and_then(Value::as_str),
+        Some("second edge annotation recording a follow-up incident")
+    );
+    assert_eq!(
+        annotation2
             .get("annotation_edge_id")
-            .and_then(Value::as_str)
-            .is_some(),
-        "annotation entry must carry the annotates-edge id: {annotation:?}"
+            .and_then(Value::as_str),
+        Some(note2_annotation_edge_id.as_str()),
+        "annotation entry must carry the exact annotates-edge id: {annotation2:?}"
     );
 }
 
